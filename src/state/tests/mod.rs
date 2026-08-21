@@ -24,8 +24,8 @@ use self::collection_suite::{
     run_deque_holes, run_deque_stream_interleave, run_deque_trace, run_map_entries_prefix_trace,
     run_map_get_many_parity_trace, run_map_key_scan_holes, run_map_keys_prefix_trace,
     run_map_keyset_exact_trace, run_map_stream_interleave, run_map_trace,
-    run_map_ttl_keyset_refresh_trace, run_set_keys_prefix_trace, run_set_keyset_exact_trace,
-    run_set_trace,
+    run_map_ttl_keyset_refresh_trace, run_set_contains_many_parity_trace,
+    run_set_keys_prefix_trace, run_set_keyset_exact_trace, run_set_trace,
 };
 use self::publication_suite::{PublicationTrace, run_publication_trace};
 use self::support::{
@@ -1117,10 +1117,10 @@ fn prop_set_keys_constraint_parity() {
 /// FALSIFICATION: invert one result in `SetHandle::contains_many`.
 #[test]
 fn prop_set_contains_many_parity() {
-    fn property(trace: SetTrace) -> Result<bool> {
-        executor::block_on(run_set_trace(trace, CommitMode::ReadCommitted))
+    fn property(input: MapGetManyInput) -> Result<bool> {
+        executor::block_on(run_set_contains_many_parity_trace(input))
     }
-    QuickCheck::new().quickcheck(property as fn(SetTrace) -> Result<bool>);
+    QuickCheck::new().quickcheck(property as fn(MapGetManyInput) -> Result<bool>);
 }
 
 /// The stored set keyset equals the live member set.

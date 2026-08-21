@@ -1364,6 +1364,58 @@ pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Res
     Ok(batch == point && presence == point_presence)
 }
 
+/// Checks set batch membership for arbitrary members and queries.
+pub(crate) async fn run_set_contains_many_parity_trace(input: MapGetManyInput) -> Result<bool> {
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = set_state::<I64KeyCodec>("st");
+    let (registry, collection_ref) =
+        registry_and_ref(&descriptor, "st", &state_key, CollectionDef::new(None))?;
+    let id = collection_ref.id();
+    let armed: ArmedKeys = Arc::default();
+    let event = read_event(0);
+    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
+    let handle = descriptor.bind(&session)?;
+    for (member, _) in &input.entries {
+        handle.insert(*member).await?;
+    }
+
+    if input.commit {
+        finalize_and_promote(&session, &oracle, event_dedup(event), &cells, id).await?;
+        let read = make_session(
+            &cells,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            read_event(1),
+        );
+        let handle = descriptor.bind(&read)?;
+        return assert_set_contains_many(&handle, &input.queries).await;
+    }
+    assert_set_contains_many(&handle, &input.queries).await
+}
+
+async fn assert_set_contains_many<S>(
+    handle: &SetHandle<S, I64KeyCodec>,
+    queries: &[i64],
+) -> Result<bool>
+where
+    S: StateSession,
+{
+    let batch = handle.contains_many(queries).await?;
+    if batch.len() != queries.len() {
+        return Ok(false);
+    }
+    for (actual, query) in batch.into_iter().zip(queries) {
+        if actual != handle.contains(query).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Seeds a deque window directly into `store`: the `head ‖ tail` meta frame for
 /// `[head, head + cells.len())` plus a present entry cell for each `Some` slot,
 /// leaving `None` slots as holes (a TTL-expired entry not yet swept). The only

@@ -237,6 +237,11 @@ pub(super) async fn run_reader_set_trace<B: ReaderBackend>(
         if forward != model.iter().copied().collect::<Vec<_>>() {
             return Ok(false);
         }
+        let backward =
+            collect_stream(reader.keys(case.key.clone(), Direction::Backward).await?).await?;
+        if backward != model.iter().rev().copied().collect::<Vec<_>>() {
+            return Ok(false);
+        }
     }
     Ok(true)
 }

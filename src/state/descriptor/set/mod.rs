@@ -4,16 +4,16 @@
 //! format and keeps the same membership rules.
 
 use super::map::{
-    Keyset, MapKeysetCodec, MapKeysetKey, MapStateError, PriorKeyset, decoded_key_list,
-    is_oversized, keyset_err, tracked_frame_len,
+    Keyset, KeysetLayout, MapKeysetCodec, MapKeysetKey, MapStateError, PriorKeyset,
+    decoded_key_list, is_oversized, read_keyset_state, subtract_keyset, update_keyset,
 };
-use super::{CellStateError, CollectionSpec, Descriptor, Keyed};
+use super::{CollectionSpec, Descriptor, Keyed};
 use crate::codec::{UnitCodec, UnitCodecError};
-use crate::state::cell_key::{Coordinate, Direction, ScanEdge};
+use crate::state::cell_key::{Direction, ScanEdge};
 use crate::state::collection::{
-    Collection, CollectionLayout, CollectionRead, CollectionWrite, Constraints, JOURNAL_INLINE,
-    Plan, StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
-    spec_matches,
+    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, Constraints,
+    JOURNAL_INLINE, Plan, StateSession, WritableStateSession, collection_layout,
+    collection_methods, same_token, spec_matches,
 };
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use crate::state::{CollectionKindId, StoreOutcome};
@@ -22,8 +22,7 @@ use educe::Educe;
 use futures::stream::{Stream, StreamExt};
 use std::fmt::Display;
 use std::num::NonZeroUsize;
-use std::slice::from_ref;
-use tracing::{Instrument, info_span, instrument, warn};
+use tracing::{Instrument, info_span, instrument};
 
 collection_layout! {
     /// The set collection kind has one keyset cell and one cell per member.
@@ -35,6 +34,10 @@ collection_layout! {
         #[id(1)]
         MEMBERS: Keyed<KC, UnitCodec>,
     }
+}
+
+impl<KC: OrderedKeyCodec> KeysetLayout for SetKind<KC> {
+    const KEYSET: CellFamily<Self, Keyed<MapKeysetKey, MapKeysetCodec>> = Self::KEYSET;
 }
 
 type FrozenLayout = SetKind<I64KeyCodec>;
@@ -246,6 +249,8 @@ where
         &self,
         dir: Direction,
     ) -> Result<Plan<S, Keyed<KC, UnitCodec>>, SetStateError> {
+        // Keep this plan local because its member family differs from Map's value
+        // family.
         let coordinates = match read_keyset_state(op).await? {
             PriorKeyset::Absent => {
                 return Ok(Plan::Points(op.coordinates(
@@ -333,99 +338,6 @@ where
     KC: OrderedKeyCodec,
 {
     SetDescriptor::new(name)
-}
-
-async fn read_keyset_state<C, KC>(op: &mut C) -> Result<PriorKeyset, SetStateError>
-where
-    C: CollectionRead<Layout = SetKind<KC>>,
-    KC: OrderedKeyCodec,
-{
-    match op.get(SetKind::<KC>::KEYSET, &()).await {
-        Ok(None) => Ok(PriorKeyset::Absent),
-        Ok(Some(keyset)) => Ok(PriorKeyset::Decoded(keyset)),
-        Err(CellStateError::Codec(_)) => {
-            warn!(
-                collection = op.name().as_str(),
-                "set keyset frame did not decode; use a member scan"
-            );
-            Ok(PriorKeyset::Malformed)
-        }
-        Err(error) => Err(keyset_err(error)),
-    }
-}
-
-fn update_keyset<C, KC>(
-    op: &mut C,
-    coordinate: Coordinate,
-    prior: PriorKeyset,
-) -> Result<(), SetStateError>
-where
-    C: CollectionWrite<Layout = SetKind<KC>>,
-    KC: OrderedKeyCodec,
-{
-    let limit = op.keyset_limit();
-    let ttl = op.has_ttl();
-    match prior {
-        PriorKeyset::Malformed => write_keyset(op, Keyset::Overflowed),
-        PriorKeyset::Absent if is_oversized(from_ref(&coordinate), limit) => {
-            write_keyset(op, Keyset::Overflowed)
-        }
-        PriorKeyset::Absent => write_keyset(op, Keyset::Tracked(vec![coordinate])),
-        PriorKeyset::Decoded(Keyset::Overflowed) if ttl => write_keyset(op, Keyset::Overflowed),
-        PriorKeyset::Decoded(Keyset::Overflowed) => Ok(()),
-        PriorKeyset::Decoded(Keyset::Tracked(mut keys)) => {
-            if is_oversized(&keys, limit) {
-                return write_keyset(op, Keyset::Overflowed);
-            }
-            match keys.binary_search(&coordinate) {
-                Ok(_) if ttl => write_keyset(op, Keyset::Tracked(keys)),
-                Ok(_) => Ok(()),
-                Err(position) => {
-                    let exceeds = keys.len() + 1 > limit
-                        || tracked_frame_len(&keys)
-                            .and_then(|length| length.checked_add(4 + coordinate.as_bytes().len()))
-                            .is_none_or(|length| length > super::map::KEYSET_BYTE_CEILING);
-                    if exceeds {
-                        write_keyset(op, Keyset::Overflowed)
-                    } else {
-                        keys.insert(position, coordinate);
-                        write_keyset(op, Keyset::Tracked(keys))
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn subtract_keyset<C, KC>(
-    op: &mut C,
-    coordinate: &Coordinate,
-    prior: PriorKeyset,
-) -> Result<(), SetStateError>
-where
-    C: CollectionWrite<Layout = SetKind<KC>>,
-    KC: OrderedKeyCodec,
-{
-    match prior {
-        PriorKeyset::Malformed => write_keyset(op, Keyset::Overflowed),
-        PriorKeyset::Decoded(Keyset::Tracked(mut keys)) => match keys.binary_search(coordinate) {
-            Ok(position) => {
-                keys.remove(position);
-                write_keyset(op, Keyset::Tracked(keys))
-            }
-            Err(_) => Ok(()),
-        },
-        PriorKeyset::Absent | PriorKeyset::Decoded(Keyset::Overflowed) => Ok(()),
-    }
-}
-
-fn write_keyset<C, KC>(op: &mut C, keyset: Keyset) -> Result<(), SetStateError>
-where
-    C: CollectionWrite<Layout = SetKind<KC>>,
-    KC: OrderedKeyCodec,
-{
-    op.set(SetKind::<KC>::KEYSET, &(), keyset)
-        .map_err(keyset_err)
 }
 
 impl<KC> Descriptor<SetKind<KC>> {

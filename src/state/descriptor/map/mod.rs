@@ -79,9 +79,9 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::CellKey;
 use crate::state::cell_key::{Coordinate, Direction, ScanEdge};
 use crate::state::collection::{
-    Collection, CollectionLayout, CollectionRead, CollectionWrite, Constraints, JOURNAL_INLINE,
-    Plan, StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
-    spec_matches,
+    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, Constraints,
+    JOURNAL_INLINE, Plan, StateSession, WritableStateSession, collection_layout,
+    collection_methods, same_token, spec_matches,
 };
 use crate::state::order_codec::{I64KeyCodec, KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::{CollectionKindId, StateAccessError, StoreOutcome};
@@ -108,6 +108,20 @@ collection_layout! {
         #[id(1)]
         ENTRIES: Keyed<KC, V>,
     }
+}
+
+/// A layout that uses the shared current-membership keyset.
+pub(crate) trait KeysetLayout: CollectionLayout + Sized {
+    /// The keyset family for this layout.
+    const KEYSET: CellFamily<Self, Keyed<MapKeysetKey, MapKeysetCodec>>;
+}
+
+impl<KC, V> KeysetLayout for MapKind<KC, V>
+where
+    KC: OrderedKeyCodec,
+    V: CellType<Key = UnitKey>,
+{
+    const KEYSET: CellFamily<Self, Keyed<MapKeysetKey, MapKeysetCodec>> = Self::KEYSET;
 }
 
 /// The instantiation the frozen-layout pin and the test-only cell-address
@@ -930,15 +944,13 @@ where
 /// [`PriorKeyset::Malformed`] (with a warning) so the caller degrades rather
 /// than errors. An access error propagates; a key-decode error cannot arise
 /// (the cell is read at its one fixed coordinate).
-async fn read_keyset_state<C, KC, V>(
-    op: &mut C,
-) -> Result<PriorKeyset, MapStateError<CellCodecError<V>>>
+pub(crate) async fn read_keyset_state<C, L, E>(op: &mut C) -> Result<PriorKeyset, MapStateError<E>>
 where
-    C: CollectionRead<Layout = MapKind<KC, V>>,
-    KC: OrderedKeyCodec,
-    V: CellType<Key = UnitKey>,
+    C: CollectionRead<Layout = L>,
+    L: KeysetLayout,
+    E: Error + Send + Sync + 'static,
 {
-    match op.get(MapKind::<KC, V>::KEYSET, &()).await {
+    match op.get(L::KEYSET, &()).await {
         Ok(None) => Ok(PriorKeyset::Absent),
         Ok(Some(keyset)) => Ok(PriorKeyset::Decoded(keyset)),
         Err(CellStateError::Codec(_)) => {
@@ -961,15 +973,15 @@ where
 /// listed. On a TTL'd collection the already-tracked and `Overflowed` no-write
 /// paths still rewrite the cell, refreshing its TTL (the module's TTL-refresh
 /// invariant).
-fn update_keyset<C, KC, V>(
+pub(crate) fn update_keyset<C, L, E>(
     op: &mut C,
     coordinate: Coordinate,
     prior: PriorKeyset,
-) -> Result<(), MapStateError<CellCodecError<V>>>
+) -> Result<(), MapStateError<E>>
 where
-    C: CollectionWrite<Layout = MapKind<KC, V>>,
-    KC: OrderedKeyCodec,
-    V: CellType<Key = UnitKey>,
+    C: CollectionWrite<Layout = L>,
+    L: KeysetLayout,
+    E: Error + Send + Sync + 'static,
 {
     let limit = op.keyset_limit();
     let ttl = op.has_ttl();
@@ -1008,15 +1020,15 @@ where
 /// not contain the coordinate, an `Overflowed` sentinel (membership unknown;
 /// one-way until `clear`), and an absent keyset are all left untouched; a
 /// malformed frame heals to `Overflowed`, exactly as `set` does.
-fn subtract_keyset<C, KC, V>(
+pub(crate) fn subtract_keyset<C, L, E>(
     op: &mut C,
     coordinate: &Coordinate,
     prior: PriorKeyset,
-) -> Result<(), MapStateError<CellCodecError<V>>>
+) -> Result<(), MapStateError<E>>
 where
-    C: CollectionWrite<Layout = MapKind<KC, V>>,
-    KC: OrderedKeyCodec,
-    V: CellType<Key = UnitKey>,
+    C: CollectionWrite<Layout = L>,
+    L: KeysetLayout,
+    E: Error + Send + Sync + 'static,
 {
     match prior {
         PriorKeyset::Malformed => write_keyset(op, Keyset::Overflowed),
@@ -1033,17 +1045,17 @@ where
 
 /// The `Tracked` arm of [`update_keyset`]: size check → already-present fast
 /// path → insert-sorted with the would-exceed check.
-fn update_tracked<C, KC, V>(
+fn update_tracked<C, L, E>(
     op: &mut C,
     coordinate: Coordinate,
     mut keys: Vec<Coordinate>,
     limit: usize,
     ttl: bool,
-) -> Result<(), MapStateError<CellCodecError<V>>>
+) -> Result<(), MapStateError<E>>
 where
-    C: CollectionWrite<Layout = MapKind<KC, V>>,
-    KC: OrderedKeyCodec,
-    V: CellType<Key = UnitKey>,
+    C: CollectionWrite<Layout = L>,
+    L: KeysetLayout,
+    E: Error + Send + Sync + 'static,
 {
     // Oversized first — collapse even when `coordinate` is already listed.
     if is_oversized(&keys, limit) {
@@ -1078,17 +1090,13 @@ where
 }
 
 /// Stages a keyset-cell write, re-homing its error under the map's type.
-fn write_keyset<C, KC, V>(
-    op: &mut C,
-    keyset: Keyset,
-) -> Result<(), MapStateError<CellCodecError<V>>>
+fn write_keyset<C, L, E>(op: &mut C, keyset: Keyset) -> Result<(), MapStateError<E>>
 where
-    C: CollectionWrite<Layout = MapKind<KC, V>>,
-    KC: OrderedKeyCodec,
-    V: CellType<Key = UnitKey>,
+    C: CollectionWrite<Layout = L>,
+    L: KeysetLayout,
+    E: Error + Send + Sync + 'static,
 {
-    op.set(MapKind::<KC, V>::KEYSET, &(), keyset)
-        .map_err(keyset_err)
+    op.set(L::KEYSET, &(), keyset).map_err(keyset_err)
 }
 
 /// Re-homes a keyset-cell access error under the map's value-codec error
