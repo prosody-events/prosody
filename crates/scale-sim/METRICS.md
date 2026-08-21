@@ -22,7 +22,7 @@ Each principal regime produces these graph families:
 
 - Plot offered arrivals, timer releases, backlog, useful throughput, and failures.
 - Plot latency percentiles, queue length, requests in flight, and the SLO budget.
-- Plot replica count, target, cap, Hold, scale actions, and cumulative replica-seconds.
+- Plot replica count, target, Hold, scale actions, and cumulative replica-seconds.
 - Plot handler utilization, dependency utilization, and utilization imbalance.
 - Plot live concurrency, useful rate, the capacity posterior, and passive resource windows.
 - Plot prediction intervals, observations, expected loss, and model mismatch.

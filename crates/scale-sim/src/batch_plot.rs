@@ -102,7 +102,7 @@ fn draw_actuation_panel<Backend: DrawingBackend>(
 ) -> Result<(), DrawingAreaErrorKind<Backend::ErrorType>> {
     let ready_seconds = micros_seconds(summary.actuation_micros);
     let x_max = 95.0_f64;
-    let y_max = f64::from(summary.cap.max(summary.target)).max(1.0_f64) * 1.08_f64;
+    let y_max = f64::from(summary.target).max(1.0_f64) * 1.08_f64;
     let mut chart = ChartBuilder::on(area)
         .margin_left(8_u32)
         .margin_right(8_u32)
@@ -175,7 +175,7 @@ fn draw<Backend: DrawingBackend>(
         "controller decision",
         "replicas",
         ("target", target, BLUE),
-        Some(("cap", cap, BLACK)),
+        None,
     )?;
     draw_panel(
         &areas[1],
@@ -307,10 +307,6 @@ fn budget_hours(summary: &BatchSloSummary) -> f64 {
 
 fn target(summary: &BatchSloSummary) -> f64 {
     f64::from(summary.target)
-}
-
-fn cap(summary: &BatchSloSummary) -> f64 {
-    f64::from(summary.cap)
 }
 
 fn miss_fraction(summary: &BatchSloSummary) -> f64 {

@@ -2000,10 +2000,6 @@ fn finish_decision(
         .saturation_probability(state.simd_level, scratch.candidate_concurrency[selected]);
     ScaleDecision::Apply(ApplyDecision {
         target,
-        cap: state
-            .configuration
-            .replica_count_max
-            .min(state.configuration.partition_count),
         diagnostics: diagnostics(
             state,
             expected_cost,

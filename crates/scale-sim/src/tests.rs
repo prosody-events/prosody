@@ -1611,7 +1611,6 @@ fn assert_lead_time_diagnostics_use_prequential_predictive_distributions(
                 losses.and_then(|values| values.get(1)).copied(),
                 satisfactions.and_then(|values| values.first()).copied(),
                 satisfactions.and_then(|values| values.get(1)).copied(),
-                sample.cap,
                 sample.arrival_predictive_median_count,
                 sample.capacity_median_per_second,
             ));
@@ -1622,7 +1621,6 @@ fn assert_lead_time_diagnostics_use_prequential_predictive_distributions(
                 losses.and_then(|values| values.get(1)).copied(),
                 satisfactions.and_then(|values| values.first()).copied(),
                 satisfactions.and_then(|values| values.get(1)).copied(),
-                sample.cap,
                 sample.arrival_predictive_median_count,
                 sample.capacity_median_per_second,
             ));
@@ -1634,7 +1632,6 @@ fn assert_lead_time_diagnostics_use_prequential_predictive_distributions(
         final_state = Some((
             index,
             sample.target,
-            sample.cap,
             sample.arrival_predictive_median_count,
             sample.capacity_median_per_second,
             sample.no_knee_probability,
@@ -1909,20 +1906,6 @@ fn plant_does_not_add_a_second_dependency_queue() -> Result<(), TestError> {
     let result = plant.run();
     assert_eq!(result.settlements()[3].settle_micros, 50_000);
     assert_eq!(result.settlements()[7].settle_micros, 50_000);
-    Ok(())
-}
-
-#[test]
-fn every_controller_sample_preserves_target_and_cap() -> Result<(), TestError> {
-    let run = run_capacity_evidence_regime(PrincipalRegime::DecliningPostKnee)?;
-    for index in 0..run.controller().len() {
-        let Some(sample) = run.controller().sample(index) else {
-            return Err(TestError::MissingControllerSample);
-        };
-        assert!(sample.target > 0);
-        assert!(sample.cap > 0);
-        assert!(sample.target <= sample.cap);
-    }
     Ok(())
 }
 

@@ -57,8 +57,6 @@ pub struct ControllerSample {
     pub samples_per_capacity_class_min: u32,
     /// Current requested replica target.
     pub target: u32,
-    /// Last valid saturation cap.
-    pub cap: u32,
     /// Whether the controller returned Hold.
     pub hold: bool,
     /// Typed Hold reason. Apply decisions have no reason.
@@ -296,7 +294,6 @@ pub struct ControllerTrace {
     at_micros: Vec<u64>,
     scenario_count: Vec<u32>,
     target: Vec<u32>,
-    cap: Vec<u32>,
     hold: Vec<bool>,
     hold_reason: Vec<Option<HoldReason>>,
     expected_cost: Vec<f64>,
@@ -639,7 +636,6 @@ impl ControllerTrace {
             at_micros: Vec::with_capacity(capacity),
             scenario_count: Vec::with_capacity(capacity),
             target: Vec::with_capacity(capacity),
-            cap: Vec::with_capacity(capacity),
             hold: Vec::with_capacity(capacity),
             hold_reason: Vec::with_capacity(capacity),
             expected_cost: Vec::with_capacity(capacity),
@@ -751,7 +747,6 @@ impl ControllerTrace {
             samples_per_capacity_class: self.scenario_count[index] / self.capacity_class_count,
             samples_per_capacity_class_min: self.samples_per_capacity_class_min,
             target: self.target[index],
-            cap: self.cap[index],
             hold: self.hold[index],
             hold_reason: self.hold_reason[index],
             expected_cost: self.expected_cost[index],
@@ -1049,7 +1044,6 @@ impl ControllerTrace {
             }
             reporter_index = Some(controller_index);
             trace.target[metric_index] = self.target[controller_index];
-            trace.cap[metric_index] = self.cap[controller_index];
             trace.hold[metric_index] = self.hold[controller_index];
             trace.expected_cost[metric_index] = self.expected_cost[controller_index];
             trace.prediction_median[metric_index] = f64::NAN;
@@ -1098,7 +1092,6 @@ impl ControllerTrace {
         self.at_micros.push(sample.at_micros);
         self.scenario_count.push(sample.scenario_count);
         self.target.push(sample.target);
-        self.cap.push(sample.cap);
         self.hold.push(sample.hold);
         self.hold_reason.push(sample.hold_reason);
         self.expected_cost.push(sample.expected_cost);
@@ -1548,7 +1541,6 @@ struct ControllerSampleInput {
     at_micros: u64,
     diagnostics: DecisionDiagnostics,
     target: u32,
-    cap: u32,
     hold: bool,
     hold_reason: Option<HoldReason>,
     arrival: ArrivalPrediction,
@@ -2339,13 +2331,13 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             .history
             .desired_replicas(0)
             .unwrap_or(context.plant.replicas);
-        let (held_target, held_cap) = self.held_target_and_cap(context.plant.replicas);
+        let held_target = self.held_target(context.plant.replicas);
         let external_scale = matches!(
             inputs.scale,
             ScaleDirective::ExternalHold | ScaleDirective::Request { .. }
         );
         let (resource_concurrency, attempt_throughput_per_second) = self.latest_capacity_rates();
-        let (diagnostics, target, cap, hold, hold_reason) = match decision {
+        let (diagnostics, target, hold, hold_reason) = match decision {
             ScaleDecision::Apply(apply) => {
                 if !external_scale {
                     inputs.scale = if apply.target == desired {
@@ -2356,26 +2348,19 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
                         }
                     };
                 }
-                (apply.diagnostics, apply.target, apply.cap, false, None)
+                (apply.diagnostics, apply.target, false, None)
             }
             ScaleDecision::Hold(held) => {
                 if !external_scale {
                     inputs.scale = ScaleDirective::Hold;
                 }
-                (
-                    held.diagnostics,
-                    held_target,
-                    held_cap,
-                    true,
-                    Some(held.reason),
-                )
+                (held.diagnostics, held_target, true, Some(held.reason))
             }
         };
         let sample = self.report_sample(&ControllerSampleInput {
             at_micros: context.now_micros,
             diagnostics,
             target,
-            cap,
             hold,
             hold_reason,
             arrival: arrival_predictive,
@@ -2406,7 +2391,6 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             at_micros,
             diagnostics,
             target,
-            cap,
             hold,
             hold_reason,
             arrival,
@@ -2430,7 +2414,6 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             samples_per_capacity_class: diagnostics.scenario_count / capacity_class_count,
             samples_per_capacity_class_min: self.state.posterior_samples_per_capacity_class_min(),
             target,
-            cap,
             hold,
             hold_reason,
             expected_cost: diagnostics.expected_cost,
@@ -2483,17 +2466,11 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         }
     }
 
-    fn held_target_and_cap(&self, current_replicas: u32) -> (u32, u32) {
-        let held_target = (0..self.trace.len())
+    fn held_target(&self, current_replicas: u32) -> u32 {
+        (0..self.trace.len())
             .rev()
             .find_map(|index| self.trace.sample(index).filter(|sample| !sample.hold))
-            .map_or(current_replicas, |sample| sample.target);
-        let held_cap = (0..self.trace.len())
-            .rev()
-            .find_map(|index| self.trace.sample(index).map(|sample| sample.cap))
-            .filter(|cap| *cap > 0)
-            .unwrap_or(self.configuration.core().replica_count_max);
-        (held_target, held_cap)
+            .map_or(current_replicas, |sample| sample.target)
     }
 
     fn latest_capacity_rates(&self) -> (f64, f64) {

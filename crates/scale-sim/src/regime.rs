@@ -560,11 +560,6 @@ fn validate_idle_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> 
 
 fn validate_application_limited_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
     require_closed_loop(
-        minimum_cap(run) >= 8,
-        PrincipalRegime::ApplicationLimited,
-        "uninformative evidence created a false saturation cap",
-    )?;
-    require_closed_loop(
         final_no_knee_probability(run) >= 0.25_f64,
         PrincipalRegime::ApplicationLimited,
         "uninformative evidence removed the no-knee hypothesis",
@@ -682,7 +677,6 @@ fn validate_capacity_closed_loop_claim(
     // Identification then completes during the bounded clamp traversal.
     const DEMAND_STEP_MICROS: u64 = 270_000_000;
     const REACTION_LIMIT_MICROS: u64 = 5_000_000;
-    const ENGAGEMENT_LIMIT_MICROS: u64 = 20_000_000;
     const KNEE_CONCURRENCY: u32 = 64;
     let pre_step_target = controller_samples(run)
         .take_while(|sample| sample.at_micros <= DEMAND_STEP_MICROS)
@@ -714,18 +708,6 @@ fn validate_capacity_closed_loop_claim(
         evidence_at.is_some(),
         regime,
         "the plant produced no resource evidence above the knee",
-    )?;
-    let engaged = evidence_at.is_some_and(|evidence_at| {
-        controller_samples(run).any(|sample| {
-            sample.at_micros >= evidence_at
-                && sample.at_micros <= evidence_at + ENGAGEMENT_LIMIT_MICROS
-                && sample.cap <= 4
-        })
-    });
-    require_closed_loop(
-        engaged,
-        regime,
-        "the capacity cap did not engage after evidence became available",
     )?;
     if regime == PrincipalRegime::FlatPostKnee {
         return require_closed_loop(
@@ -906,22 +888,6 @@ fn validate_rebalance_storm_claim(run: &PrincipalRun) -> Result<(), RegimeValida
         PrincipalRegime::RebalanceStorm,
         "the controller churned during the calm rebalance tail",
     )?;
-    // The cap claim measures the calm tail, where the cap can bind a
-    // decision. During the storm the first ambiguous onset windows let the
-    // knee ridge briefly outweigh the no-knee cells. This is an honest
-    // posterior transient at one operating point. External actions drive
-    // every transition. A pause-taught standing false knee still fails
-    // because it persists into the calm tail. The rank clamp bounds the
-    // transient by ln(1 / p) per window, and recovery follows at that rate.
-    let calm_minimum_cap = controller_samples(run)
-        .filter(|sample| sample.at_micros >= CALM_START_MICROS)
-        .map(|sample| sample.cap)
-        .min();
-    require_closed_loop(
-        calm_minimum_cap.is_some_and(|cap| cap >= 2),
-        PrincipalRegime::RebalanceStorm,
-        "rebalance evidence created a false saturation cap",
-    )?;
     // The run stays at one operating point after onset. The data cannot
     // separate no-knee cells from knees above this point. Thus, the honest
     // posterior recovers to an even split. This bound rejects a standing
@@ -976,11 +942,6 @@ fn validate_loose_budget_claim(run: &PrincipalRun) -> Result<(), RegimeValidatio
             <= landed_window_seconds + 3.0_f64 * clear_seconds,
         PrincipalRegime::LooseBudgetBacklog,
         "the controller used excessive capacity after the descent landed",
-    )?;
-    require_closed_loop(
-        minimum_cap(run) >= maximum_target(run),
-        PrincipalRegime::LooseBudgetBacklog,
-        "the saturation cap fell below a selected target",
     )
 }
 
@@ -1168,20 +1129,6 @@ fn final_target(run: &PrincipalRun) -> Option<u32> {
     controller_samples(run).last().map(|sample| sample.target)
 }
 
-fn minimum_cap(run: &PrincipalRun) -> u32 {
-    controller_samples(run)
-        .map(|sample| sample.cap)
-        .min()
-        .unwrap_or(0)
-}
-
-fn maximum_target(run: &PrincipalRun) -> u32 {
-    controller_samples(run)
-        .map(|sample| sample.target)
-        .max()
-        .unwrap_or(0)
-}
-
 fn final_no_knee_probability(run: &PrincipalRun) -> f64 {
     controller_samples(run)
         .last()
@@ -1290,10 +1237,10 @@ fn validate_run_envelope(
             });
         };
         require_regime(
-            sample.target > 0 && sample.cap > 0 && sample.target <= sample.cap,
+            sample.target > 0,
             regime,
             experiment,
-            "a controller sample has an invalid target or cap",
+            "a controller sample has an invalid target",
         )?;
     }
     let has_external_target = (0..run.inputs.len()).any(|row| {
@@ -1379,14 +1326,6 @@ fn validate_capacity_evidence(
                 experiment,
                 "the flat capacity belief retained excess no-knee mass",
             )?;
-            require_regime(
-                controller_samples(run)
-                    .last()
-                    .is_some_and(|sample| sample.cap == 2),
-                regime,
-                experiment,
-                "the flat capacity run did not finish with a cap of two",
-            )?;
         }
         PrincipalRegime::DecliningPostKnee => {
             require_regime(
@@ -1431,7 +1370,6 @@ fn capacity_evidence_has_no_gap(run: &PrincipalRun, maximum_gap: usize) -> bool 
 fn validate_declining_capacity_evidence(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
     const KNEE_CONCURRENCY: f64 = 64.0_f64;
     const BELIEF_DEADLINE_MICROS: u64 = 10_000_000;
-    const CAP_DEADLINE_MICROS: u64 = 60_000_000;
     let regime = PrincipalRegime::DecliningPostKnee;
     let experiment = RegimeExperiment::CapacityEvidence;
     let first_collapse = controller_samples(run)
@@ -1483,20 +1421,6 @@ fn validate_declining_capacity_evidence(run: &PrincipalRun) -> Result<(), Regime
         regime,
         experiment,
         "the declining no-knee probability recovered after its post-knee fall",
-    )?;
-    let cap_engagement = controller_samples(run).position(|sample| sample.cap < 128);
-    require_regime(
-        first_collapse
-            .map(|(_, collapse_micros)| collapse_micros)
-            .zip(cap_engagement)
-            .is_some_and(|(collapse_micros, cap_index)| {
-                run.controller.sample(cap_index).is_some_and(|sample| {
-                    sample.at_micros <= collapse_micros.saturating_add(CAP_DEADLINE_MICROS)
-                })
-            }),
-        regime,
-        experiment,
-        "the declining capacity cap did not engage within 60 seconds",
     )
 }
 
@@ -1731,10 +1655,8 @@ const fn replica_count_max(regime: PrincipalRegime, experiment: RegimeExperiment
             // from every no-knee cell, so the posterior separates fast.
             4
         }
-        PrincipalRegime::FlatPostKnee
-        | PrincipalRegime::DecliningPostKnee
-        | PrincipalRegime::HotSerializedKey
-        | PrincipalRegime::TransientFailures => 2,
+        PrincipalRegime::FlatPostKnee | PrincipalRegime::DecliningPostKnee => 3,
+        PrincipalRegime::HotSerializedKey | PrincipalRegime::TransientFailures => 2,
         PrincipalRegime::ShortBurst
         | PrincipalRegime::SeasonalWaves
         | PrincipalRegime::TimerWave => 48,
@@ -2647,9 +2569,15 @@ impl PrincipalDefinition {
             PrincipalRegime::ApplicationLimited | PrincipalRegime::SnapshotFaults => standard,
             PrincipalRegime::LinearThroughput => Self::linear_closed_loop().handler(100_000),
             PrincipalRegime::FlatPostKnee => {
+                // The knee throughput is 320 operations per second. The final
+                // demand is 400 per second for 330 seconds. The 0.202-second
+                // service time implies 80.8 operations above the 64-operation knee.
                 Self::capacity_closed_loop(100, 100).shared_resource(64, 320, 0)
             }
             PrincipalRegime::DecliningPostKnee => {
+                // The knee throughput is 320 operations per second. The final
+                // demand is 400 per second for 330 seconds. The 0.202-second
+                // service time implies 80.8 operations above the 64-operation knee.
                 Self::capacity_closed_loop(100, 100).shared_resource(64, 320, 2)
             }
             PrincipalRegime::ShortBurst => short_burst_definition(standard),

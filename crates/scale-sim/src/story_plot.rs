@@ -19,7 +19,7 @@ use crate::{
 
 const WIDTH: u32 = 1_240;
 const PANEL_HEIGHT: u32 = 340;
-const PANEL_COUNT: u32 = 19;
+const PANEL_COUNT: u32 = 18;
 const LABEL_GAP_FRACTION: f64 = 0.08_f64;
 const LABEL_FONT_PIXELS: u32 = 19;
 const CHART_MARGIN_LEFT: u32 = 12;
@@ -29,7 +29,6 @@ const STORY_FILES: [&str; PANEL_COUNT as usize] = [
     "01-demand.svg",
     "02-backlog.svg",
     "03-scale.svg",
-    "04-saturation-cap.svg",
     "05-latency.svg",
     "06-risk.svg",
     "07-capacity-evidence.svg",
@@ -362,7 +361,6 @@ fn story_panels(story: &RegimeStory<'_>) -> Result<[StoryPanel; PANEL_COUNT as u
         work_panel(story.inputs),
         queue_panel(trace),
         scale_panel(trace, story.inputs),
-        cap_panel(trace),
         latency_panel(trace, budget_seconds),
         risk_panel(trace, story.allowed_miss_fraction),
         evidence_panel(resource_windows),
@@ -432,24 +430,6 @@ fn scale_panel(trace: &MetricTrace, inputs: &SeriesHistory) -> StoryPanel {
             metric_u32(trace, "controller target", &trace.target).step(),
         ],
     )
-}
-
-fn cap_panel(trace: &MetricTrace) -> StoryPanel {
-    let mut panel = StoryPanel::new(
-        "replicas",
-        vec![metric_u32(trace, "saturation cap", &trace.cap)],
-    );
-    for index in 1..trace.cap.len() {
-        let before = trace.cap[index - 1];
-        let after = trace.cap[index];
-        if before != after && before > 0 && after > 0 {
-            panel.annotations.push(StoryAnnotation {
-                at_micros: trace.at_micros[index],
-                label: format!("cap {before} → {after}"),
-            });
-        }
-    }
-    panel
 }
 
 fn latency_panel(trace: &MetricTrace, budget_seconds: f64) -> StoryPanel {
@@ -657,7 +637,6 @@ fn decision_loss_panel(trace: &MetricTrace, controller: &ControllerTrace) -> Sto
         vec![
             metric_u32(trace, "actual", &trace.replicas).step(),
             metric_u32(trace, "selected target", &trace.target).points(),
-            metric_u32(trace, "saturation cap", &trace.cap).step(),
         ],
     )
     .with_bounded_heatmap(decision_loss_heatmap(controller))

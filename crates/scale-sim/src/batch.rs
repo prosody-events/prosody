@@ -53,8 +53,6 @@ pub struct BatchSloSummary {
     pub initial_replicas: u32,
     /// Time when launch, rebalance, and warm-up make the request ready.
     pub actuation_micros: u64,
-    /// Saturation cap selected before the batch starts.
-    pub cap: u32,
     /// Fraction of jobs that exceeded the latency budget.
     pub miss_fraction: f64,
     /// Time when the final job settled.
@@ -188,7 +186,6 @@ pub fn run_batch_slo_with_inputs(
         target: apply.target,
         initial_replicas: INITIAL_REPLICAS,
         actuation_micros,
-        cap: apply.cap,
         miss_fraction,
         completion_micros,
         replica_seconds,

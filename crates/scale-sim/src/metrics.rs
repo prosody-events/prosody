@@ -75,8 +75,6 @@ pub struct MetricPoint {
     pub replicas: u32,
     /// Requested replica target.
     pub target: u32,
-    /// Saturation cap.
-    pub cap: u32,
     /// Whether the controller returned Hold.
     pub hold: bool,
     /// Realized SLO miss fraction.
@@ -151,7 +149,6 @@ impl MetricPoint {
             prediction_high: 0.0_f64,
             replicas: 0,
             target: 0,
-            cap: 0,
             hold: false,
             miss_fraction: 0.0_f64,
             misses: 0,
@@ -212,7 +209,6 @@ pub struct MetricTrace {
     pub(crate) prediction_high: Vec<f64>,
     pub(crate) replicas: Vec<u32>,
     pub(crate) target: Vec<u32>,
-    pub(crate) cap: Vec<u32>,
     pub(crate) hold: Vec<bool>,
     pub(crate) miss_fraction: Vec<f64>,
     pub(crate) misses: Vec<u64>,
@@ -283,7 +279,6 @@ impl MetricTrace {
             prediction_high: Vec::with_capacity(capacity),
             replicas: Vec::with_capacity(capacity),
             target: Vec::with_capacity(capacity),
-            cap: Vec::with_capacity(capacity),
             hold: Vec::with_capacity(capacity),
             miss_fraction: Vec::with_capacity(capacity),
             misses: Vec::with_capacity(capacity),
@@ -361,7 +356,6 @@ impl MetricTrace {
         self.prediction_high.push(point.prediction_high);
         self.replicas.push(point.replicas);
         self.target.push(point.target);
-        self.cap.push(point.cap);
         self.hold.push(point.hold);
         self.miss_fraction.push(point.miss_fraction);
         self.misses.push(point.misses);
@@ -433,7 +427,6 @@ impl MetricTrace {
             prediction_high: self.prediction_high[index],
             replicas: self.replicas[index],
             target: self.target[index],
-            cap: self.cap[index],
             hold: self.hold[index],
             miss_fraction: self.miss_fraction[index],
             misses: self.misses[index],

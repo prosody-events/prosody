@@ -87,7 +87,7 @@ pub(crate) fn semantic_style(label: &str) -> SemanticStyle {
             pattern: LinePattern::Solid,
         };
     }
-    if label.contains("limit") || label.contains("cap") || label.contains("slo") {
+    if label.contains("limit") || label.contains("slo") {
         return SemanticStyle {
             color: RGBColor(213, 94, 0),
             pattern: LinePattern::Dashed,
@@ -117,7 +117,7 @@ pub(crate) fn label_margin(labels: impl Iterator<Item = usize>) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AxisScale, LinePattern, Quantity, label_margin, semantic_style};
+    use super::{AxisScale, Quantity, label_margin, semantic_style};
 
     #[test]
     fn visual_contract_keeps_semantics_stable() {
@@ -126,10 +126,6 @@ mod tests {
         assert_eq!(
             semantic_style("actual replicas"),
             semantic_style("actual ready")
-        );
-        assert_eq!(
-            semantic_style("saturation cap").pattern,
-            LinePattern::Dashed
         );
         assert_eq!(
             semantic_style("posterior density").color,

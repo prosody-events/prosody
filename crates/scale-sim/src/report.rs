@@ -18,7 +18,7 @@ use crate::{
 };
 use prosody_scale_core::{PosteriorQuery, TransitionDirection};
 
-const STORY_FIGURES: [FlowFigure; 19] = [
+const STORY_FIGURES: [FlowFigure; 18] = [
     FlowFigure::new(
         "Demand and history",
         "01-demand.svg",
@@ -35,11 +35,6 @@ const STORY_FIGURES: [FlowFigure; 19] = [
         "03-scale.svg",
         "This figure separates historical replicas, external interventions, controller targets, \
          and actual replicas.",
-    ),
-    FlowFigure::new(
-        "Saturation limit",
-        "04-saturation-cap.svg",
-        "The cap limits controller targets when accepted capacity evidence identifies saturation.",
     ),
     FlowFigure::new(
         "Latency outcome",
@@ -108,7 +103,7 @@ const STORY_FIGURES: [FlowFigure; 19] = [
         "Decision loss by replica candidate",
         "17-decision-loss.svg",
         "Dark cells have low expected cost. Light cells have high expected cost. The lines show \
-         the selected target, saturation cap, and actual replicas.",
+         the selected target and actual replicas.",
     ),
     FlowFigure::new(
         "Certified capacity event trace",
@@ -477,16 +472,15 @@ pub fn write_batch_report_pdf(
          Experimental results\n\n",
     );
     source.push_str(
-        "#table(columns: 7, stroke: none, inset: 5pt, [*SLO*], [*Target*], [*Cap*], [*Ready*], \
+        "#table(columns: 6, stroke: none, inset: 5pt, [*SLO*], [*Target*], [*Ready*], \
          [*Complete*], [*Misses*], [*Replica-hours*],",
     );
     for summary in summaries {
         writeln!(
             source,
-            "[{}], [{}], [{}], [{}], [{}], [{:.3}], [{:.1}],",
+            "[{}], [{}], [{}], [{}], [{:.3}], [{:.1}],",
             format_duration(summary.budget_micros),
             summary.target,
-            summary.cap,
             format_duration(summary.actuation_micros),
             format_duration(summary.completion_micros),
             summary.miss_fraction,
@@ -510,8 +504,7 @@ pub fn write_batch_report_pdf(
         &mut source,
         "Actuation behavior",
         "actuation.svg",
-        "This plot separates the initial replicas, requested target, saturation cap, and delayed \
-         ready time.",
+        "This plot separates the initial replicas, requested target, and delayed ready time.",
         true,
     )?;
     check_images(images)?;
@@ -559,7 +552,7 @@ fn write_batch_strengths_and_limitations(
     writeln!(source, "\n=== Diagnostic strengths\n")?;
     writeln!(
         source,
-        "- The table separates target, cap, ready time, completion time, misses, and replica cost."
+        "- The table separates target, ready time, completion time, misses, and replica cost."
     )?;
     writeln!(
         source,
@@ -1301,9 +1294,8 @@ fn write_summary(source: &mut String, summary: ReportSummary) -> Result<(), fmt:
     )?;
     writeln!(
         source,
-        "\nThe smallest reported controller cap was {} replicas. {} events missed the SLO. The \
-         total observed miss fraction was {:.3}.",
-        summary.minimum_cap, summary.total_misses, summary.total_miss_fraction
+        "\n{} events missed the SLO. The total observed miss fraction was {:.3}.",
+        summary.total_misses, summary.total_miss_fraction
     )?;
     writeln!(
         source,
@@ -1342,19 +1334,6 @@ fn write_outcome_assessment(source: &mut String, summary: ReportSummary) -> Resu
             source,
             "The plant stopped with {} queued events.",
             summary.final_backlog
-        )?;
-    }
-    if summary.minimum_cap == summary.maximum_cap {
-        writeln!(
-            source,
-            "\nThe controller cap stayed at {} replicas.",
-            summary.minimum_cap
-        )?;
-    } else {
-        writeln!(
-            source,
-            "\nThe saturation cap ranged from {} to {} replicas.",
-            summary.minimum_cap, summary.maximum_cap
         )?;
     }
     writeln!(
@@ -1548,8 +1527,8 @@ const fn known_limitation(regime: PrincipalRegime) -> Option<&'static str> {
              posterior change before it credits the algorithm.",
         ),
         PrincipalRegime::ReplicaCeiling => Some(
-            "The configuration ceiling is not a learned saturation cap. Keep configuration and \
-             model limits separate.",
+            "The configuration ceiling limits the experiment. Keep configuration and model limits \
+             separate.",
         ),
         _ => None,
     }
@@ -1751,11 +1730,10 @@ fn write_capacity_state_row(
     let knee = posterior_quantiles(controller, PosteriorQuery::Knee, index);
     writeln!(
         source,
-        "{label}: time {}, target {}, cap {}, capacity {:.1}/{:.1}/{:.1} operations per second, \
-         and knee {:.1}/{:.1}/{:.1} operations.",
+        "{label}: time {}, target {}, capacity {:.1}/{:.1}/{:.1} operations per second, and knee \
+         {:.1}/{:.1}/{:.1} operations.",
         format_duration(sample.at_micros),
         sample.target,
-        sample.cap,
         sample.capacity_low_per_second,
         sample.capacity_median_per_second,
         sample.capacity_high_per_second,
@@ -1797,7 +1775,7 @@ fn write_experiment_figures(
     experiment: ExperimentReport<'_>,
 ) -> Result<(), fmt::Error> {
     writeln!(source, "\n#pagebreak()\n== Evidence\n")?;
-    for index in [0_usize, 6, 8, 9, 10, 11, 12, 13, 14, 17] {
+    for index in [0_usize, 5, 7, 8, 9, 10, 11, 12, 13, 16] {
         write_manifest_figure(source, directory, STORY_FIGURES[index], experiment)?;
     }
     writeln!(source, "\n#pagebreak()\n== Belief\n")?;
@@ -1835,11 +1813,11 @@ fn write_experiment_figures(
         writeln!(source, "]\n")?;
     }
     writeln!(source, "\n#pagebreak()\n== Decision\n")?;
-    for index in [15_usize, 16] {
+    for index in [14_usize, 15] {
         write_manifest_figure(source, directory, STORY_FIGURES[index], experiment)?;
     }
     writeln!(source, "\n#pagebreak()\n== Outcome\n")?;
-    for index in [1_usize, 2, 3, 4, 5, 18] {
+    for index in [1_usize, 2, 3, 4, 17] {
         write_manifest_figure(source, directory, STORY_FIGURES[index], experiment)?;
     }
     Ok(())
@@ -1978,8 +1956,6 @@ struct ReportSummary {
     minimum_replicas: u32,
     maximum_replicas: u32,
     maximum_target: u32,
-    minimum_cap: u32,
-    maximum_cap: u32,
     total_miss_fraction: f64,
     total_misses: u64,
     maximum_miss_fraction: f64,
@@ -1997,8 +1973,6 @@ impl ReportSummary {
             minimum_replicas: u32::MAX,
             maximum_replicas: 0,
             maximum_target: 0,
-            minimum_cap: u32::MAX,
-            maximum_cap: 0,
             total_miss_fraction: 0.0_f64,
             total_misses: 0,
             maximum_miss_fraction: 0.0_f64,
@@ -2018,10 +1992,6 @@ impl ReportSummary {
             summary.minimum_replicas = summary.minimum_replicas.min(point.replicas);
             summary.maximum_replicas = summary.maximum_replicas.max(point.replicas);
             summary.maximum_target = summary.maximum_target.max(point.target);
-            if point.cap > 0 {
-                summary.minimum_cap = summary.minimum_cap.min(point.cap);
-                summary.maximum_cap = summary.maximum_cap.max(point.cap);
-            }
             summary.maximum_miss_fraction = summary.maximum_miss_fraction.max(point.miss_fraction);
             summary.total_misses = summary.total_misses.saturating_add(point.misses);
             summary.final_backlog = point.backlog;
@@ -2035,9 +2005,6 @@ impl ReportSummary {
         }
         if summary.minimum_replicas == u32::MAX {
             summary.minimum_replicas = 0;
-        }
-        if summary.minimum_cap == u32::MAX {
-            summary.minimum_cap = 0;
         }
         summary
     }
@@ -2228,10 +2195,10 @@ const fn question(regime: PrincipalRegime) -> &'static str {
             "does capacity evidence preserve continued scaling while throughput remains linear?"
         }
         PrincipalRegime::FlatPostKnee => {
-            "does the posterior identify a flat knee and impose a useful saturation cap?"
+            "does the posterior identify a flat knee and avoid wasteful scale?"
         }
         PrincipalRegime::DecliningPostKnee => {
-            "does the posterior identify harmful concurrency and reduce the saturation cap?"
+            "does the posterior identify harmful concurrency and reduce scale?"
         }
         PrincipalRegime::ShortBurst => {
             "does the controller account for launch delay when a burst ends quickly?"
@@ -2301,7 +2268,7 @@ const fn expectation(regime: PrincipalRegime) -> &'static str {
             "concentrate knee mass and prevent scale beyond useful dependency capacity."
         }
         PrincipalRegime::DecliningPostKnee => {
-            "concentrate harmful-collapse mass and cap concurrency below the declining region."
+            "concentrate harmful-collapse mass and keep concurrency below the declining region."
         }
         PrincipalRegime::ShortBurst => {
             "avoid late replicas whose launch time exceeds the remaining burst duration."

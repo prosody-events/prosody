@@ -2213,8 +2213,6 @@ pub struct DecisionDiagnostics {
 pub struct ApplyDecision {
     /// Desired replica count.
     pub target: u32,
-    /// Largest replica count allowed by the partition and configuration limits.
-    pub cap: u32,
     /// Bounded diagnostic values.
     pub diagnostics: DecisionDiagnostics,
 }
@@ -2238,7 +2236,7 @@ pub enum HoldReason {
 /// Result of one controller transition.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScaleDecision {
-    /// Apply a target and its saturation cap.
+    /// Apply a target.
     Apply(ApplyDecision),
     /// Keep the current replica count.
     Hold(HoldDecision),
