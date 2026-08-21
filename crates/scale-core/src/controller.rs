@@ -35,8 +35,8 @@ use crate::types::{
 use crate::{
     ApplyDecision, ArrivalCountPredictive, ArrivalPredictiveError, CapacityGrid, Configuration,
     ConfigurationError, DecisionDiagnostics, DemandClass, GroupObservation, HoldDecision,
-    HoldReason, ModelTime, PosteriorError, PosteriorQuery, PredictiveQuantileError, PriorArtifact,
-    RandomStream, ResourceWindow, ScaleDecision,
+    HoldReason, ModelTime, OccupancyTraceEvidence, PosteriorError, PosteriorQuery,
+    PredictiveQuantileError, PriorArtifact, RandomStream, ScaleDecision,
 };
 use thiserror::Error;
 
@@ -309,16 +309,15 @@ impl ScaleState {
 
     /// Finds completion quantiles and the CDF interval around one observation.
     ///
-    /// The predictive uses the prior report's occupancy. It uses the current
-    /// report's certified start schedule.
+    /// The predictive uses the current report's certified occupancy trace.
     pub fn completion_predictive_summary(
         &mut self,
-        window: &ResourceWindow,
+        evidence: OccupancyTraceEvidence<'_>,
         observed: u32,
         thresholds: [f64; 3],
     ) -> CompletionPredictiveSummary {
         self.capacity
-            .completion_predictive_summary(window, observed, thresholds)
+            .completion_predictive_summary(evidence, observed, thresholds)
     }
 
     /// Writes the marginal capacity posterior into caller-owned buffers.
@@ -554,6 +553,14 @@ impl ScaleState {
                 }
             }
         }
+    }
+}
+
+impl GroupObservation<'_> {
+    /// Returns the certified occupancy trace for this report.
+    #[must_use]
+    pub const fn occupancy_trace_evidence(&self) -> Option<OccupancyTraceEvidence<'_>> {
+        self.resource
     }
 }
 

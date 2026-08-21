@@ -2,9 +2,9 @@ use super::{
     ArrivalSchedule, ArrivalSeries, CALENDAR_PRIOR_RATE_SECONDS, CALENDAR_PRIOR_SHAPE,
     HISTORICAL_SCHEDULE, HISTORY_EVENT_COUNT_MAX, HistoricalSeries, IndexSeries,
     PrincipalDefinition, PrincipalRegime, RunSchedule, RunStopReason, SEASONAL_SCHEDULE,
-    SharedResourcePolicy, StopCondition, capacity_regime_axes, format_clock, live_launch_count_max,
-    replica_count_max, resource_attempt_count_max, run_principal_definition,
-    run_principal_regime_seeded,
+    SharedResourcePolicy, StopCondition, binomial_coverage_lower_tail, capacity_regime_axes,
+    format_clock, live_launch_count_max, replica_count_max, resource_attempt_count_max,
+    run_principal_definition, run_principal_regime_seeded,
 };
 use crate::model::{AttemptFrame, AttemptModel};
 use crate::{
@@ -12,6 +12,7 @@ use crate::{
     PlantConfiguration, PlantError, PrincipalRunError, SeriesCell,
 };
 use quickcheck_macros::quickcheck;
+use statrs::distribution::{Binomial, BinomialError, DiscreteCDF};
 use std::time::Duration;
 
 #[test]
@@ -814,4 +815,26 @@ where
     times
         .into_iter()
         .fold(0_u32, |emitted, now| emitted + series.at(now, emitted))
+}
+
+#[test]
+fn coverage_lower_tail_matches_the_binomial_oracle() -> Result<(), BinomialError> {
+    // 1000 windows exceeds the linear-domain underflow point near 440.
+    for (windows, covered) in [
+        (10, 4),
+        (10, 5),
+        (100, 50),
+        (180, 76),
+        (400, 300),
+        (1000, 760),
+    ] {
+        let oracle = Binomial::new(0.8_f64, windows)?.cdf(covered);
+        let actual = binomial_coverage_lower_tail(windows, covered);
+        let tolerance = 1e-9_f64 * oracle + 1e-300_f64;
+        assert!(
+            (actual - oracle).abs() <= tolerance,
+            "windows {windows} covered {covered}: actual {actual} oracle {oracle}"
+        );
+    }
+    Ok(())
 }

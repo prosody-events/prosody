@@ -257,6 +257,7 @@ impl ArrivalPrior {
         self.authored_shape
     }
 
+    #[cfg(test)]
     pub(crate) const fn rate_seconds(&self) -> f64 {
         self.rate_seconds
     }

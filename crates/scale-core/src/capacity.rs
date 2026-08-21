@@ -1,5 +1,4 @@
 use std::{
-    array,
     f64::consts::{E, LOG2_E},
     mem::size_of,
     time::Duration,
@@ -56,12 +55,6 @@ const CAPACITY_MODEL_BUDGET: PriorArtifactBudget = PriorArtifactBudget::new(
     REPORT_CLOCK_ERROR_SECONDS,
     CURVE_GRID_RELATIVE_ERROR_MAX,
 );
-const EMPTY_START_WINDOW: StartWindow = StartWindow {
-    end_micros: 0,
-    exposure_seconds: 0.0_f64,
-    started_attempts: None,
-};
-
 /// Versioned prior and approximation limits for the capacity model.
 ///
 /// Version 2 uses the certified event-path sampling model. It assigns one
@@ -564,21 +557,6 @@ impl ResourceWindow {
 }
 
 #[derive(Clone, Copy)]
-struct StartWindow {
-    end_micros: u64,
-    exposure_seconds: f64,
-    started_attempts: Option<u32>,
-}
-
-#[derive(Clone, Copy)]
-struct RetainedHistory<'a> {
-    windows: &'a [StartWindow],
-    head: usize,
-    length: usize,
-    end_micros: u64,
-}
-
-#[derive(Clone, Copy)]
 struct CapacityAllocation {
     cell_count: usize,
     state_count: usize,
@@ -586,58 +564,13 @@ struct CapacityAllocation {
     filter_curve_count: usize,
     transition_count: usize,
     ln_gamma_integer_count: usize,
-    start_history_capacity: usize,
-    group_count: usize,
-}
-
-struct CompletionScratch<'a> {
-    simd_level: Level,
-    coefficients: &'a mut [f64],
-    convolution: &'a mut [f64],
-    binomial: &'a mut [f64],
-    ln_gamma_integers: &'a [f64],
-}
-
-#[derive(Clone, Copy)]
-struct CompletionTail<'a> {
-    coefficient_log_scale: f64,
-    posterior_shape: f64,
-    posterior_rate: f64,
-    missing: f64,
-    ln_gamma_integers: &'a [f64],
-}
-
-#[derive(Clone, Copy)]
-struct DescendingLogGamma {
-    value: f64,
-    correction: f64,
-}
-
-impl DescendingLogGamma {
-    const fn new(value: f64) -> Self {
-        Self {
-            value,
-            correction: 0.0_f64,
-        }
-    }
-
-    fn previous(self, shape: f64, count: usize) -> Self {
-        let previous = count.saturating_sub(1);
-        let previous_float = f64::from(u32::try_from(previous).unwrap_or(u32::MAX));
-        let term = -(previous_float + shape).ln() - self.correction;
-        let value = self.value + term;
-        Self {
-            value,
-            correction: (value - self.value) - term,
-        }
-    }
+    group_limit: usize,
 }
 
 pub(crate) struct CapacityFactor {
     simd_level: Level,
     grid: CapacityGrid,
     arrival_shape: f64,
-    arrival_rate_seconds: f64,
     concurrency_max: f64,
     exposure_min_seconds: f64,
     history_coverage_seconds: f64,
@@ -652,15 +585,9 @@ pub(crate) struct CapacityFactor {
     /// Stores the authoritative normalized filter posterior in the log domain.
     filter_log_weights: Vec<f64>,
     filter_curve_weights: Vec<f64>,
-    start_history: Vec<StartWindow>,
-    start_history_head: usize,
-    start_history_len: usize,
     observation_clock_micros: u64,
-    predictive_start_history: Vec<StartWindow>,
     previous_window_concurrency: Option<f64>,
     completion_coefficients: Vec<f64>,
-    completion_convolution: Vec<f64>,
-    completion_binomial: Vec<f64>,
     completion_cell_cdfs: Vec<f64>,
     ln_gamma_integers: Vec<f64>,
     state_exposure_seconds: Vec<f64>,
@@ -695,8 +622,7 @@ impl CapacityFactor {
         )?;
         let cell_count = grid.service_times_seconds.len();
         let state_count = concurrency_max as usize + 1;
-        let (history_coverage_seconds, start_history_capacity) =
-            start_history_contract(&grid, concurrency_max, exposure_min_seconds)?;
+        let history_coverage_seconds = history_coverage(&grid, concurrency_max)?;
         let artifact = capacity_model_artifact_with_groups(
             change_rate_per_second,
             arrival_prior.shape(),
@@ -725,8 +651,7 @@ impl CapacityFactor {
                 filter_curve_count,
                 transition_count,
                 ln_gamma_integer_count,
-                start_history_capacity,
-                group_count: group_count_max as usize,
+                group_limit: group_count_max as usize,
             },
         )?;
         let (filter_weights, filter_curve_weights) = filter_prior(
@@ -740,7 +665,6 @@ impl CapacityFactor {
             simd_level: Level::new(),
             grid,
             arrival_shape: arrival_prior.shape(),
-            arrival_rate_seconds: arrival_prior.rate_seconds(),
             concurrency_max,
             exposure_min_seconds,
             history_coverage_seconds,
@@ -753,15 +677,9 @@ impl CapacityFactor {
             filter_log_weights,
             filter_weights,
             filter_curve_weights,
-            start_history: vec![EMPTY_START_WINDOW; start_history_capacity],
-            start_history_head: 0,
-            start_history_len: 0,
             observation_clock_micros: 0,
-            predictive_start_history: vec![EMPTY_START_WINDOW; start_history_capacity],
             previous_window_concurrency: None,
             completion_coefficients: vec![0.0_f64; attempt_count_max as usize + 1],
-            completion_convolution: vec![0.0_f64; attempt_count_max as usize + 1],
-            completion_binomial: vec![0.0_f64; attempt_count_max as usize + 1],
             completion_cell_cdfs: vec![0.0_f64; cell_count],
             ln_gamma_integers: integer_ln_gamma_table(ln_gamma_integer_count)?,
             state_exposure_seconds: vec![0.0_f64; state_count],
@@ -894,61 +812,46 @@ impl CapacityFactor {
         feature = "hotpath",
         hotpath::measure(label = "completion_predictive_sweep")
     )]
-    /// Predicts completions with admitted starts fixed as observed cohorts.
+    /// Predicts completions from the certified occupancy path.
     fn completion_predictive_sweep(
         &mut self,
-        window: &ResourceWindow,
+        evidence: OccupancyTraceEvidence<'_>,
         count_max: u32,
         mut visit: impl FnMut(u32, f64) -> bool,
     ) {
-        self.predictive_start_history
-            .copy_from_slice(&self.start_history);
-        let mut head = self.start_history_head;
-        let mut length = self.start_history_len;
-        let end_micros = self
-            .observation_clock_micros
-            .saturating_add(window.exposure_micros());
-        record_start_window(
-            &mut self.predictive_start_history,
-            &mut head,
-            &mut length,
-            window,
-            end_micros,
-            Some(window.started_attempts()),
+        fold_trace(
+            evidence,
+            &mut self.state_exposure_seconds,
+            &mut self.state_completion_counts,
         );
-        let predictive_concurrency = self
-            .previous_window_concurrency
-            .unwrap_or(window.concurrency);
         self.completion_cell_cdfs.fill(0.0_f64);
+        for index in 0..self.weights.len() {
+            if index < self.grid.knee_cell_count as usize {
+                fill_knee_state_rates(&self.grid, index, &mut self.state_rates);
+            } else {
+                fill_no_knee_state_rates(&self.grid, index, &mut self.state_rates);
+            }
+            self.likelihoods[index] = self
+                .state_rates
+                .iter()
+                .zip(&self.state_exposure_seconds)
+                .map(|(rate, exposure)| rate * exposure)
+                .sum();
+        }
         for count in 0..=count_max {
             for index in 0..self.weights.len() {
-                let predictive_window = ResourceWindow {
-                    concurrency: predictive_concurrency,
-                    exposure_micros: window.exposure_micros,
-                    completed_attempts: count,
-                    started_attempts: window.started_attempts,
+                let intensity = self.likelihoods[index];
+                let log_mass = if intensity == 0.0_f64 {
+                    if count == 0 {
+                        0.0_f64
+                    } else {
+                        f64::NEG_INFINITY
+                    }
+                } else {
+                    -intensity + f64::from(count) * intensity.ln()
+                        - self.ln_gamma_integers[count as usize]
                 };
-                self.completion_cell_cdfs[index] += completion_log_likelihood(
-                    &self.grid,
-                    index,
-                    RetainedHistory {
-                        windows: &self.predictive_start_history,
-                        head,
-                        length,
-                        end_micros,
-                    },
-                    &predictive_window,
-                    self.arrival_shape,
-                    self.arrival_rate_seconds,
-                    CompletionScratch {
-                        simd_level: self.simd_level,
-                        coefficients: &mut self.completion_coefficients,
-                        convolution: &mut self.completion_convolution,
-                        binomial: &mut self.completion_binomial,
-                        ln_gamma_integers: &self.ln_gamma_integers,
-                    },
-                )
-                .exp();
+                self.completion_cell_cdfs[index] += log_mass.exp();
             }
             let mut cumulative = 0.0_f64;
             for (weight, cell_cdf) in self.weights.iter().zip(&self.completion_cell_cdfs) {
@@ -962,7 +865,7 @@ impl CapacityFactor {
 
     pub(crate) fn completion_predictive_summary(
         &mut self,
-        window: &ResourceWindow,
+        evidence: OccupancyTraceEvidence<'_>,
         observed: u32,
         thresholds: [f64; 3],
     ) -> CompletionPredictiveSummary {
@@ -979,7 +882,7 @@ impl CapacityFactor {
         } else {
             0.0_f64
         };
-        self.completion_predictive_sweep(window, count_max, |count, cdf| {
+        self.completion_predictive_sweep(evidence, count_max, |count, cdf| {
             for index in 0..thresholds.len() {
                 if !quantile_found[index] && cdf >= thresholds[index] {
                     quantile_counts[index] = count;
@@ -1004,75 +907,28 @@ impl CapacityFactor {
     #[cfg(test)]
     pub(crate) fn completion_predictive_cdf(
         &mut self,
-        window: &ResourceWindow,
+        evidence: OccupancyTraceEvidence<'_>,
         completed_attempts: u32,
     ) -> f64 {
         if completed_attempts as usize >= self.completion_coefficients.len() {
             return 1.0_f64;
         }
-        self.predictive_start_history
-            .copy_from_slice(&self.start_history);
-        let mut head = self.start_history_head;
-        let mut length = self.start_history_len;
-        let end_micros = self
-            .observation_clock_micros
-            .saturating_add(window.exposure_micros());
-        record_start_window(
-            &mut self.predictive_start_history,
-            &mut head,
-            &mut length,
-            window,
-            end_micros,
-            Some(window.started_attempts()),
-        );
-        let predictive_concurrency = self
-            .previous_window_concurrency
-            .unwrap_or(window.concurrency);
-        let mut cumulative = 0.0_f64;
-        for index in 0..self.weights.len() {
-            let mut cell_cdf = 0.0_f64;
-            for count in 0..=completed_attempts {
-                let predictive_window = ResourceWindow {
-                    concurrency: predictive_concurrency,
-                    exposure_micros: window.exposure_micros,
-                    completed_attempts: count,
-                    started_attempts: window.started_attempts,
-                };
-                cell_cdf += completion_log_likelihood(
-                    &self.grid,
-                    index,
-                    RetainedHistory {
-                        windows: &self.predictive_start_history,
-                        head,
-                        length,
-                        end_micros,
-                    },
-                    &predictive_window,
-                    self.arrival_shape,
-                    self.arrival_rate_seconds,
-                    CompletionScratch {
-                        simd_level: self.simd_level,
-                        coefficients: &mut self.completion_coefficients,
-                        convolution: &mut self.completion_convolution,
-                        binomial: &mut self.completion_binomial,
-                        ln_gamma_integers: &self.ln_gamma_integers,
-                    },
-                )
-                .exp();
-            }
-            cumulative += self.weights[index] * cell_cdf;
-        }
-        cumulative.clamp(0.0_f64, 1.0_f64)
+        let mut result = 0.0_f64;
+        self.completion_predictive_sweep(evidence, completed_attempts, |_, cdf| {
+            result = cdf;
+            true
+        });
+        result
     }
 
     #[cfg(test)]
     pub(crate) fn write_completion_predictive_cdfs(
         &mut self,
-        window: &ResourceWindow,
+        evidence: OccupancyTraceEvidence<'_>,
         output: &mut [f64],
     ) {
         let count_max = output.len().saturating_sub(1) as u32;
-        self.completion_predictive_sweep(window, count_max, |count, cdf| {
+        self.completion_predictive_sweep(evidence, count_max, |count, cdf| {
             output[count as usize] = cdf;
             true
         });
@@ -1117,7 +973,6 @@ impl CapacityFactor {
     /// largest certified Poisson term count. `D` is the contracted death count.
     /// `D` is zero when contraction cannot occur. `F` is the filter count.
     /// [`validate_capacity_allocation`] bounds this cost at construction.
-    /// Every report enters the start-history ring for completion prediction.
     ///
     /// The update applies evidence to its interval start. It then advances
     /// the change process across the evidence interval.
@@ -1133,14 +988,6 @@ impl CapacityFactor {
         self.observation_clock_micros = self
             .observation_clock_micros
             .saturating_add(elapsed.as_micros() as u64);
-        record_start_window(
-            &mut self.start_history,
-            &mut self.start_history_head,
-            &mut self.start_history_len,
-            window,
-            self.observation_clock_micros,
-            Some(window.started_attempts()),
-        );
         debug_assert!(
             window.exposure_seconds() >= self.exposure_min_seconds,
             "the observation buffer enforces minimum resource exposure"
@@ -1186,13 +1033,6 @@ impl CapacityFactor {
         self.observation_clock_micros = self
             .observation_clock_micros
             .saturating_add(elapsed.as_micros() as u64);
-        record_start_gap(
-            &mut self.start_history,
-            &mut self.start_history_head,
-            &mut self.start_history_len,
-            self.observation_clock_micros,
-            elapsed,
-        );
         self.residual_integrated_hazards.fill(0.0_f64);
         self.discard_next_residual = true;
     }
@@ -1652,22 +1492,14 @@ fn validate_capacity_observation_contract(
     }
 }
 
-fn start_history_contract(
-    grid: &CapacityGrid,
-    concurrency_max: f64,
-    exposure_min_seconds: f64,
-) -> Result<(f64, usize), CapacityModelError> {
+fn history_coverage(grid: &CapacityGrid, concurrency_max: f64) -> Result<f64, CapacityModelError> {
     let coverage = (0..grid.service_times_seconds.len())
         .map(|index| effective_service_time(grid, index, concurrency_max))
         .fold(0.0_f64, f64::max);
     if !coverage.is_finite() {
         return Err(CapacityModelError::InvalidObservationContract);
     }
-    let count = (coverage / exposure_min_seconds).ceil() as usize;
-    let capacity = count
-        .checked_add(1)
-        .ok_or(CapacityModelError::StorageBound)?;
-    Ok((coverage, capacity))
+    Ok(coverage)
 }
 
 fn validate_capacity_allocation(
@@ -1705,7 +1537,7 @@ fn validate_capacity_allocation(
 
 fn capacity_update_operation_count(allocation: CapacityAllocation) -> Option<u64> {
     let states = u64::try_from(allocation.state_count).ok()?;
-    let groups = u64::try_from(allocation.group_count).ok()?;
+    let groups = u64::try_from(allocation.group_limit).ok()?;
     let cells = u64::try_from(allocation.cell_count).ok()?;
     // Each cell fills its rate vector and scans it for the raw path score.
     let path_cost = cells.checked_mul(states)?.checked_mul(2)?;
@@ -1745,7 +1577,6 @@ fn capacity_storage_bytes(allocation: CapacityAllocation) -> Result<usize, Capac
         state_count,
         transition_count,
         ln_gamma_integer_count,
-        start_history_capacity,
         ..
     } = allocation;
     filter_curve_count
@@ -1769,12 +1600,6 @@ fn capacity_storage_bytes(allocation: CapacityAllocation) -> Result<usize, Capac
             transition_count
                 .checked_mul(size_of::<u64>() + 2 * size_of::<u32>())
                 .and_then(|transition_bytes| bytes.checked_add(transition_bytes))
-        })
-        .and_then(|bytes| {
-            start_history_capacity
-                .checked_mul(2)
-                .and_then(|count| count.checked_mul(size_of::<StartWindow>()))
-                .and_then(|history_bytes| bytes.checked_add(history_bytes))
         })
         .and_then(|bytes| {
             ln_gamma_integer_count
@@ -2126,39 +1951,6 @@ fn normalize(weights: &mut [f64]) {
     }
 }
 
-fn record_start_window(
-    history: &mut [StartWindow],
-    head: &mut usize,
-    length: &mut usize,
-    window: &ResourceWindow,
-    end_micros: u64,
-    started_attempts: Option<u32>,
-) {
-    history[*head] = StartWindow {
-        end_micros,
-        exposure_seconds: window.exposure_seconds(),
-        started_attempts,
-    };
-    *head = (*head + 1) % history.len();
-    *length = (*length + 1).min(history.len());
-}
-
-fn record_start_gap(
-    history: &mut [StartWindow],
-    head: &mut usize,
-    length: &mut usize,
-    end_micros: u64,
-    exposure: Duration,
-) {
-    history[*head] = StartWindow {
-        end_micros,
-        exposure_seconds: exposure.as_secs_f64(),
-        started_attempts: None,
-    };
-    *head = (*head + 1) % history.len();
-    *length = (*length + 1).min(history.len());
-}
-
 fn posterior_update_eligible(prior_predictive: f64) -> bool {
     prior_predictive.is_finite()
 }
@@ -2284,365 +2076,6 @@ fn path_log_score(
     path_log_score_with_rates(&rates, exposure_seconds, completion_counts)
 }
 
-#[cfg(test)]
-fn completion_expectation(
-    grid: &CapacityGrid,
-    index: usize,
-    history: RetainedHistory<'_>,
-    window: &ResourceWindow,
-    arrival_shape: f64,
-    arrival_rate_seconds: f64,
-) -> f64 {
-    let delay = effective_service_time(grid, index, window.concurrency);
-    let target_end = delay + window.exposure_seconds();
-    let mut known_mean = 0.0_f64;
-    let mut known_overlap = 0.0_f64;
-    let mut posterior_shape = arrival_shape;
-    let mut posterior_rate = arrival_rate_seconds;
-    for offset in 0..history.length {
-        let index = (history.head + history.windows.len() - 1 - offset) % history.windows.len();
-        let start_window = history.windows[index];
-        let age = Duration::from_micros(history.end_micros.saturating_sub(start_window.end_micros))
-            .as_secs_f64();
-        let window_end = age + start_window.exposure_seconds;
-        if let Some(starts) = start_window.started_attempts {
-            posterior_shape += f64::from(starts);
-            posterior_rate += start_window.exposure_seconds;
-            let overlap = (window_end.min(target_end) - age.max(delay)).max(0.0_f64);
-            known_overlap += overlap;
-            known_mean += f64::from(starts) * overlap / start_window.exposure_seconds;
-        }
-    }
-    let missing = (window.exposure_seconds() - known_overlap).max(0.0_f64);
-    known_mean + posterior_shape / posterior_rate * missing
-}
-
-#[cfg_attr(
-    feature = "hotpath",
-    hotpath::measure(label = "completion_log_likelihood")
-)]
-fn completion_log_likelihood(
-    grid: &CapacityGrid,
-    index: usize,
-    history: RetainedHistory<'_>,
-    window: &ResourceWindow,
-    arrival_shape: f64,
-    arrival_rate_seconds: f64,
-    scratch: CompletionScratch<'_>,
-) -> f64 {
-    let CompletionScratch {
-        simd_level,
-        coefficients,
-        convolution,
-        binomial,
-        ln_gamma_integers,
-    } = scratch;
-    let completed = window.completed_attempts as usize;
-    if completed >= coefficients.len() {
-        return f64::NEG_INFINITY;
-    }
-    let delay = effective_service_time(grid, index, window.concurrency);
-    let target_end = delay + window.exposure_seconds();
-    let mut known_overlap = 0.0_f64;
-    let mut posterior_shape = arrival_shape;
-    let mut posterior_rate = arrival_rate_seconds;
-    let mut deterministic = 0_usize;
-    for offset in 0..history.length {
-        let history_index =
-            (history.head + history.windows.len() - 1 - offset) % history.windows.len();
-        let start_window = history.windows[history_index];
-        let age = Duration::from_micros(history.end_micros.saturating_sub(start_window.end_micros))
-            .as_secs_f64();
-        let window_end = age + start_window.exposure_seconds;
-        if let Some(starts) = start_window.started_attempts {
-            posterior_shape += f64::from(starts);
-            posterior_rate += start_window.exposure_seconds;
-            let overlap = (window_end.min(target_end) - age.max(delay)).max(0.0_f64);
-            known_overlap += overlap;
-            if overlap >= start_window.exposure_seconds {
-                deterministic = deterministic.saturating_add(starts as usize);
-            }
-        }
-    }
-    if deterministic > completed {
-        return f64::NEG_INFINITY;
-    }
-    let target = completed - deterministic;
-    coefficients[..=target].fill(0.0_f64);
-    coefficients[0] = 1.0_f64;
-    let mut degree = 0_usize;
-    let mut coefficient_log_scale = 0.0_f64;
-    for offset in 0..history.length {
-        let history_index =
-            (history.head + history.windows.len() - 1 - offset) % history.windows.len();
-        let start_window = history.windows[history_index];
-        let age = Duration::from_micros(history.end_micros.saturating_sub(start_window.end_micros))
-            .as_secs_f64();
-        let window_end = age + start_window.exposure_seconds;
-        if let Some(starts) = start_window.started_attempts {
-            let overlap = (window_end.min(target_end) - age.max(delay)).max(0.0_f64);
-            let probability = overlap / start_window.exposure_seconds;
-            if probability > 0.0_f64 && probability < 1.0_f64 {
-                let group_degree = (starts as usize).min(target);
-                write_binomial_log_masses(
-                    starts,
-                    probability,
-                    group_degree,
-                    binomial,
-                    ln_gamma_integers,
-                );
-                let (maximum, scale, next_degree) = dispatch!(simd_level, simd => completion_group_convolution(
-                    simd,
-                    coefficients,
-                    convolution,
-                    binomial,
-                    degree,
-                    group_degree,
-                    target,
-                ));
-                if scale <= 0.0_f64 {
-                    return f64::NEG_INFINITY;
-                }
-                degree = next_degree;
-                coefficient_log_scale += maximum + scale.ln();
-            }
-        }
-    }
-    let missing = (window.exposure_seconds() - known_overlap).max(0.0_f64);
-    completion_probability_from_coefficients(
-        coefficients,
-        degree,
-        target,
-        CompletionTail {
-            coefficient_log_scale,
-            posterior_shape,
-            posterior_rate,
-            missing,
-            ln_gamma_integers,
-        },
-    )
-}
-
-#[cfg_attr(
-    feature = "hotpath",
-    hotpath::measure(label = "binomial_mass_generation")
-)]
-fn write_binomial_log_masses(
-    starts: u32,
-    probability: f64,
-    group_degree: usize,
-    output: &mut [f64],
-    ln_gamma_integers: &[f64],
-) {
-    // Observation intake rejects windows whose started attempts exceed the
-    // attempt cap, so `trials` and both derived indexes stay inside the table.
-    let trials = starts as usize;
-    let trials_float = f64::from(starts);
-    let trials_log_gamma = ln_gamma_integers[trials];
-    let log_probability = probability.ln();
-    let log_failure_probability = (-probability).ln_1p();
-    for (mass_index, value) in output[..=group_degree].iter_mut().enumerate() {
-        let count = f64::from(u32::try_from(mass_index).unwrap_or(u32::MAX));
-        let log_combination = trials_log_gamma
-            - ln_gamma_integers[mass_index]
-            - ln_gamma_integers[trials - mass_index];
-        *value = (trials_float - count).mul_add(
-            log_failure_probability,
-            count.mul_add(log_probability, log_combination),
-        );
-    }
-}
-
-#[cfg_attr(
-    feature = "hotpath",
-    hotpath::measure(label = "completion_group_convolution")
-)]
-fn completion_group_convolution<S: Simd>(
-    simd: S,
-    coefficients: &mut [f64],
-    convolution: &mut [f64],
-    binomial: &mut [f64],
-    degree: usize,
-    group_degree: usize,
-    target: usize,
-) -> (f64, f64, usize) {
-    let next_degree = target.min(degree + group_degree);
-    // Log masses are finite or negative infinity, and convolutions contain
-    // non-negative products. Neither maximum scan can contain NaN.
-    let maximum = exponentiate_log_masses(simd, &mut binomial[..=group_degree]);
-    convolution[..=next_degree].fill(0.0_f64);
-    let mut known = 0_usize;
-    while known + 7 <= degree && group_degree >= 7 {
-        let full_added_count = group_degree + 1;
-        let eighth_added_count = group_degree.min(target - known - 7) + 1;
-        if eighth_added_count != full_added_count {
-            break;
-        }
-        convolution_axpy_eight(
-            simd,
-            &coefficients[known..known + 8],
-            &binomial[..full_added_count],
-            &mut convolution[known..known + group_degree + 8],
-        );
-        known += 8;
-    }
-    while known + 3 <= degree && group_degree >= 3 {
-        let full_added_count = group_degree + 1;
-        let fourth_added_count = group_degree.min(target - known - 3) + 1;
-        if fourth_added_count != full_added_count {
-            break;
-        }
-        convolution_axpy_four(
-            simd,
-            &coefficients[known..known + 4],
-            &binomial[..full_added_count],
-            &mut convolution[known..known + group_degree + 4],
-        );
-        known += 4;
-    }
-    for known in known..=degree {
-        let added_count = group_degree.min(target - known) + 1;
-        convolution_axpy(
-            simd,
-            coefficients[known],
-            &binomial[..added_count],
-            &mut convolution[known..known + added_count],
-        );
-    }
-    let scale = vector_max(simd, &convolution[..=next_degree], 0.0_f64);
-    vector_divide(
-        simd,
-        &convolution[..=next_degree],
-        &mut coefficients[..=next_degree],
-        scale,
-    );
-    (maximum, scale, next_degree)
-}
-
-fn convolution_axpy_eight<S: Simd>(
-    simd: S,
-    coefficients: &[f64],
-    values: &[f64],
-    output: &mut [f64],
-) {
-    for row in 0..8 {
-        convolution_axpy(
-            simd,
-            coefficients[row],
-            &values[..7 - row],
-            &mut output[row..7],
-        );
-        let suffix_start = values.len() - row;
-        convolution_axpy(
-            simd,
-            coefficients[row],
-            &values[suffix_start..],
-            &mut output[values.len()..values.len() + row],
-        );
-    }
-
-    let lane_count = S::f64s::N;
-    let shared_count = values.len() - 7;
-    let vector_count = shared_count / lane_count;
-    let coefficient_vectors: [S::f64s; 8] =
-        array::from_fn(|row| S::f64s::splat(simd, coefficients[row]));
-    for vector in 0..vector_count {
-        let added = vector * lane_count;
-        let output_start = added + 7;
-        let output_end = output_start + lane_count;
-        let mut current = S::f64s::from_slice(simd, &output[output_start..output_end]);
-        for row in 0..8 {
-            let value = S::f64s::from_slice(simd, &values[added + 7 - row..output_end - row]);
-            current = coefficient_vectors[row].mul_add(value, current);
-        }
-        current.store_slice(&mut output[output_start..output_end]);
-    }
-    for added in vector_count * lane_count..shared_count {
-        let output_index = added + 7;
-        for row in 0..8 {
-            output[output_index] =
-                coefficients[row].mul_add(values[added + 7 - row], output[output_index]);
-        }
-    }
-}
-
-fn convolution_axpy_four<S: Simd>(
-    simd: S,
-    coefficients: &[f64],
-    values: &[f64],
-    output: &mut [f64],
-) {
-    for row in 0..4 {
-        convolution_axpy(
-            simd,
-            coefficients[row],
-            &values[..3 - row],
-            &mut output[row..3],
-        );
-        let suffix_start = values.len() - row;
-        convolution_axpy(
-            simd,
-            coefficients[row],
-            &values[suffix_start..],
-            &mut output[values.len()..values.len() + row],
-        );
-    }
-
-    let lane_count = S::f64s::N;
-    let shared_count = values.len() - 3;
-    let vector_count = shared_count / lane_count;
-    let coefficient_vectors = [
-        S::f64s::splat(simd, coefficients[0]),
-        S::f64s::splat(simd, coefficients[1]),
-        S::f64s::splat(simd, coefficients[2]),
-        S::f64s::splat(simd, coefficients[3]),
-    ];
-    for vector in 0..vector_count {
-        let added = vector * lane_count;
-        let output_start = added + 3;
-        let output_end = output_start + lane_count;
-        let mut current = S::f64s::from_slice(simd, &output[output_start..output_end]);
-        for row in 0..4 {
-            let value = S::f64s::from_slice(simd, &values[added + 3 - row..output_end - row]);
-            current = coefficient_vectors[row].mul_add(value, current);
-        }
-        current.store_slice(&mut output[output_start..output_end]);
-    }
-    for added in vector_count * lane_count..shared_count {
-        let output_index = added + 3;
-        for row in 0..4 {
-            output[output_index] =
-                coefficients[row].mul_add(values[added + 3 - row], output[output_index]);
-        }
-    }
-}
-
-#[cfg_attr(feature = "hotpath", hotpath::measure(label = "mass_exponentiation"))]
-fn exponentiate_log_masses<S: Simd>(simd: S, values: &mut [f64]) -> f64 {
-    let maximum = vector_max(simd, values, f64::NEG_INFINITY);
-    let lane_count = S::f64s::N;
-    let vector_count = values.len() / lane_count;
-    let maximum_vector = S::f64s::splat(simd, maximum);
-    for vector in 0..vector_count {
-        let start = vector * lane_count;
-        let end = start + lane_count;
-        vector_exp(
-            simd,
-            S::f64s::from_slice(simd, &values[start..end]) - maximum_vector,
-        )
-        .store_slice(&mut values[start..end]);
-    }
-    let tail = &mut values[vector_count * lane_count..];
-    if !tail.is_empty() {
-        let input = S::f64s::from_fn(simd, |lane| {
-            tail.get(lane).map_or(0.0_f64, |value| *value - maximum)
-        });
-        let output = vector_exp(simd, input);
-        tail.copy_from_slice(&output.as_slice()[..tail.len()]);
-    }
-    maximum
-}
-
 fn vector_exp<S: Simd>(simd: S, value: S::f64s) -> S::f64s {
     const LN_2_HIGH: f64 = 6.933_593_75e-1_f64;
     const LN_2_LOW: f64 = -2.121_944_400_546_905_8e-4_f64;
@@ -2757,304 +2190,6 @@ fn write_normalized_exponentials<S: Simd>(
         let exponential = vector_exp(simd, input) / total;
         output[vector_count * lane_count..].copy_from_slice(&exponential.as_slice()[..tail.len()]);
     }
-}
-
-fn convolution_axpy<S: Simd>(simd: S, coefficient: f64, values: &[f64], output: &mut [f64]) {
-    let lane_count = S::f64s::N;
-    let vector_count = values.len() / lane_count;
-    let coefficient = S::f64s::splat(simd, coefficient);
-    for vector in 0..vector_count {
-        let start = vector * lane_count;
-        let end = start + lane_count;
-        let value = S::f64s::from_slice(simd, &values[start..end]);
-        let current = S::f64s::from_slice(simd, &output[start..end]);
-        coefficient
-            .mul_add(value, current)
-            .store_slice(&mut output[start..end]);
-    }
-    for index in vector_count * lane_count..values.len() {
-        output[index] = coefficient.as_slice()[0].mul_add(values[index], output[index]);
-    }
-}
-
-fn vector_max<S: Simd>(simd: S, values: &[f64], initial: f64) -> f64 {
-    let lane_count = S::f64s::N;
-    let vector_count = values.len() / lane_count;
-    let mut maximum = S::f64s::splat(simd, initial);
-    for vector in 0..vector_count {
-        let start = vector * lane_count;
-        let end = start + lane_count;
-        maximum = maximum.max(S::f64s::from_slice(simd, &values[start..end]));
-    }
-    let mut result = maximum.as_slice().iter().copied().fold(initial, f64::max);
-    for value in &values[vector_count * lane_count..] {
-        result = result.max(*value);
-    }
-    result
-}
-
-fn vector_divide<S: Simd>(simd: S, values: &[f64], output: &mut [f64], divisor: f64) {
-    let lane_count = S::f64s::N;
-    let vector_count = values.len() / lane_count;
-    let divisor = S::f64s::splat(simd, divisor);
-    for vector in 0..vector_count {
-        let start = vector * lane_count;
-        let end = start + lane_count;
-        let value = S::f64s::from_slice(simd, &values[start..end]);
-        (value / divisor).store_slice(&mut output[start..end]);
-    }
-    for index in vector_count * lane_count..values.len() {
-        output[index] = values[index] / divisor.as_slice()[0];
-    }
-}
-
-#[cfg(test)]
-fn completion_log_likelihood_reference(
-    grid: &CapacityGrid,
-    index: usize,
-    history: RetainedHistory<'_>,
-    window: &ResourceWindow,
-    arrival_shape: f64,
-    arrival_rate_seconds: f64,
-    scratch: CompletionScratch<'_>,
-) -> f64 {
-    let CompletionScratch {
-        coefficients,
-        convolution,
-        binomial,
-        ..
-    } = scratch;
-    let completed = window.completed_attempts as usize;
-    if completed >= coefficients.len() {
-        return f64::NEG_INFINITY;
-    }
-    let delay = effective_service_time(grid, index, window.concurrency);
-    let target_end = delay + window.exposure_seconds();
-    let mut known_overlap = 0.0_f64;
-    let mut posterior_shape = arrival_shape;
-    let mut posterior_rate = arrival_rate_seconds;
-    let mut deterministic = 0_usize;
-    for offset in 0..history.length {
-        let history_index =
-            (history.head + history.windows.len() - 1 - offset) % history.windows.len();
-        let start_window = history.windows[history_index];
-        let age = Duration::from_micros(history.end_micros.saturating_sub(start_window.end_micros))
-            .as_secs_f64();
-        let window_end = age + start_window.exposure_seconds;
-        if let Some(starts) = start_window.started_attempts {
-            posterior_shape += f64::from(starts);
-            posterior_rate += start_window.exposure_seconds;
-            let overlap = (window_end.min(target_end) - age.max(delay)).max(0.0_f64);
-            known_overlap += overlap;
-            if overlap >= start_window.exposure_seconds {
-                deterministic = deterministic.saturating_add(starts as usize);
-            }
-        }
-    }
-    if deterministic > completed {
-        return f64::NEG_INFINITY;
-    }
-    let target = completed - deterministic;
-    coefficients[..=target].fill(0.0_f64);
-    coefficients[0] = 1.0_f64;
-    let mut degree = 0_usize;
-    let mut coefficient_log_scale = 0.0_f64;
-    for offset in 0..history.length {
-        let history_index =
-            (history.head + history.windows.len() - 1 - offset) % history.windows.len();
-        let start_window = history.windows[history_index];
-        let age = Duration::from_micros(history.end_micros.saturating_sub(start_window.end_micros))
-            .as_secs_f64();
-        let window_end = age + start_window.exposure_seconds;
-        if let Some(starts) = start_window.started_attempts {
-            let overlap = (window_end.min(target_end) - age.max(delay)).max(0.0_f64);
-            let probability = overlap / start_window.exposure_seconds;
-            if probability > 0.0_f64 && probability < 1.0_f64 {
-                let group_degree = (starts as usize).min(target);
-                let maximum = (0..=group_degree)
-                    .map(|count| binomial_log_probability_reference(starts, count, probability))
-                    .fold(f64::NEG_INFINITY, f64::max);
-                for (count, value) in binomial[..=group_degree].iter_mut().enumerate() {
-                    *value = (binomial_log_probability_reference(starts, count, probability)
-                        - maximum)
-                        .exp();
-                }
-                convolution[..=target].fill(0.0_f64);
-                for known in 0..=degree {
-                    let remaining = target - known;
-                    for added in 0..=group_degree.min(remaining) {
-                        convolution[known + added] += coefficients[known] * binomial[added];
-                    }
-                }
-                degree = target.min(degree + group_degree);
-                let scale = convolution[..=degree]
-                    .iter()
-                    .copied()
-                    .fold(0.0_f64, f64::max);
-                if scale <= 0.0_f64 {
-                    return f64::NEG_INFINITY;
-                }
-                for (coefficient, value) in coefficients[..=degree]
-                    .iter_mut()
-                    .zip(&convolution[..=degree])
-                {
-                    *coefficient = *value / scale;
-                }
-                coefficient_log_scale += maximum + scale.ln();
-            }
-        }
-    }
-    let missing = (window.exposure_seconds() - known_overlap).max(0.0_f64);
-    completion_probability_from_coefficients_reference(
-        coefficients,
-        degree,
-        target,
-        coefficient_log_scale,
-        posterior_shape,
-        posterior_rate,
-        missing,
-    )
-}
-
-#[cfg(test)]
-fn completion_probability_from_coefficients_reference(
-    coefficients: &[f64],
-    degree: usize,
-    target: usize,
-    coefficient_log_scale: f64,
-    posterior_shape: f64,
-    posterior_rate: f64,
-    missing: f64,
-) -> f64 {
-    if missing == 0.0_f64 {
-        return if target <= degree && coefficients[target] > 0.0_f64 {
-            coefficients[target].ln() + coefficient_log_scale
-        } else {
-            f64::NEG_INFINITY
-        };
-    }
-    let success = posterior_rate / (posterior_rate + missing);
-    let mut likelihood = f64::NEG_INFINITY;
-    for (known, coefficient) in coefficients.iter().enumerate().take(degree.min(target) + 1) {
-        if *coefficient > 0.0_f64 {
-            let missing_count = target - known;
-            likelihood = log_add_exp(
-                likelihood,
-                coefficient.ln()
-                    + coefficient_log_scale
-                    + negative_binomial_log_probability(posterior_shape, success, missing_count),
-            );
-        }
-    }
-    likelihood
-}
-
-#[cfg_attr(
-    feature = "hotpath",
-    hotpath::measure(label = "completion_probability_from_coefficients")
-)]
-fn completion_probability_from_coefficients(
-    coefficients: &[f64],
-    degree: usize,
-    target: usize,
-    tail: CompletionTail<'_>,
-) -> f64 {
-    let CompletionTail {
-        coefficient_log_scale,
-        posterior_shape,
-        posterior_rate,
-        missing,
-        ln_gamma_integers,
-    } = tail;
-    if missing == 0.0_f64 {
-        return if target <= degree && coefficients[target] > 0.0_f64 {
-            coefficients[target].ln() + coefficient_log_scale
-        } else {
-            f64::NEG_INFINITY
-        };
-    }
-    let success = posterior_rate / (posterior_rate + missing);
-    let shape_log_gamma = ln_gamma(posterior_shape);
-    let log_success = success.ln();
-    let log_failure = (-success).ln_1p();
-    let mut likelihood = f64::NEG_INFINITY;
-    let maximum_known = degree.min(target);
-    let target_float = f64::from(u32::try_from(target).unwrap_or(u32::MAX));
-    let mut count_shape_log_gamma =
-        DescendingLogGamma::new(ln_gamma(target_float + posterior_shape));
-    for (known, coefficient) in coefficients.iter().enumerate().take(maximum_known + 1) {
-        let missing_count = target - known;
-        if *coefficient > 0.0_f64 {
-            likelihood = log_add_exp(
-                likelihood,
-                coefficient.ln()
-                    + coefficient_log_scale
-                    + negative_binomial_log_probability_hoisted(
-                        posterior_shape,
-                        missing_count,
-                        shape_log_gamma,
-                        log_success,
-                        log_failure,
-                        ln_gamma_integers,
-                        count_shape_log_gamma.value,
-                    ),
-            );
-        }
-        if known < maximum_known {
-            count_shape_log_gamma = count_shape_log_gamma.previous(posterior_shape, missing_count);
-        }
-    }
-    likelihood
-}
-
-fn negative_binomial_log_probability_hoisted(
-    shape: f64,
-    count: usize,
-    shape_log_gamma: f64,
-    log_success: f64,
-    log_failure: f64,
-    ln_gamma_integers: &[f64],
-    count_shape_log_gamma: f64,
-) -> f64 {
-    let count_float = f64::from(u32::try_from(count).unwrap_or(u32::MAX));
-    count_shape_log_gamma - shape_log_gamma - ln_gamma_integers[count]
-        + shape * log_success
-        + count_float * log_failure
-}
-
-#[cfg(test)]
-fn binomial_log_probability(
-    trials: u32,
-    count: usize,
-    probability: f64,
-    ln_gamma_integers: &[f64],
-) -> f64 {
-    // Construction sizes the table for every reachable pure-death state.
-    let trials_index = trials as usize;
-    let trials_float = f64::from(trials);
-    let count_float = f64::from(u32::try_from(count).unwrap_or(u32::MAX));
-    ln_gamma_integers[trials_index]
-        - ln_gamma_integers[count]
-        - ln_gamma_integers[trials_index - count]
-        + count_float * probability.ln()
-        + (trials_float - count_float) * (-probability).ln_1p()
-}
-
-#[cfg(test)]
-fn binomial_log_probability_reference(trials: u32, count: usize, probability: f64) -> f64 {
-    let trials = f64::from(trials);
-    let count = f64::from(u32::try_from(count).unwrap_or(u32::MAX));
-    ln_gamma(trials + 1.0_f64) - ln_gamma(count + 1.0_f64) - ln_gamma(trials - count + 1.0_f64)
-        + count * probability.ln()
-        + (trials - count) * (-probability).ln_1p()
-}
-
-#[cfg(test)]
-fn negative_binomial_log_probability(shape: f64, success: f64, count: usize) -> f64 {
-    let count = f64::from(u32::try_from(count).unwrap_or(u32::MAX));
-    ln_gamma(count + shape) - ln_gamma(shape) - ln_gamma(count + 1.0_f64)
-        + shape * success.ln()
-        + count * (-success).ln_1p()
 }
 
 fn log_weighted_sum(weights: &[f64], log_values: &[f64]) -> f64 {

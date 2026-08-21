@@ -6,9 +6,9 @@ use prosody_scale_core::{
     ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort,
     CapacityClockCheck, CapacityGrid, Cohort, Configuration, ConfigurationError,
     DecisionDiagnostics, DecisionRejection, DemandClass, HoldReason, LaunchComponentSummary,
-    ModelTime, ObservationBuffer, OccupancyTransition, PosteriorQuery, RandomStream,
-    ReadinessGroupId, ReadinessLump, ReadinessObservation, RebalanceEvidence, ResourceWindow,
-    ScaleDecision, ScaleScratch, ScaleState, TransitionDirection, step,
+    ModelTime, ObservationBuffer, OccupancyTraceEvidence, OccupancyTransition, PosteriorQuery,
+    RandomStream, ReadinessGroupId, ReadinessLump, ReadinessObservation, RebalanceEvidence,
+    ResourceWindow, ScaleDecision, ScaleScratch, ScaleState, TransitionDirection, step,
 };
 #[cfg(test)]
 use statrs::distribution::{DiscreteCDF, Poisson};
@@ -2321,12 +2321,17 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         let arrival_predictive = self.arrival_prediction(context.now_micros)?;
         let partition_predictive = self.partition_prediction(context.now_micros)?;
         let lead_time_predictive = self.lead_time_prediction()?;
-        let capacity_predictive = self.capacity_prediction(context.now_micros)?;
-        let decision = step(
+        let capacity_sample = self.capacity_evidence_sample;
+        let diagnostic_seed = self.diagnostic_seed;
+        let observation = self.observation.observation();
+        let capacity_predictive = Self::capacity_prediction(
             &mut self.state,
-            &mut self.scratch,
-            self.observation.observation(),
-        );
+            capacity_sample,
+            diagnostic_seed,
+            context.now_micros,
+            observation.occupancy_trace_evidence(),
+        )?;
+        let decision = step(&mut self.state, &mut self.scratch, observation);
         let desired = context
             .history
             .desired_replicas(0)
@@ -2607,18 +2612,21 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure(label = "capacity_prediction"))]
-    fn capacity_prediction(&mut self, now_micros: u64) -> Result<CapacityPrediction, PlantError> {
-        let rank_offset = predictive_rank_offset(self.diagnostic_seed, now_micros);
-        match self.capacity_evidence_sample {
+    fn capacity_prediction(
+        state: &mut ScaleState,
+        sample: CapacityEvidenceSample,
+        diagnostic_seed: u64,
+        now_micros: u64,
+        evidence: Option<OccupancyTraceEvidence<'_>>,
+    ) -> Result<CapacityPrediction, PlantError> {
+        let rank_offset = predictive_rank_offset(diagnostic_seed, now_micros);
+        match sample {
             CapacityEvidenceSample::None => Ok(CapacityPrediction::missing()),
             CapacityEvidenceSample::Window(window) => {
-                let evidence = self
-                    .latest_capacity_window
-                    .ok_or(PlantError::MetricCapacity)?
-                    .evidence()?;
+                let evidence = evidence.ok_or(PlantError::MetricCapacity)?;
                 let observed = window.completed_attempts;
-                let summary = self.state.completion_predictive_summary(
-                    &evidence,
+                let summary = state.completion_predictive_summary(
+                    evidence,
                     observed,
                     [0.1_f64, 0.5_f64, 0.9_f64],
                 );

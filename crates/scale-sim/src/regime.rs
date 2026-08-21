@@ -373,21 +373,45 @@ fn validate_capacity_coverage(
 ) -> Result<(), RegimeValidationError> {
     let (capacity_window_count, capacity_covered_count) = capacity_coverage(run);
     if capacity_window_count >= 10 {
-        let coverage = count_as_f64(capacity_covered_count) / count_as_f64(capacity_window_count);
-        // The bar is one-sided. Under-coverage (ranks in the tails) marks a
-        // belief inconsistent with observation — the false-knee collapse
-        // scored 0.14 here. Over-coverage is not a defect: the plant
-        // completes work deterministically, so a calibrated Poisson
-        // predictive centers every rank and approaches full coverage. A
-        // two-sided bar would test the plant's dispersion, not the belief.
+        // Randomized ranks are uniform under a correct predictive. The central
+        // band has probability at least 0.8. Thus, the cover count is
+        // stochastically at least Binomial(n, 0.8). Alpha 0.01 is the stated
+        // false-red probability. At n = 10, the check accepts at least 5 covers.
         require_regime(
-            coverage >= 0.65_f64,
+            binomial_coverage_lower_tail(capacity_window_count, capacity_covered_count) > 0.01_f64,
             regime,
             experiment,
             "capacity predictive coverage fell below its stated probability",
         )?;
     }
     Ok(())
+}
+
+// The recurrence runs in the log domain: the linear-domain start value
+// 0.2^n underflows f64 near 440 windows and would force a false red.
+fn binomial_coverage_lower_tail(window_count: u64, covered_count: u64) -> f64 {
+    let mut log_mass = count_as_f64(window_count) * 0.2_f64.ln();
+    let mut log_cumulative = f64::NEG_INFINITY;
+    for covered in 0..=covered_count.min(window_count) {
+        log_cumulative = log_add_exp(log_cumulative, log_mass);
+        if covered < window_count {
+            log_mass +=
+                (count_as_f64(window_count - covered) * 4.0_f64 / count_as_f64(covered + 1)).ln();
+        }
+    }
+    log_cumulative.exp().min(1.0_f64)
+}
+
+fn log_add_exp(left: f64, right: f64) -> f64 {
+    let (low, high) = if left < right {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    if high == f64::NEG_INFINITY {
+        return f64::NEG_INFINITY;
+    }
+    high + (low - high).exp().ln_1p()
 }
 
 fn validate_closed_loop_stimulus(
