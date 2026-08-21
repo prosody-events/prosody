@@ -825,6 +825,10 @@ impl Plant {
 }
 
 impl<M: AttemptModel> Plant<M> {
+    pub(crate) fn partition_owners(&self) -> &[u32] {
+        &self.partition_owner
+    }
+
     /// Allocates all bounded plant memory with one regime calculation model.
     ///
     /// # Errors

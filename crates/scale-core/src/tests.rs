@@ -9,9 +9,7 @@ use thiserror::Error;
 use crate::arrival::{ArrivalEvidence, ArrivalFactor, ArrivalPrior};
 use crate::capacity::{CapacityFactor, log_normal_axis_masses};
 use crate::change_point::ChangePointKernel;
-use crate::controller::{
-    ScenarioRole, minimal_moved_partitions, mixed_event_supply, scenario_random, scenario_substream,
-};
+use crate::controller::{ScenarioRole, mixed_event_supply, scenario_random, scenario_substream};
 use crate::edf::{
     ArrivalPath, EdfOutcome, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
     evaluate_prepared_step, evaluate_prepared_trajectory, prepare, required_capacity_prepared,
@@ -1259,47 +1257,23 @@ fn partition_posterior_does_not_depend_on_evidence_segmentation() -> Result<(), 
 }
 
 #[test]
-fn moved_partition_draws_preserve_joint_skew_uncertainty() -> Result<(), TestError> {
+fn partition_share_draws_preserve_joint_skew_uncertainty() -> Result<(), TestError> {
     let mut factor = PartitionFactor::new(2)?;
     factor.update(&[1_000, 0]);
     let mut random = RandomStream::new(47);
-    let mut order = [0_u32; 2];
     let mut shares = [0.0_f64; 2];
-    let mut prefix = [0.0_f64; 3];
-    let mut minimum_one_moved = 1.0_f64;
-    let mut maximum_one_moved = 0.0_f64;
+    let mut minimum_first_share = 1.0_f64;
+    let mut maximum_first_share = 0.0_f64;
     for _ in 0_u32..128 {
-        factor.sample_moved_prefix(&mut random, &mut order, &mut shares, &mut prefix);
-        assert!(prefix[0] <= prefix[1] && prefix[1] <= prefix[2]);
-        assert!(close_relative(prefix[2], 1.0_f64));
-        minimum_one_moved = minimum_one_moved.min(prefix[1]);
-        maximum_one_moved = maximum_one_moved.max(prefix[1]);
+        factor.sample_shares(&mut random, &mut shares);
+        assert!(close_relative(shares.iter().sum(), 1.0_f64));
+        minimum_first_share = minimum_first_share.min(shares[0]);
+        maximum_first_share = maximum_first_share.max(shares[0]);
     }
 
-    assert!(minimum_one_moved < 0.1_f64);
-    assert!(maximum_one_moved > 0.9_f64);
+    assert!(minimum_first_share > 0.9_f64);
+    assert!(maximum_first_share > minimum_first_share);
     Ok(())
-}
-
-#[quickcheck]
-fn moved_partition_formula_matches_assignment_overlap(
-    partition_seed: u8,
-    current_seed: u8,
-    target_seed: u8,
-) -> bool {
-    let partitions = u32::from(partition_seed) + 1;
-    let current = u32::from(current_seed) % partitions + 1;
-    let target = u32::from(target_seed) % partitions + 1;
-    let common = current.min(target);
-    let overlap = (0..common)
-        .map(|owner| {
-            let current_count = partitions / current + u32::from(owner < partitions % current);
-            let target_count = partitions / target + u32::from(owner < partitions % target);
-            current_count.min(target_count)
-        })
-        .sum::<u32>();
-
-    minimal_moved_partitions(partitions, current, target) == partitions - overlap
 }
 
 #[test]

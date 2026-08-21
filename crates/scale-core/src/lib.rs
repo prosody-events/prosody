@@ -8,6 +8,7 @@
 pub const MODEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 mod arrival;
+mod assignment;
 mod capacity;
 mod change_point;
 /// The bounded controller state, scratch columns, and transition function.
@@ -24,6 +25,7 @@ pub use arrival::{
     ArrivalBoundaryDiagnostic, ArrivalCountPredictive, ArrivalEvidence, ArrivalPredictiveError,
     ArrivalPrior, ArrivalPriorError,
 };
+pub use assignment::{AssignmentError, sticky_assignment};
 pub use capacity::{
     CapacityClockCheck, CapacityCurve, CapacityGrid, CapacityGridError, CapacityModelError,
     CapacityPrior, CompletionPredictiveSummary, PosteriorError, ResourceWindow,

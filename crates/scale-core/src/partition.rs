@@ -143,39 +143,13 @@ impl PartitionFactor {
         (prior + maximum) / (prior_total + total)
     }
 
-    /// Draws one joint share vector in random partition order.
-    ///
-    /// Each output is the total share in the first `n` moved partitions.
-    pub(crate) fn sample_moved_prefix(
-        &self,
-        random: &mut RandomStream,
-        partition_order: &mut [u32],
-        share_draws: &mut [f64],
-        moved_prefix: &mut [f64],
-    ) {
-        assert_eq!(
-            partition_order.len(),
-            self.count_sums.len(),
-            "the order must contain each partition"
-        );
+    /// Draws one joint partition-share vector.
+    pub(crate) fn sample_shares(&self, random: &mut RandomStream, share_draws: &mut [f64]) {
         assert_eq!(
             share_draws.len(),
             self.count_sums.len(),
             "each partition must have one share draw"
         );
-        assert_eq!(
-            moved_prefix.len(),
-            self.count_sums.len() + 1,
-            "the prefix must include the empty subset"
-        );
-        for (partition, slot) in partition_order.iter_mut().enumerate() {
-            *slot = partition as u32;
-        }
-        for end in (1..partition_order.len()).rev() {
-            let bound = end as u32 + 1;
-            partition_order.swap(end, random.index_below(bound) as usize);
-        }
-
         let prior = JEFFREYS_CONCENTRATION;
         let total = loop {
             let mut total = 0.0_f64;
@@ -187,12 +161,9 @@ impl PartitionFactor {
                 break total;
             }
         };
-        moved_prefix[0] = 0.0_f64;
-        for (rank, &partition) in partition_order.iter().enumerate() {
-            let share = share_draws[partition as usize] / total;
-            moved_prefix[rank + 1] = (moved_prefix[rank] + share).min(1.0_f64);
+        for share in share_draws {
+            *share /= total;
         }
-        moved_prefix[self.count_sums.len()] = 1.0_f64;
     }
 
     pub(crate) const fn value_count(&self) -> u32 {

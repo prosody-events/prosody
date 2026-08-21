@@ -28,6 +28,7 @@ use crate::random::count_as_f64;
 #[cfg(test)]
 use crate::random::permuted_rank;
 use crate::reliability::{RELIABILITY_BIN_COUNT, ReliabilityFactor};
+use crate::sticky_assignment;
 use crate::types::{
     ActuationCommitments, BacklogColumns, CalendarForecast, CohortColumns, EventCohorts,
     POSTERIOR_SAMPLES_PER_CAPACITY_CLASS_MIN, ScheduledRelease, SlotSecondCohorts,
@@ -570,7 +571,8 @@ pub struct ScaleScratch {
     partition_offsets: Vec<u32>,
     partition_write_offsets: Vec<u32>,
     partition_cohort_indexes: Vec<u32>,
-    moved_partition_counts: Vec<u32>,
+    current_partition_owners: Vec<u32>,
+    termination_order: Vec<u32>,
     posterior_missed_work_sums: Vec<f64>,
     posterior_miss_delay_fraction_sums: Vec<f64>,
     posterior_late_area_sums: Vec<f64>,
@@ -638,11 +640,11 @@ struct ScenarioWorkspace {
     unassigned_cohorts: EventCohorts,
     prepared_placements: Vec<PreparedPlacement>,
     posterior_resource_supply: Vec<f64>,
-    partition_order: Vec<u32>,
     partition_share_draws: Vec<f64>,
-    moved_partition_share: Vec<f64>,
-    moved_partition_prefix_rows: Vec<f64>,
-    moved_partition_prefix_valid: Vec<bool>,
+    assignment: Vec<u32>,
+    target_assignment: Vec<u32>,
+    assignment_counts: Vec<u32>,
+    moved_partitions: Vec<bool>,
     launch_shocks: Vec<LaunchDurationShock>,
     rebalance_shocks: Vec<RebalanceDurationShock>,
     commitment_pause_micros: Vec<u64>,
@@ -727,7 +729,6 @@ struct ActiveTransition {
 
 #[derive(Clone, Copy)]
 struct TrajectoryPreparation {
-    candidate_count: usize,
     now_micros: u64,
 }
 
@@ -764,7 +765,8 @@ struct CandidateEvaluation<'a> {
 /// The decision-invariant inputs every scenario reads.
 struct ScenarioShared<'a> {
     resource_cohorts: &'a EventCohorts,
-    moved_partition_counts: &'a [u32],
+    current_partition_owners: &'a [u32],
+    termination_order: &'a [u32],
     partition_offsets: &'a [u32],
     partition_cohort_indexes: &'a [u32],
     partition_count: usize,
@@ -1009,17 +1011,11 @@ impl ScenarioWorkspace {
             unassigned_cohorts: EventCohorts::new(bounds.work_cohort_count_max),
             prepared_placements,
             posterior_resource_supply: vec![0.0_f64; bounds.replica_count_max],
-            partition_order: vec![0; bounds.partition_count],
             partition_share_draws: vec![0.0_f64; bounds.partition_count],
-            moved_partition_share: vec![0.0_f64; bounds.partition_offset_count],
-            moved_partition_prefix_rows: vec![
-                0.0_f64;
-                bounds
-                    .world_event_count_max
-                    .checked_mul(bounds.partition_offset_count)
-                    .ok_or(ConfigurationError::PlatformLimit)?
-            ],
-            moved_partition_prefix_valid: vec![false; bounds.world_event_count_max],
+            assignment: vec![0; bounds.partition_count],
+            target_assignment: vec![0; bounds.partition_count],
+            assignment_counts: vec![0; bounds.replica_count_max],
+            moved_partitions: vec![false; bounds.partition_count],
             launch_shocks: vec![LaunchDurationShock::placeholder(); bounds.world_event_count_max],
             rebalance_shocks: vec![
                 RebalanceDurationShock::placeholder();
@@ -1059,10 +1055,8 @@ impl ScaleScratch {
             ..
         } = &bounds;
         let candidate_concurrency = vec![0.0_f64; replica_count_max];
-        let moved_partition_counts = moved_partition_count_matrix(
-            configuration.partition_count,
-            configuration.replica_count_max,
-        )?;
+        let current_partition_owners = vec![0; partition_count];
+        let termination_order = (0..configuration.replica_count_max).rev().collect();
         let worker_count = rayon::current_num_threads()
             .min(posterior_sample_count)
             .max(1);
@@ -1075,7 +1069,8 @@ impl ScaleScratch {
             partition_offsets: vec![0; partition_offset_count],
             partition_write_offsets: vec![0; partition_count],
             partition_cohort_indexes: vec![0; work_cohort_count_max],
-            moved_partition_counts,
+            current_partition_owners,
+            termination_order,
             posterior_missed_work_sums: vec![0.0_f64; replica_count_max],
             posterior_miss_delay_fraction_sums: vec![0.0_f64; replica_count_max],
             posterior_late_area_sums: vec![0.0_f64; replica_count_max],
@@ -1282,6 +1277,7 @@ pub fn step(
         launch,
         rebalance,
         current_replicas,
+        partition_owners,
         actuation_commitments,
     } = observation;
     let elapsed = Duration::from_micros(
@@ -1324,6 +1320,13 @@ pub fn step(
     }
     if let Some(replicas) = current_replicas {
         state.current_replicas = replicas;
+    }
+    if let Some(owners) = partition_owners {
+        scratch.current_partition_owners.copy_from_slice(owners);
+    } else {
+        for (partition, owner) in scratch.current_partition_owners.iter_mut().enumerate() {
+            *owner = partition as u32 % state.current_replicas;
+        }
     }
 
     select_target(
@@ -1439,7 +1442,8 @@ fn evaluate_scenarios(
     };
     let shared = ScenarioShared {
         resource_cohorts: &scratch.resource_cohorts,
-        moved_partition_counts: &scratch.moved_partition_counts,
+        current_partition_owners: &scratch.current_partition_owners,
+        termination_order: &scratch.termination_order,
         partition_offsets: &scratch.partition_offsets,
         partition_cohort_indexes: &scratch.partition_cohort_indexes,
         partition_count: scratch.partition_write_offsets.len(),
@@ -2141,7 +2145,10 @@ fn prepare_supply_trajectories(
 ) {
     let current_supply = draws.current_supply;
     let candidate_count = workspace.posterior_resource_supply.len();
-    workspace.moved_partition_prefix_valid.fill(false);
+    let mut placement_random = draws.placement_random.clone();
+    state
+        .partition_placement
+        .sample_shares(&mut placement_random, &mut workspace.partition_share_draws);
     prepare_world_shocks(workspace, draws);
     let now_micros = sample_commitment_pauses(
         state,
@@ -2186,6 +2193,9 @@ fn prepare_candidate_trajectories(
     clear_trajectory(&mut workspace.trajectory);
     workspace.trajectory_offsets[0] = 0;
     for candidate_index in 0..candidate_count {
+        workspace
+            .assignment
+            .copy_from_slice(shared.current_partition_owners);
         let candidate = candidate_index as u32 + 1;
         let (first, fixed_event_count, committed_replicas) = push_candidate_events(
             state,
@@ -2218,10 +2228,7 @@ fn prepare_candidate_trajectories(
                 draws,
                 read,
                 &mut active,
-                TrajectoryPreparation {
-                    candidate_count,
-                    now_micros,
-                },
+                TrajectoryPreparation { now_micros },
             );
         }
         workspace.trajectory.targets.truncate(active.write);
@@ -2238,7 +2245,6 @@ fn prepare_candidate_trajectories(
             state,
             shared,
             workspace,
-            draws,
             shared.mean_trajectory,
             ReactiveTransition {
                 replicas: active.replicas,
@@ -2284,27 +2290,13 @@ fn write_trajectory_event(
     let world_event = workspace.trajectory.world_events[read];
     let sampled_ready =
         sampled_membership_ready(state, workspace, draws, world_event, pause, ready_override);
-    let moved = shared.moved_partition_counts
-        [(active.replicas as usize - 1) * preparation.candidate_count + target as usize - 1];
-    // A clipped commitment can keep membership unchanged. Its readiness still
-    // gates the successor repair.
+    let (moved, moved_share) = transition_moved_share(shared, workspace, target);
     let ready = if target == active.replicas {
-        sampled_ready
+        pause
     } else {
         membership_ready(direction, moved, pause, sampled_ready)
     };
-    if let Some(event) = world_event {
-        sample_moved_partition_prefix(state, workspace, draws, event);
-    } else {
-        let mut random = draws.placement_random.clone().domain(pause);
-        state.partition_placement.sample_moved_prefix(
-            &mut random,
-            &mut workspace.partition_order,
-            &mut workspace.partition_share_draws,
-            &mut workspace.moved_partition_share,
-        );
-    }
-    let retained = 1.0_f64 - workspace.moved_partition_share[moved as usize];
+    let retained = 1.0_f64 - moved_share;
     workspace.trajectory.targets[active.write] = target;
     workspace.trajectory.pause_micros[active.write] = pause;
     workspace.trajectory.ready_override_micros[active.write] = ready_override;
@@ -2329,6 +2321,37 @@ fn clear_trajectory(trajectory: &mut TrajectoryColumns) {
     trajectory.ready_boundaries.clear();
     trajectory.during_supply.clear();
     trajectory.after_supply.clear();
+}
+
+fn transition_moved_share(
+    shared: &ScenarioShared<'_>,
+    workspace: &mut ScenarioWorkspace,
+    target: u32,
+) -> (u32, f64) {
+    let result = sticky_assignment(
+        &workspace.assignment,
+        target,
+        shared.termination_order,
+        &mut workspace.target_assignment,
+        &mut workspace.assignment_counts,
+        &mut workspace.moved_partitions,
+    );
+    assert!(
+        result.is_ok(),
+        "the observed assignment must satisfy its configured bounds: {result:?}, target {target}"
+    );
+    let mut count = 0_u32;
+    let mut share = 0.0_f64;
+    for (partition, moved) in workspace.moved_partitions.iter().copied().enumerate() {
+        if moved {
+            count += 1;
+            share += workspace.partition_share_draws[partition];
+        }
+    }
+    workspace
+        .assignment
+        .copy_from_slice(&workspace.target_assignment);
+    (count, share.min(1.0_f64))
 }
 
 const fn membership_ready(
@@ -2375,7 +2398,7 @@ fn push_candidate_events(
     };
     for commitment_index in 0..actuation_commitments.launching_len() {
         let commitment_direction = actuation_commitments.launching_direction(commitment_index);
-        if candidate_direction.is_some_and(|direction| direction != commitment_direction)
+        if candidate_direction.is_none_or(|direction| direction != commitment_direction)
             || workspace.commitment_pause_micros[commitment_index] == u64::MAX
         {
             continue;
@@ -2440,7 +2463,6 @@ fn append_reactive_repairs(
     state: &ScaleState,
     shared: &ScenarioShared<'_>,
     workspace: &mut ScenarioWorkspace,
-    draws: &ScenarioDraws,
     mean_trajectory: MeanRateTrajectory<'_>,
     mut transition: ReactiveTransition,
 ) {
@@ -2465,7 +2487,7 @@ fn append_reactive_repairs(
         if requested_micros < transition.ready_micros {
             continue;
         }
-        append_reactive_repair(state, shared, workspace, draws, repair, &mut transition);
+        append_reactive_repair(state, shared, workspace, repair, &mut transition);
     }
     if let Some(mut repair) = final_repair
         && repair.requested_micros < transition.ready_micros
@@ -2477,7 +2499,7 @@ fn append_reactive_repairs(
             .div_ceil(report_interval);
         repair.requested_micros =
             now_micros.saturating_add(report_count.saturating_mul(report_interval));
-        append_reactive_repair(state, shared, workspace, draws, repair, &mut transition);
+        append_reactive_repair(state, shared, workspace, repair, &mut transition);
     }
 }
 
@@ -2485,12 +2507,10 @@ fn append_reactive_repair(
     state: &ScaleState,
     shared: &ScenarioShared<'_>,
     workspace: &mut ScenarioWorkspace,
-    draws: &ScenarioDraws,
     repair: ReactiveRepair,
     transition: &mut ReactiveTransition,
 ) {
     let action_count = shared.action_count;
-    let candidate_count = workspace.posterior_resource_supply.len();
     let target = repair_target(
         &workspace.posterior_resource_supply[..action_count],
         repair.rate,
@@ -2514,8 +2534,7 @@ fn append_reactive_repair(
             direction,
             replica_delta,
         )));
-    let moved = shared.moved_partition_counts
-        [(transition.replicas as usize - 1) * candidate_count + target as usize - 1];
+    let (moved, moved_share) = transition_moved_share(shared, workspace, target);
     let repair_ready_micros = if direction == TransitionDirection::Down && moved == 0 {
         pause_micros
     } else {
@@ -2525,8 +2544,7 @@ fn append_reactive_repair(
             repair.world_event,
         )))
     };
-    sample_moved_partition_prefix(state, workspace, draws, repair.world_event);
-    let retained = 1.0_f64 - workspace.moved_partition_share[moved as usize];
+    let retained = 1.0_f64 - moved_share;
     let after = workspace.posterior_resource_supply[target as usize - 1];
     workspace.trajectory.targets.push(target);
     workspace
@@ -2709,42 +2727,6 @@ fn sampled_membership_ready(
     )
 }
 
-#[cfg_attr(
-    feature = "hotpath",
-    hotpath::measure(label = "sample_moved_partition_prefix")
-)]
-fn sample_moved_partition_prefix(
-    state: &ScaleState,
-    workspace: &mut ScenarioWorkspace,
-    draws: &ScenarioDraws,
-    world_event: WorldEvent,
-) {
-    let ordinal = world_event.index();
-    let row_width = workspace.moved_partition_share.len();
-    let first = ordinal * row_width;
-    let last = first + row_width;
-    if workspace.moved_partition_prefix_valid[ordinal] {
-        workspace
-            .moved_partition_share
-            .copy_from_slice(&workspace.moved_partition_prefix_rows[first..last]);
-        return;
-    }
-    let mut random = draws
-        .placement_random
-        .clone()
-        .domain(world_event.report_boundary as u64)
-        .domain(world_event.role as u64);
-    state.partition_placement.sample_moved_prefix(
-        &mut random,
-        &mut workspace.partition_order,
-        &mut workspace.partition_share_draws,
-        &mut workspace.moved_partition_share,
-    );
-    workspace.moved_partition_prefix_rows[first..last]
-        .copy_from_slice(&workspace.moved_partition_share);
-    workspace.moved_partition_prefix_valid[ordinal] = true;
-}
-
 fn sort_trajectory_events(trajectory: &mut TrajectoryColumns, first: usize) {
     for mut event in first + 1..trajectory.targets.len() {
         while event > first && trajectory.pause_micros[event] < trajectory.pause_micros[event - 1] {
@@ -2760,44 +2742,6 @@ fn sort_trajectory_events(trajectory: &mut TrajectoryColumns, first: usize) {
 
 fn seconds_to_micros(seconds: f64) -> u64 {
     (seconds * 1_000_000.0_f64) as u64
-}
-
-pub(crate) fn minimal_moved_partitions(partitions: u32, current: u32, target: u32) -> u32 {
-    assert!(
-        partitions > 0 && current > 0 && target > 0,
-        "partition and replica counts are one-based"
-    );
-    let current = current.min(partitions);
-    let target = target.min(partitions);
-    let common = current.min(target);
-    let current_base = partitions / current;
-    let target_base = partitions / target;
-    let current_extra = partitions % current;
-    let target_extra = partitions % target;
-    let overlap = match current_base.cmp(&target_base) {
-        Ordering::Less => common * current_base + common.min(current_extra),
-        Ordering::Greater => common * target_base + common.min(target_extra),
-        Ordering::Equal => common * current_base + common.min(current_extra).min(target_extra),
-    };
-    partitions.saturating_sub(overlap)
-}
-
-fn moved_partition_count_matrix(
-    partitions: u32,
-    replica_count_max: u32,
-) -> Result<Vec<u32>, ConfigurationError> {
-    let replica_count =
-        usize::try_from(replica_count_max).map_err(|_| ConfigurationError::PlatformLimit)?;
-    let cell_count = replica_count
-        .checked_mul(replica_count)
-        .ok_or(ConfigurationError::PlatformLimit)?;
-    let mut counts = Vec::with_capacity(cell_count);
-    for current in 1..=replica_count_max {
-        for target in 1..=replica_count_max {
-            counts.push(minimal_moved_partitions(partitions, current, target));
-        }
-    }
-    Ok(counts)
 }
 
 #[cfg_attr(feature = "hotpath", hotpath::measure(label = "prepare_work_cohorts"))]

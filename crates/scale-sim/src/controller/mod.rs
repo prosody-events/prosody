@@ -1793,6 +1793,8 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             self.inflight_transitions[index].from_replicas
         });
         self.observation.set_current_replicas(ready_replicas)?;
+        self.observation
+            .set_partition_owners(context.partition_owners)?;
         if let Some(calendar) = calendar {
             self.observation.set_calendar_forecast(
                 calendar.artifact(),

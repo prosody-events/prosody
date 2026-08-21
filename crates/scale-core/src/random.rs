@@ -123,19 +123,6 @@ impl RandomStream {
         (exact + 0.5_f64) * UNIT_SCALE
     }
 
-    /// Returns an unbiased integer below a positive bound.
-    pub(crate) fn index_below(&mut self, bound: u32) -> u32 {
-        assert!(bound > 0, "a random index bound must be positive");
-        let bound = u64::from(bound);
-        let threshold = bound.wrapping_neg() % bound;
-        loop {
-            let product = u128::from(self.next_u64()) * u128::from(bound);
-            if product as u64 >= threshold {
-                return (product >> 64) as u32;
-            }
-        }
-    }
-
     /// Returns the next counter value.
     #[must_use]
     pub const fn counter(&self) -> u64 {

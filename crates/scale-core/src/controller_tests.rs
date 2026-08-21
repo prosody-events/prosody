@@ -1,13 +1,13 @@
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
+use std::time::Duration;
 use thiserror::Error;
 
 use super::{
-    SCHEDULED_PARTITION, ScenarioDraws, ScenarioRole, ScenarioWorkspace, ScratchBounds,
-    TransitionRole, WorldEvent, balanced_partition_owner, balanced_partition_range,
-    partition_replica_capacity, prepare_work_cohorts, prepare_world_shocks, repair_target,
-    sample_moved_partition_prefix, scenario_event_count, scenario_horizons, scenario_quantile,
-    scenario_random,
+    SCHEDULED_PARTITION, ScenarioDraws, ScenarioRole, ScenarioWorkspace, ScratchBounds, WorldEvent,
+    balanced_partition_owner, balanced_partition_range, partition_replica_capacity,
+    prepare_work_cohorts, prepare_world_shocks, repair_target, scenario_event_count,
+    scenario_horizons, scenario_quantile, scenario_random,
 };
 use crate::arrival::MeanRateTrajectory;
 use crate::edf::{
@@ -18,10 +18,155 @@ use crate::types::{EventCohorts, SlotSecondCohorts};
 use crate::{
     ActuationCommitment, ArrivalPrior, ArrivalPriorError, BacklogCohort, CapacityGrid,
     CapacityGridError, CapacityPrior, Configuration, ConfigurationError, DecisionCurveError,
-    DemandClass, LaunchPrior, ModelTime, ObservationBuffer, ObservationError, PosteriorError,
-    PosteriorQuery, RebalancePrior, ReliabilityPrior, ScaleDecision, ScaleScratch, ScaleState,
-    ScheduledRelease, ServiceObjective, step,
+    DemandClass, LaunchPrior, ModelTime, ObservationBuffer, ObservationError, OccupancyTransition,
+    PosteriorError, PosteriorQuery, RebalancePrior, ReliabilityPrior, ResourceWindow,
+    ScaleDecision, ScaleScratch, ScaleState, ScheduledRelease, ServiceObjective, step,
 };
+
+struct I27Measurement {
+    replica_seconds: [f64; 8],
+    costs: [f64; 8],
+    candidate_eight_has_target_eight_event: bool,
+}
+
+#[test]
+fn committed_eight_prices_only_the_honest_replica_margin() -> Result<(), TestError> {
+    let measurement = i27_measurement(Some((7, 8)), 0.02_f64, 12)?;
+    assert_eq!(argmin(&measurement.costs), 0);
+    assert!(!measurement.candidate_eight_has_target_eight_event);
+    let replica_margin =
+        3.0_f64 * (measurement.replica_seconds[7] - measurement.replica_seconds[0]);
+    assert!((replica_margin - 47.197_503_f64).abs() < 0.01_f64);
+    assert!(measurement.costs[0] < measurement.costs[7]);
+    Ok(())
+}
+
+#[test]
+fn inflight_descent_prices_only_the_honest_replica_margin() -> Result<(), TestError> {
+    let measurement = i27_measurement(Some((8, 1)), 0.02_f64, 12)?;
+    assert!(measurement.costs[0] < measurement.costs[7]);
+    Ok(())
+}
+
+fn argmin(values: &[f64]) -> usize {
+    values
+        .iter()
+        .enumerate()
+        .min_by(|left, right| left.1.total_cmp(right.1))
+        .map_or(0, |(index, _)| index)
+}
+
+fn i27_measurement(
+    commitment: Option<(u32, u32)>,
+    service_seconds: f64,
+    seasoning_ticks: u64,
+) -> Result<I27Measurement, TestError> {
+    let (mut state, mut scratch, mut observation) = i27_model(service_seconds)?;
+    for tick in 1_u64..=seasoning_ticks {
+        observation.clear();
+        let now = tick * 1_000_000;
+        observation.advance_model_time(ModelTime::from_micros(now))?;
+        let mut partition_arrivals = [0_u32; 64];
+        partition_arrivals[0] = u32::MAX;
+        observation.set_partition_arrivals(&partition_arrivals, 1_000_000)?;
+        observation.set_resource_observation(
+            ResourceWindow::new_with_starts(32.0_f64, 1.0_f64, 300, 300)?,
+            32,
+            32,
+            &[OccupancyTransition::new(500_000, 300, 300)],
+        )?;
+        let evidence = observation.observation();
+        if let Some(arrivals) = evidence.arrivals {
+            state.arrivals.update(arrivals, None, 1_000_000);
+        }
+        if let Some(partitions) = evidence.partition_arrivals {
+            state.partition_placement.update(partitions.consume());
+        }
+        if let Some(resource) = evidence.resource {
+            state.capacity.update(resource, Duration::from_secs(1));
+        }
+        state.model_time = ModelTime::from_micros(now);
+    }
+    observation.clear();
+    let decision_micros = seasoning_ticks.saturating_add(1).saturating_mul(1_000_000);
+    observation.advance_model_time(ModelTime::from_micros(decision_micros))?;
+    observation.set_arrivals(500, 1_000_000)?;
+    observation.set_resource_observation(
+        ResourceWindow::new_with_starts(32.0_f64, 1.0_f64, 500, 500)?,
+        32,
+        32,
+        &[OccupancyTransition::new(500_000, 500, 500)],
+    )?;
+    observation.set_current_replicas(8)?;
+    let owners = (0_u32..64)
+        .map(|partition| partition % 8)
+        .collect::<Vec<_>>();
+    observation.set_partition_owners(&owners)?;
+    observation.set_backlog(BacklogCohort::new(
+        decision_micros,
+        decision_micros.saturating_sub(1_000_000),
+        1_800,
+        0,
+        DemandClass::Normal,
+    )?)?;
+    if let Some((from, target)) = commitment {
+        observation.push_actuation_commitment(ActuationCommitment::launching(
+            from,
+            target,
+            ModelTime::from_micros(decision_micros.saturating_sub(1_000_000)),
+        )?)?;
+    }
+    let _ = step(&mut state, &mut scratch, observation.observation());
+    let mut costs = [0.0_f64; 8];
+    scratch.write_decision_expected_costs(&mut costs)?;
+    let mut replica_seconds = [0.0_f64; 8];
+    replica_seconds.copy_from_slice(&scratch.posterior_replica_seconds_sums[..8]);
+    let workspace = &scratch.scenario_workspaces[0];
+    let first = workspace.trajectory_offsets[7] as usize;
+    let last = workspace.trajectory_offsets[8] as usize;
+    let candidate_eight_has_target_eight_event =
+        workspace.trajectory.targets[first..last].contains(&8);
+    Ok(I27Measurement {
+        replica_seconds,
+        costs,
+        candidate_eight_has_target_eight_event,
+    })
+}
+
+fn i27_model(
+    service_seconds: f64,
+) -> Result<(ScaleState, ScaleScratch, ObservationBuffer), TestError> {
+    let configuration = Configuration {
+        cohort_count_max: 64,
+        calendar_segment_count_max: 64,
+        scheduled_release_count_max: 64,
+        readiness_lump_count_max: 14,
+        partition_count: 64,
+        replica_count_max: 8,
+        slots_per_replica: 32,
+        posterior_sample_count: 256,
+        report_interval_micros: 1_000_000,
+        resource_window_attempt_count_max: 100_000,
+        resource_window_group_count_max: 64,
+        failure_service_weight: 0.3_f64,
+        arrival_prior: ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?,
+        capacity_change_rate_per_second: 1.0_f64 / 300.0_f64,
+        reliability_prior: ReliabilityPrior::authored()?,
+        launch_time_prior: LaunchPrior::kubernetes()?,
+        rebalance_time_prior: RebalancePrior::kip848()?,
+        objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
+    };
+    let grid = CapacityGrid::new_with_prior(
+        &[service_seconds],
+        &[10_000.0_f64],
+        &[0.0_f64],
+        CapacityPrior::LogUniform,
+    )?;
+    let state = ScaleState::new(configuration.clone(), grid)?;
+    let scratch = state.new_scratch()?;
+    let observation = ObservationBuffer::new(&configuration)?;
+    Ok((state, scratch, observation))
+}
 
 #[quickcheck]
 fn balanced_partition_ranges_match_owner_order(partition_seed: u8, replica_seed: u8) -> bool {
@@ -38,52 +183,6 @@ fn balanced_partition_ranges_match_owner_order(partition_seed: u8, replica_seed:
                 replica,
             ))
     })
-}
-
-#[test]
-fn moved_partition_prefix_cache_matches_world_event_draw() -> Result<(), TestError> {
-    let (state, _scratch, _observation) = test_model()?;
-    let bounds = ScratchBounds::new(state.configuration())?;
-    let mut workspace = ScenarioWorkspace::new(&bounds)?;
-    let placement_random = scenario_random(11, 256, ScenarioRole::Placement);
-    let draws = ScenarioDraws {
-        current_supply: 1.0_f64,
-        lead_random: placement_random.clone(),
-        rebalance_random: placement_random.clone(),
-        placement_random: placement_random.clone(),
-        commitment_random: placement_random.clone(),
-    };
-    let event = WorldEvent::repair(1);
-    sample_moved_partition_prefix(&state, &mut workspace, &draws, event);
-    let first = workspace.moved_partition_share.clone();
-    sample_moved_partition_prefix(&state, &mut workspace, &draws, event);
-
-    let mut order = vec![0; bounds.partition_count];
-    let mut shares = vec![0.0_f64; bounds.partition_count];
-    let mut expected = vec![0.0_f64; bounds.partition_offset_count];
-    let mut random = placement_random
-        .domain(event.report_boundary as u64)
-        .domain(TransitionRole::ReactiveRepair as u64);
-    state.partition_placement.sample_moved_prefix(
-        &mut random,
-        &mut order,
-        &mut shares,
-        &mut expected,
-    );
-    assert!(
-        first
-            .iter()
-            .zip(&expected)
-            .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
-    );
-    assert!(
-        workspace
-            .moved_partition_share
-            .iter()
-            .zip(&expected)
-            .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
-    );
-    Ok(())
 }
 
 #[quickcheck]
@@ -250,14 +349,10 @@ fn idle_pending_descent_cost_ladder_selects_one() -> Result<(), TestError> {
     }
     let mut costs = vec![0.0_f64; scratch.decision_candidate_count()];
     scratch.write_decision_expected_costs(&mut costs)?;
-    let increments = costs
-        .windows(2)
-        .map(|pair| pair[1] - pair[0])
-        .collect::<Vec<_>>();
-    assert!(
-        increments.iter().all(|increment| *increment > 0.0_f64),
-        "costs={costs:?}, increments={increments:?}"
-    );
+    // One plant draw gives -20.33 for cancel and reissue. The expected model
+    // includes a positive one-boundary premium.
+    assert_eq!(argmin(&costs), 0, "costs={costs:?}");
+    assert!(costs[7] > costs[0], "costs={costs:?}");
     Ok(())
 }
 
@@ -714,5 +809,7 @@ enum TestError {
     Observation(#[from] ObservationError),
     #[error(transparent)]
     Posterior(#[from] PosteriorError),
+    #[error(transparent)]
+    ResourceWindow(#[from] crate::ResourceWindowError),
 }
 use std::num::TryFromIntError;

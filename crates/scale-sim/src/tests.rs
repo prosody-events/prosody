@@ -4,6 +4,7 @@ use std::iter::repeat;
 use prosody_scale_core::{
     ArrivalPrior, ArrivalPriorError, CapacityGrid, Configuration as ControllerConfiguration,
     LaunchPrior, PosteriorQuery, RandomStream, RebalancePrior, ReliabilityPrior, ServiceObjective,
+    sticky_assignment as model_assignment,
 };
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
@@ -1937,6 +1938,124 @@ fn pending_pod_readiness_does_not_pause_existing_work() -> Result<(), TestError>
     assert_eq!(first_dispatch, 10_000);
     assert!(first.settle_micros < actuation.ready_micros);
     assert!(later_dispatch >= actuation.ready_micros);
+    Ok(())
+}
+
+#[test]
+fn target_eight_cancels_pending_down_without_reconciliation() -> Result<(), TestError> {
+    let configuration = PlantConfiguration::new(64, 1, 1, 4, 32, 1)?.with_rebalance(10, 90);
+    let mut plant = Plant::new(configuration, 8)?;
+    plant.replace_scale_target(ScaleChange {
+        at_micros: 10,
+        replicas: 1,
+    })?;
+    plant.replace_scale_target(ScaleChange {
+        at_micros: 11,
+        replicas: 8,
+    })?;
+
+    let after = plant.advance_until(1_000_000);
+
+    assert_eq!(after.replicas, 8);
+    assert_eq!(after.paused_partitions, 0);
+    assert_eq!(after.rebalance_pause_micros, 0);
+    assert_eq!(after.reconciliation_started_micros, None);
+    assert_eq!(after.reconciliation_completed_micros, None);
+    Ok(())
+}
+
+#[quickcheck]
+fn assignment_model_matches_plant_sticky_rule(
+    partition_seed: u8,
+    initial_seed: u8,
+    targets: Vec<u8>,
+) -> TestResult {
+    let partition_count = usize::from(partition_seed % 64 + 1);
+    let replica_max = partition_count.min(8);
+    let initial = u32::from(initial_seed) % replica_max as u32 + 1;
+    let mut current = super::initial_assignment(partition_count, initial);
+    let mut plant_target = vec![0; partition_count];
+    let mut model_target = vec![0; partition_count];
+    let mut plant_counts = vec![0; replica_max];
+    let mut model_counts = vec![0; replica_max];
+    let mut model_moved = vec![false; partition_count];
+    let termination_order = (0..replica_max as u32).rev().collect::<Vec<_>>();
+    for seed in targets.into_iter().take(32) {
+        let target = u32::from(seed) % replica_max as u32 + 1;
+        super::sticky_assignment(&current, target, &mut plant_target, &mut plant_counts);
+        if let Err(error) = model_assignment(
+            &current,
+            target,
+            &termination_order,
+            &mut model_target,
+            &mut model_counts,
+            &mut model_moved,
+        ) {
+            return TestResult::error(error.to_string());
+        }
+        let plant_moved = current
+            .iter()
+            .zip(&plant_target)
+            .map(|(before, after)| before != after);
+        if model_target != plant_target || !model_moved.iter().copied().eq(plant_moved) {
+            return TestResult::failed();
+        }
+        current.copy_from_slice(&plant_target);
+    }
+    TestResult::passed()
+}
+
+#[test]
+fn seasoned_idle_cancel_and_reissue_bills_the_plant_transition() -> Result<(), TestError> {
+    const FRESH_READY_MICROS: u64 = 28_964_442;
+    const RESIDUAL_READY_MICROS: u64 = 30_932_467;
+    const REPORT_MICROS: u64 = 1_000_000;
+    const WINDOW_MICROS: u64 = 32_000_000;
+    let configuration = PlantConfiguration::new(64, 1, 1, 8, 32, 1)?.with_rebalance(0, 0);
+
+    let mut continued = Plant::new(configuration.clone(), 8)?;
+    continued.replace_scale_target(ScaleChange {
+        at_micros: RESIDUAL_READY_MICROS,
+        replicas: 1,
+    })?;
+    continued.replace_scale_target(ScaleChange {
+        at_micros: RESIDUAL_READY_MICROS,
+        replicas: 1,
+    })?;
+
+    let mut reissued = Plant::new(configuration.clone(), 8)?;
+    reissued.replace_scale_target(ScaleChange {
+        at_micros: RESIDUAL_READY_MICROS,
+        replicas: 1,
+    })?;
+    reissued.replace_scale_target(ScaleChange {
+        at_micros: 0,
+        replicas: 8,
+    })?;
+    let reissued_ready_micros = REPORT_MICROS.saturating_add(FRESH_READY_MICROS);
+    reissued.replace_scale_target(ScaleChange {
+        at_micros: reissued_ready_micros,
+        replicas: 1,
+    })?;
+
+    let mut held = Plant::new(configuration, 8)?;
+    held.replace_scale_target(ScaleChange {
+        at_micros: RESIDUAL_READY_MICROS,
+        replicas: 1,
+    })?;
+    held.replace_scale_target(ScaleChange {
+        at_micros: 0,
+        replicas: 8,
+    })?;
+
+    assert_eq!(continued.advance_until(RESIDUAL_READY_MICROS).replicas, 1);
+    assert_eq!(reissued.advance_until(reissued_ready_micros).replicas, 1);
+    assert_eq!(held.advance_until(WINDOW_MICROS).replicas, 8);
+    let continued_seconds = 32.0_f64 + 7.0_f64 * 30.932_467_f64;
+    let reissued_seconds = 32.0_f64 + 7.0_f64 * 29.964_442_f64;
+    let held_seconds = 8.0_f64 * 32.0_f64;
+    assert!(held_seconds > continued_seconds);
+    assert!(reissued_seconds < continued_seconds);
     Ok(())
 }
 

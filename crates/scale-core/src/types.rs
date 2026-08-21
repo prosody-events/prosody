@@ -1305,6 +1305,7 @@ pub struct GroupObservation<'a> {
     pub(crate) launch: Option<LaunchEvidence<'a>>,
     pub(crate) rebalance: Option<RebalanceEvidence>,
     pub(crate) current_replicas: Option<u32>,
+    pub(crate) partition_owners: Option<&'a [u32]>,
     pub(crate) actuation_commitments: &'a ActuationCommitments,
 }
 
@@ -1479,6 +1480,8 @@ pub struct ObservationBuffer {
     rebalance: Option<RebalanceEvidence>,
     rebalance_cursor: Option<ModelTime>,
     current_replicas: Option<u32>,
+    partition_owners: Vec<u32>,
+    has_partition_owners: bool,
     actuation_commitments: ActuationCommitments,
     model_time: ModelTime,
     deadline_offset_max_micros: u64,
@@ -1553,6 +1556,8 @@ impl ObservationBuffer {
             rebalance: None,
             rebalance_cursor: None,
             current_replicas: None,
+            partition_owners: vec![0; partition_count],
+            has_partition_owners: false,
             actuation_commitments: ActuationCommitments::new(replica_count_max),
             model_time: ModelTime::from_micros(0),
             deadline_offset_max_micros,
@@ -1593,6 +1598,7 @@ impl ObservationBuffer {
         self.readiness_lumps.clear();
         self.rebalance = None;
         self.current_replicas = None;
+        self.has_partition_owners = false;
         self.actuation_commitments.clear();
     }
 
@@ -2075,6 +2081,22 @@ impl ObservationBuffer {
         Ok(())
     }
 
+    /// Sets the current partition-to-owner map.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the map does not match the configured bounds.
+    pub fn set_partition_owners(&mut self, owners: &[u32]) -> Result<(), ObservationError> {
+        if owners.len() != self.partition_owners.len()
+            || owners.iter().any(|owner| *owner >= self.replica_count_max)
+        {
+            return Err(ObservationError::PartitionOwner);
+        }
+        self.partition_owners.copy_from_slice(owners);
+        self.has_partition_owners = true;
+        Ok(())
+    }
+
     /// Adds one observed incomplete replica transition.
     ///
     /// # Errors
@@ -2157,6 +2179,7 @@ impl ObservationBuffer {
             }),
             rebalance: self.rebalance.take(),
             current_replicas: self.current_replicas.take(),
+            partition_owners: self.has_partition_owners.then_some(&self.partition_owners),
             actuation_commitments: &self.actuation_commitments,
         }
     }
@@ -2407,6 +2430,9 @@ pub enum ObservationError {
     /// A warm replica count is outside the configured range.
     #[error("the current replica count is outside the configured range")]
     ReplicaCount,
+    /// A partition owner map does not match the configured bounds.
+    #[error("the partition owner map does not match the configured bounds")]
+    PartitionOwner,
     /// An evidence counter exceeded its fixed representation.
     #[error("an evidence count exceeds u32")]
     CountOverflow,

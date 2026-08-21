@@ -18,6 +18,8 @@ pub struct TickContext<'a> {
     pub tick_index: u32,
     /// Plant state before new demand enters.
     pub plant: PlantSnapshot,
+    /// Current owner for each partition.
+    pub partition_owners: &'a [u32],
     /// Prior tick values in newest-first order.
     pub history: TickHistoryView<'a>,
     /// Current observable Normal backlog.
@@ -903,6 +905,7 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
                 now_micros,
                 tick_index: self.tick_index,
                 plant,
+                partition_owners: &[],
                 history: self.history.view(),
                 normal_backlog: NormalBacklogView {
                     counts: &self.partition_normal_backlog,
@@ -933,6 +936,7 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             now_micros,
             tick_index: self.tick_index,
             plant: before,
+            partition_owners: &[],
             history: self.history.view(),
             normal_backlog: NormalBacklogView {
                 counts: &self.partition_normal_backlog,
@@ -951,6 +955,7 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             now_micros,
             tick_index: self.tick_index,
             plant: before,
+            partition_owners: &[],
             history: self.history.view(),
             normal_backlog: NormalBacklogView {
                 counts: &self.partition_normal_backlog,
@@ -995,6 +1000,7 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
                 now_micros,
                 tick_index: self.tick_index,
                 plant: after,
+                partition_owners: self.plant.partition_owners(),
                 history: self.history.view(),
                 normal_backlog: NormalBacklogView {
                     counts: &self.partition_normal_backlog,
