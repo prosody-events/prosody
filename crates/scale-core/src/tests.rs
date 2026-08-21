@@ -14,9 +14,7 @@ use crate::edf::{
     ArrivalPath, EdfOutcome, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
     evaluate_prepared_step, evaluate_prepared_trajectory, prepare, required_capacity_prepared,
 };
-use crate::lead_time::{
-    LaunchDurationShock, LaunchTimeFactor, RebalanceDurationShock, RebalanceTimeFactor,
-};
+use crate::lead_time::{LaunchTimeFactor, RebalanceTimeFactor};
 use crate::partition::PartitionFactor;
 use crate::planning::terminal_replica_seconds;
 use crate::reliability::ReliabilityFactor;
@@ -361,19 +359,20 @@ fn edf_counts_a_late_cohort_after_an_earlier_wide_interval() -> Result<(), TestE
 #[test]
 fn scenario_random_coordinates_do_not_shift_between_factors() {
     let mut first_arrival = scenario_random(17, 256, ScenarioRole::Arrival);
-    let mut first_lead = scenario_random(17, 256, ScenarioRole::LeadTime);
-    let expected_lead = first_lead.next_u64();
+    let mut first_commitment = scenario_random(17, 256, ScenarioRole::Commitment).domain(1_000_000);
+    let expected_commitment = first_commitment.next_u64();
     for _ in 0_u8..100 {
         let _ = first_arrival.next_u64();
     }
 
-    let mut second_lead = scenario_random(17, 256, ScenarioRole::LeadTime);
-    let mut other_scenario_lead = scenario_random(18, 256, ScenarioRole::LeadTime);
+    let mut second_commitment =
+        scenario_random(17, 256, ScenarioRole::Commitment).domain(1_000_000);
+    let mut other_transition = scenario_random(17, 256, ScenarioRole::Commitment).domain(2_000_000);
     let mut reliability = scenario_random(17, 256, ScenarioRole::Reliability);
 
-    assert_eq!(second_lead.next_u64(), expected_lead);
-    assert_ne!(other_scenario_lead.next_u64(), expected_lead);
-    assert_ne!(reliability.next_u64(), expected_lead);
+    assert_eq!(second_commitment.next_u64(), expected_commitment);
+    assert_ne!(other_transition.next_u64(), expected_commitment);
+    assert_ne!(reliability.next_u64(), expected_commitment);
 }
 
 #[test]
@@ -771,47 +770,6 @@ fn mixture_witness() -> Result<MixtureWitness, TestError> {
             readiness_lump(2, 59_950_000, 60_050_000)?,
         ],
     })
-}
-
-#[quickcheck]
-fn duration_shock_transforms_match_direct_samplers(
-    seed: u64,
-    delta_seed: u8,
-    scale_up: bool,
-) -> quickcheck::TestResult {
-    let witness = match mixture_witness() {
-        Ok(witness) => witness,
-        Err(error) => return quickcheck::TestResult::error(error.to_string()),
-    };
-    let direction = if scale_up {
-        TransitionDirection::Up
-    } else {
-        TransitionDirection::Down
-    };
-    let delta = u32::from(delta_seed % 8 + 1);
-    let mut shock_launch_random = RandomStream::new(seed);
-    let launch_shock = LaunchDurationShock::draw(&mut shock_launch_random);
-    let direct_launch = witness
-        .factor
-        .legacy_seconds_from_shock(direction, delta, launch_shock);
-    let transformed_launch = witness
-        .factor
-        .seconds_from_shock(direction, delta, launch_shock);
-
-    let rebalance_prior = match RebalancePrior::kip848() {
-        Ok(prior) => prior,
-        Err(error) => return quickcheck::TestResult::error(error.to_string()),
-    };
-    let rebalance = RebalanceTimeFactor::new(&rebalance_prior);
-    let mut shock_rebalance_random = RandomStream::new(seed.rotate_left(17));
-    let rebalance_shock = RebalanceDurationShock::draw(&mut shock_rebalance_random);
-    let direct_rebalance = rebalance.legacy_seconds_from_shock(rebalance_shock);
-    let transformed_rebalance = rebalance.seconds_from_shock(rebalance_shock);
-
-    quickcheck::TestResult::from_bool(
-        direct_launch.to_bits() == transformed_launch.to_bits()
-            && direct_rebalance.to_bits() == transformed_rebalance.to_bits(),
-    )
 }
 
 fn readiness_lump(group: u64, after: u64, ready: u64) -> Result<ReadinessLump, TestError> {

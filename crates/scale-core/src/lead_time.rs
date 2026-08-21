@@ -1,4 +1,4 @@
-use std::f64::consts::{SQRT_2, TAU};
+use std::f64::consts::SQRT_2;
 use std::time::Duration;
 
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
@@ -32,78 +32,6 @@ pub enum TransitionDirection {
     Up,
     /// The requested replica count decreased.
     Down,
-}
-
-/// Candidate-independent selectors for one launch duration.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct LaunchDurationShock {
-    component_selector: f64,
-    mode_selector: f64,
-    duration: LogNormalShock,
-}
-
-/// Candidate-independent selectors for one rebalance duration.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct RebalanceDurationShock {
-    cell_selector: f64,
-    duration: LogNormalShock,
-}
-
-/// Two uniform values that define one standardized normal value.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct LogNormalShock {
-    radius_selector: f64,
-    angle_selector: f64,
-}
-
-impl LaunchDurationShock {
-    pub(crate) const fn placeholder() -> Self {
-        Self {
-            component_selector: 0.5_f64,
-            mode_selector: 0.5_f64,
-            duration: LogNormalShock::placeholder(),
-        }
-    }
-
-    pub(crate) fn draw(random: &mut RandomStream) -> Self {
-        Self {
-            component_selector: random.open_unit_f64(),
-            mode_selector: random.open_unit_f64(),
-            duration: LogNormalShock::draw(random),
-        }
-    }
-}
-
-impl RebalanceDurationShock {
-    pub(crate) const fn placeholder() -> Self {
-        Self {
-            cell_selector: 0.5_f64,
-            duration: LogNormalShock::placeholder(),
-        }
-    }
-
-    pub(crate) fn draw(random: &mut RandomStream) -> Self {
-        Self {
-            cell_selector: random.open_unit_f64(),
-            duration: LogNormalShock::draw(random),
-        }
-    }
-}
-
-impl LogNormalShock {
-    const fn placeholder() -> Self {
-        Self {
-            radius_selector: 0.5_f64,
-            angle_selector: 0.5_f64,
-        }
-    }
-
-    fn draw(random: &mut RandomStream) -> Self {
-        Self {
-            radius_selector: random.open_unit_f64(),
-            angle_selector: random.open_unit_f64(),
-        }
-    }
 }
 
 /// One stable scheduling-group identity.
@@ -806,43 +734,6 @@ impl LaunchTimeFactor {
         self.component_summary(self.last_replica_delta)
     }
 
-    pub(crate) fn seconds_from_shock(
-        &self,
-        direction: TransitionDirection,
-        replica_delta: u32,
-        shock: LaunchDurationShock,
-    ) -> f64 {
-        let hypothesis = select_weight_index(&self.weights, shock.component_selector);
-        let components = self.components(hypothesis, replica_delta);
-        let cell = if direction == TransitionDirection::Up
-            && shock.mode_selector < components.slow_probability
-        {
-            components.slow
-        } else {
-            components.fast
-        };
-        log_normal_from_shock(cell, shock.duration)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn legacy_seconds_from_shock(
-        &self,
-        direction: TransitionDirection,
-        replica_delta: u32,
-        shock: LaunchDurationShock,
-    ) -> f64 {
-        let hypothesis = select_weight_index(&self.weights, shock.component_selector);
-        let components = self.components(hypothesis, replica_delta);
-        let cell = if direction == TransitionDirection::Up
-            && shock.mode_selector < components.slow_probability
-        {
-            components.slow
-        } else {
-            components.fast
-        };
-        legacy_log_normal_from_shock(cell, shock.duration)
-    }
-
     pub(crate) fn predictive_cdf(
         &self,
         direction: TransitionDirection,
@@ -1092,21 +983,6 @@ impl RebalanceTimeFactor {
             .zip(&self.prior.cells)
             .map(|(weight, cell)| weight * log_normal_mean(*cell))
             .sum()
-    }
-
-    pub(crate) fn sample_seconds(&self, random: &mut RandomStream) -> f64 {
-        self.seconds_from_shock(RebalanceDurationShock::draw(random))
-    }
-
-    pub(crate) fn seconds_from_shock(&self, shock: RebalanceDurationShock) -> f64 {
-        let cell = self.prior.cells[select_weight_index(&self.weights, shock.cell_selector)];
-        log_normal_from_shock(cell, shock.duration)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn legacy_seconds_from_shock(&self, shock: RebalanceDurationShock) -> f64 {
-        let cell = self.prior.cells[select_weight_index(&self.weights, shock.cell_selector)];
-        legacy_log_normal_from_shock(cell, shock.duration)
     }
 
     pub(crate) fn predictive_cdf(&self, elapsed_seconds: f64) -> f64 {
@@ -1390,19 +1266,6 @@ fn log_normal_cdf(cell: DurationCell, elapsed_seconds: f64) -> f64 {
     1.0_f64 - normal_survival(standardized)
 }
 
-fn log_normal_from_shock(cell: DurationCell, shock: LogNormalShock) -> f64 {
-    let radius = (-2.0_f64 * shock.radius_selector.ln()).sqrt();
-    let normal = radius * (TAU * shock.angle_selector).cos();
-    (cell.mu_log_seconds + cell.sigma_log_seconds * normal).exp()
-}
-
-#[cfg(test)]
-fn legacy_log_normal_from_shock(cell: DurationCell, shock: LogNormalShock) -> f64 {
-    let radius = (-2.0_f64 * shock.radius_selector.ln()).sqrt();
-    let normal = radius * (TAU * shock.angle_selector).cos();
-    (cell.mu_log_seconds + cell.sigma_log_seconds * normal).exp()
-}
-
 fn sample_log_normal_after(
     cell: DurationCell,
     elapsed_seconds: f64,
@@ -1430,19 +1293,6 @@ fn sample_log_normal_after(
         }
     }
     f64::midpoint(low, high)
-}
-
-fn select_weight_index(weights: &[f64], selector: f64) -> usize {
-    let mut cumulative = 0.0_f64;
-    let mut selected = weights.len() - 1;
-    for (index, weight) in weights.iter().copied().enumerate() {
-        cumulative += weight;
-        if cumulative >= selector {
-            selected = index;
-            break;
-        }
-    }
-    selected
 }
 
 fn invert_predictive(

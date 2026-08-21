@@ -267,12 +267,6 @@ const fn mix(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-#[cfg(test)]
-pub(crate) fn permuted_rank(scenario: u32, count: u32, role: u64) -> u32 {
-    let (multiplier, offset) = permutation_parameters(count, role);
-    apply_permutation(scenario, count, multiplier, offset)
-}
-
 fn permutation_parameters(count: u32, role: u64) -> (u32, u32) {
     let mut multiplier = (role as u32 | 1) % count;
     while greatest_common_divisor(multiplier, count) != 1 {
