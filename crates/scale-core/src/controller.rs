@@ -2292,7 +2292,13 @@ fn write_trajectory_event(
         sampled_membership_ready(state, workspace, draws, world_event, pause, ready_override);
     let moved = shared.moved_partition_counts
         [(active.replicas as usize - 1) * preparation.candidate_count + target as usize - 1];
-    let ready = membership_ready(direction, moved, pause, sampled_ready);
+    // A clipped commitment can keep membership unchanged. Its readiness still
+    // gates the successor repair.
+    let ready = if target == active.replicas {
+        sampled_ready
+    } else {
+        membership_ready(direction, moved, pause, sampled_ready)
+    };
     if let Some(event) = world_event {
         sample_moved_partition_prefix(state, workspace, draws, event);
     } else {
@@ -2368,39 +2374,38 @@ fn push_candidate_events(
         commitment.target_replicas
     });
     let fixed_event_count = workspace.trajectory.targets.len() - first;
-    if candidate != committed_replicas {
-        let candidate_direction = if candidate > committed_replicas {
-            TransitionDirection::Up
-        } else {
-            TransitionDirection::Down
-        };
-        for commitment_index in 0..actuation_commitments.launching_len() {
-            if actuation_commitments.launching_direction(commitment_index) != candidate_direction
-                || workspace.commitment_pause_micros[commitment_index] == u64::MAX
-            {
-                continue;
-            }
-            let target = match candidate_direction {
-                TransitionDirection::Up => actuation_commitments
-                    .launching_target_replicas(commitment_index)
-                    .min(candidate),
-                TransitionDirection::Down => actuation_commitments
-                    .launching_target_replicas(commitment_index)
-                    .max(candidate),
-            };
-            if target == committed_replicas
-                || workspace.trajectory.targets[first..].contains(&target)
-            {
-                continue;
-            }
-            push_trajectory_event(
-                &mut workspace.trajectory,
-                target,
-                workspace.commitment_pause_micros[commitment_index],
-                Some(workspace.commitment_ready_micros[commitment_index]),
-                None,
-            );
+    let candidate_direction = match candidate.cmp(&committed_replicas) {
+        Ordering::Greater => Some(TransitionDirection::Up),
+        Ordering::Less => Some(TransitionDirection::Down),
+        Ordering::Equal => None,
+    };
+    for commitment_index in 0..actuation_commitments.launching_len() {
+        let commitment_direction = actuation_commitments.launching_direction(commitment_index);
+        if candidate_direction.is_some_and(|direction| direction != commitment_direction)
+            || workspace.commitment_pause_micros[commitment_index] == u64::MAX
+        {
+            continue;
         }
+        let target = candidate_direction.map_or(candidate, |direction| match direction {
+            TransitionDirection::Up => actuation_commitments
+                .launching_target_replicas(commitment_index)
+                .min(candidate),
+            TransitionDirection::Down => actuation_commitments
+                .launching_target_replicas(commitment_index)
+                .max(candidate),
+        });
+        if (target == committed_replicas && candidate != committed_replicas)
+            || workspace.trajectory.targets[first..].contains(&target)
+        {
+            continue;
+        }
+        push_trajectory_event(
+            &mut workspace.trajectory,
+            target,
+            workspace.commitment_pause_micros[commitment_index],
+            Some(workspace.commitment_ready_micros[commitment_index]),
+            None,
+        );
     }
     if candidate != committed_replicas
         && !workspace.trajectory.targets[first..].contains(&candidate)

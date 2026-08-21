@@ -15,10 +15,11 @@ use crate::edf::{
 use crate::lead_time::{LaunchDurationShock, RebalanceDurationShock};
 use crate::types::{EventCohorts, SlotSecondCohorts};
 use crate::{
-    ArrivalPrior, ArrivalPriorError, BacklogCohort, CapacityGrid, CapacityGridError, Configuration,
-    ConfigurationError, DecisionCurveError, DemandClass, LaunchPrior, ModelTime, ObservationBuffer,
-    ObservationError, PosteriorError, PosteriorQuery, RebalancePrior, ReliabilityPrior,
-    ScaleDecision, ScaleScratch, ScaleState, ScheduledRelease, ServiceObjective, step,
+    ActuationCommitment, ArrivalPrior, ArrivalPriorError, BacklogCohort, CapacityGrid,
+    CapacityGridError, CapacityPrior, Configuration, ConfigurationError, DecisionCurveError,
+    DemandClass, LaunchPrior, ModelTime, ObservationBuffer, ObservationError, PosteriorError,
+    PosteriorQuery, RebalancePrior, ReliabilityPrior, ScaleDecision, ScaleScratch, ScaleState,
+    ScheduledRelease, ServiceObjective, step,
 };
 
 #[quickcheck]
@@ -180,13 +181,27 @@ fn idle_decision_cost_increments_are_equal_across_the_replica_ladder() -> Result
     let mut configuration = test_configuration()?;
     configuration.partition_count = 64;
     configuration.replica_count_max = 8;
-    configuration.posterior_sample_count = 128;
+    configuration.posterior_sample_count = 4_096;
     configuration.report_interval_micros = 100_000;
-    let grid = CapacityGrid::new(&[0.1_f64], &[1_000.0_f64], &[0.0_f64])?;
+    configuration.arrival_prior = ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?;
+    configuration.capacity_change_rate_per_second = 1.0_f64 / 300.0_f64;
+    let grid = CapacityGrid::new_with_prior(
+        &[0.000_5_f64, 0.001_f64, 0.002_f64, 0.004_f64, 0.008_f64],
+        &[32_000.0_f64, 64_000.0_f64, 128_000.0_f64, 256_000.0_f64],
+        &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64],
+        CapacityPrior::LogUniform,
+    )?;
     let mut state = ScaleState::new(configuration.clone(), grid)?;
     let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
-    observation.advance_model_time(ModelTime::from_micros(1))?;
+    observation.advance_model_time(ModelTime::from_micros(240_000_000))?;
+    observation.set_arrivals(0, 240_000_000)?;
+    observation.set_current_replicas(8)?;
+    observation.push_actuation_commitment(ActuationCommitment::launching(
+        8,
+        1,
+        ModelTime::from_micros(239_000_000),
+    )?)?;
 
     if !matches!(
         step(&mut state, &mut scratch, observation.observation()),
