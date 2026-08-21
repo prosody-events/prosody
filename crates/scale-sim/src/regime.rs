@@ -1825,29 +1825,46 @@ fn capacity_grid(
     capacity_regime: bool,
     sensitivity: Option<CapacitySensitivity>,
 ) -> Result<CapacityGrid, prosody_scale_core::CapacityGridError> {
-    let historical_regime = historical_regime(regime);
-    let (service_times_seconds, capacities_per_second): (&[f64], &[f64]) = if historical_regime {
-        (
-            &[0.025_f64, 0.05_f64, 0.1_f64, 0.2_f64, 0.4_f64],
-            &[64_000.0_f64, 128_000.0_f64, 256_000.0_f64],
-        )
-    } else if capacity_regime {
-        capacity_regime_axes(regime, sensitivity)
-    } else {
-        // Every step stays within the capacity model's two-octave cell
-        // bound. The nine original anchors remain grid points.
-        (
-            &[0.000_5_f64, 0.001_f64, 0.002_f64, 0.004_f64, 0.008_f64],
-            &[32_000.0_f64, 64_000.0_f64, 128_000.0_f64, 256_000.0_f64],
-        )
-    };
+    if capacity_regime {
+        let (service_times_seconds, capacities_per_second) =
+            capacity_regime_axes(regime, sensitivity);
+        return CapacityGrid::new_with_prior(
+            service_times_seconds,
+            capacities_per_second,
+            CAPACITY_COLLAPSE_GRID,
+            CapacityPrior::LogUniform,
+        );
+    }
+    let (service_times_seconds, capacities_per_second) = principal_capacity_grid_axes(regime);
     let prior = CapacityPrior::LogUniform;
     CapacityGrid::new_with_prior(
-        service_times_seconds,
+        &service_times_seconds,
         capacities_per_second,
         CAPACITY_COLLAPSE_GRID,
         prior,
     )
+}
+
+fn principal_capacity_grid_axes(regime: PrincipalRegime) -> ([f64; 5], &'static [f64]) {
+    let handler_seconds = Duration::from_micros(
+        PrincipalDefinition::for_regime(regime)
+            .inputs
+            .handler_micros,
+    )
+    .as_secs_f64();
+    let service_times_seconds = [
+        handler_seconds / 4.0_f64,
+        handler_seconds / 2.0_f64,
+        handler_seconds,
+        handler_seconds * 2.0_f64,
+        handler_seconds * 4.0_f64,
+    ];
+    let capacities_per_second = if historical_regime(regime) {
+        &[64_000.0_f64, 128_000.0_f64, 256_000.0_f64][..]
+    } else {
+        &[32_000.0_f64, 64_000.0_f64, 128_000.0_f64, 256_000.0_f64][..]
+    };
+    (service_times_seconds, capacities_per_second)
 }
 
 const fn historical_regime(regime: PrincipalRegime) -> bool {

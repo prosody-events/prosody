@@ -3,8 +3,9 @@ use super::{
     HISTORICAL_SCHEDULE, HISTORY_EVENT_COUNT_MAX, HistoricalSeries, IndexSeries,
     PrincipalDefinition, PrincipalRegime, RunSchedule, RunStopReason, SEASONAL_SCHEDULE,
     SharedResourcePolicy, StopCondition, binomial_coverage_lower_tail, capacity_regime_axes,
-    format_clock, live_launch_count_max, replica_count_max, resource_attempt_count_max,
-    run_principal_definition, run_principal_regime_seeded,
+    format_clock, is_capacity_regime, live_launch_count_max, principal_capacity_grid_axes,
+    replica_count_max, resource_attempt_count_max, run_principal_definition,
+    run_principal_regime_seeded,
 };
 use crate::model::{AttemptFrame, AttemptModel};
 use crate::{
@@ -14,6 +15,59 @@ use crate::{
 use quickcheck_macros::quickcheck;
 use statrs::distribution::{Binomial, BinomialError, DiscreteCDF};
 use std::time::Duration;
+
+#[test]
+fn non_capacity_grid_contains_the_configured_handler_as_an_interior_point() {
+    // Capacity regimes are exempt. Their axes model combined handler and
+    // dependency service, not the bare configured handler duration.
+    let excluded: Vec<_> = PrincipalRegime::ALL
+        .into_iter()
+        .filter(|regime| !is_capacity_regime(*regime))
+        .filter(|regime| {
+            let handler_seconds = Duration::from_micros(
+                PrincipalDefinition::for_regime(*regime)
+                    .inputs
+                    .handler_micros,
+            )
+            .as_secs_f64();
+            let (service_axis, _) = principal_capacity_grid_axes(*regime);
+            !service_axis
+                .get(1..service_axis.len().saturating_sub(1))
+                .is_some_and(|values| {
+                    values
+                        .iter()
+                        .any(|value| value.to_bits() == handler_seconds.to_bits())
+                })
+        })
+        .map(PrincipalRegime::name)
+        .collect();
+
+    assert!(excluded.is_empty(), "{excluded:?}");
+}
+
+#[test]
+fn derived_principal_grid_preserves_existing_axis_bits() {
+    let (standard_service, standard_capacity) = principal_capacity_grid_axes(PrincipalRegime::Idle);
+    let (historical_service, historical_capacity) =
+        principal_capacity_grid_axes(PrincipalRegime::HistoricalMatch);
+
+    assert_eq!(
+        standard_service.map(f64::to_bits),
+        [0.000_5_f64, 0.001_f64, 0.002_f64, 0.004_f64, 0.008_f64].map(f64::to_bits)
+    );
+    assert_eq!(
+        historical_service.map(f64::to_bits),
+        [0.025_f64, 0.05_f64, 0.1_f64, 0.2_f64, 0.4_f64].map(f64::to_bits)
+    );
+    assert_eq!(
+        standard_capacity,
+        &[32_000.0_f64, 64_000.0_f64, 128_000.0_f64, 256_000.0_f64]
+    );
+    assert_eq!(
+        historical_capacity,
+        &[64_000.0_f64, 128_000.0_f64, 256_000.0_f64]
+    );
+}
 
 #[test]
 fn capacity_regime_service_truth_is_inside_its_axis() {
@@ -258,7 +312,7 @@ fn authored_regimes_meet_capacity_model_contracts() {
         let definition = PrincipalDefinition::for_regime(regime);
         let result = super::principal_graph(
             regime,
-            super::is_capacity_regime(regime),
+            is_capacity_regime(regime),
             definition,
             super::DEFAULT_CONCURRENCY_PER_REPLICA,
             None,
