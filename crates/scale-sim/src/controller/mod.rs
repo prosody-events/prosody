@@ -1694,8 +1694,8 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         let state = ScaleState::new(core_configuration.clone(), capacity_grid.clone())?;
         let trace = ControllerTrace::new(trace_count_max, &state)?;
         let partition_posterior_count = trace.partition_share_posterior.values.len();
-        let transition_capacity =
-            usize::try_from(trace_count_max).map_err(|_| ConfigurationError::PlatformLimit)?;
+        let transition_capacity = usize::try_from(core_configuration.readiness_lump_count_max)
+            .map_err(|_| ConfigurationError::PlatformLimit)?;
         let capacity_transition_count =
             usize::try_from(core_configuration.resource_window_group_count_max)
                 .map_err(|_| ConfigurationError::PlatformLimit)?;
@@ -1989,7 +1989,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             let completed_micros = context
                 .plant
                 .reconciliation_completed_micros
-                .map_or(context.now_micros, |completed| completed);
+                .unwrap_or(context.now_micros);
             while !self.ready_transitions.is_empty() {
                 let transition = self.ready_transitions.remove(0);
                 let elapsed_micros =
@@ -2002,8 +2002,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
                     .reconciliation_started_micros
                     .filter(|started| *started > transition.requested_at_micros)
                     .filter(|started| completed_micros > *started);
-                let launch_completed_micros =
-                    rebalance_started.map_or(completed_micros, |started| started);
+                let launch_completed_micros = rebalance_started.unwrap_or(completed_micros);
                 let launch = if transition.direction() == TransitionDirection::Up {
                     let observation = ReadinessObservation::ready(
                         ModelTime::from_micros(transition.requested_at_micros),
@@ -2493,7 +2492,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             .rev()
             .find_map(|index| self.trace.sample(index).map(|sample| sample.cap))
             .filter(|cap| *cap > 0)
-            .map_or(self.configuration.core().replica_count_max, |cap| cap);
+            .unwrap_or(self.configuration.core().replica_count_max);
         (held_target, held_cap)
     }
 
@@ -2575,7 +2574,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             let mut random = RandomStream::new(self.diagnostic_seed).domain(
                 0x7061_7274_6974_696f_u64
                     ^ now_micros
-                    ^ u64::try_from(partition).map_or(u64::MAX, |value| value),
+                    ^ u64::try_from(partition).unwrap_or(u64::MAX),
             );
             for _ in 0..count {
                 let rank = cumulative + random.open_unit_f64() * probability;
@@ -2659,20 +2658,20 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
 
     fn track_scale_request(
         &mut self,
-        context: &TickContext<'_>,
+        now_micros: u64,
+        ready: u32,
         replicas: u32,
         plant_in_flight: u32,
     ) -> Result<(), PlantError> {
-        let ready = context.plant.replicas;
         if replicas <= ready {
             while let Some(pending) = self.inflight_transitions.pop() {
-                self.record_censored_transition(context, pending)?;
+                self.record_censored_transition(now_micros, pending)?;
             }
             if replicas < ready {
                 self.push_pending_transition(PendingTransition {
                     from_replicas: ready,
                     target_replicas: replicas,
-                    requested_at_micros: context.now_micros,
+                    requested_at_micros: now_micros,
                 })?;
             }
             self.assert_pending_up_segments(ready, replicas, plant_in_flight);
@@ -2683,7 +2682,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         while index < self.inflight_transitions.len() {
             if self.inflight_transitions[index].direction() == TransitionDirection::Down {
                 let pending = self.inflight_transitions.remove(index);
-                self.record_censored_transition(context, pending)?;
+                self.record_censored_transition(now_micros, pending)?;
             } else {
                 index += 1;
             }
@@ -2694,7 +2693,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             let Some(pending) = self.inflight_transitions.pop() else {
                 break;
             };
-            self.record_censored_transition(context, pending)?;
+            self.record_censored_transition(now_micros, pending)?;
         }
         if let Some(pending) = self.inflight_transitions.last_mut()
             && pending.direction() == TransitionDirection::Up
@@ -2714,7 +2713,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             self.push_pending_transition(PendingTransition {
                 from_replicas: frontier,
                 target_replicas: replicas,
-                requested_at_micros: context.now_micros,
+                requested_at_micros: now_micros,
             })?;
         }
         self.assert_pending_up_segments(ready, replicas, plant_in_flight);
@@ -2758,18 +2757,16 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
 
     fn record_censored_transition(
         &mut self,
-        context: &TickContext<'_>,
+        now_micros: u64,
         transition: PendingTransition,
     ) -> Result<(), PlantError> {
-        let exposure_micros = context
-            .now_micros
-            .saturating_sub(transition.requested_at_micros);
+        let exposure_micros = now_micros.saturating_sub(transition.requested_at_micros);
         if exposure_micros == 0 {
             return Ok(());
         }
         let launch = if transition.direction() == TransitionDirection::Up {
             let requested_at = ModelTime::from_micros(transition.requested_at_micros);
-            let observed_at = ModelTime::from_micros(context.now_micros);
+            let observed_at = ModelTime::from_micros(now_micros);
             Some(PendingLaunchObservation {
                 requested_at,
                 requested_delta: transition.replica_delta(),
@@ -2780,7 +2777,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
                             ^ u64::from(transition.target_replicas).rotate_left(32),
                     ),
                     transition.replica_delta(),
-                    ReadinessObservation::pending(requested_at, observed_at)?,
+                    ReadinessObservation::canceled(requested_at, observed_at)?,
                 )?,
             })
         } else {
@@ -2812,6 +2809,29 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         }
         self.pending_transition_observations.push_back(observation);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retarget_for_test(
+        &mut self,
+        now_micros: u64,
+        ready: u32,
+        target: u32,
+        plant_in_flight: u32,
+    ) -> Result<usize, PlantError> {
+        self.track_scale_request(now_micros, ready, target, plant_in_flight)?;
+        if let Some(pending) = self.pending_transition_observations.pop_front()
+            && let Some(launch) = pending.launch
+        {
+            self.observation.set_launch_evidence(
+                launch.requested_at,
+                launch.requested_delta,
+                launch.observed_at,
+                slice::from_ref(&launch.lump),
+            )?;
+            let _ = self.observation.observation();
+        }
+        Ok(self.observation.open_readiness_group_count())
     }
 }
 
@@ -2880,10 +2900,10 @@ fn bucket_window_transitions(
 fn predictive_rank_bin(rank: f64) -> usize {
     (1..HANDLER_RANK_BIN_COUNT)
         .position(|boundary| {
-            let boundary = u32::try_from(boundary).map_or(u32::MAX, |value| value);
+            let boundary = u32::try_from(boundary).unwrap_or(u32::MAX);
             rank < f64::from(boundary) / 10.0_f64
         })
-        .map_or(HANDLER_RANK_BIN_COUNT - 1, |bin| bin)
+        .unwrap_or(HANDLER_RANK_BIN_COUNT - 1)
 }
 
 fn predictive_rank_offset(seed: u64, now_micros: u64) -> f64 {
@@ -2897,8 +2917,8 @@ fn arrival_predictive_rank_offset(seed: u64, now_micros: u64) -> f64 {
 }
 
 fn count_f64(value: u64) -> f64 {
-    let high = u32::try_from(value >> 32_u32).map_or(0, |part| part);
-    let low = u32::try_from(value & u64::from(u32::MAX)).map_or(0, |part| part);
+    let high = u32::try_from(value >> 32_u32).unwrap_or(0);
+    let low = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(0);
     f64::from(high) * 4_294_967_296.0_f64 + f64::from(low)
 }
 
@@ -3069,7 +3089,12 @@ impl<Workload: TickGenerator> TickGenerator for ClosedLoop<Workload> {
         replicas: u32,
         plant_in_flight: u32,
     ) -> Result<(), PlantError> {
-        self.track_scale_request(&context, replicas, plant_in_flight)
+        self.track_scale_request(
+            context.now_micros,
+            context.plant.replicas,
+            replicas,
+            plant_in_flight,
+        )
     }
 
     fn event(&self, context: EventContext<'_>) -> Result<EventInputs, PlantError> {

@@ -2,11 +2,15 @@ use super::{
     ArrivalSchedule, ArrivalSeries, CALENDAR_PRIOR_RATE_SECONDS, CALENDAR_PRIOR_SHAPE,
     HISTORICAL_SCHEDULE, HISTORY_EVENT_COUNT_MAX, HistoricalSeries, IndexSeries,
     PrincipalDefinition, PrincipalRegime, RunSchedule, RunStopReason, SEASONAL_SCHEDULE,
-    SharedResourcePolicy, StopCondition, capacity_regime_axes, format_clock, replica_count_max,
-    resource_attempt_count_max, run_principal_definition, run_principal_regime_seeded,
+    SharedResourcePolicy, StopCondition, capacity_regime_axes, format_clock, live_launch_count_max,
+    replica_count_max, resource_attempt_count_max, run_principal_definition,
+    run_principal_regime_seeded,
 };
 use crate::model::{AttemptFrame, AttemptModel};
-use crate::{ConcurrencyLatencyCurve, PlantError, PrincipalRunError, SeriesCell};
+use crate::{
+    ConcurrencyLatencyCurve, EventOutcome, EventSource, EventSpec, FinalOutcome, Plant,
+    PlantConfiguration, PlantError, PrincipalRunError, SeriesCell,
+};
 use quickcheck_macros::quickcheck;
 use std::time::Duration;
 
@@ -82,7 +86,7 @@ fn maximum_evidence_concurrency(regime: PrincipalRegime, definition: PrincipalDe
         return f64::NAN;
     };
     let final_micros = definition.schedule.workload_end_micros.saturating_sub(1);
-    let steps = u32::try_from(final_micros / step_interval_micros).map_or(u32::MAX, |value| value);
+    let steps = u32::try_from(final_micros / step_interval_micros).unwrap_or(u32::MAX);
     let rate = initial_per_second.saturating_add(increment_per_second.saturating_mul(steps));
     let demand_concurrency = f64::from(rate) * attempt_service_seconds(definition);
     let fleet_slots =
@@ -179,6 +183,48 @@ fn calendar_forecast_round_trips_the_historical_schedule(seasonal: bool) -> bool
             .all(|pair| pair[0].end_micros() == pair[1].start_micros())
 }
 
+#[quickcheck]
+fn retarget_churn_keeps_readiness_cursors_within_live_launches(seed: u64) -> bool {
+    let regime = PrincipalRegime::Idle;
+    let mut definition = PrincipalDefinition::for_regime(regime);
+    definition.inputs.seed = seed;
+    let replica_count_max = replica_count_max(regime, definition.experiment);
+    let live_launch_count_max = live_launch_count_max(replica_count_max);
+    let Ok(mut controller) = super::principal_graph(
+        regime,
+        false,
+        definition,
+        super::DEFAULT_CONCURRENCY_PER_REPLICA,
+        None,
+    ) else {
+        return false;
+    };
+    let mut now_micros = 1_u64;
+    for index in 0..=live_launch_count_max {
+        let random_code = seed.rotate_left(index).wrapping_add(u64::from(index));
+        let Ok(target_offset) = u32::try_from(random_code % u64::from(replica_count_max - 1))
+        else {
+            return false;
+        };
+        let target = 2 + target_offset;
+        if controller
+            .retarget_for_test(now_micros, 1, target, target - 1)
+            .is_err()
+        {
+            return false;
+        }
+        now_micros = now_micros.saturating_add(1);
+        let Ok(open_count) = controller.retarget_for_test(now_micros, 1, 1, 0) else {
+            return false;
+        };
+        if open_count > live_launch_count_max as usize {
+            return false;
+        }
+        now_micros = now_micros.saturating_add(1);
+    }
+    true
+}
+
 #[test]
 fn shared_resource_collapse_controls_latency_curve() {
     assert_eq!(
@@ -247,6 +293,7 @@ fn shared_resource_load_uses_active_dependency_count() -> Result<(), PrincipalRu
         SharedResourcePolicy::new(2, 10, 2),
         ConcurrencyLatencyCurve::zero(),
         4,
+        0,
     )?;
     let lightly_loaded = model.calculate(attempt_frame(100, 2));
     let handler_heavy = model.calculate(attempt_frame(1_000, 2));
@@ -726,6 +773,37 @@ fn seeded_regimes_replay_and_separate_input_draws() -> Result<(), PrincipalRunEr
         different_seed_changes_input,
         "different seeds must change at least one demand draw"
     );
+    Ok(())
+}
+
+#[test]
+fn fixed_seed_regime_replays_identical_summary() -> Result<(), PrincipalRunError> {
+    let definition = PrincipalDefinition::standard()
+        .messages(ArrivalSeries::Once(8))
+        .event_count_max(8)
+        .seeded(31);
+    let run = |definition: PrincipalDefinition| -> Result<_, PrincipalRunError> {
+        let configuration =
+            PlantConfiguration::new(1, 8, 8, 1, 8, 8)?.with_service_seed(definition.inputs.seed);
+        let mut plant = Plant::new(configuration, 1)?;
+        for event_index in 0..8 {
+            plant.add_event(EventSpec {
+                release_micros: 0,
+                partition: 0,
+                key: event_index,
+                handler_micros: definition.inputs.handler_micros,
+                dependency_operations: 1,
+                outcome: EventOutcome::Final(FinalOutcome::Success),
+                source: EventSource::Message,
+            })?;
+        }
+        Ok(plant.run())
+    };
+    let first = run(definition)?;
+    let replay = run(definition)?;
+
+    assert_eq!(first.events(), replay.events());
+    assert_eq!(first.settlements(), replay.settlements());
     Ok(())
 }
 

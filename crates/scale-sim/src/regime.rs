@@ -25,6 +25,8 @@ use crate::{
     TickContext, TickGenerator, TickInputs,
 };
 
+const RESOURCE_COMPONENT: u64 = 0x7265_736f_7572_6365;
+
 const CAPACITY_COLLAPSE_GRID: &[f64] = &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64];
 const REPLICA_SECOND_DELAY_RATE: f64 = 3.0_f64;
 
@@ -92,7 +94,7 @@ const SEASONAL_SCHEDULE: &[ScheduleSegment] = &[
     ScheduleSegment::new(361_000_000, 420_000_000, 0),
 ];
 
-/// A principal deterministic plant regime for plot review.
+/// A principal reproducible plant regime for plot review.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrincipalRegime {
     /// No work arrives.
@@ -212,7 +214,7 @@ impl PrincipalRegime {
     }
 }
 
-/// Runs one deterministic principal regime through the shared harness.
+/// Runs one reproducible principal regime through the shared harness.
 ///
 /// # Errors
 ///
@@ -224,8 +226,8 @@ pub fn run_principal_regime(regime: PrincipalRegime) -> Result<PrincipalRun, Pri
 
 /// Runs one seeded principal regime through the shared harness.
 ///
-/// The seed changes stochastic input equations. It does not change controller
-/// inference or actuation logic.
+/// The seed changes stochastic inputs and service durations. It does not change
+/// controller inference or actuation logic.
 ///
 /// # Errors
 ///
@@ -522,17 +524,10 @@ fn validate_closed_loop_claim(
         }
         PrincipalRegime::ShortBurst => validate_short_burst_claim(run),
         PrincipalRegime::SeasonalWaves => validate_seasonal_claim(run),
-        PrincipalRegime::HotPartition => validate_single_worker_claim(
-            regime,
-            run,
-            "the decision did not expose the binding partition-placement loss",
-        ),
+        PrincipalRegime::HotPartition | PrincipalRegime::HotSerializedKey => {
+            validate_single_worker_claim(regime, run)
+        }
         PrincipalRegime::TimerWave => validate_timer_wave_claim(run),
-        PrincipalRegime::HotSerializedKey => validate_single_worker_claim(
-            regime,
-            run,
-            "the decision did not expose the binding serialized-key loss",
-        ),
         PrincipalRegime::TransientFailures => validate_transient_failure_claim(run),
         PrincipalRegime::PermanentRejections => validate_permanent_rejection_claim(run),
         PrincipalRegime::RebalanceStorm => validate_rebalance_storm_claim(run),
@@ -633,9 +628,7 @@ pub(crate) fn linear_miss_accounting(run: &PrincipalRun) -> LinearMissAccounting
             let replica_micros = u64::from(run.simulation.slots_per_replica) * 1_000_000;
             let required =
                 work_micros.saturating_add(replica_micros.saturating_sub(1)) / replica_micros;
-            let required = u32::try_from(required)
-                .map_or(u32::MAX, |value| value)
-                .max(1);
+            let required = u32::try_from(required).unwrap_or(u32::MAX).max(1);
             let earliest_ready = release_micros.saturating_add(report_micros);
             if let Some(change) =
                 run.simulation.changes.iter().find(|change| {
@@ -816,9 +809,34 @@ fn validate_seasonal_claim(run: &PrincipalRun) -> Result<(), RegimeValidationErr
 fn validate_single_worker_claim(
     regime: PrincipalRegime,
     run: &PrincipalRun,
-    invariant: &'static str,
 ) -> Result<(), RegimeValidationError> {
-    require_closed_loop(single_worker_constraint_binds(run), regime, invariant)
+    let mut decisions = (0..run.controller.len()).filter_map(|index| {
+        Some((
+            run.controller.sample(index)?,
+            run.controller.decision_expected_costs(index)?,
+        ))
+    });
+    require_closed_loop(
+        decisions
+            .clone()
+            .any(|(sample, _)| !sample.hold && sample.target == 1),
+        regime,
+        "no non-hold decision selected one replica",
+    )?;
+    require_closed_loop(
+        decisions
+            .clone()
+            .any(|(_, losses)| losses.first().is_some_and(|loss| *loss > 0.0_f64)),
+        regime,
+        "no decision had positive one-replica loss",
+    )?;
+    require_closed_loop(
+        decisions.any(|(_, losses)| {
+            !losses.is_empty() && losses.iter().skip(1).all(|loss| *loss == f64::INFINITY)
+        }),
+        regime,
+        "no decision had infinite loss for every larger replica target",
+    )
 }
 
 fn validate_timer_wave_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
@@ -1082,8 +1100,8 @@ fn slo_miss_fraction(run: &PrincipalRun, budget_micros: u64) -> f64 {
     let unsettled = run.events().len().saturating_sub(run.settlements().len());
     count_as_f64(
         u64::try_from(slo_miss_count(run, budget_micros).saturating_add(unsettled))
-            .map_or(u64::MAX, |count| count),
-    ) / count_as_f64(u64::try_from(run.events().len()).map_or(u64::MAX, |count| count))
+            .unwrap_or(u64::MAX),
+    ) / count_as_f64(u64::try_from(run.events().len()).unwrap_or(u64::MAX))
 }
 
 fn release_window_miss_fraction(
@@ -1116,10 +1134,8 @@ fn release_window_miss_fraction(
         1.0_f64
     } else {
         let unsettled_count = event_count.saturating_sub(settled_count);
-        count_as_f64(
-            u64::try_from(miss_count.saturating_add(unsettled_count))
-                .map_or(u64::MAX, |count| count),
-        ) / count_as_f64(u64::try_from(event_count).map_or(u64::MAX, |count| count))
+        count_as_f64(u64::try_from(miss_count.saturating_add(unsettled_count)).unwrap_or(u64::MAX))
+            / count_as_f64(u64::try_from(event_count).unwrap_or(u64::MAX))
     }
 }
 
@@ -1156,14 +1172,14 @@ fn minimum_cap(run: &PrincipalRun) -> u32 {
     controller_samples(run)
         .map(|sample| sample.cap)
         .min()
-        .map_or(0, |cap| cap)
+        .unwrap_or(0)
 }
 
 fn maximum_target(run: &PrincipalRun) -> u32 {
     controller_samples(run)
         .map(|sample| sample.target)
         .max()
-        .map_or(0, |target| target)
+        .unwrap_or(0)
 }
 
 fn final_no_knee_probability(run: &PrincipalRun) -> f64 {
@@ -1209,24 +1225,6 @@ fn capacity_coverage(run: &PrincipalRun) -> (u64, u64) {
         ));
     }
     (windows, covered)
-}
-
-fn single_worker_constraint_binds(run: &PrincipalRun) -> bool {
-    (0..run.controller.len()).any(|index| {
-        let Some(sample) = run.controller.sample(index) else {
-            return false;
-        };
-        let Some(losses) = run.controller.decision_expected_costs(index) else {
-            return false;
-        };
-        let Some(&one_replica) = losses.first() else {
-            return false;
-        };
-        !sample.hold
-            && sample.target == 1
-            && one_replica > 0.0_f64
-            && losses.iter().skip(1).all(|loss| *loss == f64::INFINITY)
-    })
 }
 
 fn input_sum(history: &SeriesHistory, name: &str) -> u64 {
@@ -1546,7 +1544,8 @@ fn run_principal_definition_inner(
         definition.event_count_max,
         slots_per_replica,
         definition.inputs.shared_resource.parallelism,
-    )?;
+    )?
+    .with_service_seed(seed);
     let graph = principal_graph(
         regime,
         capacity_regime,
@@ -1558,6 +1557,7 @@ fn run_principal_definition_inner(
         definition.inputs.shared_resource,
         principal_handler_curve(regime)?,
         definition.event_count_max,
+        seed,
     )?;
     let mut harness = SimulationHarness::with_attempt_model(
         plant_configuration,
@@ -1641,11 +1641,12 @@ fn principal_graph(
         definition.inputs.handler_micros,
         regime == PrincipalRegime::TransientFailures,
     )?;
+    let readiness_lump_count_max = readiness_lump_count_max(replica_count_max);
     let controller_configuration = Configuration {
         cohort_count_max: 64,
         calendar_segment_count_max: 64,
         scheduled_release_count_max: 64,
-        readiness_lump_count_max: 64,
+        readiness_lump_count_max,
         partition_count: 64,
         replica_count_max,
         slots_per_replica,
@@ -1691,6 +1692,21 @@ fn principal_graph(
         }
         _ => Ok(graph),
     }
+}
+
+const fn readiness_lump_count_max(replica_count_max: u32) -> u32 {
+    let live_launch_count = live_launch_count_max(replica_count_max);
+    let completed_launch_backlog = live_launch_count;
+    let total = live_launch_count.saturating_add(completed_launch_backlog);
+    if total == 0 { 1 } else { total }
+}
+
+const fn live_launch_count_max(replica_count_max: u32) -> u32 {
+    const REPLICA_COUNT_MIN: u32 = 1;
+    const LAUNCH_BATCH_MIN: u32 = 1;
+
+    let replica_span = replica_count_max.saturating_sub(REPLICA_COUNT_MIN);
+    replica_span.div_ceil(LAUNCH_BATCH_MIN)
 }
 
 const fn replica_count_max(regime: PrincipalRegime, experiment: RegimeExperiment) -> u32 {
@@ -2350,9 +2366,10 @@ impl PrincipalAttemptModel {
         resource: SharedResourcePolicy,
         handler_curve: ConcurrencyLatencyCurve,
         history_count_max: u32,
+        seed: u64,
     ) -> Result<Self, PlantError> {
         Ok(Self {
-            graph: PrincipalAttemptGraph::new(resource, handler_curve, history_count_max)?,
+            graph: PrincipalAttemptGraph::new(resource, handler_curve, seed, history_count_max)?,
         })
     }
 }
@@ -2371,6 +2388,7 @@ series_graph! {
     struct PrincipalAttemptGraph(AttemptFrame) with (
         resource: SharedResourcePolicy,
         handler_curve: ConcurrencyLatencyCurve,
+        seed: u64,
     ) {
         series resource_capacity: u32 ["shared resource capacity", Count, Input] =
             AttemptResourceCapacity(resource) => ();
@@ -2379,7 +2397,7 @@ series_graph! {
         series resource_load: u32 ["shared resource offered concurrency", Count, Input] =
             AttemptResourceLoad {} => ();
         series dependency_operation_micros: u64 ["shared resource operation time", Microseconds, State] =
-            AttemptResourceLatency(resource.parallelism, resource.collapse) =>
+            AttemptResourceLatency(resource.parallelism, resource.collapse, seed) =>
             (resource_base_micros, resource_load);
         series handler_added_micros: u64 ["handler contention", Microseconds, Input] =
             AttemptHandlerContention(handler_curve) => ();
@@ -2424,17 +2442,26 @@ impl SeriesFunction<AttemptFrame, ()> for AttemptResourceLoad {
     }
 }
 
-struct AttemptResourceLatency(u32, u32);
+struct AttemptResourceLatency(u32, u32, u64);
 
 impl SeriesFunction<AttemptFrame, (u64, u32)> for AttemptResourceLatency {
     type Output = u64;
 
     fn calculate(
         &self,
-        _: SeriesContext<'_, AttemptFrame>,
+        context: SeriesContext<'_, AttemptFrame>,
         (base_micros, offered_concurrency): (u64, u32),
     ) -> Self::Output {
-        overloaded_operation_micros(base_micros, self.0, offered_concurrency, self.1)
+        let mean_micros =
+            overloaded_operation_micros(base_micros, self.0, offered_concurrency, self.1);
+        // This sample is the dependency duration given its start-time mean.
+        crate::exponential_duration_micros(
+            self.2,
+            context.frame.event_index,
+            context.frame.attempt,
+            RESOURCE_COMPONENT,
+            mean_micros,
+        )
     }
 }
 
@@ -2458,7 +2485,7 @@ fn overloaded_operation_micros(
     let scaled = u128::from(base_micros)
         .saturating_mul(numerator)
         .div_ceil(denominator);
-    u64::try_from(scaled).map_or(u64::MAX, |value| value)
+    u64::try_from(scaled).unwrap_or(u64::MAX)
 }
 
 struct AttemptHandlerContention(ConcurrencyLatencyCurve);
@@ -2660,6 +2687,8 @@ impl PrincipalDefinition {
                 .initial_replicas(1),
             PrincipalRegime::TransientFailures => transient_failures_definition(standard),
             PrincipalRegime::PermanentRejections => {
+                // The idle-stable stop drains all work. Its 298-second bound is
+                // 149,000 handler means for 2,000 events.
                 standard.permanent_rejections(OccurrenceSeries::Every(10))
             }
             PrincipalRegime::RebalanceStorm => standard
@@ -2931,6 +2960,12 @@ fn seasonal_definition(standard: PrincipalDefinition) -> PrincipalDefinition {
 }
 
 fn transient_failures_definition(standard: PrincipalDefinition) -> PrincipalDefinition {
+    // The 30-second drain is 300 handler means. A union bound puts any one of
+    // 43,200 handler draws beyond it below 2.3e-126.
+    let schedule = RunSchedule {
+        maximum_micros: 150_000_000,
+        ..RunSchedule::hot_partition()
+    };
     standard
         .messages(ArrivalSeries::Rate {
             per_second: 300,
@@ -2941,7 +2976,7 @@ fn transient_failures_definition(standard: PrincipalDefinition) -> PrincipalDefi
             interval: 10,
             transient_count: 2,
         })
-        .schedule(RunSchedule::hot_partition())
+        .schedule(schedule)
         .event_count_max(TRANSIENT_EVENT_COUNT)
         .initial_replicas(1)
 }

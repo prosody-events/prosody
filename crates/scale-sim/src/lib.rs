@@ -13,6 +13,7 @@ use thiserror::Error;
 
 const PLOT_FONT_FAMILY: &str = "Charter";
 const DEFAULT_CONCURRENCY_PER_REPLICA: u32 = 32;
+const HANDLER_COMPONENT: u64 = 0x6861_6e64_6c65_7200;
 
 mod batch;
 mod batch_plot;
@@ -204,6 +205,7 @@ pub struct PlantConfiguration {
     retry_policy: RetryPolicy,
     rebalance: Kip848Rebalance,
     handler_latency_curve: ConcurrencyLatencyCurve,
+    service_seed: u64,
 }
 
 impl PlantConfiguration {
@@ -245,6 +247,7 @@ impl PlantConfiguration {
                 0,
             ),
             handler_latency_curve: ConcurrencyLatencyCurve::zero(),
+            service_seed: 0,
         })
     }
 
@@ -252,6 +255,13 @@ impl PlantConfiguration {
     #[must_use]
     pub const fn with_metric_poll_interval_micros(mut self, micros: u64) -> Self {
         self.metric_poll_interval_micros = micros;
+        self
+    }
+
+    /// Sets the seed for stateless service-duration draws.
+    #[must_use]
+    pub(crate) const fn with_service_seed(mut self, seed: u64) -> Self {
+        self.service_seed = seed;
         self
     }
 
@@ -1485,8 +1495,16 @@ impl<M: AttemptModel> Plant<M> {
         }
         self.dependency_micros[event_index] =
             self.dependency_micros[event_index].saturating_add(dependency_micros);
-        let handler_micros =
+        let handler_mean_micros =
             self.events.handler_micros[event_index].saturating_add(attempt.handler_added_micros);
+        // This sample is the handler duration given its start-time mean.
+        let handler_micros = exponential_duration_micros(
+            self.configuration.service_seed,
+            event,
+            self.attempts_by_event[event_index],
+            HANDLER_COMPONENT,
+            handler_mean_micros,
+        );
         self.handler_micros[event_index] =
             self.handler_micros[event_index].saturating_add(handler_micros);
         dependency_finish.saturating_add(handler_micros)
@@ -1697,10 +1715,8 @@ impl<M: AttemptModel> Plant<M> {
         let rate = if self.attempt_outcomes.is_empty() {
             0.0_f64
         } else {
-            let failures =
-                u32::try_from(self.attempt_failure_count).map_or(u32::MAX, |value| value);
-            let attempts =
-                u32::try_from(self.attempt_outcomes.len()).map_or(u32::MAX, |value| value);
+            let failures = u32::try_from(self.attempt_failure_count).unwrap_or(u32::MAX);
+            let attempts = u32::try_from(self.attempt_outcomes.len()).unwrap_or(u32::MAX);
             f64::from(failures) / f64::from(attempts)
         };
         rate < self.configuration.retry_policy.defer_threshold
@@ -2009,6 +2025,22 @@ fn bounded_random(seed: u64, event: u32, attempt: u32, mode: u64, bound: u64) ->
             return (product >> 64) as u64;
         }
     }
+}
+
+fn exponential_duration_micros(
+    seed: u64,
+    event: u32,
+    attempt: u32,
+    component: u64,
+    mean_micros: u64,
+) -> u64 {
+    if mean_micros == 0 {
+        return 0;
+    }
+    let domain = (u64::from(event) << 32_u32) ^ u64::from(attempt) ^ component.rotate_left(17);
+    let uniform = RandomStream::new(seed).domain(domain).open_unit_f64();
+    let sample = -u64_to_f64(mean_micros) * uniform.ln();
+    sample.round().min(u64_to_f64(u64::MAX)) as u64
 }
 
 fn heap_push(heap: &mut Vec<Scheduled>, value: Scheduled) {

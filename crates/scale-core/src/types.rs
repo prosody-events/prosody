@@ -1446,8 +1446,9 @@ struct OccupancyTraceHeader {
 /// Reusable owner for one [`GroupObservation`] view.
 ///
 /// Each open readiness group owns one cursor. A pending interval advances its
-/// cursor, and a ready interval removes it. The configured lump limit bounds
-/// all cursor storage. The rebalance cursor follows the same rule.
+/// cursor. Exactly one ready or canceled observation closes each opened
+/// cursor. The configured lump limit bounds all cursor storage. The rebalance
+/// cursor follows the same rule.
 #[derive(Debug)]
 pub struct ObservationBuffer {
     partition_count: u32,
@@ -1485,6 +1486,13 @@ pub struct ObservationBuffer {
 }
 
 impl ObservationBuffer {
+    /// Returns the number of readiness groups that await a terminal
+    /// observation.
+    #[must_use]
+    pub const fn open_readiness_group_count(&self) -> usize {
+        self.readiness_cursors.len()
+    }
+
     /// Allocates one buffer at its validated maximum size.
     ///
     /// # Errors
@@ -1971,11 +1979,13 @@ impl ObservationBuffer {
         let completed_open_count = lumps
             .iter()
             .filter(|lump| {
-                matches!(lump.observation(), ReadinessObservation::Ready { .. })
-                    && self
-                        .readiness_cursors
-                        .iter()
-                        .any(|(group, _)| *group == lump.group())
+                matches!(
+                    lump.observation(),
+                    ReadinessObservation::Ready { .. } | ReadinessObservation::Canceled { .. }
+                ) && self
+                    .readiness_cursors
+                    .iter()
+                    .any(|(group, _)| *group == lump.group())
             })
             .count();
         let new_pending_count = lumps
@@ -1993,10 +2003,12 @@ impl ObservationBuffer {
         {
             return Err(ObservationError::ReadinessLumpCapacity);
         }
-        for lump in lumps
-            .iter()
-            .filter(|lump| matches!(lump.observation(), ReadinessObservation::Ready { .. }))
-        {
+        for lump in lumps.iter().filter(|lump| {
+            matches!(
+                lump.observation(),
+                ReadinessObservation::Ready { .. } | ReadinessObservation::Canceled { .. }
+            )
+        }) {
             if let Some(position) = self
                 .readiness_cursors
                 .iter()
@@ -2044,7 +2056,7 @@ impl ObservationBuffer {
         }
         self.rebalance_cursor = match evidence.observation() {
             ReadinessObservation::Pending { .. } => Some(through),
-            ReadinessObservation::Ready { .. } => None,
+            ReadinessObservation::Ready { .. } | ReadinessObservation::Canceled { .. } => None,
         };
         self.rebalance = Some(evidence);
         Ok(())

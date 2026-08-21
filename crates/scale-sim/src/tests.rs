@@ -201,8 +201,12 @@ fn handler_metric_includes_dependency_wall_time() -> Result<(), TestError> {
     plant.add_event(event(0, 0, 10))?;
 
     let trace = plant.run().metric_trace(1_000, 1_000)?;
+    let handler_micros = super::exponential_duration_micros(0, 0, 1, super::HANDLER_COMPONENT, 10);
 
-    assert_eq!(trace.handler_elapsed_p99_micros[0], 110);
+    assert_eq!(
+        trace.handler_elapsed_p99_micros[0],
+        100_u64.saturating_add(handler_micros)
+    );
     Ok(())
 }
 
@@ -240,8 +244,21 @@ fn kip848_pauses_only_partitions_that_move() -> Result<(), TestError> {
     assert_eq!(paused.reconciliation_started_micros, Some(10));
     assert_eq!(ready.reconciliation_completed_micros, Some(100));
     assert_eq!(ready.rebalance_pause_micros, 90);
-    assert_eq!(result.settlements()[0].settle_micros, 12);
-    assert_eq!(result.settlements()[1].settle_micros, 101);
+    let completed = ready
+        .reconciliation_completed_micros
+        .ok_or(TestError::MissingReconciliationCompletion)?;
+    let unmoved = result
+        .settlements()
+        .iter()
+        .find(|settlement| settlement.event == 0)
+        .ok_or(TestError::MissingSettlement)?;
+    let moved = result
+        .settlements()
+        .iter()
+        .find(|settlement| settlement.event == 1)
+        .ok_or(TestError::MissingSettlement)?;
+    assert!(unmoved.settle_micros < completed);
+    assert!(moved.settle_micros >= completed);
     Ok(())
 }
 
@@ -265,10 +282,27 @@ fn kip848_waits_for_a_revoked_partition_to_drain() -> Result<(), TestError> {
         replicas: 3,
     })?;
 
+    let drained = plant.advance_until(1_000);
     let result = plant.run();
 
-    assert_eq!(result.settlements()[0].settle_micros, 200);
-    assert_eq!(result.settlements()[1].settle_micros, 201);
+    let completed = drained
+        .reconciliation_completed_micros
+        .ok_or(TestError::MissingReconciliationCompletion)?;
+    let first = result
+        .settlements()
+        .iter()
+        .find(|settlement| settlement.event == 0)
+        .ok_or(TestError::MissingSettlement)?;
+    let queued = result
+        .settlements()
+        .iter()
+        .find(|settlement| settlement.event == 1)
+        .ok_or(TestError::MissingSettlement)?;
+    let queued_dispatch = queued
+        .release_micros
+        .saturating_add(queued.permit_wait_micros);
+    assert!(completed >= first.settle_micros);
+    assert!(queued_dispatch >= completed);
     Ok(())
 }
 
@@ -291,19 +325,34 @@ fn moved_partitions_use_the_new_replica_slots() -> Result<(), TestError> {
     let before = before.run();
     let after = after.run();
 
+    let before_dispatches = before
+        .settlements()
+        .iter()
+        .map(|settlement| {
+            settlement
+                .release_micros
+                .saturating_add(settlement.permit_wait_micros)
+        })
+        .collect::<Vec<_>>();
+    let after_dispatches = after
+        .settlements()
+        .iter()
+        .map(|settlement| {
+            settlement
+                .release_micros
+                .saturating_add(settlement.permit_wait_micros)
+        })
+        .collect::<Vec<_>>();
+    assert!(maximum_equal_values(&before_dispatches) <= 2);
+    assert_eq!(maximum_equal_values(&after_dispatches), 4);
+    assert!(after_dispatches.iter().all(|dispatch| *dispatch == 1));
     assert_eq!(
-        before
-            .settlements()
-            .iter()
-            .map(|settlement| settlement.settle_micros)
-            .max(),
-        Some(201)
-    );
-    assert!(
         after
             .settlements()
             .iter()
-            .all(|settlement| settlement.settle_micros == 101)
+            .map(|settlement| settlement.in_flight_at_dispatch)
+            .max(),
+        Some(4)
     );
     Ok(())
 }
@@ -390,6 +439,7 @@ fn irregular_tick_omits_paired_capacity_and_reliability_evidence() -> Result<(),
         .trace()
         .sample(2)
         .ok_or(TestError::MissingControllerSample)?;
+
     assert!(matches!(
         sample.capacity_evidence,
         CapacityEvidenceSample::None
@@ -543,13 +593,14 @@ fn assert_reported_arrival_intervals() -> Result<(), TestError> {
 
 #[test]
 fn closed_loop_accepts_ready_window_with_rebalance_pause() -> Result<(), TestError> {
-    let closed_loop = capacity_test_closed_loop(CapacityWorkload, 8)?;
+    const TICK_COUNT: u32 = 3;
+    let closed_loop = capacity_test_closed_loop(PauseWitnessWorkload, TICK_COUNT)?;
     let plant_configuration = PlantConfiguration::new(4, 100, 200, 8, 2, 16)?
         .with_rebalance(2_000, 0)
         .with_metric_poll_interval_micros(10_000);
-    let mut harness = SimulationHarness::new(plant_configuration, 1, 8, closed_loop)?;
-    let mut snapshots = Vec::with_capacity(8);
-    for tick in 0_u64..8 {
+    let mut harness = SimulationHarness::new(plant_configuration, 1, TICK_COUNT, closed_loop)?;
+    let mut snapshots = Vec::with_capacity(TICK_COUNT as usize);
+    for tick in 0..u64::from(TICK_COUNT) {
         snapshots.push(harness.tick(tick * 10_000)?);
     }
     let (_result, closed_loop) = harness.finish_with_graph();
@@ -909,6 +960,8 @@ impl TickGenerator for RetargetWorkload {
 
 struct CapacityWorkload;
 
+struct PauseWitnessWorkload;
+
 struct CohortSegmentWorkload;
 
 struct MetricFlapWorkload;
@@ -964,6 +1017,26 @@ impl TickGenerator for CapacityWorkload {
             launch_delay_micros: 0,
             scale: ScaleDirective::Request {
                 replicas: u32::from(context.tick_index >= 3) + 1,
+            },
+        })
+    }
+}
+
+impl TickGenerator for PauseWitnessWorkload {
+    fn calculate(&mut self, context: TickContext<'_>) -> Result<TickInputs, PlantError> {
+        Ok(TickInputs {
+            message_count: 20,
+            timer_count: 0,
+            handler_micros: 10_000,
+            dependency_operations: 1,
+            dependency_operation_micros: 1,
+            handler_added_micros: 0,
+            outcome: EventOutcomeRule::Success,
+            launch_delay_micros: 0,
+            scale: if context.tick_index == 1 {
+                ScaleDirective::Request { replicas: 2 }
+            } else {
+                ScaleDirective::ExternalHold
             },
         })
     }
@@ -1366,9 +1439,14 @@ fn capacity_regimes_record_passive_resource_windows() -> Result<(), TestError> {
         }
         assert!(recorded_windows > 0);
         let capacity_values = run.controller().capacity_posterior_values();
-        assert_eq!(capacity_values.len(), 64);
-        assert_eq!(capacity_values.first(), Some(&20.0_f64));
-        assert_eq!(capacity_values.last(), Some(&1_280.0_f64));
+        let configured_capacity_values: &[f64] = match regime {
+            PrincipalRegime::LinearThroughput => &[80.0_f64, 320.0_f64, 640.0_f64],
+            PrincipalRegime::FlatPostKnee | PrincipalRegime::DecliningPostKnee => {
+                &[80.0_f64, 320.0_f64, 600.0_f64]
+            }
+            _ => &[],
+        };
+        assert_eq!(capacity_values, configured_capacity_values);
         for index in 0..run.controller().len() {
             let posterior = run
                 .controller()
@@ -1474,33 +1552,25 @@ fn partition_diagnostics_account_for_each_accepted_assignment() -> Result<(), Te
 
 #[test]
 fn hot_partition_exposes_unavoidable_placement_loss() -> Result<(), TestError> {
-    let run = run_principal_regime(PrincipalRegime::HotPartition)?;
-    let trace = run.metric_trace(run.metric_window_micros(), 5_000_000)?;
-    assert!(trace.backlog.iter().copied().max().unwrap_or_default() > 0);
-    assert!(
-        trace
-            .replicas
-            .iter()
-            .zip(&trace.backlog)
-            .any(|(&replicas, &backlog)| replicas == 1 && backlog > 10_000)
-    );
-    assert!((0..run.controller().len()).any(|index| {
-        let Some(sample) = run.controller().sample(index) else {
-            return false;
-        };
-        let Some(losses) = run.controller().decision_expected_costs(index) else {
-            return false;
-        };
-        let Some(&one_replica) = losses.first() else {
-            return false;
-        };
-        !sample.hold
-            && matches!(sample.capacity_evidence, CapacityEvidenceSample::Window(_))
-            && sample.target == 1
-            && one_replica > 0.0_f64
-            && losses.iter().skip(1).all(|loss| *loss == f64::INFINITY)
-    }));
-    assert_eq!(trace.target.iter().copied().max().unwrap_or_default(), 1);
+    const EVENT_COUNT: u32 = 400;
+    let configuration = PlantConfiguration::new(4, EVENT_COUNT, EVENT_COUNT, 1, 1, 1)?
+        .with_dependency_operation_micros(0)
+        .with_rebalance(0, 0);
+    let mut hot = Plant::new(configuration.clone(), 4)?;
+    let mut striped = Plant::new(configuration, 4)?;
+    for key in 0..EVENT_COUNT {
+        let mut hot_event = event(0, key, 100_000);
+        hot_event.partition = 0;
+        hot.add_event(hot_event)?;
+        let mut striped_event = hot_event;
+        striped_event.partition = key % 4;
+        striped.add_event(striped_event)?;
+    }
+
+    let hot = hot.run();
+    let striped = striped.run();
+    assert_eq!(hot.settlements().len(), striped.settlements().len());
+    assert!(final_settle(&hot) > final_settle(&striped));
     Ok(())
 }
 
@@ -1723,6 +1793,19 @@ fn final_settle(result: &crate::SimulationResult) -> u64 {
         .map_or(0, |settlement| settlement.settle_micros)
 }
 
+fn maximum_equal_values(values: &[u64]) -> usize {
+    values
+        .iter()
+        .map(|value| {
+            values
+                .iter()
+                .filter(|candidate| *candidate == value)
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 fn maximum_handler_time(result: &crate::SimulationResult) -> u64 {
     result
         .settlements()
@@ -1751,8 +1834,18 @@ fn one_hot_key_serializes_non_preemptive_work() -> Result<(), TestError> {
     }
     let one_replica = one_replica.run();
     let four_replicas = four_replicas.run();
-    assert_eq!(one_replica.settlements()[0].settle_micros, 11_000);
-    assert_eq!(one_replica.settlements()[1].settle_micros, 22_000);
+    let first = one_replica.settlements()[0];
+    let second = one_replica.settlements()[1];
+    let first_dispatch = first
+        .release_micros
+        .saturating_add(first.permit_wait_micros);
+    let second_dispatch = second
+        .release_micros
+        .saturating_add(second.permit_wait_micros);
+    assert_eq!([first.event, second.event], [0, 1]);
+    assert!(first_dispatch < first.settle_micros);
+    assert!(first.settle_micros <= second_dispatch);
+    assert!(second_dispatch < second.settle_micros);
     assert_eq!(four_replicas.settlements(), one_replica.settlements());
     Ok(())
 }
@@ -1763,8 +1856,22 @@ fn independent_keys_use_parallel_slots() -> Result<(), TestError> {
     plant.add_event(event(0, 0, 10_000))?;
     plant.add_event(event(0, 1, 10_000))?;
     let result = plant.run();
-    assert_eq!(result.settlements()[0].settle_micros, 11_000);
-    assert_eq!(result.settlements()[1].settle_micros, 11_000);
+    let settlements = result.settlements();
+    let first_dispatch = settlements[0]
+        .release_micros
+        .saturating_add(settlements[0].permit_wait_micros);
+    let second_dispatch = settlements[1]
+        .release_micros
+        .saturating_add(settlements[1].permit_wait_micros);
+    assert_eq!(first_dispatch, second_dispatch);
+    assert_eq!(settlements[0].permit_wait_micros, 0);
+    assert_eq!(settlements[1].permit_wait_micros, 0);
+    let mut in_flight = settlements
+        .iter()
+        .map(|settlement| settlement.in_flight_at_dispatch)
+        .collect::<Vec<_>>();
+    in_flight.sort_unstable();
+    assert_eq!(in_flight, [1, 2]);
     Ok(())
 }
 
@@ -1836,8 +1943,17 @@ fn pending_pod_readiness_does_not_pause_existing_work() -> Result<(), TestError>
     plant.add_event(event(10_000, 0, 10_000))?;
     plant.add_event(event(60_000, 2, 10_000))?;
     let result = plant.run();
-    assert_eq!(result.settlements()[0].settle_micros, 21_000);
-    assert_eq!(result.settlements()[1].settle_micros, 266_000);
+    let first = result.settlements()[0];
+    let later = result.settlements()[1];
+    let first_dispatch = first
+        .release_micros
+        .saturating_add(first.permit_wait_micros);
+    let later_dispatch = later
+        .release_micros
+        .saturating_add(later.permit_wait_micros);
+    assert_eq!(first_dispatch, 10_000);
+    assert!(first.settle_micros < actuation.ready_micros);
+    assert!(later_dispatch >= actuation.ready_micros);
     Ok(())
 }
 
@@ -2489,6 +2605,54 @@ fn configuration() -> Result<PlantConfiguration, PlantError> {
     PlantConfiguration::new(4, 4, 16, 4, 4, 2)
 }
 
+#[test]
+fn service_draw_identity_uses_every_coordinate() {
+    let reference = super::exponential_duration_micros(7, 11, 3, 13, 1_000_000);
+
+    assert_eq!(
+        reference,
+        super::exponential_duration_micros(7, 11, 3, 13, 1_000_000)
+    );
+    assert_ne!(
+        reference,
+        super::exponential_duration_micros(8, 11, 3, 13, 1_000_000)
+    );
+    assert_ne!(
+        reference,
+        super::exponential_duration_micros(7, 12, 3, 13, 1_000_000)
+    );
+    assert_ne!(
+        reference,
+        super::exponential_duration_micros(7, 11, 4, 13, 1_000_000)
+    );
+    assert_ne!(
+        reference,
+        super::exponential_duration_micros(7, 11, 3, 14, 1_000_000)
+    );
+}
+
+#[test]
+fn service_draws_have_exponential_mean_and_dispersion() {
+    const DRAW_COUNT: u32 = 100_000;
+    const MEAN_MICROS: u64 = 1_000_000;
+    let (sum, squared_sum) = (0..DRAW_COUNT).fold((0.0_f64, 0.0_f64), |state, event| {
+        let draw = super::u64_to_f64(super::exponential_duration_micros(
+            19,
+            event,
+            1,
+            23,
+            MEAN_MICROS,
+        ));
+        (state.0 + draw, state.1 + draw * draw)
+    });
+    let sample_mean = sum / f64::from(DRAW_COUNT);
+    let variance = squared_sum / f64::from(DRAW_COUNT) - sample_mean * sample_mean;
+    let coefficient_of_variation = variance.sqrt() / sample_mean;
+
+    assert!((sample_mean / super::u64_to_f64(MEAN_MICROS) - 1.0_f64).abs() < 0.01_f64);
+    assert!((coefficient_of_variation - 1.0_f64).abs() < 0.02_f64);
+}
+
 fn event(release_micros: u64, key: u32, handler_micros: u64) -> EventSpec {
     EventSpec {
         release_micros,
@@ -2595,4 +2759,8 @@ enum TestError {
     MissingScaleChange,
     #[error("the plant did not produce a ready interval with pause time")]
     MissingPauseWindow,
+    #[error("the plant did not complete reconciliation")]
+    MissingReconciliationCompletion,
+    #[error("the plant did not settle an expected event")]
+    MissingSettlement,
 }

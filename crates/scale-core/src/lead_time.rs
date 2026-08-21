@@ -55,6 +55,13 @@ pub enum ReadinessObservation {
         /// Inclusive current observation bound.
         through: ModelTime,
     },
+    /// A superseded group stayed pending until this terminal observation.
+    Canceled {
+        /// Exclusive prior observation bound.
+        after: ModelTime,
+        /// Inclusive cancellation-time bound.
+        at: ModelTime,
+    },
 }
 
 impl ReadinessObservation {
@@ -85,6 +92,18 @@ impl ReadinessObservation {
         Ok(Self::Pending { after, through })
     }
 
+    /// Constructs one terminal cancellation interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the interval is empty or reversed.
+    pub fn canceled(after: ModelTime, at: ModelTime) -> Result<Self, LaunchEvidenceError> {
+        if at <= after {
+            return Err(LaunchEvidenceError::InvalidInterval);
+        }
+        Ok(Self::Canceled { after, at })
+    }
+
     pub(crate) const fn bounds(self) -> (ModelTime, ModelTime) {
         match self {
             Self::Ready {
@@ -92,6 +111,7 @@ impl ReadinessObservation {
                 at_or_before,
             } => (after, at_or_before),
             Self::Pending { after, through } => (after, through),
+            Self::Canceled { after, at } => (after, at),
         }
     }
 }
@@ -438,7 +458,7 @@ impl LaunchPrior {
             duration_coverage(&fast, 0.5_f64, 120.0_f64),
             duration_coverage(&slow, 15.0_f64, 1_800.0_f64),
         ];
-        let budget = PriorArtifactBudget::new(64, 2_048, 4_096, 1.0e-4_f64, 0.001_f64, 1.0e-4_f64);
+        let budget = PriorArtifactBudget::new(64, 2_048, 8_192, 1.0e-4_f64, 0.001_f64, 1.0e-4_f64);
         // Logits of 10%, 50%, and 90% slow-mixture probability.
         let intercepts = [
             -2.197_224_577_336_219_6_f64,
@@ -828,8 +848,7 @@ impl LaunchTimeFactor {
     }
 
     pub(crate) fn posterior_value_count(&self) -> u32 {
-        u32::try_from(self.prior.fast_cells.len() + self.prior.slow_cells.len())
-            .map_or(u32::MAX, |count| count)
+        u32::try_from(self.prior.fast_cells.len() + self.prior.slow_cells.len()).unwrap_or(u32::MAX)
     }
 
     pub(crate) fn write_posterior(
@@ -1050,7 +1069,7 @@ impl RebalanceTimeFactor {
     }
 
     pub(crate) fn posterior_value_count(&self) -> u32 {
-        u32::try_from(self.prior.cells.len()).map_or(u32::MAX, |count| count)
+        u32::try_from(self.prior.cells.len()).unwrap_or(u32::MAX)
     }
 
     pub(crate) fn write_posterior(&self, values: &mut [f64], probabilities: &mut [f64]) -> bool {
@@ -1204,7 +1223,8 @@ fn launch_observation_probability(
             let slow = observation_probability(components.slow, observation, requested_at);
             (1.0_f64 - components.slow_probability) * fast + components.slow_probability * slow
         }
-        ReadinessObservation::Pending { after, through } => {
+        ReadinessObservation::Pending { after, through }
+        | ReadinessObservation::Canceled { after, at: through } => {
             let lower_seconds =
                 Duration::from_micros(after.as_micros().saturating_sub(requested_at.as_micros()))
                     .as_secs_f64();
@@ -1240,7 +1260,7 @@ fn observation_probability(
         ReadinessObservation::Ready { .. } => {
             log_normal_cdf(cell, upper_seconds) - log_normal_cdf(cell, lower_seconds)
         }
-        ReadinessObservation::Pending { .. } => {
+        ReadinessObservation::Pending { .. } | ReadinessObservation::Canceled { .. } => {
             let prior_survival = 1.0_f64 - log_normal_cdf(cell, lower_seconds);
             let current_survival = 1.0_f64 - log_normal_cdf(cell, upper_seconds);
             // Finite log-normal survival is positive. The floor only repairs
