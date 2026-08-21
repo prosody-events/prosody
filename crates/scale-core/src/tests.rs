@@ -828,7 +828,10 @@ fn test_normal_cdf(value: f64) -> f64 {
         * t
         + 0.254_829_592_f64)
         * t;
-    0.5_f64 * (1.0_f64 + sign * (1.0_f64 - polynomial * (-value * value).exp()))
+    f64::midpoint(
+        1.0_f64,
+        sign * (1.0_f64 - polynomial * (-value * value).exp()),
+    )
 }
 
 #[test]
@@ -2342,7 +2345,7 @@ fn sustainable_supply_never_falls_with_more_slots() -> Result<(), PosteriorError
 }
 
 fn cohort_fraction(count: usize) -> f64 {
-    f64::from(u32::try_from(count).map_or(u32::MAX, |count| count))
+    f64::from(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
 fn close_relative(left: f64, right: f64) -> bool {

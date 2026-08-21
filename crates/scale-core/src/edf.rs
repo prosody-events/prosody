@@ -246,8 +246,8 @@ impl DeadlineState {
             let span = crossing.min(remaining);
             let queue_after = self.queue + queue_rate * span;
             let overdue_after = self.overdue + overdue_rate * span;
-            queue_area += 0.5_f64 * (self.queue + queue_after) * span;
-            late_area += 0.5_f64 * (self.overdue + overdue_after) * span;
+            queue_area += f64::midpoint(self.queue, queue_after) * span;
+            late_area += f64::midpoint(self.overdue, overdue_after) * span;
             self.queue = queue_after;
             self.overdue = overdue_after;
             self.on_time += on_time_rate * span;
@@ -664,7 +664,7 @@ impl ArrivalPath<'_> {
             .end_seconds
             .partition_point(|end| relative >= *end)
             .min(self.rates.len().saturating_sub(1));
-        self.rates.get(index).copied().map_or(0.0_f64, |rate| rate)
+        self.rates.get(index).copied().unwrap_or(0.0_f64)
     }
 
     #[cfg(test)]
@@ -763,7 +763,7 @@ impl<'a> ArrivalCursor<'a> {
             .rates
             .get(self.segment.min(self.path.rates.len().saturating_sub(1)))
             .copied()
-            .map_or(0.0_f64, |rate| rate)
+            .unwrap_or(0.0_f64)
     }
 
     fn next_boundary(&self) -> Option<f64> {
@@ -794,7 +794,7 @@ impl<'a> ArrivalCursor<'a> {
                         .min(self.path.rates.len().saturating_sub(1)),
                 )
                 .copied()
-                .map_or(0.0_f64, |rate| rate)
+                .unwrap_or(0.0_f64)
         }
     }
 
@@ -1756,7 +1756,7 @@ mod tests {
             let release_micros = u64::from(release_seed % 2_000) * 1_000;
             let deadline_micros = release_micros + u64::from(deadline_seed % 2_000 + 1) * 1_000;
             let work = f64::from(work_seed % 1_000 + 1) / 10.0_f64;
-            let partition = u32::try_from(index).map_or(u32::MAX, |value| value);
+            let partition = u32::try_from(index).unwrap_or(u32::MAX);
             cohorts.push_values(release_micros, deadline_micros, work, partition);
             horizon_micros = horizon_micros.max(deadline_micros + 1_000_000);
         }
@@ -1790,9 +1790,9 @@ mod tests {
         capacity_seed: u64,
     ) -> bool {
         let capacities = S::f64s::from_fn(simd, |lane| {
-            let shift = u32::try_from((lane % 8) * 8).map_or(0, |value| value);
+            let shift = u32::try_from((lane % 8) * 8).unwrap_or(0);
             let rotated = capacity_seed.rotate_left(shift) & u64::from(u16::MAX);
-            let seed = u16::try_from(rotated).map_or(u16::MAX, |value| value);
+            let seed = u16::try_from(rotated).unwrap_or(u16::MAX);
             f64::from(seed % 2_000 + 1) / 100.0_f64
         });
         let batch = evaluate_prepared_step_capacities(
@@ -1849,11 +1849,11 @@ mod tests {
         for (index, ((release_seed, deadline_seed), work_seed)) in
             releases.zip(deadlines).zip(works).take(count).enumerate()
         {
-            let index_micros = u64::try_from(index).map_or(u64::MAX, |value| value) * 10;
+            let index_micros = u64::try_from(index).unwrap_or(u64::MAX) * 10;
             let release_micros = u64::from(release_seed % 1_500) * 1_000 + index_micros;
             let deadline_micros = release_micros + u64::from(deadline_seed % 1_500 + 1) * 1_000;
             let work = f64::from(work_seed % 1_000 + 1) / 10.0_f64;
-            let partition = u32::try_from(index).map_or(u32::MAX, |value| value);
+            let partition = u32::try_from(index).unwrap_or(u32::MAX);
             cohorts.push_values(release_micros, deadline_micros, work, partition);
         }
         let Ok(count_u32) = u32::try_from(count) else {
@@ -1985,7 +1985,7 @@ mod tests {
         let mut after = Vec::with_capacity(lane_count * 2);
         offsets.push(0);
         for lane in 0..lane_count {
-            let lane_u64 = u64::try_from(lane).map_or(u64::MAX, |value| value);
+            let lane_u64 = u64::try_from(lane).unwrap_or(u64::MAX);
             let first_pause = 200_000 + lane_u64 * 30_000;
             let second_pause = 1_100_000 + (lane_count - lane - 1) as u64 * 20_000;
             let first_ready = first_pause + 400_000 + lane_u64 * 10_000;
@@ -1995,11 +1995,11 @@ mod tests {
             let mut lane_ready = [first_ready, second_ready];
             lane_ready.sort_unstable();
             ready_boundaries.extend_from_slice(&lane_ready);
-            let shift = u32::try_from((lane % 8) * 8).map_or(0, |value| value);
+            let shift = u32::try_from((lane % 8) * 8).unwrap_or(0);
             let lane_supply = f64::from((supply_seed.rotate_left(shift) as u16) % 100 + 1);
             during.extend_from_slice(&[lane_supply * 0.5_f64, lane_supply * 0.75_f64]);
             after.extend_from_slice(&[lane_supply * 1.25_f64, lane_supply * 1.5_f64]);
-            offsets.push(u32::try_from(pause_micros.len()).map_or(u32::MAX, |value| value));
+            offsets.push(u32::try_from(pause_micros.len()).unwrap_or(u32::MAX));
         }
         let initial = f64::from((supply_seed as u16) % 100 + 1);
         let trajectories = SupplyTrajectoryBatch {

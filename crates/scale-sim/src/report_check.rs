@@ -169,7 +169,7 @@ pub fn label_inside_image(
     font_pixels: u32,
 ) -> bool {
     let character_count = text.chars().count().min(10_000);
-    let character_count = u32::try_from(character_count).map_or(10_000, |value| value);
+    let character_count = u32::try_from(character_count).unwrap_or(10_000);
     let width = character_count
         .saturating_mul(font_pixels)
         .saturating_mul(3)

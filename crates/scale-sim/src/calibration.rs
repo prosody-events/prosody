@@ -742,7 +742,7 @@ fn rank_bin(rank: f64) -> usize {
     UPPER_BOUNDS
         .into_iter()
         .position(|upper| rank < upper)
-        .map_or(RANK_BIN_COUNT - 1, |bin| bin)
+        .unwrap_or(RANK_BIN_COUNT - 1)
 }
 
 fn posterior_width(values: &[f64], probabilities: &[f64]) -> f64 {
@@ -751,7 +751,7 @@ fn posterior_width(values: &[f64], probabilities: &[f64]) -> f64 {
 }
 
 fn posterior_quantile(values: &[f64], probabilities: &[f64], threshold: f64) -> f64 {
-    let fallback = values.last().copied().map_or(f64::NAN, |value| value);
+    let fallback = values.last().copied().unwrap_or(f64::NAN);
     let mut cumulative = 0.0_f64;
     for (&value, &probability) in values.iter().zip(probabilities) {
         cumulative += probability;

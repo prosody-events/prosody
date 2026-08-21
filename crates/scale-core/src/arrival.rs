@@ -262,7 +262,7 @@ impl ArrivalPrior {
     }
 
     pub(crate) fn posterior_value_count(&self) -> u32 {
-        u32::try_from(self.rate_count).map_or(u32::MAX, |count| count)
+        u32::try_from(self.rate_count).unwrap_or(u32::MAX)
     }
 
     fn storage_bytes(hazard_count: usize, rate_count: usize) -> Result<usize, ArrivalPriorError> {
@@ -1004,7 +1004,7 @@ fn arrival_grids(hazard: GridSpec, rate: GridSpec) -> ArrivalGrids {
 fn geometric_grid(low: f64, log_step: f64, count: usize) -> Box<[f64]> {
     (0..count)
         .map(|index| {
-            let index = u32::try_from(index).map_or(u32::MAX, |value| value);
+            let index = u32::try_from(index).unwrap_or(u32::MAX);
             (low.ln() + f64::from(index) * log_step).exp()
         })
         .collect()

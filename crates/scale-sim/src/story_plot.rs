@@ -1147,8 +1147,8 @@ fn story_plot_horizontal_bounds(panel: &StoryPanel) -> (i32, i32) {
         .saturating_sub(key_width)
         .saturating_sub(CHART_MARGIN_RIGHT);
     (
-        i32::try_from(left).map_or(i32::MAX, |value| value),
-        i32::try_from(right).map_or(i32::MAX, |value| value),
+        i32::try_from(left).unwrap_or(i32::MAX),
+        i32::try_from(right).unwrap_or(i32::MAX),
     )
 }
 

@@ -233,7 +233,7 @@ impl BetaFactor {
         {
             let lower = f64::from(index) * width;
             let upper = f64::from(index + 1) * width;
-            *value = (lower + upper) * 0.5_f64;
+            *value = f64::midpoint(lower, upper);
             *probability = distribution.cdf(upper) - distribution.cdf(lower);
         }
         Ok(())

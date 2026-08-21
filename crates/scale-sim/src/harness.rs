@@ -927,7 +927,7 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
     /// Returns an error when generated demand exceeds a fixed plant bound.
     #[cfg_attr(feature = "hotpath", hotpath::measure(label = "harness_tick"))]
     pub fn tick(&mut self, now_micros: u64) -> Result<PlantSnapshot, PlantError> {
-        let previous_micros = self.history.view().now_micros(0).map_or(0, |time| time);
+        let previous_micros = self.history.view().now_micros(0).unwrap_or(0);
         let before = self.plant.advance_until(previous_micros);
         let schedule_context = TickContext {
             now_micros,

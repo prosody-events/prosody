@@ -112,7 +112,7 @@ pub(crate) fn shape(style: SemanticStyle, width: u32) -> ShapeStyle {
 pub(crate) fn label_margin(labels: impl Iterator<Item = usize>) -> u32 {
     let longest = labels.max().unwrap_or(0);
     let clamped = longest.saturating_mul(11).clamp(72, 220);
-    u32::try_from(clamped).map_or(220, |value| value)
+    u32::try_from(clamped).unwrap_or(220)
 }
 
 #[cfg(test)]

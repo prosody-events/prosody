@@ -155,8 +155,8 @@ pub(crate) fn sample_poisson(mean: PoissonMean, random: &mut RandomStream) -> u6
 }
 
 pub(crate) fn count_as_f64(value: u64) -> f64 {
-    let high = u32::try_from(value >> 32_u32).map_or(u32::MAX, |part| part);
-    let low = u32::try_from(value & u64::from(u32::MAX)).map_or(u32::MAX, |part| part);
+    let high = u32::try_from(value >> 32_u32).unwrap_or(u32::MAX);
+    let low = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
     f64::from(high) * 4_294_967_296.0_f64 + f64::from(low)
 }
 

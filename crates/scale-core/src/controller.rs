@@ -1098,7 +1098,7 @@ impl ScaleScratch {
 
     fn action_columns(&self, index: usize, rate: f64) -> DecisionActionColumns {
         DecisionActionColumns {
-            action_index: u32::try_from(index).map_or(u32::MAX, |value| value),
+            action_index: u32::try_from(index).unwrap_or(u32::MAX),
             late_area_mean: self.posterior_late_area_sums[index],
             replica_seconds_mean: self.posterior_replica_seconds_sums[index],
             cost: self.posterior_late_area_sums[index]
@@ -1163,8 +1163,7 @@ impl ScaleScratch {
         let candidate_count = self.posterior_miss_delay_fraction_sums.len();
         let action_count = decision_action_count(self);
         for scenario in 0..self.active_scenario_count {
-            let inner_count =
-                u32::try_from(self.active_inner_count).map_or(u32::MAX, |value| value);
+            let inner_count = u32::try_from(self.active_inner_count).unwrap_or(u32::MAX);
             let mass =
                 self.class_masses[scenario / self.active_inner_count] / f64::from(inner_count);
             let first = scenario * candidate_count;
@@ -1640,7 +1639,7 @@ fn evaluate_scenario_outcome(
 fn finalize_scenario_columns(state: &ScaleState, scratch: &mut ScaleScratch) {
     dispatch!(state.simd_level, simd => aggregate_scenario_values(simd, scratch));
     scratch.decision_curve_sample_count =
-        u32::try_from(scratch.active_scenario_count).map_or(u32::MAX, |count| count);
+        u32::try_from(scratch.active_scenario_count).unwrap_or(u32::MAX);
 }
 
 /// Returns the planning and disturbance horizons for one scenario.
@@ -1718,7 +1717,7 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
     scratch.posterior_supply_sums.fill(0.0_f64);
     scratch.decision_event_count = 0.0_f64;
     for scenario in 0..scratch.active_scenario_count {
-        let inner_count = u32::try_from(scratch.active_inner_count).map_or(u32::MAX, |value| value);
+        let inner_count = u32::try_from(scratch.active_inner_count).unwrap_or(u32::MAX);
         let cell_weight =
             scratch.class_masses[scenario / scratch.active_inner_count] / f64::from(inner_count);
         let count = count_as_f64(scratch.active_inner_count as u64);

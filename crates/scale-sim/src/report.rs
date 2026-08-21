@@ -1187,8 +1187,8 @@ fn capacity_calibration_results_match(
 }
 
 fn report_count_f64(value: u64) -> f64 {
-    let high = u32::try_from(value >> 32_u32).map_or(0, |part| part);
-    let low = u32::try_from(value & u64::from(u32::MAX)).map_or(0, |part| part);
+    let high = u32::try_from(value >> 32_u32).unwrap_or(0);
+    let low = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(0);
     f64::from(high) * 4_294_967_296.0_f64 + f64::from(low)
 }
 
@@ -1776,7 +1776,7 @@ fn posterior_quantiles(
     let Some(probabilities) = controller.posterior(query, index) else {
         return [f64::NAN; 3];
     };
-    let fallback = values.last().copied().map_or(f64::NAN, |value| value);
+    let fallback = values.last().copied().unwrap_or(f64::NAN);
     let mut quantiles = [fallback; 3];
     let thresholds = [0.1_f64, 0.5_f64, 0.9_f64];
     let mut threshold = 0_usize;

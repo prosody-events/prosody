@@ -343,7 +343,7 @@ pub(crate) fn draw_color_key<Backend: DrawingBackend>(
 ) -> Result<(), DrawingAreaErrorKind<Backend::ErrorType>> {
     let (_, height) = area.dim_in_pixel();
     let height = height.clamp(1_u32, u32::MAX >> 1_u32);
-    let height = i32::try_from(height).map_or(i32::MAX, |value| value);
+    let height = i32::try_from(height).unwrap_or(i32::MAX);
     for y in 0_i32..height {
         let density = 1.0_f64 - f64::from(y) / f64::from(height);
         area.draw(&Rectangle::new(

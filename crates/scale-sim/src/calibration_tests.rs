@@ -42,8 +42,8 @@ fn predictive_rank_maps_to_one_decile(raw_rank: u64) -> bool {
 }
 
 fn unit_interval(value: u64) -> f64 {
-    let high = u32::try_from(value >> 32_u32).map_or(0, |part| part);
-    let low = u32::try_from(value & u64::from(u32::MAX)).map_or(0, |part| part);
+    let high = u32::try_from(value >> 32_u32).unwrap_or(0);
+    let low = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(0);
     let numerator = f64::from(high) * 4_294_967_296.0_f64 + f64::from(low);
     numerator / 18_446_744_073_709_551_615.0_f64
 }

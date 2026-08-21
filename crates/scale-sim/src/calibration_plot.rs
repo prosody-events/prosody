@@ -1083,7 +1083,7 @@ fn write_ranks(directory: &Path, calibration: &CapacityCalibration) -> Result<()
             .zip(regimes)
         {
             let counts = rank_counts(calibration.trials(), regime);
-            let maximum_count = counts.iter().copied().max().map_or(1, |count| count).max(1);
+            let maximum_count = counts.iter().copied().max().unwrap_or(1).max(1);
             let total = counts.iter().copied().map(u64::from).sum::<u64>();
             let expected = count_f64(total) / 10.0_f64;
             let maximum = f64::from(maximum_count).max(expected) * 1.08_f64;
