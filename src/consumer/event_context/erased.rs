@@ -186,11 +186,11 @@ pub trait DynMapState<Item: Send + 'static>: Send + Sync {
     /// Whether the map holds no live entries.
     async fn is_empty(&self) -> Result<bool, ErasedStateError>;
 
-    /// Reads each key in input order as one isolated batch. Absent keys yield
+    /// Reads each key in input order as one aligned batch. Absent keys yield
     /// `None`, and duplicate keys retain their positions.
     async fn get_many(&self, keys: Vec<String>) -> Result<Vec<Option<Item>>, ErasedStateError>;
 
-    /// Tests each key for presence in input order as one isolated batch.
+    /// Tests each key for presence in input order as one aligned batch.
     async fn contains_many(&self, keys: Vec<String>) -> Result<Vec<bool>, ErasedStateError>;
 
     /// Inserts or overwrites `key`. Rejects the JSON-null sentinel

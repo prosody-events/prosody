@@ -710,7 +710,7 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     ///
     /// # Errors
     ///
-    /// An engine access error.
+    /// Returns an engine access error.
     fn contains_many<T: CellType>(
         &mut self,
         family: CellFamily<Self::Layout, T>,

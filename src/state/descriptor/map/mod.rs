@@ -475,7 +475,7 @@ where
         Ok(op.contains(MapKind::<KC, V>::ENTRIES, key).await?)
     }
 
-    /// Reads the values for `keys` as one isolated batch — one result per input
+    /// Reads the values for `keys` as one aligned batch — one result per input
     /// key, aligned index-wise (`results[i]` answers `keys[i]`; duplicate keys
     /// are answered per position; absent keys read `None`).
     ///
@@ -513,7 +513,7 @@ where
             .into_vec())
     }
 
-    /// Tests `keys` for presence as one isolated batch. `results[i]` answers
+    /// Tests `keys` for presence as one aligned batch. `results[i]` answers
     /// `keys[i]`. Duplicate keys keep their positions.
     ///
     /// # Errors
@@ -774,6 +774,7 @@ where
     /// # Errors
     ///
     /// Returns a key codec error or an access error from the session.
+    #[instrument(name = "map.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err)]
     pub async fn is_empty(&self) -> Result<bool, MapStateError<CellCodecError<V>>> {
         let keys = self.keys(Direction::Forward);
         futures::pin_mut!(keys);

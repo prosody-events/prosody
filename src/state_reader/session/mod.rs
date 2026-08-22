@@ -262,8 +262,8 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         }
     }
 
-    /// Presence twin of [`Self::cached_batch`]. A miss populates nothing by
-    /// design.
+    /// Matches [`Self::cached_batch`] but reads only cell presence. A miss
+    /// populates nothing by design.
     async fn cached_presence_batch(
         &self,
         selected: Option<&CollectionId>,
@@ -334,7 +334,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         self.probe_point(selection, cell).await
     }
 
-    /// Point-read instantiation of [`Self::resolve_probe`].
+    /// Uses [`Self::resolve_probe`] for a point read.
     async fn probe_point(
         &self,
         selection: &mut Option<PinnedSource>,
@@ -381,7 +381,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         self.probe_presence_batch(selection, section, batch).await
     }
 
-    /// Presence instantiation of [`Self::resolve_probe`].
+    /// Uses [`Self::resolve_probe`] for a presence batch.
     async fn probe_presence_batch(
         &self,
         selection: &mut Option<PinnedSource>,
@@ -407,7 +407,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         .await
     }
 
-    /// Batch instantiation of [`Self::resolve_probe`].
+    /// Uses [`Self::resolve_probe`] for a value batch.
     async fn probe_batch(
         &self,
         selection: &mut Option<PinnedSource>,
@@ -498,7 +498,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         }
     }
 
-    /// Presence twin of [`Self::scan_from`].
+    /// Matches [`Self::scan_from`] but streams only cell presence.
     fn scan_presence_from<'a>(
         &'a self,
         selected: Option<&'a PinnedSource>,

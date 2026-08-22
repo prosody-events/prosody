@@ -264,7 +264,7 @@ where
             .map_err(|e| StateReaderError::store(&e))
     }
 
-    /// Reads the committed values for `map_keys` as one isolated batch,
+    /// Reads the committed values for `map_keys` as one aligned batch,
     /// index-aligned to the input.
     ///
     /// # Errors
