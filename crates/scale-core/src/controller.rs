@@ -1119,9 +1119,14 @@ impl ScaleScratch {
             action_index: u32::try_from(index).unwrap_or(u32::MAX),
             late_area_mean: self.posterior_late_area_sums[index],
             replica_seconds_mean: self.posterior_replica_seconds_sums[index],
-            cost: self.posterior_late_area_sums[index]
-                + rate * self.posterior_replica_seconds_sums[index],
+            cost: self.decision_cost(index, rate),
         }
+    }
+
+    fn decision_cost(&self, index: usize, rate: f64) -> f64 {
+        self.posterior_late_area_sums[0]
+            + rate * self.posterior_replica_seconds_sums[0]
+            + self.paired_cost_differences[index]
     }
 
     /// Writes the expected cost for each candidate.
@@ -1147,8 +1152,7 @@ impl ScaleScratch {
         let action_count = decision_action_count(self);
         for (index, expected_cost) in expected_costs.iter_mut().enumerate() {
             if index < action_count {
-                *expected_cost = self.posterior_late_area_sums[index]
-                    + self.decision_rate * self.posterior_replica_seconds_sums[index];
+                *expected_cost = self.decision_cost(index, self.decision_rate);
             } else {
                 *expected_cost = f64::INFINITY;
             }

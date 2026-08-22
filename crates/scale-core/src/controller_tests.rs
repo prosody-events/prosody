@@ -80,6 +80,20 @@ fn hypothetical_prices_are_invariant_to_subinterval_model_time_shifts() -> Resul
 }
 
 #[test]
+fn exposed_cost_ladder_preserves_paired_decision_differences() -> Result<(), TestError> {
+    let (_, scratch) = i27_step(Some((8, 1)), 0.02_f64, 12)?;
+    let mut costs = [0.0_f64; 8];
+    scratch.write_decision_expected_costs(&mut costs)?;
+    let selected = argmin(&scratch.paired_cost_differences[..8]);
+
+    assert_eq!(argmin(&costs), selected, "costs={costs:?}");
+    assert!(costs.iter().enumerate().all(|(candidate, cost)| {
+        cost.to_bits() == (costs[0] + scratch.paired_cost_differences[candidate]).to_bits()
+    }));
+    Ok(())
+}
+
+#[test]
 fn committed_eight_prices_only_the_honest_replica_margin() -> Result<(), TestError> {
     let measurement = i27_measurement(Some((7, 8)), 0.02_f64, 12)?;
     assert_eq!(argmin(&measurement.costs), 0);
@@ -103,8 +117,8 @@ fn inflight_descent_prices_only_the_honest_replica_margin() -> Result<(), TestEr
     );
     // The world-slot sampler prices rung one at 1,004,478.968. It prices rung
     // eight at 1,004,678.242. The cancel-plus-fresh equality keeps this order.
-    assert!((measurement.costs[0] - 1_004_478.968_f64).abs() < 0.01_f64);
-    assert!((measurement.costs[7] - 1_004_678.242_f64).abs() < 0.01_f64);
+    assert!((measurement.costs[0] - 1_004_478.967_953_551_2_f64).abs() < 0.01_f64);
+    assert!((measurement.costs[7] - 1_004_678.241_793_565_8_f64).abs() < 0.01_f64);
     assert!(measurement.costs[0] < measurement.costs[7]);
     Ok(())
 }
@@ -665,14 +679,14 @@ fn idle_pending_descent_cost_ladder_selects_one() -> Result<(), TestError> {
     scratch.write_decision_expected_costs(&mut costs)?;
     // The world-slot sampler gives this ladder after posterior aggregation.
     let expected = [
-        14_709.608_f64,
-        14_858.794_f64,
-        14_954.249_f64,
-        15_049.703_f64,
-        15_145.158_f64,
-        15_248.122_f64,
-        15_336.068_f64,
-        14_791.059_f64,
+        14_709.607_509_029_654_f64,
+        14_858.793_771_582_883_f64,
+        14_954.248_534_462_233_f64,
+        15_049.703_297_341_583_f64,
+        15_145.158_060_220_932_f64,
+        15_248.122_141_874_586_f64,
+        15_336.067_585_979_63_f64,
+        14_791.059_016_336_865_f64,
     ];
     assert!(
         costs
