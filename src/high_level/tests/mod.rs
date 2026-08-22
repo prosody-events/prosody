@@ -29,6 +29,7 @@ use color_eyre::eyre::{ensure, eyre};
 use lifecycle::subsystem;
 use serde_json::{Value, json};
 use std::convert::Infallible;
+use std::future::ready;
 use std::slice::from_ref;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -107,40 +108,40 @@ impl FallibleHandler for EchoHandler {
     type Output = Value;
     type Payload = Value;
 
-    async fn on_message<C>(
+    fn on_message<C>(
         &self,
         _ctx: C,
         message: ConsumerMessage<Value>,
         _demand: DemandType,
-    ) -> Result<Value, Infallible>
+    ) -> impl Future<Output = Result<Value, Infallible>>
     where
         C: EventContext<Payload = Value>,
     {
-        Ok(message.payload().clone())
+        ready(Ok(message.payload().clone()))
     }
 
-    async fn on_excise<C>(
+    fn on_excise<C>(
         &self,
         _ctx: C,
         _message: ConsumerMessage<()>,
         _demand: DemandType,
-    ) -> Result<Value, Infallible>
+    ) -> impl Future<Output = Result<Value, Infallible>>
     where
         C: EventContext<Payload = Value>,
     {
-        Ok(Value::Null)
+        ready(Ok(Value::Null))
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _ctx: C,
         _trigger: Trigger,
         _demand: DemandType,
-    ) -> Result<Value, Infallible>
+    ) -> impl Future<Output = Result<Value, Infallible>>
     where
         C: EventContext<Payload = Value>,
     {
-        Ok(Value::Null)
+        ready(Ok(Value::Null))
     }
 
     async fn shutdown(self) {}
@@ -236,40 +237,40 @@ impl FallibleHandler for NoOpHandler {
     type Output = ();
     type Payload = Value;
 
-    async fn on_message<C>(
+    fn on_message<C>(
         &self,
         _ctx: C,
         _message: ConsumerMessage<Value>,
         _demand: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
-    async fn on_excise<C>(
+    fn on_excise<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<()>,
         _demand: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _ctx: C,
         _trigger: Trigger,
         _demand: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
     async fn shutdown(self) {}
@@ -287,40 +288,40 @@ impl FallibleHandler for BinaryHandler {
     type Output = ();
     type Payload = BinaryPayload;
 
-    async fn on_message<C>(
+    fn on_message<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<Self::Payload>,
         _demand: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
-    async fn on_excise<C>(
+    fn on_excise<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<()>,
         _demand: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _context: C,
         _trigger: Trigger,
         _demand: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
     async fn shutdown(self) {}

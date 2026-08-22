@@ -12,6 +12,7 @@ use color_eyre::eyre::{Result, bail, eyre};
 use futures::StreamExt;
 use quickcheck::{QuickCheck, TestResult};
 use serde_json::json;
+use std::future::ready;
 use tokio::runtime::Builder;
 use uuid::Uuid;
 
@@ -154,40 +155,40 @@ impl FallibleHandler for SkipReadProbe {
     type Output = u64;
     type Payload = serde_json::Value;
 
-    async fn on_excise<C>(
+    fn on_excise<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<()>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(0)
+        ready(Ok(0))
     }
 
-    async fn on_message<C>(
+    fn on_message<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<Self::Payload>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(0)
+        ready(Ok(0))
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _context: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(0)
+        ready(Ok(0))
     }
 
     async fn after_commit<C>(&self, context: C, _result: Result<Self::Output, Self::Error>)

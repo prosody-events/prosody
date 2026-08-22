@@ -27,6 +27,7 @@ use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crossbeam_utils::CachePadded;
 use serde_json::json;
+use std::future::ready;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -79,51 +80,51 @@ impl FallibleHandler for MockHandler {
     type Output = ();
     type Payload = serde_json::Value;
 
-    async fn on_excise<C>(
+    fn on_excise<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<()>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
         self.call_count.fetch_add(1, Ordering::Relaxed);
-        if let Some(ref error) = self.error {
+        ready(if let Some(ref error) = self.error {
             Err(error.clone())
         } else {
             Ok(())
-        }
+        })
     }
 
-    async fn on_message<C>(
+    fn on_message<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<Self::Payload>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
         self.call_count.fetch_add(1, Ordering::Relaxed);
-        if let Some(ref e) = self.error {
+        ready(if let Some(ref e) = self.error {
             Err(e.clone())
         } else {
             Ok(())
-        }
+        })
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _context: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
         self.call_count.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        ready(Ok(()))
     }
 
     async fn shutdown(self) {}
@@ -276,40 +277,40 @@ fn settlement_classification_table() {
         type Output = ();
         type Payload = serde_json::Value;
 
-        async fn on_excise<C>(
+        fn on_excise<C>(
             &self,
             _context: C,
             _message: ConsumerMessage<()>,
             _demand_type: DemandType,
-        ) -> Result<Self::Output, Self::Error>
+        ) -> impl Future<Output = Result<Self::Output, Self::Error>>
         where
             C: EventContext<Payload = Self::Payload>,
         {
-            Ok(())
+            ready(Ok(()))
         }
 
-        async fn on_message<C>(
+        fn on_message<C>(
             &self,
             _context: C,
             _message: ConsumerMessage<Self::Payload>,
             _demand_type: DemandType,
-        ) -> Result<Self::Output, Self::Error>
+        ) -> impl Future<Output = Result<Self::Output, Self::Error>>
         where
             C: EventContext<Payload = Self::Payload>,
         {
-            Ok(())
+            ready(Ok(()))
         }
 
-        async fn on_timer<C>(
+        fn on_timer<C>(
             &self,
             _context: C,
             _trigger: Trigger,
             _demand_type: DemandType,
-        ) -> Result<Self::Output, Self::Error>
+        ) -> impl Future<Output = Result<Self::Output, Self::Error>>
         where
             C: EventContext<Payload = Self::Payload>,
         {
-            Ok(())
+            ready(Ok(()))
         }
 
         async fn shutdown(self) {}

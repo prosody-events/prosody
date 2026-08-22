@@ -1,4 +1,5 @@
 use super::*;
+use std::future::ready;
 
 #[tokio::test]
 async fn dedup_skip_records_no_second_marker() -> color_eyre::Result<()> {
@@ -152,52 +153,52 @@ impl FallibleHandler for ApplyProbe {
     type Output = ();
     type Payload = serde_json::Value;
 
-    async fn on_excise<C>(
+    fn on_excise<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<()>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
         self.log.lock().push(ApplyEvent::Handler);
-        match &self.error {
+        ready(match &self.error {
             Some(error) => Err(error.clone()),
             None => Ok(()),
-        }
+        })
     }
 
-    async fn on_message<C>(
+    fn on_message<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<Self::Payload>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
         self.log.lock().push(ApplyEvent::Handler);
-        match &self.error {
+        ready(match &self.error {
             Some(e) => Err(e.clone()),
             None => Ok(()),
-        }
+        })
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _context: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
         self.log.lock().push(ApplyEvent::Handler);
-        match &self.error {
+        ready(match &self.error {
             Some(e) => Err(e.clone()),
             None => Ok(()),
-        }
+        })
     }
 
     async fn after_commit<C>(&self, _context: C, _result: Result<Self::Output, Self::Error>)
