@@ -14,7 +14,10 @@ use crate::edf::{
     SupplyTrajectoryBatch, evaluate_prepared_step, evaluate_prepared_step_capacities,
     evaluate_prepared_trajectory, evaluate_prepared_trajectory_batch, prepare,
 };
-use crate::lead_time::{LaunchComponentSummary, LaunchTimeFactor, RebalanceTimeFactor};
+use crate::lead_time::{
+    LaunchComponentSummary, LaunchHypothesis, LaunchTimeFactor, RebalanceHypothesis,
+    RebalanceTimeFactor,
+};
 use crate::partition::PartitionFactor;
 use crate::planning::{
     ActionColumns, billing_replica_seconds, complete_horizon_micros, select_paired_action,
@@ -1501,6 +1504,8 @@ fn evaluate_one_scenario(
         cells.arrival_path_end_seconds,
         cells.arrival_path_rates,
     );
+    let commitment_random = scenario_random(sample, scenario_count, ScenarioRole::Commitment);
+    let transition_hypotheses = sample_transition_hypotheses(state, &commitment_random);
     prepare_supply_trajectories(
         state,
         shared,
@@ -1508,7 +1513,8 @@ fn evaluate_one_scenario(
         &ScenarioDraws {
             current_supply,
             placement_random,
-            commitment_random: scenario_random(sample, scenario_count, ScenarioRole::Commitment),
+            commitment_random,
+            transition_hypotheses,
         },
     );
     evaluate_scenario_outcome(
@@ -2064,6 +2070,19 @@ struct ScenarioDraws {
     current_supply: f64,
     placement_random: RandomStream,
     commitment_random: RandomStream,
+    transition_hypotheses: TransitionHypotheses,
+}
+
+#[derive(Clone, Copy)]
+struct TransitionHypotheses {
+    launch: LaunchHypothesis,
+    rebalance: RebalanceHypothesis,
+}
+
+#[derive(Clone, Copy)]
+struct HypotheticalDraws<'a> {
+    random: &'a RandomStream,
+    hypotheses: TransitionHypotheses,
 }
 
 #[cfg_attr(
@@ -2123,7 +2142,10 @@ fn prepare_candidate_trajectories(
             state,
             workspace,
             shared.actuation_commitments,
-            &draws.commitment_random,
+            HypotheticalDraws {
+                random: &draws.commitment_random,
+                hypotheses: draws.transition_hypotheses,
+            },
             candidate,
             now_micros,
         );
@@ -2171,7 +2193,10 @@ fn prepare_candidate_trajectories(
                 supply: active.after_supply,
                 ready_micros: active.ready_micros,
             },
-            &draws.commitment_random,
+            HypotheticalDraws {
+                random: &draws.commitment_random,
+                hypotheses: draws.transition_hypotheses,
+            },
         );
         workspace
             .trajectory
@@ -2290,7 +2315,7 @@ fn push_candidate_events(
     state: &ScaleState,
     workspace: &mut ScenarioWorkspace,
     actuation_commitments: &ActuationCommitments,
-    random: &RandomStream,
+    draws: HypotheticalDraws<'_>,
     candidate: u32,
     now_micros: u64,
 ) -> (usize, usize, u32) {
@@ -2332,12 +2357,12 @@ fn push_candidate_events(
             TransitionDirection::Down
         };
         let replica_delta = candidate.abs_diff(state.current_replicas);
-        let (pause_micros, ready_micros) = sample_transition_times(
+        let (pause_micros, ready_micros) = sample_hypothetical_transition_times(
             state,
-            random,
+            draws.random,
             now_micros,
-            now_micros,
-            0.0_f64,
+            draws.hypotheses,
+            0,
             direction,
             replica_delta,
         );
@@ -2365,10 +2390,11 @@ fn append_reactive_repairs(
     workspace: &mut ScenarioWorkspace,
     mean_trajectory: MeanRateTrajectory<'_>,
     mut transition: ReactiveTransition,
-    random: &RandomStream,
+    draws: HypotheticalDraws<'_>,
 ) {
     let now_micros = state.model_time.as_micros();
     let mut final_repair = None;
+    let mut next_slot = 1_u64;
     for (boundary, rate) in mean_trajectory.rates().enumerate() {
         let requested_micros = now_micros.saturating_add(
             state
@@ -2386,7 +2412,17 @@ fn append_reactive_repairs(
         if requested_micros < transition.ready_micros {
             continue;
         }
-        append_reactive_repair(state, shared, workspace, repair, &mut transition, random);
+        if append_reactive_repair(
+            state,
+            shared,
+            workspace,
+            repair,
+            &mut transition,
+            draws,
+            next_slot,
+        ) {
+            next_slot += 1;
+        }
     }
     if let Some(mut repair) = final_repair
         && repair.requested_micros < transition.ready_micros
@@ -2398,7 +2434,15 @@ fn append_reactive_repairs(
             .div_ceil(report_interval);
         repair.requested_micros =
             now_micros.saturating_add(report_count.saturating_mul(report_interval));
-        append_reactive_repair(state, shared, workspace, repair, &mut transition, random);
+        let _ = append_reactive_repair(
+            state,
+            shared,
+            workspace,
+            repair,
+            &mut transition,
+            draws,
+            next_slot,
+        );
     }
 }
 
@@ -2408,15 +2452,16 @@ fn append_reactive_repair(
     workspace: &mut ScenarioWorkspace,
     repair: ReactiveRepair,
     transition: &mut ReactiveTransition,
-    random: &RandomStream,
-) {
+    draws: HypotheticalDraws<'_>,
+    slot: u64,
+) -> bool {
     let action_count = shared.action_count;
     let target = repair_target(
         &workspace.posterior_resource_supply[..action_count],
         repair.rate,
     );
     if target == transition.replicas {
-        return;
+        return false;
     }
     let direction = if target > transition.replicas {
         TransitionDirection::Up
@@ -2424,12 +2469,12 @@ fn append_reactive_repair(
         TransitionDirection::Down
     };
     let replica_delta = target.abs_diff(transition.replicas);
-    let (pause_micros, sampled_ready_micros) = sample_transition_times(
+    let (pause_micros, sampled_ready_micros) = sample_hypothetical_transition_times(
         state,
-        random,
+        draws.random,
         repair.requested_micros,
-        repair.requested_micros,
-        0.0_f64,
+        draws.hypotheses,
+        slot,
         direction,
         replica_delta,
     );
@@ -2456,6 +2501,7 @@ fn append_reactive_repair(
     transition.replicas = target;
     transition.supply = after;
     transition.ready_micros = repair_ready_micros;
+    true
 }
 
 /// Returns the smallest replica target whose supply covers one rate.
@@ -2533,10 +2579,11 @@ fn sample_commitment_pauses(
     now_micros
 }
 
-/// Samples one transition through its stable request-time identity.
+/// Samples one real transition through its fixed request time.
 ///
-/// At zero elapsed time, retained and fresh paths use this function with
-/// bit-identical inputs and produce bit-identical results.
+/// A real request time is a physical constant, so the draw is stable across
+/// ticks. The price moves only through elapsed-time survival conditioning.
+/// Hypothetical transitions use [`sample_hypothetical_transition_times`].
 fn sample_transition_times(
     state: &ScaleState,
     random: &RandomStream,
@@ -2558,6 +2605,50 @@ fn sample_transition_times(
     let rebalance_seconds = state
         .rebalance_time
         .sample_remaining_seconds(0.0_f64, &mut rebalance_random);
+    (
+        pause_micros,
+        pause_micros.saturating_add(seconds_to_micros(rebalance_seconds)),
+    )
+}
+
+/// Samples the world and slot residuals for hypothetical transitions.
+///
+/// The Commitment stream owns this layout. Domain 0 is launch. Domain 1 is
+/// rebalance. Counter 0 in each domain selects the world hypothesis. A nested
+/// slot domain uses counter 0 for mode and counter 1 for the log-normal value.
+fn sample_transition_hypotheses(state: &ScaleState, random: &RandomStream) -> TransitionHypotheses {
+    let mut launch_random = random.clone().domain(0);
+    let launch = state
+        .lead_time
+        .hypothesis_from_uniform(launch_random.open_unit_f64());
+    let mut rebalance_random = random.clone().domain(1);
+    let rebalance = state
+        .rebalance_time
+        .hypothesis_from_uniform(rebalance_random.open_unit_f64());
+    TransitionHypotheses { launch, rebalance }
+}
+
+fn sample_hypothetical_transition_times(
+    state: &ScaleState,
+    random: &RandomStream,
+    requested_at_micros: u64,
+    hypotheses: TransitionHypotheses,
+    slot: u64,
+    direction: TransitionDirection,
+    replica_delta: u32,
+) -> (u64, u64) {
+    let mut launch_random = random.clone().domain(0).domain(slot);
+    let launch_seconds = state.lead_time.sample_hypothesis_seconds(
+        hypotheses.launch,
+        direction,
+        replica_delta,
+        &mut launch_random,
+    );
+    let pause_micros = requested_at_micros.saturating_add(seconds_to_micros(launch_seconds));
+    let mut rebalance_random = random.clone().domain(1).domain(slot);
+    let rebalance_seconds = state
+        .rebalance_time
+        .sample_hypothesis_seconds(hypotheses.rebalance, &mut rebalance_random);
     (
         pause_micros,
         pause_micros.saturating_add(seconds_to_micros(rebalance_seconds)),

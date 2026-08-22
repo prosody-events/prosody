@@ -622,6 +622,9 @@ pub(crate) struct LaunchTimeFactor {
     last_replica_delta: u32,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct LaunchHypothesis(usize);
+
 impl LaunchTimeFactor {
     pub(crate) fn new(prior: &LaunchPrior) -> Self {
         Self {
@@ -829,6 +832,35 @@ impl LaunchTimeFactor {
         ) - elapsed_seconds
     }
 
+    pub(crate) fn hypothesis_from_uniform(&self, uniform: f64) -> LaunchHypothesis {
+        LaunchHypothesis(weighted_index(&self.weights, uniform))
+    }
+
+    pub(crate) fn sample_hypothesis_seconds(
+        &self,
+        hypothesis: LaunchHypothesis,
+        direction: TransitionDirection,
+        replica_delta: u32,
+        random: &mut RandomStream,
+    ) -> f64 {
+        let components = self.components(hypothesis.0, replica_delta);
+        let slow_probability = match direction {
+            TransitionDirection::Up => components.slow_probability,
+            TransitionDirection::Down => 0.0_f64,
+        };
+        let cell = if random.open_unit_f64() < slow_probability {
+            components.slow
+        } else {
+            components.fast
+        };
+        sample_log_normal_after(
+            cell,
+            0.0_f64,
+            self.prior.budget.path_time_error_seconds(),
+            random,
+        )
+    }
+
     pub(crate) fn posterior_value_count(&self) -> u32 {
         u32::try_from(self.prior.fast_cells.len() + self.prior.slow_cells.len()).unwrap_or(u32::MAX)
     }
@@ -937,6 +969,9 @@ pub(crate) struct RebalanceTimeFactor {
     likelihoods: Vec<f64>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RebalanceHypothesis(usize);
+
 impl RebalanceTimeFactor {
     pub(crate) fn new(prior: &RebalancePrior) -> Self {
         Self {
@@ -1041,6 +1076,24 @@ impl RebalanceTimeFactor {
             self.prior.budget.path_time_error_seconds(),
             random,
         ) - elapsed_seconds
+    }
+
+    pub(crate) fn hypothesis_from_uniform(&self, uniform: f64) -> RebalanceHypothesis {
+        RebalanceHypothesis(weighted_index(&self.weights, uniform))
+    }
+
+    pub(crate) fn sample_hypothesis_seconds(
+        &self,
+        hypothesis: RebalanceHypothesis,
+        random: &mut RandomStream,
+    ) -> f64 {
+        let _mode_uniform = random.open_unit_f64();
+        sample_log_normal_after(
+            self.prior.cells[hypothesis.0],
+            0.0_f64,
+            self.prior.budget.path_time_error_seconds(),
+            random,
+        )
     }
 
     pub(crate) fn posterior_value_count(&self) -> u32 {
@@ -1256,6 +1309,18 @@ fn logistic(value: f64) -> f64 {
 
 fn log_normal_mean(cell: DurationCell) -> f64 {
     (cell.mu_log_seconds + 0.5_f64 * cell.sigma_log_seconds * cell.sigma_log_seconds).exp()
+}
+
+fn weighted_index(weights: &[f64], uniform: f64) -> usize {
+    let selector = uniform * weights.iter().sum::<f64>();
+    let mut cumulative = 0.0_f64;
+    for (index, weight) in weights.iter().copied().enumerate() {
+        cumulative += weight;
+        if cumulative >= selector {
+            return index;
+        }
+    }
+    weights.len().saturating_sub(1)
 }
 
 fn log_normal_cdf(cell: DurationCell, elapsed_seconds: f64) -> f64 {

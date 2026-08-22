@@ -5,8 +5,9 @@ use thiserror::Error;
 
 use super::{
     SCHEDULED_PARTITION, ScenarioRole, balanced_partition_owner, balanced_partition_range,
-    partition_replica_capacity, prepare_work_cohorts, repair_target, sample_transition_times,
-    scenario_event_count, scenario_horizons, scenario_random,
+    partition_replica_capacity, prepare_work_cohorts, repair_target,
+    sample_hypothetical_transition_times, sample_transition_hypotheses, sample_transition_times,
+    scenario_event_count, scenario_horizons, scenario_random, select_target,
 };
 use crate::arrival::MeanRateTrajectory;
 use crate::edf::{
@@ -14,11 +15,12 @@ use crate::edf::{
 };
 use crate::types::{EventCohorts, SlotSecondCohorts};
 use crate::{
-    ActuationCommitment, ArrivalPrior, ArrivalPriorError, BacklogCohort, CapacityGrid,
-    CapacityGridError, CapacityPrior, Configuration, ConfigurationError, DecisionCurveError,
-    DemandClass, LaunchPrior, ModelTime, ObservationBuffer, ObservationError, OccupancyTransition,
-    PosteriorError, PosteriorQuery, RebalancePrior, ReliabilityPrior, ResourceWindow,
-    ScaleDecision, ScaleScratch, ScaleState, ScheduledRelease, ServiceObjective, step,
+    ActuationCommitment, ArrivalPrior, ArrivalPriorError, BacklogCohort, CalendarArtifactId,
+    CalendarRateSegment, CapacityGrid, CapacityGridError, CapacityPrior, Configuration,
+    ConfigurationError, DecisionCurveError, DemandClass, LaunchPrior, ModelTime, ObservationBuffer,
+    ObservationError, OccupancyTransition, PosteriorError, PosteriorQuery, RebalancePrior,
+    ReliabilityPrior, ResourceWindow, ScaleDecision, ScaleScratch, ScaleState, ScheduledRelease,
+    ServiceObjective, step,
 };
 
 struct I27Measurement {
@@ -29,6 +31,55 @@ struct I27Measurement {
 }
 
 #[test]
+fn hypothetical_prices_are_invariant_to_subinterval_model_time_shifts() -> Result<(), TestError> {
+    let (mut baseline, _) = i27_step(None, 0.02_f64, 12)?;
+    let (mut shifted, _) = i27_step(None, 0.02_f64, 12)?;
+    shifted.model_time = ModelTime::from_micros(baseline.model_time.as_micros() + 100_000);
+    let mut baseline_scratch = baseline.new_scratch()?;
+    let mut shifted_scratch = shifted.new_scratch()?;
+    let mut observation = ObservationBuffer::new(&baseline.configuration)?;
+    let inputs = observation.observation();
+
+    let baseline_decision = select_target(
+        &mut baseline,
+        &mut baseline_scratch,
+        inputs.cohorts,
+        inputs.backlog,
+        inputs.scheduled_releases,
+        inputs.calendar,
+        inputs.actuation_commitments,
+    );
+    let shifted_decision = select_target(
+        &mut shifted,
+        &mut shifted_scratch,
+        inputs.cohorts,
+        inputs.backlog,
+        inputs.scheduled_releases,
+        inputs.calendar,
+        inputs.actuation_commitments,
+    );
+    let ScaleDecision::Apply(baseline_apply) = baseline_decision else {
+        return Err(TestError::UnexpectedDecision);
+    };
+    let ScaleDecision::Apply(shifted_apply) = shifted_decision else {
+        return Err(TestError::UnexpectedDecision);
+    };
+    assert_eq!(baseline_apply.target, shifted_apply.target);
+    let mut baseline_costs = vec![0.0_f64; baseline_scratch.decision_candidate_count()];
+    let mut shifted_costs = vec![0.0_f64; shifted_scratch.decision_candidate_count()];
+    baseline_scratch.write_decision_expected_costs(&mut baseline_costs)?;
+    shifted_scratch.write_decision_expected_costs(&mut shifted_costs)?;
+    assert!(
+        baseline_costs
+            .iter()
+            .zip(&shifted_costs)
+            .all(|(left, right)| left.to_bits() == right.to_bits()),
+        "baseline={baseline_costs:?}, shifted={shifted_costs:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn committed_eight_prices_only_the_honest_replica_margin() -> Result<(), TestError> {
     let measurement = i27_measurement(Some((7, 8)), 0.02_f64, 12)?;
     assert_eq!(argmin(&measurement.costs), 0);
@@ -36,8 +87,8 @@ fn committed_eight_prices_only_the_honest_replica_margin() -> Result<(), TestErr
     let replica_margin =
         3.0_f64 * (measurement.replica_seconds[7] - measurement.replica_seconds[0]);
     // The objective charges 3.0 per replica-second. The sampled difference is
-    // 8.277257 replica-seconds, so the honest margin is 3.0 * 8.277257.
-    assert!((replica_margin - 24.831_772_f64).abs() < 0.01_f64);
+    // 6.102541 replica-seconds, so the honest margin is 3.0 * 6.102541.
+    assert!((replica_margin - 18.307_623_f64).abs() < 0.01_f64);
     assert!(measurement.costs[0] < measurement.costs[7]);
     Ok(())
 }
@@ -50,10 +101,10 @@ fn inflight_descent_prices_only_the_honest_replica_margin() -> Result<(), TestEr
         &measurement.candidate_transition_times[1..7],
         &fresh.candidate_transition_times[1..7]
     );
-    // The repair remap prices rung one at 1,004,478.968 and rung eight at
-    // 1,004,684.153. The cancel-plus-fresh equality preserves this ordering.
+    // The world-slot sampler prices rung one at 1,004,478.968. It prices rung
+    // eight at 1,004,678.242. The cancel-plus-fresh equality keeps this order.
     assert!((measurement.costs[0] - 1_004_478.968_f64).abs() < 0.01_f64);
-    assert!((measurement.costs[7] - 1_004_684.153_f64).abs() < 0.01_f64);
+    assert!((measurement.costs[7] - 1_004_678.242_f64).abs() < 0.01_f64);
     assert!(measurement.costs[0] < measurement.costs[7]);
     Ok(())
 }
@@ -292,73 +343,175 @@ fn balanced_partition_ranges_match_owner_order(partition_seed: u8, replica_seed:
 }
 
 #[test]
-fn repair_draws_key_by_absolute_request_time() -> Result<(), TestError> {
-    // A modeled repair is a transition requested at an absolute report
-    // boundary. Its pause and ready times must come from the shared
-    // transition sampler keyed by that boundary time. The search below
-    // recovers the (scenario, boundary) pair behind each observed repair
-    // bit pattern; a report-relative key has no matching pair.
-    let (state, scratch) = i27_step(None, 0.02_f64, 12)?;
-    let workspace = &scratch.scenario_workspaces[0];
-    let now_micros = 13_000_000_u64;
-    let interval_micros = 1_000_000_u64;
-    let scenario_count = 256_usize;
-    let current_replicas = 8_u32;
-    let mut repair_count = 0_usize;
-    for candidate_index in 0..8_usize {
-        let first = workspace.trajectory_offsets[candidate_index] as usize;
-        let last = workspace.trajectory_offsets[candidate_index + 1] as usize;
-        let candidate = candidate_index as u32 + 1;
-        // A non-current candidate opens with its fixed fresh transition;
-        // the hold candidate has repair events only.
-        let repairs_from = if candidate == current_replicas {
-            first
-        } else {
-            first + 1
+fn equal_repair_slots_share_event_residuals_across_rungs() -> Result<(), TestError> {
+    let (state, scratch) = idle_ladder_step(256, true)?;
+    let mean = MeanRateTrajectory::new(&scratch.mean_arrival_rates);
+    let workspace_count = scratch
+        .scenario_workspaces
+        .len()
+        .min(scratch.active_scenario_count)
+        .max(1);
+    let found = scratch
+        .scenario_workspaces
+        .iter()
+        .take(workspace_count)
+        .find_map(|workspace| {
+            let repairs = produced_repairs(&state, workspace, mean);
+            repairs.iter().enumerate().find_map(|(index, left)| {
+                repairs[index + 1..]
+                    .iter()
+                    .find(|right| {
+                        left.rung != right.rung
+                            && left.slot == right.slot
+                            && left.direction == right.direction
+                            && left.delta == right.delta
+                    })
+                    .map(|right| (*left, *right))
+            })
+        });
+    let Some((left, right)) = found else {
+        return Err(TestError::UnexpectedDecision);
+    };
+    assert_eq!(left.launch_residual, right.launch_residual);
+    assert_eq!(left.rebalance_residual, right.rebalance_residual);
+
+    let scenario_count = scratch.active_scenario_count;
+    assert!((0..scenario_count as u32).any(|scenario| {
+        let random = scenario_random(scenario, scenario_count, ScenarioRole::Commitment);
+        let hypotheses = sample_transition_hypotheses(&state, &random);
+        let sampled = sample_hypothetical_transition_times(
+            &state,
+            &random,
+            left.requested,
+            hypotheses,
+            left.slot,
+            left.direction,
+            left.delta,
+        );
+        sampled.0 - left.requested == left.launch_residual
+            && sampled.1 - sampled.0 == left.rebalance_residual
+    }));
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ProducedRepair {
+    rung: usize,
+    slot: u64,
+    requested: u64,
+    direction: crate::TransitionDirection,
+    delta: u32,
+    launch_residual: u64,
+    rebalance_residual: u64,
+}
+
+struct RepairReplay {
+    event: usize,
+    replicas: u32,
+    ready: u64,
+    slot: u64,
+}
+
+fn produced_repairs(
+    state: &ScaleState,
+    workspace: &super::ScenarioWorkspace,
+    mean: MeanRateTrajectory<'_>,
+) -> Vec<ProducedRepair> {
+    let now = state.model_time.as_micros();
+    let interval = state.configuration.report_interval_micros;
+    let mut repairs = Vec::new();
+    for rung in 0..8_usize {
+        let first = workspace.trajectory_offsets[rung] as usize;
+        let last = workspace.trajectory_offsets[rung + 1] as usize;
+        if first == last {
+            continue;
+        }
+        let candidate = rung as u32 + 1;
+        let fresh =
+            usize::from(first + 1 < last && workspace.trajectory.targets[first + 1] == candidate);
+        let event = first + 1 + fresh;
+        let mut replay = RepairReplay {
+            event,
+            replicas: workspace.trajectory.targets[event - 1],
+            ready: workspace.trajectory.ready_micros[event - 1],
+            slot: 1,
         };
-        for event in repairs_from..last {
-            repair_count += 1;
-            let target = workspace.trajectory.targets[event];
-            let previous = if event == first {
-                current_replicas
-            } else {
-                workspace.trajectory.targets[event - 1]
-            };
-            assert_ne!(target, previous, "a repair must change the replica count");
-            let direction = if target > previous {
-                crate::TransitionDirection::Up
-            } else {
-                crate::TransitionDirection::Down
-            };
-            let replica_delta = target.abs_diff(previous);
-            let times = (
-                workspace.trajectory.pause_micros[event],
-                workspace.trajectory.sampled_ready_micros[event],
-            );
-            let boundary_count = times.0.saturating_sub(now_micros).div_ceil(interval_micros);
-            let matched = (0..scenario_count as u32).any(|scenario| {
-                let random = scenario_random(scenario, scenario_count, ScenarioRole::Commitment);
-                (1..=boundary_count).any(|boundary| {
-                    let requested = now_micros + boundary * interval_micros;
-                    sample_transition_times(
-                        &state,
-                        &random,
-                        requested,
-                        requested,
-                        0.0_f64,
-                        direction,
-                        replica_delta,
-                    ) == times
-                })
-            });
-            assert!(
-                matched,
-                "repair times {times:?} match no absolute-keyed draw"
+        let mut final_repair = None;
+        for (boundary, rate) in mean.rates().enumerate() {
+            let requested = now.saturating_add(interval.saturating_mul(boundary as u64 + 1));
+            final_repair = Some((requested, rate));
+            if requested < replay.ready {
+                continue;
+            }
+            let target = repair_target(&workspace.posterior_resource_supply, rate);
+            if target == replay.replicas {
+                continue;
+            }
+            push_produced_repair(
+                workspace,
+                rung,
+                requested,
+                target,
+                &mut replay,
+                &mut repairs,
             );
         }
+        if let Some((requested, rate)) = final_repair
+            && requested < replay.ready
+        {
+            let requested = now.saturating_add(
+                replay
+                    .ready
+                    .saturating_sub(now)
+                    .div_ceil(interval)
+                    .saturating_mul(interval),
+            );
+            let target = repair_target(&workspace.posterior_resource_supply, rate);
+            if target != replay.replicas {
+                push_produced_repair(
+                    workspace,
+                    rung,
+                    requested,
+                    target,
+                    &mut replay,
+                    &mut repairs,
+                );
+            }
+        }
+        assert_eq!(replay.event, last);
     }
-    assert!(repair_count >= 1, "the fixture produced no repair event");
-    Ok(())
+    repairs
+}
+
+fn push_produced_repair(
+    workspace: &super::ScenarioWorkspace,
+    rung: usize,
+    requested: u64,
+    target: u32,
+    replay: &mut RepairReplay,
+    repairs: &mut Vec<ProducedRepair>,
+) {
+    assert_eq!(workspace.trajectory.targets[replay.event], target);
+    let direction = if target > replay.replicas {
+        crate::TransitionDirection::Up
+    } else {
+        crate::TransitionDirection::Down
+    };
+    let pause = workspace.trajectory.pause_micros[replay.event];
+    let sampled_ready = workspace.trajectory.sampled_ready_micros[replay.event];
+    repairs.push(ProducedRepair {
+        rung,
+        slot: replay.slot,
+        requested,
+        direction,
+        delta: target.abs_diff(replay.replicas),
+        launch_residual: pause - requested,
+        rebalance_residual: sampled_ready - pause,
+    });
+    replay.replicas = target;
+    replay.ready = workspace.trajectory.ready_micros[replay.event];
+    replay.event += 1;
+    replay.slot += 1;
 }
 
 #[test]
@@ -378,29 +531,34 @@ fn flat_predictive_mean_has_no_successor_repair() {
 #[test]
 fn commitment_domains_form_distinct_midpoint_permutations() {
     const COUNT: usize = 64;
-    let first = (0..COUNT)
-        .map(|scenario| {
-            scenario_random(scenario as u32, COUNT, ScenarioRole::Commitment)
-                .domain(11)
-                .open_unit_f64()
+    let coordinates = [0_u64, 1].map(|domain| {
+        [0_u64, 1].map(|counter| {
+            (0..COUNT)
+                .map(|scenario| {
+                    let mut random =
+                        scenario_random(scenario as u32, COUNT, ScenarioRole::Commitment)
+                            .domain(domain);
+                    if counter == 1 {
+                        let _ = random.open_unit_f64();
+                    }
+                    random.open_unit_f64()
+                })
+                .collect::<Vec<_>>()
         })
-        .collect::<Vec<_>>();
-    let second = (0..COUNT)
-        .map(|scenario| {
-            scenario_random(scenario as u32, COUNT, ScenarioRole::Commitment)
-                .domain(12)
-                .open_unit_f64()
-        })
-        .collect::<Vec<_>>();
-    let mut sorted = first.clone();
-    sorted.sort_by(f64::total_cmp);
-
-    assert!(sorted.iter().enumerate().all(|(rank, quantile)| {
-        let rank = u32::try_from(rank).unwrap_or(u32::MAX);
-        let count = u32::try_from(COUNT).unwrap_or(u32::MAX);
-        quantile.to_bits() == ((f64::from(rank) + 0.5_f64) / f64::from(count)).to_bits()
-    }));
-    assert_ne!(first, second);
+    });
+    for permutation in coordinates.iter().flatten() {
+        let mut sorted = permutation.clone();
+        sorted.sort_by(f64::total_cmp);
+        assert!(sorted.iter().enumerate().all(|(rank, quantile)| {
+            let rank = u32::try_from(rank).unwrap_or(u32::MAX);
+            let count = u32::try_from(COUNT).unwrap_or(u32::MAX);
+            quantile.to_bits() == ((f64::from(rank) + 0.5_f64) / f64::from(count)).to_bits()
+        }));
+    }
+    assert_ne!(coordinates[0][0], coordinates[1][0]);
+    assert_ne!(coordinates[0][1], coordinates[1][1]);
+    assert_ne!(coordinates[0][0], coordinates[0][1]);
+    assert_ne!(coordinates[1][0], coordinates[1][1]);
 }
 
 #[test]
@@ -438,12 +596,15 @@ fn identical_posterior_decisions_have_identical_cost_ladders() -> Result<(), Tes
     Ok(())
 }
 
-#[test]
-fn idle_pending_descent_cost_ladder_selects_one() -> Result<(), TestError> {
+fn idle_ladder_step(
+    sample_count: u32,
+    alternating_calendar: bool,
+) -> Result<(ScaleState, ScaleScratch), TestError> {
     let mut configuration = test_configuration()?;
     configuration.partition_count = 64;
+    configuration.calendar_segment_count_max = 64;
     configuration.replica_count_max = 8;
-    configuration.posterior_sample_count = 4_096;
+    configuration.posterior_sample_count = sample_count;
     configuration.report_interval_micros = 100_000;
     configuration.arrival_prior = ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?;
     configuration.capacity_change_rate_per_second = 1.0_f64 / 300.0_f64;
@@ -457,32 +618,61 @@ fn idle_pending_descent_cost_ladder_selects_one() -> Result<(), TestError> {
     let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     observation.advance_model_time(ModelTime::from_micros(240_000_000))?;
-    observation.set_arrivals(0, 240_000_000)?;
+    if !alternating_calendar {
+        observation.set_arrivals(0, 240_000_000)?;
+    }
+    if alternating_calendar {
+        observation.set_calendar_forecast(
+            CalendarArtifactId(1),
+            0.001_f64,
+            &[
+                CalendarRateSegment::new(
+                    0,
+                    240_000_000,
+                    500_000_000,
+                    1_000_000_000_000.0_f64,
+                    0.001_f64,
+                )?,
+                CalendarRateSegment::new(1, 500_000_000, 600_000_000, 0.001_f64, 1.0_f64)?,
+            ],
+        )?;
+    }
     observation.set_current_replicas(8)?;
-    observation.push_actuation_commitment(ActuationCommitment::launching(
-        8,
-        1,
-        ModelTime::from_micros(239_000_000),
-    )?)?;
-
+    let commitment = if alternating_calendar {
+        ActuationCommitment::rebalancing(
+            8,
+            4,
+            ModelTime::from_micros(238_000_000),
+            ModelTime::from_micros(239_000_000),
+        )?
+    } else {
+        ActuationCommitment::launching(8, 1, ModelTime::from_micros(239_000_000))?
+    };
+    observation.push_actuation_commitment(commitment)?;
     if !matches!(
         step(&mut state, &mut scratch, observation.observation()),
         ScaleDecision::Apply(_)
     ) {
         return Err(TestError::UnexpectedDecision);
     }
+    Ok((state, scratch))
+}
+
+#[test]
+fn idle_pending_descent_cost_ladder_selects_one() -> Result<(), TestError> {
+    let (_, scratch) = idle_ladder_step(4_096, false)?;
     let mut costs = vec![0.0_f64; scratch.decision_candidate_count()];
     scratch.write_decision_expected_costs(&mut costs)?;
-    // The repair remap gives this ladder after posterior aggregation.
+    // The world-slot sampler gives this ladder after posterior aggregation.
     let expected = [
         14_709.608_f64,
-        14_870.643_f64,
-        14_966.448_f64,
-        15_062.253_f64,
-        15_158.058_f64,
-        15_254.765_f64,
-        15_349.668_f64,
-        14_738.688_f64,
+        14_858.794_f64,
+        14_954.249_f64,
+        15_049.703_f64,
+        15_145.158_f64,
+        15_248.122_f64,
+        15_336.068_f64,
+        14_791.059_f64,
     ];
     assert!(
         costs
