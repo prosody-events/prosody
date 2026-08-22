@@ -13,8 +13,8 @@ const ERROR_CODE: u64 = u64::MAX;
 
 /// Runs one fixed-grid decision and returns its portable integer encoding.
 ///
-/// Bits 0 through 31 contain the target. Bits 32 through 62 contain the cap.
-/// Bit 63 identifies a Hold decision. `u64::MAX` identifies invalid input.
+/// Bits 0 through 31 contain the target. Bit 63 identifies a Hold
+/// decision. `u64::MAX` identifies invalid input.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 #[must_use]
 pub fn fixture_decision(offered_events: u32) -> u64 {
@@ -98,7 +98,7 @@ pub fn fixture_decision(offered_events: u32) -> u64 {
 
 fn encode(decision: ScaleDecision) -> u64 {
     match decision {
-        ScaleDecision::Apply(apply) => u64::from(apply.target) | (u64::from(apply.cap) << 32_u32),
+        ScaleDecision::Apply(apply) => u64::from(apply.target),
         ScaleDecision::Hold(_) => 1_u64 << 63_u32,
     }
 }
