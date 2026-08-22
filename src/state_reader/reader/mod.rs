@@ -529,7 +529,7 @@ where
             .map_err(|error| StateReaderError::store(&error))
     }
 
-    /// Streams committed set members in key order.
+    /// Streams committed set members in the direction `dir`.
     ///
     /// # Errors
     ///

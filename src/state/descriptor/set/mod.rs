@@ -1,6 +1,6 @@
-//! Presence-only ordered set collection.
+//! An ordered set that stores only membership.
 //!
-//! A set stores one zero-byte member cell per key. It shares the map keyset
+//! A set stores one zero-byte cell per member. It shares the map keyset
 //! format and keeps the same membership rules.
 
 use super::map::{
@@ -102,9 +102,12 @@ pub struct SetHandle<S, KC> {
     cells: Collection<S, SetKind<KC>>,
 }
 
-/// A directional set query.
+/// A directional set member stream query.
 ///
 /// Build one with [`SetHandle::query`]. Finish it with [`keys`](Self::keys).
+/// `from` and `to` include their member. `after` and `before` exclude their
+/// member. State all edges in iteration order. A later call for the same edge
+/// replaces the earlier call. A start past the end yields an empty stream.
 #[must_use]
 pub struct SetQuery<'a, S, KC> {
     handle: &'a SetHandle<S, KC>,
@@ -142,7 +145,7 @@ where
         self
     }
 
-    /// Sets the maximum number of present keys.
+    /// Sets the maximum number of present members.
     pub fn limit(mut self, limit: NonZeroUsize) -> Self {
         self.constraints.limit = Some(limit);
         self
@@ -154,7 +157,7 @@ where
         self
     }
 
-    /// Streams live keys in the query direction.
+    /// Streams live members in the query direction.
     pub fn keys(self) -> impl Stream<Item = SetItem<KC>> + 'a {
         let span = info_span!(
             "set.keys",
@@ -280,7 +283,7 @@ where
         )))
     }
 
-    /// Streams live keys in set order.
+    /// Streams live members in the direction `dir`.
     pub fn keys(&self, dir: Direction) -> impl Stream<Item = SetItem<KC>> + '_ {
         self.query(dir).keys()
     }
@@ -299,6 +302,7 @@ where
     /// # Errors
     ///
     /// Returns a key codec error or a session access error.
+    #[instrument(name = "set.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err)]
     pub async fn is_empty(&self) -> Result<bool, SetStateError> {
         let keys = self
             .query(Direction::Forward)
@@ -341,7 +345,8 @@ where
 }
 
 impl<KC> Descriptor<SetKind<KC>> {
-    /// Sets the number of live members that the set tracks before scans.
+    /// Sets the maximum member count for tracked reads. Larger sets use
+    /// scans.
     #[must_use]
     pub fn keyset_limit(mut self, limit: usize) -> Self {
         self.def.keyset_limit = limit;
