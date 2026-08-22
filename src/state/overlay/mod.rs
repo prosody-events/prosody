@@ -166,7 +166,7 @@ where
         Ok(out)
     }
 
-    /// Presence twin of [`Self::get_many`].
+    /// Matches [`Self::get_many`] but reads only cell presence.
     pub async fn contains_many<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -257,7 +257,7 @@ where
         self.merge_cells(collection, scan, bottom)
     }
 
-    /// Presence twin of [`Self::scan_cells`].
+    /// Matches [`Self::scan_cells`] but streams only cell presence.
     pub fn scan_keys<'a>(
         &'a self,
         collection: &'a CollectionId,
