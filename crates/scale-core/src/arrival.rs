@@ -253,6 +253,7 @@ impl ArrivalPrior {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn shape(&self) -> f64 {
         self.authored_shape
     }
@@ -260,6 +261,11 @@ impl ArrivalPrior {
     #[cfg(test)]
     pub(crate) const fn rate_seconds(&self) -> f64 {
         self.rate_seconds
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn change_rate_per_second(&self) -> f64 {
+        self.hazard_center
     }
 
     pub(crate) fn posterior_value_count(&self) -> u32 {

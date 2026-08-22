@@ -9,7 +9,6 @@ use statrs::distribution::{Beta, ContinuousCDF, Gamma, LogNormal};
 use statrs::function::gamma::{gamma_lr, gamma_ur, ln_gamma};
 use thiserror::Error;
 
-use crate::arrival::ArrivalPrior;
 use crate::change_point::ChangePointKernel;
 use crate::types::prior_artifact_contract_holds;
 use crate::{
@@ -570,7 +569,7 @@ struct CapacityAllocation {
 pub(crate) struct CapacityFactor {
     simd_level: Level,
     grid: CapacityGrid,
-    arrival_shape: f64,
+    change_hazard_shape: f64,
     concurrency_max: f64,
     exposure_min_seconds: f64,
     history_coverage_seconds: f64,
@@ -608,7 +607,7 @@ impl CapacityFactor {
     pub(crate) fn new_with_prior_with_groups(
         grid: CapacityGrid,
         change_rate_per_second: f64,
-        arrival_prior: &ArrivalPrior,
+        change_hazard_shape: f64,
         concurrency_max: f64,
         exposure_min_seconds: f64,
         attempt_count_max: u32,
@@ -625,7 +624,7 @@ impl CapacityFactor {
         let history_coverage_seconds = history_coverage(&grid, concurrency_max)?;
         let artifact = capacity_model_artifact_with_groups(
             change_rate_per_second,
-            arrival_prior.shape(),
+            change_hazard_shape,
             group_count_max,
         )?
         .with_coverage(&grid, history_coverage_seconds)?;
@@ -664,7 +663,7 @@ impl CapacityFactor {
         Ok(Self {
             simd_level: Level::new(),
             grid,
-            arrival_shape: arrival_prior.shape(),
+            change_hazard_shape,
             concurrency_max,
             exposure_min_seconds,
             history_coverage_seconds,
@@ -701,7 +700,7 @@ impl CapacityFactor {
     pub(crate) fn new_with_prior(
         grid: CapacityGrid,
         change_rate_per_second: f64,
-        arrival_prior: &ArrivalPrior,
+        change_hazard_shape: f64,
         concurrency_max: f64,
         exposure_min_seconds: f64,
         attempt_count_max: u32,
@@ -709,7 +708,7 @@ impl CapacityFactor {
         Self::new_with_prior_with_groups(
             grid,
             change_rate_per_second,
-            arrival_prior,
+            change_hazard_shape,
             concurrency_max,
             exposure_min_seconds,
             attempt_count_max,
@@ -731,7 +730,7 @@ impl CapacityFactor {
     ) -> Result<PriorArtifact, CapacityModelError> {
         let artifact = capacity_model_artifact_with_groups(
             change_rate_per_second,
-            self.arrival_shape,
+            self.change_hazard_shape,
             self.resource_window_group_count_max,
         )?
         .with_coverage(&self.grid, self.history_coverage_seconds)?;

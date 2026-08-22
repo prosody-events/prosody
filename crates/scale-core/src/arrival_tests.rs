@@ -14,6 +14,24 @@ use crate::types::{CalendarColumns, CalendarForecast};
 use crate::{CalendarArtifactId, CalendarRateSegment, RandomStream};
 
 #[test]
+fn diffuse_prior_respects_the_storage_budget_edge() {
+    let selected = ArrivalPrior::new(0.123_f64, 0.001_947_5_f64, 1.0_f64 / 3_600.0_f64);
+    assert!(selected.is_ok(), "{selected:?}");
+    assert!(matches!(
+        ArrivalPrior::new(
+            0.122_f64,
+            0.122_f64 * 0.0019_f64 / 0.12_f64,
+            1.0_f64 / 3_600.0_f64,
+        ),
+        Err(ArrivalPriorError::StorageBudget { .. })
+    ));
+    assert!(matches!(
+        ArrivalPrior::new(0.12_f64, 0.0019_f64, 1.0_f64 / 3_600.0_f64),
+        Err(ArrivalPriorError::StorageBudget { .. })
+    ));
+}
+
+#[test]
 fn concentrated_posterior_has_a_finite_exact_predictive_rank() -> Result<(), TestError> {
     let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
     let mut factor = ArrivalFactor::new(&model);

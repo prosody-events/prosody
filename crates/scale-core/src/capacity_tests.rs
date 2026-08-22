@@ -19,9 +19,9 @@ use super::{
     log_contamination_mixture, log_normal_axis_masses, log_weighted_sum, path_log_score,
     vector_exp,
 };
+use crate::OccupancyTraceEvidence;
 use crate::change_point::ChangePointKernel;
 use crate::types::occupancy_trace_for_test;
-use crate::{ArrivalPrior, OccupancyTraceEvidence};
 
 fn kernel_float_matches(actual: f64, expected: f64) -> bool {
     if actual.is_infinite() || expected.is_infinite() {
@@ -100,7 +100,7 @@ fn storm_factor() -> Result<super::CapacityFactor, TestError> {
     Ok(super::CapacityFactor::new_with_prior_with_groups(
         grid,
         1.0_f64 / 300.0_f64,
-        &ArrivalPrior::new(1.0_f64, 86_400.0_f64, 1.0_f64 / 86_400.0_f64)?,
+        4.0_f64,
         256.0_f64,
         0.1_f64,
         10_000,
@@ -201,13 +201,10 @@ fn rejecting_update_leaves_the_posterior_byte_identical(operation_codes: Vec<u8>
     let Ok(grid) = CapacityGrid::new(&[0.25_f64, 1.0_f64], &[100.0_f64], &[0.0_f64]) else {
         return false;
     };
-    let Ok(prior) = ArrivalPrior::test_artifact() else {
-        return false;
-    };
     let Ok(mut factor) = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        &prior,
+        4.0_f64,
         1.0_f64,
         1.0_f64,
         8,
@@ -228,11 +225,10 @@ fn rejecting_update_leaves_the_posterior_byte_identical(operation_codes: Vec<u8>
 #[test]
 fn missed_tick_update_matches_an_explicit_interval_start_transition() -> Result<(), TestError> {
     let grid = CapacityGrid::new(&[0.25_f64, 1.0_f64], &[100.0_f64], &[0.0_f64])?;
-    let prior = ArrivalPrior::test_artifact()?;
     let mut owned = super::CapacityFactor::new_with_prior(
         grid.clone(),
         1.0_f64 / 300.0_f64,
-        &prior,
+        4.0_f64,
         1.0_f64,
         1.0_f64,
         8,
@@ -240,7 +236,7 @@ fn missed_tick_update_matches_an_explicit_interval_start_transition() -> Result<
     let mut explicit = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        &prior,
+        4.0_f64,
         1.0_f64,
         1.0_f64,
         8,
@@ -269,7 +265,7 @@ fn first_completion_residual_after_a_gap_is_discarded() -> Result<(), TestError>
     let mut factor = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        &ArrivalPrior::test_artifact()?,
+        4.0_f64,
         2.0_f64,
         1.0_f64,
         2,
@@ -357,7 +353,7 @@ fn an_identifiable_persistent_run_beats_contamination_redraws() -> Result<(), Te
     let mut factor = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        &ArrivalPrior::test_artifact()?,
+        4.0_f64,
         1.0_f64,
         1.0_f64,
         32,
@@ -447,11 +443,10 @@ fn one_second_transition_retains_an_informative_capacity_update() -> Result<(), 
         &[80.0_f64, 320.0_f64, 640.0_f64],
         &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64],
     )?;
-    let arrival_prior = ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?;
     let mut factor = super::CapacityFactor::new_with_prior_with_groups(
         grid,
         1.0_f64 / 300.0_f64,
-        &arrival_prior,
+        4.0_f64,
         192.0_f64,
         1.0_f64,
         2_112,
@@ -517,11 +512,10 @@ fn saturated_fleet_occupancy_discriminates_the_flat_plateau() -> Result<(), Test
         &[80.0_f64, 320.0_f64, 600.0_f64],
         &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64],
     )?;
-    let arrival_prior = ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?;
     let mut factor = super::CapacityFactor::new_with_prior_with_groups(
         grid,
         1.0_f64 / 300.0_f64,
-        &arrival_prior,
+        4.0_f64,
         128.0_f64,
         1.0_f64,
         2_112,
@@ -1676,7 +1670,7 @@ fn flat_capacity_factor() -> Result<super::CapacityFactor, TestError> {
     Ok(super::CapacityFactor::new_with_prior_with_groups(
         grid,
         1.0_f64 / 300.0_f64,
-        &ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?,
+        4.0_f64,
         96.0_f64,
         1.0_f64,
         48_096,
@@ -1841,7 +1835,7 @@ fn no_knee_condition_reports_zero_mass_and_unbounded_capacity() -> Result<(), Te
     let mut factor = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        &ArrivalPrior::test_artifact()?,
+        4.0_f64,
         1.0_f64,
         1.0_f64,
         3,
@@ -1872,7 +1866,7 @@ fn capacity_update_does_not_allocate() -> Result<(), TestError> {
     let mut factor = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        &ArrivalPrior::test_artifact()?,
+        4.0_f64,
         1.0_f64,
         1.0_f64,
         64,
@@ -1896,7 +1890,7 @@ fn raw_path_score_matches_the_exponential_clock_oracle() -> Result<(), TestError
     let mut factor = super::CapacityFactor::new_with_prior(
         grid.clone(),
         1.0_f64 / 300.0_f64,
-        &ArrivalPrior::test_artifact()?,
+        4.0_f64,
         1.0_f64,
         1.0_f64,
         8,
@@ -2090,13 +2084,10 @@ fn batched_completion_residuals_accept_the_specified_clock(batch_code: u8) -> bo
     let Ok(grid) = CapacityGrid::new(&[1.0_f64], &[100.0_f64], &[0.0_f64]) else {
         return false;
     };
-    let Ok(prior) = ArrivalPrior::test_artifact() else {
-        return false;
-    };
     let Ok(mut factor) = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        &prior,
+        4.0_f64,
         20.0_f64,
         1.0_f64,
         32,
@@ -2149,7 +2140,7 @@ fn batched_completion_residuals_reject_a_misspecified_clock() -> Result<(), Test
     let mut factor = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        &ArrivalPrior::test_artifact()?,
+        4.0_f64,
         20.0_f64,
         1.0_f64,
         32,
@@ -2179,7 +2170,7 @@ fn residual_ring_retains_the_latest_contract_window() -> Result<(), TestError> {
     let mut factor = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        &ArrivalPrior::test_artifact()?,
+        4.0_f64,
         1.0_f64,
         1.0_f64,
         3,
@@ -2201,7 +2192,7 @@ fn curve_axis_rejects_more_than_two_octaves_per_cell() -> Result<(), TestError> 
     let result = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        &ArrivalPrior::test_artifact()?,
+        4.0_f64,
         1.0_f64,
         1.0_f64,
         3,
@@ -2216,7 +2207,7 @@ fn residual_cdf_mixes_each_curve_before_the_clock_check() -> Result<(), TestErro
     let mut factor = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        &ArrivalPrior::test_artifact()?,
+        4.0_f64,
         1.0_f64,
         1.0_f64,
         8,
@@ -2245,13 +2236,10 @@ fn fixed_occupancy_predictive_has_exponential_server_mean_and_variance(
     let Ok(grid) = CapacityGrid::new(&[service_seconds], &[100.0_f64], &[0.0_f64]) else {
         return false;
     };
-    let Ok(prior) = ArrivalPrior::test_artifact() else {
-        return false;
-    };
     let Ok(mut factor) = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        &prior,
+        4.0_f64,
         8.0_f64,
         0.25_f64,
         255,
@@ -2288,13 +2276,10 @@ fn varying_trace_predictive_uses_integrated_intensity(first_seed: u8, second_see
     let Ok(grid) = CapacityGrid::new(&[0.5_f64], &[100.0_f64], &[0.0_f64]) else {
         return false;
     };
-    let Ok(prior) = ArrivalPrior::test_artifact() else {
-        return false;
-    };
     let Ok(mut factor) = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        &prior,
+        4.0_f64,
         8.0_f64,
         1.0_f64,
         255,
@@ -2335,13 +2320,10 @@ fn completion_predictive_mixture_matches_direct_cell_oracle(count: u8) -> bool {
     let Ok(grid) = CapacityGrid::new(&[0.5_f64, 1.0_f64], &[100.0_f64], &[0.0_f64]) else {
         return false;
     };
-    let Ok(prior) = ArrivalPrior::test_artifact() else {
-        return false;
-    };
     let Ok(mut factor) = super::CapacityFactor::new_with_prior(
         grid.clone(),
         1.0_f64 / 300.0_f64,
-        &prior,
+        4.0_f64,
         2.0_f64,
         1.0_f64,
         255,
@@ -2374,13 +2356,10 @@ fn exponential_plant_randomized_ranks_are_uniform_in_both_tails(seed: u8) -> boo
     let Ok(grid) = CapacityGrid::new(&[0.5_f64], &[100.0_f64], &[0.0_f64]) else {
         return false;
     };
-    let Ok(prior) = ArrivalPrior::test_artifact() else {
-        return false;
-    };
     let Ok(mut factor) = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        &prior,
+        4.0_f64,
         2.0_f64,
         1.0_f64,
         255,
@@ -2421,13 +2400,10 @@ fn completion_predictive_cdf_is_monotone(count: u8) -> bool {
     let Ok(grid) = CapacityGrid::new(&[1.0_f64], &[100.0_f64], &[0.0_f64]) else {
         return false;
     };
-    let Ok(prior) = ArrivalPrior::test_artifact() else {
-        return false;
-    };
     let Ok(mut factor) = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        &prior,
+        4.0_f64,
         2.0_f64,
         1.0_f64,
         255,
@@ -2453,14 +2429,11 @@ fn completion_predictive_sweep_matches_scalar_cdf_and_summary(
     let Ok(grid) = CapacityGrid::new(&[0.5_f64, 2.0_f64], &[100.0_f64], &[0.0_f64]) else {
         return false;
     };
-    let Ok(prior) = ArrivalPrior::test_artifact() else {
-        return false;
-    };
     let count_max = 16_u32 + u32::from(seed % 16);
     let Ok(mut factor) = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        &prior,
+        4.0_f64,
         2.0_f64,
         1.0_f64,
         count_max,

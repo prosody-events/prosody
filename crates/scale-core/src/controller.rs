@@ -193,7 +193,7 @@ impl ScaleState {
         let capacity = CapacityFactor::new_with_prior_with_groups(
             capacity_grid,
             configuration.capacity_change_rate_per_second,
-            &configuration.arrival_prior,
+            4.0_f64,
             configuration.capacity_concurrency_max()?,
             configuration.resource_exposure_min_seconds(),
             configuration.resource_window_attempt_count_max,

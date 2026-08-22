@@ -58,8 +58,8 @@ const CALENDAR_HISTORY_EXPOSURE_SECONDS: u32 = 900;
 const IDLE_COST_START_MICROS: u64 = 91_000_000;
 const IDLE_DURATION_MICROS: u64 = 240_000_000;
 const SHORT_BURST_RELEASE_MICROS: u64 = 120_000_000;
-const CALENDAR_PRIOR_SHAPE: f64 = 4.0_f64;
-const CALENDAR_PRIOR_RATE_SECONDS: f64 = 0.01_f64;
+const CALENDAR_PRIOR_SHAPE: f64 = 0.123_f64;
+const CALENDAR_PRIOR_RATE_SECONDS: f64 = 0.001_947_5_f64;
 const CALENDAR_MODEL_PRIOR_PROBABILITY: f64 = 0.5_f64;
 const HISTORY_START_MICROS: u64 = 300_000_000;
 const HISTORY_END_MICROS: u64 = 420_000_000;
@@ -1680,9 +1680,9 @@ fn principal_graph(
         resource_window_group_count_max: resource_group_count_max(regime),
         failure_service_weight: DEFAULT_FAILURE_WEIGHT,
         arrival_prior: prosody_scale_core::ArrivalPrior::new(
-            4.0_f64,
-            0.01_f64,
-            1.0_f64 / 90.0_f64,
+            0.123_f64,
+            0.001_947_5_f64,
+            1.0_f64 / 3_600.0_f64,
         )?,
         // A collapsing plant changes as work crosses its knee. The kernel
         // revives cells that current data cover. This rate matches the

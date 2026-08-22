@@ -2256,13 +2256,34 @@ fn plateau_configuration() -> Result<Configuration, TestError> {
         resource_window_attempt_count_max: 100_000,
         resource_window_group_count_max: 256,
         failure_service_weight: 0.3_f64,
-        arrival_prior: ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?,
+        arrival_prior: ArrivalPrior::new(0.123_f64, 0.001_947_5_f64, 1.0_f64 / 3_600.0_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
         reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,
         rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     })
+}
+
+#[test]
+fn principal_configuration_freezes_the_arrival_prior() -> Result<(), TestError> {
+    let configuration = plateau_configuration()?;
+    assert_eq!(
+        configuration.arrival_prior.shape().to_bits(),
+        0.123_f64.to_bits()
+    );
+    assert_eq!(
+        configuration.arrival_prior.rate_seconds().to_bits(),
+        0.001_947_5_f64.to_bits()
+    );
+    assert_eq!(
+        configuration
+            .arrival_prior
+            .change_rate_per_second()
+            .to_bits(),
+        (1.0_f64 / 3_600.0_f64).to_bits()
+    );
+    Ok(())
 }
 
 fn plateau_grid() -> Result<CapacityGrid, TestError> {
@@ -2556,7 +2577,7 @@ fn capacity_factor_with_rate(
     Ok(CapacityFactor::new_with_prior(
         grid,
         change_rate_per_second,
-        &ArrivalPrior::test_artifact()?,
+        4.0_f64,
         concurrency_max,
         1.0_f64,
         100_000,
