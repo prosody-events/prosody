@@ -1,4 +1,5 @@
 use super::*;
+use std::future::ready;
 
 #[derive(Clone)]
 struct IntermediateHookHandler {
@@ -58,16 +59,16 @@ impl FallibleHandler for IntermediateHookHandler {
         self.handle(context).await
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _context: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
     async fn after_abort<C>(&self, context: C, _result: Result<Self::Output, Self::Error>)

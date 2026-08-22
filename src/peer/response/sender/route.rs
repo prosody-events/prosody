@@ -13,7 +13,7 @@ use crate::peer::router::{EndpointKind, NetworkRouter, ResponseSender, SendFailu
 use opentelemetry::Context;
 use opentelemetry_semantic_conventions::attribute::ERROR_TYPE;
 use std::fmt::Display;
-use std::future::Future;
+use std::future::{Future, ready};
 use tokio::time::{Instant, timeout_at};
 use tracing::field::Empty;
 use tracing::{Instrument, Span, debug_span, error, warn};
@@ -123,23 +123,23 @@ async fn deliver_route<R: ResponseRoute>(
 }
 
 impl ResponseRoute for LocalTarget {
-    async fn deliver(
+    fn deliver(
         &self,
         frame: Staged,
         _deadline: RequestDeadline,
         _context: &Context,
-    ) -> Result<RouteOutcome, DropReason> {
+    ) -> impl Future<Output = Result<RouteOutcome, DropReason>> {
         if !self.owns(frame.target()) {
-            return Ok(RouteOutcome::Declined(frame));
+            return ready(Ok(RouteOutcome::Declined(frame)));
         }
         let disposition = self.accept(frame.into_local_frame());
         disposition.record(self.pending().metrics());
-        if disposition == ResponseDisposition::Accepted {
+        ready(if disposition == ResponseDisposition::Accepted {
             Ok(RouteOutcome::Delivered(Delivery::Local))
         } else {
             Span::current().record(ERROR_TYPE, disposition.label());
             Err(DropReason::SendFailed)
-        }
+        })
     }
 }
 

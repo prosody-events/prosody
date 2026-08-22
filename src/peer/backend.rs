@@ -15,6 +15,8 @@ use crate::peer::runtime::{PreparedRuntime, prepare_local};
 #[cfg(test)]
 use crate::state_reader::{CassandraReaderBackend, MemoryReaderBackend};
 
+#[cfg(test)]
+use std::future::ready;
 pub(crate) async fn prepare_cassandra(
     config: &PeerConfiguration,
     store: CassandraStore,
@@ -52,7 +54,10 @@ impl<C: Codec> PeerBackend for CassandraReaderBackend<C> {
 impl<C: Codec> PeerBackend for MemoryReaderBackend<C> {
     type Runtime = PreparedLocalPeerRuntime;
 
-    async fn prepare(&self, _config: &PeerConfiguration) -> Result<Self::Runtime, ConsumerError> {
-        Ok(prepare_local())
+    fn prepare(
+        &self,
+        _config: &PeerConfiguration,
+    ) -> impl Future<Output = Result<Self::Runtime, ConsumerError>> {
+        ready(Ok(prepare_local()))
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use std::future::ready;
 
 #[tokio::test]
 async fn reload_permanent_failure_records_the_reloaded_id() -> Result<()> {
@@ -100,39 +101,47 @@ struct TableStore;
 impl MessageDeferStore for TableStore {
     type Error = StagingError;
 
-    async fn defer_first_message(&self, _key: &Key, _offset: Offset) -> Result<(), StagingError> {
-        Ok(())
-    }
-
-    async fn get_next_deferred_message(
-        &self,
-        _key: &Key,
-    ) -> Result<Option<(Offset, u32)>, StagingError> {
-        Ok(None)
-    }
-
-    async fn append_deferred_message(
+    fn defer_first_message(
         &self,
         _key: &Key,
         _offset: Offset,
-    ) -> Result<(), StagingError> {
-        Ok(())
+    ) -> impl Future<Output = Result<(), StagingError>> {
+        ready(Ok(()))
     }
 
-    async fn remove_deferred_message(
+    fn get_next_deferred_message(
+        &self,
+        _key: &Key,
+    ) -> impl Future<Output = Result<Option<(Offset, u32)>, StagingError>> {
+        ready(Ok(None))
+    }
+
+    fn append_deferred_message(
         &self,
         _key: &Key,
         _offset: Offset,
-    ) -> Result<(), StagingError> {
-        Ok(())
+    ) -> impl Future<Output = Result<(), StagingError>> {
+        ready(Ok(()))
     }
 
-    async fn set_retry_count(&self, _key: &Key, _retry_count: u32) -> Result<(), StagingError> {
-        Ok(())
+    fn remove_deferred_message(
+        &self,
+        _key: &Key,
+        _offset: Offset,
+    ) -> impl Future<Output = Result<(), StagingError>> {
+        ready(Ok(()))
     }
 
-    async fn delete_key(&self, _key: &Key) -> Result<(), StagingError> {
-        Ok(())
+    fn set_retry_count(
+        &self,
+        _key: &Key,
+        _retry_count: u32,
+    ) -> impl Future<Output = Result<(), StagingError>> {
+        ready(Ok(()))
+    }
+
+    fn delete_key(&self, _key: &Key) -> impl Future<Output = Result<(), StagingError>> {
+        ready(Ok(()))
     }
 }
 
