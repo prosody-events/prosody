@@ -208,7 +208,9 @@ where
 
 /// A directional map stream query for a standalone reader.
 ///
-/// See [`crate::state::descriptor::map::MapQuery::limit`] for the limit
+/// Build one with [`StateReader::query`]. Finish it with
+/// [`entries`](Self::entries) or [`keys`](Self::keys). See
+/// [`crate::state::descriptor::map::MapQuery::limit`] for the limit
 /// contract.
 #[must_use]
 pub struct MapReaderQuery<'a, KC, V, C: Codec, B = MemoryReaderBackend<C>> {

@@ -117,9 +117,9 @@ pub(crate) struct RangePlan<S: StateSession, T> {
     _cell: PhantomData<fn() -> T>,
 }
 
-/// The constraints a query applies to its plan: the direction-relative edges
-/// and the limit on present yields. A query collects one set and passes it to
-/// the terminal. Each arm applies the set to its own read.
+/// The range and result limit for one directional query. The limit counts
+/// present results only. A query collects one value and passes it to the
+/// terminal; each arm applies it to its own read.
 #[derive(Clone)]
 pub(crate) struct Constraints {
     pub(crate) start: ScanEdge<Coordinate>,
@@ -168,7 +168,8 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
         }
     }
 
-    /// Drives the planned arm under `constraints` presence-only. It yields
+    /// Drives the planned arm under `constraints` and reads only key
+    /// presence. It yields
     /// keys and never touches a value. See [`Self::entries`] for the dispatch
     /// rule.
     pub(crate) fn keys(self, constraints: Constraints) -> impl Stream<Item = KeyItem<T>> + Send {
@@ -215,7 +216,7 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
             let Constraints { start, end, limit } = constraints;
             let keys = constrained_keys::<T>(keys, dir, start.as_ref(), end.as_ref());
             let base = &base;
-            let chunks = stream::unfold((keys.into_iter().peekable(), true), |(mut keys, first)| async move {
+            let chunks = stream::unfold((keys.peekable(), true), |(mut keys, first)| async move {
                 keys.peek()?; // exhausted ⇒ unfold ends
                 let chunk: CellBuffer<KeyOf<T>> =
                     keys.by_ref().take(chunk_width(limit, first)).collect();
@@ -274,7 +275,7 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
             let Constraints { start, end, limit } = constraints;
             let keys = constrained_keys::<T>(keys, dir, start.as_ref(), end.as_ref());
             let base = &base;
-            let chunks = stream::unfold((keys.into_iter().peekable(), true), |(mut keys, first)| async move {
+            let chunks = stream::unfold((keys.peekable(), true), |(mut keys, first)| async move {
                 keys.peek()?;
                 let mut inner =
                     <S::Engine as sealed::ReadEngine<S>>::resume(&base.session, &base.plan).await;
@@ -331,11 +332,11 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
 }
 
 fn constrained_keys<T: CellType>(
-    mut keys: Vec<KeyOf<T>>,
+    keys: Vec<KeyOf<T>>,
     dir: Direction,
     start: ScanEdge<&Coordinate>,
     end: ScanEdge<&Coordinate>,
-) -> Vec<KeyOf<T>> {
+) -> impl Iterator<Item = KeyOf<T>> + Send {
     let start = match (dir, start) {
         (_, ScanEdge::Unbounded) => 0,
         (Direction::Forward, ScanEdge::Included(edge)) => {
@@ -366,13 +367,7 @@ fn constrained_keys<T: CellType>(
             keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) > *edge)
         }
     };
-    if start >= end {
-        keys.clear();
-    } else {
-        keys.truncate(end);
-        keys.drain(..start);
-    }
-    keys
+    keys.into_iter().skip(start).take(end.saturating_sub(start))
 }
 
 /// Narrows the first tracked chunk to the limit.
@@ -450,11 +445,11 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
         }
     }
 
-    /// Folds the query constraints into the plan's own window. A query edge
-    /// can only reach a whole-section plan, because a deque bounds its window
-    /// inside its planning read. An edge therefore lands only on an unbounded
-    /// side, and a set window edge always survives. The limit keeps the
-    /// smaller value: a query cannot widen the window's yield bound.
+    /// Restricts the plan to the query range: a query can never widen the
+    /// plan's own window or raise its yield bound. A query edge lands only on
+    /// an unbounded side (a deque bounds its window inside its planning read,
+    /// so an already-set edge always survives), and the limit keeps the
+    /// smaller value.
     fn constrained(mut self, constraints: Constraints) -> Self {
         let Constraints { start, end, limit } = constraints;
         if matches!(self.start, ScanEdge::Unbounded) {

@@ -459,7 +459,8 @@ where
     }
 
     /// Sets the maximum number of present items that the stream yields.
-    /// Absent rows are free. Fetch sizing cannot change an answer.
+    /// Absent rows do not count toward the limit. Fetch sizing cannot change an
+    /// answer.
     pub fn limit(mut self, limit: NonZeroUsize) -> Self {
         self.constraints.limit = Some(limit);
         self
