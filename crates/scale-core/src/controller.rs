@@ -640,6 +640,7 @@ struct ScenarioWorkspace {
     target_assignment: Vec<u32>,
     assignment_counts: Vec<u32>,
     moved_partitions: Vec<bool>,
+    repair_supply: Vec<f64>,
     commitment_pause_micros: Vec<u64>,
     commitment_ready_micros: Vec<u64>,
     rebalancing_ready_micros: u64,
@@ -673,6 +674,11 @@ struct ReactiveTransition {
 struct ReactiveRepair {
     requested_micros: u64,
     rate: f64,
+}
+
+struct SelectedReactiveRepair {
+    requested_micros: u64,
+    target: u32,
 }
 
 struct RepairTargetSelection {
@@ -974,6 +980,7 @@ impl ScenarioWorkspace {
             target_assignment: vec![0; bounds.partition_count],
             assignment_counts: vec![0; bounds.replica_count_max],
             moved_partitions: vec![false; bounds.partition_count],
+            repair_supply: vec![0.0_f64; bounds.replica_count_max],
             commitment_pause_micros: vec![0_u64; bounds.replica_count_max],
             commitment_ready_micros: vec![0_u64; bounds.replica_count_max],
             rebalancing_ready_micros: u64::MAX,
@@ -2520,6 +2527,7 @@ fn append_reactive_repairs(
     let now_micros = state.model_time.as_micros();
     let mut final_repair = None;
     let mut next_slot = 1_u64;
+    let mut supply_is_stale = true;
     for (boundary, rate) in mean_trajectory.rates().enumerate() {
         let requested_micros = now_micros.saturating_add(
             state
@@ -2537,16 +2545,27 @@ fn append_reactive_repairs(
         if requested_micros < transition.ready_micros {
             continue;
         }
+        if supply_is_stale {
+            prepare_assignment_repair_supply(state, shared, workspace, draws);
+        }
+        let target =
+            assignment_repair_target(&workspace.repair_supply[..shared.action_count], rate);
         if append_reactive_repair(
             state,
             shared,
             workspace,
-            repair,
+            &SelectedReactiveRepair {
+                requested_micros: repair.requested_micros,
+                target,
+            },
             &mut transition,
             draws,
             next_slot,
         ) {
             next_slot += 1;
+            supply_is_stale = true;
+        } else {
+            supply_is_stale = false;
         }
     }
     if let Some(mut repair) = final_repair
@@ -2559,11 +2578,19 @@ fn append_reactive_repairs(
             .div_ceil(report_interval);
         repair.requested_micros =
             now_micros.saturating_add(report_count.saturating_mul(report_interval));
+        if supply_is_stale {
+            prepare_assignment_repair_supply(state, shared, workspace, draws);
+        }
+        let target =
+            assignment_repair_target(&workspace.repair_supply[..shared.action_count], repair.rate);
         let _ = append_reactive_repair(
             state,
             shared,
             workspace,
-            repair,
+            &SelectedReactiveRepair {
+                requested_micros: repair.requested_micros,
+                target,
+            },
             &mut transition,
             draws,
             next_slot,
@@ -2575,12 +2602,12 @@ fn append_reactive_repair(
     state: &ScaleState,
     shared: &ScenarioShared<'_>,
     workspace: &mut ScenarioWorkspace,
-    repair: ReactiveRepair,
+    repair: &SelectedReactiveRepair,
     transition: &mut ReactiveTransition,
     draws: HypotheticalDraws<'_>,
     slot: u64,
 ) -> bool {
-    let target = assignment_repair_target(state, shared, workspace, draws, repair.rate);
+    let target = repair.target;
     if target == transition.replicas {
         return false;
     }
@@ -2637,22 +2664,15 @@ fn append_reactive_repair(
     true
 }
 
-/// Returns the smallest replica target whose supply covers one rate.
+/// Computes each repair supply for the current sticky assignment.
 ///
-/// When no target covers the rate, this function selects maximum supply.
-///
-/// This target is the reactive-policy fixed point. The live policy uses the
-/// posterior-mean rate from its next report. The controller keeps this demand
-/// floor by design. Sampled future rates affect cost, but they do not restrict
-/// the initial action set.
-fn assignment_repair_target(
+/// The supply ladder stays valid until a transition changes the assignment.
+fn prepare_assignment_repair_supply(
     state: &ScaleState,
     shared: &ScenarioShared<'_>,
     workspace: &mut ScenarioWorkspace,
     draws: HypotheticalDraws<'_>,
-    rate: f64,
-) -> u32 {
-    let mut selection = RepairTargetSelection::new();
+) {
     for candidate_index in 0..shared.action_count {
         let target = candidate_index as u32 + 1;
         sticky_target_assignment(shared, workspace, target);
@@ -2661,7 +2681,7 @@ fn assignment_repair_target(
             max_share.is_finite() && max_share > 0.0_f64,
             "a valid repair assignment must have one positive finite owner share"
         );
-        let supply = placement_supply(
+        workspace.repair_supply[candidate_index] = placement_supply(
             draws.curve,
             draws.event_supply_factor,
             state.configuration.slots_per_replica,
@@ -2669,6 +2689,21 @@ fn assignment_repair_target(
             shared.partition_count,
             max_share,
         );
+    }
+}
+
+/// Returns the smallest replica target whose supply covers one rate.
+///
+/// When no target covers the rate, this function selects maximum supply.
+///
+/// This target is the reactive-policy fixed point. The live policy uses the
+/// posterior-mean rate from its next report. The controller keeps this demand
+/// floor by design. Sampled future rates affect cost, but they do not restrict
+/// the initial action set.
+fn assignment_repair_target(supply: &[f64], rate: f64) -> u32 {
+    let mut selection = RepairTargetSelection::new();
+    for (candidate_index, &supply) in supply.iter().enumerate() {
+        let target = candidate_index as u32 + 1;
         if let Some(target) = selection.consider(target, supply, rate) {
             return target;
         }
