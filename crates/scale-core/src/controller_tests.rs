@@ -4,15 +4,18 @@ use std::time::Duration;
 use thiserror::Error;
 
 use super::{
-    SCHEDULED_PARTITION, ScenarioRole, balanced_partition_owner, balanced_partition_range,
-    partition_replica_capacity, prepare_work_cohorts, repair_target,
-    sample_hypothetical_transition_times, sample_transition_hypotheses, sample_transition_times,
-    scenario_event_count, scenario_horizons, scenario_random, select_target,
+    RepairTargetSelection, SCHEDULED_PARTITION, ScenarioRole, balanced_partition_owner,
+    balanced_partition_range, max_owner_share, partition_replica_capacity, placement_supply,
+    prepare_work_cohorts, sample_hypothetical_transition_times, sample_transition_hypotheses,
+    sample_transition_times, scenario_event_count, scenario_horizons, scenario_random,
+    select_target,
 };
+use crate::CapacityCurve;
 use crate::arrival::MeanRateTrajectory;
 use crate::edf::{
     ArrivalPath, EdfScratch, EvaluationWindow, SupplyStep, evaluate_prepared_step, prepare,
 };
+use crate::partition::PartitionFactor;
 use crate::types::{EventCohorts, SlotSecondCohorts};
 use crate::{
     ActuationCommitment, ArrivalPrior, ArrivalPriorError, BacklogCohort, CalendarArtifactId,
@@ -22,12 +25,131 @@ use crate::{
     ReliabilityPrior, ResourceWindow, ScaleDecision, ScaleScratch, ScaleState, ScheduledRelease,
     ServiceObjective, step,
 };
+use crate::{RandomStream, sticky_assignment};
 
 struct I27Measurement {
     replica_seconds: [f64; 8],
     costs: [f64; 8],
     candidate_eight_has_target_eight_event: bool,
     candidate_transition_times: [Option<(u64, u64)>; 8],
+}
+
+#[test]
+fn placement_supply_uses_the_group_curve_at_useful_concurrency() {
+    let curve = CapacityCurve::Knee {
+        service_time_seconds: 0.5_f64,
+        capacity_per_second: 80.0_f64,
+        collapse: 1.0_f64,
+    };
+    let max_owner_share = 22.0_f64 / 64.0_f64;
+
+    let supply = placement_supply(curve, 0.75_f64, 32, 3, 64, max_owner_share);
+
+    let useful_concurrency = 32.0_f64 * 64.0_f64 / 22.0_f64;
+    assert_eq!(
+        supply.to_bits(),
+        (0.75_f64 * curve.sustainable_throughput(useful_concurrency)).to_bits()
+    );
+}
+
+#[test]
+fn concentrated_placement_prices_equal_supply_at_all_counts() {
+    let curve = CapacityCurve::NoKnee {
+        service_time_seconds: 0.25_f64,
+    };
+    let one = placement_supply(curve, 0.8_f64, 32, 1, 64, 1.0_f64);
+    let eight = placement_supply(curve, 0.8_f64, 32, 8, 64, 1.0_f64);
+
+    assert_eq!(one.to_bits(), eight.to_bits());
+}
+
+#[test]
+fn sampled_placement_reduces_balanced_supply_below_the_count_cap() -> Result<(), TestError> {
+    let factor = PartitionFactor::new(64)?;
+    let mut shares = [0.0_f64; 64];
+    let mut random = RandomStream::new(7);
+    factor.sample_shares(&mut random, &mut shares);
+    let owners = (0_u32..64)
+        .map(|partition| partition % 2)
+        .collect::<Vec<_>>();
+    let mut owner_sums = [0.0_f64; 2];
+    let maximum = max_owner_share(&owners, &shares, &mut owner_sums);
+    let curve = CapacityCurve::NoKnee {
+        service_time_seconds: 1.0_f64,
+    };
+
+    let supply = placement_supply(curve, 1.0_f64, 32, 2, 64, maximum);
+
+    assert!(maximum > 0.5_f64);
+    assert!(supply < curve.sustainable_throughput(64.0_f64));
+    Ok(())
+}
+
+#[test]
+fn current_supply_uses_the_observed_owner_map() -> Result<(), TestError> {
+    let mut factor = PartitionFactor::new(4)?;
+    factor.update(&[100, 50, 40, 0]);
+    let observed = [0_u32, 0, 1, 1];
+    let hypothetical = [0_u32, 1, 0, 1];
+
+    let observed_maximum = factor.maximum_assigned_expected_share(&observed);
+    let hypothetical_maximum = factor.maximum_assigned_expected_share(&hypothetical);
+
+    assert!(observed_maximum > hypothetical_maximum);
+    Ok(())
+}
+
+#[test]
+fn equal_counts_can_have_path_dependent_supply() -> Result<(), TestError> {
+    let current = [0_u32, 0, 1, 1, 2];
+    let termination_order = [3_u32, 2, 1, 0];
+    let mut direct = [0_u32; 5];
+    let mut expanded = [0_u32; 5];
+    let mut counts = [0_u32; 4];
+    let mut moved = [false; 5];
+    sticky_assignment(
+        &current,
+        2,
+        &termination_order,
+        &mut direct,
+        &mut counts,
+        &mut moved,
+    )?;
+    sticky_assignment(
+        &current,
+        4,
+        &termination_order,
+        &mut expanded,
+        &mut counts,
+        &mut moved,
+    )?;
+    let expanded_from = expanded;
+    sticky_assignment(
+        &expanded_from,
+        2,
+        &termination_order,
+        &mut expanded,
+        &mut counts,
+        &mut moved,
+    )?;
+    let shares = [0.35_f64, 0.25_f64, 0.2_f64, 0.15_f64, 0.05_f64];
+    let mut owner_sums = [0.0_f64; 2];
+    let direct_maximum = max_owner_share(&direct, &shares, &mut owner_sums);
+    let expanded_maximum = max_owner_share(&expanded, &shares, &mut owner_sums);
+
+    assert_ne!(direct, expanded);
+    assert_ne!(direct_maximum.to_bits(), expanded_maximum.to_bits());
+    Ok(())
+}
+
+#[test]
+fn concentrated_owner_capacity_has_no_second_placement_penalty() {
+    let supply = 123.0_f64;
+
+    assert_eq!(
+        partition_replica_capacity(supply, 8, 1.0_f64).to_bits(),
+        supply.to_bits()
+    );
 }
 
 #[test]
@@ -116,9 +238,17 @@ fn inflight_descent_prices_only_the_honest_replica_margin() -> Result<(), TestEr
         &fresh.candidate_transition_times[1..7]
     );
     // The world-slot sampler prices rung one at 1,004,478.968. It prices rung
-    // eight at 1,004,678.242. The cancel-plus-fresh equality keeps this order.
-    assert!((measurement.costs[0] - 1_004_478.967_953_551_2_f64).abs() < 0.01_f64);
-    assert!((measurement.costs[7] - 1_004_678.241_793_565_8_f64).abs() < 0.01_f64);
+    // eight at 1,004,520.826. The cancel-plus-fresh equality keeps this order.
+    assert!(
+        (measurement.costs[0] - 1_004_478.967_953_551_2_f64).abs() < 0.01_f64,
+        "costs={:?}",
+        measurement.costs
+    );
+    assert!(
+        (measurement.costs[7] - 1_004_520.826_044_493_5_f64).abs() < 0.01_f64,
+        "costs={:?}",
+        measurement.costs
+    );
     assert!(measurement.costs[0] < measurement.costs[7]);
     Ok(())
 }
@@ -359,7 +489,6 @@ fn balanced_partition_ranges_match_owner_order(partition_seed: u8, replica_seed:
 #[test]
 fn equal_repair_slots_share_event_residuals_across_rungs() -> Result<(), TestError> {
     let (state, scratch) = idle_ladder_step(256, true)?;
-    let mean = MeanRateTrajectory::new(&scratch.mean_arrival_rates);
     let workspace_count = scratch
         .scenario_workspaces
         .len()
@@ -370,7 +499,7 @@ fn equal_repair_slots_share_event_residuals_across_rungs() -> Result<(), TestErr
         .iter()
         .take(workspace_count)
         .find_map(|workspace| {
-            let repairs = produced_repairs(&state, workspace, mean);
+            let repairs = produced_repairs(workspace);
             repairs.iter().enumerate().find_map(|(index, left)| {
                 repairs[index + 1..]
                     .iter()
@@ -419,20 +548,7 @@ struct ProducedRepair {
     rebalance_residual: u64,
 }
 
-struct RepairReplay {
-    event: usize,
-    replicas: u32,
-    ready: u64,
-    slot: u64,
-}
-
-fn produced_repairs(
-    state: &ScaleState,
-    workspace: &super::ScenarioWorkspace,
-    mean: MeanRateTrajectory<'_>,
-) -> Vec<ProducedRepair> {
-    let now = state.model_time.as_micros();
-    let interval = state.configuration.report_interval_micros;
+fn produced_repairs(workspace: &super::ScenarioWorkspace) -> Vec<ProducedRepair> {
     let mut repairs = Vec::new();
     for rung in 0..8_usize {
         let first = workspace.trajectory_offsets[rung] as usize;
@@ -443,103 +559,51 @@ fn produced_repairs(
         let candidate = rung as u32 + 1;
         let fresh =
             usize::from(first + 1 < last && workspace.trajectory.targets[first + 1] == candidate);
-        let event = first + 1 + fresh;
-        let mut replay = RepairReplay {
-            event,
-            replicas: workspace.trajectory.targets[event - 1],
-            ready: workspace.trajectory.ready_micros[event - 1],
-            slot: 1,
-        };
-        let mut final_repair = None;
-        for (boundary, rate) in mean.rates().enumerate() {
-            let requested = now.saturating_add(interval.saturating_mul(boundary as u64 + 1));
-            final_repair = Some((requested, rate));
-            if requested < replay.ready {
-                continue;
-            }
-            let target = repair_target(&workspace.posterior_resource_supply, rate);
-            if target == replay.replicas {
-                continue;
-            }
-            push_produced_repair(
-                workspace,
+        let repair_first = first + 1 + fresh;
+        for (repair_ordinal, event) in (repair_first..last).enumerate() {
+            let replicas = workspace.trajectory.targets[event - 1];
+            let target = workspace.trajectory.targets[event];
+            let direction = if target > replicas {
+                crate::TransitionDirection::Up
+            } else {
+                crate::TransitionDirection::Down
+            };
+            let requested = workspace.trajectory.requested_micros[event];
+            let pause = workspace.trajectory.pause_micros[event];
+            let sampled_ready = workspace.trajectory.sampled_ready_micros[event];
+            repairs.push(ProducedRepair {
                 rung,
+                slot: repair_ordinal as u64 + 1,
                 requested,
-                target,
-                &mut replay,
-                &mut repairs,
-            );
+                direction,
+                delta: target.abs_diff(replicas),
+                launch_residual: pause - requested,
+                rebalance_residual: sampled_ready - pause,
+            });
         }
-        if let Some((requested, rate)) = final_repair
-            && requested < replay.ready
-        {
-            let requested = now.saturating_add(
-                replay
-                    .ready
-                    .saturating_sub(now)
-                    .div_ceil(interval)
-                    .saturating_mul(interval),
-            );
-            let target = repair_target(&workspace.posterior_resource_supply, rate);
-            if target != replay.replicas {
-                push_produced_repair(
-                    workspace,
-                    rung,
-                    requested,
-                    target,
-                    &mut replay,
-                    &mut repairs,
-                );
-            }
-        }
-        assert_eq!(replay.event, last);
     }
     repairs
 }
 
-fn push_produced_repair(
-    workspace: &super::ScenarioWorkspace,
-    rung: usize,
-    requested: u64,
-    target: u32,
-    replay: &mut RepairReplay,
-    repairs: &mut Vec<ProducedRepair>,
-) {
-    assert_eq!(workspace.trajectory.targets[replay.event], target);
-    let direction = if target > replay.replicas {
-        crate::TransitionDirection::Up
-    } else {
-        crate::TransitionDirection::Down
-    };
-    let pause = workspace.trajectory.pause_micros[replay.event];
-    let sampled_ready = workspace.trajectory.sampled_ready_micros[replay.event];
-    repairs.push(ProducedRepair {
-        rung,
-        slot: replay.slot,
-        requested,
-        direction,
-        delta: target.abs_diff(replay.replicas),
-        launch_residual: pause - requested,
-        rebalance_residual: sampled_ready - pause,
-    });
-    replay.replicas = target;
-    replay.ready = workspace.trajectory.ready_micros[replay.event];
-    replay.event += 1;
-    replay.slot += 1;
+#[test]
+fn non_monotone_repair_selects_smallest_cover_or_maximum_supply() {
+    let supply = [4.0_f64, 9.0_f64, 7.0_f64, 8.0_f64];
+
+    assert_eq!(select_repair_target(&supply, 7.5_f64), 2);
+    assert_eq!(select_repair_target(&supply, 10.0_f64), 2);
 }
 
-#[test]
-fn flat_predictive_mean_has_no_successor_repair() {
-    // Successor targets accept this measurable view, not scenario latent rates.
-    let trajectory = MeanRateTrajectory::new(&[150.0_f64; 8]);
-    let supply = [100.0_f64, 200.0_f64, 300.0_f64];
-    let initial = 2_u32;
-
-    assert!(
-        trajectory
-            .rates()
-            .all(|rate| repair_target(&supply, rate) == initial)
-    );
+fn select_repair_target(supply: &[f64], rate: f64) -> u32 {
+    let mut selection = RepairTargetSelection::new();
+    if let Some(target) = supply
+        .iter()
+        .enumerate()
+        .find_map(|(index, &value)| selection.consider(index as u32 + 1, value, rate))
+    {
+        target
+    } else {
+        selection.best_target
+    }
 }
 
 #[test]
@@ -684,9 +748,9 @@ fn idle_pending_descent_cost_ladder_selects_one() -> Result<(), TestError> {
         14_954.248_534_462_233_f64,
         15_049.703_297_341_583_f64,
         15_145.158_060_220_932_f64,
-        15_248.122_141_874_586_f64,
-        15_336.067_585_979_63_f64,
-        14_791.059_016_336_865_f64,
+        15_269.143_638_178_215_f64,
+        15_357.081_410_520_615_f64,
+        14_791.723_114_078_739_f64,
     ];
     assert!(
         costs
@@ -707,7 +771,7 @@ fn calendar_wave_retargets_at_mean_boundaries() {
     let mut target = 2_u32;
     let mut changes = Vec::new();
     for (boundary, rate) in trajectory.rates().enumerate() {
-        let next = repair_target(&supply, rate);
+        let next = select_repair_target(&supply, rate);
         if next != target {
             changes.push((boundary + 1, next));
             target = next;
@@ -745,7 +809,8 @@ fn partition_deadline_outputs_preserve_work_scale() -> Result<(), TestError> {
         let mut scaled_scratch = EdfScratch::new(2)?;
         prepare(&raw, &mut raw_scratch);
         prepare(&scaled, &mut scaled_scratch);
-        let raw_capacity = partition_replica_capacity(supply, replica_count);
+        let max_owner_share = 1.0_f64 / f64::from(replica_count as u32);
+        let raw_capacity = partition_replica_capacity(supply, replica_count, max_owner_share);
         let replica_count_f64 = f64::from(replica_count as u32);
         let scaled_capacity = supply * service_time_seconds / replica_count_f64;
         let raw_outcome = evaluate_prepared_step(
@@ -1137,6 +1202,8 @@ fn test_configuration() -> Result<Configuration, TestError> {
 enum TestError {
     #[error("the controller returned an unexpected decision")]
     UnexpectedDecision,
+    #[error(transparent)]
+    Assignment(#[from] crate::AssignmentError),
     #[error(transparent)]
     Integer(#[from] TryFromIntError),
     #[error(transparent)]

@@ -181,6 +181,22 @@ impl PartitionFactor {
         }
         true
     }
+
+    pub(crate) fn maximum_assigned_expected_share(&self, owners: &[u32]) -> f64 {
+        let prior = JEFFREYS_CONCENTRATION;
+        let total = prior * f64::from(self.partition_count) + self.count_sums.iter().sum::<f64>();
+        let owner_count = owners.iter().copied().max().map_or(0, |owner| owner + 1);
+        (0..owner_count)
+            .map(|owner| {
+                owners
+                    .iter()
+                    .zip(&self.count_sums)
+                    .filter(|(assigned, _)| **assigned == owner)
+                    .map(|(_, count)| (prior + count) / total)
+                    .sum::<f64>()
+            })
+            .fold(0.0_f64, f64::max)
+    }
 }
 
 fn sample_prior_quantiles(

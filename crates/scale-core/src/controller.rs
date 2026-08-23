@@ -6,8 +6,8 @@ use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use crate::TransitionDirection;
 use crate::arrival::{ArrivalBoundaryDiagnostic, ArrivalFactor, ArrivalPrior, MeanRateTrajectory};
 use crate::capacity::{
-    CapacityClockCheck, CapacityFactor, CompletionPredictiveSummary, ThroughputPosteriorCell,
-    curve_throughput,
+    CapacityClockCheck, CapacityCurve, CapacityFactor, CompletionPredictiveSummary,
+    ThroughputPosteriorCell,
 };
 use crate::edf::{
     ArrivalPath, EdfOutcomeLanes, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
@@ -149,8 +149,8 @@ fn candidate_concurrency_ladder(configuration: &Configuration) -> Vec<f64> {
 }
 
 fn curves_are_equivalent(
-    left: crate::CapacityCurve,
-    right: crate::CapacityCurve,
+    left: CapacityCurve,
+    right: CapacityCurve,
     candidate_concurrency: &[f64],
 ) -> bool {
     left.service_time_seconds()
@@ -575,7 +575,6 @@ pub struct ScaleScratch {
     paired_cost_differences: Vec<f64>,
     posterior_supply_sums: Vec<f64>,
     class_masses: Vec<f64>,
-    candidate_concurrency: Vec<f64>,
     scenario_miss_delay_fraction: Vec<f64>,
     scenario_late_area: Vec<f64>,
     scenario_drain_seconds: Vec<f64>,
@@ -583,6 +582,7 @@ pub struct ScaleScratch {
     scenario_rejection: Vec<u8>,
     scenario_missed_work: Vec<f64>,
     scenario_supply: Vec<f64>,
+    scenario_max_owner_share: Vec<f64>,
     scenario_arrival_path_end_seconds: Vec<f64>,
     scenario_arrival_path_rates: Vec<f64>,
     mean_arrival_rates: Vec<f64>,
@@ -634,8 +634,8 @@ struct ScenarioWorkspace {
     edf: EdfScratch,
     unassigned_cohorts: EventCohorts,
     prepared_placements: Vec<PreparedPlacement>,
-    posterior_resource_supply: Vec<f64>,
     partition_share_draws: Vec<f64>,
+    owner_share_sums: Vec<f64>,
     assignment: Vec<u32>,
     target_assignment: Vec<u32>,
     assignment_counts: Vec<u32>,
@@ -654,6 +654,7 @@ struct PreparedPlacement {
 
 struct TrajectoryColumns {
     targets: Vec<u32>,
+    requested_micros: Vec<u64>,
     pause_micros: Vec<u64>,
     sampled_ready_micros: Vec<u64>,
     ready_micros: Vec<u64>,
@@ -672,6 +673,11 @@ struct ReactiveTransition {
 struct ReactiveRepair {
     requested_micros: u64,
     rate: f64,
+}
+
+struct RepairTargetSelection {
+    best_target: u32,
+    best_supply: f64,
 }
 
 struct ActiveTransition {
@@ -725,9 +731,7 @@ struct ScenarioShared<'a> {
     partition_offsets: &'a [u32],
     partition_cohort_indexes: &'a [u32],
     partition_count: usize,
-    candidate_concurrency: &'a [f64],
     action_count: usize,
-    current_index: usize,
     normal_events: f64,
     failure_events: f64,
     calendar: Option<CalendarForecast<'a>>,
@@ -745,6 +749,7 @@ struct ScenarioColumns<'a> {
     candidate_stride: usize,
     path_stride: usize,
     supply: &'a mut [f64],
+    max_owner_share: &'a mut [f64],
     miss_delay_fraction: &'a mut [f64],
     late_area: &'a mut [f64],
     drain_seconds: &'a mut [f64],
@@ -761,6 +766,7 @@ struct ScenarioColumns<'a> {
 /// One scenario's output cells.
 struct ScenarioCells<'a> {
     supply: &'a mut [f64],
+    max_owner_share: &'a mut [f64],
     miss_delay_fraction: &'a mut [f64],
     late_area: &'a mut [f64],
     drain_seconds: &'a mut [f64],
@@ -780,6 +786,7 @@ impl ScenarioColumns<'_> {
         let cell = scenario * self.candidate_stride;
         let path_cell = scenario * self.path_stride;
         let (left_supply, right_supply) = self.supply.split_at_mut(cell);
+        let (left_max_owner_share, right_max_owner_share) = self.max_owner_share.split_at_mut(cell);
         let (left_miss_delay_fraction, right_miss_delay_fraction) =
             self.miss_delay_fraction.split_at_mut(cell);
         let (left_late_area, right_late_area) = self.late_area.split_at_mut(cell);
@@ -802,6 +809,7 @@ impl ScenarioColumns<'_> {
                 candidate_stride: self.candidate_stride,
                 path_stride: self.path_stride,
                 supply: left_supply,
+                max_owner_share: left_max_owner_share,
                 miss_delay_fraction: left_miss_delay_fraction,
                 late_area: left_late_area,
                 drain_seconds: left_drain,
@@ -820,6 +828,7 @@ impl ScenarioColumns<'_> {
                 candidate_stride: self.candidate_stride,
                 path_stride: self.path_stride,
                 supply: right_supply,
+                max_owner_share: right_max_owner_share,
                 miss_delay_fraction: right_miss_delay_fraction,
                 late_area: right_late_area,
                 drain_seconds: right_drain,
@@ -843,6 +852,7 @@ impl ScenarioColumns<'_> {
         let path_last = path_first + self.path_stride;
         ScenarioCells {
             supply: &mut self.supply[first..last],
+            max_owner_share: &mut self.max_owner_share[first..last],
             miss_delay_fraction: &mut self.miss_delay_fraction[first..last],
             late_area: &mut self.late_area[first..last],
             drain_seconds: &mut self.drain_seconds[first..last],
@@ -934,6 +944,7 @@ impl TrajectoryColumns {
     fn new(capacity: usize) -> Self {
         Self {
             targets: Vec::with_capacity(capacity),
+            requested_micros: Vec::with_capacity(capacity),
             pause_micros: Vec::with_capacity(capacity),
             sampled_ready_micros: Vec::with_capacity(capacity),
             ready_micros: Vec::with_capacity(capacity),
@@ -957,8 +968,8 @@ impl ScenarioWorkspace {
             edf: EdfScratch::new(bounds.work_cohort_count_max_u32)?,
             unassigned_cohorts: EventCohorts::new(bounds.work_cohort_count_max),
             prepared_placements,
-            posterior_resource_supply: vec![0.0_f64; bounds.replica_count_max],
             partition_share_draws: vec![0.0_f64; bounds.partition_count],
+            owner_share_sums: vec![0.0_f64; bounds.replica_count_max],
             assignment: vec![0; bounds.partition_count],
             target_assignment: vec![0; bounds.partition_count],
             assignment_counts: vec![0; bounds.replica_count_max],
@@ -996,7 +1007,6 @@ impl ScaleScratch {
             successor_report_count_max,
             ..
         } = &bounds;
-        let candidate_concurrency = vec![0.0_f64; replica_count_max];
         let current_partition_owners = vec![0; partition_count];
         let termination_order = (0..configuration.replica_count_max).rev().collect();
         let worker_count = rayon::current_num_threads()
@@ -1020,7 +1030,6 @@ impl ScaleScratch {
             paired_cost_differences: vec![0.0_f64; replica_count_max],
             posterior_supply_sums: vec![0.0_f64; replica_count_max],
             class_masses: vec![0.0_f64; capacity_class_count],
-            candidate_concurrency,
             scenario_miss_delay_fraction: vec![0.0_f64; scenario_cell_count],
             scenario_late_area: vec![0.0_f64; scenario_cell_count],
             scenario_drain_seconds: vec![0.0_f64; scenario_cell_count],
@@ -1028,6 +1037,7 @@ impl ScaleScratch {
             scenario_rejection: vec![0; scenario_cell_count],
             scenario_missed_work: vec![0.0_f64; scenario_cell_count],
             scenario_supply: vec![0.0_f64; scenario_cell_count],
+            scenario_max_owner_share: vec![0.0_f64; scenario_cell_count],
             scenario_arrival_path_end_seconds: vec![0.0_f64; arrival_path_cell_count],
             scenario_arrival_path_rates: vec![0.0_f64; arrival_path_cell_count],
             mean_arrival_rates: vec![0.0_f64; successor_report_count_max],
@@ -1299,7 +1309,6 @@ fn select_target(
     let (normal_events, failure_events) = demand_class_totals(cohorts, backlog);
     prepare_work_cohorts(state, scratch, cohorts, backlog, scheduled_releases);
     prepare_partition_work(scratch);
-    prepare_candidate_concurrency(state, scratch);
     scratch.posterior_missed_work_sums.fill(0.0_f64);
     scratch.posterior_miss_delay_fraction_sums.fill(0.0_f64);
     let scenario_count = state.configuration.posterior_sample_count;
@@ -1369,6 +1378,7 @@ fn evaluate_scenarios(
         candidate_stride,
         path_stride,
         supply: &mut scratch.scenario_supply[..scenario_total * candidate_stride],
+        max_owner_share: &mut scratch.scenario_max_owner_share[..scenario_total * candidate_stride],
         miss_delay_fraction: &mut scratch.scenario_miss_delay_fraction
             [..scenario_total * candidate_stride],
         late_area: &mut scratch.scenario_late_area[..scenario_total * candidate_stride],
@@ -1393,9 +1403,7 @@ fn evaluate_scenarios(
         partition_offsets: &scratch.partition_offsets,
         partition_cohort_indexes: &scratch.partition_cohort_indexes,
         partition_count: scratch.partition_write_offsets.len(),
-        candidate_concurrency: &scratch.candidate_concurrency,
         action_count,
-        current_index: state.current_replicas as usize - 1,
         normal_events,
         failure_events,
         calendar,
@@ -1427,18 +1435,11 @@ fn evaluate_scenario_workers(
         prepare_partition_placements(shared, workspace);
         for local in 0..columns.scenario_count {
             let scenario = columns.first_scenario + local;
-            prepare_scenario_supply(
-                state,
-                shared,
-                workspace,
-                &mut columns.cells(local),
-                scenario,
-            );
+            evaluate_one_scenario(state, shared, workspace, columns.cells(local), scenario);
         }
         partition_deadline_outcomes(state, shared, workspace, &mut columns);
         for local in 0..columns.scenario_count {
-            let scenario = columns.first_scenario + local;
-            evaluate_one_scenario(state, shared, workspace, columns.cells(local), scenario);
+            normalize_scenario_outcomes(state, shared, &mut columns.cells(local));
         }
         return;
     }
@@ -1496,10 +1497,14 @@ fn evaluate_one_scenario(
     mut cells: ScenarioCells<'_>,
     scenario: usize,
 ) {
-    let current_supply = prepare_scenario_supply(state, shared, workspace, &mut cells, scenario);
     let sample = scenario as u32;
     let scenario_count = shared.inner_count * state.capacity_classes.len();
-    let placement_random = scenario_substream(sample, ScenarioRole::Placement);
+    let mut placement_random = scenario_substream(sample, ScenarioRole::Placement);
+    state
+        .partition_placement
+        .sample_shares(&mut placement_random, &mut workspace.partition_share_draws);
+    let (curve, event_supply_factor, current_supply) =
+        prepare_scenario_supply(state, shared, workspace, &mut cells, scenario);
     let path_length = sample_scenario_path(
         state,
         shared.calendar,
@@ -1516,7 +1521,8 @@ fn evaluate_one_scenario(
         workspace,
         &ScenarioDraws {
             current_supply,
-            placement_random,
+            curve,
+            event_supply_factor,
             commitment_random,
             transition_hypotheses,
         },
@@ -1525,7 +1531,7 @@ fn evaluate_one_scenario(
         state,
         shared,
         workspace,
-        cells,
+        &mut cells,
         &ScenarioForecast {
             current_supply,
             path_length,
@@ -1541,18 +1547,11 @@ fn prepare_scenario_supply(
     workspace: &mut ScenarioWorkspace,
     cells: &mut ScenarioCells<'_>,
     scenario: usize,
-) -> f64 {
+) -> (CapacityCurve, f64, f64) {
     let capacity_class = scenario / shared.inner_count;
     let sample = scenario as u32;
     let representative = state.capacity_classes.representative(capacity_class);
     let (curve, _) = state.capacity.curve_and_probability(representative);
-    // ScaleScratch::new gives both buffers one replica-count element per action.
-    dispatch!(state.simd_level, simd => curve_throughput(
-        simd,
-        curve,
-        shared.candidate_concurrency,
-        &mut workspace.posterior_resource_supply,
-    ));
     let mut reliability_random = scenario_substream(sample, ScenarioRole::Reliability);
     let (normal_retry, failure_retry) = state
         .reliability
@@ -1565,14 +1564,34 @@ fn prepare_scenario_supply(
         shared.normal_events,
         shared.failure_events,
     );
-    dispatch!(state.simd_level, simd => scale_and_store_supply(
-        simd,
+    workspace
+        .assignment
+        .copy_from_slice(shared.current_partition_owners);
+    let current_replicas = state.current_replicas as usize;
+    let current_max_share = assignment_max_owner_share(workspace, current_replicas);
+    let current_supply = placement_supply(
+        curve,
         event_supply_factor,
-        &mut workspace.posterior_resource_supply,
-        &mut *cells.supply,
-    ));
-    let current_concurrency = shared.candidate_concurrency[shared.current_index];
-    curve.sustainable_throughput(current_concurrency) * event_supply_factor
+        state.configuration.slots_per_replica,
+        current_replicas,
+        shared.partition_count,
+        current_max_share,
+    );
+    for candidate_index in 0..shared.action_count {
+        let target = candidate_index as u32 + 1;
+        sticky_target_assignment(shared, workspace, target);
+        let max_share = target_assignment_max_owner_share(workspace, target as usize);
+        cells.max_owner_share[candidate_index] = max_share;
+        cells.supply[candidate_index] = placement_supply(
+            curve,
+            event_supply_factor,
+            state.configuration.slots_per_replica,
+            target as usize,
+            shared.partition_count,
+            max_share,
+        );
+    }
+    (curve, event_supply_factor, current_supply)
 }
 
 /// Evaluates one scenario's prepared trajectories into decision cells.
@@ -1580,7 +1599,7 @@ fn evaluate_scenario_outcome(
     state: &ScaleState,
     shared: &ScenarioShared<'_>,
     workspace: &mut ScenarioWorkspace,
-    mut cells: ScenarioCells<'_>,
+    cells: &mut ScenarioCells<'_>,
     forecast: &ScenarioForecast,
 ) {
     let start_seconds = Duration::from_micros(state.model_time.as_micros()).as_secs_f64();
@@ -1622,7 +1641,6 @@ fn evaluate_scenario_outcome(
         &mut cells.drain_seconds[..shared.action_count],
         &mut cells.missed_work[..shared.action_count],
     );
-    normalize_scenario_outcomes(state, shared, &mut cells);
     // Every candidate uses the same billing horizon. It includes the final
     // successor event, even when a sampled transition exceeds the plan.
     let billing_horizon_micros = workspace
@@ -2041,9 +2059,17 @@ fn finish_decision(
         + state.configuration.objective.replica_second_delay_rate()
             * scratch.posterior_replica_seconds_sums[selected];
     let miss_delay_fraction = scratch.posterior_miss_delay_fraction_sums[selected];
+    let max_owner_share = state
+        .partition_placement
+        .maximum_assigned_expected_share(&scratch.current_partition_owners);
+    let slots = f64::from(state.configuration.slots_per_replica);
+    let replica_limit = state
+        .current_replicas
+        .min(state.configuration.partition_count);
+    let effective_concurrency = (slots / max_owner_share).min(slots * f64::from(replica_limit));
     let saturation_probability = state
         .capacity
-        .saturation_probability(state.simd_level, scratch.candidate_concurrency[selected]);
+        .saturation_probability(state.simd_level, effective_concurrency);
     let paired_cost_standard_error = scratch
         .decision_column_summary(selected)
         .and_then(|summary| summary.paired_standard_error);
@@ -2072,7 +2098,8 @@ struct ScenarioForecast {
 /// One scenario's sampled transition and disturbance context.
 struct ScenarioDraws {
     current_supply: f64,
-    placement_random: RandomStream,
+    curve: CapacityCurve,
+    event_supply_factor: f64,
     commitment_random: RandomStream,
     transition_hypotheses: TransitionHypotheses,
 }
@@ -2087,6 +2114,8 @@ struct TransitionHypotheses {
 struct HypotheticalDraws<'a> {
     random: &'a RandomStream,
     hypotheses: TransitionHypotheses,
+    curve: CapacityCurve,
+    event_supply_factor: f64,
 }
 
 #[cfg_attr(
@@ -2100,11 +2129,7 @@ fn prepare_supply_trajectories(
     draws: &ScenarioDraws,
 ) {
     let current_supply = draws.current_supply;
-    let candidate_count = workspace.posterior_resource_supply.len();
-    let mut placement_random = draws.placement_random.clone();
-    state
-        .partition_placement
-        .sample_shares(&mut placement_random, &mut workspace.partition_share_draws);
+    let candidate_count = shared.action_count;
     let now_micros = sample_commitment_pauses(
         state,
         workspace,
@@ -2149,6 +2174,8 @@ fn prepare_candidate_trajectories(
             HypotheticalDraws {
                 random: &draws.commitment_random,
                 hypotheses: draws.transition_hypotheses,
+                curve: draws.curve,
+                event_supply_factor: draws.event_supply_factor,
             },
             candidate,
             now_micros,
@@ -2171,14 +2198,17 @@ fn prepare_candidate_trajectories(
                 continue;
             }
             write_trajectory_event(
+                state,
                 shared,
                 workspace,
+                draws,
                 read,
                 &mut active,
                 TrajectoryPreparation { now_micros },
             );
         }
         workspace.trajectory.targets.truncate(active.write);
+        workspace.trajectory.requested_micros.truncate(active.write);
         workspace.trajectory.pause_micros.truncate(active.write);
         workspace
             .trajectory
@@ -2200,6 +2230,8 @@ fn prepare_candidate_trajectories(
             HypotheticalDraws {
                 random: &draws.commitment_random,
                 hypotheses: draws.transition_hypotheses,
+                curve: draws.curve,
+                event_supply_factor: draws.event_supply_factor,
             },
         );
         workspace
@@ -2213,8 +2245,10 @@ fn prepare_candidate_trajectories(
 }
 
 fn write_trajectory_event(
+    state: &ScaleState,
     shared: &ScenarioShared<'_>,
     workspace: &mut ScenarioWorkspace,
+    draws: &ScenarioDraws,
     read: usize,
     active: &mut ActiveTransition,
     preparation: TrajectoryPreparation,
@@ -2243,12 +2277,21 @@ fn write_trajectory_event(
     };
     let retained = 1.0_f64 - moved_share;
     workspace.trajectory.targets[active.write] = target;
+    workspace.trajectory.requested_micros[active.write] =
+        workspace.trajectory.requested_micros[read];
     workspace.trajectory.pause_micros[active.write] = pause;
     workspace.trajectory.sampled_ready_micros[active.write] = sampled_ready;
     workspace.trajectory.ready_micros[active.write] = ready;
     workspace.trajectory.during_supply[active.write] = before_supply * retained;
-    workspace.trajectory.after_supply[active.write] =
-        workspace.posterior_resource_supply[target as usize - 1];
+    let max_share = assignment_max_owner_share(workspace, target as usize);
+    workspace.trajectory.after_supply[active.write] = placement_supply(
+        draws.curve,
+        draws.event_supply_factor,
+        state.configuration.slots_per_replica,
+        target as usize,
+        shared.partition_count,
+        max_share,
+    );
     active.ready_micros = ready;
     active.during_supply = workspace.trajectory.during_supply[active.write];
     active.after_supply = workspace.trajectory.after_supply[active.write];
@@ -2259,6 +2302,7 @@ fn write_trajectory_event(
 
 fn clear_trajectory(trajectory: &mut TrajectoryColumns) {
     trajectory.targets.clear();
+    trajectory.requested_micros.clear();
     trajectory.pause_micros.clear();
     trajectory.sampled_ready_micros.clear();
     trajectory.ready_micros.clear();
@@ -2298,6 +2342,78 @@ fn transition_moved_share(
     (count, share.min(1.0_f64))
 }
 
+fn sticky_target_assignment(
+    shared: &ScenarioShared<'_>,
+    workspace: &mut ScenarioWorkspace,
+    target: u32,
+) {
+    let result = sticky_assignment(
+        &workspace.assignment,
+        target,
+        shared.termination_order,
+        &mut workspace.target_assignment,
+        &mut workspace.assignment_counts,
+        &mut workspace.moved_partitions,
+    );
+    assert!(
+        result.is_ok(),
+        "the observed assignment must satisfy its configured bounds: {result:?}, target {target}"
+    );
+}
+
+fn assignment_max_owner_share(workspace: &mut ScenarioWorkspace, replica_count: usize) -> f64 {
+    let assignment = &workspace.assignment;
+    max_owner_share(
+        assignment,
+        &workspace.partition_share_draws,
+        &mut workspace.owner_share_sums[..replica_count],
+    )
+}
+
+fn target_assignment_max_owner_share(
+    workspace: &mut ScenarioWorkspace,
+    replica_count: usize,
+) -> f64 {
+    max_owner_share(
+        &workspace.target_assignment,
+        &workspace.partition_share_draws,
+        &mut workspace.owner_share_sums[..replica_count],
+    )
+}
+
+fn max_owner_share(assignment: &[u32], shares: &[f64], owner_sums: &mut [f64]) -> f64 {
+    owner_sums.fill(0.0_f64);
+    for (&owner, &share) in assignment.iter().zip(shares) {
+        owner_sums[owner as usize] += share;
+    }
+    owner_sums.iter().copied().fold(0.0_f64, f64::max)
+}
+
+/// Returns cluster supply for one fixed partition assignment.
+///
+/// The capacity curve gives group-wide throughput. Each owner has a fixed slot
+/// bound. Per-slot throughput is uniform at one global concurrency. Partition
+/// routing is fixed. An owner cannot use another owner's slots. The largest
+/// owner share sets useful concurrency. Aggregate EDF and the partition
+/// evaluator use this same operating point.
+fn placement_supply(
+    curve: CapacityCurve,
+    event_supply_factor: f64,
+    slots_per_replica: u32,
+    replica_count: usize,
+    partition_count: usize,
+    max_owner_share: f64,
+) -> f64 {
+    debug_assert!(
+        max_owner_share.is_finite() && max_owner_share > 0.0_f64,
+        "a valid assignment must have one positive finite owner share"
+    );
+    let slots = f64::from(slots_per_replica);
+    let replica_limit = replica_count.min(partition_count) as u32;
+    let concurrency = (slots / max_owner_share).min(slots * f64::from(replica_limit));
+    event_supply_factor * curve.sustainable_throughput(concurrency)
+}
+
 const fn membership_ready(
     direction: TransitionDirection,
     moved: u32,
@@ -2329,6 +2445,7 @@ fn push_candidate_events(
         push_trajectory_event(
             &mut workspace.trajectory,
             commitment.target_replicas,
+            commitment.requested_at.as_micros(),
             now_micros,
             workspace.rebalancing_ready_micros,
         );
@@ -2348,6 +2465,9 @@ fn push_candidate_events(
         push_trajectory_event(
             &mut workspace.trajectory,
             candidate,
+            actuation_commitments
+                .launching_requested_at(commitment_index)
+                .as_micros(),
             workspace.commitment_pause_micros[commitment_index],
             workspace.commitment_ready_micros[commitment_index],
         );
@@ -2373,6 +2493,7 @@ fn push_candidate_events(
         push_trajectory_event(
             &mut workspace.trajectory,
             candidate,
+            now_micros,
             pause_micros,
             ready_micros,
         );
@@ -2459,11 +2580,7 @@ fn append_reactive_repair(
     draws: HypotheticalDraws<'_>,
     slot: u64,
 ) -> bool {
-    let action_count = shared.action_count;
-    let target = repair_target(
-        &workspace.posterior_resource_supply[..action_count],
-        repair.rate,
-    );
+    let target = assignment_repair_target(state, shared, workspace, draws, repair.rate);
     if target == transition.replicas {
         return false;
     }
@@ -2489,8 +2606,20 @@ fn append_reactive_repair(
         sampled_ready_micros
     };
     let retained = 1.0_f64 - moved_share;
-    let after = workspace.posterior_resource_supply[target as usize - 1];
+    let max_share = assignment_max_owner_share(workspace, target as usize);
+    let after = placement_supply(
+        draws.curve,
+        draws.event_supply_factor,
+        state.configuration.slots_per_replica,
+        target as usize,
+        shared.partition_count,
+        max_share,
+    );
     workspace.trajectory.targets.push(target);
+    workspace
+        .trajectory
+        .requested_micros
+        .push(repair.requested_micros);
     workspace.trajectory.pause_micros.push(pause_micros);
     workspace
         .trajectory
@@ -2510,16 +2639,61 @@ fn append_reactive_repair(
 
 /// Returns the smallest replica target whose supply covers one rate.
 ///
-/// The supply column is non-decreasing. When no target covers the rate,
-/// the largest target is the best repair.
+/// When no target covers the rate, this function selects maximum supply.
 ///
 /// This target is the reactive-policy fixed point. The live policy uses the
 /// posterior-mean rate from its next report. The controller keeps this demand
 /// floor by design. Sampled future rates affect cost, but they do not restrict
 /// the initial action set.
-fn repair_target(supply: &[f64], rate: f64) -> u32 {
-    let index = supply.partition_point(|value| *value < rate);
-    index.min(supply.len() - 1) as u32 + 1
+fn assignment_repair_target(
+    state: &ScaleState,
+    shared: &ScenarioShared<'_>,
+    workspace: &mut ScenarioWorkspace,
+    draws: HypotheticalDraws<'_>,
+    rate: f64,
+) -> u32 {
+    let mut selection = RepairTargetSelection::new();
+    for candidate_index in 0..shared.action_count {
+        let target = candidate_index as u32 + 1;
+        sticky_target_assignment(shared, workspace, target);
+        let max_share = target_assignment_max_owner_share(workspace, target as usize);
+        debug_assert!(
+            max_share.is_finite() && max_share > 0.0_f64,
+            "a valid repair assignment must have one positive finite owner share"
+        );
+        let supply = placement_supply(
+            draws.curve,
+            draws.event_supply_factor,
+            state.configuration.slots_per_replica,
+            target as usize,
+            shared.partition_count,
+            max_share,
+        );
+        if let Some(target) = selection.consider(target, supply, rate) {
+            return target;
+        }
+    }
+    selection.best_target
+}
+
+impl RepairTargetSelection {
+    const fn new() -> Self {
+        Self {
+            best_target: 1,
+            best_supply: f64::NEG_INFINITY,
+        }
+    }
+
+    fn consider(&mut self, target: u32, supply: f64, rate: f64) -> Option<u32> {
+        if supply >= rate {
+            return Some(target);
+        }
+        if supply > self.best_supply {
+            self.best_target = target;
+            self.best_supply = supply;
+        }
+        None
+    }
 }
 
 #[cfg_attr(
@@ -2677,10 +2851,12 @@ pub(crate) fn scenario_substream(scenario: u32, role: ScenarioRole) -> RandomStr
 fn push_trajectory_event(
     trajectory: &mut TrajectoryColumns,
     target: u32,
+    requested_micros: u64,
     pause_micros: u64,
     sampled_ready_micros: u64,
 ) {
     trajectory.targets.push(target);
+    trajectory.requested_micros.push(requested_micros);
     trajectory.pause_micros.push(pause_micros);
     trajectory.sampled_ready_micros.push(sampled_ready_micros);
     trajectory.ready_micros.push(0_u64);
@@ -2692,6 +2868,7 @@ fn sort_trajectory_events(trajectory: &mut TrajectoryColumns, first: usize) {
     for mut event in first + 1..trajectory.targets.len() {
         while event > first && trajectory.pause_micros[event] < trajectory.pause_micros[event - 1] {
             trajectory.targets.swap(event, event - 1);
+            trajectory.requested_micros.swap(event, event - 1);
             trajectory.pause_micros.swap(event, event - 1);
             trajectory.sampled_ready_micros.swap(event, event - 1);
             trajectory.ready_micros.swap(event, event - 1);
@@ -2836,7 +3013,11 @@ fn partition_deadline_outcomes_simd<S: Simd>(
             for local in (0..full_lane_count).step_by(lane_count) {
                 let capacities = S::f64s::from_fn(simd, |lane| {
                     let cell = (local + lane) * columns.candidate_stride + candidate;
-                    partition_replica_capacity(columns.supply[cell], replica_count)
+                    partition_replica_capacity(
+                        columns.supply[cell],
+                        replica_count,
+                        columns.max_owner_share[cell],
+                    )
                 });
                 let outcomes = evaluate_prepared_step_capacities(
                     simd,
@@ -2852,7 +3033,11 @@ fn partition_deadline_outcomes_simd<S: Simd>(
             }
             for local in full_lane_count..columns.scenario_count {
                 let cell = local * columns.candidate_stride + candidate;
-                let capacity = partition_replica_capacity(columns.supply[cell], replica_count);
+                let capacity = partition_replica_capacity(
+                    columns.supply[cell],
+                    replica_count,
+                    columns.max_owner_share[cell],
+                );
                 let outcome = evaluate_prepared_step(
                     &placement.cohorts,
                     SupplyStep {
@@ -2896,8 +3081,10 @@ fn accumulate_partition_outcome_lanes<S: Simd>(
     }
 }
 
-fn partition_replica_capacity(supply: f64, replica_count: usize) -> f64 {
-    supply / u32::try_from(replica_count).map_or(f64::INFINITY, f64::from)
+fn partition_replica_capacity(supply: f64, replica_count: usize, max_owner_share: f64) -> f64 {
+    let uniform_share =
+        u32::try_from(replica_count).map_or(0.0_f64, |count| 1.0_f64 / f64::from(count));
+    supply * max_owner_share.max(uniform_share)
 }
 
 #[cfg(test)]
@@ -2920,15 +3107,6 @@ fn balanced_partition_range(partitions: usize, replicas: usize, replica: usize) 
     first..first + width
 }
 
-fn prepare_candidate_concurrency(state: &ScaleState, scratch: &mut ScaleScratch) {
-    for (candidate_index, concurrency) in scratch.candidate_concurrency.iter_mut().enumerate() {
-        let candidate = candidate_index as u32 + 1;
-        let active_replicas = candidate.min(state.configuration.partition_count);
-        *concurrency =
-            f64::from(active_replicas.saturating_mul(state.configuration.slots_per_replica));
-    }
-}
-
 /// Returns the complete physical action domain.
 ///
 /// Kafka assigns one partition to at most one consumer. A larger target adds
@@ -2944,30 +3122,6 @@ fn demand_class_totals(cohorts: &CohortColumns, backlog: &BacklogColumns) -> (f6
     let totals = cohorts.demand_totals();
     let backlog_totals = backlog.demand_totals();
     (totals.0 + backlog_totals.0, totals.1 + backlog_totals.1)
-}
-
-fn scale_and_store_supply<S: Simd>(
-    simd: S,
-    factor: f64,
-    supply: &mut [f64],
-    scenario_supply: &mut [f64],
-) {
-    let lane_count = S::f64s::N;
-    let vector_count = supply.len() / lane_count;
-    let scalar_factor = factor;
-    let factor = S::f64s::splat(simd, scalar_factor);
-    for vector in 0..vector_count {
-        let start = vector * lane_count;
-        let end = start + lane_count;
-        let scaled = S::f64s::from_slice(simd, &supply[start..end]) * factor;
-        scaled.store_slice(&mut supply[start..end]);
-        scaled.store_slice(&mut scenario_supply[start..end]);
-    }
-    let tail = vector_count * lane_count;
-    for value in &mut supply[tail..] {
-        *value *= scalar_factor;
-    }
-    scenario_supply[tail..].copy_from_slice(&supply[tail..]);
 }
 
 pub(crate) fn mixed_event_supply(

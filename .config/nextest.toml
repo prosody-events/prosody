@@ -1,2 +1,5 @@
 [profile.default]
 status-level = "pass"
+# A test that runs for hours is a defect, never a wait. Mark slow at 60 s;
+# hard-kill at 10 minutes. Fix the code's performance, not the timeout.
+slow-timeout = { period = "60s", terminate-after = 10 }

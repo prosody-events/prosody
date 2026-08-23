@@ -2494,6 +2494,7 @@ fn saturation_probability<S: Simd>(
     total
 }
 
+#[cfg(test)]
 pub(super) fn curve_throughput<S: Simd>(
     simd: S,
     curve: CapacityCurve,
