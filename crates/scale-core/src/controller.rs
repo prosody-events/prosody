@@ -646,6 +646,9 @@ struct ScenarioWorkspace {
     assignment_counts: Vec<u32>,
     moved_partitions: Vec<bool>,
     repair_supply: Vec<f64>,
+    repair_cache_assignments: Vec<u32>,
+    repair_cache_supplies: Vec<f64>,
+    repair_cache_valid: Vec<bool>,
     commitment_pause_micros: Vec<u64>,
     commitment_ready_micros: Vec<u64>,
     rebalancing_ready_micros: u64,
@@ -738,6 +741,8 @@ struct ScratchBounds {
     scenario_cell_count: usize,
     arrival_path_cell_count: usize,
     successor_report_count_max: usize,
+    repair_cache_assignment_count: usize,
+    repair_cache_supply_count: usize,
 }
 
 struct CandidateEvaluation<'a> {
@@ -969,6 +974,12 @@ impl ScratchBounds {
                 .checked_mul(configuration.arrival_prior.path_segment_count_max())
                 .ok_or(ConfigurationError::PlatformLimit)?,
             successor_report_count_max,
+            repair_cache_assignment_count: replica_count_max
+                .checked_mul(partition_count)
+                .ok_or(ConfigurationError::PlatformLimit)?,
+            repair_cache_supply_count: replica_count_max
+                .checked_mul(replica_count_max)
+                .ok_or(ConfigurationError::PlatformLimit)?,
         })
     }
 }
@@ -1008,6 +1019,9 @@ impl ScenarioWorkspace {
             assignment_counts: vec![0; bounds.replica_count_max],
             moved_partitions: vec![false; bounds.partition_count],
             repair_supply: vec![0.0_f64; bounds.replica_count_max],
+            repair_cache_assignments: vec![0; bounds.repair_cache_assignment_count],
+            repair_cache_supplies: vec![0.0_f64; bounds.repair_cache_supply_count],
+            repair_cache_valid: vec![false; bounds.replica_count_max],
             commitment_pause_micros: vec![0_u64; bounds.replica_count_max],
             commitment_ready_micros: vec![0_u64; bounds.replica_count_max],
             rebalancing_ready_micros: u64::MAX,
@@ -1617,7 +1631,7 @@ fn prepare_scenario_supply(
     for candidate_index in 0..shared.action_count {
         let target = candidate_index as u32 + 1;
         sticky_target_assignment(shared, workspace, target);
-        let max_share = target_assignment_max_owner_share(workspace);
+        let max_share = target_assignment_max_owner_share(workspace, target as usize);
         cells.max_owner_share[candidate_index] = max_share;
         cells.supply[candidate_index] = placement_supply(
             curve,
@@ -2165,6 +2179,7 @@ fn prepare_supply_trajectories(
     workspace: &mut ScenarioWorkspace,
     draws: &ScenarioDraws,
 ) {
+    workspace.repair_cache_valid.fill(false);
     let current_supply = draws.current_supply;
     let candidate_count = shared.action_count;
     let now_micros = sample_commitment_pauses(
@@ -2384,18 +2399,89 @@ fn sticky_target_assignment(
     workspace: &mut ScenarioWorkspace,
     target: u32,
 ) {
-    let result = sticky_assignment(
-        &workspace.assignment,
-        target,
-        shared.termination_order,
-        &mut workspace.target_assignment,
-        &mut workspace.assignment_counts,
-        &mut workspace.moved_partitions,
+    let current_count = workspace
+        .assignment
+        .iter()
+        .copied()
+        .max()
+        .map_or(0, |owner| owner + 1);
+    let owner_count = target.min(shared.partition_count as u32);
+    debug_assert!(
+        current_count > 0,
+        "the current assignment must not be empty"
     );
-    assert!(
-        result.is_ok(),
-        "the observed assignment must satisfy its configured bounds: {result:?}, target {target}"
+    debug_assert!(owner_count > 0, "the target assignment must have an owner");
+    debug_assert!(
+        current_count as usize <= workspace.assignment_counts.len(),
+        "the owner remap must cover the current assignment"
     );
+
+    workspace.moved_partitions[..current_count as usize].fill(false);
+    let removed_count = current_count.saturating_sub(owner_count) as usize;
+    for &owner in shared
+        .termination_order
+        .iter()
+        .filter(|owner| **owner < current_count)
+        .take(removed_count)
+    {
+        workspace.moved_partitions[owner as usize] = true;
+    }
+    let mut removed_before = 0_u32;
+    for owner in 0..current_count {
+        workspace.assignment_counts[owner as usize] = if workspace.moved_partitions[owner as usize]
+        {
+            removed_before += 1;
+            u32::MAX
+        } else {
+            owner - removed_before
+        };
+    }
+    for (&owner, target_owner) in workspace
+        .assignment
+        .iter()
+        .zip(&mut workspace.target_assignment)
+    {
+        *target_owner = workspace.assignment_counts[owner as usize];
+    }
+
+    workspace.assignment_counts[..owner_count as usize].fill(0);
+    for &owner in workspace
+        .target_assignment
+        .iter()
+        .filter(|owner| **owner != u32::MAX)
+    {
+        workspace.assignment_counts[owner as usize] += 1;
+    }
+    let base = shared.partition_count as u32 / owner_count;
+    let remainder = shared.partition_count as u32 % owner_count;
+    for target_owner in workspace.target_assignment.iter_mut().rev() {
+        let owner = *target_owner;
+        if owner == u32::MAX {
+            continue;
+        }
+        let desired = base + u32::from(owner < remainder);
+        if workspace.assignment_counts[owner as usize] > desired {
+            *target_owner = u32::MAX;
+            workspace.assignment_counts[owner as usize] -= 1;
+        }
+    }
+    let mut owner = 0_u32;
+    for target_owner in workspace
+        .target_assignment
+        .iter_mut()
+        .filter(|owner| **owner == u32::MAX)
+    {
+        while owner < owner_count {
+            let desired = base + u32::from(owner < remainder);
+            if workspace.assignment_counts[owner as usize] < desired {
+                break;
+            }
+            owner += 1;
+        }
+        debug_assert!(owner < owner_count, "the target assignment must balance");
+        *target_owner = owner;
+        workspace.assignment_counts[owner as usize] += 1;
+    }
 }
 
 fn assignment_max_owner_share(workspace: &mut ScenarioWorkspace) -> f64 {
@@ -2407,12 +2493,17 @@ fn assignment_max_owner_share(workspace: &mut ScenarioWorkspace) -> f64 {
     )
 }
 
-fn target_assignment_max_owner_share(workspace: &mut ScenarioWorkspace) -> f64 {
-    max_owner_share(
-        &workspace.target_assignment,
-        &workspace.partition_share_draws,
-        &mut workspace.owner_share_sums,
-    )
+fn target_assignment_max_owner_share(workspace: &mut ScenarioWorkspace, owner_count: usize) -> f64 {
+    let owner_sums = &mut workspace.owner_share_sums[..owner_count];
+    owner_sums.fill(0.0_f64);
+    for (&owner, &share) in workspace
+        .target_assignment
+        .iter()
+        .zip(&workspace.partition_share_draws)
+    {
+        owner_sums[owner as usize] += share;
+    }
+    owner_sums.iter().copied().fold(0.0_f64, f64::max)
 }
 
 fn max_owner_share(assignment: &[u32], shares: &[f64], owner_sums: &mut [f64]) -> f64 {
@@ -2915,16 +3006,43 @@ fn append_reactive_repair(
 /// Computes each repair supply for the current sticky assignment.
 ///
 /// The supply ladder stays valid until a transition changes the assignment.
+#[cfg_attr(
+    feature = "hotpath",
+    hotpath::measure(label = "prepare_assignment_repair_supply")
+)]
 fn prepare_assignment_repair_supply(
     state: &ScaleState,
     shared: &ScenarioShared<'_>,
     workspace: &mut ScenarioWorkspace,
     draws: HypotheticalDraws<'_>,
 ) {
+    let replica_count = workspace
+        .assignment
+        .iter()
+        .copied()
+        .max()
+        .map_or(0, |owner| owner as usize + 1);
+    debug_assert!(
+        replica_count > 0,
+        "the current assignment must not be empty"
+    );
+    let replica_slot = replica_count - 1;
+    let assignment_first = replica_slot * shared.partition_count;
+    let assignment_last = assignment_first + shared.partition_count;
+    let supply_first = replica_slot * shared.action_count;
+    let supply_last = supply_first + shared.action_count;
+    if workspace.repair_cache_valid[replica_slot]
+        && workspace.repair_cache_assignments[assignment_first..assignment_last]
+            == workspace.assignment
+    {
+        workspace.repair_supply[..shared.action_count]
+            .copy_from_slice(&workspace.repair_cache_supplies[supply_first..supply_last]);
+        return;
+    }
     for candidate_index in 0..shared.action_count {
         let target = candidate_index as u32 + 1;
         sticky_target_assignment(shared, workspace, target);
-        let max_share = target_assignment_max_owner_share(workspace);
+        let max_share = target_assignment_max_owner_share(workspace, target as usize);
         debug_assert!(
             max_share.is_finite() && max_share > 0.0_f64,
             "a valid repair assignment must have one positive finite owner share"
@@ -2938,6 +3056,11 @@ fn prepare_assignment_repair_supply(
             max_share,
         );
     }
+    workspace.repair_cache_assignments[assignment_first..assignment_last]
+        .copy_from_slice(&workspace.assignment);
+    workspace.repair_cache_supplies[supply_first..supply_last]
+        .copy_from_slice(&workspace.repair_supply[..shared.action_count]);
+    workspace.repair_cache_valid[replica_slot] = true;
 }
 
 /// Returns the smallest replica target whose supply covers one rate.
