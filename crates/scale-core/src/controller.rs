@@ -305,15 +305,16 @@ impl ScaleState {
 
     /// Finds completion quantiles and the CDF interval around one observation.
     ///
-    /// The predictive uses the current report's certified occupancy trace.
+    /// The predictive uses the report's initial state and scheduled starts.
     pub fn completion_predictive_summary(
         &mut self,
         evidence: OccupancyTraceEvidence<'_>,
+        seed: u64,
         observed: u32,
         thresholds: [f64; 3],
     ) -> CompletionPredictiveSummary {
         self.capacity
-            .completion_predictive_summary(evidence, observed, thresholds)
+            .completion_predictive_summary(evidence, seed, observed, thresholds)
     }
 
     /// Writes the marginal capacity posterior into caller-owned buffers.

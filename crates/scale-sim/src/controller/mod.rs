@@ -2629,6 +2629,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
                 let observed = window.completed_attempts;
                 let summary = state.completion_predictive_summary(
                     evidence,
+                    diagnostic_seed ^ now_micros.rotate_left(17),
                     observed,
                     [0.1_f64, 0.5_f64, 0.9_f64],
                 );

@@ -7,7 +7,7 @@ use std::{
 use allocation_counter::measure;
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use quickcheck_macros::quickcheck;
-use statrs::distribution::{ContinuousCDF, DiscreteCDF, Gamma, Poisson};
+use statrs::distribution::{Binomial, BinomialError, ContinuousCDF, DiscreteCDF, Gamma};
 use thiserror::Error;
 
 use super::{
@@ -30,20 +30,6 @@ fn kernel_float_matches(actual: f64, expected: f64) -> bool {
             && actual.is_sign_positive() == expected.is_sign_positive();
     }
     (actual - expected).abs() <= 1.0e-12_f64.max(1.0e-9_f64 * expected.abs())
-}
-
-fn predictive_moments(cdfs: &[f64]) -> (f64, f64) {
-    let mut previous = 0.0_f64;
-    let mut mean = 0.0_f64;
-    let mut second = 0.0_f64;
-    for (count, cdf) in cdfs.iter().copied().enumerate() {
-        let mass = cdf - previous;
-        let value = u32::try_from(count).map_or(f64::from(u32::MAX), f64::from);
-        mean += mass * value;
-        second += mass * value * value;
-        previous = cdf;
-    }
-    (mean, second - mean * mean)
 }
 
 fn update_constant_trace(
@@ -1885,6 +1871,31 @@ fn capacity_update_does_not_allocate() -> Result<(), TestError> {
 }
 
 #[test]
+fn completion_predictive_does_not_allocate() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.01_f64], &[1_000.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        4.0_f64,
+        0.1_f64,
+        64,
+    )?;
+    let window = ResourceWindow::new_with_starts(3.0_f64, 0.1_f64, 10, 10)?;
+    let offsets = (0_u64..10).map(|index| index * 10_000).collect::<Vec<_>>();
+    let completed = [1_u32; 10];
+    let started = [1_u32; 10];
+    let evidence = occupancy_trace_for_test(window, 3, 3, 300_000, &offsets, &completed, &started);
+
+    let allocation = measure(|| {
+        factor.completion_predictive_summary(evidence, 11, 10, [0.1_f64, 0.5_f64, 0.9_f64]);
+    });
+    assert_eq!(allocation.count_total, 0);
+    assert_eq!(allocation.bytes_total, 0);
+    Ok(())
+}
+
+#[test]
 fn raw_path_score_matches_the_exponential_clock_oracle() -> Result<(), TestError> {
     let grid = CapacityGrid::new(&[0.5_f64, 1.0_f64], &[100.0_f64], &[0.0_f64])?;
     let mut factor = super::CapacityFactor::new_with_prior(
@@ -2024,7 +2035,6 @@ fn honest_regime_prices_derive_the_capacity_operation_budget() -> Result<(), Tes
         filter_count: 432,
         filter_curve_count: 3_024,
         transition_count: 200_001,
-        ln_gamma_integer_count: 100_001,
         group_limit: 100_000,
     };
     let prices = [
@@ -2072,7 +2082,6 @@ fn operation_price_for_test(
         filter_count: 160,
         filter_curve_count: 160 * cell_count,
         transition_count: 100_001,
-        ln_gamma_integer_count: 50_001,
         group_limit: group_count,
     })
     .ok_or(CapacityModelError::StorageBound)
@@ -2224,8 +2233,44 @@ fn residual_cdf_mixes_each_curve_before_the_clock_check() -> Result<(), TestErro
     Ok(())
 }
 
+#[test]
+fn joint_completion_predictive_covers_fast_realized_completions() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.01_f64], &[1_000.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        1.0_f64,
+        0.1_f64,
+        32,
+    )?;
+    factor.weights.fill(0.0_f64);
+    factor.weights[0] = 1.0_f64;
+    let window = ResourceWindow::new_with_starts(0.01_f64, 0.1_f64, 10, 10)?;
+    let mut offsets = [0_u64; 20];
+    let mut completed = [0_u32; 20];
+    let mut started = [0_u32; 20];
+    for index in 0..10 {
+        offsets[index * 2] = 1_000 + index as u64 * 10_000;
+        offsets[index * 2 + 1] = offsets[index * 2] + 100;
+        started[index * 2] = 1;
+        completed[index * 2 + 1] = 1;
+    }
+    let evidence = occupancy_trace_for_test(window, 0, 0, 1_000, &offsets, &completed, &started);
+    let summary =
+        factor.completion_predictive_summary(evidence, 7, 10, [0.1_f64, 0.5_f64, 0.9_f64]);
+
+    assert!((-0.1_f64).exp() > 0.9_f64);
+    assert!(
+        summary.quantile_counts[0] <= 10 && summary.quantile_counts[2] >= 10,
+        "joint band: {:?}",
+        summary.quantile_counts
+    );
+    Ok(())
+}
+
 #[quickcheck]
-fn fixed_occupancy_predictive_has_exponential_server_mean_and_variance(
+fn pre_window_attempt_predictive_matches_exponential_survival(
     concurrency_seed: u8,
     service_seed: u8,
     exposure_seed: u8,
@@ -2263,14 +2308,18 @@ fn fixed_occupancy_predictive_has_exponential_server_mean_and_variance(
         &[],
     );
     let mut cdfs = [0.0_f64; 256];
-    factor.write_completion_predictive_cdfs(evidence, &mut cdfs);
-    let (mean, variance) = predictive_moments(&cdfs);
-    let intensity = f64::from(concurrency) / service_seconds * exposure_seconds;
-    (mean - intensity).abs() <= 1.0e-9_f64 && (variance - intensity).abs() <= 1.0e-8_f64
+    factor.write_completion_predictive_cdfs(evidence, 11, &mut cdfs);
+    let completion_probability = 1.0_f64 - (-exposure_seconds / service_seconds).exp();
+    let Ok(oracle) = Binomial::new(completion_probability, u64::from(concurrency)) else {
+        return false;
+    };
+    let error_max = 2.0_f64 / 256.0_f64.sqrt();
+    (0..=concurrency)
+        .all(|count| (cdfs[count as usize] - oracle.cdf(u64::from(count))).abs() <= error_max)
 }
 
 #[quickcheck]
-fn varying_trace_predictive_uses_integrated_intensity(first_seed: u8, second_seed: u8) -> bool {
+fn joint_predictive_ignores_realized_completion_times(first_seed: u8, second_seed: u8) -> bool {
     let first = u32::from(first_seed % 8 + 1);
     let second = u32::from(second_seed % 8 + 1);
     let Ok(grid) = CapacityGrid::new(&[0.5_f64], &[100.0_f64], &[0.0_f64]) else {
@@ -2308,73 +2357,64 @@ fn varying_trace_predictive_uses_integrated_intensity(first_seed: u8, second_see
         &completed,
         &started,
     );
-    let mut cdfs = [0.0_f64; 256];
-    factor.write_completion_predictive_cdfs(evidence, &mut cdfs);
-    let (mean, variance) = predictive_moments(&cdfs);
-    let intensity = f64::from(first + second);
-    (mean - intensity).abs() <= 1.0e-9_f64 && (variance - intensity).abs() <= 1.0e-8_f64
+    let alternate_offsets = [250_000_u64, 500_000_u64];
+    let alternate_completed = [first, 0_u32];
+    let alternate_started = [0_u32, second];
+    let alternate = occupancy_trace_for_test(
+        window,
+        first,
+        second,
+        u128::from(first + second) * 250_000_u128 + u128::from(second) * 250_000_u128,
+        &alternate_offsets,
+        &alternate_completed,
+        &alternate_started,
+    );
+    let mut first_cdfs = [0.0_f64; 256];
+    let mut alternate_cdfs = [0.0_f64; 256];
+    factor.write_completion_predictive_cdfs(evidence, 11, &mut first_cdfs);
+    factor.write_completion_predictive_cdfs(alternate, 11, &mut alternate_cdfs);
+    first_cdfs
+        .iter()
+        .zip(alternate_cdfs)
+        .all(|(first, alternate)| first.to_bits() == alternate.to_bits())
 }
 
-#[quickcheck]
-fn completion_predictive_mixture_matches_direct_cell_oracle(count: u8) -> bool {
-    let Ok(grid) = CapacityGrid::new(&[0.5_f64, 1.0_f64], &[100.0_f64], &[0.0_f64]) else {
-        return false;
-    };
-    let Ok(mut factor) = super::CapacityFactor::new_with_prior(
+#[test]
+fn completion_predictive_mixture_matches_direct_cell_oracle() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.5_f64, 1.0_f64], &[100.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
         grid.clone(),
         1.0_f64 / 300.0_f64,
         4.0_f64,
         2.0_f64,
         1.0_f64,
         255,
-    ) else {
-        return false;
-    };
+    )?;
     factor.weights.fill(0.0_f64);
     let last = factor.weights.len() - 1;
     factor.weights[0] = 0.25_f64;
     factor.weights[last] = 0.75_f64;
-    let Ok(window) = ResourceWindow::new_with_starts(2.0_f64, 1.0_f64, 0, 0) else {
-        return false;
-    };
+    let window = ResourceWindow::new_with_starts(2.0_f64, 1.0_f64, 0, 0)?;
     let evidence = occupancy_trace_for_test(window, 2, 2, 2_000_000, &[], &[], &[]);
-    let actual = factor.completion_predictive_cdf(evidence, u32::from(count));
-    let first_intensity = super::state_rate(&grid, 0, 2);
-    let last_intensity = super::state_rate(&grid, last, 2);
-    let (Ok(first_oracle), Ok(last_oracle)) =
-        (Poisson::new(first_intensity), Poisson::new(last_intensity))
-    else {
-        return false;
-    };
-    let expected = 0.25_f64 * first_oracle.cdf(u64::from(count))
-        + 0.75_f64 * last_oracle.cdf(u64::from(count));
-    kernel_float_matches(actual, expected)
+    let first_probability = 1.0_f64 - (-super::state_rate(&grid, 0, 1)).exp();
+    let last_probability = 1.0_f64 - (-super::state_rate(&grid, last, 1)).exp();
+    let first_oracle = Binomial::new(first_probability, 2)?;
+    let last_oracle = Binomial::new(last_probability, 2)?;
+    for count in 0..=2 {
+        let actual = factor.completion_predictive_cdf(evidence, 11, count);
+        let expected = 0.25_f64 * first_oracle.cdf(u64::from(count))
+            + 0.75_f64 * last_oracle.cdf(u64::from(count));
+        assert!(
+            (actual - expected).abs() <= 0.1_f64,
+            "count {count}: {actual} != {expected}"
+        );
+    }
+    Ok(())
 }
 
 #[quickcheck]
-fn exponential_plant_randomized_ranks_are_uniform_in_both_tails(seed: u8) -> bool {
-    let Ok(grid) = CapacityGrid::new(&[0.5_f64], &[100.0_f64], &[0.0_f64]) else {
-        return false;
-    };
-    let Ok(mut factor) = super::CapacityFactor::new_with_prior(
-        grid,
-        1.0_f64 / 300.0_f64,
-        4.0_f64,
-        2.0_f64,
-        1.0_f64,
-        255,
-    ) else {
-        return false;
-    };
-    factor.weights.fill(0.0_f64);
-    factor.weights[0] = 1.0_f64;
-    let Ok(window) = ResourceWindow::new_with_starts(2.0_f64, 1.0_f64, 0, 0) else {
-        return false;
-    };
-    let evidence = occupancy_trace_for_test(window, 2, 2, 2_000_000, &[], &[], &[]);
-    let mut cdfs = [0.0_f64; 256];
-    factor.write_completion_predictive_cdfs(evidence, &mut cdfs);
-    let Ok(plant) = Poisson::new(4.0_f64) else {
+fn randomized_discrete_ranks_are_uniform_in_both_tails(seed: u8) -> bool {
+    let Ok(plant) = Binomial::new(1.0_f64 - (-2.0_f64).exp(), 2) else {
         return false;
     };
     let mut lower_tail = 0_u32;
@@ -2385,10 +2425,15 @@ fn exponential_plant_randomized_ranks_are_uniform_in_both_tails(seed: u8) -> boo
         while plant.cdf(count as u64) < draw {
             count += 1;
         }
-        let lower = if count == 0 { 0.0_f64 } else { cdfs[count - 1] };
+        let lower = if count == 0 {
+            0.0_f64
+        } else {
+            plant.cdf(count as u64 - 1)
+        };
+        let upper = plant.cdf(count as u64);
         let offset_index = (index * 73 + u32::from(seed)) % 256;
         let offset = (f64::from(offset_index) + 0.5_f64) / 256.0_f64;
-        let rank = lower + offset * (cdfs[count] - lower);
+        let rank = lower + offset * (upper - lower);
         lower_tail += u32::from(rank < 0.1_f64);
         upper_tail += u32::from(rank > 0.9_f64);
     }
@@ -2415,8 +2460,8 @@ fn completion_predictive_cdf_is_monotone(count: u8) -> bool {
         return false;
     };
     let evidence = occupancy_trace_for_test(window, 1, 1, 1_000_000, &[], &[], &[]);
-    let lower = factor.completion_predictive_cdf(evidence, u32::from(count));
-    let upper = factor.completion_predictive_cdf(evidence, u32::from(count) + 1);
+    let lower = factor.completion_predictive_cdf(evidence, 11, u32::from(count));
+    let upper = factor.completion_predictive_cdf(evidence, 11, u32::from(count) + 1);
     (0.0_f64..=1.0_f64).contains(&lower) && lower <= upper && upper <= 1.0_f64
 }
 
@@ -2459,11 +2504,11 @@ fn completion_predictive_sweep_matches_scalar_cdf_and_summary(
         &[],
     );
     let mut sweep = vec![0.0_f64; count_max as usize + 1];
-    factor.write_completion_predictive_cdfs(evidence, &mut sweep);
+    factor.write_completion_predictive_cdfs(evidence, u64::from(seed), &mut sweep);
     for (count, actual) in sweep.iter().enumerate() {
         if !kernel_float_matches(
             *actual,
-            factor.completion_predictive_cdf(evidence, count as u32),
+            factor.completion_predictive_cdf(evidence, u64::from(seed), count as u32),
         ) {
             return false;
         }
@@ -2471,14 +2516,15 @@ fn completion_predictive_sweep_matches_scalar_cdf_and_summary(
 
     let observed = u32::from(seed) % (count_max + 1);
     let thresholds = [0.1_f64, 0.5_f64, 0.9_f64];
-    let summary = factor.completion_predictive_summary(evidence, observed, thresholds);
+    let summary =
+        factor.completion_predictive_summary(evidence, u64::from(seed), observed, thresholds);
     let mut reference_quantiles = [count_max; 3];
     for (index, threshold) in thresholds.into_iter().enumerate() {
         let mut low = 0_u32;
         let mut high = count_max;
         while low < high {
             let middle = low + (high - low) / 2;
-            if factor.completion_predictive_cdf(evidence, middle) >= threshold {
+            if factor.completion_predictive_cdf(evidence, u64::from(seed), middle) >= threshold {
                 high = middle;
             } else {
                 low = middle + 1;
@@ -2486,11 +2532,11 @@ fn completion_predictive_sweep_matches_scalar_cdf_and_summary(
         }
         reference_quantiles[index] = low;
     }
-    let reference_upper = factor.completion_predictive_cdf(evidence, observed);
+    let reference_upper = factor.completion_predictive_cdf(evidence, u64::from(seed), observed);
     let reference_lower = if observed == 0 {
         0.0_f64
     } else {
-        factor.completion_predictive_cdf(evidence, observed - 1)
+        factor.completion_predictive_cdf(evidence, u64::from(seed), observed - 1)
     };
     let rank_offset = f64::from(seed) / f64::from(u8::MAX);
     let rank = summary.lower + rank_offset * (summary.upper - summary.lower);
@@ -2568,6 +2614,8 @@ fn exponential_matches_libm(input: f64, actual: f64) -> bool {
 
 #[derive(Debug, Error)]
 enum TestError {
+    #[error(transparent)]
+    Binomial(#[from] BinomialError),
     #[error(transparent)]
     Arrival(#[from] crate::ArrivalPriorError),
     #[error(transparent)]

@@ -6,10 +6,11 @@ use std::{
 
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use statrs::distribution::{Beta, ContinuousCDF, Gamma, LogNormal};
-use statrs::function::gamma::{gamma_lr, gamma_ur, ln_gamma};
+use statrs::function::gamma::{gamma_lr, gamma_ur};
 use thiserror::Error;
 
 use crate::change_point::ChangePointKernel;
+use crate::random::RandomStream;
 use crate::types::prior_artifact_contract_holds;
 use crate::{
     OccupancyTraceEvidence, PriorArtifact, PriorArtifactBudget, PriorArtifactIdentity,
@@ -562,7 +563,6 @@ struct CapacityAllocation {
     filter_count: usize,
     filter_curve_count: usize,
     transition_count: usize,
-    ln_gamma_integer_count: usize,
     group_limit: usize,
 }
 
@@ -587,8 +587,6 @@ pub(crate) struct CapacityFactor {
     observation_clock_micros: u64,
     previous_window_concurrency: Option<f64>,
     completion_coefficients: Vec<f64>,
-    completion_cell_cdfs: Vec<f64>,
-    ln_gamma_integers: Vec<f64>,
     state_exposure_seconds: Vec<f64>,
     state_completion_counts: Vec<u32>,
     state_rates: Vec<f64>,
@@ -638,8 +636,7 @@ impl CapacityFactor {
         let filter_curve_count = filter_count
             .checked_mul(cell_count)
             .ok_or(CapacityModelError::StorageBound)?;
-        let (transition_count, ln_gamma_integer_count) =
-            attempt_buffer_counts(attempt_count_max, state_count)?;
+        let transition_count = attempt_buffer_count(attempt_count_max)?;
         validate_capacity_allocation(
             &grid,
             &artifact,
@@ -649,7 +646,6 @@ impl CapacityFactor {
                 filter_count,
                 filter_curve_count,
                 transition_count,
-                ln_gamma_integer_count,
                 group_limit: group_count_max as usize,
             },
         )?;
@@ -679,8 +675,6 @@ impl CapacityFactor {
             observation_clock_micros: 0,
             previous_window_concurrency: None,
             completion_coefficients: vec![0.0_f64; attempt_count_max as usize + 1],
-            completion_cell_cdfs: vec![0.0_f64; cell_count],
-            ln_gamma_integers: integer_ln_gamma_table(ln_gamma_integer_count)?,
             state_exposure_seconds: vec![0.0_f64; state_count],
             state_completion_counts: vec![0; state_count],
             state_rates: vec![0.0_f64; state_count],
@@ -811,51 +805,43 @@ impl CapacityFactor {
         feature = "hotpath",
         hotpath::measure(label = "completion_predictive_sweep")
     )]
-    /// Predicts completions from the certified occupancy path.
+    /// Generates the joint completion predictive from pre-window state.
+    ///
+    /// Each posterior draw starts with the initial busy count. It applies the
+    /// recorded starts and generates all completion times from the drawn curve.
+    /// Live-attempt ages do not change the model's memoryless completion draw.
     fn completion_predictive_sweep(
         &mut self,
         evidence: OccupancyTraceEvidence<'_>,
+        seed: u64,
         count_max: u32,
         mut visit: impl FnMut(u32, f64) -> bool,
     ) {
-        fold_trace(
-            evidence,
-            &mut self.state_exposure_seconds,
-            &mut self.state_completion_counts,
-        );
-        self.completion_cell_cdfs.fill(0.0_f64);
-        for index in 0..self.weights.len() {
-            if index < self.grid.knee_cell_count as usize {
-                fill_knee_state_rates(&self.grid, index, &mut self.state_rates);
-            } else {
-                fill_no_knee_state_rates(&self.grid, index, &mut self.state_rates);
+        self.completion_coefficients.fill(0.0_f64);
+        let sample_count = self.completion_coefficients.len() as u32;
+        let mut cell = 0_usize;
+        let mut cumulative = self.weights[0];
+        for scenario in 0..sample_count {
+            let mut random = RandomStream::new(seed)
+                .domain(0x636f_6d70_6c65_7465)
+                .domain(u64::from(scenario));
+            let posterior_draw = (f64::from(scenario) + 0.5_f64) / f64::from(sample_count);
+            while posterior_draw > cumulative && cell + 1 < self.weights.len() {
+                cell += 1;
+                cumulative += self.weights[cell];
             }
-            self.likelihoods[index] = self
-                .state_rates
-                .iter()
-                .zip(&self.state_exposure_seconds)
-                .map(|(rate, exposure)| rate * exposure)
-                .sum();
+            let completed = generate_completion_count(evidence, &self.grid, cell, &mut random);
+            let bucket = match usize::try_from(completed) {
+                Ok(count) => count,
+                Err(_) => usize::MAX,
+            }
+            .min(self.completion_coefficients.len() - 1);
+            self.completion_coefficients[bucket] += 1.0_f64;
         }
+        let sample_count = f64::from(sample_count);
+        let mut cumulative = 0.0_f64;
         for count in 0..=count_max {
-            for index in 0..self.weights.len() {
-                let intensity = self.likelihoods[index];
-                let log_mass = if intensity == 0.0_f64 {
-                    if count == 0 {
-                        0.0_f64
-                    } else {
-                        f64::NEG_INFINITY
-                    }
-                } else {
-                    -intensity + f64::from(count) * intensity.ln()
-                        - self.ln_gamma_integers[count as usize]
-                };
-                self.completion_cell_cdfs[index] += log_mass.exp();
-            }
-            let mut cumulative = 0.0_f64;
-            for (weight, cell_cdf) in self.weights.iter().zip(&self.completion_cell_cdfs) {
-                cumulative += *weight * *cell_cdf;
-            }
+            cumulative += self.completion_coefficients[count as usize] / sample_count;
             if !visit(count, cumulative.clamp(0.0_f64, 1.0_f64)) {
                 break;
             }
@@ -865,6 +851,7 @@ impl CapacityFactor {
     pub(crate) fn completion_predictive_summary(
         &mut self,
         evidence: OccupancyTraceEvidence<'_>,
+        seed: u64,
         observed: u32,
         thresholds: [f64; 3],
     ) -> CompletionPredictiveSummary {
@@ -881,7 +868,7 @@ impl CapacityFactor {
         } else {
             0.0_f64
         };
-        self.completion_predictive_sweep(evidence, count_max, |count, cdf| {
+        self.completion_predictive_sweep(evidence, seed, count_max, |count, cdf| {
             for index in 0..thresholds.len() {
                 if !quantile_found[index] && cdf >= thresholds[index] {
                     quantile_counts[index] = count;
@@ -907,13 +894,14 @@ impl CapacityFactor {
     pub(crate) fn completion_predictive_cdf(
         &mut self,
         evidence: OccupancyTraceEvidence<'_>,
+        seed: u64,
         completed_attempts: u32,
     ) -> f64 {
         if completed_attempts as usize >= self.completion_coefficients.len() {
             return 1.0_f64;
         }
         let mut result = 0.0_f64;
-        self.completion_predictive_sweep(evidence, completed_attempts, |_, cdf| {
+        self.completion_predictive_sweep(evidence, seed, completed_attempts, |_, cdf| {
             result = cdf;
             true
         });
@@ -924,10 +912,11 @@ impl CapacityFactor {
     pub(crate) fn write_completion_predictive_cdfs(
         &mut self,
         evidence: OccupancyTraceEvidence<'_>,
+        seed: u64,
         output: &mut [f64],
     ) {
         let count_max = output.len().saturating_sub(1) as u32;
-        self.completion_predictive_sweep(evidence, count_max, |count, cdf| {
+        self.completion_predictive_sweep(evidence, seed, count_max, |count, cdf| {
             output[count as usize] = cdf;
             true
         });
@@ -1575,13 +1564,12 @@ fn capacity_storage_bytes(allocation: CapacityAllocation) -> Result<usize, Capac
         filter_count,
         state_count,
         transition_count,
-        ln_gamma_integer_count,
         ..
     } = allocation;
     filter_curve_count
         .checked_add(
             cell_count
-                .checked_mul(4)
+                .checked_mul(3)
                 .ok_or(CapacityModelError::StorageBound)?,
         )
         .and_then(|count| {
@@ -1600,41 +1588,18 @@ fn capacity_storage_bytes(allocation: CapacityAllocation) -> Result<usize, Capac
                 .checked_mul(size_of::<u64>() + 2 * size_of::<u32>())
                 .and_then(|transition_bytes| bytes.checked_add(transition_bytes))
         })
-        .and_then(|bytes| {
-            ln_gamma_integer_count
-                .checked_mul(size_of::<f64>())
-                .and_then(|table_bytes| bytes.checked_add(table_bytes))
-        })
         .and_then(|bytes| bytes.checked_add(size_of::<u32>()))
         .ok_or(CapacityModelError::StorageBound)
 }
 
-/// Derives attempt buffers and the integer gamma table from certified bounds.
-fn attempt_buffer_counts(
-    attempt_count_max: u32,
-    state_count: usize,
-) -> Result<(usize, usize), CapacityModelError> {
+/// Derives the transition buffer size from the certified attempt bound.
+fn attempt_buffer_count(attempt_count_max: u32) -> Result<usize, CapacityModelError> {
     let attempt_count =
         usize::try_from(attempt_count_max).map_err(|_| CapacityModelError::StorageBound)?;
-    let transition_count = attempt_count
+    attempt_count
         .checked_mul(2)
         .and_then(|count| count.checked_add(1))
-        .ok_or(CapacityModelError::StorageBound)?;
-    let ln_gamma_integer_count = attempt_count
-        .checked_add(1)
-        .map(|count| count.max(state_count))
-        .ok_or(CapacityModelError::StorageBound)?;
-    Ok((transition_count, ln_gamma_integer_count))
-}
-
-/// Index `n` stores `ln_gamma(n + 1)` for the attempt and state ranges.
-fn integer_ln_gamma_table(count: usize) -> Result<Vec<f64>, CapacityModelError> {
-    (0..count)
-        .map(|index| {
-            let integer = u32::try_from(index).map_err(|_| CapacityModelError::StorageBound)?;
-            Ok(ln_gamma(f64::from(integer) + 1.0_f64))
-        })
-        .collect()
+        .ok_or(CapacityModelError::StorageBound)
 }
 
 fn capacity_grid_storage_bytes(cell_count: usize, knee_cell_count: usize) -> Option<usize> {
@@ -1974,6 +1939,67 @@ fn state_rate(grid: &CapacityGrid, index: usize, state: usize) -> f64 {
         grid.no_knee[index] > 0.0_f64,
         state,
     )
+}
+
+fn generate_completion_count(
+    evidence: OccupancyTraceEvidence<'_>,
+    grid: &CapacityGrid,
+    cell: usize,
+    random: &mut RandomStream,
+) -> u32 {
+    let mut busy = evidence.initial_busy_slots();
+    let mut completed = 0_u32;
+    let mut now_seconds = 0.0_f64;
+    for (&offset_micros, &started) in evidence
+        .offsets_micros()
+        .iter()
+        .zip(evidence.start_groups())
+        .filter(|(_, started)| **started > 0)
+    {
+        let boundary_seconds = Duration::from_micros(offset_micros).as_secs_f64();
+        generate_completions_until(
+            grid,
+            cell,
+            boundary_seconds,
+            random,
+            &mut now_seconds,
+            &mut busy,
+            &mut completed,
+        );
+        busy = busy.saturating_add(started);
+    }
+    generate_completions_until(
+        grid,
+        cell,
+        evidence.window().exposure_seconds(),
+        random,
+        &mut now_seconds,
+        &mut busy,
+        &mut completed,
+    );
+    completed
+}
+
+fn generate_completions_until(
+    grid: &CapacityGrid,
+    cell: usize,
+    boundary_seconds: f64,
+    random: &mut RandomStream,
+    now_seconds: &mut f64,
+    busy: &mut u32,
+    completed: &mut u32,
+) {
+    while *busy > 0 {
+        let rate = state_rate(grid, cell, *busy as usize);
+        let wait_seconds = -random.open_unit_f64().ln() / rate;
+        if *now_seconds + wait_seconds >= boundary_seconds {
+            break;
+        }
+        *now_seconds += wait_seconds;
+        *busy -= 1;
+        *completed = completed.saturating_add(1);
+    }
+    *now_seconds = boundary_seconds;
 }
 
 fn fill_knee_state_rates(grid: &CapacityGrid, index: usize, rates: &mut [f64]) {
