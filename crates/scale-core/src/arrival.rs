@@ -308,7 +308,9 @@ pub(crate) struct ArrivalFactor {
     reset_probability: [Box<[f64]>; RESET_COUNT],
     reset_means: [f64; RESET_COUNT],
     probability: Box<[f64]>,
-    scratch: Box<[f64]>,
+    // This buffer holds the cumulative posterior between updates. An update
+    // uses it as scratch space, then restores the cumulative posterior.
+    cumulative_probability: Box<[f64]>,
     rate_scratch: Box<[f64]>,
     // Calendar segment changes take effect at the next evidence boundary.
     // Each interval belongs to the segment active at its start.
@@ -404,6 +406,8 @@ impl ArrivalFactor {
                 }
             }
         }
+        let mut cumulative_probability = vec![0.0_f64; cell_count].into_boxed_slice();
+        write_cumulative_probability(&probability, &mut cumulative_probability);
         Self {
             model: model.clone(),
             hazards,
@@ -411,7 +415,7 @@ impl ArrivalFactor {
             reset_probability,
             reset_means,
             probability,
-            scratch: vec![0.0_f64; cell_count].into_boxed_slice(),
+            cumulative_probability,
             rate_scratch: vec![0.0_f64; model.rate_count].into_boxed_slice(),
             calendar_artifact: None,
             calendar_position: 0,
@@ -474,7 +478,7 @@ impl ArrivalFactor {
         if duration == 0.0_f64 {
             return;
         }
-        self.scratch.fill(0.0_f64);
+        self.cumulative_probability.fill(0.0_f64);
         if let Some(value) = count {
             for (likelihood, rate) in self.rate_scratch.iter_mut().zip(&self.rates) {
                 *likelihood = log_poisson_mass(value, rate * duration);
@@ -492,22 +496,22 @@ impl ArrivalFactor {
                     let index = cell(hazard, reset, destination, self.rates.len());
                     let prior = self.probability[index] * retained
                         + reset_mass * self.reset_probability[reset][destination];
-                    self.scratch[index] =
+                    self.cumulative_probability[index] =
                         count.map_or(prior, |_| prior.ln() + self.rate_scratch[destination]);
                 }
             }
         }
         if count.is_some() {
             let maximum = self
-                .scratch
+                .cumulative_probability
                 .iter()
                 .copied()
                 .fold(f64::NEG_INFINITY, f64::max);
-            for value in &mut self.scratch {
+            for value in &mut self.cumulative_probability {
                 *value = (*value - maximum).exp();
             }
         }
-        let normalizer = self.scratch.iter().sum::<f64>();
+        let normalizer = self.cumulative_probability.iter().sum::<f64>();
         assert!(
             normalizer.is_finite() && normalizer > 0.0_f64,
             "validated arrival evidence must have positive finite mass"
@@ -515,10 +519,11 @@ impl ArrivalFactor {
         for (probability, next) in self
             .probability
             .iter_mut()
-            .zip(self.scratch.iter().copied())
+            .zip(self.cumulative_probability.iter().copied())
         {
             *probability = next / normalizer;
         }
+        write_cumulative_probability(&self.probability, &mut self.cumulative_probability);
     }
 
     pub(crate) fn prepare_calendar(
@@ -580,10 +585,32 @@ impl ArrivalFactor {
         let calendar = calendar
             .filter(|forecast| calendar_covers(forecast.segments, now_micros, duration_seconds));
         let calendar_probability = calendar.map_or(0.0_f64, |_| self.calendar_probability());
+        rates[..count].fill(0.0_f64);
+        for hazard in 0..self.hazards.len() {
+            for reset in 0..RESET_COUNT {
+                let mut group = 0.0_f64;
+                let mut retained_mean = 0.0_f64;
+                for rate in 0..self.rates.len() {
+                    let probability = self.probability[cell(hazard, reset, rate, self.rates.len())];
+                    group += probability;
+                    retained_mean += probability * self.rates[rate];
+                }
+                let reset_mean = self.reset_means[reset];
+                for (index, output) in rates[..count].iter_mut().enumerate() {
+                    let offset = report_interval_micros.saturating_mul(index as u64 + 1);
+                    let at_micros = now_micros.saturating_add(offset);
+                    let elapsed =
+                        Duration::from_micros(at_micros.saturating_sub(self.last_evidence_micros))
+                            .as_secs_f64();
+                    let retained = (-self.hazards[hazard] * elapsed).exp();
+                    *output += retained * retained_mean + (1.0_f64 - retained) * group * reset_mean;
+                }
+            }
+        }
         for (index, output) in rates[..count].iter_mut().enumerate() {
             let offset = report_interval_micros.saturating_mul(index as u64 + 1);
             let at_micros = now_micros.saturating_add(offset);
-            let local = self.marginal_mean(at_micros);
+            let local = *output;
             let calendar_mean = calendar.map_or(local, |forecast| {
                 calendar_segment_at(forecast.segments, at_micros).map_or(local, |segment| {
                     self.calendar_segment_mean(forecast, segment)
@@ -859,7 +886,11 @@ impl ArrivalFactor {
     }
 
     fn sample_joint(&self, random: &mut RandomStream) -> (usize, usize, usize) {
-        let selected = sample_discrete(&self.probability, random);
+        let draw = random.open_unit_f64();
+        let selected = self
+            .cumulative_probability
+            .partition_point(|&cumulative| draw > cumulative)
+            .min(self.cumulative_probability.len() - 1);
         let hazard = selected / (RESET_COUNT * self.rates.len());
         let remainder = selected % (RESET_COUNT * self.rates.len());
         (
@@ -1088,6 +1119,14 @@ fn sample_discrete(probability: &[f64], random: &mut RandomStream) -> usize {
         }
     }
     probability.len() - 1
+}
+
+fn write_cumulative_probability(probability: &[f64], cumulative: &mut [f64]) {
+    let mut sum = 0.0_f64;
+    for (value, cumulative) in probability.iter().zip(cumulative) {
+        sum += value;
+        *cumulative = sum;
+    }
 }
 
 fn poisson_mass(count: u32, mean: f64) -> f64 {
