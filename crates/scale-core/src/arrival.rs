@@ -340,8 +340,13 @@ impl<'a> MeanRateTrajectory<'a> {
         Self { rates }
     }
 
+    #[cfg(test)]
     pub(crate) fn rates(self) -> impl Iterator<Item = f64> + 'a {
         self.rates.iter().copied()
+    }
+
+    pub(crate) const fn as_slice(self) -> &'a [f64] {
+        self.rates
     }
 }
 

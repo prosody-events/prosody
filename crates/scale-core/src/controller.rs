@@ -587,6 +587,7 @@ pub struct ScaleScratch {
     scenario_arrival_path_end_seconds: Vec<f64>,
     scenario_arrival_path_rates: Vec<f64>,
     mean_arrival_rates: Vec<f64>,
+    mean_rate_runs: Vec<MonotoneRun>,
     scenario_event_count: Vec<f64>,
     scenario_partition_missed_work: Vec<f64>,
     scenario_partition_late_area: Vec<f64>,
@@ -680,6 +681,27 @@ struct ReactiveRepair {
     rate: f64,
 }
 
+#[derive(Clone, Copy)]
+struct MonotoneRun {
+    start: usize,
+    end: usize,
+    direction: RunDirection,
+    min: f64,
+    max: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunDirection {
+    Increasing,
+    Decreasing,
+}
+
+#[derive(Clone, Copy)]
+enum RepairBand {
+    Covering { lower: f64, upper: f64 },
+    Fallback { maximum: f64 },
+}
+
 struct SelectedReactiveRepair {
     requested_micros: u64,
     target: u32,
@@ -750,6 +772,7 @@ struct ScenarioShared<'a> {
     planning_horizon_micros: u64,
     disturbance_horizon_micros: u64,
     mean_trajectory: MeanRateTrajectory<'a>,
+    mean_rate_runs: &'a [MonotoneRun],
 }
 
 /// One worker's disjoint chunk of the scenario-indexed output cells.
@@ -1052,6 +1075,7 @@ impl ScaleScratch {
             scenario_arrival_path_end_seconds: vec![0.0_f64; arrival_path_cell_count],
             scenario_arrival_path_rates: vec![0.0_f64; arrival_path_cell_count],
             mean_arrival_rates: vec![0.0_f64; successor_report_count_max],
+            mean_rate_runs: Vec::with_capacity(successor_report_count_max),
             scenario_event_count: vec![0.0_f64; posterior_sample_count],
             scenario_partition_missed_work: vec![0.0_f64; scenario_cell_count],
             scenario_partition_late_area: vec![0.0_f64; scenario_cell_count],
@@ -1380,6 +1404,7 @@ fn evaluate_scenarios(
         state.model_time.as_micros(),
         &mut scratch.mean_arrival_rates,
     );
+    write_monotone_runs(mean_trajectory.as_slice(), &mut scratch.mean_rate_runs);
     let worker_count = scratch.scenario_workspaces.len().min(scenario_total).max(1);
     let scenario_chunk = scenario_total.div_ceil(worker_count);
     let active_workers = scenario_total.div_ceil(scenario_chunk);
@@ -1423,6 +1448,7 @@ fn evaluate_scenarios(
         planning_horizon_micros,
         disturbance_horizon_micros,
         mean_trajectory,
+        mean_rate_runs: &scratch.mean_rate_runs,
     };
     evaluate_scenario_workers(
         state,
@@ -2526,10 +2552,21 @@ fn append_reactive_repairs(
     draws: HypotheticalDraws<'_>,
 ) {
     let now_micros = state.model_time.as_micros();
-    let mut final_repair = None;
+    let rates = mean_trajectory.as_slice();
+    let final_repair = rates.last().copied().map(|rate| ReactiveRepair {
+        requested_micros: now_micros.saturating_add(
+            state
+                .configuration
+                .report_interval_micros
+                .saturating_mul(rates.len() as u64),
+        ),
+        rate,
+    });
     let mut next_slot = 1_u64;
     let mut supply_is_stale = true;
-    for (boundary, rate) in mean_trajectory.rates().enumerate() {
+    let mut boundary = 0;
+    while boundary < rates.len() {
+        let rate = rates[boundary];
         let requested_micros = now_micros.saturating_add(
             state
                 .configuration
@@ -2540,10 +2577,15 @@ fn append_reactive_repairs(
             requested_micros,
             rate,
         };
-        final_repair = Some(repair);
         // One transition runs at a time: the successor acts once the
         // active transition completes and the report shows the shortage.
         if requested_micros < transition.ready_micros {
+            boundary = transition
+                .ready_micros
+                .saturating_sub(now_micros)
+                .div_ceil(state.configuration.report_interval_micros)
+                .saturating_sub(1) as usize;
+            boundary = boundary.max(1).min(rates.len());
             continue;
         }
         if supply_is_stale {
@@ -2565,8 +2607,20 @@ fn append_reactive_repairs(
         ) {
             next_slot += 1;
             supply_is_stale = true;
+            boundary += 1;
         } else {
             supply_is_stale = false;
+            let supply = &workspace.repair_supply[..shared.action_count];
+            let band = repair_band(supply, target, rate);
+            boundary = next_repair_boundary(
+                rates,
+                shared.mean_rate_runs,
+                boundary,
+                band,
+                now_micros,
+                state.configuration.report_interval_micros,
+                transition.ready_micros,
+            );
         }
     }
     if let Some(mut repair) = final_repair
@@ -2596,6 +2650,199 @@ fn append_reactive_repairs(
             draws,
             next_slot,
         );
+    }
+}
+
+fn write_monotone_runs(rates: &[f64], runs: &mut Vec<MonotoneRun>) {
+    runs.clear();
+    if rates.is_empty() {
+        return;
+    }
+    debug_assert!(
+        rates.iter().all(|rate| rate.is_finite()),
+        "mean rates must be finite"
+    );
+    let mut start = 0;
+    let mut direction = None;
+    for index in 1..rates.len() {
+        let next = if rates[index] > rates[index - 1] {
+            Some(RunDirection::Increasing)
+        } else if rates[index] < rates[index - 1] {
+            Some(RunDirection::Decreasing)
+        } else {
+            None
+        };
+        let Some(next) = next else {
+            continue;
+        };
+        if let Some(current) = direction
+            && current != next
+        {
+            push_monotone_run(rates, runs, start, index - 1, current);
+            start = index - 1;
+        }
+        direction = Some(next);
+    }
+    push_monotone_run(
+        rates,
+        runs,
+        start,
+        rates.len() - 1,
+        direction.unwrap_or(RunDirection::Increasing),
+    );
+}
+
+fn push_monotone_run(
+    rates: &[f64],
+    runs: &mut Vec<MonotoneRun>,
+    start: usize,
+    end: usize,
+    direction: RunDirection,
+) {
+    let (min, max) = if rates[start] <= rates[end] {
+        (rates[start], rates[end])
+    } else {
+        (rates[end], rates[start])
+    };
+    runs.push(MonotoneRun {
+        start,
+        end,
+        direction,
+        min,
+        max,
+    });
+}
+
+fn repair_band(supply: &[f64], target: u32, rate: f64) -> RepairBand {
+    debug_assert!(rate.is_finite(), "the selected rate must be finite");
+    debug_assert!(
+        supply.iter().all(|value| value.is_finite()),
+        "repair supplies must be finite"
+    );
+    let selected = target as usize - 1;
+    if supply[selected] >= rate {
+        let lower = supply[..selected]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        RepairBand::Covering {
+            lower,
+            upper: supply[selected],
+        }
+    } else {
+        RepairBand::Fallback {
+            maximum: supply.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        }
+    }
+}
+
+fn next_repair_boundary(
+    rates: &[f64],
+    runs: &[MonotoneRun],
+    boundary: usize,
+    band: RepairBand,
+    now_micros: u64,
+    report_interval_micros: u64,
+    transition_ready_micros: u64,
+) -> usize {
+    let first = boundary + 1;
+    if first >= rates.len() {
+        return rates.len();
+    }
+    let ready_boundary = transition_ready_micros
+        .saturating_sub(now_micros)
+        .div_ceil(report_interval_micros)
+        .saturating_sub(1) as usize;
+    let cap = if ready_boundary > boundary {
+        ready_boundary.min(rates.len())
+    } else {
+        rates.len()
+    };
+    let first_run = runs.partition_point(|run| run.end < first);
+    for run in &runs[first_run..] {
+        let start = first.max(run.start);
+        let end = cap.min(run.end + 1);
+        if start >= end {
+            if cap <= run.start {
+                break;
+            }
+            continue;
+        }
+        let (segment_min, segment_max) = if start == run.start && end == run.end + 1 {
+            (run.min, run.max)
+        } else {
+            (
+                rates[start].min(rates[end - 1]),
+                rates[start].max(rates[end - 1]),
+            )
+        };
+        if band.strictly_contains(segment_min, segment_max) {
+            if end == cap {
+                return cap;
+            }
+            continue;
+        }
+        if band.is_guard_candidate(rates[start]) {
+            return start;
+        }
+        if band.is_guard_candidate(rates[end - 1]) {
+            return first_guard_candidate(rates, start, end, run.direction, band);
+        }
+        if end == cap {
+            return cap;
+        }
+    }
+    cap
+}
+
+fn first_guard_candidate(
+    rates: &[f64],
+    first: usize,
+    end: usize,
+    direction: RunDirection,
+    band: RepairBand,
+) -> usize {
+    let mut low = first + 1;
+    let mut high = end - 1;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let crossed = match direction {
+            RunDirection::Increasing => band.crosses_upper(rates[middle]),
+            RunDirection::Decreasing => band.crosses_lower(rates[middle]),
+        };
+        if crossed {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    low
+}
+
+impl RepairBand {
+    fn strictly_contains(self, min: f64, max: f64) -> bool {
+        match self {
+            Self::Covering { lower, upper } => min > lower && max < upper,
+            Self::Fallback { maximum } => min > maximum,
+        }
+    }
+
+    fn is_guard_candidate(self, rate: f64) -> bool {
+        self.crosses_lower(rate) || self.crosses_upper(rate)
+    }
+
+    fn crosses_lower(self, rate: f64) -> bool {
+        match self {
+            Self::Covering { lower, .. } => rate <= lower,
+            Self::Fallback { maximum } => rate <= maximum,
+        }
+    }
+
+    fn crosses_upper(self, rate: f64) -> bool {
+        match self {
+            Self::Covering { upper, .. } => rate >= upper,
+            Self::Fallback { .. } => false,
+        }
     }
 }
 

@@ -5,10 +5,10 @@ use thiserror::Error;
 
 use super::{
     RepairTargetSelection, SCHEDULED_PARTITION, ScenarioRole, assignment_max_owner_share,
-    balanced_partition_owner, balanced_partition_range, max_owner_share,
-    partition_replica_capacity, placement_supply, prepare_work_cohorts,
+    balanced_partition_owner, balanced_partition_range, max_owner_share, next_repair_boundary,
+    partition_replica_capacity, placement_supply, prepare_work_cohorts, repair_band,
     sample_hypothetical_transition_times, sample_transition_hypotheses, sample_transition_times,
-    scenario_event_count, scenario_horizons, scenario_random, select_target,
+    scenario_event_count, scenario_horizons, scenario_random, select_target, write_monotone_runs,
 };
 use crate::CapacityCurve;
 use crate::arrival::MeanRateTrajectory;
@@ -619,6 +619,154 @@ fn select_repair_target(supply: &[f64], rate: f64) -> u32 {
     } else {
         selection.best_target
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WalkRepair {
+    target: u32,
+    boundary: usize,
+    requested_micros: u64,
+    pause_micros: u64,
+    ready_micros: u64,
+    supply_bits: u64,
+}
+
+#[quickcheck]
+fn event_driven_successor_matches_naive_walk(
+    raw_rates: Vec<i16>,
+    raw_supply: Vec<i16>,
+    ladder_changes: Vec<i16>,
+    timings: Vec<u8>,
+    initial: u8,
+) -> bool {
+    let rates = raw_rates
+        .into_iter()
+        .take(96)
+        .map(|value| f64::from(value).abs() + 1.0_f64)
+        .collect::<Vec<_>>();
+    let base_supply = raw_supply
+        .into_iter()
+        .take(8)
+        .map(|value| f64::from(value).abs() + 1.0_f64)
+        .collect::<Vec<_>>();
+    if base_supply.is_empty() {
+        return true;
+    }
+    let changes = if ladder_changes.is_empty() {
+        vec![0_i16]
+    } else {
+        ladder_changes.into_iter().take(16).collect()
+    };
+    let timings = if timings.is_empty() {
+        vec![0_u8]
+    } else {
+        timings.into_iter().take(32).collect()
+    };
+    let initial = u32::from(initial) % base_supply.len() as u32 + 1;
+
+    successor_walk_fixture(&rates, &base_supply, &changes, &timings, initial, false)
+        == successor_walk_fixture(&rates, &base_supply, &changes, &timings, initial, true)
+}
+
+fn successor_walk_fixture(
+    rates: &[f64],
+    base_supply: &[f64],
+    ladder_changes: &[i16],
+    timings: &[u8],
+    initial: u32,
+    event_driven: bool,
+) -> Vec<WalkRepair> {
+    const REPORT_MICROS: u64 = 100;
+    let mut runs = Vec::with_capacity(rates.len());
+    write_monotone_runs(rates, &mut runs);
+    let mut repairs = Vec::new();
+    let mut supply = vec![0.0_f64; base_supply.len()];
+    let mut replicas = initial;
+    let mut ready_micros = u64::from(timings[0] % 4) * REPORT_MICROS;
+    let mut boundary = 0;
+    while boundary < rates.len() {
+        let requested_micros = (boundary as u64 + 1) * REPORT_MICROS;
+        if requested_micros < ready_micros {
+            boundary += 1;
+            continue;
+        }
+        write_fixture_ladder(base_supply, ladder_changes, repairs.len(), &mut supply);
+        let target = select_repair_target(&supply, rates[boundary]);
+        if target != replicas {
+            push_fixture_repair(
+                &mut repairs,
+                &supply,
+                target,
+                boundary,
+                requested_micros,
+                timings,
+                &mut ready_micros,
+            );
+            replicas = target;
+            boundary += 1;
+        } else if event_driven {
+            boundary = next_repair_boundary(
+                rates,
+                &runs,
+                boundary,
+                repair_band(&supply, target, rates[boundary]),
+                0,
+                REPORT_MICROS,
+                ready_micros,
+            );
+        } else {
+            boundary += 1;
+        }
+    }
+    if let Some(&rate) = rates.last()
+        && (rates.len() as u64) * REPORT_MICROS < ready_micros
+    {
+        let boundary = ready_micros.div_ceil(REPORT_MICROS).saturating_sub(1) as usize;
+        let requested_micros = (boundary as u64 + 1) * REPORT_MICROS;
+        write_fixture_ladder(base_supply, ladder_changes, repairs.len(), &mut supply);
+        let target = select_repair_target(&supply, rate);
+        if target != replicas {
+            push_fixture_repair(
+                &mut repairs,
+                &supply,
+                target,
+                boundary,
+                requested_micros,
+                timings,
+                &mut ready_micros,
+            );
+        }
+    }
+    repairs
+}
+
+fn write_fixture_ladder(base: &[f64], changes: &[i16], repair_count: usize, supply: &mut [f64]) {
+    let shift = f64::from(changes[repair_count % changes.len()]) / 8.0_f64;
+    for (index, value) in supply.iter_mut().enumerate() {
+        *value = (base[index] + shift).max(0.25_f64);
+    }
+}
+
+fn push_fixture_repair(
+    repairs: &mut Vec<WalkRepair>,
+    supply: &[f64],
+    target: u32,
+    boundary: usize,
+    requested_micros: u64,
+    timings: &[u8],
+    ready_micros: &mut u64,
+) {
+    let timing = timings[repairs.len() % timings.len()];
+    let pause_micros = requested_micros + u64::from(timing % 5) * 17;
+    *ready_micros = pause_micros + u64::from(timing / 5 % 7) * 31;
+    repairs.push(WalkRepair {
+        target,
+        boundary,
+        requested_micros,
+        pause_micros,
+        ready_micros: *ready_micros,
+        supply_bits: supply[target as usize - 1].to_bits(),
+    });
 }
 
 #[test]
