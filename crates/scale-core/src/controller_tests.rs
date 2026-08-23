@@ -4,11 +4,11 @@ use std::time::Duration;
 use thiserror::Error;
 
 use super::{
-    RepairTargetSelection, SCHEDULED_PARTITION, ScenarioRole, balanced_partition_owner,
-    balanced_partition_range, max_owner_share, partition_replica_capacity, placement_supply,
-    prepare_work_cohorts, sample_hypothetical_transition_times, sample_transition_hypotheses,
-    sample_transition_times, scenario_event_count, scenario_horizons, scenario_random,
-    select_target,
+    RepairTargetSelection, SCHEDULED_PARTITION, ScenarioRole, assignment_max_owner_share,
+    balanced_partition_owner, balanced_partition_range, max_owner_share,
+    partition_replica_capacity, placement_supply, prepare_work_cohorts,
+    sample_hypothetical_transition_times, sample_transition_hypotheses, sample_transition_times,
+    scenario_event_count, scenario_horizons, scenario_random, select_target,
 };
 use crate::CapacityCurve;
 use crate::arrival::MeanRateTrajectory;
@@ -96,6 +96,21 @@ fn current_supply_uses_the_observed_owner_map() -> Result<(), TestError> {
     let hypothetical_maximum = factor.maximum_assigned_expected_share(&hypothetical);
 
     assert!(observed_maximum > hypothetical_maximum);
+    Ok(())
+}
+
+#[test]
+fn observed_owner_id_need_not_be_below_current_replica_count() -> Result<(), TestError> {
+    let (_, mut scratch, _) = i27_model(0.02_f64)?;
+    let workspace = &mut scratch.scenario_workspaces[0];
+    for (partition, owner) in workspace.assignment.iter_mut().enumerate() {
+        *owner = [0_u32, 1, 2, 4][partition % 4];
+    }
+    workspace.partition_share_draws.fill(1.0_f64 / 64.0_f64);
+
+    let maximum = assignment_max_owner_share(workspace);
+
+    assert_eq!(maximum.to_bits(), 0.25_f64.to_bits());
     Ok(())
 }
 

@@ -630,6 +630,9 @@ pub struct DecisionColumnSummary {
 /// index-derived ([`scenario_random`]) and the aggregation pass reads
 /// the cells in a fixed order, so the parallel evaluation is
 /// bit-identical to a serial one.
+///
+/// `owner_share_sums` covers the configured owner-ID universe. Observed owner
+/// IDs do not have to form a dense range below the current replica count.
 struct ScenarioWorkspace {
     edf: EdfScratch,
     unassigned_cohorts: EventCohorts,
@@ -1575,7 +1578,7 @@ fn prepare_scenario_supply(
         .assignment
         .copy_from_slice(shared.current_partition_owners);
     let current_replicas = state.current_replicas as usize;
-    let current_max_share = assignment_max_owner_share(workspace, current_replicas);
+    let current_max_share = assignment_max_owner_share(workspace);
     let current_supply = placement_supply(
         curve,
         event_supply_factor,
@@ -1587,7 +1590,7 @@ fn prepare_scenario_supply(
     for candidate_index in 0..shared.action_count {
         let target = candidate_index as u32 + 1;
         sticky_target_assignment(shared, workspace, target);
-        let max_share = target_assignment_max_owner_share(workspace, target as usize);
+        let max_share = target_assignment_max_owner_share(workspace);
         cells.max_owner_share[candidate_index] = max_share;
         cells.supply[candidate_index] = placement_supply(
             curve,
@@ -2290,7 +2293,7 @@ fn write_trajectory_event(
     workspace.trajectory.sampled_ready_micros[active.write] = sampled_ready;
     workspace.trajectory.ready_micros[active.write] = ready;
     workspace.trajectory.during_supply[active.write] = before_supply * retained;
-    let max_share = assignment_max_owner_share(workspace, target as usize);
+    let max_share = assignment_max_owner_share(workspace);
     workspace.trajectory.after_supply[active.write] = placement_supply(
         draws.curve,
         draws.event_supply_factor,
@@ -2368,23 +2371,20 @@ fn sticky_target_assignment(
     );
 }
 
-fn assignment_max_owner_share(workspace: &mut ScenarioWorkspace, replica_count: usize) -> f64 {
+fn assignment_max_owner_share(workspace: &mut ScenarioWorkspace) -> f64 {
     let assignment = &workspace.assignment;
     max_owner_share(
         assignment,
         &workspace.partition_share_draws,
-        &mut workspace.owner_share_sums[..replica_count],
+        &mut workspace.owner_share_sums,
     )
 }
 
-fn target_assignment_max_owner_share(
-    workspace: &mut ScenarioWorkspace,
-    replica_count: usize,
-) -> f64 {
+fn target_assignment_max_owner_share(workspace: &mut ScenarioWorkspace) -> f64 {
     max_owner_share(
         &workspace.target_assignment,
         &workspace.partition_share_draws,
-        &mut workspace.owner_share_sums[..replica_count],
+        &mut workspace.owner_share_sums,
     )
 }
 
@@ -2633,7 +2633,7 @@ fn append_reactive_repair(
         sampled_ready_micros
     };
     let retained = 1.0_f64 - moved_share;
-    let max_share = assignment_max_owner_share(workspace, target as usize);
+    let max_share = assignment_max_owner_share(workspace);
     let after = placement_supply(
         draws.curve,
         draws.event_supply_factor,
@@ -2676,7 +2676,7 @@ fn prepare_assignment_repair_supply(
     for candidate_index in 0..shared.action_count {
         let target = candidate_index as u32 + 1;
         sticky_target_assignment(shared, workspace, target);
-        let max_share = target_assignment_max_owner_share(workspace, target as usize);
+        let max_share = target_assignment_max_owner_share(workspace);
         debug_assert!(
             max_share.is_finite() && max_share > 0.0_f64,
             "a valid repair assignment must have one positive finite owner share"
