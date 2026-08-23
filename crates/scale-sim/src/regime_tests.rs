@@ -5,7 +5,7 @@ use super::{
     SharedResourcePolicy, StopCondition, binomial_coverage_lower_tail, capacity_regime_axes,
     format_clock, is_capacity_regime, live_launch_count_max, principal_capacity_grid_axes,
     replica_count_max, resource_attempt_count_max, run_principal_definition,
-    run_principal_regime_seeded,
+    run_principal_regime_seeded, service_axis,
 };
 use crate::model::{AttemptFrame, AttemptModel};
 use crate::{
@@ -17,27 +17,16 @@ use statrs::distribution::{Binomial, BinomialError, DiscreteCDF};
 use std::time::Duration;
 
 #[test]
-fn non_capacity_grid_contains_the_configured_handler_as_an_interior_point() {
-    // Capacity regimes are exempt. Their axes model combined handler and
-    // dependency service, not the bare configured handler duration.
+fn each_principal_service_axis_contains_its_stated_mean_attempt_time() {
     let excluded: Vec<_> = PrincipalRegime::ALL
         .into_iter()
         .filter(|regime| !is_capacity_regime(*regime))
         .filter(|regime| {
-            let handler_seconds = Duration::from_micros(
-                PrincipalDefinition::for_regime(*regime)
-                    .inputs
-                    .handler_micros,
-            )
-            .as_secs_f64();
+            let truth = attempt_service_seconds(PrincipalDefinition::for_regime(*regime));
             let (service_axis, _) = principal_capacity_grid_axes(*regime);
             !service_axis
-                .get(1..service_axis.len().saturating_sub(1))
-                .is_some_and(|values| {
-                    values
-                        .iter()
-                        .any(|value| value.to_bits() == handler_seconds.to_bits())
-                })
+                .iter()
+                .any(|value| value.to_bits() == truth.to_bits())
         })
         .map(PrincipalRegime::name)
         .collect();
@@ -46,18 +35,18 @@ fn non_capacity_grid_contains_the_configured_handler_as_an_interior_point() {
 }
 
 #[test]
-fn derived_principal_grid_preserves_existing_axis_bits() {
+fn derived_principal_grid_uses_stated_mean_attempt_bits() {
     let (standard_service, standard_capacity) = principal_capacity_grid_axes(PrincipalRegime::Idle);
     let (historical_service, historical_capacity) =
         principal_capacity_grid_axes(PrincipalRegime::HistoricalMatch);
 
     assert_eq!(
         standard_service.map(f64::to_bits),
-        [0.000_5_f64, 0.001_f64, 0.002_f64, 0.004_f64, 0.008_f64].map(f64::to_bits)
+        [0.000_75_f64, 0.001_5_f64, 0.003_f64, 0.006_f64, 0.012_f64].map(f64::to_bits)
     );
     assert_eq!(
         historical_service.map(f64::to_bits),
-        [0.025_f64, 0.05_f64, 0.1_f64, 0.2_f64, 0.4_f64].map(f64::to_bits)
+        [0.025_25_f64, 0.050_5_f64, 0.101_f64, 0.202_f64, 0.404_f64].map(f64::to_bits)
     );
     assert_eq!(
         standard_capacity,
@@ -66,6 +55,27 @@ fn derived_principal_grid_preserves_existing_axis_bits() {
     assert_eq!(
         historical_capacity,
         &[64_000.0_f64, 128_000.0_f64, 256_000.0_f64]
+    );
+}
+
+#[test]
+fn handler_only_service_axis_preserves_existing_bits() {
+    assert_eq!(
+        service_axis(0.002_f64).map(f64::to_bits),
+        [0.000_5_f64, 0.001_f64, 0.002_f64, 0.004_f64, 0.008_f64].map(f64::to_bits)
+    );
+}
+
+#[test]
+fn principal_service_axis_contains_the_stated_mean_attempt_time() {
+    let regime = PrincipalRegime::ApplicationLimited;
+    let truth = attempt_service_seconds(PrincipalDefinition::for_regime(regime));
+    let (service_axis, _) = principal_capacity_grid_axes(regime);
+
+    assert!(
+        service_axis
+            .iter()
+            .any(|service| service.to_bits() == truth.to_bits())
     );
 }
 

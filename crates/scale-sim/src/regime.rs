@@ -1846,25 +1846,27 @@ fn capacity_grid(
 }
 
 fn principal_capacity_grid_axes(regime: PrincipalRegime) -> ([f64; 5], &'static [f64]) {
-    let handler_seconds = Duration::from_micros(
-        PrincipalDefinition::for_regime(regime)
-            .inputs
-            .handler_micros,
-    )
-    .as_secs_f64();
-    let service_times_seconds = [
-        handler_seconds / 4.0_f64,
-        handler_seconds / 2.0_f64,
-        handler_seconds,
-        handler_seconds * 2.0_f64,
-        handler_seconds * 4.0_f64,
-    ];
+    let definition = PrincipalDefinition::for_regime(regime);
+    let mean_attempt_seconds =
+        Duration::from_micros(definition.inputs.stated_mean_attempt_micros()).as_secs_f64();
+    let service_times_seconds = service_axis(mean_attempt_seconds);
     let capacities_per_second = if historical_regime(regime) {
         &[64_000.0_f64, 128_000.0_f64, 256_000.0_f64][..]
     } else {
         &[32_000.0_f64, 64_000.0_f64, 128_000.0_f64, 256_000.0_f64][..]
     };
     (service_times_seconds, capacities_per_second)
+}
+
+/// Returns an axis that contains the stated mean attempt time exactly.
+fn service_axis(mean_attempt_seconds: f64) -> [f64; 5] {
+    [
+        mean_attempt_seconds / 4.0_f64,
+        mean_attempt_seconds / 2.0_f64,
+        mean_attempt_seconds,
+        mean_attempt_seconds * 2.0_f64,
+        mean_attempt_seconds * 4.0_f64,
+    ]
 }
 
 const fn historical_regime(regime: PrincipalRegime) -> bool {
@@ -3084,6 +3086,15 @@ struct InputPolicies {
     history: HistoricalSeries,
     seed: u64,
     stochastic_arrivals: bool,
+}
+
+impl InputPolicies {
+    fn stated_mean_attempt_micros(self) -> u64 {
+        let shared_micros = u64::from(self.shared_resource.parallelism)
+            .saturating_mul(1_000_000)
+            .div_ceil(u64::from(self.shared_resource.capacity_per_second));
+        self.handler_micros.saturating_add(shared_micros)
+    }
 }
 
 #[derive(Clone, Copy)]
