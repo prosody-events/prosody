@@ -601,6 +601,8 @@ pub struct PlantSnapshot {
     pub backlog: u32,
     /// Handler attempts that currently hold slots.
     pub active_handlers: u32,
+    /// Attempts that can start when a slot becomes free.
+    pub available_attempts: u32,
     /// Cumulative handler occupancy in handler-microseconds.
     pub handler_occupancy_micros: u64,
     /// Cumulative successful final completions.
@@ -723,6 +725,8 @@ pub struct AttemptTransition {
 /// Direction of one exact handler-slot transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttemptTransitionKind {
+    /// One attempt became available for dispatch.
+    Available,
     /// One handler slot started work.
     Start,
     /// One handler slot completed work.
@@ -1240,6 +1244,10 @@ impl<M: AttemptModel> Plant<M> {
                         }
                         self.attempt_state[event as usize] =
                             AttemptState::Ready(DemandClass::Failure);
+                        self.attempt_transitions.push(AttemptTransition {
+                            at_micros: scheduled.at_micros,
+                            kind: AttemptTransitionKind::Available,
+                        });
                     }
                 }
                 ScheduledKind::DependencyDone => {
@@ -1371,6 +1379,10 @@ impl<M: AttemptModel> Plant<M> {
         }
         self.key_tail[key] = event;
         self.attempt_state[event as usize] = AttemptState::Ready(DemandClass::Normal);
+        self.attempt_transitions.push(AttemptTransition {
+            at_micros: self.now_micros,
+            kind: AttemptTransitionKind::Available,
+        });
         self.queued_events += 1;
     }
 
@@ -1912,6 +1924,13 @@ impl<M: AttemptModel> Plant<M> {
                 PartitionReconciliation::Paused { .. }
             )));
         }
+        let available_attempts = u32::try_from(
+            self.attempt_state
+                .iter()
+                .filter(|state| matches!(state, AttemptState::Ready(_)))
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
         PlantSnapshot {
             at_micros,
             replicas: self.replicas,
@@ -1919,6 +1938,7 @@ impl<M: AttemptModel> Plant<M> {
             settled: self.settled_events,
             backlog: self.released_events.saturating_sub(self.settled_events),
             active_handlers: self.active_handlers,
+            available_attempts,
             handler_occupancy_micros: self.handler_occupancy_micros,
             useful_completions: self.useful_completions,
             completed_attempts: self.completed_attempts,

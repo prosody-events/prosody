@@ -566,6 +566,13 @@ struct CapacityAllocation {
     group_limit: usize,
 }
 
+struct GeneratedWindow {
+    now_seconds: f64,
+    busy: u32,
+    available: u32,
+    completed: u32,
+}
+
 pub(crate) struct CapacityFactor {
     simd_level: Level,
     grid: CapacityGrid,
@@ -807,8 +814,8 @@ impl CapacityFactor {
     )]
     /// Generates the joint completion predictive from pre-window state.
     ///
-    /// Each posterior draw starts with the initial busy count. It applies the
-    /// recorded starts and generates all completion times from the drawn curve.
+    /// Each draw starts with the pre-window busy and available work counts.
+    /// Demand arrivals and generated completions determine all later starts.
     /// Live-attempt ages do not change the model's memoryless completion draw.
     fn completion_predictive_sweep(
         &mut self,
@@ -830,7 +837,13 @@ impl CapacityFactor {
                 cell += 1;
                 cumulative += self.weights[cell];
             }
-            let completed = generate_completion_count(evidence, &self.grid, cell, &mut random);
+            let completed = generate_completion_count(
+                evidence,
+                &self.grid,
+                cell,
+                evidence.slot_count(),
+                &mut random,
+            );
             let bucket = match usize::try_from(completed) {
                 Ok(count) => count,
                 Err(_) => usize::MAX,
@@ -1945,39 +1958,35 @@ fn generate_completion_count(
     evidence: OccupancyTraceEvidence<'_>,
     grid: &CapacityGrid,
     cell: usize,
+    slot_count: u32,
     random: &mut RandomStream,
 ) -> u32 {
-    let mut busy = evidence.initial_busy_slots();
-    let mut completed = 0_u32;
-    let mut now_seconds = 0.0_f64;
-    for (&offset_micros, &started) in evidence
+    let mut state = GeneratedWindow {
+        now_seconds: 0.0_f64,
+        busy: evidence.initial_busy_slots(),
+        available: evidence.initial_available_attempts(),
+        completed: 0,
+    };
+    fill_available_slots(slot_count, &mut state.busy, &mut state.available);
+    for (&offset_micros, &demand) in evidence
         .offsets_micros()
         .iter()
-        .zip(evidence.start_groups())
-        .filter(|(_, started)| **started > 0)
+        .zip(evidence.demand_groups())
+        .filter(|(_, demand)| **demand > 0)
     {
         let boundary_seconds = Duration::from_micros(offset_micros).as_secs_f64();
-        generate_completions_until(
-            grid,
-            cell,
-            boundary_seconds,
-            random,
-            &mut now_seconds,
-            &mut busy,
-            &mut completed,
-        );
-        busy = busy.saturating_add(started);
+        generate_completions_until(grid, cell, boundary_seconds, random, &mut state);
+        state.available = state.available.saturating_add(demand);
+        fill_available_slots(slot_count, &mut state.busy, &mut state.available);
     }
     generate_completions_until(
         grid,
         cell,
         evidence.window().exposure_seconds(),
         random,
-        &mut now_seconds,
-        &mut busy,
-        &mut completed,
+        &mut state,
     );
-    completed
+    state.completed
 }
 
 fn generate_completions_until(
@@ -1985,21 +1994,29 @@ fn generate_completions_until(
     cell: usize,
     boundary_seconds: f64,
     random: &mut RandomStream,
-    now_seconds: &mut f64,
-    busy: &mut u32,
-    completed: &mut u32,
+    state: &mut GeneratedWindow,
 ) {
-    while *busy > 0 {
-        let rate = state_rate(grid, cell, *busy as usize);
+    while state.busy > 0 {
+        let rate = state_rate(grid, cell, state.busy as usize);
         let wait_seconds = -random.open_unit_f64().ln() / rate;
-        if *now_seconds + wait_seconds >= boundary_seconds {
+        if state.now_seconds + wait_seconds >= boundary_seconds {
             break;
         }
-        *now_seconds += wait_seconds;
-        *busy -= 1;
-        *completed = completed.saturating_add(1);
+        state.now_seconds += wait_seconds;
+        if state.available > 0 {
+            state.available -= 1;
+        } else {
+            state.busy -= 1;
+        }
+        state.completed = state.completed.saturating_add(1);
     }
-    *now_seconds = boundary_seconds;
+    state.now_seconds = boundary_seconds;
+}
+
+fn fill_available_slots(slot_count: u32, busy: &mut u32, available: &mut u32) {
+    let started = slot_count.saturating_sub(*busy).min(*available);
+    *busy = busy.saturating_add(started);
+    *available -= started;
 }
 
 fn fill_knee_state_rates(grid: &CapacityGrid, index: usize, rates: &mut [f64]) {

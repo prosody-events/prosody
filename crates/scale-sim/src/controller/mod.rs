@@ -2162,6 +2162,13 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         let Some(initial_busy_slots) = context.history.active_handlers(0) else {
             return Ok(());
         };
+        let initial_available_attempts = context.history.available_attempts(0).unwrap_or(0);
+        let slot_count = context
+            .history
+            .replicas(0)
+            .unwrap_or(0)
+            .checked_mul(self.configuration.core().slots_per_replica)
+            .ok_or(PlantError::PlatformLimit)?;
         let Some(previous_count) = context.history.attempt_transition_count(0) else {
             return Ok(());
         };
@@ -2219,9 +2226,11 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             busy_slot_micros: u128::from(occupancy),
         };
         self.latest_capacity_window = Some(current);
-        self.observation.set_resource_observation(
+        self.observation.set_resource_observation_with_demand(
             current.evidence()?,
             initial_busy_slots,
+            slot_count,
+            initial_available_attempts,
             final_busy_slots,
             &self.capacity_transition_scratch,
         )?;
@@ -2864,12 +2873,13 @@ fn bucket_window_transitions(
                 .min(bin_count.saturating_sub(1)),
         )
         .map_err(|_| PlantError::PlatformLimit)?;
-        let (completed, started) = match transition.kind {
-            AttemptTransitionKind::Start => (0_u32, 1_u32),
-            AttemptTransitionKind::Completion => (1_u32, 0_u32),
+        let (completed, started, available) = match transition.kind {
+            AttemptTransitionKind::Available => (0_u32, 0_u32, 1_u32),
+            AttemptTransitionKind::Start => (0_u32, 1_u32, 0_u32),
+            AttemptTransitionKind::Completion => (1_u32, 0_u32, 0_u32),
         };
         let group = groups.get_mut(bin).ok_or(PlantError::MetricCapacity)?;
-        *group = OccupancyTransition::new(
+        *group = OccupancyTransition::new_with_demand(
             group.offset_micros(),
             group
                 .completed_attempts()
@@ -2879,9 +2889,17 @@ fn bucket_window_transitions(
                 .started_attempts()
                 .checked_add(started)
                 .ok_or(PlantError::MetricCapacity)?,
+            group
+                .available_attempts()
+                .checked_add(available)
+                .ok_or(PlantError::MetricCapacity)?,
         );
     }
-    groups.retain(|group| group.completed_attempts() > 0 || group.started_attempts() > 0);
+    groups.retain(|group| {
+        group.completed_attempts() > 0
+            || group.started_attempts() > 0
+            || group.available_attempts() > 0
+    });
     Ok(())
 }
 

@@ -21,7 +21,7 @@ use super::{
 };
 use crate::OccupancyTraceEvidence;
 use crate::change_point::ChangePointKernel;
-use crate::types::occupancy_trace_for_test;
+use crate::types::{occupancy_trace_for_test, occupancy_trace_with_demand_for_test};
 
 fn kernel_float_matches(actual: f64, expected: f64) -> bool {
     if actual.is_infinite() || expected.is_infinite() {
@@ -2234,13 +2234,13 @@ fn residual_cdf_mixes_each_curve_before_the_clock_check() -> Result<(), TestErro
 }
 
 #[test]
-fn joint_completion_predictive_covers_fast_realized_completions() -> Result<(), TestError> {
-    let grid = CapacityGrid::new(&[0.01_f64], &[1_000.0_f64], &[0.0_f64])?;
+fn demand_conditioned_predictive_covers_fast_realized_completions() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.1_f64], &[1_000.0_f64], &[0.0_f64])?;
     let mut factor = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
         4.0_f64,
-        1.0_f64,
+        10.0_f64,
         0.1_f64,
         32,
     )?;
@@ -2256,13 +2256,21 @@ fn joint_completion_predictive_covers_fast_realized_completions() -> Result<(), 
         started[index * 2] = 1;
         completed[index * 2 + 1] = 1;
     }
-    let evidence = occupancy_trace_for_test(window, 0, 0, 1_000, &offsets, &completed, &started);
+    let available = [0_u32; 20];
+    let evidence = occupancy_trace_with_demand_for_test(
+        window,
+        10,
+        10,
+        10,
+        10,
+        1_000_000,
+        (&offsets, &completed, &started, &available),
+    );
     let summary =
-        factor.completion_predictive_summary(evidence, 7, 10, [0.1_f64, 0.5_f64, 0.9_f64]);
+        factor.completion_predictive_summary(evidence, 7, 13, [0.1_f64, 0.5_f64, 0.9_f64]);
 
-    assert!((-0.1_f64).exp() > 0.9_f64);
     assert!(
-        summary.quantile_counts[0] <= 10 && summary.quantile_counts[2] >= 10,
+        summary.quantile_counts[0] <= 13 && summary.quantile_counts[2] >= 13,
         "joint band: {:?}",
         summary.quantile_counts
     );

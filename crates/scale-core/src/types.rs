@@ -1315,6 +1315,7 @@ pub struct OccupancyTransition {
     offset_micros: u64,
     completed_attempts: u32,
     started_attempts: u32,
+    available_attempts: u32,
 }
 
 impl OccupancyTransition {
@@ -1325,6 +1326,23 @@ impl OccupancyTransition {
             offset_micros,
             completed_attempts,
             started_attempts,
+            available_attempts: started_attempts,
+        }
+    }
+
+    /// Constructs one ordered transition group with an exogenous demand count.
+    #[must_use]
+    pub const fn new_with_demand(
+        offset_micros: u64,
+        completed_attempts: u32,
+        started_attempts: u32,
+        available_attempts: u32,
+    ) -> Self {
+        Self {
+            offset_micros,
+            completed_attempts,
+            started_attempts,
+            available_attempts,
         }
     }
 
@@ -1345,6 +1363,12 @@ impl OccupancyTransition {
     pub const fn started_attempts(self) -> u32 {
         self.started_attempts
     }
+
+    /// Returns attempts that became available at this clock tick.
+    #[must_use]
+    pub const fn available_attempts(self) -> u32 {
+        self.available_attempts
+    }
 }
 
 /// A certified busy-slot path for one resource report.
@@ -1355,12 +1379,15 @@ impl OccupancyTransition {
 pub struct OccupancyTraceEvidence<'a> {
     window: ResourceWindow,
     initial_busy_slots: u32,
+    slot_count: u32,
+    initial_available_attempts: u32,
     final_busy_slots: u32,
     busy_slot_micros: u128,
     mean_concurrency: f64,
     offsets_micros: &'a [u64],
     completed_attempts: &'a [u32],
     started_attempts: &'a [u32],
+    available_attempts: &'a [u32],
 }
 
 impl OccupancyTraceEvidence<'_> {
@@ -1374,6 +1401,18 @@ impl OccupancyTraceEvidence<'_> {
     #[must_use]
     pub const fn initial_busy_slots(&self) -> u32 {
         self.initial_busy_slots
+    }
+
+    /// Returns the slot count available during the report.
+    #[must_use]
+    pub const fn slot_count(&self) -> u32 {
+        self.slot_count
+    }
+
+    /// Returns work that was available at the report start.
+    #[must_use]
+    pub const fn initial_available_attempts(&self) -> u32 {
+        self.initial_available_attempts
     }
 
     /// Returns the busy-slot count at the report end.
@@ -1411,6 +1450,10 @@ impl OccupancyTraceEvidence<'_> {
     pub(crate) const fn start_groups(&self) -> &[u32] {
         self.started_attempts
     }
+
+    pub(crate) const fn demand_groups(&self) -> &[u32] {
+        self.available_attempts
+    }
 }
 
 #[cfg(test)]
@@ -1426,12 +1469,41 @@ pub(crate) const fn occupancy_trace_for_test<'a>(
     OccupancyTraceEvidence {
         window,
         initial_busy_slots,
+        slot_count: u32::MAX,
+        initial_available_attempts: 0,
         final_busy_slots,
         busy_slot_micros,
         mean_concurrency: window.concurrency(),
         offsets_micros,
         completed_attempts,
         started_attempts,
+        available_attempts: started_attempts,
+    }
+}
+
+#[cfg(test)]
+pub(crate) const fn occupancy_trace_with_demand_for_test<'a>(
+    window: ResourceWindow,
+    initial_busy_slots: u32,
+    slot_count: u32,
+    initial_available_attempts: u32,
+    final_busy_slots: u32,
+    busy_slot_micros: u128,
+    transitions: (&'a [u64], &'a [u32], &'a [u32], &'a [u32]),
+) -> OccupancyTraceEvidence<'a> {
+    let (offsets_micros, completed_attempts, started_attempts, available_attempts) = transitions;
+    OccupancyTraceEvidence {
+        window,
+        initial_busy_slots,
+        slot_count,
+        initial_available_attempts,
+        final_busy_slots,
+        busy_slot_micros,
+        mean_concurrency: window.concurrency(),
+        offsets_micros,
+        completed_attempts,
+        started_attempts,
+        available_attempts,
     }
 }
 
@@ -1439,6 +1511,8 @@ pub(crate) const fn occupancy_trace_for_test<'a>(
 struct OccupancyTraceHeader {
     window: ResourceWindow,
     initial_busy_slots: u32,
+    slot_count: u32,
+    initial_available_attempts: u32,
     final_busy_slots: u32,
     busy_slot_micros: u128,
     mean_concurrency: f64,
@@ -1473,6 +1547,7 @@ pub struct ObservationBuffer {
     resource_transition_offsets_micros: Vec<u64>,
     resource_transition_completed_attempts: Vec<u32>,
     resource_transition_started_attempts: Vec<u32>,
+    resource_transition_available_attempts: Vec<u32>,
     attempt_outcomes: Option<AttemptOutcomeEvidence>,
     launch_header: Option<LaunchEvidenceHeader>,
     readiness_lumps: Vec<ReadinessLump>,
@@ -1549,6 +1624,9 @@ impl ObservationBuffer {
                 resource_transition_count_max,
             ),
             resource_transition_started_attempts: Vec::with_capacity(resource_transition_count_max),
+            resource_transition_available_attempts: Vec::with_capacity(
+                resource_transition_count_max,
+            ),
             attempt_outcomes: None,
             launch_header: None,
             readiness_lumps: Vec::with_capacity(readiness_lump_count_max),
@@ -1593,6 +1671,7 @@ impl ObservationBuffer {
         self.resource_transition_offsets_micros.clear();
         self.resource_transition_completed_attempts.clear();
         self.resource_transition_started_attempts.clear();
+        self.resource_transition_available_attempts.clear();
         self.attempt_outcomes = None;
         self.launch_header = None;
         self.readiness_lumps.clear();
@@ -1793,6 +1872,30 @@ impl ObservationBuffer {
         final_busy_slots: u32,
         transitions: &[OccupancyTransition],
     ) -> Result<(), ObservationError> {
+        self.set_resource_observation_with_demand(
+            window,
+            initial_busy_slots,
+            self.resource_concurrency_max as u32,
+            0,
+            final_busy_slots,
+            transitions,
+        )
+    }
+
+    /// Sets one resource summary with its busy-slot and demand traces.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the trace violates its certified contract.
+    pub fn set_resource_observation_with_demand(
+        &mut self,
+        window: ResourceWindow,
+        initial_busy_slots: u32,
+        slot_count: u32,
+        initial_available_attempts: u32,
+        final_busy_slots: u32,
+        transitions: &[OccupancyTransition],
+    ) -> Result<(), ObservationError> {
         if self.resource_trace.is_some() {
             return Err(ObservationError::ResourceWindowPending);
         }
@@ -1809,6 +1912,8 @@ impl ObservationBuffer {
         }
         if initial_busy_slots > self.resource_concurrency_max as u32
             || final_busy_slots > self.resource_concurrency_max as u32
+            || slot_count > self.resource_concurrency_max as u32
+            || initial_busy_slots > slot_count
         {
             return Err(ObservationError::ResourceBusySlots);
         }
@@ -1871,6 +1976,7 @@ impl ObservationBuffer {
         self.resource_transition_offsets_micros.clear();
         self.resource_transition_completed_attempts.clear();
         self.resource_transition_started_attempts.clear();
+        self.resource_transition_available_attempts.clear();
         for transition in transitions {
             self.resource_transition_offsets_micros
                 .push(transition.offset_micros);
@@ -1878,10 +1984,14 @@ impl ObservationBuffer {
                 .push(transition.completed_attempts);
             self.resource_transition_started_attempts
                 .push(transition.started_attempts);
+            self.resource_transition_available_attempts
+                .push(transition.available_attempts);
         }
         self.resource_trace = Some(OccupancyTraceHeader {
             window,
             initial_busy_slots,
+            slot_count,
+            initial_available_attempts,
             final_busy_slots,
             busy_slot_micros,
             mean_concurrency: derived_concurrency,
@@ -2161,12 +2271,15 @@ impl ObservationBuffer {
                 .map(|header| OccupancyTraceEvidence {
                     window: header.window,
                     initial_busy_slots: header.initial_busy_slots,
+                    slot_count: header.slot_count,
+                    initial_available_attempts: header.initial_available_attempts,
                     final_busy_slots: header.final_busy_slots,
                     busy_slot_micros: header.busy_slot_micros,
                     mean_concurrency: header.mean_concurrency,
                     offsets_micros: &self.resource_transition_offsets_micros,
                     completed_attempts: &self.resource_transition_completed_attempts,
                     started_attempts: &self.resource_transition_started_attempts,
+                    available_attempts: &self.resource_transition_available_attempts,
                 }),
             attempt_outcomes: self.attempt_outcomes.take(),
             launch: self.launch_header.take().map(|header| {
