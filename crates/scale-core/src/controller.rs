@@ -1348,7 +1348,7 @@ fn select_target(
 /// loop.
 #[cfg_attr(feature = "hotpath", hotpath::measure(label = "evaluate_scenarios"))]
 fn evaluate_scenarios(
-    state: &ScaleState,
+    state: &mut ScaleState,
     scratch: &mut ScaleScratch,
     normal_events: f64,
     failure_events: f64,

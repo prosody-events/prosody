@@ -196,7 +196,7 @@ fn path_initial_draw_applies_the_elapsed_transition() -> Result<(), TestError> {
 #[test]
 fn sampled_path_average_converges_to_mean_trajectory() -> Result<(), TestError> {
     let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 90.0_f64)?;
-    let factor = ArrivalFactor::new(&model);
+    let mut factor = ArrivalFactor::new(&model);
     let mut mean_rates = [0.0_f64; 3];
     let mean = factor.write_mean_rate_trajectory(90_000_000, 30_000_000, None, 0, &mut mean_rates);
     let expected = mean.rates().collect::<Vec<_>>();
@@ -266,6 +266,81 @@ fn calendar_mean_trajectory_follows_segment_boundaries() -> Result<(), TestError
     assert_eq!(
         actual.rates().collect::<Vec<_>>(),
         vec![100.0_f64, 400.0_f64, 400.0_f64, 400.0_f64]
+    );
+    Ok(())
+}
+
+#[test]
+fn calendar_mean_trajectory_uses_the_authored_prior_before_evidence() -> Result<(), TestError> {
+    let model = ArrivalPrior::new(2.0_f64, 20.0_f64, 1.0_f64 / 3_600.0_f64)?;
+    let mut local_factor = ArrivalFactor::new(&model);
+    let mut factor = ArrivalFactor::new(&model);
+    let mut segments = CalendarColumns::new(1);
+    segments.extend(&[CalendarRateSegment {
+        position: 0,
+        start_micros: 0,
+        end_micros: 2_000_000,
+        shape: 100.0_f64,
+        rate_seconds: 1.0_f64,
+    }]);
+    let calendar = CalendarForecast {
+        artifact: CalendarArtifactId(9),
+        prior_probability: 0.25_f64,
+        segments: &segments,
+    };
+    let mut local_rates = [0.0_f64; 1];
+    let local = local_factor
+        .write_mean_rate_trajectory(1_000_000, 1_000_000, None, 0, &mut local_rates)
+        .rates()
+        .next()
+        .ok_or(TestError::Distribution)?;
+    let mut rates = [0.0_f64; 1];
+    let actual = factor
+        .write_mean_rate_trajectory(1_000_000, 1_000_000, Some(calendar), 0, &mut rates)
+        .rates()
+        .next()
+        .ok_or(TestError::Distribution)?;
+    let expected = 0.75_f64 * local + 0.25_f64 * 100.0_f64;
+
+    assert_ne!(actual.to_bits(), local.to_bits());
+    assert!((actual - expected).abs() <= f64::EPSILON * expected);
+    Ok(())
+}
+
+#[test]
+fn decision_read_does_not_reset_calendar_evidence() -> Result<(), TestError> {
+    let model = ArrivalPrior::new(2.0_f64, 20.0_f64, 1.0_f64 / 3_600.0_f64)?;
+    let mut factor = ArrivalFactor::new(&model);
+    let mut segments = CalendarColumns::new(1);
+    segments.extend(&[CalendarRateSegment {
+        position: 0,
+        start_micros: 0,
+        end_micros: 3_000_000,
+        shape: 100.0_f64,
+        rate_seconds: 1.0_f64,
+    }]);
+    let calendar = CalendarForecast {
+        artifact: CalendarArtifactId(9),
+        prior_probability: 0.25_f64,
+        segments: &segments,
+    };
+    factor.update(
+        ArrivalEvidence::new(100, 1_000_000),
+        Some(calendar),
+        1_000_000,
+    );
+    let posterior_log_odds = factor.calendar_log_odds;
+    let mut rates = [0.0_f64; 1];
+
+    factor.write_mean_rate_trajectory(1_000_000, 1_000_000, Some(calendar), 1_000_000, &mut rates);
+
+    assert_ne!(
+        posterior_log_odds.to_bits(),
+        super::logit(0.25_f64).to_bits()
+    );
+    assert_eq!(
+        factor.calendar_log_odds.to_bits(),
+        posterior_log_odds.to_bits()
     );
     Ok(())
 }

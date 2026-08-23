@@ -319,6 +319,8 @@ pub(crate) struct ArrivalFactor {
     calendar_position: u32,
     calendar_shape: f64,
     calendar_rate: f64,
+    /// The calendar belief starts at the authored prior before evidence.
+    /// Only arrival evidence changes the belief after the artifact seed.
     calendar_log_odds: f64,
     calendar_active: bool,
     last_evidence_micros: u64,
@@ -572,7 +574,7 @@ impl ArrivalFactor {
     /// calendar component uses its Gamma mean. The sampler excludes scheduled
     /// releases, so this trajectory excludes them too.
     pub(crate) fn write_mean_rate_trajectory<'a>(
-        &self,
+        &mut self,
         duration_micros: u64,
         report_interval_micros: u64,
         calendar: Option<CalendarForecast<'_>>,
@@ -581,9 +583,7 @@ impl ArrivalFactor {
     ) -> MeanRateTrajectory<'a> {
         let count = (duration_micros / report_interval_micros) as usize;
         assert!(count <= rates.len(), "mean trajectory storage is too small");
-        let duration_seconds = Duration::from_micros(duration_micros).as_secs_f64();
-        let calendar = calendar
-            .filter(|forecast| calendar_covers(forecast.segments, now_micros, duration_seconds));
+        self.prepare_calendar(calendar, now_micros);
         let calendar_probability = calendar.map_or(0.0_f64, |_| self.calendar_probability());
         rates[..count].fill(0.0_f64);
         for hazard in 0..self.hazards.len() {
