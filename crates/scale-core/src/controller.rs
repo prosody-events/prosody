@@ -2222,19 +2222,20 @@ fn prepare_candidate_trajectories(
             .assignment
             .copy_from_slice(shared.current_partition_owners);
         let candidate = candidate_index as u32 + 1;
-        let (first, fixed_event_count, committed_replicas) = push_candidate_events(
-            state,
-            workspace,
-            shared.actuation_commitments,
-            HypotheticalDraws {
-                random: &draws.commitment_random,
-                hypotheses: draws.transition_hypotheses,
-                curve: draws.curve,
-                event_supply_factor: draws.event_supply_factor,
-            },
-            candidate,
-            now_micros,
-        );
+        let (first, fixed_event_count, committed_replicas, transition_ordinal) =
+            push_candidate_events(
+                state,
+                workspace,
+                shared.actuation_commitments,
+                HypotheticalDraws {
+                    random: &draws.commitment_random,
+                    hypotheses: draws.transition_hypotheses,
+                    curve: draws.curve,
+                    event_supply_factor: draws.event_supply_factor,
+                },
+                candidate,
+                now_micros,
+            );
         sort_trajectory_events(&mut workspace.trajectory, first + fixed_event_count);
         let mut active = ActiveTransition {
             replicas: state.current_replicas,
@@ -2288,6 +2289,7 @@ fn prepare_candidate_trajectories(
                 curve: draws.curve,
                 event_supply_factor: draws.event_supply_factor,
             },
+            transition_ordinal,
         );
         workspace
             .trajectory
@@ -2557,8 +2559,8 @@ const fn membership_ready(
 
 /// Pushes one candidate's committed and requested transition events.
 ///
-/// Returns the candidate's first event index, its fixed-event count, and
-/// the replica count the started rebalance commits.
+/// Returns the first event, fixed-event count, committed replica count, and
+/// next hypothetical transition ordinal.
 fn push_candidate_events(
     state: &ScaleState,
     workspace: &mut ScenarioWorkspace,
@@ -2566,7 +2568,7 @@ fn push_candidate_events(
     draws: HypotheticalDraws<'_>,
     candidate: u32,
     now_micros: u64,
-) -> (usize, usize, u32) {
+) -> (usize, usize, u32, u64) {
     let first = workspace.trajectory.targets.len();
     let rebalancing = actuation_commitments.rebalancing();
     let committed_replicas = rebalancing.map_or(state.current_replicas, |commitment| {
@@ -2600,9 +2602,9 @@ fn push_candidate_events(
             workspace.commitment_ready_micros[commitment_index],
         );
     }
-    if candidate != state.current_replicas
-        && !workspace.trajectory.targets[first..].contains(&candidate)
-    {
+    let sampled_initial = candidate != state.current_replicas
+        && !workspace.trajectory.targets[first..].contains(&candidate);
+    if sampled_initial {
         let direction = if candidate > state.current_replicas {
             TransitionDirection::Up
         } else {
@@ -2613,6 +2615,7 @@ fn push_candidate_events(
             state,
             draws.random,
             now_micros,
+            0,
             draws.hypotheses,
             direction,
             replica_delta,
@@ -2625,7 +2628,13 @@ fn push_candidate_events(
             ready_micros,
         );
     }
-    (first, fixed_event_count, committed_replicas)
+    let transition_ordinal = u64::from(sampled_initial);
+    (
+        first,
+        fixed_event_count,
+        committed_replicas,
+        transition_ordinal,
+    )
 }
 
 /// Appends the reactive corrections one certainty-equivalent successor makes.
@@ -2643,6 +2652,7 @@ fn append_reactive_repairs(
     mean_trajectory: MeanRateTrajectory<'_>,
     mut transition: ReactiveTransition,
     draws: HypotheticalDraws<'_>,
+    mut transition_ordinal: u64,
 ) {
     let now_micros = state.model_time.as_micros();
     let rates = mean_trajectory.as_slice();
@@ -2695,6 +2705,7 @@ fn append_reactive_repairs(
             },
             &mut transition,
             draws,
+            &mut transition_ordinal,
         ) {
             supply_is_stale = true;
             boundary += 1;
@@ -2738,6 +2749,7 @@ fn append_reactive_repairs(
             },
             &mut transition,
             draws,
+            &mut transition_ordinal,
         );
     }
 }
@@ -2942,6 +2954,7 @@ fn append_reactive_repair(
     repair: &SelectedReactiveRepair,
     transition: &mut ReactiveTransition,
     draws: HypotheticalDraws<'_>,
+    transition_ordinal: &mut u64,
 ) -> bool {
     let target = repair.target;
     if target == transition.replicas {
@@ -2957,10 +2970,12 @@ fn append_reactive_repair(
         state,
         draws.random,
         repair.requested_micros,
+        *transition_ordinal,
         draws.hypotheses,
         direction,
         replica_delta,
     );
+    *transition_ordinal = transition_ordinal.saturating_add(1);
     let (moved, moved_share) = transition_moved_share(shared, workspace, target);
     let repair_ready_micros = if direction == TransitionDirection::Down && moved == 0 {
         pause_micros
@@ -3191,13 +3206,9 @@ fn sample_transition_times(
     )
 }
 
-/// Samples the world and physical-transition residuals for hypothetical
-/// transitions.
+/// Samples the delay hypotheses for hypothetical transitions.
 ///
-/// The Commitment stream owns this layout. Domain 0 is launch. Domain 1 is
-/// rebalance. Counter 0 in each domain selects the world hypothesis. The nested
-/// domains identify the decision-relative request boundary, direction, and
-/// replica delta.
+/// Domain 0 is launch. Domain 1 is rebalance. Counter 0 selects the hypothesis.
 fn sample_transition_hypotheses(state: &ScaleState, random: &RandomStream) -> TransitionHypotheses {
     let mut launch_random = random.clone().domain(0);
     let launch = state
@@ -3210,16 +3221,22 @@ fn sample_transition_hypotheses(state: &ScaleState, random: &RandomStream) -> Tr
     TransitionHypotheses { launch, rebalance }
 }
 
+/// Samples one hypothetical transition through its trajectory ordinal.
+///
+/// Time-shift coupling gives identical draws to candidate trajectories that
+/// request the same transition sequence at different times. Each successive
+/// ordinal selects independent draws. The key contains the stream
+/// domain, ordinal, direction, and replica delta. It contains no absolute time.
+/// Marginal delay distributions therefore do not change.
 fn sample_hypothetical_transition_times(
     state: &ScaleState,
     random: &RandomStream,
     requested_at_micros: u64,
+    transition_ordinal: u64,
     hypotheses: TransitionHypotheses,
     direction: TransitionDirection,
     replica_delta: u32,
 ) -> (u64, u64) {
-    let requested_boundary = requested_at_micros.saturating_sub(state.model_time.as_micros())
-        / state.configuration.report_interval_micros;
     let direction_domain = match direction {
         TransitionDirection::Up => 0,
         TransitionDirection::Down => 1,
@@ -3227,7 +3244,7 @@ fn sample_hypothetical_transition_times(
     let mut launch_random = random
         .clone()
         .domain(0)
-        .domain(requested_boundary)
+        .domain(transition_ordinal)
         .domain(direction_domain)
         .domain(u64::from(replica_delta));
     let launch_seconds = state.lead_time.sample_hypothesis_seconds(
@@ -3240,7 +3257,7 @@ fn sample_hypothetical_transition_times(
     let mut rebalance_random = random
         .clone()
         .domain(1)
-        .domain(requested_boundary)
+        .domain(transition_ordinal)
         .domain(direction_domain)
         .domain(u64::from(replica_delta));
     let rebalance_seconds = state

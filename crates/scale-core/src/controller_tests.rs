@@ -31,6 +31,7 @@ use crate::{RandomStream, sticky_assignment};
 
 struct I27Measurement {
     replica_seconds: [f64; 8],
+    late_area: [f64; 8],
     costs: [f64; 8],
     candidate_eight_has_target_eight_event: bool,
     candidate_transition_times: [Option<(u64, u64)>; 8],
@@ -374,11 +375,20 @@ fn committed_eight_prices_only_the_honest_replica_margin() -> Result<(), TestErr
     assert!(!measurement.candidate_eight_has_target_eight_event);
     let replica_margin =
         3.0_f64 * (measurement.replica_seconds[7] - measurement.replica_seconds[0]);
-    // The objective charges 3.0 per replica-second. The sampled difference is
-    // 6.568792 replica-seconds, so the honest margin is 3.0 * 6.568792.
+    // Candidate eight holds seven more replicas for one report interval.
+    // The interval is one second. The objective charges 3.0 per replica-second.
     assert!(
-        (replica_margin - 19.706_375_f64).abs() < 0.01_f64,
+        (replica_margin - 3.0_f64 * 7.0_f64 * 1.0_f64).abs() < 0.01_f64,
         "replica_margin={replica_margin}"
+    );
+    assert_eq!(
+        measurement.late_area[0].to_bits(),
+        measurement.late_area[7].to_bits()
+    );
+    assert!(
+        (measurement.costs[7] - measurement.costs[0] - replica_margin).abs() < 0.01_f64,
+        "costs={:?}, replica_margin={replica_margin}",
+        measurement.costs
     );
     assert!(measurement.costs[0] < measurement.costs[7]);
     Ok(())
@@ -392,17 +402,18 @@ fn inflight_descent_prices_only_the_honest_replica_margin() -> Result<(), TestEr
         &measurement.candidate_transition_times[1..7],
         &fresh.candidate_transition_times[1..7]
     );
-    // Physical-transition draws price rung one at 22,542.768. They price rung
-    // eight at 22,574.680. The cancel-plus-fresh equality keeps this order.
+    // Time-shift coupling gives both descents the same delay draw. The cost
+    // difference is therefore only the replica-second difference.
+    let expected_margin =
+        3.0_f64 * (measurement.replica_seconds[7] - measurement.replica_seconds[0]);
     assert!(
-        (measurement.costs[0] - 22_542.767_764_170_098_f64).abs() < 0.01_f64,
-        "costs={:?}",
+        (measurement.costs[7] - measurement.costs[0] - expected_margin).abs() < 0.01_f64,
+        "costs={:?}, expected_margin={expected_margin}",
         measurement.costs
     );
-    assert!(
-        (measurement.costs[7] - 22_574.679_837_654_472_f64).abs() < 0.01_f64,
-        "costs={:?}",
-        measurement.costs
+    assert_eq!(
+        measurement.late_area[0].to_bits(),
+        measurement.late_area[7].to_bits()
     );
     assert!(measurement.costs[0] < measurement.costs[7]);
     Ok(())
@@ -412,6 +423,8 @@ fn inflight_descent_prices_only_the_honest_replica_margin() -> Result<(), TestEr
 fn cancel_prices_candidate_two_from_the_current_count() -> Result<(), TestError> {
     let retained = i27_measurement(Some((8, 1)), 0.02_f64, 12)?;
     let fresh = i27_measurement(None, 0.02_f64, 12)?;
+    // Both candidate-two paths start from eight replicas. Their transition is
+    // ordinal zero, so time-shift coupling gives them the same draw.
     assert_eq!(
         retained.candidate_transition_times[1],
         fresh.candidate_transition_times[1]
@@ -497,6 +510,8 @@ fn i27_measurement(
     scratch.write_decision_expected_costs(&mut costs)?;
     let mut replica_seconds = [0.0_f64; 8];
     replica_seconds.copy_from_slice(&scratch.posterior_replica_seconds_sums[..8]);
+    let mut late_area = [0.0_f64; 8];
+    late_area.copy_from_slice(&scratch.posterior_late_area_sums[..8]);
     let workspace = &scratch.scenario_workspaces[0];
     let first = workspace.trajectory_offsets[7] as usize;
     let last = workspace.trajectory_offsets[8] as usize;
@@ -519,6 +534,7 @@ fn i27_measurement(
     });
     Ok(I27Measurement {
         replica_seconds,
+        late_area,
         costs,
         candidate_eight_has_target_eight_event,
         candidate_transition_times,
@@ -661,6 +677,7 @@ fn equal_physical_transitions_share_draws_across_rungs() -> Result<(), TestError
                     .find(|right| {
                         left.rung != right.rung
                             && left.requested == right.requested
+                            && left.ordinal == right.ordinal
                             && left.direction == right.direction
                             && left.delta == right.delta
                     })
@@ -681,6 +698,7 @@ fn equal_physical_transitions_share_draws_across_rungs() -> Result<(), TestError
             &state,
             &random,
             left.requested,
+            left.ordinal,
             hypotheses,
             left.direction,
             left.delta,
@@ -688,6 +706,39 @@ fn equal_physical_transitions_share_draws_across_rungs() -> Result<(), TestError
         sampled.0 - left.requested == left.launch_residual
             && sampled.1 - sampled.0 == left.rebalance_residual
     }));
+    Ok(())
+}
+
+#[test]
+fn time_shifted_transition_requests_share_delay_draws() -> Result<(), TestError> {
+    let (state, ..) = i27_model(0.02_f64)?;
+    let early_request = state.model_time.as_micros();
+    let late_request = early_request.saturating_add(state.configuration.report_interval_micros);
+    for scenario in 0_u32..256 {
+        let random = scenario_random(scenario, 256, ScenarioRole::Commitment);
+        let hypotheses = sample_transition_hypotheses(&state, &random);
+        let early = sample_hypothetical_transition_times(
+            &state,
+            &random,
+            early_request,
+            0,
+            hypotheses,
+            crate::TransitionDirection::Down,
+            7,
+        );
+        let late = sample_hypothetical_transition_times(
+            &state,
+            &random,
+            late_request,
+            0,
+            hypotheses,
+            crate::TransitionDirection::Down,
+            7,
+        );
+
+        assert_eq!(early.0 - early_request, late.0 - late_request);
+        assert_eq!(early.1 - early.0, late.1 - late.0);
+    }
     Ok(())
 }
 
@@ -746,6 +797,7 @@ struct ProducedRepair {
     requested: u64,
     direction: crate::TransitionDirection,
     delta: u32,
+    ordinal: u64,
     launch_residual: u64,
     rebalance_residual: u64,
 }
@@ -762,7 +814,7 @@ fn produced_repairs(workspace: &super::ScenarioWorkspace) -> Vec<ProducedRepair>
         let fresh =
             usize::from(first + 1 < last && workspace.trajectory.targets[first + 1] == candidate);
         let repair_first = first + 1 + fresh;
-        for event in repair_first..last {
+        for (ordinal, event) in (repair_first..last).enumerate() {
             let replicas = workspace.trajectory.targets[event - 1];
             let target = workspace.trajectory.targets[event];
             let direction = if target > replicas {
@@ -778,6 +830,7 @@ fn produced_repairs(workspace: &super::ScenarioWorkspace) -> Vec<ProducedRepair>
                 requested,
                 direction,
                 delta: target.abs_diff(replicas),
+                ordinal: ordinal as u64 + u64::from(fresh == 1),
                 launch_residual: pause - requested,
                 rebalance_residual: sampled_ready - pause,
             });
@@ -999,6 +1052,14 @@ fn idle_ladder_step(
     sample_count: u32,
     alternating_calendar: bool,
 ) -> Result<(ScaleState, ScaleScratch), TestError> {
+    idle_ladder_step_with_commitment(sample_count, alternating_calendar, true)
+}
+
+fn idle_ladder_step_with_commitment(
+    sample_count: u32,
+    alternating_calendar: bool,
+    include_commitment: bool,
+) -> Result<(ScaleState, ScaleScratch), TestError> {
     let mut configuration = test_configuration()?;
     configuration.partition_count = 64;
     configuration.calendar_segment_count_max = 64;
@@ -1047,7 +1108,9 @@ fn idle_ladder_step(
     } else {
         ActuationCommitment::launching(8, 1, ModelTime::from_micros(239_000_000))?
     };
-    observation.push_actuation_commitment(commitment)?;
+    if include_commitment {
+        observation.push_actuation_commitment(commitment)?;
+    }
     if !matches!(
         step(&mut state, &mut scratch, observation.observation()),
         ScaleDecision::Apply(_)
@@ -1058,20 +1121,40 @@ fn idle_ladder_step(
 }
 
 #[test]
+fn idle_hold_cost_is_the_extra_hold_billing_term() -> Result<(), TestError> {
+    let (state, scratch) = idle_ladder_step_with_commitment(4_096, false, false)?;
+    let mut costs = vec![0.0_f64; scratch.decision_candidate_count()];
+    scratch.write_decision_expected_costs(&mut costs)?;
+    let extra_replicas = f64::from(state.current_replicas - 1);
+    let hold_seconds =
+        Duration::from_micros(state.configuration.report_interval_micros).as_secs_f64();
+    let expected_extra_hold = 3.0_f64 * extra_replicas * hold_seconds;
+
+    assert!(
+        (costs[7] - costs[0] - expected_extra_hold).abs() < 0.01_f64,
+        "costs={costs:?}, expected_extra_hold={expected_extra_hold}"
+    );
+    assert!(costs[0] < costs[7], "costs={costs:?}");
+    Ok(())
+}
+
+#[test]
 fn idle_pending_descent_cost_ladder_selects_one() -> Result<(), TestError> {
     let (_, scratch) = idle_ladder_step(4_096, false)?;
     let mut costs = vec![0.0_f64; scratch.decision_candidate_count()];
     scratch.write_decision_expected_costs(&mut costs)?;
-    // Physical-transition draws give this ladder after posterior aggregation.
+    // The pending descent keeps its fixed commitment draw. Each hypothetical
+    // transition uses its trajectory ordinal. Posterior aggregation gives this
+    // deterministic ladder.
     let expected = [
         15_002.668_927_987_197_f64,
-        15_185.514_855_254_482_f64,
-        15_235.720_567_547_98_f64,
-        15_288.589_812_824_881_f64,
-        15_450.181_400_019_706_f64,
-        15_487.382_988_414_396_f64,
-        15_604.777_772_592_28_f64,
-        15_117.016_486_960_754_f64,
+        15_188.231_581_566_639_f64,
+        15_243.568_218_116_203_f64,
+        15_306.547_427_367_463_f64,
+        15_413.570_740_424_926_f64,
+        15_450.781_762_108_305_f64,
+        15_671.373_187_053_82_f64,
+        15_127.185_310_810_915_f64,
     ];
     assert!(
         costs
