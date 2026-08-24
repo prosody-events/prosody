@@ -1679,11 +1679,7 @@ fn principal_graph(
         resource_window_attempt_count_max: attempt_count_max,
         resource_window_group_count_max: resource_group_count_max(regime),
         failure_service_weight: DEFAULT_FAILURE_WEIGHT,
-        arrival_prior: prosody_scale_core::ArrivalPrior::new(
-            0.123_f64,
-            0.001_947_5_f64,
-            1.0_f64 / 3_600.0_f64,
-        )?,
+        arrival_prior: prosody_scale_core::ArrivalPrior::new(1.0_f64 / 3_600.0_f64)?,
         // A collapsing plant changes as work crosses its knee. The kernel
         // revives cells that current data cover. This rate matches the
         // workload change cadence.

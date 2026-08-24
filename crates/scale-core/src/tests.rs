@@ -1082,7 +1082,7 @@ fn partition_arrival_update_is_consumed_once() -> Result<(), TestError> {
 
 #[test]
 fn arrival_change_point_replaces_stale_rate_evidence() -> Result<(), TestError> {
-    let prior = ArrivalPrior::new(100.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
+    let prior = ArrivalPrior::test_prior(100.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
     let mut factor = ArrivalFactor::new(&prior);
     for _ in 0_u32..100 {
         factor.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
@@ -1101,7 +1101,7 @@ fn arrival_change_point_replaces_stale_rate_evidence() -> Result<(), TestError> 
 
 #[test]
 fn arrival_change_point_normalizes_after_an_extreme_rate_change() -> Result<(), TestError> {
-    let prior = ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
+    let prior = ArrivalPrior::test_prior(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
     let upper_rate = prior.coverage()[0].upper_endpoint();
     let mut factor = ArrivalFactor::new(&prior);
 
@@ -1121,7 +1121,7 @@ fn arrival_change_point_normalizes_after_an_extreme_rate_change() -> Result<(), 
 
 #[test]
 fn missing_arrival_prediction_is_cadence_invariant() -> Result<(), TestError> {
-    let prior = ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
+    let prior = ArrivalPrior::test_prior(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
     let mut coarse = ArrivalFactor::new(&prior);
     let mut fine = ArrivalFactor::new(&prior);
     coarse.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
@@ -1140,7 +1140,7 @@ fn missing_arrival_prediction_is_cadence_invariant() -> Result<(), TestError> {
 #[test]
 fn missing_interval_weakens_stale_arrival_evidence_before_the_next_update() -> Result<(), TestError>
 {
-    let prior = ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
+    let prior = ArrivalPrior::test_prior(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
     let mut contiguous = ArrivalFactor::new(&prior);
     let mut missing = ArrivalFactor::new(&prior);
     contiguous.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
@@ -1733,7 +1733,7 @@ fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
         resource_window_attempt_count_max: 100_000,
         resource_window_group_count_max: 256,
         failure_service_weight: 0.3_f64,
-        arrival_prior: ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?,
+        arrival_prior: ArrivalPrior::test_prior(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
         reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,
@@ -2256,7 +2256,7 @@ fn plateau_configuration() -> Result<Configuration, TestError> {
         resource_window_attempt_count_max: 100_000,
         resource_window_group_count_max: 256,
         failure_service_weight: 0.3_f64,
-        arrival_prior: ArrivalPrior::new(0.123_f64, 0.001_947_5_f64, 1.0_f64 / 3_600.0_f64)?,
+        arrival_prior: ArrivalPrior::new(1.0_f64 / 3_600.0_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
         reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,
@@ -2268,14 +2268,28 @@ fn plateau_configuration() -> Result<Configuration, TestError> {
 #[test]
 fn principal_configuration_freezes_the_arrival_prior() -> Result<(), TestError> {
     let configuration = plateau_configuration()?;
-    assert_eq!(
-        configuration.arrival_prior.shape().to_bits(),
-        0.123_f64.to_bits()
-    );
-    assert_eq!(
-        configuration.arrival_prior.rate_seconds().to_bits(),
-        0.001_947_5_f64.to_bits()
-    );
+    let expected = [
+        (
+            41_747.0_f64 / 60_141.0_f64,
+            0.297_940_155_825_579_76_f64,
+            18.465_576_079_550_7_f64,
+        ),
+        (
+            14_287.0_f64 / 60_141.0_f64,
+            0.153_965_056_458_288_76_f64,
+            0.004_476_205_026_778_658_f64,
+        ),
+        (
+            4_107.0_f64 / 60_141.0_f64,
+            0.243_864_972_491_019_13_f64,
+            0.003_256_466_062_584_514_f64,
+        ),
+    ];
+    for (actual, expected) in configuration.arrival_prior.reset_components().zip(expected) {
+        assert_eq!(actual.0.to_bits(), expected.0.to_bits());
+        assert_eq!(actual.1.to_bits(), expected.1.to_bits());
+        assert_eq!(actual.2.to_bits(), expected.2.to_bits());
+    }
     assert_eq!(
         configuration
             .arrival_prior
@@ -2408,9 +2422,9 @@ fn posterior_mean(state: &ScaleState, query: PosteriorQuery) -> Result<f64, Test
 
 #[test]
 fn model_priors_carry_validated_artifacts() -> Result<(), TestError> {
-    let validated = ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?;
+    let validated = ArrivalPrior::new(1.0_f64 / 86_400.0_f64)?;
     assert_eq!(ArrivalPrior::test_artifact()?, validated);
-    assert_eq!(validated.artifact().version(), 1);
+    assert_eq!(validated.artifact().version(), 2);
     assert_eq!(validated.coverage().len(), 5);
     assert!(
         validated.coverage().iter().all(
@@ -2512,7 +2526,7 @@ fn decision_with_threads(thread_count: usize) -> Result<ScaleDecision, TestError
 }
 
 fn negligible_arrival_prior() -> Result<ArrivalPrior, TestError> {
-    Ok(ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?)
+    Ok(ArrivalPrior::test_prior(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?)
 }
 
 fn grid() -> Result<CapacityGrid, TestError> {

@@ -117,7 +117,7 @@ pub fn run_batch_slo_with_inputs(
         // prior expects about one spurious arrival per day. A one-per-second
         // mean forecasts a phantom stream across the whole budget window and
         // erases the budget response the batch regime exists to measure.
-        arrival_prior: ArrivalPrior::new(1.0_f64, 86_400.0_f64, 1.0_f64 / 86_400.0_f64)?,
+        arrival_prior: ArrivalPrior::new(1.0_f64 / 86_400.0_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
         reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,

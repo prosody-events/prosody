@@ -1,7 +1,6 @@
 use allocation_counter::measure;
 use quickcheck_macros::quickcheck;
 use statrs::distribution::{ContinuousCDF, Gamma};
-use statrs::function::gamma::{gamma_lr, gamma_ur};
 use std::f64::consts::E;
 use thiserror::Error;
 
@@ -14,26 +13,42 @@ use crate::types::{CalendarColumns, CalendarForecast};
 use crate::{CalendarArtifactId, CalendarRateSegment, RandomStream};
 
 #[test]
-fn diffuse_prior_respects_the_storage_budget_edge() {
-    let selected = ArrivalPrior::new(0.123_f64, 0.001_947_5_f64, 1.0_f64 / 3_600.0_f64);
+fn authored_prior_respects_the_storage_budget() {
+    let selected = ArrivalPrior::new(1.0_f64 / 3_600.0_f64);
     assert!(selected.is_ok(), "{selected:?}");
     assert!(matches!(
-        ArrivalPrior::new(
-            0.122_f64,
-            0.122_f64 * 0.0019_f64 / 0.12_f64,
-            1.0_f64 / 3_600.0_f64,
-        ),
-        Err(ArrivalPriorError::StorageBudget { .. })
-    ));
-    assert!(matches!(
-        ArrivalPrior::new(0.12_f64, 0.0019_f64, 1.0_f64 / 3_600.0_f64),
+        ArrivalPrior::test_prior(0.05_f64, 0.05_f64, 1.0_f64 / 3_600.0_f64),
         Err(ArrivalPriorError::StorageBudget { .. })
     ));
 }
 
 #[test]
+fn authored_grid_fits_the_storage_budget() -> Result<(), TestError> {
+    let model = ArrivalPrior::new(1.0_f64 / 3_600.0_f64)?;
+    let cell_count = model.hazard_count * RESET_COUNT * model.rate_count;
+    let storage = ArrivalPrior::storage_bytes(model.hazard_count, model.rate_count)?;
+    assert_eq!(
+        (
+            model.rate_low.to_bits(),
+            model.coverage()[0].upper_endpoint().to_bits(),
+            model.rate_count,
+            cell_count,
+            storage,
+        ),
+        (
+            0x3770_0000_0000_0000,
+            0x40bc_addc_7e9f_24d9,
+            2_606,
+            422_172,
+            6_838_576,
+        )
+    );
+    Ok(())
+}
+
+#[test]
 fn concentrated_posterior_has_a_finite_exact_predictive_rank() -> Result<(), TestError> {
-    let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
+    let model = ArrivalPrior::test_prior(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
     let mut factor = ArrivalFactor::new(&model);
     let rate_count = factor.rates.len();
     factor.probability.fill(0.0_f64);
@@ -50,7 +65,7 @@ fn concentrated_posterior_has_a_finite_exact_predictive_rank() -> Result<(), Tes
 
 #[quickcheck]
 fn boundary_filter_matches_exhaustive_one_step(count_code: u8, duration_code: u16) -> bool {
-    let Ok(model) = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64) else {
+    let Ok(model) = ArrivalPrior::test_prior(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64) else {
         return false;
     };
     let duration = 0.1_f64 + 30.0_f64 * f64::from(duration_code) / f64::from(u16::MAX);
@@ -85,7 +100,7 @@ fn boundary_filter_matches_exhaustive_one_step(count_code: u8, duration_code: u1
 
 #[test]
 fn update_path_does_not_allocate() -> Result<(), ArrivalPriorError> {
-    let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
+    let model = ArrivalPrior::test_prior(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
     let factor = ArrivalFactor::new(&model);
     let rate_count = factor.rates.len();
     let hazard_count = factor.hazards.len();
@@ -101,62 +116,42 @@ fn update_path_does_not_allocate() -> Result<(), ArrivalPriorError> {
 }
 
 #[test]
-fn reset_cell_masses_are_exact_and_exhaustive() -> Result<(), TestError> {
-    let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
+fn authored_component_targets_and_cell_masses_are_exact() -> Result<(), TestError> {
+    let model = ArrivalPrior::new(1.0_f64 / 3_600.0_f64)?;
     let factor = ArrivalFactor::new(&model);
     let rate_count = factor.rates.len();
-    let mean = model.shape() / model.rate_seconds();
+    let targets = [
+        (0.6942_f64, 0.003_889_f64, 0.1425_f64),
+        (0.2376_f64, 1.574_444_f64, 436.5617_f64),
+        (0.0683_f64, 12.4275_f64, 739.1681_f64),
+    ];
 
-    for (shape, masses) in [1.0_f64, 2.0_f64, 4.0_f64]
-        .into_iter()
+    for ((((weight, shape, rate), masses), record), (target_weight, median, p99)) in model
+        .reset_components()
         .zip(factor.reset_probability)
+        .zip(&model.coverage()[..RESET_COUNT])
+        .zip(targets)
     {
-        let distribution = Gamma::new(shape, shape).map_err(|_| TestError::Distribution)?;
-        let lower_boundary = (factor.rates[0] * factor.rates[1]).sqrt() / mean;
-        let upper_boundary =
-            (factor.rates[rate_count - 2] * factor.rates[rate_count - 1]).sqrt() / mean;
+        let distribution = Gamma::new(shape, rate).map_err(|_| TestError::Distribution)?;
+        let lower_boundary = (factor.rates[0] * factor.rates[1]).sqrt();
+        let upper_boundary = (factor.rates[rate_count - 2] * factor.rates[rate_count - 1]).sqrt();
 
+        assert!((weight - target_weight).abs() <= 5.0e-5_f64);
+        assert!((distribution.inverse_cdf(0.5_f64) - median).abs() <= 2.0e-12_f64 * median);
+        assert!((distribution.inverse_cdf(0.99_f64) - p99).abs() <= 2.0e-12_f64 * p99);
         assert!((masses.iter().sum::<f64>() - 1.0_f64).abs() <= 2.0e-15_f64);
         assert!((masses[0] - distribution.cdf(lower_boundary)).abs() <= f64::EPSILON);
         assert!(
             (masses[rate_count - 1] - (1.0_f64 - distribution.cdf(upper_boundary))).abs()
                 <= f64::EPSILON
         );
-        let below_index = rate_count * 3 / 4;
-        let below_lower = (factor.rates[below_index - 1] * factor.rates[below_index]).sqrt() / mean;
-        let below_upper = (factor.rates[below_index] * factor.rates[below_index + 1]).sqrt() / mean;
-        let below_mass =
-            gamma_lr(shape, shape * below_upper) - gamma_lr(shape, shape * below_lower);
-        assert!(factor.rates[below_index] < mean && masses[below_index] > 0.0_f64);
-        assert!((masses[below_index] - below_mass).abs() <= 32.0_f64 * f64::EPSILON * below_mass);
-
-        let first_above = factor
-            .rates
-            .iter()
-            .position(|rate| *rate > mean)
-            .ok_or(TestError::Distribution)?;
-        let above_index = first_above + 2;
-        assert!(above_index + 1 < rate_count);
-        let above_lower = (factor.rates[above_index - 1] * factor.rates[above_index]).sqrt() / mean;
-        let above_upper = (factor.rates[above_index] * factor.rates[above_index + 1]).sqrt() / mean;
-        let above_mass =
-            gamma_ur(shape, shape * above_lower) - gamma_ur(shape, shape * above_upper);
-        assert!(factor.rates[above_index] > mean && masses[above_index] > 0.0_f64);
-        assert!((masses[above_index] - above_mass).abs() <= 32.0_f64 * f64::EPSILON * above_mass);
-    }
-    for (record, shape) in model.coverage()[..RESET_COUNT]
-        .iter()
-        .zip([1.0_f64, 2.0_f64, 4.0_f64])
-    {
-        let distribution = Gamma::new(shape, shape).map_err(|_| TestError::Distribution)?;
         assert!(
-            (record.lower_tail_probability() - distribution.cdf(record.lower_endpoint() / mean))
-                .abs()
+            (record.lower_tail_probability() - distribution.cdf(record.lower_endpoint())).abs()
                 <= f64::EPSILON
         );
         assert!(
             (record.upper_tail_probability()
-                - (1.0_f64 - distribution.cdf(record.upper_endpoint() / mean)))
+                - (1.0_f64 - distribution.cdf(record.upper_endpoint())))
             .abs()
                 <= f64::EPSILON
         );
@@ -165,8 +160,77 @@ fn reset_cell_masses_are_exact_and_exhaustive() -> Result<(), TestError> {
 }
 
 #[test]
+fn authored_mixture_zero_evidence_tail_is_bounded() -> Result<(), TestError> {
+    let model = ArrivalPrior::new(1.0_f64 / 3_600.0_f64)?;
+    let mut tail = 0.0_f64;
+    for (weight, shape, rate) in model.reset_components() {
+        let distribution = Gamma::new(shape, rate).map_err(|_| TestError::Distribution)?;
+        tail += weight * (1.0_f64 - distribution.cdf(100.0_f64));
+    }
+    assert!(tail <= 0.05_f64, "zero-evidence tail was {tail}");
+    Ok(())
+}
+
+#[test]
+fn silence_moves_reset_odds_toward_the_quiet_component() -> Result<(), TestError> {
+    let model = ArrivalPrior::new(1.0_f64 / 3_600.0_f64)?;
+    let mut factor = ArrivalFactor::new(&model);
+    let initial = reset_masses(&factor);
+    for report in 1_u64..=8 {
+        factor.update(
+            ArrivalEvidence::new(0, 60_000_000),
+            None,
+            report * 60_000_000,
+        );
+    }
+    let silent = reset_masses(&factor);
+    assert!(silent[0] / silent[2] > initial[0] / initial[2]);
+    Ok(())
+}
+
+#[quickcheck]
+fn transition_reinjection_preserves_each_reset_mass(duration_code: u16) -> bool {
+    let Ok(model) = ArrivalPrior::new(1.0_f64 / 3_600.0_f64) else {
+        return false;
+    };
+    let mut factor = ArrivalFactor::new(&model);
+    let before = reset_masses_by_hazard(&factor);
+    let duration = 0.1_f64 + 300.0_f64 * f64::from(duration_code) / f64::from(u16::MAX);
+    factor.transition(duration, None);
+    let after = reset_masses_by_hazard(&factor);
+    before
+        .iter()
+        .zip(after)
+        .all(|(before, after)| (before - after).abs() <= 2.0e-15_f64)
+}
+
+fn reset_masses(factor: &ArrivalFactor) -> [f64; RESET_COUNT] {
+    let mut masses = [0.0_f64; RESET_COUNT];
+    for hazard in 0..factor.hazards.len() {
+        for (reset, mass) in masses.iter_mut().enumerate() {
+            *mass += (0..factor.rates.len())
+                .map(|rate| factor.probability[cell(hazard, reset, rate, factor.rates.len())])
+                .sum::<f64>();
+        }
+    }
+    masses
+}
+
+fn reset_masses_by_hazard(factor: &ArrivalFactor) -> Box<[f64]> {
+    (0..factor.hazards.len())
+        .flat_map(|hazard| {
+            (0..RESET_COUNT).map(move |reset| {
+                (0..factor.rates.len())
+                    .map(|rate| factor.probability[cell(hazard, reset, rate, factor.rates.len())])
+                    .sum::<f64>()
+            })
+        })
+        .collect()
+}
+
+#[test]
 fn path_initial_draw_applies_the_elapsed_transition() -> Result<(), TestError> {
-    let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 90.0_f64)?;
+    let model = ArrivalPrior::test_prior(2.0_f64, 0.2_f64, 1.0_f64 / 90.0_f64)?;
     let mut factor = ArrivalFactor::new(&model);
     let rate_count = factor.rates.len();
     let maximum_rate = factor.rates[rate_count - 1];
@@ -195,7 +259,7 @@ fn path_initial_draw_applies_the_elapsed_transition() -> Result<(), TestError> {
 
 #[test]
 fn sampled_path_average_converges_to_mean_trajectory() -> Result<(), TestError> {
-    let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 90.0_f64)?;
+    let model = ArrivalPrior::test_prior(2.0_f64, 0.2_f64, 1.0_f64 / 90.0_f64)?;
     let mut factor = ArrivalFactor::new(&model);
     let mut mean_rates = [0.0_f64; 3];
     let mean = factor.write_mean_rate_trajectory(90_000_000, 30_000_000, None, 0, &mut mean_rates);
@@ -234,7 +298,7 @@ fn sampled_path_average_converges_to_mean_trajectory() -> Result<(), TestError> 
 
 #[test]
 fn calendar_mean_trajectory_follows_segment_boundaries() -> Result<(), TestError> {
-    let model = ArrivalPrior::new(2.0_f64, 20.0_f64, 1.0_f64 / 3_600.0_f64)?;
+    let model = ArrivalPrior::test_prior(2.0_f64, 20.0_f64, 1.0_f64 / 3_600.0_f64)?;
     let mut factor = ArrivalFactor::new(&model);
     let mut segments = CalendarColumns::new(2);
     segments.extend(&[
@@ -272,7 +336,7 @@ fn calendar_mean_trajectory_follows_segment_boundaries() -> Result<(), TestError
 
 #[test]
 fn calendar_mean_trajectory_uses_the_authored_prior_before_evidence() -> Result<(), TestError> {
-    let model = ArrivalPrior::new(2.0_f64, 20.0_f64, 1.0_f64 / 3_600.0_f64)?;
+    let model = ArrivalPrior::test_prior(2.0_f64, 20.0_f64, 1.0_f64 / 3_600.0_f64)?;
     let mut local_factor = ArrivalFactor::new(&model);
     let mut factor = ArrivalFactor::new(&model);
     let mut segments = CalendarColumns::new(1);
@@ -309,7 +373,7 @@ fn calendar_mean_trajectory_uses_the_authored_prior_before_evidence() -> Result<
 
 #[test]
 fn decision_read_does_not_reset_calendar_evidence() -> Result<(), TestError> {
-    let model = ArrivalPrior::new(2.0_f64, 20.0_f64, 1.0_f64 / 3_600.0_f64)?;
+    let model = ArrivalPrior::test_prior(2.0_f64, 20.0_f64, 1.0_f64 / 3_600.0_f64)?;
     let mut factor = ArrivalFactor::new(&model);
     let mut segments = CalendarColumns::new(1);
     segments.extend(&[CalendarRateSegment {
@@ -347,7 +411,7 @@ fn decision_read_does_not_reset_calendar_evidence() -> Result<(), TestError> {
 
 #[test]
 fn derived_grids_meet_their_accuracy_and_coverage_budgets() -> Result<(), TestError> {
-    let model = ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?;
+    let model = ArrivalPrior::test_prior(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?;
     let factor = ArrivalFactor::new(&model);
     let rate_error = (model.rate_log_step * 0.5_f64).exp() - 1.0_f64;
     let hazard_error = model.hazard_log_step / E;
@@ -368,7 +432,7 @@ fn derived_grids_meet_their_accuracy_and_coverage_budgets() -> Result<(), TestEr
 
 #[test]
 fn expired_calendar_returns_the_local_marginal() -> Result<(), TestError> {
-    let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
+    let model = ArrivalPrior::test_prior(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
     let mut factor = ArrivalFactor::new(&model);
     let mut segments = CalendarColumns::new(1);
     segments.extend(&[CalendarRateSegment {
@@ -409,7 +473,7 @@ fn zero_length_path_segment_is_rejected() {
 
 #[test]
 fn crossing_interval_updates_its_start_calendar_segment() -> Result<(), ArrivalPriorError> {
-    let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
+    let model = ArrivalPrior::test_prior(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
     let mut segments = CalendarColumns::new(2);
     segments.extend(&[
         CalendarRateSegment {
@@ -481,7 +545,7 @@ fn crossing_interval_updates_its_start_calendar_segment() -> Result<(), ArrivalP
 
 #[quickcheck]
 fn accepted_paths_end_at_the_requested_horizon(seed: u64, duration_code: u16) -> bool {
-    let Ok(model) = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 86_400.0_f64) else {
+    let Ok(model) = ArrivalPrior::test_prior(2.0_f64, 0.2_f64, 1.0_f64 / 86_400.0_f64) else {
         return false;
     };
     let duration =

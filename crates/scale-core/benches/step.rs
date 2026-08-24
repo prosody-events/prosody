@@ -297,7 +297,7 @@ fn configuration(case: BenchmarkCase) -> Result<Configuration, BenchmarkError> {
         resource_window_attempt_count_max: 100_000,
         resource_window_group_count_max: 256,
         failure_service_weight: 0.3_f64,
-        arrival_prior: ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?,
+        arrival_prior: ArrivalPrior::new(1.0_f64 / 90.0_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 300.0_f64,
         reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,

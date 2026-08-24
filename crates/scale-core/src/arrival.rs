@@ -14,7 +14,7 @@ use crate::{
 };
 
 const RESET_COUNT: usize = 3;
-const MODEL_VERSION: u32 = 1;
+const MODEL_VERSION: u32 = 2;
 const ARRIVAL_ARTIFACT_SOURCE: u64 = 0x0041_5252_4956_414c;
 const T_MAX_SECONDS_U32: u32 = 7 * 24 * 60 * 60;
 const T_MAX_SECONDS: f64 = T_MAX_SECONDS_U32 as f64;
@@ -43,6 +43,47 @@ const CALENDAR_SEGMENT_LIMIT: usize =
 // Poisson tail contract larger than useful controller scratch.
 const PATH_SEGMENT_LIMIT: usize = 262_144;
 const ARRIVAL_COUNT_DOMAIN: u64 = 0x6172_7269_7661_6c73;
+
+// The source-hour weights use the exact class counts from the telemetry
+// artifact.
+const RESET_COMPONENTS: [ResetComponent; RESET_COUNT] = [
+    ResetComponent::new(
+        41_747.0_f64 / 60_141.0_f64,
+        0.297_940_155_825_579_76_f64,
+        18.465_576_079_550_7_f64,
+    ),
+    ResetComponent::new(
+        14_287.0_f64 / 60_141.0_f64,
+        0.153_965_056_458_288_76_f64,
+        0.004_476_205_026_778_658_f64,
+    ),
+    ResetComponent::new(
+        4_107.0_f64 / 60_141.0_f64,
+        0.243_864_972_491_019_13_f64,
+        0.003_256_466_062_584_514_f64,
+    ),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ResetComponent {
+    weight: f64,
+    shape: f64,
+    rate_seconds: f64,
+}
+
+impl ResetComponent {
+    const fn new(weight: f64, shape: f64, rate_seconds: f64) -> Self {
+        Self {
+            weight,
+            shape,
+            rate_seconds,
+        }
+    }
+
+    const fn mean(self) -> f64 {
+        self.shape / self.rate_seconds
+    }
+}
 
 /// Exact count prediction from the finite arrival model.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -92,15 +133,14 @@ struct ArrivalGrids {
 /// The declared model is discrete at evidence boundaries. A rate stays fixed
 /// during an interval. It changes at the next boundary with probability
 /// `1 - exp(-hazard * duration)`. The filter is exact for this finite model.
-/// The caller authors the reset-shape center. The prior gives equal mass to
-/// that shape and shapes one octave below and above it for scale robustness.
+/// Three telemetry classes define the reset-rate mixture. The filter learns
+/// each group's class without moving mass between classes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArrivalPrior {
     artifact: PriorArtifactIdentity,
     budget: PriorArtifactBudget,
     coverage: Box<[PriorCoverageRecord]>,
-    authored_shape: f64,
-    rate_seconds: f64,
+    reset_components: [ResetComponent; RESET_COUNT],
     hazard_center: f64,
     hazard_low: f64,
     hazard_log_step: f64,
@@ -119,35 +159,44 @@ impl ArrivalPrior {
 
     /// Constructs a validated finite arrival model.
     ///
-    /// `shape` and `rate_seconds` define the reset-rate prior. The change rate
-    /// locates the hazard prior. Exact parameter bits identify this authored
-    /// artifact. Its coverage records certify every reset-rate tail and the
-    /// rejected change-path tail.
+    /// The telemetry artifact defines the reset-rate components. The change
+    /// rate locates the hazard prior. Exact parameter bits identify the model.
     ///
     /// # Errors
     ///
     /// Returns an error when the prior or its resource contract is invalid.
-    pub fn new(
-        shape: f64,
-        rate_seconds: f64,
+    pub fn new(change_rate_per_second: f64) -> Result<Self, ArrivalPriorError> {
+        Self::from_components(RESET_COMPONENTS, change_rate_per_second)
+    }
+
+    fn from_components(
+        reset_components: [ResetComponent; RESET_COUNT],
         change_rate_per_second: f64,
     ) -> Result<Self, ArrivalPriorError> {
-        if !shape.is_finite() || shape <= 0.0_f64 {
-            return Err(ArrivalPriorError::InvalidShape);
-        }
-        if !rate_seconds.is_finite() || rate_seconds <= 0.0_f64 {
+        if reset_components.iter().any(|component| {
+            !component.weight.is_finite()
+                || component.weight <= 0.0_f64
+                || !component.shape.is_finite()
+                || component.shape <= 0.0_f64
+                || !component.rate_seconds.is_finite()
+                || component.rate_seconds <= 0.0_f64
+                || !component.mean().is_finite()
+        }) || (reset_components
+            .iter()
+            .map(|component| component.weight)
+            .sum::<f64>()
+            - 1.0_f64)
+            .abs()
+            > f64::EPSILON
+        {
             return Err(ArrivalPriorError::InvalidRate);
         }
         if !change_rate_per_second.is_finite() || change_rate_per_second <= 0.0_f64 {
             return Err(ArrivalPriorError::InvalidChangeRate);
         }
         let tail_limit = EPSILON_BOUNDARY * 0.25_f64;
-        let mean = shape / rate_seconds;
-        if !mean.is_finite() || mean <= 0.0_f64 {
-            return Err(ArrivalPriorError::InvalidRate);
-        }
         let hazard = derive_hazard_grid(change_rate_per_second, tail_limit)?;
-        let rate = derive_rate_grid(shape, mean, tail_limit)?;
+        let rate = derive_rate_grid(&reset_components, tail_limit)?;
         let cell_count = cell_count(hazard.count, rate.count)?;
         let storage_bytes = Self::storage_bytes(hazard.count, rate.count)?;
         if storage_bytes > STORAGE_BUDGET_BYTES {
@@ -172,8 +221,7 @@ impl ArrivalPrior {
         }
         let achieved_rate_error = rate.log_step.mul_add(0.5_f64, 0.0_f64).exp() - 1.0_f64;
         let (coverage, path_change_bound) = arrival_coverage(
-            shape,
-            mean,
+            &reset_components,
             rates,
             hazards,
             change_rate_per_second,
@@ -183,10 +231,15 @@ impl ArrivalPrior {
         if PoissonMean::new(maximum_poisson_mean).is_none() {
             return Err(ArrivalPriorError::InvalidPoissonMean);
         }
-        let random_stream = shape.to_bits()
-            ^ rate_seconds.to_bits().rotate_left(21)
-            ^ change_rate_per_second.to_bits().rotate_left(42)
-            | 1;
+        let random_stream = reset_components.iter().zip([0_u32, 17, 34]).fold(
+            change_rate_per_second.to_bits().rotate_left(42),
+            |identity, (component, rotation)| {
+                identity
+                    ^ component.weight.to_bits().rotate_left(rotation)
+                    ^ component.shape.to_bits().rotate_left(rotation + 7)
+                    ^ component.rate_seconds.to_bits().rotate_left(rotation + 13)
+            },
+        ) | 1;
         let artifact =
             PriorArtifactIdentity::new(ARRIVAL_ARTIFACT_SOURCE, MODEL_VERSION, random_stream);
         let budget = arrival_artifact_budget(cell_count)?;
@@ -204,8 +257,7 @@ impl ArrivalPrior {
             artifact,
             budget,
             coverage: coverage.into(),
-            authored_shape: shape,
-            rate_seconds,
+            reset_components,
             hazard_center,
             hazard_low: hazard.low,
             hazard_log_step: hazard.log_step,
@@ -222,7 +274,17 @@ impl ArrivalPrior {
     /// the subject. A test pins it equal to validated construction.
     #[cfg(test)]
     pub(crate) fn test_artifact() -> Result<Self, ArrivalPriorError> {
-        Self::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)
+        Self::new(1.0_f64 / 86_400.0_f64)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_prior(
+        shape: f64,
+        rate_seconds: f64,
+        change_rate_per_second: f64,
+    ) -> Result<Self, ArrivalPriorError> {
+        let component = ResetComponent::new(1.0_f64 / 3.0_f64, shape, rate_seconds);
+        Self::from_components([component; RESET_COUNT], change_rate_per_second)
     }
 
     /// Returns this prior's artifact identity.
@@ -254,18 +316,15 @@ impl ArrivalPrior {
     }
 
     #[cfg(test)]
-    pub(crate) const fn shape(&self) -> f64 {
-        self.authored_shape
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn rate_seconds(&self) -> f64 {
-        self.rate_seconds
-    }
-
-    #[cfg(test)]
     pub(crate) const fn change_rate_per_second(&self) -> f64 {
         self.hazard_center
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_components(&self) -> impl Iterator<Item = (f64, f64, f64)> + '_ {
+        self.reset_components
+            .iter()
+            .map(|component| (component.weight, component.shape, component.rate_seconds))
     }
 
     pub(crate) fn posterior_value_count(&self) -> u32 {
@@ -366,17 +425,10 @@ impl ArrivalFactor {
         );
         let hazards = grids.hazards;
         let hazard_prior = exact_gamma_masses(&hazards, HAZARD_SHAPE, model.hazard_center);
-        let mean = model.authored_shape / model.rate_seconds;
         let rates = grids.rates;
-        // The declared reset-shape prior is uniform on one octave below the
-        // authored center, the center, and one octave above the center. Each
-        // shape keeps the authored mean and changes only concentration.
-        let reset_shapes = [
-            model.authored_shape * 0.5_f64,
-            model.authored_shape,
-            model.authored_shape * 2.0_f64,
-        ];
-        let reset_probability = reset_shapes.map(|shape| {
+        let reset_probability = model.reset_components.map(|component| {
+            let mean = component.mean();
+            let shape = component.shape;
             (0..model.rate_count)
                 .map(|index| {
                     if index == 0 {
@@ -408,8 +460,9 @@ impl ArrivalFactor {
         for hazard in 0..model.hazard_count {
             for reset in 0..RESET_COUNT {
                 for rate in 0..model.rate_count {
-                    probability[cell(hazard, reset, rate, model.rate_count)] =
-                        hazard_prior[hazard] / 3.0_f64 * reset_probability[reset][rate];
+                    probability[cell(hazard, reset, rate, model.rate_count)] = hazard_prior[hazard]
+                        * model.reset_components[reset].weight
+                        * reset_probability[reset][rate];
                 }
             }
         }
@@ -997,8 +1050,11 @@ fn derive_hazard_grid(mean: f64, tail_limit: f64) -> Result<GridSpec, ArrivalPri
     })
 }
 
-fn derive_rate_grid(shape: f64, mean: f64, tail_limit: f64) -> Result<GridSpec, ArrivalPriorError> {
-    let (low, high) = rate_window(shape, mean, tail_limit)?;
+fn derive_rate_grid(
+    components: &[ResetComponent; RESET_COUNT],
+    tail_limit: f64,
+) -> Result<GridSpec, ArrivalPriorError> {
+    let (low, high) = rate_window(components, tail_limit)?;
     let intervals = ((high / low).ln() / (2.0_f64 * EPSILON_GRID.ln_1p())).ceil() as usize;
     Ok(GridSpec {
         low,
@@ -1061,24 +1117,27 @@ fn geometric_upper(values: &[f64], index: usize) -> f64 {
     (values[index] * values[index + 1]).sqrt()
 }
 
-fn rate_window(shape: f64, mean: f64, tail_limit: f64) -> Result<(f64, f64), ArrivalPriorError> {
+fn rate_window(
+    components: &[ResetComponent; RESET_COUNT],
+    tail_limit: f64,
+) -> Result<(f64, f64), ArrivalPriorError> {
     let mut low = f64::INFINITY;
     let mut high = 0.0_f64;
-    for density_shape in [shape, shape * 0.5_f64, shape, shape * 2.0_f64] {
-        let distribution =
-            Gamma::new(density_shape, density_shape).map_err(|_| ArrivalPriorError::InvalidRate)?;
-        low = low.min(mean * distribution.inverse_cdf(tail_limit));
-        high = high.max(mean * distribution.inverse_cdf(1.0_f64 - tail_limit));
+    for component in components {
+        let distribution = Gamma::new(component.shape, component.rate_seconds)
+            .map_err(|_| ArrivalPriorError::InvalidRate)?;
+        low = low.min(distribution.inverse_cdf(tail_limit));
+        high = high.max(distribution.inverse_cdf(1.0_f64 - tail_limit));
     }
-    while [shape, shape * 0.5_f64, shape, shape * 2.0_f64]
-        .into_iter()
-        .any(|density_shape| gamma_lr(density_shape, density_shape * low / mean) > tail_limit)
+    while components
+        .iter()
+        .any(|component| gamma_lr(component.shape, component.rate_seconds * low) > tail_limit)
     {
         low *= 0.5_f64;
     }
-    while [shape, shape * 0.5_f64, shape, shape * 2.0_f64]
-        .into_iter()
-        .any(|density_shape| gamma_ur(density_shape, density_shape * high / mean) > tail_limit)
+    while components
+        .iter()
+        .any(|component| gamma_ur(component.shape, component.rate_seconds * high) > tail_limit)
     {
         high *= 2.0_f64;
     }
@@ -1139,8 +1198,7 @@ fn poisson_mass(count: u32, mean: f64) -> f64 {
 }
 
 fn arrival_coverage(
-    shape: f64,
-    mean: f64,
+    components: &[ResetComponent; RESET_COUNT],
     rates: &[f64],
     hazards: &[f64],
     hazard_mean: f64,
@@ -1148,16 +1206,13 @@ fn arrival_coverage(
 ) -> Result<([PriorCoverageRecord; RESET_COUNT + 2], usize), ArrivalPriorError> {
     let mut coverage =
         [PriorCoverageRecord::new(0.0_f64, 1.0_f64, 0.0_f64, 0.0_f64, 0.0_f64); RESET_COUNT + 2];
-    for (record, reset_shape) in coverage
-        .iter_mut()
-        .zip([shape * 0.5_f64, shape, shape * 2.0_f64])
-    {
-        let distribution =
-            Gamma::new(reset_shape, reset_shape).map_err(|_| ArrivalPriorError::InvalidRate)?;
+    for (record, component) in coverage.iter_mut().zip(components) {
+        let distribution = Gamma::new(component.shape, component.rate_seconds)
+            .map_err(|_| ArrivalPriorError::InvalidRate)?;
         let lower_endpoint = rates[0];
         let upper_endpoint = rates[rates.len() - 1];
-        let lower_tail = distribution.cdf(lower_endpoint / mean);
-        let upper_tail = gamma_ur(reset_shape, reset_shape * upper_endpoint / mean);
+        let lower_tail = distribution.cdf(lower_endpoint);
+        let upper_tail = gamma_ur(component.shape, component.rate_seconds * upper_endpoint);
         if !lower_tail.is_finite() || !upper_tail.is_finite() {
             return Err(ArrivalPriorError::InvalidRate);
         }
@@ -1312,9 +1367,6 @@ fn log_predictive_mass(shape: f64, rate: f64, count: u32, exposure: f64) -> f64 
 /// Failure while constructing an arrival model.
 #[derive(Debug, Eq, Error, PartialEq)]
 pub enum ArrivalPriorError {
-    /// The Gamma shape is not finite and positive.
-    #[error("arrival prior shape must be finite and positive")]
-    InvalidShape,
     /// The Gamma rate is not finite and positive.
     #[error("arrival prior rate must be finite and positive")]
     InvalidRate,

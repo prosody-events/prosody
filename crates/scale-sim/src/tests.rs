@@ -34,7 +34,7 @@ use crate::{CapacityEvidenceKind, CapacityEvidenceSample};
 /// Returns the authored test prior: one arrival per second and one expected
 /// change per day. These tests exercise the controller, not this prior.
 fn test_arrival_prior() -> Result<ArrivalPrior, ArrivalPriorError> {
-    ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)
+    ArrivalPrior::new(1.0_f64 / 86_400.0_f64)
 }
 
 #[test]

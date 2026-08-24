@@ -23,7 +23,7 @@ pub fn fixture_decision(offered_events: u32) -> u64 {
     };
     // Use one arrival each second and one expected change each day because this
     // fixture measures step cost, not the prior.
-    let Ok(arrival_prior) = ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64) else {
+    let Ok(arrival_prior) = ArrivalPrior::new(1.0_f64 / 86_400.0_f64) else {
         return ERROR_CODE;
     };
     let Ok(launch_time_prior) = LaunchPrior::kubernetes() else {

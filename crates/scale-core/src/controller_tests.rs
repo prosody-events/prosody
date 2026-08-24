@@ -252,15 +252,15 @@ fn inflight_descent_prices_only_the_honest_replica_margin() -> Result<(), TestEr
         &measurement.candidate_transition_times[1..7],
         &fresh.candidate_transition_times[1..7]
     );
-    // The world-slot sampler prices rung one at 1,004,478.968. It prices rung
-    // eight at 1,004,520.826. The cancel-plus-fresh equality keeps this order.
+    // The world-slot sampler prices rung one at 22,226.746. It prices rung
+    // eight at 22,268.604. The cancel-plus-fresh equality keeps this order.
     assert!(
-        (measurement.costs[0] - 1_004_478.967_953_551_2_f64).abs() < 0.01_f64,
+        (measurement.costs[0] - 22_226.746_262_107_597_f64).abs() < 0.01_f64,
         "costs={:?}",
         measurement.costs
     );
     assert!(
-        (measurement.costs[7] - 1_004_520.826_044_493_5_f64).abs() < 0.01_f64,
+        (measurement.costs[7] - 22_268.604_353_049_002_f64).abs() < 0.01_f64,
         "costs={:?}",
         measurement.costs
     );
@@ -465,7 +465,7 @@ fn i27_model(
         resource_window_attempt_count_max: 100_000,
         resource_window_group_count_max: 64,
         failure_service_weight: 0.3_f64,
-        arrival_prior: ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?,
+        arrival_prior: ArrivalPrior::test_prior(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 300.0_f64,
         reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,
@@ -806,7 +806,7 @@ fn commitment_domains_form_distinct_midpoint_permutations() {
 fn identical_posterior_decisions_have_identical_cost_ladders() -> Result<(), TestError> {
     let mut configuration = test_configuration()?;
     configuration.posterior_sample_count = 256;
-    configuration.arrival_prior = ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?;
+    configuration.arrival_prior = ArrivalPrior::new(1.0_f64 / 3_600.0_f64)?;
     let grid = CapacityGrid::new(&[0.1_f64], &[1_000.0_f64], &[0.0_f64])?;
     let mut state = ScaleState::new(configuration.clone(), grid)?;
     let mut scratch = state.new_scratch()?;
@@ -847,7 +847,7 @@ fn idle_ladder_step(
     configuration.replica_count_max = 8;
     configuration.posterior_sample_count = sample_count;
     configuration.report_interval_micros = 100_000;
-    configuration.arrival_prior = ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?;
+    configuration.arrival_prior = ArrivalPrior::new(1.0_f64 / 3_600.0_f64)?;
     configuration.capacity_change_rate_per_second = 1.0_f64 / 300.0_f64;
     let grid = CapacityGrid::new_with_prior(
         &[0.000_5_f64, 0.001_f64, 0.002_f64, 0.004_f64, 0.008_f64],
@@ -911,9 +911,9 @@ fn idle_pending_descent_cost_ladder_selects_one() -> Result<(), TestError> {
         14_954.248_534_462_233_f64,
         15_049.703_297_341_583_f64,
         15_145.158_060_220_932_f64,
-        15_269.143_638_178_215_f64,
-        15_357.081_410_520_615_f64,
-        14_791.723_114_078_739_f64,
+        15_240.612_823_100_284_f64,
+        15_336.067_585_979_63_f64,
+        14_734.828_438_602_572_f64,
     ];
     assert!(
         costs
@@ -1352,7 +1352,7 @@ fn test_configuration() -> Result<Configuration, TestError> {
         resource_window_attempt_count_max: 100_000,
         resource_window_group_count_max: 256,
         failure_service_weight: 0.3_f64,
-        arrival_prior: ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?,
+        arrival_prior: ArrivalPrior::test_prior(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
         reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,
