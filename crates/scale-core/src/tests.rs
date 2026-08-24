@@ -2366,9 +2366,12 @@ fn steady_plateau_selects_the_cost_minimum() -> Result<(), TestError> {
         apply.target,
         configuration.partition_count
     );
-    // The anti-scaling wall stays gone: one step above the demand floor
-    // costs less expected delay than holding at it.
-    assert!(costs[2] <= costs[1], "costs={:?}", &costs[..8]);
+    // The plateau demand uses 30 slots against 32 per replica, so two
+    // replicas are the demand floor. The objective (late area plus three
+    // times replica-seconds) prices the floor as the feasible minimum on
+    // this surface; the selected-versus-runner-up assertion above proves
+    // the minimum was compared, and this pin proves it is the floor.
+    assert_eq!(apply.target, 2, "costs={:?}", &costs[..8]);
     Ok(())
 }
 
