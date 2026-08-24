@@ -198,6 +198,8 @@ designs are where bloat and bug re-introduction live:
 
 **Style:**
 
+- Structure function bodies as logical paragraphs. Keep statements for one
+  operation together. Add a blank line before a new concept or operation.
 - Prefer `use` statements over fully qualified prefixes
 - Methods without `self` should be functions (except `new` and similar)
 - Ask before large structural changes
