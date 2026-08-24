@@ -2262,7 +2262,7 @@ pub struct PrincipalRun {
 }
 
 impl PrincipalRun {
-    #[cfg(test)]
+    #[cfg(all(test, simulation_profile))]
     pub(crate) fn applied_changes(&self) -> &[crate::ScaleChange] {
         &self.simulation.changes
     }

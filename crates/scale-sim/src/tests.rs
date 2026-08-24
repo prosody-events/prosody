@@ -1,3 +1,4 @@
+#[cfg(simulation_profile)]
 use std::cmp::Ordering;
 use std::iter::repeat;
 
@@ -8,10 +9,16 @@ use prosody_scale_core::{
 };
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
+#[cfg(simulation_profile)]
 use rayon::prelude::*;
 use thiserror::Error;
 
+#[cfg(simulation_profile)]
+use crate::RunStopReason;
+#[cfg(simulation_profile)]
 use crate::regime::linear_miss_accounting;
+#[cfg(simulation_profile)]
+use crate::run_capacity_evidence_regime;
 use crate::series::{
     OutputFunction, SeriesCell, SeriesContext, SeriesFunction, SeriesHistory, SeriesKey,
     SeriesMetadata, SeriesRole, SeriesUnit, series_graph, series_graph_is_acyclic,
@@ -23,11 +30,10 @@ use crate::{
     EventSpec, FaultPattern, FinalOutcome, HistoricalAttemptModel, Kip848Rebalance, Plant,
     PlantConfiguration, PlantError, PrincipalRegime, PrincipalRunError, PriorArtifactKind,
     QuantileTable, RegimeExperiment, RegimeValidationError, ReliabilityEvidenceSample,
-    ReporterDirective, RetryCount, RetryOutcome, RunStopReason, ScaleChange, ScaleDirective,
-    ScaleRequest, SimulationHarness, Snapshot, SnapshotChannel, SnapshotCursor, SnapshotTable,
-    StepSeries, TickContext, TickGenerator, TickInputs, W6AblationArm, WorkloadSeries,
-    run_batch_regime, run_batch_slo, run_capacity_evidence_regime, run_parallel,
-    run_principal_regime, validate_principal_regime,
+    ReporterDirective, RetryCount, RetryOutcome, ScaleChange, ScaleDirective, ScaleRequest,
+    SimulationHarness, Snapshot, SnapshotChannel, SnapshotCursor, SnapshotTable, StepSeries,
+    TickContext, TickGenerator, TickInputs, W6AblationArm, WorkloadSeries, run_batch_regime,
+    run_batch_slo, run_parallel, run_principal_regime, validate_principal_regime,
 };
 use crate::{CapacityEvidenceKind, CapacityEvidenceSample};
 
@@ -1449,6 +1455,9 @@ fn replica_ceiling_exposes_unmet_demand_at_the_limit() -> Result<(), TestError> 
 }
 
 #[test]
+#[cfg(simulation_profile)]
+/// Runs only with the simulation profile because it executes three full
+/// workloads.
 fn capacity_regimes_record_passive_resource_windows() -> Result<(), TestError> {
     [
         PrincipalRegime::LinearThroughput,
@@ -1623,6 +1632,7 @@ fn hot_partition_exposes_unavoidable_placement_loss() -> Result<(), TestError> {
     Ok(())
 }
 
+#[cfg(simulation_profile)]
 fn assert_lead_time_diagnostics_use_prequential_predictive_distributions(
     run: &crate::PrincipalRun,
 ) -> Result<(), TestError> {
@@ -1712,6 +1722,7 @@ fn assert_lead_time_diagnostics_use_prequential_predictive_distributions(
     Ok(())
 }
 
+#[cfg(simulation_profile)]
 fn assert_linear_closed_loop_uses_only_controller_scale_targets(run: &crate::PrincipalRun) {
     assert_eq!(run.stop().reason, RunStopReason::DurationComplete);
     for row in 0..run.inputs().len() {
@@ -1723,6 +1734,8 @@ fn assert_linear_closed_loop_uses_only_controller_scale_targets(run: &crate::Pri
 }
 
 #[test]
+#[cfg(simulation_profile)]
+/// Runs only with the simulation profile because it executes a full workload.
 fn linear_closed_loop_satisfies_its_declared_outcome() -> Result<(), TestError> {
     let run = run_principal_regime(PrincipalRegime::LinearThroughput)?;
     assert_lead_time_diagnostics_use_prequential_predictive_distributions(&run)?;
@@ -1737,6 +1750,7 @@ fn linear_closed_loop_satisfies_its_declared_outcome() -> Result<(), TestError> 
     Ok(())
 }
 
+#[cfg(simulation_profile)]
 fn assert_linear_miss_bound(run: &crate::PrincipalRun) {
     let accounting = linear_miss_accounting(run);
     assert!(
@@ -1746,6 +1760,7 @@ fn assert_linear_miss_bound(run: &crate::PrincipalRun) {
     );
 }
 
+#[cfg(simulation_profile)]
 fn assert_linear_scale_response(run: &crate::PrincipalRun) {
     assert!(
         run.applied_changes()
@@ -1757,6 +1772,8 @@ fn assert_linear_scale_response(run: &crate::PrincipalRun) {
 }
 
 #[test]
+#[cfg(simulation_profile)]
+/// Runs only with the simulation profile because it executes a full workload.
 fn capacity_median_matches_each_posterior_slice() -> Result<(), TestError> {
     let run = run_capacity_evidence_regime(PrincipalRegime::DecliningPostKnee)?;
     let values = run.controller().capacity_posterior_values();

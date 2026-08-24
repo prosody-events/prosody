@@ -7,6 +7,13 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() -> io::Result<()> {
+    println!("cargo::rustc-check-cfg=cfg(simulation_profile)");
+    // Cargo reports the inherited profile name here. The simulation profile's
+    // optimization level is its build-script-visible identity.
+    if env::var("OPT_LEVEL").is_ok_and(|level| level == "1") {
+        println!("cargo::rustc-cfg=simulation_profile");
+    }
+
     let repository =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").map_err(io::Error::other)?).join("../..");
     let git_head = repository.join(".git/HEAD");

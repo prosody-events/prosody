@@ -647,6 +647,9 @@ fn historical_message_count(history: HistoricalSeries) -> Result<u32, PrincipalR
 }
 
 #[test]
+#[cfg(simulation_profile)]
+/// Runs only with the simulation profile because it executes two controller
+/// steps.
 fn matching_history_changes_prearrival_decision_and_requests_step_capacity()
 -> Result<(), PrincipalRunError> {
     let one_tick = RunSchedule {
