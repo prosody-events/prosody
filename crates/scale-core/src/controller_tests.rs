@@ -299,6 +299,61 @@ fn hypothetical_prices_are_invariant_to_subinterval_model_time_shifts() -> Resul
 }
 
 #[test]
+fn identical_posterior_decisions_have_identical_cost_ladders() -> Result<(), TestError> {
+    let (mut baseline, _) = i27_step(None, 0.02_f64, 12)?;
+    let (mut next, _) = i27_step(None, 0.02_f64, 12)?;
+    next.model_time = ModelTime::from_micros(
+        baseline
+            .model_time
+            .as_micros()
+            .saturating_add(baseline.configuration.report_interval_micros),
+    );
+    let mut baseline_scratch = baseline.new_scratch()?;
+    let mut next_scratch = next.new_scratch()?;
+    let mut observation = ObservationBuffer::new(&baseline.configuration)?;
+    let inputs = observation.observation();
+
+    let baseline_decision = select_target(
+        &mut baseline,
+        &mut baseline_scratch,
+        inputs.cohorts,
+        inputs.backlog,
+        inputs.scheduled_releases,
+        inputs.calendar,
+        inputs.actuation_commitments,
+    );
+    let next_decision = select_target(
+        &mut next,
+        &mut next_scratch,
+        inputs.cohorts,
+        inputs.backlog,
+        inputs.scheduled_releases,
+        inputs.calendar,
+        inputs.actuation_commitments,
+    );
+    let ScaleDecision::Apply(baseline_apply) = baseline_decision else {
+        return Err(TestError::UnexpectedDecision);
+    };
+    let ScaleDecision::Apply(next_apply) = next_decision else {
+        return Err(TestError::UnexpectedDecision);
+    };
+    let mut baseline_costs = vec![0.0_f64; baseline_scratch.decision_candidate_count()];
+    let mut next_costs = vec![0.0_f64; next_scratch.decision_candidate_count()];
+    baseline_scratch.write_decision_expected_costs(&mut baseline_costs)?;
+    next_scratch.write_decision_expected_costs(&mut next_costs)?;
+
+    assert_eq!(baseline_apply.target, next_apply.target);
+    assert!(
+        baseline_costs
+            .iter()
+            .zip(&next_costs)
+            .all(|(left, right)| left.to_bits() == right.to_bits()),
+        "baseline={baseline_costs:?}, next={next_costs:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn exposed_cost_ladder_preserves_paired_decision_differences() -> Result<(), TestError> {
     let (_, scratch) = i27_step(Some((8, 1)), 0.02_f64, 12)?;
     let mut costs = [0.0_f64; 8];
@@ -320,9 +375,9 @@ fn committed_eight_prices_only_the_honest_replica_margin() -> Result<(), TestErr
     let replica_margin =
         3.0_f64 * (measurement.replica_seconds[7] - measurement.replica_seconds[0]);
     // The objective charges 3.0 per replica-second. The sampled difference is
-    // 7.965166 replica-seconds, so the honest margin is 3.0 * 7.965166.
+    // 6.568792 replica-seconds, so the honest margin is 3.0 * 6.568792.
     assert!(
-        (replica_margin - 23.895_499_f64).abs() < 0.01_f64,
+        (replica_margin - 19.706_375_f64).abs() < 0.01_f64,
         "replica_margin={replica_margin}"
     );
     assert!(measurement.costs[0] < measurement.costs[7]);
@@ -338,14 +393,14 @@ fn inflight_descent_prices_only_the_honest_replica_margin() -> Result<(), TestEr
         &fresh.candidate_transition_times[1..7]
     );
     // Physical-transition draws price rung one at 22,542.768. They price rung
-    // eight at 22,593.099. The cancel-plus-fresh equality keeps this order.
+    // eight at 22,574.680. The cancel-plus-fresh equality keeps this order.
     assert!(
         (measurement.costs[0] - 22_542.767_764_170_098_f64).abs() < 0.01_f64,
         "costs={:?}",
         measurement.costs
     );
     assert!(
-        (measurement.costs[7] - 22_593.099_449_365_41_f64).abs() < 0.01_f64,
+        (measurement.costs[7] - 22_574.679_837_654_472_f64).abs() < 0.01_f64,
         "costs={:?}",
         measurement.costs
     );
@@ -890,7 +945,8 @@ fn push_fixture_repair(
     let (origin, target) = transition;
     let direction = u64::from(target < origin);
     let delta = u64::from(target.abs_diff(origin));
-    let timing_key = requested_micros ^ (direction << 1_u32) ^ (delta << 2_u32);
+    let relative_boundary = boundary as u64 + 1;
+    let timing_key = relative_boundary ^ (direction << 1_u32) ^ (delta << 2_u32);
     let timing_count = u64::try_from(timings.len()).unwrap_or(u64::MAX);
     let timing_index = usize::try_from(timing_key % timing_count).unwrap_or(0);
     let timing = timings[timing_index];
@@ -937,41 +993,6 @@ fn commitment_domains_form_distinct_midpoint_permutations() {
     assert_ne!(coordinates[0][1], coordinates[1][1]);
     assert_ne!(coordinates[0][0], coordinates[0][1]);
     assert_ne!(coordinates[1][0], coordinates[1][1]);
-}
-
-#[test]
-fn identical_posterior_decisions_have_identical_cost_ladders() -> Result<(), TestError> {
-    let mut configuration = test_configuration()?;
-    configuration.posterior_sample_count = 256;
-    configuration.arrival_prior = ArrivalPrior::new(1.0_f64 / 3_600.0_f64)?;
-    let grid = CapacityGrid::new(&[0.1_f64], &[1_000.0_f64], &[0.0_f64])?;
-    let mut state = ScaleState::new(configuration.clone(), grid)?;
-    let mut scratch = state.new_scratch()?;
-    let mut observation = ObservationBuffer::new(&configuration)?;
-    observation.advance_model_time(ModelTime::from_micros(1_000_000))?;
-    observation.set_current_replicas(4)?;
-    observation.set_backlog(BacklogCohort::new(
-        1_000_000,
-        500_000,
-        100,
-        0,
-        DemandClass::Normal,
-    )?)?;
-    let _ = step(&mut state, &mut scratch, observation.observation());
-    let mut first = vec![0.0_f64; scratch.decision_candidate_count()];
-    scratch.write_decision_expected_costs(&mut first)?;
-
-    let _ = step(&mut state, &mut scratch, observation.observation());
-    let mut second = vec![0.0_f64; scratch.decision_candidate_count()];
-    scratch.write_decision_expected_costs(&mut second)?;
-
-    assert!(
-        first
-            .iter()
-            .zip(&second)
-            .all(|(left, right)| left.to_bits() == right.to_bits())
-    );
-    Ok(())
 }
 
 fn idle_ladder_step(
@@ -1044,13 +1065,13 @@ fn idle_pending_descent_cost_ladder_selects_one() -> Result<(), TestError> {
     // Physical-transition draws give this ladder after posterior aggregation.
     let expected = [
         15_002.668_927_987_197_f64,
-        15_071.119_970_947_477_f64,
-        15_179.597_407_374_56_f64,
-        15_391.932_417_089_418_f64,
-        15_472.511_244_575_338_f64,
-        15_513.248_026_116_547_f64,
-        15_619.660_299_843_654_f64,
-        15_022.433_008_180_305_f64,
+        15_185.514_855_254_482_f64,
+        15_235.720_567_547_98_f64,
+        15_288.589_812_824_881_f64,
+        15_450.181_400_019_706_f64,
+        15_487.382_988_414_396_f64,
+        15_604.777_772_592_28_f64,
+        15_117.016_486_960_754_f64,
     ];
     assert!(
         costs

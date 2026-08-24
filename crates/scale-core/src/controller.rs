@@ -3196,7 +3196,8 @@ fn sample_transition_times(
 ///
 /// The Commitment stream owns this layout. Domain 0 is launch. Domain 1 is
 /// rebalance. Counter 0 in each domain selects the world hypothesis. The nested
-/// domains identify the request boundary, direction, and replica delta.
+/// domains identify the decision-relative request boundary, direction, and
+/// replica delta.
 fn sample_transition_hypotheses(state: &ScaleState, random: &RandomStream) -> TransitionHypotheses {
     let mut launch_random = random.clone().domain(0);
     let launch = state
@@ -3217,7 +3218,8 @@ fn sample_hypothetical_transition_times(
     direction: TransitionDirection,
     replica_delta: u32,
 ) -> (u64, u64) {
-    let requested_boundary = requested_at_micros / state.configuration.report_interval_micros;
+    let requested_boundary = requested_at_micros.saturating_sub(state.model_time.as_micros())
+        / state.configuration.report_interval_micros;
     let direction_domain = match direction {
         TransitionDirection::Up => 0,
         TransitionDirection::Down => 1,
