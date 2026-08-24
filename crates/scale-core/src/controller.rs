@@ -662,13 +662,29 @@ struct PreparedPlacement {
 
 struct TrajectoryColumns {
     targets: Vec<u32>,
+    kinds: Vec<TrajectoryEventKind>,
     requested_micros: Vec<u64>,
     pause_micros: Vec<u64>,
     sampled_ready_micros: Vec<u64>,
     ready_micros: Vec<u64>,
+    billing_ready_micros: Vec<u64>,
     ready_boundaries: Vec<u64>,
     during_supply: Vec<f64>,
     after_supply: Vec<f64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TrajectoryEventKind {
+    FixedTransition,
+    FencedCommitment,
+    FenceClosure,
+    Transition,
+}
+
+impl TrajectoryEventKind {
+    const fn is_fixed(self) -> bool {
+        !matches!(self, Self::Transition)
+    }
 }
 
 struct ReactiveTransition {
@@ -939,9 +955,10 @@ impl ScratchBounds {
             .saturating_add(seconds_to_micros(2.0_f64 * transition_span_seconds));
         let successor_report_count_max =
             successor_horizon_micros.div_ceil(configuration.report_interval_micros) as usize;
-        // Each candidate can hold at most two fixed events per replica,
-        // one requested event, one repair per report boundary, and one
-        // terminal repair after an unfinished transition.
+        // A partial split can add one retained event and one fence pair.
+        // At most one commitment has a partial split. Newer commitments use
+        // fence pairs. Older commitments use one retained event. Thus, R
+        // commitments use at most 2R + 1 slots, including a fresh transition.
         let candidate_event_count_max = replica_count_max
             .checked_mul(2)
             .and_then(|events| events.checked_add(1))
@@ -987,10 +1004,12 @@ impl TrajectoryColumns {
     fn new(capacity: usize) -> Self {
         Self {
             targets: Vec::with_capacity(capacity),
+            kinds: Vec::with_capacity(capacity),
             requested_micros: Vec::with_capacity(capacity),
             pause_micros: Vec::with_capacity(capacity),
             sampled_ready_micros: Vec::with_capacity(capacity),
             ready_micros: Vec::with_capacity(capacity),
+            billing_ready_micros: Vec::with_capacity(capacity),
             ready_boundaries: Vec::with_capacity(capacity),
             during_supply: Vec::with_capacity(capacity),
             after_supply: Vec::with_capacity(capacity),
@@ -1693,7 +1712,7 @@ fn evaluate_scenario_outcome(
     // successor event, even when a sampled transition exceeds the plan.
     let billing_horizon_micros = workspace
         .trajectory
-        .ready_micros
+        .billing_ready_micros
         .iter()
         .copied()
         .max()
@@ -1708,7 +1727,7 @@ fn evaluate_scenario_outcome(
             state.current_replicas,
             &workspace.trajectory.targets[first..last],
             &workspace.trajectory.requested_micros[first..last],
-            &workspace.trajectory.ready_micros[first..last],
+            &workspace.trajectory.billing_ready_micros[first..last],
         ) + terminal_replica_seconds(
             state.model_time.as_micros(),
             forecast.planning_horizon_micros,
@@ -2222,21 +2241,20 @@ fn prepare_candidate_trajectories(
             .assignment
             .copy_from_slice(shared.current_partition_owners);
         let candidate = candidate_index as u32 + 1;
-        let (first, fixed_event_count, committed_replicas, transition_ordinal) =
-            push_candidate_events(
-                state,
-                workspace,
-                shared.actuation_commitments,
-                HypotheticalDraws {
-                    random: &draws.commitment_random,
-                    hypotheses: draws.transition_hypotheses,
-                    curve: draws.curve,
-                    event_supply_factor: draws.event_supply_factor,
-                },
-                candidate,
-                now_micros,
-            );
-        sort_trajectory_events(&mut workspace.trajectory, first + fixed_event_count);
+        let (first, committed_replicas, transition_ordinal) = push_candidate_events(
+            state,
+            workspace,
+            shared.actuation_commitments,
+            HypotheticalDraws {
+                random: &draws.commitment_random,
+                hypotheses: draws.transition_hypotheses,
+                curve: draws.curve,
+                event_supply_factor: draws.event_supply_factor,
+            },
+            candidate,
+            now_micros,
+        );
+        sort_trajectory_events(&mut workspace.trajectory, first);
         let mut active = ActiveTransition {
             replicas: state.current_replicas,
             ready_micros: now_micros,
@@ -2247,7 +2265,7 @@ fn prepare_candidate_trajectories(
         };
         for read in first..workspace.trajectory.targets.len() {
             let target = workspace.trajectory.targets[read];
-            if read >= first + fixed_event_count
+            if !workspace.trajectory.kinds[read].is_fixed()
                 && ((candidate > committed_replicas && target <= active.replicas)
                     || (candidate < committed_replicas && target >= active.replicas))
             {
@@ -2264,6 +2282,7 @@ fn prepare_candidate_trajectories(
             );
         }
         workspace.trajectory.targets.truncate(active.write);
+        workspace.trajectory.kinds.truncate(active.write);
         workspace.trajectory.requested_micros.truncate(active.write);
         workspace.trajectory.pause_micros.truncate(active.write);
         workspace
@@ -2271,6 +2290,10 @@ fn prepare_candidate_trajectories(
             .sampled_ready_micros
             .truncate(active.write);
         workspace.trajectory.ready_micros.truncate(active.write);
+        workspace
+            .trajectory
+            .billing_ready_micros
+            .truncate(active.write);
         workspace.trajectory.during_supply.truncate(active.write);
         workspace.trajectory.after_supply.truncate(active.write);
         append_reactive_repairs(
@@ -2311,7 +2334,9 @@ fn write_trajectory_event(
     preparation: TrajectoryPreparation,
 ) {
     let target = workspace.trajectory.targets[read];
+    let kind = workspace.trajectory.kinds[read];
     let pause = workspace.trajectory.pause_micros[read].max(preparation.now_micros);
+    let billing_ready = workspace.trajectory.sampled_ready_micros[read].max(pause);
     let before_supply = if pause < active.ready_micros {
         if let Some(event) = active.event {
             workspace.trajectory.ready_micros[event] = pause;
@@ -2320,6 +2345,28 @@ fn write_trajectory_event(
     } else {
         active.after_supply
     };
+    if matches!(
+        kind,
+        TrajectoryEventKind::FencedCommitment | TrajectoryEventKind::FenceClosure
+    ) {
+        workspace.trajectory.targets[active.write] = target;
+        workspace.trajectory.kinds[active.write] = kind;
+        workspace.trajectory.requested_micros[active.write] =
+            workspace.trajectory.requested_micros[read];
+        workspace.trajectory.pause_micros[active.write] = pause;
+        workspace.trajectory.sampled_ready_micros[active.write] = pause;
+        workspace.trajectory.ready_micros[active.write] = pause;
+        workspace.trajectory.billing_ready_micros[active.write] = billing_ready;
+        workspace.trajectory.during_supply[active.write] = before_supply;
+        workspace.trajectory.after_supply[active.write] = before_supply;
+        active.ready_micros = pause;
+        active.during_supply = before_supply;
+        active.after_supply = before_supply;
+        active.event = Some(active.write);
+        active.write += 1;
+        active.replicas = target;
+        return;
+    }
     let direction = if target > active.replicas {
         TransitionDirection::Up
     } else {
@@ -2334,11 +2381,13 @@ fn write_trajectory_event(
     };
     let retained = 1.0_f64 - moved_share;
     workspace.trajectory.targets[active.write] = target;
+    workspace.trajectory.kinds[active.write] = kind;
     workspace.trajectory.requested_micros[active.write] =
         workspace.trajectory.requested_micros[read];
     workspace.trajectory.pause_micros[active.write] = pause;
     workspace.trajectory.sampled_ready_micros[active.write] = sampled_ready;
     workspace.trajectory.ready_micros[active.write] = ready;
+    workspace.trajectory.billing_ready_micros[active.write] = ready;
     workspace.trajectory.during_supply[active.write] = before_supply * retained;
     let max_share = assignment_max_owner_share(workspace);
     workspace.trajectory.after_supply[active.write] = placement_supply(
@@ -2359,10 +2408,12 @@ fn write_trajectory_event(
 
 fn clear_trajectory(trajectory: &mut TrajectoryColumns) {
     trajectory.targets.clear();
+    trajectory.kinds.clear();
     trajectory.requested_micros.clear();
     trajectory.pause_micros.clear();
     trajectory.sampled_ready_micros.clear();
     trajectory.ready_micros.clear();
+    trajectory.billing_ready_micros.clear();
     trajectory.ready_boundaries.clear();
     trajectory.during_supply.clear();
     trajectory.after_supply.clear();
@@ -2557,10 +2608,115 @@ const fn membership_ready(
     }
 }
 
+fn push_up_commitment_events(
+    workspace: &mut ScenarioWorkspace,
+    commitments: &ActuationCommitments,
+    commitment_index: usize,
+    cancel_up: u32,
+    retained_up_target: u32,
+    now_micros: u64,
+) -> u32 {
+    let delta = commitments.launching_replica_delta(commitment_index);
+    let ready = workspace.commitment_ready_micros[commitment_index];
+    let newer_delta = (0..commitments.launching_len())
+        .filter(|&index| {
+            matches!(
+                commitments.launching_direction(index),
+                TransitionDirection::Up
+            ) && workspace.commitment_pause_micros[index] != u64::MAX
+                && (workspace.commitment_ready_micros[index] > ready
+                    || (workspace.commitment_ready_micros[index] == ready
+                        && index > commitment_index))
+        })
+        .fold(0_u32, |total, index| {
+            total.saturating_add(commitments.launching_replica_delta(index))
+        });
+    let cancelled = delta.min(cancel_up.saturating_sub(newer_delta));
+    let retained = delta - cancelled;
+    let retained_target = retained_up_target.saturating_add(retained);
+    if retained > 0 {
+        push_trajectory_event(
+            &mut workspace.trajectory,
+            TrajectoryEventKind::FixedTransition,
+            retained_target,
+            commitments
+                .launching_requested_at(commitment_index)
+                .as_micros(),
+            workspace.commitment_pause_micros[commitment_index],
+            workspace.commitment_ready_micros[commitment_index],
+        );
+    }
+    if cancelled > 0 {
+        push_trajectory_event(
+            &mut workspace.trajectory,
+            TrajectoryEventKind::FencedCommitment,
+            retained_target.saturating_add(cancelled),
+            commitments
+                .launching_requested_at(commitment_index)
+                .as_micros(),
+            now_micros,
+            workspace.commitment_ready_micros[commitment_index],
+        );
+        push_trajectory_event(
+            &mut workspace.trajectory,
+            TrajectoryEventKind::FenceClosure,
+            retained_target,
+            now_micros,
+            now_micros,
+            now_micros,
+        );
+    }
+    retained_target
+}
+
+fn push_down_commitment_events(
+    workspace: &mut ScenarioWorkspace,
+    commitments: &ActuationCommitments,
+    commitment_index: usize,
+    first: usize,
+    candidate: u32,
+    current_replicas: u32,
+    now_micros: u64,
+) {
+    let target = commitments.launching_target_replicas(commitment_index);
+    if workspace.trajectory.targets[first..].contains(&target) {
+        return;
+    }
+    let continues = candidate == target;
+    push_trajectory_event(
+        &mut workspace.trajectory,
+        if continues {
+            TrajectoryEventKind::FixedTransition
+        } else {
+            TrajectoryEventKind::FencedCommitment
+        },
+        target,
+        commitments
+            .launching_requested_at(commitment_index)
+            .as_micros(),
+        if continues {
+            workspace.commitment_pause_micros[commitment_index]
+        } else {
+            now_micros
+        },
+        workspace.commitment_ready_micros[commitment_index],
+    );
+    if !continues {
+        push_trajectory_event(
+            &mut workspace.trajectory,
+            TrajectoryEventKind::FenceClosure,
+            current_replicas,
+            now_micros,
+            now_micros,
+            now_micros,
+        );
+    }
+}
+
 /// Pushes one candidate's committed and requested transition events.
 ///
-/// Returns the first event, fixed-event count, committed replica count, and
-/// next hypothetical transition ordinal.
+/// Returns the first event, committed replica count, and next hypothetical
+/// transition ordinal.
 fn push_candidate_events(
     state: &ScaleState,
     workspace: &mut ScenarioWorkspace,
@@ -2568,12 +2724,13 @@ fn push_candidate_events(
     draws: HypotheticalDraws<'_>,
     candidate: u32,
     now_micros: u64,
-) -> (usize, usize, u32, u64) {
+) -> (usize, u32, u64) {
     let first = workspace.trajectory.targets.len();
     let rebalancing = actuation_commitments.rebalancing();
-    let committed_replicas = rebalancing.map_or(state.current_replicas, |commitment| {
+    let rebalancing_target = rebalancing.map_or(state.current_replicas, |commitment| {
         push_trajectory_event(
             &mut workspace.trajectory,
+            TrajectoryEventKind::FixedTransition,
             commitment.target_replicas,
             commitment.requested_at.as_micros(),
             now_micros,
@@ -2581,36 +2738,71 @@ fn push_candidate_events(
         );
         commitment.target_replicas
     });
-    let fixed_event_count = workspace.trajectory.targets.len() - first;
+    let planned = (0..actuation_commitments.launching_len()).fold(
+        state.current_replicas,
+        |planned, index| {
+            if workspace.commitment_pause_micros[index] != u64::MAX
+                && matches!(
+                    actuation_commitments.launching_direction(index),
+                    TransitionDirection::Up
+                )
+            {
+                planned.saturating_add(actuation_commitments.launching_replica_delta(index))
+            } else {
+                planned
+            }
+        },
+    );
+    let cancel_up = if candidate < state.current_replicas {
+        planned.saturating_sub(state.current_replicas)
+    } else {
+        planned.saturating_sub(candidate)
+    };
+    let mut retained_up_target = state.current_replicas;
+    let mut has_up = false;
     for commitment_index in 0..actuation_commitments.launching_len() {
-        if candidate == state.current_replicas
-            || candidate != actuation_commitments.launching_target_replicas(commitment_index)
-            || workspace.commitment_pause_micros[commitment_index] == u64::MAX
-        {
+        if workspace.commitment_pause_micros[commitment_index] == u64::MAX {
             continue;
         }
-        if workspace.trajectory.targets[first..].contains(&candidate) {
+        if matches!(
+            actuation_commitments.launching_direction(commitment_index),
+            TransitionDirection::Up
+        ) {
+            has_up = true;
+            retained_up_target = push_up_commitment_events(
+                workspace,
+                actuation_commitments,
+                commitment_index,
+                cancel_up,
+                retained_up_target,
+                now_micros,
+            );
             continue;
         }
-        push_trajectory_event(
-            &mut workspace.trajectory,
+        push_down_commitment_events(
+            workspace,
+            actuation_commitments,
+            commitment_index,
+            first,
             candidate,
-            actuation_commitments
-                .launching_requested_at(commitment_index)
-                .as_micros(),
-            workspace.commitment_pause_micros[commitment_index],
-            workspace.commitment_ready_micros[commitment_index],
+            state.current_replicas,
+            now_micros,
         );
     }
-    let sampled_initial = candidate != state.current_replicas
+    let committed_replicas = if candidate >= state.current_replicas && has_up {
+        retained_up_target
+    } else {
+        rebalancing_target
+    };
+    let sampled_initial = candidate != committed_replicas
         && !workspace.trajectory.targets[first..].contains(&candidate);
     if sampled_initial {
-        let direction = if candidate > state.current_replicas {
+        let direction = if candidate > committed_replicas {
             TransitionDirection::Up
         } else {
             TransitionDirection::Down
         };
-        let replica_delta = candidate.abs_diff(state.current_replicas);
+        let replica_delta = candidate.abs_diff(committed_replicas);
         let (pause_micros, ready_micros) = sample_hypothetical_transition_times(
             state,
             draws.random,
@@ -2622,6 +2814,7 @@ fn push_candidate_events(
         );
         push_trajectory_event(
             &mut workspace.trajectory,
+            TrajectoryEventKind::Transition,
             candidate,
             now_micros,
             pause_micros,
@@ -2629,12 +2822,7 @@ fn push_candidate_events(
         );
     }
     let transition_ordinal = u64::from(sampled_initial);
-    (
-        first,
-        fixed_event_count,
-        committed_replicas,
-        transition_ordinal,
-    )
+    (first, committed_replicas, transition_ordinal)
 }
 
 /// Appends the reactive corrections one certainty-equivalent successor makes.
@@ -2976,12 +3164,10 @@ fn append_reactive_repair(
         replica_delta,
     );
     *transition_ordinal = transition_ordinal.saturating_add(1);
-    let (moved, moved_share) = transition_moved_share(shared, workspace, target);
-    let repair_ready_micros = if direction == TransitionDirection::Down && moved == 0 {
-        pause_micros
-    } else {
-        sampled_ready_micros
-    };
+    let (_moved, moved_share) = transition_moved_share(shared, workspace, target);
+    // The plant samples the actuator delay before it calculates partition
+    // moves. Thus, every down waits until sampled_ready_micros.
+    let repair_ready_micros = sampled_ready_micros;
     let retained = 1.0_f64 - moved_share;
     let max_share = assignment_max_owner_share(workspace);
     let after = placement_supply(
@@ -2995,6 +3181,10 @@ fn append_reactive_repair(
     workspace.trajectory.targets.push(target);
     workspace
         .trajectory
+        .kinds
+        .push(TrajectoryEventKind::Transition);
+    workspace
+        .trajectory
         .requested_micros
         .push(repair.requested_micros);
     workspace.trajectory.pause_micros.push(pause_micros);
@@ -3003,6 +3193,10 @@ fn append_reactive_repair(
         .sampled_ready_micros
         .push(sampled_ready_micros);
     workspace.trajectory.ready_micros.push(repair_ready_micros);
+    workspace
+        .trajectory
+        .billing_ready_micros
+        .push(repair_ready_micros);
     workspace
         .trajectory
         .during_supply
@@ -3137,11 +3331,10 @@ fn sample_commitment_pauses(
                 .saturating_sub(commitments.launching_requested_at(index).as_micros()),
         )
         .as_secs_f64();
-        let requested_at = commitments.launching_requested_at(index).as_micros();
         let (pause_micros, ready_micros) = sample_transition_times(
             state,
             random,
-            requested_at,
+            index as u64,
             now_micros,
             elapsed_seconds,
             commitments.launching_direction(index),
@@ -3163,7 +3356,7 @@ fn sample_commitment_pauses(
         .as_secs_f64();
         let mut rebalance_random = random
             .clone()
-            .domain(commitment.requested_at.as_micros())
+            .domain(commitments.launching_len() as u64)
             .domain(1);
         now_micros.saturating_add(seconds_to_micros(
             state
@@ -3174,21 +3367,29 @@ fn sample_commitment_pauses(
     now_micros
 }
 
-/// Samples one real transition through its fixed request time.
+/// Samples one real transition through its commitment ordinal.
 ///
-/// A real request time is a physical constant, so the draw is stable across
-/// ticks. The price moves only through elapsed-time survival conditioning.
-/// Hypothetical transitions use [`sample_hypothetical_transition_times`].
+/// Time-shift coupling keeps the draw stable when all physical times shift.
+/// Elapsed-time survival conditioning changes only the remaining delay.
 fn sample_transition_times(
     state: &ScaleState,
     random: &RandomStream,
-    requested_at_micros: u64,
+    transition_ordinal: u64,
     now_micros: u64,
     elapsed_seconds: f64,
     direction: TransitionDirection,
     replica_delta: u32,
 ) -> (u64, u64) {
-    let mut launch_random = random.clone().domain(requested_at_micros).domain(0);
+    let direction_domain = match direction {
+        TransitionDirection::Up => 0,
+        TransitionDirection::Down => 1,
+    };
+    let mut launch_random = random
+        .clone()
+        .domain(transition_ordinal)
+        .domain(direction_domain)
+        .domain(u64::from(replica_delta))
+        .domain(0);
     let remaining_seconds = state.lead_time.sample_remaining_seconds(
         direction,
         replica_delta,
@@ -3196,7 +3397,12 @@ fn sample_transition_times(
         &mut launch_random,
     );
     let pause_micros = now_micros.saturating_add(seconds_to_micros(remaining_seconds));
-    let mut rebalance_random = random.clone().domain(requested_at_micros).domain(1);
+    let mut rebalance_random = random
+        .clone()
+        .domain(transition_ordinal)
+        .domain(direction_domain)
+        .domain(u64::from(replica_delta))
+        .domain(1);
     let rebalance_seconds = state
         .rebalance_time
         .sample_remaining_seconds(0.0_f64, &mut rebalance_random);
@@ -3286,28 +3492,36 @@ pub(crate) fn scenario_substream(scenario: u32, role: ScenarioRole) -> RandomStr
 
 fn push_trajectory_event(
     trajectory: &mut TrajectoryColumns,
+    kind: TrajectoryEventKind,
     target: u32,
     requested_micros: u64,
     pause_micros: u64,
     sampled_ready_micros: u64,
 ) {
     trajectory.targets.push(target);
+    trajectory.kinds.push(kind);
     trajectory.requested_micros.push(requested_micros);
     trajectory.pause_micros.push(pause_micros);
     trajectory.sampled_ready_micros.push(sampled_ready_micros);
     trajectory.ready_micros.push(0_u64);
+    trajectory.billing_ready_micros.push(0_u64);
     trajectory.during_supply.push(0.0_f64);
     trajectory.after_supply.push(0.0_f64);
 }
 
 fn sort_trajectory_events(trajectory: &mut TrajectoryColumns, first: usize) {
+    // Sort by fence time. Preserve insertion order at equal times. The caller
+    // inserts each commitment before its closure and inserts the new target
+    // after all closures. This order is deterministic for equal fence times.
     for mut event in first + 1..trajectory.targets.len() {
         while event > first && trajectory.pause_micros[event] < trajectory.pause_micros[event - 1] {
             trajectory.targets.swap(event, event - 1);
+            trajectory.kinds.swap(event, event - 1);
             trajectory.requested_micros.swap(event, event - 1);
             trajectory.pause_micros.swap(event, event - 1);
             trajectory.sampled_ready_micros.swap(event, event - 1);
             trajectory.ready_micros.swap(event, event - 1);
+            trajectory.billing_ready_micros.swap(event, event - 1);
             event -= 1;
         }
     }

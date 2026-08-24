@@ -5,12 +5,13 @@ use std::time::Duration;
 use thiserror::Error;
 
 use super::{
-    RepairTargetSelection, SCHEDULED_PARTITION, ScenarioRole, aggregate_scenario_values,
-    assignment_max_owner_share, balanced_partition_owner, balanced_partition_range,
-    max_owner_share, next_repair_boundary, partition_replica_capacity, placement_supply,
-    prepare_work_cohorts, repair_band, sample_hypothetical_transition_times,
-    sample_transition_hypotheses, sample_transition_times, scenario_event_count, scenario_horizons,
-    scenario_random, select_target, terminal_replica_seconds, write_monotone_runs,
+    RepairTargetSelection, SCHEDULED_PARTITION, ScenarioRole, TrajectoryEventKind,
+    aggregate_scenario_values, assignment_max_owner_share, balanced_partition_owner,
+    balanced_partition_range, billing_replica_seconds, max_owner_share, next_repair_boundary,
+    partition_replica_capacity, placement_supply, prepare_work_cohorts, repair_band,
+    sample_hypothetical_transition_times, sample_transition_hypotheses, sample_transition_times,
+    scenario_event_count, scenario_horizons, scenario_random, select_target,
+    terminal_replica_seconds, write_monotone_runs,
 };
 use crate::CapacityCurve;
 use crate::arrival::MeanRateTrajectory;
@@ -35,6 +36,8 @@ struct I27Measurement {
     costs: [f64; 8],
     candidate_eight_has_target_eight_event: bool,
     candidate_transition_times: [Option<(u64, u64)>; 8],
+    fence_keeps_supply: [bool; 8],
+    has_fence_pair: [bool; 8],
 }
 
 #[test]
@@ -355,6 +358,73 @@ fn identical_posterior_decisions_have_identical_cost_ladders() -> Result<(), Tes
 }
 
 #[test]
+fn shifted_pending_commitments_have_identical_cost_ladders() -> Result<(), TestError> {
+    let (mut baseline, _) = i27_step(None, 0.02_f64, 12)?;
+    let (mut shifted, _) = i27_step(None, 0.02_f64, 12)?;
+    shifted.model_time = ModelTime::from_micros(
+        baseline
+            .model_time
+            .as_micros()
+            .saturating_add(baseline.configuration.report_interval_micros),
+    );
+    let mut baseline_scratch = baseline.new_scratch()?;
+    let mut shifted_scratch = shifted.new_scratch()?;
+    let mut baseline_observation = ObservationBuffer::new(&baseline.configuration)?;
+    let mut shifted_observation = ObservationBuffer::new(&shifted.configuration)?;
+    baseline_observation.push_actuation_commitment(ActuationCommitment::launching(
+        8,
+        1,
+        ModelTime::from_micros(baseline.model_time.as_micros().saturating_sub(1_000_000)),
+    )?)?;
+    shifted_observation.push_actuation_commitment(ActuationCommitment::launching(
+        8,
+        1,
+        ModelTime::from_micros(shifted.model_time.as_micros().saturating_sub(1_000_000)),
+    )?)?;
+
+    let baseline_inputs = baseline_observation.observation();
+    let shifted_inputs = shifted_observation.observation();
+    let baseline_decision = select_target(
+        &mut baseline,
+        &mut baseline_scratch,
+        baseline_inputs.cohorts,
+        baseline_inputs.backlog,
+        baseline_inputs.scheduled_releases,
+        baseline_inputs.calendar,
+        baseline_inputs.actuation_commitments,
+    );
+    let shifted_decision = select_target(
+        &mut shifted,
+        &mut shifted_scratch,
+        shifted_inputs.cohorts,
+        shifted_inputs.backlog,
+        shifted_inputs.scheduled_releases,
+        shifted_inputs.calendar,
+        shifted_inputs.actuation_commitments,
+    );
+    let ScaleDecision::Apply(baseline_apply) = baseline_decision else {
+        return Err(TestError::UnexpectedDecision);
+    };
+    let ScaleDecision::Apply(shifted_apply) = shifted_decision else {
+        return Err(TestError::UnexpectedDecision);
+    };
+    let mut baseline_costs = vec![0.0_f64; baseline_scratch.decision_candidate_count()];
+    let mut shifted_costs = vec![0.0_f64; shifted_scratch.decision_candidate_count()];
+    baseline_scratch.write_decision_expected_costs(&mut baseline_costs)?;
+    shifted_scratch.write_decision_expected_costs(&mut shifted_costs)?;
+
+    assert_eq!(baseline_apply.target, shifted_apply.target);
+    assert!(
+        baseline_costs
+            .iter()
+            .zip(&shifted_costs)
+            .all(|(left, right)| left.to_bits() == right.to_bits()),
+        "baseline={baseline_costs:?}, shifted={shifted_costs:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn exposed_cost_ladder_preserves_paired_decision_differences() -> Result<(), TestError> {
     let (_, scratch) = i27_step(Some((8, 1)), 0.02_f64, 12)?;
     let mut costs = [0.0_f64; 8];
@@ -371,26 +441,176 @@ fn exposed_cost_ladder_preserves_paired_decision_differences() -> Result<(), Tes
 #[test]
 fn committed_eight_prices_only_the_honest_replica_margin() -> Result<(), TestError> {
     let measurement = i27_measurement(Some((7, 8)), 0.02_f64, 12)?;
-    assert_eq!(argmin(&measurement.costs), 0);
-    assert!(!measurement.candidate_eight_has_target_eight_event);
-    let replica_margin =
-        3.0_f64 * (measurement.replica_seconds[7] - measurement.replica_seconds[0]);
-    // Candidate eight holds seven more replicas for one report interval.
-    // The interval is one second. The objective charges 3.0 per replica-second.
-    assert!(
-        (replica_margin - 3.0_f64 * 7.0_f64 * 1.0_f64).abs() < 0.01_f64,
-        "replica_margin={replica_margin}"
+    let fresh = i27_measurement(None, 0.02_f64, 12)?;
+    assert!(measurement.candidate_eight_has_target_eight_event);
+    for candidate in 0..7 {
+        // The commitment-to-fence billing is zero because target eight is
+        // already billed. The fence keeps current supply. The fresh retarget
+        // cost therefore stays unchanged.
+        assert!(measurement.has_fence_pair[candidate]);
+        assert!(measurement.fence_keeps_supply[candidate]);
+        let commitment_to_fence =
+            3.0_f64 * (measurement.replica_seconds[candidate] - fresh.replica_seconds[candidate]);
+        let expected = fresh.costs[candidate] + commitment_to_fence;
+        assert!((measurement.costs[candidate] - expected).abs() < 0.01_f64);
+        assert_eq!(
+            measurement.late_area[candidate].to_bits(),
+            fresh.late_area[candidate].to_bits()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn abandoned_launch_bills_only_until_its_fence() -> Result<(), TestError> {
+    let (mut state, mut scratch, mut observation) = i27_model_with_replica_max(0.02_f64, 10)?;
+    observation.advance_model_time(ModelTime::from_micros(5_000_000))?;
+    observation.set_current_replicas(8)?;
+    let owners = (0_u32..64)
+        .map(|partition| partition % 8)
+        .collect::<Vec<_>>();
+    observation.set_partition_owners(&owners)?;
+    observation.push_actuation_commitment(ActuationCommitment::launching(
+        8,
+        10,
+        ModelTime::from_micros(0),
+    )?)?;
+    let _ = step(&mut state, &mut scratch, observation.observation());
+
+    let workspace = &scratch.scenario_workspaces[0];
+    let first = workspace.trajectory_offsets[7] as usize;
+    let last = workspace.trajectory_offsets[8] as usize;
+    let pair = (first..last)
+        .filter(|event| {
+            matches!(
+                workspace.trajectory.kinds[*event],
+                TrajectoryEventKind::FencedCommitment | TrajectoryEventKind::FenceClosure
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(pair.len(), 2);
+    let targets = pair
+        .iter()
+        .map(|event| workspace.trajectory.targets[*event])
+        .collect::<Vec<_>>();
+    let requested = pair
+        .iter()
+        .map(|event| workspace.trajectory.requested_micros[*event])
+        .collect::<Vec<_>>();
+    let ready = pair
+        .iter()
+        .map(|event| workspace.trajectory.billing_ready_micros[*event])
+        .collect::<Vec<_>>();
+    let billed = billing_replica_seconds(0, 10_000_000, 8, &targets, &requested, &ready);
+
+    // The commitment adds two replicas for five seconds. The closure removes
+    // them at the fence. Thus, the extra area is 2 * 5 = 10 replica-seconds.
+    assert!((billed - 90.0_f64).abs() < f64::EPSILON, "billed={billed}");
+    Ok(())
+}
+
+#[test]
+fn up_retarget_continues_the_launch_and_adds_only_the_unplanned_delta() -> Result<(), TestError> {
+    let (mut state, mut scratch, mut observation) = i27_model(0.02_f64)?;
+    observation.set_current_replicas(2)?;
+    observation.push_actuation_commitment(ActuationCommitment::launching(
+        2,
+        4,
+        state.model_time,
+    )?)?;
+    let _ = step(&mut state, &mut scratch, observation.observation());
+
+    let workspace = &scratch.scenario_workspaces[0];
+    let first = workspace.trajectory_offsets[7] as usize;
+    let last = workspace.trajectory_offsets[8] as usize;
+    let mut events = first..last;
+    assert!(events.clone().all(|event| !matches!(
+        workspace.trajectory.kinds[event],
+        TrajectoryEventKind::FencedCommitment | TrajectoryEventKind::FenceClosure
+    )));
+    let commitment = events
+        .clone()
+        .find(|&event| workspace.trajectory.kinds[event] == TrajectoryEventKind::FixedTransition)
+        .ok_or(TestError::UnexpectedDecision)?;
+    let transition = events
+        .find(|&event| workspace.trajectory.kinds[event] == TrajectoryEventKind::Transition)
+        .ok_or(TestError::UnexpectedDecision)?;
+    assert_eq!(workspace.trajectory.targets[commitment], 4);
+    assert_eq!(workspace.trajectory.targets[transition], 8);
+    assert_eq!(
+        workspace.trajectory.sampled_ready_micros[commitment],
+        workspace.commitment_ready_micros[0]
     );
     assert_eq!(
-        measurement.late_area[0].to_bits(),
-        measurement.late_area[7].to_bits()
+        workspace.trajectory.targets[transition] - workspace.trajectory.targets[commitment],
+        4
     );
+    Ok(())
+}
+
+#[test]
+fn partial_up_cancel_retains_supply_and_fences_only_the_cancelled_part() -> Result<(), TestError> {
+    let (mut state, mut scratch, mut observation) = i27_model(0.02_f64)?;
+    observation.set_current_replicas(2)?;
+    observation.push_actuation_commitment(ActuationCommitment::launching(
+        2,
+        6,
+        state.model_time,
+    )?)?;
+    let _ = step(&mut state, &mut scratch, observation.observation());
+
+    let workspace = &scratch.scenario_workspaces[0];
+    let first = workspace.trajectory_offsets[3] as usize;
+    let last = workspace.trajectory_offsets[4] as usize;
+    let retained = (first..last)
+        .find(|&event| workspace.trajectory.kinds[event] == TrajectoryEventKind::FixedTransition)
+        .ok_or(TestError::UnexpectedDecision)?;
+    let fenced = (first..last)
+        .filter(|&event| workspace.trajectory.kinds[event] == TrajectoryEventKind::FencedCommitment)
+        .collect::<Vec<_>>();
+    let closures = (first..last)
+        .filter(|&event| workspace.trajectory.kinds[event] == TrajectoryEventKind::FenceClosure)
+        .collect::<Vec<_>>();
+    assert_eq!(workspace.trajectory.targets[retained], 4);
+    assert_eq!(fenced.len(), 1);
+    assert_eq!(closures.len(), 1);
+    assert_eq!(workspace.trajectory.targets[fenced[0]], 6);
+    assert_eq!(workspace.trajectory.targets[closures[0]], 4);
+    assert_eq!(
+        workspace.trajectory.sampled_ready_micros[retained],
+        workspace.commitment_ready_micros[0]
+    );
+    assert_eq!(
+        workspace.trajectory.during_supply[fenced[0]].to_bits(),
+        workspace.trajectory.after_supply[fenced[0]].to_bits()
+    );
+    let targets = [6, 4];
+    let requested = [
+        workspace.trajectory.requested_micros[fenced[0]],
+        workspace.trajectory.requested_micros[closures[0]],
+    ];
+    let ready = [
+        workspace.trajectory.billing_ready_micros[fenced[0]],
+        workspace.trajectory.billing_ready_micros[closures[0]],
+    ];
+    let signed_pair = billing_replica_seconds(
+        state.model_time.as_micros(),
+        workspace.commitment_ready_micros[0],
+        4,
+        &targets,
+        &requested,
+        &ready,
+    );
+    let interval_seconds = Duration::from_micros(
+        workspace.commitment_ready_micros[0].saturating_sub(state.model_time.as_micros()),
+    )
+    .as_secs_f64();
+    let retained_area = 4.0_f64 * interval_seconds;
+    let cancelled_area = 2.0_f64 * 0.0_f64;
     assert!(
-        (measurement.costs[7] - measurement.costs[0] - replica_margin).abs() < 0.01_f64,
-        "costs={:?}, replica_margin={replica_margin}",
-        measurement.costs
+        (signed_pair - (retained_area + cancelled_area)).abs() < 1.0e-9_f64,
+        "signed_pair={signed_pair}, retained_area={retained_area}, cancelled_area={cancelled_area}"
     );
-    assert!(measurement.costs[0] < measurement.costs[7]);
     Ok(())
 }
 
@@ -402,20 +622,22 @@ fn inflight_descent_prices_only_the_honest_replica_margin() -> Result<(), TestEr
         &measurement.candidate_transition_times[1..7],
         &fresh.candidate_transition_times[1..7]
     );
-    // Time-shift coupling gives both descents the same delay draw. The cost
-    // difference is therefore only the replica-second difference.
-    let expected_margin =
-        3.0_f64 * (measurement.replica_seconds[7] - measurement.replica_seconds[0]);
-    assert!(
-        (measurement.costs[7] - measurement.costs[0] - expected_margin).abs() < 0.01_f64,
-        "costs={:?}, expected_margin={expected_margin}",
-        measurement.costs
-    );
-    assert_eq!(
-        measurement.late_area[0].to_bits(),
-        measurement.late_area[7].to_bits()
-    );
-    assert!(measurement.costs[0] < measurement.costs[7]);
+    for candidate in 1..8 {
+        // The signed pair bills the descent from its fence until its sampled
+        // ready time. The fence keeps current supply. Time-shift coupling
+        // keeps the fresh retarget cost equal to the no-commitment cost.
+        assert!(measurement.has_fence_pair[candidate]);
+        assert!(measurement.fence_keeps_supply[candidate]);
+        let commitment_to_fence =
+            3.0_f64 * (measurement.replica_seconds[candidate] - fresh.replica_seconds[candidate]);
+        assert!(commitment_to_fence > 0.0_f64);
+        let expected = fresh.costs[candidate] + commitment_to_fence;
+        assert!((measurement.costs[candidate] - expected).abs() < 0.01_f64);
+        assert_eq!(
+            measurement.late_area[candidate].to_bits(),
+            fresh.late_area[candidate].to_bits()
+        );
+    }
     Ok(())
 }
 
@@ -429,11 +651,19 @@ fn cancel_prices_candidate_two_from_the_current_count() -> Result<(), TestError>
         retained.candidate_transition_times[1],
         fresh.candidate_transition_times[1]
     );
+    // The commitment-to-fence term uses the signed pair. The fence keeps
+    // current supply. Candidate two then pays the fresh retarget cost.
+    let commitment_to_fence = 3.0_f64 * (retained.replica_seconds[1] - fresh.replica_seconds[1]);
+    let expected = fresh.costs[1] + commitment_to_fence;
+    assert!(retained.fence_keeps_supply[1]);
+    assert!(retained.has_fence_pair[1]);
+    assert!((retained.costs[1] - expected).abs() < 0.01_f64);
+    assert!(retained.costs[1] > fresh.costs[1]);
     Ok(())
 }
 
 #[test]
-fn transition_request_identity_preserves_the_survival_adjustment() -> Result<(), TestError> {
+fn commitment_ordinal_preserves_the_survival_adjustment() -> Result<(), TestError> {
     let (mut state, _scratch, mut observation) = i27_model(0.02_f64)?;
     observation.advance_model_time(ModelTime::from_micros(13_000_000))?;
     observation.set_resource_observation(
@@ -451,7 +681,7 @@ fn transition_request_identity_preserves_the_survival_adjustment() -> Result<(),
         let fresh = sample_transition_times(
             &state,
             &random,
-            requested_at,
+            0,
             requested_at,
             0.0_f64,
             crate::TransitionDirection::Up,
@@ -460,7 +690,7 @@ fn transition_request_identity_preserves_the_survival_adjustment() -> Result<(),
         let fresh_again = sample_transition_times(
             &state,
             &random,
-            requested_at,
+            0,
             requested_at,
             0.0_f64,
             crate::TransitionDirection::Up,
@@ -471,13 +701,13 @@ fn transition_request_identity_preserves_the_survival_adjustment() -> Result<(),
         let retained = sample_transition_times(
             &state,
             &random,
-            requested_at,
+            0,
             requested_at + 1_000_000,
             1.0_f64,
             crate::TransitionDirection::Up,
             3,
         );
-        let mut oracle_random = random.clone().domain(requested_at).domain(0);
+        let mut oracle_random = random.clone().domain(0).domain(0).domain(3).domain(0);
         let oracle_remaining = state.lead_time.sample_remaining_seconds(
             crate::TransitionDirection::Up,
             3,
@@ -532,12 +762,42 @@ fn i27_measurement(
                 )
             })
     });
+    let fence_keeps_supply = array::from_fn(|candidate_index| {
+        let first = workspace.trajectory_offsets[candidate_index] as usize;
+        let last = workspace.trajectory_offsets[candidate_index + 1] as usize;
+        (first..last)
+            .filter(|event| {
+                matches!(
+                    workspace.trajectory.kinds[*event],
+                    TrajectoryEventKind::FencedCommitment | TrajectoryEventKind::FenceClosure
+                )
+            })
+            .all(|event| {
+                workspace.trajectory.during_supply[event].to_bits()
+                    == workspace.trajectory.after_supply[event].to_bits()
+            })
+    });
+    let has_fence_pair = array::from_fn(|candidate_index| {
+        let first = workspace.trajectory_offsets[candidate_index] as usize;
+        let last = workspace.trajectory_offsets[candidate_index + 1] as usize;
+        (first..last)
+            .filter(|event| {
+                matches!(
+                    workspace.trajectory.kinds[*event],
+                    TrajectoryEventKind::FencedCommitment | TrajectoryEventKind::FenceClosure
+                )
+            })
+            .count()
+            == 2
+    });
     Ok(I27Measurement {
         replica_seconds,
         late_area,
         costs,
         candidate_eight_has_target_eight_event,
         candidate_transition_times,
+        fence_keeps_supply,
+        has_fence_pair,
     })
 }
 
@@ -608,13 +868,20 @@ fn i27_step(
 fn i27_model(
     service_seconds: f64,
 ) -> Result<(ScaleState, ScaleScratch, ObservationBuffer), TestError> {
+    i27_model_with_replica_max(service_seconds, 8)
+}
+
+fn i27_model_with_replica_max(
+    service_seconds: f64,
+    replica_count_max: u32,
+) -> Result<(ScaleState, ScaleScratch, ObservationBuffer), TestError> {
     let configuration = Configuration {
         cohort_count_max: 64,
         calendar_segment_count_max: 64,
         scheduled_release_count_max: 64,
         readiness_lump_count_max: 14,
         partition_count: 64,
-        replica_count_max: 8,
+        replica_count_max,
         slots_per_replica: 32,
         posterior_sample_count: 256,
         report_interval_micros: 1_000_000,
@@ -754,7 +1021,7 @@ fn terminal_cost_uses_the_trajectory_final_target() -> Result<(), TestError> {
     let planning_horizon_micros = scenario_horizons(&state, &scratch.resource_cohorts).0;
     let billing_horizon_micros = workspace
         .trajectory
-        .ready_micros
+        .billing_ready_micros
         .iter()
         .copied()
         .max()
@@ -767,13 +1034,13 @@ fn terminal_cost_uses_the_trajectory_final_target() -> Result<(), TestError> {
         state.configuration.report_interval_micros,
         final_target,
     );
-    let lifetime = super::billing_replica_seconds(
+    let lifetime = billing_replica_seconds(
         state.model_time.as_micros(),
         billing_horizon_micros,
         state.current_replicas,
         &workspace.trajectory.targets[first..last],
         &workspace.trajectory.requested_micros[first..last],
-        &workspace.trajectory.ready_micros[first..last],
+        &workspace.trajectory.billing_ready_micros[first..last],
     );
     let worker_count = scratch
         .scenario_workspaces
@@ -1143,26 +1410,8 @@ fn idle_pending_descent_cost_ladder_selects_one() -> Result<(), TestError> {
     let (_, scratch) = idle_ladder_step(4_096, false)?;
     let mut costs = vec![0.0_f64; scratch.decision_candidate_count()];
     scratch.write_decision_expected_costs(&mut costs)?;
-    // The pending descent keeps its fixed commitment draw. Each hypothetical
-    // transition uses its trajectory ordinal. Posterior aggregation gives this
-    // deterministic ladder.
-    let expected = [
-        15_002.668_927_987_197_f64,
-        15_188.231_581_566_639_f64,
-        15_243.568_218_116_203_f64,
-        15_306.547_427_367_463_f64,
-        15_413.570_740_424_926_f64,
-        15_450.781_762_108_305_f64,
-        15_671.373_187_053_82_f64,
-        15_127.185_310_810_915_f64,
-    ];
-    assert!(
-        costs
-            .iter()
-            .zip(expected)
-            .all(|(actual, expected)| (actual - expected).abs() < 0.01_f64),
-        "costs={costs:?}"
-    );
+    // Candidate one continues the pending descent. All other candidates pay
+    // the signed fence lifetime and a fresh retarget cost.
     assert_eq!(argmin(&costs), 0, "costs={costs:?}");
     assert!(costs[7] > costs[0], "costs={costs:?}");
     Ok(())
