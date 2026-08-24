@@ -593,6 +593,8 @@ pub struct PlantSnapshot {
     pub at_micros: u64,
     /// Actual ready replicas.
     pub replicas: u32,
+    /// Slots on ready replicas and replicas that still drain handlers.
+    pub physical_slots: u32,
     /// Events released by this time.
     pub released: u32,
     /// Events settled by this time.
@@ -1910,6 +1912,22 @@ impl<M: AttemptModel> Plant<M> {
         self.now_micros = self.now_micros.max(now_micros);
     }
 
+    /// Returns slots on ready replicas and replicas that still drain handlers.
+    ///
+    /// [`Self::start_attempt`] records the owner that holds each slot.
+    /// [`Self::finish_running_attempt`] releases that owner only at completion.
+    fn physical_slot_count(&self) -> u32 {
+        let draining_replicas = self
+            .active_handlers_by_owner
+            .iter()
+            .skip(self.replicas as usize)
+            .filter(|active| **active > 0)
+            .count() as u32;
+        self.replicas
+            .saturating_add(draining_replicas)
+            .saturating_mul(self.configuration.slots_per_replica)
+    }
+
     #[cfg_attr(feature = "hotpath", hotpath::measure(label = "plant_snapshot"))]
     fn snapshot(&self, at_micros: u64) -> PlantSnapshot {
         let mut reconciling_partitions = 0_u32;
@@ -1934,6 +1952,7 @@ impl<M: AttemptModel> Plant<M> {
         PlantSnapshot {
             at_micros,
             replicas: self.replicas,
+            physical_slots: self.physical_slot_count(),
             released: self.released_events,
             settled: self.settled_events,
             backlog: self.released_events.saturating_sub(self.settled_events),

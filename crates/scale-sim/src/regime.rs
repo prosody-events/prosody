@@ -615,9 +615,10 @@ fn validate_linear_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError
 ///
 /// A level belief cannot act before an authored rate step. Each reaction
 /// window starts at that step. It ends when the run first records enough ready
-/// replicas after one report interval. Permit wait plus handler service gives
-/// the physical miss allowance in each window. Settlements outside the windows
-/// retain the SLO epsilon bound. All values come from the completed trace.
+/// replicas after one report interval. Permit wait plus dependency and handler
+/// service gives the physical miss allowance in each window. Settlements
+/// outside the windows retain the SLO epsilon bound. All values come from the
+/// completed trace.
 pub(crate) fn linear_miss_accounting(run: &PrincipalRun) -> LinearMissAccounting {
     let report_micros = run
         .controller
@@ -674,6 +675,7 @@ pub(crate) fn linear_miss_accounting(run: &PrincipalRun) -> LinearMissAccounting
         if in_reaction_window {
             let physical_miss = settlement
                 .permit_wait_micros
+                .saturating_add(settlement.dependency_micros)
                 .saturating_add(settlement.handler_micros)
                 > budget_micros;
             accounting.reaction_window_allowance += usize::from(physical_miss);

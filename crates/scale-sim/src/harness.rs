@@ -419,6 +419,7 @@ pub struct TickHistory {
     message_count: Vec<u32>,
     timer_count: Vec<u32>,
     replicas: Vec<u32>,
+    physical_slots: Vec<u32>,
     released: Vec<u32>,
     settled: Vec<u32>,
     backlog: Vec<u32>,
@@ -484,6 +485,7 @@ impl TickHistory {
             message_count: vec![0; capacity],
             timer_count: vec![0; capacity],
             replicas: vec![0; capacity],
+            physical_slots: vec![0; capacity],
             released: vec![0; capacity],
             settled: vec![0; capacity],
             backlog: vec![0; capacity],
@@ -532,6 +534,7 @@ impl TickHistory {
         self.message_count[index] = inputs.message_count;
         self.timer_count[index] = inputs.timer_count;
         self.replicas[index] = plant.replicas;
+        self.physical_slots[index] = plant.physical_slots;
         self.released[index] = plant.released;
         self.settled[index] = plant.settled;
         self.backlog[index] = plant.backlog;
@@ -614,6 +617,13 @@ impl<'a> TickHistoryView<'a> {
     pub fn replicas(self, steps_back: usize) -> Option<u32> {
         self.index(steps_back)
             .map(|index| self.history.replicas[index])
+    }
+
+    /// Returns slots on ready replicas and replicas that still drain handlers.
+    #[must_use]
+    pub fn physical_slots(self, steps_back: usize) -> Option<u32> {
+        self.index(steps_back)
+            .map(|index| self.history.physical_slots[index])
     }
 
     /// Returns released events for one newest-first offset.

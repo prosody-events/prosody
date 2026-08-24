@@ -2163,12 +2163,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             return Ok(());
         };
         let initial_available_attempts = context.history.available_attempts(0).unwrap_or(0);
-        let slot_count = context
-            .history
-            .replicas(0)
-            .unwrap_or(0)
-            .checked_mul(self.configuration.core().slots_per_replica)
-            .ok_or(PlantError::PlatformLimit)?;
+        let slot_count = context.history.physical_slots(0).unwrap_or(0);
         let Some(previous_count) = context.history.attempt_transition_count(0) else {
             return Ok(());
         };
