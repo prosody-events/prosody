@@ -52,8 +52,8 @@ pub(crate) struct ActionSelection {
 
 /// Selects the lowest-cost feasible action from posterior columns.
 ///
-/// When no action meets epsilon, the smallest miss fraction wins. This
-/// fallback keeps loss finite and marks every action as a deadline rejection.
+/// When no action meets epsilon, the lowest-cost action wins. The fallback
+/// status remains separate from each scenario's rejection reasons.
 #[cfg(test)]
 pub(crate) fn select_action(columns: &ActionColumns<'_>) -> ActionSelection {
     select_action_by(columns, |index| columns.cost(index))
@@ -82,9 +82,8 @@ fn select_action_by(columns: &ActionColumns<'_>, cost: impl Fn(usize) -> f64) ->
     feasible.unwrap_or_else(|| ActionSelection {
         index: (0..columns.late_area_sums.len())
             .min_by(|left, right| {
-                columns
-                    .miss_fraction(*left)
-                    .total_cmp(&columns.miss_fraction(*right))
+                cost(*left)
+                    .total_cmp(&cost(*right))
                     .then_with(|| left.cmp(right))
             })
             .unwrap_or(0),
@@ -101,16 +100,9 @@ pub(crate) fn select_paired_runner_up(
     (0..columns.late_area_sums.len())
         .filter(|index| *index != selected && (used_fallback || columns.is_feasible(*index)))
         .min_by(|left, right| {
-            if used_fallback {
-                columns
-                    .miss_fraction(*left)
-                    .total_cmp(&columns.miss_fraction(*right))
-                    .then_with(|| left.cmp(right))
-            } else {
-                cost_differences[*left]
-                    .total_cmp(&cost_differences[*right])
-                    .then_with(|| left.cmp(right))
-            }
+            cost_differences[*left]
+                .total_cmp(&cost_differences[*right])
+                .then_with(|| left.cmp(right))
         })
 }
 
@@ -177,8 +169,8 @@ pub(crate) fn next_report_boundary_at_or_after(
 
 /// Prices the reached replica state after the common billing horizon.
 ///
-/// The first successor report boundary caps the shared terminal budget. The
-/// smaller action index still resolves an exact finite-cost tie.
+/// The next report boundary caps the shared terminal budget. The smaller
+/// action index still resolves an exact finite-cost tie.
 pub(crate) fn terminal_replica_seconds(
     model_time_micros: u64,
     planning_horizon_micros: u64,

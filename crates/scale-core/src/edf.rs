@@ -407,6 +407,7 @@ impl<S: Simd> DeadlineStateLanes<S> {
 
     /// This method exists because full-rate masks measurably slow the step
     /// kernel; its parity property pins equivalence.
+    #[cfg(test)]
     fn advance_zero_rate(
         &mut self,
         simd: S,
@@ -1023,6 +1024,7 @@ pub(crate) fn evaluate_prepared_step<Unit>(
 ///
 /// All lanes share cohorts, times, zero arrivals, and zero initial debt. Each
 /// lane supplies one constant capacity for the complete window.
+#[cfg(test)]
 pub(crate) fn evaluate_prepared_step_capacities<S: Simd, Unit>(
     simd: S,
     cohorts: &WorkCohorts<Unit>,

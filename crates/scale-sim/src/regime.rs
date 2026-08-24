@@ -1093,9 +1093,8 @@ fn validate_historical_under_claim(run: &PrincipalRun) -> Result<(), RegimeValid
 }
 
 fn validate_historical_missing_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
-    // Down-transition dents and likely repairs make a one-step excursion the
-    // priced cost minimum. The target returns to its old bound within tens of
-    // seconds.
+    // Transition dents can make a one-step excursion the priced cost minimum.
+    // The target returns to its old bound within tens of seconds.
     let mut seasoned = controller_samples(run).filter(|sample| {
         sample.at_micros >= HISTORY_START_MICROS.saturating_add(CAPACITY_WARMUP_MICROS)
     });

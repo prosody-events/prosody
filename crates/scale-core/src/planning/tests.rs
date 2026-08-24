@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use super::{
     ActionColumns, billing_replica_seconds, complete_horizon_micros,
-    next_report_boundary_at_or_after, select_action, terminal_replica_seconds,
+    next_report_boundary_at_or_after, select_action, select_paired_action, select_paired_runner_up,
+    terminal_replica_seconds,
 };
 
 #[test]
@@ -102,24 +103,27 @@ fn feasible_action_is_never_beaten_by_an_infeasible_action(
     selection.index == 0 && !selection.used_fallback
 }
 
-#[quickcheck]
-fn empty_feasible_set_selects_the_smallest_miss_fraction(
-    first_excess: u16,
-    second_excess: u16,
-) -> bool {
-    let first = f64::from(first_excess) + 2.0_f64;
-    let second = f64::from(second_excess) + 2.0_f64;
+#[test]
+fn empty_feasible_set_uses_cost_for_selection_and_runner_up() {
     let columns = ActionColumns {
-        late_area_sums: &[0.0_f64; 2],
-        replica_seconds_sums: &[0.0_f64; 2],
-        miss_fraction_sums: &[first, second],
+        late_area_sums: &[0.0_f64; 3],
+        replica_seconds_sums: &[0.0_f64; 3],
+        miss_fraction_sums: &[0.6_f64, 0.9_f64, 0.7_f64],
         epsilon: 0.5_f64,
         rate: 1.0_f64,
     };
-    let expected = usize::from(second < first);
-    let selection = select_action(&columns);
+    let cost_differences = [10.0_f64, 0.0_f64, 5.0_f64];
+    let selection = select_paired_action(&columns, &cost_differences);
+    let runner_up = select_paired_runner_up(
+        &columns,
+        &cost_differences,
+        selection.index,
+        selection.used_fallback,
+    );
 
-    selection.index == expected && selection.used_fallback
+    assert_eq!(selection.index, 1);
+    assert!(selection.used_fallback);
+    assert_eq!(runner_up, Some(2));
 }
 
 #[test]
@@ -159,7 +163,9 @@ fn one_descent_bills_origin_until_ready_then_target(
         + f64::from(target) * Duration::from_micros(end - ready).as_secs_f64();
     let held = f64::from(origin) * Duration::from_micros(end).as_secs_f64();
 
-    (billed - expected).abs() <= f64::EPSILON * expected.abs().max(1.0_f64) && billed < held
+    // The subject subtracts the descent tail from the held area, so its
+    // rounding error scales with the held area, the largest intermediate.
+    (billed - expected).abs() <= 4.0_f64 * f64::EPSILON * held.max(1.0_f64) && billed < held
 }
 
 #[quickcheck]

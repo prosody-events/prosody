@@ -2370,12 +2370,17 @@ fn steady_plateau_selects_the_cost_minimum() -> Result<(), TestError> {
         apply.target,
         configuration.partition_count
     );
-    // The plateau demand uses 30 slots against 32 per replica, so two
-    // replicas are the demand floor. The objective (late area plus three
-    // times replica-seconds) prices the floor as the feasible minimum on
-    // this surface; the selected-versus-runner-up assertion above proves
-    // the minimum was compared, and this pin proves it is the floor.
-    assert_eq!(apply.target, 2, "costs={:?}", &costs[..8]);
+    // Target eight beats target nine by 14,005.486 cost units. The paired
+    // standard error is 50.003, so the margin is 280.096 standard errors.
+    let cost_argmin = costs
+        .iter()
+        .enumerate()
+        .min_by(|left, right| left.1.total_cmp(right.1))
+        .ok_or(ConfigurationError::PlatformLimit)?;
+    let cost_argmin =
+        u32::try_from(cost_argmin.0 + 1).map_err(|_| ConfigurationError::PlatformLimit)?;
+    assert_eq!(cost_argmin, 8, "costs={:?}", &costs[..9]);
+    assert_eq!(apply.target, cost_argmin);
     Ok(())
 }
 

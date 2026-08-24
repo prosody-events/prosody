@@ -1,18 +1,19 @@
+#[cfg(test)]
 use std::ops::Range;
 use std::time::Duration;
 
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 
 use crate::TransitionDirection;
-use crate::arrival::{ArrivalBoundaryDiagnostic, ArrivalFactor, ArrivalPrior, MeanRateTrajectory};
+use crate::arrival::{ArrivalBoundaryDiagnostic, ArrivalFactor, ArrivalPrior};
 use crate::capacity::{
     CapacityClockCheck, CapacityCurve, CapacityFactor, CompletionPredictiveSummary,
     ThroughputPosteriorCell,
 };
 use crate::edf::{
-    ArrivalPath, EdfOutcomeLanes, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
-    SupplyTrajectoryBatch, evaluate_prepared_step, evaluate_prepared_step_capacities,
-    evaluate_prepared_trajectory, evaluate_prepared_trajectory_batch, prepare,
+    ArrivalPath, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory, SupplyTrajectoryBatch,
+    evaluate_prepared_step, evaluate_prepared_trajectory, evaluate_prepared_trajectory_batch,
+    prepare,
 };
 use crate::lead_time::{
     LaunchComponentSummary, LaunchHypothesis, LaunchTimeFactor, RebalanceHypothesis,
@@ -586,8 +587,6 @@ pub struct ScaleScratch {
     scenario_max_owner_share: Vec<f64>,
     scenario_arrival_path_end_seconds: Vec<f64>,
     scenario_arrival_path_rates: Vec<f64>,
-    mean_arrival_rates: Vec<f64>,
-    mean_rate_runs: Vec<MonotoneRun>,
     scenario_event_count: Vec<f64>,
     scenario_partition_missed_work: Vec<f64>,
     scenario_partition_late_area: Vec<f64>,
@@ -637,17 +636,15 @@ pub struct DecisionColumnSummary {
 struct ScenarioWorkspace {
     edf: EdfScratch,
     unassigned_cohorts: EventCohorts,
-    prepared_placements: Vec<PreparedPlacement>,
+    partition_placement: PreparedPlacement,
     partition_share_draws: Vec<f64>,
+    partition_arrival_rates: Vec<f64>,
+    partition_replica_supply: f64,
     owner_share_sums: Vec<f64>,
     assignment: Vec<u32>,
     target_assignment: Vec<u32>,
     assignment_counts: Vec<u32>,
     moved_partitions: Vec<bool>,
-    repair_supply: Vec<f64>,
-    repair_cache_assignments: Vec<u32>,
-    repair_cache_supplies: Vec<f64>,
-    repair_cache_valid: Vec<bool>,
     commitment_pause_micros: Vec<u64>,
     commitment_ready_micros: Vec<u64>,
     rebalancing_ready_micros: u64,
@@ -687,49 +684,6 @@ impl TrajectoryEventKind {
     }
 }
 
-struct ReactiveTransition {
-    replicas: u32,
-    supply: f64,
-    ready_micros: u64,
-}
-
-#[derive(Clone, Copy)]
-struct ReactiveRepair {
-    requested_micros: u64,
-    rate: f64,
-}
-
-#[derive(Clone, Copy)]
-struct MonotoneRun {
-    start: usize,
-    end: usize,
-    direction: RunDirection,
-    min: f64,
-    max: f64,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RunDirection {
-    Increasing,
-    Decreasing,
-}
-
-#[derive(Clone, Copy)]
-enum RepairBand {
-    Covering { lower: f64, upper: f64 },
-    Fallback { maximum: f64 },
-}
-
-struct SelectedReactiveRepair {
-    requested_micros: u64,
-    target: u32,
-}
-
-struct RepairTargetSelection {
-    best_target: u32,
-    best_supply: f64,
-}
-
 struct ActiveTransition {
     replicas: u32,
     ready_micros: u64,
@@ -750,14 +704,11 @@ struct ScratchBounds {
     partition_count: usize,
     partition_offset_count: usize,
     replica_count_max: usize,
-    placement_count_max: usize,
     trajectory_event_count_max: usize,
     posterior_sample_count: usize,
     scenario_cell_count: usize,
     arrival_path_cell_count: usize,
-    successor_report_count_max: usize,
-    repair_cache_assignment_count: usize,
-    repair_cache_supply_count: usize,
+    arrival_path_segment_count_max: usize,
 }
 
 struct CandidateEvaluation<'a> {
@@ -791,8 +742,6 @@ struct ScenarioShared<'a> {
     inner_count: usize,
     planning_horizon_micros: u64,
     disturbance_horizon_micros: u64,
-    mean_trajectory: MeanRateTrajectory<'a>,
-    mean_rate_runs: &'a [MonotoneRun],
 }
 
 /// One worker's disjoint chunk of the scenario-indexed output cells.
@@ -945,16 +894,6 @@ impl ScratchBounds {
         let scenario_cell_count = posterior_sample_count
             .checked_mul(replica_count_max)
             .ok_or(ConfigurationError::PlatformLimit)?;
-        let transition_span_seconds = configuration.launch_time_prior.coverage_support_seconds().1
-            + configuration
-                .rebalance_time_prior
-                .coverage_support_seconds()
-                .1;
-        let successor_horizon_micros = configuration
-            .report_interval_micros
-            .saturating_add(seconds_to_micros(2.0_f64 * transition_span_seconds));
-        let successor_report_count_max =
-            successor_horizon_micros.div_ceil(configuration.report_interval_micros) as usize;
         // A partial split can add one retained event and one fence pair.
         // At most one commitment has a partial split. Newer commitments use
         // fence pairs. Older commitments use one retained event. Thus, R
@@ -962,16 +901,7 @@ impl ScratchBounds {
         let candidate_event_count_max = replica_count_max
             .checked_mul(2)
             .and_then(|events| events.checked_add(1))
-            .and_then(|events| events.checked_add(successor_report_count_max))
             .and_then(|events| events.checked_add(1))
-            .ok_or(ConfigurationError::PlatformLimit)?;
-        let placement_count_max = replica_count_max
-            .checked_mul(
-                replica_count_max
-                    .checked_add(1)
-                    .ok_or(ConfigurationError::PlatformLimit)?,
-            )
-            .and_then(|count| count.checked_div(2))
             .ok_or(ConfigurationError::PlatformLimit)?;
         Ok(Self {
             work_cohort_count_max,
@@ -980,7 +910,6 @@ impl ScratchBounds {
             partition_count,
             partition_offset_count,
             replica_count_max,
-            placement_count_max,
             trajectory_event_count_max: replica_count_max
                 .checked_mul(candidate_event_count_max)
                 .ok_or(ConfigurationError::PlatformLimit)?,
@@ -989,13 +918,7 @@ impl ScratchBounds {
             arrival_path_cell_count: posterior_sample_count
                 .checked_mul(configuration.arrival_prior.path_segment_count_max())
                 .ok_or(ConfigurationError::PlatformLimit)?,
-            successor_report_count_max,
-            repair_cache_assignment_count: replica_count_max
-                .checked_mul(partition_count)
-                .ok_or(ConfigurationError::PlatformLimit)?,
-            repair_cache_supply_count: replica_count_max
-                .checked_mul(replica_count_max)
-                .ok_or(ConfigurationError::PlatformLimit)?,
+            arrival_path_segment_count_max: configuration.arrival_prior.path_segment_count_max(),
         })
     }
 }
@@ -1019,27 +942,21 @@ impl TrajectoryColumns {
 
 impl ScenarioWorkspace {
     fn new(bounds: &ScratchBounds) -> Result<Self, ConfigurationError> {
-        let mut prepared_placements = Vec::with_capacity(bounds.placement_count_max);
-        for _ in 0..bounds.placement_count_max {
-            prepared_placements.push(PreparedPlacement {
-                cohorts: SlotSecondCohorts::new(bounds.work_cohort_count_max),
-                edf: EdfScratch::new(bounds.work_cohort_count_max_u32)?,
-            });
-        }
         Ok(Self {
             edf: EdfScratch::new(bounds.work_cohort_count_max_u32)?,
             unassigned_cohorts: EventCohorts::new(bounds.work_cohort_count_max),
-            prepared_placements,
+            partition_placement: PreparedPlacement {
+                cohorts: SlotSecondCohorts::new(bounds.work_cohort_count_max),
+                edf: EdfScratch::new(bounds.work_cohort_count_max_u32)?,
+            },
             partition_share_draws: vec![0.0_f64; bounds.partition_count],
+            partition_arrival_rates: vec![0.0_f64; bounds.arrival_path_segment_count_max],
+            partition_replica_supply: 0.0_f64,
             owner_share_sums: vec![0.0_f64; bounds.replica_count_max],
             assignment: vec![0; bounds.partition_count],
             target_assignment: vec![0; bounds.partition_count],
             assignment_counts: vec![0; bounds.replica_count_max],
             moved_partitions: vec![false; bounds.partition_count],
-            repair_supply: vec![0.0_f64; bounds.replica_count_max],
-            repair_cache_assignments: vec![0; bounds.repair_cache_assignment_count],
-            repair_cache_supplies: vec![0.0_f64; bounds.repair_cache_supply_count],
-            repair_cache_valid: vec![false; bounds.replica_count_max],
             commitment_pause_micros: vec![0_u64; bounds.replica_count_max],
             commitment_ready_micros: vec![0_u64; bounds.replica_count_max],
             rebalancing_ready_micros: u64::MAX,
@@ -1070,7 +987,6 @@ impl ScaleScratch {
             posterior_sample_count,
             scenario_cell_count,
             arrival_path_cell_count,
-            successor_report_count_max,
             ..
         } = &bounds;
         let current_partition_owners = vec![0; partition_count];
@@ -1106,8 +1022,6 @@ impl ScaleScratch {
             scenario_max_owner_share: vec![0.0_f64; scenario_cell_count],
             scenario_arrival_path_end_seconds: vec![0.0_f64; arrival_path_cell_count],
             scenario_arrival_path_rates: vec![0.0_f64; arrival_path_cell_count],
-            mean_arrival_rates: vec![0.0_f64; successor_report_count_max],
-            mean_rate_runs: Vec::with_capacity(successor_report_count_max),
             scenario_event_count: vec![0.0_f64; posterior_sample_count],
             scenario_partition_missed_work: vec![0.0_f64; scenario_cell_count],
             scenario_partition_late_area: vec![0.0_f64; scenario_cell_count],
@@ -1427,14 +1341,6 @@ fn evaluate_scenarios(
     let action_count = decision_action_count(scratch);
     let (planning_horizon_micros, disturbance_horizon_micros) =
         scenario_horizons(state, &scratch.resource_cohorts);
-    let mean_trajectory = state.arrivals.write_mean_rate_trajectory(
-        disturbance_horizon_micros.saturating_sub(state.model_time.as_micros()),
-        state.configuration.report_interval_micros,
-        calendar,
-        state.model_time.as_micros(),
-        &mut scratch.mean_arrival_rates,
-    );
-    write_monotone_runs(mean_trajectory.as_slice(), &mut scratch.mean_rate_runs);
     let worker_count = scratch.scenario_workspaces.len().min(scenario_total).max(1);
     let scenario_chunk = scenario_total.div_ceil(worker_count);
     let active_workers = scenario_total.div_ceil(scenario_chunk);
@@ -1477,8 +1383,6 @@ fn evaluate_scenarios(
         inner_count,
         planning_horizon_micros,
         disturbance_horizon_micros,
-        mean_trajectory,
-        mean_rate_runs: &scratch.mean_rate_runs,
     };
     evaluate_scenario_workers(
         state,
@@ -1499,12 +1403,10 @@ fn evaluate_scenario_workers(
     scenario_chunk: usize,
 ) {
     if let [workspace] = workspaces {
-        prepare_partition_placements(shared, workspace);
         for local in 0..columns.scenario_count {
             let scenario = columns.first_scenario + local;
             evaluate_one_scenario(state, shared, workspace, columns.cells(local), scenario);
         }
-        partition_deadline_outcomes(state, shared, workspace, &mut columns);
         for local in 0..columns.scenario_count {
             normalize_scenario_outcomes(state, shared, &mut columns.cells(local));
         }
@@ -1526,34 +1428,6 @@ fn evaluate_scenario_workers(
             );
         },
     );
-}
-
-fn prepare_partition_placements(shared: &ScenarioShared<'_>, workspace: &mut ScenarioWorkspace) {
-    let mut placement_index = 0_usize;
-    for candidate in 0..shared.action_count {
-        let replica_count = (candidate + 1).min(shared.partition_count);
-        for replica in 0..replica_count {
-            let placement = &mut workspace.prepared_placements[placement_index];
-            placement.cohorts.clear();
-            for partition in
-                balanced_partition_range(shared.partition_count, replica_count, replica)
-            {
-                let first = shared.partition_offsets[partition] as usize;
-                let last = shared.partition_offsets[partition + 1] as usize;
-                for &cohort_index in &shared.partition_cohort_indexes[first..last] {
-                    let cohort = cohort_index as usize;
-                    placement.cohorts.push_values(
-                        shared.resource_cohorts.release_micros(cohort),
-                        shared.resource_cohorts.deadline_micros(cohort),
-                        shared.resource_cohorts.work(cohort),
-                        shared.resource_cohorts.partition(cohort),
-                    );
-                }
-            }
-            prepare(&placement.cohorts, &mut placement.edf);
-            placement_index += 1;
-        }
-    }
 }
 
 /// Samples one scenario's draws and writes its decision cells.
@@ -1631,6 +1505,8 @@ fn prepare_scenario_supply(
         shared.normal_events,
         shared.failure_events,
     );
+    workspace.partition_replica_supply = event_supply_factor
+        * curve.sustainable_throughput(f64::from(state.configuration.slots_per_replica));
     workspace
         .assignment
         .copy_from_slice(shared.current_partition_owners);
@@ -1677,6 +1553,11 @@ fn evaluate_scenario_outcome(
         end_seconds: &cells.arrival_path_end_seconds[..forecast.path_length],
         rates: &cells.arrival_path_rates[..forecast.path_length],
     };
+    let no_partitioned_arrivals = ArrivalPath {
+        start_seconds,
+        end_seconds: &[f64::MAX],
+        rates: &[0.0_f64],
+    };
     *cells.event_count = scenario_event_count(
         shared.normal_events,
         shared.failure_events,
@@ -1701,23 +1582,23 @@ fn evaluate_scenario_outcome(
             trajectory_during_supply: &workspace.trajectory.during_supply,
             trajectory_after_supply: &workspace.trajectory.after_supply,
             horizon_micros: forecast.planning_horizon_micros,
-            arrival_path,
+            arrival_path: no_partitioned_arrivals,
         },
         &mut workspace.edf,
         &mut cells.miss_delay_fraction[..shared.action_count],
         &mut cells.drain_seconds[..shared.action_count],
         &mut cells.missed_work[..shared.action_count],
     );
-    // Every candidate uses the same billing horizon. It includes the final
-    // successor event, even when a sampled transition exceeds the plan.
-    let billing_horizon_micros = workspace
-        .trajectory
-        .billing_ready_micros
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(forecast.planning_horizon_micros)
-        .max(forecast.planning_horizon_micros);
+    partition_deadline_outcome_one(
+        state,
+        shared,
+        workspace,
+        cells.partition_missed_work,
+        cells.partition_late_area,
+        &arrival_path,
+    );
+    // Every candidate integrates its committed plant path to the same horizon.
+    let billing_horizon_micros = forecast.planning_horizon_micros;
     for candidate_index in 0..shared.action_count {
         let first = workspace.trajectory_offsets[candidate_index] as usize;
         let last = workspace.trajectory_offsets[candidate_index + 1] as usize;
@@ -1933,15 +1814,6 @@ fn numerical_decision(state: &ScaleState, scratch: &mut ScaleScratch) -> usize {
         &columns,
         &scratch.paired_cost_differences[..candidate_count],
     );
-    if selection.used_fallback {
-        let deadline = DecisionRejection::Deadline.bit();
-        for scenario in 0..scratch.active_scenario_count {
-            let first = scenario * scratch.posterior_miss_delay_fraction_sums.len();
-            for rejection in &mut scratch.scenario_rejection[first..first + candidate_count] {
-                *rejection |= deadline;
-            }
-        }
-    }
     selection.index
 }
 
@@ -2092,6 +1964,7 @@ fn evaluate_candidates_simd<S: Simd>(
         );
         for lane in 0..lane_count {
             let candidate = first_candidate + lane;
+            let _delay_area = outcomes.delay_area.as_slice()[lane];
             miss_delay_fraction[candidate] =
                 outcomes.late_area.as_slice()[lane] + outcomes.terminal_late_area.as_slice()[lane];
             drain_seconds[candidate] = outcomes.drain_seconds.as_slice()[lane];
@@ -2187,8 +2060,6 @@ struct TransitionHypotheses {
 struct HypotheticalDraws<'a> {
     random: &'a RandomStream,
     hypotheses: TransitionHypotheses,
-    curve: CapacityCurve,
-    event_supply_factor: f64,
 }
 
 #[cfg_attr(
@@ -2201,7 +2072,6 @@ fn prepare_supply_trajectories(
     workspace: &mut ScenarioWorkspace,
     draws: &ScenarioDraws,
 ) {
-    workspace.repair_cache_valid.fill(false);
     let current_supply = draws.current_supply;
     let candidate_count = shared.action_count;
     let now_micros = sample_commitment_pauses(
@@ -2241,15 +2111,13 @@ fn prepare_candidate_trajectories(
             .assignment
             .copy_from_slice(shared.current_partition_owners);
         let candidate = candidate_index as u32 + 1;
-        let (first, committed_replicas, transition_ordinal) = push_candidate_events(
+        let (first, committed_replicas) = push_candidate_events(
             state,
             workspace,
             shared.actuation_commitments,
             HypotheticalDraws {
                 random: &draws.commitment_random,
                 hypotheses: draws.transition_hypotheses,
-                curve: draws.curve,
-                event_supply_factor: draws.event_supply_factor,
             },
             candidate,
             now_micros,
@@ -2296,24 +2164,9 @@ fn prepare_candidate_trajectories(
             .truncate(active.write);
         workspace.trajectory.during_supply.truncate(active.write);
         workspace.trajectory.after_supply.truncate(active.write);
-        append_reactive_repairs(
-            state,
-            shared,
-            workspace,
-            shared.mean_trajectory,
-            ReactiveTransition {
-                replicas: active.replicas,
-                supply: active.after_supply,
-                ready_micros: active.ready_micros,
-            },
-            HypotheticalDraws {
-                random: &draws.commitment_random,
-                hypotheses: draws.transition_hypotheses,
-                curve: draws.curve,
-                event_supply_factor: draws.event_supply_factor,
-            },
-            transition_ordinal,
-        );
+        // The plan space contains one target for the full horizon. It cannot
+        // express a later target. The sampled arrival path carries each
+        // forecast into the late-area calculation.
         workspace
             .trajectory
             .ready_boundaries
@@ -2724,7 +2577,7 @@ fn push_candidate_events(
     draws: HypotheticalDraws<'_>,
     candidate: u32,
     now_micros: u64,
-) -> (usize, u32, u64) {
+) -> (usize, u32) {
     let first = workspace.trajectory.targets.len();
     let rebalancing = actuation_commitments.rebalancing();
     let rebalancing_target = rebalancing.map_or(state.current_replicas, |commitment| {
@@ -2821,490 +2674,7 @@ fn push_candidate_events(
             ready_micros,
         );
     }
-    let transition_ordinal = u64::from(sampled_initial);
-    (first, committed_replicas, transition_ordinal)
-}
-
-/// Appends the reactive corrections one certainty-equivalent successor makes.
-///
-/// Successor measurability requires each target to use only tick-time data.
-/// The mean view makes the scenario latent path unreachable from target choice.
-///
-/// Certainty equivalence omits rescue after a surprise surge. It can overprice
-/// low targets. A surprise lull can overprice high targets. Paired reports
-/// measure both bias directions.
-fn append_reactive_repairs(
-    state: &ScaleState,
-    shared: &ScenarioShared<'_>,
-    workspace: &mut ScenarioWorkspace,
-    mean_trajectory: MeanRateTrajectory<'_>,
-    mut transition: ReactiveTransition,
-    draws: HypotheticalDraws<'_>,
-    mut transition_ordinal: u64,
-) {
-    let now_micros = state.model_time.as_micros();
-    let rates = mean_trajectory.as_slice();
-    let final_repair = rates.last().copied().map(|rate| ReactiveRepair {
-        requested_micros: now_micros.saturating_add(
-            state
-                .configuration
-                .report_interval_micros
-                .saturating_mul(rates.len() as u64),
-        ),
-        rate,
-    });
-    let mut supply_is_stale = true;
-    let mut boundary = 0;
-    while boundary < rates.len() {
-        let rate = rates[boundary];
-        let requested_micros = now_micros.saturating_add(
-            state
-                .configuration
-                .report_interval_micros
-                .saturating_mul(boundary as u64 + 1),
-        );
-        let repair = ReactiveRepair {
-            requested_micros,
-            rate,
-        };
-        // One transition runs at a time: the successor acts once the
-        // active transition completes and the report shows the shortage.
-        if requested_micros < transition.ready_micros {
-            boundary = transition
-                .ready_micros
-                .saturating_sub(now_micros)
-                .div_ceil(state.configuration.report_interval_micros)
-                .saturating_sub(1) as usize;
-            boundary = boundary.max(1).min(rates.len());
-            continue;
-        }
-        if supply_is_stale {
-            prepare_assignment_repair_supply(state, shared, workspace, draws);
-        }
-        let target =
-            assignment_repair_target(&workspace.repair_supply[..shared.action_count], rate);
-        if append_reactive_repair(
-            state,
-            shared,
-            workspace,
-            &SelectedReactiveRepair {
-                requested_micros: repair.requested_micros,
-                target,
-            },
-            &mut transition,
-            draws,
-            &mut transition_ordinal,
-        ) {
-            supply_is_stale = true;
-            boundary += 1;
-        } else {
-            supply_is_stale = false;
-            let supply = &workspace.repair_supply[..shared.action_count];
-            let band = repair_band(supply, target, rate);
-            boundary = next_repair_boundary(
-                rates,
-                shared.mean_rate_runs,
-                boundary,
-                band,
-                now_micros,
-                state.configuration.report_interval_micros,
-                transition.ready_micros,
-            );
-        }
-    }
-    if let Some(mut repair) = final_repair
-        && repair.requested_micros < transition.ready_micros
-    {
-        let report_interval = state.configuration.report_interval_micros;
-        let report_count = transition
-            .ready_micros
-            .saturating_sub(now_micros)
-            .div_ceil(report_interval);
-        repair.requested_micros =
-            now_micros.saturating_add(report_count.saturating_mul(report_interval));
-        if supply_is_stale {
-            prepare_assignment_repair_supply(state, shared, workspace, draws);
-        }
-        let target =
-            assignment_repair_target(&workspace.repair_supply[..shared.action_count], repair.rate);
-        let _ = append_reactive_repair(
-            state,
-            shared,
-            workspace,
-            &SelectedReactiveRepair {
-                requested_micros: repair.requested_micros,
-                target,
-            },
-            &mut transition,
-            draws,
-            &mut transition_ordinal,
-        );
-    }
-}
-
-fn write_monotone_runs(rates: &[f64], runs: &mut Vec<MonotoneRun>) {
-    runs.clear();
-    if rates.is_empty() {
-        return;
-    }
-    debug_assert!(
-        rates.iter().all(|rate| rate.is_finite()),
-        "mean rates must be finite"
-    );
-    let mut start = 0;
-    let mut direction = None;
-    for index in 1..rates.len() {
-        let next = if rates[index] > rates[index - 1] {
-            Some(RunDirection::Increasing)
-        } else if rates[index] < rates[index - 1] {
-            Some(RunDirection::Decreasing)
-        } else {
-            None
-        };
-        let Some(next) = next else {
-            continue;
-        };
-        if let Some(current) = direction
-            && current != next
-        {
-            push_monotone_run(rates, runs, start, index - 1, current);
-            start = index - 1;
-        }
-        direction = Some(next);
-    }
-    push_monotone_run(
-        rates,
-        runs,
-        start,
-        rates.len() - 1,
-        direction.unwrap_or(RunDirection::Increasing),
-    );
-}
-
-fn push_monotone_run(
-    rates: &[f64],
-    runs: &mut Vec<MonotoneRun>,
-    start: usize,
-    end: usize,
-    direction: RunDirection,
-) {
-    let (min, max) = if rates[start] <= rates[end] {
-        (rates[start], rates[end])
-    } else {
-        (rates[end], rates[start])
-    };
-    runs.push(MonotoneRun {
-        start,
-        end,
-        direction,
-        min,
-        max,
-    });
-}
-
-fn repair_band(supply: &[f64], target: u32, rate: f64) -> RepairBand {
-    debug_assert!(rate.is_finite(), "the selected rate must be finite");
-    debug_assert!(
-        supply.iter().all(|value| value.is_finite()),
-        "repair supplies must be finite"
-    );
-    let selected = target as usize - 1;
-    if supply[selected] >= rate {
-        let lower = supply[..selected]
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
-        RepairBand::Covering {
-            lower,
-            upper: supply[selected],
-        }
-    } else {
-        RepairBand::Fallback {
-            maximum: supply.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-        }
-    }
-}
-
-fn next_repair_boundary(
-    rates: &[f64],
-    runs: &[MonotoneRun],
-    boundary: usize,
-    band: RepairBand,
-    now_micros: u64,
-    report_interval_micros: u64,
-    transition_ready_micros: u64,
-) -> usize {
-    let first = boundary + 1;
-    if first >= rates.len() {
-        return rates.len();
-    }
-    let ready_boundary = transition_ready_micros
-        .saturating_sub(now_micros)
-        .div_ceil(report_interval_micros)
-        .saturating_sub(1) as usize;
-    let cap = if ready_boundary > boundary {
-        ready_boundary.min(rates.len())
-    } else {
-        rates.len()
-    };
-    let first_run = runs.partition_point(|run| run.end < first);
-    for run in &runs[first_run..] {
-        let start = first.max(run.start);
-        let end = cap.min(run.end + 1);
-        if start >= end {
-            if cap <= run.start {
-                break;
-            }
-            continue;
-        }
-        let (segment_min, segment_max) = if start == run.start && end == run.end + 1 {
-            (run.min, run.max)
-        } else {
-            (
-                rates[start].min(rates[end - 1]),
-                rates[start].max(rates[end - 1]),
-            )
-        };
-        if band.strictly_contains(segment_min, segment_max) {
-            if end == cap {
-                return cap;
-            }
-            continue;
-        }
-        if band.is_guard_candidate(rates[start]) {
-            return start;
-        }
-        if band.is_guard_candidate(rates[end - 1]) {
-            return first_guard_candidate(rates, start, end, run.direction, band);
-        }
-        if end == cap {
-            return cap;
-        }
-    }
-    cap
-}
-
-fn first_guard_candidate(
-    rates: &[f64],
-    first: usize,
-    end: usize,
-    direction: RunDirection,
-    band: RepairBand,
-) -> usize {
-    let mut low = first + 1;
-    let mut high = end - 1;
-    while low < high {
-        let middle = low + (high - low) / 2;
-        let crossed = match direction {
-            RunDirection::Increasing => band.crosses_upper(rates[middle]),
-            RunDirection::Decreasing => band.crosses_lower(rates[middle]),
-        };
-        if crossed {
-            high = middle;
-        } else {
-            low = middle + 1;
-        }
-    }
-    low
-}
-
-impl RepairBand {
-    fn strictly_contains(self, min: f64, max: f64) -> bool {
-        match self {
-            Self::Covering { lower, upper } => min > lower && max < upper,
-            Self::Fallback { maximum } => min > maximum,
-        }
-    }
-
-    fn is_guard_candidate(self, rate: f64) -> bool {
-        self.crosses_lower(rate) || self.crosses_upper(rate)
-    }
-
-    fn crosses_lower(self, rate: f64) -> bool {
-        match self {
-            Self::Covering { lower, .. } => rate <= lower,
-            Self::Fallback { maximum } => rate <= maximum,
-        }
-    }
-
-    fn crosses_upper(self, rate: f64) -> bool {
-        match self {
-            Self::Covering { upper, .. } => rate >= upper,
-            Self::Fallback { .. } => false,
-        }
-    }
-}
-
-fn append_reactive_repair(
-    state: &ScaleState,
-    shared: &ScenarioShared<'_>,
-    workspace: &mut ScenarioWorkspace,
-    repair: &SelectedReactiveRepair,
-    transition: &mut ReactiveTransition,
-    draws: HypotheticalDraws<'_>,
-    transition_ordinal: &mut u64,
-) -> bool {
-    let target = repair.target;
-    if target == transition.replicas {
-        return false;
-    }
-    let direction = if target > transition.replicas {
-        TransitionDirection::Up
-    } else {
-        TransitionDirection::Down
-    };
-    let replica_delta = target.abs_diff(transition.replicas);
-    let (pause_micros, sampled_ready_micros) = sample_hypothetical_transition_times(
-        state,
-        draws.random,
-        repair.requested_micros,
-        *transition_ordinal,
-        draws.hypotheses,
-        direction,
-        replica_delta,
-    );
-    *transition_ordinal = transition_ordinal.saturating_add(1);
-    let (_moved, moved_share) = transition_moved_share(shared, workspace, target);
-    // The plant samples the actuator delay before it calculates partition
-    // moves. Thus, every down waits until sampled_ready_micros.
-    let repair_ready_micros = sampled_ready_micros;
-    let retained = 1.0_f64 - moved_share;
-    let max_share = assignment_max_owner_share(workspace);
-    let after = placement_supply(
-        draws.curve,
-        draws.event_supply_factor,
-        state.configuration.slots_per_replica,
-        target as usize,
-        shared.partition_count,
-        max_share,
-    );
-    workspace.trajectory.targets.push(target);
-    workspace
-        .trajectory
-        .kinds
-        .push(TrajectoryEventKind::Transition);
-    workspace
-        .trajectory
-        .requested_micros
-        .push(repair.requested_micros);
-    workspace.trajectory.pause_micros.push(pause_micros);
-    workspace
-        .trajectory
-        .sampled_ready_micros
-        .push(sampled_ready_micros);
-    workspace.trajectory.ready_micros.push(repair_ready_micros);
-    workspace
-        .trajectory
-        .billing_ready_micros
-        .push(repair_ready_micros);
-    workspace
-        .trajectory
-        .during_supply
-        .push(transition.supply * retained);
-    workspace.trajectory.after_supply.push(after);
-    transition.replicas = target;
-    transition.supply = after;
-    transition.ready_micros = repair_ready_micros;
-    true
-}
-
-/// Computes each repair supply for the current sticky assignment.
-///
-/// The supply ladder stays valid until a transition changes the assignment.
-#[cfg_attr(
-    feature = "hotpath",
-    hotpath::measure(label = "prepare_assignment_repair_supply")
-)]
-fn prepare_assignment_repair_supply(
-    state: &ScaleState,
-    shared: &ScenarioShared<'_>,
-    workspace: &mut ScenarioWorkspace,
-    draws: HypotheticalDraws<'_>,
-) {
-    let replica_count = workspace
-        .assignment
-        .iter()
-        .copied()
-        .max()
-        .map_or(0, |owner| owner as usize + 1);
-    debug_assert!(
-        replica_count > 0,
-        "the current assignment must not be empty"
-    );
-    let replica_slot = replica_count - 1;
-    let assignment_first = replica_slot * shared.partition_count;
-    let assignment_last = assignment_first + shared.partition_count;
-    let supply_first = replica_slot * shared.action_count;
-    let supply_last = supply_first + shared.action_count;
-    if workspace.repair_cache_valid[replica_slot]
-        && workspace.repair_cache_assignments[assignment_first..assignment_last]
-            == workspace.assignment
-    {
-        workspace.repair_supply[..shared.action_count]
-            .copy_from_slice(&workspace.repair_cache_supplies[supply_first..supply_last]);
-        return;
-    }
-    for candidate_index in 0..shared.action_count {
-        let target = candidate_index as u32 + 1;
-        sticky_target_assignment(shared, workspace, target);
-        let max_share = target_assignment_max_owner_share(workspace, target as usize);
-        debug_assert!(
-            max_share.is_finite() && max_share > 0.0_f64,
-            "a valid repair assignment must have one positive finite owner share"
-        );
-        workspace.repair_supply[candidate_index] = placement_supply(
-            draws.curve,
-            draws.event_supply_factor,
-            state.configuration.slots_per_replica,
-            target as usize,
-            shared.partition_count,
-            max_share,
-        );
-    }
-    workspace.repair_cache_assignments[assignment_first..assignment_last]
-        .copy_from_slice(&workspace.assignment);
-    workspace.repair_cache_supplies[supply_first..supply_last]
-        .copy_from_slice(&workspace.repair_supply[..shared.action_count]);
-    workspace.repair_cache_valid[replica_slot] = true;
-}
-
-/// Returns the smallest replica target whose supply covers one rate.
-///
-/// When no target covers the rate, this function selects maximum supply.
-///
-/// This target is the reactive-policy fixed point. The live policy uses the
-/// posterior-mean rate from its next report. The controller keeps this demand
-/// floor by design. Sampled future rates affect cost, but they do not restrict
-/// the initial action set.
-fn assignment_repair_target(supply: &[f64], rate: f64) -> u32 {
-    let mut selection = RepairTargetSelection::new();
-    for (candidate_index, &supply) in supply.iter().enumerate() {
-        let target = candidate_index as u32 + 1;
-        if let Some(target) = selection.consider(target, supply, rate) {
-            return target;
-        }
-    }
-    selection.best_target
-}
-
-impl RepairTargetSelection {
-    const fn new() -> Self {
-        Self {
-            best_target: 1,
-            best_supply: f64::NEG_INFINITY,
-        }
-    }
-
-    fn consider(&mut self, target: u32, supply: f64, rate: f64) -> Option<u32> {
-        if supply >= rate {
-            return Some(target);
-        }
-        if supply > self.best_supply {
-            self.best_target = target;
-            self.best_supply = supply;
-        }
-        None
-    }
+    (first, committed_replicas)
 }
 
 #[cfg_attr(
@@ -3614,127 +2984,146 @@ fn prepare_partition_work(scratch: &mut ScaleScratch) {
     }
 }
 
-#[cfg_attr(
-    feature = "hotpath",
-    hotpath::measure(label = "partition_deadline_outcomes")
-)]
-fn partition_deadline_outcomes(
+fn partition_deadline_outcome_one(
     state: &ScaleState,
     shared: &ScenarioShared<'_>,
     workspace: &mut ScenarioWorkspace,
-    columns: &mut ScenarioColumns<'_>,
+    partition_missed_work: &mut [f64],
+    partition_late_area: &mut [f64],
+    arrivals: &ArrivalPath<'_>,
 ) {
-    columns.partition_missed_work.fill(0.0_f64);
-    columns.partition_late_area.fill(0.0_f64);
-    dispatch!(state.simd_level, simd => partition_deadline_outcomes_simd(
-        simd,
-        state,
-        shared,
-        workspace,
-        columns,
-    ));
-}
-
-fn partition_deadline_outcomes_simd<S: Simd>(
-    simd: S,
-    state: &ScaleState,
-    shared: &ScenarioShared<'_>,
-    workspace: &mut ScenarioWorkspace,
-    columns: &mut ScenarioColumns<'_>,
-) {
-    let no_arrivals = ArrivalPath {
-        start_seconds: Duration::from_micros(state.model_time.as_micros()).as_secs_f64(),
-        end_seconds: &[f64::MAX],
-        rates: &[0.0_f64],
-    };
+    partition_missed_work.fill(0.0_f64);
+    partition_late_area.fill(0.0_f64);
     let window = EvaluationWindow {
         start_micros: state.model_time.as_micros(),
         horizon_micros: shared.planning_horizon_micros,
         initial_debt_work: 0.0_f64,
         deadline_budget_micros: state.configuration.objective.budget_micros(),
     };
-    let lane_count = S::f64s::N;
-    let mut placement_index = 0_usize;
     for candidate in 0..shared.action_count {
-        let replica_count = (candidate + 1).min(shared.partition_count);
-        for _ in 0..replica_count {
-            let placement = &mut workspace.prepared_placements[placement_index];
-            let full_lane_count = columns.scenario_count / lane_count * lane_count;
-            for local in (0..full_lane_count).step_by(lane_count) {
-                let capacities = S::f64s::from_fn(simd, |lane| {
-                    let cell = (local + lane) * columns.candidate_stride + candidate;
-                    partition_replica_capacity(
-                        columns.supply[cell],
-                        replica_count,
-                        columns.max_owner_share[cell],
-                    )
-                });
-                let outcomes = evaluate_prepared_step_capacities(
-                    simd,
-                    &placement.cohorts,
-                    capacities,
-                    window,
-                    &no_arrivals,
-                    &placement.edf,
-                );
-                accumulate_partition_outcome_lanes(
-                    columns, candidate, local, lane_count, &outcomes,
-                );
+        let owner_count = candidate + 1;
+        plant_target_assignment(
+            shared.current_partition_owners,
+            owner_count,
+            &mut workspace.target_assignment,
+            &mut workspace.assignment_counts,
+        );
+        let mut missed_work = 0.0_f64;
+        let mut late_area = 0.0_f64;
+        for owner in 0..owner_count {
+            let placement = &mut workspace.partition_placement;
+            placement.cohorts.clear();
+            let mut owner_share = 0.0_f64;
+            for (partition, &partition_owner) in workspace.target_assignment.iter().enumerate() {
+                if partition_owner as usize != owner {
+                    continue;
+                }
+                owner_share += workspace.partition_share_draws[partition];
+                let first = shared.partition_offsets[partition] as usize;
+                let last = shared.partition_offsets[partition + 1] as usize;
+                for &cohort_index in &shared.partition_cohort_indexes[first..last] {
+                    let cohort = cohort_index as usize;
+                    placement.cohorts.push_values(
+                        shared.resource_cohorts.release_micros(cohort),
+                        shared.resource_cohorts.deadline_micros(cohort),
+                        shared.resource_cohorts.work(cohort),
+                        shared.resource_cohorts.partition(cohort),
+                    );
+                }
             }
-            for local in full_lane_count..columns.scenario_count {
-                let cell = local * columns.candidate_stride + candidate;
-                let capacity = partition_replica_capacity(
-                    columns.supply[cell],
-                    replica_count,
-                    columns.max_owner_share[cell],
-                );
-                let outcome = evaluate_prepared_step(
-                    &placement.cohorts,
-                    SupplyStep {
-                        before: capacity,
-                        during: capacity,
-                        after: capacity,
-                        pause_micros: state.model_time.as_micros(),
-                        ready_micros: state.model_time.as_micros(),
-                    },
-                    window,
-                    &no_arrivals,
-                    &mut placement.edf,
-                );
-                columns.partition_missed_work[cell] += outcome.missed_work;
-                columns.partition_late_area[cell] += outcome.late_area + outcome.terminal_late_area;
+            prepare(&placement.cohorts, &mut placement.edf);
+            for (scaled, rate) in workspace
+                .partition_arrival_rates
+                .iter_mut()
+                .zip(arrivals.rates)
+            {
+                *scaled = owner_share * rate;
             }
-            placement_index += 1;
+            let owner_arrivals = ArrivalPath {
+                start_seconds: arrivals.start_seconds,
+                end_seconds: arrivals.end_seconds,
+                rates: &workspace.partition_arrival_rates[..arrivals.rates.len()],
+            };
+            let capacity = workspace.partition_replica_supply;
+            let outcome = evaluate_prepared_step(
+                &placement.cohorts,
+                SupplyStep {
+                    before: capacity,
+                    during: capacity,
+                    after: capacity,
+                    pause_micros: state.model_time.as_micros(),
+                    ready_micros: state.model_time.as_micros(),
+                },
+                window,
+                &owner_arrivals,
+                &mut placement.edf,
+            );
+            missed_work += outcome.missed_work;
+            late_area += outcome.late_area + outcome.terminal_late_area;
+        }
+        partition_missed_work[candidate] = missed_work;
+        partition_late_area[candidate] = late_area;
+    }
+}
+
+/// Applies the plant's sticky and balanced partition assignment.
+fn plant_target_assignment(
+    current: &[u32],
+    owner_count: usize,
+    target: &mut [u32],
+    counts: &mut [u32],
+) {
+    counts[..owner_count].fill(0);
+    for (partition, &owner) in current.iter().enumerate() {
+        if owner < owner_count as u32 {
+            target[partition] = owner;
+            counts[owner as usize] += 1;
+        } else {
+            target[partition] = u32::MAX;
         }
     }
-}
-
-fn accumulate_partition_outcome_lanes<S: Simd>(
-    columns: &mut ScenarioColumns<'_>,
-    candidate: usize,
-    first_local: usize,
-    lane_count: usize,
-    outcomes: &EdfOutcomeLanes<S>,
-) {
-    let EdfOutcomeLanes {
-        delay_area: _delay_area,
-        missed_work,
-        late_area,
-        terminal_late_area,
-        drain_seconds: _drain_seconds,
-    } = outcomes;
-    for lane in 0..lane_count {
-        let cell = (first_local + lane) * columns.candidate_stride + candidate;
-        columns.partition_missed_work[cell] += missed_work.as_slice()[lane];
-        columns.partition_late_area[cell] +=
-            late_area.as_slice()[lane] + terminal_late_area.as_slice()[lane];
+    let base = current.len() / owner_count;
+    let remainder = current.len() % owner_count;
+    for (owner, count) in counts.iter_mut().enumerate().take(owner_count) {
+        let desired = base + usize::from(owner < remainder);
+        let mut excess = *count as usize - desired.min(*count as usize);
+        for target_owner in target.iter_mut().rev() {
+            if excess == 0 {
+                break;
+            }
+            if *target_owner == owner as u32 {
+                *target_owner = u32::MAX;
+                *count -= 1;
+                excess -= 1;
+            }
+        }
+    }
+    let mut owner = 0_usize;
+    for target_owner in target.iter_mut().filter(|owner| **owner == u32::MAX) {
+        while counts[owner] as usize >= base + usize::from(owner < remainder) {
+            owner += 1;
+        }
+        *target_owner = owner as u32;
+        counts[owner] += 1;
     }
 }
 
-fn partition_replica_capacity(supply: f64, replica_count: usize, max_owner_share: f64) -> f64 {
-    let uniform_share =
-        u32::try_from(replica_count).map_or(0.0_f64, |count| 1.0_f64 / f64::from(count));
-    supply * max_owner_share.max(uniform_share)
+#[cfg(test)]
+fn instantaneous_owner_supply(
+    assignment: &[u32],
+    shares: &[f64],
+    demand: f64,
+    replica_supply: f64,
+    owner_sums: &mut [f64],
+) -> f64 {
+    owner_sums.fill(0.0_f64);
+    for (&owner, &share) in assignment.iter().zip(shares) {
+        owner_sums[owner as usize] += share;
+    }
+    owner_sums
+        .iter()
+        .map(|share| (share * demand).min(replica_supply))
+        .sum()
 }
 
 #[cfg(test)]
@@ -3749,6 +3138,7 @@ fn balanced_partition_owner(partitions: usize, replicas: usize, partition: usize
     }
 }
 
+#[cfg(test)]
 fn balanced_partition_range(partitions: usize, replicas: usize, replica: usize) -> Range<usize> {
     let base = partitions / replicas;
     let remainder = partitions % replicas;
