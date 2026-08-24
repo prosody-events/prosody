@@ -2248,7 +2248,7 @@ fn plateau_configuration() -> Result<Configuration, TestError> {
         posterior_sample_count: 4_096,
         report_interval_micros: 1_000_000,
         resource_window_attempt_count_max: 100_000,
-        resource_window_group_count_max: 256,
+        resource_window_group_count_max: 300,
         failure_service_weight: 0.3_f64,
         arrival_prior: ArrivalPrior::new(1.0_f64 / 3_600.0_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
