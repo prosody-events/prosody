@@ -569,7 +569,7 @@ pub struct ScaleScratch {
     partition_cohort_indexes: Vec<u32>,
     current_partition_owners: Vec<u32>,
     termination_order: Vec<u32>,
-    posterior_missed_work_sums: Vec<f64>,
+    posterior_miss_fraction_sums: Vec<f64>,
     posterior_miss_delay_fraction_sums: Vec<f64>,
     posterior_late_area_sums: Vec<f64>,
     posterior_replica_seconds_sums: Vec<f64>,
@@ -595,7 +595,6 @@ pub struct ScaleScratch {
     active_scenario_count: usize,
     active_inner_count: usize,
     decision_curve_sample_count: u32,
-    decision_event_count: f64,
     decision_epsilon: f64,
     decision_rate: f64,
 }
@@ -1071,7 +1070,7 @@ impl ScaleScratch {
             partition_cohort_indexes: vec![0; work_cohort_count_max],
             current_partition_owners,
             termination_order,
-            posterior_missed_work_sums: vec![0.0_f64; replica_count_max],
+            posterior_miss_fraction_sums: vec![0.0_f64; replica_count_max],
             posterior_miss_delay_fraction_sums: vec![0.0_f64; replica_count_max],
             posterior_late_area_sums: vec![0.0_f64; replica_count_max],
             posterior_replica_seconds_sums: vec![0.0_f64; replica_count_max],
@@ -1097,7 +1096,6 @@ impl ScaleScratch {
             active_scenario_count: posterior_sample_count,
             active_inner_count: 0,
             decision_curve_sample_count: 0,
-            decision_event_count: 0.0_f64,
             decision_epsilon: 0.0_f64,
             decision_rate: 0.0_f64,
         })
@@ -1119,8 +1117,7 @@ impl ScaleScratch {
         let columns = ActionColumns {
             late_area_sums: &self.posterior_late_area_sums[..action_count],
             replica_seconds_sums: &self.posterior_replica_seconds_sums[..action_count],
-            missed_work_sums: &self.posterior_missed_work_sums[..action_count],
-            event_count: self.decision_event_count,
+            miss_fraction_sums: &self.posterior_miss_fraction_sums[..action_count],
             epsilon: self.decision_epsilon,
             rate: self.decision_rate,
         };
@@ -1358,7 +1355,7 @@ fn select_target(
     let (normal_events, failure_events) = demand_class_totals(cohorts, backlog);
     prepare_work_cohorts(state, scratch, cohorts, backlog, scheduled_releases);
     prepare_partition_work(scratch);
-    scratch.posterior_missed_work_sums.fill(0.0_f64);
+    scratch.posterior_miss_fraction_sums.fill(0.0_f64);
     scratch.posterior_miss_delay_fraction_sums.fill(0.0_f64);
     let scenario_count = state.configuration.posterior_sample_count;
     let class_count = state.capacity_classes.len() as u32;
@@ -1696,7 +1693,7 @@ fn evaluate_scenario_outcome(
     // successor event, even when a sampled transition exceeds the plan.
     let billing_horizon_micros = workspace
         .trajectory
-        .pause_micros
+        .ready_micros
         .iter()
         .copied()
         .max()
@@ -1710,12 +1707,12 @@ fn evaluate_scenario_outcome(
             billing_horizon_micros,
             state.current_replicas,
             &workspace.trajectory.targets[first..last],
-            &workspace.trajectory.pause_micros[first..last],
+            &workspace.trajectory.requested_micros[first..last],
+            &workspace.trajectory.ready_micros[first..last],
         ) + terminal_replica_seconds(
             state.model_time.as_micros(),
             forecast.planning_horizon_micros,
             billing_horizon_micros,
-            cells.drain_seconds[candidate_index],
             state.configuration.report_interval_micros,
             workspace.trajectory.targets[first..last]
                 .last()
@@ -1803,32 +1800,35 @@ fn sample_scenario_path(
 fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
     let candidate_count = decision_action_count(scratch);
     let candidate_stride = scratch.posterior_miss_delay_fraction_sums.len();
-    scratch.posterior_missed_work_sums.fill(0.0_f64);
+    scratch.posterior_miss_fraction_sums.fill(0.0_f64);
     scratch.posterior_miss_delay_fraction_sums.fill(0.0_f64);
     scratch.posterior_late_area_sums.fill(0.0_f64);
     scratch.posterior_replica_seconds_sums.fill(0.0_f64);
     scratch.posterior_supply_sums.fill(0.0_f64);
-    scratch.decision_event_count = 0.0_f64;
     for scenario in 0..scratch.active_scenario_count {
         let inner_count = u32::try_from(scratch.active_inner_count).unwrap_or(u32::MAX);
         let cell_weight =
             scratch.class_masses[scenario / scratch.active_inner_count] / f64::from(inner_count);
-        let count = count_as_f64(scratch.active_inner_count as u64);
-        scratch.decision_event_count += scratch.class_masses[scenario / scratch.active_inner_count]
-            / count
-            * scratch.scenario_event_count[scenario];
+        let event_count = scratch.scenario_event_count[scenario];
         let first = scenario * candidate_stride;
         let vector_count = candidate_count / S::f64s::N;
         for vector in 0..vector_count {
             let target = vector * S::f64s::N;
             let last = target + S::f64s::N;
             let cell = first + target;
-            let missed =
-                S::f64s::from_slice(simd, &scratch.posterior_missed_work_sums[target..last])
+            let miss_fraction =
+                S::f64s::from_slice(simd, &scratch.posterior_miss_fraction_sums[target..last])
                     + S::f64s::from_slice(
                         simd,
                         &scratch.scenario_missed_work[cell..cell + S::f64s::N],
-                    ) * S::f64s::splat(simd, cell_weight);
+                    ) * S::f64s::splat(
+                        simd,
+                        if event_count > 0.0_f64 {
+                            cell_weight / event_count
+                        } else {
+                            0.0_f64
+                        },
+                    );
             let miss_delay_fraction = S::f64s::from_slice(
                 simd,
                 &scratch.posterior_miss_delay_fraction_sums[target..last],
@@ -1851,7 +1851,7 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
             let supply = S::f64s::from_slice(simd, &scratch.posterior_supply_sums[target..last])
                 + S::f64s::from_slice(simd, &scratch.scenario_supply[cell..cell + S::f64s::N])
                     * S::f64s::splat(simd, cell_weight);
-            missed.store_slice(&mut scratch.posterior_missed_work_sums[target..last]);
+            miss_fraction.store_slice(&mut scratch.posterior_miss_fraction_sums[target..last]);
             miss_delay_fraction
                 .store_slice(&mut scratch.posterior_miss_delay_fraction_sums[target..last]);
             late_area.store_slice(&mut scratch.posterior_late_area_sums[target..last]);
@@ -1860,8 +1860,11 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
         }
         for target in vector_count * S::f64s::N..candidate_count {
             let cell = first + target;
-            scratch.posterior_missed_work_sums[target] +=
-                cell_weight * scratch.scenario_missed_work[cell];
+            scratch.posterior_miss_fraction_sums[target] += if event_count > 0.0_f64 {
+                cell_weight * scratch.scenario_missed_work[cell] / event_count
+            } else {
+                0.0_f64
+            };
             scratch.posterior_miss_delay_fraction_sums[target] +=
                 cell_weight * scratch.scenario_miss_delay_fraction[cell];
             scratch.posterior_late_area_sums[target] +=
@@ -1899,8 +1902,7 @@ fn numerical_decision(state: &ScaleState, scratch: &mut ScaleScratch) -> usize {
     let columns = ActionColumns {
         late_area_sums: &scratch.posterior_late_area_sums[..candidate_count],
         replica_seconds_sums: &scratch.posterior_replica_seconds_sums[..candidate_count],
-        missed_work_sums: &scratch.posterior_missed_work_sums[..candidate_count],
-        event_count: scratch.decision_event_count,
+        miss_fraction_sums: &scratch.posterior_miss_fraction_sums[..candidate_count],
         epsilon: state.configuration.objective.epsilon(),
         rate,
     };
@@ -1934,6 +1936,7 @@ fn scheduled_event_count(cohorts: &EventCohorts, horizon_micros: u64) -> f64 {
         .sum()
 }
 
+/// Returns one scenario's nonnegative event count.
 fn scenario_event_count(
     normal_events: f64,
     failure_events: f64,
@@ -1977,10 +1980,10 @@ fn normalize_scenario_outcomes(
         let missed_work = cells.missed_work[candidate] + cells.partition_missed_work[candidate];
         cells.missed_work[candidate] = missed_work;
         let mut rejection = 0_u8;
-        let miss_fraction = if *cells.event_count == 0.0_f64 {
-            0.0_f64
-        } else {
+        let miss_fraction = if *cells.event_count > 0.0_f64 {
             missed_work / *cells.event_count
+        } else {
+            0.0_f64
         };
         // This SLO constraint is epsilon's only consumer.
         if miss_fraction > state.configuration.objective.epsilon() {
@@ -2611,7 +2614,6 @@ fn push_candidate_events(
             draws.random,
             now_micros,
             draws.hypotheses,
-            0,
             direction,
             replica_delta,
         );
@@ -2653,7 +2655,6 @@ fn append_reactive_repairs(
         ),
         rate,
     });
-    let mut next_slot = 1_u64;
     let mut supply_is_stale = true;
     let mut boundary = 0;
     while boundary < rates.len() {
@@ -2694,9 +2695,7 @@ fn append_reactive_repairs(
             },
             &mut transition,
             draws,
-            next_slot,
         ) {
-            next_slot += 1;
             supply_is_stale = true;
             boundary += 1;
         } else {
@@ -2739,7 +2738,6 @@ fn append_reactive_repairs(
             },
             &mut transition,
             draws,
-            next_slot,
         );
     }
 }
@@ -2944,7 +2942,6 @@ fn append_reactive_repair(
     repair: &SelectedReactiveRepair,
     transition: &mut ReactiveTransition,
     draws: HypotheticalDraws<'_>,
-    slot: u64,
 ) -> bool {
     let target = repair.target;
     if target == transition.replicas {
@@ -2961,7 +2958,6 @@ fn append_reactive_repair(
         draws.random,
         repair.requested_micros,
         draws.hypotheses,
-        slot,
         direction,
         replica_delta,
     );
@@ -3195,11 +3191,12 @@ fn sample_transition_times(
     )
 }
 
-/// Samples the world and slot residuals for hypothetical transitions.
+/// Samples the world and physical-transition residuals for hypothetical
+/// transitions.
 ///
 /// The Commitment stream owns this layout. Domain 0 is launch. Domain 1 is
-/// rebalance. Counter 0 in each domain selects the world hypothesis. A nested
-/// slot domain uses counter 0 for mode and counter 1 for the log-normal value.
+/// rebalance. Counter 0 in each domain selects the world hypothesis. The nested
+/// domains identify the request boundary, direction, and replica delta.
 fn sample_transition_hypotheses(state: &ScaleState, random: &RandomStream) -> TransitionHypotheses {
     let mut launch_random = random.clone().domain(0);
     let launch = state
@@ -3217,11 +3214,20 @@ fn sample_hypothetical_transition_times(
     random: &RandomStream,
     requested_at_micros: u64,
     hypotheses: TransitionHypotheses,
-    slot: u64,
     direction: TransitionDirection,
     replica_delta: u32,
 ) -> (u64, u64) {
-    let mut launch_random = random.clone().domain(0).domain(slot);
+    let requested_boundary = requested_at_micros / state.configuration.report_interval_micros;
+    let direction_domain = match direction {
+        TransitionDirection::Up => 0,
+        TransitionDirection::Down => 1,
+    };
+    let mut launch_random = random
+        .clone()
+        .domain(0)
+        .domain(requested_boundary)
+        .domain(direction_domain)
+        .domain(u64::from(replica_delta));
     let launch_seconds = state.lead_time.sample_hypothesis_seconds(
         hypotheses.launch,
         direction,
@@ -3229,7 +3235,12 @@ fn sample_hypothetical_transition_times(
         &mut launch_random,
     );
     let pause_micros = requested_at_micros.saturating_add(seconds_to_micros(launch_seconds));
-    let mut rebalance_random = random.clone().domain(1).domain(slot);
+    let mut rebalance_random = random
+        .clone()
+        .domain(1)
+        .domain(requested_boundary)
+        .domain(direction_domain)
+        .domain(u64::from(replica_delta));
     let rebalance_seconds = state
         .rebalance_time
         .sample_hypothesis_seconds(hypotheses.rebalance, &mut rebalance_random);

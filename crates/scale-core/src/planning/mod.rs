@@ -21,8 +21,7 @@ pub(crate) fn complete_horizon_micros(
 pub(crate) struct ActionColumns<'a> {
     pub(crate) late_area_sums: &'a [f64],
     pub(crate) replica_seconds_sums: &'a [f64],
-    pub(crate) missed_work_sums: &'a [f64],
-    pub(crate) event_count: f64,
+    pub(crate) miss_fraction_sums: &'a [f64],
     pub(crate) epsilon: f64,
     pub(crate) rate: f64,
 }
@@ -32,12 +31,13 @@ impl ActionColumns<'_> {
         self.late_area_sums[index] + self.rate * self.replica_seconds_sums[index]
     }
 
+    /// Returns the posterior mean of the per-period miss fraction.
+    ///
+    /// A scenario's probability discounts its contribution. An empty period
+    /// contributes zero. Each nonempty scenario uses its ratio of expected
+    /// missed work to expected events.
     pub(crate) fn miss_fraction(&self, index: usize) -> f64 {
-        if self.event_count == 0.0_f64 {
-            0.0_f64
-        } else {
-            self.missed_work_sums[index] / self.event_count
-        }
+        self.miss_fraction_sums[index]
     }
 
     fn is_feasible(&self, index: usize) -> bool {
@@ -116,37 +116,45 @@ pub(crate) fn select_paired_runner_up(
 
 /// Integrates billed replica count over one virtual-time interval.
 ///
-/// The target and pod-lifetime columns have equal lengths. Pod-lifetime times
-/// are monotonic. A target changes the billed resource at its paired time.
+/// Joining replicas bill from their request time. Leaving replicas bill until
+/// their transition is ready. Each target is the reached state. This rule
+/// also applies when transition lifetimes overlap.
 pub(crate) fn billing_replica_seconds(
     start_micros: u64,
     end_micros: u64,
     initial_replicas: u32,
     targets: &[u32],
-    pod_lifetime_micros: &[u64],
+    requested_micros: &[u64],
+    ready_micros: &[u64],
 ) -> f64 {
     assert_eq!(
         targets.len(),
-        pod_lifetime_micros.len(),
-        "each target must pair with one pod-lifetime time"
+        requested_micros.len(),
+        "each target must pair with one request time"
+    );
+    assert_eq!(
+        targets.len(),
+        ready_micros.len(),
+        "each target must pair with one ready time"
     );
     assert!(
         end_micros >= start_micros,
         "the integration interval must not be inverted"
     );
-    let mut cursor = start_micros;
-    let mut replicas = initial_replicas;
-    let mut area = 0.0_f64;
-    for (&target, &pod_lifetime) in targets.iter().zip(pod_lifetime_micros) {
-        let boundary = pod_lifetime.clamp(cursor, end_micros);
-        area += f64::from(replicas) * Duration::from_micros(boundary - cursor).as_secs_f64();
-        cursor = boundary;
-        if pod_lifetime >= end_micros {
-            return area;
-        }
-        replicas = target;
+    let interval = Duration::from_micros(end_micros - start_micros).as_secs_f64();
+    let mut area = f64::from(initial_replicas) * interval;
+    let mut origin = initial_replicas;
+    for ((&target, &requested), &ready) in targets.iter().zip(requested_micros).zip(ready_micros) {
+        let (boundary, delta, sign) = if target >= origin {
+            (requested, target - origin, 1.0_f64)
+        } else {
+            (ready, origin - target, -1.0_f64)
+        };
+        let lifetime = end_micros.saturating_sub(boundary.max(start_micros));
+        area += sign * f64::from(delta) * Duration::from_micros(lifetime).as_secs_f64();
+        origin = target;
     }
-    area + f64::from(replicas) * Duration::from_micros(end_micros - cursor).as_secs_f64()
+    area
 }
 
 /// Returns the first report boundary at or after the specified time.
@@ -167,28 +175,30 @@ pub(crate) fn next_report_boundary_at_or_after(
             * report_interval_seconds
 }
 
-/// Prices terminal pod lifetime after the common billing horizon.
+/// Prices the reached replica state after the common billing horizon.
 ///
-/// The planning horizon caps an infinite drain. The smaller action index still
-/// resolves an exact finite-cost tie.
+/// The first successor report boundary caps the shared terminal budget. The
+/// smaller action index still resolves an exact finite-cost tie.
 pub(crate) fn terminal_replica_seconds(
     model_time_micros: u64,
     planning_horizon_micros: u64,
     billing_horizon_micros: u64,
-    drain_seconds: f64,
     report_interval_micros: u64,
     replicas: u32,
 ) -> f64 {
-    if drain_seconds == 0.0_f64 {
-        return drain_seconds;
-    }
     let planning_horizon_seconds = Duration::from_micros(planning_horizon_micros).as_secs_f64();
     let billing_horizon_seconds = Duration::from_micros(billing_horizon_micros).as_secs_f64();
     let report_seconds = Duration::from_micros(report_interval_micros).as_secs_f64();
     let report_epoch_seconds =
         Duration::from_micros(model_time_micros).as_secs_f64() + report_seconds;
-    let drain_at = planning_horizon_seconds + drain_seconds.min(planning_horizon_seconds);
-    let boundary = next_report_boundary_at_or_after(report_epoch_seconds, report_seconds, drain_at);
+    let mut boundary = next_report_boundary_at_or_after(
+        report_epoch_seconds,
+        report_seconds,
+        billing_horizon_seconds.max(planning_horizon_seconds),
+    );
+    if boundary <= billing_horizon_seconds {
+        boundary += report_seconds;
+    }
     f64::from(replicas) * (boundary - billing_horizon_seconds).max(0.0_f64)
 }
 
