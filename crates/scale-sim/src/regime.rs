@@ -9,7 +9,7 @@ use chrono::{Local, TimeDelta};
 use prosody_scale_core::{
     CalendarArtifactId, CalendarRateSegment, CapacityGrid, CapacityPrior, Configuration,
     DecisionRejection, LaunchPrior, RandomStream, RebalancePrior, ReliabilityPrior,
-    ScheduledRelease, ServiceObjective,
+    ScheduledRelease, ServiceObjective, authored_calendar_rate_prior,
 };
 
 use crate::harness::TickDrivenAttemptModel;
@@ -58,8 +58,6 @@ const CALENDAR_HISTORY_EXPOSURE_SECONDS: u32 = 900;
 const IDLE_COST_START_MICROS: u64 = 91_000_000;
 const IDLE_DURATION_MICROS: u64 = 240_000_000;
 const SHORT_BURST_RELEASE_MICROS: u64 = 120_000_000;
-const CALENDAR_PRIOR_SHAPE: f64 = 0.123_f64;
-const CALENDAR_PRIOR_RATE_SECONDS: f64 = 0.001_947_5_f64;
 const CALENDAR_MODEL_PRIOR_PROBABILITY: f64 = 0.5_f64;
 const HISTORY_START_MICROS: u64 = 300_000_000;
 const HISTORY_END_MICROS: u64 = 420_000_000;
@@ -3147,12 +3145,15 @@ impl HistoricalSeries {
             });
         }
         let exposure_scale = f64::from(CALENDAR_HISTORY_EXPOSURE_SECONDS) / span_seconds;
+        // The calendar model accepts one Gamma per segment. Preserve the
+        // current arrival mixture's population mean and variance in that Gamma.
+        let prior = authored_calendar_rate_prior();
         let mut segments = [CalendarRateSegment::new(
             0,
             first.start_micros,
             first.end_micros,
-            CALENDAR_PRIOR_SHAPE,
-            CALENDAR_PRIOR_RATE_SECONDS,
+            prior.shape(),
+            prior.rate_seconds(),
         )?; 8];
         for (position, source) in self.segments.iter().enumerate() {
             let exposure_seconds =
@@ -3164,8 +3165,8 @@ impl HistoricalSeries {
                 position as u32,
                 source.start_micros,
                 source.end_micros,
-                CALENDAR_PRIOR_SHAPE + historical_count,
-                CALENDAR_PRIOR_RATE_SECONDS + exposure_seconds,
+                prior.shape() + historical_count,
+                prior.rate_seconds() + exposure_seconds,
             )?;
         }
         Ok(Some(CalendarForecastInput::new(

@@ -1,17 +1,17 @@
 use super::{
-    ArrivalSchedule, ArrivalSeries, CALENDAR_PRIOR_RATE_SECONDS, CALENDAR_PRIOR_SHAPE,
-    HISTORICAL_SCHEDULE, HISTORY_EVENT_COUNT_MAX, HistoricalSeries, IndexSeries,
-    PrincipalDefinition, PrincipalRegime, RunSchedule, RunStopReason, SEASONAL_SCHEDULE,
-    SharedResourcePolicy, StopCondition, binomial_coverage_lower_tail, capacity_regime_axes,
-    format_clock, is_capacity_regime, live_launch_count_max, principal_capacity_grid_axes,
-    replica_count_max, resource_attempt_count_max, run_principal_definition,
-    run_principal_regime_seeded, service_axis,
+    ArrivalSchedule, ArrivalSeries, HISTORICAL_SCHEDULE, HISTORY_EVENT_COUNT_MAX, HistoricalSeries,
+    IndexSeries, PrincipalDefinition, PrincipalRegime, RunSchedule, RunStopReason,
+    SEASONAL_SCHEDULE, SharedResourcePolicy, StopCondition, binomial_coverage_lower_tail,
+    capacity_regime_axes, format_clock, is_capacity_regime, live_launch_count_max,
+    principal_capacity_grid_axes, replica_count_max, resource_attempt_count_max,
+    run_principal_definition, run_principal_regime_seeded, service_axis,
 };
 use crate::model::{AttemptFrame, AttemptModel};
 use crate::{
     ConcurrencyLatencyCurve, EventOutcome, EventSource, EventSpec, FinalOutcome, Plant,
     PlantConfiguration, PlantError, PrincipalRunError, SeriesCell,
 };
+use prosody_scale_core::authored_calendar_rate_prior;
 use quickcheck_macros::quickcheck;
 use statrs::distribution::{Binomial, BinomialError, DiscreteCDF};
 use std::time::Duration;
@@ -215,6 +215,7 @@ fn calendar_forecast_round_trips_the_historical_schedule(seasonal: bool) -> bool
     } else {
         HISTORICAL_SCHEDULE
     };
+    let prior = authored_calendar_rate_prior();
     let Ok(Some(forecast)) = history.forecast() else {
         return false;
     };
@@ -233,15 +234,14 @@ fn calendar_forecast_round_trips_the_historical_schedule(seasonal: bool) -> bool
         .enumerate()
         .all(|(position, (actual, expected))| {
             let posterior_mean = actual.shape() / actual.rate_seconds();
-            let tolerance = (CALENDAR_PRIOR_SHAPE
-                - f64::from(expected.rate_per_second) * CALENDAR_PRIOR_RATE_SECONDS)
-                .abs()
+            let expected_rate = f64::from(expected.rate_per_second);
+            let tolerance = (prior.shape() - expected_rate * prior.rate_seconds()).abs()
                 / actual.rate_seconds()
-                + f64::EPSILON;
+                + f64::EPSILON * expected_rate.abs();
             actual.position() == position as u32
                 && actual.start_micros() == expected.start_micros
                 && actual.end_micros() == expected.end_micros
-                && (posterior_mean - f64::from(expected.rate_per_second)).abs() <= tolerance
+                && (posterior_mean - expected_rate).abs() <= tolerance
         })
         && segments
             .windows(2)

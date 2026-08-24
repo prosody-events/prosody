@@ -71,6 +71,27 @@ struct ResetComponent {
     rate_seconds: f64,
 }
 
+/// One Gamma approximation to the authored population rate mixture.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CalendarRatePrior {
+    shape: f64,
+    rate_seconds: f64,
+}
+
+impl CalendarRatePrior {
+    /// Returns the Gamma shape.
+    #[must_use]
+    pub const fn shape(self) -> f64 {
+        self.shape
+    }
+
+    /// Returns the Gamma rate in seconds.
+    #[must_use]
+    pub const fn rate_seconds(self) -> f64 {
+        self.rate_seconds
+    }
+}
+
 impl ResetComponent {
     const fn new(weight: f64, shape: f64, rate_seconds: f64) -> Self {
         Self {
@@ -82,6 +103,31 @@ impl ResetComponent {
 
     const fn mean(self) -> f64 {
         self.shape / self.rate_seconds
+    }
+}
+
+/// Returns the moment-matched Gamma prior for calendar rate segments.
+///
+/// Calendar segments require one Gamma distribution. The arrival artifact is
+/// a Gamma mixture. This function preserves its population mean and variance.
+#[must_use]
+pub fn authored_calendar_rate_prior() -> CalendarRatePrior {
+    let mean = RESET_COMPONENTS
+        .iter()
+        .map(|component| component.weight * component.mean())
+        .sum::<f64>();
+    let second_moment = RESET_COMPONENTS
+        .iter()
+        .map(|component| {
+            let component_mean = component.mean();
+            component.weight
+                * (component.shape / component.rate_seconds.powi(2) + component_mean.powi(2))
+        })
+        .sum::<f64>();
+    let variance = second_moment - mean.powi(2);
+    CalendarRatePrior {
+        shape: mean.powi(2) / variance,
+        rate_seconds: mean / variance,
     }
 }
 

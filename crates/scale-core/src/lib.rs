@@ -23,7 +23,7 @@ mod types;
 
 pub use arrival::{
     ArrivalBoundaryDiagnostic, ArrivalCountPredictive, ArrivalEvidence, ArrivalPredictiveError,
-    ArrivalPrior, ArrivalPriorError,
+    ArrivalPrior, ArrivalPriorError, CalendarRatePrior, authored_calendar_rate_prior,
 };
 pub use assignment::{AssignmentError, sticky_assignment};
 pub use capacity::{
