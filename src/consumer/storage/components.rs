@@ -103,7 +103,7 @@ where
 {
     dedup_ttl_seconds(inputs.dedup_ttl)?;
     let dedup = MemoryDeduplicationStoreProvider::new();
-    let publisher = keyed_state.memory_publication_setup(publications).await?;
+    let publisher = keyed_state.memory_publication_setup(publications)?;
     let state = memory_state_provider::<C>(
         keyed_state,
         dedup.clone(),
@@ -182,9 +182,7 @@ where
         ttl,
         inputs.dedup_cache_capacity,
     );
-    let publisher = keyed_state
-        .cassandra_publication_setup(publications, observer)
-        .await?;
+    let publisher = keyed_state.cassandra_publication_setup(publications, observer);
     let state = cassandra_state_provider::<C>(
         keyed_state,
         dedup.clone(),

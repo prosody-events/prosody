@@ -77,11 +77,9 @@ where
 
 /// Acquires the partition's keyed-state manager, retrying on failure until
 /// the shutdown signal is received — the same pattern as
-/// [`init_timer_manager`]. Acquisition is eager: descriptor identities are
-/// validated against the segment's durable rows before any event
-/// dispatches. `trigger_store` is the partition's own store handle, cloned
-/// into each attempt so the commit oracle reads timer tags through the
-/// exact instance the timer manager writes through.
+/// [`init_timer_manager`]. Acquisition publishes routing for the owner. It
+/// then validates descriptor identities before event dispatch. `trigger_store`
+/// is the partition's own store handle. Each attempt clones this handle.
 ///
 /// Returns `None` if shutdown is signaled before acquisition succeeds.
 async fn init_state_manager<SP, S>(

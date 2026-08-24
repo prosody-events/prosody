@@ -77,7 +77,6 @@ impl Fixture {
             recovery_delay: CompactDuration::new(30),
             armed: Arc::default(),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-            publisher: None,
         })
     }
 

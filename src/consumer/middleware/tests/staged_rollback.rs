@@ -105,7 +105,6 @@ async fn permanent_finalize_skip_commits_unmarked_with_backstop_armed() -> Resul
             recovery_delay: CompactDuration::new(30),
             armed: Arc::default(),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-            publisher: None,
         });
     let context = MockEventContext::new()
         .with_session(session)
@@ -266,7 +265,6 @@ async fn permanent_skip_hook_reads_through_the_stamp() -> Result<()> {
             recovery_delay: CompactDuration::new(30),
             armed: Arc::default(),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-            publisher: None,
         });
 
     // A nested retry's epoch bump: `reset` discards the (empty) dirty and
