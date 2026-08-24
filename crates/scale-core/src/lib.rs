@@ -46,10 +46,11 @@ pub use reliability::ReliabilityPrior;
 pub use types::{
     ActuationCommitment, ApplyDecision, AttemptOutcomeCounts, AttemptOutcomeEvidence,
     BacklogCohort, CalendarArtifactId, CalendarRateSegment, Cohort, Configuration,
-    ConfigurationError, DecisionDiagnostics, DemandClass, GroupObservation, HoldDecision,
-    HoldReason, ModelTime, ObservationBuffer, ObservationError, OccupancyTraceEvidence,
-    OccupancyTransition, PosteriorQuery, PriorArtifact, PriorArtifactBudget, PriorArtifactIdentity,
-    PriorCoverageRecord, ScaleDecision, ScheduledRelease, ServiceObjective,
+    ConfigurationError, DecisionDiagnostics, DemandClass, DispatchCapacity, GroupObservation,
+    HoldDecision, HoldReason, ModelTime, ObservationBuffer, ObservationError,
+    OccupancyTraceEvidence, OccupancyTransition, PosteriorQuery, PriorArtifact,
+    PriorArtifactBudget, PriorArtifactIdentity, PriorCoverageRecord, ScaleDecision,
+    ScheduledRelease, ServiceObjective,
 };
 
 #[cfg(test)]

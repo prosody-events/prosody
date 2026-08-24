@@ -425,6 +425,7 @@ pub struct TickHistory {
     backlog: Vec<u32>,
     active_handlers: Vec<u32>,
     available_attempts: Vec<u32>,
+    dispatchable_demand_ceiling: Vec<u32>,
     handler_occupancy_micros: Vec<u64>,
     attempt_transition_count: Vec<usize>,
     useful_completions: Vec<u32>,
@@ -491,6 +492,7 @@ impl TickHistory {
             backlog: vec![0; capacity],
             active_handlers: vec![0; capacity],
             available_attempts: vec![0; capacity],
+            dispatchable_demand_ceiling: vec![0; capacity],
             handler_occupancy_micros: vec![0; capacity],
             attempt_transition_count: vec![0; capacity],
             useful_completions: vec![0; capacity],
@@ -540,6 +542,7 @@ impl TickHistory {
         self.backlog[index] = plant.backlog;
         self.active_handlers[index] = plant.active_handlers;
         self.available_attempts[index] = plant.available_attempts;
+        self.dispatchable_demand_ceiling[index] = plant.dispatchable_demand_ceiling;
         self.handler_occupancy_micros[index] = plant.handler_occupancy_micros;
         self.attempt_transition_count[index] = plant.attempt_transition_count;
         self.useful_completions[index] = plant.useful_completions;
@@ -659,6 +662,13 @@ impl<'a> TickHistoryView<'a> {
     pub fn available_attempts(self, steps_back: usize) -> Option<u32> {
         self.index(steps_back)
             .map(|index| self.history.available_attempts[index])
+    }
+
+    /// Returns the structural dispatch ceiling for one newest-first offset.
+    #[must_use]
+    pub fn dispatchable_demand_ceiling(self, steps_back: usize) -> Option<u32> {
+        self.index(steps_back)
+            .map(|index| self.history.dispatchable_demand_ceiling[index])
     }
 
     /// Returns cumulative handler occupancy for one newest-first offset.

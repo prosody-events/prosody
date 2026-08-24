@@ -5,10 +5,11 @@ use std::time::Duration;
 use prosody_scale_core::{
     ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort,
     CapacityClockCheck, CapacityGrid, Cohort, Configuration, ConfigurationError,
-    DecisionDiagnostics, DecisionRejection, DemandClass, HoldReason, LaunchComponentSummary,
-    ModelTime, ObservationBuffer, OccupancyTraceEvidence, OccupancyTransition, PosteriorQuery,
-    RandomStream, ReadinessGroupId, ReadinessLump, ReadinessObservation, RebalanceEvidence,
-    ResourceWindow, ScaleDecision, ScaleScratch, ScaleState, TransitionDirection, step,
+    DecisionDiagnostics, DecisionRejection, DemandClass, DispatchCapacity, HoldReason,
+    LaunchComponentSummary, ModelTime, ObservationBuffer, OccupancyTraceEvidence,
+    OccupancyTransition, PosteriorQuery, RandomStream, ReadinessGroupId, ReadinessLump,
+    ReadinessObservation, RebalanceEvidence, ResourceWindow, ScaleDecision, ScaleScratch,
+    ScaleState, TransitionDirection, step,
 };
 #[cfg(test)]
 use statrs::distribution::{DiscreteCDF, Poisson};
@@ -2164,6 +2165,10 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         };
         let initial_available_attempts = context.history.available_attempts(0).unwrap_or(0);
         let slot_count = context.history.physical_slots(0).unwrap_or(0);
+        let dispatchable_demand_ceiling = context
+            .history
+            .dispatchable_demand_ceiling(0)
+            .unwrap_or(slot_count);
         let Some(previous_count) = context.history.attempt_transition_count(0) else {
             return Ok(());
         };
@@ -2224,7 +2229,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         self.observation.set_resource_observation_with_demand(
             current.evidence()?,
             initial_busy_slots,
-            slot_count,
+            DispatchCapacity::new(slot_count, dispatchable_demand_ceiling)?,
             initial_available_attempts,
             final_busy_slots,
             &self.capacity_transition_scratch,

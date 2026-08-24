@@ -605,6 +605,8 @@ pub struct PlantSnapshot {
     pub active_handlers: u32,
     /// Attempts that can start when a slot becomes free.
     pub available_attempts: u32,
+    /// Maximum attempts that the current key queues can dispatch together.
+    pub dispatchable_demand_ceiling: u32,
     /// Cumulative handler occupancy in handler-microseconds.
     pub handler_occupancy_micros: u64,
     /// Cumulative successful final completions.
@@ -769,6 +771,8 @@ pub struct Plant<M = SeriesAttemptModel> {
     key_head: Vec<u32>,
     key_tail: Vec<u32>,
     key_active: Vec<bool>,
+    outstanding_demand_by_key: Vec<u32>,
+    outstanding_demand_key_count: u32,
     owner_at_dispatch: Vec<u32>,
     partition_owner: Vec<u32>,
     partition_target_owner: Vec<u32>,
@@ -886,6 +890,8 @@ impl<M: AttemptModel> Plant<M> {
             key_head: vec![NO_EVENT; key_count],
             key_tail: vec![NO_EVENT; key_count],
             key_active: vec![false; key_count],
+            outstanding_demand_by_key: vec![0; key_count],
+            outstanding_demand_key_count: 0,
             owner_at_dispatch: vec![0; event_count_max],
             partition_owner: initial_assignment(partition_count, initial_replicas),
             partition_target_owner: vec![0; partition_count],
@@ -954,6 +960,11 @@ impl<M: AttemptModel> Plant<M> {
         }
         let event_index = self.events.len() as u32;
         self.events.push(event);
+        let demand = &mut self.outstanding_demand_by_key[event.key as usize];
+        self.outstanding_demand_key_count = self
+            .outstanding_demand_key_count
+            .saturating_add(u32::from(*demand == 0));
+        *demand = demand.saturating_add(1);
         if self.started {
             heap_push(
                 &mut self.heap,
@@ -1690,6 +1701,11 @@ impl<M: AttemptModel> Plant<M> {
         self.settled_by_event[event_index] = true;
         self.settled_events = self.settled_events.saturating_add(1);
         self.key_active[key] = false;
+        let demand = &mut self.outstanding_demand_by_key[key];
+        *demand = demand.saturating_sub(1);
+        self.outstanding_demand_key_count = self
+            .outstanding_demand_key_count
+            .saturating_sub(u32::from(*demand == 0));
         self.remove_head(key);
     }
 
@@ -1949,15 +1965,25 @@ impl<M: AttemptModel> Plant<M> {
                 .count(),
         )
         .unwrap_or(u32::MAX);
+        let physical_slots = self.physical_slot_count();
+        let outstanding_demand_count =
+            (self.events.len() as u32).saturating_sub(self.settled_events);
+        let dispatchable_demand_ceiling =
+            if outstanding_demand_count > self.outstanding_demand_key_count {
+                self.outstanding_demand_key_count.min(physical_slots)
+            } else {
+                physical_slots
+            };
         PlantSnapshot {
             at_micros,
             replicas: self.replicas,
-            physical_slots: self.physical_slot_count(),
+            physical_slots,
             released: self.released_events,
             settled: self.settled_events,
             backlog: self.released_events.saturating_sub(self.settled_events),
             active_handlers: self.active_handlers,
             available_attempts,
+            dispatchable_demand_ceiling,
             handler_occupancy_micros: self.handler_occupancy_micros,
             useful_completions: self.useful_completions,
             completed_attempts: self.completed_attempts,

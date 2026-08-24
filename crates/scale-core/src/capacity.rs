@@ -841,7 +841,9 @@ impl CapacityFactor {
                 evidence,
                 &self.grid,
                 cell,
-                evidence.slot_count(),
+                evidence
+                    .slot_count()
+                    .min(evidence.dispatchable_demand_ceiling()),
                 &mut random,
             );
             let bucket = match usize::try_from(completed) {

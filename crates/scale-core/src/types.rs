@@ -1371,6 +1371,37 @@ impl OccupancyTransition {
     }
 }
 
+/// Physical and structural dispatch limits for one resource report.
+#[derive(Clone, Copy, Debug)]
+pub struct DispatchCapacity {
+    slot_count: u32,
+    demand_ceiling: u32,
+}
+
+impl DispatchCapacity {
+    /// Constructs valid physical and structural dispatch limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the demand ceiling exceeds the slot count.
+    pub fn new(slot_count: u32, demand_ceiling: u32) -> Result<Self, ObservationError> {
+        if demand_ceiling > slot_count {
+            return Err(ObservationError::ResourceBusySlots);
+        }
+        Ok(Self {
+            slot_count,
+            demand_ceiling,
+        })
+    }
+
+    const fn unconstrained(slot_count: u32) -> Self {
+        Self {
+            slot_count,
+            demand_ceiling: slot_count,
+        }
+    }
+}
+
 /// A certified busy-slot path for one resource report.
 ///
 /// The observation buffer constructs this view only after it proves the
@@ -1380,6 +1411,7 @@ pub struct OccupancyTraceEvidence<'a> {
     window: ResourceWindow,
     initial_busy_slots: u32,
     slot_count: u32,
+    dispatchable_demand_ceiling: u32,
     initial_available_attempts: u32,
     final_busy_slots: u32,
     busy_slot_micros: u128,
@@ -1407,6 +1439,12 @@ impl OccupancyTraceEvidence<'_> {
     #[must_use]
     pub const fn slot_count(&self) -> u32 {
         self.slot_count
+    }
+
+    /// Returns the maximum number of attempts that structure can dispatch.
+    #[must_use]
+    pub const fn dispatchable_demand_ceiling(&self) -> u32 {
+        self.dispatchable_demand_ceiling
     }
 
     /// Returns work that was available at the report start.
@@ -1470,6 +1508,7 @@ pub(crate) const fn occupancy_trace_for_test<'a>(
         window,
         initial_busy_slots,
         slot_count: u32::MAX,
+        dispatchable_demand_ceiling: u32::MAX,
         initial_available_attempts: 0,
         final_busy_slots,
         busy_slot_micros,
@@ -1485,7 +1524,7 @@ pub(crate) const fn occupancy_trace_for_test<'a>(
 pub(crate) const fn occupancy_trace_with_demand_for_test<'a>(
     window: ResourceWindow,
     initial_busy_slots: u32,
-    slot_count: u32,
+    capacity: DispatchCapacity,
     initial_available_attempts: u32,
     final_busy_slots: u32,
     busy_slot_micros: u128,
@@ -1495,7 +1534,8 @@ pub(crate) const fn occupancy_trace_with_demand_for_test<'a>(
     OccupancyTraceEvidence {
         window,
         initial_busy_slots,
-        slot_count,
+        slot_count: capacity.slot_count,
+        dispatchable_demand_ceiling: capacity.demand_ceiling,
         initial_available_attempts,
         final_busy_slots,
         busy_slot_micros,
@@ -1512,6 +1552,7 @@ struct OccupancyTraceHeader {
     window: ResourceWindow,
     initial_busy_slots: u32,
     slot_count: u32,
+    dispatchable_demand_ceiling: u32,
     initial_available_attempts: u32,
     final_busy_slots: u32,
     busy_slot_micros: u128,
@@ -1875,7 +1916,7 @@ impl ObservationBuffer {
         self.set_resource_observation_with_demand(
             window,
             initial_busy_slots,
-            self.resource_concurrency_max as u32,
+            DispatchCapacity::unconstrained(self.resource_concurrency_max as u32),
             0,
             final_busy_slots,
             transitions,
@@ -1891,7 +1932,7 @@ impl ObservationBuffer {
         &mut self,
         window: ResourceWindow,
         initial_busy_slots: u32,
-        slot_count: u32,
+        capacity: DispatchCapacity,
         initial_available_attempts: u32,
         final_busy_slots: u32,
         transitions: &[OccupancyTransition],
@@ -1910,13 +1951,16 @@ impl ObservationBuffer {
         {
             return Err(ObservationError::ResourceAttemptCount);
         }
-        if initial_busy_slots > self.resource_concurrency_max as u32
-            || final_busy_slots > self.resource_concurrency_max as u32
-            || slot_count > self.resource_concurrency_max as u32
-            || initial_busy_slots > slot_count
-        {
-            return Err(ObservationError::ResourceBusySlots);
-        }
+        let DispatchCapacity {
+            slot_count,
+            demand_ceiling: dispatchable_demand_ceiling,
+        } = capacity;
+        validate_resource_bounds(
+            initial_busy_slots,
+            final_busy_slots,
+            capacity,
+            self.resource_concurrency_max as u32,
+        )?;
         if transitions.len() > self.resource_group_count_max {
             return Err(ObservationError::ResourceTraceGroupCount);
         }
@@ -1973,6 +2017,21 @@ impl ObservationBuffer {
         if (derived_concurrency - window.concurrency()).abs() > concurrency_error {
             return Err(ObservationError::ResourceTraceSummary);
         }
+        self.store_resource_transitions(transitions);
+        self.resource_trace = Some(OccupancyTraceHeader {
+            window,
+            initial_busy_slots,
+            slot_count,
+            dispatchable_demand_ceiling,
+            initial_available_attempts,
+            final_busy_slots,
+            busy_slot_micros,
+            mean_concurrency: derived_concurrency,
+        });
+        Ok(())
+    }
+
+    fn store_resource_transitions(&mut self, transitions: &[OccupancyTransition]) {
         self.resource_transition_offsets_micros.clear();
         self.resource_transition_completed_attempts.clear();
         self.resource_transition_started_attempts.clear();
@@ -1987,16 +2046,6 @@ impl ObservationBuffer {
             self.resource_transition_available_attempts
                 .push(transition.available_attempts);
         }
-        self.resource_trace = Some(OccupancyTraceHeader {
-            window,
-            initial_busy_slots,
-            slot_count,
-            initial_available_attempts,
-            final_busy_slots,
-            busy_slot_micros,
-            mean_concurrency: derived_concurrency,
-        });
-        Ok(())
     }
 
     /// Sets one complete attempt-outcome window.
@@ -2272,6 +2321,7 @@ impl ObservationBuffer {
                     window: header.window,
                     initial_busy_slots: header.initial_busy_slots,
                     slot_count: header.slot_count,
+                    dispatchable_demand_ceiling: header.dispatchable_demand_ceiling,
                     initial_available_attempts: header.initial_available_attempts,
                     final_busy_slots: header.final_busy_slots,
                     busy_slot_micros: header.busy_slot_micros,
@@ -2296,6 +2346,22 @@ impl ObservationBuffer {
             actuation_commitments: &self.actuation_commitments,
         }
     }
+}
+
+fn validate_resource_bounds(
+    initial_busy_slots: u32,
+    final_busy_slots: u32,
+    capacity: DispatchCapacity,
+    concurrency_max: u32,
+) -> Result<(), ObservationError> {
+    if initial_busy_slots > concurrency_max
+        || final_busy_slots > concurrency_max
+        || capacity.slot_count > concurrency_max
+        || initial_busy_slots > capacity.slot_count
+    {
+        return Err(ObservationError::ResourceBusySlots);
+    }
+    Ok(())
 }
 
 fn busy_slot_mean(busy_slot_micros: u128, exposure_micros: u64) -> Result<f64, ObservationError> {

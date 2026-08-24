@@ -21,9 +21,9 @@ use crate::types::{SlotSecondCohorts, occupancy_trace_for_test};
 use crate::{
     ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort,
     CapacityCurve, CapacityGrid, CapacityPrior, Cohort, Configuration, ConfigurationError,
-    DemandClass, DurationCell, HoldReason, LaunchPrior, LaunchPriorGrid, ModelTime,
-    ObservationBuffer, ObservationError, OccupancyTransition, PosteriorError, PosteriorQuery,
-    PriorArtifactBudget, PriorArtifactIdentity, PriorCoverageRecord, RandomStream,
+    DemandClass, DispatchCapacity, DurationCell, HoldReason, LaunchPrior, LaunchPriorGrid,
+    ModelTime, ObservationBuffer, ObservationError, OccupancyTransition, PosteriorError,
+    PosteriorQuery, PriorArtifactBudget, PriorArtifactIdentity, PriorCoverageRecord, RandomStream,
     ReadinessGroupId, ReadinessLump, ReadinessObservation, RebalanceEvidence, RebalancePrior,
     ReliabilityPrior, ResourceWindow, ScaleDecision, ScaleState, ServiceObjective,
     ThroughputPosteriorCell, TransitionDirection, step,
@@ -1001,6 +1001,10 @@ fn occupancy_trace_contract_rejects_each_invalid_value() -> Result<(), TestError
         Err(crate::ResourceWindowError::ClockResolution)
     ));
     let empty = ResourceWindow::new_with_starts(0.0_f64, 1.0_f64, 0, 0)?;
+    assert!(matches!(
+        DispatchCapacity::new(2, 3),
+        Err(ObservationError::ResourceBusySlots)
+    ));
     assert!(matches!(
         observation.set_resource_observation(empty, 129, 129, &[]),
         Err(ObservationError::ResourceBusySlots)

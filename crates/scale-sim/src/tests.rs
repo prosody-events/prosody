@@ -1895,6 +1895,11 @@ fn one_hot_key_serializes_non_preemptive_work() -> Result<(), TestError> {
         plant.add_event(event(0, 0, 10_000))?;
         plant.add_event(event(0, 0, 10_000))?;
     }
+    assert_eq!(one_replica.advance_until(0).dispatchable_demand_ceiling, 1);
+    assert_eq!(
+        four_replicas.advance_until(0).dispatchable_demand_ceiling,
+        1
+    );
     let one_replica = one_replica.run();
     let four_replicas = four_replicas.run();
     let first = one_replica.settlements()[0];
@@ -1918,6 +1923,11 @@ fn independent_keys_use_parallel_slots() -> Result<(), TestError> {
     let mut plant = Plant::new(configuration()?, 1)?;
     plant.add_event(event(0, 0, 10_000))?;
     plant.add_event(event(0, 1, 10_000))?;
+    let snapshot = plant.advance_until(0);
+    assert_eq!(
+        snapshot.dispatchable_demand_ceiling,
+        snapshot.physical_slots
+    );
     let result = plant.run();
     let settlements = result.settlements();
     let first_dispatch = settlements[0]

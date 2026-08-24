@@ -19,9 +19,9 @@ use super::{
     log_contamination_mixture, log_normal_axis_masses, log_weighted_sum, path_log_score,
     vector_exp,
 };
-use crate::OccupancyTraceEvidence;
 use crate::change_point::ChangePointKernel;
 use crate::types::{occupancy_trace_for_test, occupancy_trace_with_demand_for_test};
+use crate::{DispatchCapacity, OccupancyTraceEvidence};
 
 fn kernel_float_matches(actual: f64, expected: f64) -> bool {
     if actual.is_infinite() || expected.is_infinite() {
@@ -2260,7 +2260,7 @@ fn demand_conditioned_predictive_covers_fast_realized_completions() -> Result<()
     let evidence = occupancy_trace_with_demand_for_test(
         window,
         10,
-        10,
+        DispatchCapacity::new(10, 10)?,
         10,
         10,
         1_000_000,
@@ -2274,6 +2274,38 @@ fn demand_conditioned_predictive_covers_fast_realized_completions() -> Result<()
         "joint band: {:?}",
         summary.quantile_counts
     );
+    Ok(())
+}
+
+#[test]
+fn dispatch_ceiling_limits_the_completion_predictive() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.1_f64], &[1_000.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        32.0_f64,
+        0.1_f64,
+        512,
+    )?;
+    factor.weights.fill(0.0_f64);
+    factor.weights[0] = 1.0_f64;
+    let window = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 10, 10)?;
+    let evidence = occupancy_trace_with_demand_for_test(
+        window,
+        1,
+        DispatchCapacity::new(32, 1)?,
+        511,
+        1,
+        1_000_000,
+        (&[], &[], &[], &[]),
+    );
+    let summary =
+        factor.completion_predictive_summary(evidence, 7, 10, [0.1_f64, 0.5_f64, 0.9_f64]);
+
+    assert!(summary.quantile_counts[0] <= 10);
+    assert!(summary.quantile_counts[2] >= 10);
+    assert!(summary.quantile_counts[2] < 20);
     Ok(())
 }
 
@@ -2634,6 +2666,8 @@ enum TestError {
     Posterior(#[from] crate::PosteriorError),
     #[error(transparent)]
     Window(#[from] ResourceWindowError),
+    #[error(transparent)]
+    Observation(#[from] crate::ObservationError),
     #[error(transparent)]
     ParseFloat(#[from] ParseFloatError),
     #[error(transparent)]
