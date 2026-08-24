@@ -9,7 +9,9 @@ use plotters::coord::Shift;
 use plotters::coord::types::{RangedCoordf64, RangedCoordu64};
 use plotters::prelude::*;
 
-use crate::posterior_plot::{PosteriorHeatmap, draw_color_key, draw_posterior_heatmap};
+use crate::posterior_plot::{
+    MAX_RENDERED_PLOT_POINTS, PosteriorHeatmap, draw_color_key, draw_posterior_heatmap,
+};
 use crate::visual::{AxisScale, LinePattern, Quantity, label_margin, semantic_style, shape};
 use crate::{
     ArrivalEvidenceSample, CapacityEvidenceSample, ControllerTrace, ImageManifestEntry,
@@ -74,13 +76,13 @@ pub fn write_regime_story_figures(
     directory: &Path,
     story: &RegimeStory<'_>,
 ) -> Result<Vec<ImageManifestEntry>, PlotError> {
-    let panels = story_panels(story)?;
+    let mut panels = story_panels(story)?;
     if panels.iter().all(|panel| panel.series.is_empty()) {
         return Err(PlotError::EmptyTrace);
     }
     fs::create_dir_all(directory)?;
     let mut manifest = Vec::with_capacity(panels.len());
-    for (index, (file, panel)) in STORY_FILES.iter().zip(&panels).enumerate() {
+    for (index, (file, panel)) in STORY_FILES.iter().zip(&mut panels).enumerate() {
         let content = panel.content();
         let entry = ImageManifestEntry {
             file: format!("story/{file}"),
@@ -95,19 +97,21 @@ pub fn write_regime_story_figures(
         if content != PanelContent::Visible {
             continue;
         }
-        let mut svg = String::new();
-        {
-            let root = SVGBackend::with_string(&mut svg, (WIDTH, PANEL_HEIGHT)).into_drawing_area();
-            root.fill(&WHITE).map_err(|error| drawing_error(&error))?;
-            draw_panel(&root, panel).map_err(|error| drawing_error(&error))?;
-            root.present().map_err(|error| drawing_error(&error))?;
-        };
-        fs::write(
-            directory.join(file),
-            svg.replace("<rect ", "<rect shape-rendering=\"crispEdges\" "),
-        )?;
+        panel.decimate_for_rendering();
+        fs::write(directory.join(file), render_panel_svg(panel)?)?;
     }
     Ok(manifest)
+}
+
+fn render_panel_svg(panel: &StoryPanel) -> Result<String, PlotError> {
+    let mut svg = String::new();
+    {
+        let root = SVGBackend::with_string(&mut svg, (WIDTH, PANEL_HEIGHT)).into_drawing_area();
+        root.fill(&WHITE).map_err(|error| drawing_error(&error))?;
+        draw_panel(&root, panel).map_err(|error| drawing_error(&error))?;
+        root.present().map_err(|error| drawing_error(&error))?;
+    };
+    Ok(svg.replace("<rect ", "<rect shape-rendering=\"crispEdges\" "))
 }
 
 fn draw_panel<Backend: DrawingBackend>(
@@ -1094,6 +1098,17 @@ impl StoryPanel {
         })
     }
 
+    fn decimate_for_rendering(&mut self) {
+        let component_count = self.series.len() + usize::from(self.heatmap.is_some());
+        let component_budget = MAX_RENDERED_PLOT_POINTS / component_count.max(1);
+        for series in &mut self.series {
+            series.decimate_for_rendering(component_budget);
+        }
+        if let Some(heatmap) = &mut self.heatmap {
+            heatmap.decimate_for_rendering(component_budget);
+        }
+    }
+
     fn with_horizon(mut self, horizon_micros: u64) -> Self {
         self.horizon_micros = Some(horizon_micros);
         self
@@ -1207,6 +1222,54 @@ impl StorySeries {
         self.style = SeriesStyle::LightLine;
         self
     }
+
+    fn decimate_for_rendering(&mut self, maximum_points: usize) {
+        if self.values.len() <= maximum_points {
+            return;
+        }
+        let bucket_count = (maximum_points / 2).max(1);
+        let bucket_size = self.values.len().div_ceil(bucket_count);
+        let mut at_micros = Vec::with_capacity(maximum_points);
+        let mut values = Vec::with_capacity(maximum_points);
+        for start in (0..self.values.len()).step_by(bucket_size) {
+            let end = start.saturating_add(bucket_size).min(self.values.len());
+            let mut extrema = (start..end)
+                .filter(|index| self.values[*index].is_finite())
+                .fold(None, |extrema, index| {
+                    Some(extrema.map_or((index, index), |(minimum, maximum)| {
+                        let minimum = if self.values[index] < self.values[minimum] {
+                            index
+                        } else {
+                            minimum
+                        };
+                        let maximum = if self.values[index] > self.values[maximum] {
+                            index
+                        } else {
+                            maximum
+                        };
+                        (minimum, maximum)
+                    }))
+                });
+            let Some((minimum, maximum)) = extrema.take() else {
+                at_micros.push(self.at_micros[start]);
+                values.push(self.values[start]);
+                continue;
+            };
+            let (first, second) = if minimum <= maximum {
+                (minimum, maximum)
+            } else {
+                (maximum, minimum)
+            };
+            at_micros.push(self.at_micros[first]);
+            values.push(self.values[first]);
+            if first != second {
+                at_micros.push(self.at_micros[second]);
+                values.push(self.values[second]);
+            }
+        }
+        self.at_micros = at_micros;
+        self.values = values;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1251,7 +1314,9 @@ fn deduplicate_series(series: Vec<StorySeries>) -> Vec<StorySeries> {
 
 #[cfg(test)]
 mod tests {
-    use super::{StoryPanel, StorySeries, finish_story_panels};
+    use super::{
+        MAX_RENDERED_PLOT_POINTS, StoryPanel, StorySeries, finish_story_panels, render_panel_svg,
+    };
 
     #[test]
     fn story_panels_share_the_experiment_horizon() {
@@ -1299,5 +1364,52 @@ mod tests {
         let panel = StoryPanel::new("replicas", vec![series]);
 
         assert!(panel.clipped_label().is_some());
+    }
+
+    #[test]
+    fn story_writer_bounds_svg_nodes_and_preserves_extremes() -> Result<(), super::PlotError> {
+        let length = MAX_RENDERED_PLOT_POINTS.saturating_mul(20);
+        let at_micros = (0..length)
+            .map(|index| u64::try_from(index).unwrap_or(u64::MAX))
+            .collect();
+        let mut values = (0..length)
+            .map(|index| f64::from(u32::try_from(index % 31).unwrap_or(0)))
+            .collect::<Vec<_>>();
+        values[length / 3] = -17.0_f64;
+        values[length * 2 / 3] = 91.0_f64;
+        let mut panel = StoryPanel::new(
+            "events",
+            vec![StorySeries::new("long series", at_micros, values).points()],
+        );
+
+        let old_svg = render_panel_svg(&panel)?;
+        panel.decimate_for_rendering();
+        let svg = render_panel_svg(&panel)?;
+        let svg_nodes = xml_node_count(&svg);
+
+        assert!(xml_node_count(&old_svg) >= 5_000);
+        assert!(svg_nodes < 5_000);
+        assert!(panel.series[0].values.contains(&-17.0_f64));
+        assert!(panel.series[0].values.contains(&91.0_f64));
+        assert!(panel.series[0].values.len() <= MAX_RENDERED_PLOT_POINTS);
+        Ok(())
+    }
+
+    fn xml_node_count(xml: &str) -> usize {
+        let bytes = xml.as_bytes();
+        let mut nodes = 1_usize;
+        let mut previous_end = 0_usize;
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte != b'<' {
+                continue;
+            }
+            nodes = nodes.saturating_add(usize::from(index > previous_end));
+            let marker = bytes.get(index + 1).copied();
+            nodes = nodes.saturating_add(usize::from(!matches!(marker, Some(b'/' | b'?' | b'!'))));
+            if let Some(offset) = bytes[index..].iter().position(|byte| *byte == b'>') {
+                previous_end = index.saturating_add(offset).saturating_add(1);
+            }
+        }
+        nodes
     }
 }

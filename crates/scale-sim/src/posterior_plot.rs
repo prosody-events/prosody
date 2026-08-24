@@ -19,11 +19,38 @@ use crate::{
 const WIDTH: u32 = 1_440;
 const HEATMAP_HEIGHT: u32 = 440;
 const SNAPSHOT_HEIGHT: u32 = 480;
+/// Typst accepts fewer than 5,000 SVG nodes. This 1,600-point budget keeps plot
+/// nodes below 4,000.
+pub(crate) const MAX_RENDERED_PLOT_POINTS: usize = 1_600;
 
 pub(crate) struct PosteriorHeatmap {
     pub(crate) at_micros: Vec<u64>,
     pub(crate) values: Vec<f64>,
     pub(crate) probabilities: Vec<f64>,
+}
+
+impl PosteriorHeatmap {
+    pub(crate) fn decimate_for_rendering(&mut self, maximum_cells: usize) {
+        let width = self.values.len();
+        let height = self.at_micros.len();
+        if width.checked_mul(height) != Some(self.probabilities.len()) {
+            return;
+        }
+        if width.saturating_mul(height) <= maximum_cells || width == 0 || height == 0 {
+            return;
+        }
+        let target_height = height.min(maximum_cells / width).max(1);
+        let time_indices = spaced_indices(height, target_height);
+        let mut at_micros = Vec::with_capacity(time_indices.len());
+        let mut probabilities = Vec::with_capacity(width.saturating_mul(time_indices.len()));
+        for &time_index in &time_indices {
+            at_micros.push(self.at_micros[time_index]);
+            let row = time_index.saturating_mul(width);
+            probabilities.extend_from_slice(&self.probabilities[row..row + width]);
+        }
+        self.at_micros = at_micros;
+        self.probabilities = probabilities;
+    }
 }
 
 struct PosteriorPanel {
@@ -54,10 +81,10 @@ pub fn write_model_belief_figures(
     if controller.is_empty() {
         return Err(PlotError::EmptyTrace);
     }
-    let panels = model_panels(controller);
+    let mut panels = model_panels(controller);
     fs::create_dir_all(directory)?;
     let mut manifest = Vec::with_capacity(panels.len());
-    for panel in &panels {
+    for panel in &mut panels {
         let content = if panel_unchanged(panel) {
             PanelContent::Unchanged
         } else {
@@ -75,6 +102,7 @@ pub fn write_model_belief_figures(
         if content != PanelContent::Visible {
             continue;
         }
+        panel.decimate_heatmap_for_rendering();
         let mut svg = String::new();
         {
             let root =
@@ -103,10 +131,10 @@ pub fn write_model_belief_snapshot_figures(
     if controller.is_empty() {
         return Err(PlotError::EmptyTrace);
     }
-    let panels = model_panels(controller);
+    let mut panels = model_panels(controller);
     fs::create_dir_all(directory)?;
     let mut manifest = Vec::with_capacity(panels.len());
-    for panel in &panels {
+    for panel in &mut panels {
         let content = if panel_unchanged(panel) {
             PanelContent::Unchanged
         } else {
@@ -124,6 +152,7 @@ pub fn write_model_belief_snapshot_figures(
         if content != PanelContent::Visible {
             continue;
         }
+        panel.decimate_snapshots_for_rendering();
         let mut svg = String::new();
         {
             let root =
@@ -477,6 +506,78 @@ impl PosteriorPanel {
         };
         (self.y_label)(value)
     }
+
+    fn decimate_heatmap_for_rendering(&mut self) {
+        let target_width = integer_square_root(MAX_RENDERED_PLOT_POINTS).max(1);
+        self.coarsen_value_axis(target_width);
+        self.heatmap
+            .decimate_for_rendering(MAX_RENDERED_PLOT_POINTS);
+    }
+
+    fn decimate_snapshots_for_rendering(&mut self) {
+        self.coarsen_value_axis(MAX_RENDERED_PLOT_POINTS / 3);
+    }
+
+    fn coarsen_value_axis(&mut self, maximum_values: usize) {
+        let width = self.heatmap.values.len();
+        if width <= maximum_values || width == 0 {
+            return;
+        }
+        let bucket_size = width.div_ceil(maximum_values);
+        let bucket_count = width.div_ceil(bucket_size);
+        let mut values = Vec::with_capacity(bucket_count);
+        let mut prior = Vec::with_capacity(bucket_count);
+        let mut probabilities =
+            Vec::with_capacity(self.heatmap.at_micros.len().saturating_mul(bucket_count));
+        for row in self.heatmap.probabilities.chunks_exact(width) {
+            aggregate_buckets(row, bucket_size, &mut probabilities);
+        }
+        aggregate_buckets(&self.prior, bucket_size, &mut prior);
+        for start in (0..width).step_by(bucket_size) {
+            let end = start.saturating_add(bucket_size).min(width);
+            let value = if start == 0 {
+                self.heatmap.values[0]
+            } else if end == width {
+                self.heatmap.values[width - 1]
+            } else {
+                self.heatmap.values[start].midpoint(self.heatmap.values[end - 1])
+            };
+            values.push(value);
+        }
+        self.heatmap.values = values;
+        self.heatmap.probabilities = probabilities;
+        self.prior = prior;
+    }
+}
+
+fn aggregate_buckets(values: &[f64], bucket_size: usize, output: &mut Vec<f64>) {
+    output.extend(
+        values
+            .chunks(bucket_size)
+            .map(|bucket| bucket.iter().sum::<f64>()),
+    );
+}
+
+fn integer_square_root(value: usize) -> usize {
+    let mut root = 0_usize;
+    while root
+        .saturating_add(1)
+        .saturating_mul(root.saturating_add(1))
+        <= value
+    {
+        root = root.saturating_add(1);
+    }
+    root
+}
+
+fn spaced_indices(length: usize, count: usize) -> Vec<usize> {
+    if count == 1 {
+        return vec![length - 1];
+    }
+    let final_index = length - 1;
+    (0..count)
+        .map(|sample| sample.saturating_mul(final_index) / (count - 1))
+        .collect()
 }
 
 fn axis_for_values(values: &[f64]) -> AxisScale {
