@@ -1310,7 +1310,7 @@ fn report_views_match_the_fixed_model_contract() -> Result<(), TestError> {
 
     state.write_posterior(query, &mut values, &mut probabilities)?;
 
-    assert_eq!(artifact.identity().version(), 2);
+    assert_eq!(artifact.identity().version(), 5);
     assert!(!artifact.coverage().is_empty());
     assert!(artifact.coverage().iter().all(|coverage| {
         coverage.lower_tail_probability() >= 0.0_f64 && coverage.upper_tail_probability() >= 0.0_f64

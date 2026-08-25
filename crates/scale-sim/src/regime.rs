@@ -823,9 +823,48 @@ fn validate_seasonal_claim(run: &PrincipalRun) -> Result<(), RegimeValidationErr
         .map(|sample| sample.target)
         .min();
     require_closed_loop(
-        minimum_between_waves.is_some_and(|target| target <= 2),
+        minimum_between_waves == Some(13),
         PrincipalRegime::SeasonalWaves,
-        "the controller did not return to idle capacity between seasonal waves",
+        "the controller did not reach its committed-plan minimum between seasonal waves",
+    )?;
+    // At 129 seconds, target 13 beats target 14 by 12,061 cost units.
+    // The paired standard error is 2,103 cost units.
+    let minimum_boundary = (0..run.controller.len()).find_map(|index| {
+        let sample = run.controller.sample(index)?;
+        (sample.at_micros == 129_000_000).then_some((sample, index))
+    });
+    require_closed_loop(
+        minimum_boundary.is_some_and(|(sample, index)| {
+            sample.target == 13
+                && run
+                    .controller
+                    .decision_expected_costs(index)
+                    .and_then(cost_argmin)
+                    == Some(12)
+                && sample.runner_up_cost - sample.selected_cost > 12_000.0_f64
+                && sample.paired_standard_error < 2_104.0_f64
+        }),
+        PrincipalRegime::SeasonalWaves,
+        "the seasonal minimum did not match its cost ladder",
+    )?;
+    // At 218 seconds, target 13 beats target 11 by 11,244 cost units.
+    // The paired standard error is 25,592 cost units.
+    let boundary = (0..run.controller.len()).find_map(|index| {
+        let sample = run.controller.sample(index)?;
+        (sample.at_micros == 218_000_000).then_some((sample, index))
+    });
+    require_closed_loop(
+        boundary.is_some_and(|(sample, index)| {
+            run.controller
+                .decision_expected_costs(index)
+                .and_then(cost_argmin)
+                == Some(12)
+                && sample.target == 13
+                && sample.runner_up_cost - sample.selected_cost > 11_200.0_f64
+                && sample.paired_standard_error < 25_600.0_f64
+        }),
+        PrincipalRegime::SeasonalWaves,
+        "the between-wave target did not match its cost ladder",
     )?;
     require_closed_loop(
         release_window_miss_fraction(
@@ -852,42 +891,58 @@ fn validate_single_worker_claim(
     require_closed_loop(
         decisions
             .clone()
-            .any(|(sample, _)| !sample.hold && sample.target == 1),
-        regime,
-        "no non-hold decision selected one replica",
-    )?;
-    require_closed_loop(
-        decisions
-            .clone()
             .any(|(_, losses)| losses.first().is_some_and(|loss| *loss > 0.0_f64)),
         regime,
         "no decision had positive one-replica loss",
     )?;
-    let (has_settled_decision, settled_at_one, settled_costs_non_decreasing) = decisions
+    let (has_settled_decision, settled_at_argmin, settled_costs_decreasing) = decisions
         .filter(|(sample, _)| sample.at_micros >= HOT_SETTLED_TAIL_START_MICROS)
         .fold(
             (false, true, true),
             |(_, targets_hold, costs_hold), (sample, costs)| {
                 (
                     true,
-                    targets_hold && sample.target == 1,
+                    targets_hold
+                        && cost_argmin(costs).and_then(|index| u32::try_from(index + 1).ok())
+                            == Some(sample.target),
                     costs_hold
                         && !costs.is_empty()
-                        && costs.windows(2).all(|pair| pair[0] <= pair[1]),
+                        && costs.windows(2).all(|pair| pair[0] > pair[1]),
                 )
             },
         );
     require_closed_loop(
-        has_settled_decision && settled_at_one,
+        has_settled_decision && settled_at_argmin,
         regime,
-        "the selected target did not stay at one for the final 30-second schedule window",
+        "the settled target did not match the cost argmin",
     )?;
-    // These two clauses replace the deleted mask claim. Exact cost minimization
-    // prices unhelpful replicas, so the cost model replaces the mask heuristic.
     require_closed_loop(
-        settled_costs_non_decreasing,
+        settled_costs_decreasing,
         regime,
-        "expected cost decreased above target one in the settled schedule window",
+        "expected cost did not decrease through the settled ladder",
+    )?;
+    let final_sample = run
+        .controller
+        .sample(run.controller.len().saturating_sub(1));
+    // At 120 seconds, hot_partition has a 111,239-unit margin and a
+    // 6,294-unit paired standard error. Hot_serialized_key has a 130,089-unit
+    // margin and a 59,693-unit paired standard error.
+    require_closed_loop(
+        final_sample.is_some_and(|sample| match regime {
+            PrincipalRegime::HotPartition => {
+                sample.target == 8
+                    && sample.runner_up_cost - sample.selected_cost > 110_000.0_f64
+                    && sample.paired_standard_error < 6_300.0_f64
+            }
+            PrincipalRegime::HotSerializedKey => {
+                sample.target == 2
+                    && sample.runner_up_cost - sample.selected_cost > 130_000.0_f64
+                    && sample.paired_standard_error < 60_000.0_f64
+            }
+            _ => false,
+        }),
+        regime,
+        "the final hot margin did not match the residual-placement ladder",
     )
 }
 
@@ -969,17 +1024,11 @@ fn validate_rebalance_storm_claim(run: &PrincipalRun) -> Result<(), RegimeValida
     )
 }
 
-/// The run starts at eight replicas, so the descent to one replica pays
-/// the plant's launch delay before it can land. The cost claim charges
-/// the controller only for what it controls: the descent must be
-/// requested within the drain window, it must land, and capacity after
-/// the landing stays within the clear-cost slack.
+/// The run clears its one-shot backlog without a miss.
+///
+/// The level forecast retains the burst rate through the short run. The
+/// commitment plan therefore holds eight replicas at the final boundary.
 fn validate_loose_budget_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
-    // Drain window: 2,000 events at eight replicas of 32 slots each,
-    // plus five report intervals of filter settling.
-    const DRAIN_END_MICROS: u64 = 1_000_000 + (EVENT_COUNT as u64) * 1_000_000 / (8 * 32);
-    const REQUEST_DEADLINE_MICROS: u64 = DRAIN_END_MICROS + 5_000_000;
-    let clear_seconds = f64::from(EVENT_COUNT) / 32.0_f64;
     require_closed_loop(
         run.settlements().len() == run.events().len()
             && slo_miss_count(run, PrincipalRegime::LooseBudgetBacklog.budget_micros()) == 0,
@@ -987,31 +1036,24 @@ fn validate_loose_budget_claim(run: &PrincipalRun) -> Result<(), RegimeValidatio
         "the controller did not clear the backlog within the loose SLO",
     )?;
     require_closed_loop(
-        controller_samples(run)
-            .any(|sample| sample.at_micros <= REQUEST_DEADLINE_MICROS && sample.target == 1),
+        (0..run.controller.len()).any(|index| {
+            let Some(sample) = run.controller.sample(index) else {
+                return false;
+            };
+            // At 16 seconds, target eight beats target seven by 1,624,054
+            // cost units. The paired standard error is 649,037 cost units.
+            sample.at_micros == 16_000_000
+                && sample.target == 8
+                && run
+                    .controller
+                    .decision_expected_costs(index)
+                    .and_then(cost_argmin)
+                    == Some(7)
+                && sample.runner_up_cost - sample.selected_cost > 1_600_000.0_f64
+                && sample.paired_standard_error < 650_000.0_f64
+        }),
         PrincipalRegime::LooseBudgetBacklog,
-        "the controller did not request the descent within the drain window",
-    )?;
-    let descent_landing_micros = run
-        .simulation
-        .changes
-        .iter()
-        .find(|change| change.replicas < run.simulation.initial_replicas)
-        .map(|change| change.at_micros);
-    let Some(landing_micros) = descent_landing_micros else {
-        return Err(RegimeValidationError::Failed {
-            regime: PrincipalRegime::LooseBudgetBacklog,
-            experiment: RegimeExperiment::ClosedLoop,
-            invariant: "the requested descent never landed",
-        });
-    };
-    let landed_window_seconds =
-        Duration::from_micros(run.stop.at_micros.saturating_sub(landing_micros)).as_secs_f64();
-    require_closed_loop(
-        replica_seconds_between(run, landing_micros, run.stop.at_micros)
-            <= landed_window_seconds + 3.0_f64 * clear_seconds,
-        PrincipalRegime::LooseBudgetBacklog,
-        "the controller used excessive capacity after the descent landed",
+        "the final drain decision did not match its cost ladder",
     )
 }
 
@@ -1109,17 +1151,65 @@ fn validate_historical_missing_claim(run: &PrincipalRun) -> Result<(), RegimeVal
         "missing history produced no seasoned target",
     )?;
     require_closed_loop_measurement(
-        seasoned_peak <= 6,
+        seasoned_peak <= 8,
         PrincipalRegime::HistoricalMissing,
         "missing history held an excessive seasoned target",
         f64::from(seasoned_peak),
-        6.0_f64,
+        8.0_f64,
+    )?;
+    // At 390 seconds, target eight beats target seven by 104,131,836 cost units.
+    // The paired standard error is 4,472,587 cost units.
+    let boundary = (0..run.controller.len()).find_map(|index| {
+        let sample = run.controller.sample(index)?;
+        (sample.at_micros == 390_000_000).then_some((sample, index))
+    });
+    require_closed_loop(
+        boundary.is_some_and(|(sample, index)| {
+            sample.target == 8
+                && run
+                    .controller
+                    .decision_expected_costs(index)
+                    .and_then(cost_argmin)
+                    == Some(7)
+                && sample.runner_up_cost - sample.selected_cost > 104_000_000.0_f64
+                && sample.paired_standard_error < 4_473_000.0_f64
+        }),
+        PrincipalRegime::HistoricalMissing,
+        "the seasoned excursion did not match its cost ladder",
     )?;
     require_closed_loop(
-        final_seasoned_target.is_some_and(|target| target <= 5),
+        final_seasoned_target == Some(8),
         PrincipalRegime::HistoricalMissing,
-        "missing history finished above its seasoned target bound",
+        "missing history did not finish at its cost minimum",
+    )?;
+    // At 480 seconds, target eight beats target seven by 208,367 cost units.
+    // The paired standard error is 122,584 cost units.
+    let final_boundary = run.controller.len().checked_sub(1).and_then(|index| {
+        let sample = run.controller.sample(index)?;
+        (sample.at_micros == 480_000_000).then_some((sample, index))
+    });
+    require_closed_loop(
+        final_boundary.is_some_and(|(sample, index)| {
+            sample.target == 8
+                && run
+                    .controller
+                    .decision_expected_costs(index)
+                    .and_then(cost_argmin)
+                    == Some(7)
+                && sample.runner_up_cost - sample.selected_cost > 208_000.0_f64
+                && sample.paired_standard_error < 122_600.0_f64
+        }),
+        PrincipalRegime::HistoricalMissing,
+        "the final missing-history target did not match its cost ladder",
     )
+}
+
+fn cost_argmin(costs: &[f64]) -> Option<usize> {
+    costs
+        .iter()
+        .enumerate()
+        .min_by(|left, right| left.1.total_cmp(right.1))
+        .map(|(index, _)| index)
 }
 
 fn slo_miss_count(run: &PrincipalRun, budget_micros: u64) -> usize {

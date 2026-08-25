@@ -23,7 +23,7 @@ use crate::{
     CapacityCurve, CapacityGrid, CapacityPrior, Cohort, Configuration, ConfigurationError,
     DemandClass, DispatchCapacity, DurationCell, HoldReason, LaunchPrior, LaunchPriorGrid,
     ModelTime, ObservationBuffer, ObservationError, OccupancyTransition, OwnerCapacity,
-    PosteriorError, PosteriorQuery, PriorArtifactBudget, PriorArtifactIdentity,
+    PlacementCapacity, PosteriorError, PosteriorQuery, PriorArtifactBudget, PriorArtifactIdentity,
     PriorCoverageRecord, RandomStream, ReadinessGroupId, ReadinessLump, ReadinessObservation,
     RebalanceEvidence, RebalancePrior, ReliabilityPrior, ResourceWindow, ScaleDecision, ScaleState,
     ServiceObjective, ThroughputPosteriorCell, TransitionDirection, step,
@@ -1006,7 +1006,22 @@ fn occupancy_trace_contract_rejects_each_invalid_value() -> Result<(), TestError
         Err(ObservationError::ResourceBusySlots)
     ));
     assert!(matches!(
-        OwnerCapacity::new(0, &[1], &[], &[]),
+        OwnerCapacity::new(0, &[1], &[1], &[1], &[0], (&[], &[], &[])),
+        Err(ObservationError::ResourceOwnerCapacity)
+    ));
+    assert!(matches!(
+        PlacementCapacity::new(
+            DispatchCapacity::new(2, 2)?,
+            OwnerCapacity::new(2, &[1], &[1], &[0], &[0], (&[], &[], &[]))?
+        ),
+        Err(ObservationError::ResourceOwnerCapacity)
+    ));
+    let unordered_arrivals = PlacementCapacity::new(
+        DispatchCapacity::new(2, 1)?,
+        OwnerCapacity::new(2, &[1], &[1], &[0], &[0], (&[2, 1], &[0, 0], &[0, 0]))?,
+    )?;
+    assert!(matches!(
+        observation.set_resource_observation_with_owners(empty, 0, unordered_arrivals, 1, 0, &[],),
         Err(ObservationError::ResourceOwnerCapacity)
     ));
     assert!(matches!(
@@ -1063,6 +1078,32 @@ fn occupancy_trace_contract_rejects_each_invalid_value() -> Result<(), TestError
         observation.set_resource_observation(empty, 0, 0, &too_many),
         Err(ObservationError::ResourceTraceGroupCount)
     ));
+    Ok(())
+}
+
+#[test]
+fn service_duration_contract_rejects_malformed_columns() -> Result<(), TestError> {
+    let configuration = configuration()?;
+    let balanced = [OccupancyTransition::new(500_000, 1, 1)];
+    let window = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 1, 1)?;
+
+    let mut offset_range = ObservationBuffer::new(&configuration)?;
+    offset_range.set_resource_observation(window, 1, 1, &balanced)?;
+    assert!(matches!(
+        offset_range.set_resource_service_evidence(&[1_000_001], &[500_000], &[0], &[500_000]),
+        Err(ObservationError::ResourceServiceEvidence)
+    ));
+
+    let mut age_count = ObservationBuffer::new(&configuration)?;
+    age_count.set_resource_observation(window, 1, 1, &balanced)?;
+    assert!(matches!(
+        age_count.set_resource_service_evidence(&[500_000], &[500_000], &[], &[500_000]),
+        Err(ObservationError::ResourceServiceEvidence)
+    ));
+
+    let mut valid = ObservationBuffer::new(&configuration)?;
+    valid.set_resource_observation(window, 1, 1, &balanced)?;
+    valid.set_resource_service_evidence(&[500_000], &[500_000], &[0], &[500_000])?;
     Ok(())
 }
 

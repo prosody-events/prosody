@@ -36,8 +36,10 @@ fn bucketed_transitions_stay_admissible_and_preserve_totals(
         };
         transitions.push(AttemptTransition {
             at_micros,
+            started_at_micros: at_micros,
             kind,
             owner: 0,
+            key: 0,
         });
     }
     let mut groups = Vec::with_capacity(GROUP_COUNT_MAX);

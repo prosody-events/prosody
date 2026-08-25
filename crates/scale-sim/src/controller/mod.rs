@@ -28,6 +28,7 @@ use crate::{
 
 const HANDLER_COVERAGE_LEVELS: [f64; 4] = [0.5_f64, 0.8_f64, 0.9_f64, 0.95_f64];
 const HANDLER_RANK_BIN_COUNT: usize = 10;
+
 #[cfg(test)]
 const GAUSS_LEGENDRE_NODES: [f64; 4] = [
     0.183_434_642_495_649_8_f64,
@@ -80,6 +81,8 @@ pub struct ControllerSample {
     pub runner_up_replica_seconds_mean: f64,
     /// Runner-up action expected-cost sum.
     pub runner_up_cost: f64,
+    /// Paired standard error of the runner-up cost minus selected cost.
+    pub paired_standard_error: f64,
     /// Posterior expected arrival rate.
     pub arrival_rate_per_second: f64,
     /// Arrival evidence accepted at this controller tick.
@@ -306,6 +309,7 @@ pub struct ControllerTrace {
     runner_up_late_area_mean: Vec<f64>,
     runner_up_replica_seconds_mean: Vec<f64>,
     runner_up_cost: Vec<f64>,
+    paired_standard_error: Vec<f64>,
     arrival_rate_per_second: Vec<f64>,
     arrival_evidence: Vec<bool>,
     arrival_evidence_count: Vec<u32>,
@@ -372,6 +376,8 @@ pub struct ControllerTrace {
     arrival_posterior_probabilities: Vec<f64>,
     decision_candidate_count: usize,
     decision_expected_costs: Vec<f64>,
+    decision_late_areas: Vec<f64>,
+    decision_replica_seconds: Vec<f64>,
     decision_deadline_satisfaction_probabilities: Vec<f64>,
     decision_deadline_rejections: Vec<f64>,
     decision_placement_rejections: Vec<f64>,
@@ -648,6 +654,7 @@ impl ControllerTrace {
             runner_up_late_area_mean: Vec::with_capacity(capacity),
             runner_up_replica_seconds_mean: Vec::with_capacity(capacity),
             runner_up_cost: Vec::with_capacity(capacity),
+            paired_standard_error: Vec::with_capacity(capacity),
             arrival_rate_per_second: Vec::with_capacity(capacity),
             arrival_evidence: Vec::with_capacity(capacity),
             arrival_evidence_count: Vec::with_capacity(capacity),
@@ -714,6 +721,8 @@ impl ControllerTrace {
             arrival_posterior_probabilities: Vec::with_capacity(posterior.arrival_cell_count),
             decision_candidate_count: posterior.decision_candidate_count,
             decision_expected_costs: Vec::with_capacity(posterior.decision_cell_count),
+            decision_late_areas: Vec::with_capacity(posterior.decision_cell_count),
+            decision_replica_seconds: Vec::with_capacity(posterior.decision_cell_count),
             decision_deadline_satisfaction_probabilities: Vec::with_capacity(
                 posterior.decision_cell_count,
             ),
@@ -759,6 +768,7 @@ impl ControllerTrace {
             runner_up_late_area_mean: self.runner_up_late_area_mean[index],
             runner_up_replica_seconds_mean: self.runner_up_replica_seconds_mean[index],
             runner_up_cost: self.runner_up_cost[index],
+            paired_standard_error: self.paired_standard_error[index],
             arrival_rate_per_second: self.arrival_rate_per_second[index],
             arrival_evidence: self.arrival_evidence_sample(index),
             arrival_predictive_low_count: self.arrival_predictive_low_count[index],
@@ -915,6 +925,22 @@ impl ControllerTrace {
         let start = index.checked_mul(self.decision_candidate_count)?;
         let end = start.checked_add(self.decision_candidate_count)?;
         self.decision_expected_costs.get(start..end)
+    }
+
+    /// Returns the expected late area for each candidate at one decision.
+    #[must_use]
+    pub fn decision_late_areas(&self, index: usize) -> Option<&[f64]> {
+        let start = index.checked_mul(self.decision_candidate_count)?;
+        let end = start.checked_add(self.decision_candidate_count)?;
+        self.decision_late_areas.get(start..end)
+    }
+
+    /// Returns the expected replica-seconds for each candidate at one decision.
+    #[must_use]
+    pub fn decision_replica_seconds(&self, index: usize) -> Option<&[f64]> {
+        let start = index.checked_mul(self.decision_candidate_count)?;
+        let end = start.checked_add(self.decision_candidate_count)?;
+        self.decision_replica_seconds.get(start..end)
     }
 
     /// Returns the absolute deadline-satisfaction probability for each
@@ -1263,6 +1289,11 @@ impl ControllerTrace {
             .push(runner_up.map_or(f64::NAN, |action| action.replica_seconds_mean));
         self.runner_up_cost
             .push(runner_up.map_or(f64::NAN, |action| action.cost));
+        self.paired_standard_error.push(
+            summary
+                .and_then(|summary| summary.paired_standard_error)
+                .unwrap_or(f64::NAN),
+        );
     }
 
     fn push_decision_curves(&mut self, scratch: &ScaleScratch) -> Result<(), PlantError> {
@@ -1274,6 +1305,8 @@ impl ControllerTrace {
             return Err(PlantError::MetricCapacity);
         }
         self.decision_expected_costs.resize(decision_end, f64::NAN);
+        self.decision_late_areas.resize(decision_end, f64::NAN);
+        self.decision_replica_seconds.resize(decision_end, f64::NAN);
         if decision_end > self.decision_deadline_satisfaction_probabilities.capacity() {
             return Err(PlantError::MetricCapacity);
         }
@@ -1281,6 +1314,13 @@ impl ControllerTrace {
             .resize(decision_end, f64::NAN);
         match scratch.write_decision_expected_costs(
             &mut self.decision_expected_costs[decision_start..decision_end],
+        ) {
+            Ok(()) | Err(prosody_scale_core::DecisionCurveError::Unavailable) => {}
+            Err(error) => return Err(error.into()),
+        }
+        match scratch.write_decision_cost_terms(
+            &mut self.decision_late_areas[decision_start..decision_end],
+            &mut self.decision_replica_seconds[decision_start..decision_end],
         ) {
             Ok(()) | Err(prosody_scale_core::DecisionCurveError::Unavailable) => {}
             Err(error) => return Err(error.into()),
@@ -1425,6 +1465,15 @@ pub struct ClosedLoop<Workload> {
     owner_supply_scratch: Vec<u32>,
     owner_arrival_offset_scratch: Vec<u64>,
     owner_arrival_owner_scratch: Vec<u32>,
+    owner_arrival_key_scratch: Vec<u32>,
+    previous_owner_active_attempt_counts: Vec<u32>,
+    previous_owner_work_labels: Vec<u32>,
+    live_attempt_start_scratch: Vec<u64>,
+    initial_live_age_scratch: Vec<u64>,
+    final_live_age_scratch: Vec<u64>,
+    completion_offset_scratch: Vec<u64>,
+    completion_duration_scratch: Vec<u64>,
+    service_ledger_transition_count: usize,
     arrival_evidence_sample: ArrivalEvidenceSample,
     partition_evidence_accepted: bool,
     partition_posterior_values: Vec<f64>,
@@ -1714,6 +1763,15 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             owner_supply_scratch: Vec::with_capacity(owner_count_max),
             owner_arrival_offset_scratch: Vec::with_capacity(resource_attempt_count_max),
             owner_arrival_owner_scratch: Vec::with_capacity(resource_attempt_count_max),
+            owner_arrival_key_scratch: Vec::with_capacity(resource_attempt_count_max),
+            previous_owner_active_attempt_counts: Vec::with_capacity(owner_count_max),
+            previous_owner_work_labels: Vec::with_capacity(resource_attempt_count_max),
+            live_attempt_start_scratch: Vec::with_capacity(resource_attempt_count_max),
+            initial_live_age_scratch: Vec::with_capacity(resource_attempt_count_max),
+            final_live_age_scratch: Vec::with_capacity(resource_attempt_count_max),
+            completion_offset_scratch: Vec::with_capacity(resource_attempt_count_max),
+            completion_duration_scratch: Vec::with_capacity(resource_attempt_count_max),
+            service_ledger_transition_count: 0,
             arrival_evidence_sample: ArrivalEvidenceSample::None,
             partition_evidence_accepted: false,
             partition_posterior_values: vec![0.0_f64; partition_posterior_count],
@@ -2218,6 +2276,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
     ) {
         self.owner_arrival_offset_scratch.clear();
         self.owner_arrival_owner_scratch.clear();
+        self.owner_arrival_key_scratch.clear();
         for transition in transitions {
             if transition.kind != AttemptTransitionKind::Available {
                 continue;
@@ -2229,7 +2288,55 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
                     .min(exposure_micros),
             );
             self.owner_arrival_owner_scratch.push(transition.owner);
+            self.owner_arrival_key_scratch.push(transition.key);
         }
+    }
+
+    fn prepare_service_evidence(
+        &mut self,
+        transitions: &[AttemptTransition],
+        previous_count: usize,
+        previous_micros: u64,
+        exposure_micros: u64,
+    ) -> Result<(), PlantError> {
+        for transition in transitions
+            .get(self.service_ledger_transition_count..previous_count)
+            .unwrap_or(&[])
+        {
+            update_live_attempt_starts(&mut self.live_attempt_start_scratch, *transition)?;
+        }
+        self.initial_live_age_scratch.clear();
+        for started_at in self.live_attempt_start_scratch.iter().copied() {
+            self.initial_live_age_scratch
+                .push(previous_micros.saturating_sub(started_at));
+        }
+        self.completion_offset_scratch.clear();
+        self.completion_duration_scratch.clear();
+        for transition in transitions.get(previous_count..).unwrap_or(&[]) {
+            if transition.kind == AttemptTransitionKind::Completion {
+                self.completion_offset_scratch.push(
+                    transition
+                        .at_micros
+                        .saturating_sub(previous_micros)
+                        .min(exposure_micros),
+                );
+                self.completion_duration_scratch.push(
+                    transition
+                        .at_micros
+                        .saturating_sub(transition.started_at_micros)
+                        .max(1),
+                );
+            }
+            update_live_attempt_starts(&mut self.live_attempt_start_scratch, *transition)?;
+        }
+        self.service_ledger_transition_count = transitions.len();
+        self.final_live_age_scratch.clear();
+        let window_end = previous_micros.saturating_add(exposure_micros);
+        for started_at in self.live_attempt_start_scratch.iter().copied() {
+            self.final_live_age_scratch
+                .push(window_end.saturating_sub(started_at));
+        }
+        Ok(())
     }
 
     fn prepare_capacity_evidence(&mut self, context: &TickContext<'_>) -> Result<(), PlantError> {
@@ -2249,6 +2356,9 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             .history
             .dispatchable_demand_ceiling(0)
             .unwrap_or(slot_count);
+        if initial_busy_slots > slot_count || dispatchable_demand_ceiling > slot_count {
+            return Ok(());
+        }
         let Some(previous_count) = context.history.attempt_transition_count(0) else {
             return Ok(());
         };
@@ -2256,8 +2366,23 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             .attempt_transitions
             .get(previous_count..context.plant.attempt_transition_count)
             .unwrap_or(&[]);
+        self.prepare_service_evidence(
+            context.attempt_transitions,
+            previous_count,
+            previous_micros,
+            exposure_micros,
+        )?;
         self.prepare_owner_arrivals(window_transitions, previous_micros, exposure_micros);
         self.prepare_owner_supplies(context, slot_count)?;
+        let owner_initial_key_counts = context
+            .history
+            .owner_key_counts(0)
+            .and_then(|counts| counts.get(..self.owner_supply_scratch.len()))
+            .ok_or(PlantError::MetricCapacity)?;
+        let owner_initial_active_attempt_counts = self
+            .previous_owner_active_attempt_counts
+            .get(..self.owner_supply_scratch.len())
+            .ok_or(PlantError::MetricCapacity)?;
         bucket_window_transitions(
             window_transitions,
             previous_micros,
@@ -2265,48 +2390,12 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             self.configuration.core().resource_window_group_count_max,
             &mut self.capacity_transition_scratch,
         )?;
-        let completed_attempts = self
-            .capacity_transition_scratch
-            .iter()
-            .map(|group| group.completed_attempts())
-            .fold(0_u32, u32::saturating_add);
-        let started_attempts = self
-            .capacity_transition_scratch
-            .iter()
-            .map(|group| group.started_attempts())
-            .fold(0_u32, u32::saturating_add);
-        let mut final_busy_slots = initial_busy_slots;
-        let mut previous_offset = 0_u64;
-        let mut busy_slot_micros = 0_u128;
-        for group in &self.capacity_transition_scratch {
-            busy_slot_micros = busy_slot_micros
-                .checked_add(
-                    u128::from(group.offset_micros() - previous_offset)
-                        * u128::from(final_busy_slots),
-                )
-                .ok_or(PlantError::MetricCapacity)?;
-            final_busy_slots = final_busy_slots
-                .checked_add(group.started_attempts())
-                .and_then(|state| state.checked_sub(group.completed_attempts()))
-                .ok_or(PlantError::MetricCapacity)?;
-            previous_offset = group.offset_micros();
-        }
-        busy_slot_micros = busy_slot_micros
-            .checked_add(
-                u128::from(exposure_micros - previous_offset) * u128::from(final_busy_slots),
-            )
-            .ok_or(PlantError::MetricCapacity)?;
-        let occupancy = u64::try_from(busy_slot_micros).map_err(|_| PlantError::MetricCapacity)?;
-        let exposure_seconds = Duration::from_micros(exposure_micros).as_secs_f64();
-        let current = CapacityWindow {
-            concurrency: Duration::from_micros(occupancy).as_secs_f64() / exposure_seconds,
-            exposure_seconds,
-            completed_attempts,
-            started_attempts,
+        let current = capacity_window(
+            &self.capacity_transition_scratch,
             initial_busy_slots,
-            final_busy_slots,
-            busy_slot_micros: u128::from(occupancy),
-        };
+            exposure_micros,
+        )?;
+        let final_busy_slots = current.final_busy_slots;
         self.latest_capacity_window = Some(current);
         self.observation.set_resource_observation_with_owners(
             current.evidence()?,
@@ -2316,13 +2405,25 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
                 OwnerCapacity::new(
                     self.configuration.core().slots_per_replica,
                     &self.owner_supply_scratch,
-                    &self.owner_arrival_offset_scratch,
-                    &self.owner_arrival_owner_scratch,
+                    owner_initial_key_counts,
+                    owner_initial_active_attempt_counts,
+                    &self.previous_owner_work_labels,
+                    (
+                        &self.owner_arrival_offset_scratch,
+                        &self.owner_arrival_owner_scratch,
+                        &self.owner_arrival_key_scratch,
+                    ),
                 )?,
-            ),
+            )?,
             initial_available_attempts,
             final_busy_slots,
             &self.capacity_transition_scratch,
+        )?;
+        self.observation.set_resource_service_evidence(
+            &self.completion_offset_scratch,
+            &self.completion_duration_scratch,
+            &self.initial_live_age_scratch,
+            &self.final_live_age_scratch,
         )?;
         self.capacity_evidence_sample = CapacityEvidenceSample::Window(current.sample());
         Ok(())
@@ -2425,12 +2526,13 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         let capacity_sample = self.capacity_evidence_sample;
         let diagnostic_seed = self.diagnostic_seed;
         let observation = self.observation.observation();
+        let capacity_evidence = observation.occupancy_trace_evidence();
         let capacity_predictive = Self::capacity_prediction(
             &mut self.state,
             capacity_sample,
             diagnostic_seed,
             context.now_micros,
-            observation.occupancy_trace_evidence(),
+            capacity_evidence.as_ref(),
         )?;
         let decision = step(&mut self.state, &mut self.scratch, observation);
         let desired = context
@@ -2531,6 +2633,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             runner_up_late_area_mean: f64::NAN,
             runner_up_replica_seconds_mean: f64::NAN,
             runner_up_cost: f64::NAN,
+            paired_standard_error: f64::NAN,
             arrival_rate_per_second: diagnostics.arrival_rate_per_second,
             arrival_evidence: self.arrival_evidence_sample,
             arrival_predictive_low_count: arrival.quantiles[0],
@@ -2718,7 +2821,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         sample: CapacityEvidenceSample,
         diagnostic_seed: u64,
         now_micros: u64,
-        evidence: Option<OccupancyTraceEvidence<'_>>,
+        evidence: Option<&OccupancyTraceEvidence<'_>>,
     ) -> Result<CapacityPrediction, PlantError> {
         let rank_offset = predictive_rank_offset(diagnostic_seed, now_micros);
         match sample {
@@ -2727,7 +2830,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
                 let evidence = evidence.ok_or(PlantError::MetricCapacity)?;
                 let observed = window.completed_attempts;
                 let summary = state.completion_predictive_summary(
-                    evidence,
+                    *evidence,
                     diagnostic_seed ^ now_micros.rotate_left(17),
                     observed,
                     [0.1_f64, 0.5_f64, 0.9_f64],
@@ -2929,6 +3032,50 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
 /// boundary state equals the exact state at that time. One group is a
 /// simultaneous batch at its boundary; the certified intake checks the net
 /// state, so every physically valid transition stream stays representable.
+fn capacity_window(
+    transitions: &[OccupancyTransition],
+    initial_busy_slots: u32,
+    exposure_micros: u64,
+) -> Result<CapacityWindow, PlantError> {
+    let completed_attempts = transitions
+        .iter()
+        .map(|group| group.completed_attempts())
+        .fold(0_u32, u32::saturating_add);
+    let started_attempts = transitions
+        .iter()
+        .map(|group| group.started_attempts())
+        .fold(0_u32, u32::saturating_add);
+    let mut final_busy_slots = initial_busy_slots;
+    let mut previous_offset = 0_u64;
+    let mut busy_slot_micros = 0_u128;
+    for group in transitions {
+        busy_slot_micros = busy_slot_micros
+            .checked_add(
+                u128::from(group.offset_micros() - previous_offset) * u128::from(final_busy_slots),
+            )
+            .ok_or(PlantError::MetricCapacity)?;
+        final_busy_slots = final_busy_slots
+            .checked_add(group.started_attempts())
+            .and_then(|state| state.checked_sub(group.completed_attempts()))
+            .ok_or(PlantError::MetricCapacity)?;
+        previous_offset = group.offset_micros();
+    }
+    busy_slot_micros = busy_slot_micros
+        .checked_add(u128::from(exposure_micros - previous_offset) * u128::from(final_busy_slots))
+        .ok_or(PlantError::MetricCapacity)?;
+    let occupancy = u64::try_from(busy_slot_micros).map_err(|_| PlantError::MetricCapacity)?;
+    let exposure_seconds = Duration::from_micros(exposure_micros).as_secs_f64();
+    Ok(CapacityWindow {
+        concurrency: Duration::from_micros(occupancy).as_secs_f64() / exposure_seconds,
+        exposure_seconds,
+        completed_attempts,
+        started_attempts,
+        initial_busy_slots,
+        final_busy_slots,
+        busy_slot_micros: u128::from(occupancy),
+    })
+}
+
 fn bucket_window_transitions(
     transitions: &[AttemptTransition],
     window_start_micros: u64,
@@ -2990,6 +3137,24 @@ fn bucket_window_transitions(
             || group.started_attempts() > 0
             || group.available_attempts() > 0
     });
+    Ok(())
+}
+
+fn update_live_attempt_starts(
+    live_starts: &mut Vec<u64>,
+    transition: AttemptTransition,
+) -> Result<(), PlantError> {
+    match transition.kind {
+        AttemptTransitionKind::Start => live_starts.push(transition.started_at_micros),
+        AttemptTransitionKind::Completion => {
+            let index = live_starts
+                .iter()
+                .position(|started| *started == transition.started_at_micros)
+                .ok_or(PlantError::MetricCapacity)?;
+            live_starts.swap_remove(index);
+        }
+        AttemptTransitionKind::Available => {}
+    }
     Ok(())
 }
 
@@ -3176,7 +3341,14 @@ impl<Workload: TickGenerator> TickGenerator for ClosedLoop<Workload> {
             calendar.as_ref(),
             &scheduled_releases,
         )?;
-        self.apply_decision(&context, inputs, reporter)
+        let result = self.apply_decision(&context, inputs, reporter);
+        self.previous_owner_active_attempt_counts.clear();
+        self.previous_owner_active_attempt_counts
+            .extend_from_slice(context.owner_active_attempt_counts);
+        self.previous_owner_work_labels.clear();
+        self.previous_owner_work_labels
+            .extend_from_slice(context.owner_work_labels);
+        result
     }
 
     fn metric_polled(

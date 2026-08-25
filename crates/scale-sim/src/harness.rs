@@ -30,6 +30,10 @@ pub struct TickContext<'a> {
     pub completed_settlements: &'a [Settlement],
     /// Exact handler-slot transitions through this tick.
     pub attempt_transitions: &'a [crate::AttemptTransition],
+    /// Active attempt counts for each owner at this time.
+    pub owner_active_attempt_counts: &'a [u32],
+    /// Key labels for all active and queued attempts at this time.
+    pub owner_work_labels: &'a [u32],
 }
 
 /// Paired Normal backlog columns for all partitions.
@@ -426,6 +430,7 @@ pub struct TickHistory {
     active_handlers: Vec<u32>,
     available_attempts: Vec<u32>,
     dispatchable_demand_ceiling: Vec<u32>,
+    owner_key_counts: Vec<u32>,
     handler_occupancy_micros: Vec<u64>,
     attempt_transition_count: Vec<usize>,
     useful_completions: Vec<u32>,
@@ -449,6 +454,7 @@ pub struct TickHistory {
     partition_normal_backlog: Vec<u32>,
     partition_owners: Vec<u32>,
     partition_count: usize,
+    owner_count: usize,
     cursor: usize,
     length: usize,
 }
@@ -494,6 +500,7 @@ impl TickHistory {
             active_handlers: vec![0; capacity],
             available_attempts: vec![0; capacity],
             dispatchable_demand_ceiling: vec![0; capacity],
+            owner_key_counts: vec![0; partition_cell_count],
             handler_occupancy_micros: vec![0; capacity],
             attempt_transition_count: vec![0; capacity],
             useful_completions: vec![0; capacity],
@@ -517,6 +524,7 @@ impl TickHistory {
             partition_normal_backlog: vec![0; partition_cell_count],
             partition_owners: vec![0; partition_cell_count],
             partition_count,
+            owner_count: partition_count,
             cursor: 0,
             length: 0,
         })
@@ -533,6 +541,7 @@ impl TickHistory {
         inputs: TickInputs,
         partition_normal_backlog: &[u32],
         partition_owners: &[u32],
+        owner_key_counts: &[u32],
     ) {
         let index = self.cursor;
         self.now_micros[index] = now_micros;
@@ -576,6 +585,9 @@ impl TickHistory {
         self.partition_normal_backlog[partition_start..partition_end]
             .copy_from_slice(partition_normal_backlog);
         self.partition_owners[partition_start..partition_end].copy_from_slice(partition_owners);
+        let owner_start = index * self.owner_count;
+        let owner_end = owner_start + self.owner_count;
+        self.owner_key_counts[owner_start..owner_end].copy_from_slice(owner_key_counts);
         self.cursor = (self.cursor + 1) % self.now_micros.len();
         self.length = (self.length + 1).min(self.now_micros.len());
     }
@@ -673,6 +685,15 @@ impl<'a> TickHistoryView<'a> {
     pub fn dispatchable_demand_ceiling(self, steps_back: usize) -> Option<u32> {
         self.index(steps_back)
             .map(|index| self.history.dispatchable_demand_ceiling[index])
+    }
+
+    /// Returns each owner's capped key count for one newest-first offset.
+    #[must_use]
+    pub fn owner_key_counts(self, steps_back: usize) -> Option<&'a [u32]> {
+        let index = self.index(steps_back)?;
+        let start = index * self.history.owner_count;
+        let end = start + self.history.owner_count;
+        Some(&self.history.owner_key_counts[start..end])
     }
 
     /// Returns cumulative handler occupancy for one newest-first offset.
@@ -858,6 +879,8 @@ pub struct SimulationHarness<Graph, Model = DefaultTickAttemptModel> {
     partition_normal_oldest_release_micros: Vec<u64>,
     partition_failure_backlog: Vec<u32>,
     partition_failure_release_micros: Vec<u64>,
+    owner_active_attempt_counts: Vec<u32>,
+    owner_work_labels: Vec<u32>,
 }
 
 impl<Graph: TickGenerator> SimulationHarness<Graph, DefaultTickAttemptModel> {
@@ -926,6 +949,8 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             partition_normal_oldest_release_micros: vec![0; partition_capacity],
             partition_failure_backlog: vec![0; partition_capacity],
             partition_failure_release_micros: vec![0; partition_capacity],
+            owner_active_attempt_counts: Vec::with_capacity(partition_capacity),
+            owner_work_labels: Vec::new(),
         })
     }
 
@@ -960,6 +985,8 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
                 },
                 completed_settlements: self.plant.completed_settlements(),
                 attempt_transitions: self.plant.attempt_transitions(),
+                owner_active_attempt_counts: &[],
+                owner_work_labels: &[],
             },
             self.published_replicas,
             self.plant.in_flight_replicas(),
@@ -991,6 +1018,8 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             },
             completed_settlements: self.plant.completed_settlements(),
             attempt_transitions: &[],
+            owner_active_attempt_counts: &[],
+            owner_work_labels: &[],
         };
         let inputs = self.graph.calculate(schedule_context)?;
         self.plant.attempt_model.update(inputs);
@@ -1010,6 +1039,8 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             },
             completed_settlements: &[],
             attempt_transitions: &[],
+            owner_active_attempt_counts: &[],
+            owner_work_labels: &[],
         };
         let mut event_sink = EventSink {
             graph: &self.graph,
@@ -1018,18 +1049,7 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             partition_count: self.partition_count,
             key_count: self.key_count,
         };
-        event_sink.add(
-            &event_context,
-            inputs,
-            crate::EventSource::Message,
-            inputs.message_count,
-        )?;
-        event_sink.add(
-            &event_context,
-            inputs,
-            crate::EventSource::Timer,
-            inputs.timer_count,
-        )?;
+        event_sink.add_inputs(&event_context, inputs)?;
         let after = self.plant.advance_until(now_micros);
         self.plant.write_partition_backlogs(
             now_micros,
@@ -1038,6 +1058,10 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             &mut self.partition_failure_backlog,
             &mut self.partition_failure_release_micros,
         )?;
+        self.plant.write_owner_work_labels(
+            &mut self.owner_active_attempt_counts,
+            &mut self.owner_work_labels,
+        );
         let observed_inputs = self.graph.observe(
             TickContext {
                 now_micros,
@@ -1055,6 +1079,8 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
                 },
                 completed_settlements: self.plant.completed_settlements(),
                 attempt_transitions: self.plant.attempt_transitions(),
+                owner_active_attempt_counts: &self.owner_active_attempt_counts,
+                owner_work_labels: &self.owner_work_labels,
             },
             inputs,
         )?;
@@ -1068,6 +1094,7 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             observed_inputs,
             &self.partition_normal_backlog,
             self.plant.partition_owners(),
+            self.plant.owner_key_counts(),
         );
         self.tick_index = self.tick_index.saturating_add(1);
         Ok(after)
@@ -1108,6 +1135,20 @@ struct EventSink<'a, Graph, Model> {
 }
 
 impl<Graph: TickGenerator, Model: AttemptModel> EventSink<'_, Graph, Model> {
+    fn add_inputs(
+        &mut self,
+        context: &TickContext<'_>,
+        inputs: TickInputs,
+    ) -> Result<(), PlantError> {
+        for (source, count) in [
+            (crate::EventSource::Message, inputs.message_count),
+            (crate::EventSource::Timer, inputs.timer_count),
+        ] {
+            self.add(context, inputs, source, count)?;
+        }
+        Ok(())
+    }
+
     fn add(
         &mut self,
         context: &TickContext<'_>,

@@ -1,16 +1,20 @@
 use std::{
-    f64::consts::{E, LOG2_E},
+    borrow::Borrow,
+    collections::HashMap,
+    f64::consts::{E, LOG2_E, PI},
+    iter::repeat_n,
     mem::size_of,
     time::Duration,
 };
 
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
-use statrs::distribution::{Beta, ContinuousCDF, Gamma, LogNormal};
-use statrs::function::gamma::{gamma_lr, gamma_ur};
+use rand_distr::{Binomial, Distribution};
+use statrs::distribution::{Beta, ContinuousCDF, Gamma, LogNormal, Normal};
+use statrs::function::gamma::{gamma_lr, gamma_ur, ln_gamma};
 use thiserror::Error;
 
 use crate::change_point::ChangePointKernel;
-use crate::random::RandomStream;
+use crate::random::{PoissonMean, RandomStream, sample_gamma, sample_poisson};
 use crate::types::prior_artifact_contract_holds;
 use crate::{
     OccupancyTraceEvidence, PriorArtifact, PriorArtifactBudget, PriorArtifactIdentity,
@@ -19,12 +23,43 @@ use crate::{
 
 const CAPACITY_MODEL_STORAGE_BYTES_MAX: usize = 512 * 1_024 * 1_024;
 const CAPACITY_MODEL_ARTIFACT_SOURCE: u64 = 0x4341_5041_4349_5459;
-const CAPACITY_MODEL_ARTIFACT_VERSION: u32 = 2;
-/// One capacity update can use at most 13 million simple operations.
+const CAPACITY_MODEL_ARTIFACT_VERSION: u32 = 5;
+const SERVICE_SHAPES: [u32; 6] = [1, 2, 4, 8, 16, 32];
+const SERVICE_CLOCKS: [ServiceClock; 7] = [
+    ServiceClock::Erlang(SERVICE_SHAPES[0]),
+    ServiceClock::Erlang(SERVICE_SHAPES[1]),
+    ServiceClock::Erlang(SERVICE_SHAPES[2]),
+    ServiceClock::Erlang(SERVICE_SHAPES[3]),
+    ServiceClock::Erlang(SERVICE_SHAPES[4]),
+    ServiceClock::Erlang(SERVICE_SHAPES[5]),
+    ServiceClock::Deterministic,
+];
+/// The completion predictive permits at most `1 / 64` rank error.
+const COMPLETION_PREDICTIVE_RANK_ERROR_MAX: f64 = 1.0_f64 / 64.0_f64;
+/// One predictive sweep uses at most 8,192 Monte Carlo draws.
 ///
-/// The price table has a maximum of 6,303,059 operations. Two-times headroom
-/// gives 12,606,118 operations. Rounding up gives 13,000,000 operations.
-const CAPACITY_UPDATE_OPERATION_COUNT_MAX: u64 = 13_000_000;
+/// The median has the largest rank standard error. The order-statistic normal
+/// approximation gives `sqrt(0.5 * 0.5 / 8,192) < 1 / 128`. This gives a
+/// factor-two margin against [`COMPLETION_PREDICTIVE_RANK_ERROR_MAX`].
+/// A smaller attempt contract keeps one stratum for each possible count.
+const COMPLETION_PREDICTIVE_DRAW_COUNT: u32 = 8_192;
+const _: () = assert!(
+    0.25_f64 / COMPLETION_PREDICTIVE_DRAW_COUNT as f64
+        <= (COMPLETION_PREDICTIVE_RANK_ERROR_MAX / 2.0_f64)
+            * (COMPLETION_PREDICTIVE_RANK_ERROR_MAX / 2.0_f64),
+    "the predictive draw count must satisfy the rank error bound"
+);
+const WITHIN_CELL_NEWTON_STEPS: u64 = 5;
+/// The within-cell Laplace evidence has relative error at most `8 / n`.
+///
+/// This Bernstein-von-Mises bound applies when the mode is interior, the
+/// curvature is positive, and `n` completed durations are available.
+const WITHIN_CELL_LAPLACE_ERROR_CONSTANT: f64 = 8.0_f64;
+/// One capacity update can use at most 1.6 billion simple operations.
+///
+/// The duration price table has a maximum below 800 million operations.
+/// Two-times headroom fits the rounded bound.
+const CAPACITY_UPDATE_OPERATION_COUNT_MAX: u64 = 1_600_000_000;
 const REPORT_CLOCK_ERROR_SECONDS: f64 = 1.0e-6_f64;
 /// The residual check has a one-percent test size.
 ///
@@ -57,11 +92,20 @@ const CAPACITY_MODEL_BUDGET: PriorArtifactBudget = PriorArtifactBudget::new(
 );
 /// Versioned prior and approximation limits for the capacity model.
 ///
-/// Version 2 uses the certified event-path sampling model. It assigns one
+/// Version 5 uses at most 8,192 completion-predictive draws. The median rank
+/// error has a factor-two margin below the authorized `1 / 64`
+/// error. This version uses labeled key queues for generative completion
+/// sampling. One
+/// fleet clock applies fleet-wide state rates to all owner queues. It uses
+/// observed arrivals as exogenous events. Sampled completions close keys.
+/// The update still conditions on the observed occupancy and duration paths.
+/// It assigns one
 /// affected window and nine clean windows to observation quality. It assigns
 /// equal prior odds to the bounded knee family and the no-knee family. Within
 /// the knee family, it assigns equal odds to no collapse and positive collapse.
-/// The quadratic collapse law represents pairwise contention after the knee.
+/// The clock family gives equal prior odds to six Erlang clocks and one
+/// deterministic clock. The deterministic clock is the exact infinite-shape
+/// Erlang limit. The quadratic collapse law represents pairwise contention.
 /// Busy-state coverage is unverified. The artifact records no per-busy-state
 /// coverage. A labelled plant corpus can replace these judgments under a new
 /// version.
@@ -76,8 +120,8 @@ struct CapacityModelArtifact {
     observation_quality_beta: f64,
     no_knee_probability: f64,
     no_collapse_probability: f64,
-    markov_clock_assumption: MarkovClockAssumption,
-    start_delay_evidence: StartDelayEvidence,
+    service_clock_assumption: ServiceClockAssumption,
+    service_duration_evidence: ServiceDurationEvidence,
     resource_window_group_count_max: u32,
 }
 
@@ -100,15 +144,26 @@ impl CapacityModelArtifact {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MarkovClockAssumption {
-    MemorylessAggregateCompletions,
+enum ServiceClockAssumption {
+    ErlangAndDeterministicRenewal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StartDelayEvidence {
-    /// The model discards start-delay evidence. No factor recovers this
-    /// evidence.
-    DiscardedWithoutRecovery,
+enum ServiceClock {
+    Erlang(u32),
+    Deterministic,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OwnerKeyLayout {
+    Unique,
+    Serialized,
+    General,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceDurationEvidence {
+    ObservedAttemptDurationsAndBoundaryAges,
 }
 
 /// Time-rescaled residual evidence for the aggregate completion clock.
@@ -573,6 +628,31 @@ struct GeneratedWindow {
     completed: u32,
 }
 
+#[derive(Clone, Copy)]
+struct DurationStatistics {
+    completion_count: u32,
+    duration_sum_seconds: f64,
+    log_duration_sum_seconds: f64,
+}
+
+struct WithinCellPosterior<'a, 'b> {
+    shape: u32,
+    low: f64,
+    high: f64,
+    evidence: &'a OccupancyTraceEvidence<'b>,
+    statistics: DurationStatistics,
+    aggregate_count: u32,
+    prior: CapacityPrior,
+}
+
+struct DeterministicWithinCellPosterior<'a, 'b> {
+    low: f64,
+    high: f64,
+    evidence: &'a OccupancyTraceEvidence<'b>,
+    aggregate_count: u32,
+    prior: CapacityPrior,
+}
+
 pub(crate) struct CapacityFactor {
     simd_level: Level,
     grid: CapacityGrid,
@@ -584,6 +664,9 @@ pub(crate) struct CapacityFactor {
     prior_weights: Vec<f64>,
     weights: Vec<f64>,
     likelihoods: Vec<f64>,
+    shape_weights: [f64; SERVICE_CLOCKS.len()],
+    shape_scores: Vec<f64>,
+    shape_cell_weights: Vec<f64>,
     hazard_rates_per_second: Vec<f64>,
     contamination_probabilities: Vec<f64>,
     /// Provides the normalized linear view of `filter_log_weights`.
@@ -594,6 +677,21 @@ pub(crate) struct CapacityFactor {
     observation_clock_micros: u64,
     previous_window_concurrency: Option<f64>,
     completion_coefficients: Vec<f64>,
+    predictive_stage_scratch: Vec<f64>,
+    predictive_owner_snapshot: Vec<OwnerGeneratedWindow>,
+    predictive_owner_scratch: Vec<OwnerGeneratedWindow>,
+    predictive_arrival_key_scratch: Vec<usize>,
+    predictive_owner_key_index_scratch: HashMap<u64, usize>,
+    predictive_owner_count_scratch: Vec<OwnerCount>,
+    predictive_owner_key_scratch: Vec<u64>,
+    predictive_owner_slot_scratch: Vec<u64>,
+    duration_rates: Vec<f64>,
+    duration_log_rate_modes: Vec<f64>,
+    duration_log_rate_curvatures: Vec<f64>,
+    duration_log_rate_lows: Vec<f64>,
+    duration_log_rate_highs: Vec<f64>,
+    duration_draw_cdf_lows: Vec<f64>,
+    duration_draw_cdf_highs: Vec<f64>,
     state_exposure_seconds: Vec<f64>,
     state_completion_counts: Vec<u32>,
     state_rates: Vec<f64>,
@@ -663,6 +761,8 @@ impl CapacityFactor {
             filter_count,
         );
         let filter_log_weights = filter_weights.iter().map(|weight| weight.ln()).collect();
+        let (duration_log_rate_modes, duration_log_rate_lows, duration_log_rate_highs) =
+            duration_log_rate_bounds(&grid);
         Ok(Self {
             simd_level: Level::new(),
             grid,
@@ -674,6 +774,12 @@ impl CapacityFactor {
             weights: prior_weights.clone(),
             prior_weights,
             likelihoods: vec![0.0_f64; cell_count],
+            shape_weights: [1.0_f64 / f64::from(SERVICE_CLOCKS.len() as u32); SERVICE_CLOCKS.len()],
+            shape_scores: vec![0.0_f64; cell_count * SERVICE_CLOCKS.len()],
+            shape_cell_weights: vec![
+                1.0_f64 / f64::from(SERVICE_CLOCKS.len() as u32);
+                cell_count * SERVICE_CLOCKS.len()
+            ],
             hazard_rates_per_second,
             contamination_probabilities,
             filter_log_weights,
@@ -682,6 +788,21 @@ impl CapacityFactor {
             observation_clock_micros: 0,
             previous_window_concurrency: None,
             completion_coefficients: vec![0.0_f64; attempt_count_max as usize + 1],
+            predictive_stage_scratch: Vec::with_capacity(attempt_count_max as usize),
+            predictive_owner_snapshot: Vec::with_capacity(group_count_max as usize),
+            predictive_owner_scratch: Vec::with_capacity(group_count_max as usize),
+            predictive_arrival_key_scratch: Vec::with_capacity(attempt_count_max as usize),
+            predictive_owner_key_index_scratch: HashMap::with_capacity(attempt_count_max as usize),
+            predictive_owner_count_scratch: Vec::with_capacity(group_count_max as usize),
+            predictive_owner_key_scratch: Vec::with_capacity(attempt_count_max as usize),
+            predictive_owner_slot_scratch: Vec::with_capacity(attempt_count_max as usize),
+            duration_rates: vec![0.0_f64; cell_count],
+            duration_log_rate_modes,
+            duration_log_rate_curvatures: vec![1.0e24_f64; cell_count * SERVICE_CLOCKS.len()],
+            duration_log_rate_lows,
+            duration_log_rate_highs,
+            duration_draw_cdf_lows: vec![0.0_f64; cell_count * SERVICE_CLOCKS.len()],
+            duration_draw_cdf_highs: vec![1.0_f64; cell_count * SERVICE_CLOCKS.len()],
             state_exposure_seconds: vec![0.0_f64; state_count],
             state_completion_counts: vec![0; state_count],
             state_rates: vec![0.0_f64; state_count],
@@ -695,6 +816,53 @@ impl CapacityFactor {
             discard_next_residual: false,
             markov_clock_rejected: false,
         })
+    }
+
+    fn fill_duration_draw_cdfs(&mut self) {
+        for cell in 0..self.weights.len() {
+            let cell_low = -self.grid.service_time_highs[cell].ln();
+            let cell_high = -self.grid.service_time_lows[cell].ln();
+            for (shape, clock) in SERVICE_CLOCKS.iter().copied().enumerate() {
+                let index = cell * SERVICE_CLOCKS.len() + shape;
+                let (low, high) = if clock == ServiceClock::Deterministic {
+                    (
+                        self.duration_log_rate_lows[index],
+                        self.duration_log_rate_highs[index],
+                    )
+                } else {
+                    (cell_low, cell_high)
+                };
+                if let Ok(normal) = Normal::new(
+                    self.duration_log_rate_modes[index],
+                    self.duration_log_rate_curvatures[index].sqrt().recip(),
+                ) {
+                    self.duration_draw_cdf_lows[index] = normal.cdf(low);
+                    self.duration_draw_cdf_highs[index] = normal.cdf(high);
+                }
+            }
+        }
+    }
+
+    fn prepare_completion_owners(
+        &mut self,
+        evidence: &OccupancyTraceEvidence<'_>,
+    ) -> (OwnerKeyLayout, bool) {
+        let layout = owner_key_layout(evidence, &mut self.predictive_owner_key_scratch);
+        let saturated = saturated_owner_window(
+            evidence,
+            layout,
+            &mut self.predictive_owner_key_scratch,
+            &mut self.predictive_owner_slot_scratch,
+        );
+        build_owner_depth_snapshot(
+            evidence,
+            &mut self.predictive_owner_snapshot,
+            &mut self.predictive_arrival_key_scratch,
+            &mut self.predictive_owner_key_index_scratch,
+        );
+        self.predictive_owner_scratch
+            .clone_from(&self.predictive_owner_snapshot);
+        (layout, saturated)
     }
 
     #[cfg(test)]
@@ -819,32 +987,91 @@ impl CapacityFactor {
     /// Live-attempt ages do not change the model's memoryless completion draw.
     fn completion_predictive_sweep(
         &mut self,
-        evidence: OccupancyTraceEvidence<'_>,
+        evidence: &OccupancyTraceEvidence<'_>,
         seed: u64,
         count_max: u32,
         mut visit: impl FnMut(u32, f64) -> bool,
     ) {
         self.completion_coefficients.fill(0.0_f64);
-        let sample_count = self.completion_coefficients.len() as u32;
+        let (owner_key_layout, saturated_owner_window) = self.prepare_completion_owners(evidence);
+        self.fill_duration_draw_cdfs();
+        let sample_count =
+            COMPLETION_PREDICTIVE_DRAW_COUNT.min(self.completion_coefficients.len() as u32);
+        let sample_count_reciprocal = f64::from(sample_count).recip();
         let mut cell = 0_usize;
         let mut cumulative = self.weights[0];
         for scenario in 0..sample_count {
             let mut random = RandomStream::new(seed)
                 .domain(0x636f_6d70_6c65_7465)
                 .domain(u64::from(scenario));
-            let posterior_draw = (f64::from(scenario) + 0.5_f64) / f64::from(sample_count);
+            let posterior_draw = (f64::from(scenario) + 0.5_f64) * sample_count_reciprocal;
             while posterior_draw > cumulative && cell + 1 < self.weights.len() {
                 cell += 1;
                 cumulative += self.weights[cell];
             }
+            let shape_scenario = scenario.wrapping_mul(2_653_443_761) % sample_count;
+            let shape_draw = (f64::from(shape_scenario) + 0.5_f64) * sample_count_reciprocal;
+            let shape_start = cell * SERVICE_CLOCKS.len();
+            let shape_weights =
+                &self.shape_cell_weights[shape_start..shape_start + SERVICE_CLOCKS.len()];
+            let mut shape_index = 0_usize;
+            let mut shape_cumulative = shape_weights[0];
+            while shape_draw > shape_cumulative && shape_index + 1 < SERVICE_CLOCKS.len() {
+                shape_index += 1;
+                shape_cumulative += shape_weights[shape_index];
+            }
+            let rate_index = cell * SERVICE_CLOCKS.len() + shape_index;
+            let mut rate_random = RandomStream::new(seed)
+                .domain(0x7261_7465_5f64_7261)
+                .domain(u64::from(scenario));
+            let slot_rate = match SERVICE_CLOCKS[shape_index] {
+                ServiceClock::Erlang(_) => truncated_log_rate_draw(
+                    self.duration_log_rate_modes[rate_index],
+                    self.duration_log_rate_curvatures[rate_index],
+                    -self.grid.service_time_highs[cell].ln(),
+                    -self.grid.service_time_lows[cell].ln(),
+                    self.duration_draw_cdf_lows[rate_index],
+                    self.duration_draw_cdf_highs[rate_index],
+                    rate_random.open_unit_f64(),
+                ),
+                ServiceClock::Deterministic => deterministic_log_rate_draw(DeterministicRateDraw {
+                    mode: self.duration_log_rate_modes[rate_index],
+                    curvature: self.duration_log_rate_curvatures[rate_index],
+                    low: self.duration_log_rate_lows[rate_index],
+                    high: self.duration_log_rate_highs[rate_index],
+                    cell: (
+                        -self.grid.service_time_highs[cell].ln(),
+                        -self.grid.service_time_lows[cell].ln(),
+                    ),
+                    prior: self.grid.prior,
+                    lower_cdf: self.duration_draw_cdf_lows[rate_index],
+                    upper_cdf: self.duration_draw_cdf_highs[rate_index],
+                    draw: rate_random.open_unit_f64(),
+                }),
+            };
             let completed = generate_completion_count(
                 evidence,
-                &self.grid,
-                cell,
+                &CompletionWalk {
+                    grid: &self.grid,
+                    cell,
+                    clock: SERVICE_CLOCKS[shape_index],
+                    slot_rate,
+                },
                 evidence
                     .slot_count()
                     .min(evidence.dispatchable_demand_ceiling()),
                 &mut random,
+                CompletionGeneration {
+                    stages: &mut self.predictive_stage_scratch,
+                    owners: &mut self.predictive_owner_scratch,
+                    owner_snapshot: &self.predictive_owner_snapshot,
+                    arrival_keys: &self.predictive_arrival_key_scratch,
+                    owner_counts: &mut self.predictive_owner_count_scratch,
+                    owner_key_layout,
+                    saturated_owner_window,
+                    owner_keys: &self.predictive_owner_key_scratch,
+                    owner_slots: &self.predictive_owner_slot_scratch,
+                },
             );
             let bucket = match usize::try_from(completed) {
                 Ok(count) => count,
@@ -853,23 +1080,22 @@ impl CapacityFactor {
             .min(self.completion_coefficients.len() - 1);
             self.completion_coefficients[bucket] += 1.0_f64;
         }
-        let sample_count = f64::from(sample_count);
-        let mut cumulative = 0.0_f64;
-        for count in 0..=count_max {
-            cumulative += self.completion_coefficients[count as usize] / sample_count;
-            if !visit(count, cumulative.clamp(0.0_f64, 1.0_f64)) {
-                break;
-            }
-        }
+        visit_completion_cdf(
+            &self.completion_coefficients,
+            sample_count_reciprocal,
+            count_max,
+            &mut visit,
+        );
     }
 
-    pub(crate) fn completion_predictive_summary(
+    pub(crate) fn completion_predictive_summary<'a>(
         &mut self,
-        evidence: OccupancyTraceEvidence<'_>,
+        evidence: impl Borrow<OccupancyTraceEvidence<'a>>,
         seed: u64,
         observed: u32,
         thresholds: [f64; 3],
     ) -> CompletionPredictiveSummary {
+        let evidence = evidence.borrow();
         let count_max = self.completion_coefficients.len().saturating_sub(1) as u32;
         let mut quantile_counts = [count_max; 3];
         let mut quantile_found = [false; 3];
@@ -906,12 +1132,13 @@ impl CapacityFactor {
     }
 
     #[cfg(test)]
-    pub(crate) fn completion_predictive_cdf(
+    pub(crate) fn completion_predictive_cdf<'a>(
         &mut self,
-        evidence: OccupancyTraceEvidence<'_>,
+        evidence: impl Borrow<OccupancyTraceEvidence<'a>>,
         seed: u64,
         completed_attempts: u32,
     ) -> f64 {
+        let evidence = evidence.borrow();
         if completed_attempts as usize >= self.completion_coefficients.len() {
             return 1.0_f64;
         }
@@ -924,12 +1151,13 @@ impl CapacityFactor {
     }
 
     #[cfg(test)]
-    pub(crate) fn write_completion_predictive_cdfs(
+    pub(crate) fn write_completion_predictive_cdfs<'a>(
         &mut self,
-        evidence: OccupancyTraceEvidence<'_>,
+        evidence: impl Borrow<OccupancyTraceEvidence<'a>>,
         seed: u64,
         output: &mut [f64],
     ) {
+        let evidence = evidence.borrow();
         let count_max = output.len().saturating_sub(1) as u32;
         self.completion_predictive_sweep(evidence, seed, count_max, |count, cdf| {
             output[count as usize] = cdf;
@@ -980,7 +1208,12 @@ impl CapacityFactor {
     /// The update applies evidence to its interval start. It then advances
     /// the change process across the evidence interval.
     #[cfg_attr(feature = "hotpath", hotpath::measure(label = "capacity_update"))]
-    pub(crate) fn update(&mut self, evidence: OccupancyTraceEvidence<'_>, elapsed: Duration) {
+    pub(crate) fn update<'a>(
+        &mut self,
+        evidence: impl Borrow<OccupancyTraceEvidence<'a>>,
+        elapsed: Duration,
+    ) {
+        let evidence = evidence.borrow();
         let window = evidence.window();
         debug_assert!(
             evidence.mean_concurrency() <= self.concurrency_max,
@@ -1001,14 +1234,21 @@ impl CapacityFactor {
             &mut self.state_completion_counts,
         );
         self.update_residual_check(evidence);
-        for index in 0..self.grid.knee_cell_count as usize {
-            fill_knee_state_rates(&self.grid, index, &mut self.state_rates);
-            self.update_cell_likelihood(index, evidence);
+        let (offsets, durations, ..) = evidence.service_durations();
+        if offsets.is_empty() && !evidence.completion_groups().iter().all(|count| *count == 0) {
+            for index in 0..self.grid.knee_cell_count as usize {
+                fill_knee_state_rates(&self.grid, index, &mut self.state_rates);
+                self.update_path_likelihood(index);
+            }
+            for index in self.grid.knee_cell_count as usize..self.likelihoods.len() {
+                fill_no_knee_state_rates(&self.grid, index, &mut self.state_rates);
+                self.update_path_likelihood(index);
+            }
+        } else {
+            let statistics = duration_statistics(durations);
+            self.update_duration_likelihoods(evidence, statistics);
         }
-        for index in self.grid.knee_cell_count as usize..self.likelihoods.len() {
-            fill_no_knee_state_rates(&self.grid, index, &mut self.state_rates);
-            self.update_cell_likelihood(index, evidence);
-        }
+        self.update_shape_weights();
         let prior_predictive = log_weighted_sum(&self.prior_weights, &self.likelihoods);
         if posterior_update_eligible(prior_predictive) {
             self.update_filters(prior_predictive);
@@ -1022,13 +1262,155 @@ impl CapacityFactor {
     /// The observed path comes from an admission-controlled system. Every
     /// certified trace is feasible with probability one. The raw Markov path
     /// score is the exact conditional likelihood.
-    fn update_cell_likelihood(&mut self, index: usize, _: OccupancyTraceEvidence<'_>) {
-        let raw = path_log_score_with_rates(
+    fn update_path_likelihood(&mut self, index: usize) {
+        self.likelihoods[index] = path_log_score_with_rates(
             &self.state_rates,
             &self.state_exposure_seconds,
             &self.state_completion_counts,
         );
-        self.likelihoods[index] = raw;
+        let start = index * SERVICE_CLOCKS.len();
+        self.shape_scores[start..start + SERVICE_CLOCKS.len()].fill(self.likelihoods[index]);
+        self.shape_cell_weights[start..start + SERVICE_CLOCKS.len()]
+            .copy_from_slice(&self.shape_weights);
+    }
+
+    fn update_duration_likelihoods(
+        &mut self,
+        evidence: &OccupancyTraceEvidence<'_>,
+        statistics: DurationStatistics,
+    ) {
+        debug_assert!(
+            statistics.completion_count == 0
+                || WITHIN_CELL_LAPLACE_ERROR_CONSTANT / f64::from(statistics.completion_count)
+                    > 0.0_f64,
+            "the priced Laplace error bound must stay positive"
+        );
+        let concurrency = evidence.mean_concurrency().max(1.0_f64);
+        for (index, rate) in self.duration_rates.iter_mut().enumerate() {
+            *rate = throughput(
+                self.grid.service_times_seconds[index],
+                self.grid.capacities_per_second[index],
+                self.grid.collapse_values[index],
+                self.grid.no_knee[index] > 0.0_f64,
+                concurrency,
+            ) / concurrency;
+        }
+        for index in 0..self.duration_rates.len() {
+            let point_rate = self.duration_rates[index];
+            let low = -self.grid.service_time_highs[index].ln();
+            let high = -self.grid.service_time_lows[index].ln();
+            let aggregate_score =
+                aggregate_completion_log_score(&self.grid, index, &self.state_completion_counts);
+            let aggregate_count = self.state_completion_counts.iter().copied().sum::<u32>();
+            let start = index * SERVICE_CLOCKS.len();
+            for (shape_index, clock) in SERVICE_CLOCKS.iter().copied().enumerate() {
+                let mode_index = start + shape_index;
+                if clock == ServiceClock::Deterministic {
+                    let posterior = DeterministicWithinCellPosterior {
+                        low,
+                        high,
+                        evidence,
+                        aggregate_count,
+                        prior: self.grid.prior,
+                    };
+                    let (mode, curvature, score) =
+                        deterministic_within_cell_log_evidence(&posterior);
+                    self.duration_log_rate_modes[mode_index] = mode;
+                    self.duration_log_rate_curvatures[mode_index] = curvature;
+                    let (feasible_low, feasible_high) =
+                        deterministic_feasible_interval(evidence, low, high);
+                    self.duration_log_rate_lows[mode_index] = feasible_low;
+                    self.duration_log_rate_highs[mode_index] = feasible_high;
+                    self.shape_scores[mode_index] =
+                        score + aggregate_score - f64::from(aggregate_count) * point_rate.ln();
+                    continue;
+                }
+                let shape = match clock {
+                    ServiceClock::Erlang(shape) => shape,
+                    ServiceClock::Deterministic => continue,
+                };
+                if low.to_bits() == high.to_bits() {
+                    self.duration_log_rate_modes[mode_index] = low;
+                    self.duration_log_rate_curvatures[mode_index] = f64::INFINITY;
+                    self.shape_scores[mode_index] =
+                        duration_log_likelihood(shape, point_rate, evidence, statistics)
+                            + f64::from(aggregate_count) * low;
+                    self.shape_scores[mode_index] +=
+                        aggregate_score - f64::from(aggregate_count) * point_rate.ln();
+                    continue;
+                }
+                let posterior = WithinCellPosterior {
+                    shape,
+                    low,
+                    high,
+                    evidence,
+                    statistics,
+                    aggregate_count,
+                    prior: self.grid.prior,
+                };
+                let (mode, curvature) =
+                    within_cell_mode(point_rate.ln().clamp(low, high), &posterior);
+                self.duration_log_rate_modes[mode_index] = mode;
+                self.duration_log_rate_curvatures[mode_index] = curvature;
+                self.shape_scores[mode_index] =
+                    within_cell_laplace_log_evidence(mode, curvature, &posterior);
+                self.shape_scores[mode_index] +=
+                    aggregate_score - f64::from(aggregate_count) * point_rate.ln();
+            }
+            self.likelihoods[index] = log_weighted_sum(
+                &self.shape_weights,
+                &self.shape_scores[start..start + SERVICE_CLOCKS.len()],
+            );
+            normalize_log_weights(
+                &self.shape_weights,
+                &self.shape_scores[start..start + SERVICE_CLOCKS.len()],
+                &mut self.shape_cell_weights[start..start + SERVICE_CLOCKS.len()],
+            );
+        }
+    }
+
+    fn update_shape_weights(&mut self) {
+        let mut predictive = [f64::NEG_INFINITY; SERVICE_CLOCKS.len()];
+        for (shape, score) in predictive.iter_mut().enumerate() {
+            let mut maximum = f64::NEG_INFINITY;
+            for cell in 0..self.weights.len() {
+                maximum = maximum.max(
+                    self.weights[cell].ln()
+                        + self.shape_scores[cell * SERVICE_CLOCKS.len() + shape],
+                );
+            }
+            let mut sum = 0.0_f64;
+            for cell in 0..self.weights.len() {
+                sum += (self.weights[cell].ln()
+                    + self.shape_scores[cell * SERVICE_CLOCKS.len() + shape]
+                    - maximum)
+                    .exp();
+            }
+            *score = maximum + sum.ln();
+        }
+        let maximum = self
+            .shape_weights
+            .iter()
+            .zip(predictive)
+            .filter(|(weight, score)| **weight > 0.0_f64 && score.is_finite())
+            .map(|(weight, score)| weight.ln() + score)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let normalizer = self
+            .shape_weights
+            .iter()
+            .zip(predictive)
+            .filter(|(weight, score)| **weight > 0.0_f64 && score.is_finite())
+            .map(|(weight, score)| (weight.ln() + score - maximum).exp())
+            .sum::<f64>();
+        let previous = self.shape_weights;
+        for shape in 0..SERVICE_CLOCKS.len() {
+            self.shape_weights[shape] =
+                if previous[shape] > 0.0_f64 && predictive[shape].is_finite() {
+                    (previous[shape].ln() + predictive[shape] - maximum).exp() / normalizer
+                } else {
+                    0.0_f64
+                };
+        }
     }
 
     pub(crate) fn omit_observation(&mut self, elapsed: Duration) {
@@ -1064,7 +1446,22 @@ impl CapacityFactor {
         }
     }
 
-    fn update_residual_check(&mut self, evidence: OccupancyTraceEvidence<'_>) {
+    fn update_residual_check(&mut self, evidence: &OccupancyTraceEvidence<'_>) {
+        let (offsets, durations, ..) = evidence.service_durations();
+        if !durations.is_empty() {
+            for (&offset, &duration) in offsets.iter().zip(durations) {
+                let pit = self.duration_predictive_pit(evidence, offset, duration);
+                self.record_residual(pit);
+            }
+            if self.residual_sample_count > 0 {
+                let sample_count = f64::from(self.residual_sample_count);
+                let alpha = RESIDUAL_REJECTION_PROBABILITY;
+                let dkw_bound = (-(alpha * 0.5_f64).ln() / (2.0_f64 * sample_count)).sqrt();
+                self.refresh_residual_check(sample_count);
+                self.markov_clock_rejected = self.residual_maximum_distance > dkw_bound;
+            }
+            return;
+        }
         let mut state = evidence.initial_busy_slots() as usize;
         let mut previous_offset = 0_u64;
         for ((&offset, &completed), &started) in evidence
@@ -1080,7 +1477,7 @@ impl CapacityFactor {
                     self.discard_next_residual = false;
                 } else {
                     let residual = self.predictive_residual(completed);
-                    self.record_residual(residual);
+                    self.record_residual(-(-residual).exp_m1());
                 }
                 self.residual_integrated_hazards.fill(0.0_f64);
             }
@@ -1100,6 +1497,56 @@ impl CapacityFactor {
             // Decision gating waits for a calibrated rejection rule.
             self.markov_clock_rejected = self.residual_maximum_distance > dkw_bound;
         }
+    }
+
+    fn duration_predictive_pit(
+        &self,
+        evidence: &OccupancyTraceEvidence<'_>,
+        offset_micros: u64,
+        duration_micros: u64,
+    ) -> f64 {
+        let entry_micros = duration_micros.saturating_sub(offset_micros);
+        let concurrency = evidence.mean_concurrency().max(1.0_f64);
+        let mut predictive = 0.0_f64;
+        for cell in 0..self.weights.len() {
+            let rate = throughput(
+                self.grid.service_times_seconds[cell],
+                self.grid.capacities_per_second[cell],
+                self.grid.collapse_values[cell],
+                self.grid.no_knee[cell] > 0.0_f64,
+                concurrency,
+            ) / concurrency;
+            let total = Duration::from_micros(duration_micros).as_secs_f64() * rate;
+            let entry = Duration::from_micros(entry_micros).as_secs_f64() * rate;
+            for (shape_index, clock) in SERVICE_CLOCKS.iter().copied().enumerate() {
+                let (total_cdf, entry_cdf) = match clock {
+                    ServiceClock::Erlang(shape) => {
+                        let shape = f64::from(shape);
+                        (
+                            if total <= 0.0_f64 {
+                                0.0_f64
+                            } else {
+                                gamma_lr(shape, shape * total)
+                            },
+                            if entry <= 0.0_f64 {
+                                0.0_f64
+                            } else {
+                                gamma_lr(shape, shape * entry)
+                            },
+                        )
+                    }
+                    ServiceClock::Deterministic => {
+                        (f64::from(total >= 1.0_f64), f64::from(entry >= 1.0_f64))
+                    }
+                };
+                let conditional =
+                    (total_cdf - entry_cdf) / (1.0_f64 - entry_cdf).max(f64::MIN_POSITIVE);
+                predictive += self.weights[cell]
+                    * self.shape_weights[shape_index]
+                    * conditional.clamp(0.0_f64, 1.0_f64);
+            }
+        }
+        predictive.clamp(0.0_f64, 1.0_f64)
     }
 
     fn add_residual_exposure(&mut self, state: usize, exposure: f64) {
@@ -1150,7 +1597,7 @@ impl CapacityFactor {
             let index = u32::try_from(index).unwrap_or(u32::MAX);
             let lower = f64::from(index) / sample_count;
             let upper = f64::from(index.saturating_add(1)) / sample_count;
-            let cdf = -(-residual).exp_m1();
+            let cdf = residual;
             maximum = maximum.max((cdf - lower).abs());
             maximum = maximum.max((upper - cdf).abs());
         }
@@ -1562,13 +2009,40 @@ fn capacity_update_operation_count(allocation: CapacityAllocation) -> Option<u64
         .checked_mul(sort_levels)?
         .checked_mul(2)?
         .checked_add(attempts.checked_mul(2)?)?;
+    // One merge builds the completion statistics. Each rate group then scores
+    // six Erlang clocks. The deterministic clock uses indicators and one
+    // closed-form marginal. Boundary ages stay bounded by the live-state limit.
+    let duration_summary_cost = attempts.checked_mul(5)?;
+    let rate_sort_cost = cells
+        .checked_mul(u64::from(cells.max(1).ilog2() + 1))?
+        .checked_mul(2)?;
+    let duration_density_cost = cells
+        .checked_mul((SERVICE_CLOCKS.len() - 1) as u64)?
+        .checked_mul(12)?
+        .checked_mul(WITHIN_CELL_NEWTON_STEPS + 1)?;
+    let duration_boundary_cost = cells
+        .checked_mul((SERVICE_CLOCKS.len() - 1) as u64)?
+        .checked_mul(states)?
+        .checked_mul(20)?
+        .checked_mul(WITHIN_CELL_NEWTON_STEPS + 1)?;
+    let duration_cost = duration_summary_cost
+        .checked_add(rate_sort_cost)?
+        .checked_add(duration_density_cost)?
+        .checked_add(duration_boundary_cost)?
+        .checked_add(cells.checked_mul(attempts.checked_add(states)?)?)?
+        .checked_add(cells)?;
     let trace_cost = groups.checked_mul(5)?;
+    // The owner-label contract scans each attempt for its key maximum,
+    // duplicate state, distinct count, and stored columns.
+    let owner_label_cost = attempts.checked_mul(8)?;
     let filter_cost = u64::try_from(allocation.filter_curve_count).ok()?;
     path_cost
         .checked_add(residual_grid_cost)?
         .checked_add(residual_ring_cost)?
         .checked_add(residual_sort_cost)?
+        .checked_add(duration_cost)?
         .checked_add(trace_cost)?
+        .checked_add(owner_label_cost)?
         .checked_add(filter_cost)
 }
 
@@ -1584,7 +2058,7 @@ fn capacity_storage_bytes(allocation: CapacityAllocation) -> Result<usize, Capac
     filter_curve_count
         .checked_add(
             cell_count
-                .checked_mul(3)
+                .checked_mul(5 + SERVICE_CLOCKS.len())
                 .ok_or(CapacityModelError::StorageBound)?,
         )
         .and_then(|count| {
@@ -1600,7 +2074,7 @@ fn capacity_storage_bytes(allocation: CapacityAllocation) -> Result<usize, Capac
         })
         .and_then(|bytes| {
             transition_count
-                .checked_mul(size_of::<u64>() + 2 * size_of::<u32>())
+                .checked_mul(size_of::<u64>() + 3 * size_of::<u32>())
                 .and_then(|transition_bytes| bytes.checked_add(transition_bytes))
         })
         .and_then(|bytes| bytes.checked_add(size_of::<u32>()))
@@ -1772,8 +2246,8 @@ fn capacity_model_artifact_with_groups(
         observation_quality_beta: 9.0_f64,
         no_knee_probability: 0.5_f64,
         no_collapse_probability: 0.5_f64,
-        markov_clock_assumption: MarkovClockAssumption::MemorylessAggregateCompletions,
-        start_delay_evidence: StartDelayEvidence::DiscardedWithoutRecovery,
+        service_clock_assumption: ServiceClockAssumption::ErlangAndDeterministicRenewal,
+        service_duration_evidence: ServiceDurationEvidence::ObservedAttemptDurationsAndBoundaryAges,
         resource_window_group_count_max,
     };
     if !prior_artifact_contract_holds(
@@ -1791,8 +2265,10 @@ fn capacity_model_artifact_with_groups(
         || artifact.coverage[HAZARD_COVERAGE_INDEX].decision_cost_error()
             != HAZARD_TRANSITION_PROBABILITY_ERROR_MAX
         || artifact.budget.path_time_error_seconds() != REPORT_CLOCK_ERROR_SECONDS
-        || artifact.markov_clock_assumption != MarkovClockAssumption::MemorylessAggregateCompletions
-        || artifact.start_delay_evidence != StartDelayEvidence::DiscardedWithoutRecovery
+        || artifact.service_clock_assumption
+            != ServiceClockAssumption::ErlangAndDeterministicRenewal
+        || artifact.service_duration_evidence
+            != ServiceDurationEvidence::ObservedAttemptDurationsAndBoundaryAges
         || artifact.resource_window_group_count_max == 0
     {
         return Err(CapacityModelError::InvalidObservationContract);
@@ -1930,6 +2406,21 @@ fn normalize(weights: &mut [f64]) {
     }
 }
 
+fn visit_completion_cdf(
+    coefficients: &[f64],
+    sample_count_reciprocal: f64,
+    count_max: u32,
+    visit: &mut impl FnMut(u32, f64) -> bool,
+) {
+    let mut cumulative = 0.0_f64;
+    for count in 0..=count_max {
+        cumulative += coefficients[count as usize] * sample_count_reciprocal;
+        if !visit(count, cumulative.clamp(0.0_f64, 1.0_f64)) {
+            break;
+        }
+    }
+}
+
 fn posterior_update_eligible(prior_predictive: f64) -> bool {
     prior_predictive.is_finite()
 }
@@ -1956,22 +2447,87 @@ fn state_rate(grid: &CapacityGrid, index: usize, state: usize) -> f64 {
     )
 }
 
+struct CompletionGeneration<'a> {
+    stages: &'a mut Vec<f64>,
+    owners: &'a mut Vec<OwnerGeneratedWindow>,
+    owner_snapshot: &'a Vec<OwnerGeneratedWindow>,
+    arrival_keys: &'a [usize],
+    owner_counts: &'a mut Vec<OwnerCount>,
+    owner_key_layout: OwnerKeyLayout,
+    saturated_owner_window: bool,
+    owner_keys: &'a [u64],
+    owner_slots: &'a [u64],
+}
+
 fn generate_completion_count(
-    evidence: OccupancyTraceEvidence<'_>,
-    grid: &CapacityGrid,
-    cell: usize,
+    evidence: &OccupancyTraceEvidence<'_>,
+    walk: &CompletionWalk<'_>,
     slot_count: u32,
     random: &mut RandomStream,
+    generation: CompletionGeneration<'_>,
 ) -> u32 {
+    let CompletionGeneration {
+        stages,
+        owners,
+        owner_snapshot,
+        arrival_keys,
+        owner_counts,
+        owner_key_layout,
+        saturated_owner_window,
+        owner_keys,
+        owner_slots,
+    } = generation;
     if !evidence.owner_supplied_attempts().is_empty() {
-        return generate_owner_completion_count(evidence, grid, cell, random);
+        if saturated_owner_window
+            && let Some(completed) = generate_saturated_owner_completion_count(
+                evidence,
+                walk,
+                random,
+                owner_keys,
+                owner_slots,
+            )
+        {
+            return completed;
+        }
+        if owner_key_layout != OwnerKeyLayout::General {
+            let slots_per_owner = if owner_key_layout == OwnerKeyLayout::Serialized {
+                1
+            } else {
+                evidence.slots_per_owner()
+            };
+            return generate_counted_owner_completion_count(
+                evidence,
+                walk,
+                random,
+                owner_counts,
+                slots_per_owner,
+            );
+        }
+        return generate_owner_completion_walk(
+            evidence,
+            walk,
+            random,
+            stages,
+            owners,
+            owner_snapshot,
+            arrival_keys,
+        )
+        .0;
     }
+    if walk.clock == ServiceClock::Deterministic {
+        return generate_deterministic_completion_count(evidence, walk, slot_count, random, stages);
+    }
+    let ServiceClock::Erlang(shape) = walk.clock else {
+        return 0;
+    };
     let mut state = GeneratedWindow {
         now_seconds: 0.0_f64,
         busy: evidence.initial_busy_slots(),
         available: evidence.initial_available_attempts(),
         completed: 0,
     };
+    stages.clear();
+    stages.push(sample_erlang_work(shape, random));
     fill_available_slots(slot_count, &mut state.busy, &mut state.available);
     for (&offset_micros, &demand) in evidence
         .offsets_micros()
@@ -1980,108 +2536,648 @@ fn generate_completion_count(
         .filter(|(_, demand)| **demand > 0)
     {
         let boundary_seconds = Duration::from_micros(offset_micros).as_secs_f64();
-        generate_completions_until(grid, cell, boundary_seconds, random, &mut state);
+        generate_completions_until(walk, boundary_seconds, random, stages, &mut state);
         state.available = state.available.saturating_add(demand);
+        let previous_busy = state.busy;
         fill_available_slots(slot_count, &mut state.busy, &mut state.available);
+        debug_assert!(
+            state.busy >= previous_busy,
+            "new demand cannot remove a busy slot"
+        );
     }
     generate_completions_until(
-        grid,
-        cell,
+        walk,
         evidence.window().exposure_seconds(),
         random,
+        stages,
         &mut state,
     );
     state.completed
 }
 
-fn generate_owner_completion_count(
-    evidence: OccupancyTraceEvidence<'_>,
-    grid: &CapacityGrid,
-    cell: usize,
+/// Samples an exact completion count for one covered saturated owner draw.
+///
+/// For Erlang shape `k`, stage events form a Poisson process with rate
+/// `k * T(s)`. Constant busy state makes `T(s)` constant. Therefore, if `S`
+/// is the stage count, `(S + r) / k` is the completion count. The remainder
+/// `(S + r) % k` is the next stage residual `r`. This window starts with
+/// residual zero.
+///
+/// Each busy slot stays with its initial key while that key has queued work.
+/// The walk attributes each completion uniformly across the busy slots. Thus,
+/// conditional on total `N`, slot counts are `Multinomial(N, 1 / slot_count)`.
+/// The conditional-binomial draw samples that identity in slot order. Coverage
+/// proves that each initial key has enough initial work for its sampled count.
+/// An uncovered draw returns to the general event walk.
+fn generate_saturated_owner_completion_count(
+    evidence: &OccupancyTraceEvidence<'_>,
+    walk: &CompletionWalk<'_>,
     random: &mut RandomStream,
-) -> u32 {
-    let exposure = evidence.window().exposure_seconds();
-    let (arrival_offsets, arrival_owners) = evidence.owner_arrivals();
-    evidence
+    owner_keys: &[u64],
+    owner_slots: &[u64],
+) -> Option<u32> {
+    let ServiceClock::Erlang(shape) = walk.clock else {
+        return None;
+    };
+    let point_rate = walk.grid.service_times_seconds[walk.cell].recip();
+    let throughput = state_rate(walk.grid, walk.cell, evidence.initial_busy_slots() as usize)
+        * walk.slot_rate
+        / point_rate;
+    let mean = PoissonMean::from_product(
+        f64::from(shape) * throughput,
+        evidence.window().exposure_seconds(),
+    );
+    let completed = saturated_erlang_completion_count(shape, mean, 0, random).0;
+    saturated_owner_draw_is_covered(completed, owner_keys, owner_slots, random).then_some(completed)
+}
+
+fn saturated_owner_draw_is_covered(
+    completed: u32,
+    owner_keys: &[u64],
+    owner_slots: &[u64],
+    random: &mut RandomStream,
+) -> bool {
+    let mut remaining = u64::from(completed);
+    let mut remaining_slots = owner_slots.len() as u64;
+    for &key in owner_slots {
+        let attributed = if remaining_slots == 1 {
+            remaining
+        } else {
+            let probability =
+                1.0_f64 / f64::from(u32::try_from(remaining_slots).unwrap_or(u32::MAX));
+            let Ok(binomial) = Binomial::new(remaining, probability) else {
+                return false;
+            };
+            binomial.sample(&mut *random)
+        };
+        let start = owner_keys.partition_point(|candidate| *candidate < key);
+        let end = owner_keys.partition_point(|candidate| *candidate <= key);
+        if attributed > end.saturating_sub(start) as u64 {
+            return false;
+        }
+        remaining = remaining.saturating_sub(attributed);
+        remaining_slots -= 1;
+    }
+    remaining == 0
+}
+
+/// Converts homogeneous Erlang stage events into completions and a residual.
+fn saturated_erlang_completion_count(
+    shape: u32,
+    mean: PoissonMean,
+    carried_stage_residual: u32,
+    random: &mut RandomStream,
+) -> (u32, u32) {
+    let stages = sample_poisson(mean, random).saturating_add(u64::from(carried_stage_residual));
+    let shape = u64::from(shape);
+    (
+        u32::try_from(stages / shape).unwrap_or(u32::MAX),
+        u32::try_from(stages % shape).unwrap_or(u32::MAX),
+    )
+}
+
+/// Prepares the fixed initial slots for per-draw saturation checks.
+///
+/// The owner set stays fixed. Every fleet slot must be in use at the start.
+/// The per-draw check excludes arrivals because their offsets can follow a
+/// sampled completion. This exclusion can only send a draw to the general walk.
+fn saturated_owner_window(
+    evidence: &OccupancyTraceEvidence<'_>,
+    owner_key_layout: OwnerKeyLayout,
+    keys: &mut Vec<u64>,
+    slots: &mut Vec<u64>,
+) -> bool {
+    if owner_key_layout != OwnerKeyLayout::General
+        || evidence.initial_busy_slots() != evidence.slot_count()
+        || evidence.initial_busy_slots() == 0
+    {
+        return false;
+    }
+    let (active_counts, initial_keys) = evidence.owner_initial_work();
+    keys.clear();
+    slots.clear();
+    let mut cursor = 0_usize;
+    for (owner, supplied) in evidence
         .owner_supplied_attempts()
         .iter()
         .copied()
         .enumerate()
-        .fold(0_u32, |total, (owner, supplied)| {
-            let mut state = OwnerGeneratedWindow {
-                now: 0.0_f64,
-                supplied,
-                completed: 0,
-            };
-            for (&offset, &arrival_owner) in arrival_offsets.iter().zip(arrival_owners) {
-                if arrival_owner as usize != owner {
-                    continue;
-                }
-                let boundary = Duration::from_micros(offset).as_secs_f64();
-                generate_owner_completions_until(
-                    grid,
-                    cell,
-                    evidence.slots_per_owner(),
-                    boundary,
-                    random,
-                    &mut state,
-                );
-                state.supplied = state.supplied.saturating_add(1);
-            }
-            generate_owner_completions_until(
-                grid,
-                cell,
-                evidence.slots_per_owner(),
-                exposure,
+    {
+        let end = cursor.saturating_add(supplied as usize);
+        let Some(owner_keys) = initial_keys.get(cursor..end) else {
+            return false;
+        };
+        cursor = end;
+        let active = active_counts.get(owner).copied().unwrap_or(0) as usize;
+        let Some(active_keys) = owner_keys.get(..active) else {
+            return false;
+        };
+        let owner_prefix = (owner as u64) << 32_u32;
+        keys.extend(owner_keys.iter().map(|key| owner_prefix | u64::from(*key)));
+        slots.extend(active_keys.iter().map(|key| owner_prefix | u64::from(*key)));
+    }
+    if cursor != initial_keys.len() {
+        return false;
+    }
+    keys.sort_unstable();
+    slots.len() == evidence.initial_busy_slots() as usize
+}
+
+fn generate_owner_completion_walk(
+    evidence: &OccupancyTraceEvidence<'_>,
+    walk: &CompletionWalk<'_>,
+    random: &mut RandomStream,
+    stages: &mut Vec<f64>,
+    owners: &mut Vec<OwnerGeneratedWindow>,
+    owner_snapshot: &Vec<OwnerGeneratedWindow>,
+    arrival_keys: &[usize],
+) -> (u32, f64) {
+    // The owner sampler projects one fleet walk onto owner queues. The fleet
+    // rate stays constant between arrivals and sampled stage transitions.
+    if walk.clock == ServiceClock::Deterministic {
+        return (
+            generate_deterministic_owner_completion_count(
+                evidence,
+                walk,
                 random,
-                &mut state,
-            );
-            total.saturating_add(state.completed)
-        })
+                stages,
+                owners,
+                owner_snapshot,
+                arrival_keys,
+            ),
+            0.0_f64,
+        );
+    }
+    let ServiceClock::Erlang(shape) = walk.clock else {
+        return (0, 0.0_f64);
+    };
+    let (arrival_offsets, arrival_owners, _) = evidence.owner_arrivals();
+    owners.clone_from(owner_snapshot);
+    let mut now = 0.0_f64;
+    let mut busy_slot_seconds = 0.0_f64;
+    let mut fleet_stage = sample_erlang_work(shape, random);
+    let mut arrivals = arrival_offsets
+        .iter()
+        .copied()
+        .zip(arrival_owners.iter().copied())
+        .zip(arrival_keys.iter().copied())
+        .peekable();
+    while let Some(offset) = arrivals.peek().map(|((offset, _), _)| *offset) {
+        let boundary = Duration::from_micros(offset).as_secs_f64();
+        generate_owner_completions_until(
+            walk,
+            evidence.slots_per_owner(),
+            boundary,
+            random,
+            &mut OwnerCompletionState {
+                now: &mut now,
+                busy_slot_seconds: &mut busy_slot_seconds,
+                fleet_stage: &mut fleet_stage,
+                owners,
+            },
+        );
+        while arrivals.peek().is_some_and(|((at, _), _)| *at == offset) {
+            if let Some(((_, owner), key)) = arrivals.next()
+                && let Some(state) = owners.get_mut(owner as usize)
+            {
+                open_owner_key(key, shape, evidence.slots_per_owner(), state);
+            }
+        }
+    }
+    generate_owner_completions_until(
+        walk,
+        evidence.slots_per_owner(),
+        evidence.window().exposure_seconds(),
+        random,
+        &mut OwnerCompletionState {
+            now: &mut now,
+            busy_slot_seconds: &mut busy_slot_seconds,
+            fleet_stage: &mut fleet_stage,
+            owners,
+        },
+    );
+    stages.clear();
+    let completed = owners
+        .iter()
+        .fold(0_u32, |total, owner| total.saturating_add(owner.completed));
+    (completed, busy_slot_seconds)
 }
 
-struct OwnerGeneratedWindow {
-    now: f64,
-    supplied: u32,
-    completed: u32,
+#[derive(Clone, Copy, Default)]
+struct OwnerCount {
+    active: u32,
+    queued: u32,
 }
 
-fn generate_owner_completions_until(
-    grid: &CapacityGrid,
-    cell: usize,
+fn owner_key_layout(evidence: &OccupancyTraceEvidence<'_>, keys: &mut Vec<u64>) -> OwnerKeyLayout {
+    if evidence.owner_supplied_attempts().is_empty() {
+        return OwnerKeyLayout::General;
+    }
+    keys.clear();
+    let mut key_cursor = 0_usize;
+    for (owner, supplied) in evidence
+        .owner_supplied_attempts()
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let key_end = key_cursor.saturating_add(supplied as usize);
+        let owner_keys = evidence
+            .owner_initial_work()
+            .1
+            .get(key_cursor..key_end)
+            .unwrap_or(&[]);
+        keys.extend(
+            owner_keys
+                .iter()
+                .map(|key| (owner as u64) << 32_u32 | u64::from(*key)),
+        );
+        key_cursor = key_end;
+    }
+    keys.extend(
+        evidence
+            .owner_arrivals()
+            .1
+            .iter()
+            .zip(evidence.owner_arrivals().2)
+            .map(|(owner, key)| u64::from(*owner) << 32_u32 | u64::from(*key)),
+    );
+    keys.sort_unstable();
+    if !keys.windows(2).any(|pair| pair[0] == pair[1]) {
+        return OwnerKeyLayout::Unique;
+    }
+    let serialized = keys
+        .windows(2)
+        .all(|pair| pair[0] == pair[1] || pair[0] >> 32_u32 != pair[1] >> 32_u32);
+    if serialized {
+        OwnerKeyLayout::Serialized
+    } else {
+        OwnerKeyLayout::General
+    }
+}
+
+fn generate_counted_owner_completion_count(
+    evidence: &OccupancyTraceEvidence<'_>,
+    walk: &CompletionWalk<'_>,
+    random: &mut RandomStream,
+    owners: &mut Vec<OwnerCount>,
+    slots_per_owner: u32,
+) -> u32 {
+    let supplied = evidence.owner_supplied_attempts();
+    let active = evidence.owner_initial_work().0;
+    owners.resize(supplied.len(), OwnerCount::default());
+    for (owner, state) in owners.iter_mut().enumerate() {
+        state.active = active.get(owner).copied().unwrap_or(0).min(slots_per_owner);
+        state.queued = supplied[owner].saturating_sub(state.active);
+    }
+    let (arrival_offsets, arrival_owners, _) = evidence.owner_arrivals();
+    let mut now = 0.0_f64;
+    let mut work = match walk.clock {
+        ServiceClock::Erlang(shape) => sample_erlang_work(shape, random),
+        ServiceClock::Deterministic => 1.0_f64,
+    };
+    let mut completed = 0_u32;
+    let mut arrivals = arrival_offsets
+        .iter()
+        .copied()
+        .zip(arrival_owners.iter().copied())
+        .peekable();
+    while let Some(offset) = arrivals.peek().map(|(offset, _)| *offset) {
+        generate_unique_owner_completions_until(
+            walk,
+            slots_per_owner,
+            Duration::from_micros(offset).as_secs_f64(),
+            random,
+            &mut UniqueOwnerCompletionState {
+                now: &mut now,
+                work: &mut work,
+                owners,
+                completed: &mut completed,
+            },
+        );
+        while arrivals.peek().is_some_and(|(at, _)| *at == offset) {
+            if let Some((_, owner)) = arrivals.next()
+                && let Some(state) = owners.get_mut(owner as usize)
+            {
+                if state.active < slots_per_owner {
+                    state.active += 1;
+                } else {
+                    state.queued += 1;
+                }
+            }
+        }
+    }
+    generate_unique_owner_completions_until(
+        walk,
+        slots_per_owner,
+        evidence.window().exposure_seconds(),
+        random,
+        &mut UniqueOwnerCompletionState {
+            now: &mut now,
+            work: &mut work,
+            owners,
+            completed: &mut completed,
+        },
+    );
+    completed
+}
+
+struct UniqueOwnerCompletionState<'a> {
+    now: &'a mut f64,
+    work: &'a mut f64,
+    owners: &'a mut [OwnerCount],
+    completed: &'a mut u32,
+}
+
+fn generate_unique_owner_completions_until(
+    walk: &CompletionWalk<'_>,
     slots_per_owner: u32,
     boundary: f64,
     random: &mut RandomStream,
-    state: &mut OwnerGeneratedWindow,
+    state: &mut UniqueOwnerCompletionState<'_>,
 ) {
-    while state.supplied > 0 {
-        let concurrency = state.supplied.min(slots_per_owner);
-        let rate = state_rate(grid, cell, concurrency as usize);
-        let completion = state.now - random.open_unit_f64().ln() / rate;
-        if completion >= boundary {
+    loop {
+        let concurrency = state.owners.iter().map(|owner| owner.active).sum::<u32>();
+        if concurrency == 0 {
             break;
         }
-        state.now = completion;
-        state.supplied -= 1;
-        state.completed = state.completed.saturating_add(1);
+        let fleet_rate = deterministic_fleet_rate(walk, concurrency);
+        let rate = match walk.clock {
+            ServiceClock::Erlang(shape) => f64::from(shape) * fleet_rate,
+            ServiceClock::Deterministic => fleet_rate,
+        };
+        let event = *state.now + *state.work / rate;
+        if event >= boundary {
+            *state.work -= (boundary - *state.now) * rate;
+            break;
+        }
+        *state.now = event;
+        *state.work = match walk.clock {
+            ServiceClock::Erlang(shape) => sample_erlang_work(shape, random),
+            ServiceClock::Deterministic => 1.0_f64,
+        };
+        let mut slot = ((random.open_unit_f64() * f64::from(concurrency)) as u32)
+            .min(concurrency.saturating_sub(1));
+        for owner in state.owners.iter_mut() {
+            if slot < owner.active {
+                *state.completed = state.completed.saturating_add(1);
+                if owner.queued > 0 {
+                    owner.queued -= 1;
+                } else {
+                    owner.active -= 1;
+                }
+                break;
+            }
+            slot -= owner.active;
+        }
+        for owner in state.owners.iter_mut() {
+            let started = slots_per_owner
+                .saturating_sub(owner.active)
+                .min(owner.queued);
+            owner.active += started;
+            owner.queued -= started;
+        }
     }
-    state.now = boundary;
+    *state.now = boundary;
+}
+
+#[derive(Clone)]
+struct OwnerGeneratedWindow {
+    completed: u32,
+    keys: Vec<OwnerKeyDepth>,
+    active_keys: Vec<usize>,
+    waiting_head: Option<usize>,
+    waiting_tail: Option<usize>,
+}
+
+#[derive(Clone)]
+struct OwnerKeyDepth {
+    active: bool,
+    queued_depth: u32,
+    next_waiting: Option<usize>,
+}
+
+/// Builds the report-start key depths once for all predictive draws.
+///
+/// The count contract ignores live-attempt ages. Attempt labels within one key
+/// are interchangeable for counts. A completion keeps its key while that key
+/// has queued depth. Otherwise, it closes that key and opens the owner's next
+/// waiting key. Thus active state and queued depth preserve every state change
+/// that can affect a completion count. Per-attempt queue items add no state.
+fn build_owner_depth_snapshot(
+    evidence: &OccupancyTraceEvidence<'_>,
+    owners: &mut Vec<OwnerGeneratedWindow>,
+    arrival_key_indices: &mut Vec<usize>,
+    key_indices: &mut HashMap<u64, usize>,
+) {
+    let supplied_attempts = evidence.owner_supplied_attempts();
+    let (initial_active_counts, initial_keys) = evidence.owner_initial_work();
+    owners.resize_with(supplied_attempts.len(), || OwnerGeneratedWindow {
+        completed: 0,
+        keys: Vec::new(),
+        active_keys: Vec::new(),
+        waiting_head: None,
+        waiting_tail: None,
+    });
+    owners.truncate(supplied_attempts.len());
+    for state in owners.iter_mut() {
+        state.completed = 0;
+        state.keys.clear();
+        state.active_keys.clear();
+        state.waiting_head = None;
+        state.waiting_tail = None;
+    }
+    key_indices.clear();
+    let mut key_cursor = 0_usize;
+    for (owner, (&supplied, state)) in supplied_attempts.iter().zip(owners.iter_mut()).enumerate() {
+        let key_end = key_cursor.saturating_add(supplied as usize);
+        let owner_keys = initial_keys.get(key_cursor..key_end).unwrap_or(&[]);
+        key_cursor = key_end;
+        let active_count = initial_active_counts.get(owner).copied().unwrap_or(0) as usize;
+        for (attempt, &key) in owner_keys.iter().enumerate() {
+            let identity = (owner as u64) << 32_u32 | u64::from(key);
+            if let Some(&key_index) = key_indices.get(&identity) {
+                state.keys[key_index].queued_depth =
+                    state.keys[key_index].queued_depth.saturating_add(1);
+            } else {
+                let key_index = state.keys.len();
+                state.keys.push(OwnerKeyDepth {
+                    active: attempt < active_count,
+                    queued_depth: u32::from(attempt >= active_count),
+                    next_waiting: None,
+                });
+                if attempt < active_count {
+                    state.active_keys.push(key_index);
+                } else {
+                    enqueue_owner_key(key_index, state);
+                }
+                key_indices.insert(identity, key_index);
+            }
+        }
+    }
+    arrival_key_indices.clear();
+    let (_, arrival_owners, arrival_keys) = evidence.owner_arrivals();
+    for (&owner, &key) in arrival_owners.iter().zip(arrival_keys) {
+        let identity = u64::from(owner) << 32_u32 | u64::from(key);
+        let state = &mut owners[owner as usize];
+        let key_index = *key_indices.entry(identity).or_insert_with(|| {
+            let key_index = state.keys.len();
+            state.keys.push(OwnerKeyDepth {
+                active: false,
+                queued_depth: 0,
+                next_waiting: None,
+            });
+            key_index
+        });
+        arrival_key_indices.push(key_index);
+    }
+}
+
+fn enqueue_owner_key(key: usize, state: &mut OwnerGeneratedWindow) {
+    if let Some(tail) = state.waiting_tail {
+        state.keys[tail].next_waiting = Some(key);
+    } else {
+        state.waiting_head = Some(key);
+    }
+    state.waiting_tail = Some(key);
+}
+
+fn open_owner_key(key: usize, _shape: u32, slot_limit: u32, state: &mut OwnerGeneratedWindow) {
+    if state.keys[key].active || state.keys[key].queued_depth > 0 {
+        state.keys[key].queued_depth = state.keys[key].queued_depth.saturating_add(1);
+    } else if state.active_keys.len() < slot_limit as usize {
+        state.keys[key].active = true;
+        state.active_keys.push(key);
+    } else {
+        state.keys[key].queued_depth = 1;
+        enqueue_owner_key(key, state);
+    }
+}
+
+struct CompletionWalk<'a> {
+    grid: &'a CapacityGrid,
+    cell: usize,
+    clock: ServiceClock,
+    slot_rate: f64,
+}
+
+struct OwnerCompletionState<'a> {
+    now: &'a mut f64,
+    busy_slot_seconds: &'a mut f64,
+    fleet_stage: &'a mut f64,
+    owners: &'a mut [OwnerGeneratedWindow],
+}
+
+fn generate_owner_completions_until(
+    walk: &CompletionWalk<'_>,
+    slots_per_owner: u32,
+    boundary: f64,
+    random: &mut RandomStream,
+    state: &mut OwnerCompletionState<'_>,
+) {
+    // The fleet walk samples one exact Erlang completion interval. See
+    // `sample_erlang_work` for the boundary residual invariant.
+    loop {
+        let concurrency = state.owners.iter().fold(0_usize, |total, owner| {
+            total.saturating_add(owner.active_keys.len())
+        });
+        if concurrency == 0 {
+            break;
+        }
+        let ServiceClock::Erlang(shape) = walk.clock else {
+            return;
+        };
+        let point_rate = 1.0_f64 / walk.grid.service_times_seconds[walk.cell];
+        let aggregate_rate =
+            state_rate(walk.grid, walk.cell, concurrency) * walk.slot_rate / point_rate;
+        let rate = f64::from(shape) * aggregate_rate;
+        let completion = *state.now + *state.fleet_stage / rate;
+        if completion >= boundary {
+            *state.fleet_stage -= (boundary - *state.now) * rate;
+            let concurrency = u32::try_from(concurrency).unwrap_or(u32::MAX);
+            *state.busy_slot_seconds += (boundary - *state.now) * f64::from(concurrency);
+            break;
+        }
+        let concurrency = f64::from(u32::try_from(concurrency).unwrap_or(u32::MAX));
+        *state.busy_slot_seconds += (completion - *state.now) * concurrency;
+        *state.now = completion;
+        *state.fleet_stage = sample_erlang_work(shape, random);
+        let fleet_slot = (random.open_unit_f64() * concurrency) as usize;
+        let Some((owner, slot)) = owner_slot(state.owners, fleet_slot) else {
+            break;
+        };
+        let owner_state = &mut state.owners[owner];
+        owner_state.completed = owner_state.completed.saturating_add(1);
+        let key = owner_state.active_keys[slot];
+        if owner_state.keys[key].queued_depth > 0 {
+            owner_state.keys[key].queued_depth -= 1;
+        } else {
+            owner_state.keys[key].active = false;
+            owner_state.active_keys.swap_remove(slot);
+            dispatch_owner_keys(shape, slots_per_owner, owner_state);
+        }
+    }
+    *state.now = boundary;
+}
+
+fn owner_slot(owners: &[OwnerGeneratedWindow], mut fleet_slot: usize) -> Option<(usize, usize)> {
+    for (owner, state) in owners.iter().enumerate() {
+        if fleet_slot < state.active_keys.len() {
+            return Some((owner, fleet_slot));
+        }
+        fleet_slot = fleet_slot.saturating_sub(state.active_keys.len());
+    }
+    None
+}
+
+fn dispatch_owner_keys(shape: u32, slot_limit: u32, state: &mut OwnerGeneratedWindow) {
+    while state.active_keys.len() < slot_limit as usize {
+        let Some(key) = state.waiting_head else {
+            break;
+        };
+        state.waiting_head = state.keys[key].next_waiting;
+        if state.waiting_head.is_none() {
+            state.waiting_tail = None;
+        }
+        state.keys[key].next_waiting = None;
+        state.keys[key].active = true;
+        state.keys[key].queued_depth -= 1;
+        state.active_keys.push(key);
+    }
+    let _ = shape;
+}
+
+#[cfg(test)]
+fn owner_open_key_count(state: &OwnerGeneratedWindow) -> usize {
+    state
+        .keys
+        .iter()
+        .filter(|key| key.active || key.queued_depth > 0)
+        .count()
 }
 
 fn generate_completions_until(
-    grid: &CapacityGrid,
-    cell: usize,
+    walk: &CompletionWalk<'_>,
     boundary_seconds: f64,
     random: &mut RandomStream,
+    stages: &mut [f64],
     state: &mut GeneratedWindow,
 ) {
     while state.busy > 0 {
-        let rate = state_rate(grid, cell, state.busy as usize);
-        let wait_seconds = -random.open_unit_f64().ln() / rate;
-        if state.now_seconds + wait_seconds >= boundary_seconds {
+        let point_rate = 1.0_f64 / walk.grid.service_times_seconds[walk.cell];
+        let aggregate_rate =
+            state_rate(walk.grid, walk.cell, state.busy as usize) * walk.slot_rate / point_rate;
+        let ServiceClock::Erlang(shape) = walk.clock else {
+            return;
+        };
+        let rate = f64::from(shape) * aggregate_rate;
+        let completion = state.now_seconds + stages[0] / rate;
+        if completion >= boundary_seconds {
+            stages[0] -= (boundary_seconds - state.now_seconds) * rate;
             break;
         }
-        state.now_seconds += wait_seconds;
+        state.now_seconds = completion;
+        stages[0] = sample_erlang_work(shape, random);
         if state.available > 0 {
             state.available -= 1;
         } else {
@@ -2090,6 +3186,208 @@ fn generate_completions_until(
         state.completed = state.completed.saturating_add(1);
     }
     state.now_seconds = boundary_seconds;
+}
+
+/// Samples the operational work for one fleet completion.
+///
+/// For shape `k`, `sum(Exp(k * T(s)))` equals `Gamma(k, k * T(s))`.
+/// Equivalently, one `Gamma(k, 1)` work draw completes after `work / rate`.
+/// A boundary after `dt` consumes `rate * dt` work. The current exponential
+/// stage is memoryless. Its residual plus the remaining whole stages has the
+/// same conditional law. Thus subtraction preserves the exact residual stage
+/// count and work across each rate change.
+fn sample_erlang_work(remaining: u32, random: &mut RandomStream) -> f64 {
+    match remaining {
+        1 => -random.open_unit_f64().ln(),
+        2 => -(random.open_unit_f64() * random.open_unit_f64()).ln(),
+        _ => {
+            let _decorrelation = random.open_unit_f64();
+            sample_gamma(f64::from(remaining), random)
+        }
+    }
+}
+
+fn deterministic_fleet_rate(walk: &CompletionWalk<'_>, concurrency: u32) -> f64 {
+    let point_rate = walk.grid.service_times_seconds[walk.cell].recip();
+    state_rate(walk.grid, walk.cell, concurrency as usize) * walk.slot_rate / point_rate
+}
+
+fn generate_deterministic_completion_count(
+    evidence: &OccupancyTraceEvidence<'_>,
+    walk: &CompletionWalk<'_>,
+    slot_count: u32,
+    random: &mut RandomStream,
+    operational_work: &mut Vec<f64>,
+) -> u32 {
+    let mut state = GeneratedWindow {
+        now_seconds: 0.0_f64,
+        busy: evidence.initial_busy_slots(),
+        available: evidence.initial_available_attempts(),
+        completed: 0,
+    };
+    operational_work.clear();
+    operational_work.push(1.0_f64);
+    fill_available_slots(slot_count, &mut state.busy, &mut state.available);
+    for (&offset, &demand) in evidence
+        .offsets_micros()
+        .iter()
+        .zip(evidence.demand_groups())
+        .filter(|(_, demand)| **demand > 0)
+    {
+        let boundary = Duration::from_micros(offset).as_secs_f64();
+        generate_deterministic_completions_until(
+            walk,
+            boundary,
+            random,
+            operational_work,
+            &mut state,
+        );
+        state.available = state.available.saturating_add(demand);
+        let previous_busy = state.busy;
+        fill_available_slots(slot_count, &mut state.busy, &mut state.available);
+        debug_assert!(
+            state.busy >= previous_busy,
+            "new demand cannot remove a busy slot"
+        );
+    }
+    generate_deterministic_completions_until(
+        walk,
+        evidence.window().exposure_seconds(),
+        random,
+        operational_work,
+        &mut state,
+    );
+    state.completed
+}
+
+fn generate_deterministic_completions_until(
+    walk: &CompletionWalk<'_>,
+    boundary: f64,
+    random: &mut RandomStream,
+    operational_work: &mut [f64],
+    state: &mut GeneratedWindow,
+) {
+    while state.busy > 0 {
+        let rate = deterministic_fleet_rate(walk, state.busy);
+        let completion = state.now_seconds + operational_work[0] / rate;
+        if completion >= boundary {
+            operational_work[0] -= (boundary - state.now_seconds) * rate;
+            break;
+        }
+        state.now_seconds = completion;
+        operational_work[0] = 1.0_f64;
+        state.completed = state.completed.saturating_add(1);
+        let _slot = ((random.open_unit_f64() * f64::from(state.busy)) as usize)
+            .min(state.busy.saturating_sub(1) as usize);
+        if state.available > 0 {
+            state.available -= 1;
+        } else {
+            state.busy -= 1;
+        }
+    }
+    state.now_seconds = boundary;
+}
+
+fn generate_deterministic_owner_completion_count(
+    evidence: &OccupancyTraceEvidence<'_>,
+    walk: &CompletionWalk<'_>,
+    random: &mut RandomStream,
+    deadlines: &mut Vec<f64>,
+    owners: &mut Vec<OwnerGeneratedWindow>,
+    owner_snapshot: &Vec<OwnerGeneratedWindow>,
+    arrival_keys: &[usize],
+) -> u32 {
+    let (arrival_offsets, arrival_owners, _) = evidence.owner_arrivals();
+    owners.clone_from(owner_snapshot);
+    let mut now = 0.0_f64;
+    let mut fleet_work = 1.0_f64;
+    let mut arrivals = arrival_offsets
+        .iter()
+        .copied()
+        .zip(arrival_owners.iter().copied())
+        .zip(arrival_keys.iter().copied())
+        .peekable();
+    while let Some(offset) = arrivals.peek().map(|((offset, _), _)| *offset) {
+        let boundary = Duration::from_micros(offset).as_secs_f64();
+        generate_deterministic_owner_completions_until(
+            walk,
+            evidence.slots_per_owner(),
+            boundary,
+            random,
+            &mut now,
+            &mut fleet_work,
+            owners,
+        );
+        while arrivals.peek().is_some_and(|((at, _), _)| *at == offset) {
+            if let Some(((_, owner), key)) = arrivals.next()
+                && let Some(state) = owners.get_mut(owner as usize)
+            {
+                open_owner_key(key, 1, evidence.slots_per_owner(), state);
+            }
+        }
+    }
+    generate_deterministic_owner_completions_until(
+        walk,
+        evidence.slots_per_owner(),
+        evidence.window().exposure_seconds(),
+        random,
+        &mut now,
+        &mut fleet_work,
+        owners,
+    );
+    deadlines.clear();
+    owners
+        .iter()
+        .fold(0_u32, |total, owner| total.saturating_add(owner.completed))
+}
+
+fn generate_deterministic_owner_completions_until(
+    walk: &CompletionWalk<'_>,
+    slot_limit: u32,
+    boundary: f64,
+    random: &mut RandomStream,
+    now: &mut f64,
+    fleet_work: &mut f64,
+    owners: &mut [OwnerGeneratedWindow],
+) {
+    // Shared operational work gives the exact deterministic fleet law.
+    loop {
+        let concurrency = fleet_concurrency(owners);
+        if concurrency == 0 {
+            break;
+        }
+        let rate = deterministic_fleet_rate(walk, concurrency as u32);
+        let completion = *now + *fleet_work / rate;
+        if completion >= boundary {
+            *fleet_work -= (boundary - *now) * rate;
+            break;
+        }
+        *fleet_work = 1.0_f64;
+        *now = completion;
+        let concurrency_float = f64::from(u32::try_from(concurrency).unwrap_or(u32::MAX));
+        let fleet_slot = ((random.open_unit_f64() * concurrency_float) as usize)
+            .min(concurrency.saturating_sub(1));
+        let Some((owner, slot)) = owner_slot(owners, fleet_slot) else {
+            break;
+        };
+        let state = &mut owners[owner];
+        state.completed = state.completed.saturating_add(1);
+        let key = state.active_keys[slot];
+        if state.keys[key].queued_depth > 0 {
+            state.keys[key].queued_depth -= 1;
+        } else {
+            state.keys[key].active = false;
+            state.active_keys.swap_remove(slot);
+            dispatch_owner_keys(1, slot_limit, state);
+        }
+    }
+    *now = boundary;
+}
+
+fn fleet_concurrency(owners: &[OwnerGeneratedWindow]) -> usize {
+    owners.iter().fold(0_usize, |total, owner| {
+        total.saturating_add(owner.active_keys.len())
+    })
 }
 
 fn fill_available_slots(slot_count: u32, busy: &mut u32, available: &mut u32) {
@@ -2143,7 +3441,7 @@ fn fill_state_rates(grid: &CapacityGrid, index: usize, rates: &mut [f64]) {
 /// group boundaries only, and a group's completions are attributed to the
 /// state that accrued the exposure they came from.
 fn fold_trace(
-    evidence: OccupancyTraceEvidence<'_>,
+    evidence: &OccupancyTraceEvidence<'_>,
     exposure_seconds: &mut [f64],
     completion_counts: &mut [u32],
 ) {
@@ -2183,6 +3481,351 @@ fn path_log_score_with_rates(
         }
     }
     score
+}
+
+fn aggregate_completion_log_score(
+    grid: &CapacityGrid,
+    index: usize,
+    completion_counts: &[u32],
+) -> f64 {
+    let mut score = 0.0_f64;
+    for (state, count) in completion_counts.iter().copied().enumerate().skip(1) {
+        if count > 0 {
+            score += f64::from(count) * state_rate(grid, index, state).ln();
+        }
+    }
+    score
+}
+
+fn duration_statistics(durations_micros: &[u64]) -> DurationStatistics {
+    let mut duration_sum_seconds = 0.0_f64;
+    let mut log_duration_sum_seconds = 0.0_f64;
+    for &duration in durations_micros {
+        let duration_seconds = Duration::from_micros(duration).as_secs_f64();
+        duration_sum_seconds += duration_seconds;
+        log_duration_sum_seconds += duration_seconds.ln();
+    }
+    DurationStatistics {
+        completion_count: u32::try_from(durations_micros.len()).unwrap_or(u32::MAX),
+        duration_sum_seconds,
+        log_duration_sum_seconds,
+    }
+}
+
+fn repeated_service_logs(service_times: &[f64], map: impl Fn(f64) -> f64 + Copy) -> Vec<f64> {
+    service_times
+        .iter()
+        .flat_map(|service| repeat_n(map(*service), SERVICE_CLOCKS.len()))
+        .collect()
+}
+
+fn duration_log_rate_bounds(grid: &CapacityGrid) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    (
+        repeated_service_logs(&grid.service_times_seconds, |service| service.recip().ln()),
+        repeated_service_logs(&grid.service_time_highs, |service| -service.ln()),
+        repeated_service_logs(&grid.service_time_lows, |service| -service.ln()),
+    )
+}
+
+fn duration_log_likelihood(
+    shape: u32,
+    per_slot_rate: f64,
+    evidence: &OccupancyTraceEvidence<'_>,
+    statistics: DurationStatistics,
+) -> f64 {
+    let (offsets, durations, _, final_ages) = evidence.service_durations();
+    let shape = f64::from(shape);
+    let log_normalizer = shape * shape.ln() - ln_gamma(shape);
+    let completion_count = f64::from(statistics.completion_count);
+    if statistics.completion_count > 0
+        && (per_slot_rate <= 0.0_f64 || !statistics.log_duration_sum_seconds.is_finite())
+    {
+        return f64::NEG_INFINITY;
+    }
+    let mut score = completion_count * log_normalizer
+        + completion_count * REPORT_CLOCK_ERROR_SECONDS.ln()
+        + (shape - 1.0_f64) * completion_count * per_slot_rate.ln()
+        + (shape - 1.0_f64) * statistics.log_duration_sum_seconds
+        - shape * per_slot_rate * statistics.duration_sum_seconds;
+    for (&offset, &duration) in offsets.iter().zip(durations) {
+        let entry_micros = duration.saturating_sub(offset);
+        if entry_micros > 0 {
+            let entry = Duration::from_micros(entry_micros).as_secs_f64() * per_slot_rate;
+            score -= erlang_log_survival(shape, entry);
+        }
+    }
+    let exposure_micros = evidence.window().exposure_micros();
+    for elapsed_micros in final_ages.iter().copied() {
+        let elapsed = Duration::from_micros(elapsed_micros).as_secs_f64() * per_slot_rate;
+        score += erlang_log_survival(shape, elapsed);
+        let entry_micros = elapsed_micros.saturating_sub(exposure_micros);
+        if entry_micros > 0 {
+            let entry = Duration::from_micros(entry_micros).as_secs_f64() * per_slot_rate;
+            score -= erlang_log_survival(shape, entry);
+        }
+    }
+    score
+}
+
+fn deterministic_feasible_interval(
+    evidence: &OccupancyTraceEvidence<'_>,
+    mut low: f64,
+    mut high: f64,
+) -> (f64, f64) {
+    let (_, durations, _, final_ages) = evidence.service_durations();
+    for duration in durations.iter().copied() {
+        let duration_low = Duration::from_micros(duration).as_secs_f64();
+        let duration_high = Duration::from_micros(duration.saturating_add(1)).as_secs_f64();
+        low = low.max(-duration_high.ln());
+        high = high.min(-duration_low.ln());
+    }
+    for age in final_ages.iter().copied().filter(|age| *age > 0) {
+        high = high.min(-Duration::from_micros(age).as_secs_f64().ln());
+    }
+    (low, high)
+}
+
+fn deterministic_within_cell_log_evidence(
+    posterior: &DeterministicWithinCellPosterior<'_, '_>,
+) -> (f64, f64, f64) {
+    if posterior.low.to_bits() == posterior.high.to_bits() {
+        let period = (-posterior.low).exp();
+        let (_, durations, _, final_ages) = posterior.evidence.service_durations();
+        let feasible = durations.iter().copied().all(|duration| {
+            Duration::from_micros(duration).as_secs_f64() <= period
+                && period < Duration::from_micros(duration.saturating_add(1)).as_secs_f64()
+        }) && final_ages
+            .iter()
+            .copied()
+            .all(|age| Duration::from_micros(age).as_secs_f64() < period);
+        let score = if feasible {
+            f64::from(posterior.aggregate_count) * posterior.low
+        } else {
+            f64::NEG_INFINITY
+        };
+        return (posterior.low, f64::INFINITY, score);
+    }
+    let (low, high) =
+        deterministic_feasible_interval(posterior.evidence, posterior.low, posterior.high);
+    if low >= high {
+        return (low, f64::INFINITY, f64::NEG_INFINITY);
+    }
+    let count = f64::from(posterior.aggregate_count);
+    match posterior.prior {
+        CapacityPrior::LogUniform => {
+            let log_integral = if count == 0.0_f64 {
+                (high - low).ln()
+            } else {
+                let upper = count * high;
+                upper + (-(count * (high - low))).exp_m1().abs().ln() - count.ln()
+            };
+            (
+                high,
+                -count,
+                log_integral - (posterior.high - posterior.low).ln(),
+            )
+        }
+        CapacityPrior::LogNormal {
+            service_time_median_seconds,
+            log_standard_deviation,
+            ..
+        } => {
+            let mean = -service_time_median_seconds.ln();
+            let variance = log_standard_deviation.powi(2);
+            let shifted_mean = mean + count * variance;
+            let Ok(shifted) = Normal::new(shifted_mean, log_standard_deviation) else {
+                return (shifted_mean, variance.recip(), f64::NEG_INFINITY);
+            };
+            let Ok(prior) = Normal::new(mean, log_standard_deviation) else {
+                return (shifted_mean, variance.recip(), f64::NEG_INFINITY);
+            };
+            let feasible_mass = shifted.cdf(high) - shifted.cdf(low);
+            let cell_mass = prior.cdf(posterior.high) - prior.cdf(posterior.low);
+            let score = count.mul_add(mean, 0.5_f64 * count * count * variance)
+                + feasible_mass.max(f64::MIN_POSITIVE).ln()
+                - cell_mass.max(f64::MIN_POSITIVE).ln();
+            (shifted_mean.clamp(low, high), variance.recip(), score)
+        }
+    }
+}
+
+fn within_cell_mode(initial: f64, posterior: &WithinCellPosterior<'_, '_>) -> (f64, f64) {
+    let mut mode = initial;
+    for _ in 0..WITHIN_CELL_NEWTON_STEPS {
+        let (_, gradient, second) = within_cell_log_posterior(mode, posterior);
+        if !second.is_finite() || second >= 0.0_f64 {
+            break;
+        }
+        mode = (mode - gradient / second).clamp(posterior.low, posterior.high);
+    }
+    let (_, _, second) = within_cell_log_posterior(mode, posterior);
+    (mode, (-second).max(f64::MIN_POSITIVE))
+}
+
+fn within_cell_laplace_log_evidence(
+    mode: f64,
+    curvature: f64,
+    posterior: &WithinCellPosterior<'_, '_>,
+) -> f64 {
+    let (value, ..) = within_cell_log_posterior(mode, posterior);
+    let Ok(normal) = Normal::new(mode, curvature.sqrt().recip()) else {
+        return f64::NEG_INFINITY;
+    };
+    let mass = (normal.cdf(posterior.high) - normal.cdf(posterior.low)).max(f64::MIN_POSITIVE);
+    value + 0.5_f64 * (2.0_f64 * PI / curvature).ln() + mass.ln()
+}
+
+fn within_cell_log_posterior(
+    log_rate: f64,
+    posterior: &WithinCellPosterior<'_, '_>,
+) -> (f64, f64, f64) {
+    let rate = log_rate.exp();
+    let shape_float = f64::from(posterior.shape);
+    let mut value = duration_log_likelihood(
+        posterior.shape,
+        rate,
+        posterior.evidence,
+        posterior.statistics,
+    ) + f64::from(posterior.aggregate_count) * log_rate;
+    let mut gradient = (shape_float - 1.0_f64) * f64::from(posterior.statistics.completion_count)
+        - shape_float * rate * posterior.statistics.duration_sum_seconds
+        + f64::from(posterior.aggregate_count);
+    let mut second = -shape_float * rate * posterior.statistics.duration_sum_seconds;
+    let (offsets, durations, _, final_ages) = posterior.evidence.service_durations();
+    for (&offset, &duration) in offsets.iter().zip(durations) {
+        let entry = duration.saturating_sub(offset);
+        if entry > 0 {
+            let (first, curvature) = erlang_log_survival_derivatives(posterior.shape, rate, entry);
+            gradient -= first;
+            second -= curvature;
+        }
+    }
+    let exposure = posterior.evidence.window().exposure_micros();
+    for elapsed in final_ages.iter().copied() {
+        let (first, curvature) = erlang_log_survival_derivatives(posterior.shape, rate, elapsed);
+        gradient += first;
+        second += curvature;
+        let entry = elapsed.saturating_sub(exposure);
+        if entry > 0 {
+            let (first, curvature) = erlang_log_survival_derivatives(posterior.shape, rate, entry);
+            gradient -= first;
+            second -= curvature;
+        }
+    }
+    match posterior.prior {
+        CapacityPrior::LogUniform => value -= (posterior.high - posterior.low).ln(),
+        CapacityPrior::LogNormal {
+            service_time_median_seconds,
+            log_standard_deviation,
+            ..
+        } => {
+            let mean = -service_time_median_seconds.ln();
+            let standardized = (log_rate - mean) / log_standard_deviation;
+            let normal = Normal::new(mean, log_standard_deviation);
+            let mass = normal.map_or(1.0_f64, |distribution| {
+                distribution.cdf(posterior.high) - distribution.cdf(posterior.low)
+            });
+            value += -0.5_f64 * standardized * standardized
+                - log_standard_deviation.ln()
+                - 0.5_f64 * (2.0_f64 * PI).ln()
+                - mass.max(f64::MIN_POSITIVE).ln();
+            gradient -= (log_rate - mean) / log_standard_deviation.powi(2);
+            second -= log_standard_deviation.powi(2).recip();
+        }
+    }
+    (value, gradient, second)
+}
+
+fn erlang_log_survival_derivatives(shape: u32, rate: f64, micros: u64) -> (f64, f64) {
+    if micros == 0 {
+        return (0.0_f64, 0.0_f64);
+    }
+    let z = f64::from(shape) * rate * Duration::from_micros(micros).as_secs_f64();
+    let mut term = 1.0_f64;
+    let mut sum = term;
+    for order in 1..shape {
+        term *= z / f64::from(order);
+        sum += term;
+    }
+    let quotient = z * term / sum;
+    (-quotient, -quotient * (f64::from(shape) - z + quotient))
+}
+
+fn truncated_log_rate_draw(
+    mode: f64,
+    curvature: f64,
+    low: f64,
+    high: f64,
+    lower: f64,
+    upper: f64,
+    draw: f64,
+) -> f64 {
+    let Ok(normal) = Normal::new(mode, curvature.sqrt().recip()) else {
+        return mode.exp();
+    };
+    normal
+        .inverse_cdf(lower + draw * (upper - lower))
+        .clamp(low, high)
+        .exp()
+}
+
+/// Draws a deterministic rate from its feasible interval.
+///
+/// An infeasible member has zero conditional posterior mass. Selection cannot
+/// call the clamp branch for that member. The clamp enforces the cell bound if
+/// stored state becomes inconsistent.
+#[derive(Clone, Copy)]
+struct DeterministicRateDraw {
+    mode: f64,
+    curvature: f64,
+    low: f64,
+    high: f64,
+    cell: (f64, f64),
+    prior: CapacityPrior,
+    lower_cdf: f64,
+    upper_cdf: f64,
+    draw: f64,
+}
+
+fn deterministic_log_rate_draw(parameters: DeterministicRateDraw) -> f64 {
+    let DeterministicRateDraw {
+        mode,
+        curvature,
+        low,
+        high,
+        cell,
+        prior,
+        lower_cdf,
+        upper_cdf,
+        draw,
+    } = parameters;
+    if low >= high {
+        return mode.clamp(cell.0, cell.1).exp();
+    }
+    match prior {
+        CapacityPrior::LogNormal { .. } => {
+            truncated_log_rate_draw(mode, curvature, low, high, lower_cdf, upper_cdf, draw)
+        }
+        CapacityPrior::LogUniform => {
+            let count = -curvature;
+            if count == 0.0_f64 {
+                low + draw * (high - low)
+            } else {
+                let lower = (count * (low - high)).exp();
+                high + (lower + draw * (1.0_f64 - lower)).ln() / count
+            }
+            .exp()
+        }
+    }
+}
+
+fn erlang_log_survival(shape: f64, operational_time: f64) -> f64 {
+    if operational_time <= 0.0_f64 {
+        return 0.0_f64;
+    }
+    gamma_ur(shape, shape * operational_time)
+        .max(f64::MIN_POSITIVE)
+        .ln()
 }
 
 #[cfg(test)]
@@ -2325,6 +3968,28 @@ fn log_weighted_sum(weights: &[f64], log_values: &[f64]) -> f64 {
             .map(|(weight, value)| weight * (*value - maximum).exp())
             .sum::<f64>()
             .ln()
+}
+
+fn normalize_log_weights(weights: &[f64], log_values: &[f64], output: &mut [f64]) {
+    let maximum = weights
+        .iter()
+        .zip(log_values)
+        .filter(|(weight, value)| **weight > 0.0_f64 && value.is_finite())
+        .map(|(weight, value)| weight.ln() + value)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let normalizer = weights
+        .iter()
+        .zip(log_values)
+        .filter(|(weight, value)| **weight > 0.0_f64 && value.is_finite())
+        .map(|(weight, value)| (weight.ln() + value - maximum).exp())
+        .sum::<f64>();
+    for ((output, weight), value) in output.iter_mut().zip(weights).zip(log_values) {
+        *output = if *weight > 0.0_f64 && value.is_finite() {
+            (weight.ln() + value - maximum).exp() / normalizer
+        } else {
+            0.0_f64
+        };
+    }
 }
 
 fn log_contamination_mixture(clean: f64, prior_predictive: f64, probability: f64) -> f64 {

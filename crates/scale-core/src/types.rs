@@ -1383,8 +1383,12 @@ pub struct DispatchCapacity {
 pub struct OwnerCapacity<'a> {
     slots_per_owner: u32,
     supplied_attempts: &'a [u32],
+    initial_key_counts: &'a [u32],
+    initial_active_attempt_counts: &'a [u32],
+    initial_key_labels: &'a [u32],
     arrival_offsets_micros: &'a [u64],
     arrival_owners: &'a [u32],
+    arrival_key_labels: &'a [u32],
 }
 
 impl<'a> OwnerCapacity<'a> {
@@ -1396,20 +1400,41 @@ impl<'a> OwnerCapacity<'a> {
     pub fn new(
         slots_per_owner: u32,
         supplied_attempts: &'a [u32],
-        arrival_offsets_micros: &'a [u64],
-        arrival_owners: &'a [u32],
+        initial_key_counts: &'a [u32],
+        initial_active_attempt_counts: &'a [u32],
+        initial_key_labels: &'a [u32],
+        arrivals: (&'a [u64], &'a [u32], &'a [u32]),
     ) -> Result<Self, ObservationError> {
+        let (arrival_offsets_micros, arrival_owners, arrival_key_labels) = arrivals;
         if slots_per_owner == 0
             || supplied_attempts.is_empty()
+            || supplied_attempts.len() != initial_key_counts.len()
+            || supplied_attempts.len() != initial_active_attempt_counts.len()
+            || supplied_attempts.iter().copied().sum::<u32>() as usize != initial_key_labels.len()
+            || initial_key_counts
+                .iter()
+                .any(|count| *count > slots_per_owner)
             || arrival_offsets_micros.len() != arrival_owners.len()
+            || arrival_owners.len() != arrival_key_labels.len()
+        {
+            return Err(ObservationError::ResourceOwnerCapacity);
+        }
+        if supplied_attempts
+            .iter()
+            .zip(initial_active_attempt_counts)
+            .any(|(supplied, active)| active > supplied)
         {
             return Err(ObservationError::ResourceOwnerCapacity);
         }
         Ok(Self {
             slots_per_owner,
             supplied_attempts,
+            initial_key_counts,
+            initial_active_attempt_counts,
+            initial_key_labels,
             arrival_offsets_micros,
             arrival_owners,
+            arrival_key_labels,
         })
     }
 }
@@ -1423,9 +1448,24 @@ pub struct PlacementCapacity<'a> {
 
 impl<'a> PlacementCapacity<'a> {
     /// Combines physical dispatch limits with owner queue supplies.
-    #[must_use]
-    pub const fn new(dispatch: DispatchCapacity, owners: OwnerCapacity<'a>) -> Self {
-        Self { dispatch, owners }
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the initial owner levels do not sum to the fleet
+    /// ceiling.
+    pub fn new(
+        dispatch: DispatchCapacity,
+        owners: OwnerCapacity<'a>,
+    ) -> Result<Self, ObservationError> {
+        let owner_ceiling = owners
+            .initial_key_counts
+            .iter()
+            .try_fold(0_u32, |sum, ceiling| sum.checked_add(*ceiling))
+            .ok_or(ObservationError::ResourceOwnerCapacity)?;
+        if owner_ceiling != dispatch.demand_ceiling {
+            return Err(ObservationError::ResourceOwnerCapacity);
+        }
+        Ok(Self { dispatch, owners })
     }
 }
 
@@ -1480,8 +1520,12 @@ pub struct OccupancyTraceEvidence<'a> {
     dispatchable_demand_ceiling: u32,
     slots_per_owner: u32,
     owner_supplied_attempts: &'a [u32],
+    owner_initial_key_counts: &'a [u32],
+    owner_initial_active_attempt_counts: &'a [u32],
+    owner_initial_key_labels: &'a [u32],
     owner_arrival_offsets_micros: &'a [u64],
     owner_arrival_owners: &'a [u32],
+    owner_arrival_key_labels: &'a [u32],
     initial_available_attempts: u32,
     final_busy_slots: u32,
     busy_slot_micros: u128,
@@ -1490,6 +1534,10 @@ pub struct OccupancyTraceEvidence<'a> {
     completed_attempts: &'a [u32],
     started_attempts: &'a [u32],
     available_attempts: &'a [u32],
+    completion_offsets_micros: &'a [u64],
+    completion_durations_micros: &'a [u64],
+    initial_live_attempt_ages_micros: &'a [u64],
+    final_live_attempt_ages_micros: &'a [u64],
 }
 
 impl OccupancyTraceEvidence<'_> {
@@ -1529,8 +1577,25 @@ impl OccupancyTraceEvidence<'_> {
         self.owner_supplied_attempts
     }
 
-    pub(crate) const fn owner_arrivals(&self) -> (&[u64], &[u32]) {
-        (self.owner_arrival_offsets_micros, self.owner_arrival_owners)
+    /// Returns each owner's dispatchable-key count at the report start.
+    #[must_use]
+    pub const fn owner_initial_key_counts(&self) -> &[u32] {
+        self.owner_initial_key_counts
+    }
+
+    pub(crate) const fn owner_initial_work(&self) -> (&[u32], &[u32]) {
+        (
+            self.owner_initial_active_attempt_counts,
+            self.owner_initial_key_labels,
+        )
+    }
+
+    pub(crate) const fn owner_arrivals(&self) -> (&[u64], &[u32], &[u32]) {
+        (
+            self.owner_arrival_offsets_micros,
+            self.owner_arrival_owners,
+            self.owner_arrival_key_labels,
+        )
     }
 
     /// Returns work that was available at the report start.
@@ -1578,6 +1643,15 @@ impl OccupancyTraceEvidence<'_> {
     pub(crate) const fn demand_groups(&self) -> &[u32] {
         self.available_attempts
     }
+
+    pub(crate) const fn service_durations(&self) -> (&[u64], &[u64], &[u64], &[u64]) {
+        (
+            self.completion_offsets_micros,
+            self.completion_durations_micros,
+            self.initial_live_attempt_ages_micros,
+            self.final_live_attempt_ages_micros,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1597,8 +1671,12 @@ pub(crate) const fn occupancy_trace_for_test<'a>(
         dispatchable_demand_ceiling: u32::MAX,
         slots_per_owner: 0,
         owner_supplied_attempts: &[],
+        owner_initial_key_counts: &[],
+        owner_initial_active_attempt_counts: &[],
+        owner_initial_key_labels: &[],
         owner_arrival_offsets_micros: &[],
         owner_arrival_owners: &[],
+        owner_arrival_key_labels: &[],
         initial_available_attempts: 0,
         final_busy_slots,
         busy_slot_micros,
@@ -1607,6 +1685,50 @@ pub(crate) const fn occupancy_trace_for_test<'a>(
         completed_attempts,
         started_attempts,
         available_attempts: started_attempts,
+        completion_offsets_micros: &[],
+        completion_durations_micros: &[],
+        initial_live_attempt_ages_micros: &[],
+        final_live_attempt_ages_micros: &[],
+    }
+}
+
+#[cfg(test)]
+pub(crate) const fn occupancy_trace_with_service_for_test<'a>(
+    window: ResourceWindow,
+    initial_busy_slots: u32,
+    final_busy_slots: u32,
+    busy_slot_micros: u128,
+    transitions: (&'a [u64], &'a [u32], &'a [u32]),
+    service: (&'a [u64], &'a [u64], &'a [u64], &'a [u64]),
+) -> OccupancyTraceEvidence<'a> {
+    let (offsets_micros, completed_attempts, started_attempts) = transitions;
+    let (completion_offsets_micros, completion_durations_micros, initial_ages, final_ages) =
+        service;
+    OccupancyTraceEvidence {
+        window,
+        initial_busy_slots,
+        slot_count: u32::MAX,
+        dispatchable_demand_ceiling: u32::MAX,
+        slots_per_owner: 0,
+        owner_supplied_attempts: &[],
+        owner_initial_key_counts: &[],
+        owner_initial_active_attempt_counts: &[],
+        owner_initial_key_labels: &[],
+        owner_arrival_offsets_micros: &[],
+        owner_arrival_owners: &[],
+        owner_arrival_key_labels: &[],
+        initial_available_attempts: 0,
+        final_busy_slots,
+        busy_slot_micros,
+        mean_concurrency: window.concurrency(),
+        offsets_micros,
+        completed_attempts,
+        started_attempts,
+        available_attempts: started_attempts,
+        completion_offsets_micros,
+        completion_durations_micros,
+        initial_live_attempt_ages_micros: initial_ages,
+        final_live_attempt_ages_micros: final_ages,
     }
 }
 
@@ -1628,8 +1750,12 @@ pub(crate) const fn occupancy_trace_with_demand_for_test<'a>(
         dispatchable_demand_ceiling: capacity.demand_ceiling,
         slots_per_owner: 0,
         owner_supplied_attempts: &[],
+        owner_initial_key_counts: &[],
+        owner_initial_active_attempt_counts: &[],
+        owner_initial_key_labels: &[],
         owner_arrival_offsets_micros: &[],
         owner_arrival_owners: &[],
+        owner_arrival_key_labels: &[],
         initial_available_attempts,
         final_busy_slots,
         busy_slot_micros,
@@ -1638,6 +1764,10 @@ pub(crate) const fn occupancy_trace_with_demand_for_test<'a>(
         completed_attempts,
         started_attempts,
         available_attempts,
+        completion_offsets_micros: &[],
+        completion_durations_micros: &[],
+        initial_live_attempt_ages_micros: &[],
+        final_live_attempt_ages_micros: &[],
     }
 }
 
@@ -1660,8 +1790,12 @@ pub(crate) const fn occupancy_trace_with_owners_for_test<'a>(
         dispatchable_demand_ceiling: dispatch.demand_ceiling,
         slots_per_owner: owners.slots_per_owner,
         owner_supplied_attempts: owners.supplied_attempts,
+        owner_initial_key_counts: owners.initial_key_counts,
+        owner_initial_active_attempt_counts: owners.initial_active_attempt_counts,
+        owner_initial_key_labels: owners.initial_key_labels,
         owner_arrival_offsets_micros: owners.arrival_offsets_micros,
         owner_arrival_owners: owners.arrival_owners,
+        owner_arrival_key_labels: owners.arrival_key_labels,
         initial_available_attempts,
         final_busy_slots,
         busy_slot_micros,
@@ -1670,6 +1804,10 @@ pub(crate) const fn occupancy_trace_with_owners_for_test<'a>(
         completed_attempts,
         started_attempts,
         available_attempts,
+        completion_offsets_micros: &[],
+        completion_durations_micros: &[],
+        initial_live_attempt_ages_micros: &[],
+        final_live_attempt_ages_micros: &[],
     }
 }
 
@@ -1716,9 +1854,18 @@ pub struct ObservationBuffer {
     resource_transition_completed_attempts: Vec<u32>,
     resource_transition_started_attempts: Vec<u32>,
     resource_transition_available_attempts: Vec<u32>,
+    resource_completion_offsets_micros: Vec<u64>,
+    resource_completion_durations_micros: Vec<u64>,
+    resource_initial_live_attempt_ages_micros: Vec<u64>,
+    resource_final_live_attempt_ages_micros: Vec<u64>,
     resource_owner_supplied_attempts: Vec<u32>,
+    resource_owner_initial_key_counts: Vec<u32>,
+    resource_owner_initial_active_attempt_counts: Vec<u32>,
+    resource_owner_initial_key_labels: Vec<u32>,
     resource_owner_arrival_offsets_micros: Vec<u64>,
     resource_owner_arrival_owners: Vec<u32>,
+    resource_owner_arrival_key_labels: Vec<u32>,
+    resource_owner_key_seen: Vec<bool>,
     attempt_outcomes: Option<AttemptOutcomeEvidence>,
     launch_header: Option<LaunchEvidenceHeader>,
     readiness_lumps: Vec<ReadinessLump>,
@@ -1798,13 +1945,34 @@ impl ObservationBuffer {
             resource_transition_available_attempts: Vec::with_capacity(
                 resource_transition_count_max,
             ),
+            resource_completion_offsets_micros: Vec::with_capacity(
+                configuration.resource_window_attempt_count_max as usize,
+            ),
+            resource_completion_durations_micros: Vec::with_capacity(
+                configuration.resource_window_attempt_count_max as usize,
+            ),
+            resource_initial_live_attempt_ages_micros: Vec::with_capacity(
+                configuration.resource_window_attempt_count_max as usize,
+            ),
+            resource_final_live_attempt_ages_micros: Vec::with_capacity(
+                configuration.resource_window_attempt_count_max as usize,
+            ),
             resource_owner_supplied_attempts: Vec::with_capacity(replica_count_max),
+            resource_owner_initial_key_counts: Vec::with_capacity(replica_count_max),
+            resource_owner_initial_active_attempt_counts: Vec::with_capacity(replica_count_max),
+            resource_owner_initial_key_labels: Vec::with_capacity(
+                configuration.resource_window_attempt_count_max as usize,
+            ),
             resource_owner_arrival_offsets_micros: Vec::with_capacity(
                 configuration.resource_window_attempt_count_max as usize,
             ),
             resource_owner_arrival_owners: Vec::with_capacity(
                 configuration.resource_window_attempt_count_max as usize,
             ),
+            resource_owner_arrival_key_labels: Vec::with_capacity(
+                configuration.resource_window_attempt_count_max as usize,
+            ),
+            resource_owner_key_seen: Vec::new(),
             attempt_outcomes: None,
             launch_header: None,
             readiness_lumps: Vec::with_capacity(readiness_lump_count_max),
@@ -1850,6 +2018,10 @@ impl ObservationBuffer {
         self.resource_transition_completed_attempts.clear();
         self.resource_transition_started_attempts.clear();
         self.resource_transition_available_attempts.clear();
+        self.resource_completion_offsets_micros.clear();
+        self.resource_completion_durations_micros.clear();
+        self.resource_initial_live_attempt_ages_micros.clear();
+        self.resource_final_live_attempt_ages_micros.clear();
         self.attempt_outcomes = None;
         self.launch_header = None;
         self.readiness_lumps.clear();
@@ -2108,6 +2280,48 @@ impl ObservationBuffer {
         )
     }
 
+    /// Adds exact service durations and report-start ages to the resource
+    /// report.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for mismatched columns, invalid times, or invalid ages.
+    pub fn set_resource_service_evidence(
+        &mut self,
+        completion_offsets_micros: &[u64],
+        completion_durations_micros: &[u64],
+        initial_live_attempt_ages_micros: &[u64],
+        final_live_attempt_ages_micros: &[u64],
+    ) -> Result<(), ObservationError> {
+        let Some(header) = self.resource_trace else {
+            return Err(ObservationError::ResourceServiceEvidence);
+        };
+        if completion_offsets_micros.len() != completion_durations_micros.len()
+            || completion_offsets_micros.len() as u32 != header.window.completed_attempts()
+            || initial_live_attempt_ages_micros.len() as u32 != header.initial_busy_slots
+            || final_live_attempt_ages_micros.len() as u32 != header.final_busy_slots
+            || completion_offsets_micros
+                .iter()
+                .copied()
+                .zip(completion_durations_micros.iter().copied())
+                .any(|(offset, duration)| offset > header.window.exposure_micros() || duration == 0)
+            || completion_offsets_micros
+                .windows(2)
+                .any(|pair| pair[0] > pair[1])
+        {
+            return Err(ObservationError::ResourceServiceEvidence);
+        }
+        self.resource_completion_offsets_micros
+            .extend_from_slice(completion_offsets_micros);
+        self.resource_completion_durations_micros
+            .extend_from_slice(completion_durations_micros);
+        self.resource_initial_live_attempt_ages_micros
+            .extend_from_slice(initial_live_attempt_ages_micros);
+        self.resource_final_live_attempt_ages_micros
+            .extend_from_slice(final_live_attempt_ages_micros);
+        Ok(())
+    }
+
     fn set_resource_observation_with_capacity(
         &mut self,
         window: ResourceWindow,
@@ -2120,6 +2334,16 @@ impl ObservationBuffer {
         let (capacity, owners) = capacity.parts();
         if self.resource_trace.is_some() {
             return Err(ObservationError::ResourceWindowPending);
+        }
+        if owners.is_some_and(|owners| {
+            owners
+                .initial_active_attempt_counts
+                .iter()
+                .copied()
+                .sum::<u32>()
+                != initial_busy_slots
+        }) {
+            return Err(ObservationError::ResourceOwnerCapacity);
         }
         if window.concurrency() > self.resource_concurrency_max {
             return Err(ObservationError::ResourceConcurrency);
@@ -2148,40 +2372,13 @@ impl ObservationBuffer {
         if transitions.len() > self.resource_transition_offsets_micros.capacity() {
             return Err(ObservationError::ResourceTransitionCapacity);
         }
-        let mut state = initial_busy_slots;
-        let mut previous_offset = 0_u64;
-        let mut busy_slot_micros = 0_u128;
-        let mut completed_attempts = 0_u32;
-        let mut started_attempts = 0_u32;
-        for (index, transition) in transitions.iter().copied().enumerate() {
-            if transition.offset_micros > window.exposure_micros() {
-                return Err(ObservationError::ResourceTransitionTime);
-            }
-            if index > 0 && transition.offset_micros <= previous_offset {
-                return Err(ObservationError::ResourceTransitionOrder);
-            }
-            let elapsed = transition.offset_micros - previous_offset;
-            busy_slot_micros = busy_slot_micros
-                .checked_add(u128::from(elapsed) * u128::from(state))
-                .ok_or(ObservationError::CountOverflow)?;
-            // One group is a simultaneous batch: coalescing destroys the
-            // within-offset event order, so only the net state is checked.
-            state = state
-                .checked_add(transition.started_attempts)
-                .and_then(|value| value.checked_sub(transition.completed_attempts))
-                .filter(|value| *value <= self.resource_concurrency_max as u32)
-                .ok_or(ObservationError::ResourceBusySlots)?;
-            completed_attempts = completed_attempts
-                .checked_add(transition.completed_attempts)
-                .ok_or(ObservationError::CountOverflow)?;
-            started_attempts = started_attempts
-                .checked_add(transition.started_attempts)
-                .ok_or(ObservationError::CountOverflow)?;
-            previous_offset = transition.offset_micros;
-        }
-        busy_slot_micros = busy_slot_micros
-            .checked_add(u128::from(window.exposure_micros() - previous_offset) * u128::from(state))
-            .ok_or(ObservationError::CountOverflow)?;
+        let (state, busy_slot_micros, completed_attempts, started_attempts) =
+            fold_resource_transitions(
+                window,
+                initial_busy_slots,
+                self.resource_concurrency_max as u32,
+                transitions,
+            )?;
         if state != final_busy_slots
             || completed_attempts != window.completed_attempts()
             || started_attempts != window.started_attempts()
@@ -2247,8 +2444,12 @@ impl ObservationBuffer {
         transitions: &[OccupancyTransition],
     ) -> Result<(), ObservationError> {
         self.resource_owner_supplied_attempts.clear();
+        self.resource_owner_initial_key_counts.clear();
+        self.resource_owner_initial_active_attempt_counts.clear();
+        self.resource_owner_initial_key_labels.clear();
         self.resource_owner_arrival_offsets_micros.clear();
         self.resource_owner_arrival_owners.clear();
+        self.resource_owner_arrival_key_labels.clear();
         let Some(owners) = owners else {
             return Ok(());
         };
@@ -2273,21 +2474,71 @@ impl ObservationBuffer {
         let supplied = initial_supply
             .checked_add(owners.arrival_owners.len() as u32)
             .ok_or(ObservationError::CountOverflow)?;
+        let mut label_start = 0_usize;
+        let mut labels_valid = true;
+        for ((&owner_supply, &key_count), &active_count) in owners
+            .supplied_attempts
+            .iter()
+            .zip(owners.initial_key_counts)
+            .zip(owners.initial_active_attempt_counts)
+        {
+            let label_end = label_start.saturating_add(owner_supply as usize);
+            let Some(labels) = owners.initial_key_labels.get(label_start..label_end) else {
+                labels_valid = false;
+                break;
+            };
+            let seen_len = labels
+                .iter()
+                .copied()
+                .max()
+                .map_or(0, |label| label as usize + 1);
+            self.resource_owner_key_seen.clear();
+            self.resource_owner_key_seen.resize(seen_len, false);
+            let mut distinct = 0_usize;
+            for (index, &label) in labels.iter().enumerate() {
+                let seen = &mut self.resource_owner_key_seen[label as usize];
+                if index < active_count as usize && *seen {
+                    labels_valid = false;
+                    break;
+                }
+                if !*seen {
+                    *seen = true;
+                    distinct += 1;
+                }
+            }
+            if distinct.min(owners.slots_per_owner as usize) != key_count as usize {
+                labels_valid = false;
+                break;
+            }
+            label_start = label_end;
+        }
         let arrivals_valid = owners
             .arrival_offsets_micros
             .iter()
             .copied()
             .zip(owners.arrival_owners.iter().copied())
-            .all(|(offset, owner)| offset <= window.exposure_micros() && owner < owner_count);
-        if owner_slots < slot_count || supplied < demand || !arrivals_valid {
+            .all(|(offset, owner)| offset <= window.exposure_micros() && owner < owner_count)
+            && owners
+                .arrival_offsets_micros
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1]);
+        if owner_slots < slot_count || supplied < demand || !arrivals_valid || !labels_valid {
             return Err(ObservationError::ResourceOwnerCapacity);
         }
         self.resource_owner_supplied_attempts
             .extend_from_slice(owners.supplied_attempts);
+        self.resource_owner_initial_key_counts
+            .extend_from_slice(owners.initial_key_counts);
+        self.resource_owner_initial_active_attempt_counts
+            .extend_from_slice(owners.initial_active_attempt_counts);
+        self.resource_owner_initial_key_labels
+            .extend_from_slice(owners.initial_key_labels);
         self.resource_owner_arrival_offsets_micros
             .extend_from_slice(owners.arrival_offsets_micros);
         self.resource_owner_arrival_owners
             .extend_from_slice(owners.arrival_owners);
+        self.resource_owner_arrival_key_labels
+            .extend_from_slice(owners.arrival_key_labels);
         Ok(())
     }
 
@@ -2567,8 +2818,13 @@ impl ObservationBuffer {
                     dispatchable_demand_ceiling: header.dispatchable_demand_ceiling,
                     slots_per_owner: header.slots_per_owner,
                     owner_supplied_attempts: &self.resource_owner_supplied_attempts,
+                    owner_initial_key_counts: &self.resource_owner_initial_key_counts,
+                    owner_initial_active_attempt_counts: &self
+                        .resource_owner_initial_active_attempt_counts,
+                    owner_initial_key_labels: &self.resource_owner_initial_key_labels,
                     owner_arrival_offsets_micros: &self.resource_owner_arrival_offsets_micros,
                     owner_arrival_owners: &self.resource_owner_arrival_owners,
+                    owner_arrival_key_labels: &self.resource_owner_arrival_key_labels,
                     initial_available_attempts: header.initial_available_attempts,
                     final_busy_slots: header.final_busy_slots,
                     busy_slot_micros: header.busy_slot_micros,
@@ -2577,6 +2833,11 @@ impl ObservationBuffer {
                     completed_attempts: &self.resource_transition_completed_attempts,
                     started_attempts: &self.resource_transition_started_attempts,
                     available_attempts: &self.resource_transition_available_attempts,
+                    completion_offsets_micros: &self.resource_completion_offsets_micros,
+                    completion_durations_micros: &self.resource_completion_durations_micros,
+                    initial_live_attempt_ages_micros: &self
+                        .resource_initial_live_attempt_ages_micros,
+                    final_live_attempt_ages_micros: &self.resource_final_live_attempt_ages_micros,
                 }),
             attempt_outcomes: self.attempt_outcomes.take(),
             launch: self.launch_header.take().map(|header| {
@@ -2620,6 +2881,53 @@ fn busy_slot_mean(busy_slot_micros: u128, exposure_micros: u64) -> Result<f64, O
     Ok(f64::from(whole)
         + Duration::from_micros(remainder).as_secs_f64()
             / Duration::from_micros(exposure_micros).as_secs_f64())
+}
+
+fn fold_resource_transitions(
+    window: ResourceWindow,
+    initial_busy_slots: u32,
+    concurrency_max: u32,
+    transitions: &[OccupancyTransition],
+) -> Result<(u32, u128, u32, u32), ObservationError> {
+    let mut state = initial_busy_slots;
+    let mut previous_offset = 0_u64;
+    let mut busy_slot_micros = 0_u128;
+    let mut completed_attempts = 0_u32;
+    let mut started_attempts = 0_u32;
+    for (index, transition) in transitions.iter().copied().enumerate() {
+        if transition.offset_micros > window.exposure_micros() {
+            return Err(ObservationError::ResourceTransitionTime);
+        }
+        if index > 0 && transition.offset_micros <= previous_offset {
+            return Err(ObservationError::ResourceTransitionOrder);
+        }
+        let elapsed = transition.offset_micros - previous_offset;
+        busy_slot_micros = busy_slot_micros
+            .checked_add(u128::from(elapsed) * u128::from(state))
+            .ok_or(ObservationError::CountOverflow)?;
+        // One group is a simultaneous batch. Only its net state is valid.
+        state = state
+            .checked_add(transition.started_attempts)
+            .and_then(|value| value.checked_sub(transition.completed_attempts))
+            .filter(|value| *value <= concurrency_max)
+            .ok_or(ObservationError::ResourceBusySlots)?;
+        completed_attempts = completed_attempts
+            .checked_add(transition.completed_attempts)
+            .ok_or(ObservationError::CountOverflow)?;
+        started_attempts = started_attempts
+            .checked_add(transition.started_attempts)
+            .ok_or(ObservationError::CountOverflow)?;
+        previous_offset = transition.offset_micros;
+    }
+    busy_slot_micros = busy_slot_micros
+        .checked_add(u128::from(window.exposure_micros() - previous_offset) * u128::from(state))
+        .ok_or(ObservationError::CountOverflow)?;
+    Ok((
+        state,
+        busy_slot_micros,
+        completed_attempts,
+        started_attempts,
+    ))
 }
 
 /// Bounded values exported for diagnosis.
@@ -2793,6 +3101,9 @@ pub enum ObservationError {
     /// A resource summary disagrees with its derived trace values.
     #[error("the resource summary disagrees with its trace")]
     ResourceTraceSummary,
+    /// Service duration columns disagree with the resource trace.
+    #[error("service duration columns disagree with the resource trace")]
+    ResourceServiceEvidence,
     /// An incomplete actuation has invalid replica counts or exceeds its bound.
     #[error("an actuation commitment is invalid or exceeds its fixed bound")]
     ActuationCommitment,

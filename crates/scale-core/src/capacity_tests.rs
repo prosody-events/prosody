@@ -1,4 +1,6 @@
 use std::{
+    collections::HashMap,
+    f64::consts::PI,
     num::{ParseFloatError, ParseIntError},
     str::FromStr,
     time::Duration,
@@ -7,22 +9,26 @@ use std::{
 use allocation_counter::measure;
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use quickcheck_macros::quickcheck;
-use statrs::distribution::{Binomial, BinomialError, ContinuousCDF, DiscreteCDF, Gamma};
+use statrs::distribution::{
+    Binomial, BinomialError, ContinuousCDF, DiscreteCDF, Gamma, Normal, NormalError,
+};
 use thiserror::Error;
 
 use super::{
     CAPACITY_UPDATE_OPERATION_COUNT_MAX, CapacityAllocation, CapacityGrid, CapacityGridError,
-    CapacityModelError, HAZARD_COVERAGE_INDEX, HAZARD_TRANSITION_PROBABILITY_ERROR_MAX,
-    OBSERVATION_COVERAGE_INDEX, OBSERVATION_PROBABILITY_ERROR_MAX, ResourceWindow,
-    ResourceWindowError, capacity_model_artifact, capacity_update_operation_count,
-    contamination_prior, fill_knee_state_rates, fill_no_knee_state_rates, fold_trace, hazard_prior,
+    CapacityModelError, CapacityPrior, HAZARD_COVERAGE_INDEX,
+    HAZARD_TRANSITION_PROBABILITY_ERROR_MAX, OBSERVATION_COVERAGE_INDEX,
+    OBSERVATION_PROBABILITY_ERROR_MAX, ResourceWindow, ResourceWindowError,
+    capacity_model_artifact, capacity_update_operation_count, contamination_prior,
+    fill_knee_state_rates, fill_no_knee_state_rates, fold_trace, hazard_prior,
     log_contamination_mixture, log_normal_axis_masses, log_weighted_sum, path_log_score,
     vector_exp,
 };
 use crate::change_point::ChangePointKernel;
+use crate::random::RandomStream;
 use crate::types::{
     occupancy_trace_for_test, occupancy_trace_with_demand_for_test,
-    occupancy_trace_with_owners_for_test,
+    occupancy_trace_with_owners_for_test, occupancy_trace_with_service_for_test,
 };
 use crate::{DispatchCapacity, OccupancyTraceEvidence, OwnerCapacity, PlacementCapacity};
 
@@ -84,7 +90,7 @@ fn storm_factor() -> Result<super::CapacityFactor, TestError> {
         &[0.0005_f64, 0.001_f64, 0.002_f64, 0.004_f64, 0.008_f64],
         &[32_000.0_f64, 64_000.0_f64, 128_000.0_f64, 256_000.0_f64],
         &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64],
-        super::CapacityPrior::LogUniform,
+        CapacityPrior::LogUniform,
     )?;
     Ok(super::CapacityFactor::new_with_prior_with_groups(
         grid,
@@ -387,7 +393,15 @@ fn an_identifiable_persistent_run_beats_contamination_redraws() -> Result<(), Te
 fn hazard_cells_cover_the_declared_gamma_tails() -> Result<(), TestError> {
     let mean_per_second = 1.0_f64 / 300.0_f64;
     let artifact = capacity_model_artifact(mean_per_second, 4.0_f64)?;
-    assert_eq!(artifact.identity.version(), 2);
+    assert_eq!(artifact.identity.version(), 5);
+    assert_eq!(
+        artifact.service_clock_assumption,
+        super::ServiceClockAssumption::ErlangAndDeterministicRenewal
+    );
+    assert_eq!(
+        artifact.service_duration_evidence,
+        super::ServiceDurationEvidence::ObservedAttemptDurationsAndBoundaryAges
+    );
     assert!(
         artifact.coverage[HAZARD_COVERAGE_INDEX].tail_probability()
             <= artifact.budget.boundary_probability_max()
@@ -454,17 +468,17 @@ fn one_second_transition_retains_an_informative_capacity_update() -> Result<(), 
     let evidence =
         occupancy_trace_for_test(window, 50, 50, 50_000_000, &offsets, &completed, &started);
     fold_trace(
-        evidence,
+        &evidence,
         &mut factor.state_exposure_seconds,
         &mut factor.state_completion_counts,
     );
     for index in 0..factor.grid.knee_cell_count as usize {
         fill_knee_state_rates(&factor.grid, index, &mut factor.state_rates);
-        factor.update_cell_likelihood(index, evidence);
+        factor.update_path_likelihood(index);
     }
     for index in factor.grid.knee_cell_count as usize..factor.likelihoods.len() {
         fill_no_knee_state_rates(&factor.grid, index, &mut factor.state_rates);
-        factor.update_cell_likelihood(index, evidence);
+        factor.update_path_likelihood(index);
     }
     let prior_predictive = log_weighted_sum(&factor.prior_weights, &factor.likelihoods);
     factor.update_filters(prior_predictive);
@@ -1654,7 +1668,7 @@ fn flat_capacity_factor() -> Result<super::CapacityFactor, TestError> {
         &[0.101_f64, 0.202_f64, 0.404_f64],
         &[80.0_f64, 320.0_f64, 600.0_f64],
         &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64],
-        super::CapacityPrior::LogUniform,
+        CapacityPrior::LogUniform,
     )?;
     Ok(super::CapacityFactor::new_with_prior_with_groups(
         grid,
@@ -1919,13 +1933,461 @@ fn raw_path_score_matches_the_exponential_clock_oracle() -> Result<(), TestError
         let rate = super::state_rate(&grid, index, 1);
         let mut exposures = [0.0_f64; 2];
         let mut completion_counts = [0_u32; 2];
-        fold_trace(evidence, &mut exposures, &mut completion_counts);
+        fold_trace(&evidence, &mut exposures, &mut completion_counts);
         let raw = path_log_score(&grid, index, &exposures, &completion_counts);
         let oracle = rate.ln() - rate * 0.25_f64;
         assert!((raw - oracle).abs() <= 256.0_f64 * f64::EPSILON);
     }
 
-    assert_contamination_filter_parity(&mut factor, &grid, evidence);
+    assert_contamination_filter_parity(&mut factor, &grid, &evidence);
+    Ok(())
+}
+
+#[test]
+fn shape_one_duration_score_nests_the_markov_path_score() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.5_f64], &[100.0_f64], &[0.0_f64])?;
+    let window = ResourceWindow::new_with_starts(1.8_f64, 1.0_f64, 1, 1)?;
+    let offsets = [400_000_u64, 600_000_u64];
+    let completed = [1_u32, 0];
+    let started = [0_u32, 1];
+    let completion_offsets = [400_000_u64];
+    let durations = [400_000_u64];
+    let initial_ages = [0_u64, 0];
+    let final_ages = [1_000_000_u64, 400_000];
+    let evidence = occupancy_trace_with_service_for_test(
+        window,
+        2,
+        2,
+        1_800_000,
+        (&offsets, &completed, &started),
+        (&completion_offsets, &durations, &initial_ages, &final_ages),
+    );
+    let mut exposures = [0.0_f64; 3];
+    let mut completion_counts = [0_u32; 3];
+    fold_trace(&evidence, &mut exposures, &mut completion_counts);
+    let markov = path_log_score(&grid, 0, &exposures, &completion_counts)
+        + super::REPORT_CLOCK_ERROR_SECONDS.ln();
+    let statistics = super::duration_statistics(&durations);
+    let duration = super::duration_log_likelihood(1, 2.0_f64, &evidence, statistics)
+        + super::aggregate_completion_log_score(&grid, 0, &completion_counts);
+    assert!((markov - duration).abs() <= 256.0_f64 * f64::EPSILON);
+    Ok(())
+}
+
+#[test]
+fn within_cell_newton_mode_matches_the_completion_mode() -> Result<(), TestError> {
+    let window = ResourceWindow::new_with_starts(0.2_f64, 1.0_f64, 1, 0)?;
+    let offsets = [200_000_u64];
+    let counts = [1_u32];
+    let started = [0_u32];
+    let durations = [200_000_u64];
+    let evidence = occupancy_trace_with_service_for_test(
+        window,
+        1,
+        0,
+        200_000,
+        (&offsets, &counts, &started),
+        (&offsets, &durations, &[], &[]),
+    );
+    let statistics = super::duration_statistics(&durations);
+    let posterior = super::WithinCellPosterior {
+        shape: 4,
+        low: 0.0_f64,
+        high: 10.0_f64.ln(),
+        evidence: &evidence,
+        statistics,
+        aggregate_count: 1,
+        prior: CapacityPrior::LogUniform,
+    };
+    let (mode, _) = super::within_cell_mode(1.0_f64, &posterior);
+
+    assert!((mode - 5.0_f64.ln()).abs() <= 1.0e-10_f64);
+    Ok(())
+}
+
+#[test]
+fn differing_duration_bins_zero_the_deterministic_member() -> Result<(), TestError> {
+    let window = ResourceWindow::new_with_starts(0.2_f64, 1.0_f64, 2, 0)?;
+    let offsets = [100_000_u64, 200_000];
+    let durations = [100_000_u64, 100_002];
+    let evidence = occupancy_trace_with_service_for_test(
+        window,
+        1,
+        0,
+        200_000,
+        (&offsets, &[1, 1], &[1, 0]),
+        (&offsets, &durations, &[], &[]),
+    );
+    let posterior = super::DeterministicWithinCellPosterior {
+        low: 5.0_f64.ln(),
+        high: 20.0_f64.ln(),
+        evidence: &evidence,
+        aggregate_count: 2,
+        prior: CapacityPrior::LogUniform,
+    };
+
+    let (_, _, score) = super::deterministic_within_cell_log_evidence(&posterior);
+
+    assert!(score.is_infinite() && score.is_sign_negative());
+    Ok(())
+}
+
+#[test]
+fn empty_feasible_interval_gives_the_deterministic_member_zero_posterior_mass()
+-> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.1_f64], &[100.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        1.0_f64,
+        0.1_f64,
+        8,
+    )?;
+    let window = ResourceWindow::new_with_starts(0.2_f64, 1.0_f64, 2, 0)?;
+    let offsets = [100_000_u64, 200_000];
+    let durations = [100_000_u64, 100_002];
+    factor.update(
+        occupancy_trace_with_service_for_test(
+            window,
+            1,
+            0,
+            200_000,
+            (&offsets, &[1, 1], &[1, 0]),
+            (&offsets, &durations, &[], &[]),
+        ),
+        Duration::from_secs(1),
+    );
+
+    assert_eq!(
+        factor.shape_cell_weights[super::SERVICE_CLOCKS.len() - 1].to_bits(),
+        0.0_f64.to_bits()
+    );
+    Ok(())
+}
+
+#[test]
+fn deterministic_closed_form_matches_numerical_integration() -> Result<(), TestError> {
+    let window = ResourceWindow::new_with_starts(0.1_f64, 1.0_f64, 1, 0)?;
+    let offsets = [100_000_u64];
+    let durations = [100_000_u64];
+    let evidence = occupancy_trace_with_service_for_test(
+        window,
+        1,
+        0,
+        100_000,
+        (&offsets, &[1], &[0]),
+        (&offsets, &durations, &[], &[]),
+    );
+    let prior = CapacityPrior::LogNormal {
+        service_time_median_seconds: 0.11_f64,
+        capacity_median_per_second: 100.0_f64,
+        log_standard_deviation: 0.4_f64,
+    };
+    let posterior = super::DeterministicWithinCellPosterior {
+        low: 5.0_f64.ln(),
+        high: 20.0_f64.ln(),
+        evidence: &evidence,
+        aggregate_count: 2,
+        prior,
+    };
+    let (_, _, score) = super::deterministic_within_cell_log_evidence(&posterior);
+    let (low, high) =
+        super::deterministic_feasible_interval(&evidence, posterior.low, posterior.high);
+    let mean = -0.11_f64.ln();
+    let deviation = 0.4_f64;
+    let steps = 100_000_u32;
+    let width = (high - low) / f64::from(steps);
+    let integral = (0..steps)
+        .map(|index| {
+            let x = low + (f64::from(index) + 0.5_f64) * width;
+            let standardized = (x - mean) / deviation;
+            (2.0_f64 * x - 0.5_f64 * standardized * standardized).exp()
+                / (deviation * (2.0_f64 * PI).sqrt())
+        })
+        .sum::<f64>()
+        * width;
+    let distribution = Normal::new(mean, deviation)?;
+    let cell_mass = distribution.cdf(posterior.high) - distribution.cdf(posterior.low);
+
+    assert!((score.exp() - integral / cell_mass).abs() <= 1.0e-8_f64);
+    Ok(())
+}
+
+#[test]
+fn predictive_median_tracks_an_off_grid_duration_within_its_cell() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.09_f64, 0.11_f64], &[10_000.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        100.0_f64,
+        0.01_f64,
+        2_047,
+    )?;
+    let duration = 95_000_u64;
+    let durations = vec![duration; 64];
+    let completion_offsets = vec![duration; 64];
+    let update_window = ResourceWindow::new_with_starts(6.08_f64, 1.0_f64, 64, 0)?;
+    factor.update(
+        occupancy_trace_with_service_for_test(
+            update_window,
+            64,
+            0,
+            6_080_000,
+            (&[duration], &[64], &[0]),
+            (&completion_offsets, &durations, &[], &[]),
+        ),
+        Duration::from_secs(1),
+    );
+    factor.weights.fill(0.0_f64);
+    factor.weights[2] = 1.0_f64;
+    factor.shape_weights.fill(0.0_f64);
+    factor.shape_weights[super::SERVICE_SHAPES.len() - 1] = 1.0_f64;
+    factor.shape_cell_weights.fill(0.0_f64);
+    factor.shape_cell_weights[2 * super::SERVICE_CLOCKS.len() + super::SERVICE_SHAPES.len() - 1] =
+        1.0_f64;
+
+    let predictive_window = ResourceWindow::new_with_starts(100.0_f64, 1.0_f64, 0, 0)?;
+    let predictive = occupancy_trace_with_demand_for_test(
+        predictive_window,
+        100,
+        DispatchCapacity::new(100, 100)?,
+        2_000,
+        100,
+        100_000_000,
+        (&[], &[], &[], &[]),
+    );
+    let summary =
+        factor.completion_predictive_summary(predictive, 91, 1_000, [0.1_f64, 0.5_f64, 0.9_f64]);
+    let expected = 1_053_u32;
+
+    assert!(
+        summary.quantile_counts[1].abs_diff(expected) <= 2,
+        "median was {}",
+        summary.quantile_counts[1]
+    );
+    Ok(())
+}
+
+#[test]
+fn off_grid_duration_predictive_ranks_are_central() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.09_f64, 0.11_f64], &[10_000.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid.clone(),
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        100.0_f64,
+        0.01_f64,
+        255,
+    )?;
+    let duration = 95_000_u64;
+    let durations = vec![duration; 64];
+    let completion_offsets = vec![duration; 64];
+    let update_window = ResourceWindow::new_with_starts(6.08_f64, 1.0_f64, 64, 0)?;
+    factor.update(
+        occupancy_trace_with_service_for_test(
+            update_window,
+            64,
+            0,
+            6_080_000,
+            (&[duration], &[64], &[0]),
+            (&completion_offsets, &durations, &[], &[]),
+        ),
+        Duration::from_secs(1),
+    );
+    factor.weights.fill(0.0_f64);
+    factor.weights[2] = 1.0_f64;
+    factor.shape_weights.fill(0.0_f64);
+    factor.shape_weights[super::SERVICE_SHAPES.len() - 1] = 1.0_f64;
+    factor.shape_cell_weights.fill(0.0_f64);
+    factor.shape_cell_weights[2 * super::SERVICE_CLOCKS.len() + super::SERVICE_SHAPES.len() - 1] =
+        1.0_f64;
+
+    let predictive_window = ResourceWindow::new_with_starts(10.0_f64, 1.0_f64, 0, 0)?;
+    let predictive = occupancy_trace_with_demand_for_test(
+        predictive_window,
+        10,
+        DispatchCapacity::new(10, 10)?,
+        200,
+        10,
+        10_000_000,
+        (&[], &[], &[], &[]),
+    );
+    let mut lower_tail = 0_u32;
+    let mut upper_tail = 0_u32;
+    let mut rank_sum = 0.0_f64;
+    let mut stages = Vec::new();
+    let mut owners = Vec::new();
+    let owner_snapshot = Vec::new();
+    for trial in 0_u64..64 {
+        let mut plant_random = RandomStream::new(trial).domain(0x706c_616e_745f_7261);
+        let realized = super::generate_completion_count(
+            &predictive,
+            &super::CompletionWalk {
+                grid: &grid,
+                cell: 2,
+                clock: super::ServiceClock::Erlang(32),
+                slot_rate: 1.0_f64 / 0.095_f64,
+            },
+            10,
+            &mut plant_random,
+            super::CompletionGeneration {
+                stages: &mut stages,
+                owners: &mut owners,
+                owner_snapshot: &owner_snapshot,
+                arrival_keys: &[],
+                owner_counts: &mut Vec::new(),
+                owner_key_layout: super::OwnerKeyLayout::General,
+                saturated_owner_window: false,
+                owner_keys: &[],
+                owner_slots: &[],
+            },
+        );
+        let summary = factor.completion_predictive_summary(
+            predictive,
+            trial,
+            realized,
+            [0.1_f64, 0.5_f64, 0.9_f64],
+        );
+        let offset = (f64::from((trial * 47 % 64) as u32) + 0.5_f64) / 64.0_f64;
+        let rank = summary.lower + offset * (summary.upper - summary.lower);
+        rank_sum += rank;
+        lower_tail += u32::from(rank < 0.1_f64);
+        upper_tail += u32::from(rank > 0.9_f64);
+    }
+
+    let mean_rank = rank_sum / 64.0_f64;
+    assert!(
+        (1..=12).contains(&lower_tail)
+            && (1..=12).contains(&upper_tail)
+            && (0.35_f64..=0.65_f64).contains(&mean_rank),
+        "lower={lower_tail} upper={upper_tail} mean={mean_rank}"
+    );
+    Ok(())
+}
+
+#[test]
+fn duration_samples_learn_the_clock_family_extremes() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.1_f64], &[100.0_f64], &[0.0_f64])?;
+    let mut deterministic = super::CapacityFactor::new_with_prior(
+        grid.clone(),
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        1.0_f64,
+        0.1_f64,
+        64,
+    )?;
+    let mut exponential = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        1.0_f64,
+        0.1_f64,
+        64,
+    )?;
+    let offsets = [500_000_u64];
+    let completed = [1_u32];
+    let started = [1_u32];
+    let initial_ages = [0_u64];
+    let final_ages = [0_u64];
+    for index in 0..32_u32 {
+        let deterministic_duration = [100_000_u64];
+        let probability = (f64::from(index) + 0.5_f64) / 32.0_f64;
+        let exponential_duration = [(-probability.ln() * 100_000.0_f64) as u64];
+        let window = ResourceWindow::new_with_starts(1.0_f64, 0.5_f64, 1, 1)?;
+        let deterministic_evidence = occupancy_trace_with_service_for_test(
+            window,
+            1,
+            1,
+            500_000,
+            (&offsets, &completed, &started),
+            (
+                &offsets,
+                &deterministic_duration,
+                &initial_ages,
+                &final_ages,
+            ),
+        );
+        let exponential_evidence = occupancy_trace_with_service_for_test(
+            window,
+            1,
+            1,
+            500_000,
+            (&offsets, &completed, &started),
+            (&offsets, &exponential_duration, &initial_ages, &final_ages),
+        );
+        deterministic.update(deterministic_evidence, Duration::from_millis(500));
+        exponential.update(exponential_evidence, Duration::from_millis(500));
+    }
+    assert_eq!(
+        deterministic
+            .shape_weights
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(index, _)| index),
+        Some(super::SERVICE_CLOCKS.len() - 1)
+    );
+    assert_eq!(
+        exponential
+            .shape_weights
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(index, _)| index),
+        Some(0)
+    );
+    Ok(())
+}
+
+#[test]
+fn completion_predictive_ignores_live_attempt_ages() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.1_f64], &[100.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        1.0_f64,
+        0.02_f64,
+        255,
+    )?;
+    factor.weights.fill(1.0_f64);
+    let window = ResourceWindow::new_with_starts(1.0_f64, 0.02_f64, 0, 0)?;
+    let fresh_initial = [0_u64];
+    let aged_initial = [90_000_u64];
+    let fresh_final = [20_000_u64];
+    let aged_final = [110_000_u64];
+    let fresh = occupancy_trace_with_service_for_test(
+        window,
+        1,
+        1,
+        20_000,
+        (&[], &[], &[]),
+        (&[], &[], &fresh_initial, &fresh_final),
+    );
+    let aged = occupancy_trace_with_service_for_test(
+        window,
+        1,
+        1,
+        20_000,
+        (&[], &[], &[]),
+        (&[], &[], &aged_initial, &aged_final),
+    );
+    factor.shape_weights.fill(0.0_f64);
+    factor.shape_weights[super::SERVICE_SHAPES.len() - 1] = 1.0_f64;
+    let fresh_high =
+        factor.completion_predictive_summary(fresh, 19, 0, [0.1_f64, 0.5_f64, 0.9_f64]);
+    let aged_high = factor.completion_predictive_summary(aged, 19, 0, [0.1_f64, 0.5_f64, 0.9_f64]);
+    assert_eq!(fresh_high, aged_high);
+
+    factor.shape_weights.fill(0.0_f64);
+    factor.shape_weights[0] = 1.0_f64;
+    let fresh_shape_one =
+        factor.completion_predictive_summary(fresh, 19, 0, [0.1_f64, 0.5_f64, 0.9_f64]);
+    let aged_shape_one =
+        factor.completion_predictive_summary(aged, 19, 0, [0.1_f64, 0.5_f64, 0.9_f64]);
+    assert_eq!(fresh_shape_one, aged_shape_one);
     Ok(())
 }
 
@@ -1958,7 +2420,7 @@ fn below_bound_raw_score_matches_pre_removal_corrected_score() {
 fn assert_contamination_filter_parity(
     factor: &mut super::CapacityFactor,
     grid: &CapacityGrid,
-    evidence: OccupancyTraceEvidence<'_>,
+    evidence: &OccupancyTraceEvidence<'_>,
 ) {
     let initial_filter_weights = factor.filter_weights.clone();
     let initial_curve_weights = factor.filter_curve_weights.clone();
@@ -2032,6 +2494,14 @@ fn honest_regime_prices_derive_the_capacity_operation_budget() -> Result<(), Tes
         &[64_000.0_f64, 128_000.0_f64, 256_000.0_f64],
         &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64],
     )?;
+    let plateau_capacities = (1_u32..=64)
+        .map(|value| f64::from(value) * 20.0_f64)
+        .collect::<Vec<_>>();
+    let plateau = CapacityGrid::new(
+        &[0.025_f64, 0.05_f64, 0.1_f64, 0.2_f64],
+        &plateau_capacities,
+        &[0.0_f64],
+    )?;
     let production_default = CapacityAllocation {
         cell_count: 7,
         state_count: 2,
@@ -2054,21 +2524,35 @@ fn honest_regime_prices_derive_the_capacity_operation_budget() -> Result<(), Tes
         operation_price_for_test(&historical, 257, 256)?,
         operation_price_for_test(&historical, 449, 128)?,
         operation_price_for_test(&historical, 129, 256)?,
+        operation_price_for_test(&plateau, 4_097, 300)?,
         capacity_update_operation_count(production_default)
             .ok_or(CapacityModelError::StorageBound)?,
     ];
     assert_eq!(
         prices,
         [
-            1_824_191, 1_752_821, 1_742_837, 1_991_679, 1_774_079, 1_791_551, 1_791_551, 1_824_191,
-            1_790_783, 1_824_191, 1_795_331, 1_794_563, 1_778_691, 6_303_059,
+            22_512_431,
+            9_797_143,
+            6_187_927,
+            101_124_719,
+            22_462_319,
+            10_713_071,
+            10_713_071,
+            22_512_431,
+            22_479_023,
+            22_512_431,
+            17_768_691,
+            26_766_003,
+            11_753_331,
+            785_898_980,
+            8_316_226,
         ]
     );
     let maximum = prices
         .into_iter()
         .max()
         .ok_or(CapacityModelError::StorageBound)?;
-    assert_eq!(CAPACITY_UPDATE_OPERATION_COUNT_MAX, 13_000_000);
+    assert_eq!(CAPACITY_UPDATE_OPERATION_COUNT_MAX, 1_600_000_000);
     assert!(maximum.saturating_mul(2) <= CAPACITY_UPDATE_OPERATION_COUNT_MAX);
     Ok(())
 }
@@ -2090,12 +2574,26 @@ fn operation_price_for_test(
     .ok_or(CapacityModelError::StorageBound)
 }
 
+fn repeated_key_labels(work: usize, key_count: u32) -> Vec<u32> {
+    (0..work).map(|index| index as u32 % key_count).collect()
+}
+
+fn owner_depth_snapshot(
+    evidence: &OccupancyTraceEvidence<'_>,
+) -> (Vec<super::OwnerGeneratedWindow>, Vec<usize>) {
+    let mut owners = Vec::new();
+    let mut arrivals = Vec::new();
+    super::build_owner_depth_snapshot(evidence, &mut owners, &mut arrivals, &mut HashMap::new());
+    (owners, arrivals)
+}
+
 #[quickcheck]
-fn batched_completion_residuals_accept_the_specified_clock(batch_code: u8) -> bool {
-    let batch_count = u32::from(batch_code % 7 + 2);
+fn duration_residuals_accept_the_specified_clock(shape_code: u8) -> bool {
+    let shape = super::SERVICE_SHAPES[usize::from(shape_code) % super::SERVICE_SHAPES.len()];
     let Ok(grid) = CapacityGrid::new(&[1.0_f64], &[100.0_f64], &[0.0_f64]) else {
         return false;
     };
+    let rate = super::state_rate(&grid, 0, 1);
     let Ok(mut factor) = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
@@ -2106,38 +2604,22 @@ fn batched_completion_residuals_accept_the_specified_clock(batch_code: u8) -> bo
     ) else {
         return false;
     };
-    let Ok(distribution) = Gamma::new(f64::from(batch_count), 1.0_f64) else {
+    factor.weights.fill(0.0_f64);
+    factor.weights[0] = 1.0_f64;
+    factor.shape_weights.fill(0.0_f64);
+    factor.shape_weights[usize::from(shape_code) % super::SERVICE_SHAPES.len()] = 1.0_f64;
+    let Ok(distribution) = Gamma::new(f64::from(shape), f64::from(shape)) else {
         return false;
     };
-    let Ok(window) = ResourceWindow::new_with_starts(20.0_f64, 1.0_f64, batch_count, batch_count)
-    else {
+    let Ok(window) = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 0, 0) else {
         return false;
     };
-    let offset = (distribution.inverse_cdf(0.5_f64) / 20.0_f64 * 1_000_000.0_f64) as u64;
-    factor.update(
-        occupancy_trace_for_test(
-            window,
-            20,
-            20,
-            20_000_000,
-            &[offset],
-            &[batch_count],
-            &[batch_count],
-        ),
-        Duration::from_secs(1),
-    );
-    if factor.residual_sample_count != 1 {
-        return false;
-    }
-    factor.residual_head = 0;
-    factor.residual_len = 0;
-    factor.residual_sample_count = 0;
+    let evidence = occupancy_trace_for_test(window, 1, 1, 1_000_000, &[], &[], &[]);
     for sample in 0_u32..32 {
         let probability = (f64::from(sample) + 0.5_f64) / 32.0_f64;
-        let hazard = distribution.inverse_cdf(probability);
-        factor.residual_integrated_hazards.fill(hazard);
-        let residual = factor.predictive_residual(batch_count);
-        factor.record_residual(residual);
+        let duration = (distribution.inverse_cdf(probability) / rate * 1_000_000.0_f64) as u64;
+        let pit = factor.duration_predictive_pit(&evidence, duration, duration);
+        factor.record_residual(pit);
     }
     let sample_count = f64::from(factor.residual_sample_count);
     factor.refresh_residual_check(sample_count);
@@ -2169,7 +2651,7 @@ fn batched_completion_residuals_reject_a_misspecified_clock() -> Result<(), Test
     let window = ResourceWindow::new_with_starts(0.0_f64, 1.0_f64, 0, 0)?;
     let offsets: [u64; 0] = [];
     let counts: [u32; 0] = [];
-    factor.update_residual_check(occupancy_trace_for_test(
+    factor.update_residual_check(&occupancy_trace_for_test(
         window, 0, 0, 0, &offsets, &counts, &counts,
     ));
     assert!(factor.markov_clock_rejected());
@@ -2237,7 +2719,8 @@ fn residual_cdf_mixes_each_curve_before_the_clock_check() -> Result<(), TestErro
 }
 
 #[test]
-fn demand_conditioned_predictive_covers_fast_realized_completions() -> Result<(), TestError> {
+fn demand_conditioned_predictive_ranks_fast_completions_in_the_upper_tail() -> Result<(), TestError>
+{
     let grid = CapacityGrid::new(&[0.1_f64], &[1_000.0_f64], &[0.0_f64])?;
     let mut factor = super::CapacityFactor::new_with_prior(
         grid,
@@ -2272,11 +2755,7 @@ fn demand_conditioned_predictive_covers_fast_realized_completions() -> Result<()
     let summary =
         factor.completion_predictive_summary(evidence, 7, 13, [0.1_f64, 0.5_f64, 0.9_f64]);
 
-    assert!(
-        summary.quantile_counts[0] <= 13 && summary.quantile_counts[2] >= 13,
-        "joint band: {:?}",
-        summary.quantile_counts
-    );
+    assert!(summary.lower < 0.95_f64 && summary.upper > 0.95_f64);
     Ok(())
 }
 
@@ -2327,13 +2806,21 @@ fn hot_owner_limits_the_completion_predictive() -> Result<(), TestError> {
     factor.weights[0] = 1.0_f64;
     let window = ResourceWindow::new_with_starts(32.0_f64, 1.0_f64, 320, 320)?;
     let supplies = [4_096, 0, 0, 0, 0, 0, 0, 0];
+    let labels = repeated_key_labels(4_096, 32);
     let evidence = occupancy_trace_with_owners_for_test(
         window,
         32,
         PlacementCapacity::new(
-            DispatchCapacity::new(256, 256)?,
-            OwnerCapacity::new(32, &supplies, &[], &[])?,
-        ),
+            DispatchCapacity::new(256, 32)?,
+            OwnerCapacity::new(
+                32,
+                &supplies,
+                &[32, 0, 0, 0, 0, 0, 0, 0],
+                &[32, 0, 0, 0, 0, 0, 0, 0],
+                &labels,
+                (&[], &[], &[]),
+            )?,
+        )?,
         4_064,
         32,
         32_000_000,
@@ -2357,7 +2844,168 @@ fn hot_owner_limits_the_completion_predictive() -> Result<(), TestError> {
 }
 
 #[test]
-fn one_owner_conditioning_matches_the_fleet_predictive() -> Result<(), TestError> {
+fn constant_owner_key_path_limits_the_completion_predictive() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.1_f64], &[10_000.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        32.0_f64,
+        0.1_f64,
+        4_096,
+    )?;
+    factor.weights.fill(0.0_f64);
+    factor.weights[0] = 1.0_f64;
+    let window = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 10, 10)?;
+    let supplies = [4_096];
+    let labels = vec![0; 4_096];
+    let evidence = occupancy_trace_with_owners_for_test(
+        window,
+        1,
+        PlacementCapacity::new(
+            DispatchCapacity::new(32, 1)?,
+            OwnerCapacity::new(32, &supplies, &[1], &[1], &labels, (&[], &[], &[]))?,
+        )?,
+        4_095,
+        1,
+        1_000_000,
+        (&[], &[], &[], &[]),
+    );
+
+    let summary =
+        factor.completion_predictive_summary(evidence, 7, 10, [0.1_f64, 0.5_f64, 0.9_f64]);
+
+    assert!(summary.quantile_counts[0] <= 10);
+    assert!(summary.quantile_counts[2] >= 10);
+    assert!(summary.quantile_counts[2] < 20);
+    Ok(())
+}
+
+#[test]
+fn labeled_arrivals_increase_the_completion_predictive() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.1_f64], &[10_000.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        32.0_f64,
+        0.1_f64,
+        4_096,
+    )?;
+    factor.weights.fill(0.0_f64);
+    factor.weights[0] = 1.0_f64;
+    let window = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 10, 10)?;
+    let supplies = [4_096];
+    let labels = vec![0; 4_096];
+    let arrival_offsets = [500_000; 31];
+    let arrival_owners = [0; 31];
+    let arrival_keys = (1..32).collect::<Vec<_>>();
+    let constant = occupancy_trace_with_owners_for_test(
+        window,
+        1,
+        PlacementCapacity::new(
+            DispatchCapacity::new(32, 1)?,
+            OwnerCapacity::new(32, &supplies, &[1], &[1], &labels, (&[], &[], &[]))?,
+        )?,
+        4_095,
+        1,
+        1_000_000,
+        (&[], &[], &[], &[]),
+    );
+    let ramp = occupancy_trace_with_owners_for_test(
+        window,
+        1,
+        PlacementCapacity::new(
+            DispatchCapacity::new(32, 1)?,
+            OwnerCapacity::new(
+                32,
+                &supplies,
+                &[1],
+                &[1],
+                &labels,
+                (&arrival_offsets, &arrival_owners, &arrival_keys),
+            )?,
+        )?,
+        4_095,
+        1,
+        1_000_000,
+        (&[], &[], &[], &[]),
+    );
+
+    let constant_summary =
+        factor.completion_predictive_summary(constant, 7, 10, [0.1_f64, 0.5_f64, 0.9_f64]);
+    let ramp_summary =
+        factor.completion_predictive_summary(ramp, 7, 10, [0.1_f64, 0.5_f64, 0.9_f64]);
+
+    assert!(ramp_summary.quantile_counts[1] > constant_summary.quantile_counts[1]);
+    Ok(())
+}
+
+#[test]
+fn nonbinding_owner_key_path_preserves_the_completion_predictive() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.1_f64], &[10_000.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        32.0_f64,
+        0.1_f64,
+        4_096,
+    )?;
+    factor.weights.fill(0.0_f64);
+    factor.weights[0] = 1.0_f64;
+    let window = ResourceWindow::new_with_starts(32.0_f64, 1.0_f64, 640, 640)?;
+    let supplies = [4_096, 4_096];
+    let mut labels = repeated_key_labels(4_096, 32);
+    labels.extend(repeated_key_labels(4_096, 32));
+    let unclamped = occupancy_trace_with_owners_for_test(
+        window,
+        64,
+        PlacementCapacity::new(
+            DispatchCapacity::new(64, 64)?,
+            OwnerCapacity::new(
+                32,
+                &supplies,
+                &[32, 32],
+                &[32, 32],
+                &labels,
+                (&[], &[], &[]),
+            )?,
+        )?,
+        8_128,
+        64,
+        64_000_000,
+        (&[], &[], &[], &[]),
+    );
+    let nonbinding_path = occupancy_trace_with_owners_for_test(
+        window,
+        64,
+        PlacementCapacity::new(
+            DispatchCapacity::new(64, 64)?,
+            OwnerCapacity::new(
+                32,
+                &supplies,
+                &[32, 32],
+                &[32, 32],
+                &labels,
+                (&[], &[], &[]),
+            )?,
+        )?,
+        8_128,
+        64,
+        64_000_000,
+        (&[], &[], &[], &[]),
+    );
+
+    assert_eq!(
+        factor.completion_predictive_summary(unclamped, 7, 640, [0.1_f64, 0.5_f64, 0.9_f64]),
+        factor.completion_predictive_summary(nonbinding_path, 7, 640, [0.1_f64, 0.5_f64, 0.9_f64])
+    );
+    Ok(())
+}
+
+#[test]
+fn one_owner_conditioning_tracks_the_fleet_predictive() -> Result<(), TestError> {
     let grid = CapacityGrid::new(&[0.1_f64], &[10_000.0_f64], &[0.0_f64])?;
     let mut factor = super::CapacityFactor::new_with_prior(
         grid,
@@ -2380,23 +3028,388 @@ fn one_owner_conditioning_matches_the_fleet_predictive() -> Result<(), TestError
         (&[], &[], &[], &[]),
     );
     let supplies = [4_096];
+    let labels = repeated_key_labels(4_096, 32);
     let owner = occupancy_trace_with_owners_for_test(
         window,
         32,
         PlacementCapacity::new(
             DispatchCapacity::new(32, 32)?,
-            OwnerCapacity::new(32, &supplies, &[], &[])?,
-        ),
+            OwnerCapacity::new(32, &supplies, &[32], &[32], &labels, (&[], &[], &[]))?,
+        )?,
         4_064,
         32,
         32_000_000,
         (&[], &[], &[], &[]),
     );
 
-    assert_eq!(
-        factor.completion_predictive_summary(fleet, 7, 320, [0.1_f64, 0.5_f64, 0.9_f64]),
-        factor.completion_predictive_summary(owner, 7, 320, [0.1_f64, 0.5_f64, 0.9_f64])
+    let fleet = factor.completion_predictive_summary(fleet, 7, 320, [0.1_f64, 0.5_f64, 0.9_f64]);
+    let owner = factor.completion_predictive_summary(owner, 7, 320, [0.1_f64, 0.5_f64, 0.9_f64]);
+    assert_eq!(fleet.quantile_counts[1], owner.quantile_counts[1]);
+    assert!(
+        fleet
+            .quantile_counts
+            .iter()
+            .zip(owner.quantile_counts)
+            .all(|(left, right)| left.abs_diff(right) <= 2)
     );
+    Ok(())
+}
+
+#[test]
+fn total_fleet_knee_limits_two_owner_completions() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[1.0_f64], &[2.0_f64], &[1.0_f64])?;
+    let window = ResourceWindow::new_with_starts(4.0_f64, 1.5_f64, 0, 0)?;
+    let supplies = [4_u32, 4_u32];
+    let labels = [0_u32, 1, 0, 1, 0, 1, 0, 1];
+    let evidence = occupancy_trace_with_owners_for_test(
+        window,
+        4,
+        PlacementCapacity::new(
+            DispatchCapacity::new(4, 4)?,
+            OwnerCapacity::new(2, &supplies, &[2, 2], &[2, 2], &labels, (&[], &[], &[]))?,
+        )?,
+        4,
+        4,
+        6_000_000,
+        (&[], &[], &[], &[]),
+    );
+    let walk = super::CompletionWalk {
+        grid: &grid,
+        cell: 0,
+        clock: super::ServiceClock::Deterministic,
+        slot_rate: 1.0_f64,
+    };
+    let (snapshot, arrival_keys) = owner_depth_snapshot(&evidence);
+    let completed = super::generate_completion_count(
+        &evidence,
+        &walk,
+        4,
+        &mut RandomStream::new(7),
+        super::CompletionGeneration {
+            stages: &mut Vec::new(),
+            owners: &mut Vec::new(),
+            owner_snapshot: &snapshot,
+            arrival_keys: &arrival_keys,
+            owner_counts: &mut Vec::new(),
+            owner_key_layout: super::OwnerKeyLayout::General,
+            saturated_owner_window: false,
+            owner_keys: &[],
+            owner_slots: &[],
+        },
+    );
+
+    assert!(kernel_float_matches(
+        super::state_rate(&grid, 0, 2),
+        2.0_f64
+    ));
+    assert!(kernel_float_matches(
+        super::state_rate(&grid, 0, 4),
+        1.0_f64
+    ));
+    assert_eq!(completed, 1);
+    Ok(())
+}
+
+#[test]
+fn backlogged_knee_walk_preserves_saturated_busy_exposure() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.1_f64], &[2_000.0_f64], &[0.0_f64])?;
+    let window = ResourceWindow::new_with_starts(200.0_f64, 1.0_f64, 2_000, 0)?;
+    let supplies = [2_200_u32];
+    let labels = repeated_key_labels(2_200, 200);
+    let evidence = occupancy_trace_with_owners_for_test(
+        window,
+        200,
+        PlacementCapacity::new(
+            DispatchCapacity::new(200, 200)?,
+            OwnerCapacity::new(200, &supplies, &[200], &[200], &labels, (&[], &[], &[]))?,
+        )?,
+        2_000,
+        200,
+        200_000_000,
+        (&[], &[], &[], &[]),
+    );
+    let walk = super::CompletionWalk {
+        grid: &grid,
+        cell: 0,
+        clock: super::ServiceClock::Erlang(1),
+        slot_rate: 10.0_f64,
+    };
+    let (snapshot, arrival_keys) = owner_depth_snapshot(&evidence);
+    let result = super::generate_owner_completion_walk(
+        &evidence,
+        &walk,
+        &mut RandomStream::new(19),
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &snapshot,
+        &arrival_keys,
+    );
+
+    assert!(kernel_float_matches(
+        super::state_rate(&grid, 0, 200),
+        2_000.0_f64
+    ));
+    assert!(result.1 > 175.0_f64, "{result:?}");
+    assert!(result.1 <= 200.0_f64, "{result:?}");
+    Ok(())
+}
+
+#[test]
+fn saturated_fast_path_matches_general_walk_distribution() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.1_f64], &[10_000.0_f64], &[0.0_f64])?;
+    let window = ResourceWindow::new_with_starts(4.0_f64, 1.0_f64, 40, 0)?;
+    let supplies = [12_u32];
+    let labels = repeated_key_labels(12, 4);
+    let evidence = occupancy_trace_with_owners_for_test(
+        window,
+        4,
+        PlacementCapacity::new(
+            DispatchCapacity::new(4, 4)?,
+            OwnerCapacity::new(4, &supplies, &[4], &[4], &labels, (&[], &[], &[]))?,
+        )?,
+        40,
+        4,
+        4_000_000,
+        (&[], &[], &[], &[]),
+    );
+    let walk = super::CompletionWalk {
+        grid: &grid,
+        cell: 0,
+        clock: super::ServiceClock::Erlang(8),
+        slot_rate: 1.0_f64,
+    };
+    let mut fast_sum = 0.0_f64;
+    let mut fast_square_sum = 0.0_f64;
+    let mut walk_sum = 0.0_f64;
+    let mut walk_square_sum = 0.0_f64;
+    let mut fallback_count = 0_u64;
+    let mut keys = Vec::new();
+    let mut slots = Vec::new();
+    let (snapshot, arrival_keys) = owner_depth_snapshot(&evidence);
+    assert!(super::saturated_owner_window(
+        &evidence,
+        super::OwnerKeyLayout::General,
+        &mut keys,
+        &mut slots,
+    ));
+    let sample_count = 4_096_u64;
+    for seed in 0..sample_count {
+        let mut fast_random = RandomStream::new(seed).domain(0x7361_745f_6661_7374);
+        let fast = if let Some(completed) = super::generate_saturated_owner_completion_count(
+            &evidence,
+            &walk,
+            &mut fast_random,
+            &keys,
+            &slots,
+        ) {
+            completed
+        } else {
+            fallback_count += 1;
+            super::generate_owner_completion_walk(
+                &evidence,
+                &walk,
+                &mut fast_random,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &snapshot,
+                &arrival_keys,
+            )
+            .0
+        };
+        let fast = f64::from(fast);
+        let walk_count = super::generate_owner_completion_walk(
+            &evidence,
+            &walk,
+            &mut RandomStream::new(seed).domain(0x7361_745f_7761_6c6b),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &snapshot,
+            &arrival_keys,
+        )
+        .0;
+        let walk_count = f64::from(walk_count);
+        fast_sum += fast;
+        fast_square_sum += fast * fast;
+        walk_sum += walk_count;
+        walk_square_sum += walk_count * walk_count;
+    }
+    let count = f64::from(u32::try_from(sample_count).unwrap_or(u32::MAX));
+    let fast_mean = fast_sum / count;
+    let walk_mean = walk_sum / count;
+    let fast_variance = fast_square_sum / count - fast_mean * fast_mean;
+    let walk_variance = walk_square_sum / count - walk_mean * walk_mean;
+
+    assert!(
+        (fast_mean - walk_mean).abs() < 0.2_f64,
+        "{fast_mean} {walk_mean}"
+    );
+    assert!(
+        (fast_variance - walk_variance).abs() < 1.0_f64,
+        "{fast_variance} {walk_variance}"
+    );
+    assert!(fallback_count > 0, "the moderate queues must use fallback");
+    assert!(
+        fallback_count < sample_count,
+        "the moderate queues must certify some draws"
+    );
+    Ok(())
+}
+
+#[test]
+fn infeasible_deterministic_draw_stays_inside_its_cell() {
+    let draw = super::deterministic_log_rate_draw(super::DeterministicRateDraw {
+        mode: 10_000.0_f64.ln(),
+        curvature: f64::INFINITY,
+        low: 100.0_f64.ln(),
+        high: 40.0_f64.ln(),
+        cell: (2.5_f64.ln(), 40.0_f64.ln()),
+        prior: CapacityPrior::LogUniform,
+        lower_cdf: 0.0_f64,
+        upper_cdf: 1.0_f64,
+        draw: 0.5_f64,
+    });
+
+    assert!((2.5_f64..=40.0_f64).contains(&draw), "draw={draw}");
+}
+
+#[test]
+fn deterministic_owner_predictive_matches_the_exact_drain_count() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.1_f64], &[10_000.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        1.0_f64,
+        0.1_f64,
+        63,
+    )?;
+    factor.weights.fill(0.0_f64);
+    factor.weights[0] = 1.0_f64;
+    factor.shape_weights.fill(0.0_f64);
+    factor.shape_weights[super::SERVICE_CLOCKS.len() - 1] = 1.0_f64;
+    let window = ResourceWindow::new_with_starts(1.0_f64, 2.0_f64, 7, 0)?;
+    let supplies = [7_u32];
+    let labels = vec![0; 7];
+    let evidence = occupancy_trace_with_owners_for_test(
+        window,
+        1,
+        PlacementCapacity::new(
+            DispatchCapacity::new(1, 1)?,
+            OwnerCapacity::new(1, &supplies, &[1], &[1], &labels, (&[], &[], &[]))?,
+        )?,
+        6,
+        1,
+        2_000_000,
+        (&[], &[], &[], &[]),
+    );
+
+    let summary =
+        factor.completion_predictive_summary(evidence, 41, 7, [0.1_f64, 0.5_f64, 0.9_f64]);
+    assert_eq!(summary.quantile_counts[1], 7);
+    Ok(())
+}
+
+#[test]
+fn sampled_completion_does_not_strand_another_key() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[1.0_f64], &[2.0_f64], &[0.0_f64])?;
+    let walk = super::CompletionWalk {
+        grid: &grid,
+        cell: 0,
+        clock: super::ServiceClock::Deterministic,
+        slot_rate: 1.0_f64,
+    };
+    let state = super::OwnerGeneratedWindow {
+        completed: 0,
+        keys: vec![
+            super::OwnerKeyDepth {
+                active: true,
+                queued_depth: 0,
+                next_waiting: None,
+            },
+            super::OwnerKeyDepth {
+                active: true,
+                queued_depth: 0,
+                next_waiting: None,
+            },
+        ],
+        active_keys: vec![0, 1],
+        waiting_head: None,
+        waiting_tail: None,
+    };
+    let mut owners = [state];
+    let mut now = 0.0_f64;
+    let mut fleet_work = 1.0_f64;
+
+    super::generate_deterministic_owner_completions_until(
+        &walk,
+        2,
+        3.0_f64,
+        &mut RandomStream::new(7),
+        &mut now,
+        &mut fleet_work,
+        &mut owners,
+    );
+
+    assert_eq!(owners[0].completed, 2);
+    assert!(owners[0].active_keys.is_empty());
+    Ok(())
+}
+
+#[test]
+fn shared_key_dispatches_only_one_attempt() {
+    let mut state = super::OwnerGeneratedWindow {
+        completed: 0,
+        keys: vec![super::OwnerKeyDepth {
+            active: false,
+            queued_depth: 2,
+            next_waiting: None,
+        }],
+        active_keys: Vec::new(),
+        waiting_head: Some(0),
+        waiting_tail: Some(0),
+    };
+
+    super::dispatch_owner_keys(1, 2, &mut state);
+
+    assert_eq!(state.active_keys, [0]);
+    assert_eq!(state.keys[0].queued_depth, 1);
+}
+
+#[test]
+fn last_sampled_completion_closes_the_key() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[1.0_f64], &[1.0_f64], &[0.0_f64])?;
+    let walk = super::CompletionWalk {
+        grid: &grid,
+        cell: 0,
+        clock: super::ServiceClock::Deterministic,
+        slot_rate: 1.0_f64,
+    };
+    let state = super::OwnerGeneratedWindow {
+        completed: 0,
+        keys: vec![super::OwnerKeyDepth {
+            active: true,
+            queued_depth: 0,
+            next_waiting: None,
+        }],
+        active_keys: vec![0],
+        waiting_head: None,
+        waiting_tail: None,
+    };
+    let mut owners = [state];
+    let mut now = 0.0_f64;
+    let mut fleet_work = 1.0_f64;
+
+    super::generate_deterministic_owner_completions_until(
+        &walk,
+        1,
+        2.0_f64,
+        &mut RandomStream::new(7),
+        &mut now,
+        &mut fleet_work,
+        &mut owners,
+    );
+
+    assert_eq!(super::owner_open_key_count(&owners[0]), 0);
     Ok(())
 }
 
@@ -2424,6 +3437,10 @@ fn pre_window_attempt_predictive_matches_exponential_survival(
     };
     factor.weights.fill(0.0_f64);
     factor.weights[0] = 1.0_f64;
+    factor.shape_weights.fill(0.0_f64);
+    factor.shape_weights[0] = 1.0_f64;
+    factor.shape_cell_weights.fill(0.0_f64);
+    factor.shape_cell_weights[0] = 1.0_f64;
     let Ok(window) =
         ResourceWindow::new_with_starts(f64::from(concurrency), exposure_seconds, 0, 0)
     else {
@@ -2447,6 +3464,40 @@ fn pre_window_attempt_predictive_matches_exponential_survival(
     let error_max = 2.0_f64 / 256.0_f64.sqrt();
     (0..=concurrency)
         .all(|count| (cdfs[count as usize] - oracle.cdf(u64::from(count))).abs() <= error_max)
+}
+
+#[test]
+fn one_pre_window_attempt_matches_exponential_survival() -> Result<(), TestError> {
+    let service_seconds = 0.5_f64;
+    let exposure_seconds = 0.25_f64;
+    let grid = CapacityGrid::new(&[service_seconds], &[100.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        8.0_f64,
+        0.25_f64,
+        255,
+    )?;
+    factor.weights.fill(0.0_f64);
+    factor.weights[0] = 1.0_f64;
+    factor.shape_cell_weights.fill(0.0_f64);
+    factor.shape_cell_weights[0] = 1.0_f64;
+    let window = ResourceWindow::new_with_starts(1.0_f64, exposure_seconds, 0, 0)?;
+    let evidence = occupancy_trace_for_test(
+        window,
+        1,
+        1,
+        u128::from(window.exposure_micros()),
+        &[],
+        &[],
+        &[],
+    );
+    let actual = factor.completion_predictive_cdf(evidence, 11, 0);
+    let expected = (-exposure_seconds / service_seconds).exp();
+
+    assert!((actual - expected).abs() <= 2.0_f64 / 256.0_f64.sqrt());
+    Ok(())
 }
 
 #[quickcheck]
@@ -2747,6 +3798,8 @@ fn exponential_matches_libm(input: f64, actual: f64) -> bool {
 enum TestError {
     #[error(transparent)]
     Binomial(#[from] BinomialError),
+    #[error(transparent)]
+    Normal(#[from] NormalError),
     #[error(transparent)]
     Arrival(#[from] crate::ArrivalPriorError),
     #[error(transparent)]

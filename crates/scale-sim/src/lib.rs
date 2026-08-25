@@ -7,6 +7,7 @@ use prosody_scale_core::{DemandClass, RandomStream};
 use rayon::prelude::*;
 use statrs::distribution::{BinomialError, PoissonError};
 use std::collections::VecDeque;
+use std::iter::repeat_n;
 use std::mem;
 use std::num::NonZeroU8;
 use thiserror::Error;
@@ -726,6 +727,11 @@ pub struct AttemptTransition {
     pub kind: AttemptTransitionKind,
     /// Owner that receives the attempt transition.
     pub owner: u32,
+    /// Opaque key label within the owner.
+    pub key: u32,
+    /// Attempt start time for a completion. Other transitions use their event
+    /// time.
+    pub started_at_micros: u64,
 }
 
 /// Direction of one exact handler-slot transition.
@@ -774,7 +780,6 @@ pub struct Plant<M = SeriesAttemptModel> {
     key_tail: Vec<u32>,
     key_active: Vec<bool>,
     outstanding_demand_by_key: Vec<u32>,
-    outstanding_demand_key_count: u32,
     owner_at_dispatch: Vec<u32>,
     partition_owner: Vec<u32>,
     partition_target_owner: Vec<u32>,
@@ -782,6 +787,8 @@ pub struct Plant<M = SeriesAttemptModel> {
     partition_reconciliation: Vec<PartitionReconciliation>,
     partition_active_handlers: Vec<u32>,
     active_handlers_by_owner: Vec<u32>,
+    owner_open_key_counts: Vec<u32>,
+    owner_key_counts: Vec<u32>,
     assignment_counts: Vec<u32>,
     reconciliation_started_micros: Option<u64>,
     reconciliation_completed_micros: Option<u64>,
@@ -841,6 +848,53 @@ impl<M: AttemptModel> Plant<M> {
         &self.partition_owner
     }
 
+    pub(crate) fn owner_key_counts(&self) -> &[u32] {
+        &self.owner_key_counts
+    }
+
+    pub(crate) fn write_owner_work_labels(
+        &self,
+        active_counts: &mut Vec<u32>,
+        labels: &mut Vec<u32>,
+    ) {
+        active_counts.clear();
+        labels.clear();
+        active_counts.resize(self.owner_key_counts.len(), 0);
+        for (owner, active_count) in active_counts.iter_mut().enumerate() {
+            for key in 0..self.key_head.len() {
+                let event = self.key_head[key];
+                if event == NO_EVENT
+                    || !matches!(self.attempt_state[event as usize], AttemptState::Running(_))
+                {
+                    continue;
+                }
+                let partition = self.events.partition[event as usize] as usize;
+                if self.partition_owner[partition] as usize == owner {
+                    labels.push(key as u32);
+                    *active_count = active_count.saturating_add(1);
+                }
+            }
+            for key in 0..self.key_head.len() {
+                let event = self.key_head[key];
+                if event == NO_EVENT {
+                    continue;
+                }
+                let partition = self.events.partition[event as usize] as usize;
+                if self.partition_owner[partition] as usize != owner {
+                    continue;
+                }
+                let count = self.outstanding_demand_by_key[key];
+                labels.extend(repeat_n(
+                    key as u32,
+                    count.saturating_sub(u32::from(matches!(
+                        self.attempt_state[event as usize],
+                        AttemptState::Running(_)
+                    ))) as usize,
+                ));
+            }
+        }
+    }
+
     /// Allocates all bounded plant memory with one regime calculation model.
     ///
     /// # Errors
@@ -893,7 +947,6 @@ impl<M: AttemptModel> Plant<M> {
             key_tail: vec![NO_EVENT; key_count],
             key_active: vec![false; key_count],
             outstanding_demand_by_key: vec![0; key_count],
-            outstanding_demand_key_count: 0,
             owner_at_dispatch: vec![0; event_count_max],
             partition_owner: initial_assignment(partition_count, initial_replicas),
             partition_target_owner: vec![0; partition_count],
@@ -901,6 +954,8 @@ impl<M: AttemptModel> Plant<M> {
             partition_reconciliation: vec![PartitionReconciliation::Serving; partition_count],
             partition_active_handlers: vec![0; partition_count],
             active_handlers_by_owner: vec![0; partition_count],
+            owner_open_key_counts: vec![0; partition_count],
+            owner_key_counts: vec![0; partition_count],
             assignment_counts: vec![0; partition_count],
             reconciliation_started_micros: None,
             reconciliation_completed_micros: None,
@@ -962,11 +1017,6 @@ impl<M: AttemptModel> Plant<M> {
         }
         let event_index = self.events.len() as u32;
         self.events.push(event);
-        let demand = &mut self.outstanding_demand_by_key[event.key as usize];
-        self.outstanding_demand_key_count = self
-            .outstanding_demand_key_count
-            .saturating_add(u32::from(*demand == 0));
-        *demand = demand.saturating_add(1);
         if self.started {
             heap_push(
                 &mut self.heap,
@@ -1264,6 +1314,8 @@ impl<M: AttemptModel> Plant<M> {
                             kind: AttemptTransitionKind::Available,
                             owner: self.partition_owner
                                 [self.events.partition[event as usize] as usize],
+                            key: self.events.key[event as usize],
+                            started_at_micros: scheduled.at_micros,
                         });
                     }
                 }
@@ -1388,6 +1440,16 @@ impl<M: AttemptModel> Plant<M> {
     fn enqueue(&mut self, event: u32) {
         self.released_events = self.released_events.saturating_add(1);
         let key = self.events.key[event as usize] as usize;
+        let demand = &mut self.outstanding_demand_by_key[key];
+        if *demand == 0 {
+            let owner = self.partition_owner[self.events.partition[event as usize] as usize];
+            self.owner_open_key_counts[owner as usize] =
+                self.owner_open_key_counts[owner as usize].saturating_add(1);
+            let count = self.owner_open_key_counts[owner as usize]
+                .min(self.configuration.slots_per_replica);
+            self.owner_key_counts[owner as usize] = count;
+        }
+        *demand = demand.saturating_add(1);
         let tail = self.key_tail[key];
         if tail == NO_EVENT {
             self.key_head[key] = event;
@@ -1400,6 +1462,8 @@ impl<M: AttemptModel> Plant<M> {
             at_micros: self.now_micros,
             kind: AttemptTransitionKind::Available,
             owner: self.partition_owner[self.events.partition[event as usize] as usize],
+            key: self.events.key[event as usize],
+            started_at_micros: self.now_micros,
         });
         self.queued_events += 1;
     }
@@ -1474,6 +1538,8 @@ impl<M: AttemptModel> Plant<M> {
             at_micros: now_micros,
             kind: AttemptTransitionKind::Start,
             owner: owner as u32,
+            key: self.events.key[event_index],
+            started_at_micros: now_micros,
         });
         self.active_handlers_by_owner[owner] += 1;
         self.partition_active_handlers[partition] += 1;
@@ -1557,6 +1623,8 @@ impl<M: AttemptModel> Plant<M> {
             at_micros: now_micros,
             kind: AttemptTransitionKind::Completion,
             owner: self.owner_at_dispatch[event_index],
+            key: self.events.key[event_index],
+            started_at_micros: self.attempt_started_micros[event_index],
         });
         let retry = match event_outcome {
             EventOutcome::Final(_) => None,
@@ -1710,9 +1778,15 @@ impl<M: AttemptModel> Plant<M> {
         self.key_active[key] = false;
         let demand = &mut self.outstanding_demand_by_key[key];
         *demand = demand.saturating_sub(1);
-        self.outstanding_demand_key_count = self
-            .outstanding_demand_key_count
-            .saturating_sub(u32::from(*demand == 0));
+        if *demand == 0 {
+            let partition = self.events.partition[event_index] as usize;
+            let owner = self.partition_owner[partition];
+            self.owner_open_key_counts[owner as usize] =
+                self.owner_open_key_counts[owner as usize].saturating_sub(1);
+            let count = self.owner_open_key_counts[owner as usize]
+                .min(self.configuration.slots_per_replica);
+            self.owner_key_counts[owner as usize] = count;
+        }
         self.remove_head(key);
     }
 
@@ -1901,6 +1975,32 @@ impl<M: AttemptModel> Plant<M> {
             return;
         };
         if self.partition_active_handlers[partition] == 0 && ready_micros <= now_micros {
+            let previous_owner = self.partition_owner[partition];
+            let moved_key_count = self
+                .outstanding_demand_by_key
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, demand)| *demand > 0)
+                .filter(|(key, _)| {
+                    let event = self.key_head[*key];
+                    event != NO_EVENT && self.events.partition[event as usize] as usize == partition
+                })
+                .count() as u32;
+            if previous_owner != target_owner && moved_key_count > 0 {
+                self.owner_open_key_counts[previous_owner as usize] = self.owner_open_key_counts
+                    [previous_owner as usize]
+                    .saturating_sub(moved_key_count);
+                let previous_count = self.owner_open_key_counts[previous_owner as usize]
+                    .min(self.configuration.slots_per_replica);
+                self.owner_key_counts[previous_owner as usize] = previous_count;
+                self.owner_open_key_counts[target_owner as usize] = self.owner_open_key_counts
+                    [target_owner as usize]
+                    .saturating_add(moved_key_count);
+                let target_count = self.owner_open_key_counts[target_owner as usize]
+                    .min(self.configuration.slots_per_replica);
+                self.owner_key_counts[target_owner as usize] = target_count;
+            }
             self.partition_owner[partition] = target_owner;
             self.partition_reconciliation[partition] = PartitionReconciliation::Serving;
             if self
@@ -1952,7 +2052,7 @@ impl<M: AttemptModel> Plant<M> {
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure(label = "plant_snapshot"))]
-    fn snapshot(&self, at_micros: u64) -> PlantSnapshot {
+    fn snapshot(&mut self, at_micros: u64) -> PlantSnapshot {
         let mut reconciling_partitions = 0_u32;
         let mut paused_partitions = 0_u32;
         for state in &self.partition_reconciliation {
@@ -1973,14 +2073,11 @@ impl<M: AttemptModel> Plant<M> {
         )
         .unwrap_or(u32::MAX);
         let physical_slots = self.physical_slot_count();
-        let outstanding_demand_count =
-            (self.events.len() as u32).saturating_sub(self.settled_events);
-        let dispatchable_demand_ceiling =
-            if outstanding_demand_count > self.outstanding_demand_key_count {
-                self.outstanding_demand_key_count.min(physical_slots)
-            } else {
-                physical_slots
-            };
+        let dispatchable_demand_ceiling = self
+            .owner_key_counts
+            .iter()
+            .copied()
+            .fold(0_u32, u32::saturating_add);
         PlantSnapshot {
             at_micros,
             replicas: self.replicas,

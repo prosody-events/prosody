@@ -1149,6 +1149,43 @@ impl ScaleScratch {
         Ok(())
     }
 
+    /// Writes the late area and replica-seconds for each candidate.
+    ///
+    /// Candidate index zero represents one replica. The last index represents
+    /// the configured replica limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid buffer or an unavailable decision.
+    pub fn write_decision_cost_terms(
+        &self,
+        late_areas: &mut [f64],
+        replica_seconds: &mut [f64],
+    ) -> Result<(), DecisionCurveError> {
+        let expected = self.posterior_miss_delay_fraction_sums.len();
+        if late_areas.len() != expected || replica_seconds.len() != expected {
+            return Err(DecisionCurveError::BufferLength { expected });
+        }
+        if self.decision_curve_sample_count == 0 {
+            return Err(DecisionCurveError::Unavailable);
+        }
+        let action_count = decision_action_count(self);
+        for (index, (late_area, replica_seconds)) in late_areas
+            .iter_mut()
+            .zip(replica_seconds.iter_mut())
+            .enumerate()
+        {
+            if index < action_count {
+                *late_area = self.posterior_late_area_sums[index];
+                *replica_seconds = self.posterior_replica_seconds_sums[index];
+            } else {
+                *late_area = f64::INFINITY;
+                *replica_seconds = f64::INFINITY;
+            }
+        }
+        Ok(())
+    }
+
     /// Writes the probability of one rejection reason for each candidate.
     ///
     /// A scenario can contain more than one reason. These probabilities do

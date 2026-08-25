@@ -1924,10 +1924,7 @@ fn independent_keys_use_parallel_slots() -> Result<(), TestError> {
     plant.add_event(event(0, 0, 10_000))?;
     plant.add_event(event(0, 1, 10_000))?;
     let snapshot = plant.advance_until(0);
-    assert_eq!(
-        snapshot.dispatchable_demand_ceiling,
-        snapshot.physical_slots
-    );
+    assert_eq!(snapshot.dispatchable_demand_ceiling, 2);
     let result = plant.run();
     let settlements = result.settlements();
     let first_dispatch = settlements[0]
