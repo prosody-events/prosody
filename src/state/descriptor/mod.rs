@@ -263,6 +263,9 @@ impl<K: OrderedKeyCodec, T: CellType<Key = UnitKey>> CellType for Keyed<K, T> {
 /// The logical key a cell type's ops address by — `()` for a single-cell type.
 pub type KeyOf<T> = <<T as CellType>::Key as OrderedKeyCodec>::Key;
 
+/// The borrowed key form that point operations accept for cell type `T`.
+pub type BorrowedKeyOf<T> = <<T as CellType>::Key as OrderedKeyCodec>::Borrowed;
+
 /// The codec error a cell type's `get`/`set` surface — the codec half of
 /// [`CellStateError`].
 pub type CellCodecError<T> = <<T as CellType>::Codec as Codec>::Error;

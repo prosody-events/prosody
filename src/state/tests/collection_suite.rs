@@ -821,7 +821,7 @@ async fn run_set_trace_inner(
         },
         async |handle, op, model: &mut BTreeSet<i64>| match op {
             SetOp::Insert(key) => {
-                handle.insert(key).await?;
+                handle.insert(&key).await?;
                 model.insert(key);
                 Ok(OpOutcome::Continue)
             }
@@ -948,7 +948,7 @@ pub(crate) async fn run_set_keyset_exact_trace(trace: SetTrace) -> Result<bool> 
         for op in event.ops {
             match op {
                 SetOp::Insert(key) => {
-                    handle.insert(key).await?;
+                    handle.insert(&key).await?;
                     model.insert(key);
                 }
                 SetOp::Remove(key) => {
@@ -1046,7 +1046,7 @@ async fn run_map_trace_inner(
         async |handle, op, scratch: &mut BTreeMap<i64, Value>| match op {
             MapOp::Set(k, b) => {
                 let v = Value::from(b);
-                handle.set(k, v.clone()).await?;
+                handle.set(&k, v.clone()).await?;
                 scratch.insert(k, v);
                 Ok(OpOutcome::Continue)
             }
@@ -1138,7 +1138,7 @@ pub(crate) async fn run_map_ttl_keyset_refresh_trace(trace: MapTrace) -> Result<
         for op in &ev.ops {
             match *op {
                 MapOp::Set(k, b) => {
-                    handle.set(k, Value::from(b)).await?;
+                    handle.set(&k, Value::from(b)).await?;
                     // Snapshot immediately, before any later Commit drains
                     // dirty: a TTL'd set always buffers the keyset cell.
                     let snapshot = dirty.collection_snapshot(&id);
@@ -1202,7 +1202,7 @@ pub(crate) async fn run_map_keyset_exact_trace(trace: MapTrace) -> Result<bool> 
             match *op {
                 MapOp::Set(k, b) => {
                     let v = Value::from(b);
-                    handle.set(k, v.clone()).await?;
+                    handle.set(&k, v.clone()).await?;
                     model.insert(k, v);
                 }
                 MapOp::Remove(k) => {
@@ -1327,7 +1327,7 @@ pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Res
     let session0 = make_session(&cells, &oracle, &registry, &state_key, &armed, ev0);
     let handle0 = descriptor.bind(&session0).map_err(|e| eyre!("bind: {e}"))?;
     for (k, b) in &input.entries {
-        handle0.set(*k, Value::from(*b)).await?;
+        handle0.set(k, Value::from(*b)).await?;
     }
 
     // Read arm: the same (dirty) session, or a fresh event after committing 0.
@@ -1378,7 +1378,7 @@ pub(crate) async fn run_set_contains_many_parity_trace(input: MapGetManyInput) -
     let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
     let handle = descriptor.bind(&session)?;
     for (member, _) in &input.entries {
-        handle.insert(*member).await?;
+        handle.insert(member).await?;
     }
 
     if input.commit {
@@ -2697,7 +2697,7 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
     let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event1);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
-        handle.set(7, Value::from(1_u8)).await?;
+        handle.set(&7, Value::from(1_u8)).await?;
         finalize_and_promote(&session, &oracle, event_dedup(event1), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
@@ -2750,7 +2750,7 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
     let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event3);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
-        handle.set(7, Value::from(1_u8)).await?;
+        handle.set(&7, Value::from(1_u8)).await?;
         finalize_and_promote(&session, &oracle, event_dedup(event3), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
@@ -2787,7 +2787,7 @@ fn map_first_set_writes_keyset() -> Result<()> {
     let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
-        handle.set(7, Value::from(1_u8)).await?;
+        handle.set(&7, Value::from(1_u8)).await?;
         finalize_and_promote(&session, &oracle, event_dedup(event), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
@@ -2911,8 +2911,8 @@ fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
     let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event1);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
-        handle.set(1, Value::from(1_u8)).await?;
-        handle.set(2, Value::from(2_u8)).await?;
+        handle.set(&1, Value::from(1_u8)).await?;
+        handle.set(&2, Value::from(2_u8)).await?;
         finalize_and_promote(&session, &oracle, event_dedup(event1), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
@@ -2937,7 +2937,7 @@ fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
     let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event2);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
-        handle.set(3, Value::from(3_u8)).await?;
+        handle.set(&3, Value::from(3_u8)).await?;
         finalize_and_promote(&session, &oracle, event_dedup(event2), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
@@ -2987,8 +2987,8 @@ fn map_keyset_stays_tracked_under_ttl() -> Result<()> {
     let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
-        handle.set(1, Value::from(1_u8)).await?;
-        handle.set(2, Value::from(2_u8)).await?;
+        handle.set(&1, Value::from(1_u8)).await?;
+        handle.set(&2, Value::from(2_u8)).await?;
         finalize_and_promote(&session, &oracle, event_dedup(event), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
@@ -3010,7 +3010,7 @@ fn map_keyset_stays_tracked_under_ttl() -> Result<()> {
     let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event2);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
-        handle.set(1, Value::from(1_u8)).await?;
+        handle.set(&1, Value::from(1_u8)).await?;
         finalize_and_promote(&session, &oracle, event_dedup(event2), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
@@ -3048,8 +3048,8 @@ fn map_keyset_malformed_frame_degrades_and_heals() -> Result<()> {
     let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event1);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
-        handle.set(1, Value::from(1_u8)).await?;
-        handle.set(2, Value::from(2_u8)).await?;
+        handle.set(&1, Value::from(1_u8)).await?;
+        handle.set(&2, Value::from(2_u8)).await?;
         finalize_and_promote(&session, &oracle, event_dedup(event1), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
@@ -3086,7 +3086,7 @@ fn map_keyset_malformed_frame_degrades_and_heals() -> Result<()> {
     let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event2);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
-        handle.set(1, Value::from(9_u8)).await?;
+        handle.set(&1, Value::from(9_u8)).await?;
         finalize_and_promote(&session, &oracle, event_dedup(event2), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
@@ -3170,7 +3170,7 @@ fn map_keyset_oversized_frame_collapses_before_fast_path() -> Result<()> {
     let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
-        handle.set(1, Value::from(11_u8)).await?;
+        handle.set(&1, Value::from(11_u8)).await?;
         finalize_and_promote(&session, &oracle, event_dedup(event), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
@@ -3211,8 +3211,8 @@ fn map_keyset_byte_ceiling_overflows() -> Result<()> {
     let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
-        handle.set(big_a, Value::from(1_u8)).await?;
-        handle.set(big_b, Value::from(2_u8)).await?;
+        handle.set(&big_a, Value::from(1_u8)).await?;
+        handle.set(&big_b, Value::from(2_u8)).await?;
         finalize_and_promote(&session, &oracle, event_dedup(event), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
@@ -3257,7 +3257,7 @@ fn map_keyset_subtracts_on_remove() -> Result<()> {
     let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event1);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
-        handle.set(7, Value::from(1_u8)).await?;
+        handle.set(&7, Value::from(1_u8)).await?;
         finalize_and_promote(&session, &oracle, event_dedup(event1), &cells, &id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
@@ -3278,7 +3278,7 @@ fn map_keyset_subtracts_on_remove() -> Result<()> {
     );
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
-        handle.set(7, Value::from(2_u8)).await?;
+        handle.set(&7, Value::from(2_u8)).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
     let after_reset = dirty.collection_snapshot(&id);
@@ -3546,7 +3546,7 @@ pub(crate) async fn run_map_stream_interleave(input: MapInterleave) -> Result<bo
         .map_err(|e| eyre!("bind: {e}"))?;
     for i in 0..INTERLEAVE_SEED {
         let key = i64::try_from(i)?;
-        seed.set(key, Value::from(key)).await?;
+        seed.set(&key, Value::from(key)).await?;
         ever_held.entry(key).or_default().insert(key);
     }
     finalize_and_promote(&seed_session, &oracle, Uuid::from_u128(1), &cells, id).await?;
@@ -3581,7 +3581,7 @@ pub(crate) async fn run_map_stream_interleave(input: MapInterleave) -> Result<bo
                 }
             }
             MapStreamStep::Set(key, val) => {
-                guarded("set", handle.set(key, Value::from(val))).await?;
+                guarded("set", handle.set(&key, Value::from(val))).await?;
                 ever_held.entry(key).or_default().insert(val);
             }
             MapStreamStep::Remove(key) => {

@@ -16,10 +16,11 @@
 //! window.
 
 use super::operation::read_keys_bytes;
-use super::{StateSession, resolve_batch, resolve_cell, sealed};
+use super::{StateSession, encode_borrowed, resolve_batch, resolve_cell, sealed};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::descriptor::{
-    CellCodecError, CellStateError, CellType, ContextOf, FromSession, KeyOf, ResolvedOf,
+    BorrowedKeyOf, CellCodecError, CellStateError, CellType, ContextOf, FromSession, KeyOf,
+    ResolvedOf,
 };
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::store::{CELL_BATCH, CellBuffer, CoordinateBatch};
@@ -28,6 +29,7 @@ use async_stream::try_stream;
 use bytes::Bytes;
 use futures::future::Either;
 use futures::stream::{self, Stream, StreamExt};
+use std::borrow::Borrow;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use tokio::task::coop::cooperative;
@@ -234,13 +236,13 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
                             &base.plan,
                         )
                         .await;
-                        read_keys_bytes::<S, T>(
+                        read_keys_bytes::<S, T, _, _>(
                             &base.session,
                             &mut inner,
                             base.state_type,
                             &base.name,
                             base.section,
-                            &chunk,
+                            chunk.iter(),
                         )
                         .await
                         .map_err(CellStateError::Access)?
@@ -283,13 +285,13 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
                     keys.by_ref().take(chunk_width(limit, first)).collect();
                 // Pair each key with its slot so the emission stage can drop
                 // absent keys AND checkpoint per key.
-                let paired = read_keys_presence::<S, T>(
+                let paired = read_keys_presence::<S, T, _, _>(
                     &base.session,
                     &mut inner,
                     base.state_type,
                     &base.name,
                     base.section,
-                    &chunk,
+                    chunk.iter(),
                 )
                 .await
                 .map(|slots| {
@@ -340,31 +342,31 @@ fn constrained_keys<T: CellType>(
     let start = match (dir, start) {
         (_, ScanEdge::Unbounded) => 0,
         (Direction::Forward, ScanEdge::Included(edge)) => {
-            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) < *edge)
+            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode_owned(key) < *edge)
         }
         (Direction::Forward, ScanEdge::Excluded(edge)) => {
-            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) <= *edge)
+            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode_owned(key) <= *edge)
         }
         (Direction::Backward, ScanEdge::Included(edge)) => {
-            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) > *edge)
+            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode_owned(key) > *edge)
         }
         (Direction::Backward, ScanEdge::Excluded(edge)) => {
-            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) >= *edge)
+            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode_owned(key) >= *edge)
         }
     };
     let end = match (dir, end) {
         (_, ScanEdge::Unbounded) => keys.len(),
         (Direction::Forward, ScanEdge::Included(edge)) => {
-            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) <= *edge)
+            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode_owned(key) <= *edge)
         }
         (Direction::Forward, ScanEdge::Excluded(edge)) => {
-            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) < *edge)
+            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode_owned(key) < *edge)
         }
         (Direction::Backward, ScanEdge::Included(edge)) => {
-            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) >= *edge)
+            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode_owned(key) >= *edge)
         }
         (Direction::Backward, ScanEdge::Excluded(edge)) => {
-            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) > *edge)
+            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode_owned(key) > *edge)
         }
     };
     keys.into_iter().skip(start).take(end.saturating_sub(start))
@@ -539,28 +541,22 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
 }
 
 /// Reads key presence in aligned batches without value payloads.
-pub(super) async fn read_keys_presence<S, T>(
+pub(super) async fn read_keys_presence<'a, S, T, Q, I>(
     session: &S,
     inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
     state_type: StateType,
     name: &StateName,
     section: Section,
-    keys: &[KeyOf<T>],
+    keys: I,
 ) -> Result<CellBuffer<bool>, StateAccessError>
 where
     S: StateSession,
     T: CellType,
+    Q: Borrow<BorrowedKeyOf<T>> + Sync + ?Sized + 'a,
+    I: Iterator<Item = &'a Q> + Send,
 {
-    let coordinates = keys.iter().map(<T::Key as OrderedKeyCodec>::encode);
-    let presence =
-        read_presence_coordinates::<S>(session, inner, state_type, name, section, coordinates)
-            .await?;
-    debug_assert_eq!(
-        presence.len(),
-        keys.len(),
-        "batch read answers every input position"
-    );
-    Ok(presence)
+    let coordinates = keys.map(encode_borrowed::<T, Q>);
+    read_presence_coordinates::<S>(session, inner, state_type, name, section, coordinates).await
 }
 
 /// Reads presence for encoded coordinates in aligned batches.
@@ -572,10 +568,13 @@ pub(super) async fn read_presence_coordinates<S: StateSession>(
     state_type: StateType,
     name: &StateName,
     section: Section,
-    coordinates: impl ExactSizeIterator<Item = Coordinate> + Send,
+    coordinates: impl Iterator<Item = Coordinate> + Send,
 ) -> Result<CellBuffer<bool>, StateAccessError> {
-    let mut presence = CellBuffer::with_capacity(coordinates.len());
+    // An iterator without an exact bound can grow this result buffer.
+    let mut presence = CellBuffer::with_capacity(coordinates.size_hint().0);
+    let mut expected = 0;
     for batch in CoordinateBatch::chunks(coordinates) {
+        expected += batch.len();
         presence.extend(
             <S::Engine as sealed::ReadEngine<S>>::read_presence_batch(
                 session, inner, state_type, name, section, &batch,
@@ -583,6 +582,11 @@ pub(super) async fn read_presence_coordinates<S: StateSession>(
             .await?,
         );
     }
+    debug_assert_eq!(
+        presence.len(),
+        expected,
+        "batch read answers every input position"
+    );
     Ok(presence)
 }
 

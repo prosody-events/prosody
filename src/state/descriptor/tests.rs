@@ -35,6 +35,7 @@ use quickcheck::{QuickCheck, TestResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
+use std::iter::once;
 use std::sync::Arc;
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -637,7 +638,7 @@ fn collection_ops_export_operation_spans() -> Result<()> {
                 map_state::<Utf8KeyCodec, JsonCodec>("counts"),
                 MemoryLoader::new(),
             )?;
-            map.set("k1".to_owned(), json!(1_i32)).await?;
+            map.set("k1", json!(1_i32)).await?;
             map.get(&"k1".to_owned()).await?;
             let _entries: Vec<_> = map.stream(Direction::Forward).try_collect().await?;
             map.remove(&"k1".to_owned()).await?;
@@ -755,7 +756,7 @@ mod scope_containment {
             // Distinct writes to each sibling, interleaved.
             cart.set(a.clone()).await?;
             wishlist.set(b.clone()).await?;
-            counts.set("qty".to_owned(), b.clone()).await?;
+            counts.set("qty", b.clone()).await?;
             log.push_back(a.clone()).await?;
 
             // Each handle reads back exactly its own collection's data — no
@@ -777,6 +778,69 @@ mod scope_containment {
         }
         QuickCheck::new().quickcheck(prop as fn(ArbJson, ArbJson) -> TestResult);
     }
+}
+
+#[test]
+fn prop_borrowed_utf8_keys_address_maps_and_sets() {
+    async fn check(key: String, value: Value) -> Result<bool> {
+        let map = map_state::<Utf8KeyCodec, JsonCodec>("map");
+        let set = set_state::<Utf8KeyCodec>("set");
+        let mut registry = CollectionDefRegistry::default();
+        registry.register(&map, CollectionDef::new(None))?;
+        registry.register(&set, CollectionDef::new(None))?;
+        let session = test_session(MemoryLoader::new(), registry);
+        let map = map.bind(&session)?;
+        let set = set.bind(&session)?;
+        let key_ref = key.as_str();
+
+        map.set(key_ref, value.clone()).await?;
+        let point = map.get(key_ref).await?;
+        let present = map.contains_key(key_ref).await?;
+        let batch = map.get_many(once(key_ref).filter(|_| true)).await?;
+        let map_keys = map
+            .query(Direction::Forward)
+            .from(key_ref)
+            .to(key_ref)
+            .keys()
+            .try_collect::<Vec<_>>()
+            .await?;
+        map.remove(key_ref).await?;
+        let removed = !map.contains_key(key_ref).await?;
+
+        set.insert(key_ref).await?;
+        let member = set.contains(key_ref).await?;
+        let members = set.contains_many(once(key_ref).filter(|_| true)).await?;
+        let set_keys = set
+            .query(Direction::Forward)
+            .from(key_ref)
+            .to(key_ref)
+            .keys()
+            .try_collect::<Vec<_>>()
+            .await?;
+        set.remove(key_ref).await?;
+        let member_removed = !set.contains(key_ref).await?;
+
+        Ok(point == Some(value.clone())
+            && present
+            && batch == vec![Some(value)]
+            && map_keys == vec![key.clone()]
+            && removed
+            && member
+            && members == vec![true]
+            && set_keys == vec![key]
+            && member_removed)
+    }
+
+    fn prop(key: String, value: ArbJson) -> TestResult {
+        let input = format!("key={key:?} value={:#?}", value.0);
+        finish_trace(
+            executor::block_on(check(key, value.0)),
+            "borrowed UTF-8 key parity",
+            &input,
+        )
+    }
+
+    QuickCheck::new().quickcheck(prop as fn(String, ArbJson) -> TestResult);
 }
 
 /// Every typed op enforces the termination guard, and the guard holds in each

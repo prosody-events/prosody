@@ -119,7 +119,7 @@ async fn run_msg_map(ops: Vec<MsgMapOp>) -> Result<bool> {
                 let key = map_key(key_index);
                 let id = i64::from(id);
                 let message = seed_message(&loader, id)?;
-                handle.set(key.clone(), &message).await?;
+                handle.set(&key, &message).await?;
                 model.insert(key, id);
             }
             MsgMapOp::Remove(key_index) => {

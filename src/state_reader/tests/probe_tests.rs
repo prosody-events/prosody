@@ -345,7 +345,7 @@ async fn short_batch_buffer_fails_the_uncached_read() -> Result<()> {
     let tp_a = topic("topic-a");
 
     env.commit(GROUP_A, tp_a, &key, 1, |h| async move {
-        h.set(0, Value::from("A0"))
+        h.set(&0, Value::from("A0"))
             .await
             .map_err(|e| eyre!("set: {e}"))
     })
@@ -385,13 +385,13 @@ async fn get_many_answers_from_one_source() -> Result<()> {
     // A is the lowest source and holds only key 0; B is the decoy and holds
     // only key 1, tagged distinctly.
     env.commit(GROUP_A, tp_a, &key, 1, |h| async move {
-        h.set(0, Value::from("A0"))
+        h.set(&0, Value::from("A0"))
             .await
             .map_err(|e| eyre!("set: {e}"))
     })
     .await?;
     env.commit(GROUP_B, tp_b, &key, 2, |h| async move {
-        h.set(1, Value::from("B1"))
+        h.set(&1, Value::from("B1"))
             .await
             .map_err(|e| eyre!("set: {e}"))
     })

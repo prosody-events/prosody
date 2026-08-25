@@ -651,7 +651,7 @@ fn map_cold_chunk_is_one_batch_read() -> Result<()> {
         );
         let seed = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
         for i in 0..CELL_BATCH as i64 {
-            seed.set(i, Value::from(i))
+            seed.set(&i, Value::from(i))
                 .await
                 .map_err(|e| eyre!("{e}"))?;
         }
@@ -750,7 +750,7 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
         let seed = descriptor
             .bind(&seed_session)
             .map_err(|e| eyre!("bind: {e}"))?;
-        seed.set(K1, Value::from(K1))
+        seed.set(&K1, Value::from(K1))
             .await
             .map_err(|e| eyre!("{e}"))?;
         finalize_and_promote(&seed_session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
@@ -784,7 +784,7 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
             "never-set key is absent"
         );
         handle
-            .set(K2, Value::from(K2))
+            .set(&K2, Value::from(K2))
             .await
             .map_err(|e| eyre!("{e}"))?;
         assert!(
@@ -798,7 +798,7 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
         );
         handle.clear().await.map_err(|e| eyre!("{e}"))?;
         handle
-            .set(K3, Value::from(K3))
+            .set(&K3, Value::from(K3))
             .await
             .map_err(|e| eyre!("{e}"))?;
         assert!(handle.contains_key(&K3).await.map_err(|e| eyre!("{e}"))?);
@@ -883,7 +883,7 @@ async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bo
     let seed = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     for i in 0..n {
         let key = i64::try_from(i)?;
-        seed.set(key, Value::from(key))
+        seed.set(&key, Value::from(key))
             .await
             .map_err(|e| eyre!("{e}"))?;
     }
@@ -1564,9 +1564,9 @@ fn map_stream_issues_no_scans() -> Result<()> {
         let handle = map_state::<I64KeyCodec, JsonCodec>("mp")
             .bind(&session)
             .map_err(|e| eyre!("bind: {e}"))?;
-        handle.set(0, Value::from(10_i64)).await?;
-        handle.set(1, Value::from(11_i64)).await?;
-        handle.set(2, Value::from(12_i64)).await?;
+        handle.set(&0, Value::from(10_i64)).await?;
+        handle.set(&1, Value::from(11_i64)).await?;
+        handle.set(&2, Value::from(12_i64)).await?;
         let id = CollectionId::new(
             state_key.clone(),
             StateType::Application,
@@ -1650,7 +1650,7 @@ fn map_overflowed_stream_issues_one_scan() -> Result<()> {
         map_state::<I64KeyCodec, JsonCodec>("mp-of")
             .bind(&session)
             .map_err(|e| eyre!("bind: {e}"))?
-            .set(0, Value::from(99_i64))
+            .set(&0, Value::from(99_i64))
             .await?;
         let of_id = CollectionId::new(
             state_key.clone(),
@@ -2016,7 +2016,7 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
     let seed = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     for i in 0..n {
         let key = i64::try_from(i)?;
-        seed.set(key, Value::from(key))
+        seed.set(&key, Value::from(key))
             .await
             .map_err(|e| eyre!("{e}"))?;
     }

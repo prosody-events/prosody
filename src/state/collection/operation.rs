@@ -3,20 +3,21 @@
 use super::stream::{PlanBase, read_keys_presence, read_presence_coordinates};
 use super::{
     CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, CoordinatePlan,
-    RangePlan, StateSession, WritableStateSession, cell_key, encode_cell, resolve_batch,
-    resolve_cell, sealed, sealed_ops,
+    RangePlan, StateSession, WritableStateSession, cell_key, encode_borrowed, encode_cell,
+    resolve_batch, resolve_cell, sealed, sealed_ops,
 };
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Direction, ScanEdge, Section};
 use crate::state::descriptor::{
-    CellCodecError, CellResolver, CellStateError, CellType, ContextOf, FromSession, KeyOf,
-    ResolvedOf, WriteOf,
+    BorrowedKeyOf, CellCodecError, CellResolver, CellStateError, CellType, ContextOf, FromSession,
+    KeyOf, ResolvedOf, WriteOf,
 };
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::{StateName, StateType};
 use bytes::Bytes;
 use smallvec::SmallVec;
+use std::borrow::Borrow;
 use std::future::Future;
 use std::num::NonZeroUsize;
 
@@ -142,9 +143,9 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
     ) -> RangePlan<S, T> {
         RangePlan::new(
             self.plan_base(family.section()),
-            ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode(start)),
+            ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode_owned(start)),
             dir,
-            ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode(end)),
+            ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode_owned(end)),
             Some(limit),
         )
     }
@@ -281,37 +282,43 @@ impl<S: StateSession, L> CollectionRead for ReadOperation<'_, S, L> {
         self.collection.def().capacity
     }
 
-    fn get_many<T>(
+    fn get_many<'a, T, Q, I>(
         &mut self,
         family: CellFamily<L, T>,
-        keys: &[KeyOf<T>],
+        keys: I,
     ) -> impl Future<
         Output = Result<CellBuffer<Option<ResolvedOf<T>>>, CellStateError<CellCodecError<T>>>,
     > + Send
     where
         T: CellType,
+        Q: Borrow<BorrowedKeyOf<T>> + Sync + ?Sized + 'a,
+        I: IntoIterator<Item = &'a Q>,
+        I::IntoIter: Send,
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         let section = family.section();
         let Self { collection, inner } = self;
         let session = collection.session();
-        read_keys_resolved::<S, T>(
+        read_keys_resolved::<S, T, Q, I::IntoIter>(
             session,
             inner,
             collection.state_type(),
             collection.name(),
             section,
-            keys,
+            keys.into_iter(),
         )
     }
 
-    fn contains<T: CellType>(
+    fn contains<T: CellType, Q>(
         &mut self,
         family: CellFamily<L, T>,
-        key: &KeyOf<T>,
-    ) -> impl Future<Output = Result<bool, StateAccessError>> + Send {
+        key: &Q,
+    ) -> impl Future<Output = Result<bool, StateAccessError>> + Send
+    where
+        Q: Borrow<BorrowedKeyOf<T>> + ?Sized,
+    {
         let section = family.section();
-        let coordinate = <T::Key as OrderedKeyCodec>::encode(key);
+        let coordinate = <T::Key as OrderedKeyCodec>::encode(key.borrow());
         let Self { collection, inner } = self;
         let session = collection.session();
         async move {
@@ -327,30 +334,36 @@ impl<S: StateSession, L> CollectionRead for ReadOperation<'_, S, L> {
         }
     }
 
-    fn contains_many<T: CellType>(
+    fn contains_many<'a, T: CellType, Q, I>(
         &mut self,
         family: CellFamily<L, T>,
-        keys: &[KeyOf<T>],
-    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send {
+        keys: I,
+    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send
+    where
+        Q: Borrow<BorrowedKeyOf<T>> + Sync + ?Sized + 'a,
+        I: IntoIterator<Item = &'a Q>,
+        I::IntoIter: Send,
+    {
         let section = family.section();
         let Self { collection, inner } = self;
-        read_keys_presence::<S, T>(
+        read_keys_presence::<S, T, Q, I::IntoIter>(
             collection.session(),
             inner,
             collection.state_type(),
             collection.name(),
             section,
-            keys,
+            keys.into_iter(),
         )
     }
 
-    fn get<T>(
+    fn get<T, Q>(
         &mut self,
         family: CellFamily<L, T>,
-        key: &KeyOf<T>,
+        key: &Q,
     ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send
     where
         T: CellType,
+        Q: Borrow<BorrowedKeyOf<T>> + ?Sized,
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         // The key is lowered before the async block, so only the owned
@@ -395,28 +408,31 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         self.collection.def().capacity
     }
 
-    fn get_many<T>(
+    fn get_many<'a, T, Q, I>(
         &mut self,
         family: CellFamily<L, T>,
-        keys: &[KeyOf<T>],
+        keys: I,
     ) -> impl Future<
         Output = Result<CellBuffer<Option<ResolvedOf<T>>>, CellStateError<CellCodecError<T>>>,
     > + Send
     where
         T: CellType,
+        Q: Borrow<BorrowedKeyOf<T>> + Sync + ?Sized + 'a,
+        I: IntoIterator<Item = &'a Q>,
+        I::IntoIter: Send,
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         let section = family.section();
         // Fold the journal per position first: a staged answer never reaches
         // the engine, and only the journal-silent positions enter the batch.
-        let slots: CellBuffer<Slot> = keys
-            .iter()
-            .map(|key| match self.staged(&cell_key(family, key)) {
-                Some(Staged::Present(bytes)) => Slot::Answered(Some(bytes)),
-                Some(Staged::Absent) => Slot::Answered(None),
-                None => Slot::Pending(<T::Key as OrderedKeyCodec>::encode(key)),
-            })
-            .collect();
+        let keys = keys.into_iter();
+        // An iterator without an exact bound can grow this result buffer.
+        let mut slots = CellBuffer::with_capacity(keys.size_hint().0);
+        slots.extend(keys.map(|key| match self.staged(&cell_key(family, key)) {
+            Some(Staged::Present(bytes)) => Slot::Answered(Some(bytes)),
+            Some(Staged::Absent) => Slot::Answered(None),
+            None => Slot::Pending(<T::Key as OrderedKeyCodec>::encode(key.borrow())),
+        }));
         let Self {
             collection, inner, ..
         } = self;
@@ -435,11 +451,14 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         }
     }
 
-    fn contains<T: CellType>(
+    fn contains<T: CellType, Q>(
         &mut self,
         family: CellFamily<L, T>,
-        key: &KeyOf<T>,
-    ) -> impl Future<Output = Result<bool, StateAccessError>> + Send {
+        key: &Q,
+    ) -> impl Future<Output = Result<bool, StateAccessError>> + Send
+    where
+        Q: Borrow<BorrowedKeyOf<T>> + ?Sized,
+    {
         let cell = cell_key(family, key);
         let staged = self.staged(&cell);
         let Self {
@@ -465,21 +484,29 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         }
     }
 
-    fn contains_many<T: CellType>(
+    fn contains_many<'a, T: CellType, Q, I>(
         &mut self,
         family: CellFamily<L, T>,
-        keys: &[KeyOf<T>],
-    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send {
+        keys: I,
+    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send
+    where
+        Q: Borrow<BorrowedKeyOf<T>> + Sync + ?Sized + 'a,
+        I: IntoIterator<Item = &'a Q>,
+        I::IntoIter: Send,
+    {
         let section = family.section();
-        let mut slots = CellBuffer::with_capacity(keys.len());
-        let mut pending = CellBuffer::with_capacity(keys.len());
+        let keys = keys.into_iter();
+        // An iterator without an exact bound can grow these result buffers.
+        let capacity = keys.size_hint().0;
+        let mut slots = CellBuffer::with_capacity(capacity);
+        let mut pending = CellBuffer::with_capacity(capacity);
         for key in keys {
             match self.staged(&cell_key(family, key)) {
                 Some(Staged::Present(_)) => slots.push(Some(true)),
                 Some(Staged::Absent) => slots.push(Some(false)),
                 None => {
                     slots.push(None);
-                    pending.push(<T::Key as OrderedKeyCodec>::encode(key));
+                    pending.push(<T::Key as OrderedKeyCodec>::encode(key.borrow()));
                 }
             }
         }
@@ -507,13 +534,14 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         }
     }
 
-    fn get<T>(
+    fn get<T, Q>(
         &mut self,
         family: CellFamily<L, T>,
-        key: &KeyOf<T>,
+        key: &Q,
     ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send
     where
         T: CellType,
+        Q: Borrow<BorrowedKeyOf<T>> + ?Sized,
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         let cell = cell_key(family, key);
@@ -548,13 +576,14 @@ async fn read_presence<S: StateSession>(
 }
 
 impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
-    fn take<T>(
+    fn take<T, Q>(
         &mut self,
         family: CellFamily<L, T>,
-        key: &KeyOf<T>,
+        key: &Q,
     ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send
     where
         T: CellType,
+        Q: Borrow<BorrowedKeyOf<T>> + ?Sized,
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         let cell = cell_key(family, key);
@@ -573,12 +602,15 @@ impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
         }
     }
 
-    fn set<T: CellType>(
+    fn set<T: CellType, Q>(
         &mut self,
         family: CellFamily<L, T>,
-        key: &KeyOf<T>,
+        key: &Q,
         value: WriteOf<'_, T>,
-    ) -> Result<(), CellStateError<CellCodecError<T>>> {
+    ) -> Result<(), CellStateError<CellCodecError<T>>>
+    where
+        Q: Borrow<BorrowedKeyOf<T>> + ?Sized,
+    {
         let cell = cell_key(family, key);
         let stored = <T::Resolver as CellResolver>::stored_from(value);
         let buffer = encode_cell::<T::Codec>(stored).map_err(CellStateError::Codec)?;
@@ -589,7 +621,10 @@ impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
         Ok(())
     }
 
-    fn clear<T: CellType>(&mut self, family: CellFamily<L, T>, key: &KeyOf<T>) {
+    fn clear<T: CellType, Q>(&mut self, family: CellFamily<L, T>, key: &Q)
+    where
+        Q: Borrow<BorrowedKeyOf<T>> + ?Sized,
+    {
         self.journal.push(Mutation::Clear {
             cell: cell_key(family, key),
         });
@@ -702,21 +737,22 @@ async fn batched_bytes<S: StateSession>(
 /// # Errors
 ///
 /// An access error from the engine.
-pub(super) async fn read_keys_bytes<S, T>(
+pub(super) async fn read_keys_bytes<'a, S, T, Q, I>(
     session: &S,
     inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
     state_type: StateType,
     name: &StateName,
     section: Section,
-    keys: &[KeyOf<T>],
+    keys: I,
 ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError>
 where
     S: StateSession,
     T: CellType,
+    Q: Borrow<BorrowedKeyOf<T>> + Sync + ?Sized + 'a,
+    I: Iterator<Item = &'a Q>,
 {
-    // Mapped as a function item, so the lowering carries no closure whose
-    // higher-ranked capture would defeat the future's `Send` proof.
-    let coordinates = keys.iter().map(<T::Key as OrderedKeyCodec>::encode);
+    let capacity = keys.size_hint().0;
+    let coordinates = keys.map(encode_borrowed::<T, Q>);
     read_coordinate_bytes(
         session,
         inner,
@@ -724,13 +760,13 @@ where
         name,
         section,
         coordinates,
-        keys.len(),
+        capacity,
     )
     .await
 }
 
 /// Reads `coordinates` from the engine and returns the bytes, index-aligned to
-/// the input. `expected` is the coordinate count, known to every caller.
+/// the input. `capacity` is the iterator's guaranteed minimum size.
 ///
 /// The read is split into maximal batches and the batches are issued
 /// **sequentially**: two repair-capable owner reads over one collection must
@@ -742,14 +778,17 @@ async fn read_coordinate_bytes<S, I>(
     name: &StateName,
     section: Section,
     coordinates: I,
-    expected: usize,
+    capacity: usize,
 ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError>
 where
     S: StateSession,
     I: IntoIterator<Item = Coordinate>,
 {
-    let mut bytes: CellBuffer<Option<Bytes>> = SmallVec::with_capacity(expected);
+    // An iterator without an exact bound can grow this result buffer.
+    let mut bytes: CellBuffer<Option<Bytes>> = SmallVec::with_capacity(capacity);
+    let mut expected = 0;
     for batch in CoordinateBatch::chunks(coordinates) {
+        expected += batch.len();
         bytes.extend(
             <S::Engine as sealed::ReadEngine<S>>::read_batch(
                 session, inner, state_type, name, section, &batch,
@@ -772,19 +811,22 @@ where
 ///
 /// An access error from the engine, a codec error (Permanent), or a resolution
 /// error.
-pub(super) async fn read_keys_resolved<S, T>(
+pub(super) async fn read_keys_resolved<'a, S, T, Q, I>(
     session: &S,
     inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
     state_type: StateType,
     name: &StateName,
     section: Section,
-    keys: &[KeyOf<T>],
+    keys: I,
 ) -> Result<CellBuffer<Option<ResolvedOf<T>>>, CellStateError<CellCodecError<T>>>
 where
     S: StateSession,
     T: CellType,
+    Q: Borrow<BorrowedKeyOf<T>> + Sync + ?Sized + 'a,
+    I: Iterator<Item = &'a Q> + Send,
     for<'s> ContextOf<'s, T>: FromSession<'s, S>,
 {
-    let bytes = read_keys_bytes::<S, T>(session, inner, state_type, name, section, keys).await?;
+    let bytes =
+        read_keys_bytes::<S, T, Q, I>(session, inner, state_type, name, section, keys).await?;
     resolve_batch::<S, T>(session, bytes).await
 }
