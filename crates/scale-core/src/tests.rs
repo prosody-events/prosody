@@ -22,11 +22,11 @@ use crate::{
     ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort,
     CapacityCurve, CapacityGrid, CapacityPrior, Cohort, Configuration, ConfigurationError,
     DemandClass, DispatchCapacity, DurationCell, HoldReason, LaunchPrior, LaunchPriorGrid,
-    ModelTime, ObservationBuffer, ObservationError, OccupancyTransition, PosteriorError,
-    PosteriorQuery, PriorArtifactBudget, PriorArtifactIdentity, PriorCoverageRecord, RandomStream,
-    ReadinessGroupId, ReadinessLump, ReadinessObservation, RebalanceEvidence, RebalancePrior,
-    ReliabilityPrior, ResourceWindow, ScaleDecision, ScaleState, ServiceObjective,
-    ThroughputPosteriorCell, TransitionDirection, step,
+    ModelTime, ObservationBuffer, ObservationError, OccupancyTransition, OwnerCapacity,
+    PosteriorError, PosteriorQuery, PriorArtifactBudget, PriorArtifactIdentity,
+    PriorCoverageRecord, RandomStream, ReadinessGroupId, ReadinessLump, ReadinessObservation,
+    RebalanceEvidence, RebalancePrior, ReliabilityPrior, ResourceWindow, ScaleDecision, ScaleState,
+    ServiceObjective, ThroughputPosteriorCell, TransitionDirection, step,
 };
 
 const NO_FUTURE_ARRIVALS: ArrivalPath<'static> = ArrivalPath {
@@ -1004,6 +1004,10 @@ fn occupancy_trace_contract_rejects_each_invalid_value() -> Result<(), TestError
     assert!(matches!(
         DispatchCapacity::new(2, 3),
         Err(ObservationError::ResourceBusySlots)
+    ));
+    assert!(matches!(
+        OwnerCapacity::new(0, &[1], &[], &[]),
+        Err(ObservationError::ResourceOwnerCapacity)
     ));
     assert!(matches!(
         observation.set_resource_observation(empty, 129, 129, &[]),

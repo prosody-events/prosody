@@ -1963,6 +1963,9 @@ fn generate_completion_count(
     slot_count: u32,
     random: &mut RandomStream,
 ) -> u32 {
+    if !evidence.owner_supplied_attempts().is_empty() {
+        return generate_owner_completion_count(evidence, grid, cell, random);
+    }
     let mut state = GeneratedWindow {
         now_seconds: 0.0_f64,
         busy: evidence.initial_busy_slots(),
@@ -1989,6 +1992,80 @@ fn generate_completion_count(
         &mut state,
     );
     state.completed
+}
+
+fn generate_owner_completion_count(
+    evidence: OccupancyTraceEvidence<'_>,
+    grid: &CapacityGrid,
+    cell: usize,
+    random: &mut RandomStream,
+) -> u32 {
+    let exposure = evidence.window().exposure_seconds();
+    let (arrival_offsets, arrival_owners) = evidence.owner_arrivals();
+    evidence
+        .owner_supplied_attempts()
+        .iter()
+        .copied()
+        .enumerate()
+        .fold(0_u32, |total, (owner, supplied)| {
+            let mut state = OwnerGeneratedWindow {
+                now: 0.0_f64,
+                supplied,
+                completed: 0,
+            };
+            for (&offset, &arrival_owner) in arrival_offsets.iter().zip(arrival_owners) {
+                if arrival_owner as usize != owner {
+                    continue;
+                }
+                let boundary = Duration::from_micros(offset).as_secs_f64();
+                generate_owner_completions_until(
+                    grid,
+                    cell,
+                    evidence.slots_per_owner(),
+                    boundary,
+                    random,
+                    &mut state,
+                );
+                state.supplied = state.supplied.saturating_add(1);
+            }
+            generate_owner_completions_until(
+                grid,
+                cell,
+                evidence.slots_per_owner(),
+                exposure,
+                random,
+                &mut state,
+            );
+            total.saturating_add(state.completed)
+        })
+}
+
+struct OwnerGeneratedWindow {
+    now: f64,
+    supplied: u32,
+    completed: u32,
+}
+
+fn generate_owner_completions_until(
+    grid: &CapacityGrid,
+    cell: usize,
+    slots_per_owner: u32,
+    boundary: f64,
+    random: &mut RandomStream,
+    state: &mut OwnerGeneratedWindow,
+) {
+    while state.supplied > 0 {
+        let concurrency = state.supplied.min(slots_per_owner);
+        let rate = state_rate(grid, cell, concurrency as usize);
+        let completion = state.now - random.open_unit_f64().ln() / rate;
+        if completion >= boundary {
+            break;
+        }
+        state.now = completion;
+        state.supplied -= 1;
+        state.completed = state.completed.saturating_add(1);
+    }
+    state.now = boundary;
 }
 
 fn generate_completions_until(

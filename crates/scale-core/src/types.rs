@@ -1378,6 +1378,72 @@ pub struct DispatchCapacity {
     demand_ceiling: u32,
 }
 
+/// Owner-isolated queue supplies for one resource report.
+#[derive(Clone, Copy, Debug)]
+pub struct OwnerCapacity<'a> {
+    slots_per_owner: u32,
+    supplied_attempts: &'a [u32],
+    arrival_offsets_micros: &'a [u64],
+    arrival_owners: &'a [u32],
+}
+
+impl<'a> OwnerCapacity<'a> {
+    /// Constructs owner-isolated queue supplies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the owner set or slot count is empty.
+    pub fn new(
+        slots_per_owner: u32,
+        supplied_attempts: &'a [u32],
+        arrival_offsets_micros: &'a [u64],
+        arrival_owners: &'a [u32],
+    ) -> Result<Self, ObservationError> {
+        if slots_per_owner == 0
+            || supplied_attempts.is_empty()
+            || arrival_offsets_micros.len() != arrival_owners.len()
+        {
+            return Err(ObservationError::ResourceOwnerCapacity);
+        }
+        Ok(Self {
+            slots_per_owner,
+            supplied_attempts,
+            arrival_offsets_micros,
+            arrival_owners,
+        })
+    }
+}
+
+/// Certified dispatch and owner limits for one resource report.
+#[derive(Clone, Copy, Debug)]
+pub struct PlacementCapacity<'a> {
+    dispatch: DispatchCapacity,
+    owners: OwnerCapacity<'a>,
+}
+
+impl<'a> PlacementCapacity<'a> {
+    /// Combines physical dispatch limits with owner queue supplies.
+    #[must_use]
+    pub const fn new(dispatch: DispatchCapacity, owners: OwnerCapacity<'a>) -> Self {
+        Self { dispatch, owners }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ResourceCapacity<'a> {
+    Aggregate(DispatchCapacity),
+    Placement(PlacementCapacity<'a>),
+}
+
+impl<'a> ResourceCapacity<'a> {
+    const fn parts(self) -> (DispatchCapacity, Option<OwnerCapacity<'a>>) {
+        match self {
+            Self::Aggregate(dispatch) => (dispatch, None),
+            Self::Placement(placement) => (placement.dispatch, Some(placement.owners)),
+        }
+    }
+}
+
 impl DispatchCapacity {
     /// Constructs valid physical and structural dispatch limits.
     ///
@@ -1412,6 +1478,10 @@ pub struct OccupancyTraceEvidence<'a> {
     initial_busy_slots: u32,
     slot_count: u32,
     dispatchable_demand_ceiling: u32,
+    slots_per_owner: u32,
+    owner_supplied_attempts: &'a [u32],
+    owner_arrival_offsets_micros: &'a [u64],
+    owner_arrival_owners: &'a [u32],
     initial_available_attempts: u32,
     final_busy_slots: u32,
     busy_slot_micros: u128,
@@ -1445,6 +1515,22 @@ impl OccupancyTraceEvidence<'_> {
     #[must_use]
     pub const fn dispatchable_demand_ceiling(&self) -> u32 {
         self.dispatchable_demand_ceiling
+    }
+
+    /// Returns the slot count for each isolated owner.
+    #[must_use]
+    pub const fn slots_per_owner(&self) -> u32 {
+        self.slots_per_owner
+    }
+
+    /// Returns all attempts supplied to each owner during the report.
+    #[must_use]
+    pub const fn owner_supplied_attempts(&self) -> &[u32] {
+        self.owner_supplied_attempts
+    }
+
+    pub(crate) const fn owner_arrivals(&self) -> (&[u64], &[u32]) {
+        (self.owner_arrival_offsets_micros, self.owner_arrival_owners)
     }
 
     /// Returns work that was available at the report start.
@@ -1509,6 +1595,10 @@ pub(crate) const fn occupancy_trace_for_test<'a>(
         initial_busy_slots,
         slot_count: u32::MAX,
         dispatchable_demand_ceiling: u32::MAX,
+        slots_per_owner: 0,
+        owner_supplied_attempts: &[],
+        owner_arrival_offsets_micros: &[],
+        owner_arrival_owners: &[],
         initial_available_attempts: 0,
         final_busy_slots,
         busy_slot_micros,
@@ -1536,6 +1626,42 @@ pub(crate) const fn occupancy_trace_with_demand_for_test<'a>(
         initial_busy_slots,
         slot_count: capacity.slot_count,
         dispatchable_demand_ceiling: capacity.demand_ceiling,
+        slots_per_owner: 0,
+        owner_supplied_attempts: &[],
+        owner_arrival_offsets_micros: &[],
+        owner_arrival_owners: &[],
+        initial_available_attempts,
+        final_busy_slots,
+        busy_slot_micros,
+        mean_concurrency: window.concurrency(),
+        offsets_micros,
+        completed_attempts,
+        started_attempts,
+        available_attempts,
+    }
+}
+
+#[cfg(test)]
+pub(crate) const fn occupancy_trace_with_owners_for_test<'a>(
+    window: ResourceWindow,
+    initial_busy_slots: u32,
+    capacity: PlacementCapacity<'a>,
+    initial_available_attempts: u32,
+    final_busy_slots: u32,
+    busy_slot_micros: u128,
+    transitions: (&'a [u64], &'a [u32], &'a [u32], &'a [u32]),
+) -> OccupancyTraceEvidence<'a> {
+    let PlacementCapacity { dispatch, owners } = capacity;
+    let (offsets_micros, completed_attempts, started_attempts, available_attempts) = transitions;
+    OccupancyTraceEvidence {
+        window,
+        initial_busy_slots,
+        slot_count: dispatch.slot_count,
+        dispatchable_demand_ceiling: dispatch.demand_ceiling,
+        slots_per_owner: owners.slots_per_owner,
+        owner_supplied_attempts: owners.supplied_attempts,
+        owner_arrival_offsets_micros: owners.arrival_offsets_micros,
+        owner_arrival_owners: owners.arrival_owners,
         initial_available_attempts,
         final_busy_slots,
         busy_slot_micros,
@@ -1553,6 +1679,7 @@ struct OccupancyTraceHeader {
     initial_busy_slots: u32,
     slot_count: u32,
     dispatchable_demand_ceiling: u32,
+    slots_per_owner: u32,
     initial_available_attempts: u32,
     final_busy_slots: u32,
     busy_slot_micros: u128,
@@ -1589,6 +1716,9 @@ pub struct ObservationBuffer {
     resource_transition_completed_attempts: Vec<u32>,
     resource_transition_started_attempts: Vec<u32>,
     resource_transition_available_attempts: Vec<u32>,
+    resource_owner_supplied_attempts: Vec<u32>,
+    resource_owner_arrival_offsets_micros: Vec<u64>,
+    resource_owner_arrival_owners: Vec<u32>,
     attempt_outcomes: Option<AttemptOutcomeEvidence>,
     launch_header: Option<LaunchEvidenceHeader>,
     readiness_lumps: Vec<ReadinessLump>,
@@ -1667,6 +1797,13 @@ impl ObservationBuffer {
             resource_transition_started_attempts: Vec::with_capacity(resource_transition_count_max),
             resource_transition_available_attempts: Vec::with_capacity(
                 resource_transition_count_max,
+            ),
+            resource_owner_supplied_attempts: Vec::with_capacity(replica_count_max),
+            resource_owner_arrival_offsets_micros: Vec::with_capacity(
+                configuration.resource_window_attempt_count_max as usize,
+            ),
+            resource_owner_arrival_owners: Vec::with_capacity(
+                configuration.resource_window_attempt_count_max as usize,
             ),
             attempt_outcomes: None,
             launch_header: None,
@@ -1937,6 +2074,50 @@ impl ObservationBuffer {
         final_busy_slots: u32,
         transitions: &[OccupancyTransition],
     ) -> Result<(), ObservationError> {
+        self.set_resource_observation_with_capacity(
+            window,
+            initial_busy_slots,
+            ResourceCapacity::Aggregate(capacity),
+            initial_available_attempts,
+            final_busy_slots,
+            transitions,
+        )
+    }
+
+    /// Sets one resource summary with owner-isolated queue supplies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the trace or owner supplies violate the contract.
+    pub fn set_resource_observation_with_owners(
+        &mut self,
+        window: ResourceWindow,
+        initial_busy_slots: u32,
+        capacity: PlacementCapacity<'_>,
+        initial_available_attempts: u32,
+        final_busy_slots: u32,
+        transitions: &[OccupancyTransition],
+    ) -> Result<(), ObservationError> {
+        self.set_resource_observation_with_capacity(
+            window,
+            initial_busy_slots,
+            ResourceCapacity::Placement(capacity),
+            initial_available_attempts,
+            final_busy_slots,
+            transitions,
+        )
+    }
+
+    fn set_resource_observation_with_capacity(
+        &mut self,
+        window: ResourceWindow,
+        initial_busy_slots: u32,
+        capacity: ResourceCapacity<'_>,
+        initial_available_attempts: u32,
+        final_busy_slots: u32,
+        transitions: &[OccupancyTransition],
+    ) -> Result<(), ObservationError> {
+        let (capacity, owners) = capacity.parts();
         if self.resource_trace.is_some() {
             return Err(ObservationError::ResourceWindowPending);
         }
@@ -2017,12 +2198,21 @@ impl ObservationBuffer {
         if (derived_concurrency - window.concurrency()).abs() > concurrency_error {
             return Err(ObservationError::ResourceTraceSummary);
         }
+        let slots_per_owner = owners.map_or(0, |value| value.slots_per_owner);
+        self.store_owner_capacity(
+            owners,
+            window,
+            slot_count,
+            initial_busy_slots.saturating_add(initial_available_attempts),
+            transitions,
+        )?;
         self.store_resource_transitions(transitions);
         self.resource_trace = Some(OccupancyTraceHeader {
             window,
             initial_busy_slots,
             slot_count,
             dispatchable_demand_ceiling,
+            slots_per_owner,
             initial_available_attempts,
             final_busy_slots,
             busy_slot_micros,
@@ -2046,6 +2236,59 @@ impl ObservationBuffer {
             self.resource_transition_available_attempts
                 .push(transition.available_attempts);
         }
+    }
+
+    fn store_owner_capacity(
+        &mut self,
+        owners: Option<OwnerCapacity<'_>>,
+        window: ResourceWindow,
+        slot_count: u32,
+        initial_demand: u32,
+        transitions: &[OccupancyTransition],
+    ) -> Result<(), ObservationError> {
+        self.resource_owner_supplied_attempts.clear();
+        self.resource_owner_arrival_offsets_micros.clear();
+        self.resource_owner_arrival_owners.clear();
+        let Some(owners) = owners else {
+            return Ok(());
+        };
+        let owner_count = u32::try_from(owners.supplied_attempts.len())
+            .map_err(|_| ObservationError::ResourceOwnerCapacity)?;
+        let owner_slots = owner_count
+            .checked_mul(owners.slots_per_owner)
+            .ok_or(ObservationError::ResourceOwnerCapacity)?;
+        let initial_supply = owners
+            .supplied_attempts
+            .iter()
+            .try_fold(0_u32, |sum, value| {
+                sum.checked_add(*value)
+                    .ok_or(ObservationError::CountOverflow)
+            })?;
+        let demand = transitions
+            .iter()
+            .try_fold(initial_demand, |sum, transition| {
+                sum.checked_add(transition.available_attempts)
+                    .ok_or(ObservationError::CountOverflow)
+            })?;
+        let supplied = initial_supply
+            .checked_add(owners.arrival_owners.len() as u32)
+            .ok_or(ObservationError::CountOverflow)?;
+        let arrivals_valid = owners
+            .arrival_offsets_micros
+            .iter()
+            .copied()
+            .zip(owners.arrival_owners.iter().copied())
+            .all(|(offset, owner)| offset <= window.exposure_micros() && owner < owner_count);
+        if owner_slots < slot_count || supplied < demand || !arrivals_valid {
+            return Err(ObservationError::ResourceOwnerCapacity);
+        }
+        self.resource_owner_supplied_attempts
+            .extend_from_slice(owners.supplied_attempts);
+        self.resource_owner_arrival_offsets_micros
+            .extend_from_slice(owners.arrival_offsets_micros);
+        self.resource_owner_arrival_owners
+            .extend_from_slice(owners.arrival_owners);
+        Ok(())
     }
 
     /// Sets one complete attempt-outcome window.
@@ -2322,6 +2565,10 @@ impl ObservationBuffer {
                     initial_busy_slots: header.initial_busy_slots,
                     slot_count: header.slot_count,
                     dispatchable_demand_ceiling: header.dispatchable_demand_ceiling,
+                    slots_per_owner: header.slots_per_owner,
+                    owner_supplied_attempts: &self.resource_owner_supplied_attempts,
+                    owner_arrival_offsets_micros: &self.resource_owner_arrival_offsets_micros,
+                    owner_arrival_owners: &self.resource_owner_arrival_owners,
                     initial_available_attempts: header.initial_available_attempts,
                     final_busy_slots: header.final_busy_slots,
                     busy_slot_micros: header.busy_slot_micros,
@@ -2528,6 +2775,9 @@ pub enum ObservationError {
     /// A busy-slot boundary or transition exceeds the plant range.
     #[error("a resource busy-slot state is outside the configured range")]
     ResourceBusySlots,
+    /// Owner queue supplies do not cover the certified resource demand.
+    #[error("owner queue supplies do not cover the certified resource demand")]
+    ResourceOwnerCapacity,
     /// A resource trace exceeds its fixed transition bound.
     #[error("the resource trace exceeds its fixed transition bound")]
     ResourceTransitionCapacity,

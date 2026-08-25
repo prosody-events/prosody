@@ -447,6 +447,7 @@ pub struct TickHistory {
     dependency_operation_micros: Vec<u64>,
     desired_replicas: Vec<u32>,
     partition_normal_backlog: Vec<u32>,
+    partition_owners: Vec<u32>,
     partition_count: usize,
     cursor: usize,
     length: usize,
@@ -514,6 +515,7 @@ impl TickHistory {
             dependency_operation_micros: vec![0; capacity],
             desired_replicas: vec![0; capacity],
             partition_normal_backlog: vec![0; partition_cell_count],
+            partition_owners: vec![0; partition_cell_count],
             partition_count,
             cursor: 0,
             length: 0,
@@ -530,6 +532,7 @@ impl TickHistory {
         plant: PlantSnapshot,
         inputs: TickInputs,
         partition_normal_backlog: &[u32],
+        partition_owners: &[u32],
     ) {
         let index = self.cursor;
         self.now_micros[index] = now_micros;
@@ -572,6 +575,7 @@ impl TickHistory {
         let partition_end = partition_start + self.partition_count;
         self.partition_normal_backlog[partition_start..partition_end]
             .copy_from_slice(partition_normal_backlog);
+        self.partition_owners[partition_start..partition_end].copy_from_slice(partition_owners);
         self.cursor = (self.cursor + 1) % self.now_micros.len();
         self.length = (self.length + 1).min(self.now_micros.len());
     }
@@ -820,6 +824,15 @@ impl<'a> TickHistoryView<'a> {
         Some(&self.history.partition_normal_backlog[start..end])
     }
 
+    /// Returns the partition owners for one newest-first offset.
+    #[must_use]
+    pub fn partition_owners(self, steps_back: usize) -> Option<&'a [u32]> {
+        let index = self.index(steps_back)?;
+        let start = index * self.history.partition_count;
+        let end = start + self.history.partition_count;
+        Some(&self.history.partition_owners[start..end])
+    }
+
     fn index(self, steps_back: usize) -> Option<usize> {
         if steps_back >= self.history.length {
             return None;
@@ -1054,6 +1067,7 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             after,
             observed_inputs,
             &self.partition_normal_backlog,
+            self.plant.partition_owners(),
         );
         self.tick_index = self.tick_index.saturating_add(1);
         Ok(after)

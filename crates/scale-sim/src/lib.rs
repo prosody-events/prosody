@@ -724,6 +724,8 @@ pub struct AttemptTransition {
     pub at_micros: u64,
     /// Direction of the busy-slot change.
     pub kind: AttemptTransitionKind,
+    /// Owner that receives the attempt transition.
+    pub owner: u32,
 }
 
 /// Direction of one exact handler-slot transition.
@@ -1260,6 +1262,8 @@ impl<M: AttemptModel> Plant<M> {
                         self.attempt_transitions.push(AttemptTransition {
                             at_micros: scheduled.at_micros,
                             kind: AttemptTransitionKind::Available,
+                            owner: self.partition_owner
+                                [self.events.partition[event as usize] as usize],
                         });
                     }
                 }
@@ -1395,6 +1399,7 @@ impl<M: AttemptModel> Plant<M> {
         self.attempt_transitions.push(AttemptTransition {
             at_micros: self.now_micros,
             kind: AttemptTransitionKind::Available,
+            owner: self.partition_owner[self.events.partition[event as usize] as usize],
         });
         self.queued_events += 1;
     }
@@ -1468,6 +1473,7 @@ impl<M: AttemptModel> Plant<M> {
         self.attempt_transitions.push(AttemptTransition {
             at_micros: now_micros,
             kind: AttemptTransitionKind::Start,
+            owner: owner as u32,
         });
         self.active_handlers_by_owner[owner] += 1;
         self.partition_active_handlers[partition] += 1;
@@ -1550,6 +1556,7 @@ impl<M: AttemptModel> Plant<M> {
         self.attempt_transitions.push(AttemptTransition {
             at_micros: now_micros,
             kind: AttemptTransitionKind::Completion,
+            owner: self.owner_at_dispatch[event_index],
         });
         let retry = match event_outcome {
             EventOutcome::Final(_) => None,

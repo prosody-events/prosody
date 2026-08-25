@@ -20,8 +20,11 @@ use super::{
     vector_exp,
 };
 use crate::change_point::ChangePointKernel;
-use crate::types::{occupancy_trace_for_test, occupancy_trace_with_demand_for_test};
-use crate::{DispatchCapacity, OccupancyTraceEvidence};
+use crate::types::{
+    occupancy_trace_for_test, occupancy_trace_with_demand_for_test,
+    occupancy_trace_with_owners_for_test,
+};
+use crate::{DispatchCapacity, OccupancyTraceEvidence, OwnerCapacity, PlacementCapacity};
 
 fn kernel_float_matches(actual: f64, expected: f64) -> bool {
     if actual.is_infinite() || expected.is_infinite() {
@@ -2306,6 +2309,94 @@ fn dispatch_ceiling_limits_the_completion_predictive() -> Result<(), TestError> 
     assert!(summary.quantile_counts[0] <= 10);
     assert!(summary.quantile_counts[2] >= 10);
     assert!(summary.quantile_counts[2] < 20);
+    Ok(())
+}
+
+#[test]
+fn hot_owner_limits_the_completion_predictive() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.1_f64], &[10_000.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        32.0_f64,
+        0.1_f64,
+        4_096,
+    )?;
+    factor.weights.fill(0.0_f64);
+    factor.weights[0] = 1.0_f64;
+    let window = ResourceWindow::new_with_starts(32.0_f64, 1.0_f64, 320, 320)?;
+    let supplies = [4_096, 0, 0, 0, 0, 0, 0, 0];
+    let evidence = occupancy_trace_with_owners_for_test(
+        window,
+        32,
+        PlacementCapacity::new(
+            DispatchCapacity::new(256, 256)?,
+            OwnerCapacity::new(32, &supplies, &[], &[])?,
+        ),
+        4_064,
+        32,
+        32_000_000,
+        (&[], &[], &[], &[]),
+    );
+
+    let summary =
+        factor.completion_predictive_summary(evidence, 7, 320, [0.1_f64, 0.5_f64, 0.9_f64]);
+
+    assert!(
+        summary.quantile_counts[0] < 400,
+        "{:?}",
+        summary.quantile_counts
+    );
+    assert!(
+        summary.quantile_counts[2] > 250,
+        "{:?}",
+        summary.quantile_counts
+    );
+    Ok(())
+}
+
+#[test]
+fn one_owner_conditioning_matches_the_fleet_predictive() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.1_f64], &[10_000.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        32.0_f64,
+        0.1_f64,
+        4_096,
+    )?;
+    factor.weights.fill(0.0_f64);
+    factor.weights[0] = 1.0_f64;
+    let window = ResourceWindow::new_with_starts(32.0_f64, 1.0_f64, 320, 320)?;
+    let fleet = occupancy_trace_with_demand_for_test(
+        window,
+        32,
+        DispatchCapacity::new(32, 32)?,
+        4_064,
+        32,
+        32_000_000,
+        (&[], &[], &[], &[]),
+    );
+    let supplies = [4_096];
+    let owner = occupancy_trace_with_owners_for_test(
+        window,
+        32,
+        PlacementCapacity::new(
+            DispatchCapacity::new(32, 32)?,
+            OwnerCapacity::new(32, &supplies, &[], &[])?,
+        ),
+        4_064,
+        32,
+        32_000_000,
+        (&[], &[], &[], &[]),
+    );
+
+    assert_eq!(
+        factor.completion_predictive_summary(fleet, 7, 320, [0.1_f64, 0.5_f64, 0.9_f64]),
+        factor.completion_predictive_summary(owner, 7, 320, [0.1_f64, 0.5_f64, 0.9_f64])
+    );
     Ok(())
 }
 

@@ -48,8 +48,8 @@ pub use types::{
     BacklogCohort, CalendarArtifactId, CalendarRateSegment, Cohort, Configuration,
     ConfigurationError, DecisionDiagnostics, DemandClass, DispatchCapacity, GroupObservation,
     HoldDecision, HoldReason, ModelTime, ObservationBuffer, ObservationError,
-    OccupancyTraceEvidence, OccupancyTransition, PosteriorQuery, PriorArtifact,
-    PriorArtifactBudget, PriorArtifactIdentity, PriorCoverageRecord, ScaleDecision,
+    OccupancyTraceEvidence, OccupancyTransition, OwnerCapacity, PlacementCapacity, PosteriorQuery,
+    PriorArtifact, PriorArtifactBudget, PriorArtifactIdentity, PriorCoverageRecord, ScaleDecision,
     ScheduledRelease, ServiceObjective,
 };
 

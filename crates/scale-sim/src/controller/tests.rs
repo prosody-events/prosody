@@ -34,7 +34,11 @@ fn bucketed_transitions_stay_admissible_and_preserve_totals(
             started += 1;
             AttemptTransitionKind::Start
         };
-        transitions.push(AttemptTransition { at_micros, kind });
+        transitions.push(AttemptTransition {
+            at_micros,
+            kind,
+            owner: 0,
+        });
     }
     let mut groups = Vec::with_capacity(GROUP_COUNT_MAX);
     let Ok(group_count_max) = u32::try_from(GROUP_COUNT_MAX) else {

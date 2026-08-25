@@ -7,9 +7,9 @@ use prosody_scale_core::{
     CapacityClockCheck, CapacityGrid, Cohort, Configuration, ConfigurationError,
     DecisionDiagnostics, DecisionRejection, DemandClass, DispatchCapacity, HoldReason,
     LaunchComponentSummary, ModelTime, ObservationBuffer, OccupancyTraceEvidence,
-    OccupancyTransition, PosteriorQuery, RandomStream, ReadinessGroupId, ReadinessLump,
-    ReadinessObservation, RebalanceEvidence, ResourceWindow, ScaleDecision, ScaleScratch,
-    ScaleState, TransitionDirection, step,
+    OccupancyTransition, OwnerCapacity, PlacementCapacity, PosteriorQuery, RandomStream,
+    ReadinessGroupId, ReadinessLump, ReadinessObservation, RebalanceEvidence, ResourceWindow,
+    ScaleDecision, ScaleScratch, ScaleState, TransitionDirection, step,
 };
 #[cfg(test)]
 use statrs::distribution::{DiscreteCDF, Poisson};
@@ -1422,6 +1422,9 @@ pub struct ClosedLoop<Workload> {
     observation: ObservationBuffer,
     arrival_counts: Vec<u32>,
     generated_counts: Vec<u32>,
+    owner_supply_scratch: Vec<u32>,
+    owner_arrival_offset_scratch: Vec<u64>,
+    owner_arrival_owner_scratch: Vec<u32>,
     arrival_evidence_sample: ArrivalEvidenceSample,
     partition_evidence_accepted: bool,
     partition_posterior_values: Vec<f64>,
@@ -1692,6 +1695,11 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         let capacity_transition_count =
             usize::try_from(core_configuration.resource_window_group_count_max)
                 .map_err(|_| ConfigurationError::PlatformLimit)?;
+        let owner_count_max = usize::try_from(core_configuration.replica_count_max)
+            .map_err(|_| ConfigurationError::PlatformLimit)?;
+        let resource_attempt_count_max =
+            usize::try_from(core_configuration.resource_window_attempt_count_max)
+                .map_err(|_| ConfigurationError::PlatformLimit)?;
         let scratch = state.new_scratch()?;
         let observation = ObservationBuffer::new(core_configuration)?;
         Ok(Self {
@@ -1703,6 +1711,9 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             observation,
             arrival_counts: vec![0; partition_count],
             generated_counts: vec![0; partition_count],
+            owner_supply_scratch: Vec::with_capacity(owner_count_max),
+            owner_arrival_offset_scratch: Vec::with_capacity(resource_attempt_count_max),
+            owner_arrival_owner_scratch: Vec::with_capacity(resource_attempt_count_max),
             arrival_evidence_sample: ArrivalEvidenceSample::None,
             partition_evidence_accepted: false,
             partition_posterior_values: vec![0.0_f64; partition_posterior_count],
@@ -2152,6 +2163,75 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         feature = "hotpath",
         hotpath::measure(label = "prepare_capacity_evidence")
     )]
+    fn prepare_owner_supplies(
+        &mut self,
+        context: &TickContext<'_>,
+        slot_count: u32,
+    ) -> Result<(), PlantError> {
+        let backlog = context
+            .history
+            .partition_normal_backlog(0)
+            .ok_or(PlantError::MetricCapacity)?;
+        let owners = context
+            .history
+            .partition_owners(0)
+            .ok_or(PlantError::MetricCapacity)?;
+        // The owner set covers every owner present in the window's evidence:
+        // the current assignment, the report-start assignment, the arrival
+        // owners, and the physical fleet. An owner with no queue has zero
+        // completion intensity, so extra owners keep the predictive exact.
+        let assigned = context
+            .partition_owners
+            .iter()
+            .chain(owners.iter())
+            .chain(self.owner_arrival_owner_scratch.iter())
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let physical = slot_count
+            .div_ceil(self.configuration.core().slots_per_replica)
+            .max(1);
+        let owner_count =
+            usize::try_from(assigned.max(physical)).map_err(|_| PlantError::PlatformLimit)?;
+        self.owner_supply_scratch.clear();
+        self.owner_supply_scratch.resize(owner_count, 0);
+        for (partition, &count) in backlog.iter().enumerate() {
+            let owner = owners
+                .get(partition)
+                .copied()
+                .ok_or(PlantError::PartitionIndex)? as usize;
+            let supply = self
+                .owner_supply_scratch
+                .get_mut(owner)
+                .ok_or(PlantError::MetricCapacity)?;
+            *supply = supply.saturating_add(count);
+        }
+        Ok(())
+    }
+
+    fn prepare_owner_arrivals(
+        &mut self,
+        transitions: &[AttemptTransition],
+        previous_micros: u64,
+        exposure_micros: u64,
+    ) {
+        self.owner_arrival_offset_scratch.clear();
+        self.owner_arrival_owner_scratch.clear();
+        for transition in transitions {
+            if transition.kind != AttemptTransitionKind::Available {
+                continue;
+            }
+            self.owner_arrival_offset_scratch.push(
+                transition
+                    .at_micros
+                    .saturating_sub(previous_micros)
+                    .min(exposure_micros),
+            );
+            self.owner_arrival_owner_scratch.push(transition.owner);
+        }
+    }
+
     fn prepare_capacity_evidence(&mut self, context: &TickContext<'_>) -> Result<(), PlantError> {
         let Some(previous_micros) = context.history.now_micros(0) else {
             return Ok(());
@@ -2176,6 +2256,8 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             .attempt_transitions
             .get(previous_count..context.plant.attempt_transition_count)
             .unwrap_or(&[]);
+        self.prepare_owner_arrivals(window_transitions, previous_micros, exposure_micros);
+        self.prepare_owner_supplies(context, slot_count)?;
         bucket_window_transitions(
             window_transitions,
             previous_micros,
@@ -2226,10 +2308,18 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             busy_slot_micros: u128::from(occupancy),
         };
         self.latest_capacity_window = Some(current);
-        self.observation.set_resource_observation_with_demand(
+        self.observation.set_resource_observation_with_owners(
             current.evidence()?,
             initial_busy_slots,
-            DispatchCapacity::new(slot_count, dispatchable_demand_ceiling)?,
+            PlacementCapacity::new(
+                DispatchCapacity::new(slot_count, dispatchable_demand_ceiling)?,
+                OwnerCapacity::new(
+                    self.configuration.core().slots_per_replica,
+                    &self.owner_supply_scratch,
+                    &self.owner_arrival_offset_scratch,
+                    &self.owner_arrival_owner_scratch,
+                )?,
+            ),
             initial_available_attempts,
             final_busy_slots,
             &self.capacity_transition_scratch,
