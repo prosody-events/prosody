@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    f64::consts::PI,
     num::{ParseFloatError, ParseIntError},
     str::FromStr,
     time::Duration,
@@ -10,7 +9,7 @@ use allocation_counter::measure;
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use quickcheck_macros::quickcheck;
 use statrs::distribution::{
-    Binomial, BinomialError, ContinuousCDF, DiscreteCDF, Gamma, Normal, NormalError,
+    Binomial, BinomialError, ContinuousCDF, DiscreteCDF, Gamma, NormalError,
 };
 use thiserror::Error;
 
@@ -20,11 +19,9 @@ use super::{
     HAZARD_TRANSITION_PROBABILITY_ERROR_MAX, OBSERVATION_COVERAGE_INDEX,
     OBSERVATION_PROBABILITY_ERROR_MAX, ResourceWindow, ResourceWindowError,
     capacity_model_artifact, capacity_update_operation_count, contamination_prior,
-    fill_knee_state_rates, fill_no_knee_state_rates, fold_trace, hazard_prior,
-    log_contamination_mixture, log_normal_axis_masses, log_weighted_sum, path_log_score,
-    vector_exp,
+    deterministic_log_uniform_rate, fill_knee_state_rates, fill_no_knee_state_rates, fold_trace,
+    hazard_prior, log_normal_axis_masses, log_weighted_sum, path_log_score, vector_exp,
 };
-use crate::change_point::ChangePointKernel;
 use crate::random::RandomStream;
 use crate::types::{
     occupancy_trace_for_test, occupancy_trace_with_demand_for_test,
@@ -39,6 +36,86 @@ fn kernel_float_matches(actual: f64, expected: f64) -> bool {
             && actual.is_sign_positive() == expected.is_sign_positive();
     }
     (actual - expected).abs() <= 1.0e-12_f64.max(1.0e-9_f64 * expected.abs())
+}
+
+#[quickcheck]
+fn deterministic_log_uniform_draw_matches_finite_form(
+    low_seed: u16,
+    width_seed: u16,
+    count_seed: i8,
+    draw_seed: u16,
+) -> bool {
+    let low = f64::from(low_seed) / 1_024.0_f64 - 32.0_f64;
+    let high = low + (f64::from(width_seed) + 1.0_f64) / 1_024.0_f64;
+    let count = f64::from(count_seed) / 16.0_f64;
+    let draw = (f64::from(draw_seed) + 0.5_f64) / 65_536.0_f64;
+    let expected = if count == 0.0_f64 {
+        (low + draw * (high - low)).exp()
+    } else {
+        let lower = (count * (low - high)).exp();
+        (high + (lower + draw * (1.0_f64 - lower)).ln() / count).exp()
+    };
+    kernel_float_matches(
+        deterministic_log_uniform_rate(low, high, count, draw),
+        expected,
+    )
+}
+
+#[test]
+fn deterministic_log_uniform_draw_evaluates_overflow_limit() {
+    let low = 0.345_574_089_946_889_3_f64;
+    let high = 1.038_721_270_506_834_7_f64;
+    let count = -1.0e24_f64;
+    let draw = 0.126_149_466_607_743_57_f64;
+    let lower = (count * (low - high)).exp();
+    let old = (high + (lower + draw * (1.0_f64 - lower)).ln() / count).exp();
+
+    assert!(old.is_nan());
+    assert_eq!(
+        deterministic_log_uniform_rate(low, high, count, draw).to_bits(),
+        low.exp().to_bits()
+    );
+}
+
+#[test]
+fn deterministic_log_uniform_members_start_with_zero_observations() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[1.0_f64], &[10.0_f64], &[0.0_f64])?;
+    let factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        1.0_f64,
+        0.1_f64,
+        63,
+    )?;
+    let deterministic = super::SERVICE_CLOCKS.len() - 1;
+
+    assert_eq!(
+        factor.deterministic_log_uniform_counts[deterministic],
+        Some(0.0_f64)
+    );
+    Ok(())
+}
+
+#[test]
+fn duration_curvatures_start_absent() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[1.0_f64], &[10.0_f64], &[0.0_f64])?;
+    let factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        1.0_f64,
+        0.1_f64,
+        63,
+    )?;
+
+    assert!(
+        factor
+            .duration_log_rate_curvatures
+            .iter()
+            .all(Option::is_none)
+    );
+    Ok(())
 }
 
 fn update_constant_trace(
@@ -1889,26 +1966,30 @@ fn capacity_update_does_not_allocate() -> Result<(), TestError> {
 
 #[test]
 fn completion_predictive_does_not_allocate() -> Result<(), TestError> {
-    let grid = CapacityGrid::new(&[0.01_f64], &[1_000.0_f64], &[0.0_f64])?;
-    let mut factor = super::CapacityFactor::new_with_prior(
-        grid,
-        1.0_f64 / 300.0_f64,
-        4.0_f64,
-        4.0_f64,
-        0.1_f64,
-        64,
-    )?;
     let window = ResourceWindow::new_with_starts(3.0_f64, 0.1_f64, 10, 10)?;
     let offsets = (0_u64..10).map(|index| index * 10_000).collect::<Vec<_>>();
     let completed = [1_u32; 10];
     let started = [1_u32; 10];
     let evidence = occupancy_trace_for_test(window, 3, 3, 300_000, &offsets, &completed, &started);
+    let mut counts = [0_u64; 2];
+    for (count, group_limit) in counts.iter_mut().zip([32, 64]) {
+        let grid = CapacityGrid::new(&[0.01_f64], &[1_000.0_f64], &[0.0_f64])?;
+        let mut factor = super::CapacityFactor::new_with_prior(
+            grid,
+            1.0_f64 / 300.0_f64,
+            4.0_f64,
+            4.0_f64,
+            0.1_f64,
+            group_limit,
+        )?;
+        *count = measure(|| {
+            factor.completion_predictive_summary(evidence, 11, 10, [0.1_f64, 0.5_f64, 0.9_f64]);
+        })
+        .count_total;
+    }
+    // The thread scope allocates this constant set of parallel dispatch objects.
+    assert_eq!(counts, [34, 34]);
 
-    let allocation = measure(|| {
-        factor.completion_predictive_summary(evidence, 11, 10, [0.1_f64, 0.5_f64, 0.9_f64]);
-    });
-    assert_eq!(allocation.count_total, 0);
-    assert_eq!(allocation.bytes_total, 0);
     Ok(())
 }
 
@@ -1944,37 +2025,6 @@ fn raw_path_score_matches_the_exponential_clock_oracle() -> Result<(), TestError
 }
 
 #[test]
-fn shape_one_duration_score_nests_the_markov_path_score() -> Result<(), TestError> {
-    let grid = CapacityGrid::new(&[0.5_f64], &[100.0_f64], &[0.0_f64])?;
-    let window = ResourceWindow::new_with_starts(1.8_f64, 1.0_f64, 1, 1)?;
-    let offsets = [400_000_u64, 600_000_u64];
-    let completed = [1_u32, 0];
-    let started = [0_u32, 1];
-    let completion_offsets = [400_000_u64];
-    let durations = [400_000_u64];
-    let initial_ages = [0_u64, 0];
-    let final_ages = [1_000_000_u64, 400_000];
-    let evidence = occupancy_trace_with_service_for_test(
-        window,
-        2,
-        2,
-        1_800_000,
-        (&offsets, &completed, &started),
-        (&completion_offsets, &durations, &initial_ages, &final_ages),
-    );
-    let mut exposures = [0.0_f64; 3];
-    let mut completion_counts = [0_u32; 3];
-    fold_trace(&evidence, &mut exposures, &mut completion_counts);
-    let markov = path_log_score(&grid, 0, &exposures, &completion_counts)
-        + super::REPORT_CLOCK_ERROR_SECONDS.ln();
-    let statistics = super::duration_statistics(&durations);
-    let duration = super::duration_log_likelihood(1, 2.0_f64, &evidence, statistics)
-        + super::aggregate_completion_log_score(&grid, 0, &completion_counts);
-    assert!((markov - duration).abs() <= 256.0_f64 * f64::EPSILON);
-    Ok(())
-}
-
-#[test]
 fn within_cell_newton_mode_matches_the_completion_mode() -> Result<(), TestError> {
     let window = ResourceWindow::new_with_starts(0.2_f64, 1.0_f64, 1, 0)?;
     let offsets = [200_000_u64];
@@ -1996,7 +2046,9 @@ fn within_cell_newton_mode_matches_the_completion_mode() -> Result<(), TestError
         high: 10.0_f64.ln(),
         evidence: &evidence,
         statistics,
-        aggregate_count: 1,
+        curve_log_sum: 0.0_f64,
+        curve_scaled_exposure_seconds: statistics.duration_sum_seconds,
+        running_curve_factor: 1.0_f64,
         prior: CapacityPrior::LogUniform,
     };
     let (mode, _) = super::within_cell_mode(1.0_f64, &posterior);
@@ -2006,29 +2058,417 @@ fn within_cell_newton_mode_matches_the_completion_mode() -> Result<(), TestError
 }
 
 #[test]
-fn differing_duration_bins_zero_the_deterministic_member() -> Result<(), TestError> {
-    let window = ResourceWindow::new_with_starts(0.2_f64, 1.0_f64, 2, 0)?;
-    let offsets = [100_000_u64, 200_000];
-    let durations = [100_000_u64, 100_002];
+fn accumulated_integrand_equals_direct_per_attempt_sum() -> Result<(), TestError> {
+    fn direct_erlang_sum(
+        shape: u32,
+        rate: f64,
+        completed: &[(f64, f64, f64)],
+        running: &[(f64, f64)],
+    ) -> f64 {
+        let shape = f64::from(shape);
+        let normalizer = shape * shape.ln() - super::ln_gamma(shape);
+        let density = completed.iter().map(|&(duration, curve, curve_time)| {
+            normalizer
+                + super::REPORT_CLOCK_ERROR_SECONDS.ln()
+                + shape * (rate * curve).ln()
+                + (shape - 1.0_f64) * duration.ln()
+                - shape * rate * curve_time
+        });
+        let survival = running
+            .iter()
+            .map(|&(age, curve)| super::erlang_log_survival(shape, rate * curve * age));
+        density.chain(survival).sum()
+    }
+
+    let window = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 0, 0)?;
+    let final_ages = [230_000_u64, 610_000];
+    let evidence = occupancy_trace_with_service_for_test(
+        window,
+        4,
+        4,
+        4_000_000,
+        (&[], &[], &[]),
+        (&[], &[], &[], &final_ages),
+    );
+    let durations = [0.12_f64, 0.31_f64, 0.47_f64];
+    let statistics = super::DurationStatistics {
+        completion_count: 3,
+        duration_sum_seconds: durations.iter().sum(),
+        log_duration_sum_seconds: durations.iter().map(|duration| duration.ln()).sum(),
+    };
+
+    for curves in [[1.0_f64, 1.0_f64, 1.0_f64], [1.0_f64, 0.75_f64, 0.5_f64]] {
+        let curve_times = [
+            durations[0] * curves[0],
+            durations[1] * curves[1],
+            durations[2] * curves[2],
+        ];
+        let curve_log_sum = curves.iter().map(|curve| curve.ln()).sum();
+        let curve_scaled_exposure_seconds = curve_times.iter().sum();
+        let running_curve = curves[2];
+        let completed = [
+            (durations[0], curves[0], curve_times[0]),
+            (durations[1], curves[1], curve_times[1]),
+            (durations[2], curves[2], curve_times[2]),
+        ];
+        let running = [(0.23_f64, running_curve), (0.61_f64, running_curve)];
+
+        for shape in [1_u32, 4, 32] {
+            for rate in [2.5_f64, 5.0_f64, 8.0_f64] {
+                let actual = super::accumulated_erlang_log_likelihood(
+                    shape,
+                    rate,
+                    &evidence,
+                    statistics,
+                    curve_log_sum,
+                    curve_scaled_exposure_seconds,
+                    running_curve,
+                );
+                let direct = direct_erlang_sum(shape, rate, &completed, &running);
+                assert!(
+                    (actual - direct).abs() <= 1.0e-10_f64,
+                    "shape {shape}, rate {rate}: {actual} != {direct}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn model_curve_factor(service_time: f64, capacity: f64, collapse: f64, state: u32) -> f64 {
+    let concurrency = f64::from(state);
+    let knee = capacity * service_time;
+    let throughput = if concurrency <= knee {
+        concurrency / service_time
+    } else {
+        let excess = (concurrency - knee) / knee;
+        capacity / (1.0_f64 + collapse * excess * excess)
+    };
+    throughput / (concurrency / service_time)
+}
+
+fn collapse_test_grid() -> Result<CapacityGrid, CapacityGridError> {
+    CapacityGrid::new(&[0.2_f64], &[20.0_f64], &[2.0_f64])
+}
+
+#[test]
+fn collapse_cell_integrand_equals_direct_per_attempt_sum() -> Result<(), TestError> {
+    let grid = collapse_test_grid()?;
+    let cell = 0_usize;
+    let state = 6_u32;
+    let curve = model_curve_factor(0.2_f64, 20.0_f64, 2.0_f64, state);
+    let window = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, state, 0)?;
+    let final_ages = [170_000_u64, 290_000, 430_000];
+    let evidence = occupancy_trace_with_service_for_test(
+        window,
+        state,
+        state,
+        6_000_000,
+        (&[], &[], &[]),
+        (&[], &[], &[], &final_ages),
+    );
+    let durations = [0.71_f64, 0.83_f64, 0.97_f64, 1.09_f64, 1.17_f64, 1.23_f64];
+    let statistics = super::DurationStatistics {
+        completion_count: state,
+        duration_sum_seconds: durations.iter().sum(),
+        log_duration_sum_seconds: durations.iter().map(|duration| duration.ln()).sum(),
+    };
+    let mut exposures = [0.0_f64; 7];
+    exposures[state as usize] = statistics.duration_sum_seconds / f64::from(state);
+    let mut completions = [0_u32; 7];
+    completions[state as usize] = state;
+    let point_rate = grid.service_times_seconds[cell].recip();
+    let curve_log_sum = super::completion_curve_log_sum(&grid, cell, point_rate, &completions);
+    let scaled_exposure = super::curve_scaled_exposure(&grid, cell, point_rate, &exposures);
+    let running_curve = super::final_state_curve_factor(&grid, cell, point_rate, &evidence);
+
+    for shape in [1_u32, 32] {
+        let shape_float = f64::from(shape);
+        let normalizer = shape_float * shape_float.ln() - super::ln_gamma(shape_float);
+        for rate in [2.51_f64, 5.03_f64, 8.07_f64] {
+            let direct_density: f64 = durations
+                .iter()
+                .map(|duration| {
+                    normalizer
+                        + super::REPORT_CLOCK_ERROR_SECONDS.ln()
+                        + shape_float * (rate * curve).ln()
+                        + (shape_float - 1.0_f64) * duration.ln()
+                        - shape_float * rate * curve * duration
+                })
+                .sum();
+            let direct_survival: f64 = final_ages
+                .iter()
+                .map(|age| {
+                    super::erlang_log_survival(
+                        shape_float,
+                        rate * curve * Duration::from_micros(*age).as_secs_f64(),
+                    )
+                })
+                .sum();
+            let actual = super::accumulated_erlang_log_likelihood(
+                shape,
+                rate,
+                &evidence,
+                statistics,
+                curve_log_sum,
+                scaled_exposure,
+                running_curve,
+            );
+            assert!(
+                (actual - direct_density - direct_survival).abs() <= 1.0e-10_f64,
+                "shape {shape}, rate {rate}: {actual} != {}",
+                direct_density + direct_survival
+            );
+        }
+    }
+
+    for rate in [2.51_f64, 5.03_f64, 8.07_f64] {
+        let durations = [Duration::from_secs_f64(1.0_f64 / (rate * curve)).as_micros() as u64; 6];
+        let (mut low, mut high) = (f64::NEG_INFINITY, f64::INFINITY);
+        for duration in durations {
+            let duration_low = Duration::from_micros(duration).as_secs_f64();
+            let duration_high = Duration::from_micros(duration + 1).as_secs_f64();
+            low = low.max(-duration_high.ln() - curve.ln());
+            high = high.min(-duration_low.ln() - curve.ln());
+        }
+        let actual = super::accumulated_deterministic_log_likelihood(
+            rate.ln(),
+            &evidence,
+            state,
+            f64::from(state) * curve.ln(),
+            running_curve,
+            low,
+            high,
+        );
+        let period = 1.0_f64 / (rate * curve);
+        let running_is_feasible = final_ages
+            .iter()
+            .all(|age| Duration::from_micros(*age).as_secs_f64() < period);
+        let direct = if running_is_feasible {
+            f64::from(state) * (rate * curve * super::REPORT_CLOCK_ERROR_SECONDS).ln()
+        } else {
+            f64::NEG_INFINITY
+        };
+        assert!(
+            kernel_float_matches(actual, direct),
+            "rate {rate}: {actual} != {direct}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn deterministic_integrand_equals_direct_per_attempt_sum() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.2_f64, 0.4_f64], &[3.0_f64], &[1.0_f64])?;
+    let knee_cell = 0_usize;
+    let no_knee_cell = grid.knee_cell_count as usize;
+
+    for index in [knee_cell, no_knee_cell] {
+        let point_rate = grid.service_times_seconds[index].recip();
+        let states = [2_usize, 6, 4];
+        let curves = states.map(|state| super::state_rate(&grid, index, state) / point_rate);
+        assert!(
+            curves
+                .iter()
+                .any(|curve| curve.to_bits() != 1.0_f64.to_bits())
+        );
+
+        for rate in [2.51_f64, 5.03_f64, 8.07_f64] {
+            let durations = curves.map(|curve| {
+                u64::try_from(Duration::from_secs_f64(1.0_f64 / (rate * curve)).as_micros())
+                    .unwrap_or(u64::MAX)
+            });
+            let running_curve = curves[2];
+            let final_ages = [u64::try_from(
+                Duration::from_secs_f64(0.5_f64 / (rate * running_curve)).as_micros(),
+            )
+            .unwrap_or(u64::MAX)];
+            let window = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 0, 0)?;
+            let evidence = occupancy_trace_with_service_for_test(
+                window,
+                4,
+                4,
+                4_000_000,
+                (&[], &[], &[]),
+                (&[], &[], &[], &final_ages),
+            );
+            let mut feasible_low = f64::NEG_INFINITY;
+            let mut feasible_high = f64::INFINITY;
+            let mut direct = 0.0_f64;
+            for (&duration, &curve) in durations.iter().zip(&curves) {
+                let low = Duration::from_micros(duration).as_secs_f64();
+                let high = Duration::from_micros(duration.saturating_add(1)).as_secs_f64();
+                feasible_low = feasible_low.max(-high.ln() - curve.ln());
+                feasible_high = feasible_high.min(-low.ln() - curve.ln());
+                let period = 1.0_f64 / (rate * curve);
+                if low <= period && period < high {
+                    direct += (rate * curve * super::REPORT_CLOCK_ERROR_SECONDS).ln();
+                } else {
+                    direct = f64::NEG_INFINITY;
+                }
+            }
+            if Duration::from_micros(final_ages[0]).as_secs_f64() * rate * running_curve >= 1.0_f64
+            {
+                direct = f64::NEG_INFINITY;
+            }
+            let actual = super::accumulated_deterministic_log_likelihood(
+                rate.ln(),
+                &evidence,
+                3,
+                curves.iter().map(|curve| curve.ln()).sum(),
+                running_curve,
+                feasible_low,
+                feasible_high,
+            );
+            assert!(
+                kernel_float_matches(actual, direct),
+                "cell {index}, rate {rate}: {actual} != {direct}; bounds \
+                 {feasible_low}..{feasible_high}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn accumulated_shape_one_marginal_identifies_a_knee() -> Result<(), TestError> {
+    let window = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 0, 0)?;
     let evidence = occupancy_trace_with_service_for_test(
         window,
         1,
-        0,
-        200_000,
-        (&offsets, &[1, 1], &[1, 0]),
-        (&offsets, &durations, &[], &[]),
+        1,
+        1_000_000,
+        (&[], &[], &[]),
+        (&[], &[], &[], &[]),
     );
-    let posterior = super::DeterministicWithinCellPosterior {
-        low: 5.0_f64.ln(),
-        high: 20.0_f64.ln(),
+    let low = 0.1_f64.ln();
+    let high = 20.0_f64.ln();
+    let marginal = |exposure| {
+        let posterior = super::WithinCellPosterior {
+            shape: 1,
+            low,
+            high,
+            evidence: &evidence,
+            statistics: super::DurationStatistics {
+                completion_count: 150,
+                duration_sum_seconds: exposure,
+                log_duration_sum_seconds: 0.0_f64,
+            },
+            curve_log_sum: 0.0_f64,
+            curve_scaled_exposure_seconds: exposure,
+            running_curve_factor: 1.0_f64,
+            prior: CapacityPrior::LogUniform,
+        };
+        let (mode, curvature) = super::within_cell_mode((150.0_f64 / exposure).ln(), &posterior);
+        (
+            super::within_cell_laplace_log_evidence(mode, curvature, &posterior),
+            mode,
+        )
+    };
+    let (knee_marginal, _) = marginal(30.0_f64);
+    let (no_knee_marginal, no_knee_mode) = marginal(50.0_f64);
+    let knee_constant = 50.0_f64 * 10.0_f64.ln() + 100.0_f64 * 20.0_f64.ln();
+    let no_knee_constant = 50.0_f64 * 10.0_f64.ln() + 100.0_f64 * 40.0_f64.ln();
+    let discrimination_margin = knee_marginal + knee_constant - no_knee_marginal - no_knee_constant;
+    let expected_margin =
+        150.0_f64 * (50.0_f64 / 30.0_f64).ln() - 100.0_f64 * (40.0_f64 / 20.0_f64).ln();
+    assert!((discrimination_margin - expected_margin).abs() < 0.01_f64);
+    assert!(discrimination_margin > 5.0_f64);
+
+    let count = 150.0_f64;
+    let exact = super::ln_gamma(count) - count * 50.0_f64.ln() - (high - low).ln()
+        + count * super::REPORT_CLOCK_ERROR_SECONDS.ln();
+    assert!((no_knee_marginal - exact).abs() < 0.01_f64);
+    assert!((no_knee_mode - 3.0_f64.ln()).abs() < 1.0e-12_f64);
+    Ok(())
+}
+
+#[test]
+fn frozen_probe_shape_one_mode_matches_the_single_counted_rate() -> Result<(), TestError> {
+    let window = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 0, 0)?;
+    let evidence = occupancy_trace_with_service_for_test(
+        window,
+        1,
+        1,
+        1_000_000,
+        (&[], &[], &[]),
+        (&[], &[], &[], &[]),
+    );
+    let count = 28_439_u32;
+    let exposure = 5_716.252_598_f64;
+    let posterior = super::WithinCellPosterior {
+        shape: 1,
+        low: 3.5_f64.ln(),
+        high: 7.0_f64.ln(),
         evidence: &evidence,
-        aggregate_count: 2,
+        statistics: super::DurationStatistics {
+            completion_count: count,
+            duration_sum_seconds: exposure,
+            log_duration_sum_seconds: 0.0_f64,
+        },
+        curve_log_sum: 0.0_f64,
+        curve_scaled_exposure_seconds: exposure,
+        running_curve_factor: 1.0_f64,
         prior: CapacityPrior::LogUniform,
     };
+    let expected = (f64::from(count) / exposure).ln();
+    let (mode, _) = super::within_cell_mode(expected, &posterior);
 
-    let (_, _, score) = super::deterministic_within_cell_log_evidence(&posterior);
+    assert!((mode - expected).abs() <= 1.0e-12_f64);
+    assert!(posterior.low < mode && mode < posterior.high);
+    Ok(())
+}
 
-    assert!(score.is_infinite() && score.is_sign_negative());
+#[test]
+fn running_then_completed_attempt_telescopes_to_its_completed_density() -> Result<(), TestError> {
+    let window = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 0, 0)?;
+    let running_age = [200_000_u64];
+    let running = occupancy_trace_with_service_for_test(
+        window,
+        1,
+        1,
+        1_000_000,
+        (&[], &[], &[]),
+        (&[], &[], &[], &running_age),
+    );
+    let completed = occupancy_trace_with_service_for_test(
+        window,
+        1,
+        1,
+        1_000_000,
+        (&[], &[], &[]),
+        (&[], &[], &[], &[]),
+    );
+    let statistics = super::DurationStatistics {
+        completion_count: 1,
+        duration_sum_seconds: 0.3_f64,
+        log_duration_sum_seconds: 0.3_f64.ln(),
+    };
+    let score = |evidence: &OccupancyTraceEvidence<'_>, statistics| {
+        super::accumulated_erlang_log_likelihood(
+            4,
+            5.0_f64,
+            evidence,
+            statistics,
+            0.0_f64,
+            statistics.duration_sum_seconds,
+            1.0_f64,
+        )
+    };
+    let joint = score(&completed, statistics);
+    let single_batch = score(&completed, statistics);
+    let double_counted = joint
+        + score(
+            &running,
+            super::DurationStatistics {
+                completion_count: 0,
+                duration_sum_seconds: 0.0_f64,
+                log_duration_sum_seconds: 0.0_f64,
+            },
+        );
+
+    assert_eq!(joint.to_bits(), single_batch.to_bits());
+    assert!((double_counted - single_batch).abs() > 0.1_f64);
     Ok(())
 }
 
@@ -2063,54 +2503,6 @@ fn empty_feasible_interval_gives_the_deterministic_member_zero_posterior_mass()
         factor.shape_cell_weights[super::SERVICE_CLOCKS.len() - 1].to_bits(),
         0.0_f64.to_bits()
     );
-    Ok(())
-}
-
-#[test]
-fn deterministic_closed_form_matches_numerical_integration() -> Result<(), TestError> {
-    let window = ResourceWindow::new_with_starts(0.1_f64, 1.0_f64, 1, 0)?;
-    let offsets = [100_000_u64];
-    let durations = [100_000_u64];
-    let evidence = occupancy_trace_with_service_for_test(
-        window,
-        1,
-        0,
-        100_000,
-        (&offsets, &[1], &[0]),
-        (&offsets, &durations, &[], &[]),
-    );
-    let prior = CapacityPrior::LogNormal {
-        service_time_median_seconds: 0.11_f64,
-        capacity_median_per_second: 100.0_f64,
-        log_standard_deviation: 0.4_f64,
-    };
-    let posterior = super::DeterministicWithinCellPosterior {
-        low: 5.0_f64.ln(),
-        high: 20.0_f64.ln(),
-        evidence: &evidence,
-        aggregate_count: 2,
-        prior,
-    };
-    let (_, _, score) = super::deterministic_within_cell_log_evidence(&posterior);
-    let (low, high) =
-        super::deterministic_feasible_interval(&evidence, posterior.low, posterior.high);
-    let mean = -0.11_f64.ln();
-    let deviation = 0.4_f64;
-    let steps = 100_000_u32;
-    let width = (high - low) / f64::from(steps);
-    let integral = (0..steps)
-        .map(|index| {
-            let x = low + (f64::from(index) + 0.5_f64) * width;
-            let standardized = (x - mean) / deviation;
-            (2.0_f64 * x - 0.5_f64 * standardized * standardized).exp()
-                / (deviation * (2.0_f64 * PI).sqrt())
-        })
-        .sum::<f64>()
-        * width;
-    let distribution = Normal::new(mean, deviation)?;
-    let cell_mass = distribution.cdf(posterior.high) - distribution.cdf(posterior.low);
-
-    assert!((score.exp() - integral / cell_mass).abs() <= 1.0e-8_f64);
     Ok(())
 }
 
@@ -2422,50 +2814,30 @@ fn assert_contamination_filter_parity(
     grid: &CapacityGrid,
     evidence: &OccupancyTraceEvidence<'_>,
 ) {
-    let initial_filter_weights = factor.filter_weights.clone();
-    let initial_curve_weights = factor.filter_curve_weights.clone();
     let mut exposures = [0.0_f64; 2];
     let mut completion_counts = [0_u32; 2];
     fold_trace(evidence, &mut exposures, &mut completion_counts);
     let likelihoods = (0..grid.cell_count() as usize)
         .map(|index| path_log_score(grid, index, &exposures, &completion_counts))
         .collect::<Vec<_>>();
-    let prior_predictive = log_weighted_sum(&factor.prior_weights, &likelihoods);
-    let cell_count = likelihoods.len();
-    let quality_count = factor.contamination_probabilities.len();
-    let mut direct_weights = vec![0.0_f64; cell_count];
-    let mut filter_evidence = vec![0.0_f64; initial_filter_weights.len()];
-    let mut conditional_weights = vec![0.0_f64; initial_curve_weights.len()];
-    for (filter, prior) in initial_curve_weights.chunks_exact(cell_count).enumerate() {
-        let contamination = factor.contamination_probabilities[filter % quality_count];
-        let mixtures = likelihoods
-            .iter()
-            .map(|likelihood| {
-                log_contamination_mixture(*likelihood, prior_predictive, contamination).exp()
-            })
-            .collect::<Vec<_>>();
-        let predictive = prior
-            .iter()
-            .zip(&mixtures)
-            .map(|(weight, likelihood)| weight * likelihood)
-            .sum::<f64>();
-        filter_evidence[filter] = initial_filter_weights[filter] * predictive;
-        for cell in 0..cell_count {
-            conditional_weights[filter * cell_count + cell] =
-                prior[cell] * mixtures[cell] / predictive;
-        }
-    }
-    let total_filter_evidence = filter_evidence.iter().sum::<f64>();
-    for (filter, evidence) in filter_evidence.iter().enumerate() {
-        let transition =
-            ChangePointKernel::new(factor.hazard_rates_per_second[filter / quality_count])
-                .probabilities(Duration::from_secs(1));
-        for cell in 0..cell_count {
-            let conditional = transition.retained * conditional_weights[filter * cell_count + cell]
-                + transition.redrawn * factor.prior_weights[cell];
-            direct_weights[cell] += evidence / total_filter_evidence * conditional;
-        }
-    }
+    let maximum = factor
+        .prior_weights
+        .iter()
+        .zip(&likelihoods)
+        .map(|(prior, likelihood)| prior.ln() + likelihood)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let total = factor
+        .prior_weights
+        .iter()
+        .zip(&likelihoods)
+        .map(|(prior, likelihood)| (prior.ln() + likelihood - maximum).exp())
+        .sum::<f64>();
+    let direct_weights = factor
+        .prior_weights
+        .iter()
+        .zip(&likelihoods)
+        .map(|(prior, likelihood)| (prior.ln() + likelihood - maximum).exp() / total)
+        .collect::<Vec<_>>();
     factor.update(evidence, Duration::from_secs(1));
     let operation_bound = 4_096.0_f64 * f64::EPSILON;
     assert!(
@@ -2475,6 +2847,61 @@ fn assert_contamination_filter_parity(
             .zip(direct_weights)
             .all(|(actual, expected)| (actual - expected).abs() <= operation_bound)
     );
+}
+
+#[test]
+fn posterior_surfaces_project_the_accumulated_joint() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.1_f64, 0.2_f64], &[8.0_f64, 16.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        8.0_f64,
+        0.1_f64,
+        64,
+    )?;
+    let offsets = [100_000_u64, 200_000, 300_000, 400_000];
+    let durations = [100_000_u64, 110_000, 90_000, 105_000];
+    let evidence = occupancy_trace_with_service_for_test(
+        ResourceWindow::new_with_starts(0.4_f64, 1.0_f64, 4, 0)?,
+        4,
+        0,
+        400_000,
+        (&offsets, &[1, 1, 1, 1], &[0, 0, 0, 0]),
+        (&offsets, &durations, &[], &[]),
+    );
+    factor.update(evidence, Duration::from_secs(1));
+
+    let cell_logs = factor
+        .prior_weights
+        .iter()
+        .zip(&factor.likelihoods)
+        .map(|(prior, marginal)| prior.ln() + marginal)
+        .collect::<Vec<_>>();
+    let maximum = cell_logs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let total = cell_logs
+        .iter()
+        .map(|score| (score - maximum).exp())
+        .sum::<f64>();
+    for (actual, score) in factor.weights.iter().zip(&cell_logs) {
+        let expected = (score - maximum).exp() / total;
+        assert!((actual - expected).abs() <= 1.0e-12_f64);
+    }
+    for cell in 0..factor.weights.len() {
+        let start = cell * super::SERVICE_CLOCKS.len();
+        let end = start + super::SERVICE_CLOCKS.len();
+        let scores = &factor.shape_scores[start..end];
+        let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let total = scores
+            .iter()
+            .map(|score| (score - maximum).exp())
+            .sum::<f64>();
+        for (actual, score) in factor.shape_cell_weights[start..end].iter().zip(scores) {
+            let expected = (score - maximum).exp() / total;
+            assert!((actual - expected).abs() <= 1.0e-12_f64);
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -3259,7 +3686,8 @@ fn saturated_fast_path_matches_general_walk_distribution() -> Result<(), TestErr
 fn infeasible_deterministic_draw_stays_inside_its_cell() {
     let draw = super::deterministic_log_rate_draw(super::DeterministicRateDraw {
         mode: 10_000.0_f64.ln(),
-        curvature: f64::INFINITY,
+        curvature: Some(f64::INFINITY),
+        log_uniform_count: Some(0.0_f64),
         low: 100.0_f64.ln(),
         high: 40.0_f64.ln(),
         cell: (2.5_f64.ln(), 40.0_f64.ln()),
@@ -3578,20 +4006,134 @@ fn completion_predictive_mixture_matches_direct_cell_oracle() -> Result<(), Test
     factor.weights[last] = 0.75_f64;
     let window = ResourceWindow::new_with_starts(2.0_f64, 1.0_f64, 0, 0)?;
     let evidence = occupancy_trace_for_test(window, 2, 2, 2_000_000, &[], &[], &[]);
-    let first_probability = 1.0_f64 - (-super::state_rate(&grid, 0, 1)).exp();
-    let last_probability = 1.0_f64 - (-super::state_rate(&grid, last, 1)).exp();
-    let first_oracle = Binomial::new(first_probability, 2)?;
-    let last_oracle = Binomial::new(last_probability, 2)?;
     for count in 0..=2 {
         let actual = factor.completion_predictive_cdf(evidence, 11, count);
-        let expected = 0.25_f64 * first_oracle.cdf(u64::from(count))
-            + 0.75_f64 * last_oracle.cdf(u64::from(count));
+        let expected = 0.25_f64 * direct_fleet_clock_cdf(&grid, 0, 2, 1.0_f64, count)
+            + 0.75_f64 * direct_fleet_clock_cdf(&grid, last, 2, 1.0_f64, count);
+        let sample_count = f64::from(super::COMPLETION_PREDICTIVE_DRAW_COUNT.min(256));
+        let tolerance = (2.0_f64 * 100.0_f64.ln() / sample_count).sqrt();
         assert!(
-            (actual - expected).abs() <= 0.1_f64,
+            (actual - expected).abs() <= tolerance,
             "count {count}: {actual} != {expected}"
         );
     }
     Ok(())
+}
+
+#[test]
+fn parallel_completion_sweep_is_bit_identical_to_serial() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.5_f64, 1.0_f64], &[100.0_f64], &[0.0_f64])?;
+    let mut serial = super::CapacityFactor::new_with_prior(
+        grid.clone(),
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        8.0_f64,
+        1.0_f64,
+        255,
+    )?;
+    let mut parallel = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        4.0_f64,
+        8.0_f64,
+        1.0_f64,
+        255,
+    )?;
+    serial.use_serial_predictive_sweep_for_test();
+    let window = ResourceWindow::new_with_starts(8.0_f64, 1.0_f64, 0, 8)?;
+    let evidence = occupancy_trace_for_test(window, 8, 8, 8_000_000, &[], &[], &[]);
+    let mut serial_cdfs = [0.0_f64; 256];
+    let mut parallel_cdfs = [0.0_f64; 256];
+    serial.write_completion_predictive_cdfs(evidence, 0x7061_7269_7479, &mut serial_cdfs);
+    parallel.write_completion_predictive_cdfs(evidence, 0x7061_7269_7479, &mut parallel_cdfs);
+
+    assert!(
+        serial_cdfs
+            .iter()
+            .zip(parallel_cdfs)
+            .all(|(serial, parallel)| serial.to_bits() == parallel.to_bits())
+    );
+    Ok(())
+}
+
+fn direct_fleet_clock_cdf(
+    grid: &CapacityGrid,
+    cell: usize,
+    initial_busy: u32,
+    exposure_seconds: f64,
+    count: u32,
+) -> f64 {
+    let clock_probability = f64::from(super::SERVICE_CLOCKS.len() as u32).recip();
+    super::SERVICE_CLOCKS
+        .iter()
+        .copied()
+        .map(|clock| match clock {
+            super::ServiceClock::Erlang(shape) => {
+                direct_erlang_fleet_cdf(grid, cell, initial_busy, exposure_seconds, count, shape)
+            }
+            super::ServiceClock::Deterministic => {
+                let mut elapsed = 0.0_f64;
+                let mut completed = 0_u32;
+                while completed < initial_busy {
+                    let busy = initial_busy - completed;
+                    elapsed += super::state_rate(grid, cell, busy as usize).recip();
+                    if elapsed >= exposure_seconds {
+                        break;
+                    }
+                    completed += 1;
+                }
+                if completed <= count { 1.0_f64 } else { 0.0_f64 }
+            }
+        })
+        .sum::<f64>()
+        * clock_probability
+}
+
+fn direct_erlang_fleet_cdf(
+    grid: &CapacityGrid,
+    cell: usize,
+    initial_busy: u32,
+    exposure_seconds: f64,
+    count: u32,
+    shape: u32,
+) -> f64 {
+    let phase_limit = initial_busy.saturating_mul(shape);
+    let absorbed_phase = count
+        .saturating_add(1)
+        .saturating_mul(shape)
+        .min(phase_limit);
+    if absorbed_phase == phase_limit && count >= initial_busy {
+        return 1.0_f64;
+    }
+    let maximum_rate = (0..initial_busy)
+        .map(|completed| {
+            f64::from(shape) * super::state_rate(grid, cell, (initial_busy - completed) as usize)
+        })
+        .fold(0.0_f64, f64::max);
+    let poisson_mean = maximum_rate * exposure_seconds;
+    let mut phase_probabilities = vec![0.0_f64; absorbed_phase as usize + 1];
+    phase_probabilities[0] = 1.0_f64;
+    let mut poisson_probability = (-poisson_mean).exp();
+    let mut result = poisson_probability;
+    for step in 1_u32..=512 {
+        let mut next = vec![0.0_f64; phase_probabilities.len()];
+        for phase in 0..absorbed_phase {
+            let completed = phase / shape;
+            let rate = f64::from(shape)
+                * super::state_rate(grid, cell, (initial_busy - completed) as usize);
+            let advance = rate / maximum_rate;
+            next[phase as usize] += phase_probabilities[phase as usize] * (1.0_f64 - advance);
+            next[phase as usize + 1] += phase_probabilities[phase as usize] * advance;
+        }
+        next[absorbed_phase as usize] += phase_probabilities[absorbed_phase as usize];
+        phase_probabilities = next;
+        poisson_probability *= poisson_mean / f64::from(step);
+        result += poisson_probability * (1.0_f64 - phase_probabilities[absorbed_phase as usize]);
+        if poisson_probability < f64::EPSILON {
+            break;
+        }
+    }
+    result
 }
 
 #[quickcheck]

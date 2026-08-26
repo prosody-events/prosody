@@ -7,7 +7,6 @@ use prosody_scale_core::{DemandClass, RandomStream};
 use rayon::prelude::*;
 use statrs::distribution::{BinomialError, PoissonError};
 use std::collections::VecDeque;
-use std::iter::repeat_n;
 use std::mem;
 use std::num::NonZeroU8;
 use thiserror::Error;
@@ -713,6 +712,13 @@ enum RetryMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OwnerWork {
+    owner: u32,
+    key: u32,
+    running: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AttemptOutcome {
     at_micros: u64,
     result: AttemptResult,
@@ -789,6 +795,14 @@ pub struct Plant<M = SeriesAttemptModel> {
     active_handlers_by_owner: Vec<u32>,
     owner_open_key_counts: Vec<u32>,
     owner_key_counts: Vec<u32>,
+    owner_observed_supplies: Vec<u32>,
+    owner_observed_key_counts: Vec<u32>,
+    owner_observed_active_counts: Vec<u32>,
+    owner_observed_work_labels: Vec<u32>,
+    owner_observed_work: Vec<OwnerWork>,
+    owner_observed_key_owner: Vec<u32>,
+    owner_observed_active_offsets: Vec<usize>,
+    owner_observed_queued_offsets: Vec<usize>,
     assignment_counts: Vec<u32>,
     reconciliation_started_micros: Option<u64>,
     reconciliation_completed_micros: Option<u64>,
@@ -848,51 +862,20 @@ impl<M: AttemptModel> Plant<M> {
         &self.partition_owner
     }
 
-    pub(crate) fn owner_key_counts(&self) -> &[u32] {
-        &self.owner_key_counts
+    pub(crate) fn owner_supplies(&self) -> &[u32] {
+        &self.owner_observed_supplies
     }
 
-    pub(crate) fn write_owner_work_labels(
-        &self,
-        active_counts: &mut Vec<u32>,
-        labels: &mut Vec<u32>,
-    ) {
-        active_counts.clear();
-        labels.clear();
-        active_counts.resize(self.owner_key_counts.len(), 0);
-        for (owner, active_count) in active_counts.iter_mut().enumerate() {
-            for key in 0..self.key_head.len() {
-                let event = self.key_head[key];
-                if event == NO_EVENT
-                    || !matches!(self.attempt_state[event as usize], AttemptState::Running(_))
-                {
-                    continue;
-                }
-                let partition = self.events.partition[event as usize] as usize;
-                if self.partition_owner[partition] as usize == owner {
-                    labels.push(key as u32);
-                    *active_count = active_count.saturating_add(1);
-                }
-            }
-            for key in 0..self.key_head.len() {
-                let event = self.key_head[key];
-                if event == NO_EVENT {
-                    continue;
-                }
-                let partition = self.events.partition[event as usize] as usize;
-                if self.partition_owner[partition] as usize != owner {
-                    continue;
-                }
-                let count = self.outstanding_demand_by_key[key];
-                labels.extend(repeat_n(
-                    key as u32,
-                    count.saturating_sub(u32::from(matches!(
-                        self.attempt_state[event as usize],
-                        AttemptState::Running(_)
-                    ))) as usize,
-                ));
-            }
-        }
+    pub(crate) fn owner_observed_key_counts(&self) -> &[u32] {
+        &self.owner_observed_key_counts
+    }
+
+    pub(crate) fn owner_active_attempt_counts(&self) -> &[u32] {
+        &self.owner_observed_active_counts
+    }
+
+    pub(crate) fn owner_work_labels(&self) -> &[u32] {
+        &self.owner_observed_work_labels
     }
 
     /// Allocates all bounded plant memory with one regime calculation model.
@@ -956,6 +939,14 @@ impl<M: AttemptModel> Plant<M> {
             active_handlers_by_owner: vec![0; partition_count],
             owner_open_key_counts: vec![0; partition_count],
             owner_key_counts: vec![0; partition_count],
+            owner_observed_supplies: vec![0; partition_count],
+            owner_observed_key_counts: vec![0; partition_count],
+            owner_observed_active_counts: vec![0; partition_count],
+            owner_observed_work_labels: Vec::with_capacity(event_count_max),
+            owner_observed_work: Vec::with_capacity(event_count_max),
+            owner_observed_key_owner: vec![0; key_count],
+            owner_observed_active_offsets: vec![0; partition_count],
+            owner_observed_queued_offsets: vec![0; partition_count],
             assignment_counts: vec![0; partition_count],
             reconciliation_started_micros: None,
             reconciliation_completed_micros: None,
@@ -2051,6 +2042,91 @@ impl<M: AttemptModel> Plant<M> {
             .saturating_mul(self.configuration.slots_per_replica)
     }
 
+    /// Emits one owner observation from one attempt-state snapshot.
+    ///
+    /// Supply, active counts, key ceilings, labels, and the demand ceiling
+    /// describe the same attempts. Deferred attempts do not enter the
+    /// observation before they become available. `OwnerCapacity::new` and
+    /// `PlacementCapacity::new` consume this invariant.
+    fn prepare_owner_observation(&mut self) -> u32 {
+        self.owner_observed_supplies.fill(0);
+        self.owner_observed_key_counts.fill(0);
+        self.owner_observed_active_counts.fill(0);
+        self.owner_observed_work_labels.clear();
+        self.owner_observed_work.clear();
+        self.owner_observed_key_owner.fill(0);
+        for key_head in self
+            .key_head
+            .iter()
+            .copied()
+            .filter(|event| *event != NO_EVENT)
+        {
+            let mut event = key_head;
+            while event != NO_EVENT {
+                let event_index = event as usize;
+                event = self.next_by_event[event_index];
+                let running = matches!(self.attempt_state[event_index], AttemptState::Running(_));
+                let observable = running
+                    || matches!(self.attempt_state[event_index], AttemptState::Ready(_))
+                    || (matches!(self.attempt_state[event_index], AttemptState::Pending)
+                        && self.events.release_micros[event_index] <= self.now_micros
+                        && !self.settled_by_event[event_index]);
+                if !observable {
+                    continue;
+                }
+                let partition = self.events.partition[event_index] as usize;
+                let owner = if running {
+                    self.owner_at_dispatch[event_index]
+                } else {
+                    self.partition_owner[partition]
+                };
+                self.owner_observed_work.push(OwnerWork {
+                    owner,
+                    key: self.events.key[event_index],
+                    running,
+                });
+                let owner_index = owner as usize;
+                let key = self.events.key[event_index] as usize;
+                self.owner_observed_supplies[owner_index] =
+                    self.owner_observed_supplies[owner_index].saturating_add(1);
+                self.owner_observed_active_counts[owner_index] = self.owner_observed_active_counts
+                    [owner_index]
+                    .saturating_add(u32::from(running));
+                let owner_marker = owner.saturating_add(1);
+                if self.owner_observed_key_owner[key] != owner_marker {
+                    self.owner_observed_key_owner[key] = owner_marker;
+                    self.owner_observed_key_counts[owner_index] = self.owner_observed_key_counts
+                        [owner_index]
+                        .saturating_add(1)
+                        .min(self.configuration.slots_per_replica);
+                }
+            }
+        }
+        self.owner_observed_work_labels
+            .resize(self.owner_observed_work.len(), 0);
+        let mut owner_start = 0_usize;
+        for owner in 0..self.owner_observed_supplies.len() {
+            self.owner_observed_active_offsets[owner] = owner_start;
+            self.owner_observed_queued_offsets[owner] =
+                owner_start.saturating_add(self.owner_observed_active_counts[owner] as usize);
+            owner_start = owner_start.saturating_add(self.owner_observed_supplies[owner] as usize);
+        }
+        for work in &self.owner_observed_work {
+            let owner = work.owner as usize;
+            let offset = if work.running {
+                &mut self.owner_observed_active_offsets[owner]
+            } else {
+                &mut self.owner_observed_queued_offsets[owner]
+            };
+            self.owner_observed_work_labels[*offset] = work.key;
+            *offset = offset.saturating_add(1);
+        }
+        self.owner_observed_key_counts
+            .iter()
+            .copied()
+            .fold(0_u32, u32::saturating_add)
+    }
+
     #[cfg_attr(feature = "hotpath", hotpath::measure(label = "plant_snapshot"))]
     fn snapshot(&mut self, at_micros: u64) -> PlantSnapshot {
         let mut reconciling_partitions = 0_u32;
@@ -2073,11 +2149,7 @@ impl<M: AttemptModel> Plant<M> {
         )
         .unwrap_or(u32::MAX);
         let physical_slots = self.physical_slot_count();
-        let dispatchable_demand_ceiling = self
-            .owner_key_counts
-            .iter()
-            .copied()
-            .fold(0_u32, u32::saturating_add);
+        let dispatchable_demand_ceiling = self.prepare_owner_observation();
         PlantSnapshot {
             at_micros,
             replicas: self.replicas,

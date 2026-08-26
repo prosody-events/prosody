@@ -32,6 +32,10 @@ pub struct TickContext<'a> {
     pub attempt_transitions: &'a [crate::AttemptTransition],
     /// Active attempt counts for each owner at this time.
     pub owner_active_attempt_counts: &'a [u32],
+    /// Observable attempt supply for each owner at this time.
+    pub owner_supplies: &'a [u32],
+    /// Observable dispatchable key count for each owner at this time.
+    pub owner_key_counts: &'a [u32],
     /// Key labels for all active and queued attempts at this time.
     pub owner_work_labels: &'a [u32],
 }
@@ -879,8 +883,6 @@ pub struct SimulationHarness<Graph, Model = DefaultTickAttemptModel> {
     partition_normal_oldest_release_micros: Vec<u64>,
     partition_failure_backlog: Vec<u32>,
     partition_failure_release_micros: Vec<u64>,
-    owner_active_attempt_counts: Vec<u32>,
-    owner_work_labels: Vec<u32>,
 }
 
 impl<Graph: TickGenerator> SimulationHarness<Graph, DefaultTickAttemptModel> {
@@ -949,8 +951,6 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             partition_normal_oldest_release_micros: vec![0; partition_capacity],
             partition_failure_backlog: vec![0; partition_capacity],
             partition_failure_release_micros: vec![0; partition_capacity],
-            owner_active_attempt_counts: Vec::with_capacity(partition_capacity),
-            owner_work_labels: Vec::new(),
         })
     }
 
@@ -986,6 +986,8 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
                 completed_settlements: self.plant.completed_settlements(),
                 attempt_transitions: self.plant.attempt_transitions(),
                 owner_active_attempt_counts: &[],
+                owner_supplies: &[],
+                owner_key_counts: &[],
                 owner_work_labels: &[],
             },
             self.published_replicas,
@@ -1019,6 +1021,8 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             completed_settlements: self.plant.completed_settlements(),
             attempt_transitions: &[],
             owner_active_attempt_counts: &[],
+            owner_supplies: &[],
+            owner_key_counts: &[],
             owner_work_labels: &[],
         };
         let inputs = self.graph.calculate(schedule_context)?;
@@ -1040,6 +1044,8 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             completed_settlements: &[],
             attempt_transitions: &[],
             owner_active_attempt_counts: &[],
+            owner_supplies: &[],
+            owner_key_counts: &[],
             owner_work_labels: &[],
         };
         let mut event_sink = EventSink {
@@ -1058,10 +1064,6 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             &mut self.partition_failure_backlog,
             &mut self.partition_failure_release_micros,
         )?;
-        self.plant.write_owner_work_labels(
-            &mut self.owner_active_attempt_counts,
-            &mut self.owner_work_labels,
-        );
         let observed_inputs = self.graph.observe(
             TickContext {
                 now_micros,
@@ -1079,8 +1081,10 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
                 },
                 completed_settlements: self.plant.completed_settlements(),
                 attempt_transitions: self.plant.attempt_transitions(),
-                owner_active_attempt_counts: &self.owner_active_attempt_counts,
-                owner_work_labels: &self.owner_work_labels,
+                owner_active_attempt_counts: self.plant.owner_active_attempt_counts(),
+                owner_supplies: self.plant.owner_supplies(),
+                owner_key_counts: self.plant.owner_observed_key_counts(),
+                owner_work_labels: self.plant.owner_work_labels(),
             },
             inputs,
         )?;
@@ -1094,7 +1098,7 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             observed_inputs,
             &self.partition_normal_backlog,
             self.plant.partition_owners(),
-            self.plant.owner_key_counts(),
+            self.plant.owner_observed_key_counts(),
         );
         self.tick_index = self.tick_index.saturating_add(1);
         Ok(after)

@@ -1462,12 +1462,14 @@ pub struct ClosedLoop<Workload> {
     observation: ObservationBuffer,
     arrival_counts: Vec<u32>,
     generated_counts: Vec<u32>,
-    owner_supply_scratch: Vec<u32>,
     owner_arrival_offset_scratch: Vec<u64>,
     owner_arrival_owner_scratch: Vec<u32>,
     owner_arrival_key_scratch: Vec<u32>,
+    previous_owner_supplies: Vec<u32>,
+    previous_owner_key_counts: Vec<u32>,
     previous_owner_active_attempt_counts: Vec<u32>,
     previous_owner_work_labels: Vec<u32>,
+    previous_dispatchable_demand_ceiling: u32,
     live_attempt_start_scratch: Vec<u64>,
     initial_live_age_scratch: Vec<u64>,
     final_live_age_scratch: Vec<u64>,
@@ -1760,12 +1762,14 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             observation,
             arrival_counts: vec![0; partition_count],
             generated_counts: vec![0; partition_count],
-            owner_supply_scratch: Vec::with_capacity(owner_count_max),
             owner_arrival_offset_scratch: Vec::with_capacity(resource_attempt_count_max),
             owner_arrival_owner_scratch: Vec::with_capacity(resource_attempt_count_max),
             owner_arrival_key_scratch: Vec::with_capacity(resource_attempt_count_max),
+            previous_owner_supplies: Vec::with_capacity(owner_count_max),
+            previous_owner_key_counts: Vec::with_capacity(owner_count_max),
             previous_owner_active_attempt_counts: Vec::with_capacity(owner_count_max),
             previous_owner_work_labels: Vec::with_capacity(resource_attempt_count_max),
+            previous_dispatchable_demand_ceiling: 0,
             live_attempt_start_scratch: Vec::with_capacity(resource_attempt_count_max),
             initial_live_age_scratch: Vec::with_capacity(resource_attempt_count_max),
             final_live_age_scratch: Vec::with_capacity(resource_attempt_count_max),
@@ -2217,57 +2221,6 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
     /// A tie clamps to offset zero or to the full exposure. Only a window
     /// that spans exactly one report interval is a certified report; a tick
     /// at any other spacing omits the observation.
-    #[cfg_attr(
-        feature = "hotpath",
-        hotpath::measure(label = "prepare_capacity_evidence")
-    )]
-    fn prepare_owner_supplies(
-        &mut self,
-        context: &TickContext<'_>,
-        slot_count: u32,
-    ) -> Result<(), PlantError> {
-        let backlog = context
-            .history
-            .partition_normal_backlog(0)
-            .ok_or(PlantError::MetricCapacity)?;
-        let owners = context
-            .history
-            .partition_owners(0)
-            .ok_or(PlantError::MetricCapacity)?;
-        // The owner set covers every owner present in the window's evidence:
-        // the current assignment, the report-start assignment, the arrival
-        // owners, and the physical fleet. An owner with no queue has zero
-        // completion intensity, so extra owners keep the predictive exact.
-        let assigned = context
-            .partition_owners
-            .iter()
-            .chain(owners.iter())
-            .chain(self.owner_arrival_owner_scratch.iter())
-            .copied()
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        let physical = slot_count
-            .div_ceil(self.configuration.core().slots_per_replica)
-            .max(1);
-        let owner_count =
-            usize::try_from(assigned.max(physical)).map_err(|_| PlantError::PlatformLimit)?;
-        self.owner_supply_scratch.clear();
-        self.owner_supply_scratch.resize(owner_count, 0);
-        for (partition, &count) in backlog.iter().enumerate() {
-            let owner = owners
-                .get(partition)
-                .copied()
-                .ok_or(PlantError::PartitionIndex)? as usize;
-            let supply = self
-                .owner_supply_scratch
-                .get_mut(owner)
-                .ok_or(PlantError::MetricCapacity)?;
-            *supply = supply.saturating_add(count);
-        }
-        Ok(())
-    }
-
     fn prepare_owner_arrivals(
         &mut self,
         transitions: &[AttemptTransition],
@@ -2352,10 +2305,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         };
         let initial_available_attempts = context.history.available_attempts(0).unwrap_or(0);
         let slot_count = context.history.physical_slots(0).unwrap_or(0);
-        let dispatchable_demand_ceiling = context
-            .history
-            .dispatchable_demand_ceiling(0)
-            .unwrap_or(slot_count);
+        let dispatchable_demand_ceiling = self.previous_dispatchable_demand_ceiling;
         if initial_busy_slots > slot_count || dispatchable_demand_ceiling > slot_count {
             return Ok(());
         }
@@ -2373,16 +2323,9 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             exposure_micros,
         )?;
         self.prepare_owner_arrivals(window_transitions, previous_micros, exposure_micros);
-        self.prepare_owner_supplies(context, slot_count)?;
-        let owner_initial_key_counts = context
-            .history
-            .owner_key_counts(0)
-            .and_then(|counts| counts.get(..self.owner_supply_scratch.len()))
-            .ok_or(PlantError::MetricCapacity)?;
-        let owner_initial_active_attempt_counts = self
-            .previous_owner_active_attempt_counts
-            .get(..self.owner_supply_scratch.len())
-            .ok_or(PlantError::MetricCapacity)?;
+        let owner_initial_key_counts = &self.previous_owner_key_counts;
+        let owner_initial_active_attempt_counts =
+            self.previous_owner_active_attempt_counts.as_slice();
         bucket_window_transitions(
             window_transitions,
             previous_micros,
@@ -2404,7 +2347,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
                 DispatchCapacity::new(slot_count, dispatchable_demand_ceiling)?,
                 OwnerCapacity::new(
                     self.configuration.core().slots_per_replica,
-                    &self.owner_supply_scratch,
+                    &self.previous_owner_supplies,
                     owner_initial_key_counts,
                     owner_initial_active_attempt_counts,
                     &self.previous_owner_work_labels,
@@ -3342,12 +3285,19 @@ impl<Workload: TickGenerator> TickGenerator for ClosedLoop<Workload> {
             &scheduled_releases,
         )?;
         let result = self.apply_decision(&context, inputs, reporter);
+        self.previous_owner_supplies.clear();
+        self.previous_owner_supplies
+            .extend_from_slice(context.owner_supplies);
+        self.previous_owner_key_counts.clear();
+        self.previous_owner_key_counts
+            .extend_from_slice(context.owner_key_counts);
         self.previous_owner_active_attempt_counts.clear();
         self.previous_owner_active_attempt_counts
             .extend_from_slice(context.owner_active_attempt_counts);
         self.previous_owner_work_labels.clear();
         self.previous_owner_work_labels
             .extend_from_slice(context.owner_work_labels);
+        self.previous_dispatchable_demand_ceiling = context.plant.dispatchable_demand_ceiling;
         result
     }
 

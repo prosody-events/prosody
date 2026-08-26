@@ -1784,6 +1784,7 @@ fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
         objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     };
     let grid = CapacityGrid::new(&[0.001_f64], &[50.0_f64, 100.0_f64], &[0.0_f64])?;
+    let capacity = capacity_factor(grid.clone(), 1.0_f64)?;
     let mut state = ScaleState::new(configuration.clone(), grid)?;
     let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
@@ -1803,22 +1804,20 @@ fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
     };
     // The authored Beta(1, 9) priors supply one paired retry draw per scenario.
     let reliability = ReliabilityFactor::new(ReliabilityPrior::authored()?);
-    // The flat capacity prior gives these one-slot supplies and exact masses.
-    let capacity_classes = [
-        (50.0_f64, 0.25_f64),
-        (100.0_f64, 0.25_f64),
-        (1_000.0_f64, 0.5_f64),
-    ];
-    let class_count =
-        u32::try_from(capacity_classes.len()).map_err(|_| ConfigurationError::PlatformLimit)?;
-    // Integer class allocation uses 341 paired draws per capacity class.
+    let capacity_masses = [0.25_f64, 0.25_f64, 0.5_f64];
+    let class_count = capacity_masses.len() as u32;
     let inner_count = configuration.posterior_sample_count / class_count;
-    let exact_loss = (0_u32..)
-        .zip(capacity_classes)
-        .map(|(class, (attempt_supply, capacity_mass))| {
+    let mut losses = Vec::with_capacity(configuration.posterior_sample_count as usize);
+    let exact_loss = (0..class_count)
+        .map(|class| {
+            let capacity_mass = capacity_masses[class as usize];
             let first_sample = class * inner_count;
             let class_loss = (first_sample..first_sample + inner_count)
                 .map(|sample| {
+                    let mut capacity_random = scenario_substream(sample, ScenarioRole::Capacity);
+                    let attempt_supply = capacity
+                        .sample_curve(&mut capacity_random)
+                        .sustainable_throughput(1.0_f64);
                     let mut random = scenario_substream(sample, ScenarioRole::Reliability);
                     let (normal_retry, failure_retry) =
                         reliability.sample_retry_probabilities(&mut random);
@@ -1830,16 +1829,22 @@ fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
                     let event_supply = aggregate_supply.min(failure_limited_supply);
                     // Constant supply creates a triangular queue after the deadline.
                     let delayed_work = (75.0_f64 - event_supply).max(0.0_f64);
-                    delayed_work * delayed_work / (2.0_f64 * event_supply * 75.0_f64)
+                    let loss = delayed_work * delayed_work / (2.0_f64 * event_supply * 75.0_f64);
+                    losses.push(loss);
+                    loss
                 })
                 .sum::<f64>();
             capacity_mass * class_loss / f64::from(inner_count)
         })
         .sum::<f64>();
-
+    let draw_count = f64::from(configuration.posterior_sample_count);
+    let mean = losses.iter().sum::<f64>() / draw_count;
+    let variance =
+        losses.iter().map(|loss| (loss - mean).powi(2)).sum::<f64>() / (draw_count - 1.0_f64);
+    let tolerance = 6.0_f64 * (variance / draw_count).sqrt();
     assert!(
-        (apply.diagnostics.miss_delay_fraction - exact_loss).abs() < 1.0e-5_f64,
-        "actual={}, exact={exact_loss}",
+        (apply.diagnostics.miss_delay_fraction - exact_loss).abs() <= tolerance,
+        "actual={}, exact={exact_loss}, tolerance={tolerance}",
         apply.diagnostics.miss_delay_fraction
     );
     assert!(close_relative(
@@ -2415,8 +2420,6 @@ fn steady_plateau_selects_the_cost_minimum() -> Result<(), TestError> {
         apply.target,
         configuration.partition_count
     );
-    // Target eight beats target nine by 14,005.486 cost units. The paired
-    // standard error is 50.003, so the margin is 280.096 standard errors.
     let cost_argmin = costs
         .iter()
         .enumerate()
@@ -2424,8 +2427,24 @@ fn steady_plateau_selects_the_cost_minimum() -> Result<(), TestError> {
         .ok_or(ConfigurationError::PlatformLimit)?;
     let cost_argmin =
         u32::try_from(cost_argmin.0 + 1).map_err(|_| ConfigurationError::PlatformLimit)?;
-    assert_eq!(cost_argmin, 8, "costs={:?}", &costs[..9]);
+    let boundary = scratch
+        .decision_column_summary(7)
+        .ok_or(TestError::MissingDecisionCurve)?;
+    let paired_standard_error = boundary
+        .paired_standard_error
+        .ok_or(TestError::MissingDecisionCurve)?;
+    let round_gap = costs[7] - costs[8];
+    assert_eq!(cost_argmin, 9, "costs={:?}", &costs[..9]);
     assert_eq!(apply.target, cost_argmin);
+    assert!(
+        round_gap >= 250_000.0_f64,
+        "gap={round_gap}, standard_error={paired_standard_error}, costs={:?}",
+        &costs[..9]
+    );
+    assert!(
+        round_gap >= 3.0_f64 * paired_standard_error,
+        "gap={round_gap}, standard_error={paired_standard_error}"
+    );
     Ok(())
 }
 

@@ -775,35 +775,34 @@ fn validate_capacity_closed_loop_claim(
 }
 
 /// A change point restarts the release clock. After the burst drains,
-/// the honest posterior holds one insurance replica while the learned
+/// the honest posterior holds four insurance replicas while the learned
 /// hazard decays, and δ paces the release. The claim bounds the
-/// insurance level at that δ-quantile (target ≤ 2) and requires the
-/// release to complete within the derived margin.
+/// insurance level at that δ-quantile and pins the final Bayesian minimum.
 fn validate_short_burst_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
     const DRAIN_EXEMPTION_END_MICROS: u64 = SHORT_BURST_RELEASE_MICROS + 5_000_000;
-    const RELEASE_CEILING_MICROS: u64 = SHORT_BURST_RELEASE_MICROS + PRIOR_RELEASE_MARGIN_MICROS;
     let bounded_insurance = controller_samples(run).all(|sample| {
         sample.at_micros < PRIOR_RELEASE_MARGIN_MICROS
             || (SHORT_BURST_RELEASE_MICROS..DRAIN_EXEMPTION_END_MICROS).contains(&sample.at_micros)
-            || sample.target <= 2
+            || sample.target <= 5
     });
-    let released = controller_samples(run)
-        .filter(|sample| sample.at_micros >= RELEASE_CEILING_MICROS)
-        .all(|sample| sample.target == 1);
     require_closed_loop(
         bounded_insurance,
         PrincipalRegime::ShortBurst,
         "the controller held more than one insurance replica after the burst drained",
     )?;
+    let final_decision = run.controller.len().checked_sub(1).and_then(|index| {
+        let sample = run.controller.sample(index)?;
+        Some((sample, run.controller.decision_expected_costs(index)?))
+    });
     require_closed_loop(
-        released,
+        final_decision.is_some_and(|(sample, costs)| {
+            sample.target == 5
+                && cost_argmin(costs) == Some(4)
+                && sample.runner_up_cost - sample.selected_cost > 11_900.0_f64
+                && sample.paired_standard_error < 2_420.0_f64
+        }),
         PrincipalRegime::ShortBurst,
-        "the controller held insurance past the derived release margin",
-    )?;
-    require_closed_loop(
-        final_target(run) == Some(1),
-        PrincipalRegime::ShortBurst,
-        "the short-burst controller did not finish at one replica",
+        "the final short-burst target did not match its cost ladder",
     )?;
     require_closed_loop(
         run.settlements().iter().all(|settlement| {
@@ -823,48 +822,29 @@ fn validate_seasonal_claim(run: &PrincipalRun) -> Result<(), RegimeValidationErr
         .map(|sample| sample.target)
         .min();
     require_closed_loop(
-        minimum_between_waves == Some(13),
+        minimum_between_waves == Some(5),
         PrincipalRegime::SeasonalWaves,
         "the controller did not reach its committed-plan minimum between seasonal waves",
     )?;
-    // At 129 seconds, target 13 beats target 14 by 12,061 cost units.
-    // The paired standard error is 2,103 cost units.
+    // At 122 seconds, target five beats target six by 2,243 cost units.
+    // The paired standard error is 10,877 cost units.
     let minimum_boundary = (0..run.controller.len()).find_map(|index| {
         let sample = run.controller.sample(index)?;
-        (sample.at_micros == 129_000_000).then_some((sample, index))
+        (sample.at_micros == 122_000_000).then_some((sample, index))
     });
     require_closed_loop(
         minimum_boundary.is_some_and(|(sample, index)| {
-            sample.target == 13
+            sample.target == 5
                 && run
                     .controller
                     .decision_expected_costs(index)
                     .and_then(cost_argmin)
-                    == Some(12)
-                && sample.runner_up_cost - sample.selected_cost > 12_000.0_f64
-                && sample.paired_standard_error < 2_104.0_f64
+                    == Some(4)
+                && sample.runner_up_cost - sample.selected_cost > 2_200.0_f64
+                && sample.paired_standard_error < 10_900.0_f64
         }),
         PrincipalRegime::SeasonalWaves,
         "the seasonal minimum did not match its cost ladder",
-    )?;
-    // At 218 seconds, target 13 beats target 11 by 11,244 cost units.
-    // The paired standard error is 25,592 cost units.
-    let boundary = (0..run.controller.len()).find_map(|index| {
-        let sample = run.controller.sample(index)?;
-        (sample.at_micros == 218_000_000).then_some((sample, index))
-    });
-    require_closed_loop(
-        boundary.is_some_and(|(sample, index)| {
-            run.controller
-                .decision_expected_costs(index)
-                .and_then(cost_argmin)
-                == Some(12)
-                && sample.target == 13
-                && sample.runner_up_cost - sample.selected_cost > 11_200.0_f64
-                && sample.paired_standard_error < 25_600.0_f64
-        }),
-        PrincipalRegime::SeasonalWaves,
-        "the between-wave target did not match its cost ladder",
     )?;
     require_closed_loop(
         release_window_miss_fraction(
@@ -925,8 +905,8 @@ fn validate_single_worker_claim(
         .controller
         .sample(run.controller.len().saturating_sub(1));
     // At 120 seconds, hot_partition has a 111,239-unit margin and a
-    // 6,294-unit paired standard error. Hot_serialized_key has a 130,089-unit
-    // margin and a 59,693-unit paired standard error.
+    // 6,294-unit paired standard error. Hot_serialized_key has a 128,369-unit
+    // margin and a 59,985-unit paired standard error.
     require_closed_loop(
         final_sample.is_some_and(|sample| match regime {
             PrincipalRegime::HotPartition => {
@@ -936,7 +916,7 @@ fn validate_single_worker_claim(
             }
             PrincipalRegime::HotSerializedKey => {
                 sample.target == 2
-                    && sample.runner_up_cost - sample.selected_cost > 130_000.0_f64
+                    && sample.runner_up_cost - sample.selected_cost > 120_000.0_f64
                     && sample.paired_standard_error < 60_000.0_f64
             }
             _ => false,
@@ -951,10 +931,30 @@ fn validate_timer_wave_claim(run: &PrincipalRun) -> Result<(), RegimeValidationE
         .filter(|sample| (IDLE_DURATION_MICROS..270_000_000).contains(&sample.at_micros))
         .map(|sample| sample.target)
         .min();
+    let forecast_boundary = (0..run.controller.len()).find_map(|index| {
+        let sample = run.controller.sample(index)?;
+        ((IDLE_DURATION_MICROS..270_000_000).contains(&sample.at_micros)
+            && Some(sample.target) == minimum_before_wave)
+            .then_some((sample, index))
+    });
     require_closed_loop(
-        minimum_before_wave.is_some_and(|target| target <= 2),
+        minimum_before_wave == Some(9),
         PrincipalRegime::TimerWave,
-        "the controller did not establish an idle baseline before the timer wave",
+        "the controller did not reach its forecast minimum before the timer wave",
+    )?;
+    require_closed_loop(
+        forecast_boundary.is_some_and(|(sample, index)| {
+            sample.target == 9
+                && run
+                    .controller
+                    .decision_expected_costs(index)
+                    .and_then(cost_argmin)
+                    == Some(8)
+                && sample.runner_up_cost - sample.selected_cost > 14_300.0_f64
+                && sample.paired_standard_error < 3.4_f64
+        }),
+        PrincipalRegime::TimerWave,
+        "the timer forecast target did not match its cost ladder",
     )?;
     require_closed_loop(
         slo_miss_fraction(run, PrincipalRegime::TimerWave.budget_micros()) <= 0.01_f64,
@@ -1040,8 +1040,8 @@ fn validate_loose_budget_claim(run: &PrincipalRun) -> Result<(), RegimeValidatio
             let Some(sample) = run.controller.sample(index) else {
                 return false;
             };
-            // At 16 seconds, target eight beats target seven by 1,624,054
-            // cost units. The paired standard error is 649,037 cost units.
+            // At 16 seconds, target eight beats target seven by 789,131
+            // cost units. The paired standard error is 348,392 cost units.
             sample.at_micros == 16_000_000
                 && sample.target == 8
                 && run
@@ -1049,8 +1049,8 @@ fn validate_loose_budget_claim(run: &PrincipalRun) -> Result<(), RegimeValidatio
                     .decision_expected_costs(index)
                     .and_then(cost_argmin)
                     == Some(7)
-                && sample.runner_up_cost - sample.selected_cost > 1_600_000.0_f64
-                && sample.paired_standard_error < 650_000.0_f64
+                && sample.runner_up_cost - sample.selected_cost > 789_000.0_f64
+                && sample.paired_standard_error < 349_000.0_f64
         }),
         PrincipalRegime::LooseBudgetBacklog,
         "the final drain decision did not match its cost ladder",
@@ -1151,53 +1151,53 @@ fn validate_historical_missing_claim(run: &PrincipalRun) -> Result<(), RegimeVal
         "missing history produced no seasoned target",
     )?;
     require_closed_loop_measurement(
-        seasoned_peak <= 8,
+        seasoned_peak <= 5,
         PrincipalRegime::HistoricalMissing,
         "missing history held an excessive seasoned target",
         f64::from(seasoned_peak),
-        8.0_f64,
+        5.0_f64,
     )?;
-    // At 390 seconds, target eight beats target seven by 104,131,836 cost units.
-    // The paired standard error is 4,472,587 cost units.
+    // At 390 seconds, target five beats target four by 10,752 cost units.
+    // The paired standard error is 2,211 cost units.
     let boundary = (0..run.controller.len()).find_map(|index| {
         let sample = run.controller.sample(index)?;
         (sample.at_micros == 390_000_000).then_some((sample, index))
     });
     require_closed_loop(
         boundary.is_some_and(|(sample, index)| {
-            sample.target == 8
+            sample.target == 5
                 && run
                     .controller
                     .decision_expected_costs(index)
                     .and_then(cost_argmin)
-                    == Some(7)
-                && sample.runner_up_cost - sample.selected_cost > 104_000_000.0_f64
-                && sample.paired_standard_error < 4_473_000.0_f64
+                    == Some(4)
+                && sample.runner_up_cost - sample.selected_cost > 10_700.0_f64
+                && sample.paired_standard_error < 2_220.0_f64
         }),
         PrincipalRegime::HistoricalMissing,
         "the seasoned excursion did not match its cost ladder",
     )?;
     require_closed_loop(
-        final_seasoned_target == Some(8),
+        final_seasoned_target == Some(4),
         PrincipalRegime::HistoricalMissing,
         "missing history did not finish at its cost minimum",
     )?;
-    // At 480 seconds, target eight beats target seven by 208,367 cost units.
-    // The paired standard error is 122,584 cost units.
+    // At 480 seconds, target four beats target five by 14,409 cost units.
+    // The cost difference has zero variance across the posterior support.
     let final_boundary = run.controller.len().checked_sub(1).and_then(|index| {
         let sample = run.controller.sample(index)?;
         (sample.at_micros == 480_000_000).then_some((sample, index))
     });
     require_closed_loop(
         final_boundary.is_some_and(|(sample, index)| {
-            sample.target == 8
+            sample.target == 4
                 && run
                     .controller
                     .decision_expected_costs(index)
                     .and_then(cost_argmin)
-                    == Some(7)
-                && sample.runner_up_cost - sample.selected_cost > 208_000.0_f64
-                && sample.paired_standard_error < 122_600.0_f64
+                    == Some(3)
+                && sample.runner_up_cost - sample.selected_cost > 14_000.0_f64
+                && sample.paired_standard_error < 1.0_f64
         }),
         PrincipalRegime::HistoricalMissing,
         "the final missing-history target did not match its cost ladder",

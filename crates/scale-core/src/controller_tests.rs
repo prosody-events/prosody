@@ -10,8 +10,8 @@ use super::{
     billing_replica_seconds, instantaneous_owner_supply, max_owner_share, numerical_decision,
     placement_supply, plant_target_assignment, prepare_work_cohorts,
     sample_hypothetical_transition_times, sample_transition_hypotheses, sample_transition_times,
-    scenario_event_count, scenario_horizons, scenario_random, select_target,
-    terminal_replica_seconds,
+    scenario_capacity_curve, scenario_event_count, scenario_horizons, scenario_random,
+    select_target, terminal_replica_seconds,
 };
 use crate::CapacityCurve;
 use crate::edf::{
@@ -1133,13 +1133,22 @@ fn idle_ladder_step(
     sample_count: u32,
     alternating_calendar: bool,
 ) -> Result<(ScaleState, ScaleScratch), TestError> {
-    idle_ladder_step_with_commitment(sample_count, alternating_calendar, true)
+    idle_ladder_step_with_commitment(sample_count, alternating_calendar, true, 1)
+}
+
+fn idle_ladder_step_with_target(
+    sample_count: u32,
+    alternating_calendar: bool,
+    pending_target: u32,
+) -> Result<(ScaleState, ScaleScratch), TestError> {
+    idle_ladder_step_with_commitment(sample_count, alternating_calendar, true, pending_target)
 }
 
 fn idle_ladder_step_with_commitment(
     sample_count: u32,
     alternating_calendar: bool,
     include_commitment: bool,
+    pending_target: u32,
 ) -> Result<(ScaleState, ScaleScratch), TestError> {
     let mut configuration = test_configuration()?;
     configuration.partition_count = 64;
@@ -1174,12 +1183,12 @@ fn idle_ladder_step_with_commitment(
     let commitment = if alternating_calendar {
         ActuationCommitment::rebalancing(
             8,
-            4,
+            pending_target,
             ModelTime::from_micros(238_000_000),
             ModelTime::from_micros(239_000_000),
         )?
     } else {
-        ActuationCommitment::launching(8, 1, ModelTime::from_micros(239_000_000))?
+        ActuationCommitment::launching(8, pending_target, ModelTime::from_micros(239_000_000))?
     };
     if include_commitment {
         observation.push_actuation_commitment(commitment)?;
@@ -1202,6 +1211,62 @@ fn idle_pending_descent_cost_ladder_selects_one() -> Result<(), TestError> {
     // the signed fence lifetime and a fresh retarget cost.
     assert_eq!(argmin(&costs), 0, "costs={costs:?}");
     assert!(costs[7] > costs[0], "costs={costs:?}");
+    Ok(())
+}
+
+#[test]
+fn bidirectional_retarget_projects_a_fresh_transition() -> Result<(), TestError> {
+    let (_, scratch) = idle_ladder_step_with_target(4_096, true, 6)?;
+    let workspace = &scratch.scenario_workspaces[0];
+
+    let stay_first = workspace.trajectory_offsets[5] as usize;
+    let stay_last = workspace.trajectory_offsets[6] as usize;
+    assert!(
+        (stay_first..stay_last)
+            .all(|event| { workspace.trajectory.kinds[event] != TrajectoryEventKind::Transition })
+    );
+
+    let retarget_first = workspace.trajectory_offsets[6] as usize;
+    let retarget_last = workspace.trajectory_offsets[7] as usize;
+    let retarget = (retarget_first..retarget_last)
+        .find(|&event| workspace.trajectory.kinds[event] == TrajectoryEventKind::Transition)
+        .ok_or(TestError::UnexpectedDecision)?;
+    assert_eq!(workspace.trajectory.targets[retarget], 7);
+    assert!(
+        workspace.trajectory.ready_micros[retarget] > workspace.trajectory.pause_micros[retarget]
+    );
+    assert!(
+        workspace.trajectory.during_supply[retarget] < workspace.trajectory.after_supply[retarget]
+    );
+    let mut cohorts = SlotSecondCohorts::new(1);
+    cohorts.push_values(
+        workspace.trajectory.pause_micros[retarget],
+        workspace.trajectory.pause_micros[retarget].saturating_add(1_000_000),
+        10.0_f64,
+        0,
+    );
+    let mut edf = EdfScratch::new(1)?;
+    prepare(&cohorts, &mut edf);
+    let no_arrivals = ArrivalPath {
+        start_seconds: 0.0_f64,
+        end_seconds: &[f64::MAX],
+        rates: &[0.0_f64],
+    };
+    let loss = super::fresh_transition_late_area(
+        &cohorts,
+        &mut edf,
+        10.0_f64,
+        EvaluationWindow {
+            start_micros: 240_000_000,
+            horizon_micros: workspace.trajectory.ready_micros[retarget].saturating_add(2_000_000),
+            initial_debt_work: 0.0_f64,
+            deadline_budget_micros: 1_000_000,
+        },
+        &no_arrivals,
+        workspace.trajectory.pause_micros[retarget],
+        workspace.trajectory.ready_micros[retarget],
+    );
+    assert!(loss > 0.0_f64, "loss={loss}");
     Ok(())
 }
 
@@ -1595,6 +1660,39 @@ fn curve_class_columns_equal_cell_columns_with_rolled_masses() -> Result<(), Tes
     }
 
     assert!(approximately_equal(class_column, cell_column));
+    Ok(())
+}
+
+#[test]
+fn scenario_supply_preserves_joint_capacity_spread_and_target_pairing() -> Result<(), TestError> {
+    let configuration = test_configuration()?;
+    let grid = CapacityGrid::new(&[0.05_f64, 0.2_f64], &[1_000.0_f64], &[0.0_f64])?;
+    let mut state = ScaleState::new(configuration, grid)?;
+    for cell in 0..state.capacity.curve_posterior_value_count() as usize {
+        let rate = state
+            .capacity
+            .curve_and_probability(cell)
+            .0
+            .service_time_seconds()
+            .recip();
+        state
+            .capacity
+            .set_duration_draw_for_test(cell, rate.ln(), 16.0_f64);
+    }
+    let mut distinct = false;
+    let mut previous = None;
+    for scenario in 0..64_u32 {
+        let curve = scenario_capacity_curve(&state, 0, scenario);
+        let one_replica = curve.sustainable_throughput(1.0_f64);
+        for _target in 1..=state.configuration.replica_count_max {
+            assert_eq!(scenario_capacity_curve(&state, 0, scenario), curve);
+        }
+        if previous.is_some_and(|value| !approximately_equal(value, one_replica)) {
+            distinct = true;
+        }
+        previous = Some(one_replica);
+    }
+    assert!(distinct, "scenario supplies must preserve posterior spread");
     Ok(())
 }
 

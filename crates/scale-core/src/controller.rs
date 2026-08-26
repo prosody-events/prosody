@@ -71,6 +71,7 @@ pub(crate) enum ScenarioRole {
     Placement = 0x706c_6163_656d_656e,
     Commitment = 0x636f_6d6d_6974_6d65,
     Arrival = 0x6172_7269_7661_6c73,
+    Capacity = 0x6361_7061_6369_7479,
 }
 
 /// Fixed curve classes and their capacity-cell members.
@@ -131,6 +132,7 @@ impl CapacityClasses {
         self.representatives.len()
     }
 
+    #[cfg(test)]
     fn representative(&self, class: usize) -> usize {
         self.representatives[class]
     }
@@ -668,6 +670,7 @@ struct TrajectoryColumns {
     ready_boundaries: Vec<u64>,
     during_supply: Vec<f64>,
     after_supply: Vec<f64>,
+    moved_share: Vec<f64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -676,12 +679,6 @@ enum TrajectoryEventKind {
     FencedCommitment,
     FenceClosure,
     Transition,
-}
-
-impl TrajectoryEventKind {
-    const fn is_fixed(self) -> bool {
-        !matches!(self, Self::Transition)
-    }
 }
 
 struct ActiveTransition {
@@ -936,6 +933,7 @@ impl TrajectoryColumns {
             ready_boundaries: Vec::with_capacity(capacity),
             during_supply: Vec::with_capacity(capacity),
             after_supply: Vec::with_capacity(capacity),
+            moved_share: Vec::with_capacity(capacity),
         }
     }
 }
@@ -1528,8 +1526,7 @@ fn prepare_scenario_supply(
 ) -> (CapacityCurve, f64, f64) {
     let capacity_class = scenario / shared.inner_count;
     let sample = scenario as u32;
-    let representative = state.capacity_classes.representative(capacity_class);
-    let (curve, _) = state.capacity.curve_and_probability(representative);
+    let curve = scenario_capacity_curve(state, capacity_class, sample);
     let mut reliability_random = scenario_substream(sample, ScenarioRole::Reliability);
     let (normal_retry, failure_retry) = state
         .reliability
@@ -1572,6 +1569,15 @@ fn prepare_scenario_supply(
         );
     }
     (curve, event_supply_factor, current_supply)
+}
+
+fn scenario_capacity_curve(
+    state: &ScaleState,
+    _capacity_class: usize,
+    scenario: u32,
+) -> CapacityCurve {
+    let mut random = scenario_substream(scenario, ScenarioRole::Capacity);
+    state.capacity.sample_curve(&mut random)
 }
 
 /// Evaluates one scenario's prepared trajectories into decision cells.
@@ -2148,7 +2154,7 @@ fn prepare_candidate_trajectories(
             .assignment
             .copy_from_slice(shared.current_partition_owners);
         let candidate = candidate_index as u32 + 1;
-        let (first, committed_replicas) = push_candidate_events(
+        let (first, _committed_replicas) = push_candidate_events(
             state,
             workspace,
             shared.actuation_commitments,
@@ -2169,13 +2175,6 @@ fn prepare_candidate_trajectories(
             write: first,
         };
         for read in first..workspace.trajectory.targets.len() {
-            let target = workspace.trajectory.targets[read];
-            if !workspace.trajectory.kinds[read].is_fixed()
-                && ((candidate > committed_replicas && target <= active.replicas)
-                    || (candidate < committed_replicas && target >= active.replicas))
-            {
-                continue;
-            }
             write_trajectory_event(
                 state,
                 shared,
@@ -2201,6 +2200,7 @@ fn prepare_candidate_trajectories(
             .truncate(active.write);
         workspace.trajectory.during_supply.truncate(active.write);
         workspace.trajectory.after_supply.truncate(active.write);
+        workspace.trajectory.moved_share.truncate(active.write);
         // The plan space contains one target for the full horizon. It cannot
         // express a later target. The sampled arrival path carries each
         // forecast into the late-area calculation.
@@ -2249,6 +2249,7 @@ fn write_trajectory_event(
         workspace.trajectory.billing_ready_micros[active.write] = billing_ready;
         workspace.trajectory.during_supply[active.write] = before_supply;
         workspace.trajectory.after_supply[active.write] = before_supply;
+        workspace.trajectory.moved_share[active.write] = 0.0_f64;
         active.ready_micros = pause;
         active.during_supply = before_supply;
         active.after_supply = before_supply;
@@ -2288,6 +2289,7 @@ fn write_trajectory_event(
         shared.partition_count,
         max_share,
     );
+    workspace.trajectory.moved_share[active.write] = moved_share;
     active.ready_micros = ready;
     active.during_supply = workspace.trajectory.during_supply[active.write];
     active.after_supply = workspace.trajectory.after_supply[active.write];
@@ -2307,6 +2309,7 @@ fn clear_trajectory(trajectory: &mut TrajectoryColumns) {
     trajectory.ready_boundaries.clear();
     trajectory.during_supply.clear();
     trajectory.after_supply.clear();
+    trajectory.moved_share.clear();
 }
 
 fn transition_moved_share(
@@ -2914,6 +2917,7 @@ fn push_trajectory_event(
     trajectory.billing_ready_micros.push(0_u64);
     trajectory.during_supply.push(0.0_f64);
     trajectory.after_supply.push(0.0_f64);
+    trajectory.moved_share.push(0.0_f64);
 }
 
 fn sort_trajectory_events(trajectory: &mut TrajectoryColumns, first: usize) {
@@ -3029,14 +3033,8 @@ fn partition_deadline_outcome_one(
     partition_late_area: &mut [f64],
     arrivals: &ArrivalPath<'_>,
 ) {
-    partition_missed_work.fill(0.0_f64);
-    partition_late_area.fill(0.0_f64);
-    let window = EvaluationWindow {
-        start_micros: state.model_time.as_micros(),
-        horizon_micros: shared.planning_horizon_micros,
-        initial_debt_work: 0.0_f64,
-        deadline_budget_micros: state.configuration.objective.budget_micros(),
-    };
+    clear_partition_outcomes(partition_missed_work, partition_late_area);
+    let window = partition_evaluation_window(state, shared);
     for candidate in 0..shared.action_count {
         let owner_count = candidate + 1;
         plant_target_assignment(
@@ -3045,8 +3043,7 @@ fn partition_deadline_outcome_one(
             &mut workspace.target_assignment,
             &mut workspace.assignment_counts,
         );
-        let mut missed_work = 0.0_f64;
-        let mut late_area = 0.0_f64;
+        let (mut missed_work, mut late_area) = (0.0_f64, 0.0_f64);
         for owner in 0..owner_count {
             let placement = &mut workspace.partition_placement;
             placement.cohorts.clear();
@@ -3098,9 +3095,102 @@ fn partition_deadline_outcome_one(
             missed_work += outcome.missed_work;
             late_area += outcome.late_area + outcome.terminal_late_area;
         }
+        let first = workspace.trajectory_offsets[candidate] as usize;
+        let last = workspace.trajectory_offsets[candidate + 1] as usize;
+        for event in first..last {
+            if workspace.trajectory.kinds[event] != TrajectoryEventKind::Transition {
+                continue;
+            }
+            let moved_share = workspace.trajectory.moved_share[event];
+            if moved_share == 0.0_f64 {
+                continue;
+            }
+            for (scaled, rate) in workspace
+                .partition_arrival_rates
+                .iter_mut()
+                .zip(arrivals.rates)
+            {
+                *scaled = moved_share * rate;
+            }
+            let moved_arrivals = ArrivalPath {
+                start_seconds: arrivals.start_seconds,
+                end_seconds: arrivals.end_seconds,
+                rates: &workspace.partition_arrival_rates[..arrivals.rates.len()],
+            };
+            let placement = &mut workspace.partition_placement;
+            placement.cohorts.clear();
+            prepare(&placement.cohorts, &mut placement.edf);
+            late_area += fresh_transition_late_area(
+                &placement.cohorts,
+                &mut placement.edf,
+                workspace.partition_replica_supply,
+                window,
+                &moved_arrivals,
+                workspace.trajectory.pause_micros[event],
+                workspace.trajectory.ready_micros[event],
+            );
+        }
         partition_missed_work[candidate] = missed_work;
         partition_late_area[candidate] = late_area;
     }
+}
+
+fn clear_partition_outcomes(missed_work: &mut [f64], late_area: &mut [f64]) {
+    missed_work.fill(0.0_f64);
+    late_area.fill(0.0_f64);
+}
+
+fn partition_evaluation_window(
+    state: &ScaleState,
+    shared: &ScenarioShared<'_>,
+) -> EvaluationWindow {
+    EvaluationWindow {
+        start_micros: state.model_time.as_micros(),
+        horizon_micros: shared.planning_horizon_micros,
+        initial_debt_work: 0.0_f64,
+        deadline_budget_micros: state.configuration.objective.budget_micros(),
+    }
+}
+
+fn fresh_transition_late_area(
+    cohorts: &SlotSecondCohorts,
+    edf: &mut EdfScratch,
+    capacity: f64,
+    window: EvaluationWindow,
+    arrivals: &ArrivalPath<'_>,
+    pause_micros: u64,
+    ready_micros: u64,
+) -> f64 {
+    let baseline = evaluate_prepared_step(
+        cohorts,
+        SupplyStep {
+            before: capacity,
+            during: capacity,
+            after: capacity,
+            pause_micros: window.start_micros,
+            ready_micros: window.start_micros,
+        },
+        window,
+        arrivals,
+        edf,
+    );
+    let transition = evaluate_prepared_step(
+        cohorts,
+        SupplyStep {
+            before: capacity,
+            during: 0.0_f64,
+            after: capacity,
+            pause_micros,
+            ready_micros,
+        },
+        window,
+        arrivals,
+        edf,
+    );
+    (transition.late_area + transition.terminal_late_area
+        - baseline.late_area
+        - baseline.terminal_late_area)
+        .max(0.0_f64)
 }
 
 /// Applies the plant's sticky and balanced partition assignment.
