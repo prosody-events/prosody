@@ -17,7 +17,7 @@ use futures::Stream;
 use scc::hash_map::Entry;
 use smallvec::SmallVec;
 use std::convert::Infallible;
-use std::future::Future;
+use std::future::{Future, ready};
 use std::sync::Arc;
 use tokio::task::coop::cooperative;
 
@@ -287,15 +287,15 @@ where
         }
     }
 
-    async fn provisional_cell_at<'a>(
+    fn provisional_cell_at<'a>(
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-    ) -> Result<Option<ProvisionalCell>, Self::Error> {
-        Ok(match self.read_raw(collection, cell) {
+    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + 'a {
+        ready(Ok(match self.read_raw(collection, cell) {
             Cell::Provisional(provisional) => Some(provisional),
             Cell::Resolved(_) => None,
-        })
+        }))
     }
 
     fn provisional_many<'a>(

@@ -28,6 +28,7 @@ use rdkafka::ClientConfig;
 use rdkafka::Message;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use serde_json::{Value, json};
+use std::future::{Future, ready};
 use std::time::Duration;
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::time::{Instant, timeout};
@@ -56,16 +57,16 @@ const DEFER_TEST_TIMEOUT: Duration = Duration::from_mins(5);
 
 macro_rules! ignore_excise {
     () => {
-        async fn on_excise<C>(
+        fn on_excise<C>(
             &self,
             _: C,
             _: ConsumerMessage<()>,
             _: DemandType,
-        ) -> Result<(), Self::Error>
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send
         where
             C: EventContext<Payload = Value>,
         {
-            Ok(())
+            ready(Ok(()))
         }
     };
 }
@@ -102,16 +103,16 @@ impl FallibleHandler for FailingHandler {
         Err(TestError)
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _ctx: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
     async fn shutdown(self) {}
@@ -253,16 +254,16 @@ impl FallibleHandler for TimerCancellingHandler {
         Ok(())
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _ctx: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
     async fn shutdown(self) {}
@@ -320,16 +321,16 @@ impl FallibleHandler for ClearAndScheduleHandler {
         Ok(())
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _ctx: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
     async fn shutdown(self) {}
@@ -373,16 +374,16 @@ impl FallibleHandler for TransientMessageHandler {
         Ok(())
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _ctx: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
     async fn shutdown(self) {}

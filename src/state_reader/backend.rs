@@ -33,6 +33,7 @@ use bytes::Bytes;
 use futures::Stream;
 use std::convert::Infallible;
 use std::error::Error;
+use std::future::ready;
 use std::marker::PhantomData;
 
 #[cfg(test)]
@@ -100,17 +101,21 @@ impl CommittedCellSource for CassandraCellResources {
 impl CommittedCellSource for MemoryCells {
     type Error = Infallible;
 
-    async fn load(&self, id: &CollectionId, cell: &CellKey) -> Result<Option<Bytes>, Self::Error> {
-        Ok(Self::read_committed(self, id, cell))
+    fn load(
+        &self,
+        id: &CollectionId,
+        cell: &CellKey,
+    ) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> + Send {
+        ready(Ok(Self::read_committed(self, id, cell)))
     }
 
-    async fn load_many(
+    fn load_many(
         &self,
         id: &CollectionId,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, Self::Error> {
-        Ok(Self::read_committed_many(self, id, section, batch))
+    ) -> impl Future<Output = Result<CellBuffer<Option<Bytes>>, Self::Error>> + Send {
+        ready(Ok(Self::read_committed_many(self, id, section, batch)))
     }
 
     fn scan<'a>(
@@ -134,13 +139,13 @@ impl CommittedCellSource for ScriptedCellSource {
         read
     }
 
-    async fn load_many(
+    fn load_many(
         &self,
         id: &CollectionId,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, Self::Error> {
-        Self::read_committed_many(self, id, section, batch)
+    ) -> impl Future<Output = Result<CellBuffer<Option<Bytes>>, Self::Error>> + Send {
+        ready(Self::read_committed_many(self, id, section, batch))
     }
 
     fn scan<'a>(

@@ -1,6 +1,7 @@
 //! Fixed-TTL cell store used by cache metadata tests.
 
 use super::*;
+use std::future::ready;
 
 #[derive(Clone)]
 pub(crate) struct TtlStub {
@@ -17,22 +18,23 @@ impl TtlStub {
 impl CellStore for TtlStub {
     type Error = Infallible;
 
-    async fn get<'a>(
+    fn get<'a>(
         &'a self,
         _collection: &'a CollectionId,
         _cell: &'a CellKey,
         _own: EventRef,
-    ) -> Result<Committed, Self::Error> {
-        Ok(Committed::new(Some(self.value.clone())))
+    ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
+        ready(Ok(Committed::new(Some(self.value.clone()))))
     }
 
-    async fn get_for_cache<'a>(
+    fn get_for_cache<'a>(
         &'a self,
         _collection: &'a CollectionId,
         _cell: &'a CellKey,
         _own: EventRef,
-    ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
-        Ok((Committed::new(Some(self.value.clone())), self.ttl))
+    ) -> impl Future<Output = Result<(Committed, Option<CompactDuration>), Self::Error>> + Send + 'a
+    {
+        ready(Ok((Committed::new(Some(self.value.clone())), self.ttl)))
     }
 
     fn scan_cells<'a>(
@@ -51,12 +53,12 @@ impl CellStore for TtlStub {
         stream::empty()
     }
 
-    async fn provisional_cell_at<'a>(
+    fn provisional_cell_at<'a>(
         &'a self,
         _collection: &'a CollectionId,
         _cell: &'a CellKey,
-    ) -> Result<Option<ProvisionalCell>, Self::Error> {
-        Ok(None)
+    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + 'a {
+        ready(Ok(None))
     }
 
     fn provisional_many<'a>(
@@ -69,53 +71,53 @@ impl CellStore for TtlStub {
         provisional_point_loop(self, collection, section, batch)
     }
 
-    async fn write_provisional<'a>(
+    fn write_provisional<'a>(
         &'a self,
         _collection: &'a CollectionRef,
         _writes: &'a [(CellKey, ProvisionalWrite)],
         _marker: Option<&'a EventMarker>,
-    ) -> Result<(), Self::Error> {
-        Ok(())
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        ready(Ok(()))
     }
 
-    async fn write_resolved<'a>(
+    fn write_resolved<'a>(
         &'a self,
         _collection: &'a CollectionRef,
         _cells: &'a [(CellKey, Option<Bytes>)],
         _clears: &'a [SectionClear],
-    ) -> Result<(), Self::Error> {
-        Ok(())
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        ready(Ok(()))
     }
 
-    async fn mark_resolved<'a>(
+    fn mark_resolved<'a>(
         &'a self,
         _collection: &'a CollectionRef,
         _cells: &'a [CellKey],
-    ) -> Result<(), Self::Error> {
-        Ok(())
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        ready(Ok(()))
     }
 
-    async fn standing_marker<'a>(
+    fn standing_marker<'a>(
         &'a self,
         _collection: &'a CollectionId,
-    ) -> Result<Option<EventMarker>, Self::Error> {
-        Ok(None)
+    ) -> impl Future<Output = Result<Option<EventMarker>, Self::Error>> + Send + 'a {
+        ready(Ok(None))
     }
 
-    async fn commit_provisional<'a>(
+    fn commit_provisional<'a>(
         &'a self,
         _collection: &'a CollectionRef,
         _writes: &'a [(CellKey, ProvisionalWrite)],
         _clears: &'a [SectionClear],
-    ) -> Result<(), Self::Error> {
-        Ok(())
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        ready(Ok(()))
     }
 
-    async fn abort_provisional<'a>(
+    fn abort_provisional<'a>(
         &'a self,
         _collection: &'a CollectionRef,
         _writes: &'a [(CellKey, ProvisionalWrite)],
-    ) -> Result<(), Self::Error> {
-        Ok(())
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        ready(Ok(()))
     }
 }
