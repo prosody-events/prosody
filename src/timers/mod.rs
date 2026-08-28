@@ -213,12 +213,6 @@ impl TimerRequest {
         }
     }
 
-    /// Converts this request into a tagged internal trigger with a fresh tag.
-    #[must_use]
-    pub(crate) fn into_trigger(self) -> Trigger {
-        Trigger::new(self.key, self.time, self.timer_type, self.span)
-    }
-
     /// Converts this request into a tagged internal trigger with `tag`.
     #[must_use]
     pub(crate) fn into_trigger_with_tag(self, tag: i32) -> Trigger {

@@ -20,7 +20,7 @@ use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::future::{Future, ready};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
@@ -30,12 +30,15 @@ use super::settle::arm_backstop;
 use super::*;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::tests::test_support::{
-    MockEventContext, create_test_message, create_test_message_from,
+    MockEventContext, RecordingOracle, create_test_message, create_test_message_from,
+    is_provisional,
 };
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::receipted_sealed;
 use crate::consumer::{EventHandler, Receipted, Redelivery, Uncommitted};
 use crate::error::ErrorCategory;
+use crate::state::CollectionId;
+use crate::state::memory::MemoryCellStore;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
@@ -168,8 +171,17 @@ impl FallibleHandler for ProbeHandler {
 struct RecordingGuard {
     committed: Arc<AtomicUsize>,
     aborted: Arc<AtomicUsize>,
+    receipts: Arc<AtomicUsize>,
     redelivery: Redelivery,
+    order: Option<GuardOrder>,
 }
+
+type GuardOrder = (
+    MemoryCellStore<RecordingOracle>,
+    CollectionId,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+);
 
 impl RecordingGuard {
     /// A fresh guard and the two counters it records into, in
@@ -181,7 +193,9 @@ impl RecordingGuard {
             Self {
                 committed: committed.clone(),
                 aborted: aborted.clone(),
+                receipts: Arc::default(),
                 redelivery: Redelivery::Sweeps,
+                order: None,
             },
             committed,
             aborted,
@@ -193,10 +207,27 @@ impl RecordingGuard {
         guard.redelivery = Redelivery::Reruns;
         (guard, committed, aborted)
     }
+
+    fn with_order(
+        mut self,
+        store: MemoryCellStore<RecordingOracle>,
+        id: CollectionId,
+        receipt_saw_provisional: Arc<AtomicBool>,
+        commit_saw_resolved: Arc<AtomicBool>,
+    ) -> Self {
+        self.order = Some((store, id, receipt_saw_provisional, commit_saw_resolved));
+        self
+    }
 }
 
 impl Uncommitted for RecordingGuard {
     async fn commit(self) {
+        if let Some((store, id, _, commit_saw_resolved)) = &self.order {
+            let resolved = is_provisional(store, id)
+                .await
+                .is_ok_and(|provisional| !provisional);
+            commit_saw_resolved.store(resolved, Ordering::SeqCst);
+        }
         self.committed.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -212,8 +243,14 @@ impl Receipted for RecordingGuard {
         ready(self.redelivery)
     }
 
-    fn receipt(&mut self) -> impl Future<Output = ()> + Send {
-        ready(())
+    async fn receipt(&mut self) {
+        self.receipts.fetch_add(1, Ordering::SeqCst);
+        if let Some((store, id, receipt_saw_provisional, _)) = &self.order {
+            let provisional = is_provisional(store, id)
+                .await
+                .is_ok_and(|provisional| provisional);
+            receipt_saw_provisional.store(provisional, Ordering::SeqCst);
+        }
     }
 }
 
@@ -325,7 +362,9 @@ async fn after_commit_for_timer_path_with_ok_output() {
             let guard = RecordingGuard {
                 committed: self.committed.clone(),
                 aborted: self.aborted.clone(),
+                receipts: Arc::default(),
                 redelivery: Redelivery::Sweeps,
+                order: None,
             };
             (trigger, guard)
         }
@@ -498,6 +537,5 @@ mod backstop_amortization;
 /// (promoted cells the new values, un-promoted cells `prev`).
 mod hook_visibility;
 mod marker_record_must_succeed;
-mod redelivery_settlement;
 mod settled_view;
 mod settlement_classification;

@@ -409,10 +409,11 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
 
     /// Updates the `tag` on both persisted timer indices.
     ///
-    /// No-op if the row is absent. Used by
-    /// `complete()`-from-`FiringRescheduled` to rotate the tag so the
-    /// commit oracle can detect the round-trip after in-memory operation and
-    /// after slab reloads.
+    /// Requires both rows. The transition table emits this write only from
+    /// `FiringRescheduled`, where both rows stand. On an absent row the
+    /// backends differ: Cassandra upserts a partial row, the memory store
+    /// does nothing. The commit from `FiringRescheduled` rotates the tag so
+    /// the oracle reports the finished attempt as committed.
     fn update_tag(
         &self,
         key: &Key,

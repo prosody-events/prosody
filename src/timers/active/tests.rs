@@ -57,7 +57,6 @@ enum Op {
         key: Key,
         time: CompactDateTime,
         ty: TimerType,
-        tag: i32,
     },
     Remove {
         key: Key,
@@ -70,12 +69,6 @@ enum Op {
         ty: TimerType,
         state: TimerState,
     },
-    SetTag {
-        key: Key,
-        time: CompactDateTime,
-        ty: TimerType,
-        tag: i32,
-    },
 }
 
 impl Op {
@@ -85,8 +78,7 @@ impl Op {
         match self {
             Op::Insert { key, time, ty, .. }
             | Op::Remove { key, time, ty }
-            | Op::SetState { key, time, ty, .. }
-            | Op::SetTag { key, time, ty, .. } => (key.clone(), *time, *ty),
+            | Op::SetState { key, time, ty, .. } => (key.clone(), *time, *ty),
         }
     }
 }
@@ -97,26 +89,15 @@ impl Arbitrary for Op {
         let time =
             CompactDateTime::from(TIME_POOL[usize::from(u8::arbitrary(g)) % TIME_POOL.len()]);
         let ty = TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
-        match u8::arbitrary(g) % 4 {
-            0 => Op::Insert {
-                key,
-                time,
-                ty,
-                tag: i32::arbitrary(g),
-            },
-            1 => Op::Remove { key, time, ty },
-            2 => Op::SetState {
+        match u8::arbitrary(g) % 3 {
+            0 => Op::Insert { key, time, ty },
+            1 => Op::SetState {
                 key,
                 time,
                 ty,
                 state: STATES[usize::from(u8::arbitrary(g)) % STATES.len()],
             },
-            _ => Op::SetTag {
-                key,
-                time,
-                ty,
-                tag: i32::arbitrary(g),
-            },
+            _ => Op::Remove { key, time, ty },
         }
     }
 }
@@ -151,7 +132,6 @@ async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
             active.get_state(key, *time, *ty).await,
             entry.map(|e| e.state)
         );
-        assert_eq!(active.get_tag(key, *time, *ty).await, entry.map(|e| e.tag));
         assert_eq!(active.contains(key, *time, *ty).await, entry.is_some());
         assert_eq!(
             active.is_scheduled(key, *time, *ty).await,
@@ -218,19 +198,12 @@ async fn run_trace(trace: Trace) {
         }
 
         match op {
-            Op::Insert { key, time, ty, tag } => {
+            Op::Insert { key, time, ty } => {
                 active
-                    .insert(Trigger::with_tag(
-                        key.clone(),
-                        time,
-                        ty,
-                        tag,
-                        Span::current(),
-                    ))
+                    .insert(Trigger::new(key.clone(), time, ty, Span::current()))
                     .await;
                 model.entry((key, time, ty)).or_insert(ActiveTriggerEntry {
                     state: TimerState::Scheduled,
-                    tag,
                 });
             }
             Op::Remove { key, time, ty } => {
@@ -253,17 +226,6 @@ async fn run_trace(trace: Trace) {
                 };
                 assert_eq!(got, want, "set_state return");
             }
-            Op::SetTag { key, time, ty, tag } => {
-                let got = active.set_tag(&key, time, ty, tag).await;
-                let want = match model.get_mut(&(key, time, ty)) {
-                    Some(entry) => {
-                        entry.tag = tag;
-                        true
-                    }
-                    None => false,
-                };
-                assert_eq!(got, want, "set_tag return");
-            }
         }
 
         assert_equiv(&active, &model, &seen).await;
@@ -280,34 +242,4 @@ fn prop_active_triggers_track_model() {
         executor::block_on(run_trace(trace));
     }
     QuickCheck::new().quickcheck(property as fn(Trace));
-}
-
-/// Receipt and retire preserve the split timer lifecycle for every prior state.
-#[test]
-fn receipt_and_retire_transition_table() {
-    use TimerState::{Aborted, Firing, FiringRescheduled, Scheduled};
-
-    let receipt_delete = [Some(Firing), Some(Scheduled), Some(Aborted), None];
-    for prior in receipt_delete {
-        let transition = transition(prior, TimerOp::Receipt);
-        assert_eq!(transition.store(), StoreEffect::DeleteKeyRow);
-        assert_eq!(transition.phases().0.queue, QueueEffect::None);
-        assert!(transition.announce().is_none());
-    }
-
-    let rescheduled = transition(Some(FiringRescheduled), TimerOp::Receipt);
-    assert_eq!(rescheduled.store(), StoreEffect::UpdateTag);
-    assert!(rescheduled.phases().1.adopt_tag);
-
-    for prior in [Some(Firing), Some(Aborted), None] {
-        let transition = transition(prior, TimerOp::Retire);
-        assert_eq!(transition.store(), StoreEffect::DeleteSlabRow);
-        assert_eq!(transition.phases().0.queue, QueueEffect::Deactivate);
-    }
-
-    for prior in [Some(Scheduled), Some(FiringRescheduled)] {
-        let transition = transition(prior, TimerOp::Retire);
-        assert_eq!(transition.store(), StoreEffect::None);
-        assert_eq!(transition.phases().0.queue, QueueEffect::None);
-    }
 }

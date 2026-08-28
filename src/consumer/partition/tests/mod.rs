@@ -29,7 +29,7 @@ use runtime::{
 };
 use serde_json::json;
 use std::array::from_fn;
-use std::future::{Future, ready};
+use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -41,55 +41,6 @@ use tracing::Span;
 /// A committed application-timer refire is swept without handler dispatch.
 #[tokio::test]
 async fn committed_application_refire_skips_handler() -> color_eyre::Result<()> {
-    #[derive(Clone, Default)]
-    struct TimerProbe(Arc<AtomicUsize>);
-
-    impl EventHandler for TimerProbe {
-        type Payload = serde_json::Value;
-
-        fn on_message<C>(
-            &self,
-            _context: C,
-            _message: UncommittedMessage<Self::Payload>,
-            _demand_type: DemandType,
-        ) -> impl Future<Output = ()> + Send
-        where
-            C: EventContext<Payload = Self::Payload>,
-        {
-            ready(())
-        }
-
-        fn on_excise<C>(
-            &self,
-            _context: C,
-            _message: UncommittedMessage<()>,
-            _demand_type: DemandType,
-        ) -> impl Future<Output = ()> + Send
-        where
-            C: EventContext<Payload = Self::Payload>,
-        {
-            ready(())
-        }
-
-        fn on_timer<C, U>(
-            &self,
-            _context: C,
-            _timer: U,
-            _demand_type: DemandType,
-        ) -> impl Future<Output = ()> + Send
-        where
-            C: EventContext<Payload = Self::Payload>,
-            U: UncommittedTimer,
-        {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            ready(())
-        }
-
-        fn shutdown(self) -> impl Future<Output = ()> + Send {
-            ready(())
-        }
-    }
-
     let (stream, timers, shutdown_tx) = setup_timer_manager().await?;
     pin_mut!(stream);
     let trigger = create_test_trigger("committed-refire", 0, TimerType::Application)?;
@@ -98,15 +49,13 @@ async fn committed_application_refire_skips_handler() -> color_eyre::Result<()> 
         .next()
         .await
         .ok_or_else(|| eyre!("expected pending timer"))?;
-    timers
-        .receipt(&trigger.key, trigger.time, trigger.timer_type)
-        .await?;
+    timers.receipt(&trigger).await?;
 
     let provider = memory_state_provider(CollectionDefRegistry::default());
     let state = provider
         .acquire(Topic::from("test"), 0, timers.test_store().clone())
         .await?;
-    let probe = TimerProbe::default();
+    let probe = TestHandler::new();
     let (_shutdown_control, shutdown_rx) = watch::channel(ShutdownPhase::default());
     process_event(
         UncommittedEvent::Timer(pending),
@@ -124,7 +73,7 @@ async fn committed_application_refire_skips_handler() -> color_eyre::Result<()> 
     )
     .await;
 
-    assert_eq!(probe.0.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.timer_fires.load(Ordering::SeqCst), 0);
     let slab_id = trigger
         .time
         .epoch_seconds()

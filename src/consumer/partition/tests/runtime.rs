@@ -155,6 +155,7 @@ where
 pub(super) struct TestHandler {
     pub(super) processed_offsets: Arc<Mutex<Vec<Offset>>>,
     pub(super) has_concurrent_processing: Arc<Mutex<bool>>,
+    pub(super) timer_fires: Arc<AtomicUsize>,
     keys_in_processing: Arc<Mutex<Vec<Key>>>,
     notify: Arc<Notify>,
     delay: Duration,
@@ -172,6 +173,7 @@ impl TestHandler {
         Self {
             processed_offsets: Arc::new(Mutex::new(Vec::new())),
             has_concurrent_processing: Arc::new(Mutex::new(false)),
+            timer_fires: Arc::new(AtomicUsize::new(0)),
             keys_in_processing: Arc::new(Mutex::new(Vec::new())),
             notify: Arc::new(Notify::new()),
             delay,
@@ -246,7 +248,7 @@ impl EventHandler for TestHandler {
         C: EventContext<Payload = Self::Payload>,
         U: UncommittedTimer,
     {
-        // todo: add timer test
+        self.timer_fires.fetch_add(1, Ordering::SeqCst);
     }
 
     async fn shutdown(self) {}

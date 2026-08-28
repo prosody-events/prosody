@@ -458,6 +458,7 @@ fn prop_recover_commits_unless_shutdown_interrupts_reschedule() {
         category: ErrorCategory,
         shutdown: bool,
         within: Option<u32>,
+        redelivered: bool,
     ) -> Result<TestResult> {
         let cart = StateName::try_new("cart")?;
         let registry = registry_with_cart_within(within.map(CompactDuration::new))?;
@@ -502,56 +503,39 @@ fn prop_recover_commits_unless_shutdown_interrupts_reschedule() {
             .await;
 
         let before = CompactDateTime::now()?;
-        let resolution = manager.recover(key.clone(), &timers, &shutdown_rx).await;
+        let resolution = if redelivered {
+            manager
+                .resolve_redelivered(key.clone(), &timers, &shutdown_rx)
+                .await
+        } else {
+            manager.recover(key.clone(), &timers, &shutdown_rx).await
+        };
         let after = CompactDateTime::now()?;
         let scheduled = timers
             .scheduled_times(&key, TimerType::StateRecovery)
             .await?;
         let armed = manager.inner.armed.contains_async(&key).await;
 
-        if scheduled.len() != 1 {
-            return Ok(TestResult::error(format!(
-                "exactly one StateRecovery trigger must ever exist, got {}",
-                scheduled.len()
-            )));
-        }
-        let rescheduled = scheduled[0] < standing;
-
-        let reschedule_case =
-            matches!(category, ErrorCategory::Transient | ErrorCategory::Terminal) && !shutdown;
-        let shutdown_abort =
-            matches!(category, ErrorCategory::Transient | ErrorCategory::Terminal) && shutdown;
-
-        let ok = if shutdown_abort {
-            // Shutdown interrupted the reschedule: abort, standing timer intact,
-            // armed cleared.
-            resolution == SweepResolution::Abort && !rescheduled && !armed
-        } else if reschedule_case {
-            // Non-shutdown transient/terminal: commit after a sooner singleton
-            // reschedule, armed re-set — and the reschedule honors the
-            // registered `recovery_within` tightening.
-            if !fire_in_tightened_window(scheduled[0], before, after, within) {
-                return Ok(TestResult::error(format!(
-                    "rescheduled fire {} outside the tightened window (recovery_within {within:?} \
-                     must tighten the retry delay)",
-                    scheduled[0].epoch_seconds()
-                )));
-            }
-            resolution == SweepResolution::Commit && rescheduled && armed
-        } else {
-            // Permanent per-cell skip: commit, no reschedule, armed cleared.
-            resolution == SweepResolution::Commit && !rescheduled && !armed
-        };
-        if !ok {
-            return Ok(TestResult::error(format!(
-                "category={category:?} shutdown={shutdown}: resolution={resolution:?} \
-                 rescheduled={rescheduled} armed={armed}"
-            )));
-        }
-        Ok(TestResult::passed())
+        Ok(check_recovery(RecoveryObservation {
+            category,
+            shutdown,
+            within,
+            redelivered,
+            resolution,
+            scheduled,
+            armed,
+            standing,
+            before,
+            after,
+        }))
     }
 
-    fn property(category_sel: u8, shutdown: bool, within_sel: Option<u16>) -> TestResult {
+    fn property(
+        category_sel: u8,
+        shutdown: bool,
+        within_sel: Option<u16>,
+        redelivered: bool,
+    ) -> TestResult {
         let category = match category_sel % 3 {
             0 => ErrorCategory::Permanent,
             1 => ErrorCategory::Transient,
@@ -564,14 +548,71 @@ fn prop_recover_commits_unless_shutdown_interrupts_reschedule() {
             return TestResult::error("failed to build runtime");
         };
         runtime.block_on(async move {
-            match run(category, shutdown, within).await {
+            match run(category, shutdown, within, redelivered).await {
                 Ok(result) => result,
                 Err(e) => TestResult::error(format!("setup failed: {e}")),
             }
         })
     }
 
-    QuickCheck::new().quickcheck(property as fn(u8, bool, Option<u16>) -> TestResult);
+    QuickCheck::new().quickcheck(property as fn(u8, bool, Option<u16>, bool) -> TestResult);
+}
+
+struct RecoveryObservation {
+    category: ErrorCategory,
+    shutdown: bool,
+    within: Option<u32>,
+    redelivered: bool,
+    resolution: SweepResolution,
+    scheduled: Vec<CompactDateTime>,
+    armed: bool,
+    standing: CompactDateTime,
+    before: CompactDateTime,
+    after: CompactDateTime,
+}
+
+fn check_recovery(observed: RecoveryObservation) -> TestResult {
+    let RecoveryObservation {
+        category,
+        shutdown,
+        within,
+        redelivered,
+        resolution,
+        scheduled,
+        armed,
+        standing,
+        before,
+        after,
+    } = observed;
+    if scheduled.len() != 1 {
+        return TestResult::error(format!(
+            "exactly one StateRecovery trigger must exist, got {}",
+            scheduled.len()
+        ));
+    }
+    let rescheduled = scheduled[0] < standing;
+    let retry = matches!(category, ErrorCategory::Transient | ErrorCategory::Terminal);
+    let ok = match (redelivered, retry, shutdown) {
+        (true, true, true) => resolution == SweepResolution::Abort && !rescheduled && armed,
+        (true, true, false) => resolution == SweepResolution::Commit && rescheduled && armed,
+        (true, false, _) => resolution == SweepResolution::Commit && !rescheduled && armed,
+        (false, true, true) => resolution == SweepResolution::Abort && !rescheduled && !armed,
+        (false, true, false) => {
+            fire_in_tightened_window(scheduled[0], before, after, within)
+                && resolution == SweepResolution::Commit
+                && rescheduled
+                && armed
+        }
+        (false, false, _) => resolution == SweepResolution::Commit && !rescheduled && !armed,
+    };
+    if ok {
+        TestResult::passed()
+    } else {
+        TestResult::error(format!(
+            "category={category:?} shutdown={shutdown}: resolution={resolution:?} \
+             rescheduled={rescheduled} armed={armed}"
+        ))
+    }
 }
 
 /// Buffers writes to two `ReadCommitted` collections (`cart`, `wishlist`) and

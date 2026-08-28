@@ -85,6 +85,28 @@ pub(crate) async fn setup_timer_manager_at(
     watch::Sender<ShutdownPhase>,
 )> {
     let store = memory_store(test_segment("test-segment", 300_u32));
+    setup_timer_manager_over_at(store, initial).await
+}
+
+/// Builds a timer manager over an existing in-memory store.
+pub(crate) async fn setup_timer_manager_over(
+    store: TableAdapter<InMemoryTriggerStore>,
+) -> Result<(
+    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
+    TimerManager<TableAdapter<InMemoryTriggerStore>>,
+    watch::Sender<ShutdownPhase>,
+)> {
+    setup_timer_manager_over_at(store, ShutdownPhase::default()).await
+}
+
+async fn setup_timer_manager_over_at(
+    store: TableAdapter<InMemoryTriggerStore>,
+    initial: ShutdownPhase,
+) -> Result<(
+    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
+    TimerManager<TableAdapter<InMemoryTriggerStore>>,
+    watch::Sender<ShutdownPhase>,
+)> {
     let (shutdown_tx, shutdown_rx) = watch::channel(initial);
     let telemetry = Telemetry::new();
 

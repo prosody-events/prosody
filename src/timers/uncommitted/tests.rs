@@ -1,5 +1,5 @@
 use super::*;
-use crate::consumer::{Receipted, Redelivery, Uncommitted};
+use crate::consumer::Uncommitted;
 use crate::related_span;
 use crate::test_util::{
     assert_span_relation, capture_events, captured_spans, captured_spans_filtered,
@@ -8,15 +8,15 @@ use crate::test_util::{
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::manager::TimerManager;
-use crate::timers::slab::Slab;
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::InMemoryTriggerStore;
 use crate::timers::test_support::{create_test_trigger, setup_timer_manager};
 use color_eyre::eyre::{Result, eyre};
-use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
+use futures::{Stream, StreamExt, pin_mut};
 use opentelemetry::trace::TraceContextExt as _;
 use std::thread;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::task;
 use tokio::time::{self, advance};
 use tracing_subscriber::filter::LevelFilter;
@@ -55,8 +55,9 @@ async fn test_pending_timer_fire_consumes() -> Result<()> {
 
     // Verify fire() consumes the PendingTimer and returns FiringTimer
     let firing_timer = pending_timer
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("Expected fire() to return Some"))?;
 
     // Verify the FiringTimer has correct metadata
@@ -86,7 +87,10 @@ async fn test_cancelled_pending_timer_fire_completes_without_drop_warning() -> R
         .await?;
 
     assert!(
-        pending_timer.fire().await.is_none(),
+        pending_timer
+            .fire(&watch::channel(ShutdownPhase::default()).1)
+            .await
+            .is_none(),
         "cancelled pending timer should not transition to firing"
     );
     assert!(
@@ -105,8 +109,9 @@ async fn test_firing_timer_commit() -> Result<()> {
     pin_mut!(stream);
     let (trigger, pending_timer) = schedule_and_pop(&manager, &mut stream, "commit-test").await?;
     let firing_timer = pending_timer
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("Expected fire() to return Some"))?;
 
     // Commit the timer
@@ -117,82 +122,6 @@ async fn test_firing_timer_commit() -> Result<()> {
         .scheduled_times(&trigger.key, TimerType::Application)
         .await?;
     assert!(times.is_empty(), "Timer should be removed after commit");
-    let slab = Slab::from_time(manager.test_store().slab_size(), trigger.time);
-    assert!(
-        manager
-            .test_store()
-            .get_slab_triggers_all_types(slab.id())
-            .try_collect::<Vec<_>>()
-            .await?
-            .is_empty(),
-        "commit without receipt removes the slab row",
-    );
-
-    Ok(())
-}
-
-/// A receipt removes the key row. Retirement then removes the slab row.
-#[tokio::test]
-async fn receipt_then_commit_splits_timer_removal() -> Result<()> {
-    time::pause();
-    let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    pin_mut!(stream);
-    let (trigger, pending) = schedule_and_pop(&manager, &mut stream, "split-commit").await?;
-    let firing = pending
-        .fire()
-        .await
-        .ok_or_else(|| eyre!("expected firing timer"))?;
-    let (_trigger, mut guard) = firing.into_inner();
-
-    assert_eq!(guard.redelivery().await, Redelivery::Sweeps);
-    guard.receipt().await;
-    assert!(
-        manager
-            .test_store()
-            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
-            .await?
-            .is_none()
-    );
-    let slab = Slab::from_time(manager.test_store().slab_size(), trigger.time);
-    assert_eq!(
-        manager
-            .test_store()
-            .get_slab_triggers_all_types(slab.id())
-            .try_collect::<Vec<_>>()
-            .await?
-            .len(),
-        1
-    );
-
-    guard.commit().await;
-    assert!(
-        manager
-            .test_store()
-            .get_slab_triggers_all_types(slab.id())
-            .try_collect::<Vec<_>>()
-            .await?
-            .is_empty()
-    );
-    Ok(())
-}
-
-/// Defer timers and rescheduled application timers rerun their handlers.
-#[tokio::test]
-async fn redelivery_posture_follows_type_and_state() -> Result<()> {
-    time::pause();
-    let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    pin_mut!(stream);
-
-    let deferred = create_test_trigger("deferred", 1, TimerType::DeferredMessage)?;
-    let firing = schedule_and_fire(&manager, &mut stream, deferred).await?;
-    assert_eq!(firing.redelivery().await, Redelivery::Reruns);
-    firing.commit().await;
-
-    let application = create_test_trigger("rescheduled", 3, TimerType::Application)?;
-    let firing = schedule_and_fire(&manager, &mut stream, application.clone()).await?;
-    manager.schedule_trigger(application).await?;
-    assert_eq!(firing.redelivery().await, Redelivery::Reruns);
-    firing.commit().await;
     Ok(())
 }
 
@@ -204,8 +133,9 @@ async fn test_firing_timer_abort() -> Result<()> {
     pin_mut!(stream);
     let (trigger, pending_timer) = schedule_and_pop(&manager, &mut stream, "abort-test").await?;
     let firing_timer = pending_timer
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("Expected fire() to return Some"))?;
 
     // Abort the timer
@@ -260,8 +190,9 @@ async fn schedule_and_fire(
         .next()
         .await
         .ok_or_else(|| eyre!("expected a pending timer"))?
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("expected fire() to return Some"))
 }
 
@@ -420,8 +351,9 @@ async fn dispatch_span_context_survives_thread_hop() -> Result<()> {
         .next()
         .await
         .ok_or_else(|| eyre!("expected a pending timer"))?
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("expected fire() to return Some"))?;
 
     let scheduling = firing.trigger().context().span().span_context().clone();

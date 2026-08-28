@@ -1,8 +1,6 @@
 //! Sweep-posture commits arm only when promotion is incomplete.
 use super::*;
-use crate::consumer::middleware::tests::test_support::{
-    TestLifecycleAccess, buffered_failing_sweep,
-};
+use crate::consumer::middleware::tests::test_support::{TestLifecycleAccess, buffered_with};
 use crate::error::ErrorCategory;
 use crate::loader::MemoryLoader;
 use crate::state::StateKey;
@@ -70,12 +68,13 @@ async fn incomplete_commits_arm_once_while_timer_stands() -> Result<()> {
     let mut scheduled = 0;
 
     for sentinel in 0..2 {
-        let context = buffered_failing_sweep(
-            ErrorCategory::Permanent,
+        let context = buffered_with(
             armed.clone(),
+            Some((ErrorCategory::Permanent, 1)),
             MockEventContext::with_timer_tracking,
         )
-        .await?;
+        .await?
+        .0;
         let handler = ProbeHandler::ok(sentinel);
         let (guard, committed, aborted) = RecordingGuard::new();
 
@@ -97,12 +96,13 @@ async fn rerun_commits_arm_once_while_timer_stands() -> Result<()> {
     let mut scheduled = 0;
 
     for sentinel in 0..2 {
-        let context = buffered_failing_sweep(
-            ErrorCategory::Permanent,
+        let context = buffered_with(
             armed.clone(),
+            Some((ErrorCategory::Permanent, 1)),
             MockEventContext::with_timer_tracking,
         )
-        .await?;
+        .await?
+        .0;
         let handler = ProbeHandler::ok(sentinel);
         let (guard, committed, aborted) = RecordingGuard::new_reruns();
 

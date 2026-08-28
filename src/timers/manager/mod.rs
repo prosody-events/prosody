@@ -231,7 +231,25 @@ where
     /// Returns [`TimerManagerError`] if the storage insert or the scheduler
     /// enqueue fails.
     pub async fn schedule(&self, request: TimerRequest) -> Result<(), TimerManagerError<T::Error>> {
-        self.schedule_trigger(request.into_trigger()).await
+        let trigger = self.mint(request).await?;
+        self.schedule_trigger(trigger).await
+    }
+
+    /// Mints the trigger for `request` with the coordinate's standing identity.
+    ///
+    /// The store key row is the sole tag authority; the in-memory registry
+    /// holds no tag. A standing row keeps its tag, so a repeat schedule of one
+    /// coordinate is one timer and its live attempt stays uncommitted. An
+    /// absent row mints a fresh tag, so the cells a receipted attempt left
+    /// behind still resolve as committed.
+    async fn mint(&self, request: TimerRequest) -> Result<Trigger, TimerManagerError<T::Error>> {
+        let tag = self
+            .0
+            .store
+            .current_tag(&request.key, request.time, request.timer_type)
+            .await
+            .map_err(TimerManagerError::Store)?;
+        Ok(request.into_trigger_with_tag(tag.unwrap_or_else(|| rand::rng().random())))
     }
 
     /// Schedules an already-tagged internal trigger.
@@ -311,13 +329,7 @@ where
         &self,
         request: TimerRequest,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        let tag = self
-            .current_tag(&request.key, request.time, request.timer_type)
-            .await?;
-        let trigger = match tag {
-            Some(tag) => request.into_trigger_with_tag(tag),
-            None => request.into_trigger(),
-        };
+        let trigger = self.mint(request).await?;
         self.clear_and_schedule_trigger(trigger).await
     }
 
@@ -392,28 +404,34 @@ where
         );
     }
 
-    /// Transitions a timer from `Scheduled` to `Firing` state, returning the
-    /// canonical tag at the moment of transition.
+    /// Classifies a fired timer from its key row, then moves it from
+    /// `Scheduled` to `Firing`.
     ///
-    /// Returns `None` if the transition failed (timer absent or not Scheduled).
-    /// Reading the tag under the same trigger-lock as the state transition
-    /// guarantees the tag is coherent with the Scheduled→Firing transition.
-    pub(crate) async fn fire_with_tag(
+    /// The store read runs first. A failed read leaves the timer `Scheduled`,
+    /// so the caller can retry this call. Every schedule for a key runs
+    /// inside that key's handler, so no schedule lands between the read and
+    /// the flip.
+    ///
+    /// Returns `None` if the timer is absent or not `Scheduled`.
+    pub(crate) async fn fire(
         &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> Option<i32> {
-        if !self.0.scheduler.fire(key, time, timer_type).await {
-            return None;
-        }
-        // KeyManager linearises events for this key, so the tag read here is
-        // coherent with the just-completed Scheduled → Firing transition.
-        self.0
-            .scheduler
-            .active_triggers()
-            .get_tag(key, time, timer_type)
+        trigger: &Trigger,
+    ) -> Result<Option<Fire>, TimerManagerError<T::Error>> {
+        let tag = self
+            .0
+            .store
+            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
             .await
+            .map_err(TimerManagerError::Store)?;
+        let fired = self
+            .0
+            .scheduler
+            .fire(&trigger.key, trigger.time, trigger.timer_type)
+            .await;
+        Ok(fired.then_some(match tag {
+            Some(tag) => Fire::Live(tag),
+            None => Fire::Committed,
+        }))
     }
 
     /// Marks a timer as completed.
@@ -429,14 +447,8 @@ where
     /// # Errors
     ///
     /// Returns [`TimerManagerError::Store`] if the storage write fails.
-    pub async fn complete(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> Result<(), TimerManagerError<T::Error>> {
-        self.drive_key(key, time, timer_type, TimerOp::Complete)
-            .await
+    pub async fn complete(&self, trigger: &Trigger) -> Result<(), TimerManagerError<T::Error>> {
+        self.drive(trigger, TimerOp::Complete).await
     }
 
     /// Records a timer receipt without retiring its redelivery source.
@@ -446,12 +458,9 @@ where
     /// Returns [`TimerManagerError::Store`] if the receipt write fails.
     pub(crate) async fn receipt(
         &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
+        trigger: &Trigger,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        self.drive_key(key, time, timer_type, TimerOp::Receipt)
-            .await
+        self.drive(trigger, TimerOp::Receipt).await
     }
 
     /// Retires a timer redelivery source after state promotion.
@@ -461,36 +470,9 @@ where
     /// Returns [`TimerManagerError::Store`] if the retirement write fails.
     pub(crate) async fn retire(
         &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
+        trigger: &Trigger,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        self.drive_key(key, time, timer_type, TimerOp::Retire).await
-    }
-
-    async fn drive_key(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-        op: TimerOp,
-    ) -> Result<(), TimerManagerError<T::Error>> {
-        let active = self.0.scheduler.active_triggers();
-        let prior = active.get_state(key, time, timer_type).await;
-        let t = transition(prior, op);
-
-        // A tag-rotating completion writes a tag provably distinct from the
-        // current one; baking it into the trigger keeps the store write and
-        // the registry adoption agreeing on one value. The read-modify-write
-        // is per-key linearised by KeyManager — no TOCTOU window.
-        let tag = if matches!(t.store(), StoreEffect::UpdateTag) {
-            let current = active.get_tag(key, time, timer_type).await.unwrap_or(0_i32);
-            fresh_tag_distinct_from(current)
-        } else {
-            0_i32
-        };
-        let trigger = Trigger::with_tag(key.clone(), time, timer_type, tag, Span::current());
-        self.apply(&trigger, t).await
+        self.drive(trigger, TimerOp::Retire).await
     }
 
     /// Returns a point-in-time [`TimerSnapshot`] of the in-memory scheduler.
@@ -510,9 +492,8 @@ where
     /// `timers::active::transition`; abort transitions carry no store
     /// effect, so the only fallible step is the queue removal, which is
     /// deliberately best-effort — abort has no error path.
-    pub async fn abort(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
-        let trigger = Trigger::new(key.clone(), time, timer_type, Span::current());
-        let _ = self.drive(&trigger, TimerOp::Abort).await;
+    pub async fn abort(&self, trigger: &Trigger) {
+        let _ = self.drive(trigger, TimerOp::Abort).await;
     }
 
     /// Resolves the state-machine transition for `trigger` and applies it.
@@ -569,7 +550,12 @@ where
             StoreEffect::UpdateTag => self
                 .0
                 .store
-                .update_tag(&trigger.key, trigger.time, trigger.timer_type, trigger.tag)
+                .update_tag(
+                    &trigger.key,
+                    trigger.time,
+                    trigger.timer_type,
+                    fresh_tag_distinct_from(trigger.tag),
+                )
                 .await
                 .map_err(TimerManagerError::Store)?,
         }
@@ -594,34 +580,6 @@ where
         Ok(())
     }
 
-    /// Returns the current `tag` for a timer, consulting `ActiveTriggers` first
-    /// and falling back to the store.
-    ///
-    /// Returns `None` if the timer is absent from both in-memory state and the
-    /// store (oracle interpretation: "committed"). Returns `Some(0)` for legacy
-    /// rows without a stored tag.
-    pub(crate) async fn current_tag(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> Result<Option<i32>, TimerManagerError<T::Error>> {
-        if let Some(tag) = self
-            .0
-            .scheduler
-            .active_triggers()
-            .get_tag(key, time, timer_type)
-            .await
-        {
-            return Ok(Some(tag));
-        }
-        self.0
-            .store
-            .current_tag(key, time, timer_type)
-            .await
-            .map_err(TimerManagerError::Store)
-    }
-
     pub(crate) async fn timer_state(
         &self,
         key: &Key,
@@ -634,24 +592,12 @@ where
             .get_state(key, time, timer_type)
             .await
     }
+}
 
-    /// Reports whether the store records a committed refire.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TimerManagerError::Store`] if the tag read fails.
-    pub(crate) async fn is_committed_refire(
-        &self,
-        trigger: &Trigger,
-    ) -> Result<bool, TimerManagerError<T::Error>> {
-        let tag = self
-            .0
-            .store
-            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
-            .await
-            .map_err(TimerManagerError::Store)?;
-        Ok(tag.is_none_or(|tag| tag != trigger.tag))
-    }
+/// Classifies the store key row for one fired timer.
+pub(crate) enum Fire {
+    Live(i32),
+    Committed,
 }
 
 /// Generates a fresh tag guaranteed != `current`.
@@ -669,7 +615,7 @@ pub(crate) fn fresh_tag_distinct_from(current: i32) -> i32 {
 }
 
 /// Applies one side of a transition's in-memory effects: the registry state
-/// flip, the tag adoption, then the scheduler queue effect, in that order.
+/// flip, then the scheduler queue effect, in that order.
 async fn apply_memory<E>(
     scheduler: &TriggerScheduler<E>,
     trigger: &Trigger,
@@ -682,11 +628,6 @@ where
     if let Some(state) = effects.next_state {
         active
             .set_state(&trigger.key, trigger.time, trigger.timer_type, state)
-            .await;
-    }
-    if effects.adopt_tag {
-        active
-            .set_tag(&trigger.key, trigger.time, trigger.timer_type, trigger.tag)
             .await;
     }
     match effects.queue {

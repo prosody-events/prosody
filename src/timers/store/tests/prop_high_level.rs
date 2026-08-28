@@ -119,6 +119,20 @@ pub enum HighLevelOperation {
         /// The timer type.
         timer_type: TimerType,
     },
+    /// Remove only the key row.
+    RemoveKeyRow {
+        /// The segment.
+        segment: Segment,
+        /// The row coordinate.
+        trigger: Trigger,
+    },
+    /// Remove only the slab row.
+    RemoveSlabRow {
+        /// The segment.
+        segment: Segment,
+        /// The row coordinate.
+        trigger: Trigger,
+    },
 }
 
 /// Test input containing an isolated segment and high-level operations.
@@ -238,6 +252,38 @@ fn generate_delete_slab(
     HighLevelOperation::DeleteSlab {
         segment_id: segment.id,
         slab_id,
+    }
+}
+
+/// Generates a single-index removal. The coordinate leaves `existing`, so no
+/// later `UpdateTag` targets a half-removed row: [`TriggerStore::update_tag`]
+/// requires both rows, and the backends differ on an absent one.
+fn generate_remove_index(
+    g: &mut Gen,
+    segment: &Segment,
+    existing: &mut ExistingTriggers,
+    slab: bool,
+) -> HighLevelOperation {
+    let Some(chosen) = existing
+        .iter()
+        .nth(usize::arbitrary(g) % existing.len())
+        .cloned()
+    else {
+        return generate_current_tag(g, segment, existing);
+    };
+    existing.remove(&chosen);
+    let (_, _, key, time, timer_type) = chosen;
+    let trigger = Trigger::new(key, time, timer_type, Span::current());
+    if slab {
+        HighLevelOperation::RemoveSlabRow {
+            segment: segment.clone(),
+            trigger,
+        }
+    } else {
+        HighLevelOperation::RemoveKeyRow {
+            segment: segment.clone(),
+            trigger,
+        }
     }
 }
 
@@ -401,7 +447,7 @@ impl Arbitrary for HighLevelTestInput {
         for _ in 0..op_count {
             let segment = &segment;
 
-            let op = match u8::arbitrary(g) % 10 {
+            let op = match u8::arbitrary(g) % 12 {
                 0 => {
                     let op = generate_add_trigger(g, segment, &mut existing_triggers);
                     if let HighLevelOperation::AddTrigger { ref trigger, .. } = op {
@@ -450,6 +496,12 @@ impl Arbitrary for HighLevelTestInput {
                     // iteration still produces something useful.
                     None => generate_current_tag(g, segment, &existing_triggers),
                 },
+                10 if !existing_triggers.is_empty() => {
+                    generate_remove_index(g, segment, &mut existing_triggers, false)
+                }
+                11 if !existing_triggers.is_empty() => {
+                    generate_remove_index(g, segment, &mut existing_triggers, true)
+                }
                 _ => generate_current_tag(g, segment, &existing_triggers),
             };
 
@@ -605,6 +657,25 @@ impl HighLevelModel {
                     slabs.remove(slab_id);
                 }
             }
+            HighLevelOperation::RemoveKeyRow { segment, trigger } => {
+                let tuple = (trigger.key.clone(), trigger.time, trigger.timer_type);
+                if let Some(rows) =
+                    self.key_index
+                        .get_mut(&(segment.id, trigger.key.clone(), trigger.timer_type))
+                {
+                    rows.remove(&tuple);
+                }
+                self.remove_tag(segment.id, &trigger.key, trigger.timer_type, trigger.time);
+            }
+            HighLevelOperation::RemoveSlabRow { segment, trigger } => {
+                let slab = Slab::from_time(segment.slab_size, trigger.time).id();
+                if let Some(rows) = self
+                    .slab_index
+                    .get_mut(&(segment.id, slab, trigger.timer_type))
+                {
+                    rows.remove(&(trigger.key.clone(), trigger.time, trigger.timer_type));
+                }
+            }
             HighLevelOperation::GetSlabTriggersAllTypes { .. }
             | HighLevelOperation::GetKeyTimes { .. }
             | HighLevelOperation::GetKeyTriggers { .. }
@@ -728,14 +799,18 @@ where
                     "Op #{op_idx} GetSlabTriggersAllTypes current_tag failed: {e:?}"
                 )
             })?;
+        // A receipt deletes the key row first; the slab row stands alone until
+        // retire. The model says which slab rows are such orphans.
+        let tuple = (trigger.key.clone(), trigger.time, trigger.timer_type);
+        let model_has_key_row = model.key_index.values().any(|rows| rows.contains(&tuple));
         let Some(key_tag) = key_tag else {
-            return Err(color_eyre::eyre::eyre!(
-                "Op #{op_idx} GetSlabTriggersAllTypes returned slab trigger without key tag: \
-                 key={:?} time={:?} type={:?}",
-                trigger.key,
-                trigger.time,
-                trigger.timer_type
-            ));
+            if model_has_key_row {
+                return Err(color_eyre::eyre::eyre!(
+                    "Op #{op_idx} GetSlabTriggersAllTypes: key row absent for {tuple:?} but the \
+                     model has it"
+                ));
+            }
+            continue;
         };
         if trigger.tag != key_tag {
             return Err(color_eyre::eyre::eyre!(
@@ -931,21 +1006,10 @@ where
     S::Error: Debug,
 {
     for (op_idx, op) in operations.iter().enumerate() {
-        let mutating = matches!(
-            op,
-            HighLevelOperation::AddTrigger { .. }
-                | HighLevelOperation::RemoveTrigger { .. }
-                | HighLevelOperation::DeleteSlab { .. }
-                | HighLevelOperation::ClearAndSchedule { .. }
-                | HighLevelOperation::UpdateTag { .. }
-        );
-
         match op {
             HighLevelOperation::AddTrigger { trigger, .. } => {
                 model.apply(op);
-                store.add_trigger(trigger.clone()).await.map_err(|e| {
-                    color_eyre::eyre::eyre!("Op #{op_idx} AddTrigger failed: {e:?}")
-                })?;
+                apply_add(store, trigger, op_idx).await?;
             }
             HighLevelOperation::RemoveTrigger {
                 key,
@@ -963,9 +1027,7 @@ where
             }
             HighLevelOperation::DeleteSlab { slab_id, .. } => {
                 model.apply(op);
-                store.delete_slab(*slab_id).await.map_err(|e| {
-                    color_eyre::eyre::eyre!("Op #{op_idx} DeleteSlab failed: {e:?}")
-                })?;
+                apply_delete_slab(store, *slab_id, op_idx).await?;
             }
             HighLevelOperation::ClearAndSchedule { new_trigger, .. } => {
                 model.apply(op);
@@ -1017,15 +1079,86 @@ where
             } => {
                 verify_current_tag(store, model, segment, key, *time, *timer_type, op_idx).await?;
             }
+            HighLevelOperation::RemoveKeyRow { trigger, .. } => {
+                model.apply(op);
+                store
+                    .remove_key_row(&trigger.key, trigger.time, trigger.timer_type)
+                    .await
+                    .map_err(|e| {
+                        color_eyre::eyre::eyre!("Op #{op_idx} RemoveKeyRow failed: {e:?}")
+                    })?;
+            }
+            HighLevelOperation::RemoveSlabRow { trigger, .. } => {
+                model.apply(op);
+                store
+                    .remove_slab_row(&trigger.key, trigger.time, trigger.timer_type)
+                    .await
+                    .map_err(|e| {
+                        color_eyre::eyre::eyre!("Op #{op_idx} RemoveSlabRow failed: {e:?}")
+                    })?;
+            }
         }
 
-        if mutating {
-            verify_dual_index_consistency(store, model)
-                .await
-                .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} consistency check: {e}"))?;
+        if mutates_store(op) {
+            verify_mutation(store, model, operations, op_idx).await?;
         }
     }
     Ok(())
+}
+
+async fn apply_add<S>(store: &S, trigger: &Trigger, op_idx: usize) -> color_eyre::Result<()>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    store
+        .add_trigger(trigger.clone())
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} AddTrigger failed: {e:?}"))
+}
+
+async fn apply_delete_slab<S>(store: &S, slab: SlabId, op_idx: usize) -> color_eyre::Result<()>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    store
+        .delete_slab(slab)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} DeleteSlab failed: {e:?}"))
+}
+
+fn mutates_store(op: &HighLevelOperation) -> bool {
+    matches!(
+        op,
+        HighLevelOperation::AddTrigger { .. }
+            | HighLevelOperation::RemoveTrigger { .. }
+            | HighLevelOperation::DeleteSlab { .. }
+            | HighLevelOperation::ClearAndSchedule { .. }
+            | HighLevelOperation::UpdateTag { .. }
+            | HighLevelOperation::RemoveKeyRow { .. }
+            | HighLevelOperation::RemoveSlabRow { .. }
+    )
+}
+
+async fn verify_mutation<S>(
+    store: &S,
+    model: &HighLevelModel,
+    operations: &[HighLevelOperation],
+    op_idx: usize,
+) -> color_eyre::Result<()>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    verify_dual_index_consistency(store, model)
+        .await
+        .map_err(|e| {
+            color_eyre::eyre::eyre!(
+                "Op #{op_idx} consistency check: {e}\nops={:?}",
+                &operations[..=op_idx]
+            )
+        })
 }
 
 /// Cleans up all test data using only public `TriggerStore` API.
@@ -1034,19 +1167,18 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    // Remove all triggers from the model
-    for ((segment_id, slab_id, _timer_type), trigger_set) in &model.slab_index {
-        for (key, time, timer_type) in trigger_set {
-            store
-                .remove_trigger(key, *time, *timer_type)
-                .await
-                .map_err(|e| {
-                    color_eyre::eyre::eyre!(
-                        "cleanup remove_trigger failed: segment={segment_id:?} slab={slab_id:?} \
-                         key={key:?} time={time:?} type={timer_type:?}: {e:?}"
-                    )
-                })?;
-        }
+    let mut triggers = collect_model_slab_set(model);
+    triggers.extend(collect_model_key_set(model));
+    for (key, time, timer_type, segment_id) in triggers {
+        store
+            .remove_trigger(&key, time, timer_type)
+            .await
+            .map_err(|e| {
+                color_eyre::eyre::eyre!(
+                    "cleanup remove_trigger failed: segment={segment_id:?} key={key:?} \
+                     time={time:?} type={timer_type:?}: {e:?}"
+                )
+            })?;
     }
 
     // Delete all slabs that were created
@@ -1137,7 +1269,7 @@ where
     Ok(key_triggers)
 }
 
-fn collect_model_trigger_set(model: &HighLevelModel) -> HashSet<StoreTriggerTuple> {
+fn collect_model_slab_set(model: &HighLevelModel) -> HashSet<StoreTriggerTuple> {
     let mut model_triggers = HashSet::new();
     for ((segment_id, _slab_id, _timer_type), trigger_set) in &model.slab_index {
         for (key, time, timer_type) in trigger_set {
@@ -1147,28 +1279,35 @@ fn collect_model_trigger_set(model: &HighLevelModel) -> HashSet<StoreTriggerTupl
     model_triggers
 }
 
+fn collect_model_key_set(model: &HighLevelModel) -> HashSet<StoreTriggerTuple> {
+    let mut triggers = HashSet::new();
+    for ((segment_id, ..), rows) in &model.key_index {
+        for (key, time, timer_type) in rows {
+            triggers.insert((key.clone(), *time, *timer_type, *segment_id));
+        }
+    }
+    triggers
+}
+
 fn verify_trigger_sets(
     slab_triggers: &HashSet<StoreTriggerTuple>,
     key_triggers: &HashSet<StoreTriggerTuple>,
-    model_triggers: &HashSet<StoreTriggerTuple>,
+    model_slab: &HashSet<StoreTriggerTuple>,
+    model_key: &HashSet<StoreTriggerTuple>,
 ) -> color_eyre::Result<()> {
-    if slab_triggers != key_triggers {
-        let slab_only: Vec<_> = slab_triggers.difference(key_triggers).collect();
-        let key_only: Vec<_> = key_triggers.difference(slab_triggers).collect();
-
-        return Err(color_eyre::eyre::eyre!(
-            "Dual-index consistency violation!\nTriggers in slab index but not key index: \
-             {slab_only:?}\nTriggers in key index but not slab index: {key_only:?}"
-        ));
-    }
-
-    if slab_triggers != model_triggers {
-        let store_only: Vec<_> = slab_triggers.difference(model_triggers).collect();
-        let model_only: Vec<_> = model_triggers.difference(slab_triggers).collect();
+    if slab_triggers != model_slab {
+        let store_only: Vec<_> = slab_triggers.difference(model_slab).collect();
+        let model_only: Vec<_> = model_slab.difference(slab_triggers).collect();
 
         return Err(color_eyre::eyre::eyre!(
             "Store does not match model!\nTriggers in store but not model: \
              {store_only:?}\nTriggers in model but not store: {model_only:?}"
+        ));
+    }
+
+    if key_triggers != model_key {
+        return Err(color_eyre::eyre::eyre!(
+            "Key index does not match its model"
         ));
     }
 
@@ -1233,10 +1372,16 @@ where
             .find(|t| t.key == *key && t.time == *time && t.timer_type == *timer_type)
             .map(|t| t.tag);
 
-        if slab_tag != Some(*expected_tag) {
+        let expected_slab_tag = model
+            .slab_index
+            .get(&(*segment_id, slab_id, *timer_type))
+            .is_some_and(|rows| rows.contains(&(key.clone(), *time, *timer_type)))
+            .then_some(*expected_tag);
+        if slab_tag != expected_slab_tag {
             return Err(color_eyre::eyre::eyre!(
                 "Slab-index trigger tag mismatch: segment={segment_id} slab={slab_id} key={key:?} \
-                 time={time:?} type={timer_type:?} expected Some({expected_tag}), got {slab_tag:?}"
+                 time={time:?} type={timer_type:?} expected {expected_slab_tag:?}, got \
+                 {slab_tag:?}"
             ));
         }
     }
@@ -1254,9 +1399,10 @@ where
 {
     let slab_triggers = collect_slab_trigger_set(store, model).await?;
     let key_triggers = collect_key_trigger_set(store, model).await?;
-    let model_triggers = collect_model_trigger_set(model);
+    let model_slab = collect_model_slab_set(model);
+    let model_key = collect_model_key_set(model);
 
-    verify_trigger_sets(&slab_triggers, &key_triggers, &model_triggers)?;
+    verify_trigger_sets(&slab_triggers, &key_triggers, &model_slab, &model_key)?;
     verify_tag_consistency(store, model).await
 }
 

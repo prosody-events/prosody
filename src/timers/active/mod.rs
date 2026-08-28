@@ -31,18 +31,10 @@ use ahash::HashMap;
 use scc::hash_map::Entry;
 use std::sync::Arc;
 
-/// Per-timer entry combining lifecycle state with the oracle tag.
-///
-/// `state` and `tag` must be mutated together under the trigger-lock.
-/// Per-key linearization (`KeyManager`) makes this coherent: no two
-/// `EventContext` operations for the same key run concurrently.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ActiveTriggerEntry {
     /// Lifecycle state of the timer.
     pub(crate) state: TimerState,
-    /// Random 32-bit identity; `0` for legacy/inline timers without a stored
-    /// tag.
-    pub(crate) tag: i32,
 }
 
 /// Point-in-time counts of active timers for metrics reporting.
@@ -169,11 +161,6 @@ pub(crate) enum EffectOrder {
     MemoryThenStore,
     /// The durable write runs first; all in-memory effects after.
     StoreThenMemory,
-    /// The state flip runs before the durable write; the tag adoption and
-    /// queue effect after it. Sole user: reviving an `Aborted` slot via
-    /// `clear_and_schedule`, whose requeue must only happen once the fresh
-    /// row is durable.
-    StateThenStoreThenQueue,
 }
 
 /// Telemetry event a [`Transition`] emits once fully applied.
@@ -187,13 +174,11 @@ pub(crate) enum Announce {
 
 /// The in-memory effects on one side of a [`Transition`]'s durable write.
 ///
-/// Applied in field order: state flip, tag adoption, then queue effect.
+/// Applied in field order: state flip, then queue effect.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MemoryEffects {
     /// New registry state for the timer; `None` leaves the entry untouched.
     pub(crate) next_state: Option<TimerState>,
-    /// Adopt the driving trigger's tag into the registry entry.
-    pub(crate) adopt_tag: bool,
     /// Scheduler effect to run after the state and tag updates.
     pub(crate) queue: QueueEffect,
 }
@@ -202,7 +187,6 @@ impl MemoryEffects {
     /// No in-memory effects.
     const NONE: Self = Self {
         next_state: None,
-        adopt_tag: false,
         queue: QueueEffect::None,
     };
 }
@@ -219,8 +203,6 @@ impl MemoryEffects {
 pub(crate) struct Transition {
     /// New registry state for the timer; `None` leaves the entry untouched.
     next_state: Option<TimerState>,
-    /// Adopt the driving trigger's tag into the registry entry.
-    adopt_tag: bool,
     /// Scheduler queue effect.
     queue: QueueEffect,
     /// Durable-store effect.
@@ -247,23 +229,11 @@ impl Transition {
     pub(crate) fn phases(self) -> (MemoryEffects, MemoryEffects) {
         let all = MemoryEffects {
             next_state: self.next_state,
-            adopt_tag: self.adopt_tag,
             queue: self.queue,
         };
         match self.ordering {
             EffectOrder::MemoryThenStore => (all, MemoryEffects::NONE),
             EffectOrder::StoreThenMemory => (MemoryEffects::NONE, all),
-            EffectOrder::StateThenStoreThenQueue => (
-                MemoryEffects {
-                    next_state: self.next_state,
-                    ..MemoryEffects::NONE
-                },
-                MemoryEffects {
-                    adopt_tag: self.adopt_tag,
-                    queue: self.queue,
-                    ..MemoryEffects::NONE
-                },
-            ),
         }
     }
 }
@@ -278,7 +248,7 @@ pub struct ActiveTriggers(Arc<scc::HashMap<Key, TriggerStateMap>>);
 
 impl ActiveTriggers {
     /// Inserts a trigger into the active registry with
-    /// [`TimerState::Scheduled`] state and the trigger's `tag`.
+    /// [`TimerState::Scheduled`] state.
     ///
     /// Creates a new map of (time, type) to entry if no entry exists for the
     /// trigger's key. Duplicate insertions are ignored if the trigger already
@@ -286,7 +256,6 @@ impl ActiveTriggers {
     pub async fn insert(&self, trigger: Trigger) {
         let entry = ActiveTriggerEntry {
             state: TimerState::Scheduled,
-            tag: trigger.tag,
         };
         self.0
             .entry_async(trigger.key)
@@ -328,42 +297,6 @@ impl ActiveTriggers {
             })
             .await
             .flatten()
-    }
-
-    /// Returns the tag of a given trigger time and type for a key, or
-    /// `None` if absent.
-    pub async fn get_tag(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> Option<i32> {
-        self.0
-            .read_async(key, |_, states| {
-                states.get(&(time, timer_type)).map(|e| e.tag)
-            })
-            .await
-            .flatten()
-    }
-
-    /// Atomically updates the tag for a given trigger entry.
-    ///
-    /// Returns `true` if the entry existed and was updated.
-    pub async fn set_tag(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-        tag: i32,
-    ) -> bool {
-        if let Entry::Occupied(mut occupied) = self.0.entry_async(key.clone()).await {
-            let states = occupied.get_mut();
-            if let Some(entry) = states.get_mut(&(time, timer_type)) {
-                entry.tag = tag;
-                return true;
-            }
-        }
-        false
     }
 
     /// Checks whether a given trigger time and type is active for a key.
@@ -468,13 +401,12 @@ impl ActiveTriggers {
 /// scheduled, already removed, or its slab not yet loaded (absent timers
 /// still accept `Schedule`/`Unschedule` so durable rows stay authoritative).
 pub(crate) fn transition(prior: Option<TimerState>, op: TimerOp) -> Transition {
-    use EffectOrder::{StateThenStoreThenQueue, StoreThenMemory};
+    use EffectOrder::StoreThenMemory;
     use TimerState::{Aborted, Firing, FiringRescheduled, Scheduled};
 
     /// A row with every effect at its no-op value.
     const NOOP: Transition = Transition {
         next_state: None,
-        adopt_tag: false,
         queue: QueueEffect::None,
         store: StoreEffect::None,
         ordering: EffectOrder::MemoryThenStore,
@@ -490,24 +422,17 @@ pub(crate) fn transition(prior: Option<TimerState>, op: TimerOp) -> Transition {
             ..NOOP
         },
 
-        // Requeue an aborted timer: its row and tag are already durable.
-        (TimerOp::Schedule, Some(Aborted)) => Transition {
+        // Schedule a coordinate with no live attempt. Persisting the rows
+        // before the scheduler `Add` means a concurrent slab-load scan between
+        // the two writes already sees them; the actor's `Add` then finds the
+        // slab owned and just inserts the in-memory entry. An aborted refire
+        // re-persists too because its key row can be absent after a receipt.
+        (TimerOp::Schedule, Some(Scheduled | Aborted) | None) => Transition {
             next_state: Some(Scheduled),
-            queue: QueueEffect::Enqueue,
-            announce: Some(Announce::Scheduled),
-            ..NOOP
-        },
-
-        // Fresh schedule. Persisting the row before the scheduler `Add`
-        // means a concurrent slab-load scan between the two writes already
-        // sees the row; the actor's `Add` then finds the slab owned and just
-        // inserts the in-memory entry.
-        (TimerOp::Schedule, Some(Scheduled) | None) => Transition {
             queue: QueueEffect::Insert,
             store: StoreEffect::Insert,
             ordering: StoreThenMemory,
             announce: Some(Announce::Scheduled),
-            ..NOOP
         },
 
         // Cancel a reschedule: back to `Firing`, drop the queued re-fire.
@@ -538,7 +463,6 @@ pub(crate) fn transition(prior: Option<TimerState>, op: TimerOp) -> Transition {
         // a rotation the store could lose.
         (TimerOp::Complete | TimerOp::Receipt, Some(FiringRescheduled)) => Transition {
             next_state: Some(Scheduled),
-            adopt_tag: true,
             store: StoreEffect::UpdateTag,
             ordering: StoreThenMemory,
             ..NOOP
@@ -588,14 +512,11 @@ pub(crate) fn transition(prior: Option<TimerState>, op: TimerOp) -> Transition {
             ..NOOP
         },
 
-        // Revive an aborted slot via `clear_and_schedule`: flip to
-        // `Scheduled` before the atomic write; adopt the trigger's tag and
-        // requeue only once the fresh row is durable.
+        // Revive an aborted slot after the atomic write makes its row durable.
         (TimerOp::ClearSchedule, Some(Aborted)) => Transition {
             next_state: Some(Scheduled),
-            adopt_tag: true,
             queue: QueueEffect::Insert,
-            ordering: StateThenStoreThenQueue,
+            ordering: StoreThenMemory,
             ..NOOP
         },
 

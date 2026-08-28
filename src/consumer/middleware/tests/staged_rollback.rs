@@ -1,15 +1,17 @@
 use super::*;
 use crate::consumer::middleware::tests::test_support::{
-    Ctx, buffered, cart, committed_value, is_provisional,
+    Ctx, DuplicateHandler, TestLifecycleAccess, buffered, buffered_with, cart, committed_value,
+    is_provisional,
 };
 use crate::loader::MemoryLoader;
 use crate::state::descriptor::Registered;
+use crate::state::manager::ArmedKeys;
 use crate::state::memory::MemoryCellStore;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-use crate::state::store::CellStore;
+use crate::state::session::Finalized;
+use crate::state::session::sealed::StateLifecycle;
 use crate::state::{EventRef, StateKey, StateName};
 use color_eyre::eyre::{Result, bail, eyre};
-use futures::StreamExt;
 use quickcheck::{QuickCheck, TestResult};
 use serde_json::json;
 use std::future::ready;
@@ -302,36 +304,25 @@ async fn permanent_skip_hook_reads_through_the_stamp() -> Result<()> {
     Ok(())
 }
 
-/// Abort-only-on-shutdown, end to end through `settle`'s success path: a
-/// shutdown is the *sole* thing that stops the durability sequence short
-/// of a commit — a shutdown seen before the finalize stage abandons with
-/// nothing ever staged, so nothing is left provisional; the offset aborts
-/// either way (the event redelivers and re-runs). Every store failure
-/// instead retries forever.
+/// Every settle posture commits unless shutdown interrupts it, and a failed
+/// promote never blocks the commit.
 ///
-/// The never-abort-except-shutdown invariant, as a property over a
-/// generated leading-failure count, the **category** those failures
-/// classify as, and a shutdown flag: `settle`'s success path aborts the
-/// offset **iff** shutdown (leaving nothing provisional), and
-/// otherwise self-heals to a commit **no matter how many** failures —
-/// of **any** category — the arm hits first (the arm is must-succeed,
-/// invariant 8) — then records the marker, commits, and promotes the
-/// cell. Generating the category is what exercises the retry-forever
-/// fold in `retry_step`: `Terminal` retries rather than abandons, and
-/// `Permanent` is retried by the arm's own loop past `retry_step`'s
-/// `Skip`. Each iteration runs on its own paused single-thread
-/// runtime so the retry backoff advances instantly and never blocks.
+/// The property varies the posture (Duplicate, Final sweeps, Final reruns),
+/// an optional promote failure (category and budget), and the shutdown flag.
+/// A Final posture aborts if and only if shutdown is active. That check runs
+/// before the stage, so the abort leaves no provisional cell. A Duplicate
+/// sweeps a pre-staged cell. A clean sweep commits even under shutdown. A
+/// Permanent sweep failure logs and commits. A Transient sweep failure aborts
+/// under shutdown; otherwise it arms one backstop and commits.
+///
+/// A failed promote leaves the cell provisional in every posture. The sweep
+/// posture arms one backstop for it; the rerun posture armed before the
+/// marker. The sweep posture records its receipt while the cell is
+/// provisional and commits after the promote. Each case runs on a paused
+/// runtime.
 #[test]
 fn prop_settle_aborts_iff_shutdown() {
-    fn property(fail_count: u8, category_sel: u8, shutdown: bool) -> TestResult {
-        // A small bound keeps each iteration's paused-clock retry loop fast
-        // while still crossing the zero / non-zero boundary.
-        let fail_count = usize::from(fail_count % 6);
-        let category = match category_sel % 3 {
-            0 => ErrorCategory::Transient,
-            1 => ErrorCategory::Permanent,
-            _ => ErrorCategory::Terminal,
-        };
+    fn property(posture: u8, failure: u8, shutdown: bool) -> TestResult {
         let runtime = Builder::new_current_thread()
             .enable_time()
             .start_paused(true)
@@ -340,41 +331,93 @@ fn prop_settle_aborts_iff_shutdown() {
             return TestResult::error("failed to build paused runtime");
         };
         runtime.block_on(async move {
-            let configure = |c: Ctx| {
-                let c = c.with_timer_failures(fail_count, category);
-                if shutdown { c.with_shutdown() } else { c }
+            let sweep_failure = match failure % 3 {
+                0 => None,
+                1 => Some((ErrorCategory::Permanent, 8)),
+                _ => Some((ErrorCategory::Transient, 1)),
             };
-            let Ok((context, cell_store, cart_id)) = buffered(configure).await else {
+            let armed: ArmedKeys = Arc::default();
+            let configure = MockEventContext::with_timer_tracking;
+            let Ok((mut context, cell_store, cart_id)) =
+                buffered_with(armed, sweep_failure, configure).await
+            else {
                 return TestResult::error("failed to buffer the write");
             };
-            let handler = ProbeHandler::ok(0);
-            let (guard, committed, aborted) = RecordingGuard::new();
-
-            settle(&handler, context, guard, Ok(0)).await;
+            let posture = posture % 3;
+            if posture == 0 {
+                let Ok(lifecycle) = context.test_lifecycle() else {
+                    return TestResult::error("failed to get the lifecycle");
+                };
+                if !matches!(lifecycle.finalize().await, Ok(Finalized::Staged(_))) {
+                    return TestResult::error("duplicate setup did not stage the cell");
+                }
+            }
+            if shutdown {
+                context = context.with_shutdown();
+            }
+            let (guard, committed, aborted) = if posture == 2 {
+                RecordingGuard::new_reruns()
+            } else {
+                RecordingGuard::new()
+            };
+            let receipts = guard.receipts.clone();
+            let receipt_saw_provisional = Arc::new(AtomicBool::new(false));
+            let commit_saw_resolved = Arc::new(AtomicBool::new(false));
+            let guard = if posture == 1 && !shutdown {
+                guard.with_order(
+                    cell_store.clone(),
+                    cart_id.clone(),
+                    receipt_saw_provisional.clone(),
+                    commit_saw_resolved.clone(),
+                )
+            } else {
+                guard
+            };
+            if posture == 0 {
+                settle(&DuplicateHandler, context.clone(), guard, Ok(())).await;
+            } else {
+                settle(&ProbeHandler::ok(0), context.clone(), guard, Ok(0)).await;
+            }
 
             let committed = committed.load(Ordering::SeqCst);
             let aborted = aborted.load(Ordering::SeqCst);
-            let provisional = cell_store.provisional_cells(&cart_id);
-            futures::pin_mut!(provisional);
-            let still_provisional = matches!(provisional.next().await, Some(Ok(_)));
+            let receipts = receipts.load(Ordering::SeqCst);
+            let Ok(still_provisional) = is_provisional(&cell_store, &cart_id).await else {
+                return TestResult::error("failed to inspect the provisional cell");
+            };
+            let scheduled = context.count_scheduled(TimerType::StateRecovery);
+            let transient = matches!(sweep_failure, Some((ErrorCategory::Transient, _)));
+            let failing = sweep_failure.is_some();
 
-            if shutdown {
-                // Abort iff shutdown: the offset aborts, and nothing was
-                // ever staged (settle's finalize step sees shutdown first).
-                if aborted != 1 || committed != 0 || still_provisional {
-                    return TestResult::error(format!(
-                        "shutdown must abort with nothing staged: committed={committed} \
-                         aborted={aborted} provisional={still_provisional}"
-                    ));
-                }
+            let expected_abort = if posture == 0 {
+                shutdown && transient
             } else {
-                // No shutdown: self-heal to a commit however many failures first.
-                if committed != 1 || aborted != 0 || still_provisional {
-                    return TestResult::error(format!(
-                        "non-shutdown must self-heal to commit: committed={committed} \
-                         aborted={aborted} provisional={still_provisional}"
-                    ));
-                }
+                shutdown
+            };
+            let expected_receipts = usize::from(posture == 1 && !shutdown);
+            // The Duplicate setup stages the cell before `settle`. A Duplicate
+            // abort leaves that cell for the next sweep. A Final abort occurs
+            // before the stage, so nothing is provisional.
+            let expected_provisional = failing && (posture == 0 || !expected_abort);
+            let expected_armed = usize::from(
+                !expected_abort
+                    && (posture == 2 || (posture == 1 && failing) || (posture == 0 && transient)),
+            );
+            if aborted != usize::from(expected_abort)
+                || committed != usize::from(!expected_abort)
+                || receipts != expected_receipts
+                || still_provisional != expected_provisional
+                || scheduled != expected_armed
+                || (posture == 1
+                    && !shutdown
+                    && (!receipt_saw_provisional.load(Ordering::SeqCst)
+                        || commit_saw_resolved.load(Ordering::SeqCst) == failing))
+            {
+                return TestResult::error(format!(
+                    "posture={posture} failure={sweep_failure:?} shutdown={shutdown} \
+                     committed={committed} aborted={aborted} receipts={receipts} \
+                     provisional={still_provisional} armed={scheduled}"
+                ));
             }
             TestResult::passed()
         })
