@@ -43,7 +43,7 @@ use tokio::time::sleep;
 use tracing::{Level, Span, error, warn};
 
 /// Delay between retry attempts when commits fail.
-pub(crate) const RETRY_DURATION: Duration = Duration::from_secs(1);
+const RETRY_DURATION: Duration = Duration::from_secs(1);
 
 /// Shared released trace (a dispatched no-op span) used to release processing
 /// resources without allocating a fresh `Arc` on every
