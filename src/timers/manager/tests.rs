@@ -1275,6 +1275,31 @@ async fn tag_inv3_firing_commit_removes_row() -> Result<()> {
     Ok(())
 }
 
+/// The durable key-index tag alone classifies timer refires.
+#[tokio::test]
+async fn committed_refire_follows_store_tag() -> Result<()> {
+    time::pause();
+    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+    let trigger = create_test_trigger("refire", 10, TimerType::Application)?;
+
+    assert!(manager.is_committed_refire(&trigger).await?);
+    manager.schedule_trigger(trigger.clone()).await?;
+    assert!(!manager.is_committed_refire(&trigger).await?);
+
+    let different = Trigger::with_tag(
+        trigger.key.clone(),
+        trigger.time,
+        trigger.timer_type,
+        trigger.tag.wrapping_add(1),
+        Span::current(),
+    );
+    assert!(manager.is_committed_refire(&different).await?);
+    manager
+        .complete(&trigger.key, trigger.time, trigger.timer_type)
+        .await?;
+    Ok(())
+}
+
 /// Inv #8 (reload parity): after `complete()`-from-`FiringRescheduled`,
 /// the tag persisted in the store equals the tag held in
 /// `ActiveTriggers`, and both equal the rotated post-commit value.

@@ -18,7 +18,7 @@ pub mod test_support;
 
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
-use std::future::ready;
+use std::future::{Future, ready};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -26,15 +26,15 @@ use std::time::Duration;
 use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
 
-use super::settle::{ArmOutcome, arm_backstop};
+use super::settle::arm_backstop;
 use super::*;
-use crate::consumer::EventHandler;
-use crate::consumer::Uncommitted;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::tests::test_support::{
     MockEventContext, create_test_message, create_test_message_from,
 };
 use crate::consumer::partition::offsets::OffsetTracker;
+use crate::consumer::receipted_sealed;
+use crate::consumer::{EventHandler, Receipted, Redelivery, Uncommitted};
 use crate::error::ErrorCategory;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
@@ -168,6 +168,7 @@ impl FallibleHandler for ProbeHandler {
 struct RecordingGuard {
     committed: Arc<AtomicUsize>,
     aborted: Arc<AtomicUsize>,
+    redelivery: Redelivery,
 }
 
 impl RecordingGuard {
@@ -180,10 +181,17 @@ impl RecordingGuard {
             Self {
                 committed: committed.clone(),
                 aborted: aborted.clone(),
+                redelivery: Redelivery::Sweeps,
             },
             committed,
             aborted,
         )
+    }
+
+    fn new_reruns() -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let (mut guard, committed, aborted) = Self::new();
+        guard.redelivery = Redelivery::Reruns;
+        (guard, committed, aborted)
     }
 }
 
@@ -194,6 +202,18 @@ impl Uncommitted for RecordingGuard {
 
     async fn abort(self) {
         self.aborted.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl receipted_sealed::Sealed for RecordingGuard {}
+
+impl Receipted for RecordingGuard {
+    fn redelivery(&self) -> impl Future<Output = Redelivery> + Send {
+        ready(self.redelivery)
+    }
+
+    fn receipt(&mut self) -> impl Future<Output = ()> + Send {
+        ready(())
     }
 }
 
@@ -305,6 +325,7 @@ async fn after_commit_for_timer_path_with_ok_output() {
             let guard = RecordingGuard {
                 committed: self.committed.clone(),
                 aborted: self.aborted.clone(),
+                redelivery: Redelivery::Sweeps,
             };
             (trigger, guard)
         }
@@ -477,5 +498,6 @@ mod backstop_amortization;
 /// (promoted cells the new values, un-promoted cells `prev`).
 mod hook_visibility;
 mod marker_record_must_succeed;
+mod redelivery_settlement;
 mod settled_view;
 mod settlement_classification;

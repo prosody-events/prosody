@@ -1,7 +1,5 @@
 use super::*;
 use crate::Key;
-use crate::consumer::EventHandler;
-use crate::consumer::Uncommitted;
 use crate::consumer::message::ConsumerMessageValue;
 use crate::consumer::message::UncommittedMessage;
 use crate::consumer::middleware::tests::test_support::{
@@ -10,10 +8,13 @@ use crate::consumer::middleware::tests::test_support::{
 };
 use crate::consumer::middleware::{FallibleEventHandler, Settlement, SettlementHandler};
 use crate::consumer::partition::offsets::OffsetTracker;
+use crate::consumer::receipted_sealed;
+use crate::consumer::{EventHandler, Receipted, Redelivery, Uncommitted};
 use crate::state::manager::EventStateScope;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::{EventRef, StateKey};
 use crossbeam_utils::CachePadded;
+use std::future::ready;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -164,6 +165,18 @@ impl Uncommitted for Guard {
 
     async fn abort(self) {
         self.aborted.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl receipted_sealed::Sealed for Guard {}
+
+impl Receipted for Guard {
+    fn redelivery(&self) -> impl Future<Output = Redelivery> + Send {
+        ready(Redelivery::Sweeps)
+    }
+
+    fn receipt(&mut self) -> impl Future<Output = ()> + Send {
+        ready(())
     }
 }
 

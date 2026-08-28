@@ -369,6 +369,22 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Removes a trigger from the key index only.
+    fn remove_key_row(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Removes a trigger from the slab index only.
+    fn remove_slab_row(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
     /// Atomically clears existing timers for a key/type and schedules a new
     /// one.
     ///

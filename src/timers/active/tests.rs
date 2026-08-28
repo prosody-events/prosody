@@ -281,3 +281,33 @@ fn prop_active_triggers_track_model() {
     }
     QuickCheck::new().quickcheck(property as fn(Trace));
 }
+
+/// Receipt and retire preserve the split timer lifecycle for every prior state.
+#[test]
+fn receipt_and_retire_transition_table() {
+    use TimerState::{Aborted, Firing, FiringRescheduled, Scheduled};
+
+    let receipt_delete = [Some(Firing), Some(Scheduled), Some(Aborted), None];
+    for prior in receipt_delete {
+        let transition = transition(prior, TimerOp::Receipt);
+        assert_eq!(transition.store(), StoreEffect::DeleteKeyRow);
+        assert_eq!(transition.phases().0.queue, QueueEffect::None);
+        assert!(transition.announce().is_none());
+    }
+
+    let rescheduled = transition(Some(FiringRescheduled), TimerOp::Receipt);
+    assert_eq!(rescheduled.store(), StoreEffect::UpdateTag);
+    assert!(rescheduled.phases().1.adopt_tag);
+
+    for prior in [Some(Firing), Some(Aborted), None] {
+        let transition = transition(prior, TimerOp::Retire);
+        assert_eq!(transition.store(), StoreEffect::DeleteSlabRow);
+        assert_eq!(transition.phases().0.queue, QueueEffect::Deactivate);
+    }
+
+    for prior in [Some(Scheduled), Some(FiringRescheduled)] {
+        let transition = transition(prior, TimerOp::Retire);
+        assert_eq!(transition.store(), StoreEffect::None);
+        assert_eq!(transition.phases().0.queue, QueueEffect::None);
+    }
+}

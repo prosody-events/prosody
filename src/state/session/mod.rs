@@ -70,7 +70,7 @@ use crate::state::descriptor::{
 use crate::state::dirty::{CellSnapshot, ClearedSections, DirtyStore, DirtyVal, ResolvedCells};
 use crate::state::first_write::FirstWriteBarrier;
 use crate::state::identity::{CollectionId, CollectionRef};
-use crate::state::manager::ArmedKeys;
+use crate::state::manager::{ArmedKeys, sweep_partition};
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::oracle::CommitOracle;
 use crate::state::overlay::Overlay;
@@ -446,8 +446,9 @@ pub(crate) mod sealed {
         /// `finalize`.
         Clean,
 
-        /// At least one `ReadCommitted` collection staged; the boundary must
-        /// arm the `StateRecovery` backstop and consume the receipt.
+        /// At least one `ReadCommitted` collection staged. The boundary must
+        /// consume the receipt. It arms a backstop when the posture requires
+        /// one.
         Staged(StagedState<S>),
     }
 
@@ -506,8 +507,8 @@ pub(crate) mod sealed {
         /// `event`/`prev`, O(1) per cell) after the event committed; the
         /// commit arm also applies the frozen clears' gap erase. Best-effort:
         /// failures warn per collection and fold into
-        /// [`ApplyOutcome::Incomplete`] (the backstop, always left armed,
-        /// lets the sweep retry).
+        /// [`ApplyOutcome::Incomplete`]. The boundary arms a safety timer
+        /// before it retires a sweep-posture redelivery source.
         pub(crate) async fn promote(self) -> ApplyOutcome {
             let StagedState {
                 store, collections, ..
@@ -527,13 +528,9 @@ pub(crate) mod sealed {
         /// Every staged cell promoted to its committed data.
         Resolved,
 
-        /// At least one resolution failed. Recovery is guaranteed without any
-        /// point-clear: the durability boundary never unschedules the per-key
-        /// `StateRecovery` backstop (only the sweep's own fire clears it), so
-        /// the standing backstop fires and the sweep retries; a
-        /// transient sweep failure reschedules a fresh backstop, a
-        /// permanent per-cell skip is left to first-touch and the key's
-        /// next commit. The backstop aborts only on shutdown.
+        /// At least one resolution failed. The boundary arms a safety timer
+        /// before source retirement. A transient sweep failure schedules a
+        /// new timer. First-touch handles a permanent cell failure.
         Incomplete,
     }
 
@@ -583,6 +580,13 @@ pub(crate) mod sealed {
             marker: MessageMarker,
             proof: MarkerWrite,
         ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
+
+        /// Sweeps this session's key through all registered collections.
+        ///
+        /// `overlay.lower()` is the session cell store. The partition recovery
+        /// path sweeps the same store. This verb never changes `ArmedKeys`.
+        /// A redelivered event does not consume a standing safety timer.
+        fn sweep(&self) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
         /// Discards just this event's buffered dirty cells — the isolation step
         /// of the attempt-boundary [`Self::reset`] transition (which then bumps
@@ -1473,6 +1477,17 @@ where
             .record_message(marker.into_uuid())
             .await
             .map_err(|e| StateAccessError::store(&e))
+    }
+
+    async fn sweep(&self) -> Result<(), StateAccessError> {
+        sweep_partition(
+            self.inner.overlay.lower(),
+            &self.inner.oracle,
+            &self.inner.registry,
+            &self.inner.state_key,
+        )
+        .await
+        .map_err(|error| StateAccessError::store(&error))
     }
 
     fn discard_dirty(&self) {

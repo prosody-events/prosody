@@ -26,7 +26,7 @@ async fn arm_shutdown_rolls_the_staged_cells_back() -> Result<()> {
     let (context, cell_store, cart_id) = buffered(Ctx::with_shutdown_on_timer_read).await?;
     let handler = ProbeHandler::ok(0);
     let log = handler.log.clone();
-    let (guard, committed, aborted) = RecordingGuard::new();
+    let (guard, committed, aborted) = RecordingGuard::new_reruns();
 
     settle(&handler, context, guard, Ok(0)).await;
 

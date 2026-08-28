@@ -257,6 +257,7 @@ fn guard() -> (RecordingGuard, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let g = RecordingGuard {
         committed: committed.clone(),
         aborted: aborted.clone(),
+        redelivery: Redelivery::Sweeps,
     };
     (g, committed, aborted)
 }

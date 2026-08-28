@@ -78,9 +78,9 @@ type IdentityErr<B> = <<B as StateBackend>::Identity as DescriptorIdentityStore>
 /// `StateRecovery` backstop.
 ///
 /// A lock-free [`scc::HashMap`](ConcurrentHashMap) (not a `Mutex<HashMap>`):
-/// the durability boundary touches it on every stateful commit, concurrently
-/// across the partition's keys, so a single mutex would serialize unrelated
-/// keys. The stored fire lets `arm_backstop` re-arm only when a newly-staged
+/// the durability boundary touches it for each required arm. Different keys
+/// can arm concurrently, so a single mutex would serialize unrelated keys.
+/// The stored fire lets `arm_backstop` re-arm only when a newly-staged
 /// commit's fire is *sooner* than the standing one (the tightening the
 /// per-collection `recovery_within` bound needs); the map is still
 /// self-draining ([`PartitionStateManager::recover`] removes the key when the
@@ -217,6 +217,16 @@ pub trait PartitionStateManager: Clone + Send + Sync + 'static {
     /// [`SweepResolution::Abort`], so the trigger refires and re-sweeps on the
     /// next partition acquisition.
     fn recover<T>(
+        &self,
+        key: Key,
+        timers: &TimerManager<T>,
+        shutdown: &watch::Receiver<ShutdownPhase>,
+    ) -> impl Future<Output = SweepResolution> + Send
+    where
+        T: TriggerStore;
+
+    /// Resolves state for a committed redelivery without consuming a backstop.
+    fn resolve_redelivered<T>(
         &self,
         key: Key,
         timers: &TimerManager<T>,
@@ -361,7 +371,6 @@ where
     where
         T: TriggerStore,
     {
-        let state_key = StateKey::new(self.inner.segment_id, key.clone());
         // Sweep↔debounce ordering (finding F2): clear the armed flag BEFORE
         // reading the provisional set, so the key's next stateful commit (or the
         // reschedule below) re-arms a fresh backstop. Per-key serialization — a
@@ -371,6 +380,37 @@ where
         // point-clears another event's backstop: only this fired sweep clears,
         // and only its own.
         self.inner.armed.remove_async(&key).await;
+        self.resolve_sweep(key, timers, shutdown).await
+    }
+
+    async fn resolve_redelivered<T>(
+        &self,
+        key: Key,
+        timers: &TimerManager<T>,
+        shutdown: &watch::Receiver<ShutdownPhase>,
+    ) -> SweepResolution
+    where
+        T: TriggerStore,
+    {
+        self.resolve_sweep(key, timers, shutdown).await
+    }
+}
+
+impl<B, L> StateManager<B, L>
+where
+    B: StateBackend,
+    L: Clone + Send + Sync + 'static,
+{
+    async fn resolve_sweep<T>(
+        &self,
+        key: Key,
+        timers: &TimerManager<T>,
+        shutdown: &watch::Receiver<ShutdownPhase>,
+    ) -> SweepResolution
+    where
+        T: TriggerStore,
+    {
+        let state_key = StateKey::new(self.inner.segment_id, key.clone());
         match sweep_partition(
             &self.inner.cell,
             &self.inner.oracle,
@@ -593,7 +633,7 @@ where
 /// [`sweep_provisional`](crate::state::resolve), left for first-touch or a
 /// later sweep; a transient/terminal failure propagates via `Err` for
 /// [`PartitionStateManager::recover`] to reschedule against.
-async fn sweep_partition<S, O>(
+pub(crate) async fn sweep_partition<S, O>(
     cell: &S,
     oracle: &O,
     registry: &CollectionDefRegistry,

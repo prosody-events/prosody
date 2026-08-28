@@ -170,9 +170,9 @@ fn settlement_classification_table() {
             Settlement::Final,
         ),
         (
-            "Inner(None) delegates to dedup's Bypassed (dedup hit)",
+            "Inner(None) delegates to dedup's Duplicate",
             Ok(MessageDeferOutput::Inner(None)),
-            Settlement::Bypassed,
+            Settlement::Duplicate,
         ),
         (
             "Deferred is Bypassed (parked for retry)",

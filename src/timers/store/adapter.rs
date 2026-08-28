@@ -202,6 +202,29 @@ where
         Ok(())
     }
 
+    async fn remove_key_row(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<(), Self::Error> {
+        self.operations
+            .delete_key_trigger(timer_type, key, time)
+            .await
+    }
+
+    async fn remove_slab_row(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<(), Self::Error> {
+        let slab = Slab::from_time(self.slab_size(), time);
+        self.operations
+            .delete_slab_trigger(&slab, timer_type, key, time)
+            .await
+    }
+
     async fn update_tag(
         &self,
         key: &Key,

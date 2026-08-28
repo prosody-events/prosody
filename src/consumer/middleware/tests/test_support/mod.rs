@@ -26,13 +26,15 @@ use crate::consumer::middleware::{
     DemandType, FallibleHandler, RepinProof, Settlement, SettlementHandler,
 };
 use crate::consumer::partition::ShutdownPhase;
-use crate::consumer::{Keyed, Uncommitted};
+use crate::consumer::receipted_sealed;
+use crate::consumer::{Keyed, Receipted, Redelivery, Uncommitted};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::{MemoryLoader, MessageLoader};
 use crate::state::cell::Committed;
 use crate::state::descriptor::tests::{FixedOracle, TestSession, test_session_parts};
 use crate::state::descriptor::{Registered, StateDescriptor, ValueDescriptor, value_state};
 use crate::state::dirty::DirtyStore;
+use crate::state::manager::ArmedKeys;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
@@ -40,7 +42,7 @@ use crate::state::session::{
     EventSession, KeyedStateSession, LifecycleAccess, SessionParts, TerminationWatch,
 };
 use crate::state::store::CellStore;
-use crate::state::tests::cell_suite::value_cell;
+use crate::state::tests::cell_suite::{FailingCellStore, value_cell};
 use crate::state::tests::support::UnavailableState;
 use crate::state::{
     CollectionId, CommitDecision, EventRef, PartitionBackend, StateKey, StateName, StateType,
@@ -51,6 +53,19 @@ use crate::timers::{TimerType, Trigger, UncommittedTimer};
 
 /// A context backed by a real keyed-state test session.
 pub type Ctx = MockEventContext<Value, TestSession>;
+
+/// Session whose sweep fails for the `cart` collection.
+pub type FailingSweepSession = KeyedStateSession<
+    PartitionBackend<
+        RecordingOracle,
+        MemoryDescriptorIdentityStore,
+        FailingCellStore<MemoryCellStore<RecordingOracle>>,
+    >,
+    MemoryLoader<Value>,
+>;
+
+/// Event context for a session whose sweep fails.
+pub type FailingSweepContext = MockEventContext<Value, FailingSweepSession>;
 
 /// A commit guard that reports when durability reaches the commit.
 ///
@@ -105,6 +120,18 @@ impl Uncommitted for GatedGuard {
     }
 }
 
+impl receipted_sealed::Sealed for GatedGuard {}
+
+impl Receipted for GatedGuard {
+    fn redelivery(&self) -> impl Future<Output = Redelivery> + Send {
+        future::ready(Redelivery::Sweeps)
+    }
+
+    fn receipt(&mut self) -> impl Future<Output = ()> + Send {
+        future::ready(())
+    }
+}
+
 /// Returns the `cart` value descriptor.
 pub fn cart() -> ValueDescriptor {
     value_state("cart")
@@ -133,6 +160,48 @@ pub async fn buffered(
         StateName::try_new("cart")?,
     );
     Ok((context, cell_store, cart_id))
+}
+
+/// Buffers one `cart` write in a session with the selected sweep failure.
+pub async fn buffered_failing_sweep(
+    category: ErrorCategory,
+    armed: ArmedKeys,
+    configure: impl FnOnce(FailingSweepContext) -> FailingSweepContext,
+) -> color_eyre::Result<FailingSweepContext> {
+    let descriptor = cart();
+    let mut registry = CollectionDefRegistry::default();
+    registry.register(&descriptor, CollectionDef::new(None))?;
+    let registry = Arc::new(registry);
+    let oracle = RecordingOracle::new();
+    let store = FailingCellStore::new_with_category(
+        MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone()),
+        StateName::try_new("cart")?,
+        category,
+    );
+    let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let session = KeyedStateSession::new(SessionParts {
+        cell: store,
+        dirty: Arc::new(DirtyStore::new()),
+        oracle,
+        loader: MemoryLoader::new(),
+        registry,
+        state_key: StateKey::new(Uuid::from_u128(0xD0), Arc::from("duplicate")),
+        event: EventRef::Message {
+            dedup_id: Uuid::from_u128(0xD0),
+        },
+        recovery_delay: CompactDuration::new(30),
+        armed,
+        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+        publisher: None,
+    });
+    let context = configure(MockEventContext::new().with_session(session));
+    let handle = context
+        .state(Registered::new(descriptor))
+        .map_err(|error| color_eyre::eyre::eyre!("bind cart: {error}"))?;
+    handle.set(json!({ "x": 1_i32 })).await?;
+    drop(shutdown_tx);
+    Ok(context)
 }
 
 /// Reports whether `id` still has a provisional cell.

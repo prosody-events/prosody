@@ -14,6 +14,7 @@ use educe::Educe;
 use humantime::format_duration;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
+use std::future::ready;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -25,7 +26,8 @@ use tokio::time::{Instant, sleep_until};
 use tokio::{select, spawn};
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::consumer::Uncommitted;
+use crate::consumer::receipted_sealed as sealed;
+use crate::consumer::{Receipted, Redelivery, Uncommitted};
 use crate::{Offset, Partition, Topic};
 
 #[cfg(test)]
@@ -197,6 +199,18 @@ impl Uncommitted for UncommittedOffset {
         };
 
         warn!(self.offset, "commit aborted");
+    }
+}
+
+impl sealed::Sealed for UncommittedOffset {}
+
+impl Receipted for UncommittedOffset {
+    fn redelivery(&self) -> impl Future<Output = Redelivery> + Send {
+        ready(Redelivery::Sweeps)
+    }
+
+    fn receipt(&mut self) -> impl Future<Output = ()> + Send {
+        ready(())
     }
 }
 

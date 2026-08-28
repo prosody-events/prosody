@@ -6,6 +6,7 @@ use async_stream::stream;
 use futures::{FutureExt, Stream};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::watch;
+use tokio::time::sleep;
 use tracing::{Instrument, debug, debug_span, error, info_span};
 
 use super::ShutdownPhase;
@@ -22,6 +23,7 @@ use crate::state::manager::{EventStateScope, PartitionStateManager, SweepResolut
 use crate::state::session::{EventSession, TerminationWatch};
 use crate::state::{EventRef, TimerEventRef};
 use crate::timers::store::TriggerStore;
+use crate::timers::uncommitted::RETRY_DURATION;
 use crate::timers::{PendingTimer, TimerManager, TimerType, UncommittedTimer};
 use crate::{EventIdentity, EventType, ProcessScope};
 
@@ -153,6 +155,34 @@ async fn process_timer<T, S, M, P>(
             SweepResolution::Abort => commit_guard.abort().await,
         }
         return;
+    }
+
+    if firing.timer_type() == TimerType::Application {
+        loop {
+            match timer_manager.is_committed_refire(firing.trigger()).await {
+                Ok(false) => break,
+                Ok(true) => {
+                    let _guard = firing.process_scope();
+                    let (trigger, commit_guard) = firing.into_inner();
+                    match state_manager
+                        .resolve_redelivered(trigger.key.clone(), timer_manager, shutdown_rx)
+                        .await
+                    {
+                        SweepResolution::Commit => commit_guard.commit().await,
+                        SweepResolution::Abort => commit_guard.abort().await,
+                    }
+                    return;
+                }
+                Err(error) => {
+                    if *shutdown_rx.borrow() >= ShutdownPhase::Cancelling {
+                        firing.abort().await;
+                        return;
+                    }
+                    error!(error = %error, "failed to read timer receipt; retrying");
+                    sleep(RETRY_DURATION).await;
+                }
+            }
+        }
     }
 
     let (cancel_tx, cancel_rx) = watch::channel(false);

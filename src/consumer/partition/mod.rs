@@ -49,7 +49,7 @@ mod runtime;
 mod util;
 
 #[cfg(test)]
-use dispatch::guarded_dispatch;
+use dispatch::{guarded_dispatch, process_event};
 use runtime::handle_messages;
 
 #[cfg(test)]

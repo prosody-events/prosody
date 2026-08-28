@@ -36,7 +36,7 @@ use std::sync::Arc;
 /// `state` and `tag` must be mutated together under the trigger-lock.
 /// Per-key linearization (`KeyManager`) makes this coherent: no two
 /// `EventContext` operations for the same key run concurrently.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ActiveTriggerEntry {
     /// Lifecycle state of the timer.
     pub(crate) state: TimerState,
@@ -99,6 +99,10 @@ pub(crate) enum TimerOp {
     Unschedule,
     /// The delivery handler committed.
     Complete,
+    /// Record the commit receipt but keep its redelivery source.
+    Receipt,
+    /// Retire the redelivery source after state promotion.
+    Retire,
     /// The delivery handler abandoned the attempt.
     Abort,
     /// The new timer of a `clear_and_schedule`. Rows for this op and
@@ -119,7 +123,7 @@ pub(crate) enum TimerOp {
 /// [`ActiveTriggers`] entry (and, for `Insert`, persist slab metadata).
 /// These four and `Deactivate` are the only effects that create or delete
 /// registry entries — [`Transition`]s never invent state any other way.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum QueueEffect {
     /// No queue change.
     #[default]
@@ -137,7 +141,7 @@ pub(crate) enum QueueEffect {
 }
 
 /// Durable-store effect of a [`Transition`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StoreEffect {
     /// No store write.
     None,
@@ -145,6 +149,10 @@ pub(crate) enum StoreEffect {
     Insert,
     /// Delete the timer row (`remove_trigger`).
     Delete,
+    /// Delete only the key-index row (`remove_key_row`).
+    DeleteKeyRow,
+    /// Delete only the slab row (`remove_slab_row`).
+    DeleteSlabRow,
     /// Rotate the persisted oracle tag to the trigger's tag (`update_tag`).
     UpdateTag,
 }
@@ -155,7 +163,7 @@ pub(crate) enum StoreEffect {
 /// Store-first orderings exist exactly where an in-memory effect must not
 /// be observable before the row it describes is durable; memory-first
 /// orderings run queue removals before the row disappears.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EffectOrder {
     /// All in-memory effects run before the durable write.
     MemoryThenStore,
@@ -169,7 +177,7 @@ pub(crate) enum EffectOrder {
 }
 
 /// Telemetry event a [`Transition`] emits once fully applied.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Announce {
     /// Emit a `timer_scheduled` lifecycle event.
     Scheduled,
@@ -525,10 +533,10 @@ pub(crate) fn transition(prior: Option<TimerState>, op: TimerOp) -> Transition {
             ..NOOP
         },
 
-        // Commit a rescheduled timer: the row stays (the timer fires again)
+        // Receipt or commit a rescheduled timer: the row stays and fires again.
         // and the oracle tag rotates — durably first, so memory never shows
         // a rotation the store could lose.
-        (TimerOp::Complete, Some(FiringRescheduled)) => Transition {
+        (TimerOp::Complete | TimerOp::Receipt, Some(FiringRescheduled)) => Transition {
             next_state: Some(Scheduled),
             adopt_tag: true,
             store: StoreEffect::UpdateTag,
@@ -544,6 +552,22 @@ pub(crate) fn transition(prior: Option<TimerState>, op: TimerOp) -> Transition {
             ..NOOP
         },
 
+        // A Firing receipt leaves the entry Firing. The scheduler cannot
+        // refire it before retire. The in-process oracle stays conservative
+        // until retire. Per-key serialization prevents a reader during settle.
+        (TimerOp::Receipt, Some(Firing | Scheduled | Aborted) | None) => Transition {
+            store: StoreEffect::DeleteKeyRow,
+            ..NOOP
+        },
+
+        // Retire a consumed source. Firing already removed its queue entry.
+        (TimerOp::Retire, Some(Firing | Aborted) | None) => Transition {
+            queue: QueueEffect::Deactivate,
+            store: StoreEffect::DeleteSlabRow,
+            ..NOOP
+        },
+
+        // A scheduled timer or rescheduled firing must fire again.
         // Abort a reschedule: the timer is still queued; it fires again.
         (TimerOp::Abort, Some(FiringRescheduled)) => Transition {
             next_state: Some(Scheduled),
@@ -588,7 +612,8 @@ pub(crate) fn transition(prior: Option<TimerState>, op: TimerOp) -> Transition {
         // already-aborted or absent timer.
         (TimerOp::Schedule | TimerOp::ClearSchedule, Some(FiringRescheduled))
         | (TimerOp::Unschedule | TimerOp::ClearReplaced, Some(Firing))
-        | (TimerOp::Abort, Some(Aborted) | None) => NOOP,
+        | (TimerOp::Abort, Some(Aborted) | None)
+        | (TimerOp::Retire, Some(Scheduled | FiringRescheduled)) => NOOP,
     }
 }
 

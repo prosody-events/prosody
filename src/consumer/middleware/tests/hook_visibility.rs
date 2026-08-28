@@ -174,9 +174,9 @@ async fn arm_shutdown_after_abort_reads_the_restored_committed_base() -> Result<
         )
         .await?;
     let handler = HookProbe::new(vec![StateName::try_new("cart")?]);
-    let (guard, committed, aborted) = RecordingGuard::new();
+    let (guard, committed, aborted) = RecordingGuard::new_reruns();
 
-    settle(&handler, context, guard, Ok(0)).await;
+    settle(&handler, context.clone(), guard, Ok(0)).await;
 
     assert_eq!(aborted.load(Ordering::SeqCst), 1, "arm-shutdown aborts");
     assert_eq!(committed.load(Ordering::SeqCst), 0);
@@ -392,15 +392,22 @@ async fn incomplete_promote_after_commit_reads_the_mixed_per_cell_view() -> Resu
             Some(b"B1"),
         )
         .await;
-    let context = MockEventContext::new().with_session(session);
+    let context = MockEventContext::new()
+        .with_session(session)
+        .with_timer_tracking();
 
     let handler = HookProbe::new(vec![cart, wishlist]);
     let (guard, committed, aborted) = RecordingGuard::new();
 
-    settle(&handler, context, guard, Ok(0)).await;
+    settle(&handler, context.clone(), guard, Ok(0)).await;
 
     assert_eq!(committed.load(Ordering::SeqCst), 1, "the event committed");
     assert_eq!(aborted.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        context.count_scheduled(TimerType::StateRecovery),
+        1,
+        "an incomplete sweep-posture promotion arms before retirement",
+    );
     assert_eq!(
         recorded.lock().as_slice(),
         [Uuid::from_u128(0xF2)],

@@ -332,9 +332,9 @@ fn settlement_classification_table() {
             Settlement::Final,
         ),
         (
-            "Ok(None) dedup hit is Bypassed",
+            "Ok(None) dedup hit is Duplicate",
             Ok(None),
-            Settlement::Bypassed,
+            Settlement::Duplicate,
         ),
         (
             "Err(Inner) delegates (leaf Final)",
@@ -364,6 +364,6 @@ impl FallibleEventHandler for DeduplicationHandler<MockHandler, MemoryDeduplicat
 
 /// A dedup skip records no second marker: the store is pre-seeded with the
 /// session's dedup id, the boundary is driven end to end, and the skip
-/// (`Ok(None)`, `Bypassed`) commits the offset without re-recording — the
+/// (`Ok(None)`, `Duplicate`) commits the offset without re-recording — the
 /// oracle log stays empty (seeding wrote the store, never the log).
 mod contracts;

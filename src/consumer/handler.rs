@@ -73,6 +73,42 @@ pub trait Uncommitted {
     fn abort(self) -> impl Future<Output = ()> + Send;
 }
 
+/// Selects how the settle boundary protects state after it records a receipt.
+///
+/// A message receipt is a deduplication row. A timer receipt deletes its
+/// key-index row while its slab row remains as the redelivery source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Redelivery {
+    /// Promote state before retirement. A committed redelivery sweeps state.
+    Sweeps,
+    /// Arm a safety timer before commit. A redelivery runs the handler again.
+    Reruns,
+}
+
+/// Splits an event commit into a receipt and redelivery-source retirement.
+///
+/// The receipt makes the commit oracle report that the event committed.
+/// The boundary records a message deduplication row before it calls
+/// `receipt()`. The message guard does nothing in `receipt()`. A timer guard
+/// deletes its key-index row.
+///
+/// [`Redelivery::Sweeps`] lets the boundary promote state before retirement.
+/// A committed redelivery then sweeps the key and retires its source.
+/// [`Redelivery::Reruns`] arms a safety timer before the combined commit.
+/// This posture lets defer refires reload work and rescheduled timers run
+/// again.
+pub trait Receipted: Uncommitted + sealed::Sealed {
+    /// Returns the redelivery posture for this event.
+    fn redelivery(&self) -> impl Future<Output = Redelivery> + Send;
+
+    /// Records the receipt. Retries every failure until the write succeeds.
+    fn receipt(&mut self) -> impl Future<Output = ()> + Send;
+}
+
+pub(crate) mod sealed {
+    pub trait Sealed {}
+}
+
 /// Provides handlers for processing messages from specific partitions.
 ///
 /// This trait allows creating custom message handlers for each partition,

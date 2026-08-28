@@ -414,13 +414,12 @@ where
 // As the outermost durability layer, transient errors retry forever (no
 // fallback exists below). This impl owns the commit-vs-abort *decision* — a
 // shutdown abort must redeliver, not commit, which only the `Resolution` from
-// `run` distinguishes — but it delegates the durability *sequence* (stage →
-// arm → marker record → commit → promote) to the shared `settle` / `abandon`
-// functions, the single owner of that sequence (see the `FallibleEventHandler`
-// docs). Settle-once, mirrored from the `FallibleHandler` impl above: only
-// this outermost position settles; the mid-stack impl loops and returns.
-// Per-attempt apply hooks are `run`'s responsibility — see its apply-hook
-// split.
+// `run` distinguishes. It delegates both durability postures to the shared
+// `settle` and `abandon` functions. They own the sequence (see the
+// `FallibleEventHandler` docs). Settle-once, mirrored from the
+// `FallibleHandler` impl above: only this outermost position settles; the
+// mid-stack impl loops and returns. Per-attempt apply hooks are `run`'s
+// responsibility — see its apply-hook split.
 
 mod event;
 

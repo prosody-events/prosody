@@ -353,6 +353,37 @@ async fn recover_promotes_committed_cell_clears_armed_and_leaves_backstop() -> R
     Ok(())
 }
 
+/// A redelivery sweep resolves committed state without consuming a standing
+/// backstop.
+#[tokio::test]
+async fn resolve_redelivered_promotes_and_preserves_armed_key() -> Result<()> {
+    let oracle = FixedOracle::committed();
+    let registry = registry_with_cart()?;
+    let cell = cell_store(oracle.clone(), &registry);
+    let manager = acquire(&provider_with(cell.clone(), oracle, registry)).await?;
+    let (_stream, timers, _shutdown_tx) = timer_manager().await?;
+    let (_no_shutdown_tx, no_shutdown) = watch::channel(ShutdownPhase::default());
+    let key: Key = Arc::from("redelivered");
+
+    let session = manager
+        .session(key.clone(), timer_event(&key), termination())
+        .handle();
+    stage_under_timer(session, &manager, &key, 11).await?;
+
+    assert_eq!(
+        manager
+            .resolve_redelivered(key.clone(), &timers, &no_shutdown)
+            .await,
+        SweepResolution::Commit,
+    );
+    assert_eq!(
+        committed(&cell, &id_for(&key, "cart")?).await?,
+        Some(bytes(11)),
+    );
+    assert!(manager.inner.armed.contains_async(&key).await);
+    Ok(())
+}
+
 /// `recover` rolls an uncommitted provisional cell back to its committed base
 /// (`prev`, here absent) when the oracle says the event never committed.
 #[tokio::test]

@@ -22,12 +22,14 @@
 //! remove timers permanently; aborts deactivate them in-memory while preserving
 //! persistent state for potential reloading.
 
-use crate::consumer::{Keyed, Uncommitted};
+use crate::consumer::receipted_sealed as sealed;
+use crate::consumer::{Keyed, Receipted, Redelivery, Uncommitted};
 use crate::otel::SpanRelation;
 use crate::related_span;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::TriggerTrace;
+use crate::timers::active::TimerState;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::manager::TimerManager;
 use crate::timers::store::TriggerStore;
@@ -41,7 +43,7 @@ use tokio::time::sleep;
 use tracing::{Level, Span, warn};
 
 /// Delay between retry attempts when commits fail.
-const RETRY_DURATION: Duration = Duration::from_secs(1);
+pub(crate) const RETRY_DURATION: Duration = Duration::from_secs(1);
 
 /// Shared released trace (a dispatched no-op span) used to release processing
 /// resources without allocating a fresh `Arc` on every
@@ -58,7 +60,7 @@ static RELEASED_TRACE: LazyLock<Arc<TriggerTrace>> =
 /// processed by a handler.
 pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
     /// The commit guard type for this timer.
-    type CommitGuard: Uncommitted + Send;
+    type CommitGuard: Receipted + Send;
 
     /// Scheduled execution time of this timer.
     fn time(&self) -> CompactDateTime;
@@ -149,11 +151,22 @@ where
     /// Manager coordinating persistent and in-memory state.
     manager: TimerManager<T>,
 
-    /// Indicates if this timer has already been committed or aborted.
-    completed: bool,
+    /// Current receipt and completion phase.
+    phase: Phase,
 
     /// Global timer semaphore permit; released when this trigger is dropped.
     _permit: OwnedSemaphorePermit,
+}
+
+/// Receipt and completion phase for one delivered timer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Phase {
+    /// The timer has no receipt and can still commit or abort.
+    Active,
+    /// The timer has a receipt and still has a redelivery source.
+    Receipted,
+    /// The timer committed or aborted.
+    Completed,
 }
 
 /// RAII guard that releases timer processing resources (spans) on drop.
@@ -182,7 +195,7 @@ where
                 time,
                 timer_type,
                 manager,
-                completed: false,
+                phase: Phase::Active,
                 _permit: permit,
             },
         }
@@ -204,7 +217,7 @@ where
         // Attempt to transition from Scheduled → Firing, reading the canonical
         // tag from ActiveTriggers under the trigger-lock.
         let Some(canonical_tag) = self.uncommitted.fire_with_tag().await else {
-            self.uncommitted.completed = true;
+            self.uncommitted.phase = Phase::Completed;
             return None;
         };
 
@@ -299,6 +312,21 @@ where
     }
 }
 
+impl<T> Receipted for FiringTimer<T>
+where
+    T: TriggerStore,
+{
+    async fn redelivery(&self) -> Redelivery {
+        self.uncommitted.redelivery().await
+    }
+
+    async fn receipt(&mut self) {
+        self.uncommitted.receipt().await;
+    }
+}
+
+impl<T> sealed::Sealed for FiringTimer<T> where T: TriggerStore {}
+
 impl<T> Keyed for FiringTimer<T>
 where
     T: TriggerStore,
@@ -354,10 +382,70 @@ where
     }
 }
 
+impl<T> Receipted for UncommittedTriggerGuard<T>
+where
+    T: TriggerStore,
+{
+    async fn redelivery(&self) -> Redelivery {
+        match &self.inner {
+            Some(trigger) => trigger.redelivery().await,
+            None => Redelivery::Reruns,
+        }
+    }
+
+    async fn receipt(&mut self) {
+        if let Some(trigger) = &mut self.inner {
+            trigger.receipt().await;
+        }
+    }
+}
+
+impl<T> sealed::Sealed for UncommittedTriggerGuard<T> where T: TriggerStore {}
+
 impl<T> UncommittedTrigger<T>
 where
     T: TriggerStore,
 {
+    async fn redelivery(&self) -> Redelivery {
+        if self.timer_type != TimerType::Application {
+            // Defer refires reload queued work that the defer middleware owns.
+            return Redelivery::Reruns;
+        }
+
+        let state = self
+            .manager
+            .timer_state(&self.key, self.time, self.timer_type)
+            .await;
+        // A rescheduled refire must run the application handler again.
+        if matches!(state, Some(TimerState::FiringRescheduled)) {
+            Redelivery::Reruns
+        } else {
+            Redelivery::Sweeps
+        }
+    }
+
+    async fn receipt(&mut self) {
+        if self.phase != Phase::Active {
+            return;
+        }
+
+        loop {
+            match self
+                .manager
+                .receipt(&self.key, self.time, self.timer_type)
+                .await
+            {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::error!("failed to record timer receipt: {error:#}; retrying");
+                    sleep(RETRY_DURATION).await;
+                }
+            }
+        }
+
+        self.phase = Phase::Receipted;
+    }
+
     /// Attempt to transition the timer from `Scheduled` to `Firing` state,
     /// returning the value observed at the transition; see
     /// [`PendingTimer::fire`] for what "canonical" means here.
@@ -375,18 +463,23 @@ where
     /// Retries indefinitely on failures, waiting `RETRY_DURATION` between
     /// attempts. Multiple commits or aborts are ignored.
     async fn commit(&mut self) {
-        if self.completed {
+        if self.phase == Phase::Completed {
             warn!("timer already marked as completed; ignoring commit");
             return;
         }
 
-        // Retry loop: ensure TimerManager::complete eventually succeeds.
+        // Retry until the selected timer operation succeeds.
         loop {
-            match self
-                .manager
-                .complete(&self.key, self.time, self.timer_type)
-                .await
-            {
+            let result = if self.phase == Phase::Receipted {
+                self.manager
+                    .retire(&self.key, self.time, self.timer_type)
+                    .await
+            } else {
+                self.manager
+                    .complete(&self.key, self.time, self.timer_type)
+                    .await
+            };
+            match result {
                 Ok(()) => break,
                 Err(error) => {
                     tracing::error!("failed to commit timer: {error:#}; retrying");
@@ -395,7 +488,7 @@ where
             }
         }
 
-        self.completed = true;
+        self.phase = Phase::Completed;
     }
 
     /// Deactivate the timer in-memory without removing from storage.
@@ -403,7 +496,7 @@ where
     /// The timer can fire again if reloaded. Multiple aborts or commits
     /// are ignored.
     async fn abort(&mut self) {
-        if self.completed {
+        if self.phase == Phase::Completed {
             warn!("timer already marked as completed; ignoring abort");
             return;
         }
@@ -411,7 +504,7 @@ where
         self.manager
             .abort(&self.key, self.time, self.timer_type)
             .await;
-        self.completed = true;
+        self.phase = Phase::Completed;
     }
 }
 
@@ -452,7 +545,7 @@ where
     ///
     /// Helps detect resource leaks from unacknowledged timers.
     fn drop(&mut self) {
-        if !self.completed {
+        if self.phase != Phase::Completed {
             warn!("timer was dropped without committing or aborting");
         }
     }

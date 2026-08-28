@@ -9,7 +9,7 @@ use crate::consumer::middleware::providers::LeafHandler;
 use crate::consumer::middleware::retry::RetryHandler;
 use crate::consumer::middleware::telemetry::TelemetryHandler;
 use crate::consumer::middleware::tests::test_support::{
-    BypassedHandler, ScriptedHandler, TestError as SupportError,
+    BypassedHandler, DuplicateHandler, ScriptedHandler, TestError as SupportError,
 };
 use crate::consumer::middleware::timeout::TimeoutHandler;
 use crate::consumer::middleware::{Settlement, SettlementHandler};
@@ -18,10 +18,11 @@ use crate::consumer::middleware::{Settlement, SettlementHandler};
 /// test pass-through) delegate both sides verbatim.
 #[test]
 fn passthrough_wrappers_delegate_settlement() {
-    fn assert_delegates<W, P>(label: &str)
+    fn assert_delegates<W, P, D>(label: &str)
     where
         W: SettlementHandler<Output = (), Error = SupportError>,
         P: SettlementHandler<Output = (), Error = SupportError>,
+        D: SettlementHandler<Output = (), Error = SupportError>,
     {
         let ok: Result<(), SupportError> = Ok(());
         let err: Result<(), SupportError> = Err(SupportError(ErrorCategory::Permanent));
@@ -43,17 +44,42 @@ fn passthrough_wrappers_delegate_settlement() {
             Settlement::Bypassed,
             "{label} probe Err"
         );
+        assert_eq!(
+            D::settlement(ok.as_ref()),
+            Settlement::Duplicate,
+            "{label} duplicate Ok"
+        );
+        assert_eq!(
+            D::settlement(err.as_ref()),
+            Settlement::Duplicate,
+            "{label} duplicate Err"
+        );
     }
 
-    assert_delegates::<RetryHandler<ScriptedHandler>, RetryHandler<BypassedHandler>>("retry");
-    assert_delegates::<LogHandler<ScriptedHandler>, LogHandler<BypassedHandler>>("log");
-    assert_delegates::<TimeoutHandler<ScriptedHandler>, TimeoutHandler<BypassedHandler>>("timeout");
-    assert_delegates::<TelemetryHandler<ScriptedHandler>, TelemetryHandler<BypassedHandler>>(
-        "telemetry",
-    );
+    assert_delegates::<
+        RetryHandler<ScriptedHandler>,
+        RetryHandler<BypassedHandler>,
+        RetryHandler<DuplicateHandler>,
+    >("retry");
+    assert_delegates::<
+        LogHandler<ScriptedHandler>,
+        LogHandler<BypassedHandler>,
+        LogHandler<DuplicateHandler>,
+    >("log");
+    assert_delegates::<
+        TimeoutHandler<ScriptedHandler>,
+        TimeoutHandler<BypassedHandler>,
+        TimeoutHandler<DuplicateHandler>,
+    >("timeout");
+    assert_delegates::<
+        TelemetryHandler<ScriptedHandler>,
+        TelemetryHandler<BypassedHandler>,
+        TelemetryHandler<DuplicateHandler>,
+    >("telemetry");
     assert_delegates::<
         PassThroughMiddleware<ScriptedHandler>,
         PassThroughMiddleware<BypassedHandler>,
+        PassThroughMiddleware<DuplicateHandler>,
     >("pass-through");
 }
 

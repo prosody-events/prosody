@@ -1,5 +1,6 @@
 use super::*;
-use std::future::ready;
+use crate::consumer::{Receipted, Redelivery, receipted_sealed};
+use std::future::{Future, ready};
 
 /// Test error carrying its classification. Display matches the per-file
 /// originals (`test error (Transient)`) so no assertion text changes.
@@ -298,6 +299,60 @@ impl SettlementHandler for BypassedHandler {
     }
 }
 
+/// Probe leaf whose settlement classification is `Duplicate` for every result.
+#[derive(Clone)]
+pub struct DuplicateHandler;
+
+impl FallibleHandler for DuplicateHandler {
+    type Error = TestError;
+    type Output = ();
+    type Payload = Value;
+
+    fn on_excise<C>(
+        &self,
+        _context: C,
+        _message: ConsumerMessage<()>,
+        _demand_type: DemandType,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        ready(Ok(()))
+    }
+
+    fn on_message<C>(
+        &self,
+        _context: C,
+        _message: ConsumerMessage<Self::Payload>,
+        _demand_type: DemandType,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        ready(Ok(()))
+    }
+
+    fn on_timer<C>(
+        &self,
+        _context: C,
+        _trigger: Trigger,
+        _demand_type: DemandType,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        ready(Ok(()))
+    }
+
+    async fn shutdown(self) {}
+}
+
+impl SettlementHandler for DuplicateHandler {
+    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        Settlement::Duplicate
+    }
+}
+
 /// Wraps `value` in a `ConsumerMessage` holding a fresh capacity permit.
 ///
 /// Surfaces the (never-in-practice) permit-acquisition failure rather than
@@ -335,6 +390,18 @@ impl Uncommitted for RecordingTimerGuard {
 
     async fn abort(self) {
         self.aborted.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl receipted_sealed::Sealed for RecordingTimerGuard {}
+
+impl Receipted for RecordingTimerGuard {
+    fn redelivery(&self) -> impl Future<Output = Redelivery> + Send {
+        ready(Redelivery::Sweeps)
+    }
+
+    fn receipt(&mut self) -> impl Future<Output = ()> + Send {
+        ready(())
     }
 }
 

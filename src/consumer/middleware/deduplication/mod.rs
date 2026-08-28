@@ -402,7 +402,8 @@ where
             // earlier dispatch; nothing here may stage or re-record.
             // `Store(_)` — the filter's read failed before the inner ran: a
             // layer failure, not the event's outcome.
-            Ok(None) | Err(DeduplicationError::Store(_)) => Settlement::Bypassed,
+            Ok(None) => Settlement::Duplicate,
+            Err(DeduplicationError::Store(_)) => Settlement::Bypassed,
         }
     }
 }

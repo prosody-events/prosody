@@ -5,7 +5,7 @@ use super::{
     SettlementHandler, UncommittedMessage, UncommittedTimer, abandon, debug, log_message_failure,
     log_timer_failure, settle,
 };
-use crate::consumer::Uncommitted;
+use crate::consumer::Receipted;
 
 async fn process_record<T, C, Q, F, Fut>(
     handler: &RetryHandler<T>,
@@ -53,7 +53,7 @@ async fn finish<T, C, G>(
     resolution: Resolution<T::Output, T::Error>,
 ) where
     C: EventContext<Payload = T::Payload>,
-    G: Uncommitted + Send,
+    G: Receipted + Send,
     T: SettlementHandler,
 {
     // Settle on the FINAL dispatch context (a fresh re-pinned Arc for a

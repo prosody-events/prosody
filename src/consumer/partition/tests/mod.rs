@@ -4,8 +4,9 @@
 use super::*;
 use crate::Key;
 use crate::consumer::message::{
-    ConsumerMessage, ConsumerMessageValue, ConsumerRecord, UncommittedMessage,
+    ConsumerMessage, ConsumerMessageValue, ConsumerRecord, UncommittedEvent, UncommittedMessage,
 };
+use crate::consumer::middleware::deduplication::DedupIdentity;
 use crate::consumer::{DemandType, EventContext, EventHandler, Keyed, Uncommitted};
 use crate::loader::MemoryLoader;
 use crate::state::SharedStateBackend;
@@ -14,25 +15,132 @@ use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentit
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::tests::support::FixedOracle;
 use crate::telemetry::Telemetry;
-use crate::timers::UncommittedTimer;
+use crate::timers::store::TriggerStore;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
+use crate::timers::test_support::{create_test_trigger, setup_timer_manager};
+use crate::timers::{TimerType, UncommittedTimer};
 use crate::tracing::init_test_logging;
 use aho_corasick::StartKind;
 use color_eyre::eyre::eyre;
 use crossbeam_utils::CachePadded;
+use futures::{StreamExt, TryStreamExt, pin_mut};
 use runtime::{
     TestHandler, create_test_message, wait_for_partition_stalled, wait_for_processed_offsets,
 };
 use serde_json::json;
 use std::array::from_fn;
-use std::future::Future;
+use std::future::{Future, ready};
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore, watch};
 use tokio::time::{Instant, sleep, sleep_until};
 use tracing::Span;
+
+/// A committed application-timer refire is swept without handler dispatch.
+#[tokio::test]
+async fn committed_application_refire_skips_handler() -> color_eyre::Result<()> {
+    #[derive(Clone, Default)]
+    struct TimerProbe(Arc<AtomicUsize>);
+
+    impl EventHandler for TimerProbe {
+        type Payload = serde_json::Value;
+
+        fn on_message<C>(
+            &self,
+            _context: C,
+            _message: UncommittedMessage<Self::Payload>,
+            _demand_type: DemandType,
+        ) -> impl Future<Output = ()> + Send
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            ready(())
+        }
+
+        fn on_excise<C>(
+            &self,
+            _context: C,
+            _message: UncommittedMessage<()>,
+            _demand_type: DemandType,
+        ) -> impl Future<Output = ()> + Send
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            ready(())
+        }
+
+        fn on_timer<C, U>(
+            &self,
+            _context: C,
+            _timer: U,
+            _demand_type: DemandType,
+        ) -> impl Future<Output = ()> + Send
+        where
+            C: EventContext<Payload = Self::Payload>,
+            U: UncommittedTimer,
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ready(())
+        }
+
+        fn shutdown(self) -> impl Future<Output = ()> + Send {
+            ready(())
+        }
+    }
+
+    let (stream, timers, shutdown_tx) = setup_timer_manager().await?;
+    pin_mut!(stream);
+    let trigger = create_test_trigger("committed-refire", 0, TimerType::Application)?;
+    timers.schedule_trigger(trigger.clone()).await?;
+    let pending = stream
+        .next()
+        .await
+        .ok_or_else(|| eyre!("expected pending timer"))?;
+    timers
+        .receipt(&trigger.key, trigger.time, trigger.timer_type)
+        .await?;
+
+    let provider = memory_state_provider(CollectionDefRegistry::default());
+    let state = provider
+        .acquire(Topic::from("test"), 0, timers.test_store().clone())
+        .await?;
+    let probe = TimerProbe::default();
+    let (_shutdown_control, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    process_event(
+        UncommittedEvent::Timer(pending),
+        &probe,
+        &shutdown_rx,
+        &timers,
+        &state,
+        DedupIdentity {
+            version: "1",
+            group_id: "test-group",
+            topic: "test",
+            partition: 0,
+        },
+        SpanRelation::default(),
+    )
+    .await;
+
+    assert_eq!(probe.0.load(Ordering::SeqCst), 0);
+    let slab_id = trigger
+        .time
+        .epoch_seconds()
+        .saturating_div(timers.test_store().slab_size().seconds());
+    assert!(
+        timers
+            .test_store()
+            .get_slab_triggers_all_types(slab_id)
+            .try_collect::<Vec<_>>()
+            .await?
+            .is_empty(),
+        "the committed-refire path retires the slab row",
+    );
+    drop(shutdown_tx);
+    Ok(())
+}
 
 /// Helper trait for waiting on processed offsets.
 trait HasProcessedOffsets {

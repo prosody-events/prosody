@@ -99,6 +99,11 @@ impl<T> TimerManager<T>
 where
     T: TriggerStore,
 {
+    #[cfg(test)]
+    pub(crate) fn test_store(&self) -> &T {
+        &self.0.store
+    }
+
     /// Creates a new timer manager for the specified segment.
     ///
     /// Initializes:
@@ -430,9 +435,49 @@ where
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
+        self.drive_key(key, time, timer_type, TimerOp::Complete)
+            .await
+    }
+
+    /// Records a timer receipt without retiring its redelivery source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimerManagerError::Store`] if the receipt write fails.
+    pub(crate) async fn receipt(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<(), TimerManagerError<T::Error>> {
+        self.drive_key(key, time, timer_type, TimerOp::Receipt)
+            .await
+    }
+
+    /// Retires a timer redelivery source after state promotion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimerManagerError::Store`] if the retirement write fails.
+    pub(crate) async fn retire(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<(), TimerManagerError<T::Error>> {
+        self.drive_key(key, time, timer_type, TimerOp::Retire).await
+    }
+
+    async fn drive_key(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+        op: TimerOp,
+    ) -> Result<(), TimerManagerError<T::Error>> {
         let active = self.0.scheduler.active_triggers();
         let prior = active.get_state(key, time, timer_type).await;
-        let t = transition(prior, TimerOp::Complete);
+        let t = transition(prior, op);
 
         // A tag-rotating completion writes a tag provably distinct from the
         // current one; baking it into the trigger keeps the store write and
@@ -509,6 +554,18 @@ where
                 .remove_trigger(&trigger.key, trigger.time, trigger.timer_type)
                 .await
                 .map_err(TimerManagerError::Store)?,
+            StoreEffect::DeleteKeyRow => self
+                .0
+                .store
+                .remove_key_row(&trigger.key, trigger.time, trigger.timer_type)
+                .await
+                .map_err(TimerManagerError::Store)?,
+            StoreEffect::DeleteSlabRow => self
+                .0
+                .store
+                .remove_slab_row(&trigger.key, trigger.time, trigger.timer_type)
+                .await
+                .map_err(TimerManagerError::Store)?,
             StoreEffect::UpdateTag => self
                 .0
                 .store
@@ -563,6 +620,37 @@ where
             .current_tag(key, time, timer_type)
             .await
             .map_err(TimerManagerError::Store)
+    }
+
+    pub(crate) async fn timer_state(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Option<TimerState> {
+        self.0
+            .scheduler
+            .active_triggers()
+            .get_state(key, time, timer_type)
+            .await
+    }
+
+    /// Reports whether the store records a committed refire.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimerManagerError::Store`] if the tag read fails.
+    pub(crate) async fn is_committed_refire(
+        &self,
+        trigger: &Trigger,
+    ) -> Result<bool, TimerManagerError<T::Error>> {
+        let tag = self
+            .0
+            .store
+            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+            .await
+            .map_err(TimerManagerError::Store)?;
+        Ok(tag.is_none_or(|tag| tag != trigger.tag))
     }
 }
 
