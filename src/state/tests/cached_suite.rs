@@ -38,7 +38,7 @@ use super::support::{
     CountingCellStore, HoldingCellStore, batch_of, fresh_collection as collection, probe,
 };
 use crate::error::ErrorCategory;
-use crate::test_util::TEST_RUNTIME;
+use crate::test_util::{GlobalMetrics, TEST_RUNTIME};
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, ensure, eyre};
@@ -1421,6 +1421,127 @@ fn absent_get_is_cached() -> Result<()> {
             counting.lower_reads(),
             1,
             "two gets of an absent cell pay exactly one durable read"
+        );
+        Ok(())
+    })
+}
+
+/// Cell-load metrics count logical cells. They distinguish cache answers from
+/// durable fallbacks without labels that contain user identities.
+#[test]
+fn cell_load_metrics_report_source_and_cache_result() -> Result<()> {
+    let metrics = GlobalMetrics::install();
+    TEST_RUNTIME.block_on(async {
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            ScriptedOracle::default(),
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let fjall = test_db::cache("cell-load-metrics")?;
+        let fail_puts = fjall.fail_puts();
+        let cached = Cached::new(fjall, counting).with_metrics(metrics.cell_metrics());
+        let id = collection("cell-load-metrics")?;
+
+        cached.get(&id, &cell_at(1), probe(1)).await?;
+        cached.get(&id, &cell_at(1), probe(2)).await?;
+        let batch = batch_of(2u8..5)?;
+        cached.get_many(&id, SECTION, &batch, probe(3)).await?;
+        cached.get_many(&id, SECTION, &batch, probe(4)).await?;
+
+        let points = metrics.points("prosody.state.cell.loads")?;
+        assert_eq!(
+            points,
+            [
+                (("get", "cache", "hit"), 1),
+                (("get_many", "cache", "hit"), 3),
+                (("get", "store", "miss"), 1),
+                (("get_many", "store", "not_all_hit"), 3),
+            ]
+            .into_iter()
+            .map(|((operation, source, result), value)| {
+                (
+                    BTreeMap::from([
+                        (
+                            "prosody.state.cell.cache.result".to_owned(),
+                            result.to_owned(),
+                        ),
+                        (
+                            "prosody.state.cell.operation.name".to_owned(),
+                            operation.to_owned(),
+                        ),
+                        (
+                            "prosody.state.cell.load.source".to_owned(),
+                            source.to_owned(),
+                        ),
+                    ]),
+                    value,
+                )
+            })
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            metrics.points("prosody.state.cell.load.duration")?,
+            points
+                .into_iter()
+                .map(|(attributes, _)| (attributes, 1))
+                .collect::<Vec<_>>()
+        );
+        assert!(metrics.is_exponential_histogram("prosody.state.cell.load.duration")?);
+        metrics.metrics().request_latency.record(0.01, &[]);
+        assert!(metrics.is_exponential_histogram("prosody.request.duration")?);
+
+        fail_puts.store(true, Ordering::Relaxed);
+        cached.get(&id, &cell_at(9), probe(5)).await?;
+        assert_eq!(
+            metrics.points("prosody.state.cell.cache.errors")?,
+            vec![(
+                BTreeMap::from([
+                    (
+                        "prosody.state.cell.cache.phase".to_owned(),
+                        "fill".to_owned(),
+                    ),
+                    (
+                        "prosody.state.cell.operation.name".to_owned(),
+                        "get".to_owned(),
+                    )
+                ]),
+                1,
+            )]
+        );
+
+        let failed_metrics = GlobalMetrics::install();
+        let failed_lower = FailingCellStore::failing_get_for_cache(
+            MemoryCellStore::new(
+                MemoryCells::new(),
+                ScriptedOracle::default(),
+                Arc::new(CollectionDefRegistry::default()),
+            ),
+            BTreeMap::from([(8, ErrorCategory::Transient)]),
+        );
+        let failed = Cached::new(test_db::cache("cell-load-error-metrics")?, failed_lower)
+            .with_metrics(failed_metrics.cell_metrics());
+        let failed_id = collection("cell-load-error-metrics")?;
+        assert!(failed.get(&failed_id, &cell_at(8), probe(6)).await.is_err());
+        assert_eq!(
+            failed_metrics.points("prosody.state.cell.load.duration")?,
+            vec![(
+                BTreeMap::from([
+                    ("prosody.error.category".to_owned(), "transient".to_owned()),
+                    (
+                        "prosody.state.cell.cache.result".to_owned(),
+                        "miss".to_owned(),
+                    ),
+                    (
+                        "prosody.state.cell.load.source".to_owned(),
+                        "store".to_owned(),
+                    ),
+                    (
+                        "prosody.state.cell.operation.name".to_owned(),
+                        "get".to_owned(),
+                    ),
+                ]),
+                1,
+            )]
         );
         Ok(())
     })

@@ -2,6 +2,8 @@
 //! labels to the rule that no identity is ever one.
 
 use crate::peer::metrics::PeerMetrics;
+use crate::state::cached::metrics::CellMetrics;
+use crate::tracing::exponential_histograms;
 use color_eyre::Result;
 use color_eyre::eyre::{bail, ensure};
 use opentelemetry::KeyValue;
@@ -20,6 +22,7 @@ pub(crate) struct GlobalMetrics {
     /// value into the exporter before a test reads it.
     provider: SdkMeterProvider,
     metrics: PeerMetrics,
+    cell_metrics: CellMetrics,
 }
 
 impl GlobalMetrics {
@@ -27,19 +30,27 @@ impl GlobalMetrics {
     pub(crate) fn install() -> Self {
         let exporter = InMemoryMetricExporter::default();
         let provider = SdkMeterProvider::builder()
+            .with_view(exponential_histograms)
             .with_periodic_exporter(exporter.clone())
             .build();
         let metrics = PeerMetrics::new(&provider.meter("prosody"));
+        let cell_metrics = CellMetrics::new(&provider.meter("prosody"));
         Self {
             exporter,
             provider,
             metrics,
+            cell_metrics,
         }
     }
 
     /// The peer instruments bound to this capture.
     pub(crate) fn metrics(&self) -> PeerMetrics {
         self.metrics.clone()
+    }
+
+    /// The keyed-state cell instruments bound to this capture.
+    pub(crate) fn cell_metrics(&self) -> CellMetrics {
+        self.cell_metrics.clone()
     }
 
     /// Every series the instrument named `name` carries, as its exact attribute
@@ -64,6 +75,26 @@ impl GlobalMetrics {
             }
         }
         Ok(points.into_iter().collect())
+    }
+
+    /// Returns whether `name` exports as an exponential histogram.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot flush or read the exporter.
+    pub(crate) fn is_exponential_histogram(&self, name: &str) -> Result<bool> {
+        self.provider.force_flush()?;
+        for resource in self.exporter.get_finished_metrics()? {
+            for scope in resource.scope_metrics() {
+                if let Some(metric) = scope.metrics().find(|metric| metric.name() == name) {
+                    return Ok(matches!(
+                        metric.data(),
+                        AggregatedMetrics::F64(MetricData::ExponentialHistogram(_))
+                    ));
+                }
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -112,9 +143,9 @@ fn collect_points(
     points: &mut BTreeMap<BTreeMap<String, String>, i64>,
 ) -> Result<()> {
     match data {
-        AggregatedMetrics::U64(data) => read(name, data, points, |value| Ok(i64::try_from(value)?)),
-        AggregatedMetrics::I64(data) => read(name, data, points, Ok),
-        AggregatedMetrics::F64(data) => read(name, data, points, |_| {
+        AggregatedMetrics::U64(data) => read(data, points, |value| Ok(i64::try_from(value)?)),
+        AggregatedMetrics::I64(data) => read(data, points, Ok),
+        AggregatedMetrics::F64(data) => read(data, points, |_| {
             bail!("{name} carries floating-point values, which this harness cannot read")
         }),
     }
@@ -127,7 +158,6 @@ fn collect_points(
 /// values were recorded under each attribute set, not what they summed to. So a
 /// floating-point histogram is readable where a floating-point sum is not.
 fn read<T: Copy>(
-    name: &str,
     data: &MetricData<T>,
     points: &mut BTreeMap<BTreeMap<String, String>, i64>,
     value: impl Fn(T) -> Result<i64>,
@@ -151,8 +181,13 @@ fn read<T: Copy>(
                 );
             }
         }
-        MetricData::ExponentialHistogram(_) => {
-            bail!("{name} is an exponential histogram, which this harness cannot read");
+        MetricData::ExponentialHistogram(histogram) => {
+            for point in histogram.data_points() {
+                let _ = points.insert(
+                    attribute_map(point.attributes()),
+                    i64::try_from(point.count())?,
+                );
+            }
         }
     }
     Ok(())
