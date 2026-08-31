@@ -37,6 +37,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use opentelemetry::trace::{TraceContextExt, TraceId};
 use serde_json::Value;
+use std::future::ready;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -259,19 +260,21 @@ impl MessageLoader for RequestLoader {
     type Error = RequestLoaderError;
     type Payload = Value;
 
-    async fn load_message(
+    fn load_message(
         &self,
         _topic: Topic,
         _partition: Partition,
         _offset: Offset,
-    ) -> Result<ConsumerRecord<Value>, RequestLoaderError> {
+    ) -> impl Future<Output = Result<ConsumerRecord<Value>, RequestLoaderError>> {
         // The Kafka loader parents a reloaded record's span on the record's own
         // propagated context, so a reload rejoins the trace the request began
         // in. This double does the same, from one fixed remote context.
         let load = related_span!(SpanRelation::Child, sampled_remote_context(), "load");
-        requesting_under(TARGET, REQUEST, KEY, load)
-            .map(ConsumerRecord::Message)
-            .map_err(|_| RequestLoaderError::Unavailable)
+        ready(
+            requesting_under(TARGET, REQUEST, KEY, load)
+                .map(ConsumerRecord::Message)
+                .map_err(|_| RequestLoaderError::Unavailable),
+        )
     }
 
     async fn try_load_message(

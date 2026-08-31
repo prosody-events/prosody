@@ -23,6 +23,7 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::{Key, Partition, Topic};
 use color_eyre::eyre::eyre;
+use futures::FutureExt;
 use parking_lot::Mutex;
 use std::convert::Infallible;
 use std::fmt::{self, Debug};
@@ -260,44 +261,46 @@ impl FallibleHandler for OutcomeHandler {
     type Output = ();
     type Payload = serde_json::Value;
 
-    async fn on_excise<C>(
+    fn on_excise<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<()>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
-    async fn on_message<C>(
+    fn on_message<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<serde_json::Value>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _context: C,
         trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        self.timer_calls.lock().push(trigger.key.clone());
-        self.ambient_pairs
-            .lock()
-            .push((tracing::Span::current().id(), trigger.span().id()));
-        self.take_outcome().into_result()
+        ready(()).map(move |()| {
+            self.timer_calls.lock().push(trigger.key.clone());
+            self.ambient_pairs
+                .lock()
+                .push((tracing::Span::current().id(), trigger.span().id()));
+            self.take_outcome().into_result()
+        })
     }
 
     async fn shutdown(self) {}

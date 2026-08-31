@@ -30,6 +30,7 @@ use color_eyre::eyre::{Result, eyre};
 use futures::StreamExt;
 use quickcheck::{QuickCheck, TestResult};
 use serde_json::json;
+use std::future::ready;
 use thiserror::Error;
 use tokio::runtime::Builder;
 use tokio::sync::watch;
@@ -73,7 +74,7 @@ impl FlakyMarkerOracle {
 impl CommitOracle for FlakyMarkerOracle {
     type Error = MockMarkerError;
 
-    async fn record_message(&self, dedup_id: Uuid) -> Result<(), Self::Error> {
+    fn record_message(&self, dedup_id: Uuid) -> impl Future<Output = Result<(), Self::Error>> {
         // While the countdown is positive, decrement it and inject one
         // more failure; once exhausted, record the marker.
         if self
@@ -81,18 +82,18 @@ impl CommitOracle for FlakyMarkerOracle {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
-            return Err(MockMarkerError(self.category));
+            return ready(Err(MockMarkerError(self.category)));
         }
         self.recorded.lock().push(dedup_id);
-        Ok(())
+        ready(Ok(()))
     }
 
-    async fn resolve<'a>(
+    fn resolve<'a>(
         &'a self,
         _state_key: &'a StateKey,
         _event: EventRef,
-    ) -> Result<CommitDecision, Self::Error> {
-        Ok(CommitDecision::Committed)
+    ) -> impl Future<Output = Result<CommitDecision, Self::Error>> {
+        ready(Ok(CommitDecision::Committed))
     }
 }
 

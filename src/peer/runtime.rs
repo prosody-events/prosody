@@ -20,7 +20,7 @@ use crate::peer::router::runtime::{
 };
 use crate::peer::router::{LocalTarget, NetworkRoute};
 use crate::producer::ProsodyProducer;
-use std::future::Future;
+use std::future::{Future, ready};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -148,7 +148,7 @@ impl<D: PeerDirectory> PreparedRuntime for PreparedPeerRuntime<D> {
     async fn launch(self) -> Result<Self::Running, (Self, ConsumerError)> {
         self.activate().await.map_err(|(prepared, error)| {
             (
-                prepared,
+                *prepared,
                 PeerInitError::Directory {
                     message: format!("{error:#}"),
                 }
@@ -170,8 +170,8 @@ impl PreparedRuntime for PreparedLocalPeerRuntime {
         self.response_route()
     }
 
-    async fn launch(self) -> Result<Self::Running, (Self, ConsumerError)> {
-        Ok(self.activate())
+    fn launch(self) -> impl Future<Output = Result<Self::Running, (Self, ConsumerError)>> {
+        ready(Ok(self.activate()))
     }
 
     async fn release(self) {

@@ -30,6 +30,7 @@ use prosody::{
     timers::duration::CompactDuration,
 };
 use serde_json::{Value, json};
+use std::future::{Future, ready};
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::time::timeout;
@@ -269,16 +270,16 @@ impl FallibleHandler for InlineReplacementHandler {
 
     async fn shutdown(self) {}
 
-    async fn on_excise<C>(
+    fn on_excise<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<()>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 }
 

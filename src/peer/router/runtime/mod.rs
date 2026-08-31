@@ -213,12 +213,12 @@ impl<D: PeerDirectory> PreparedPeerRuntime<D> {
     /// Returns this value and the directory's error when the first write fails.
     /// The caller then owns the release order, because only the caller knows
     /// what else it holds.
-    pub(crate) async fn activate(self) -> Result<PeerRuntime<D>, (Self, D::Error)> {
+    pub(crate) async fn activate(self) -> Result<PeerRuntime<D>, (Box<Self>, D::Error)> {
         if let Err(error) = self.directory.register(&self.registration).await {
             if let Err(delete_error) = self.directory.deregister(&self.registration).await {
                 warn!(%delete_error, peer = %self.registration.peer, "failed peer registration rollback");
             }
-            return Err((self, error));
+            return Err((Box::new(self), error));
         }
         let ttl = self.directory.ttl();
         let (stop_refresh, stopped) = watch::channel(false);

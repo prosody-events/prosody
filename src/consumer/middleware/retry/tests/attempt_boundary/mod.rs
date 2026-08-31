@@ -12,6 +12,7 @@ use crate::state::{EventRef, StateKey, StoreOutcome};
 use color_eyre::eyre::Result;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use std::future::ready;
 use uuid::Uuid;
 
 /// What a keyed-state read observed inside an apply hook.
@@ -133,16 +134,16 @@ impl FallibleHandler for AttemptAwareHandler {
         self.handle(context, demand_type).await
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _context: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
     async fn shutdown(self) {}
@@ -288,16 +289,16 @@ impl FallibleHandler for FinalHookReadHandler {
         self.handle(context, demand_type).await
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _context: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
     async fn after_commit<C>(&self, context: C, _result: Result<Self::Output, Self::Error>)

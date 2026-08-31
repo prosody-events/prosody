@@ -21,6 +21,7 @@ use crate::state::{
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::Result;
+use std::future::ready;
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -96,40 +97,40 @@ impl FallibleHandler for HookProbe {
     type Output = u64;
     type Payload = serde_json::Value;
 
-    async fn on_excise<C>(
+    fn on_excise<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<()>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(0)
+        ready(Ok(0))
     }
 
-    async fn on_message<C>(
+    fn on_message<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<Self::Payload>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(0)
+        ready(Ok(0))
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _context: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(0)
+        ready(Ok(0))
     }
 
     async fn after_commit<C>(&self, context: C, _result: Result<Self::Output, Self::Error>)
@@ -215,18 +216,18 @@ impl FlushTripOracle {
 impl CommitOracle for FlushTripOracle {
     type Error = TestError;
 
-    async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
+    fn record_message(&self, _dedup_id: Uuid) -> impl Future<Output = Result<(), Self::Error>> {
         self.attempts.fetch_add(1, Ordering::SeqCst);
         self.trip.request_shutdown();
-        Err(TestError(ErrorCategory::Transient, "record"))
+        ready(Err(TestError(ErrorCategory::Transient, "record")))
     }
 
-    async fn resolve<'a>(
+    fn resolve<'a>(
         &'a self,
         _state_key: &'a StateKey,
         _event: EventRef,
-    ) -> Result<CommitDecision, Self::Error> {
-        Ok(CommitDecision::NotCommitted)
+    ) -> impl Future<Output = Result<CommitDecision, Self::Error>> {
+        ready(Ok(CommitDecision::NotCommitted))
     }
 }
 

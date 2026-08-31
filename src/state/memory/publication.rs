@@ -9,6 +9,7 @@ use crate::subsystem::SubsystemName;
 use scc::{Guard, TreeIndex};
 use std::cmp::Ordering;
 use std::convert::Infallible;
+use std::future::ready;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
@@ -29,40 +30,40 @@ impl MemoryPublicationStore {
 impl PublicationStore for MemoryPublicationStore {
     type Error = Infallible;
 
-    async fn upsert(
+    fn upsert(
         &self,
         subsystem: &SubsystemName,
         state_type: StateType,
         name: &StateName,
         row: &StatePublication,
-    ) -> Result<(), Self::Error> {
+    ) -> impl Future<Output = Result<(), Self::Error>> {
         self.rows.upsert_sync(
             publication_key(subsystem, state_type, name, row),
             row.clone(),
         );
-        Ok(())
+        ready(Ok(()))
     }
 
-    async fn remove_group(
+    fn remove_group(
         &self,
         subsystem: &SubsystemName,
         state_type: StateType,
         name: &StateName,
         group_id: &str,
-    ) -> Result<(), Self::Error> {
+    ) -> impl Future<Output = Result<(), Self::Error>> {
         remove_span(
             &self.rows,
             PublicationScope::group_range(subsystem, state_type, name, group_id),
         );
-        Ok(())
+        ready(Ok(()))
     }
 
-    async fn read_publications(
+    fn read_publications(
         &self,
         subsystem: &SubsystemName,
         state_type: StateType,
         name: &StateName,
-    ) -> Result<PublicationRows, Self::Error> {
+    ) -> impl Future<Output = Result<PublicationRows, Self::Error>> {
         let guard = Guard::new();
         let rows = self
             .rows
@@ -71,7 +72,7 @@ impl PublicationStore for MemoryPublicationStore {
             .map(|(_key, row)| row.clone())
             .collect();
         drop(guard);
-        Ok(rows)
+        ready(Ok(rows))
     }
 }
 

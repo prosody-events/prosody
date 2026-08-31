@@ -29,6 +29,7 @@ use crate::state::{StateName, StateType};
 use crate::state_reader::backend::ReaderBackend;
 use bytes::Bytes;
 use futures::stream::Stream;
+use std::future::ready;
 
 /// The engine every published-reader session binds. `pub` for the same reason
 /// [`OwnerEngine`](crate::state::collection::owner::OwnerEngine) is: it is the
@@ -86,11 +87,13 @@ impl<C: Codec, B: ReaderBackend<C>> sealed::ReadEngine<ReadSession<C, B>> for Re
         }
     }
 
-    async fn begin_read(session: &ReadSession<C, B>) -> Self::ReadInner<'_> {
+    fn begin_read(
+        session: &ReadSession<C, B>,
+    ) -> impl Future<Output = Option<PinnedSource>> + Send {
         // Admission is not a concept here: the invocation starts from whatever
         // the session already selected and performs no I/O until its first
         // command.
-        session.pin.get().cloned()
+        ready(session.pin.get().cloned())
     }
 
     async fn read_point(
@@ -128,8 +131,11 @@ impl<C: Codec, B: ReaderBackend<C>> sealed::ReadEngine<ReadSession<C, B>> for Re
         inner.clone()
     }
 
-    async fn resume<'a>(_session: &'a ReadSession<C, B>, plan: &Self::Plan) -> Self::ReadInner<'a> {
-        plan.clone()
+    fn resume<'a>(
+        _session: &'a ReadSession<C, B>,
+        plan: &Self::Plan,
+    ) -> impl Future<Output = Self::ReadInner<'a>> + Send {
+        ready(plan.clone())
     }
 
     fn page<'a>(
