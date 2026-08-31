@@ -38,7 +38,7 @@ use super::support::{
     CountingCellStore, HoldingCellStore, batch_of, fresh_collection as collection, probe,
 };
 use crate::error::ErrorCategory;
-use crate::test_util::{GlobalMetrics, TEST_RUNTIME};
+use crate::test_util::{GlobalMetrics, TEST_RUNTIME, labels};
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, ensure, eyre};
@@ -1460,19 +1460,10 @@ fn cell_load_metrics_report_source_and_cache_result() -> Result<()> {
             .into_iter()
             .map(|((operation, source, result), value)| {
                 (
-                    BTreeMap::from([
-                        (
-                            "prosody.state.cell.cache.result".to_owned(),
-                            result.to_owned(),
-                        ),
-                        (
-                            "prosody.state.cell.operation.name".to_owned(),
-                            operation.to_owned(),
-                        ),
-                        (
-                            "prosody.state.cell.load.source".to_owned(),
-                            source.to_owned(),
-                        ),
+                    labels([
+                        ("prosody.state.cell.cache.result", result),
+                        ("prosody.state.cell.operation.name", operation),
+                        ("prosody.state.cell.load.source", source),
                     ]),
                     value,
                 )
@@ -1487,7 +1478,7 @@ fn cell_load_metrics_report_source_and_cache_result() -> Result<()> {
                 .collect::<Vec<_>>()
         );
         assert!(metrics.is_exponential_histogram("prosody.state.cell.load.duration")?);
-        metrics.metrics().request_latency.record(0.01, &[]);
+        metrics.metrics().request_latency.record(0.01_f64, &[]);
         assert!(metrics.is_exponential_histogram("prosody.request.duration")?);
 
         fail_puts.store(true, Ordering::Relaxed);
@@ -1495,15 +1486,9 @@ fn cell_load_metrics_report_source_and_cache_result() -> Result<()> {
         assert_eq!(
             metrics.points("prosody.state.cell.cache.errors")?,
             vec![(
-                BTreeMap::from([
-                    (
-                        "prosody.state.cell.cache.phase".to_owned(),
-                        "fill".to_owned(),
-                    ),
-                    (
-                        "prosody.state.cell.operation.name".to_owned(),
-                        "get".to_owned(),
-                    )
+                labels([
+                    ("prosody.state.cell.cache.phase", "fill"),
+                    ("prosody.state.cell.operation.name", "get"),
                 ]),
                 1,
             )]
@@ -1525,20 +1510,11 @@ fn cell_load_metrics_report_source_and_cache_result() -> Result<()> {
         assert_eq!(
             failed_metrics.points("prosody.state.cell.load.duration")?,
             vec![(
-                BTreeMap::from([
-                    ("prosody.error.category".to_owned(), "transient".to_owned()),
-                    (
-                        "prosody.state.cell.cache.result".to_owned(),
-                        "miss".to_owned(),
-                    ),
-                    (
-                        "prosody.state.cell.load.source".to_owned(),
-                        "store".to_owned(),
-                    ),
-                    (
-                        "prosody.state.cell.operation.name".to_owned(),
-                        "get".to_owned(),
-                    ),
+                labels([
+                    ("prosody.error.category", "transient"),
+                    ("prosody.state.cell.cache.result", "miss"),
+                    ("prosody.state.cell.load.source", "store"),
+                    ("prosody.state.cell.operation.name", "get"),
                 ]),
                 1,
             )]

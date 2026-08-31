@@ -101,7 +101,14 @@ impl GlobalMetrics {
 /// One data point's whole attribute set, for a comparison that catches an extra
 /// attribute as well as a wrong one.
 pub(crate) fn label(key: &str, value: &str) -> BTreeMap<String, String> {
-    BTreeMap::from([(key.to_owned(), value.to_owned())])
+    labels([(key, value)])
+}
+
+/// One data point's whole attribute set.
+pub(crate) fn labels<const N: usize>(attributes: [(&str, &str); N]) -> BTreeMap<String, String> {
+    attributes
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .into()
 }
 
 /// Asserts that every label is a plain lowercase token and that no two are
