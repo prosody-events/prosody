@@ -77,11 +77,11 @@ pub struct ConsumerConfiguration {
     /// List of topics to subscribe to.
     ///
     /// Environment variable: `PROSODY_SUBSCRIBED_TOPICS`
-    /// Default: None (must be specified)
-    ///
-    /// At least one topic must be specified.
-    #[builder(default = "from_vec_env(\"PROSODY_SUBSCRIBED_TOPICS\")?", setter(into))]
-    #[validate(length(min = 1_u64))]
+    /// Default: no subscriptions
+    #[builder(
+        default = "from_optional_vec_env(\"PROSODY_SUBSCRIBED_TOPICS\")?.unwrap_or_default()",
+        setter(into)
+    )]
     pub subscribed_topics: Vec<String>,
 
     /// Allowed event type prefixes.
