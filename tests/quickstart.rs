@@ -18,6 +18,7 @@ use prosody::prelude::*;
 use prosody::tracing::init_test_logging;
 use serde_json::json;
 use std::convert::Infallible;
+use std::future::{Future, ready};
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
@@ -47,16 +48,16 @@ impl FallibleHandler for MyHandler {
         Ok(())
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _context: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
     async fn shutdown(self) {}

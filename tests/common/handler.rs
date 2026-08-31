@@ -14,6 +14,7 @@ use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::high_level::{ClientHandler, Codecs};
 use prosody::timers::{Trigger, UncommittedTimer};
 use serde_json::Value;
+use std::future::{Future, ready};
 use std::time::Duration as StdDuration;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
@@ -156,30 +157,30 @@ impl FallibleHandler for FallibleTestHandler {
         Ok(())
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _context: C,
         _timer: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 
     async fn shutdown(self) {}
 
-    async fn on_excise<C>(
+    fn on_excise<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<()>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 }
 

@@ -15,6 +15,7 @@ use crate::subsystem::SubsystemName;
 use quick_cache::sync::Cache;
 use std::convert::Infallible;
 use std::error::Error;
+use std::future::ready;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{error, warn};
@@ -150,12 +151,12 @@ pub struct NoPublisher;
 impl FirstWriteBarrier for NoPublisher {
     type Error = Infallible;
 
-    async fn publish_if_needed(
+    fn publish_if_needed(
         &self,
         _state_type: StateType,
         _name: &StateName,
-    ) -> Result<(), Self::Error> {
-        Ok(())
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        ready(Ok(()))
     }
 }
 

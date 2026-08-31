@@ -25,6 +25,7 @@ use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
+use std::future::ready;
 use std::net::SocketAddr;
 use std::ptr;
 use std::slice;
@@ -37,16 +38,16 @@ use uuid::{Uuid, Version};
 struct CountedNetwork(Arc<AtomicUsize>, PeerMetrics);
 
 impl ResponseRoute for CountedNetwork {
-    async fn deliver(
+    fn deliver(
         &self,
         _frame: Staged,
         _deadline: RequestDeadline,
         _context: &opentelemetry::Context,
-    ) -> Result<RouteOutcome, DropReason> {
+    ) -> impl Future<Output = Result<RouteOutcome, DropReason>> {
         self.0.fetch_add(1, Ordering::Relaxed);
-        Ok(RouteOutcome::Delivered(RouteDelivery::Remote(
+        ready(Ok(RouteOutcome::Delivered(RouteDelivery::Remote(
             EndpointKind::Direct,
-        )))
+        ))))
     }
 }
 

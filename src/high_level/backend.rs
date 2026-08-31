@@ -11,6 +11,7 @@ use crate::state_reader::{
     CassandraReaderBackend, MemoryReaderBackend, ReaderBackend, StateReaderDependencies,
     StateReaderError,
 };
+use std::future::ready;
 use std::marker::PhantomData;
 
 mod sealed {
@@ -102,11 +103,12 @@ where
     type Reader = MemoryReaderBackend<C>;
     type Router = LocalRouter;
 
-    async fn build_reader(
+    fn build_reader(
         &self,
         config: &ReaderConfiguration,
-    ) -> Result<StateReaderDependencies<C, Self::Reader>, StateReaderError> {
-        Ok(StateReaderDependencies::memory(
+    ) -> impl Future<Output = Result<StateReaderDependencies<C, Self::Reader>, StateReaderError>>
+    {
+        ready(Ok(StateReaderDependencies::memory(
             config.group_id.clone(),
             config.stall_threshold,
             self.cells.clone(),
@@ -115,7 +117,7 @@ where
             self.loader.clone(),
             config.cache_size,
         )
-        .with_default_read_cache_ttl(config.cache_ttl))
+        .with_default_read_cache_ttl(config.cache_ttl)))
     }
 
     async fn build_router(

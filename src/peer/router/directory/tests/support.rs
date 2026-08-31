@@ -16,6 +16,7 @@ use color_eyre::Result;
 use parking_lot::Mutex;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use std::convert::Infallible;
+use std::future::ready;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -61,7 +62,10 @@ impl PeerDirectory for TestDirectory {
         self.ttl
     }
 
-    async fn register(&self, registration: &PeerRegistration) -> Result<(), Self::Error> {
+    fn register(
+        &self,
+        registration: &PeerRegistration,
+    ) -> impl Future<Output = Result<(), Self::Error>> {
         let mut registrations = self.registrations.lock();
         if let Some(stored) = registrations
             .iter_mut()
@@ -74,23 +78,29 @@ impl PeerDirectory for TestDirectory {
             }
             registrations.push(registration.clone());
         }
-        Ok(())
+        ready(Ok(()))
     }
 
-    async fn read(&self, peer: PeerId) -> Result<Option<PeerRegistration>, Self::Error> {
-        Ok(self
+    fn read(
+        &self,
+        peer: PeerId,
+    ) -> impl Future<Output = Result<Option<PeerRegistration>, Self::Error>> {
+        ready(Ok(self
             .registrations
             .lock()
             .iter()
             .find(|registration| registration.peer == peer)
-            .cloned())
+            .cloned()))
     }
 
-    async fn deregister(&self, registration: &PeerRegistration) -> Result<(), Self::Error> {
+    fn deregister(
+        &self,
+        registration: &PeerRegistration,
+    ) -> impl Future<Output = Result<(), Self::Error>> {
         self.registrations
             .lock()
             .retain(|stored| stored.peer != registration.peer);
-        Ok(())
+        ready(Ok(()))
     }
 }
 

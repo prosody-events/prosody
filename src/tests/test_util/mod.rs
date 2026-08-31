@@ -17,6 +17,7 @@ use quickcheck::{Arbitrary, Gen};
 use serde_json::{Map, Value};
 use std::env;
 use std::fmt::{Debug, Write as _};
+use std::future::ready;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
@@ -103,9 +104,9 @@ pub(crate) fn test_cassandra_config() -> CassandraConfiguration {
 struct TestExporter(Arc<Mutex<Vec<SpanData>>>);
 
 impl SpanExporter for TestExporter {
-    async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+    fn export(&self, batch: Vec<SpanData>) -> impl Future<Output = OTelSdkResult> {
         self.0.lock().extend(batch);
-        Ok(())
+        ready(Ok(()))
     }
 }
 
@@ -161,11 +162,11 @@ fn span_pipeline(
 struct GlobalSpanExporter;
 
 impl SpanExporter for GlobalSpanExporter {
-    async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+    fn export(&self, batch: Vec<SpanData>) -> impl Future<Output = OTelSdkResult> {
         if let Some(spans) = GLOBAL_SPANS.lock().as_mut() {
             spans.extend(batch);
         }
-        Ok(())
+        ready(Ok(()))
     }
 }
 
