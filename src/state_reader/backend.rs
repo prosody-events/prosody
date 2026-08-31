@@ -168,16 +168,16 @@ impl CommittedCellSource for MemoryCells {
         Self::scan_committed(self, id, scan).map(|item| item.map(|(key, _)| key))
     }
 
-    async fn load_presence_many(
+    fn load_presence_many(
         &self,
         id: &CollectionId,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<PresenceBatch, Self::Error> {
-        Ok(Self::read_committed_many(self, id, section, batch)
+    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send {
+        ready(Ok(Self::read_committed_many(self, id, section, batch)
             .into_iter()
             .map(|value| value.is_some())
-            .collect())
+            .collect()))
     }
 }
 
@@ -218,14 +218,16 @@ impl CommittedCellSource for ScriptedCellSource {
         Self::scan_committed(self, id, scan).map(|item| item.map(|(key, _)| key))
     }
 
-    async fn load_presence_many(
+    fn load_presence_many(
         &self,
         id: &CollectionId,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<PresenceBatch, Self::Error> {
-        Self::read_committed_many(self, id, section, batch)
-            .map(|values| values.into_iter().map(|value| value.is_some()).collect())
+    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send {
+        ready(
+            Self::read_committed_many(self, id, section, batch)
+                .map(|values| values.into_iter().map(|value| value.is_some()).collect()),
+        )
     }
 }
 

@@ -55,14 +55,14 @@ impl CellStore for TtlStub {
         stream::empty()
     }
 
-    async fn contains_many<'a>(
+    fn contains_many<'a>(
         &'a self,
         _collection: &'a CollectionId,
         _section: Section,
         batch: &'a CoordinateBatch,
         _own: EventRef,
-    ) -> Result<PresenceBatch, Self::Error> {
-        Ok(smallvec![true; batch.len()])
+    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send + 'a {
+        ready(Ok(smallvec![true; batch.len()]))
     }
 
     fn provisional_cells<'a>(

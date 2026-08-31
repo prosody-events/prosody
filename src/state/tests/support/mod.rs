@@ -235,15 +235,15 @@ where
         ready(Err(StateAccessError::Unavailable))
     }
 
-    async fn read_presence_batch(
+    fn read_presence_batch(
         _session: &UnavailableState<P>,
         _inner: &mut Self::ReadInner<'_>,
         _state_type: StateType,
         _name: &StateName,
         _section: Section,
         _batch: &CoordinateBatch,
-    ) -> Result<PresenceBatch, StateAccessError> {
-        Err(StateAccessError::Unavailable)
+    ) -> impl Future<Output = Result<PresenceBatch, StateAccessError>> + Send {
+        ready(Err(StateAccessError::Unavailable))
     }
 
     fn capture((): &()) {}
