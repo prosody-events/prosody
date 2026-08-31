@@ -12,6 +12,7 @@ use crate::error::ErrorCategory;
 use crate::loader::KafkaLoaderError;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::{EventRef, StateKey, TimerEventRef};
+use std::future::ready;
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
@@ -180,19 +181,22 @@ struct TableStore;
 impl TimerDeferStore for TableStore {
     type Error = TestError;
 
-    async fn defer_first_timer(&self, _trigger: &Trigger) -> Result<(), TestError> {
-        Ok(())
+    fn defer_first_timer(&self, _trigger: &Trigger) -> impl Future<Output = Result<(), TestError>> {
+        ready(Ok(()))
     }
 
-    async fn get_next_deferred_timer(
+    fn get_next_deferred_timer(
         &self,
         _key: &Key,
-    ) -> Result<Option<(Trigger, u32)>, TestError> {
-        Ok(None)
+    ) -> impl Future<Output = Result<Option<(Trigger, u32)>, TestError>> {
+        ready(Ok(None))
     }
 
-    async fn append_deferred_timer(&self, _trigger: &Trigger) -> Result<(), TestError> {
-        Ok(())
+    fn append_deferred_timer(
+        &self,
+        _trigger: &Trigger,
+    ) -> impl Future<Output = Result<(), TestError>> {
+        ready(Ok(()))
     }
 
     fn deferred_times(
@@ -202,20 +206,24 @@ impl TimerDeferStore for TableStore {
         ready(Ok(Vec::new()))
     }
 
-    async fn remove_deferred_timer(
+    fn remove_deferred_timer(
         &self,
         _key: &Key,
         _time: CompactDateTime,
-    ) -> Result<(), TestError> {
-        Ok(())
+    ) -> impl Future<Output = Result<(), TestError>> {
+        ready(Ok(()))
     }
 
-    async fn set_retry_count(&self, _key: &Key, _retry_count: u32) -> Result<(), TestError> {
-        Ok(())
+    fn set_retry_count(
+        &self,
+        _key: &Key,
+        _retry_count: u32,
+    ) -> impl Future<Output = Result<(), TestError>> {
+        ready(Ok(()))
     }
 
-    async fn delete_key(&self, _key: &Key) -> Result<(), TestError> {
-        Ok(())
+    fn delete_key(&self, _key: &Key) -> impl Future<Output = Result<(), TestError>> {
+        ready(Ok(()))
     }
 }
 

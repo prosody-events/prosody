@@ -75,16 +75,16 @@ impl FixedOracle {
 impl CommitOracle for FixedOracle {
     type Error = Infallible;
 
-    async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
-        Ok(())
+    fn record_message(&self, _dedup_id: Uuid) -> impl Future<Output = Result<(), Self::Error>> {
+        ready(Ok(()))
     }
 
-    async fn resolve<'a>(
+    fn resolve<'a>(
         &'a self,
         _state_key: &'a StateKey,
         _event: EventRef,
-    ) -> Result<CommitDecision, Self::Error> {
-        Ok(self.0)
+    ) -> impl Future<Output = Result<CommitDecision, Self::Error>> {
+        ready(Ok(self.0))
     }
 }
 
@@ -105,17 +105,17 @@ impl CountingOracle {
 impl CommitOracle for CountingOracle {
     type Error = Infallible;
 
-    async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
-        Ok(())
+    fn record_message(&self, _dedup_id: Uuid) -> impl Future<Output = Result<(), Self::Error>> {
+        ready(Ok(()))
     }
 
-    async fn resolve<'a>(
+    fn resolve<'a>(
         &'a self,
         _state_key: &'a StateKey,
         _event: EventRef,
-    ) -> Result<CommitDecision, Self::Error> {
+    ) -> impl Future<Output = Result<CommitDecision, Self::Error>> {
         self.0.fetch_add(1, Ordering::Relaxed);
-        Ok(CommitDecision::NotCommitted)
+        ready(Ok(CommitDecision::NotCommitted))
     }
 }
 
@@ -212,25 +212,25 @@ where
 
     async fn begin_read(_session: &UnavailableState<P>) {}
 
-    async fn read_point(
+    fn read_point(
         _session: &UnavailableState<P>,
         _inner: &mut Self::ReadInner<'_>,
         _state_type: StateType,
         _name: &StateName,
         _cell: &CellKey,
-    ) -> Result<Option<Bytes>, StateAccessError> {
-        Err(StateAccessError::Unavailable)
+    ) -> impl Future<Output = Result<Option<Bytes>, StateAccessError>> {
+        ready(Err(StateAccessError::Unavailable))
     }
 
-    async fn read_batch(
+    fn read_batch(
         _session: &UnavailableState<P>,
         _inner: &mut Self::ReadInner<'_>,
         _state_type: StateType,
         _name: &StateName,
         _section: Section,
         _batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
-        Err(StateAccessError::Unavailable)
+    ) -> impl Future<Output = Result<CellBuffer<Option<Bytes>>, StateAccessError>> {
+        ready(Err(StateAccessError::Unavailable))
     }
 
     fn capture((): &()) {}
@@ -258,8 +258,10 @@ where
 {
     type WriteInner<'a> = NoWrite;
 
-    async fn begin_write(_session: &UnavailableState<P>) -> Result<NoWrite, StateAccessError> {
-        Err(StateAccessError::Unavailable)
+    fn begin_write(
+        _session: &UnavailableState<P>,
+    ) -> impl Future<Output = Result<NoWrite, StateAccessError>> {
+        ready(Err(StateAccessError::Unavailable))
     }
 
     fn validate_write(
@@ -278,21 +280,21 @@ where
     ) {
     }
 
-    async fn commit(
+    fn commit(
         _session: &UnavailableState<P>,
         _state_type: StateType,
         _name: &StateName,
-    ) -> Result<StoreOutcome, StateAccessError> {
-        Err(StateAccessError::Unavailable)
+    ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> {
+        ready(Err(StateAccessError::Unavailable))
     }
 
-    async fn rollback(
+    fn rollback(
         _session: &UnavailableState<P>,
         _state_type: StateType,
         _name: &StateName,
-    ) -> StoreOutcome {
+    ) -> impl Future<Output = StoreOutcome> {
         // Stateless: nothing is ever buffered, so the discard is a NoOp.
-        StoreOutcome::NoOp
+        ready(StoreOutcome::NoOp)
     }
 }
 
@@ -333,16 +335,16 @@ where
         self.gate.close(|_waited_s| {}).await
     }
 
-    async fn finalize(&self) -> Result<Finalized<Self::Cell>, StateAccessError> {
-        Ok(Finalized::Clean)
+    fn finalize(&self) -> impl Future<Output = Result<Finalized<Self::Cell>, StateAccessError>> {
+        ready(Ok(Finalized::Clean))
     }
 
-    async fn record_marker(
+    fn record_marker(
         &self,
         _marker: MessageMarker,
         _proof: MarkerWrite,
-    ) -> Result<(), StateAccessError> {
-        Ok(())
+    ) -> impl Future<Output = Result<(), StateAccessError>> {
+        ready(Ok(()))
     }
 
     fn discard_dirty(&self) {}
@@ -359,15 +361,15 @@ where
         CompactDuration::MIN
     }
 
-    async fn backstop_armed(&self) -> Option<CompactDateTime> {
-        None
+    fn backstop_armed(&self) -> impl Future<Output = Option<CompactDateTime>> {
+        ready(None)
     }
 
     async fn mark_backstop_armed(&self, _fire: CompactDateTime) {}
 
-    async fn publish_first_writes(&self) -> Result<(), StateAccessError> {
+    fn publish_first_writes(&self) -> impl Future<Output = Result<(), StateAccessError>> {
         // Inert session: nothing is published.
-        Ok(())
+        ready(Ok(()))
     }
 }
 

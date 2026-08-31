@@ -52,6 +52,7 @@ use prosody::timers::Trigger;
 use prosody::tracing::init_test_logging;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::future::{Future, ready};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -167,12 +168,12 @@ impl FallibleHandler for DeferTestHandler {
         }
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _context: C,
         _timer: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
     where
         C: EventContext<Payload = Self::Payload>,
     {
@@ -182,21 +183,21 @@ impl FallibleHandler for DeferTestHandler {
         // therefore the framework fires neither apply hook on this leaf for
         // that path). This method only runs for non-defer timers, which the
         // tests in this file do not schedule.
-        Ok(())
+        ready(Ok(()))
     }
 
     async fn shutdown(self) {}
 
-    async fn on_excise<C>(
+    fn on_excise<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<()>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 }
 

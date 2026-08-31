@@ -22,6 +22,7 @@ use crate::state::tests::cell_suite::value_cell;
 use crate::state::{CollectionId, EventRef, StateKey, StateName, StateType, StoreOutcome};
 use color_eyre::eyre::{Result, bail, eyre};
 use serde_json::{Value, json};
+use std::future::ready;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -122,40 +123,40 @@ impl<M: Classify> FallibleHandler for ViewProbe<M> {
     type Output = u64;
     type Payload = Value;
 
-    async fn on_excise<C>(
+    fn on_excise<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<()>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(0)
+        ready(Ok(0))
     }
 
-    async fn on_message<C>(
+    fn on_message<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<Self::Payload>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(0)
+        ready(Ok(0))
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _context: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(0)
+        ready(Ok(0))
     }
 
     async fn after_commit<C>(&self, context: C, _result: Result<Self::Output, Self::Error>)

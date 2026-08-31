@@ -15,8 +15,10 @@ use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::tests::test_support::{MockEventContext, OutcomeSlot};
 use crate::timers::Trigger;
 use crate::{Key, Offset};
+use futures::FutureExt;
 use parking_lot::Mutex;
 use std::fmt::{self, Debug};
+use std::future::ready;
 use std::sync::Arc;
 use tracing::span::Id;
 
@@ -163,47 +165,49 @@ impl FallibleHandler for OutcomeHandler {
     type Output = ();
     type Payload = serde_json::Value;
 
-    async fn on_excise<C>(
+    fn on_excise<C>(
         &self,
         _context: C,
         message: ConsumerMessage<()>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        self.handle_message(&message)
+        ready(()).map(move |()| self.handle_message(&message))
     }
 
-    async fn on_message<C>(
+    fn on_message<C>(
         &self,
         _context: C,
         message: ConsumerMessage<serde_json::Value>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        self.handle_message(&message)
+        ready(()).map(move |()| self.handle_message(&message))
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _context: C,
         trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        let outcome = self.take_outcome();
-        tracing::debug!(
-            "OutcomeHandler.on_timer: key={:?}, outcome={:?}",
-            trigger.key,
-            outcome
-        );
-        self.maybe_trigger_shutdown();
-        outcome.into_result()
+        ready(()).map(move |()| {
+            let outcome = self.take_outcome();
+            tracing::debug!(
+                "OutcomeHandler.on_timer: key={:?}, outcome={:?}",
+                trigger.key,
+                outcome
+            );
+            self.maybe_trigger_shutdown();
+            outcome.into_result()
+        })
     }
 
     async fn shutdown(self) {

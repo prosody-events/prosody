@@ -58,7 +58,7 @@ use quickcheck::{Arbitrary, Gen};
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::error::Error;
-use std::future::Future;
+use std::future::{Future, ready};
 use std::iter;
 use std::pin::Pin;
 use std::slice;
@@ -221,8 +221,11 @@ impl FailingOracle {
 impl CommitOracle for FailingOracle {
     type Error = FailingOracleError;
 
-    async fn record_message(&self, _dedup_id: Uuid) -> Result<(), Self::Error> {
-        Ok(())
+    fn record_message(
+        &self,
+        _dedup_id: Uuid,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        ready(Ok(()))
     }
 
     async fn resolve<'a>(
@@ -343,29 +346,32 @@ pub(crate) trait ShapeProbe {
 pub(crate) struct MemoryShapeProbe(pub(crate) MemoryCells);
 
 impl ShapeProbe for MemoryShapeProbe {
-    async fn cell_rows(&self, id: &CollectionId) -> Result<RowKeys> {
-        Ok(self
+    fn cell_rows(&self, id: &CollectionId) -> impl Future<Output = Result<RowKeys>> {
+        ready(Ok(self
             .0
             .stored_coordinates(id)
             .into_iter()
             .map(|cell| row_key(&cell))
-            .collect())
+            .collect()))
     }
 
-    async fn standing_marker(&self, id: &CollectionId) -> Result<Option<ProbedMarker>> {
-        Ok(self.0.standing_marker_of(id).map(|marker| {
+    fn standing_marker(
+        &self,
+        id: &CollectionId,
+    ) -> impl Future<Output = Result<Option<ProbedMarker>>> {
+        ready(Ok(self.0.standing_marker_of(id).map(|marker| {
             let (staged, clears) = probed_parts(&marker);
             (marker.event(), staged, clears)
-        }))
+        })))
     }
 
-    async fn provisional_rows(&self, id: &CollectionId) -> Result<RowKeys> {
-        Ok(self
+    fn provisional_rows(&self, id: &CollectionId) -> impl Future<Output = Result<RowKeys>> {
+        ready(Ok(self
             .0
             .provisional_coordinates(id)
             .iter()
             .map(row_key)
-            .collect())
+            .collect()))
     }
 }
 

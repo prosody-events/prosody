@@ -18,6 +18,7 @@ pub mod test_support;
 
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::future::ready;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -106,43 +107,43 @@ impl FallibleHandler for ProbeHandler {
     type Output = u64;
     type Payload = serde_json::Value;
 
-    async fn on_excise<C>(
+    fn on_excise<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<()>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
         self.log.lock().push(HookEvent::Handler);
-        self.result.clone().map(|()| self.sentinel)
+        ready(self.result.clone().map(|()| self.sentinel))
     }
 
-    async fn on_message<C>(
+    fn on_message<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<Self::Payload>,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
         self.log.lock().push(HookEvent::Handler);
-        self.result.clone().map(|()| self.sentinel)
+        ready(self.result.clone().map(|()| self.sentinel))
     }
 
-    async fn on_timer<C>(
+    fn on_timer<C>(
         &self,
         _context: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
         self.log.lock().push(HookEvent::Handler);
-        self.result.clone().map(|()| self.sentinel)
+        ready(self.result.clone().map(|()| self.sentinel))
     }
 
     async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)

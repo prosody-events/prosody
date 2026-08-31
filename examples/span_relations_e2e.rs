@@ -41,6 +41,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::env;
+use std::future::ready;
 use std::thread;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::time::{Duration, timeout};
@@ -159,16 +160,16 @@ impl FallibleHandler for SpanProbe {
 
     async fn shutdown(self) {}
 
-    async fn on_excise<C>(
+    fn on_excise<C>(
         &self,
         _context: C,
         _message: ConsumerMessage<()>,
         _demand_type: DemandType,
-    ) -> Result<(), Infallible>
+    ) -> impl Future<Output = Result<(), Infallible>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        Ok(())
+        ready(Ok(()))
     }
 }
 

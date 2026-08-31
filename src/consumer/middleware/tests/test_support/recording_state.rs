@@ -1,4 +1,5 @@
 use super::*;
+use std::future::ready;
 
 // =========================================================================
 // Recording-session harness for the settlement-boundary marker tests
@@ -43,17 +44,17 @@ impl Default for RecordingOracle {
 impl CommitOracle for RecordingOracle {
     type Error = Infallible;
 
-    async fn record_message(&self, dedup_id: Uuid) -> Result<(), Self::Error> {
+    fn record_message(&self, dedup_id: Uuid) -> impl Future<Output = Result<(), Self::Error>> {
         self.recorded.lock().push(dedup_id);
-        Ok(())
+        ready(Ok(()))
     }
 
-    async fn resolve<'a>(
+    fn resolve<'a>(
         &'a self,
         _state_key: &'a StateKey,
         _event: EventRef,
-    ) -> Result<CommitDecision, Self::Error> {
-        Ok(CommitDecision::Committed)
+    ) -> impl Future<Output = Result<CommitDecision, Self::Error>> {
+        ready(Ok(CommitDecision::Committed))
     }
 }
 
