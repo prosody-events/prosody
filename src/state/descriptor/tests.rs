@@ -11,19 +11,16 @@ use crate::codec::{JsonCodec, JsonCodecError};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::kafka_state::message_state;
 use crate::consumer::middleware::tests::test_support::MockEventContext;
-use crate::consumer::observer::KafkaObserver;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::cell_key::Direction;
 use crate::state::dirty::DirtyStore;
-use crate::state::first_write::FirstWritePublisher;
 use crate::state::manager::ArmedKeys;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::order_codec::{I64KeyCodec, Utf8KeyCodec};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
-use crate::state::tests::support::ScriptedPublicationStore;
 use crate::state::{CommitMode, EventRef, PartitionBackend, StateKey, StateName, StateType};
 use crate::test_util::{ArbJson, TEST_RUNTIME, captured_spans};
 use crate::timers::duration::CompactDuration;
@@ -110,28 +107,10 @@ pub(crate) fn test_session_with_armed(
     (KeyedStateSession::new(parts), cell_store)
 }
 
-/// Like [`test_session_parts`] but wires a [`FirstWritePublisher`] into the
-/// session, so a test can drive the first-write publication barrier that
-/// `Published` collections write through.
-pub(crate) fn test_session_with_publisher(
-    loader: MemoryLoader<Value>,
-    registry: CollectionDefRegistry,
-    state_key: StateKey,
-    publisher: FirstWritePublisher<ScriptedPublicationStore, KafkaObserver>,
-) -> (TestSession, MemoryCellStore<FixedOracle>) {
-    let (mut parts, cell_store) = session_parts(loader, registry, state_key, Arc::default(), false);
-    parts.publisher = Some(publisher);
-    (KeyedStateSession::new(parts), cell_store)
-}
-
 /// The partition backend every test-session fixture in this module shares: the
 /// memory cell store resolving through a get-out-of-the-way [`FixedOracle`].
-pub(crate) type TestBackend = PartitionBackend<
-    FixedOracle,
-    MemoryDescriptorIdentityStore,
-    MemoryCellStore<FixedOracle>,
-    FirstWritePublisher<ScriptedPublicationStore, KafkaObserver>,
->;
+pub(crate) type TestBackend =
+    PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, MemoryCellStore<FixedOracle>>;
 
 /// Builds a test session over an arbitrary loader payload — the generic twin of
 /// [`test_session`] (which pins the loader to `MemoryLoader<Value>`). The
@@ -189,7 +168,6 @@ pub(crate) fn session_parts<L>(
         recovery_delay: CompactDuration::new(30),
         armed,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-        publisher: None,
     };
     (parts, cell_store)
 }
@@ -217,12 +195,7 @@ pub(crate) fn session_with_dirty(
 /// A test session over an arbitrary cell store `C` — the twin of
 /// [`TestSession`], whose store is pinned to the plain memory one.
 pub(crate) type SessionOver<C> = KeyedStateSession<
-    PartitionBackend<
-        FixedOracle,
-        MemoryDescriptorIdentityStore,
-        C,
-        FirstWritePublisher<ScriptedPublicationStore, KafkaObserver>,
-    >,
+    PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, C>,
     MemoryLoader<Value>,
 >;
 
@@ -249,7 +222,6 @@ pub(crate) fn session_over<C: CellStore>(
         recovery_delay: CompactDuration::new(30),
         armed: Arc::default(),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-        publisher: None,
     })
 }
 

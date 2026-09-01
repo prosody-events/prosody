@@ -420,7 +420,6 @@ async fn permanent_finalize_failure_discards_overlay_keeping_floor() -> Result<(
         recovery_delay: CompactDuration::new(30),
         armed: Arc::default(),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-        publisher: None,
     });
     let context = MockEventContext::new()
         .with_session(session)
