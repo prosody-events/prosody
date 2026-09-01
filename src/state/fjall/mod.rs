@@ -88,13 +88,14 @@ use tracing::warn;
 /// never crosses an `.await`.
 const SCAN_HOP_ROWS: usize = 256;
 
-/// The one-way cache-fuse counter, bumped once per blow (see
-/// [`FjallCellCache::blow_fuse`]).
-static FUSE_BLOWN: LazyLock<Counter<u64>> = LazyLock::new(|| {
+/// Assignments that disabled their cell cache after a repair failure.
+///
+/// [`FjallCellCache::blow_fuse`] increments this counter once per assignment.
+static CACHE_DISABLED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     meter("prosody")
-        .u64_counter("prosody.state.cache_fuse_blown")
-        .with_description("Keyed-state cache fuses blown (one per degraded assignment)")
-        .with_unit("{fuse}")
+        .u64_counter("prosody.state.cell.cache.disabled_assignments")
+        .with_description("Keyed-state assignments that disabled their cell cache")
+        .with_unit("{assignment}")
         .build()
 });
 
@@ -362,8 +363,8 @@ impl FjallCellCache {
     /// once per degraded assignment; later calls are no-ops.
     pub(crate) fn blow_fuse(&self) {
         if !self.fuse.swap(true, Ordering::Relaxed) {
-            warn!("keyed-state cache fuse blown; degrading the assignment to durable reads");
-            FUSE_BLOWN.add(1, &[]);
+            warn!("keyed-state cell cache disabled for this assignment; using durable reads");
+            CACHE_DISABLED.add(1, &[]);
         }
     }
 
