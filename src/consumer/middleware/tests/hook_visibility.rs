@@ -281,7 +281,6 @@ async fn ambiguous_record_shutdown_after_abort_reads_prev() -> Result<()> {
             recovery_delay: CompactDuration::new(30),
             armed: Arc::default(),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-            publisher: None,
         });
     session
         .seed(
@@ -379,7 +378,6 @@ async fn incomplete_promote_after_commit_reads_the_mixed_per_cell_view() -> Resu
             recovery_delay: CompactDuration::new(30),
             armed: Arc::default(),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-            publisher: None,
         });
     session
         .seed(StateType::Application, &cart, &value_cell(), Some(b"A1"))

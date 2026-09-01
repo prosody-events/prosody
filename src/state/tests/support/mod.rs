@@ -42,7 +42,7 @@ use std::fmt;
 use std::future::{Future, ready};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
@@ -54,7 +54,7 @@ mod ttl;
 
 pub(crate) use counting::{CountingCellStore, CountingResolver, ResolveCounter};
 pub(crate) use holding::{HoldingCellStore, Holds};
-pub(crate) use publication::{ParkedRead, PublicationCall, ScriptedPublicationStore};
+pub(crate) use publication::{ParkedRead, ScriptedPublicationStore};
 pub(crate) use ttl::TtlStub;
 
 /// Get-out-of-the-way commit oracle: `record_message` is a no-op and every
@@ -389,11 +389,6 @@ where
     }
 
     async fn mark_backstop_armed(&self, _fire: CompactDateTime) {}
-
-    fn publish_first_writes(&self) -> impl Future<Output = Result<(), StateAccessError>> {
-        // Inert session: nothing is published.
-        ready(Ok(()))
-    }
 }
 
 impl<P> MarkerIdentity for UnavailableState<P>

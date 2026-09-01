@@ -146,6 +146,9 @@
 //! `Cached::get`) — correctness rests on the lower store, so
 //! `Cached::Error` is just the lower store's error.
 
+pub(crate) mod metrics;
+
+use self::metrics::{CacheResult, CellMetrics, Source};
 use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::cell_key::{CellKey, Coordinate, Scan, Section};
 use super::event_ref::EventRef;
@@ -160,6 +163,7 @@ use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, pin_mut};
+use quanta::Instant;
 use std::future::Future;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -187,6 +191,7 @@ pub(crate) const DELETE_RETRY_BUDGET: usize = 5;
 pub struct Cached<L> {
     fjall: FjallCellCache,
     lower: L,
+    metrics: CellMetrics,
 }
 
 impl<L> Cached<L> {
@@ -195,7 +200,18 @@ impl<L> Cached<L> {
     /// keyspace.
     #[must_use]
     pub fn new(fjall: FjallCellCache, lower: L) -> Self {
-        Self { fjall, lower }
+        Self {
+            fjall,
+            lower,
+            metrics: CellMetrics::default(),
+        }
+    }
+
+    /// Replaces the metric instruments for a test-local meter.
+    #[cfg(test)]
+    pub(crate) fn with_metrics(mut self, metrics: CellMetrics) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// The fjall expiry for a cell **read back** from the lower store now: the
@@ -331,39 +347,60 @@ where
         cell: &'a CellKey,
         own: EventRef,
     ) -> Result<Committed, Self::Error> {
+        let started = Instant::now();
         // Blown fuse: pure passthrough — no D3 (its only purpose is
         // fjall-entry repair), no publish.
         if self.fjall.fuse_blown() {
-            return self.lower.get(collection, cell, own).await;
+            let loaded = self.lower.get(collection, cell, own).await;
+            self.metrics
+                .point(started, Source::Store, CacheResult::Disabled, &loaded);
+            return loaded;
         }
-        match self.fjall.get(collection, cell).await {
+        let cache_result = match self.fjall.get(collection, cell).await {
             // A hit (Present value or Absent tag) is the current committed
             // projection (KV1); serve it verbatim with zero lower reads.
-            Ok(CacheRead::Hit(committed)) => return Ok(committed),
+            Ok(CacheRead::Hit(committed)) => {
+                let loaded = Ok(committed);
+                self.metrics
+                    .point(started, Source::Cache, CacheResult::Hit, &loaded);
+                return loaded;
+            }
             // A Miss asserts nothing and an Expired entry is a co-expiry gap
             // (KV2): fall through and re-publish.
-            Ok(CacheRead::Miss | CacheRead::Expired) => {}
+            Ok(CacheRead::Miss) => CacheResult::Miss,
+            Ok(CacheRead::Expired) => CacheResult::Expired,
             // A fjall read failure degrades this one read to a durable one.
-            Err(error) => warn_skip("read", &error),
+            Err(error) => {
+                warn_skip("read", &error);
+                self.metrics.cache_error("get", "lookup");
+                CacheResult::Error
+            }
+        };
+        let loaded = async {
+            self.delete_read_window(collection, own).await?;
+            let (committed, remaining) = self.lower.get_for_cache(collection, cell, own).await?;
+            // Best-effort fill publish — present or absent (negative caching),
+            // stamped with the remaining-TTL co-expiry. Sound because of
+            // GetNeverReadsOwnStaged (module doc, KV2). A failed publish degrades
+            // with NO delete. On the Miss/Expired arms the prior state already
+            // fell through, so nothing stale survives. On the `Err(fjall read)`
+            // arm the prior state can be a live, unexpired entry that stays — safe
+            // because every schedule reaching here re-reads a value EQUAL to that
+            // surviving entry (the D5 pre-call transform installs the committed
+            // projection; per-key dispatch serializes whole events), so the entry
+            // is never stale on its own — a stale hit here would already be a KV1
+            // break from another site.
+            let expiry = self.expiry_for(remaining);
+            if let Err(error) = self.fjall.put(collection, cell, &committed, expiry).await {
+                warn_skip("populate", &error);
+                self.metrics.cache_error("get", "fill");
+            }
+            Ok(committed)
         }
-        self.delete_read_window(collection, own).await?;
-        let (committed, remaining) = self.lower.get_for_cache(collection, cell, own).await?;
-        // Best-effort fill publish — present or absent (negative caching),
-        // stamped with the remaining-TTL co-expiry. Sound because of
-        // GetNeverReadsOwnStaged (module doc, KV2). A failed publish degrades
-        // with NO delete. On the Miss/Expired arms the prior state already
-        // fell through, so nothing stale survives. On the `Err(fjall read)`
-        // arm the prior state can be a live, unexpired entry that stays — safe
-        // because every schedule reaching here re-reads a value EQUAL to that
-        // surviving entry (the D5 pre-call transform installs the committed
-        // projection; per-key dispatch serializes whole events), so the entry
-        // is never stale on its own — a stale hit here would already be a KV1
-        // break from another site.
-        let expiry = self.expiry_for(remaining);
-        if let Err(error) = self.fjall.put(collection, cell, &committed, expiry).await {
-            warn_skip("populate", &error);
-        }
-        Ok(committed)
+        .await;
+        self.metrics
+            .point(started, Source::Store, cache_result, &loaded);
+        loaded
     }
 
     /// Batch point read with the **all-hits-or-refetch** contract: one blocking
@@ -394,57 +431,87 @@ where
         batch: &'a CoordinateBatch,
         own: EventRef,
     ) -> Result<CommittedBatch, Self::Error> {
+        let started = Instant::now();
         // Fuse snapshot ONCE at entry. Blown: pure passthrough — no D3 (its only
         // purpose is fjall-entry repair), no publish. Admitted: the whole verb
         // runs admitted even if the fuse blows mid-call — no second fuse check
         // below (the snapshot-once admission contract).
         if self.fjall.fuse_blown() {
-            return self.lower.get_many(collection, section, batch, own).await;
+            let loaded = self.lower.get_many(collection, section, batch, own).await;
+            self.metrics.batch(
+                batch.len(),
+                started,
+                Source::Store,
+                CacheResult::Disabled,
+                &loaded,
+            );
+            return loaded;
         }
         // Probe: ONE blocking hop, exhaustive.
-        match self.fjall.get_batch(collection, section, batch).await {
+        let cache_result = match self.fjall.get_batch(collection, section, batch).await {
             // Every position is a hit (Present value or Absent tag), the current
             // committed projection (KV1): serve verbatim, zero lower reads, no D3.
-            Ok(Some(hits)) => return Ok(hits),
+            Ok(Some(hits)) => {
+                let loaded = Ok(hits);
+                self.metrics.batch(
+                    batch.len(),
+                    started,
+                    Source::Cache,
+                    CacheResult::Hit,
+                    &loaded,
+                );
+                return loaded;
+            }
             // Any miss/expired (KV2): fall through and refetch the WHOLE batch.
-            Ok(None) => {}
+            Ok(None) => CacheResult::NotAllHit,
             // A fjall probe failure degrades this read to a durable one.
-            Err(error) => warn_skip("read batch", &error),
+            Err(error) => {
+                warn_skip("read batch", &error);
+                self.metrics.cache_error("get_many", "lookup");
+                CacheResult::Error
+            }
+        };
+        let loaded = async {
+            // All-hits-or-refetch: any non-hit discards every sampled value and
+            // re-reads the whole batch from durable truth AFTER the read-window guard.
+            self.delete_read_window(collection, own).await?;
+            // Anchor the co-expiry on a clock read taken BEFORE the durable read
+            // (see the module's TTL co-expiry doc): a wide batch resolution can only
+            // stamp entries EARLY, never past their durable row death.
+            let stamped_at = self.fjall.clock().now_ms();
+            // On Err: publish NOTHING (a negative/Absent entry is published only from
+            // a fully successful batch).
+            let filled: CacheBatch = self
+                .lower
+                .get_many_for_cache(collection, section, batch, own)
+                .await?;
+            // Publish every cell (present AND absent), one atomic batch, NO delete on
+            // failure (the read-fill no-delete degrade — distinct from the mutator D1
+            // delete-on-failure). Each `CellKey` is built inline — no scratch buffer.
+            let projected =
+                batch
+                    .iter()
+                    .zip(filled.iter())
+                    .map(|(coordinate, (committed, remaining))| {
+                        (
+                            CellKey {
+                                section,
+                                coordinate: coordinate.clone(),
+                            },
+                            committed.clone(),
+                            expiry_at(stamped_at, *remaining),
+                        )
+                    });
+            if let Err(error) = self.fjall.put_batch(collection, projected).await {
+                warn_skip("populate batch", &error);
+                self.metrics.cache_error("get_many", "fill");
+            }
+            Ok(filled.into_iter().map(|(committed, _)| committed).collect())
         }
-        // All-hits-or-refetch: any non-hit discards every sampled value and
-        // re-reads the whole batch from durable truth AFTER the read-window guard.
-        self.delete_read_window(collection, own).await?;
-        // Anchor the co-expiry on a clock read taken BEFORE the durable read
-        // (see the module's TTL co-expiry doc): a wide batch resolution can only
-        // stamp entries EARLY, never past their durable row death.
-        let stamped_at = self.fjall.clock().now_ms();
-        // On Err: publish NOTHING (a negative/Absent entry is published only from
-        // a fully successful batch).
-        let filled: CacheBatch = self
-            .lower
-            .get_many_for_cache(collection, section, batch, own)
-            .await?;
-        // Publish every cell (present AND absent), one atomic batch, NO delete on
-        // failure (the read-fill no-delete degrade — distinct from the mutator D1
-        // delete-on-failure). Each `CellKey` is built inline — no scratch buffer.
-        let projected =
-            batch
-                .iter()
-                .zip(filled.iter())
-                .map(|(coordinate, (committed, remaining))| {
-                    (
-                        CellKey {
-                            section,
-                            coordinate: coordinate.clone(),
-                        },
-                        committed.clone(),
-                        expiry_at(stamped_at, *remaining),
-                    )
-                });
-        if let Err(error) = self.fjall.put_batch(collection, projected).await {
-            warn_skip("populate batch", &error);
-        }
-        Ok(filled.into_iter().map(|(committed, _)| committed).collect())
+        .await;
+        self.metrics
+            .batch(batch.len(), started, Source::Store, cache_result, &loaded);
+        loaded
     }
 
     async fn contains_many<'a>(
