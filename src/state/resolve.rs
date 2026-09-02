@@ -364,7 +364,9 @@ where
 /// Resolves an unsettled section clear before a durable resolved write.
 ///
 /// The caller creates [`UnsettledClear`] only when the marker has a clear.
-/// Resolution makes the later write newer than this clear.
+/// The caller starts its write after this resolution completes.
+/// A concurrent resolver can apply the same clear after that write.
+/// This function does not serialize marker resolution.
 pub(crate) async fn resolve_unsettled_clear_before_write<S, O>(
     store: &S,
     oracle: &O,
