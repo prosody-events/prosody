@@ -73,7 +73,8 @@ pub fn cache_with_clock(name: &str, clock: Clock) -> Result<FjallCellCache> {
 
 /// Returns a marker-check handle for the named test workspace.
 ///
-/// Use a new workspace to model a new partition assignment.
+/// A store that models a new assignment needs a cold check set; the Cassandra
+/// `MarkerMemo` doc owns the rule.
 pub fn marker_checks(name: &str) -> Result<MarkerCheckSet> {
     // Create the handle through the cache to share its disabled state.
     Ok(cache(name)?.marker_checks())

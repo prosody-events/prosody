@@ -361,6 +361,9 @@ fn memory_batch_alignment() -> Result<()> {
 /// Proves that marker resolution reads provisional cells in bounded batches.
 ///
 /// The test expects three batch reads, no point reads, and one event check.
+///
+/// Falsification: Replace `resolve_event_marker` batch reads with point reads.
+/// Then `raw_batch_reads` becomes zero and the read-count asserts fail.
 #[test]
 fn memory_resolve_event_marker_batches_reads() -> Result<()> {
     executor::block_on(async {
@@ -419,6 +422,10 @@ fn memory_resolve_event_marker_batches_reads() -> Result<()> {
 ///
 /// Two sections contain different values at coordinate 7.
 /// Each value must remain in its original section.
+///
+/// Falsification: Use `SECTIONS[0]` for each `section_batches` result.
+/// Then one survivor stays provisional and the `remaining.is_empty()` assert
+/// fails.
 #[test]
 fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
     executor::block_on(async {
@@ -492,6 +499,9 @@ fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
 }
 
 /// Proves that an event-check error takes priority over a cell-read error.
+///
+/// Falsification: Replace the joined reads with `try_join!`.
+/// Then the store error wins and the `matches!` assert fails.
 #[test]
 fn resolve_event_marker_double_failure_surfaces_oracle() -> Result<()> {
     executor::block_on(async {
@@ -567,10 +577,8 @@ fn memory_overlay_precedence_set_beats_section_clear() -> Result<()> {
 /// exactly ONE lower batch read for its entries — a full-width scan chunk is
 /// one [`CoordinateBatch`], one lower `get_many`; only the keyset meta cell
 /// stays a point read.
-/// The test fails if revert `CoordinatePlan`'s chunk source to a per-key point
-/// `get` loop →
-/// `batch_reads == 0` and `lower_reads == CELL_BATCH` (+ keyset) → both asserts
-/// red. Counters are read after the full drain, so nothing masks them.
+/// Falsification: Replace `CoordinatePlan` batch reads with per-key `get`
+/// calls. Then `batch_reads` becomes zero and both read-count asserts fail.
 #[test]
 fn map_cold_chunk_is_one_batch_read() -> Result<()> {
     executor::block_on(async {
@@ -665,11 +673,9 @@ fn map_cold_chunk_is_one_batch_read() -> Result<()> {
 /// (read-your-writes: committed/absent/uncommitted-set/uncommitted-remove/
 /// set-after-clear) while never running the resolver — contrasted against
 /// `get`, which resolves on the very same collection.
-/// The test fails if an always-`Ok(true)` body flips every `!... .await?`
-/// assert red; a `get`-delegating body (`self.get(key).await.map(|o|
-/// o.is_some())`) makes `resolves.resolves()` nonzero before the `assert_eq!`
-/// runs, since `contains_key(&k1)` on the seeded, resolvable key is the first
-/// call. Both revert to green.
+///
+/// Falsification: Make `contains_key` always return `Ok(true)`.
+/// Then absent-key checks return true and the presence asserts fail.
 #[test]
 fn map_contains_key_presence_without_resolving() -> Result<()> {
     const K1: i64 = 1;
@@ -782,6 +788,9 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
 }
 
 /// Proves that key scans do not resolve cell values.
+///
+/// Falsification: Route `MapHandle::keys` through the resolving stream.
+/// Then the resolver count becomes nonzero and the count assert fails.
 #[test]
 fn map_keys_no_resolve() -> Result<()> {
     executor::block_on(async {
@@ -960,9 +969,10 @@ fn prop_deque_collection_lifecycle_read_uncommitted() {
 /// both commit modes — so lazy push-only eviction, its rollback under
 /// abort/crash, and the at-least-once `commit()` floor all hold with a cap in
 /// play. The unbounded lifecycle properties above test the `capacity = None`
-/// path. The test fails if make `evictions` always return `0` (skip
-/// enforcement) → after a push-to-full the handle window exceeds the trimmed
-/// model → `assert_deque` mismatch → red.
+/// path.
+///
+/// Falsification: Make `evictions` always return zero.
+/// Then the handle exceeds the model and the `assert_deque` check fails.
 #[test]
 fn prop_deque_bounded_lifecycle() {
     fn property(trace: DequeTrace) -> Result<bool> {
@@ -993,9 +1003,9 @@ fn prop_deque_bounded_lifecycle_read_uncommitted() {
 /// within the computed catch-up pushes, evicting at most `TRIM_MAX` slots per
 /// push (read from the buffered dirty overlay). See
 /// [`run_deque_capacity_convergence`] for the full disposition.
-/// The test fails if drop `.min(TRIM_MAX)` from `evictions` → an over-wide
-/// window's first push buffers `> TRIM_MAX` entry deletes → the per-push cap
-/// assert → red.
+///
+/// Falsification: Remove `.min(TRIM_MAX)` from `evictions`.
+/// Then one push exceeds the delete limit and the per-push cap assert fails.
 #[test]
 fn prop_deque_capacity_convergence() {
     fn property(shape: DequeCapacityShape) -> Result<bool> {
@@ -1791,12 +1801,10 @@ fn resolve_session(
 /// values, never the whole `n`-entry collection. The counting store bounds the
 /// fetches and the counting resolver bounds the resolutions. Both counters sit
 /// at the lowest layer, so nothing masks a materialization.
-/// The test fails if widen `keys.by_ref().take(CELL_BATCH)` in
-/// `CoordinatePlan::entry_source` to `.take(usize::MAX)` (drain every tracked
-/// key in one chunk) → `take(k)` fetches and resolves all `n` → `batch_reads ==
-/// n.div_ceil(16)` and `resolves == n`, both over their bounds for `n ≫ k` →
-/// red. (Inflating `CELL_BATCH` itself cannot falsify: the assertion bound
-/// moves with it.)
+///
+/// Falsification: Make `CoordinatePlan::entry_source` consume all tracked keys.
+/// Then the read and resolver counts exceed their bounds, and both asserts
+/// fail. A larger `CELL_BATCH` cannot falsify: the bound moves with it.
 async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
@@ -1900,12 +1908,11 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
 /// [`run_map_stream_prefix_lazy`] over a dense `n`-entry window on the
 /// point-get arm — at most one batch read beyond `k` (entries flow through the
 /// batch verb; only the bounds meta cell is a point read) and at most
-/// `k + CELL_BATCH` resolved. The test fails if widen
-/// `keys.by_ref().take(CELL_BATCH)` in `CoordinatePlan::entry_source` to
-/// `.take(usize::MAX)` (fetch the whole window in one chunk) →
-/// `batch_reads == n.div_ceil(16)` and `resolves == n`, both over their bounds
-/// for `n ≫ k` → red. (Inflating `CELL_BATCH` itself cannot falsify: the
-/// assertion bound moves with it.)
+/// `k + CELL_BATCH` resolved.
+///
+/// Falsification: Make `CoordinatePlan::entry_source` consume all tracked keys.
+/// Then the read and resolver counts exceed their bounds, and both asserts
+/// fail. A larger `CELL_BATCH` cannot falsify: the bound moves with it.
 async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
@@ -2002,11 +2009,9 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
 /// (resolver-carrying) deque capped at one slot, a `push_back` that evicts the
 /// front resolves **nothing** — a blind push never resolves, so a nonzero count
 /// could come only from the eviction path reading the evicted slot.
-/// The test fails if change the eviction `entries.clear` to an `entries.get`
-/// then `clear` (as `pop_front` does) → the evicted slot resolves through
-/// `CountingResolver` → `resolves() == 1 != 0` → red. The `resolves()` assert
-/// is read **before** the survivor peek (which does resolve), so nothing masks
-/// it.
+///
+/// Falsification: Replace the eviction clear with a get followed by a clear.
+/// Then the evicted slot resolves and the zero-count assert fails.
 #[test]
 fn deque_bounded_eviction_does_not_resolve() -> Result<()> {
     executor::block_on(async {

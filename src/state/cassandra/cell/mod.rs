@@ -129,9 +129,8 @@ use crate::state::marker::{EventMarker, SectionClear, encode_marker_payload};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{
-    PriorEventClear, ReadPreparation, ResolveCellError, Resolver, UnsettledClear, flatten_resolve,
-    peek_read, resolve_event_marker, resolve_prior_clear_before_read, resolve_read,
-    resolve_unsettled_clear_before_write,
+    ReadPreparation, ResolveCellError, Resolver, flatten_resolve, peek_read, resolve_event_marker,
+    resolve_prior_clear_before_read, resolve_read, resolve_unsettled_clear_before_write,
 };
 use crate::state::store::{
     CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe,
@@ -272,21 +271,28 @@ pub(crate) struct RecoveryReadCounts {
 
 /// Tracks marker state for one partition assignment.
 ///
-/// `unsettled` can over-report, but it must not under-report after `checked` is
-/// set. Update `unsettled` before `checked` to enforce this invariant.
-/// A settle removes the marker and keeps `checked` set.
+/// `unsettled` can over-report, but it must not under-report after `checks` is
+/// set. Update `unsettled` before `checks` to enforce this invariant.
+/// A settle removes the marker and keeps `checks` set.
 /// The disk-backed check set prevents unbounded keyed RAM use.
+///
+/// A check-set row is valid only for a store whose `unsettled` map saw that
+/// collection's marker read. Production gives each partition assignment one
+/// store and one check set from that assignment's new workspace. A store that
+/// models a new assignment must start with a cold check set for the collections
+/// it reads. A check-set error reads as unchecked and causes one extra durable
+/// marker read.
 #[derive(Debug)]
 struct MarkerMemo {
     unsettled: scc::HashMap<CollectionId, EventMarker, RandomState>,
-    checked: MarkerCheckSet,
+    checks: MarkerCheckSet,
 }
 
 impl MarkerMemo {
-    fn new(checked: MarkerCheckSet) -> Self {
+    fn new(checks: MarkerCheckSet) -> Self {
         Self {
             unsettled: scc::HashMap::default(),
-            checked,
+            checks,
         }
     }
 }

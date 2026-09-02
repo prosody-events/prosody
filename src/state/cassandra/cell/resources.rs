@@ -74,7 +74,8 @@ impl CassandraCellResources {
     /// It returns cells in coordinate order.
     /// The limit counts only returned cells.
     ///
-    /// The projection is sound without that repair. A provisional row's `prev`
+    /// This scan does not resolve an unsettled section clear.
+    /// The projection is still sound: a provisional row's `prev`
     /// is committed by construction, and a resolved row's `data` was committed
     /// at some earlier point. So a resolved row written before a committed but
     /// not-yet-applied section clear reads a value that was once committed but

@@ -55,7 +55,7 @@ async fn corrupt_cleared_window(
     Ok((fx, store, collection))
 }
 
-/// A point read repairs its standing section clear before it decodes the stale
+/// A point read repairs its unsettled section clear before it decodes the stale
 /// row that the clear removes.
 #[tokio::test]
 async fn point_read_repairs_before_decode() -> Result<()> {
@@ -69,7 +69,7 @@ async fn point_read_repairs_before_decode() -> Result<()> {
     Ok(())
 }
 
-/// A batch read repairs its standing section clear before it decodes any stale
+/// A batch read repairs its unsettled section clear before it decodes any stale
 /// row that the clear removes.
 #[tokio::test]
 async fn batch_read_repairs_before_decode() -> Result<()> {

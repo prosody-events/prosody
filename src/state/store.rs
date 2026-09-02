@@ -115,8 +115,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// required). Provisional cells in range are oracle-resolved here; cleared
     /// or absent cells are skipped, so the stream yields only present committed
     /// bytes in `coordinate` byte order. Returns marker-resolved truth exactly
-    /// as [`Self::get`] does (the committed-unapplied read window, stated
-    /// there).
+    /// as [`Self::get`] does (see *Prior section clears* on [`Self::get`]).
     fn scan_cells<'a>(
         &'a self,
         collection: &'a CollectionId,

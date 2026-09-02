@@ -102,6 +102,7 @@ impl<'a> PriorEventClear<'a> {
 }
 
 /// Reports whether read preparation changed durable state.
+#[must_use]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadPreparation {
     Unchanged,
@@ -238,7 +239,9 @@ where
         .unsettled_marker(collection.id())
         .await
         .map_err(ResolveCellError::Store)?
-        .is_some_and(|marker| !marker.clears().is_empty());
+        .as_ref()
+        .and_then(UnsettledClear::new)
+        .is_some();
     if deferred {
         return Ok(Committed::new(match decision {
             CommitDecision::Committed => provisional.into_data(),
@@ -363,7 +366,7 @@ where
 
 /// Resolves an unsettled section clear before a durable resolved write.
 ///
-/// The caller creates [`UnsettledClear`] only when the marker has a clear.
+/// Resolves the marker only when it has a section clear.
 /// The caller starts its write after this resolution completes.
 /// A concurrent resolver can apply the same clear after that write.
 /// This function does not serialize marker resolution.
@@ -371,13 +374,13 @@ pub(crate) async fn resolve_unsettled_clear_before_write<S, O>(
     store: &S,
     oracle: &O,
     collection: &CollectionRef,
-    clear: Option<UnsettledClear<'_>>,
+    marker: Option<&EventMarker>,
 ) -> Result<(), ResolveCellError<S::Error, O::Error>>
 where
     S: CellStore,
     O: CommitOracle,
 {
-    let Some(clear) = clear else {
+    let Some(clear) = marker.and_then(UnsettledClear::new) else {
         return Ok(());
     };
     resolve_event_marker(store, oracle, collection, clear.marker()).await
@@ -385,20 +388,21 @@ where
 
 /// Resolves a prior event's section clear before a read.
 ///
-/// The caller creates [`PriorEventClear`] only for a different event.
+/// Resolves the marker only when it is a prior event's section clear.
 /// A concurrent raw read must run again when this function changes durable
 /// state.
 pub(crate) async fn resolve_prior_clear_before_read<S, O>(
     store: &S,
     oracle: &O,
     collection: &CollectionRef,
-    clear: Option<PriorEventClear<'_>>,
+    marker: Option<&EventMarker>,
+    own: EventRef,
 ) -> Result<ReadPreparation, ResolveCellError<S::Error, O::Error>>
 where
     S: CellStore,
     O: CommitOracle,
 {
-    let Some(clear) = clear else {
+    let Some(clear) = marker.and_then(|marker| PriorEventClear::new(marker, own)) else {
         return Ok(ReadPreparation::Unchanged);
     };
     resolve_event_marker(store, oracle, collection, clear.marker()).await?;
@@ -411,6 +415,11 @@ where
 /// It then resolves provisional cells that remain.
 /// A permanent data error leaves work for a later read or sweep.
 /// Other errors stop this sweep and cause a later retry.
+///
+/// Ruling: grouping the per-cell pass by `(collection, event)` stays deferred.
+/// The marker pass does one oracle lookup and one settle for the common case.
+/// The per-cell pass handles rare residue only.
+/// Grouping would complicate the permanent-skip and transient-fail posture.
 pub(crate) async fn sweep_provisional<S, O>(
     store: &S,
     oracle: &O,

@@ -50,8 +50,12 @@
 //! A final failure disables the cache for the assignment.
 //! The failure does not stop durable state settlement.
 //!
-//! A durable write always occurs before its cache update.
-//! A failed durable write cannot publish a new cache value.
+//! A mutator publishes a new cache value only after its durable write succeeds.
+//! A failed durable write therefore never publishes the new value.
+//! `commit_provisional` is the one exception: the event verdict is final before
+//! it runs, so it publishes the committed values before the durable promote.
+//! Removals (`write_resolved`, `mark_resolved`, section clears) run before the
+//! durable call, so a failed durable call leaves cells cold, never stale.
 //!
 //! **The Incomplete trap.**
 //! `commit_provisional`
@@ -108,7 +112,7 @@ use super::event_ref::EventRef;
 use super::fjall::{CacheRead, FjallCellCache, FjallCellCacheError};
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::{EventMarker, SectionClear};
-use super::resolve::PriorEventClear;
+use super::resolve::{PriorEventClear, UnsettledClear};
 use super::store::{
     CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, section_batches,
 };
@@ -197,6 +201,9 @@ impl<L> Cached<L> {
 
     /// Removes cache entries that an event marker can change.
     ///
+    /// Takes the marker, not a clear type: the stage boundary evicts for any
+    /// prior event marker, with or without clears.
+    ///
     /// A failed removal disables the cache.
     async fn evict_marker_cache_entries(&self, collection: &CollectionId, marker: &EventMarker) {
         retry_delete(&self.fjall, "marker staged", || {
@@ -220,7 +227,9 @@ impl<L> Cached<L> {
     /// `project` computes each cell's committed projection from its batch
     /// entry.
     ///
-    /// A failed cache update removes all old entries for these cells.
+    /// A failed cache update removes all old entries for these cells. The
+    /// durable value has moved, so an old entry would serve the pre-write
+    /// value.
     async fn publish_written<T>(
         &self,
         collection: &CollectionRef,
@@ -333,6 +342,15 @@ where
     /// Reads a batch from the cache only when every entry is current.
     ///
     /// One missing or expired entry reloads the complete batch.
+    /// A batch of hits consults no marker. This is sound for three reasons. The
+    /// settle transform installs committed values before the promote.
+    /// Per-key dispatch serializes events on a key. Every assignment starts
+    /// with a cold cache.
+    ///
+    /// Ruling: partial refetch (keep the hits, load only the misses) stays
+    /// deferred until a benchmark shows a material Cassandra gain. Such a
+    /// design must pin the committed-but-unpromoted window with a property
+    /// test.
     async fn get_many<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -646,9 +664,9 @@ where
         // Remove entries that an unsettled section clear can change.
         // Do this before the lower store resolves the clear.
         if let Some(unsettled) = self.lower.unsettled_marker(collection.id()).await?
-            && !unsettled.clears().is_empty()
+            && let Some(clear) = UnsettledClear::new(&unsettled)
         {
-            self.evict_marker_cache_entries(collection.id(), &unsettled)
+            self.evict_marker_cache_entries(collection.id(), clear.marker())
                 .await;
         }
         // Remove each cleared section before the lower write.
@@ -731,6 +749,9 @@ where
         // Publish the committed values before durable promotion.
         // The event result is final before this function starts.
         // Remove the entries if this cache update fails.
+        // Ruling: keep this transform. Delete-and-refill would leave staged
+        // cells cold after each commit and cost one durable point read per hot
+        // cell per event.
         if let Err(error) = self.fjall.commit_batch(collection.id(), writes).await {
             warn_skip("commit transform", &error);
             let cells: CellBuffer<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
@@ -847,7 +868,7 @@ where
 /// self-heals. A **backward** local clock step after publication is the one
 /// direction the fall-through does not cover: the entry never reads as expired,
 /// so it stays a hit past the durable row's death for the size of the step,
-/// until the next write-through or D-site eviction heals it — bounded by the
+/// until the next write-through or marker eviction heals it — bounded by the
 /// NTP step magnitude. A monotonic-clock floor would remove it; it is not
 /// applied here.
 fn expiry_at(stamped_at: u64, remaining: Option<CompactDuration>) -> u64 {
@@ -863,9 +884,9 @@ fn expiry_at(stamped_at: u64, remaining: Option<CompactDuration>) -> u64 {
 /// Runs a must-succeed repair delete: up to [`DELETE_RETRY_BUDGET`] attempts
 /// with [`DELETE_RETRY_DELAY`] between them, warning per failure; on
 /// exhaustion it **disables the cache** and returns. Completes-or-disables: it
-/// never fails upward and never stalls settlement — see the module's retry
-/// posture for why every failure class (there is no Permanent escape hatch)
-/// lands in the same bounded place.
+/// never fails upward and never stalls settlement — see the module's cache
+/// disablement section for why every failure class (there is no Permanent
+/// escape hatch) lands in the same bounded place.
 ///
 /// A dropped **boundary-owned** settle/sweep future abandons the retry
 /// harmlessly: the drop coincides with assignment revocation (the workspace —

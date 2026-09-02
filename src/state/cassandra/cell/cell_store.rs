@@ -4,12 +4,11 @@ use super::{
     BatchUnit, Bytes, CacheBatch, CassandraStore, CassandraStoreError, Cell, CellAddr,
     CellBatchRow, CellBuffer, CellKey, CellKind, CellStore, CellStoreError, CollectionId,
     CollectionRef, CommitOracle, Committed, CommittedBatch, CompactDuration, Coordinate,
-    CoordinateBatch, EventMarker, EventRef, KeyRow, PER_STATEMENT_OVERHEAD, Pk, PriorEventClear,
-    ProvisionalCell, ProvisionalWrite, ReadPreparation, ResolveCellError, RowShape, Scan, Section,
-    SectionClear, SmallVec, Stream, UnsettledClear, decode, decode_batch_rows,
-    decode_cell_ttl_result, decode_provisional_batch, dedupe, encode_cell_blobs,
-    expand_to_input_order, extend_gap_units, flatten_resolve, gap_count, into_store_err,
-    match_batch_rows_to_coordinates, resolve_prior_clear_before_read, resolve_read,
+    CoordinateBatch, EventMarker, EventRef, KeyRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell,
+    ProvisionalWrite, ReadPreparation, ResolveCellError, RowShape, Scan, Section, SectionClear,
+    SmallVec, Stream, decode, decode_batch_rows, decode_cell_ttl_result, decode_provisional_batch,
+    dedupe, encode_cell_blobs, expand_to_input_order, extend_gap_units, flatten_resolve, gap_count,
+    into_store_err, match_batch_rows_to_coordinates, resolve_prior_clear_before_read, resolve_read,
     resolve_unsettled_clear_before_write, section_batches, smallvec, sorted_unique_coordinates,
     try_stream, ttl_seconds_to_duration, ttl_to_i32, write_provisional,
 };
@@ -47,12 +46,15 @@ where
         );
         let mut row = row.map_err(ResolveCellError::Store)?;
         let marker = marker?;
-        let clear = marker
-            .as_ref()
-            .and_then(|marker| PriorEventClear::new(marker, own));
-        if resolve_prior_clear_before_read(self, self.resolver.oracle(), &collection_ref, clear)
-            .await
-            .map_err(flatten_resolve)?
+        if resolve_prior_clear_before_read(
+            self,
+            self.resolver.oracle(),
+            &collection_ref,
+            marker.as_ref(),
+            own,
+        )
+        .await
+        .map_err(flatten_resolve)?
             == ReadPreparation::DurableStateChanged
         {
             row = self
@@ -111,12 +113,15 @@ where
         );
         let mut rows = rows.map_err(ResolveCellError::Store)?;
         let marker = marker?;
-        let clear = marker
-            .as_ref()
-            .and_then(|marker| PriorEventClear::new(marker, own));
-        if resolve_prior_clear_before_read(self, self.resolver.oracle(), &collection_ref, clear)
-            .await
-            .map_err(flatten_resolve)?
+        if resolve_prior_clear_before_read(
+            self,
+            self.resolver.oracle(),
+            &collection_ref,
+            marker.as_ref(),
+            own,
+        )
+        .await
+        .map_err(flatten_resolve)?
             == ReadPreparation::DurableStateChanged
         {
             rows = self
@@ -259,10 +264,14 @@ where
         // Resolve an unsettled section clear before this write.
         // The clear cannot remove a value that this write adds.
         let marker = self.unsettled_marker(collection.id()).await?;
-        let clear = marker.as_ref().and_then(UnsettledClear::new);
-        resolve_unsettled_clear_before_write(self, self.resolver.oracle(), collection, clear)
-            .await
-            .map_err(flatten_resolve)?;
+        resolve_unsettled_clear_before_write(
+            self,
+            self.resolver.oracle(),
+            collection,
+            marker.as_ref(),
+        )
+        .await
+        .map_err(flatten_resolve)?;
         // Survivors are the present-data `cells`, excluded from the gaps
         // positionally, so every batch row stays disjoint and may be packed
         // independently.
@@ -319,7 +328,7 @@ where
         collection: &'a CollectionId,
     ) -> Result<Option<EventMarker>, Self::Error> {
         // A completed check makes the memory map authoritative.
-        if self.memo.checked.contains(collection).await {
+        if self.memo.checks.contains(collection).await {
             return Ok(self
                 .memo
                 .unsettled
@@ -367,7 +376,7 @@ where
                 .upsert_async(collection.clone(), marker.clone())
                 .await;
         }
-        self.memo.checked.set(collection).await;
+        self.memo.checks.set(collection).await;
         Ok(marker)
     }
 

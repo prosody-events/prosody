@@ -920,6 +920,10 @@ fn write_path_delete_recovers_within_budget() -> Result<()> {
 /// Proves that a failed durable write does not cache the new value.
 ///
 /// The next read loads the old durable value.
+///
+/// Example test by necessity: the crash and overlay properties observe values,
+/// not the serving layer. The lower-read count is below the model's
+/// abstraction, so it cannot join the generator.
 #[test]
 fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
     use crate::state::StateName;

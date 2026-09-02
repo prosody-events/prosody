@@ -112,18 +112,18 @@ async fn event_marker_co_expires_with_collection_ttl() -> Result<()> {
     Ok(())
 }
 
-/// The `Cached` stage-boundary D3: event A stages two coordinates through
-/// the cached assembly (fjall holds A's stage-time `prev`s as the committed
-/// projections), A's commit marker is recorded but the settle never runs (the
-/// skipped-settle window); event B then stages ONE overlapping coordinate
-/// through the same assembly. The lower store's stage boundary resolves A's
-/// event marker *beneath* the cache, so `Cached::write_provisional` must
-/// delete A's marker-listed coordinates' entries BEFORE forwarding down —
-/// without the delete, A's untouched coordinate keeps serving the stale warm
-/// `prev` verbatim forever. A deterministic falsifier of the delete-ordering
-/// the fault/crash alphabet surfaces as model divergence against the live
-/// `Cached` composition; it isolates the skipped-settle boundary window
-/// without a generated schedule.
+/// The `Cached` stage-boundary marker eviction: event A stages two coordinates
+/// through the cached assembly (fjall holds A's stage-time `prev`s as the
+/// committed projections), A's commit marker is recorded but the settle never
+/// runs (the skipped-settle window); event B then stages ONE overlapping
+/// coordinate through the same assembly. The lower store's stage boundary
+/// resolves A's event marker *beneath* the cache, so
+/// `Cached::write_provisional` must delete A's marker-listed coordinates'
+/// entries BEFORE forwarding down — without the delete, A's untouched
+/// coordinate keeps serving the stale warm `prev` verbatim forever. A
+/// deterministic falsifier of the delete-ordering the fault/crash alphabet
+/// surfaces as model divergence against the live `Cached` composition; it
+/// isolates the skipped-settle boundary window without a generated schedule.
 #[tokio::test]
 async fn stage_boundary_deletes_foreign_marker_entries() -> Result<()> {
     init_test_logging();

@@ -251,6 +251,11 @@ async fn fixture() -> Result<Fixture> {
 
 impl Fixture {
     /// Returns a Cassandra store that uses the fixture's marker-check set.
+    ///
+    /// All stores from one fixture share one warm check set. Collections are
+    /// fresh per test. A test that builds a second store over a collection
+    /// uses an exclusive check set and clears it first (see
+    /// `batch_bind.rs`).
     fn bottom_store(&self, oracle: ScriptedOracle) -> CassandraStore<ScriptedOracle> {
         self.bottom_store_with(oracle, self.marker_checks.clone())
     }

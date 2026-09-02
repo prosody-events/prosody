@@ -193,7 +193,7 @@ impl EventMarker {
 ///                  survivor_count × [coord_len: u32 BE][coord bytes]
 /// ```
 ///
-/// Frozen and verified; the Cassandra marker row is its production caller (the
+/// Frozen and pinned; the Cassandra marker row is its production caller (the
 /// payload rides the row's `data`/`encoding`/`version` columns).
 ///
 /// # Errors

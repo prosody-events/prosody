@@ -5,12 +5,11 @@ use super::{
     CellAddr, CellBatchRow, CellBlobs, CellKey, CellKind, CellQueries, CellStore, CellStoreError,
     CollectionDefRegistry, CollectionId, CollectionRef, CommitOracle, Coordinate, EventMarker,
     EventRef, KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, MarkerCheckSet, Pk,
-    PreparedStatement, PriorEventClear, QueryRowsResult, ResolveCellError, ResolvedRow, Resolver,
-    RowShape, SHARD_FANOUT_CONCURRENCY, Scan, Section, Session, Stream, TryStreamExt, blob_weight,
-    encode, encode_marker_payload, fetch_and_decode_cell, fetch_cell_rows_result,
-    fetch_cells_batch_result, flatten_resolve, marker_delete_unit, marker_last_split, page_cells,
-    peek_read, pin_mut, resolve_event_marker, resolve_prior_clear_before_read, smallvec,
-    try_stream,
+    PreparedStatement, QueryRowsResult, ResolveCellError, ResolvedRow, Resolver, RowShape,
+    SHARD_FANOUT_CONCURRENCY, Scan, Section, Session, Stream, TryStreamExt, blob_weight, encode,
+    encode_marker_payload, fetch_and_decode_cell, fetch_cell_rows_result, fetch_cells_batch_result,
+    flatten_resolve, marker_delete_unit, marker_last_split, page_cells, peek_read, pin_mut,
+    resolve_event_marker, resolve_prior_clear_before_read, smallvec, try_stream,
 };
 
 impl<O> CassandraStore<O> {
@@ -23,13 +22,13 @@ impl<O> CassandraStore<O> {
         queries: Arc<CellQueries>,
         oracle: O,
         registry: Arc<CollectionDefRegistry>,
-        checked: MarkerCheckSet,
+        checks: MarkerCheckSet,
     ) -> Self {
         Self {
             session,
             queries,
             resolver: Resolver::new(oracle, registry),
-            memo: Arc::new(super::MarkerMemo::new(checked)),
+            memo: Arc::new(super::MarkerMemo::new(checks)),
             #[cfg(test)]
             counters: Arc::default(),
         }
@@ -163,7 +162,7 @@ impl<O> CassandraStore<O> {
     /// Records that durable state has no unsettled marker.
     pub(super) async fn record_marker_settled(&self, collection: &CollectionId) {
         self.memo.unsettled.remove_async(collection).await;
-        self.memo.checked.set(collection).await;
+        self.memo.checks.set(collection).await;
     }
 }
 
@@ -195,7 +194,7 @@ where
             .unsettled
             .upsert_async(collection.id().clone(), marker.clone())
             .await;
-        self.memo.checked.set(collection.id()).await;
+        self.memo.checks.set(collection.id()).await;
         let payload = encode_marker_payload(marker)
             .map_err(CassandraCellStoreError::from)
             .map_err(ResolveCellError::Store)?;
@@ -222,12 +221,16 @@ where
             // Resolve a prior event's section clear before the scan starts.
             // The scan cannot return data that the clear removed.
             let marker = self.unsettled_marker(collection).await?;
-            let clear = marker
-                .as_ref()
-                .and_then(|marker| PriorEventClear::new(marker, own));
-            resolve_prior_clear_before_read(self, self.resolver.oracle(), &collection_ref, clear)
-                .await
-                .map_err(flatten_resolve)?;
+            // The scan starts after this resolution, so a durable change needs no re-read.
+            let _ = resolve_prior_clear_before_read(
+                self,
+                self.resolver.oracle(),
+                &collection_ref,
+                marker.as_ref(),
+                own,
+            )
+            .await
+            .map_err(flatten_resolve)?;
             // The shared paging core (`page_cells`): it selects the per-bound
             // statement, decodes each row, and applies `past_end`. It applies
             // no resolution and no limit.

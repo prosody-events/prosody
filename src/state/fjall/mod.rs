@@ -101,7 +101,7 @@ static CACHE_DISABLED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// epoch.
 ///
 /// A non-`dyn` seam: production reads the [`Wall`](Self::Wall) clock; a test
-/// can test time with `Fixed` and advance the shared counter past
+/// can pin time with `Fixed` and advance the shared counter past
 /// a stamped expiry **without sleeping**, so the TTL-expiry property is
 /// deterministic. The cache stamps expiries with the same source it reads them
 /// against, so the two never disagree.
@@ -239,7 +239,7 @@ impl Inner {
     }
 
     /// The warm-index keyspace handle (provisional coordinates and the
-    /// cold-seed and marker-marker checkes).
+    /// cold-seed rows and marker-check rows).
     fn index_handle(&self) -> &Keyspace {
         match self {
             #[cfg(test)]
@@ -340,8 +340,6 @@ impl FjallCellCache {
     ///
     /// All cache and marker-check handles observe the same state.
     /// This state does not reset during an assignment.
-    ///
-    /// [`Cached`]: crate::state::cached::Cached
     #[must_use]
     pub(crate) fn is_disabled(&self) -> bool {
         self.disabled.load(Ordering::Relaxed)
@@ -614,7 +612,10 @@ impl FjallCellCache {
     ///
     /// Writes all specified cells in one cache update.
     ///
-    /// The caller handles a failed update according to its durable operation.
+    /// A failed commit leaves the cache unchanged.
+    /// The caller owns the repair: a write-through caller removes the old
+    /// entries (`Cached::publish_written`); a read-fill caller does not
+    /// (`Cached::get_many`).
     pub(crate) async fn put_batch(
         &self,
         collection: &CollectionId,
@@ -717,8 +718,8 @@ impl FjallCellCache {
     }
 
     /// Deletes a batch of committed cell entries in one atomic
-    /// [`OwnedWriteBatch`] — the D-site repair primitive (keys built at exact
-    /// size). Idempotent: removing an absent key is a no-op.
+    /// [`OwnedWriteBatch`] — the must-succeed repair primitive (keys built at
+    /// exact size). Idempotent: removing an absent key is a no-op.
     pub(crate) async fn delete_batch(
         &self,
         collection: &CollectionId,
@@ -994,13 +995,12 @@ impl FjallCellCache {
     }
 }
 
-/// A `Clone` handle over the per-partition warm-index keyspace recording
-/// **marker presence**: whether a collection's durable event marker has been
-/// consulted this assignment. The bounded, disk-backed replacement for the
-/// bottom store's former in-RAM checked set — the rows live in the
-/// per-assignment `index` keyspace, so the workspace `Drop` and the startup
-/// orphan sweep reclaim them at revocation.
-/// Tracks completed durable marker checks on disk.
+/// Records which collections had their durable event marker read this
+/// assignment.
+///
+/// The rows live in the per-assignment `index` keyspace. The workspace `Drop`
+/// and the startup orphan sweep reclaim them. A RAM set would grow without
+/// bound over a weeks-long assignment.
 ///
 /// An error leaves the collection unchecked.
 /// The next check reads the durable marker again.

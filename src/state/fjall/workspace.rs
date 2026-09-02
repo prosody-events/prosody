@@ -180,7 +180,7 @@ impl FjallWorkspace {
     }
 
     /// Returns the warm-index keyspace handle (provisional coordinates,
-    /// and the cold-seed and marker-presence latches).
+    /// and the cold-seed rows and marker-check rows).
     #[must_use]
     pub fn index_handle(&self) -> &Keyspace {
         &self.index

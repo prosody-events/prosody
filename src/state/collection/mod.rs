@@ -572,7 +572,7 @@ impl<S: WritableStateSession, L> Collection<S, L> {
     /// the over-budget residual on the collection-grain atomicity invariant,
     /// stated in the [`store`](crate::state::store) module. Only the idempotent
     /// handler re-run repairs it, by re-issuing the same ops. The bottom store
-    /// resolves any standing clears-bearing marker before the write lands, so a
+    /// resolves any unsettled section clear before the write lands, so a
     /// stale clear's replay cannot erase it.
     ///
     /// # Errors

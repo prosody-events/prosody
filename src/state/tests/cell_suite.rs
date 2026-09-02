@@ -1300,6 +1300,19 @@ where
 ///
 /// A simulated crash rebuilds the store over the same durable state.
 /// The final recovery must remove all unsettled state.
+///
+/// The trace checks these invariants after every event:
+/// - The committed projection equals the model for every collection without a
+///   deferred settle, and for every collection after the final recovery.
+/// - The unsettled marker model (owner, staged set, clears) satisfies the
+///   marker-completeness postcondition (`assert_physical`).
+/// - A section clear removes only non-survivor cells, and the clear's delete
+///   runs before the new writes land.
+/// - A write that lands after a committed clear survives the clear's resolution
+///   (the `blind` dimension).
+/// - After a `SettleFailure`, later reads and the sweep repair the state.
+///
+/// A final sweep and assertion pass closes every trace.
 pub(crate) async fn run_crash_equivalence_trace<S, F, P>(
     make_store: F,
     oracle: ScriptedOracle,

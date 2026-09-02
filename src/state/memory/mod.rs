@@ -6,9 +6,8 @@ use super::marker::{EventMarker, SectionClear};
 use super::oracle::CommitOracle;
 use super::registry::CollectionDefRegistry;
 use super::resolve::{
-    PriorEventClear, ResolveCellError, Resolver, UnsettledClear, flatten_resolve, peek_read,
-    resolve_event_marker, resolve_prior_clear_before_read, resolve_read,
-    resolve_unsettled_clear_before_write,
+    ResolveCellError, Resolver, flatten_resolve, peek_read, resolve_event_marker,
+    resolve_prior_clear_before_read, resolve_read, resolve_unsettled_clear_before_write,
 };
 use super::store::{CellBuffer, CellStore, CoordinateBatch, provisional_point_loop};
 use super::{CollectionId, CollectionRef, EventRef};
@@ -91,12 +90,16 @@ where
         own: EventRef,
     ) -> Result<(), ResolveCellError<Infallible, O::Error>> {
         let marker = self.unsettled_marker(collection_ref.id()).await?;
-        let clear = marker
-            .as_ref()
-            .and_then(|marker| PriorEventClear::new(marker, own));
-        resolve_prior_clear_before_read(self, self.resolver.oracle(), collection_ref, clear)
-            .await
-            .map_err(flatten_resolve)?;
+        // The read starts after this resolution, so a durable change needs no re-read.
+        let _ = resolve_prior_clear_before_read(
+            self,
+            self.resolver.oracle(),
+            collection_ref,
+            marker.as_ref(),
+            own,
+        )
+        .await
+        .map_err(flatten_resolve)?;
         Ok(())
     }
 
@@ -369,10 +372,14 @@ where
         // Resolve an unsettled section clear before this write.
         // The clear cannot remove a value that this write adds.
         let marker = self.unsettled_marker(collection.id()).await?;
-        let clear = marker.as_ref().and_then(UnsettledClear::new);
-        resolve_unsettled_clear_before_write(self, self.resolver.oracle(), collection, clear)
-            .await
-            .map_err(flatten_resolve)?;
+        resolve_unsettled_clear_before_write(
+            self,
+            self.resolver.oracle(),
+            collection,
+            marker.as_ref(),
+        )
+        .await
+        .map_err(flatten_resolve)?;
         self.apply_resolved(collection.id(), cells, clears).await;
         Ok(())
     }
