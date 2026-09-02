@@ -452,7 +452,7 @@ pub(crate) fn assert_no_settlement_residue(cells: &MemoryCells, id: &CollectionI
     if !cells.provisional_coordinates(id).is_empty() {
         bail!("settlement left a provisional cell standing");
     }
-    if cells.standing_marker_of(id).is_some() {
+    if cells.unsettled_marker_of(id).is_some() {
         bail!("settlement left an event marker standing");
     }
     Ok(())

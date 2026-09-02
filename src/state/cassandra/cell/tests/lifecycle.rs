@@ -188,11 +188,12 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
 /// `kind=Cell` range recovery never touches, so they cost nothing.
 ///
 /// This also pins who pays the seed: a committed `write_resolved` still never
-/// *writes* the marker slice, but its write-side boundary (`help_write_window`)
-/// is now the first marker consumer, so it pays the one durable seed read; the
-/// FIRST read, the scan, the stage boundary, and both sweeps then ride the
-/// memo. The fixed value is non-vacuous: the same counter stays exactly 1
-/// across six marker consumers spanning the write, reads, stage, and sweeps.
+/// *writes* the marker slice, but its write-side boundary
+/// (`resolve_unsettled_clear_before_write`) is now the first marker consumer,
+/// so it pays the one durable seed read; the FIRST read, the scan, the stage
+/// boundary, and both sweeps then ride the memo. The fixed value is
+/// non-vacuous: the same counter stays exactly 1 across six marker consumers
+/// spanning the write, reads, stage, and sweeps.
 ///
 /// Sizes are kept modest (not large production scale) so the live test stays
 /// fast; 16× is ample to distinguish an O(#cells) regression, which would
@@ -323,7 +324,7 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
 /// Presence-latch loss degrades to a **re-check, never an under-report**: if
 /// the per-assignment latch is lost mid-assignment (modeled here as an
 /// index-keyspace clear — the same unchecked answer a fjall read error degrades
-/// to), the next `standing_marker` pays exactly ONE
+/// to), the next `unsettled_marker` pays exactly ONE
 /// durable marker point read, still observes the standing durable marker, and
 /// re-seeds the latch — it never rides a stale RAM answer that would strand the
 /// marker. Takes an EXCLUSIVE index keyspace (the clearing-test isolation
@@ -333,12 +334,12 @@ async fn presence_loss_forces_one_recheck_and_reseeds() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
     // Exclusive, clearable presence domain: `keyspace_pair` and
-    // `test_db::presence` open the same `<name>_index` keyspace.
+    // `test_db::marker_checks` open the same `<name>_index` keyspace.
     let (_db, _cache, index) = test_db::keyspace_pair("cassandra_presence_degrade")?;
     index.clear()?;
     let store = fx.bottom_store_with(
         ScriptedOracle::default(),
-        test_db::presence("cassandra_presence_degrade")?,
+        test_db::marker_checks("cassandra_presence_degrade")?,
     );
     let counts = store.recovery_reads();
     let c = collection("presence-degrade")?;
@@ -363,7 +364,7 @@ async fn presence_loss_forces_one_recheck_and_reseeds() -> Result<()> {
     );
 
     // A consult while seeded: presence hit, no durable read.
-    store.standing_marker(c.id()).await?;
+    store.unsettled_marker(c.id()).await?;
     assert_eq!(
         counts.marker_point_reads.load(Ordering::Relaxed),
         after_stage,
@@ -375,7 +376,7 @@ async fn presence_loss_forces_one_recheck_and_reseeds() -> Result<()> {
 
     // The next consult pays exactly one durable re-check and still sees the
     // standing durable marker.
-    let recovered = store.standing_marker(c.id()).await?;
+    let recovered = store.unsettled_marker(c.id()).await?;
     assert_eq!(
         counts.marker_point_reads.load(Ordering::Relaxed),
         after_stage + 1,
@@ -387,7 +388,7 @@ async fn presence_loss_forces_one_recheck_and_reseeds() -> Result<()> {
     );
 
     // And it re-seeded the latch: a further consult rides RAM again.
-    store.standing_marker(c.id()).await?;
+    store.unsettled_marker(c.id()).await?;
     assert_eq!(
         counts.marker_point_reads.load(Ordering::Relaxed),
         after_stage + 1,

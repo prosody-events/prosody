@@ -6,8 +6,9 @@ use super::marker::{EventMarker, SectionClear};
 use super::oracle::CommitOracle;
 use super::registry::CollectionDefRegistry;
 use super::resolve::{
-    ResolveCellError, Resolver, flatten_resolve, help_read_window, help_write_window, peek_read,
-    resolve_marker, resolve_read,
+    PriorEventClear, ResolveCellError, Resolver, UnsettledClear, flatten_resolve, peek_read,
+    resolve_event_marker, resolve_prior_clear_before_read, resolve_read,
+    resolve_unsettled_clear_before_write,
 };
 use super::store::{CellBuffer, CellStore, CoordinateBatch, provisional_point_loop};
 use super::{CollectionId, CollectionRef, EventRef};
@@ -82,25 +83,23 @@ where
 
     /// The committed-unapplied read window, shared verbatim by `get` and
     /// `scan_cells`: resolve a standing FOREIGN clears-bearing marker
-    /// (`help_read_window`) before the raw read/snapshot, so both paths serve
-    /// post-clear truth. The marker map is RAM — the ~always marker-free fast
-    /// path costs one map read. Both read paths MUST run identical help;
-    /// funneling them through one helper makes drift structurally impossible.
+    /// (`resolve_prior_clear_before_read`) before the raw read/snapshot, so
+    /// both paths serve post-clear truth. The marker map is RAM — the
+    /// ~always marker-free fast path costs one map read. Both read paths
+    /// MUST run identical help; funneling them through one helper makes
+    /// drift structurally impossible.
     async fn read_help(
         &self,
         collection_ref: &CollectionRef,
         own: EventRef,
     ) -> Result<(), ResolveCellError<Infallible, O::Error>> {
-        let marker = self.standing_marker(collection_ref.id()).await?;
-        help_read_window(
-            self,
-            self.resolver.oracle(),
-            collection_ref,
-            marker.as_ref(),
-            own,
-        )
-        .await
-        .map_err(flatten_resolve)?;
+        let marker = self.unsettled_marker(collection_ref.id()).await?;
+        let clear = marker
+            .as_ref()
+            .and_then(|marker| PriorEventClear::new(marker, own));
+        resolve_prior_clear_before_read(self, self.resolver.oracle(), collection_ref, clear)
+            .await
+            .map_err(flatten_resolve)?;
         Ok(())
     }
 
@@ -340,7 +339,7 @@ where
                 .await
                 && standing.event() != marker.event()
             {
-                resolve_marker(self, self.resolver.oracle(), collection, &standing)
+                resolve_event_marker(self, self.resolver.oracle(), collection, &standing)
                     .await
                     .map_err(flatten_resolve)?;
             }
@@ -374,15 +373,17 @@ where
         cells: &'a [(CellKey, Option<Bytes>)],
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        // The write-side committed-unapplied boundary (`help_write_window`):
-        // resolve any standing clears-bearing marker before this blind write,
-        // ordering the write after that resolution so a stale clear's replay
-        // cannot erase it (modulo the concurrent-resolver residual documented on
-        // `help_write_window`). Marker-free otherwise (the marker lifecycle
-        // belongs to the staged verbs). The marker map is RAM — the ~always
-        // marker-free fast path costs one read.
-        let standing = self.standing_marker(collection.id()).await?;
-        help_write_window(self, self.resolver.oracle(), collection, standing.as_ref())
+        // The write-side committed-unapplied boundary
+        // (`resolve_unsettled_clear_before_write`): resolve any standing
+        // clears-bearing marker before this blind write, ordering the write
+        // after that resolution so a stale clear's replay cannot erase it
+        // (modulo the concurrent-resolver residual documented on
+        // `resolve_unsettled_clear_before_write`). Marker-free otherwise (the marker
+        // lifecycle belongs to the staged verbs). The marker map is RAM — the
+        // ~always marker-free fast path costs one read.
+        let marker = self.unsettled_marker(collection.id()).await?;
+        let clear = marker.as_ref().and_then(UnsettledClear::new);
+        resolve_unsettled_clear_before_write(self, self.resolver.oracle(), collection, clear)
             .await
             .map_err(flatten_resolve)?;
         self.apply_resolved(collection.id(), cells, clears).await;
@@ -411,7 +412,7 @@ where
         Ok(())
     }
 
-    async fn standing_marker<'a>(
+    async fn unsettled_marker<'a>(
         &'a self,
         collection: &'a CollectionId,
     ) -> Result<Option<EventMarker>, Self::Error> {

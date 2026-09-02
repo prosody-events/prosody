@@ -98,12 +98,12 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ///
     /// Reads return **marker-resolved truth**: a standing **foreign** event
     /// marker that carries section clears is resolved through the sweep path
-    /// (`help_read_window` in `resolve`) before the read is served, so a
-    /// committed-but-unapplied clear can never serve pre-clear rows. Markers
-    /// without clears are left standing — first-touch resolution stays
-    /// cell-grained and marker-free. [`Self::scan_cells`] and the cache-fill
-    /// twin [`Self::get_for_cache`] share the same implementation, so the
-    /// contract holds across all three reads.
+    /// (`resolve_prior_clear_before_read` in `resolve`) before the read is
+    /// served, so a committed-but-unapplied clear can never serve pre-clear
+    /// rows. Markers without clears are left standing — first-touch
+    /// resolution stays cell-grained and marker-free. [`Self::scan_cells`]
+    /// and the cache-fill twin [`Self::get_for_cache`] share the same
+    /// implementation, so the contract holds across all three reads.
     ///
     /// # Errors
     ///
@@ -387,17 +387,17 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// # The committed-unapplied write window
     ///
     /// Before writing, each bottom store resolves any standing clears-bearing
-    /// event marker (`help_write_window` in `resolve`, the write-side twin of
-    /// the read window on [`Self::get`]), ordering this write after that
-    /// resolution so a stale clear's positional replay cannot erase it —
-    /// subject to the concurrent-resolver residual stated on
-    /// `help_write_window`. The settle verbs bypass this boundary (they
-    /// delete the very marker they settle); the callers that can reach it
-    /// *with a standing clears-bearing marker* are the blind writes — the
-    /// mid-handler `commit()` and the `ReadUncommitted` direct apply. (The
-    /// `resolve_cell` write-backs also reach `write_resolved`, but only
-    /// ever clears-free or marker-free — see the repair-provenance
-    /// invariant on `resolve_cell`.)
+    /// event marker (`resolve_unsettled_clear_before_write` in `resolve`, the
+    /// write-side twin of the read window on [`Self::get`]), ordering this
+    /// write after that resolution so a stale clear's positional replay
+    /// cannot erase it — subject to the concurrent-resolver residual stated
+    /// on `resolve_unsettled_clear_before_write`. The settle verbs bypass
+    /// this boundary (they delete the very marker they settle); the callers
+    /// that can reach it *with a standing clears-bearing marker* are the
+    /// blind writes — the mid-handler `commit()` and the `ReadUncommitted`
+    /// direct apply. (The `resolve_cell` write-backs also reach
+    /// `write_resolved`, but only ever clears-free or marker-free — see the
+    /// repair-provenance invariant on `resolve_cell`.)
     ///
     /// # Errors
     ///
@@ -418,7 +418,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns [`Self::Error`] on a store failure.
-    fn standing_marker<'a>(
+    fn unsettled_marker<'a>(
         &'a self,
         collection: &'a CollectionId,
     ) -> impl Future<Output = Result<Option<EventMarker>, Self::Error>> + Send + 'a;

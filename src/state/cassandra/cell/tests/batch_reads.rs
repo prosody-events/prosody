@@ -466,6 +466,6 @@ async fn cassandra_raw_batch_no_side_effects() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
     let oracle = CountingOracle::default();
-    let store = fx.bottom_store_with(oracle.clone(), fx.presence.clone());
+    let store = fx.bottom_store_with(oracle.clone(), fx.marker_checks.clone());
     Box::pin(run_raw_batch_no_side_effects(store, oracle)).await
 }

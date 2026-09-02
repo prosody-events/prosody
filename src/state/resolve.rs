@@ -13,9 +13,10 @@
 //!
 //! `sweep_provisional` is the recovery loop built once over the public trait:
 //! it resolves the collection's standing event marker as a unit
-//! (`resolve_marker`) then streams any remaining provisional cells, returning
-//! whether the stage ended fully resolved. The backstop that triggered the
-//! sweep is never unscheduled directly (finding F2); it clears only by firing.
+//! (`resolve_event_marker`) then streams any remaining provisional cells,
+//! returning whether the stage ended fully resolved. The backstop that
+//! triggered the sweep is never unscheduled directly (finding F2); it clears
+//! only by firing.
 
 use super::CommitDecision;
 use super::SHARD_FANOUT_CONCURRENCY;
@@ -77,6 +78,48 @@ impl<O> Resolver<O> {
             self.registry.ttl_for(id.state_type(), id.name()),
         )
     }
+}
+
+/// A marker that has at least one section clear.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UnsettledClear<'a>(&'a EventMarker);
+
+impl<'a> UnsettledClear<'a> {
+    #[must_use]
+    pub(crate) fn new(marker: &'a EventMarker) -> Option<Self> {
+        (!marker.clears().is_empty()).then_some(Self(marker))
+    }
+
+    #[must_use]
+    pub(crate) fn marker(self) -> &'a EventMarker {
+        self.0
+    }
+}
+
+/// A section clear from an event other than the current event.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PriorEventClear<'a>(UnsettledClear<'a>);
+
+impl<'a> PriorEventClear<'a> {
+    #[must_use]
+    pub(crate) fn new(marker: &'a EventMarker, current_event: EventRef) -> Option<Self> {
+        (marker.event() != current_event)
+            .then(|| UnsettledClear::new(marker))
+            .flatten()
+            .map(Self)
+    }
+
+    #[must_use]
+    pub(crate) fn marker(self) -> &'a EventMarker {
+        self.0.marker()
+    }
+}
+
+/// States if read preparation changed durable state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadPreparation {
+    Unchanged,
+    DurableStateChanged,
 }
 
 /// Collapses the one redundant nesting a bottom store's `get`/`scan` produce.
@@ -195,13 +238,14 @@ where
 /// primitive verbs and leaves any standing event marker in place. The marker's
 /// resulting over-report is harmless — a later point read sees the cell already
 /// resolved and drops it — and the marker is cleared by the next stage boundary
-/// or the sweep's marker leg ([`resolve_marker`]).
+/// or the sweep's marker leg ([`resolve_event_marker`]).
 ///
 /// # Repair-provenance invariant
 ///
 /// A repair's payload derives from durable state that logically **predates**
 /// any standing marker, so it must never land *after* that marker resolves:
-/// [`write_resolved`]'s write-help boundary ([`help_write_window`]) resolves a
+/// [`write_resolved`]'s write-help boundary
+/// ([`resolve_unsettled_clear_before_write`]) resolves a
 /// standing clears-bearing marker first, and a positional clear erases only the
 /// frozen survivors, so a stale repair write-back landing afterward would
 /// resurrect a row the committed clear erases — a silently lost committed
@@ -234,11 +278,11 @@ where
         .map_err(ResolveCellError::Oracle)?;
     // Repair-provenance guard (invariant above): beneath a standing
     // clears-bearing marker the repair degrades to peek semantics — value-only,
-    // deferred to the marker's own resolution. `standing_marker` is RAM-native
+    // deferred to the marker's own resolution. `unsettled_marker` is RAM-native
     // on memory and memo-backed on Cassandra, so this is one RAM read on the
     // rare repair path.
     let deferred = store
-        .standing_marker(collection.id())
+        .unsettled_marker(collection.id())
         .await
         .map_err(ResolveCellError::Store)?
         .is_some_and(|marker| !marker.clears().is_empty());
@@ -313,7 +357,7 @@ where
 /// Returns [`ResolveCellError::Oracle`] on an oracle failure (preempting a
 /// concurrent cell-read failure) or [`ResolveCellError::Store`] on a rebuild /
 /// settle failure.
-pub(crate) async fn resolve_marker<S, O>(
+pub(crate) async fn resolve_event_marker<S, O>(
     store: &S,
     oracle: &O,
     collection: &CollectionRef,
@@ -389,135 +433,53 @@ where
     }
 }
 
-/// The committed-unapplied **write** window — the write-side twin of
-/// [`help_read_window`], sharing its clears-triggered core.
+/// Resolves an unsettled section clear before a durable resolved write.
 ///
-/// Before a durable resolved write lands (the marker-free
-/// [`CellStore::write_resolved`]), any standing event marker that carries
-/// section clears is resolved through the sweep path ([`resolve_marker`]).
-/// A clear's gap deletes are **positional, never temporal** — they exclude only
-/// the frozen survivors at a fresh driver timestamp — so a cell written into a
-/// cleared section while the clears-bearing marker still stands is erased when
-/// the marker later resolves. Resolving first closes that window:
-///
-/// > **Ordering guarantee.** The resolved write lands strictly *after* the
-/// > standing clears-bearing marker resolution this boundary performs, so a
-/// > blind write can no longer drop into a section that a still-standing clear
-/// > will replay over.
-///
-/// # Not single-flight (open correctness residual)
-///
-/// This ordering holds against the resolution *this* boundary performs, not
-/// against every resolver. [`resolve_marker`] is not guarded per collection: it
-/// captures the marker snapshot, then reads before it mutates. A **concurrent**
-/// resolver that captured the same marker before this write landed — a
-/// gate-free scan's read-help, another `write_resolved` — can still resume and
-/// replay that marker's frozen clears at a fresh timestamp *after* the write,
-/// erasing it. This stale-marker-replay race lives in the shared
-/// [`resolve_marker`] core, so [`help_read_window`] carries it too — any
-/// resolver entrant can erase an intervening committed write. Closing it
-/// requires single-flighting marker resolution across every entrant, not a
-/// change at this boundary. It is tracked as a known open correctness residual.
-///
-/// Returns whether it resolved. The read twin [`help_read_window`] is called
-/// concurrently with a raw read whose result it re-issues on a `true`; the
-/// write callers ([`CellStore::write_resolved`]) hold no concurrent read and
-/// discard the bool — the resolution is the whole point, and their write lands
-/// after it. Markers without clears are left standing (first-touch stays
-/// cell-grained and marker-free); the whole write cost stays one memoized
-/// standing-marker read on the ~always marker-free fast path. A resolution
-/// failure fails the write, retryable by the caller.
-///
-/// # No own-event guard
-///
-/// Unlike [`help_read_window`], [`CellStore::write_resolved`] carries no
-/// [`EventRef`], so this helper resolves a standing clears-bearing marker
-/// regardless of whose event owns it. Every payload that reaches this boundary
-/// is **handler-fresh** and postdates any standing marker, so resolving the
-/// marker first is always the right order; a standing **own-event** marker is
-/// impossible or benign at every production caller:
-///
-/// * **Session `commit()` / `ReadUncommitted` finalize.** Both write *before*
-///   the event's own stage exists (`ReadUncommitted` never stages), so a
-///   standing same-event marker there is a previous attempt's (or a crashed
-///   incarnation's) uncommitted stage — [`EventRef`] is attempt-independent and
-///   a marker-record that actually landed dedup-filters the redispatch, so the
-///   handler would not be re-running. Resolving it performs the exact
-///   oracle-mediated abort the armed sweep would.
-/// * **[`resolve_cell`] write-backs never reach this boundary beneath a
-///   standing clears-bearing marker.** A repair's payload predates the marker,
-///   so `resolve_cell` degrades to peek semantics there and issues no durable
-///   write — the repair-provenance invariant documented on [`resolve_cell`].
-///   What can still reach `write_resolved` from a repair is a clears-free
-///   marker (no-op) or none, both benign.
-/// * **The settle verbs never pass through** — Cassandra settles natively,
-///   memory routes to its raw apply — so a verb deleting the marker it settles
-///   never re-enters this boundary.
-///
-/// # Errors
-///
-/// Returns [`ResolveCellError`] as [`resolve_marker`] would.
-pub(crate) async fn help_write_window<S, O>(
+/// The caller creates [`UnsettledClear`] only when the marker has a clear.
+/// Resolution makes the later write newer than this clear.
+pub(crate) async fn resolve_unsettled_clear_before_write<S, O>(
     store: &S,
     oracle: &O,
     collection: &CollectionRef,
-    marker: Option<&EventMarker>,
-) -> Result<bool, ResolveCellError<S::Error, O::Error>>
+    clear: Option<UnsettledClear<'_>>,
+) -> Result<(), ResolveCellError<S::Error, O::Error>>
 where
     S: CellStore,
     O: CommitOracle,
 {
-    let Some(marker) = marker else {
-        return Ok(false);
+    let Some(clear) = clear else {
+        return Ok(());
     };
-    if marker.clears().is_empty() {
-        return Ok(false);
-    }
-    resolve_marker(store, oracle, collection, marker).await?;
-    Ok(true)
+    resolve_event_marker(store, oracle, collection, clear.marker()).await
 }
 
-/// The committed-unapplied read window: a standing **foreign** event marker
-/// that carries section clears means gap tombstones may not have landed yet,
-/// and a pre-clear resolved row cannot be caught by per-cell oracle resolution
-/// the way a provisional cell is. Resolve the whole marker through the sweep
-/// path ([`resolve_marker`]) before serving the read; markers without clears
-/// are left standing (first-touch stays cell-grained and marker-free).
+/// Resolves a prior event's section clear before a read.
 ///
-/// The one read-help decision, shared by both bottom stores' `get`/`scan`
-/// pairs. Returns whether it resolved, so a caller that read concurrently with
-/// the marker consult re-issues its raw read. It shares the clears-triggered
-/// core with its write-side twin [`help_write_window`]; the own-event guard is
-/// the read side's sole addition and is load-bearing: the staging event's own
-/// reads between stage and settle must NOT resolve its own marker (that would
-/// settle the event mid-flight) — the trigger is strictly *foreign AND clears
-/// non-empty*.
-///
-/// # Errors
-///
-/// Returns [`ResolveCellError`] as [`resolve_marker`] would.
-pub(crate) async fn help_read_window<S, O>(
+/// The caller creates [`PriorEventClear`] only for a different event.
+/// A concurrent raw read must run again when this function changes durable
+/// state.
+pub(crate) async fn resolve_prior_clear_before_read<S, O>(
     store: &S,
     oracle: &O,
     collection: &CollectionRef,
-    marker: Option<&EventMarker>,
-    own: EventRef,
-) -> Result<bool, ResolveCellError<S::Error, O::Error>>
+    clear: Option<PriorEventClear<'_>>,
+) -> Result<ReadPreparation, ResolveCellError<S::Error, O::Error>>
 where
     S: CellStore,
     O: CommitOracle,
 {
-    match marker {
-        Some(marker) if marker.event() == own => Ok(false),
-        marker => help_write_window(store, oracle, collection, marker).await,
-    }
+    let Some(clear) = clear else {
+        return Ok(ReadPreparation::Unchanged);
+    };
+    resolve_event_marker(store, oracle, collection, clear.marker()).await?;
+    Ok(ReadPreparation::DurableStateChanged)
 }
 
 /// Resolves a collection's in-flight stage during recovery. Returns `true` iff
 /// nothing was left unresolved, for the recovery sweep to act on.
 ///
 /// Two legs, both with the retry-forever posture: the **marker leg** first
-/// ([`resolve_marker`] on any standing event marker), then the per-cell
+/// ([`resolve_event_marker`] on any standing event marker), then the per-cell
 /// **mop-up** (the cold `provisional_cells` scan) that resolves any cells the
 /// marker leg left behind (a Permanent-skipped cell, a marker-listed
 /// coordinate resolved concurrently). A `Permanent` failure in either leg is
@@ -547,11 +509,11 @@ where
     // memory backend, memo-warm on Cassandra — no durable marker read either
     // way), so this is a free no-op almost always.
     let marker_ok = match store
-        .standing_marker(collection.id())
+        .unsettled_marker(collection.id())
         .await
         .map_err(ResolveCellError::Store)?
     {
-        Some(marker) => match resolve_marker(store, oracle, collection, &marker).await {
+        Some(marker) => match resolve_event_marker(store, oracle, collection, &marker).await {
             Ok(()) => true,
             Err(error) if error.classify_error() == ErrorCategory::Permanent => {
                 error!(

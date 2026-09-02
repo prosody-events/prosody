@@ -40,7 +40,7 @@ use super::memory::{
 use super::oracle::CommitOracle;
 use super::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use super::registry::{CollectionDef, CollectionDefRegistry};
-use super::resolve::{ResolveCellError, resolve_marker};
+use super::resolve::{ResolveCellError, resolve_event_marker};
 use super::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use super::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, dedupe};
 use super::{
@@ -136,8 +136,8 @@ fn prop_memory_cell_crash_equivalence() {
 /// Regression pin over the memory store: a blind `write_resolved` into a
 /// section whose clears-bearing marker still stands survives the marker's later
 /// resolution (the write-side committed-unapplied boundary). Falsify by
-/// deleting the `standing_marker` + `help_write_window` lines in
-/// `MemoryCellStore::write_resolved`.
+/// deleting the `unsettled_marker` + `resolve_unsettled_clear_before_write`
+/// lines in `MemoryCellStore::write_resolved`.
 #[test]
 fn blind_write_survives_stale_clear() -> Result<()> {
     let oracle = ScriptedOracle::default();
@@ -361,7 +361,7 @@ fn memory_batch_alignment() -> Result<()> {
     executor::block_on(run_batch_alignment(store))
 }
 
-/// `resolve_marker` rebuilds the staged set through per-section
+/// `resolve_event_marker` rebuilds the staged set through per-section
 /// `<=CELL_BATCH` `provisional_many` batches (never per-coordinate point
 /// reads) and consults the oracle exactly ONCE: staging 129 cells in section 0
 /// and 3 in section 1 makes the marker leg issue `ceil(129/128) + ceil(3/128)
@@ -369,10 +369,11 @@ fn memory_batch_alignment() -> Result<()> {
 /// memory `provisional_many` is a point-loop, so `raw_batch_reads` counts the
 /// LOGICAL batch calls (one per chunk) — a faithful pin that the marker leg
 /// issues `ceil` batch calls and no direct point reads.
-/// FALSIFICATION: revert `resolve_marker`'s chunk loop to `provisional_cell_at`
-/// → `raw_batch_reads == 0` and `raw_point_reads == 132`, both asserts red.
+/// FALSIFICATION: revert `resolve_event_marker`'s chunk loop to
+/// `provisional_cell_at` → `raw_batch_reads == 0` and `raw_point_reads == 132`,
+/// both asserts red.
 #[test]
-fn memory_resolve_marker_batches_reads() -> Result<()> {
+fn memory_resolve_event_marker_batches_reads() -> Result<()> {
     executor::block_on(async {
         let counting =
             CountingCellStore::new(memory_store(MemoryCells::new(), ScriptedOracle::default()));
@@ -406,9 +407,9 @@ fn memory_resolve_marker_batches_reads() -> Result<()> {
         // The oracle answers NotCommitted ⇒ abort; the verdict is irrelevant to
         // the read counts this pin measures.
         counting.reset();
-        resolve_marker(&counting, &oracle, &cref, &marker)
+        resolve_event_marker(&counting, &oracle, &cref, &marker)
             .await
-            .map_err(|e| eyre!("resolve_marker: {e}"))?;
+            .map_err(|e| eyre!("resolve_event_marker: {e}"))?;
 
         assert_eq!(
             counting.raw_batch_reads(),
@@ -432,16 +433,16 @@ fn memory_resolve_marker_batches_reads() -> Result<()> {
 /// survivors onto `(0, 7)` and leaves `(1, 7)` unresolved-provisional.
 ///
 /// The discriminator is a provisional-sweep drain taken IMMEDIATELY after
-/// `resolve_marker`, before any `get`: a foreign-reader `get` self-heals a
-/// still-provisional cell through its own oracle consult (`resolve_cell`
+/// `resolve_event_marker`, before any `get`: a foreign-reader `get` self-heals
+/// a still-provisional cell through its own oracle consult (`resolve_cell`
 /// promotes the cell's stored bytes in place), so a `get`-after-drain would
 /// repair the collapse before an assertion could observe it. The drain reads
-/// `resolve_marker`'s own output.
+/// `resolve_event_marker`'s own output.
 /// FALSIFICATION: replace the chunk's `section` with a fixed `SECTIONS[0]` in
-/// `resolve_marker`/`section_batches` → the drain reports `(1, 7)` still
+/// `resolve_event_marker`/`section_batches` → the drain reports `(1, 7)` still
 /// provisional (`remaining.is_empty()` red).
 #[test]
-fn resolve_marker_rekeys_survivors_by_section() -> Result<()> {
+fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
     executor::block_on(async {
         let store = MemoryCellStore::new(
             MemoryCells::new(),
@@ -470,11 +471,11 @@ fn resolve_marker_rekeys_survivors_by_section() -> Result<()> {
             .map_err(|e| eyre!("stage: {e}"))?;
 
         let oracle = FixedOracle::committed();
-        resolve_marker(&store, &oracle, &cref, &marker)
+        resolve_event_marker(&store, &oracle, &cref, &marker)
             .await
-            .map_err(|e| eyre!("resolve_marker: {e}"))?;
+            .map_err(|e| eyre!("resolve_event_marker: {e}"))?;
 
-        // Observe `resolve_marker`'s own output BEFORE any `get`: nothing may be
+        // Observe `resolve_event_marker`'s own output BEFORE any `get`: nothing may be
         // left provisional. A `get` here would self-heal a survivor the collapse
         // regression left provisional (see the doc comment), so this drain must
         // run first.
@@ -483,7 +484,8 @@ fn resolve_marker_rekeys_survivors_by_section() -> Result<()> {
             .map_err(|e| eyre!("drain: {e}"))?;
         assert!(
             remaining.is_empty(),
-            "both survivors are resolved by resolve_marker, none left provisional: {remaining:?}"
+            "both survivors are resolved by resolve_event_marker, none left provisional: \
+             {remaining:?}"
         );
 
         // A foreign reader event: the cells are already resolved, so `get`
@@ -512,16 +514,16 @@ fn resolve_marker_rekeys_survivors_by_section() -> Result<()> {
 }
 
 /// Overlap-precedence pin: when BOTH the oracle read and a raw batch read fail,
-/// `resolve_marker` surfaces the ORACLE error (its retry/skip classification
-/// governs), and the overlap leaves the oracle-read and raw-batch-read counts
-/// unchanged. [`FailingOracle`] yields once so the oracle is observed `Pending`
-/// on the first poll pass while the poisoned batch read is `Ready(Err)` — the
-/// `join`-plus-oracle-first ordering is what surfaces the oracle error.
-/// FALSIFICATION: swap `join(oracle, reads)` + oracle-first for
+/// `resolve_event_marker` surfaces the ORACLE error (its retry/skip
+/// classification governs), and the overlap leaves the oracle-read and
+/// raw-batch-read counts unchanged. [`FailingOracle`] yields once so the oracle
+/// is observed `Pending` on the first poll pass while the poisoned batch read
+/// is `Ready(Err)` — the `join`-plus-oracle-first ordering is what surfaces the
+/// oracle error. FALSIFICATION: swap `join(oracle, reads)` + oracle-first for
 /// `try_join!(oracle, reads)` → the store error surfaces (matches! fails) and
 /// `oracle.resolves() == 0`.
 #[test]
-fn resolve_marker_double_failure_surfaces_oracle() -> Result<()> {
+fn resolve_event_marker_double_failure_surfaces_oracle() -> Result<()> {
     executor::block_on(async {
         let id = fresh_collection("resolve-marker-double-fail")?;
         let name = id.name().clone();
@@ -548,7 +550,7 @@ fn resolve_marker_double_failure_surfaces_oracle() -> Result<()> {
 
         counting.reset();
         let oracle = FailingOracle::default();
-        let err = match resolve_marker(&counting, &oracle, &cref, &marker).await {
+        let err = match resolve_event_marker(&counting, &oracle, &cref, &marker).await {
             Ok(()) => return Err(eyre!("expected a double failure, got Ok")),
             Err(err) => err,
         };
@@ -1217,7 +1219,7 @@ async fn boundary_resolve_pin(a_committed: bool) -> Result<()> {
 
     // B's marker replaces A's.
     assert_eq!(
-        cells.standing_marker_of(&id).map(|marker| marker.event()),
+        cells.unsettled_marker_of(&id).map(|marker| marker.event()),
         Some(b),
         "B's marker stands after the boundary overwrite"
     );
@@ -1280,7 +1282,7 @@ async fn clears_only_boundary_pin(a_committed: bool) -> Result<()> {
     // Raw probes BEFORE any resolving read — a `get` would read-help-resolve
     // B's clears-bearing marker and destroy the shape under test.
     let standing = cells
-        .standing_marker_of(&id)
+        .unsettled_marker_of(&id)
         .ok_or_else(|| eyre!("B's clears-only marker must stand after the stage"))?;
     assert_eq!(standing.event(), b, "B's marker replaced A's");
     assert_eq!(

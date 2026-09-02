@@ -6,7 +6,7 @@
 //! can resolve the whole stage as a unit — promote or roll back every listed
 //! cell — from a single point read rather than a scan over per-coordinate
 //! rows. [`EventMarker`] is what
-//! [`standing_marker`](super::store::CellStore::standing_marker) returns and
+//! [`unsettled_marker`](super::store::CellStore::unsettled_marker) returns and
 //! the memory backend stores; this module also owns its frozen
 //! wire `encode_marker_payload`/`decode_marker_payload` codec — the payload
 //! the Cassandra marker row carries in its `data` column.

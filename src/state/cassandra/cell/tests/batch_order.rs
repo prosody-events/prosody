@@ -91,7 +91,7 @@ async fn markerless_provisional_is_sweep_invisible_but_first_touch_repairs() -> 
         .await?;
     oracle.record_message(Uuid::from_u128(0xA11CE)).await?;
 
-    assert!(store.standing_marker(c.id()).await?.is_none());
+    assert!(store.unsettled_marker(c.id()).await?.is_none());
     assert!(
         sweep_provisional(&store, &oracle, &c).await?,
         "a markerless sweep sees no work"

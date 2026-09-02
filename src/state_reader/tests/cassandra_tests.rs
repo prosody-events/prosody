@@ -61,7 +61,7 @@ use uuid::Uuid;
 
 /// The live-Cassandra [`ReaderBackend`]. It holds one
 /// `CassandraStore<FixedOracle>`, which bundles a shared session, prepared
-/// queries, and one `MarkerMemo`/`MarkerPresence` lifecycle. That store is
+/// queries, and one `MarkerMemo`/`MarkerCheckSet` lifecycle. That store is
 /// cloned into a fresh owner session for each event. The reader reads through
 /// [`CassandraCellResources`] over the same session and the same queries.
 struct CassandraReaderBackend {
@@ -182,7 +182,7 @@ async fn cassandra_backend() -> Result<CassandraReaderBackend> {
     )?;
     let registry = Arc::new(registry);
 
-    let presence = test_db::presence("state_reader_cassandra_presence")?;
+    let presence = test_db::marker_checks("state_reader_cassandra_presence")?;
     let store = CassandraCellStore::new(
         conn.clone(),
         cell_queries.clone(),

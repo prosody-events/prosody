@@ -198,11 +198,11 @@ where
         self.inner.mark_resolved(collection, cells)
     }
 
-    fn standing_marker<'a>(
+    fn unsettled_marker<'a>(
         &'a self,
         collection: &'a CollectionId,
     ) -> impl Future<Output = Result<Option<EventMarker>, Self::Error>> + Send + 'a {
-        self.inner.standing_marker(collection)
+        self.inner.unsettled_marker(collection)
     }
 
     fn commit_provisional<'a>(
@@ -1060,12 +1060,12 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
 }
 
 /// D3 write-leg pin (memory-backed): a blind `write_resolved` resolves a
-/// standing clears-bearing marker BENEATH this cache (`help_write_window` in
-/// the lower store), a settle no cache verb observes. The D3 leg deletes the
-/// marker's staged coordinates and cleared sections first, so a later read of a
-/// staged coordinate falls through to the beneath-resolved value instead of
-/// serving the stale published `prev`. Reverting the D3 block freezes the stale
-/// `prev` warm and reddens this pin.
+/// standing clears-bearing marker BENEATH this cache
+/// (`resolve_unsettled_clear_before_write` in the lower store), a settle no
+/// cache verb observes. The D3 leg deletes the marker's staged coordinates and
+/// cleared sections first, so a later read of a staged coordinate falls through
+/// to the beneath-resolved value instead of serving the stale published `prev`.
+/// Reverting the D3 block freezes the stale `prev` warm and reddens this pin.
 #[test]
 fn blind_write_deletes_beneath_resolved_marker_window() -> Result<()> {
     TEST_RUNTIME.block_on(async {
@@ -2011,7 +2011,7 @@ fn absent_fill_over_aborted_foreign_provisional_publishes_absent() -> Result<()>
     })
 }
 
-/// The recovery sweep never calls `scan_cells` — it rides `standing_marker`,
+/// The recovery sweep never calls `scan_cells` — it rides `unsettled_marker`,
 /// the warm index, and `provisional_many` batch reads — so "scans are
 /// durable" (KV3) adds zero recovery cost. Falsified through the
 /// counting-store seam: the exact op set is asserted, never the sweep

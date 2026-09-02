@@ -17,8 +17,8 @@ impl CassandraCellResources {
     /// the `kind=Cell` row and projects
     /// [`crate::state::cell::Cell::project_committed`]. It never returns an
     /// in-flight provisional value and never runs owner-side repair: no
-    /// `help_read_window`, no oracle. An absent row reads `None`. It
-    /// decodes the borrowed row before it drops the response.
+    /// `resolve_prior_clear_before_read`, no oracle. An absent row reads
+    /// `None`. It decodes the borrowed row before it drops the response.
     ///
     /// # Errors
     ///
@@ -75,8 +75,8 @@ impl CassandraCellResources {
     /// the shared [`page_cells`] pager and yields each present cell's
     /// [`crate::state::cell::Cell::project_committed`] in `coordinate` order.
     /// The scan's `limit` counts only present yields. It skips
-    /// `help_read_window`, the owner-side durable repair a reader cannot
-    /// and may not run.
+    /// `resolve_prior_clear_before_read`, the owner-side durable repair a
+    /// reader cannot and may not run.
     ///
     /// The projection is sound without that repair. A provisional row's `prev`
     /// is committed by construction, and a resolved row's `data` was committed

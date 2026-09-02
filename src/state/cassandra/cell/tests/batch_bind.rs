@@ -97,7 +97,7 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     presence_index.clear()?;
     let reader = fx.bottom_store_with(
         ScriptedOracle::default(),
-        test_db::presence("cassandra_mixed_presence")?,
+        test_db::marker_checks("cassandra_mixed_presence")?,
     );
     let staged = provisional_cells(&reader, &id).await?;
     assert_eq!(staged.len(), 1, "only A stays provisional: {staged:?}");
@@ -137,7 +137,7 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     presence_index.clear()?;
     let reader = fx.bottom_store_with(
         ScriptedOracle::default(),
-        test_db::presence("cassandra_mixed_presence")?,
+        test_db::marker_checks("cassandra_mixed_presence")?,
     );
     assert!(
         provisional_cells(&reader, &id).await?.is_empty(),

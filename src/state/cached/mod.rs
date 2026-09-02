@@ -114,7 +114,7 @@
 //! 2. **The warm provisional index and its seeded latch** — bypassed wholesale:
 //!    `provisional_cells` delegates the lower stream verbatim (no seed check,
 //!    no recording, no latch).
-//! 3. **[`MarkerPresence`](crate::state::fjall)** — fused for uniformity; its
+//! 3. **[`MarkerCheckSet`](crate::state::fjall)** — fused for uniformity; its
 //!    own contract is over-report-safe.
 //!
 //! # TTL co-expiry
@@ -155,6 +155,7 @@ use super::event_ref::EventRef;
 use super::fjall::{CacheRead, FjallCellCache, FjallCellCacheError};
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::{EventMarker, SectionClear};
+use super::resolve::PriorEventClear;
 use super::store::{
     CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, section_batches,
 };
@@ -248,7 +249,7 @@ impl<L> Cached<L> {
     /// the shared D3 body behind the fall-through-read guard and the stage
     /// boundary. Must-succeed (lands-or-fuses): a stale entry left behind a
     /// beneath-cache resolution would be served verbatim forever.
-    async fn delete_marker_window(&self, collection: &CollectionId, standing: &EventMarker) {
+    async fn evict_marker_cache_entries(&self, collection: &CollectionId, standing: &EventMarker) {
         retry_delete(&self.fjall, "marker staged", || {
             self.fjall.delete_batch(collection, standing.staged())
         })
@@ -319,16 +320,16 @@ where
     /// Verdict-blind (rare path; correctness beats eviction precision). The
     /// consult rides the lower store's marker memo (presence latch + standing
     /// map), so the fast path adds no durable read.
-    async fn delete_read_window(
+    async fn evict_prior_clear_before_read(
         &self,
         collection: &CollectionId,
         own: EventRef,
     ) -> Result<(), L::Error> {
-        if let Some(standing) = self.lower.standing_marker(collection).await?
-            && standing.event() != own
-            && !standing.clears().is_empty()
+        if let Some(marker) = self.lower.unsettled_marker(collection).await?
+            && let Some(clear) = PriorEventClear::new(&marker, own)
         {
-            self.delete_marker_window(collection, &standing).await;
+            self.evict_marker_cache_entries(collection, clear.marker())
+                .await;
         }
         Ok(())
     }
@@ -376,7 +377,7 @@ where
             }
         };
         let loaded = async {
-            self.delete_read_window(collection, own).await?;
+            self.evict_prior_clear_before_read(collection, own).await?;
             let (committed, remaining) = self.lower.get_for_cache(collection, cell, own).await?;
             // Best-effort fill publish — present or absent (negative caching),
             // stamped with the remaining-TTL co-expiry. Sound because of
@@ -473,7 +474,7 @@ where
         let loaded = async {
             // All-hits-or-refetch: any non-hit discards every sampled value and
             // re-reads the whole batch from durable truth AFTER the read-window guard.
-            self.delete_read_window(collection, own).await?;
+            self.evict_prior_clear_before_read(collection, own).await?;
             // Anchor the co-expiry on a clock read taken BEFORE the durable read
             // (see the module's TTL co-expiry doc): a wide batch resolution can only
             // stamp entries EARLY, never past their durable row death.
@@ -523,7 +524,7 @@ where
         // fuse snapshot happens on first poll, inside the generator.
         try_stream! {
             if !self.fjall.fuse_blown() {
-                self.delete_read_window(collection, own).await?;
+                self.evict_prior_clear_before_read(collection, own).await?;
             }
             let inner = self.lower.scan_cells(collection, scan, own);
             pin_mut!(inner);
@@ -686,10 +687,11 @@ where
         // correctness beats eviction precision). Warm via the lower store's
         // marker memo, so the fast path adds no durable read.
         if let Some(marker) = marker
-            && let Some(standing) = self.lower.standing_marker(collection.id()).await?
+            && let Some(standing) = self.lower.unsettled_marker(collection.id()).await?
             && standing.event() != marker.event()
         {
-            self.delete_marker_window(collection.id(), &standing).await;
+            self.evict_marker_cache_entries(collection.id(), &standing)
+                .await;
         }
         // Anchor the co-expiry on a clock read taken BEFORE the lower write
         // (see the module's TTL co-expiry doc). Establish first: a failed
@@ -747,7 +749,7 @@ where
             return self.lower.write_resolved(collection, cells, clears).await;
         }
         // D3: the lower `write_resolved` now runs the write-side boundary
-        // (`help_write_window`) — a blind write resolves a standing
+        // (`resolve_unsettled_clear_before_write`) — a blind write resolves a standing
         // clears-bearing marker BENEATH this cache (staged cells promote, gap
         // tombstones land), a settle no cache verb observes, so no publish
         // would ever follow. Delete the marker's staged coordinates and cleared
@@ -755,10 +757,11 @@ where
         // compare (`write_resolved` carries no `EventRef`) — deleting an own
         // marker's window costs a fall-through, never staleness. Rides the
         // lower store's marker memo, so the fast path adds no durable read.
-        if let Some(standing) = self.lower.standing_marker(collection.id()).await?
+        if let Some(standing) = self.lower.unsettled_marker(collection.id()).await?
             && !standing.clears().is_empty()
         {
-            self.delete_marker_window(collection.id(), &standing).await;
+            self.evict_marker_cache_entries(collection.id(), &standing)
+                .await;
         }
         // D4, whole-section, BEFORE the lower call: this is the marker-free
         // direct apply (ReadUncommitted finalize / mid-handler `commit()`) — a
@@ -975,13 +978,13 @@ where
         result
     }
 
-    async fn standing_marker<'a>(
+    async fn unsettled_marker<'a>(
         &'a self,
         collection: &'a CollectionId,
     ) -> Result<Option<EventMarker>, Self::Error> {
         // A pure lower read — the cache never caches markers (the marker
         // lifecycle lives in the lower store), so no fuse arm is needed.
-        self.lower.standing_marker(collection).await
+        self.lower.unsettled_marker(collection).await
     }
 }
 

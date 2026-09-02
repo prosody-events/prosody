@@ -33,7 +33,7 @@
 //! stage writes the marker first, alone, so a torn stage is always
 //! marker-without-cells (over-report-safe), never cells-without-marker (a
 //! strand). The per-assignment marker memo — the standing RAM map
-//! ([`MarkerMemo`]) plus the fjall presence latch ([`MarkerPresence`]) — bounds
+//! ([`MarkerMemo`]) plus the fjall presence latch ([`MarkerCheckSet`]) — bounds
 //! durable marker reads to at most one per collection per assignment.
 //!
 //! The marker also carries the stage's **section clears** (each cleared
@@ -130,13 +130,14 @@ use crate::cassandra_queries;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::event_ref::EventRef;
-use crate::state::fjall::MarkerPresence;
+use crate::state::fjall::MarkerCheckSet;
 use crate::state::marker::{EventMarker, SectionClear, encode_marker_payload};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{
-    ResolveCellError, Resolver, flatten_resolve, help_read_window, help_write_window, peek_read,
-    resolve_marker, resolve_read,
+    PriorEventClear, ReadPreparation, ResolveCellError, Resolver, UnsettledClear, flatten_resolve,
+    peek_read, resolve_event_marker, resolve_prior_clear_before_read, resolve_read,
+    resolve_unsettled_clear_before_write,
 };
 use crate::state::store::{
     CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe,
@@ -261,10 +262,10 @@ pub struct CassandraCellResources {
 }
 
 /// Test-only recovery-read counters. `marker_point_reads` increments only in
-/// [`standing_marker`](CellStore::standing_marker)'s durable-read arm — a memo
-/// hit (presence latch + standing map) must not count — which is what makes the
-/// "at most one durable marker read per collection per assignment" pin
-/// non-vacuous.
+/// [`unsettled_marker`](CellStore::unsettled_marker)'s durable-read arm — a
+/// memo hit (presence latch + standing map) must not count — which is what
+/// makes the "at most one durable marker read per collection per assignment"
+/// pin non-vacuous.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct RecoveryReadCounts {
@@ -279,49 +280,25 @@ pub(crate) struct RecoveryReadCounts {
     pub(crate) provisional_in_queries: AtomicUsize,
 }
 
-/// Per-assignment RAM record of the markers known to stand: one standing
-/// [`EventMarker`] per collection with an outstanding marker. Self-draining —
-/// [`settle_memo`](CassandraStore::settle_memo) removes the entry on
-/// commit/abort — so its population tracks collections with live markers, never
-/// the whole key space.
+/// Tracks marker state for one partition assignment.
 ///
-/// It is the RAM half of the marker memo the three marker consumers ride (the
-/// cold recovery seed, the stage-boundary check, and read-help). The
-/// **checked** half — "has this collection's durable marker been consulted this
-/// assignment?" — lives on disk in the per-assignment fjall index keyspace
-/// ([`MarkerPresence`]): a RAM checked-set is insert-only and unbounded over a
-/// weeks-long assignment.
-///
-/// **Memo invariant:** the pair may **over-report** a marker (list one that
-/// never durably landed — resolving a phantom marker is a harmless no-op
-/// settle) but must never **under-report** (presence-checked true while
-/// `standing` misses a durable marker would strand that marker's cells from the
-/// sweep until the next assignment). Two rules preserve it:
-/// * `standing` is upserted **before** the presence set and before the durable
-///   stage attempt (see [`stage_marker`](CassandraStore::stage_marker)), so a
-///   presence hit never finds `standing` behind durable truth.
-/// * A presence fjall error reads as **unchecked** ([`MarkerPresence`] is
-///   infallible by design), degrading to one redundant durable marker read —
-///   never a false checked-true. `standing` is pure RAM, untouched by presence
-///   failures.
-///
-/// **Ownership invariant:** `standing` and the presence latch are ONE memo with
-/// one lifecycle — a presence keyspace may only ever be read by stores sharing
-/// this very `standing` map (clones of one store). Production enforces this by
-/// construction: one store per partition acquisition, its latch minted from the
-/// same fresh-per-assignment fjall workspace. Test fixtures must preserve it —
-/// a re-minted store models a fresh assignment and gets a cold latch.
-///
-/// Per-key serialization means no two ops race on one collection's entry; scc
-/// handles cross-collection concurrency. Minted fresh per [`CassandraStore`]
-/// (fresh store per partition acquisition ⇒ cold memo per assignment); clones
-/// share the `Arc`.
-///
-/// One field, still a named type: it anchors the memo and ownership invariants
-/// the module, stage, and settle docs cite.
-#[derive(Debug, Default)]
+/// `unsettled` can over-report, but it must not under-report after `checked` is
+/// set. Update `unsettled` before `checked` to enforce this invariant.
+/// A settle removes the marker and keeps `checked` set.
+/// The disk-backed check set prevents unbounded keyed RAM use.
+#[derive(Debug)]
 struct MarkerMemo {
-    standing: scc::HashMap<CollectionId, EventMarker, RandomState>,
+    unsettled: scc::HashMap<CollectionId, EventMarker, RandomState>,
+    checked: MarkerCheckSet,
+}
+
+impl MarkerMemo {
+    fn new(checked: MarkerCheckSet) -> Self {
+        Self {
+            unsettled: scc::HashMap::default(),
+            checked,
+        }
+    }
 }
 
 /// Cassandra-backed uniform cell store.
@@ -331,7 +308,6 @@ pub struct CassandraStore<O> {
     queries: Arc<CellQueries>,
     resolver: Resolver<O>,
     memo: Arc<MarkerMemo>,
-    presence: MarkerPresence,
     #[cfg(test)]
     counters: Arc<RecoveryReadCounts>,
 }

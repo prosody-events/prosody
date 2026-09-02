@@ -468,7 +468,7 @@ async fn rollback_restores_the_commit_floor_without_durable_writes() -> Result<(
         Some(Bytes::from_static(b"V")),
     );
     assert!(fx.cells.provisional_coordinates(&cart_id).is_empty());
-    assert!(fx.cells.standing_marker_of(&cart_id).is_none());
+    assert!(fx.cells.unsettled_marker_of(&cart_id).is_none());
 
     // Sibling isolation: the rollback drained only cart; wishlist stands.
     let touched = fx.dirty.touched(&fx.state_key.key);
@@ -795,7 +795,7 @@ fn finalize_matches_model(
                 return Some("the single-collection trace staged more than one record");
             };
             let expected = EventMarker::frozen(event, &collection.writes, &collection.clears);
-            (fx.cells.standing_marker_of(&fx.value_id()) != Some(expected))
+            (fx.cells.unsettled_marker_of(&fx.value_id()) != Some(expected))
                 .then_some("the receipt's frozen records diverge from the durable event marker")
         }
     }
@@ -1108,7 +1108,7 @@ async fn clears_only_session_boundary(a_committed: bool) -> Result<()> {
     // B's clears-bearing marker replaced it.
     let standing = fx
         .cells
-        .standing_marker_of(&id)
+        .unsettled_marker_of(&id)
         .ok_or_else(|| eyre!("B's clears-only marker must stand after the stage"))?;
     assert_eq!(standing.event(), b, "B's marker replaced A's");
     assert!(
@@ -1127,7 +1127,7 @@ async fn clears_only_session_boundary(a_committed: bool) -> Result<()> {
     fx.oracle.record_message(b_dedup).await?;
     assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
     assert!(
-        fx.cells.standing_marker_of(&id).is_none(),
+        fx.cells.unsettled_marker_of(&id).is_none(),
         "the settle deleted B's clears-bearing marker"
     );
     assert!(
@@ -1204,7 +1204,7 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
     // attempt one's single cell.
     let marker = fx
         .cells
-        .standing_marker_of(&fx.value_id())
+        .unsettled_marker_of(&fx.value_id())
         .ok_or_else(|| eyre!("no standing marker after the re-stage"))?;
     assert_eq!(marker.event(), event, "the marker stays the same event's");
     assert_eq!(
@@ -1233,7 +1233,7 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
         "the retry's extra cell commits with the rest of its stage"
     );
     assert!(
-        fx.cells.standing_marker_of(&fx.value_id()).is_none(),
+        fx.cells.unsettled_marker_of(&fx.value_id()).is_none(),
         "the settle deleted the single (overwritten) event marker"
     );
     Ok(())
@@ -1241,14 +1241,14 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
 
 /// The own-event read-window guard: the staging event's own reads between stage
 /// and settle must NOT resolve their own in-flight event marker
-/// (`help_read_window`'s `marker.event() == own` disjunct). Resolving it would
-/// settle the event mid-flight — the reachable shape is a retry attempt reading
-/// its own predecessor attempt's still-standing clears-bearing marker. This is
-/// an example because the value-projection lifecycle property is structurally
-/// blind to it: a mid-flight self-resolution rolls the uncommitted stage back
-/// and the retry re-stages the same values, so the committed projection still
-/// converges — only the marker's standing state, observed here at the read
-/// path, exposes the premature settle.
+/// (`resolve_prior_clear_before_read`'s `marker.event() == own` disjunct).
+/// Resolving it would settle the event mid-flight — the reachable shape is a
+/// retry attempt reading its own predecessor attempt's still-standing
+/// clears-bearing marker. This is an example because the value-projection
+/// lifecycle property is structurally blind to it: a mid-flight self-resolution
+/// rolls the uncommitted stage back and the retry re-stages the same values, so
+/// the committed projection still converges — only the marker's standing state,
+/// observed here at the read path, exposes the premature settle.
 #[tokio::test]
 async fn own_event_read_does_not_resolve_its_own_marker() -> Result<()> {
     let fx = Fixture::new()?;
@@ -1274,7 +1274,7 @@ async fn own_event_read_does_not_resolve_its_own_marker() -> Result<()> {
     raw.get(&id, &cell_at(0), e).await?;
     let standing = fx
         .cells
-        .standing_marker_of(&id)
+        .unsettled_marker_of(&id)
         .ok_or_else(|| eyre!("an own-event read must leave the in-flight marker standing"))?;
     assert_eq!(
         standing.event(),
@@ -1292,7 +1292,7 @@ async fn own_event_read_does_not_resolve_its_own_marker() -> Result<()> {
     // marker deleted).
     raw.get(&id, &cell_at(0), probe(999)).await?;
     assert!(
-        fx.cells.standing_marker_of(&id).is_none(),
+        fx.cells.unsettled_marker_of(&id).is_none(),
         "a foreign read resolves the uncommitted marker away",
     );
     Ok(())

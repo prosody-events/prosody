@@ -38,7 +38,7 @@ fn prop_cassandra_cell_crash_equivalence() {
         // minted from that same cold cache.
         let make = |handle: &PoisonHandle| -> Result<FaultyBottom> {
             let cache = test_db::cold_cache("cassandra_crash")?;
-            let presence = cache.presence();
+            let presence = cache.marker_checks();
             Ok(Cached::new(
                 cache,
                 FailingCellStore::with_handle(
@@ -79,7 +79,7 @@ fn cassandra_blind_write_survives_stale_clear() -> Result<()> {
         let fx = fixture().await?;
         let oracle = ScriptedOracle::default();
         let cache = test_db::cold_cache("cassandra_blind_write")?;
-        let presence = cache.presence();
+        let presence = cache.marker_checks();
         let store = Cached::new(cache, fx.bottom_store_with(oracle.clone(), presence));
         run_blind_write_survives_stale_clear(store, oracle).await
     })
@@ -118,7 +118,7 @@ fn cassandra_repair_defers_beneath_stale_clear() -> Result<()> {
         // durable truth, reaching `resolve_cell`.
         let stage = fx.bottom_store(oracle.clone());
         let cache = test_db::cold_cache("cassandra_repair_defer")?;
-        let presence = cache.presence();
+        let presence = cache.marker_checks();
         let store = Cached::new(cache, fx.bottom_store_with(oracle.clone(), presence));
         let probe = CassandraShapeProbe {
             session: fx.cassandra.clone(),
@@ -137,7 +137,7 @@ fn cassandra_repair_after_marker_abort_converges() -> Result<()> {
         let oracle = ScriptedOracle::default();
         let stage = fx.bottom_store(oracle.clone());
         let cache = test_db::cold_cache("cassandra_repair_abort")?;
-        let presence = cache.presence();
+        let presence = cache.marker_checks();
         let store = Cached::new(cache, fx.bottom_store_with(oracle.clone(), presence));
         let probe = CassandraShapeProbe {
             session: fx.cassandra.clone(),
@@ -185,7 +185,7 @@ fn prop_cassandra_cell_implicit_overwrite() {
         // is minted from that same cold cache.
         let make = || -> Result<Bottom> {
             let cache = test_db::cold_cache("cassandra_overwrite")?;
-            let presence = cache.presence();
+            let presence = cache.marker_checks();
             Ok(Cached::new(
                 cache,
                 fx.bottom_store_with(oracle.clone(), presence),

@@ -10,7 +10,7 @@
 //!
 //! Three consumers share the workspace: the committed cell entries (the
 //! `cache` keyspace), the warm provisional index + seeded latch (the `index`
-//! keyspace), and the `MarkerPresence` latch (also `index`). All three
+//! keyspace), and the `MarkerCheckSet` latch (also `index`). All three
 //! observe the one shared **cache fuse** (`FjallCellCache::fuse_blown`);
 //! how a blown fuse partitions them is documented on `Cached`'s retry
 //! posture.
@@ -154,7 +154,7 @@ pub(crate) struct FjallCellCache {
     inner: Arc<Inner>,
     clock: Clock,
     /// The one-way **cache fuse**, shared by every clone and every
-    /// [`MarkerPresence`] handle of one workspace (see
+    /// [`MarkerCheckSet`] handle of one workspace (see
     /// [`fuse_blown`](Self::fuse_blown)).
     #[educe(Debug(ignore))]
     fuse: Arc<AtomicBool>,
@@ -343,7 +343,7 @@ impl FjallCellCache {
     /// Whether the workspace's one-way **cache fuse** has blown.
     ///
     /// The fuse lives in the shared inner state, so every [`Cached`] clone and
-    /// [`MarkerPresence`] handle of one workspace observes the same bit — a
+    /// [`MarkerCheckSet`] handle of one workspace observes the same bit — a
     /// per-clone fuse would let the next event's intact clone serve the very
     /// stale hit the blown clone made unreachable. Consumers snapshot it once
     /// at their own entry (one admission decision per verb); it never resets
@@ -459,13 +459,13 @@ impl FjallCellCache {
         .await
     }
 
-    /// Mints a [`MarkerPresence`] handle over this cache's warm-index keyspace
+    /// Mints a [`MarkerCheckSet`] handle over this cache's warm-index keyspace
     /// — the bottom store's bounded marker-checked latch, sharing the
     /// workspace's per-assignment lifecycle (cold exactly when the store's RAM
     /// memo is, dropped at revocation).
     #[must_use]
-    pub(crate) fn presence(&self) -> MarkerPresence {
-        MarkerPresence {
+    pub(crate) fn marker_checks(&self) -> MarkerCheckSet {
+        MarkerCheckSet {
             index: self.inner.index_handle().clone(),
             fuse: self.fuse.clone(),
         }
@@ -1041,14 +1041,14 @@ impl FjallCellCache {
 /// the contract above already makes the degradation safe.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
-pub(crate) struct MarkerPresence {
+pub(crate) struct MarkerCheckSet {
     #[educe(Debug(ignore))]
     index: Keyspace,
     #[educe(Debug(ignore))]
     fuse: Arc<AtomicBool>,
 }
 
-impl MarkerPresence {
+impl MarkerCheckSet {
     /// Whether `collection`'s durable marker has been consulted this
     /// assignment. Any fjall error reads as **unchecked** (`false`) — a
     /// redundant durable re-check, never an under-report.
@@ -1056,7 +1056,7 @@ impl MarkerPresence {
         if self.fuse.load(Ordering::Relaxed) {
             return false;
         }
-        match read_cell(&self.index, codec::index_presence_key(collection)).await {
+        match read_cell(&self.index, codec::marker_check_key(collection)).await {
             Ok(raw) => raw.is_some(),
             Err(error) => {
                 warn!(%error, "marker-presence read failed; treating collection as unchecked");
@@ -1073,7 +1073,7 @@ impl MarkerPresence {
             return;
         }
         if let Err(error) =
-            write_index_empty(&self.index, codec::index_presence_key(collection)).await
+            write_index_empty(&self.index, codec::marker_check_key(collection)).await
         {
             warn!(%error, "marker-presence write failed; leaving collection unchecked");
         }

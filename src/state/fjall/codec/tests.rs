@@ -1,6 +1,6 @@
 use super::{
     Read, collection_prefix, coord_cell_key, decode_cell, encode_absent_cell, encode_present_cell,
-    index_coord_key, index_presence_key, index_seeded_key,
+    index_coord_key, index_seeded_key, marker_check_key,
 };
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::tests::support::fixed_collection;
@@ -264,7 +264,7 @@ fn frozen_warm_index_bytes() -> Result<()> {
     assert_eq!(seeded.as_slice(), expected.as_slice(), "seeded key layout");
 
     // presence key: [hash][Presence=0x03].
-    let presence = index_presence_key(&id);
+    let presence = marker_check_key(&id);
     let mut expected = prefix.to_vec();
     expected.push(0x03);
     assert_eq!(

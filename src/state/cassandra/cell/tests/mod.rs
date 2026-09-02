@@ -33,7 +33,7 @@ use crate::state::cached::Cached;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
-use crate::state::fjall::{MarkerPresence, test_db};
+use crate::state::fjall::{MarkerCheckSet, test_db};
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
@@ -109,7 +109,7 @@ fn row_encoding_uses_the_larger_present_payload() -> Result<()> {
 ///   `encoding`/`version` columns) is returned; a `cell_delete`d or gap-erased
 ///   row is not — so exact-set equality against the model's present set catches
 ///   residue and lost rows alike.
-/// * `standing_marker` — the whole `kind=Marker` slice, asserting the
+/// * `unsettled_marker` — the whole `kind=Marker` slice, asserting the
 ///   structural shape (at most ONE row, at the fixed address `(0, empty)` — the
 ///   zero-per-coordinate-rows postcondition) before decoding the frozen payload
 ///   (staged set AND clear half) through the production decoder.
@@ -164,7 +164,7 @@ impl ShapeProbe for CassandraShapeProbe {
         Ok(out)
     }
 
-    async fn standing_marker(&self, id: &CollectionId) -> Result<Option<ProbedMarker>> {
+    async fn unsettled_marker(&self, id: &CollectionId) -> Result<Option<ProbedMarker>> {
         use crate::cassandra::TABLE_KEYED_STATE_CELL;
 
         let cql = format!(
@@ -245,7 +245,7 @@ struct Fixture {
     cassandra: CassandraSession,
     queries: Arc<CellQueries>,
     registry: Arc<CollectionDefRegistry>,
-    presence: MarkerPresence,
+    marker_checks: MarkerCheckSet,
 }
 
 async fn fixture() -> Result<Fixture> {
@@ -256,7 +256,7 @@ async fn fixture() -> Result<Fixture> {
         cassandra,
         queries,
         registry: Arc::new(CollectionDefRegistry::default()),
-        presence: test_db::presence("cassandra_cell_presence")?,
+        marker_checks: test_db::marker_checks("cassandra_cell_presence")?,
     })
 }
 
@@ -268,7 +268,7 @@ impl Fixture {
     /// assignment and must pass a cold presence handle via
     /// [`bottom_store_with`](Self::bottom_store_with).
     fn bottom_store(&self, oracle: ScriptedOracle) -> CassandraStore<ScriptedOracle> {
-        self.bottom_store_with(oracle, self.presence.clone())
+        self.bottom_store_with(oracle, self.marker_checks.clone())
     }
 
     /// A bare store over an explicit presence handle and an arbitrary
@@ -280,14 +280,14 @@ impl Fixture {
     fn bottom_store_with<O: CommitOracle>(
         &self,
         oracle: O,
-        presence: MarkerPresence,
+        marker_checks: MarkerCheckSet,
     ) -> CassandraStore<O> {
         CassandraStore::new(
             self.cassandra.clone(),
             self.queries.clone(),
             oracle,
             self.registry.clone(),
-            presence,
+            marker_checks,
         )
     }
 }

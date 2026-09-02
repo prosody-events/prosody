@@ -172,11 +172,11 @@ where
         self.inner.mark_resolved(collection, cells)
     }
 
-    fn standing_marker<'a>(
+    fn unsettled_marker<'a>(
         &'a self,
         collection: &'a CollectionId,
     ) -> impl Future<Output = Result<Option<EventMarker>, Self::Error>> + Send + 'a {
-        self.inner.standing_marker(collection)
+        self.inner.unsettled_marker(collection)
     }
 
     async fn commit_provisional<'a>(

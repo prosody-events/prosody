@@ -132,7 +132,7 @@ impl MemoryCells {
     }
 
     #[cfg(test)]
-    pub(crate) fn standing_marker_of(&self, collection: &CollectionId) -> Option<EventMarker> {
+    pub(crate) fn unsettled_marker_of(&self, collection: &CollectionId) -> Option<EventMarker> {
         self.markers
             .read_sync(collection, |_, marker| marker.clone())
     }

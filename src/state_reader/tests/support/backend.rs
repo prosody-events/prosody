@@ -137,7 +137,7 @@ pub(in crate::state_reader::tests) trait ReaderBackend {
 
     /// A cell store to seed one event through. Cloning shares the committed
     /// backing, memory cells or Cassandra rows, across a trace's events. On
-    /// Cassandra, cloning also shares the one `MarkerMemo`/`MarkerPresence`
+    /// Cassandra, cloning also shares the one `MarkerMemo`/`MarkerCheckSet`
     /// lifecycle the store owns.
     fn owner_cell(&self) -> Self::OwnerCell;
 

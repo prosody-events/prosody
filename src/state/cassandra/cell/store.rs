@@ -4,19 +4,20 @@ use super::{
     Arc, BatchUnit, Bytes, CassandraCellStoreError, CassandraSession, CassandraStore, Cell,
     CellAddr, CellBatchRow, CellBlobs, CellKey, CellKind, CellQueries, CellStore, CellStoreError,
     CollectionDefRegistry, CollectionId, CollectionRef, CommitOracle, Coordinate, EventMarker,
-    EventRef, KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, MarkerPresence, Pk,
-    PreparedStatement, QueryRowsResult, ResolveCellError, ResolvedRow, Resolver, RowShape,
-    SHARD_FANOUT_CONCURRENCY, Scan, Section, Session, Stream, TryStreamExt, blob_weight, encode,
-    encode_marker_payload, fetch_and_decode_cell, fetch_cell_rows_result, fetch_cells_batch_result,
-    flatten_resolve, help_read_window, marker_delete_unit, marker_last_split, page_cells,
-    peek_read, pin_mut, resolve_marker, smallvec, try_stream,
+    EventRef, KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, MarkerCheckSet, Pk,
+    PreparedStatement, PriorEventClear, QueryRowsResult, ResolveCellError, ResolvedRow, Resolver,
+    RowShape, SHARD_FANOUT_CONCURRENCY, Scan, Section, Session, Stream, TryStreamExt, blob_weight,
+    encode, encode_marker_payload, fetch_and_decode_cell, fetch_cell_rows_result,
+    fetch_cells_batch_result, flatten_resolve, marker_delete_unit, marker_last_split, page_cells,
+    peek_read, pin_mut, resolve_event_marker, resolve_prior_clear_before_read, smallvec,
+    try_stream,
 };
 
 impl<O> CassandraStore<O> {
     /// Creates a Cassandra cell store over an existing session, a prepared
     /// [`CellQueries`] set, the commit oracle it resolves provisional cells
     /// through, the registry that supplies per-collection TTLs, and the
-    /// per-assignment [`MarkerPresence`] latch minted from the partition's
+    /// per-assignment [`MarkerCheckSet`] latch minted from the partition's
     /// fjall workspace.
     #[must_use]
     pub(crate) fn new(
@@ -24,14 +25,13 @@ impl<O> CassandraStore<O> {
         queries: Arc<CellQueries>,
         oracle: O,
         registry: Arc<CollectionDefRegistry>,
-        presence: MarkerPresence,
+        checked: MarkerCheckSet,
     ) -> Self {
         Self {
             session,
             queries,
             resolver: Resolver::new(oracle, registry),
-            memo: Arc::default(),
-            presence,
+            memo: Arc::new(super::MarkerMemo::new(checked)),
             #[cfg(test)]
             counters: Arc::default(),
         }
@@ -166,9 +166,9 @@ impl<O> CassandraStore<O> {
     /// ([`super::MarkerMemo`]'s standing map plus the presence latch): the
     /// marker is now durably deleted, so the collection is known
     /// marker-absent for the rest of the assignment.
-    pub(super) async fn settle_memo(&self, collection: &CollectionId) {
-        self.memo.standing.remove_async(collection).await;
-        self.presence.set(collection).await;
+    pub(super) async fn record_marker_settled(&self, collection: &CollectionId) {
+        self.memo.unsettled.remove_async(collection).await;
+        self.memo.checked.set(collection).await;
     }
 }
 
@@ -192,18 +192,18 @@ where
         collection: &CollectionRef,
         marker: &EventMarker,
     ) -> Result<MarkerBlob, CellStoreError<O::Error>> {
-        if let Some(standing) = self.standing_marker(collection.id()).await?
+        if let Some(standing) = self.unsettled_marker(collection.id()).await?
             && standing.event() != marker.event()
         {
-            resolve_marker(self, self.resolver.oracle(), collection, &standing)
+            resolve_event_marker(self, self.resolver.oracle(), collection, &standing)
                 .await
                 .map_err(flatten_resolve)?;
         }
         self.memo
-            .standing
+            .unsettled
             .upsert_async(collection.id().clone(), marker.clone())
             .await;
-        self.presence.set(collection.id()).await;
+        self.memo.checked.set(collection.id()).await;
         let payload = encode_marker_payload(marker)
             .map_err(CassandraCellStoreError::from)
             .map_err(ResolveCellError::Store)?;
@@ -227,14 +227,17 @@ where
         let limit = scan.limit;
         let collection_ref = self.resolver.collection_ref(collection);
         try_stream! {
-            // Read-help once before the pager opens (`help_read_window`): a
+            // Read-help once before the pager opens (`resolve_prior_clear_before_read`): a
             // standing foreign clears-bearing marker is resolved so the scan
             // pages post-clear truth. Memo-backed — no durable marker read
             // after the seed read. The reader-only scan
             // ([`CassandraCellResources::scan_committed`]) skips this: it
             // observes `prev`, which is committed by construction.
-            let standing = self.standing_marker(collection).await?;
-            help_read_window(self, self.resolver.oracle(), &collection_ref, standing.as_ref(), own)
+            let marker = self.unsettled_marker(collection).await?;
+            let clear = marker
+                .as_ref()
+                .and_then(|marker| PriorEventClear::new(marker, own));
+            resolve_prior_clear_before_read(self, self.resolver.oracle(), &collection_ref, clear)
                 .await
                 .map_err(flatten_resolve)?;
             // The shared paging core (`page_cells`): it selects the per-bound
