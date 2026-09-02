@@ -11,17 +11,9 @@ pub(super) fn finish(result: Result<bool>) -> TestResult {
     }
 }
 
-/// The crash-recovery-equivalence property over the production
-/// `Cached<CassandraStore>` assembly at the full clears-bearing alphabet
-/// (crash-recovery equivalence and oracle-correctness properties). A "crash"
-/// rebuilds the cache cold over the same durable Cassandra rows and oracle
-/// set, so every durable clear leg — gap range deletes, marker-last settle,
-/// the marker payload's clear half, read-help
-/// — runs beneath the production cache with its D3/D4 deletes, and the
-/// lower fault seam (`FaultDepth::Lower` settle failures + directed
-/// post-failure reads, stage faults) fires beneath the cache against live
-/// CQL. The tempdir and fjall client outlive every store the `make` closure
-/// mints (the await completes before they drop).
+/// Proves recovery parity for the production Cassandra cache.
+///
+/// Each simulated crash creates a new cache over the same durable rows.
 #[test]
 fn prop_cassandra_cell_crash_equivalence() {
     async fn run(trace: Trace) -> Result<bool> {
@@ -33,8 +25,8 @@ fn prop_cassandra_cell_crash_equivalence() {
         // cheap journal marker, no keyspace-creation fsync) instead of
         // minting a fresh workspace per make; distinct v4 segments per
         // iteration keep the shared keyspace disjoint. The cleared index
-        // keyspace also resets the bottom store's presence latch — per-
-        // assignment state dies with the assignment, so the presence handle is
+        // keyspace also resets the bottom store's marker check — per-
+        // assignment state dies with the assignment, so the marker-check handle is
         // minted from that same cold cache.
         let make = |handle: &PoisonHandle| -> Result<FaultyBottom> {
             let cache = test_db::cold_cache("cassandra_crash")?;
@@ -65,13 +57,7 @@ fn prop_cassandra_cell_crash_equivalence() {
         .quickcheck((|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(Trace) -> TestResult);
 }
 
-/// Regression pin over the production `Cached<CassandraStore>` assembly: a
-/// blind `write_resolved` into a section whose clears-bearing marker still
-/// stands survives the marker's later resolution — exercising the helper and
-/// the Cached D3 write leg together. Falsify by deleting the boundary lines in
-/// `CassandraStore::write_resolved` (the survival assertion reddens) or the D3
-/// block in `Cached::write_resolved` (the promoted-cell assertion reddens on
-/// the stale warm Absent entry).
+/// Proves that a resolved write survives an earlier unsettled section clear.
 #[test]
 fn cassandra_blind_write_survives_stale_clear() -> Result<()> {
     init_test_logging();
@@ -85,8 +71,8 @@ fn cassandra_blind_write_survives_stale_clear() -> Result<()> {
     })
 }
 
-/// Posture-parity pin over the bare live store: a blind `write_resolved` leaves
-/// a standing clears-FREE marker standing.
+/// Posture-parity test over the bare live store: a blind `write_resolved`
+/// leaves an unsettled clears-FREE marker unsettled.
 #[test]
 fn cassandra_blind_write_leaves_clears_free_marker() -> Result<()> {
     init_test_logging();
@@ -100,12 +86,13 @@ fn cassandra_blind_write_leaves_clears_free_marker() -> Result<()> {
     })
 }
 
-/// Regression pin over the production `Cached<CassandraStore>` assembly: a
-/// repair whose payload predates a standing committed clears-bearing marker
+/// Regression test over the production `Cached<CassandraStore>` assembly: a
+/// repair whose payload predates an unsettled committed clears-bearing marker
 /// defers to peek semantics beneath the cache, so the marker's own resolution
 /// (the committed positional clear) erases the cell instead of a stale repair
-/// resurrecting it. The D4 clear-eviction beats the earlier deferred fill.
-/// Falsify by deleting the `deferred` guard in `resolve_cell`.
+/// resurrecting it. The section-clear cache guard clear-eviction beats the
+/// earlier deferred fill. Falsify by deleting the `deferred` guard in
+/// `resolve_cell`.
 #[test]
 fn cassandra_repair_defers_beneath_stale_clear() -> Result<()> {
     init_test_logging();
@@ -113,7 +100,7 @@ fn cassandra_repair_defers_beneath_stale_clear() -> Result<()> {
         let fx = fixture().await?;
         let oracle = ScriptedOracle::default();
         // Stage under the fixture's presence (the prior assignment). The reader
-        // is a fresh cold assignment: a cold cache whose own presence latch is
+        // is a fresh cold assignment: a cold cache whose own marker check is
         // cold, so `x` never warms it and the Cached read cold-seeds from
         // durable truth, reaching `resolve_cell`.
         let stage = fx.bottom_store(oracle.clone());
@@ -127,8 +114,8 @@ fn cassandra_repair_defers_beneath_stale_clear() -> Result<()> {
     })
 }
 
-/// Convergence pin over `Cached<CassandraStore>`: the deferral wedges nothing —
-/// when the standing marker aborts, x's committed projection stays its base.
+/// Convergence test over `Cached<CassandraStore>`: the deferral wedges nothing
+/// — when the unsettled marker aborts, x's committed projection stays its base.
 #[test]
 fn cassandra_repair_after_marker_abort_converges() -> Result<()> {
     init_test_logging();
@@ -181,7 +168,7 @@ fn prop_cassandra_cell_implicit_overwrite() {
         // `make` clears the shared `cassandra_overwrite` keyspace pair (no
         // keyspace-creation fsync); distinct v4 segments per iteration keep it
         // disjoint. The cleared index keyspace resets the bottom store's
-        // presence latch too — a fresh cold assignment — so its presence handle
+        // marker check too — a fresh cold assignment — so its marker-check handle
         // is minted from that same cold cache.
         let make = || -> Result<Bottom> {
             let cache = test_db::cold_cache("cassandra_overwrite")?;

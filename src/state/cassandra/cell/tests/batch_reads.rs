@@ -50,8 +50,8 @@ async fn cassandra_batch_preserves_input_positions() -> Result<()> {
 /// present with a valid frame, `event` NULL ⇒ `PrevWithoutEvent`. B (`0xFE`,
 /// high): `data` present, `encoding` NULL ⇒ `BlobWithoutEncoding`. The
 /// clustering order (A < B) is the reverse of the `[B, A]` read list both
-/// resolve-order pins issue, so the decode order the reader picks decides which
-/// error surfaces.
+/// resolve-order tests issue, so the decode order the reader picks decides
+/// which error surfaces.
 async fn seed_prev_without_event_and_blob_without_encoding(
     session: &Session,
     id: &CollectionId,
@@ -100,7 +100,7 @@ async fn seed_prev_without_event_and_blob_without_encoding(
     Ok((cell_a, cell_b))
 }
 
-/// Resolve-order pin: two rows with DISTINCT corruption shapes at coordinates
+/// Resolve-order test: two rows with DISTINCT corruption shapes at coordinates
 /// whose clustering order (A `0x01` < B `0xFE`) is the reverse of the read list
 /// `[B, A]`. `get_many` decodes unique rows in first-occurrence order. Thus, it
 /// must surface B's `BlobWithoutEncoding`, not A's `PrevWithoutEvent`,
@@ -159,7 +159,7 @@ async fn first_error_is_first_input_position() -> Result<()> {
     Ok(())
 }
 
-/// Sort-necessity unit pin (no cluster): a SHUFFLED raw batch with two corrupt
+/// Sort-necessity unit test (no cluster): a SHUFFLED raw batch with two corrupt
 /// rows — low coord `0x01` = `PrevWithoutEvent`, high coord `0xFE` =
 /// `BlobWithoutEncoding`, pushed high-then-low — must surface the LOWEST
 /// coordinate's error after the borrowed batch follows input resolution order.
@@ -289,7 +289,7 @@ async fn resolved_corrupt_rows_fail_before_blob_decode() -> Result<()> {
     Ok(())
 }
 
-/// Query-count pin: `provisional_many` issues exactly ONE `IN` query per chunk
+/// Query-count test: `provisional_many` issues exactly ONE `IN` query per chunk
 /// and NO point reads or marker reads. A fresh reader store (cold counters)
 /// stages nothing itself, so the counters reflect the verb alone; the dedicated
 /// `provisional_in_queries` counter proves it BATCHED rather than merely "no
@@ -446,8 +446,8 @@ fn prop_cassandra_raw_batch_parity() {
         );
 }
 
-/// Ascending-output pin over the live store. The sort requirement is also
-/// pinned by `borrowed_batch_decodes_in_resolution_order` and
+/// Ascending-output test over the live store. The sort requirement is also
+/// verified by `borrowed_batch_decodes_in_resolution_order` and
 /// `provisional_batch_coordinates_are_sorted_and_distinct`.
 #[tokio::test]
 async fn cassandra_raw_batch_ascending_output() -> Result<()> {
@@ -459,7 +459,7 @@ async fn cassandra_raw_batch_ascending_output() -> Result<()> {
     .await
 }
 
-/// No-side-effects pin over the live store built on a [`CountingOracle`]:
+/// No-side-effects test over the live store built on a [`CountingOracle`]:
 /// `provisional_many` never resolves, writes, or caches.
 #[tokio::test]
 async fn cassandra_raw_batch_no_side_effects() -> Result<()> {

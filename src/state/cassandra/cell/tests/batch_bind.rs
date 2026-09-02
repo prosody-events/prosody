@@ -88,9 +88,9 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     // columns). B was promoted out of the provisional set by the key-only
     // promote row.
     //
-    // Fresh-assignment presence for each fresh reader: the presence latch is
+    // Fresh-assignment presence for each fresh reader: the marker check is
     // per-assignment state; without a cold domain the reader would presence-hit
-    // (the writer staged into the shared fixture latch) into its empty standing
+    // (the writer staged into the shared fixture latch) into its empty unsettled
     // map and skip the durable marker read this test exists to exercise.
     // Exclusive keyspace name (clearing-test rule).
     let (_db, _cache, presence_index) = test_db::keyspace_pair("cassandra_mixed_presence")?;
@@ -132,7 +132,7 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     fx.cassandra
         .execute_unlogged_batches(&delete, 1 << 20, 4_096, SHARD_FANOUT_CONCURRENCY)
         .await?;
-    // Fresh reader = fresh assignment: reset the exclusive presence latch so
+    // Fresh reader = fresh assignment: reset the exclusive marker check so
     // this reader's cold memo forces the durable read that now finds no marker.
     presence_index.clear()?;
     let reader = fx.bottom_store_with(

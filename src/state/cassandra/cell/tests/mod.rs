@@ -101,21 +101,10 @@ fn row_encoding_uses_the_larger_present_payload() -> Result<()> {
     Ok(())
 }
 
-/// [`ShapeProbe`] over the live cluster, read by raw CQL against the trace's
-/// own partition key only (the isolation rule):
+/// Reads physical Cassandra rows for shared store tests.
 ///
-/// * `cell_rows` — the physically stored `kind=Cell` rows as `(section,
-///   coordinate byte)`. A residue row (an absent value left with live
-///   `encoding`/`version` columns) is returned; a `cell_delete`d or gap-erased
-///   row is not — so exact-set equality against the model's present set catches
-///   residue and lost rows alike.
-/// * `unsettled_marker` — the whole `kind=Marker` slice, asserting the
-///   structural shape (at most ONE row, at the fixed address `(0, empty)` — the
-///   zero-per-coordinate-rows postcondition) before decoding the frozen payload
-///   (staged set AND clear half) through the production decoder.
-/// * `provisional_rows` — `kind=Cell` rows whose `event` is populated (filtered
-///   in code; CQL cannot filter a regular column without ALLOW FILTERING, and
-///   the partition is the trace's own — bounded).
+/// This probe reads only the test trace's partition.
+/// It checks cell rows, one fixed marker row, and provisional rows.
 struct CassandraShapeProbe {
     session: CassandraSession,
 }
@@ -261,22 +250,12 @@ async fn fixture() -> Result<Fixture> {
 }
 
 impl Fixture {
-    /// The bare resolving Cassandra cell store over `oracle`, using the
-    /// fixture's shared warm presence keyspace. Safe while a test builds ONE
-    /// store per collection (fresh v4 segments keep tests disjoint); a test
-    /// minting a second store over the same collection models a fresh
-    /// assignment and must pass a cold presence handle via
-    /// [`bottom_store_with`](Self::bottom_store_with).
+    /// Returns a Cassandra store that uses the fixture's marker-check set.
     fn bottom_store(&self, oracle: ScriptedOracle) -> CassandraStore<ScriptedOracle> {
         self.bottom_store_with(oracle, self.marker_checks.clone())
     }
 
-    /// A bare store over an explicit presence handle and an arbitrary
-    /// [`CommitOracle`] — for assemblies that model reassignment
-    /// (crash/overwrite rebuilds, fresh cold readers), the
-    /// presence-degradation test, and pins that need a
-    /// non-[`ScriptedOracle`] oracle (e.g. the [`CountingOracle`]
-    /// no-side-effects pin).
+    /// Returns a Cassandra store with an explicit marker-check set.
     fn bottom_store_with<O: CommitOracle>(
         &self,
         oracle: O,

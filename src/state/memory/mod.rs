@@ -81,13 +81,10 @@ where
         &self.cells.inner
     }
 
-    /// The committed-unapplied read window, shared verbatim by `get` and
-    /// `scan_cells`: resolve a standing FOREIGN clears-bearing marker
-    /// (`resolve_prior_clear_before_read`) before the raw read/snapshot, so
-    /// both paths serve post-clear truth. The marker map is RAM — the
-    /// ~always marker-free fast path costs one map read. Both read paths
-    /// MUST run identical help; funneling them through one helper makes
-    /// drift structurally impossible.
+    /// Resolves a prior event's section clear before a read.
+    ///
+    /// Both point reads and scans use this function.
+    /// They cannot return data that the clear removed.
     async fn read_help(
         &self,
         collection_ref: &CollectionRef,
@@ -107,7 +104,7 @@ where
     /// cleared section whose coordinate is not a survivor (positional
     /// exclusion — the frozen list is sorted, so a binary search decides), and
     /// clears each removed coordinate from the [`WarmIndex`]. Erasing a
-    /// still-provisional foreign entry is correct (the erasure argument on
+    /// still-provisional prior event entry is correct (the erasure argument on
     /// [`CellStore::commit_provisional`]); removal is idempotent.
     async fn erase_clear(&self, collection: &CollectionId, clear: &SectionClear) {
         let mut removed: Vec<CellKey> = Vec::new();
@@ -128,13 +125,9 @@ where
         }
     }
 
-    /// The raw resolved-write apply — erase the cleared sections, then upsert
-    /// present values / remove absent ones (the row-absence invariant), and
-    /// drop each cell's provisional coordinate from the [`WarmIndex`]. Shared
-    /// by the trait [`write_resolved`](CellStore::write_resolved) (which runs
-    /// the write-help boundary first) and the settle verbs (which run while the
-    /// marker being settled still stands and must NOT re-enter the boundary —
-    /// re-entry would recurse on that marker's own resolution).
+    /// Applies resolved values without marker resolution.
+    ///
+    /// Callers must resolve required section clears before this function.
     async fn apply_resolved(
         &self,
         collection: &CollectionId,
@@ -329,17 +322,17 @@ where
                     .all(|(cell, _)| marker.staged().binary_search(cell).is_ok()),
                 "every staged write must be listed by the event marker"
             );
-            // Stage boundary: resolve any standing FOREIGN marker (a different
+            // Stage boundary: resolve any unsettled prior event marker (a different
             // event) before overwriting it, establishing marker uniqueness per
             // collection. A resolution failure fails the stage.
-            if let Some(standing) = self
+            if let Some(unsettled) = self
                 .cells
                 .markers
                 .read_async(collection.id(), |_, marker| marker.clone())
                 .await
-                && standing.event() != marker.event()
+                && unsettled.event() != marker.event()
             {
-                resolve_event_marker(self, self.resolver.oracle(), collection, &standing)
+                resolve_event_marker(self, self.resolver.oracle(), collection, &unsettled)
                     .await
                     .map_err(flatten_resolve)?;
             }
@@ -373,14 +366,8 @@ where
         cells: &'a [(CellKey, Option<Bytes>)],
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        // The write-side committed-unapplied boundary
-        // (`resolve_unsettled_clear_before_write`): resolve any standing
-        // clears-bearing marker before this blind write, ordering the write
-        // after that resolution so a stale clear's replay cannot erase it
-        // (modulo the concurrent-resolver residual documented on
-        // `resolve_unsettled_clear_before_write`). Marker-free otherwise (the marker
-        // lifecycle belongs to the staged verbs). The marker map is RAM — the
-        // ~always marker-free fast path costs one read.
+        // Resolve an unsettled section clear before this write.
+        // The clear cannot remove a value that this write adds.
         let marker = self.unsettled_marker(collection.id()).await?;
         let clear = marker.as_ref().and_then(UnsettledClear::new);
         resolve_unsettled_clear_before_write(self, self.resolver.oracle(), collection, clear)
@@ -432,8 +419,8 @@ where
         // Route present-data cells to a promote (`mark_resolved`) and
         // absent-data cells to a row-deleting raw apply (the row-absence
         // invariant), then erase the clears and delete the marker. The raw
-        // `apply_resolved` never re-enters the write-help boundary — the marker
-        // being settled here still stands, so a re-entry would recurse on it.
+        // `apply_resolved` never re-enters the clear resolution boundary — the marker
+        // being settled here remains unsettled, so a re-entry would recurse on it.
         // All steps idempotent, and memory has no mid-call crash, so the
         // ordering carries no correctness weight (survivors are excluded from
         // the erase positionally either way).
@@ -469,7 +456,7 @@ where
     ) -> Result<(), Self::Error> {
         // Write each staged cell's committed base `prev` back as resolved
         // (`prev = None` restores exact absence) via the raw apply — which,
-        // unlike the trait `write_resolved`, must not re-enter the write-help
+        // unlike the trait `write_resolved`, must not re-enter the clear resolution
         // boundary on the marker this abort is deleting — then delete the
         // marker.
         let cells: CellBuffer<(CellKey, Option<Bytes>)> = writes

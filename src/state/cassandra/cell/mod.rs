@@ -32,9 +32,9 @@
 //! batch budget carries the marker row **in** the atomic batch; an over-budget
 //! stage writes the marker first, alone, so a torn stage is always
 //! marker-without-cells (over-report-safe), never cells-without-marker (a
-//! strand). The per-assignment marker memo — the standing RAM map
-//! ([`MarkerMemo`]) plus the fjall presence latch ([`MarkerCheckSet`]) — bounds
-//! durable marker reads to at most one per collection per assignment.
+//! strand). [`MarkerMemo`] keeps unsettled markers in memory.
+//! [`MarkerCheckSet`] stores completed checks on disk.
+//! Together, they permit one durable marker read per assignment and collection.
 //!
 //! The marker also carries the stage's **section clears** (each cleared
 //! section with its frozen survivor list). A committed clear is applied as the
@@ -45,15 +45,9 @@
 //! [`commit_provisional`](CellStore::commit_provisional) and its abort twin
 //! [`abort_provisional`](CellStore::abort_provisional));
 //! [`write_resolved`](CellStore::write_resolved) applies its direct clears
-//! marker-free. Until the gaps land, reads are defended by **read-help** and
-//! blind committed writes by its **write twin**: `get`/`scan` (and `get`'s
-//! cache-fill twin) resolve a standing foreign clears-bearing marker through
-//! the sweep path before serving — the committed-unapplied read-window
-//! contract stated on [`get`](CellStore::get) — and `write_resolved` resolves a
-//! standing clears-bearing marker before landing (the committed-unapplied
-//! write-window contract stated on
-//! [`write_resolved`](CellStore::write_resolved)); both ride the same memo, so
-//! the fast path pays no durable marker read.
+//! A read resolves a prior event's section clear before it returns data.
+//! A resolved write resolves an unsettled section clear before it writes data.
+//! These operations use the same marker memo.
 //!
 //! The three cell mutators write exactly one cell-column shape each:
 //!
@@ -261,11 +255,7 @@ pub struct CassandraCellResources {
     pub(crate) queries: Arc<CellQueries>,
 }
 
-/// Test-only recovery-read counters. `marker_point_reads` increments only in
-/// [`unsettled_marker`](CellStore::unsettled_marker)'s durable-read arm — a
-/// memo hit (presence latch + standing map) must not count — which is what
-/// makes the "at most one durable marker read per collection per assignment"
-/// pin non-vacuous.
+/// Counts durable reads during recovery tests.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct RecoveryReadCounts {
@@ -275,7 +265,7 @@ pub(crate) struct RecoveryReadCounts {
     /// #provisional.
     pub(crate) cell_point_reads: AtomicUsize,
     /// `provisional_many` IN queries — exactly one per non-empty chunk.
-    /// Distinct from `cell_point_reads` so the query-count pin proves the verb
+    /// Distinct from `cell_point_reads` so the query-count test proves the verb
     /// BATCHED (one IN query) rather than point-looped.
     pub(crate) provisional_in_queries: AtomicUsize,
 }

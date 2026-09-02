@@ -39,13 +39,8 @@ where
         own: EventRef,
     ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
         let collection_ref = self.resolver.collection_ref(collection);
-        // The committed-unapplied read window (`resolve_prior_clear_before_read`):
-        // consult the standing marker — memo-backed, so no durable read after
-        // the one seed read —
-        // CONCURRENTLY with the cell point read, keeping the ~always
-        // marker-free fast path free of serial latency. If the marker was
-        // resolved (foreign + clears), the pre-help row may hold a now-erased
-        // value, so the point read is re-issued.
+        // Read the cell and marker at the same time.
+        // Read the cell again if a prior clear changes durable state.
         let (row, marker) = futures::join!(
             self.point_read_cell_result(&self.queries.read_cell_ttl, collection, cell),
             self.unsettled_marker(collection),
@@ -108,12 +103,8 @@ where
     ) -> Result<CacheBatch, Self::Error> {
         let collection_ref = self.resolver.collection_ref(collection);
         let (unique_coordinates, input_indices) = dedupe(batch);
-        // The committed-unapplied read window, exactly as the point read
-        // (`get_for_cache`): consult the standing marker — memo-backed, so no
-        // durable read after the one seed read — CONCURRENTLY with the batch
-        // query. If the marker was resolved (foreign + clears), the pre-help
-        // rows may hold now-erased values, so the whole `IN` query is re-issued
-        // once.
+        // Read the cells and marker at the same time.
+        // Read all cells again if a prior clear changes durable state.
         let (rows, marker) = futures::join!(
             self.batch_read_result(collection, section, &unique_coordinates),
             self.unsettled_marker(collection),
@@ -174,13 +165,8 @@ where
         collection: &'a CollectionId,
     ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
         try_stream! {
-            // The **cold seed** is the standing event marker (memoized — the
-            // one durable marker point read per collection per assignment
-            // happens in `unsettled_marker`, wherever it fires first): its
-            // frozen payload lists the staged coordinates, so recovery cost is
-            // ∝ #provisional, never #cells, with no range read anywhere. The
-            // warm short-circuit that skips this on a quiescent sweep lives
-            // one layer up on `Cached` (which owns the fjall warm index).
+            // The event marker lists each staged coordinate.
+            // Recovery reads only those coordinates.
             let Some(marker) = self.unsettled_marker(collection).await? else {
                 return;
             };
@@ -245,7 +231,7 @@ where
         let unique_coordinates = sorted_unique_coordinates(batch);
         // One IN query, reusing the TTL-bearing batch read; TTL is discarded in
         // the decoder. Never consults the oracle, never resolves, never writes —
-        // no read-window marker resolve, exactly as `provisional_cell_at`.
+        // no prior-clear marker resolve, exactly as `provisional_cell_at`.
         let result = self
             .batch_read_result(collection, section, &unique_coordinates)
             .await
@@ -270,19 +256,8 @@ where
         cells: &'a [(CellKey, Option<Bytes>)],
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        // The write-side committed-unapplied boundary
-        // (`resolve_unsettled_clear_before_write`): resolve any standing
-        // clears-bearing event marker before this blind write lands, ordering
-        // the write after that resolution so a stale clear's positional replay
-        // cannot erase it (modulo the concurrent-resolver residual documented
-        // on `resolve_unsettled_clear_before_write`). Memo-backed
-        // (`unsettled_marker`): one RAM/presence check steady-state,
-        // and the first marker consumer per collection per assignment pays the
-        // one durable seed read. The verb still never *writes* the marker slice
-        // (the marker lifecycle belongs to the staged verbs — see
-        // `CellStore::write_provisional`); the resolution runs through this
-        // store's own `commit_provisional`/`abort_provisional`, keeping the
-        // memo coherent.
+        // Resolve an unsettled section clear before this write.
+        // The clear cannot remove a value that this write adds.
         let marker = self.unsettled_marker(collection.id()).await?;
         let clear = marker.as_ref().and_then(UnsettledClear::new);
         resolve_unsettled_clear_before_write(self, self.resolver.oracle(), collection, clear)
@@ -343,10 +318,7 @@ where
         &'a self,
         collection: &'a CollectionId,
     ) -> Result<Option<EventMarker>, Self::Error> {
-        // Memo hit: the presence latch says the durable marker was consulted
-        // this assignment, so the RAM standing map is at least durable truth —
-        // zero durable reads. A presence fjall error reads as unchecked (a
-        // redundant durable re-check, never an under-report).
+        // A completed check makes the memory map authoritative.
         if self.memo.checked.contains(collection).await {
             return Ok(self
                 .memo
@@ -354,8 +326,7 @@ where
                 .read_async(collection, |_, marker| marker.clone())
                 .await);
         }
-        // Memo miss: the one durable point read at the fixed marker address,
-        // seeding the memo for the rest of the assignment.
+        // Read the fixed marker row once for this assignment.
         #[cfg(test)]
         self.counters
             .marker_point_reads

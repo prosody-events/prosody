@@ -8,12 +8,10 @@
 //! bare cache view can never be mistaken for a complete store — a miss asserts
 //! nothing and always falls through (KV2, owned by `Cached`).
 //!
-//! Three consumers share the workspace: the committed cell entries (the
-//! `cache` keyspace), the warm provisional index + seeded latch (the `index`
-//! keyspace), and the `MarkerCheckSet` latch (also `index`). All three
-//! observe the one shared **cache fuse** (`FjallCellCache::fuse_blown`);
-//! how a blown fuse partitions them is documented on `Cached`'s retry
-//! posture.
+//! Three components share this workspace.
+//! The cache stores committed cells.
+//! The index stores provisional cells and completed marker checks.
+//! All components use one cache-disabled state.
 //!
 //! # Workspace ownership
 //!
@@ -90,7 +88,7 @@ const SCAN_HOP_ROWS: usize = 256;
 
 /// Assignments that disabled their cell cache after a repair failure.
 ///
-/// [`FjallCellCache::blow_fuse`] increments this counter once per assignment.
+/// [`FjallCellCache::disable`] increments this counter once per assignment.
 static CACHE_DISABLED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     meter("prosody")
         .u64_counter("prosody.state.cell.cache.disabled_assignments")
@@ -103,7 +101,7 @@ static CACHE_DISABLED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// epoch.
 ///
 /// A non-`dyn` seam: production reads the [`Wall`](Self::Wall) clock; a test
-/// can pin time with `Fixed` and advance the shared counter past
+/// can test time with `Fixed` and advance the shared counter past
 /// a stamped expiry **without sleeping**, so the TTL-expiry property is
 /// deterministic. The cache stamps expiries with the same source it reads them
 /// against, so the two never disagree.
@@ -153,15 +151,13 @@ pub(crate) struct FjallCellCache {
     #[educe(Debug(ignore))]
     inner: Arc<Inner>,
     clock: Clock,
-    /// The one-way **cache fuse**, shared by every clone and every
-    /// [`MarkerCheckSet`] handle of one workspace (see
-    /// [`fuse_blown`](Self::fuse_blown)).
+    /// The cache-disabled state for all workspace handles.
     #[educe(Debug(ignore))]
-    fuse: Arc<AtomicBool>,
+    disabled: Arc<AtomicBool>,
     /// Test-only fault seam: when set, every [`put`](Self::put),
     /// [`put_batch`](Self::put_batch), and [`commit_batch`](Self::commit_batch)
     /// returns an engine error without touching fjall, so a test can force a
-    /// publish failure (the D1 repair path).
+    /// publish failure (the failed-publish cache guard repair path).
     #[cfg(test)]
     #[educe(Debug(ignore))]
     fail_puts: Arc<AtomicBool>,
@@ -188,7 +184,7 @@ pub(crate) struct FjallCellCache {
     /// [`delete_section`](Self::delete_section), and
     /// [`index_unseed`](Self::index_unseed), so a test can make exactly the
     /// next N must-succeed deletes fail (forcing the retry path, or blowing
-    /// the fuse past the budget) and then heal automatically.
+    /// cache disablement past the budget) and then heal automatically.
     #[cfg(test)]
     #[educe(Debug(ignore))]
     fail_deletes: Arc<AtomicU64>,
@@ -214,7 +210,7 @@ pub(crate) struct FjallCellCache {
 ///
 /// The [`Database`] is held in both arms because batch writes are issued
 /// through [`Database::batch`], not the keyspace handle. The `index` keyspace
-/// (warm provisional coordinates and the cold-seed and marker-presence
+/// (warm provisional coordinates and the cold-seed and marker-check
 /// latches)
 /// rides alongside `cache` in
 /// both arms purely for lifecycle co-location — it shares the workspace's
@@ -243,7 +239,7 @@ impl Inner {
     }
 
     /// The warm-index keyspace handle (provisional coordinates and the
-    /// cold-seed and marker-presence latches).
+    /// cold-seed and marker-marker checkes).
     fn index_handle(&self) -> &Keyspace {
         match self {
             #[cfg(test)]
@@ -324,7 +320,7 @@ impl FjallCellCache {
         Self {
             inner: Arc::new(inner),
             clock,
-            fuse: Arc::new(AtomicBool::new(false)),
+            disabled: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             fail_puts: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -340,29 +336,22 @@ impl FjallCellCache {
         }
     }
 
-    /// Whether the workspace's one-way **cache fuse** has blown.
+    /// Reports whether this assignment has disabled its cache.
     ///
-    /// The fuse lives in the shared inner state, so every [`Cached`] clone and
-    /// [`MarkerCheckSet`] handle of one workspace observes the same bit — a
-    /// per-clone fuse would let the next event's intact clone serve the very
-    /// stale hit the blown clone made unreachable. Consumers snapshot it once
-    /// at their own entry (one admission decision per verb); it never resets
-    /// within an assignment and dies with the workspace (its removal path).
+    /// All cache and marker-check handles observe the same state.
+    /// This state does not reset during an assignment.
     ///
     /// [`Cached`]: crate::state::cached::Cached
     #[must_use]
-    pub(crate) fn fuse_blown(&self) -> bool {
-        self.fuse.load(Ordering::Relaxed)
+    pub(crate) fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::Relaxed)
     }
 
-    /// Blows the cache fuse: permanently (for this assignment) degrades the
-    /// cache to a loud durable passthrough. Called by a must-succeed delete
-    /// that exhausted its retry budget — the delete "lands or fuses", so a
-    /// sick local disk can never stall settlement or leave a stale entry
-    /// reachable. Loud by contract: the first blow warns and bumps the metric
-    /// once per degraded assignment; later calls are no-ops.
-    pub(crate) fn blow_fuse(&self) {
-        if !self.fuse.swap(true, Ordering::Relaxed) {
+    /// Disables the cache for this assignment.
+    ///
+    /// A disabled cache sends all operations to durable storage.
+    pub(crate) fn disable(&self) {
+        if !self.disabled.swap(true, Ordering::Relaxed) {
             warn!("keyed-state cell cache disabled for this assignment; using durable reads");
             CACHE_DISABLED.add(1, &[]);
         }
@@ -459,15 +448,12 @@ impl FjallCellCache {
         .await
     }
 
-    /// Mints a [`MarkerCheckSet`] handle over this cache's warm-index keyspace
-    /// — the bottom store's bounded marker-checked latch, sharing the
-    /// workspace's per-assignment lifecycle (cold exactly when the store's RAM
-    /// memo is, dropped at revocation).
+    /// Returns a marker-check handle for this workspace.
     #[must_use]
     pub(crate) fn marker_checks(&self) -> MarkerCheckSet {
         MarkerCheckSet {
             index: self.inner.index_handle().clone(),
-            fuse: self.fuse.clone(),
+            disabled: self.disabled.clone(),
         }
     }
 
@@ -626,21 +612,9 @@ impl FjallCellCache {
     /// **single** [`spawn_blocking`] over one atomic [`OwnedWriteBatch`]
     /// (the shared `run_batch` ceremony).
     ///
-    /// Each `(cell, projection, expiry)` is encoded to a frame and inserted;
-    /// `commit` lands the whole set as one fjall mutation, so a multi-cell
-    /// cache update is never torn (mirroring the same-partition `UNLOGGED
-    /// BATCH` the Cassandra side uses). This collapses the per-cell settle
-    /// writes from N blocking thread-hops to one. The single-cell write-through
-    /// paths keep [`put`](Self::put).
+    /// Writes all specified cells in one cache update.
     ///
-    /// On a commit failure the caller's posture depends on the write's
-    /// provenance: a settle write-through (via
-    /// [`publish_written`](crate::state::cached::Cached)) deletes the written
-    /// cells' entries (D1 — the durable value moved, so a stale entry would
-    /// serve the pre-write value verbatim), while a read-fill (via
-    /// [`get_many`](crate::state::cached::Cached)) degrades with NO delete — a
-    /// miss/expired/error prior state left nothing stale, and a live entry
-    /// hidden by a read error equals what the next read resolves.
+    /// The caller handles a failed update according to its durable operation.
     pub(crate) async fn put_batch(
         &self,
         collection: &CollectionId,
@@ -674,9 +648,10 @@ impl FjallCellCache {
         .await
     }
 
-    /// The **settle transform** (D5): rewrites each staged cell's entry
-    /// `prev → data` at its **stage-anchored** expiry, atomically, in a single
-    /// [`spawn_blocking`] over one [`OwnedWriteBatch`]. Called by
+    /// The **settle transform** (settlement cache update): rewrites each staged
+    /// cell's entry `prev → data` at its **stage-anchored** expiry,
+    /// atomically, in a single [`spawn_blocking`] over one
+    /// [`OwnedWriteBatch`]. Called by
     /// [`Cached::commit_provisional`](crate::state::cached::Cached) strictly
     /// **before** the lower promote — the commit verdict is already fixed when
     /// that verb runs, so `data` *is* the logical committed projection and
@@ -1025,57 +1000,44 @@ impl FjallCellCache {
 /// bottom store's former in-RAM checked set — the rows live in the
 /// per-assignment `index` keyspace, so the workspace `Drop` and the startup
 /// orphan sweep reclaim them at revocation.
+/// Tracks completed durable marker checks on disk.
 ///
-/// **Infallible by design.** fjall is never a durability or recovery source,
-/// so a fjall error degrades to a re-check, never an under-report:
-/// [`contains`](Self::contains) reads as **unchecked** (`false`) on any error
-/// and [`set`](Self::set) warns and continues. Each failure costs one redundant
-/// durable marker point read — under a *persistent* fjall failure that is a
-/// continuous per-consult fallback (one durable read per consult until fjall
-/// heals), never a wrong answer. Neither can lose a durable marker: the
-/// standing RAM map is untouched by presence failures (the memo and ownership
-/// invariants live on the bottom store's `MarkerMemo`).
-///
-/// A blown cache fuse fuses this latch too — `contains` answers unchecked and
-/// `set` no-ops — purely for uniformity (blown means zero fjall dependence);
-/// the contract above already makes the degradation safe.
+/// An error leaves the collection unchecked.
+/// The next check reads the durable marker again.
+/// A disabled cache stops reads and writes through this handle.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub(crate) struct MarkerCheckSet {
     #[educe(Debug(ignore))]
     index: Keyspace,
     #[educe(Debug(ignore))]
-    fuse: Arc<AtomicBool>,
+    disabled: Arc<AtomicBool>,
 }
 
 impl MarkerCheckSet {
-    /// Whether `collection`'s durable marker has been consulted this
-    /// assignment. Any fjall error reads as **unchecked** (`false`) — a
-    /// redundant durable re-check, never an under-report.
+    /// Reports whether this assignment checked the collection's durable marker.
     pub(crate) async fn contains(&self, collection: &CollectionId) -> bool {
-        if self.fuse.load(Ordering::Relaxed) {
+        if self.disabled.load(Ordering::Relaxed) {
             return false;
         }
         match read_cell(&self.index, codec::marker_check_key(collection)).await {
             Ok(raw) => raw.is_some(),
             Err(error) => {
-                warn!(%error, "marker-presence read failed; treating collection as unchecked");
+                warn!(%error, "marker check failed; the collection remains unchecked");
                 false
             }
         }
     }
 
-    /// Records `collection`'s durable marker as consulted. A fjall error is
-    /// swallowed (warn): the collection stays unchecked and the next consult
-    /// pays one redundant durable read.
+    /// Records a completed durable marker check for the collection.
     pub(crate) async fn set(&self, collection: &CollectionId) {
-        if self.fuse.load(Ordering::Relaxed) {
+        if self.disabled.load(Ordering::Relaxed) {
             return;
         }
         if let Err(error) =
             write_index_empty(&self.index, codec::marker_check_key(collection)).await
         {
-            warn!(%error, "marker-presence write failed; leaving collection unchecked");
+            warn!(%error, "marker check record failed; the collection remains unchecked");
         }
     }
 }

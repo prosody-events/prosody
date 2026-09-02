@@ -5,11 +5,8 @@
 //! event marker naming that event and the coordinates it staged, so recovery
 //! can resolve the whole stage as a unit — promote or roll back every listed
 //! cell — from a single point read rather than a scan over per-coordinate
-//! rows. [`EventMarker`] is what
-//! [`unsettled_marker`](super::store::CellStore::unsettled_marker) returns and
-//! the memory backend stores; this module also owns its frozen
-//! wire `encode_marker_payload`/`decode_marker_payload` codec — the payload
-//! the Cassandra marker row carries in its `data` column.
+//! rows. [`EventMarker`] represents this unsettled state.
+//! This module also encodes and decodes the Cassandra marker value.
 //!
 //! # Invariants
 //!
@@ -116,7 +113,7 @@ impl SectionClear {
     }
 }
 
-/// The standing event marker for one collection: the owning event, its full
+/// The unsettled event marker for one collection: the owning event, its full
 /// staged coordinate set, and each cleared section's frozen survivors.
 ///
 /// See the module docs for the invariants it carries. Constructed only inside
@@ -196,7 +193,7 @@ impl EventMarker {
 ///                  survivor_count × [coord_len: u32 BE][coord bytes]
 /// ```
 ///
-/// Frozen and pinned; the Cassandra marker row is its production caller (the
+/// Frozen and verified; the Cassandra marker row is its production caller (the
 /// payload rides the row's `data`/`encoding`/`version` columns).
 ///
 /// # Errors

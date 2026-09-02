@@ -12,13 +12,11 @@ impl CassandraCellResources {
         Self { session, queries }
     }
 
-    /// Reads one cell's committed value without consulting the oracle. This is
-    /// the read path a standalone reader uses, not the owner. It point-reads
-    /// the `kind=Cell` row and projects
-    /// [`crate::state::cell::Cell::project_committed`]. It never returns an
-    /// in-flight provisional value and never runs owner-side repair: no
-    /// `resolve_prior_clear_before_read`, no oracle. An absent row reads
-    /// `None`. It decodes the borrowed row before it drops the response.
+    /// Returns one cell for a standalone reader.
+    ///
+    /// This read does not resolve markers or change durable state.
+    /// It returns `prev` for a provisional cell.
+    /// It returns `None` for an absent cell.
     ///
     /// # Errors
     ///
@@ -70,13 +68,11 @@ impl CassandraCellResources {
         Ok(expand_to_input_order(&input_indices, &unique_answers))
     }
 
-    /// Scans a section's committed values without consulting the oracle. This
-    /// is the scan path a standalone reader uses, not the owner. It drives
-    /// the shared [`page_cells`] pager and yields each present cell's
-    /// [`crate::state::cell::Cell::project_committed`] in `coordinate` order.
-    /// The scan's `limit` counts only present yields. It skips
-    /// `resolve_prior_clear_before_read`, the owner-side durable repair a
-    /// reader cannot and may not run.
+    /// Scans cells for a standalone reader.
+    ///
+    /// This scan does not resolve markers or change durable state.
+    /// It returns cells in coordinate order.
+    /// The limit counts only returned cells.
     ///
     /// The projection is sound without that repair. A provisional row's `prev`
     /// is committed by construction, and a resolved row's `data` was committed

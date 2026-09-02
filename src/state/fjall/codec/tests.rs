@@ -45,7 +45,7 @@ fn present_round_trip() {
 }
 
 /// A present cell is framed `[0x01][expiry: u64 BE][raw payload]` —
-/// byte-for-byte, no app-level compression. This pins the frame layout: the
+/// byte-for-byte, no app-level compression. This tests the frame layout: the
 /// fjall codec stores the payload verbatim after the tag + expiry header (fjall
 /// block-compresses on disk via LZ4), so the cell is not a zstd frame.
 #[test]
@@ -60,7 +60,7 @@ fn present_cell_is_raw_tagged_payload_with_expiry() {
 
 /// A `Set` of empty bytes is a present cell distinct from `Absent`, and must
 /// round-trip as `Present(empty)` with its expiry. Raw framing has no
-/// compression frame to pad an empty tail (zstd used to), so this pins the
+/// compression frame to pad an empty tail (zstd used to), so this tests the
 /// empty case deterministically rather than leaving it to the property test's
 /// dice.
 #[test]
@@ -238,7 +238,7 @@ fn null_in_key_or_name_does_not_shift_field_boundary() -> Result<()> {
 // --- Warm-index key codec ---------------------------------------------------
 
 /// The frozen wire bytes of a coord key, a seeded key, and a presence key —
-/// any persisted encoding gets a pinned-bytes test. Also proves a coord key
+/// any persisted encoding gets a verified-bytes test. Also proves a coord key
 /// round-trips back to its `CellKey`. (Index discriminant `0x02` is retired
 /// with the deleted design's interval rows; `Presence` stays `0x03`.)
 #[test]

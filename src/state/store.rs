@@ -94,16 +94,11 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// provisional cell through the oracle (or short-circuiting to its `prev`
     /// when `own` owns it). A missing row resolves to `Committed(None)`.
     ///
-    /// # The committed-unapplied read window
+    /// # Prior section clears
     ///
-    /// Reads return **marker-resolved truth**: a standing **foreign** event
-    /// marker that carries section clears is resolved through the sweep path
-    /// (`resolve_prior_clear_before_read` in `resolve`) before the read is
-    /// served, so a committed-but-unapplied clear can never serve pre-clear
-    /// rows. Markers without clears are left standing — first-touch
-    /// resolution stays cell-grained and marker-free. [`Self::scan_cells`]
-    /// and the cache-fill twin [`Self::get_for_cache`] share the same
-    /// implementation, so the contract holds across all three reads.
+    /// Resolves a prior event's section clear before it returns data.
+    /// The read cannot return data that the clear removed.
+    /// Markers without section clears remain unsettled.
     ///
     /// # Errors
     ///
@@ -171,7 +166,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ///   semantic failures** (a corrupt row shape, an oracle consult) the one
     ///   surfaced is the earliest input position's. A backend may additionally
     ///   fail the batch as a whole *before* any row resolves (the Cassandra
-    ///   override's `IN` query, its standing-marker read, or the read-window
+    ///   override's `IN` query, its unsettled-marker read, or the prior-clear
     ///   re-issue); such a whole-collection failure carries **no** input
     ///   position, exactly as the point [`Self::get`] surfaces the same failure
     ///   with no cell attribution.
@@ -347,7 +342,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// the marker and runs the boundary check like any stage, because a
     /// committed-unapplied clear is recoverable state.
     ///
-    /// Before staging, the backend resolves any standing marker naming a
+    /// Before staging, the backend resolves any unsettled marker naming a
     /// **different** event — the stage-boundary rule that keeps marker
     /// uniqueness per collection an invariant; a resolution failure fails the
     /// stage (the retry middleware handles it).
@@ -384,20 +379,10 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// present-data coordinates — the single survivor definition — so no
     /// written row can overlap a gap range (batches stay row-disjoint).
     ///
-    /// # The committed-unapplied write window
+    /// # Unsettled section clears
     ///
-    /// Before writing, each bottom store resolves any standing clears-bearing
-    /// event marker (`resolve_unsettled_clear_before_write` in `resolve`, the
-    /// write-side twin of the read window on [`Self::get`]), ordering this
-    /// write after that resolution so a stale clear's positional replay
-    /// cannot erase it — subject to the concurrent-resolver residual stated
-    /// on `resolve_unsettled_clear_before_write`. The settle verbs bypass
-    /// this boundary (they delete the very marker they settle); the callers
-    /// that can reach it *with a standing clears-bearing marker* are the
-    /// blind writes — the mid-handler `commit()` and the `ReadUncommitted`
-    /// direct apply. (The `resolve_cell` write-backs also reach
-    /// `write_resolved`, but only ever clears-free or marker-free — see the
-    /// repair-provenance invariant on `resolve_cell`.)
+    /// Resolves an unsettled section clear before it writes cells.
+    /// The clear cannot remove a value that this write adds.
     ///
     /// # Errors
     ///
@@ -409,7 +394,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         clears: &'a [SectionClear],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
-    /// Point-reads the collection's standing **event marker**, or `None` when
+    /// Point-reads the collection's unsettled **event marker**, or `None` when
     /// none stands (≈ always). Feeds the recovery sweep's marker leg and the
     /// stage-boundary rule. Required with no default: a defaulted `Ok(None)` on
     /// a marker-bearing backend would be a silent recovery hole, so every impl
@@ -450,9 +435,9 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// [`Self::mark_resolved`], absent data deletes its row via the raw
     /// resolved apply, and the marker is deleted last — the memory backend
     /// routes to its own raw apply so the settle never re-enters the
-    /// write-help boundary on the marker it is deleting; the Cassandra backend
-    /// implements the identical routing natively with same-partition batches):
-    /// with markers, a
+    /// clear resolution boundary on the marker it is deleting; the Cassandra
+    /// backend implements the identical routing natively with
+    /// same-partition batches): with markers, a
     /// defaulted override behind a trait default is a landmine — a wrapper
     /// store that forgot to forward the verb would fall into a default routing
     /// through the *wrapper's* verbs and bypass the inner store's marker
@@ -464,7 +449,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// range deletes between sorted survivors. The marker delete is issued
     /// only after every cell resolution and gap delete has completed, unless
     /// one same-partition batch carries all of them atomically. Erasing a
-    /// still-provisional **foreign** row is correct: single-writer ordering
+    /// still-provisional **prior event** row is correct: single-writer ordering
     /// puts the committed clear after every pre-existing row, so a
     /// non-survivor's post-clear state is absent regardless of its unresolved
     /// history (the erasure argument). Survivors are protected positionally by
