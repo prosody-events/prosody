@@ -6,7 +6,7 @@ async fn corrupt_cleared_window(
 ) -> Result<(Fixture, CassandraStore<ScriptedOracle>, CollectionRef)> {
     let fx = fixture().await?;
     let oracle = ScriptedOracle::default();
-    let store = fx.bottom_store(oracle.clone());
+    let store = fx.bottom_store(oracle.clone())?;
     let collection = collection(name)?;
     let id = collection.id();
 

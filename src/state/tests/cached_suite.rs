@@ -501,7 +501,7 @@ where
 }
 
 /// Crash-recovery equivalence over the **real** `Cached<MemoryCellStore>` at
-/// the full clears-bearing alphabet: each resolution arm drives
+/// the full alphabet of markers with clears: each resolution arm drives
 /// `commit_provisional`/`abort_provisional` (the publish-on-settle path), and
 /// a "crash" rebuilds the cache cold over the same warm memory cells (a fresh
 /// fjall workspace — the assignment-scoped lifecycle). The committed
@@ -1003,7 +1003,7 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
                 .write_resolved(&cref, &cells, slice::from_ref(&clear))
                 .await
                 .is_err(),
-            "the armed clears-bearing lower write must be rejected"
+            "the armed lower write with clears must be rejected"
         );
         *handle.lock() = None;
         counting.reset();
@@ -1051,7 +1051,7 @@ fn blind_write_deletes_beneath_resolved_marker_window() -> Result<()> {
             .write_resolved(&cref, &[(cell_at(0), Some(bytes(1)))], &[])
             .await?;
 
-        // Stage a committed clears-bearing marker through the cache and leave
+        // Stage a committed marker with clears through the cache and leave
         // it unsettled (no settle). The cache now holds the published `prev`
         // (bytes(1)) for the staged coordinate.
         let prev = cached.get(&id, &cell_at(0), event_a).await?;
@@ -2495,8 +2495,8 @@ impl Replay {
             .map_err(|e| eyre!("twin stage: {e:?}"))?;
         if stale_pending {
             // The boundary delete is verdict-blind and unconditional on
-            // clears: staged coordinates always drop; a clears-bearing stale
-            // marker drops its section wholesale.
+            // clears: staged coordinates always drop; a stale marker with
+            // clears drops its section wholesale.
             self.model_stale_resolved();
         }
         self.model_publish(staged.iter().map(|(cell, _)| cell.coordinate.as_bytes()[0]));
@@ -2610,7 +2610,7 @@ impl Replay {
     /// One parity get of `key`, updating the warm model with the fill.
     async fn check_get(&mut self, key: u8) -> Result<()> {
         let own = self.reader();
-        // A fall-through read of a stale clears-bearing marker fires prior-clear cache
+        // A fall-through read of a stale marker with clears fires prior-clear cache
         // guard and resolves the marker beneath; a warm hit touches neither.
         let falls_through = !self.is_warm(key);
         if falls_through
@@ -2650,7 +2650,7 @@ impl Replay {
     }
 
     /// One parity full-section scan. Scans fire prior-clear cache guard on a
-    /// stale clears-bearing marker and resolve it beneath, but publish
+    /// stale marker with clears and resolve it beneath, but publish
     /// nothing (KV3).
     async fn check_scan(&mut self) -> Result<()> {
         let own = self.reader();

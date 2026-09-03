@@ -23,7 +23,7 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
+    let store = fx.bottom_store(ScriptedOracle::default())?;
     let c = collection("mixed-batch")?;
     let id = c.id().clone();
 
@@ -81,24 +81,14 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
         .execute_unlogged_batches(&units, 1 << 20, 4_096, SHARD_FANOUT_CONCURRENCY)
         .await?;
 
-    // Read back through a FRESH store: its cold memo forces the durable
+    // Read back through a fresh store. Its cold memo forces the durable
     // marker read, so recovery decodes the batch-written marker (proving the
     // `marker_write` row bound its own columns), finds it lists exactly A,
     // and reads A back provisional with A's payload (the stage row bound its
     // columns). B was promoted out of the provisional set by the key-only
     // promote row.
     //
-    // Fresh-assignment presence for each fresh reader: the marker check is
-    // per-assignment state; without a cold domain the reader would presence-hit
-    // (the writer staged into the shared fixture latch) into its empty unsettled
-    // map and skip the durable marker read this test exists to exercise.
-    // Exclusive keyspace name (clearing-test rule).
-    let (_db, _cache, presence_index) = test_db::keyspace_pair("cassandra_mixed_presence")?;
-    presence_index.clear()?;
-    let reader = fx.bottom_store_with(
-        ScriptedOracle::default(),
-        test_db::marker_checks("cassandra_mixed_presence")?,
-    );
+    let reader = fx.bottom_store(ScriptedOracle::default())?;
     let staged = provisional_cells(&reader, &id).await?;
     assert_eq!(staged.len(), 1, "only A stays provisional: {staged:?}");
     let (key, prov) = staged
@@ -132,13 +122,7 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     fx.cassandra
         .execute_unlogged_batches(&delete, 1 << 20, 4_096, SHARD_FANOUT_CONCURRENCY)
         .await?;
-    // Fresh reader = fresh assignment: reset the exclusive marker check so
-    // this reader's cold memo forces the durable read that now finds no marker.
-    presence_index.clear()?;
-    let reader = fx.bottom_store_with(
-        ScriptedOracle::default(),
-        test_db::marker_checks("cassandra_mixed_presence")?,
-    );
+    let reader = fx.bottom_store(ScriptedOracle::default())?;
     assert!(
         provisional_cells(&reader, &id).await?.is_empty(),
         "marker_delete removed the marker row, so cold recovery lists nothing"

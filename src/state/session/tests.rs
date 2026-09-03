@@ -551,7 +551,7 @@ enum ValueOp {
     Set(u8),
     Clear,
     /// The section-clear marker leg: buffers a dirty clear of the value's
-    /// section, so the stage carries a clears-bearing durable marker — a lone
+    /// section, so the stage carries a durable marker with clears — a lone
     /// `ClearSection` produces a clears-only stage with an empty write set.
     ClearSection,
     /// The mid-handler write-through: everything buffered so far becomes
@@ -827,7 +827,7 @@ async fn checked_finalize(
 /// before the loop-tail resolving reads heal a skipped settle to identical
 /// bytes and mask it. A stage overwrites any marker a prior
 /// Reset/Failed/Incomplete-promote event left unsettled (a clear-free marker
-/// stands, cells healed, until the next stage; a clears-bearing one is
+/// stands, cells healed, until the next stage; a marker with clears is
 /// resolved by its own event's loop-tail read window), so the residue check is
 /// exact on the healthy arm — and only there: those outcomes leave residue by
 /// design. A poisoned promote must report `Incomplete`, leaving the stranded
@@ -1059,7 +1059,7 @@ async fn failed_finalize_keeps_the_buffer_whole_for_retry() -> Result<()> {
 /// prior event's unsettled committed marker (seeded crash-style through a raw
 /// store handle) is resolved — its cells settle per its verdict — rather than
 /// blind-deleted by the clears-only event's own settle, and the session's own
-/// clears-bearing marker is written by `finalize` then deleted by the
+/// marker with clears is written by `finalize` then deleted by the
 /// receipt's `promote` (which also applies the clear's gap erase).
 ///
 /// The generated crash/reassignment alphabet (the crash-trace generator's
@@ -1105,7 +1105,7 @@ async fn clears_only_session_boundary(a_committed: bool) -> Result<()> {
 
     // Raw probes before any resolving read: the boundary resolved A's marker
     // (nothing of A stays provisional; A's cells settled per its verdict) and
-    // B's clears-bearing marker replaced it.
+    // B's marker with clears replaced it.
     let unsettled = fx
         .cells
         .unsettled_marker_of(&id)
@@ -1128,7 +1128,7 @@ async fn clears_only_session_boundary(a_committed: bool) -> Result<()> {
     assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
     assert!(
         fx.cells.unsettled_marker_of(&id).is_none(),
-        "the settle deleted B's clears-bearing marker"
+        "the settle deleted B's marker with clears"
     );
     assert!(
         fx.cells.stored_coordinates(&id).is_empty(),
@@ -1249,7 +1249,7 @@ async fn own_event_read_does_not_resolve_its_own_marker() -> Result<()> {
     let id = fx.value_id();
     let collection = CollectionRef::new(id.clone(), None);
 
-    // Stage event E's clears-bearing marker directly (one survivor cell in the
+    // Stage event E's marker with clears directly (one survivor cell in the
     // cleared section) and leave E unrecorded — in-flight, uncommitted.
     let (e, _e_dedup) = message(1);
     let writes = [(

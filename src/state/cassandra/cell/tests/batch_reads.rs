@@ -11,7 +11,7 @@ fn prop_cassandra_batch_read_parity() {
     async fn run(trace: BatchReadTrace) -> Result<bool> {
         let fx = fixture().await?;
         let oracle = ScriptedOracle::default();
-        let store = fx.bottom_store(oracle.clone());
+        let store = fx.bottom_store(oracle.clone())?;
         Box::pin(run_batch_read_parity_trace(store, oracle, trace)).await
     }
 
@@ -29,7 +29,7 @@ async fn cassandra_batch_duplicate_co_observation() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
     Box::pin(run_batch_duplicate_co_observation(
-        fx.bottom_store(ScriptedOracle::default()),
+        fx.bottom_store(ScriptedOracle::default())?,
     ))
     .await
 }
@@ -40,7 +40,7 @@ async fn cassandra_batch_preserves_input_positions() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
     Box::pin(run_batch_alignment(
-        fx.bottom_store(ScriptedOracle::default()),
+        fx.bottom_store(ScriptedOracle::default())?,
     ))
     .await
 }
@@ -115,7 +115,7 @@ async fn first_error_is_first_input_position() -> Result<()> {
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
+    let store = fx.bottom_store(ScriptedOracle::default())?;
     let c = collection("resolve-order")?;
     let id = c.id();
     let own = event(9);
@@ -270,7 +270,7 @@ async fn resolved_corrupt_rows_fail_before_blob_decode() -> Result<()> {
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
+    let store = fx.bottom_store(ScriptedOracle::default())?;
     let c = collection("resolved-corrupt-error")?;
     let id = c.id();
     seed_prev_without_event_and_blob_without_encoding(fx.cassandra.session(), id).await?;
@@ -298,7 +298,7 @@ async fn resolved_corrupt_rows_fail_before_blob_decode() -> Result<()> {
 async fn cassandra_raw_batch_is_one_query() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    let seed = fx.bottom_store(ScriptedOracle::default());
+    let seed = fx.bottom_store(ScriptedOracle::default())?;
     let c = collection("raw-one-query")?;
     let id = c.id();
     let staging = event(0x11);
@@ -315,7 +315,7 @@ async fn cassandra_raw_batch_is_one_query() -> Result<()> {
     seed.write_provisional(&c, &writes, Some(&marker)).await?;
 
     // A fresh store: cold counters shared across its clones.
-    let reader = fx.bottom_store(ScriptedOracle::default());
+    let reader = fx.bottom_store(ScriptedOracle::default())?;
     let counters = reader.recovery_reads();
     let batch = CoordinateBatch::chunks([1u8, 2].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
@@ -357,7 +357,7 @@ async fn cassandra_recovery_batches_by_section_at_boundary() -> Result<()> {
     let staging = event(0x22);
 
     for n in [127u32, 128, 129] {
-        let store = fx.bottom_store(ScriptedOracle::default());
+        let store = fx.bottom_store(ScriptedOracle::default())?;
         let c = collection(&format!("recovery-boundary-{n}"))?;
         let counters = store.recovery_reads();
         let writes: Vec<(CellKey, ProvisionalWrite)> = (0..n)
@@ -391,7 +391,7 @@ async fn cassandra_recovery_batches_by_section_at_boundary() -> Result<()> {
 
     // Two sections: 129 in section 0 (two chunks) + 1 in section 1 (one chunk)
     // ⇒ ceil(129/128) + ceil(1/128) = 3 IN queries.
-    let store = fx.bottom_store(ScriptedOracle::default());
+    let store = fx.bottom_store(ScriptedOracle::default())?;
     let c = collection("recovery-boundary-two-sections")?;
     let counters = store.recovery_reads();
     let mut writes: Vec<(CellKey, ProvisionalWrite)> = (0..129u32)
@@ -434,7 +434,7 @@ async fn cassandra_recovery_batches_by_section_at_boundary() -> Result<()> {
 fn prop_cassandra_raw_batch_parity() {
     async fn run(trace: RawBatchTrace) -> Result<bool> {
         let fx = fixture().await?;
-        let store = fx.bottom_store(ScriptedOracle::default());
+        let store = fx.bottom_store(ScriptedOracle::default())?;
         Box::pin(run_raw_batch_parity_trace(store, trace)).await
     }
 
@@ -454,7 +454,7 @@ async fn cassandra_raw_batch_ascending_output() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
     Box::pin(run_raw_batch_ascending_output(
-        fx.bottom_store(ScriptedOracle::default()),
+        fx.bottom_store(ScriptedOracle::default())?,
     ))
     .await
 }
@@ -466,6 +466,6 @@ async fn cassandra_raw_batch_no_side_effects() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
     let oracle = CountingOracle::default();
-    let store = fx.bottom_store_with(oracle.clone(), fx.marker_checks.clone());
+    let store = fx.bottom_store(oracle.clone())?;
     Box::pin(run_raw_batch_no_side_effects(store, oracle)).await
 }

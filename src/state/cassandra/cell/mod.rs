@@ -271,8 +271,9 @@ pub(crate) struct RecoveryReadCounts {
 
 /// Tracks marker state for one partition assignment.
 ///
-/// `unsettled` can over-report, but it must not under-report after `checks` is
-/// set. Update `unsettled` before `checks` to enforce this invariant.
+/// `unsettled` can over-report: it can list a marker that never landed.
+/// It must not under-report after `checks` is set: it must not miss a durable
+/// marker. Update `unsettled` before `checks` to enforce this invariant.
 /// A settle removes the marker and keeps `checks` set.
 /// The disk-backed check set prevents unbounded keyed RAM use.
 ///

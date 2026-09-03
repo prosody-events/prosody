@@ -154,7 +154,7 @@ fn blind_write_leaves_clears_free_marker() -> Result<()> {
 }
 
 /// Regression test over the memory store: a repair whose payload predates a
-/// unsettled committed clears-bearing marker defers to peek semantics, so the
+/// committed but unsettled marker with clears defers to peek semantics, so the
 /// marker's own resolution erases the cell rather than a stale repair
 /// resurrecting it. Falsify by deleting the `deferred` guard in `resolve_cell`.
 #[test]
@@ -1219,7 +1219,7 @@ fn boundary_resolves_aborted_foreign_marker() -> Result<()> {
 /// crashes with no recovery, then event B stages **clears only** — an empty
 /// write set whose marker carries a cleared section. The boundary must resolve
 /// A's marker exactly as a writing stage would (A's cells settle per A's
-/// verdict, nothing of A stays provisional) while B's clears-bearing marker
+/// verdict, nothing of A stays provisional) while B's marker with clears
 /// stands. The crash-trace generator's clears dimension produces this shape
 /// organically; this test is its fast deterministic falsifier, matching the
 /// documented role of [`boundary_resolve_pin`].
@@ -1244,7 +1244,7 @@ async fn clears_only_boundary_pin(a_committed: bool) -> Result<()> {
         .await?;
 
     // Raw probes before any resolving read — a `get` would clear resolution-resolve
-    // B's clears-bearing marker and destroy the shape under test.
+    // B's marker with clears and destroy the shape under test.
     let unsettled = cells
         .unsettled_marker_of(&id)
         .ok_or_else(|| eyre!("B's clears-only marker must stand after the stage"))?;

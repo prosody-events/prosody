@@ -65,7 +65,7 @@ async fn markerless_provisional_is_sweep_invisible_but_first_touch_repairs() -> 
     init_test_logging();
     let fx = fixture().await?;
     let oracle = ScriptedOracle::default();
-    let store = fx.bottom_store(oracle.clone());
+    let store = fx.bottom_store(oracle.clone())?;
     let c = collection("markerless-orphan")?;
     let cell = value_cell();
     let data = Bytes::from_static(b"committed-after-crash");

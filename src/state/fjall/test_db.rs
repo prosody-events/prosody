@@ -26,8 +26,11 @@ use super::workspace::keyspace_options;
 use super::{Clock, FjallCellCache, MarkerCheckSet};
 use color_eyre::eyre::{Result, eyre};
 use fjall::{Database, Keyspace};
+use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::atomic::AtomicBool;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 /// One fjall database shared by every test in the process, created once.
 static SHARED_DB: LazyLock<Result<(Database, TempDir), String>> = LazyLock::new(|| {
@@ -71,12 +74,22 @@ pub fn cache_with_clock(name: &str, clock: Clock) -> Result<FjallCellCache> {
     Ok(FjallCellCache::with_clock(database, cache, index, clock))
 }
 
-/// Returns a marker-check handle for the named test workspace.
+/// Returns a cold marker-check set over a new, uniquely named index keyspace.
 ///
-/// A store that models a new assignment needs a cold check set; the Cassandra
-/// `MarkerMemo` doc owns the rule.
+/// Each call models a new assignment. The keyspace is never shared or cleared.
+/// Creation costs one directory `fsync` (~128 ms on APFS).
+pub fn cold_marker_checks() -> Result<MarkerCheckSet> {
+    let database = shared_database()?;
+    let name = format!("cassandra_cell_checks_{}_index", Uuid::new_v4().simple());
+    let index = database.keyspace(&name, keyspace_options)?;
+    Ok(MarkerCheckSet {
+        index,
+        disabled: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+/// Returns a marker-check handle for the named test workspace.
 pub fn marker_checks(name: &str) -> Result<MarkerCheckSet> {
-    // Create the handle through the cache to share its disabled state.
     Ok(cache(name)?.marker_checks())
 }
 

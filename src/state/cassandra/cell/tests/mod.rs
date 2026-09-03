@@ -234,7 +234,6 @@ struct Fixture {
     cassandra: CassandraSession,
     queries: Arc<CellQueries>,
     registry: Arc<CollectionDefRegistry>,
-    marker_checks: MarkerCheckSet,
 }
 
 async fn fixture() -> Result<Fixture> {
@@ -245,19 +244,14 @@ async fn fixture() -> Result<Fixture> {
         cassandra,
         queries,
         registry: Arc::new(CollectionDefRegistry::default()),
-        marker_checks: test_db::marker_checks("cassandra_cell_presence")?,
     })
 }
 
 impl Fixture {
-    /// Returns a Cassandra store that uses the fixture's marker-check set.
-    ///
-    /// All stores from one fixture share one warm check set. Collections are
-    /// fresh per test. A test that builds a second store over a collection
-    /// uses an exclusive check set and clears it first (see
-    /// `batch_bind.rs`).
-    fn bottom_store(&self, oracle: ScriptedOracle) -> CassandraStore<ScriptedOracle> {
-        self.bottom_store_with(oracle, self.marker_checks.clone())
+    /// Returns a Cassandra store with a cold check set.
+    /// Each store models a new assignment.
+    fn bottom_store<O: CommitOracle>(&self, oracle: O) -> Result<CassandraStore<O>> {
+        Ok(self.bottom_store_with(oracle, test_db::cold_marker_checks()?))
     }
 
     /// Returns a Cassandra store with an explicit marker-check set.

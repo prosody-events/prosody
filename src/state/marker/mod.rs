@@ -177,6 +177,21 @@ impl EventMarker {
     pub fn clears(&self) -> &[SectionClear] {
         &self.inner.clears
     }
+
+    /// Reports whether the marker carries at least one section clear.
+    #[must_use]
+    pub(crate) fn has_clears(&self) -> bool {
+        !self.inner.clears.is_empty()
+    }
+
+    /// Reports whether the marker is another event's marker with a section
+    /// clear.
+    ///
+    /// A read by `own` must resolve such a marker before it reads.
+    #[must_use]
+    pub(crate) fn is_prior_clear(&self, own: EventRef) -> bool {
+        self.event() != own && self.has_clears()
+    }
 }
 
 /// Encodes an [`EventMarker`]'s payload — everything but its `event` — to the

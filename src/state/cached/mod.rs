@@ -46,6 +46,21 @@
 //! stale. Remove old entries when an update fails after a durable write.
 //! Use the expiry stamp for time-based removal.
 //!
+//! The must-succeed sites, by verb:
+//! - `write_provisional` removes a prior event marker's staged entries and
+//!   cleared sections. It resets the cold seed after a failed lower stage or a
+//!   failed index record.
+//! - `write_resolved` removes an unsettled clear's entries, the cleared
+//!   sections, and the written cells.
+//! - `mark_resolved` removes the promoted cells.
+//! - `commit_provisional` installs the settle transform, or removes the staged
+//!   entries if the transform fails. It removes the committed sections' other
+//!   entries.
+//! - `publish_written` removes the cells of a failed publish.
+//!
+//! A provisional-index clear after a resolution is not a repair site. A failed
+//! clear only over-reports a cell to the sweep, so it warns and continues.
+//!
 //! A required removal retries for a bounded period.
 //! A final failure disables the cache for the assignment.
 //! The failure does not stop durable state settlement.
@@ -112,7 +127,6 @@ use super::event_ref::EventRef;
 use super::fjall::{CacheRead, FjallCellCache, FjallCellCacheError};
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::{EventMarker, SectionClear};
-use super::resolve::{PriorEventClear, UnsettledClear};
 use super::store::{
     CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, section_batches,
 };
@@ -201,9 +215,6 @@ impl<L> Cached<L> {
 
     /// Removes cache entries that an event marker can change.
     ///
-    /// Takes the marker, not a clear type: the stage boundary evicts for any
-    /// prior event marker, with or without clears.
-    ///
     /// A failed removal disables the cache.
     async fn evict_marker_cache_entries(&self, collection: &CollectionId, marker: &EventMarker) {
         retry_delete(&self.fjall, "marker staged", || {
@@ -272,10 +283,9 @@ where
         own: EventRef,
     ) -> Result<(), L::Error> {
         if let Some(marker) = self.lower.unsettled_marker(collection).await?
-            && let Some(clear) = PriorEventClear::new(&marker, own)
+            && marker.is_prior_clear(own)
         {
-            self.evict_marker_cache_entries(collection, clear.marker())
-                .await;
+            self.evict_marker_cache_entries(collection, &marker).await;
         }
         Ok(())
     }
@@ -664,9 +674,9 @@ where
         // Remove entries that an unsettled section clear can change.
         // Do this before the lower store resolves the clear.
         if let Some(unsettled) = self.lower.unsettled_marker(collection.id()).await?
-            && let Some(clear) = UnsettledClear::new(&unsettled)
+            && unsettled.has_clears()
         {
-            self.evict_marker_cache_entries(collection.id(), clear.marker())
+            self.evict_marker_cache_entries(collection.id(), &unsettled)
                 .await;
         }
         // Remove each cleared section before the lower write.

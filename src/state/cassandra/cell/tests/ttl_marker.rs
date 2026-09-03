@@ -13,7 +13,7 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
+    let store = fx.bottom_store(ScriptedOracle::default())?;
     let ttl = CompactDuration::new(3_600);
     let old = Bytes::from_static(b"old");
 
@@ -61,7 +61,7 @@ async fn event_marker_co_expires_with_collection_ttl() -> Result<()> {
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
+    let store = fx.bottom_store(ScriptedOracle::default())?;
     let c = CollectionRef::new(
         collection("marker-ttl")?.id().clone(),
         Some(CompactDuration::new(TTL)),
@@ -131,7 +131,7 @@ async fn stage_boundary_deletes_foreign_marker_entries() -> Result<()> {
     let oracle = ScriptedOracle::default();
     let store = Cached::new(
         test_db::cache("cassandra_boundary_delete")?,
-        fx.bottom_store(oracle.clone()),
+        fx.bottom_store(oracle.clone())?,
     );
     let c = collection("boundary-delete")?;
     let id = c.id().clone();

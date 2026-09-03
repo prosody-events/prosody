@@ -78,7 +78,7 @@ fn cassandra_blind_write_leaves_clears_free_marker() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let fx = fixture().await?;
-        let store = fx.bottom_store(ScriptedOracle::default());
+        let store = fx.bottom_store(ScriptedOracle::default())?;
         let probe = CassandraShapeProbe {
             session: fx.cassandra.clone(),
         };
@@ -87,7 +87,7 @@ fn cassandra_blind_write_leaves_clears_free_marker() -> Result<()> {
 }
 
 /// Regression test over the production `Cached<CassandraStore>` assembly: a
-/// repair whose payload predates an unsettled committed clears-bearing marker
+/// repair whose payload predates a committed but unsettled marker with clears
 /// defers to peek semantics beneath the cache, so the marker's own resolution
 /// (the committed positional clear) erases the cell instead of a stale repair
 /// resurrecting it. The section-clear cache guard clear-eviction beats the
@@ -103,7 +103,7 @@ fn cassandra_repair_defers_beneath_stale_clear() -> Result<()> {
         // is a fresh cold assignment: a cold cache whose own marker check is
         // cold, so `x` never warms it and the Cached read cold-seeds from
         // durable truth, reaching `resolve_cell`.
-        let stage = fx.bottom_store(oracle.clone());
+        let stage = fx.bottom_store(oracle.clone())?;
         let cache = test_db::cold_cache("cassandra_repair_defer")?;
         let presence = cache.marker_checks();
         let store = Cached::new(cache, fx.bottom_store_with(oracle.clone(), presence));
@@ -122,7 +122,7 @@ fn cassandra_repair_after_marker_abort_converges() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let fx = fixture().await?;
         let oracle = ScriptedOracle::default();
-        let stage = fx.bottom_store(oracle.clone());
+        let stage = fx.bottom_store(oracle.clone())?;
         let cache = test_db::cold_cache("cassandra_repair_abort")?;
         let presence = cache.marker_checks();
         let store = Cached::new(cache, fx.bottom_store_with(oracle.clone(), presence));
@@ -145,7 +145,7 @@ fn prop_cassandra_apply_idempotence() {
         let probe = CassandraShapeProbe {
             session: fx.cassandra.clone(),
         };
-        run_apply_idempotence(fx.bottom_store(oracle.clone()), oracle, input, &probe).await
+        run_apply_idempotence(fx.bottom_store(oracle.clone())?, oracle, input, &probe).await
     }
 
     init_test_logging();
@@ -195,7 +195,7 @@ fn prop_cassandra_cell_implicit_overwrite() {
 fn assembly(fx: &Fixture) -> Result<Bottom> {
     Ok(Cached::new(
         test_db::cache("cassandra_overlay")?,
-        fx.bottom_store(ScriptedOracle::default()),
+        fx.bottom_store(ScriptedOracle::default())?,
     ))
 }
 
@@ -230,7 +230,7 @@ fn prop_cassandra_bottom_scan() {
         let probe = CassandraShapeProbe {
             session: fx.cassandra.clone(),
         };
-        run_bottom_scan_trace(fx.bottom_store(ScriptedOracle::default()), trace, &probe).await
+        run_bottom_scan_trace(fx.bottom_store(ScriptedOracle::default())?, trace, &probe).await
     }
 
     init_test_logging();

@@ -339,7 +339,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// strand. A **clears-only** stage is representable as `writes = []` with
     /// a marker whose `staged()` is empty and `clears()` non-empty; it writes
     /// the marker and runs the boundary check like any stage, because a
-    /// committed-unapplied clear is recoverable state.
+    /// committed but unsettled clear is recoverable state.
     ///
     /// Before staging, the backend resolves any unsettled marker naming a
     /// **different** event — the stage-boundary rule that keeps marker

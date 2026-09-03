@@ -445,7 +445,7 @@ enum Outcome {
     CrashMidFanOut,
     /// Commit marker recorded (committed), then the settle attempt fails under
     /// a poison armed at the generated [`FaultDepth`]: the stage lingers over
-    /// the **warm** in-process store — the committed-unapplied window (on a
+    /// the **warm** in-process store — the unsettled-clear window (on a
     /// `Cached` instantiation, `Wrapper` depth leaves the settle transform
     /// unrun, and `Lower` depth leaves it run with the cleared sections
     /// deleted).
@@ -527,7 +527,7 @@ struct TraceEvent {
     /// blind-clears dimension would need gap-trim modelling, and
     /// `write_resolved`'s clears leg keeps its coverage through the stage path.
     /// Their whole purpose is to land into a section whose PRIOR event's
-    /// clears-bearing marker remains unsettled, so the write-side boundary
+    /// marker with clears remains unsettled, so the write-side boundary
     /// (`resolve_unsettled_clear_before_write`) is exercised over generated
     /// traces.
     blind: Vec<(u8, u8, u8, Mutation)>,
@@ -775,7 +775,7 @@ type StagedWrites = Vec<(u8, Vec<(CellKey, ProvisionalWrite)>, Vec<SectionClear>
 /// marker whose `staged()` is empty and `clears()` non-empty.
 ///
 /// `stale_prev_ok[i]` accepts a stale prev-read on collection `i`: a restage
-/// over a **warm** committed-unapplied stage (a settle failure with the
+/// over a **warm** stage with an unsettled clear (a settle failure with the
 /// in-process cache intact) may legitimately read the warm pre-settle value
 /// — the accepted bounded window. The staged prev still feeds the write, so a
 /// later rollback restores exactly what was read (mirrored in the model by the
@@ -862,7 +862,7 @@ impl TraceState {
     /// coordinate becomes the **staged prev** — exactly what
     /// `abort_provisional` / first-touch rollback durably restores. Normally
     /// a no-op (the staged prev was checked equal to the model); in the
-    /// accepted warm committed-unapplied window it faithfully captures the
+    /// accepted warm unsettled-clear window it faithfully captures the
     /// restage's stale-read rollback.
     fn apply_rollback(&mut self, slot: usize, writes: &[(CellKey, ProvisionalWrite)]) {
         for (cell, write) in writes {
@@ -912,8 +912,8 @@ impl TraceState {
     /// Issues one event's blind resolved writes against `store` (the
     /// mid-handler `commit()` / `ReadUncommitted` direct apply) and keeps
     /// the model in step. Grouped by collection (last-writer-wins per
-    /// cell); each collection's write settles any unsettled clears-bearing
-    /// marker in the model ([`Self::apply_write_help`]) before the cells
+    /// cell); each collection's write settles any unsettled marker with clears
+    /// in the model ([`Self::apply_write_help`]) before the cells
     /// land, then the blind cells advance the model. A clears-FREE marker's
     /// deferral survives the boundary no-op, so the blind-overwritten cells
     /// are trimmed from it — the marker's eventual resolution drops them
@@ -1024,7 +1024,7 @@ impl TraceState {
                 // short-circuits; the read resolves each staged provisional
                 // cell. A clears-free marker lingers (first-touch is
                 // marker-free — the over-report the model keeps); a
-                // clears-bearing marker is resolved complete by the first get
+                // marker with clears is resolved complete by the first get
                 // (clear resolution), which `note_read_help` accounts for after the
                 // convergence pass.
                 let recovery_event = EventRef::Message {
@@ -1079,7 +1079,7 @@ impl TraceState {
             match ev.outcome {
                 Outcome::SettleFailure(depth) => {
                     // Committed, then the settle fails under the armed poison
-                    // — the committed-unapplied window over the WARM store.
+                    // — the unsettled-clear window over the WARM store.
                     // `Wrapper` fires outside the store under test (the settle
                     // provably never reaches it: durable state and any warm
                     // entries stay exactly as staged); `Lower` fires beneath
@@ -1230,8 +1230,8 @@ where
 
 /// The per-event closing pass: convergence + row shape wait for deferred
 /// collections; marker shape and marker completeness never wait (read-only
-/// probes). The convergence pass's own reads resolve prior event clears-bearing
-/// markers (clear resolution), which `note_read_help` folds into the marker
+/// probes). The convergence pass's own reads resolve prior event markers with
+/// clears (clear resolution), which `note_read_help` folds into the marker
 /// model before the physical probe.
 async fn assert_event_end<S, P>(
     store: &S,
@@ -1337,7 +1337,7 @@ where
         // Blind resolved writes run at the TOP of the event, before any stage —
         // the mid-handler `commit()` / `ReadUncommitted` direct apply — so each
         // lands after the write-side boundary resolves any unsettled
-        // clears-bearing marker (the defect this phase closes).
+        // marker with clears (the defect this phase closes).
         state.apply_blind_writes(&store, &refs, &ev.blind).await?;
 
         // Mid-fan-out tears at CELL granularity: a whole-cell prefix of the
@@ -1374,7 +1374,7 @@ where
 
         // Restaging a deferred collection resolves its lingering stage — the
         // prev-reads first-touch-resolve overlapping cells (clear resolution resolves
-        // a clears-bearing marker whole) and the stage boundary mops up the
+        // a marker with clears whole) and the stage boundary mops up the
         // rest, so apply the deferred verdict to the model before the prev
         // check. A warm deferral additionally permits a stale prev-read (see
         // `stage_event`).
@@ -1482,7 +1482,7 @@ where
         dedup_id: Uuid::from_u128(1),
     };
 
-    // Stage collection 0's committed clears-bearing marker and leave it unsettled
+    // Stage collection 0's committed marker with clears and leave it unsettled
     // (do NOT settle) — exactly the shape a failed settle leaves behind.
     let survivor = cell_in(0, 0);
     let prev = store.get(refs[0].id(), &survivor, event_a).await?;
@@ -1598,7 +1598,7 @@ where
 /// over `{x}` then RESTAGE F over `{y}` (the same-event restage overwrites F's
 /// marker WITHOUT resolving it — the stage boundary resolves only prior event
 /// markers — so `x` is left provisional and UNLISTED by any marker), then stage
-/// event E over survivor `s` with a clears-bearing marker on `SECTIONS[0]` (E's
+/// event E over survivor `s` whose marker clears `SECTIONS[0]` (E's
 /// stage boundary aborts the now-prior event `F:{y}` marker; `x` stays
 /// untouched and unlisted). F is never recorded (it crashed before its dedup
 /// record), so its verdict is `NotCommitted`. Returns `(x, s, event_e)`.
@@ -1655,7 +1655,7 @@ where
         .write_provisional(cref, &f_second, Some(&f_second_marker))
         .await?;
 
-    // Stage E over survivor s with a clears-bearing marker: the stage boundary
+    // Stage E over survivor s with a marker with clears: the stage boundary
     // resolves the now-prior event F:{y} marker (F unrecorded → NotCommitted →
     // abort), leaving E's marker unsettled and x still orphaned provisional.
     let e_writes = vec![(
@@ -1672,8 +1672,8 @@ where
 }
 
 /// Deterministic regression test (both backends): a repair whose payload
-/// predates an unsettled clears-bearing marker must not land after that marker
-/// resolves. Beneath E's committed clears-bearing marker, `resolve_cell`
+/// predates an unsettled marker with clears must not land after that marker
+/// resolves. Beneath E's committed marker with clears, `resolve_cell`
 /// degrades `x`'s repair to peek semantics (value-only, no durable write), so
 /// E's marker remains unsettled and the marker's own resolution — the committed
 /// positional clear — erases `x` instead of a stale repair resurrecting it.
@@ -1720,7 +1720,7 @@ where
     );
     ensure!(
         probe.unsettled_marker(id).await?.map(|(ev, ..)| ev) == Some(event_e),
-        "the repair must not resolve E's unsettled clears-bearing marker"
+        "the repair must not resolve E's unsettled marker with clears"
     );
 
     // Resolving E the way production does replays its positional clear, erasing

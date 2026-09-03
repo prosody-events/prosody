@@ -8,7 +8,7 @@ use super::*;
 async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
+    let store = fx.bottom_store(ScriptedOracle::default())?;
     let c = collection("cart")?;
     let cell = value_cell();
     let data = Bytes::from_static(b"v1");
@@ -91,7 +91,7 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
     let fx = fixture().await?;
     // Keep a clone of the bottom store so we can read its recovery counters; the
     // clone shares the same `Arc` counters as the one inside `Cached`.
-    let bottom = fx.bottom_store(ScriptedOracle::default());
+    let bottom = fx.bottom_store(ScriptedOracle::default())?;
     let counts = bottom.recovery_reads();
     let store = Cached::new(test_db::cache("cassandra_warm")?, bottom);
     let c = collection("warm-quiescence")?;
@@ -186,7 +186,7 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
     for committed in [32u32, 512] {
-        let store = fx.bottom_store(ScriptedOracle::default());
+        let store = fx.bottom_store(ScriptedOracle::default())?;
         let c = collection(&format!("bounded-{committed}"))?;
 
         // `committed` resolved cells: the write never writes the marker slice,
@@ -384,7 +384,7 @@ async fn committed_clear_deletes_the_row() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
     let oracle = ScriptedOracle::default();
-    let store = fx.bottom_store(oracle.clone());
+    let store = fx.bottom_store(oracle.clone())?;
     let c = collection("clear-deletes")?;
     let cell = value_cell();
     let old = Bytes::from_static(b"old");

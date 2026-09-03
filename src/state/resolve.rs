@@ -66,42 +66,10 @@ impl<O> Resolver<O> {
     }
 }
 
-/// A marker that has at least one section clear.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct UnsettledClear<'a>(&'a EventMarker);
-
-impl<'a> UnsettledClear<'a> {
-    #[must_use]
-    pub(crate) fn new(marker: &'a EventMarker) -> Option<Self> {
-        (!marker.clears().is_empty()).then_some(Self(marker))
-    }
-
-    #[must_use]
-    pub(crate) fn marker(self) -> &'a EventMarker {
-        self.0
-    }
-}
-
-/// A section clear from an event other than the current event.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PriorEventClear<'a>(UnsettledClear<'a>);
-
-impl<'a> PriorEventClear<'a> {
-    #[must_use]
-    pub(crate) fn new(marker: &'a EventMarker, current_event: EventRef) -> Option<Self> {
-        (marker.event() != current_event)
-            .then(|| UnsettledClear::new(marker))
-            .flatten()
-            .map(Self)
-    }
-
-    #[must_use]
-    pub(crate) fn marker(self) -> &'a EventMarker {
-        self.0.marker()
-    }
-}
-
 /// Reports whether read preparation changed durable state.
+///
+/// A concurrent reader re-reads on `DurableStateChanged`. A reader that starts
+/// after the resolution discards the value.
 #[must_use]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadPreparation {
@@ -240,8 +208,7 @@ where
         .await
         .map_err(ResolveCellError::Store)?
         .as_ref()
-        .and_then(UnsettledClear::new)
-        .is_some();
+        .is_some_and(EventMarker::has_clears);
     if deferred {
         return Ok(Committed::new(match decision {
             CommitDecision::Committed => provisional.into_data(),
@@ -380,17 +347,17 @@ where
     S: CellStore,
     O: CommitOracle,
 {
-    let Some(clear) = marker.and_then(UnsettledClear::new) else {
+    let Some(marker) = marker.filter(|marker| marker.has_clears()) else {
         return Ok(());
     };
-    resolve_event_marker(store, oracle, collection, clear.marker()).await
+    resolve_event_marker(store, oracle, collection, marker).await
 }
 
 /// Resolves a prior event's section clear before a read.
 ///
-/// Resolves the marker only when it is a prior event's section clear.
-/// A concurrent raw read must run again when this function changes durable
-/// state.
+/// Resolves the marker only when it is another event's marker with a section
+/// clear. A concurrent raw read must run again when this function changes
+/// durable state.
 pub(crate) async fn resolve_prior_clear_before_read<S, O>(
     store: &S,
     oracle: &O,
@@ -402,10 +369,10 @@ where
     S: CellStore,
     O: CommitOracle,
 {
-    let Some(clear) = marker.and_then(|marker| PriorEventClear::new(marker, own)) else {
+    let Some(marker) = marker.filter(|marker| marker.is_prior_clear(own)) else {
         return Ok(ReadPreparation::Unchanged);
     };
-    resolve_event_marker(store, oracle, collection, clear.marker()).await?;
+    resolve_event_marker(store, oracle, collection, marker).await?;
     Ok(ReadPreparation::DurableStateChanged)
 }
 
