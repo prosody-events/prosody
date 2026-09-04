@@ -89,6 +89,7 @@ use async_stream::try_stream;
 use bytes::{Bytes, BytesMut};
 use educe::Educe;
 use futures::stream::{Stream, StreamExt};
+use std::borrow::Borrow;
 use std::error::Error;
 use std::fmt::Display;
 use std::num::NonZeroUsize;
@@ -215,6 +216,7 @@ const KEYSET_MAX_ENTRIES: usize = KEYSET_BYTE_CEILING / 4;
 pub(crate) struct MapKeysetKey;
 
 impl OrderedKeyCodec for MapKeysetKey {
+    type Borrowed = ();
     type Key = ();
 
     fn encode((): &()) -> Coordinate {
@@ -445,30 +447,42 @@ impl<'a, S, KC, V> MapQuery<'a, S, KC, V>
 where
     S: StateSession,
     KC: OrderedKeyCodec + 'static,
-    KC::Key: Display,
+    KC::Borrowed: Display,
     V: CellType<Key = UnitKey>,
 {
     /// Starts at `key`.
-    pub fn from(mut self, key: &KC::Key) -> Self {
-        self.constraints.start = ScanEdge::Included(KC::encode(key));
+    pub fn from<Q>(mut self, key: &Q) -> Self
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
+        self.constraints.start = ScanEdge::Included(KC::encode(key.borrow()));
         self
     }
 
     /// Starts after `key`.
-    pub fn after(mut self, key: &KC::Key) -> Self {
-        self.constraints.start = ScanEdge::Excluded(KC::encode(key));
+    pub fn after<Q>(mut self, key: &Q) -> Self
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
+        self.constraints.start = ScanEdge::Excluded(KC::encode(key.borrow()));
         self
     }
 
     /// Stops at `key`.
-    pub fn to(mut self, key: &KC::Key) -> Self {
-        self.constraints.end = ScanEdge::Included(KC::encode(key));
+    pub fn to<Q>(mut self, key: &Q) -> Self
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
+        self.constraints.end = ScanEdge::Included(KC::encode(key.borrow()));
         self
     }
 
     /// Stops before `key`.
-    pub fn before(mut self, key: &KC::Key) -> Self {
-        self.constraints.end = ScanEdge::Excluded(KC::encode(key));
+    pub fn before<Q>(mut self, key: &Q) -> Self
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
+        self.constraints.end = ScanEdge::Excluded(KC::encode(key.borrow()));
         self
     }
 
@@ -534,7 +548,7 @@ where
     }
 }
 
-// `KC::Key: Display` exists only so the operation spans can record the map
+// `KC::Borrowed: Display` exists only so operation spans can record the map
 // key as a joinable attribute (Debug would quote strings); every real key
 // (`String`, `i64`, `u64`) already satisfies it, and no other map machinery
 // needs it.
@@ -543,7 +557,7 @@ impl<S, KC, V> MapHandle<S, KC, V>
 where
     S: StateSession,
     KC: OrderedKeyCodec + 'static,
-    KC::Key: Display,
+    KC::Borrowed: Display,
     V: CellType<Key = UnitKey>,
 {
     /// Reads and resolves the value for `key` (`None` when absent).
@@ -555,14 +569,17 @@ where
     #[instrument(
         name = "map.get",
         skip_all,
-        fields(collection = self.cells.name().as_str(), map.key = %key),
+        fields(collection = self.cells.name().as_str(), map.key = %<Q as Borrow<KC::Borrowed>>::borrow(key)),
         err
     )]
     #[read(op)]
-    pub async fn get(
+    pub async fn get<Q>(
         &self,
-        key: &KC::Key,
-    ) -> Result<Option<ResolvedOf<V>>, MapStateError<CellCodecError<V>>> {
+        key: &Q,
+    ) -> Result<Option<ResolvedOf<V>>, MapStateError<CellCodecError<V>>>
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
         Ok(op.get(MapKind::<KC, V>::ENTRIES, key).await?)
     }
 
@@ -586,14 +603,14 @@ where
     #[instrument(
         name = "map.contains_key",
         skip_all,
-        fields(collection = self.cells.name().as_str(), map.key = %key),
+        fields(collection = self.cells.name().as_str(), map.key = %<Q as Borrow<KC::Borrowed>>::borrow(key)),
         err
     )]
     #[read(op)]
-    pub async fn contains_key(
-        &self,
-        key: &KC::Key,
-    ) -> Result<bool, MapStateError<CellCodecError<V>>> {
+    pub async fn contains_key<Q>(&self, key: &Q) -> Result<bool, MapStateError<CellCodecError<V>>>
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
         Ok(op.contains(MapKind::<KC, V>::ENTRIES, key).await?)
     }
 
@@ -606,8 +623,9 @@ where
     /// close — can interleave anywhere inside this call. Isolation does not
     /// freeze wall-clock TTL passage; how deduplicated and cross-batch cells
     /// are timed is the store layer's batch-read observation contract, stated
-    /// once on the internal batch-read verb. This method adds only the
-    /// user-sized `Vec`, no observation behavior of its own.
+    /// once on the internal batch-read verb. The result reserves the
+    /// iterator's lower size bound. An exact-size iterator allocates the
+    /// result once. Another iterator can grow the result.
     ///
     /// Keys are addressed directly — there is no keyset consult, so a key
     /// outside the tracked keyset simply reads `None`.
@@ -621,22 +639,28 @@ where
     #[instrument(
         name = "map.get_many",
         skip_all,
-        fields(collection = self.cells.name().as_str(), keys = keys.len() as i64),
+        fields(collection = self.cells.name().as_str()),
         err
     )]
     #[read(op)]
-    pub async fn get_many(
+    pub async fn get_many<'a, I, Q>(
         &self,
-        keys: &[KC::Key],
-    ) -> Result<Vec<Option<ResolvedOf<V>>>, MapStateError<CellCodecError<V>>> {
+        keys: I,
+    ) -> Result<Vec<Option<ResolvedOf<V>>>, MapStateError<CellCodecError<V>>>
+    where
+        I: IntoIterator<Item = &'a Q>,
+        I::IntoIter: Send,
+        Q: Borrow<KC::Borrowed> + Sync + ?Sized + 'a,
+    {
         Ok(op
-            .get_many(MapKind::<KC, V>::ENTRIES, keys)
+            .get_many(MapKind::<KC, V>::ENTRIES, keys.into_iter())
             .await?
             .into_vec())
     }
 
     /// Tests `keys` for presence as one aligned batch. `results[i]` answers
-    /// `keys[i]`. Duplicate keys keep their positions.
+    /// `keys[i]`. Duplicate keys keep their positions. Result allocation uses
+    /// the same iterator size policy as [`get_many`](Self::get_many).
     ///
     /// # Errors
     ///
@@ -644,16 +668,21 @@ where
     #[instrument(
         name = "map.contains_many",
         skip_all,
-        fields(collection = self.cells.name().as_str(), keys = keys.len() as i64),
+        fields(collection = self.cells.name().as_str()),
         err
     )]
     #[read(op)]
-    pub async fn contains_many(
+    pub async fn contains_many<'a, I, Q>(
         &self,
-        keys: &[KC::Key],
-    ) -> Result<Vec<bool>, MapStateError<CellCodecError<V>>> {
+        keys: I,
+    ) -> Result<Vec<bool>, MapStateError<CellCodecError<V>>>
+    where
+        I: IntoIterator<Item = &'a Q>,
+        I::IntoIter: Send,
+        Q: Borrow<KC::Borrowed> + Sync + ?Sized + 'a,
+    {
         Ok(op
-            .contains_many(MapKind::<KC, V>::ENTRIES, keys)
+            .contains_many(MapKind::<KC, V>::ENTRIES, keys.into_iter())
             .await?
             .into_vec())
     }
@@ -669,15 +698,18 @@ where
     #[instrument(
         name = "map.set",
         skip_all,
-        fields(collection = self.cells.name().as_str(), map.key = %key),
+        fields(collection = self.cells.name().as_str(), map.key = %<Q as Borrow<KC::Borrowed>>::borrow(key)),
         err
     )]
     #[write(op)]
-    pub async fn set(
+    pub async fn set<Q>(
         &self,
-        key: KC::Key,
+        key: &Q,
         value: WriteOf<'_, V>,
-    ) -> Result<(), MapStateError<CellCodecError<V>>> {
+    ) -> Result<(), MapStateError<CellCodecError<V>>>
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
         // Read the keyset *before* staging the entry: own writes are visible to
         // own reads, and the transition depends on the pre-set frame.
         //
@@ -686,9 +718,9 @@ where
         // the only collection that needs the coordinate at the call site. A
         // coordinate-addressed mutation command on `CollectionWrite` would
         // therefore serve one caller, so keep the second encode.
-        let coordinate = KC::encode(&key);
+        let coordinate = KC::encode(key.borrow());
         let prior = read_keyset_state(op).await?;
-        op.set(MapKind::<KC, V>::ENTRIES, &key, value)?;
+        op.set(MapKind::<KC, V>::ENTRIES, key, value)?;
         update_keyset(op, coordinate, prior)
     }
 
@@ -705,12 +737,15 @@ where
     #[instrument(
         name = "map.remove",
         skip_all,
-        fields(collection = self.cells.name().as_str(), map.key = %key),
+        fields(collection = self.cells.name().as_str(), map.key = %<Q as Borrow<KC::Borrowed>>::borrow(key)),
         err
     )]
     #[write(op)]
-    pub async fn remove(&self, key: &KC::Key) -> Result<(), MapStateError<CellCodecError<V>>> {
-        let coordinate = KC::encode(key);
+    pub async fn remove<Q>(&self, key: &Q) -> Result<(), MapStateError<CellCodecError<V>>>
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
+        let coordinate = KC::encode(key.borrow());
         let prior = read_keyset_state(op).await?;
         op.clear(MapKind::<KC, V>::ENTRIES, key);
         subtract_keyset(op, &coordinate, prior)
@@ -1156,7 +1191,7 @@ pub(crate) fn decoded_key_list<KC: OrderedKeyCodec>(
     let mut keys = Vec::with_capacity(coordinates.len());
     for coordinate in coordinates {
         let key = KC::decode(coordinate.as_bytes()).ok()?;
-        if KC::encode(&key) != *coordinate {
+        if KC::encode_owned(&key) != *coordinate {
             return None;
         }
         keys.push(key);

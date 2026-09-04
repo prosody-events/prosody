@@ -11,6 +11,7 @@ use crate::codec::Codec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::Coordinate;
 use bytes::{Bytes, BytesMut};
+use std::borrow::Borrow;
 use std::str::{Utf8Error, from_utf8};
 use thiserror::Error;
 
@@ -36,6 +37,12 @@ use thiserror::Error;
 ///   Held by construction when `serialize`/`deserialize` delegate to
 ///   `encode`/`decode`, as every impl here does.
 pub trait OrderedKeyCodec: Codec<Payload = Self::Key, Error = KeyCodecError> {
+    /// The borrowed key form accepted by point operations.
+    ///
+    /// The owned key must borrow this type without changing its order or
+    /// encoded bytes. For example, a `String` key borrows `str`.
+    type Borrowed: Ord + ?Sized;
+
     /// The logical key type, ordered to match its encoded byte order.
     ///
     /// `Send + Sync + 'static`, not merely `Ord`: a typed scan yields the
@@ -43,10 +50,15 @@ pub trait OrderedKeyCodec: Codec<Payload = Self::Key, Error = KeyCodecError> {
     /// ride as a [`Codec`] payload (so it must be
     /// `Sync + 'static`). Every real key (`String`, `i64`, `u64`, `()`)
     /// already satisfies it.
-    type Key: Ord + Send + Sync + 'static;
+    type Key: Borrow<Self::Borrowed> + Ord + Send + Sync + 'static;
 
     /// Encodes a key to its order-preserving bytes.
-    fn encode(key: &Self::Key) -> Coordinate;
+    fn encode(key: &Self::Borrowed) -> Coordinate;
+
+    /// Encodes an owned key through its borrowed form.
+    fn encode_owned(key: &Self::Key) -> Coordinate {
+        Self::encode(key.borrow())
+    }
 
     /// Decodes order-preserving bytes back to the logical key.
     ///
@@ -73,6 +85,7 @@ pub trait OrderedKeyCodec: Codec<Payload = Self::Key, Error = KeyCodecError> {
 pub struct UnitKey;
 
 impl OrderedKeyCodec for UnitKey {
+    type Borrowed = ();
     type Key = ();
 
     fn encode((): &Self::Key) -> Coordinate {
@@ -140,10 +153,11 @@ pub fn order_preserving_i64_decode(bytes: [u8; 8]) -> i64 {
 pub struct Utf8KeyCodec;
 
 impl OrderedKeyCodec for Utf8KeyCodec {
+    type Borrowed = str;
     type Key = String;
 
-    fn encode(key: &Self::Key) -> Coordinate {
-        Coordinate::from_bytes(key.clone().into_bytes())
+    fn encode(key: &Self::Borrowed) -> Coordinate {
+        Coordinate::from_bytes(Bytes::copy_from_slice(key.as_bytes()))
     }
 
     fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError> {
@@ -199,6 +213,7 @@ impl Codec for Utf8KeyCodec {
 pub struct I64KeyCodec;
 
 impl OrderedKeyCodec for I64KeyCodec {
+    type Borrowed = i64;
     type Key = i64;
 
     fn encode(key: &Self::Key) -> Coordinate {
@@ -242,6 +257,7 @@ impl Codec for I64KeyCodec {
 pub struct U64KeyCodec;
 
 impl OrderedKeyCodec for U64KeyCodec {
+    type Borrowed = u64;
     type Key = u64;
 
     fn encode(key: &Self::Key) -> Coordinate {

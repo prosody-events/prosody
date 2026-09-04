@@ -21,8 +21,8 @@ where
     C: OrderedKeyCodec,
     C::Key: Clone,
 {
-    let ea = C::encode(&a);
-    let eb = C::encode(&b);
+    let ea = C::encode_owned(&a);
+    let eb = C::encode_owned(&b);
     let monotone = a.cmp(&b) == ea.as_bytes().cmp(eb.as_bytes());
     let round_trips =
         C::decode(ea.as_bytes()).as_ref() == Ok(&a) && C::decode(eb.as_bytes()).as_ref() == Ok(&b);
@@ -118,8 +118,8 @@ fn deque_index_anchors_are_frozen() {
 /// all-zero, unlike the signed `i64` codec).
 #[test]
 fn map_key_coordinate_bytes_are_frozen() {
-    assert_eq!(Utf8KeyCodec::encode(&"cart".to_owned()).as_bytes(), b"cart");
-    assert_eq!(Utf8KeyCodec::encode(&String::new()).as_bytes(), b"");
+    assert_eq!(Utf8KeyCodec::encode("cart").as_bytes(), b"cart");
+    assert_eq!(Utf8KeyCodec::encode("").as_bytes(), b"");
     assert_eq!(
         U64KeyCodec::encode(&0).as_bytes(),
         &[0, 0, 0, 0, 0, 0, 0, 0]
@@ -180,7 +180,7 @@ fn prop_key_codec_payload_bytes_are_coordinate_bytes() {
         let mut borrowed = Vec::new();
         codec.serialize_ref(&key, &mut borrowed).is_ok()
             && borrowed == buf
-            && buf == KC::encode(&key).as_bytes()
+            && buf == KC::encode_owned(&key).as_bytes()
             && codec.deserialize(&mut buf.clone()) == Ok(key.clone())
             && codec.deserialize_owned(BytesMut::from(buf.as_slice())) == Ok(key)
     }

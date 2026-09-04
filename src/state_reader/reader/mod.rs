@@ -45,6 +45,7 @@ use crate::subsystem::SubsystemName;
 use acquisition::{DEFAULT_REFRESH_INTERVAL, PublicationSnapshot};
 use futures::stream::{Stream, StreamExt};
 use quanta::Clock;
+use std::borrow::Borrow;
 use std::fmt::Display;
 use std::num::NonZeroUsize;
 use std::ops::{Bound, RangeBounds};
@@ -226,31 +227,43 @@ where
     B: ReaderBackend<C>,
     C::Payload: Clone,
     KC: OrderedKeyCodec + 'static,
-    KC::Key: Display,
+    KC::Borrowed: Display,
     V: CellType<Key = UnitKey>,
     for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
 {
     /// Starts at `key`.
-    pub fn from(mut self, key: &KC::Key) -> Self {
-        self.constraints.start = ScanEdge::Included(KC::encode(key));
+    pub fn from<Q>(mut self, key: &Q) -> Self
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
+        self.constraints.start = ScanEdge::Included(KC::encode(key.borrow()));
         self
     }
 
     /// Starts after `key`.
-    pub fn after(mut self, key: &KC::Key) -> Self {
-        self.constraints.start = ScanEdge::Excluded(KC::encode(key));
+    pub fn after<Q>(mut self, key: &Q) -> Self
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
+        self.constraints.start = ScanEdge::Excluded(KC::encode(key.borrow()));
         self
     }
 
     /// Stops at `key`.
-    pub fn to(mut self, key: &KC::Key) -> Self {
-        self.constraints.end = ScanEdge::Included(KC::encode(key));
+    pub fn to<Q>(mut self, key: &Q) -> Self
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
+        self.constraints.end = ScanEdge::Included(KC::encode(key.borrow()));
         self
     }
 
     /// Stops before `key`.
-    pub fn before(mut self, key: &KC::Key) -> Self {
-        self.constraints.end = ScanEdge::Excluded(KC::encode(key));
+    pub fn before<Q>(mut self, key: &Q) -> Self
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
+        self.constraints.end = ScanEdge::Excluded(KC::encode(key.borrow()));
         self
     }
 
@@ -322,7 +335,7 @@ where
     B: ReaderBackend<C>,
     C::Payload: Clone,
     KC: OrderedKeyCodec + 'static,
-    KC::Key: Display,
+    KC::Borrowed: Display,
     V: CellType<Key = UnitKey>,
     for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
 {
@@ -332,11 +345,14 @@ where
     /// # Errors
     ///
     /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
-    pub async fn get<K: Into<Key>>(
+    pub async fn get<K: Into<Key>, Q>(
         &self,
         key: K,
-        map_key: &KC::Key,
-    ) -> Result<Option<ResolvedOf<V>>, StateReaderError> {
+        map_key: &Q,
+    ) -> Result<Option<ResolvedOf<V>>, StateReaderError>
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
         let session = self.session(key.into()).await?;
         let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
         handle
@@ -350,11 +366,14 @@ where
     /// # Errors
     ///
     /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
-    pub async fn contains_key<K: Into<Key>>(
+    pub async fn contains_key<K: Into<Key>, Q>(
         &self,
         key: K,
-        map_key: &KC::Key,
-    ) -> Result<bool, StateReaderError> {
+        map_key: &Q,
+    ) -> Result<bool, StateReaderError>
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
         let session = self.session(key.into()).await?;
         let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
         handle
@@ -383,11 +402,17 @@ where
     /// # Errors
     ///
     /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
-    pub async fn get_many<K: Into<Key>>(
+    pub async fn get_many<'a, K, I, Q>(
         &self,
         key: K,
-        map_keys: &[KC::Key],
-    ) -> Result<Vec<Option<ResolvedOf<V>>>, StateReaderError> {
+        map_keys: I,
+    ) -> Result<Vec<Option<ResolvedOf<V>>>, StateReaderError>
+    where
+        K: Into<Key>,
+        I: IntoIterator<Item = &'a Q>,
+        I::IntoIter: Send,
+        Q: Borrow<KC::Borrowed> + Sync + ?Sized + 'a,
+    {
         let session = self.session(key.into()).await?;
         let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
         handle
@@ -402,11 +427,17 @@ where
     /// # Errors
     ///
     /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
-    pub async fn contains_many<K: Into<Key>>(
+    pub async fn contains_many<'a, K, I, Q>(
         &self,
         key: K,
-        map_keys: &[KC::Key],
-    ) -> Result<Vec<bool>, StateReaderError> {
+        map_keys: I,
+    ) -> Result<Vec<bool>, StateReaderError>
+    where
+        K: Into<Key>,
+        I: IntoIterator<Item = &'a Q>,
+        I::IntoIter: Send,
+        Q: Borrow<KC::Borrowed> + Sync + ?Sized + 'a,
+    {
         let session = self.session(key.into()).await?;
         let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
         handle
@@ -477,18 +508,21 @@ where
     B: ReaderBackend<C>,
     C::Payload: Clone,
     KC: OrderedKeyCodec + 'static,
-    KC::Key: Display + 'static,
+    KC::Borrowed: Display,
 {
     /// Reports whether the committed set contains `member`.
     ///
     /// # Errors
     ///
     /// Returns an error when session acquisition or handle binding fails.
-    pub async fn contains<K: Into<Key>>(
+    pub async fn contains<K: Into<Key>, Q>(
         &self,
         key: K,
-        member: &KC::Key,
-    ) -> Result<bool, StateReaderError> {
+        member: &Q,
+    ) -> Result<bool, StateReaderError>
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
         let session = self.session(key.into()).await?;
         let handle: SetHandle<_, KC> = self.descriptor.bind(&session)?;
         handle
@@ -502,11 +536,17 @@ where
     /// # Errors
     ///
     /// Returns an error when session acquisition or handle binding fails.
-    pub async fn contains_many<K: Into<Key>>(
+    pub async fn contains_many<'a, K, I, Q>(
         &self,
         key: K,
-        members: &[KC::Key],
-    ) -> Result<Vec<bool>, StateReaderError> {
+        members: I,
+    ) -> Result<Vec<bool>, StateReaderError>
+    where
+        K: Into<Key>,
+        I: IntoIterator<Item = &'a Q>,
+        I::IntoIter: Send,
+        Q: Borrow<KC::Borrowed> + Sync + ?Sized + 'a,
+    {
         let session = self.session(key.into()).await?;
         let handle: SetHandle<_, KC> = self.descriptor.bind(&session)?;
         handle

@@ -20,6 +20,7 @@ use crate::state::{CollectionKindId, StoreOutcome};
 use async_stream::try_stream;
 use educe::Educe;
 use futures::stream::{Stream, StreamExt};
+use std::borrow::Borrow;
 use std::fmt::Display;
 use std::num::NonZeroUsize;
 use tracing::{Instrument, info_span, instrument};
@@ -119,29 +120,41 @@ impl<'a, S, KC> SetQuery<'a, S, KC>
 where
     S: StateSession,
     KC: OrderedKeyCodec + 'static,
-    KC::Key: Display,
+    KC::Borrowed: Display,
 {
     /// Starts at `key`.
-    pub fn from(mut self, key: &KC::Key) -> Self {
-        self.constraints.start = ScanEdge::Included(KC::encode(key));
+    pub fn from<Q>(mut self, key: &Q) -> Self
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
+        self.constraints.start = ScanEdge::Included(KC::encode(key.borrow()));
         self
     }
 
     /// Starts after `key`.
-    pub fn after(mut self, key: &KC::Key) -> Self {
-        self.constraints.start = ScanEdge::Excluded(KC::encode(key));
+    pub fn after<Q>(mut self, key: &Q) -> Self
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
+        self.constraints.start = ScanEdge::Excluded(KC::encode(key.borrow()));
         self
     }
 
     /// Stops at `key`.
-    pub fn to(mut self, key: &KC::Key) -> Self {
-        self.constraints.end = ScanEdge::Included(KC::encode(key));
+    pub fn to<Q>(mut self, key: &Q) -> Self
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
+        self.constraints.end = ScanEdge::Included(KC::encode(key.borrow()));
         self
     }
 
     /// Stops before `key`.
-    pub fn before(mut self, key: &KC::Key) -> Self {
-        self.constraints.end = ScanEdge::Excluded(KC::encode(key));
+    pub fn before<Q>(mut self, key: &Q) -> Self
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
+        self.constraints.end = ScanEdge::Excluded(KC::encode(key.borrow()));
         self
     }
 
@@ -180,19 +193,22 @@ impl<S, KC> SetHandle<S, KC>
 where
     S: StateSession,
     KC: OrderedKeyCodec + 'static,
-    KC::Key: Display,
+    KC::Borrowed: Display,
 {
     /// Inserts `key` into the set.
     ///
     /// # Errors
     ///
     /// Returns a codec error or a session access error.
-    #[instrument(name = "set.insert", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
+    #[instrument(name = "set.insert", skip_all, fields(collection = self.cells.name().as_str(), set.key = %<Q as Borrow<KC::Borrowed>>::borrow(key)), err)]
     #[write(op)]
-    pub async fn insert(&self, key: KC::Key) -> Result<(), SetStateError> {
-        let coordinate = KC::encode(&key);
+    pub async fn insert<Q>(&self, key: &Q) -> Result<(), SetStateError>
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
+        let coordinate = KC::encode(key.borrow());
         let prior = read_keyset_state(op).await?;
-        op.set(SetKind::<KC>::MEMBERS, &key, ())?;
+        op.set(SetKind::<KC>::MEMBERS, key, ())?;
         update_keyset(op, coordinate, prior)
     }
 
@@ -201,10 +217,13 @@ where
     /// # Errors
     ///
     /// Returns a session access error.
-    #[instrument(name = "set.remove", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
+    #[instrument(name = "set.remove", skip_all, fields(collection = self.cells.name().as_str(), set.key = %<Q as Borrow<KC::Borrowed>>::borrow(key)), err)]
     #[write(op)]
-    pub async fn remove(&self, key: &KC::Key) -> Result<(), SetStateError> {
-        let coordinate = KC::encode(key);
+    pub async fn remove<Q>(&self, key: &Q) -> Result<(), SetStateError>
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
+        let coordinate = KC::encode(key.borrow());
         let prior = read_keyset_state(op).await?;
         op.clear(SetKind::<KC>::MEMBERS, key);
         subtract_keyset(op, &coordinate, prior)
@@ -215,22 +234,31 @@ where
     /// # Errors
     ///
     /// Returns a session access error.
-    #[instrument(name = "set.contains", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
+    #[instrument(name = "set.contains", skip_all, fields(collection = self.cells.name().as_str(), set.key = %<Q as Borrow<KC::Borrowed>>::borrow(key)), err)]
     #[read(op)]
-    pub async fn contains(&self, key: &KC::Key) -> Result<bool, SetStateError> {
+    pub async fn contains<Q>(&self, key: &Q) -> Result<bool, SetStateError>
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized,
+    {
         Ok(op.contains(SetKind::<KC>::MEMBERS, key).await?)
     }
 
-    /// Tests each key for membership in input order.
+    /// Tests each key for membership in input order. The result reserves the
+    /// iterator's lower size bound. An exact-size iterator allocates once.
     ///
     /// # Errors
     ///
     /// Returns a session access error.
-    #[instrument(name = "set.contains_many", skip_all, fields(collection = self.cells.name().as_str(), keys = keys.len() as i64), err)]
+    #[instrument(name = "set.contains_many", skip_all, fields(collection = self.cells.name().as_str()), err)]
     #[read(op)]
-    pub async fn contains_many(&self, keys: &[KC::Key]) -> Result<Vec<bool>, SetStateError> {
+    pub async fn contains_many<'a, I, Q>(&self, keys: I) -> Result<Vec<bool>, SetStateError>
+    where
+        I: IntoIterator<Item = &'a Q>,
+        I::IntoIter: Send,
+        Q: Borrow<KC::Borrowed> + Sync + ?Sized + 'a,
+    {
         Ok(op
-            .contains_many(SetKind::<KC>::MEMBERS, keys)
+            .contains_many(SetKind::<KC>::MEMBERS, keys.into_iter())
             .await?
             .into_vec())
     }

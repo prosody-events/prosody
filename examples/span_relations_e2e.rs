@@ -91,10 +91,7 @@ impl FallibleHandler for SpanProbe {
         // ambient receive span, exercising each kind's instrumentation.
         let state_ops = async {
             context.state(self.cart)?.set(json!({"key": 1_i32})).await?;
-            context
-                .state(self.counts)?
-                .set(key.to_string(), json!(1_i32))
-                .await?;
+            context.state(self.counts)?.set(&key, json!(1_i32)).await?;
             context.state(self.log)?.push_back(json!(2_i32)).await?;
             Ok::<_, Error>(())
         };

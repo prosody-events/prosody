@@ -56,10 +56,10 @@
 
 use crate::codec::{Codec, SerializeBufGuard};
 use crate::state::access::StateAccessError;
-use crate::state::cell_key::{CellKey, Scan, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
 use crate::state::descriptor::{
-    CellCodecError, CellResolver, CellStateError, CellType, CollectionSpec, ContextOf, FromSession,
-    KeyOf, ResolvedOf, StructuralIdentity, WriteOf,
+    BorrowedKeyOf, CellCodecError, CellResolver, CellStateError, CellType, CollectionSpec,
+    ContextOf, FromSession, ResolvedOf, StructuralIdentity, WriteOf,
 };
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::registry::CollectionDef;
@@ -68,6 +68,7 @@ use crate::state::{RESOLVE_FANOUT, StateName, StateType, StoreOutcome};
 use bytes::{Bytes, BytesMut};
 use educe::Educe;
 use futures::stream::{Stream, StreamExt, TryStreamExt, iter};
+use std::borrow::Borrow;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
@@ -674,13 +675,14 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     ///
     /// An access error from the engine, a codec error (Permanent) when the
     /// cell bytes do not decode, or a resolution error from the resolver.
-    fn get<T>(
+    fn get<T, Q>(
         &mut self,
         family: CellFamily<Self::Layout, T>,
-        key: &KeyOf<T>,
+        key: &Q,
     ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send
     where
         T: CellType,
+        Q: Borrow<BorrowedKeyOf<T>> + ?Sized,
         for<'s> ContextOf<'s, T>: FromSession<'s, Self::Session>;
 
     /// Reads, decodes, and resolves `keys` as one aligned batch: `result[i]`
@@ -694,15 +696,18 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     /// # Errors
     ///
     /// As [`Self::get`].
-    fn get_many<T>(
+    fn get_many<'a, T, Q, I>(
         &mut self,
         family: CellFamily<Self::Layout, T>,
-        keys: &[KeyOf<T>],
+        keys: I,
     ) -> impl Future<
         Output = Result<CellBuffer<Option<ResolvedOf<T>>>, CellStateError<CellCodecError<T>>>,
     > + Send
     where
         T: CellType,
+        Q: Borrow<BorrowedKeyOf<T>> + Sync + ?Sized + 'a,
+        I: IntoIterator<Item = &'a Q>,
+        I::IntoIter: Send,
         for<'s> ContextOf<'s, T>: FromSession<'s, Self::Session>;
 
     /// Tests `keys` for presence as one aligned batch. Each result answers the
@@ -711,11 +716,15 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     /// # Errors
     ///
     /// Returns an engine access error.
-    fn contains_many<T: CellType>(
+    fn contains_many<'a, T: CellType, Q, I>(
         &mut self,
         family: CellFamily<Self::Layout, T>,
-        keys: &[KeyOf<T>],
-    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send;
+        keys: I,
+    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send
+    where
+        Q: Borrow<BorrowedKeyOf<T>> + Sync + ?Sized + 'a,
+        I: IntoIterator<Item = &'a Q>,
+        I::IntoIter: Send;
 
     /// Whether a stored cell exists at `key`, **without decoding its value or
     /// running the resolver**. The guarantee is "no decode, no resolve", not
@@ -724,11 +733,13 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     /// # Errors
     ///
     /// An access error from the engine.
-    fn contains<T: CellType>(
+    fn contains<T: CellType, Q>(
         &mut self,
         family: CellFamily<Self::Layout, T>,
-        key: &KeyOf<T>,
-    ) -> impl Future<Output = Result<bool, StateAccessError>> + Send;
+        key: &Q,
+    ) -> impl Future<Output = Result<bool, StateAccessError>> + Send
+    where
+        Q: Borrow<BorrowedKeyOf<T>> + ?Sized;
 }
 
 /// The mutation commands, implemented only by the write operation.
@@ -751,13 +762,14 @@ pub(crate) trait CollectionWrite: CollectionRead {
     /// # Errors
     ///
     /// As [`CollectionRead::get`].
-    fn take<T>(
+    fn take<T, Q>(
         &mut self,
         family: CellFamily<Self::Layout, T>,
-        key: &KeyOf<T>,
+        key: &Q,
     ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send
     where
         T: CellType,
+        Q: Borrow<BorrowedKeyOf<T>> + ?Sized,
         for<'s> ContextOf<'s, T>: FromSession<'s, Self::Session>;
 
     /// Stages a write of `value` at `key`.
@@ -765,15 +777,19 @@ pub(crate) trait CollectionWrite: CollectionRead {
     /// # Errors
     ///
     /// A codec error (Permanent) when the value fails to encode.
-    fn set<T: CellType>(
+    fn set<T: CellType, Q>(
         &mut self,
         family: CellFamily<Self::Layout, T>,
-        key: &KeyOf<T>,
+        key: &Q,
         value: WriteOf<'_, T>,
-    ) -> Result<(), CellStateError<CellCodecError<T>>>;
+    ) -> Result<(), CellStateError<CellCodecError<T>>>
+    where
+        Q: Borrow<BorrowedKeyOf<T>> + ?Sized;
 
     /// Stages a clear of the cell at `key`.
-    fn clear<T: CellType>(&mut self, family: CellFamily<Self::Layout, T>, key: &KeyOf<T>);
+    fn clear<T: CellType, Q>(&mut self, family: CellFamily<Self::Layout, T>, key: &Q)
+    where
+        Q: Borrow<BorrowedKeyOf<T>> + ?Sized;
 
     /// Stages an absence over the collection's **whole declared layout** — one
     /// payload-free journal entry that expands to every active and reserved
@@ -795,11 +811,22 @@ pub(crate) mod sealed_ops {
 
 /// The full cell address for `key` in `family` — the sole place a collection's
 /// typed key is lowered to its order-preserving coordinate.
-fn cell_key<L, T: CellType>(family: CellFamily<L, T>, key: &KeyOf<T>) -> CellKey {
+fn cell_key<L, T: CellType, Q>(family: CellFamily<L, T>, key: &Q) -> CellKey
+where
+    Q: Borrow<BorrowedKeyOf<T>> + ?Sized,
+{
     CellKey {
         section: family.section(),
-        coordinate: <T::Key as OrderedKeyCodec>::encode(key),
+        coordinate: <T::Key as OrderedKeyCodec>::encode(key.borrow()),
     }
+}
+
+/// Encodes one key from any type that borrows the codec's key view.
+fn encode_borrowed<T: CellType, Q>(key: &Q) -> Coordinate
+where
+    Q: Borrow<BorrowedKeyOf<T>> + ?Sized,
+{
+    <T::Key as OrderedKeyCodec>::encode(key.borrow())
 }
 
 /// Decodes and resolves raw cell bytes into the exposed application value.
