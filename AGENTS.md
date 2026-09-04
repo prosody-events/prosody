@@ -76,7 +76,8 @@ aspirations — perform each one; do not merely agree with it:
   state: fjall (RAM = block cache + memtables; data spills to the
   assignment-scoped disk workspace) and a capacity-bounded `quick_cache`. An
   insert-only `scc` map/set keyed by key or collection is a defect regardless
-  of entry size (the `MarkerMemo.checked` bug class). Every in-memory map
+  of entry size. The former in-RAM `MarkerMemo` checked set was this bug;
+  `MarkerCheckSet` is its disk-backed fix. Every in-memory map
   names its removal path; self-draining maps (removed on settle/fire) are
   fine but still need the drain named.
 

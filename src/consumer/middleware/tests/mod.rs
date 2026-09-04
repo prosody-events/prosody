@@ -455,7 +455,6 @@ async fn pass_through_middleware_forwards_after_abort_on_terminal() -> color_eyr
     Ok(())
 }
 
-mod publication;
 /// The settle boundary's single staged-rollback site: shutdown at the
 /// backstop arm — after a successful stage, before any marker record attempt —
 /// rolls the staged cells back to their committed base. `abandon` has no

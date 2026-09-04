@@ -40,11 +40,8 @@ impl ParkedRead {
 pub(crate) struct ScriptedPublicationStore {
     inner: MemoryPublicationStore,
     calls: Arc<Mutex<Vec<PublicationCall>>>,
-    fail: Arc<AtomicBool>,
     read_fail: Arc<Mutex<Option<ErrorCategory>>>,
     remove_fail: Arc<Mutex<Option<ErrorCategory>>>,
-    errored: Arc<Semaphore>,
-    gate: Option<Arc<ReleaseGate>>,
     read_gate: Arc<Mutex<Option<Arc<ReleaseGate>>>>,
 }
 
@@ -53,33 +50,10 @@ impl ScriptedPublicationStore {
         Self {
             inner: MemoryPublicationStore::new(),
             calls: Arc::new(Mutex::new(Vec::new())),
-            fail: Arc::new(AtomicBool::new(false)),
             read_fail: Arc::new(Mutex::new(None)),
             remove_fail: Arc::new(Mutex::new(None)),
-            errored: Arc::new(Semaphore::new(0)),
-            gate: None,
             read_gate: Arc::new(Mutex::new(None)),
         }
-    }
-
-    pub(crate) fn failing() -> Self {
-        let store = Self::new();
-        store.fail.store(true, Ordering::Release);
-        store
-    }
-
-    pub(crate) fn gated() -> Self {
-        Self {
-            gate: Some(Arc::new(ReleaseGate {
-                entered: Semaphore::new(0),
-                released: Semaphore::new(0),
-            })),
-            ..Self::new()
-        }
-    }
-
-    pub(crate) fn heal(&self) {
-        self.fail.store(false, Ordering::Release);
     }
 
     pub(crate) fn fail_reads_with(&self, category: ErrorCategory) {
@@ -92,26 +66,6 @@ impl ScriptedPublicationStore {
 
     pub(crate) fn heal_reads(&self) {
         *self.read_fail.lock() = None;
-    }
-
-    pub(crate) async fn wait_errored(&self) {
-        if let Ok(permit) = self.errored.acquire().await {
-            permit.forget();
-        }
-    }
-
-    pub(crate) async fn wait_entered(&self) {
-        if let Some(gate) = &self.gate
-            && let Ok(permit) = gate.entered.acquire().await
-        {
-            permit.forget();
-        }
-    }
-
-    pub(crate) fn release(&self) {
-        if let Some(gate) = &self.gate {
-            gate.released.add_permits(1);
-        }
     }
 
     pub(crate) fn gate_reads(&self) {
@@ -157,20 +111,6 @@ impl ScriptedPublicationStore {
             .count()
     }
 
-    pub(crate) fn upserts_for(&self, name: &str, topic: &str) -> usize {
-        self.calls
-            .lock()
-            .iter()
-            .filter(|call| {
-                matches!(
-                    call,
-                    PublicationCall::Upsert { name: stored_name, topic: stored_topic, .. }
-                        if stored_name == name && stored_topic == topic
-                )
-            })
-            .count()
-    }
-
     pub(crate) async fn rows(
         &self,
         subsystem: &SubsystemName,
@@ -195,16 +135,6 @@ impl PublicationStore for ScriptedPublicationStore {
         name: &StateName,
         row: &StatePublication,
     ) -> Result<(), Self::Error> {
-        if self.fail.load(Ordering::Acquire) {
-            self.errored.add_permits(1);
-            return Err(ScriptedPublicationError(ErrorCategory::Transient));
-        }
-        if let Some(gate) = &self.gate {
-            gate.entered.add_permits(1);
-            if let Ok(permit) = gate.released.acquire().await {
-                permit.forget();
-            }
-        }
         self.calls.lock().push(PublicationCall::Upsert {
             name: name.as_str().to_owned(),
             group: row.group_id.to_string(),

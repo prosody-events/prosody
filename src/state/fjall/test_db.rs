@@ -23,11 +23,14 @@
 //! reclaimer.
 
 use super::workspace::keyspace_options;
-use super::{Clock, FjallCellCache, MarkerPresence};
+use super::{Clock, FjallCellCache, MarkerCheckSet};
 use color_eyre::eyre::{Result, eyre};
 use fjall::{Database, Keyspace};
+use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::atomic::AtomicBool;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 /// One fjall database shared by every test in the process, created once.
 static SHARED_DB: LazyLock<Result<(Database, TempDir), String>> = LazyLock::new(|| {
@@ -71,17 +74,23 @@ pub fn cache_with_clock(name: &str, clock: Clock) -> Result<FjallCellCache> {
     Ok(FjallCellCache::with_clock(database, cache, index, clock))
 }
 
-/// A [`MarkerPresence`] handle over the `name` warm-index keyspace — the bare
-/// bottom store's marker-checked latch. Shares [`cache`]'s isolation contract
-/// (distinct v4 segments keep non-clearing tests disjoint) with one addition:
-/// the latch is **per-assignment** state, so a test that mints a SECOND store
-/// over the same collection (modeling reassignment/crash) must give the new
-/// store a cold presence domain — an exclusive keyspace name cleared before the
-/// mint, or a handle from the same [`cold_cache`] the assembly rebuilds.
-pub fn presence(name: &str) -> Result<MarkerPresence> {
-    // Minted through the cache so the handle carries the workspace's shared
-    // fuse bit, exactly as production `FjallCellCache::presence` does.
-    Ok(cache(name)?.presence())
+/// Returns a cold marker-check set over a new, uniquely named index keyspace.
+///
+/// Each call models a new assignment. The keyspace is never shared or cleared.
+/// Creation costs one directory `fsync` (~128 ms on APFS).
+pub fn cold_marker_checks() -> Result<MarkerCheckSet> {
+    let database = shared_database()?;
+    let name = format!("cassandra_cell_checks_{}_index", Uuid::new_v4().simple());
+    let index = database.keyspace(&name, keyspace_options)?;
+    Ok(MarkerCheckSet {
+        index,
+        disabled: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+/// Returns a marker-check handle for the named test workspace.
+pub fn marker_checks(name: &str) -> Result<MarkerCheckSet> {
+    Ok(cache(name)?.marker_checks())
 }
 
 /// A **cold** [`FjallCellCache`]: get-or-create the `name` keyspace pair, then

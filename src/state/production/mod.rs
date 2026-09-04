@@ -16,18 +16,13 @@
 
 use crate::ConsumerGroup;
 use crate::consumer::middleware::deduplication::DeduplicationStoreProvider;
-use crate::consumer::observer::KafkaObserver;
 use crate::state::cached::Cached;
 use crate::state::cassandra::{
-    CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
-    CassandraStore,
+    CassandraCellResources, CassandraDescriptorIdentityStore, CassandraStore,
 };
 use crate::state::commit::{CommitManager, StoreTagSource};
-use crate::state::first_write::{FirstWritePublisher, FixedPartitionCount, PublisherTemplate};
 use crate::state::fjall::{FjallCellCache, FjallCellCacheError, FjallClient};
-use crate::state::memory::{
-    MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore,
-};
+use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::{PartitionBackend, StateBackendFactory};
 use crate::timers::store::TriggerStore;
@@ -66,7 +61,6 @@ pub(crate) struct CassandraStateBackendFactory<DP> {
     registry: Arc<CollectionDefRegistry>,
     dedup: DP,
     consumer_group: ConsumerGroup,
-    publisher: Option<PublisherTemplate<CassandraPublicationStore, KafkaObserver>>,
 }
 
 impl<DP> CassandraStateBackendFactory<DP> {
@@ -85,7 +79,6 @@ impl<DP> CassandraStateBackendFactory<DP> {
         registry: Arc<CollectionDefRegistry>,
         dedup: DP,
         consumer_group: ConsumerGroup,
-        publisher: Option<PublisherTemplate<CassandraPublicationStore, KafkaObserver>>,
     ) -> Self {
         Self {
             client,
@@ -94,7 +87,6 @@ impl<DP> CassandraStateBackendFactory<DP> {
             registry,
             dedup,
             consumer_group,
-            publisher,
         }
     }
 }
@@ -108,7 +100,6 @@ where
         ProductionOracle<DP, S>,
         CassandraDescriptorIdentityStore,
         Cached<CassandraStore<ProductionOracle<DP, S>>>,
-        FirstWritePublisher<CassandraPublicationStore, KafkaObserver>,
     >;
     type Error = FjallCellCacheError;
 
@@ -140,15 +131,10 @@ where
             queries.clone(),
             oracle.clone(),
             self.registry.clone(),
-            fjall.presence(),
+            fjall.marker_checks(),
         );
         let cell = Cached::new(fjall, cassandra);
-        Ok(PartitionBackend::with_publisher(
-            oracle,
-            self.identity.clone(),
-            cell,
-            self.publisher.as_ref().map(|template| template.bind(topic)),
-        ))
+        Ok(PartitionBackend::new(oracle, self.identity.clone(), cell))
     }
 }
 
@@ -166,7 +152,6 @@ pub(crate) struct MemoryStateBackendFactory<DP> {
     registry: Arc<CollectionDefRegistry>,
     dedup: DP,
     consumer_group: ConsumerGroup,
-    publisher: Option<PublisherTemplate<MemoryPublicationStore, FixedPartitionCount>>,
 }
 
 impl<DP> MemoryStateBackendFactory<DP> {
@@ -180,7 +165,6 @@ impl<DP> MemoryStateBackendFactory<DP> {
         registry: Arc<CollectionDefRegistry>,
         dedup: DP,
         consumer_group: ConsumerGroup,
-        publisher: Option<PublisherTemplate<MemoryPublicationStore, FixedPartitionCount>>,
     ) -> Self {
         Self {
             cells,
@@ -188,7 +172,6 @@ impl<DP> MemoryStateBackendFactory<DP> {
             registry,
             dedup,
             consumer_group,
-            publisher,
         }
     }
 }
@@ -202,7 +185,6 @@ where
         ProductionOracle<DP, S>,
         MemoryDescriptorIdentityStore,
         MemoryCellStore<ProductionOracle<DP, S>>,
-        FirstWritePublisher<MemoryPublicationStore, FixedPartitionCount>,
     >;
     type Error = Infallible;
 
@@ -220,12 +202,7 @@ where
             triggers,
         );
         let cell = MemoryCellStore::new(self.cells.clone(), oracle.clone(), self.registry.clone());
-        Ok(PartitionBackend::with_publisher(
-            oracle,
-            self.identity.clone(),
-            cell,
-            self.publisher.as_ref().map(|template| template.bind(topic)),
-        ))
+        Ok(PartitionBackend::new(oracle, self.identity.clone(), cell))
     }
 }
 
