@@ -40,7 +40,7 @@ use super::memory::{
 use super::oracle::CommitOracle;
 use super::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use super::registry::{CollectionDef, CollectionDefRegistry};
-use super::resolve::{ResolveCellError, resolve_marker};
+use super::resolve::{ResolveCellError, resolve_event_marker};
 use super::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use super::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, dedupe};
 use super::{
@@ -133,11 +133,7 @@ fn prop_memory_cell_crash_equivalence() {
     QuickCheck::new().quickcheck(property as fn(Trace) -> Result<bool>);
 }
 
-/// Regression pin over the memory store: a blind `write_resolved` into a
-/// section whose clears-bearing marker still stands survives the marker's later
-/// resolution (the write-side committed-unapplied boundary). Falsify by
-/// deleting the `standing_marker` + `help_write_window` lines in
-/// `MemoryCellStore::write_resolved`.
+/// Proves that a resolved write survives an earlier unsettled section clear.
 #[test]
 fn blind_write_survives_stale_clear() -> Result<()> {
     let oracle = ScriptedOracle::default();
@@ -145,8 +141,9 @@ fn blind_write_survives_stale_clear() -> Result<()> {
     executor::block_on(run_blind_write_survives_stale_clear(store, oracle))
 }
 
-/// Posture-parity pin over the memory store: a blind `write_resolved` leaves a
-/// standing clears-FREE marker standing (the boundary triggers on clears only).
+/// Posture-parity test over the memory store: a blind `write_resolved` leaves a
+/// unsettled clears-FREE marker unsettled (the boundary triggers on clears
+/// only).
 #[test]
 fn blind_write_leaves_clears_free_marker() -> Result<()> {
     let oracle = ScriptedOracle::default();
@@ -156,8 +153,8 @@ fn blind_write_leaves_clears_free_marker() -> Result<()> {
     executor::block_on(run_blind_write_leaves_clears_free_marker(store, &probe))
 }
 
-/// Regression pin over the memory store: a repair whose payload predates a
-/// standing committed clears-bearing marker defers to peek semantics, so the
+/// Regression test over the memory store: a repair whose payload predates a
+/// committed but unsettled marker with clears defers to peek semantics, so the
 /// marker's own resolution erases the cell rather than a stale repair
 /// resurrecting it. Falsify by deleting the `deferred` guard in `resolve_cell`.
 #[test]
@@ -172,8 +169,8 @@ fn repair_defers_beneath_stale_clear() -> Result<()> {
     ))
 }
 
-/// Convergence pin over the memory store: the deferral wedges nothing — when
-/// the standing marker aborts, x's committed projection stays its base.
+/// Convergence test over the memory store: the deferral wedges nothing — when
+/// the unsettled marker aborts, x's committed projection stays its base.
 #[test]
 fn repair_after_marker_abort_converges() -> Result<()> {
     let oracle = ScriptedOracle::default();
@@ -277,7 +274,7 @@ fn cell_buffers_spill_before_full_batch() {
 /// `dedupe` keeps unique coordinates in first-occurrence order and maps every
 /// input position to its unique's index — the dedup + first-occurrence leg the
 /// batch verbs and the Cassandra `IN` override share (a value-only test cannot
-/// observe client-side dedup, so it is pinned directly here).
+/// observe client-side dedup, so it is verified directly here).
 #[test]
 fn dedupe_uniques_and_plan() -> Result<()> {
     let bytes_in = [5u8, 9, 5, 2, 9, 5];
@@ -324,7 +321,7 @@ fn prop_memory_raw_batch_parity() {
     QuickCheck::new().quickcheck(property as fn(RawBatchTrace) -> Result<bool>);
 }
 
-/// Ascending-output pin over the memory store (deterministic): the sort in
+/// Ascending-output test over the memory store (deterministic): the sort in
 /// `provisional_point_loop` is load-bearing here — without it the output
 /// collapses to input byte order.
 #[test]
@@ -333,7 +330,7 @@ fn memory_raw_batch_ascending_output() -> Result<()> {
     executor::block_on(run_raw_batch_ascending_output(store))
 }
 
-/// No-side-effects pin over the memory store built on a [`CountingOracle`]:
+/// No-side-effects test over the memory store built on a [`CountingOracle`]:
 /// `provisional_many` never resolves, writes, or caches.
 #[test]
 fn memory_raw_batch_no_side_effects() -> Result<()> {
@@ -361,18 +358,14 @@ fn memory_batch_alignment() -> Result<()> {
     executor::block_on(run_batch_alignment(store))
 }
 
-/// `resolve_marker` rebuilds the staged set through per-section
-/// `<=CELL_BATCH` `provisional_many` batches (never per-coordinate point
-/// reads) and consults the oracle exactly ONCE: staging 129 cells in section 0
-/// and 3 in section 1 makes the marker leg issue `ceil(129/128) + ceil(3/128)
-/// = 3` raw batch reads, zero raw point reads, and one oracle resolve. The
-/// memory `provisional_many` is a point-loop, so `raw_batch_reads` counts the
-/// LOGICAL batch calls (one per chunk) — a faithful pin that the marker leg
-/// issues `ceil` batch calls and no direct point reads.
-/// FALSIFICATION: revert `resolve_marker`'s chunk loop to `provisional_cell_at`
-/// → `raw_batch_reads == 0` and `raw_point_reads == 132`, both asserts red.
+/// Proves that marker resolution reads provisional cells in bounded batches.
+///
+/// The test expects three batch reads, no point reads, and one event check.
+///
+/// Falsification: Replace `resolve_event_marker` batch reads with point reads.
+/// Then `raw_batch_reads` becomes zero and the read-count asserts fail.
 #[test]
-fn memory_resolve_marker_batches_reads() -> Result<()> {
+fn memory_resolve_event_marker_batches_reads() -> Result<()> {
     executor::block_on(async {
         let counting =
             CountingCellStore::new(memory_store(MemoryCells::new(), ScriptedOracle::default()));
@@ -404,11 +397,11 @@ fn memory_resolve_marker_batches_reads() -> Result<()> {
             .map_err(|e| eyre!("stage: {e}"))?;
 
         // The oracle answers NotCommitted ⇒ abort; the verdict is irrelevant to
-        // the read counts this pin measures.
+        // the read counts this test measures.
         counting.reset();
-        resolve_marker(&counting, &oracle, &cref, &marker)
+        resolve_event_marker(&counting, &oracle, &cref, &marker)
             .await
-            .map_err(|e| eyre!("resolve_marker: {e}"))?;
+            .map_err(|e| eyre!("resolve_event_marker: {e}"))?;
 
         assert_eq!(
             counting.raw_batch_reads(),
@@ -425,23 +418,16 @@ fn memory_resolve_marker_batches_reads() -> Result<()> {
     })
 }
 
-/// Section-rekey pin: a marker staging the SAME coordinate byte in BOTH
-/// sections with DIFFERENT values must commit each survivor at its own
-/// `(section, coordinate)`, never collapse to one section. A regression that
-/// drops the chunk's section (keys every survivor at section 0) commits both
-/// survivors onto `(0, 7)` and leaves `(1, 7)` unresolved-provisional.
+/// Proves that marker resolution keeps the section for each coordinate.
 ///
-/// The discriminator is a provisional-sweep drain taken IMMEDIATELY after
-/// `resolve_marker`, before any `get`: a foreign-reader `get` self-heals a
-/// still-provisional cell through its own oracle consult (`resolve_cell`
-/// promotes the cell's stored bytes in place), so a `get`-after-drain would
-/// repair the collapse before an assertion could observe it. The drain reads
-/// `resolve_marker`'s own output.
-/// FALSIFICATION: replace the chunk's `section` with a fixed `SECTIONS[0]` in
-/// `resolve_marker`/`section_batches` → the drain reports `(1, 7)` still
-/// provisional (`remaining.is_empty()` red).
+/// Two sections contain different values at coordinate 7.
+/// Each value must remain in its original section.
+///
+/// Falsification: Use `SECTIONS[0]` for each `section_batches` result.
+/// Then one survivor stays provisional and the `remaining.is_empty()` assert
+/// fails.
 #[test]
-fn resolve_marker_rekeys_survivors_by_section() -> Result<()> {
+fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
     executor::block_on(async {
         let store = MemoryCellStore::new(
             MemoryCells::new(),
@@ -470,11 +456,11 @@ fn resolve_marker_rekeys_survivors_by_section() -> Result<()> {
             .map_err(|e| eyre!("stage: {e}"))?;
 
         let oracle = FixedOracle::committed();
-        resolve_marker(&store, &oracle, &cref, &marker)
+        resolve_event_marker(&store, &oracle, &cref, &marker)
             .await
-            .map_err(|e| eyre!("resolve_marker: {e}"))?;
+            .map_err(|e| eyre!("resolve_event_marker: {e}"))?;
 
-        // Observe `resolve_marker`'s own output BEFORE any `get`: nothing may be
+        // Observe `resolve_event_marker`'s own output before any `get`: nothing may be
         // left provisional. A `get` here would self-heal a survivor the collapse
         // regression left provisional (see the doc comment), so this drain must
         // run first.
@@ -483,10 +469,11 @@ fn resolve_marker_rekeys_survivors_by_section() -> Result<()> {
             .map_err(|e| eyre!("drain: {e}"))?;
         assert!(
             remaining.is_empty(),
-            "both survivors are resolved by resolve_marker, none left provisional: {remaining:?}"
+            "both survivors are resolved by resolve_event_marker, none left provisional: \
+             {remaining:?}"
         );
 
-        // A foreign reader event: the cells are already resolved, so `get`
+        // A prior event reader event: the cells are already resolved, so `get`
         // returns the committed value directly.
         let reader = EventRef::Message {
             dedup_id: Uuid::from_u128(2),
@@ -511,17 +498,12 @@ fn resolve_marker_rekeys_survivors_by_section() -> Result<()> {
     })
 }
 
-/// Overlap-precedence pin: when BOTH the oracle read and a raw batch read fail,
-/// `resolve_marker` surfaces the ORACLE error (its retry/skip classification
-/// governs), and the overlap leaves the oracle-read and raw-batch-read counts
-/// unchanged. [`FailingOracle`] yields once so the oracle is observed `Pending`
-/// on the first poll pass while the poisoned batch read is `Ready(Err)` — the
-/// `join`-plus-oracle-first ordering is what surfaces the oracle error.
-/// FALSIFICATION: swap `join(oracle, reads)` + oracle-first for
-/// `try_join!(oracle, reads)` → the store error surfaces (matches! fails) and
-/// `oracle.resolves() == 0`.
+/// Proves that an event-check error takes priority over a cell-read error.
+///
+/// Falsification: Replace the joined reads with `try_join!`.
+/// Then the store error wins and the `matches!` assert fails.
 #[test]
-fn resolve_marker_double_failure_surfaces_oracle() -> Result<()> {
+fn resolve_event_marker_double_failure_surfaces_oracle() -> Result<()> {
     executor::block_on(async {
         let id = fresh_collection("resolve-marker-double-fail")?;
         let name = id.name().clone();
@@ -548,7 +530,7 @@ fn resolve_marker_double_failure_surfaces_oracle() -> Result<()> {
 
         counting.reset();
         let oracle = FailingOracle::default();
-        let err = match resolve_marker(&counting, &oracle, &cref, &marker).await {
+        let err = match resolve_event_marker(&counting, &oracle, &cref, &marker).await {
             Ok(()) => return Err(eyre!("expected a double failure, got Ok")),
             Err(err) => err,
         };
@@ -567,7 +549,7 @@ fn resolve_marker_double_failure_surfaces_oracle() -> Result<()> {
 }
 
 /// Drains a memory store's `provisional_cells` sweep into its yielded cells,
-/// for the recovery pins that assert nothing is left provisional.
+/// for the recovery tests that assert nothing is left provisional.
 async fn drain_memory_provisional<S: CellStore>(
     store: &S,
     id: &CollectionId,
@@ -581,7 +563,7 @@ async fn drain_memory_provisional<S: CellStore>(
     Ok(out)
 }
 
-/// A dirty `Set` inside a standing dirty section-clear answers its bytes
+/// A dirty `Set` inside an unsettled dirty section-clear answers its bytes
 /// through `Overlay::get_many` (precedence + duplicate co-observation), and the
 /// dirty-answered positions never reach the lower batch.
 #[test]
@@ -595,10 +577,8 @@ fn memory_overlay_precedence_set_beats_section_clear() -> Result<()> {
 /// exactly ONE lower batch read for its entries — a full-width scan chunk is
 /// one [`CoordinateBatch`], one lower `get_many`; only the keyset meta cell
 /// stays a point read.
-/// FALSIFICATION: revert `CoordinatePlan`'s chunk source to a per-key point
-/// `get` loop →
-/// `batch_reads == 0` and `lower_reads == CELL_BATCH` (+ keyset) → both asserts
-/// red. Counters are read after the full drain, so nothing masks them.
+/// Falsification: Replace `CoordinatePlan` batch reads with per-key `get`
+/// calls. Then `batch_reads` becomes zero and both read-count asserts fail.
 #[test]
 fn map_cold_chunk_is_one_batch_read() -> Result<()> {
     executor::block_on(async {
@@ -649,7 +629,7 @@ fn map_cold_chunk_is_one_batch_read() -> Result<()> {
         }
         finalize_and_promote(&session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
 
-        // Fresh cold session, zeroed counters; drain the WHOLE stream.
+        // Fresh cold session, zeroed counters; drain the complete stream.
         counting.reset();
         let event = EventRef::Message {
             dedup_id: Uuid::from_u128(2),
@@ -693,11 +673,9 @@ fn map_cold_chunk_is_one_batch_read() -> Result<()> {
 /// (read-your-writes: committed/absent/uncommitted-set/uncommitted-remove/
 /// set-after-clear) while never running the resolver — contrasted against
 /// `get`, which resolves on the very same collection.
-/// FALSIFICATION: an always-`Ok(true)` body flips every `!... .await?` assert
-/// red; a `get`-delegating body (`self.get(key).await.map(|o|
-/// o.is_some())`) makes `resolves.resolves()` nonzero before the `assert_eq!`
-/// runs, since `contains_key(&k1)` on the seeded, resolvable key is the FIRST
-/// call. Both revert to green.
+///
+/// Falsification: Make `contains_key` always return `Ok(true)`.
+/// Then absent-key checks return true and the presence asserts fail.
 #[test]
 fn map_contains_key_presence_without_resolving() -> Result<()> {
     const K1: i64 = 1;
@@ -809,16 +787,10 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
     })
 }
 
-/// The key-scan resolver-skip pin: `keys()` runs the resolver zero times on
-/// BOTH arms (tracked point-get and degrade scan) over a dense committed map,
-/// so a message-backed map enumerates keys with no Kafka fetch. The tracked
-/// arm additionally contrasts a `get()` on a present key (which DOES resolve),
-/// proving the zero is a real skip on a resolvable cell — not an unresolvable
-/// one.
-/// FALSIFICATION: routing `MapHandle::keys` through `self.stream(dir)` (mapping
-/// `(k, _)`) resolves every drained key → `resolves() == n > 0` on either arm →
-/// red; routing only the `MapPlan::Scan` arm through the resolving `scan`
-/// reddens the degrade arm alone. Both revert to green.
+/// Proves that key scans do not resolve cell values.
+///
+/// Falsification: Route `MapHandle::keys` through the resolving stream.
+/// Then the resolver count becomes nonzero and the count assert fails.
 #[test]
 fn map_keys_no_resolve() -> Result<()> {
     executor::block_on(async {
@@ -996,10 +968,11 @@ fn prop_deque_collection_lifecycle_read_uncommitted() {
 /// step with a `VecDeque` model that applies the identical capped-trim rule, in
 /// both commit modes — so lazy push-only eviction, its rollback under
 /// abort/crash, and the at-least-once `commit()` floor all hold with a cap in
-/// play. The unbounded lifecycle properties above pin the `capacity = None`
-/// path. FALSIFICATION: make `evictions` always return `0` (skip enforcement) →
-/// after a push-to-full the handle window exceeds the trimmed model →
-/// `assert_deque` mismatch → red.
+/// play. The unbounded lifecycle properties above test the `capacity = None`
+/// path.
+///
+/// Falsification: Make `evictions` always return zero.
+/// Then the handle exceeds the model and the `assert_deque` check fails.
 #[test]
 fn prop_deque_bounded_lifecycle() {
     fn property(trace: DequeTrace) -> Result<bool> {
@@ -1030,9 +1003,9 @@ fn prop_deque_bounded_lifecycle_read_uncommitted() {
 /// within the computed catch-up pushes, evicting at most `TRIM_MAX` slots per
 /// push (read from the buffered dirty overlay). See
 /// [`run_deque_capacity_convergence`] for the full disposition.
-/// FALSIFICATION: drop `.min(TRIM_MAX)` from `evictions` → an over-wide
-/// window's first push buffers `> TRIM_MAX` entry deletes → the per-push cap
-/// assert → red.
+///
+/// Falsification: Remove `.min(TRIM_MAX)` from `evictions`.
+/// Then one push exceeds the delete limit and the per-push cap assert fails.
 #[test]
 fn prop_deque_capacity_convergence() {
     fn property(shape: DequeCapacityShape) -> Result<bool> {
@@ -1134,8 +1107,9 @@ fn prop_deque_ttl_holes() {
 /// Stage event A (dedup 1) at section-0 coordinates {0, 1} over an empty base,
 /// optionally recording its commit, then crash with no recovery: returns a
 /// fresh store over the same warm `MemoryCells`, so A's provisional cells and
-/// marker survive. The shared prologue of the two foreign-marker boundary pins;
-/// each caller then stages event B and asserts the stage boundary resolved A.
+/// marker survive. The shared prologue of the two prior event-marker boundary
+/// tests; each caller then stages event B and asserts the stage boundary
+/// resolved A.
 async fn stage_a_then_crash(
     name: &str,
     a_committed: bool,
@@ -1173,15 +1147,7 @@ async fn stage_a_then_crash(
     Ok((memory_store(cells.clone(), oracle), cells, id))
 }
 
-/// Staging over a standing **foreign** marker with live cells: event A stages
-/// coordinates {0, 1}, the process crashes with no recovery (a fresh store over
-/// the same warm cells), then event B stages coordinate {1} on the same
-/// collection. B's stage boundary must resolve A's standing marker first, so
-/// A's untouched coordinate 0 settles to A's verdict, B's marker replaces A's,
-/// and only B's cell stays provisional. The generated crash/reassignment
-/// alphabet (the `Defer` recovery in the crash-equivalence trace) subsumes
-/// this shape; these two pins are kept as the fast, deterministic falsifiers
-/// for the boundary arm.
+/// Proves that a new stage resolves a prior event marker first.
 async fn boundary_resolve_pin(a_committed: bool) -> Result<()> {
     let (store, cells, id) = stage_a_then_crash("boundary", a_committed).await?;
     let collection = CollectionRef::new(id.clone(), None);
@@ -1200,7 +1166,7 @@ async fn boundary_resolve_pin(a_committed: bool) -> Result<()> {
         .write_provisional(&collection, &writes_b, Some(&marker_b))
         .await?;
 
-    // Exactly B's one staged cell remains provisional — checked BEFORE any
+    // Exactly B's one staged cell remains provisional — checked before any
     // resolving read, so a skipped boundary resolve (A's coordinate 0 left
     // provisional) surfaces here rather than being masked by a later `get`.
     let mut provisional = 0usize;
@@ -1217,7 +1183,7 @@ async fn boundary_resolve_pin(a_committed: bool) -> Result<()> {
 
     // B's marker replaces A's.
     assert_eq!(
-        cells.standing_marker_of(&id).map(|marker| marker.event()),
+        cells.unsettled_marker_of(&id).map(|marker| marker.event()),
         Some(b),
         "B's marker stands after the boundary overwrite"
     );
@@ -1253,9 +1219,9 @@ fn boundary_resolves_aborted_foreign_marker() -> Result<()> {
 /// crashes with no recovery, then event B stages **clears only** — an empty
 /// write set whose marker carries a cleared section. The boundary must resolve
 /// A's marker exactly as a writing stage would (A's cells settle per A's
-/// verdict, nothing of A stays provisional) while B's clears-bearing marker
+/// verdict, nothing of A stays provisional) while B's marker with clears
 /// stands. The crash-trace generator's clears dimension produces this shape
-/// organically; this pin is its fast deterministic falsifier, matching the
+/// organically; this test is its fast deterministic falsifier, matching the
 /// documented role of [`boundary_resolve_pin`].
 ///
 /// Deliberately kept parallel to [`boundary_resolve_pin`] (B stages a
@@ -1277,14 +1243,14 @@ async fn clears_only_boundary_pin(a_committed: bool) -> Result<()> {
         .write_provisional(&collection, &[], Some(&marker_b))
         .await?;
 
-    // Raw probes BEFORE any resolving read — a `get` would read-help-resolve
-    // B's clears-bearing marker and destroy the shape under test.
-    let standing = cells
-        .standing_marker_of(&id)
+    // Raw probes before any resolving read — a `get` would clear resolution-resolve
+    // B's marker with clears and destroy the shape under test.
+    let unsettled = cells
+        .unsettled_marker_of(&id)
         .ok_or_else(|| eyre!("B's clears-only marker must stand after the stage"))?;
-    assert_eq!(standing.event(), b, "B's marker replaced A's");
+    assert_eq!(unsettled.event(), b, "B's marker replaced A's");
     assert_eq!(
-        standing.clears().len(),
+        unsettled.clears().len(),
         1,
         "B's marker carries its cleared section"
     );
@@ -1294,7 +1260,7 @@ async fn clears_only_boundary_pin(a_committed: bool) -> Result<()> {
     );
 
     // A's cells settled per A's verdict (these reads resolve B's marker via
-    // read-help — after the shape assertions above, and section 0 is
+    // clear resolution — after the shape assertions above, and section 0 is
     // untouched by B's section-1 clear either way).
     let probe = EventRef::Message {
         dedup_id: Uuid::from_u128(u128::MAX),
@@ -1352,7 +1318,7 @@ fn prop_memory_publication_trace() {
 }
 
 /// The per-partition backend over a [`CountingCellStore`], so a directed test
-/// can pin the lower-store scan count a collection op issues.
+/// can test the lower-store scan count a collection op issues.
 type CountingBackend = PartitionBackend<
     ScriptedOracle,
     MemoryDescriptorIdentityStore,
@@ -1427,7 +1393,7 @@ async fn drain_map_stream(
     Ok(out)
 }
 
-/// The Map keyset budget pins for the point-get arms (parity of
+/// The Map keyset budget tests for the point-get arms (parity of
 /// `deque_stream_issues_no_scans`): a never-written map yields nothing and
 /// issues zero scans, and a small committed map streams through the batch verb
 /// — zero scans, one keyset point-get, and one batch read for the entries, in
@@ -1526,7 +1492,7 @@ fn map_stream_issues_no_scans() -> Result<()> {
     })
 }
 
-/// The overflowed-map budget pin (the liveness proof for
+/// The overflowed-map budget test (the liveness proof for
 /// `map_stream_issues_no_scans`): a keyset-disabled map (`keyset_limit = 0`)
 /// overflows on its first set and streams through **exactly one** full-section
 /// scan (plus the single keyset get — bounds are gone).
@@ -1652,8 +1618,8 @@ async fn seed_wide_deque(
 /// Sub-threshold deque iteration streams through the batch verb: a small
 /// committed deque issues **zero** lower-store scans, one bounds point-get, and
 /// one batch read for the entries, in both directions. The test then hands the
-/// same fixture to [`assert_wide_deque_scan_is_window_bounded`], which pins the
-/// fallback arm.
+/// same fixture to [`assert_wide_deque_scan_is_window_bounded`], which tests
+/// the fallback arm.
 #[test]
 fn deque_stream_issues_no_scans() -> Result<()> {
     executor::block_on(async {
@@ -1815,7 +1781,7 @@ impl Arbitrary for StreamPrefix {
 }
 
 /// Mints a session over `counting` carrying a [`ResolveCounter`] loader, so a
-/// stream-laziness pin can bound resolutions independently of fetches.
+/// stream-laziness test can bound resolutions independently of fetches.
 fn resolve_session(
     counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
     oracle: &ScriptedOracle,
@@ -1835,12 +1801,10 @@ fn resolve_session(
 /// values, never the whole `n`-entry collection. The counting store bounds the
 /// fetches and the counting resolver bounds the resolutions. Both counters sit
 /// at the lowest layer, so nothing masks a materialization.
-/// FALSIFICATION: widen `keys.by_ref().take(CELL_BATCH)` in
-/// `CoordinatePlan::entry_source` to `.take(usize::MAX)` (drain every tracked
-/// key in one chunk) → `take(k)` fetches and resolves all `n` → `batch_reads ==
-/// n.div_ceil(16)` and `resolves == n`, both over their bounds for `n ≫ k` →
-/// red. (Inflating `CELL_BATCH` itself cannot falsify: the assertion bound
-/// moves with it.)
+///
+/// Falsification: Make `CoordinatePlan::entry_source` consume all tracked keys.
+/// Then the read and resolver counts exceed their bounds, and both asserts
+/// fail. A larger `CELL_BATCH` cannot falsify: the bound moves with it.
 async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
@@ -1944,12 +1908,11 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
 /// [`run_map_stream_prefix_lazy`] over a dense `n`-entry window on the
 /// point-get arm — at most one batch read beyond `k` (entries flow through the
 /// batch verb; only the bounds meta cell is a point read) and at most
-/// `k + CELL_BATCH` resolved. FALSIFICATION: widen
-/// `keys.by_ref().take(CELL_BATCH)` in `CoordinatePlan::entry_source` to
-/// `.take(usize::MAX)` (fetch the whole window in one chunk) →
-/// `batch_reads == n.div_ceil(16)` and `resolves == n`, both over their bounds
-/// for `n ≫ k` → red. (Inflating `CELL_BATCH` itself cannot falsify: the
-/// assertion bound moves with it.)
+/// `k + CELL_BATCH` resolved.
+///
+/// Falsification: Make `CoordinatePlan::entry_source` consume all tracked keys.
+/// Then the read and resolver counts exceed their bounds, and both asserts
+/// fail. A larger `CELL_BATCH` cannot falsify: the bound moves with it.
 async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
     let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
@@ -2046,11 +2009,9 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
 /// (resolver-carrying) deque capped at one slot, a `push_back` that evicts the
 /// front resolves **nothing** — a blind push never resolves, so a nonzero count
 /// could come only from the eviction path reading the evicted slot.
-/// FALSIFICATION: change the eviction `entries.clear` to an `entries.get` then
-/// `clear` (as `pop_front` does) → the evicted slot resolves through
-/// `CountingResolver` → `resolves() == 1 != 0` → red. The `resolves()` assert
-/// is read **before** the survivor peek (which does resolve), so nothing masks
-/// it.
+///
+/// Falsification: Replace the eviction clear with a get followed by a clear.
+/// Then the evicted slot resolves and the zero-count assert fails.
 #[test]
 fn deque_bounded_eviction_does_not_resolve() -> Result<()> {
     executor::block_on(async {

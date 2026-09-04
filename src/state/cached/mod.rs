@@ -11,15 +11,9 @@
 //!
 //! # The five invariants
 //!
-//! - **KV1 — a hit is current.** Every fjall entry (Present bytes or Absent
-//!   tag) under an unexpired stamp equals that cell's current committed
-//!   projection. Maintained by write-through on every mutator, TTL co-expiry
-//!   (below), and the must-succeed repair sites (D1–D5). A hit is served
-//!   verbatim — there is no read-side mismatch detection — so a lost delete is
-//!   a wrong answer, not a slow one; that is why the repair deletes are
-//!   must-succeed, and why one that cannot land blows the **cache fuse** (see
-//!   the retry posture): a fused cache serves no hits at all, so KV1 holds
-//!   vacuously.
+//! - **KV1 — a hit is current.** Each unexpired entry equals the committed
+//!   cell. Every state change updates or removes the entry. A required removal
+//!   failure disables the cache.
 //! - **KV2 — a miss is unknown.** A fjall miss (or expired entry) asserts
 //!   nothing. The reader falls through to the lower store's resolving read and
 //!   publishes what it finds — **including absence** (the Absent tag), so
@@ -32,58 +26,51 @@
 //!   `commit_provisional`/`abort_provisional`, never `get`), so the lower read
 //!   is always a settled committed projection.
 //! - **KV3 — scans bypass the cache.** `scan_cells` never reads or writes
-//!   fjall; its only cache interaction is the pre-scan read-window invalidation
-//!   (D3). There is no way to serve a range from the cache, so there is no
-//!   completeness fact to maintain. A scan's cost is always exactly one
-//!   lower-store scan.
+//!   fjall; its only cache interaction is the pre-scan prior-clear invalidation
+//!   (prior-clear cache guard). There is no way to serve a range from the
+//!   cache, so there is no completeness fact to maintain. A scan's cost is
+//!   always exactly one lower-store scan.
 //! - **KV4 — a read-back fill can never overwrite a newer write-through.**
 //!   Enforced, not argued, by three legs: per-key event dispatch serializes
 //!   whole events on a key; the per-event **session operation gate**
 //!   (`SessionGate` in [`crate::state::session`]) serializes in-handler ops so
 //!   a suspended fill cannot straddle a `commit()`'s durable write; and the
 //!   sweep/settle boundary never overlaps a handler-issued fill.
-//! - **KV5 — first-touch permanence.** Once a cell's projection has been
-//!   successfully published — by any mutator's write-through (present and
-//!   absent projections, including the staged `prev` and the settle transform's
-//!   `data`) or by a fill's read-back — every later point read of it is a fjall
-//!   hit with zero durable reads, until: partition loss/rebalance (the
-//!   workspace is assignment-scoped, born cold); a scan (durable by design, not
-//!   a point read); TTL expiry (the co-expired entry falls through once and
-//!   re-caches); an explicit clear covering the cell (D4 — the next touch
-//!   re-reads once); or a D-site eviction (re-warmed by the next read). Under
-//!   fjall faults the contract is eventual, not one-shot: a failed publish
-//!   leaves the cell cold for one more durable read, and a failed fjall *read*
-//!   degrades that one read to a durable one.
+//! - **KV5 — first-touch permanence.** A successful update keeps later point
+//!   reads in the cache. Reassignment, scans, expiry, and clears can remove an
+//!   entry. A cache error can also cause one durable read.
 //!
 //! # The must-succeed repair sites
 //!
-//! Two rules generate every site — the review criterion for any future verb:
-//! **(1)** before invoking any lower operation that can change or resolve the
-//! logical committed projection without atomically installing the matching
-//! cache projection, install that projection (D5's transform) or delete every
-//! affected entry (D2–D4); **(2)** after authoritative success, a failed cache
-//! publication deletes the entries it failed to replace (D1). TTL co-expiry is
-//! the one staleness source neither rule reaches — it is time-based, handled by
-//! the expiry stamp.
+//! Update or remove affected entries before a lower operation can make them
+//! stale. Remove old entries when an update fails after a durable write.
+//! Use the expiry stamp for time-based removal.
 //!
-//! | # | Site | Deleted / rewritten | Ordering |
-//! |---|---|---|---|
-//! | D1 | Failed fjall publish after a successful lower write | the written cells' entries | after the lower ack — the durable value moved |
-//! | D2 | Raw `mark_resolved` promote (the value is not carried) | the promoted cells' entries | **before** the lower call — deleting early costs a fall-through; deleting after leaves a promoted-but-cached `prev` on a mid-way cancel, a window the sweep never repairs |
-//! | D3 | Standing clears-bearing marker resolved beneath the cache (fall-through read, `scan_cells`, the stage boundary, or a blind `write_resolved`) | the marker's staged coordinates **and** cleared sections | before the lower call, verdict-blind; rides the lower store's marker memo |
-//! | D4 | Committed section clears | the cleared sections' entries — at the commit site, **excluding** the staged coordinates the D5 transform just installed | before the lower call — delete-first leaves the sections merely cold on a failed/cancelled lower write |
-//! | D5 | The **settle transform** (`commit_provisional` only) | staged entries rewritten `prev → data` at their stage-anchored expiry, atomically, **before** the lower promote; a failed transform falls back to must-succeed deletion of the same entries | the verdict is already fixed when the verb runs, so `data` *is* the committed projection — installing it pre-call is correct even if the promote fails or the future is dropped, and the staged cells stay **warm** through the settle |
+//! The must-succeed sites, by verb:
+//! - `write_provisional` removes a prior event marker's staged entries and
+//!   cleared sections. It resets the cold seed after a failed lower stage or a
+//!   failed index record.
+//! - `write_resolved` removes an unsettled clear's entries, the cleared
+//!   sections, and the written cells.
+//! - `mark_resolved` removes the promoted cells.
+//! - `commit_provisional` installs the settle transform, or removes the staged
+//!   entries if the transform fails. It removes the committed sections' other
+//!   entries.
+//! - `publish_written` removes the cells of a failed publish.
 //!
-//! "Must-succeed" means: the delete either lands (bounded retries) or blows
-//! the cache fuse — it never fails upward, never stalls settlement, and never
-//! leaves a stale entry reachable.
+//! A provisional-index clear after a resolution is not a repair site. A failed
+//! clear only over-reports a cell to the sweep, so it warns and continues.
 //!
-//! Establish-then-publish, in one line: `lower.write` precedes every fjall
-//! publish, so a failed lower write returns the error and **never publishes**
-//! the new value. It may still leave the touched cells cold: `write_resolved`'s
-//! pre-call deletes (delete-first D4 section clears, and the drop-safe delete
-//! of the written cells) run before the lower write, so a failed apply degrades
-//! to a correct slow fall-through, never a wrong warm hit.
+//! A required removal retries for a bounded period.
+//! A final failure disables the cache for the assignment.
+//! The failure does not stop durable state settlement.
+//!
+//! A mutator publishes a new cache value only after its durable write succeeds.
+//! A failed durable write therefore never publishes the new value.
+//! `commit_provisional` is the one exception: the event verdict is final before
+//! it runs, so it publishes the committed values before the durable promote.
+//! Removals (`write_resolved`, `mark_resolved`, section clears) run before the
+//! durable call, so a failed durable call leaves cells cold, never stale.
 //!
 //! **The Incomplete trap.**
 //! `commit_provisional`
@@ -93,29 +80,16 @@
 //! [`ApplyOutcome::Incomplete`](crate::state::session) and arm `StateRecovery`
 //! forever for a perfectly healthy durable store.
 //!
-//! # The retry posture and the cache fuse
+//! # Cache disablement
 //!
-//! A failed must-succeed delete retries up to `DELETE_RETRY_BUDGET` times
-//! (the budget absorbs transients), then blows the workspace's one-way
-//! **cache fuse** — the sick-disk arm: local disk health can never stall the
-//! data path. The fuse is one shared `AtomicBool` in the fjall workspace's
-//! inner state, so every `Cached` clone of one assignment observes the same
-//! bit; it is loud (warn + metric), permanent for the assignment, and dies
-//! with the workspace. Each verb snapshots it **once at entry** — one
-//! admission decision governs every internal fjall step, never a no-op/live
-//! mix — and an admitted verb finishes against fjall even if the fuse blows
-//! mid-verb (safe: per-key dispatch excludes same-key readers, and the fuse
-//! never resets, so partial state is bypassed forever). Blown, fjall's three
-//! consumers partition by their contracts:
+//! A failed required removal disables the cache after bounded retries.
+//! All clones share this state for the assignment.
+//! Each operation reads this state once when it starts.
+//! An accepted operation completes its cache work.
 //!
-//! 1. **Committed cell entries** — every publish/delete no-ops and every read
-//!    falls through to the lower resolving read, so an undeleted stale entry is
-//!    unreachable and KV1 holds vacuously.
-//! 2. **The warm provisional index and its seeded latch** — bypassed wholesale:
-//!    `provisional_cells` delegates the lower stream verbatim (no seed check,
-//!    no recording, no latch).
-//! 3. **[`MarkerPresence`](crate::state::fjall)** — fused for uniformity; its
-//!    own contract is over-report-safe.
+//! A disabled cache sends committed cell operations to durable storage.
+//! It also bypasses the provisional index.
+//! [`MarkerCheckSet`](crate::state::fjall) stops its disk operations.
 //!
 //! # TTL co-expiry
 //!
@@ -129,14 +103,12 @@
 //! * A direct write (`write_resolved` / `write_provisional` /
 //!   `abort_provisional`) anchors on a clock read taken **before** the lower
 //!   write and stamps `floor(stamped_at) + ttl` ([`CollectionRef::ttl`]).
-//! * The settle transform (D5) **reuses** the stage-anchored expiry already on
-//!   the cell's entry — the promote does not re-stamp the durable TTL, so
-//!   `data` keeps the death set at stage time; a fresh `now + ttl` would
-//!   overhang it by the whole stage→commit gap.
+//! * Settlement keeps the expiry that the stage assigned. Durable promotion
+//!   does not change the durable expiry.
 //! * A fill reads the cell's *remaining* TTL from the lower store and stamps
 //!   `floor(now) + remaining`: the point fill (`CellStore::get_for_cache`)
-//!   reads the clock AFTER the lower read, while the batch fill
-//!   (`CellStore::get_many_for_cache`) anchors its clock read BEFORE the
+//!   reads the clock after the lower read, while the batch fill
+//!   (`CellStore::get_many_for_cache`) anchors its clock read before the
 //!   durable read, so a wide resolution can only stamp entries early.
 //!
 //! The cache read path stays a hint: a fjall read error is logged and degrades
@@ -170,22 +142,18 @@ use tracing::warn;
 
 /// Delay between attempts of a must-succeed repair delete ([`retry_delete`])
 /// while fjall is transiently failing. Zero under test: the bounded-retry
-/// pins assert lands-or-fuses, never pacing.
+/// tests assert completes-or-disables, never pacing.
 #[cfg(not(test))]
 const DELETE_RETRY_DELAY: Duration = Duration::from_millis(100);
 #[cfg(test)]
 const DELETE_RETRY_DELAY: Duration = Duration::ZERO;
 
-/// Attempts a must-succeed repair delete makes before blowing the cache fuse:
-/// the budget absorbs transient I/O hiccups (one must not cost a weeks-long
-/// assignment its cache); the fuse handles the sick disk.
+/// Maximum cache removal attempts before cache disablement.
 pub(crate) const DELETE_RETRY_BUDGET: usize = 5;
 
 /// A write-through fjall K/V cache over a lower committed `CellStore`.
 ///
-/// A cheap `Arc`-backed handle, cloned with the stack per event; the fjall
-/// workspace (and its shared cache fuse) is per-assignment — cold at a fresh
-/// assignment, dropped at revocation.
+/// A shared cache handle for one partition assignment.
 #[derive(Clone)]
 pub struct Cached<L> {
     fjall: FjallCellCache,
@@ -233,8 +201,9 @@ impl<L> Cached<L> {
         self.fjall.stored_expiry(collection, cell).await
     }
 
-    /// Test-only: force-deletes the cells' fjall entries — the D5 pins' cold
-    /// arm (the transform's delete-fallback shape, reproduced directly).
+    /// Test-only: force-deletes the cells' fjall entries — the settlement cache
+    /// update tests' cold arm (the transform's delete-fallback shape,
+    /// reproduced directly).
     #[cfg(test)]
     pub(crate) async fn evict_for_tests(
         &self,
@@ -244,16 +213,15 @@ impl<L> Cached<L> {
         self.fjall.delete_batch(collection, cells).await
     }
 
-    /// Deletes a foreign marker's staged coordinates and cleared sections —
-    /// the shared D3 body behind the fall-through-read guard and the stage
-    /// boundary. Must-succeed (lands-or-fuses): a stale entry left behind a
-    /// beneath-cache resolution would be served verbatim forever.
-    async fn delete_marker_window(&self, collection: &CollectionId, standing: &EventMarker) {
+    /// Removes cache entries that an event marker can change.
+    ///
+    /// A failed removal disables the cache.
+    async fn evict_marker_cache_entries(&self, collection: &CollectionId, marker: &EventMarker) {
         retry_delete(&self.fjall, "marker staged", || {
-            self.fjall.delete_batch(collection, standing.staged())
+            self.fjall.delete_batch(collection, marker.staged())
         })
         .await;
-        for clear in standing.clears() {
+        for clear in marker.clears() {
             retry_delete(&self.fjall, "marker section", || {
                 self.fjall.delete_section(collection, clear.section(), &[])
             })
@@ -270,9 +238,9 @@ impl<L> Cached<L> {
     /// `project` computes each cell's committed projection from its batch
     /// entry.
     ///
-    /// A failed publish runs D1: after the lower ack the durable value moved,
-    /// so a still-present old entry would serve the pre-write value verbatim —
-    /// the written cells' entries are deleted, must-succeed.
+    /// A failed cache update removes all old entries for these cells. The
+    /// durable value has moved, so an old entry would serve the pre-write
+    /// value.
     async fn publish_written<T>(
         &self,
         collection: &CollectionRef,
@@ -290,7 +258,8 @@ impl<L> Cached<L> {
             .map(|(cell, value)| (cell.clone(), project(value), expiry));
         if let Err(error) = self.fjall.put_batch(collection.id(), projected).await {
             warn_skip("publish", &error);
-            // D1 repair: rebuild the delete keys from the `cells` param.
+            // failed-publish cache guard repair: rebuild the delete keys from the `cells`
+            // param.
             let keys: CellBuffer<CellKey> = cells.iter().map(|(cell, _)| cell.clone()).collect();
             retry_delete(&self.fjall, "publish repair", || {
                 self.fjall.delete_batch(collection.id(), &keys)
@@ -304,31 +273,19 @@ impl<L> Cached<L>
 where
     L: CellStore,
 {
-    /// The fall-through read's D3 guard: a lower read can read-help-resolve a
-    /// standing foreign clears-bearing event marker **beneath** this cache
-    /// (the bottom store's committed-unapplied read window), settling the
-    /// marker WHOLE — gap tombstones land and staged cells promote while
-    /// sibling entries may still hold pre-settle values — a settle no cache
-    /// verb observes, so no repair would ever follow. Delete the marker's
-    /// staged coordinates and cleared sections BEFORE issuing the lower read
-    /// (mirroring the boundary guard in
-    /// [`write_provisional`](CellStore::write_provisional)): belt-and-braces
-    /// in production — a committed clears-bearing marker's deletes already ran
-    /// at the settle attempt, or the workspace died with the assignment — but
-    /// load-bearing under the fault alphabet's skipped-settle window.
-    /// Verdict-blind (rare path; correctness beats eviction precision). The
-    /// consult rides the lower store's marker memo (presence latch + standing
-    /// map), so the fast path adds no durable read.
-    async fn delete_read_window(
+    /// Removes entries before a read resolves a prior section clear.
+    ///
+    /// The clear can change staged cells and other cells in its sections.
+    /// Remove all affected entries before the lower read.
+    async fn evict_prior_clear_before_read(
         &self,
         collection: &CollectionId,
         own: EventRef,
     ) -> Result<(), L::Error> {
-        if let Some(standing) = self.lower.standing_marker(collection).await?
-            && standing.event() != own
-            && !standing.clears().is_empty()
+        if let Some(marker) = self.lower.unsettled_marker(collection).await?
+            && marker.is_prior_clear(own)
         {
-            self.delete_marker_window(collection, &standing).await;
+            self.evict_marker_cache_entries(collection, &marker).await;
         }
         Ok(())
     }
@@ -347,9 +304,8 @@ where
         own: EventRef,
     ) -> Result<Committed, Self::Error> {
         let started = Instant::now();
-        // Blown fuse: pure passthrough — no D3 (its only purpose is
-        // fjall-entry repair), no publish.
-        if self.fjall.fuse_blown() {
+        // Send the read to durable storage when the cache is disabled.
+        if self.fjall.is_disabled() {
             let loaded = self.lower.get(collection, cell, own).await;
             self.metrics
                 .point(started, Source::Store, CacheResult::Disabled, &loaded);
@@ -376,19 +332,10 @@ where
             }
         };
         let loaded = async {
-            self.delete_read_window(collection, own).await?;
+            self.evict_prior_clear_before_read(collection, own).await?;
             let (committed, remaining) = self.lower.get_for_cache(collection, cell, own).await?;
-            // Best-effort fill publish — present or absent (negative caching),
-            // stamped with the remaining-TTL co-expiry. Sound because of
-            // GetNeverReadsOwnStaged (module doc, KV2). A failed publish degrades
-            // with NO delete. On the Miss/Expired arms the prior state already
-            // fell through, so nothing stale survives. On the `Err(fjall read)`
-            // arm the prior state can be a live, unexpired entry that stays — safe
-            // because every schedule reaching here re-reads a value EQUAL to that
-            // surviving entry (the D5 pre-call transform installs the committed
-            // projection; per-key dispatch serializes whole events), so the entry
-            // is never stale on its own — a stale hit here would already be a KV1
-            // break from another site.
+            // Cache the durable result with its remaining lifetime.
+            // A failed update keeps an equal live entry or no entry.
             let expiry = self.expiry_for(remaining);
             if let Err(error) = self.fjall.put(collection, cell, &committed, expiry).await {
                 warn_skip("populate", &error);
@@ -402,27 +349,18 @@ where
         loaded
     }
 
-    /// Batch point read with the **all-hits-or-refetch** contract: one blocking
-    /// probe of the whole `CoordinateBatch`; every position a hit serves the
-    /// batch verbatim (KV1, zero lower reads), and any miss or expired entry
-    /// discards all sampled values and refetches every position from durable
-    /// truth.
+    /// Reads a batch from the cache only when every entry is current.
     ///
-    /// Serving the pure-hit batch with zero marker consults rests on the
-    /// cache-coherence invariant underpinning KV1: no cache entry ever coexists
-    /// with an oracle-committed-but-unpromoted provisional cell a same-key
-    /// event could read. It holds by construction — the D5 settle transform
-    /// installs the committed `data` projection into the cache before the
-    /// promote, so any entry standing through the committed-but-unpromoted
-    /// window already IS the current projection; per-key dispatch serializes
-    /// whole events, so no other same-key event races that settle; and every
-    /// ownership change mints a born-cold workspace (KV5), so no stale entry
-    /// survives a crash or rebalance. Ruling: selective partial-refetch
-    /// (retaining sampled hits beside durably-fetched misses) is sound
-    /// under this same invariant but stays deferred — held as
-    /// all-hits-or-refetch pending a benchmark showing material Cassandra
-    /// bytes/latency improvement; a partial-refetch design must pin the
-    /// committed-but-unpromoted window with a property.
+    /// One missing or expired entry reloads the complete batch.
+    /// A batch of hits consults no marker. This is sound for three reasons. The
+    /// settle transform installs committed values before the promote.
+    /// Per-key dispatch serializes events on a key. Every assignment starts
+    /// with a cold cache.
+    ///
+    /// Ruling: partial refetch (keep the hits, load only the misses) stays
+    /// deferred until a benchmark shows a material Cassandra gain. Such a
+    /// design must pin the committed-but-unpromoted window with a property
+    /// test.
     async fn get_many<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -431,11 +369,9 @@ where
         own: EventRef,
     ) -> Result<CommittedBatch, Self::Error> {
         let started = Instant::now();
-        // Fuse snapshot ONCE at entry. Blown: pure passthrough — no D3 (its only
-        // purpose is fjall-entry repair), no publish. Admitted: the whole verb
-        // runs admitted even if the fuse blows mid-call — no second fuse check
-        // below (the snapshot-once admission contract).
-        if self.fjall.fuse_blown() {
+        // Check the disabled state once when this operation starts.
+        // Complete accepted cache work if another operation disables the cache.
+        if self.fjall.is_disabled() {
             let loaded = self.lower.get_many(collection, section, batch, own).await;
             self.metrics.batch(
                 batch.len(),
@@ -449,7 +385,8 @@ where
         // Probe: ONE blocking hop, exhaustive.
         let cache_result = match self.fjall.get_batch(collection, section, batch).await {
             // Every position is a hit (Present value or Absent tag), the current
-            // committed projection (KV1): serve verbatim, zero lower reads, no D3.
+            // committed projection (KV1): serve verbatim, zero lower reads, no prior-clear cache
+            // guard.
             Ok(Some(hits)) => {
                 let loaded = Ok(hits);
                 self.metrics.batch(
@@ -461,7 +398,7 @@ where
                 );
                 return loaded;
             }
-            // Any miss/expired (KV2): fall through and refetch the WHOLE batch.
+            // Any miss/expired (KV2): fall through and refetch the complete batch.
             Ok(None) => CacheResult::NotAllHit,
             // A fjall probe failure degrades this read to a durable one.
             Err(error) => {
@@ -472,9 +409,9 @@ where
         };
         let loaded = async {
             // All-hits-or-refetch: any non-hit discards every sampled value and
-            // re-reads the whole batch from durable truth AFTER the read-window guard.
-            self.delete_read_window(collection, own).await?;
-            // Anchor the co-expiry on a clock read taken BEFORE the durable read
+            // re-reads the whole batch from durable truth after the prior-clear guard.
+            self.evict_prior_clear_before_read(collection, own).await?;
+            // Anchor the co-expiry on a clock read taken before the durable read
             // (see the module's TTL co-expiry doc): a wide batch resolution can only
             // stamp entries EARLY, never past their durable row death.
             let stamped_at = self.fjall.clock().now_ms();
@@ -485,8 +422,9 @@ where
                 .get_many_for_cache(collection, section, batch, own)
                 .await?;
             // Publish every cell (present AND absent), one atomic batch, NO delete on
-            // failure (the read-fill no-delete degrade — distinct from the mutator D1
-            // delete-on-failure). Each `CellKey` is built inline — no scratch buffer.
+            // failure (the read-fill no-delete degrade — distinct from the mutator
+            // failed-publish cache guard delete-on-failure). Each `CellKey` is
+            // built inline — no scratch buffer.
             let projected =
                 batch
                     .iter()
@@ -519,11 +457,12 @@ where
         scan: Scan<'a>,
         own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        // Scans bypass the cache (KV3): D3 guard, then the lower scan — the
-        // fuse snapshot happens on first poll, inside the generator.
+        // Scans bypass the cache (KV3): prior-clear cache guard, then the lower
+        // scan — the cache-disabled check happens on first poll, inside the
+        // generator.
         try_stream! {
-            if !self.fjall.fuse_blown() {
-                self.delete_read_window(collection, own).await?;
+            if !self.fjall.is_disabled() {
+                self.evict_prior_clear_before_read(collection, own).await?;
             }
             let inner = self.lower.scan_cells(collection, scan, own);
             pin_mut!(inner);
@@ -553,13 +492,9 @@ where
         // warm set — the fjall index is a hint over the authoritative durable
         // event marker.
         try_stream! {
-            // Blown fuse: the warm index AND its seeded latch are bypassed
-            // WHOLESALE — no seed check, no recording, no latch. Post-fuse,
-            // write_provisional's index recording no-ops, so a snapshot seeded
-            // pre-fuse is silently incomplete; consulting it would
-            // short-circuit the sweep and strand a provisional cell (the F2
-            // class).
-            if self.fjall.fuse_blown() {
+            // Bypass the provisional index when the cache is disabled.
+            // An older index can be incomplete after disablement.
+            if self.fjall.is_disabled() {
                 let inner = self.lower.provisional_cells(collection);
                 pin_mut!(inner);
                 while let Some(item) = inner.next().await {
@@ -639,7 +574,7 @@ where
         collection: &'a CollectionId,
         cell: &'a CellKey,
     ) -> Result<Option<ProvisionalCell>, Self::Error> {
-        // A pure lower read — no fjall step, so no fuse arm is needed.
+        // A pure lower read — no fjall step, so no cache-disabled branch is needed.
         self.lower.provisional_cell_at(collection, cell).await
     }
 
@@ -651,8 +586,9 @@ where
     ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
     {
         // A raw provisional read the committed-value cache cannot answer, so
-        // delegate straight to the lower store — no fjall step, no fuse arm
-        // (like `provisional_cell_at`). Nothing is published into the cache.
+        // delegate straight to the lower store — no fjall step, no cache-disabled
+        // branch (like `provisional_cell_at`). Nothing is published into the
+        // cache.
         self.lower.provisional_many(collection, section, batch)
     }
 
@@ -662,36 +598,25 @@ where
         writes: &'a [(CellKey, ProvisionalWrite)],
         marker: Option<&'a EventMarker>,
     ) -> Result<(), Self::Error> {
-        // Blown fuse: lower call only — no boundary repair (entries are
+        // Disabled cache: lower call only — no boundary repair (entries are
         // unreachable), no index recording, no publish. On Err return
         // verbatim; the index is bypassed wholesale, so there is no unseed.
-        if self.fjall.fuse_blown() {
+        if self.fjall.is_disabled() {
             return self
                 .lower
                 .write_provisional(collection, writes, marker)
                 .await;
         }
-        // Boundary D3: the lower store's stage boundary resolves any standing
-        // FOREIGN event marker *beneath* this cache — a settle no wrapper verb
-        // observes, so no publish or delete would ever follow it. With warm
-        // entries still holding those cells' stage-time `prev`, a committed
-        // foreign marker resolved down there would promote durably while fjall
-        // keeps serving the stale `prev` — an unbounded stale window, because
-        // the boundary (unlike the sweep) never routes through this type's
-        // settle verbs. So delete the marker's staged coordinates — and its
-        // cleared sections, whose gap tombstones the boundary resolve lands —
-        // BEFORE forwarding down. Deleting early only costs a fall-through
-        // (the lower read is oracle-resolving), and the uncommitted arm needs
-        // no special casing — the delete is verdict-blind (rare path;
-        // correctness beats eviction precision). Warm via the lower store's
-        // marker memo, so the fast path adds no durable read.
+        // The lower store can resolve a prior event marker during this stage.
+        // Remove each affected cache entry before that resolution.
         if let Some(marker) = marker
-            && let Some(standing) = self.lower.standing_marker(collection.id()).await?
-            && standing.event() != marker.event()
+            && let Some(unsettled) = self.lower.unsettled_marker(collection.id()).await?
+            && unsettled.event() != marker.event()
         {
-            self.delete_marker_window(collection.id(), &standing).await;
+            self.evict_marker_cache_entries(collection.id(), &unsettled)
+                .await;
         }
-        // Anchor the co-expiry on a clock read taken BEFORE the lower write
+        // Anchor the co-expiry on a clock read taken before the lower write
         // (see the module's TTL co-expiry doc). Establish first: a failed
         // lower write returns the error — but a PARTIAL durable stage may have
         // landed cells the warm set now misses, so the seeded latch must drop
@@ -743,32 +668,19 @@ where
         cells: &'a [(CellKey, Option<Bytes>)],
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        if self.fjall.fuse_blown() {
+        if self.fjall.is_disabled() {
             return self.lower.write_resolved(collection, cells, clears).await;
         }
-        // D3: the lower `write_resolved` now runs the write-side boundary
-        // (`help_write_window`) — a blind write resolves a standing
-        // clears-bearing marker BENEATH this cache (staged cells promote, gap
-        // tombstones land), a settle no cache verb observes, so no publish
-        // would ever follow. Delete the marker's staged coordinates and cleared
-        // sections first, as the fall-through read guard does. No own event to
-        // compare (`write_resolved` carries no `EventRef`) — deleting an own
-        // marker's window costs a fall-through, never staleness. Rides the
-        // lower store's marker memo, so the fast path adds no durable read.
-        if let Some(standing) = self.lower.standing_marker(collection.id()).await?
-            && !standing.clears().is_empty()
+        // Remove entries that an unsettled section clear can change.
+        // Do this before the lower store resolves the clear.
+        if let Some(unsettled) = self.lower.unsettled_marker(collection.id()).await?
+            && unsettled.has_clears()
         {
-            self.delete_marker_window(collection.id(), &standing).await;
+            self.evict_marker_cache_entries(collection.id(), &unsettled)
+                .await;
         }
-        // D4, whole-section, BEFORE the lower call: this is the marker-free
-        // direct apply (ReadUncommitted finalize / mid-handler `commit()`) — a
-        // stale entry in a cleared section has NO later repair (no marker
-        // exists for read-help to resolve), so delete-first is mandatory. A
-        // failed or cancelled lower write then leaves the sections merely cold
-        // (a slow read, never a wrong one). Whole-section is correct here —
-        // unlike the commit site — because the written cells are deleted
-        // pre-call (drop-safety, below) and re-warmed by `publish_written(data)`
-        // AFTER the lower call.
+        // Remove each cleared section before the lower write.
+        // A failed lower write leaves the section uncached.
         for clear in clears {
             retry_delete(&self.fjall, "clear section", || {
                 self.fjall
@@ -776,20 +688,9 @@ where
             })
             .await;
         }
-        // Drop-safety: `write_resolved` is the one user-droppable write path —
-        // mid-handler `commit()` / ReadUncommitted finalize run in a
-        // handler-owned future the `SessionGate` blesses dropping. The written
-        // cells' OLD entries go stale the instant the durable write lands, and
-        // the re-warming `publish_written` runs only AFTER the lower ack — so a
-        // drop (or a publish + D1 failure) in that window would leave them
-        // served verbatim forever (KV1). Delete the written cells' entries
-        // pre-call too, must-succeed: a drop then leaves them cold (a
-        // fall-through), never stale, and the success path re-warms them. A
-        // pre-call INSTALL would be wrong here — unlike the D5 transform the
-        // write's success is not yet fixed, so caching `data` early could cache
-        // a value that never lands. (Not a per-message hot path: this verb runs
-        // only on `commit()`/finalize, and the keys are one bounded batch off
-        // the `cells` param — the same key-clone shape D1 already uses.)
+        // Remove old entries before the durable write.
+        // Cancellation can then leave entries absent, but never stale.
+        // Publish the new values only after the durable write succeeds.
         let cell_keys: CellBuffer<CellKey> = cells.iter().map(|(cell, _)| cell.clone()).collect();
         retry_delete(&self.fjall, "resolved cells", || {
             self.fjall.delete_batch(collection.id(), &cell_keys)
@@ -821,22 +722,11 @@ where
         collection: &'a CollectionRef,
         cells: &'a [CellKey],
     ) -> Result<(), Self::Error> {
-        if self.fjall.fuse_blown() {
+        if self.fjall.is_disabled() {
             return self.lower.mark_resolved(collection, cells).await;
         }
-        // D2: the raw promote keeps `data` as the committed value but does not
-        // carry it here, so the cache cannot publish the new committed
-        // projection from the keys alone (`commit_provisional` is the promote
-        // path that does carry the staged writes; this raw promote is only
-        // reached by the recovery sweep / `resolve_cell`). Because a hit is
-        // served verbatim, a stale `prev` left cached would be served forever
-        // — so delete the touched entries, must-succeed, BEFORE the durable
-        // promote: deleting early only costs a fall-through (the lower read
-        // resolves through the oracle), while deleting after would leave a
-        // promoted-but-cached `prev` if the caller is cancelled mid-way — a
-        // window the sweep could never repair, since a resolved cell is never
-        // re-promoted. Delete-first, a crash or cancellation leaves the cell
-        // provisional and the sweep retries whole.
+        // The keys do not contain the new committed values.
+        // Remove their old entries before the durable promotion.
         retry_delete(&self.fjall, "promote", || {
             self.fjall.delete_batch(collection.id(), cells)
         })
@@ -860,26 +750,18 @@ where
         writes: &'a [(CellKey, ProvisionalWrite)],
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        if self.fjall.fuse_blown() {
+        if self.fjall.is_disabled() {
             return self
                 .lower
                 .commit_provisional(collection, writes, clears)
                 .await;
         }
-        // (1) The D5 settle transform, strictly BEFORE the lower promote: the
-        // commit verdict is already fixed when this verb runs (the settle
-        // boundary records the marker and commits the offset first; the sweep
-        // calls it only on an oracle `committed` verdict), so `data` IS the
-        // logical committed projection — installing it pre-call is correct
-        // even if the promote then fails or this future is dropped, and the
-        // staged cells stay WARM through the settle. A failed transform batch
-        // falls back to must-succeed deletion of the same entries (cold, never
-        // stale).
-        //
-        // Recorded ruling — commit warmth pays rent; do not replace the
-        // transform with delete-and-refill: leaving staged cells cold after
-        // commit would charge one durable point read per hot cell per event on
-        // the dominant read-modify-write workload.
+        // Publish the committed values before durable promotion.
+        // The event result is final before this function starts.
+        // Remove the entries if this cache update fails.
+        // Ruling: keep this transform. Delete-and-refill would leave staged
+        // cells cold after each commit and cost one durable point read per hot
+        // cell per event.
         if let Err(error) = self.fjall.commit_batch(collection.id(), writes).await {
             warn_skip("commit transform", &error);
             let cells: CellBuffer<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
@@ -888,15 +770,8 @@ where
             })
             .await;
         }
-        // (2) D4 scoped to the cleared sections MINUS the staged coordinates —
-        // the set equation: S (the staged coordinates) holds `data` warm, C∖S
-        // (every other cached entry in the cleared sections) is deleted,
-        // everything else untouched. A whole-section delete here would evict
-        // the entries the transform just installed — cold, not wrong, but it
-        // would silently void commit warmth exactly on clear-and-repopulate
-        // events; and running D4 first instead would destroy the stage frames
-        // whose expiries the transform reads. Order: transform → scoped D4 →
-        // lower promote.
+        // Remove other entries from each cleared section.
+        // Keep the staged entries that this settlement just published.
         if !clears.is_empty() {
             let staged: CellBuffer<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
             for clear in clears {
@@ -935,7 +810,7 @@ where
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
-        if self.fjall.fuse_blown() {
+        if self.fjall.is_disabled() {
             return self.lower.abort_provisional(collection, writes).await;
         }
         let cells: CellBuffer<(CellKey, Option<Bytes>)> = writes
@@ -975,13 +850,13 @@ where
         result
     }
 
-    async fn standing_marker<'a>(
+    async fn unsettled_marker<'a>(
         &'a self,
         collection: &'a CollectionId,
     ) -> Result<Option<EventMarker>, Self::Error> {
         // A pure lower read — the cache never caches markers (the marker
-        // lifecycle lives in the lower store), so no fuse arm is needed.
-        self.lower.standing_marker(collection).await
+        // lifecycle lives in the lower store), so no cache-disabled branch is needed.
+        self.lower.unsettled_marker(collection).await
     }
 }
 
@@ -1000,10 +875,10 @@ where
 /// bounded and accepted. Cross-node clock skew (the coordinator's wall clock
 /// differs from this node's) no client-side arithmetic can remove; a *forward*
 /// skew or step only shortens the fjall life, so it too falls through and
-/// self-heals. A **backward** local clock step AFTER publication is the one
+/// self-heals. A **backward** local clock step after publication is the one
 /// direction the fall-through does not cover: the entry never reads as expired,
 /// so it stays a hit past the durable row's death for the size of the step,
-/// until the next write-through or D-site eviction heals it — bounded by the
+/// until the next write-through or marker eviction heals it — bounded by the
 /// NTP step magnitude. A monotonic-clock floor would remove it; it is not
 /// applied here.
 fn expiry_at(stamped_at: u64, remaining: Option<CompactDuration>) -> u64 {
@@ -1018,10 +893,10 @@ fn expiry_at(stamped_at: u64, remaining: Option<CompactDuration>) -> u64 {
 
 /// Runs a must-succeed repair delete: up to [`DELETE_RETRY_BUDGET`] attempts
 /// with [`DELETE_RETRY_DELAY`] between them, warning per failure; on
-/// exhaustion it **blows the cache fuse** and returns. Lands-or-fuses: it
-/// never fails upward and never stalls settlement — see the module's retry
-/// posture for why every failure class (there is no Permanent escape hatch)
-/// lands in the same bounded place.
+/// exhaustion it **disables the cache** and returns. Completes-or-disables: it
+/// never fails upward and never stalls settlement — see the module's cache
+/// disablement section for why every failure class (there is no Permanent
+/// escape hatch) lands in the same bounded place.
 ///
 /// A dropped **boundary-owned** settle/sweep future abandons the retry
 /// harmlessly: the drop coincides with assignment revocation (the workspace —
@@ -1047,7 +922,7 @@ where
             }
         }
     }
-    fjall.blow_fuse();
+    fjall.disable();
 }
 
 /// Logs a degraded fjall cache operation (the cache is a hint; correctness
