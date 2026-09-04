@@ -97,7 +97,7 @@ async fn map_cursor_is_lazy() -> Result<()> {
     let cursor = ctx
         .map_state(MAP_NAME)
         .map_err(|e| eyre!("vend map: {e}"))?
-        .scan(Direction::Forward);
+        .scan(MapScanConfig::default());
     let first = cursor.next().await.map_err(|e| eyre!("first next: {e}"))?;
     assert!(first.is_some(), "the seeded map must yield a first entry");
 

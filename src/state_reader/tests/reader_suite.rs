@@ -50,6 +50,7 @@ use color_eyre::eyre::{Result, eyre};
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
+use std::num::NonZeroUsize;
 
 /// The fixed routing coordinates one trace runs under. The owner writes
 /// through them and the reader independently recomputes them. Bundled so a
@@ -241,6 +242,36 @@ async fn assert_map<B: ReaderBackend>(
     if keys != model.keys().copied().collect::<Vec<_>>() {
         return Ok(false);
     }
+    let constrained_entries = Box::pin(collect_stream(
+        reader
+            .query(case.key.clone(), Direction::Forward)
+            .from(&-1)
+            .before(&2)
+            .limit(NonZeroUsize::MIN)
+            .entries()
+            .await?,
+    ))
+    .await?;
+    let expected_entries = model
+        .range(-1..2)
+        .take(1)
+        .map(|(key, value)| (*key, value.clone()))
+        .collect::<Vec<_>>();
+    if constrained_entries != expected_entries {
+        return Ok(false);
+    }
+    let constrained_keys = Box::pin(collect_stream(
+        reader
+            .query(case.key.clone(), Direction::Forward)
+            .after(&-2)
+            .to(&1)
+            .keys()
+            .await?,
+    ))
+    .await?;
+    if constrained_keys != model.range(-1..=1).map(|(key, _)| *key).collect::<Vec<_>>() {
+        return Ok(false);
+    }
     let backward = Box::pin(collect_stream(
         reader.stream(case.key.clone(), Direction::Backward).await?,
     ))
@@ -376,7 +407,37 @@ async fn assert_deque<B: ReaderBackend>(
         reader.stream(case.key.clone(), Direction::Backward).await?,
     ))
     .await?;
-    Ok(backward == model.iter().rev().cloned().collect::<Vec<_>>())
+    if backward != model.iter().rev().cloned().collect::<Vec<_>>() {
+        return Ok(false);
+    }
+    let constrained = Box::pin(collect_stream(
+        reader
+            .query(case.key.clone(), Direction::Forward)
+            .range(1..=3)
+            .limit(NonZeroUsize::MIN)
+            .values()
+            .await?,
+    ))
+    .await?;
+    if constrained != model.iter().skip(1).take(1).cloned().collect::<Vec<_>>() {
+        return Ok(false);
+    }
+    let constrained_backward = Box::pin(collect_stream(
+        reader
+            .query(case.key.clone(), Direction::Backward)
+            .range(1..=3)
+            .values()
+            .await?,
+    ))
+    .await?;
+    Ok(constrained_backward
+        == model
+            .iter()
+            .take(4)
+            .skip(1)
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>())
 }
 
 /// Drives a Deque trace: commit each event's push/pop/clear, mirror into a

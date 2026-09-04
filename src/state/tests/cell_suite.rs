@@ -35,7 +35,7 @@
 //!   is the resolved committed base, the same path `finalize` uses.
 
 use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
-use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
+use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::super::dirty::DirtyStore;
 use super::super::identity::{CollectionId, CollectionRef};
 use super::super::marker::{EventMarker, SectionClear};
@@ -61,6 +61,7 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::future::{Future, ready};
 use std::iter;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::slice;
 use std::sync::Arc;
@@ -2355,7 +2356,7 @@ struct ScanReq {
     start_kind: EdgeKind,
     end_kind: EdgeKind,
     end: u8,
-    limit: Option<u8>,
+    limit: Option<NonZeroUsize>,
     partial: Option<u8>,
 }
 
@@ -2370,8 +2371,9 @@ impl Arbitrary for ScanReq {
             start_kind: EdgeKind::arbitrary(g),
             end_kind: EdgeKind::arbitrary(g),
             end: u8::arbitrary(g) % (CELLS + 1),
-            // Includes 0 and values > the cell count.
-            limit: bool::arbitrary(g).then(|| u8::arbitrary(g) % (CELLS + 4)),
+            limit: bool::arbitrary(g)
+                .then(|| NonZeroUsize::new(usize::from(u8::arbitrary(g) % (CELLS + 4)) + 1))
+                .flatten(),
             partial: bool::arbitrary(g).then(|| u8::arbitrary(g) % (CELLS + 1)),
         }
     }
@@ -2408,7 +2410,7 @@ fn scan_oracle(model: &CellModel, req: ScanReq) -> Vec<(u8, Bytes)> {
         cells.reverse();
     }
     if let Some(limit) = req.limit {
-        cells.truncate(limit as usize);
+        cells.truncate(limit.get());
     }
     cells
 }
@@ -2440,24 +2442,26 @@ fn in_scan_range(req: ScanReq, c: u8) -> bool {
 /// Builds the [`Scan`] request from a [`ScanReq`] and owned anchor coordinates.
 /// `req.start_kind`/`req.end_kind` choose each edge (incl/excl/unbounded).
 fn scan_of<'a>(req: ScanReq, start: &'a Coordinate, end: &'a Coordinate) -> Scan<'a> {
-    let edge = |kind, coordinate| match kind {
-        EdgeKind::Included => ScanEdge::Included(coordinate),
-        EdgeKind::Excluded => ScanEdge::Excluded(coordinate),
-        EdgeKind::Unbounded => ScanEdge::Unbounded,
+    let dir = if req.forward {
+        Direction::Forward
+    } else {
+        Direction::Backward
     };
-    let start = edge(req.start_kind, start);
-    let end = edge(req.end_kind, end);
-    Scan {
-        section: SECTIONS[req.sect as usize % SECTIONS.len()],
-        start,
-        dir: if req.forward {
-            Direction::Forward
-        } else {
-            Direction::Backward
-        },
-        end,
-        limit: req.limit.map(usize::from),
+    let mut scan = Scan::over(SECTIONS[req.sect as usize % SECTIONS.len()], dir);
+    scan = match req.start_kind {
+        EdgeKind::Included => scan.from(start),
+        EdgeKind::Excluded => scan.after(start),
+        EdgeKind::Unbounded => scan,
+    };
+    scan = match req.end_kind {
+        EdgeKind::Included => scan.to(end),
+        EdgeKind::Excluded => scan.before(end),
+        EdgeKind::Unbounded => scan,
+    };
+    if let Some(limit) = req.limit {
+        scan = scan.limit(limit);
     }
+    scan
 }
 
 /// Collects an overlay scan, mapping each cell to `(coordinate byte, bytes)`.

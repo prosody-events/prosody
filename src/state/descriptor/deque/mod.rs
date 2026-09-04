@@ -83,8 +83,8 @@ use crate::state::cell_key::Direction;
 #[cfg(test)]
 use crate::state::cell_key::{CellKey, Coordinate};
 use crate::state::collection::{
-    Collection, CollectionLayout, CollectionRead, CollectionWrite, JOURNAL_INLINE, Plan,
-    StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
+    Collection, CollectionLayout, CollectionRead, CollectionWrite, Constraints, JOURNAL_INLINE,
+    Plan, StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
     spec_matches,
 };
 #[cfg(test)]
@@ -96,6 +96,7 @@ use educe::Educe;
 use futures::stream::{Stream, StreamExt};
 use std::error::Error;
 use std::num::NonZeroUsize;
+use std::ops::{Bound, RangeBounds};
 use thiserror::Error;
 use tracing::{Instrument, Span, field::Empty, info_span, instrument};
 
@@ -243,6 +244,78 @@ pub struct DequeHandle<S, T> {
     cells: Collection<S, DequeKind<T>>,
 }
 
+/// A directional deque stream query over front-relative positions.
+///
+/// Build one with [`DequeHandle::query`]. Finish it with
+/// [`values`](Self::values).
+#[must_use]
+pub struct DequeQuery<'a, S, T> {
+    handle: &'a DequeHandle<S, T>,
+    dir: Direction,
+    start: Bound<usize>,
+    end: Bound<usize>,
+    limit: Option<NonZeroUsize>,
+}
+
+impl<'a, S, T> DequeQuery<'a, S, T>
+where
+    S: StateSession,
+    T: CellType<Key = UnitKey>,
+{
+    /// Sets the front-relative position range.
+    pub fn range<R: RangeBounds<usize>>(mut self, range: R) -> Self {
+        self.start = range.start_bound().cloned();
+        self.end = range.end_bound().cloned();
+        self
+    }
+
+    /// Sets the maximum number of present values.
+    pub fn limit(mut self, limit: NonZeroUsize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Streams the query's live values.
+    pub fn values(
+        self,
+    ) -> impl Stream<Item = Result<ResolvedOf<T>, DequeStateError<CellCodecError<T>>>> + 'a
+    where
+        for<'s> ContextOf<'s, T>: FromSession<'s, S>,
+    {
+        // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
+        // so each inner await is instrumented with a clone instead; the
+        // span's recorded time is the stream's own work. Unlike the sibling
+        // ops' `err`, failures are yielded per item rather than recorded on
+        // the span — a failing chunk ends with an OK-status span, and the
+        // yielded `Err` surfaces to the caller inside this span's scope.
+        let span = info_span!(
+            "deque.stream",
+            collection = self.handle.cells.name().as_str(),
+            direction = ?self.dir,
+        );
+        try_stream! {
+            // Init: `stream_plan` reads the bounds cell under an admission
+            // that it drops as it returns, before this `?` sees the result.
+            let plan = self.handle
+                .stream_plan(self.dir, &self.start, &self.end)
+                .instrument(span.clone())
+                .await?;
+            let inner = plan.entries(Constraints {
+                limit: self.limit,
+                ..Constraints::default()
+            });
+            futures::pin_mut!(inner);
+            while let Some(item) = inner.next().instrument(span.clone()).await {
+                // The driver yields the decoded index. The module's window
+                // invariant makes that index redundant, so expose only the
+                // resolved element.
+                let (_, value) = item?;
+                yield value;
+            }
+        }
+    }
+}
+
 #[collection_methods(field = cells, session = S)]
 impl<S, T> DequeHandle<S, T>
 where
@@ -383,9 +456,33 @@ where
     async fn stream_plan(
         &self,
         dir: Direction,
+        start: &Bound<usize>,
+        end: &Bound<usize>,
     ) -> Result<Plan<S, Keyed<I64KeyCodec, T>>, DequeStateError<CellCodecError<T>>> {
         let window = bounds(op).await?;
-        let len = window.len()?;
+        let window_len = window.len()?;
+        let start = match start {
+            Bound::Included(position) => *position,
+            Bound::Excluded(position) => position.saturating_add(1),
+            Bound::Unbounded => 0,
+        }
+        .min(window_len);
+        let end = match end {
+            Bound::Included(position) => position.saturating_add(1),
+            Bound::Excluded(position) => *position,
+            Bound::Unbounded => window_len,
+        }
+        .min(window_len);
+        if start >= end {
+            return Ok(Plan::Points(op.coordinates(
+                DequeKind::<T>::ENTRIES,
+                Vec::new(),
+                dir,
+            )));
+        }
+        let len = end - start;
+        let first = window.absolute(start)?;
+        let last = window.absolute(end - 1)?;
         // The wide-window guard yields the scan limit as `NonZeroUsize`, so a
         // zero limit is uncompilable here rather than checked.
         if let Some(limit) = NonZeroUsize::new(len).filter(|n| n.get() > DEQUE_POINT_ITERATION_MAX)
@@ -394,13 +491,9 @@ where
             // It runs from the front `head` to the back `tail − 1`, and
             // mirrors backward. A wide window is nonempty, so `tail − 1` does
             // not underflow.
-            let last = window
-                .tail
-                .checked_sub(1)
-                .ok_or(MetaDecodeError::IndexOverflow)?;
             let (start, end) = match dir {
-                Direction::Forward => (window.head, last),
-                Direction::Backward => (last, window.head),
+                Direction::Forward => (first, last),
+                Direction::Backward => (last, first),
             };
             return Ok(Plan::Scan(op.range_within(
                 DequeKind::<T>::ENTRIES,
@@ -410,25 +503,23 @@ where
                 limit,
             )));
         }
-        // Point-get arm. `absolute` is monotone in the position. One check of
-        // the extreme index therefore proves that every position in `[0, len)`
-        // is in range, and that the coordinate list cannot fail.
-        if len > 0 {
-            window.absolute(len - 1)?;
-        }
-        let head = window.head;
+        // Point-get arm. `absolute` is monotone in the position, and `first`
+        // and `last` checked both extremes above, so every interior index is
+        // `first + offset` with no overflow possible.
         // `DEQUE_POINT_ITERATION_MAX` bounds this buffer at 128 × 8 B ≈ 1 KiB.
         // This code sizes it once and pays it once per stream construction,
         // never in the per-item steady state. Owned indices are what let one
         // driver serve both the owner and the reader.
         let mut indices: Vec<i64> = Vec::with_capacity(len);
-        indices.extend((0..len).map(|position| head + position as i64));
+        indices.extend((0..len).map(|offset| first + offset as i64));
         if dir == Direction::Backward {
             indices.reverse();
         }
-        Ok(Plan::Points(
-            op.coordinates(DequeKind::<T>::ENTRIES, indices),
-        ))
+        Ok(Plan::Points(op.coordinates(
+            DequeKind::<T>::ENTRIES,
+            indices,
+            dir,
+        )))
     }
 
     /// Streams the live elements in index order — front to back for
@@ -471,29 +562,17 @@ where
     where
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
-        // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
-        // so each inner await is instrumented with a clone instead; the
-        // span's recorded time is the stream's own work. Unlike the sibling
-        // ops' `err`, failures are yielded per item rather than recorded on
-        // the span — a failing chunk ends with an OK-status span, and the
-        // yielded `Err` surfaces to the caller inside this span's scope.
-        let span = info_span!(
-            "deque.stream",
-            collection = self.cells.name().as_str(),
-            direction = ?dir,
-        );
-        try_stream! {
-            // Init: `stream_plan` reads the bounds cell under an admission
-            // that it drops as it returns, before this `?` sees the result.
-            let inner = self.stream_plan(dir).instrument(span.clone()).await?.entries();
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().instrument(span.clone()).await {
-                // The driver yields the decoded index. The module's window
-                // invariant makes that index redundant, so expose only the
-                // resolved element.
-                let (_, value) = item?;
-                yield value;
-            }
+        self.query(dir).values()
+    }
+
+    /// Builds a directional deque stream query.
+    pub fn query(&self, dir: Direction) -> DequeQuery<'_, S, T> {
+        DequeQuery {
+            handle: self,
+            dir,
+            start: Bound::Unbounded,
+            end: Bound::Unbounded,
+            limit: None,
         }
     }
 

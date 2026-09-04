@@ -18,6 +18,7 @@
 //! [`order_codec`]: crate::state::order_codec
 
 use bytes::Bytes;
+use std::num::NonZeroUsize;
 use std::ops::Bound;
 
 /// Disjoint, orderable sub-grouping of one collection's cells.
@@ -195,26 +196,100 @@ impl<T> From<ScanEdge<T>> for Bound<T> {
 /// `start` (the high side) toward `end` (the low side). Either edge may be
 /// [`ScanEdge::Unbounded`] (open on that side), so a scan is still single-
 /// section but need not be pinned to a known coordinate range.
+///
+/// Build a scan with [`Scan::over`]. Prepositions that name a coordinate
+/// include it (`from` and `to`). Prepositions that name a relation exclude it
+/// (`after` and `before`). State all edges in iteration order. A later call for
+/// the same edge replaces the earlier call.
 #[derive(Clone, Copy)]
 pub struct Scan<'a> {
-    /// The section whose cells the scan walks.
-    pub section: Section,
-
-    /// The edge the scan starts walking from (low side forward, high side
-    /// backward).
-    pub start: ScanEdge<&'a Coordinate>,
-
-    /// The direction the scan walks from `start`.
-    pub dir: Direction,
-
-    /// The edge the scan stops at (high side forward, low side backward).
-    pub end: ScanEdge<&'a Coordinate>,
-
-    /// The optional maximum number of cells to yield.
-    pub limit: Option<usize>,
+    section: Section,
+    start: ScanEdge<&'a Coordinate>,
+    dir: Direction,
+    end: ScanEdge<&'a Coordinate>,
+    limit: Option<NonZeroUsize>,
 }
 
-impl Scan<'_> {
+impl<'a> Scan<'a> {
+    /// Builds an unbounded scan over one section.
+    #[must_use]
+    pub fn over(section: Section, dir: Direction) -> Self {
+        Self {
+            section,
+            start: ScanEdge::Unbounded,
+            dir,
+            end: ScanEdge::Unbounded,
+            limit: None,
+        }
+    }
+
+    /// Starts at `coordinate`.
+    #[must_use]
+    pub fn from(mut self, coordinate: &'a Coordinate) -> Self {
+        self.start = ScanEdge::Included(coordinate);
+        self
+    }
+
+    /// Starts after `coordinate`.
+    #[must_use]
+    pub fn after(mut self, coordinate: &'a Coordinate) -> Self {
+        self.start = ScanEdge::Excluded(coordinate);
+        self
+    }
+
+    /// Stops at `coordinate`.
+    #[must_use]
+    pub fn to(mut self, coordinate: &'a Coordinate) -> Self {
+        self.end = ScanEdge::Included(coordinate);
+        self
+    }
+
+    /// Stops before `coordinate`.
+    #[must_use]
+    pub fn before(mut self, coordinate: &'a Coordinate) -> Self {
+        self.end = ScanEdge::Excluded(coordinate);
+        self
+    }
+
+    /// Sets the maximum result count.
+    #[must_use]
+    pub fn limit(mut self, limit: NonZeroUsize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Removes the maximum result count.
+    #[must_use]
+    pub(crate) fn without_limit(mut self) -> Self {
+        self.limit = None;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn section(&self) -> Section {
+        self.section
+    }
+
+    #[must_use]
+    pub(crate) fn start(&self) -> ScanEdge<&'a Coordinate> {
+        self.start
+    }
+
+    #[must_use]
+    pub(crate) fn direction(&self) -> Direction {
+        self.dir
+    }
+
+    #[must_use]
+    pub(crate) fn end(&self) -> ScanEdge<&'a Coordinate> {
+        self.end
+    }
+
+    #[must_use]
+    pub(crate) fn result_limit(&self) -> Option<NonZeroUsize> {
+        self.limit
+    }
+
     /// The scan's direction-relative edges resolved to absolute `(low, high)`:
     /// forward keeps `(start, end)`, backward swaps to `(end, start)`.
     #[must_use]

@@ -77,10 +77,10 @@ use crate::codec::{Codec, JsonCodec};
 use crate::error::{ClassifyError, ErrorCategory};
 #[cfg(test)]
 use crate::state::cell_key::CellKey;
-use crate::state::cell_key::{Coordinate, Direction};
+use crate::state::cell_key::{Coordinate, Direction, ScanEdge};
 use crate::state::collection::{
-    Collection, CollectionLayout, CollectionRead, CollectionWrite, JOURNAL_INLINE, Plan,
-    StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
+    Collection, CollectionLayout, CollectionRead, CollectionWrite, Constraints, JOURNAL_INLINE,
+    Plan, StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
     spec_matches,
 };
 use crate::state::order_codec::{I64KeyCodec, KeyCodecError, OrderedKeyCodec, UnitKey};
@@ -416,12 +416,15 @@ pub struct MapHandle<S, KC, V> {
 /// A directional map stream query.
 ///
 /// Build one with [`MapHandle::query`]. Finish with [`keys`](Self::keys) or
-/// [`entries`](Self::entries).
+/// [`entries`](Self::entries). `from` and `to` include their key. `after` and
+/// `before` exclude their key. State all edges in iteration order. A later call
+/// for the same edge replaces the earlier call. A start past the end yields an
+/// empty stream.
 #[must_use]
 pub struct MapQuery<'a, S, KC, V> {
     handle: &'a MapHandle<S, KC, V>,
     dir: Direction,
-    limit: Option<NonZeroUsize>,
+    constraints: Constraints,
 }
 
 impl<'a, S, KC, V> MapQuery<'a, S, KC, V>
@@ -431,10 +434,43 @@ where
     KC::Key: Display,
     V: CellType<Key = UnitKey>,
 {
+    /// Starts at `key`.
+    pub fn from(mut self, key: &KC::Key) -> Self {
+        self.constraints.start = ScanEdge::Included(KC::encode(key));
+        self
+    }
+
+    /// Starts after `key`.
+    pub fn after(mut self, key: &KC::Key) -> Self {
+        self.constraints.start = ScanEdge::Excluded(KC::encode(key));
+        self
+    }
+
+    /// Stops at `key`.
+    pub fn to(mut self, key: &KC::Key) -> Self {
+        self.constraints.end = ScanEdge::Included(KC::encode(key));
+        self
+    }
+
+    /// Stops before `key`.
+    pub fn before(mut self, key: &KC::Key) -> Self {
+        self.constraints.end = ScanEdge::Excluded(KC::encode(key));
+        self
+    }
+
     /// Sets the maximum number of present items that the stream yields.
-    /// Absent rows are free. Fetch sizing cannot change an answer.
+    /// Absent rows do not count toward the limit. Fetch sizing cannot change an
+    /// answer.
     pub fn limit(mut self, limit: NonZeroUsize) -> Self {
-        self.limit = Some(limit);
+        self.constraints.limit = Some(limit);
+        self
+    }
+
+    /// Replaces the whole constraint set with one that an outer layer
+    /// lowered. The reader and the erased surfaces apply their configs
+    /// through this one method.
+    pub(crate) fn with_constraints(mut self, constraints: Constraints) -> Self {
+        self.constraints = constraints;
         self
     }
 
@@ -458,11 +494,7 @@ where
             // Init: `stream_plan` reads the keyset under an admission it drops
             // as it returns, before this `?` observes the result.
             let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
-            let plan = match self.limit {
-                Some(limit) => plan.with_limit(limit),
-                None => plan,
-            };
-            let inner = plan.entries();
+            let inner = plan.entries(self.constraints);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
                 yield item?;
@@ -479,11 +511,7 @@ where
         );
         try_stream! {
             let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
-            let plan = match self.limit {
-                Some(limit) => plan.with_limit(limit),
-                None => plan,
-            };
-            let inner = plan.keys();
+            let inner = plan.keys(self.constraints);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
                 yield item?;
@@ -720,9 +748,11 @@ where
             // Absent ⇒ no live entries: an empty tracked plan — zero
             // coordinates, so zero point gets and no scan.
             PriorKeyset::Absent => {
-                return Ok(Plan::Points(
-                    op.coordinates(MapKind::<KC, V>::ENTRIES, Vec::new()),
-                ));
+                return Ok(Plan::Points(op.coordinates(
+                    MapKind::<KC, V>::ENTRIES,
+                    Vec::new(),
+                    dir,
+                )));
             }
             // Overflowed falls to the scan with no warning; Malformed already
             // warned in `read_keyset_state`.
@@ -752,9 +782,11 @@ where
         if dir == Direction::Backward {
             keys.reverse();
         }
-        Ok(Plan::Points(
-            op.coordinates(MapKind::<KC, V>::ENTRIES, keys),
-        ))
+        Ok(Plan::Points(op.coordinates(
+            MapKind::<KC, V>::ENTRIES,
+            keys,
+            dir,
+        )))
     }
 
     /// Streams the live entries in key order — ascending for
@@ -824,7 +856,7 @@ where
         MapQuery {
             handle: self,
             dir,
-            limit: None,
+            constraints: Constraints::default(),
         }
     }
 

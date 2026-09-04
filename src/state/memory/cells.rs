@@ -80,7 +80,7 @@ impl MemoryCells {
             let mut raw: Vec<(CellKey, Cell)> = Vec::new();
             self.inner.iter_sync(|(id, cell), stored| {
                 if id == collection
-                    && cell.section == scan.section
+                    && cell.section == scan.section()
                     && scan.contains(&cell.coordinate)
                 {
                     raw.push((cell.clone(), stored.to_cell()));
@@ -88,13 +88,13 @@ impl MemoryCells {
                 true
             });
             raw.sort_by(|(a, _), (b, _)| a.coordinate.cmp(&b.coordinate));
-            if scan.dir == Direction::Backward {
+            if scan.direction() == Direction::Backward {
                 raw.reverse();
             }
-            let limit = scan.limit;
+            let limit = scan.result_limit();
             let mut yielded = 0usize;
             for (cell, stored) in raw {
-                if limit.is_some_and(|n| yielded >= n) {
+                if limit.is_some_and(|n| yielded >= n.get()) {
                     break;
                 }
                 if let Some(bytes) =

@@ -84,7 +84,7 @@ pub(crate) use operation::{
     JOURNAL_INLINE, Mutation, MutationJournal, ReadOperation, WriteOperation,
 };
 pub(crate) use prosody_macros::{collection_layout, collection_methods};
-pub(crate) use stream::{CoordinatePlan, Plan, RangePlan};
+pub(crate) use stream::{Constraints, CoordinatePlan, Plan, RangePlan};
 
 /// Framework-internal engine authority: admission, the raw byte reads,
 /// mutation replay, and the mid-handler durable pair.

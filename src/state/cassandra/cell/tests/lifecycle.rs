@@ -61,13 +61,9 @@ pub(super) fn cell_i(i: u32) -> CellKey {
 async fn drain_section_scan<S: CellStore>(store: &S, id: &CollectionId) -> Result<u32> {
     let low = Coordinate::empty();
     let high = Coordinate::from_bytes(vec![0xFF, 0xFF, 0xFF, 0xFF]);
-    let scan = Scan {
-        section: Section::new(0),
-        start: ScanEdge::Included(&low),
-        dir: Direction::Forward,
-        end: ScanEdge::Included(&high),
-        limit: None,
-    };
+    let scan = Scan::over(Section::new(0), Direction::Forward)
+        .from(&low)
+        .to(&high);
     let stream = store.scan_cells(id, scan, event(1));
     futures::pin_mut!(stream);
     let mut scanned = 0_u32;

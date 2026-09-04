@@ -267,12 +267,11 @@ where
 {
     let start_c = Coordinate::from_bytes(vec![start]);
     let end_c = end.map(|b| Coordinate::from_bytes(vec![b]));
-    let scan = Scan {
-        section: SECTION,
-        start: ScanEdge::Included(&start_c),
-        dir: Direction::Forward,
-        end: end_c.as_ref(),
-        limit: None,
+    let scan = Scan::over(SECTION, Direction::Forward).from(&start_c);
+    let scan = match end_c.as_ref() {
+        ScanEdge::Included(end) => scan.to(end),
+        ScanEdge::Excluded(end) => scan.before(end),
+        ScanEdge::Unbounded => scan,
     };
     let stream = store.scan_cells(id, scan, own);
     futures::pin_mut!(stream);

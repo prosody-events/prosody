@@ -1,6 +1,6 @@
 //! The two scoped operation types and the invocation-local write journal.
 
-use super::stream::{PlanBase, read_keys_presence};
+use super::stream::{PlanBase, read_keys_presence, read_presence_coordinates};
 use super::{
     CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, CoordinatePlan,
     RangePlan, StateSession, WritableStateSession, cell_key, encode_cell, resolve_batch,
@@ -100,8 +100,9 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
         &self,
         family: CellFamily<L, T>,
         keys: Vec<KeyOf<T>>,
+        dir: Direction,
     ) -> CoordinatePlan<S, T> {
-        CoordinatePlan::new(self.plan_base(family.section()), keys)
+        CoordinatePlan::new(self.plan_base(family.section()), keys, dir)
     }
 
     /// Plans a managed durable range over the whole of `family`'s section, in
@@ -487,20 +488,15 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         } = self;
         async move {
             let expected = pending.len();
-            let mut answers = CellBuffer::with_capacity(expected);
-            for batch in CoordinateBatch::chunks(pending) {
-                answers.extend(
-                    <S::Engine as sealed::ReadEngine<S>>::read_presence_batch(
-                        collection.session(),
-                        &mut **inner,
-                        collection.state_type(),
-                        collection.name(),
-                        section,
-                        &batch,
-                    )
-                    .await?,
-                );
-            }
+            let answers = read_presence_coordinates::<S>(
+                collection.session(),
+                &mut **inner,
+                collection.state_type(),
+                collection.name(),
+                section,
+                pending.into_iter(),
+            )
+            .await?;
             let received = answers.len();
             let mut answers = answers.into_iter();
             slots

@@ -20,7 +20,7 @@ use super::support::{
 };
 use crate::Key;
 use crate::codec::JsonCodec;
-use crate::state::cell_key::{Coordinate, Direction, Scan, ScanEdge, Section};
+use crate::state::cell_key::{Coordinate, Direction, Scan, Section};
 use crate::state::descriptor::{
     DescriptorIdentity, StateDescriptor, deque_state, map_state, value_state,
 };
@@ -168,13 +168,7 @@ async fn reader_reads_prev_in_commit_window() -> Result<()> {
         .await?;
     let expected: Vec<bool> = values.into_iter().map(|value| value.is_some()).collect();
     assert_eq!(presence.as_slice(), expected);
-    let scan = Scan {
-        section,
-        start: ScanEdge::Unbounded,
-        dir: Direction::Forward,
-        end: ScanEdge::Unbounded,
-        limit: None,
-    };
+    let scan = Scan::over(section, Direction::Forward);
     let values = harness.cells.scan(&id, scan).map_ok(|(cell, _)| cell);
     assert_eq!(
         harness

@@ -59,6 +59,55 @@ impl Arbitrary for MapTrace {
     }
 }
 
+async fn assert_map_scans<P: ParityPayload>(
+    handle: &BoxMapState<P>,
+    visible: &BTreeMap<String, P>,
+) -> Result<bool> {
+    let scanned = drain_cursor(&handle.scan(MapScanConfig::default())).await?;
+    if scanned.len() != visible.len()
+        || scanned
+            .iter()
+            .zip(visible)
+            .any(|((key, value), (expected_key, expected_value))| {
+                key != expected_key || !P::same(value, expected_value)
+            })
+    {
+        return Ok(false);
+    }
+    if drain_cursor(&handle.keys(MapScanConfig::default())).await?
+        != visible.keys().cloned().collect::<Vec<_>>()
+    {
+        return Ok(false);
+    }
+    let config = MapScanConfig {
+        dir: Direction::Forward,
+        limit: Some(NonZeroUsize::MIN),
+        start: Bound::Included(KEYS[1].to_owned()),
+        end: Bound::Included(KEYS[2].to_owned()),
+    };
+    let expected = visible
+        .range(KEYS[1].to_owned()..=KEYS[2].to_owned())
+        .take(1)
+        .collect::<Vec<_>>();
+    let constrained = drain_cursor(&handle.scan(config.clone())).await?;
+    if constrained.len() != expected.len()
+        || constrained
+            .iter()
+            .zip(expected)
+            .any(|((key, value), (expected_key, expected_value))| {
+                key != expected_key || !P::same(value, expected_value)
+            })
+    {
+        return Ok(false);
+    }
+    Ok(drain_cursor(&handle.keys(config)).await?
+        == visible
+            .range(KEYS[1].to_owned()..=KEYS[2].to_owned())
+            .take(1)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>())
+}
+
 /// Drives a map trace through the erased handle and a `(floor, visible)`
 /// `BTreeMap` model, asserting after every op that each pooled key reads equal
 /// (`get` and `contains_key` both) and a full forward scan yields exactly
@@ -149,26 +198,7 @@ where
             {
                 return Ok(false);
             }
-            // A forward scan must yield exactly the visible key-ordered entries.
-            let scanned = drain_cursor(&handle.scan(Direction::Forward)).await?;
-            let expected: Vec<(String, P)> = visible
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            if scanned.len() != expected.len()
-                || scanned
-                    .iter()
-                    .zip(&expected)
-                    .any(|((sk, sv), (ek, ev))| sk != ek || !P::same(sv, ev))
-            {
-                return Ok(false);
-            }
-            // The key-only cursor is the value-free twin of the scan: it must
-            // yield exactly the same visible keys in the same key order,
-            // exercised here through the erased seam.
-            let scanned_keys = drain_cursor(&handle.keys(Direction::Forward)).await?;
-            let expected_keys: Vec<String> = visible.keys().cloned().collect();
-            if scanned_keys != expected_keys {
+            if !assert_map_scans(&handle, &visible).await? {
                 return Ok(false);
             }
         }

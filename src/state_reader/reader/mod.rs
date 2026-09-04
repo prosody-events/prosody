@@ -30,7 +30,8 @@ mod admission;
 use crate::Key;
 use crate::codec::Codec;
 use crate::state::StateName;
-use crate::state::cell_key::Direction;
+use crate::state::cell_key::{Direction, ScanEdge};
+use crate::state::collection::Constraints;
 use crate::state::descriptor::{
     CellType, ContextOf, DequeDescriptor, DequeHandle, FromSession, MapDescriptor, MapHandle,
     ResolvedOf, StateDescriptor, ValueDescriptor,
@@ -46,6 +47,7 @@ use futures::stream::{Stream, StreamExt};
 use quanta::Clock;
 use std::fmt::Display;
 use std::num::NonZeroUsize;
+use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::coop::cooperative;
@@ -206,14 +208,16 @@ where
 
 /// A directional map stream query for a standalone reader.
 ///
-/// See [`crate::state::descriptor::map::MapQuery::limit`] for the limit
+/// Build one with [`StateReader::query`]. Finish it with
+/// [`entries`](Self::entries) or [`keys`](Self::keys). See
+/// [`crate::state::descriptor::map::MapQuery::limit`] for the limit
 /// contract.
 #[must_use]
 pub struct MapReaderQuery<'a, KC, V, C: Codec, B = MemoryReaderBackend<C>> {
     reader: &'a StateReader<MapDescriptor<KC, V>, C, B>,
     key: Key,
     dir: Direction,
-    limit: Option<NonZeroUsize>,
+    constraints: Constraints,
 }
 
 impl<KC, V, C, B> MapReaderQuery<'_, KC, V, C, B>
@@ -226,9 +230,33 @@ where
     V: CellType<Key = UnitKey>,
     for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
 {
+    /// Starts at `key`.
+    pub fn from(mut self, key: &KC::Key) -> Self {
+        self.constraints.start = ScanEdge::Included(KC::encode(key));
+        self
+    }
+
+    /// Starts after `key`.
+    pub fn after(mut self, key: &KC::Key) -> Self {
+        self.constraints.start = ScanEdge::Excluded(KC::encode(key));
+        self
+    }
+
+    /// Stops at `key`.
+    pub fn to(mut self, key: &KC::Key) -> Self {
+        self.constraints.end = ScanEdge::Included(KC::encode(key));
+        self
+    }
+
+    /// Stops before `key`.
+    pub fn before(mut self, key: &KC::Key) -> Self {
+        self.constraints.end = ScanEdge::Excluded(KC::encode(key));
+        self
+    }
+
     /// Sets the maximum number of present items that the stream yields.
     pub fn limit(mut self, limit: NonZeroUsize) -> Self {
-        self.limit = Some(limit);
+        self.constraints.limit = Some(limit);
         self
     }
 
@@ -250,12 +278,10 @@ where
         let session = self.reader.session(self.key).await?;
         let handle: MapHandle<_, KC, V> = self.reader.descriptor.bind(&session)?;
         Ok(async_stream::try_stream! {
-            let query = handle.query(self.dir);
-            let query = match self.limit {
-                Some(limit) => query.limit(limit),
-                None => query,
-            };
-            let inner = query.entries();
+            let inner = handle
+                .query(self.dir)
+                .with_constraints(self.constraints)
+                .entries();
             futures::pin_mut!(inner);
             while let Some(item) = cooperative(inner.next()).await {
                 yield item.map_err(|e| StateReaderError::store(&e))?;
@@ -278,12 +304,10 @@ where
         let session = self.reader.session(self.key).await?;
         let handle: MapHandle<_, KC, V> = self.reader.descriptor.bind(&session)?;
         Ok(async_stream::try_stream! {
-            let query = handle.query(self.dir);
-            let query = match self.limit {
-                Some(limit) => query.limit(limit),
-                None => query,
-            };
-            let inner = query.keys();
+            let inner = handle
+                .query(self.dir)
+                .with_constraints(self.constraints)
+                .keys();
             futures::pin_mut!(inner);
             while let Some(item) = cooperative(inner.next()).await {
                 yield item.map_err(|e| StateReaderError::store(&e))?;
@@ -442,12 +466,76 @@ where
             reader: self,
             key: key.into(),
             dir,
-            limit: None,
+            constraints: Constraints::default(),
         }
     }
 }
 
 // --- Deque reads ------------------------------------------------------------
+
+/// A directional deque stream query for a standalone reader.
+#[must_use]
+pub struct DequeReaderQuery<'a, T, C: Codec, B = MemoryReaderBackend<C>> {
+    reader: &'a StateReader<DequeDescriptor<T>, C, B>,
+    key: Key,
+    dir: Direction,
+    start: Bound<usize>,
+    end: Bound<usize>,
+    limit: Option<NonZeroUsize>,
+}
+
+impl<T, C, B> DequeReaderQuery<'_, T, C, B>
+where
+    C: Codec,
+    B: ReaderBackend<C>,
+    C::Payload: Clone,
+    T: CellType<Key = UnitKey>,
+    for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
+{
+    /// Sets the front-relative position range.
+    pub fn range<R: RangeBounds<usize>>(mut self, range: R) -> Self {
+        self.start = range.start_bound().cloned();
+        self.end = range.end_bound().cloned();
+        self
+    }
+
+    /// Sets the maximum number of present values.
+    pub fn limit(mut self, limit: NonZeroUsize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Streams committed values in the query direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when session acquisition or handle binding fails.
+    pub async fn values(
+        self,
+    ) -> Result<
+        impl Stream<Item = Result<ResolvedOf<T>, StateReaderError>> + 'static,
+        StateReaderError,
+    >
+    where
+        T: 'static,
+        ResolvedOf<T>: 'static,
+    {
+        let session = self.reader.session(self.key).await?;
+        let handle: DequeHandle<_, T> = self.reader.descriptor.bind(&session)?;
+        Ok(async_stream::try_stream! {
+            let query = handle.query(self.dir).range((self.start, self.end));
+            let query = match self.limit {
+                Some(limit) => query.limit(limit),
+                None => query,
+            };
+            let inner = query.values();
+            futures::pin_mut!(inner);
+            while let Some(item) = cooperative(inner.next()).await {
+                yield item.map_err(|error| StateReaderError::store(&error))?;
+            }
+        })
+    }
+}
 
 impl<T, C, B> StateReader<DequeDescriptor<T>, C, B>
 where
@@ -559,15 +647,19 @@ where
         T: 'static,
         ResolvedOf<T>: 'static,
     {
-        let session = self.session(key.into()).await?;
-        let handle: DequeHandle<_, T> = self.descriptor.bind(&session)?;
-        Ok(async_stream::try_stream! {
-            let inner = handle.stream(dir);
-            futures::pin_mut!(inner);
-            while let Some(item) = cooperative(inner.next()).await {
-                yield item.map_err(|e| StateReaderError::store(&e))?;
-            }
-        })
+        self.query(key, dir).values().await
+    }
+
+    /// Builds a directional stream query for partition `key`.
+    pub fn query<K: Into<Key>>(&self, key: K, dir: Direction) -> DequeReaderQuery<'_, T, C, B> {
+        DequeReaderQuery {
+            reader: self,
+            key: key.into(),
+            dir,
+            start: Bound::Unbounded,
+            end: Bound::Unbounded,
+            limit: None,
+        }
     }
 }
 

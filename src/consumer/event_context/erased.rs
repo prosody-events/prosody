@@ -35,13 +35,13 @@ use crate::consumer::kafka_state::MessageCell;
 use crate::consumer::message::ConsumerMessage;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MessageLoader;
-use crate::state::cell_key::Direction;
-use crate::state::collection::WritableStateSession;
+use crate::state::cell_key::{Direction, ScanEdge};
+use crate::state::collection::{Constraints, WritableStateSession};
 use crate::state::descriptor::{
     CellCodecError, CellStateError, CellType, ContextOf, DequeHandle, DequeStateError, FromSession,
     MapHandle, MapStateError, ResolvedOf, ValueHandle,
 };
-use crate::state::order_codec::{UnitKey, Utf8KeyCodec};
+use crate::state::order_codec::{OrderedKeyCodec, UnitKey, Utf8KeyCodec};
 
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -50,6 +50,7 @@ use futures::stream::{BoxStream, StreamExt};
 use std::fmt::Display;
 use std::future::Future;
 use std::num::NonZeroUsize;
+use std::ops::Bound;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -68,6 +69,54 @@ pub enum ErasedCategory {
     /// Transient failure — retry may succeed (store/loader hiccup, a
     /// terminated attempt, a folded lower-layer `Terminal`).
     Transient,
+}
+
+/// Erased map scan constraints.
+#[derive(Clone, Debug)]
+pub struct MapScanConfig {
+    /// The scan direction.
+    pub dir: Direction,
+    /// The maximum number of present items.
+    pub limit: Option<NonZeroUsize>,
+    /// The direction-relative start edge.
+    pub start: Bound<String>,
+    /// The direction-relative end edge.
+    pub end: Bound<String>,
+}
+
+impl Default for MapScanConfig {
+    fn default() -> Self {
+        Self {
+            dir: Direction::Forward,
+            limit: None,
+            start: Bound::Unbounded,
+            end: Bound::Unbounded,
+        }
+    }
+}
+
+/// Erased deque scan constraints.
+#[derive(Clone, Debug)]
+pub struct DequeScanConfig {
+    /// The scan direction.
+    pub dir: Direction,
+    /// The maximum number of present items.
+    pub limit: Option<NonZeroUsize>,
+    /// The inclusive or exclusive front-relative range start.
+    pub start: Bound<u64>,
+    /// The inclusive or exclusive front-relative range end.
+    pub end: Bound<u64>,
+}
+
+impl Default for DequeScanConfig {
+    fn default() -> Self {
+        Self {
+            dir: Direction::Forward,
+            limit: None,
+            start: Bound::Unbounded,
+            end: Bound::Unbounded,
+        }
+    }
 }
 
 impl From<ErasedCategory> for ErrorCategory {
@@ -204,12 +253,12 @@ pub trait DynMapState<Item: Send + 'static>: Send + Sync {
     async fn clear(&self) -> Result<(), ErasedStateError>;
 
     /// A demand-driven cursor over the live entries in key order.
-    fn scan(&self, dir: Direction) -> BoxStateCursor<(String, Item)>;
+    fn scan(&self, config: MapScanConfig) -> BoxStateCursor<(String, Item)>;
 
     /// A demand-driven cursor over the live entry **keys** in key order,
     /// without decoding or resolving any value (zero Kafka fetches for a
     /// message-backed map). A key is present even when its value is not.
-    fn keys(&self, dir: Direction) -> BoxStateCursor<String>;
+    fn keys(&self, config: MapScanConfig) -> BoxStateCursor<String>;
 
     /// Durably commits buffered ops mid-handler (at-least-once).
     async fn commit(&self) -> Result<(), ErasedStateError>;
@@ -254,7 +303,7 @@ pub trait DynDequeState<Item: Send + 'static>: Send + Sync {
     async fn clear(&self) -> Result<(), ErasedStateError>;
 
     /// A demand-driven cursor over the live elements in index order.
-    fn scan(&self, dir: Direction) -> BoxStateCursor<Item>;
+    fn scan(&self, config: DequeScanConfig) -> BoxStateCursor<Item>;
 
     /// Durably commits buffered ops mid-handler (at-least-once).
     async fn commit(&self) -> Result<(), ErasedStateError>;
@@ -745,10 +794,13 @@ where
             .map_err(|e| ErasedStateError::from_classified(&e))
     }
 
-    fn scan(&self, dir: Direction) -> BoxStateCursor<(String, ResolvedOf<T>)> {
+    fn scan(&self, config: MapScanConfig) -> BoxStateCursor<(String, ResolvedOf<T>)> {
         let handle = self.handle.clone();
         let stream = try_stream! {
-            let inner = handle.stream(dir);
+            let inner = handle
+                .query(config.dir)
+                .with_constraints(map_constraints(config))
+                .entries();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 let (key, value) = item.map_err(|e| ErasedStateError::from_classified(&e))?;
@@ -758,10 +810,13 @@ where
         Box::new(StateCursor::new(Box::pin(stream)))
     }
 
-    fn keys(&self, dir: Direction) -> BoxStateCursor<String> {
+    fn keys(&self, config: MapScanConfig) -> BoxStateCursor<String> {
         let handle = self.handle.clone();
         let stream = try_stream! {
-            let inner = handle.keys(dir);
+            let inner = handle
+                .query(config.dir)
+                .with_constraints(map_constraints(config))
+                .keys();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 let key = item.map_err(|e| ErasedStateError::from_classified(&e))?;
@@ -873,10 +928,16 @@ where
             .map_err(|e| ErasedStateError::from_classified(&e))
     }
 
-    fn scan(&self, dir: Direction) -> BoxStateCursor<ResolvedOf<T>> {
+    fn scan(&self, config: DequeScanConfig) -> BoxStateCursor<ResolvedOf<T>> {
         let handle = self.handle.clone();
         let stream = try_stream! {
-            let inner = handle.stream(dir);
+            let start = bound_usize(config.start);
+            let end = bound_usize(config.end);
+            let mut query = handle.query(config.dir).range((start, end));
+            if let Some(limit) = config.limit {
+                query = query.limit(limit);
+            }
+            let inner = query.values();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 let value = item.map_err(|e| ErasedStateError::from_classified(&e))?;
@@ -896,6 +957,24 @@ where
 
     async fn rollback(&self) {
         self.handle.rollback().await;
+    }
+}
+
+fn bound_usize(bound: Bound<u64>) -> Bound<usize> {
+    bound.map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+}
+
+/// Lowers an erased [`MapScanConfig`] to typed [`Constraints`].
+fn map_constraints(config: MapScanConfig) -> Constraints {
+    let edge = |bound: Bound<String>| match bound {
+        Bound::Included(key) => ScanEdge::Included(Utf8KeyCodec::encode(&key)),
+        Bound::Excluded(key) => ScanEdge::Excluded(Utf8KeyCodec::encode(&key)),
+        Bound::Unbounded => ScanEdge::Unbounded,
+    };
+    Constraints {
+        start: edge(config.start),
+        end: edge(config.end),
+        limit: config.limit,
     }
 }
 

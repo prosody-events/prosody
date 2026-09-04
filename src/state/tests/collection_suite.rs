@@ -65,6 +65,7 @@ use std::fmt::Display;
 use std::future::Future;
 use std::iter::once;
 use std::num::NonZeroUsize;
+use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -98,6 +99,58 @@ type SuiteSession = KeyedStateSession<SuiteBackend, MemoryLoader<Value>>;
 /// sign boundary so re-inserts, removes, and ordered scans across negative and
 /// positive `i64` keys all occur.
 pub(crate) const KEY_POOL: [i64; 5] = [-2, -1, 0, 1, 2];
+
+/// One random set of direction-relative stream constraints.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StreamConstraints {
+    start: Option<(i64, bool)>,
+    end: Option<(i64, bool)>,
+    limit: Option<NonZeroUsize>,
+}
+
+/// One random set of absolute deque plan constraints.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DequePlanConstraints {
+    start: Option<(i64, bool)>,
+    end: Option<(i64, bool)>,
+    limit: Option<NonZeroUsize>,
+}
+
+impl Arbitrary for DequePlanConstraints {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let edge = |g: &mut Gen| {
+            bool::arbitrary(g).then(|| {
+                let coordinate = i64::from(u8::arbitrary(g) % 132);
+                (coordinate, bool::arbitrary(g))
+            })
+        };
+        Self {
+            start: edge(g),
+            end: edge(g),
+            limit: bool::arbitrary(g)
+                .then(|| NonZeroUsize::new(usize::from(u8::arbitrary(g) % 132) + 1))
+                .flatten(),
+        }
+    }
+}
+
+impl Arbitrary for StreamConstraints {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let edge = |g: &mut Gen| {
+            bool::arbitrary(g).then(|| {
+                let coordinate = i64::from(u8::arbitrary(g) % 7) - 3;
+                (coordinate, bool::arbitrary(g))
+            })
+        };
+        Self {
+            start: edge(g),
+            end: edge(g),
+            limit: bool::arbitrary(g)
+                .then(|| NonZeroUsize::new(usize::from(u8::arbitrary(g) % 7) + 1))
+                .flatten(),
+        }
+    }
+}
 
 /// Max ops per event, keeping each event's batch small while the trace as a
 /// whole still grows and drains the collection.
@@ -701,41 +754,47 @@ pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> R
 
 pub(crate) async fn run_map_keys_prefix_trace(
     trace: MapTrace,
-    limit: NonZeroUsize,
+    constraints: StreamConstraints,
 ) -> Result<bool> {
-    run_map_prefix_trace(trace, limit, PrefixFamily::Keys).await
+    run_map_prefix_trace(trace, constraints, PrefixFamily::Keys).await
 }
 
 pub(crate) async fn run_map_entries_prefix_trace(
     trace: MapTrace,
-    limit: NonZeroUsize,
+    constraints: StreamConstraints,
 ) -> Result<bool> {
-    run_map_prefix_trace(trace, limit, PrefixFamily::Entries).await
+    run_map_prefix_trace(trace, constraints, PrefixFamily::Entries).await
 }
 
 async fn run_map_prefix_trace(
     trace: MapTrace,
-    limit: NonZeroUsize,
+    constraints: StreamConstraints,
     family: PrefixFamily,
 ) -> Result<bool> {
     if !run_map_trace_inner(
         trace.clone(),
         CommitMode::ReadCommitted,
         4096,
-        Some((limit, family)),
+        Some((constraints, family)),
     )
     .await?
     {
         return Ok(false);
     }
-    run_map_trace_inner(trace, CommitMode::ReadCommitted, 0, Some((limit, family))).await
+    run_map_trace_inner(
+        trace,
+        CommitMode::ReadCommitted,
+        0,
+        Some((constraints, family)),
+    )
+    .await
 }
 
 async fn run_map_trace_inner(
     trace: MapTrace,
     commit_mode: CommitMode,
     keyset_limit: usize,
-    prefix: Option<(NonZeroUsize, PrefixFamily)>,
+    prefix: Option<(StreamConstraints, PrefixFamily)>,
 ) -> Result<bool> {
     run_collection_trace(
         trace,
@@ -1559,7 +1618,7 @@ where
 async fn assert_map<S>(
     handle: &MapHandle<S, I64KeyCodec, JsonCodec>,
     model: &BTreeMap<i64, Value>,
-    prefix: Option<(NonZeroUsize, PrefixFamily)>,
+    prefix: Option<(StreamConstraints, PrefixFamily)>,
 ) -> Result<bool>
 where
     S: StateSession,
@@ -1591,18 +1650,18 @@ where
     if collect_map_keys(handle, Direction::Backward).await? != descending_keys {
         return Ok(false);
     }
-    if let Some((limit, family)) = prefix {
+    if let Some((constraints, family)) = prefix {
         for dir in [Direction::Forward, Direction::Backward] {
             let matches = match family {
                 PrefixFamily::Keys => {
                     let unlimited = collect_map_keys(handle, dir).await?;
-                    drain(handle.query(dir).limit(limit).keys()).await?
-                        == unlimited.into_iter().take(limit.get()).collect::<Vec<_>>()
+                    collect_constrained_map_keys(handle, dir, constraints).await?
+                        == constrained(unlimited, dir, constraints)
                 }
                 PrefixFamily::Entries => {
                     let unlimited = collect_map(handle, dir).await?;
-                    drain(handle.query(dir).limit(limit).entries()).await?
-                        == unlimited.into_iter().take(limit.get()).collect::<Vec<_>>()
+                    collect_constrained_map(handle, dir, constraints).await?
+                        == constrained(unlimited, dir, constraints)
                 }
             };
             if !matches {
@@ -1611,6 +1670,214 @@ where
         }
     }
     Ok(handle.is_empty().await? == model.is_empty())
+}
+
+fn constrained<T>(values: Vec<T>, dir: Direction, constraints: StreamConstraints) -> Vec<T>
+where
+    T: MapKey,
+{
+    values
+        .into_iter()
+        .filter(|value| constraints.contains(value.map_key(), dir))
+        .take(constraints.limit.map_or(usize::MAX, NonZeroUsize::get))
+        .collect()
+}
+
+trait MapKey {
+    fn map_key(&self) -> i64;
+}
+
+impl MapKey for i64 {
+    fn map_key(&self) -> i64 {
+        *self
+    }
+}
+
+impl MapKey for (i64, Value) {
+    fn map_key(&self) -> i64 {
+        self.0
+    }
+}
+
+impl StreamConstraints {
+    fn contains(self, key: i64, dir: Direction) -> bool {
+        edges_contain(self.start, self.end, key, dir)
+    }
+}
+
+/// The oracle's direction-relative interval check, shared by both constraint
+/// generators.
+fn edges_contain(
+    start: Option<(i64, bool)>,
+    end: Option<(i64, bool)>,
+    key: i64,
+    dir: Direction,
+) -> bool {
+    let starts = start.is_none_or(|(edge, included)| match dir {
+        Direction::Forward => key > edge || (included && key == edge),
+        Direction::Backward => key < edge || (included && key == edge),
+    });
+    let ends = end.is_none_or(|(edge, included)| match dir {
+        Direction::Forward => key < edge || (included && key == edge),
+        Direction::Backward => key > edge || (included && key == edge),
+    });
+    starts && ends
+}
+
+/// Proves deque plan constraint parity on the point and range arms.
+pub(crate) async fn run_deque_constraint_parity(constraints: DequePlanConstraints) -> Result<bool> {
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let point = deque_state::<JsonCodec>("dq-point");
+    let range = deque_state::<JsonCodec>("dq-range");
+    let mut registry = CollectionDefRegistry::default();
+    registry.register(&point, CollectionDef::new(None))?;
+    registry.register(&range, CollectionDef::new(None))?;
+    let registry = Arc::new(registry);
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let collection_ref = |name| -> Result<CollectionRef> {
+        Ok(CollectionRef::new(
+            CollectionId::new(
+                state_key.clone(),
+                StateType::Application,
+                StateName::try_new(name)?,
+            ),
+            None,
+        ))
+    };
+    let point_cells = (0_u8..5_u8).map(Some).collect::<Vec<_>>();
+    seed_deque_window(&store, &collection_ref("dq-point")?, 0, &point_cells).await?;
+    let range_cells = (0_u8..=u8::try_from(deque::DEQUE_POINT_ITERATION_MAX)?)
+        .map(Some)
+        .collect::<Vec<_>>();
+    seed_deque_window(&store, &collection_ref("dq-range")?, 0, &range_cells).await?;
+    let armed: ArmedKeys = Arc::default();
+    let session = make_session(
+        &cells,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        read_event(0),
+    );
+    for (descriptor, width) in [(point, 5), (range, deque::DEQUE_POINT_ITERATION_MAX + 1)] {
+        let handle = descriptor
+            .bind(&session)
+            .map_err(|error| eyre!("bind: {error}"))?;
+        for dir in [Direction::Forward, Direction::Backward] {
+            let unlimited = drain(handle.stream(dir)).await?;
+            let (start, end) = constraints.range(dir)?;
+            let mut query = handle.query(dir).range((start, end));
+            if let Some(limit) = constraints.limit {
+                query = query.limit(limit);
+            }
+            let constrained = drain(query.values()).await?;
+            let indexed = unlimited
+                .into_iter()
+                .enumerate()
+                .map(|(position, value)| {
+                    let index = match dir {
+                        Direction::Forward => position,
+                        Direction::Backward => width - 1 - position,
+                    };
+                    Ok((i64::try_from(index)?, value))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let expected = indexed
+                .into_iter()
+                .filter(|(index, _)| constraints.contains(*index, dir))
+                .map(|(_, value)| value)
+                .take(constraints.limit.map_or(usize::MAX, NonZeroUsize::get))
+                .collect::<Vec<_>>();
+            if constrained != expected {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+impl DequePlanConstraints {
+    fn range(self, dir: Direction) -> Result<(Bound<usize>, Bound<usize>)> {
+        let bound = |edge: Option<(i64, bool)>| -> Result<Bound<usize>> {
+            edge.map_or(Ok(Bound::Unbounded), |(position, included)| {
+                let position = usize::try_from(position)?;
+                Ok(if included {
+                    Bound::Included(position)
+                } else {
+                    Bound::Excluded(position)
+                })
+            })
+        };
+        match dir {
+            Direction::Forward => Ok((bound(self.start)?, bound(self.end)?)),
+            Direction::Backward => Ok((bound(self.end)?, bound(self.start)?)),
+        }
+    }
+
+    fn contains(self, key: i64, dir: Direction) -> bool {
+        edges_contain(self.start, self.end, key, dir)
+    }
+}
+
+/// Collects a map handle's `stream(dir)` into a `(key, value)` vector.
+async fn collect_constrained_map<S>(
+    handle: &MapHandle<S, I64KeyCodec, JsonCodec>,
+    dir: Direction,
+    constraints: StreamConstraints,
+) -> Result<Vec<(i64, Value)>>
+where
+    S: StateSession,
+{
+    let mut query = handle.query(dir);
+    if let Some((start, included)) = constraints.start {
+        query = if included {
+            query.from(&start)
+        } else {
+            query.after(&start)
+        };
+    }
+    if let Some((end, included)) = constraints.end {
+        query = if included {
+            query.to(&end)
+        } else {
+            query.before(&end)
+        };
+    }
+    if let Some(limit) = constraints.limit {
+        query = query.limit(limit);
+    }
+    drain(query.entries()).await
+}
+
+async fn collect_constrained_map_keys<S>(
+    handle: &MapHandle<S, I64KeyCodec, JsonCodec>,
+    dir: Direction,
+    constraints: StreamConstraints,
+) -> Result<Vec<i64>>
+where
+    S: StateSession,
+{
+    let mut query = handle.query(dir);
+    if let Some((start, included)) = constraints.start {
+        query = if included {
+            query.from(&start)
+        } else {
+            query.after(&start)
+        };
+    }
+    if let Some((end, included)) = constraints.end {
+        query = if included {
+            query.to(&end)
+        } else {
+            query.before(&end)
+        };
+    }
+    if let Some(limit) = constraints.limit {
+        query = query.limit(limit);
+    }
+    drain(query.keys()).await
 }
 
 /// Collects a map handle's `stream(dir)` into a `(key, value)` vector.

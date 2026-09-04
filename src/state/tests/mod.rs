@@ -18,8 +18,9 @@ use self::cell_suite::{
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
-    DequeCapacityShape, DequeHoles, DequeInterleave, DequeTrace, MapGetManyInput, MapInterleave,
-    MapKeyHoles, MapTrace, finalize_and_promote, run_deque_capacity_convergence, run_deque_holes,
+    DequeCapacityShape, DequeHoles, DequeInterleave, DequePlanConstraints, DequeTrace,
+    MapGetManyInput, MapInterleave, MapKeyHoles, MapTrace, StreamConstraints, finalize_and_promote,
+    run_deque_capacity_convergence, run_deque_constraint_parity, run_deque_holes,
     run_deque_stream_interleave, run_deque_trace, run_map_entries_prefix_trace,
     run_map_get_many_parity_trace, run_map_key_scan_holes, run_map_keys_prefix_trace,
     run_map_keyset_exact_trace, run_map_stream_interleave, run_map_trace,
@@ -1054,26 +1055,31 @@ fn prop_map_collection_lifecycle_read_uncommitted() {
     QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
 }
 
-/// Limited map keys equal the unlimited present-key prefix on both plan arms.
+/// Constrained map keys match an unlimited filtered prefix on both plan arms.
 #[test]
-fn prop_map_keys_limit_is_present_prefix() {
-    fn property(trace: MapTrace, limit: u8) -> Result<bool> {
-        // A zero plan limit is uncompilable; the generator's zero maps to one.
-        let limit = NonZeroUsize::new(usize::from(limit)).unwrap_or(NonZeroUsize::MIN);
-        executor::block_on(run_map_keys_prefix_trace(trace, limit))
+fn prop_map_keys_constraint_parity() {
+    fn property(trace: MapTrace, constraints: StreamConstraints) -> Result<bool> {
+        executor::block_on(run_map_keys_prefix_trace(trace, constraints))
     }
-    QuickCheck::new().quickcheck(property as fn(MapTrace, u8) -> Result<bool>);
+    QuickCheck::new().quickcheck(property as fn(MapTrace, StreamConstraints) -> Result<bool>);
 }
 
-/// Limited map entries equal the unlimited present-entry prefix on both arms.
+/// Constrained entries match an unlimited filtered prefix on both plan arms.
 #[test]
-fn prop_map_entries_limit_is_present_prefix() {
-    fn property(trace: MapTrace, limit: u8) -> Result<bool> {
-        // A zero plan limit is uncompilable; the generator's zero maps to one.
-        let limit = NonZeroUsize::new(usize::from(limit)).unwrap_or(NonZeroUsize::MIN);
-        executor::block_on(run_map_entries_prefix_trace(trace, limit))
+fn prop_map_entries_constraint_parity() {
+    fn property(trace: MapTrace, constraints: StreamConstraints) -> Result<bool> {
+        executor::block_on(run_map_entries_prefix_trace(trace, constraints))
     }
-    QuickCheck::new().quickcheck(property as fn(MapTrace, u8) -> Result<bool>);
+    QuickCheck::new().quickcheck(property as fn(MapTrace, StreamConstraints) -> Result<bool>);
+}
+
+/// Constrained deque values match a filtered prefix on both plan arms.
+#[test]
+fn prop_deque_constraint_parity() {
+    fn property(constraints: DequePlanConstraints) -> Result<bool> {
+        executor::block_on(run_deque_constraint_parity(constraints))
+    }
+    QuickCheck::new().quickcheck(property as fn(DequePlanConstraints) -> Result<bool>);
 }
 
 /// Keyset exactness: over an arbitrary committed trace on a non-overflowing
