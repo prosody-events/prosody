@@ -13,29 +13,31 @@ use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
 };
 use crate::state::config::KeyedStateConfiguration;
-use crate::state::first_write::{
-    FixedPartitionCount, PartitionCountSource, PublisherTemplate, reconcile_publications,
-};
 use crate::state::fjall::FjallClient;
 use crate::state::manager::StateManagerProvider;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
 use crate::state::publication::PublicationStore;
+use crate::state::publisher::{
+    FixedPartitionCount, PartitionCountSource, PublicationOwner, PublicationTopics,
+};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state_reader::PartitionCount;
 use crate::timers::duration::CompactDuration;
-use crate::{ByteSize, Codec, ConsumerGroup, EventIdentity, EventType};
+use crate::{ByteSize, Codec, ConsumerGroup, EventIdentity, EventType, Topic};
 use std::fs;
 use std::sync::Arc;
 
 pub(crate) type MemoryStateProvider<P> = StateManagerProvider<
     MemoryStateBackendFactory<MemoryDeduplicationStoreProvider>,
     MemoryLoader<P>,
+    Option<PublicationOwner<MemoryPublicationStore, FixedPartitionCount>>,
 >;
 
 pub(crate) type CassandraStateProvider<C> = StateManagerProvider<
     CassandraStateBackendFactory<CassandraDeduplicationStoreProvider>,
     KafkaLoader<C>,
+    Option<PublicationOwner<CassandraPublicationStore, KafkaObserver>>,
 >;
 
 /// Keyed-state wiring inputs shared by every mode.
@@ -44,6 +46,7 @@ pub(crate) struct KeyedStateInputs {
     group: ConsumerGroup,
     pub(in crate::consumer) version: Arc<str>,
     registry: Arc<CollectionDefRegistry>,
+    topics: Option<PublicationTopics>,
     mock: bool,
 }
 
@@ -60,11 +63,17 @@ impl KeyedStateInputs {
         CompactDuration::try_from(consumer_config.slab_size)
             .map_err(ConsumerError::InvalidSlabSize)?;
         let registry = Arc::new(config.build_registry().map_err(KeyedStateInitError::from)?);
+        let topics: Vec<Topic> = consumer_config
+            .subscribed_topics
+            .iter()
+            .map(|topic| Topic::from(topic.as_str()))
+            .collect();
         Ok(Self {
             config,
             group: Arc::from(consumer_config.group_id.as_str()),
             version: Arc::from(dedup_version),
             registry,
+            topics: PublicationTopics::new(topics),
             mock: consumer_config.mock,
         })
     }
@@ -73,10 +82,16 @@ impl KeyedStateInputs {
     /// backend and loader. The partition loop acquires one state manager
     /// per assignment from it; the pending-index scanner travels inside
     /// the backend the factory mints.
-    fn provider<B, L>(&self, backend: B, loader: L) -> StateManagerProvider<B, L> {
+    fn provider<B, L, P>(
+        &self,
+        backend: B,
+        loader: L,
+        publisher: P,
+    ) -> StateManagerProvider<B, L, P> {
         StateManagerProvider::new(
             backend,
             loader,
+            publisher,
             self.registry.clone(),
             self.group.clone(),
             self.config.recovery_delay,
@@ -87,79 +102,55 @@ impl KeyedStateInputs {
     /// consumer's own observation, so the routing row advertises the topology
     /// that consumer sees. The observer is the one carried by
     /// [`StartupServices`](super::runtime::StartupServices).
-    pub(in crate::consumer) async fn cassandra_publication_setup(
+    pub(in crate::consumer) fn cassandra_publication_setup(
         &self,
         store: CassandraPublicationStore,
         observer: KafkaObserver,
-    ) -> Result<Option<PublisherTemplate<CassandraPublicationStore, KafkaObserver>>, ConsumerError>
-    {
-        self.publication_setup(store, observer).await
+    ) -> Option<PublicationOwner<CassandraPublicationStore, KafkaObserver>> {
+        self.publication_setup(store, observer)
     }
 
     /// Publication setup for mock-mode memory storage. The fixed partition
     /// count is the mock cluster's topology. A live Kafka consumer using
     /// in-memory storage cannot publish because this backend has no real topic
     /// partition-count source.
-    pub(in crate::consumer) async fn memory_publication_setup(
+    pub(in crate::consumer) fn memory_publication_setup(
         &self,
         store: MemoryPublicationStore,
-    ) -> Result<Option<PublisherTemplate<MemoryPublicationStore, FixedPartitionCount>>, ConsumerError>
+    ) -> Result<Option<PublicationOwner<MemoryPublicationStore, FixedPartitionCount>>, ConsumerError>
     {
         if self.registry.has_published() && !self.mock {
             return Err(KeyedStateInitError::PublishedMemoryStorage.into());
         }
-        self.publication_setup(store, FixedPartitionCount(PartitionCount::MOCK))
-            .await
+        Ok(self.publication_setup(store, FixedPartitionCount(PartitionCount::MOCK)))
     }
 
-    /// Runs startup reconciliation and, when publishing is active, builds the
-    /// first-write publisher template for one backend's publication store.
+    /// Builds the assignment owner for one backend's publication store.
     /// The two typed wrappers above choose the count source, so a mock topology
     /// can never reach a Cassandra routing row.
     ///
-    /// Reconciliation runs whenever a subsystem is configured. It retires this
-    /// group's routing rows for collections no longer published, the
-    /// `.published(false)` path. Running once per process start is what makes
-    /// retirement eventually consistent rather than immediate; see
-    /// [`reconcile_publications`].
-    ///
-    /// The template is built only when a collection is actually published.
-    /// Otherwise there is nothing to advertise, and `None` disables the
-    /// first-write barrier. The low-level
+    /// The owner runs only on partition zero of the first topic in lexical
+    /// order. It replaces the group's full routing set during assignment
+    /// acquisition. The low-level
     /// [`ProsodyConsumer::new`](crate::consumer::ProsodyConsumer::new)
     /// constructor never calls this: it rejects registrations.
-    ///
-    /// # Errors
-    ///
-    /// Any reconciliation failure propagates so the caller's build fails.
-    async fn publication_setup<S, N>(
-        &self,
-        store: S,
-        counts: N,
-    ) -> Result<Option<PublisherTemplate<S, N>>, ConsumerError>
+    fn publication_setup<S, N>(&self, store: S, counts: N) -> Option<PublicationOwner<S, N>>
     where
         S: PublicationStore,
         N: PartitionCountSource,
     {
-        let Some(subsystem) = self.config.subsystem.clone() else {
-            return Ok(None);
+        let (Some(subsystem), Some(topics)) = (self.config.subsystem.clone(), self.topics.clone())
+        else {
+            return None;
         };
-        reconcile_publications(&store, &self.registry, &subsystem, &self.group)
-            .await
-            .map_err(|error| KeyedStateInitError::Publication {
-                message: format!("{error:#}"),
-                category: error.classify_error(),
-            })?;
-        if !self.registry.has_published() {
-            return Ok(None);
-        }
-        Ok(Some(PublisherTemplate::new(
+        Some(PublicationOwner::new(
             subsystem,
             self.group.clone(),
-            Arc::new(store),
+            store,
             counts,
             self.registry.clone(),
-        )))
+            topics,
+        ))
     }
 }
 
@@ -178,7 +169,7 @@ pub(in crate::consumer) fn memory_state_provider<C: Codec>(
     cells: MemoryCells,
     identities: MemoryDescriptorIdentityStore,
     loader: MemoryLoader<C::Payload>,
-    publisher_template: Option<PublisherTemplate<MemoryPublicationStore, FixedPartitionCount>>,
+    publisher: Option<PublicationOwner<MemoryPublicationStore, FixedPartitionCount>>,
 ) -> MemoryStateProvider<C::Payload>
 where
     C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
@@ -191,9 +182,8 @@ where
         keyed_state.registry.clone(),
         dedup_provider,
         keyed_state.group.clone(),
-        publisher_template,
     );
-    keyed_state.provider(backend, loader)
+    keyed_state.provider(backend, loader, publisher)
 }
 
 /// Builds the keyed-state provider for a Cassandra backend. It opens the fjall
@@ -207,7 +197,7 @@ pub(in crate::consumer) fn cassandra_state_provider<C: Codec>(
     cell_store: CassandraCellResources,
     identity_store: CassandraDescriptorIdentityStore,
     loader: KafkaLoader<C>,
-    publisher_template: Option<PublisherTemplate<CassandraPublicationStore, KafkaObserver>>,
+    publisher: Option<PublicationOwner<CassandraPublicationStore, KafkaObserver>>,
 ) -> Result<CassandraStateProvider<C>, ConsumerError>
 where
     C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
@@ -230,9 +220,8 @@ where
         keyed_state.registry.clone(),
         dedup_provider,
         keyed_state.group.clone(),
-        publisher_template,
     );
-    Ok(keyed_state.provider(backend, loader))
+    Ok(keyed_state.provider(backend, loader, publisher))
 }
 
 #[cfg(test)]
@@ -260,9 +249,7 @@ mod tests {
             .build()?;
         let inputs = KeyedStateInputs::new(state, &consumer, "v1")?;
 
-        let result = inputs
-            .memory_publication_setup(MemoryPublicationStore::new())
-            .await;
+        let result = inputs.memory_publication_setup(MemoryPublicationStore::new());
 
         assert!(matches!(
             result,

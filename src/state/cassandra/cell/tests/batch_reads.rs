@@ -11,7 +11,7 @@ fn prop_cassandra_batch_read_parity() {
     async fn run(trace: BatchReadTrace) -> Result<bool> {
         let fx = fixture().await?;
         let oracle = ScriptedOracle::default();
-        let store = fx.bottom_store(oracle.clone());
+        let store = fx.bottom_store(oracle.clone())?;
         Box::pin(run_batch_read_parity_trace(
             store.clone(),
             store,
@@ -35,7 +35,7 @@ async fn cassandra_batch_duplicate_co_observation() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
     Box::pin(run_batch_duplicate_co_observation(
-        fx.bottom_store(ScriptedOracle::default()),
+        fx.bottom_store(ScriptedOracle::default())?,
     ))
     .await
 }
@@ -46,7 +46,7 @@ async fn cassandra_batch_preserves_input_positions() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
     Box::pin(run_batch_alignment(
-        fx.bottom_store(ScriptedOracle::default()),
+        fx.bottom_store(ScriptedOracle::default())?,
     ))
     .await
 }
@@ -56,8 +56,8 @@ async fn cassandra_batch_preserves_input_positions() -> Result<()> {
 /// present with a valid frame, `event` NULL ⇒ `PrevWithoutEvent`. B (`0xFE`,
 /// high): `data` present, `encoding` NULL ⇒ `BlobWithoutEncoding`. The
 /// clustering order (A < B) is the reverse of the `[B, A]` read list both
-/// resolve-order pins issue, so the decode order the reader picks decides which
-/// error surfaces.
+/// resolve-order tests issue, so the decode order the reader picks decides
+/// which error surfaces.
 async fn seed_prev_without_event_and_blob_without_encoding(
     session: &Session,
     id: &CollectionId,
@@ -106,7 +106,7 @@ async fn seed_prev_without_event_and_blob_without_encoding(
     Ok((cell_a, cell_b))
 }
 
-/// Resolve-order pin: two rows with DISTINCT corruption shapes at coordinates
+/// Resolve-order test: two rows with DISTINCT corruption shapes at coordinates
 /// whose clustering order (A `0x01` < B `0xFE`) is the reverse of the read list
 /// `[B, A]`. `get_many` decodes unique rows in first-occurrence order. Thus, it
 /// must surface B's `BlobWithoutEncoding`, not A's `PrevWithoutEvent`,
@@ -121,7 +121,7 @@ async fn first_error_is_first_input_position() -> Result<()> {
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
+    let store = fx.bottom_store(ScriptedOracle::default())?;
     let c = collection("resolve-order")?;
     let id = c.id();
     let own = event(9);
@@ -165,7 +165,7 @@ async fn first_error_is_first_input_position() -> Result<()> {
     Ok(())
 }
 
-/// Sort-necessity unit pin (no cluster): a SHUFFLED raw batch with two corrupt
+/// Sort-necessity unit test (no cluster): a SHUFFLED raw batch with two corrupt
 /// rows — low coord `0x01` = `PrevWithoutEvent`, high coord `0xFE` =
 /// `BlobWithoutEncoding`, pushed high-then-low — must surface the LOWEST
 /// coordinate's error after the borrowed batch follows input resolution order.
@@ -276,7 +276,7 @@ async fn resolved_corrupt_rows_fail_before_blob_decode() -> Result<()> {
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
+    let store = fx.bottom_store(ScriptedOracle::default())?;
     let c = collection("resolved-corrupt-error")?;
     let id = c.id();
     seed_prev_without_event_and_blob_without_encoding(fx.cassandra.session(), id).await?;
@@ -295,7 +295,7 @@ async fn resolved_corrupt_rows_fail_before_blob_decode() -> Result<()> {
     Ok(())
 }
 
-/// Query-count pin: `provisional_many` issues exactly ONE `IN` query per chunk
+/// Query-count test: `provisional_many` issues exactly ONE `IN` query per chunk
 /// and NO point reads or marker reads. A fresh reader store (cold counters)
 /// stages nothing itself, so the counters reflect the verb alone; the dedicated
 /// `provisional_in_queries` counter proves it BATCHED rather than merely "no
@@ -304,7 +304,7 @@ async fn resolved_corrupt_rows_fail_before_blob_decode() -> Result<()> {
 async fn cassandra_raw_batch_is_one_query() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    let seed = fx.bottom_store(ScriptedOracle::default());
+    let seed = fx.bottom_store(ScriptedOracle::default())?;
     let c = collection("raw-one-query")?;
     let id = c.id();
     let staging = event(0x11);
@@ -321,7 +321,7 @@ async fn cassandra_raw_batch_is_one_query() -> Result<()> {
     seed.write_provisional(&c, &writes, Some(&marker)).await?;
 
     // A fresh store: cold counters shared across its clones.
-    let reader = fx.bottom_store(ScriptedOracle::default());
+    let reader = fx.bottom_store(ScriptedOracle::default())?;
     let counters = reader.recovery_reads();
     let batch = CoordinateBatch::chunks([1u8, 2].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
@@ -363,7 +363,7 @@ async fn cassandra_recovery_batches_by_section_at_boundary() -> Result<()> {
     let staging = event(0x22);
 
     for n in [127u32, 128, 129] {
-        let store = fx.bottom_store(ScriptedOracle::default());
+        let store = fx.bottom_store(ScriptedOracle::default())?;
         let c = collection(&format!("recovery-boundary-{n}"))?;
         let counters = store.recovery_reads();
         let writes: Vec<(CellKey, ProvisionalWrite)> = (0..n)
@@ -397,7 +397,7 @@ async fn cassandra_recovery_batches_by_section_at_boundary() -> Result<()> {
 
     // Two sections: 129 in section 0 (two chunks) + 1 in section 1 (one chunk)
     // ⇒ ceil(129/128) + ceil(1/128) = 3 IN queries.
-    let store = fx.bottom_store(ScriptedOracle::default());
+    let store = fx.bottom_store(ScriptedOracle::default())?;
     let c = collection("recovery-boundary-two-sections")?;
     let counters = store.recovery_reads();
     let mut writes: Vec<(CellKey, ProvisionalWrite)> = (0..129u32)
@@ -440,7 +440,7 @@ async fn cassandra_recovery_batches_by_section_at_boundary() -> Result<()> {
 fn prop_cassandra_raw_batch_parity() {
     async fn run(trace: RawBatchTrace) -> Result<bool> {
         let fx = fixture().await?;
-        let store = fx.bottom_store(ScriptedOracle::default());
+        let store = fx.bottom_store(ScriptedOracle::default())?;
         Box::pin(run_raw_batch_parity_trace(store, trace)).await
     }
 
@@ -452,26 +452,26 @@ fn prop_cassandra_raw_batch_parity() {
         );
 }
 
-/// Ascending-output pin over the live store. The sort requirement is also
-/// pinned by `borrowed_batch_decodes_in_resolution_order` and
+/// Ascending-output test over the live store. The sort requirement is also
+/// verified by `borrowed_batch_decodes_in_resolution_order` and
 /// `provisional_batch_coordinates_are_sorted_and_distinct`.
 #[tokio::test]
 async fn cassandra_raw_batch_ascending_output() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
     Box::pin(run_raw_batch_ascending_output(
-        fx.bottom_store(ScriptedOracle::default()),
+        fx.bottom_store(ScriptedOracle::default())?,
     ))
     .await
 }
 
-/// No-side-effects pin over the live store built on a [`CountingOracle`]:
+/// No-side-effects test over the live store built on a [`CountingOracle`]:
 /// `provisional_many` never resolves, writes, or caches.
 #[tokio::test]
 async fn cassandra_raw_batch_no_side_effects() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
     let oracle = CountingOracle::default();
-    let store = fx.bottom_store_with(oracle.clone(), fx.presence.clone());
+    let store = fx.bottom_store(oracle.clone())?;
     Box::pin(run_raw_batch_no_side_effects(store, oracle)).await
 }

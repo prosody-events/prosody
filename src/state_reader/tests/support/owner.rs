@@ -89,7 +89,6 @@ fn owner_session<C: CellStore>(
         recovery_delay: CompactDuration::new(30),
         armed: ArmedKeys::default(),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-        publisher: None,
     })
 }
 

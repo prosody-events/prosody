@@ -37,7 +37,7 @@ async fn read_cell_blob(fx: &Fixture, id: &CollectionId) -> Result<(Vec<u8>, i16
 async fn legacy_null_null_residue_reads_committed_none() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
+    let store = fx.bottom_store(ScriptedOracle::default())?;
     let c = collection("legacy-residue")?;
     let cell = value_cell();
     let id = c.id();
@@ -79,7 +79,7 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
+    let store = fx.bottom_store(ScriptedOracle::default())?;
     let c = collection("cart")?;
     let cell = value_cell();
     let payload = Bytes::from(vec![0xAB_u8; 16 * 1024 + 1]);
@@ -116,7 +116,7 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
 async fn cassandra_data_column_is_raw_through_the_block_size() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
+    let store = fx.bottom_store(ScriptedOracle::default())?;
     let c = collection("raw-format")?;
     let cell = value_cell();
     let payload = Bytes::from_static(b"raw durable payload");
@@ -148,7 +148,7 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default());
+    let store = fx.bottom_store(ScriptedOracle::default())?;
     let c = collection("corrupt-timer")?;
     let id = c.id();
 
@@ -215,7 +215,7 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
 fn prop_cassandra_present_cell_is_uniquely_owned() {
     async fn check(payload: Vec<u8>) -> Result<bool> {
         let fx = fixture().await?;
-        let store = fx.bottom_store(ScriptedOracle::default());
+        let store = fx.bottom_store(ScriptedOracle::default())?;
         let c = collection("uniq")?;
         let cell = value_cell();
         let data = Bytes::from(payload);
@@ -262,7 +262,7 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
 
     async fn check(payloads: Vec<Vec<u8>>) -> Result<bool> {
         let fx = fixture().await?;
-        let store = fx.bottom_store(ScriptedOracle::default());
+        let store = fx.bottom_store(ScriptedOracle::default())?;
         let id = CollectionId::new(
             StateKey::new(Uuid::new_v4(), Arc::from("k")),
             StateType::Application,

@@ -11,7 +11,7 @@
 //! promote, clean inline rollback, or a crash at one of three points followed
 //! by recovery through the sweep *or* first-touch. After every event the
 //! committed projection must equal the model, whichever path ran. Companions
-//! pin implicit overwrite (resolution-on-read); the **unified overlay view**
+//! test implicit overwrite (resolution-on-read); the **unified overlay view**
 //! (`run_overlay_trace`), where point `get`s, range `scan`s, dirty buffering,
 //! and committed writes are **intermixed** in one trace so their interaction is
 //! exercised — dirty-wins, clear-hides, scan bounds / direction / limit /
@@ -42,7 +42,7 @@ use super::super::marker::{EventMarker, SectionClear};
 use super::super::memory::MemoryCells;
 use super::super::oracle::CommitOracle;
 use super::super::overlay::Overlay;
-use super::super::resolve::{resolve_cell, resolve_marker, sweep_provisional};
+use super::super::resolve::{resolve_cell, resolve_event_marker, sweep_provisional};
 use super::super::store::{
     CELL_BATCH, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch,
     provisional_point_loop,
@@ -204,9 +204,9 @@ impl CommitOracle for ScriptedOracle {
 
 /// A commit oracle whose `resolve` YIELDS ONCE then fails `Transient`, counting
 /// consults. The single yield is load-bearing for the overlap-precedence
-/// falsification (`resolve_marker_double_failure_surfaces_oracle`): it forces
-/// `resolve` to observe `Pending` on the first poll pass while the (ready)
-/// batch read errors, so `resolve_marker`'s
+/// falsification (`resolve_event_marker_double_failure_surfaces_oracle`): it
+/// forces `resolve` to observe `Pending` on the first poll pass while the
+/// (ready) batch read errors, so `resolve_event_marker`'s
 /// [`join`](futures::future::join)-plus-oracle-first surfaces the ORACLE error,
 /// whereas a first-error-short-circuiting combinator would surface the STORE
 /// error. `record_message` is inert.
@@ -242,7 +242,7 @@ impl CommitOracle for FailingOracle {
 }
 
 /// A runtime-agnostic "`Pending` on the first poll, `Ready` after" future —
-/// robust under `futures::executor::block_on` (which the memory pins use),
+/// robust under `futures::executor::block_on` (which the memory tests use),
 /// unlike `tokio::task::yield_now`. Wakes itself so the executor re-polls.
 #[derive(Default)]
 struct YieldOnce(bool);
@@ -282,7 +282,7 @@ pub(crate) type RowKeys = BTreeSet<(i8, u8)>;
 /// survivor coordinate bytes.
 pub(crate) type ClearMap = BTreeMap<i8, BTreeSet<u8>>;
 
-/// The physically observed standing **event marker**: its owning event, its
+/// The physically observed unsettled **event marker**: its owning event, its
 /// frozen staged row keys, and each cleared section's frozen survivors —
 /// exactly what the durable payload carries, in probe-comparable shape.
 pub(crate) type ProbedMarker = (EventRef, RowKeys, ClearMap);
@@ -330,15 +330,15 @@ pub(crate) fn probed_parts(marker: &EventMarker) -> (RowKeys, ClearMap) {
 pub(crate) trait ShapeProbe {
     async fn cell_rows(&self, id: &CollectionId) -> Result<RowKeys>;
 
-    /// The collection's standing **event marker** as physically observed —
+    /// The collection's unsettled **event marker** as physically observed —
     /// including the payload's clear half — or `None` when no marker stands.
     /// Read raw, never through the resolving store.
-    async fn standing_marker(&self, id: &CollectionId) -> Result<Option<ProbedMarker>>;
+    async fn unsettled_marker(&self, id: &CollectionId) -> Result<Option<ProbedMarker>>;
 
     /// The row keys whose stored rows are physically **provisional**, read
-    /// raw. Together with [`Self::standing_marker`] this feeds the
+    /// raw. Together with [`Self::unsettled_marker`] this feeds the
     /// marker-completeness postcondition: a provisional row unlisted by the
-    /// standing marker is stranded from recovery.
+    /// unsettled marker is stranded from recovery.
     async fn provisional_rows(&self, id: &CollectionId) -> Result<RowKeys>;
 }
 
@@ -357,11 +357,11 @@ impl ShapeProbe for MemoryShapeProbe {
             .collect()))
     }
 
-    fn standing_marker(
+    fn unsettled_marker(
         &self,
         id: &CollectionId,
     ) -> impl Future<Output = Result<Option<ProbedMarker>>> {
-        ready(Ok(self.0.standing_marker_of(id).map(|marker| {
+        ready(Ok(self.0.unsettled_marker_of(id).map(|marker| {
             let (staged, clears) = probed_parts(&marker);
             (marker.event(), staged, clears)
         })))
@@ -447,7 +447,7 @@ enum Outcome {
     CrashMidFanOut,
     /// Commit marker recorded (committed), then the settle attempt fails under
     /// a poison armed at the generated [`FaultDepth`]: the stage lingers over
-    /// the **warm** in-process store — the committed-unapplied window (on a
+    /// the **warm** in-process store — the unsettled-clear window (on a
     /// `Cached` instantiation, `Wrapper` depth leaves the settle transform
     /// unrun, and `Lower` depth leaves it run with the cleared sections
     /// deleted).
@@ -493,10 +493,10 @@ enum Recovery {
     /// The backstop sweep resolves every pooled collection.
     Sweep,
     /// Reads of the crashed event's staged cells first-touch-resolve them;
-    /// the standing event marker lingers (first-touch is marker-free — the
+    /// the unsettled event marker lingers (first-touch is marker-free — the
     /// over-report the model keeps).
     FirstTouch,
-    /// No immediate recovery: the standing event marker and provisional cells
+    /// No immediate recovery: the unsettled event marker and provisional cells
     /// linger into subsequent events, resolved at the next stage boundary or
     /// a later sweep — the fresh-assignee shape (the crash rebuild models the
     /// cold new assignee).
@@ -518,19 +518,20 @@ impl Arbitrary for Recovery {
 /// clears) in one `write_provisional` call — unless `split` is set, which
 /// stages a ≥2-cell collection in two sequential same-event calls carrying the
 /// same union marker, exercising the same-event marker overwrite at the stage
-/// boundary (the second stage's standing marker is the event's OWN and must
+/// boundary (the second stage's unsettled marker is the event's OWN and must
 /// not be resolved).
 #[derive(Clone, Debug)]
 struct TraceEvent {
     writes: Vec<(u8, u8, u8, Mutation)>,
-    /// Blind resolved writes issued at the TOP of the event, BEFORE any stage —
+    /// Blind resolved writes issued at the TOP of the event, before any stage —
     /// modelling the mid-handler `commit()` / `ReadUncommitted` direct apply
     /// (`write_resolved`). Deliberately **cells-only** (no clears): a
     /// blind-clears dimension would need gap-trim modelling, and
     /// `write_resolved`'s clears leg keeps its coverage through the stage path.
     /// Their whole purpose is to land into a section whose PRIOR event's
-    /// clears-bearing marker still stands, so the write-side boundary
-    /// (`help_write_window`) is exercised over generated traces.
+    /// marker with clears remains unsettled, so the write-side boundary
+    /// (`resolve_unsettled_clear_before_write`) is exercised over generated
+    /// traces.
     blind: Vec<(u8, u8, u8, Mutation)>,
     /// Durable section clears as `(collection, section idx)`. Deduped; the
     /// clear's collection is drawn independently of the writes', so
@@ -540,11 +541,11 @@ struct TraceEvent {
     outcome: Outcome,
     recovery: Recovery,
     split: bool,
-    /// When set, the event's FIRST planned stage is rejected at the lower
+    /// When set, the event's first planned stage is rejected at the lower
     /// store (a transient `write_provisional` fault) and the event is never
     /// dispatched: the model, marker model, and deferrals stay untouched —
     /// the rejected stage's boundary resolve never reached the bottom store,
-    /// so a lingering foreign stage still lingers. Weighted low; shrinks to
+    /// so a lingering prior event stage still lingers. Weighted low; shrinks to
     /// `false`.
     stage_fault: bool,
 }
@@ -726,7 +727,7 @@ where
         if skip[slot] {
             continue;
         }
-        // Check raw provisional state FIRST — `get` would resolve a lingering
+        // Check raw provisional state first — `get` would resolve a lingering
         // provisional cell and mask a non-convergence.
         if provisional_count(store, id).await? != 0 {
             return Ok(false);
@@ -768,15 +769,15 @@ type StagedWrites = Vec<(u8, Vec<(CellKey, ProvisionalWrite)>, Vec<SectionClear>
 /// staged writes + frozen clears for the settle. Every stage passes the
 /// event's frozen union marker; when `split` is set, a ≥2-cell collection is
 /// staged in two sequential same-event `write_provisional` calls (prefix, then
-/// the rest), both carrying that union marker. The second call's standing
+/// the rest), both carrying that union marker. The second call's unsettled
 /// marker is the event's OWN; the stage boundary must overwrite it, never
 /// resolve it. This is the only path that exercises the same-event marker
-/// overwrite, so treating an own marker as foreign strands the prefix and
+/// overwrite, so treating an own marker as prior event strands the prefix and
 /// fails convergence. A clears-only collection stages `writes = []` with a
 /// marker whose `staged()` is empty and `clears()` non-empty.
 ///
 /// `stale_prev_ok[i]` accepts a stale prev-read on collection `i`: a restage
-/// over a **warm** committed-unapplied stage (a settle failure with the
+/// over a **warm** stage with an unsettled clear (a settle failure with the
 /// in-process cache intact) may legitimately read the warm pre-settle value
 /// — the accepted bounded window. The staged prev still feeds the write, so a
 /// later rollback restores exactly what was read (mirrored in the model by the
@@ -843,17 +844,7 @@ struct Deferred {
     warm: bool,
 }
 
-/// The crash-equivalence runner's tracked state: the committed-projection
-/// model, the standing-event-marker model (owning event's dedup payload, its
-/// staged row keys, and its clear half; `None` ⇒ no marker stands), and the
-/// per-slot lingering (deferred) stages whose convergence/row-shape checks
-/// wait for resolution. The marker model is set on stage; cleared by a clean
-/// settle, a sweep, the first foreign read (read-help,
-/// [`Self::note_read_help`], clears-bearing only), or a blind write's
-/// write-help ([`Self::apply_write_help`], clears-bearing only); **kept** by
-/// clears-free crash→first-touch (first-touch is marker-free — the over-report
-/// the model pins), a deferral, and a settle failure; replaced by the next
-/// stage (boundary overwrite).
+/// Tracks committed values, unsettled markers, and deferred stages.
 struct TraceState {
     model: Vec<BTreeMap<(u8, u8), Option<Bytes>>>,
     marker_model: Vec<Option<(u128, RowKeys, ClearMap)>>,
@@ -873,7 +864,7 @@ impl TraceState {
     /// coordinate becomes the **staged prev** — exactly what
     /// `abort_provisional` / first-touch rollback durably restores. Normally
     /// a no-op (the staged prev was checked equal to the model); in the
-    /// accepted warm committed-unapplied window it faithfully captures the
+    /// accepted warm unsettled-clear window it faithfully captures the
     /// restage's stale-read rollback.
     fn apply_rollback(&mut self, slot: usize, writes: &[(CellKey, ProvisionalWrite)]) {
         for (cell, write) in writes {
@@ -899,13 +890,10 @@ impl TraceState {
         }
     }
 
-    /// Models the write-side committed-unapplied boundary (`help_write_window`)
-    /// a blind `write_resolved` runs before it writes: a standing
-    /// **clears-bearing** marker on `slot` is resolved WHOLE (the marker being
-    /// deleted, its stage settled) before the blind cells land. A committed
-    /// stage already advanced the model at its flush; an uncommitted one rolls
-    /// its staged writes back to their `prev`s. A clears-FREE marker is left
-    /// standing (the boundary no-ops on it), so this leaves `deferred[slot]`
+    /// Models clear resolution before a resolved write.
+    ///
+    /// The model settles an unsettled section clear before it writes cells.
+    /// unsettled (the boundary no-ops on it), so this leaves `deferred[slot]`
     /// intact for the later resolution — the caller then trims the
     /// blind-overwritten cells from it. Mirrors `note_read_help`, but per-slot
     /// and deferral-settling.
@@ -926,8 +914,8 @@ impl TraceState {
     /// Issues one event's blind resolved writes against `store` (the
     /// mid-handler `commit()` / `ReadUncommitted` direct apply) and keeps
     /// the model in step. Grouped by collection (last-writer-wins per
-    /// cell); each collection's write settles any standing clears-bearing
-    /// marker in the model ([`Self::apply_write_help`]) before the cells
+    /// cell); each collection's write settles any unsettled marker with clears
+    /// in the model ([`Self::apply_write_help`]) before the cells
     /// land, then the blind cells advance the model. A clears-FREE marker's
     /// deferral survives the boundary no-op, so the blind-overwritten cells
     /// are trimmed from it — the marker's eventual resolution drops them
@@ -968,12 +956,7 @@ impl TraceState {
         Ok(())
     }
 
-    /// Models the read-help side effect of the convergence pass: its `get`s on
-    /// a non-deferred collection resolve any standing foreign clears-bearing
-    /// marker (the committed-unapplied read window), so the marker model drops
-    /// it. A clears-free marker is never resolved by reads (first-touch stays
-    /// marker-free), and an unread collection (empty model, nothing to `get`)
-    /// keeps its marker standing.
+    /// Removes markers that convergence reads must resolve.
     fn note_read_help(&mut self) {
         for slot in 0..self.deferred.len() {
             if self.deferred[slot].is_none()
@@ -1026,7 +1009,7 @@ impl TraceState {
                         return Ok(false);
                     }
                 }
-                // The sweep's marker leg resolves every standing marker —
+                // The sweep's marker leg resolves every unsettled marker —
                 // this event's stage AND any earlier deferral. A committed
                 // marker's clear half applies its gaps here (the model
                 // already advanced at flush).
@@ -1043,8 +1026,8 @@ impl TraceState {
                 // short-circuits; the read resolves each staged provisional
                 // cell. A clears-free marker lingers (first-touch is
                 // marker-free — the over-report the model keeps); a
-                // clears-bearing marker is resolved WHOLE by the first get
-                // (read-help), which `note_read_help` accounts for after the
+                // marker with clears is resolved complete by the first get
+                // (clear resolution), which `note_read_help` accounts for after the
                 // convergence pass.
                 let recovery_event = EventRef::Message {
                     dedup_id: Uuid::from_u128(u128::MAX - index as u128),
@@ -1065,7 +1048,7 @@ impl TraceState {
             Recovery::Defer => {
                 // No recovery: the stage lingers into subsequent events
                 // (cold — the rebuild models the fresh assignee). The
-                // standing marker's clear half is asserted by the probe while
+                // unsettled marker's clear half is asserted by the probe while
                 // it lingers.
                 for (coll, cell_writes, _) in staged_writes {
                     self.deferred[*coll as usize] = Some(Deferred {
@@ -1098,7 +1081,7 @@ impl TraceState {
             match ev.outcome {
                 Outcome::SettleFailure(depth) => {
                     // Committed, then the settle fails under the armed poison
-                    // — the committed-unapplied window over the WARM store.
+                    // — the unsettled-clear window over the WARM store.
                     // `Wrapper` fires outside the store under test (the settle
                     // provably never reaches it: durable state and any warm
                     // entries stay exactly as staged); `Lower` fires beneath
@@ -1129,7 +1112,7 @@ impl TraceState {
                         // of the cleared sections serving marker-resolved
                         // truth — a warm staged cell holds the verdict's
                         // `data`, an evicted one falls through and
-                        // read-help-resolves (the model advanced at flush —
+                        // clear resolution-resolves (the model advanced at flush —
                         // committed ⇒ post-clear values); a wrong, missing, or
                         // late repair serves stale pre-clear values ⇒
                         // divergence.
@@ -1150,7 +1133,7 @@ impl TraceState {
                             }
                         }
                         // Warm staged cells never reach the lower store, so
-                        // the reads alone may leave the marker standing (the
+                        // the reads alone may leave the marker unsettled (the
                         // commit-warmth contract); resolve it the way
                         // production does — the armed sweep — which is a
                         // no-op where a fall-through read already settled it.
@@ -1194,12 +1177,12 @@ impl TraceState {
 ///   legitimately provisional): the stored `kind=Cell` rows equal the model's
 ///   present set exactly, so a residue row or a lost row both surface — and a
 ///   committed clear whose gaps never landed shows up as extra rows.
-/// * **Marker shape** (always): the standing event marker matches the model —
+/// * **Marker shape** (always): the unsettled event marker matches the model —
 ///   owning event, frozen staged row keys, AND the payload's clear half — or is
 ///   absent.
 /// * **Marker completeness** (always — the universal marker-first invariant):
-///   every physically provisional row is listed by the standing marker; with no
-///   marker standing, no provisional row exists. A violation is a strand.
+///   every physically provisional row is listed by the unsettled marker; with
+///   no marker unsettled, no provisional row exists. A violation is a strand.
 async fn assert_physical<P>(probe: &P, ids: &[CollectionId], state: &TraceState) -> Result<bool>
 where
     P: ShapeProbe,
@@ -1215,7 +1198,7 @@ where
                 return Ok(false);
             }
         }
-        let observed = probe.standing_marker(id).await?;
+        let observed = probe.unsettled_marker(id).await?;
         let expected = state.marker_model[slot]
             .as_ref()
             .map(|(index, staged, clears)| {
@@ -1249,9 +1232,9 @@ where
 
 /// The per-event closing pass: convergence + row shape wait for deferred
 /// collections; marker shape and marker completeness never wait (read-only
-/// probes). The convergence pass's own reads resolve foreign clears-bearing
-/// markers (read-help), which `note_read_help` folds into the marker model
-/// before the physical probe.
+/// probes). The convergence pass's own reads resolve prior event markers with
+/// clears (clear resolution), which `note_read_help` folds into the marker
+/// model before the physical probe.
 async fn assert_event_end<S, P>(
     store: &S,
     ids: &[CollectionId],
@@ -1274,7 +1257,7 @@ where
 /// seam armed (`Poison::WriteProvisional`, transient), requiring the stage to
 /// be rejected — the injected fault is not a runtime error: an `Ok` is a red
 /// property. Prevs come from the model, never from store reads — a prev-read
-/// could first-touch-resolve a lingering foreign stage the fault must leave
+/// could first-touch-resolve a lingering prior event stage the fault must leave
 /// lingering; the rejected write lands nothing, so the staged prevs are never
 /// observed.
 async fn reject_stage<S>(
@@ -1315,28 +1298,23 @@ where
     Ok(attempted.is_err())
 }
 
-/// Drives `trace` through stores built by `make_store` (each wrapped in a
-/// poison-armable [`FailingCellStore`]; the [`PoisonHandle`] argument is the
-/// **lower** fault seam each instantiation buries beneath any cache in its
-/// composition), asserting the committed projection equals the model after
-/// every event regardless of the resolution path. A crash rebuilds the store
-/// over the same warm backing the closure captures. Alongside the committed
-/// projection it tracks a standing-event-marker model (owner + staged set +
-/// clear half) checked with the marker-completeness postcondition after every
-/// event ([`assert_physical`]); [`stage_event`]'s split dimension exercises
-/// the same-event marker overwrite; the durable `clears` dimension (including
-/// clears-only stages) exercises the gap erase and the committed-unapplied
-/// read window (read-help); the `Defer` recovery, the depth-generated
-/// `SettleFailure` outcome (with directed post-failure reads pinning the
-/// delete-first D4 ordering), and the `stage_fault` dimension make
-/// stage-over-a-standing-foreign-marker, committed-unapplied windows,
-/// rejected stages, and fresh-assignment recovery arise organically. The
-/// per-event `blind` dimension issues mid-handler `write_resolved`s at the top
-/// of each event, so a blind write lands into a section whose prior event's
-/// clears-bearing marker still stands — encoding the write-side invariant in
-/// the model: **a write that lands after a committed clear survives the
-/// clear's resolution**, checked on every generated trace. A final sweep +
-/// full assertion pass closes every trace, so no trace ends unchecked.
+/// Compares each generated operation with the committed-state model.
+///
+/// A simulated crash rebuilds the store over the same durable state.
+/// The final recovery must remove all unsettled state.
+///
+/// The trace checks these invariants after every event:
+/// - The committed projection equals the model for every collection without a
+///   deferred settle, and for every collection after the final recovery.
+/// - The unsettled marker model (owner, staged set, clears) satisfies the
+///   marker-completeness postcondition (`assert_physical`).
+/// - A section clear removes only non-survivor cells, and the clear's delete
+///   runs before the new writes land.
+/// - A write that lands after a committed clear survives the clear's resolution
+///   (the `blind` dimension).
+/// - After a `SettleFailure`, later reads and the sweep repair the state.
+///
+/// A final sweep and assertion pass closes every trace.
 pub(crate) async fn run_crash_equivalence_trace<S, F, P>(
     make_store: F,
     oracle: ScriptedOracle,
@@ -1358,10 +1336,10 @@ where
         let dedup_id = Uuid::from_u128(index as u128);
         let event = EventRef::Message { dedup_id };
 
-        // Blind resolved writes run at the TOP of the event, BEFORE any stage —
+        // Blind resolved writes run at the TOP of the event, before any stage —
         // the mid-handler `commit()` / `ReadUncommitted` direct apply — so each
-        // lands AFTER the write-side boundary resolves any standing
-        // clears-bearing marker (the defect this phase closes).
+        // lands after the write-side boundary resolves any unsettled
+        // marker with clears (the defect this phase closes).
         state.apply_blind_writes(&store, &refs, &ev.blind).await?;
 
         // Mid-fan-out tears at CELL granularity: a whole-cell prefix of the
@@ -1380,11 +1358,11 @@ where
 
         // Stage fault: the event's first planned stage is rejected at the
         // lower store and the event is never dispatched — every model stays
-        // untouched. Decided BEFORE the deferral-take below (a rejected
+        // untouched. Decided before the deferral-take below (a rejected
         // stage's boundary resolve never reached the bottom store, so a
-        // lingering foreign stage still lingers). The convergence and
+        // lingering prior event stage still lingers). The convergence and
         // physical passes still run: this is where a phantom publish or a
-        // lost standing marker would surface.
+        // lost unsettled marker would surface.
         if ev.stage_fault
             && let Some(plan) = staged.first()
         {
@@ -1397,9 +1375,9 @@ where
         }
 
         // Restaging a deferred collection resolves its lingering stage — the
-        // prev-reads first-touch-resolve overlapping cells (read-help resolves
-        // a clears-bearing marker whole) and the stage boundary mops up the
-        // rest, so apply the deferred verdict to the model BEFORE the prev
+        // prev-reads first-touch-resolve overlapping cells (clear resolution resolves
+        // a marker with clears whole) and the stage boundary mops up the
+        // rest, so apply the deferred verdict to the model before the prev
         // check. A warm deferral additionally permits a stale prev-read (see
         // `stage_event`).
         let mut stale_prev_ok = vec![false; POOL as usize];
@@ -1431,7 +1409,7 @@ where
         else {
             return Ok(false);
         };
-        // Each stage overwrites any lingering foreign marker with this event's
+        // Each stage overwrites any lingering prior event marker with this event's
         // marker listing its full staged set and clear half.
         for (coll, cell_writes, clears) in &staged_writes {
             let (staged_set, clear_map) =
@@ -1489,20 +1467,11 @@ where
     assert_physical(probe, &ids, &state).await
 }
 
-/// Deterministic regression pin (both backends): a blind resolved write that
-/// lands into a section whose clears-bearing marker still stands survives the
-/// marker's later resolution. The write-side committed-unapplied boundary
-/// (`help_write_window`) resolves the standing marker BEFORE the blind cell is
-/// written, so the clear's positional gap erase runs while the cell does not
-/// yet exist and the cell lands on top.
+/// Proves that a resolved write survives an earlier unsettled section clear.
 ///
-/// The failed-settle durable shape is reproduced directly (crash-simulation
-/// idiom — real verbs, nothing forgotten): stage a committed event's
-/// clears-bearing marker and leave it standing (no settle), then blind-write a
-/// **non-survivor** coordinate of the cleared section, then resolve the marker
-/// through the sweep. Without the boundary the clear replays at a fresh
+/// The store resolves the clear before it writes the new cell.
 /// timestamp and erases the blind cell (the falsification: remove the boundary
-/// from the store under test → the survival assertion reddens).
+/// from the store under test → the survival assertion makes this test fail).
 pub(crate) async fn run_blind_write_survives_stale_clear<S>(
     store: S,
     oracle: ScriptedOracle,
@@ -1515,7 +1484,7 @@ where
         dedup_id: Uuid::from_u128(1),
     };
 
-    // Stage collection 0's committed clears-bearing marker and leave it standing
+    // Stage collection 0's committed marker with clears and leave it unsettled
     // (do NOT settle) — exactly the shape a failed settle leaves behind.
     let survivor = cell_in(0, 0);
     let prev = store.get(refs[0].id(), &survivor, event_a).await?;
@@ -1560,16 +1529,8 @@ where
     Ok(())
 }
 
-/// Posture-parity pin (both backends): a blind resolved write leaves a standing
-/// **clears-free** marker standing — the write-side boundary triggers only on
-/// clears (the mirror of read-help's trigger), so a first-touch marker is never
-/// settled by an unrelated blind write. Raw probes throughout: a `get` of the
-/// staged cell would first-touch-resolve it and destroy the shape under test.
-///
-/// Falsification: drop the clears-empty short-circuit in `help_write_window` →
-/// the blind write resolves the clears-free marker (oracle not committed →
-/// abort: the staged cell rolls back, the marker is deleted) → the marker
-/// assertion reddens on both backends.
+/// Proves that a resolved write does not settle a marker without section
+/// clears.
 pub(crate) async fn run_blind_write_leaves_clears_free_marker<S, P>(
     store: S,
     probe: &P,
@@ -1605,9 +1566,9 @@ where
 
     let (expected_staged, expected_clears) = probed_parts(&marker);
     ensure!(
-        probe.standing_marker(id).await?
+        probe.unsettled_marker(id).await?
             == Some((event_a, expected_staged.clone(), expected_clears.clone())),
-        "a blind write must leave a clears-free marker standing"
+        "a blind write must leave a clears-free marker unsettled"
     );
     ensure!(
         probe
@@ -1618,7 +1579,8 @@ where
     );
 
     // The blind cell reads back, and the marker STILL stands after the read
-    // (read-help leaves clears-free markers standing too — parity with reads).
+    // (clear resolution leaves clears-free markers unsettled too — parity with
+    // reads).
     let read_event = EventRef::Message {
         dedup_id: Uuid::from_u128(u128::MAX / 2),
     };
@@ -1627,25 +1589,25 @@ where
         "the blind write did not read back"
     );
     ensure!(
-        probe.standing_marker(id).await? == Some((event_a, expected_staged, expected_clears)),
-        "reading a clears-free marker's collection must leave it standing"
+        probe.unsettled_marker(id).await? == Some((event_a, expected_staged, expected_clears)),
+        "reading a clears-free marker's collection must leave it unsettled"
     );
     Ok(())
 }
 
 /// Stages the defect shape a deferred repair must survive, shared by the two
-/// repair-provenance pins below: seed `x` = resolved `bytes(7)`, stage event F
+/// repair-provenance tests below: seed `x` = resolved `bytes(7)`, stage event F
 /// over `{x}` then RESTAGE F over `{y}` (the same-event restage overwrites F's
-/// marker WITHOUT resolving it — the stage boundary resolves only foreign
+/// marker WITHOUT resolving it — the stage boundary resolves only prior event
 /// markers — so `x` is left provisional and UNLISTED by any marker), then stage
-/// event E over survivor `s` with a clears-bearing marker on `SECTIONS[0]` (E's
-/// stage boundary aborts the now-foreign `F:{y}` marker; `x` stays untouched
-/// and unlisted). F is never recorded (it crashed before its dedup record), so
-/// its verdict is `NotCommitted`. Returns `(x, s, event_e)`.
+/// event E over survivor `s` whose marker clears `SECTIONS[0]` (E's
+/// stage boundary aborts the now-prior event `F:{y}` marker; `x` stays
+/// untouched and unlisted). F is never recorded (it crashed before its dedup
+/// record), so its verdict is `NotCommitted`. Returns `(x, s, event_e)`.
 ///
 /// Expressing the same-event restage with divergent staged sets in the
 /// `Trace`/`CellModel` generator is structural surgery (unlisted-cell
-/// bookkeeping the model does not carry), so this invariant is pinned
+/// bookkeeping the model does not carry), so this invariant is verified
 /// deterministically here rather than folded into the crash/overwrite property.
 pub(crate) async fn stage_deferred_repair_shape<S>(
     store: &S,
@@ -1665,8 +1627,9 @@ where
     let y = cell_in(0, 3);
     let s = cell_in(0, 0);
 
-    // Seed x = resolved bytes(7) (no marker standing → the write-help boundary
-    // is a no-op), then read the still-clean bases before any provisional stage.
+    // Seed x = resolved bytes(7) (no marker unsettled → the clear resolution
+    // boundary is a no-op), then read the still-clean bases before any
+    // provisional stage.
     store
         .write_resolved(cref, &[(x.clone(), Some(bytes(7)))], &[])
         .await?;
@@ -1675,7 +1638,7 @@ where
     let prev_s = store.get(id, &s, event_e).await?;
 
     // Stage F over {x}, then restage F over {y}: same-event, so the stage
-    // boundary does not resolve F's own standing marker and x is orphaned
+    // boundary does not resolve F's own unsettled marker and x is orphaned
     // provisional, unlisted by the overwriting F:{y} marker.
     let f_first = vec![(
         x.clone(),
@@ -1694,9 +1657,9 @@ where
         .write_provisional(cref, &f_second, Some(&f_second_marker))
         .await?;
 
-    // Stage E over survivor s with a clears-bearing marker: the stage boundary
-    // resolves the now-foreign F:{y} marker (F unrecorded → NotCommitted →
-    // abort), leaving E's marker standing and x still orphaned provisional.
+    // Stage E over survivor s with a marker with clears: the stage boundary
+    // resolves the now-prior event F:{y} marker (F unrecorded → NotCommitted →
+    // abort), leaving E's marker unsettled and x still orphaned provisional.
     let e_writes = vec![(
         s.clone(),
         ProvisionalWrite::new(Some(bytes(1)), prev_s, event_e),
@@ -1710,34 +1673,30 @@ where
     Ok((x, s, event_e))
 }
 
-/// Deterministic regression pin (both backends): a repair whose payload
-/// predates a standing clears-bearing marker must NOT land after that marker
-/// resolves. Beneath E's committed clears-bearing marker, `resolve_cell`
+/// Deterministic regression test (both backends): a repair whose payload
+/// predates an unsettled marker with clears must not land after that marker
+/// resolves. Beneath E's committed marker with clears, `resolve_cell`
 /// degrades `x`'s repair to peek semantics (value-only, no durable write), so
-/// E's marker still stands and the marker's own resolution — the committed
+/// E's marker remains unsettled and the marker's own resolution — the committed
 /// positional clear — erases `x` instead of a stale repair resurrecting it.
 ///
 /// F committed nothing, E committed. The read of `x` (own = E) declines
-/// read-help (own marker) and reaches `resolve_cell`, which defers. The sweep
-/// then resolves E: `s` promotes, the `SECTIONS[0]` gap erase deletes the
+/// clear resolution (own marker) and reaches `resolve_cell`, which defers. The
+/// sweep then resolves E: `s` promotes, the `SECTIONS[0]` gap erase deletes the
 /// non-survivor `x`.
 ///
 /// The shape is staged through `stage` — the **prior assignment's** store — so
 /// that `x` never warms the cache above the reading assembly and the
 /// assembly-under-test read of `x` is a genuine cold miss that reaches
 /// `resolve_cell` (a warm hit would serve the correct projection without ever
-/// invoking the guard, so the pin would not exercise the fix on a cached
+/// invoking the guard, so the test would not exercise the fix on a cached
 /// backend). For the bare memory store `stage` and `store` are two handles over
-/// the same cells; for Cassandra `stage` stages under its own presence latch
+/// the same cells; for Cassandra `stage` stages under its own marker check
 /// and `store` is the `Cached` assembly of a **fresh cold assignment** over the
 /// same durable rows (a cold presence + cold cache — the post-rebalance
 /// recovery posture), so its reads cold-seed from durable truth.
 ///
-/// Falsification: delete the `deferred` guard in `resolve_cell` → the read's
-/// repair write-back resolves E's marker early (its clear erases `x`, then the
-/// stale `bytes(7)` lands on top) → the marker-still-stands assertion and the
-/// post-sweep `x`-absent assertion both redden. Prove it once (inject, red,
-/// revert).
+/// Proves that an old repair waits for an unsettled section clear.
 pub(crate) async fn run_repair_defers_beneath_stale_clear<St, S, P>(
     stage: &St,
     store: S,
@@ -1755,15 +1714,15 @@ where
     let (x, s, event_e) = stage_deferred_repair_shape(stage, cref).await?;
     oracle.record_message(Uuid::from_u128(2)).await?;
 
-    // The own-event read declines read-help and reaches the deferred repair:
+    // The own-event read declines clear resolution and reaches the deferred repair:
     // the prev projection is served with no durable write, so E's marker stands.
     ensure!(
         store.get(id, &x, event_e).await?.into_inner() == Some(bytes(7)),
         "the deferred repair must serve the committed-base projection"
     );
     ensure!(
-        probe.standing_marker(id).await?.map(|(ev, ..)| ev) == Some(event_e),
-        "the repair must not resolve E's standing clears-bearing marker"
+        probe.unsettled_marker(id).await?.map(|(ev, ..)| ev) == Some(event_e),
+        "the repair must not resolve E's unsettled marker with clears"
     );
 
     // Resolving E the way production does replays its positional clear, erasing
@@ -1783,30 +1742,20 @@ where
     Ok(())
 }
 
-/// Deterministic convergence pin (both backends): the deferral wedges nothing —
-/// when the standing marker's event aborts, no clear applies and `x`'s
+/// Deterministic convergence test (both backends): the deferral wedges nothing
+/// — when the unsettled marker's event aborts, no clear applies and `x`'s
 /// committed projection stays its base, served correctly.
 ///
 /// Same shape as [`run_repair_defers_beneath_stale_clear`] but E is never
 /// recorded (`NotCommitted`). The own-event read of `x` defers (E's marker
-/// stands — the falsifiable guard pin); the sweep aborts E (survivor `s` rolls
+/// stands — the falsifiable guard test); the sweep aborts E (survivor `s` rolls
 /// back, no clear) and deletes the marker, so nothing blocks. `x` then projects
 /// its committed base (`bytes(7)`) — no committed clear ever ran, so the defect
 /// shape simply drains.
 ///
-/// The post-sweep *durable* cleanup of the orphaned, unlisted `x` is
-/// intentionally backend-divergent, so this pin asserts only the cross-backend
-/// truths (marker gone, correct projection): the memory sweep scans every
-/// provisional row and repairs `x` in place, whereas the Cassandra mop-up is
-/// seeded from the standing marker's staged list (recovery cost ∝ #provisional,
-/// not #cells), so an unlisted orphan is left for first-touch or its TTL — a
-/// harmless residue that resolves to exactly the base the cache already serves.
+/// Proves that repair converges after an unsettled marker aborts.
 ///
-/// Falsification: delete the `deferred` guard → the read's repair write-back
-/// resolves E's marker early (aborting E mid-flight) → the marker-still-stands
-/// assertion reddens. `stage` is the bare/lower store, as in
-/// [`run_repair_defers_beneath_stale_clear`], so the read is a genuine cold
-/// miss that reaches the guard.
+/// Both backends must remove the marker and return the committed value.
 pub(crate) async fn run_repair_after_marker_abort_converges<St, S, P>(
     stage: &St,
     store: S,
@@ -1829,15 +1778,15 @@ where
         "the deferred repair serves the committed-base projection"
     );
     ensure!(
-        probe.standing_marker(id).await?.map(|(ev, ..)| ev) == Some(event_e),
-        "the repair must not resolve E's standing marker"
+        probe.unsettled_marker(id).await?.map(|(ev, ..)| ev) == Some(event_e),
+        "the repair must not resolve E's unsettled marker"
     );
 
     // The sweep aborts E (no clear applied) and drains the marker; x's
     // committed projection stays its base.
     sweep_provisional(&store, &oracle, cref).await?;
     ensure!(
-        probe.standing_marker(id).await?.is_none(),
+        probe.unsettled_marker(id).await?.is_none(),
         "the abort must resolve E's marker away — the deferral wedges nothing"
     );
     let read = EventRef::Message {
@@ -1900,11 +1849,11 @@ impl Arbitrary for OverwriteTrace {
 /// predecessor's still-provisional cell is resolved through the oracle — the
 /// implicit-overwrite / first-touch path. A predecessor is resolved either at
 /// the **next stage of its collection** (the stage-boundary resolve of the
-/// standing foreign marker) or, when its collection is never re-staged, by the
-/// final read. The staged `prev` must equal the model committed base, and at
-/// the end every cell must equal the model. Both oracle arms run: a committing
-/// predecessor promotes to its `data`, a non-committing one rolls back to its
-/// `prev`.
+/// unsettled prior event marker) or, when its collection is never re-staged, by
+/// the final read. The staged `prev` must equal the model committed base, and
+/// at the end every cell must equal the model. Both oracle arms run: a
+/// committing predecessor promotes to its `data`, a non-committing one rolls
+/// back to its `prev`.
 pub(crate) async fn run_overwrite_trace<S, F>(
     make_store: F,
     oracle: ScriptedOracle,
@@ -2000,8 +1949,9 @@ enum OverlayOp {
     /// (`write_resolved` with a frozen [`SectionClear`]) — the generated
     /// producer for the direct-apply clear leg beneath the overlay. On a
     /// `Cached` lower store this is the op that kills a missing
-    /// `write_resolved` D4 section delete: a warm pre-clear cell of the
-    /// cleared section would serve stale and diverge on the next point leg.
+    /// `write_resolved` section-clear cache guard section delete: a warm
+    /// pre-clear cell of the cleared section would serve stale and diverge
+    /// on the next point leg.
     CommitClearSection(SeedClear),
     /// Run a range scan and assert it against the oracle (the range leg,
     /// intermixed with the point reads asserted after every op).
@@ -2043,7 +1993,7 @@ impl Arbitrary for OverlayTrace {
 }
 
 /// The visible-value model over the sampled section pool: dirty wins
-/// (`Set`→present, `Cleared`→absent), a standing dirty clear marker hides the
+/// (`Set`→present, `Cleared`→absent), an unsettled dirty clear marker hides the
 /// committed leg **of its section only**, else the committed value (present or
 /// absent). Keys are `(section idx, coord)`.
 #[derive(Default)]
@@ -2230,14 +2180,9 @@ fn presence_of(batch: &CommittedBatch) -> PresenceBatch {
         .collect()
 }
 
-/// Deterministic precedence pin for [`Overlay::get_many`]: a dirty `Set` inside
-/// a standing dirty section-clear answers its bytes (the `Set` arm is checked
-/// BEFORE the section-clear), and a dirty-answered position never reaches the
-/// lower batch. Read `[5, 5]` so the duplicate co-observation is pinned too.
+/// Proves that a dirty value takes priority over a dirty section clear.
 ///
-/// Memory-only (the `batch_reads() == 0` claim needs the counting store); the
-/// backend-generic parity leg in [`run_overlay_trace`] covers the split itself
-/// on both backends.
+/// Duplicate reads must return the same value without a lower read.
 pub(crate) async fn run_overlay_precedence_pin<S: CellStore>(
     counting: CountingCellStore<S>,
 ) -> Result<()> {
@@ -2258,7 +2203,7 @@ pub(crate) async fn run_overlay_precedence_pin<S: CellStore>(
         .write_resolved(&collection_ref, &[(cell_in(0, 5), Some(bytes(42)))], &[])
         .await?;
     counting.reset();
-    // A standing dirty section-clear, then a dirty `Set` repopulating coord 5.
+    // An unsettled dirty section-clear, then a dirty `Set` repopulating coord 5.
     overlay.dirty().clear_section(&id, SECTIONS[0]);
     overlay.dirty().set(&id, &cell_in(0, 5), &bytes(7));
     let batch = batch_of([5, 5])?;
@@ -2267,7 +2212,7 @@ pub(crate) async fn run_overlay_precedence_pin<S: CellStore>(
     assert_eq!(
         got[0].clone().into_inner(),
         Some(bytes(7)),
-        "a dirty Set beats a standing section-clear"
+        "a dirty Set beats an unsettled section-clear"
     );
     assert_eq!(got[0], got[1], "the duplicate position co-observes the Set");
     assert_eq!(
@@ -2670,7 +2615,7 @@ where
 /// One step of the generated apply interleaving.
 #[derive(Clone, Copy, Debug)]
 enum ApplyOp {
-    /// Resolve the standing marker as a unit (the sweep's marker leg) — a
+    /// Resolve the unsettled marker as a unit (the sweep's marker leg) — a
     /// re-resolve after settlement exercises the exhausted-marker path.
     ResolveMarker,
     /// Re-apply the verdict-matching settle over the full staged set.
@@ -2755,16 +2700,10 @@ impl Arbitrary for ApplyTrace {
     }
 }
 
-/// Apply idempotence: settle re-application is a pure idempotent function of
-/// the frozen staged data. Seeds a committed base, stages one event's writes
-/// and section clears, records the verdict, then drives the generated
-/// interleaving of `resolve_marker`, verdict-matching settle re-applies, and
-/// per-cell `resolve_cell` first-touches — closing with one final settle so
-/// every schedule ends fully settled. Postconditions: the committed
-/// projection equals the verdict state (committed ⇒ cleared sections hold
-/// exactly the survivors, staged data promoted, other sections keep the base
-/// plus staged mutations; aborted ⇒ exactly the pre-stage base), no marker
-/// stands, nothing is provisional, and the physical row shape matches.
+/// Proves that repeated settlement produces the same final state.
+///
+/// The test varies operation order and the event result.
+/// The final state must contain no unsettled marker or provisional cell.
 pub(crate) async fn run_apply_idempotence<S, P>(
     store: S,
     oracle: ScriptedOracle,
@@ -2840,7 +2779,7 @@ where
     for op in &input.ops {
         match op {
             ApplyOp::ResolveMarker => {
-                resolve_marker(&store, &oracle, &collection, &marker).await?;
+                resolve_event_marker(&store, &oracle, &collection, &marker).await?;
             }
             ApplyOp::Settle => {
                 reapply_settle(&store, &collection, input.committed, &writes, &clears).await?;
@@ -2919,7 +2858,7 @@ where
     if probe.cell_rows(id).await? != present {
         return Ok(false);
     }
-    if probe.standing_marker(id).await?.is_some() {
+    if probe.unsettled_marker(id).await?.is_some() {
         return Ok(false);
     }
     if !probe.provisional_rows(id).await?.is_empty() {
@@ -2957,7 +2896,7 @@ pub(crate) enum Poison {
     /// crash trace's stage-fault dimension.
     WriteProvisional(StateName, ErrorCategory),
     /// Direct-apply path: `write_resolved` fails with the given category for
-    /// one named collection — the establish-then-publish pin's lower-write
+    /// one named collection — the establish-then-publish test's lower-write
     /// fault (a failed lower write must leave the cache untouched).
     WriteResolved(StateName, ErrorCategory),
     /// Read-fill path: `get_for_cache` fails for the chosen single-byte
@@ -2968,7 +2907,7 @@ pub(crate) enum Poison {
     GetForCache(BTreeMap<u8, ErrorCategory>),
     /// Raw recovery-reconstruction read path: `provisional_many` fails with the
     /// given category (`Ready(Err)` on the first poll) for one named
-    /// collection — the overlap-precedence pin's cell-read leg, run
+    /// collection — the overlap-precedence test's cell-read leg, run
     /// concurrently with a failing oracle.
     ProvisionalMany(StateName, ErrorCategory),
 }
@@ -3277,7 +3216,7 @@ where
         batch: &'a CoordinateBatch,
     ) -> Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error> {
         // A poisoned collection fails `Ready(Err)` on the first poll (the
-        // overlap-precedence pin's cell-read leg). Otherwise inherit the inner
+        // overlap-precedence test's cell-read leg). Otherwise inherit the inner
         // store's survivors through this wrapper's `provisional_cell_at` (which
         // wraps the inner error).
         if let Some(category) = self.injected_provisional_many(collection) {
@@ -3330,12 +3269,12 @@ where
             .map_err(FailCellError::Inner)
     }
 
-    async fn standing_marker<'a>(
+    async fn unsettled_marker<'a>(
         &'a self,
         collection: &'a CollectionId,
     ) -> Result<Option<EventMarker>, Self::Error> {
         self.inner
-            .standing_marker(collection)
+            .unsettled_marker(collection)
             .await
             .map_err(FailCellError::Inner)
     }
@@ -3575,11 +3514,7 @@ where
                 .collect::<Vec<_>>())
 }
 
-/// Deterministic within-batch duplicate co-observation + scatter-alignment pin:
-/// two present cells with distinct values, read as `[k, m, k]` in one batch —
-/// both `k` positions must answer identically and equal the point `get`, and
-/// the `m` position must carry its own value (a mis-built scatter plan mapping
-/// a duplicate to the wrong unique reddens this).
+/// Proves that duplicate batch positions return the same cell value.
 pub(crate) async fn run_batch_duplicate_co_observation<S: CellStore>(store: S) -> Result<()> {
     let id = CollectionId::new(
         StateKey::new(Uuid::new_v4(), Arc::from("key")),
@@ -3617,11 +3552,11 @@ pub(crate) async fn run_batch_duplicate_co_observation<S: CellStore>(store: S) -
     Ok(())
 }
 
-/// Deterministic alignment pin: a read list spanning two chunks that mixes
+/// Deterministic alignment test: a read list spanning two chunks that mixes
 /// present, absent, and duplicate coordinates — the concatenated `get_many`
 /// output has exactly the input length and each position matches the point
-/// `get` (a dropped no-row position reddens both the length check and the
-/// per-position compare).
+/// `get` (a dropped no-row position makes this test fail both the length check
+/// and the per-position compare).
 pub(crate) async fn run_batch_alignment<S: CellStore>(store: S) -> Result<()> {
     let id = CollectionId::new(
         StateKey::new(Uuid::new_v4(), Arc::from("key")),
@@ -3781,7 +3716,7 @@ pub(crate) async fn run_raw_batch_parity_trace<S: CellStore>(
     Ok(actual.into_vec() == reference)
 }
 
-/// Deterministic ascending-output pin: provisional cells staged and read in a
+/// Deterministic ascending-output test: provisional cells staged and read in a
 /// NON-ascending byte order still come back strictly ascending by coordinate,
 /// each carrying its staged data.
 pub(crate) async fn run_raw_batch_ascending_output<S: CellStore>(store: S) -> Result<()> {
@@ -3826,13 +3761,7 @@ pub(crate) async fn run_raw_batch_ascending_output<S: CellStore>(store: S) -> Re
     Ok(())
 }
 
-/// Deterministic no-side-effects pin: `provisional_many` never consults the
-/// oracle, never mutates the raw provisional set or the standing marker, and
-/// returns exactly the surviving provisional cells (ascending). The three legs
-/// — the oracle counter, the raw before/after snapshot, and the result check —
-/// are jointly complete: an oracle consult reddens the counter; an own-event
-/// resolve that writes back reddens the snapshot; a wrong/dropped survivor
-/// reddens the result.
+/// Proves that provisional batch reads do not change state or check events.
 pub(crate) async fn run_raw_batch_no_side_effects<S: CellStore>(
     store: S,
     oracle: CountingOracle,
@@ -3864,7 +3793,7 @@ pub(crate) async fn run_raw_batch_no_side_effects<S: CellStore>(
     let after = raw_snapshot(&store, collection.id(), &read_bytes).await?;
     assert!(
         before == after,
-        "provisional_many mutated the raw provisional set or the standing marker"
+        "provisional_many mutated the raw provisional set or the unsettled marker"
     );
     assert_eq!(
         oracle.resolves(),
@@ -3893,8 +3822,8 @@ pub(crate) async fn run_raw_batch_no_side_effects<S: CellStore>(
     Ok(())
 }
 
-/// Reads each coordinate's RAW provisional cell plus the standing marker — the
-/// no-side-effects pin's before/after snapshot (never a resolving read, so a
+/// Reads each coordinate's RAW provisional cell plus the unsettled marker — the
+/// no-side-effects test's before/after snapshot (never a resolving read, so a
 /// skipped resolve is visible).
 async fn raw_snapshot<S: CellStore>(
     store: &S,
@@ -3905,7 +3834,7 @@ async fn raw_snapshot<S: CellStore>(
     for &b in read_bytes {
         cells.push(store.provisional_cell_at(id, &cell_in(0, b)).await?);
     }
-    let marker = store.standing_marker(id).await?;
+    let marker = store.unsettled_marker(id).await?;
     Ok((cells, marker))
 }
 
@@ -4081,11 +4010,11 @@ mod sweep {
             store.durable_writes() > 0,
             "first sweep must resolve provisional cells"
         );
-        // Non-vacuous: the sweep read each collection's standing marker once.
+        // Meaningful: the sweep read each collection's unsettled marker once.
         assert_eq!(
             store.marker_reads(),
             refs.len(),
-            "first sweep reads each collection's standing marker exactly once"
+            "first sweep reads each collection's unsettled marker exactly once"
         );
 
         // Second sweep is a no-op: no provisional cell remains to resolve and no
@@ -4097,7 +4026,7 @@ mod sweep {
         }
         assert_eq!(store.durable_writes(), 0);
         // The sweep still *entered* both legs once per collection — the counters
-        // that make the durable-write assertion non-vacuous.
+        // that make the durable-write assertion meaningful.
         assert_eq!(store.recovery_sweeps(), refs.len());
         assert_eq!(store.marker_reads(), refs.len());
         Ok(())
@@ -4174,7 +4103,7 @@ mod sweep {
     /// ⟺ the durable provisional cells). Minting the cold store fresh over the
     /// shared cells is the memory cold-window.
     ///
-    /// Because each stage's boundary resolves the predecessor's standing
+    /// Because each stage's boundary resolves the predecessor's unsettled
     /// marker, **only the final op's cell can still be provisional**: a
     /// trailing `StageOnly` lingers, any trailing settle clears it. So the
     /// property also asserts both sets against that exact expected set,
