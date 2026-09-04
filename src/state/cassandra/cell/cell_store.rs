@@ -4,13 +4,15 @@ use super::{
     BatchUnit, Bytes, CacheBatch, CassandraStore, CassandraStoreError, Cell, CellAddr,
     CellBatchRow, CellBuffer, CellKey, CellKind, CellStore, CellStoreError, CollectionId,
     CollectionRef, CommitOracle, Committed, CommittedBatch, CompactDuration, Coordinate,
-    CoordinateBatch, EventMarker, EventRef, KeyRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell,
-    ProvisionalWrite, ReadPreparation, ResolveCellError, RowShape, Scan, Section, SectionClear,
-    SmallVec, Stream, decode, decode_batch_rows, decode_cell_ttl_result, decode_provisional_batch,
-    dedupe, encode_cell_blobs, expand_to_input_order, extend_gap_units, flatten_resolve, gap_count,
-    into_store_err, match_batch_rows_to_coordinates, resolve_prior_clear_before_read, resolve_read,
-    resolve_unsettled_clear_before_write, section_batches, smallvec, sorted_unique_coordinates,
-    try_stream, ttl_seconds_to_duration, ttl_to_i32, write_provisional,
+    CoordinateBatch, EventMarker, EventRef, KeyRow, PER_STATEMENT_OVERHEAD, Pk, PresenceBatch,
+    ProvisionalCell, ProvisionalWrite, ReadPreparation, ResolveCellError, RowShape, Scan,
+    ScanStatements, Section, SectionClear, SmallVec, Stream, StreamExt, decode, decode_batch_rows,
+    decode_cell_ttl_result, decode_presence_batch_rows, decode_provisional_batch, dedupe,
+    encode_cell_blobs, expand_to_input_order, extend_gap_units, fetch_presence_batch_result,
+    flatten_resolve, gap_count, into_store_err, match_batch_rows_to_coordinates, peek_read,
+    resolve_prior_clear_before_read, resolve_read, resolve_unsettled_clear_before_write,
+    section_batches, smallvec, sorted_unique_coordinates, try_stream, ttl_seconds_to_duration,
+    ttl_to_i32, write_provisional,
 };
 
 impl<O> CellStore for CassandraStore<O>
@@ -156,13 +158,96 @@ where
         Ok(expand_to_input_order(&input_indices, &unique_answers))
     }
 
+    async fn contains_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> Result<PresenceBatch, Self::Error> {
+        let collection_ref = self.resolver.collection_ref(collection);
+        let (unique_coordinates, input_indices) = dedupe(batch);
+        // Use the prior-clear sequence documented on `get_for_cache`.
+        let (rows, marker) = futures::join!(
+            fetch_presence_batch_result(
+                &self.session,
+                &self.queries,
+                collection,
+                section,
+                &unique_coordinates,
+            ),
+            self.unsettled_marker(collection),
+        );
+        let mut rows = rows.map_err(ResolveCellError::Store)?;
+        if resolve_prior_clear_before_read(
+            self,
+            self.resolver.oracle(),
+            &collection_ref,
+            marker?.as_ref(),
+            own,
+        )
+        .await
+        .map_err(flatten_resolve)?
+            == ReadPreparation::DurableStateChanged
+        {
+            rows = fetch_presence_batch_result(
+                &self.session,
+                &self.queries,
+                collection,
+                section,
+                &unique_coordinates,
+            )
+            .await
+            .map_err(ResolveCellError::Store)?;
+        }
+        let rows = decode_presence_batch_rows(&rows, &unique_coordinates)
+            .map_err(ResolveCellError::Store)?;
+        let mut answers = PresenceBatch::with_capacity(unique_coordinates.len());
+        for row in rows {
+            let raw = match row {
+                Some(cell) => cell,
+                None => Cell::Resolved(Committed::new(None)),
+            };
+            answers.push(
+                peek_read(self.resolver.oracle(), &collection_ref, own, raw)
+                    .await
+                    .map_err(ResolveCellError::Oracle)?
+                    .get()
+                    .is_some(),
+            );
+        }
+        Ok(expand_to_input_order(&input_indices, &answers))
+    }
+
     fn scan_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
         own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        self.scan_inner(collection, scan, own)
+        self.scan_inner(
+            ScanStatements::values(&self.queries),
+            collection,
+            scan,
+            own,
+            decode::try_decode_keyed_cell,
+        )
+    }
+
+    fn scan_keys<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
+        self.scan_inner(
+            ScanStatements::presence(&self.queries),
+            collection,
+            scan,
+            own,
+            decode::try_decode_keyed_presence,
+        )
+        .map(|item| item.map(|(key, _)| key))
     }
 
     fn provisional_cells<'a>(

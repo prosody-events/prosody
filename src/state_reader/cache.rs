@@ -20,7 +20,7 @@
 use crate::Key;
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::CellKey;
-use crate::state::store::CellBuffer;
+use crate::state::store::{CellBuffer, PresenceBatch};
 use crate::state::{StateName, StateType};
 use crate::state_reader::source::SourceId;
 use bytes::Bytes;
@@ -136,6 +136,12 @@ impl ReaderCache {
         self.clock.now().duration_since(issued) < ttl
     }
 
+    fn fresh_entry(&self, key: &CacheKey, ttl: Duration) -> Option<CacheVal> {
+        self.inner
+            .get(key)
+            .filter(|(issued, _)| self.fresh(*issued, ttl))
+    }
+
     /// The read-through point read. Serve a fresh hit. Expire a stale hit,
     /// removing it only if it still carries the observed issue time. Then
     /// refill single-flight through `fill`.
@@ -196,8 +202,8 @@ impl ReaderCache {
     {
         let mut hits: CellBuffer<Option<Bytes>> = CellBuffer::with_capacity(keys.len());
         for key in keys {
-            match self.inner.get(key) {
-                Some((issued, value)) if self.fresh(issued, ttl) => hits.push(value),
+            match self.fresh_entry(key, ttl) {
+                Some((_, value)) => hits.push(value),
                 // A single miss refetches the whole batch, so probing the
                 // remaining keys is wasted work — stop at the first.
                 _ => break,
@@ -218,6 +224,13 @@ impl ReaderCache {
             cooperative(self.write_through(key, issued, value.clone())).await;
         }
         Ok(fresh)
+    }
+
+    /// Returns presence when every key has a fresh cached value.
+    pub(crate) fn presence_many(&self, keys: &[CacheKey], ttl: Duration) -> Option<PresenceBatch> {
+        keys.iter()
+            .map(|key| self.fresh_entry(key, ttl).map(|(_, value)| value.is_some()))
+            .collect()
     }
 
     /// Writes `value` for `key`. A fill replaces an observation issued earlier.

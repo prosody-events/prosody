@@ -78,6 +78,30 @@ pub(super) type FramedKeyedCellRow = (
     Option<RawEventRef>,
 );
 
+/// Presence body from the two write times and shared cell metadata.
+pub(super) type RawPresenceRow = RawCellRow<i64>;
+
+/// Presence scan row with its section and coordinate.
+pub(super) type FramedKeyedPresenceRow = (
+    i8,
+    Vec<u8>,
+    Option<i64>,
+    Option<i64>,
+    Option<i16>,
+    Option<i32>,
+    Option<RawEventRef>,
+);
+
+/// Presence batch row with its borrowed coordinate.
+pub(super) type BorrowedKeyedPresenceRow<'frame> = (
+    &'frame [u8],
+    Option<i64>,
+    Option<i64>,
+    Option<i16>,
+    Option<i32>,
+    Option<RawEventRef>,
+);
+
 /// Seven-column shape produced by `SELECT data, prev_data, encoding, version,
 /// event, TTL(data), TTL(prev_data)` — a [`RawCellRow`] suffixed with the
 /// per-blob remaining TTLs [`blob_ttl`] coalesces, for the cache-fill point
@@ -179,6 +203,17 @@ pub(super) fn try_decode_keyed_cell(
     Ok((key, cell))
 }
 
+/// Decodes a presence scan row into its key and sentinel cell.
+pub(super) fn try_decode_keyed_presence(
+    row: FramedKeyedPresenceRow,
+) -> Result<(CellKey, Cell), CassandraCellStoreError> {
+    let (section, coordinate, data, prev, encoding, version, event) = row;
+    Ok((
+        clustered_cell_key(section, coordinate),
+        try_decode_presence((data, prev, encoding, version, event))?,
+    ))
+}
+
 /// Decodes a cache-fill point row into its [`Cell`] and co-expiry TTL
 /// ([`blob_ttl`]). Fails with the same corruption errors as
 /// [`try_decode_cell`].
@@ -259,6 +294,31 @@ pub(super) fn try_decode_cell<B: AsRef<[u8]>>(
             let event = raw.try_into_event()?;
             Ok(Cell::Provisional(ProvisionalCell::new(data, prev, event)))
         }
+    }
+}
+
+/// Decodes write-time presence into a sentinel [`Cell`]. A live write time
+/// becomes `Some(Bytes::new())`; a dead write time becomes `None`. The sentinel
+/// never crosses a store boundary. Presence cells resolve through `peek_read`
+/// only: a repairing resolve would persist the sentinel over real bytes.
+pub(super) fn try_decode_presence(row: RawPresenceRow) -> Result<Cell, CassandraCellStoreError> {
+    let (data, prev, encoding, version, event) = row;
+    validate_row_shape(
+        data.as_ref(),
+        prev.as_ref(),
+        encoding,
+        version,
+        event.as_ref(),
+    )?;
+    let data = data.map(|_| Bytes::new());
+    let prev = prev.map(|_| Bytes::new());
+    match event {
+        None => Ok(Cell::Resolved(Committed::new(data))),
+        Some(raw) => Ok(Cell::Provisional(ProvisionalCell::new(
+            data,
+            prev,
+            raw.try_into_event()?,
+        ))),
     }
 }
 

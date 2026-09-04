@@ -26,11 +26,11 @@ use crate::state::descriptor_identity::DescriptorIdentityStore;
 use crate::state::identity::CollectionId;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state::publication::PublicationStore;
-use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store::{CellBuffer, CoordinateBatch, PresenceBatch};
 use crate::timers::store::cassandra::CassandraTriggerStoreProvider;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use bytes::Bytes;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use std::convert::Infallible;
 use std::error::Error;
 use std::future::ready;
@@ -71,6 +71,23 @@ pub trait CommittedCellSource: Clone + Send + Sync + 'static {
         id: &'a CollectionId,
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a;
+
+    /// Streams keys with a committed cell projection in `scan` order.
+    /// This read does not consult the oracle or run owner-side repair.
+    fn scan_presence<'a>(
+        &'a self,
+        id: &'a CollectionId,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a;
+
+    /// Reads index-aligned committed presence values.
+    /// This read does not consult the oracle or run owner-side repair.
+    fn load_presence_many(
+        &self,
+        id: &CollectionId,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send;
 }
 
 impl CommittedCellSource for CassandraCellResources {
@@ -95,6 +112,23 @@ impl CommittedCellSource for CassandraCellResources {
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         Self::scan_committed(self, id, scan)
+    }
+
+    fn scan_presence<'a>(
+        &'a self,
+        id: &'a CollectionId,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
+        Self::scan_committed_keys(self, id, scan)
+    }
+
+    async fn load_presence_many(
+        &self,
+        id: &CollectionId,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<PresenceBatch, Self::Error> {
+        Self::read_committed_presence_many(self, id, section, batch).await
     }
 }
 
@@ -125,6 +159,26 @@ impl CommittedCellSource for MemoryCells {
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         Self::scan_committed(self, id, scan)
     }
+
+    fn scan_presence<'a>(
+        &'a self,
+        id: &'a CollectionId,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
+        Self::scan_committed(self, id, scan).map(|item| item.map(|(key, _)| key))
+    }
+
+    fn load_presence_many(
+        &self,
+        id: &CollectionId,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send {
+        ready(Ok(Self::read_committed_many(self, id, section, batch)
+            .into_iter()
+            .map(|value| value.is_some())
+            .collect()))
+    }
 }
 
 #[cfg(test)]
@@ -154,6 +208,26 @@ impl CommittedCellSource for ScriptedCellSource {
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         Self::scan_committed(self, id, scan)
+    }
+
+    fn scan_presence<'a>(
+        &'a self,
+        id: &'a CollectionId,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
+        Self::scan_committed(self, id, scan).map(|item| item.map(|(key, _)| key))
+    }
+
+    fn load_presence_many(
+        &self,
+        id: &CollectionId,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send {
+        ready(
+            Self::read_committed_many(self, id, section, batch)
+                .map(|values| values.into_iter().map(|value| value.is_some()).collect()),
+        )
     }
 }
 

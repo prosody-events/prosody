@@ -25,6 +25,11 @@ const _: () = assert!(
 pub struct CoordinateBatch(CellBuffer<Coordinate>);
 
 impl CoordinateBatch {
+    /// Creates one batch for one coordinate.
+    pub(crate) fn one(coordinate: Coordinate) -> Self {
+        CoordinateBatch(CellBuffer::from_iter([coordinate]))
+    }
+
     /// Splits `coords` into maximal `1..=CELL_BATCH` batches in input order.
     pub fn chunks<I: IntoIterator<Item = Coordinate>>(
         coords: I,
@@ -57,6 +62,9 @@ pub type CellBuffer<T> = SmallVec<[T; CELLS_INLINE]>;
 
 /// The index-aligned result of a committed batch read.
 pub type CommittedBatch = CellBuffer<Committed>;
+
+/// One presence bit per input position.
+pub type PresenceBatch = CellBuffer<bool>;
 
 /// The index-aligned result of a cache-fill batch read.
 pub type CacheBatch = CellBuffer<(Committed, Option<CompactDuration>)>;

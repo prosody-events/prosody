@@ -7,14 +7,15 @@
 //! collection-layer handles over this one trait and the durability layer is
 //! written exactly once.
 //!
-//! Its currency is the resolved [`Committed`] cell: `get` and `scan_cells`
-//! oracle-resolve any in-flight provisional cell **inside the backend** before
-//! yielding, so callers above it (the `Overlay`
-//! dirty overlay, the [`Cached`](super::cached::Cached) write-through cache)
-//! are oracle-free and merely delegate down. The `own: EventRef` argument lets
-//! the bottom store short-circuit to `prev` for the running handler's own
-//! provisional cell without an oracle consult (the own-event-base-is-prev
-//! invariant); the per-event session injects it, so collections never pass it.
+//! Its currency is the resolved [`Committed`] cell. `get`, `get_many`,
+//! `scan_cells`, `scan_keys`, and `contains_many` oracle-resolve provisional
+//! cells **inside the backend** before they return. Thus, the `Overlay` dirty
+//! overlay and the [`Cached`](super::cached::Cached) store do not use the
+//! oracle. They delegate resolution to lower stores. The `own: EventRef`
+//! argument lets the bottom store short-circuit to `prev` for the running
+//! handler's own provisional cell without an oracle consult (the
+//! own-event-base-is-prev invariant); the per-event session injects it, so
+//! collections never pass it.
 //!
 //! # Collection-grain atomicity invariant
 //!
@@ -60,14 +61,17 @@ pub(crate) use super::store_helpers::{
     sorted_unique_coordinates,
 };
 pub(crate) use super::store_types::CELL_BATCH;
-pub use super::store_types::{CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch};
+pub use super::store_types::{
+    CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch, PresenceBatch,
+};
 
 /// Uniform durable storage for the cells of one collection partition.
 ///
-/// `get` is a resolving point read and `scan_cells` a resolving single-section
-/// range stream; `provisional_cells` is the whole-partition recovery scan. The
-/// three mutators take a collection's touched cells as a batch and map onto the
-/// durability sequence:
+/// `get` and `get_many` are resolving point reads. `scan_cells` and `scan_keys`
+/// are resolving range streams. `contains_many` is their batch presence twin.
+/// `provisional_cells` is the whole-partition recovery scan. The three mutators
+/// take a collection's touched cells as a batch and map onto the durability
+/// sequence:
 ///
 /// * [`Self::write_provisional`] — *stage*: writes `data | prev | event` for
 ///   each cell (the `ReadCommitted` outcome path).
@@ -99,6 +103,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// Resolves a prior event's section clear before it returns data.
     /// The read cannot return data that the clear removed.
     /// Markers without section clears remain unsettled.
+    /// [`Self::scan_cells`], [`Self::scan_keys`], [`Self::get_many`],
+    /// [`Self::contains_many`], and cache-fill reads use the same guard.
     ///
     /// # Errors
     ///
@@ -122,6 +128,18 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         scan: Scan<'a>,
         own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a;
+
+    /// Scans visible committed keys in coordinate order. The scan applies its
+    /// direction, edges, and limit to present keys.
+    ///
+    /// This read uses the marker-resolved presence rules on
+    /// [`Self::contains_many`].
+    fn scan_keys<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a;
 
     /// Cache-fill point read: the committed value **plus** the durable cell's
     /// remaining TTL, for the [`Cached`](super::cached::Cached) write-through
@@ -203,6 +221,20 @@ pub trait CellStore: Clone + Send + Sync + 'static {
             Ok(expand_to_input_order(&input_indices, &unique_answers))
         }
     }
+
+    /// Tests presence for one section's coordinates in one backend hop.
+    /// Results follow the observation contract on [`Self::get_many`].
+    ///
+    /// This read returns marker-resolved truth through the read window stated
+    /// on [`Self::get`]. It resolves provisional presence with `peek_read` and
+    /// never repairs a cell from its own snapshot.
+    fn contains_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send + 'a;
 
     /// Cache-fill batch twin of [`Self::get_for_cache`]: the batch read plus
     /// each position's remaining TTL, for the

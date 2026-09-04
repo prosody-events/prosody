@@ -63,7 +63,7 @@ use crate::state::descriptor::{
 };
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::registry::CollectionDef;
-use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store::{CellBuffer, CoordinateBatch, PresenceBatch};
 use crate::state::{RESOLVE_FANOUT, StateName, StateType, StoreOutcome};
 use bytes::{Bytes, BytesMut};
 use educe::Educe;
@@ -101,8 +101,9 @@ pub(crate) use stream::{CoordinatePlan, Plan, RangePlan};
 /// name.
 pub(crate) mod sealed {
     use super::{
-        Bytes, CellBuffer, CellKey, CollectionDef, CoordinateBatch, MutationJournal, Scan, Section,
-        StateAccessError, StateName, StateType, StoreOutcome, Stream, StructuralIdentity,
+        Bytes, CellBuffer, CellKey, CollectionDef, CoordinateBatch, MutationJournal, PresenceBatch,
+        Scan, Section, StateAccessError, StateName, StateType, StoreOutcome, Stream,
+        StructuralIdentity,
     };
     use std::future::Future;
     use std::ops::DerefMut;
@@ -182,6 +183,20 @@ pub(crate) mod sealed {
             batch: &CoordinateBatch,
         ) -> impl Future<Output = Result<CellBuffer<Option<Bytes>>, StateAccessError>> + Send;
 
+        /// Reads presence for one aligned batch.
+        ///
+        /// This method matches [`Self::read_batch`] for admission, state
+        /// advancement, source selection, and error order. It returns only
+        /// the `is_some` projection of each visible cell.
+        fn read_presence_batch(
+            session: &S,
+            inner: &mut Self::ReadInner<'_>,
+            state_type: StateType,
+            name: &StateName,
+            section: Section,
+            batch: &CoordinateBatch,
+        ) -> impl Future<Output = Result<PresenceBatch, StateAccessError>> + Send;
+
         /// Freezes this invocation's state into the plan a managed stream
         /// driver runs on. Total: there is no unplannable invocation, so no
         /// driver carries an unreachable arm.
@@ -204,6 +219,16 @@ pub(crate) mod sealed {
             name: &'a StateName,
             scan: Scan<'a>,
         ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a;
+
+        /// Pages visible keys under the same plan and fence contract as
+        /// [`Self::page`]. It returns no value payload.
+        fn page_keys<'a>(
+            session: &'a S,
+            plan: &'a Self::Plan,
+            state_type: StateType,
+            name: &'a StateName,
+            scan: Scan<'a>,
+        ) -> impl Stream<Item = Result<CellKey, StateAccessError>> + Send + 'a;
 
         /// The per-emission fence a managed stream runs after every source
         /// completion, before the item or error escapes. Vacuous on the
@@ -679,6 +704,18 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     where
         T: CellType,
         for<'s> ContextOf<'s, T>: FromSession<'s, Self::Session>;
+
+    /// Tests `keys` for presence as one aligned batch. Each result answers the
+    /// same input position. Duplicate keys keep their positions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an engine access error.
+    fn contains_many<T: CellType>(
+        &mut self,
+        family: CellFamily<Self::Layout, T>,
+        keys: &[KeyOf<T>],
+    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send;
 
     /// Whether a stored cell exists at `key`, **without decoding its value or
     /// running the resolver**. The guarantee is "no decode, no resolve", not

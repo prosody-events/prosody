@@ -15,7 +15,7 @@ use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::registry::CollectionDef;
 use crate::state::session::{KeyedStateSession, MutatePermit, OpPermit};
-use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store::{CellBuffer, CoordinateBatch, PresenceBatch};
 use crate::state::{StateBackend, StateName, StateType, StoreOutcome};
 use bytes::Bytes;
 use futures::stream::Stream;
@@ -94,6 +94,20 @@ where
         session.get_many(state_type, name, section, batch).await
     }
 
+    async fn read_presence_batch(
+        session: &KeyedStateSession<B, L>,
+        _inner: &mut Self::ReadInner<'_>,
+        state_type: StateType,
+        name: &StateName,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<PresenceBatch, StateAccessError> {
+        ensure_live(session)?;
+        session
+            .contains_many(state_type, name, section, batch)
+            .await
+    }
+
     fn capture(_inner: &OpPermit<'_>) {}
 
     /// Reacquires the gate for one continuation — the same acquire
@@ -113,6 +127,16 @@ where
         // Unwitnessed by design: a range pages gate-free, taking the gate only
         // for the planning command that preceded it.
         session.scan(state_type, name, scan)
+    }
+
+    fn page_keys<'a>(
+        session: &'a KeyedStateSession<B, L>,
+        (): &'a (),
+        state_type: StateType,
+        name: &'a StateName,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<CellKey, StateAccessError>> + Send + 'a {
+        session.scan_keys(state_type, name, scan)
     }
 
     fn fence(session: &KeyedStateSession<B, L>) -> Result<(), StateAccessError> {

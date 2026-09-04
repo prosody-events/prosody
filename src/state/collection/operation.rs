@@ -1,6 +1,6 @@
 //! The two scoped operation types and the invocation-local write journal.
 
-use super::stream::PlanBase;
+use super::stream::{PlanBase, read_keys_presence};
 use super::{
     CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, CoordinatePlan,
     RangePlan, StateSession, WritableStateSession, cell_key, encode_cell, resolve_batch,
@@ -309,20 +309,38 @@ impl<S: StateSession, L> CollectionRead for ReadOperation<'_, S, L> {
         family: CellFamily<L, T>,
         key: &KeyOf<T>,
     ) -> impl Future<Output = Result<bool, StateAccessError>> + Send {
-        let cell = cell_key(family, key);
+        let section = family.section();
+        let coordinate = <T::Key as OrderedKeyCodec>::encode(key);
         let Self { collection, inner } = self;
         let session = collection.session();
         async move {
-            let bytes = <S::Engine as sealed::ReadEngine<S>>::read_point(
+            read_presence(
                 session,
                 inner,
                 collection.state_type(),
                 collection.name(),
-                &cell,
+                section,
+                coordinate,
             )
-            .await?;
-            Ok(bytes.is_some())
+            .await
         }
+    }
+
+    fn contains_many<T: CellType>(
+        &mut self,
+        family: CellFamily<L, T>,
+        keys: &[KeyOf<T>],
+    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send {
+        let section = family.section();
+        let Self { collection, inner } = self;
+        read_keys_presence::<S, T>(
+            collection.session(),
+            inner,
+            collection.state_type(),
+            collection.name(),
+            section,
+            keys,
+        )
     }
 
     fn get<T>(
@@ -431,16 +449,65 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
             match staged {
                 Some(Staged::Present(_)) => Ok(true),
                 Some(Staged::Absent) => Ok(false),
-                None => Ok(<S::Engine as sealed::ReadEngine<S>>::read_point(
-                    session,
-                    &mut **inner,
-                    collection.state_type(),
-                    collection.name(),
-                    &cell,
-                )
-                .await?
-                .is_some()),
+                None => {
+                    read_presence(
+                        session,
+                        &mut **inner,
+                        collection.state_type(),
+                        collection.name(),
+                        cell.section,
+                        cell.coordinate,
+                    )
+                    .await
+                }
             }
+        }
+    }
+
+    fn contains_many<T: CellType>(
+        &mut self,
+        family: CellFamily<L, T>,
+        keys: &[KeyOf<T>],
+    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send {
+        let section = family.section();
+        let mut slots = CellBuffer::with_capacity(keys.len());
+        let mut pending = CellBuffer::with_capacity(keys.len());
+        for key in keys {
+            match self.staged(&cell_key(family, key)) {
+                Some(Staged::Present(_)) => slots.push(Some(true)),
+                Some(Staged::Absent) => slots.push(Some(false)),
+                None => {
+                    slots.push(None);
+                    pending.push(<T::Key as OrderedKeyCodec>::encode(key));
+                }
+            }
+        }
+        let Self {
+            collection, inner, ..
+        } = self;
+        async move {
+            let expected = pending.len();
+            let mut answers = CellBuffer::with_capacity(expected);
+            for batch in CoordinateBatch::chunks(pending) {
+                answers.extend(
+                    <S::Engine as sealed::ReadEngine<S>>::read_presence_batch(
+                        collection.session(),
+                        &mut **inner,
+                        collection.state_type(),
+                        collection.name(),
+                        section,
+                        &batch,
+                    )
+                    .await?,
+                );
+            }
+            let received = answers.len();
+            let mut answers = answers.into_iter();
+            slots
+                .into_iter()
+                .map(|slot| slot.or_else(|| answers.next()))
+                .collect::<Option<CellBuffer<bool>>>()
+                .ok_or_else(|| StateAccessError::misaligned_batch(received, expected))
         }
     }
 
@@ -462,6 +529,26 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         // engine await, never the borrowed key.
         async move { read_staged::<S, T, L>(collection, &mut **inner, staged, &cell).await }
     }
+}
+
+/// Reads one coordinate through the engine's presence batch.
+async fn read_presence<S: StateSession>(
+    session: &S,
+    inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
+    state_type: StateType,
+    name: &StateName,
+    section: Section,
+    coordinate: Coordinate,
+) -> Result<bool, StateAccessError> {
+    let batch = CoordinateBatch::one(coordinate);
+    let answers = <S::Engine as sealed::ReadEngine<S>>::read_presence_batch(
+        session, inner, state_type, name, section, &batch,
+    )
+    .await?;
+    answers
+        .first()
+        .copied()
+        .ok_or_else(|| StateAccessError::misaligned_batch(answers.len(), batch.len()))
 }
 
 impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
@@ -613,9 +700,8 @@ async fn batched_bytes<S: StateSession>(
         .collect())
 }
 
-/// Reads `keys`' visible committed bytes as one aligned batch — the whole read
-/// a journal-free invocation performs, and the presence-only half a key-scan
-/// chunk needs, with no decode and no resolver.
+/// Reads visible committed bytes for typed entry reads.
+/// The result aligns with `keys` and does not decode values.
 ///
 /// # Errors
 ///

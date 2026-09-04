@@ -128,7 +128,8 @@ use super::fjall::{CacheRead, FjallCellCache, FjallCellCacheError};
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::{EventMarker, SectionClear};
 use super::store::{
-    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, section_batches,
+    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch,
+    section_batches,
 };
 use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
@@ -451,6 +452,58 @@ where
         loaded
     }
 
+    async fn contains_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> Result<PresenceBatch, Self::Error> {
+        if self.fjall.is_disabled() {
+            return self
+                .lower
+                .contains_many(collection, section, batch, own)
+                .await;
+        }
+        match self
+            .fjall
+            .get_presence_batch(collection, section, batch)
+            .await
+        {
+            Ok(Some(hits)) => return Ok(hits),
+            Ok(None) => {}
+            Err(error) => warn_skip("read presence batch", &error),
+        }
+        self.evict_prior_clear_before_read(collection, own).await?;
+        // Take the clock sample before the durable read. Published entries can
+        // then expire early, but they cannot outlive durable data.
+        let stamped_at = self.fjall.clock().now_ms();
+        let presence = self
+            .lower
+            .contains_many(collection, section, batch, own)
+            .await?;
+        // A presence read has no value bytes. Cache only Absent positions.
+        // Present positions stay cold until a value read can publish payloads.
+        let absent = batch
+            .iter()
+            .zip(&presence)
+            .filter(|(_, present)| !**present)
+            .map(|(coordinate, _)| {
+                (
+                    CellKey {
+                        section,
+                        coordinate: coordinate.clone(),
+                    },
+                    Committed::new(None),
+                    expiry_at(stamped_at, None),
+                )
+            });
+        if let Err(error) = self.fjall.put_batch(collection, absent).await {
+            warn_skip("populate presence batch", &error);
+        }
+        Ok(presence)
+    }
+
     fn scan_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -465,6 +518,26 @@ where
                 self.evict_prior_clear_before_read(collection, own).await?;
             }
             let inner = self.lower.scan_cells(collection, scan, own);
+            pin_mut!(inner);
+            while let Some(item) = inner.next().await {
+                yield item?;
+            }
+        }
+    }
+
+    fn scan_keys<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
+        // A shared helper needs an inner-stream type for two small methods.
+        // These direct twins are easier to read.
+        try_stream! {
+            if !self.fjall.is_disabled() {
+                self.evict_prior_clear_before_read(collection, own).await?;
+            }
+            let inner = self.lower.scan_keys(collection, scan, own);
             pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 yield item?;

@@ -304,7 +304,12 @@ fn prop_memory_batch_read_parity() {
     fn property(trace: BatchReadTrace) -> Result<bool> {
         let oracle = ScriptedOracle::default();
         let store = memory_store(MemoryCells::new(), oracle.clone());
-        executor::block_on(run_batch_read_parity_trace(store, oracle, trace))
+        executor::block_on(run_batch_read_parity_trace(
+            store.clone(),
+            store,
+            oracle,
+            trace,
+        ))
     }
     QuickCheck::new().quickcheck(property as fn(BatchReadTrace) -> Result<bool>);
 }
@@ -771,11 +776,10 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
             .set(K3, Value::from(K3))
             .await
             .map_err(|e| eyre!("{e}"))?;
-        assert!(
-            handle.contains_key(&K3).await.map_err(|e| eyre!("{e}"))?,
-            "set after clear -> true"
-        );
-        assert_eq!(resolves.resolves(), 0, "no contains_key resolved");
+        assert!(handle.contains_key(&K3).await.map_err(|e| eyre!("{e}"))?);
+        assert_eq!(resolves.resolves(), 0);
+        assert_eq!(counting.presence_reads(), 2);
+        assert_eq!(counting.batch_reads(), 0);
 
         // Contrast: the K3 cell IS resolvable, so the zero above is a real skip.
         assert!(handle.get(&K3).await.map_err(|e| eyre!("{e}"))?.is_some());
@@ -871,6 +875,8 @@ async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bo
     );
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
+    assert!(!handle.is_empty().await.map_err(|e| eyre!("{e}"))?);
+
     for dir in [Direction::Forward, Direction::Backward] {
         let drained: Vec<i64> = {
             let stream = handle.keys(dir);
@@ -893,7 +899,7 @@ async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bo
     assert_eq!(
         resolves.resolves(),
         0,
-        "keys() resolves nothing on either arm"
+        "is_empty and keys resolve nothing on either arm"
     );
 
     if get_contrast {
@@ -1055,11 +1061,10 @@ fn prop_map_keyset_exact() {
     QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
 }
 
-/// `Map::get_many` parity: it answers each position exactly as the point `get`
-/// over random populations and query lists (duplicates, absent keys, and
-/// `> CELL_BATCH` lengths crossing sub-batches), in both the dirty-overlay and
-/// committed arms. See `run_map_get_many_parity_trace` for why the point path
-/// is a valid oracle here.
+/// Map batch-read parity: values and presence answer each position exactly as
+/// their point twins over random populations and query lists. The inputs cover
+/// duplicates, absent keys, and lengths above `CELL_BATCH` in dirty and
+/// committed arms.
 #[test]
 fn prop_map_get_many_parity() {
     fn property(input: MapGetManyInput) -> Result<bool> {
@@ -1354,7 +1359,7 @@ fn session_with_loader<L>(
 
 /// Mints a session over `counting` for one event with the default in-memory
 /// loader.
-fn counting_session(
+pub(super) fn counting_session(
     counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
     oracle: &ScriptedOracle,
     registry: &Arc<CollectionDefRegistry>,
@@ -1539,6 +1544,14 @@ fn map_overflowed_stream_issues_one_scan() -> Result<()> {
             dedup_id: Uuid::from_u128(u128::MAX - 100),
         };
         let session = counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
+        let handle = map_state::<I64KeyCodec, JsonCodec>("mp-of")
+            .bind(&session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        assert!(
+            !handle.is_empty().await?,
+            "a live overflowed map is not empty"
+        );
+        counting.reset();
         let out = drain_map_stream(&session, "mp-of", Direction::Forward).await?;
         assert_eq!(
             out,
@@ -1554,6 +1567,39 @@ fn map_overflowed_stream_issues_one_scan() -> Result<()> {
             counting.lower_reads(),
             1,
             "the single keyset get — no bound reads"
+        );
+
+        handle.remove(&0).await?;
+        finalize_and_promote(
+            &session,
+            &oracle,
+            Uuid::from_u128(u128::MAX - 100),
+            &cells,
+            &of_id,
+        )
+        .await?;
+        counting.reset();
+        let empty_session = counting_session(
+            &counting,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            EventRef::Message {
+                dedup_id: Uuid::from_u128(u128::MAX - 99),
+            },
+        );
+        let empty = map_state::<I64KeyCodec, JsonCodec>("mp-of")
+            .bind(&empty_session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        assert!(
+            empty.is_empty().await?,
+            "a removed overflowed entry leaves an empty map"
+        );
+        assert_eq!(
+            counting.presence_scans(),
+            1,
+            "the empty overflowed map scans once"
         );
         Ok(())
     })

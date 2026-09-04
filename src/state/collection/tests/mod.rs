@@ -227,6 +227,7 @@ enum Command {
     Get(Family, i64),
     GetMany(Family, Vec<i64>),
     Contains(Family, i64),
+    ContainsMany(Family, Vec<i64>),
     Take(Family, i64),
     ClearCollection,
 }
@@ -237,7 +238,7 @@ impl Arbitrary for Command {
         // actually occur inside one invocation.
         let key = i64::from(u8::arbitrary(g) % 3);
         let family = Family::arbitrary(g);
-        match u8::arbitrary(g) % 7 {
+        match u8::arbitrary(g) % 8 {
             0 => Self::Set(family, key, i64::from(u8::arbitrary(g))),
             1 => Self::Clear(family, key),
             2 => Self::Get(family, key),
@@ -248,7 +249,13 @@ impl Arbitrary for Command {
                     .collect(),
             ),
             4 => Self::Contains(family, key),
-            5 => Self::Take(family, key),
+            5 => Self::ContainsMany(
+                family,
+                (0..u8::arbitrary(g) % 4)
+                    .map(|_| i64::from(u8::arbitrary(g) % 3))
+                    .collect(),
+            ),
+            6 => Self::Take(family, key),
             _ => Self::ClearCollection,
         }
     }
@@ -408,6 +415,17 @@ where
                     "presence agrees with the journal fold, without resolving"
                 );
             }
+            Command::ContainsMany(family, keys) => {
+                let expected: Vec<bool> = keys
+                    .iter()
+                    .map(|key| model.visible(*family, *key).is_some())
+                    .collect();
+                assert_eq!(
+                    op.contains_many(family.token(), keys).await?.into_vec(),
+                    expected,
+                    "batch presence agrees with each journal-fold position"
+                );
+            }
             &Command::Take(family, key) => {
                 assert_eq!(
                     op.take(family.token(), &key).await?,
@@ -464,6 +482,17 @@ async fn run_invocation(case: Invocation) -> Result<()> {
         .cells
         .write(async move |op| {
             let mut model = seeded;
+            op.set(PairLayout::LEFT, &2, 1)?;
+            model.cells.insert((Family::Left.section(), 2), Some(1));
+            op.clear(PairLayout::LEFT, &2);
+            model.cells.insert((Family::Left.section(), 2), None);
+            assert_eq!(
+                op.contains_many(PairLayout::LEFT, &[2, 3, 2])
+                    .await?
+                    .into_vec(),
+                vec![false, false, false],
+                "batch presence sees staged clears, absent keys, and duplicates"
+            );
             run_commands(op, &commands, &mut model).await?;
             assert_eq!(
                 op.journal_spilled(),

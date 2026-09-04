@@ -19,7 +19,9 @@ struct OpCounts {
     get: AtomicUsize,
     get_many: AtomicUsize,
     get_many_for_cache: AtomicUsize,
+    contains_many: AtomicUsize,
     scan_cells: AtomicUsize,
+    scan_keys: AtomicUsize,
     provisional_cells: AtomicUsize,
     provisional_cell_at: AtomicUsize,
     provisional_many: AtomicUsize,
@@ -65,6 +67,14 @@ impl<S> CountingCellStore<S> {
         self.counts.scan_cells.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn presence_scans(&self) -> usize {
+        self.counts.scan_keys.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn presence_reads(&self) -> usize {
+        self.counts.contains_many.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn recovery_sweeps(&self) -> usize {
         self.counts.provisional_cells.load(Ordering::Relaxed)
     }
@@ -91,7 +101,9 @@ impl<S> CountingCellStore<S> {
         self.counts.get.store(0, Ordering::Relaxed);
         self.counts.get_many.store(0, Ordering::Relaxed);
         self.counts.get_many_for_cache.store(0, Ordering::Relaxed);
+        self.counts.contains_many.store(0, Ordering::Relaxed);
         self.counts.scan_cells.store(0, Ordering::Relaxed);
+        self.counts.scan_keys.store(0, Ordering::Relaxed);
         self.counts.provisional_cells.store(0, Ordering::Relaxed);
         self.counts.provisional_cell_at.store(0, Ordering::Relaxed);
         self.counts.provisional_many.store(0, Ordering::Relaxed);
@@ -144,6 +156,27 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         self.counts.scan_cells.fetch_add(1, Ordering::Relaxed);
         self.inner.scan_cells(collection, scan, own)
+    }
+
+    fn scan_keys<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
+        self.counts.scan_keys.fetch_add(1, Ordering::Relaxed);
+        self.inner.scan_keys(collection, scan, own)
+    }
+
+    fn contains_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send + 'a {
+        self.counts.contains_many.fetch_add(1, Ordering::Relaxed);
+        self.inner.contains_many(collection, section, batch, own)
     }
 
     fn provisional_cells<'a>(

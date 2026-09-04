@@ -58,7 +58,7 @@ use self::codec::Read;
 use crate::state::CollectionId;
 use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Section};
-use crate::state::store::{CellBuffer, CommittedBatch, CoordinateBatch};
+use crate::state::store::{CellBuffer, CommittedBatch, CoordinateBatch, PresenceBatch};
 use ahash::RandomState;
 use bytes::Bytes;
 use educe::Educe;
@@ -496,6 +496,51 @@ impl FjallCellCache {
         section: Section,
         batch: &CoordinateBatch,
     ) -> Result<Option<CommittedBatch>, FjallCellCacheError> {
+        let raws = self.read_batch(collection, section, batch).await?;
+        // One clock sample classifies every position; decode failures propagate.
+        let now = self.clock.now_ms();
+        let mut hits: CommittedBatch = SmallVec::new();
+        for raw in raws {
+            let (expiry, read) = codec::decode_cell(raw.as_deref())?;
+            match classify(expiry, read, now) {
+                CacheRead::Hit(committed) => hits.push(committed),
+                CacheRead::Miss | CacheRead::Expired => return Ok(None),
+            }
+        }
+        Ok(Some(hits))
+    }
+
+    /// Reads batch presence without copying present payload bytes.
+    ///
+    /// This method applies the same absence and expiry rules as
+    /// [`Self::get_batch`].
+    pub(crate) async fn get_presence_batch(
+        &self,
+        collection: &CollectionId,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<Option<PresenceBatch>, FjallCellCacheError> {
+        let raws = self.read_batch(collection, section, batch).await?;
+        let now = self.clock.now_ms();
+        let mut hits = PresenceBatch::with_capacity(raws.len());
+        for raw in raws {
+            let (expiry, read) = codec::decode_presence(raw.as_deref())?;
+            match read {
+                Read::Unknown => return Ok(None),
+                _ if expired(expiry, now) => return Ok(None),
+                Read::Present(()) => hits.push(true),
+                Read::Absent => hits.push(false),
+            }
+        }
+        Ok(Some(hits))
+    }
+
+    async fn read_batch(
+        &self,
+        collection: &CollectionId,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<CellBuffer<Option<Slice>>, FjallCellCacheError> {
         // Encode every key up front (bounded, sized once): small requests stay
         // inline and the owned keys move into the blocking closure.
         let keys: CellBuffer<SmallVec<[u8; 32]>> = batch
@@ -516,7 +561,7 @@ impl FjallCellCache {
         // ONE blocking hop reads every key exhaustively; a per-key engine error
         // (or the injected fault) fails the whole hop, mirroring how `read_cell`
         // surfaces one via `??`.
-        let raws = spawn_blocking(
+        spawn_blocking(
             move || -> Result<CellBuffer<Option<Slice>>, FjallCellCacheError> {
                 #[cfg(test)]
                 probes.fetch_add(1, Ordering::Relaxed);
@@ -531,18 +576,7 @@ impl FjallCellCache {
                 Ok(out)
             },
         )
-        .await??;
-        // One clock sample classifies every position; decode failures propagate.
-        let now = self.clock.now_ms();
-        let mut hits: CommittedBatch = SmallVec::new();
-        for raw in raws {
-            let (expiry, read) = codec::decode_cell(raw.as_deref())?;
-            match classify(expiry, read, now) {
-                CacheRead::Hit(committed) => hits.push(committed),
-                CacheRead::Miss | CacheRead::Expired => return Ok(None),
-            }
-        }
-        Ok(Some(hits))
+        .await?
     }
 
     /// The absolute expiry (millis; `0` = never) stamped on the cell's current

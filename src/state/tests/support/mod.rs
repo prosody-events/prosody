@@ -20,7 +20,8 @@ use crate::state::registry::CollectionDef;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{Finalized, MessageMarker, OpPermit, SessionGate};
 use crate::state::store::{
-    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, provisional_point_loop,
+    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch,
+    provisional_point_loop,
 };
 use crate::state::{
     CollectionId, CollectionRef, CommitDecision, EventRef, StateKey, StateName, StateType,
@@ -35,6 +36,7 @@ use futures::stream::{self, Stream};
 use parking_lot::Mutex;
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
+use smallvec::smallvec;
 use std::convert::Infallible;
 use std::fmt;
 use std::future::{Future, ready};
@@ -233,6 +235,17 @@ where
         ready(Err(StateAccessError::Unavailable))
     }
 
+    fn read_presence_batch(
+        _session: &UnavailableState<P>,
+        _inner: &mut Self::ReadInner<'_>,
+        _state_type: StateType,
+        _name: &StateName,
+        _section: Section,
+        _batch: &CoordinateBatch,
+    ) -> impl Future<Output = Result<PresenceBatch, StateAccessError>> + Send {
+        ready(Err(StateAccessError::Unavailable))
+    }
+
     fn capture((): &()) {}
 
     async fn resume(_session: &UnavailableState<P>, (): &()) {}
@@ -244,6 +257,16 @@ where
         _name: &'a StateName,
         _scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+        stream::once(async { Err(StateAccessError::Unavailable) })
+    }
+
+    fn page_keys<'a>(
+        _session: &'a UnavailableState<P>,
+        (): &'a (),
+        _state_type: StateType,
+        _name: &'a StateName,
+        _scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<CellKey, StateAccessError>> + Send + 'a {
         stream::once(async { Err(StateAccessError::Unavailable) })
     }
 

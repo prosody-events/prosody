@@ -44,7 +44,8 @@ use super::super::oracle::CommitOracle;
 use super::super::overlay::Overlay;
 use super::super::resolve::{resolve_cell, resolve_event_marker, sweep_provisional};
 use super::super::store::{
-    CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, provisional_point_loop,
+    CELL_BATCH, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch,
+    provisional_point_loop,
 };
 use super::super::{CommitDecision, EventRef, StateKey, StateName, StateType};
 use super::support::{CountingCellStore, CountingOracle, batch_of};
@@ -2117,6 +2118,10 @@ where
                 if collect_scan(&overlay, &id, &req, own, None).await? != expected {
                     return Ok(false);
                 }
+                let expected_keys: Vec<u8> = expected.iter().map(|(key, _)| *key).collect();
+                if collect_scan_keys(&overlay, &id, &req, own).await? != expected_keys {
+                    return Ok(false);
+                }
             }
         }
 
@@ -2144,6 +2149,12 @@ where
             let got = overlay
                 .get_many(&id, SECTIONS[s as usize], &batch, own)
                 .await?;
+            let presence = overlay
+                .contains_many(&id, SECTIONS[s as usize], &batch, own)
+                .await?;
+            if presence != presence_of(&got) {
+                return Ok(false);
+            }
             if got.len() != CELLS as usize + 1 {
                 return Ok(false);
             }
@@ -2159,6 +2170,13 @@ where
         }
     }
     Ok(true)
+}
+
+fn presence_of(batch: &CommittedBatch) -> PresenceBatch {
+    batch
+        .iter()
+        .map(|committed| committed.get().is_some())
+        .collect()
 }
 
 /// Proves that a dirty value takes priority over a dirty section clear.
@@ -2469,6 +2487,27 @@ where
     Ok(out)
 }
 
+/// Collects the payload-free twin of [`collect_scan`].
+async fn collect_scan_keys<S>(
+    overlay: &Overlay<S>,
+    id: &CollectionId,
+    req: &ScanReq,
+    own: EventRef,
+) -> Result<Vec<u8>>
+where
+    S: CellStore,
+{
+    let start = Coordinate::from_bytes(vec![req.start]);
+    let end = Coordinate::from_bytes(vec![req.end]);
+    let stream = overlay.scan_keys(id, scan_of(*req, &start, &end), own);
+    futures::pin_mut!(stream);
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        out.push(coord_of(&item?));
+    }
+    Ok(out)
+}
+
 /// Drives interleaved committed seeds, durable section clears, and scans
 /// **directly over a bottom store's `scan_cells`** (no overlay), pinning the
 /// backend's own ordering, clustering-range bounds, and limit handling — the
@@ -2523,7 +2562,8 @@ where
                 let expected = scan_oracle(&model, req);
                 let start = Coordinate::from_bytes(vec![req.start]);
                 let end = Coordinate::from_bytes(vec![req.end]);
-                let stream = store.scan_cells(&id, scan_of(req, &start, &end), own);
+                let scan = scan_of(req, &start, &end);
+                let stream = store.scan_cells(&id, scan, own);
                 futures::pin_mut!(stream);
                 let mut got = Vec::new();
                 while let Some(item) = stream.next().await {
@@ -2531,6 +2571,15 @@ where
                     got.push((coord_of(&key), value));
                 }
                 if got != expected {
+                    return Ok(false);
+                }
+                let keys = store.scan_keys(&id, scan, own);
+                futures::pin_mut!(keys);
+                let mut got_keys = Vec::new();
+                while let Some(key) = keys.next().await {
+                    got_keys.push(coord_of(&key?));
+                }
+                if got_keys != expected.iter().map(|(key, _)| *key).collect::<Vec<_>>() {
                     return Ok(false);
                 }
             }
@@ -3112,6 +3161,30 @@ where
             .map(|item| item.map_err(FailCellError::Inner))
     }
 
+    fn scan_keys<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
+        self.inner
+            .scan_keys(collection, scan, own)
+            .map(|item| item.map_err(FailCellError::Inner))
+    }
+
+    async fn contains_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> Result<PresenceBatch, Self::Error> {
+        self.inner
+            .contains_many(collection, section, batch, own)
+            .await
+            .map_err(FailCellError::Inner)
+    }
+
     fn provisional_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -3360,11 +3433,18 @@ async fn seed_batch<S: CellStore>(
 /// in place: a single collection would let the oracle loop pre-resolve every
 /// cell before `get_many` ran, so `get_many` would never exercise its own
 /// resolution. Distinct `StateKey`s isolate the row sets on both backends.
-pub(crate) async fn run_batch_read_parity_trace<S: CellStore>(
-    store: S,
+/// The read store must start cold over the seeded state. Seeding through a
+/// cache violates KV1 because staging alone does not run the settle transform.
+pub(crate) async fn run_batch_read_parity_trace<Seed, Read>(
+    seed_store: Seed,
+    read_store: Read,
     oracle: ScriptedOracle,
     trace: BatchReadTrace,
-) -> Result<bool> {
+) -> Result<bool>
+where
+    Seed: CellStore,
+    Read: CellStore,
+{
     let (resolved, provisional) = collapse_population(&trace.population);
 
     let event = EventRef::Message {
@@ -3392,28 +3472,42 @@ pub(crate) async fn run_batch_read_parity_trace<S: CellStore>(
     };
     let expected_coll = mk()?;
     let batch_coll = mk()?;
-    seed_batch(&store, &expected_coll, &resolved, &provisional, event).await?;
-    seed_batch(&store, &batch_coll, &resolved, &provisional, event).await?;
+    let presence_coll = mk()?;
+    seed_batch(&seed_store, &expected_coll, &resolved, &provisional, event).await?;
+    seed_batch(&seed_store, &batch_coll, &resolved, &provisional, event).await?;
+    seed_batch(&seed_store, &presence_coll, &resolved, &provisional, event).await?;
 
     let section = SECTIONS[trace.read_section as usize % SECTIONS.len()];
     let mut expected: Vec<Committed> = Vec::with_capacity(trace.reads.len());
     for &b in &trace.reads {
         expected.push(
-            store
+            read_store
                 .get(expected_coll.id(), &cell_in(trace.read_section, b), own)
                 .await?,
         );
     }
     let coords = trace.reads.iter().map(|&b| Coordinate::from_bytes(vec![b]));
     let mut got: Vec<Committed> = Vec::with_capacity(trace.reads.len());
+    let mut presence = Vec::with_capacity(trace.reads.len());
     for batch in CoordinateBatch::chunks(coords) {
         got.extend(
-            store
+            read_store
                 .get_many(batch_coll.id(), section, &batch, own)
                 .await?,
         );
+        presence.extend(
+            read_store
+                .contains_many(presence_coll.id(), section, &batch, own)
+                .await?,
+        );
     }
-    Ok(got.len() == trace.reads.len() && got == expected)
+    Ok(got.len() == trace.reads.len()
+        && got == expected
+        && presence
+            == expected
+                .iter()
+                .map(|cell| cell.get().is_some())
+                .collect::<Vec<_>>())
 }
 
 /// Proves that duplicate batch positions return the same cell value.

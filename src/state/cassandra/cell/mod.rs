@@ -101,9 +101,9 @@ pub use queries::CellQueries;
 #[cfg(test)]
 use read::decode_rows_for_coordinates;
 use read::{
-    decode_batch_rows, decode_cell_ttl_result, fetch_and_decode_cell, fetch_cell_rows_result,
-    fetch_cells_batch, fetch_cells_batch_result, into_store_err, match_batch_rows_to_coordinates,
-    page_cells,
+    ScanStatements, decode_batch_rows, decode_cell_ttl_result, decode_presence_batch_rows,
+    fetch_and_decode_cell, fetch_cell_rows_result, fetch_cells_batch, fetch_cells_batch_result,
+    fetch_presence_batch_result, into_store_err, match_batch_rows_to_coordinates, page_cells,
 };
 use rows::{
     CellAddr, CellBatchRow, CellBlobs, GapBetweenRow, GapEdgeRow, GapSectionRow, KeyRow,
@@ -133,7 +133,7 @@ use crate::state::resolve::{
     resolve_prior_clear_before_read, resolve_read, resolve_unsettled_clear_before_write,
 };
 use crate::state::store::{
-    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe,
+    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch, dedupe,
     expand_to_input_order, section_batches, sorted_unique_coordinates,
 };
 use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
@@ -141,10 +141,11 @@ use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
 use async_stream::try_stream;
 use bytes::Bytes;
-use decode::{BorrowedKeyedCellTtlRow, FramedKeyedCellRow, split_keyed_cell_ttl};
+use decode::{BorrowedKeyedCellTtlRow, split_keyed_cell_ttl};
 use encoding::{EncodedBlob, encode, encode_payload, select_encoding};
-use futures::{Stream, TryStreamExt, pin_mut};
+use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
 use scylla::client::session::Session;
+use scylla::deserialize::row::DeserializeRow;
 use scylla::response::query_result::QueryRowsResult;
 use scylla::serialize::SerializationError;
 use scylla::serialize::row::{RowSerializationContext, SerializeRow};

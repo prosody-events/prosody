@@ -20,11 +20,12 @@ use super::super::memory::{MemoryCellStore, MemoryCells};
 use super::super::oracle::CommitOracle;
 use super::super::registry::CollectionDefRegistry;
 use super::super::resolve::sweep_provisional;
-use super::super::store::{CellBuffer, CellStore, CoordinateBatch};
+use super::super::store::{CellBuffer, CellStore, CoordinateBatch, PresenceBatch};
 use super::super::{CollectionId, CollectionRef, EventRef};
 use super::cell_suite::{
-    FailingCellStore, MemoryShapeProbe, OverlayTrace, Poison, PoisonHandle, SECTION,
-    ScriptedOracle, Trace, bytes, cell_at, run_crash_equivalence_trace, run_overlay_trace,
+    BatchReadTrace, FailingCellStore, MemoryShapeProbe, OverlayTrace, Poison, PoisonHandle,
+    SECTION, ScanTrace, ScriptedOracle, Trace, bytes, cell_at, run_batch_read_parity_trace,
+    run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_trace,
     stage_deferred_repair_shape,
 };
 use super::support::{
@@ -122,6 +123,25 @@ where
         own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         self.inner.scan_cells(collection, scan, own)
+    }
+
+    fn scan_keys<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
+        self.inner.scan_keys(collection, scan, own)
+    }
+
+    fn contains_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send + 'a {
+        self.inner.contains_many(collection, section, batch, own)
     }
 
     async fn get_for_cache<'a>(
@@ -1373,6 +1393,65 @@ fn absent_get_is_cached() -> Result<()> {
             1,
             "two gets of an absent cell pay exactly one durable read"
         );
+        Ok(())
+    })
+}
+
+/// KV2 negative caching: two presence reads of a never-written cell issue one
+/// lower read. The second read uses the cached Absent tag.
+#[test]
+fn absent_presence_is_cached() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let (cached, counting, id) = counting_cached("absent-presence")?;
+        let batch = batch_of([9])?;
+
+        counting.reset();
+        assert_eq!(
+            cached.contains_many(&id, SECTION, &batch, probe(1)).await?,
+            PresenceBatch::from_iter([false]),
+        );
+        assert_eq!(
+            cached.contains_many(&id, SECTION, &batch, probe(2)).await?,
+            PresenceBatch::from_iter([false]),
+        );
+        assert_eq!(
+            counting.presence_reads(),
+            1,
+            "two absent presence reads pay one durable read"
+        );
+        Ok(())
+    })
+}
+
+/// A blown fuse bypasses a stale cache entry for a presence batch.
+#[test]
+fn blown_fuse_presence_reads_durable_truth() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            MemoryCells::new(),
+            ScriptedOracle::default(),
+            Arc::new(CollectionDefRegistry::default()),
+        ));
+        let fjall = test_db::cache("presence-fuse")?;
+        let cached = Cached::new(fjall.clone(), counting.clone());
+        let id = collection("presence-fuse")?;
+        let collection = CollectionRef::new(id.clone(), None);
+        cached
+            .write_resolved(&collection, &[(cell_at(1), Some(bytes(1)))], &[])
+            .await?;
+        counting
+            .write_resolved(&collection, &[(cell_at(1), None)], &[])
+            .await?;
+        fjall.disable();
+        counting.reset();
+
+        assert_eq!(
+            cached
+                .contains_many(&id, SECTION, &batch_of([1])?, probe(1))
+                .await?,
+            PresenceBatch::from_iter([false]),
+        );
+        assert_eq!(counting.presence_reads(), 1, "the fused read delegates");
         Ok(())
     })
 }
@@ -3015,6 +3094,60 @@ fn counting_cached(name: &str) -> Result<(Cached<CountingLower>, CountingLower, 
     let cached = Cached::new(test_db::cache(name)?, counting.clone());
     let id = collection(name)?;
     Ok((cached, counting, id))
+}
+
+/// Presence scans through the cache match value scan keys.
+#[test]
+fn prop_cached_scan_presence_parity() {
+    fn property(trace: ScanTrace) -> Result<bool> {
+        let cells = MemoryCells::new();
+        let oracle = ScriptedOracle::default();
+        let name = Uuid::new_v4().to_string();
+        let cached = cached_over(&cells, &oracle, &name)?;
+        let probe = MemoryShapeProbe(cells);
+        TEST_RUNTIME.block_on(run_bottom_scan_trace(cached, trace, &probe))
+    }
+    QuickCheck::new().quickcheck(property as fn(ScanTrace) -> Result<bool>);
+}
+
+/// Presence batches through the cache match value batch reads.
+#[test]
+fn prop_cached_batch_presence_parity() {
+    fn property(trace: BatchReadTrace) -> Result<bool> {
+        let cells = MemoryCells::new();
+        let oracle = ScriptedOracle::default();
+        let name = Uuid::new_v4().to_string();
+        let bottom = MemoryCellStore::new(
+            cells.clone(),
+            oracle.clone(),
+            Arc::new(CollectionDefRegistry::default()),
+        );
+        let cached = cached_over(&cells, &oracle, &name)?;
+        TEST_RUNTIME.block_on(run_batch_read_parity_trace(bottom, cached, oracle, trace))
+    }
+    QuickCheck::new().quickcheck(property as fn(BatchReadTrace) -> Result<bool>);
+}
+
+/// A fully warm presence batch uses present and absent cache entries.
+#[test]
+fn batch_presence_all_hits_reads_nothing() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let (cached, counting, id) = counting_cached("presence-all-hits")?;
+        let collection = CollectionRef::new(id.clone(), None);
+        counting
+            .write_resolved(&collection, &[(cell_at(1), Some(bytes(1)))], &[])
+            .await?;
+        let batch = batch_of([1, 2])?;
+        cached.get_many(&id, SECTION, &batch, probe(1)).await?;
+        counting.reset();
+
+        assert_eq!(
+            cached.contains_many(&id, SECTION, &batch, probe(2)).await?,
+            PresenceBatch::from_iter([true, false]),
+        );
+        assert_eq!(counting.presence_reads(), 0, "warm hits need no lower read");
+        Ok(())
+    })
 }
 
 /// T-a all-hits: a `CELL_BATCH`-wide chunk whose every coordinate is warm

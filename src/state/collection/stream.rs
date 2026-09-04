@@ -22,7 +22,7 @@ use crate::state::descriptor::{
     CellCodecError, CellStateError, CellType, ContextOf, FromSession, KeyOf, ResolvedOf,
 };
 use crate::state::order_codec::OrderedKeyCodec;
-use crate::state::store::{CELL_BATCH, CellBuffer};
+use crate::state::store::{CELL_BATCH, CellBuffer, CoordinateBatch};
 use crate::state::{SHARD_FANOUT_CONCURRENCY, StateAccessError, StateName, StateType};
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -236,8 +236,8 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
         }
     }
 
-    /// The unfenced presence-only body: the same chunking, with the value bytes
-    /// used as a presence bit and discarded.
+    /// The unfenced presence-only body uses the same chunking. It reads one
+    /// presence bit for each key.
     fn key_source(self) -> impl Stream<Item = KeyItem<T>> + Send {
         try_stream! {
             let Self { base, keys } = self;
@@ -249,7 +249,7 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
                 let chunk: CellBuffer<KeyOf<T>> = keys.by_ref().take(CELL_BATCH).collect();
                 // Pair each key with its slot so the emission stage can drop
                 // absent keys AND checkpoint per key.
-                let paired = read_keys_bytes::<S, T>(
+                let paired = read_keys_presence::<S, T>(
                     &base.session,
                     &mut inner,
                     base.state_type,
@@ -262,7 +262,7 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
                     chunk
                         .into_iter()
                         .zip(slots)
-                        .collect::<CellBuffer<(KeyOf<T>, Option<Bytes>)>>()
+                        .collect::<CellBuffer<(KeyOf<T>, bool)>>()
                 });
                 Some((paired, keys))
             });
@@ -281,7 +281,7 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
                     .map(|(key, slot)| {
                         cooperative(async move {
                             Ok::<Option<KeyOf<T>>, CellStateError<CellCodecError<T>>>(
-                                slot.map(|_| key),
+                                slot.then_some(key),
                             )
                         })
                     })
@@ -338,6 +338,24 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
         )
     }
 
+    /// Opens the plan's payload-free key page.
+    fn page_keys(&self) -> impl Stream<Item = Result<CellKey, StateAccessError>> + Send + '_ {
+        let scan = Scan {
+            section: self.base.section,
+            start: self.start.as_ref(),
+            dir: self.dir,
+            end: self.end.as_ref(),
+            limit: self.limit,
+        };
+        <S::Engine as sealed::ReadEngine<S>>::page_keys(
+            &self.base.session,
+            &self.base.plan,
+            self.base.state_type,
+            &self.base.name,
+            scan,
+        )
+    }
+
     /// Streams the section's live entries, resolved, in `dir` order.
     pub(crate) fn entries(self) -> impl Stream<Item = ScanItem<T>> + Send
     where
@@ -347,8 +365,8 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
         fenced::<S, _, T>(session, self.entry_source())
     }
 
-    /// Streams the section's live keys in `dir` order, **without decoding or
-    /// resolving any value** — the paged envelope's value bytes are discarded.
+    /// Streams the section's live keys in `dir` order through presence-only
+    /// pages. It does not transfer, decode, or resolve a value.
     pub(crate) fn keys(self) -> impl Stream<Item = KeyItem<T>> + Send {
         let session = self.base.session.clone();
         fenced::<S, _, T>(session, self.key_source())
@@ -391,10 +409,10 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
         try_stream! {
             let plan = self;
             <S::Engine as sealed::ReadEngine<S>>::fence(&plan.base.session)?;
-            let inner = plan.page()
+            let inner = plan.page_keys()
                 .map(|item| {
                     cooperative(async move {
-                        let (cell, _bytes) = item?; // value bytes discarded — never decoded
+                        let cell = item?;
                         let key = <T::Key as OrderedKeyCodec>::decode(cell.coordinate.as_bytes())
                             .map_err(CellStateError::Key)?;
                         Ok::<KeyOf<T>, CellStateError<CellCodecError<T>>>(key)
@@ -407,6 +425,37 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
             }
         }
     }
+}
+
+/// Reads key presence in aligned batches without value payloads.
+pub(super) async fn read_keys_presence<S, T>(
+    session: &S,
+    inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
+    state_type: StateType,
+    name: &StateName,
+    section: Section,
+    keys: &[KeyOf<T>],
+) -> Result<CellBuffer<bool>, StateAccessError>
+where
+    S: StateSession,
+    T: CellType,
+{
+    let coordinates = keys.iter().map(<T::Key as OrderedKeyCodec>::encode);
+    let mut presence = CellBuffer::with_capacity(keys.len());
+    for batch in CoordinateBatch::chunks(coordinates) {
+        presence.extend(
+            <S::Engine as sealed::ReadEngine<S>>::read_presence_batch(
+                session, inner, state_type, name, section, &batch,
+            )
+            .await?,
+        );
+    }
+    debug_assert_eq!(
+        presence.len(),
+        keys.len(),
+        "batch read answers every input position"
+    );
+    Ok(presence)
 }
 
 /// The managed stream fence adapter — the SOLE home of a managed stream's

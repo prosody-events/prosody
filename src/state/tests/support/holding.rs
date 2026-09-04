@@ -106,6 +106,25 @@ where
         self.inner.scan_cells(collection, scan, own)
     }
 
+    fn scan_keys<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
+        self.inner.scan_keys(collection, scan, own)
+    }
+
+    fn contains_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send + 'a {
+        self.inner.contains_many(collection, section, batch, own)
+    }
+
     async fn get_for_cache<'a>(
         &'a self,
         collection: &'a CollectionId,

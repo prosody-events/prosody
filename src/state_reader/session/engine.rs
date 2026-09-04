@@ -24,7 +24,7 @@ use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::collection::{StateSession, sealed};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::registry::{CollectionDef, MAX_KEYSET_LIMIT};
-use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store::{CellBuffer, CoordinateBatch, PresenceBatch};
 use crate::state::{StateName, StateType};
 use crate::state_reader::backend::ReaderBackend;
 use bytes::Bytes;
@@ -127,6 +127,22 @@ impl<C: Codec, B: ReaderBackend<C>> sealed::ReadEngine<ReadSession<C, B>> for Re
         result
     }
 
+    async fn read_presence_batch(
+        session: &ReadSession<C, B>,
+        inner: &mut Self::ReadInner<'_>,
+        _state_type: StateType,
+        _name: &StateName,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<PresenceBatch, StateAccessError> {
+        let unselected = inner.is_none();
+        let result = session.presence_batch_read(inner, section, batch).await;
+        if unselected {
+            publish(session, inner.as_ref());
+        }
+        result
+    }
+
     fn capture(inner: &Self::ReadInner<'_>) -> Self::Plan {
         inner.clone()
     }
@@ -146,6 +162,16 @@ impl<C: Codec, B: ReaderBackend<C>> sealed::ReadEngine<ReadSession<C, B>> for Re
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
         session.scan_from(plan.as_ref(), scan)
+    }
+
+    fn page_keys<'a>(
+        session: &'a ReadSession<C, B>,
+        plan: &'a Self::Plan,
+        _state_type: StateType,
+        _name: &'a StateName,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<CellKey, StateAccessError>> + Send + 'a {
+        session.scan_presence_from(plan.as_ref(), scan)
     }
 
     /// Vacuous: a published reader has no attempt, no cancellation, and no

@@ -46,6 +46,25 @@ impl CellStore for TtlStub {
         stream::empty()
     }
 
+    fn scan_keys<'a>(
+        &'a self,
+        _collection: &'a CollectionId,
+        _scan: Scan<'a>,
+        _own: EventRef,
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
+        stream::empty()
+    }
+
+    fn contains_many<'a>(
+        &'a self,
+        _collection: &'a CollectionId,
+        _section: Section,
+        batch: &'a CoordinateBatch,
+        _own: EventRef,
+    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send + 'a {
+        ready(Ok(smallvec![true; batch.len()]))
+    }
+
     fn provisional_cells<'a>(
         &'a self,
         _collection: &'a CollectionId,
