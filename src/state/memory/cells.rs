@@ -18,7 +18,7 @@ type MarkerMap = scc::HashMap<CollectionId, EventMarker, RandomState>;
 
 /// A process-shared in-memory cell map.
 ///
-/// Cells and standing event markers survive partition reassignment within the
+/// Cells and unsettled event markers survive partition reassignment within the
 /// process because clones share these maps.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryCells {
@@ -132,7 +132,7 @@ impl MemoryCells {
     }
 
     #[cfg(test)]
-    pub(crate) fn standing_marker_of(&self, collection: &CollectionId) -> Option<EventMarker> {
+    pub(crate) fn unsettled_marker_of(&self, collection: &CollectionId) -> Option<EventMarker> {
         self.markers
             .read_sync(collection, |_, marker| marker.clone())
     }

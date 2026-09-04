@@ -13,13 +13,11 @@ impl CassandraCellResources {
         Self { session, queries }
     }
 
-    /// Reads one cell's committed value without consulting the oracle. This is
-    /// the read path a standalone reader uses, not the owner. It point-reads
-    /// the `kind=Cell` row and projects
-    /// [`crate::state::cell::Cell::project_committed`]. It never returns an
-    /// in-flight provisional value and never runs owner-side repair: no
-    /// `help_read_window`, no oracle. An absent row reads `None`. It
-    /// decodes the borrowed row before it drops the response.
+    /// Returns one cell for a standalone reader.
+    ///
+    /// This read does not resolve markers or change durable state.
+    /// It returns `prev` for a provisional cell.
+    /// It returns `None` for an absent cell.
     ///
     /// # Errors
     ///
@@ -99,7 +97,21 @@ impl CassandraCellResources {
         Ok(expand_to_input_order(&input_indices, &unique_answers))
     }
 
-    /// Scans committed values through [`Self::scan_committed_inner`].
+    /// Scans cells for a standalone reader.
+    ///
+    /// This scan does not resolve markers or change durable state.
+    /// It returns cells in coordinate order.
+    /// The limit counts only returned cells.
+    ///
+    /// This scan does not resolve an unsettled section clear.
+    /// The projection is still sound: a provisional row's `prev`
+    /// is committed by construction, and a resolved row's `data` was committed
+    /// at some earlier point. So a resolved row written before a committed but
+    /// not-yet-applied section clear reads a value that was once committed but
+    /// is now stale, until the owner applies the clear. That staleness is
+    /// bounded (see
+    /// [`Cell::project_committed`](crate::state::cell::Cell::project_committed)).
+    /// It is never an uncommitted read.
     pub(crate) fn scan_committed<'a>(
         &'a self,
         id: &'a CollectionId,

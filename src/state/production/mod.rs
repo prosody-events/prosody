@@ -131,7 +131,7 @@ where
             queries.clone(),
             oracle.clone(),
             self.registry.clone(),
-            fjall.presence(),
+            fjall.marker_checks(),
         );
         let cell = Cached::new(fjall, cassandra);
         Ok(PartitionBackend::new(oracle, self.identity.clone(), cell))
