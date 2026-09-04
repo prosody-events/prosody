@@ -482,7 +482,6 @@ fn make_session_with_dirty(
         recovery_delay: CompactDuration::new(30),
         armed: armed.clone(),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-        publisher: None,
     })
 }
 
@@ -3506,7 +3505,7 @@ fn check_map_yield(
 /// before any mutator runs, so a yielded key must be a seed key and its value
 /// one held there at some point (values are read live, chunk by chunk). Every
 /// op is bounded by [`INTERLEAVE_HANG_GUARD`] — the only deadline, never the
-/// assertion. FALSIFICATION: hold the chunk's admission across the yield by
+/// assertion. Falsification: hold the chunk's admission across the yield by
 /// returning it in `CoordinatePlan`'s unfold state (`Some((entries, inner,
 /// keys))`) so it lives into the forwarding loop → the first mutator after an
 /// `Advance` blocks on the gate the suspended generator holds → the hang-guard
@@ -3617,7 +3616,7 @@ pub(crate) async fn run_map_stream_interleave(input: MapInterleave) -> Result<bo
 /// commit/rollback mutators interleave with `next()`. No op deadlocks, no
 /// `Advance` errors, the yielded count never exceeds the init window length,
 /// and every yielded value was pushed at some point (position identity — a
-/// popped position reads absent and is skipped). Same FALSIFICATION as the map
+/// popped position reads absent and is skipped). Same falsification as the map
 /// twin.
 pub(crate) async fn run_deque_stream_interleave(input: DequeInterleave) -> Result<bool> {
     let DequeInterleave { steps, backward } = input;

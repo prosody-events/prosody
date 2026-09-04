@@ -290,19 +290,19 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             Span::current().record("responses.missing", display(Missing(results)));
             Span::current().record("responses.errors", display(Failures(results)));
             Span::current().record("request.outcome", completeness);
-            self.registry
-                .metrics()
-                .request_latency
-                .record(waited, &[KeyValue::new("outcome", completeness)]);
+            self.registry.metrics().request_latency.record(
+                waited,
+                &[KeyValue::new("prosody.request.outcome", completeness)],
+            );
         } else {
             if let Err(error) = &collected {
                 record_request_error(error);
             }
             Span::current().record("request.outcome", "failed");
-            self.registry
-                .metrics()
-                .request_latency
-                .record(waited, &[KeyValue::new("outcome", "failed")]);
+            self.registry.metrics().request_latency.record(
+                waited,
+                &[KeyValue::new("prosody.request.outcome", "failed")],
+            );
         }
         collected
     }
