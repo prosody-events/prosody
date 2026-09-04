@@ -169,9 +169,8 @@ where
         Ok((timer_stream, manager))
     }
 
-    /// Retrieves all scheduled execution times for a given key and timer
-    /// type: every persisted time except those currently `Firing` (being
-    /// processed and not scheduled to fire again).
+    /// Returns persisted times for a key and timer type, except those in
+    /// `Firing` or `FiringReplaced` state.
     ///
     /// # Errors
     ///
@@ -184,9 +183,9 @@ where
     ) -> Result<Vec<CompactDateTime>, TimerManagerError<T::Error>> {
         let active_triggers = self.0.scheduler.active_triggers();
 
-        // Stream from storage and filter in a single pass — no intermediate
-        // Vec. Firing is the only excluded state; times absent from
-        // ActiveTriggers (slab not yet loaded) still count as scheduled.
+        // Filter the store stream in one pass without an intermediate buffer.
+        // Times absent from the registry (slab not yet loaded) still count as
+        // scheduled.
         let stream = self
             .0
             .store
@@ -198,11 +197,11 @@ where
                 let state = active_triggers.get_state(key, time, timer_type);
                 async move {
                     match state.await {
-                        Some(TimerState::Firing) => false,
+                        Some(TimerState::Firing | TimerState::FiringReplaced) => false,
                         Some(
                             TimerState::Scheduled
                             | TimerState::FiringRescheduled
-                            | TimerState::Aborted,
+                            | TimerState::Parked,
                         )
                         | None => true,
                     }
@@ -216,7 +215,7 @@ where
     ///
     /// Inserts the timer into persistent storage and, if its slab is currently
     /// owned, enqueues it in the in-memory scheduler. Prior-state handling
-    /// (re-fire after commit for a firing timer, requeue for an aborted one)
+    /// (re-fire after commit for a firing timer, requeue for a parked one)
     /// is resolved by the state machine in `timers::active::transition`.
     ///
     /// **Singleton vs Overflow routing:**
@@ -235,13 +234,11 @@ where
         self.schedule_trigger(trigger).await
     }
 
-    /// Mints the trigger for `request` with the coordinate's standing identity.
-    ///
-    /// The store key row is the sole tag authority; the in-memory registry
-    /// holds no tag. A standing row keeps its tag, so a repeat schedule of one
-    /// coordinate is one timer and its live attempt stays uncommitted. An
-    /// absent row mints a fresh tag, so the cells a receipted attempt left
-    /// behind still resolve as committed.
+    /// Uses the key-row tag for `request`, or a fresh tag when no row exists.
+    /// The key row is the only home of the tag; the registry holds no tag.
+    /// Keep this read: a fresh tag on a repeated write would make an aborted
+    /// attempt's cells read as committed. An `Overflow` key needs one point
+    /// read per schedule and per fire.
     async fn mint(&self, request: TimerRequest) -> Result<Trigger, TimerManagerError<T::Error>> {
         let tag = self
             .0
@@ -436,10 +433,9 @@ where
 
     /// Marks a timer as completed.
     ///
-    /// A completion from `FiringRescheduled` keeps the DB row (the timer
-    /// fires again) and rotates the oracle tag; from any other state it
-    /// deletes the row. Resolved by the state machine in
-    /// `timers::active::transition`.
+    /// `FiringRescheduled` keeps the rows and rotates the tag for the next
+    /// fire. `FiringReplaced` only removes the active entry. Other states
+    /// delete the rows.
     ///
     /// Typically invoked by [`crate::timers::uncommitted::FiringTimer`]'s
     /// [`crate::consumer::Uncommitted::commit()`] impl.

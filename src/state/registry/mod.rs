@@ -21,6 +21,9 @@ mod tests;
 
 pub use definition::{CollectionDef, CommitMode, ReadCachePolicy, StateVisibility};
 
+/// The minimum recovery delay. A failed sweep cannot repeat faster than this.
+pub(crate) const RECOVERY_DELAY_FLOOR: CompactDuration = CompactDuration::new(1);
+
 /// Registration ceiling on the Map keyset bound: a larger limit is rejected at
 /// build ([`RegisterStateError::KeysetLimit`]), capping the point-get fan-out
 /// (and decode allocation) a single `stream` can issue — the byte ceiling
@@ -207,8 +210,8 @@ impl CollectionDefRegistry {
 
     /// Returns the recovery-convergence bound declared for `(state_type,
     /// name)`, or `None` for a name with no bound (or not in the registry).
-    /// The durability boundary folds this against the `recovery_delay`
-    /// floor, so `None` means "use the floor"; see [`CollectionDef`].
+    /// [`Self::tightened_recovery_delay`] combines this bound with the
+    /// configured delay.
     #[must_use]
     pub(crate) fn recovery_within_for(
         &self,
@@ -216,6 +219,19 @@ impl CollectionDefRegistry {
         name: &StateName,
     ) -> Option<CompactDuration> {
         self.def_for(state_type, name).recovery_within
+    }
+
+    /// Tightens the delay by each collection bound, then applies
+    /// [`RECOVERY_DELAY_FLOOR`].
+    pub(crate) fn tightened_recovery_delay<'a>(
+        &self,
+        recovery_delay: CompactDuration,
+        collections: impl Iterator<Item = (StateType, &'a StateName)>,
+    ) -> CompactDuration {
+        collections
+            .filter_map(|(state_type, name)| self.recovery_within_for(state_type, name))
+            .fold(recovery_delay, CompactDuration::min)
+            .max(RECOVERY_DELAY_FLOOR)
     }
 
     fn lookup_collection(

@@ -15,7 +15,7 @@ use crate::consumer::message::{
 };
 use crate::consumer::middleware::deduplication::{DedupIdentity, dedup_uuid_for_message};
 use crate::consumer::partition::offsets::OffsetTracker;
-use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
+use crate::consumer::{DemandType, EventHandler, Keyed, ReceiptedSource, Uncommitted};
 use crate::loader::MessageLoader;
 use crate::otel::SpanRelation;
 use crate::state::manager::{EventStateScope, PartitionStateManager, SweepResolution};
@@ -142,13 +142,13 @@ async fn process_timer<T, S, M, P>(
     };
     let firing = match fired {
         Fired::Live(firing) => firing,
-        Fired::Committed(key, commit_guard) => {
+        Fired::Committed(source) => {
             match state_manager
-                .resolve_redelivered(key, timer_manager, shutdown_rx)
+                .resolve_redelivered(source.key().clone(), timer_manager, shutdown_rx)
                 .await
             {
-                SweepResolution::Commit => commit_guard.commit().await,
-                SweepResolution::Abort => commit_guard.abort().await,
+                SweepResolution::Commit => source.retire().await,
+                SweepResolution::Abort => source.keep().await,
             }
             return;
         }

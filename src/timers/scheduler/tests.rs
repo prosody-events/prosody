@@ -224,7 +224,7 @@ impl Arbitrary for OpSequence {
 enum ModelActiveState {
     Scheduled,
     Firing,
-    Aborted,
+    Parked,
 }
 
 impl ModelActiveState {
@@ -232,9 +232,9 @@ impl ModelActiveState {
         match state {
             TimerState::Scheduled => Ok(Self::Scheduled),
             TimerState::Firing => Ok(Self::Firing),
-            TimerState::Aborted => Ok(Self::Aborted),
-            TimerState::FiringRescheduled => {
-                Err("property model does not create FiringRescheduled timers".to_owned())
+            TimerState::Parked => Ok(Self::Parked),
+            TimerState::FiringReplaced | TimerState::FiringRescheduled => {
+                Err("model does not replace or reschedule active attempts".to_owned())
             }
         }
     }
@@ -312,10 +312,10 @@ impl Fixture {
         let trigger = Trigger::new(key.clone(), time, ty, Span::current());
         let current_model = self.model_for(&key, time, ty);
 
-        // Reviving an Aborted timer with the same identity is an in-memory
+        // Reviving a Parked timer with the same identity is an in-memory
         // state transition: the store row already exists, so just flip the
         // state back to Scheduled and re-queue.
-        if current_model.active_state == Some(ModelActiveState::Aborted) {
+        if current_model.active_state == Some(ModelActiveState::Parked) {
             self.triggers
                 .active_triggers()
                 .set_state(&key, time, ty, TimerState::Scheduled)
@@ -419,12 +419,15 @@ impl Fixture {
         {
             Some(TimerState::Scheduled) => true,
             Some(TimerState::Firing) => false,
-            Some(TimerState::Aborted | TimerState::FiringRescheduled) | None => return Ok(()),
+            Some(
+                TimerState::Parked | TimerState::FiringReplaced | TimerState::FiringRescheduled,
+            )
+            | None => return Ok(()),
         };
 
         self.triggers
             .active_triggers()
-            .set_state(&key, time, ty, TimerState::Aborted)
+            .set_state(&key, time, ty, TimerState::Parked)
             .await;
         if needs_dequeue {
             let trigger = Trigger::new(key.clone(), time, ty, Span::current());
@@ -432,7 +435,7 @@ impl Fixture {
         }
 
         let mut model = self.model_for(&key, time, ty);
-        model.active_state = Some(ModelActiveState::Aborted);
+        model.active_state = Some(ModelActiveState::Parked);
         self.set_model(key, time, ty, model);
         Ok(())
     }
@@ -794,7 +797,7 @@ async fn test_cleanup_preserves_aborted_timer_slab_and_reload_schedules_it() -> 
         .await;
     triggers
         .active_triggers()
-        .set_state(&key, time, ty, TimerState::Aborted)
+        .set_state(&key, time, ty, TimerState::Parked)
         .await;
     triggers.remove_queue_only(&trigger);
 
@@ -804,7 +807,7 @@ async fn test_cleanup_preserves_aborted_timer_slab_and_reload_schedules_it() -> 
         store.get_slab_range(0..=SlabId::MAX).try_collect().await?;
     assert!(
         slabs_after_cleanup.contains(&slab_id),
-        "cleanup must keep slab metadata while an Aborted timer is active"
+        "cleanup must keep slab metadata while a Parked timer is active"
     );
     let times_after_cleanup: BTreeSet<CompactDateTime> =
         store.get_key_times(ty, &key).try_collect().await?;

@@ -16,7 +16,7 @@ use super::*;
 
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::receipted_sealed;
-use crate::consumer::{Keyed, Receipted, Redelivery, Uncommitted};
+use crate::consumer::{Keyed, Receipted, ReceiptedSource, Redelivery, Uncommitted};
 use crate::timers::UncommittedTimer;
 use color_eyre::eyre::{Result, bail};
 use crossbeam_utils::CachePadded;
@@ -41,13 +41,23 @@ impl Uncommitted for MockCommitGuard {
 impl receipted_sealed::Sealed for MockCommitGuard {}
 
 impl Receipted for MockCommitGuard {
+    type Source = Self;
+
     fn redelivery(&self) -> impl Future<Output = Redelivery> + Send {
         ready(Redelivery::Sweeps)
     }
 
-    fn receipt(&mut self) -> impl Future<Output = ()> + Send {
-        ready(())
+    fn receipt(self) -> impl Future<Output = Self::Source> + Send {
+        ready(self)
     }
+}
+
+impl ReceiptedSource for MockCommitGuard {
+    async fn retire(self) {
+        self.commit().await;
+    }
+
+    async fn keep(self) {}
 }
 
 /// Mock uncommitted timer for testing `EventHandler::on_timer`.

@@ -13,16 +13,16 @@
 //!
 //! # State Definitions
 //!
-//! | State                | `ActiveTriggers`    | `DelayQueue` | `Database` |
-//! |----------------------|---------------------|--------------|------------|
-//! | `UNSCHEDULED`        | absent              | -            | -          |
-//! | `SCHEDULED`          | `Scheduled`         | ✓            | ✓          |
-//! | `FIRING`             | `Firing`            | -            | ✓          |
-//! | `FIRING_RESCHEDULED` | `FiringRescheduled` | ✓            | ✓          |
-//! | `ABORTED`            | `Aborted`           | -            | ✓          |
+//! | State                  | `ActiveTriggers`      | `DelayQueue`   | `Database`                             |
+//! | ---------------------- | --------------------- | -------------- | -------------------------------------- |
+//! | `UNSCHEDULED`          | absent                | -              | -                                      |
+//! | `SCHEDULED`            | `Scheduled`           | ✓              | ✓                                      |
+//! | `FIRING`               | `Firing`              | -              | ✓                                      |
+//! | `FIRING_REPLACED`      | `FiringReplaced`      | -              | -                                      |
+//! | `FIRING_RESCHEDULED`   | `FiringRescheduled`   | ✓              | ✓                                      |
+//! | `PARKED`               | `Parked`              | -              | ✓ (slab row; key row unless receipted) |
 //!
-//! Aborted state is in-memory only; persisted rows load as `Scheduled` after
-//! restart.
+//! Persisted rows load as `Scheduled` after restart.
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
@@ -42,7 +42,7 @@ pub(crate) struct ActiveTriggerEntry {
 pub struct TimerSnapshot {
     /// Timers in any state in the loaded scheduling window.
     pub active: u32,
-    /// Timers in `Firing` or `FiringRescheduled` state.
+    /// Timers in `Firing`, `FiringReplaced`, or `FiringRescheduled` state.
     pub in_flight: u32,
     /// Timers whose `fire_time <= now` (any state).
     pub overdue: u32,
@@ -68,13 +68,18 @@ pub enum TimerState {
     /// Handler is processing this timer; it has not been rescheduled.
     Firing,
 
+    /// The handler still processes this attempt, but `clear_and_schedule`
+    /// replaced its rows. The coordinate has no durable rows or queue entry.
+    FiringReplaced,
+
     /// Handler is processing this timer; the same (key, time, type) was
     /// re-scheduled during dispatch and will fire again after commit.
     FiringRescheduled,
 
-    /// Delivery was aborted; the persisted row is retained (for recovery or
-    /// an explicit requeue) but the timer is not in the `DelayQueue`.
-    Aborted,
+    /// The timer has no queue entry. Its slab row waits for reload, schedule,
+    /// or retire. An aborted attempt keeps its key row. A receipted attempt
+    /// has no key row.
+    Parked,
 }
 
 /// A lifecycle operation submitted to the timer state machine.
@@ -191,14 +196,10 @@ impl MemoryEffects {
     };
 }
 
-/// One resolved step of the timer state machine.
+/// The effects of one timer operation.
 ///
-/// Only [`transition`] constructs values of this type, so the table's
-/// exhaustive `(op, prior state)` match is the only place a transition can
-/// be defined — an illegal transition is unwritable outside it. Consumers
-/// read the in-memory effects through [`phases`](Self::phases), which
-/// splits them around the durable write according to the row's
-/// [`EffectOrder`].
+/// [`transition`] selects the effects for every operation and prior state.
+/// [`phases`](Self::phases) separates memory effects around the durable write.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Transition {
     /// New registry state for the timer; `None` leaves the entry untouched.
@@ -214,6 +215,19 @@ pub(crate) struct Transition {
 }
 
 impl Transition {
+    const DEACTIVATE: Self = Self {
+        queue: QueueEffect::Deactivate,
+        ..Self::NONE
+    };
+    /// A row with every effect at its no-op value.
+    const NONE: Self = Self {
+        next_state: None,
+        queue: QueueEffect::None,
+        store: StoreEffect::None,
+        ordering: EffectOrder::MemoryThenStore,
+        announce: None,
+    };
+
     /// The durable-store effect, if any.
     pub(crate) fn store(self) -> StoreEffect {
         self.store
@@ -372,7 +386,9 @@ impl ActiveTriggers {
                     s.active = s.active.saturating_add(1);
                     if matches!(
                         entry.state,
-                        TimerState::Firing | TimerState::FiringRescheduled
+                        TimerState::Firing
+                            | TimerState::FiringReplaced
+                            | TimerState::FiringRescheduled
                     ) {
                         s.in_flight = s.in_flight.saturating_add(1);
                     }
@@ -402,32 +418,52 @@ impl ActiveTriggers {
 /// still accept `Schedule`/`Unschedule` so durable rows stay authoritative).
 pub(crate) fn transition(prior: Option<TimerState>, op: TimerOp) -> Transition {
     use EffectOrder::StoreThenMemory;
-    use TimerState::{Aborted, Firing, FiringRescheduled, Scheduled};
-
-    /// A row with every effect at its no-op value.
-    const NOOP: Transition = Transition {
-        next_state: None,
-        queue: QueueEffect::None,
-        store: StoreEffect::None,
-        ordering: EffectOrder::MemoryThenStore,
-        announce: None,
-    };
+    use TimerOp as Op;
+    use TimerState::{Firing, FiringReplaced, FiringRescheduled, Parked, Scheduled};
 
     match (op, prior) {
-        // Scheduling a firing timer marks it for a re-fire after commit; the
-        // durable row already exists, only the queue needs the entry back.
-        (TimerOp::Schedule | TimerOp::ClearSchedule, Some(Firing)) => Transition {
+        // Queue the next fire. The current attempt still has durable rows.
+        (Op::Schedule | Op::ClearSchedule, Some(Firing)) => Transition {
             next_state: Some(FiringRescheduled),
             queue: QueueEffect::Enqueue,
-            ..NOOP
+            ..Transition::NONE
         },
 
-        // Schedule a coordinate with no live attempt. Persisting the rows
-        // before the scheduler `Add` means a concurrent slab-load scan between
-        // the two writes already sees them; the actor's `Add` then finds the
-        // slab owned and just inserts the in-memory entry. An aborted refire
-        // re-persists too because its key row can be absent after a receipt.
-        (TimerOp::Schedule, Some(Scheduled | Aborted) | None) => Transition {
+        // Restore the replaced rows before the next fire can enter the queue.
+        (Op::Schedule, Some(FiringReplaced)) => Transition {
+            next_state: Some(FiringRescheduled),
+            queue: QueueEffect::Enqueue,
+            store: StoreEffect::Insert,
+            ordering: StoreThenMemory,
+            ..Transition::NONE
+        },
+
+        // Queue the next fire after the caller's atomic write restores the rows.
+        (Op::ClearSchedule, Some(FiringReplaced)) => Transition {
+            next_state: Some(FiringRescheduled),
+            queue: QueueEffect::Enqueue,
+            ordering: StoreThenMemory,
+            ..Transition::NONE
+        },
+
+        // Keep the attempt active while the caller replaces its rows.
+        (Op::ClearReplaced, Some(Firing)) => Transition {
+            next_state: Some(FiringReplaced),
+            ..Transition::NONE
+        },
+
+        // Cancel the next fire because the caller replaces its rows.
+        (Op::ClearReplaced, Some(FiringRescheduled)) => Transition {
+            next_state: Some(FiringReplaced),
+            queue: QueueEffect::Dequeue,
+            ..Transition::NONE
+        },
+
+        // Remove the active entry. This coordinate has no durable rows.
+        (Op::Complete | Op::Retire | Op::Abort, Some(FiringReplaced)) => Transition::DEACTIVATE,
+
+        // Write both rows before the scheduler can load them or queue the timer.
+        (Op::Schedule, Some(Scheduled | Parked) | None) => Transition {
             next_state: Some(Scheduled),
             queue: QueueEffect::Insert,
             store: StoreEffect::Insert,
@@ -435,106 +471,90 @@ pub(crate) fn transition(prior: Option<TimerState>, op: TimerOp) -> Transition {
             announce: Some(Announce::Scheduled),
         },
 
-        // Cancel a reschedule: back to `Firing`, drop the queued re-fire.
-        // The in-flight delivery completes normally without firing again.
-        (TimerOp::Unschedule | TimerOp::ClearReplaced, Some(FiringRescheduled)) => Transition {
+        // Cancel the next fire. The current attempt keeps its rows until commit.
+        (Op::Unschedule, Some(FiringRescheduled)) => Transition {
             next_state: Some(Firing),
             queue: QueueEffect::Dequeue,
-            ..NOOP
+            ..Transition::NONE
         },
 
-        // Plain cancel: remove from memory first, then delete the row.
-        (TimerOp::Unschedule, Some(Scheduled | Aborted) | None) => Transition {
+        // Cancel the timer before its durable rows disappear.
+        (Op::Unschedule, Some(Scheduled | Parked) | None) => Transition {
             queue: QueueEffect::Remove,
             store: StoreEffect::Delete,
             announce: Some(Announce::Cancelled),
-            ..NOOP
+            ..Transition::NONE
         },
 
-        // A timer replaced by `clear_and_schedule`: as `Unschedule`, minus
-        // the row delete and telemetry the caller owns.
-        (TimerOp::ClearReplaced, Some(Scheduled | Aborted) | None) => Transition {
+        // Remove the replaced timer. The caller deletes its rows and emits telemetry.
+        (Op::ClearReplaced, Some(Scheduled | Parked) | None) => Transition {
             queue: QueueEffect::Remove,
-            ..NOOP
+            ..Transition::NONE
         },
 
-        // Receipt or commit a rescheduled timer: the row stays and fires again.
-        // and the oracle tag rotates — durably first, so memory never shows
-        // a rotation the store could lose.
-        (TimerOp::Complete | TimerOp::Receipt, Some(FiringRescheduled)) => Transition {
+        // Rotate the tag before the queued timer can fire as a new attempt.
+        (Op::Complete | Op::Receipt | Op::Retire, Some(FiringRescheduled)) => Transition {
             next_state: Some(Scheduled),
             store: StoreEffect::UpdateTag,
             ordering: StoreThenMemory,
-            ..NOOP
+            ..Transition::NONE
         },
 
-        // Commit anything else: drop the registry entry (firing already
-        // popped the queue entry), then delete the row.
-        (TimerOp::Complete, Some(Firing | Scheduled | Aborted) | None) => Transition {
-            queue: QueueEffect::Deactivate,
+        // Remove the entry and rows because the attempt committed without a next fire.
+        (Op::Complete, Some(Firing | Scheduled | Parked) | None) => Transition {
             store: StoreEffect::Delete,
-            ..NOOP
+            ..Transition::DEACTIVATE
         },
 
-        // A Firing receipt leaves the entry Firing. The scheduler cannot
-        // refire it before retire. The in-process oracle stays conservative
-        // until retire. Per-key serialization prevents a reader during settle.
-        (TimerOp::Receipt, Some(Firing | Scheduled | Aborted) | None) => Transition {
+        // Park after the key-row delete. A failed delete leaves Firing, so the retry deletes the
+        // row again.
+        (Op::Receipt, Some(Firing)) => Transition {
+            next_state: Some(Parked),
             store: StoreEffect::DeleteKeyRow,
-            ..NOOP
+            ordering: StoreThenMemory,
+            ..Transition::NONE
         },
 
-        // Retire a consumed source. Firing already removed its queue entry.
-        (TimerOp::Retire, Some(Firing | Aborted) | None) => Transition {
-            queue: QueueEffect::Deactivate,
+        // Remove the slab row after promotion. The timer has no queue entry.
+        (Op::Retire, Some(Firing | Parked) | None) => Transition {
             store: StoreEffect::DeleteSlabRow,
-            ..NOOP
+            ..Transition::DEACTIVATE
         },
 
-        // A scheduled timer or rescheduled firing must fire again.
-        // Abort a reschedule: the timer is still queued; it fires again.
-        (TimerOp::Abort, Some(FiringRescheduled)) => Transition {
+        // Keep the queued timer so another attempt can fire after abort.
+        (Op::Abort, Some(FiringRescheduled)) => Transition {
             next_state: Some(Scheduled),
-            ..NOOP
+            ..Transition::NONE
         },
 
-        // Abort a queued timer: keep the row for recovery, drop the queue
-        // entry.
-        (TimerOp::Abort, Some(Scheduled)) => Transition {
-            next_state: Some(Aborted),
+        // Park a queued timer. Its rows remain for reload or another schedule.
+        (Op::Abort, Some(Scheduled)) => Transition {
+            next_state: Some(Parked),
             queue: QueueEffect::Dequeue,
-            ..NOOP
+            ..Transition::NONE
         },
 
-        // Abort a firing timer: keep the row; firing already dequeued it.
-        (TimerOp::Abort, Some(Firing)) => Transition {
-            next_state: Some(Aborted),
-            ..NOOP
+        // Park the failed attempt. Its rows remain, and fire already removed its queue entry.
+        (Op::Abort, Some(Firing)) => Transition {
+            next_state: Some(Parked),
+            ..Transition::NONE
         },
 
-        // Revive an aborted slot after the atomic write makes its row durable.
-        (TimerOp::ClearSchedule, Some(Aborted)) => Transition {
+        // Queue the timer after the caller's atomic write restores its rows.
+        (Op::ClearSchedule, Some(Scheduled | Parked) | None) => Transition {
             next_state: Some(Scheduled),
             queue: QueueEffect::Insert,
             ordering: StoreThenMemory,
-            ..NOOP
+            ..Transition::NONE
         },
 
-        // The new timer of a `clear_and_schedule`: queue it only after the
-        // atomic write lands.
-        (TimerOp::ClearSchedule, Some(Scheduled) | None) => Transition {
-            queue: QueueEffect::Insert,
-            ordering: StoreThenMemory,
-            ..NOOP
-        },
-
-        // Inert pairs: re-scheduling an already-rescheduled timer,
-        // cancelling or replacing a timer mid-fire, and aborting an
-        // already-aborted or absent timer.
-        (TimerOp::Schedule | TimerOp::ClearSchedule, Some(FiringRescheduled))
-        | (TimerOp::Unschedule | TimerOp::ClearReplaced, Some(Firing))
-        | (TimerOp::Abort, Some(Aborted) | None)
-        | (TimerOp::Retire, Some(Scheduled | FiringRescheduled)) => NOOP,
+        // Keep the current state when the operation has no work to do.
+        (Op::Schedule | Op::ClearSchedule, Some(FiringRescheduled))
+        | (Op::Unschedule, Some(Firing))
+        | (Op::Unschedule | Op::ClearReplaced, Some(FiringReplaced))
+        | (Op::Receipt, Some(FiringReplaced | Scheduled | Parked) | None)
+        | (Op::Abort, Some(Parked) | None)
+        | (Op::Retire, Some(Scheduled)) => Transition::NONE,
     }
 }
 

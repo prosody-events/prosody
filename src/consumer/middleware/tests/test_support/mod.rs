@@ -27,7 +27,7 @@ use crate::consumer::middleware::{
 };
 use crate::consumer::partition::ShutdownPhase;
 use crate::consumer::receipted_sealed;
-use crate::consumer::{Keyed, Receipted, Redelivery, Uncommitted};
+use crate::consumer::{Keyed, Receipted, ReceiptedSource, Redelivery, Uncommitted};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::{MemoryLoader, MessageLoader};
 use crate::state::cell::Committed;
@@ -122,13 +122,23 @@ impl Uncommitted for GatedGuard {
 impl receipted_sealed::Sealed for GatedGuard {}
 
 impl Receipted for GatedGuard {
+    type Source = Self;
+
     fn redelivery(&self) -> impl Future<Output = Redelivery> + Send {
         future::ready(Redelivery::Sweeps)
     }
 
-    fn receipt(&mut self) -> impl Future<Output = ()> + Send {
-        future::ready(())
+    fn receipt(self) -> impl Future<Output = Self::Source> + Send {
+        future::ready(self)
     }
+}
+
+impl ReceiptedSource for GatedGuard {
+    async fn retire(self) {
+        self.commit().await;
+    }
+
+    async fn keep(self) {}
 }
 
 /// Returns the `cart` value descriptor.
@@ -143,17 +153,24 @@ pub fn cart() -> ValueDescriptor {
 pub async fn buffered(
     configure: impl FnOnce(Ctx) -> Ctx,
 ) -> color_eyre::Result<(Ctx, MemoryCellStore<RecordingOracle>, CollectionId)> {
-    buffered_with(Arc::default(), None, configure).await
+    buffered_with(Arc::default(), None, None, configure).await
 }
 
 /// Buffers one `cart` write with a finite optional sweep failure.
 pub async fn buffered_with(
     armed: ArmedKeys,
     sweep_failure: Option<(ErrorCategory, usize)>,
+    recovery_within: Option<CompactDuration>,
     configure: impl FnOnce(Ctx) -> Ctx,
 ) -> color_eyre::Result<(Ctx, MemoryCellStore<RecordingOracle>, CollectionId)> {
     let mut registry = CollectionDefRegistry::default();
-    registry.register(&cart(), CollectionDef::new(None))?;
+    registry.register(
+        &cart(),
+        CollectionDef {
+            recovery_within,
+            ..CollectionDef::new(None)
+        },
+    )?;
     let registry = Arc::new(registry);
     let state_key = StateKey::new(Uuid::from_u128(0x7), Arc::from("user-1"));
     let oracle = RecordingOracle::new();
@@ -219,12 +236,9 @@ pub async fn committed_value(
         .map_err(|error| color_eyre::eyre::eyre!("read committed: {error}"))
 }
 
-/// Timer-operation error the mock injects on demand, carrying the category to
-/// classify as. The backstop arm is must-succeed (invariant 8), so it retries
-/// **every** category forever — a `with_timer_failures(k, category)` context
-/// exercises the retry-forever self-heal for each, including `Terminal` (which
-/// `retry_step` retries rather than abandons) and `Permanent` (which the arm's
-/// own loop retries past `retry_step`'s `Skip`).
+/// Timer writes record each attempt before they return a result.
+/// `with_timer_failures(count, category)` fails the first `count` writes.
+/// A successful arm thus records `count + 1` attempts for each error category.
 mod context;
 pub use context::*;
 mod handlers;

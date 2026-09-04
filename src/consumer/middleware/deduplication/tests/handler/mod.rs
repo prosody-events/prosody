@@ -1,6 +1,4 @@
-//! Unit tests for the deduplication handler: the stateless filter over the
-//! session's boundary-readable message marker, the dedup-id derivation, and
-//! the settlement classification table.
+//! Check marker lookup, handler calls, and settlement.
 
 use crate::consumer::DemandType;
 use crate::consumer::EventHandler;
@@ -9,8 +7,8 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::deduplication::{
     DedupIdentity, DeduplicationConfiguration, DeduplicationError, DeduplicationHandler,
-    DeduplicationMiddleware, DeduplicationStore, MemoryDeduplicationStore,
-    MemoryDeduplicationStoreProvider, dedup_uuid, dedup_uuid_for_message,
+    DeduplicationMiddleware, DeduplicationOutput, DeduplicationStore, MemoryDeduplicationStore,
+    MemoryDeduplicationStoreProvider, Presence, dedup_uuid, dedup_uuid_for_message,
 };
 use crate::consumer::middleware::tests::test_support::{
     MockEventContext, RecordingSession, create_test_message_from, recording_session,
@@ -143,8 +141,79 @@ fn create_handler<T>(inner: T) -> DeduplicationHandler<T, MemoryDeduplicationSto
     }
 }
 
-/// The fixed identity the tests derive message dedup ids under — the free
-/// function stands in for the partition loop's `EventRef` derivation.
+/// Supply each lookup result without a network store.
+#[derive(Clone)]
+struct LookupStore(Result<Presence, TestError>);
+
+impl DeduplicationStore for LookupStore {
+    type Error = TestError;
+
+    fn lookup(&self, _id: Uuid) -> impl Future<Output = Result<Presence, Self::Error>> {
+        ready(self.0.clone())
+    }
+
+    fn insert(&self, _id: Uuid) -> impl Future<Output = Result<(), Self::Error>> {
+        ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn lookup_controls_dispatch() -> color_eyre::Result<()> {
+    for (presence, output, settlement) in [
+        (
+            Ok(Presence::Absent),
+            Some(DeduplicationOutput::Ran(())),
+            Settlement::Final,
+        ),
+        (
+            Ok(Presence::Cached),
+            Some(DeduplicationOutput::Repeated),
+            Settlement::Bypassed,
+        ),
+        (
+            Ok(Presence::Durable),
+            Some(DeduplicationOutput::Redelivered),
+            Settlement::Duplicate,
+        ),
+        (Err(TestError::Transient), None, Settlement::Bypassed),
+    ] {
+        for excise in [false, true] {
+            let handler = DeduplicationHandler {
+                inner: MockHandler::success(),
+                store: LookupStore(presence.clone()),
+            };
+            let message = create_test_message("key1", Some("evt1"))?;
+            let context = session_context(dedup_uuid_for_message(test_identity(), &message));
+            let result = if excise {
+                FallibleHandler::on_excise(
+                    &handler,
+                    context,
+                    create_test_message_from(ConsumerMessageValue {
+                        key: "key1".into(),
+                        payload: (),
+                        ..Default::default()
+                    })?,
+                    DemandType::Normal,
+                )
+                .await
+            } else {
+                FallibleHandler::on_message(&handler, context, message, DemandType::Normal).await
+            };
+            assert_eq!(result.as_ref().map_err(|_| ()), output.as_ref().ok_or(()));
+            assert_eq!(
+                DeduplicationHandler::<MockHandler, LookupStore>::settlement(result.as_ref()),
+                settlement
+            );
+            assert_eq!(
+                handler.inner.call_count(),
+                usize::from(matches!(presence, Ok(Presence::Absent)))
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Supply the partition identity for message markers.
 fn test_identity() -> DedupIdentity<'static> {
     DedupIdentity {
         version: "1",
@@ -169,8 +238,7 @@ fn create_test_message(
     })
 }
 
-/// A session-backed mock context whose `EventRef::Message` carries
-/// `dedup_id` — the identity the filter reads.
+/// Set the message identity that the filter reads.
 fn session_context(dedup_id: Uuid) -> MockEventContext<serde_json::Value, RecordingSession> {
     let state_key = StateKey::new(Uuid::from_u128(0xDD), Arc::from("test-key"));
     let (session, _cell_store, _dirty, _recorded) = recording_session(
@@ -181,10 +249,7 @@ fn session_context(dedup_id: Uuid) -> MockEventContext<serde_json::Value, Record
     MockEventContext::new().with_session(session)
 }
 
-/// A row already present in the store (written by a prior committed
-/// dispatch's settle-boundary record) filters the message before the handler
-/// runs. The filter reads the session's `EventRef` dedup id — the same
-/// identity the boundary records.
+/// A stored marker prevents a second handler call.
 #[tokio::test]
 async fn seeded_id_filters_before_handler() -> color_eyre::Result<()> {
     let handler = create_handler(MockHandler::success());
@@ -195,7 +260,10 @@ async fn seeded_id_filters_before_handler() -> color_eyre::Result<()> {
     let context = session_context(id);
 
     let result = FallibleHandler::on_message(&handler, context, msg, DemandType::Normal).await;
-    assert!(matches!(result, Ok(None)), "a seeded id is filtered");
+    assert!(
+        matches!(result, Ok(DeduplicationOutput::Repeated)),
+        "a seeded id is filtered"
+    );
     assert_eq!(handler.inner.call_count(), 0, "filtered before the handler");
     Ok(())
 }
@@ -208,13 +276,12 @@ async fn cache_miss_runs_handler() -> color_eyre::Result<()> {
     let context = session_context(dedup_uuid_for_message(test_identity(), &msg));
 
     let result = FallibleHandler::on_message(&handler, context, msg, DemandType::Normal).await;
-    assert!(matches!(result, Ok(Some(()))));
+    assert!(matches!(result, Ok(DeduplicationOutput::Ran(()))));
     assert_eq!(handler.inner.call_count(), 1);
     Ok(())
 }
 
-/// The filter keys on the exact session identity: a store row for a
-/// *different* message's id never filters this one.
+/// A marker for another message cannot filter this message.
 #[tokio::test]
 async fn a_different_message_id_is_not_filtered() -> color_eyre::Result<()> {
     let handler = create_handler(MockHandler::success());
@@ -228,13 +295,12 @@ async fn a_different_message_id_is_not_filtered() -> color_eyre::Result<()> {
 
     let context = session_context(dedup_uuid_for_message(test_identity(), &msg2));
     let result = FallibleHandler::on_message(&handler, context, msg2, DemandType::Normal).await;
-    assert!(matches!(result, Ok(Some(()))));
+    assert!(matches!(result, Ok(DeduplicationOutput::Ran(()))));
     assert_eq!(handler.inner.call_count(), 1);
     Ok(())
 }
 
-/// A context with no marker source (the stateless default session)
-/// dispatches unfiltered — the filter cannot key without an identity.
+/// A context without a message identity cannot filter messages.
 #[tokio::test]
 async fn no_marker_source_dispatches_unfiltered() -> color_eyre::Result<()> {
     let handler = create_handler(MockHandler::success());
@@ -242,7 +308,7 @@ async fn no_marker_source_dispatches_unfiltered() -> color_eyre::Result<()> {
 
     let msg = create_test_message("key1", Some("evt1"))?;
     let result = FallibleHandler::on_message(&handler, context, msg, DemandType::Normal).await;
-    assert!(matches!(result, Ok(Some(()))));
+    assert!(matches!(result, Ok(DeduplicationOutput::Ran(()))));
     assert_eq!(handler.inner.call_count(), 1);
     Ok(())
 }
@@ -258,17 +324,14 @@ async fn timer_passthrough() {
     );
 
     let result = FallibleHandler::on_timer(&handler, context, trigger, DemandType::Normal).await;
-    assert!(result.is_ok());
+    assert!(matches!(result, Ok(DeduplicationOutput::Ran(()))));
     assert_eq!(handler.inner.call_count(), 1);
 }
 
-/// The settlement classification table: every Output and error variant. The
-/// probe inner classifies everything `Bypassed`, so the delegating rows are
-/// proven to delegate (a hardcoded `Final` would fail them).
+/// Check each result variant. The probe detects a lost inner classification.
 #[test]
 fn settlement_classification_table() {
-    /// Inner probe whose classification is `Bypassed` for every result, so
-    /// delegation is observable.
+    /// Always return `Bypassed` to check delegation.
     #[derive(Clone)]
     struct BypassedProbe;
 
@@ -324,16 +387,21 @@ fn settlement_classification_table() {
 
     type Subject = DeduplicationHandler<MockHandler, MemoryDeduplicationStore>;
     type Probe = DeduplicationHandler<BypassedProbe, MemoryDeduplicationStore>;
-    type SubjectResult = Result<Option<()>, DeduplicationError<TestError>>;
+    type SubjectResult = Result<DeduplicationOutput<()>, DeduplicationError<TestError>>;
     let rows: Vec<(&str, SubjectResult, Settlement)> = vec![
         (
-            "Ok(Some) delegates (leaf Final)",
-            Ok(Some(())),
+            "Ran delegates",
+            Ok(DeduplicationOutput::Ran(())),
             Settlement::Final,
         ),
         (
-            "Ok(None) dedup hit is Duplicate",
-            Ok(None),
+            "Repeated bypasses the sweep",
+            Ok(DeduplicationOutput::Repeated),
+            Settlement::Bypassed,
+        ),
+        (
+            "Redelivered requests the sweep",
+            Ok(DeduplicationOutput::Redelivered),
             Settlement::Duplicate,
         ),
         (
@@ -351,19 +419,16 @@ fn settlement_classification_table() {
         assert_eq!(Subject::settlement(result.as_ref()), expected, "{label}");
     }
 
-    // Delegation proof: over a Bypassed-classifying inner, the delegating
-    // rows stay Bypassed — the wrapper is not hardcoding Final.
-    let ok: Result<Option<()>, DeduplicationError<TestError>> = Ok(Some(()));
+    // Preserve the inner classification for success and failure.
+    let ok: Result<DeduplicationOutput<()>, DeduplicationError<TestError>> =
+        Ok(DeduplicationOutput::Ran(()));
     assert_eq!(Probe::settlement(ok.as_ref()), Settlement::Bypassed);
-    let err: Result<Option<()>, DeduplicationError<TestError>> =
+    let err: Result<DeduplicationOutput<()>, DeduplicationError<TestError>> =
         Err(DeduplicationError::Inner(TestError::Permanent));
     assert_eq!(Probe::settlement(err.as_ref()), Settlement::Bypassed);
 }
 
 impl FallibleEventHandler for DeduplicationHandler<MockHandler, MemoryDeduplicationStore> {}
 
-/// A dedup skip records no second marker: the store is pre-seeded with the
-/// session's dedup id, the boundary is driven end to end, and the skip
-/// (`Ok(None)`, `Duplicate`) commits the offset without re-recording — the
-/// oracle log stays empty (seeding wrote the store, never the log).
+/// A repeated message commits its offset without a second marker.
 mod contracts;

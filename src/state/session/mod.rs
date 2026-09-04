@@ -460,8 +460,8 @@ pub(crate) mod sealed {
         /// handle).
         pub(super) store: S,
         pub(super) collections: Vec<StagedCollection>,
-        /// The `recovery_delay` floor tightened once, at finalize, by the
-        /// smallest `recovery_within` among the staged collections.
+        /// The delay from [`CollectionDefRegistry::tightened_recovery_delay`]
+        /// for the staged collections.
         pub(super) recovery_delay: CompactDuration,
     }
 
@@ -629,12 +629,9 @@ pub(crate) mod sealed {
         /// produce a live attempt-N+1 (or stamped-final) view.
         fn repin(&self, proof: RepinProof) -> Self;
 
-        /// The always-on `recovery_delay` floor (a plain config read). The
-        /// per-event tightened delay lives on the receipt
-        /// ([`StagedState::recovery_delay`], folded once at finalize); the
-        /// floor is for the defensive arm after a permanent finalize failure,
-        /// where no receipt exists.
-        fn recovery_floor(&self) -> CompactDuration;
+        /// The recovery delay when no receipt names the staged collections.
+        /// Applies the bounds of all registered collections.
+        fn fallback_recovery_delay(&self) -> CompactDuration;
 
         /// The fire time of the `StateRecovery` backstop recorded as standing
         /// for this session's key, or `None` when none has been recorded this
@@ -1386,17 +1383,13 @@ where
         if collections.is_empty() {
             return Ok(Finalized::Clean);
         }
-        // Tighten the always-on floor by the smallest `recovery_within` among
-        // the staged collections — folded exactly once, here, onto the
-        // receipt. `recovery_within` on a `ReadUncommitted` collection is
-        // inert: such collections never appear in the receipt.
-        let recovery_delay = collections
-            .iter()
-            .filter_map(|staged| {
+        let recovery_delay = registry.tightened_recovery_delay(
+            self.inner.recovery_delay,
+            collections.iter().map(|staged| {
                 let id = staged.collection.id();
-                registry.recovery_within_for(id.state_type(), id.name())
-            })
-            .fold(self.inner.recovery_delay, CompactDuration::min);
+                (id.state_type(), id.name())
+            }),
+        );
         Ok(Finalized::Staged(StagedState {
             store: lower.clone(),
             collections,
@@ -1465,8 +1458,10 @@ where
         }
     }
 
-    fn recovery_floor(&self) -> CompactDuration {
-        self.inner.recovery_delay
+    fn fallback_recovery_delay(&self) -> CompactDuration {
+        self.inner
+            .registry
+            .tightened_recovery_delay(self.inner.recovery_delay, self.inner.registry.collections())
     }
 
     async fn backstop_armed(&self) -> Option<CompactDateTime> {

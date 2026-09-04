@@ -941,11 +941,9 @@ impl TriggerOperations for CassandraTriggerStore {
                 )?;
                 *guard = new_state;
             }
-            // Concurrent `clear_and_schedule` won the lock first and rewrote
-            // the UDT to a different timer (or cleared it entirely). The new
-            // Inline timer carries its own freshly-minted tag from
-            // `Trigger::new`, so our rotation is moot. Do NOT assert/warn —
-            // this race is legitimate under normal reschedule contention.
+            // This coordinate has no key row to update. `mint` reuses a standing tag.
+            // A same-coordinate `clear_and_schedule` during an attempt keeps that tag.
+            // The later Complete from FiringRescheduled rotates it.
             TimerState::Inline(_) | TimerState::Absent => {}
             TimerState::Overflow => {
                 tokio::try_join!(

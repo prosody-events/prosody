@@ -95,10 +95,7 @@ async fn run_arm(
 /// `(bounds, standing)`:
 ///
 /// - **Fire time** — a staged event schedules its `StateRecovery` sweep at now
-///   plus the minimum recovery bound. Thus, no provisional cell outlives its
-///   collection's bound and the fire never exceeds the floor (hence stays below
-///   every collection's TTL, the `TtlBelowRecoveryDelay` invariant — no
-///   dedup-margin regression).
+///   plus the smallest recovery bound, with a one-second minimum.
 /// - **Arm-if-sooner** — a standing backstop is re-armed **iff** the new fire
 ///   is strictly sooner; on re-arm `ArmedKeys` holds the scheduled fire, and
 ///   when kept the standing fire is left untouched.
@@ -130,7 +127,11 @@ fn prop_arm_backstop_arms_iff_new_fire_is_sooner() {
 
         let (before, after, context) = run_arm(bounds, &key, &armed, None).await?;
         let ops = context.timer_operations();
-        let delay = bounds.iter().filter_map(|o| *o).fold(FLOOR_SECS, u32::min);
+        let delay = bounds
+            .iter()
+            .filter_map(|o| *o)
+            .fold(FLOOR_SECS, u32::min)
+            .max(1);
         let stored = armed.read_async(&raw_key, |_, &f| f).await;
         let scheduled = scheduled_recovery_fire(&ops);
 
@@ -213,7 +214,11 @@ fn prop_reacquisition_never_loosens_standing_backstop() {
         let now_durable = context.durable_scheduled(TimerType::StateRecovery);
         let stored = armed.read_async(&raw_key, |_, &f| f).await;
         let scheduled = scheduled_recovery_fire(&ops);
-        let delay = bounds.iter().filter_map(|o| *o).fold(FLOOR_SECS, u32::min);
+        let delay = bounds
+            .iter()
+            .filter_map(|o| *o)
+            .fold(FLOOR_SECS, u32::min)
+            .max(1);
 
         if standing == Some(false) {
             if scheduled.is_some() {

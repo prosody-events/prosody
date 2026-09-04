@@ -258,6 +258,7 @@ fn guard() -> (RecordingGuard, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         committed: committed.clone(),
         aborted: aborted.clone(),
         receipts: Arc::default(),
+        kept: Arc::default(),
         redelivery: Redelivery::Sweeps,
         order: None,
     };

@@ -2,7 +2,7 @@
 //!
 //! Uses [`scc::HashSet`] for lock-free concurrent access. All data is volatile.
 
-use super::store::{DeduplicationStore, DeduplicationStoreProvider};
+use super::store::{DeduplicationStore, DeduplicationStoreProvider, Presence};
 use crate::{Partition, Topic};
 use ahash::RandomState;
 use scc::HashSet;
@@ -35,8 +35,12 @@ impl Default for MemoryDeduplicationStore {
 impl DeduplicationStore for MemoryDeduplicationStore {
     type Error = Infallible;
 
-    async fn exists(&self, id: Uuid) -> Result<bool, Self::Error> {
-        Ok(self.set.contains_async(&id).await)
+    async fn lookup(&self, id: Uuid) -> Result<Presence, Self::Error> {
+        Ok(if self.set.contains_async(&id).await {
+            Presence::Cached
+        } else {
+            Presence::Absent
+        })
     }
 
     async fn insert(&self, id: Uuid) -> Result<(), Self::Error> {

@@ -71,6 +71,7 @@ async fn incomplete_commits_arm_once_while_timer_stands() -> Result<()> {
         let context = buffered_with(
             armed.clone(),
             Some((ErrorCategory::Permanent, 1)),
+            None,
             MockEventContext::with_timer_tracking,
         )
         .await?
@@ -99,6 +100,7 @@ async fn rerun_commits_arm_once_while_timer_stands() -> Result<()> {
         let context = buffered_with(
             armed.clone(),
             Some((ErrorCategory::Permanent, 1)),
+            None,
             MockEventContext::with_timer_tracking,
         )
         .await?

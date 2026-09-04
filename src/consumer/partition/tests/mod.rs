@@ -50,7 +50,11 @@ async fn committed_application_refire_skips_handler() -> color_eyre::Result<()> 
         .next()
         .await
         .ok_or_else(|| eyre!("expected pending timer"))?;
-    timers.receipt(&trigger).await?;
+    // Seed the stored receipt. The loaded timer has not fired.
+    timers
+        .test_store()
+        .remove_key_row(&trigger.key, trigger.time, trigger.timer_type)
+        .await?;
 
     let provider = memory_state_provider(CollectionDefRegistry::default());
     let state = provider

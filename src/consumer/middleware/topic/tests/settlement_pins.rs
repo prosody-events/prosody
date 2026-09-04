@@ -9,7 +9,7 @@ use crate::consumer::middleware::tests::test_support::{
 use crate::consumer::middleware::{FallibleEventHandler, Settlement, SettlementHandler};
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::receipted_sealed;
-use crate::consumer::{EventHandler, Receipted, Redelivery, Uncommitted};
+use crate::consumer::{EventHandler, Receipted, ReceiptedSource, Redelivery, Uncommitted};
 use crate::state::manager::EventStateScope;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::{EventRef, StateKey};
@@ -171,13 +171,23 @@ impl Uncommitted for Guard {
 impl receipted_sealed::Sealed for Guard {}
 
 impl Receipted for Guard {
+    type Source = Self;
+
     fn redelivery(&self) -> impl Future<Output = Redelivery> + Send {
         ready(Redelivery::Sweeps)
     }
 
-    fn receipt(&mut self) -> impl Future<Output = ()> + Send {
-        ready(())
+    fn receipt(self) -> impl Future<Output = Self::Source> + Send {
+        ready(self)
     }
+}
+
+impl ReceiptedSource for Guard {
+    async fn retire(self) {
+        self.commit().await;
+    }
+
+    async fn keep(self) {}
 }
 
 /// A Permanent producer error (a payload serialization rejection), for

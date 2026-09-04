@@ -29,7 +29,7 @@ use tracing::{error, warn};
 
 use super::FallibleHandler;
 use crate::consumer::event_context::EventContext;
-use crate::consumer::{Receipted, Redelivery};
+use crate::consumer::{Receipted, ReceiptedSource, Redelivery};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::access::StateAccessError;
 use crate::state::descriptor::Registered;
@@ -210,11 +210,13 @@ pub(super) enum ArmOutcome {
 enum PreparedState<S: CellStore> {
     /// The event staged no provisional cells.
     Clean,
-    /// The event staged cells and captured their safety-timer delay.
-    Staged {
+    /// The committed delivery sweeps these cells.
+    Sweeps {
         promotable: Promotable<S>,
         recovery_delay: CompactDuration,
     },
+    /// The backstop is armed. Another delivery runs the handler.
+    Reruns { promotable: Promotable<S> },
 }
 
 /// Owns both durability sequences after the stack returns its final result.
@@ -302,7 +304,12 @@ pub(crate) async fn settle<T, C, G>(
                         error!("keyed-state duplicate sweep failed: {error:#}");
                         if context.is_shutdown()
                             || matches!(
-                                arm_backstop(&context, lifecycle, lifecycle.recovery_floor()).await,
+                                arm_backstop(
+                                    &context,
+                                    lifecycle,
+                                    lifecycle.fallback_recovery_delay()
+                                )
+                                .await,
                                 ArmOutcome::ShuttingDown
                             )
                         {
@@ -403,6 +410,16 @@ fn discard_uncommitted<S: StateLifecycle>(lifecycle: Option<&S>) {
 ///
 /// Rerun posture arms before commit. Its safety timer covers a crash before
 /// promotion because its refire must run the handler.
+///
+/// These cases need first touch for recovery:
+///
+/// * Shutdown prevents the backstop arm after a permanent stage failure.
+/// * A replaced firing timer crashes before promotion. It has no slab row or
+///   backstop.
+/// * A new schedule recreates a committed timer's key row before its refire
+///   pops. The fire then runs the handler instead of the sweep.
+///
+/// First touch resolves each case through the oracle with the correct value.
 async fn settle_committed<'a, T, C, G>(
     handler: &T,
     context: C,
@@ -425,75 +442,62 @@ async fn settle_committed<'a, T, C, G>(
 
     // 0. Stage provisional cells / write resolved, retrying transient
     // failures.
-    let finalized =
-        match retry_step(&context, "keyed-state finalize", || lifecycle.finalize()).await {
-            StepOutcome::Done(finalized) => finalized,
-            StepOutcome::Skip => {
-                // Permanent stage failure: a partial stage may be durable. Arm
-                // the backstop defensively so the sweep resolves it, skip the
-                // marker record (invariant: marker present ⇒ stage durable),
-                // and commit. A shutdown `ShuttingDown` from the arm is
-                // deliberately ignored: committing a permanently-unstageable
-                // event beats livelocking, and first-touch heals the unarmed
-                // cell (the sole first-touch-only recovery residual —
-                // everything else is redelivery or an armed sweep). No receipt
-                // exists to carry a finalize-folded delay, so the defensive
-                // arm uses the plain floor.
-                let _ = arm_backstop(&context, lifecycle, lifecycle.recovery_floor()).await;
-                guard.commit().await;
-                // Not a successful finalize (`finalize`'s failure paths leave
-                // the buffer whole); `discard_uncommitted` owns the
-                // permit-held / commit-now-floor contract.
-                discard_uncommitted(Some(lifecycle));
-                drop(permit);
-                fire_apply_hook(handler, context, true, result).await;
-                return;
-            }
-            StepOutcome::Abandon => {
-                // Shutdown before a receipt exists: nothing is recorded to
-                // roll back (finalize mints the receipt only on full success);
-                // redelivery re-runs from clean state, and recovery owns any
-                // partial durable stage. Discard the uncommitted overlay under
-                // the still-held permit (finalize did not drain it) before
-                // dropping — closes the drop→`abandon` reacquire gap where a
-                // leaked read could observe the residue in the open-gate
-                // window. `abandon` performs its own idempotent gate close.
-                discard_uncommitted(Some(lifecycle));
-                drop(permit);
-                abandon(handler, context, guard, result).await;
-                return;
-            }
-        };
-
-    let redelivery = guard.redelivery().await;
-
-    // 2. Capture the stage delay once. Rerun posture arms before certification.
-    let prepared = match finalized {
-        Finalized::Clean => PreparedState::Clean,
-        Finalized::Staged(staged) if redelivery == Redelivery::Sweeps => {
-            let recovery_delay = staged.recovery_delay();
-            PreparedState::Staged {
-                promotable: staged.certify(),
-                recovery_delay,
-            }
+    let finalized = match retry_step(&context, "keyed-state finalize", || lifecycle.finalize())
+        .await
+    {
+        StepOutcome::Done(finalized) => finalized,
+        StepOutcome::Skip => {
+            // A partial stage may exist. Arm recovery, omit the marker, and commit.
+            let _ = arm_backstop(&context, lifecycle, lifecycle.fallback_recovery_delay()).await;
+            guard.commit().await;
+            // Not a successful finalize (`finalize`'s failure paths leave
+            // the buffer whole); `discard_uncommitted` owns the
+            // permit-held / commit-now-floor contract.
+            discard_uncommitted(Some(lifecycle));
+            drop(permit);
+            fire_apply_hook(handler, context, true, result).await;
+            return;
         }
-        Finalized::Staged(staged) => {
+        StepOutcome::Abandon => {
+            // Shutdown before a receipt exists: nothing is recorded to
+            // roll back (finalize mints the receipt only on full success);
+            // redelivery re-runs from clean state, and recovery owns any
+            // partial durable stage. Discard the uncommitted overlay under
+            // the still-held permit (finalize did not drain it) before
+            // dropping — closes the drop→`abandon` reacquire gap where a
+            // leaked read could observe the residue in the open-gate
+            // window. `abandon` performs its own idempotent gate close.
+            discard_uncommitted(Some(lifecycle));
+            drop(permit);
+            abandon(handler, context, guard, result).await;
+            return;
+        }
+    };
+
+    // Capture the delay once. Arm before certification when delivery reruns.
+    let prepared = match (finalized, guard.redelivery().await) {
+        (Finalized::Clean, _) => PreparedState::Clean,
+        (Finalized::Staged(staged), redelivery) => {
             let recovery_delay = staged.recovery_delay();
-            match arm_backstop(&context, lifecycle, recovery_delay).await {
-                ArmOutcome::Armed => PreparedState::Staged {
+            match redelivery {
+                Redelivery::Sweeps => PreparedState::Sweeps {
                     promotable: staged.certify(),
                     recovery_delay,
                 },
-                ArmOutcome::ShuttingDown => {
-                    // The ONE reachable rollback site — before any
-                    // marker-record attempt, so restoring the committed base
-                    // is sound; past `certify` a rollback no longer compiles.
-                    guard.abort().await;
-                    staged.rollback().await;
-                    drop(permit);
-                    fire_apply_hook(handler, context, false, result).await;
-                    return;
-                }
+                Redelivery::Reruns => match arm_backstop(&context, lifecycle, recovery_delay).await
+                {
+                    ArmOutcome::Armed => PreparedState::Reruns {
+                        promotable: staged.certify(),
+                    },
+                    ArmOutcome::ShuttingDown => {
+                        // No marker write has started. The stage can still roll back.
+                        guard.abort().await;
+                        staged.rollback().await;
+                        drop(permit);
+                        fire_apply_hook(handler, context, false, result).await;
+                        return;
+                    }
+                },
             }
         }
     };
@@ -522,58 +526,51 @@ async fn settle_committed<'a, T, C, G>(
     }
 
     // 4. Apply the selected receipt and promotion order.
-    let commit = match (prepared, redelivery) {
-        (PreparedState::Clean, _) => {
+    match prepared {
+        PreparedState::Clean => {
             guard.commit().await;
-            true
         }
-        (PreparedState::Staged { promotable, .. }, Redelivery::Reruns) => {
+        PreparedState::Reruns { promotable } => {
             guard.commit().await;
             if promotable.promote().await == ApplyOutcome::Incomplete {
                 warn!("keyed-state promote incomplete; the StateRecovery sweep will retry");
             }
-            true
         }
-        (
-            PreparedState::Staged {
-                promotable,
-                recovery_delay,
-            },
-            Redelivery::Sweeps,
-        ) => settle_sweep_posture(&context, lifecycle, guard, promotable, recovery_delay).await,
-    };
+        PreparedState::Sweeps {
+            promotable,
+            recovery_delay,
+        } => settle_sweep_posture(&context, lifecycle, guard, promotable, recovery_delay).await,
+    }
 
     // 5. The permit drops before the apply hook, so hook reads can proceed.
     drop(permit);
-    fire_apply_hook(handler, context, commit, result).await;
+    fire_apply_hook(handler, context, true, result).await;
 }
 
 /// Settles staged state when committed redelivery can sweep the key.
 async fn settle_sweep_posture<C, G>(
     context: &C,
     lifecycle: &C::State,
-    mut guard: G,
+    guard: G,
     promotable: Promotable<<C::State as StateLifecycle>::Cell>,
     recovery_delay: CompactDuration,
-) -> bool
-where
+) where
     C: EventContext,
     G: Receipted + Send,
 {
-    guard.receipt().await;
+    let source = guard.receipt().await;
     if promotable.promote().await == ApplyOutcome::Incomplete {
         warn!("keyed-state promote incomplete; the StateRecovery sweep will retry");
         if matches!(
             arm_backstop(context, lifecycle, recovery_delay).await,
             ArmOutcome::ShuttingDown
         ) {
-            guard.abort().await;
-            return false;
+            source.keep().await;
+            return;
         }
     }
 
-    guard.commit().await;
-    true
+    source.retire().await;
 }
 
 /// Abandons the event: abort the marker (offset → redelivery, timer →
@@ -640,45 +637,19 @@ async fn fire_apply_hook<T, C>(
     }
 }
 
-/// Arms the per-key `StateRecovery` backstop as an arm-if-sooner singleton.
+/// Arms a `StateRecovery` timer only if it fires before the standing timer.
+/// Retries each error until the arm succeeds or shutdown starts (invariant 8).
 ///
-/// Arming is **must-succeed** (invariant 8: a backstop is the only guarantee a
-/// staged provisional cell resolves before its TTL, so we must not certify the
-/// stage without one). Every non-shutdown failure — a transient, terminal, or
-/// permanent timer-store error, or a fire-time computation error — therefore
-/// retries forever; the arm returns [`ArmOutcome::ShuttingDown`] only when
-/// shutdown interrupts it, never a swallow or an abort.
+/// [`ArmedKeys`](crate::state::manager::ArmedKeys) records the standing fire.
+/// A missing entry requires a store read because a timer can survive
+/// acquisition. The state manager's `reschedule_backstop` applies the same
+/// arm-if-sooner rule. Per-key serialization prevents a sweep during this
+/// decision. Only the fired sweep clears the entry (finding F2).
 ///
-/// The first required arm on a quiet key issues one `clear_and_schedule`
-/// (a type-scoped singleton overwrite — only the key's `StateRecovery` timers
-/// move; user timers of other types are untouched) and records the standing
-/// fire. A later request re-arms only when its fire is strictly sooner than
-/// the standing one — the tightening a per-collection `recovery_within` bound
-/// needs. Otherwise, the standing timer already protects the stage. A request
-/// that only loosens keeps the tighter timer. Equal requests issue one store
-/// write. A tighter request pulls the timer sooner.
-///
-/// The recorded fire lives in the per-acquisition in-RAM `ArmedKeys`, but a
-/// durable backstop outlives an acquisition. So a key's first arm after
-/// reacquisition seeds the map from the durable trigger store before deciding:
-/// a prior epoch's sooner still-standing fire is kept, never overwritten with
-/// a later one. Never-loosen therefore holds across reacquisition, not just
-/// within one epoch.
-///
-/// The standing fire is cleared only when the sweep fires (the manager's
-/// `recover`), so the durability boundary never unschedules and one event can
-/// never clear another's still-needed backstop (finding F2). Per-key
-/// serialization makes the decision race-free: the sweep that consumes a
-/// backstop cannot run while a commit on the same key decides whether to
-/// re-arm.
-///
-/// Normal sweep-posture commits do not arm. Rerun stages arm before commit.
-/// Incomplete promotion and failed duplicate sweeps arm before retirement.
-/// Permanent stage failures use a defensive arm without a stage receipt.
-///
-/// `delay` is the caller's fire delay: the receipt's finalize-folded
-/// `recovery_delay()` on the staged path, `recovery_floor()` on the defensive
-/// permanent-failure arm.
+/// Rerun stages arm before commit. Incomplete promotions and failed duplicate
+/// sweeps arm before retirement. Permanent stage failures also request an arm.
+/// `delay` comes from the stage, or from `fallback_recovery_delay` when no
+/// stage exists.
 pub(super) async fn arm_backstop<C>(
     context: &C,
     lifecycle: &C::State,
@@ -703,15 +674,6 @@ where
                 continue;
             }
         };
-        // Arm-if-sooner: a standing backstop that fires no later than this one
-        // already sweeps this commit's staged cells, so skip re-arming. Per-key
-        // serialization makes the standing fire reliable — the sweep that
-        // consumes it cannot run while this commit decides. `ArmedKeys` is
-        // minted empty per acquisition while a prior epoch's backstop survives
-        // in the durable trigger store, so a RAM miss consults the store and
-        // seeds the map: assuming "unarmed" there would let the singleton
-        // overwrite replace a sooner still-standing fire with a later one — a
-        // loosening the boundary must never perform.
         let standing = match lifecycle.backstop_armed().await {
             Some(standing) => Some(standing),
             None => match retry_step(context, "read standing StateRecovery backstop", || {

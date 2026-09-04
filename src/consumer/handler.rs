@@ -85,24 +85,32 @@ pub enum Redelivery {
     Reruns,
 }
 
-/// Splits an event commit into a receipt and redelivery-source retirement.
+/// Records an event receipt and returns its committed source.
 ///
-/// The receipt makes the commit oracle report that the event committed.
-/// The boundary records a message deduplication row before it calls
-/// `receipt()`. The message guard does nothing in `receipt()`. A timer guard
-/// deletes its key-index row.
-///
-/// [`Redelivery::Sweeps`] lets the boundary promote state before retirement.
-/// A committed redelivery then sweeps the key and retires its source.
-/// [`Redelivery::Reruns`] arms a safety timer before the combined commit.
-/// This posture lets defer refires reload work and rescheduled timers run
-/// again.
+/// The boundary records the message marker before receipt. A timer receipt
+/// deletes its key row. The oracle then reports the event as committed.
+/// [`ReceiptedSource::retire`] removes the source after promotion.
+/// [`ReceiptedSource::keep`] preserves the source for another recovery sweep.
+/// Neither action can abort the committed event.
 pub trait Receipted: Uncommitted + sealed::Sealed {
+    /// The source after the event commits.
+    type Source: ReceiptedSource;
+
     /// Returns the redelivery posture for this event.
     fn redelivery(&self) -> impl Future<Output = Redelivery> + Send;
 
-    /// Records the receipt. Retries every failure until the write succeeds.
-    fn receipt(&mut self) -> impl Future<Output = ()> + Send;
+    /// Records the receipt. The event commits at this step. Retries each failed
+    /// write.
+    fn receipt(self) -> impl Future<Output = Self::Source> + Send;
+}
+
+/// The source of a committed event. It cannot abort the event.
+pub trait ReceiptedSource: sealed::Sealed + Send {
+    /// Retires the source after state promotion.
+    fn retire(self) -> impl Future<Output = ()> + Send;
+
+    /// Keeps the source so its next delivery sweeps the key.
+    fn keep(self) -> impl Future<Output = ()> + Send;
 }
 
 pub(crate) mod sealed {

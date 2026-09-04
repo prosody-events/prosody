@@ -32,13 +32,13 @@ const TIME_POOL: [u32; 5] = [1000, 1100, 1200, 1300, 1400];
 /// [`TIME_POOL`].
 const NOW: u32 = 1200;
 
-/// The four lifecycle states `set_state` can store. `TimerState` has no
-/// `Arbitrary` of its own, so ops index this pool directly.
-const STATES: [TimerState; 4] = [
+/// The lifecycle states that `set_state` can store.
+const STATES: [TimerState; 5] = [
     TimerState::Scheduled,
     TimerState::Firing,
+    TimerState::FiringReplaced,
     TimerState::FiringRescheduled,
-    TimerState::Aborted,
+    TimerState::Parked,
 ];
 
 /// Identifies one registry entry across the real registry and the model.
@@ -161,7 +161,7 @@ async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
         count = count.saturating_add(1);
         if matches!(
             entry.state,
-            TimerState::Firing | TimerState::FiringRescheduled
+            TimerState::Firing | TimerState::FiringReplaced | TimerState::FiringRescheduled
         ) {
             in_flight = in_flight.saturating_add(1);
         }

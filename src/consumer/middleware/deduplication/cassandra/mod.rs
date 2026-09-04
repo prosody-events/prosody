@@ -1,7 +1,7 @@
 //! Cassandra-backed deduplication store.
 
 use super::queries::DeduplicationQueries;
-use super::store::{DeduplicationStore, DeduplicationStoreProvider};
+use super::store::{DeduplicationStore, DeduplicationStoreProvider, Presence};
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::{Partition, Topic};
@@ -10,12 +10,8 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Cassandra-backed deduplication store.
-///
-/// All instances share the same Cassandra session, prepared queries, and
-/// write-through cache. Reads check the cache first; on a miss, the store is
-/// queried and the result is promoted. Writes go to the store and then into the
-/// cache.
+/// Read durable markers through a shared cache.
+/// Each read or write adds the marker to the cache.
 #[derive(Clone, Debug)]
 pub struct CassandraDeduplicationStore {
     store: CassandraStore,
@@ -27,9 +23,9 @@ pub struct CassandraDeduplicationStore {
 impl DeduplicationStore for CassandraDeduplicationStore {
     type Error = CassandraStoreError;
 
-    async fn exists(&self, id: Uuid) -> Result<bool, Self::Error> {
+    async fn lookup(&self, id: Uuid) -> Result<Presence, Self::Error> {
         if self.cache.get(&id).is_some() {
-            return Ok(true);
+            return Ok(Presence::Cached);
         }
         let result = self
             .store
@@ -45,7 +41,11 @@ impl DeduplicationStore for CassandraDeduplicationStore {
         if has_rows {
             self.cache.insert(id, ());
         }
-        Ok(has_rows)
+        Ok(if has_rows {
+            Presence::Durable
+        } else {
+            Presence::Absent
+        })
     }
 
     async fn insert(&self, id: Uuid) -> Result<(), Self::Error> {
@@ -58,12 +58,7 @@ impl DeduplicationStore for CassandraDeduplicationStore {
     }
 }
 
-/// Factory for Cassandra deduplication stores.
-///
-/// Holds shared resources; all stores created by this provider share the same
-/// session, queries, TTL, and write-through cache, so a UUID cached by one
-/// per-partition store short-circuits the Cassandra round-trip for every other
-/// partition served by the same process.
+/// Share the session, queries, TTL, and cache across partitions.
 #[derive(Clone, Debug)]
 pub struct CassandraDeduplicationStoreProvider {
     store: CassandraStore,

@@ -1,19 +1,19 @@
 use super::*;
 
 #[tokio::test]
-async fn exists_returns_false_for_new_id() -> color_eyre::Result<()> {
+async fn lookup_returns_absent_for_new_id() -> color_eyre::Result<()> {
     let store = MemoryDeduplicationStore::new();
     let id = Uuid::new_v4();
-    assert!(!store.exists(id).await?);
+    assert_eq!(store.lookup(id).await?, Presence::Absent);
     Ok(())
 }
 
 #[tokio::test]
-async fn insert_then_exists_returns_true() -> color_eyre::Result<()> {
+async fn insert_then_lookup_returns_cached() -> color_eyre::Result<()> {
     let store = MemoryDeduplicationStore::new();
     let id = Uuid::new_v4();
     store.insert(id).await?;
-    assert!(store.exists(id).await?);
+    assert_eq!(store.lookup(id).await?, Presence::Cached);
     Ok(())
 }
 
@@ -32,7 +32,7 @@ async fn concurrent_access() -> color_eyre::Result<()> {
     h1.await??;
     h2.await??;
 
-    assert!(store.exists(id1).await?);
-    assert!(store.exists(id2).await?);
+    assert_eq!(store.lookup(id1).await?, Presence::Cached);
+    assert_eq!(store.lookup(id2).await?, Presence::Cached);
     Ok(())
 }

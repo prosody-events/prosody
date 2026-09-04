@@ -35,7 +35,7 @@ use crate::consumer::middleware::tests::test_support::{
 };
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::receipted_sealed;
-use crate::consumer::{EventHandler, Receipted, Redelivery, Uncommitted};
+use crate::consumer::{EventHandler, Receipted, ReceiptedSource, Redelivery, Uncommitted};
 use crate::error::ErrorCategory;
 use crate::state::CollectionId;
 use crate::state::memory::MemoryCellStore;
@@ -172,6 +172,7 @@ struct RecordingGuard {
     committed: Arc<AtomicUsize>,
     aborted: Arc<AtomicUsize>,
     receipts: Arc<AtomicUsize>,
+    kept: Arc<AtomicUsize>,
     redelivery: Redelivery,
     order: Option<GuardOrder>,
 }
@@ -194,6 +195,7 @@ impl RecordingGuard {
                 committed: committed.clone(),
                 aborted: aborted.clone(),
                 receipts: Arc::default(),
+                kept: Arc::default(),
                 redelivery: Redelivery::Sweeps,
                 order: None,
             },
@@ -239,11 +241,13 @@ impl Uncommitted for RecordingGuard {
 impl receipted_sealed::Sealed for RecordingGuard {}
 
 impl Receipted for RecordingGuard {
+    type Source = Self;
+
     fn redelivery(&self) -> impl Future<Output = Redelivery> + Send {
         ready(self.redelivery)
     }
 
-    async fn receipt(&mut self) {
+    async fn receipt(self) -> Self::Source {
         self.receipts.fetch_add(1, Ordering::SeqCst);
         if let Some((store, id, receipt_saw_provisional, _)) = &self.order {
             let provisional = is_provisional(store, id)
@@ -251,6 +255,17 @@ impl Receipted for RecordingGuard {
                 .is_ok_and(|provisional| provisional);
             receipt_saw_provisional.store(provisional, Ordering::SeqCst);
         }
+        self
+    }
+}
+
+impl ReceiptedSource for RecordingGuard {
+    async fn retire(self) {
+        self.commit().await;
+    }
+
+    async fn keep(self) {
+        self.kept.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -363,6 +378,7 @@ async fn after_commit_for_timer_path_with_ok_output() {
                 committed: self.committed.clone(),
                 aborted: self.aborted.clone(),
                 receipts: Arc::default(),
+                kept: Arc::default(),
                 redelivery: Redelivery::Sweeps,
                 order: None,
             };

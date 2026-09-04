@@ -11,6 +11,8 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::Finalized;
 use crate::state::session::sealed::StateLifecycle;
 use crate::state::{EventRef, StateKey, StateName};
+use crate::timers::datetime::CompactDateTime;
+use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, bail, eyre};
 use quickcheck::{QuickCheck, TestResult};
 use serde_json::json;
@@ -302,25 +304,18 @@ async fn permanent_skip_hook_reads_through_the_stamp() -> Result<()> {
     Ok(())
 }
 
-/// Every settle posture commits unless shutdown interrupts it, and a failed
-/// promote never blocks the commit.
-///
-/// The property varies the posture (Duplicate, Final sweeps, Final reruns),
-/// an optional promote failure (category and budget), and the shutdown flag.
-/// A Final posture aborts if and only if shutdown is active. That check runs
-/// before the stage, so the abort leaves no provisional cell. A Duplicate
-/// sweeps a pre-staged cell. A clean sweep commits even under shutdown. A
-/// Permanent sweep failure logs and commits. A Transient sweep failure aborts
-/// under shutdown; otherwise it arms one backstop and commits.
-///
-/// A failed promote leaves the cell provisional in every posture. The sweep
-/// posture arms one backstop for it; the rerun posture armed before the
-/// marker. The sweep posture records its receipt while the cell is
-/// provisional and commits after the promote. Each case runs on a paused
-/// runtime.
+/// Shutdown can abort before receipt. After receipt it keeps the committed
+/// source. Each failed timer write must retry. Each collection bound limits
+/// recovery delay.
 #[test]
 fn prop_settle_aborts_iff_shutdown() {
-    fn property(posture: u8, failure: u8, shutdown: bool) -> TestResult {
+    fn property(
+        posture: u8,
+        failure: u8,
+        shutdown: bool,
+        late_shutdown: bool,
+        timer_failure: (u8, u8),
+    ) -> TestResult {
         let runtime = Builder::new_current_thread()
             .enable_time()
             .start_paused(true)
@@ -329,96 +324,132 @@ fn prop_settle_aborts_iff_shutdown() {
             return TestResult::error("failed to build paused runtime");
         };
         runtime.block_on(async move {
-            let sweep_failure = match failure % 3 {
-                0 => None,
-                1 => Some((ErrorCategory::Permanent, 8)),
-                _ => Some((ErrorCategory::Transient, 1)),
-            };
-            let armed: ArmedKeys = Arc::default();
-            let configure = MockEventContext::with_timer_tracking;
-            let Ok((mut context, cell_store, cart_id)) =
-                buffered_with(armed, sweep_failure, configure).await
-            else {
-                return TestResult::error("failed to buffer the write");
-            };
-            let posture = posture % 3;
-            if posture == 0 {
-                let Ok(lifecycle) = context.test_lifecycle() else {
-                    return TestResult::error("failed to get the lifecycle");
-                };
-                if !matches!(lifecycle.finalize().await, Ok(Finalized::Staged(_))) {
-                    return TestResult::error("duplicate setup did not stage the cell");
-                }
+            match settle_case(posture, failure, shutdown, late_shutdown, timer_failure).await {
+                Ok(result) => result,
+                Err(error) => TestResult::error(error.to_string()),
             }
-            if shutdown {
-                context = context.with_shutdown();
-            }
-            let (guard, committed, aborted) = if posture == 2 {
-                RecordingGuard::new_reruns()
-            } else {
-                RecordingGuard::new()
-            };
-            let receipts = guard.receipts.clone();
-            let receipt_saw_provisional = Arc::new(AtomicBool::new(false));
-            let commit_saw_resolved = Arc::new(AtomicBool::new(false));
-            let guard = if posture == 1 && !shutdown {
-                guard.with_order(
-                    cell_store.clone(),
-                    cart_id.clone(),
-                    receipt_saw_provisional.clone(),
-                    commit_saw_resolved.clone(),
-                )
-            } else {
-                guard
-            };
-            if posture == 0 {
-                settle(&DuplicateHandler, context.clone(), guard, Ok(())).await;
-            } else {
-                settle(&ProbeHandler::ok(0), context.clone(), guard, Ok(0)).await;
-            }
-
-            let committed = committed.load(Ordering::SeqCst);
-            let aborted = aborted.load(Ordering::SeqCst);
-            let receipts = receipts.load(Ordering::SeqCst);
-            let Ok(still_provisional) = is_provisional(&cell_store, &cart_id).await else {
-                return TestResult::error("failed to inspect the provisional cell");
-            };
-            let scheduled = context.count_scheduled(TimerType::StateRecovery);
-            let transient = matches!(sweep_failure, Some((ErrorCategory::Transient, _)));
-            let failing = sweep_failure.is_some();
-
-            let expected_abort = if posture == 0 {
-                shutdown && transient
-            } else {
-                shutdown
-            };
-            let expected_receipts = usize::from(posture == 1 && !shutdown);
-            // The Duplicate setup stages the cell before `settle`. A Duplicate
-            // abort leaves that cell for the next sweep. A Final abort occurs
-            // before the stage, so nothing is provisional.
-            let expected_provisional = failing && (posture == 0 || !expected_abort);
-            let expected_armed = usize::from(
-                !expected_abort
-                    && (posture == 2 || (posture == 1 && failing) || (posture == 0 && transient)),
-            );
-            if aborted != usize::from(expected_abort)
-                || committed != usize::from(!expected_abort)
-                || receipts != expected_receipts
-                || still_provisional != expected_provisional
-                || scheduled != expected_armed
-                || (posture == 1
-                    && !shutdown
-                    && (!receipt_saw_provisional.load(Ordering::SeqCst)
-                        || commit_saw_resolved.load(Ordering::SeqCst) == failing))
-            {
-                return TestResult::error(format!(
-                    "posture={posture} failure={sweep_failure:?} shutdown={shutdown} \
-                     committed={committed} aborted={aborted} receipts={receipts} \
-                     provisional={still_provisional} armed={scheduled}"
-                ));
-            }
-            TestResult::passed()
         })
     }
-    QuickCheck::new().quickcheck(property as fn(u8, u8, bool) -> TestResult);
+    QuickCheck::new().quickcheck(property as fn(u8, u8, bool, bool, (u8, u8)) -> TestResult);
+}
+
+async fn settle_case(
+    posture: u8,
+    failure: u8,
+    shutdown: bool,
+    late_shutdown: bool,
+    timer_failure: (u8, u8),
+) -> Result<TestResult> {
+    let sweep_failure = match failure % 3 {
+        0 => None,
+        1 => Some((ErrorCategory::Permanent, 8)),
+        _ => Some((ErrorCategory::Transient, 1)),
+    };
+    let armed: ArmedKeys = Arc::default();
+    let count = usize::from(timer_failure.0 % 5);
+    let (mut context, cell_store, cart_id) = buffered_with(
+        armed.clone(),
+        sweep_failure,
+        Some(CompactDuration::new(1)),
+        |context| fail_timer_writes(context, timer_failure),
+    )
+    .await?;
+    let posture = posture % 3;
+    let late_shutdown = late_shutdown
+        && !shutdown
+        && posture == 1
+        && matches!(sweep_failure, Some((ErrorCategory::Transient, _)));
+    if late_shutdown {
+        context = context.with_shutdown_on_timer_read();
+    }
+    if posture == 0 {
+        let lifecycle = context.test_lifecycle()?;
+        assert!(matches!(lifecycle.finalize().await?, Finalized::Staged(_)));
+    }
+    if shutdown {
+        context = context.with_shutdown();
+    }
+    let (guard, committed, aborted) = if posture == 2 {
+        RecordingGuard::new_reruns()
+    } else {
+        RecordingGuard::new()
+    };
+    let receipts = guard.receipts.clone();
+    let kept = guard.kept.clone();
+    let receipt_saw_provisional = Arc::new(AtomicBool::new(false));
+    let commit_saw_resolved = Arc::new(AtomicBool::new(false));
+    let guard = guard.with_order(
+        cell_store.clone(),
+        cart_id.clone(),
+        receipt_saw_provisional.clone(),
+        commit_saw_resolved.clone(),
+    );
+    let handler = ProbeHandler::ok(0);
+    let before = CompactDateTime::now()?;
+    if posture == 0 {
+        settle(&DuplicateHandler, context.clone(), guard, Ok(())).await;
+    } else {
+        settle(&handler, context.clone(), guard, Ok(0)).await;
+    }
+
+    let after = CompactDateTime::now()?;
+    let kept = kept.load(Ordering::SeqCst);
+    let committed = committed.load(Ordering::SeqCst);
+    let aborted = aborted.load(Ordering::SeqCst);
+    let receipts = receipts.load(Ordering::SeqCst);
+    let still_provisional = is_provisional(&cell_store, &cart_id).await?;
+    let scheduled = context.count_scheduled(TimerType::StateRecovery);
+    let transient = matches!(sweep_failure, Some((ErrorCategory::Transient, _)));
+    let failing = sweep_failure.is_some();
+
+    let expected_abort = shutdown && (posture != 0 || transient);
+    let expected_receipts = usize::from(posture == 1 && !shutdown);
+    // The Duplicate setup stages the cell before `settle`. A Duplicate
+    // abort leaves that cell for the next sweep. A Final abort occurs
+    // before the stage, so nothing is provisional.
+    let expected_provisional = failing && (posture == 0 || !expected_abort);
+    let expected_armed = usize::from(
+        !expected_abort
+            && !late_shutdown
+            && (posture == 2 || (posture == 1 && failing) || (posture == 0 && transient)),
+    );
+    if aborted != usize::from(expected_abort)
+        || committed != usize::from(!expected_abort && !late_shutdown)
+        || kept != usize::from(late_shutdown)
+        || receipts != expected_receipts
+        || still_provisional != expected_provisional
+        || scheduled != expected_armed * (count + 1)
+        || armed.len() != expected_armed
+        || !context
+            .durable_scheduled(TimerType::StateRecovery)
+            .iter()
+            .all(|fire| {
+                (before.epoch_seconds() + 1..=after.epoch_seconds() + 1)
+                    .contains(&fire.epoch_seconds())
+            })
+        || (late_shutdown && handler.log.lock().as_slice() != [HookEvent::AfterCommit(Ok(0))])
+        || (posture == 1
+            && !shutdown
+            && (!receipt_saw_provisional.load(Ordering::SeqCst)
+                || commit_saw_resolved.load(Ordering::SeqCst) == failing))
+    {
+        return Ok(TestResult::error(format!(
+            "posture={posture} failure={sweep_failure:?} shutdown={shutdown} late={late_shutdown} \
+             timer={timer_failure:?} committed={committed} aborted={aborted} receipts={receipts} \
+             kept={kept} provisional={still_provisional} armed={scheduled} durable={:?}",
+            context.durable_scheduled(TimerType::StateRecovery)
+        )));
+    }
+    Ok(TestResult::passed())
+}
+
+fn fail_timer_writes(context: Ctx, failure: (u8, u8)) -> Ctx {
+    let category = match failure.1 % 3 {
+        0 => ErrorCategory::Transient,
+        1 => ErrorCategory::Permanent,
+        _ => ErrorCategory::Terminal,
+    };
+    context
+        .with_timer_tracking()
+        .with_timer_failures(usize::from(failure.0 % 5), category)
 }

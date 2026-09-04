@@ -431,112 +431,17 @@ fn fire_in_tightened_window(
         .contains(&fire.epoch_seconds())
 }
 
-/// `recover` **never aborts the fired trigger except on shutdown** (retry
-/// forever; abort only on shutdown), over a generated sweep-failure category
-/// and a shutdown flag. Invariants proven for a staged cell whose promote
-/// fails:
-///
-/// * A per-cell **Permanent** failure → `Commit` with **no** reschedule
-///   (rescheduling a cell that never resolves would spin a refire loop;
-///   first-touch and the key's next commit recover it).
-/// * A **Transient** or **Terminal** sweep failure without shutdown → `Commit`
-///   after rescheduling a fresh backstop, recorded in `armed`. The reschedule
-///   fires at the `recovery_delay` floor tightened by the registered
-///   collections' `recovery_within` (floored at the retry cadence) — the same
-///   tightening the commit path applies, so a failed sweep does not stretch a
-///   tightly bounded collection's convergence out to the full floor.
-/// * A transient/terminal failure **with** shutdown → `Abort`, leaving the
-///   standing backstop for reacquisition (the reschedule was interrupted).
-///
-/// Across every case a **single** `StateRecovery` trigger ever exists (the
-/// reschedule is a singleton overwrite — why the boundary needs no
-/// `unschedule_all`) and `recover` clears the pre-existing `armed` entry at its
-/// top (re-set only by a successful reschedule). Each iteration builds a fresh
-/// current-thread runtime (TESTING.md: per-iteration runtimes); no path sleeps
-/// (a healthy reschedule lands first try; shutdown returns before the backoff).
+/// A failed sweep keeps an earlier timer or arms a timer with the tightened
+/// delay. Shutdown alone can abort a sweep. Both recovery entry points follow
+/// this rule.
 #[test]
 fn prop_recover_commits_unless_shutdown_interrupts_reschedule() {
-    async fn run(
-        category: ErrorCategory,
-        shutdown: bool,
-        within: Option<u32>,
-        redelivered: bool,
-    ) -> Result<TestResult> {
-        let cart = StateName::try_new("cart")?;
-        let registry = registry_with_cart_within(within.map(CompactDuration::new))?;
-        let inner = cell_store(FixedOracle::committed(), &registry);
-        let cell = FailingCellStore::new_with_category(inner, cart.clone(), category);
-        let manager = poison_provider(cell, registry)
-            .acquire(Topic::from("t"), 0, test_triggers())
-            .await
-            .map_err(|e| eyre!("acquire failed: {e}"))?;
-        let (_stream, timers, _shutdown_tx) = timer_manager().await?;
-        let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
-        if shutdown {
-            shutdown_tx.send_replace(ShutdownPhase::Cancelling);
-        }
-        let key: Key = Arc::from("k");
-
-        // Stage a committed cell whose sweep-time promote hits the poison.
-        let session = manager
-            .session(key.clone(), timer_event(&key), termination())
-            .handle();
-        seed_value(&session, &cart, 7).await;
-        if !matches!(session.finalize().await?, Finalized::Staged(_)) {
-            return Ok(TestResult::error("expected the cell to stage"));
-        }
-
-        // A standing backstop + a pre-existing armed entry: a reschedule
-        // overwrites the timer (singleton) and re-arms; every other outcome
-        // leaves the timer intact and clears the armed entry.
-        let standing = CompactDateTime::now()?.add_duration(CompactDuration::new(600))?;
-        timers
-            .schedule(TimerRequest::new(
-                key.clone(),
-                standing,
-                TimerType::StateRecovery,
-                Span::current(),
-            ))
-            .await?;
-        let _ = manager
-            .inner
-            .armed
-            .insert_async(key.clone(), standing)
-            .await;
-
-        let before = CompactDateTime::now()?;
-        let resolution = if redelivered {
-            manager
-                .resolve_redelivered(key.clone(), &timers, &shutdown_rx)
-                .await
-        } else {
-            manager.recover(key.clone(), &timers, &shutdown_rx).await
-        };
-        let after = CompactDateTime::now()?;
-        let scheduled = timers
-            .scheduled_times(&key, TimerType::StateRecovery)
-            .await?;
-        let armed = manager.inner.armed.contains_async(&key).await;
-
-        Ok(check_recovery(RecoveryObservation {
-            category,
-            shutdown,
-            within,
-            redelivered,
-            resolution,
-            scheduled,
-            armed,
-            standing,
-            before,
-            after,
-        }))
-    }
-
     fn property(
         category_sel: u8,
         shutdown: bool,
         within_sel: Option<u16>,
         redelivered: bool,
+        standing_sel: u8,
     ) -> TestResult {
         let category = match category_sel % 3 {
             0 => ErrorCategory::Permanent,
@@ -550,14 +455,101 @@ fn prop_recover_commits_unless_shutdown_interrupts_reschedule() {
             return TestResult::error("failed to build runtime");
         };
         runtime.block_on(async move {
-            match run(category, shutdown, within, redelivered).await {
+            match run_recovery_case(
+                category,
+                shutdown,
+                within,
+                redelivered,
+                if standing_sel % 61 == 60 {
+                    600
+                } else {
+                    u32::from(standing_sel % 61)
+                },
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(e) => TestResult::error(format!("setup failed: {e}")),
             }
         })
     }
 
-    QuickCheck::new().quickcheck(property as fn(u8, bool, Option<u16>, bool) -> TestResult);
+    QuickCheck::new().quickcheck(property as fn(u8, bool, Option<u16>, bool, u8) -> TestResult);
+}
+
+async fn run_recovery_case(
+    category: ErrorCategory,
+    shutdown: bool,
+    within: Option<u32>,
+    redelivered: bool,
+    standing_offset: u32,
+) -> Result<TestResult> {
+    let cart = StateName::try_new("cart")?;
+    let registry = registry_with_cart_within(within.map(CompactDuration::new))?;
+    let inner = cell_store(FixedOracle::committed(), &registry);
+    let cell = FailingCellStore::new_with_category(inner, cart.clone(), category);
+    let manager = poison_provider(cell, registry)
+        .acquire(Topic::from("t"), 0, test_triggers())
+        .await
+        .map_err(|e| eyre!("acquire failed: {e}"))?;
+    let (_stream, timers, _shutdown_tx) = timer_manager().await?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    if shutdown {
+        shutdown_tx.send_replace(ShutdownPhase::Cancelling);
+    }
+    let key: Key = Arc::from("k");
+
+    // Stage a committed cell whose sweep-time promote hits the poison.
+    let session = manager
+        .session(key.clone(), timer_event(&key), termination())
+        .handle();
+    seed_value(&session, &cart, 7).await;
+    if !matches!(session.finalize().await?, Finalized::Staged(_)) {
+        return Ok(TestResult::error("expected the cell to stage"));
+    }
+
+    // Seed a standing timer on either side of the recovery delay.
+    let standing = CompactDateTime::now()?.add_duration(CompactDuration::new(standing_offset))?;
+    timers
+        .schedule(TimerRequest::new(
+            key.clone(),
+            standing,
+            TimerType::StateRecovery,
+            Span::current(),
+        ))
+        .await?;
+    let _ = manager
+        .inner
+        .armed
+        .insert_async(key.clone(), standing)
+        .await;
+
+    let before = CompactDateTime::now()?;
+    let resolution = if redelivered {
+        manager
+            .resolve_redelivered(key.clone(), &timers, &shutdown_rx)
+            .await
+    } else {
+        manager.recover(key.clone(), &timers, &shutdown_rx).await
+    };
+    let after = CompactDateTime::now()?;
+    let scheduled = timers
+        .scheduled_times(&key, TimerType::StateRecovery)
+        .await?;
+    let armed = manager.inner.armed.contains_async(&key).await;
+
+    Ok(check_recovery(RecoveryObservation {
+        category,
+        shutdown,
+        within,
+        redelivered,
+        resolution,
+        scheduled,
+        armed,
+        standing,
+        before,
+        after,
+    }))
 }
 
 struct RecoveryObservation {
@@ -592,19 +584,19 @@ fn check_recovery(observed: RecoveryObservation) -> TestResult {
             scheduled.len()
         ));
     }
-    let rescheduled = scheduled[0] < standing;
+    let rescheduled = scheduled[0] != standing;
+    let delay = within.map_or(30, |within| within.min(30)).max(1);
+    let earlier = if rescheduled {
+        scheduled[0] < standing && fire_in_tightened_window(scheduled[0], before, after, within)
+    } else {
+        standing.epoch_seconds() <= after.epoch_seconds() + delay
+    };
     let retry = matches!(category, ErrorCategory::Transient | ErrorCategory::Terminal);
     let ok = match (redelivered, retry, shutdown) {
         (true, true, true) => resolution == SweepResolution::Abort && !rescheduled && armed,
-        (true, true, false) => resolution == SweepResolution::Commit && rescheduled && armed,
+        (_, true, false) => resolution == SweepResolution::Commit && earlier && armed,
         (true, false, _) => resolution == SweepResolution::Commit && !rescheduled && armed,
         (false, true, true) => resolution == SweepResolution::Abort && !rescheduled && !armed,
-        (false, true, false) => {
-            fire_in_tightened_window(scheduled[0], before, after, within)
-                && resolution == SweepResolution::Commit
-                && rescheduled
-                && armed
-        }
         (false, false, _) => resolution == SweepResolution::Commit && !rescheduled && !armed,
     };
     if ok {
@@ -612,7 +604,8 @@ fn check_recovery(observed: RecoveryObservation) -> TestResult {
     } else {
         TestResult::error(format!(
             "category={category:?} shutdown={shutdown}: resolution={resolution:?} \
-             rescheduled={rescheduled} armed={armed}"
+             rescheduled={rescheduled} armed={armed} standing={standing:?} \
+             scheduled={scheduled:?} within={within:?}"
         ))
     }
 }

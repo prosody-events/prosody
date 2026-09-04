@@ -1,16 +1,9 @@
-//! Property-based tests for deduplication store operations.
-//!
-//! Tests the [`DeduplicationStore`] trait against
-//! [`MemoryDeduplicationStore`] as the reference implementation. Any store
-//! under test (notably [`CassandraDeduplicationStore`] with its in-process
-//! write-through cache) must produce identical `exists` answers to a fresh
-//! `MemoryDeduplicationStore` driven by the same operation sequence.
-//!
-//! [`CassandraDeduplicationStore`]: super::super::cassandra::CassandraDeduplicationStore
+//! Store parity holds for marker presence. The source can differ between
+//! stores.
 
 use crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStore;
-use crate::consumer::middleware::deduplication::store::DeduplicationStore;
-use color_eyre::eyre::eyre;
+use crate::consumer::middleware::deduplication::store::{DeduplicationStore, Presence};
+use color_eyre::eyre::{ensure, eyre};
 use quickcheck::{Arbitrary, Gen};
 use std::error::Error;
 use uuid::Uuid;
@@ -18,8 +11,8 @@ use uuid::Uuid;
 /// Operations that can be performed on the deduplication store.
 #[derive(Clone, Debug)]
 pub enum DeduplicationOperation {
-    /// Check if an ID exists.
-    Exists(usize),
+    /// Check if an ID lookup.
+    Lookup(usize),
     /// Insert an ID.
     Insert(usize),
 }
@@ -48,7 +41,7 @@ impl Arbitrary for DeduplicationTestInput {
             let op = if bool::arbitrary(g) {
                 DeduplicationOperation::Insert(id_index)
             } else {
-                DeduplicationOperation::Exists(id_index)
+                DeduplicationOperation::Lookup(id_index)
             };
             operations.push(op);
         }
@@ -57,22 +50,11 @@ impl Arbitrary for DeduplicationTestInput {
     }
 }
 
-/// Verifies that the store under test matches a fresh
-/// [`MemoryDeduplicationStore`] reference driven by the same operations.
-///
-/// # Test Strategy
-///
-/// 1. Start with an empty subject store and a fresh `MemoryDeduplicationStore`
-///    reference.
-/// 2. Apply the operation sequence to both.
-/// 3. After every `Exists` query, assert the subject's answer equals the
-///    reference's answer.
-/// 4. After all operations, re-check every ID in the pool against both stores.
+/// Compare marker presence after each read and at the end of the trace.
 ///
 /// # Errors
 ///
-/// Returns an error if store operations fail or any answer diverges from the
-/// reference.
+/// Return an error if a store operation fails or the results differ.
 pub async fn prop_dedup_store_model_equivalence<S>(
     store: &S,
     input: DeduplicationTestInput,
@@ -85,21 +67,22 @@ where
 
     for (op_idx, op) in input.operations.iter().enumerate() {
         match op {
-            DeduplicationOperation::Exists(id_index) => {
+            DeduplicationOperation::Lookup(id_index) => {
                 let id = input.ids[*id_index];
                 let expected = reference
-                    .exists(id)
+                    .lookup(id)
                     .await
-                    .map_err(|e| eyre!("Op #{op_idx} reference Exists failed: {e:?}"))?;
+                    .map_err(|e| eyre!("Op #{op_idx} reference Lookup failed: {e:?}"))?;
                 let actual = store
-                    .exists(id)
+                    .lookup(id)
                     .await
-                    .map_err(|e| eyre!("Op #{op_idx} Exists failed: {e:?}"))?;
+                    .map_err(|e| eyre!("Op #{op_idx} Lookup failed: {e:?}"))?;
 
-                if expected != actual {
+                ensure!(expected != Presence::Durable, "memory has no durable store");
+                if expected.is_present() != actual.is_present() {
                     return Err(eyre!(
-                        "Op #{op_idx} Exists mismatch for id={id}: reference={expected}, \
-                         store={actual}"
+                        "Op #{op_idx} Lookup mismatch for id={id}: reference={expected:?}, \
+                         store={actual:?}"
                     ));
                 }
             }
@@ -119,17 +102,18 @@ where
 
     for (i, &id) in input.ids.iter().enumerate() {
         let expected = reference
-            .exists(id)
+            .lookup(id)
             .await
-            .map_err(|e| eyre!("Final reference Exists for id[{i}]={id}: {e:?}"))?;
+            .map_err(|e| eyre!("Final reference Lookup for id[{i}]={id}: {e:?}"))?;
         let actual = store
-            .exists(id)
+            .lookup(id)
             .await
-            .map_err(|e| eyre!("Final Exists check failed for id[{i}]={id}: {e:?}"))?;
+            .map_err(|e| eyre!("Final Lookup check failed for id[{i}]={id}: {e:?}"))?;
 
-        if expected != actual {
+        ensure!(expected != Presence::Durable, "memory has no durable store");
+        if expected.is_present() != actual.is_present() {
             return Err(eyre!(
-                "Final state mismatch for id[{i}]={id}: reference={expected}, store={actual}"
+                "Final state mismatch for id[{i}]={id}: reference={expected:?}, store={actual:?}"
             ));
         }
     }

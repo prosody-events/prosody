@@ -16,7 +16,7 @@ use crate::state::memory::MemoryPublicationStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::oracle::CommitOracle;
 use crate::state::publication::{PublicationRows, PublicationStore, StatePublication};
-use crate::state::registry::CollectionDef;
+use crate::state::registry::{CollectionDef, RECOVERY_DELAY_FLOOR};
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{Finalized, MessageMarker, OpPermit, SessionGate};
 use crate::state::store::{
@@ -369,8 +369,8 @@ where
         self.clone()
     }
 
-    fn recovery_floor(&self) -> CompactDuration {
-        CompactDuration::MIN
+    fn fallback_recovery_delay(&self) -> CompactDuration {
+        RECOVERY_DELAY_FLOOR
     }
 
     fn backstop_armed(&self) -> impl Future<Output = Option<CompactDateTime>> + Send {

@@ -309,11 +309,8 @@ async fn staged_fire_delay(
     }
 }
 
-/// The receipt's `recovery_delay` is `min(recovery_delay floor, min over
-/// staged collections' recovery_within)`: a `None` bound or one above the
-/// floor is inert, a tighter one pulls the delay down, and a clean event
-/// stages nothing so it mints no receipt at all — the recovery delay of a
-/// never-staged event is unrepresentable.
+/// The receipt uses the smallest collection bound, with a one-second minimum.
+/// A clean event has no stage receipt.
 #[test]
 fn prop_finalize_folds_recovery_delay_against_floor() {
     const FLOOR_SECS: u32 = 30;
@@ -325,7 +322,11 @@ fn prop_finalize_folds_recovery_delay_against_floor() {
         }
         let bounds: Vec<Option<u32>> = raw.into_iter().map(|o| o.map(u32::from)).collect();
         // Non-empty → the floor tightened by the smallest declared bound.
-        let expected = bounds.iter().filter_map(|o| *o).fold(FLOOR_SECS, u32::min);
+        let expected = bounds
+            .iter()
+            .filter_map(|o| *o)
+            .fold(FLOOR_SECS, u32::min)
+            .max(1);
         match executor::block_on(staged_fire_delay(&bounds, FLOOR_SECS)) {
             Ok(None) if bounds.is_empty() => TestResult::passed(),
             Ok(None) => TestResult::error(format!("expected a receipt for {bounds:?}, got Clean")),

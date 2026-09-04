@@ -432,6 +432,7 @@ you change the sequence. The anchors code comments cite by name:
 - **Finding F2:** the boundary never unschedules a backstop. Only its fired
   recovery sweep clears the standing backstop. A redelivery sweep clears none.
   Arm-if-sooner prevents one event from loosening another event's backstop.
+  A rescheduled backstop after a failed sweep also follows arm-if-sooner.
 - **Posture:** retry transient AND terminal store failures forever; skip only
   permanent data-rejections; abort only on shutdown; never emit Terminal.
 - **No WAL, ever.** State is one provisional cell per value. The in-memory

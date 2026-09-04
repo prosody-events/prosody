@@ -65,11 +65,6 @@ use tracing::{Span, error};
 /// retry cadence in [`crate::consumer::middleware`].
 const RESCHEDULE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
-/// Floor on a rescheduled backstop's fire delay, so a zero (or sub-second)
-/// `recovery_within` cannot turn a persistently failing sweep into a hot
-/// refire loop. Matches [`RESCHEDULE_RETRY_DELAY`].
-const RESCHEDULE_FLOOR: CompactDuration = CompactDuration::new(1);
-
 /// The shared descriptor-identity store's error of a [`StateBackend`] bundle.
 type IdentityErr<B> = <<B as StateBackend>::Identity as DescriptorIdentityStore>::Error;
 
@@ -443,25 +438,9 @@ impl<B, L> StateManager<B, L>
 where
     B: StateBackend,
 {
-    /// Reschedules a fresh `StateRecovery` backstop after a failed sweep,
-    /// retrying every non-shutdown failure until it lands.
-    ///
-    /// The fire delay is the `recovery_delay` floor tightened by the smallest
-    /// `recovery_within` among the registered collections — the same
-    /// tightening `finalize` folds onto the receipt's recovery delay, so a
-    /// transient sweep failure does not stretch a tightly bounded
-    /// collection's convergence out to the full floor. Which
-    /// collections still hold provisional cells is unknown here (the sweep
-    /// failed), so folding the whole registered set is the conservative
-    /// direction: it can only fire sooner, and an early sweep that finds
-    /// nothing resolves trivially. Floored at [`RESCHEDULE_FLOOR`].
-    ///
-    /// A rescheduled backstop is durable in the trigger store — it survives
-    /// shutdown and fires on reacquisition — so once it lands this returns
-    /// [`SweepResolution::Commit`] even if shutdown is now in progress. It
-    /// returns [`SweepResolution::Abort`] only when shutdown interrupts
-    /// *before* the backstop lands; then the fired trigger refires and
-    /// re-sweeps on the next acquisition, so the cell is never orphaned.
+    /// Arms a backstop after a failed sweep. Keeps an earlier standing timer.
+    /// Retries each failure until the timer is durable or shutdown starts.
+    /// The settle boundary's `arm_backstop` applies the same rule.
     async fn reschedule_backstop<T>(
         &self,
         key: &Key,
@@ -474,12 +453,7 @@ where
         let delay = self
             .inner
             .registry
-            .collections()
-            .filter_map(|(state_type, name)| {
-                self.inner.registry.recovery_within_for(state_type, name)
-            })
-            .fold(self.inner.recovery_delay, CompactDuration::min)
-            .max(RESCHEDULE_FLOOR);
+            .tightened_recovery_delay(self.inner.recovery_delay, self.inner.registry.collections());
         loop {
             if *shutdown.borrow() >= ShutdownPhase::Cancelling {
                 return SweepResolution::Abort;
@@ -492,13 +466,30 @@ where
                     continue;
                 }
             };
+            let standing = match self.inner.armed.read_async(key, |_, fire| *fire).await {
+                Some(fire) => Some(fire),
+                None => match timers.scheduled_times(key, TimerType::StateRecovery).await {
+                    Ok(scheduled) => {
+                        let standing = scheduled.into_iter().min();
+                        if let Some(fire) = standing {
+                            self.inner.armed.upsert_async(key.clone(), fire).await;
+                        }
+                        standing
+                    }
+                    Err(error) => {
+                        error!(error = %error, "failed to read standing recovery timer; retrying");
+                        sleep(RESCHEDULE_RETRY_DELAY).await;
+                        continue;
+                    }
+                },
+            };
+            if standing.is_some_and(|standing| standing <= fire) {
+                return SweepResolution::Commit;
+            }
             let request =
                 TimerRequest::new(key.clone(), fire, TimerType::StateRecovery, Span::current());
             match timers.clear_and_schedule(request).await {
                 Ok(()) => {
-                    // The rescheduled backstop is now the standing one; record
-                    // its fire so the arm-if-sooner path on the key's next commit
-                    // sees it (mirrors `mark_backstop_armed`).
                     self.inner.armed.upsert_async(key.clone(), fire).await;
                     return SweepResolution::Commit;
                 }
