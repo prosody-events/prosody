@@ -106,6 +106,7 @@ fn durable_identity_wire_contract_is_frozen() {
     assert_eq!(i8::from(CollectionKindId::Value), 1);
     assert_eq!(i8::from(CollectionKindId::Map), 2);
     assert_eq!(i8::from(CollectionKindId::Deque), 3);
+    assert_eq!(i8::from(CollectionKindId::Set), 4);
     // Value is single-cell: its key axis is the unit codec, and that token must
     // stay frozen or existing Value collections silently brick.
     assert_eq!(cart().structural_identity().key_format_id, "unit.v1");

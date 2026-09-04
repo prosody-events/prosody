@@ -5,27 +5,27 @@
 //! through the real owner
 //! [`KeyedStateSession`](crate::state::session::KeyedStateSession) via
 //! [`owner_commit_cell`], and the same ops advance a plain
-//! `Option`/`BTreeMap`/`VecDeque` model in lockstep. After every event, a
-//! freshly created [`StateReader`] must answer point `get`, `get_many`,
-//! `stream` (forward and backward), and `len` exactly as the model does. That
-//! is the invariant the whole suite checks: a committed read always matches
-//! the model. The runner is written once over a generic [`ReaderBackend`]. It
-//! is instantiated for the memory reader in `reader_tests` and for a
-//! live-Cassandra reader in `cassandra_tests`.
+//! `Option`/`BTreeMap`/`BTreeSet`/`VecDeque` model in lockstep. After each
+//! event, a freshly created [`StateReader`] must answer point `get`,
+//! `get_many`, `stream` (forward and backward), and `len` exactly as the model
+//! does. That is the invariant the whole suite checks: a committed read always
+//! matches the model. The runner is written once over a generic
+//! [`ReaderBackend`]. It is instantiated for the memory reader in
+//! `reader_tests` and for a live-Cassandra reader in `cassandra_tests`.
 //!
 //! The trace generators are reused wholesale from
 //! [`collection_suite`](crate::state::tests::collection_suite) (`MapOp`,
-//! `DequeOp`, `Trace`, `KEY_POOL`). Only the degenerate [`ValueOp`] is new,
-//! since a Value has no removal. The runner ignores the generators'
-//! mid-handler `Commit`/`Get` ops. A reader only observes committed state, and
-//! the runner already promotes every event, so those ops add no new outcome
-//! to check.
+//! `SetOp`, `DequeOp`, `Trace`, `KEY_POOL`). Only the degenerate [`ValueOp`] is
+//! new, since a Value has no removal. The runner ignores the generators'
+//! mid-handler commit and read operations. A reader only observes committed
+//! state, and the runner already promotes every event, so those ops add no new
+//! outcome to check.
 //!
 //! One property needs a note. A bug that only shows up on a non-empty scan
 //! must not be able to hide by shrinking its counterexample down to an empty
 //! trace. The ordered `stream` is asserted against the ordered model after
-//! every event, empty or not. The Map and Deque generators are weighted
-//! toward `Set`/`Push`, so a non-empty, ordered, multi-entry state keeps
+//! every event, empty or not. The generators favor insert operations.
+//! Thus, a non-empty ordered state keeps
 //! recurring. A counterexample keeps its witness because `Trace` shrink
 //! preserves event structure. An empty read is still a real assertion:
 //! `stream` yields nothing and `get` returns `None`.
@@ -38,18 +38,19 @@ use crate::Topic;
 use crate::codec::JsonCodec;
 use crate::state::cell_key::Direction;
 use crate::state::descriptor::{
-    DequeDescriptor, DequeHandle, DescriptorIdentity, MapDescriptor, MapHandle, ValueDescriptor,
+    DequeDescriptor, DequeHandle, DescriptorIdentity, MapDescriptor, MapHandle, SetDescriptor,
+    SetHandle, ValueDescriptor,
 };
 use crate::state::descriptor_identity::DurableDescriptorIdentity;
 use crate::state::identity::StateKey;
 use crate::state::order_codec::I64KeyCodec;
-use crate::state::tests::collection_suite::{DequeOp, KEY_POOL, MapOp, Trace};
+use crate::state::tests::collection_suite::{DequeOp, KEY_POOL, MapOp, SetOp, Trace};
 use crate::state_reader::{PartitionCount, StateReader};
 use crate::subsystem::SubsystemName;
 use color_eyre::eyre::{Result, eyre};
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 
 /// The fixed routing coordinates one trace runs under. The owner writes
@@ -166,6 +167,84 @@ type OwnerMapHandle<B> =
 
 /// The concrete Deque handle the owner session binds.
 type OwnerDequeHandle<B> = DequeHandle<OwnerSession<<B as ReaderBackend>::OwnerCell>, JsonCodec>;
+
+type OwnerSetHandle<B> = SetHandle<OwnerSession<<B as ReaderBackend>::OwnerCell>, I64KeyCodec>;
+
+/// Drives committed set writes and checks every reader surface.
+pub(super) async fn run_reader_set_trace<B: ReaderBackend>(
+    backend: &B,
+    descriptor: SetDescriptor<I64KeyCodec>,
+    case: &ReaderCase<'_>,
+    trace: Trace<SetOp>,
+) -> Result<bool> {
+    let registry = backend.registry();
+    let state_key = seed_source(backend, descriptor, case).await?;
+    let mut model = BTreeSet::new();
+    for (index, ops) in trace.events_ops().enumerate() {
+        let staged = ops.to_vec();
+        let for_handle = staged.clone();
+        owner_commit_cell(
+            backend.owner_cell(),
+            &registry,
+            &state_key,
+            descriptor,
+            index as u128,
+            move |handle: OwnerSetHandle<B>| async move {
+                for op in for_handle {
+                    match op {
+                        SetOp::Insert(key) => handle
+                            .insert(key)
+                            .await
+                            .map_err(|error| eyre!("insert: {error}"))?,
+                        SetOp::Remove(key) => handle
+                            .remove(&key)
+                            .await
+                            .map_err(|error| eyre!("remove: {error}"))?,
+                        SetOp::Clear => handle
+                            .clear()
+                            .await
+                            .map_err(|error| eyre!("clear: {error}"))?,
+                        SetOp::Contains(_) | SetOp::IsEmpty | SetOp::Commit => {}
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await?;
+        for op in staged {
+            match op {
+                SetOp::Insert(key) => {
+                    model.insert(key);
+                }
+                SetOp::Remove(key) => {
+                    model.remove(&key);
+                }
+                SetOp::Clear => model.clear(),
+                SetOp::Contains(_) | SetOp::IsEmpty | SetOp::Commit => {}
+            }
+        }
+        let deps = backend.deps();
+        let reader = StateReader::new(&deps, case.sub.clone(), descriptor)?;
+        if reader.is_empty(case.key.clone()).await? != model.is_empty() {
+            return Ok(false);
+        }
+        let expected = KEY_POOL.map(|member| model.contains(&member)).to_vec();
+        if reader.contains_many(case.key.clone(), &KEY_POOL).await? != expected {
+            return Ok(false);
+        }
+        let forward =
+            collect_stream(reader.keys(case.key.clone(), Direction::Forward).await?).await?;
+        if forward != model.iter().copied().collect::<Vec<_>>() {
+            return Ok(false);
+        }
+        let backward =
+            collect_stream(reader.keys(case.key.clone(), Direction::Backward).await?).await?;
+        if backward != model.iter().rev().copied().collect::<Vec<_>>() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
 
 /// Applies one Map event's ops to the owner `handle` (ignoring the generators'
 /// mid-handler `Get`/`Commit`, which are no-ops for a committed read).

@@ -91,10 +91,12 @@ use thiserror::Error;
 
 pub mod deque;
 pub mod map;
+pub mod set;
 mod value;
 
 pub use deque::{DequeDescriptor, DequeHandle, DequeQuery, DequeStateError, deque_state};
 pub use map::{MapDescriptor, MapHandle, MapStateError, map_state};
+pub use set::{SetDescriptor, SetHandle, SetQuery, SetStateError, set_state};
 pub use value::{ValueDescriptor, ValueHandle, ValueKind, value_state};
 
 /// A resolver: how a decoded cell (`Stored`) maps to and from the value a

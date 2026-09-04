@@ -19,12 +19,13 @@ use self::cell_suite::{
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
     DequeCapacityShape, DequeHoles, DequeInterleave, DequePlanConstraints, DequeTrace,
-    MapGetManyInput, MapInterleave, MapKeyHoles, MapTrace, StreamConstraints, finalize_and_promote,
-    run_deque_capacity_convergence, run_deque_constraint_parity, run_deque_holes,
-    run_deque_stream_interleave, run_deque_trace, run_map_entries_prefix_trace,
+    MapGetManyInput, MapInterleave, MapKeyHoles, MapTrace, SetTrace, StreamConstraints,
+    finalize_and_promote, run_deque_capacity_convergence, run_deque_constraint_parity,
+    run_deque_holes, run_deque_stream_interleave, run_deque_trace, run_map_entries_prefix_trace,
     run_map_get_many_parity_trace, run_map_key_scan_holes, run_map_keys_prefix_trace,
     run_map_keyset_exact_trace, run_map_stream_interleave, run_map_trace,
-    run_map_ttl_keyset_refresh_trace,
+    run_map_ttl_keyset_refresh_trace, run_set_contains_many_parity_trace,
+    run_set_keys_prefix_trace, run_set_keyset_exact_trace, run_set_trace,
 };
 use self::publication_suite::{PublicationTrace, run_publication_trace};
 use self::support::{
@@ -1053,6 +1054,56 @@ fn prop_map_collection_lifecycle_read_uncommitted() {
         executor::block_on(run_map_trace(trace, CommitMode::ReadUncommitted))
     }
     QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
+}
+
+/// Set lifecycle parity in read-committed mode.
+/// FALSIFICATION: make `SetHandle::remove` skip its member clear.
+#[test]
+fn prop_set_collection_lifecycle() {
+    fn property(trace: SetTrace) -> Result<bool> {
+        executor::block_on(run_set_trace(trace, CommitMode::ReadCommitted))
+    }
+    QuickCheck::new().quickcheck(property as fn(SetTrace) -> Result<bool>);
+}
+
+/// Set lifecycle parity in read-uncommitted mode.
+/// FALSIFICATION: make the set trace keep its prior model after finalize.
+#[test]
+fn prop_set_collection_lifecycle_read_uncommitted() {
+    fn property(trace: SetTrace) -> Result<bool> {
+        executor::block_on(run_set_trace(trace, CommitMode::ReadUncommitted))
+    }
+    QuickCheck::new().quickcheck(property as fn(SetTrace) -> Result<bool>);
+}
+
+/// Set query constraints match a filtered unlimited prefix.
+/// FALSIFICATION: ignore the set query limit in `SetQuery::limit`.
+#[test]
+fn prop_set_keys_constraint_parity() {
+    fn property(trace: SetTrace, constraints: StreamConstraints) -> Result<bool> {
+        executor::block_on(run_set_keys_prefix_trace(trace, constraints))
+    }
+    QuickCheck::new().quickcheck(property as fn(SetTrace, StreamConstraints) -> Result<bool>);
+}
+
+/// Set batch membership matches the `BTreeSet` model.
+/// FALSIFICATION: invert one result in `SetHandle::contains_many`.
+#[test]
+fn prop_set_contains_many_parity() {
+    fn property(input: MapGetManyInput) -> Result<bool> {
+        executor::block_on(run_set_contains_many_parity_trace(input))
+    }
+    QuickCheck::new().quickcheck(property as fn(MapGetManyInput) -> Result<bool>);
+}
+
+/// The stored set keyset equals the live member set.
+/// FALSIFICATION: make `SetHandle::remove` skip keyset subtraction.
+#[test]
+fn prop_set_keyset_exact() {
+    fn property(trace: SetTrace) -> Result<bool> {
+        executor::block_on(run_set_keyset_exact_trace(trace))
+    }
+    QuickCheck::new().quickcheck(property as fn(SetTrace) -> Result<bool>);
 }
 
 /// Constrained map keys match an unlimited filtered prefix on both plan arms.

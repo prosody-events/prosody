@@ -12,7 +12,8 @@
 //! segment the owner wrote.
 
 use super::reader_suite::{
-    ReaderCase, ValueOp, run_reader_deque_trace, run_reader_map_trace, run_reader_value_trace,
+    ReaderCase, ValueOp, run_reader_deque_trace, run_reader_map_trace, run_reader_set_trace,
+    run_reader_value_trace,
 };
 use super::support::{
     GROUP_A, MemoryHarness, MemoryReaderBackend, mock_count, owner_commit, owner_stage,
@@ -22,7 +23,7 @@ use crate::Key;
 use crate::codec::JsonCodec;
 use crate::state::cell_key::{Coordinate, Direction, Scan, Section};
 use crate::state::descriptor::{
-    DescriptorIdentity, StateDescriptor, deque_state, map_state, value_state,
+    DescriptorIdentity, StateDescriptor, deque_state, map_state, set_state, value_state,
 };
 use crate::state::descriptor_identity::DurableDescriptorIdentity;
 use crate::state::identity::CollectionId;
@@ -30,7 +31,7 @@ use crate::state::order_codec::I64KeyCodec;
 use crate::state::publication::PublicationStore;
 use crate::state::registry::CollectionDef;
 use crate::state::store::CoordinateBatch;
-use crate::state::tests::collection_suite::{DequeOp, MapOp, Trace};
+use crate::state::tests::collection_suite::{DequeOp, MapOp, SetOp, Trace};
 use crate::state::{ReadCachePolicy, StateType};
 use crate::state_reader::CommittedCellSource;
 use crate::state_reader::{StateReader, StateReaderError};
@@ -91,6 +92,15 @@ reader_prop!(
     map_state::<I64KeyCodec, JsonCodec>,
     "reader-map",
     run_reader_map_trace
+);
+
+// The reader set surface equals a `BTreeSet` model after each event.
+reader_prop!(
+    prop_reader_set_committed,
+    SetOp,
+    set_state::<I64KeyCodec>,
+    "reader-set",
+    run_reader_set_trace
 );
 
 // The reader's `len`, front-relative `get`, and ordered `stream` equal a

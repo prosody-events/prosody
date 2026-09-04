@@ -63,7 +63,7 @@ async fn assert_map_scans<P: ParityPayload>(
     handle: &BoxMapState<P>,
     visible: &BTreeMap<String, P>,
 ) -> Result<bool> {
-    let scanned = drain_cursor(&handle.scan(MapScanConfig::default())).await?;
+    let scanned = drain_cursor(&handle.scan(KeyScanConfig::default())).await?;
     if scanned.len() != visible.len()
         || scanned
             .iter()
@@ -74,12 +74,12 @@ async fn assert_map_scans<P: ParityPayload>(
     {
         return Ok(false);
     }
-    if drain_cursor(&handle.keys(MapScanConfig::default())).await?
+    if drain_cursor(&handle.keys(KeyScanConfig::default())).await?
         != visible.keys().cloned().collect::<Vec<_>>()
     {
         return Ok(false);
     }
-    let config = MapScanConfig {
+    let config = KeyScanConfig {
         dir: Direction::Forward,
         limit: Some(NonZeroUsize::MIN),
         start: Bound::Included(KEYS[1].to_owned()),

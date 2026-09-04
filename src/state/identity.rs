@@ -36,6 +36,9 @@ pub enum CollectionKindId {
 
     /// An index-addressed double-ended queue.
     Deque = 3,
+
+    /// A presence-only ordered set.
+    Set = 4,
 }
 
 impl From<CollectionKindId> for i8 {

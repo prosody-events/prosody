@@ -39,7 +39,7 @@ use crate::state::cell_key::{Direction, ScanEdge};
 use crate::state::collection::{Constraints, WritableStateSession};
 use crate::state::descriptor::{
     CellCodecError, CellStateError, CellType, ContextOf, DequeHandle, DequeStateError, FromSession,
-    MapHandle, MapStateError, ResolvedOf, ValueHandle,
+    MapHandle, MapStateError, ResolvedOf, SetHandle, ValueHandle,
 };
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey, Utf8KeyCodec};
 
@@ -73,7 +73,7 @@ pub enum ErasedCategory {
 
 /// Erased map scan constraints.
 #[derive(Clone, Debug)]
-pub struct MapScanConfig {
+pub struct KeyScanConfig {
     /// The scan direction.
     pub dir: Direction,
     /// The maximum number of present items.
@@ -84,7 +84,7 @@ pub struct MapScanConfig {
     pub end: Bound<String>,
 }
 
-impl Default for MapScanConfig {
+impl Default for KeyScanConfig {
     fn default() -> Self {
         Self {
             dir: Direction::Forward,
@@ -253,17 +253,40 @@ pub trait DynMapState<Item: Send + 'static>: Send + Sync {
     async fn clear(&self) -> Result<(), ErasedStateError>;
 
     /// A demand-driven cursor over the live entries in key order.
-    fn scan(&self, config: MapScanConfig) -> BoxStateCursor<(String, Item)>;
+    fn scan(&self, config: KeyScanConfig) -> BoxStateCursor<(String, Item)>;
 
     /// A demand-driven cursor over the live entry **keys** in key order,
     /// without decoding or resolving any value (zero Kafka fetches for a
     /// message-backed map). A key is present even when its value is not.
-    fn keys(&self, config: MapScanConfig) -> BoxStateCursor<String>;
+    fn keys(&self, config: KeyScanConfig) -> BoxStateCursor<String>;
 
     /// Durably commits buffered ops mid-handler (at-least-once).
     async fn commit(&self) -> Result<(), ErasedStateError>;
 
     /// Discards buffered uncommitted ops.
+    async fn rollback(&self);
+}
+
+/// Erased presence-only ordered set with `String` keys.
+#[async_trait]
+pub trait DynSetState: Send + Sync {
+    /// Tests whether `key` belongs to the set.
+    async fn contains(&self, key: String) -> Result<bool, ErasedStateError>;
+    /// Tests each key for membership in input order.
+    async fn contains_many(&self, keys: Vec<String>) -> Result<Vec<bool>, ErasedStateError>;
+    /// Reports whether the set has no live members.
+    async fn is_empty(&self) -> Result<bool, ErasedStateError>;
+    /// Inserts `key` into the set.
+    async fn insert(&self, key: String) -> Result<(), ErasedStateError>;
+    /// Removes `key` from the set.
+    async fn remove(&self, key: String) -> Result<(), ErasedStateError>;
+    /// Removes all members.
+    async fn clear(&self) -> Result<(), ErasedStateError>;
+    /// Returns a demand-driven cursor over live keys.
+    fn keys(&self, config: KeyScanConfig) -> BoxStateCursor<String>;
+    /// Commits buffered set operations.
+    async fn commit(&self) -> Result<(), ErasedStateError>;
+    /// Discards buffered set operations.
     async fn rollback(&self);
 }
 
@@ -317,6 +340,8 @@ pub type BoxValueState<Item> = Box<dyn DynValueState<Item>>;
 
 /// Boxed erased map handle a vend method returns.
 pub type BoxMapState<Item> = Box<dyn DynMapState<Item>>;
+/// Boxed erased set handle.
+pub type BoxSetState = Box<dyn DynSetState>;
 
 /// Boxed erased deque handle a vend method returns.
 pub type BoxDequeState<Item> = Box<dyn DynDequeState<Item>>;
@@ -794,12 +819,12 @@ where
             .map_err(|e| ErasedStateError::from_classified(&e))
     }
 
-    fn scan(&self, config: MapScanConfig) -> BoxStateCursor<(String, ResolvedOf<T>)> {
+    fn scan(&self, config: KeyScanConfig) -> BoxStateCursor<(String, ResolvedOf<T>)> {
         let handle = self.handle.clone();
         let stream = try_stream! {
             let inner = handle
                 .query(config.dir)
-                .with_constraints(map_constraints(config))
+                .with_constraints(key_constraints(config))
                 .entries();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
@@ -810,12 +835,12 @@ where
         Box::new(StateCursor::new(Box::pin(stream)))
     }
 
-    fn keys(&self, config: MapScanConfig) -> BoxStateCursor<String> {
+    fn keys(&self, config: KeyScanConfig) -> BoxStateCursor<String> {
         let handle = self.handle.clone();
         let stream = try_stream! {
             let inner = handle
                 .query(config.dir)
-                .with_constraints(map_constraints(config))
+                .with_constraints(key_constraints(config))
                 .keys();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
@@ -832,6 +857,89 @@ where
             .await
             .map(drop)
             .map_err(|e| ErasedStateError::from_classified(&e))
+    }
+
+    async fn rollback(&self) {
+        self.handle.rollback().await;
+    }
+}
+
+/// Erased set wrapper over a typed UTF-8 set.
+pub(super) struct ErasedSet<S> {
+    handle: SetHandle<S, Utf8KeyCodec>,
+}
+
+impl<S> ErasedSet<S> {
+    pub(super) fn new(handle: SetHandle<S, Utf8KeyCodec>) -> Self {
+        Self { handle }
+    }
+}
+
+#[async_trait]
+impl<S> DynSetState for ErasedSet<S>
+where
+    S: WritableStateSession,
+{
+    async fn contains(&self, key: String) -> Result<bool, ErasedStateError> {
+        self.handle
+            .contains(&key)
+            .await
+            .map_err(|error| ErasedStateError::from_classified(&error))
+    }
+
+    async fn contains_many(&self, keys: Vec<String>) -> Result<Vec<bool>, ErasedStateError> {
+        self.handle
+            .contains_many(&keys)
+            .await
+            .map_err(|error| ErasedStateError::from_classified(&error))
+    }
+
+    async fn is_empty(&self) -> Result<bool, ErasedStateError> {
+        self.handle
+            .is_empty()
+            .await
+            .map_err(|error| ErasedStateError::from_classified(&error))
+    }
+
+    async fn insert(&self, key: String) -> Result<(), ErasedStateError> {
+        self.handle
+            .insert(key)
+            .await
+            .map_err(|error| ErasedStateError::from_classified(&error))
+    }
+
+    async fn remove(&self, key: String) -> Result<(), ErasedStateError> {
+        self.handle
+            .remove(&key)
+            .await
+            .map_err(|error| ErasedStateError::from_classified(&error))
+    }
+
+    async fn clear(&self) -> Result<(), ErasedStateError> {
+        self.handle
+            .clear()
+            .await
+            .map_err(|error| ErasedStateError::from_classified(&error))
+    }
+
+    fn keys(&self, config: KeyScanConfig) -> BoxStateCursor<String> {
+        let handle = self.handle.clone();
+        let stream = try_stream! {
+            let inner = handle.query(config.dir).with_constraints(key_constraints(config)).keys();
+            futures::pin_mut!(inner);
+            while let Some(item) = inner.next().await {
+                yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
+            }
+        };
+        Box::new(StateCursor::new(Box::pin(stream)))
+    }
+
+    async fn commit(&self) -> Result<(), ErasedStateError> {
+        self.handle
+            .commit()
+            .await
+            .map(drop)
+            .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
     async fn rollback(&self) {
@@ -964,8 +1072,8 @@ fn bound_usize(bound: Bound<u64>) -> Bound<usize> {
     bound.map(|value| usize::try_from(value).unwrap_or(usize::MAX))
 }
 
-/// Lowers an erased [`MapScanConfig`] to typed [`Constraints`].
-fn map_constraints(config: MapScanConfig) -> Constraints {
+/// Lowers an erased [`KeyScanConfig`] to typed [`Constraints`].
+fn key_constraints(config: KeyScanConfig) -> Constraints {
     let edge = |bound: Bound<String>| match bound {
         Bound::Included(key) => ScanEdge::Included(Utf8KeyCodec::encode(&key)),
         Bound::Excluded(key) => ScanEdge::Excluded(Utf8KeyCodec::encode(&key)),
