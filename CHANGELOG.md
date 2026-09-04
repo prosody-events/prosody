@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.7.0](https://github.com/prosody-events/prosody/compare/prosody-v0.6.0...prosody-v0.7.0) (2026-09-04)
+
+
+### Features
+
+* add keyed-state cell metrics ([#82](https://github.com/prosody-events/prosody/issues/82)) ([9a499b9](https://github.com/prosody-events/prosody/commit/9a499b95d5e675dd05db4e18e936d9e7c341cf3b))
+
+
+### Bug Fixes
+
+* allow published reads without topic subscriptions ([#81](https://github.com/prosody-events/prosody/issues/81)) ([87ea311](https://github.com/prosody-events/prosody/commit/87ea311049cd9c18b581e4db75509ecfb578f7db))
+* resolve all Rust 1.98 quality issues ([#83](https://github.com/prosody-events/prosody/issues/83)) ([fc48b63](https://github.com/prosody-events/prosody/commit/fc48b633cf76466c136ab12f5ab9db978abecfbc))
+* serialize keyed-state publication ([#77](https://github.com/prosody-events/prosody/issues/77)) ([c759797](https://github.com/prosody-events/prosody/commit/c7597978ed050d13c4f2085e9db15d6e2bc8e0b2))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * prosody-macros bumped from 0.6.0 to 0.7.0
+
 ## [0.6.0](https://github.com/prosody-events/prosody/compare/prosody-v0.5.0...prosody-v0.6.0) (2026-08-19)
 
 
