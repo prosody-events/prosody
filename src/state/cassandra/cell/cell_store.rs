@@ -5,13 +5,14 @@ use super::{
     CellBatchRow, CellBuffer, CellKey, CellKind, CellStore, CellStoreError, CollectionId,
     CollectionRef, CommitOracle, Committed, CommittedBatch, CompactDuration, Coordinate,
     CoordinateBatch, EventMarker, EventRef, KeyRow, PER_STATEMENT_OVERHEAD, Pk, PresenceBatch,
-    ProvisionalCell, ProvisionalWrite, ResolveCellError, RowShape, Scan, ScanStatements, Section,
-    SectionClear, SmallVec, Stream, StreamExt, decode, decode_batch_rows, decode_cell_ttl_result,
-    decode_presence_batch_rows, decode_provisional_batch, dedupe, encode_cell_blobs,
-    expand_to_input_order, extend_gap_units, fetch_presence_batch_result, flatten_resolve,
-    gap_count, help_read_window, help_write_window, into_store_err,
-    match_batch_rows_to_coordinates, peek_read, resolve_read, section_batches, smallvec,
-    sorted_unique_coordinates, try_stream, ttl_seconds_to_duration, ttl_to_i32, write_provisional,
+    ProvisionalCell, ProvisionalWrite, ReadPreparation, ResolveCellError, RowShape, Scan,
+    ScanStatements, Section, SectionClear, SmallVec, Stream, StreamExt, decode, decode_batch_rows,
+    decode_cell_ttl_result, decode_presence_batch_rows, decode_provisional_batch, dedupe,
+    encode_cell_blobs, expand_to_input_order, extend_gap_units, fetch_presence_batch_result,
+    flatten_resolve, gap_count, into_store_err, match_batch_rows_to_coordinates, peek_read,
+    resolve_prior_clear_before_read, resolve_read, resolve_unsettled_clear_before_write,
+    section_batches, smallvec, sorted_unique_coordinates, try_stream, ttl_seconds_to_duration,
+    ttl_to_i32, write_provisional,
 };
 
 impl<O> CellStore for CassandraStore<O>
@@ -39,27 +40,24 @@ where
         own: EventRef,
     ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
         let collection_ref = self.resolver.collection_ref(collection);
-        // The committed-unapplied read window (`help_read_window`): consult
-        // the standing marker — memo-backed, so no durable read after the one
-        // seed read —
-        // CONCURRENTLY with the cell point read, keeping the ~always
-        // marker-free fast path free of serial latency. If the marker was
-        // resolved (foreign + clears), the pre-help row may hold a now-erased
-        // value, so the point read is re-issued.
-        let (row, standing) = futures::join!(
+        // Read the cell and marker at the same time.
+        // Read the cell again if a prior clear changes durable state.
+        let (row, marker) = futures::join!(
             self.point_read_cell_result(&self.queries.read_cell_ttl, collection, cell),
-            self.standing_marker(collection),
+            self.unsettled_marker(collection),
         );
         let mut row = row.map_err(ResolveCellError::Store)?;
-        if help_read_window(
+        let marker = marker?;
+        if resolve_prior_clear_before_read(
             self,
             self.resolver.oracle(),
             &collection_ref,
-            standing?.as_ref(),
+            marker.as_ref(),
             own,
         )
         .await
         .map_err(flatten_resolve)?
+            == ReadPreparation::DurableStateChanged
         {
             row = self
                 .point_read_cell_result(&self.queries.read_cell_ttl, collection, cell)
@@ -109,26 +107,24 @@ where
     ) -> Result<CacheBatch, Self::Error> {
         let collection_ref = self.resolver.collection_ref(collection);
         let (unique_coordinates, input_indices) = dedupe(batch);
-        // The committed-unapplied read window, exactly as the point read
-        // (`get_for_cache`): consult the standing marker — memo-backed, so no
-        // durable read after the one seed read — CONCURRENTLY with the batch
-        // query. If the marker was resolved (foreign + clears), the pre-help
-        // rows may hold now-erased values, so the whole `IN` query is re-issued
-        // once.
-        let (rows, standing) = futures::join!(
+        // Read the cells and marker at the same time.
+        // Read all cells again if a prior clear changes durable state.
+        let (rows, marker) = futures::join!(
             self.batch_read_result(collection, section, &unique_coordinates),
-            self.standing_marker(collection),
+            self.unsettled_marker(collection),
         );
         let mut rows = rows.map_err(ResolveCellError::Store)?;
-        if help_read_window(
+        let marker = marker?;
+        if resolve_prior_clear_before_read(
             self,
             self.resolver.oracle(),
             &collection_ref,
-            standing?.as_ref(),
+            marker.as_ref(),
             own,
         )
         .await
         .map_err(flatten_resolve)?
+            == ReadPreparation::DurableStateChanged
         {
             rows = self
                 .batch_read_result(collection, section, &unique_coordinates)
@@ -171,8 +167,8 @@ where
     ) -> Result<PresenceBatch, Self::Error> {
         let collection_ref = self.resolver.collection_ref(collection);
         let (unique_coordinates, input_indices) = dedupe(batch);
-        // Use the read-window sequence documented on `get_for_cache`.
-        let (rows, standing) = futures::join!(
+        // Use the prior-clear sequence documented on `get_for_cache`.
+        let (rows, marker) = futures::join!(
             fetch_presence_batch_result(
                 &self.session,
                 &self.queries,
@@ -180,18 +176,19 @@ where
                 section,
                 &unique_coordinates,
             ),
-            self.standing_marker(collection),
+            self.unsettled_marker(collection),
         );
         let mut rows = rows.map_err(ResolveCellError::Store)?;
-        if help_read_window(
+        if resolve_prior_clear_before_read(
             self,
             self.resolver.oracle(),
             &collection_ref,
-            standing?.as_ref(),
+            marker?.as_ref(),
             own,
         )
         .await
         .map_err(flatten_resolve)?
+            == ReadPreparation::DurableStateChanged
         {
             rows = fetch_presence_batch_result(
                 &self.session,
@@ -258,14 +255,9 @@ where
         collection: &'a CollectionId,
     ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
         try_stream! {
-            // The **cold seed** is the standing event marker (memoized — the
-            // one durable marker point read per collection per assignment
-            // happens in `standing_marker`, wherever it fires first): its
-            // frozen payload lists the staged coordinates, so recovery cost is
-            // ∝ #provisional, never #cells, with no range read anywhere. The
-            // warm short-circuit that skips this on a quiescent sweep lives
-            // one layer up on `Cached` (which owns the fjall warm index).
-            let Some(marker) = self.standing_marker(collection).await? else {
+            // The event marker lists each staged coordinate.
+            // Recovery reads only those coordinates.
+            let Some(marker) = self.unsettled_marker(collection).await? else {
                 return;
             };
 
@@ -329,7 +321,7 @@ where
         let unique_coordinates = sorted_unique_coordinates(batch);
         // One IN query, reusing the TTL-bearing batch read; TTL is discarded in
         // the decoder. Never consults the oracle, never resolves, never writes —
-        // no read-window marker resolve, exactly as `provisional_cell_at`.
+        // no prior-clear marker resolve, exactly as `provisional_cell_at`.
         let result = self
             .batch_read_result(collection, section, &unique_coordinates)
             .await
@@ -354,22 +346,17 @@ where
         cells: &'a [(CellKey, Option<Bytes>)],
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        // The write-side committed-unapplied boundary (`help_write_window`):
-        // resolve any standing clears-bearing event marker before this blind
-        // write lands, ordering the write after that resolution so a stale
-        // clear's positional replay cannot erase it (modulo the
-        // concurrent-resolver residual documented on `help_write_window`).
-        // Memo-backed (`standing_marker`): one RAM/presence check steady-state,
-        // and the first marker consumer per collection per assignment pays the
-        // one durable seed read. The verb still never *writes* the marker slice
-        // (the marker lifecycle belongs to the staged verbs — see
-        // `CellStore::write_provisional`); the resolution runs through this
-        // store's own `commit_provisional`/`abort_provisional`, keeping the
-        // memo coherent.
-        let standing = self.standing_marker(collection.id()).await?;
-        help_write_window(self, self.resolver.oracle(), collection, standing.as_ref())
-            .await
-            .map_err(flatten_resolve)?;
+        // Resolve an unsettled section clear before this write.
+        // The clear cannot remove a value that this write adds.
+        let marker = self.unsettled_marker(collection.id()).await?;
+        resolve_unsettled_clear_before_write(
+            self,
+            self.resolver.oracle(),
+            collection,
+            marker.as_ref(),
+        )
+        .await
+        .map_err(flatten_resolve)?;
         // Survivors are the present-data `cells`, excluded from the gaps
         // positionally, so every batch row stays disjoint and may be packed
         // independently.
@@ -421,23 +408,19 @@ where
             .map_err(ResolveCellError::Store)
     }
 
-    async fn standing_marker<'a>(
+    async fn unsettled_marker<'a>(
         &'a self,
         collection: &'a CollectionId,
     ) -> Result<Option<EventMarker>, Self::Error> {
-        // Memo hit: the presence latch says the durable marker was consulted
-        // this assignment, so the RAM standing map is at least durable truth —
-        // zero durable reads. A presence fjall error reads as unchecked (a
-        // redundant durable re-check, never an under-report).
-        if self.presence.contains(collection).await {
+        // A completed check makes the memory map authoritative.
+        if self.memo.checks.contains(collection).await {
             return Ok(self
                 .memo
-                .standing
+                .unsettled
                 .read_async(collection, |_, marker| marker.clone())
                 .await);
         }
-        // Memo miss: the one durable point read at the fixed marker address,
-        // seeding the memo for the rest of the assignment.
+        // Read the fixed marker row once for this assignment.
         #[cfg(test)]
         self.counters
             .marker_point_reads
@@ -474,11 +457,11 @@ where
             .map_err(ResolveCellError::Store)?;
         if let Some(marker) = &marker {
             self.memo
-                .standing
+                .unsettled
                 .upsert_async(collection.clone(), marker.clone())
                 .await;
         }
-        self.presence.set(collection).await;
+        self.memo.checks.set(collection).await;
         Ok(marker)
     }
 
@@ -517,7 +500,7 @@ where
         }));
         extend_gap_units(&mut units, &self.queries, pk, clears);
         self.issue_marker_last(pk, units).await?;
-        self.settle_memo(collection.id()).await;
+        self.record_marker_settled(collection.id()).await;
         Ok(())
     }
 
@@ -547,7 +530,7 @@ where
         let mut units = Vec::with_capacity(cells.len() + 1);
         units.extend(self.resolved_units(pk, ttl, &blobs, &cells));
         self.issue_marker_last(pk, units).await?;
-        self.settle_memo(collection.id()).await;
+        self.record_marker_settled(collection.id()).await;
         Ok(())
     }
 }

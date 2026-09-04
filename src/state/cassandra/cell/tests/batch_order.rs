@@ -1,7 +1,7 @@
 use super::*;
 
 /// The pure single-batch packing decision both marker-ordering callers rest
-/// on — `write_provisional`'s stage marker-FIRST choice and
+/// on — `write_provisional`'s stage marker-first choice and
 /// `marker_last_split`'s settle marker-LAST split: a unit set fits one batch
 /// iff the weight sum is within the byte budget AND the unit count is within
 /// the statement budget. (The intra-call tear of an over-budget stage cannot be
@@ -22,7 +22,7 @@ fn fits_one_batch_decides_on_both_budgets() {
 }
 
 /// Settle's budget decision preserves one atomic batch whenever possible and
-/// otherwise isolates the final marker unit as the split tail. This pins the
+/// otherwise isolates the final marker unit as the split tail. This tests the
 /// split INDEX `issue_marker_last` relies on; the temporal ordering (prefix
 /// awaited before the marker tail) is enforced structurally by that helper
 /// owning both awaits, not by this pure property.
@@ -65,7 +65,7 @@ async fn markerless_provisional_is_sweep_invisible_but_first_touch_repairs() -> 
     init_test_logging();
     let fx = fixture().await?;
     let oracle = ScriptedOracle::default();
-    let store = fx.bottom_store(oracle.clone());
+    let store = fx.bottom_store(oracle.clone())?;
     let c = collection("markerless-orphan")?;
     let cell = value_cell();
     let data = Bytes::from_static(b"committed-after-crash");
@@ -91,7 +91,7 @@ async fn markerless_provisional_is_sweep_invisible_but_first_touch_repairs() -> 
         .await?;
     oracle.record_message(Uuid::from_u128(0xA11CE)).await?;
 
-    assert!(store.standing_marker(c.id()).await?.is_none());
+    assert!(store.unsettled_marker(c.id()).await?.is_none());
     assert!(
         sweep_provisional(&store, &oracle, &c).await?,
         "a markerless sweep sees no work"

@@ -158,17 +158,15 @@ impl CollectionDefRegistry {
     }
 
     /// Whether `(state_type, name)` is registered as `Published`. The
-    /// first-write publisher consults this before upserting a routing row. An
-    /// unregistered name is never published.
+    /// assignment publisher consults this when it replaces the routing set.
+    /// An unregistered name is never published.
     #[must_use]
     pub(crate) fn is_published(&self, state_type: StateType, name: &StateName) -> bool {
         self.lookup_collection(state_type, name)
             .is_some_and(|c| c.def.visibility == StateVisibility::Published)
     }
 
-    /// Whether any registered collection is `Published`. Gates the whole
-    /// first-write publication subsystem: with no published collection there is
-    /// nothing to advertise and nothing to reconcile.
+    /// Whether any registered collection is `Published`.
     #[must_use]
     pub(crate) fn has_published(&self) -> bool {
         self.defs

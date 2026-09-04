@@ -64,7 +64,7 @@ use uuid::Uuid;
 
 /// The live-Cassandra [`ReaderBackend`]. It holds one
 /// `CassandraStore<FixedOracle>`, which bundles a shared session, prepared
-/// queries, and one `MarkerMemo`/`MarkerPresence` lifecycle. That store is
+/// queries, and one `MarkerMemo`/`MarkerCheckSet` lifecycle. That store is
 /// cloned into a fresh owner session for each event. The reader reads through
 /// [`CassandraCellResources`] over the same session and the same queries.
 struct CassandraReaderBackend {
@@ -162,7 +162,7 @@ fn reader_topic() -> Topic {
 }
 
 /// Builds the heavy environment: a session, prepared queries, a process
-/// presence latch, and a registry carrying the four per-kind defs, plus the
+/// marker check, and a registry carrying the four per-kind defs, plus the
 /// shared owner cell store and the reader's carriers.
 async fn cassandra_backend() -> Result<CassandraReaderBackend> {
     let conn = CassandraConn::new(&test_cassandra_config()).await?;
@@ -190,7 +190,7 @@ async fn cassandra_backend() -> Result<CassandraReaderBackend> {
     )?;
     let registry = Arc::new(registry);
 
-    let presence = test_db::presence("state_reader_cassandra_presence")?;
+    let presence = test_db::marker_checks("state_reader_cassandra_presence")?;
     let store = CassandraCellStore::new(
         conn.clone(),
         cell_queries.clone(),
@@ -303,13 +303,13 @@ cassandra_reader_prop!(
     run_reader_deque_trace
 );
 
-/// A probe-and-pin test over two admitted live-Cassandra sources: the
+/// A probe-and-test test over two admitted live-Cassandra sources: the
 /// lowest-ordered `SourceId` group must answer. Both groups commit divergent
 /// values under one fresh subsystem. Because `-00` sorts lexicographically
 /// before `-01`, the reader must observe `-00`'s value.
 ///
-/// FALSIFICATION: reverse `ValidatedPublications::new`'s sort to
-/// `b.id.cmp(&a.id)`. The higher group then pins, and the assert goes red.
+/// The test fails if reverse `ValidatedPublications::new`'s sort to
+/// `b.id.cmp(&a.id)`. The higher group then tests, and the assert goes red.
 #[test]
 fn reader_two_group_lowest_wins() -> Result<()> {
     init_test_logging();
@@ -367,7 +367,7 @@ fn reader_two_group_lowest_wins() -> Result<()> {
 /// real owner in a single event. The reader then streams it forward and
 /// backward, and both directions must equal the ordered model.
 ///
-/// FALSIFICATION: drop the first yield in
+/// The test fails if drop the first yield in
 /// `CassandraCellResources::scan_committed`. The forward stream then loses
 /// its front element and the assert goes red.
 #[test]

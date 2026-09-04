@@ -16,8 +16,6 @@
 use super::store::CellStore;
 use crate::error::ClassifyError;
 use crate::state::descriptor_identity::DescriptorIdentityStore;
-use crate::state::first_write::FirstWriteBarrier;
-use crate::state::first_write::NoPublisher;
 use crate::state::oracle::CommitOracle;
 use crate::{Partition, Topic};
 #[cfg(test)]
@@ -55,9 +53,6 @@ pub trait StateBackend: Send + Sync + 'static {
     /// production, `MemoryCellStore` in tests). The session wraps it in the
     /// per-event dirty `Overlay`.
     type Cell: CellStore;
-    /// First-write publication barrier.
-    type Publisher: FirstWriteBarrier;
-
     /// The shared commit oracle (the settle boundary records the marker
     /// through it).
     fn oracle(&self) -> Self::Oracle;
@@ -67,54 +62,38 @@ pub trait StateBackend: Send + Sync + 'static {
 
     /// The uniform durable cell store.
     fn cell(&self) -> Self::Cell;
-    /// Publisher bound to this partition's topic.
-    fn publisher(&self) -> Option<Self::Publisher>;
 }
 
 /// The one concrete backend every factory mints; [`StateBackend`] projects its
 /// store type so callers name only `B`.
 #[derive(Clone, Debug)]
-pub struct PartitionBackend<O, I, C, P = NoPublisher> {
+pub struct PartitionBackend<O, I, C> {
     oracle: O,
     identity: I,
     cell: C,
-    publisher: Option<P>,
 }
 
-impl<O, I, C, P> PartitionBackend<O, I, C, P> {
-    /// Bundles the shared oracle, descriptor-identity store, cell store, and
-    /// optional first-write publisher for one partition.
+impl<O, I, C> PartitionBackend<O, I, C> {
+    /// Bundles the shared oracle, descriptor-identity store, and cell store.
     #[must_use]
-    pub fn with_publisher(oracle: O, identity: I, cell: C, publisher: Option<P>) -> Self {
+    pub fn new(oracle: O, identity: I, cell: C) -> Self {
         Self {
             oracle,
             identity,
             cell,
-            publisher,
         }
     }
 }
 
-impl<O, I, C> PartitionBackend<O, I, C> {
-    /// Bundles backend parts without publication.
-    #[cfg(test)]
-    #[must_use]
-    pub fn new(oracle: O, identity: I, cell: C) -> Self {
-        Self::with_publisher(oracle, identity, cell, None)
-    }
-}
-
-impl<O, I, C, P> StateBackend for PartitionBackend<O, I, C, P>
+impl<O, I, C> StateBackend for PartitionBackend<O, I, C>
 where
     O: CommitOracle,
     I: DescriptorIdentityStore + Clone,
     C: CellStore,
-    P: FirstWriteBarrier,
 {
     type Cell = C;
     type Identity = I;
     type Oracle = O;
-    type Publisher = P;
 
     fn oracle(&self) -> O {
         self.oracle.clone()
@@ -126,10 +105,6 @@ where
 
     fn cell(&self) -> C {
         self.cell.clone()
-    }
-
-    fn publisher(&self) -> Option<P> {
-        self.publisher.clone()
     }
 }
 
@@ -209,7 +184,7 @@ where
     I: DescriptorIdentityStore + Clone,
     O: CommitOracle,
 {
-    type Backend = PartitionBackend<O, I, S, NoPublisher>;
+    type Backend = PartitionBackend<O, I, S>;
     type Error = Infallible;
 
     fn for_partition(

@@ -1,4 +1,4 @@
-//! The central settlement property + the protocol pins it cannot observe.
+//! The central settlement property + the protocol tests it cannot observe.
 //!
 //! [`prop_value_lifecycle_equivalence`] drives a random sequence of events —
 //! each a short op list (set / clear / section-clear / mid-handler
@@ -33,16 +33,16 @@
 //! bypasses) and the committed projection equal the model — so a failed
 //! event's buffered write can neither linger nor be read as uncommitted.
 //!
-//! The surviving examples pin what the single-collection value trace cannot
+//! The surviving examples test what the single-collection value trace cannot
 //! observe: the `commit()`/`rollback()` drains are collection-scoped (sibling
 //! isolation, zero durable writes on rollback); a terminated session's
 //! rollback is a `NoOp` so a stale clone cannot drain a later same-key
 //! event's buffer; a mid-stage failure leaves the buffer whole for an
 //! idempotent retry; a retry re-finalize rebuilds the same event's marker; an
-//! own-event read leaves its in-flight marker standing; and the clears-only
-//! stage boundary resolves a seeded foreign marker. (The settle boundary's
-//! own marker-record ordering and exactly-once pins live in
-//! `consumer::middleware::tests` and the defer/retry pin suites, where the
+//! own-event read leaves its in-flight marker unsettled; and the clears-only
+//! stage boundary resolves a seeded prior event marker. (The settle boundary's
+//! own marker-record ordering and exactly-once tests live in
+//! `consumer::middleware::tests` and the defer/retry test suites, where the
 //! real boundary is driven.)
 
 use super::sealed::{ApplyOutcome, StagedState, StateLifecycle};
@@ -180,7 +180,6 @@ impl Fixture {
             recovery_delay: CompactDuration::new(30),
             armed: self.armed.clone(),
             termination: TerminationWatch::new(self.shutdown_rx.clone(), self.cancel_rx.clone()),
-            publisher: None,
         }))
     }
 
@@ -205,7 +204,6 @@ impl Fixture {
             recovery_delay: CompactDuration::new(30),
             armed: self.armed.clone(),
             termination: TerminationWatch::new(self.shutdown_rx.clone(), cancel_rx),
-            publisher: None,
         }))
     }
 
@@ -299,7 +297,6 @@ async fn staged_fire_delay(
         recovery_delay: CompactDuration::new(floor_secs),
         armed: Arc::default(),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-        publisher: None,
     });
     for name in &names {
         session
@@ -471,7 +468,7 @@ async fn rollback_restores_the_commit_floor_without_durable_writes() -> Result<(
         Some(Bytes::from_static(b"V")),
     );
     assert!(fx.cells.provisional_coordinates(&cart_id).is_empty());
-    assert!(fx.cells.standing_marker_of(&cart_id).is_none());
+    assert!(fx.cells.unsettled_marker_of(&cart_id).is_none());
 
     // Sibling isolation: the rollback drained only cart; wishlist stands.
     let touched = fx.dirty.touched(&fx.state_key.key);
@@ -554,7 +551,7 @@ enum ValueOp {
     Set(u8),
     Clear,
     /// The section-clear marker leg: buffers a dirty clear of the value's
-    /// section, so the stage carries a clears-bearing durable marker — a lone
+    /// section, so the stage carries a durable marker with clears — a lone
     /// `ClearSection` produces a clears-only stage with an empty write set.
     ClearSection,
     /// The mid-handler write-through: everything buffered so far becomes
@@ -680,7 +677,7 @@ enum Floor {
 }
 
 impl Floor {
-    /// The durable value this floor pins, or `pre_event` when no `commit()`
+    /// The durable value this floor tests, or `pre_event` when no `commit()`
     /// landed this event.
     fn resolve(&self, pre_event: Option<Bytes>) -> Option<Bytes> {
         match self {
@@ -798,7 +795,7 @@ fn finalize_matches_model(
                 return Some("the single-collection trace staged more than one record");
             };
             let expected = EventMarker::frozen(event, &collection.writes, &collection.clears);
-            (fx.cells.standing_marker_of(&fx.value_id()) != Some(expected))
+            (fx.cells.unsettled_marker_of(&fx.value_id()) != Some(expected))
                 .then_some("the receipt's frozen records diverge from the durable event marker")
         }
     }
@@ -829,8 +826,8 @@ async fn checked_finalize(
 /// healthy promote must fully resolve — and leave no residue, checked raw
 /// before the loop-tail resolving reads heal a skipped settle to identical
 /// bytes and mask it. A stage overwrites any marker a prior
-/// Reset/Failed/Incomplete-promote event left standing (a clear-free marker
-/// stands, cells healed, until the next stage; a clears-bearing one is
+/// Reset/Failed/Incomplete-promote event left unsettled (a clear-free marker
+/// stands, cells healed, until the next stage; a marker with clears is
 /// resolved by its own event's loop-tail read window), so the residue check is
 /// exact on the healthy arm — and only there: those outcomes leave residue by
 /// design. A poisoned promote must report `Incomplete`, leaving the stranded
@@ -937,7 +934,7 @@ async fn run(trace: Trace) -> Result<()> {
                     let finalized =
                         checked_finalize(&fx, &session, event, ev_model.buffered).await?;
                     // Dropping the receipt leaves any provisional written by
-                    // `finalize` standing, projecting its `prev` (the
+                    // `finalize` unsettled, projecting its `prev` (the
                     // `commit()`-landed snapshot, or the unchanged committed
                     // base) — exactly the discarded-stage behavior the
                     // attempt-boundary `discard_dirty` pairs with.
@@ -1058,15 +1055,15 @@ async fn failed_finalize_keeps_the_buffer_whole_for_retry() -> Result<()> {
     Ok(())
 }
 
-/// The clears-only stage runs the stage-boundary foreign-marker resolve: a
-/// standing **foreign** committed marker (seeded crash-style through a raw
+/// The clears-only stage runs the stage-boundary prior event-marker resolve: a
+/// prior event's unsettled committed marker (seeded crash-style through a raw
 /// store handle) is resolved — its cells settle per its verdict — rather than
 /// blind-deleted by the clears-only event's own settle, and the session's own
-/// clears-bearing marker is written by `finalize` then deleted by the
+/// marker with clears is written by `finalize` then deleted by the
 /// receipt's `promote` (which also applies the clear's gap erase).
 ///
 /// The generated crash/reassignment alphabet (the crash-trace generator's
-/// clears dimension) subsumes this shape; these two pins are kept as the fast,
+/// clears dimension) subsumes this shape; these two tests are kept as the fast,
 /// deterministic falsifiers for the clears-only boundary arm, mirroring the
 /// `boundary_resolve_pin` role in the `state::tests` crash-equivalence suite.
 async fn clears_only_session_boundary(a_committed: bool) -> Result<()> {
@@ -1106,14 +1103,14 @@ async fn clears_only_session_boundary(a_committed: bool) -> Result<()> {
         bail!("the clears-only event must stage");
     };
 
-    // Raw probes BEFORE any resolving read: the boundary resolved A's marker
+    // Raw probes before any resolving read: the boundary resolved A's marker
     // (nothing of A stays provisional; A's cells settled per its verdict) and
-    // B's clears-bearing marker replaced it.
-    let standing = fx
+    // B's marker with clears replaced it.
+    let unsettled = fx
         .cells
-        .standing_marker_of(&id)
+        .unsettled_marker_of(&id)
         .ok_or_else(|| eyre!("B's clears-only marker must stand after the stage"))?;
-    assert_eq!(standing.event(), b, "B's marker replaced A's");
+    assert_eq!(unsettled.event(), b, "B's marker replaced A's");
     assert!(
         fx.cells.provisional_coordinates(&id).is_empty(),
         "the boundary resolved all of A's cells; B staged nothing"
@@ -1130,8 +1127,8 @@ async fn clears_only_session_boundary(a_committed: bool) -> Result<()> {
     fx.oracle.record_message(b_dedup).await?;
     assert_eq!(staged.certify().promote().await, ApplyOutcome::Resolved);
     assert!(
-        fx.cells.standing_marker_of(&id).is_none(),
-        "the settle deleted B's clears-bearing marker"
+        fx.cells.unsettled_marker_of(&id).is_none(),
+        "the settle deleted B's marker with clears"
     );
     assert!(
         fx.cells.stored_coordinates(&id).is_empty(),
@@ -1140,13 +1137,13 @@ async fn clears_only_session_boundary(a_committed: bool) -> Result<()> {
     Ok(())
 }
 
-/// Clears-only session boundary resolve when the foreign event committed.
+/// Clears-only session boundary resolve when the prior event committed.
 #[tokio::test]
 async fn clears_only_session_boundary_resolves_committed_foreign_marker() -> Result<()> {
     clears_only_session_boundary(true).await
 }
 
-/// Clears-only session boundary resolve when the foreign event aborted.
+/// Clears-only session boundary resolve when the prior event aborted.
 #[tokio::test]
 async fn clears_only_session_boundary_resolves_aborted_foreign_marker() -> Result<()> {
     clears_only_session_boundary(false).await
@@ -1154,7 +1151,7 @@ async fn clears_only_session_boundary_resolves_aborted_foreign_marker() -> Resul
 
 /// A retry attempt re-runs `finalize`: the second stage **rebuilds** the same
 /// event's durable marker from its own staged set — never keeps the first
-/// attempt's frozen payload, never resolves it as foreign — the settle
+/// attempt's frozen payload, never resolves it as prior event — the settle
 /// converges to the retried values, and no event marker stands afterwards.
 /// The two attempts stage *different* cell sets so a kept (stale) marker is
 /// observable: recovery resolves exactly the coordinates the marker lists, so
@@ -1202,13 +1199,13 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
         bail!("the retry re-stage must mint a receipt");
     };
 
-    // The standing durable marker is the retry's, rebuilt whole: same event,
+    // The unsettled durable marker is the retry's, rebuilt whole: same event,
     // and its frozen coordinate list is attempt two's staged set — not
     // attempt one's single cell.
     let marker = fx
         .cells
-        .standing_marker_of(&fx.value_id())
-        .ok_or_else(|| eyre!("no standing marker after the re-stage"))?;
+        .unsettled_marker_of(&fx.value_id())
+        .ok_or_else(|| eyre!("no unsettled marker after the re-stage"))?;
     assert_eq!(marker.event(), event, "the marker stays the same event's");
     assert_eq!(
         marker.staged(),
@@ -1236,22 +1233,15 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
         "the retry's extra cell commits with the rest of its stage"
     );
     assert!(
-        fx.cells.standing_marker_of(&fx.value_id()).is_none(),
+        fx.cells.unsettled_marker_of(&fx.value_id()).is_none(),
         "the settle deleted the single (overwritten) event marker"
     );
     Ok(())
 }
 
-/// The own-event read-window guard: the staging event's own reads between stage
-/// and settle must NOT resolve their own in-flight event marker
-/// (`help_read_window`'s `marker.event() == own` disjunct). Resolving it would
-/// settle the event mid-flight — the reachable shape is a retry attempt reading
-/// its own predecessor attempt's still-standing clears-bearing marker. This is
-/// an example because the value-projection lifecycle property is structurally
-/// blind to it: a mid-flight self-resolution rolls the uncommitted stage back
-/// and the retry re-stages the same values, so the committed projection still
-/// converges — only the marker's standing state, observed here at the read
-/// path, exposes the premature settle.
+/// Proves that an event cannot resolve its own marker during a read.
+///
+/// Early resolution would settle the event before its handler completes.
 #[tokio::test]
 async fn own_event_read_does_not_resolve_its_own_marker() -> Result<()> {
     let fx = Fixture::new()?;
@@ -1259,7 +1249,7 @@ async fn own_event_read_does_not_resolve_its_own_marker() -> Result<()> {
     let id = fx.value_id();
     let collection = CollectionRef::new(id.clone(), None);
 
-    // Stage event E's clears-bearing marker directly (one survivor cell in the
+    // Stage event E's marker with clears directly (one survivor cell in the
     // cleared section) and leave E unrecorded — in-flight, uncommitted.
     let (e, _e_dedup) = message(1);
     let writes = [(
@@ -1271,16 +1261,14 @@ async fn own_event_read_does_not_resolve_its_own_marker() -> Result<()> {
     raw.write_provisional(&collection, &writes, Some(&marker))
         .await?;
 
-    // E's own read hits the standing marker with `own == E`: the guard keeps
-    // the marker standing (E must not settle itself mid-flight) and E's staged
-    // cell stays provisional.
+    // An event read must not settle its own marker.
     raw.get(&id, &cell_at(0), e).await?;
-    let standing = fx
+    let unsettled = fx
         .cells
-        .standing_marker_of(&id)
-        .ok_or_else(|| eyre!("an own-event read must leave the in-flight marker standing"))?;
+        .unsettled_marker_of(&id)
+        .ok_or_else(|| eyre!("an own-event read must leave the in-flight marker unsettled"))?;
     assert_eq!(
-        standing.event(),
+        unsettled.event(),
         e,
         "the own read left E's marker untouched"
     );
@@ -1290,25 +1278,25 @@ async fn own_event_read_does_not_resolve_its_own_marker() -> Result<()> {
     );
 
     // Contrast — the resolve path is reachable, so the guard (not an inert
-    // resolve) is what protects the own read: a *foreign* read of the same
+    // resolve) is what protects the own read: a *prior event* read of the same
     // uncommitted marker resolves it (verdict: not committed → rolled back, the
     // marker deleted).
     raw.get(&id, &cell_at(0), probe(999)).await?;
     assert!(
-        fx.cells.standing_marker_of(&id).is_none(),
-        "a foreign read resolves the uncommitted marker away",
+        fx.cells.unsettled_marker_of(&id).is_none(),
+        "a prior event read resolves the uncommitted marker away",
     );
     Ok(())
 }
 
-// ---- Batched read-committed staging: query-count + prev-pairing pins ----
+// ---- Batched read-committed staging: query-count + prev-pairing tests ----
 //
-// These pin the batch-read staging change: a `ReadCommitted` stage reads its
+// These test the batch-read staging change: a `ReadCommitted` stage reads its
 // survivors' committed bases through one `get_many` per section chunk (never a
 // point read per cell), and each chunk's bases pair with EXACTLY the dirty
 // records that produced it. The query-count property derives its expected batch
 // count from the stage's dirty *input* (independent of the code under test);
-// the pairing pins seed distinct per-cell bases and abort, so a reversed
+// the pairing tests seed distinct per-cell bases and abort, so a reversed
 // pairing diverges.
 
 /// The counting cell store the query-count fixture mints: a
@@ -1389,7 +1377,6 @@ impl CountingFixture {
             recovery_delay: CompactDuration::new(30),
             armed: Arc::default(),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-            publisher: None,
         });
         let id = CollectionId::new(
             state_key.clone(),
@@ -1442,8 +1429,8 @@ impl CountingFixture {
         Ok(())
     }
 
-    /// The committed value of `cell`, read through a foreign probe so the read
-    /// resolves raw committed truth.
+    /// The committed value of `cell`, read through a prior event probe so the
+    /// read resolves raw committed truth.
     async fn committed(&self, cell: &CellKey) -> Result<Option<Bytes>> {
         Ok(self
             .counting
@@ -1741,7 +1728,7 @@ async fn stage_query_count_splits_per_section() -> Result<()> {
 
 /// A stage with no surviving cells builds no batch and issues no read: a
 /// section clear followed by a clear of one of its cells leaves only a
-/// `Cleared` cell subsumed by the standing section marker. The clears-only
+/// `Cleared` cell subsumed by the unsettled section marker. The clears-only
 /// stage still writes its marker (a separate counter), but reads nothing.
 #[tokio::test]
 async fn stage_clears_only_issues_no_read() -> Result<()> {
@@ -1832,7 +1819,7 @@ enum MultiOutcome {
     /// Stage then roll back — the committed projection is unchanged.
     Abort,
     /// Drop the receipt, discard the dirty buffer, then re-apply and commit —
-    /// the retry re-stages over its own standing provisional cells' base.
+    /// the retry re-stages over its own unsettled provisional cells' base.
     Retry,
 }
 
@@ -1892,7 +1879,7 @@ impl Arbitrary for MultiTrace {
 }
 
 /// A staging op with its byte resolved to a trace-unique value, so every cell
-/// with a standing committed base has a DISTINCT base — the condition that
+/// with an unsettled committed base has a DISTINCT base — the condition that
 /// makes a reversed base pairing observable.
 #[derive(Clone, Debug)]
 enum ConcreteOp {

@@ -127,6 +127,7 @@ fn provider_with(
     StateManagerProvider::new(
         SharedStateBackend::new(cell, MemoryDescriptorIdentityStore::new(), oracle),
         MemoryLoader::new(),
+        NoPublisher,
         registry,
         Arc::from("test-group"),
         CompactDuration::new(30),
@@ -143,6 +144,7 @@ fn poison_provider(cell: PoisonCell, registry: Arc<CollectionDefRegistry>) -> Po
             FixedOracle::committed(),
         ),
         MemoryLoader::new(),
+        NoPublisher,
         registry,
         Arc::from("test-group"),
         CompactDuration::new(30),

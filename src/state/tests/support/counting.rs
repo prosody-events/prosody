@@ -15,7 +15,7 @@ struct OpCounts {
     mark_resolved: AtomicUsize,
     commit_provisional: AtomicUsize,
     abort_provisional: AtomicUsize,
-    standing_marker: AtomicUsize,
+    unsettled_marker: AtomicUsize,
     get: AtomicUsize,
     get_many: AtomicUsize,
     get_many_for_cache: AtomicUsize,
@@ -45,7 +45,7 @@ impl<S> CountingCellStore<S> {
     }
 
     pub(crate) fn marker_reads(&self) -> usize {
-        self.counts.standing_marker.load(Ordering::Relaxed)
+        self.counts.unsettled_marker.load(Ordering::Relaxed)
     }
 
     pub(crate) fn lower_reads(&self) -> usize {
@@ -102,7 +102,7 @@ impl<S> CountingCellStore<S> {
         self.counts.mark_resolved.store(0, Ordering::Relaxed);
         self.counts.commit_provisional.store(0, Ordering::Relaxed);
         self.counts.abort_provisional.store(0, Ordering::Relaxed);
-        self.counts.standing_marker.store(0, Ordering::Relaxed);
+        self.counts.unsettled_marker.store(0, Ordering::Relaxed);
         self.counts.get.store(0, Ordering::Relaxed);
         self.counts.get_many.store(0, Ordering::Relaxed);
         self.counts.get_many_for_cache.store(0, Ordering::Relaxed);
@@ -253,12 +253,12 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
         self.inner.mark_resolved(collection, cells).await
     }
 
-    async fn standing_marker<'a>(
+    async fn unsettled_marker<'a>(
         &'a self,
         collection: &'a CollectionId,
     ) -> Result<Option<EventMarker>, Self::Error> {
-        self.counts.standing_marker.fetch_add(1, Ordering::Relaxed);
-        self.inner.standing_marker(collection).await
+        self.counts.unsettled_marker.fetch_add(1, Ordering::Relaxed);
+        self.inner.unsettled_marker(collection).await
     }
 
     async fn commit_provisional<'a>(

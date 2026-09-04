@@ -11,11 +11,14 @@ use opentelemetry_otlp::{
     ExporterBuildError, MetricExporter, Protocol, SpanExporter, WithExportConfig,
 };
 use opentelemetry_sdk::error::OTelSdkError;
-use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::metrics::{
+    Aggregation, Instrument, InstrumentKind, PeriodicReader, SdkMeterProvider, Stream,
+};
 use opentelemetry_sdk::trace::{SdkTracerProvider, Tracer};
 use std::env;
 use std::sync::OnceLock;
 use thiserror::Error;
+use tracing::error;
 use tracing::level_filters::LevelFilter;
 use tracing::subscriber::{SetGlobalDefaultError, set_global_default};
 use tracing_opentelemetry::OpenTelemetryLayer;
@@ -109,11 +112,14 @@ where
     #[allow(clippy::print_stderr, reason = "tracing is not initialized yet")]
     let meter_provider = match build_metric_exporter() {
         Ok(exporter) => SdkMeterProvider::builder()
+            .with_view(exponential_histograms)
             .with_reader(PeriodicReader::builder(exporter).build())
             .build(),
         Err(e) => {
             eprintln!("failed to initialize OpenTelemetry OTLP metric exporter: {e}");
-            SdkMeterProvider::builder().build()
+            SdkMeterProvider::builder()
+                .with_view(exponential_histograms)
+                .build()
         }
     };
     set_meter_provider(meter_provider.clone());
@@ -128,6 +134,29 @@ where
         .map_err(|_| TracingError::AlreadyInitialized)?;
 
     Ok(())
+}
+
+/// Selects base-2 exponential aggregation for all Prosody histograms.
+pub(crate) fn exponential_histograms(instrument: &Instrument) -> Option<Stream> {
+    if instrument.kind() != InstrumentKind::Histogram || !instrument.name().starts_with("prosody.")
+    {
+        return None;
+    }
+
+    match Stream::builder()
+        .with_aggregation(Aggregation::Base2ExponentialHistogram {
+            max_size: 160,
+            max_scale: 20,
+            record_min_max: false,
+        })
+        .build()
+    {
+        Ok(stream) => Some(stream),
+        Err(error) => {
+            error!(%error, "failed to configure a Prosody exponential histogram");
+            None
+        }
+    }
 }
 
 /// Exports all buffered telemetry (spans and metrics) without tearing the

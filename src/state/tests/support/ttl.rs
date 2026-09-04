@@ -116,7 +116,7 @@ impl CellStore for TtlStub {
         ready(Ok(()))
     }
 
-    fn standing_marker<'a>(
+    fn unsettled_marker<'a>(
         &'a self,
         _collection: &'a CollectionId,
     ) -> impl Future<Output = Result<Option<EventMarker>, Self::Error>> + Send + 'a {
