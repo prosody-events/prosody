@@ -16,10 +16,10 @@ use color_eyre::eyre::ensure;
 use std::collections::BTreeMap;
 
 /// How many requests this process waits for answers to.
-const PENDING: &str = "prosody.requests.pending";
+const PENDING: &str = "prosody.request.pending";
 
 /// How long one request waited, by how complete its answers were.
-const LATENCY: &str = "prosody.request.latency";
+const LATENCY: &str = "prosody.request.duration";
 
 /// The subsystem the registered request awaits.
 const SUBSYSTEM: &str = "billing";
@@ -60,7 +60,7 @@ async fn an_unanswered_call_records_its_wait_as_answered_by_nobody() -> Result<(
     let metrics = GlobalMetrics::install();
     unanswered_call_with_registry(PendingRegistry::with_metrics(metrics.metrics())).await?;
     ensure!(
-        metrics.points(LATENCY)? == vec![(label("outcome", "none"), 1)],
+        metrics.points(LATENCY)? == vec![(label("prosody.request.outcome", "none"), 1)],
         "the call must record one wait under the answers it got: {:?}",
         metrics.points(LATENCY)?
     );

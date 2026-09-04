@@ -76,7 +76,8 @@ aspirations — perform each one; do not merely agree with it:
   state: fjall (RAM = block cache + memtables; data spills to the
   assignment-scoped disk workspace) and a capacity-bounded `quick_cache`. An
   insert-only `scc` map/set keyed by key or collection is a defect regardless
-  of entry size (the `MarkerMemo.checked` bug class). Every in-memory map
+  of entry size. The former in-RAM `MarkerMemo` checked set was this bug;
+  `MarkerCheckSet` is its disk-backed fix. Every in-memory map
   names its removal path; self-draining maps (removed on settle/fire) are
   fine but still need the drain named.
 
@@ -416,7 +417,8 @@ all is a pure function of the stack's final result: the crate-internal
 `Settlement` classification (`SettlementHandler::settlement`, one explicit
 impl per framework wrapper, the leaf adapter minted at `into_provider`
 hardcoding `Final`) decides `Final`, `Duplicate`, or `Bypassed` before it checks
-the error category. The message commit marker comes from the session's event identity
+the error category. The message commit marker comes from the session's event
+identity
 (`message_marker()` — the message `EventRef`'s dedup id, or the
 deferred-reload's last-wins identity override), never deposited by middleware.
 The sweep posture uses stage → marker-record → receipt → promote → retire.
@@ -428,7 +430,7 @@ you change the sequence. The anchors code comments cite by name:
   incomplete promotions, duplicate sweep failures, and permanent stage
   failures use `arm_backstop`. It retries every non-shutdown failure.
 - **Finding F2:** the boundary never unschedules a backstop. Only its fired
-  recovery sweep clears the standing marker. A redelivery sweep clears none.
+  recovery sweep clears the standing backstop. A redelivery sweep clears none.
   Arm-if-sooner prevents one event from loosening another event's backstop.
 - **Posture:** retry transient AND terminal store failures forever; skip only
   permanent data-rejections; abort only on shutdown; never emit Terminal.

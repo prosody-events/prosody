@@ -79,10 +79,9 @@ enum IndexKind {
     Coord = 0x00,
     /// The one-time cold-seed latch: key `[hash][Seeded]`, empty value.
     Seeded = 0x01,
-    /// The marker-presence latch: key `[hash][Presence]`, empty value.
-    /// Presence ⟺ the collection's durable event marker has been consulted this
-    /// assignment — the bounded, disk-backed half of the bottom store's marker
-    /// memo (see [`MarkerPresence`](super::MarkerPresence)).
+    /// Records a completed durable marker check.
+    ///
+    /// The key is `[hash][Presence]`. The value is empty.
     Presence = 0x03,
 }
 
@@ -219,12 +218,9 @@ pub(super) fn index_seeded_key(id: &CollectionId) -> [u8; COLLECTION_PREFIX_LEN 
     index_family_head(id, IndexKind::Seeded)
 }
 
-/// The warm-index key for a collection's marker-presence latch:
-/// `[hash][Presence]`. Presence ⟺ the collection's durable event marker has
-/// been consulted this assignment (see
-/// [`MarkerPresence`](super::MarkerPresence)).
+/// Returns the key for a completed durable marker check.
 #[must_use]
-pub(super) fn index_presence_key(id: &CollectionId) -> [u8; COLLECTION_PREFIX_LEN + 1] {
+pub(super) fn marker_check_key(id: &CollectionId) -> [u8; COLLECTION_PREFIX_LEN + 1] {
     index_family_head(id, IndexKind::Presence)
 }
 

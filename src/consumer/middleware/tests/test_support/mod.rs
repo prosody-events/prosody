@@ -180,7 +180,6 @@ pub async fn buffered_with(
         recovery_delay: CompactDuration::new(30),
         armed,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
-        publisher: None,
     });
     let context = configure(MockEventContext::new().with_session(session));
     let handle = context

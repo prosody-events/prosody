@@ -1,6 +1,6 @@
 mod metrics;
 
-pub(crate) use self::metrics::{GlobalMetrics, assert_distinct_labels, label};
+pub(crate) use self::metrics::{GlobalMetrics, assert_distinct_labels, label, labels};
 use crate::cassandra::CassandraConfiguration;
 use crate::otel::SpanRelation;
 use color_eyre::Result;

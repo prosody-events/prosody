@@ -11,12 +11,10 @@
 //! recovery sweep resolves provisional cells through the *same* cell store and
 //! oracle.
 //!
-//! Acquisition is **eager**: descriptor identities are validated against the
-//! group-global identity table before the manager exists, so no session can
-//! operate under an unvalidated identity. The validation is hoisted to a
-//! process-level latch (the identity table is group-global, so it runs once,
-//! not per partition). The partition loop retries failed acquisitions until
-//! shutdown, the same pattern as timer-manager initialization.
+//! Acquisition is **eager**. Descriptor identities validate against the
+//! group-global identity table. The publication owner then replaces routing
+//! rows. The manager exists only after both operations succeed. The partition
+//! loop retries failed acquisitions until shutdown.
 //!
 //! State is **always wired** — there is no no-state mode. The manager is
 //! Kafka-agnostic: it mints a session for an already-resolved [`EventRef`],
@@ -35,6 +33,7 @@ use crate::state::descriptor_identity::{
 };
 use crate::state::dirty::DirtyStore;
 use crate::state::oracle::CommitOracle;
+use crate::state::publisher::{AssignmentPublisher, NoPublisher};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{ResolveCellError, sweep_provisional};
 use crate::state::session::{EventSession, KeyedStateSession, SessionParts, TerminationWatch};
@@ -306,10 +305,6 @@ where
     /// the sweep fires. Semantics of an absent key are owned by [`ArmedKeys`]:
     /// unknown, not unarmed.
     armed: ArmedKeys,
-    /// The first-write publisher bound to this partition's topic, or `None`
-    /// when nothing is published. Cloned into every session this manager
-    /// creates.
-    publisher: Option<B::Publisher>,
 }
 
 /// The real per-partition state manager: owns the partition-lifetime cell
@@ -358,7 +353,6 @@ where
             recovery_delay: self.inner.recovery_delay,
             armed: self.inner.armed.clone(),
             termination,
-            publisher: self.inner.publisher.clone(),
         }))
     }
 
@@ -518,12 +512,13 @@ where
 }
 
 /// Process-wide [`PartitionStateProvider`] over a
-/// `StateBackendFactory`: acquisition mints the partition's backend and
-/// eagerly validates descriptor identities.
+/// `StateBackendFactory`: acquisition publishes routing and validates
+/// descriptor identities before it mints the manager.
 #[derive(Clone)]
-pub struct StateManagerProvider<F, L> {
+pub struct StateManagerProvider<F, L, P = NoPublisher> {
     backend: F,
     loader: L,
+    publisher: P,
     registry: Arc<CollectionDefRegistry>,
     consumer_group: Arc<str>,
     recovery_delay: CompactDuration,
@@ -536,8 +531,11 @@ pub struct StateManagerProvider<F, L> {
     validated: Arc<OnceCell<()>>,
 }
 
-impl<F, L> StateManagerProvider<F, L> {
+impl<F, L, P> StateManagerProvider<F, L, P> {
     /// Creates the provider.
+    ///
+    /// `publisher` uses the assignment that this provider receives. It does
+    /// not observe Kafka or track assignments itself.
     ///
     /// `consumer_group` derives the partition's segment id for **state-cell
     /// identity** via the crate-internal
@@ -556,6 +554,7 @@ impl<F, L> StateManagerProvider<F, L> {
     pub(crate) fn new(
         backend: F,
         loader: L,
+        publisher: P,
         registry: Arc<CollectionDefRegistry>,
         consumer_group: Arc<str>,
         recovery_delay: CompactDuration,
@@ -563,6 +562,7 @@ impl<F, L> StateManagerProvider<F, L> {
         Self {
             backend,
             loader,
+            publisher,
             registry,
             consumer_group,
             recovery_delay,
@@ -571,13 +571,14 @@ impl<F, L> StateManagerProvider<F, L> {
     }
 }
 
-impl<F, L, T> PartitionStateProvider<T> for StateManagerProvider<F, L>
+impl<F, L, P, T> PartitionStateProvider<T> for StateManagerProvider<F, L, P>
 where
     F: StateBackendFactory<T>,
     L: Clone + Send + Sync + 'static,
+    P: AssignmentPublisher,
     T: Send,
 {
-    type AcquireError = StateAcquireError<F::Error, IdentityErr<F::Backend>>;
+    type AcquireError = StateAcquireError<F::Error, IdentityErr<F::Backend>, P::Error>;
     type Manager = StateManager<F::Backend, L>;
 
     async fn acquire(
@@ -606,6 +607,10 @@ where
             })
             .await
             .map_err(StateAcquireError::Identity)?;
+        self.publisher
+            .publish_if_owner(topic, partition)
+            .await
+            .map_err(StateAcquireError::Publication)?;
         Ok(StateManager {
             inner: Arc::new(StateManagerInner {
                 cell: backend.cell(),
@@ -616,7 +621,6 @@ where
                 segment_id,
                 recovery_delay: self.recovery_delay,
                 armed: Arc::default(),
-                publisher: backend.publisher(),
             }),
         })
     }
@@ -673,11 +677,16 @@ where
 /// Error raised when a [`StateManagerProvider`] cannot acquire a
 /// partition's manager.
 #[derive(Debug, Error)]
-pub enum StateAcquireError<FactoryErr, StoreErr>
+pub enum StateAcquireError<FactoryErr, StoreErr, PublicationErr>
 where
     FactoryErr: ClassifyError + Error + Send + Sync + 'static,
     StoreErr: ClassifyError + Error + Send + Sync + 'static,
+    PublicationErr: ClassifyError + Error + Send + Sync + 'static,
 {
+    /// Routing-set publication failed on its owning assignment.
+    #[error("keyed-state publication failed at partition acquisition")]
+    Publication(#[source] PublicationErr),
+
     /// The backend factory failed to mint the partition's backend.
     #[error("keyed-state backend factory failed at partition acquisition")]
     Factory(#[source] FactoryErr),
@@ -690,13 +699,16 @@ where
     Identity(#[source] DescriptorIdentityError<StoreErr>),
 }
 
-impl<FactoryErr, StoreErr> ClassifyError for StateAcquireError<FactoryErr, StoreErr>
+impl<FactoryErr, StoreErr, PublicationErr> ClassifyError
+    for StateAcquireError<FactoryErr, StoreErr, PublicationErr>
 where
     FactoryErr: ClassifyError + Error + Send + Sync + 'static,
     StoreErr: ClassifyError + Error + Send + Sync + 'static,
+    PublicationErr: ClassifyError + Error + Send + Sync + 'static,
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {
+            Self::Publication(e) => e.classify_error(),
             Self::Factory(e) => e.classify_error(),
             Self::Identity(e) => e.classify_error(),
         }

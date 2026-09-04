@@ -40,7 +40,7 @@ use std::fmt;
 use std::future::{Future, ready};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
@@ -52,7 +52,7 @@ mod ttl;
 
 pub(crate) use counting::{CountingCellStore, CountingResolver, ResolveCounter};
 pub(crate) use holding::{HoldingCellStore, Holds};
-pub(crate) use publication::{ParkedRead, PublicationCall, ScriptedPublicationStore};
+pub(crate) use publication::{ParkedRead, ScriptedPublicationStore};
 pub(crate) use ttl::TtlStub;
 
 /// Get-out-of-the-way commit oracle: `record_message` is a no-op and every
@@ -91,7 +91,7 @@ impl CommitOracle for FixedOracle {
     }
 }
 
-/// A commit oracle counting every `resolve` consult — the no-oracle pins'
+/// A commit oracle counting every `resolve` consult — the no-oracle tests'
 /// probe: a verb that must never resolve leaves the counter at zero.
 /// `record_message` is a no-op; `resolve` bumps and returns a fixed
 /// `NotCommitted`.
@@ -378,11 +378,6 @@ where
     }
 
     async fn mark_backstop_armed(&self, _fire: CompactDateTime) {}
-
-    fn publish_first_writes(&self) -> impl Future<Output = Result<(), StateAccessError>> + Send {
-        // Inert session: nothing is published.
-        ready(Ok(()))
-    }
 }
 
 impl<P> MarkerIdentity for UnavailableState<P>
@@ -454,7 +449,7 @@ pub(crate) fn probe(n: u128) -> EventRef {
 }
 
 /// Asserts an explicit settle (promote, rollback, or sweep) left nothing
-/// behind for `id`: no provisional cell and no standing event marker, read
+/// behind for `id`: no provisional cell and no unsettled event marker, read
 /// **raw** from the durable maps. A resolving read cannot make this check —
 /// it heals a still-provisional cell to the same bytes a correct settle
 /// writes, so a skipped settle reads back identically. The marker leg is
@@ -462,15 +457,15 @@ pub(crate) fn probe(n: u128) -> EventRef {
 /// there the stranded marker is the only raw evidence of a skipped settle.
 ///
 /// Call only where the harness guarantees the collection is fully settled;
-/// first-touch heals leave the marker standing by design, so an event that
+/// first-touch heals leave the marker unsettled by design, so an event that
 /// deliberately abandons its stage (reset, final-error) leaves residue a
 /// later resolving read absorbs — don't probe across such an event.
 pub(crate) fn assert_no_settlement_residue(cells: &MemoryCells, id: &CollectionId) -> Result<()> {
     if !cells.provisional_coordinates(id).is_empty() {
-        bail!("settlement left a provisional cell standing");
+        bail!("settlement left a provisional cell unsettled");
     }
-    if cells.standing_marker_of(id).is_some() {
-        bail!("settlement left an event marker standing");
+    if cells.unsettled_marker_of(id).is_some() {
+        bail!("settlement left an event marker unsettled");
     }
     Ok(())
 }

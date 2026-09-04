@@ -1,13 +1,28 @@
 //! Unit tests for consumer-build configuration cross-checks.
 
 use super::{
-    DEFAULT_STATISTICS_INTERVAL, MAX_STATISTICS_INTERVAL, MIN_RECOVERY_EVIDENCE_TTL_SECONDS,
-    RECOVERY_TTL_DELAY_MULTIPLIER, validate_recovery_ttl_margin, validate_statistics_interval,
+    ConsumerConfiguration, DEFAULT_STATISTICS_INTERVAL, MAX_STATISTICS_INTERVAL,
+    MIN_RECOVERY_EVIDENCE_TTL_SECONDS, RECOVERY_TTL_DELAY_MULTIPLIER, validate_recovery_ttl_margin,
+    validate_statistics_interval,
 };
 use crate::timers::duration::CompactDuration;
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
 use std::time::Duration;
+
+/// A reader needs Kafka coordinates, but it does not need a topic subscription.
+///
+/// Falsify: require one subscribed topic in [`ConsumerConfiguration`].
+#[test]
+fn consumer_configuration_allows_no_topic_subscription() {
+    let mut builder = ConsumerConfiguration::builder();
+    builder
+        .bootstrap_servers(vec!["kafka:9092".to_owned()])
+        .group_id("state-reader");
+
+    let config = builder.build();
+    assert!(matches!(config, Ok(config) if config.subscribed_topics.is_empty()));
+}
 
 /// The deduplication-TTL floor is `max(48 × recovery_delay, 1h)` (see
 /// [`validate_recovery_ttl_margin`]). Pins both arms of the `max` and the `≥`

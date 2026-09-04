@@ -4,34 +4,31 @@ use super::{
     Arc, BatchUnit, Bytes, CassandraCellStoreError, CassandraSession, CassandraStore, Cell,
     CellAddr, CellBatchRow, CellBlobs, CellKey, CellKind, CellQueries, CellStore, CellStoreError,
     CollectionDefRegistry, CollectionId, CollectionRef, CommitOracle, Coordinate, EventMarker,
-    EventRef, KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, MarkerPresence, Pk,
+    EventRef, KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, MarkerCheckSet, Pk,
     PreparedStatement, QueryRowsResult, ResolveCellError, ResolvedRow, Resolver, RowShape,
     SHARD_FANOUT_CONCURRENCY, Scan, Section, Session, Stream, TryStreamExt, blob_weight, encode,
     encode_marker_payload, fetch_and_decode_cell, fetch_cell_rows_result, fetch_cells_batch_result,
-    flatten_resolve, help_read_window, marker_delete_unit, marker_last_split, page_cells,
-    peek_read, pin_mut, resolve_marker, smallvec, try_stream,
+    flatten_resolve, marker_delete_unit, marker_last_split, page_cells, peek_read, pin_mut,
+    resolve_event_marker, resolve_prior_clear_before_read, smallvec, try_stream,
 };
 
 impl<O> CassandraStore<O> {
-    /// Creates a Cassandra cell store over an existing session, a prepared
-    /// [`CellQueries`] set, the commit oracle it resolves provisional cells
-    /// through, the registry that supplies per-collection TTLs, and the
-    /// per-assignment [`MarkerPresence`] latch minted from the partition's
-    /// fjall workspace.
+    /// Creates a Cassandra cell store for one partition assignment.
+    ///
+    /// The marker-check set must use the assignment cache workspace.
     #[must_use]
     pub(crate) fn new(
         session: CassandraSession,
         queries: Arc<CellQueries>,
         oracle: O,
         registry: Arc<CollectionDefRegistry>,
-        presence: MarkerPresence,
+        checks: MarkerCheckSet,
     ) -> Self {
         Self {
             session,
             queries,
             resolver: Resolver::new(oracle, registry),
-            memo: Arc::default(),
-            presence,
+            memo: Arc::new(super::MarkerMemo::new(checks)),
             #[cfg(test)]
             counters: Arc::default(),
         }
@@ -162,13 +159,10 @@ impl<O> CassandraStore<O> {
         })
     }
 
-    /// Mirrors a successful settle into the marker memo
-    /// ([`super::MarkerMemo`]'s standing map plus the presence latch): the
-    /// marker is now durably deleted, so the collection is known
-    /// marker-absent for the rest of the assignment.
-    pub(super) async fn settle_memo(&self, collection: &CollectionId) {
-        self.memo.standing.remove_async(collection).await;
-        self.presence.set(collection).await;
+    /// Records that durable state has no unsettled marker.
+    pub(super) async fn record_marker_settled(&self, collection: &CollectionId) {
+        self.memo.unsettled.remove_async(collection).await;
+        self.memo.checks.set(collection).await;
     }
 }
 
@@ -180,30 +174,27 @@ where
     /// resolve, the memo mirror, and the frozen payload's encoding. Returns
     /// the marker row's blob.
     ///
-    /// The boundary resolves any standing FOREIGN marker (a different event)
-    /// before overwriting it, establishing marker uniqueness per collection. A
-    /// same-event marker (a retry attempt re-running finalize, or the later
-    /// chunk of a split stage) is overwritten, never resolved. A resolution
-    /// failure fails the stage (retry middleware). The memo is updated BEFORE
-    /// the durable attempt (the over-report-safe direction — see the
-    /// [`super::MarkerMemo`] invariant).
+    /// Resolves a prior event marker before it stores the new marker.
+    ///
+    /// A marker for the same event can be replaced safely.
+    /// The function updates the memo before it writes durable state.
     pub(super) async fn stage_marker(
         &self,
         collection: &CollectionRef,
         marker: &EventMarker,
     ) -> Result<MarkerBlob, CellStoreError<O::Error>> {
-        if let Some(standing) = self.standing_marker(collection.id()).await?
-            && standing.event() != marker.event()
+        if let Some(unsettled) = self.unsettled_marker(collection.id()).await?
+            && unsettled.event() != marker.event()
         {
-            resolve_marker(self, self.resolver.oracle(), collection, &standing)
+            resolve_event_marker(self, self.resolver.oracle(), collection, &unsettled)
                 .await
                 .map_err(flatten_resolve)?;
         }
         self.memo
-            .standing
+            .unsettled
             .upsert_async(collection.id().clone(), marker.clone())
             .await;
-        self.presence.set(collection.id()).await;
+        self.memo.checks.set(collection.id()).await;
         let payload = encode_marker_payload(marker)
             .map_err(CassandraCellStoreError::from)
             .map_err(ResolveCellError::Store)?;
@@ -227,16 +218,19 @@ where
         let limit = scan.limit;
         let collection_ref = self.resolver.collection_ref(collection);
         try_stream! {
-            // Read-help once before the pager opens (`help_read_window`): a
-            // standing foreign clears-bearing marker is resolved so the scan
-            // pages post-clear truth. Memo-backed — no durable marker read
-            // after the seed read. The reader-only scan
-            // ([`CassandraCellResources::scan_committed`]) skips this: it
-            // observes `prev`, which is committed by construction.
-            let standing = self.standing_marker(collection).await?;
-            help_read_window(self, self.resolver.oracle(), &collection_ref, standing.as_ref(), own)
-                .await
-                .map_err(flatten_resolve)?;
+            // Resolve a prior event's section clear before the scan starts.
+            // The scan cannot return data that the clear removed.
+            let marker = self.unsettled_marker(collection).await?;
+            // The scan starts after this resolution, so a durable change needs no re-read.
+            let _ = resolve_prior_clear_before_read(
+                self,
+                self.resolver.oracle(),
+                &collection_ref,
+                marker.as_ref(),
+                own,
+            )
+            .await
+            .map_err(flatten_resolve)?;
             // The shared paging core (`page_cells`): it selects the per-bound
             // statement, decodes each row, and applies `past_end`. It applies
             // no resolution and no limit.
@@ -247,10 +241,10 @@ where
             // Deliberately sequential, not an oversight: the common `peek_read`
             // is a free no-op (own-event provisional / already-resolved cells
             // consult no oracle), so steady-state scans gain nothing from
-            // fan-out; the only payoff is mid-recovery across many foreign
+            // fan-out; the only payoff is mid-recovery across many prior event
             // provisional cells. And because `limit` counts *present* yields —
             // knowable only post-resolve — a buffered pipeline would resolve up
-            // to N−1 foreign-provisional cells past the boundary, each an extra
+            // to N−1 prior event-provisional cells past the boundary, each an extra
             // oracle read: a recovery-only win we won't pay for on a hot read
             // path. `peek_read` is read-only — it never writes a resolution
             // back durably (a scan write-back could clobber a newer `commit()`
@@ -275,7 +269,7 @@ where
 
     /// Issues a settle's `units` marker-LAST: appends the collection's marker
     /// delete, then runs one atomic batch when everything fits the budget, else
-    /// awaits the recovery prefix to completion BEFORE issuing the marker
+    /// awaits the recovery prefix to completion before issuing the marker
     /// alone. Owning the append, the split, and the ordered await here
     /// makes marker misplacement and await reversal unrepresentable at the
     /// call sites — the coupling [`marker_last_split`]'s positional index

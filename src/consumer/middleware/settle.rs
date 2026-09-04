@@ -1,7 +1,7 @@
 //! Owns keyed-state durability after the middleware stack returns.
 //!
-//! Sweep posture uses publish → stage → marker → receipt → promote → retire.
-//! Rerun posture uses publish → stage → arm → marker → commit → promote.
+//! Sweep posture uses stage → marker → receipt → promote → retire.
+//! Rerun posture uses stage → arm → marker → commit → promote.
 //!
 //! Both durability boundaries — the blanket [`EventHandler`] impl in the
 //! parent module and [`RetryHandler`](super::retry::RetryHandler) — route
@@ -203,31 +203,6 @@ pub(super) enum ArmOutcome {
 
     /// Shutdown intervened before the safety timer became durable.
     /// The caller keeps or aborts the redelivery source for another attempt.
-    ShuttingDown,
-}
-
-/// Outcome of the first-write publication barrier.
-///
-/// Publishing must succeed, for the same reason arming the backstop must
-/// (invariant 8). A `Published` collection's committed state is undiscoverable
-/// by a cross-group reader until its routing row exists. The row must precede
-/// the stage. [`publish_first_writes`] retries every non-shutdown failure
-/// forever, regardless of category, matching `arm_backstop`.
-///
-/// A dropped or misconfigured publication table surfaces
-/// `CassandraPublicationError::Database`, which classifies `Terminal` or
-/// `Transient`. The barrier retries it forever anyway, so a schema-level fault
-/// blocks dispatch until an operator repairs the schema. Blocking is
-/// deliberate: committing published state with no routing row to advertise it
-/// would leave that state permanently unreachable. The only non-`Published`
-/// outcome is a shutdown, which abandons before anything stages.
-enum PublishOutcome {
-    /// Every touched `Published` collection has a routing row (or there was
-    /// nothing to publish).
-    Published,
-
-    /// Shutdown intervened before publication completed. The caller abandons
-    /// before staging, so redelivery re-runs from clean state.
     ShuttingDown,
 }
 
@@ -448,19 +423,7 @@ async fn settle_committed<'a, T, C, G>(
         return;
     };
 
-    // 0. First-write publication barrier. A `Published` collection's routing
-    // row must exist before its committed state does, so publish before the
-    // stage. This must succeed: it retries until shutdown. A shutdown here
-    // abandons before anything stages, so the marker is untouched and
-    // redelivery re-runs from a clean state.
-    if let PublishOutcome::ShuttingDown = publish_first_writes(&context, lifecycle).await {
-        discard_uncommitted(Some(lifecycle));
-        drop(permit);
-        abandon(handler, context, guard, result).await;
-        return;
-    }
-
-    // 1. Stage provisional cells / write resolved, retrying transient
+    // 0. Stage provisional cells / write resolved, retrying transient
     // failures.
     let finalized =
         match retry_step(&context, "keyed-state finalize", || lifecycle.finalize()).await {
@@ -558,7 +521,6 @@ async fn settle_committed<'a, T, C, G>(
         }
     }
 
-    // 4. Clean commits need no split receipt.
     // 4. Apply the selected receipt and promotion order.
     let commit = match (prepared, redelivery) {
         (PreparedState::Clean, _) => {
@@ -675,33 +637,6 @@ async fn fire_apply_hook<T, C>(
         handler.after_commit(stamped, result).await;
     } else {
         handler.after_abort(stamped, result).await;
-    }
-}
-
-/// Runs the first-write publication barrier for every `Published` collection
-/// this event touched, retrying until it succeeds or shutdown intervenes.
-///
-/// Must-succeed (see [`PublishOutcome`]): every non-shutdown failure retries
-/// forever, so this never emits a `Terminal` and never abandons in normal
-/// operation. Called as settle step 0 — before any stage — so a published
-/// collection's committed state can never exist without its routing row. The
-/// barrier is idempotent and memoized, so retries and a prior `commit()`'s
-/// publication cost nothing.
-async fn publish_first_writes<C>(context: &C, lifecycle: &C::State) -> PublishOutcome
-where
-    C: EventContext,
-{
-    loop {
-        if context.is_shutdown() {
-            return PublishOutcome::ShuttingDown;
-        }
-        match lifecycle.publish_first_writes().await {
-            Ok(()) => return PublishOutcome::Published,
-            Err(error) => {
-                error!(error = %error, "keyed-state publication failed; retrying");
-                sleep(DURABILITY_RETRY_DELAY).await;
-            }
-        }
     }
 }
 

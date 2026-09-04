@@ -5,11 +5,8 @@
 //! event marker naming that event and the coordinates it staged, so recovery
 //! can resolve the whole stage as a unit — promote or roll back every listed
 //! cell — from a single point read rather than a scan over per-coordinate
-//! rows. [`EventMarker`] is what
-//! [`standing_marker`](super::store::CellStore::standing_marker) returns and
-//! the memory backend stores; this module also owns its frozen
-//! wire `encode_marker_payload`/`decode_marker_payload` codec — the payload
-//! the Cassandra marker row carries in its `data` column.
+//! rows. [`EventMarker`] represents this unsettled state.
+//! This module also encodes and decodes the Cassandra marker value.
 //!
 //! # Invariants
 //!
@@ -116,7 +113,7 @@ impl SectionClear {
     }
 }
 
-/// The standing event marker for one collection: the owning event, its full
+/// The unsettled event marker for one collection: the owning event, its full
 /// staged coordinate set, and each cleared section's frozen survivors.
 ///
 /// See the module docs for the invariants it carries. Constructed only inside
@@ -179,6 +176,21 @@ impl EventMarker {
     #[must_use]
     pub fn clears(&self) -> &[SectionClear] {
         &self.inner.clears
+    }
+
+    /// Reports whether the marker carries at least one section clear.
+    #[must_use]
+    pub(crate) fn has_clears(&self) -> bool {
+        !self.inner.clears.is_empty()
+    }
+
+    /// Reports whether the marker is another event's marker with a section
+    /// clear.
+    ///
+    /// A read by `own` must resolve such a marker before it reads.
+    #[must_use]
+    pub(crate) fn is_prior_clear(&self, own: EventRef) -> bool {
+        self.event() != own && self.has_clears()
     }
 }
 
