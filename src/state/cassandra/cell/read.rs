@@ -290,6 +290,7 @@ where
     // O(1) refcount bumps (`Coordinate` is `Bytes`), never byte copies.
     let start = scan.start.cloned();
     let end = scan.end.cloned();
+    let limit = scan.limit;
     try_stream! {
         let pk = Pk::of(collection);
         // The section-prefix bind values every scan statement shares.
@@ -301,26 +302,26 @@ where
         // pager must open inside each arm.
         let pager = match (dir, start.as_ref()) {
             (Direction::Forward, ScanEdge::Included(c)) => {
-                session.session().execute_iter(statements.forward_incl.clone(),
+                session.session().execute_iter(scan_statement(statements.forward_incl, limit),
                     (seg, key, st, name, cell_kind, sect, c)).await
             }
             (Direction::Forward, ScanEdge::Excluded(c)) => {
-                session.session().execute_iter(statements.forward_excl.clone(),
+                session.session().execute_iter(scan_statement(statements.forward_excl, limit),
                     (seg, key, st, name, cell_kind, sect, c)).await
             }
             (Direction::Backward, ScanEdge::Included(c)) => {
-                session.session().execute_iter(statements.backward_incl.clone(),
+                session.session().execute_iter(scan_statement(statements.backward_incl, limit),
                     (seg, key, st, name, cell_kind, sect, c)).await
             }
             (Direction::Backward, ScanEdge::Excluded(c)) => {
-                session.session().execute_iter(statements.backward_excl.clone(),
+                session.session().execute_iter(scan_statement(statements.backward_excl, limit),
                     (seg, key, st, name, cell_kind, sect, c)).await
             }
             (Direction::Forward, ScanEdge::Unbounded) => {
-                session.session().execute_iter(statements.forward_all.clone(), prefix).await
+                session.session().execute_iter(scan_statement(statements.forward_all, limit), prefix).await
             }
             (Direction::Backward, ScanEdge::Unbounded) => {
-                session.session().execute_iter(statements.backward_all.clone(), prefix).await
+                session.session().execute_iter(scan_statement(statements.backward_all, limit), prefix).await
             }
         };
         let stream = pager
@@ -339,6 +340,19 @@ where
             yield (key, cell);
         }
     }
+}
+
+/// Clones one prepared scan statement and applies its fetch-size hint.
+/// The present-yield counter remains the only result limit.
+fn scan_statement(statement: &PreparedStatement, limit: Option<usize>) -> PreparedStatement {
+    let mut statement = statement.clone();
+    if let Some(limit) = limit {
+        let default = statement.get_page_size();
+        let default_usize = usize::try_from(default).unwrap_or(usize::MAX);
+        let hint = limit.saturating_add(8).min(default_usize);
+        statement.set_page_size(i32::try_from(hint).unwrap_or(default));
+    }
+    statement
 }
 
 /// Whether `key` has walked past the in-code `end` edge for the scan

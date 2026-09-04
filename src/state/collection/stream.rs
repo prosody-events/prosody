@@ -29,6 +29,7 @@ use bytes::Bytes;
 use futures::future::Either;
 use futures::stream::{self, Stream, StreamExt};
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use tokio::task::coop::cooperative;
 
 /// One item a resolving managed stream yields: a decoded key paired with its
@@ -92,6 +93,7 @@ impl<S: StateSession> PlanBase<S> {
 pub(crate) struct CoordinatePlan<S: StateSession, T: CellType> {
     base: PlanBase<S>,
     keys: Vec<KeyOf<T>>,
+    limit: Option<NonZeroUsize>,
 }
 
 /// A managed durable-range plan: one contiguous span of one section, walked in
@@ -111,7 +113,7 @@ pub(crate) struct RangePlan<S: StateSession, T> {
     start: ScanEdge<Coordinate>,
     dir: Direction,
     end: ScanEdge<Coordinate>,
-    limit: Option<usize>,
+    limit: Option<NonZeroUsize>,
     _cell: PhantomData<fn() -> T>,
 }
 
@@ -133,6 +135,18 @@ pub(crate) enum Plan<S: StateSession, T: CellType> {
 }
 
 impl<S: StateSession, T: CellType> Plan<S, T> {
+    /// Sets the maximum number of present items that the plan can yield.
+    ///
+    /// Both arms accept the limit even though no production caller limits
+    /// entries yet: the shared builder keeps the twin scans symmetric.
+    pub(crate) fn with_limit(mut self, limit: NonZeroUsize) -> Self {
+        match &mut self {
+            Self::Points(plan) => plan.limit = Some(limit),
+            Self::Scan(plan) => plan.limit = Some(limit),
+        }
+        self
+    }
+
     /// Drives the planned arm and resolves each live entry.
     pub(crate) fn entries(self) -> impl Stream<Item = ScanItem<T>> + Send
     where
@@ -157,7 +171,11 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
 impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
     /// Builds the plan over the planning invocation's captured state.
     pub(super) fn new(base: PlanBase<S>, keys: Vec<KeyOf<T>>) -> Self {
-        Self { base, keys }
+        Self {
+            base,
+            keys,
+            limit: None,
+        }
     }
 
     /// Streams each planned key's live entry, resolved, in plan order.
@@ -166,7 +184,8 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         let session = self.base.session.clone();
-        fenced::<S, _, T>(session, self.entry_source())
+        let limit = self.limit.map_or(usize::MAX, NonZeroUsize::get);
+        fenced::<S, _, T>(session, self.entry_source().take(limit))
     }
 
     /// Streams the planned keys whose cell is present, **without decoding or
@@ -174,7 +193,8 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
     /// with zero loader fetches.
     pub(crate) fn keys(self) -> impl Stream<Item = KeyItem<T>> + Send {
         let session = self.base.session.clone();
-        fenced::<S, _, T>(session, self.key_source())
+        let limit = self.limit.map_or(usize::MAX, NonZeroUsize::get);
+        fenced::<S, _, T>(session, self.key_source().take(limit))
     }
 
     /// The unfenced resolving body: one admission-scoped batch read, then one
@@ -184,11 +204,12 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         try_stream! {
-            let Self { base, keys } = self;
+            let Self { base, keys, limit } = self;
             let base = &base;
-            let chunks = stream::unfold(keys.into_iter().peekable(), |mut keys| async move {
+            let chunks = stream::unfold((keys.into_iter().peekable(), true), |(mut keys, first)| async move {
                 keys.peek()?; // exhausted ⇒ unfold ends
-                let chunk: CellBuffer<KeyOf<T>> = keys.by_ref().take(CELL_BATCH).collect();
+                let chunk: CellBuffer<KeyOf<T>> =
+                    keys.by_ref().take(chunk_width(limit, first)).collect();
                 // Admission spans the chunk's raw batch read ONLY: it is
                 // released before the chunk's bounded resolve fan-out — which
                 // touches no collection state and may reach a loader — and so
@@ -225,7 +246,7 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
                     )
                 }
                 .await;
-                Some((entries, keys))
+                Some((entries, (keys, false)))
             });
             futures::pin_mut!(chunks);
             while let Some(chunk) = chunks.next().await {
@@ -240,13 +261,14 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
     /// presence bit for each key.
     fn key_source(self) -> impl Stream<Item = KeyItem<T>> + Send {
         try_stream! {
-            let Self { base, keys } = self;
+            let Self { base, keys, limit } = self;
             let base = &base;
-            let chunks = stream::unfold(keys.into_iter().peekable(), |mut keys| async move {
+            let chunks = stream::unfold((keys.into_iter().peekable(), true), |(mut keys, first)| async move {
                 keys.peek()?;
                 let mut inner =
                     <S::Engine as sealed::ReadEngine<S>>::resume(&base.session, &base.plan).await;
-                let chunk: CellBuffer<KeyOf<T>> = keys.by_ref().take(CELL_BATCH).collect();
+                let chunk: CellBuffer<KeyOf<T>> =
+                    keys.by_ref().take(chunk_width(limit, first)).collect();
                 // Pair each key with its slot so the emission stage can drop
                 // absent keys AND checkpoint per key.
                 let paired = read_keys_presence::<S, T>(
@@ -264,7 +286,7 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
                         .zip(slots)
                         .collect::<CellBuffer<(KeyOf<T>, bool)>>()
                 });
-                Some((paired, keys))
+                Some((paired, (keys, false)))
             });
             futures::pin_mut!(chunks);
             while let Some(chunk) = chunks.next().await {
@@ -297,6 +319,16 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
     }
 }
 
+/// Narrows the first tracked chunk to the limit.
+/// Dead tracked keys make later chunks return to full width.
+fn chunk_width(limit: Option<NonZeroUsize>, first: bool) -> usize {
+    if first {
+        limit.map_or(CELL_BATCH, |limit| limit.get().min(CELL_BATCH))
+    } else {
+        CELL_BATCH
+    }
+}
+
 impl<S: StateSession, T: CellType> RangePlan<S, T> {
     /// Builds the plan over the planning invocation's captured state. The plan
     /// walks `[start, end]` and yields at most `limit` cells. The edges are
@@ -306,7 +338,7 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
         start: ScanEdge<Coordinate>,
         dir: Direction,
         end: ScanEdge<Coordinate>,
-        limit: Option<usize>,
+        limit: Option<NonZeroUsize>,
     ) -> Self {
         Self {
             base,
@@ -327,7 +359,7 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
             start: self.start.as_ref(),
             dir: self.dir,
             end: self.end.as_ref(),
-            limit: self.limit,
+            limit: self.limit.map(NonZeroUsize::get),
         };
         <S::Engine as sealed::ReadEngine<S>>::page(
             &self.base.session,
@@ -345,7 +377,7 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
             start: self.start.as_ref(),
             dir: self.dir,
             end: self.end.as_ref(),
-            limit: self.limit,
+            limit: self.limit.map(NonZeroUsize::get),
         };
         <S::Engine as sealed::ReadEngine<S>>::page_keys(
             &self.base.session,

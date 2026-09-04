@@ -91,6 +91,7 @@ use educe::Educe;
 use futures::stream::{Stream, StreamExt};
 use std::error::Error;
 use std::fmt::Display;
+use std::num::NonZeroUsize;
 use std::slice::from_ref;
 use thiserror::Error;
 use tracing::{Instrument, info_span, instrument, warn};
@@ -412,6 +413,85 @@ pub struct MapHandle<S, KC, V> {
     cells: Collection<S, MapKind<KC, V>>,
 }
 
+/// A directional map stream query.
+///
+/// Build one with [`MapHandle::query`]. Finish with [`keys`](Self::keys) or
+/// [`entries`](Self::entries).
+#[must_use]
+pub struct MapQuery<'a, S, KC, V> {
+    handle: &'a MapHandle<S, KC, V>,
+    dir: Direction,
+    limit: Option<NonZeroUsize>,
+}
+
+impl<'a, S, KC, V> MapQuery<'a, S, KC, V>
+where
+    S: StateSession,
+    KC: OrderedKeyCodec + 'static,
+    KC::Key: Display,
+    V: CellType<Key = UnitKey>,
+{
+    /// Sets the maximum number of present items that the stream yields.
+    /// Absent rows are free. Fetch sizing cannot change an answer.
+    pub fn limit(mut self, limit: NonZeroUsize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Streams live entries in the query direction.
+    pub fn entries(self) -> impl Stream<Item = MapStreamItem<KC, V>> + 'a
+    where
+        for<'s> ContextOf<'s, V>: FromSession<'s, S>,
+    {
+        // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
+        // so each inner await is instrumented with a clone instead; the
+        // span's recorded time is the stream's own work. Unlike the sibling
+        // ops' `err`, failures are yielded per item rather than recorded on
+        // the span — a failing chunk ends with an OK-status span, and the
+        // yielded `Err` surfaces to the caller inside this span's scope.
+        let span = info_span!(
+            "map.stream",
+            collection = self.handle.cells.name().as_str(),
+            direction = ?self.dir,
+        );
+        try_stream! {
+            // Init: `stream_plan` reads the keyset under an admission it drops
+            // as it returns, before this `?` observes the result.
+            let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
+            let plan = match self.limit {
+                Some(limit) => plan.with_limit(limit),
+                None => plan,
+            };
+            let inner = plan.entries();
+            futures::pin_mut!(inner);
+            while let Some(item) = inner.next().instrument(span.clone()).await {
+                yield item?;
+            }
+        }
+    }
+
+    /// Streams live keys in the query direction.
+    pub fn keys(self) -> impl Stream<Item = MapKeyItem<KC, V>> + 'a {
+        let span = info_span!(
+            "map.keys",
+            collection = self.handle.cells.name().as_str(),
+            direction = ?self.dir,
+        );
+        try_stream! {
+            let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
+            let plan = match self.limit {
+                Some(limit) => plan.with_limit(limit),
+                None => plan,
+            };
+            let inner = plan.keys();
+            futures::pin_mut!(inner);
+            while let Some(item) = inner.next().instrument(span.clone()).await {
+                yield item?;
+            }
+        }
+    }
+}
+
 // `KC::Key: Display` exists only so the operation spans can record the map
 // key as a joinable attribute (Debug would quote strings); every real key
 // (`String`, `i64`, `u64`) already satisfies it, and no other map machinery
@@ -718,26 +798,7 @@ where
     where
         for<'s> ContextOf<'s, V>: FromSession<'s, S>,
     {
-        // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
-        // so each inner await is instrumented with a clone instead; the
-        // span's recorded time is the stream's own work. Unlike the sibling
-        // ops' `err`, failures are yielded per item rather than recorded on
-        // the span — a failing chunk ends with an OK-status span, and the
-        // yielded `Err` surfaces to the caller inside this span's scope.
-        let span = info_span!(
-            "map.stream",
-            collection = self.cells.name().as_str(),
-            direction = ?dir,
-        );
-        try_stream! {
-            // Init: `stream_plan` reads the keyset under an admission it drops
-            // as it returns, before this `?` observes the result.
-            let inner = self.stream_plan(dir).instrument(span.clone()).await?.entries();
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().instrument(span.clone()).await {
-                yield item?;
-            }
-        }
+        self.query(dir).entries()
     }
 
     /// Streams the live entries' **keys** in key order (ascending for
@@ -755,17 +816,15 @@ where
     /// [`stream`](Self::stream)'s (same keyset-plan decision); only the value
     /// work is dropped.
     pub fn keys(&self, dir: Direction) -> impl Stream<Item = MapKeyItem<KC, V>> + '_ {
-        let span = info_span!(
-            "map.keys",
-            collection = self.cells.name().as_str(),
-            direction = ?dir,
-        );
-        try_stream! {
-            let inner = self.stream_plan(dir).instrument(span.clone()).await?.keys();
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().instrument(span.clone()).await {
-                yield item?;
-            }
+        self.query(dir).keys()
+    }
+
+    /// Builds a directional stream query.
+    pub fn query(&self, dir: Direction) -> MapQuery<'_, S, KC, V> {
+        MapQuery {
+            handle: self,
+            dir,
+            limit: None,
         }
     }
 
@@ -776,7 +835,10 @@ where
     /// Returns a key codec error or an access error from the session.
     #[instrument(name = "map.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err)]
     pub async fn is_empty(&self) -> Result<bool, MapStateError<CellCodecError<V>>> {
-        let keys = self.keys(Direction::Forward);
+        let keys = self
+            .query(Direction::Forward)
+            .limit(NonZeroUsize::MIN)
+            .keys();
         futures::pin_mut!(keys);
         Ok(keys.next().await.transpose()?.is_none())
     }

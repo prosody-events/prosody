@@ -20,6 +20,7 @@ struct OpCounts {
     get_many: AtomicUsize,
     get_many_for_cache: AtomicUsize,
     contains_many: AtomicUsize,
+    presence_batch_width: AtomicUsize,
     scan_cells: AtomicUsize,
     scan_keys: AtomicUsize,
     provisional_cells: AtomicUsize,
@@ -75,6 +76,10 @@ impl<S> CountingCellStore<S> {
         self.counts.contains_many.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn presence_batch_width(&self) -> usize {
+        self.counts.presence_batch_width.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn recovery_sweeps(&self) -> usize {
         self.counts.provisional_cells.load(Ordering::Relaxed)
     }
@@ -102,6 +107,7 @@ impl<S> CountingCellStore<S> {
         self.counts.get_many.store(0, Ordering::Relaxed);
         self.counts.get_many_for_cache.store(0, Ordering::Relaxed);
         self.counts.contains_many.store(0, Ordering::Relaxed);
+        self.counts.presence_batch_width.store(0, Ordering::Relaxed);
         self.counts.scan_cells.store(0, Ordering::Relaxed);
         self.counts.scan_keys.store(0, Ordering::Relaxed);
         self.counts.provisional_cells.store(0, Ordering::Relaxed);
@@ -176,6 +182,9 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
         own: EventRef,
     ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send + 'a {
         self.counts.contains_many.fetch_add(1, Ordering::Relaxed);
+        self.counts
+            .presence_batch_width
+            .store(batch.len(), Ordering::Relaxed);
         self.inner.contains_many(collection, section, batch, own)
     }
 

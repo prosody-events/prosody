@@ -386,10 +386,14 @@ where
     ) -> Result<Plan<S, Keyed<I64KeyCodec, T>>, DequeStateError<CellCodecError<T>>> {
         let window = bounds(op).await?;
         let len = window.len()?;
-        if len > DEQUE_POINT_ITERATION_MAX {
+        // The wide-window guard yields the scan limit as `NonZeroUsize`, so a
+        // zero limit is uncompilable here rather than checked.
+        if let Some(limit) = NonZeroUsize::new(len).filter(|n| n.get() > DEQUE_POINT_ITERATION_MAX)
+        {
             // Wide window: one durable range scan, anchored on the window.
             // It runs from the front `head` to the back `tail − 1`, and
-            // mirrors backward. `len > 0` proves `tail − 1` does not underflow.
+            // mirrors backward. A wide window is nonempty, so `tail − 1` does
+            // not underflow.
             let last = window
                 .tail
                 .checked_sub(1)
@@ -403,7 +407,7 @@ where
                 &start,
                 dir,
                 &end,
-                len,
+                limit,
             )));
         }
         // Point-get arm. `absolute` is monotone in the position. One check of

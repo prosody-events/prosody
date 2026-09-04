@@ -43,5 +43,5 @@ pub(crate) use source::PUBLICATION_READ_LIMIT;
 // same reason: they appear in that public signature and in the public
 // `PartitionCount::try_from`.
 pub use partitioner::{EmptyKeyError, PartitionCount, PartitionCountError, partition_for_key};
-pub use reader::StateReader;
+pub use reader::{MapReaderQuery, StateReader};
 pub use session::ReadSession;

@@ -45,6 +45,7 @@ use acquisition::{DEFAULT_REFRESH_INTERVAL, PublicationSnapshot};
 use futures::stream::{Stream, StreamExt};
 use quanta::Clock;
 use std::fmt::Display;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::coop::cooperative;
@@ -203,6 +204,94 @@ where
 
 // --- Map reads --------------------------------------------------------------
 
+/// A directional map stream query for a standalone reader.
+///
+/// See [`crate::state::descriptor::map::MapQuery::limit`] for the limit
+/// contract.
+#[must_use]
+pub struct MapReaderQuery<'a, KC, V, C: Codec, B = MemoryReaderBackend<C>> {
+    reader: &'a StateReader<MapDescriptor<KC, V>, C, B>,
+    key: Key,
+    dir: Direction,
+    limit: Option<NonZeroUsize>,
+}
+
+impl<KC, V, C, B> MapReaderQuery<'_, KC, V, C, B>
+where
+    C: Codec,
+    B: ReaderBackend<C>,
+    C::Payload: Clone,
+    KC: OrderedKeyCodec + 'static,
+    KC::Key: Display,
+    V: CellType<Key = UnitKey>,
+    for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
+{
+    /// Sets the maximum number of present items that the stream yields.
+    pub fn limit(mut self, limit: NonZeroUsize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Streams committed live entries in the query direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when session acquisition or handle binding fails.
+    pub async fn entries(
+        self,
+    ) -> Result<
+        impl Stream<Item = Result<(KC::Key, ResolvedOf<V>), StateReaderError>> + 'static,
+        StateReaderError,
+    >
+    where
+        V: 'static,
+        ResolvedOf<V>: 'static,
+    {
+        let session = self.reader.session(self.key).await?;
+        let handle: MapHandle<_, KC, V> = self.reader.descriptor.bind(&session)?;
+        Ok(async_stream::try_stream! {
+            let query = handle.query(self.dir);
+            let query = match self.limit {
+                Some(limit) => query.limit(limit),
+                None => query,
+            };
+            let inner = query.entries();
+            futures::pin_mut!(inner);
+            while let Some(item) = cooperative(inner.next()).await {
+                yield item.map_err(|e| StateReaderError::store(&e))?;
+            }
+        })
+    }
+
+    /// Streams committed live keys in the query direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when session acquisition or handle binding fails.
+    pub async fn keys(
+        self,
+    ) -> Result<impl Stream<Item = Result<KC::Key, StateReaderError>> + 'static, StateReaderError>
+    where
+        V: 'static,
+        KC::Key: 'static,
+    {
+        let session = self.reader.session(self.key).await?;
+        let handle: MapHandle<_, KC, V> = self.reader.descriptor.bind(&session)?;
+        Ok(async_stream::try_stream! {
+            let query = handle.query(self.dir);
+            let query = match self.limit {
+                Some(limit) => query.limit(limit),
+                None => query,
+            };
+            let inner = query.keys();
+            futures::pin_mut!(inner);
+            while let Some(item) = cooperative(inner.next()).await {
+                yield item.map_err(|e| StateReaderError::store(&e))?;
+            }
+        })
+    }
+}
+
 impl<KC, V, C, B> StateReader<MapDescriptor<KC, V>, C, B>
 where
     C: Codec,
@@ -326,15 +415,7 @@ where
         V: 'static,
         ResolvedOf<V>: 'static,
     {
-        let session = self.session(key.into()).await?;
-        let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
-        Ok(async_stream::try_stream! {
-            let inner = handle.stream(dir);
-            futures::pin_mut!(inner);
-            while let Some(item) = cooperative(inner.next()).await {
-                yield item.map_err(|e| StateReaderError::store(&e))?;
-            }
-        })
+        self.query(key, dir).entries().await
     }
 
     /// Streams committed live keys without decoding or resolving values.
@@ -352,15 +433,17 @@ where
         V: 'static,
         KC::Key: 'static,
     {
-        let session = self.session(key.into()).await?;
-        let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
-        Ok(async_stream::try_stream! {
-            let inner = handle.keys(dir);
-            futures::pin_mut!(inner);
-            while let Some(item) = cooperative(inner.next()).await {
-                yield item.map_err(|e| StateReaderError::store(&e))?;
-            }
-        })
+        self.query(key, dir).keys().await
+    }
+
+    /// Builds a directional stream query for partition `key`.
+    pub fn query<K: Into<Key>>(&self, key: K, dir: Direction) -> MapReaderQuery<'_, KC, V, C, B> {
+        MapReaderQuery {
+            reader: self,
+            key: key.into(),
+            dir,
+            limit: None,
+        }
     }
 }
 
