@@ -33,7 +33,7 @@ use crate::cassandra::{BatchUnit, CassandraStore as CassandraSession};
 use crate::state::cached::Cached;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use crate::state::fjall::{MarkerCheckSet, test_db};
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::oracle::CommitOracle;
