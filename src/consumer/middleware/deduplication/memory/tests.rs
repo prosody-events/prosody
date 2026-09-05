@@ -9,11 +9,11 @@ async fn lookup_returns_absent_for_new_id() -> color_eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn insert_then_lookup_returns_cached() -> color_eyre::Result<()> {
+async fn insert_then_lookup_returns_settled() -> color_eyre::Result<()> {
     let store = MemoryDeduplicationStore::new();
     let id = Uuid::new_v4();
     store.insert(id).await?;
-    assert_eq!(store.lookup(id).await?, Presence::Cached);
+    assert_eq!(store.lookup(id).await?, Presence::Settled);
     Ok(())
 }
 
@@ -32,7 +32,7 @@ async fn concurrent_access() -> color_eyre::Result<()> {
     h1.await??;
     h2.await??;
 
-    assert_eq!(store.lookup(id1).await?, Presence::Cached);
-    assert_eq!(store.lookup(id2).await?, Presence::Cached);
+    assert_eq!(store.lookup(id1).await?, Presence::Settled);
+    assert_eq!(store.lookup(id2).await?, Presence::Settled);
     Ok(())
 }

@@ -7,21 +7,10 @@
 mod handler;
 pub mod prop_dedup_store;
 
-/// Generate a comprehensive test suite for a `DeduplicationStore`
-/// implementation.
-///
-/// This macro creates property-based tests using `QuickCheck` to verify
-/// that a `DeduplicationStore` implementation correctly handles all operations
-/// by comparing against a simple reference model.
-///
-/// # Usage
-///
-/// ```rust,ignore
-/// dedup_store_tests!(async { Ok::<_, Report>(MyStore::new()) });
-/// ```
+/// Test marker presence across assignments from one provider.
 #[macro_export]
 macro_rules! dedup_store_tests {
-    ($store_constructor:expr) => {
+    ($provider_constructor:expr $(, tests = $count:expr)?) => {
         use quickcheck::{QuickCheck, TestResult};
         use tokio::runtime::Builder;
         use tracing::Instrument;
@@ -32,7 +21,7 @@ macro_rules! dedup_store_tests {
             $crate::tracing::init_test_logging();
             let _span = tracing::info_span!("test").entered();
 
-            QuickCheck::new()
+            QuickCheck::new()$(.tests($count))?
                 .quickcheck(prop_model_equivalence as fn(DeduplicationTestInput) -> TestResult);
         }
 
@@ -44,13 +33,13 @@ macro_rules! dedup_store_tests {
                 Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
             };
 
-            let store = match runtime.block_on(($store_constructor).instrument(span.clone())) {
+            let provider = match runtime.block_on(($provider_constructor).instrument(span.clone())) {
                 Ok(s) => s,
-                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+                Err(e) => return TestResult::error(format!("Failed to create provider: {e:?}")),
             };
 
             match runtime.block_on(
-                async { prop_dedup_store_model_equivalence(&store, input).await }.instrument(span),
+                async { prop_dedup_store_model_equivalence(&provider, input).await }.instrument(span),
             ) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(format!("{e:?}")),

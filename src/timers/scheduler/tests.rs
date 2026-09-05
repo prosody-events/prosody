@@ -58,6 +58,7 @@ type TestStore = TableAdapter<InMemoryTriggerStore>;
 fn fresh_state(store: TestStore, segment: Segment) -> ActorState<TestStore> {
     let now = Instant::now();
     ActorState {
+        ready: None,
         store,
         segment,
         known_slab_ids: BTreeSet::new(),
@@ -309,7 +310,8 @@ impl Fixture {
 
     async fn apply_schedule(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
         let (key, time, ty) = spec.resolve(self.now_slab);
-        let trigger = Trigger::new(key.clone(), time, ty, Span::current());
+        // This model keeps one tag. The manager property tests tag changes.
+        let trigger = Trigger::with_tag(key.clone(), time, ty, 0, Span::current());
         let current_model = self.model_for(&key, time, ty);
 
         // Reviving a Parked timer with the same identity is an in-memory
@@ -369,8 +371,10 @@ impl Fixture {
             .remove_trigger(&key, time, ty)
             .await
             .map_err(|e| format!("remove_trigger: {e:?}"))?;
-        let trigger = Trigger::new(key.clone(), time, ty, Span::current());
-        self.triggers.remove(&trigger).await;
+        let trigger = Trigger::with_tag(key.clone(), time, ty, 0, Span::current());
+        self.triggers
+            .remove_if_live(&trigger, Some(trigger.tag))
+            .await;
         self.set_model(
             key,
             time,
@@ -395,7 +399,7 @@ impl Fixture {
             return Ok(());
         }
 
-        let trigger = Trigger::new(key.clone(), time, ty, Span::current());
+        let trigger = Trigger::with_tag(key.clone(), time, ty, 0, Span::current());
         self.triggers.remove_queue_only(&trigger);
         self.triggers
             .active_triggers()
@@ -430,7 +434,7 @@ impl Fixture {
             .set_state(&key, time, ty, TimerState::Parked)
             .await;
         if needs_dequeue {
-            let trigger = Trigger::new(key.clone(), time, ty, Span::current());
+            let trigger = Trigger::with_tag(key.clone(), time, ty, 0, Span::current());
             self.triggers.remove_queue_only(&trigger);
         }
 
@@ -657,6 +661,7 @@ impl Fixture {
             let store_times: BTreeSet<CompactDateTime> = self
                 .store
                 .get_key_times(*ty, key)
+                .map_ok(|(time, _)| time)
                 .try_collect()
                 .await
                 .map_err(|e| format!("get_key_times: {e:?}"))?;
@@ -809,8 +814,11 @@ async fn test_cleanup_preserves_aborted_timer_slab_and_reload_schedules_it() -> 
         slabs_after_cleanup.contains(&slab_id),
         "cleanup must keep slab metadata while a Parked timer is active"
     );
-    let times_after_cleanup: BTreeSet<CompactDateTime> =
-        store.get_key_times(ty, &key).try_collect().await?;
+    let times_after_cleanup: BTreeSet<CompactDateTime> = store
+        .get_key_times(ty, &key)
+        .map_ok(|(time, _)| time)
+        .try_collect()
+        .await?;
     assert!(
         times_after_cleanup.contains(&time),
         "cleanup must not delete the persisted timer row"

@@ -339,7 +339,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         &self,
         timer_type: TimerType,
         key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<(CompactDateTime, i32), Self::Error>> + Send;
 
     /// Streams full trigger objects for a key and timer type.
     ///
@@ -359,6 +359,10 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Implementations should attempt to keep both tables in sync.
     /// Transactional backends can provide ACID guarantees.
     fn add_trigger(&self, trigger: Trigger)
+    -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Write the key row without changing the slab row.
+    fn add_key_row(&self, trigger: Trigger)
     -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Removes a trigger from both slab and key tables.
@@ -385,35 +389,27 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Atomically clears existing timers for a key/type and schedules a new
-    /// one.
+    /// Clear the key rows and schedule a new timer.
+    /// Keep each slab row named in `keep`, including the new coordinate.
+    /// A kept new coordinate already has its slab row.
     ///
-    /// This is the core primitive for tombstone-free singleton timer
-    /// overwrites. Reads existing trigger times from the key index, writes
-    /// the new timer to both indexes (new slab + singleton key slot), then
-    /// deletes old slab entries.
-    ///
-    /// # Write Ordering
-    ///
-    /// New timer is written FIRST, then old entries are deleted. This ensures
-    /// at-least-once delivery: if a crash occurs, both timers may exist
-    /// temporarily, but the timer will never be lost.
+    /// Write the new key row before deleting old slab rows.
+    /// A crash can leave extra slab rows, but it cannot remove the new timer.
     fn clear_and_schedule(
         &self,
         trigger: Trigger,
+        keep: &[CompactDateTime],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // ===================================================================
     // Tag Operations (2 methods) - Used by TimerManager commit oracle
     // ===================================================================
 
-    /// Updates the `tag` on both persisted timer indices.
+    /// Updates the key row tag. The slab row keeps its original tag.
     ///
-    /// Requires both rows. The transition table emits this write only from
-    /// `FiringRescheduled`, where both rows stand. On an absent row the
-    /// backends differ: Cassandra upserts a partial row, the memory store
-    /// does nothing. The commit from `FiringRescheduled` rotates the tag so
-    /// the oracle reports the finished attempt as committed.
+    /// Requires a key row. Cassandra can write a partial row if the key row is
+    /// absent. A reload uses the slab tag to detect an earlier attempt and
+    /// request a sweep.
     fn update_tag(
         &self,
         key: &Key,

@@ -248,7 +248,7 @@ async fn timer_manager() -> Result<(
         TimerManager::new(config, HeartbeatRegistry::test(), shutdown_rx, semaphores)
             .await
             .map_err(|e| eyre!("{e}"))?;
-    Ok((stream, manager, shutdown_tx))
+    Ok((stream::iter(stream.await).flatten(), manager, shutdown_tx))
 }
 
 /// The timer `EventRef` the lifecycle tests stage under.
@@ -330,10 +330,12 @@ async fn recover_promotes_committed_cell_clears_armed_and_leaves_backstop() -> R
         ))
         .await?;
 
-    assert_eq!(
-        manager.recover(key.clone(), &timers, &no_shutdown).await,
-        SweepResolution::Commit,
-        "a fully resolved sweep commits the fired trigger",
+    assert!(
+        matches!(
+            manager.recover(key.clone(), &timers, &no_shutdown).await,
+            SweepResolution::Commit(_)
+        ),
+        "a fully resolved sweep commits the fired trigger"
     );
 
     assert_eq!(
@@ -372,12 +374,12 @@ async fn resolve_redelivered_promotes_and_preserves_armed_key() -> Result<()> {
         .handle();
     stage_under_timer(session, &manager, &key, 11).await?;
 
-    assert_eq!(
+    assert!(matches!(
         manager
             .resolve_redelivered(key.clone(), &timers, &no_shutdown)
             .await,
-        SweepResolution::Commit,
-    );
+        SweepResolution::Commit(_)
+    ));
     assert_eq!(
         committed(&cell, &id_for(&key, "cart")?).await?,
         Some(bytes(11)),
@@ -403,10 +405,12 @@ async fn recover_rolls_back_uncommitted_cell() -> Result<()> {
         .handle();
     stage_under_timer(session, &manager, &key, 99).await?;
 
-    assert_eq!(
-        manager.recover(key.clone(), &timers, &no_shutdown).await,
-        SweepResolution::Commit,
-        "a fully resolved rollback commits the fired trigger",
+    assert!(
+        matches!(
+            manager.recover(key.clone(), &timers, &no_shutdown).await,
+            SweepResolution::Commit(_)
+        ),
+        "a fully resolved rollback commits the fired trigger"
     );
 
     assert_eq!(
@@ -594,10 +598,14 @@ fn check_recovery(observed: RecoveryObservation) -> TestResult {
     let retry = matches!(category, ErrorCategory::Transient | ErrorCategory::Terminal);
     let ok = match (redelivered, retry, shutdown) {
         (true, true, true) => resolution == SweepResolution::Abort && !rescheduled && armed,
-        (_, true, false) => resolution == SweepResolution::Commit && earlier && armed,
-        (true, false, _) => resolution == SweepResolution::Commit && !rescheduled && armed,
+        (_, true, false) => matches!(resolution, SweepResolution::Commit(_)) && earlier && armed,
+        (true, false, _) => {
+            matches!(resolution, SweepResolution::Commit(_)) && !rescheduled && armed
+        }
         (false, true, true) => resolution == SweepResolution::Abort && !rescheduled && !armed,
-        (false, false, _) => resolution == SweepResolution::Commit && !rescheduled && !armed,
+        (false, false, _) => {
+            matches!(resolution, SweepResolution::Commit(_)) && !rescheduled && !armed
+        }
     };
     if ok {
         TestResult::passed()

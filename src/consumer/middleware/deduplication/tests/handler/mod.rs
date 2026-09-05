@@ -166,12 +166,12 @@ async fn lookup_controls_dispatch() -> color_eyre::Result<()> {
             Settlement::Final,
         ),
         (
-            Ok(Presence::Cached),
+            Ok(Presence::Settled),
             Some(DeduplicationOutput::Repeated),
             Settlement::Bypassed,
         ),
         (
-            Ok(Presence::Durable),
+            Ok(Presence::Inherited),
             Some(DeduplicationOutput::Redelivered),
             Settlement::Duplicate,
         ),

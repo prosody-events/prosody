@@ -26,7 +26,10 @@ use crate::timers::active::{
     Transition, transition,
 };
 use crate::timers::datetime::CompactDateTime;
+use crate::timers::queue::RemoveOutcome;
 use rand::RngExt;
+use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt::Debug;
 
@@ -114,9 +117,9 @@ where
     /// `shutdown_rx` signals partition shutdown; the scheduler actor serves
     /// commands through `Draining` and exits at `>= ShutdownPhase::Cancelling`.
     /// `semaphores` bounds in-flight timer
-    /// events per type (see module docs). Returns a [`Stream`] of
-    /// [`PendingTimer<T>`] alongside the [`TimerManager<T>`] used to
-    /// schedule and manage timers.
+    /// events per type. Returns the manager and a future for its timer stream.
+    /// The future yields the stream after the first load, or `None` if the
+    /// actor stops first.
     ///
     /// # Errors
     ///
@@ -127,7 +130,13 @@ where
         heartbeats: HeartbeatRegistry,
         shutdown_rx: watch::Receiver<ShutdownPhase>,
         semaphores: Arc<TimerSemaphores>,
-    ) -> Result<(impl Stream<Item = PendingTimer<T>>, Self), TimerManagerError<T::Error>> {
+    ) -> Result<
+        (
+            impl Future<Output = Option<impl Stream<Item = PendingTimer<T>>>>,
+            Self,
+        ),
+        TimerManagerError<T::Error>,
+    > {
         // Ensure the segment exists in persistent storage.
         let segment = get_or_create_segment(&config.store).await?;
 
@@ -155,8 +164,12 @@ where
         // per-type semaphore permit per timer to bound in-flight timer events.
         // If the semaphore is closed the stream terminates rather than
         // silently dropping timers.
-        let timer_stream = stream! {
-            let mut receiver = ReceiverStream::new(trigger_rx);
+        let timer_stream = async move {
+            let Ok(receiver) = trigger_rx.await else {
+                return None;
+            };
+            Some(stream! {
+            let mut receiver = ReceiverStream::new(receiver);
             while let Some(trigger) = receiver.next().await {
                 let semaphore = semaphores[trigger.timer_type as usize].clone();
                 let Ok(permit) = semaphore.acquire_owned().await else {
@@ -164,6 +177,7 @@ where
                 };
                 yield PendingTimer::new(trigger, cloned_manager.clone(), permit);
             }
+            })
         };
 
         Ok((timer_stream, manager))
@@ -190,6 +204,7 @@ where
             .0
             .store
             .get_key_times(timer_type, key)
+            .map_ok(|(time, _)| time)
             .map_err(TimerManagerError::Store);
 
         stream
@@ -235,10 +250,9 @@ where
     }
 
     /// Uses the key-row tag for `request`, or a fresh tag when no row exists.
-    /// The key row is the only home of the tag; the registry holds no tag.
+    /// The key row supplies the live tag. The registry holds no tag.
     /// Keep this read: a fresh tag on a repeated write would make an aborted
-    /// attempt's cells read as committed. An `Overflow` key needs one point
-    /// read per schedule and per fire.
+    /// attempt's cells read as committed.
     async fn mint(&self, request: TimerRequest) -> Result<Trigger, TimerManagerError<T::Error>> {
         let tag = self
             .0
@@ -309,14 +323,8 @@ where
             .await
     }
 
-    /// Atomically clears existing timers and schedules a new one.
-    ///
-    /// This is the optimized path for singleton timer overwrites: existing
-    /// triggers are read to determine which slabs need cleanup, the
-    /// in-memory scheduler is updated (unschedule old, schedule new), and
-    /// the store's `clear_and_schedule` persists everything in one atomic
-    /// write. Prior-state handling for the new and replaced timers is
-    /// resolved by the state machine in `timers::active::transition`.
+    /// Replace the key rows and update the scheduler.
+    /// Keep each firing source until its attempt finishes.
     ///
     /// # Errors
     ///
@@ -335,7 +343,7 @@ where
         &self,
         trigger: Trigger,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        let existing_times: Vec<CompactDateTime> = self
+        let existing_times: SmallVec<[(CompactDateTime, i32); 2]> = self
             .0
             .store
             .get_key_times(trigger.timer_type, &trigger.key)
@@ -362,19 +370,23 @@ where
 
         // In-memory effects that must precede the atomic write: the new
         // timer's pre-persist half, then the removal of every replaced time.
-        apply_memory(&self.0.scheduler, &trigger, pre).await?;
-        unschedule_replaced_timers(&self.0.scheduler, &trigger, &existing_times).await?;
+        apply_memory(&self.0.scheduler, &trigger, pre, None).await?;
+        let mut keep =
+            unschedule_replaced_timers(&self.0.scheduler, &trigger, &existing_times).await?;
+        if prior.is_some() {
+            keep.push(trigger.time);
+        }
 
         // The single durable write: atomically inserts the new row and
         // clears the replaced ones (`ClearSchedule` transitions carry no
         // store effect of their own).
         self.0
             .store
-            .clear_and_schedule(trigger.clone())
+            .clear_and_schedule(trigger.clone(), &keep)
             .await
             .map_err(TimerManagerError::Store)?;
 
-        apply_memory(&self.0.scheduler, &trigger, post).await?;
+        apply_memory(&self.0.scheduler, &trigger, post, None).await?;
         self.emit_clear_telemetry(&trigger, &existing_times);
 
         Ok(())
@@ -382,8 +394,8 @@ where
 
     /// Emits one `timer_cancelled` event per replaced time (excluding the
     /// new time) and one `timer_scheduled` event for the new trigger.
-    fn emit_clear_telemetry(&self, trigger: &Trigger, existing_times: &[CompactDateTime]) {
-        for &old_time in existing_times {
+    fn emit_clear_telemetry(&self, trigger: &Trigger, existing_times: &[(CompactDateTime, i32)]) {
+        for &(old_time, _) in existing_times {
             if old_time != trigger.time {
                 self.0.telemetry.timer_cancelled(
                     trigger.key.clone(),
@@ -426,7 +438,8 @@ where
             .fire(&trigger.key, trigger.time, trigger.timer_type)
             .await;
         Ok(fired.then_some(match tag {
-            Some(tag) => Fire::Live(tag),
+            Some(tag) if tag == trigger.tag => Fire::Live(tag),
+            Some(tag) => Fire::Unswept(tag),
             None => Fire::Committed,
         }))
     }
@@ -434,8 +447,8 @@ where
     /// Marks a timer as completed.
     ///
     /// `FiringRescheduled` keeps the rows and rotates the tag for the next
-    /// fire. `FiringReplaced` only removes the active entry. Other states
-    /// delete the rows.
+    /// fire. `FiringReplaced` deletes its slab row. Other states delete both
+    /// rows.
     ///
     /// Typically invoked by [`crate::timers::uncommitted::FiringTimer`]'s
     /// [`crate::consumer::Uncommitted::commit()`] impl.
@@ -515,14 +528,34 @@ where
         t: Transition,
     ) -> Result<(), TimerManagerError<T::Error>> {
         let (pre, post) = t.phases();
-        apply_memory(&self.0.scheduler, trigger, pre).await?;
+        let key_tag = if pre.queue == QueueEffect::Remove {
+            self.0
+                .store
+                .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+                .await
+                .map_err(TimerManagerError::Store)?
+        } else {
+            None
+        };
+        let removed = apply_memory(&self.0.scheduler, trigger, pre, key_tag).await?;
+        let store = match (t.store(), removed) {
+            (StoreEffect::Delete, RemoveOutcome::KeptSource) => StoreEffect::DeleteKeyRow,
+            (store, _) => store,
+        };
 
-        match t.store() {
+        let mut next = Cow::Borrowed(trigger);
+        match store {
             StoreEffect::None => {}
             StoreEffect::Insert => self
                 .0
                 .store
                 .add_trigger(trigger.clone())
+                .await
+                .map_err(TimerManagerError::Store)?,
+            StoreEffect::InsertKeyRow => self
+                .0
+                .store
+                .add_key_row(trigger.clone())
                 .await
                 .map_err(TimerManagerError::Store)?,
             StoreEffect::Delete => self
@@ -543,20 +576,17 @@ where
                 .remove_slab_row(&trigger.key, trigger.time, trigger.timer_type)
                 .await
                 .map_err(TimerManagerError::Store)?,
-            StoreEffect::UpdateTag => self
-                .0
-                .store
-                .update_tag(
-                    &trigger.key,
-                    trigger.time,
-                    trigger.timer_type,
-                    fresh_tag_distinct_from(trigger.tag),
-                )
-                .await
-                .map_err(TimerManagerError::Store)?,
+            StoreEffect::UpdateTag => {
+                next.to_mut().tag = fresh_tag_distinct_from(trigger.tag);
+                self.0
+                    .store
+                    .update_tag(&trigger.key, trigger.time, trigger.timer_type, next.tag)
+                    .await
+                    .map_err(TimerManagerError::Store)?;
+            }
         }
 
-        apply_memory(&self.0.scheduler, trigger, post).await?;
+        apply_memory(&self.0.scheduler, &next, post, None).await?;
 
         match t.announce() {
             Some(Announce::Scheduled) => self.0.telemetry.timer_scheduled(
@@ -591,8 +621,13 @@ where
 }
 
 /// Classifies the store key row for one fired timer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fire {
+    /// The key tag equals the queued tag: one live attempt.
     Live(i32),
+    /// The key tag differs from the queued tag: sweep before the handler.
+    Unswept(i32),
+    /// The key row is absent: the attempt committed.
     Committed,
 }
 
@@ -616,7 +651,8 @@ async fn apply_memory<E>(
     scheduler: &TriggerScheduler<E>,
     trigger: &Trigger,
     effects: MemoryEffects,
-) -> Result<(), TimerManagerError<E>>
+    key_tag: Option<i32>,
+) -> Result<RemoveOutcome, TimerManagerError<E>>
 where
     E: ClassifyError + Error + Debug + Send + Sync + 'static,
 {
@@ -631,31 +667,29 @@ where
         QueueEffect::Enqueue => scheduler.add_to_queue(trigger.clone()).await?,
         QueueEffect::Dequeue => scheduler.remove_from_queue(trigger.clone()).await?,
         QueueEffect::Insert => scheduler.schedule(trigger.clone()).await?,
-        QueueEffect::Remove => scheduler.unschedule(trigger.clone()).await?,
+        QueueEffect::Retag => scheduler.retag(trigger.clone()).await?,
+        QueueEffect::Remove => return Ok(scheduler.unschedule(trigger.clone(), key_tag).await?),
         QueueEffect::Deactivate => {
             scheduler
                 .deactivate(&trigger.key, trigger.time, trigger.timer_type)
                 .await;
         }
     }
-    Ok(())
+    Ok(RemoveOutcome::Removed)
 }
 
-/// Unschedules every replaced (old-time) timer during a `clear_and_schedule`
-/// operation, resolving each through the state machine's `ClearReplaced` op.
-///
-/// All effects are in-memory: the caller's atomic store write subsumes the
-/// per-row deletes. The scheduler removal is idempotent — the actor finds
-/// nothing when the slab isn't loaded.
+/// Remove replaced queue entries and collect the slab rows that must stay.
+/// The caller applies the slab deletes in the clear write.
 async fn unschedule_replaced_timers<E>(
     scheduler: &TriggerScheduler<E>,
     new_trigger: &Trigger,
-    existing_times: &[CompactDateTime],
-) -> Result<(), TimerManagerError<E>>
+    existing_times: &[(CompactDateTime, i32)],
+) -> Result<SmallVec<[CompactDateTime; 2]>, TimerManagerError<E>>
 where
     E: ClassifyError + Error + Debug + Send + Sync + 'static,
 {
-    for &old_time in existing_times {
+    let mut keep = SmallVec::new();
+    for &(old_time, key_tag) in existing_times {
         if old_time == new_trigger.time {
             continue; // Same time as new — resolved by the caller's ClearSchedule op.
         }
@@ -670,7 +704,8 @@ where
             .active_triggers()
             .get_state(&old.key, old.time, old.timer_type)
             .await;
-        let (pre, post) = transition(prior, TimerOp::ClearReplaced).phases();
+        let transition = transition(prior, TimerOp::ClearReplaced);
+        let (pre, post) = transition.phases();
         debug!(
             key = %old.key,
             timer_type = ?old.timer_type,
@@ -678,10 +713,13 @@ where
             prior_state = ?prior,
             "clear_and_schedule: unscheduling replaced timer"
         );
-        apply_memory(scheduler, &old, pre).await?;
-        apply_memory(scheduler, &old, post).await?;
+        let removed = apply_memory(scheduler, &old, pre, Some(key_tag)).await?;
+        apply_memory(scheduler, &old, post, Some(key_tag)).await?;
+        if transition.store() == StoreEffect::None || removed == RemoveOutcome::KeptSource {
+            keep.push(old_time);
+        }
     }
-    Ok(())
+    Ok(keep)
 }
 
 #[cfg(test)]

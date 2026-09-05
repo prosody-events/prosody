@@ -1,9 +1,4 @@
-//! Adapts `TriggerOperations` to implement `TriggerStore`.
-//!
-//! This module provides the `TableAdapter` struct that wraps a type
-//! implementing `TriggerOperations` (22 primitive methods) and provides the
-//! public `TriggerStore` interface (13 methods) with coordinated dual-table
-//! operations.
+//! Apply coordinated writes through the store operations.
 
 use crate::Key;
 use crate::timers::DELETE_CONCURRENCY;
@@ -19,33 +14,9 @@ use std::future::Future;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use tokio::try_join;
-use tracing::{debug, instrument};
+use tracing::instrument;
 
-/// Adapts `TriggerOperations` to implement `TriggerStore`.
-///
-/// This struct wraps a type implementing `TriggerOperations` (22 primitive
-/// methods) and provides the public `TriggerStore` interface (13 methods)
-/// with coordinated dual-table operations.
-///
-/// Uses `Arc` for cheap cloning and best-effort consistency via `try_join!`.
-///
-/// **Visibility**: `pub` but not re-exported from `store/mod.rs`.
-/// Used by factory functions in implementation modules (cassandra/mod.rs,
-/// memory.rs) which return concrete `TableAdapter<T>` types.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// // Factory functions return concrete TableAdapter:
-/// pub fn cassandra_store(...) -> TableAdapter<CassandraTriggerStore> {
-///     let cassandra = CassandraTriggerStore::new(...);
-///     TableAdapter::new(cassandra)
-/// }
-///
-/// // Consumer usage:
-/// let store = cassandra_store(...);  // TableAdapter<CassandraTriggerStore>: TriggerStore
-/// let manager = TimerManager::new(..., store);
-/// ```
+/// Adapt store operations to the public timer store.
 #[derive(Clone)]
 pub struct TableAdapter<T> {
     operations: Arc<T>,
@@ -155,7 +126,7 @@ where
         &self,
         timer_type: TimerType,
         key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send {
+    ) -> impl Stream<Item = Result<(CompactDateTime, i32), Self::Error>> + Send {
         self.operations.get_key_times(timer_type, key)
     }
 
@@ -183,6 +154,10 @@ where
             self.operations.upsert_key_trigger(trigger),
         )?;
         Ok(())
+    }
+
+    async fn add_key_row(&self, trigger: Trigger) -> Result<(), Self::Error> {
+        self.operations.upsert_key_trigger(trigger).await
     }
 
     #[instrument(level = "debug", skip(self), err)]
@@ -246,74 +221,49 @@ where
         self.operations.current_tag(key, time, timer_type).await
     }
 
-    #[instrument(level = "debug", skip(self, trigger), err)]
-    async fn clear_and_schedule(&self, trigger: Trigger) -> Result<(), Self::Error> {
-        // INVARIANT (at-least-once delivery): Write new timer FIRST, then
-        // delete old entries. If crash occurs after writing new but before
-        // deleting old, both timers exist (may fire twice). If we deleted
-        // first and crashed, timer would be lost (never fires). The ordering
-        // below enforces: Step 1 (write new) completes before Step 2 (delete
-        // old).
-
+    #[instrument(level = "debug", skip(self, trigger, keep), err)]
+    async fn clear_and_schedule(
+        &self,
+        trigger: Trigger,
+        keep: &[CompactDateTime],
+    ) -> Result<(), Self::Error> {
         let slab_size = self.slab_size();
         let new_slab = Slab::from_time(slab_size, trigger.time);
         let key = trigger.key.clone();
         let timer_type = trigger.timer_type;
 
-        // Step 1 (DUAL-INDEX WRITE): write the new timer to both indices in
-        // parallel. `clear_and_schedule_key` atomically clears the key index
-        // entry and returns the old trigger times it replaced — no separate
-        // pre-read needed. The key index uses the Cassandra singleton-slot
-        // optimisation: a single atomic op DELETEs all clustering rows and
-        // UPDATEs the static slot, so singleton→singleton replacement
-        // creates zero tombstones.
+        // Write the new timer before any old source disappears.
+        let write_slab = async {
+            if !keep.contains(&trigger.time) {
+                self.operations
+                    .insert_slab_trigger(new_slab, trigger.clone())
+                    .await?;
+            }
+            Ok::<(), Self::Error>(())
+        };
         let ((), old_times) = try_join!(
-            self.operations
-                .insert_slab_trigger(new_slab, trigger.clone()),
-            self.operations.clear_and_schedule_key(trigger),
+            write_slab,
+            self.operations.clear_and_schedule_key(trigger.clone()),
         )?;
 
-        debug!(
-            key = %key,
-            timer_type = ?timer_type,
-            old_entry_count = old_times.len(),
-            "clear_and_schedule: new timer written to slab + key indices; proceeding to delete old slab entries"
-        );
-
-        // Step 2: Delete old entries from slab index only.
-        // Key index was already cleared atomically in Step 1.
-        // INVARIANT (at-least-once): This runs AFTER Step 1 completes, so
-        // the new timer is guaranteed to exist before old entries are removed.
-        // Each delete targets a different clustering row, so concurrent deletes
-        // to the same partition are safe.
-        stream::iter(old_times.iter().copied())
-            .map(|old_time| {
-                let old_slab = Slab::from_time(slab_size, old_time);
-                let ops = &self.operations;
-                let key = &key;
-                async move {
-                    debug!(
-                        key = %key,
-                        timer_type = ?timer_type,
-                        old_time = ?old_time,
-                        old_slab_id = ?old_slab.id(),
-                        "clear_and_schedule: deleting old slab entry"
-                    );
-                    ops.delete_slab_trigger(&old_slab, timer_type, key, old_time)
-                        .await
-                }
-            })
-            .buffer_unordered(DELETE_CONCURRENCY)
-            .try_collect::<()>()
-            .await?;
-
-        debug!(
-            key = %key,
-            timer_type = ?timer_type,
-            deleted_count = old_times.len(),
-            "clear_and_schedule: complete"
-        );
-
+        stream::iter(
+            old_times
+                .iter()
+                .copied()
+                .filter(|time| !keep.contains(time)),
+        )
+        .map(|old_time| {
+            let old_slab = Slab::from_time(slab_size, old_time);
+            let ops = &self.operations;
+            let key = &key;
+            async move {
+                ops.delete_slab_trigger(&old_slab, timer_type, key, old_time)
+                    .await
+            }
+        })
+        .buffer_unordered(DELETE_CONCURRENCY)
+        .try_collect::<()>()
+        .await?;
         Ok(())
     }
 }

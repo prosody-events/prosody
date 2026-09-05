@@ -12,7 +12,7 @@ use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::Debug;
 use strum::VariantArray;
@@ -92,20 +92,42 @@ impl Arbitrary for KeyTriggerTestInput {
         // Generate a slab size for this test (1 second to 7 days to avoid TTL overflow)
         let slab_size = CompactDuration::new(u32::arbitrary(g).clamp(1, 604_800));
 
-        // Generate 10-50 operations
-        let op_count = (usize::arbitrary(g) % 40) + 10;
+        // A dense trace crosses the eight-tag cache bound.
+        let dense = bool::arbitrary(g);
+        let shared_key = Key::from(KEY_POOL[usize::from(u8::arbitrary(g)) % KEY_POOL.len()]);
+        let shared_type =
+            TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
+        let base = CompactDateTime::arbitrary(g);
+        let op_count = (usize::arbitrary(g) % 40) + 16;
         let mut operations = Vec::with_capacity(op_count);
 
-        for _ in 0..op_count {
+        for index in 0..op_count {
             let key_idx = usize::from(u8::arbitrary(g)) % KEY_POOL.len();
             let key = Key::from(KEY_POOL[key_idx]);
 
             let timer_type =
                 TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
 
-            let time = CompactDateTime::arbitrary(g);
-
-            let op = match u8::arbitrary(g) % 8 {
+            let (key, timer_type, time) = if dense {
+                let offset = if index < 12 {
+                    index as u32
+                } else {
+                    u32::arbitrary(g) % 12
+                };
+                (
+                    shared_key.clone(),
+                    shared_type,
+                    CompactDateTime::from(base.epoch_seconds() + offset),
+                )
+            } else {
+                (key, timer_type, CompactDateTime::arbitrary(g))
+            };
+            let choice = if dense && index < 12 {
+                0
+            } else {
+                u8::arbitrary(g) % 8
+            };
+            let op = match choice {
                 0 => {
                     // Insert operation
                     let tag = derive_tag(&key, time, timer_type);
@@ -270,6 +292,7 @@ where
     let model_times = model.get_times(timer_type, key);
     let store_times: Vec<CompactDateTime> = operations
         .get_key_times(timer_type, key)
+        .map_ok(|(time, _)| time)
         .try_collect()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Get key times failed: {e:?}"))?;
@@ -342,6 +365,7 @@ where
     // Verify times match trigger times
     let store_times: Vec<CompactDateTime> = operations
         .get_key_times(timer_type, key)
+        .map_ok(|(time, _)| time)
         .try_collect()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Get key times failed: {e:?}"))?;
@@ -495,8 +519,8 @@ where
 /// 1. Start with empty store and model
 /// 2. Apply sequence of random operations to both
 /// 3. Verify that for every key:
-///    - `operations.get_key_times(type, key)` matches `model.get_times(type,
-///      key)`
+///    - The times from `operations.get_key_times(type, key)` match
+///      `model.get_times(type, key)`
 ///    - `operations.get_key_triggers(type, key)` matches
 ///      `model.get_triggers(type, key)`
 ///    - `operations.get_key_triggers_all_types(key)` matches
@@ -530,9 +554,40 @@ where
     }
 
     let mut model = KeyTriggerModel::new();
+    let mut touched = BTreeSet::new();
 
     for (op_idx, op) in input.operations.iter().enumerate() {
+        match op {
+            KeyTriggerOperation::Insert { trigger }
+            | KeyTriggerOperation::ClearAndSchedule { trigger } => {
+                touched.insert((trigger.key.clone(), trigger.time, trigger.timer_type));
+            }
+            KeyTriggerOperation::Delete {
+                key,
+                time,
+                timer_type,
+            } => {
+                touched.insert((key.clone(), *time, *timer_type));
+            }
+            KeyTriggerOperation::GetTimes { .. }
+            | KeyTriggerOperation::GetTriggers { .. }
+            | KeyTriggerOperation::GetAllTypes { .. }
+            | KeyTriggerOperation::ClearByType { .. }
+            | KeyTriggerOperation::ClearAllTypes { .. } => {}
+        }
         apply_operation(operations, &mut model, op, op_idx).await?;
+        let cold = operations.cold();
+        for (key, time, timer_type) in &touched {
+            let (warm_tag, cold_tag) = futures::try_join!(
+                operations.current_tag(key, *time, *timer_type),
+                cold.current_tag(key, *time, *timer_type),
+            )?;
+            color_eyre::eyre::ensure!(
+                warm_tag == cold_tag,
+                "Op #{op_idx}: cached tag differs for {key} at {time:?}: warm={warm_tag:?}, \
+                 cold={cold_tag:?}"
+            );
+        }
     }
 
     // Final sanity check: verify model-store equivalence for all keys

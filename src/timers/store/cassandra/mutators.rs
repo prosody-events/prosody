@@ -20,10 +20,10 @@
 //! before reading and hold through the write, serialising mutations per
 //! `(key, timer_type)` without a global lock.
 
+use super::state::OverflowTags;
 use crate::Key;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::slab::Slab;
 use crate::timers::store::SegmentId;
 use crate::timers::store::cassandra::CassandraTriggerStore;
 use crate::timers::store::cassandra::error::CassandraTriggerStoreError;
@@ -75,7 +75,7 @@ struct PromoteOverflowParams<'a> {
 fn require_inline(state: &TimerState) -> Result<&InlineTimer, CassandraTriggerStoreError> {
     match state {
         TimerState::Inline(timer) => Ok(timer),
-        TimerState::Overflow | TimerState::Absent => {
+        TimerState::Overflow(_) | TimerState::Absent => {
             Err(CassandraTriggerStoreError::AbsentStateNotSerializable)
         }
     }
@@ -310,58 +310,15 @@ impl CassandraTriggerStore {
         timer_type: TimerType,
         ttl_time: CompactDateTime,
     ) -> Result<(), CassandraTriggerStoreError> {
+        let overflow_state = TimerState::Overflow(OverflowTags::unknown());
         self.execute_with_optional_ttl(
             ttl_time,
             &self.queries().set_state_overflow_with_ttl,
             &self.queries().set_state_overflow,
-            |ttl| {
-                (
-                    ttl,
-                    timer_type,
-                    &TimerState::Overflow,
-                    segment_id,
-                    key.as_ref(),
-                )
-            },
-            || (timer_type, &TimerState::Overflow, segment_id, key.as_ref()),
+            |ttl| (ttl, timer_type, &overflow_state, segment_id, key.as_ref()),
+            || (timer_type, &overflow_state, segment_id, key.as_ref()),
         )
         .await
-    }
-
-    /// Rotates the commit-oracle tag on the slab index for an existing timer.
-    ///
-    /// Callers must only invoke this for timers they have observed as
-    /// scheduled. Like the key-index clustering update, a missed target would
-    /// write a partial row in Cassandra.
-    #[instrument(level = "debug", skip(self), err)]
-    pub(super) async fn update_slab_tag(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-        new_tag: i32,
-    ) -> Result<(), CassandraTriggerStoreError> {
-        let slab = Slab::from_time(self.segment.slab_size, time);
-        let slab_size = slab.size().seconds() as i32;
-        let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
-
-        self.session()
-            .execute_unpaged(
-                &self.queries().update_slab_tag,
-                (
-                    new_tag,
-                    &self.segment.id,
-                    slab_size,
-                    slab_id,
-                    timer_type,
-                    key.as_ref(),
-                    time,
-                ),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?;
-
-        Ok(())
     }
 
     /// Removes a state entry for a single timer type (returns to Absent).
@@ -667,7 +624,7 @@ impl CassandraTriggerStore {
         promoted: ClusteringEntry<'_>,
         new: ClusteringEntry<'_>,
     ) -> Result<(), CassandraTriggerStoreError> {
-        let overflow_state = TimerState::Overflow;
+        let overflow_state = TimerState::Overflow(OverflowTags::unknown());
         let ttl_time = promoted.time.max(new.time);
         let key_ref = key.as_ref();
 
@@ -746,6 +703,13 @@ impl CassandraTriggerStore {
             |ttl| (segment_id, key, timer_type, time, &span_map, tag, ttl),
             || (segment_id, key, timer_type, time, &span_map, tag),
         )
-        .await
+        .await?;
+
+        if let Some(handle) = self.state_cache.get(&(trigger.key.clone(), timer_type))
+            && let TimerState::Overflow(tags) = &mut *handle.lock().await
+        {
+            tags.insert(time, tag);
+        }
+        Ok(())
     }
 }

@@ -411,15 +411,8 @@ fn discard_uncommitted<S: StateLifecycle>(lifecycle: Option<&S>) {
 /// Rerun posture arms before commit. Its safety timer covers a crash before
 /// promotion because its refire must run the handler.
 ///
-/// These cases need first touch for recovery:
-///
-/// * Shutdown prevents the backstop arm after a permanent stage failure.
-/// * A replaced firing timer crashes before promotion. It has no slab row or
-///   backstop.
-/// * A new schedule recreates a committed timer's key row before its refire
-///   pops. The fire then runs the handler instead of the sweep.
-///
-/// First touch resolves each case through the oracle with the correct value.
+/// A permanent stage failure needs first touch if shutdown prevents its
+/// backstop arm. First touch uses the oracle to resolve the correct value.
 async fn settle_committed<'a, T, C, G>(
     handler: &T,
     context: C,

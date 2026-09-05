@@ -7,6 +7,7 @@
 //!
 //! [`TriggerScheduler`]: super::TriggerScheduler
 
+use super::BUFFER_SIZE;
 use super::{Command, CommandOperation};
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::Heartbeat;
@@ -24,7 +25,7 @@ use std::pin::pin;
 use std::time::Duration;
 use tokio::select;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::coop::cooperative;
 use tokio::time::{Instant, sleep_until};
 use tracing::{debug, warn};
@@ -49,6 +50,12 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// the state.
 pub(super) struct ActorState<T> {
     pub(super) store: T,
+    /// The trigger receiver and its hand-off. The first successful load sends
+    /// the receiver to the partition.
+    pub(super) ready: Option<(
+        oneshot::Sender<mpsc::Receiver<Trigger>>,
+        mpsc::Receiver<Trigger>,
+    )>,
     pub(super) segment: Segment,
     /// Slab metadata rows this actor has written or observed in the loaded
     /// prefix.
@@ -79,7 +86,7 @@ pub(super) async fn run_actor<T>(
     segment: Segment,
     mut triggers: TriggerQueue,
     mut commands: mpsc::Receiver<Command<T::Error>>,
-    trigger_tx: mpsc::Sender<Trigger>,
+    ready: oneshot::Sender<mpsc::Receiver<Trigger>>,
     heartbeat: Heartbeat,
     mut shutdown_rx: watch::Receiver<ShutdownPhase>,
 ) where
@@ -87,8 +94,10 @@ pub(super) async fn run_actor<T>(
 {
     let preload_window = calculate_preload(segment.slab_size);
     let now = Instant::now();
+    let (trigger_tx, receiver) = mpsc::channel(BUFFER_SIZE);
     let mut state: ActorState<T> = ActorState {
         store,
+        ready: Some((ready, receiver)),
         segment,
         known_slab_ids: BTreeSet::new(),
         last_persisted_watermark: None,
@@ -189,28 +198,37 @@ pub(super) async fn run_actor<T>(
 async fn process_command<T>(
     state: &mut ActorState<T>,
     triggers: &mut TriggerQueue,
-    Command {
-        operation,
-        trigger,
-        result_tx,
-    }: Command<T::Error>,
+    command: Command<T::Error>,
 ) where
     T: TriggerStore,
 {
-    let result: Result<(), T::Error> = match operation {
-        CommandOperation::Add => handle_add(state, triggers, trigger).await,
-        CommandOperation::Remove => {
-            triggers.remove(&trigger).await;
-            Ok(())
+    let (operation, trigger, result_tx) = match command {
+        Command::Apply {
+            operation,
+            trigger,
+            result_tx,
+        } => (operation, trigger, result_tx),
+        Command::Remove {
+            trigger,
+            key_tag,
+            result_tx,
+        } => {
+            let outcome = triggers.remove_if_live(&trigger, key_tag).await;
+            let _ = result_tx.send(outcome);
+            return;
         }
+        Command::Retag(trigger) => {
+            triggers.retag(&trigger);
+            return;
+        }
+    };
+    let result: Result<Option<Trigger>, T::Error> = match operation {
+        CommandOperation::Add => handle_add(state, triggers, trigger).await.map(|()| None),
         CommandOperation::AddToQueue => {
             triggers.insert_queue_only(trigger);
-            Ok(())
+            Ok(None)
         }
-        CommandOperation::RemoveFromQueue => {
-            triggers.remove_queue_only(&trigger);
-            Ok(())
-        }
+        CommandOperation::RemoveFromQueue => Ok(triggers.remove_queue_only(&trigger)),
     };
 
     // Ignore send errors: the caller will observe a closed reply channel as
@@ -456,6 +474,9 @@ where
 
     match load_result {
         Ok(count) => {
+            if let Some((sender, receiver)) = state.ready.take() {
+                let _ = sender.send(receiver);
+            }
             state.highest_loaded_slab_id = Some(target_slab_id);
             debug!(
                 start_slab_id,

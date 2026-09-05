@@ -15,7 +15,7 @@ use crate::timers::{
     PendingTimer, TimerManager, TimerManagerConfig, TimerSemaphores, TimerType, Trigger,
 };
 use color_eyre::eyre::{Result, eyre};
-use futures::Stream;
+use futures::{Stream, StreamExt, stream};
 use std::array::from_fn;
 use std::sync::Arc;
 use tokio::sync::{Semaphore, watch};
@@ -124,5 +124,6 @@ async fn setup_timer_manager_over_at(
     )
     .await
     .map_err(|e| eyre!("Failed to create timer manager: {}", e))?;
+    let stream = stream::iter(stream.await).flatten();
     Ok((stream, manager, shutdown_tx))
 }

@@ -10,6 +10,7 @@ use crate::consumer::receipted_sealed as sealed;
 use crate::consumer::{Keyed, Receipted, ReceiptedSource, Redelivery, Uncommitted};
 use crate::otel::SpanRelation;
 use crate::related_span;
+use crate::state::manager::KeySwept;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::TriggerTrace;
@@ -97,6 +98,26 @@ where
     uncommitted: UncommittedTrigger<T>,
 }
 
+/// A live fire whose coordinate holds an earlier attempt.
+///
+/// `swept` needs the proof that only the key sweep mints, so no handler can
+/// run before the sweep.
+pub(crate) struct UnsweptTimer<T: TriggerStore>(FiringTimer<T>);
+
+impl<T: TriggerStore> UnsweptTimer<T> {
+    pub(crate) fn key(&self) -> &Key {
+        self.0.key()
+    }
+
+    pub(crate) async fn abort(self) {
+        self.0.abort().await;
+    }
+
+    pub(crate) fn swept(self, _proof: KeySwept) -> FiringTimer<T> {
+        self.0
+    }
+}
+
 /// Classifies a fired timer before handler dispatch.
 pub(crate) enum Fired<T>
 where
@@ -104,6 +125,9 @@ where
 {
     /// The key row identifies a live attempt.
     Live(FiringTimer<T>),
+    /// The key row tag differs from the queued tag. An earlier attempt can
+    /// hold provisional cells, so the key sweep runs first.
+    Unswept(UnsweptTimer<T>),
     /// The key row is absent, so the attempt already committed.
     Committed(ReceiptedTimer<T>),
 }
@@ -116,7 +140,7 @@ where
     pub(crate) fn into_live(self) -> Option<FiringTimer<T>> {
         match self {
             Self::Live(timer) => Some(timer),
-            Self::Committed(..) => None,
+            Self::Unswept(..) | Self::Committed(..) => None,
         }
     }
 }
@@ -210,6 +234,10 @@ where
             Fire::Live(tag) => {
                 uncommitted.trigger.tag = tag;
                 Fired::Live(FiringTimer { uncommitted })
+            }
+            Fire::Unswept(tag) => {
+                uncommitted.trigger.tag = tag;
+                Fired::Unswept(UnsweptTimer(FiringTimer { uncommitted }))
             }
             Fire::Committed => Fired::Committed(ReceiptedTimer { inner: uncommitted }),
         })

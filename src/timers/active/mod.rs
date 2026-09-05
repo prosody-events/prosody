@@ -18,7 +18,7 @@
 //! | `UNSCHEDULED`          | absent                | -              | -                                      |
 //! | `SCHEDULED`            | `Scheduled`           | ✓              | ✓                                      |
 //! | `FIRING`               | `Firing`              | -              | ✓                                      |
-//! | `FIRING_REPLACED`      | `FiringReplaced`      | -              | -                                      |
+//! | `FIRING_REPLACED`      | `FiringReplaced`      | -              | slab row; no key row                   |
 //! | `FIRING_RESCHEDULED`   | `FiringRescheduled`   | ✓              | ✓                                      |
 //! | `PARKED`               | `Parked`              | -              | ✓ (slab row; key row unless receipted) |
 //!
@@ -69,7 +69,7 @@ pub enum TimerState {
     Firing,
 
     /// The handler still processes this attempt, but `clear_and_schedule`
-    /// replaced its rows. The coordinate has no durable rows or queue entry.
+    /// replaced its key row. Its slab row remains until complete or retire.
     FiringReplaced,
 
     /// Handler is processing this timer; the same (key, time, type) was
@@ -102,14 +102,10 @@ pub(crate) enum TimerOp {
     Retire,
     /// The delivery handler abandoned the attempt.
     Abort,
-    /// The new timer of a `clear_and_schedule`. Rows for this op and
-    /// [`ClearReplaced`](Self::ClearReplaced) carry [`StoreEffect::None`]:
-    /// the caller owns the single atomic `clear_and_schedule` store write,
-    /// which subsumes every per-row insert and delete.
+    /// Schedule the new coordinate. The clear write applies the store effects
+    /// for this coordinate and each [`ClearReplaced`](Self::ClearReplaced) row.
     ClearSchedule,
-    /// A replaced (old-time) timer of a `clear_and_schedule`. As
-    /// [`Unschedule`](Self::Unschedule), except the atomic store write
-    /// subsumes the row delete and the caller emits telemetry wholesale.
+    /// Replace an old coordinate. The clear write applies its slab delete.
     ClearReplaced,
 }
 
@@ -131,6 +127,8 @@ pub(crate) enum QueueEffect {
     Dequeue,
     /// Full scheduler `Add`: slab metadata, queue insert, registry insert.
     Insert,
+    /// Set the queued tag after the store rotates it.
+    Retag,
     /// Full scheduler `Remove`: queue removal plus registry removal.
     Remove,
     /// Registry-only removal; the queue entry was already popped by firing.
@@ -144,7 +142,10 @@ pub(crate) enum StoreEffect {
     None,
     /// Insert the timer row (`add_trigger`).
     Insert,
-    /// Delete the timer row (`remove_trigger`).
+    /// Insert only the key row (`add_key_row`).
+    InsertKeyRow,
+    /// Delete both rows. If the queue keeps an older source, delete only the
+    /// key row.
     Delete,
     /// Delete only the key-index row (`remove_key_row`).
     DeleteKeyRow,
@@ -226,6 +227,17 @@ impl Transition {
         store: StoreEffect::None,
         ordering: EffectOrder::MemoryThenStore,
         announce: None,
+    };
+    const PARK: Self = Self {
+        next_state: Some(TimerState::Parked),
+        ..Self::NONE
+    };
+    const SCHEDULE_KEY: Self = Self {
+        next_state: Some(TimerState::Scheduled),
+        store: StoreEffect::InsertKeyRow,
+        ordering: EffectOrder::StoreThenMemory,
+        announce: Some(Announce::Scheduled),
+        ..Self::NONE
     };
 
     /// The durable-store effect, if any.
@@ -429,11 +441,11 @@ pub(crate) fn transition(prior: Option<TimerState>, op: TimerOp) -> Transition {
             ..Transition::NONE
         },
 
-        // Restore the replaced rows before the next fire can enter the queue.
+        // Restore the key row before the next fire enters the queue.
         (Op::Schedule, Some(FiringReplaced)) => Transition {
             next_state: Some(FiringRescheduled),
             queue: QueueEffect::Enqueue,
-            store: StoreEffect::Insert,
+            store: StoreEffect::InsertKeyRow,
             ordering: StoreThenMemory,
             ..Transition::NONE
         },
@@ -459,16 +471,20 @@ pub(crate) fn transition(prior: Option<TimerState>, op: TimerOp) -> Transition {
             ..Transition::NONE
         },
 
-        // Remove the active entry. This coordinate has no durable rows.
-        (Op::Complete | Op::Retire | Op::Abort, Some(FiringReplaced)) => Transition::DEACTIVATE,
-
         // Write both rows before the scheduler can load them or queue the timer.
-        (Op::Schedule, Some(Scheduled | Parked) | None) => Transition {
-            next_state: Some(Scheduled),
+        (Op::Schedule, None) => Transition {
             queue: QueueEffect::Insert,
             store: StoreEffect::Insert,
-            ordering: StoreThenMemory,
-            announce: Some(Announce::Scheduled),
+            ..Transition::SCHEDULE_KEY
+        },
+
+        // Keep the queued trigger and its slab tag on a repeat schedule.
+        (Op::Schedule, Some(Scheduled)) => Transition::SCHEDULE_KEY,
+
+        // Queue the parked coordinate after its key row is ready.
+        (Op::Schedule, Some(Parked)) => Transition {
+            queue: QueueEffect::Insert,
+            ..Transition::SCHEDULE_KEY
         },
 
         // Cancel the next fire. The current attempt keeps its rows until commit.
@@ -489,6 +505,7 @@ pub(crate) fn transition(prior: Option<TimerState>, op: TimerOp) -> Transition {
         // Remove the replaced timer. The caller deletes its rows and emits telemetry.
         (Op::ClearReplaced, Some(Scheduled | Parked) | None) => Transition {
             queue: QueueEffect::Remove,
+            store: StoreEffect::DeleteSlabRow,
             ..Transition::NONE
         },
 
@@ -496,6 +513,7 @@ pub(crate) fn transition(prior: Option<TimerState>, op: TimerOp) -> Transition {
         (Op::Complete | Op::Receipt | Op::Retire, Some(FiringRescheduled)) => Transition {
             next_state: Some(Scheduled),
             store: StoreEffect::UpdateTag,
+            queue: QueueEffect::Retag,
             ordering: StoreThenMemory,
             ..Transition::NONE
         },
@@ -509,14 +527,14 @@ pub(crate) fn transition(prior: Option<TimerState>, op: TimerOp) -> Transition {
         // Park after the key-row delete. A failed delete leaves Firing, so the retry deletes the
         // row again.
         (Op::Receipt, Some(Firing)) => Transition {
-            next_state: Some(Parked),
             store: StoreEffect::DeleteKeyRow,
             ordering: StoreThenMemory,
-            ..Transition::NONE
+            ..Transition::PARK
         },
 
         // Remove the slab row after promotion. The timer has no queue entry.
-        (Op::Retire, Some(Firing | Parked) | None) => Transition {
+        (Op::Retire, Some(Firing | Parked | FiringReplaced) | None)
+        | (Op::Complete, Some(FiringReplaced)) => Transition {
             store: StoreEffect::DeleteSlabRow,
             ..Transition::DEACTIVATE
         },
@@ -529,16 +547,12 @@ pub(crate) fn transition(prior: Option<TimerState>, op: TimerOp) -> Transition {
 
         // Park a queued timer. Its rows remain for reload or another schedule.
         (Op::Abort, Some(Scheduled)) => Transition {
-            next_state: Some(Parked),
             queue: QueueEffect::Dequeue,
-            ..Transition::NONE
+            ..Transition::PARK
         },
 
         // Park the failed attempt. Its rows remain, and fire already removed its queue entry.
-        (Op::Abort, Some(Firing)) => Transition {
-            next_state: Some(Parked),
-            ..Transition::NONE
-        },
+        (Op::Abort, Some(Firing | FiringReplaced)) => Transition::PARK,
 
         // Queue the timer after the caller's atomic write restores its rows.
         (Op::ClearSchedule, Some(Scheduled | Parked) | None) => Transition {

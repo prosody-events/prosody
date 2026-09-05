@@ -106,7 +106,7 @@ cassandra_queries! {
 
         /// Gets all scheduled times for a key and timer type
         get_key_times: (
-            "SELECT time FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ?",
+            "SELECT time, tag FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ?",
             TABLE_TYPED_KEYS
         ),
 
@@ -466,14 +466,6 @@ cassandra_queries! {
         update_tag: (
             "UPDATE $keyspace.{} SET tag = ? WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?",
             TABLE_TYPED_KEYS
-        ),
-
-        /// Updates tag on an existing slab-index clustering row. Caller must
-        /// guarantee the row exists (see `update_tag`'s precondition); a
-        /// missed target would write a partial row.
-        update_slab_tag: (
-            "UPDATE $keyspace.{} SET tag = ? WHERE segment_id = ? AND slab_size = ? AND id = ? AND timer_type = ? AND key = ? AND time = ?",
-            TABLE_TYPED_SLABS
         ),
 
         /// Reads the tag from a single clustering row.

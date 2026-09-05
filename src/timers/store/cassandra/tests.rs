@@ -1,14 +1,10 @@
 //! Integration tests for [`CassandraTriggerStore`].
 //!
-//! These tests run against a real Cassandra node and are skipped automatically
-//! when one isn't available. They exist because the V3 state-column logic
-//! involves conditional write paths (inline vs. overflow vs. absent) and
-//! concurrent mutex semantics that are hard to exercise meaningfully with a
-//! mock. Running against actual Cassandra also catches serialisation bugs,
-//! TTL edge-cases, and UDT schema mismatches that unit tests cannot.
+//! These tests need Cassandra. They check stored rows and cached state.
 //!
 //! [`CassandraTriggerStore`]: super::CassandraTriggerStore
 
+use super::state::OverflowTags;
 use super::{CassandraTriggerStore, cassandra_store};
 use super::{InlineTimer, TimerState};
 use crate::Key;
@@ -206,8 +202,11 @@ async fn collect_key_times(
     timer_type: TimerType,
     key: &Key,
 ) -> Result<Vec<CompactDateTime>> {
-    let mut times: Vec<CompactDateTime> =
-        store.get_key_times(timer_type, key).try_collect().await?;
+    let mut times: Vec<CompactDateTime> = store
+        .get_key_times(timer_type, key)
+        .map_ok(|(time, _)| time)
+        .try_collect()
+        .await?;
     times.sort();
     Ok(times)
 }
@@ -303,8 +302,11 @@ async fn assert_state_and_reads(
                 expected.time
             );
         }
-        TimerState::Overflow => {
-            assert_eq!(state, TimerState::Overflow, "{phase}: expected Overflow");
+        TimerState::Overflow(_) => {
+            assert!(
+                matches!(state, TimerState::Overflow(_)),
+                "{phase}: expected Overflow"
+            );
         }
     }
 
@@ -324,13 +326,13 @@ async fn assert_state_and_reads(
                 expected.time,
             );
         }
-        TimerState::Overflow => {
+        TimerState::Overflow(_) => {
             assert!(
                 cached.is_some(),
                 "{phase}: cache should have Overflow entry"
             );
             assert!(
-                matches!(cached, Some(Ok(TimerState::Overflow))),
+                matches!(cached, Some(Ok(TimerState::Overflow(_)))),
                 "{phase}: cached state should be Overflow, got {cached:?}"
             );
         }
@@ -389,7 +391,7 @@ async fn test_state_transitions_schedule_promote_demote() -> Result<()> {
         &segment_id,
         tt,
         &key,
-        &TimerState::Overflow,
+        &TimerState::Overflow(OverflowTags::unknown()),
         &[t1, t2],
         "promote",
     )
@@ -702,7 +704,7 @@ async fn test_pre_migration_reads_and_migration() -> Result<()> {
     let state = store.fetch_state(&segment_id, &key_b, tt).await?;
     assert_eq!(
         state,
-        TimerState::Overflow,
+        TimerState::Overflow(OverflowTags::unknown()),
         "B post-backfill: expected Overflow"
     );
     assert_key_reads(&store, tt, &key_b, &[t1, t2], "B backfilled").await?;
@@ -911,10 +913,12 @@ async fn test_inline_state_round_trip() -> Result<()> {
     let (handle, _) = store
         .resolve_state(&segment_id, &key, TimerType::Application)
         .await?;
-    assert_eq!(
-        *handle.lock().await,
-        TimerState::Overflow,
-        "phase 4: expected Overflow after promotion"
+    assert!(
+        matches!(
+            *handle.lock().await,
+            TimerState::Overflow(OverflowTags::Complete(_))
+        ),
+        "phase 4: expected a complete Overflow list after promotion"
     );
 
     // Phase 5: clear_and_schedule_key(t4) on an overflow key → back to
@@ -934,6 +938,7 @@ async fn test_inline_state_round_trip() -> Result<()> {
     // Phase 6: Verify get_key_times returns exactly [t4].
     let times: Vec<CompactDateTime> = store
         .get_key_times(TimerType::Application, &key)
+        .map_ok(|(time, _)| time)
         .try_collect()
         .await?;
     assert_eq!(
@@ -1033,8 +1038,8 @@ async fn test_current_tag_inline_trigger() -> Result<()> {
         .map(|t| t.tag);
     assert_eq!(
         slab_tag,
-        Some(new_tag),
-        "update_tag must rotate the tag in the slab index"
+        Some(expected_tag),
+        "the slab row must keep its original tag"
     );
 
     store.remove_trigger(&key, time, timer_type).await?;
@@ -1237,7 +1242,11 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
     assert!(cached_b.is_none(), "store B cache should be cold (None)");
 
     // Store B can still read the data via shared keyspace (same segment ID).
-    let times: Vec<CompactDateTime> = ops_b.get_key_times(tt, &key).try_collect().await?;
+    let times: Vec<CompactDateTime> = ops_b
+        .get_key_times(tt, &key)
+        .map_ok(|(time, _)| time)
+        .try_collect()
+        .await?;
     assert_eq!(times, vec![t1], "store B should read t1 via shared session");
 
     // After the read, store B's cache should now be warm (Inline cached from DB).
@@ -1492,7 +1501,7 @@ async fn prop_timer_state_invariant(
                 }
                 n => {
                     assert!(
-                        matches!(timer_state, TimerState::Overflow),
+                        matches!(timer_state, TimerState::Overflow(_)),
                         "Invariant violation: {n} timers for ({key}, {timer_type:?}) but state is \
                          {timer_state:?} — expected Overflow"
                     );

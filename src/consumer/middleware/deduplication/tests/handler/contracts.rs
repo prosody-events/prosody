@@ -210,8 +210,8 @@ impl FallibleHandler for ApplyProbe {
 async fn apply_hooks_follow_inner_calls() -> color_eyre::Result<()> {
     for presence in [
         Ok(Presence::Absent),
-        Ok(Presence::Cached),
-        Ok(Presence::Durable),
+        Ok(Presence::Settled),
+        Ok(Presence::Inherited),
         Err(TestError::Transient),
     ] {
         for error in [None, Some(TestError::Permanent)] {

@@ -20,6 +20,7 @@
 //! - **Cross-backend compatibility**: Working with any `TriggerStore`
 //!   implementation
 
+use futures::TryStreamExt;
 use std::collections::{HashMap, HashSet as StdHashSet};
 use std::fmt::Debug;
 use std::hash::BuildHasher;
@@ -142,6 +143,7 @@ where
 {
     store
         .get_key_times(timer_type, key)
+        .map_ok(|(time, _)| time)
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -231,6 +233,7 @@ where
     // Get all trigger times for this key
     let times: Vec<CompactDateTime> = store
         .get_key_times(timer_type, key)
+        .map_ok(|(time, _)| time)
         .collect::<Vec<_>>()
         .await
         .into_iter()

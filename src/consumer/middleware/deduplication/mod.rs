@@ -1,8 +1,9 @@
 //! Filter messages through their commit markers.
 //!
-//! A cached marker skips the handler and commits the source. A durable marker
-//! also requests a recovery sweep. The settle boundary records each marker
-//! after it stages state. Both steps use the session's message identity.
+//! A marker from this assignment skips the handler and commits the source.
+//! An inherited marker also requests a recovery sweep. The settle boundary
+//! records each marker after it stages state. Both steps use the session's
+//! message identity.
 //!
 //! Apply hooks run only when the inner handler ran.
 
@@ -135,11 +136,10 @@ where
 pub enum DeduplicationOutput<O> {
     /// The inner handler ran.
     Ran(O),
-    /// The message settled in this process before. The source commits.
-    /// A source that shutdown kept for redelivery can return here after the
-    /// process regains the partition. First touch then resolves its cells.
+    /// This assignment already observed the marker. The source commits.
     Repeated,
-    /// An earlier owner recorded the marker. The boundary sweeps the key.
+    /// An earlier assignment or owner recorded the marker. The boundary sweeps
+    /// the key.
     Redelivered,
 }
 
@@ -176,8 +176,8 @@ where
                 .map_err(|error| DeduplicationError::Store(Box::new(error)))?;
             let output = match presence {
                 Presence::Absent => None,
-                Presence::Cached => Some(DeduplicationOutput::Repeated),
-                Presence::Durable => Some(DeduplicationOutput::Redelivered),
+                Presence::Settled => Some(DeduplicationOutput::Repeated),
+                Presence::Inherited => Some(DeduplicationOutput::Redelivered),
             };
             if let Some(output) = output {
                 info_span!(parent: message.span(), "message.filtered", reason = "deduplicated")

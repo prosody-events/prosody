@@ -40,6 +40,13 @@ use std::ops::RangeInclusive;
 /// `TableAdapter`), but is not re-exported from `store/mod.rs`, keeping it
 /// effectively internal.
 pub trait TriggerOperations: Clone + Send + Sync + 'static {
+    /// Test only: a store over the same rows with an empty cache.
+    #[cfg(test)]
+    #[must_use]
+    fn cold(&self) -> Self {
+        self.clone()
+    }
+
     /// Error type for storage operations.
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
@@ -159,7 +166,7 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
         &self,
         timer_type: TimerType,
         key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<(CompactDateTime, i32), Self::Error>> + Send;
 
     /// Streams all triggers for a given key and timer type.
     fn get_key_triggers(

@@ -8,6 +8,7 @@ use crate::{Partition, Topic};
 use quick_cache::sync::Cache;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Instant;
 use uuid::Uuid;
 
 /// Read durable markers through a shared cache.
@@ -17,15 +18,21 @@ pub struct CassandraDeduplicationStore {
     store: CassandraStore,
     queries: Arc<DeduplicationQueries>,
     ttl: i32,
-    cache: Arc<Cache<Uuid, ()>>,
+    cache: Arc<Cache<Uuid, Instant>>,
+    acquired: Instant,
 }
 
 impl DeduplicationStore for CassandraDeduplicationStore {
     type Error = CassandraStoreError;
 
     async fn lookup(&self, id: Uuid) -> Result<Presence, Self::Error> {
-        if self.cache.get(&id).is_some() {
-            return Ok(Presence::Cached);
+        if let Some(stamp) = self.cache.get(&id) {
+            return Ok(if stamp >= self.acquired {
+                Presence::Settled
+            } else {
+                self.cache.insert(id, Instant::now());
+                Presence::Inherited
+            });
         }
         let result = self
             .store
@@ -39,10 +46,10 @@ impl DeduplicationStore for CassandraDeduplicationStore {
             .is_some();
 
         if has_rows {
-            self.cache.insert(id, ());
+            self.cache.insert(id, Instant::now());
         }
         Ok(if has_rows {
-            Presence::Durable
+            Presence::Inherited
         } else {
             Presence::Absent
         })
@@ -53,7 +60,7 @@ impl DeduplicationStore for CassandraDeduplicationStore {
             .session()
             .execute_unpaged(&self.queries.insert_with_ttl, (id, self.ttl))
             .await?;
-        self.cache.insert(id, ());
+        self.cache.insert(id, Instant::now());
         Ok(())
     }
 }
@@ -64,7 +71,7 @@ pub struct CassandraDeduplicationStoreProvider {
     store: CassandraStore,
     queries: Arc<DeduplicationQueries>,
     ttl: i32,
-    cache: Arc<Cache<Uuid, ()>>,
+    cache: Arc<Cache<Uuid, Instant>>,
 }
 
 impl CassandraDeduplicationStoreProvider {
@@ -100,6 +107,7 @@ impl DeduplicationStoreProvider for CassandraDeduplicationStoreProvider {
             queries: self.queries.clone(),
             ttl: self.ttl,
             cache: self.cache.clone(),
+            acquired: Instant::now(),
         }
     }
 }

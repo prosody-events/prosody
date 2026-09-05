@@ -24,9 +24,15 @@ use scylla::deserialize::value::DeserializeValue;
 use scylla::deserialize::{DeserializationError, FrameSlice, TypeCheckError};
 use scylla::serialize::SerializationError;
 use scylla::serialize::value::SerializeValue;
+use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::mem;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
+
+/// Maximum number of cached tags for one key and timer type.
+const OVERFLOW_TAG_CAPACITY: usize = 8;
+type TagList = SmallVec<[(CompactDateTime, i32); OVERFLOW_TAG_CAPACITY]>;
 
 /// Cache key for the per-partition timer state cache.
 pub(super) type StateCacheKey = (Key, TimerType);
@@ -94,7 +100,60 @@ pub enum TimerState {
     /// Exactly one timer, stored inline in the state column.
     Inline(InlineTimer),
     /// Multiple timers exist; stored in clustering rows.
-    Overflow,
+    Overflow(OverflowTags),
+}
+
+/// Cached tags from clustering rows. Writes keep each stored pair current.
+/// The list never grows beyond `OVERFLOW_TAG_CAPACITY`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OverflowTags {
+    /// The list contains every row.
+    Complete(TagList),
+    /// Other rows can exist outside this list.
+    Partial(TagList),
+}
+
+/// Result of a cached tag lookup.
+pub(super) enum TagLookup {
+    /// The list holds the row's tag.
+    Known(i32),
+    /// The list is complete and holds no row at this time.
+    Absent,
+    /// The list is partial. Read the row.
+    Unknown,
+}
+
+impl OverflowTags {
+    pub(super) fn unknown() -> Self {
+        Self::Partial(SmallVec::new())
+    }
+
+    pub(super) fn get(&self, time: CompactDateTime) -> TagLookup {
+        let (Self::Complete(tags) | Self::Partial(tags)) = self;
+        match tags.iter().find(|(stored, _)| *stored == time) {
+            Some((_, tag)) => TagLookup::Known(*tag),
+            None => match self {
+                Self::Complete(_) => TagLookup::Absent,
+                Self::Partial(_) => TagLookup::Unknown,
+            },
+        }
+    }
+
+    pub(super) fn insert(&mut self, time: CompactDateTime, tag: i32) {
+        let (Self::Complete(tags) | Self::Partial(tags)) = self;
+        if let Some((_, stored)) = tags.iter_mut().find(|(stored, _)| *stored == time) {
+            *stored = tag;
+        } else if tags.len() < OVERFLOW_TAG_CAPACITY {
+            tags.push((time, tag));
+        } else if let Self::Complete(tags) = self {
+            *self = Self::Partial(mem::take(tags));
+        }
+    }
+
+    pub(super) fn remove(&mut self, time: CompactDateTime) {
+        let (Self::Complete(tags) | Self::Partial(tags)) = self;
+        tags.retain(|(stored, _)| *stored != time);
+    }
 }
 
 /// Cassandra UDT serde type for `key_timer_state`.
@@ -126,7 +185,7 @@ impl SerializeValue for TimerState {
                 span: Some(timer.span.clone()),
                 tag: Some(timer.tag),
             },
-            Self::Overflow => RawTimerState {
+            Self::Overflow(_) => RawTimerState {
                 inline: Some(false),
                 time: None,
                 span: None,
@@ -159,10 +218,10 @@ impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for TimerState {
                     span: raw.span.unwrap_or_default(),
                     tag: raw.tag.unwrap_or(0_i32),
                 })),
-                None => Ok(Self::Overflow),
+                None => Ok(Self::Overflow(OverflowTags::unknown())),
             }
         } else {
-            Ok(Self::Overflow)
+            Ok(Self::Overflow(OverflowTags::unknown()))
         }
     }
 }

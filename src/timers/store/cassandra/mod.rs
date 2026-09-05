@@ -55,7 +55,7 @@ pub(crate) mod migration;
 pub use crate::cassandra::CassandraConfiguration;
 pub use error::CassandraTriggerStoreError;
 pub use provider::{CassandraTriggerStoreProvider, cassandra_store};
-pub use state::{InlineTimer, TimerState};
+pub use state::{InlineTimer, OverflowTags, TimerState};
 
 /// Cassandra-based implementation of [`TriggerStore`](super::TriggerStore).
 ///

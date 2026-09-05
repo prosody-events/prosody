@@ -52,6 +52,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use scc::HashMap as ConcurrentHashMap;
 use std::error::Error;
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -230,13 +231,20 @@ pub trait PartitionStateManager: Clone + Send + Sync + 'static {
         T: TriggerStore;
 }
 
+/// Proof that the keyed-state sweep for one key ran.
+///
+/// Only `resolve_redelivered` mints it, so a step that needs it cannot run
+/// before the sweep.
+#[derive(Debug, PartialEq, Eq)]
+pub struct KeySwept(());
+
 /// What the fired `StateRecovery` trigger's commit guard should do once
 /// [`PartitionStateManager::recover`] returns.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum SweepResolution {
     /// Commit the fired trigger — the sweep made progress (resolved, a
     /// permanent per-cell skip, or a fresh backstop rescheduled).
-    Commit,
+    Commit(KeySwept),
 
     /// Abort the fired trigger — shutdown interrupted a reschedule, so let the
     /// trigger refire (and re-sweep) on the next partition acquisition.
@@ -369,7 +377,7 @@ where
         // point-clears another event's backstop: only this fired sweep clears,
         // and only its own.
         self.inner.armed.remove_async(&key).await;
-        self.resolve_sweep(key, timers, shutdown).await
+        self.resolve_redelivered(key, timers, shutdown).await
     }
 
     async fn resolve_redelivered<T>(
@@ -381,7 +389,10 @@ where
     where
         T: TriggerStore,
     {
-        self.resolve_sweep(key, timers, shutdown).await
+        match self.resolve_sweep(key, timers, shutdown).await {
+            ControlFlow::Continue(()) => SweepResolution::Commit(KeySwept(())),
+            ControlFlow::Break(()) => SweepResolution::Abort,
+        }
     }
 }
 
@@ -395,7 +406,7 @@ where
         key: Key,
         timers: &TimerManager<T>,
         shutdown: &watch::Receiver<ShutdownPhase>,
-    ) -> SweepResolution
+    ) -> ControlFlow<()>
     where
         T: TriggerStore,
     {
@@ -410,7 +421,7 @@ where
         {
             // Resolved, or a per-cell Permanent skip: commit and reschedule
             // nothing (see the trait doc for why).
-            Ok(()) => SweepResolution::Commit,
+            Ok(()) => ControlFlow::Continue(()),
             // Whole-sweep permanent failure: commit to stop refiring; first-touch
             // still recovers.
             Err(error) if error.classify_error() == ErrorCategory::Permanent => {
@@ -419,7 +430,7 @@ where
                     "keyed-state recovery sweep failed permanently: {error:#}; \
                      committing trigger (first-touch still recovers)"
                 );
-                SweepResolution::Commit
+                ControlFlow::Continue(())
             }
             // Transient/terminal failure: reschedule a fresh backstop, then
             // commit (never abort — see the trait doc).
@@ -446,7 +457,7 @@ where
         key: &Key,
         timers: &TimerManager<T>,
         shutdown: &watch::Receiver<ShutdownPhase>,
-    ) -> SweepResolution
+    ) -> ControlFlow<()>
     where
         T: TriggerStore,
     {
@@ -456,7 +467,7 @@ where
             .tightened_recovery_delay(self.inner.recovery_delay, self.inner.registry.collections());
         loop {
             if *shutdown.borrow() >= ShutdownPhase::Cancelling {
-                return SweepResolution::Abort;
+                return ControlFlow::Break(());
             }
             let fire = match CompactDateTime::now().and_then(|now| now.add_duration(delay)) {
                 Ok(fire) => fire,
@@ -484,14 +495,14 @@ where
                 },
             };
             if standing.is_some_and(|standing| standing <= fire) {
-                return SweepResolution::Commit;
+                return ControlFlow::Continue(());
             }
             let request =
                 TimerRequest::new(key.clone(), fire, TimerType::StateRecovery, Span::current());
             match timers.clear_and_schedule(request).await {
                 Ok(()) => {
                     self.inner.armed.upsert_async(key.clone(), fire).await;
-                    return SweepResolution::Commit;
+                    return ControlFlow::Continue(());
                 }
                 Err(error) => {
                     error!(error = %error, "failed to reschedule StateRecovery backstop; retrying");

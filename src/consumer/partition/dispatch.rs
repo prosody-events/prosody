@@ -142,12 +142,24 @@ async fn process_timer<T, S, M, P>(
     };
     let firing = match fired {
         Fired::Live(firing) => firing,
+        Fired::Unswept(firing) => {
+            match state_manager
+                .resolve_redelivered(firing.key().clone(), timer_manager, shutdown_rx)
+                .await
+            {
+                SweepResolution::Commit(proof) => firing.swept(proof),
+                SweepResolution::Abort => {
+                    firing.abort().await;
+                    return;
+                }
+            }
+        }
         Fired::Committed(source) => {
             match state_manager
                 .resolve_redelivered(source.key().clone(), timer_manager, shutdown_rx)
                 .await
             {
-                SweepResolution::Commit => source.retire().await,
+                SweepResolution::Commit(_) => source.retire().await,
                 SweepResolution::Abort => source.keep().await,
             }
             return;
@@ -163,7 +175,7 @@ async fn process_timer<T, S, M, P>(
             .recover(trigger.key.clone(), timer_manager, shutdown_rx)
             .await
         {
-            SweepResolution::Commit => commit_guard.commit().await,
+            SweepResolution::Commit(_) => commit_guard.commit().await,
             SweepResolution::Abort => commit_guard.abort().await,
         }
         return;

@@ -23,6 +23,13 @@ pub struct TriggerQueue {
     active: ActiveTriggers,
 }
 
+/// Whether a cancel removed the timer or kept an older recovery source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoveOutcome {
+    Removed,
+    KeptSource,
+}
+
 impl TriggerQueue {
     /// Creates a new, empty [`TriggerQueue`].
     pub fn new() -> Self {
@@ -67,28 +74,25 @@ impl TriggerQueue {
         Some(expired.into_inner())
     }
 
-    /// Removes a [`Trigger`] from both the delay queue and the active registry.
-    ///
-    /// Handles two cases:
-    /// 1. Timer is still in the delay queue: removes from both queue and
-    ///    [`ActiveTriggers`]
-    /// 2. Timer was delivered but not yet fired: removes from
-    ///    [`ActiveTriggers`] only (queue removal is a no-op)
-    ///
-    /// This is idempotent: calling remove on an already-removed trigger has no
-    /// effect.
-    pub async fn remove(&mut self, trigger: &Trigger) {
-        // Remove from delay queue if present (may have already been delivered).
-        if let Some(queue_key) = self.queue_keys.remove(trigger) {
-            self.queue.remove(&queue_key);
+    /// Remove a live schedule. Keep a queued source whose key tag differs.
+    pub(crate) async fn remove_if_live(
+        &mut self,
+        trigger: &Trigger,
+        key_tag: Option<i32>,
+    ) -> RemoveOutcome {
+        if let Some(queue_key) = self.queue_keys.get_mut(trigger) {
+            let item = self.queue.remove(queue_key);
+            if Some(item.get_ref().tag) != key_tag {
+                let deadline = item.deadline();
+                *queue_key = self.queue.insert_at(item.into_inner(), deadline);
+                return RemoveOutcome::KeptSource;
+            }
+            self.queue_keys.remove(trigger);
         }
-
-        // Always remove from ActiveTriggers. This handles the case where the
-        // timer was delivered from the queue (removed from queue_keys) but not
-        // yet transitioned to Firing via fire(). The remove is idempotent.
         self.active
             .remove(&trigger.key, trigger.time, trigger.timer_type)
             .await;
+        RemoveOutcome::Removed
     }
 
     /// Adds a [`Trigger`] to the `DelayQueue` without modifying
@@ -122,20 +126,28 @@ impl TriggerQueue {
         true
     }
 
+    /// Change the queued tag without changing its deadline or trace.
+    pub(crate) fn retag(&mut self, trigger: &Trigger) {
+        if let Some(queue_key) = self.queue_keys.get_mut(trigger) {
+            let mut item = self.queue.remove(queue_key);
+            let deadline = item.deadline();
+            item.get_mut().tag = trigger.tag;
+            *queue_key = self.queue.insert_at(item.into_inner(), deadline);
+        }
+    }
+
     /// Removes a [`Trigger`] from the `DelayQueue` without modifying
     /// `ActiveTriggers`.
     ///
     /// Used for canceling a reschedule: the caller transitions the state
     /// from `FiringRescheduled` back to `Firing` and only needs the timer
     /// removed from the queue.
-    pub(crate) fn remove_queue_only(&mut self, trigger: &Trigger) {
+    pub(crate) fn remove_queue_only(&mut self, trigger: &Trigger) -> Option<Trigger> {
         // Look up and remove the trigger's delay queue key.
-        let Some(queue_key) = self.queue_keys.remove(trigger) else {
-            return;
-        };
+        let queue_key = self.queue_keys.remove(trigger)?;
 
         // Remove from the delay queue only, not from ActiveTriggers.
-        self.queue.remove(&queue_key);
+        Some(self.queue.remove(&queue_key).into_inner())
     }
 }
 

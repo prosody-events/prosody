@@ -672,7 +672,7 @@ async fn verify_key_state_invariant(
                     ));
                 }
             }
-            n if *n >= 2 && !matches!(state, TimerState::Overflow) => {
+            n if *n >= 2 && !matches!(state, TimerState::Overflow(_)) => {
                 return Err(color_eyre::eyre::eyre!(
                     "Key state invariant violated: ({}, {:?}) has {n} triggers but state is \
                      {state:?}, expected Overflow",
