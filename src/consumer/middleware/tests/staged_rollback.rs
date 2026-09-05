@@ -20,39 +20,36 @@ use std::future::ready;
 use tokio::runtime::Builder;
 use uuid::Uuid;
 
-/// Shutdown between a successful stage and the backstop arm drives
-/// settle's ONE reachable rollback: the guard aborts, the staged cell
-/// rolls back to its committed base (here absent, so the cell resolves
-/// away), and `after_abort` fires. The abort itself proves the staged arm
-/// ran — a `Clean` finalize would have committed instead.
+/// Shutdown before the stage aborts the guard and discards the buffered cells.
 #[tokio::test]
-async fn arm_shutdown_rolls_the_staged_cells_back() -> Result<()> {
-    let (context, cell_store, cart_id) = buffered(Ctx::with_shutdown_on_timer_read).await?;
+async fn shutdown_before_stage_discards_buffered_cells() -> Result<()> {
+    let (context, cell_store, cart_id) = buffered(|context| context).await?;
+    let context = context.with_shutdown();
     let handler = ProbeHandler::ok(0);
     let log = handler.log.clone();
-    let (guard, committed, aborted) = RecordingGuard::new_reruns();
+    let (guard, committed, aborted) = RecordingGuard::new();
 
     settle(&handler, context, guard, Ok(0)).await;
 
     assert_eq!(
         aborted.load(Ordering::SeqCst),
         1,
-        "arm-shutdown must abort the guard"
+        "shutdown must abort the guard"
     );
     assert_eq!(committed.load(Ordering::SeqCst), 0);
     assert!(
         !is_provisional(&cell_store, &cart_id).await?,
-        "the receipt's rollback must settle the staged cell",
+        "shutdown must leave no staged cell",
     );
     assert_eq!(
         committed_value(&cell_store, &cart_id).await?,
         None,
-        "rollback restores the absent committed base — not the staged value",
+        "shutdown preserves the absent committed base",
     );
     assert_eq!(
         log.lock().clone(),
         vec![HookEvent::AfterAbort(Ok(0))],
-        "the arm-shutdown abort fires after_abort exactly once",
+        "shutdown fires after_abort exactly once",
     );
     Ok(())
 }
@@ -354,7 +351,7 @@ async fn settle_case(
         |context| fail_timer_writes(context, timer_failure),
     )
     .await?;
-    let posture = posture % 3;
+    let posture = posture % 2;
     let late_shutdown = late_shutdown
         && !shutdown
         && posture == 1
@@ -369,11 +366,7 @@ async fn settle_case(
     if shutdown {
         context = context.with_shutdown();
     }
-    let (guard, committed, aborted) = if posture == 2 {
-        RecordingGuard::new_reruns()
-    } else {
-        RecordingGuard::new()
-    };
+    let (guard, committed, aborted) = RecordingGuard::new();
     let receipts = guard.receipts.clone();
     let kept = guard.kept.clone();
     let receipt_saw_provisional = Arc::new(AtomicBool::new(false));
@@ -411,7 +404,7 @@ async fn settle_case(
     let expected_armed = usize::from(
         !expected_abort
             && !late_shutdown
-            && (posture == 2 || (posture == 1 && failing) || (posture == 0 && transient)),
+            && ((posture == 1 && failing) || (posture == 0 && transient)),
     );
     if aborted != usize::from(expected_abort)
         || committed != usize::from(!expected_abort && !late_shutdown)

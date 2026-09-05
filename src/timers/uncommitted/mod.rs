@@ -7,14 +7,13 @@
 
 use crate::consumer::partition::ShutdownPhase;
 use crate::consumer::receipted_sealed as sealed;
-use crate::consumer::{Keyed, Receipted, ReceiptedSource, Redelivery, Uncommitted};
+use crate::consumer::{Keyed, Receipted, ReceiptedSource, Uncommitted};
 use crate::otel::SpanRelation;
 use crate::related_span;
 use crate::state::manager::KeySwept;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::TriggerTrace;
-use crate::timers::active::TimerState;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::manager::{Fire, TimerManager};
 use crate::timers::store::TriggerStore;
@@ -326,10 +325,6 @@ where
 {
     type Source = ReceiptedTimer<T>;
 
-    async fn redelivery(&self) -> Redelivery {
-        self.uncommitted.redelivery().await
-    }
-
     async fn receipt(self) -> Self::Source {
         self.uncommitted.receipt().await
     }
@@ -382,10 +377,6 @@ where
 {
     type Source = ReceiptedTimer<T>;
 
-    async fn redelivery(&self) -> Redelivery {
-        self.inner.redelivery().await
-    }
-
     async fn receipt(self) -> Self::Source {
         self.inner.receipt().await
     }
@@ -397,28 +388,6 @@ impl<T> UncommittedTrigger<T>
 where
     T: TriggerStore,
 {
-    async fn redelivery(&self) -> Redelivery {
-        if self.trigger.timer_type != TimerType::Application {
-            // Defer refires reload queued work that the defer middleware owns.
-            return Redelivery::Reruns;
-        }
-
-        let state = self
-            .manager
-            .timer_state(
-                &self.trigger.key,
-                self.trigger.time,
-                self.trigger.timer_type,
-            )
-            .await;
-        // A rescheduled refire must run the application handler again.
-        if matches!(state, Some(TimerState::FiringRescheduled(_))) {
-            Redelivery::Reruns
-        } else {
-            Redelivery::Sweeps
-        }
-    }
-
     async fn receipt(self) -> ReceiptedTimer<T> {
         let manager = &self.manager;
         let trigger = &self.trigger;

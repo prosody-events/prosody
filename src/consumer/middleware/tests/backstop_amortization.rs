@@ -90,35 +90,6 @@ async fn incomplete_commits_arm_once_while_timer_stands() -> Result<()> {
     Ok(())
 }
 
-/// Two rerun-posture commits share one standing safety timer.
-#[tokio::test]
-async fn rerun_commits_arm_once_while_timer_stands() -> Result<()> {
-    let armed: ArmedKeys = Arc::default();
-    let mut scheduled = 0;
-
-    for sentinel in 0..2 {
-        let context = buffered_with(
-            armed.clone(),
-            Some((ErrorCategory::Permanent, 1)),
-            None,
-            MockEventContext::with_timer_tracking,
-        )
-        .await?
-        .0;
-        let handler = ProbeHandler::ok(sentinel);
-        let (guard, committed, aborted) = RecordingGuard::new_reruns();
-
-        settle(&handler, context.clone(), guard, Ok(sentinel)).await;
-
-        assert_eq!(committed.load(Ordering::SeqCst), 1);
-        assert_eq!(aborted.load(Ordering::SeqCst), 0);
-        scheduled += context.count_scheduled(TimerType::StateRecovery);
-    }
-
-    assert_eq!(scheduled, 1, "the standing timer covers the later rerun");
-    Ok(())
-}
-
 /// The amortization is per key: a commit on a different key arms its own
 /// backstop even while the first key's stands.
 #[tokio::test]

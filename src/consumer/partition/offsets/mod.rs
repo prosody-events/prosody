@@ -27,7 +27,7 @@ use tokio::{select, spawn};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::consumer::receipted_sealed as sealed;
-use crate::consumer::{Receipted, ReceiptedSource, Redelivery, Uncommitted};
+use crate::consumer::{Receipted, ReceiptedSource, Uncommitted};
 use crate::{Offset, Partition, Topic};
 
 #[cfg(test)]
@@ -206,10 +206,6 @@ impl sealed::Sealed for UncommittedOffset {}
 
 impl Receipted for UncommittedOffset {
     type Source = Self;
-
-    fn redelivery(&self) -> impl Future<Output = Redelivery> + Send {
-        ready(Redelivery::Sweeps)
-    }
 
     fn receipt(self) -> impl Future<Output = Self::Source> + Send {
         ready(self)

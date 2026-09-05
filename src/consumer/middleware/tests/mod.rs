@@ -35,7 +35,7 @@ use crate::consumer::middleware::tests::test_support::{
 };
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::receipted_sealed;
-use crate::consumer::{EventHandler, Receipted, ReceiptedSource, Redelivery, Uncommitted};
+use crate::consumer::{EventHandler, Receipted, ReceiptedSource, Uncommitted};
 use crate::error::ErrorCategory;
 use crate::state::CollectionId;
 use crate::state::memory::MemoryCellStore;
@@ -173,7 +173,7 @@ struct RecordingGuard {
     aborted: Arc<AtomicUsize>,
     receipts: Arc<AtomicUsize>,
     kept: Arc<AtomicUsize>,
-    redelivery: Redelivery,
+
     order: Option<GuardOrder>,
 }
 
@@ -196,18 +196,12 @@ impl RecordingGuard {
                 aborted: aborted.clone(),
                 receipts: Arc::default(),
                 kept: Arc::default(),
-                redelivery: Redelivery::Sweeps,
+
                 order: None,
             },
             committed,
             aborted,
         )
-    }
-
-    fn new_reruns() -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
-        let (mut guard, committed, aborted) = Self::new();
-        guard.redelivery = Redelivery::Reruns;
-        (guard, committed, aborted)
     }
 
     fn with_order(
@@ -242,10 +236,6 @@ impl receipted_sealed::Sealed for RecordingGuard {}
 
 impl Receipted for RecordingGuard {
     type Source = Self;
-
-    fn redelivery(&self) -> impl Future<Output = Redelivery> + Send {
-        ready(self.redelivery)
-    }
 
     async fn receipt(self) -> Self::Source {
         self.receipts.fetch_add(1, Ordering::SeqCst);
@@ -379,7 +369,7 @@ async fn after_commit_for_timer_path_with_ok_output() {
                 aborted: self.aborted.clone(),
                 receipts: Arc::default(),
                 kept: Arc::default(),
-                redelivery: Redelivery::Sweeps,
+
                 order: None,
             };
             (trigger, guard)
@@ -541,15 +531,9 @@ mod staged_rollback;
 
 mod arm_backstop;
 mod backstop_amortization;
-/// Post-settle hook visibility: `finalize` drains the event's dirty overlay
-/// on success, so the apply hooks read the **lower store** — the per-cell
-/// committed projection, where an own-event provisional cell answers its
-/// committed base `prev` — never the event's pre-settle overlay. One pin per
-/// ruled-on window: the arm-shutdown rollback's `after_abort` reads the
-/// restored committed base; the ambiguous marker-record shutdown's
-/// `after_abort` reads `prev` (staged cells deliberately left provisional);
-/// the `Incomplete`-promote `after_commit` reads the mixed per-cell view
-/// (promoted cells the new values, un-promoted cells `prev`).
+/// Apply hooks read the committed projection after settlement.
+/// Shutdown before the stage preserves the base. An ambiguous marker write
+/// leaves provisional cells. Incomplete promotion exposes each cell's result.
 mod hook_visibility;
 mod marker_record_must_succeed;
 mod settled_view;

@@ -309,7 +309,7 @@ async fn uncommitted_message(offset: Offset) -> Result<(UncommittedMessage<Value
 /// marker records, the offset commits — and firing the defer timer
 /// re-runs the leaf unfiltered.
 #[tokio::test]
-async fn defer_swallow_records_nothing_and_reload_reruns() -> Result<()> {
+async fn defer_swallow_records_nothing_and_reload_retries() -> Result<()> {
     let fx = Fixture::new()?;
     let (session, cell_store, dirty, recorded) = fx.session(EventRef::Message {
         dedup_id: message_id(0),
@@ -399,7 +399,7 @@ async fn reload_records_the_reloaded_marker_and_redelivery_filters() -> Result<(
     assert_eq!(committed.load(Ordering::SeqCst), 1, "the trigger commits");
     assert_eq!(fx.leaf.processed(), vec![0], "the leaf ran once");
 
-    // Redelivery of the original message: the settle-recorded id reaches
+    // The next delivery of the original message: the settle-recorded id reaches
     // the dedup store (in production the oracle IS the dedup store), and
     // the filter — reading the message session's EventRef id — skips the
     // leaf without recording a second marker.

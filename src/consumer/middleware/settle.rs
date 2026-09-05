@@ -1,7 +1,6 @@
 //! Owns keyed-state durability after the middleware stack returns.
 //!
 //! Sweep posture uses stage → marker → receipt → promote → retire.
-//! Rerun posture uses stage → arm → marker → commit → promote.
 //!
 //! Both durability boundaries — the blanket [`EventHandler`] impl in the
 //! parent module and [`RetryHandler`](super::retry::RetryHandler) — route
@@ -29,13 +28,12 @@ use tracing::{error, warn};
 
 use super::FallibleHandler;
 use crate::consumer::event_context::EventContext;
-use crate::consumer::{Receipted, ReceiptedSource, Redelivery};
+use crate::consumer::{Receipted, ReceiptedSource};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::access::StateAccessError;
 use crate::state::descriptor::Registered;
 use crate::state::session::sealed::{ApplyOutcome, MarkerIdentity, Promotable, StateLifecycle};
 use crate::state::session::{Finalized, LifecycleAccess, MessageMarker, OpPermit};
-use crate::state::store::CellStore;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -67,7 +65,7 @@ impl<C: EventContext> SettlementAccess for C {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Settlement {
     /// The result is the event's own outcome (the dispatch reached the
-    /// handler layer). An `Ok` result uses its redelivery posture.
+    /// handler layer). An `Ok` result uses the durability sequence.
     /// Err: record the marker iff the category is Permanent; commit.
     Final,
 
@@ -194,9 +192,8 @@ enum StepOutcome<R> {
 /// Outcome of arming the `StateRecovery` backstop.
 ///
 /// Some recovery paths require a durable safety timer before source retirement.
-/// [`arm_backstop`] retries every non-shutdown failure. These paths include a
-/// rerun stage, incomplete promotion, duplicate sweep failure, and permanent
-/// stage failure.
+/// [`arm_backstop`] retries every non-shutdown failure. These paths include an
+/// incomplete promotion, duplicate sweep failure, and permanent stage failure.
 pub(super) enum ArmOutcome {
     /// The backstop is armed, or a standing one already guards this commit.
     Armed,
@@ -206,20 +203,7 @@ pub(super) enum ArmOutcome {
     ShuttingDown,
 }
 
-/// State prepared for the marker and source-settlement steps.
-enum PreparedState<S: CellStore> {
-    /// The event staged no provisional cells.
-    Clean,
-    /// The committed delivery sweeps these cells.
-    Sweeps {
-        promotable: Promotable<S>,
-        recovery_delay: CompactDuration,
-    },
-    /// The backstop is armed. Another delivery runs the handler.
-    Reruns { promotable: Promotable<S> },
-}
-
-/// Owns both durability sequences after the stack returns its final result.
+/// Owns the durability sequence after the stack returns its final result.
 /// Both the blanket [`EventHandler`] impl and
 /// [`RetryHandler`](super::retry::RetryHandler) route their final outcome
 /// here, so the wrong ordering (marker before stage) is structurally
@@ -229,7 +213,7 @@ enum PreparedState<S: CellStore> {
 /// category second: a [`Settlement::Bypassed`] result stages nothing and
 /// records no marker (see the variant's parity argument); a
 /// [`Settlement::Duplicate`] result sweeps before source retirement. A
-/// [`Settlement::Final`] result runs the selected sequence on `Ok`, records the
+/// [`Settlement::Final`] result runs the sequence on `Ok`, records the
 /// marker without a stage on a Permanent error, and commits bare on a
 /// Transient one. A Terminal error always abandons, before the
 /// classification is even consulted — commit-on-Terminal is unwritable
@@ -379,11 +363,7 @@ fn discard_uncommitted<S: StateLifecycle>(lifecycle: Option<&S>) {
     }
 }
 
-/// Applies the success sequence for the event's redelivery posture.
-///
-/// Sweep posture records the receipt before promotion. It retires the source
-/// after promotion. Rerun posture arms before its combined commit and
-/// promotion.
+/// Records the receipt before promotion, then retires the source.
 ///
 /// The marker is read from the session's event identity
 /// (`message_marker()`: the message `EventRef`'s dedup id, or the
@@ -395,21 +375,19 @@ fn discard_uncommitted<S: StateLifecycle>(lifecycle: Option<&S>) {
 ///
 /// Message sweep posture closes these crash windows:
 ///
-/// * A crash before the marker leaves the offset active. Redelivery reruns the
-///   handler.
+/// * A crash before the marker leaves the offset active. The next delivery runs
+///   the handler.
 /// * A crash after the marker leaves the offset active. Deduplication
 ///   classifies redelivery as `Duplicate`, which sweeps state.
 /// * A crash after promotion leaves the offset active. Duplicate redelivery
 ///   retires it.
 /// * A crash after offset commit leaves no pending state.
 ///
-/// A timer receipt is its commit marker. A crash before receipt reruns the
-/// handler. First-touch resolves provisional cells from the abandoned timer
-/// attempt. A crash after receipt causes the committed-refire path to sweep and
-/// retire the slab row.
-///
-/// Rerun posture arms before commit. Its safety timer covers a crash before
-/// promotion because its refire must run the handler.
+/// A timer receipt is its commit marker. Before receipt, the next delivery
+/// runs the handler. First touch resolves cells from the abandoned attempt.
+/// After receipt, recovery sweeps the key before it retires the slab row.
+/// A rescheduled coordinate keeps its slab tag. Receipt rotates its key tag,
+/// so recovery sweeps the old attempt before it starts the next live attempt.
 ///
 /// A permanent stage failure needs first touch if shutdown prevents its
 /// backstop arm. First touch uses the oracle to resolve the correct value.
@@ -469,32 +447,10 @@ async fn settle_committed<'a, T, C, G>(
 
     crash_point().await;
 
-    // Capture the delay once. Arm before certification when delivery reruns.
-    let prepared = match (finalized, guard.redelivery().await) {
-        (Finalized::Clean, _) => PreparedState::Clean,
-        (Finalized::Staged(staged), redelivery) => {
-            let recovery_delay = staged.recovery_delay();
-            match redelivery {
-                Redelivery::Sweeps => PreparedState::Sweeps {
-                    promotable: staged.certify(),
-                    recovery_delay,
-                },
-                Redelivery::Reruns => match arm_backstop(&context, lifecycle, recovery_delay).await
-                {
-                    ArmOutcome::Armed => PreparedState::Reruns {
-                        promotable: staged.certify(),
-                    },
-                    ArmOutcome::ShuttingDown => {
-                        // No marker write has started. The stage can still roll back.
-                        guard.abort().await;
-                        staged.rollback().await;
-                        drop(permit);
-                        fire_apply_hook(handler, context, false, result).await;
-                        return;
-                    }
-                },
-            }
-        }
+    // 2. Capture the delay and certify before the marker write.
+    let prepared = match finalized {
+        Finalized::Clean => None,
+        Finalized::Staged(staged) => Some((staged.recovery_delay(), staged.certify())),
     };
 
     // 3. Record the message marker after the stage. Timer events have no
@@ -522,21 +478,12 @@ async fn settle_committed<'a, T, C, G>(
 
     crash_point().await;
 
-    // 4. Apply the selected receipt and promotion order.
+    // 4. Receipt, promote, and retire staged state.
     match prepared {
-        PreparedState::Clean => {
-            guard.commit().await;
+        None => guard.commit().await,
+        Some((recovery_delay, promotable)) => {
+            settle_sweep_posture(&context, lifecycle, guard, promotable, recovery_delay).await;
         }
-        PreparedState::Reruns { promotable } => {
-            guard.commit().await;
-            if promotable.promote().await == ApplyOutcome::Incomplete {
-                warn!("keyed-state promote incomplete; the StateRecovery sweep will retry");
-            }
-        }
-        PreparedState::Sweeps {
-            promotable,
-            recovery_delay,
-        } => settle_sweep_posture(&context, lifecycle, guard, promotable, recovery_delay).await,
     }
 
     // 5. The permit drops before the apply hook, so hook reads can proceed.
@@ -580,9 +527,7 @@ async fn settle_sweep_posture<C, G>(
 ///
 /// Never *promotes* keyed state: certified staged cells (if any exist) stay
 /// provisional for redelivery, first-touch, or the armed sweep to resolve
-/// through the oracle — the one inline rollback lives at the arm-shutdown arm
-/// of `settle_committed`, where possession of the un-certified receipt proves
-/// it is sound. It does discard the uncommitted dirty overlay under the held
+/// through the oracle. It discards the uncommitted dirty overlay under the held
 /// permit (abandon is never a successful finalize), so a leaked hook-window
 /// read observes committed truth, not aborted-attempt residue; the commit-now
 /// floor survives (its cells drained at `commit()` time).
@@ -647,8 +592,8 @@ async fn fire_apply_hook<T, C>(
 /// arm-if-sooner rule. Per-key serialization prevents a sweep during this
 /// decision. Only the fired sweep clears the entry (finding F2).
 ///
-/// Rerun stages arm before commit. Incomplete promotions and failed duplicate
-/// sweeps arm before retirement. Permanent stage failures also request an arm.
+/// Incomplete promotions and failed duplicate sweeps arm before retirement.
+/// Permanent stage failures also request an arm.
 /// `delay` comes from the stage, or from `fallback_recovery_delay` when no
 /// stage exists.
 pub(super) async fn arm_backstop<C>(

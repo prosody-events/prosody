@@ -19,12 +19,9 @@ use crate::timers::UncommittedTimer;
 /// ```text
 /// Bypassed final                → commit → after_commit (no stage, no marker)
 /// Final Ok  → stage provisional cells / write resolved (retry transient failures in place)
-///           → rerun posture only: arm the StateRecovery backstop
-///             (arm-if-sooner; per-key singleton)
 ///           → record the message marker (read from the session's event
 ///             identity; STRICTLY after the stage)
-///           → sweep posture: receipt → promote → retire the source
-///           → rerun posture: commit the source → promote
+///           → receipt → promote → retire the source
 ///           → after_commit(Ok)
 /// Final Err Transient/Permanent → record marker iff Permanent → commit → after_commit(Err)
 /// Err Terminal                  → abort → after_abort
@@ -32,8 +29,7 @@ use crate::timers::UncommittedTimer;
 ///
 /// Because the marker record is textually *after* the stage in one function,
 /// the marker-before-durable-state bug class is **unwritable**, not merely
-/// avoided. The crash-window argument for the full step order — including
-/// why each posture uses its order — lives on
+/// avoided. The crash windows for the step order are documented on
 /// `settle_committed` in `settle.rs`. The timer marker (trigger tag) is
 /// written outside the stack by the marker commit; the message marker here
 /// restores message/timer symmetry.

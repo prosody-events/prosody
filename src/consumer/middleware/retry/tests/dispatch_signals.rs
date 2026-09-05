@@ -16,7 +16,7 @@ use super::*;
 
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::receipted_sealed;
-use crate::consumer::{Keyed, Receipted, ReceiptedSource, Redelivery, Uncommitted};
+use crate::consumer::{Keyed, Receipted, ReceiptedSource, Uncommitted};
 use crate::timers::UncommittedTimer;
 use color_eyre::eyre::{Result, bail};
 use crossbeam_utils::CachePadded;
@@ -42,10 +42,6 @@ impl receipted_sealed::Sealed for MockCommitGuard {}
 
 impl Receipted for MockCommitGuard {
     type Source = Self;
-
-    fn redelivery(&self) -> impl Future<Output = Redelivery> + Send {
-        ready(Redelivery::Sweeps)
-    }
 
     fn receipt(self) -> impl Future<Output = Self::Source> + Send {
         ready(self)

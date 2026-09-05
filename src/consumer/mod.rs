@@ -128,7 +128,7 @@ pub use crate::consumer::error::{
 pub use crate::consumer::event_context::{EventContext, TerminationSignals};
 pub(crate) use crate::consumer::handler::sealed as receipted_sealed;
 pub use crate::consumer::handler::{DemandType, EventHandler, HandlerProvider, Keyed, Uncommitted};
-pub use crate::consumer::handler::{Receipted, ReceiptedSource, Redelivery};
+pub use crate::consumer::handler::{Receipted, ReceiptedSource};
 pub use crate::consumer::kafka_state::{
     MessageCell, MessageDescriptor, MessageRef, MessageRefCodec, MessageRefCodecError,
     MessageResolver, MessageStateError, message_deque_state, message_map_state, message_state,

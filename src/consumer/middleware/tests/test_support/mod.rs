@@ -27,7 +27,7 @@ use crate::consumer::middleware::{
 };
 use crate::consumer::partition::ShutdownPhase;
 use crate::consumer::receipted_sealed;
-use crate::consumer::{Keyed, Receipted, ReceiptedSource, Redelivery, Uncommitted};
+use crate::consumer::{Keyed, Receipted, ReceiptedSource, Uncommitted};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::{MemoryLoader, MessageLoader};
 use crate::state::cell::Committed;
@@ -123,10 +123,6 @@ impl receipted_sealed::Sealed for GatedGuard {}
 
 impl Receipted for GatedGuard {
     type Source = Self;
-
-    fn redelivery(&self) -> impl Future<Output = Redelivery> + Send {
-        future::ready(Redelivery::Sweeps)
-    }
 
     fn receipt(self) -> impl Future<Output = Self::Source> + Send {
         future::ready(self)

@@ -169,10 +169,7 @@ impl<P, S> MockEventContext<P, S> {
         self
     }
 
-    /// Flip the shutdown watch as a side effect of every `scheduled()` read —
-    /// deterministic "shutdown arrives during the backstop arm" for the settle
-    /// boundary's arm-shutdown rollback test (the read completes, then the
-    /// arm's next retry step sees shutdown at its loop top).
+    /// Starts shutdown after a timer read, before the backstop arm can write.
     #[must_use]
     pub fn with_shutdown_on_timer_read(self) -> Self {
         Self {

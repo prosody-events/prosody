@@ -425,9 +425,8 @@ where
     Ok((Arc::new(registry), collection_ref))
 }
 
-/// Resolves the event along its outcome's path: consume the `finalize`
-/// receipt inline (promote/rollback), or crash → fresh store → sweep.
-/// Returns `false` only if a sweep strands a cell.
+/// Promotes committed events and sweeps aborted events. A crash uses a fresh
+/// store. Returns `false` only if a sweep strands a cell.
 async fn resolve_event(
     session: SuiteSession,
     finalized: Finalized<MemoryCellStore<ScriptedOracle>>,
@@ -447,7 +446,8 @@ async fn resolve_event(
         }
         Outcome::Abort => {
             if let Finalized::Staged(staged) = finalized {
-                staged.rollback().await;
+                drop(staged);
+                session.sweep().await?;
             }
         }
         Outcome::CrashCommitted | Outcome::CrashAborted => {
@@ -465,10 +465,7 @@ async fn resolve_event(
             }
         }
     }
-    // Every outcome in this runner's alphabet settles fully (promote and
-    // rollback delete the marker; the sweep resolves it), so no settlement
-    // residue may remain — checked raw, before the resolving read-back below
-    // heals a skipped settle to identical bytes and masks it.
+    // Check raw state before reads can hide an incomplete promotion or sweep.
     assert_no_settlement_residue(cells, collection_ref.id())?;
     Ok(true)
 }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::consumer::{Receipted, ReceiptedSource, Redelivery, receipted_sealed};
+use crate::consumer::{Receipted, ReceiptedSource, receipted_sealed};
 use std::future::{Future, ready};
 
 /// Test error carrying its classification. Display matches the per-file
@@ -397,10 +397,6 @@ impl receipted_sealed::Sealed for RecordingTimerGuard {}
 
 impl Receipted for RecordingTimerGuard {
     type Source = Self;
-
-    fn redelivery(&self) -> impl Future<Output = Redelivery> + Send {
-        ready(Redelivery::Sweeps)
-    }
 
     fn receipt(self) -> impl Future<Output = Self::Source> + Send {
         ready(self)

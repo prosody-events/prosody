@@ -547,7 +547,8 @@ where
     T::Error: Error + Send + Sync + 'static,
 {
     // Clean up the keys from this trial to ensure isolation: trials share a
-    // fixed key pool, so cleanup prevents pollution across trials and reruns.
+    // fixed key pool, so cleanup prevents pollution across trials and repeated
+    // runs.
     for key_str in &KEY_POOL {
         let key = Key::from(*key_str);
         operations

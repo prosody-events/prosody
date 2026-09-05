@@ -422,12 +422,11 @@ identity
 (`message_marker()` — the message `EventRef`'s dedup id, or the
 deferred-reload's last-wins identity override), never deposited by middleware.
 The sweep posture uses stage → marker-record → receipt → promote → retire.
-The rerun posture uses stage → arm-backstop → marker-record → commit → promote.
-Their crash windows are documented on `settle_committed`. Read that doc before
+Its crash windows are documented on `settle_committed`. Read that doc before
 you change the sequence. The anchors code comments cite by name:
 
-- **Invariant 8:** every required backstop arm is must-succeed. Rerun stages,
-  incomplete promotions, duplicate sweep failures, and permanent stage
+- **Invariant 8:** every required backstop arm is must-succeed. Incomplete
+  promotions, duplicate sweep failures, and permanent stage
   failures use `arm_backstop`. It retries every non-shutdown failure.
 - **Finding F2:** the boundary never unschedules a backstop. Only its fired
   recovery sweep clears the standing backstop. A redelivery sweep clears none.

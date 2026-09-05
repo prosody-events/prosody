@@ -919,11 +919,9 @@ async fn run(trace: Trace) -> Result<()> {
                     let finalized =
                         checked_finalize(&fx, &session, event, ev_model.buffered).await?;
                     if let Finalized::Staged(staged) = finalized {
-                        staged.rollback().await;
-                        // Same raw probe as `promote_receipt`'s healthy arm: a
-                        // rollback that skipped its store call would be healed
-                        // to identical bytes by the loop-tail resolving reads
-                        // and masked.
+                        drop(staged);
+                        session.sweep().await?;
+                        // Check raw cells before a read can hide a missed sweep.
                         assert_no_settlement_residue(&fx.cells, &fx.value_id())?;
                     }
                     // Post-commit ops roll back to their `prev`, which
@@ -1788,7 +1786,9 @@ async fn stage_restores_distinct_bases_on_abort() -> Result<()> {
     let Finalized::Staged(staged) = session.finalize().await? else {
         bail!("the overwriting event must stage");
     };
-    staged.rollback().await;
+    drop(staged);
+    session.sweep().await?;
+    assert_no_settlement_residue(&fx.cells, &fx.value_id())?;
 
     let probe = probe(u128::MAX);
     assert_eq!(
@@ -2039,7 +2039,9 @@ async fn run_multi_section(trace: MultiTrace) -> Result<()> {
                 }
                 MultiOutcome::Abort => {
                     if let Finalized::Staged(staged) = session.finalize().await? {
-                        staged.rollback().await;
+                        drop(staged);
+                        session.sweep().await?;
+                        assert_no_settlement_residue(&fx.cells, &fx.value_id())?;
                     }
                 }
                 MultiOutcome::Retry => {

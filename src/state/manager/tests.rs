@@ -713,12 +713,10 @@ async fn promote_promotes_all_staged_cells() -> Result<()> {
     Ok(())
 }
 
-/// After `finalize`, the receipt's `rollback` rolls every staged
-/// `ReadCommitted` cell back to its committed base (here absent) — asserted
-/// through `committed()` reads, since `rollback` returns nothing.
+/// Recovery restores each aborted collection's committed base.
 #[tokio::test]
-async fn rollback_rolls_back_all_staged_cells() -> Result<()> {
-    let oracle = FixedOracle::committed();
+async fn sweep_rolls_back_all_staged_cells() -> Result<()> {
+    let oracle = FixedOracle::not_committed();
     let registry = registry_with_mixed()?;
     let cell = cell_store(oracle.clone(), &registry);
     let manager = acquire(&provider_with(cell.clone(), oracle, registry)).await?;
@@ -728,10 +726,17 @@ async fn rollback_rolls_back_all_staged_cells() -> Result<()> {
     let Finalized::Staged(staged) = session.finalize().await? else {
         bail!("expected a staged receipt");
     };
-    staged.rollback().await;
+    drop(staged);
+    session.sweep().await?;
 
-    assert_eq!(committed(&cell, &id_for(&key, "cart")?).await?, None);
-    assert_eq!(committed(&cell, &id_for(&key, "wishlist")?).await?, None);
+    for name in ["cart", "wishlist"] {
+        let id = id_for(&key, name)?;
+        assert!(
+            staged_cell(&cell, &id).await?.is_none(),
+            "the sweep must resolve {name}"
+        );
+        assert_eq!(committed(&cell, &id).await?, None);
+    }
     Ok(())
 }
 

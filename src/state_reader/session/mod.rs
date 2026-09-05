@@ -42,7 +42,7 @@
 //!   selected.
 //!
 //! Once pinned, every later call addresses the pinned source directly, even on
-//! `None` or `Err`. The probe never reruns within an operation. Determinism is
+//! `None` or `Err`. The probe runs once per operation. Determinism is
 //! source-preference order, not a stable pin under transient faults: with
 //! `A=Err` and `B=Some` the pin is B, and a later run with `A=Some` pins A.
 //! That is an availability difference, never a committed-only violation.

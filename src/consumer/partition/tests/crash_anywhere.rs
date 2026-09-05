@@ -1,4 +1,6 @@
 //! Each delivered event adds one to its key's counter, despite process crashes.
+//! The harness uses real partition dispatch because mock contexts cannot test
+//! manager and settle interactions.
 
 use super::super::ShutdownPhase;
 use super::super::dispatch::process_event;
@@ -29,7 +31,7 @@ use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
 use crate::timers::test_support::{setup_timer_manager_over, test_segment};
 use crate::timers::{PendingTimer, TimerManager, TimerType, Trigger};
 use crate::{Key, Topic};
-use color_eyre::eyre::{Result, bail, eyre};
+use color_eyre::eyre::{Report, Result, bail, eyre};
 use crossbeam_utils::CachePadded;
 use futures::{Stream, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
@@ -81,7 +83,7 @@ struct Stores {
     markers: MemoryDeduplicationStoreProvider,
     registry: Arc<CollectionDefRegistry>,
     counter: Registered<ValueDescriptor>,
-    ends: Arc<Mutex<[Option<CompactDateTime>; KEYS.len()]>>,
+    targets: Arc<Mutex<[(u64, CompactDuration); KEYS.len()]>>,
 }
 
 struct Process<S> {
@@ -95,7 +97,7 @@ struct Process<S> {
 #[derive(Clone)]
 struct Counter {
     value: Registered<ValueDescriptor>,
-    ends: Arc<Mutex<[Option<CompactDateTime>; KEYS.len()]>>,
+    targets: Arc<Mutex<[(u64, CompactDuration); KEYS.len()]>>,
 }
 
 impl FallibleEventHandler for DeduplicationHandler<LeafHandler<Counter>, MemoryDeduplicationStore> {}
@@ -128,7 +130,7 @@ impl Stores {
             markers: MemoryDeduplicationStoreProvider::new(),
             registry: Arc::new(registry),
             counter: Registered::new(descriptor),
-            ends: Arc::new(Mutex::new([None; KEYS.len()])),
+            targets: Arc::new(Mutex::new([(0, CompactDuration::new(0)); KEYS.len()])),
         })
     }
 
@@ -170,7 +172,7 @@ impl Stores {
             handler: DeduplicationHandler {
                 inner: LeafHandler::new(Counter {
                     value: self.counter,
-                    ends: self.ends.clone(),
+                    targets: self.targets.clone(),
                 }),
                 store: self.markers.create_store(topic(), 0, IDENTITY.group_id),
             },
@@ -284,7 +286,7 @@ impl<S: Stream<Item = PendingTimer<Timers>>> Process<S> {
 }
 
 impl Counter {
-    async fn increment<C: EventContext<Payload = Value>>(&self, context: &C) -> Result<()> {
+    async fn increment<C: EventContext<Payload = Value>>(&self, context: &C) -> Result<u64> {
         let value = context.state(self.value)?;
         let count = match value.get().await? {
             Some(value) => value
@@ -293,7 +295,7 @@ impl Counter {
             None => 0,
         };
         value.set(Value::from(count + 1)).await?;
-        Ok(())
+        Ok(count + 1)
     }
 }
 
@@ -311,7 +313,8 @@ impl FallibleHandler for Counter {
     where
         C: EventContext<Payload = Value>,
     {
-        self.increment(&context).await.map_err(HandlerError::from)
+        self.increment(&context).await?;
+        Ok(())
     }
 
     async fn on_excise<C>(
@@ -323,7 +326,8 @@ impl FallibleHandler for Counter {
     where
         C: EventContext<Payload = Value>,
     {
-        self.increment(&context).await.map_err(HandlerError::from)
+        self.increment(&context).await?;
+        Ok(())
     }
 
     async fn on_timer<C>(
@@ -336,18 +340,15 @@ impl FallibleHandler for Counter {
         C: EventContext<Payload = Value>,
     {
         let result: Result<()> = async {
-            self.increment(&context).await?;
+            let count = self.increment(&context).await?;
             let index = KEYS
                 .iter()
                 .position(|key| *key == timer.key.as_ref())
                 .ok_or_else(|| eyre!("timer has an unknown key"))?;
-            let end = self.ends.lock()[index].ok_or_else(|| eyre!("timer has no chain"))?;
-            if timer.time < end {
+            let (target, step) = self.targets.lock()[index];
+            if count < target {
                 context
-                    .clear_and_schedule(
-                        timer.time.add_duration(CompactDuration::new(1))?,
-                        TimerType::Application,
-                    )
+                    .clear_and_schedule(timer.time.add_duration(step)?, TimerType::Application)
                     .await?;
             }
             Ok(())
@@ -386,7 +387,7 @@ fn prop_crash_anywhere() {
             .enable_all()
             .start_paused(true)
             .build()
-            .map_err(color_eyre::Report::from)
+            .map_err(Report::from)
             .and_then(|runtime| runtime.block_on(run_trace(trace)));
         match result {
             Ok(()) => TestResult::passed(),
@@ -422,10 +423,10 @@ async fn run_trace(trace: Vec<(u8, u8, u8)>) -> Result<()> {
                 1 => {
                     let time = CompactDateTime::now()?
                         .add_duration(CompactDuration::new(u32::from(value % 4)))?;
-                    let links = 1 + u32::from(value / 4) % MAX_CHAIN;
-                    stores.ends.lock()[index] =
-                        Some(time.add_duration(CompactDuration::new(links - 1))?);
+                    let step = CompactDuration::new(u32::from((value / 4) % 2));
+                    let links = 1 + u32::from(value / 8) % MAX_CHAIN;
                     expected[index] += u64::from(links);
+                    stores.targets.lock()[index] = (expected[index], step);
                     process
                         .timers
                         .schedule_trigger(Trigger::new(
@@ -471,8 +472,7 @@ async fn crash_before_stage_keeps_both_increments() -> Result<()> {
     let stores = Stores::new()?;
     let mut process = stores.process().await?;
     let time = CompactDateTime::now()?;
-    let next = time.add_duration(CompactDuration::new(1))?;
-    stores.ends.lock()[0] = Some(next);
+    stores.targets.lock()[0] = (2, CompactDuration::new(1));
     let trigger = Trigger::new(
         Key::from(KEYS[0]),
         time,
@@ -496,15 +496,49 @@ async fn crash_before_stage_keeps_both_increments() -> Result<()> {
     result
 }
 
-#[derive(Debug, Error)]
-#[error("handler failed: {0}")]
-struct HandlerError(String);
+/// Every crash boundary preserves both increments at one timer coordinate.
+/// The counter replays idempotently, so the manager property
+/// `prop_same_coordinate_clear_preserves_timer_oracle` pins key tag rotation.
+#[tokio::test(start_paused = true)]
+async fn every_crash_point_keeps_rescheduled_chain() -> Result<()> {
+    for budget in 1_usize..=24 {
+        let stores = Stores::new()?;
+        let mut process = stores.process().await?;
+        stores.targets.lock()[0] = (2, CompactDuration::new(0));
+        process
+            .timers
+            .schedule_trigger(Trigger::new(
+                Key::from(KEYS[0]),
+                CompactDateTime::now()?,
+                TimerType::Application,
+                Span::none(),
+            ))
+            .await?;
 
-impl From<color_eyre::Report> for HandlerError {
-    fn from(error: color_eyre::Report) -> Self {
-        Self(format!("{error:#}"))
+        let result: Result<()> = async {
+            process.timer(budget).await?;
+            process.stop().await?;
+            process = stores.process().await?;
+            let mut fires = 0;
+            while stores.has_timers().await? {
+                fires += 1;
+                if fires > MAX_CHAIN + 2 {
+                    bail!("timer chain did not stop");
+                }
+                process.timer(usize::MAX).await?;
+            }
+            stores.check(&[2, 0, 0], 0)
+        }
+        .await;
+        process.stop().await?;
+        result.map_err(|error| eyre!("poll budget {budget}: {error:#}"))?;
     }
+    Ok(())
 }
+
+#[derive(Debug, Error)]
+#[error("handler failed: {0:#}")]
+struct HandlerError(#[from] Report);
 
 impl ClassifyError for HandlerError {
     fn classify_error(&self) -> ErrorCategory {

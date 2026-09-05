@@ -73,31 +73,16 @@ pub trait Uncommitted {
     fn abort(self) -> impl Future<Output = ()> + Send;
 }
 
-/// Selects how the settle boundary protects state after it records a receipt.
-///
-/// A message receipt is a deduplication row. A timer receipt deletes its
-/// key-index row while its slab row remains as the redelivery source.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Redelivery {
-    /// Promote state before retirement. A committed redelivery sweeps state.
-    Sweeps,
-    /// Arm a safety timer before commit. A redelivery runs the handler again.
-    Reruns,
-}
-
 /// Records an event receipt and returns its committed source.
 ///
 /// The boundary records the message marker before receipt. A timer receipt
-/// deletes its key row. The oracle then reports the event as committed.
+/// changes its key row. The oracle then reports the event as committed.
 /// [`ReceiptedSource::retire`] removes the source after promotion.
 /// [`ReceiptedSource::keep`] preserves the source for another recovery sweep.
 /// Neither action can abort the committed event.
 pub trait Receipted: Uncommitted + sealed::Sealed {
     /// The source after the event commits.
     type Source: ReceiptedSource;
-
-    /// Returns the redelivery posture for this event.
-    fn redelivery(&self) -> impl Future<Output = Redelivery> + Send;
 
     /// Records the receipt. The event commits at this step. Retries each failed
     /// write.
