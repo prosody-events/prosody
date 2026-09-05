@@ -32,15 +32,6 @@ const TIME_POOL: [u32; 5] = [1000, 1100, 1200, 1300, 1400];
 /// [`TIME_POOL`].
 const NOW: u32 = 1200;
 
-/// The lifecycle states that `set_state` can store.
-const STATES: [TimerState; 5] = [
-    TimerState::Scheduled,
-    TimerState::Firing,
-    TimerState::FiringReplaced,
-    TimerState::FiringRescheduled,
-    TimerState::Parked,
-];
-
 /// Identifies one registry entry across the real registry and the model.
 type Triple = (Key, CompactDateTime, TimerType);
 
@@ -85,17 +76,24 @@ impl Op {
 
 impl Arbitrary for Op {
     fn arbitrary(g: &mut Gen) -> Self {
-        let key = format!("key-{}", u8::arbitrary(g) % 3).into();
+        let key: Key = format!("key-{}", u8::arbitrary(g) % 3).into();
         let time =
             CompactDateTime::from(TIME_POOL[usize::from(u8::arbitrary(g)) % TIME_POOL.len()]);
         let ty = TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
+        let states = [
+            TimerState::Scheduled,
+            TimerState::Firing,
+            TimerState::FiringReplaced(Trigger::new(key.clone(), time, ty, Span::none())),
+            TimerState::FiringRescheduled,
+            TimerState::Parked,
+        ];
         match u8::arbitrary(g) % 3 {
             0 => Op::Insert { key, time, ty },
             1 => Op::SetState {
                 key,
                 time,
                 ty,
-                state: STATES[usize::from(u8::arbitrary(g)) % STATES.len()],
+                state: states[usize::from(u8::arbitrary(g)) % states.len()].clone(),
             },
             _ => Op::Remove { key, time, ty },
         }
@@ -130,7 +128,7 @@ async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
         let entry = model.get(&(key.clone(), *time, *ty));
         assert_eq!(
             active.get_state(key, *time, *ty).await,
-            entry.map(|e| e.state)
+            entry.map(|e| e.state.clone())
         );
         assert_eq!(active.contains(key, *time, *ty).await, entry.is_some());
         assert_eq!(
@@ -161,7 +159,7 @@ async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
         count = count.saturating_add(1);
         if matches!(
             entry.state,
-            TimerState::Firing | TimerState::FiringReplaced | TimerState::FiringRescheduled
+            TimerState::Firing | TimerState::FiringReplaced(_) | TimerState::FiringRescheduled
         ) {
             in_flight = in_flight.saturating_add(1);
         }
@@ -216,7 +214,7 @@ async fn run_trace(trace: Trace) {
                 ty,
                 state,
             } => {
-                let got = active.set_state(&key, time, ty, state).await;
+                let got = active.set_state(&key, time, ty, state.clone()).await;
                 let want = match model.get_mut(&(key, time, ty)) {
                     Some(entry) => {
                         entry.state = state;

@@ -1,8 +1,7 @@
 //! Internal trait for primitive storage operations.
 //!
 //! This module defines the `TriggerOperations` trait used by Cassandra and
-//! Memory implementations. It provides 22 primitive methods that operate on
-//! individual tables without coordinating across tables.
+//! Memory implementations. Its methods operate on individual tables.
 //!
 //! **Not part of the public API.** Use `TriggerStore` instead.
 
@@ -21,8 +20,7 @@ use std::ops::RangeInclusive;
 
 /// Internal trait for primitive storage operations.
 ///
-/// This trait provides 22 primitive methods that operate on individual
-/// tables without coordinating across tables. It is the trait bound for
+/// Its methods operate on individual tables. It is the trait bound for
 /// `TableAdapter<T>`, which is part of the public API.
 ///
 /// **Users should not implement this trait directly.** Use `TriggerStore`
@@ -190,6 +188,13 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     fn upsert_key_trigger(
         &self,
         trigger: Trigger,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Replaces one key entry. Other coordinates keep their entries.
+    fn replace_key_trigger(
+        &self,
+        old: &Trigger,
+        new: Trigger,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Deletes a specific trigger from the key-based index.

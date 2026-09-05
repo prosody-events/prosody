@@ -379,6 +379,22 @@ fn discard_uncommitted<S: StateLifecycle>(lifecycle: Option<&S>) {
     }
 }
 
+/// A point where a process can stop between two durable steps.
+///
+/// Memory backends finish a durable step in one poll, so a poll-budget test
+/// needs a yield to stop between steps. Production builds compile it out.
+#[cfg(test)]
+fn crash_point() -> impl Future<Output = ()> {
+    use tokio::task::yield_now;
+    yield_now()
+}
+
+#[cfg(not(test))]
+fn crash_point() -> impl Future<Output = ()> {
+    use std::future::ready;
+    ready(())
+}
+
 /// Applies the success sequence for the event's redelivery posture.
 ///
 /// Sweep posture records the receipt before promotion. It retires the source
@@ -467,6 +483,8 @@ async fn settle_committed<'a, T, C, G>(
         }
     };
 
+    crash_point().await;
+
     // Capture the delay once. Arm before certification when delivery reruns.
     let prepared = match (finalized, guard.redelivery().await) {
         (Finalized::Clean, _) => PreparedState::Clean,
@@ -518,6 +536,8 @@ async fn settle_committed<'a, T, C, G>(
         }
     }
 
+    crash_point().await;
+
     // 4. Apply the selected receipt and promotion order.
     match prepared {
         PreparedState::Clean => {
@@ -552,6 +572,8 @@ async fn settle_sweep_posture<C, G>(
     G: Receipted + Send,
 {
     let source = guard.receipt().await;
+    crash_point().await;
+
     if promotable.promote().await == ApplyOutcome::Incomplete {
         warn!("keyed-state promote incomplete; the StateRecovery sweep will retry");
         if matches!(
@@ -562,6 +584,8 @@ async fn settle_sweep_posture<C, G>(
             return;
         }
     }
+
+    crash_point().await;
 
     source.retire().await;
 }

@@ -403,6 +403,24 @@ cassandra_queries! {
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
         ),
 
+        /// Replace one clustering entry in the same partition.
+        replace_key_trigger: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span, tag) VALUES (?, ?, ?, ?, ?, ?) USING TTL ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// Replace one clustering entry without a TTL.
+        replace_key_trigger_no_ttl: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span, tag) VALUES (?, ?, ?, ?, ?, ?); \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
         /// BATCH: Clear clustering rows for a single timer type + remove state entry.
         /// Same partition — no cross-partition overhead.
         batch_clear_key_triggers: (

@@ -484,6 +484,18 @@ impl TriggerOperations for InMemoryTriggerStore {
     /// index.
     ///
     /// For in-memory store, this simply clears and inserts.
+    async fn replace_key_trigger(&self, old: &Trigger, new: Trigger) -> Result<(), Self::Error> {
+        let mut entry = self
+            .inner
+            .key_triggers
+            .entry_async((self.segment.id, old.key.clone()))
+            .await
+            .or_default();
+        entry.get_mut().remove(&(old.timer_type, old.time));
+        entry.get_mut().insert((new.timer_type, new.time), new);
+        Ok(())
+    }
+
     async fn clear_and_schedule_key(
         &self,
         trigger: Trigger,

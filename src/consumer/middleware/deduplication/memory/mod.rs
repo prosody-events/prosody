@@ -64,6 +64,12 @@ pub struct MemoryDeduplicationStoreProvider {
 }
 
 impl MemoryDeduplicationStoreProvider {
+    /// Returns the number of stored message markers.
+    #[cfg(test)]
+    pub(crate) fn marker_count(&self) -> usize {
+        self.records.len()
+    }
+
     /// Creates a new provider backed by one fresh shared store.
     #[must_use]
     pub fn new() -> Self {

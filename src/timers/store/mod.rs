@@ -39,7 +39,7 @@ use uuid::Uuid;
 pub mod cassandra;
 pub mod memory;
 
-/// Internal primitive operations trait (22 methods).
+/// Internal primitive operations trait.
 ///
 /// The trait itself is `pub` to satisfy Rust's visibility rules (used in public
 /// `TableAdapter`), but is not re-exported, keeping it effectively internal.
@@ -50,6 +50,15 @@ pub mod operations;
 /// This module is public to allow returning concrete `TableAdapter<T>` types
 /// from factory functions, but it's not re-exported at the crate root.
 pub mod adapter;
+
+/// Selects whether a replacement keeps the old slab row for recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetainOldSlab {
+    /// Keep the old source until state promotion finishes.
+    Yes,
+    /// Remove the old source after the replacement write.
+    No,
+}
 
 #[cfg(test)]
 /// Comprehensive test suite for [`TriggerStore`] implementations.
@@ -250,6 +259,15 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     // ===================================================================
     // Segment Accessors
     // ===================================================================
+
+    /// Replaces one timer without a gap in its key entry.
+    /// Other coordinates keep their rows. `retain` controls the old slab row.
+    fn replace(
+        &self,
+        old: &Trigger,
+        new: Trigger,
+        retain: RetainOldSlab,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Returns the segment this store is scoped to.
     fn segment(&self) -> Segment;

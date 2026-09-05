@@ -52,7 +52,7 @@ async fn test_remove_clears_active_registry() -> Result<()> {
     );
 
     // Case 1: remove while still queued.
-    triggers.remove_if_live(&trigger, Some(trigger.tag)).await;
+    triggers.remove_if_live(&trigger).await;
     assert!(
         !triggers
             .active_triggers()
@@ -85,7 +85,7 @@ async fn test_remove_clears_active_registry() -> Result<()> {
 
     // Case 2: remove after delivery — clears ActiveTriggers without
     // panicking on the already-absent queue key.
-    triggers.remove_if_live(&trigger, Some(trigger.tag)).await;
+    triggers.remove_if_live(&trigger).await;
     assert!(
         !triggers
             .active_triggers()
@@ -94,7 +94,7 @@ async fn test_remove_clears_active_registry() -> Result<()> {
     );
 
     // Idempotent: removing an already-removed trigger is a no-op.
-    triggers.remove_if_live(&trigger, Some(trigger.tag)).await;
+    triggers.remove_if_live(&trigger).await;
     assert!(
         !triggers
             .active_triggers()

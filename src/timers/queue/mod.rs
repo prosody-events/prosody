@@ -23,11 +23,13 @@ pub struct TriggerQueue {
     active: ActiveTriggers,
 }
 
-/// Whether a cancel removed the timer or kept an older recovery source.
+/// What a queue effect kept in place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RemoveOutcome {
-    Removed,
-    KeptSource,
+pub(crate) enum Kept {
+    /// The effect kept nothing back.
+    Nothing,
+    /// The queue kept a retained source whose tag differs from the key tag.
+    Source,
 }
 
 impl TriggerQueue {
@@ -74,25 +76,22 @@ impl TriggerQueue {
         Some(expired.into_inner())
     }
 
-    /// Remove a live schedule. Keep a queued source whose key tag differs.
-    pub(crate) async fn remove_if_live(
-        &mut self,
-        trigger: &Trigger,
-        key_tag: Option<i32>,
-    ) -> RemoveOutcome {
+    /// Remove a live schedule. `trigger.tag` is the key row tag; a queued item
+    /// with another tag is a retained source and stays.
+    pub(crate) async fn remove_if_live(&mut self, trigger: &Trigger) -> Kept {
         if let Some(queue_key) = self.queue_keys.get_mut(trigger) {
             let item = self.queue.remove(queue_key);
-            if Some(item.get_ref().tag) != key_tag {
+            if item.get_ref().tag != trigger.tag {
                 let deadline = item.deadline();
                 *queue_key = self.queue.insert_at(item.into_inner(), deadline);
-                return RemoveOutcome::KeptSource;
+                return Kept::Source;
             }
             self.queue_keys.remove(trigger);
         }
         self.active
             .remove(&trigger.key, trigger.time, trigger.timer_type)
             .await;
-        RemoveOutcome::Removed
+        Kept::Nothing
     }
 
     /// Adds a [`Trigger`] to the `DelayQueue` without modifying

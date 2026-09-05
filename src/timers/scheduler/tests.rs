@@ -229,12 +229,12 @@ enum ModelActiveState {
 }
 
 impl ModelActiveState {
-    fn from_timer_state(state: TimerState) -> StdResult<Self, String> {
+    fn from_timer_state(state: &TimerState) -> StdResult<Self, String> {
         match state {
             TimerState::Scheduled => Ok(Self::Scheduled),
             TimerState::Firing => Ok(Self::Firing),
             TimerState::Parked => Ok(Self::Parked),
-            TimerState::FiringReplaced | TimerState::FiringRescheduled => {
+            TimerState::FiringReplaced(_) | TimerState::FiringRescheduled => {
                 Err("model does not replace or reschedule active attempts".to_owned())
             }
         }
@@ -372,9 +372,7 @@ impl Fixture {
             .await
             .map_err(|e| format!("remove_trigger: {e:?}"))?;
         let trigger = Trigger::with_tag(key.clone(), time, ty, 0, Span::current());
-        self.triggers
-            .remove_if_live(&trigger, Some(trigger.tag))
-            .await;
+        self.triggers.remove_if_live(&trigger).await;
         self.set_model(
             key,
             time,
@@ -424,7 +422,7 @@ impl Fixture {
             Some(TimerState::Scheduled) => true,
             Some(TimerState::Firing) => false,
             Some(
-                TimerState::Parked | TimerState::FiringReplaced | TimerState::FiringRescheduled,
+                TimerState::Parked | TimerState::FiringReplaced(_) | TimerState::FiringRescheduled,
             )
             | None => return Ok(()),
         };
@@ -682,6 +680,7 @@ impl Fixture {
                 .await;
             let owned = owns_slab(&self.state, slab_id);
             let actual_model_state = actual_state
+                .as_ref()
                 .map(ModelActiveState::from_timer_state)
                 .transpose()?;
             if actual_model_state != expected.active_state {

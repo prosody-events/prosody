@@ -215,6 +215,13 @@ CLAUDE.md).
 
 Exemplar: `run_crash_equivalence_trace` in `src/state/tests/cell_suite.rs`.
 
+The poll-budget harness in `src/consumer/partition/tests/crash_anywhere.rs`
+stops dispatch after a generated number of polls. `crash_point()` in the
+settle boundary yields between durable steps, because memory stores finish a
+step in one poll. Each simulated process gets new managers over the shared
+durable stores. Check raw cells before any read can resolve provisional
+state. Keep each reduced failure as a fixed trace.
+
 ### Seeding stale state directly
 
 To test recovery paths that normal execution cannot produce (a pending

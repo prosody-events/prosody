@@ -391,5 +391,6 @@ async fn test_partition_manager_is_stalled() -> color_eyre::Result<()> {
     Ok(())
 }
 
+mod crash_anywhere;
 mod runtime;
 mod unwind;

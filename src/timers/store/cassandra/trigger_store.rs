@@ -828,6 +828,63 @@ impl TriggerOperations for CassandraTriggerStore {
     /// `resolve_state` returns the per-`(key, timer_type)` mutex; holding
     /// `handle.lock().await` for the entire match serialises the
     /// read-decide-write sequence against concurrent same-key writers.
+    async fn replace_key_trigger(&self, old: &Trigger, new: Trigger) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
+        let (handle, _) = self
+            .resolve_state(&segment_id, &old.key, old.timer_type)
+            .await?;
+        let mut state = handle.lock().await;
+        let pending = PendingKeyTrigger::from_trigger(self.propagator(), &new);
+        match &mut *state {
+            TimerState::Inline(_) | TimerState::Absent => {
+                let (_, next) = pending.into_inline_state();
+                self.set_state_inline(&segment_id, &old.key, old.timer_type, &next)
+                    .await?;
+                *state = next;
+            }
+            TimerState::Overflow(tags) => {
+                self.execute_with_optional_ttl(
+                    new.time,
+                    &self.queries().replace_key_trigger,
+                    &self.queries().replace_key_trigger_no_ttl,
+                    |ttl| {
+                        (
+                            segment_id,
+                            old.key.as_ref(),
+                            old.timer_type,
+                            old.time,
+                            segment_id,
+                            new.key.as_ref(),
+                            new.timer_type,
+                            new.time,
+                            &pending.span_map,
+                            new.tag,
+                            ttl,
+                        )
+                    },
+                    || {
+                        (
+                            segment_id,
+                            old.key.as_ref(),
+                            old.timer_type,
+                            old.time,
+                            segment_id,
+                            new.key.as_ref(),
+                            new.timer_type,
+                            new.time,
+                            &pending.span_map,
+                            new.tag,
+                        )
+                    },
+                )
+                .await?;
+                tags.remove(old.time);
+                tags.insert(new.time, new.tag);
+            }
+        }
+        Ok(())
+    }
+
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn clear_and_schedule_key(
         &self,

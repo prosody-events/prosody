@@ -1,5 +1,6 @@
 //! Apply coordinated writes through the store operations.
 
+use super::RetainOldSlab;
 use crate::Key;
 use crate::timers::DELETE_CONCURRENCY;
 use crate::timers::TimerType;
@@ -219,6 +220,26 @@ where
         timer_type: TimerType,
     ) -> Result<Option<i32>, Self::Error> {
         self.operations.current_tag(key, time, timer_type).await
+    }
+
+    #[instrument(level = "debug", skip(self, old, new), err)]
+    async fn replace(
+        &self,
+        old: &Trigger,
+        new: Trigger,
+        retain: RetainOldSlab,
+    ) -> Result<(), Self::Error> {
+        self.operations
+            .replace_key_trigger(old, new.clone())
+            .await?;
+        self.operations
+            .insert_slab_trigger(Slab::from_time(self.slab_size(), new.time), new)
+            .await?;
+        if retain == RetainOldSlab::No {
+            self.remove_slab_row(&old.key, old.time, old.timer_type)
+                .await?;
+        }
+        Ok(())
     }
 
     #[instrument(level = "debug", skip(self, trigger, keep), err)]

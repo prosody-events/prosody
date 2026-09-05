@@ -8,7 +8,7 @@
 //! [`TriggerScheduler`]: super::TriggerScheduler
 
 use super::BUFFER_SIZE;
-use super::{Command, CommandOperation};
+use super::Command;
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::Heartbeat;
 use crate::timers::datetime::CompactDateTime;
@@ -202,41 +202,26 @@ async fn process_command<T>(
 ) where
     T: TriggerStore,
 {
-    let (operation, trigger, result_tx) = match command {
-        Command::Apply {
-            operation,
-            trigger,
-            result_tx,
-        } => (operation, trigger, result_tx),
-        Command::Remove {
-            trigger,
-            key_tag,
-            result_tx,
-        } => {
-            let outcome = triggers.remove_if_live(&trigger, key_tag).await;
-            let _ = result_tx.send(outcome);
-            return;
+    // A dropped reply means the caller stopped waiting; nothing to do.
+    match command {
+        Command::Add { trigger, reply } => {
+            let _ = reply.send(handle_add(state, triggers, trigger).await);
         }
-        Command::Retag(trigger) => {
-            triggers.retag(&trigger);
-            return;
-        }
-    };
-    let result: Result<Option<Trigger>, T::Error> = match operation {
-        CommandOperation::Add => handle_add(state, triggers, trigger).await.map(|()| None),
-        CommandOperation::AddToQueue => {
+        Command::AddToQueue { trigger, reply } => {
             triggers.insert_queue_only(trigger);
-            Ok(None)
+            let _ = reply.send(());
         }
-        CommandOperation::RemoveFromQueue => Ok(triggers.remove_queue_only(&trigger)),
-    };
-
-    // Ignore send errors: the caller will observe a closed reply channel as
-    // a shutdown signal.
-    let _ = result_tx.send(result);
+        Command::RemoveFromQueue { trigger, reply } => {
+            let _ = reply.send(triggers.remove_queue_only(&trigger));
+        }
+        Command::Remove { trigger, reply } => {
+            let _ = reply.send(triggers.remove_if_live(&trigger).await);
+        }
+        Command::Retag(trigger) => triggers.retag(&trigger),
+    }
 }
 
-/// Handler for [`CommandOperation::Add`].
+/// Handler for [`Command::Add`].
 ///
 /// Classifies the trigger's slab as **owned** or **pending**:
 ///
