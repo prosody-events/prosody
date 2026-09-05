@@ -72,8 +72,8 @@ impl<L> Overlay<L> {
     }
 
     /// The lower committed store (the session reads the committed base and
-    /// stages through it at `finalize`; the receipt holds a clone of it for
-    /// promote/rollback).
+    /// stages through it at `finalize`; the receipt holds a clone for
+    /// promotion).
     #[must_use]
     pub fn lower(&self) -> &L {
         &self.lower

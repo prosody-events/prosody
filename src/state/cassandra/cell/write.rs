@@ -2,7 +2,7 @@ use super::{
     BatchUnit, CassandraStore, CellAddr, CellBatchRow, CellKey, CellStoreError, CollectionRef,
     CommitOracle, EventMarker, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, MarkerWriteRow,
     PER_STATEMENT_OVERHEAD, Pk, ProvisionalWrite, ResolveCellError, RowShape, StageRow,
-    blob_weight, encode_cell_blobs, fits_one_batch, smallvec, ttl_to_i32,
+    blob_weight, encode_cell_blobs, fits_one_batch, smallvec, ttl_bind,
 };
 
 pub(super) async fn write_provisional<O>(
@@ -42,22 +42,8 @@ where
         blobs.push(encode_cell_blobs(write.data(), write.prev()).map_err(ResolveCellError::Store)?);
     }
 
-    // The collection TTL is uniform, so the with-TTL vs no-TTL choice — and
-    // hence which statement each row carries — is made once for the whole
-    // batch, never per cell. The marker row shares the TTL (co-expiry with
-    // the newest staged cell).
-    let ttl = collection.ttl().map(ttl_to_i32);
-    let (cell_stmt, marker_stmt) = if ttl.is_some() {
-        (
-            &store.queries.write_provisional,
-            &store.queries.marker_write,
-        )
-    } else {
-        (
-            &store.queries.write_provisional_no_ttl,
-            &store.queries.marker_write_no_ttl,
-        )
-    };
+    // The marker and cells share the collection TTL.
+    let ttl = ttl_bind(collection.ttl());
     // The marker unit leads; each cell unit is one row. `units` stays a
     // `Vec` (not a `CellBuffer`) — see the `run_batches` ruling.
     let mut units: Vec<BatchUnit<CellBatchRow>> = Vec::with_capacity(writes.len() + 1);
@@ -65,7 +51,7 @@ where
         units.push(BatchUnit::new(
             blob.payload.as_ref().len() as u64 + PER_STATEMENT_OVERHEAD,
             smallvec![CellBatchRow {
-                statement: marker_stmt,
+                statement: &store.queries.marker_write,
                 row: RowShape::MarkerWrite(MarkerWriteRow {
                     ttl,
                     payload: blob.payload.as_ref(),
@@ -81,7 +67,7 @@ where
         BatchUnit::new(
             blob_weight(blob),
             smallvec![CellBatchRow {
-                statement: cell_stmt,
+                statement: &store.queries.write_provisional,
                 row: RowShape::Stage(StageRow {
                     ttl,
                     data: blob.data(),

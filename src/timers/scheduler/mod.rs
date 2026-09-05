@@ -23,10 +23,9 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::timers::active::ActiveTriggers;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
-use crate::timers::queue::TriggerQueue;
+use crate::timers::queue::{Kept, TriggerQueue};
 use crate::timers::store::{Segment, TriggerStore};
 use crate::timers::{TimerType, Trigger};
-use futures::TryFutureExt;
 use std::error::Error as StdError;
 use thiserror::Error;
 use tokio::spawn;
@@ -38,7 +37,7 @@ mod actor;
 mod tests;
 
 /// Size of the internal command and trigger channels.
-const BUFFER_SIZE: usize = 64;
+pub(super) const BUFFER_SIZE: usize = 64;
 
 /// Asynchronous scheduler for timer [`Trigger`]s.
 ///
@@ -59,32 +58,41 @@ impl<E> Clone for TriggerScheduler<E> {
     }
 }
 
-/// Command sent from `TriggerScheduler` handles to the actor task.
-///
-/// Carries an `oneshot` reply so the caller can observe success, a store
-/// error (currently only the Schedule operation can produce one), or a
-/// shutdown signal via the channel being closed.
+/// One request to the actor. A reply sender closes on shutdown.
 #[derive(Debug)]
-pub(super) struct Command<E> {
-    pub(super) operation: CommandOperation,
-    pub(super) trigger: Trigger,
-    pub(super) result_tx: oneshot::Sender<Result<(), E>>,
-}
-
-/// Operation variants for [`Command`].
-#[derive(Copy, Clone, Debug)]
-pub(super) enum CommandOperation {
-    /// Insert a trigger: persist slab metadata + add to `TriggerQueue`/
-    /// `ActiveTriggers`.
-    Add,
-    /// Remove a trigger from both `DelayQueue` and `ActiveTriggers`.
-    Remove,
-    /// Add a trigger to the `DelayQueue` only (used when the caller has
-    /// already transitioned `ActiveTriggers` to `FiringRescheduled`).
-    AddToQueue,
-    /// Remove a trigger from the `DelayQueue` only (cancel an earlier
-    /// `AddToQueue`).
-    RemoveFromQueue,
+pub(super) enum Command<E> {
+    /// Persist slab metadata, then queue and register the trigger.
+    Add {
+        trigger: Trigger,
+        reply: oneshot::Sender<Result<(), E>>,
+    },
+    /// Queue a trigger whose registry entry the caller already set.
+    AddToQueue {
+        trigger: Trigger,
+        reply: oneshot::Sender<()>,
+    },
+    /// Remove the queue entry only and reply with it.
+    RemoveFromQueue {
+        trigger: Trigger,
+        reply: oneshot::Sender<Option<Trigger>>,
+    },
+    /// Deliver a queued trigger for a manual test dispatch.
+    #[cfg(test)]
+    TakeFromQueue {
+        trigger: Trigger,
+        reply: oneshot::Sender<Option<Trigger>>,
+    },
+    /// Cancel a live schedule. The reply says whether the queue kept a
+    /// retained source.
+    Remove {
+        trigger: Trigger,
+        reply: oneshot::Sender<Kept>,
+    },
+    /// Set the item tag, then reply.
+    Retag {
+        trigger: Trigger,
+        reply: oneshot::Sender<()>,
+    },
 }
 
 impl<E> TriggerScheduler<E>
@@ -97,35 +105,35 @@ where
     /// and slab cleanup. `store` must be `Clone` so the manager can keep its
     /// own handle for trigger-row writes; the actor serves commands through
     /// `Draining` (so settling handlers can still schedule) and exits at
-    /// `shutdown_rx >= Cancelling`. Returns the receiver end of the
-    /// expired-trigger channel along with the scheduler handle.
+    /// `shutdown_rx >= Cancelling`. Returns the scheduler handle and a
+    /// receiver that yields the expired-trigger channel after the first load.
     pub fn new<T>(
         store: T,
         segment: Segment,
         heartbeats: &HeartbeatRegistry,
         shutdown_rx: watch::Receiver<ShutdownPhase>,
-    ) -> (mpsc::Receiver<Trigger>, Self)
+    ) -> (oneshot::Receiver<mpsc::Receiver<Trigger>>, Self)
     where
         T: TriggerStore<Error = E>,
     {
         let (command_tx, commands_rx) = mpsc::channel(BUFFER_SIZE);
-        let (trigger_tx, triggers_rx) = mpsc::channel(BUFFER_SIZE);
         let triggers = TriggerQueue::new();
         let active_triggers = triggers.active_triggers().clone();
         let heartbeat = heartbeats.register("timer scheduler");
 
+        let (ready_tx, ready_rx) = oneshot::channel();
         spawn(actor::run_actor(
             store,
             segment,
             triggers,
             commands_rx,
-            trigger_tx,
+            ready_tx,
             heartbeat,
             shutdown_rx,
         ));
 
         (
-            triggers_rx,
+            ready_rx,
             Self {
                 command_tx,
                 active_triggers,
@@ -145,12 +153,18 @@ where
     /// current watermark, the slab insert and watermark update are written
     /// in one UNLOGGED BATCH.
     pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerSchedulerError<E>> {
-        self.send_command(CommandOperation::Add, trigger).await
+        self.ask(|reply| Command::Add { trigger, reply })
+            .await?
+            .map_err(TimerSchedulerError::Store)
     }
 
-    /// Unschedule a previously scheduled [`Trigger`].
-    pub async fn unschedule(&self, trigger: Trigger) -> Result<(), TimerSchedulerError<E>> {
-        self.send_command(CommandOperation::Remove, trigger).await
+    /// Cancel the live schedule whose key tag is `trigger.tag`. A queued item
+    /// with another tag is a retained source and stays.
+    pub(crate) async fn unschedule(
+        &self,
+        trigger: Trigger,
+    ) -> Result<Kept, TimerSchedulerError<E>> {
+        self.ask(|reply| Command::Remove { trigger, reply }).await
     }
 
     /// Add a trigger to the `DelayQueue` without modifying `ActiveTriggers`.
@@ -158,7 +172,7 @@ where
         &self,
         trigger: Trigger,
     ) -> Result<(), TimerSchedulerError<E>> {
-        self.send_command(CommandOperation::AddToQueue, trigger)
+        self.ask(|reply| Command::AddToQueue { trigger, reply })
             .await
     }
 
@@ -168,30 +182,34 @@ where
         &self,
         trigger: Trigger,
     ) -> Result<(), TimerSchedulerError<E>> {
-        self.send_command(CommandOperation::RemoveFromQueue, trigger)
+        self.ask(|reply| Command::RemoveFromQueue { trigger, reply })
+            .await
+            .map(|_| ())
+    }
+
+    /// Returns after the actor sets the item tag at its current location.
+    pub(crate) async fn retag(&self, trigger: Trigger) -> Result<(), TimerSchedulerError<E>> {
+        self.ask(|reply| Command::Retag { trigger, reply }).await
+    }
+
+    /// Remove a queued trigger for a manual test dispatch.
+    #[cfg(test)]
+    pub(crate) async fn take_from_queue(
+        &self,
+        trigger: Trigger,
+    ) -> Result<Option<Trigger>, TimerSchedulerError<E>> {
+        self.ask(|reply| Command::TakeFromQueue { trigger, reply })
             .await
     }
 
-    /// Transitions a timer from `Scheduled` to `Firing` state.
-    ///
-    /// Returns `true` if the transition succeeded.
+    /// Starts the delivered item's attempt and returns its current tag.
     pub(crate) async fn fire(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> bool {
-        use crate::timers::active::TimerState;
-
-        if let Some(TimerState::Scheduled) =
-            self.active_triggers.get_state(key, time, timer_type).await
-        {
-            self.active_triggers
-                .set_state(key, time, timer_type, TimerState::Firing)
-                .await
-        } else {
-            false
-        }
+    ) -> Option<i32> {
+        self.active_triggers.fire(key, time, timer_type).await
     }
 
     /// Deactivate a trigger without removing it from the persistent queue.
@@ -199,24 +217,18 @@ where
         self.active_triggers.remove(key, time, timer_type).await;
     }
 
-    async fn send_command(
+    /// Send one command and wait for its reply. A closed channel means the
+    /// actor stopped.
+    async fn ask<R>(
         &self,
-        operation: CommandOperation,
-        trigger: Trigger,
-    ) -> Result<(), TimerSchedulerError<E>> {
-        let (result_tx, result_rx) = oneshot::channel();
+        command: impl FnOnce(oneshot::Sender<R>) -> Command<E>,
+    ) -> Result<R, TimerSchedulerError<E>> {
+        let (reply, response) = oneshot::channel();
         self.command_tx
-            .send(Command {
-                operation,
-                trigger,
-                result_tx,
-            })
-            .map_err(|_| TimerSchedulerError::Shutdown)
-            .await?;
-        result_rx
+            .send(command(reply))
             .await
-            .map_err(|_| TimerSchedulerError::Shutdown)?
-            .map_err(TimerSchedulerError::Store)
+            .map_err(|_| TimerSchedulerError::Shutdown)?;
+        response.await.map_err(|_| TimerSchedulerError::Shutdown)
     }
 }
 

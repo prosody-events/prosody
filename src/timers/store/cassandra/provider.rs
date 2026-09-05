@@ -16,7 +16,6 @@
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::timers::store::Segment;
 use crate::timers::store::TriggerStoreProvider;
-use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::cassandra::CassandraTriggerStore;
 use crate::timers::store::cassandra::error::CassandraTriggerStoreError;
 use crate::timers::store::cassandra::queries::Queries;
@@ -44,10 +43,9 @@ use std::sync::Arc;
 pub async fn cassandra_store(
     config: &CassandraConfiguration,
     segment: Segment,
-) -> Result<TableAdapter<CassandraTriggerStore>, CassandraTriggerStoreError> {
+) -> Result<CassandraTriggerStore, CassandraTriggerStoreError> {
     let store = CassandraStore::new(config).await?;
-    let cassandra = CassandraTriggerStore::with_store(store, &config.keyspace, segment).await?;
-    Ok(TableAdapter::new(cassandra))
+    CassandraTriggerStore::with_store(store, &config.keyspace, segment).await
 }
 
 /// Factory holding shared Cassandra resources for creating per-segment stores.
@@ -87,13 +85,9 @@ impl CassandraTriggerStoreProvider {
 }
 
 impl TriggerStoreProvider for CassandraTriggerStoreProvider {
-    type Store = TableAdapter<CassandraTriggerStore>;
+    type Store = CassandraTriggerStore;
 
     fn create_store(&self, segment: Segment) -> Self::Store {
-        TableAdapter::new(CassandraTriggerStore::with_shared(
-            self.store.clone(),
-            Arc::clone(&self.queries),
-            segment,
-        ))
+        CassandraTriggerStore::with_shared(self.store.clone(), Arc::clone(&self.queries), segment)
     }
 }

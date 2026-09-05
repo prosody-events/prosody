@@ -73,6 +73,35 @@ pub trait Uncommitted {
     fn abort(self) -> impl Future<Output = ()> + Send;
 }
 
+/// Records an event receipt and returns its committed source.
+///
+/// The boundary records the message marker before receipt. A timer receipt
+/// changes its key row. The oracle then reports the event as committed.
+/// [`ReceiptedSource::retire`] removes the source after promotion.
+/// [`ReceiptedSource::keep`] preserves the source for another recovery sweep.
+/// Neither action can abort the committed event.
+pub trait Receipted: Uncommitted + sealed::Sealed {
+    /// The source after the event commits.
+    type Source: ReceiptedSource;
+
+    /// Records the receipt. The event commits at this step. Retries each failed
+    /// write.
+    fn receipt(self) -> impl Future<Output = Self::Source> + Send;
+}
+
+/// The source of a committed event. It cannot abort the event.
+pub trait ReceiptedSource: sealed::Sealed + Send {
+    /// Retires the source after state promotion.
+    fn retire(self) -> impl Future<Output = ()> + Send;
+
+    /// Keeps the source so its next delivery sweeps the key.
+    fn keep(self) -> impl Future<Output = ()> + Send;
+}
+
+pub(crate) mod sealed {
+    pub trait Sealed {}
+}
+
 /// Provides handlers for processing messages from specific partitions.
 ///
 /// This trait allows creating custom message handlers for each partition,

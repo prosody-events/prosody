@@ -1,2 +1,4 @@
 [profile.default]
 status-level = "pass"
+# A test that runs past ten minutes is a defect, never a wait. Stop it.
+slow-timeout = { period = "60s", terminate-after = 10, grace-period = "10s" }

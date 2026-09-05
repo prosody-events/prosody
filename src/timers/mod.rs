@@ -75,7 +75,7 @@ mod manager;
 mod queue;
 mod scheduler;
 mod segment;
-mod slab;
+pub(crate) mod slab;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -211,12 +211,6 @@ impl TimerRequest {
             timer_type,
             span,
         }
-    }
-
-    /// Converts this request into a tagged internal trigger with a fresh tag.
-    #[must_use]
-    pub(crate) fn into_trigger(self) -> Trigger {
-        Trigger::new(self.key, self.time, self.timer_type, self.span)
     }
 
     /// Converts this request into a tagged internal trigger with `tag`.

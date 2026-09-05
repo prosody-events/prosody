@@ -372,9 +372,9 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.write_provisional_no_ttl,
+                statement: &q.write_provisional,
                 row: RowShape::Stage(StageRow {
-                    ttl: None,
+                    ttl: 0,
                     data: blob_a.data(),
                     prev_data: None,
                     encoding: blob_a.encoding(),
@@ -397,9 +397,9 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.write_resolved_no_ttl,
+                statement: &q.write_resolved,
                 row: RowShape::Resolved(ResolvedRow {
-                    ttl: None,
+                    ttl: 0,
                     data: blob_c.data(),
                     encoding: blob_c.encoding(),
                     version: blob_c.version(),
@@ -420,9 +420,9 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.marker_write_no_ttl,
+                statement: &q.marker_write,
                 row: RowShape::MarkerWrite(MarkerWriteRow {
-                    ttl: None,
+                    ttl: 0,
                     payload: marker_blob.payload.as_ref(),
                     encoding: marker_blob.payload.encoding(),
                     event: event(2),

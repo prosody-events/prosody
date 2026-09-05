@@ -172,7 +172,7 @@ pub async fn prop_v1_slab_metadata_model_equivalence(
 ) -> color_eyre::Result<()> {
     // Clean up slabs from this trial to ensure isolation
     // Even with unique v4 UUIDs, cleanup prevents test pollution if trials fail and
-    // rerun
+    // Repeat the trace.
     for segment_id in &input.segment_ids {
         // Delete all possible slab IDs from segments table (match range in Arbitrary)
         for slab_id in 0..10 {

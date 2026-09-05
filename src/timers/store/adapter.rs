@@ -1,180 +1,35 @@
-//! Adapts `TriggerOperations` to implement `TriggerStore`.
-//!
-//! This module provides the `TableAdapter` struct that wraps a type
-//! implementing `TriggerOperations` (22 primitive methods) and provides the
-//! public `TriggerStore` interface (13 methods) with coordinated dual-table
-//! operations.
+//! Compose writes to the key and slab rows.
 
+use super::{RetainOldSlab, TriggerStore};
 use crate::Key;
-use crate::timers::DELETE_CONCURRENCY;
-use crate::timers::TimerType;
-use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::duration::CompactDuration;
-use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentId, TriggerStore};
-use futures::{Stream, StreamExt, TryStreamExt, stream};
-use std::future::Future;
-use std::ops::RangeInclusive;
-use std::sync::Arc;
+use crate::timers::slab::Slab;
+use crate::timers::{DELETE_CONCURRENCY, TimerType, Trigger};
+use crate::util::crash_point;
+use futures::{StreamExt, TryStreamExt, stream};
 use tokio::try_join;
-use tracing::{debug, instrument};
+use tracing::instrument;
 
-/// Adapts `TriggerOperations` to implement `TriggerStore`.
-///
-/// This struct wraps a type implementing `TriggerOperations` (22 primitive
-/// methods) and provides the public `TriggerStore` interface (13 methods)
-/// with coordinated dual-table operations.
-///
-/// Uses `Arc` for cheap cloning and best-effort consistency via `try_join!`.
-///
-/// **Visibility**: `pub` but not re-exported from `store/mod.rs`.
-/// Used by factory functions in implementation modules (cassandra/mod.rs,
-/// memory.rs) which return concrete `TableAdapter<T>` types.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// // Factory functions return concrete TableAdapter:
-/// pub fn cassandra_store(...) -> TableAdapter<CassandraTriggerStore> {
-///     let cassandra = CassandraTriggerStore::new(...);
-///     TableAdapter::new(cassandra)
-/// }
-///
-/// // Consumer usage:
-/// let store = cassandra_store(...);  // TableAdapter<CassandraTriggerStore>: TriggerStore
-/// let manager = TimerManager::new(..., store);
-/// ```
+/// Compose row writes without a second store trait.
 #[derive(Clone)]
-pub struct TableAdapter<T> {
-    operations: Arc<T>,
+pub(crate) struct TableAdapter<T> {
+    operations: T,
 }
 
 impl<T> TableAdapter<T> {
-    /// Creates a new `TableAdapter` wrapping the given operations.
-    pub fn new(operations: T) -> Self {
-        Self {
-            operations: Arc::new(operations),
-        }
+    pub(crate) fn new(operations: T) -> Self {
+        Self { operations }
     }
 
-    /// Returns a reference to the underlying operations.
-    ///
-    /// Provides access to low-level `TriggerOperations` methods for cases
-    /// where direct primitive access is needed (e.g., migration, internal
-    /// maintenance operations).
-    #[must_use]
-    pub fn operations(&self) -> &T {
-        self.operations.as_ref()
+    pub(crate) fn operations(&self) -> &T {
+        &self.operations
     }
 }
 
-/// Implements the public `TriggerStore` interface using internal
-/// `TriggerOperations`.
-impl<T> TriggerStore for TableAdapter<T>
-where
-    T: TriggerOperations,
-{
-    type Error = T::Error;
-
-    // ===================================================================
-    // Segment accessors
-    // ===================================================================
-
-    fn segment(&self) -> Segment {
-        self.operations.segment().clone()
-    }
-
-    fn segment_id(&self) -> SegmentId {
-        self.operations.segment().id
-    }
-
-    fn slab_size(&self) -> CompactDuration {
-        self.operations.segment().slab_size
-    }
-
-    // ===================================================================
-    // Pass-through methods: Delegate directly to operations
-    // ===================================================================
-
-    fn get_segment(&self) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send {
-        self.operations.get_segment()
-    }
-
-    fn insert_segment(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        self.operations.insert_segment()
-    }
-
-    fn get_slab_range(
-        &self,
-        range: RangeInclusive<SlabId>,
-    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send {
-        self.operations.get_slab_range(range)
-    }
-
-    fn get_slab_triggers_all_types(
-        &self,
-        slab_id: SlabId,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
-        let slab = Slab::new(slab_id, self.slab_size());
-        self.operations.get_slab_triggers_all_types(slab)
-    }
-
-    fn insert_slab(&self, slab: Slab) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        self.operations.insert_slab(slab)
-    }
-
-    fn delete_slab(&self, slab_id: SlabId) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        self.operations.delete_slab(slab_id)
-    }
-
-    fn get_slab_watermark(
-        &self,
-    ) -> impl Future<Output = Result<Option<SlabId>, Self::Error>> + Send {
-        self.operations.get_slab_watermark()
-    }
-
-    fn set_slab_watermark(
-        &self,
-        watermark: Option<SlabId>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        self.operations.set_slab_watermark(watermark)
-    }
-
-    fn batch_insert_slab_with_watermark(
-        &self,
-        slab: Slab,
-        watermark: Option<SlabId>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        self.operations
-            .batch_insert_slab_with_watermark(slab, watermark)
-    }
-
-    fn get_key_times(
-        &self,
-        timer_type: TimerType,
-        key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send {
-        self.operations.get_key_times(timer_type, key)
-    }
-
-    fn get_key_triggers(
-        &self,
-        timer_type: TimerType,
-        key: &Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
-        self.operations.get_key_triggers(timer_type, key)
-    }
-
-    // ===================================================================
-    // Coordinated writes: Use try_join! for best-effort dual-table
-    // consistency
-    // ===================================================================
-
+impl<T: TriggerStore> TableAdapter<T> {
     #[instrument(level = "debug", skip(self, trigger), err)]
-    async fn add_trigger(&self, trigger: Trigger) -> Result<(), Self::Error> {
-        let slab = Slab::from_time(self.slab_size(), trigger.time);
+    pub(crate) async fn add_trigger(&self, trigger: Trigger) -> Result<(), T::Error> {
+        let slab = Slab::from_time(self.operations.segment().slab_size, trigger.time);
         // Coordinate the two trigger-row writes; slab metadata is owned by
         // the scheduler actor (which short-circuits the round-trip when the
         // slab is already known).
@@ -185,14 +40,18 @@ where
         Ok(())
     }
 
+    pub(crate) async fn add_key_row(&self, trigger: Trigger) -> Result<(), T::Error> {
+        self.operations.upsert_key_trigger(trigger).await
+    }
+
     #[instrument(level = "debug", skip(self), err)]
-    async fn remove_trigger(
+    pub(crate) async fn remove_trigger(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> Result<(), Self::Error> {
-        let slab = Slab::from_time(self.slab_size(), time);
+    ) -> Result<(), T::Error> {
+        let slab = Slab::from_time(self.operations.segment().slab_size, time);
         // Coordinate: delete from both tables
         try_join!(
             self.operations
@@ -202,95 +61,95 @@ where
         Ok(())
     }
 
-    async fn update_tag(
+    pub(crate) async fn remove_key_row(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
-        new_tag: i32,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), T::Error> {
         self.operations
-            .update_tag(key, time, timer_type, new_tag)
+            .delete_key_trigger(timer_type, key, time)
             .await
     }
 
-    async fn current_tag(
+    pub(crate) async fn remove_slab_row(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> Result<Option<i32>, Self::Error> {
-        self.operations.current_tag(key, time, timer_type).await
+    ) -> Result<(), T::Error> {
+        let slab = Slab::from_time(self.operations.segment().slab_size, time);
+        self.operations
+            .delete_slab_trigger(&slab, timer_type, key, time)
+            .await
     }
 
-    #[instrument(level = "debug", skip(self, trigger), err)]
-    async fn clear_and_schedule(&self, trigger: Trigger) -> Result<(), Self::Error> {
-        // INVARIANT (at-least-once delivery): Write new timer FIRST, then
-        // delete old entries. If crash occurs after writing new but before
-        // deleting old, both timers exist (may fire twice). If we deleted
-        // first and crashed, timer would be lost (never fires). The ordering
-        // below enforces: Step 1 (write new) completes before Step 2 (delete
-        // old).
+    /// Write the new slab row before the key swap can commit the attempt.
+    /// A stop before the swap leaves a slab row for recovery to remove.
+    #[instrument(level = "debug", skip(self, old, new), err)]
+    pub(crate) async fn replace(
+        &self,
+        old: &Trigger,
+        new: Trigger,
+        retain: RetainOldSlab,
+    ) -> Result<(), T::Error> {
+        let slab = Slab::from_time(self.operations.segment().slab_size, new.time);
+        self.operations
+            .insert_slab_trigger(slab, new.clone())
+            .await?;
+        // Memory writes finish in one poll. Tests must stop between these writes.
+        crash_point().await;
+        self.operations.replace_key_trigger(old, new).await?;
+        if retain == RetainOldSlab::No {
+            self.remove_slab_row(&old.key, old.time, old.timer_type)
+                .await?;
+        }
+        Ok(())
+    }
 
-        let slab_size = self.slab_size();
+    #[instrument(level = "debug", skip(self, trigger, keep), err)]
+    pub(crate) async fn clear_and_schedule(
+        &self,
+        trigger: Trigger,
+        keep: &[CompactDateTime],
+    ) -> Result<(), T::Error> {
+        let slab_size = self.operations.segment().slab_size;
         let new_slab = Slab::from_time(slab_size, trigger.time);
         let key = trigger.key.clone();
         let timer_type = trigger.timer_type;
 
-        // Step 1 (DUAL-INDEX WRITE): write the new timer to both indices in
-        // parallel. `clear_and_schedule_key` atomically clears the key index
-        // entry and returns the old trigger times it replaced — no separate
-        // pre-read needed. The key index uses the Cassandra singleton-slot
-        // optimisation: a single atomic op DELETEs all clustering rows and
-        // UPDATEs the static slot, so singleton→singleton replacement
-        // creates zero tombstones.
+        // Write the new timer before any old source disappears.
+        let write_slab = async {
+            if !keep.contains(&trigger.time) {
+                self.operations
+                    .insert_slab_trigger(new_slab, trigger.clone())
+                    .await?;
+            }
+            Ok::<(), T::Error>(())
+        };
         let ((), old_times) = try_join!(
-            self.operations
-                .insert_slab_trigger(new_slab, trigger.clone()),
-            self.operations.clear_and_schedule_key(trigger),
+            write_slab,
+            self.operations.clear_and_schedule_key(trigger.clone()),
         )?;
 
-        debug!(
-            key = %key,
-            timer_type = ?timer_type,
-            old_entry_count = old_times.len(),
-            "clear_and_schedule: new timer written to slab + key indices; proceeding to delete old slab entries"
-        );
-
-        // Step 2: Delete old entries from slab index only.
-        // Key index was already cleared atomically in Step 1.
-        // INVARIANT (at-least-once): This runs AFTER Step 1 completes, so
-        // the new timer is guaranteed to exist before old entries are removed.
-        // Each delete targets a different clustering row, so concurrent deletes
-        // to the same partition are safe.
-        stream::iter(old_times.iter().copied())
-            .map(|old_time| {
-                let old_slab = Slab::from_time(slab_size, old_time);
-                let ops = &self.operations;
-                let key = &key;
-                async move {
-                    debug!(
-                        key = %key,
-                        timer_type = ?timer_type,
-                        old_time = ?old_time,
-                        old_slab_id = ?old_slab.id(),
-                        "clear_and_schedule: deleting old slab entry"
-                    );
-                    ops.delete_slab_trigger(&old_slab, timer_type, key, old_time)
-                        .await
-                }
-            })
-            .buffer_unordered(DELETE_CONCURRENCY)
-            .try_collect::<()>()
-            .await?;
-
-        debug!(
-            key = %key,
-            timer_type = ?timer_type,
-            deleted_count = old_times.len(),
-            "clear_and_schedule: complete"
-        );
-
+        stream::iter(
+            old_times
+                .iter()
+                .copied()
+                .filter(|time| !keep.contains(time)),
+        )
+        .map(|old_time| {
+            let old_slab = Slab::from_time(slab_size, old_time);
+            let ops = &self.operations;
+            let key = &key;
+            async move {
+                ops.delete_slab_trigger(&old_slab, timer_type, key, old_time)
+                    .await
+            }
+        })
+        .buffer_unordered(DELETE_CONCURRENCY)
+        .try_collect::<()>()
+        .await?;
         Ok(())
     }
 }

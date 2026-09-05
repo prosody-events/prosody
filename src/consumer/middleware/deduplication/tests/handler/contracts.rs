@@ -121,24 +121,11 @@ fn ttl_below_minimum_rejected() {
     assert!(result.is_err());
 }
 
-/// Probe handler that records work-stage and apply-hook events.
-///
-/// `Handler` records an `on_message`/`on_timer` invocation; `InnerAfterCommit`
-/// / `InnerAfterAbort` record the corresponding apply hook. Tests assert at
-/// most one apply event per `Handler` event, and zero when no `Handler` fired.
+/// Record each handler call and apply hook.
 #[derive(Clone, Default)]
 struct ApplyProbe {
     log: Arc<parking_lot::Mutex<Vec<ApplyEvent>>>,
     error: Option<TestError>,
-}
-
-impl ApplyProbe {
-    fn failing(error: TestError) -> Self {
-        Self {
-            log: Arc::default(),
-            error: Some(error),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,107 +205,74 @@ impl FallibleHandler for ApplyProbe {
     async fn shutdown(self) {}
 }
 
+/// Both hooks forward results only when the inner handler ran.
 #[tokio::test]
-async fn dedup_skip_does_not_invoke_inner_after_commit() -> color_eyre::Result<()> {
-    // First message goes through, second is deduplicated → inner.after_commit
-    // must fire on the first dispatch but NOT on the second.
-    let inner = ApplyProbe::default();
-    let log = inner.log.clone();
-    let handler = create_handler(inner);
-
-    let msg1 = create_test_message("key1", Some("evt1"))?;
-    let msg2 = create_test_message("key1", Some("evt1"))?;
-    let id = dedup_uuid_for_message(test_identity(), &msg1);
-
-    // First dispatch: inner runs, on_message returns Ok(Some(())).
-    let context1 = session_context(id);
-    let result1 =
-        FallibleHandler::on_message(&handler, context1.clone(), msg1, DemandType::Normal).await;
-    assert!(matches!(result1, Ok(Some(()))));
-    // The dedup middleware's after_commit must forward the inner half.
-    FallibleHandler::after_commit(&handler, context1, result1).await;
-
-    // Simulate the `settle` boundary recording the marker after the first
-    // commit (the middleware never writes the store itself).
-    handler.store.insert(id).await?;
-
-    // Second dispatch: deduplicated, on_message returns Ok(None).
-    let context2 = session_context(id);
-    let result2 =
-        FallibleHandler::on_message(&handler, context2.clone(), msg2, DemandType::Normal).await;
-    assert!(matches!(result2, Ok(None)));
-    FallibleHandler::after_commit(&handler, context2, result2).await;
-
-    assert_eq!(
-        log.lock().clone(),
-        vec![ApplyEvent::Handler, ApplyEvent::InnerAfterCommit],
-        "second dispatch must NOT invoke inner.after_commit (handler never ran)",
-    );
+async fn apply_hooks_follow_inner_calls() -> color_eyre::Result<()> {
+    for presence in [
+        Ok(Presence::Absent),
+        Ok(Presence::Settled),
+        Ok(Presence::Inherited),
+        Err(TestError::Transient),
+    ] {
+        for error in [None, Some(TestError::Permanent)] {
+            for commit in [false, true] {
+                for timer in [false, true] {
+                    let inner = ApplyProbe {
+                        error: error.clone(),
+                        ..ApplyProbe::default()
+                    };
+                    let log = inner.log.clone();
+                    let handler = DeduplicationHandler {
+                        inner,
+                        store: LookupStore(presence.clone()),
+                    };
+                    let message = create_test_message("key1", Some("evt1"))?;
+                    let context =
+                        session_context(dedup_uuid_for_message(test_identity(), &message));
+                    let result = if timer {
+                        let trigger = Trigger::for_testing(
+                            "key1".into(),
+                            CompactDateTime::from(1000_u32),
+                            TimerType::default(),
+                        );
+                        FallibleHandler::on_timer(
+                            &handler,
+                            context.clone(),
+                            trigger,
+                            DemandType::Normal,
+                        )
+                        .await
+                    } else {
+                        FallibleHandler::on_message(
+                            &handler,
+                            context.clone(),
+                            message,
+                            DemandType::Normal,
+                        )
+                        .await
+                    };
+                    if commit {
+                        FallibleHandler::after_commit(&handler, context, result).await;
+                    } else {
+                        FallibleHandler::after_abort(&handler, context, result).await;
+                    }
+                    let ran = timer || matches!(presence, Ok(Presence::Absent));
+                    let hook = if commit {
+                        ApplyEvent::InnerAfterCommit
+                    } else {
+                        ApplyEvent::InnerAfterAbort
+                    };
+                    let expected = [ApplyEvent::Handler, hook];
+                    assert_eq!(log.lock().as_slice(), if ran { &expected[..] } else { &[] });
+                }
+            }
+        }
+    }
     Ok(())
 }
 
-#[tokio::test]
-async fn dedup_passthrough_forwards_after_commit_for_handler_ok() -> color_eyre::Result<()> {
-    // Sanity: when the handler runs, inner.after_commit must receive the Ok
-    // forwarded through DeduplicationHandler::after_commit.
-    let inner = ApplyProbe::default();
-    let log = inner.log.clone();
-    let handler = create_handler(inner);
-    let context = MockEventContext::new();
-
-    let msg = create_test_message("key1", Some("evt-fresh"))?;
-
-    let result =
-        FallibleHandler::on_message(&handler, context.clone(), msg, DemandType::Normal).await;
-    assert!(matches!(result, Ok(Some(()))));
-    FallibleHandler::after_commit(&handler, context, result).await;
-
-    assert_eq!(
-        log.lock().clone(),
-        vec![ApplyEvent::Handler, ApplyEvent::InnerAfterCommit],
-        "passthrough: inner.after_commit fires when inner ran successfully",
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn dedup_passthrough_forwards_after_commit_for_handler_err() -> color_eyre::Result<()> {
-    // When the inner runs and returns an `Err`, the dedup middleware must
-    // forward that `Err` through whichever apply hook the framework chooses.
-    // Here we simulate the framework treating the dispatch as final (e.g. a
-    // permanent-classification error routed to a DLQ) by calling
-    // `after_commit` with the inner-typed error wrapped by the dedup layer.
-    let inner = ApplyProbe::failing(TestError::Permanent);
-    let log = inner.log.clone();
-    let handler = create_handler(inner);
-    let context = MockEventContext::new();
-
-    let msg = create_test_message("key1", Some("evt-err"))?;
-
-    let result =
-        FallibleHandler::on_message(&handler, context.clone(), msg, DemandType::Normal).await;
-    assert!(result.is_err());
-    FallibleHandler::after_commit(&handler, context, result).await;
-
-    assert_eq!(
-        log.lock().clone(),
-        vec![ApplyEvent::Handler, ApplyEvent::InnerAfterCommit],
-        "inner.after_commit must receive the inner-typed Err when the dispatch is final",
-    );
-    Ok(())
-}
-
-/// The dedup id every deriver produces must agree: the partition loop's
-/// `EventRef` derivation, the message-defer reload override, and the
-/// keyed-state recovery oracle all call the canonical
-/// [`dedup_uuid_for_message`] with the same [`DedupIdentity`]. If a reader
-/// diverged, recovery would look committed message state up under the wrong
-/// id and always read `NotCommitted`, silently rolling state back.
-///
-/// Exercised with and without an `event_id` because [`dedup_uuid`] selects a
-/// different hash branch (`event_id` vs offset) for each; the regression that
-/// motivated this — a reader hardcoding `version=""` and `event_id=None` —
-/// is pinned by the inequality asserts against the buggy form.
+/// Marker writers and readers must derive the same ID.
+/// Both event IDs and offset fallbacks must agree.
 #[test]
 fn dedup_id_writer_matches_canonical_reader_derivation() -> color_eyre::Result<()> {
     const VERSION: &str = "1";

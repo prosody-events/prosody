@@ -26,7 +26,7 @@ use super::actor::{
     collect_active_slab_ids, handle_add, load_step, next_unloaded_slab_id, owns_slab,
 };
 use crate::Key;
-use crate::timers::active::TimerState;
+use crate::timers::active::{Item, TimerState};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::queue::TriggerQueue;
@@ -53,11 +53,12 @@ use tracing::Span;
 const SLAB_SIZE_SECS: u32 = 300;
 const PRELOAD_SECS: u32 = 120;
 
-type TestStore = TableAdapter<InMemoryTriggerStore>;
+type TestStore = InMemoryTriggerStore;
 
 fn fresh_state(store: TestStore, segment: Segment) -> ActorState<TestStore> {
     let now = Instant::now();
     ActorState {
+        ready: None,
         store,
         segment,
         known_slab_ids: BTreeSet::new(),
@@ -224,17 +225,17 @@ impl Arbitrary for OpSequence {
 enum ModelActiveState {
     Scheduled,
     Firing,
-    Aborted,
+    Parked,
 }
 
 impl ModelActiveState {
-    fn from_timer_state(state: TimerState) -> StdResult<Self, String> {
+    fn from_timer_state(state: &TimerState) -> StdResult<Self, String> {
         match state {
-            TimerState::Scheduled => Ok(Self::Scheduled),
+            TimerState::Scheduled(_) => Ok(Self::Scheduled),
             TimerState::Firing => Ok(Self::Firing),
-            TimerState::Aborted => Ok(Self::Aborted),
-            TimerState::FiringRescheduled => {
-                Err("property model does not create FiringRescheduled timers".to_owned())
+            TimerState::Parked => Ok(Self::Parked),
+            TimerState::FiringReplaced(_) | TimerState::FiringRescheduled(_) => {
+                Err("model does not replace or reschedule active attempts".to_owned())
             }
         }
     }
@@ -309,16 +310,17 @@ impl Fixture {
 
     async fn apply_schedule(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
         let (key, time, ty) = spec.resolve(self.now_slab);
-        let trigger = Trigger::new(key.clone(), time, ty, Span::current());
+        // This model keeps one tag. The manager property tests tag changes.
+        let trigger = Trigger::with_tag(key.clone(), time, ty, 0, Span::current());
         let current_model = self.model_for(&key, time, ty);
 
-        // Reviving an Aborted timer with the same identity is an in-memory
+        // Reviving a Parked timer with the same identity is an in-memory
         // state transition: the store row already exists, so just flip the
         // state back to Scheduled and re-queue.
-        if current_model.active_state == Some(ModelActiveState::Aborted) {
+        if current_model.active_state == Some(ModelActiveState::Parked) {
             self.triggers
                 .active_triggers()
-                .set_state(&key, time, ty, TimerState::Scheduled)
+                .set_state(&key, time, ty, TimerState::Scheduled(Item::Queued))
                 .await;
             self.triggers.insert_queue_only(trigger);
             self.set_model(
@@ -341,7 +343,7 @@ impl Fixture {
             && !self.state.known_slab_ids.contains(&slab_id);
         let old_watermark = self.state.last_persisted_watermark;
 
-        self.store
+        TableAdapter::new(self.store.clone())
             .add_trigger(trigger.clone())
             .await
             .map_err(|e| format!("add_trigger: {e:?}"))?;
@@ -365,12 +367,12 @@ impl Fixture {
 
     async fn apply_unschedule(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
         let (key, time, ty) = spec.resolve(self.now_slab);
-        self.store
+        TableAdapter::new(self.store.clone())
             .remove_trigger(&key, time, ty)
             .await
             .map_err(|e| format!("remove_trigger: {e:?}"))?;
-        let trigger = Trigger::new(key.clone(), time, ty, Span::current());
-        self.triggers.remove(&trigger).await;
+        let trigger = Trigger::with_tag(key.clone(), time, ty, 0, Span::current());
+        self.triggers.remove_if_live(&trigger).await;
         self.set_model(
             key,
             time,
@@ -390,12 +392,12 @@ impl Fixture {
                 .active_triggers()
                 .get_state(&key, time, ty)
                 .await,
-            Some(TimerState::Scheduled)
+            Some(TimerState::Scheduled(Item::Queued))
         ) {
             return Ok(());
         }
 
-        let trigger = Trigger::new(key.clone(), time, ty, Span::current());
+        let trigger = Trigger::with_tag(key.clone(), time, ty, 0, Span::current());
         self.triggers.remove_queue_only(&trigger);
         self.triggers
             .active_triggers()
@@ -417,22 +419,27 @@ impl Fixture {
             .get_state(&key, time, ty)
             .await
         {
-            Some(TimerState::Scheduled) => true,
+            Some(TimerState::Scheduled(_)) => true,
             Some(TimerState::Firing) => false,
-            Some(TimerState::Aborted | TimerState::FiringRescheduled) | None => return Ok(()),
+            Some(
+                TimerState::Parked
+                | TimerState::FiringReplaced(_)
+                | TimerState::FiringRescheduled(_),
+            )
+            | None => return Ok(()),
         };
 
         self.triggers
             .active_triggers()
-            .set_state(&key, time, ty, TimerState::Aborted)
+            .set_state(&key, time, ty, TimerState::Parked)
             .await;
         if needs_dequeue {
-            let trigger = Trigger::new(key.clone(), time, ty, Span::current());
+            let trigger = Trigger::with_tag(key.clone(), time, ty, 0, Span::current());
             self.triggers.remove_queue_only(&trigger);
         }
 
         let mut model = self.model_for(&key, time, ty);
-        model.active_state = Some(ModelActiveState::Aborted);
+        model.active_state = Some(ModelActiveState::Parked);
         self.set_model(key, time, ty, model);
         Ok(())
     }
@@ -654,6 +661,7 @@ impl Fixture {
             let store_times: BTreeSet<CompactDateTime> = self
                 .store
                 .get_key_times(*ty, key)
+                .map_ok(|(time, _)| time)
                 .try_collect()
                 .await
                 .map_err(|e| format!("get_key_times: {e:?}"))?;
@@ -674,6 +682,7 @@ impl Fixture {
                 .await;
             let owned = owns_slab(&self.state, slab_id);
             let actual_model_state = actual_state
+                .as_ref()
                 .map(ModelActiveState::from_timer_state)
                 .transpose()?;
             if actual_model_state != expected.active_state {
@@ -780,7 +789,9 @@ async fn test_cleanup_preserves_aborted_timer_slab_and_reload_schedules_it() -> 
     let trigger = Trigger::new(key.clone(), time, ty, Span::current());
 
     store.insert_slab(slab).await?;
-    store.add_trigger(trigger.clone()).await?;
+    TableAdapter::new(store.clone())
+        .add_trigger(trigger.clone())
+        .await?;
 
     let mut state = fresh_state(store.clone(), segment.clone());
     state.known_slab_ids.insert(slab_id);
@@ -794,7 +805,7 @@ async fn test_cleanup_preserves_aborted_timer_slab_and_reload_schedules_it() -> 
         .await;
     triggers
         .active_triggers()
-        .set_state(&key, time, ty, TimerState::Aborted)
+        .set_state(&key, time, ty, TimerState::Parked)
         .await;
     triggers.remove_queue_only(&trigger);
 
@@ -804,10 +815,13 @@ async fn test_cleanup_preserves_aborted_timer_slab_and_reload_schedules_it() -> 
         store.get_slab_range(0..=SlabId::MAX).try_collect().await?;
     assert!(
         slabs_after_cleanup.contains(&slab_id),
-        "cleanup must keep slab metadata while an Aborted timer is active"
+        "cleanup must keep slab metadata while a Parked timer is active"
     );
-    let times_after_cleanup: BTreeSet<CompactDateTime> =
-        store.get_key_times(ty, &key).try_collect().await?;
+    let times_after_cleanup: BTreeSet<CompactDateTime> = store
+        .get_key_times(ty, &key)
+        .map_ok(|(time, _)| time)
+        .try_collect()
+        .await?;
     assert!(
         times_after_cleanup.contains(&time),
         "cleanup must not delete the persisted timer row"
@@ -823,7 +837,7 @@ async fn test_cleanup_preserves_aborted_timer_slab_and_reload_schedules_it() -> 
             .active_triggers()
             .get_state(&key, time, ty)
             .await,
-        Some(TimerState::Scheduled),
+        Some(TimerState::Scheduled(Item::Queued)),
         "restart/load should reconstruct persisted aborted timers as Scheduled"
     );
 

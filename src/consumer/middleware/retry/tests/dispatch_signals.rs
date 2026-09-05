@@ -15,10 +15,12 @@ use super::*;
 // - Signal: shutdown vs cancellation
 
 use crate::consumer::partition::offsets::OffsetTracker;
-use crate::consumer::{Keyed, Uncommitted};
+use crate::consumer::receipted_sealed;
+use crate::consumer::{Keyed, Receipted, ReceiptedSource, Uncommitted};
 use crate::timers::UncommittedTimer;
 use color_eyre::eyre::{Result, bail};
 use crossbeam_utils::CachePadded;
+use std::future::ready;
 
 /// Mock commit guard for tracking commit/abort calls.
 struct MockCommitGuard {
@@ -34,6 +36,24 @@ impl Uncommitted for MockCommitGuard {
     async fn abort(self) {
         self.aborted.store(true, Ordering::Relaxed);
     }
+}
+
+impl receipted_sealed::Sealed for MockCommitGuard {}
+
+impl Receipted for MockCommitGuard {
+    type Source = Self;
+
+    fn receipt(self) -> impl Future<Output = Self::Source> + Send {
+        ready(self)
+    }
+}
+
+impl ReceiptedSource for MockCommitGuard {
+    async fn retire(self) {
+        self.commit().await;
+    }
+
+    async fn keep(self) {}
 }
 
 /// Mock uncommitted timer for testing `EventHandler::on_timer`.

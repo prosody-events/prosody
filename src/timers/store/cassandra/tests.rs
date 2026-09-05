@@ -1,15 +1,11 @@
 //! Integration tests for [`CassandraTriggerStore`].
 //!
-//! These tests run against a real Cassandra node and are skipped automatically
-//! when one isn't available. They exist because the V3 state-column logic
-//! involves conditional write paths (inline vs. overflow vs. absent) and
-//! concurrent mutex semantics that are hard to exercise meaningfully with a
-//! mock. Running against actual Cassandra also catches serialisation bugs,
-//! TTL edge-cases, and UDT schema mismatches that unit tests cannot.
+//! These tests need Cassandra. They check stored rows and cached state.
 //!
 //! [`CassandraTriggerStore`]: super::CassandraTriggerStore
 
-use super::{CassandraTriggerStore, cassandra_store};
+use super::state::OverflowTags;
+use super::{CassandraTriggerStore, CassandraTriggerStoreError, cassandra_store};
 use super::{InlineTimer, TimerState};
 use crate::Key;
 use crate::cassandra::CassandraStore;
@@ -19,7 +15,8 @@ use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::operations::TriggerOperations;
+use crate::timers::store::TriggerStore;
+use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::tests::common::KEY_POOL;
 use crate::timers::store::tests::prop_key_triggers::{KeyTriggerOperation, KeyTriggerTestInput};
 use crate::timers::store::{Segment, SegmentId, SegmentVersion};
@@ -72,11 +69,13 @@ trigger_store_tests!(
         let segment = test_segment("", slab_size);
         CassandraTriggerStore::with_store(store, &config.keyspace, segment).await
     },
-    crate::timers::store::adapter::TableAdapter<CassandraTriggerStore>,
+    TableAdapter<CassandraTriggerStore>,
     |slab_size| async move {
         let config = test_cassandra_config();
         let segment = test_segment("", slab_size);
-        cassandra_store(&config, segment).await
+        Ok::<_, CassandraTriggerStoreError>(TableAdapter::new(
+            cassandra_store(&config, segment).await?,
+        ))
     },
     integration_test_count(25)
 );
@@ -206,8 +205,11 @@ async fn collect_key_times(
     timer_type: TimerType,
     key: &Key,
 ) -> Result<Vec<CompactDateTime>> {
-    let mut times: Vec<CompactDateTime> =
-        store.get_key_times(timer_type, key).try_collect().await?;
+    let mut times: Vec<CompactDateTime> = store
+        .get_key_times(timer_type, key)
+        .map_ok(|(time, _)| time)
+        .try_collect()
+        .await?;
     times.sort();
     Ok(times)
 }
@@ -303,8 +305,11 @@ async fn assert_state_and_reads(
                 expected.time
             );
         }
-        TimerState::Overflow => {
-            assert_eq!(state, TimerState::Overflow, "{phase}: expected Overflow");
+        TimerState::Overflow(_) => {
+            assert!(
+                matches!(state, TimerState::Overflow(_)),
+                "{phase}: expected Overflow"
+            );
         }
     }
 
@@ -324,13 +329,13 @@ async fn assert_state_and_reads(
                 expected.time,
             );
         }
-        TimerState::Overflow => {
+        TimerState::Overflow(_) => {
             assert!(
                 cached.is_some(),
                 "{phase}: cache should have Overflow entry"
             );
             assert!(
-                matches!(cached, Some(Ok(TimerState::Overflow))),
+                matches!(cached, Some(Ok(TimerState::Overflow(_)))),
                 "{phase}: cached state should be Overflow, got {cached:?}"
             );
         }
@@ -389,7 +394,7 @@ async fn test_state_transitions_schedule_promote_demote() -> Result<()> {
         &segment_id,
         tt,
         &key,
-        &TimerState::Overflow,
+        &TimerState::Overflow(OverflowTags::unknown()),
         &[t1, t2],
         "promote",
     )
@@ -419,7 +424,6 @@ async fn test_state_transitions_schedule_promote_demote() -> Result<()> {
 #[tokio::test]
 async fn test_promote_preserves_tag() -> Result<()> {
     use crate::timers::store::TriggerStore;
-    use crate::timers::store::adapter::TableAdapter;
     init_test_logging();
     let (store, _segment_id) = setup_test_store("promote_tag").await?;
     let store = TableAdapter::new(store);
@@ -434,7 +438,7 @@ async fn test_promote_preserves_tag() -> Result<()> {
     let tag1 = trigger1.tag;
     store.add_trigger(trigger1).await?;
     assert_eq!(
-        store.current_tag(&key, t1, tt).await?,
+        store.operations().current_tag(&key, t1, tt).await?,
         Some(tag1),
         "tag1 must be queryable while Inline"
     );
@@ -447,12 +451,12 @@ async fn test_promote_preserves_tag() -> Result<()> {
     store.add_trigger(trigger2).await?;
 
     assert_eq!(
-        store.current_tag(&key, t1, tt).await?,
+        store.operations().current_tag(&key, t1, tt).await?,
         Some(tag1),
         "promotion must preserve tag1 in the clustering row"
     );
     assert_eq!(
-        store.current_tag(&key, t2, tt).await?,
+        store.operations().current_tag(&key, t2, tt).await?,
         Some(tag2),
         "new clustering row must carry tag2"
     );
@@ -462,7 +466,7 @@ async fn test_promote_preserves_tag() -> Result<()> {
     // permanently stamped into Inline.
     store.remove_trigger(&key, t2, tt).await?;
     assert_eq!(
-        store.current_tag(&key, t1, tt).await?,
+        store.operations().current_tag(&key, t1, tt).await?,
         Some(tag1),
         "demotion must round-trip tag1 from clustering row back to Inline state"
     );
@@ -702,7 +706,7 @@ async fn test_pre_migration_reads_and_migration() -> Result<()> {
     let state = store.fetch_state(&segment_id, &key_b, tt).await?;
     assert_eq!(
         state,
-        TimerState::Overflow,
+        TimerState::Overflow(OverflowTags::unknown()),
         "B post-backfill: expected Overflow"
     );
     assert_key_reads(&store, tt, &key_b, &[t1, t2], "B backfilled").await?;
@@ -911,10 +915,12 @@ async fn test_inline_state_round_trip() -> Result<()> {
     let (handle, _) = store
         .resolve_state(&segment_id, &key, TimerType::Application)
         .await?;
-    assert_eq!(
-        *handle.lock().await,
-        TimerState::Overflow,
-        "phase 4: expected Overflow after promotion"
+    assert!(
+        matches!(
+            *handle.lock().await,
+            TimerState::Overflow(OverflowTags::Complete(_))
+        ),
+        "phase 4: expected a complete Overflow list after promotion"
     );
 
     // Phase 5: clear_and_schedule_key(t4) on an overflow key → back to
@@ -934,6 +940,7 @@ async fn test_inline_state_round_trip() -> Result<()> {
     // Phase 6: Verify get_key_times returns exactly [t4].
     let times: Vec<CompactDateTime> = store
         .get_key_times(TimerType::Application, &key)
+        .map_ok(|(time, _)| time)
         .try_collect()
         .await?;
     assert_eq!(
@@ -979,7 +986,6 @@ async fn test_inline_state_round_trip() -> Result<()> {
 #[tokio::test]
 async fn test_current_tag_inline_trigger() -> Result<()> {
     use crate::timers::store::TriggerStore;
-    use crate::timers::store::adapter::TableAdapter;
     init_test_logging();
     let (store, _segment_id) = setup_test_store("current_tag_inline").await?;
     let store = TableAdapter::new(store);
@@ -994,7 +1000,10 @@ async fn test_current_tag_inline_trigger() -> Result<()> {
     store.add_trigger(trigger).await?;
 
     // current_tag must return Some(expected_tag), not None.
-    let actual_tag = store.current_tag(&key, time, timer_type).await?;
+    let actual_tag = store
+        .operations()
+        .current_tag(&key, time, timer_type)
+        .await?;
     assert_eq!(
         actual_tag,
         Some(expected_tag),
@@ -1003,8 +1012,14 @@ async fn test_current_tag_inline_trigger() -> Result<()> {
 
     // update_tag must update the tag even in Inline mode.
     let new_tag = expected_tag.wrapping_add(1);
-    store.update_tag(&key, time, timer_type, new_tag).await?;
-    let updated = store.current_tag(&key, time, timer_type).await?;
+    store
+        .operations()
+        .update_tag(&key, time, timer_type, new_tag)
+        .await?;
+    let updated = store
+        .operations()
+        .current_tag(&key, time, timer_type)
+        .await?;
     assert_eq!(
         updated,
         Some(new_tag),
@@ -1022,9 +1037,10 @@ async fn test_current_tag_inline_trigger() -> Result<()> {
         "get_key_triggers_all_types must preserve the stored Inline tag"
     );
 
-    let slab_id = Slab::from_time(store.slab_size(), time).id();
+    let slab_id = Slab::from_time(store.operations().segment().slab_size, time).id();
     let slab_triggers: Vec<Trigger> = store
-        .get_slab_triggers_all_types(slab_id)
+        .operations()
+        .get_slab_triggers_all_types(Slab::new(slab_id, store.operations().segment().slab_size))
         .try_collect()
         .await?;
     let slab_tag = slab_triggers
@@ -1033,8 +1049,8 @@ async fn test_current_tag_inline_trigger() -> Result<()> {
         .map(|t| t.tag);
     assert_eq!(
         slab_tag,
-        Some(new_tag),
-        "update_tag must rotate the tag in the slab index"
+        Some(expected_tag),
+        "the slab row must keep its original tag"
     );
 
     store.remove_trigger(&key, time, timer_type).await?;
@@ -1044,7 +1060,6 @@ async fn test_current_tag_inline_trigger() -> Result<()> {
 #[tokio::test]
 async fn scheduled_context_survives_persist_fetch_round_trip() -> Result<()> {
     use crate::timers::store::TriggerStore;
-    use crate::timers::store::adapter::TableAdapter;
     use opentelemetry::trace::TraceContextExt as _;
     init_test_logging();
     let (store, _segment_id) = setup_test_store("context_round_trip").await?;
@@ -1092,7 +1107,6 @@ async fn scheduled_context_survives_persist_fetch_round_trip() -> Result<()> {
 #[tokio::test]
 async fn test_key_triggers_all_types_preserves_inline_tags() -> Result<()> {
     use crate::timers::store::TriggerStore;
-    use crate::timers::store::adapter::TableAdapter;
     init_test_logging();
     let (store, _segment_id) = setup_test_store("all_types_inline_tags").await?;
     let store = TableAdapter::new(store);
@@ -1237,7 +1251,11 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
     assert!(cached_b.is_none(), "store B cache should be cold (None)");
 
     // Store B can still read the data via shared keyspace (same segment ID).
-    let times: Vec<CompactDateTime> = ops_b.get_key_times(tt, &key).try_collect().await?;
+    let times: Vec<CompactDateTime> = ops_b
+        .get_key_times(tt, &key)
+        .map_ok(|(time, _)| time)
+        .try_collect()
+        .await?;
     assert_eq!(times, vec![t1], "store B should read t1 via shared session");
 
     // After the read, store B's cache should now be warm (Inline cached from DB).
@@ -1268,7 +1286,7 @@ async fn oracle_reads_through_the_writers_store() -> Result<()> {
     use super::CassandraTriggerStoreProvider;
     use crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStore;
     use crate::state::commit::{CommitManager, StoreTagSource};
-    use crate::timers::store::{TriggerStore, TriggerStoreProvider};
+    use crate::timers::store::TriggerStoreProvider;
     init_test_logging();
 
     let config = test_cassandra_config();
@@ -1289,7 +1307,9 @@ async fn oracle_reads_through_the_writers_store() -> Result<()> {
 
     // Stage → crash: the trigger row stands. Recovery's first-touch consult
     // observes it (NotCommitted → the event refires) and warms the cache.
-    writer.add_trigger(trigger).await?;
+    TableAdapter::new(writer.clone())
+        .add_trigger(trigger)
+        .await?;
     assert!(
         !oracle
             .is_timer_committed(&key, timer_type, time, wal_tag)
@@ -1300,7 +1320,9 @@ async fn oracle_reads_through_the_writers_store() -> Result<()> {
     // The refired event commits the trigger through the partition's store
     // (row removed). The sweep's consult must observe the commit even though
     // the previous consult warmed the cache.
-    writer.remove_trigger(&key, time, timer_type).await?;
+    TableAdapter::new(writer.clone())
+        .remove_trigger(&key, time, timer_type)
+        .await?;
     assert!(
         oracle
             .is_timer_committed(&key, timer_type, time, wal_tag)
@@ -1318,7 +1340,9 @@ async fn oracle_reads_through_the_writers_store() -> Result<()> {
             .await?,
         "absent row reads committed before the reschedule"
     );
-    writer.add_trigger(second).await?;
+    TableAdapter::new(writer.clone())
+        .add_trigger(second)
+        .await?;
     assert!(
         !oracle
             .is_timer_committed(&key, timer_type, time, second_tag)
@@ -1326,7 +1350,9 @@ async fn oracle_reads_through_the_writers_store() -> Result<()> {
         "schedule through the writer must read NotCommitted"
     );
 
-    writer.remove_trigger(&key, time, timer_type).await?;
+    TableAdapter::new(writer.clone())
+        .remove_trigger(&key, time, timer_type)
+        .await?;
     Ok(())
 }
 
@@ -1492,7 +1518,7 @@ async fn prop_timer_state_invariant(
                 }
                 n => {
                     assert!(
-                        matches!(timer_state, TimerState::Overflow),
+                        matches!(timer_state, TimerState::Overflow(_)),
                         "Invariant violation: {n} timers for ({key}, {timer_type:?}) but state is \
                          {timer_state:?} — expected Overflow"
                     );

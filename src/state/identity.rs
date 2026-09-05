@@ -192,12 +192,11 @@ impl CollectionId {
 ///
 /// The TTL is `Option<CompactDuration>`: `Some(d)` binds a TTL via
 /// `USING TTL ?` on every Cassandra write the store issues for this
-/// collection; `None` writes via the `*_no_ttl` query variants and means the
-/// application opted into indefinite retention. An over-ceiling `Some(d)`
-/// (Cassandra rejects `USING TTL ?` values above `630_720_000` seconds) is
-/// rejected at `CollectionDefRegistry::register` time — never silently
-/// collapsed to `None`, which would turn a finite retention into permanent
-/// storage.
+/// collection. `None` binds zero and keeps the collection without expiry. An
+/// over-ceiling `Some(d)` (Cassandra rejects `USING TTL ?` values above
+/// `630_720_000` seconds) is rejected at `CollectionDefRegistry::register` time
+/// — never silently collapsed to `None`, which would turn a finite retention
+/// into permanent storage.
 ///
 /// The per-collection TTL is sourced from the shared
 /// `CollectionDefRegistry`: the

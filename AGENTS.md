@@ -416,23 +416,22 @@ through the same `settle`/`abandon`). Whether a dispatch settles the event at
 all is a pure function of the stack's final result: the crate-internal
 `Settlement` classification (`SettlementHandler::settlement`, one explicit
 impl per framework wrapper, the leaf adapter minted at `into_provider`
-hardcoding `Final`) decides `Final` vs `Bypassed` before the error category is
-consulted; the message commit marker is read from the session's event identity
+hardcoding `Final`) decides `Final`, `Duplicate`, or `Bypassed` before it checks
+the error category. The message commit marker comes from the session's event
+identity
 (`message_marker()` — the message `EventRef`'s dedup id, or the
 deferred-reload's last-wins identity override), never deposited by middleware.
-The full stage → arm-backstop → marker-record → commit → promote order, its
-crash-window argument, and the sweep's mirrored posture are documented once on
-their owning items — `settle`/`settle_committed`, `arm_backstop`/`ArmOutcome`,
-and `StateManager::recover` — read those doc comments before touching any of
-it. The anchors code comments cite by name:
+The sweep posture uses stage → marker-record → receipt → promote → retire.
+Its crash windows are documented on `settle_committed`. Read that doc before
+you change the sequence. The anchors code comments cite by name:
 
-- **Invariant 8:** arming the backstop is must-succeed. `arm_backstop` retries
-  every non-shutdown failure and can only report `ShuttingDown`, so "abort in
-  normal operation" is structurally unwritable at the boundary.
-- **Finding F2:** neither the boundary nor the sweep ever unschedules a
-  backstop — per-key `StateRecovery` timers are only ever pulled sooner
-  (arm-if-sooner), so one event can never clear or loosen another event's
-  still-needed backstop. There is no `unschedule_all`; do not reintroduce one.
+- **Invariant 8:** every required backstop arm is must-succeed. Incomplete
+  promotions, duplicate sweep failures, and permanent stage
+  failures use `arm_backstop`. It retries every non-shutdown failure.
+- **Finding F2:** the boundary never unschedules a backstop. Only its fired
+  recovery sweep clears the standing backstop. A redelivery sweep clears none.
+  Arm-if-sooner prevents one event from loosening another event's backstop.
+  A rescheduled backstop after a failed sweep also follows arm-if-sooner.
 - **Posture:** retry transient AND terminal store failures forever; skip only
   permanent data-rejections; abort only on shutdown; never emit Terminal.
 - **No WAL, ever.** State is one provisional cell per value. The in-memory

@@ -35,11 +35,10 @@ pub(super) fn blob_weight(blob: &CellBlobs) -> u64 {
     PER_STATEMENT_OVERHEAD + blob_bytes
 }
 
-/// Converts a per-write TTL to the `i32` the driver binds to `USING TTL ?`.
-/// The input is pre-validated against Cassandra's ceiling at registration, so
-/// the saturating conversion is only a defensive floor.
-pub(super) fn ttl_to_i32(ttl: CompactDuration) -> i32 {
-    ttl.seconds().try_into().unwrap_or(i32::MAX)
+/// Returns the collection TTL bind value. Zero means no expiry for `None`.
+/// Registration validates a present duration against Cassandra's limit.
+pub(super) fn ttl_bind(ttl: Option<CompactDuration>) -> i32 {
+    ttl.map_or(0, |ttl| ttl.seconds().try_into().unwrap_or(i32::MAX))
 }
 
 /// Converts a blob-TTL read (`decode`'s `blob_ttl`) into the cache-fill

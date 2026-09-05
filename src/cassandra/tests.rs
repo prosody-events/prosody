@@ -5,7 +5,8 @@
 //! integration tests (one real batch) composed with this proof of the
 //! boundaries, so it needs no separate fixture.
 
-use super::chunk_boundaries;
+use super::{MAX_CASSANDRA_TTL_SECS, chunk_boundaries, ttl_bind};
+use color_eyre::eyre::{Result, ensure};
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
 use std::ops::Range;
@@ -90,4 +91,25 @@ fn chunk_boundaries_are_minimal_and_within_limits(
     }
 
     TestResult::passed()
+}
+
+/// TTL binds preserve supported seconds and disable expiry for larger values.
+#[quickcheck]
+fn ttl_bind_respects_the_ceiling(seconds: u64) -> Result<()> {
+    let ceiling = u64::try_from(MAX_CASSANDRA_TTL_SECS)?;
+    for seconds in [0, ceiling - 1, ceiling, ceiling + 1, u64::MAX, seconds] {
+        let actual = ttl_bind(seconds);
+        if seconds < ceiling {
+            ensure!(
+                u64::try_from(actual)? == seconds,
+                "The TTL changed below the ceiling"
+            );
+        } else {
+            ensure!(
+                actual == 0_i32,
+                "The TTL must disable expiry at or above the ceiling"
+            );
+        }
+    }
+    Ok(())
 }

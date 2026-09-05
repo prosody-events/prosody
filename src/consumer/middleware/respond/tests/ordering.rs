@@ -42,8 +42,8 @@ fn the_response_leaves_only_after_the_durable_commit() -> Result<()> {
             }
 
             assert!(
-                is_provisional(&cell_store, &cart_id).await?,
-                "the staged value must remain provisional at the commit"
+                !is_provisional(&cell_store, &cart_id).await?,
+                "the sweep posture promotes before it retires the source"
             );
             assert_eq!(
                 serialize_count(),

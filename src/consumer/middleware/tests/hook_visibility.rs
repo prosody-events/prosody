@@ -2,7 +2,7 @@ use super::*;
 use crate::codec::JsonCodec;
 use crate::consumer::middleware::tests::test_support::RecordingOracle;
 use crate::consumer::middleware::tests::test_support::TestLifecycleAccess;
-use crate::consumer::middleware::tests::test_support::{Ctx, buffered, is_provisional};
+use crate::consumer::middleware::tests::test_support::{buffered, is_provisional};
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::collection::sealed::{ReadEngine, Session};
@@ -156,16 +156,12 @@ impl SettlementHandler for HookProbe {
     }
 }
 
-/// Window 1 — `after_abort` after the arm-shutdown rollback reads the
-/// **restored committed base**: the drain removed the dirty overlay and
-/// the receipt's rollback settled the staged cell back to `prev` before
-/// the hook fires, so the hook sees the truthful base, not the aborted
-/// write's bytes.
+/// After shutdown before the stage, the abort hook reads the committed base.
 #[tokio::test]
-async fn arm_shutdown_after_abort_reads_the_restored_committed_base() -> Result<()> {
-    let (context, cell_store, cart_id) = buffered(Ctx::with_shutdown_on_timer_read).await?;
-    // Seed the committed base the rollback restores. Safe after the
-    // buffered set: finalize captures `prev` later, inside settle.
+async fn shutdown_before_stage_after_abort_reads_committed_base() -> Result<()> {
+    let (context, cell_store, cart_id) = buffered(|context| context).await?;
+    let context = context.with_shutdown();
+    // Seed the committed base beneath the buffered write.
     cell_store
         .write_resolved(
             &CollectionRef::new(cart_id.clone(), None),
@@ -176,18 +172,18 @@ async fn arm_shutdown_after_abort_reads_the_restored_committed_base() -> Result<
     let handler = HookProbe::new(vec![StateName::try_new("cart")?]);
     let (guard, committed, aborted) = RecordingGuard::new();
 
-    settle(&handler, context, guard, Ok(0)).await;
+    settle(&handler, context.clone(), guard, Ok(0)).await;
 
-    assert_eq!(aborted.load(Ordering::SeqCst), 1, "arm-shutdown aborts");
+    assert_eq!(aborted.load(Ordering::SeqCst), 1, "shutdown aborts");
     assert_eq!(committed.load(Ordering::SeqCst), 0);
     assert!(
         !is_provisional(&cell_store, &cart_id).await?,
-        "the receipt's rollback settled the staged cell before the hook",
+        "shutdown leaves no staged cell before the hook",
     );
     assert_eq!(
         handler.reads(),
         vec![(Hook::Abort, vec![Ok(Some(Bytes::from_static(b"base")))])],
-        "after_abort reads the restored committed base, not the aborted write",
+        "after_abort reads the committed base",
     );
     Ok(())
 }
@@ -390,15 +386,22 @@ async fn incomplete_promote_after_commit_reads_the_mixed_per_cell_view() -> Resu
             Some(b"B1"),
         )
         .await;
-    let context = MockEventContext::new().with_session(session);
+    let context = MockEventContext::new()
+        .with_session(session)
+        .with_timer_tracking();
 
     let handler = HookProbe::new(vec![cart, wishlist]);
     let (guard, committed, aborted) = RecordingGuard::new();
 
-    settle(&handler, context, guard, Ok(0)).await;
+    settle(&handler, context.clone(), guard, Ok(0)).await;
 
     assert_eq!(committed.load(Ordering::SeqCst), 1, "the event committed");
     assert_eq!(aborted.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        context.count_scheduled(TimerType::StateRecovery),
+        1,
+        "an incomplete sweep-posture promotion arms before retirement",
+    );
     assert_eq!(
         recorded.lock().as_slice(),
         [Uuid::from_u128(0xF2)],

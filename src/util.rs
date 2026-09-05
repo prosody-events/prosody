@@ -22,6 +22,22 @@ use std::fmt::Display;
 use std::str::FromStr;
 use std::time::Duration;
 
+/// A point where a process can stop between two durable steps.
+///
+/// Memory backends finish a durable step in one poll, so a poll-budget test
+/// needs a yield to stop between steps. Production builds compile it out.
+#[cfg(test)]
+pub(crate) fn crash_point() -> impl Future<Output = ()> {
+    use tokio::task::yield_now;
+    yield_now()
+}
+
+#[cfg(not(test))]
+pub(crate) fn crash_point() -> impl Future<Output = ()> {
+    use std::future::ready;
+    ready(())
+}
+
 /// Retrieves and parses an environment variable into the specified type.
 ///
 /// # Errors

@@ -1,7 +1,5 @@
 use super::*;
 use crate::Key;
-use crate::consumer::EventHandler;
-use crate::consumer::Uncommitted;
 use crate::consumer::message::ConsumerMessageValue;
 use crate::consumer::message::UncommittedMessage;
 use crate::consumer::middleware::tests::test_support::{
@@ -10,10 +8,13 @@ use crate::consumer::middleware::tests::test_support::{
 };
 use crate::consumer::middleware::{FallibleEventHandler, Settlement, SettlementHandler};
 use crate::consumer::partition::offsets::OffsetTracker;
+use crate::consumer::receipted_sealed;
+use crate::consumer::{EventHandler, Receipted, ReceiptedSource, Uncommitted};
 use crate::state::manager::EventStateScope;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::{EventRef, StateKey};
 use crossbeam_utils::CachePadded;
+use std::future::ready;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -165,6 +166,24 @@ impl Uncommitted for Guard {
     async fn abort(self) {
         self.aborted.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+impl receipted_sealed::Sealed for Guard {}
+
+impl Receipted for Guard {
+    type Source = Self;
+
+    fn receipt(self) -> impl Future<Output = Self::Source> + Send {
+        ready(self)
+    }
+}
+
+impl ReceiptedSource for Guard {
+    async fn retire(self) {
+        self.commit().await;
+    }
+
+    async fn keep(self) {}
 }
 
 /// A Permanent producer error (a payload serialization rejection), for

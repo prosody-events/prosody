@@ -41,7 +41,10 @@ struct TimerInitContext<'a> {
 async fn init_timer_manager<S>(
     trigger_store: S,
     ctx: TimerInitContext<'_>,
-) -> Option<(impl Stream<Item = PendingTimer<S>>, TimerManager<S>)>
+) -> Option<(
+    impl Future<Output = Option<impl Stream<Item = PendingTimer<S>>>>,
+    TimerManager<S>,
+)>
 where
     S: TriggerStore,
 {
@@ -253,6 +256,16 @@ async fn run_partition<T, S, M, P>(
         partition_info.partition,
         shutdown_rx.clone(),
     ));
+
+    let mut load_shutdown = shutdown_rx.clone();
+    let timer_stream = tokio::select! {
+        stream = timer_stream => stream,
+        () = async { let _ = load_shutdown.wait_for(|phase| *phase >= ShutdownPhase::Draining).await; } => None,
+    };
+    let Some(timer_stream) = timer_stream else {
+        handler.shutdown().await;
+        return;
+    };
 
     let timer_events = stream! {
         pin_mut!(timer_stream);

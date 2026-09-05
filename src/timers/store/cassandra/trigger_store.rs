@@ -1,4 +1,4 @@
-//! [`TriggerOperations`] implementation for [`CassandraTriggerStore`].
+//! [`TriggerStore`] implementation for [`CassandraTriggerStore`].
 //!
 //! Each method resolves the current [`TimerState`] (via the cache or a DB
 //! read) before issuing writes, so it can pick the cheapest Cassandra
@@ -10,9 +10,8 @@
 //! (see [`crate::timers::store::cassandra::state`]) and hold it from the state
 //! check through the DB write — that is what makes the read-decide-write
 //! sequence linearisable against concurrent callers on the same
-//! `(key, timer_type)`. Read-only stream methods take the same lock briefly
-//! to snapshot the state, then release before any DB I/O: a concurrent
-//! transition just shifts the snapshot, which is acceptable for a stream.
+//! `(key, timer_type)`. The time scan holds this lock until it fills the tag
+//! list. Other streams release it after they copy the state.
 //!
 //! `get_key_triggers_all_types` is the most complex method: it reads the full
 //! `state` map in one query, then merges inline entries (sorted by
@@ -30,20 +29,21 @@
 //! topology.
 //!
 //! [`FiringTimer::set_dispatch_span`]: crate::timers::uncommitted::FiringTimer::set_dispatch_span
-//! [`TriggerOperations`]: crate::timers::store::operations::TriggerOperations
+//! [`TriggerStore`]: crate::timers::store::TriggerStore
 //! [`CassandraTriggerStore`]: crate::timers::store::cassandra::CassandraTriggerStore
 //! [`TimerState`]: crate::timers::store::cassandra::TimerState
 
+use super::state::{OverflowTags, TagLookup};
 use crate::Key;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
+use crate::timers::store::TriggerStore;
 use crate::timers::store::cassandra::CassandraTriggerStore;
 use crate::timers::store::cassandra::error::CassandraTriggerStoreError;
 use crate::timers::store::cassandra::migration;
 use crate::timers::store::cassandra::state::{ClusteringEntry, InlineTimer, TimerState};
-use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, SegmentVersion};
 use crate::timers::{TimerType, Trigger, TriggerId};
 use async_stream::try_stream;
@@ -63,8 +63,17 @@ use tokio::task::coop::cooperative;
 use tracing::field::Empty;
 use tracing::{Span, instrument};
 
-impl TriggerOperations for CassandraTriggerStore {
+impl TriggerStore for CassandraTriggerStore {
     type Error = CassandraTriggerStoreError;
+
+    #[cfg(test)]
+    fn cold(&self) -> Self {
+        Self::with_shared(
+            self.store.clone(),
+            self.queries.clone(),
+            self.segment.clone(),
+        )
+    }
 
     fn segment(&self) -> &Segment {
         &self.segment
@@ -192,12 +201,13 @@ impl TriggerOperations for CassandraTriggerStore {
         let segment_id = self.segment.id;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
 
-        self.execute_with_optional_ttl(
-            slab.range().end,
+        self.execute_unpaged_discard(
             &self.queries().insert_slab,
-            &self.queries().insert_slab_no_ttl,
-            |ttl| (segment_id, slab_id, ttl),
-            || (segment_id, slab_id),
+            (
+                segment_id,
+                slab_id,
+                self.store.calculate_ttl(slab.range().end),
+            ),
         )
         .await
     }
@@ -239,17 +249,18 @@ impl TriggerOperations for CassandraTriggerStore {
         let segment_id = self.segment.id;
         let watermark_i32 = watermark.map(|w| i32::from_le_bytes(w.to_le_bytes()));
 
-        // TTL anchor uses the natural slab end; `calculate_ttl` adds the
-        // configured `base_ttl` grace period (default 1 year), matching the
+        // TTL anchor uses the natural slab end; `CassandraStore::calculate_ttl` adds
+        // the configured `base_ttl` grace period (default 1 year), matching the
         // same lifetime as `insert_slab` and slab triggers.
         let anchor_time = anchor_after_watermark(watermark, self.segment.slab_size);
 
-        self.execute_with_optional_ttl(
-            anchor_time,
+        self.execute_unpaged_discard(
             &self.queries().set_slab_watermark,
-            &self.queries().set_slab_watermark_no_ttl,
-            |ttl| (ttl, watermark_i32, segment_id),
-            || (watermark_i32, segment_id),
+            (
+                self.store.calculate_ttl(anchor_time),
+                watermark_i32,
+                segment_id,
+            ),
         )
         .await
     }
@@ -265,18 +276,16 @@ impl TriggerOperations for CassandraTriggerStore {
         let watermark_i32 = watermark.map(|w| i32::from_le_bytes(w.to_le_bytes()));
 
         // Same anchor as `insert_slab` so the slab row and watermark hint
-        // share a lifetime. `calculate_ttl` adds the configured `base_ttl`
-        // grace period (default 1 year) on top of `slab.range().end` — that
-        // grace is what lets a lagging client process past-time slabs
+        // share a lifetime. `CassandraStore::calculate_ttl` adds the configured
+        // `base_ttl` grace period (default 1 year) on top of `slab.range().end`
+        // — that grace is what lets a lagging client process past-time slabs
         // without finding them already TTL'd out.
         let anchor_time = slab.range().end;
 
-        self.execute_with_optional_ttl(
-            anchor_time,
+        let ttl = self.store.calculate_ttl(anchor_time);
+        self.execute_unpaged_discard(
             &self.queries().batch_insert_slab_with_watermark,
-            &self.queries().batch_insert_slab_with_watermark_no_ttl,
-            |ttl| (segment_id, slab_id, ttl, ttl, watermark_i32, segment_id),
-            || (segment_id, slab_id, watermark_i32, segment_id),
+            (segment_id, slab_id, ttl, ttl, watermark_i32, segment_id),
         )
         .await
     }
@@ -360,20 +369,19 @@ impl TriggerOperations for CassandraTriggerStore {
         let timer_type = trigger.timer_type;
         let tag = trigger.tag;
 
-        self.execute_with_optional_ttl(
-            slab.range().end,
+        self.execute_unpaged_discard(
             &self.queries().insert_slab_trigger,
-            &self.queries().insert_slab_trigger_no_ttl,
-            |ttl| {
-                (
-                    segment_id, slab_size, slab_id, timer_type, key, time, &span_map, tag, ttl,
-                )
-            },
-            || {
-                (
-                    segment_id, slab_size, slab_id, timer_type, key, time, &span_map, tag,
-                )
-            },
+            (
+                segment_id,
+                slab_size,
+                slab_id,
+                timer_type,
+                key,
+                time,
+                &span_map,
+                tag,
+                self.store.calculate_ttl(slab.range().end),
+            ),
         )
         .await
     }
@@ -426,7 +434,7 @@ impl TriggerOperations for CassandraTriggerStore {
         &self,
         timer_type: TimerType,
         key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send {
+    ) -> impl Stream<Item = Result<(CompactDateTime, i32), Self::Error>> + Send {
         let key_clone = key.clone();
         let segment_id = self.segment.id;
 
@@ -434,16 +442,14 @@ impl TriggerOperations for CassandraTriggerStore {
             let (handle, cached) = self.resolve_state(&segment_id, &key_clone, timer_type).await?;
             Span::current().record("state_cached", cached);
 
-            // Snapshot the state and release the lock before any DB I/O — a
-            // concurrent transition would just shift the snapshot, which is
-            // fine for a read-only stream.
-            let state = handle.lock().await.clone();
-            match state {
+            let mut state = handle.lock().await;
+            match &mut *state {
                 TimerState::Inline(timer) => {
                     // Inline: yield time from cache (0 clustering query).
-                    yield timer.time;
+                    yield (timer.time, timer.tag);
                 }
-                TimerState::Overflow => {
+                TimerState::Overflow(tags) => {
+                    let mut scanned = OverflowTags::Complete(SmallVec::new());
                     // Overflow: scan clustering rows.
                     let stream = self
                         .session()
@@ -453,17 +459,20 @@ impl TriggerOperations for CassandraTriggerStore {
                         )
                         .await
                         .map_err(CassandraStoreError::from)?
-                        .rows_stream::<(CompactDateTime,)>()
+                        .rows_stream::<(CompactDateTime, Option<i32>)>()
                         .map_err(CassandraStoreError::from)?;
 
                     pin_mut!(stream);
-                    while let Some((time,)) =
+                    while let Some((time, tag)) =
                         cooperative(stream.try_next())
                             .await
                             .map_err(CassandraStoreError::from)?
                     {
-                        yield time;
+                        let tag = tag.unwrap_or_default();
+                        scanned.insert(time, tag);
+                        yield (time, tag);
                     }
+                    *tags = scanned;
                 }
                 TimerState::Absent => {
                     // Post-V3 Absent is unambiguous: 0 timers, yield nothing.
@@ -495,7 +504,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     let context = self.propagator().extract(&timer.span);
                     yield Trigger::restored(key_clone.clone(), timer.time, timer_type, timer.tag, context);
                 }
-                TimerState::Overflow => {
+                TimerState::Overflow(_) => {
                     // Overflow: scan clustering rows.
                     let stream = self
                         .session()
@@ -567,7 +576,7 @@ impl TriggerOperations for CassandraTriggerStore {
             Span::current().record("state_cached", false);
 
             // Check if any type is Overflow — if so, clustering scan needed.
-            let has_overflow = state_map.values().any(|s| matches!(s, TimerState::Overflow));
+            let has_overflow = state_map.values().any(|s| matches!(s, TimerState::Overflow(_)));
 
             if has_overflow {
                 // At least one type needs clustering — run the merge.
@@ -699,7 +708,7 @@ impl TriggerOperations for CassandraTriggerStore {
         Span::current().record("state_cached", cached);
 
         let mut guard = handle.lock().await;
-        match &*guard {
+        match &mut *guard {
             TimerState::Inline(timer) if timer.time == time => {
                 // Inline timer matches the delete target → remove state, become Absent.
                 // No clustering row exists for inline timers, so only remove state.
@@ -707,7 +716,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     .await?;
                 *guard = TimerState::Absent;
             }
-            TimerState::Overflow => {
+            TimerState::Overflow(tags) => {
                 // Read pre-delete clustering rows (LIMIT 3) in one round-trip.
                 // After filtering the target out, the survivor count drives
                 // the post-delete state — and any survivor's data is already
@@ -756,6 +765,7 @@ impl TriggerOperations for CassandraTriggerStore {
                             (&segment_id, key.as_ref(), timer_type, time),
                         )
                         .await?;
+                        tags.remove(time);
                     }
                 }
             }
@@ -817,6 +827,45 @@ impl TriggerOperations for CassandraTriggerStore {
     /// `resolve_state` returns the per-`(key, timer_type)` mutex; holding
     /// `handle.lock().await` for the entire match serialises the
     /// read-decide-write sequence against concurrent same-key writers.
+    async fn replace_key_trigger(&self, old: &Trigger, new: Trigger) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
+        let (handle, _) = self
+            .resolve_state(&segment_id, &old.key, old.timer_type)
+            .await?;
+        let mut state = handle.lock().await;
+        let pending = PendingKeyTrigger::from_trigger(self.propagator(), &new);
+        match &mut *state {
+            TimerState::Inline(_) | TimerState::Absent => {
+                let (_, next) = pending.into_inline_state();
+                self.set_state_inline(&segment_id, &old.key, old.timer_type, &next)
+                    .await?;
+                *state = next;
+            }
+            TimerState::Overflow(tags) => {
+                self.execute_unpaged_discard(
+                    &self.queries().replace_key_trigger,
+                    (
+                        segment_id,
+                        old.key.as_ref(),
+                        old.timer_type,
+                        old.time,
+                        segment_id,
+                        new.key.as_ref(),
+                        new.timer_type,
+                        new.time,
+                        &pending.span_map,
+                        new.tag,
+                        self.store.calculate_ttl(new.time),
+                    ),
+                )
+                .await?;
+                tags.remove(old.time);
+                tags.insert(new.time, new.tag);
+            }
+        }
+        Ok(())
+    }
+
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn clear_and_schedule_key(
         &self,
@@ -857,7 +906,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     SmallVec::from_buf([old_time])
                 }
             }
-            TimerState::Overflow => {
+            TimerState::Overflow(_) => {
                 clear_overflow_and_schedule_key(self, &segment_id, &trigger, &new_state).await?
             }
         };
@@ -928,50 +977,35 @@ impl TriggerOperations for CassandraTriggerStore {
         Span::current().record("state_cached", cached);
 
         let mut guard = handle.lock().await;
-        match &*guard {
+        match &mut *guard {
             TimerState::Inline(timer) if timer.time == time => {
                 let new_state = TimerState::Inline(InlineTimer {
                     time: timer.time,
                     span: timer.span.clone(),
                     tag: new_tag,
                 });
-                tokio::try_join!(
-                    self.set_state_inline(&segment_id, key, timer_type, &new_state),
-                    self.update_slab_tag(key, time, timer_type, new_tag),
-                )?;
+                self.set_state_inline(&segment_id, key, timer_type, &new_state)
+                    .await?;
                 *guard = new_state;
             }
-            // Concurrent `clear_and_schedule` won the lock first and rewrote
-            // the UDT to a different timer (or cleared it entirely). The new
-            // Inline timer carries its own freshly-minted tag from
-            // `Trigger::new`, so our rotation is moot. Do NOT assert/warn —
-            // this race is legitimate under normal reschedule contention.
+            // This coordinate has no key row to update. `mint` reuses a standing tag.
+            // A same-coordinate `clear_and_schedule` during an attempt keeps that tag.
+            // The later Complete from FiringRescheduled rotates it.
             TimerState::Inline(_) | TimerState::Absent => {}
-            TimerState::Overflow => {
-                tokio::try_join!(
-                    self.execute_unpaged_discard(
-                        &self.queries().update_tag,
-                        (new_tag, &segment_id, key.as_ref(), timer_type, time),
-                    ),
-                    self.update_slab_tag(key, time, timer_type, new_tag),
-                )?;
+            TimerState::Overflow(tags) => {
+                self.execute_unpaged_discard(
+                    &self.queries().update_tag,
+                    (new_tag, &segment_id, key.as_ref(), timer_type, time),
+                )
+                .await?;
+                tags.insert(time, new_tag);
             }
         }
         Ok(())
     }
 
-    /// Reads the commit-oracle tag for a single timer at `time`.
-    ///
-    /// Cache-first via `resolve_state`: a hit answers with zero DB reads.
-    /// This is sound because the partition's single writer is the only
-    /// mutator of this instance's `state_cache`, and the keyed-state commit
-    /// oracle consults through a **clone of this instance** (handle passing
-    /// at partition acquisition — see `StateBackendFactory::for_partition`), so
-    /// writer and oracle share one cache; per-key serialization orders every
-    /// consult against the mutations it must observe. On `Overflow`, the
-    /// clustering row's tag column is read under the per-key mutex so a
-    /// concurrent promote/demote cannot interleave between the state check and
-    /// the row read.
+    /// Reads a tag from the shared state cache when the list can answer.
+    /// An unknown tag needs one clustering row read. Clones share this cache.
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn current_tag(
         &self,
@@ -983,25 +1017,33 @@ impl TriggerOperations for CassandraTriggerStore {
         let (handle, cached) = self.resolve_state(&segment_id, key, timer_type).await?;
         Span::current().record("state_cached", cached);
 
-        let guard = handle.lock().await;
-        match &*guard {
+        let mut guard = handle.lock().await;
+        match &mut *guard {
             TimerState::Inline(timer) if timer.time == time => Ok(Some(timer.tag)),
             TimerState::Inline(_) | TimerState::Absent => Ok(None),
-            TimerState::Overflow => {
-                let row = self
-                    .session()
-                    .execute_unpaged(
-                        &self.queries().current_tag_key,
-                        (&segment_id, key.as_ref(), timer_type, time),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)?
-                    .into_rows_result()
-                    .map_err(CassandraStoreError::from)?
-                    .maybe_first_row::<(Option<i32>,)>()
-                    .map_err(CassandraStoreError::from)?;
-                Ok(row.map(|(tag_opt,)| tag_opt.unwrap_or(0_i32)))
-            }
+            TimerState::Overflow(tags) => match tags.get(time) {
+                TagLookup::Known(tag) => Ok(Some(tag)),
+                TagLookup::Absent => Ok(None),
+                TagLookup::Unknown => {
+                    let row = self
+                        .session()
+                        .execute_unpaged(
+                            &self.queries().current_tag_key,
+                            (&segment_id, key.as_ref(), timer_type, time),
+                        )
+                        .await
+                        .map_err(CassandraStoreError::from)?
+                        .into_rows_result()
+                        .map_err(CassandraStoreError::from)?
+                        .maybe_first_row::<(Option<i32>,)>()
+                        .map_err(CassandraStoreError::from)?;
+                    let tag = row.map(|(tag_opt,)| tag_opt.unwrap_or(0_i32));
+                    if let Some(tag) = tag {
+                        tags.insert(time, tag);
+                    }
+                    Ok(tag)
+                }
+            },
         }
     }
 
@@ -1044,10 +1086,10 @@ async fn clear_overflow_and_schedule_key(
         )
         .await
         .map_err(CassandraStoreError::from)?
-        .rows_stream::<(CompactDateTime,)>()
+        .rows_stream::<(CompactDateTime, Option<i32>)>()
         .map_err(CassandraStoreError::from)?
         .map_err(CassandraStoreError::from)
-        .map_ok(|(time,)| time)
+        .map_ok(|(time, _)| time)
         .try_filter(|&time| ready(time != trigger.time))
         .try_collect()
         .await?;
@@ -1100,31 +1142,17 @@ impl PendingKeyTrigger {
         segment_id: &SegmentId,
     ) -> Result<(), CassandraTriggerStoreError> {
         store
-            .execute_with_optional_ttl(
-                self.id.time,
+            .execute_unpaged_discard(
                 &store.queries().insert_key_trigger_clustering,
-                &store.queries().insert_key_trigger_clustering_no_ttl,
-                |ttl| {
-                    (
-                        segment_id,
-                        self.id.key.as_ref(),
-                        self.id.timer_type,
-                        self.id.time,
-                        &self.span_map,
-                        self.tag,
-                        ttl,
-                    )
-                },
-                || {
-                    (
-                        segment_id,
-                        self.id.key.as_ref(),
-                        self.id.timer_type,
-                        self.id.time,
-                        &self.span_map,
-                        self.tag,
-                    )
-                },
+                (
+                    segment_id,
+                    self.id.key.as_ref(),
+                    self.id.timer_type,
+                    self.id.time,
+                    &self.span_map,
+                    self.tag,
+                    store.store.calculate_ttl(self.id.time),
+                ),
             )
             .await
     }
@@ -1137,7 +1165,7 @@ enum KeyUpsertTransition {
         existing: InlineTimer,
         new: PendingKeyTrigger,
     },
-    UpsertClustering(PendingKeyTrigger),
+    UpsertClustering(PendingKeyTrigger, OverflowTags),
 }
 
 impl KeyUpsertTransition {
@@ -1149,7 +1177,7 @@ impl KeyUpsertTransition {
                 existing: existing.clone(),
                 new,
             },
-            TimerState::Overflow => Self::UpsertClustering(new),
+            TimerState::Overflow(tags) => Self::UpsertClustering(new, tags.clone()),
         }
     }
 
@@ -1180,11 +1208,15 @@ impl KeyUpsertTransition {
                         new.clustering_entry(),
                     )
                     .await?;
-                Ok(TimerState::Overflow)
+                let mut tags = OverflowTags::Complete(SmallVec::new());
+                tags.insert(existing.time, existing.tag);
+                tags.insert(new.id.time, new.tag);
+                Ok(TimerState::Overflow(tags))
             }
-            Self::UpsertClustering(new) => {
+            Self::UpsertClustering(new, mut tags) => {
                 new.insert_clustering(store, segment_id).await?;
-                Ok(TimerState::Overflow)
+                tags.insert(new.id.time, new.tag);
+                Ok(TimerState::Overflow(tags))
             }
         }
     }
@@ -1193,9 +1225,9 @@ impl KeyUpsertTransition {
 /// Returns the TTL anchor time for a watermark update.
 ///
 /// Anchors on the natural end of the slab at `watermark + 1`. The actual
-/// TTL is `(anchor - now) + base_ttl` because `calculate_ttl` adds the
-/// configured grace period (default 1 year) — slabs and the watermark hint
-/// deliberately outlive their natural end so a lagging consumer can still
+/// TTL is `(anchor - now) + base_ttl` because `CassandraStore::calculate_ttl`
+/// adds the configured grace period (default 1 year) — slabs and the watermark
+/// hint deliberately outlive their natural end so a lagging consumer can still
 /// process past-time slabs.
 fn anchor_after_watermark(
     watermark: Option<SlabId>,

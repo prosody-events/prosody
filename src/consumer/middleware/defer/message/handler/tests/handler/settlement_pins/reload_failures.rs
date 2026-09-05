@@ -145,13 +145,10 @@ impl MessageDeferStore for TableStore {
     }
 }
 
-/// The settlement classification table for the message-defer wrapper:
-/// every Output and error variant. The delegating rows are proven to
-/// delegate by routing through the dedup wrapper's own table (`Inner
-/// None` reaches dedup's `Bypassed`, never a hardcoded `Final`).
+/// The wrapper preserves each result from the deduplication handler.
 #[test]
 fn settlement_classification_table() {
-    use crate::consumer::middleware::deduplication::DeduplicationError;
+    use crate::consumer::middleware::deduplication::{DeduplicationError, DeduplicationOutput};
     use crate::timers::datetime::CompactDateTimeError;
 
     type Subject = MessageDeferHandler<
@@ -160,19 +157,24 @@ fn settlement_classification_table() {
         MemoryLoader<Value>,
         AlwaysDefer,
     >;
-    type Out = MessageDeferOutput<Option<()>, DeduplicationError<StagingError>>;
+    type Out = MessageDeferOutput<DeduplicationOutput<()>, DeduplicationError<StagingError>>;
     type TableErr = DeferError<StagingError, DeduplicationError<StagingError>, MemoryLoaderError>;
 
     let rows: Vec<(&str, Result<Out, TableErr>, Settlement)> = vec![
         (
-            "Inner(Some) delegates through dedup to the leaf's Final",
-            Ok(MessageDeferOutput::Inner(Some(()))),
+            "Ran delegates to Final",
+            Ok(MessageDeferOutput::Inner(DeduplicationOutput::Ran(()))),
             Settlement::Final,
         ),
         (
-            "Inner(None) delegates to dedup's Bypassed (dedup hit)",
-            Ok(MessageDeferOutput::Inner(None)),
+            "Repeated delegates to Bypassed",
+            Ok(MessageDeferOutput::Inner(DeduplicationOutput::Repeated)),
             Settlement::Bypassed,
+        ),
+        (
+            "Redelivered delegates to Duplicate",
+            Ok(MessageDeferOutput::Inner(DeduplicationOutput::Redelivered)),
+            Settlement::Duplicate,
         ),
         (
             "Deferred is Bypassed (parked for retry)",

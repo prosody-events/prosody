@@ -1,11 +1,3 @@
-//! Internal trait for primitive storage operations.
-//!
-//! This module defines the `TriggerOperations` trait used by Cassandra and
-//! Memory implementations. It provides 22 primitive methods that operate on
-//! individual tables without coordinating across tables.
-//!
-//! **Not part of the public API.** Use `TriggerStore` instead.
-
 use crate::Key;
 use crate::error::ClassifyError;
 use crate::timers::datetime::CompactDateTime;
@@ -19,27 +11,21 @@ use std::error::Error;
 use std::future::Future;
 use std::ops::RangeInclusive;
 
-/// Internal trait for primitive storage operations.
+/// The timer store trait for individual table operations.
 ///
-/// This trait provides 22 primitive methods that operate on individual
-/// tables without coordinating across tables. It is the trait bound for
-/// `TableAdapter<T>`, which is part of the public API.
+/// [`CassandraTriggerStore`] and [`InMemoryTriggerStore`] implement this trait.
+/// Store clones must observe every completed write to their shared rows.
 ///
-/// **Users should not implement this trait directly.** Use `TriggerStore`
-/// instead.
-///
-/// # Used by
-///
-/// - `CassandraTriggerStore` implementation
-/// - `InMemoryTriggerStore` implementation
-/// - `TableAdapter` to implement `TriggerStore`
-///
-/// # Visibility
-///
-/// This trait is `pub` to satisfy Rust's visibility rules (used in public
-/// `TableAdapter`), but is not re-exported from `store/mod.rs`, keeping it
-/// effectively internal.
-pub trait TriggerOperations: Clone + Send + Sync + 'static {
+/// [`CassandraTriggerStore`]: super::cassandra::CassandraTriggerStore
+/// [`InMemoryTriggerStore`]: super::memory::InMemoryTriggerStore
+pub trait TriggerStore: Clone + Send + Sync + 'static {
+    /// Test only: a store over the same rows with an empty cache.
+    #[cfg(test)]
+    #[must_use]
+    fn cold(&self) -> Self {
+        self.clone()
+    }
+
     /// Error type for storage operations.
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
@@ -159,7 +145,7 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
         &self,
         timer_type: TimerType,
         key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<(CompactDateTime, i32), Self::Error>> + Send;
 
     /// Streams all triggers for a given key and timer type.
     fn get_key_triggers(
@@ -183,6 +169,13 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     fn upsert_key_trigger(
         &self,
         trigger: Trigger,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Replaces one key entry. Other coordinates keep their entries.
+    fn replace_key_trigger(
+        &self,
+        old: &Trigger,
+        new: Trigger,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Deletes a specific trigger from the key-based index.
@@ -227,14 +220,8 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     // Tag Operations (2 methods)
     // =========================================================================
 
-    /// Rotates the `tag` on an existing scheduled timer in every persisted
-    /// index maintained by this operation implementation.
-    ///
-    /// **Precondition:** the caller must have observed the timer at `(key,
-    /// time, timer_type)` as currently scheduled. Today's only caller is
-    /// `complete()`-from-`FiringRescheduled`, which has just loaded the timer
-    /// from storage. Implementations may treat a missing row as a no-op or as
-    /// undefined, so callers must not depend on either behaviour.
+    /// Updates the key row tag. The slab row keeps its original tag.
+    /// The caller must first confirm that the key row exists.
     fn update_tag(
         &self,
         key: &Key,

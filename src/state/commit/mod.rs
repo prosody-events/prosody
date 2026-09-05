@@ -134,7 +134,7 @@ where
         dedup_id: Uuid,
     ) -> Result<bool, CommitManagerError<D::Error, TS::Error>> {
         self.dedup
-            .exists(dedup_id)
+            .recorded(dedup_id)
             .await
             .map_err(CommitManagerError::Dedup)
     }

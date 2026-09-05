@@ -8,7 +8,6 @@ use crate::test_util::{
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::manager::TimerManager;
-use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::InMemoryTriggerStore;
 use crate::timers::test_support::{create_test_trigger, setup_timer_manager};
 use color_eyre::eyre::{Result, eyre};
@@ -16,13 +15,14 @@ use futures::{Stream, StreamExt, pin_mut};
 use opentelemetry::trace::TraceContextExt as _;
 use std::thread;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::task;
 use tokio::time::{self, advance};
 use tracing_subscriber::filter::LevelFilter;
 
 const DROPPED_UNCOMMITTED_WARNING: &str = "timer was dropped without committing or aborting";
 
-type TestStore = TableAdapter<InMemoryTriggerStore>;
+type TestStore = InMemoryTriggerStore;
 
 /// Schedules a 1s trigger for `key`, advances past it, and pops the
 /// resulting pending timer from the stream.
@@ -54,8 +54,9 @@ async fn test_pending_timer_fire_consumes() -> Result<()> {
 
     // Verify fire() consumes the PendingTimer and returns FiringTimer
     let firing_timer = pending_timer
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("Expected fire() to return Some"))?;
 
     // Verify the FiringTimer has correct metadata
@@ -85,7 +86,10 @@ async fn test_cancelled_pending_timer_fire_completes_without_drop_warning() -> R
         .await?;
 
     assert!(
-        pending_timer.fire().await.is_none(),
+        pending_timer
+            .fire(&watch::channel(ShutdownPhase::default()).1)
+            .await
+            .is_none(),
         "cancelled pending timer should not transition to firing"
     );
     assert!(
@@ -104,8 +108,9 @@ async fn test_firing_timer_commit() -> Result<()> {
     pin_mut!(stream);
     let (trigger, pending_timer) = schedule_and_pop(&manager, &mut stream, "commit-test").await?;
     let firing_timer = pending_timer
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("Expected fire() to return Some"))?;
 
     // Commit the timer
@@ -116,7 +121,6 @@ async fn test_firing_timer_commit() -> Result<()> {
         .scheduled_times(&trigger.key, TimerType::Application)
         .await?;
     assert!(times.is_empty(), "Timer should be removed after commit");
-
     Ok(())
 }
 
@@ -128,8 +132,9 @@ async fn test_firing_timer_abort() -> Result<()> {
     pin_mut!(stream);
     let (trigger, pending_timer) = schedule_and_pop(&manager, &mut stream, "abort-test").await?;
     let firing_timer = pending_timer
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("Expected fire() to return Some"))?;
 
     // Abort the timer
@@ -184,8 +189,9 @@ async fn schedule_and_fire(
         .next()
         .await
         .ok_or_else(|| eyre!("expected a pending timer"))?
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("expected fire() to return Some"))
 }
 
@@ -344,8 +350,9 @@ async fn dispatch_span_context_survives_thread_hop() -> Result<()> {
         .next()
         .await
         .ok_or_else(|| eyre!("expected a pending timer"))?
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("expected fire() to return Some"))?;
 
     let scheduling = firing.trigger().context().span().span_context().clone();

@@ -1,19 +1,21 @@
 //! In-memory deduplication store for testing.
 //!
-//! Uses [`scc::HashSet`] for lock-free concurrent access. All data is volatile.
+//! Provider drop releases the records after all store handles drop.
 
-use super::store::{DeduplicationStore, DeduplicationStoreProvider};
+use super::store::{DeduplicationStore, DeduplicationStoreProvider, Marker, Presence};
 use crate::{Partition, Topic};
 use ahash::RandomState;
-use scc::HashSet;
+use scc::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Instant;
 use uuid::Uuid;
 
-/// In-memory deduplication store backed by a lock-free hash set.
+/// Message markers shared by the stores from one provider.
 #[derive(Clone, Debug)]
 pub struct MemoryDeduplicationStore {
-    set: Arc<HashSet<Uuid, RandomState>>,
+    records: Arc<HashMap<Uuid, Marker, RandomState>>,
+    acquired: Instant,
 }
 
 impl MemoryDeduplicationStore {
@@ -21,7 +23,8 @@ impl MemoryDeduplicationStore {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            set: Arc::new(HashSet::with_hasher(RandomState::new())),
+            records: Arc::new(HashMap::with_hasher(RandomState::new())),
+            acquired: Instant::now(),
         }
     }
 }
@@ -35,37 +38,48 @@ impl Default for MemoryDeduplicationStore {
 impl DeduplicationStore for MemoryDeduplicationStore {
     type Error = Infallible;
 
-    async fn exists(&self, id: Uuid) -> Result<bool, Self::Error> {
-        Ok(self.set.contains_async(&id).await)
+    async fn recorded(&self, id: Uuid) -> Result<bool, Self::Error> {
+        Ok(self.records.contains_async(&id).await)
+    }
+
+    async fn lookup(&self, id: Uuid) -> Result<Presence, Self::Error> {
+        let Some(mut entry) = self.records.get_async(&id).await else {
+            return Ok(Presence::Absent);
+        };
+        if matches!(entry.get(), Marker::Observed(stamp) if *stamp >= self.acquired) {
+            Ok(Presence::Settled)
+        } else {
+            *entry.get_mut() = Marker::Observed(Instant::now());
+            Ok(Presence::Inherited)
+        }
     }
 
     async fn insert(&self, id: Uuid) -> Result<(), Self::Error> {
-        let _ = self.set.insert_async(id).await;
+        self.records
+            .upsert_async(id, Marker::Observed(Instant::now()))
+            .await;
         Ok(())
     }
 }
 
-/// Hands out clones of one shared in-memory deduplication store.
-///
-/// Every `create_store` call returns a clone of the **same** `Arc`-backed
-/// store, so the deduplication middleware (writer) and the keyed-state commit
-/// oracle (reader) observe the same rows for a partition — exactly as the
-/// Cassandra provider does by sharing its session and cache. A fresh store per
-/// call would split-brain the oracle: it would never see the middleware's
-/// inserts and message recovery would silently fail. The dedup UUID encodes
-/// topic/partition, so one shared set across partitions cannot collide.
+/// Share marker records across assignments. Each new store starts an
+/// assignment.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryDeduplicationStoreProvider {
-    store: MemoryDeduplicationStore,
+    records: Arc<HashMap<Uuid, Marker, RandomState>>,
 }
 
 impl MemoryDeduplicationStoreProvider {
+    /// Returns the number of stored message markers.
+    #[cfg(test)]
+    pub(crate) fn marker_count(&self) -> usize {
+        self.records.len()
+    }
+
     /// Creates a new provider backed by one fresh shared store.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            store: MemoryDeduplicationStore::new(),
-        }
+        Self::default()
     }
 }
 
@@ -78,7 +92,10 @@ impl DeduplicationStoreProvider for MemoryDeduplicationStoreProvider {
         _partition: Partition,
         _consumer_group: &str,
     ) -> Self::Store {
-        self.store.clone()
+        MemoryDeduplicationStore {
+            records: self.records.clone(),
+            acquired: Instant::now(),
+        }
     }
 }
 
@@ -86,9 +103,11 @@ impl DeduplicationStoreProvider for MemoryDeduplicationStoreProvider {
 mod prop_tests {
     use std::convert::Infallible;
 
-    use super::MemoryDeduplicationStore;
+    use super::MemoryDeduplicationStoreProvider;
 
-    crate::dedup_store_tests!(async { Ok::<_, Infallible>(MemoryDeduplicationStore::new()) });
+    crate::dedup_store_tests!(async {
+        Ok::<_, Infallible>(MemoryDeduplicationStoreProvider::new())
+    });
 }
 
 #[cfg(test)]

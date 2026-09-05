@@ -1,13 +1,5 @@
-//! Trace + model property for [`ActiveTriggers`].
-//!
-//! `ActiveTriggers` is a concurrent registry whose only invariants are pure
-//! map/aggregation facts: a read returns the last write, `remove` deletes,
-//! `scan_active_times` visits exactly the live `(time, type)` tuples, and
-//! `snapshot` counts match a fold over the contents. The timer *state machine*
-//! (schedule/fire/commit/abort) is not implemented here — it lives in the
-//! scheduler and is proven by `prop_scheduler_invariants`. So this suite drives
-//! the registry and a plain `HashMap` model through a random op sequence and
-//! asserts equivalence after every op.
+//! Registry reads and counts must agree with a plain map.
+//! The fixed trace checks delivery between the state read and completion.
 
 use super::*;
 use crate::Key;
@@ -32,15 +24,6 @@ const TIME_POOL: [u32; 5] = [1000, 1100, 1200, 1300, 1400];
 /// [`TIME_POOL`].
 const NOW: u32 = 1200;
 
-/// The four lifecycle states `set_state` can store. `TimerState` has no
-/// `Arbitrary` of its own, so ops index this pool directly.
-const STATES: [TimerState; 4] = [
-    TimerState::Scheduled,
-    TimerState::Firing,
-    TimerState::FiringRescheduled,
-    TimerState::Aborted,
-];
-
 /// Identifies one registry entry across the real registry and the model.
 type Triple = (Key, CompactDateTime, TimerType);
 
@@ -57,7 +40,6 @@ enum Op {
         key: Key,
         time: CompactDateTime,
         ty: TimerType,
-        tag: i32,
     },
     Remove {
         key: Key,
@@ -70,12 +52,6 @@ enum Op {
         ty: TimerType,
         state: TimerState,
     },
-    SetTag {
-        key: Key,
-        time: CompactDateTime,
-        ty: TimerType,
-        tag: i32,
-    },
 }
 
 impl Op {
@@ -85,38 +61,35 @@ impl Op {
         match self {
             Op::Insert { key, time, ty, .. }
             | Op::Remove { key, time, ty }
-            | Op::SetState { key, time, ty, .. }
-            | Op::SetTag { key, time, ty, .. } => (key.clone(), *time, *ty),
+            | Op::SetState { key, time, ty, .. } => (key.clone(), *time, *ty),
         }
     }
 }
 
 impl Arbitrary for Op {
     fn arbitrary(g: &mut Gen) -> Self {
-        let key = format!("key-{}", u8::arbitrary(g) % 3).into();
+        let key: Key = format!("key-{}", u8::arbitrary(g) % 3).into();
         let time =
             CompactDateTime::from(TIME_POOL[usize::from(u8::arbitrary(g)) % TIME_POOL.len()]);
         let ty = TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
-        match u8::arbitrary(g) % 4 {
-            0 => Op::Insert {
+        let states = [
+            TimerState::Scheduled(Item::Queued),
+            TimerState::Scheduled(Item::Delivered { tag: 42_i32 }),
+            TimerState::Firing,
+            TimerState::FiringReplaced(Trigger::new(key.clone(), time, ty, Span::none())),
+            TimerState::FiringRescheduled(Item::Queued),
+            TimerState::FiringRescheduled(Item::Delivered { tag: 42_i32 }),
+            TimerState::Parked,
+        ];
+        match u8::arbitrary(g) % 3 {
+            0 => Op::Insert { key, time, ty },
+            1 => Op::SetState {
                 key,
                 time,
                 ty,
-                tag: i32::arbitrary(g),
+                state: states[usize::from(u8::arbitrary(g)) % states.len()].clone(),
             },
-            1 => Op::Remove { key, time, ty },
-            2 => Op::SetState {
-                key,
-                time,
-                ty,
-                state: STATES[usize::from(u8::arbitrary(g)) % STATES.len()],
-            },
-            _ => Op::SetTag {
-                key,
-                time,
-                ty,
-                tag: i32::arbitrary(g),
-            },
+            _ => Op::Remove { key, time, ty },
         }
     }
 }
@@ -149,15 +122,14 @@ async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
         let entry = model.get(&(key.clone(), *time, *ty));
         assert_eq!(
             active.get_state(key, *time, *ty).await,
-            entry.map(|e| e.state)
+            entry.map(|e| e.state.clone())
         );
-        assert_eq!(active.get_tag(key, *time, *ty).await, entry.map(|e| e.tag));
         assert_eq!(active.contains(key, *time, *ty).await, entry.is_some());
         assert_eq!(
             active.is_scheduled(key, *time, *ty).await,
             entry.is_some_and(|e| matches!(
                 e.state,
-                TimerState::Scheduled | TimerState::FiringRescheduled
+                TimerState::Scheduled(_) | TimerState::FiringRescheduled(_)
             ))
         );
     }
@@ -181,7 +153,7 @@ async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
         count = count.saturating_add(1);
         if matches!(
             entry.state,
-            TimerState::Firing | TimerState::FiringRescheduled
+            TimerState::Firing | TimerState::FiringReplaced(_) | TimerState::FiringRescheduled(_)
         ) {
             in_flight = in_flight.saturating_add(1);
         }
@@ -218,20 +190,18 @@ async fn run_trace(trace: Trace) {
         }
 
         match op {
-            Op::Insert { key, time, ty, tag } => {
-                active
-                    .insert(Trigger::with_tag(
-                        key.clone(),
-                        time,
-                        ty,
-                        tag,
-                        Span::current(),
-                    ))
+            Op::Insert { key, time, ty } => {
+                let got = active
+                    .queue(&Trigger::new(key.clone(), time, ty, Span::current()))
                     .await;
-                model.entry((key, time, ty)).or_insert(ActiveTriggerEntry {
-                    state: TimerState::Scheduled,
-                    tag,
+                let entry = model.entry((key, time, ty)).or_insert(ActiveTriggerEntry {
+                    state: TimerState::Parked,
                 });
+                let want = entry.state == TimerState::Parked;
+                if want {
+                    entry.state = TimerState::Scheduled(Item::Queued);
+                }
+                assert_eq!(got, want, "queue return");
             }
             Op::Remove { key, time, ty } => {
                 active.remove(&key, time, ty).await;
@@ -243,7 +213,7 @@ async fn run_trace(trace: Trace) {
                 ty,
                 state,
             } => {
-                let got = active.set_state(&key, time, ty, state).await;
+                let got = active.set_state(&key, time, ty, state.clone()).await;
                 let want = match model.get_mut(&(key, time, ty)) {
                     Some(entry) => {
                         entry.state = state;
@@ -253,31 +223,72 @@ async fn run_trace(trace: Trace) {
                 };
                 assert_eq!(got, want, "set_state return");
             }
-            Op::SetTag { key, time, ty, tag } => {
-                let got = active.set_tag(&key, time, ty, tag).await;
-                let want = match model.get_mut(&(key, time, ty)) {
-                    Some(entry) => {
-                        entry.tag = tag;
-                        true
-                    }
-                    None => false,
-                };
-                assert_eq!(got, want, "set_tag return");
-            }
         }
 
         assert_equiv(&active, &model, &seen).await;
     }
 }
 
-/// The registry tracks a plain `HashMap` model op-for-op across
-/// Insert/Remove/SetState/SetTag, and every reader (`get_state`, `get_tag`,
-/// `contains`, `is_scheduled`, `scan_active_times`, `snapshot`) agrees after
-/// every op.
+/// Registry reads and counts agree with a map after each insert, remove, or
+/// state change.
 #[test]
 fn prop_active_triggers_track_model() {
     fn property(trace: Trace) {
         executor::block_on(run_trace(trace));
     }
     QuickCheck::new().quickcheck(property as fn(Trace));
+}
+
+/// Completion must keep an item delivered after the transition's state read.
+#[tokio::test]
+async fn completion_keeps_item_delivered_after_state_read() -> color_eyre::Result<()> {
+    use color_eyre::eyre::ensure;
+
+    let active = ActiveTriggers::default();
+    let trigger = Trigger::with_tag(
+        Key::from("delivery-race"),
+        CompactDateTime::from(NOW),
+        TimerType::Application,
+        42,
+        Span::none(),
+    );
+    ensure!(active.queue(&trigger).await);
+    ensure!(
+        active
+            .set_state(
+                &trigger.key,
+                trigger.time,
+                trigger.timer_type,
+                TimerState::FiringRescheduled(Item::Queued)
+            )
+            .await
+    );
+
+    let prior = active
+        .get_state(&trigger.key, trigger.time, trigger.timer_type)
+        .await;
+    active.deliver(&trigger).await;
+    let (_, after) = transition(prior.as_ref(), TimerOp::Complete).phases();
+    match after.next {
+        Next::Keep => {}
+        Next::Idle => {
+            active
+                .idle(&trigger.key, trigger.time, trigger.timer_type)
+                .await;
+        }
+        Next::To(state) => {
+            active
+                .set_state(&trigger.key, trigger.time, trigger.timer_type, state)
+                .await;
+        }
+    }
+
+    let actual = active
+        .fire(&trigger.key, trigger.time, trigger.timer_type)
+        .await;
+    ensure!(
+        actual == Some(trigger.tag),
+        "completion lost the delivered item: actual={actual:?}"
+    );
+    Ok(())
 }

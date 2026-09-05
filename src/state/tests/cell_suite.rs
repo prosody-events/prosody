@@ -2876,6 +2876,7 @@ pub(crate) type PoisonHandle = Arc<parking_lot::Mutex<Option<Poison>>>;
 pub(crate) struct FailingCellStore<S> {
     inner: S,
     poison: PoisonHandle,
+    budget: Option<Arc<AtomicUsize>>,
 }
 
 impl<S> FailingCellStore<S> {
@@ -2890,6 +2891,22 @@ impl<S> FailingCellStore<S> {
     /// sweep's reschedule path.
     pub(crate) fn new_with_category(inner: S, poison: StateName, category: ErrorCategory) -> Self {
         Self::armed(inner, Poison::Collection(poison, category))
+    }
+
+    /// Fails at most `budget` promote operations for `poison`.
+    pub(crate) fn failing_promote(
+        inner: S,
+        poison: StateName,
+        category: ErrorCategory,
+        budget: usize,
+    ) -> Self {
+        Self {
+            inner,
+            poison: Arc::new(parking_lot::Mutex::new(Some(Poison::Collection(
+                poison, category,
+            )))),
+            budget: Some(Arc::new(AtomicUsize::new(budget))),
+        }
     }
 
     /// Wraps `inner`, poisoning `mark_resolved` for each single-byte coordinate
@@ -2931,7 +2948,11 @@ impl<S> FailingCellStore<S> {
     /// runner's constructor, re-wrapping each crash-rebuilt store around one
     /// handle.
     pub(crate) fn with_handle(inner: S, poison: PoisonHandle) -> Self {
-        Self { inner, poison }
+        Self {
+            inner,
+            poison,
+            budget: None,
+        }
     }
 
     fn armed(inner: S, poison: Poison) -> Self {
@@ -2946,6 +2967,15 @@ impl<S> FailingCellStore<S> {
 
     /// The category to inject when `mark_resolved` touches `cells`, or `None`.
     fn injected(&self, collection: &CollectionRef, cells: &[CellKey]) -> Option<ErrorCategory> {
+        if let Some(budget) = &self.budget
+            && budget
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_err()
+        {
+            return None;
+        }
         match &*self.poison.lock() {
             Some(Poison::Collection(name, category)) => {
                 (*collection.id().name() == *name).then_some(*category)

@@ -45,12 +45,10 @@
 //!    resolved values — draining the event's dirty range (the stage consumes
 //!    the buffered ops) and returning the staged work as a linear `Finalized`
 //!    receipt.
-//! 3. Strictly after the stage, the boundary records the message commit marker
-//!    read from the session's event identity — the message `EventRef`'s dedup
-//!    id, or the deferred-reload override (`message_marker`) — through the
-//!    commit oracle. After the offset/trigger commit the boundary consumes the
-//!    receipt: `certify().promote()` promotes the staged cells; on an
-//!    arm-shutdown abort `rollback()` restores their committed bases.
+//! 3. The boundary certifies the stage, then records the message marker. It
+//!    records the event receipt before promotion and retires the source after
+//!    promotion. Recovery resolves cells through the commit oracle after a
+//!    crash or an incomplete promotion.
 //! 4. At attempt boundaries the retry loop runs the `next_attempt` verb, whose
 //!    `reset` transition discards this event's dirty buffer (under the gate)
 //!    and bumps the attempt epoch, so the next attempt starts clean and any
@@ -69,7 +67,7 @@ use crate::state::descriptor::{
 };
 use crate::state::dirty::{CellSnapshot, ClearedSections, DirtyStore, DirtyVal, ResolvedCells};
 use crate::state::identity::{CollectionId, CollectionRef};
-use crate::state::manager::ArmedKeys;
+use crate::state::manager::{ArmedKeys, sweep_partition};
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::oracle::CommitOracle;
 use crate::state::overlay::Overlay;
@@ -124,7 +122,7 @@ pub(crate) mod sealed {
     use super::{
         CellKey, CellStore, CollectionRef, CompactDateTime, CompactDuration, Duration, Future,
         MarkerWrite, ProvisionalWrite, RepinProof, SectionClear, StateAccessError, Uuid,
-        resolve_collections,
+        promote_collections,
     };
     use opentelemetry::global::meter;
     use opentelemetry::metrics::Counter;
@@ -400,28 +398,13 @@ pub(crate) mod sealed {
         }
     }
 
-    /// One collection's frozen settlement record: the provisional cells
-    /// `finalize` staged (the ref carries the TTL) plus the frozen
-    /// [`SectionClear`]s its event marker carries — what the receipt promotes
-    /// or rolls back.
+    /// One collection's frozen writes and section clears for promotion.
     ///
-    /// Built exactly once per collection, at `finalize`, from the
-    /// post-`commit()` dirty buffer — `commit()`-landed cells are already
-    /// durably committed and never marker-listed, so the record lists exactly
-    /// the cells recovery owns. Only a retry attempt re-running `finalize`
-    /// rebuilds it, overwriting the same-event marker idempotently. Only
-    /// `ReadCommitted` collections appear; `ReadUncommitted` writes resolve at
-    /// stage time with nothing to settle. Survivors nest inside their
-    /// [`SectionClear`] — never a parallel vector — so promote/rollback
-    /// structurally cannot recompute them from live provisional rows. The
-    /// record and the skinny durable marker payload deliberately do not
-    /// merge: the marker persists coordinates (recovery rebuilds writes by
-    /// point-read); the record holds the full [`ProvisionalWrite`]s for the
-    /// inline promote/rollback. Each `(cell, write)`'s `data` is the value to
-    /// promote to, `prev` the committed base to roll back to; the clears
-    /// apply on the commit arm only (rollback needs no clear leg — the stage
-    /// touched nothing destructive). A clears-only collection appears with an
-    /// empty write set — the entry that arms the recovery backstop.
+    /// Finalize captures the writes after each explicit collection commit.
+    /// Only `ReadCommitted` collections need promotion. Other collections
+    /// write resolved values during the stage. Clear survivors stay inside
+    /// each [`SectionClear`], so promotion never reconstructs them from live
+    /// rows.
     // `Vec`, not `SmallVec`, deliberately: the receipt is held across the
     // settle boundary's awaits, so inline entries bloat every such future past
     // clippy's `large_futures` bound. The `with_capacity` folds at the build
@@ -445,22 +428,21 @@ pub(crate) mod sealed {
         /// `finalize`.
         Clean,
 
-        /// At least one `ReadCommitted` collection staged; the boundary must
-        /// arm the `StateRecovery` backstop and consume the receipt.
+        /// At least one `ReadCommitted` collection staged. The boundary must
+        /// consume the receipt. Incomplete promotion requires a backstop.
         Staged(StagedState<S>),
     }
 
-    /// The linear settlement receipt for one event's staged cells. Consumed
-    /// exactly once: [`Self::rollback`] before any marker record attempt, or
-    /// [`Self::certify`] → [`Promotable::promote`] after the commit.
+    /// The receipt for one event's staged cells. Call [`Self::certify`] before
+    /// the marker write, then [`Promotable::promote`] after the event receipt.
     #[must_use]
     pub struct StagedState<S: CellStore> {
         /// Clone of the partition's lower committed store (an `Arc`-backed
         /// handle).
         pub(super) store: S,
         pub(super) collections: Vec<StagedCollection>,
-        /// The `recovery_delay` floor tightened once, at finalize, by the
-        /// smallest `recovery_within` among the staged collections.
+        /// The delay from [`CollectionDefRegistry::tightened_recovery_delay`]
+        /// for the staged collections.
         pub(super) recovery_delay: CompactDuration,
     }
 
@@ -470,26 +452,9 @@ pub(crate) mod sealed {
             self.recovery_delay
         }
 
-        /// Rolls every staged cell back to its committed base (`prev`) after
-        /// the event aborted. Best-effort: each collection is driven to
-        /// completion regardless of siblings, per-collection failures warn,
-        /// and anything left provisional is the armed sweep's (or
-        /// first-touch's) to resolve — there is no caller decision to feed,
-        /// so no outcome is returned.
-        pub(crate) async fn rollback(self) {
-            resolve_collections(&self.store, self.collections, false).await;
-        }
-
-        /// Certifies the stage for promotion — entering the marker record
-        /// phase forfeits rollback. Before any record attempt, rolling back to
-        /// the committed base is sound; after one it is not: a record
-        /// write-timeout is ambiguous — the marker may be durable — so a
-        /// rollback could erase a committed write that redelivery then
-        /// dedup-filters away. In that window the staged cells stay
-        /// provisional and the (already-armed) sweep resolves them through
-        /// the oracle, which reads whether the marker landed. Consuming the
-        /// receipt here makes the rule structural: a [`Promotable`] has no
-        /// rollback.
+        /// Certifies the stage before the boundary attempts the marker write.
+        /// An ambiguous marker result leaves cells for recovery through the
+        /// oracle.
         pub(crate) fn certify(self) -> Promotable<S> {
             Promotable(self)
         }
@@ -505,13 +470,13 @@ pub(crate) mod sealed {
         /// `event`/`prev`, O(1) per cell) after the event committed; the
         /// commit arm also applies the frozen clears' gap erase. Best-effort:
         /// failures warn per collection and fold into
-        /// [`ApplyOutcome::Incomplete`] (the backstop, always left armed,
-        /// lets the sweep retry).
+        /// [`ApplyOutcome::Incomplete`]. The boundary arms a safety timer
+        /// before it retires a sweep-posture redelivery source.
         pub(crate) async fn promote(self) -> ApplyOutcome {
             let StagedState {
                 store, collections, ..
             } = self.0;
-            if resolve_collections(&store, collections, true).await {
+            if promote_collections(&store, collections).await {
                 ApplyOutcome::Resolved
             } else {
                 ApplyOutcome::Incomplete
@@ -526,13 +491,9 @@ pub(crate) mod sealed {
         /// Every staged cell promoted to its committed data.
         Resolved,
 
-        /// At least one resolution failed. Recovery is guaranteed without any
-        /// point-clear: the durability boundary never unschedules the per-key
-        /// `StateRecovery` backstop (only the sweep's own fire clears it), so
-        /// the standing backstop fires and the sweep retries; a
-        /// transient sweep failure reschedules a fresh backstop, a
-        /// permanent per-cell skip is left to first-touch and the key's
-        /// next commit. The backstop aborts only on shutdown.
+        /// At least one resolution failed. The boundary arms a safety timer
+        /// before source retirement. A transient sweep failure schedules a
+        /// new timer. First-touch handles a permanent cell failure.
         Incomplete,
     }
 
@@ -583,6 +544,13 @@ pub(crate) mod sealed {
             proof: MarkerWrite,
         ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
+        /// Sweeps this session's key through all registered collections.
+        ///
+        /// `overlay.lower()` is the session cell store. The partition recovery
+        /// path sweeps the same store. This verb never changes `ArmedKeys`.
+        /// A redelivered event does not consume a standing safety timer.
+        fn sweep(&self) -> impl Future<Output = Result<(), StateAccessError>> + Send;
+
         /// Discards just this event's buffered dirty cells — the isolation step
         /// of the attempt-boundary [`Self::reset`] transition (which then bumps
         /// the epoch under the same gate hold), and the failure-path backstop
@@ -595,8 +563,7 @@ pub(crate) mod sealed {
         /// (never cleared at all — see [`MarkerIdentity::set_reload_marker`]).
         /// On the success path [`Self::finalize`] has already drained
         /// the buffer (the stage consumes it), making the scope-drop
-        /// clear a no-op there; the receipt's promote/rollback read
-        /// only receipt-owned data, never dirty.
+        /// clear a no-op there. Promotion reads only receipt-owned data.
         fn discard_dirty(&self);
 
         /// Flips this session terminated, synchronously and idempotently — the
@@ -625,12 +592,9 @@ pub(crate) mod sealed {
         /// produce a live attempt-N+1 (or stamped-final) view.
         fn repin(&self, proof: RepinProof) -> Self;
 
-        /// The always-on `recovery_delay` floor (a plain config read). The
-        /// per-event tightened delay lives on the receipt
-        /// ([`StagedState::recovery_delay`], folded once at finalize); the
-        /// floor is for the defensive arm after a permanent finalize failure,
-        /// where no receipt exists.
-        fn recovery_floor(&self) -> CompactDuration;
+        /// The recovery delay when no receipt names the staged collections.
+        /// Applies the bounds of all registered collections.
+        fn fallback_recovery_delay(&self) -> CompactDuration;
 
         /// The fire time of the `StateRecovery` backstop recorded as standing
         /// for this session's key, or `None` when none has been recorded this
@@ -1382,17 +1346,13 @@ where
         if collections.is_empty() {
             return Ok(Finalized::Clean);
         }
-        // Tighten the always-on floor by the smallest `recovery_within` among
-        // the staged collections — folded exactly once, here, onto the
-        // receipt. `recovery_within` on a `ReadUncommitted` collection is
-        // inert: such collections never appear in the receipt.
-        let recovery_delay = collections
-            .iter()
-            .filter_map(|staged| {
+        let recovery_delay = registry.tightened_recovery_delay(
+            self.inner.recovery_delay,
+            collections.iter().map(|staged| {
                 let id = staged.collection.id();
-                registry.recovery_within_for(id.state_type(), id.name())
-            })
-            .fold(self.inner.recovery_delay, CompactDuration::min);
+                (id.state_type(), id.name())
+            }),
+        );
         Ok(Finalized::Staged(StagedState {
             store: lower.clone(),
             collections,
@@ -1410,6 +1370,17 @@ where
             .record_message(marker.into_uuid())
             .await
             .map_err(|e| StateAccessError::store(&e))
+    }
+
+    async fn sweep(&self) -> Result<(), StateAccessError> {
+        sweep_partition(
+            self.inner.overlay.lower(),
+            &self.inner.oracle,
+            &self.inner.registry,
+            &self.inner.state_key,
+        )
+        .await
+        .map_err(|error| StateAccessError::store(&error))
     }
 
     fn discard_dirty(&self) {
@@ -1450,8 +1421,10 @@ where
         }
     }
 
-    fn recovery_floor(&self) -> CompactDuration {
-        self.inner.recovery_delay
+    fn fallback_recovery_delay(&self) -> CompactDuration {
+        self.inner
+            .registry
+            .tightened_recovery_delay(self.inner.recovery_delay, self.inner.registry.collections())
     }
 
     async fn backstop_armed(&self) -> Option<CompactDateTime> {
@@ -1677,20 +1650,10 @@ where
     }
 }
 
-/// Resolves every staged collection after the event's outcome is known:
-/// `committed` ⇒ promote each cell's `data` and apply the frozen clears' gap
-/// erase (the cell store's
-/// [`commit_provisional`](CellStore::commit_provisional) /
-/// [`abort_provisional`](CellStore::abort_provisional) carry the projection so
-/// the write-through cache can publish it), otherwise roll each back to its
-/// `prev` (the abort arm ignores the clears — rollback needs no clear leg).
-/// Best-effort: drives every per-collection resolution to completion
-/// regardless of siblings, returning whether all resolved.
-async fn resolve_collections<S>(
-    store: &S,
-    collections: Vec<StagedCollection>,
-    committed: bool,
-) -> bool
+/// Promotes each staged collection and reports whether all writes succeeded.
+/// A failed write leaves provisional cells for recovery. Other collections
+/// still complete their writes.
+async fn promote_collections<S>(store: &S, collections: Vec<StagedCollection>) -> bool
 where
     S: CellStore,
 {
@@ -1702,11 +1665,7 @@ where
                  clears,
              }| {
                 cooperative(async move {
-                    let result = if committed {
-                        store.commit_provisional(&collection, &writes, &clears).await
-                    } else {
-                        store.abort_provisional(&collection, &writes).await
-                    };
+                    let result = store.commit_provisional(&collection, &writes, &clears).await;
                     match result {
                         Ok(()) => true,
                         Err(error) => {

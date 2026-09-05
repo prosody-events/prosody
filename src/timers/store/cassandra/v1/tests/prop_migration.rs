@@ -13,7 +13,6 @@ use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::cassandra::v1::V1Operations;
 use crate::timers::store::cassandra::{CassandraTriggerStore, TimerState};
-use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, SegmentVersion, TriggerStore, TriggerV1};
 use crate::timers::{TimerType, Trigger};
 use ahash::{HashMap, HashSet};
@@ -287,6 +286,7 @@ async fn setup_v3_state(
     input: &MigrationTestInput,
 ) -> color_eyre::Result<()> {
     store
+        .operations()
         .insert_segment()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to insert V3 segment: {e:?}"))?;
@@ -296,6 +296,7 @@ async fn setup_v3_state(
         // Slab metadata is normally written by the scheduler actor; this
         // fixture writes it directly so the migration test sees the slabs.
         store
+            .operations()
             .insert_slab(slab)
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Failed to insert V3 slab: {e:?}"))?;
@@ -324,6 +325,7 @@ async fn verify_segment_metadata(
     initial_version: SegmentVersion,
 ) -> color_eyre::Result<()> {
     let segment = store
+        .operations()
         .get_segment()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to get segment: {e:?}"))?
@@ -377,6 +379,7 @@ async fn collect_key_index_triggers(
 
         for &timer_type in TimerType::VARIANTS {
             let found: Vec<Trigger> = store
+                .operations()
                 .get_key_triggers(timer_type, key)
                 .try_collect()
                 .await
@@ -437,7 +440,11 @@ async fn verify_correct_indexing(
     // Verify each slab has correct triggers
     for (slab_id, expected) in &expected_by_slab {
         let actual_triggers: Vec<Trigger> = store
-            .get_slab_triggers_all_types(*slab_id)
+            .operations()
+            .get_slab_triggers_all_types(Slab::new(
+                *slab_id,
+                store.operations().segment().slab_size,
+            ))
             .try_collect()
             .await
             .map_err(|e| {
@@ -475,7 +482,8 @@ async fn verify_dual_index_consistency(
 
     for slab_id in slab_ids {
         let triggers: Vec<Trigger> = store
-            .get_slab_triggers_all_types(slab_id)
+            .operations()
+            .get_slab_triggers_all_types(Slab::new(slab_id, store.operations().segment().slab_size))
             .try_collect()
             .await
             .map_err(|e| {
@@ -672,7 +680,7 @@ async fn verify_key_state_invariant(
                     ));
                 }
             }
-            n if *n >= 2 && !matches!(state, TimerState::Overflow) => {
+            n if *n >= 2 && !matches!(state, TimerState::Overflow(_)) => {
                 return Err(color_eyre::eyre::eyre!(
                     "Key state invariant violated: ({}, {:?}) has {n} triggers but state is \
                      {state:?}, expected Overflow",
@@ -759,6 +767,7 @@ pub async fn prop_migration_invariants(
     // Trigger migration by calling get_segment()
     // Note: Empty V1 segments (no triggers) don't exist in the database
     let segment_opt = store
+        .operations()
         .get_segment()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to trigger migration: {e:?}"))?;

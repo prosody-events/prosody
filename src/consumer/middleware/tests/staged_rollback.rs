@@ -1,29 +1,30 @@
 use super::*;
 use crate::consumer::middleware::tests::test_support::{
-    Ctx, buffered, cart, committed_value, is_provisional,
+    Ctx, DuplicateHandler, TestLifecycleAccess, buffered, buffered_with, cart, committed_value,
+    is_provisional,
 };
 use crate::loader::MemoryLoader;
 use crate::state::descriptor::Registered;
+use crate::state::manager::ArmedKeys;
 use crate::state::memory::MemoryCellStore;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-use crate::state::store::CellStore;
+use crate::state::session::Finalized;
+use crate::state::session::sealed::StateLifecycle;
 use crate::state::{EventRef, StateKey, StateName};
+use crate::timers::datetime::CompactDateTime;
+use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, bail, eyre};
-use futures::StreamExt;
 use quickcheck::{QuickCheck, TestResult};
 use serde_json::json;
 use std::future::ready;
 use tokio::runtime::Builder;
 use uuid::Uuid;
 
-/// Shutdown between a successful stage and the backstop arm drives
-/// settle's ONE reachable rollback: the guard aborts, the staged cell
-/// rolls back to its committed base (here absent, so the cell resolves
-/// away), and `after_abort` fires. The abort itself proves the staged arm
-/// ran — a `Clean` finalize would have committed instead.
+/// Shutdown before the stage aborts the guard and discards the buffered cells.
 #[tokio::test]
-async fn arm_shutdown_rolls_the_staged_cells_back() -> Result<()> {
-    let (context, cell_store, cart_id) = buffered(Ctx::with_shutdown_on_timer_read).await?;
+async fn shutdown_before_stage_discards_buffered_cells() -> Result<()> {
+    let (context, cell_store, cart_id) = buffered(|context| context).await?;
+    let context = context.with_shutdown();
     let handler = ProbeHandler::ok(0);
     let log = handler.log.clone();
     let (guard, committed, aborted) = RecordingGuard::new();
@@ -33,22 +34,22 @@ async fn arm_shutdown_rolls_the_staged_cells_back() -> Result<()> {
     assert_eq!(
         aborted.load(Ordering::SeqCst),
         1,
-        "arm-shutdown must abort the guard"
+        "shutdown must abort the guard"
     );
     assert_eq!(committed.load(Ordering::SeqCst), 0);
     assert!(
         !is_provisional(&cell_store, &cart_id).await?,
-        "the receipt's rollback must settle the staged cell",
+        "shutdown must leave no staged cell",
     );
     assert_eq!(
         committed_value(&cell_store, &cart_id).await?,
         None,
-        "rollback restores the absent committed base — not the staged value",
+        "shutdown preserves the absent committed base",
     );
     assert_eq!(
         log.lock().clone(),
         vec![HookEvent::AfterAbort(Ok(0))],
-        "the arm-shutdown abort fires after_abort exactly once",
+        "shutdown fires after_abort exactly once",
     );
     Ok(())
 }
@@ -300,36 +301,18 @@ async fn permanent_skip_hook_reads_through_the_stamp() -> Result<()> {
     Ok(())
 }
 
-/// Abort-only-on-shutdown, end to end through `settle`'s success path: a
-/// shutdown is the *sole* thing that stops the durability sequence short
-/// of a commit — a shutdown seen before the finalize stage abandons with
-/// nothing ever staged, so nothing is left provisional; the offset aborts
-/// either way (the event redelivers and re-runs). Every store failure
-/// instead retries forever.
-///
-/// The never-abort-except-shutdown invariant, as a property over a
-/// generated leading-failure count, the **category** those failures
-/// classify as, and a shutdown flag: `settle`'s success path aborts the
-/// offset **iff** shutdown (leaving nothing provisional), and
-/// otherwise self-heals to a commit **no matter how many** failures —
-/// of **any** category — the arm hits first (the arm is must-succeed,
-/// invariant 8) — then records the marker, commits, and promotes the
-/// cell. Generating the category is what exercises the retry-forever
-/// fold in `retry_step`: `Terminal` retries rather than abandons, and
-/// `Permanent` is retried by the arm's own loop past `retry_step`'s
-/// `Skip`. Each iteration runs on its own paused single-thread
-/// runtime so the retry backoff advances instantly and never blocks.
+/// Shutdown can abort before receipt. After receipt it keeps the committed
+/// source. Each failed timer write must retry. Each collection bound limits
+/// recovery delay.
 #[test]
 fn prop_settle_aborts_iff_shutdown() {
-    fn property(fail_count: u8, category_sel: u8, shutdown: bool) -> TestResult {
-        // A small bound keeps each iteration's paused-clock retry loop fast
-        // while still crossing the zero / non-zero boundary.
-        let fail_count = usize::from(fail_count % 6);
-        let category = match category_sel % 3 {
-            0 => ErrorCategory::Transient,
-            1 => ErrorCategory::Permanent,
-            _ => ErrorCategory::Terminal,
-        };
+    fn property(
+        posture: u8,
+        failure: u8,
+        shutdown: bool,
+        late_shutdown: bool,
+        timer_failure: (u8, u8),
+    ) -> TestResult {
         let runtime = Builder::new_current_thread()
             .enable_time()
             .start_paused(true)
@@ -338,44 +321,128 @@ fn prop_settle_aborts_iff_shutdown() {
             return TestResult::error("failed to build paused runtime");
         };
         runtime.block_on(async move {
-            let configure = |c: Ctx| {
-                let c = c.with_timer_failures(fail_count, category);
-                if shutdown { c.with_shutdown() } else { c }
-            };
-            let Ok((context, cell_store, cart_id)) = buffered(configure).await else {
-                return TestResult::error("failed to buffer the write");
-            };
-            let handler = ProbeHandler::ok(0);
-            let (guard, committed, aborted) = RecordingGuard::new();
-
-            settle(&handler, context, guard, Ok(0)).await;
-
-            let committed = committed.load(Ordering::SeqCst);
-            let aborted = aborted.load(Ordering::SeqCst);
-            let provisional = cell_store.provisional_cells(&cart_id);
-            futures::pin_mut!(provisional);
-            let still_provisional = matches!(provisional.next().await, Some(Ok(_)));
-
-            if shutdown {
-                // Abort iff shutdown: the offset aborts, and nothing was
-                // ever staged (settle's finalize step sees shutdown first).
-                if aborted != 1 || committed != 0 || still_provisional {
-                    return TestResult::error(format!(
-                        "shutdown must abort with nothing staged: committed={committed} \
-                         aborted={aborted} provisional={still_provisional}"
-                    ));
-                }
-            } else {
-                // No shutdown: self-heal to a commit however many failures first.
-                if committed != 1 || aborted != 0 || still_provisional {
-                    return TestResult::error(format!(
-                        "non-shutdown must self-heal to commit: committed={committed} \
-                         aborted={aborted} provisional={still_provisional}"
-                    ));
-                }
+            match settle_case(posture, failure, shutdown, late_shutdown, timer_failure).await {
+                Ok(result) => result,
+                Err(error) => TestResult::error(error.to_string()),
             }
-            TestResult::passed()
         })
     }
-    QuickCheck::new().quickcheck(property as fn(u8, u8, bool) -> TestResult);
+    QuickCheck::new().quickcheck(property as fn(u8, u8, bool, bool, (u8, u8)) -> TestResult);
+}
+
+async fn settle_case(
+    posture: u8,
+    failure: u8,
+    shutdown: bool,
+    late_shutdown: bool,
+    timer_failure: (u8, u8),
+) -> Result<TestResult> {
+    let sweep_failure = match failure % 3 {
+        0 => None,
+        1 => Some((ErrorCategory::Permanent, 8)),
+        _ => Some((ErrorCategory::Transient, 1)),
+    };
+    let armed: ArmedKeys = Arc::default();
+    let count = usize::from(timer_failure.0 % 5);
+    let (mut context, cell_store, cart_id) = buffered_with(
+        armed.clone(),
+        sweep_failure,
+        Some(CompactDuration::new(1)),
+        |context| fail_timer_writes(context, timer_failure),
+    )
+    .await?;
+    let posture = posture % 2;
+    let late_shutdown = late_shutdown
+        && !shutdown
+        && posture == 1
+        && matches!(sweep_failure, Some((ErrorCategory::Transient, _)));
+    if late_shutdown {
+        context = context.with_shutdown_on_timer_read();
+    }
+    if posture == 0 {
+        let lifecycle = context.test_lifecycle()?;
+        assert!(matches!(lifecycle.finalize().await?, Finalized::Staged(_)));
+    }
+    if shutdown {
+        context = context.with_shutdown();
+    }
+    let (guard, committed, aborted) = RecordingGuard::new();
+    let receipts = guard.receipts.clone();
+    let kept = guard.kept.clone();
+    let receipt_saw_provisional = Arc::new(AtomicBool::new(false));
+    let commit_saw_resolved = Arc::new(AtomicBool::new(false));
+    let guard = guard.with_order(
+        cell_store.clone(),
+        cart_id.clone(),
+        receipt_saw_provisional.clone(),
+        commit_saw_resolved.clone(),
+    );
+    let handler = ProbeHandler::ok(0);
+    let before = CompactDateTime::now()?;
+    if posture == 0 {
+        settle(&DuplicateHandler, context.clone(), guard, Ok(())).await;
+    } else {
+        settle(&handler, context.clone(), guard, Ok(0)).await;
+    }
+
+    let after = CompactDateTime::now()?;
+    let kept = kept.load(Ordering::SeqCst);
+    let committed = committed.load(Ordering::SeqCst);
+    let aborted = aborted.load(Ordering::SeqCst);
+    let receipts = receipts.load(Ordering::SeqCst);
+    let still_provisional = is_provisional(&cell_store, &cart_id).await?;
+    let scheduled = context.count_scheduled(TimerType::StateRecovery);
+    let transient = matches!(sweep_failure, Some((ErrorCategory::Transient, _)));
+    let failing = sweep_failure.is_some();
+
+    let expected_abort = shutdown && (posture != 0 || transient);
+    let expected_receipts = usize::from(posture == 1 && !shutdown);
+    // The Duplicate setup stages the cell before `settle`. A Duplicate
+    // abort leaves that cell for the next sweep. A Final abort occurs
+    // before the stage, so nothing is provisional.
+    let expected_provisional = failing && (posture == 0 || !expected_abort);
+    let expected_armed = usize::from(
+        !expected_abort
+            && !late_shutdown
+            && ((posture == 1 && failing) || (posture == 0 && transient)),
+    );
+    if aborted != usize::from(expected_abort)
+        || committed != usize::from(!expected_abort && !late_shutdown)
+        || kept != usize::from(late_shutdown)
+        || receipts != expected_receipts
+        || still_provisional != expected_provisional
+        || scheduled != expected_armed * (count + 1)
+        || armed.len() != expected_armed
+        || !context
+            .durable_scheduled(TimerType::StateRecovery)
+            .iter()
+            .all(|fire| {
+                (before.epoch_seconds() + 1..=after.epoch_seconds() + 1)
+                    .contains(&fire.epoch_seconds())
+            })
+        || (late_shutdown && handler.log.lock().as_slice() != [HookEvent::AfterCommit(Ok(0))])
+        || (posture == 1
+            && !shutdown
+            && (!receipt_saw_provisional.load(Ordering::SeqCst)
+                || commit_saw_resolved.load(Ordering::SeqCst) == failing))
+    {
+        return Ok(TestResult::error(format!(
+            "posture={posture} failure={sweep_failure:?} shutdown={shutdown} late={late_shutdown} \
+             timer={timer_failure:?} committed={committed} aborted={aborted} receipts={receipts} \
+             kept={kept} provisional={still_provisional} armed={scheduled} durable={:?}",
+            context.durable_scheduled(TimerType::StateRecovery)
+        )));
+    }
+    Ok(TestResult::passed())
+}
+
+fn fail_timer_writes(context: Ctx, failure: (u8, u8)) -> Ctx {
+    let category = match failure.1 % 3 {
+        0 => ErrorCategory::Transient,
+        1 => ErrorCategory::Permanent,
+        _ => ErrorCategory::Terminal,
+    };
+    context
+        .with_timer_tracking()
+        .with_timer_failures(usize::from(failure.0 % 5), category)
 }

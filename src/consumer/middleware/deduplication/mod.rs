@@ -1,29 +1,11 @@
-//! Cassandra-backed deduplication middleware.
+//! Filter messages through their commit markers.
 //!
-//! Replaces the previous local-only LRU deduplication cache with a two-tier
-//! approach: a global shared write-through cache backed by persistent
-//! Cassandra storage. This ensures duplicates are detected even after restarts
-//! or rebalances.
+//! A marker from this assignment skips the handler and commits the source.
+//! An inherited marker also requests a recovery sweep. The settle boundary
+//! records each marker after it stages state. Both steps use the session's
+//! message identity.
 //!
-//! The cache is shared across all partitions so it survives partition
-//! reassignments without cold-start penalties.
-//!
-//! The middleware lives in the common block (built by
-//! `build_common_middleware`), just outside `cancellation`. It is a
-//! **stateless duplicate filter**: a dedup hit short-circuits before the
-//! inner runs. The marker it checks is the boundary-readable message
-//! identity (`message_marker()` — the session `EventRef`'s dedup id, or the
-//! deferred-reload override), and the marker **write** belongs to the
-//! `settle` durability boundary, strictly after the stage — filter and
-//! record read the same accessor, so they cannot disagree, and the commit
-//! marker can never precede the durable state it certifies. Deduplication is
-//! mandatory; there is no disabled variant.
-//!
-//! # Apply hooks
-//!
-//! `Output` encodes whether the inner ran: `Some` means the inner ran and
-//! its apply hook is forwarded; `None` means a dedup hit prevented the inner
-//! from running and both hooks are suppressed.
+//! Apply hooks run only when the inner handler ran.
 
 pub mod cassandra;
 pub mod config;
@@ -63,7 +45,7 @@ pub use self::config::{
     DeduplicationConfigurationBuilderError, IDEMPOTENCE_VERSION_ENV,
 };
 pub use self::memory::{MemoryDeduplicationStore, MemoryDeduplicationStoreProvider};
-pub use self::store::{DeduplicationStore, DeduplicationStoreProvider};
+pub use self::store::{DeduplicationStore, DeduplicationStoreProvider, Presence};
 
 /// Shared state for the deduplication middleware.
 #[derive(Clone, Debug)]
@@ -72,14 +54,8 @@ struct DeduplicationShared<S> {
     store_provider: S,
 }
 
-/// Deduplication middleware.
-///
-/// Wraps the inner middleware stack and checks incoming messages against a
-/// persistent store. Duplicates are filtered out before reaching the handler.
-///
-/// The `P` parameter is the handler payload type, fixed by the chain it is
-/// composed into. `S` is the store provider; any caching is the provider's
-/// responsibility.
+/// Filter messages before the inner handler runs.
+/// `P` fixes the payload type. The store provider owns the cache.
 #[derive(Clone, Debug)]
 pub struct DeduplicationMiddleware<S: DeduplicationStoreProvider, P> {
     shared: Arc<DeduplicationShared<S>>,
@@ -87,10 +63,7 @@ pub struct DeduplicationMiddleware<S: DeduplicationStoreProvider, P> {
 }
 
 impl<S: DeduplicationStoreProvider, P> DeduplicationMiddleware<S, P> {
-    /// Creates a new middleware.
-    ///
-    /// Deduplication is mandatory: it is the commit oracle for keyed state, so
-    /// there is no disabled variant.
+    /// Create the required filter for message commit markers.
     ///
     /// # Errors
     ///
@@ -158,6 +131,18 @@ where
     }
 }
 
+/// The handler result or the reason it did not run.
+#[derive(Debug, Eq, PartialEq)]
+pub enum DeduplicationOutput<O> {
+    /// The inner handler ran.
+    Ran(O),
+    /// This assignment already observed the marker. The source commits.
+    Repeated,
+    /// An earlier assignment or owner recorded the marker. The boundary sweeps
+    /// the key.
+    Redelivered,
+}
+
 /// Handler that checks messages against the shared dedup store (with cache).
 #[derive(Clone)]
 pub struct DeduplicationHandler<T, S: DeduplicationStore> {
@@ -175,32 +160,34 @@ where
         context: C,
         message: ConsumerMessage<H::MessagePayload>,
         demand_type: DemandType,
-    ) -> Result<Option<T::Output>, DeduplicationError<T::Error>>
+    ) -> Result<DeduplicationOutput<T::Output>, DeduplicationError<T::Error>>
     where
         H: HandlerMethod<T>,
         C: EventContext<Payload = T::Payload>,
     {
-        // The filter reads the identity that the settle boundary records.
-        // It reads the session dedup ID or the deferred-load override. Thus,
-        // the filter and record cannot disagree. A missing source skips filtering.
-        let marker = context
-            .marker_identity()
-            .ok()
-            .and_then(|marker| marker.message_marker());
-        if let Some(marker) = marker
-            && self
-                .store
-                .exists(marker.into_uuid())
-                .await
-                .map_err(|error| DeduplicationError::Store(Box::new(error)))?
+        // A missing source has no message marker to check.
+        if let Ok(identity) = context.marker_identity()
+            && let Some(marker) = identity.message_marker()
         {
-            info_span!(parent: message.span(), "message.filtered", reason = "deduplicated")
-                .in_scope(|| debug!("message deduplicated"));
-            return Ok(None);
+            let presence = self
+                .store
+                .lookup(marker.into_uuid())
+                .await
+                .map_err(|error| DeduplicationError::Store(Box::new(error)))?;
+            let output = match presence {
+                Presence::Absent => None,
+                Presence::Settled => Some(DeduplicationOutput::Repeated),
+                Presence::Inherited => Some(DeduplicationOutput::Redelivered),
+            };
+            if let Some(output) = output {
+                info_span!(parent: message.span(), "message.filtered", reason = "deduplicated")
+                    .in_scope(|| debug!(?presence, "message deduplicated"));
+                return Ok(output);
+            }
         }
         H::call(&self.inner, context, message, demand_type)
             .await
-            .map(Some)
+            .map(DeduplicationOutput::Ran)
             .map_err(DeduplicationError::Inner)
     }
 }
@@ -301,9 +288,7 @@ where
     S: DeduplicationStore,
 {
     type Error = DeduplicationError<T::Error>;
-    /// `Some` — inner ran; forward apply hook. `None` — dedup hit; suppress
-    /// both hooks.
-    type Output = Option<T::Output>;
+    type Output = DeduplicationOutput<T::Output>;
     type Payload = T::Payload;
 
     async fn on_message<C>(
@@ -344,7 +329,7 @@ where
         self.inner
             .on_timer(context, trigger, demand_type)
             .await
-            .map(Some)
+            .map(DeduplicationOutput::Ran)
             .map_err(DeduplicationError::Inner)
     }
 
@@ -352,16 +337,12 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        // `Store(_)` arises only from the `exists` read before dispatch —
-        // the inner never ran — so suppressing the inner's apply hook is
-        // correct. `Store(_)` is classified Transient (see `ClassifyError`
-        // below), so the outer retry layer redrives the whole stack and the
-        // inner sees a fresh invocation. (The marker is never written here;
-        // the `settle` boundary records it after the stage.) Apply hooks
-        // are best-effort by design — see `FallibleHandler::after_commit`.
         match result {
-            Ok(Some(output)) => self.inner.after_commit(context, Ok(output)).await,
-            Ok(None) | Err(DeduplicationError::Store(_)) => {}
+            Ok(DeduplicationOutput::Ran(output)) => {
+                self.inner.after_commit(context, Ok(output)).await;
+            }
+            Ok(DeduplicationOutput::Repeated | DeduplicationOutput::Redelivered)
+            | Err(DeduplicationError::Store(_)) => {}
             Err(DeduplicationError::Inner(error)) => {
                 self.inner.after_commit(context, Err(error)).await;
             }
@@ -372,11 +353,12 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        // See `after_commit`: `Err(Store(_))` is the pre-inner read failure;
-        // the inner never ran, so suppress its hook and let retry redrive.
         match result {
-            Ok(Some(output)) => self.inner.after_abort(context, Ok(output)).await,
-            Ok(None) | Err(DeduplicationError::Store(_)) => {}
+            Ok(DeduplicationOutput::Ran(output)) => {
+                self.inner.after_abort(context, Ok(output)).await;
+            }
+            Ok(DeduplicationOutput::Repeated | DeduplicationOutput::Redelivered)
+            | Err(DeduplicationError::Store(_)) => {}
             Err(DeduplicationError::Inner(error)) => {
                 self.inner.after_abort(context, Err(error)).await;
             }
@@ -395,14 +377,12 @@ where
 {
     fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
         match result {
-            // Inner ran: its result is the dispatch's outcome.
-            Ok(Some(output)) => T::settlement(Ok(output)),
+            Ok(DeduplicationOutput::Ran(output)) => T::settlement(Ok(output)),
             Err(DeduplicationError::Inner(error)) => T::settlement(Err(error)),
-            // `Ok(None)` — dedup hit: the message already committed on an
-            // earlier dispatch; nothing here may stage or re-record.
-            // `Store(_)` — the filter's read failed before the inner ran: a
-            // layer failure, not the event's outcome.
-            Ok(None) | Err(DeduplicationError::Store(_)) => Settlement::Bypassed,
+            Ok(DeduplicationOutput::Repeated) | Err(DeduplicationError::Store(_)) => {
+                Settlement::Bypassed
+            }
+            Ok(DeduplicationOutput::Redelivered) => Settlement::Duplicate,
         }
     }
 }

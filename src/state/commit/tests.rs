@@ -1,3 +1,4 @@
+use crate::timers::store::adapter::TableAdapter;
 use color_eyre::eyre::{Result, eyre};
 use uuid::Uuid;
 
@@ -53,7 +54,9 @@ async fn message_committed_after_insert() -> Result<()> {
 async fn store_tag_source_resolves_three_states() -> Result<()> {
     let store = memory_store(test_segment("test", 300_u32));
     let trigger = create_test_trigger("k", 5, TimerType::Application)?;
-    store.add_trigger(trigger.clone()).await?;
+    TableAdapter::new(store.clone())
+        .add_trigger(trigger.clone())
+        .await?;
 
     let oracle = CommitManager::new(
         MemoryDeduplicationStore::new(),
@@ -86,7 +89,7 @@ async fn store_tag_source_resolves_three_states() -> Result<()> {
     );
 
     // row-absent → committed (fired-and-removed).
-    store
+    TableAdapter::new(store.clone())
         .remove_trigger(&trigger.key, trigger.time, trigger.timer_type)
         .await?;
     assert!(
@@ -125,7 +128,9 @@ async fn oracle_reads_through_the_partitions_store() -> Result<()> {
         trigger.timer_type,
         trigger.tag,
     );
-    partition_store.add_trigger(trigger).await?;
+    TableAdapter::new(partition_store.clone())
+        .add_trigger(trigger)
+        .await?;
 
     assert!(
         !oracle
@@ -136,7 +141,7 @@ async fn oracle_reads_through_the_partitions_store() -> Result<()> {
 
     // Committing the fire through the partition's store removes the row; the
     // oracle must observe it through its own view of the shared store.
-    partition_store
+    TableAdapter::new(partition_store.clone())
         .remove_trigger(&key, time, timer_type)
         .await?;
     assert!(

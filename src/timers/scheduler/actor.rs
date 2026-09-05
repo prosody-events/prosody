@@ -7,7 +7,8 @@
 //!
 //! [`TriggerScheduler`]: super::TriggerScheduler
 
-use super::{Command, CommandOperation};
+use super::BUFFER_SIZE;
+use super::Command;
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::Heartbeat;
 use crate::timers::datetime::CompactDateTime;
@@ -24,7 +25,7 @@ use std::pin::pin;
 use std::time::Duration;
 use tokio::select;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::coop::cooperative;
 use tokio::time::{Instant, sleep_until};
 use tracing::{debug, warn};
@@ -49,6 +50,12 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// the state.
 pub(super) struct ActorState<T> {
     pub(super) store: T,
+    /// The trigger receiver and its hand-off. The first successful load sends
+    /// the receiver to the partition.
+    pub(super) ready: Option<(
+        oneshot::Sender<mpsc::Receiver<Trigger>>,
+        mpsc::Receiver<Trigger>,
+    )>,
     pub(super) segment: Segment,
     /// Slab metadata rows this actor has written or observed in the loaded
     /// prefix.
@@ -79,7 +86,7 @@ pub(super) async fn run_actor<T>(
     segment: Segment,
     mut triggers: TriggerQueue,
     mut commands: mpsc::Receiver<Command<T::Error>>,
-    trigger_tx: mpsc::Sender<Trigger>,
+    ready: oneshot::Sender<mpsc::Receiver<Trigger>>,
     heartbeat: Heartbeat,
     mut shutdown_rx: watch::Receiver<ShutdownPhase>,
 ) where
@@ -87,8 +94,10 @@ pub(super) async fn run_actor<T>(
 {
     let preload_window = calculate_preload(segment.slab_size);
     let now = Instant::now();
+    let (trigger_tx, receiver) = mpsc::channel(BUFFER_SIZE);
     let mut state: ActorState<T> = ActorState {
         store,
+        ready: Some((ready, receiver)),
         segment,
         known_slab_ids: BTreeSet::new(),
         last_persisted_watermark: None,
@@ -162,6 +171,7 @@ pub(super) async fn run_actor<T>(
                     process_command(&mut state, &mut triggers, command).await;
                 }
                 Some(trigger) = triggers.next() => {
+                    triggers.active_triggers().deliver(&trigger).await;
                     if let Err(err) = trigger_tx.try_send(trigger) {
                         match err {
                             TrySendError::Full(t) => trigger_to_send = Some(t),
@@ -189,36 +199,41 @@ pub(super) async fn run_actor<T>(
 async fn process_command<T>(
     state: &mut ActorState<T>,
     triggers: &mut TriggerQueue,
-    Command {
-        operation,
-        trigger,
-        result_tx,
-    }: Command<T::Error>,
+    command: Command<T::Error>,
 ) where
     T: TriggerStore,
 {
-    let result: Result<(), T::Error> = match operation {
-        CommandOperation::Add => handle_add(state, triggers, trigger).await,
-        CommandOperation::Remove => {
-            triggers.remove(&trigger).await;
-            Ok(())
+    // A dropped reply means the caller stopped waiting; nothing to do.
+    match command {
+        Command::Add { trigger, reply } => {
+            let _ = reply.send(handle_add(state, triggers, trigger).await);
         }
-        CommandOperation::AddToQueue => {
+        Command::AddToQueue { trigger, reply } => {
             triggers.insert_queue_only(trigger);
-            Ok(())
+            let _ = reply.send(());
         }
-        CommandOperation::RemoveFromQueue => {
-            triggers.remove_queue_only(&trigger);
-            Ok(())
+        Command::RemoveFromQueue { trigger, reply } => {
+            let _ = reply.send(triggers.remove_queue_only(&trigger));
         }
-    };
-
-    // Ignore send errors: the caller will observe a closed reply channel as
-    // a shutdown signal.
-    let _ = result_tx.send(result);
+        #[cfg(test)]
+        Command::TakeFromQueue { trigger, reply } => {
+            let trigger = triggers.remove_queue_only(&trigger);
+            if let Some(trigger) = &trigger {
+                triggers.active_triggers().deliver(trigger).await;
+            }
+            let _ = reply.send(trigger);
+        }
+        Command::Remove { trigger, reply } => {
+            let _ = reply.send(triggers.remove_if_live(&trigger).await);
+        }
+        Command::Retag { trigger, reply } => {
+            triggers.retag(&trigger).await;
+            let _ = reply.send(());
+        }
+    }
 }
 
-/// Handler for [`CommandOperation::Add`].
+/// Handler for [`Command::Add`].
 ///
 /// Classifies the trigger's slab as **owned** or **pending**:
 ///
@@ -229,10 +244,9 @@ async fn process_command<T>(
 ///   lowers the watermark (invariant I6) — the only way the actor can pull a
 ///   slab back below its own high-water without violating I1.
 /// - A **pending** slab sits above the load high-water and has never been
-///   touched by the actor. The trigger row (written first by the manager via
-///   [`TriggerStore::add_trigger`]) waits in storage; the actor just persists
-///   slab metadata so `load_step` can find it later. Keeps the in-memory queue
-///   bounded to the preload window.
+///   touched by the actor. The manager writes the trigger row first. The actor
+///   writes slab metadata so `load_step` can find it later. This bounds the
+///   queue to the preload window.
 pub(super) async fn handle_add<T>(
     state: &mut ActorState<T>,
     triggers: &mut TriggerQueue,
@@ -456,6 +470,9 @@ where
 
     match load_result {
         Ok(count) => {
+            if let Some((sender, receiver)) = state.ready.take() {
+                let _ = sender.send(receiver);
+            }
             state.highest_loaded_slab_id = Some(target_slab_id);
             debug!(
                 start_slab_id,
@@ -490,14 +507,15 @@ async fn drain_slab_range<T>(
 where
     T: TriggerStore,
 {
-    let store_for_tasks = store.clone();
     let mut stream = pin!(
         store
             .get_slab_range(range)
             .map_ok(move |slab_id| {
-                let store = store_for_tasks.clone();
                 async move {
-                    let triggers = pin!(store.get_slab_triggers_all_types(slab_id));
+                    let triggers = pin!(store.get_slab_triggers_all_types(Slab::new(
+                        slab_id,
+                        store.segment().slab_size
+                    )));
                     let slab_triggers = cooperative(triggers.try_collect::<Vec<_>>()).await?;
                     Ok::<_, T::Error>((slab_id, slab_triggers))
                 }

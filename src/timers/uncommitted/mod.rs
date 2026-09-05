@@ -1,44 +1,31 @@
-//! Uncommitted timer events and transaction-like semantics.
+//! Timer guards control each attempt and its recovery source.
 //!
-//! Defines the timer event abstraction used for processing fired timers that
-//! have been delivered to the application but not yet acknowledged:
-//!
-//! - [`UncommittedTimer`] - A trait providing timer metadata and transaction
-//!   operations while hiding the concrete store implementation.
-//! - [`PendingTimer`] - Timer delivered from the queue but not yet firing.
-//! - [`FiringTimer`] - Timer currently being processed by a handler.
-//!
-//! Enforces a type-safe transaction pattern:
-//!
-//! 1. Delivery: timers arrive as [`PendingTimer`]
-//! 2. Activation: call [`PendingTimer::fire()`] to transition to
-//!    [`FiringTimer`]
-//! 3. Processing: application handles the timer event
-//! 4. Acknowledgment: application calls [`FiringTimer::commit()`] or
-//!    [`FiringTimer::abort()`] on [`FiringTimer`]
-//! 5. Cleanup: timers are removed from storage or left for retry
-//!
-//! Timers use at-least-once delivery and survive restarts. Successful commits
-//! remove timers permanently; aborts deactivate them in-memory while preserving
-//! persistent state for potential reloading.
+//! [`PendingTimer`] holds a delivered trigger. Its fire starts a live attempt
+//! or returns a committed source for a recovery sweep.
+//! [`FiringTimer`] can commit or abort. Its receipt returns [`ReceiptedTimer`],
+//! which can retire or keep the source but cannot abort the committed event.
 
-use crate::consumer::{Keyed, Uncommitted};
+use crate::consumer::partition::ShutdownPhase;
+use crate::consumer::receipted_sealed as sealed;
+use crate::consumer::{Keyed, Receipted, ReceiptedSource, Uncommitted};
 use crate::otel::SpanRelation;
 use crate::related_span;
+use crate::state::manager::KeySwept;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::TriggerTrace;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::manager::TimerManager;
+use crate::timers::manager::{Fire, TimerManager};
 use crate::timers::store::TriggerStore;
 use crate::{Key, ProcessScope};
 use arc_swap::ArcSwap;
 use educe::Educe;
+use std::fmt::Display;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, watch};
 use tokio::time::sleep;
-use tracing::{Level, Span, warn};
+use tracing::{Level, Span, error, warn};
 
 /// Delay between retry attempts when commits fail.
 const RETRY_DURATION: Duration = Duration::from_secs(1);
@@ -58,7 +45,7 @@ static RELEASED_TRACE: LazyLock<Arc<TriggerTrace>> =
 /// processed by a handler.
 pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
     /// The commit guard type for this timer.
-    type CommitGuard: Uncommitted + Send;
+    type CommitGuard: Receipted + Send;
 
     /// Scheduled execution time of this timer.
     fn time(&self) -> CompactDateTime;
@@ -83,7 +70,7 @@ pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
 /// Timer delivered from the queue but not yet transitioned to firing state.
 ///
 /// Wraps a [`Trigger`] and an internal transaction state. Call
-/// [`PendingTimer::fire()`] to transition to [`FiringTimer`] before processing.
+/// The framework transitions this timer to [`FiringTimer`] before processing.
 /// If the timer was cancelled while queued, `fire()` returns `None`.
 #[derive(Educe)]
 #[educe(Debug(bound = ""))]
@@ -91,9 +78,6 @@ pub struct PendingTimer<T>
 where
     T: TriggerStore,
 {
-    /// The underlying timer data: key, execution time, and trace.
-    trigger: Trigger,
-
     /// Transaction state and coordination with [`TimerManager`].
     #[educe(Debug(ignore))]
     uncommitted: UncommittedTrigger<T>,
@@ -101,32 +85,73 @@ where
 
 /// Timer currently being processed by a handler.
 ///
-/// Created by calling [`PendingTimer::fire()`]. Owns the `commit()`/`abort()`
-/// capability. Processing must end with either `commit()` or `abort()`.
+/// Owns the `commit()` and `abort()` capability for a live timer.
 #[derive(Educe)]
 #[educe(Debug(bound = ""))]
 pub struct FiringTimer<T>
 where
     T: TriggerStore,
 {
-    /// The underlying timer data: key, execution time, and trace.
-    trigger: Trigger,
-
     /// Transaction state and coordination with [`TimerManager`].
     #[educe(Debug(ignore))]
     uncommitted: UncommittedTrigger<T>,
 }
 
-/// A wrapper around `UncommittedTrigger` that implements [`Uncommitted`].
+/// A live fire whose coordinate holds an earlier attempt.
 ///
-/// This wrapper is necessary because `UncommittedTrigger` implements [`Drop`]
-/// and [`Uncommitted`] requires consuming `self`.
-pub struct UncommittedTriggerGuard<T>
+/// `swept` needs the proof that only the key sweep mints, so no handler can
+/// run before the sweep.
+pub(crate) struct UnsweptTimer<T: TriggerStore>(FiringTimer<T>);
+
+impl<T: TriggerStore> UnsweptTimer<T> {
+    pub(crate) fn key(&self) -> &Key {
+        self.0.key()
+    }
+
+    pub(crate) async fn abort(self) {
+        self.0.abort().await;
+    }
+
+    pub(crate) fn swept(self, _proof: KeySwept) -> FiringTimer<T> {
+        self.0
+    }
+}
+
+/// Classifies a fired timer before handler dispatch.
+pub(crate) enum Fired<T>
 where
     T: TriggerStore,
 {
-    /// The wrapped uncommitted trigger.
-    inner: Option<UncommittedTrigger<T>>,
+    /// The key row identifies a live attempt.
+    Live(FiringTimer<T>),
+    /// The key row tag differs from the item tag. An earlier attempt can
+    /// hold provisional cells, so the key sweep runs first.
+    Unswept(UnsweptTimer<T>),
+    /// The key row is absent, so the attempt already committed.
+    Committed(ReceiptedTimer<T>),
+}
+
+impl<T> Fired<T>
+where
+    T: TriggerStore,
+{
+    #[cfg(test)]
+    pub(crate) fn into_live(self) -> Option<FiringTimer<T>> {
+        match self {
+            Self::Live(timer) => Some(timer),
+            Self::Unswept(..) | Self::Committed(..) => None,
+        }
+    }
+}
+
+/// A timer that can commit or abort its attempt.
+pub struct UncommittedTriggerGuard<T: TriggerStore> {
+    inner: UncommittedTrigger<T>,
+}
+
+/// A committed timer whose slab row permits another recovery sweep.
+pub struct ReceiptedTimer<T: TriggerStore> {
+    inner: UncommittedTrigger<T>,
 }
 
 /// Internal transaction state for an uncommitted timer.
@@ -137,19 +162,13 @@ struct UncommittedTrigger<T>
 where
     T: TriggerStore,
 {
-    /// Logical key of the timer.
-    key: Key,
-
-    /// Scheduled execution time.
-    time: CompactDateTime,
-
-    /// Timer type classification.
-    timer_type: TimerType,
+    /// The attempt identity.
+    trigger: Trigger,
 
     /// Manager coordinating persistent and in-memory state.
     manager: TimerManager<T>,
 
-    /// Indicates if this timer has already been committed or aborted.
+    /// Suppresses the drop warning after an explicit final action.
     completed: bool,
 
     /// Global timer semaphore permit; released when this trigger is dropped.
@@ -172,15 +191,9 @@ where
     /// timer is dropped.
     #[must_use]
     pub fn new(trigger: Trigger, manager: TimerManager<T>, permit: OwnedSemaphorePermit) -> Self {
-        let key = trigger.key.clone();
-        let time = trigger.time;
-        let timer_type = trigger.timer_type;
         Self {
-            trigger,
             uncommitted: UncommittedTrigger {
-                key,
-                time,
-                timer_type,
+                trigger,
                 manager,
                 completed: false,
                 _permit: permit,
@@ -195,29 +208,37 @@ where
     /// `Firing` state. If the timer was cancelled while queued, returns
     /// `None` and the timer is marked as completed.
     ///
-    /// The `FiringTimer`'s trigger carries the canonical tag from
-    /// `ActiveTriggers` at the moment of dispatch. This tag may differ from
-    /// the tag on the queue-popped trigger if a `complete()`-from-
-    /// `FiringRescheduled` rotation occurred while this entry was in the
-    /// delay queue.
-    pub async fn fire(mut self) -> Option<FiringTimer<T>> {
-        // Attempt to transition from Scheduled → Firing, reading the canonical
-        // tag from ActiveTriggers under the trigger-lock.
-        let Some(canonical_tag) = self.uncommitted.fire_with_tag().await else {
-            self.uncommitted.completed = true;
-            return None;
+    /// A live `FiringTimer` carries the tag from the store key row.
+    /// A committed result has no key row and cannot reach a handler.
+    pub(crate) async fn fire(self, shutdown: &watch::Receiver<ShutdownPhase>) -> Option<Fired<T>> {
+        let mut uncommitted = self.uncommitted;
+        let fire = loop {
+            match uncommitted.manager.fire(&uncommitted.trigger).await {
+                Ok(Some(fire)) => break fire,
+                Ok(None) => {
+                    uncommitted.completed = true;
+                    return None;
+                }
+                Err(error) => {
+                    if *shutdown.borrow() >= ShutdownPhase::Cancelling {
+                        uncommitted.abort().await;
+                        return None;
+                    }
+                    error!(error = %error, "failed to read timer receipt; retrying");
+                    sleep(RETRY_DURATION).await;
+                }
+            }
         };
-
-        // Re-stamp the trigger with the canonical tag so provisional-cell
-        // writers can embed the observed-at-dispatch value. `tag` is excluded
-        // from `Hash/Eq/Ord` (see `Trigger` doc), so the in-place write
-        // preserves the `(key, time, timer_type)` identity used by any
-        // downstream map keys.
-        self.trigger.tag = canonical_tag;
-
-        Some(FiringTimer {
-            trigger: self.trigger,
-            uncommitted: self.uncommitted,
+        Some(match fire {
+            Fire::Live(tag) => {
+                uncommitted.trigger.tag = tag;
+                Fired::Live(FiringTimer { uncommitted })
+            }
+            Fire::Unswept(tag) => {
+                uncommitted.trigger.tag = tag;
+                Fired::Unswept(UnsweptTimer(FiringTimer { uncommitted }))
+            }
+            Fire::Committed => Fired::Committed(ReceiptedTimer { inner: uncommitted }),
         })
     }
 }
@@ -228,11 +249,10 @@ where
 {
     /// Returns a reference to the underlying [`Trigger`].
     ///
-    /// See [`PendingTimer::fire`] for what the trigger's `tag` field means
-    /// here.
+    /// The trigger tag comes from the store key row.
     #[must_use]
     pub fn trigger(&self) -> &Trigger {
-        &self.trigger
+        &self.uncommitted.trigger
     }
 
     /// Replaces the trigger's trace with a `"trigger"` dispatch span.
@@ -253,16 +273,17 @@ where
     /// ([`TimerType::is_application`]); two macro invocations because a
     /// tracing callsite's level is static.
     pub fn set_dispatch_span(&self, relation: SpanRelation) {
-        let context = self.trigger.context();
-        let span = if self.trigger.timer_type.is_application() {
+        let trigger = &self.uncommitted.trigger;
+        let context = trigger.context();
+        let span = if trigger.timer_type.is_application() {
             related_span!(
                 level: Level::INFO,
                 relation,
                 context,
                 "trigger",
-                key = %self.trigger.key,
-                timer.fire_time = %self.trigger.time.to_rfc3339(),
-                timer.type = ?self.trigger.timer_type,
+                key = %trigger.key,
+                timer.fire_time = %trigger.time.to_rfc3339(),
+                timer.type = ?trigger.timer_type,
             )
         } else {
             related_span!(
@@ -270,12 +291,12 @@ where
                 relation,
                 context,
                 "trigger",
-                key = %self.trigger.key,
-                timer.fire_time = %self.trigger.time.to_rfc3339(),
-                timer.type = ?self.trigger.timer_type,
+                key = %trigger.key,
+                timer.fire_time = %trigger.time.to_rfc3339(),
+                timer.type = ?trigger.timer_type,
             )
         };
-        self.trigger.set_span(span);
+        trigger.set_span(span);
     }
 }
 
@@ -285,8 +306,7 @@ where
 {
     /// Commit this timer after successful processing.
     ///
-    /// Repeated calls are ignored. Blocks until the underlying storage
-    /// removal succeeds, retrying on errors.
+    /// Retries each failed store write.
     async fn commit(mut self) {
         self.uncommitted.commit().await;
     }
@@ -299,6 +319,19 @@ where
     }
 }
 
+impl<T> Receipted for FiringTimer<T>
+where
+    T: TriggerStore,
+{
+    type Source = ReceiptedTimer<T>;
+
+    async fn receipt(self) -> Self::Source {
+        self.uncommitted.receipt().await
+    }
+}
+
+impl<T> sealed::Sealed for FiringTimer<T> where T: TriggerStore {}
+
 impl<T> Keyed for FiringTimer<T>
 where
     T: TriggerStore,
@@ -307,7 +340,7 @@ where
 
     /// Returns the key associated with this timer.
     fn key(&self) -> &Self::Key {
-        &self.trigger.key
+        &self.uncommitted.trigger.key
     }
 }
 
@@ -319,19 +352,7 @@ where
 
     /// Returns the key associated with this timer.
     fn key(&self) -> &Self::Key {
-        &self.trigger.key
-    }
-}
-
-impl<T> UncommittedTriggerGuard<T>
-where
-    T: TriggerStore,
-{
-    /// Create a new guard wrapping an uncommitted trigger.
-    fn new(trigger: UncommittedTrigger<T>) -> Self {
-        Self {
-            inner: Some(trigger),
-        }
+        &self.uncommitted.trigger.key
     }
 }
 
@@ -341,77 +362,72 @@ where
 {
     /// Commit this timer after successful processing.
     async fn commit(mut self) {
-        if let Some(mut trigger) = self.inner.take() {
-            trigger.commit().await;
-        }
+        self.inner.commit().await;
     }
 
     /// Abort this timer without deleting persistent data.
     async fn abort(mut self) {
-        if let Some(mut trigger) = self.inner.take() {
-            trigger.abort().await;
-        }
+        self.inner.abort().await;
     }
 }
+
+impl<T> Receipted for UncommittedTriggerGuard<T>
+where
+    T: TriggerStore,
+{
+    type Source = ReceiptedTimer<T>;
+
+    async fn receipt(self) -> Self::Source {
+        self.inner.receipt().await
+    }
+}
+
+impl<T> sealed::Sealed for UncommittedTriggerGuard<T> where T: TriggerStore {}
 
 impl<T> UncommittedTrigger<T>
 where
     T: TriggerStore,
 {
-    /// Attempt to transition the timer from `Scheduled` to `Firing` state,
-    /// returning the value observed at the transition; see
-    /// [`PendingTimer::fire`] for what "canonical" means here.
-    ///
-    /// Returns `None` if the transition failed (timer was cancelled or is not
-    /// in `Scheduled` state).
-    async fn fire_with_tag(&self) -> Option<i32> {
-        self.manager
-            .fire_with_tag(&self.key, self.time, self.timer_type)
-            .await
+    async fn receipt(self) -> ReceiptedTimer<T> {
+        let manager = &self.manager;
+        let trigger = &self.trigger;
+        retry_until_ok("record timer receipt", || manager.receipt(trigger)).await;
+        ReceiptedTimer { inner: self }
     }
 
-    /// Permanently remove the timer from storage and deactivate it.
-    ///
-    /// Retries indefinitely on failures, waiting `RETRY_DURATION` between
-    /// attempts. Multiple commits or aborts are ignored.
     async fn commit(&mut self) {
-        if self.completed {
-            warn!("timer already marked as completed; ignoring commit");
-            return;
-        }
-
-        // Retry loop: ensure TimerManager::complete eventually succeeds.
-        loop {
-            match self
-                .manager
-                .complete(&self.key, self.time, self.timer_type)
-                .await
-            {
-                Ok(()) => break,
-                Err(error) => {
-                    tracing::error!("failed to commit timer: {error:#}; retrying");
-                    sleep(RETRY_DURATION).await;
-                }
-            }
-        }
-
+        let manager = &self.manager;
+        let trigger = &self.trigger;
+        retry_until_ok("commit timer", || manager.complete(trigger)).await;
         self.completed = true;
     }
 
-    /// Deactivate the timer in-memory without removing from storage.
-    ///
-    /// The timer can fire again if reloaded. Multiple aborts or commits
-    /// are ignored.
     async fn abort(&mut self) {
-        if self.completed {
-            warn!("timer already marked as completed; ignoring abort");
-            return;
-        }
-
-        self.manager
-            .abort(&self.key, self.time, self.timer_type)
-            .await;
+        self.manager.abort(&self.trigger).await;
         self.completed = true;
+    }
+}
+
+impl<T: TriggerStore> sealed::Sealed for ReceiptedTimer<T> {}
+
+impl<T: TriggerStore> Keyed for ReceiptedTimer<T> {
+    type Key = Key;
+
+    fn key(&self) -> &Key {
+        &self.inner.trigger.key
+    }
+}
+
+impl<T: TriggerStore> ReceiptedSource for ReceiptedTimer<T> {
+    async fn retire(mut self) {
+        let manager = &self.inner.manager;
+        let trigger = &self.inner.trigger;
+        retry_until_ok("retire timer", || manager.retire(trigger)).await;
+        self.inner.completed = true;
+    }
+
+    async fn keep(mut self) {
+        self.inner.abort().await;
     }
 }
 
@@ -423,24 +439,30 @@ where
 
     /// Scheduled execution time of this timer.
     fn time(&self) -> CompactDateTime {
-        self.trigger.time
+        self.uncommitted.trigger.time
     }
 
     /// Timer type classification.
     fn timer_type(&self) -> TimerType {
-        self.trigger.timer_type
+        self.uncommitted.trigger.timer_type
     }
 
     /// Returns the tracing span associated with this timer.
     ///
     /// Returns `Span::none()` if processing resources have been released.
     fn span(&self) -> Span {
-        self.trigger.span()
+        self.uncommitted.trigger.span()
     }
 
     /// Decompose into the raw [`Trigger`] and the commit guard.
     fn into_inner(self) -> (Trigger, Self::CommitGuard) {
-        (self.trigger, UncommittedTriggerGuard::new(self.uncommitted))
+        let trigger = self.uncommitted.trigger.clone();
+        (
+            trigger,
+            UncommittedTriggerGuard {
+                inner: self.uncommitted,
+            },
+        )
     }
 }
 
@@ -448,9 +470,7 @@ impl<T> Drop for UncommittedTrigger<T>
 where
     T: TriggerStore,
 {
-    /// Warn if a timer is dropped without being committed or aborted.
-    ///
-    /// Helps detect resource leaks from unacknowledged timers.
+    /// Warn if no explicit final action releases the timer.
     fn drop(&mut self) {
         if !self.completed {
             warn!("timer was dropped without committing or aborting");
@@ -471,7 +491,25 @@ where
     type Guard = TriggerProcessGuard;
 
     fn process_scope(&self) -> Self::Guard {
-        TriggerProcessGuard(self.trigger.trace.clone())
+        TriggerProcessGuard(self.uncommitted.trigger.trace.clone())
+    }
+}
+
+/// Retry the store operation until it succeeds.
+async fn retry_until_ok<F, Fut, E>(action: &str, mut op: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: Display,
+{
+    loop {
+        match op().await {
+            Ok(()) => return,
+            Err(error) => {
+                error!("failed to {action}: {error:#}; retrying");
+                sleep(RETRY_DURATION).await;
+            }
+        }
     }
 }
 

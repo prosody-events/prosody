@@ -29,7 +29,7 @@ where
         .await
         .map_err(TimerManagerError::Store)?;
 
-    Ok(store.segment())
+    Ok(store.segment().clone())
 }
 
 #[cfg(test)]

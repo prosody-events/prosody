@@ -1,51 +1,57 @@
 //! Cassandra-backed deduplication store.
 
 use super::queries::DeduplicationQueries;
-use super::store::{DeduplicationStore, DeduplicationStoreProvider};
+use super::store::{DeduplicationStore, DeduplicationStoreProvider, Marker, Presence};
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::{Partition, Topic};
 use quick_cache::sync::Cache;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Instant;
 use uuid::Uuid;
 
-/// Cassandra-backed deduplication store.
-///
-/// All instances share the same Cassandra session, prepared queries, and
-/// write-through cache. Reads check the cache first; on a miss, the store is
-/// queried and the result is promoted. Writes go to the store and then into the
-/// cache.
+/// Read durable markers through a shared cache.
+/// Each read or write adds the marker to the cache.
 #[derive(Clone, Debug)]
 pub struct CassandraDeduplicationStore {
     store: CassandraStore,
     queries: Arc<DeduplicationQueries>,
     ttl: i32,
-    cache: Arc<Cache<Uuid, ()>>,
+    cache: Arc<Cache<Uuid, Marker>>,
+    acquired: Instant,
 }
 
 impl DeduplicationStore for CassandraDeduplicationStore {
     type Error = CassandraStoreError;
 
-    async fn exists(&self, id: Uuid) -> Result<bool, Self::Error> {
+    async fn recorded(&self, id: Uuid) -> Result<bool, Self::Error> {
         if self.cache.get(&id).is_some() {
             return Ok(true);
         }
-        let result = self
-            .store
-            .session()
-            .execute_unpaged(&self.queries.check_exists, (id,))
-            .await?;
-
-        let has_rows = result
-            .into_rows_result()?
-            .maybe_first_row::<(Uuid,)>()?
-            .is_some();
-
-        if has_rows {
-            self.cache.insert(id, ());
+        let recorded = self.read_marker(id).await?;
+        if recorded {
+            self.cache.insert(id, Marker::Recorded);
         }
-        Ok(has_rows)
+        Ok(recorded)
+    }
+
+    async fn lookup(&self, id: Uuid) -> Result<Presence, Self::Error> {
+        match self.cache.get(&id) {
+            Some(Marker::Observed(stamp)) if stamp >= self.acquired => Ok(Presence::Settled),
+            Some(Marker::Recorded | Marker::Observed(_)) => {
+                self.cache.insert(id, Marker::Observed(Instant::now()));
+                Ok(Presence::Inherited)
+            }
+            None => {
+                if self.read_marker(id).await? {
+                    self.cache.insert(id, Marker::Observed(Instant::now()));
+                    Ok(Presence::Inherited)
+                } else {
+                    Ok(Presence::Absent)
+                }
+            }
+        }
     }
 
     async fn insert(&self, id: Uuid) -> Result<(), Self::Error> {
@@ -53,23 +59,31 @@ impl DeduplicationStore for CassandraDeduplicationStore {
             .session()
             .execute_unpaged(&self.queries.insert_with_ttl, (id, self.ttl))
             .await?;
-        self.cache.insert(id, ());
+        self.cache.insert(id, Marker::Observed(Instant::now()));
         Ok(())
     }
 }
 
-/// Factory for Cassandra deduplication stores.
-///
-/// Holds shared resources; all stores created by this provider share the same
-/// session, queries, TTL, and write-through cache, so a UUID cached by one
-/// per-partition store short-circuits the Cassandra round-trip for every other
-/// partition served by the same process.
+impl CassandraDeduplicationStore {
+    async fn read_marker(&self, id: Uuid) -> Result<bool, CassandraStoreError> {
+        Ok(self
+            .store
+            .session()
+            .execute_unpaged(&self.queries.check_exists, (id,))
+            .await?
+            .into_rows_result()?
+            .maybe_first_row::<(Uuid,)>()?
+            .is_some())
+    }
+}
+
+/// Share the session, queries, TTL, and cache across partitions.
 #[derive(Clone, Debug)]
 pub struct CassandraDeduplicationStoreProvider {
     store: CassandraStore,
     queries: Arc<DeduplicationQueries>,
     ttl: i32,
-    cache: Arc<Cache<Uuid, ()>>,
+    cache: Arc<Cache<Uuid, Marker>>,
 }
 
 impl CassandraDeduplicationStoreProvider {
@@ -105,6 +119,7 @@ impl DeduplicationStoreProvider for CassandraDeduplicationStoreProvider {
             queries: self.queries.clone(),
             ttl: self.ttl,
             cache: self.cache.clone(),
+            acquired: Instant::now(),
         }
     }
 }

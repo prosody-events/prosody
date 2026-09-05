@@ -3,21 +3,23 @@ use crate::Topic;
 use crate::consumer::{Keyed, Uncommitted};
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
+use crate::timers::active::Item;
 use crate::timers::duration::CompactDuration;
 use crate::timers::scheduler::TimerSchedulerError;
-use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
 use crate::timers::store::tests::common::KEY_POOL;
 use crate::timers::test_support::{
-    create_test_trigger, setup_timer_manager, setup_timer_manager_at, test_segment, test_semaphores,
+    create_test_trigger, setup_timer_manager, setup_timer_manager_at, setup_timer_manager_over,
+    test_segment, test_semaphores,
 };
-use crate::timers::uncommitted::UncommittedTriggerGuard;
-use color_eyre::eyre::{Result, eyre};
+use crate::timers::uncommitted::{Fired, UncommittedTriggerGuard};
+use color_eyre::eyre::{Result, ensure, eyre};
 use futures::{StreamExt, pin_mut};
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
+use strum::VariantArray;
 use tokio::runtime::Builder;
 use tokio::sync::watch;
 use tokio::task;
@@ -33,6 +35,26 @@ async fn count_scheduled<T: TriggerStore>(
     Ok(manager.scheduled_times(key, timer_type).await?.len())
 }
 
+async fn wait_for_owned(
+    manager: &TimerManager<InMemoryTriggerStore>,
+    trigger: &Trigger,
+) -> Result<()> {
+    for _ in 0..500_u16 {
+        advance(Duration::from_millis(10)).await;
+        task::yield_now().await;
+        if manager
+            .0
+            .scheduler
+            .active_triggers()
+            .contains(&trigger.key, trigger.time, trigger.timer_type)
+            .await
+        {
+            return Ok(());
+        }
+    }
+    Err(eyre!("timer slab was not owned"))
+}
+
 /// Helper: wait for timer and fire it
 async fn wait_and_fire<S, T>(
     stream: &mut S,
@@ -44,8 +66,9 @@ where
 {
     let pending = stream.next().await.ok_or_else(|| eyre!("{msg}"))?;
     let firing = pending
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("{msg} - not active"))?;
     Ok(firing.into_inner())
 }
@@ -80,6 +103,7 @@ async fn test_new_timer_manager_creation() -> Result<()> {
     let stored = manager
         .0
         .store
+        .operations()
         .get_segment()
         .await?
         .ok_or_else(|| eyre!("segment should be persisted after manager init"))?;
@@ -114,8 +138,9 @@ async fn test_timer_stream_delivery() -> Result<()> {
 
     if let Some(pending_timer) = stream.next().await {
         let firing_timer = pending_timer
-            .fire()
+            .fire(&watch::channel(ShutdownPhase::default()).1)
             .await
+            .and_then(Fired::into_live)
             .ok_or_else(|| eyre!("Timer should be active"))?;
         let (trigger_data, _) = firing_timer.into_inner();
         assert_eq!(trigger_data.key, trigger.key);
@@ -379,16 +404,21 @@ async fn actor_exits_at_cancelling() -> Result<()> {
         .await?;
 
     // Advancing to Cancelling must terminate the actor. Poll an idempotent
-    // scheduler-reaching op until it observes the closed channel; the await
+    // queue-only command until it observes the closed channel; the await
     // itself synchronizes with the actor (a nextest timeout is the sole
-    // hang-guard, per TESTING.md — never the assertion).
+    // hang-guard, per TESTING.md — never the assertion). The manager's
+    // `unschedule` returns early for a timer without a key row, so the probe
+    // talks to the scheduler directly.
     shutdown_tx.send(ShutdownPhase::Cancelling)?;
+    let probe = Trigger::new(
+        Key::from("never-scheduled"),
+        time,
+        TimerType::Application,
+        Span::current(),
+    );
     loop {
-        match manager
-            .unschedule(&Key::from("never-scheduled"), time, TimerType::Application)
-            .await
-        {
-            Err(TimerManagerError::Scheduler(TimerSchedulerError::Shutdown)) => break,
+        match manager.0.scheduler.remove_from_queue(probe.clone()).await {
+            Err(TimerSchedulerError::Shutdown) => break,
             Ok(()) => task::yield_now().await,
             Err(e) => return Err(eyre!("unexpected error awaiting actor exit: {e:#}")),
         }
@@ -415,7 +445,11 @@ async fn test_reschedule_idempotent() -> Result<()> {
     task::yield_now().await;
 
     let pending = stream.next().await.ok_or_else(|| eyre!("No timer"))?;
-    let firing = pending.fire().await.ok_or_else(|| eyre!("Not active"))?;
+    let firing = pending
+        .fire(&watch::channel(ShutdownPhase::default()).1)
+        .await
+        .and_then(Fired::into_live)
+        .ok_or_else(|| eyre!("Not active"))?;
 
     // Reschedule multiple times - all should succeed as no-ops
     manager.schedule_trigger(trigger.clone()).await?;
@@ -436,8 +470,9 @@ async fn test_reschedule_idempotent() -> Result<()> {
         .ok_or_else(|| eyre!("No second timer"))?;
 
     let firing2 = pending2
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("Second fire not active"))?;
     let (_, guard2) = firing2.into_inner();
     guard2.commit().await;
@@ -470,7 +505,11 @@ async fn test_commit_deletes_when_not_rescheduled() -> Result<()> {
     task::yield_now().await;
 
     let pending = stream.next().await.ok_or_else(|| eyre!("No timer"))?;
-    let firing = pending.fire().await.ok_or_else(|| eyre!("Not active"))?;
+    let firing = pending
+        .fire(&watch::channel(ShutdownPhase::default()).1)
+        .await
+        .and_then(Fired::into_live)
+        .ok_or_else(|| eyre!("Not active"))?;
 
     // Commit without rescheduling (FIRING → UNSCHEDULED)
     let (_, guard) = firing.into_inner();
@@ -510,7 +549,11 @@ async fn test_abort_rescheduled_stays_scheduled() -> Result<()> {
     task::yield_now().await;
 
     let pending = stream.next().await.ok_or_else(|| eyre!("No timer"))?;
-    let firing = pending.fire().await.ok_or_else(|| eyre!("Not active"))?;
+    let firing = pending
+        .fire(&watch::channel(ShutdownPhase::default()).1)
+        .await
+        .and_then(Fired::into_live)
+        .ok_or_else(|| eyre!("Not active"))?;
     manager.schedule_trigger(trigger.clone()).await?;
 
     // Abort with reschedule (FIRING_RESCHEDULED → SCHEDULED)
@@ -525,7 +568,13 @@ async fn test_abort_rescheduled_stays_scheduled() -> Result<()> {
         .await
         .map_err(|_| eyre!("Timer should fire again after abort"))?
         .ok_or_else(|| eyre!("No second timer"))?;
-    assert!(pending2.fire().await.is_some(), "Second fire should work");
+    assert!(
+        pending2
+            .fire(&watch::channel(ShutdownPhase::default()).1)
+            .await
+            .is_some(),
+        "Second fire should work"
+    );
 
     Ok(())
 }
@@ -548,7 +597,11 @@ async fn test_reschedule_same_time_fires_again() -> Result<()> {
     task::yield_now().await;
 
     let pending1 = stream.next().await.ok_or_else(|| eyre!("First timer"))?;
-    let firing1 = pending1.fire().await.ok_or_else(|| eyre!("First fire"))?;
+    let firing1 = pending1
+        .fire(&watch::channel(ShutdownPhase::default()).1)
+        .await
+        .and_then(Fired::into_live)
+        .ok_or_else(|| eyre!("First fire"))?;
 
     // 3. Reschedule during handler
     manager.schedule_trigger(trigger.clone()).await?;
@@ -567,8 +620,9 @@ async fn test_reschedule_same_time_fires_again() -> Result<()> {
         .ok_or_else(|| eyre!("No second timer"))?;
 
     let firing2 = pending2
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("Second fire not active"))?;
 
     // Verify it's the same timer
@@ -612,7 +666,11 @@ async fn test_unschedule_firing_noop() -> Result<()> {
 
     // Fire the timer (transition to FIRING state)
     let pending = stream.next().await.ok_or_else(|| eyre!("No timer"))?;
-    let firing = pending.fire().await.ok_or_else(|| eyre!("Not active"))?;
+    let firing = pending
+        .fire(&watch::channel(ShutdownPhase::default()).1)
+        .await
+        .and_then(Fired::into_live)
+        .ok_or_else(|| eyre!("Not active"))?;
 
     // Unschedule while firing - should be a no-op (FIRING state)
     let unschedule_result = manager
@@ -672,7 +730,11 @@ async fn test_unschedule_cancels_reschedule() -> Result<()> {
 
     // Fire the timer (transition to FIRING state)
     let pending = stream.next().await.ok_or_else(|| eyre!("No timer"))?;
-    let firing = pending.fire().await.ok_or_else(|| eyre!("Not active"))?;
+    let firing = pending
+        .fire(&watch::channel(ShutdownPhase::default()).1)
+        .await
+        .and_then(Fired::into_live)
+        .ok_or_else(|| eyre!("Not active"))?;
 
     // Reschedule while firing (FIRING → FIRING_RESCHEDULED)
     manager.schedule_trigger(trigger.clone()).await?;
@@ -686,7 +748,7 @@ async fn test_unschedule_cancels_reschedule() -> Result<()> {
         .await;
     assert_eq!(
         state_after_reschedule,
-        Some(TimerState::FiringRescheduled),
+        Some(TimerState::FiringRescheduled(Item::Queued)),
         "Timer should be in FiringRescheduled state"
     );
 
@@ -764,7 +826,11 @@ async fn test_scheduled_times_excludes_firing() -> Result<()> {
     task::yield_now().await;
 
     let pending = stream.next().await.ok_or_else(|| eyre!("No timer"))?;
-    let firing = pending.fire().await.ok_or_else(|| eyre!("Not active"))?;
+    let firing = pending
+        .fire(&watch::channel(ShutdownPhase::default()).1)
+        .await
+        .and_then(Fired::into_live)
+        .ok_or_else(|| eyre!("Not active"))?;
 
     // Verify timer is NOT in scheduled_times while firing
     let times_during = manager
@@ -804,7 +870,11 @@ async fn test_scheduled_times_includes_rescheduled() -> Result<()> {
     task::yield_now().await;
 
     let pending = stream.next().await.ok_or_else(|| eyre!("No timer"))?;
-    let firing = pending.fire().await.ok_or_else(|| eyre!("Not active"))?;
+    let firing = pending
+        .fire(&watch::channel(ShutdownPhase::default()).1)
+        .await
+        .and_then(Fired::into_live)
+        .ok_or_else(|| eyre!("Not active"))?;
 
     // While firing, timer should NOT be in scheduled_times
     let times_firing = manager
@@ -874,8 +944,9 @@ async fn test_fire_scheduled_timer() -> Result<()> {
 
     // Verify fire() returns Some for scheduled timer
     let firing = pending
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("fire() should return Some for scheduled timer"))?;
 
     // Verify the FiringTimer has correct metadata
@@ -920,7 +991,9 @@ async fn test_fire_cancelled_timer() -> Result<()> {
         .await?;
 
     // Verify fire() returns None since timer was cancelled
-    let result = pending.fire().await;
+    let result = pending
+        .fire(&watch::channel(ShutdownPhase::default()).1)
+        .await;
     assert!(
         result.is_none(),
         "fire() should return None for cancelled timer"
@@ -950,8 +1023,9 @@ async fn test_reschedule_abort_fires_again() -> Result<()> {
         .await
         .ok_or_else(|| eyre!("First timer should fire"))?;
     let firing1 = pending1
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("First fire should succeed"))?;
 
     // 3. Reschedule during handler (FIRING → FIRING_RESCHEDULED)
@@ -971,8 +1045,9 @@ async fn test_reschedule_abort_fires_again() -> Result<()> {
         .ok_or_else(|| eyre!("No second timer"))?;
 
     let firing2 = pending2
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("Second fire should succeed"))?;
 
     // 6. Verify it's the same timer
@@ -1016,7 +1091,11 @@ async fn test_abort_firing_preserves_db() -> Result<()> {
         .next()
         .await
         .ok_or_else(|| eyre!("Expected a pending timer"))?;
-    let firing = pending.fire().await.ok_or_else(|| eyre!("Not active"))?;
+    let firing = pending
+        .fire(&watch::channel(ShutdownPhase::default()).1)
+        .await
+        .and_then(Fired::into_live)
+        .ok_or_else(|| eyre!("Not active"))?;
 
     // Verify timer is in Firing state - scheduled_times() excludes Firing timers
     let times_while_firing = manager
@@ -1027,7 +1106,7 @@ async fn test_abort_firing_preserves_db() -> Result<()> {
         "Timer in Firing state should be excluded from scheduled_times()"
     );
 
-    // Abort the timer (transitions to Aborted, DB preserved for recovery)
+    // Abort the timer (transitions to Parked, DB preserved for recovery)
     let (_, guard) = firing.into_inner();
     guard.abort().await;
 
@@ -1039,8 +1118,8 @@ async fn test_abort_firing_preserves_db() -> Result<()> {
         .await;
     assert_eq!(
         state_after_abort,
-        Some(TimerState::Aborted),
-        "Timer should remain active as Aborted after abort"
+        Some(TimerState::Parked),
+        "Timer should remain active as Parked after abort"
     );
 
     // Verify timer is still visible through scheduled_times because its DB
@@ -1080,8 +1159,9 @@ async fn test_clear_and_schedule_firing_same_time() -> Result<()> {
         .await
         .ok_or_else(|| eyre!("Expected pending timer"))?;
     let firing = pending
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("Expected active timer"))?;
     let first_firing_tag = firing.trigger().tag;
 
@@ -1100,6 +1180,7 @@ async fn test_clear_and_schedule_firing_same_time() -> Result<()> {
     let store_tag_before_commit = manager
         .0
         .store
+        .operations()
         .current_tag(&trigger.key, trigger.time, trigger.timer_type)
         .await?
         .ok_or_else(|| eyre!("store tag missing before commit"))?;
@@ -1125,6 +1206,9 @@ async fn test_clear_and_schedule_firing_same_time() -> Result<()> {
     guard.commit().await;
 
     let tag_after_commit = manager
+        .0
+        .store
+        .operations()
         .current_tag(&trigger.key, trigger.time, trigger.timer_type)
         .await?
         .ok_or_else(|| eyre!("tag missing after commit"))?;
@@ -1152,8 +1236,9 @@ async fn test_clear_and_schedule_firing_same_time() -> Result<()> {
         .await?
         .ok_or_else(|| eyre!("Expected timer to fire again after FiringRescheduled commit"))?;
     let firing2 = pending2
-        .fire()
+        .fire(&watch::channel(ShutdownPhase::default()).1)
         .await
+        .and_then(Fired::into_live)
         .ok_or_else(|| eyre!("Second firing not active"))?;
 
     let (refired_trigger, guard2) = firing2.into_inner();
@@ -1168,163 +1253,175 @@ async fn test_clear_and_schedule_firing_same_time() -> Result<()> {
     Ok(())
 }
 
-// =========================================================================
-// prop_tag_rotation: timer tag invariants
-// =========================================================================
-
-/// Inv #6: after `schedule`, `current_tag` returns `Some(_)`.
+/// Traces from property failures. Each one lost a source or fired the wrong
+/// kind.
 #[tokio::test]
-async fn tag_inv6_schedule_gives_tag() -> Result<()> {
+async fn pinned_oracle_traces() -> Result<()> {
+    use ManagerOracleOp::{
+        Abort, DifferentCoordinateClear, Fire, Pop, Receipt, RescheduleSame, Restart, Schedule,
+        Unschedule, UnscheduleAlternate,
+    };
+    for ops in [
+        vec![
+            Schedule,
+            Pop,
+            Fire,
+            DifferentCoordinateClear,
+            Restart,
+            Pop,
+            Fire,
+        ],
+        vec![Schedule, Pop, Fire, Receipt, Restart, Schedule, Pop, Fire],
+        vec![Schedule, Pop, Fire, Schedule, Receipt, Restart, Pop, Fire],
+        vec![Schedule, Pop, Fire, Abort, Fire],
+        vec![
+            Schedule,
+            Pop,
+            Fire,
+            Receipt,
+            Restart,
+            Schedule,
+            DifferentCoordinateClear,
+            Schedule,
+            Pop,
+            Fire,
+        ],
+    ] {
+        run_same_coordinate_oracle_trace(&ManagerOracleTrace { timer_type: 0, ops }).await?;
+        time::resume();
+    }
+    run_same_coordinate_oracle_trace(&ManagerOracleTrace {
+        timer_type: 139,
+        ops: vec![
+            Schedule,
+            Pop,
+            Fire,
+            Receipt,
+            Restart,
+            Receipt,
+            Restart,
+            UnscheduleAlternate,
+            Unschedule,
+            DifferentCoordinateClear,
+            RescheduleSame,
+            Abort,
+            Restart,
+            Pop,
+            Pop,
+            Unschedule,
+        ],
+    })
+    .await?;
+    time::resume();
+    Ok(())
+}
+
+/// A property trace that fires a new tag before the retained source gets its
+/// sweep.
+#[tokio::test]
+async fn delivered_clear_keeps_receipted_source() -> Result<()> {
+    use ManagerOracleOp::{
+        Abort, DifferentCoordinateClear, Fire, Pop, Receipt, RescheduleSame, Restart,
+        SameCoordinateClear, Schedule, Unschedule, UnscheduleAlternate,
+    };
+    run_same_coordinate_oracle_trace(&ManagerOracleTrace {
+        timer_type: 22,
+        ops: vec![
+            Schedule,
+            Pop,
+            Fire,
+            Receipt,
+            Restart,
+            RescheduleSame,
+            UnscheduleAlternate,
+            Abort,
+            Pop,
+            Abort,
+            Unschedule,
+            DifferentCoordinateClear,
+            Abort,
+            RescheduleSame,
+            SameCoordinateClear,
+            Fire,
+            Fire,
+            Abort,
+            Pop,
+            Abort,
+            Schedule,
+            Fire,
+        ],
+    })
+    .await
+}
+
+/// A cancel must remove the pending replacement from the active attempt.
+#[tokio::test]
+async fn pending_cancel_keeps_replacement_absent() -> Result<()> {
+    use ManagerOracleOp::{
+        DifferentCoordinateClear, Fire, Pop, RescheduleSame, Schedule, Unschedule,
+        UnscheduleAlternate,
+    };
+    run_same_coordinate_oracle_trace(&ManagerOracleTrace {
+        timer_type: 0,
+        ops: vec![
+            Schedule,
+            Pop,
+            Fire,
+            UnscheduleAlternate,
+            Schedule,
+            RescheduleSame,
+            Unschedule,
+            Unschedule,
+            Fire,
+            Schedule,
+            DifferentCoordinateClear,
+            UnscheduleAlternate,
+        ],
+    })
+    .await
+}
+
+/// A delivered reschedule must fire as a live attempt after completion.
+#[tokio::test]
+async fn delivered_reschedule_fires_after_commit() -> Result<()> {
     time::pause();
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    let trigger = create_test_trigger("k", 10, TimerType::Application)?;
+    let (_stream, manager, _shutdown) = setup_timer_manager().await?;
+    let trigger = create_test_trigger("delivered-reschedule", 20, TimerType::Application)?;
     manager.schedule_trigger(trigger.clone()).await?;
+    let first = manager
+        .0
+        .scheduler
+        .take_from_queue(trigger.clone())
+        .await?
+        .ok_or_else(|| eyre!("first schedule has no queue item"))?;
+    ensure!(
+        manager.fire(&first).await? == Some(Fire::Live(first.tag)),
+        "first schedule did not fire Live"
+    );
+
+    manager.schedule_trigger(first.clone()).await?;
+    let delivered = manager
+        .0
+        .scheduler
+        .take_from_queue(first.clone())
+        .await?
+        .ok_or_else(|| eyre!("reschedule has no queue item"))?;
+    manager.complete(&first).await?;
     let tag = manager
-        .current_tag(&trigger.key, trigger.time, trigger.timer_type)
-        .await?;
-    assert!(tag.is_some(), "expected Some tag after schedule");
-    Ok(())
-}
-
-/// Inv #7: Scheduled→Firing does NOT rotate the tag.
-#[tokio::test]
-async fn tag_inv7_fire_does_not_rotate() -> Result<()> {
-    time::pause();
-    let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    pin_mut!(stream);
-    let trigger = create_test_trigger("k", 1, TimerType::Application)?;
-    manager.schedule_trigger(trigger.clone()).await?;
-    let tag_before = manager
-        .current_tag(&trigger.key, trigger.time, trigger.timer_type)
-        .await?
-        .ok_or_else(|| eyre!("tag missing before fire"))?;
-
-    advance(Duration::from_secs(2)).await;
-    task::yield_now().await;
-    let pending = stream.next().await.ok_or_else(|| eyre!("no pending"))?;
-    let firing = pending.fire().await.ok_or_else(|| eyre!("not active"))?;
-
-    // Tag must be identical at dispatch.
-    assert_eq!(
-        firing.trigger().tag,
-        tag_before,
-        "inv #7: Scheduled→Firing must not rotate tag"
-    );
-    firing.commit().await;
-    Ok(())
-}
-
-/// Inv #2: complete()-from-FiringRescheduled rotates tag; new != old.
-#[tokio::test]
-async fn tag_inv2_firing_rescheduled_commit_rotates() -> Result<()> {
-    time::pause();
-    let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    pin_mut!(stream);
-    let trigger = create_test_trigger("k", 1, TimerType::Application)?;
-    manager.schedule_trigger(trigger.clone()).await?;
-    let tag_initial = manager
-        .current_tag(&trigger.key, trigger.time, trigger.timer_type)
-        .await?
-        .ok_or_else(|| eyre!("no tag before fire"))?;
-
-    advance(Duration::from_secs(2)).await;
-    task::yield_now().await;
-    let pending = stream.next().await.ok_or_else(|| eyre!("no pending"))?;
-    let firing = pending.fire().await.ok_or_else(|| eyre!("not active"))?;
-
-    // Re-schedule same trigger (Firing → FiringRescheduled).
-    manager.schedule_trigger(trigger.clone()).await?;
-
-    // Commit while FiringRescheduled → must rotate tag.
-    firing.commit().await;
-
-    let tag_after = manager
-        .current_tag(&trigger.key, trigger.time, trigger.timer_type)
-        .await?
-        .ok_or_else(|| eyre!("tag absent after FiringRescheduled commit (row should remain)"))?;
-    assert_ne!(
-        tag_after, tag_initial,
-        "inv #2: complete()-from-FiringRescheduled must rotate tag"
-    );
-    Ok(())
-}
-
-/// Inv #3: `complete()`-from-`Firing` removes the row; `current_tag` →
-/// `None`.
-#[tokio::test]
-async fn tag_inv3_firing_commit_removes_row() -> Result<()> {
-    time::pause();
-    let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    pin_mut!(stream);
-    let trigger = create_test_trigger("k", 1, TimerType::Application)?;
-    manager.schedule_trigger(trigger.clone()).await?;
-
-    advance(Duration::from_secs(2)).await;
-    task::yield_now().await;
-    let pending = stream.next().await.ok_or_else(|| eyre!("no pending"))?;
-    let firing = pending.fire().await.ok_or_else(|| eyre!("not active"))?;
-    firing.commit().await;
-
-    let tag_after = manager
-        .current_tag(&trigger.key, trigger.time, trigger.timer_type)
-        .await?;
-    assert!(
-        tag_after.is_none(),
-        "inv #3: complete()-from-Firing must leave no row (current_tag → None)"
-    );
-    Ok(())
-}
-
-/// Inv #8 (reload parity): after `complete()`-from-`FiringRescheduled`,
-/// the tag persisted in the store equals the tag held in
-/// `ActiveTriggers`, and both equal the rotated post-commit value.
-///
-/// `TimerManager::current_tag` consults `ActiveTriggers` first and only
-/// falls through to the store on miss, so this test bypasses the manager
-/// helper and queries the store directly via the held trigger-lock —
-/// otherwise both reads would hit the in-memory path and a store/memory
-/// divergence would go undetected.
-#[tokio::test]
-async fn tag_inv8_reload_parity() -> Result<()> {
-    time::pause();
-    let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    pin_mut!(stream);
-    let trigger = create_test_trigger("k", 1, TimerType::Application)?;
-    manager.schedule_trigger(trigger.clone()).await?;
-    let tag_initial = manager
-        .current_tag(&trigger.key, trigger.time, trigger.timer_type)
-        .await?
-        .ok_or_else(|| eyre!("no tag before fire"))?;
-
-    advance(Duration::from_secs(2)).await;
-    task::yield_now().await;
-    let pending = stream.next().await.ok_or_else(|| eyre!("no pending"))?;
-    let firing = pending.fire().await.ok_or_else(|| eyre!("not active"))?;
-    manager.schedule_trigger(trigger.clone()).await?; // → FiringRescheduled
-    firing.commit().await; // → rotates tag
-
-    // In-memory path: ActiveTriggers has the new tag.
-    let tag_active = manager
-        .current_tag(&trigger.key, trigger.time, trigger.timer_type)
-        .await?
-        .ok_or_else(|| eyre!("in-memory tag absent"))?;
-
-    // Store path: query the persistent store directly, skipping the
-    // ActiveTriggers cache that `manager.current_tag` consults first.
-    let tag_store = manager
         .0
         .store
-        .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+        .operations()
+        .current_tag(&first.key, first.time, first.timer_type)
         .await?
-        .ok_or_else(|| eyre!("store tag absent"))?;
-
-    assert_eq!(
-        tag_active, tag_store,
-        "inv #8: reload parity — in-memory tag must equal store tag after rotation"
+        .ok_or_else(|| eyre!("reschedule has no key tag"))?;
+    ensure!(
+        tag != delivered.tag,
+        "completion did not rotate the key tag"
     );
-    assert_ne!(
-        tag_store, tag_initial,
-        "inv #8: store tag must reflect the post-commit rotation, not the pre-fire value"
+    let actual = manager.fire(&delivered).await?;
+    ensure!(
+        actual == Some(Fire::Live(tag)),
+        "delivered reschedule must fire Live after commit: actual={actual:?}"
     );
     Ok(())
 }
@@ -1345,223 +1442,524 @@ fn prop_same_coordinate_clear_preserves_timer_oracle_inner(
         Err(error) => return TestResult::error(format!("runtime build failed: {error}")),
     };
 
-    runtime.block_on(async {
-        match run_same_coordinate_oracle_trace(trace).await {
+    runtime.block_on(async move {
+        match run_same_coordinate_oracle_trace(&trace).await {
             Ok(()) => TestResult::passed(),
-            Err(error) => TestResult::error(format!("{error:?}")),
+            Err(error) => TestResult::error(format!("{error:?} trace={trace:?}")),
         }
     })
 }
 
-async fn run_same_coordinate_oracle_trace(trace: ManagerOracleTrace) -> Result<()> {
+async fn run_same_coordinate_oracle_trace(trace: &ManagerOracleTrace) -> Result<()> {
     time::pause();
-
-    let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+    let (stream, mut manager, mut shutdown_tx) = setup_timer_manager().await?;
+    task::spawn(stream.for_each(|_| async {}));
     let key = Key::from("prop-oracle-key");
-    let timer_type = TimerType::Application;
-    let base_time = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
-    let alternate_time = base_time.add_duration(CompactDuration::new(60))?;
+    let timer_type = TimerType::VARIANTS[trace.timer_type % TimerType::VARIANTS.len()];
+    let base_time = CompactDateTime::now()?.add_duration(CompactDuration::new(20))?;
+    let alternate_time = base_time.add_duration(CompactDuration::new(20))?;
+    let mut model = TimerOracleModel::default();
     let mut attempt = None;
+    let mut delivered = None;
 
-    for op in trace.0 {
-        apply_oracle_op(
-            &manager,
-            &key,
-            timer_type,
-            base_time,
-            alternate_time,
-            &mut attempt,
-            op,
-        )
-        .await?;
-        assert_wal_oracle(&manager, &key, timer_type, attempt).await?;
-        assert_active_store_tags_agree(&manager, &key, timer_type, base_time).await?;
-        assert_active_store_tags_agree(&manager, &key, timer_type, alternate_time).await?;
+    for op in trace.ops.iter().copied() {
+        if matches!(op, ManagerOracleOp::Restart) {
+            let store = manager.0.store.operations().clone();
+            shutdown_tx.send_replace(ShutdownPhase::Cancelling);
+            task::yield_now().await;
+            let (stream, restarted, restarted_shutdown) = setup_timer_manager_over(store).await?;
+            task::spawn(stream.for_each(|_| async {}));
+            manager = restarted;
+            shutdown_tx = restarted_shutdown;
+            if model.registry == Some(ModelState::FiringReplaced) {
+                model.alternate = ModelSchedule::Absent;
+            }
+            model.item_tag = model.slab;
+            model.registry = model.slab.map(|_| ModelState::Scheduled(Item::Queued));
+            attempt = None;
+            delivered = None;
+        } else {
+            apply_oracle_op(
+                &manager,
+                &key,
+                timer_type,
+                (base_time, alternate_time),
+                &mut model,
+                (&mut attempt, &mut delivered),
+                op,
+            )
+            .await?;
+        }
+        ensure!(
+            manager
+                .0
+                .store
+                .operations()
+                .current_tag(&key, base_time, timer_type)
+                .await?
+                == model.key,
+            "key tag differs from model after {op:?}"
+        );
+        ensure!(
+            manager
+                .timer_state(&key, base_time, timer_type)
+                .await
+                .map(ModelState::from)
+                == model.registry,
+            "registry differs from model after {op:?}: {model:?}"
+        );
+        let times = manager.scheduled_times(&key, timer_type).await?;
+        ensure!(
+            times.contains(&alternate_time) == (model.alternate == ModelSchedule::Scheduled),
+            "replacement listing differs after {op:?}: {model:?}"
+        );
+        ensure!(
+            !(model.unswept && model.slab.is_none()),
+            "receipted source lost before its sweep after {op:?}: {model:?}"
+        );
     }
-
     Ok(())
 }
 
 async fn apply_oracle_op(
-    manager: &TimerManager<TableAdapter<InMemoryTriggerStore>>,
+    manager: &TimerManager<InMemoryTriggerStore>,
     key: &Key,
     timer_type: TimerType,
-    base_time: CompactDateTime,
-    alternate_time: CompactDateTime,
-    attempt: &mut Option<WalAttempt>,
+    (base_time, alternate_time): (CompactDateTime, CompactDateTime),
+    model: &mut TimerOracleModel,
+    (attempt, delivered): (&mut Option<Trigger>, &mut Option<Trigger>),
     op: ManagerOracleOp,
 ) -> Result<()> {
+    use ManagerOracleOp as Op;
     match op {
-        ManagerOracleOp::Schedule => {
-            manager
-                .schedule(TimerRequest::new(
-                    key.clone(),
-                    base_time,
-                    timer_type,
-                    Span::current(),
-                ))
-                .await?;
+        Op::Schedule | Op::RescheduleSame | Op::SameCoordinateClear => {
+            let request = TimerRequest::new(key.clone(), base_time, timer_type, Span::current());
+            if matches!(op, Op::SameCoordinateClear) {
+                manager.clear_and_schedule(request).await?;
+                model.alternate = ModelSchedule::Absent;
+            } else {
+                manager.schedule(request).await?;
+            }
+            let tag = manager
+                .0
+                .store
+                .operations()
+                .current_tag(key, base_time, timer_type)
+                .await?
+                .ok_or_else(|| eyre!("schedule wrote no key tag"))?;
+            model.schedule(tag)?;
+            let trigger =
+                Trigger::with_tag(key.clone(), base_time, timer_type, tag, Span::current());
+            wait_for_owned(manager, &trigger).await?;
         }
-        ManagerOracleOp::Fire => {
-            if attempt.is_none()
-                && let Some(tag) = manager.fire_with_tag(key, base_time, timer_type).await
-            {
-                *attempt = Some(WalAttempt {
-                    time: base_time,
-                    tag,
-                    committed: false,
-                });
+        Op::Pop => {
+            if matches!(
+                model.registry,
+                Some(
+                    ModelState::Scheduled(Item::Queued)
+                        | ModelState::FiringRescheduled(Item::Queued)
+                )
+            ) {
+                let coordinate = Trigger::new(key.clone(), base_time, timer_type, Span::current());
+                *delivered = manager.0.scheduler.take_from_queue(coordinate).await?;
+                ensure!(
+                    delivered.as_ref().map(|trigger| trigger.tag) == model.item_tag,
+                    "popped tag differs from model: {model:?}"
+                );
+                model.pop()?;
             }
         }
-        ManagerOracleOp::SameCoordinateClear => {
-            let time = attempt
-                .filter(|attempt| !attempt.committed)
-                .map_or(base_time, |attempt| attempt.time);
+        Op::Fire => {
+            if matches!(
+                model.registry,
+                Some(ModelState::Scheduled(Item::Delivered { .. }))
+            ) {
+                *attempt = fire_oracle(manager, delivered.take(), model).await?;
+            }
+        }
+        Op::Receipt | Op::Retire | Op::Commit | Op::Abort => {
+            if let Some(trigger) = attempt.as_ref() {
+                let prior = model.registry;
+                apply_attempt_op(manager, trigger, model, op).await?;
+                if prior == Some(ModelState::FiringReplaced) && matches!(op, Op::Abort) {
+                    model.alternate = ModelSchedule::Absent;
+                }
+                if matches!(prior, Some(ModelState::Firing | ModelState::FiringReplaced))
+                    && matches!(op, Op::Receipt | Op::Commit | Op::Abort)
+                {
+                    check_alternate(manager, key, alternate_time, timer_type, model.alternate)
+                        .await?;
+                }
+                if !matches!(op, Op::Receipt) {
+                    *attempt = None;
+                }
+            }
+        }
+        Op::DifferentCoordinateClear => {
             manager
                 .clear_and_schedule(TimerRequest::new(
                     key.clone(),
-                    time,
+                    alternate_time,
                     timer_type,
                     Span::current(),
                 ))
                 .await?;
+            model.clear();
+            model.alternate = ModelSchedule::Scheduled;
         }
-        ManagerOracleOp::DifferentCoordinateClear => {
-            if !has_uncommitted_attempt(*attempt) {
-                manager
-                    .clear_and_schedule(TimerRequest::new(
-                        key.clone(),
-                        alternate_time,
-                        timer_type,
-                        Span::current(),
-                    ))
-                    .await?;
+        Op::Unschedule => {
+            manager.unschedule(key, base_time, timer_type).await?;
+            model.unschedule();
+        }
+        Op::UnscheduleAlternate => {
+            manager.unschedule(key, alternate_time, timer_type).await?;
+            if model.registry == Some(ModelState::FiringReplaced) {
+                model.registry = Some(ModelState::Firing);
             }
+            model.alternate = ModelSchedule::Absent;
         }
-        ManagerOracleOp::Commit => {
-            if let Some(current) = attempt.as_mut()
-                && !current.committed
-            {
-                manager.complete(key, current.time, timer_type).await?;
-                current.committed = true;
-            }
-        }
-        ManagerOracleOp::Abort => {
-            if let Some(current) = attempt
-                && !current.committed
-            {
-                manager.abort(key, current.time, timer_type).await;
-            }
-        }
+        Op::Restart => {}
     }
-
     Ok(())
 }
 
-async fn assert_wal_oracle(
-    manager: &TimerManager<TableAdapter<InMemoryTriggerStore>>,
+async fn check_alternate(
+    manager: &TimerManager<InMemoryTriggerStore>,
     key: &Key,
+    time: CompactDateTime,
     timer_type: TimerType,
-    attempt: Option<WalAttempt>,
+    expected: ModelSchedule,
 ) -> Result<()> {
-    let Some(attempt) = attempt else {
-        return Ok(());
-    };
-
-    let current_tag = manager
+    let coordinate = Trigger::new(key.clone(), time, timer_type, Span::none());
+    let queued = manager.0.scheduler.take_from_queue(coordinate).await?;
+    let tag = manager
         .0
         .store
-        .current_tag(key, attempt.time, timer_type)
+        .operations()
+        .current_tag(key, time, timer_type)
         .await?;
-    let oracle_committed = match current_tag {
-        None => true,
-        Some(tag) => tag != attempt.tag,
-    };
-
-    assert_eq!(
-        oracle_committed, attempt.committed,
-        "store-only oracle disagreed with WAL model: tag={current_tag:?}, wal={attempt:?}"
-    );
-
-    if !attempt.committed {
-        assert_eq!(
-            current_tag,
-            Some(attempt.tag),
-            "uncommitted WAL tag must remain current until commit"
-        );
+    match expected {
+        ModelSchedule::Absent => ensure!(
+            tag.is_none() && queued.is_none(),
+            "cancel or abort wrote the pending replacement"
+        ),
+        ModelSchedule::Scheduled => {
+            let queued = queued.ok_or_else(|| eyre!("replacement has no queued trigger"))?;
+            ensure!(
+                tag == Some(queued.tag),
+                "replacement tag differs from its queued tag"
+            );
+            manager
+                .0
+                .scheduler
+                .active_triggers()
+                .set_state(key, time, timer_type, TimerState::Scheduled(Item::Queued))
+                .await;
+            manager.0.scheduler.add_to_queue(queued).await?;
+        }
     }
-
     Ok(())
 }
 
-async fn assert_active_store_tags_agree(
-    manager: &TimerManager<TableAdapter<InMemoryTriggerStore>>,
-    key: &Key,
-    timer_type: TimerType,
-    time: CompactDateTime,
+async fn apply_attempt_op(
+    manager: &TimerManager<InMemoryTriggerStore>,
+    trigger: &Trigger,
+    model: &mut TimerOracleModel,
+    op: ManagerOracleOp,
 ) -> Result<()> {
-    let active = manager.0.scheduler.active_triggers();
-    let Some(active_tag) = active.get_tag(key, time, timer_type).await else {
-        return Ok(());
-    };
-
-    let store_tag = manager.0.store.current_tag(key, time, timer_type).await?;
-    assert_eq!(
-        store_tag,
-        Some(active_tag),
-        "active tag and store tag must agree when a timer is active"
-    );
+    use ManagerOracleOp as Op;
+    use ModelState::{Firing, FiringReplaced, FiringRescheduled, Parked, Scheduled};
+    match op {
+        Op::Receipt => manager.receipt(trigger).await?,
+        Op::Retire => manager.retire(trigger).await?,
+        Op::Commit => manager.complete(trigger).await?,
+        Op::Abort => manager.abort(trigger).await,
+        _ => return Ok(()),
+    }
+    match op {
+        Op::Receipt => model.unswept = true,
+        Op::Retire => model.unswept = false,
+        _ => {}
+    }
+    match (op, model.registry) {
+        (Op::Receipt | Op::Retire | Op::Commit, Some(FiringRescheduled(item))) => {
+            let tag = manager
+                .0
+                .store
+                .operations()
+                .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+                .await?
+                .ok_or_else(|| eyre!("rotation wrote no key tag"))?;
+            ensure!(Some(tag) != model.key, "rotation kept the old key tag");
+            model.key = Some(tag);
+            model.item_tag = Some(tag);
+            model.registry = Some(Scheduled(match item {
+                Item::Queued => Item::Queued,
+                Item::Delivered { .. } => Item::Delivered { tag },
+            }));
+        }
+        (Op::Receipt, Some(Firing | FiringReplaced)) => {
+            model.key = None;
+            model.registry = Some(Parked);
+        }
+        (Op::Commit, Some(Firing | FiringReplaced | Parked | Scheduled(_)) | None) => {
+            *model = TimerOracleModel {
+                alternate: model.alternate,
+                ..TimerOracleModel::default()
+            };
+        }
+        (Op::Retire, Some(Firing | Parked) | None) => {
+            model.slab = None;
+            model.registry = None;
+        }
+        (Op::Abort, Some(FiringRescheduled(item))) => model.registry = Some(Scheduled(item)),
+        (Op::Abort, Some(Firing | FiringReplaced | Scheduled(_))) => {
+            model.registry = Some(Parked);
+            model.item_tag = None;
+        }
+        _ => {}
+    }
     Ok(())
 }
 
-fn has_uncommitted_attempt(attempt: Option<WalAttempt>) -> bool {
-    attempt.is_some_and(|attempt| !attempt.committed)
+async fn fire_oracle(
+    manager: &TimerManager<InMemoryTriggerStore>,
+    queued: Option<Trigger>,
+    model: &mut TimerOracleModel,
+) -> Result<Option<Trigger>> {
+    let fire = match queued.as_ref() {
+        Some(trigger) => manager.fire(trigger).await?,
+        None => None,
+    };
+    let expected = match (model.item_tag, model.key) {
+        (None, _) => None,
+        (Some(_), None) => Some(Fire::Committed),
+        (Some(q), Some(k)) if q == k => Some(Fire::Live(k)),
+        (Some(_), Some(k)) => Some(Fire::Unswept(k)),
+    };
+    ensure!(
+        fire == expected,
+        "fire disagreed with tags: expected={expected:?}, actual={fire:?}"
+    );
+    model.item_tag = None;
+    match (fire, queued) {
+        (Some(Fire::Live(tag) | Fire::Unswept(tag)), Some(mut trigger)) => {
+            ensure!(
+                !(model.unswept && fire == Some(Fire::Live(tag))),
+                "live fire skipped an unswept receipt: {model:?}"
+            );
+            model.unswept = false;
+            trigger.tag = tag;
+            model.registry = Some(ModelState::Firing);
+            Ok(Some(trigger))
+        }
+        (Some(Fire::Committed), Some(trigger)) => {
+            manager.retire(&trigger).await?;
+            model.unswept = false;
+            model.slab = None;
+            model.registry = None;
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
 }
 
 #[derive(Clone, Debug)]
-struct ManagerOracleTrace(Vec<ManagerOracleOp>);
+struct ManagerOracleTrace {
+    timer_type: usize,
+    ops: Vec<ManagerOracleOp>,
+}
 
 #[derive(Clone, Copy, Debug)]
 enum ManagerOracleOp {
     Schedule,
+    Pop,
     Fire,
     SameCoordinateClear,
     DifferentCoordinateClear,
+    Unschedule,
+    UnscheduleAlternate,
     Commit,
     Abort,
+    Receipt,
+    Retire,
+    Restart,
+    RescheduleSame,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct WalAttempt {
-    time: CompactDateTime,
-    tag: i32,
-    committed: bool,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelState {
+    Scheduled(Item),
+    Firing,
+    FiringReplaced,
+    FiringRescheduled(Item),
+    Parked,
+}
+
+impl From<TimerState> for ModelState {
+    fn from(state: TimerState) -> Self {
+        match state {
+            TimerState::Scheduled(item) => Self::Scheduled(item),
+            TimerState::Firing => Self::Firing,
+            TimerState::FiringReplaced(_) => Self::FiringReplaced,
+            TimerState::FiringRescheduled(item) => Self::FiringRescheduled(item),
+            TimerState::Parked => Self::Parked,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ModelSchedule {
+    #[default]
+    Absent,
+    Scheduled,
+}
+
+/// The model records row tags and registry state at one coordinate.
+#[derive(Default, Debug)]
+struct TimerOracleModel {
+    alternate: ModelSchedule,
+    slab: Option<i32>,
+    key: Option<i32>,
+    item_tag: Option<i32>,
+    registry: Option<ModelState>,
+    /// A receipt happened and no retire or sweep followed.
+    unswept: bool,
+}
+
+impl TimerOracleModel {
+    fn schedule(&mut self, tag: i32) -> Result<()> {
+        use ModelState::{Firing, FiringReplaced, FiringRescheduled, Parked, Scheduled};
+        if let Some(previous) = self.key {
+            ensure!(tag == previous, "schedule changed the key tag");
+        }
+        self.key = Some(tag);
+        match self.registry {
+            None => {
+                self.slab = Some(tag);
+                self.item_tag = Some(tag);
+                self.registry = Some(Scheduled(Item::Queued));
+            }
+            Some(Parked) => {
+                self.item_tag = Some(tag);
+                self.registry = Some(Scheduled(Item::Queued));
+            }
+            Some(Firing | FiringReplaced) => {
+                self.item_tag = Some(tag);
+                self.registry = Some(FiringRescheduled(Item::Queued));
+            }
+            Some(Scheduled(_) | FiringRescheduled(_)) => {}
+        }
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Result<()> {
+        let tag = self
+            .item_tag
+            .ok_or_else(|| eyre!("scheduled timer has no item tag"))?;
+        let item = Item::Delivered { tag };
+        self.registry = match self.registry {
+            Some(ModelState::Scheduled(_)) => Some(ModelState::Scheduled(item)),
+            Some(ModelState::FiringRescheduled(_)) => Some(ModelState::FiringRescheduled(item)),
+            state => state,
+        };
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        use ModelState::{Firing, FiringReplaced, FiringRescheduled};
+        match self.registry {
+            Some(Firing | FiringRescheduled(_)) => {
+                self.registry = Some(FiringReplaced);
+                self.item_tag = None;
+            }
+            Some(FiringReplaced) => {}
+            _ if self.key.is_some() => self.cancel_queued(),
+            _ => {}
+        }
+    }
+
+    fn unschedule(&mut self) {
+        use ModelState::{Firing, FiringReplaced, FiringRescheduled};
+        match self.registry {
+            Some(FiringRescheduled(_)) => {
+                self.item_tag = None;
+                self.registry = Some(Firing);
+            }
+            Some(Firing | FiringReplaced) => {}
+            _ => self.cancel_queued(),
+        }
+    }
+
+    fn cancel_queued(&mut self) {
+        match (self.item_tag, self.key) {
+            (None, _) => {
+                *self = Self {
+                    alternate: self.alternate,
+                    ..Self::default()
+                }
+            }
+            (Some(q), Some(k)) if q == k => {
+                *self = Self {
+                    alternate: self.alternate,
+                    ..Self::default()
+                }
+            }
+            (Some(_), _) => self.key = None,
+        }
+    }
 }
 
 impl Arbitrary for ManagerOracleTrace {
     fn arbitrary(g: &mut Gen) -> Self {
+        use ManagerOracleOp::{Fire, Pop, Receipt, Restart, Schedule};
+        let prefix: &[ManagerOracleOp] = match u8::arbitrary(g) % 3 {
+            0 => &[],
+            1 => &[Schedule, Pop, Fire],
+            _ => &[Schedule, Pop, Fire, Receipt, Restart],
+        };
         let len = usize::from(u8::arbitrary(g) % 24);
-        let ops = (0..len)
-            .map(|_| match u8::arbitrary(g) % 6 {
-                0 => ManagerOracleOp::Schedule,
-                1 => ManagerOracleOp::Fire,
-                2 => ManagerOracleOp::SameCoordinateClear,
-                3 => ManagerOracleOp::DifferentCoordinateClear,
-                4 => ManagerOracleOp::Commit,
-                _ => ManagerOracleOp::Abort,
-            })
-            .collect();
-        Self(ops)
+        let mut ops = Vec::with_capacity(prefix.len() + len);
+        ops.extend_from_slice(prefix);
+        for _ in 0..len {
+            let op = if matches!(ops.last(), Some(Receipt)) {
+                if bool::arbitrary(g) {
+                    ManagerOracleOp::Retire
+                } else {
+                    Restart
+                }
+            } else {
+                match u8::arbitrary(g) % 13 {
+                    0 => Schedule,
+                    1 => Fire,
+                    2 => ManagerOracleOp::SameCoordinateClear,
+                    3 => ManagerOracleOp::DifferentCoordinateClear,
+                    4 => ManagerOracleOp::Commit,
+                    5 | 7 => ManagerOracleOp::Abort,
+                    6 => Receipt,
+                    8 => Restart,
+                    9 => ManagerOracleOp::Unschedule,
+                    10 => Pop,
+                    11 => ManagerOracleOp::UnscheduleAlternate,
+                    _ => ManagerOracleOp::RescheduleSame,
+                }
+            };
+            ops.push(op);
+        }
+        Self {
+            timer_type: usize::from(u8::arbitrary(g)),
+            ops,
+        }
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         // Strictly shorter prefixes only, so shrinking always terminates.
-        let ops = self.0.clone();
-        Box::new(
-            (0..ops.len())
-                .rev()
-                .map(move |len| Self(ops[..len].to_vec())),
-        )
+        let ops = self.ops.clone();
+        let timer_type = self.timer_type;
+        Box::new((0..ops.len()).rev().map(move |len| Self {
+            timer_type,
+            ops: ops[..len].to_vec(),
+        }))
     }
 }
 
@@ -1639,12 +2037,16 @@ async fn run_crud_trace(trace: CrudTrace) -> Result<()> {
                 model[key_idx].clear();
             }
             CrudOp::Complete => {
-                manager.complete(key, time, timer_type).await?;
+                let trigger = Trigger::new(key.clone(), time, timer_type, Span::current());
+                manager.complete(&trigger).await?;
                 model[key_idx].remove(&time);
             }
             // Abort never removes the durable row (it is preserved for
             // recovery), so `scheduled_times` visibility is unchanged.
-            CrudOp::Abort => manager.abort(key, time, timer_type).await,
+            CrudOp::Abort => {
+                let trigger = Trigger::new(key.clone(), time, timer_type, Span::current());
+                manager.abort(&trigger).await;
+            }
         }
 
         for (idx, key) in keys.iter().enumerate() {

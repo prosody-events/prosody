@@ -15,13 +15,14 @@ use crate::consumer::message::{
 };
 use crate::consumer::middleware::deduplication::{DedupIdentity, dedup_uuid_for_message};
 use crate::consumer::partition::offsets::OffsetTracker;
-use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
+use crate::consumer::{DemandType, EventHandler, Keyed, ReceiptedSource, Uncommitted};
 use crate::loader::MessageLoader;
 use crate::otel::SpanRelation;
 use crate::state::manager::{EventStateScope, PartitionStateManager, SweepResolution};
 use crate::state::session::{EventSession, TerminationWatch};
 use crate::state::{EventRef, TimerEventRef};
 use crate::timers::store::TriggerStore;
+use crate::timers::uncommitted::Fired;
 use crate::timers::{PendingTimer, TimerManager, TimerType, UncommittedTimer};
 use crate::{EventIdentity, EventType, ProcessScope};
 
@@ -136,8 +137,33 @@ async fn process_timer<T, S, M, P>(
     M: PartitionStateManager<Session: EventSession<Loader: MessageLoader<Payload = P>>>,
     P: Send + Sync + 'static,
 {
-    let Some(firing) = timer.fire().await else {
+    let Some(fired) = timer.fire(shutdown_rx).await else {
         return;
+    };
+    let firing = match fired {
+        Fired::Live(firing) => firing,
+        Fired::Unswept(firing) => {
+            match state_manager
+                .resolve_redelivered(firing.key().clone(), timer_manager, shutdown_rx)
+                .await
+            {
+                SweepResolution::Commit(proof) => firing.swept(proof),
+                SweepResolution::Abort => {
+                    firing.abort().await;
+                    return;
+                }
+            }
+        }
+        Fired::Committed(source) => {
+            match state_manager
+                .resolve_redelivered(source.key().clone(), timer_manager, shutdown_rx)
+                .await
+            {
+                SweepResolution::Commit(_) => source.retire().await,
+                SweepResolution::Abort => source.keep().await,
+            }
+            return;
+        }
     };
     firing.set_dispatch_span(timer_spans);
 
@@ -149,7 +175,7 @@ async fn process_timer<T, S, M, P>(
             .recover(trigger.key.clone(), timer_manager, shutdown_rx)
             .await
         {
-            SweepResolution::Commit => commit_guard.commit().await,
+            SweepResolution::Commit(_) => commit_guard.commit().await,
             SweepResolution::Abort => commit_guard.abort().await,
         }
         return;

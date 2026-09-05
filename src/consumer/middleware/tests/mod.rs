@@ -18,24 +18,27 @@ pub mod test_support;
 
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
-use std::future::ready;
+use std::future::{Future, ready};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
 
-use super::settle::{ArmOutcome, arm_backstop};
+use super::settle::arm_backstop;
 use super::*;
-use crate::consumer::EventHandler;
-use crate::consumer::Uncommitted;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::tests::test_support::{
-    MockEventContext, create_test_message, create_test_message_from,
+    MockEventContext, RecordingOracle, create_test_message, create_test_message_from,
+    is_provisional,
 };
 use crate::consumer::partition::offsets::OffsetTracker;
+use crate::consumer::receipted_sealed;
+use crate::consumer::{EventHandler, Receipted, ReceiptedSource, Uncommitted};
 use crate::error::ErrorCategory;
+use crate::state::CollectionId;
+use crate::state::memory::MemoryCellStore;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
@@ -168,7 +171,18 @@ impl FallibleHandler for ProbeHandler {
 struct RecordingGuard {
     committed: Arc<AtomicUsize>,
     aborted: Arc<AtomicUsize>,
+    receipts: Arc<AtomicUsize>,
+    kept: Arc<AtomicUsize>,
+
+    order: Option<GuardOrder>,
 }
+
+type GuardOrder = (
+    MemoryCellStore<RecordingOracle>,
+    CollectionId,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+);
 
 impl RecordingGuard {
     /// A fresh guard and the two counters it records into, in
@@ -180,20 +194,68 @@ impl RecordingGuard {
             Self {
                 committed: committed.clone(),
                 aborted: aborted.clone(),
+                receipts: Arc::default(),
+                kept: Arc::default(),
+
+                order: None,
             },
             committed,
             aborted,
         )
     }
+
+    fn with_order(
+        mut self,
+        store: MemoryCellStore<RecordingOracle>,
+        id: CollectionId,
+        receipt_saw_provisional: Arc<AtomicBool>,
+        commit_saw_resolved: Arc<AtomicBool>,
+    ) -> Self {
+        self.order = Some((store, id, receipt_saw_provisional, commit_saw_resolved));
+        self
+    }
 }
 
 impl Uncommitted for RecordingGuard {
     async fn commit(self) {
+        if let Some((store, id, _, commit_saw_resolved)) = &self.order {
+            let resolved = is_provisional(store, id)
+                .await
+                .is_ok_and(|provisional| !provisional);
+            commit_saw_resolved.store(resolved, Ordering::SeqCst);
+        }
         self.committed.fetch_add(1, Ordering::SeqCst);
     }
 
     async fn abort(self) {
         self.aborted.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl receipted_sealed::Sealed for RecordingGuard {}
+
+impl Receipted for RecordingGuard {
+    type Source = Self;
+
+    async fn receipt(self) -> Self::Source {
+        self.receipts.fetch_add(1, Ordering::SeqCst);
+        if let Some((store, id, receipt_saw_provisional, _)) = &self.order {
+            let provisional = is_provisional(store, id)
+                .await
+                .is_ok_and(|provisional| provisional);
+            receipt_saw_provisional.store(provisional, Ordering::SeqCst);
+        }
+        self
+    }
+}
+
+impl ReceiptedSource for RecordingGuard {
+    async fn retire(self) {
+        self.commit().await;
+    }
+
+    async fn keep(self) {
+        self.kept.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -305,6 +367,10 @@ async fn after_commit_for_timer_path_with_ok_output() {
             let guard = RecordingGuard {
                 committed: self.committed.clone(),
                 aborted: self.aborted.clone(),
+                receipts: Arc::default(),
+                kept: Arc::default(),
+
+                order: None,
             };
             (trigger, guard)
         }
@@ -465,15 +531,9 @@ mod staged_rollback;
 
 mod arm_backstop;
 mod backstop_amortization;
-/// Post-settle hook visibility: `finalize` drains the event's dirty overlay
-/// on success, so the apply hooks read the **lower store** — the per-cell
-/// committed projection, where an own-event provisional cell answers its
-/// committed base `prev` — never the event's pre-settle overlay. One pin per
-/// ruled-on window: the arm-shutdown rollback's `after_abort` reads the
-/// restored committed base; the ambiguous marker-record shutdown's
-/// `after_abort` reads `prev` (staged cells deliberately left provisional);
-/// the `Incomplete`-promote `after_commit` reads the mixed per-cell view
-/// (promoted cells the new values, un-promoted cells `prev`).
+/// Apply hooks read the committed projection after settlement.
+/// Shutdown before the stage preserves the base. An ambiguous marker write
+/// leaves provisional cells. Incomplete promotion exposes each cell's result.
 mod hook_visibility;
 mod marker_record_must_succeed;
 mod settled_view;
