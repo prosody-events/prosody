@@ -22,34 +22,22 @@
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::slab::{Slab, SlabId};
-use crate::timers::{TimerType, Trigger};
 use crate::{Key, Partition, Topic};
 use educe::Educe;
-use futures::Stream;
 use opentelemetry::Context;
 use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
-use std::future::Future;
-use std::ops::RangeInclusive;
 use uuid::Uuid;
 
 /// Cassandra-based persistent storage implementation.
 pub mod cassandra;
 pub mod memory;
 
-/// Internal primitive operations trait.
-///
-/// The trait itself is `pub` to satisfy Rust's visibility rules (used in public
-/// `TableAdapter`), but is not re-exported, keeping it effectively internal.
-pub mod operations;
+mod operations;
+pub use operations::TriggerStore;
 
-/// TableAdapter struct for composing TriggerOperations into TriggerStore.
-///
-/// This module is public to allow returning concrete `TableAdapter<T>` types
-/// from factory functions, but it's not re-exported at the crate root.
-pub mod adapter;
+pub(crate) mod adapter;
 
 /// Selects whether a replacement keeps the old slab row for recovery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -227,231 +215,4 @@ pub trait TriggerStoreProvider: Clone + Send + Sync + 'static {
 
     /// Creates a store scoped to the specified segment (synchronous, no I/O).
     fn create_store(&self, segment: Segment) -> Self::Store;
-}
-
-/// Public trigger storage interface.
-///
-/// Provides both primitive read operations and coordinated write operations
-/// for the V2 schema (with `timer_type` field).
-///
-/// # Implementation Guide
-///
-/// Storage backends can implement this trait in two ways:
-///
-/// 1. **Via `TableAdapter`** (recommended for most backends):
-///    - Implement internal `TriggerOperations` trait (22 primitive methods)
-///    - Wrap in `TableAdapter<T>` which implements `TriggerStore`
-///    - Best-effort consistency using parallel execution
-///
-/// 2. **Direct implementation** (for transactional backends):
-///    - Implement `TriggerStore` directly (13 methods)
-///    - Use database transactions for atomic dual-table operations
-///    - Provides ACID guarantees
-///
-/// # Used By
-///
-/// - `TimerManager` (coordinated writes + key queries)
-/// - Slab Loader (segment management + slab queries)
-pub trait TriggerStore: Clone + Send + Sync + 'static {
-    /// Error type for storage operations.
-    type Error: ClassifyError + Error + Send + Sync + 'static;
-
-    // ===================================================================
-    // Segment Accessors
-    // ===================================================================
-
-    /// Replaces one timer without a gap in its key entry.
-    /// Other coordinates keep their rows. `retain` controls the old slab row.
-    fn replace(
-        &self,
-        old: &Trigger,
-        new: Trigger,
-        retain: RetainOldSlab,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Returns the segment this store is scoped to.
-    fn segment(&self) -> Segment;
-
-    /// Returns the segment ID this store is scoped to.
-    fn segment_id(&self) -> SegmentId;
-
-    /// Returns the slab size for this store's segment.
-    fn slab_size(&self) -> CompactDuration;
-
-    // ===================================================================
-    // Segment Operations (2 methods) - Used by Loader
-    // ===================================================================
-
-    /// Retrieves this store's segment metadata from persistent storage.
-    fn get_segment(&self) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send;
-
-    /// Persists this store's segment metadata.
-    fn insert_segment(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    // ===================================================================
-    // Slab Query Operations (2 methods) - Used by Loader
-    // ===================================================================
-
-    /// Streams slab IDs within a time range for this store's segment.
-    fn get_slab_range(
-        &self,
-        range: RangeInclusive<SlabId>,
-    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send;
-
-    /// Streams all triggers in a slab across all timer types.
-    fn get_slab_triggers_all_types(
-        &self,
-        slab_id: SlabId,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
-
-    // ===================================================================
-    // Slab Metadata Writes (2 methods) - Used by SchedulerActor
-    // ===================================================================
-
-    /// Inserts slab metadata (the `(id, slab_id)` clustering row). Used by
-    /// the scheduler actor when it observes a slab it has not registered yet
-    /// and the slab is above `slab_watermark`. Past-time slabs route through
-    /// [`Self::batch_insert_slab_with_watermark`] instead so the slab row
-    /// and the watermark lower together atomically.
-    fn insert_slab(&self, slab: Slab) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Deletes slab metadata (does not delete triggers).
-    fn delete_slab(&self, slab_id: SlabId) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    // ===================================================================
-    // Slab Watermark Operations (3 methods) - Used by SchedulerActor
-    // ===================================================================
-
-    /// Reads the persisted `slab_watermark` for this segment.
-    ///
-    /// `None` = pre-migration / fresh segment → callers should treat as
-    /// "scan from slab 0". When `Some(w)`, every slab clustering row in this
-    /// segment has `slab_id > w`.
-    fn get_slab_watermark(
-        &self,
-    ) -> impl Future<Output = Result<Option<SlabId>, Self::Error>> + Send;
-
-    /// Persists `slab_watermark` for this segment.
-    fn set_slab_watermark(
-        &self,
-        watermark: Option<SlabId>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Atomically inserts a slab clustering row and lowers
-    /// `slab_watermark` in one UNLOGGED BATCH on the segment partition.
-    fn batch_insert_slab_with_watermark(
-        &self,
-        slab: Slab,
-        watermark: Option<SlabId>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    // ===================================================================
-    // Key Query Operations (2 methods) - Used by TimerManager
-    // ===================================================================
-
-    /// Streams scheduled times for a key and timer type.
-    ///
-    /// Returns only timestamps without full trigger metadata.
-    /// More efficient than `get_key_triggers` when trace context not needed.
-    fn get_key_times(
-        &self,
-        timer_type: TimerType,
-        key: &Key,
-    ) -> impl Stream<Item = Result<(CompactDateTime, i32), Self::Error>> + Send;
-
-    /// Streams full trigger objects for a key and timer type.
-    ///
-    /// Includes all metadata (key, time, `timer_type`, trace context).
-    fn get_key_triggers(
-        &self,
-        timer_type: TimerType,
-        key: &Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
-
-    // ===================================================================
-    // Coordinated Write Operations (3 methods) - Used by TimerManager
-    // ===================================================================
-
-    /// Adds a trigger to both slab and key tables.
-    ///
-    /// Implementations should attempt to keep both tables in sync.
-    /// Transactional backends can provide ACID guarantees.
-    fn add_trigger(&self, trigger: Trigger)
-    -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Write the key row without changing the slab row.
-    fn add_key_row(&self, trigger: Trigger)
-    -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Removes a trigger from both slab and key tables.
-    fn remove_trigger(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Removes a trigger from the key index only.
-    fn remove_key_row(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Removes a trigger from the slab index only.
-    fn remove_slab_row(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Clear the key rows and schedule a new timer.
-    /// Keep each slab row named in `keep`, including the new coordinate.
-    /// A kept new coordinate already has its slab row.
-    ///
-    /// Write the new key row before deleting old slab rows.
-    /// A crash can leave extra slab rows, but it cannot remove the new timer.
-    fn clear_and_schedule(
-        &self,
-        trigger: Trigger,
-        keep: &[CompactDateTime],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    // ===================================================================
-    // Tag Operations (2 methods) - Used by TimerManager commit oracle
-    // ===================================================================
-
-    /// Updates the key row tag. The slab row keeps its original tag.
-    ///
-    /// Requires a key row. Cassandra can write a partial row if the key row is
-    /// absent. A reload uses the slab tag to detect an earlier attempt and
-    /// request a sweep.
-    fn update_tag(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-        new_tag: i32,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Reads the `tag` from a key-index row.
-    ///
-    /// Returns `None` if the row is absent (commit oracle: "committed").
-    /// Returns `Some(0)` for rows with a `NULL` tag (pre-migration rows).
-    ///
-    /// **Contract: the answer must reflect every write performed through
-    /// this store and its clones.** The keyed-state commit oracle holds a
-    /// clone of the partition's writing store (handle passing — see
-    /// `StateBackendFactory::for_partition`),
-    /// so a per-instance cache is fine as long as clones share it; a stale
-    /// answer flips a recovery decision (rolling back a committed write, or
-    /// promoting an abandoned one).
-    fn current_tag(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> impl Future<Output = Result<Option<i32>, Self::Error>> + Send;
 }

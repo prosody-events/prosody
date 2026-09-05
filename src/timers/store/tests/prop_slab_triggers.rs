@@ -11,7 +11,7 @@ use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::operations::TriggerOperations;
+use crate::timers::store::TriggerStore;
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
 use futures::TryStreamExt;
@@ -221,7 +221,7 @@ async fn verify_slab_triggers_by_type<T>(
     op_idx: usize,
 ) -> color_eyre::Result<()>
 where
-    T: TriggerOperations + Send + Sync,
+    T: TriggerStore + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
     let slab_id = slab.id();
@@ -268,7 +268,7 @@ async fn verify_slab_triggers_all_types<T>(
     op_idx: usize,
 ) -> color_eyre::Result<()>
 where
-    T: TriggerOperations + Send + Sync,
+    T: TriggerStore + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
     let slab_id = slab.id();
@@ -301,7 +301,7 @@ async fn verify_final_slab_state<T>(
     slab_size: CompactDuration,
 ) -> color_eyre::Result<()>
 where
-    T: TriggerOperations + Send + Sync,
+    T: TriggerStore + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
     for slab_id in model.all_slab_ids() {
@@ -339,7 +339,7 @@ pub async fn prop_slab_trigger_model_equivalence<T>(
     input: SlabTriggerTestInput,
 ) -> color_eyre::Result<()>
 where
-    T: TriggerOperations + Send + Sync,
+    T: TriggerStore + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
     // Clean up the slabs from any previous trial

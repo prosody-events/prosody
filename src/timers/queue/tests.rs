@@ -65,7 +65,7 @@ async fn test_remove_clears_active_registry() -> Result<()> {
     assert!(triggers.next().await.is_none());
 
     // Re-insert, then let it fire via `next()` — this pops the delay-queue
-    // entry (`queue_keys`) but leaves the `ActiveTriggers` entry Scheduled,
+    // entry (`queue_keys`) and records its delivered location in `ActiveTriggers`,
     // reproducing the "delivered but not yet transitioned to Firing" case
     // `remove`'s doc names as case 2.
     let time = CompactDateTime::now()?.add_duration(CompactDuration::new(5))?;

@@ -8,7 +8,6 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::telemetry::Telemetry;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
 use crate::timers::store::{Segment, SegmentVersion};
 use crate::timers::{
@@ -64,8 +63,8 @@ pub(crate) fn create_test_trigger(
 /// `shutdown_tx` and can send `ShutdownPhase::Cancelling` to stop the
 /// background scheduler actor.
 pub(crate) async fn setup_timer_manager() -> Result<(
-    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
-    TimerManager<TableAdapter<InMemoryTriggerStore>>,
+    impl Stream<Item = PendingTimer<InMemoryTriggerStore>>,
+    TimerManager<InMemoryTriggerStore>,
     watch::Sender<ShutdownPhase>,
 )> {
     setup_timer_manager_at(ShutdownPhase::default()).await
@@ -80,8 +79,8 @@ pub(crate) async fn setup_timer_manager() -> Result<(
 pub(crate) async fn setup_timer_manager_at(
     initial: ShutdownPhase,
 ) -> Result<(
-    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
-    TimerManager<TableAdapter<InMemoryTriggerStore>>,
+    impl Stream<Item = PendingTimer<InMemoryTriggerStore>>,
+    TimerManager<InMemoryTriggerStore>,
     watch::Sender<ShutdownPhase>,
 )> {
     let store = memory_store(test_segment("test-segment", 300_u32));
@@ -90,21 +89,21 @@ pub(crate) async fn setup_timer_manager_at(
 
 /// Builds a timer manager over an existing in-memory store.
 pub(crate) async fn setup_timer_manager_over(
-    store: TableAdapter<InMemoryTriggerStore>,
+    store: InMemoryTriggerStore,
 ) -> Result<(
-    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
-    TimerManager<TableAdapter<InMemoryTriggerStore>>,
+    impl Stream<Item = PendingTimer<InMemoryTriggerStore>>,
+    TimerManager<InMemoryTriggerStore>,
     watch::Sender<ShutdownPhase>,
 )> {
     setup_timer_manager_over_at(store, ShutdownPhase::default()).await
 }
 
 async fn setup_timer_manager_over_at(
-    store: TableAdapter<InMemoryTriggerStore>,
+    store: InMemoryTriggerStore,
     initial: ShutdownPhase,
 ) -> Result<(
-    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
-    TimerManager<TableAdapter<InMemoryTriggerStore>>,
+    impl Stream<Item = PendingTimer<InMemoryTriggerStore>>,
+    TimerManager<InMemoryTriggerStore>,
     watch::Sender<ShutdownPhase>,
 )> {
     let (shutdown_tx, shutdown_rx) = watch::channel(initial);

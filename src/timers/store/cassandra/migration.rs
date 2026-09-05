@@ -50,9 +50,9 @@
 
 use crate::Key;
 use crate::timers::duration::CompactDuration;
-use crate::timers::slab::Slab;
-use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentId, SegmentVersion, SlabId};
+use crate::timers::slab::{Slab, SlabId};
+use crate::timers::store::TriggerStore;
+use crate::timers::store::{Segment, SegmentId, SegmentVersion};
 use crate::timers::{DELETE_CONCURRENCY, TimerType, Trigger};
 
 /// Maximum concurrent slab migrations.

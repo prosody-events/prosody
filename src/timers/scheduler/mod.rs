@@ -76,14 +76,23 @@ pub(super) enum Command<E> {
         trigger: Trigger,
         reply: oneshot::Sender<Option<Trigger>>,
     },
+    /// Deliver a queued trigger for a manual test dispatch.
+    #[cfg(test)]
+    TakeFromQueue {
+        trigger: Trigger,
+        reply: oneshot::Sender<Option<Trigger>>,
+    },
     /// Cancel a live schedule. The reply says whether the queue kept a
     /// retained source.
     Remove {
         trigger: Trigger,
         reply: oneshot::Sender<Kept>,
     },
-    /// Set the queued tag after the store rotates it. No reply.
-    Retag(Trigger),
+    /// Set the item tag, then reply.
+    Retag {
+        trigger: Trigger,
+        reply: oneshot::Sender<()>,
+    },
 }
 
 impl<E> TriggerScheduler<E>
@@ -178,12 +187,9 @@ where
             .map(|_| ())
     }
 
-    /// Set the queued tag after the store rotates it.
+    /// Returns after the actor sets the item tag at its current location.
     pub(crate) async fn retag(&self, trigger: Trigger) -> Result<(), TimerSchedulerError<E>> {
-        self.command_tx
-            .send(Command::Retag(trigger))
-            .await
-            .map_err(|_| TimerSchedulerError::Shutdown)
+        self.ask(|reply| Command::Retag { trigger, reply }).await
     }
 
     /// Remove a queued trigger for a manual test dispatch.
@@ -192,30 +198,18 @@ where
         &self,
         trigger: Trigger,
     ) -> Result<Option<Trigger>, TimerSchedulerError<E>> {
-        self.ask(|reply| Command::RemoveFromQueue { trigger, reply })
+        self.ask(|reply| Command::TakeFromQueue { trigger, reply })
             .await
     }
 
-    /// Transitions a timer from `Scheduled` to `Firing` state.
-    ///
-    /// Returns `true` if the transition succeeded.
+    /// Starts the delivered item's attempt and returns its current tag.
     pub(crate) async fn fire(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> bool {
-        use crate::timers::active::TimerState;
-
-        if let Some(TimerState::Scheduled) =
-            self.active_triggers.get_state(key, time, timer_type).await
-        {
-            self.active_triggers
-                .set_state(key, time, timer_type, TimerState::Firing)
-                .await
-        } else {
-            false
-        }
+    ) -> Option<i32> {
+        self.active_triggers.fire(key, time, timer_type).await
     }
 
     /// Deactivate a trigger without removing it from the persistent queue.

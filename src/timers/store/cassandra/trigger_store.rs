@@ -1,4 +1,4 @@
-//! [`TriggerOperations`] implementation for [`CassandraTriggerStore`].
+//! [`TriggerStore`] implementation for [`CassandraTriggerStore`].
 //!
 //! Each method resolves the current [`TimerState`] (via the cache or a DB
 //! read) before issuing writes, so it can pick the cheapest Cassandra
@@ -29,7 +29,7 @@
 //! topology.
 //!
 //! [`FiringTimer::set_dispatch_span`]: crate::timers::uncommitted::FiringTimer::set_dispatch_span
-//! [`TriggerOperations`]: crate::timers::store::operations::TriggerOperations
+//! [`TriggerStore`]: crate::timers::store::TriggerStore
 //! [`CassandraTriggerStore`]: crate::timers::store::cassandra::CassandraTriggerStore
 //! [`TimerState`]: crate::timers::store::cassandra::TimerState
 
@@ -39,11 +39,11 @@ use crate::cassandra::errors::CassandraStoreError;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
+use crate::timers::store::TriggerStore;
 use crate::timers::store::cassandra::CassandraTriggerStore;
 use crate::timers::store::cassandra::error::CassandraTriggerStoreError;
 use crate::timers::store::cassandra::migration;
 use crate::timers::store::cassandra::state::{ClusteringEntry, InlineTimer, TimerState};
-use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, SegmentVersion};
 use crate::timers::{TimerType, Trigger, TriggerId};
 use async_stream::try_stream;
@@ -63,7 +63,7 @@ use tokio::task::coop::cooperative;
 use tracing::field::Empty;
 use tracing::{Span, instrument};
 
-impl TriggerOperations for CassandraTriggerStore {
+impl TriggerStore for CassandraTriggerStore {
     type Error = CassandraTriggerStoreError;
 
     #[cfg(test)]
@@ -201,12 +201,13 @@ impl TriggerOperations for CassandraTriggerStore {
         let segment_id = self.segment.id;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
 
-        self.execute_with_optional_ttl(
-            slab.range().end,
+        self.execute_unpaged_discard(
             &self.queries().insert_slab,
-            &self.queries().insert_slab_no_ttl,
-            |ttl| (segment_id, slab_id, ttl),
-            || (segment_id, slab_id),
+            (
+                segment_id,
+                slab_id,
+                self.store.calculate_ttl(slab.range().end),
+            ),
         )
         .await
     }
@@ -248,17 +249,18 @@ impl TriggerOperations for CassandraTriggerStore {
         let segment_id = self.segment.id;
         let watermark_i32 = watermark.map(|w| i32::from_le_bytes(w.to_le_bytes()));
 
-        // TTL anchor uses the natural slab end; `calculate_ttl` adds the
-        // configured `base_ttl` grace period (default 1 year), matching the
+        // TTL anchor uses the natural slab end; `CassandraStore::calculate_ttl` adds
+        // the configured `base_ttl` grace period (default 1 year), matching the
         // same lifetime as `insert_slab` and slab triggers.
         let anchor_time = anchor_after_watermark(watermark, self.segment.slab_size);
 
-        self.execute_with_optional_ttl(
-            anchor_time,
+        self.execute_unpaged_discard(
             &self.queries().set_slab_watermark,
-            &self.queries().set_slab_watermark_no_ttl,
-            |ttl| (ttl, watermark_i32, segment_id),
-            || (watermark_i32, segment_id),
+            (
+                self.store.calculate_ttl(anchor_time),
+                watermark_i32,
+                segment_id,
+            ),
         )
         .await
     }
@@ -274,18 +276,16 @@ impl TriggerOperations for CassandraTriggerStore {
         let watermark_i32 = watermark.map(|w| i32::from_le_bytes(w.to_le_bytes()));
 
         // Same anchor as `insert_slab` so the slab row and watermark hint
-        // share a lifetime. `calculate_ttl` adds the configured `base_ttl`
-        // grace period (default 1 year) on top of `slab.range().end` — that
-        // grace is what lets a lagging client process past-time slabs
+        // share a lifetime. `CassandraStore::calculate_ttl` adds the configured
+        // `base_ttl` grace period (default 1 year) on top of `slab.range().end`
+        // — that grace is what lets a lagging client process past-time slabs
         // without finding them already TTL'd out.
         let anchor_time = slab.range().end;
 
-        self.execute_with_optional_ttl(
-            anchor_time,
+        let ttl = self.store.calculate_ttl(anchor_time);
+        self.execute_unpaged_discard(
             &self.queries().batch_insert_slab_with_watermark,
-            &self.queries().batch_insert_slab_with_watermark_no_ttl,
-            |ttl| (segment_id, slab_id, ttl, ttl, watermark_i32, segment_id),
-            || (segment_id, slab_id, watermark_i32, segment_id),
+            (segment_id, slab_id, ttl, ttl, watermark_i32, segment_id),
         )
         .await
     }
@@ -369,20 +369,19 @@ impl TriggerOperations for CassandraTriggerStore {
         let timer_type = trigger.timer_type;
         let tag = trigger.tag;
 
-        self.execute_with_optional_ttl(
-            slab.range().end,
+        self.execute_unpaged_discard(
             &self.queries().insert_slab_trigger,
-            &self.queries().insert_slab_trigger_no_ttl,
-            |ttl| {
-                (
-                    segment_id, slab_size, slab_id, timer_type, key, time, &span_map, tag, ttl,
-                )
-            },
-            || {
-                (
-                    segment_id, slab_size, slab_id, timer_type, key, time, &span_map, tag,
-                )
-            },
+            (
+                segment_id,
+                slab_size,
+                slab_id,
+                timer_type,
+                key,
+                time,
+                &span_map,
+                tag,
+                self.store.calculate_ttl(slab.range().end),
+            ),
         )
         .await
     }
@@ -843,39 +842,21 @@ impl TriggerOperations for CassandraTriggerStore {
                 *state = next;
             }
             TimerState::Overflow(tags) => {
-                self.execute_with_optional_ttl(
-                    new.time,
+                self.execute_unpaged_discard(
                     &self.queries().replace_key_trigger,
-                    &self.queries().replace_key_trigger_no_ttl,
-                    |ttl| {
-                        (
-                            segment_id,
-                            old.key.as_ref(),
-                            old.timer_type,
-                            old.time,
-                            segment_id,
-                            new.key.as_ref(),
-                            new.timer_type,
-                            new.time,
-                            &pending.span_map,
-                            new.tag,
-                            ttl,
-                        )
-                    },
-                    || {
-                        (
-                            segment_id,
-                            old.key.as_ref(),
-                            old.timer_type,
-                            old.time,
-                            segment_id,
-                            new.key.as_ref(),
-                            new.timer_type,
-                            new.time,
-                            &pending.span_map,
-                            new.tag,
-                        )
-                    },
+                    (
+                        segment_id,
+                        old.key.as_ref(),
+                        old.timer_type,
+                        old.time,
+                        segment_id,
+                        new.key.as_ref(),
+                        new.timer_type,
+                        new.time,
+                        &pending.span_map,
+                        new.tag,
+                        self.store.calculate_ttl(new.time),
+                    ),
                 )
                 .await?;
                 tags.remove(old.time);
@@ -1161,31 +1142,17 @@ impl PendingKeyTrigger {
         segment_id: &SegmentId,
     ) -> Result<(), CassandraTriggerStoreError> {
         store
-            .execute_with_optional_ttl(
-                self.id.time,
+            .execute_unpaged_discard(
                 &store.queries().insert_key_trigger_clustering,
-                &store.queries().insert_key_trigger_clustering_no_ttl,
-                |ttl| {
-                    (
-                        segment_id,
-                        self.id.key.as_ref(),
-                        self.id.timer_type,
-                        self.id.time,
-                        &self.span_map,
-                        self.tag,
-                        ttl,
-                    )
-                },
-                || {
-                    (
-                        segment_id,
-                        self.id.key.as_ref(),
-                        self.id.timer_type,
-                        self.id.time,
-                        &self.span_map,
-                        self.tag,
-                    )
-                },
+                (
+                    segment_id,
+                    self.id.key.as_ref(),
+                    self.id.timer_type,
+                    self.id.time,
+                    &self.span_map,
+                    self.tag,
+                    store.store.calculate_ttl(self.id.time),
+                ),
             )
             .await
     }
@@ -1258,9 +1225,9 @@ impl KeyUpsertTransition {
 /// Returns the TTL anchor time for a watermark update.
 ///
 /// Anchors on the natural end of the slab at `watermark + 1`. The actual
-/// TTL is `(anchor - now) + base_ttl` because `calculate_ttl` adds the
-/// configured grace period (default 1 year) — slabs and the watermark hint
-/// deliberately outlive their natural end so a lagging consumer can still
+/// TTL is `(anchor - now) + base_ttl` because `CassandraStore::calculate_ttl`
+/// adds the configured grace period (default 1 year) — slabs and the watermark
+/// hint deliberately outlive their natural end so a lagging consumer can still
 /// process past-time slabs.
 fn anchor_after_watermark(
     watermark: Option<SlabId>,

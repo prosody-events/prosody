@@ -214,10 +214,21 @@ async fn process_command<T>(
         Command::RemoveFromQueue { trigger, reply } => {
             let _ = reply.send(triggers.remove_queue_only(&trigger));
         }
+        #[cfg(test)]
+        Command::TakeFromQueue { trigger, reply } => {
+            let trigger = triggers.remove_queue_only(&trigger);
+            if let Some(trigger) = &trigger {
+                triggers.active_triggers().deliver(trigger).await;
+            }
+            let _ = reply.send(trigger);
+        }
         Command::Remove { trigger, reply } => {
             let _ = reply.send(triggers.remove_if_live(&trigger).await);
         }
-        Command::Retag(trigger) => triggers.retag(&trigger),
+        Command::Retag { trigger, reply } => {
+            triggers.retag(&trigger).await;
+            let _ = reply.send(());
+        }
     }
 }
 
@@ -232,10 +243,9 @@ async fn process_command<T>(
 ///   lowers the watermark (invariant I6) — the only way the actor can pull a
 ///   slab back below its own high-water without violating I1.
 /// - A **pending** slab sits above the load high-water and has never been
-///   touched by the actor. The trigger row (written first by the manager via
-///   [`TriggerStore::add_trigger`]) waits in storage; the actor just persists
-///   slab metadata so `load_step` can find it later. Keeps the in-memory queue
-///   bounded to the preload window.
+///   touched by the actor. The manager writes the trigger row first. The actor
+///   writes slab metadata so `load_step` can find it later. This bounds the
+///   queue to the preload window.
 pub(super) async fn handle_add<T>(
     state: &mut ActorState<T>,
     triggers: &mut TriggerQueue,
@@ -496,14 +506,15 @@ async fn drain_slab_range<T>(
 where
     T: TriggerStore,
 {
-    let store_for_tasks = store.clone();
     let mut stream = pin!(
         store
             .get_slab_range(range)
             .map_ok(move |slab_id| {
-                let store = store_for_tasks.clone();
                 async move {
-                    let triggers = pin!(store.get_slab_triggers_all_types(slab_id));
+                    let triggers = pin!(store.get_slab_triggers_all_types(Slab::new(
+                        slab_id,
+                        store.segment().slab_size
+                    )));
                     let slab_triggers = cooperative(triggers.try_collect::<Vec<_>>()).await?;
                     Ok::<_, T::Error>((slab_id, slab_triggers))
                 }

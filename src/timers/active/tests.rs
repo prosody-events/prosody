@@ -1,13 +1,5 @@
-//! Trace + model property for [`ActiveTriggers`].
-//!
-//! `ActiveTriggers` is a concurrent registry whose only invariants are pure
-//! map/aggregation facts: a read returns the last write, `remove` deletes,
-//! `scan_active_times` visits exactly the live `(time, type)` tuples, and
-//! `snapshot` counts match a fold over the contents. The timer *state machine*
-//! (schedule/fire/commit/abort) is not implemented here — it lives in the
-//! scheduler and is proven by `prop_scheduler_invariants`. So this suite drives
-//! the registry and a plain `HashMap` model through a random op sequence and
-//! asserts equivalence after every op.
+//! Registry reads and counts must agree with a plain map.
+//! The fixed trace checks delivery between the state read and completion.
 
 use super::*;
 use crate::Key;
@@ -81,10 +73,10 @@ impl Arbitrary for Op {
             CompactDateTime::from(TIME_POOL[usize::from(u8::arbitrary(g)) % TIME_POOL.len()]);
         let ty = TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
         let states = [
-            TimerState::Scheduled,
+            TimerState::Scheduled(Item::Queued),
             TimerState::Firing,
             TimerState::FiringReplaced(Trigger::new(key.clone(), time, ty, Span::none())),
-            TimerState::FiringRescheduled,
+            TimerState::FiringRescheduled(Item::Queued),
             TimerState::Parked,
         ];
         match u8::arbitrary(g) % 3 {
@@ -135,7 +127,7 @@ async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
             active.is_scheduled(key, *time, *ty).await,
             entry.is_some_and(|e| matches!(
                 e.state,
-                TimerState::Scheduled | TimerState::FiringRescheduled
+                TimerState::Scheduled(_) | TimerState::FiringRescheduled(_)
             ))
         );
     }
@@ -159,7 +151,7 @@ async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
         count = count.saturating_add(1);
         if matches!(
             entry.state,
-            TimerState::Firing | TimerState::FiringReplaced(_) | TimerState::FiringRescheduled
+            TimerState::Firing | TimerState::FiringReplaced(_) | TimerState::FiringRescheduled(_)
         ) {
             in_flight = in_flight.saturating_add(1);
         }
@@ -201,7 +193,7 @@ async fn run_trace(trace: Trace) {
                     .insert(Trigger::new(key.clone(), time, ty, Span::current()))
                     .await;
                 model.entry((key, time, ty)).or_insert(ActiveTriggerEntry {
-                    state: TimerState::Scheduled,
+                    state: TimerState::Scheduled(Item::Queued),
                 });
             }
             Op::Remove { key, time, ty } => {
@@ -230,14 +222,66 @@ async fn run_trace(trace: Trace) {
     }
 }
 
-/// The registry tracks a plain `HashMap` model op-for-op across
-/// Insert/Remove/SetState/SetTag, and every reader (`get_state`, `get_tag`,
-/// `contains`, `is_scheduled`, `scan_active_times`, `snapshot`) agrees after
-/// every op.
+/// Registry reads and counts agree with a map after each insert, remove, or
+/// state change.
 #[test]
 fn prop_active_triggers_track_model() {
     fn property(trace: Trace) {
         executor::block_on(run_trace(trace));
     }
     QuickCheck::new().quickcheck(property as fn(Trace));
+}
+
+/// Completion must keep an item delivered after the transition's state read.
+#[tokio::test]
+async fn completion_keeps_item_delivered_after_state_read() -> color_eyre::Result<()> {
+    use color_eyre::eyre::ensure;
+
+    let active = ActiveTriggers::default();
+    let trigger = Trigger::with_tag(
+        Key::from("delivery-race"),
+        CompactDateTime::from(NOW),
+        TimerType::Application,
+        42,
+        Span::none(),
+    );
+    active.insert(trigger.clone()).await;
+    ensure!(
+        active
+            .set_state(
+                &trigger.key,
+                trigger.time,
+                trigger.timer_type,
+                TimerState::FiringRescheduled(Item::Queued)
+            )
+            .await
+    );
+
+    let prior = active
+        .get_state(&trigger.key, trigger.time, trigger.timer_type)
+        .await;
+    active.deliver(&trigger).await;
+    let (_, after) = transition(prior.as_ref(), TimerOp::Complete).phases();
+    match after.next {
+        Next::Keep => {}
+        Next::Idle => {
+            active
+                .idle(&trigger.key, trigger.time, trigger.timer_type)
+                .await;
+        }
+        Next::To(state) => {
+            active
+                .set_state(&trigger.key, trigger.time, trigger.timer_type, state)
+                .await;
+        }
+    }
+
+    let actual = active
+        .fire(&trigger.key, trigger.time, trigger.timer_type)
+        .await;
+    ensure!(
+        actual == Some(trigger.tag),
+        "completion lost the delivered item: actual={actual:?}"
+    );
+    Ok(())
 }

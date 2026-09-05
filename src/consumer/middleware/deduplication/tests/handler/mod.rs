@@ -148,6 +148,10 @@ struct LookupStore(Result<Presence, TestError>);
 impl DeduplicationStore for LookupStore {
     type Error = TestError;
 
+    async fn recorded(&self, id: Uuid) -> Result<bool, Self::Error> {
+        Ok(!matches!(self.lookup(id).await?, Presence::Absent))
+    }
+
     fn lookup(&self, _id: Uuid) -> impl Future<Output = Result<Presence, Self::Error>> {
         ready(self.0.clone())
     }

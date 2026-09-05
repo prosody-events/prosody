@@ -1,7 +1,7 @@
 //! Cassandra-backed deduplication store.
 
 use super::queries::DeduplicationQueries;
-use super::store::{DeduplicationStore, DeduplicationStoreProvider, Presence};
+use super::store::{DeduplicationStore, DeduplicationStoreProvider, Marker, Presence};
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::{Partition, Topic};
@@ -18,41 +18,40 @@ pub struct CassandraDeduplicationStore {
     store: CassandraStore,
     queries: Arc<DeduplicationQueries>,
     ttl: i32,
-    cache: Arc<Cache<Uuid, Instant>>,
+    cache: Arc<Cache<Uuid, Marker>>,
     acquired: Instant,
 }
 
 impl DeduplicationStore for CassandraDeduplicationStore {
     type Error = CassandraStoreError;
 
+    async fn recorded(&self, id: Uuid) -> Result<bool, Self::Error> {
+        if self.cache.get(&id).is_some() {
+            return Ok(true);
+        }
+        let recorded = self.read_marker(id).await?;
+        if recorded {
+            self.cache.insert(id, Marker::Recorded);
+        }
+        Ok(recorded)
+    }
+
     async fn lookup(&self, id: Uuid) -> Result<Presence, Self::Error> {
-        if let Some(stamp) = self.cache.get(&id) {
-            return Ok(if stamp >= self.acquired {
-                Presence::Settled
-            } else {
-                self.cache.insert(id, Instant::now());
-                Presence::Inherited
-            });
+        match self.cache.get(&id) {
+            Some(Marker::Observed(stamp)) if stamp >= self.acquired => Ok(Presence::Settled),
+            Some(Marker::Recorded | Marker::Observed(_)) => {
+                self.cache.insert(id, Marker::Observed(Instant::now()));
+                Ok(Presence::Inherited)
+            }
+            None => {
+                if self.read_marker(id).await? {
+                    self.cache.insert(id, Marker::Observed(Instant::now()));
+                    Ok(Presence::Inherited)
+                } else {
+                    Ok(Presence::Absent)
+                }
+            }
         }
-        let result = self
-            .store
-            .session()
-            .execute_unpaged(&self.queries.check_exists, (id,))
-            .await?;
-
-        let has_rows = result
-            .into_rows_result()?
-            .maybe_first_row::<(Uuid,)>()?
-            .is_some();
-
-        if has_rows {
-            self.cache.insert(id, Instant::now());
-        }
-        Ok(if has_rows {
-            Presence::Inherited
-        } else {
-            Presence::Absent
-        })
     }
 
     async fn insert(&self, id: Uuid) -> Result<(), Self::Error> {
@@ -60,8 +59,21 @@ impl DeduplicationStore for CassandraDeduplicationStore {
             .session()
             .execute_unpaged(&self.queries.insert_with_ttl, (id, self.ttl))
             .await?;
-        self.cache.insert(id, Instant::now());
+        self.cache.insert(id, Marker::Observed(Instant::now()));
         Ok(())
+    }
+}
+
+impl CassandraDeduplicationStore {
+    async fn read_marker(&self, id: Uuid) -> Result<bool, CassandraStoreError> {
+        Ok(self
+            .store
+            .session()
+            .execute_unpaged(&self.queries.check_exists, (id,))
+            .await?
+            .into_rows_result()?
+            .maybe_first_row::<(Uuid,)>()?
+            .is_some())
     }
 }
 
@@ -71,7 +83,7 @@ pub struct CassandraDeduplicationStoreProvider {
     store: CassandraStore,
     queries: Arc<DeduplicationQueries>,
     ttl: i32,
-    cache: Arc<Cache<Uuid, Instant>>,
+    cache: Arc<Cache<Uuid, Marker>>,
 }
 
 impl CassandraDeduplicationStoreProvider {

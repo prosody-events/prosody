@@ -8,9 +8,11 @@ use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
+use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::{Segment, SegmentId, SegmentVersion, TriggerStore};
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
+use color_eyre::eyre::eyre;
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen};
 use std::collections::{BTreeSet, HashSet};
@@ -780,7 +782,7 @@ impl HighLevelModel {
 
 /// Verifies `get_slab_triggers_all_types` query against model.
 async fn verify_slab_triggers_all_types<S>(
-    store: &S,
+    store: &TableAdapter<S>,
     model: &HighLevelModel,
     segment_id: SegmentId,
     slab_id: SlabId,
@@ -800,12 +802,11 @@ where
     }
 
     let actual: Vec<Trigger> = store
-        .get_slab_triggers_all_types(slab_id)
+        .operations()
+        .get_slab_triggers_all_types(Slab::new(slab_id, store.operations().segment().slab_size))
         .try_collect()
         .await
-        .map_err(|e| {
-            color_eyre::eyre::eyre!("Op #{op_idx} GetSlabTriggersAllTypes failed: {e:?}")
-        })?;
+        .map_err(|e| eyre!("Op #{op_idx} GetSlabTriggersAllTypes failed: {e:?}"))?;
 
     let actual_tuples: BTreeSet<TriggerTuple> = actual
         .iter()
@@ -813,7 +814,7 @@ where
         .collect();
 
     if expected != actual_tuples {
-        return Err(color_eyre::eyre::eyre!(
+        return Err(eyre!(
             "Op #{op_idx} GetSlabTriggersAllTypes mismatch: expected {expected:?}, got \
              {actual_tuples:?}"
         ));
@@ -821,13 +822,10 @@ where
 
     for trigger in &actual {
         let key_tag = store
+            .operations()
             .current_tag(&trigger.key, trigger.time, trigger.timer_type)
             .await
-            .map_err(|e| {
-                color_eyre::eyre::eyre!(
-                    "Op #{op_idx} GetSlabTriggersAllTypes current_tag failed: {e:?}"
-                )
-            })?;
+            .map_err(|e| eyre!("Op #{op_idx} GetSlabTriggersAllTypes current_tag failed: {e:?}"))?;
         let coordinate = (
             segment_id,
             trigger.key.clone(),
@@ -849,7 +847,7 @@ where
 
 /// Verifies `get_key_times` query against model.
 async fn verify_key_times<S>(
-    store: &S,
+    store: &TableAdapter<S>,
     model: &HighLevelModel,
     segment_id: &SegmentId,
     timer_type: TimerType,
@@ -867,14 +865,15 @@ where
         .collect();
 
     let actual_set: BTreeSet<CompactDateTime> = store
+        .operations()
         .get_key_times(timer_type, key)
         .map_ok(|(time, _)| time)
         .try_collect()
         .await
-        .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetKeyTimes failed: {e:?}"))?;
+        .map_err(|e| eyre!("Op #{op_idx} GetKeyTimes failed: {e:?}"))?;
 
     if expected != actual_set {
-        return Err(color_eyre::eyre::eyre!(
+        return Err(eyre!(
             "Op #{op_idx} GetKeyTimes mismatch: expected {expected:?}, got {actual_set:?}"
         ));
     }
@@ -883,7 +882,7 @@ where
 
 /// Verifies `get_key_triggers` query against model.
 async fn verify_key_triggers<S>(
-    store: &S,
+    store: &TableAdapter<S>,
     model: &HighLevelModel,
     segment_id: &SegmentId,
     timer_type: TimerType,
@@ -900,10 +899,11 @@ where
         .collect();
 
     let actual: Vec<Trigger> = store
+        .operations()
         .get_key_triggers(timer_type, key)
         .try_collect()
         .await
-        .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetKeyTriggers failed: {e:?}"))?;
+        .map_err(|e| eyre!("Op #{op_idx} GetKeyTriggers failed: {e:?}"))?;
 
     let actual_tuples: BTreeSet<TriggerTuple> = actual
         .iter()
@@ -911,14 +911,14 @@ where
         .collect();
 
     if expected != actual_tuples {
-        return Err(color_eyre::eyre::eyre!(
+        return Err(eyre!(
             "Op #{op_idx} GetKeyTriggers mismatch: expected {expected:?}, got {actual_tuples:?}"
         ));
     }
 
     for trigger in &actual {
         let Some(expected_tag) = model_tag_for_trigger(model, *segment_id, trigger) else {
-            return Err(color_eyre::eyre::eyre!(
+            return Err(eyre!(
                 "Op #{op_idx} GetKeyTriggers returned unmodeled trigger: key={:?} time={:?} \
                  type={:?}",
                 trigger.key,
@@ -927,7 +927,7 @@ where
             ));
         };
         if trigger.tag != expected_tag {
-            return Err(color_eyre::eyre::eyre!(
+            return Err(eyre!(
                 "Op #{op_idx} GetKeyTriggers tag mismatch: key={:?} time={:?} type={:?} expected \
                  {expected_tag:?}, got {:?}",
                 trigger.key,
@@ -942,7 +942,7 @@ where
 
 /// Verifies `get_slab_range` query against model.
 async fn verify_slab_range<S>(
-    store: &S,
+    store: &TableAdapter<S>,
     model: &HighLevelModel,
     segment_id: &SegmentId,
     range: &RangeInclusive<SlabId>,
@@ -962,13 +962,14 @@ where
         .collect();
 
     let actual_set: BTreeSet<SlabId> = store
+        .operations()
         .get_slab_range(range.clone())
         .try_collect()
         .await
-        .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetSlabRange failed: {e:?}"))?;
+        .map_err(|e| eyre!("Op #{op_idx} GetSlabRange failed: {e:?}"))?;
 
     if expected != actual_set {
-        return Err(color_eyre::eyre::eyre!(
+        return Err(eyre!(
             "Op #{op_idx} GetSlabRange mismatch: expected {expected:?}, got {actual_set:?}"
         ));
     }
@@ -977,7 +978,7 @@ where
 
 /// Verifies `current_tag` against the model's tag index.
 async fn verify_current_tag<S>(
-    store: &S,
+    store: &TableAdapter<S>,
     model: &HighLevelModel,
     segment: &Segment,
     key: &Key,
@@ -991,12 +992,13 @@ where
 {
     let expected = model.get_tag(segment.id, key, timer_type, time);
     let actual = store
+        .operations()
         .current_tag(key, time, timer_type)
         .await
-        .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} CurrentTag failed: {e:?}"))?;
+        .map_err(|e| eyre!("Op #{op_idx} CurrentTag failed: {e:?}"))?;
 
     if expected != actual {
-        return Err(color_eyre::eyre::eyre!(
+        return Err(eyre!(
             "Op #{op_idx} CurrentTag mismatch key={key} time={time:?} type={timer_type:?}: \
              model={expected:?}, store={actual:?}"
         ));
@@ -1006,7 +1008,7 @@ where
 
 /// Applies high-level operations with inline verification.
 async fn apply_high_level_operations<S>(
-    store: &S,
+    store: &TableAdapter<S>,
     model: &mut HighLevelModel,
     segment_id: SegmentId,
     operations: &[HighLevelOperation],
@@ -1031,9 +1033,7 @@ where
                 store
                     .remove_trigger(key, *time, *timer_type)
                     .await
-                    .map_err(|e| {
-                        color_eyre::eyre::eyre!("Op #{op_idx} RemoveTrigger failed: {e:?}")
-                    })?;
+                    .map_err(|e| eyre!("Op #{op_idx} RemoveTrigger failed: {e:?}"))?;
             }
             HighLevelOperation::DeleteSlab { slab_id, .. } => {
                 model.apply(op);
@@ -1044,9 +1044,7 @@ where
                 store
                     .clear_and_schedule(new_trigger.clone(), &[])
                     .await
-                    .map_err(|e| {
-                        color_eyre::eyre::eyre!("Op #{op_idx} ClearAndSchedule failed: {e:?}")
-                    })?;
+                    .map_err(|e| eyre!("Op #{op_idx} ClearAndSchedule failed: {e:?}"))?;
             }
             HighLevelOperation::GetSlabTriggersAllTypes { slab_id } => {
                 verify_slab_triggers_all_types(store, model, segment_id, *slab_id, op_idx).await?;
@@ -1077,9 +1075,10 @@ where
             } => {
                 model.apply(op);
                 store
+                    .operations()
                     .update_tag(key, *time, *timer_type, *new_tag)
                     .await
-                    .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} UpdateTag failed: {e:?}"))?;
+                    .map_err(|e| eyre!("Op #{op_idx} UpdateTag failed: {e:?}"))?;
             }
             HighLevelOperation::CurrentTag {
                 segment,
@@ -1094,18 +1093,14 @@ where
                 store
                     .remove_key_row(&trigger.key, trigger.time, trigger.timer_type)
                     .await
-                    .map_err(|e| {
-                        color_eyre::eyre::eyre!("Op #{op_idx} RemoveKeyRow failed: {e:?}")
-                    })?;
+                    .map_err(|e| eyre!("Op #{op_idx} RemoveKeyRow failed: {e:?}"))?;
             }
             HighLevelOperation::RemoveSlabRow { trigger, .. } => {
                 model.apply(op);
                 store
                     .remove_slab_row(&trigger.key, trigger.time, trigger.timer_type)
                     .await
-                    .map_err(|e| {
-                        color_eyre::eyre::eyre!("Op #{op_idx} RemoveSlabRow failed: {e:?}")
-                    })?;
+                    .map_err(|e| eyre!("Op #{op_idx} RemoveSlabRow failed: {e:?}"))?;
             }
         }
 
@@ -1116,7 +1111,11 @@ where
     Ok(())
 }
 
-async fn apply_add<S>(store: &S, trigger: &Trigger, op_idx: usize) -> color_eyre::Result<()>
+async fn apply_add<S>(
+    store: &TableAdapter<S>,
+    trigger: &Trigger,
+    op_idx: usize,
+) -> color_eyre::Result<()>
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
@@ -1124,18 +1123,23 @@ where
     store
         .add_trigger(trigger.clone())
         .await
-        .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} AddTrigger failed: {e:?}"))
+        .map_err(|e| eyre!("Op #{op_idx} AddTrigger failed: {e:?}"))
 }
 
-async fn apply_delete_slab<S>(store: &S, slab: SlabId, op_idx: usize) -> color_eyre::Result<()>
+async fn apply_delete_slab<S>(
+    store: &TableAdapter<S>,
+    slab: SlabId,
+    op_idx: usize,
+) -> color_eyre::Result<()>
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
     store
+        .operations()
         .delete_slab(slab)
         .await
-        .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} DeleteSlab failed: {e:?}"))
+        .map_err(|e| eyre!("Op #{op_idx} DeleteSlab failed: {e:?}"))
 }
 
 fn mutates_store(op: &HighLevelOperation) -> bool {
@@ -1152,7 +1156,7 @@ fn mutates_store(op: &HighLevelOperation) -> bool {
 }
 
 async fn verify_mutation<S>(
-    store: &S,
+    store: &TableAdapter<S>,
     model: &HighLevelModel,
     operations: &[HighLevelOperation],
     op_idx: usize,
@@ -1164,7 +1168,7 @@ where
     verify_dual_index_consistency(store, model)
         .await
         .map_err(|e| {
-            color_eyre::eyre::eyre!(
+            eyre!(
                 "Op #{op_idx} consistency check: {e}\nops={:?}",
                 &operations[..=op_idx]
             )
@@ -1172,7 +1176,10 @@ where
 }
 
 /// Cleans up all test data using only public `TriggerStore` API.
-async fn cleanup_test_data<S>(store: &S, model: &HighLevelModel) -> color_eyre::Result<()>
+async fn cleanup_test_data<S>(
+    store: &TableAdapter<S>,
+    model: &HighLevelModel,
+) -> color_eyre::Result<()>
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
@@ -1184,7 +1191,7 @@ where
             .remove_trigger(&key, time, timer_type)
             .await
             .map_err(|e| {
-                color_eyre::eyre::eyre!(
+                eyre!(
                     "cleanup remove_trigger failed: segment={segment_id:?} key={key:?} \
                      time={time:?} type={timer_type:?}: {e:?}"
                 )
@@ -1195,11 +1202,16 @@ where
     let mut deleted_slabs = HashSet::new();
     for (segment_id, slab_id, _timer_type) in model.slab_index.keys() {
         if deleted_slabs.insert(*slab_id) {
-            store.delete_slab(*slab_id).await.map_err(|e| {
-                color_eyre::eyre::eyre!(
-                    "cleanup delete_slab failed: segment={segment_id:?} slab={slab_id:?}: {e:?}"
-                )
-            })?;
+            store
+                .operations()
+                .delete_slab(*slab_id)
+                .await
+                .map_err(|e| {
+                    eyre!(
+                        "cleanup delete_slab failed: segment={segment_id:?} slab={slab_id:?}: \
+                         {e:?}"
+                    )
+                })?;
         }
     }
 
@@ -1212,7 +1224,7 @@ where
 /// This is the critical verification that high-level operations maintain
 /// consistency across both indices.
 async fn collect_slab_trigger_set<S>(
-    store: &S,
+    store: &TableAdapter<S>,
     model: &HighLevelModel,
 ) -> color_eyre::Result<HashSet<StoreTriggerTuple>>
 where
@@ -1228,12 +1240,14 @@ where
         }
 
         let triggers: Vec<Trigger> = store
-            .get_slab_triggers_all_types(*slab_id)
+            .operations()
+            .get_slab_triggers_all_types(Slab::new(
+                *slab_id,
+                store.operations().segment().slab_size,
+            ))
             .try_collect()
             .await
-            .map_err(|e| {
-                color_eyre::eyre::eyre!("Failed to get slab triggers for consistency check: {e:?}")
-            })?;
+            .map_err(|e| eyre!("Failed to get slab triggers for consistency check: {e:?}"))?;
 
         for trigger in triggers {
             slab_triggers.insert((
@@ -1249,7 +1263,7 @@ where
 }
 
 async fn collect_key_trigger_set<S>(
-    store: &S,
+    store: &TableAdapter<S>,
     model: &HighLevelModel,
 ) -> color_eyre::Result<HashSet<StoreTriggerTuple>>
 where
@@ -1259,12 +1273,11 @@ where
     let mut key_triggers = HashSet::new();
     for (segment_id, key, timer_type) in model.key_index.keys() {
         let triggers: Vec<Trigger> = store
+            .operations()
             .get_key_triggers(*timer_type, key)
             .try_collect()
             .await
-            .map_err(|e| {
-                color_eyre::eyre::eyre!("Failed to get key triggers for consistency check: {e:?}")
-            })?;
+            .map_err(|e| eyre!("Failed to get key triggers for consistency check: {e:?}"))?;
 
         for trigger in triggers {
             key_triggers.insert((
@@ -1309,51 +1322,48 @@ fn verify_trigger_sets(
         let store_only: Vec<_> = slab_triggers.difference(model_slab).collect();
         let model_only: Vec<_> = model_slab.difference(slab_triggers).collect();
 
-        return Err(color_eyre::eyre::eyre!(
+        return Err(eyre!(
             "Store does not match model!\nTriggers in store but not model: \
              {store_only:?}\nTriggers in model but not store: {model_only:?}"
         ));
     }
 
     if key_triggers != model_key {
-        return Err(color_eyre::eyre::eyre!(
-            "Key index does not match its model"
-        ));
+        return Err(eyre!("Key index does not match its model"));
     }
 
     Ok(())
 }
 
-async fn verify_tag_consistency<S>(store: &S, model: &HighLevelModel) -> color_eyre::Result<()>
+async fn verify_tag_consistency<S>(
+    store: &TableAdapter<S>,
+    model: &HighLevelModel,
+) -> color_eyre::Result<()>
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
     for ((segment_id, key, timer_type, time), expected_tag) in &model.tag_index {
         let current_tag = store
+            .operations()
             .current_tag(key, *time, *timer_type)
             .await
-            .map_err(|e| {
-                color_eyre::eyre::eyre!(
-                    "Failed to read current_tag during consistency check: {e:?}"
-                )
-            })?;
+            .map_err(|e| eyre!("Failed to read current_tag during consistency check: {e:?}"))?;
 
         if current_tag != Some(*expected_tag) {
-            return Err(color_eyre::eyre::eyre!(
+            return Err(eyre!(
                 "Key-index current_tag mismatch: key={key:?} time={time:?} type={timer_type:?} \
                  expected Some({expected_tag}), got {current_tag:?}"
             ));
         }
 
         let key_triggers: Vec<Trigger> = store
+            .operations()
             .get_key_triggers(*timer_type, key)
             .try_collect()
             .await
             .map_err(|e| {
-                color_eyre::eyre::eyre!(
-                    "Failed to read key triggers during tag consistency check: {e:?}"
-                )
+                eyre!("Failed to read key triggers during tag consistency check: {e:?}")
             })?;
         let key_tag = key_triggers
             .iter()
@@ -1361,21 +1371,20 @@ where
             .map(|t| t.tag);
 
         if key_tag != Some(*expected_tag) {
-            return Err(color_eyre::eyre::eyre!(
+            return Err(eyre!(
                 "Key-index trigger tag mismatch: segment={segment_id} key={key:?} time={time:?} \
                  type={timer_type:?} expected Some({expected_tag}), got {key_tag:?}"
             ));
         }
 
-        let slab_id = Slab::from_time(store.slab_size(), *time).id();
+        let slab_id = Slab::from_time(store.operations().segment().slab_size, *time).id();
         let slab_tags: Vec<Trigger> = store
-            .get_slab_triggers_all_types(slab_id)
+            .operations()
+            .get_slab_triggers_all_types(Slab::new(slab_id, store.operations().segment().slab_size))
             .try_collect()
             .await
             .map_err(|e| {
-                color_eyre::eyre::eyre!(
-                    "Failed to read slab triggers during tag consistency check: {e:?}"
-                )
+                eyre!("Failed to read slab triggers during tag consistency check: {e:?}")
             })?;
         let slab_tag = slab_tags
             .iter()
@@ -1387,7 +1396,7 @@ where
             .get(&(*segment_id, key.clone(), *timer_type, *time))
             .copied();
         if slab_tag != expected_slab_tag {
-            return Err(color_eyre::eyre::eyre!(
+            return Err(eyre!(
                 "Slab-index trigger tag mismatch: segment={segment_id} slab={slab_id} key={key:?} \
                  time={time:?} type={timer_type:?} expected {expected_slab_tag:?}, got \
                  {slab_tag:?}"
@@ -1399,7 +1408,7 @@ where
 }
 
 async fn verify_dual_index_consistency<S>(
-    store: &S,
+    store: &TableAdapter<S>,
     model: &HighLevelModel,
 ) -> color_eyre::Result<()>
 where
@@ -1421,8 +1430,8 @@ where
 ///
 /// Returns an error if dual-index consistency is violated or store operations
 /// fail.
-pub async fn prop_high_level_dual_index_consistency<S>(
-    store: &S,
+pub(crate) async fn prop_high_level_dual_index_consistency<S>(
+    store: &TableAdapter<S>,
     input: HighLevelTestInput,
 ) -> color_eyre::Result<()>
 where
@@ -1431,9 +1440,10 @@ where
 {
     // Insert the segment first
     store
+        .operations()
         .insert_segment()
         .await
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to insert segment: {e:?}"))?;
+        .map_err(|e| eyre!("Failed to insert segment: {e:?}"))?;
 
     let mut model = HighLevelModel::new();
 

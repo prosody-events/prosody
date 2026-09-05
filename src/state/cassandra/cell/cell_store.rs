@@ -10,7 +10,7 @@ use super::{
     dedupe, encode_cell_blobs, expand_to_input_order, extend_gap_units, flatten_resolve, gap_count,
     into_store_err, match_batch_rows_to_coordinates, resolve_prior_clear_before_read, resolve_read,
     resolve_unsettled_clear_before_write, section_batches, smallvec, sorted_unique_coordinates,
-    try_stream, ttl_seconds_to_duration, ttl_to_i32, write_provisional,
+    try_stream, ttl_bind, ttl_seconds_to_duration, write_provisional,
 };
 
 impl<O> CellStore for CassandraStore<O>
@@ -283,7 +283,7 @@ where
         for (_, data) in cells {
             blobs.push(encode_cell_blobs(data.as_ref(), None).map_err(ResolveCellError::Store)?);
         }
-        let ttl = collection.ttl().map(ttl_to_i32);
+        let ttl = ttl_bind(collection.ttl());
         let mut units = Vec::with_capacity(cells.len() + gap_count(clears));
         extend_gap_units(&mut units, &self.queries, pk, clears);
         units.extend(self.resolved_units(pk, ttl, &blobs, cells));
@@ -441,7 +441,7 @@ where
         for (_, data) in &cells {
             blobs.push(encode_cell_blobs(data.as_ref(), None).map_err(ResolveCellError::Store)?);
         }
-        let ttl = collection.ttl().map(ttl_to_i32);
+        let ttl = ttl_bind(collection.ttl());
         let mut units = Vec::with_capacity(cells.len() + 1);
         units.extend(self.resolved_units(pk, ttl, &blobs, &cells));
         self.issue_marker_last(pk, units).await?;

@@ -21,9 +21,8 @@ use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
+use crate::timers::store::TriggerStore;
 use crate::timers::store::TriggerStoreProvider;
-use crate::timers::store::adapter::TableAdapter;
-use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, SegmentVersion};
 use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
@@ -38,7 +37,7 @@ use std::sync::Arc;
 use tokio::join;
 
 /// In-memory, concurrent implementation of
-/// [`TriggerStore`](super::TriggerStore) for testing and development.
+/// [`TriggerStore`] for testing and development.
 ///
 /// All data is held in memory; timers and segments are lost when the process
 /// exits. This store supports the full `TriggerStore` trait API with
@@ -121,7 +120,7 @@ impl InMemoryTriggerStore {
     }
 }
 
-impl TriggerOperations for InMemoryTriggerStore {
+impl TriggerStore for InMemoryTriggerStore {
     type Error = Infallible;
 
     fn segment(&self) -> &Segment {
@@ -597,8 +596,8 @@ impl TriggerOperations for InMemoryTriggerStore {
 /// Returns an implementation of `TriggerStore` backed by in-memory data
 /// structures. This is the recommended way to create an in-memory store.
 #[must_use]
-pub fn memory_store(segment: Segment) -> TableAdapter<InMemoryTriggerStore> {
-    TableAdapter::new(InMemoryTriggerStore::new(segment))
+pub fn memory_store(segment: Segment) -> InMemoryTriggerStore {
+    InMemoryTriggerStore::new(segment)
 }
 
 /// Hands out per-segment views of one shared in-memory trigger store.
@@ -628,19 +627,20 @@ impl InMemoryTriggerStoreProvider {
 }
 
 impl TriggerStoreProvider for InMemoryTriggerStoreProvider {
-    type Store = TableAdapter<InMemoryTriggerStore>;
+    type Store = InMemoryTriggerStore;
 
     fn create_store(&self, segment: Segment) -> Self::Store {
-        TableAdapter::new(InMemoryTriggerStore {
+        InMemoryTriggerStore {
             segment,
             inner: Arc::clone(&self.inner),
-        })
+        }
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::{InMemoryTriggerStore, memory_store};
+    use crate::timers::store::adapter::TableAdapter;
     use crate::timers::test_support::test_segment;
     use crate::trigger_store_tests;
     use std::convert::Infallible;
@@ -654,9 +654,11 @@ mod test {
         |slab_size| async move {
             Result::<_, Infallible>::Ok(InMemoryTriggerStore::new(test_segment("", slab_size)))
         },
-        crate::timers::store::adapter::TableAdapter<InMemoryTriggerStore>,
+        TableAdapter<InMemoryTriggerStore>,
         |slab_size| async move {
-            Result::<_, Infallible>::Ok(memory_store(test_segment("", slab_size)))
+            Result::<_, Infallible>::Ok(TableAdapter::new(memory_store(test_segment(
+                "", slab_size,
+            ))))
         }
     );
 }

@@ -9,7 +9,7 @@
 
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::operations::TriggerOperations;
+use crate::timers::store::TriggerStore;
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen};
 use std::collections::BTreeSet;
@@ -142,7 +142,7 @@ async fn verify_slab_range<T>(
     op_idx: usize,
 ) -> color_eyre::Result<()>
 where
-    T: TriggerOperations + Send + Sync,
+    T: TriggerStore + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
     let model_range = model.get_slab_range(&range);
@@ -189,7 +189,7 @@ async fn verify_get_slabs_query<T>(
     op_idx: usize,
 ) -> color_eyre::Result<()>
 where
-    T: TriggerOperations + Send + Sync,
+    T: TriggerStore + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
     let expected = model.get_slabs();
@@ -222,7 +222,7 @@ async fn verify_final_slab_state<T>(
     model: &SlabMetadataModel,
 ) -> color_eyre::Result<()>
 where
-    T: TriggerOperations + Send + Sync,
+    T: TriggerStore + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
     // Verify get_slabs matches
@@ -271,7 +271,7 @@ pub async fn prop_slab_metadata_model_equivalence<T>(
     input: SlabMetadataTestInput,
 ) -> color_eyre::Result<()>
 where
-    T: TriggerOperations + Send + Sync,
+    T: TriggerStore + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
     // Clean up slabs from any previous trial

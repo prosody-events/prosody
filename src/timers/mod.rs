@@ -75,7 +75,7 @@ mod manager;
 mod queue;
 mod scheduler;
 mod segment;
-mod slab;
+pub(crate) mod slab;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod test_support;

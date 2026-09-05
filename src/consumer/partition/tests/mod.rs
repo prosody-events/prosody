@@ -16,6 +16,7 @@ use crate::state::publisher::NoPublisher;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::tests::support::FixedOracle;
 use crate::telemetry::Telemetry;
+use crate::timers::slab::Slab;
 use crate::timers::store::TriggerStore;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use crate::timers::test_support::{create_test_trigger, setup_timer_manager};
@@ -79,14 +80,22 @@ async fn committed_application_refire_skips_handler() -> color_eyre::Result<()> 
     .await;
 
     assert_eq!(probe.timer_fires.load(Ordering::SeqCst), 0);
-    let slab_id = trigger
-        .time
-        .epoch_seconds()
-        .saturating_div(timers.test_store().slab_size().seconds());
+    let slab_id = trigger.time.epoch_seconds().saturating_div(
+        timers
+            .test_store()
+            .operations()
+            .segment()
+            .slab_size
+            .seconds(),
+    );
     assert!(
         timers
             .test_store()
-            .get_slab_triggers_all_types(slab_id)
+            .operations()
+            .get_slab_triggers_all_types(Slab::new(
+                slab_id,
+                timers.test_store().operations().segment().slab_size
+            ))
             .try_collect::<Vec<_>>()
             .await?
             .is_empty(),

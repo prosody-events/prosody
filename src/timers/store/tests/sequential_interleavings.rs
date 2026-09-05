@@ -1,6 +1,7 @@
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::store::TriggerStore;
+use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::tests::common::{
     add_trigger, insert_segment, remove_trigger, verify_store_state,
 };
@@ -18,8 +19,8 @@ use std::fmt::Debug;
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn test_sequential_interleavings<S>(
-    store: &S,
+pub(crate) async fn test_sequential_interleavings<S>(
+    store: &TableAdapter<S>,
     input: &TriggerTestInput,
 ) -> TestStoreResult
 where

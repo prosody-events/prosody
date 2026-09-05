@@ -31,7 +31,6 @@ use crate::state::{
 };
 use crate::telemetry::Telemetry;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
 use crate::timers::store::{Segment, SegmentVersion};
 use crate::timers::{
@@ -154,7 +153,7 @@ fn poison_provider(cell: PoisonCell, registry: Arc<CollectionDefRegistry>) -> Po
 /// A fresh in-memory trigger store standing in for the partition's store
 /// handle; the [`SharedStateBackend`] providers here carry a pre-built
 /// oracle, so the handle is accepted and ignored.
-fn test_triggers() -> TableAdapter<InMemoryTriggerStore> {
+fn test_triggers() -> InMemoryTriggerStore {
     memory_store(Segment {
         id: Uuid::new_v4(),
         name: "test".to_owned(),
@@ -225,8 +224,8 @@ where
 /// Builds a real in-memory `TimerManager`; the pending stream is returned so it
 /// stays alive for the manager's lifetime.
 async fn timer_manager() -> Result<(
-    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
-    TimerManager<TableAdapter<InMemoryTriggerStore>>,
+    impl Stream<Item = PendingTimer<InMemoryTriggerStore>>,
+    TimerManager<InMemoryTriggerStore>,
     watch::Sender<ShutdownPhase>,
 )> {
     let segment = Segment {

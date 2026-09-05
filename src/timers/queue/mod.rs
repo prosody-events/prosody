@@ -6,7 +6,7 @@
 //! and prevents duplicate scheduling of the same trigger.
 
 use crate::timers::Trigger;
-use crate::timers::active::ActiveTriggers;
+use crate::timers::active::{ActiveTriggers, Item, TimerState};
 use ahash::HashMap;
 use std::collections::hash_map::Entry;
 use std::{future::poll_fn, time::Duration};
@@ -73,11 +73,14 @@ impl TriggerQueue {
         let expired = poll_fn(|cx| self.queue.poll_expired(cx)).await?;
         // Remove its scheduling key to allow potential rescheduling.
         self.queue_keys.remove(expired.get_ref());
-        Some(expired.into_inner())
+        let trigger = expired.into_inner();
+        self.active.deliver(&trigger).await;
+        Some(trigger)
     }
 
     /// Remove a live schedule. `trigger.tag` is the key row tag; a queued item
-    /// with another tag is a retained source and stays.
+    /// with another tag is a retained source and stays, including after
+    /// delivery.
     pub(crate) async fn remove_if_live(&mut self, trigger: &Trigger) -> Kept {
         if let Some(queue_key) = self.queue_keys.get_mut(trigger) {
             let item = self.queue.remove(queue_key);
@@ -87,6 +90,11 @@ impl TriggerQueue {
                 return Kept::Source;
             }
             self.queue_keys.remove(trigger);
+        } else if matches!(
+            self.active.get_state(&trigger.key, trigger.time, trigger.timer_type).await,
+            Some(TimerState::Scheduled(Item::Delivered { tag })) if tag != trigger.tag
+        ) {
+            return Kept::Source;
         }
         self.active
             .remove(&trigger.key, trigger.time, trigger.timer_type)
@@ -125,13 +133,17 @@ impl TriggerQueue {
         true
     }
 
-    /// Change the queued tag without changing its deadline or trace.
-    pub(crate) fn retag(&mut self, trigger: &Trigger) {
+    /// Change the item tag at its current location. Keep its deadline and
+    /// trace.
+    pub(crate) async fn retag(&mut self, trigger: &Trigger) {
         if let Some(queue_key) = self.queue_keys.get_mut(trigger) {
             let mut item = self.queue.remove(queue_key);
             let deadline = item.deadline();
             item.get_mut().tag = trigger.tag;
             *queue_key = self.queue.insert_at(item.into_inner(), deadline);
+        } else {
+            // The item can leave the queue before this command arrives.
+            self.active.retag_delivered(trigger).await;
         }
     }
 

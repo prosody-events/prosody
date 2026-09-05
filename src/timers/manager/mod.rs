@@ -22,7 +22,7 @@ use crate::error::ClassifyError;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::timers::active::{
-    Announce, MemoryEffects, QueueEffect, StoreEffect, TimerOp, TimerSnapshot, TimerState,
+    Announce, MemoryEffects, Next, QueueEffect, StoreEffect, TimerOp, TimerSnapshot, TimerState,
     Transition, transition,
 };
 use crate::timers::datetime::CompactDateTime;
@@ -37,6 +37,7 @@ pub use crate::timers::error::TimerManagerError;
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::segment::get_or_create_segment;
 use crate::timers::store::TriggerStore;
+use crate::timers::store::adapter::TableAdapter;
 use crate::timers::{
     DELETE_CONCURRENCY, PendingTimer, TimerRequest, TimerSemaphores, TimerType, Trigger,
 };
@@ -88,7 +89,7 @@ pub struct TimerManagerInner<T: TriggerStore> {
     /// Persistent trigger store. Cloned across the manager and the scheduler
     /// actor so trigger-row writes can race in parallel with slab metadata
     /// writes inside the actor.
-    store: T,
+    store: TableAdapter<T>,
     /// In-memory scheduler actor handle. Owns slab metadata writes, slab
     /// loading, slab cleanup, and the trigger queue.
     scheduler: TriggerScheduler<T::Error>,
@@ -103,7 +104,7 @@ where
     T: TriggerStore,
 {
     #[cfg(test)]
-    pub(crate) fn test_store(&self) -> &T {
+    pub(crate) fn test_store(&self) -> &TableAdapter<T> {
         &self.0.store
     }
 
@@ -153,7 +154,7 @@ where
         // Build the manager wrapper. The segment is consumed when the
         // scheduler actor spawns; no copy is retained here.
         let manager = Self(Arc::new(TimerManagerInner {
-            store: config.store,
+            store: TableAdapter::new(config.store),
             scheduler,
             telemetry: config.telemetry,
             source: config.source,
@@ -183,8 +184,8 @@ where
         Ok((timer_stream, manager))
     }
 
-    /// Returns persisted times for a key and timer type, except those in
-    /// `Firing` or `FiringReplaced` state.
+    /// Returns scheduled times, including a pending replacement.
+    /// Excludes the attempt coordinate unless the handler rescheduled it.
     ///
     /// # Errors
     ///
@@ -197,12 +198,15 @@ where
     ) -> Result<Vec<CompactDateTime>, TimerManagerError<T::Error>> {
         let active_triggers = self.0.scheduler.active_triggers();
 
+        let pending = active_triggers.pending_replacement(key, timer_type).await;
+
         // Filter the store stream in one pass without an intermediate buffer.
         // Times absent from the registry (slab not yet loaded) still count as
         // scheduled.
         let stream = self
             .0
             .store
+            .operations()
             .get_key_times(timer_type, key)
             .map_ok(|(time, _)| time)
             .map_err(TimerManagerError::Store);
@@ -214,14 +218,15 @@ where
                     match state.await {
                         Some(TimerState::Firing | TimerState::FiringReplaced(_)) => false,
                         Some(
-                            TimerState::Scheduled
-                            | TimerState::FiringRescheduled
+                            TimerState::Scheduled(_)
+                            | TimerState::FiringRescheduled(_)
                             | TimerState::Parked,
                         )
                         | None => true,
                     }
                 }
             })
+            .chain(stream::iter(pending.map(|(_, trigger)| Ok(trigger.time))))
             .try_collect()
             .await
     }
@@ -250,13 +255,14 @@ where
     }
 
     /// Uses the key-row tag for `request`, or a fresh tag when no row exists.
-    /// The key row supplies the live tag. The registry holds no tag.
+    /// The key row supplies the live tag.
     /// Keep this read: a fresh tag on a repeated write would make an aborted
     /// attempt's cells read as committed.
     async fn mint(&self, request: TimerRequest) -> Result<Trigger, TimerManagerError<T::Error>> {
         let tag = self
             .0
             .store
+            .operations()
             .current_tag(&request.key, request.time, request.timer_type)
             .await
             .map_err(TimerManagerError::Store)?;
@@ -302,11 +308,25 @@ where
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
+        if let Some((firing_time, pending)) = self
+            .0
+            .scheduler
+            .active_triggers()
+            .pending_replacement(key, timer_type)
+            .await
+            .filter(|(_, pending)| pending.time == time)
+        {
+            let mut firing = pending;
+            firing.time = firing_time;
+            return self.drive(&firing, TimerOp::DropReplacement).await;
+        }
+
         // No key row entry means no live schedule here. A queued item at this
         // coordinate is a retained source, which only its own fire may remove.
         let Some(tag) = self
             .0
             .store
+            .operations()
             .current_tag(key, time, timer_type)
             .await
             .map_err(TimerManagerError::Store)?
@@ -368,27 +388,22 @@ where
         let existing_times: SmallVec<[(CompactDateTime, i32); 2]> = self
             .0
             .store
+            .operations()
             .get_key_times(trigger.timer_type, &trigger.key)
             .map_err(TimerManagerError::Store)
             .try_collect()
             .await?;
 
-        // A replacement of this attempt waits for its receipt.
-        for &(time, tag) in &existing_times {
-            if time == trigger.time {
-                continue;
-            }
-            let prior = self
-                .timer_state(&trigger.key, time, trigger.timer_type)
-                .await;
-            if matches!(
-                prior,
-                Some(
-                    TimerState::Firing
-                        | TimerState::FiringRescheduled
-                        | TimerState::FiringReplaced(_)
-                )
-            ) {
+        // Select the write mode before the first coordinate changes.
+        if let Some((firing_time, _)) = self
+            .0
+            .scheduler
+            .active_triggers()
+            .attempt(&trigger.key, trigger.timer_type)
+            .await
+            .filter(|(time, _)| *time != trigger.time)
+        {
+            for &(time, tag) in &existing_times {
                 let old = Trigger::with_tag(
                     trigger.key.clone(),
                     time,
@@ -396,25 +411,14 @@ where
                     tag,
                     trigger.span(),
                 );
-                self.apply(
-                    &old,
-                    transition(prior.as_ref(), TimerOp::ClearReplaced(trigger.clone())),
-                )
-                .await?;
-                for &(other, other_tag) in &existing_times {
-                    if other != time {
-                        let other = Trigger::with_tag(
-                            trigger.key.clone(),
-                            other,
-                            trigger.timer_type,
-                            other_tag,
-                            trigger.span(),
-                        );
-                        self.drive(&other, TimerOp::Unschedule).await?;
-                    }
-                }
-                return Ok(());
+                let op = if time == firing_time {
+                    TimerOp::ClearReplaced(trigger.clone())
+                } else {
+                    TimerOp::Unschedule
+                };
+                self.drive(&old, op).await?;
             }
+            return Ok(());
         }
 
         let prior = self
@@ -476,15 +480,12 @@ where
         );
     }
 
-    /// Classifies a fired timer from its key row, then moves it from
-    /// `Scheduled` to `Firing`.
+    /// Classifies the delivered item from its current tag and the key row.
     ///
-    /// The store read runs first. A failed read leaves the timer `Scheduled`,
-    /// so the caller can retry this call. Every schedule for a key runs
-    /// inside that key's handler, so no schedule lands between the read and
-    /// the flip.
-    ///
-    /// Returns `None` if the timer is absent or not `Scheduled`.
+    /// The store read runs first. A failed read leaves the item ready for
+    /// retry. Per-key dispatch prevents a schedule between the read and the
+    /// state change. Returns `None` if the timer has no delivered item
+    /// ready for an attempt.
     pub(crate) async fn fire(
         &self,
         trigger: &Trigger,
@@ -492,6 +493,7 @@ where
         let tag = self
             .0
             .store
+            .operations()
             .current_tag(&trigger.key, trigger.time, trigger.timer_type)
             .await
             .map_err(TimerManagerError::Store)?;
@@ -500,8 +502,8 @@ where
             .scheduler
             .fire(&trigger.key, trigger.time, trigger.timer_type)
             .await;
-        Ok(fired.then_some(match tag {
-            Some(tag) if tag == trigger.tag => Fire::Live(tag),
+        Ok(fired.map(|item_tag| match tag {
+            Some(tag) if tag == item_tag => Fire::Live(tag),
             Some(tag) => Fire::Unswept(tag),
             None => Fire::Committed,
         }))
@@ -645,6 +647,7 @@ where
                 next.to_mut().tag = fresh_tag_distinct_from(trigger.tag);
                 self.0
                     .store
+                    .operations()
                     .update_tag(&trigger.key, trigger.time, trigger.timer_type, next.tag)
                     .await
                     .map_err(TimerManagerError::Store)?;
@@ -692,9 +695,9 @@ where
 /// Classifies the store key row for one fired timer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fire {
-    /// The key tag equals the queued tag: one live attempt.
+    /// The key tag equals the item tag: one live attempt.
     Live(i32),
-    /// The key tag differs from the queued tag: sweep before the handler.
+    /// The key tag differs from the item tag: sweep before the handler.
     Unswept(i32),
     /// The key row is absent: the attempt committed.
     Committed,
@@ -726,10 +729,18 @@ where
     E: ClassifyError + Error + Debug + Send + Sync + 'static,
 {
     let active = scheduler.active_triggers();
-    if let Some(state) = effects.next_state {
-        active
-            .set_state(&trigger.key, trigger.time, trigger.timer_type, state)
-            .await;
+    match effects.next {
+        Next::Keep => {}
+        Next::Idle => {
+            active
+                .idle(&trigger.key, trigger.time, trigger.timer_type)
+                .await;
+        }
+        Next::To(state) => {
+            active
+                .set_state(&trigger.key, trigger.time, trigger.timer_type, state)
+                .await;
+        }
     }
     match effects.queue {
         QueueEffect::None => {}
@@ -785,7 +796,7 @@ where
         );
         let kept = apply_memory(scheduler, &old, pre).await?;
         apply_memory(scheduler, &old, post).await?;
-        if transition.store() == StoreEffect::None || kept == Kept::Source {
+        if kept == Kept::Source {
             keep.push(old_time);
         }
     }

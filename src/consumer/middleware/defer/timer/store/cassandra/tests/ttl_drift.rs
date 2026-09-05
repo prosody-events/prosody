@@ -69,10 +69,7 @@ async fn assert_next_timer_ttl_anchored(
         .await?
         .ok_or_else(|| color_eyre::eyre::eyre!("{site}: expected TTL on next_timer"))?;
     let base_ttl_secs: i32 = store.store.base_ttl().seconds().try_into()?;
-    let expected = store
-        .store
-        .calculate_ttl(target)
-        .ok_or_else(|| color_eyre::eyre::eyre!("{site}: calculate_ttl returned None"))?;
+    let expected = store.store.calculate_ttl(target);
 
     assert!(
         ttl >= expected - CLOCK_SKEW_SECS,

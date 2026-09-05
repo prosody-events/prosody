@@ -6,6 +6,7 @@
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::slab::Slab;
+use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::tests::TestStoreResult;
 use crate::timers::store::tests::common::{
     add_trigger, get_key_triggers, get_slab_triggers, insert_segment,
@@ -26,7 +27,10 @@ use tracing::Span;
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn test_cross_slab_operations<S>(store: &S, segment: &Segment) -> TestStoreResult
+pub(crate) async fn test_cross_slab_operations<S>(
+    store: &TableAdapter<S>,
+    segment: &Segment,
+) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,

@@ -23,8 +23,8 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::{CollectionId, PartitionBackend, SharedStateBackend, StateKey, StateName};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
+use crate::timers::slab::Slab;
 use crate::timers::store::TriggerStore;
-use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
 use crate::timers::test_support::{setup_timer_manager_over, test_segment};
 use crate::timers::{PendingTimer, TimerManager, TimerType, Trigger};
@@ -56,7 +56,7 @@ const IDENTITY: DedupIdentity<'static> = DedupIdentity {
     partition: 0,
 };
 
-type Timers = TableAdapter<InMemoryTriggerStore>;
+type Timers = InMemoryTriggerStore;
 type Oracle = CommitManager<MemoryDeduplicationStore, StoreTagSource<Timers>>;
 type Backend = PartitionBackend<Oracle, MemoryDescriptorIdentityStore, MemoryCellStore<Oracle>>;
 type State = StateManager<Backend, MemoryLoader<Value>>;
@@ -180,10 +180,12 @@ impl Stores {
 
     async fn has_timers(&self) -> Result<bool> {
         let last = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
-        for slab in self.first_slab..=last.epoch_seconds() / self.timers.slab_size().seconds() {
+        for slab in
+            self.first_slab..=last.epoch_seconds() / self.timers.segment().slab_size.seconds()
+        {
             if !self
                 .timers
-                .get_slab_triggers_all_types(slab)
+                .get_slab_triggers_all_types(Slab::new(slab, self.timers.segment().slab_size))
                 .try_collect::<Vec<_>>()
                 .await?
                 .is_empty()

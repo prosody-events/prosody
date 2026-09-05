@@ -14,6 +14,8 @@ use uuid::Uuid;
 pub enum DeduplicationOperation {
     /// Read a marker.
     Lookup(usize),
+    /// Read a marker through the commit oracle.
+    OracleRead(usize),
     /// Insert an ID.
     Insert(usize),
     /// Start another assignment over the same records.
@@ -41,9 +43,10 @@ impl Arbitrary for DeduplicationTestInput {
 
         for _ in 0..op_count {
             let id_index = usize::arbitrary(g) % ids.len();
-            let op = match u8::arbitrary(g) % 3 {
+            let op = match u8::arbitrary(g) % 4 {
                 0 => DeduplicationOperation::Insert(id_index),
                 1 => DeduplicationOperation::Lookup(id_index),
+                2 => DeduplicationOperation::OracleRead(id_index),
                 _ => DeduplicationOperation::Reacquire,
             };
             operations.push(op);
@@ -80,6 +83,12 @@ where
                 )
                 .await
                 .map_err(|error| eyre!("Op #{index}: {error}"))?;
+            }
+            DeduplicationOperation::OracleRead(id_index) => {
+                ensure!(
+                    store.recorded(input.ids[id_index]).await? == stamps[id_index].is_some(),
+                    "oracle presence differs at operation {index}"
+                );
             }
             DeduplicationOperation::Insert(id_index) => {
                 store.insert(input.ids[id_index]).await?;

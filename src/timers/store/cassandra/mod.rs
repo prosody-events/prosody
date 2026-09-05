@@ -7,11 +7,6 @@
 //! allows `clear_and_schedule_key` to issue a plain `UPDATE` instead of a
 //! `DELETE`-bearing `BATCH`.
 //!
-//! This file is the public hub: it defines [`CassandraTriggerStore`], its
-//! constructors, and the shared low-level helpers (`execute_with_optional_ttl`,
-//! etc.) that all submodules call. The bulk of the logic lives in focused
-//! submodules to keep individual files navigable.
-//!
 //! [`TriggerStore`]: crate::timers::store::TriggerStore
 //! [`Absent`]: crate::timers::store::cassandra::TimerState::Absent
 //! [`Inline`]: crate::timers::store::cassandra::TimerState::Inline
@@ -21,7 +16,6 @@
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::cassandra::queries::Queries;
 use crate::timers::store::{Segment, SegmentId, SegmentVersion};
@@ -140,36 +134,6 @@ impl CassandraTriggerStore {
 
     pub(super) fn propagator(&self) -> &TextMapCompositePropagator {
         self.store.propagator()
-    }
-
-    pub(super) fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
-        self.store.calculate_ttl(time)
-    }
-
-    /// Resolves `time` to a TTL and runs the matching query, delegating to
-    /// [`CassandraStore::execute_with_optional_ttl`].
-    pub(super) async fn execute_with_optional_ttl<P1, P2>(
-        &self,
-        time: CompactDateTime,
-        query_with_ttl: &PreparedStatement,
-        query_no_ttl: &PreparedStatement,
-        params_with_ttl: impl FnOnce(i32) -> P1,
-        params_no_ttl: impl FnOnce() -> P2,
-    ) -> Result<(), CassandraTriggerStoreError>
-    where
-        P1: SerializeRow,
-        P2: SerializeRow,
-    {
-        self.store
-            .execute_with_optional_ttl(
-                self.calculate_ttl(time),
-                query_with_ttl,
-                query_no_ttl,
-                params_with_ttl,
-                params_no_ttl,
-            )
-            .await?;
-        Ok(())
     }
 
     /// Executes an unpaged query and discards the result, delegating to

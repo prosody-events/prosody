@@ -125,7 +125,7 @@ where
 {
     /// The key row identifies a live attempt.
     Live(FiringTimer<T>),
-    /// The key row tag differs from the queued tag. An earlier attempt can
+    /// The key row tag differs from the item tag. An earlier attempt can
     /// hold provisional cells, so the key sweep runs first.
     Unswept(UnsweptTimer<T>),
     /// The key row is absent, so the attempt already committed.
@@ -412,7 +412,7 @@ where
             )
             .await;
         // A rescheduled refire must run the application handler again.
-        if matches!(state, Some(TimerState::FiringRescheduled)) {
+        if matches!(state, Some(TimerState::FiringRescheduled(_))) {
             Redelivery::Reruns
         } else {
             Redelivery::Sweeps

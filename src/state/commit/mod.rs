@@ -30,7 +30,7 @@
 //! manager.
 
 use crate::Key;
-use crate::consumer::middleware::deduplication::{DeduplicationStore, Presence};
+use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::oracle::CommitOracle;
 use crate::state::{CommitDecision, EventRef, StateKey, TimerEventRef};
@@ -134,9 +134,8 @@ where
         dedup_id: Uuid,
     ) -> Result<bool, CommitManagerError<D::Error, TS::Error>> {
         self.dedup
-            .lookup(dedup_id)
+            .recorded(dedup_id)
             .await
-            .map(Presence::is_present)
             .map_err(CommitManagerError::Dedup)
     }
 

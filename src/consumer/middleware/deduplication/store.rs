@@ -4,6 +4,7 @@ use crate::error::ClassifyError;
 use crate::{Partition, Topic};
 use std::error::Error;
 use std::future::Future;
+use std::time::Instant;
 use uuid::Uuid;
 
 /// The result of a deduplication lookup.
@@ -11,7 +12,7 @@ use uuid::Uuid;
 pub enum Presence {
     /// No marker exists.
     Absent,
-    /// This assignment recorded or read the marker.
+    /// This assignment recorded the marker or the filter observed it.
     /// Its settle finished, armed a backstop, or kept its source for the next
     /// assignment.
     Settled,
@@ -19,18 +20,21 @@ pub enum Presence {
     Inherited,
 }
 
-impl Presence {
-    /// Return whether the marker exists in either store.
-    #[must_use]
-    pub fn is_present(self) -> bool {
-        !matches!(self, Self::Absent)
-    }
+/// A marker read by the oracle or observed by the filter.
+/// Oracle reads never advance the assignment stamp.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Marker {
+    Recorded,
+    Observed(Instant),
 }
 
 /// Store and read message commit markers.
 pub trait DeduplicationStore: Clone + Send + Sync + 'static {
     /// Store failure. The commit oracle preserves its classification.
     type Error: ClassifyError + Error + Send + Sync + 'static;
+
+    /// Read a marker without a filter observation.
+    fn recorded(&self, id: Uuid) -> impl Future<Output = Result<bool, Self::Error>> + Send;
 
     /// Read a marker and identify whether this assignment already observed it.
     fn lookup(&self, id: Uuid) -> impl Future<Output = Result<Presence, Self::Error>> + Send;

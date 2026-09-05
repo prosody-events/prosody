@@ -3,9 +3,9 @@ use crate::Topic;
 use crate::consumer::{Keyed, Uncommitted};
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
+use crate::timers::active::Item;
 use crate::timers::duration::CompactDuration;
 use crate::timers::scheduler::TimerSchedulerError;
-use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
 use crate::timers::store::tests::common::KEY_POOL;
 use crate::timers::test_support::{
@@ -36,7 +36,7 @@ async fn count_scheduled<T: TriggerStore>(
 }
 
 async fn wait_for_owned(
-    manager: &TimerManager<TableAdapter<InMemoryTriggerStore>>,
+    manager: &TimerManager<InMemoryTriggerStore>,
     trigger: &Trigger,
 ) -> Result<()> {
     for _ in 0..500_u16 {
@@ -103,6 +103,7 @@ async fn test_new_timer_manager_creation() -> Result<()> {
     let stored = manager
         .0
         .store
+        .operations()
         .get_segment()
         .await?
         .ok_or_else(|| eyre!("segment should be persisted after manager init"))?;
@@ -747,7 +748,7 @@ async fn test_unschedule_cancels_reschedule() -> Result<()> {
         .await;
     assert_eq!(
         state_after_reschedule,
-        Some(TimerState::FiringRescheduled),
+        Some(TimerState::FiringRescheduled(Item::Queued)),
         "Timer should be in FiringRescheduled state"
     );
 
@@ -1179,6 +1180,7 @@ async fn test_clear_and_schedule_firing_same_time() -> Result<()> {
     let store_tag_before_commit = manager
         .0
         .store
+        .operations()
         .current_tag(&trigger.key, trigger.time, trigger.timer_type)
         .await?
         .ok_or_else(|| eyre!("store tag missing before commit"))?;
@@ -1206,6 +1208,7 @@ async fn test_clear_and_schedule_firing_same_time() -> Result<()> {
     let tag_after_commit = manager
         .0
         .store
+        .operations()
         .current_tag(&trigger.key, trigger.time, trigger.timer_type)
         .await?
         .ok_or_else(|| eyre!("tag missing after commit"))?;
@@ -1254,26 +1257,172 @@ async fn test_clear_and_schedule_firing_same_time() -> Result<()> {
 /// kind.
 #[tokio::test]
 async fn pinned_oracle_traces() -> Result<()> {
-    use ManagerOracleOp::{Abort, DifferentCoordinateClear, Fire, Receipt, Restart, Schedule};
+    use ManagerOracleOp::{
+        Abort, DifferentCoordinateClear, Fire, Pop, Receipt, RescheduleSame, Restart, Schedule,
+        Unschedule, UnscheduleAlternate,
+    };
     for ops in [
-        vec![Schedule, Fire, DifferentCoordinateClear, Restart, Fire],
-        vec![Schedule, Fire, Receipt, Restart, Schedule, Fire],
-        vec![Schedule, Fire, Schedule, Receipt, Restart, Fire],
-        vec![Schedule, Fire, Abort, Fire],
         vec![
             Schedule,
+            Pop,
+            Fire,
+            DifferentCoordinateClear,
+            Restart,
+            Pop,
+            Fire,
+        ],
+        vec![Schedule, Pop, Fire, Receipt, Restart, Schedule, Pop, Fire],
+        vec![Schedule, Pop, Fire, Schedule, Receipt, Restart, Pop, Fire],
+        vec![Schedule, Pop, Fire, Abort, Fire],
+        vec![
+            Schedule,
+            Pop,
             Fire,
             Receipt,
             Restart,
             Schedule,
             DifferentCoordinateClear,
             Schedule,
+            Pop,
             Fire,
         ],
     ] {
         run_same_coordinate_oracle_trace(&ManagerOracleTrace { timer_type: 0, ops }).await?;
         time::resume();
     }
+    run_same_coordinate_oracle_trace(&ManagerOracleTrace {
+        timer_type: 139,
+        ops: vec![
+            Schedule,
+            Pop,
+            Fire,
+            Receipt,
+            Restart,
+            Receipt,
+            Restart,
+            UnscheduleAlternate,
+            Unschedule,
+            DifferentCoordinateClear,
+            RescheduleSame,
+            Abort,
+            Restart,
+            Pop,
+            Pop,
+            Unschedule,
+        ],
+    })
+    .await?;
+    time::resume();
+    Ok(())
+}
+
+/// A property trace that fires a new tag before the retained source gets its
+/// sweep.
+#[tokio::test]
+async fn delivered_clear_keeps_receipted_source() -> Result<()> {
+    use ManagerOracleOp::{
+        Abort, DifferentCoordinateClear, Fire, Pop, Receipt, RescheduleSame, Restart,
+        SameCoordinateClear, Schedule, Unschedule, UnscheduleAlternate,
+    };
+    run_same_coordinate_oracle_trace(&ManagerOracleTrace {
+        timer_type: 22,
+        ops: vec![
+            Schedule,
+            Pop,
+            Fire,
+            Receipt,
+            Restart,
+            RescheduleSame,
+            UnscheduleAlternate,
+            Abort,
+            Pop,
+            Abort,
+            Unschedule,
+            DifferentCoordinateClear,
+            Abort,
+            RescheduleSame,
+            SameCoordinateClear,
+            Fire,
+            Fire,
+            Abort,
+            Pop,
+            Abort,
+            Schedule,
+            Fire,
+        ],
+    })
+    .await
+}
+
+/// A cancel must remove the pending replacement from the active attempt.
+#[tokio::test]
+async fn pending_cancel_keeps_replacement_absent() -> Result<()> {
+    use ManagerOracleOp::{
+        DifferentCoordinateClear, Fire, Pop, RescheduleSame, Schedule, Unschedule,
+        UnscheduleAlternate,
+    };
+    run_same_coordinate_oracle_trace(&ManagerOracleTrace {
+        timer_type: 0,
+        ops: vec![
+            Schedule,
+            Pop,
+            Fire,
+            UnscheduleAlternate,
+            Schedule,
+            RescheduleSame,
+            Unschedule,
+            Unschedule,
+            Fire,
+            Schedule,
+            DifferentCoordinateClear,
+            UnscheduleAlternate,
+        ],
+    })
+    .await
+}
+
+/// A delivered reschedule must fire as a live attempt after completion.
+#[tokio::test]
+async fn delivered_reschedule_fires_after_commit() -> Result<()> {
+    time::pause();
+    let (_stream, manager, _shutdown) = setup_timer_manager().await?;
+    let trigger = create_test_trigger("delivered-reschedule", 20, TimerType::Application)?;
+    manager.schedule_trigger(trigger.clone()).await?;
+    let first = manager
+        .0
+        .scheduler
+        .take_from_queue(trigger.clone())
+        .await?
+        .ok_or_else(|| eyre!("first schedule has no queue item"))?;
+    ensure!(
+        manager.fire(&first).await? == Some(Fire::Live(first.tag)),
+        "first schedule did not fire Live"
+    );
+
+    manager.schedule_trigger(first.clone()).await?;
+    let delivered = manager
+        .0
+        .scheduler
+        .take_from_queue(first.clone())
+        .await?
+        .ok_or_else(|| eyre!("reschedule has no queue item"))?;
+    manager.complete(&first).await?;
+    let tag = manager
+        .0
+        .store
+        .operations()
+        .current_tag(&first.key, first.time, first.timer_type)
+        .await?
+        .ok_or_else(|| eyre!("reschedule has no key tag"))?;
+    ensure!(
+        tag != delivered.tag,
+        "completion did not rotate the key tag"
+    );
+    let actual = manager.fire(&delivered).await?;
+    ensure!(
+        actual == Some(Fire::Live(tag)),
+        "delivered reschedule must fire Live after commit: actual={actual:?}"
+    );
     Ok(())
 }
 
@@ -1311,19 +1460,24 @@ async fn run_same_coordinate_oracle_trace(trace: &ManagerOracleTrace) -> Result<
     let alternate_time = base_time.add_duration(CompactDuration::new(20))?;
     let mut model = TimerOracleModel::default();
     let mut attempt = None;
+    let mut delivered = None;
 
     for op in trace.ops.iter().copied() {
         if matches!(op, ManagerOracleOp::Restart) {
-            let store = manager.0.store.clone();
+            let store = manager.0.store.operations().clone();
             shutdown_tx.send_replace(ShutdownPhase::Cancelling);
             task::yield_now().await;
             let (stream, restarted, restarted_shutdown) = setup_timer_manager_over(store).await?;
             task::spawn(stream.for_each(|_| async {}));
             manager = restarted;
             shutdown_tx = restarted_shutdown;
-            model.queued = model.slab;
-            model.registry = model.slab.map(|_| ModelState::Scheduled);
+            if model.registry == Some(ModelState::FiringReplaced) {
+                model.alternate = ModelSchedule::Absent;
+            }
+            model.item_tag = model.slab;
+            model.registry = model.slab.map(|_| ModelState::Scheduled(Item::Queued));
             attempt = None;
+            delivered = None;
         } else {
             apply_oracle_op(
                 &manager,
@@ -1331,7 +1485,7 @@ async fn run_same_coordinate_oracle_trace(trace: &ManagerOracleTrace) -> Result<
                 timer_type,
                 (base_time, alternate_time),
                 &mut model,
-                &mut attempt,
+                (&mut attempt, &mut delivered),
                 op,
             )
             .await?;
@@ -1340,6 +1494,7 @@ async fn run_same_coordinate_oracle_trace(trace: &ManagerOracleTrace) -> Result<
             manager
                 .0
                 .store
+                .operations()
                 .current_tag(&key, base_time, timer_type)
                 .await?
                 == model.key,
@@ -1353,6 +1508,11 @@ async fn run_same_coordinate_oracle_trace(trace: &ManagerOracleTrace) -> Result<
                 == model.registry,
             "registry differs from model after {op:?}: {model:?}"
         );
+        let times = manager.scheduled_times(&key, timer_type).await?;
+        ensure!(
+            times.contains(&alternate_time) == (model.alternate == ModelSchedule::Scheduled),
+            "replacement listing differs after {op:?}: {model:?}"
+        );
         ensure!(
             !(model.unswept && model.slab.is_none()),
             "receipted source lost before its sweep after {op:?}: {model:?}"
@@ -1362,12 +1522,12 @@ async fn run_same_coordinate_oracle_trace(trace: &ManagerOracleTrace) -> Result<
 }
 
 async fn apply_oracle_op(
-    manager: &TimerManager<TableAdapter<InMemoryTriggerStore>>,
+    manager: &TimerManager<InMemoryTriggerStore>,
     key: &Key,
     timer_type: TimerType,
     (base_time, alternate_time): (CompactDateTime, CompactDateTime),
     model: &mut TimerOracleModel,
-    attempt: &mut Option<Trigger>,
+    (attempt, delivered): (&mut Option<Trigger>, &mut Option<Trigger>),
     op: ManagerOracleOp,
 ) -> Result<()> {
     use ManagerOracleOp as Op;
@@ -1376,12 +1536,14 @@ async fn apply_oracle_op(
             let request = TimerRequest::new(key.clone(), base_time, timer_type, Span::current());
             if matches!(op, Op::SameCoordinateClear) {
                 manager.clear_and_schedule(request).await?;
+                model.alternate = ModelSchedule::Absent;
             } else {
                 manager.schedule(request).await?;
             }
             let tag = manager
                 .0
                 .store
+                .operations()
                 .current_tag(key, base_time, timer_type)
                 .await?
                 .ok_or_else(|| eyre!("schedule wrote no key tag"))?;
@@ -1390,40 +1552,43 @@ async fn apply_oracle_op(
                 Trigger::with_tag(key.clone(), base_time, timer_type, tag, Span::current());
             wait_for_owned(manager, &trigger).await?;
         }
+        Op::Pop => {
+            if matches!(
+                model.registry,
+                Some(
+                    ModelState::Scheduled(Item::Queued)
+                        | ModelState::FiringRescheduled(Item::Queued)
+                )
+            ) {
+                let coordinate = Trigger::new(key.clone(), base_time, timer_type, Span::current());
+                *delivered = manager.0.scheduler.take_from_queue(coordinate).await?;
+                ensure!(
+                    delivered.as_ref().map(|trigger| trigger.tag) == model.item_tag,
+                    "popped tag differs from model: {model:?}"
+                );
+                model.pop()?;
+            }
+        }
         Op::Fire => {
-            if attempt.is_none() {
-                *attempt = fire_oracle(manager, key, timer_type, base_time, model).await?;
+            if matches!(
+                model.registry,
+                Some(ModelState::Scheduled(Item::Delivered { .. }))
+            ) {
+                *attempt = fire_oracle(manager, delivered.take(), model).await?;
             }
         }
         Op::Receipt | Op::Retire | Op::Commit | Op::Abort => {
             if let Some(trigger) = attempt.as_ref() {
                 let prior = model.registry;
                 apply_attempt_op(manager, trigger, model, op).await?;
-                if prior == Some(ModelState::FiringReplaced)
+                if prior == Some(ModelState::FiringReplaced) && matches!(op, Op::Abort) {
+                    model.alternate = ModelSchedule::Absent;
+                }
+                if matches!(prior, Some(ModelState::Firing | ModelState::FiringReplaced))
                     && matches!(op, Op::Receipt | Op::Commit | Op::Abort)
                 {
-                    let coordinate =
-                        Trigger::new(key.clone(), alternate_time, timer_type, Span::none());
-                    let queued = manager.0.scheduler.take_from_queue(coordinate).await?;
-                    let tag = manager
-                        .0
-                        .store
-                        .current_tag(key, alternate_time, timer_type)
+                    check_alternate(manager, key, alternate_time, timer_type, model.alternate)
                         .await?;
-                    if matches!(op, Op::Abort) {
-                        ensure!(
-                            tag.is_none() && queued.is_none(),
-                            "abort wrote the pending replacement"
-                        );
-                    } else {
-                        let queued =
-                            queued.ok_or_else(|| eyre!("replacement has no queued trigger"))?;
-                        ensure!(
-                            tag == Some(queued.tag),
-                            "replacement tag differs from its queued tag"
-                        );
-                        manager.0.scheduler.add_to_queue(queued).await?;
-                    }
                 }
                 if !matches!(op, Op::Receipt) {
                     *attempt = None;
@@ -1440,18 +1605,64 @@ async fn apply_oracle_op(
                 ))
                 .await?;
             model.clear();
+            model.alternate = ModelSchedule::Scheduled;
         }
         Op::Unschedule => {
             manager.unschedule(key, base_time, timer_type).await?;
             model.unschedule();
+        }
+        Op::UnscheduleAlternate => {
+            manager.unschedule(key, alternate_time, timer_type).await?;
+            if model.registry == Some(ModelState::FiringReplaced) {
+                model.registry = Some(ModelState::Firing);
+            }
+            model.alternate = ModelSchedule::Absent;
         }
         Op::Restart => {}
     }
     Ok(())
 }
 
+async fn check_alternate(
+    manager: &TimerManager<InMemoryTriggerStore>,
+    key: &Key,
+    time: CompactDateTime,
+    timer_type: TimerType,
+    expected: ModelSchedule,
+) -> Result<()> {
+    let coordinate = Trigger::new(key.clone(), time, timer_type, Span::none());
+    let queued = manager.0.scheduler.take_from_queue(coordinate).await?;
+    let tag = manager
+        .0
+        .store
+        .operations()
+        .current_tag(key, time, timer_type)
+        .await?;
+    match expected {
+        ModelSchedule::Absent => ensure!(
+            tag.is_none() && queued.is_none(),
+            "cancel or abort wrote the pending replacement"
+        ),
+        ModelSchedule::Scheduled => {
+            let queued = queued.ok_or_else(|| eyre!("replacement has no queued trigger"))?;
+            ensure!(
+                tag == Some(queued.tag),
+                "replacement tag differs from its queued tag"
+            );
+            manager
+                .0
+                .scheduler
+                .active_triggers()
+                .set_state(key, time, timer_type, TimerState::Scheduled(Item::Queued))
+                .await;
+            manager.0.scheduler.add_to_queue(queued).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn apply_attempt_op(
-    manager: &TimerManager<TableAdapter<InMemoryTriggerStore>>,
+    manager: &TimerManager<InMemoryTriggerStore>,
     trigger: &Trigger,
     model: &mut TimerOracleModel,
     op: ManagerOracleOp,
@@ -1471,33 +1682,40 @@ async fn apply_attempt_op(
         _ => {}
     }
     match (op, model.registry) {
-        (Op::Receipt | Op::Retire | Op::Commit, Some(FiringRescheduled)) => {
+        (Op::Receipt | Op::Retire | Op::Commit, Some(FiringRescheduled(item))) => {
             let tag = manager
                 .0
                 .store
+                .operations()
                 .current_tag(&trigger.key, trigger.time, trigger.timer_type)
                 .await?
                 .ok_or_else(|| eyre!("rotation wrote no key tag"))?;
             ensure!(Some(tag) != model.key, "rotation kept the old key tag");
             model.key = Some(tag);
-            model.queued = Some(tag);
-            model.registry = Some(Scheduled);
+            model.item_tag = Some(tag);
+            model.registry = Some(Scheduled(match item {
+                Item::Queued => Item::Queued,
+                Item::Delivered { .. } => Item::Delivered { tag },
+            }));
         }
         (Op::Receipt, Some(Firing | FiringReplaced)) => {
             model.key = None;
             model.registry = Some(Parked);
         }
-        (Op::Commit, Some(Firing | FiringReplaced | Parked | Scheduled) | None) => {
-            *model = TimerOracleModel::default();
+        (Op::Commit, Some(Firing | FiringReplaced | Parked | Scheduled(_)) | None) => {
+            *model = TimerOracleModel {
+                alternate: model.alternate,
+                ..TimerOracleModel::default()
+            };
         }
         (Op::Retire, Some(Firing | Parked) | None) => {
             model.slab = None;
             model.registry = None;
         }
-        (Op::Abort, Some(FiringRescheduled)) => model.registry = Some(Scheduled),
-        (Op::Abort, Some(Firing | FiringReplaced | Scheduled)) => {
+        (Op::Abort, Some(FiringRescheduled(item))) => model.registry = Some(Scheduled(item)),
+        (Op::Abort, Some(Firing | FiringReplaced | Scheduled(_))) => {
             model.registry = Some(Parked);
-            model.queued = None;
+            model.item_tag = None;
         }
         _ => {}
     }
@@ -1505,24 +1723,15 @@ async fn apply_attempt_op(
 }
 
 async fn fire_oracle(
-    manager: &TimerManager<TableAdapter<InMemoryTriggerStore>>,
-    key: &Key,
-    timer_type: TimerType,
-    time: CompactDateTime,
+    manager: &TimerManager<InMemoryTriggerStore>,
+    queued: Option<Trigger>,
     model: &mut TimerOracleModel,
 ) -> Result<Option<Trigger>> {
-    let coordinate = Trigger::new(key.clone(), time, timer_type, Span::current());
-    let queued = manager.0.scheduler.take_from_queue(coordinate).await?;
-    ensure!(
-        queued.as_ref().map(|trigger| trigger.tag) == model.queued,
-        "queued tag differs from model: actual={:?}, model={model:?}",
-        queued.as_ref().map(|t| t.tag)
-    );
     let fire = match queued.as_ref() {
         Some(trigger) => manager.fire(trigger).await?,
         None => None,
     };
-    let expected = match (model.queued, model.key) {
+    let expected = match (model.item_tag, model.key) {
         (None, _) => None,
         (Some(_), None) => Some(Fire::Committed),
         (Some(q), Some(k)) if q == k => Some(Fire::Live(k)),
@@ -1532,7 +1741,7 @@ async fn fire_oracle(
         fire == expected,
         "fire disagreed with tags: expected={expected:?}, actual={fire:?}"
     );
-    model.queued = None;
+    model.item_tag = None;
     match (fire, queued) {
         (Some(Fire::Live(tag) | Fire::Unswept(tag)), Some(mut trigger)) => {
             ensure!(
@@ -1564,10 +1773,12 @@ struct ManagerOracleTrace {
 #[derive(Clone, Copy, Debug)]
 enum ManagerOracleOp {
     Schedule,
+    Pop,
     Fire,
     SameCoordinateClear,
     DifferentCoordinateClear,
     Unschedule,
+    UnscheduleAlternate,
     Commit,
     Abort,
     Receipt,
@@ -1578,31 +1789,39 @@ enum ManagerOracleOp {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModelState {
-    Scheduled,
+    Scheduled(Item),
     Firing,
     FiringReplaced,
-    FiringRescheduled,
+    FiringRescheduled(Item),
     Parked,
 }
 
 impl From<TimerState> for ModelState {
     fn from(state: TimerState) -> Self {
         match state {
-            TimerState::Scheduled => Self::Scheduled,
+            TimerState::Scheduled(item) => Self::Scheduled(item),
             TimerState::Firing => Self::Firing,
             TimerState::FiringReplaced(_) => Self::FiringReplaced,
-            TimerState::FiringRescheduled => Self::FiringRescheduled,
+            TimerState::FiringRescheduled(item) => Self::FiringRescheduled(item),
             TimerState::Parked => Self::Parked,
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ModelSchedule {
+    #[default]
+    Absent,
+    Scheduled,
+}
+
 /// The model records row tags and registry state at one coordinate.
 #[derive(Default, Debug)]
 struct TimerOracleModel {
+    alternate: ModelSchedule,
     slab: Option<i32>,
     key: Option<i32>,
-    queued: Option<i32>,
+    item_tag: Option<i32>,
     registry: Option<ModelState>,
     /// A receipt happened and no retire or sweep followed.
     unswept: bool,
@@ -1618,28 +1837,41 @@ impl TimerOracleModel {
         match self.registry {
             None => {
                 self.slab = Some(tag);
-                self.queued = Some(tag);
-                self.registry = Some(Scheduled);
+                self.item_tag = Some(tag);
+                self.registry = Some(Scheduled(Item::Queued));
             }
             Some(Parked) => {
-                self.queued = Some(tag);
-                self.registry = Some(Scheduled);
+                self.item_tag = Some(tag);
+                self.registry = Some(Scheduled(Item::Queued));
             }
             Some(Firing | FiringReplaced) => {
-                self.queued = Some(tag);
-                self.registry = Some(FiringRescheduled);
+                self.item_tag = Some(tag);
+                self.registry = Some(FiringRescheduled(Item::Queued));
             }
-            Some(Scheduled | FiringRescheduled) => {}
+            Some(Scheduled(_) | FiringRescheduled(_)) => {}
         }
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Result<()> {
+        let tag = self
+            .item_tag
+            .ok_or_else(|| eyre!("scheduled timer has no item tag"))?;
+        let item = Item::Delivered { tag };
+        self.registry = match self.registry {
+            Some(ModelState::Scheduled(_)) => Some(ModelState::Scheduled(item)),
+            Some(ModelState::FiringRescheduled(_)) => Some(ModelState::FiringRescheduled(item)),
+            state => state,
+        };
         Ok(())
     }
 
     fn clear(&mut self) {
         use ModelState::{Firing, FiringReplaced, FiringRescheduled};
         match self.registry {
-            Some(Firing | FiringRescheduled) => {
+            Some(Firing | FiringRescheduled(_)) => {
                 self.registry = Some(FiringReplaced);
-                self.queued = None;
+                self.item_tag = None;
             }
             Some(FiringReplaced) => {}
             _ if self.key.is_some() => self.cancel_queued(),
@@ -1650,8 +1882,8 @@ impl TimerOracleModel {
     fn unschedule(&mut self) {
         use ModelState::{Firing, FiringReplaced, FiringRescheduled};
         match self.registry {
-            Some(FiringRescheduled) => {
-                self.queued = None;
+            Some(FiringRescheduled(_)) => {
+                self.item_tag = None;
                 self.registry = Some(Firing);
             }
             Some(Firing | FiringReplaced) => {}
@@ -1660,9 +1892,19 @@ impl TimerOracleModel {
     }
 
     fn cancel_queued(&mut self) {
-        match (self.queued, self.key) {
-            (None, _) => *self = Self::default(),
-            (Some(q), Some(k)) if q == k => *self = Self::default(),
+        match (self.item_tag, self.key) {
+            (None, _) => {
+                *self = Self {
+                    alternate: self.alternate,
+                    ..Self::default()
+                }
+            }
+            (Some(q), Some(k)) if q == k => {
+                *self = Self {
+                    alternate: self.alternate,
+                    ..Self::default()
+                }
+            }
             (Some(_), _) => self.key = None,
         }
     }
@@ -1670,26 +1912,35 @@ impl TimerOracleModel {
 
 impl Arbitrary for ManagerOracleTrace {
     fn arbitrary(g: &mut Gen) -> Self {
+        use ManagerOracleOp::{Fire, Pop, Receipt, Restart, Schedule};
+        let prefix: &[ManagerOracleOp] = match u8::arbitrary(g) % 3 {
+            0 => &[],
+            1 => &[Schedule, Pop, Fire],
+            _ => &[Schedule, Pop, Fire, Receipt, Restart],
+        };
         let len = usize::from(u8::arbitrary(g) % 24);
-        let mut ops = Vec::with_capacity(len);
+        let mut ops = Vec::with_capacity(prefix.len() + len);
+        ops.extend_from_slice(prefix);
         for _ in 0..len {
-            let op = if matches!(ops.last(), Some(ManagerOracleOp::Receipt)) {
+            let op = if matches!(ops.last(), Some(Receipt)) {
                 if bool::arbitrary(g) {
                     ManagerOracleOp::Retire
                 } else {
-                    ManagerOracleOp::Restart
+                    Restart
                 }
             } else {
-                match u8::arbitrary(g) % 11 {
-                    0 => ManagerOracleOp::Schedule,
-                    1 => ManagerOracleOp::Fire,
+                match u8::arbitrary(g) % 13 {
+                    0 => Schedule,
+                    1 => Fire,
                     2 => ManagerOracleOp::SameCoordinateClear,
                     3 => ManagerOracleOp::DifferentCoordinateClear,
                     4 => ManagerOracleOp::Commit,
                     5 | 7 => ManagerOracleOp::Abort,
-                    6 => ManagerOracleOp::Receipt,
-                    8 => ManagerOracleOp::Restart,
+                    6 => Receipt,
+                    8 => Restart,
                     9 => ManagerOracleOp::Unschedule,
+                    10 => Pop,
+                    11 => ManagerOracleOp::UnscheduleAlternate,
                     _ => ManagerOracleOp::RescheduleSame,
                 }
             };

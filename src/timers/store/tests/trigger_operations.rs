@@ -4,6 +4,7 @@
 )]
 
 use crate::timers::slab::Slab;
+use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::tests::common::{
     add_trigger, clear_triggers_for_key, get_key_triggers, get_slab_triggers, insert_segment,
     remove_trigger,
@@ -20,7 +21,7 @@ use std::fmt::Debug;
 use tracing::Span;
 
 async fn verify_duplicate_add_replaces_metadata<S>(
-    store: &S,
+    store: &TableAdapter<S>,
     segment: &Segment,
     trigger: &Trigger,
 ) -> TestStoreResult
@@ -42,10 +43,12 @@ where
         .map_err(|e| format!("duplicate add failed: {e:?}"))?;
 
     let current_tag = store
+        .operations()
         .current_tag(&trigger.key, trigger.time, trigger.timer_type)
         .await
         .map_err(|e| format!("current_tag after duplicate add failed: {e:?}"))?;
     let key_triggers: Vec<Trigger> = store
+        .operations()
         .get_key_triggers(trigger.timer_type, &trigger.key)
         .try_collect()
         .await
@@ -84,7 +87,10 @@ where
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn test_trigger_operations<S>(store: &S, input: &TriggerTestInput) -> TestStoreResult
+pub(crate) async fn test_trigger_operations<S>(
+    store: &TableAdapter<S>,
+    input: &TriggerTestInput,
+) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
@@ -181,7 +187,10 @@ where
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn test_operation_sequences<S>(store: &S, input: &TriggerSequence) -> TestStoreResult
+pub(crate) async fn test_operation_sequences<S>(
+    store: &TableAdapter<S>,
+    input: &TriggerSequence,
+) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,

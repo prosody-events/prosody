@@ -20,8 +20,8 @@
 //!
 //! [`EventHandler`]: crate::consumer::EventHandler
 
+use crate::util::crash_point;
 use std::error::Error as StdError;
-use std::future::Future;
 use std::time::Duration;
 
 use tokio::time::sleep;
@@ -377,22 +377,6 @@ fn discard_uncommitted<S: StateLifecycle>(lifecycle: Option<&S>) {
     if let Some(lifecycle) = lifecycle {
         lifecycle.discard_dirty();
     }
-}
-
-/// A point where a process can stop between two durable steps.
-///
-/// Memory backends finish a durable step in one poll, so a poll-budget test
-/// needs a yield to stop between steps. Production builds compile it out.
-#[cfg(test)]
-fn crash_point() -> impl Future<Output = ()> {
-    use tokio::task::yield_now;
-    yield_now()
-}
-
-#[cfg(not(test))]
-fn crash_point() -> impl Future<Output = ()> {
-    use std::future::ready;
-    ready(())
 }
 
 /// Applies the success sequence for the event's redelivery posture.

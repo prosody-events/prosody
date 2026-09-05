@@ -63,7 +63,7 @@ pub(super) const STATE_CACHE_CAPACITY: usize = 8_192;
 /// Callers obtain the handle via `resolve_state` (which drops `quick_cache`'s
 /// internal shard lock as soon as the `Arc` is cloned), then `.lock().await`
 /// without holding any cache internals across an await. State-mutating
-/// `TriggerOperations` methods hold this mutex from the state read through
+/// `TriggerStore` methods hold this mutex from the state read through
 /// the DB write, so concurrent operations on the same `(key, timer_type)`
 /// linearise; operations on different `(key, timer_type)` pairs do not block
 /// each other.

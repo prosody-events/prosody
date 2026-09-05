@@ -172,26 +172,21 @@ impl CassandraStore {
         self.inner.base_ttl
     }
 
-    /// Calculates an appropriate TTL value for Cassandra.
-    ///
-    /// Computes a TTL by adding the base retention period to the time
-    /// remaining until the target time, with overflow protection for
-    /// Cassandra's maximum TTL limit. Returns `None` if the TTL would exceed
-    /// Cassandra's limits or the calculation fails.
+    /// Returns the TTL bind value for the target time plus base retention.
+    /// Zero means no expiry when the value exceeds Cassandra's limit or cannot
+    /// fit.
     #[must_use]
-    pub fn calculate_ttl(&self, target_time: CompactDateTime) -> Option<i32> {
+    pub fn calculate_ttl(&self, target_time: CompactDateTime) -> i32 {
         let Ok(duration) = target_time.compact_duration_from_now() else {
-            // Return the base TTL if the time is in the past
-            return self.base_ttl().seconds().try_into().ok();
+            return self.base_ttl().seconds().try_into().unwrap_or(0);
         };
-
-        duration
-            .checked_add(self.base_ttl())
-            .ok()?
-            .seconds()
-            .try_into()
-            .ok()
-            .filter(|&ttl: &i32| i64::from(ttl) < MAX_CASSANDRA_TTL_SECS)
+        let Ok(ttl) = duration.checked_add(self.base_ttl()) else {
+            return 0;
+        };
+        match i32::try_from(ttl.seconds()) {
+            Ok(ttl) if i64::from(ttl) < MAX_CASSANDRA_TTL_SECS => ttl,
+            _ => 0,
+        }
     }
 
     /// Executes an unpaged mutation and discards the result.
@@ -215,43 +210,6 @@ impl CassandraStore {
             .await
             .map_err(CassandraStoreError::from)?;
         Ok(())
-    }
-
-    /// Executes `query_with_ttl` when `ttl` is `Some`, otherwise
-    /// `query_no_ttl`, building each statement's params on demand.
-    ///
-    /// `ttl` is the already-resolved TTL in seconds; `None` means indefinite
-    /// retention and routes to the `*_no_ttl` query variant. The two param
-    /// builders let each query carry a different parameter shape — the
-    /// `with_ttl` tuple leads with the TTL, the `no_ttl` tuple omits it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CassandraStoreError`] when the driver fails to execute.
-    pub async fn execute_with_optional_ttl<P1, P2, F1, F2>(
-        &self,
-        ttl: Option<i32>,
-        query_with_ttl: &PreparedStatement,
-        query_no_ttl: &PreparedStatement,
-        params_with_ttl: F1,
-        params_no_ttl: F2,
-    ) -> Result<(), CassandraStoreError>
-    where
-        P1: SerializeRow,
-        P2: SerializeRow,
-        F1: FnOnce(i32) -> P1,
-        F2: FnOnce() -> P2,
-    {
-        match ttl {
-            Some(ttl) => {
-                self.execute_unpaged_discard(query_with_ttl, params_with_ttl(ttl))
-                    .await
-            }
-            None => {
-                self.execute_unpaged_discard(query_no_ttl, params_no_ttl())
-                    .await
-            }
-        }
     }
 
     /// Executes `units` as the **fewest** same-partition `UNLOGGED BATCH`es

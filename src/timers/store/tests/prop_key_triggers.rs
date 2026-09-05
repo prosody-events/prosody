@@ -7,7 +7,7 @@ use super::common::{KEY_POOL, derive_tag};
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::operations::TriggerOperations;
+use crate::timers::store::TriggerStore;
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
 use futures::TryStreamExt;
@@ -97,7 +97,10 @@ impl Arbitrary for KeyTriggerTestInput {
         let shared_key = Key::from(KEY_POOL[usize::from(u8::arbitrary(g)) % KEY_POOL.len()]);
         let shared_type =
             TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
-        let base = CompactDateTime::arbitrary(g);
+        let base = match u8::arbitrary(g) % 4 {
+            0 => CompactDateTime::from(4_000_000_000_u32),
+            _ => CompactDateTime::arbitrary(g),
+        };
         let op_count = (usize::arbitrary(g) % 40) + 16;
         let mut operations = Vec::with_capacity(op_count);
 
@@ -286,7 +289,7 @@ async fn verify_key_times<T>(
     key: &Key,
 ) -> color_eyre::Result<()>
 where
-    T: TriggerOperations + Send + Sync,
+    T: TriggerStore + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
     let model_times = model.get_times(timer_type, key);
@@ -324,7 +327,7 @@ async fn verify_key_triggers<T>(
     key: &Key,
 ) -> color_eyre::Result<()>
 where
-    T: TriggerOperations + Send + Sync,
+    T: TriggerStore + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
     let model_triggers = model.get_triggers(timer_type, key);
@@ -388,7 +391,7 @@ async fn verify_all_types<T>(
     key: &Key,
 ) -> color_eyre::Result<()>
 where
-    T: TriggerOperations + Send + Sync,
+    T: TriggerStore + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
     let model_all = model.get_all_types(key);
@@ -440,7 +443,7 @@ async fn apply_operation<T>(
     op_idx: usize,
 ) -> color_eyre::Result<()>
 where
-    T: TriggerOperations + Send + Sync,
+    T: TriggerStore + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
     match op {
@@ -540,7 +543,7 @@ pub async fn prop_key_trigger_model_equivalence<T>(
     input: KeyTriggerTestInput,
 ) -> color_eyre::Result<()>
 where
-    T: TriggerOperations + Send + Sync,
+    T: TriggerStore + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
     // Clean up the keys from this trial to ensure isolation: trials share a

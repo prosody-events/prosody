@@ -8,7 +8,6 @@ use crate::test_util::{
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::manager::TimerManager;
-use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::InMemoryTriggerStore;
 use crate::timers::test_support::{create_test_trigger, setup_timer_manager};
 use color_eyre::eyre::{Result, eyre};
@@ -23,7 +22,7 @@ use tracing_subscriber::filter::LevelFilter;
 
 const DROPPED_UNCOMMITTED_WARNING: &str = "timer was dropped without committing or aborting";
 
-type TestStore = TableAdapter<InMemoryTriggerStore>;
+type TestStore = InMemoryTriggerStore;
 
 /// Schedules a 1s trigger for `key`, advances past it, and pops the
 /// resulting pending timer from the stream.

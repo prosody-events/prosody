@@ -10,7 +10,7 @@
 //! its own segment.
 
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::operations::TriggerOperations;
+use crate::timers::store::TriggerStore;
 use crate::timers::store::{Segment, SegmentVersion};
 use quickcheck::{Arbitrary, Gen};
 use std::error::Error;
@@ -215,7 +215,7 @@ pub async fn prop_segment_model_equivalence<T>(
     input: SegmentTestInput,
 ) -> color_eyre::Result<()>
 where
-    T: TriggerOperations,
+    T: TriggerStore,
     T::Error: Error + Send + Sync + 'static,
 {
     // Clean up any leftover state from a previous trial

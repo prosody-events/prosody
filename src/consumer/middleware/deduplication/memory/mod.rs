@@ -2,7 +2,7 @@
 //!
 //! Provider drop releases the records after all store handles drop.
 
-use super::store::{DeduplicationStore, DeduplicationStoreProvider, Presence};
+use super::store::{DeduplicationStore, DeduplicationStoreProvider, Marker, Presence};
 use crate::{Partition, Topic};
 use ahash::RandomState;
 use scc::HashMap;
@@ -14,7 +14,7 @@ use uuid::Uuid;
 /// Message markers shared by the stores from one provider.
 #[derive(Clone, Debug)]
 pub struct MemoryDeduplicationStore {
-    records: Arc<HashMap<Uuid, Instant, RandomState>>,
+    records: Arc<HashMap<Uuid, Marker, RandomState>>,
     acquired: Instant,
 }
 
@@ -38,20 +38,26 @@ impl Default for MemoryDeduplicationStore {
 impl DeduplicationStore for MemoryDeduplicationStore {
     type Error = Infallible;
 
+    async fn recorded(&self, id: Uuid) -> Result<bool, Self::Error> {
+        Ok(self.records.contains_async(&id).await)
+    }
+
     async fn lookup(&self, id: Uuid) -> Result<Presence, Self::Error> {
         let Some(mut entry) = self.records.get_async(&id).await else {
             return Ok(Presence::Absent);
         };
-        if *entry.get() >= self.acquired {
+        if matches!(entry.get(), Marker::Observed(stamp) if *stamp >= self.acquired) {
             Ok(Presence::Settled)
         } else {
-            *entry.get_mut() = Instant::now();
+            *entry.get_mut() = Marker::Observed(Instant::now());
             Ok(Presence::Inherited)
         }
     }
 
     async fn insert(&self, id: Uuid) -> Result<(), Self::Error> {
-        self.records.upsert_async(id, Instant::now()).await;
+        self.records
+            .upsert_async(id, Marker::Observed(Instant::now()))
+            .await;
         Ok(())
     }
 }
@@ -60,7 +66,7 @@ impl DeduplicationStore for MemoryDeduplicationStore {
 /// assignment.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryDeduplicationStoreProvider {
-    records: Arc<HashMap<Uuid, Instant, RandomState>>,
+    records: Arc<HashMap<Uuid, Marker, RandomState>>,
 }
 
 impl MemoryDeduplicationStoreProvider {

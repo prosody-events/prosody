@@ -20,6 +20,7 @@
 //! - **Cross-backend compatibility**: Working with any `TriggerStore`
 //!   implementation
 
+use crate::timers::store::adapter::TableAdapter;
 use futures::TryStreamExt;
 use std::collections::{HashMap, HashSet as StdHashSet};
 use std::fmt::Debug;
@@ -64,32 +65,19 @@ pub fn derive_tag(key: &Key, time: CompactDateTime, timer_type: TimerType) -> i3
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn insert_segment<S>(store: &S, _segment: &Segment) -> TestStoreResult
+pub(crate) async fn insert_segment<S>(
+    store: &TableAdapter<S>,
+    _segment: &Segment,
+) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
     store
+        .operations()
         .insert_segment()
         .await
         .map_err(|e| format!("Failed to insert segment: {e:?}"))?;
-    Ok(())
-}
-
-/// Helper function to delete a slab
-///
-/// # Errors
-///
-/// Returns an error if the store operation fails.
-pub async fn delete_slab<S>(store: &S, slab_id: SlabId) -> TestStoreResult
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
-    store
-        .delete_slab(slab_id)
-        .await
-        .map_err(|e| format!("Failed to delete slab: {e:?}"))?;
     Ok(())
 }
 
@@ -98,7 +86,7 @@ where
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn add_trigger<S>(store: &S, trigger: &Trigger) -> TestStoreResult
+pub(crate) async fn add_trigger<S>(store: &TableAdapter<S>, trigger: &Trigger) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
@@ -115,8 +103,8 @@ where
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn get_key_triggers<S>(
-    store: &S,
+pub(crate) async fn get_key_triggers<S>(
+    store: &TableAdapter<S>,
     _segment_id: &SegmentId,
     key: &Key,
 ) -> Result<HashSet<CompactDateTime>, String>
@@ -132,8 +120,8 @@ where
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn get_key_triggers_by_type<S>(
-    store: &S,
+pub(crate) async fn get_key_triggers_by_type<S>(
+    store: &TableAdapter<S>,
     key: &Key,
     timer_type: TimerType,
 ) -> Result<HashSet<CompactDateTime>, String>
@@ -142,6 +130,7 @@ where
     S::Error: Debug,
 {
     store
+        .operations()
         .get_key_times(timer_type, key)
         .map_ok(|(time, _)| time)
         .collect::<Vec<_>>()
@@ -159,8 +148,8 @@ where
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn get_slab_triggers_all_types<S>(
-    store: &S,
+pub(crate) async fn get_slab_triggers_all_types<S>(
+    store: &TableAdapter<S>,
     slab_id: SlabId,
 ) -> Result<HashSet<Trigger>, String>
 where
@@ -168,7 +157,8 @@ where
     S::Error: Debug,
 {
     store
-        .get_slab_triggers_all_types(slab_id)
+        .operations()
+        .get_slab_triggers_all_types(Slab::new(slab_id, store.operations().segment().slab_size))
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -184,7 +174,10 @@ where
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn get_slab_triggers<S>(store: &S, slab_id: SlabId) -> Result<HashSet<Trigger>, String>
+pub(crate) async fn get_slab_triggers<S>(
+    store: &TableAdapter<S>,
+    slab_id: SlabId,
+) -> Result<HashSet<Trigger>, String>
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
@@ -197,8 +190,8 @@ where
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn remove_trigger<S>(
-    store: &S,
+pub(crate) async fn remove_trigger<S>(
+    store: &TableAdapter<S>,
     key: &Key,
     time: CompactDateTime,
     timer_type: TimerType,
@@ -221,8 +214,8 @@ where
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn clear_triggers_for_key<S>(
-    store: &S,
+pub(crate) async fn clear_triggers_for_key<S>(
+    store: &TableAdapter<S>,
     timer_type: TimerType,
     key: &Key,
 ) -> TestStoreResult
@@ -232,6 +225,7 @@ where
 {
     // Get all trigger times for this key
     let times: Vec<CompactDateTime> = store
+        .operations()
         .get_key_times(timer_type, key)
         .map_ok(|(time, _)| time)
         .collect::<Vec<_>>()
@@ -256,8 +250,8 @@ where
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn verify_store_state<S, H1, H2>(
-    store: &S,
+pub(crate) async fn verify_store_state<S, H1, H2>(
+    store: &TableAdapter<S>,
     segment: &Segment,
     expected_state: &HashMap<Key, StdHashSet<CompactDateTime, H2>, H1>,
 ) -> TestStoreResult

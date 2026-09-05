@@ -1,4 +1,5 @@
 use crate::timers::slab::Slab;
+use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::tests::TestStoreResult;
 use crate::timers::store::tests::common::insert_segment;
 use crate::timers::store::{Segment, TriggerStore};
@@ -14,7 +15,10 @@ use std::fmt::Debug;
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn test_get_slab_range<S>(store: &S, segment: &Segment) -> TestStoreResult
+pub(crate) async fn test_get_slab_range<S>(
+    store: &TableAdapter<S>,
+    segment: &Segment,
+) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
@@ -26,6 +30,7 @@ where
     let all_slab_ids: Vec<u32> = vec![0, 5, 10, 15, 20];
     for &slab_id in &all_slab_ids {
         store
+            .operations()
             .insert_slab(Slab::new(slab_id, segment.slab_size))
             .await
             .map_err(|e| format!("Failed to insert slab {slab_id}: {e:?}"))?;
@@ -33,6 +38,7 @@ where
 
     // Test range 5..=15 should return [5, 10, 15]
     let range_slabs: Vec<u32> = store
+        .operations()
         .get_slab_range(5..=15)
         .try_collect()
         .await
@@ -49,6 +55,7 @@ where
 
     // Test range 0..=0 should return [0]
     let range_slabs: Vec<u32> = store
+        .operations()
         .get_slab_range(0..=0)
         .try_collect()
         .await
@@ -62,6 +69,7 @@ where
 
     // Test range 25..=30 should return [] (no slabs in range)
     let range_slabs: Vec<u32> = store
+        .operations()
         .get_slab_range(25..=30)
         .try_collect()
         .await

@@ -11,18 +11,8 @@
 //! authority for the state machine — which maps `(prior state, op)` to the
 //! exact registry, queue, and store effects the manager applies.
 //!
-//! # State Definitions
-//!
-//! | State                  | `ActiveTriggers`      | `DelayQueue`   | `Database`                             |
-//! | ---------------------- | --------------------- | -------------- | -------------------------------------- |
-//! | `UNSCHEDULED`          | absent                | -              | -                                      |
-//! | `SCHEDULED`            | `Scheduled`           | ✓              | ✓                                      |
-//! | `FIRING`               | `Firing`              | -              | ✓                                      |
-//! | `FIRING_REPLACED`      | `FiringReplaced`      | -              | key and slab rows; pending replacement                   |
-//! | `FIRING_RESCHEDULED`   | `FiringRescheduled`   | ✓              | ✓                                      |
-//! | `PARKED`               | `Parked`              | -              | ✓ (slab row; key row unless receipted) |
-//!
-//! Persisted rows load as `Scheduled` after restart.
+//! A coordinate owns at most one item. Its state records the item's location.
+//! Persisted rows load as `Scheduled(Item::Queued)` after restart.
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
@@ -54,47 +44,55 @@ pub struct TimerSnapshot {
 /// Maps (time, type) tuples to their lifecycle entry for a single key.
 type TriggerStateMap = HashMap<(CompactDateTime, TimerType), ActiveTriggerEntry>;
 
+/// Where a coordinate's one queue item is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Item {
+    /// In the delay queue. The queue holds its tag.
+    Queued,
+    /// Emitted to the partition and not yet fired. The registry holds its tag.
+    Delivered { tag: i32 },
+}
+
 /// Lifecycle state of a timer in the in-memory scheduler.
 ///
-/// Each timer in [`ActiveTriggers`] is in exactly one of these states; how
-/// every operation moves a timer between them is resolved by [`transition`].
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum TimerState {
-    /// Timer is in the `DelayQueue`, waiting to fire.
-    ///
-    /// This is the default state for newly scheduled timers.
-    #[default]
-    Scheduled,
-
-    /// Handler is processing this timer; it has not been rescheduled.
+/// Only `Scheduled` and `FiringRescheduled` own an [`Item`].
+/// [`transition`] defines the effects of each lifecycle operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TimerState {
+    /// The timer has an item for its next attempt.
+    Scheduled(Item),
+    /// The handler processes this timer without a next fire.
     Firing,
-
     /// The replacement waits for this attempt's receipt or completion.
     /// Both old rows stay until then. Abort drops the replacement.
     FiringReplaced(Trigger),
-
-    /// Handler is processing this timer; the same (key, time, type) was
-    /// re-scheduled during dispatch and will fire again after commit.
-    FiringRescheduled,
-
-    /// The timer has no queue entry. Its slab row waits for reload, schedule,
-    /// or retire. An aborted attempt keeps its key row. A receipted attempt
+    /// The handler processes this timer. Its next attempt has an item.
+    FiringRescheduled(Item),
+    /// The timer has no item. Its slab row waits for reload, schedule, or
+    /// retire. An aborted attempt keeps its key row. A receipted attempt
     /// has no key row.
     Parked,
+}
+
+impl Default for TimerState {
+    fn default() -> Self {
+        Self::Scheduled(Item::Queued)
+    }
 }
 
 /// A lifecycle operation submitted to the timer state machine.
 ///
 /// Ops name caller intent; [`transition`] resolves `(prior state, op)` to
-/// the effects to apply. Firing is not an op: delivering a timer performs
-/// its own `Scheduled` → `Firing` flip inside the scheduler after the
-/// `DelayQueue` pop.
+/// the effects to apply. The registry starts an attempt through
+/// [`ActiveTriggers::fire`].
 #[derive(Clone, Debug)]
 pub(crate) enum TimerOp {
     /// Request a future fire at this (key, time, type).
     Schedule,
     /// Cancel a pending fire.
     Unschedule,
+    /// Cancel the pending replacement.
+    DropReplacement,
     /// The delivery handler committed.
     Complete,
     /// Record the commit receipt but keep its redelivery source.
@@ -127,7 +125,7 @@ pub(crate) enum QueueEffect {
     Dequeue,
     /// Full scheduler `Add`: slab metadata, queue insert, registry insert.
     Insert,
-    /// Set the queued tag after the store rotates it.
+    /// Set the item tag at its current location after the store rotates it.
     Retag,
     /// Full scheduler `Remove`: queue removal plus registry removal.
     Remove,
@@ -180,13 +178,25 @@ pub(crate) enum Announce {
     Cancelled,
 }
 
+/// What the registry does to the coordinate's state.
+#[derive(Clone, Debug)]
+pub(crate) enum Next {
+    /// Keep the current state.
+    Keep,
+    /// End a rescheduled attempt and keep its current item. Keep any other
+    /// state.
+    Idle,
+    /// Replace the state.
+    To(TimerState),
+}
+
 /// The in-memory effects on one side of a [`Transition`]'s durable write.
 ///
 /// Applied in field order: state flip, then queue effect.
 #[derive(Clone, Debug)]
 pub(crate) struct MemoryEffects {
-    /// New registry state for the timer; `None` leaves the entry untouched.
-    pub(crate) next_state: Option<TimerState>,
+    /// The action to apply to the current registry state.
+    pub(crate) next: Next,
     /// Scheduler effect to run after the state and tag updates.
     pub(crate) queue: QueueEffect,
 }
@@ -194,7 +204,7 @@ pub(crate) struct MemoryEffects {
 impl MemoryEffects {
     /// No in-memory effects.
     const NONE: Self = Self {
-        next_state: None,
+        next: Next::Keep,
         queue: QueueEffect::None,
     };
 }
@@ -205,8 +215,8 @@ impl MemoryEffects {
 /// [`phases`](Self::phases) separates memory effects around the durable write.
 #[derive(Clone, Debug)]
 pub(crate) struct Transition {
-    /// New registry state for the timer; `None` leaves the entry untouched.
-    next_state: Option<TimerState>,
+    /// The action to apply to the current registry state.
+    next: Next,
     /// Scheduler queue effect.
     queue: QueueEffect,
     /// Durable-store effect.
@@ -218,24 +228,40 @@ pub(crate) struct Transition {
 }
 
 impl Transition {
+    const CANCEL: Self = Self {
+        queue: QueueEffect::Remove,
+        store: StoreEffect::Delete,
+        announce: Some(Announce::Cancelled),
+        ..Self::NONE
+    };
     const DEACTIVATE: Self = Self {
         queue: QueueEffect::Deactivate,
         ..Self::NONE
     };
+    const DROP_REPLACEMENT: Self = Self {
+        next: Next::To(TimerState::Firing),
+        announce: Some(Announce::Cancelled),
+        ..Self::NONE
+    };
     /// A row with every effect at its no-op value.
     const NONE: Self = Self {
-        next_state: None,
+        next: Next::Keep,
         queue: QueueEffect::None,
         store: StoreEffect::None,
         ordering: EffectOrder::MemoryThenStore,
         announce: None,
     };
     const PARK: Self = Self {
-        next_state: Some(TimerState::Parked),
+        next: Next::To(TimerState::Parked),
+        ..Self::NONE
+    };
+    const RESCHEDULE: Self = Self {
+        next: Next::To(TimerState::FiringRescheduled(Item::Queued)),
+        queue: QueueEffect::Enqueue,
         ..Self::NONE
     };
     const SCHEDULE_KEY: Self = Self {
-        next_state: Some(TimerState::Scheduled),
+        next: Next::To(TimerState::Scheduled(Item::Queued)),
         store: StoreEffect::InsertKeyRow,
         ordering: EffectOrder::StoreThenMemory,
         announce: Some(Announce::Scheduled),
@@ -256,7 +282,7 @@ impl Transition {
     /// halves according to the row's [`EffectOrder`].
     pub(crate) fn phases(&self) -> (MemoryEffects, MemoryEffects) {
         let all = MemoryEffects {
-            next_state: self.next_state.clone(),
+            next: self.next.clone(),
             queue: self.queue,
         };
         match self.ordering {
@@ -269,8 +295,9 @@ impl Transition {
 /// A concurrent registry of active timer triggers.
 ///
 /// Maps each [`Key`] to a [`TriggerStateMap`] of `(CompactDateTime, TimerType)`
-/// to [`TimerState`]. This allows timers of different types to coexist at the
-/// same (key, time). Cloning shares the same underlying registry.
+/// to [`TimerState`]. Timers of different types can share a key and time.
+/// Item moves hold one entry guard. Transitions select actions and never copy
+/// an existing item's location. Cloning shares the registry.
 #[derive(Clone, Debug, Default)]
 pub struct ActiveTriggers(Arc<scc::HashMap<Key, TriggerStateMap>>);
 
@@ -283,7 +310,7 @@ impl ActiveTriggers {
     /// exists.
     pub async fn insert(&self, trigger: Trigger) {
         let entry = ActiveTriggerEntry {
-            state: TimerState::Scheduled,
+            state: TimerState::Scheduled(Item::Queued),
         };
         self.0
             .entry_async(trigger.key)
@@ -313,7 +340,7 @@ impl ActiveTriggers {
 
     /// Returns the state of a given trigger time and type for a key, or
     /// `None` if the registry contains no such entry.
-    pub async fn get_state(
+    pub(crate) async fn get_state(
         &self,
         key: &Key,
         time: CompactDateTime,
@@ -325,6 +352,42 @@ impl ActiveTriggers {
             })
             .await
             .flatten()
+    }
+
+    /// Returns this key's active attempt for the timer type.
+    /// Per-key dispatch permits at most one such attempt.
+    pub(crate) async fn attempt(
+        &self,
+        key: &Key,
+        timer_type: TimerType,
+    ) -> Option<(CompactDateTime, TimerState)> {
+        self.0
+            .read_async(key, |_, states| {
+                states.iter().find_map(|(&(time, kind), entry)| {
+                    (kind == timer_type
+                        && matches!(
+                            entry.state,
+                            TimerState::Firing
+                                | TimerState::FiringRescheduled(_)
+                                | TimerState::FiringReplaced(_)
+                        ))
+                    .then(|| (time, entry.state.clone()))
+                })
+            })
+            .await
+            .flatten()
+    }
+
+    /// Returns the attempt coordinate and its pending replacement.
+    pub(crate) async fn pending_replacement(
+        &self,
+        key: &Key,
+        timer_type: TimerType,
+    ) -> Option<(CompactDateTime, Trigger)> {
+        match self.attempt(key, timer_type).await {
+            Some((time, TimerState::FiringReplaced(next))) => Some((time, next)),
+            _ => None,
+        }
     }
 
     /// Checks whether a given trigger time and type is active for a key.
@@ -344,13 +407,15 @@ impl ActiveTriggers {
         self.get_state(key, time, timer_type)
             .await
             .is_some_and(|state| {
-                matches!(state, TimerState::Scheduled | TimerState::FiringRescheduled)
+                matches!(
+                    state,
+                    TimerState::Scheduled(_) | TimerState::FiringRescheduled(_)
+                )
             })
     }
 
-    /// Atomically sets the state of a timer (preserves tag). Returns `true`
-    /// if the state was set (timer exists), `false` otherwise.
-    pub async fn set_state(
+    /// Applies [`Next::To`]. Returns `true` if the timer exists.
+    pub(crate) async fn set_state(
         &self,
         key: &Key,
         time: CompactDateTime,
@@ -365,6 +430,60 @@ impl ActiveTriggers {
             }
         }
         false
+    }
+
+    /// Ends a rescheduled attempt and keeps its current item.
+    pub(crate) async fn idle(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
+        if let Entry::Occupied(mut occupied) = self.0.entry_async(key.clone()).await
+            && let Some(entry) = occupied.get_mut().get_mut(&(time, timer_type))
+            && let TimerState::FiringRescheduled(item) = &entry.state
+        {
+            entry.state = TimerState::Scheduled(*item);
+        }
+    }
+
+    /// Moves a queued item into the registry before delivery.
+    pub(crate) async fn deliver(&self, trigger: &Trigger) {
+        if let Entry::Occupied(mut occupied) = self.0.entry_async(trigger.key.clone()).await
+            && let Some(ActiveTriggerEntry {
+                state:
+                    TimerState::Scheduled(item @ Item::Queued)
+                    | TimerState::FiringRescheduled(item @ Item::Queued),
+            }) = occupied
+                .get_mut()
+                .get_mut(&(trigger.time, trigger.timer_type))
+        {
+            *item = Item::Delivered { tag: trigger.tag };
+        }
+    }
+
+    /// Starts a delivered item's attempt and returns its tag.
+    pub(crate) async fn fire(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Option<i32> {
+        if let Entry::Occupied(mut occupied) = self.0.entry_async(key.clone()).await
+            && let Some(entry) = occupied.get_mut().get_mut(&(time, timer_type))
+            && let TimerState::Scheduled(Item::Delivered { tag }) = entry.state
+        {
+            entry.state = TimerState::Firing;
+            Some(tag)
+        } else {
+            None
+        }
+    }
+
+    /// Sets the tag of a delivered item after its state change.
+    pub(crate) async fn retag_delivered(&self, trigger: &Trigger) {
+        if let Some(mut entry) = self.0.get_async(&trigger.key).await
+            && let Some(ActiveTriggerEntry {
+                state: TimerState::Scheduled(Item::Delivered { tag }),
+            }) = entry.get_mut().get_mut(&(trigger.time, trigger.timer_type))
+        {
+            *tag = trigger.tag;
+        }
     }
 
     /// Invokes a closure for every active trigger time and type in the
@@ -402,7 +521,7 @@ impl ActiveTriggers {
                         entry.state,
                         TimerState::Firing
                             | TimerState::FiringReplaced(_)
-                            | TimerState::FiringRescheduled
+                            | TimerState::FiringRescheduled(_)
                     ) {
                         s.in_flight = s.in_flight.saturating_add(1);
                     }
@@ -438,21 +557,22 @@ pub(crate) fn transition(prior: Option<&TimerState>, op: TimerOp) -> Transition 
     match (op, prior) {
         // Queue the next fire. The attempt keeps its rows. A pending
         // replacement is dropped; `TimerManager::schedule` wrote it first.
-        (Op::Schedule | Op::ClearSchedule, Some(Firing | FiringReplaced(_))) => Transition {
-            next_state: Some(FiringRescheduled),
-            queue: QueueEffect::Enqueue,
-            ..Transition::NONE
-        },
+        (Op::Schedule | Op::ClearSchedule, Some(Firing | FiringReplaced(_))) => {
+            Transition::RESCHEDULE
+        }
+
+        // Cancel the replacement before it reaches the store.
+        (Op::DropReplacement, Some(FiringReplaced(_))) => Transition::DROP_REPLACEMENT,
 
         // Keep the newest replacement until the attempt commits.
         (Op::ClearReplaced(next), Some(Firing | FiringReplaced(_))) => Transition {
-            next_state: Some(FiringReplaced(next)),
+            next: Next::To(FiringReplaced(next)),
             ..Transition::NONE
         },
 
-        // Cancel the queued refire and keep the replacement.
-        (Op::ClearReplaced(next), Some(FiringRescheduled)) => Transition {
-            next_state: Some(FiringReplaced(next)),
+        // Cancel the next item and keep the replacement.
+        (Op::ClearReplaced(next), Some(FiringRescheduled(_))) => Transition {
+            next: Next::To(FiringReplaced(next)),
             queue: QueueEffect::Dequeue,
             ..Transition::NONE
         },
@@ -464,8 +584,11 @@ pub(crate) fn transition(prior: Option<&TimerState>, op: TimerOp) -> Transition 
             ..Transition::SCHEDULE_KEY
         },
 
-        // Keep the queued trigger and its slab tag on a repeat schedule.
-        (Op::Schedule, Some(Scheduled)) => Transition::SCHEDULE_KEY,
+        // Keep the queued or delivered tag until fire reads it.
+        (Op::Schedule, Some(Scheduled(_))) => Transition {
+            next: Next::Keep,
+            ..Transition::SCHEDULE_KEY
+        },
 
         // Queue the parked coordinate after its key row is ready.
         (Op::Schedule, Some(Parked)) => Transition {
@@ -474,30 +597,25 @@ pub(crate) fn transition(prior: Option<&TimerState>, op: TimerOp) -> Transition 
         },
 
         // Cancel the next fire. The current attempt keeps its rows until commit.
-        (Op::Unschedule, Some(FiringRescheduled)) => Transition {
-            next_state: Some(Firing),
+        (Op::Unschedule, Some(FiringRescheduled(_))) => Transition {
+            next: Next::To(Firing),
             queue: QueueEffect::Dequeue,
             ..Transition::NONE
         },
 
         // Cancel the timer before its durable rows disappear.
-        (Op::Unschedule, Some(Scheduled | Parked) | None) => Transition {
-            queue: QueueEffect::Remove,
-            store: StoreEffect::Delete,
-            announce: Some(Announce::Cancelled),
-            ..Transition::NONE
-        },
+        (Op::Unschedule, Some(Scheduled(_) | Parked) | None) => Transition::CANCEL,
 
         // Remove the replaced timer. The caller deletes its rows and emits telemetry.
-        (Op::ClearReplaced(_), Some(Scheduled | Parked) | None) => Transition {
+        (Op::ClearReplaced(_), Some(Scheduled(_) | Parked) | None) => Transition {
             queue: QueueEffect::Remove,
             store: StoreEffect::DeleteSlabRow,
             ..Transition::NONE
         },
 
-        // Rotate the tag before the queued timer can fire as a new attempt.
-        (Op::Complete | Op::Receipt | Op::Retire, Some(FiringRescheduled)) => Transition {
-            next_state: Some(Scheduled),
+        // Rotate the item tag before the next attempt.
+        (Op::Complete | Op::Receipt | Op::Retire, Some(FiringRescheduled(_))) => Transition {
+            next: Next::Idle,
             store: StoreEffect::UpdateTag,
             queue: QueueEffect::Retag,
             ordering: StoreThenMemory,
@@ -505,7 +623,7 @@ pub(crate) fn transition(prior: Option<&TimerState>, op: TimerOp) -> Transition 
         },
 
         // Remove the entry and rows because the attempt committed without a next fire.
-        (Op::Complete, Some(Firing | Scheduled | Parked) | None) => Transition {
+        (Op::Complete, Some(Firing | Scheduled(_) | Parked) | None) => Transition {
             store: StoreEffect::Delete,
             ..Transition::DEACTIVATE
         },
@@ -540,14 +658,14 @@ pub(crate) fn transition(prior: Option<&TimerState>, op: TimerOp) -> Transition 
             ..Transition::DEACTIVATE
         },
 
-        // Keep the queued timer so another attempt can fire after abort.
-        (Op::Abort, Some(FiringRescheduled)) => Transition {
-            next_state: Some(Scheduled),
+        // Keep the item so another attempt can fire after abort.
+        (Op::Abort, Some(FiringRescheduled(_))) => Transition {
+            next: Next::Idle,
             ..Transition::NONE
         },
 
-        // Park a queued timer. Its rows remain for reload or another schedule.
-        (Op::Abort, Some(Scheduled)) => Transition {
+        // Park the timer. Its rows remain for reload or another schedule.
+        (Op::Abort, Some(Scheduled(_))) => Transition {
             queue: QueueEffect::Dequeue,
             ..Transition::PARK
         },
@@ -556,20 +674,25 @@ pub(crate) fn transition(prior: Option<&TimerState>, op: TimerOp) -> Transition 
         (Op::Abort, Some(Firing | FiringReplaced(_))) => Transition::PARK,
 
         // Queue the timer after the caller's atomic write restores its rows.
-        (Op::ClearSchedule, Some(Scheduled | Parked) | None) => Transition {
-            next_state: Some(Scheduled),
+        (Op::ClearSchedule, Some(Parked) | None) => Transition {
+            next: Next::To(Scheduled(Item::Queued)),
             queue: QueueEffect::Insert,
             ordering: StoreThenMemory,
             ..Transition::NONE
         },
 
-        // Keep the current state when the operation has no work to do.
-        (Op::Schedule | Op::ClearSchedule, Some(FiringRescheduled))
+        // A clear on a scheduled timer keeps its item. The caller rewrites the key row.
+        // These operations keep the current state and have no other work.
+        (Op::ClearSchedule | Op::Retire, Some(Scheduled(_)))
+        | (Op::Schedule | Op::ClearSchedule, Some(FiringRescheduled(_)))
         | (Op::Unschedule, Some(Firing))
         | (Op::Unschedule | Op::Retire, Some(FiringReplaced(_)))
-        | (Op::Receipt, Some(Scheduled | Parked) | None)
+        | (Op::Receipt, Some(Scheduled(_) | Parked) | None)
         | (Op::Abort, Some(Parked) | None)
-        | (Op::Retire, Some(Scheduled)) => Transition::NONE,
+        | (
+            Op::DropReplacement,
+            Some(Scheduled(_) | Firing | FiringRescheduled(_) | Parked) | None,
+        ) => Transition::NONE,
     }
 }
 
