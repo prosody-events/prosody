@@ -1175,7 +1175,7 @@ where
         })
 }
 
-/// Cleans up all test data using only public `TriggerStore` API.
+/// Removes all test data through the `TableAdapter`.
 async fn cleanup_test_data<S>(
     store: &TableAdapter<S>,
     model: &HighLevelModel,

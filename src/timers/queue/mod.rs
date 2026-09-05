@@ -57,25 +57,19 @@ impl TriggerQueue {
     /// scheduled, the queued trigger adopts the new trigger's trace so that
     /// `onTimer` fires under the most recent caller's trace context.
     pub async fn insert(&mut self, trigger: Trigger) {
-        if self.enqueue(trigger.clone()) {
-            self.active.insert(trigger).await;
+        if self.queue_keys.contains_key(&trigger) || self.active.queue(&trigger).await {
+            self.enqueue(trigger);
         }
     }
 
     /// Waits for and returns the next expired [`Trigger`], if any.
     ///
-    /// Asynchronously polls the internal delay queue for the next item whose
-    /// delay has elapsed. Once retrieved, the trigger is removed from the
-    /// `queue_keys` map. Returns `None` if the underlying queue has been
-    /// closed.
+    /// The pop has no await after removal, so a `select!` branch can cancel it
+    /// safely. The caller must record delivery in the selected branch body.
     pub async fn next(&mut self) -> Option<Trigger> {
-        // Poll for the next expired item.
         let expired = poll_fn(|cx| self.queue.poll_expired(cx)).await?;
-        // Remove its scheduling key to allow potential rescheduling.
         self.queue_keys.remove(expired.get_ref());
-        let trigger = expired.into_inner();
-        self.active.deliver(&trigger).await;
-        Some(trigger)
+        Some(expired.into_inner())
     }
 
     /// Remove a live schedule. `trigger.tag` is the key row tag; a queued item
@@ -113,16 +107,16 @@ impl TriggerQueue {
         self.enqueue(trigger);
     }
 
-    /// Adds a trigger to the delay queue, returning `true` if newly inserted.
+    /// Adds a trigger to the delay queue.
     ///
     /// If the trigger already exists (same key, time, and type), the queued
     /// trigger adopts the new trigger's trace so `onTimer` fires under the
-    /// most recent caller's trace context, and returns `false`.
-    fn enqueue(&mut self, trigger: Trigger) -> bool {
+    /// most recent caller's trace context.
+    fn enqueue(&mut self, trigger: Trigger) {
         let vacant = match self.queue_keys.entry(trigger.clone()) {
             Entry::Occupied(occupied) => {
                 occupied.key().adopt_trace_from(&trigger);
-                return false;
+                return;
             }
             Entry::Vacant(vacant) => vacant,
         };
@@ -130,7 +124,6 @@ impl TriggerQueue {
         let delay = trigger.time.duration_from_now().unwrap_or(Duration::ZERO);
         let queue_key = self.queue.insert(trigger, delay);
         vacant.insert(queue_key);
-        true
     }
 
     /// Change the item tag at its current location. Keep its deadline and

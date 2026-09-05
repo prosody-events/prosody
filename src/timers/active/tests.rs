@@ -74,9 +74,11 @@ impl Arbitrary for Op {
         let ty = TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
         let states = [
             TimerState::Scheduled(Item::Queued),
+            TimerState::Scheduled(Item::Delivered { tag: 42_i32 }),
             TimerState::Firing,
             TimerState::FiringReplaced(Trigger::new(key.clone(), time, ty, Span::none())),
             TimerState::FiringRescheduled(Item::Queued),
+            TimerState::FiringRescheduled(Item::Delivered { tag: 42_i32 }),
             TimerState::Parked,
         ];
         match u8::arbitrary(g) % 3 {
@@ -189,12 +191,17 @@ async fn run_trace(trace: Trace) {
 
         match op {
             Op::Insert { key, time, ty } => {
-                active
-                    .insert(Trigger::new(key.clone(), time, ty, Span::current()))
+                let got = active
+                    .queue(&Trigger::new(key.clone(), time, ty, Span::current()))
                     .await;
-                model.entry((key, time, ty)).or_insert(ActiveTriggerEntry {
-                    state: TimerState::Scheduled(Item::Queued),
+                let entry = model.entry((key, time, ty)).or_insert(ActiveTriggerEntry {
+                    state: TimerState::Parked,
                 });
+                let want = entry.state == TimerState::Parked;
+                if want {
+                    entry.state = TimerState::Scheduled(Item::Queued);
+                }
+                assert_eq!(got, want, "queue return");
             }
             Op::Remove { key, time, ty } => {
                 active.remove(&key, time, ty).await;
@@ -245,7 +252,7 @@ async fn completion_keeps_item_delivered_after_state_read() -> color_eyre::Resul
         42,
         Span::none(),
     );
-    active.insert(trigger.clone()).await;
+    ensure!(active.queue(&trigger).await);
     ensure!(
         active
             .set_state(

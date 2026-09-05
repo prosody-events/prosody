@@ -19,6 +19,7 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::store::RetainOldSlab;
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
+#[cfg(test)]
 use scc::hash_map::Entry;
 use std::sync::Arc;
 
@@ -255,13 +256,15 @@ impl Transition {
         next: Next::To(TimerState::Parked),
         ..Self::NONE
     };
+    // Enqueue creates the item in this memory phase, so this state cannot overwrite
+    // an existing item location.
     const RESCHEDULE: Self = Self {
         next: Next::To(TimerState::FiringRescheduled(Item::Queued)),
         queue: QueueEffect::Enqueue,
         ..Self::NONE
     };
     const SCHEDULE_KEY: Self = Self {
-        next: Next::To(TimerState::Scheduled(Item::Queued)),
+        next: Next::Keep,
         store: StoreEffect::InsertKeyRow,
         ordering: EffectOrder::StoreThenMemory,
         announce: Some(Announce::Scheduled),
@@ -302,23 +305,26 @@ impl Transition {
 pub struct ActiveTriggers(Arc<scc::HashMap<Key, TriggerStateMap>>);
 
 impl ActiveTriggers {
-    /// Inserts a trigger into the active registry with
-    /// [`TimerState::Scheduled`] state.
-    ///
-    /// Creates a new map of (time, type) to entry if no entry exists for the
-    /// trigger's key. Duplicate insertions are ignored if the trigger already
-    /// exists.
-    pub async fn insert(&self, trigger: Trigger) {
-        let entry = ActiveTriggerEntry {
-            state: TimerState::Scheduled(Item::Queued),
-        };
-        self.0
-            .entry_async(trigger.key)
-            .await
-            .or_default()
+    #[cfg(test)]
+    pub(super) async fn lock_key(&self, key: &Key) -> Entry<'_, Key, TriggerStateMap> {
+        self.0.entry_async(key.clone()).await
+    }
+
+    /// Creates a queued item only when the coordinate is absent or parked.
+    /// The entry guard keeps each existing item's location unchanged.
+    pub(crate) async fn queue(&self, trigger: &Trigger) -> bool {
+        let mut occupied = self.0.entry_async(trigger.key.clone()).await.or_default();
+        let entry = occupied
             .get_mut()
             .entry((trigger.time, trigger.timer_type))
-            .or_insert(entry);
+            .or_insert(ActiveTriggerEntry {
+                state: TimerState::Parked,
+            });
+        if entry.state != TimerState::Parked {
+            return false;
+        }
+        entry.state = TimerState::Scheduled(Item::Queued);
+        true
     }
 
     /// Removes a trigger time for a specific key and timer type.
@@ -328,7 +334,7 @@ impl ActiveTriggers {
     /// effect.
     pub async fn remove(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
         // Look up the entry; if it exists, remove the (time, type) entry and clean up.
-        if let Entry::Occupied(mut occupied) = self.0.entry_async(key.clone()).await {
+        if let Some(mut occupied) = self.0.get_async(key).await {
             let states = occupied.get_mut();
             states.remove(&(time, timer_type));
 
@@ -422,7 +428,7 @@ impl ActiveTriggers {
         timer_type: TimerType,
         state: TimerState,
     ) -> bool {
-        if let Entry::Occupied(mut occupied) = self.0.entry_async(key.clone()).await {
+        if let Some(mut occupied) = self.0.get_async(key).await {
             let states = occupied.get_mut();
             if let Some(entry) = states.get_mut(&(time, timer_type)) {
                 entry.state = state;
@@ -434,7 +440,7 @@ impl ActiveTriggers {
 
     /// Ends a rescheduled attempt and keeps its current item.
     pub(crate) async fn idle(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
-        if let Entry::Occupied(mut occupied) = self.0.entry_async(key.clone()).await
+        if let Some(mut occupied) = self.0.get_async(key).await
             && let Some(entry) = occupied.get_mut().get_mut(&(time, timer_type))
             && let TimerState::FiringRescheduled(item) = &entry.state
         {
@@ -444,7 +450,7 @@ impl ActiveTriggers {
 
     /// Moves a queued item into the registry before delivery.
     pub(crate) async fn deliver(&self, trigger: &Trigger) {
-        if let Entry::Occupied(mut occupied) = self.0.entry_async(trigger.key.clone()).await
+        if let Some(mut occupied) = self.0.get_async(&trigger.key).await
             && let Some(ActiveTriggerEntry {
                 state:
                     TimerState::Scheduled(item @ Item::Queued)
@@ -464,7 +470,7 @@ impl ActiveTriggers {
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Option<i32> {
-        if let Entry::Occupied(mut occupied) = self.0.entry_async(key.clone()).await
+        if let Some(mut occupied) = self.0.get_async(key).await
             && let Some(entry) = occupied.get_mut().get_mut(&(time, timer_type))
             && let TimerState::Scheduled(Item::Delivered { tag }) = entry.state
         {
@@ -585,10 +591,7 @@ pub(crate) fn transition(prior: Option<&TimerState>, op: TimerOp) -> Transition 
         },
 
         // Keep the queued or delivered tag until fire reads it.
-        (Op::Schedule, Some(Scheduled(_))) => Transition {
-            next: Next::Keep,
-            ..Transition::SCHEDULE_KEY
-        },
+        (Op::Schedule, Some(Scheduled(_))) => Transition::SCHEDULE_KEY,
 
         // Queue the parked coordinate after its key row is ready.
         (Op::Schedule, Some(Parked)) => Transition {
@@ -675,7 +678,6 @@ pub(crate) fn transition(prior: Option<&TimerState>, op: TimerOp) -> Transition 
 
         // Queue the timer after the caller's atomic write restores its rows.
         (Op::ClearSchedule, Some(Parked) | None) => Transition {
-            next: Next::To(Scheduled(Item::Queued)),
             queue: QueueEffect::Insert,
             ordering: StoreThenMemory,
             ..Transition::NONE

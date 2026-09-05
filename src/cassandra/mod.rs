@@ -173,20 +173,15 @@ impl CassandraStore {
     }
 
     /// Returns the TTL bind value for the target time plus base retention.
-    /// Zero means no expiry when the value exceeds Cassandra's limit or cannot
-    /// fit.
+    /// Zero disables expiry at or above Cassandra's limit.
     #[must_use]
     pub fn calculate_ttl(&self, target_time: CompactDateTime) -> i32 {
-        let Ok(duration) = target_time.compact_duration_from_now() else {
-            return self.base_ttl().seconds().try_into().unwrap_or(0);
+        let base = u64::from(self.base_ttl().seconds());
+        let ttl = match target_time.compact_duration_from_now() {
+            Ok(duration) => base + u64::from(duration.seconds()),
+            Err(_) => base,
         };
-        let Ok(ttl) = duration.checked_add(self.base_ttl()) else {
-            return 0;
-        };
-        match i32::try_from(ttl.seconds()) {
-            Ok(ttl) if i64::from(ttl) < MAX_CASSANDRA_TTL_SECS => ttl,
-            _ => 0,
-        }
+        ttl_bind(ttl)
     }
 
     /// Executes an unpaged mutation and discards the result.
@@ -314,6 +309,14 @@ impl<R> BatchUnit<R> {
     /// decision (`fits_one_batch` in the cell store) over the same weights.
     pub(crate) fn weight(&self) -> u64 {
         self.weight
+    }
+}
+
+/// Caps a TTL bind value; zero disables expiry at or above Cassandra's limit.
+fn ttl_bind(seconds: u64) -> i32 {
+    match i32::try_from(seconds) {
+        Ok(ttl) if i64::from(ttl) < MAX_CASSANDRA_TTL_SECS => ttl,
+        _ => 0,
     }
 }
 

@@ -171,6 +171,7 @@ pub(super) async fn run_actor<T>(
                     process_command(&mut state, &mut triggers, command).await;
                 }
                 Some(trigger) = triggers.next() => {
+                    triggers.active_triggers().deliver(&trigger).await;
                     if let Err(err) = trigger_tx.try_send(trigger) {
                         match err {
                             TrySendError::Full(t) => trigger_to_send = Some(t),

@@ -3,9 +3,79 @@ use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger};
-use color_eyre::eyre::{Result, bail};
+use color_eyre::eyre::{Result, bail, ensure};
+use futures::poll;
 use opentelemetry::Context;
+use std::pin::pin;
+use std::task::Poll;
 use tokio::time::{Duration, advance, pause};
+
+#[tokio::test(start_paused = true)]
+async fn next_completes_while_registry_guard_is_held() -> Result<()> {
+    let mut queue = TriggerQueue::new();
+    let trigger = Trigger::for_testing(
+        Key::from("guard-held"),
+        CompactDateTime::now()?,
+        TimerType::Application,
+    );
+    ensure!(queue.active.queue(&trigger).await);
+    let active = queue.active.clone();
+    let guard = active.lock_key(&trigger.key).await;
+    queue.insert_queue_only(trigger.clone());
+
+    let result = poll!(pin!(queue.next()));
+    assert!(
+        queue.queue.is_empty(),
+        "The pop must remove the expired item"
+    );
+    assert!(
+        queue.queue_keys.is_empty(),
+        "The pop must remove its queue key"
+    );
+    assert_eq!(result, Poll::Ready(Some(trigger.clone())));
+    drop(guard);
+
+    assert_eq!(
+        active
+            .get_state(&trigger.key, trigger.time, trigger.timer_type)
+            .await,
+        Some(TimerState::Scheduled(Item::Queued)),
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn insert_keeps_a_delivered_item() -> Result<()> {
+    let mut queue = TriggerQueue::new();
+    let trigger = Trigger::restored(
+        Key::from("already-delivered"),
+        CompactDateTime::now()?,
+        TimerType::Application,
+        42,
+        Context::new(),
+    );
+    ensure!(queue.active.queue(&trigger).await);
+    queue.active.deliver(&trigger).await;
+
+    queue.insert(trigger.clone()).await;
+
+    ensure!(
+        queue.queue.is_empty(),
+        "A delivered item must not enter the queue again"
+    );
+    ensure!(
+        queue.queue_keys.is_empty(),
+        "A delivered item must have no queue key"
+    );
+    assert_eq!(
+        queue
+            .active
+            .get_state(&trigger.key, trigger.time, trigger.timer_type)
+            .await,
+        Some(TimerState::Scheduled(Item::Delivered { tag: trigger.tag })),
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_insert_and_next() -> Result<()> {
@@ -64,10 +134,7 @@ async fn test_remove_clears_active_registry() -> Result<()> {
     advance(Duration::from_secs(5)).await;
     assert!(triggers.next().await.is_none());
 
-    // Re-insert, then let it fire via `next()` — this pops the delay-queue
-    // entry (`queue_keys`) and records its delivered location in `ActiveTriggers`,
-    // reproducing the "delivered but not yet transitioned to Firing" case
-    // `remove`'s doc names as case 2.
+    // Pop the item, then record delivery as the actor does.
     let time = CompactDateTime::now()?.add_duration(CompactDuration::new(5))?;
     let trigger = Trigger::for_testing(key.clone(), time, TimerType::Application);
     triggers.insert(trigger.clone()).await;
@@ -75,6 +142,7 @@ async fn test_remove_clears_active_registry() -> Result<()> {
     let Some(delivered) = triggers.next().await else {
         bail!("No expired trigger found");
     };
+    triggers.active_triggers().deliver(&delivered).await;
     assert_eq!(delivered, trigger);
     assert!(
         triggers
