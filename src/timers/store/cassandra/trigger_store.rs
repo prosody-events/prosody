@@ -192,14 +192,9 @@ impl TriggerOperations for CassandraTriggerStore {
         let segment_id = self.segment.id;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
 
-        self.execute_with_optional_ttl(
-            slab.range().end,
-            &self.queries().insert_slab,
-            &self.queries().insert_slab_no_ttl,
-            |ttl| (segment_id, slab_id, ttl),
-            || (segment_id, slab_id),
-        )
-        .await
+        let ttl = self.calculate_ttl(slab.range().end);
+        self.execute_unpaged_discard(&self.queries().insert_slab, (segment_id, slab_id, ttl))
+            .await
     }
 
     #[instrument(level = "debug", skip(self), err)]
@@ -244,12 +239,10 @@ impl TriggerOperations for CassandraTriggerStore {
         // same lifetime as `insert_slab` and slab triggers.
         let anchor_time = anchor_after_watermark(watermark, self.segment.slab_size);
 
-        self.execute_with_optional_ttl(
-            anchor_time,
+        let ttl = self.calculate_ttl(anchor_time);
+        self.execute_unpaged_discard(
             &self.queries().set_slab_watermark,
-            &self.queries().set_slab_watermark_no_ttl,
-            |ttl| (ttl, watermark_i32, segment_id),
-            || (watermark_i32, segment_id),
+            (ttl, watermark_i32, segment_id),
         )
         .await
     }
@@ -271,12 +264,10 @@ impl TriggerOperations for CassandraTriggerStore {
         // without finding them already TTL'd out.
         let anchor_time = slab.range().end;
 
-        self.execute_with_optional_ttl(
-            anchor_time,
+        let ttl = self.calculate_ttl(anchor_time);
+        self.execute_unpaged_discard(
             &self.queries().batch_insert_slab_with_watermark,
-            &self.queries().batch_insert_slab_with_watermark_no_ttl,
-            |ttl| (segment_id, slab_id, ttl, ttl, watermark_i32, segment_id),
-            || (segment_id, slab_id, watermark_i32, segment_id),
+            (segment_id, slab_id, ttl, ttl, watermark_i32, segment_id),
         )
         .await
     }
@@ -360,20 +351,12 @@ impl TriggerOperations for CassandraTriggerStore {
         let timer_type = trigger.timer_type;
         let tag = trigger.tag;
 
-        self.execute_with_optional_ttl(
-            slab.range().end,
+        let ttl = self.calculate_ttl(slab.range().end);
+        self.execute_unpaged_discard(
             &self.queries().insert_slab_trigger,
-            &self.queries().insert_slab_trigger_no_ttl,
-            |ttl| {
-                (
-                    segment_id, slab_size, slab_id, timer_type, key, time, &span_map, tag, ttl,
-                )
-            },
-            || {
-                (
-                    segment_id, slab_size, slab_id, timer_type, key, time, &span_map, tag,
-                )
-            },
+            (
+                segment_id, slab_size, slab_id, timer_type, key, time, &span_map, tag, ttl,
+            ),
         )
         .await
     }
@@ -1099,32 +1082,19 @@ impl PendingKeyTrigger {
         store: &CassandraTriggerStore,
         segment_id: &SegmentId,
     ) -> Result<(), CassandraTriggerStoreError> {
+        let ttl = store.calculate_ttl(self.id.time);
         store
-            .execute_with_optional_ttl(
-                self.id.time,
+            .execute_unpaged_discard(
                 &store.queries().insert_key_trigger_clustering,
-                &store.queries().insert_key_trigger_clustering_no_ttl,
-                |ttl| {
-                    (
-                        segment_id,
-                        self.id.key.as_ref(),
-                        self.id.timer_type,
-                        self.id.time,
-                        &self.span_map,
-                        self.tag,
-                        ttl,
-                    )
-                },
-                || {
-                    (
-                        segment_id,
-                        self.id.key.as_ref(),
-                        self.id.timer_type,
-                        self.id.time,
-                        &self.span_map,
-                        self.tag,
-                    )
-                },
+                (
+                    segment_id,
+                    self.id.key.as_ref(),
+                    self.id.timer_type,
+                    self.id.time,
+                    &self.span_map,
+                    self.tag,
+                    ttl,
+                ),
             )
             .await
     }

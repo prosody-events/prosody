@@ -39,41 +39,22 @@ impl SerializeRow for StageRow<'_> {
         writer: &mut RowWriter<'_>,
     ) -> Result<(), SerializationError> {
         let a = &self.addr;
-        // The `ttl` arms differ only by the leading `USING TTL ?` column the
-        // no-TTL statement omits; `kind` leads the clustering key.
-        match self.ttl {
-            Some(ttl) => (
-                ttl,
-                self.data,
-                self.prev_data,
-                self.encoding,
-                self.version,
-                self.event,
-                a.pk.segment_id,
-                a.pk.key,
-                a.pk.state_type,
-                a.pk.name,
-                CellKind::Cell,
-                a.section,
-                a.coordinate,
-            )
-                .serialize(ctx, writer),
-            None => (
-                self.data,
-                self.prev_data,
-                self.encoding,
-                self.version,
-                self.event,
-                a.pk.segment_id,
-                a.pk.key,
-                a.pk.state_type,
-                a.pk.name,
-                CellKind::Cell,
-                a.section,
-                a.coordinate,
-            )
-                .serialize(ctx, writer),
-        }
+        (
+            self.ttl,
+            self.data,
+            self.prev_data,
+            self.encoding,
+            self.version,
+            self.event,
+            a.pk.segment_id,
+            a.pk.key,
+            a.pk.state_type,
+            a.pk.name,
+            CellKind::Cell,
+            a.section,
+            a.coordinate,
+        )
+            .serialize(ctx, writer)
     }
 
     fn is_empty(&self) -> bool {
@@ -88,35 +69,20 @@ impl SerializeRow for ResolvedRow<'_> {
         writer: &mut RowWriter<'_>,
     ) -> Result<(), SerializationError> {
         let a = &self.addr;
-        match self.ttl {
-            Some(ttl) => (
-                ttl,
-                self.data,
-                self.encoding,
-                self.version,
-                a.pk.segment_id,
-                a.pk.key,
-                a.pk.state_type,
-                a.pk.name,
-                CellKind::Cell,
-                a.section,
-                a.coordinate,
-            )
-                .serialize(ctx, writer),
-            None => (
-                self.data,
-                self.encoding,
-                self.version,
-                a.pk.segment_id,
-                a.pk.key,
-                a.pk.state_type,
-                a.pk.name,
-                CellKind::Cell,
-                a.section,
-                a.coordinate,
-            )
-                .serialize(ctx, writer),
-        }
+        (
+            self.ttl,
+            self.data,
+            self.encoding,
+            self.version,
+            a.pk.segment_id,
+            a.pk.key,
+            a.pk.state_type,
+            a.pk.name,
+            CellKind::Cell,
+            a.section,
+            a.coordinate,
+        )
+            .serialize(ctx, writer)
     }
 
     fn is_empty(&self) -> bool {
@@ -131,40 +97,21 @@ impl SerializeRow for MarkerWriteRow<'_> {
         writer: &mut RowWriter<'_>,
     ) -> Result<(), SerializationError> {
         let a = &self.addr;
-        // The `ttl` arms differ only by the leading `USING TTL ?` column the
-        // no-TTL statement omits (as `StageRow`). The payload always carries
-        // this build's encoding/version stamps.
-        match self.ttl {
-            Some(ttl) => (
-                ttl,
-                self.payload,
-                self.encoding,
-                INITIAL_VERSION,
-                self.event,
-                a.pk.segment_id,
-                a.pk.key,
-                a.pk.state_type,
-                a.pk.name,
-                CellKind::Marker,
-                a.section,
-                a.coordinate,
-            )
-                .serialize(ctx, writer),
-            None => (
-                self.payload,
-                self.encoding,
-                INITIAL_VERSION,
-                self.event,
-                a.pk.segment_id,
-                a.pk.key,
-                a.pk.state_type,
-                a.pk.name,
-                CellKind::Marker,
-                a.section,
-                a.coordinate,
-            )
-                .serialize(ctx, writer),
-        }
+        (
+            self.ttl,
+            self.payload,
+            self.encoding,
+            INITIAL_VERSION,
+            self.event,
+            a.pk.segment_id,
+            a.pk.key,
+            a.pk.state_type,
+            a.pk.name,
+            CellKind::Marker,
+            a.section,
+            a.coordinate,
+        )
+            .serialize(ctx, writer)
     }
 
     fn is_empty(&self) -> bool {

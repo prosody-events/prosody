@@ -94,9 +94,7 @@ mod store;
 mod write;
 
 use batch::{extend_gap_units, fits_one_batch, gap_count, marker_delete_unit, marker_last_split};
-use helpers::{
-    blob_weight, decode_provisional_batch, encode_cell_blobs, ttl_seconds_to_duration, ttl_to_i32,
-};
+use helpers::{blob_weight, decode_provisional_batch, encode_cell_blobs, ttl_seconds_to_duration};
 pub use queries::CellQueries;
 #[cfg(test)]
 use read::decode_rows_for_coordinates;
@@ -119,7 +117,7 @@ pub use encoding::EncodingError;
 use crate::cassandra::CassandraStore as CassandraSession;
 use crate::cassandra::TABLE_KEYED_STATE_CELL;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::cassandra::{BatchRow, BatchUnit};
+use crate::cassandra::{BatchRow, BatchUnit, bind_ttl};
 use crate::cassandra_queries;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};

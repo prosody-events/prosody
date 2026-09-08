@@ -142,11 +142,9 @@ pub(super) enum RowShape<'a> {
     GapBetween(GapBetweenRow<'a>),
 }
 
-/// The `write_provisional[_no_ttl]` bind shape. `ttl` selects the with-/no-TTL
-/// statement **and** the bound column count — kept consistent with the carried
-/// statement at the single construction site.
+/// The `write_provisional` bind shape. Its TTL comes from `bind_ttl`.
 pub(super) struct StageRow<'a> {
-    pub(super) ttl: Option<i32>,
+    pub(super) ttl: i32,
     pub(super) data: Option<&'a [u8]>,
     pub(super) prev_data: Option<&'a [u8]>,
     pub(super) encoding: Option<Encoding>,
@@ -155,22 +153,20 @@ pub(super) struct StageRow<'a> {
     pub(super) addr: CellAddr<'a>,
 }
 
-/// The `write_resolved[_no_ttl]` bind shape (committed `data` +
+/// The `write_resolved` bind shape (committed `data` +
 /// encoding/version; `prev_data`/`event` nulled by the statement).
+/// Its TTL comes from `bind_ttl`.
 pub(super) struct ResolvedRow<'a> {
-    pub(super) ttl: Option<i32>,
+    pub(super) ttl: i32,
     pub(super) data: Option<&'a [u8]>,
     pub(super) encoding: Option<Encoding>,
     pub(super) version: Option<i32>,
     pub(super) addr: CellAddr<'a>,
 }
 
-/// The `marker_write[_no_ttl]` bind shape: the encoded marker payload with its
-/// encoding/version, the staging event, and the fixed marker address. `ttl`
-/// selects the with-/no-TTL statement and the bound column count, exactly like
-/// [`StageRow`].
+/// The `marker_write` bind shape. Its TTL comes from `bind_ttl`.
 pub(super) struct MarkerWriteRow<'a> {
-    pub(super) ttl: Option<i32>,
+    pub(super) ttl: i32,
     pub(super) payload: &'a [u8],
     pub(super) encoding: Encoding,
     pub(super) event: EventRef,

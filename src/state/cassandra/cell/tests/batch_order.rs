@@ -74,9 +74,9 @@ async fn markerless_provisional_is_sweep_invisible_but_first_touch_repairs() -> 
     let unit = [BatchUnit::new(
         blob_weight(&blob),
         smallvec![CellBatchRow {
-            statement: &fx.queries.write_provisional_no_ttl,
+            statement: &fx.queries.write_provisional,
             row: RowShape::Stage(StageRow {
-                ttl: None,
+                ttl: 0,
                 data: blob.data(),
                 prev_data: None,
                 encoding: blob.encoding(),

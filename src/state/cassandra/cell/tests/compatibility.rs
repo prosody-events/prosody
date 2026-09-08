@@ -245,22 +245,17 @@ fn prop_cassandra_present_cell_is_uniquely_owned() {
         .quickcheck(prop as fn(Vec<u8>) -> TestResult);
 }
 
-/// Co-anchoring regression-prover: every cell of one multi-cell
-/// write under a collection TTL must share a single write timestamp **and**
-/// TTL. One same-partition `UNLOGGED BATCH` carries one batch write timestamp
-/// and one coordinator TTL anchor, so `WRITETIME(data)` and `TTL(data)` are
-/// identical across the cells; the old per-cell `execute()` loop stamped each
-/// statement with a *distinct* monotonic client timestamp, so this fails
-/// **deterministically** against it — the discriminator is the timestamp, not
-/// wall-clock TTL drift, so there is no second-boundary flakiness. Run over
-/// multi-cell writes of varying cardinality and payload sizes.
+/// One batch shares a write timestamp and TTL. A zero TTL leaves every value
+/// without expiry.
+/// The batch write timestamp, independent of wall-clock TTL drift, makes a
+/// per-statement write loop fail every time.
 #[test]
 fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
     use crate::cassandra::TABLE_KEYED_STATE_CELL;
     use crate::state::cell_key::Coordinate;
     use crate::timers::duration::CompactDuration;
 
-    async fn check(payloads: Vec<Vec<u8>>) -> Result<bool> {
+    async fn check(payloads: Vec<Vec<u8>>, finite: bool) -> Result<bool> {
         let fx = fixture().await?;
         let store = fx.bottom_store(ScriptedOracle::default())?;
         let id = CollectionId::new(
@@ -268,9 +263,7 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
             StateType::Application,
             StateName::try_new("co-anchor")?,
         );
-        // A collection TTL so the `USING TTL` path is exercised; the batch must
-        // apply one coordinator anchor across every cell.
-        let c = CollectionRef::new(id.clone(), Some(CompactDuration::new(3_600)));
+        let c = CollectionRef::new(id.clone(), finite.then_some(CompactDuration::new(3_600)));
         let cells: Vec<(CellKey, Option<Bytes>)> = payloads
             .iter()
             .enumerate()
@@ -284,8 +277,7 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
             .collect();
         store.write_resolved(&c, &cells, &[]).await?;
 
-        // `WRITETIME`/`TTL` are read functions (no schema change); both are
-        // non-null because every cell wrote a present `data`.
+        // Read the timestamp and expiry of each stored value.
         let cql = format!(
             "SELECT WRITETIME(data), TTL(data) FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? AND kind = 0 AND \
@@ -306,8 +298,8 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
             )
             .await?
             .into_rows_result()?;
-        let mut writetimes: Vec<Option<i64>> = Vec::new();
-        let mut ttls: Vec<Option<i32>> = Vec::new();
+        let mut writetimes: Vec<Option<i64>> = Vec::with_capacity(cells.len());
+        let mut ttls: Vec<Option<i32>> = Vec::with_capacity(cells.len());
         for row in result.rows::<(Option<i64>, Option<i32>)>()? {
             let (writetime, ttl) = row?;
             writetimes.push(writetime);
@@ -316,16 +308,26 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
         // One batch ⇒ every cell shares the batch timestamp and the TTL anchor.
         let writetime_equal = writetimes.windows(2).all(|w| w[0] == w[1]);
         let ttl_equal = ttls.windows(2).all(|w| w[0] == w[1]);
-        Ok(writetime_equal && ttl_equal)
+        Ok(writetimes.len() == cells.len()
+            && writetimes.iter().all(Option::is_some)
+            && writetime_equal
+            && ttl_equal
+            && ttls.iter().all(|ttl| {
+                if finite {
+                    ttl.is_some_and(|ttl| (1_i32..=3_600_i32).contains(&ttl))
+                } else {
+                    ttl.is_none()
+                }
+            }))
     }
 
-    fn prop(payloads: Vec<Vec<u8>>) -> TestResult {
+    fn prop(payloads: Vec<Vec<u8>>, finite: bool) -> TestResult {
         // ≥2 cells for "equal across cells" to discriminate; ≤256 so the
         // index-as-coordinate-byte stays unique.
         if payloads.len() < 2 || payloads.len() > 256 {
             return TestResult::discard();
         }
-        match TEST_RUNTIME.block_on(check(payloads)) {
+        match TEST_RUNTIME.block_on(check(payloads, finite)) {
             Ok(true) => TestResult::passed(),
             Ok(false) => TestResult::error(
                 "cells of one multi-cell write had differing WRITETIME/TTL — not one batch",
@@ -337,7 +339,7 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
     init_test_logging();
     QuickCheck::new()
         .tests(integration_test_count(25))
-        .quickcheck(prop as fn(Vec<Vec<u8>>) -> TestResult);
+        .quickcheck(prop as fn(Vec<Vec<u8>>, bool) -> TestResult);
 }
 
 /// Builds the mixed-statement batch for the binding-order test: five one-row
@@ -372,9 +374,9 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.write_provisional_no_ttl,
+                statement: &q.write_provisional,
                 row: RowShape::Stage(StageRow {
-                    ttl: None,
+                    ttl: 0,
                     data: blob_a.data(),
                     prev_data: None,
                     encoding: blob_a.encoding(),
@@ -397,9 +399,9 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.write_resolved_no_ttl,
+                statement: &q.write_resolved,
                 row: RowShape::Resolved(ResolvedRow {
-                    ttl: None,
+                    ttl: 0,
                     data: blob_c.data(),
                     encoding: blob_c.encoding(),
                     version: blob_c.version(),
@@ -420,9 +422,9 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.marker_write_no_ttl,
+                statement: &q.marker_write,
                 row: RowShape::MarkerWrite(MarkerWriteRow {
-                    ttl: None,
+                    ttl: 0,
                     payload: marker_blob.payload.as_ref(),
                     encoding: marker_blob.payload.encoding(),
                     event: event(2),

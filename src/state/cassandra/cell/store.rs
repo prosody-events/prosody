@@ -125,20 +125,15 @@ impl<O> CassandraStore<O> {
     pub(super) fn resolved_units<'u>(
         &'u self,
         pk: Pk<'u>,
-        ttl: Option<i32>,
+        ttl: i32,
         blobs: &'u [CellBlobs],
         cells: &'u [(CellKey, Option<Bytes>)],
     ) -> impl Iterator<Item = BatchUnit<CellBatchRow<'u>>> + 'u {
-        let cell_stmt = if ttl.is_some() {
-            &self.queries.write_resolved
-        } else {
-            &self.queries.write_resolved_no_ttl
-        };
         blobs.iter().zip(cells).map(move |(blob, (cell, _))| {
             let addr = CellAddr::new(pk, cell);
             let row = match blob.data() {
                 Some(_) => CellBatchRow {
-                    statement: cell_stmt,
+                    statement: &self.queries.write_resolved,
                     row: RowShape::Resolved(ResolvedRow {
                         ttl,
                         data: blob.data(),
