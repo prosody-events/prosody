@@ -1,13 +1,6 @@
 use super::*;
 
-/// The pure single-batch packing decision both marker-ordering callers rest
-/// on — `write_provisional`'s stage marker-first choice and
-/// `marker_last_split`'s settle marker-LAST split: a unit set fits one batch
-/// iff the weight sum is within the byte budget AND the unit count is within
-/// the statement budget. (The intra-call tear of an over-budget stage cannot be
-/// injected through the trait; the ordering is enforced by the two sequential
-/// awaits plus this decision, and the marker-completeness postcondition guards
-/// the durable shape on every generated trace.)
+/// A batch fits only when both its byte and statement counts fit.
 #[test]
 fn fits_one_batch_decides_on_both_budgets() {
     // Strictly under both budgets, and exactly at both boundaries.
@@ -21,38 +14,79 @@ fn fits_one_batch_decides_on_both_budgets() {
     assert!(fits_one_batch(iter::empty(), 0, 0));
 }
 
-/// Settle's budget decision preserves one atomic batch whenever possible and
-/// otherwise isolates the final marker unit as the split tail. This tests the
-/// split INDEX `issue_marker_last` relies on; the temporal ordering (prefix
-/// awaited before the marker tail) is enforced structurally by that helper
-/// owning both awaits, not by this pure property.
+/// Both write paths preserve atomic batches and the required split phases.
 #[test]
-fn prop_over_budget_settle_issues_marker_last() {
-    use smallvec::SmallVec;
-
-    fn prop(weights: Vec<u16>, marker_weight: u16, max_bytes: u16, max_count: u8) -> bool {
-        let mut units: Vec<BatchUnit<()>> = Vec::with_capacity(weights.len() + 1);
-        units.extend(
-            weights
-                .into_iter()
-                .map(|weight| BatchUnit::new(u64::from(weight), SmallVec::new())),
-        );
-        units.push(BatchUnit::new(u64::from(marker_weight), SmallVec::new()));
-        let split = marker_last_split(&units, u64::from(max_bytes), usize::from(max_count));
-        let fits = fits_one_batch(
-            units.iter().map(BatchUnit::weight),
+fn prop_marker_batch_phases() {
+    fn unit(weight: u64) -> BatchUnit<()> {
+        BatchUnit::new(weight, smallvec::SmallVec::new())
+    }
+    fn prop(weights: Vec<u16>, evidence: bool, max_bytes: u16, max_count: u8) -> bool {
+        let weights: Vec<_> = weights.into_iter().map(|weight| weight % 1024).collect();
+        let middle = weights
+            .iter()
+            .map(|&weight| unit(u64::from(weight)))
+            .collect();
+        let (units, phases) = settle_batches(
+            evidence.then(|| unit(19)),
+            middle,
+            unit(23),
             u64::from(max_bytes),
             usize::from(max_count),
         );
-
+        let fits = units.len() <= usize::from(max_count)
+            && units.iter().map(BatchUnit::weight).sum::<u64>() <= u64::from(max_bytes);
+        let observed: Vec<Vec<u64>> = phases
+            .iter()
+            .filter(|phase| !phase.is_empty())
+            .map(|phase| units[phase.clone()].iter().map(BatchUnit::weight).collect())
+            .collect();
+        let mut expected: Vec<Vec<u64>> = Vec::new();
         if fits {
-            split == units.len()
+            expected.push(
+                evidence
+                    .then_some(19)
+                    .into_iter()
+                    .chain(weights.iter().map(|&w| u64::from(w)))
+                    .chain([23])
+                    .collect(),
+            );
         } else {
-            split + 1 == units.len()
+            if evidence {
+                expected.push(vec![19]);
+            }
+            if !weights.is_empty() {
+                expected.push(weights.iter().map(|&w| u64::from(w)).collect());
+            }
+            expected.push(vec![23]);
+        }
+        if observed != expected {
+            return false;
+        }
+        let stage: Vec<_> = [19]
+            .into_iter()
+            .chain(weights.iter().map(|&w| u64::from(w)))
+            .map(unit)
+            .collect();
+        let phases = stage_batches(&stage, u64::from(max_bytes), usize::from(max_count));
+        let observed: Vec<Vec<u64>> = phases
+            .iter()
+            .filter(|phase| !phase.is_empty())
+            .map(|phase| stage[phase.clone()].iter().map(BatchUnit::weight).collect())
+            .collect();
+        if stage.len() <= usize::from(max_count)
+            && stage.iter().map(BatchUnit::weight).sum::<u64>() <= u64::from(max_bytes)
+        {
+            observed == vec![stage.iter().map(BatchUnit::weight).collect::<Vec<_>>()]
+        } else {
+            let mut expected = vec![vec![19]];
+            if !weights.is_empty() {
+                expected.push(weights.iter().map(|&w| u64::from(w)).collect());
+            }
+            expected.push(vec![19]);
+            observed == expected
         }
     }
-
-    QuickCheck::new().quickcheck(prop as fn(Vec<u16>, u16, u16, u8) -> bool);
+    QuickCheck::new().quickcheck(prop as fn(Vec<u16>, bool, u16, u8) -> bool);
 }
 
 /// A raw provisional cell without its recovery marker is invisible to the

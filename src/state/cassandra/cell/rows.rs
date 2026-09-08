@@ -2,6 +2,7 @@ use super::{
     Bytes, CellKey, CellKind, CollectionId, EncodedBlob, Encoding, EventRef, INITIAL_VERSION,
     PreparedStatement, StateType,
 };
+use crate::state::marker::MarkerRow;
 
 /// The four partition-key column values of a collection's Cassandra partition.
 #[derive(Clone, Copy)]
@@ -69,7 +70,7 @@ pub(super) struct MarkerBlob {
 /// The key + clustering columns addressing one cell in its partition: the four
 /// partition-key columns and the cell's `section`/`coordinate`. `kind` is
 /// **not** carried — each [`RowShape`] binds its own `kind` (`Cell` vs
-/// `Marker`), so one address type serves both a cell row and the marker row.
+/// `Marker`), so one address type serves cell rows and both marker rows.
 #[derive(Clone, Copy)]
 pub(super) struct CellAddr<'a> {
     pub(super) pk: Pk<'a>,
@@ -86,14 +87,12 @@ impl<'a> CellAddr<'a> {
         }
     }
 
-    /// The collection's **fixed marker address**: `(section = 0,
-    /// coordinate = empty)`. Every marker statement binds this one position
-    /// (with `kind = Marker`), so marker churn compacts to a single entry.
-    pub(super) fn marker(pk: Pk<'a>) -> Self {
+    /// Addresses the selected marker row in section 0.
+    pub(super) fn marker(pk: Pk<'a>, row: MarkerRow) -> Self {
         Self {
             pk,
             section: 0,
-            coordinate: &[],
+            coordinate: row.coordinate(),
         }
     }
 }
@@ -122,9 +121,10 @@ pub(super) enum RowShape<'a> {
     /// Write a resolved value (`kind=Cell`): committed `data` +
     /// encoding/version, nulling `prev_data`/`event`.
     Resolved(ResolvedRow<'a>),
-    /// Upsert the collection's event-marker row (`kind=Marker`) at the fixed
-    /// address, at the collection TTL so it co-expires with the staged cells.
+    /// Writes Staged with the event's evidence TTL.
     MarkerWrite(MarkerWriteRow<'a>),
+    /// Writes the Committed event with the evidence TTL.
+    CommittedWrite(CommittedWriteRow<'a>),
     /// Key columns only, binding the carried [`CellKind`]: a cell promote
     /// (`kind=Cell`, nulling `prev_data`/`event` while keeping `data` and its
     /// TTL), a `cell_delete` (`kind=Cell`), or a `marker_delete`
@@ -202,4 +202,11 @@ pub(super) struct GapBetweenRow<'a> {
     pub(super) section: i8,
     pub(super) low: &'a [u8],
     pub(super) high: &'a [u8],
+}
+
+/// The evidence bind shape. Its TTL comes from `bind_ttl`.
+pub(super) struct CommittedWriteRow<'a> {
+    pub(super) ttl: i32,
+    pub(super) event: EventRef,
+    pub(super) addr: CellAddr<'a>,
 }

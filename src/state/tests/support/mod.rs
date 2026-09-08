@@ -45,6 +45,8 @@ use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
 
+mod reader;
+pub(crate) use reader::reader_residue;
 mod counting;
 mod holding;
 mod publication;

@@ -49,9 +49,11 @@ use super::super::store::{
 use super::super::{CommitDecision, EventRef, StateKey, StateName, StateType};
 use super::support::{CountingCellStore, CountingOracle, batch_of};
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::marker::MarkerState;
 use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
 use bytes::Bytes;
+use color_eyre::eyre::eyre;
 use color_eyre::eyre::{Result, ensure};
 use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen};
@@ -811,7 +813,7 @@ where
             .iter()
             .map(|&s| SectionClear::frozen(SECTIONS[s as usize], &cell_writes))
             .collect();
-        let marker = EventMarker::frozen(event, &cell_writes, &clears);
+        let marker = EventMarker::frozen(event, &cell_writes, &clears, &[].into(), None);
         let collection = &refs[*coll as usize];
         if split && cell_writes.len() >= 2 {
             let mid = cell_writes.len() / 2;
@@ -846,6 +848,7 @@ struct Deferred {
 struct TraceState {
     model: Vec<BTreeMap<(u8, u8), Option<Bytes>>>,
     marker_model: Vec<Option<(u128, RowKeys, ClearMap)>>,
+    committed_model: Vec<Option<EventRef>>,
     deferred: Vec<Option<Deferred>>,
 }
 
@@ -854,6 +857,7 @@ impl TraceState {
         Self {
             model: vec![BTreeMap::new(); POOL as usize],
             marker_model: vec![None; POOL as usize],
+            committed_model: vec![None; POOL as usize],
             deferred: (0..POOL).map(|_| None).collect(),
         }
     }
@@ -1076,6 +1080,10 @@ impl TraceState {
     {
         for (coll, cell_writes, clears) in staged_writes {
             let slot = *coll as usize;
+            let marker = store
+                .unsettled_marker(refs[slot].id())
+                .await?
+                .ok_or_else(|| eyre!("settle requires the staged marker"))?;
             match ev.outcome {
                 Outcome::SettleFailure(depth) => {
                     // Committed, then the settle fails under the armed poison
@@ -1096,7 +1104,7 @@ impl TraceState {
                         FaultDepth::Lower => *lower.lock() = Some(poison),
                     }
                     let settled = store
-                        .commit_provisional(&refs[slot], cell_writes, clears)
+                        .commit_provisional(&refs[slot], &marker, cell_writes)
                         .await;
                     store.set_poison(None);
                     *lower.lock() = None;
@@ -1150,7 +1158,7 @@ impl TraceState {
                     // applies the clears' gap erase); the settle deletes the
                     // collection's marker.
                     store
-                        .commit_provisional(&refs[slot], cell_writes, clears)
+                        .commit_provisional(&refs[slot], &marker, cell_writes)
                         .await?;
                     self.marker_model[slot] = None;
                 }
@@ -1243,6 +1251,10 @@ where
     S: CellStore,
     P: ShapeProbe,
 {
+    if !assert_marker_evidence(store, ids, state).await? {
+        return Ok(false);
+    }
+
     let skip: Vec<bool> = state.deferred.iter().map(Option::is_some).collect();
     if !assert_converged(store, ids, &state.model, &skip).await? {
         return Ok(false);
@@ -1284,7 +1296,7 @@ where
         .iter()
         .map(|&s| SectionClear::frozen(SECTIONS[s as usize], &cell_writes))
         .collect();
-    let marker = EventMarker::frozen(event, &cell_writes, &clears);
+    let marker = EventMarker::frozen(event, &cell_writes, &clears, &[].into(), None);
     *lower.lock() = Some(Poison::WriteProvisional(
         refs[slot].id().name().clone(),
         ErrorCategory::Transient,
@@ -1410,8 +1422,13 @@ where
         // Each stage overwrites any lingering prior event marker with this event's
         // marker listing its full staged set and clear half.
         for (coll, cell_writes, clears) in &staged_writes {
-            let (staged_set, clear_map) =
-                probed_parts(&EventMarker::frozen(event, cell_writes, clears));
+            let (staged_set, clear_map) = probed_parts(&EventMarker::frozen(
+                event,
+                cell_writes,
+                clears,
+                &[].into(),
+                None,
+            ));
             state.marker_model[*coll as usize] = Some((index as u128, staged_set, clear_map));
         }
 
@@ -1423,6 +1440,7 @@ where
             oracle.record_message(dedup_id).await?;
             for (coll, cells, cleared) in &staged {
                 state.apply_committed(*coll as usize, cells, cleared);
+                state.committed_model[*coll as usize] = Some(event);
             }
         }
 
@@ -1462,7 +1480,24 @@ where
     if !assert_converged(&store, &ids, &state.model, &none).await? {
         return Ok(false);
     }
-    assert_physical(probe, &ids, &state).await
+    Ok(assert_physical(probe, &ids, &state).await?
+        && assert_marker_evidence(&store, &ids, &state).await?)
+}
+
+async fn assert_marker_evidence<S: CellStore>(
+    store: &S,
+    ids: &[CollectionId],
+    state: &TraceState,
+) -> Result<bool> {
+    for (slot, id) in ids.iter().enumerate() {
+        if state.marker_model[slot].is_none() {
+            let observed = store.marker_state(id).await?;
+            if observed.staged.is_some() || observed.committed != state.committed_model[slot] {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Proves that a resolved write survives an earlier unsettled section clear.
@@ -1491,7 +1526,7 @@ where
         ProvisionalWrite::new(Some(bytes(1)), prev, event_a),
     )];
     let clears = vec![SectionClear::frozen(SECTIONS[0], &writes)];
-    let marker = EventMarker::frozen(event_a, &writes, &clears);
+    let marker = EventMarker::frozen(event_a, &writes, &clears, &[].into(), None);
     store
         .write_provisional(&refs[0], &writes, Some(&marker))
         .await?;
@@ -1551,7 +1586,7 @@ where
         staged.clone(),
         ProvisionalWrite::new(Some(bytes(1)), prev, event_a),
     )];
-    let marker = EventMarker::frozen(event_a, &writes, &[]);
+    let marker = EventMarker::frozen(event_a, &writes, &[], &[].into(), None);
     store
         .write_provisional(&refs[0], &writes, Some(&marker))
         .await?;
@@ -1642,7 +1677,7 @@ where
         x.clone(),
         ProvisionalWrite::new(Some(bytes(2)), prev_x, event_f),
     )];
-    let f_first_marker = EventMarker::frozen(event_f, &f_first, &[]);
+    let f_first_marker = EventMarker::frozen(event_f, &f_first, &[], &[].into(), None);
     store
         .write_provisional(cref, &f_first, Some(&f_first_marker))
         .await?;
@@ -1650,7 +1685,7 @@ where
         y.clone(),
         ProvisionalWrite::new(Some(bytes(4)), prev_y, event_f),
     )];
-    let f_second_marker = EventMarker::frozen(event_f, &f_second, &[]);
+    let f_second_marker = EventMarker::frozen(event_f, &f_second, &[], &[].into(), None);
     store
         .write_provisional(cref, &f_second, Some(&f_second_marker))
         .await?;
@@ -1663,7 +1698,7 @@ where
         ProvisionalWrite::new(Some(bytes(1)), prev_s, event_e),
     )];
     let e_clears = vec![SectionClear::frozen(SECTIONS[0], &e_writes)];
-    let e_marker = EventMarker::frozen(event_e, &e_writes, &e_clears);
+    let e_marker = EventMarker::frozen(event_e, &e_writes, &e_clears, &[].into(), None);
     store
         .write_provisional(cref, &e_writes, Some(&e_marker))
         .await?;
@@ -1884,7 +1919,7 @@ where
             }
             cell_writes.push((key, ProvisionalWrite::new(mutation.value(), prev, event)));
         }
-        let marker = EventMarker::frozen(event, &cell_writes, &[]);
+        let marker = EventMarker::frozen(event, &cell_writes, &[], &[].into(), None);
         store
             .write_provisional(
                 &refs[slot],
@@ -2713,7 +2748,7 @@ where
         let keys: BTreeSet<(u8, u8)> = base.keys().copied().collect();
         return assert_apply_settled(&store, probe, &id, &base, &keys).await;
     }
-    let marker = EventMarker::frozen(event, &writes, &clears);
+    let marker = EventMarker::frozen(event, &writes, &clears, &[].into(), None);
     store
         .write_provisional(&collection, &writes, Some(&marker))
         .await?;
@@ -2729,7 +2764,7 @@ where
                 resolve_event_marker(&store, &oracle, &collection, &marker).await?;
             }
             ApplyOp::Settle => {
-                reapply_settle(&store, &collection, input.committed, &writes, &clears).await?;
+                reapply_settle(&store, &collection, input.committed, &writes, &marker).await?;
             }
             ApplyOp::FirstTouch(i) => {
                 let Some((cell, _)) = writes.get(*i as usize % writes.len().max(1)) else {
@@ -2741,7 +2776,7 @@ where
             }
         }
     }
-    reapply_settle(&store, &collection, input.committed, &writes, &clears).await?;
+    reapply_settle(&store, &collection, input.committed, &writes, &marker).await?;
 
     // The verdict state: committed ⇒ cleared sections collapse to survivors
     // and staged mutations land; aborted ⇒ exactly the pre-stage base.
@@ -2772,13 +2807,13 @@ async fn reapply_settle<S>(
     collection: &CollectionRef,
     committed: bool,
     writes: &[(CellKey, ProvisionalWrite)],
-    clears: &[SectionClear],
+    marker: &EventMarker,
 ) -> Result<(), S::Error>
 where
     S: CellStore,
 {
     if committed {
-        store.commit_provisional(collection, writes, clears).await
+        store.commit_provisional(collection, marker, writes).await
     } else {
         store.abort_provisional(collection, writes).await
     }
@@ -3192,6 +3227,16 @@ where
             .map_err(FailCellError::Inner)
     }
 
+    async fn marker_state<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> Result<MarkerState, Self::Error> {
+        self.inner
+            .marker_state(collection)
+            .await
+            .map_err(FailCellError::Inner)
+    }
+
     async fn unsettled_marker<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -3205,8 +3250,8 @@ where
     async fn commit_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
+        marker: &'a EventMarker,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
         // A settle arriving via the sweep's marker leg routes through the inner
         // store's `mark_resolved` on the *inner* store, bypassing the poison on
@@ -3222,7 +3267,7 @@ where
             return Err(FailCellError::Poison(category));
         }
         self.inner
-            .commit_provisional(collection, writes, clears)
+            .commit_provisional(collection, marker, writes)
             .await
             .map_err(FailCellError::Inner)
     }
@@ -3341,7 +3386,7 @@ async fn seed_batch<S: CellStore>(
                 ProvisionalWrite::new(Some(bytes(*data)), prev, event),
             ));
         }
-        let marker = EventMarker::frozen(event, &writes, &[]);
+        let marker = EventMarker::frozen(event, &writes, &[], &[].into(), None);
         store
             .write_provisional(collection, &writes, Some(&marker))
             .await?;
@@ -3828,7 +3873,7 @@ mod sweep {
             let prev = inner.get(collection.id(), &cell, event).await?;
             writes.push((cell, ProvisionalWrite::new(Some(bytes(c)), prev, event)));
         }
-        let marker = EventMarker::frozen(event, &writes, &[]);
+        let marker = EventMarker::frozen(event, &writes, &[], &[].into(), None);
         inner
             .write_provisional(&collection, &writes, Some(&marker))
             .await?;
@@ -3898,7 +3943,7 @@ mod sweep {
                 cell.clone(),
                 ProvisionalWrite::new(Some(bytes(7)), prev, event),
             )];
-            let marker = EventMarker::frozen(event, &writes, &[]);
+            let marker = EventMarker::frozen(event, &writes, &[], &[].into(), None);
             store.write_provisional(r, &writes, Some(&marker)).await?;
             oracle.record_message(dedup_id).await?;
         }
@@ -4045,7 +4090,7 @@ mod sweep {
                 cell.clone(),
                 ProvisionalWrite::new(Some(bytes(i as u8)), prev, event),
             )];
-            let marker = EventMarker::frozen(event, &writes, &[]);
+            let marker = EventMarker::frozen(event, &writes, &[], &[].into(), None);
             warm.write_provisional(&collection, &writes, Some(&marker))
                 .await?;
             match op {

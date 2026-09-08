@@ -37,7 +37,7 @@ pub enum CassandraCellStoreError {
     #[error("Cassandra event_ref UDT is corrupt: {0}")]
     CorruptUdt(#[from] CorruptUdtError),
 
-    /// The event-marker row's frozen payload failed to decode (or an
+    /// The Staged row's frozen payload failed to decode (or an
     /// oversized stage failed to encode).
     #[error("event-marker payload is corrupt: {0}")]
     MarkerPayload(#[from] MarkerPayloadError),

@@ -1,11 +1,15 @@
 use super::{
-    EventMarker, MarkerPayloadError, SectionClear, decode_marker_payload, encode_marker_payload,
+    EventMarker, MarkerPayloadError, MarkerVersion, SectionClear, decode_marker_payload,
+    encode_marker_payload, evidence_ttl,
 };
 use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::event_ref::EventRef;
 use crate::state::tests::support::arb_coordinate;
+use crate::state::{StateName, StateType};
+use crate::timers::duration::CompactDuration;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+use std::slice::from_ref;
 use uuid::Uuid;
 
 /// A fixed message event to bind every generated marker; the event is not part
@@ -61,7 +65,13 @@ impl Arbitrary for ArbMarker {
                 SectionClear::frozen(section, &arb_staged(g))
             })
             .collect();
-        Self(EventMarker::frozen(event(), &staged, &clears))
+        Self(EventMarker::frozen(
+            event(),
+            &staged,
+            &clears,
+            &[].into(),
+            None,
+        ))
     }
 }
 
@@ -71,18 +81,47 @@ impl Arbitrary for ArbMarker {
 /// lists.
 #[test]
 fn prop_marker_payload_round_trips() {
-    fn prop(marker: ArbMarker) -> TestResult {
+    fn prop(marker: ArbMarker, names: Vec<(bool, String)>, ttl: Option<u32>) -> TestResult {
         let ArbMarker(marker) = marker;
+        let touched = names
+            .into_iter()
+            .map(|(framework, name)| {
+                StateName::try_new(format!("n{name}")).map(|name| {
+                    (
+                        if framework {
+                            StateType::Framework
+                        } else {
+                            StateType::Application
+                        },
+                        name,
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>();
+        let mut touched = match touched {
+            Ok(names) => names,
+            Err(error) => return TestResult::error(error.to_string()),
+        };
+        touched.sort_unstable();
+        touched.dedup();
+        let marker = EventMarker::from_parts(
+            marker.event(),
+            marker.staged().to_vec(),
+            marker.clears().to_vec(),
+            touched.into(),
+            ttl.map(|seconds| CompactDuration::new(seconds.max(1))),
+        );
         let bytes = match encode_marker_payload(&marker) {
             Ok(bytes) => bytes,
             Err(e) => return TestResult::error(format!("encode failed: {e}")),
         };
-        match decode_marker_payload(event(), &bytes) {
+        match decode_marker_payload(event(), &bytes, MarkerVersion::V2, None) {
             Ok(decoded) => TestResult::from_bool(decoded == marker),
             Err(e) => TestResult::error(format!("decode failed: {e}")),
         }
     }
-    QuickCheck::new().quickcheck(prop as fn(ArbMarker) -> TestResult);
+    QuickCheck::new()
+        .quickcheck(prop as fn(ArbMarker, Vec<(bool, String)>, Option<u32>) -> TestResult);
 }
 
 /// The survivor definition pinned directly at its source: for any mix of
@@ -177,7 +216,20 @@ fn frozen_marker_payload_bytes() -> color_eyre::Result<()> {
             ProvisionalWrite::new(Some(bytes(9)), Committed::new(None), event()),
         )],
     );
-    let marker = EventMarker::frozen(event(), &staged, &[clear]);
+    let legacy = EventMarker::frozen(
+        event(),
+        &staged,
+        from_ref(&clear),
+        &[].into(),
+        Some(CompactDuration::new(3600)),
+    );
+    let marker = EventMarker::frozen(
+        event(),
+        &staged,
+        &[clear],
+        &vec![(StateType::Application, StateName::try_new("x")?)].into(),
+        Some(CompactDuration::new(3600)),
+    );
 
     let expected: Vec<u8> = vec![
         0x00, 0x00, 0x00, 0x02, // staged_count = 2
@@ -191,8 +243,19 @@ fn frozen_marker_payload_bytes() -> color_eyre::Result<()> {
         0x00, 0x00, 0x00, 0x01, 0x10, // survivor coord_len 1, [0x10]
     ];
     assert_eq!(
+        decode_marker_payload(
+            event(),
+            &expected,
+            MarkerVersion::V1,
+            Some(CompactDuration::new(3600))
+        )?,
+        legacy
+    );
+    let mut expected_v2 = expected;
+    expected_v2.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 1, b'x', 0, 0, 14, 16]);
+    assert_eq!(
         encode_marker_payload(&marker)?.as_ref(),
-        expected.as_slice(),
+        expected_v2.as_slice(),
         "frozen marker payload layout"
     );
     Ok(())
@@ -207,7 +270,7 @@ fn truncated_payload_is_rejected() {
     // Claims one staged cell but carries no cell bytes.
     let truncated = [0x00, 0x00, 0x00, 0x01];
     assert_eq!(
-        decode_marker_payload(event(), &truncated),
+        decode_marker_payload(event(), &truncated, MarkerVersion::V1, None),
         Err(MarkerPayloadError::Truncated)
     );
 }
@@ -222,7 +285,7 @@ fn truncated_payload_is_rejected() {
 fn inflated_count_is_rejected() {
     let inflated = [0xFF, 0xFF, 0xFF, 0xFF];
     assert_eq!(
-        decode_marker_payload(event(), &inflated),
+        decode_marker_payload(event(), &inflated, MarkerVersion::V1, None),
         Err(MarkerPayloadError::Truncated)
     );
 }
@@ -232,12 +295,36 @@ fn inflated_count_is_rejected() {
 /// property encodes exact-length buffers and cannot append trailing bytes.
 #[test]
 fn trailing_garbage_is_rejected() -> color_eyre::Result<()> {
-    let marker = EventMarker::frozen(event(), &[], &[]);
+    let marker = EventMarker::frozen(event(), &[], &[], &[].into(), None);
     let mut bytes = encode_marker_payload(&marker)?.to_vec();
     bytes.push(0xFF);
     assert_eq!(
-        decode_marker_payload(event(), &bytes),
+        decode_marker_payload(event(), &bytes, MarkerVersion::V2, None),
         Err(MarkerPayloadError::TrailingGarbage)
     );
     Ok(())
+}
+
+/// Evidence outlives every finite touched TTL; clears and unbounded retention
+/// dominate.
+#[test]
+fn prop_evidence_ttl_covers_all_collections() {
+    fn prop(has_clears: bool, seconds: Vec<u32>, unbounded: bool) -> bool {
+        let expected = if has_clears || unbounded {
+            None
+        } else {
+            seconds.iter().max().copied().map(CompactDuration::new)
+        };
+        evidence_ttl(
+            has_clears,
+            seconds.into_iter().enumerate().map(|(index, ttl)| {
+                if unbounded && index == 0 {
+                    None
+                } else {
+                    Some(CompactDuration::new(ttl))
+                }
+            }),
+        ) == expected
+    }
+    QuickCheck::new().quickcheck(prop as fn(bool, Vec<u32>, bool) -> bool);
 }

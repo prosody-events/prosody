@@ -1,43 +1,122 @@
-//! The **event marker**: the durable recovery handle for one collection's
-//! in-flight stage.
+//! A collection stores two marker rows: `Staged` carries recovery data and
+//! `Committed` carries positive commit evidence. Only a promote writes
+//! evidence.
 //!
-//! While an event's outcome is unresolved, a collection carries exactly one
-//! event marker naming that event and the coordinates it staged, so recovery
-//! can resolve the whole stage as a unit — promote or roll back every listed
-//! cell — from a single point read rather than a scan over per-coordinate
-//! rows. [`EventMarker`] represents this unsettled state.
-//! This module also encodes and decodes the Cassandra marker value.
+//! The frozen payload lists staged coordinates, clear survivors, and touched
+//! collections. Version 2 adds touched collections and the shared evidence TTL.
+//! The row's version column selects the format; the payload has no version
+//! byte.
 //!
-//! # Invariants
+//! Evidence must outlive provisional residue. [`evidence_ttl`] selects the
+//! longest cell retention. Clears or a collection without expiry require
+//! evidence without expiry. Both marker rows use that retention.
 //!
-//! * **Frozen at stage time.** The staged coordinate list and each cleared
-//!   section's survivor list are captured when the stage is written and never
-//!   re-derived from live provisional state — re-applying a stage during
-//!   recovery must be a pure function of durable staged data, correct under
-//!   partial promotion.
-//! * **Coordinates only, never values.** A marker lists `(section,
-//!   coordinate)`s, so its size scales with one event's staged write set (the
-//!   quantity the stage's batch budget already bounds), never with value bytes.
-//! * **Qualified vocabulary.** This is the *event marker*, distinct from the
-//!   dedup *commit marker* (the oracle's per-message row) and the in-RAM *dirty
-//!   clear marker* (the per-event overlay's pending clear). "Marker"
-//!   unqualified is ambiguous — always name which.
-//!
-//! The owning `event` is **not** part of the payload: on Cassandra it rides
-//! the marker row's own `event` column, so [`decode_marker_payload`] takes it
-//! as a parameter. The wire format carries no version byte — the Cassandra
-//! row's existing `encoding`/`version` columns version the blob.
+//! The stage write captures the staged list and survivor lists; recovery never
+//! derives them again. These lists contain coordinates, never values.
+//! The event marker is distinct from the dedup commit marker and the in-RAM
+//! dirty clear marker. Always use the qualified name.
 
 use super::cell::ProvisionalWrite;
 use super::cell_key::{CellKey, Coordinate, Section};
 use super::event_ref::EventRef;
+use super::identity::{StateName, StateType, StateTypeError};
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
+use std::str::from_utf8;
 use std::sync::Arc;
 use thiserror::Error;
 
 /// Width of the `u32` big-endian count/length prefixes in the frozen payload.
 const LEN_PREFIX: usize = 4;
+
+/// The two addresses in a collection's marker slice.
+///
+/// An event has commit evidence when any touched collection has `Committed(e)`.
+/// Only a promote writes this row, before any destructive promote chunk.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MarkerRow {
+    Staged,
+    Committed,
+}
+
+impl MarkerRow {
+    pub(crate) fn coordinate(self) -> &'static [u8] {
+        match self {
+            Self::Staged => &[],
+            Self::Committed => &[1],
+        }
+    }
+}
+
+/// One durable read of a collection's marker slice.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MarkerState {
+    pub(crate) staged: Option<EventMarker>,
+    pub(crate) committed: Option<EventRef>,
+}
+
+/// Evidence retained for one external read or scan.
+/// The local committed event and evidence for the staged event can both exist,
+/// so the flag does not select an alternative state.
+#[derive(Default)]
+pub(crate) struct ReaderEvidence {
+    /// The collection's own Staged and Committed rows.
+    pub(crate) state: MarkerState,
+    /// A touched collection holds Committed for the staged event.
+    pub(crate) staged_committed: bool,
+}
+
+impl ReaderEvidence {
+    pub(crate) fn committed(&self, event: EventRef) -> bool {
+        self.state.committed == Some(event)
+            || self.staged_committed
+                && self
+                    .state
+                    .staged
+                    .as_ref()
+                    .is_some_and(|marker| marker.event() == event)
+    }
+
+    pub(crate) fn survives(&self, cell: &CellKey) -> bool {
+        self.state.staged.as_ref().is_none_or(|marker| {
+            !self.committed(marker.event())
+                || marker
+                    .clears()
+                    .iter()
+                    .filter(|clear| clear.section() == cell.section)
+                    .all(|clear| clear.survivors().binary_search(&cell.coordinate).is_ok())
+        })
+    }
+}
+
+/// The format selected by the staged row's version column.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MarkerVersion {
+    V1,
+    V2,
+}
+
+impl From<MarkerVersion> for i32 {
+    fn from(version: MarkerVersion) -> Self {
+        match version {
+            MarkerVersion::V1 => 1,
+            MarkerVersion::V2 => 2,
+        }
+    }
+}
+
+impl TryFrom<i32> for MarkerVersion {
+    type Error = MarkerPayloadError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::V1),
+            2 => Ok(Self::V2),
+            _ => Err(MarkerPayloadError::Version(value)),
+        }
+    }
+}
 
 /// One cleared section paired with its **frozen survivor list**: the
 /// coordinates that outlive the clear (the section's post-clear `Set` cells).
@@ -130,6 +209,11 @@ struct EventMarkerData {
     event: EventRef,
     staged: Vec<CellKey>,
     clears: Vec<SectionClear>,
+    /// The event's dirty `ReadCommitted` collections at stage time, sorted and
+    /// unique. A collection that stages nothing stays listed; a reader
+    /// finds no Committed row there and moves on.
+    touched: Arc<[(StateType, StateName)]>,
+    evidence_ttl: Option<CompactDuration>,
 }
 
 impl EventMarker {
@@ -142,20 +226,36 @@ impl EventMarker {
         event: EventRef,
         staged: &[(CellKey, ProvisionalWrite)],
         clears: &[SectionClear],
+        touched: &Arc<[(StateType, StateName)]>,
+        evidence_ttl: Option<CompactDuration>,
     ) -> Self {
         let mut coordinates: Vec<CellKey> = staged.iter().map(|(cell, _)| cell.clone()).collect();
         coordinates.sort_unstable();
-        Self::from_parts(event, coordinates, clears.to_vec())
+        Self::from_parts(
+            event,
+            coordinates,
+            clears.to_vec(),
+            Arc::clone(touched),
+            evidence_ttl,
+        )
     }
 
     /// Reconstructs a marker from decoded parts (the payload decoder).
     #[must_use]
-    fn from_parts(event: EventRef, staged: Vec<CellKey>, clears: Vec<SectionClear>) -> Self {
+    fn from_parts(
+        event: EventRef,
+        staged: Vec<CellKey>,
+        clears: Vec<SectionClear>,
+        touched: Arc<[(StateType, StateName)]>,
+        evidence_ttl: Option<CompactDuration>,
+    ) -> Self {
         Self {
             inner: Arc::new(EventMarkerData {
                 event,
                 staged,
                 clears,
+                touched,
+                evidence_ttl,
             }),
         }
     }
@@ -178,6 +278,16 @@ impl EventMarker {
         &self.inner.clears
     }
 
+    /// The event's touched `ReadCommitted` collections, sorted and unique.
+    pub(crate) fn touched(&self) -> &[(StateType, StateName)] {
+        &self.inner.touched
+    }
+
+    /// Shared retention for the event's staged and committed rows.
+    pub(crate) fn evidence_ttl(&self) -> Option<CompactDuration> {
+        self.inner.evidence_ttl
+    }
+
     /// Reports whether the marker carries at least one section clear.
     #[must_use]
     pub(crate) fn has_clears(&self) -> bool {
@@ -196,7 +306,7 @@ impl EventMarker {
 
 /// Encodes an [`EventMarker`]'s payload — everything but its `event` — to the
 /// frozen wire bytes. Deterministic: the lists are already in
-/// constructor-sorted order.
+/// sorted order.
 ///
 /// Wire format (fixed-width big-endian, matching the fjall-codec house style):
 ///
@@ -206,9 +316,12 @@ impl EventMarker {
 /// [clears_count: u32 BE]
 ///   clears_count × [section: i8][survivor_count: u32 BE]
 ///                  survivor_count × [coord_len: u32 BE][coord bytes]
+/// [touched_count: u32 BE]
+///   touched_count × [state_type: i8][name_len: u32 BE][UTF-8 name]
+/// [evidence_ttl_secs: u32 BE] // 0 means no expiry
 /// ```
 ///
-/// Frozen and pinned; the Cassandra marker row is its production caller (the
+/// Frozen and pinned; the Cassandra Staged row is its production caller (the
 /// payload rides the row's `data`/`encoding`/`version` columns).
 ///
 /// # Errors
@@ -230,6 +343,12 @@ pub(in crate::state) fn encode_marker_payload(
         }
     }
 
+    len += 2 * LEN_PREFIX
+        + marker
+            .touched()
+            .iter()
+            .map(|(_, name)| 1 + LEN_PREFIX + name.as_str().len())
+            .sum::<usize>();
     let mut buf = Vec::with_capacity(len);
     buf.extend_from_slice(&len_u32(marker.staged().len())?.to_be_bytes());
     for cell in marker.staged() {
@@ -244,11 +363,23 @@ pub(in crate::state) fn encode_marker_payload(
             push_len_prefixed(&mut buf, coordinate)?;
         }
     }
+    buf.extend_from_slice(&len_u32(marker.touched().len())?.to_be_bytes());
+    for (state_type, name) in marker.touched() {
+        buf.push(i8::from(*state_type).cast_unsigned());
+        buf.extend_from_slice(&len_u32(name.as_str().len())?.to_be_bytes());
+        buf.extend_from_slice(name.as_str().as_bytes());
+    }
+    buf.extend_from_slice(
+        &marker
+            .evidence_ttl()
+            .map_or(0, CompactDuration::seconds)
+            .to_be_bytes(),
+    );
     Ok(Bytes::from(buf))
 }
 
 /// Decodes a marker payload produced by [`encode_marker_payload`], binding it
-/// to `event` (which rides the marker row's own column, not the payload).
+/// to `event` (which rides the Staged row's own column, not the payload).
 ///
 /// # Errors
 ///
@@ -257,6 +388,8 @@ pub(in crate::state) fn encode_marker_payload(
 pub(in crate::state) fn decode_marker_payload(
     event: EventRef,
     bytes: &[u8],
+    version: MarkerVersion,
+    legacy_ttl: Option<CompactDuration>,
 ) -> Result<EventMarker, MarkerPayloadError> {
     let mut cursor = Cursor::new(bytes);
 
@@ -287,10 +420,59 @@ pub(in crate::state) fn decode_marker_payload(
         clears.push(SectionClear { section, survivors });
     }
 
+    let (mut touched, ttl) = match version {
+        MarkerVersion::V1 => (Vec::new(), legacy_ttl),
+        MarkerVersion::V2 => {
+            let count = cursor.take_u32()? as usize;
+            let mut touched = Vec::with_capacity(count.min(cursor.remaining()));
+            for _ in 0..count {
+                let state_type = StateType::try_from(cursor.take_section()?)?;
+                let len = cursor.take_u32()? as usize;
+                let name = from_utf8(cursor.take(len)?).map_err(|_| MarkerPayloadError::Name)?;
+                touched.push((
+                    state_type,
+                    StateName::try_new(name).map_err(|_| MarkerPayloadError::Name)?,
+                ));
+            }
+            let seconds = cursor.take_u32()?;
+            (
+                touched,
+                (seconds != 0).then(|| CompactDuration::new(seconds)),
+            )
+        }
+    };
     if !cursor.is_empty() {
         return Err(MarkerPayloadError::TrailingGarbage);
     }
-    Ok(EventMarker::from_parts(event, staged, clears))
+    touched.sort_unstable();
+    touched.dedup();
+    Ok(EventMarker::from_parts(
+        event,
+        staged,
+        clears,
+        touched.into(),
+        ttl,
+    ))
+}
+
+/// Fields shared by all collection stages of one event.
+pub(crate) struct EventEvidence {
+    pub(crate) touched: Arc<[(StateType, StateName)]>,
+    pub(crate) evidence_ttl: Option<CompactDuration>,
+}
+
+/// Selects the maximum TTL, or no expiry for clears or any collection without
+/// expiry. An empty set returns None. An event without touched collections
+/// stages no marker.
+pub(crate) fn evidence_ttl(
+    has_clears: bool,
+    mut ttls: impl Iterator<Item = Option<CompactDuration>>,
+) -> Option<CompactDuration> {
+    if has_clears {
+        return None;
+    }
+    let first = ttls.next()??;
+    ttls.try_fold(first, |maximum, ttl| Some(maximum.max(ttl?)))
 }
 
 /// A `usize` length as the `u32` wire prefix, or
@@ -358,6 +540,15 @@ impl<'a> Cursor<'a> {
 /// Failure encoding or decoding a frozen event-marker payload.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MarkerPayloadError {
+    /// The payload version is unknown.
+    #[error("unknown marker version {0}")]
+    Version(i32),
+    /// A collection name is invalid.
+    #[error("invalid collection name in marker")]
+    Name,
+    /// A collection namespace is unknown.
+    #[error(transparent)]
+    StateType(#[from] StateTypeError),
     /// The buffer ended before a length-prefixed field was fully read.
     #[error("event-marker payload truncated")]
     Truncated,

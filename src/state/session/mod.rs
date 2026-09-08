@@ -70,7 +70,7 @@ use crate::state::descriptor::{
 use crate::state::dirty::{CellSnapshot, ClearedSections, DirtyStore, DirtyVal, ResolvedCells};
 use crate::state::identity::{CollectionId, CollectionRef};
 use crate::state::manager::ArmedKeys;
-use crate::state::marker::{EventMarker, SectionClear};
+use crate::state::marker::{EventEvidence, EventMarker, SectionClear, evidence_ttl};
 use crate::state::oracle::CommitOracle;
 use crate::state::overlay::Overlay;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
@@ -122,8 +122,8 @@ impl<S: StateLifecycle + MarkerIdentity + WritableStateSession> EventSession for
 /// surfaces: staging, promoting, and discarding are framework-only moves.
 pub(crate) mod sealed {
     use super::{
-        CellKey, CellStore, CollectionRef, CompactDateTime, CompactDuration, Duration, Future,
-        MarkerWrite, ProvisionalWrite, RepinProof, SectionClear, StateAccessError, Uuid,
+        CellKey, CellStore, CollectionRef, CompactDateTime, CompactDuration, Duration, EventMarker,
+        Future, MarkerWrite, ProvisionalWrite, RepinProof, StateAccessError, Uuid,
         resolve_collections,
     };
     use opentelemetry::global::meter;
@@ -429,7 +429,7 @@ pub(crate) mod sealed {
     pub struct StagedCollection {
         pub(super) collection: CollectionRef,
         pub(super) writes: Vec<(CellKey, ProvisionalWrite)>,
-        pub(super) clears: Vec<SectionClear>,
+        pub(super) marker: EventMarker,
     }
 
     /// Whether `finalize` staged any provisional cells — and, when it did,
@@ -1356,9 +1356,29 @@ where
         let registry = &self.inner.registry;
         let lower = self.inner.overlay.lower();
         let state_key = &self.inner.state_key;
+        let mut marker_touched = Vec::with_capacity(touched.len());
+        let mut has_clears = false;
+        for ((state_type, name), cleared, _) in &touched {
+            if registry.commit_mode_for(*state_type, name) == CommitMode::ReadCommitted {
+                marker_touched.push((*state_type, name.clone()));
+                has_clears |= !cleared.is_empty();
+            }
+        }
+        marker_touched.sort_unstable();
+        marker_touched.dedup();
+        let ttl = evidence_ttl(
+            has_clears,
+            marker_touched
+                .iter()
+                .map(|(state_type, name)| registry.ttl_for(*state_type, name)),
+        );
         // Sized once to the touched-collection cardinality — the fold in
         // place of an unconstrained `try_collect` keeps the receipt's vector
         // from re-growing on the per-event hot path (bounded-allocation rule).
+        let evidence = EventEvidence {
+            touched: marker_touched.into(),
+            evidence_ttl: ttl,
+        };
         let capacity = touched.len();
         let collections: Vec<StagedCollection> = stream::iter(touched)
             .map(|((state_type, name), cleared, cells)| {
@@ -1366,7 +1386,9 @@ where
                 // `cooperative` adds a per-collection coop-budget yield point
                 // so a key touching many collections does not drain the batch
                 // in one poll; `buffer_unordered` keeps full concurrency.
-                cooperative(stage_collection(lower, registry, event, id, cleared, cells))
+                cooperative(stage_collection(
+                    lower, registry, event, id, cleared, cells, &evidence,
+                ))
             })
             .buffer_unordered(STATE_FANOUT_CONCURRENCY)
             .try_fold(Vec::with_capacity(capacity), |mut acc, staged| async move {
@@ -1549,6 +1571,7 @@ async fn stage_collection<S>(
     id: CollectionId,
     cleared: ClearedSections,
     cells: CellSnapshot,
+    evidence: &EventEvidence,
 ) -> Result<Option<StagedCollection>, StateAccessError>
 where
     S: CellStore,
@@ -1641,7 +1664,13 @@ where
                 .iter()
                 .map(|&section| SectionClear::frozen(section, &writes))
                 .collect();
-            let marker = EventMarker::frozen(event, &writes, &clears);
+            let marker = EventMarker::frozen(
+                event,
+                &writes,
+                &clears,
+                &evidence.touched,
+                evidence.evidence_ttl,
+            );
             lower
                 .write_provisional(&collection_ref, &writes, Some(&marker))
                 .await
@@ -1649,7 +1678,7 @@ where
             Ok(Some(StagedCollection {
                 collection: collection_ref,
                 writes,
-                clears,
+                marker,
             }))
         }
         CommitMode::ReadUncommitted => {
@@ -1699,11 +1728,11 @@ where
             |StagedCollection {
                  collection,
                  writes,
-                 clears,
+                 marker,
              }| {
                 cooperative(async move {
                     let result = if committed {
-                        store.commit_provisional(&collection, &writes, &clears).await
+                        store.commit_provisional(&collection, &marker, &writes).await
                     } else {
                         store.abort_provisional(&collection, &writes).await
                     };

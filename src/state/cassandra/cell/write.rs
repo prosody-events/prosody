@@ -1,9 +1,10 @@
 use super::{
     BatchUnit, CassandraStore, CellAddr, CellBatchRow, CellKey, CellStoreError, CollectionRef,
-    CommitOracle, EventMarker, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, MarkerWriteRow,
+    CommitOracle, EventMarker, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerWriteRow,
     PER_STATEMENT_OVERHEAD, Pk, ProvisionalWrite, ResolveCellError, RowShape, StageRow, bind_ttl,
-    blob_weight, encode_cell_blobs, fits_one_batch, smallvec,
+    blob_weight, encode_cell_blobs, smallvec,
 };
+use crate::state::marker::MarkerRow;
 
 pub(super) async fn write_provisional<O>(
     store: &CassandraStore<O>,
@@ -21,17 +22,17 @@ where
         marker.is_some() || writes.is_empty(),
         "a markerless stage must write nothing"
     );
+    let Some(marker) = marker else {
+        return Ok(());
+    };
     debug_assert!(
-        marker.is_none_or(|marker| writes
+        writes
             .iter()
-            .all(|(cell, _)| marker.staged().binary_search(cell).is_ok())),
+            .all(|(cell, _)| marker.staged().binary_search(cell).is_ok()),
         "every staged write must be listed by the event marker"
     );
     let pk = Pk::of(collection.id());
-    let marker_blob: Option<MarkerBlob> = match marker {
-        None => None,
-        Some(marker) => Some(store.stage_marker(collection, marker).await?),
-    };
+    let marker_blob = store.stage_marker(collection, marker).await?;
 
     // Encode every cell's blobs up front (this Vec owns the `Bytes`); the
     // bound rows borrow into it and into each input cell's coordinate slice,
@@ -42,26 +43,24 @@ where
         blobs.push(encode_cell_blobs(write.data(), write.prev()).map_err(ResolveCellError::Store)?);
     }
 
-    // Cells and the marker share the collection TTL. Bind 0 for no expiry.
+    // Cells bind the collection TTL; the Staged row binds the evidence TTL.
     let ttl = bind_ttl(collection.ttl());
     // The marker unit leads; each cell unit is one row. `units` stays a
     // `Vec` (not a `CellBuffer`) — see the `run_batches` ruling.
     let mut units: Vec<BatchUnit<CellBatchRow>> = Vec::with_capacity(writes.len() + 1);
-    if let Some(blob) = &marker_blob {
-        units.push(BatchUnit::new(
-            blob.payload.as_ref().len() as u64 + PER_STATEMENT_OVERHEAD,
-            smallvec![CellBatchRow {
-                statement: &store.queries.marker_write,
-                row: RowShape::MarkerWrite(MarkerWriteRow {
-                    ttl,
-                    payload: blob.payload.as_ref(),
-                    encoding: blob.payload.encoding(),
-                    event: blob.event,
-                    addr: CellAddr::marker(pk),
-                }),
-            }],
-        ));
-    }
+    units.push(BatchUnit::new(
+        marker_blob.payload.as_ref().len() as u64 + PER_STATEMENT_OVERHEAD,
+        smallvec![CellBatchRow {
+            statement: &store.queries.marker_write,
+            row: RowShape::MarkerWrite(MarkerWriteRow {
+                ttl: bind_ttl(marker.evidence_ttl()),
+                payload: marker_blob.payload.as_ref(),
+                encoding: marker_blob.payload.encoding(),
+                event: marker_blob.event,
+                addr: CellAddr::marker(pk, MarkerRow::Staged),
+            }),
+        }],
+    ));
     units.extend(blobs.iter().zip(writes).map(|(blob, (cell, write))| {
         let addr = CellAddr::new(pk, cell);
         BatchUnit::new(
@@ -81,31 +80,14 @@ where
         )
     }));
 
-    // Marker-first ordering. Within one batch the marker rides atomically;
-    // an over-budget stage MUST await the marker batch to completion
-    // before issuing the cell batches, because `execute_unlogged_batches`
-    // runs its chunks `buffer_unordered` (chunk order is NOT guaranteed).
-    // Marker-without-cells is the over-report-safe crash shape;
-    // cells-without-marker would strand them from recovery.
-    if marker_blob.is_none()
-        || fits_one_batch(
-            units.iter().map(BatchUnit::weight),
-            MAX_BATCH_BYTES,
-            MAX_BATCH_STATEMENTS,
-        )
-    {
+    // The first staged row makes a partial stage recoverable. Re-stamp it
+    // after every cell batch completes, so evidence outlives all listed cells.
+    // Await the phases in order because run_batches executes its chunks unordered.
+    for phase in super::batch::stage_batches(&units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS) {
         store
-            .run_batches(&units)
-            .await
-            .map_err(ResolveCellError::Store)
-    } else {
-        store
-            .run_batches(&units[..1])
+            .run_batches(&units[phase])
             .await
             .map_err(ResolveCellError::Store)?;
-        store
-            .run_batches(&units[1..])
-            .await
-            .map_err(ResolveCellError::Store)
     }
+    Ok(())
 }

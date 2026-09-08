@@ -52,15 +52,11 @@ use tokio::task::coop::cooperative;
 /// A cross-group, read-only view over a published keyed-state collection.
 ///
 /// Built from a [`StateReaderDependencies`] bundle with [`StateReader::new`].
-/// Reads observe
-/// only [`Cell::project_committed`](crate::state::cell::Cell::project_committed)
-/// of one source per operation, with honest bounded staleness. Two independent
-/// sources bound that staleness. The descriptor's read-cache TTL bounds a
-/// cached value's age. The owner's commit-to-apply window bounds the second: a
-/// value can be committed before the owner applies it, so a read may return
-/// that once-committed value early (see `project_committed` above). The second
-/// source converges via the owner's recovery sweep or its next commit, not via
-/// the read cache.
+/// Each operation reads one source. Positive collection evidence makes a
+/// committed provisional value visible before the owner applies it.
+/// Committed clears restrict scans to their frozen survivors.
+/// The read-cache TTL still bounds cached value age. `recovery_within` does
+/// not bound reader staleness; readers use evidence without an owner sweep.
 ///
 /// The reader is generic over the collection descriptor `D` and the message
 /// codec `C`. The read methods live in descriptor-specialized impl blocks for

@@ -794,7 +794,13 @@ fn finalize_matches_model(
             let [collection] = staged.collections.as_slice() else {
                 return Some("the single-collection trace staged more than one record");
             };
-            let expected = EventMarker::frozen(event, &collection.writes, &collection.clears);
+            let expected = EventMarker::frozen(
+                event,
+                &collection.writes,
+                collection.marker.clears(),
+                &vec![(StateType::Application, fx.value_id().name().clone())].into(),
+                None,
+            );
             (fx.cells.unsettled_marker_of(&fx.value_id()) != Some(expected))
                 .then_some("the receipt's frozen records diverge from the durable event marker")
         }
@@ -1085,7 +1091,7 @@ async fn clears_only_session_boundary(a_committed: bool) -> Result<()> {
             ProvisionalWrite::new(Some(Bytes::from_static(b"a1")), Committed::new(None), a),
         ),
     ];
-    let marker_a = EventMarker::frozen(a, &writes_a, &[]);
+    let marker_a = EventMarker::frozen(a, &writes_a, &[], &[].into(), None);
     raw.write_provisional(&collection, &writes_a, Some(&marker_a))
         .await?;
     if a_committed {
@@ -1257,7 +1263,7 @@ async fn own_event_read_does_not_resolve_its_own_marker() -> Result<()> {
         ProvisionalWrite::new(Some(Bytes::from_static(b"s")), Committed::new(None), e),
     )];
     let clears = [SectionClear::frozen(Section::new(0), &writes)];
-    let marker = EventMarker::frozen(e, &writes, &clears);
+    let marker = EventMarker::frozen(e, &writes, &clears, &[].into(), None);
     raw.write_provisional(&collection, &writes, Some(&marker))
         .await?;
 

@@ -11,43 +11,29 @@
 //! ([`Cached`](crate::state::cached::Cached),
 //! [`Overlay`](crate::state::overlay::Overlay)) are oracle-free.
 //!
-//! # Cell rows and the event marker
+//! # Cell and marker rows
 //!
-//! The partition's leading clustering [`CellKind`] splits it into two disjoint
-//! ranges. A `kind=Cell` row is one cell over the columns `data | prev_data |
-//! encoding | version | event`, addressed by `(section, coordinate)`. One
-//! `kind=Marker` row per collection, at the **fixed address**
-//! `(section = 0, coordinate = empty)`, is the durable recovery handle: its
-//! `event` column names the staging event and its `data` column carries the
-//! frozen marker payload — the event's full staged coordinate list
-//! ([`crate::state::marker`]). Recovery
-//! ([`provisional_cells`](CellStore::provisional_cells)) point-reads the
-//! marker, then point-reads each listed cell, so its cost is proportional to
-//! the number of provisional cells, never the partition size — and because
-//! every marker write and delete lands at the one fixed position, marker churn
-//! compacts to a single entry instead of accumulating a tombstone field.
+//! [`CellKind`] separates cell rows from the marker slice.
+//! [`MarkerRow`](crate::state::marker::MarkerRow) owns the two marker
+//! addresses. `Staged` lists provisional coordinates and frozen clear
+//! survivors. `Committed` stores positive evidence for the event.
+//! Both addresses are fixed, so marker churn compacts to two entries and never
+//! grows a tombstone field.
+//! Recovery reads `Staged`, then its listed cells; it never scans all cell
+//! rows.
 //!
-//! Marker lifecycle ownership is stated once, on
-//! [`write_provisional`](CellStore::write_provisional). A stage that fits the
-//! batch budget carries the marker row **in** the atomic batch; an over-budget
-//! stage writes the marker first, alone, so a torn stage is always
-//! marker-without-cells (over-report-safe), never cells-without-marker (a
-//! strand). [`MarkerMemo`] keeps unsettled markers in memory.
-//! [`MarkerCheckSet`] stores completed checks on disk.
-//! Together, they permit one durable marker read per assignment and collection.
+//! A stage that fits one batch writes its marker and cells atomically.
+//! A split stage writes `Staged`, then cells, then re-stamps `Staged`.
+//! A torn stage can leave Staged without cells, which safely over-reports;
+//! it cannot leave cells without Staged.
+//! A promote writes evidence before cell or gap changes and deletes `Staged`
+//! last. [`issue_markers`](CassandraStore::issue_markers) owns this order for
+//! settle. [`MarkerMemo`] holds only unsettled stages. [`MarkerCheckSet`]
+//! stores completed checks on disk. Readers that need commit evidence read the
+//! durable slice.
 //!
-//! The marker also carries the stage's **section clears** (each cleared
-//! section with its frozen survivor list). A committed clear is applied as the
-//! n+1 **gap range deletes** between sorted survivors ([`extend_gap_units`]) —
-//! survivors are excluded positionally, never temporally. Settle applies the
-//! lifecycle invariant marker-**last** through the shared
-//! [`issue_marker_last`](CassandraStore::issue_marker_last) tail (used by both
-//! [`commit_provisional`](CellStore::commit_provisional) and its abort twin
-//! [`abort_provisional`](CellStore::abort_provisional));
-//! [`write_resolved`](CellStore::write_resolved) applies its direct clears
-//! A read resolves a prior event's section clear before it returns data.
-//! A resolved write resolves an unsettled section clear before it writes data.
-//! These operations use the same marker memo.
+//! A prior section clear must resolve before an owner read or resolved write.
+//! These owner operations retain their existing marker memo and commit oracle.
 //!
 //! The three cell mutators write exactly one cell-column shape each:
 //!
@@ -93,15 +79,14 @@ mod serialization;
 mod store;
 mod write;
 
-use batch::{extend_gap_units, fits_one_batch, gap_count, marker_delete_unit, marker_last_split};
+use batch::{extend_gap_units, gap_count};
 use helpers::{blob_weight, decode_provisional_batch, encode_cell_blobs, ttl_seconds_to_duration};
 pub use queries::CellQueries;
 #[cfg(test)]
 use read::decode_rows_for_coordinates;
 use read::{
     decode_batch_rows, decode_cell_ttl_result, fetch_and_decode_cell, fetch_cell_rows_result,
-    fetch_cells_batch, fetch_cells_batch_result, into_store_err, match_batch_rows_to_coordinates,
-    page_cells,
+    fetch_cells_batch, fetch_cells_batch_result, match_batch_rows_to_coordinates, page_cells,
 };
 use rows::{
     CellAddr, CellBatchRow, CellBlobs, GapBetweenRow, GapEdgeRow, GapSectionRow, KeyRow,
@@ -142,14 +127,12 @@ use bytes::Bytes;
 use decode::{BorrowedKeyedCellTtlRow, FramedKeyedCellRow, split_keyed_cell_ttl};
 use encoding::{EncodedBlob, encode, encode_payload, select_encoding};
 use futures::{Stream, TryStreamExt, pin_mut};
-use scylla::client::session::Session;
 use scylla::response::query_result::QueryRowsResult;
 use scylla::serialize::SerializationError;
 use scylla::serialize::row::{RowSerializationContext, SerializeRow};
 use scylla::serialize::writers::RowWriter;
 use scylla::statement::prepared::PreparedStatement;
 use smallvec::{SmallVec, smallvec};
-use std::error::Error;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -190,13 +173,9 @@ const INITIAL_VERSION: i32 = 1;
 /// The leading clustering discriminator that splits a collection's partition
 /// into two disjoint front-to-back ranges.
 ///
-/// [`Cell`](Self::Cell) rows carry the full cell columns;
-/// [`Marker`](Self::Marker) is the collection's **one** event-marker row at the
-/// fixed address `(section = 0, coordinate = empty)`, so recovery is a single
-/// point read at a compaction-merged position — never a range over a tombstone
-/// field. It is **always bound as a constant clustering predicate**, never
-/// decoded back into a value — hence serialize-only ([`SerializeValue`] in
-/// [`super::serialize`]), with no `TryFrom`/`DeserializeValue`.
+/// [`Cell`](Self::Cell) rows carry values. [`Marker`](Self::Marker) selects
+/// the two addresses owned by [`MarkerRow`](crate::state::marker::MarkerRow).
+/// Statements bind this discriminator; reads never decode it.
 ///
 /// # Reserved-`kind` safety
 ///
@@ -225,10 +204,7 @@ pub(super) enum CellKind {
     /// column shape.
     Cell = 0,
 
-    /// The collection's fixed-address event-marker row: `event` names the
-    /// staging event, `data` carries the frozen marker payload
-    /// ([`crate::state::marker`]). Wire value `1` unchanged from the
-    /// per-coordinate design this row replaced.
+    /// The collection's Staged and Committed slice.
     Marker = 1,
 }
 

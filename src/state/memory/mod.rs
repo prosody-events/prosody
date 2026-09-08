@@ -2,7 +2,7 @@
 
 use super::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
-use super::marker::{EventMarker, SectionClear};
+use super::marker::{EventMarker, MarkerState, SectionClear};
 use super::oracle::CommitOracle;
 use super::registry::CollectionDefRegistry;
 use super::resolve::{
@@ -331,8 +331,9 @@ where
             if let Some(unsettled) = self
                 .cells
                 .markers
-                .read_async(collection.id(), |_, marker| marker.clone())
+                .read_async(collection.id(), |_, marker| marker.staged.clone())
                 .await
+                .flatten()
                 && unsettled.event() != marker.event()
             {
                 resolve_event_marker(self, self.resolver.oracle(), collection, &unsettled)
@@ -343,8 +344,11 @@ where
             // mirrors the documented stage ordering.
             self.cells
                 .markers
-                .upsert_async(collection.id().clone(), marker.clone())
-                .await;
+                .entry_async(collection.id().clone())
+                .await
+                .or_default()
+                .get_mut()
+                .staged = Some(marker.clone());
         }
         for (cell, write) in writes {
             self.map()
@@ -406,23 +410,32 @@ where
         Ok(())
     }
 
+    async fn marker_state<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> Result<MarkerState, Self::Error> {
+        Ok(self
+            .cells
+            .markers
+            .read_async(collection, |_, state| state.clone())
+            .await
+            .unwrap_or_default())
+    }
+
     async fn unsettled_marker<'a>(
         &'a self,
         collection: &'a CollectionId,
     ) -> Result<Option<EventMarker>, Self::Error> {
-        Ok(self
-            .cells
-            .markers
-            .read_async(collection, |_, marker| marker.clone())
-            .await)
+        Ok(self.marker_state(collection).await?.staged)
     }
 
     async fn commit_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
+        marker: &'a EventMarker,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
+        let clears = marker.clears();
         // Route present-data cells to a promote (`mark_resolved`) and
         // absent-data cells to a row-deleting raw apply (the row-absence
         // invariant), then erase the clears and delete the marker. The raw
@@ -450,9 +463,16 @@ where
         for clear in clears {
             self.erase_clear(collection.id(), clear).await;
         }
-        // Settle owns the marker delete; removing an absent marker is a no-op
-        // (idempotent settle).
-        self.cells.markers.remove_async(collection.id()).await;
+        self.cells
+            .markers
+            .upsert_async(
+                collection.id().clone(),
+                MarkerState {
+                    staged: None,
+                    committed: Some(marker.event()),
+                },
+            )
+            .await;
         Ok(())
     }
 
@@ -471,7 +491,12 @@ where
             .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
             .collect();
         self.apply_resolved(collection.id(), &cells, &[]).await;
-        self.cells.markers.remove_async(collection.id()).await;
+        if let Some(mut entry) = self.cells.markers.get_async(collection.id()).await {
+            entry.get_mut().staged = None;
+            if entry.get().committed.is_none() {
+                let _ = entry.remove();
+            }
+        }
         Ok(())
     }
 }

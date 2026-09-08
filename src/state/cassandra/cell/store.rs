@@ -6,10 +6,10 @@ use super::{
     CollectionDefRegistry, CollectionId, CollectionRef, CommitOracle, Coordinate, EventMarker,
     EventRef, KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, MarkerCheckSet, Pk,
     PreparedStatement, QueryRowsResult, ResolveCellError, ResolvedRow, Resolver, RowShape,
-    SHARD_FANOUT_CONCURRENCY, Scan, Section, Session, Stream, TryStreamExt, blob_weight, encode,
+    SHARD_FANOUT_CONCURRENCY, Scan, Section, Stream, TryStreamExt, blob_weight, encode,
     encode_marker_payload, fetch_and_decode_cell, fetch_cell_rows_result, fetch_cells_batch_result,
-    flatten_resolve, marker_delete_unit, marker_last_split, page_cells, peek_read, pin_mut,
-    resolve_event_marker, resolve_prior_clear_before_read, smallvec, try_stream,
+    flatten_resolve, page_cells, peek_read, pin_mut, resolve_event_marker,
+    resolve_prior_clear_before_read, smallvec, try_stream,
 };
 
 impl<O> CassandraStore<O> {
@@ -40,10 +40,6 @@ impl<O> CassandraStore<O> {
     #[must_use]
     pub(crate) fn recovery_reads(&self) -> Arc<RecoveryReadCounts> {
         self.counters.clone()
-    }
-
-    pub(super) fn cql(&self) -> &Session {
-        self.session.session()
     }
 
     pub(super) async fn point_read_cell(
@@ -82,7 +78,7 @@ impl<O> CassandraStore<O> {
 
     /// Executes the packed same-partition `UNLOGGED BATCH`es for a multi-cell
     /// mutation — the shared tail of the cell mutators. Each [`BatchUnit`] is
-    /// one row (a cell mutation, or the marker row), packed into the fewest
+    /// one row (a cell mutation, or either marker row), packed into the fewest
     /// batches under the byte and statement budgets; every batch is
     /// row-disjoint by construction (the marker address is disjoint from every
     /// cell row by `kind`), so no same-batch timestamp tie can pit a delete
@@ -167,7 +163,7 @@ where
 {
     /// The stage's marker half, ahead of any row building: the stage-boundary
     /// resolve, the memo mirror, and the frozen payload's encoding. Returns
-    /// the marker row's blob.
+    /// the Staged row's blob.
     ///
     /// Resolves a prior event marker before it stores the new marker.
     ///
@@ -262,25 +258,25 @@ where
         }
     }
 
-    /// Issues a settle's `units` marker-LAST: appends the collection's marker
-    /// delete, then runs one atomic batch when everything fits the budget, else
-    /// awaits the recovery prefix to completion before issuing the marker
-    /// alone. Owning the append, the split, and the ordered await here
-    /// makes marker misplacement and await reversal unrepresentable at the
-    /// call sites — the coupling [`marker_last_split`]'s positional index
-    /// alone cannot enforce.
-    pub(super) async fn issue_marker_last<'u>(
+    /// Writes evidence before destructive promote chunks and deletes Staged
+    /// last. A resolved cell without evidence, or residue without Staged,
+    /// cannot result from a partial promote. An abort has no leading
+    /// evidence unit.
+    pub(super) async fn issue_markers<'u>(
         &'u self,
-        pk: Pk<'u>,
-        mut units: Vec<BatchUnit<CellBatchRow<'u>>>,
+        leading: Option<BatchUnit<CellBatchRow<'u>>>,
+        units: Vec<BatchUnit<CellBatchRow<'u>>>,
+        trailing: BatchUnit<CellBatchRow<'u>>,
     ) -> Result<(), CellStoreError<O::Error>> {
-        units.push(marker_delete_unit(pk, &self.queries));
-        let split = marker_last_split(&units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS);
-        self.run_batches(&units[..split])
-            .await
-            .map_err(ResolveCellError::Store)?;
-        if split < units.len() {
-            self.run_batches(&units[split..])
+        let (units, phases) = super::batch::settle_batches(
+            leading,
+            units,
+            trailing,
+            MAX_BATCH_BYTES,
+            MAX_BATCH_STATEMENTS,
+        );
+        for phase in phases {
+            self.run_batches(&units[phase])
                 .await
                 .map_err(ResolveCellError::Store)?;
         }

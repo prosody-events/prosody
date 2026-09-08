@@ -443,6 +443,11 @@ it. The anchors code comments cite by name:
   The marker record sits textually after the stage inside one function, so
   "marker before durable state" is unwritable.
 
+The collection's `Committed` row supplies additive evidence written by the
+promote, before cell changes. The commit point remains the dedup marker.
+Standalone readers use collection evidence to resolve provisional values.
+The backstop and commit oracle still govern owner recovery.
+
 Two residual order facts govern middleware placement:
   - `retry` stays OUTERMOST so each attempt is a fresh dispatch, isolated by
     the `next_attempt` verb between attempts: its `reset` transition discards

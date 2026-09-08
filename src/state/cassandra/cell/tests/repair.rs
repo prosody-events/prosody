@@ -25,7 +25,7 @@ async fn corrupt_cleared_window(
     let foreign = event(0xF0);
     let survivors = [(cell_in(0, 2), Some(bytes(2)))];
     let clear = SectionClear::frozen_resolved(SECTIONS[0], &survivors);
-    let marker = EventMarker::frozen(foreign, &[], slice::from_ref(&clear));
+    let marker = EventMarker::frozen(foreign, &[], slice::from_ref(&clear), &[].into(), None);
     store
         .write_provisional(&collection, &[], Some(&marker))
         .await?;

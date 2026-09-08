@@ -20,12 +20,13 @@ mod properties;
 mod repair;
 mod ttl_marker;
 
+use super::batch::{fits_one_batch, marker_delete_unit, settle_batches, stage_batches};
 use super::decode::try_decode_marker;
 use super::{
     CassandraStore, CellAddr, CellBatchRow, CellBlobs, CellCorruptReason, CellKind, CellQueries,
     KeyRow, MarkerBlob, MarkerWriteRow, Pk, ResolvedRow, RowShape, StageRow, blob_weight,
-    decode_rows_for_coordinates, encode_cell_blobs, fits_one_batch, marker_delete_unit,
-    marker_last_split, sorted_unique_coordinates, ttl_seconds_to_duration,
+    decode_rows_for_coordinates, encode_cell_blobs, sorted_unique_coordinates,
+    ttl_seconds_to_duration,
 };
 use super::{decode, encoding};
 use crate::cassandra::{BatchUnit, CassandraStore as CassandraSession};
@@ -104,7 +105,7 @@ fn row_encoding_uses_the_larger_present_payload() -> Result<()> {
 /// Reads physical Cassandra rows for shared store tests.
 ///
 /// This probe reads only the test trace's partition.
-/// It checks cell rows, one fixed marker row, and provisional rows.
+/// It checks cell rows, both marker addresses, and provisional rows.
 struct CassandraShapeProbe {
     session: CassandraSession,
 }
@@ -167,29 +168,30 @@ impl ShapeProbe for CassandraShapeProbe {
             .query_unpaged(cql, pk_binds(id))
             .await?
             .into_rows_result()?;
-        let mut rows: Vec<MarkerSliceRow> = Vec::new();
+        let mut staged = None;
+        let mut count = 0_usize;
         for row in result.rows::<MarkerSliceRow>()? {
-            rows.push(row?);
+            let (section, coordinate, data, encoding, version, raw_event) = row?;
+            count += 1_usize;
+            if section != 0 || count > 2_usize {
+                return Err(eyre!("invalid marker slice"));
+            }
+            match coordinate.as_slice() {
+                [] => {
+                    let marker = try_decode_marker((data, encoding, version, raw_event), None)?;
+                    let (cells, clears) = probed_parts(&marker);
+                    staged = Some((marker.event(), cells, clears));
+                }
+                [1] => {
+                    assert!(data.is_none() && encoding.is_none() && version.is_none());
+                    raw_event
+                        .ok_or_else(|| eyre!("committed row without event"))?
+                        .try_into_event()?;
+                }
+                _ => return Err(eyre!("unknown marker coordinate")),
+            }
         }
-        // The structural postcondition: the whole marker slice is at most ONE
-        // row, at the fixed address — zero per-coordinate rows exist.
-        if rows.len() > 1 {
-            return Err(eyre!(
-                "marker slice holds {} rows, expected ≤ 1",
-                rows.len()
-            ));
-        }
-        let Some((section, coordinate, data, encoding, version, raw_event)) = rows.pop() else {
-            return Ok(None);
-        };
-        if section != 0 || !coordinate.is_empty() {
-            return Err(eyre!(
-                "marker row off the fixed address: section {section}, coordinate {coordinate:?}"
-            ));
-        }
-        let marker = try_decode_marker((data, encoding, version, raw_event))?;
-        let (staged, clears) = probed_parts(&marker);
-        Ok(Some((marker.event(), staged, clears)))
+        Ok(staged)
     }
 
     async fn provisional_rows(&self, id: &CollectionId) -> Result<BTreeSet<(i8, u8)>> {

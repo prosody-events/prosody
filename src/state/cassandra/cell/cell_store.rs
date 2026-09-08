@@ -1,18 +1,21 @@
 #[cfg(test)]
 use super::Ordering;
+use super::batch::marker_delete_unit;
+use super::read::fetch_marker_state;
+use super::rows::CommittedWriteRow;
 use super::{
-    BatchUnit, Bytes, CacheBatch, CassandraStore, CassandraStoreError, Cell, CellAddr,
-    CellBatchRow, CellBuffer, CellKey, CellKind, CellStore, CellStoreError, CollectionId,
-    CollectionRef, CommitOracle, Committed, CommittedBatch, CompactDuration, Coordinate,
-    CoordinateBatch, EventMarker, EventRef, KeyRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell,
-    ProvisionalWrite, ReadPreparation, ResolveCellError, RowShape, Scan, Section, SectionClear,
-    SmallVec, Stream, bind_ttl, decode, decode_batch_rows, decode_cell_ttl_result,
-    decode_provisional_batch, dedupe, encode_cell_blobs, expand_to_input_order, extend_gap_units,
-    flatten_resolve, gap_count, into_store_err, match_batch_rows_to_coordinates,
-    resolve_prior_clear_before_read, resolve_read, resolve_unsettled_clear_before_write,
-    section_batches, smallvec, sorted_unique_coordinates, try_stream, ttl_seconds_to_duration,
-    write_provisional,
+    BatchUnit, Bytes, CacheBatch, CassandraStore, Cell, CellAddr, CellBatchRow, CellBuffer,
+    CellKey, CellKind, CellStore, CellStoreError, CollectionId, CollectionRef, CommitOracle,
+    Committed, CommittedBatch, CompactDuration, Coordinate, CoordinateBatch, EventMarker, EventRef,
+    KeyRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell, ProvisionalWrite, ReadPreparation,
+    ResolveCellError, RowShape, Scan, Section, SectionClear, SmallVec, Stream, bind_ttl,
+    decode_batch_rows, decode_cell_ttl_result, decode_provisional_batch, dedupe, encode_cell_blobs,
+    expand_to_input_order, extend_gap_units, flatten_resolve, gap_count,
+    match_batch_rows_to_coordinates, resolve_prior_clear_before_read, resolve_read,
+    resolve_unsettled_clear_before_write, section_batches, smallvec, sorted_unique_coordinates,
+    try_stream, ttl_seconds_to_duration, write_provisional,
 };
+use crate::state::marker::{MarkerRow, MarkerState};
 
 impl<O> CellStore for CassandraStore<O>
 where
@@ -324,6 +327,24 @@ where
             .map_err(ResolveCellError::Store)
     }
 
+    async fn marker_state<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> Result<MarkerState, Self::Error> {
+        #[cfg(test)]
+        self.counters
+            .marker_point_reads
+            .fetch_add(1, Ordering::Relaxed);
+        fetch_marker_state(
+            &self.session,
+            &self.queries,
+            collection,
+            self.resolver.collection_ref(collection).ttl(),
+        )
+        .await
+        .map_err(ResolveCellError::Store)
+    }
+
     async fn unsettled_marker<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -336,41 +357,7 @@ where
                 .read_async(collection, |_, marker| marker.clone())
                 .await);
         }
-        // Read the fixed marker row once for this assignment.
-        #[cfg(test)]
-        self.counters
-            .marker_point_reads
-            .fetch_add(1, Ordering::Relaxed);
-        let pk = Pk::of(collection);
-        let addr = CellAddr::marker(pk);
-        let result = self
-            .cql()
-            .execute_unpaged(
-                &self.queries.marker_read,
-                (
-                    pk.segment_id,
-                    pk.key,
-                    pk.state_type,
-                    pk.name,
-                    CellKind::Marker,
-                    addr.section,
-                    addr.coordinate,
-                ),
-            )
-            .await
-            .map_err(CassandraStoreError::from)
-            .map_err(into_store_err::<O::Error>)?
-            .into_rows_result()
-            .map_err(CassandraStoreError::from)
-            .map_err(into_store_err::<O::Error>)?;
-        let row = result
-            .maybe_first_row::<decode::BorrowedMarkerRow<'_>>()
-            .map_err(CassandraStoreError::from)
-            .map_err(into_store_err::<O::Error>)?;
-        let marker = row
-            .map(decode::try_decode_marker)
-            .transpose()
-            .map_err(ResolveCellError::Store)?;
+        let marker = self.marker_state(collection).await?.staged;
         if let Some(marker) = &marker {
             self.memo
                 .unsettled
@@ -384,9 +371,10 @@ where
     async fn commit_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
+        marker: &'a EventMarker,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
+        let clears = marker.clears();
         // Commit applies natively — present data promotes in place, a staged
         // clear deletes its row (the row-absence invariant).
         // Cell and gap rows are disjoint and idempotent: gaps exclude survivors
@@ -395,7 +383,7 @@ where
         let pk = Pk::of(collection.id());
         // `units` stays a `Vec` (not a `CellBuffer`) — see the `run_batches` ruling.
         let mut units: Vec<BatchUnit<CellBatchRow>> =
-            Vec::with_capacity(writes.len() + gap_count(clears) + 1);
+            Vec::with_capacity(writes.len() + gap_count(clears) + 2);
         units.extend(writes.iter().map(|(cell, write)| {
             let addr = CellAddr::new(pk, cell);
             let statement = if write.data().is_some() {
@@ -415,7 +403,19 @@ where
             )
         }));
         extend_gap_units(&mut units, &self.queries, pk, clears);
-        self.issue_marker_last(pk, units).await?;
+        let evidence = BatchUnit::new(
+            PER_STATEMENT_OVERHEAD,
+            smallvec![CellBatchRow {
+                statement: &self.queries.committed_write,
+                row: RowShape::CommittedWrite(CommittedWriteRow {
+                    ttl: bind_ttl(marker.evidence_ttl()),
+                    event: marker.event(),
+                    addr: CellAddr::marker(pk, MarkerRow::Committed),
+                }),
+            }],
+        );
+        self.issue_markers(Some(evidence), units, marker_delete_unit(pk, &self.queries))
+            .await?;
         self.record_marker_settled(collection.id()).await;
         Ok(())
     }
@@ -445,7 +445,8 @@ where
         let ttl = bind_ttl(collection.ttl());
         let mut units = Vec::with_capacity(cells.len() + 1);
         units.extend(self.resolved_units(pk, ttl, &blobs, &cells));
-        self.issue_marker_last(pk, units).await?;
+        self.issue_markers(None, units, marker_delete_unit(pk, &self.queries))
+            .await?;
         self.record_marker_settled(collection.id()).await;
         Ok(())
     }

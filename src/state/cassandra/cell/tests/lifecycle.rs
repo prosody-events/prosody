@@ -17,7 +17,7 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
         cell.clone(),
         ProvisionalWrite::new(Some(data.clone()), Committed::new(None), event(1)),
     )];
-    let marker = EventMarker::frozen(event(1), &writes, &[]);
+    let marker = EventMarker::frozen(event(1), &writes, &[], &[].into(), None);
     store.write_provisional(&c, &writes, Some(&marker)).await?;
     let staged = provisional_cells(&store, c.id()).await?;
     let (key, prov) = staged
@@ -108,9 +108,9 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
             event(1),
         ),
     )];
-    let marker = EventMarker::frozen(event(1), &writes, &[]);
+    let marker = EventMarker::frozen(event(1), &writes, &[], &[].into(), None);
     store.write_provisional(&c, &writes, Some(&marker)).await?;
-    store.commit_provisional(&c, &writes, &[]).await?;
+    store.commit_provisional(&c, &marker, &writes).await?;
     let staged_marker_reads = counts.marker_point_reads.load(Ordering::Relaxed);
     assert_eq!(
         staged_marker_reads, 1,
@@ -150,9 +150,9 @@ async fn warm_quiescence_issues_zero_queries() -> Result<()> {
         ),
     )];
     let clears = [SectionClear::frozen(cell.section, &writes)];
-    let marker = EventMarker::frozen(event(2), &writes, &clears);
+    let marker = EventMarker::frozen(event(2), &writes, &clears, &[].into(), None);
     store.write_provisional(&c, &writes, Some(&marker)).await?;
-    store.commit_provisional(&c, &writes, &clears).await?;
+    store.commit_provisional(&c, &marker, &writes).await?;
     assert!(provisional_cells(&store, c.id()).await?.is_empty());
     assert!(provisional_cells(&store, c.id()).await?.is_empty());
     assert_eq!(
@@ -247,7 +247,7 @@ async fn bounded_recovery_is_size_independent() -> Result<()> {
                 )
             })
             .collect();
-        let marker = EventMarker::frozen(event(1), &staged, &[]);
+        let marker = EventMarker::frozen(event(1), &staged, &[], &[].into(), None);
         store.write_provisional(&c, &staged, Some(&marker)).await?;
         assert_eq!(
             counts.marker_point_reads.load(Ordering::Relaxed),
@@ -328,7 +328,7 @@ async fn presence_loss_forces_one_recheck_and_reseeds() -> Result<()> {
             event(1),
         ),
     )];
-    let marker = EventMarker::frozen(event(1), &writes, &[]);
+    let marker = EventMarker::frozen(event(1), &writes, &[], &[].into(), None);
     store.write_provisional(&c, &writes, Some(&marker)).await?;
     let after_stage = counts.marker_point_reads.load(Ordering::Relaxed);
     assert_eq!(
@@ -395,7 +395,7 @@ async fn committed_clear_deletes_the_row() -> Result<()> {
         .await?;
     let write = ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(2));
     let writes = [(cell.clone(), write.clone())];
-    let marker = EventMarker::frozen(event(2), &writes, &[]);
+    let marker = EventMarker::frozen(event(2), &writes, &[], &[].into(), None);
     store.write_provisional(&c, &writes, Some(&marker)).await?;
     let staged = provisional_cells(&store, c.id()).await?;
     let (_, prov) = staged
@@ -407,7 +407,7 @@ async fn committed_clear_deletes_the_row() -> Result<()> {
 
     oracle.record_message(Uuid::from_u128(2)).await?;
     store
-        .commit_provisional(&c, &[(cell.clone(), write)], &[])
+        .commit_provisional(&c, &marker, &[(cell.clone(), write)])
         .await?;
 
     assert_eq!(

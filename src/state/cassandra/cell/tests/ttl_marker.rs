@@ -1,4 +1,6 @@
 use super::*;
+use crate::state::marker::evidence_ttl;
+use crate::timers::duration::CompactDuration;
 
 /// The cache-fill co-expiry matches the value actually returned, not the
 /// pre-resolution `TTL(data)`. A staged clear over a present base (`data`
@@ -28,7 +30,7 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
         cell.clone(),
         ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(1)),
     )];
-    let marker = EventMarker::frozen(event(1), &writes, &[]);
+    let marker = EventMarker::frozen(event(1), &writes, &[], &[].into(), None);
     store.write_provisional(&c, &writes, Some(&marker)).await?;
 
     let (committed, co_expiry) = store.get_for_cache(c.id(), &cell, event(2)).await?;
@@ -47,69 +49,78 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
     Ok(())
 }
 
-/// Marker TTL co-expiry pin: staging on a TTL'd collection stamps the
-/// event-marker row with the collection TTL, so the marker dies with the
-/// newest staged cell. Structurally untestable by the trace suites (their
-/// collection pool is TTL-less), so pinned directly with a raw-CQL
-/// `TTL(data)` read at the fixed marker address.
-#[tokio::test]
-async fn event_marker_co_expires_with_collection_ttl() -> Result<()> {
-    use crate::cassandra::TABLE_KEYED_STATE_CELL;
-    use crate::timers::duration::CompactDuration;
-
-    const TTL: u32 = 3_600;
-
+/// Both marker rows retain the event's longest TTL. Clears retain evidence
+/// without expiry.
+#[test]
+fn marker_rows_carry_evidence_ttl() {
+    fn prop(first: u16, second: u16, clear: bool) -> TestResult {
+        finish(TEST_RUNTIME.block_on(async {
+            let fx = fixture().await?;
+            let store = fx.bottom_store(ScriptedOracle::default())?;
+            let first = CompactDuration::new(u32::from(first) + 60);
+            let second = CompactDuration::new(u32::from(second) + 60);
+            let c =
+                CollectionRef::new(collection("marker-evidence-ttl")?.id().clone(), Some(first));
+            let writes = [(
+                value_cell(),
+                ProvisionalWrite::new(
+                    Some(Bytes::from_static(b"v")),
+                    Committed::new(None),
+                    event(1),
+                ),
+            )];
+            let clears: Vec<_> = clear
+                .then(|| SectionClear::frozen(value_cell().section, &writes))
+                .into_iter()
+                .collect();
+            let ttl = evidence_ttl(clear, [Some(first), Some(second)].into_iter());
+            let marker = EventMarker::frozen(event(1), &writes, &clears, &[].into(), ttl);
+            store.write_provisional(&c, &writes, Some(&marker)).await?;
+            for coordinate in [&[][..], &[1_u8][..]] {
+                if !coordinate.is_empty() {
+                    store.commit_provisional(&c, &marker, &writes).await?;
+                }
+                let pk = Pk::of(c.id());
+                let row = fx
+                    .cassandra
+                    .session()
+                    .query_unpaged(
+                        format!(
+                            "SELECT TTL(event) FROM {TEST_KEYSPACE}.keyed_state_cell WHERE \
+                             segment_id = ? AND key = ? AND state_type = ? AND name = ? AND kind \
+                             = ? AND section = ? AND coordinate = ?"
+                        ),
+                        (
+                            pk.segment_id,
+                            pk.key,
+                            pk.state_type,
+                            pk.name,
+                            CellKind::Marker,
+                            0_i8,
+                            coordinate,
+                        ),
+                    )
+                    .await?
+                    .into_rows_result()?
+                    .single_row::<(Option<i32>,)>()?;
+                if clear {
+                    assert_eq!(row.0, None);
+                } else {
+                    let remaining = row.0.ok_or_else(|| eyre!("missing evidence TTL"))?;
+                    let expected = first.max(second).seconds() as i32;
+                    assert!(
+                        remaining <= expected && remaining > expected - 60_i32,
+                        "remaining={remaining}, expected={expected}"
+                    );
+                }
+            }
+            Ok(true)
+        }))
+    }
     init_test_logging();
-    let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default())?;
-    let c = CollectionRef::new(
-        collection("marker-ttl")?.id().clone(),
-        Some(CompactDuration::new(TTL)),
-    );
-    let cell = value_cell();
-    let writes = [(
-        cell,
-        ProvisionalWrite::new(
-            Some(Bytes::from_static(b"v")),
-            Committed::new(None),
-            event(1),
-        ),
-    )];
-    let marker = EventMarker::frozen(event(1), &writes, &[]);
-    store.write_provisional(&c, &writes, Some(&marker)).await?;
-
-    let cql = format!(
-        "SELECT TTL(data) FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} WHERE segment_id = ? AND \
-         key = ? AND state_type = ? AND name = ? AND kind = 1 AND section = 0 AND coordinate = ?"
-    );
-    let id = c.id();
-    let remaining = fx
-        .cassandra
-        .session()
-        .query_unpaged(
-            cql,
-            (
-                id.state_key().segment_id,
-                id.state_key().key.as_ref(),
-                i8::from(id.state_type()),
-                id.name().as_str(),
-                b"" as &[u8],
-            ),
-        )
-        .await?
-        .into_rows_result()?
-        .maybe_first_row::<(Option<i32>,)>()?
-        .and_then(|(ttl,)| ttl)
-        .ok_or_else(|| eyre!("the event-marker row or its TTL is missing"))?;
-    assert!(
-        remaining > 0_i32 && remaining <= TTL as i32,
-        "marker TTL {remaining} must lie in (0, {TTL}]"
-    );
-    assert!(
-        remaining > TTL as i32 - 60_i32,
-        "marker TTL {remaining} must be freshly stamped (60s slack for elapsed wall time)"
-    );
-    Ok(())
+    QuickCheck::new()
+        .tests(integration_test_count(25))
+        .quickcheck(prop as fn(u16, u16, bool) -> TestResult);
 }
 
 /// The `Cached` stage-boundary marker eviction: event A stages two coordinates
@@ -171,7 +182,7 @@ async fn stage_boundary_deletes_foreign_marker_entries() -> Result<()> {
             ),
         ),
     ];
-    let marker_a = EventMarker::frozen(event(1), &writes_a, &[]);
+    let marker_a = EventMarker::frozen(event(1), &writes_a, &[], &[].into(), None);
     store
         .write_provisional(&c, &writes_a, Some(&marker_a))
         .await?;
@@ -186,7 +197,7 @@ async fn stage_boundary_deletes_foreign_marker_entries() -> Result<()> {
         cell1.clone(),
         ProvisionalWrite::new(Some(Bytes::from_static(b"b1")), prev_b, event(2)),
     )];
-    let marker_b = EventMarker::frozen(event(2), &writes_b, &[]);
+    let marker_b = EventMarker::frozen(event(2), &writes_b, &[], &[].into(), None);
     store
         .write_provisional(&c, &writes_b, Some(&marker_b))
         .await?;

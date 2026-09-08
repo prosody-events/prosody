@@ -390,7 +390,7 @@ fn memory_resolve_event_marker_batches_reads() -> Result<()> {
                 ProvisionalWrite::new(Some(bytes(2)), Committed::new(None), event),
             )
         }));
-        let marker = EventMarker::frozen(event, &writes, &[]);
+        let marker = EventMarker::frozen(event, &writes, &[], &[].into(), None);
         counting
             .write_provisional(&cref, &writes, Some(&marker))
             .await
@@ -449,7 +449,7 @@ fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
                 ProvisionalWrite::new(Some(bytes(90)), Committed::new(None), event),
             ),
         ];
-        let marker = EventMarker::frozen(event, &writes, &[]);
+        let marker = EventMarker::frozen(event, &writes, &[], &[].into(), None);
         store
             .write_provisional(&cref, &writes, Some(&marker))
             .await
@@ -522,7 +522,7 @@ fn resolve_event_marker_double_failure_surfaces_oracle() -> Result<()> {
             cell_in(0, 1),
             ProvisionalWrite::new(Some(bytes(1)), Committed::new(None), event),
         )];
-        let marker = EventMarker::frozen(event, &writes, &[]);
+        let marker = EventMarker::frozen(event, &writes, &[], &[].into(), None);
         counting
             .write_provisional(&cref, &writes, Some(&marker))
             .await
@@ -1134,7 +1134,7 @@ async fn stage_a_then_crash(
             ProvisionalWrite::new(Some(bytes(11)), prev1, a),
         ),
     ];
-    let marker_a = EventMarker::frozen(a, &writes_a, &[]);
+    let marker_a = EventMarker::frozen(a, &writes_a, &[], &[].into(), None);
     store
         .write_provisional(&collection, &writes_a, Some(&marker_a))
         .await?;
@@ -1161,7 +1161,7 @@ async fn boundary_resolve_pin(a_committed: bool) -> Result<()> {
         cell_in(0, 1),
         ProvisionalWrite::new(Some(bytes(21)), prev_b, b),
     )];
-    let marker_b = EventMarker::frozen(b, &writes_b, &[]);
+    let marker_b = EventMarker::frozen(b, &writes_b, &[], &[].into(), None);
     store
         .write_provisional(&collection, &writes_b, Some(&marker_b))
         .await?;
@@ -1238,7 +1238,7 @@ async fn clears_only_boundary_pin(a_committed: bool) -> Result<()> {
         dedup_id: Uuid::from_u128(2),
     };
     let clears_b = [SectionClear::frozen(SECTIONS[1], &[])];
-    let marker_b = EventMarker::frozen(b, &[], &clears_b);
+    let marker_b = EventMarker::frozen(b, &[], &clears_b, &[].into(), None);
     store
         .write_provisional(&collection, &[], Some(&marker_b))
         .await?;

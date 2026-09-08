@@ -44,7 +44,7 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
         cell_b.clone(),
         ProvisionalWrite::new(Some(data_b.clone()), Committed::new(None), event(1)),
     )];
-    let marker_b = EventMarker::frozen(event(1), &writes_b, &[]);
+    let marker_b = EventMarker::frozen(event(1), &writes_b, &[], &[].into(), None);
     store
         .write_provisional(&c, &writes_b, Some(&marker_b))
         .await?;
@@ -62,7 +62,13 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
         cell_a.clone(),
         ProvisionalWrite::new(Some(data_a.clone()), Committed::new(None), event(2)),
     )];
-    let marker_payload = encode_marker_payload(&EventMarker::frozen(event(2), &staged_a, &[]))?;
+    let marker_payload = encode_marker_payload(&EventMarker::frozen(
+        event(2),
+        &staged_a,
+        &[],
+        &[].into(),
+        None,
+    ))?;
     let payload = encode(&marker_payload)?;
     let marker_blob = MarkerBlob {
         payload,

@@ -47,7 +47,7 @@
 //! Use the expiry stamp for time-based removal.
 //!
 //! The must-succeed sites, by verb:
-//! - `write_provisional` removes a prior event marker's staged entries and
+//! - `write_provisional` removes a prior Staged row's listed entries and
 //!   cleared sections. It resets the cold seed after a failed lower stage or a
 //!   failed index record.
 //! - `write_resolved` removes an unsettled clear's entries, the cleared
@@ -126,7 +126,7 @@ use super::cell_key::{CellKey, Coordinate, Scan, Section};
 use super::event_ref::EventRef;
 use super::fjall::{CacheRead, FjallCellCache, FjallCellCacheError};
 use super::identity::{CollectionId, CollectionRef};
-use super::marker::{EventMarker, SectionClear};
+use super::marker::{EventMarker, MarkerState, SectionClear};
 use super::store::{
     CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, section_batches,
 };
@@ -213,7 +213,7 @@ impl<L> Cached<L> {
         self.fjall.delete_batch(collection, cells).await
     }
 
-    /// Removes cache entries that an event marker can change.
+    /// Removes cache entries that a Staged payload can change.
     ///
     /// A failed removal disables the cache.
     async fn evict_marker_cache_entries(&self, collection: &CollectionId, marker: &EventMarker) {
@@ -481,7 +481,7 @@ where
         // Cassandra queries (the zero-query-on-quiescence goal); an empty
         // snapshot yields nothing. Cold (a fresh assignment after
         // crash/rebalance mints an empty `index` keyspace): the lower store's
-        // bounded seed runs — the event-marker point read and its per-section
+        // bounded seed runs — the Staged payload read and its per-section
         // batch reads (one raw `IN` read per `<=CELL_BATCH` chunk; cost ∝
         // #provisional, never #cells) —
         // each coordinate is recorded into fjall as it streams, and the
@@ -490,7 +490,7 @@ where
         // A warm read/write failure degrades toward the cold path (re-seed
         // from durable truth), never toward trusting a possibly-incomplete
         // warm set — the fjall index is a hint over the authoritative durable
-        // event marker.
+        // Staged row.
         try_stream! {
             // Bypass the provisional index when the cache is disabled.
             // An older index can be incomplete after disablement.
@@ -555,7 +555,7 @@ where
                 }
                 // Latch `seeded` only if the whole coords set landed on disk. If
                 // any record failed, leave it unseeded so the next sweep re-seeds
-                // cold from the durable event marker rather than
+                // cold from the durable Staged row rather than
                 // short-circuiting on an incomplete snapshot and stranding a
                 // provisional cell — symmetric with `write_provisional`. A
                 // failed latch write is safe to lose (warn-and-continue): the
@@ -607,7 +607,7 @@ where
                 .write_provisional(collection, writes, marker)
                 .await;
         }
-        // The lower store can resolve a prior event marker during this stage.
+        // The lower store can resolve a prior Staged row during this stage.
         // Remove each affected cache entry before that resolution.
         if let Some(marker) = marker
             && let Some(unsettled) = self.lower.unsettled_marker(collection.id()).await?
@@ -622,7 +622,7 @@ where
         // landed cells the warm set now misses, so the seeded latch must drop
         // (must-succeed: an unseed WRITE failure would leave the latch true
         // over an incomplete snapshot, short-circuiting every later sweep on
-        // it and stranding the cell). The marker lifecycle lives entirely in
+        // it and stranding the cell). The Staged lifecycle lives entirely in
         // the lower store; the cache never caches markers.
         let stamped_at = self.fjall.clock().now_ms();
         if let Err(error) = self
@@ -639,7 +639,7 @@ where
         // Record the staged coordinates into the warm provisional-coordinate
         // cache after the durable ack, as one atomic batch. A warm write
         // failure drops the seeded latch — must-succeed, same strand argument
-        // as above — so the next sweep re-seeds from the durable event marker,
+        // as above — so the next sweep re-seeds from the durable Staged row,
         // never leaving the latch true with an unaccounted coordinate.
         if let Err(error) = self
             .fjall
@@ -747,13 +747,14 @@ where
     async fn commit_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
+        marker: &'a EventMarker,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
+        let clears = marker.clears();
         if self.fjall.is_disabled() {
             return self
                 .lower
-                .commit_provisional(collection, writes, clears)
+                .commit_provisional(collection, marker, writes)
                 .await;
         }
         // Publish the committed values before durable promotion.
@@ -783,14 +784,14 @@ where
             }
         }
         // (3) Settle in the lower store (the authoritative settle) — the lower
-        // store owns the promote-vs-delete routing and the marker delete. The
+        // store owns the promote-vs-delete routing and the Staged delete. The
         // result is returned VERBATIM (the Incomplete trap, module doc): the
         // cache already holds the committed projection either way — on Err or
         // a dropped future the entries hold `data`, correct because the
         // verdict was fixed before the call.
         let result = self
             .lower
-            .commit_provisional(collection, writes, clears)
+            .commit_provisional(collection, marker, writes)
             .await;
         // (4) Every write is resolved; drop the warm provisional coordinates
         // (warn-and-continue: over-report-safe).
@@ -850,11 +851,18 @@ where
         result
     }
 
+    async fn marker_state<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> Result<MarkerState, Self::Error> {
+        self.lower.marker_state(collection).await
+    }
+
     async fn unsettled_marker<'a>(
         &'a self,
         collection: &'a CollectionId,
     ) -> Result<Option<EventMarker>, Self::Error> {
-        // A pure lower read — the cache never caches markers (the marker
+        // A pure lower read — the cache never caches marker rows (the Staged
         // lifecycle lives in the lower store), so no cache-disabled branch is needed.
         self.lower.unsettled_marker(collection).await
     }

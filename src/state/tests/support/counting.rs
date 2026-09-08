@@ -1,6 +1,7 @@
 //! Store and resolver counters used by query-budget tests.
 
 use super::*;
+use crate::state::marker::MarkerState;
 
 #[derive(Clone)]
 pub(crate) struct CountingCellStore<S> {
@@ -211,6 +212,13 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
         self.inner.mark_resolved(collection, cells).await
     }
 
+    async fn marker_state<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> Result<MarkerState, Self::Error> {
+        self.inner.marker_state(collection).await
+    }
+
     async fn unsettled_marker<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -222,14 +230,14 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
     async fn commit_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
+        marker: &'a EventMarker,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
         self.counts
             .commit_provisional
             .fetch_add(1, Ordering::Relaxed);
         self.inner
-            .commit_provisional(collection, writes, clears)
+            .commit_provisional(collection, marker, writes)
             .await
     }
 

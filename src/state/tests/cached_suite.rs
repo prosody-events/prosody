@@ -31,6 +31,7 @@ use super::support::{
     CountingCellStore, HoldingCellStore, batch_of, fresh_collection as collection, probe,
 };
 use crate::error::ErrorCategory;
+use crate::state::marker::MarkerState;
 use crate::test_util::{GlobalMetrics, TEST_RUNTIME, labels};
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
@@ -191,6 +192,13 @@ where
         self.inner.mark_resolved(collection, cells)
     }
 
+    async fn marker_state<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> Result<MarkerState, Self::Error> {
+        self.inner.marker_state(collection).await
+    }
+
     fn unsettled_marker<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -201,10 +209,10 @@ where
     fn commit_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
+        marker: &'a EventMarker,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        clears: &'a [SectionClear],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
-        self.inner.commit_provisional(collection, writes, clears)
+        self.inner.commit_provisional(collection, marker, writes)
     }
 
     fn abort_provisional<'a>(
@@ -297,7 +305,7 @@ fn warm_entries_and_index_survive_same_workspace_rebuild() -> Result<()> {
             cell_at(3),
             ProvisionalWrite::new(Some(bytes(5)), prev, event),
         )];
-        let marker = EventMarker::frozen(event, &writes, &[]);
+        let marker = EventMarker::frozen(event, &writes, &[], &[].into(), None);
         cached
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -390,7 +398,7 @@ fn warm_snapshot_failure_degrades_to_cold_reseed() -> Result<()> {
             cell_at(3),
             ProvisionalWrite::new(Some(bytes(5)), prev, event),
         )];
-        let marker = EventMarker::frozen(event, &writes, &[]);
+        let marker = EventMarker::frozen(event, &writes, &[], &[].into(), None);
         cached
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -448,7 +456,7 @@ fn cold_seed_record_failure_leaves_collection_unseeded() -> Result<()> {
             cell_at(3),
             ProvisionalWrite::new(Some(bytes(5)), prev, event),
         )];
-        let marker = EventMarker::frozen(event, &writes, &[]);
+        let marker = EventMarker::frozen(event, &writes, &[], &[].into(), None);
         cached
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -672,7 +680,7 @@ fn cached_provisional_many_does_not_publish() -> Result<()> {
             cell_at(2),
             ProvisionalWrite::new(Some(bytes(20)), prev, event),
         )];
-        let marker = EventMarker::frozen(event, &writes, &[]);
+        let marker = EventMarker::frozen(event, &writes, &[], &[].into(), None);
         counting
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -844,7 +852,7 @@ fn promote_delete_retries_before_cache_disablement() -> Result<()> {
             cell_at(0),
             ProvisionalWrite::new(Some(bytes(5)), prev, event),
         )];
-        let marker = EventMarker::frozen(event, &writes, &[]);
+        let marker = EventMarker::frozen(event, &writes, &[], &[].into(), None);
         cached
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -1060,7 +1068,7 @@ fn blind_write_deletes_beneath_resolved_marker_window() -> Result<()> {
             ProvisionalWrite::new(Some(bytes(2)), prev, event_a),
         )];
         let clears = vec![SectionClear::frozen(SECTION, &writes)];
-        let marker = EventMarker::frozen(event_a, &writes, &clears);
+        let marker = EventMarker::frozen(event_a, &writes, &clears, &[].into(), None);
         cached
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -1232,7 +1240,7 @@ fn scan_resolution_is_read_only() -> Result<()> {
             cell_at(4),
             ProvisionalWrite::new(None, Committed::new(Some(bytes(1))), prior_event),
         )];
-        let marker = EventMarker::frozen(prior_event, &writes, &[]);
+        let marker = EventMarker::frozen(prior_event, &writes, &[], &[].into(), None);
         lower
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -1483,7 +1491,7 @@ async fn stage_committed_marker<L>(
     oracle: &ScriptedOracle,
     cref: &CollectionRef,
     dedup: u128,
-) -> Result<Vec<(CellKey, ProvisionalWrite)>>
+) -> Result<(Vec<(CellKey, ProvisionalWrite)>, EventMarker)>
 where
     L: CellStore,
 {
@@ -1502,7 +1510,7 @@ where
             ProvisionalWrite::new(Some(bytes(100 + c)), prev, event),
         ));
     }
-    let marker = EventMarker::frozen(event, &writes, &[]);
+    let marker = EventMarker::frozen(event, &writes, &[], &[].into(), None);
     cached
         .write_provisional(cref, &writes, Some(&marker))
         .await?;
@@ -1510,7 +1518,7 @@ where
     // boundary records the marker first) — the settlement cache update
     // precondition.
     oracle.record_message(Uuid::from_u128(dedup)).await?;
-    Ok(writes)
+    Ok((writes, marker))
 }
 
 /// Proves that settlement caches committed data before durable promotion.
@@ -1533,13 +1541,13 @@ fn d5_transform_installs_committed_data_precall() -> Result<()> {
         );
         let id = collection("d5-precall")?;
         let cref = CollectionRef::new(id.clone(), None);
-        let writes = stage_committed_marker(&cached, &oracle, &cref, 1).await?;
+        let (writes, marker) = stage_committed_marker(&cached, &oracle, &cref, 1).await?;
 
         *handle.lock() = Some(Poison::Collection(
             id.name().clone(),
             ErrorCategory::Transient,
         ));
-        let result = cached.commit_provisional(&cref, &writes, &[]).await;
+        let result = cached.commit_provisional(&cref, &marker, &writes).await;
         assert!(result.is_err(), "the poisoned lower promote must surface");
         *handle.lock() = None;
 
@@ -1572,7 +1580,7 @@ fn d5_transform_installs_committed_data_precall() -> Result<()> {
         let cached_b = Cached::new(test_db::cache("d5_drop")?, holding);
         let id_b = collection("d5-drop")?;
         let cref_b = CollectionRef::new(id_b.clone(), None);
-        let writes_b = stage_committed_marker(&cached_b, &oracle_b, &cref_b, 2).await?;
+        let (writes_b, marker_b) = stage_committed_marker(&cached_b, &oracle_b, &cref_b, 2).await?;
 
         holds.commit_provisional().arm(1);
         let landed_before = holds.commit_provisional().landed();
@@ -1580,7 +1588,11 @@ fn d5_transform_installs_committed_data_precall() -> Result<()> {
             let cached_b = cached_b.clone();
             let cref_b = cref_b.clone();
             let writes_b = writes_b.clone();
-            async move { cached_b.commit_provisional(&cref_b, &writes_b, &[]).await }
+            async move {
+                cached_b
+                    .commit_provisional(&cref_b, &marker_b, &writes_b)
+                    .await
+            }
         });
         // Wait until the lower batch LANDED and the response is withheld, then
         // drop the settle future mid-flight.
@@ -1654,7 +1666,7 @@ fn d5_transform_batch_failure_degrades_to_delete() -> Result<()> {
         );
         let id = collection("d5-fallback")?;
         let cref = CollectionRef::new(id.clone(), None);
-        let writes = stage_committed_marker(&cached, &oracle, &cref, 3).await?;
+        let (writes, marker) = stage_committed_marker(&cached, &oracle, &cref, 3).await?;
 
         // Poisoned lower + failed transform: the POISON surfaces, verbatim.
         fail_puts.store(true, Ordering::Relaxed);
@@ -1662,7 +1674,7 @@ fn d5_transform_batch_failure_degrades_to_delete() -> Result<()> {
             id.name().clone(),
             ErrorCategory::Transient,
         ));
-        let result = cached.commit_provisional(&cref, &writes, &[]).await;
+        let result = cached.commit_provisional(&cref, &marker, &writes).await;
         assert!(
             matches!(result, Err(ref e) if format!("{e}").contains("poison")),
             "the lower error returns verbatim — a fjall failure is never folded in"
@@ -1670,7 +1682,7 @@ fn d5_transform_batch_failure_degrades_to_delete() -> Result<()> {
         *handle.lock() = None;
 
         // Healthy lower + still-failing transform: Ok, verbatim.
-        let result = cached.commit_provisional(&cref, &writes, &[]).await;
+        let result = cached.commit_provisional(&cref, &marker, &writes).await;
         assert!(
             result.is_ok(),
             "a fjall transform failure never folds into the lower Ok"
@@ -1725,9 +1737,9 @@ fn d5_transform_retry_is_byte_equivalent() -> Result<()> {
         // A TTL'd collection, so the stage stamps a finite expiry the retry
         // must REUSE (a fresh now+ttl would differ after the clock advance).
         let cref = CollectionRef::new(id.clone(), Some(CompactDuration::new(60)));
-        let writes = stage_committed_marker(&cached, &oracle, &cref, 4).await?;
+        let (writes, marker) = stage_committed_marker(&cached, &oracle, &cref, 4).await?;
 
-        cached.commit_provisional(&cref, &writes, &[]).await?;
+        cached.commit_provisional(&cref, &marker, &writes).await?;
         let first: Vec<Option<u64>> = {
             let mut out = Vec::new();
             for c in [1u8, 2, 3] {
@@ -1739,7 +1751,7 @@ fn d5_transform_retry_is_byte_equivalent() -> Result<()> {
         // Advance the clock (a fresh now+ttl restamp would now differ), then
         // run the transform again — the sweep-retry shape.
         now.store(5_500, Ordering::Relaxed);
-        cached.commit_provisional(&cref, &writes, &[]).await?;
+        cached.commit_provisional(&cref, &marker, &writes).await?;
 
         counting.reset();
         for (i, c) in [1u8, 2, 3].into_iter().enumerate() {
@@ -1818,13 +1830,13 @@ fn d5_clear_and_repopulate_keeps_staged_cells_warm() -> Result<()> {
             SectionClear::frozen(Section::new(0), &writes),
             SectionClear::frozen(Section::new(1), &writes),
         ];
-        let marker = EventMarker::frozen(event, &writes, &clears);
+        let marker = EventMarker::frozen(event, &writes, &clears, &[].into(), None);
         cached
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
         oracle.record_message(Uuid::from_u128(5)).await?;
 
-        cached.commit_provisional(&cref, &writes, &clears).await?;
+        cached.commit_provisional(&cref, &marker, &writes).await?;
 
         // S: every staged cell reads back WARM with `data` — zero lower reads.
         counting.reset();
@@ -1877,7 +1889,7 @@ fn absent_fill_over_committed_foreign_provisional_publishes_present() -> Result<
             cell_at(4),
             ProvisionalWrite::new(Some(bytes(44)), Committed::new(None), a),
         )];
-        let marker = EventMarker::frozen(a, &writes, &[]);
+        let marker = EventMarker::frozen(a, &writes, &[], &[].into(), None);
         counting
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -1923,7 +1935,7 @@ fn absent_fill_over_aborted_foreign_provisional_publishes_absent() -> Result<()>
             cell_at(4),
             ProvisionalWrite::new(Some(bytes(44)), Committed::new(None), a),
         )];
-        let marker = EventMarker::frozen(a, &writes, &[]);
+        let marker = EventMarker::frozen(a, &writes, &[], &[].into(), None);
         counting
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -1968,7 +1980,7 @@ fn sweep_issues_no_scan_cells() -> Result<()> {
         let cached = Cached::new(test_db::cache("sweep_budget")?, counting.clone());
         let id = collection("sweep-budget")?;
         let cref = CollectionRef::new(id.clone(), None);
-        let writes = stage_committed_marker(&cached, &oracle, &cref, 6).await?;
+        let (writes, _marker) = stage_committed_marker(&cached, &oracle, &cref, 6).await?;
         drop(writes);
 
         counting.reset();
@@ -2124,7 +2136,7 @@ fn cache_disablement_applies_to_all_workspace_clones() -> Result<()> {
             cell_at(0),
             ProvisionalWrite::new(Some(bytes(9)), prev, event),
         )];
-        let marker = EventMarker::frozen(event, &early, &[]);
+        let marker = EventMarker::frozen(event, &early, &[], &[].into(), None);
         cached_a
             .write_provisional(&cref, &early, Some(&marker))
             .await?;
@@ -2140,7 +2152,7 @@ fn cache_disablement_applies_to_all_workspace_clones() -> Result<()> {
             cell_at(1),
             ProvisionalWrite::new(Some(bytes(2)), prev1, event),
         )];
-        let marker2 = EventMarker::frozen(event, &stage, &[]);
+        let marker2 = EventMarker::frozen(event, &stage, &[], &[].into(), None);
         cached_a
             .write_provisional(&cref, &stage, Some(&marker2))
             .await?;
@@ -2180,7 +2192,7 @@ fn cache_disablement_applies_to_all_workspace_clones() -> Result<()> {
             cell_at(3),
             ProvisionalWrite::new(Some(bytes(5)), prev3, event),
         )];
-        let marker3 = EventMarker::frozen(event, &post, &[]);
+        let marker3 = EventMarker::frozen(event, &post, &[], &[].into(), None);
         cached_b
             .write_provisional(&cref, &post, Some(&marker3))
             .await?;
@@ -2481,7 +2493,7 @@ impl Replay {
             .then(|| SectionClear::frozen(SECTION, &staged))
             .into_iter()
             .collect();
-        let marker = EventMarker::frozen(event, &staged, &clears);
+        let marker = EventMarker::frozen(event, &staged, &clears, &[].into(), None);
         // The subject's stage boundary resolves a stale prior event marker
         // beneath and fires the boundary prior-clear cache guard.
         let stale_pending = self.stale.is_some();
@@ -2520,12 +2532,19 @@ impl Replay {
                 self.oracle
                     .record_message(Uuid::from_u128(staged.dedup))
                     .await?;
+                let marker = EventMarker::frozen(
+                    probe(staged.dedup),
+                    &staged.writes,
+                    &staged.clears,
+                    &[].into(),
+                    None,
+                );
                 self.subject
-                    .commit_provisional(&self.cref, &staged.writes, &staged.clears)
+                    .commit_provisional(&self.cref, &marker, &staged.writes)
                     .await
                     .map_err(|e| eyre!("subject commit: {e:?}"))?;
                 self.twin
-                    .commit_provisional(&self.twin_ref, &staged.writes, &staged.clears)
+                    .commit_provisional(&self.twin_ref, &marker, &staged.writes)
                     .await
                     .map_err(|e| eyre!("twin commit: {e:?}"))?;
                 let staged_keys: Vec<u8> = staged
@@ -2936,7 +2955,7 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
                             event,
                         );
                         let writes = [(cell_at(key), write)];
-                        let marker = EventMarker::frozen(event, &writes, &[]);
+                        let marker = EventMarker::frozen(event, &writes, &[], &[].into(), None);
                         cached
                             .write_provisional(&cref, &writes, Some(&marker))
                             .await?;
@@ -2952,9 +2971,9 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
                             prev_of(&committed, key),
                             event,
                         );
-                        cached
-                            .commit_provisional(&cref, &[(cell_at(key), write)], &[])
-                            .await?;
+                        let writes = [(cell_at(key), write)];
+                        let marker = EventMarker::frozen(event, &writes, &[], &[].into(), None);
+                        cached.commit_provisional(&cref, &marker, &writes).await?;
                         committed.insert(key, Committed::new(Some(bytes(value))));
                         // The settle transform reuses the stage stamp → death
                         // unchanged.
@@ -3133,7 +3152,8 @@ fn batch_get_completes_after_cache_disablement() -> Result<()> {
         // delete.
         let prior_event = probe(7);
         let clear = SectionClear::frozen_resolved(SECTION, &[]);
-        let marker = EventMarker::frozen(prior_event, &[], slice::from_ref(&clear));
+        let marker =
+            EventMarker::frozen(prior_event, &[], slice::from_ref(&clear), &[].into(), None);
         cached.write_provisional(&cref, &[], Some(&marker)).await?;
         oracle.record_message(Uuid::from_u128(7)).await?;
 
@@ -3185,7 +3205,8 @@ fn batch_get_discards_sampled_hits_on_any_miss() -> Result<()> {
         // resolving to absent.
         let prior_event = probe(7);
         let clear = SectionClear::frozen_resolved(SECTION, &[]);
-        let marker = EventMarker::frozen(prior_event, &[], slice::from_ref(&clear));
+        let marker =
+            EventMarker::frozen(prior_event, &[], slice::from_ref(&clear), &[].into(), None);
         cached.write_provisional(&cref, &[], Some(&marker)).await?;
         oracle.record_message(Uuid::from_u128(7)).await?;
 

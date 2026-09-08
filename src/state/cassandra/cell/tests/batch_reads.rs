@@ -311,7 +311,7 @@ async fn cassandra_raw_batch_is_one_query() -> Result<()> {
             ProvisionalWrite::new(Some(bytes(b * 10)), prev, staging),
         ));
     }
-    let marker = EventMarker::frozen(staging, &writes, &[]);
+    let marker = EventMarker::frozen(staging, &writes, &[], &[].into(), None);
     seed.write_provisional(&c, &writes, Some(&marker)).await?;
 
     // A fresh store: cold counters shared across its clones.
@@ -368,7 +368,7 @@ async fn cassandra_recovery_batches_by_section_at_boundary() -> Result<()> {
                 )
             })
             .collect();
-        let marker = EventMarker::frozen(staging, &writes, &[]);
+        let marker = EventMarker::frozen(staging, &writes, &[], &[].into(), None);
         store.write_provisional(&c, &writes, Some(&marker)).await?;
 
         let found = provisional_cells(&store, c.id()).await?;
@@ -409,7 +409,7 @@ async fn cassandra_recovery_batches_by_section_at_boundary() -> Result<()> {
         },
         ProvisionalWrite::new(Some(bytes(2)), Committed::new(None), staging),
     ));
-    let marker = EventMarker::frozen(staging, &writes, &[]);
+    let marker = EventMarker::frozen(staging, &writes, &[], &[].into(), None);
     store.write_provisional(&c, &writes, Some(&marker)).await?;
 
     let found = provisional_cells(&store, c.id()).await?;

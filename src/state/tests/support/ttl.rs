@@ -1,6 +1,7 @@
 //! Fixed-TTL cell store used by cache metadata tests.
 
 use super::*;
+use crate::state::marker::MarkerState;
 use std::future::ready;
 
 #[derive(Clone)]
@@ -97,6 +98,13 @@ impl CellStore for TtlStub {
         ready(Ok(()))
     }
 
+    fn marker_state<'a>(
+        &'a self,
+        _collection: &'a CollectionId,
+    ) -> impl Future<Output = Result<MarkerState, Self::Error>> + Send + 'a {
+        ready(Ok(MarkerState::default()))
+    }
+
     fn unsettled_marker<'a>(
         &'a self,
         _collection: &'a CollectionId,
@@ -107,8 +115,8 @@ impl CellStore for TtlStub {
     fn commit_provisional<'a>(
         &'a self,
         _collection: &'a CollectionRef,
+        _marker: &'a EventMarker,
         _writes: &'a [(CellKey, ProvisionalWrite)],
-        _clears: &'a [SectionClear],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
         ready(Ok(()))
     }

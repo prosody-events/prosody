@@ -87,6 +87,19 @@ impl From<StateType> for i8 {
     }
 }
 
+impl TryFrom<i8> for StateType {
+    type Error = StateTypeError;
+
+    fn try_from(value: i8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Application),
+            #[cfg(test)]
+            1 => Ok(Self::Framework),
+            _ => Err(StateTypeError(value)),
+        }
+    }
+}
+
 /// Human-readable state collection name.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StateName(Arc<str>);
@@ -265,3 +278,8 @@ impl ClassifyError for StateNameError {
         ErrorCategory::Permanent
     }
 }
+
+/// An unknown persisted state namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+#[error("unknown state type {0}")]
+pub struct StateTypeError(pub(crate) i8);

@@ -1,6 +1,7 @@
 //! Deterministic response gates for state-store concurrency tests.
 
 use super::*;
+use crate::state::marker::MarkerState;
 
 #[derive(Clone)]
 pub(crate) struct HoldingCellStore<S> {
@@ -172,6 +173,13 @@ where
         self.inner.mark_resolved(collection, cells)
     }
 
+    async fn marker_state<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+    ) -> Result<MarkerState, Self::Error> {
+        self.inner.marker_state(collection).await
+    }
+
     fn unsettled_marker<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -182,12 +190,12 @@ where
     async fn commit_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
+        marker: &'a EventMarker,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
         self.holds
             .commit_provisional
-            .pass(self.inner.commit_provisional(collection, writes, clears))
+            .pass(self.inner.commit_provisional(collection, marker, writes))
             .await
     }
 

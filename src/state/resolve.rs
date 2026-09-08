@@ -321,7 +321,7 @@ where
     }
     match decision {
         CommitDecision::Committed => store
-            .commit_provisional(collection, &writes, marker.clears())
+            .commit_provisional(collection, marker, &writes)
             .await
             .map_err(ResolveCellError::Store),
         CommitDecision::NotCommitted => store

@@ -21,9 +21,8 @@ cassandra_queries! {
     /// or [`Unbounded`](ScanEdge::Unbounded) (the two section-only `_all`
     /// statements, which carry no start comparator). The end bound is enforced
     /// in code (`past_end`), so it needs no statement variant. The `marker_*`
-    /// statements maintain and point-read the one fixed-address event-marker
-    /// row that bounds recovery. The `gap_*` statements are the section-clear
-    /// range deletes (`extend_gap_units`) — writes, never reads. Scan issuance
+    /// statements maintain both marker rows and read their slice. The `gap_*`
+    /// statements delete section-clear gaps (`extend_gap_units`). Scan issuance
     /// is gated: the four cell mutators each write exactly one row shape, so
     /// the only reader that walks a whole section (and thus can meet a
     /// tombstone field) is an `_all` scan, reached solely by the map's degraded
@@ -177,12 +176,8 @@ cassandra_queries! {
             TABLE_KEYED_STATE_CELL
         ),
 
-        /// Upserts the collection's event-marker row with TTL (co-expiry with
-        /// the staged cells): the frozen payload in `data`/`encoding`/`version`
-        /// and the staging event in `event`. Deliberately does NOT touch
-        /// `prev_data` — a marker row never carries one, and binding an
-        /// explicit null would write a needless column tombstone at the fixed
-        /// address on every stage.
+        /// Writes Staged with the evidence TTL, frozen payload, and event.
+        /// It leaves `prev_data` untouched to avoid a needless tombstone.
         marker_write: (
             "UPDATE $keyspace.{} USING TTL ? \
              SET data = ?, encoding = ?, version = ?, event = ? \
@@ -191,18 +186,24 @@ cassandra_queries! {
             TABLE_KEYED_STATE_CELL
         ),
 
-        /// Point-reads the event-marker row at its fixed address — the cold
-        /// recovery seed (cost: one point read at a compaction-merged
-        /// position, never a range over a tombstone field).
-        marker_read: (
-            "SELECT data, encoding, version, event \
-             FROM $keyspace.{} \
+        /// Writes only the committed event with the evidence TTL.
+        committed_write: (
+            "UPDATE $keyspace.{} USING TTL ? SET event = ? \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL
         ),
 
-        /// Row-level delete of the event-marker row (on settle — the whole
+        /// Reads both rows of the marker slice.
+        marker_state: (
+            "SELECT coordinate, data, encoding, version, event \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ?",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Deletes the Staged row (on settle — the whole
         /// stage resolved). Deleting an absent marker is a harmless no-op.
         marker_delete: (
             "DELETE FROM $keyspace.{} \
