@@ -52,6 +52,8 @@ pub(crate) enum MarkerRow {
 }
 
 impl MarkerRow {
+    /// The Staged address is the marker address that prosody 0.6.0 writes, so
+    /// its residue decodes in place. Committed takes the next coordinate.
     pub(crate) fn coordinate(self) -> &'static [u8] {
         match self {
             Self::Staged => &[],
