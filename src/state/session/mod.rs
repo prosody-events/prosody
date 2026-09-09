@@ -55,7 +55,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::coop::cooperative;
-use tracing::{Level, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -1541,7 +1541,7 @@ async fn resolve_collections<S: CellStore>(
         .map(|staged| {
             cooperative(async move {
                 matches!(
-                    retry_step(shutdown, "keyed-state promote", Level::WARN, || {
+                    retry_step(shutdown, "keyed-state promote", || {
                         store.commit_provisional(&staged.collection, &staged.marker, &staged.writes)
                     })
                     .await,

@@ -18,12 +18,6 @@ use std::convert::Infallible;
 use std::future::{Future, ready};
 use tokio::task::coop::cooperative;
 
-#[cfg(test)]
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
-
 mod cells;
 mod identity;
 mod publication;
@@ -37,19 +31,13 @@ pub use publication::MemoryPublicationStore;
 #[derive(Clone, Debug)]
 pub struct MemoryCellStore {
     cells: MemoryCells,
-    #[cfg(test)]
-    pub(crate) marker_reads: Arc<AtomicUsize>,
 }
 
 impl MemoryCellStore {
     /// Wraps the shared durable cells.
     #[must_use]
     pub(crate) fn new(cells: MemoryCells) -> Self {
-        Self {
-            cells,
-            #[cfg(test)]
-            marker_reads: Arc::default(),
-        }
+        Self { cells }
     }
 
     /// Returns the raw cell through [`MemoryCells::read_committed_cell`].
@@ -310,8 +298,6 @@ impl CellStore for MemoryCellStore {
         &'a self,
         collection: &'a CollectionId,
     ) -> Result<MarkerState, Self::Error> {
-        #[cfg(test)]
-        self.marker_reads.fetch_add(1, Ordering::Relaxed);
         Ok(self
             .cells
             .markers

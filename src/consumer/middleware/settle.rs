@@ -13,7 +13,6 @@ use std::future::Future;
 
 use crate::state::retry::{DURABILITY_RETRY_DELAY, StepOutcome, retry_step};
 use tokio::time::sleep;
-use tracing::Level;
 
 use super::FallibleHandler;
 use crate::consumer::Uncommitted;
@@ -268,7 +267,6 @@ async fn settle_committed<'a, T, C, G>(
     let finalized = match retry_step(
         || context.is_shutdown(),
         "keyed-state finalize",
-        Level::ERROR,
         || lifecycle.finalize(),
     )
     .await
@@ -312,7 +310,6 @@ async fn settle_committed<'a, T, C, G>(
             match retry_step(
                 || context.is_shutdown(),
                 "keyed-state marker record",
-                Level::ERROR,
                 || lifecycle.record_marker(marker, MarkerWrite(())),
             )
             .await
@@ -417,7 +414,6 @@ where
     let _ = retry_step(
         || context.is_shutdown(),
         "keyed-state marker record",
-        Level::ERROR,
         || lifecycle.record_marker(marker, MarkerWrite(())),
     )
     .await;

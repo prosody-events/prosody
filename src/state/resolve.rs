@@ -5,7 +5,7 @@ use super::SHARD_FANOUT_CONCURRENCY;
 use super::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite, resolve_for_reader};
 use super::cell_key::CellKey;
 use super::identity::{CollectionId, CollectionRef};
-use super::marker::{EventMarker, ReaderEvidence};
+use super::marker::{EventMarker, MarkerState, ReaderEvidence};
 use super::store::{CellBuffer, CellStore, section_batches};
 use crate::error::{ClassifyError, ErrorCategory};
 use futures::{StreamExt, TryStreamExt, stream};
@@ -44,7 +44,12 @@ impl<'a, S: CellStore> EvidenceLookup<'a, S> {
             let collection = self.collection;
             let state = store.marker_state(collection).await?;
             let staged_committed = match &state.staged {
-                Some(marker) => sibling_committed(store, collection, marker).await?,
+                Some(marker) => {
+                    sibling_committed(collection, marker, |sibling| async move {
+                        store.marker_state(&sibling).await
+                    })
+                    .await?
+                }
                 None => false,
             };
             self.evidence.insert(ReaderEvidence {
@@ -56,26 +61,31 @@ impl<'a, S: CellStore> EvidenceLookup<'a, S> {
     }
 }
 
-fn sibling_committed<'a, S: CellStore>(
-    store: &'a S,
+/// Reads sibling certificates through the caller's marker decoder.
+pub(crate) fn sibling_committed<'a, E, Fut>(
     collection: &'a CollectionId,
     marker: &'a EventMarker,
-) -> impl Future<Output = Result<bool, S::Error>> + Send + 'a {
+    read: impl Fn(CollectionId) -> Fut + Send + 'a,
+) -> impl Future<Output = Result<bool, E>> + Send + 'a
+where
+    Fut: Future<Output = Result<MarkerState, E>> + Send + 'a,
+{
     stream::iter(
         marker.touched().iter().filter(move |(kind, name)| {
             *kind != collection.state_type() || name != collection.name()
         }),
     )
     .map(move |(kind, name)| {
+        let state = read(CollectionId::new(
+            collection.state_key().clone(),
+            *kind,
+            name.clone(),
+        ));
         cooperative(async move {
-            let sibling = CollectionId::new(collection.state_key().clone(), *kind, name.clone());
-            Ok::<_, S::Error>(
-                store
-                    .marker_state(&sibling)
-                    .await?
-                    .committed
-                    .is_some_and(|evidence| evidence.certifies(marker)),
-            )
+            Ok(state
+                .await?
+                .committed
+                .is_some_and(|evidence| evidence.certifies(marker)))
         })
     })
     .buffer_unordered(marker.touched().len().max(1))

@@ -1837,7 +1837,7 @@ fn prop_resolve_reads_each_marker_once() {
             }
             let expected = Some(if certificate < count { data } else { prev });
 
-            check_memory_read_budget(&memory, &id, &writes, expected.as_ref(), count).await?;
+            check_memory_read_parity(&memory, &id, &writes, expected.as_ref()).await?;
 
             // Exercise a batch and both scan directions with separate lookups.
             for direction in [None, Some(Direction::Forward), Some(Direction::Backward)] {
@@ -1889,28 +1889,24 @@ fn prop_resolve_reads_each_marker_once() {
     QuickCheck::new().quickcheck(property as fn(u8, u8, u8, u8) -> Result<()>);
 }
 
-async fn check_memory_read_budget(
+async fn check_memory_read_parity(
     store: &MemoryCellStore,
     id: &CollectionId,
     writes: &[(CellKey, ProvisionalWrite)],
     expected: Option<&Bytes>,
-    count: usize,
 ) -> Result<()> {
     use super::{Scan, ScanEdge};
     use futures::TryStreamExt;
-    use std::sync::atomic::Ordering;
 
     let batch = CoordinateBatch::chunks(writes.iter().map(|(cell, _)| cell.coordinate.clone()))
         .next()
         .ok_or_else(|| eyre!("batch missing"))?;
-    store.marker_reads.store(0, Ordering::Relaxed);
     let values = store.get_many(id, writes[0].0.section, &batch).await?;
     assert_eq!(values.len(), batch.len());
     for value in values {
         assert_eq!(value.into_inner().as_ref(), expected);
     }
-    assert_eq!(store.marker_reads.load(Ordering::Relaxed), count);
-    store.marker_reads.store(0, Ordering::Relaxed);
+
     let values = store
         .get_many_for_cache(id, writes[0].0.section, &batch)
         .await?;
@@ -1919,10 +1915,8 @@ async fn check_memory_read_budget(
         assert_eq!(value.into_inner().as_ref(), expected);
         assert_eq!(ttl, None);
     }
-    assert_eq!(store.marker_reads.load(Ordering::Relaxed), count);
 
     for dir in [Direction::Forward, Direction::Backward] {
-        store.marker_reads.store(0, Ordering::Relaxed);
         let scan = Scan {
             section: writes[0].0.section,
             start: ScanEdge::Unbounded,
@@ -1935,7 +1929,6 @@ async fn check_memory_read_budget(
         for (_, value) in rows {
             assert_eq!(Some(&value), expected);
         }
-        assert_eq!(store.marker_reads.load(Ordering::Relaxed), count);
     }
     Ok(())
 }

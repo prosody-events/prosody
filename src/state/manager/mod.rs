@@ -47,7 +47,6 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{OnceCell, watch};
 use tokio::task::coop::cooperative;
-use tracing::Level;
 
 /// The identity store error of a backend.
 type IdentityErr<B> = <<B as StateBackend>::Identity as DescriptorIdentityStore>::Error;
@@ -305,12 +304,7 @@ where
         T: TriggerStore,
     {
         let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
-        match retry_step(cancelled, "keyed-state admission", Level::ERROR, || {
-            self.inner.checks.contains(&key)
-        })
-        .await
-        .admission()
-        {
+        match admission_step(cancelled, || self.inner.checks.contains(&key)).await {
             Ok(true) => return Admission::Fresh,
             Ok(false) => {}
             Err(admission) => return admission,
@@ -318,12 +312,7 @@ where
         if let Err(admission) = self.admit_unchecked(&key, timers, shutdown).await {
             return admission;
         }
-        match retry_step(cancelled, "keyed-state admission", Level::ERROR, || {
-            self.inner.checks.mark(&key)
-        })
-        .await
-        .admission()
-        {
+        match admission_step(cancelled, || self.inner.checks.mark(&key)).await {
             Ok(()) => Admission::Fresh,
             Err(admission) => admission,
         }
@@ -342,7 +331,49 @@ where
     ) -> Result<(), Admission> {
         let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
         let registry = &self.inner.registry;
-        let states = self.marker_states(key, cancelled).await?;
+        let state_key = StateKey::new(self.inner.segment_id, key.clone());
+        let mut pending: SmallVec<[(StateType, StateName); 8]> = registry
+            .collections()
+            .map(|(kind, name)| (kind, name.clone()))
+            .collect();
+        let mut states: SmallVec<[(CollectionRef, MarkerState); 8]> =
+            SmallVec::with_capacity(pending.len());
+
+        while !pending.is_empty() {
+            let count = pending.len();
+            let loaded = stream::iter(pending.drain(..))
+                .map(|(kind, name)| {
+                    let ttl = registry.ttl_for(kind, &name);
+                    let id = CollectionId::new(state_key.clone(), kind, name);
+                    cooperative(async move {
+                        let state =
+                            admission_step(cancelled, || self.inner.cell.marker_state(&id)).await?;
+                        let collection = CollectionRef::new(id, ttl);
+                        Ok::<_, Admission>((collection, state))
+                    })
+                })
+                .buffer_unordered(count)
+                .try_collect::<SmallVec<[_; 8]>>()
+                .await?;
+            states.extend(loaded);
+
+            for (_, state) in &states {
+                let touched = state.staged.iter().flat_map(EventMarker::touched).chain(
+                    state
+                        .committed
+                        .iter()
+                        .flat_map(|marker| marker.touched.iter()),
+                );
+                for (kind, name) in touched {
+                    if !states.iter().any(|(collection, _)| {
+                        collection.id().state_type() == *kind && collection.id().name() == name
+                    }) && !pending.contains(&(*kind, name.clone()))
+                    {
+                        pending.push((*kind, name.clone()));
+                    }
+                }
+            }
+        }
 
         let mut committed: SmallVec<[CommittedMarker; 8]> = SmallVec::with_capacity(states.len());
         for (_, state) in &states {
@@ -372,11 +403,10 @@ where
                 })
             {
                 if marker.version() == MarkerVersion::V1 {
-                    retry_step(cancelled, "keyed-state admission", Level::ERROR, || {
+                    admission_step(cancelled, || {
                         self.inner.cell.abort_provisional(collection, &[])
                     })
-                    .await
-                    .admission()?;
+                    .await?;
                 }
                 continue;
             }
@@ -386,95 +416,24 @@ where
             } else {
                 CommitDecision::NotCommitted
             };
-            retry_step(cancelled, "keyed-state admission", Level::ERROR, || {
+            admission_step(cancelled, || {
                 resolve_event_marker(&self.inner.cell, collection, marker, decision)
             })
-            .await
-            .admission()?;
+            .await?;
         }
 
         for marker in committed {
             if let Some(dedup) = marker.dedup
-                && !retry_step(cancelled, "keyed-state admission", Level::ERROR, || {
-                    self.inner.dedup.exists(dedup)
-                })
-                .await
-                .admission()?
+                && !admission_step(cancelled, || self.inner.dedup.exists(dedup)).await?
             {
-                retry_step(cancelled, "keyed-state admission", Level::ERROR, || {
-                    self.inner.dedup.insert(dedup)
-                })
-                .await
-                .admission()?;
+                admission_step(cancelled, || self.inner.dedup.insert(dedup)).await?;
             }
             if let EventRef::Timer(timer) = marker.event {
-                retry_step(cancelled, "keyed-state admission", Level::ERROR, || {
-                    timers.retire_committed(key, timer)
-                })
-                .await
-                .admission()?;
+                admission_step(cancelled, || timers.retire_committed(key, timer)).await?;
             }
         }
 
         Ok(())
-    }
-
-    /// Discovers residue through registered collections and every touched list.
-    async fn marker_states(
-        &self,
-        key: &Key,
-        cancelled: impl Fn() -> bool + Copy + Sync,
-    ) -> Result<SmallVec<[(CollectionRef, MarkerState); 8]>, Admission> {
-        let registry = &self.inner.registry;
-        let state_key = StateKey::new(self.inner.segment_id, key.clone());
-        let mut pending: SmallVec<[(StateType, StateName); 8]> = registry
-            .collections()
-            .map(|(kind, name)| (kind, name.clone()))
-            .collect();
-        let mut states: SmallVec<[(CollectionRef, MarkerState); 8]> =
-            SmallVec::with_capacity(pending.len());
-
-        while !pending.is_empty() {
-            let count = pending.len();
-            let loaded = stream::iter(pending.drain(..))
-                .map(|(kind, name)| {
-                    let ttl = registry.ttl_for(kind, &name);
-                    let id = CollectionId::new(state_key.clone(), kind, name);
-                    cooperative(async move {
-                        let state =
-                            retry_step(cancelled, "keyed-state admission", Level::ERROR, || {
-                                self.inner.cell.marker_state(&id)
-                            })
-                            .await
-                            .admission()?;
-                        let collection = CollectionRef::new(id, ttl);
-                        Ok::<_, Admission>((collection, state))
-                    })
-                })
-                .buffer_unordered(count)
-                .try_collect::<SmallVec<[_; 8]>>()
-                .await?;
-            states.extend(loaded);
-
-            for (_, state) in &states {
-                let touched = state.staged.iter().flat_map(EventMarker::touched).chain(
-                    state
-                        .committed
-                        .iter()
-                        .flat_map(|marker| marker.touched.iter()),
-                );
-                for (kind, name) in touched {
-                    if !states.iter().any(|(collection, _)| {
-                        collection.id().state_type() == *kind && collection.id().name() == name
-                    }) && !pending.contains(&(*kind, name.clone()))
-                    {
-                        pending.push((*kind, name.clone()));
-                    }
-                }
-            }
-        }
-
-        Ok(states)
     }
 
     /// Reads the old commit point for residue staged before the V4 layout.
@@ -490,31 +449,31 @@ where
         let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
         match event {
             EventRef::Message { dedup_id } => {
-                retry_step(cancelled, "keyed-state admission", Level::ERROR, || {
-                    self.inner.dedup.exists(dedup_id)
-                })
-                .await
-                .admission()
+                admission_step(cancelled, || self.inner.dedup.exists(dedup_id)).await
             }
             EventRef::Timer(timer) => {
-                let tag = retry_step(cancelled, "keyed-state admission", Level::ERROR, || {
+                let tag = admission_step(cancelled, || {
                     timers.current_timer_tag(key, timer.time, timer.timer_type)
                 })
-                .await
-                .admission()?;
+                .await?;
                 Ok(tag != Some(timer.tag))
             }
         }
     }
 }
 
-impl<R> StepOutcome<R> {
-    fn admission(self) -> Result<R, Admission> {
-        match self {
-            Self::Done(value) => Ok(value),
-            Self::Skip => Err(Admission::Poisoned),
-            Self::Abandon => Err(Admission::Abandoned),
-        }
+async fn admission_step<R, E, Fut>(
+    cancelled: impl Fn() -> bool,
+    step: impl FnMut() -> Fut,
+) -> Result<R, Admission>
+where
+    Fut: Future<Output = Result<R, E>>,
+    E: ClassifyError + Error,
+{
+    match retry_step(cancelled, "keyed-state admission", step).await {
+        StepOutcome::Done(value) => Ok(value),
+        StepOutcome::Skip => Err(Admission::Poisoned),
+        StepOutcome::Abandon => Err(Admission::Abandoned),
     }
 }
 

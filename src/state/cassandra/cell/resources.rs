@@ -6,10 +6,8 @@ use super::{
     try_stream,
 };
 use crate::state::cell::{Cell, resolve_for_reader};
-use crate::state::marker::{EventMarker, ReaderEvidence};
-use futures::{StreamExt, stream};
-use std::future::Future;
-use tokio::task::coop::cooperative;
+use crate::state::marker::ReaderEvidence;
+use crate::state::resolve::sibling_committed;
 
 impl CassandraCellResources {
     /// Bundles the shared session and prepared cell statements.
@@ -26,7 +24,12 @@ impl CassandraCellResources {
         // None.
         let state = fetch_marker_state(&self.session, &self.queries, id, None).await?;
         let staged_committed = match &state.staged {
-            Some(marker) => sibling_committed(&self.session, &self.queries, id, marker).await?,
+            Some(marker) => {
+                sibling_committed(id, marker, |sibling| async move {
+                    fetch_marker_state(&self.session, &self.queries, &sibling, None).await
+                })
+                .await?
+            }
             None => false,
         };
         Ok(ReaderEvidence {
@@ -135,31 +138,4 @@ impl CassandraCellResources {
             }
         }
     }
-}
-
-fn sibling_committed<'a>(
-    session: &'a CassandraSession,
-    queries: &'a CellQueries,
-    id: &'a CollectionId,
-    marker: &'a EventMarker,
-) -> impl Future<Output = Result<bool, CassandraCellStoreError>> + Send + 'a {
-    stream::iter(
-        marker
-            .touched()
-            .iter()
-            .filter(move |(kind, name)| *kind != id.state_type() || name != id.name()),
-    )
-    .map(move |(kind, name)| {
-        cooperative(async move {
-            let touched = CollectionId::new(id.state_key().clone(), *kind, name.clone());
-            Ok::<_, CassandraCellStoreError>(
-                fetch_marker_state(session, queries, &touched, None)
-                    .await?
-                    .committed
-                    .is_some_and(|evidence| evidence.certifies(marker)),
-            )
-        })
-    })
-    .buffer_unordered(marker.touched().len().max(1))
-    .try_fold(false, |any, committed| async move { Ok(any || committed) })
 }
