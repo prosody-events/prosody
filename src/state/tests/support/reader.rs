@@ -1,8 +1,8 @@
 use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
-use crate::state::marker::{AttemptId, EventEvidence, EventMarker, SectionClear};
+use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::store::{CellStore, CoordinateBatch};
-use crate::state::tests::support::probe;
+use crate::state::tests::support::{evidence, probe};
 use crate::state::{CollectionId, CollectionRef, StateKey, StateName, StateType};
 use crate::state_reader::CommittedCellSource;
 use bytes::Bytes;
@@ -59,13 +59,7 @@ pub(crate) async fn reader_residue<S: CellStore, R: CommittedCellSource>(
         .map(|id| (id.state_type(), id.name().clone()))
         .to_vec();
     touched.sort_unstable();
-    let evidence = EventEvidence {
-        touched: touched.into(),
-        evidence_ttl: None,
-        dedup: None,
-        attempt: AttemptId::new(),
-    };
-    let marker = EventMarker::frozen(event, &writes, &clears, &evidence);
+    let marker = EventMarker::frozen(event, &writes, &clears, &evidence(touched.into(), None));
     if committed {
         let anchor = CollectionRef::new(if other { remote } else { id.clone() }, None);
         let evidence = marker.committed_payload();

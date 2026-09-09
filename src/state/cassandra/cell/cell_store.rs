@@ -215,6 +215,10 @@ impl CellStore for CassandraStore {
         &'a self,
         collection: &'a CollectionId,
     ) -> Result<MarkerState, Self::Error> {
+        #[cfg(test)]
+        self.counters
+            .marker_point_reads
+            .fetch_add(1, Ordering::Relaxed);
         fetch_marker_state(
             &self.session,
             &self.queries,

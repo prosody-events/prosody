@@ -5,9 +5,9 @@ use super::*;
 use crate::codec::JsonCodec;
 use crate::state::backend::AdmissionChecks;
 use crate::state::fjall::test_db::cold_marker_checks;
-use crate::state::marker::{EventEvidence, decode_marker_payload};
+use crate::state::marker::decode_marker_payload;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
-use crate::state::tests::support::{MemoryDeduplicationStore, run_admit_soundness};
+use crate::state::tests::support::{MemoryDeduplicationStore, evidence, run_admit_soundness};
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::Trigger;
 use crate::timers::store::adapter::TableAdapter;
@@ -181,7 +181,7 @@ fn prop_legacy_and_timer_admit_soundness() {
 /// their dedup id.
 async fn legacy_deregistration(value: u8) -> Result<()> {
     use crate::state::cell::{Committed, ProvisionalWrite};
-    use crate::state::marker::{AttemptId, decode_marker_payload};
+    use crate::state::marker::decode_marker_payload;
     use crate::state::tests::cell_suite::{bytes, value_cell};
     use crate::state::tests::support::admit_registered;
     use color_eyre::eyre::ensure;
@@ -212,17 +212,7 @@ async fn legacy_deregistration(value: u8) -> Result<()> {
     let older = EventRef::Message {
         dedup_id: Uuid::new_v4(),
     };
-    let evidence = EventMarker::frozen(
-        older,
-        &[],
-        &[],
-        &EventEvidence {
-            touched: touched.clone(),
-            evidence_ttl: None,
-            dedup: None,
-            attempt: AttemptId::new(),
-        },
-    );
+    let evidence = EventMarker::frozen(older, &[], &[], &evidence(touched, None));
     store
         .commit_provisional(&collections[0], &evidence, &[])
         .await?;
@@ -382,7 +372,6 @@ async fn retire_timer_residue(
 ) -> Result<()> {
     use crate::state::TimerEventRef;
     use crate::state::descriptor::value_state;
-    use crate::state::marker::AttemptId;
     use crate::state::registry::CollectionDef;
     use color_eyre::eyre::ensure;
     use uuid::Uuid;
@@ -405,12 +394,10 @@ async fn retire_timer_residue(
             event,
             &[],
             &[],
-            &EventEvidence {
-                touched: vec![(StateType::Application, collection.id().name().clone())].into(),
-                evidence_ttl: None,
-                dedup: None,
-                attempt: AttemptId::new(),
-            },
+            &evidence(
+                [(StateType::Application, collection.id().name().clone())].into(),
+                None,
+            ),
         );
         store.commit_provisional(&collection, &marker, &[]).await?;
         let mut registry = CollectionDefRegistry::default();

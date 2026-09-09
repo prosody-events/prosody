@@ -154,14 +154,15 @@ pub struct CassandraCellResources {
     pub(crate) queries: Arc<CellQueries>,
 }
 
-/// Counts cell and batch queries in cell-store tests.
-/// These counters observe query shapes inside one trait method that a wrapper
-/// cannot see.
+/// Counts cell, marker, and batch reads inside one store method, which no
+/// wrapper can observe.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct CellReadCounts {
     /// Point reads in `kind=Cell`, bounded by the provisional cell count.
     pub(crate) cell_point_reads: AtomicUsize,
+    /// Marker reads from `marker_state`, absent from raw provisional reads.
+    pub(crate) marker_point_reads: AtomicUsize,
     /// IN queries from `provisional_many`, exactly one per non-empty chunk.
     pub(crate) provisional_in_queries: AtomicUsize,
 }

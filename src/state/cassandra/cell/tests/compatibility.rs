@@ -1,7 +1,7 @@
 use super::*;
 use crate::cassandra::TABLE_KEYED_STATE_CELL;
 use crate::state::marker::MarkerRow;
-use crate::state::tests::support::{StageInspection, empty_evidence};
+use crate::state::tests::support::{StageInspection, evidence};
 
 async fn read_cell_blob(fx: &Fixture, id: &CollectionId) -> Result<(Vec<u8>, i16)> {
     let cql = format!(
@@ -170,7 +170,7 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
             event(1),
         ),
     )];
-    let marker = EventMarker::frozen(event(1), &writes, &[], &empty_evidence());
+    let marker = EventMarker::frozen(event(1), &writes, &[], &evidence([].into(), None));
     store.write_provisional(&c, &writes, Some(&marker)).await?;
     let corrupt_cell = format!(
         "UPDATE {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} SET event = {{kind: 1, msg_dedup_id: \

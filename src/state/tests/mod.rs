@@ -1,5 +1,5 @@
 use crate::state::CommitDecision;
-use crate::state::tests::support::{StageInspection, empty_evidence};
+use crate::state::tests::support::{StageInspection, evidence};
 use crate::test_util::TEST_RUNTIME;
 mod cached_suite;
 pub(crate) mod cell_suite;
@@ -327,7 +327,7 @@ fn memory_resolve_event_marker_batches_reads() -> Result<()> {
                 ProvisionalWrite::new(Some(bytes(2)), Committed::new(None), event),
             )
         }));
-        let marker = EventMarker::frozen(event, &writes, &[], &empty_evidence());
+        let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
         counting
             .write_provisional(&cref, &writes, Some(&marker))
             .await
@@ -381,7 +381,7 @@ fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
                 ProvisionalWrite::new(Some(bytes(90)), Committed::new(None), event),
             ),
         ];
-        let marker = EventMarker::frozen(event, &writes, &[], &empty_evidence());
+        let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
         store
             .write_provisional(&cref, &writes, Some(&marker))
             .await
@@ -1787,12 +1787,12 @@ fn prop_resolve_reads_each_marker_once() {
             }
             let memory = MemoryCellStore::new(cells.clone());
             let store = CountingCellStore::new(memory.clone()).with_marker_counts(&collections);
-            let mut evidence = empty_evidence();
-            evidence.touched = collections
+            let touched = collections
                 .iter()
                 .map(CollectionRef::id)
                 .map(|id| (id.state_type(), id.name().clone()))
                 .collect();
+            let evidence = evidence(touched, None);
             let event = support::probe(1);
             let data = bytes(value);
             let prev = bytes(value.wrapping_add(1));

@@ -1,5 +1,5 @@
 use super::*;
-use crate::state::tests::support::{CountingCellStore, empty_evidence};
+use crate::state::tests::support::evidence;
 
 /// Batch-read parity over the live `CassandraStore`: the single-`IN`-query
 /// override answers each position exactly as the sequential point-`get` oracle
@@ -302,13 +302,12 @@ async fn cassandra_raw_batch_is_one_query() -> Result<()> {
             ProvisionalWrite::new(Some(bytes(b * 10)), prev, staging),
         ));
     }
-    let marker = EventMarker::frozen(staging, &writes, &[], &empty_evidence());
+    let marker = EventMarker::frozen(staging, &writes, &[], &evidence([].into(), None));
     seed.write_provisional(&c, &writes, Some(&marker)).await?;
 
     // A fresh store: cold counters shared across its clones.
     let reader = fx.bottom_store();
     let counters = reader.read_counts();
-    let reader = CountingCellStore::new(reader);
     let batch = CoordinateBatch::chunks([1u8, 2].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
@@ -324,7 +323,11 @@ async fn cassandra_raw_batch_is_one_query() -> Result<()> {
         0,
         "no per-coordinate point reads"
     );
-    assert_eq!(reader.marker_reads(), 0, "no marker read");
+    assert_eq!(
+        counters.marker_point_reads.load(Ordering::Relaxed),
+        0,
+        "no marker read"
+    );
     Ok(())
 }
 

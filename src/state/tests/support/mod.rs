@@ -377,12 +377,15 @@ pub(crate) use admission::{
 mod inspection;
 pub(crate) use inspection::StageInspection;
 
-/// Creates evidence without touched collections, expiry, or dedup identity.
-pub(crate) fn empty_evidence() -> EventEvidence {
+/// Creates evidence for a new attempt without expiry.
+pub(crate) fn evidence(
+    touched: Arc<[(StateType, StateName)]>,
+    dedup: Option<Uuid>,
+) -> EventEvidence {
     EventEvidence {
         attempt: AttemptId::new(),
-        touched: [].into(),
+        touched,
         evidence_ttl: None,
-        dedup: None,
+        dedup,
     }
 }

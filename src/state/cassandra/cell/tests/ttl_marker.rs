@@ -1,6 +1,6 @@
 use super::*;
 use crate::state::marker::{AttemptId, EventEvidence, evidence_ttl};
-use crate::state::tests::support::empty_evidence;
+use crate::state::tests::support::evidence;
 use crate::timers::duration::CompactDuration;
 
 /// An uncommitted clear reads prev with the provisional row's finite expiry.
@@ -25,7 +25,7 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
         cell.clone(),
         ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(1)),
     )];
-    let marker = EventMarker::frozen(event(1), &writes, &[], &empty_evidence());
+    let marker = EventMarker::frozen(event(1), &writes, &[], &evidence([].into(), None));
     store.write_provisional(&c, &writes, Some(&marker)).await?;
 
     let (committed, co_expiry) = store.get_for_cache(c.id(), &cell).await?;

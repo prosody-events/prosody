@@ -28,7 +28,7 @@ use super::support::{
 };
 use crate::error::ErrorCategory;
 use crate::state::marker::MarkerState;
-use crate::state::tests::support::{admit_collection, empty_evidence, seed_commit_evidence};
+use crate::state::tests::support::{admit_collection, evidence, seed_commit_evidence};
 use crate::test_util::{GlobalMetrics, TEST_RUNTIME, labels};
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
@@ -397,7 +397,7 @@ fn cached_provisional_many_does_not_publish() -> Result<()> {
             cell_at(2),
             ProvisionalWrite::new(Some(bytes(20)), prev, event),
         )];
-        let marker = EventMarker::frozen(event, &writes, &[], &empty_evidence());
+        let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
         counting
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -546,7 +546,7 @@ fn promote_delete_retries_before_cache_disablement() -> Result<()> {
             cell_at(0),
             ProvisionalWrite::new(Some(bytes(5)), prev, event),
         )];
-        let marker = EventMarker::frozen(event, &writes, &[], &empty_evidence());
+        let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
         cached
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -808,7 +808,7 @@ fn scan_resolution_is_read_only() -> Result<()> {
             cell_at(4),
             ProvisionalWrite::new(None, Committed::new(Some(bytes(1))), prior_event),
         )];
-        let marker = EventMarker::frozen(prior_event, &writes, &[], &empty_evidence());
+        let marker = EventMarker::frozen(prior_event, &writes, &[], &evidence([].into(), None));
         lower
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -1057,7 +1057,7 @@ where
             ProvisionalWrite::new(Some(bytes(100 + c)), prev, event),
         ));
     }
-    let marker = EventMarker::frozen(event, &writes, &[], &empty_evidence());
+    let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
     cached
         .write_provisional(cref, &writes, Some(&marker))
         .await?;
@@ -1334,7 +1334,7 @@ fn d5_clear_and_repopulate_keeps_staged_cells_warm() -> Result<()> {
             SectionClear::frozen(Section::new(0), &writes),
             SectionClear::frozen(Section::new(1), &writes),
         ];
-        let marker = EventMarker::frozen(event, &writes, &clears, &empty_evidence());
+        let marker = EventMarker::frozen(event, &writes, &clears, &evidence([].into(), None));
         cached
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -1387,7 +1387,7 @@ fn absent_fill_over_committed_foreign_provisional_publishes_present() -> Result<
             cell_at(4),
             ProvisionalWrite::new(Some(bytes(44)), Committed::new(None), a),
         )];
-        let marker = EventMarker::frozen(a, &writes, &[], &empty_evidence());
+        let marker = EventMarker::frozen(a, &writes, &[], &evidence([].into(), None));
         counting
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -1428,7 +1428,7 @@ fn absent_fill_over_aborted_foreign_provisional_publishes_absent() -> Result<()>
             cell_at(4),
             ProvisionalWrite::new(Some(bytes(44)), Committed::new(None), a),
         )];
-        let marker = EventMarker::frozen(a, &writes, &[], &empty_evidence());
+        let marker = EventMarker::frozen(a, &writes, &[], &evidence([].into(), None));
         counting
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -1600,7 +1600,7 @@ fn cache_disablement_applies_to_all_workspace_clones() -> Result<()> {
             cell_at(1),
             ProvisionalWrite::new(Some(bytes(2)), prev1, event),
         )];
-        let marker2 = EventMarker::frozen(event, &stage, &[], &empty_evidence());
+        let marker2 = EventMarker::frozen(event, &stage, &[], &evidence([].into(), None));
         cached_a
             .write_provisional(&cref, &stage, Some(&marker2))
             .await?;
@@ -1639,7 +1639,7 @@ fn cache_disablement_applies_to_all_workspace_clones() -> Result<()> {
             cell_at(3),
             ProvisionalWrite::new(Some(bytes(5)), prev3, event),
         )];
-        let marker3 = EventMarker::frozen(event, &post, &[], &empty_evidence());
+        let marker3 = EventMarker::frozen(event, &post, &[], &evidence([].into(), None));
         cached_b
             .write_provisional(&cref, &post, Some(&marker3))
             .await?;
@@ -1903,7 +1903,7 @@ impl Replay {
             .then(|| SectionClear::frozen(SECTION, &staged))
             .into_iter()
             .collect();
-        let marker = EventMarker::frozen(event, &staged, &clears, &empty_evidence());
+        let marker = EventMarker::frozen(event, &staged, &clears, &evidence([].into(), None));
         self.subject
             .write_provisional(&self.cref, &staged, Some(&marker))
             .await
@@ -2905,5 +2905,5 @@ fn prop_batch_fill_expiry_never_overhangs() {
 }
 
 fn ttl_marker(event: EventRef, writes: &[(CellKey, ProvisionalWrite)]) -> EventMarker {
-    EventMarker::frozen(event, writes, &[], &empty_evidence())
+    EventMarker::frozen(event, writes, &[], &evidence([].into(), None))
 }
