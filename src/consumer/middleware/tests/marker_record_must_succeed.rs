@@ -1,9 +1,8 @@
 //! The success-path marker record is **must-succeed**: `settle` retries a
 //! failed record of ANY category — Transient, Terminal, and Permanent alike —
 //! until the marker lands. The marker is framework bookkeeping, never a data
-//! rejection: skipping a Permanent failure would commit the offset with the
-//! stage uncertified, and the armed sweep would then silently roll a
-//! successful handler's writes back with no redelivery to replay them. The
+//! rejection. A skipped record can let a committed message run again after
+//! a later event replaces its collection evidence. The
 //! marker itself is the session's boundary-readable event identity
 //! (`message_marker()`), so these pins also prove the identity sources: a
 //! message session records its `EventRef` dedup id; a pure timer session
@@ -152,15 +151,12 @@ async fn assert_no_durable_cart(
         provisional.next().await.transpose()?.is_none(),
         "no provisional cell may exist",
     );
-    let probe = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX),
-    };
     let cell = CellKey {
         section: Section::new(0),
         coordinate: Coordinate::empty(),
     };
     assert_eq!(
-        Committed::into_inner(cell_store.get(cart_id, &cell, probe).await?),
+        Committed::into_inner(cell_store.get(cart_id, &cell).await?),
         None,
         "no committed value may exist",
     );
@@ -276,12 +272,9 @@ async fn pure_timer_never_records_a_message_marker() -> Result<()> {
     Ok(())
 }
 
-/// However many leading marker-record failures of whatever category the
-/// oracle throws, `settle`'s success path self-heals: the offset commits
-/// exactly once, the marker is recorded exactly once (the stage is
-/// certified), and the staged cell is promoted — never left provisional
-/// for the sweep to roll back. Each iteration runs on its own paused
-/// runtime so the retry backoff advances instantly.
+/// Store failures cannot skip the message dedup record or source commit.
+/// The source commits once, after the dedup record succeeds.
+/// Each iteration uses paused time for retry backoff.
 #[test]
 fn prop_marker_record_self_heals_to_certified_commit() {
     fn property(fail_count: u8, category_sel: u8) -> TestResult {
@@ -324,9 +317,6 @@ fn prop_marker_record_self_heals_to_certified_commit() {
             let provisional = cell_store.staged_cells(&cart_id);
             futures::pin_mut!(provisional);
             let still_provisional = matches!(provisional.next().await, Some(Ok(_)));
-            let probe = EventRef::Message {
-                dedup_id: Uuid::from_u128(u128::MAX),
-            };
             let value = match cell_store
                 .get(
                     &cart_id,
@@ -334,7 +324,6 @@ fn prop_marker_record_self_heals_to_certified_commit() {
                         section: Section::new(0),
                         coordinate: Coordinate::empty(),
                     },
-                    probe,
                 )
                 .await
             {

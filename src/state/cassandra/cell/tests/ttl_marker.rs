@@ -36,7 +36,7 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
     );
     store.write_provisional(&c, &writes, Some(&marker)).await?;
 
-    let (committed, co_expiry) = store.get_for_cache(c.id(), &cell, event(2)).await?;
+    let (committed, co_expiry) = store.get_for_cache(c.id(), &cell).await?;
     assert_eq!(
         committed.into_inner().as_ref(),
         Some(&old),

@@ -144,7 +144,7 @@ async fn markerless_provisional_reads_its_committed_base() -> Result<()> {
         "admission left the unlisted provisional cell untouched"
     );
     assert_eq!(
-        store.get(c.id(), &cell, event(2)).await?,
+        store.get(c.id(), &cell).await?,
         Committed::new(None),
         "a markerless legacy cell reads its committed base"
     );

@@ -92,8 +92,7 @@ fn prop_cassandra_apply_idempotence() {
 }
 
 /// Implicit-overwrite soundness over `Cached<CassandraStore>`: each overwrite
-/// resolves its predecessor's provisional cell through the oracle on read, with
-/// no explicit promote or rollback.
+/// resolves prior residue through admission before the next stage.
 #[test]
 fn prop_cassandra_cell_implicit_overwrite() {
     async fn run(trace: OverwriteTrace) -> Result<bool> {

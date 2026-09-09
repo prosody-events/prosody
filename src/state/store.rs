@@ -11,7 +11,6 @@
 //! because it has no provisional state to reconstruct.
 use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::cell_key::{CellKey, Coordinate, Scan, Section};
-use super::event_ref::EventRef;
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::{EventMarker, MarkerState, SectionClear};
 use crate::error::ClassifyError;
@@ -57,8 +56,10 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
     /// Reads the committed projection without a durable write.
-    /// A missing row returns `Committed(None)`. The current event reads its
-    /// staged `prev` value.
+    /// A missing row returns `Committed(None)`.
+    /// The current event reads `prev` for a provisional cell.
+    /// Admission resolves registered residue before dispatch. The event stages
+    /// only at settle.
     ///
     /// # Errors
     ///
@@ -67,7 +68,6 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-        own: EventRef,
     ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a;
 
     /// Scans one section in coordinate order and yields present committed
@@ -76,7 +76,6 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-        own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a;
 
     /// Cache-fill point read: the committed value **plus** the durable cell's
@@ -97,10 +96,9 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-        own: EventRef,
     ) -> impl Future<Output = Result<(Committed, Option<CompactDuration>), Self::Error>> + Send + 'a
     {
-        async move { Ok((self.get(collection, cell, own).await?, None)) }
+        async move { Ok((self.get(collection, cell).await?, None)) }
     }
 
     /// Batch twin of [`Self::get`]: resolves one section's coordinates in one
@@ -143,7 +141,6 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-        own: EventRef,
     ) -> impl Future<Output = Result<CommittedBatch, Self::Error>> + Send + 'a {
         async move {
             let (unique_coordinates, input_indices) = dedupe(batch);
@@ -153,7 +150,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
                     section,
                     coordinate: Coordinate::clone(coordinate),
                 };
-                unique_answers.push(self.get(collection, &cell, own).await?);
+                unique_answers.push(self.get(collection, &cell).await?);
             }
             Ok(expand_to_input_order(&input_indices, &unique_answers))
         }
@@ -180,7 +177,6 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-        own: EventRef,
     ) -> impl Future<Output = Result<CacheBatch, Self::Error>> + Send + 'a {
         async move {
             let (unique_coordinates, input_indices) = dedupe(batch);
@@ -190,7 +186,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
                     section,
                     coordinate: Coordinate::clone(coordinate),
                 };
-                unique_answers.push(self.get_for_cache(collection, &cell, own).await?);
+                unique_answers.push(self.get_for_cache(collection, &cell).await?);
             }
             Ok(expand_to_input_order(&input_indices, &unique_answers))
         }
@@ -223,7 +219,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// empty-input case. Absent and already-resolved coordinates are omitted
     /// (over-report-safe), with exact [`Self::provisional_cell_at`] parity for
     /// malformed / partially-expired rows — the raw decoder, never a visible
-    /// resolve. Surviving rows retain `data`/`prev`/[`EventRef`] **without
+    /// resolve. Surviving rows retain
+    /// `data`/`prev`/[`EventRef`](super::event_ref::EventRef) **without
     /// writing durable state or publishing into the
     /// committed-value cache** — this is the raw residue read,
     /// not a resolving one.
@@ -253,8 +250,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a;
 
     /// Stages provisional cells and writes the collection's Staged row from
-    /// the frozen `marker`. Cells bind the collection TTL; Staged binds the
-    /// evidence TTL. The Staged row names the event, coordinates, and clears.
+    /// the frozen `marker`. Cells and Staged bind the collection TTL.
+    /// The Staged row names the event, coordinates, and clears.
     ///
     /// # Staged row lifecycle
     ///
@@ -272,13 +269,10 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// `None` requires empty `writes`: it writes no Staged row and skips the
     /// boundary check. A clears-only stage supplies a payload with empty
     /// `staged()` and non-empty `clears()`. It writes Staged and checks the
-    ///
-    /// Before the write, the backend resolves a Staged row for a different
-    /// event. A resolution failure fails the stage; retry middleware handles
-    /// it. Thus each collection has at most one unresolved stage.
+    /// boundary. Admission resolves prior residue before dispatch.
     ///
     /// Staged carries frozen clear survivors that [`Self::commit_provisional`]
-    /// applies at settle. Recovery uses only that durable payload.
+    /// applies at settle. Admission uses only that durable payload.
     /// The session derives the survivors from each collection's staged writes.
     /// After an operator shortens the TTL, older cells can outlive a committed,
     /// unapplied clear and then expire independently.
@@ -356,6 +350,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
 
     /// Writes Committed evidence, promotes the staged values and frozen clears,
     /// then deletes Staged. The Staged payload supplies the event and evidence
+    /// TTL. Promotion preserves each cell's TTL, and deletes bind no TTL.
+    /// Admission can thus promote unregistered collections without a registry
     /// TTL.
     ///
     /// Required with no default (present data promotes via

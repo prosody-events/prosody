@@ -123,10 +123,7 @@ pub async fn committed_json_value(
     name: &str,
 ) -> color_eyre::Result<Option<Value>> {
     let id = CollectionId::new(state_key, StateType::Application, StateName::try_new(name)?);
-    let probe = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX),
-    };
-    match Committed::into_inner(cell_store.get(&id, &value_cell(), probe).await?) {
+    match Committed::into_inner(cell_store.get(&id, &value_cell()).await?) {
         Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         None => Ok(None),
     }

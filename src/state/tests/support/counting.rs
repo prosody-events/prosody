@@ -96,10 +96,9 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-        own: EventRef,
     ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
         self.counts.get.fetch_add(1, Ordering::Relaxed);
-        self.inner.get(collection, cell, own)
+        self.inner.get(collection, cell)
     }
 
     fn get_many<'a>(
@@ -107,10 +106,9 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-        own: EventRef,
     ) -> impl Future<Output = Result<CommittedBatch, Self::Error>> + Send + 'a {
         self.counts.get_many.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_many(collection, section, batch, own)
+        self.inner.get_many(collection, section, batch)
     }
 
     fn get_many_for_cache<'a>(
@@ -118,23 +116,20 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-        own: EventRef,
     ) -> impl Future<Output = Result<CacheBatch, Self::Error>> + Send + 'a {
         self.counts
             .get_many_for_cache
             .fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .get_many_for_cache(collection, section, batch, own)
+        self.inner.get_many_for_cache(collection, section, batch)
     }
 
     fn scan_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-        own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         self.counts.scan_cells.fetch_add(1, Ordering::Relaxed);
-        self.inner.scan_cells(collection, scan, own)
+        self.inner.scan_cells(collection, scan)
     }
 
     async fn provisional_cell_at<'a>(
@@ -274,17 +269,16 @@ mod tests {
             section: Section::new(0),
             coordinate: Coordinate::from_bytes(vec![0]),
         };
-        let own = probe(1);
 
         store.reset();
-        store.get(&id, &cell, own).await?;
+        store.get(&id, &cell).await?;
         assert_eq!(store.visible_point_reads(), 1);
         assert_eq!(store.batch_reads(), 0);
         assert_eq!(store.raw_point_reads(), 0);
 
         store.reset();
         let batch = batch_of([0])?;
-        store.get_many(&id, Section::new(0), &batch, own).await?;
+        store.get_many(&id, Section::new(0), &batch).await?;
         assert_eq!(store.batch_reads(), 1);
         assert_eq!(store.visible_point_reads(), 0);
         assert_eq!(store.raw_point_reads(), 0);

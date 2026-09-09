@@ -5,7 +5,7 @@ use super::read::fetch_marker_state;
 use super::{
     BatchUnit, Bytes, CacheBatch, CassandraStore, Cell, CellAddr, CellBatchRow, CellBuffer,
     CellKey, CellKind, CellStore, CellStoreError, CollectionId, CollectionRef, Committed,
-    CommittedBatch, CompactDuration, Coordinate, CoordinateBatch, EventMarker, EventRef, KeyRow,
+    CommittedBatch, CompactDuration, Coordinate, CoordinateBatch, EventMarker, KeyRow,
     PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell, ProvisionalWrite, ResolveCellError, RowShape,
     Scan, Section, SectionClear, SmallVec, Stream, bind_ttl, decode_batch_rows,
     decode_cell_ttl_result, decode_provisional_batch, dedupe, encode_cell_blobs,
@@ -22,19 +22,17 @@ impl CellStore for CassandraStore {
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-        own: EventRef,
     ) -> Result<Committed, Self::Error> {
         // The committed value is exactly the cache-fill read minus its co-expiry
         // TTL; production only ever calls this via `Cached` (which uses
         // `get_for_cache`), so `get` is a thin convenience for direct callers.
-        Ok(self.get_for_cache(collection, cell, own).await?.0)
+        Ok(self.get_for_cache(collection, cell).await?.0)
     }
 
     async fn get_for_cache<'a>(
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-        own: EventRef,
     ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
         let row = self
             .point_read_cell_result(&self.queries.read_cell_ttl, collection, cell)
@@ -44,7 +42,7 @@ impl CellStore for CassandraStore {
             Some(decoded) => decoded,
             None => (Cell::Resolved(Committed::new(None)), None),
         };
-        let committed = resolve_read(self, collection, own, raw).await?;
+        let committed = resolve_read(self, collection, raw).await?;
         Ok((committed, ttl_seconds_to_duration(ttl)))
     }
 
@@ -53,12 +51,11 @@ impl CellStore for CassandraStore {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-        own: EventRef,
     ) -> Result<CommittedBatch, Self::Error> {
         // Mirrors `get` → `get_for_cache`: the committed value is the batch
         // cache-fill read minus its co-expiry TTLs.
         Ok(self
-            .get_many_for_cache(collection, section, batch, own)
+            .get_many_for_cache(collection, section, batch)
             .await?
             .into_iter()
             .map(|(committed, _)| committed)
@@ -70,7 +67,6 @@ impl CellStore for CassandraStore {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-        own: EventRef,
     ) -> Result<CacheBatch, Self::Error> {
         let (unique_coordinates, input_indices) = dedupe(batch);
         let rows = self
@@ -85,7 +81,7 @@ impl CellStore for CassandraStore {
                 Some((cell, ttl)) => (cell, ttl),
                 None => (Cell::Resolved(Committed::new(None)), None),
             };
-            let committed = resolve_read(self, collection, own, raw).await?;
+            let committed = resolve_read(self, collection, raw).await?;
             unique_answers.push((committed, ttl_seconds_to_duration(ttl)));
         }
         Ok(expand_to_input_order(&input_indices, &unique_answers))
@@ -95,9 +91,8 @@ impl CellStore for CassandraStore {
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-        own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        self.scan_inner(collection, scan, own)
+        self.scan_inner(collection, scan)
     }
 
     async fn provisional_cell_at<'a>(

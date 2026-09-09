@@ -26,10 +26,9 @@ use tokio::sync::watch;
 // --- Owner-write harness ----------------------------------------------------
 
 /// The owner backend the seeding session runs over, generic over the cell
-/// store `C`. The oracle is always the fixed committed one: a pure seed
-/// never resolves a foreign provisional. The identity type is phantom: the
-/// session never reads it. See [`SessionParts`] for why one type serves
-/// every backend. Only `C` varies: [`MemoryCellStore`] for the memory
+/// store `C`. A seed leaves no unresolved residue. The identity type is
+/// phantom: the session never reads it. See [`SessionParts`] for why one type
+/// serves every backend. Only `C` varies: [`MemoryCellStore`] for the memory
 /// reader, `CassandraStore` for the live-Cassandra reader.
 pub(in crate::state_reader::tests) type OwnerBackend<C> =
     PartitionBackend<MemoryDeduplicationStore, MemoryDescriptorIdentityStore, C, ()>;
@@ -91,11 +90,8 @@ fn owner_session<C: CellStore>(
     })
 }
 
-/// Finalizes and promotes: the event's staged cells become committed. This
-/// is the full owner settle for a committed write. Promotion calls the
-/// store's settlement verb directly; it never consults the oracle. It
-/// returns `Resolved` on any healthy store, memory or Cassandra. A
-/// non-`Resolved` outcome is a real failure the seed must surface.
+/// Finalizes and promotes the event's staged cells.
+/// An incomplete promote fails the seed on both memory and Cassandra.
 async fn promote<C: CellStore>(session: OwnerSession<C>) -> Result<()> {
     if let Finalized::Staged(staged) = session
         .finalize()

@@ -851,7 +851,7 @@ where
         let committed = self
             .inner
             .overlay
-            .get(&id, cell, self.inner.event)
+            .get(&id, cell)
             .await
             .map_err(|e| StateAccessError::store(&e))?;
         Ok(committed.into_inner())
@@ -877,7 +877,7 @@ where
         let committed = self
             .inner
             .overlay
-            .get_many(&id, section, batch, self.inner.event)
+            .get_many(&id, section, batch)
             .await
             .map_err(|e| StateAccessError::store(&e))?;
         Ok(committed.into_iter().map(Committed::into_inner).collect())
@@ -892,13 +892,12 @@ where
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
         let id = self.id_for(state_type, name);
-        let event = self.inner.event;
         // `id` is local to the generator, so `scan_cells` unifies its lifetime
         // with an owned overlay; the caller's `Copy` `Scan<'a>` rides in
         // directly (it is covariant, so it coerces to that shorter scope).
         let overlay = self.inner.overlay.clone();
         try_stream! {
-            let inner = overlay.scan_cells(&id, scan, event);
+            let inner = overlay.scan_cells(&id, scan);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 yield item.map_err(|e| StateAccessError::store(&e))?;
@@ -1438,7 +1437,7 @@ where
                             records,
                         } = chunk;
                         let bases = lower
-                            .get_many(id, section, &batch, event)
+                            .get_many(id, section, &batch)
                             .await
                             .map_err(|e| StateAccessError::store(&e))?;
                         // `get_many`'s contract: bases.len() == batch.len()

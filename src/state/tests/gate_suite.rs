@@ -439,7 +439,7 @@ fn gate_serializes_set_against_clear() -> Result<()> {
         let entry = fresh.get(&1).await.map_err(|e| eyre!("{e}"))?;
         let keyset = fx
             .counting
-            .get(&id, &map::keyset_cell(), probe(99))
+            .get(&id, &map::keyset_cell())
             .await?
             .into_inner();
         assert!(
@@ -524,7 +524,7 @@ fn gate_serializes_racing_keyset_rmw() -> Result<()> {
         let id = fx.id("m")?;
         let keyset = fx
             .counting
-            .get(&id, &map::keyset_cell(), probe(99))
+            .get(&id, &map::keyset_cell())
             .await?
             .into_inner()
             .ok_or_else(|| eyre!("missing keyset cell"))?;
@@ -627,7 +627,7 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
         // The serial second set exceeds the limit → Overflowed.
         let keyset = fx
             .counting
-            .get(&id, &map::keyset_cell(), probe(99))
+            .get(&id, &map::keyset_cell())
             .await?
             .into_inner()
             .ok_or_else(|| eyre!("missing keyset cell"))?;

@@ -43,7 +43,7 @@ impl AttemptId {
 
 /// The two addresses in a collection's marker slice.
 ///
-/// An event has commit evidence when any touched collection has `Committed(e)`.
+/// A Committed row certifies residue through its [`AttemptId`].
 /// Only a promote writes this row, before any destructive promote chunk.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MarkerRow {
@@ -101,7 +101,7 @@ impl From<&EventMarker> for CommittedMarker {
 pub(crate) struct ReaderEvidence {
     /// The collection's own Staged and Committed rows.
     pub(crate) state: MarkerState,
-    /// A touched collection holds Committed for the staged event.
+    /// A sibling collection holds Committed for the staged attempt.
     pub(crate) staged_committed: bool,
 }
 

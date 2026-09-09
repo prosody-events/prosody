@@ -233,11 +233,8 @@ async fn two_collections() -> Result<(Ctx, MemoryCellStore, CollectionId, Collec
 /// durable store — read through a foreign probe event, so a still-buffered
 /// write is invisible.
 async fn durably_present(cell_store: &MemoryCellStore, id: &CollectionId) -> Result<bool> {
-    let probe = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX),
-    };
     cell_store
-        .get(id, &value_cell(), probe)
+        .get(id, &value_cell())
         .await
         .map(|c| Committed::into_inner(c).is_some())
         .map_err(|e| eyre!("committed read: {e}"))

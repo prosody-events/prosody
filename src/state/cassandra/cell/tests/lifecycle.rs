@@ -39,19 +39,13 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
     assert_eq!(prov.event(), event(1));
 
     store.mark_resolved(&c, slice::from_ref(&cell)).await?;
-    assert_eq!(
-        store.get(c.id(), &cell, event(2)).await?,
-        Committed::new(Some(data))
-    );
+    assert_eq!(store.get(c.id(), &cell).await?, Committed::new(Some(data)));
     assert!(provisional_cells(&store, c.id()).await?.is_empty());
 
     store
         .write_resolved(&c, &[(cell.clone(), None)], &[])
         .await?;
-    assert_eq!(
-        store.get(c.id(), &cell, event(2)).await?,
-        Committed::new(None)
-    );
+    assert_eq!(store.get(c.id(), &cell).await?, Committed::new(None));
     Ok(())
 }
 
@@ -103,10 +97,7 @@ async fn committed_clear_deletes_the_row() -> Result<()> {
         .commit_provisional(&c, &marker, &[(cell.clone(), write)])
         .await?;
 
-    assert_eq!(
-        store.get(c.id(), &cell, event(3)).await?,
-        Committed::new(None)
-    );
+    assert_eq!(store.get(c.id(), &cell).await?, Committed::new(None));
 
     // The residue row would still be selected by its live `encoding`/`version`;
     // its absence proves the commit deleted the row rather than nulling columns.

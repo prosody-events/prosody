@@ -23,7 +23,6 @@ impl CellStore for TtlStub {
         &'a self,
         _collection: &'a CollectionId,
         _cell: &'a CellKey,
-        _own: EventRef,
     ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
         ready(Ok(Committed::new(Some(self.value.clone()))))
     }
@@ -32,7 +31,6 @@ impl CellStore for TtlStub {
         &'a self,
         _collection: &'a CollectionId,
         _cell: &'a CellKey,
-        _own: EventRef,
     ) -> impl Future<Output = Result<(Committed, Option<CompactDuration>), Self::Error>> + Send + 'a
     {
         ready(Ok((Committed::new(Some(self.value.clone())), self.ttl)))
@@ -42,7 +40,6 @@ impl CellStore for TtlStub {
         &'a self,
         _collection: &'a CollectionId,
         _scan: Scan<'a>,
-        _own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         stream::empty()
     }

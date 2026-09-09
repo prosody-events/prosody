@@ -34,7 +34,6 @@ pub(crate) mod metrics;
 use self::metrics::{CacheResult, CellMetrics, Source};
 use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::cell_key::{CellKey, Coordinate, Scan, Section};
-use super::event_ref::EventRef;
 use super::fjall::{CacheRead, FjallCellCache, FjallCellCacheError};
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::{EventMarker, MarkerState, SectionClear};
@@ -192,12 +191,11 @@ where
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-        own: EventRef,
     ) -> Result<Committed, Self::Error> {
         let started = Instant::now();
         // Send the read to durable storage when the cache is disabled.
         if self.fjall.is_disabled() {
-            let loaded = self.lower.get(collection, cell, own).await;
+            let loaded = self.lower.get(collection, cell).await;
             self.metrics
                 .point(started, Source::Store, CacheResult::Disabled, &loaded);
             return loaded;
@@ -223,7 +221,7 @@ where
             }
         };
         let loaded = async {
-            let (committed, remaining) = self.lower.get_for_cache(collection, cell, own).await?;
+            let (committed, remaining) = self.lower.get_for_cache(collection, cell).await?;
             // Cache the durable result with its remaining lifetime.
             // A failed update keeps an equal live entry or no entry.
             let expiry = self.expiry_for(remaining);
@@ -243,7 +241,7 @@ where
     ///
     /// One missing or expired entry reloads the complete batch.
     /// A batch of hits consults no marker. This is sound for three reasons. The
-    /// settle transform installs committed values before the promote.
+    /// settle transform installs committed values after the durable promote.
     /// Per-key dispatch serializes events on a key. Every assignment starts
     /// with a cold cache.
     ///
@@ -256,13 +254,12 @@ where
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-        own: EventRef,
     ) -> Result<CommittedBatch, Self::Error> {
         let started = Instant::now();
         // Check the disabled state once when this operation starts.
         // Complete accepted cache work if another operation disables the cache.
         if self.fjall.is_disabled() {
-            let loaded = self.lower.get_many(collection, section, batch, own).await;
+            let loaded = self.lower.get_many(collection, section, batch).await;
             self.metrics.batch(
                 batch.len(),
                 started,
@@ -307,7 +304,7 @@ where
             // a fully successful batch).
             let filled: CacheBatch = self
                 .lower
-                .get_many_for_cache(collection, section, batch, own)
+                .get_many_for_cache(collection, section, batch)
                 .await?;
             // Publish every cell (present AND absent), one atomic batch, NO delete on
             // failure (the read-fill no-delete degrade — distinct from the mutator
@@ -343,11 +340,10 @@ where
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-        own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         // Scans use the lower store without a cache update (KV3).
         try_stream! {
-            let inner = self.lower.scan_cells(collection, scan, own);
+            let inner = self.lower.scan_cells(collection, scan);
             pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 yield item?;

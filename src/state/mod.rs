@@ -134,31 +134,18 @@ pub(crate) use backend::SharedStateBackend;
 pub(crate) use backend::{PartitionBackend, StateBackend, StateBackendFactory};
 
 /// Maximum concurrent per-collection durable operations in the keyed-state
-/// lifecycle (finalize stage, commit promote, rollback, recovery sweep).
+/// lifecycle (stage, promote, rollback, admission).
 /// Each collection is its own Cassandra partition, so the fan-out is safe.
 pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
 
-/// Maximum concurrent in-flight requests within a *single* collection
-/// (one Cassandra partition → one Scylla shard): the batch-chunk submission
-/// of one durable write, the recovery sweep's per-cell resolution, a
-/// stage's committed-base reads, and the ordered resolution window of a typed
-/// cell scan (each scanned cell is decoded and its resolver/loader fan-out run
-/// up to this many items ahead of the consumer). Same shard, so this bounds
-/// round-trip / oracle-consult *overlap* (latency), not throughput; kept modest
-/// because it nests inside the per-collection `STATE_FANOUT_CONCURRENCY`
-/// fan-out, so the product is the per-shard in-flight depth.
+/// Bounds concurrent requests within one collection, which is one Cassandra
+/// partition. It covers write chunks, admission reads, staged-base reads, and
+/// typed cell resolution. It nests inside [`STATE_FANOUT_CONCURRENCY`].
 ///
-/// Ruling: retained at eight pending a benchmark sweep over candidate values
-/// `1, 2, 4, 8, 16, 32, 64`, exercised under cold multi-chunk stage reads,
-/// cold and warm-index recovery spanning multiple chunks, oracle-resolving
-/// provisional write-back, over-budget provisional/resolved/promote/abort
-/// writes, and simultaneous events across many keys (to expose global shard
-/// pressure, not one isolated shard). Batching moved what this bounds — it is
-/// now concurrent batch chunks, recovery resolution, and over-budget write
-/// batches against one shard, never point-query multiplication — so a value
-/// picked before batching would have tuned the wrong thing. Not made
-/// configurable speculatively: if the optimum proves strongly
-/// deployment-dependent, a separately validated config field is the follow-up.
+/// Ruling: keep eight until a benchmark compares `1, 2, 4, 8, 16, 32, 64`.
+/// Include cold stage reads, admission, oversized writes, and simultaneous
+/// events across keys. These workloads measure batch concurrency and shard
+/// pressure. Add configuration only if deployments require different bounds.
 pub(crate) const SHARD_FANOUT_CONCURRENCY: usize = 8;
 
 /// Maximum concurrent typed resolves in flight within one aligned batch read —

@@ -39,8 +39,7 @@ pub(crate) struct RegisteredCollection {
 ///
 /// A collection's name is unique only *within* its [`StateType`] namespace, so
 /// the same name under two state types is two distinct entries and never an
-/// identity conflict. See [`Self::collections`] for what the recovery sweep
-/// enumerates.
+/// identity conflict. Admission starts discovery from [`Self::collections`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CollectionDefRegistry {
     defs: HashMap<StateType, HashMap<StateName, RegisteredCollection>>,
@@ -147,10 +146,9 @@ impl CollectionDefRegistry {
         })
     }
 
-    /// Returns every live `(state_type, name)` collection — the
-    /// registry-sourced name set the recovery sweep enumerates (the
-    /// authoritative declared set; a collection whose descriptor was
-    /// removed is dormant, not swept).
+    /// Returns every registered `(state_type, name)` collection.
+    /// Admission also follows marker payloads to discover unregistered
+    /// collections.
     pub(crate) fn collections(&self) -> impl Iterator<Item = (StateType, &StateName)> {
         self.defs.iter().flat_map(|(state_type, namespace)| {
             namespace.keys().map(move |name| (*state_type, name))

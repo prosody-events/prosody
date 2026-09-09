@@ -319,7 +319,7 @@ async fn state_type_namespaces_cells() -> Result<()> {
     use crate::state::memory::MemoryCells;
     use crate::state::store::CellStore;
 
-    use crate::state::{CollectionId, CollectionRef, EventRef, StateKey};
+    use crate::state::{CollectionId, CollectionRef, StateKey};
     use bytes::Bytes;
 
     let store = MemoryCellStore::new(MemoryCells::new());
@@ -350,16 +350,12 @@ async fn state_type_namespaces_cells() -> Result<()> {
         .write_resolved(&fw, &[(cell.clone(), Some(Bytes::from_static(b"fw")))], &[])
         .await?;
 
-    // A resolved cell never consults the oracle, so the probe event is inert.
-    let probe = EventRef::Message {
-        dedup_id: Uuid::from_u128(0),
-    };
     assert_eq!(
-        store.get(app.id(), &cell, probe).await?,
+        store.get(app.id(), &cell).await?,
         Committed::new(Some(Bytes::from_static(b"app"))),
     );
     assert_eq!(
-        store.get(fw.id(), &cell, probe).await?,
+        store.get(fw.id(), &cell).await?,
         Committed::new(Some(Bytes::from_static(b"fw"))),
         "the framework-namespaced cell holds its own value",
     );

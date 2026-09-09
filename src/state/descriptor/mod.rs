@@ -408,8 +408,8 @@ pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
 
     /// Sets the collection's durable write TTL: the per-write Cassandra
     /// `USING TTL` that bounds how long stored state is retained. Registration
-    /// validates it against the ceiling and the recovery delay. The granularity
-    /// is seconds ([`CompactDuration`]), matching what Cassandra can store.
+    /// rejects values below one second or above the Cassandra ceiling.
+    /// The granularity is seconds ([`CompactDuration`]), as Cassandra requires.
     ///
     /// This governs retention only, never read freshness. The read-only
     /// client's cache TTL is the separate [`Self::read_cache`] policy.

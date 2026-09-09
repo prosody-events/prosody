@@ -34,8 +34,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-// Re-exported so contexts that mount a get-out-of-the-way oracle (here and the
-// middleware tests) name one canonical type.
+// Test contexts share one deduplication store type.
 pub(crate) use crate::state::tests::support::MemoryDeduplicationStore;
 
 /// Converts a property body's `Result<bool>` into a `TestResult`, surfacing
@@ -117,8 +116,8 @@ pub(crate) fn test_session_for<L>(
 }
 
 /// Assembles the [`SessionParts`] shared by every test-session fixture — a
-/// fresh memory cell store over `registry`, the committed oracle, and the given
-/// `loader`/`state_key`/`armed`. When `cancelled`, the per-event cancellation
+/// fresh memory cell store, the registry, loader, and state key.
+/// When `cancelled`, the per-event cancellation
 /// watch starts tripped (binding still succeeds — bind validates registration,
 /// not liveness — but every typed op then guards to
 /// [`StateAccessError::Terminated`]). Returns the parts plus a store clone

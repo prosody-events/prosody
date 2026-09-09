@@ -613,37 +613,17 @@ impl FjallCellCache {
         .await
     }
 
-    /// The **settle transform** (settlement cache update): rewrites each staged
-    /// cell's entry `prev → data` at its **stage-anchored** expiry,
-    /// atomically, in a single [`spawn_blocking`] over one
-    /// [`OwnedWriteBatch`]. Called by
-    /// [`Cached::commit_provisional`](crate::state::cached::Cached) strictly
-    /// **before** the lower promote — the commit verdict is already fixed when
-    /// that verb runs, so `data` *is* the logical committed projection and
-    /// installing it pre-call keeps the staged cells warm and correct even if
-    /// the promote then fails or the settle future is dropped. Reusing the
-    /// stage expiry is load-bearing: the lower promote keeps `data`'s death
-    /// set at stage time, so a fresh `now + ttl` would overhang the durable
-    /// row's death.
+    /// Publishes each staged cell's committed value at its stage expiry.
+    /// One atomic [`OwnedWriteBatch`] runs in [`spawn_blocking`].
+    /// [`Cached`](crate::state::cached::Cached) calls this after the durable
+    /// promote returns. It disables the cache if publication does not complete.
     ///
-    /// **Idempotent because the frame is not marked.** fjall frames carry no
-    /// stage/committed discriminator — `stage_expiry` decodes any valid cell
-    /// frame — so a sweep-retried transform re-reads the stage-anchored expiry
-    /// it wrote the first time and rewrites byte-equivalent bytes. The delete
-    /// arm (a missing or unreadable entry is removed in the same atomic batch)
-    /// is reached only by genuinely missing/corrupt entries, never by a retry.
-    /// The supporting routing lemma: between transform attempts no successful
-    /// fill can restamp a coordinate still eligible for the next transform — a
-    /// fall-through read of a still-listed provisional coordinate must
-    /// *resolve* it first, and the sweep rebuilds its write set from durable
-    /// provisional state, so a resolved coordinate drops out before the retry
-    /// ever sees it. A drop between this transform and the commit site's
-    /// scoped section delete is equivalent to a drop before the verb: the
-    /// armed sweep re-runs both, and both are idempotent.
+    /// The promote preserves the durable cell's expiry. This transform retains
+    /// the cached expiry, so a repeated transform cannot extend retention.
+    /// Missing or unreadable entries are removed. The next read loads them
+    /// from the durable store.
     ///
-    /// Any failure — including the `fail_puts` seam and a join error — returns
-    /// `Err` so the caller runs its must-succeed delete fallback over the same
-    /// entries.
+    /// Any failure returns `Err` so the caller removes the affected entries.
     pub(crate) async fn commit_batch(
         &self,
         collection: &CollectionId,

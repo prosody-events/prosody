@@ -4,7 +4,6 @@ use super::CommitDecision;
 use super::SHARD_FANOUT_CONCURRENCY;
 use super::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite, resolve_for_reader};
 use super::cell_key::CellKey;
-use super::event_ref::EventRef;
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::{EventMarker, ReaderEvidence};
 use super::store::{CellBuffer, CellStore, section_batches};
@@ -16,10 +15,11 @@ use tokio::task::coop::cooperative;
 
 /// Returns the committed base for an admitted event.
 /// Provisional cells use the same evidence as standalone readers.
+/// Each provisional read reads the collection marker and each touched sibling
+/// marker at most once.
 pub(crate) async fn resolve_read<S: CellStore>(
     store: &S,
     collection: &CollectionId,
-    _own: EventRef,
     raw: Cell,
 ) -> Result<Committed, S::Error> {
     match raw {
@@ -28,27 +28,27 @@ pub(crate) async fn resolve_read<S: CellStore>(
             let state = store.marker_state(collection).await?;
             let mut staged_committed = false;
             if let Some(marker) = &state.staged {
-                staged_committed = stream::iter(0..marker.touched().len())
-                    .map(|index| {
-                        cooperative(async move {
-                            let (kind, name) = &marker.touched()[index];
-                            let sibling = CollectionId::new(
-                                collection.state_key().clone(),
-                                *kind,
-                                name.clone(),
-                            );
-                            Ok::<_, S::Error>(
-                                store
-                                    .marker_state(&sibling)
-                                    .await?
-                                    .committed
-                                    .is_some_and(|evidence| evidence.certifies(marker)),
-                            )
-                        })
+                staged_committed = stream::iter((0..marker.touched().len()).filter(|&index| {
+                    let (kind, name) = &marker.touched()[index];
+                    *kind != collection.state_type() || name != collection.name()
+                }))
+                .map(|index| {
+                    cooperative(async move {
+                        let (kind, name) = &marker.touched()[index];
+                        let sibling =
+                            CollectionId::new(collection.state_key().clone(), *kind, name.clone());
+                        Ok::<_, S::Error>(
+                            store
+                                .marker_state(&sibling)
+                                .await?
+                                .committed
+                                .is_some_and(|evidence| evidence.certifies(marker)),
+                        )
                     })
-                    .buffer_unordered(marker.touched().len().max(1))
-                    .try_fold(false, |any, committed| async move { Ok(any || committed) })
-                    .await?;
+                })
+                .buffer_unordered(marker.touched().len().max(1))
+                .try_fold(false, |any, committed| async move { Ok(any || committed) })
+                .await?;
             }
             let evidence = ReaderEvidence {
                 state,

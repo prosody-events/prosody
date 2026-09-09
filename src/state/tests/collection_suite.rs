@@ -4,7 +4,7 @@
 //! [`KeyedStateSession`] lifecycle — handler ops buffer into the dirty overlay,
 //! `finalize` stages them in one co-stamped batch, then the event commits
 //! (promote), aborts (rollback), or crashes (a fresh store over the same warm
-//! `MemoryCells` recovers through the quiescence sweep). After every event the
+//! `MemoryCells` recovers through the admission). After every event the
 //! collection's observable state must equal a plain `VecDeque`/`BTreeMap` model
 //! — and intermediate `pop`/`get` return values are asserted as they happen, so
 //! a mutation that corrupts the return but heals the final shape is still
@@ -103,13 +103,13 @@ const MAX_EVENT_OPS: usize = 4;
 /// real coverage of the rollback and crash-recovery arms.
 #[derive(Clone, Copy, Debug)]
 enum Outcome {
-    /// Marker recorded, promoted inline.
+    /// Promoted inline.
     Commit,
-    /// No marker, rolled back inline.
+    /// Admission rolls back the stage.
     Abort,
-    /// Staged, marker recorded, crash → sweep promotes.
+    /// Committed evidence survives a crash; admission promotes the residue.
     CrashCommitted,
-    /// Staged, no marker, crash → sweep rolls back.
+    /// No committed evidence survives a crash; admission rolls back the stage.
     CrashAborted,
 }
 
@@ -388,8 +388,8 @@ fn make_session_with_dirty(
     })
 }
 
-/// Registers `name` under `def` and returns the shared registry plus the sweep
-/// ref.
+/// Registers `name` under `def` and returns the registry and collection
+/// reference.
 fn registry_and_ref<D>(
     descriptor: &D,
     name: &str,
@@ -412,9 +412,8 @@ where
     Ok((Arc::new(registry), collection_ref))
 }
 
-/// Resolves the event along its outcome's path: consume the `finalize`
-/// receipt inline (promote/rollback), or crash → fresh store → sweep.
-/// Returns `false` only if a sweep strands a cell.
+/// Promotes the event or runs admission after a rollback or crash.
+/// Returns `false` if admission fails or leaves residue.
 async fn resolve_event(
     session: SuiteSession,
     finalized: Finalized<MemoryCellStore, ()>,
@@ -453,7 +452,7 @@ async fn resolve_event(
             let store = MemoryCellStore::new(cells.clone());
             if !admit_collection(&store, dedup, collection_ref)
                 .await
-                .map_err(|e| eyre!("sweep: {e}"))?
+                .map_err(|e| eyre!("admission: {e}"))?
             {
                 return Ok(false);
             }
@@ -510,8 +509,8 @@ struct Backing<'a> {
 /// bind a fresh session per event, apply each op (`apply_op`, which also
 /// asserts mid-trace `pop`/`get` returns and reports mid-handler commits),
 /// `finalize`, resolve along the event's outcome (promote / rollback / crash →
-/// sweep), advance the model — the full scratch on a commit (or always, for a
-/// `ReadUncommitted` collection, whose `finalize` commits everything), the
+/// admission), advance the model — the full scratch on a commit (or always, for
+/// a `ReadUncommitted` collection, whose `finalize` commits everything), the
 /// last `commit()`-landed snapshot otherwise — then assert the committed
 /// collection through a fresh read-back session (`assert`, which absorbs any
 /// kind-specific check such as Map's `KeysetPresence`).
@@ -587,7 +586,7 @@ where
         model = if commit_mode == CommitMode::ReadUncommitted || ev.outcome.commits() {
             // ReadUncommitted commits everything at `finalize` — any outcome
             // that reached it takes the full scratch (nothing provisional
-            // exists to roll back or sweep).
+            // exists for admission to resolve).
             scratch
         } else {
             // Abort / crash-rollback revert only the post-commit
@@ -851,10 +850,7 @@ pub(crate) async fn run_map_keyset_exact_trace(trace: MapTrace) -> Result<bool> 
         // frame must equal `tracked_frame(live)`; an absent keyset is the
         // live-empty case (a fresh or `clear`ed map).
         let live: Vec<i64> = model.keys().copied().collect();
-        let stored = store
-            .get(id, &keyset_cell(), read_event(index))
-            .await?
-            .into_inner();
+        let stored = store.get(id, &keyset_cell()).await?.into_inner();
         let exact = match stored {
             Some(bytes) => bytes[..] == tracked_frame(&live)[..],
             None => model.is_empty(),
@@ -1231,11 +1227,7 @@ async fn deque_no_committed_orphans(
     id: &CollectionId,
     span: usize,
 ) -> Result<bool> {
-    let Some(bounds) = store
-        .get(id, &deque::meta_cell(), read_event(0))
-        .await?
-        .into_inner()
-    else {
+    let Some(bounds) = store.get(id, &deque::meta_cell()).await?.into_inner() else {
         bail!("bounds cell missing after the convergence pushes");
     };
     let head = i64::from_be_bytes(bounds[0..8].try_into()?);
@@ -1244,11 +1236,7 @@ async fn deque_no_committed_orphans(
         let outside = i < head || i >= tail;
         if outside
             && store
-                .get(
-                    id,
-                    &deque::entry_cell_for(&I64KeyCodec::encode(&i)),
-                    read_event(0),
-                )
+                .get(id, &deque::entry_cell_for(&I64KeyCodec::encode(&i)))
                 .await?
                 .into_inner()
                 .is_some()
@@ -1672,7 +1660,7 @@ fn deque_meta_cell_bytes_are_frozen() -> Result<()> {
         StateType::Application,
         StateName::try_new("dq")?,
     );
-    let Some(bytes) = block_on(store.get(&id, &meta_cell(), event))?.into_inner() else {
+    let Some(bytes) = block_on(store.get(&id, &meta_cell()))?.into_inner() else {
         bail!("bounds cell missing at the frozen address");
     };
     assert_eq!(
@@ -1738,7 +1726,7 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     })?;
 
     let store = MemoryCellStore::new(cells.clone());
-    let Some(bytes) = block_on(store.get(id, &meta_cell(), read_event(0)))?.into_inner() else {
+    let Some(bytes) = block_on(store.get(id, &meta_cell()))?.into_inner() else {
         bail!("bounds cell missing after the committed clear-then-push");
     };
     assert_eq!(
@@ -1752,13 +1740,13 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     // the leak the API can never surface.
     let stale = entry_cell_for(&I64KeyCodec::encode(&1));
     assert_eq!(
-        block_on(store.get(id, &stale, read_event(0)))?.into_inner(),
+        block_on(store.get(id, &stale))?.into_inner(),
         None,
         "the committed clear must physically erase the out-of-window row"
     );
     let reused = entry_cell_for(&I64KeyCodec::encode(&0));
     assert_eq!(
-        block_on(store.get(id, &reused, read_event(0)))?.into_inner(),
+        block_on(store.get(id, &reused))?.into_inner(),
         Some(Bytes::from(serde_json::to_vec(&Value::from(9_u8))?)),
         "the reused index holds exactly the post-clear push"
     );
@@ -1877,7 +1865,7 @@ fn deque_push_on_an_over_wide_window_succeeds() -> Result<()> {
             Ok::<_, color_eyre::Report>(())
         })?;
 
-        let Some(bounds) = block_on(store.get(id, &meta_cell(), event))?.into_inner() else {
+        let Some(bounds) = block_on(store.get(id, &meta_cell()))?.into_inner() else {
             bail!("bounds cell missing after the over-wide push");
         };
         let head = i64::from_be_bytes(bounds[0..8].try_into()?);
@@ -1975,13 +1963,13 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
     assert_eq!(
-        block_on(store.get(id, &keyset_cell(), read_event(0)))?.into_inner(),
+        block_on(store.get(id, &keyset_cell()))?.into_inner(),
         None,
         "the committed clear must erase the keyset cell"
     );
     for cell in &legacy {
         assert_eq!(
-            block_on(store.get(id, cell, read_event(0)))?.into_inner(),
+            block_on(store.get(id, cell))?.into_inner(),
             None,
             "the whole-layout reset must erase every retired meta coordinate too"
         );
@@ -2001,7 +1989,7 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
     assert_eq!(
-        block_on(store.get(id, &keyset_cell(), read_event(1)))?.into_inner(),
+        block_on(store.get(id, &keyset_cell()))?.into_inner(),
         Some(bytes::Bytes::from(tracked_frame(&[7]))),
         "a set after clear writes a fresh single-key Tracked keyset"
     );
@@ -2110,7 +2098,7 @@ fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
         finalize_and_promote(&session, &dedup, event_dedup(event1), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(0)))?.into_inner() else {
+    let Some(bytes) = block_on(store.get(id, &keyset_cell()))?.into_inner() else {
         bail!("the committed sets must have written a keyset cell");
     };
     // Golden literal on purpose — independent of `tracked_frame`, so a helper
@@ -2135,7 +2123,7 @@ fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
         finalize_and_promote(&session, &dedup, event_dedup(event2), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(1)))?.into_inner() else {
+    let Some(bytes) = block_on(store.get(id, &keyset_cell()))?.into_inner() else {
         bail!("the overflowing set must have written a keyset cell");
     };
     assert_eq!(
@@ -2186,7 +2174,7 @@ fn map_keyset_stays_tracked_under_ttl() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
     assert_eq!(
-        block_on(store.get(id, &keyset_cell(), read_event(0)))?
+        block_on(store.get(id, &keyset_cell()))?
             .into_inner()
             .map(|b| b.to_vec()),
         Some(tracked_frame(&[1, 2])),
@@ -2208,7 +2196,7 @@ fn map_keyset_stays_tracked_under_ttl() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
     assert_eq!(
-        block_on(store.get(id, &keyset_cell(), read_event(1)))?
+        block_on(store.get(id, &keyset_cell()))?
             .into_inner()
             .map(|b| b.to_vec()),
         Some(tracked_frame(&[1, 2])),
@@ -2275,7 +2263,7 @@ fn map_keyset_malformed_frame_degrades_and_heals() -> Result<()> {
         finalize_and_promote(&session, &dedup, event_dedup(event2), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(1)))?.into_inner() else {
+    let Some(bytes) = block_on(store.get(id, &keyset_cell()))?.into_inner() else {
         bail!("the healing set must have written a keyset cell");
     };
     assert_eq!(
@@ -2351,7 +2339,7 @@ fn map_keyset_oversized_frame_collapses_before_fast_path() -> Result<()> {
         finalize_and_promote(&session, &dedup, event_dedup(event), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(1)))?.into_inner() else {
+    let Some(bytes) = block_on(store.get(id, &keyset_cell()))?.into_inner() else {
         bail!("the set must have written a keyset cell");
     };
     assert_eq!(
@@ -2392,7 +2380,7 @@ fn map_keyset_byte_ceiling_overflows() -> Result<()> {
         finalize_and_promote(&session, &dedup, event_dedup(event), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(0)))?.into_inner() else {
+    let Some(bytes) = block_on(store.get(id, &keyset_cell()))?.into_inner() else {
         bail!("the sets must have written a keyset cell");
     };
     assert_eq!(
@@ -2488,8 +2476,7 @@ fn event_dedup(event: EventRef) -> Uuid {
     }
 }
 
-/// A read-back event distinct from every staging event so own-event resolution
-/// never short-circuits the read.
+/// Identifies a read session independently from each staged event.
 fn read_event(index: usize) -> EventRef {
     EventRef::Message {
         dedup_id: Uuid::from_u128(u128::MAX - index as u128),

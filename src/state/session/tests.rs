@@ -189,18 +189,11 @@ impl Fixture {
         )
     }
 
-    /// The durable committed Value bytes. A fresh probe event so own-event
-    /// never short-circuits; on quiescent state the resolving read is the
-    /// committed projection (a still-provisional cell resolves to its
-    /// `prev`, which is the committed value the in-flight event
-    /// superseded).
+    /// Returns the durable committed Value bytes.
     async fn committed_value(&self) -> Result<Option<Bytes>> {
-        let probe = EventRef::Message {
-            dedup_id: Uuid::from_u128(u128::MAX),
-        };
         Ok(self
             .cell_store()
-            .get(&self.value_id(), &value_cell(), probe)
+            .get(&self.value_id(), &value_cell())
             .await?
             .into_inner())
     }
@@ -242,13 +235,10 @@ async fn commit_drains_only_its_collection() -> Result<()> {
     assert_eq!(outcome, StoreOutcome::Applied);
 
     // Cart's write is committed durably; wishlist's is still only buffered.
-    let probe = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX),
-    };
     let cart_id = CollectionId::new(fx.state_key.clone(), StateType::Application, cart);
     assert_eq!(
         fx.cell_store()
-            .get(&cart_id, &value_cell(), probe)
+            .get(&cart_id, &value_cell())
             .await?
             .into_inner(),
         Some(Bytes::from_static(b"a")),
@@ -260,7 +250,7 @@ async fn commit_drains_only_its_collection() -> Result<()> {
     );
     assert_eq!(
         fx.cell_store()
-            .get(&wishlist_id, &value_cell(), probe)
+            .get(&wishlist_id, &value_cell())
             .await?
             .into_inner(),
         None,
@@ -325,12 +315,9 @@ async fn rollback_restores_the_commit_floor_without_durable_writes() -> Result<(
     // Zero durable writes by the rollback: the committed row is still V, and
     // no provisional cell or event marker was created.
     let cart_id = CollectionId::new(fx.state_key.clone(), StateType::Application, cart);
-    let probe = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX),
-    };
     assert_eq!(
         fx.cell_store()
-            .get(&cart_id, &value_cell(), probe)
+            .get(&cart_id, &value_cell())
             .await?
             .into_inner(),
         Some(Bytes::from_static(b"V")),
@@ -922,10 +909,7 @@ async fn failed_finalize_keeps_the_buffer_whole_for_retry() -> Result<()> {
     for (name, expected) in [(&cart, b"c1"), (&wishlist, b"w1")] {
         let id = CollectionId::new(fx.state_key.clone(), StateType::Application, name.clone());
         assert_eq!(
-            fx.cell_store()
-                .get(&id, &value_cell(), probe(u128::MAX))
-                .await?
-                .into_inner(),
+            fx.cell_store().get(&id, &value_cell()).await?.into_inner(),
             Some(Bytes::from_static(expected)),
             "{name:?} must commit its buffered value on the healed retry",
         );
@@ -1005,12 +989,9 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
         Some(Bytes::from_static(b"v2")),
         "the retried attempt's value wins"
     );
-    let probe = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX),
-    };
     assert_eq!(
         fx.cell_store()
-            .get(&fx.value_id(), &extra, probe)
+            .get(&fx.value_id(), &extra)
             .await?
             .into_inner(),
         Some(Bytes::from_static(b"w")),
@@ -1159,14 +1140,9 @@ impl CountingFixture {
         Ok(())
     }
 
-    /// The committed value of `cell`, read through a prior event probe so the
-    /// read resolves raw committed truth.
+    /// Returns the durable committed value of `cell`.
     async fn committed(&self, cell: &CellKey) -> Result<Option<Bytes>> {
-        Ok(self
-            .counting
-            .get(&self.id, cell, probe(u128::MAX))
-            .await?
-            .into_inner())
+        Ok(self.counting.get(&self.id, cell).await?.into_inner())
     }
 }
 
@@ -1525,20 +1501,13 @@ async fn stage_restores_distinct_bases_on_abort() -> Result<()> {
     )
     .await?;
 
-    let probe = probe(u128::MAX);
     assert_eq!(
-        fx.cell_store()
-            .get(&fx.value_id(), &c0, probe)
-            .await?
-            .into_inner(),
+        fx.cell_store().get(&fx.value_id(), &c0).await?.into_inner(),
         Some(Bytes::from_static(b"A")),
         "c0 restored to its own base",
     );
     assert_eq!(
-        fx.cell_store()
-            .get(&fx.value_id(), &c1, probe)
-            .await?
-            .into_inner(),
+        fx.cell_store().get(&fx.value_id(), &c1).await?.into_inner(),
         Some(Bytes::from_static(b"B")),
         "c1 restored to its own base",
     );
@@ -1796,10 +1765,9 @@ async fn run_multi_section(trace: MultiTrace) -> Result<()> {
         )
         .await?;
         for cell in &all {
-            let probe = probe(u128::MAX);
             let committed = fx
                 .cell_store()
-                .get(&fx.value_id(), cell, probe)
+                .get(&fx.value_id(), cell)
                 .await?
                 .into_inner();
             let expected = model.get(cell).cloned();

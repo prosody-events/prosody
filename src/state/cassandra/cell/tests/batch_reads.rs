@@ -112,14 +112,13 @@ async fn first_error_is_first_input_position() -> Result<()> {
     let store = fx.bottom_store();
     let c = collection("resolve-order")?;
     let id = c.id();
-    let own = event(9);
     let (cell_a, cell_b) =
         seed_prev_without_event_and_blob_without_encoding(fx.cassandra.session(), id).await?;
 
     // The two rows are distinguishable through the sequential oracle.
     assert!(
         matches!(
-            store.get(id, &cell_a, own).await,
+            store.get(id, &cell_a).await,
             Err(ResolveCellError::Store(
                 CassandraCellStoreError::CorruptCell(CellCorruptReason::PrevWithoutEvent)
             ))
@@ -128,7 +127,7 @@ async fn first_error_is_first_input_position() -> Result<()> {
     );
     assert!(
         matches!(
-            store.get(id, &cell_b, own).await,
+            store.get(id, &cell_b).await,
             Err(ResolveCellError::Store(
                 CassandraCellStoreError::CorruptCell(CellCorruptReason::BlobWithoutEncoding)
             ))
@@ -140,7 +139,7 @@ async fn first_error_is_first_input_position() -> Result<()> {
     let batch = CoordinateBatch::chunks([0xFEu8, 0x01].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    match Box::pin(store.get_many(id, SECTIONS[0], &batch, own)).await {
+    match Box::pin(store.get_many(id, SECTIONS[0], &batch)).await {
         Err(ResolveCellError::Store(CassandraCellStoreError::CorruptCell(reason))) => {
             assert_eq!(
                 reason,
@@ -299,7 +298,7 @@ async fn cassandra_raw_batch_is_one_query() -> Result<()> {
     let mut writes = Vec::new();
     for b in [1u8, 2] {
         let cell = cell_in(0, b);
-        let prev = seed.get(id, &cell, staging).await?;
+        let prev = seed.get(id, &cell).await?;
         writes.push((
             cell,
             ProvisionalWrite::new(Some(bytes(b * 10)), prev, staging),
@@ -371,7 +370,7 @@ async fn cassandra_raw_batch_ascending_output() -> Result<()> {
     Box::pin(run_raw_batch_ascending_output(fx.bottom_store())).await
 }
 
-/// No-side-effects test over the live store built on a [`CountingOracle`]:
+/// No-side-effects test over the live store:
 /// `provisional_many` never resolves, writes, or caches.
 #[tokio::test]
 async fn cassandra_raw_batch_no_side_effects() -> Result<()> {

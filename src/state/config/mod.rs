@@ -34,10 +34,7 @@ const SUBSYSTEM_ENV: &str = "PROSODY_SUBSYSTEM";
 
 /// Built-in default read-cache TTL, applied when the client composes readers
 /// and no other TTL is set. Five seconds trades a small staleness window for
-/// fewer repeated store reads on hot keys. It stays well within the delay
-/// reads already tolerate. The recovery sweep converges committed values
-/// within [`DEFAULT_RECOVERY_DELAY_SECS`] seconds, and routing snapshots
-/// refresh every 60 seconds.
+/// fewer repeated store reads on hot keys.
 const DEFAULT_READ_CACHE_TTL: Duration = Duration::from_secs(5);
 
 const DEFAULT_READER_CACHE_SIZE: ByteSize = match NonZeroU64::new(1_048_576) {

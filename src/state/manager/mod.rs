@@ -338,6 +338,7 @@ where
             .collect();
         let mut states: SmallVec<[(CollectionRef, MarkerState); 8]> =
             SmallVec::with_capacity(pending.len());
+
         while !pending.is_empty() {
             let count = pending.len();
             let loaded = stream::iter(pending.drain(..))
@@ -355,6 +356,7 @@ where
                 .try_collect::<SmallVec<[_; 8]>>()
                 .await?;
             states.extend(loaded);
+
             for (_, state) in &states {
                 let touched = state.staged.iter().flat_map(EventMarker::touched).chain(
                     state
@@ -372,16 +374,19 @@ where
                 }
             }
         }
+
         let mut committed: SmallVec<[CommittedMarker; 8]> = SmallVec::with_capacity(states.len());
         for (_, state) in &states {
             if let Some(marker) = &state.committed {
                 committed.push(marker.clone());
             }
         }
+
         for (collection, state) in &states {
             let Some(marker) = &state.staged else {
                 continue;
             };
+
             let is_committed = if marker.version() == MarkerVersion::V1 {
                 self.legacy_committed(key, marker.event(), timers, shutdown)
                     .await?
@@ -391,6 +396,7 @@ where
             if is_committed && !committed.iter().any(|entry| entry.event == marker.event()) {
                 committed.push(CommittedMarker::from(marker));
             }
+
             if !is_committed
                 && !registry.collections().any(|(kind, name)| {
                     kind == collection.id().state_type() && name == collection.id().name()
@@ -404,6 +410,7 @@ where
                 }
                 continue;
             }
+
             let decision = if is_committed {
                 CommitDecision::Committed
             } else {
@@ -414,6 +421,7 @@ where
             })
             .await?;
         }
+
         for marker in committed {
             if let Some(dedup) = marker.dedup
                 && !admission_step(shutdown, || self.inner.dedup.exists(dedup)).await?
@@ -424,6 +432,7 @@ where
                 admission_step(shutdown, || timers.retire_committed(key, timer)).await?;
             }
         }
+
         Ok(())
     }
 

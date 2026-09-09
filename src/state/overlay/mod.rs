@@ -40,7 +40,6 @@
 use super::cell::Committed;
 use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::dirty::{DirtyStore, DirtyVal};
-use super::event_ref::EventRef;
 use super::identity::CollectionId;
 use super::store::{CellBuffer, CellStore, CommittedBatch, CoordinateBatch};
 use async_stream::try_stream;
@@ -96,7 +95,6 @@ where
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-        own: EventRef,
     ) -> Result<Committed, L::Error> {
         match self.dirty.lookup(collection, cell) {
             Some(DirtyVal::Set(bytes)) => Ok(Committed::new(Some(bytes))),
@@ -107,7 +105,7 @@ where
             None if self.dirty.section_cleared(collection, cell.section) => {
                 Ok(Committed::new(None))
             }
-            None => self.lower.get(collection, cell, own).await,
+            None => self.lower.get(collection, cell).await,
         }
     }
 
@@ -129,7 +127,6 @@ where
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-        own: EventRef,
     ) -> Result<CommittedBatch, L::Error> {
         let section_cleared = self.dirty.section_cleared(collection, section);
         let mut answers: CellBuffer<Option<Committed>> = smallvec![None; batch.len()];
@@ -158,7 +155,7 @@ where
         for lower_batch in CoordinateBatch::chunks(untouched) {
             let lower = self
                 .lower
-                .get_many(collection, section, &lower_batch, own)
+                .get_many(collection, section, &lower_batch)
                 .await?;
             for (committed, &pos) in lower.into_iter().zip(untouched_pos.iter()) {
                 answers[pos] = Some(committed);
@@ -186,7 +183,6 @@ where
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-        own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a {
         let cleared = self.dirty.section_cleared(collection, scan.section);
         let mut top = self.dirty.section_snapshot(collection, scan.section);
@@ -226,7 +222,6 @@ where
                     limit: None,
                     ..scan
                 },
-                own,
             );
             // `top` is an owned, pre-sorted snapshot (the guard was dropped when
             // it was built), walked by index; `bottom` stays a lazy stream.

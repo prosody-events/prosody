@@ -149,11 +149,8 @@ pub async fn committed_value(
     cell_store: &MemoryCellStore,
     id: &CollectionId,
 ) -> color_eyre::Result<Option<Bytes>> {
-    let probe = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX),
-    };
     cell_store
-        .get(id, &value_cell(), probe)
+        .get(id, &value_cell())
         .await
         .map(Committed::into_inner)
         .map_err(|error| color_eyre::eyre::eyre!("read committed: {error}"))

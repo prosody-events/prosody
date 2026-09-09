@@ -129,11 +129,7 @@ async fn legacy_and_timer_residue(value: u8, mode: u8) -> Result<bool> {
         value.wrapping_add(1)
     });
     ensure!(
-        store
-            .get(collection.id(), &value_cell(), event)
-            .await?
-            .get()
-            == Some(&expected),
+        store.get(collection.id(), &value_cell()).await?.get() == Some(&expected),
         "legacy admission changed the commit decision"
     );
     ensure!(
@@ -258,10 +254,7 @@ async fn legacy_deregistration(value: u8) -> Result<()> {
     dedup.insert(dedup_id).await?;
     ensure!(admit_registered(&store, &dedup, &collections).await? == Admission::Fresh);
     ensure!(
-        store
-            .get(collections[1].id(), &value_cell(), older)
-            .await?
-            .get()
+        store.get(collections[1].id(), &value_cell()).await?.get()
             == Some(&bytes(value.wrapping_add(1))),
         "an orphan cell exposed uncommitted data"
     );

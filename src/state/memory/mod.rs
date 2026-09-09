@@ -5,7 +5,7 @@ use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::marker::{EventMarker, MarkerState, SectionClear};
 use super::resolve::{ResolveCellError, resolve_read};
 use super::store::{CellBuffer, CellStore, CoordinateBatch, provisional_point_loop};
-use super::{CollectionId, CollectionRef, EventRef};
+use super::{CollectionId, CollectionRef};
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::Stream;
@@ -112,16 +112,14 @@ impl CellStore for MemoryCellStore {
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-        own: EventRef,
     ) -> Result<Committed, Self::Error> {
-        resolve_read(self, collection, own, self.read_raw(collection, cell)).await
+        resolve_read(self, collection, self.read_raw(collection, cell)).await
     }
 
     fn scan_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-        own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         try_stream! {
             // Snapshot the matching raw cells synchronously (scc holds no
@@ -151,7 +149,7 @@ impl CellStore for MemoryCellStore {
                     break;
                 }
                 let committed =
-                    cooperative(async { resolve_read(self, collection, own, stored).await }).await?;
+                    cooperative(async { resolve_read(self, collection, stored).await }).await?;
                 if let Some(bytes) = committed.into_inner() {
                     yield (cell, bytes);
                     yielded += 1;

@@ -3,12 +3,11 @@ use super::CellReadCounts;
 use super::{
     Arc, BatchUnit, Bytes, CassandraCellStoreError, CassandraSession, CassandraStore, Cell,
     CellAddr, CellBatchRow, CellBlobs, CellKey, CellKind, CellQueries, CellStoreError,
-    CollectionDefRegistry, CollectionId, Coordinate, EventMarker, EventRef, KeyRow,
-    MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, Pk, PreparedStatement, QueryRowsResult,
-    ResolveCellError, ResolvedRow, RowShape, SHARD_FANOUT_CONCURRENCY, Scan, Section, Stream,
-    TryStreamExt, blob_weight, encode, encode_marker_payload, fetch_and_decode_cell,
-    fetch_cell_rows_result, fetch_cells_batch_result, page_cells, pin_mut, resolve_read, smallvec,
-    try_stream,
+    CollectionDefRegistry, CollectionId, Coordinate, EventMarker, KeyRow, MAX_BATCH_BYTES,
+    MAX_BATCH_STATEMENTS, MarkerBlob, Pk, PreparedStatement, QueryRowsResult, ResolveCellError,
+    ResolvedRow, RowShape, SHARD_FANOUT_CONCURRENCY, Scan, Section, Stream, TryStreamExt,
+    blob_weight, encode, encode_marker_payload, fetch_and_decode_cell, fetch_cell_rows_result,
+    fetch_cells_batch_result, page_cells, pin_mut, resolve_read, smallvec, try_stream,
 };
 
 impl CassandraStore {
@@ -151,7 +150,6 @@ impl CassandraStore {
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-        own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), CellStoreError>> + Send + 'a {
         let limit = scan.limit;
         try_stream! {
@@ -169,7 +167,7 @@ impl CassandraStore {
                 if limit.is_some_and(|n| yielded >= n) {
                     break;
                 }
-                let committed = resolve_read(self, collection, own, raw).await?;
+                let committed = resolve_read(self, collection, raw).await?;
                 if let Some(bytes) = committed.into_inner() {
                     yield (key, bytes);
                     yielded += 1;

@@ -29,7 +29,7 @@ use self::collection_suite::{
 };
 use self::publication_suite::{PublicationTrace, run_publication_trace};
 use self::support::{CountingCellStore, CountingResolver, ResolveCounter, fresh_collection};
-use super::cell::{Committed, ProvisionalWrite};
+use super::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use super::cell_key::CellKey;
 use super::descriptor::{StateDescriptor, WithResolver, deque, deque_state, map_state};
 use super::marker::EventMarker;
@@ -38,7 +38,7 @@ use super::memory::{
 };
 use super::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use super::registry::{CollectionDef, CollectionDefRegistry};
-use super::resolve::resolve_event_marker;
+use super::resolve::{resolve_event_marker, resolve_read};
 use super::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use super::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, dedupe};
 use super::{
@@ -408,10 +408,7 @@ fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
             .await
             .map_err(|e| eyre!("resolve_event_marker: {e}"))?;
 
-        // Observe `resolve_event_marker`'s own output before any `get`: nothing may be
-        // left provisional. A `get` here would self-heal a survivor the collapse
-        // regression left provisional (see the doc comment), so this drain must
-        // run first.
+        // Check raw rows: visible reads can hide unresolved provisional cells.
         let remaining = drain_memory_provisional(&store, &id)
             .await
             .map_err(|e| eyre!("drain: {e}"))?;
@@ -421,14 +418,10 @@ fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
              {remaining:?}"
         );
 
-        // A prior event reader event: the cells are already resolved, so `get`
-        // returns the committed value directly.
-        let reader = EventRef::Message {
-            dedup_id: Uuid::from_u128(2),
-        };
+        // Resolved cells return the committed value directly.
         assert_eq!(
             store
-                .get(&id, &cell_in(0, 7), reader)
+                .get(&id, &cell_in(0, 7))
                 .await
                 .map_err(|e| eyre!("get s0: {e}"))?,
             Committed::new(Some(bytes(70))),
@@ -436,7 +429,7 @@ fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
         );
         assert_eq!(
             store
-                .get(&id, &cell_in(1, 7), reader)
+                .get(&id, &cell_in(1, 7))
                 .await
                 .map_err(|e| eyre!("get s1: {e}"))?,
             Committed::new(Some(bytes(90))),
@@ -794,13 +787,10 @@ fn forwarding_default_preserves_ttl() -> Result<()> {
         StateType::Application,
         StateName::try_new("entries")?,
     );
-    let own = EventRef::Message {
-        dedup_id: Uuid::from_u128(3),
-    };
     let batch = CoordinateBatch::chunks([0u8, 1].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    let got = TEST_RUNTIME.block_on(store.get_many_for_cache(&id, SECTIONS[0], &batch, own))?;
+    let got = TEST_RUNTIME.block_on(store.get_many_for_cache(&id, SECTIONS[0], &batch))?;
     assert_eq!(got.len(), 2, "every position answered");
     for (_, remaining) in &got {
         assert_eq!(
@@ -1790,4 +1780,71 @@ fn deque_stream_interleave_is_yield_free() {
             .block_on(run_deque_stream_interleave(input))
     }
     QuickCheck::new().quickcheck(property as fn(DequeInterleave) -> Result<bool>);
+}
+
+/// A provisional read reads each touched marker once and preserves reader
+/// parity.
+#[test]
+fn prop_resolve_reads_each_marker_once() {
+    fn property(value: u8, siblings: u8, certificate: u8) -> Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let cells = MemoryCells::new();
+            let store = CountingCellStore::new(MemoryCellStore::new(cells.clone()));
+            let id = fresh_collection("read-budget")?;
+            let count = usize::from(siblings % 8) + 1;
+            let mut collections = Vec::with_capacity(count);
+            collections.push(CollectionRef::new(id.clone(), None));
+            for index in 1..count {
+                collections.push(CollectionRef::new(
+                    CollectionId::new(
+                        id.state_key().clone(),
+                        id.state_type(),
+                        StateName::try_new(format!("sibling-{index}"))?,
+                    ),
+                    None,
+                ));
+            }
+            let touched = collections
+                .iter()
+                .map(|collection| (collection.id().state_type(), collection.id().name().clone()))
+                .collect();
+            let event = support::probe(1);
+            let cell = cell_in(0, 0);
+            let data = bytes(value);
+            let prev = bytes(value.wrapping_add(1));
+            let writes = [(
+                cell.clone(),
+                ProvisionalWrite::new(
+                    Some(data.clone()),
+                    Committed::new(Some(prev.clone())),
+                    event,
+                ),
+            )];
+            let marker =
+                EventMarker::frozen(event, &writes, &[], &touched, None, None, AttemptId::new());
+            for collection in &collections {
+                store
+                    .write_provisional(collection, &writes, Some(&marker))
+                    .await?;
+            }
+            let certificate = usize::from(certificate) % (count + 1);
+            if let Some(collection) = collections.get(certificate) {
+                support::seed_commit_evidence(&store, collection).await?;
+            }
+
+            store.reset();
+            let raw = Cell::Provisional(ProvisionalCell::new(
+                Some(data.clone()),
+                Some(prev.clone()),
+                event,
+            ));
+            let actual = resolve_read(&store, &id, raw).await?.into_inner();
+            assert_eq!(actual, Some(if certificate < count { data } else { prev }));
+            assert_eq!(store.marker_reads(), count, "read each marker once");
+            assert_eq!(store.durable_writes(), 0, "reads preserve durable state");
+            assert_eq!(actual, cells.read_committed(&id, &cell));
+            Ok(())
+        })
+    }
+    QuickCheck::new().quickcheck(property as fn(u8, u8, u8) -> Result<()>);
 }

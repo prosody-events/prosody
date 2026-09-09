@@ -67,7 +67,7 @@ async fn legacy_null_null_residue_reads_committed_none() -> Result<()> {
         .await?;
 
     assert_eq!(
-        store.get(id, &cell, event(1)).await?,
+        store.get(id, &cell).await?,
         Committed::new(None),
         "the decoder must read the legacy residue as committed-absence"
     );
@@ -233,7 +233,7 @@ fn prop_cassandra_present_cell_is_uniquely_owned() {
         store
             .write_resolved(&c, &[(cell.clone(), Some(data))], &[])
             .await?;
-        let Some(bytes) = store.get(c.id(), &cell, event(1)).await?.into_inner() else {
+        let Some(bytes) = store.get(c.id(), &cell).await?.into_inner() else {
             return Err(eyre!("expected a present committed value"));
         };
         Ok(bytes.try_into_mut().is_ok())

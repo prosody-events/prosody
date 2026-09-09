@@ -57,6 +57,9 @@ impl MemoryCells {
         let state = self.marker_state(collection);
         let staged_committed = state.staged.as_ref().is_some_and(|marker| {
             marker.touched().iter().any(|(state_type, name)| {
+                if *state_type == collection.state_type() && name == collection.name() {
+                    return false;
+                }
                 let id =
                     CollectionId::new(collection.state_key().clone(), *state_type, name.clone());
                 self.marker_state(&id)
