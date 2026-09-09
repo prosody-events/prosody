@@ -29,7 +29,7 @@ use self::collection_suite::{
 };
 use self::publication_suite::{PublicationTrace, run_publication_trace};
 use self::support::{CountingCellStore, CountingResolver, ResolveCounter, fresh_collection};
-use super::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
+use super::cell::{Cell, Committed, ProvisionalWrite};
 use super::cell_key::CellKey;
 use super::descriptor::{StateDescriptor, WithResolver, deque, deque_state, map_state};
 use super::marker::EventMarker;
@@ -38,7 +38,7 @@ use super::memory::{
 };
 use super::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use super::registry::{CollectionDef, CollectionDefRegistry};
-use super::resolve::{resolve_event_marker, resolve_read};
+use super::resolve::{EvidenceLookup, resolve_event_marker};
 use super::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use super::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, dedupe};
 use super::{
@@ -51,7 +51,7 @@ use crate::loader::MemoryLoader;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
-use futures::StreamExt;
+use futures::{StreamExt, pin_mut, stream};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use serde_json::Value;
 use std::num::NonZeroUsize;
@@ -1782,14 +1782,12 @@ fn deque_stream_interleave_is_yield_free() {
     QuickCheck::new().quickcheck(property as fn(DequeInterleave) -> Result<bool>);
 }
 
-/// A provisional read reads each touched marker once and preserves reader
-/// parity.
+/// Batches and scans share one marker snapshot and preserve reader parity.
 #[test]
 fn prop_resolve_reads_each_marker_once() {
-    fn property(value: u8, siblings: u8, certificate: u8) -> Result<()> {
+    fn property(value: u8, siblings: u8, certificate: u8, length: u8) -> Result<()> {
         TEST_RUNTIME.block_on(async {
             let cells = MemoryCells::new();
-            let store = CountingCellStore::new(MemoryCellStore::new(cells.clone()));
             let id = fresh_collection("read-budget")?;
             let count = usize::from(siblings % 8) + 1;
             let mut collections = Vec::with_capacity(count);
@@ -1804,22 +1802,28 @@ fn prop_resolve_reads_each_marker_once() {
                     None,
                 ));
             }
+            let memory = MemoryCellStore::new(cells.clone());
+            let store = CountingCellStore::new(memory.clone()).with_marker_counts(&collections);
             let touched = collections
                 .iter()
                 .map(|collection| (collection.id().state_type(), collection.id().name().clone()))
                 .collect();
             let event = support::probe(1);
-            let cell = cell_in(0, 0);
             let data = bytes(value);
             let prev = bytes(value.wrapping_add(1));
-            let writes = [(
-                cell.clone(),
-                ProvisionalWrite::new(
-                    Some(data.clone()),
-                    Committed::new(Some(prev.clone())),
-                    event,
-                ),
-            )];
+            let length = length % 32 + 2;
+            let writes: Vec<_> = (0..length)
+                .map(|index| {
+                    (
+                        cell_in(0, index),
+                        ProvisionalWrite::new(
+                            Some(data.clone()),
+                            Committed::new(Some(prev.clone())),
+                            event,
+                        ),
+                    )
+                })
+                .collect();
             let marker =
                 EventMarker::frozen(event, &writes, &[], &touched, None, None, AttemptId::new());
             for collection in &collections {
@@ -1831,20 +1835,107 @@ fn prop_resolve_reads_each_marker_once() {
             if let Some(collection) = collections.get(certificate) {
                 support::seed_commit_evidence(&store, collection).await?;
             }
+            let expected = Some(if certificate < count { data } else { prev });
 
-            store.reset();
-            let raw = Cell::Provisional(ProvisionalCell::new(
-                Some(data.clone()),
-                Some(prev.clone()),
-                event,
-            ));
-            let actual = resolve_read(&store, &id, raw).await?.into_inner();
-            assert_eq!(actual, Some(if certificate < count { data } else { prev }));
-            assert_eq!(store.marker_reads(), count, "read each marker once");
-            assert_eq!(store.durable_writes(), 0, "reads preserve durable state");
-            assert_eq!(actual, cells.read_committed(&id, &cell));
+            check_memory_read_budget(&memory, &id, &writes, expected.as_ref(), count).await?;
+
+            // Exercise a batch and both scan directions with separate lookups.
+            for direction in [None, Some(Direction::Forward), Some(Direction::Backward)] {
+                store.reset();
+                let mut lookup = EvidenceLookup::new(&store, &id);
+                assert_eq!(
+                    lookup
+                        .resolve(Cell::Resolved(Committed::new(None)))
+                        .await?
+                        .into_inner(),
+                    None
+                );
+                assert_eq!(store.marker_reads(), 0, "resolved cells need no evidence");
+                let mut keys: Vec<_> = writes.iter().map(|(cell, _)| cell.clone()).collect();
+                if direction == Some(Direction::Backward) {
+                    keys.reverse();
+                }
+                if direction.is_none() {
+                    keys.extend_from_within(..);
+                }
+                let rows = stream::iter(keys);
+                pin_mut!(rows);
+                while let Some(cell) = rows.next().await {
+                    let actual = lookup
+                        .resolve(Cell::Provisional(
+                            store
+                                .provisional_cell_at(&id, &cell)
+                                .await?
+                                .ok_or_else(|| eyre!("provisional cell missing"))?,
+                        ))
+                        .await?
+                        .into_inner();
+                    assert_eq!(actual, expected);
+                    assert_eq!(actual, cells.read_committed(&id, &cell));
+                }
+                assert_eq!(store.marker_reads(), count, "one snapshot per call");
+                for collection in &collections {
+                    assert_eq!(
+                        store.marker_reads_for(collection.id()),
+                        1,
+                        "read each marker once"
+                    );
+                }
+                assert_eq!(store.durable_writes(), 0, "reads preserve durable state");
+            }
             Ok(())
         })
     }
-    QuickCheck::new().quickcheck(property as fn(u8, u8, u8) -> Result<()>);
+    QuickCheck::new().quickcheck(property as fn(u8, u8, u8, u8) -> Result<()>);
+}
+
+async fn check_memory_read_budget(
+    store: &MemoryCellStore,
+    id: &CollectionId,
+    writes: &[(CellKey, ProvisionalWrite)],
+    expected: Option<&Bytes>,
+    count: usize,
+) -> Result<()> {
+    use super::{Scan, ScanEdge};
+    use futures::TryStreamExt;
+    use std::sync::atomic::Ordering;
+
+    let batch = CoordinateBatch::chunks(writes.iter().map(|(cell, _)| cell.coordinate.clone()))
+        .next()
+        .ok_or_else(|| eyre!("batch missing"))?;
+    store.marker_reads.store(0, Ordering::Relaxed);
+    let values = store.get_many(id, writes[0].0.section, &batch).await?;
+    assert_eq!(values.len(), batch.len());
+    for value in values {
+        assert_eq!(value.into_inner().as_ref(), expected);
+    }
+    assert_eq!(store.marker_reads.load(Ordering::Relaxed), count);
+    store.marker_reads.store(0, Ordering::Relaxed);
+    let values = store
+        .get_many_for_cache(id, writes[0].0.section, &batch)
+        .await?;
+    assert_eq!(values.len(), batch.len());
+    for (value, ttl) in values {
+        assert_eq!(value.into_inner().as_ref(), expected);
+        assert_eq!(ttl, None);
+    }
+    assert_eq!(store.marker_reads.load(Ordering::Relaxed), count);
+
+    for dir in [Direction::Forward, Direction::Backward] {
+        store.marker_reads.store(0, Ordering::Relaxed);
+        let scan = Scan {
+            section: writes[0].0.section,
+            start: ScanEdge::Unbounded,
+            end: ScanEdge::Unbounded,
+            dir,
+            limit: None,
+        };
+        let rows: Vec<_> = store.scan_cells(id, scan).try_collect().await?;
+        assert_eq!(rows.len(), writes.len());
+        for (_, value) in rows {
+            assert_eq!(Some(&value), expected);
+        }
+        assert_eq!(store.marker_reads.load(Ordering::Relaxed), count);
+    }
+    Ok(())
 }

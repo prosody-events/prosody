@@ -10,55 +10,76 @@ use super::store::{CellBuffer, CellStore, section_batches};
 use crate::error::{ClassifyError, ErrorCategory};
 use futures::{StreamExt, TryStreamExt, stream};
 use std::error::Error;
+use std::future::Future;
 use thiserror::Error;
 use tokio::task::coop::cooperative;
 
-/// Returns the committed base for an admitted event.
-/// Provisional cells use the same evidence as standalone readers.
-/// Each provisional read reads the collection marker and each touched sibling
-/// marker at most once.
-pub(crate) async fn resolve_read<S: CellStore>(
-    store: &S,
-    collection: &CollectionId,
-    raw: Cell,
-) -> Result<Committed, S::Error> {
-    match raw {
-        Cell::Resolved(committed) => Ok(committed),
-        Cell::Provisional(provisional) => {
-            let state = store.marker_state(collection).await?;
-            let mut staged_committed = false;
-            if let Some(marker) = &state.staged {
-                staged_committed = stream::iter((0..marker.touched().len()).filter(|&index| {
-                    let (kind, name) = &marker.touched()[index];
-                    *kind != collection.state_type() || name != collection.name()
-                }))
-                .map(|index| {
-                    cooperative(async move {
-                        let (kind, name) = &marker.touched()[index];
-                        let sibling =
-                            CollectionId::new(collection.state_key().clone(), *kind, name.clone());
-                        Ok::<_, S::Error>(
-                            store
-                                .marker_state(&sibling)
-                                .await?
-                                .committed
-                                .is_some_and(|evidence| evidence.certifies(marker)),
-                        )
-                    })
-                })
-                .buffer_unordered(marker.touched().len().max(1))
-                .try_fold(false, |any, committed| async move { Ok(any || committed) })
-                .await?;
-            }
-            let evidence = ReaderEvidence {
-                state,
-                staged_committed,
-            };
-            Ok(Committed::new(
-                resolve_for_reader(&Cell::Provisional(provisional), &evidence).cloned(),
-            ))
+/// Resolves cells with one evidence snapshot per batch or scan.
+/// Each marker is read at most once, on the first provisional cell.
+/// Per-key serialization protects owner reads. Standalone reads accept this
+/// snapshot.
+pub(crate) struct EvidenceLookup<'a, S> {
+    store: &'a S,
+    collection: &'a CollectionId,
+    evidence: Option<ReaderEvidence>,
+}
+
+impl<'a, S: CellStore> EvidenceLookup<'a, S> {
+    pub(crate) fn new(store: &'a S, collection: &'a CollectionId) -> Self {
+        Self {
+            store,
+            collection,
+            evidence: None,
         }
     }
+
+    pub(crate) async fn resolve(&mut self, raw: Cell) -> Result<Committed, S::Error> {
+        if let Cell::Resolved(committed) = raw {
+            return Ok(committed);
+        }
+        let evidence = if let Some(evidence) = &self.evidence {
+            evidence
+        } else {
+            let store = self.store;
+            let collection = self.collection;
+            let state = store.marker_state(collection).await?;
+            let staged_committed = match &state.staged {
+                Some(marker) => sibling_committed(store, collection, marker).await?,
+                None => false,
+            };
+            self.evidence.insert(ReaderEvidence {
+                state,
+                staged_committed,
+            })
+        };
+        Ok(Committed::new(resolve_for_reader(&raw, evidence).cloned()))
+    }
+}
+
+fn sibling_committed<'a, S: CellStore>(
+    store: &'a S,
+    collection: &'a CollectionId,
+    marker: &'a EventMarker,
+) -> impl Future<Output = Result<bool, S::Error>> + Send + 'a {
+    stream::iter(
+        marker.touched().iter().filter(move |(kind, name)| {
+            *kind != collection.state_type() || name != collection.name()
+        }),
+    )
+    .map(move |(kind, name)| {
+        cooperative(async move {
+            let sibling = CollectionId::new(collection.state_key().clone(), *kind, name.clone());
+            Ok::<_, S::Error>(
+                store
+                    .marker_state(&sibling)
+                    .await?
+                    .committed
+                    .is_some_and(|evidence| evidence.certifies(marker)),
+            )
+        })
+    })
+    .buffer_unordered(marker.touched().len().max(1))
+    .try_fold(false, |any, committed| async move { Ok(any || committed) })
 }
 
 /// Applies the admission decision to all cells that still belong to this

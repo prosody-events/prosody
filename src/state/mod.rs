@@ -105,6 +105,7 @@ pub mod publication;
 pub(crate) mod publisher;
 pub mod registry;
 pub mod resolve;
+pub(crate) mod retry;
 pub mod session;
 pub(crate) mod store;
 mod store_helpers;

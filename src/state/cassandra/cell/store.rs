@@ -3,11 +3,11 @@ use super::CellReadCounts;
 use super::{
     Arc, BatchUnit, Bytes, CassandraCellStoreError, CassandraSession, CassandraStore, Cell,
     CellAddr, CellBatchRow, CellBlobs, CellKey, CellKind, CellQueries, CellStoreError,
-    CollectionDefRegistry, CollectionId, Coordinate, EventMarker, KeyRow, MAX_BATCH_BYTES,
-    MAX_BATCH_STATEMENTS, MarkerBlob, Pk, PreparedStatement, QueryRowsResult, ResolveCellError,
-    ResolvedRow, RowShape, SHARD_FANOUT_CONCURRENCY, Scan, Section, Stream, TryStreamExt,
-    blob_weight, encode, encode_marker_payload, fetch_and_decode_cell, fetch_cell_rows_result,
-    fetch_cells_batch_result, page_cells, pin_mut, resolve_read, smallvec, try_stream,
+    CollectionDefRegistry, CollectionId, Coordinate, EventMarker, EvidenceLookup, KeyRow,
+    MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, Pk, PreparedStatement, QueryRowsResult,
+    ResolveCellError, ResolvedRow, RowShape, SHARD_FANOUT_CONCURRENCY, Scan, Section, Stream,
+    TryStreamExt, blob_weight, encode, encode_marker_payload, fetch_and_decode_cell,
+    fetch_cell_rows_result, fetch_cells_batch_result, page_cells, pin_mut, smallvec, try_stream,
 };
 
 impl CassandraStore {
@@ -159,6 +159,7 @@ impl CassandraStore {
             let pages = page_cells(&self.session, &self.queries, collection, scan);
             pin_mut!(pages);
 
+            let mut lookup = EvidenceLookup::new(self, collection);
             let mut yielded = 0usize;
             while let Some((key, raw)) = pages.try_next().await.map_err(ResolveCellError::Store)? {
                 // The limit bounds *yielded* (present) cells; check it before
@@ -167,7 +168,7 @@ impl CassandraStore {
                 if limit.is_some_and(|n| yielded >= n) {
                     break;
                 }
-                let committed = resolve_read(self, collection, raw).await?;
+                let committed = lookup.resolve(raw).await?;
                 if let Some(bytes) = committed.into_inner() {
                     yield (key, bytes);
                     yielded += 1;

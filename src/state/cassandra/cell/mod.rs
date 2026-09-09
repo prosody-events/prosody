@@ -45,7 +45,7 @@ use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Sec
 use crate::state::event_ref::EventRef;
 use crate::state::marker::{EventMarker, SectionClear, encode_marker_payload};
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::resolve::{ResolveCellError, resolve_read};
+use crate::state::resolve::{EvidenceLookup, ResolveCellError};
 use crate::state::store::{
     CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe,
     expand_to_input_order, sorted_unique_coordinates,

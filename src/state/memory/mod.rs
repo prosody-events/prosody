@@ -3,8 +3,11 @@
 use super::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::marker::{EventMarker, MarkerState, SectionClear};
-use super::resolve::{ResolveCellError, resolve_read};
-use super::store::{CellBuffer, CellStore, CoordinateBatch, provisional_point_loop};
+use super::resolve::{EvidenceLookup, ResolveCellError};
+use super::store::{
+    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe,
+    expand_to_input_order, provisional_point_loop,
+};
 use super::{CollectionId, CollectionRef};
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -14,6 +17,12 @@ use smallvec::SmallVec;
 use std::convert::Infallible;
 use std::future::{Future, ready};
 use tokio::task::coop::cooperative;
+
+#[cfg(test)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 mod cells;
 mod identity;
@@ -28,13 +37,19 @@ pub use publication::MemoryPublicationStore;
 #[derive(Clone, Debug)]
 pub struct MemoryCellStore {
     cells: MemoryCells,
+    #[cfg(test)]
+    pub(crate) marker_reads: Arc<AtomicUsize>,
 }
 
 impl MemoryCellStore {
     /// Wraps the shared durable cells.
     #[must_use]
     pub(crate) fn new(cells: MemoryCells) -> Self {
-        Self { cells }
+        Self {
+            cells,
+            #[cfg(test)]
+            marker_reads: Arc::default(),
+        }
     }
 
     /// Returns the raw cell through [`MemoryCells::read_committed_cell`].
@@ -113,7 +128,42 @@ impl CellStore for MemoryCellStore {
         collection: &'a CollectionId,
         cell: &'a CellKey,
     ) -> Result<Committed, Self::Error> {
-        resolve_read(self, collection, self.read_raw(collection, cell)).await
+        EvidenceLookup::new(self, collection)
+            .resolve(self.read_raw(collection, cell))
+            .await
+    }
+
+    async fn get_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+    ) -> Result<CommittedBatch, Self::Error> {
+        let (coordinates, indices) = dedupe(batch);
+        let mut answers = CommittedBatch::with_capacity(coordinates.len());
+        let mut lookup = EvidenceLookup::new(self, collection);
+        for coordinate in coordinates {
+            let cell = CellKey {
+                section,
+                coordinate: coordinate.clone(),
+            };
+            answers.push(cooperative(lookup.resolve(self.read_raw(collection, &cell))).await?);
+        }
+        Ok(expand_to_input_order(&indices, &answers))
+    }
+
+    async fn get_many_for_cache<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+    ) -> Result<CacheBatch, Self::Error> {
+        Ok(self
+            .get_many(collection, section, batch)
+            .await?
+            .into_iter()
+            .map(|value| (value, None))
+            .collect())
     }
 
     fn scan_cells<'a>(
@@ -143,13 +193,14 @@ impl CellStore for MemoryCellStore {
             // The resolved fast path touches no tokio leaf, so a large in-memory
             // scan would drain in one poll; a per-item `cooperative` yield point
             // fires every ~128 items.
+            let mut lookup = EvidenceLookup::new(self, collection);
             let mut yielded = 0usize;
             for (cell, stored) in raw {
                 if limit.is_some_and(|n| yielded >= n) {
                     break;
                 }
                 let committed =
-                    cooperative(async { resolve_read(self, collection, stored).await }).await?;
+                    cooperative(lookup.resolve(stored)).await?;
                 if let Some(bytes) = committed.into_inner() {
                     yield (cell, bytes);
                     yielded += 1;
@@ -259,6 +310,8 @@ impl CellStore for MemoryCellStore {
         &'a self,
         collection: &'a CollectionId,
     ) -> Result<MarkerState, Self::Error> {
+        #[cfg(test)]
+        self.marker_reads.fetch_add(1, Ordering::Relaxed);
         Ok(self
             .cells
             .markers

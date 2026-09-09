@@ -5,12 +5,12 @@ use super::read::fetch_marker_state;
 use super::{
     BatchUnit, Bytes, CacheBatch, CassandraStore, Cell, CellAddr, CellBatchRow, CellBuffer,
     CellKey, CellKind, CellStore, CellStoreError, CollectionId, CollectionRef, Committed,
-    CommittedBatch, CompactDuration, Coordinate, CoordinateBatch, EventMarker, KeyRow,
-    PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell, ProvisionalWrite, ResolveCellError, RowShape,
-    Scan, Section, SectionClear, SmallVec, Stream, bind_ttl, decode_batch_rows,
+    CommittedBatch, CompactDuration, Coordinate, CoordinateBatch, EventMarker, EvidenceLookup,
+    KeyRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell, ProvisionalWrite, ResolveCellError,
+    RowShape, Scan, Section, SectionClear, SmallVec, Stream, bind_ttl, decode_batch_rows,
     decode_cell_ttl_result, decode_provisional_batch, dedupe, encode_cell_blobs,
-    expand_to_input_order, extend_gap_units, gap_count, match_batch_rows_to_coordinates,
-    resolve_read, smallvec, sorted_unique_coordinates, ttl_seconds_to_duration, write_provisional,
+    expand_to_input_order, extend_gap_units, gap_count, match_batch_rows_to_coordinates, smallvec,
+    sorted_unique_coordinates, ttl_seconds_to_duration, write_provisional,
 };
 use super::{CassandraCellStoreError, MarkerWriteRow, encode, encode_marker_payload};
 use crate::state::marker::{MarkerRow, MarkerState};
@@ -42,7 +42,7 @@ impl CellStore for CassandraStore {
             Some(decoded) => decoded,
             None => (Cell::Resolved(Committed::new(None)), None),
         };
-        let committed = resolve_read(self, collection, raw).await?;
+        let committed = EvidenceLookup::new(self, collection).resolve(raw).await?;
         Ok((committed, ttl_seconds_to_duration(ttl)))
     }
 
@@ -76,12 +76,13 @@ impl CellStore for CassandraStore {
         let rows =
             decode_batch_rows(&rows, &unique_coordinates).map_err(ResolveCellError::Store)?;
         let mut unique_answers: CacheBatch = SmallVec::with_capacity(unique_coordinates.len());
+        let mut lookup = EvidenceLookup::new(self, collection);
         for row in rows {
             let (raw, ttl) = match row {
                 Some((cell, ttl)) => (cell, ttl),
                 None => (Cell::Resolved(Committed::new(None)), None),
             };
-            let committed = resolve_read(self, collection, raw).await?;
+            let committed = lookup.resolve(raw).await?;
             unique_answers.push((committed, ttl_seconds_to_duration(ttl)));
         }
         Ok(expand_to_input_order(&input_indices, &unique_answers))

@@ -20,7 +20,6 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::middleware::{MarkerWrite, RepinProof};
 use crate::consumer::partition::ShutdownPhase;
-use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::access::StateAccessError;
 use crate::state::backend::AdmissionChecks;
 use crate::state::cell::{Committed, ProvisionalWrite};
@@ -34,6 +33,7 @@ use crate::state::identity::{CollectionId, CollectionRef};
 use crate::state::marker::{AttemptId, EventEvidence, EventMarker, SectionClear, evidence_ttl};
 use crate::state::overlay::Overlay;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+use crate::state::retry::{StepOutcome, retry_step};
 use crate::state::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch};
 use crate::state::{
     CollectionKindId, CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY,
@@ -55,8 +55,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::coop::cooperative;
-use tokio::time::sleep;
-use tracing::warn;
+use tracing::{Level, warn};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -1539,24 +1538,17 @@ async fn resolve_collections<S: CellStore>(
     shutdown: &(impl Fn() -> bool + Sync),
 ) -> bool {
     stream::iter(collections)
-        .map(|staged| cooperative(async move {
-            loop {
-                if shutdown() {
-                    return false;
-                }
-                match store.commit_provisional(&staged.collection, &staged.marker, &staged.writes).await {
-                    Ok(()) => return true,
-                    Err(error) if error.classify_error() == ErrorCategory::Permanent => {
-                        warn!(%error, "promote failed permanently; admission must resolve the key");
-                        return false;
-                    }
-                    Err(error) => {
-                        warn!(%error, "promote failed; retry");
-                        sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        }))
+        .map(|staged| {
+            cooperative(async move {
+                matches!(
+                    retry_step(shutdown, "keyed-state promote", Level::WARN, || {
+                        store.commit_provisional(&staged.collection, &staged.marker, &staged.writes)
+                    })
+                    .await,
+                    StepOutcome::Done(())
+                )
+            })
+        })
         .buffer_unordered(STATE_FANOUT_CONCURRENCY)
         .fold(true, |all, complete| async move { all && complete })
         .await

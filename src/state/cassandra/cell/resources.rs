@@ -6,8 +6,9 @@ use super::{
     try_stream,
 };
 use crate::state::cell::{Cell, resolve_for_reader};
-use crate::state::marker::ReaderEvidence;
+use crate::state::marker::{EventMarker, ReaderEvidence};
 use futures::{StreamExt, stream};
+use std::future::Future;
 use tokio::task::coop::cooperative;
 
 impl CassandraCellResources {
@@ -24,31 +25,10 @@ impl CassandraCellResources {
         // Outside readers do not use evidence TTL; version 1 therefore decodes with
         // None.
         let state = fetch_marker_state(&self.session, &self.queries, id, None).await?;
-        let mut staged_committed = false;
-        if let Some(marker) = &state.staged {
-            let reads = stream::iter((0..marker.touched().len()).filter(|&index| {
-                let (state_type, name) = &marker.touched()[index];
-                *state_type != id.state_type() || name != id.name()
-            }))
-            .map(|index| {
-                cooperative(async move {
-                    let (state_type, name) = &marker.touched()[index];
-                    let touched =
-                        CollectionId::new(id.state_key().clone(), *state_type, name.clone());
-                    Ok::<_, CassandraCellStoreError>(
-                        fetch_marker_state(&self.session, &self.queries, &touched, None)
-                            .await?
-                            .committed
-                            .as_ref()
-                            .is_some_and(|evidence| evidence.certifies(marker)),
-                    )
-                })
-            })
-            .buffer_unordered(marker.touched().len().max(1));
-            staged_committed = reads
-                .try_fold(false, |any, committed| async move { Ok(any || committed) })
-                .await?;
-        }
+        let staged_committed = match &state.staged {
+            Some(marker) => sibling_committed(&self.session, &self.queries, id, marker).await?,
+            None => false,
+        };
         Ok(ReaderEvidence {
             state,
             staged_committed,
@@ -155,4 +135,31 @@ impl CassandraCellResources {
             }
         }
     }
+}
+
+fn sibling_committed<'a>(
+    session: &'a CassandraSession,
+    queries: &'a CellQueries,
+    id: &'a CollectionId,
+    marker: &'a EventMarker,
+) -> impl Future<Output = Result<bool, CassandraCellStoreError>> + Send + 'a {
+    stream::iter(
+        marker
+            .touched()
+            .iter()
+            .filter(move |(kind, name)| *kind != id.state_type() || name != id.name()),
+    )
+    .map(move |(kind, name)| {
+        cooperative(async move {
+            let touched = CollectionId::new(id.state_key().clone(), *kind, name.clone());
+            Ok::<_, CassandraCellStoreError>(
+                fetch_marker_state(session, queries, &touched, None)
+                    .await?
+                    .committed
+                    .is_some_and(|evidence| evidence.certifies(marker)),
+            )
+        })
+    })
+    .buffer_unordered(marker.touched().len().max(1))
+    .try_fold(false, |any, committed| async move { Ok(any || committed) })
 }

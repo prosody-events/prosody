@@ -11,7 +11,7 @@ use super::super::identity::{CollectionId, CollectionRef};
 use super::super::marker::{EventMarker, SectionClear};
 use super::super::memory::MemoryCells;
 use super::super::overlay::Overlay;
-use super::super::resolve::{resolve_event_marker, resolve_read};
+use super::super::resolve::{EvidenceLookup, resolve_event_marker};
 use super::super::store::{
     CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, provisional_point_loop,
 };
@@ -1751,7 +1751,9 @@ where
                     continue;
                 };
                 if let Some(provisional) = store.provisional_cell_at(&id, cell).await? {
-                    resolve_read(&store, collection.id(), Provisional(provisional)).await?;
+                    EvidenceLookup::new(&store, collection.id())
+                        .resolve(Provisional(provisional))
+                        .await?;
                 }
             }
         }

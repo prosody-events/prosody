@@ -126,10 +126,10 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// The default reads each unique coordinate through [`Self::get`] in
     /// first-occurrence order and expands the answer to every duplicate
     /// position; a failing coordinate fails the whole batch at its earliest
-    /// occurrence (the memory default has no whole-collection phase). The
-    /// Cassandra backend overrides it with one `IN` query. Every internal
-    /// scratch buffers use [`CellBuffer`], so small calls stay inline while a
-    /// full batch spills rather than inflating this future.
+    /// occurrence. The memory backend shares evidence across its raw reads. The
+    /// Cassandra backend overrides this method with one `IN` query. All
+    /// internal scratch buffers use [`CellBuffer`], so small calls stay
+    /// inline while a full batch spills rather than inflating this future.
     ///
     /// # Errors
     ///
@@ -165,8 +165,9 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// (**not** [`Self::get_many`] with `None` TTLs — that would silently drop
     /// a backend's TTL metadata, the `commit_provisional`-wrapper bug
     /// class) in first-occurrence order and expands the `(value, ttl)`
-    /// pair to every duplicate position. Only the Cassandra store overrides
-    /// it, sharing one prepared statement with [`Self::get_many`].
+    /// pair to every duplicate position. The Cassandra store shares one
+    /// prepared statement with [`Self::get_many`]. The memory store uses
+    /// its batch read with no TTL.
     ///
     /// # Errors
     ///

@@ -9,12 +9,11 @@
 //! Apply hooks run after the permit drops. The boundary re-pins their context
 //! so reads observe the settled state.
 
-use std::error::Error as StdError;
 use std::future::Future;
-use std::time::Duration;
 
+use crate::state::retry::{DURABILITY_RETRY_DELAY, StepOutcome, retry_step};
 use tokio::time::sleep;
-use tracing::error;
+use tracing::Level;
 
 use super::FallibleHandler;
 use crate::consumer::Uncommitted;
@@ -24,11 +23,6 @@ use crate::state::access::StateAccessError;
 use crate::state::descriptor::Registered;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{Finalized, LifecycleAccess, MessageMarker, OpPermit};
-
-/// Delay between retries of a durability step (stage / promote / dedup record)
-/// that failed transiently. Mirrors the timer commit retry cadence
-/// ([`crate::timers::uncommitted`]) and the state-manager init loop.
-const DURABILITY_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Gives the settlement boundary access to the sealed session lifecycle.
 /// Other middleware uses the narrower message-marker interface.
@@ -129,26 +123,6 @@ impl<C: EventContext> NextAttempt for C {
         // Mint site 1b (re-pin to the just-bumped epoch).
         self.redispatch(RepinProof(()))
     }
-}
-
-/// Outcome of one durability step driven by [`retry_step`].
-enum StepOutcome<R> {
-    /// The step succeeded, carrying its result.
-    Done(R),
-
-    /// The step rejected its input. The caller decides whether to continue.
-    /// A success-path dedup write retries; a rejected stage commits without
-    /// promotion.
-    Skip,
-
-    /// Shutdown: abandon the event — abort the marker and let redelivery
-    /// re-run from clean state. Reached **only** via
-    /// [`EventContext::is_shutdown`], so every downstream `abandon` is, by
-    /// construction, a shutdown abort — a transient or terminal store failure
-    /// retries forever instead (see [`retry_step`]).
-    ///
-    /// [`EventContext::is_shutdown`]: crate::consumer::event_context::TerminationSignals::is_shutdown
-    Abandon,
 }
 
 /// Settles one final result and calls one apply hook.
@@ -291,31 +265,37 @@ async fn settle_committed<'a, T, C, G>(
     };
 
     // Stage provisional cells and write resolved cells.
-    let finalized =
-        match retry_step(&context, "keyed-state finalize", || lifecycle.finalize()).await {
-            StepOutcome::Done(finalized) => finalized,
-            StepOutcome::Skip => {
-                if let Some(marker) = lifecycle.message_marker() {
-                    record_marker_best_effort(&context, lifecycle, marker).await;
-                }
-                guard.commit().await;
-                // Not a successful finalize (`finalize`'s failure paths leave
-                // the buffer whole); `discard_uncommitted` owns the
-                // permit-held / commit-now-floor contract.
-                discard_uncommitted(Some(lifecycle));
-                drop(permit);
-                fire_apply_hook(handler, context, true, result).await;
-                return;
+    let finalized = match retry_step(
+        || context.is_shutdown(),
+        "keyed-state finalize",
+        Level::ERROR,
+        || lifecycle.finalize(),
+    )
+    .await
+    {
+        StepOutcome::Done(finalized) => finalized,
+        StepOutcome::Skip => {
+            if let Some(marker) = lifecycle.message_marker() {
+                record_marker_best_effort(&context, lifecycle, marker).await;
             }
-            StepOutcome::Abandon => {
-                // Admission resolves the partial stage. Discard the overlay
-                // before the permit drops so a leaked read sees no dirty data.
-                discard_uncommitted(Some(lifecycle));
-                drop(permit);
-                abandon(handler, context, guard, result).await;
-                return;
-            }
-        };
+            guard.commit().await;
+            // Not a successful finalize (`finalize`'s failure paths leave
+            // the buffer whole); `discard_uncommitted` owns the
+            // permit-held / commit-now-floor contract.
+            discard_uncommitted(Some(lifecycle));
+            drop(permit);
+            fire_apply_hook(handler, context, true, result).await;
+            return;
+        }
+        StepOutcome::Abandon => {
+            // Admission resolves the partial stage. Discard the overlay
+            // before the permit drops so a leaked read sees no dirty data.
+            discard_uncommitted(Some(lifecycle));
+            drop(permit);
+            abandon(handler, context, guard, result).await;
+            return;
+        }
+    };
 
     // The first successful promote is the commit point.
     if let Finalized::Staged(staged) = finalized
@@ -329,9 +309,12 @@ async fn settle_committed<'a, T, C, G>(
     // Record the message identity after all promote attempts finish.
     if let Some(marker) = lifecycle.message_marker() {
         loop {
-            match retry_step(&context, "keyed-state marker record", || {
-                lifecycle.record_marker(marker, MarkerWrite(()))
-            })
+            match retry_step(
+                || context.is_shutdown(),
+                "keyed-state marker record",
+                Level::ERROR,
+                || lifecycle.record_marker(marker, MarkerWrite(())),
+            )
             .await
             {
                 StepOutcome::Done(()) => break,
@@ -431,51 +414,11 @@ async fn record_marker_best_effort<C>(context: &C, lifecycle: &C::State, marker:
 where
     C: EventContext,
 {
-    let _ = retry_step(context, "keyed-state marker record", || {
-        lifecycle.record_marker(marker, MarkerWrite(()))
-    })
+    let _ = retry_step(
+        || context.is_shutdown(),
+        "keyed-state marker record",
+        Level::ERROR,
+        || lifecycle.record_marker(marker, MarkerWrite(())),
+    )
     .await;
-}
-
-/// Retries one durability step until it succeeds or shutdown intervenes.
-/// **Transient and terminal store failures both retry forever** — a terminal
-/// store error is a broken dependency, not a process-shutdown signal, and
-/// retrying self-heals when the store recovers (a store that stays broken
-/// stalls the offset until the liveness probe restarts the process, the
-/// visible last resort). Only a **permanent** (data-rejection) failure is
-/// skipped, so the straight-line sequence can continue defensively; only
-/// shutdown abandons. Mirrors the retry-until-shutdown idiom of the timer
-/// commit loop and state-manager initialization.
-async fn retry_step<C, R, E, F, Fut>(context: &C, label: &str, mut step: F) -> StepOutcome<R>
-where
-    C: EventContext,
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<R, E>>,
-    E: ClassifyError + StdError,
-{
-    loop {
-        if context.is_shutdown() {
-            return StepOutcome::Abandon;
-        }
-        match step().await {
-            Ok(value) => return StepOutcome::Done(value),
-            Err(error) => match error.classify_error() {
-                // Retry forever, not just on Transient: a Terminal store error
-                // is a broken dependency, not a process-shutdown signal.
-                // Retrying self-heals the instant the store recovers; a store
-                // that stays broken stalls the offset until the liveness probe
-                // restarts the process — a visible last resort, strictly better
-                // than silently abandoning the event here. `abandon` is
-                // reserved for genuine shutdown, caught at the top of the loop.
-                ErrorCategory::Transient | ErrorCategory::Terminal => {
-                    error!(label, error = %error, "durability step failed; retrying");
-                    sleep(DURABILITY_RETRY_DELAY).await;
-                }
-                ErrorCategory::Permanent => {
-                    error!(label, error = %error, "durability step failed permanently; skipping");
-                    return StepOutcome::Skip;
-                }
-            },
-        }
-    }
 }

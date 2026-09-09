@@ -7,6 +7,7 @@ use crate::state::marker::MarkerState;
 pub(crate) struct CountingCellStore<S> {
     inner: S,
     counts: Arc<OpCounts>,
+    marker_counts: Arc<[(CollectionId, AtomicUsize)]>,
 }
 
 #[derive(Default)]
@@ -30,7 +31,24 @@ impl<S> CountingCellStore<S> {
         Self {
             inner,
             counts: Arc::new(OpCounts::default()),
+            marker_counts: Arc::default(),
         }
+    }
+
+    /// Counts each marker in a fixed collection set for this test.
+    pub(crate) fn with_marker_counts(mut self, collections: &[CollectionRef]) -> Self {
+        self.marker_counts = collections
+            .iter()
+            .map(|collection| (collection.id().clone(), AtomicUsize::new(0)))
+            .collect();
+        self
+    }
+
+    pub(crate) fn marker_reads_for(&self, collection: &CollectionId) -> usize {
+        self.marker_counts
+            .iter()
+            .find(|(id, _)| id == collection)
+            .map_or(0, |(_, count)| count.load(Ordering::Relaxed))
     }
 
     pub(crate) fn durable_writes(&self) -> usize {
@@ -74,6 +92,9 @@ impl<S> CountingCellStore<S> {
     }
 
     pub(crate) fn reset(&self) {
+        for (_, count) in self.marker_counts.iter() {
+            count.store(0, Ordering::Relaxed);
+        }
         self.counts.write_provisional.store(0, Ordering::Relaxed);
         self.counts.write_resolved.store(0, Ordering::Relaxed);
         self.counts.mark_resolved.store(0, Ordering::Relaxed);
@@ -192,6 +213,9 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
         collection: &'a CollectionId,
     ) -> Result<MarkerState, Self::Error> {
         self.counts.marker_state.fetch_add(1, Ordering::Relaxed);
+        if let Some((_, count)) = self.marker_counts.iter().find(|(id, _)| id == collection) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
         self.inner.marker_state(collection).await
     }
 
