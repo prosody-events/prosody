@@ -578,9 +578,9 @@ pub fn memory_store(segment: Segment) -> TableAdapter<InMemoryTriggerStore> {
 /// across partition (re)acquisitions observe the same rows — mirroring
 /// [`MemoryDeduplicationStoreProvider`]. A fresh store per call would make
 /// every "durable" row vanish with the store that wrote it. All maps are
-/// keyed by [`SegmentId`], so sharing across segments cannot collide. (The
-/// state manager does not create stores here — it receives a clone
-/// of the partition's store handle.)
+/// keyed by [`SegmentId`], so sharing across segments cannot collide. The
+/// state manager does not create stores here. It receives a clone of the
+/// partition's store handle.
 ///
 /// [`MemoryDeduplicationStoreProvider`]:
 ///     crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStoreProvider

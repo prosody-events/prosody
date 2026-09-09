@@ -112,9 +112,9 @@ impl FjallClient {
 
     /// Mints a fresh per-Kafka-partition workspace.
     ///
-    /// Opens two named Fjall keyspaces — `cache` (committed-value mirror) and
-    /// `index` (the admission checks) —
-    /// sharing one fresh UUID (v4). **A workspace's keyspaces are born cold**:
+    /// Opens two named Fjall keyspaces that share one fresh UUID (v4):
+    /// `cache` holds the committed-value mirror, and `index` holds the
+    /// admission checks. **A workspace's keyspaces are born cold**:
     /// their names are minted fresh per assignment and never derived from
     /// anything, so no workspace can ever open another assignment's data.
     /// Both are dropped together at revocation.
