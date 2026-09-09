@@ -86,7 +86,7 @@ impl CollectionDefRegistry {
     ) -> Result<(), RegisterStateError> {
         let name = StateName::try_new(name)?;
         if let Some(ttl) = def.ttl
-            && i64::from(ttl.seconds()) > MAX_CASSANDRA_TTL_SECS
+            && (ttl.is_zero() || i64::from(ttl.seconds()) > MAX_CASSANDRA_TTL_SECS)
         {
             return Err(RegisterStateError::Ttl {
                 name,
@@ -205,19 +205,6 @@ impl CollectionDefRegistry {
         self.def_for(state_type, name).commit_mode
     }
 
-    /// Returns the recovery-convergence bound declared for `(state_type,
-    /// name)`, or `None` for a name with no bound (or not in the registry).
-    /// The durability boundary folds this against the `recovery_delay`
-    /// floor, so `None` means "use the floor"; see [`CollectionDef`].
-    #[must_use]
-    pub(crate) fn recovery_within_for(
-        &self,
-        state_type: StateType,
-        name: &StateName,
-    ) -> Option<CompactDuration> {
-        self.def_for(state_type, name).recovery_within
-    }
-
     fn lookup_collection(
         &self,
         state_type: StateType,
@@ -235,38 +222,17 @@ pub enum RegisterStateError {
     #[error(transparent)]
     Name(#[from] StateNameError),
 
-    /// The collection's TTL exceeds Cassandra's `USING TTL` ceiling. Rejecting
-    /// it, rather than silently collapsing to "no TTL", avoids turning "expire
-    /// in 25 years" into "persist forever".
+    /// The collection TTL must bind from 1 through 630,720,000 seconds.
+    /// Use `None` for no expiry.
     #[error(
-        "state collection {name:?} TTL {seconds} seconds exceeds Cassandra maximum of 630,720,000 \
-         seconds"
+        "state collection {name:?} TTL {seconds} seconds is outside 1 through 630,720,000 seconds"
     )]
     Ttl {
-        /// Collection name whose TTL is over the ceiling.
+        /// Collection name whose TTL is outside the valid range.
         name: StateName,
 
         /// The offending TTL, in seconds.
         seconds: u32,
-    },
-
-    /// The collection's TTL does not strictly exceed the keyed-state
-    /// `recovery_delay`. A provisional cell carries this TTL, so if the cell
-    /// could expire before the `StateRecovery` sweep resolves it, a committed
-    /// write would be lost. Indefinite retention (`None`) always passes.
-    #[error(
-        "state collection {name:?} TTL {ttl_seconds} seconds must exceed the keyed-state recovery \
-         delay of {recovery_seconds} seconds, or a provisional cell could expire before recovery"
-    )]
-    TtlBelowRecoveryDelay {
-        /// Collection name whose TTL is at or below the recovery delay.
-        name: StateName,
-
-        /// The offending TTL, in seconds.
-        ttl_seconds: u32,
-
-        /// The configured recovery delay, in seconds.
-        recovery_seconds: u32,
     },
 
     /// The collection's Map keyset limit exceeds the maximum of `4096`, which

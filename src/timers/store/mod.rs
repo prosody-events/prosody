@@ -55,9 +55,10 @@ pub mod adapter;
 /// Comprehensive test suite for [`TriggerStore`] implementations.
 pub mod tests;
 
-/// Segment schema version.
+/// Durable layout of the partition stores: timers and keyed-state markers.
 ///
-/// Determines which Cassandra table schema is used for storing triggers.
+/// Unknown versions prevent acquisition. The V4 fence keeps one commit rule
+/// per partition.
 /// - V1: Legacy schema without `timer_type` field
 /// - V2: Schema with `timer_type` field; `state` MAP may be absent for
 ///   pre-migration keys (ambiguous: 0 timers or clustering-only data)
@@ -72,6 +73,8 @@ pub enum SegmentVersion {
     V2 = 2,
     /// V3 schema: all keys have state entries backfilled; NULL = new key.
     V3 = 3,
+    /// Collection promotes commit events. No operation arms `StateRecovery`.
+    V4 = 4,
 }
 
 impl From<SegmentVersion> for i8 {
@@ -88,6 +91,7 @@ impl TryFrom<i8> for SegmentVersion {
             1 => Ok(Self::V1),
             2 => Ok(Self::V2),
             3 => Ok(Self::V3),
+            4 => Ok(Self::V4),
             _ => Err(InvalidSegmentVersionError(value)),
         }
     }
@@ -102,7 +106,7 @@ impl fmt::Display for InvalidSegmentVersionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Invalid segment version: {}. Expected 1 (V1), 2 (V2), or 3 (V3)",
+            "Invalid segment version: {}. Expected 1 (V1), 2 (V2), 3 (V3), or 4 (V4)",
             self.0
         )
     }
@@ -114,7 +118,7 @@ impl ClassifyError for InvalidSegmentVersionError {
     fn classify_error(&self) -> ErrorCategory {
         // Invalid segment version value (not 1, 2, or 3). Indicates data corruption or
         // incompatible schema version in database. Not recoverable by retry.
-        ErrorCategory::Permanent
+        ErrorCategory::Terminal
     }
 }
 
@@ -181,12 +185,10 @@ pub struct Segment {
 
 impl Segment {
     /// Canonical per-Kafka-partition segment: id derived from
-    /// `{group}:{topic}/{partition}`, schema V3.
+    /// `{group}:{topic}/{partition}`, layout V4.
     ///
-    /// Single source of the formula; the partition loop calls it once per
-    /// acquisition, and the keyed-state commit oracle shares the resulting
-    /// segment by holding a clone of the same store handle (never by
-    /// re-deriving the id).
+    /// The partition loop creates this segment once at acquisition.
+    /// State admission receives the resulting trigger store.
     #[must_use]
     pub fn for_partition(
         group_id: &str,
@@ -199,7 +201,7 @@ impl Segment {
             id: Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()),
             name,
             slab_size,
-            version: SegmentVersion::V3,
+            version: SegmentVersion::V4,
         }
     }
 }
@@ -361,6 +363,12 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     fn add_trigger(&self, trigger: Trigger)
     -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Rewrites the slab row from the authoritative key row during retirement.
+    fn insert_slab_trigger(
+        &self,
+        trigger: Trigger,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
     /// Removes a trigger from both slab and key tables.
     fn remove_trigger(
         &self,
@@ -388,15 +396,14 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // ===================================================================
-    // Tag Operations (2 methods) - Used by TimerManager commit oracle
+    // Timer identity reads and updates
     // ===================================================================
 
     /// Updates the `tag` on both persisted timer indices.
     ///
     /// No-op if the row is absent. Used by
     /// `complete()`-from-`FiringRescheduled` to rotate the tag so the
-    /// commit oracle can detect the round-trip after in-memory operation and
-    /// after slab reloads.
+    /// completed attempt and its queued replacement have distinct identities.
     fn update_tag(
         &self,
         key: &Key,
@@ -405,22 +412,28 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         new_tag: i32,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Reads the `tag` from a key-index row.
-    ///
-    /// Returns `None` if the row is absent (commit oracle: "committed").
-    /// Returns `Some(0)` for rows with a `NULL` tag (pre-migration rows).
-    ///
-    /// **Contract: the answer must reflect every write performed through
-    /// this store and its clones.** The keyed-state commit oracle holds a
-    /// clone of the partition's writing store (handle passing — see
-    /// `StateBackendFactory::for_partition`),
-    /// so a per-instance cache is fine as long as clones share it; a stale
-    /// answer flips a recovery decision (rolling back a committed write, or
-    /// promoting an abandoned one).
+    /// Reads the authoritative trigger from the key index.
+    /// Returns None when the row is absent. Legacy null tags decode as zero.
+    /// Clones must share cached state so admission observes every prior write.
+    fn current_trigger(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> impl Future<Output = Result<Option<Trigger>, Self::Error>> + Send;
+
+    /// Reads the tag of the current key row.
     fn current_tag(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> impl Future<Output = Result<Option<i32>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Option<i32>, Self::Error>> + Send {
+        async move {
+            Ok(self
+                .current_trigger(key, time, timer_type)
+                .await?
+                .map(|trigger| trigger.tag))
+        }
+    }
 }

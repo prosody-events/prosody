@@ -79,6 +79,8 @@ pub(super) enum CommandOperation {
     Add,
     /// Remove a trigger from both `DelayQueue` and `ActiveTriggers`.
     Remove,
+    /// Remove the coordinate only if no replacement tag stands.
+    RetireCommitted,
     /// Add a trigger to the `DelayQueue` only (used when the caller has
     /// already transitioned `ActiveTriggers` to `FiringRescheduled`).
     AddToQueue,
@@ -151,6 +153,15 @@ where
     /// Unschedule a previously scheduled [`Trigger`].
     pub async fn unschedule(&self, trigger: Trigger) -> Result<(), TimerSchedulerError<E>> {
         self.send_command(CommandOperation::Remove, trigger).await
+    }
+
+    /// Removes a committed attempt and preserves a replacement tag.
+    pub(crate) async fn retire_committed(
+        &self,
+        trigger: Trigger,
+    ) -> Result<(), TimerSchedulerError<E>> {
+        self.send_command(CommandOperation::RetireCommitted, trigger)
+            .await
     }
 
     /// Add a trigger to the `DelayQueue` without modifying `ActiveTriggers`.
@@ -252,3 +263,6 @@ where
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod admission_tests;

@@ -185,6 +185,12 @@ where
         Ok(())
     }
 
+    async fn insert_slab_trigger(&self, trigger: Trigger) -> Result<(), Self::Error> {
+        self.operations
+            .insert_slab_trigger(Slab::from_time(self.slab_size(), trigger.time), trigger)
+            .await
+    }
+
     #[instrument(level = "debug", skip(self), err)]
     async fn remove_trigger(
         &self,
@@ -214,13 +220,13 @@ where
             .await
     }
 
-    async fn current_tag(
+    async fn current_trigger(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> Result<Option<i32>, Self::Error> {
-        self.operations.current_tag(key, time, timer_type).await
+    ) -> Result<Option<Trigger>, Self::Error> {
+        self.operations.current_trigger(key, time, timer_type).await
     }
 
     #[instrument(level = "debug", skip(self, trigger), err)]

@@ -2,26 +2,21 @@
 use super::Ordering;
 use super::batch::marker_delete_unit;
 use super::read::fetch_marker_state;
-use super::rows::CommittedWriteRow;
 use super::{
     BatchUnit, Bytes, CacheBatch, CassandraStore, Cell, CellAddr, CellBatchRow, CellBuffer,
-    CellKey, CellKind, CellStore, CellStoreError, CollectionId, CollectionRef, CommitOracle,
-    Committed, CommittedBatch, CompactDuration, Coordinate, CoordinateBatch, EventMarker, EventRef,
-    KeyRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell, ProvisionalWrite, ReadPreparation,
-    ResolveCellError, RowShape, Scan, Section, SectionClear, SmallVec, Stream, bind_ttl,
-    decode_batch_rows, decode_cell_ttl_result, decode_provisional_batch, dedupe, encode_cell_blobs,
-    expand_to_input_order, extend_gap_units, flatten_resolve, gap_count,
-    match_batch_rows_to_coordinates, resolve_prior_clear_before_read, resolve_read,
-    resolve_unsettled_clear_before_write, section_batches, smallvec, sorted_unique_coordinates,
-    try_stream, ttl_seconds_to_duration, write_provisional,
+    CellKey, CellKind, CellStore, CellStoreError, CollectionId, CollectionRef, Committed,
+    CommittedBatch, CompactDuration, Coordinate, CoordinateBatch, EventMarker, EventRef, KeyRow,
+    PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell, ProvisionalWrite, ResolveCellError, RowShape,
+    Scan, Section, SectionClear, SmallVec, Stream, bind_ttl, decode_batch_rows,
+    decode_cell_ttl_result, decode_provisional_batch, dedupe, encode_cell_blobs,
+    expand_to_input_order, extend_gap_units, gap_count, match_batch_rows_to_coordinates,
+    resolve_read, smallvec, sorted_unique_coordinates, ttl_seconds_to_duration, write_provisional,
 };
+use super::{CassandraCellStoreError, MarkerWriteRow, encode, encode_marker_payload};
 use crate::state::marker::{MarkerRow, MarkerState};
 
-impl<O> CellStore for CassandraStore<O>
-where
-    O: CommitOracle,
-{
-    type Error = CellStoreError<O::Error>;
+impl CellStore for CassandraStore {
+    type Error = CellStoreError;
 
     async fn get<'a>(
         &'a self,
@@ -41,45 +36,15 @@ where
         cell: &'a CellKey,
         own: EventRef,
     ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
-        let collection_ref = self.resolver.collection_ref(collection);
-        // Read the cell and marker at the same time.
-        // Read the cell again if a prior clear changes durable state.
-        let (row, marker) = futures::join!(
-            self.point_read_cell_result(&self.queries.read_cell_ttl, collection, cell),
-            self.unsettled_marker(collection),
-        );
-        let mut row = row.map_err(ResolveCellError::Store)?;
-        let marker = marker?;
-        if resolve_prior_clear_before_read(
-            self,
-            self.resolver.oracle(),
-            &collection_ref,
-            marker.as_ref(),
-            own,
-        )
-        .await
-        .map_err(flatten_resolve)?
-            == ReadPreparation::DurableStateChanged
-        {
-            row = self
-                .point_read_cell_result(&self.queries.read_cell_ttl, collection, cell)
-                .await
-                .map_err(ResolveCellError::Store)?;
-        }
+        let row = self
+            .point_read_cell_result(&self.queries.read_cell_ttl, collection, cell)
+            .await
+            .map_err(ResolveCellError::Store)?;
         let (raw, ttl) = match decode_cell_ttl_result(&row).map_err(ResolveCellError::Store)? {
             Some(decoded) => decoded,
             None => (Cell::Resolved(Committed::new(None)), None),
         };
-        let committed = resolve_read(
-            self,
-            self.resolver.oracle(),
-            &collection_ref,
-            cell,
-            own,
-            raw,
-        )
-        .await
-        .map_err(flatten_resolve)?;
+        let committed = resolve_read(self, collection, own, raw).await?;
         Ok((committed, ttl_seconds_to_duration(ttl)))
     }
 
@@ -107,54 +72,20 @@ where
         batch: &'a CoordinateBatch,
         own: EventRef,
     ) -> Result<CacheBatch, Self::Error> {
-        let collection_ref = self.resolver.collection_ref(collection);
         let (unique_coordinates, input_indices) = dedupe(batch);
-        // Read the cells and marker at the same time.
-        // Read all cells again if a prior clear changes durable state.
-        let (rows, marker) = futures::join!(
-            self.batch_read_result(collection, section, &unique_coordinates),
-            self.unsettled_marker(collection),
-        );
-        let mut rows = rows.map_err(ResolveCellError::Store)?;
-        let marker = marker?;
-        if resolve_prior_clear_before_read(
-            self,
-            self.resolver.oracle(),
-            &collection_ref,
-            marker.as_ref(),
-            own,
-        )
-        .await
-        .map_err(flatten_resolve)?
-            == ReadPreparation::DurableStateChanged
-        {
-            rows = self
-                .batch_read_result(collection, section, &unique_coordinates)
-                .await
-                .map_err(ResolveCellError::Store)?;
-        }
+        let rows = self
+            .batch_read_result(collection, section, &unique_coordinates)
+            .await
+            .map_err(ResolveCellError::Store)?;
         let rows =
             decode_batch_rows(&rows, &unique_coordinates).map_err(ResolveCellError::Store)?;
         let mut unique_answers: CacheBatch = SmallVec::with_capacity(unique_coordinates.len());
-        for (&coordinate, row) in unique_coordinates.iter().zip(rows) {
-            let cell = CellKey {
-                section,
-                coordinate: Coordinate::clone(coordinate),
-            };
+        for row in rows {
             let (raw, ttl) = match row {
                 Some((cell, ttl)) => (cell, ttl),
                 None => (Cell::Resolved(Committed::new(None)), None),
             };
-            let committed = resolve_read(
-                self,
-                self.resolver.oracle(),
-                &collection_ref,
-                &cell,
-                own,
-                raw,
-            )
-            .await
-            .map_err(flatten_resolve)?;
+            let committed = resolve_read(self, collection, own, raw).await?;
             unique_answers.push((committed, ttl_seconds_to_duration(ttl)));
         }
         Ok(expand_to_input_order(&input_indices, &unique_answers))
@@ -167,38 +98,6 @@ where
         own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         self.scan_inner(collection, scan, own)
-    }
-
-    fn provisional_cells<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
-        try_stream! {
-            // The event marker lists each staged coordinate.
-            // Recovery reads only those coordinates.
-            let Some(marker) = self.unsettled_marker(collection).await? else {
-                return;
-            };
-
-            // Rebuild each listed coordinate's `ProvisionalCell` through one
-            // raw `IN` query per per-section `<=CELL_BATCH` chunk (the section
-            // is reattached to each survivor, since coordinates repeat across
-            // sections). A listed coordinate whose row is absent (cell and
-            // marker share one TTL) or already resolved (first-touch or a
-            // concurrent resolve) is dropped by `provisional_many` — the
-            // marker's over-report is safe. Sub-batches run sequentially: real
-            // `IN`-query I/O leaves drive the coop budget.
-            for (section, batch) in section_batches(marker.staged()) {
-                // `Box::pin` keeps the large per-chunk batch-read future off
-                // this generator's state so it stays small across the yield
-                // (bounded per-chunk alloc on a cold recovery path).
-                let survivors =
-                    Box::pin(self.provisional_many(collection, section, &batch)).await?;
-                for (coordinate, provisional) in survivors {
-                    yield (CellKey { section, coordinate }, provisional);
-                }
-            }
-        }
     }
 
     async fn provisional_cell_at<'a>(
@@ -239,8 +138,8 @@ where
         // This survivor-only output needs no expansion to the input order.
         let unique_coordinates = sorted_unique_coordinates(batch);
         // One IN query, reusing the TTL-bearing batch read; TTL is discarded in
-        // the decoder. Never consults the oracle, never resolves, never writes —
-        // no prior-clear marker resolve, exactly as `provisional_cell_at`.
+        // the decoder. This read neither resolves cells nor writes state.
+        // It leaves marker state unchanged, as `provisional_cell_at` does.
         let result = self
             .batch_read_result(collection, section, &unique_coordinates)
             .await
@@ -265,17 +164,6 @@ where
         cells: &'a [(CellKey, Option<Bytes>)],
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        // Resolve an unsettled section clear before this write.
-        // The clear cannot remove a value that this write adds.
-        let marker = self.unsettled_marker(collection.id()).await?;
-        resolve_unsettled_clear_before_write(
-            self,
-            self.resolver.oracle(),
-            collection,
-            marker.as_ref(),
-        )
-        .await
-        .map_err(flatten_resolve)?;
         // Survivors are the present-data `cells`, excluded from the gaps
         // positionally, so every batch row stays disjoint and may be packed
         // independently.
@@ -339,33 +227,11 @@ where
             &self.session,
             &self.queries,
             collection,
-            self.resolver.collection_ref(collection).ttl(),
+            self.registry
+                .ttl_for(collection.state_type(), collection.name()),
         )
         .await
         .map_err(ResolveCellError::Store)
-    }
-
-    async fn unsettled_marker<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-    ) -> Result<Option<EventMarker>, Self::Error> {
-        // A completed check makes the memory map authoritative.
-        if self.memo.checks.contains(collection).await {
-            return Ok(self
-                .memo
-                .unsettled
-                .read_async(collection, |_, marker| marker.clone())
-                .await);
-        }
-        let marker = self.marker_state(collection).await?.staged;
-        if let Some(marker) = &marker {
-            self.memo
-                .unsettled
-                .upsert_async(collection.clone(), marker.clone())
-                .await;
-        }
-        self.memo.checks.set(collection).await;
-        Ok(marker)
     }
 
     async fn commit_provisional<'a>(
@@ -374,6 +240,12 @@ where
         marker: &'a EventMarker,
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
+        let payload = encode_marker_payload(&marker.committed_payload())
+            .map_err(CassandraCellStoreError::from)
+            .map_err(ResolveCellError::Store)?;
+        let payload = encode(&payload)
+            .map_err(CassandraCellStoreError::from)
+            .map_err(ResolveCellError::Store)?;
         let clears = marker.clears();
         // Commit applies natively — present data promotes in place, a staged
         // clear deletes its row (the row-absence invariant).
@@ -404,11 +276,13 @@ where
         }));
         extend_gap_units(&mut units, &self.queries, pk, clears);
         let evidence = BatchUnit::new(
-            PER_STATEMENT_OVERHEAD,
+            payload.as_ref().len() as u64 + PER_STATEMENT_OVERHEAD,
             smallvec![CellBatchRow {
                 statement: &self.queries.committed_write,
-                row: RowShape::CommittedWrite(CommittedWriteRow {
+                row: RowShape::MarkerWrite(MarkerWriteRow {
                     ttl: bind_ttl(marker.evidence_ttl()),
+                    payload: payload.as_ref(),
+                    encoding: payload.encoding(),
                     event: marker.event(),
                     addr: CellAddr::marker(pk, MarkerRow::Committed),
                 }),
@@ -416,7 +290,6 @@ where
         );
         self.issue_markers(Some(evidence), units, marker_delete_unit(pk, &self.queries))
             .await?;
-        self.record_marker_settled(collection.id()).await;
         Ok(())
     }
 
@@ -447,7 +320,6 @@ where
         units.extend(self.resolved_units(pk, ttl, &blobs, &cells));
         self.issue_markers(None, units, marker_delete_unit(pk, &self.queries))
             .await?;
-        self.record_marker_settled(collection.id()).await;
         Ok(())
     }
 }

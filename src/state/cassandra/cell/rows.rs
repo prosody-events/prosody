@@ -121,10 +121,8 @@ pub(super) enum RowShape<'a> {
     /// Write a resolved value (`kind=Cell`): committed `data` +
     /// encoding/version, nulling `prev_data`/`event`.
     Resolved(ResolvedRow<'a>),
-    /// Writes Staged with the collection TTL.
+    /// Writes either marker with its selected TTL.
     MarkerWrite(MarkerWriteRow<'a>),
-    /// Writes the Committed event with the evidence TTL.
-    CommittedWrite(CommittedWriteRow<'a>),
     /// Key columns only, binding the carried [`CellKind`]: a cell promote
     /// (`kind=Cell`, nulling `prev_data`/`event` while keeping `data` and its
     /// TTL), a `cell_delete` (`kind=Cell`), or a `marker_delete`
@@ -202,11 +200,4 @@ pub(super) struct GapBetweenRow<'a> {
     pub(super) section: i8,
     pub(super) low: &'a [u8],
     pub(super) high: &'a [u8],
-}
-
-/// The evidence bind shape. Its TTL comes from `bind_ttl`.
-pub(super) struct CommittedWriteRow<'a> {
-    pub(super) ttl: i32,
-    pub(super) event: EventRef,
-    pub(super) addr: CellAddr<'a>,
 }

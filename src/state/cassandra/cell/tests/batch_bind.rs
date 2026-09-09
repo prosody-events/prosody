@@ -1,4 +1,5 @@
 use super::*;
+use crate::state::marker::AttemptId;
 
 /// Positional binding-order proof (the one silent-failure surface):
 /// `scylla::Batch` binds its statement list 1:1 with the value list, and on a
@@ -23,7 +24,7 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default())?;
+    let store = fx.bottom_store();
     let c = collection("mixed-batch")?;
     let id = c.id().clone();
 
@@ -44,7 +45,15 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
         cell_b.clone(),
         ProvisionalWrite::new(Some(data_b.clone()), Committed::new(None), event(1)),
     )];
-    let marker_b = EventMarker::frozen(event(1), &writes_b, &[], &[].into(), None);
+    let marker_b = EventMarker::frozen(
+        event(1),
+        &writes_b,
+        &[],
+        &[].into(),
+        None,
+        None,
+        AttemptId::new(),
+    );
     store
         .write_provisional(&c, &writes_b, Some(&marker_b))
         .await?;
@@ -68,6 +77,8 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
         &[],
         &[].into(),
         None,
+        None,
+        AttemptId::new(),
     ))?;
     let payload = encode(&marker_payload)?;
     let marker_blob = MarkerBlob {
@@ -94,14 +105,11 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     // columns). B was promoted out of the provisional set by the key-only
     // promote row.
     //
-    let reader = fx.bottom_store(ScriptedOracle::default())?;
+    let reader = fx.bottom_store();
     let staged = provisional_cells(&reader, &id).await?;
-    assert_eq!(staged.len(), 1, "only A stays provisional: {staged:?}");
-    let (key, prov) = staged
-        .into_iter()
-        .next()
-        .ok_or_else(|| eyre!("expected A provisional"))?;
-    assert_eq!(key, cell_a);
+    assert_eq!(staged.len(), 1);
+    let (key, prov) = &staged[0];
+    assert_eq!(key, &cell_a);
     assert_eq!(prov.data(), Some(&data_a));
 
     // B promoted to its own payload (the key-only promote row bound its
@@ -128,7 +136,7 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     fx.cassandra
         .execute_unlogged_batches(&delete, 1 << 20, 4_096, SHARD_FANOUT_CONCURRENCY)
         .await?;
-    let reader = fx.bottom_store(ScriptedOracle::default())?;
+    let reader = fx.bottom_store();
     assert!(
         provisional_cells(&reader, &id).await?.is_empty(),
         "marker_delete removed the marker row, so cold recovery lists nothing"

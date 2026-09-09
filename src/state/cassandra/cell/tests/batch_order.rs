@@ -67,39 +67,48 @@ fn prop_marker_batch_phases() {
             .chain(weights.iter().map(|&w| u64::from(w)))
             .map(unit)
             .collect();
-        let phases = stage_batches(&stage, u64::from(max_bytes), usize::from(max_count));
-        let observed: Vec<Vec<u64>> = phases
-            .iter()
-            .filter(|phase| !phase.is_empty())
-            .map(|phase| stage[phase.clone()].iter().map(BatchUnit::weight).collect())
-            .collect();
-        if stage.len() <= usize::from(max_count)
-            && stage.iter().map(BatchUnit::weight).sum::<u64>() <= u64::from(max_bytes)
-        {
-            observed == vec![stage.iter().map(BatchUnit::weight).collect::<Vec<_>>()]
-        } else {
-            let mut expected = vec![vec![19]];
-            if !weights.is_empty() {
-                expected.push(weights.iter().map(|&w| u64::from(w)).collect());
+        let chunks: Vec<_> =
+            stage_batches(&stage, u64::from(max_bytes), usize::from(max_count)).collect();
+        let mut observed = Vec::with_capacity(weights.len());
+        for chunk in &chunks {
+            if chunk.start == 0 || chunk.end > stage.len() {
+                return false;
             }
-            expected.push(vec![19]);
-            observed == expected
+            let bound: Vec<_> = super::super::batch::stage_chunk(&stage, chunk.clone())
+                .map(BatchUnit::weight)
+                .collect();
+            if bound.first() != Some(&19) || bound.len() != chunk.len() + 1 {
+                return false;
+            }
+            let count = chunk.len() + 1;
+            let bytes = 19
+                + stage[chunk.clone()]
+                    .iter()
+                    .map(BatchUnit::weight)
+                    .sum::<u64>();
+            // A single oversized cell still needs one atomic marker-and-cell mutation.
+            if chunk.len() > 1 && (count > usize::from(max_count) || bytes > u64::from(max_bytes)) {
+                return false;
+            }
+            observed.extend(stage[chunk.clone()].iter().map(BatchUnit::weight));
         }
+        !chunks.is_empty() && observed == weights.into_iter().map(u64::from).collect::<Vec<_>>()
     }
+    assert!(prop(vec![0, 0], false, 0, 3));
     QuickCheck::new().quickcheck(prop as fn(Vec<u16>, bool, u16, u8) -> bool);
 }
 
-/// A raw provisional cell without its recovery marker is invisible to the
-/// sweep, while a point read still repairs it through the commit oracle.
+/// Admission cannot discover a provisional cell without a Staged row.
+/// The owner reads its committed base and leaves the physical cell unchanged.
 #[tokio::test]
-async fn markerless_provisional_is_sweep_invisible_but_first_touch_repairs() -> Result<()> {
+async fn markerless_provisional_reads_its_committed_base() -> Result<()> {
     use super::{Pk, blob_weight};
     use smallvec::smallvec;
 
     init_test_logging();
     let fx = fixture().await?;
-    let oracle = ScriptedOracle::default();
-    let store = fx.bottom_store(oracle.clone())?;
+    let dedup = MemoryDeduplicationStore::default();
+    let store = fx.bottom_store();
     let c = collection("markerless-orphan")?;
     let cell = value_cell();
     let data = Bytes::from_static(b"committed-after-crash");
@@ -123,22 +132,22 @@ async fn markerless_provisional_is_sweep_invisible_but_first_touch_repairs() -> 
     fx.cassandra
         .execute_unlogged_batches(&unit, 1 << 20, 4_096, SHARD_FANOUT_CONCURRENCY)
         .await?;
-    oracle.record_message(Uuid::from_u128(0xA11CE)).await?;
+    dedup.insert(Uuid::from_u128(0xA11CE)).await?;
 
-    assert!(store.unsettled_marker(c.id()).await?.is_none());
+    assert!(store.marker_state(c.id()).await?.staged.is_none());
     assert!(
-        sweep_provisional(&store, &oracle, &c).await?,
-        "a markerless sweep sees no work"
+        admit_collection(&store, &dedup, &c).await?,
+        "admission sees no Staged row"
     );
     assert!(
         store.provisional_cell_at(c.id(), &cell).await?.is_some(),
-        "the sweep left the unlisted provisional cell untouched"
+        "admission left the unlisted provisional cell untouched"
     );
     assert_eq!(
         store.get(c.id(), &cell, event(2)).await?,
-        Committed::new(Some(data)),
-        "first-touch resolves the orphan through the commit oracle"
+        Committed::new(None),
+        "a markerless legacy cell reads its committed base"
     );
-    assert!(store.provisional_cell_at(c.id(), &cell).await?.is_none());
+    assert!(store.provisional_cell_at(c.id(), &cell).await?.is_some());
     Ok(())
 }

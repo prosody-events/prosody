@@ -20,6 +20,9 @@ use crate::Key;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::ClassifyError;
 use crate::heartbeat::HeartbeatRegistry;
+use crate::state::TimerEventRef;
+#[cfg(test)]
+use crate::telemetry::Telemetry;
 use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::timers::active::{
     Announce, MemoryEffects, QueueEffect, StoreEffect, TimerOp, TimerSnapshot, TimerState,
@@ -533,6 +536,70 @@ where
                 self.0.source.clone(),
             ),
             None => {}
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_scheduler(store: T, scheduler: TriggerScheduler<T::Error>) -> Self {
+        Self(Arc::new(TimerManagerInner {
+            store,
+            scheduler,
+            telemetry: Telemetry::new().partition_sender(crate::Topic::from("admission"), 0),
+            source: Arc::from("admission"),
+        }))
+    }
+
+    /// Reads the durable tag for legacy residue and source retirement.
+    pub(crate) async fn current_timer_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<Option<i32>, TimerManagerError<T::Error>> {
+        self.0
+            .store
+            .current_tag(key, time, timer_type)
+            .await
+            .map_err(TimerManagerError::Store)
+    }
+
+    /// Retires a committed attempt and preserves the key row's replacement.
+    /// Write both deletes or the slab repair before the scheduler acknowledges
+    /// the command. The actor's serial loop corrects earlier loads; later
+    /// loads read the repaired state.
+    pub(crate) async fn retire_committed(
+        &self,
+        key: &Key,
+        timer: TimerEventRef,
+    ) -> Result<(), TimerManagerError<T::Error>> {
+        let current = self
+            .0
+            .store
+            .current_trigger(key, timer.time, timer.timer_type)
+            .await
+            .map_err(TimerManagerError::Store)?;
+        if let Some(replacement) = current.filter(|trigger| trigger.tag != timer.tag) {
+            self.0
+                .store
+                .insert_slab_trigger(replacement.clone())
+                .await
+                .map_err(TimerManagerError::Store)?;
+            self.0.scheduler.schedule(replacement).await?;
+        } else {
+            self.0
+                .store
+                .remove_trigger(key, timer.time, timer.timer_type)
+                .await
+                .map_err(TimerManagerError::Store)?;
+            let trigger = Trigger::with_tag(
+                key.clone(),
+                timer.time,
+                timer.timer_type,
+                timer.tag,
+                Span::current(),
+            );
+            self.0.scheduler.retire_committed(trigger).await?;
         }
         Ok(())
     }

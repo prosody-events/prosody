@@ -1,18 +1,17 @@
 #[cfg(test)]
-use super::RecoveryReadCounts;
+use super::CellReadCounts;
 use super::{
     Arc, BatchUnit, Bytes, CassandraCellStoreError, CassandraSession, CassandraStore, Cell,
-    CellAddr, CellBatchRow, CellBlobs, CellKey, CellKind, CellQueries, CellStore, CellStoreError,
-    CollectionDefRegistry, CollectionId, CollectionRef, CommitOracle, Coordinate, EventMarker,
-    EventRef, KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, MarkerCheckSet, Pk,
-    PreparedStatement, QueryRowsResult, ResolveCellError, ResolvedRow, Resolver, RowShape,
-    SHARD_FANOUT_CONCURRENCY, Scan, Section, Stream, TryStreamExt, blob_weight, encode,
-    encode_marker_payload, fetch_and_decode_cell, fetch_cell_rows_result, fetch_cells_batch_result,
-    flatten_resolve, page_cells, peek_read, pin_mut, resolve_event_marker,
-    resolve_prior_clear_before_read, smallvec, try_stream,
+    CellAddr, CellBatchRow, CellBlobs, CellKey, CellKind, CellQueries, CellStoreError,
+    CollectionDefRegistry, CollectionId, Coordinate, EventMarker, EventRef, KeyRow,
+    MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, Pk, PreparedStatement, QueryRowsResult,
+    ResolveCellError, ResolvedRow, RowShape, SHARD_FANOUT_CONCURRENCY, Scan, Section, Stream,
+    TryStreamExt, blob_weight, encode, encode_marker_payload, fetch_and_decode_cell,
+    fetch_cell_rows_result, fetch_cells_batch_result, page_cells, pin_mut, resolve_read, smallvec,
+    try_stream,
 };
 
-impl<O> CassandraStore<O> {
+impl CassandraStore {
     /// Creates a Cassandra cell store for one partition assignment.
     ///
     /// The marker-check set must use the assignment cache workspace.
@@ -20,25 +19,21 @@ impl<O> CassandraStore<O> {
     pub(crate) fn new(
         session: CassandraSession,
         queries: Arc<CellQueries>,
-        oracle: O,
         registry: Arc<CollectionDefRegistry>,
-        checks: MarkerCheckSet,
     ) -> Self {
         Self {
             session,
             queries,
-            resolver: Resolver::new(oracle, registry),
-            memo: Arc::new(super::MarkerMemo::new(checks)),
+            registry,
             #[cfg(test)]
             counters: Arc::default(),
         }
     }
 
-    /// Test handle on the recovery-read counters (shared across clones), for
-    /// the zero-query and bounded-recovery assertions.
+    /// Returns the shared counters for durable reads.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn recovery_reads(&self) -> Arc<RecoveryReadCounts> {
+    pub(crate) fn read_counts(&self) -> Arc<CellReadCounts> {
         self.counters.clone()
     }
 
@@ -150,54 +145,6 @@ impl<O> CassandraStore<O> {
         })
     }
 
-    /// Records that durable state has no unsettled marker.
-    pub(super) async fn record_marker_settled(&self, collection: &CollectionId) {
-        self.memo.unsettled.remove_async(collection).await;
-        self.memo.checks.set(collection).await;
-    }
-}
-
-impl<O> CassandraStore<O>
-where
-    O: CommitOracle,
-{
-    /// The stage's marker half, ahead of any row building: the stage-boundary
-    /// resolve, the memo mirror, and the frozen payload's encoding. Returns
-    /// the Staged row's blob.
-    ///
-    /// Resolves a prior event marker before it stores the new marker.
-    ///
-    /// A marker for the same event can be replaced safely.
-    /// The function updates the memo before it writes durable state.
-    pub(super) async fn stage_marker(
-        &self,
-        collection: &CollectionRef,
-        marker: &EventMarker,
-    ) -> Result<MarkerBlob, CellStoreError<O::Error>> {
-        if let Some(unsettled) = self.unsettled_marker(collection.id()).await?
-            && unsettled.event() != marker.event()
-        {
-            resolve_event_marker(self, self.resolver.oracle(), collection, &unsettled)
-                .await
-                .map_err(flatten_resolve)?;
-        }
-        self.memo
-            .unsettled
-            .upsert_async(collection.id().clone(), marker.clone())
-            .await;
-        self.memo.checks.set(collection.id()).await;
-        let payload = encode_marker_payload(marker)
-            .map_err(CassandraCellStoreError::from)
-            .map_err(ResolveCellError::Store)?;
-        let payload = encode(&payload)
-            .map_err(CassandraCellStoreError::from)
-            .map_err(ResolveCellError::Store)?;
-        Ok(MarkerBlob {
-            payload,
-            event: marker.event(),
-        })
-    }
-
     /// The single resolving section scan, yielding each present cell's
     /// committed bytes — the body behind [`scan_cells`](CellStore::scan_cells).
     pub(super) fn scan_inner<'a>(
@@ -205,23 +152,9 @@ where
         collection: &'a CollectionId,
         scan: Scan<'a>,
         own: EventRef,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), CellStoreError<O::Error>>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), CellStoreError>> + Send + 'a {
         let limit = scan.limit;
-        let collection_ref = self.resolver.collection_ref(collection);
         try_stream! {
-            // Resolve a prior event's section clear before the scan starts.
-            // The scan cannot return data that the clear removed.
-            let marker = self.unsettled_marker(collection).await?;
-            // The scan starts after this resolution, so a durable change needs no re-read.
-            let _ = resolve_prior_clear_before_read(
-                self,
-                self.resolver.oracle(),
-                &collection_ref,
-                marker.as_ref(),
-                own,
-            )
-            .await
-            .map_err(flatten_resolve)?;
             // The shared paging core (`page_cells`): it selects the per-bound
             // statement, decodes each row, and applies `past_end`. It applies
             // no resolution and no limit.
@@ -229,17 +162,6 @@ where
             pin_mut!(pages);
 
             let mut yielded = 0usize;
-            // Deliberately sequential, not an oversight: the common `peek_read`
-            // is a free no-op (own-event provisional / already-resolved cells
-            // consult no oracle), so steady-state scans gain nothing from
-            // fan-out; the only payoff is mid-recovery across many prior event
-            // provisional cells. And because `limit` counts *present* yields —
-            // knowable only post-resolve — a buffered pipeline would resolve up
-            // to N−1 prior event-provisional cells past the boundary, each an extra
-            // oracle read: a recovery-only win we won't pay for on a hot read
-            // path. `peek_read` is read-only — it never writes a resolution
-            // back durably (a scan write-back could clobber a newer `commit()`
-            // of the same cell), so this posture costs no write amplification.
             while let Some((key, raw)) = pages.try_next().await.map_err(ResolveCellError::Store)? {
                 // The limit bounds *yielded* (present) cells; check it before
                 // processing the next row so `Some(0)` yields nothing (an absent
@@ -247,9 +169,7 @@ where
                 if limit.is_some_and(|n| yielded >= n) {
                     break;
                 }
-                let committed = peek_read(self.resolver.oracle(), &collection_ref, own, raw)
-                    .await
-                    .map_err(ResolveCellError::Oracle)?;
+                let committed = resolve_read(self, collection, own, raw).await?;
                 if let Some(bytes) = committed.into_inner() {
                     yield (key, bytes);
                     yielded += 1;
@@ -267,7 +187,7 @@ where
         leading: Option<BatchUnit<CellBatchRow<'u>>>,
         units: Vec<BatchUnit<CellBatchRow<'u>>>,
         trailing: BatchUnit<CellBatchRow<'u>>,
-    ) -> Result<(), CellStoreError<O::Error>> {
+    ) -> Result<(), CellStoreError> {
         let (units, phases) = super::batch::settle_batches(
             leading,
             units,
@@ -282,4 +202,18 @@ where
         }
         Ok(())
     }
+}
+
+/// Encodes one stage payload for the marker row.
+pub(super) fn stage_marker(marker: &EventMarker) -> Result<MarkerBlob, CellStoreError> {
+    let payload = encode_marker_payload(marker)
+        .map_err(CassandraCellStoreError::from)
+        .map_err(ResolveCellError::Store)?;
+    let payload = encode(&payload)
+        .map_err(CassandraCellStoreError::from)
+        .map_err(ResolveCellError::Store)?;
+    Ok(MarkerBlob {
+        payload,
+        event: marker.event(),
+    })
 }

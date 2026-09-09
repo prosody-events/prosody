@@ -2,6 +2,7 @@ use super::{
     BatchUnit, CellAddr, CellBatchRow, CellKind, CellQueries, GapBetweenRow, GapEdgeRow,
     GapSectionRow, KeyRow, PER_STATEMENT_OVERHEAD, Pk, RowShape, SectionClear, smallvec,
 };
+use crate::cassandra::chunk_boundaries;
 use crate::state::marker::MarkerRow;
 use std::ops::Range;
 
@@ -95,7 +96,7 @@ pub(super) fn marker_delete_unit<'u>(
 /// Builds the promote or abort phases under the batch budgets.
 /// The leading evidence and final Staged delete remain outside split middle
 /// chunks.
-pub(super) fn settle_batches<R>(
+pub(in crate::state) fn settle_batches<R>(
     leading: Option<BatchUnit<R>>,
     mut middle: Vec<BatchUnit<R>>,
     trailing: BatchUnit<R>,
@@ -116,19 +117,34 @@ pub(super) fn settle_batches<R>(
     (middle, phases)
 }
 
-/// A split stage writes Staged before cells, then re-stamps Staged after all
-/// cells.
-pub(super) fn stage_batches<R>(
+/// Every stage chunk includes Staged and its cells in one atomic mutation.
+/// Reserve the marker weight and statement before cells enter a chunk.
+/// A clear-only stage still writes the marker.
+pub(in crate::state) fn stage_batches<R>(
     units: &[BatchUnit<R>],
     max_bytes: u64,
     max_count: usize,
-) -> [Range<usize>; 3] {
-    let end = units.len();
-    if fits_one_batch(units.iter().map(BatchUnit::weight), max_bytes, max_count) {
-        [0..end, end..end, end..end]
-    } else {
-        [0..1, 1..end, 0..1]
-    }
+) -> impl Iterator<Item = Range<usize>> {
+    let marker_weight = units.first().map_or(0, BatchUnit::weight);
+    let cells = chunk_boundaries(
+        units.iter().skip(1).map(BatchUnit::weight),
+        max_bytes.saturating_sub(marker_weight),
+        if marker_weight > max_bytes {
+            1
+        } else {
+            max_count.saturating_sub(1)
+        },
+    )
+    .map(|range| range.start + 1..range.end + 1);
+    (units.len() == 1).then_some(1..1).into_iter().chain(cells)
+}
+
+/// Binds the discovery row to every atomic stage mutation.
+pub(in crate::state) fn stage_chunk<R>(
+    units: &[BatchUnit<R>],
+    range: Range<usize>,
+) -> impl Iterator<Item = &BatchUnit<R>> {
+    units.first().into_iter().chain(units[range].iter())
 }
 
 /// Reports whether all rows fit one atomic batch.

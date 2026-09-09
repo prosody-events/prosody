@@ -109,9 +109,8 @@ pub(super) async fn run_actor<T>(
     loop {
         heartbeat.beat();
 
-        // Serve commands through `Draining` — in-flight handlers still arm
-        // recovery backstops as they settle, and their contexts permit timer
-        // ops until `Cancelling`. Exit only once `Cancelling` is visible. This
+        // Serve commands through Draining. Handler contexts permit timer
+        // operations until Cancelling. Exit when Cancelling is visible. This
         // gate owns the exit decision; the `changed()` arms below merely wake
         // a parked actor and route back here. It also bounds the transition
         // race: `select!` is unbiased, so with commands continuously ready the
@@ -186,7 +185,7 @@ pub(super) async fn run_actor<T>(
 }
 
 /// Processes a single command from the command channel.
-async fn process_command<T>(
+pub(super) async fn process_command<T>(
     state: &mut ActorState<T>,
     triggers: &mut TriggerQueue,
     Command {
@@ -201,6 +200,16 @@ async fn process_command<T>(
         CommandOperation::Add => handle_add(state, triggers, trigger).await,
         CommandOperation::Remove => {
             triggers.remove(&trigger).await;
+            Ok(())
+        }
+        CommandOperation::RetireCommitted => {
+            let tag = triggers
+                .active_triggers()
+                .get_tag(&trigger.key, trigger.time, trigger.timer_type)
+                .await;
+            if tag.is_none_or(|tag| tag == trigger.tag) {
+                triggers.remove(&trigger).await;
+            }
             Ok(())
         }
         CommandOperation::AddToQueue => {
@@ -282,6 +291,14 @@ where
     }
 
     if is_owned {
+        // The add command carries the authoritative tag from the key row.
+        let tag = triggers
+            .active_triggers()
+            .get_tag(&trigger.key, trigger.time, trigger.timer_type)
+            .await;
+        if tag.is_some_and(|tag| tag != trigger.tag) {
+            triggers.remove(&trigger).await;
+        }
         triggers.insert(trigger).await;
     }
 

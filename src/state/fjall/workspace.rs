@@ -28,7 +28,7 @@
 //!
 //! On process startup, `FjallClient::open` deletes every existing `value_*`
 //! keyspace: the cache carries no durability guarantee — Cassandra provisional
-//! cells plus the commit oracle are the recovery source — so leftovers are
+//! cells and collection evidence are the recovery source — so leftovers are
 //! reclaimed disk, never recovered state. A failed sweep or drop-delete costs
 //! only disk until the next successful sweep or the cache volume's teardown.
 
@@ -113,7 +113,7 @@ impl FjallClient {
     /// Mints a fresh per-Kafka-partition workspace.
     ///
     /// Opens two named Fjall keyspaces — `cache` (committed-value mirror) and
-    /// `index` (the warm provisional-coordinate index and latches) —
+    /// `index` (the admission checks) —
     /// sharing one fresh UUID (v4). **A workspace's keyspaces are born cold**:
     /// their names are minted fresh per assignment and never derived from
     /// anything, so no workspace can ever open another assignment's data.

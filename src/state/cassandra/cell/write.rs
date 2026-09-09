@@ -1,20 +1,21 @@
 use super::{
-    BatchUnit, CassandraStore, CellAddr, CellBatchRow, CellKey, CellStoreError, CollectionRef,
-    CommitOracle, EventMarker, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerWriteRow,
-    PER_STATEMENT_OVERHEAD, Pk, ProvisionalWrite, ResolveCellError, RowShape, StageRow, bind_ttl,
-    blob_weight, encode_cell_blobs, smallvec,
+    BatchUnit, CassandraCellStoreError, CassandraStore, CellAddr, CellBatchRow, CellKey,
+    CellStoreError, CollectionRef, EventMarker, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS,
+    MarkerWriteRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalWrite, ResolveCellError, RowShape,
+    StageRow, bind_ttl, blob_weight, encode_cell_blobs, smallvec,
 };
+use crate::state::SHARD_FANOUT_CONCURRENCY;
 use crate::state::marker::MarkerRow;
+use futures::{StreamExt, TryStreamExt, stream};
+use smallvec::SmallVec;
+use std::ops::Range;
 
-pub(super) async fn write_provisional<O>(
-    store: &CassandraStore<O>,
+pub(super) async fn write_provisional(
+    store: &CassandraStore,
     collection: &CollectionRef,
     writes: &[(CellKey, ProvisionalWrite)],
     marker: Option<&EventMarker>,
-) -> Result<(), CellStoreError<O::Error>>
-where
-    O: CommitOracle,
-{
+) -> Result<(), CellStoreError> {
     // `None` ⇒ the explicit empty-stage no-op: no marker, no boundary
     // check (nothing to strand). A clears-only stage passes a marker with
     // empty `staged()` and runs the boundary like any stage.
@@ -32,7 +33,7 @@ where
         "every staged write must be listed by the event marker"
     );
     let pk = Pk::of(collection.id());
-    let marker_blob = store.stage_marker(collection, marker).await?;
+    let marker_blob = super::store::stage_marker(marker)?;
 
     // Encode every cell's blobs up front (this Vec owns the `Bytes`); the
     // bound rows borrow into it and into each input cell's coordinate slice,
@@ -80,14 +81,17 @@ where
         )
     }));
 
-    // The first staged row makes a partial stage recoverable. Re-stamp it
-    // after every cell batch completes, so evidence outlives all listed cells.
-    // Await the phases in order because run_batches executes its chunks unordered.
-    for phase in super::batch::stage_batches(&units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS) {
-        store
-            .run_batches(&units[phase])
-            .await
-            .map_err(ResolveCellError::Store)?;
-    }
+    let chunks: SmallVec<[Range<usize>; 1]> =
+        super::batch::stage_batches(&units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS).collect();
+    stream::iter(chunks)
+        .map(|range| {
+            let rows = super::batch::stage_chunk(&units, range);
+            store.session.execute_unlogged_batch(rows)
+        })
+        .buffer_unordered(SHARD_FANOUT_CONCURRENCY)
+        .try_collect::<()>()
+        .await
+        .map_err(CassandraCellStoreError::from)
+        .map_err(ResolveCellError::Store)?;
     Ok(())
 }

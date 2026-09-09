@@ -1,48 +1,14 @@
-//! The durable cell-store backend trait.
+//! Durable cells and collection commit evidence.
 //!
-//! [`CellStore`] is the single, uniform, **untyped** durable backend interface
-//! for keyed state. It names no collection family: cells are addressed by
-//! [`CellKey`] (a [`Section`] + ordered
-//! [`Coordinate`]), so Value/Map/Deque are
-//! collection-layer handles over this one trait and the durability layer is
-//! written exactly once.
+//! Collection handles address cells through this uniform store interface.
+//! Admission resolves residue before the handler runs. Reads project
+//! provisional cells through collection evidence without durable writes.
 //!
-//! Its currency is the resolved [`Committed`] cell: `get` and `scan_cells`
-//! oracle-resolve any in-flight provisional cell **inside the backend** before
-//! yielding, so callers above it (the `Overlay`
-//! dirty overlay, the [`Cached`](super::cached::Cached) write-through cache)
-//! are oracle-free and merely delegate down. The `own: EventRef` argument lets
-//! the bottom store short-circuit to `prev` for the running handler's own
-//! provisional cell without an oracle consult (the own-event-base-is-prev
-//! invariant); the per-event session injects it, so collections never pass it.
-//!
-//! # Collection-grain atomicity invariant
-//!
-//! The three mutators work at **collection grain**: each takes the touched
-//! cells of one collection as a slice. The invariant every backend upholds is
-//! **atomic multi-cell commit** — a single `write_provisional` /
-//! `write_resolved` / `mark_resolved` call (and `commit_provisional` /
-//! `abort_provisional` — each verb's doc states its routing)
-//! applies *all* its cells
-//! together, so no reader and no crash-recovery ever observes a torn subset
-//! (some cells written, others not), and on the Cassandra backend every cell
-//! shares one write timestamp and one TTL anchor (keyset and entries
-//! co-expire).
-//!
-//! * **Cassandra** packs the cells into **one same-partition `UNLOGGED
-//!   BATCH`**: a collection's cells share its row key, so the batch is a single
-//!   atomic replica mutation — one round-trip, not one per cell. The **sole**
-//!   split is the over-budget fallback: a collection whose cells exceed the
-//!   backend batch budget is divided into the *fewest* atomic batches that fit.
-//!   The accepted consequence is narrow — an **over-budget** `ReadUncommitted`
-//!   multi-cell *resolved* write (which arms no recovery backstop) can crash
-//!   between chunks, leaving a torn committed write recovery cannot
-//!   reconstruct; within budget that window does not exist, and a staged
-//!   (`write_provisional`) write is always recoverable regardless of chunking.
-//! * **Memory** loops its writes cell by cell. It needs no batch: one handler
-//!   per key system-wide means no observer can witness a partial multi-cell
-//!   write, and an in-memory loop never crashes mid-write — atomicity holds by
-//!   serialization, not by a transaction.
+//! Cassandra uses atomic batches within each collection partition.
+//! Oversized writes use multiple chunks. Each stage chunk includes its
+//! discovery row. Promote writes evidence before destructive chunks and deletes
+//! Staged last. An oversized resolved write can remain partial after a crash
+//! because it has no provisional state to reconstruct.
 use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::cell_key::{CellKey, Coordinate, Scan, Section};
 use super::event_ref::EventRef;
@@ -65,7 +31,7 @@ pub use super::store_types::{CacheBatch, CellBuffer, CommittedBatch, CoordinateB
 /// Uniform durable storage for the cells of one collection partition.
 ///
 /// `get` is a resolving point read and `scan_cells` a resolving single-section
-/// range stream; `provisional_cells` is the whole-partition recovery scan. The
+/// range stream. The
 /// three mutators take a collection's touched cells as a batch and map onto the
 /// durability sequence:
 ///
@@ -90,20 +56,13 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// Error type for cell-store operations.
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
-    /// Reads one cell's visible committed value, resolving an in-flight
-    /// provisional cell through the oracle (or short-circuiting to its `prev`
-    /// when `own` owns it). A missing row resolves to `Committed(None)`.
-    ///
-    /// # Prior section clears
-    ///
-    /// Resolves a prior event's section clear before it returns data.
-    /// The read cannot return data that the clear removed.
-    /// Markers without section clears remain unsettled.
+    /// Reads the committed projection without a durable write.
+    /// A missing row returns `Committed(None)`. The current event reads its
+    /// staged `prev` value.
     ///
     /// # Errors
     ///
-    /// Returns [`Self::Error`] on a store failure, a corrupt row shape, or an
-    /// oracle failure.
+    /// Returns the store error for failed reads or corrupt rows.
     fn get<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -111,11 +70,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         own: EventRef,
     ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a;
 
-    /// Complete, ordered, single-section scan (start positional, section
-    /// required). Provisional cells in range are oracle-resolved here; cleared
-    /// or absent cells are skipped, so the stream yields only present committed
-    /// bytes in `coordinate` byte order. Returns marker-resolved truth exactly
-    /// as [`Self::get`] does (see *Prior section clears* on [`Self::get`]).
+    /// Scans one section in coordinate order and yields present committed
+    /// values. Provisional cells use the same projection as [`Self::get`].
     fn scan_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -162,13 +118,12 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ///   its positions answer identically.
     /// * **First-occurrence ordering** — unique coordinates are resolved in the
     ///   order of their first appearance in `batch`, so among the **per-row
-    ///   semantic failures** (a corrupt row shape, an oracle consult) the one
+    ///   semantic failures** (a corrupt row shape, an evidence read) the one
     ///   surfaced is the earliest input position's. A backend may additionally
     ///   fail the batch as a whole *before* any row resolves (the Cassandra
-    ///   override's `IN` query, its unsettled-marker read, or the prior-clear
-    ///   re-issue); such a whole-collection failure carries **no** input
-    ///   position, exactly as the point [`Self::get`] surfaces the same failure
-    ///   with no cell attribution.
+    ///   override's `IN` query or its marker read); such a whole-collection
+    ///   failure carries **no** input position, exactly as the point
+    ///   [`Self::get`] surfaces the same failure with no cell attribution.
     ///
     /// The default reads each unique coordinate through [`Self::get`] in
     /// first-occurrence order and expands the answer to every duplicate
@@ -241,20 +196,6 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         }
     }
 
-    /// Streams the whole partition's provisional cells (all sections) for the
-    /// recovery sweep, filtering resolved rows in code.
-    ///
-    /// This is the **cold** recovery source: on the Cassandra store, the
-    /// event-marker point read (memoized per assignment) followed by one raw
-    /// `IN` batch read per `<=CELL_BATCH` section chunk
-    /// ([`provisional_many`](Self::provisional_many)) — cost ∝ #provisional,
-    /// never partition size. The warm short-circuit that skips it on a
-    /// quiescent sweep lives on [`Cached`](super::cached::Cached).
-    fn provisional_cells<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a;
-
     /// Point-reads one coordinate's provisional cell, or `None` when it is
     /// absent or resolved (over-report-safe). The single-coordinate primitive
     /// that [`provisional_point_loop`] fans out over to
@@ -283,8 +224,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// (over-report-safe), with exact [`Self::provisional_cell_at`] parity for
     /// malformed / partially-expired rows — the raw decoder, never a visible
     /// resolve. Surviving rows retain `data`/`prev`/[`EventRef`] **without
-    /// consulting the oracle, writing durable state, or publishing into the
-    /// committed-value cache** — this is the raw recovery-reconstruction read,
+    /// writing durable state or publishing into the
+    /// committed-value cache** — this is the raw residue read,
     /// not a resolving one.
     ///
     /// A whole-batch failure carries no input position (as
@@ -317,13 +258,13 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ///
     /// # Staged row lifecycle
     ///
-    /// This verb creates or replaces Staged. Settle and recovery delete it
+    /// This verb creates or replaces Staged. Settle and admission delete it
     /// through [`Self::commit_provisional`] or [`Self::abort_provisional`].
     /// [`Self::write_resolved`] and [`Self::mark_resolved`] never write Staged.
     ///
     /// Every write must occur in the frozen staged list
     /// (`writes ⊆ marker.staged()`). Split stages use that full list for every
-    /// chunk, so recovery can find every provisional coordinate.
+    /// chunk, so admission can find every provisional coordinate.
     /// The session freezes the payload once per collection at `finalize`.
     /// A retry can replace the same event's Staged row; handlers must produce
     /// the same result across retries.
@@ -331,7 +272,6 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// `None` requires empty `writes`: it writes no Staged row and skips the
     /// boundary check. A clears-only stage supplies a payload with empty
     /// `staged()` and non-empty `clears()`. It writes Staged and checks the
-    /// boundary because an unsettled clear requires recovery.
     ///
     /// Before the write, the backend resolves a Staged row for a different
     /// event. A resolution failure fails the stage; retry middleware handles
@@ -394,20 +334,6 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         collection: &'a CollectionId,
     ) -> impl Future<Output = Result<MarkerState, Self::Error>> + Send + 'a;
 
-    /// Point-reads the collection's Staged payload, or `None` when
-    /// none stands (≈ always). Feeds the recovery sweep's marker leg and the
-    /// stage-boundary rule. Required with no default: a defaulted `Ok(None)` on
-    /// a marker-bearing backend would be a silent recovery hole, so every impl
-    /// answers truthfully.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Self::Error`] on a store failure.
-    fn unsettled_marker<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-    ) -> impl Future<Output = Result<Option<EventMarker>, Self::Error>> + Send + 'a;
-
     /// Promotes each `cell`'s provisional cell to resolved: nulls `event` and
     /// `prev`, keeping `data`. O(1) bytes per cell. Idempotent — promoting a
     /// resolved cell is a harmless no-op write.
@@ -454,7 +380,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// puts the committed clear after every pre-existing row, so a
     /// non-survivor's post-clear state is absent regardless of its unresolved
     /// history (the erasure argument). Survivors are protected positionally by
-    /// the frozen list, never temporally. Idempotent; the sweep retries it.
+    /// the frozen list, never temporally. Admission can retry this operation.
     ///
     /// # Errors
     ///
@@ -471,7 +397,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// resolved value. Required with no default, for the reason on
     /// [`commit_provisional`](Self::commit_provisional). The base was never
     /// touched by the stage, so the rollback is exact and needs no per-section
-    /// discard. Idempotent; the sweep retries it.
+    /// discard. Admission can retry this operation.
     ///
     /// # Errors
     ///

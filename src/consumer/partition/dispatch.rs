@@ -1,3 +1,4 @@
+use crate::consumer::middleware::reject_admission;
 use std::future::{Future, Ready, ready};
 use std::panic::{AssertUnwindSafe, resume_unwind};
 
@@ -18,7 +19,7 @@ use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use crate::loader::MessageLoader;
 use crate::otel::SpanRelation;
-use crate::state::manager::{EventStateScope, PartitionStateManager, SweepResolution};
+use crate::state::manager::{Admission, EventStateScope, PartitionStateManager};
 use crate::state::session::{EventSession, TerminationWatch};
 use crate::state::{EventRef, TimerEventRef};
 use crate::timers::store::TriggerStore;
@@ -26,7 +27,7 @@ use crate::timers::{PendingTimer, TimerManager, TimerType, UncommittedTimer};
 use crate::{EventIdentity, EventType, ProcessScope};
 
 /// Processes one event in a fresh keyed-state session.
-pub(super) async fn process_event<T, S, M, P>(
+pub(crate) async fn process_event<T, S, M, P>(
     event: UncommittedEvent<S, P>,
     handler: &T,
     shutdown_rx: &watch::Receiver<ShutdownPhase>,
@@ -40,6 +41,12 @@ pub(super) async fn process_event<T, S, M, P>(
     M: PartitionStateManager<Session: EventSession<Loader: MessageLoader<Payload = P>>>,
     P: Send + Sync + 'static + EventIdentity,
 {
+    let admission = state_manager
+        .admit(event.key().clone(), timer_manager, shutdown_rx)
+        .await;
+    if admission == Admission::Poisoned {
+        error!(key = %event.key(), "keyed-state admission rejected the event");
+    }
     match event {
         UncommittedEvent::Message(message) => {
             process_record(
@@ -49,6 +56,7 @@ pub(super) async fn process_event<T, S, M, P>(
                 timer_manager,
                 state_manager,
                 dedup_identity,
+                admission,
             )
             .await;
         }
@@ -60,6 +68,7 @@ pub(super) async fn process_event<T, S, M, P>(
                 timer_manager,
                 state_manager,
                 dedup_identity,
+                admission,
             )
             .await;
         }
@@ -71,6 +80,7 @@ pub(super) async fn process_event<T, S, M, P>(
                 timer_manager,
                 state_manager,
                 timer_spans,
+                admission,
             )
             .await;
         }
@@ -84,6 +94,7 @@ async fn process_record<S, M, Q, F, Fut>(
     timer_manager: &TimerManager<S>,
     state_manager: &M,
     dedup_identity: DedupIdentity<'_>,
+    admission: Admission,
 ) where
     S: TriggerStore,
     M: PartitionStateManager<Session: EventSession<Loader: MessageLoader>>,
@@ -91,6 +102,10 @@ async fn process_record<S, M, Q, F, Fut>(
     F: FnOnce(PartitionEventContext<S, M::Session>, UncommittedMessage<Q>) -> Fut,
     Fut: Future<Output = ()>,
 {
+    if admission == Admission::Abandoned {
+        message.abort().await;
+        return;
+    }
     let (cancel_tx, cancel_rx) = watch::channel(false);
     // Derive the dedup id for every message — even when no descriptors are
     // registered — because the EventRef must exist before state access. This
@@ -114,6 +129,10 @@ async fn process_record<S, M, Q, F, Fut>(
         timer_manager.clone(),
         scope.handle(),
     );
+    if admission == Admission::Poisoned {
+        reject_admission(&context, message).await;
+        return;
+    }
     let cloned_context = context.clone();
     let _guard = message.process_scope();
     // Use the receive span so handler spans and `Span::current()` captures nest
@@ -130,28 +149,24 @@ async fn process_timer<T, S, M, P>(
     timer_manager: &TimerManager<S>,
     state_manager: &M,
     timer_spans: SpanRelation,
+    admission: Admission,
 ) where
     T: EventHandler<Payload = P>,
     S: TriggerStore,
     M: PartitionStateManager<Session: EventSession<Loader: MessageLoader<Payload = P>>>,
     P: Send + Sync + 'static,
 {
+    if admission == Admission::Abandoned && timer.timer_type() != TimerType::StateRecovery {
+        timer.abandon().await;
+        return;
+    }
     let Some(firing) = timer.fire().await else {
         return;
     };
     firing.set_dispatch_span(timer_spans);
 
-    // State recovery is internal. User handlers never receive its trigger.
-    if firing.timer_type() == TimerType::StateRecovery {
-        let _guard = firing.process_scope();
-        let (trigger, commit_guard) = firing.into_inner();
-        match state_manager
-            .recover(trigger.key.clone(), timer_manager, shutdown_rx)
-            .await
-        {
-            SweepResolution::Commit => commit_guard.commit().await,
-            SweepResolution::Abort => commit_guard.abort().await,
-        }
+    if firing.timer_type() == TimerType::StateRecovery || admission == Admission::Poisoned {
+        firing.commit().await;
         return;
     }
 

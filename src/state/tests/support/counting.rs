@@ -16,12 +16,11 @@ struct OpCounts {
     mark_resolved: AtomicUsize,
     commit_provisional: AtomicUsize,
     abort_provisional: AtomicUsize,
-    unsettled_marker: AtomicUsize,
+    marker_state: AtomicUsize,
     get: AtomicUsize,
     get_many: AtomicUsize,
     get_many_for_cache: AtomicUsize,
     scan_cells: AtomicUsize,
-    provisional_cells: AtomicUsize,
     provisional_cell_at: AtomicUsize,
     provisional_many: AtomicUsize,
 }
@@ -43,7 +42,7 @@ impl<S> CountingCellStore<S> {
     }
 
     pub(crate) fn marker_reads(&self) -> usize {
-        self.counts.unsettled_marker.load(Ordering::Relaxed)
+        self.counts.marker_state.load(Ordering::Relaxed)
     }
 
     pub(crate) fn lower_reads(&self) -> usize {
@@ -66,14 +65,6 @@ impl<S> CountingCellStore<S> {
         self.counts.scan_cells.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn recovery_sweeps(&self) -> usize {
-        self.counts.provisional_cells.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn warm_point_reads(&self) -> usize {
-        self.counts.provisional_cell_at.load(Ordering::Relaxed)
-    }
-
     pub(crate) fn raw_point_reads(&self) -> usize {
         self.counts.provisional_cell_at.load(Ordering::Relaxed)
     }
@@ -88,12 +79,11 @@ impl<S> CountingCellStore<S> {
         self.counts.mark_resolved.store(0, Ordering::Relaxed);
         self.counts.commit_provisional.store(0, Ordering::Relaxed);
         self.counts.abort_provisional.store(0, Ordering::Relaxed);
-        self.counts.unsettled_marker.store(0, Ordering::Relaxed);
+        self.counts.marker_state.store(0, Ordering::Relaxed);
         self.counts.get.store(0, Ordering::Relaxed);
         self.counts.get_many.store(0, Ordering::Relaxed);
         self.counts.get_many_for_cache.store(0, Ordering::Relaxed);
         self.counts.scan_cells.store(0, Ordering::Relaxed);
-        self.counts.provisional_cells.store(0, Ordering::Relaxed);
         self.counts.provisional_cell_at.store(0, Ordering::Relaxed);
         self.counts.provisional_many.store(0, Ordering::Relaxed);
     }
@@ -145,16 +135,6 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         self.counts.scan_cells.fetch_add(1, Ordering::Relaxed);
         self.inner.scan_cells(collection, scan, own)
-    }
-
-    fn provisional_cells<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
-        self.counts
-            .provisional_cells
-            .fetch_add(1, Ordering::Relaxed);
-        self.inner.provisional_cells(collection)
     }
 
     async fn provisional_cell_at<'a>(
@@ -216,15 +196,8 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
         &'a self,
         collection: &'a CollectionId,
     ) -> Result<MarkerState, Self::Error> {
+        self.counts.marker_state.fetch_add(1, Ordering::Relaxed);
         self.inner.marker_state(collection).await
-    }
-
-    async fn unsettled_marker<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-    ) -> Result<Option<EventMarker>, Self::Error> {
-        self.counts.unsettled_marker.fetch_add(1, Ordering::Relaxed);
-        self.inner.unsettled_marker(collection).await
     }
 
     async fn commit_provisional<'a>(
@@ -292,15 +265,10 @@ impl CellResolver for CountingResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::registry::CollectionDefRegistry;
 
     #[tokio::test]
     async fn counters_increment_once_per_store_call() -> Result<()> {
-        let store = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            FixedOracle::committed(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let store = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let id = fresh_collection("counter-probe")?;
         let cell = CellKey {
             section: Section::new(0),

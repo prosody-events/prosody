@@ -334,14 +334,14 @@ async fn test_timer_type_unschedule_isolation() -> Result<()> {
 // =========================================================================
 
 /// The scheduler actor must keep serving commands through `Draining` so
-/// in-flight handlers can arm their recovery backstop as they settle.
+/// active handlers can finish their timer operations.
 /// Seeding the phase before the actor spawns removes the send-then-observe
 /// race: the actor is already in the drain window on its first iteration.
 #[tokio::test]
 async fn clear_and_schedule_succeeds_while_draining() -> Result<()> {
     let (_stream, manager, _shutdown_tx) = setup_timer_manager_at(ShutdownPhase::Draining).await?;
 
-    let key = Key::from("drain-backstop");
+    let key = Key::from("drain-handler");
     let time = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
     let request = TimerRequest::new(key.clone(), time, TimerType::StateRecovery, Span::current());
 

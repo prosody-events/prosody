@@ -1,4 +1,3 @@
-use super::rows::CommittedWriteRow;
 use super::{
     BatchRow, CellBatchRow, CellKind, GapBetweenRow, GapEdgeRow, GapSectionRow, KeyRow,
     MarkerWriteRow, PreparedStatement, ResolvedRow, RowSerializationContext, RowShape, RowWriter,
@@ -22,7 +21,6 @@ impl SerializeRow for CellBatchRow<'_> {
             RowShape::Stage(row) => row.serialize(ctx, writer),
             RowShape::Resolved(row) => row.serialize(ctx, writer),
             RowShape::MarkerWrite(row) => row.serialize(ctx, writer),
-            RowShape::CommittedWrite(row) => row.serialize(ctx, writer),
             RowShape::Key(row) => row.serialize(ctx, writer),
             RowShape::GapSection(row) => row.serialize(ctx, writer),
             RowShape::GapEdge(row) => row.serialize(ctx, writer),
@@ -206,32 +204,6 @@ impl SerializeRow for GapBetweenRow<'_> {
             self.section,
             self.low,
             self.high,
-        )
-            .serialize(ctx, writer)
-    }
-
-    fn is_empty(&self) -> bool {
-        false
-    }
-}
-
-impl SerializeRow for CommittedWriteRow<'_> {
-    fn serialize(
-        &self,
-        ctx: &RowSerializationContext<'_>,
-        writer: &mut RowWriter<'_>,
-    ) -> Result<(), SerializationError> {
-        let a = &self.addr;
-        (
-            self.ttl,
-            self.event,
-            a.pk.segment_id,
-            a.pk.key,
-            a.pk.state_type,
-            a.pk.name,
-            CellKind::Marker,
-            a.section,
-            a.coordinate,
         )
             .serialize(ctx, writer)
     }

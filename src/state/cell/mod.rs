@@ -8,7 +8,7 @@
 //!   value is authoritative.
 //! * [`Cell::Provisional`] — an event staged a write: `data` is that event's
 //!   outcome, `prev` the committed value before it, `event` the owner. The
-//!   commit oracle decides which of the two becomes committed.
+//!   collection evidence selects the committed value.
 //!
 //! The model replaces the write-ahead log: rather than persisting a *recipe*
 //! (ops) to re-derive the outcome durably later, both finished outcomes are
@@ -96,6 +96,11 @@ pub(crate) fn resolve_for_reader<'a>(
 ) -> Option<&'a Bytes> {
     match cell {
         Cell::Provisional(cell) if evidence.committed(cell.event()) => cell.data(),
+        // Legacy split stages and legacy residue orphaned by admit can leave cells without a Staged
+        // row. Concurrent V4 chunks and delayed retries can produce the same state within
+        // their arrival skew. Both cases project prev until the cells expire under their
+        // own TTL. The skew changes only TTL precision: those cells were already due to
+        // vanish within that interval. Cassandra resolves TTLs to one second.
         _ => cell.project_committed(),
     }
 }

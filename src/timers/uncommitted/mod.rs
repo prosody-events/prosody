@@ -188,6 +188,16 @@ where
         }
     }
 
+    /// The namespace of this queued trigger.
+    pub(crate) fn timer_type(&self) -> TimerType {
+        self.trigger.timer_type
+    }
+
+    /// Aborts a queued source when admission stops on shutdown.
+    pub(crate) async fn abandon(mut self) {
+        self.uncommitted.abort().await;
+    }
+
     /// Transition this timer to the firing state.
     ///
     /// Consumes the `PendingTimer` and returns a [`FiringTimer`] if the timer

@@ -1,70 +1,6 @@
-//! Cassandra-backed uniform cell store.
-//!
-//! [`CassandraStore`] implements the untyped [`CellStore`] over the
-//! `keyed_state_cell` table provisioned by migration
-//! `20260522_create_keyed_state.cql`. Every durable mutation writes one
-//! self-consistent cell-column shape in a single statement.
-//!
-//! It is the **bottom** store: it owns the commit oracle (via the composed
-//! [`Resolver`]) and oracle-resolves any in-flight provisional cell inside
-//! `get`/`scan_cells` before yielding, so the layers above it
-//! ([`Cached`](crate::state::cached::Cached),
-//! [`Overlay`](crate::state::overlay::Overlay)) are oracle-free.
-//!
-//! # Cell and marker rows
-//!
-//! [`CellKind`] separates cell rows from the marker slice.
-//! [`MarkerRow`](crate::state::marker::MarkerRow) owns the two marker
-//! addresses. `Staged` lists provisional coordinates and frozen clear
-//! survivors. `Committed` stores positive evidence for the event.
-//! Both addresses are fixed, so marker churn compacts to two entries and never
-//! grows a tombstone field.
-//! Recovery reads `Staged`, then its listed cells; it never scans all cell
-//! rows.
-//!
-//! A stage that fits one batch writes its marker and cells atomically.
-//! A split stage writes `Staged`, then cells, then re-stamps `Staged`.
-//! A torn stage can leave Staged without cells, which safely over-reports;
-//! it cannot leave cells without Staged.
-//! A promote writes evidence before cell or gap changes and deletes `Staged`
-//! last. [`issue_markers`](CassandraStore::issue_markers) owns this order for
-//! settle. [`MarkerMemo`] holds only unsettled stages. [`MarkerCheckSet`]
-//! stores completed checks on disk. Readers that need commit evidence read the
-//! durable slice.
-//!
-//! A prior section clear must resolve before an owner read or resolved write.
-//! These owner operations retain their existing marker memo and commit oracle.
-//!
-//! The three cell mutators write exactly one cell-column shape each:
-//!
-//! * [`write_provisional`](CellStore::write_provisional) — *stage*: `data`,
-//!   `prev_data`, `event`, and the shared `encoding`/`version` in one `UPDATE`.
-//!   The encoding/version flags key on **either** blob being present (a
-//!   clear-over-present stages `data = null` with a non-null `prev_data`, which
-//!   still needs an encoding).
-//! * [`write_resolved`](CellStore::write_resolved) — writes a committed value
-//!   with `prev_data`/`event` nulled, **or deletes the row** when the value is
-//!   absent (the `ReadUncommitted` direct write/clear, the mid-handler
-//!   `commit()`, and rollback resolution).
-//! * [`mark_resolved`](CellStore::mark_resolved) — *promote*: nulls `prev_data`
-//!   and `event` only, keeping `data` and its TTL. O(1) bytes; reserved for
-//!   present data.
-//!
-//! # Committed absence is row absence
-//!
-//! Every path that resolves a cell to absent **deletes** the `kind=Cell` row
-//! (`cell_delete`) rather than nulling its columns — the row-absence invariant
-//! owned by [`CellStore`]. An absent-data promote therefore routes through
-//! `write_resolved(cell, None)`; [`mark_resolved`](CellStore::mark_resolved)
-//! never resolves a cell to absent. No statement in this build produces the
-//! legacy null-null-with-encoding residue shape; the decoder's tolerance of it
-//! (for rows written by earlier builds) is documented at the decoder.
-//!
-//! # Concurrency
-//!
-//! The framework guarantees one handler per key system-wide (Kafka partition
-//! ownership + in-process per-key serialization), so this store never needs
-//! LWTs or distributed locks.
+//! Stores keyed-state cells and collection commit evidence in Cassandra.
+//! Admission resolves residue before owner dispatch. Readers project values
+//! through collection evidence.
 
 mod batch;
 mod cell_store;
@@ -107,21 +43,15 @@ use crate::cassandra_queries;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::event_ref::EventRef;
-use crate::state::fjall::MarkerCheckSet;
 use crate::state::marker::{EventMarker, SectionClear, encode_marker_payload};
-use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::resolve::{
-    ReadPreparation, ResolveCellError, Resolver, flatten_resolve, peek_read, resolve_event_marker,
-    resolve_prior_clear_before_read, resolve_read, resolve_unsettled_clear_before_write,
-};
+use crate::state::resolve::{ResolveCellError, resolve_read};
 use crate::state::store::{
     CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe,
-    expand_to_input_order, section_batches, sorted_unique_coordinates,
+    expand_to_input_order, sorted_unique_coordinates,
 };
 use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
 use crate::timers::duration::CompactDuration;
-use ahash::RandomState;
 use async_stream::try_stream;
 use bytes::Bytes;
 use decode::{BorrowedKeyedCellTtlRow, FramedKeyedCellRow, split_keyed_cell_ttl};
@@ -214,27 +144,23 @@ impl From<CellKind> for i8 {
     }
 }
 
-/// The bottom store's resolving read/sweep error: a raw store failure or an
-/// oracle consult failure.
-pub type CellStoreError<OracleErr> = ResolveCellError<CassandraCellStoreError, OracleErr>;
+/// Classifies cell reads through their underlying store error.
+pub type CellStoreError = ResolveCellError<CassandraCellStoreError>;
 
-/// The session + prepared statements a [`CassandraStore`] is built from, shared
-/// across partitions. The per-partition oracle and registry are supplied at
-/// `CassandraStateBackendFactory::for_partition` time, so the resolving cell
-/// store cannot be pre-built — this holds the partition-independent parts.
+/// Shares a Cassandra session and prepared cell statements across partitions.
 #[derive(Clone)]
 pub struct CassandraCellResources {
     pub(crate) session: CassandraSession,
     pub(crate) queries: Arc<CellQueries>,
 }
 
-/// Counts durable reads during recovery tests.
+/// Counts marker, cell, and batch reads in cell-store tests.
 #[cfg(test)]
 #[derive(Debug, Default)]
-pub(crate) struct RecoveryReadCounts {
-    /// Durable event-marker point reads — memo misses only.
+pub(crate) struct CellReadCounts {
+    /// Durable reads of the full marker slice.
     pub(crate) marker_point_reads: AtomicUsize,
-    /// `kind=Cell` point reads issued during recovery — bounded by
+    /// `kind=Cell` point reads of provisional data — bounded by
     /// #provisional.
     pub(crate) cell_point_reads: AtomicUsize,
     /// `provisional_many` IN queries — exactly one per non-empty chunk.
@@ -243,42 +169,18 @@ pub(crate) struct RecoveryReadCounts {
     pub(crate) provisional_in_queries: AtomicUsize,
 }
 
-/// Tracks marker state for one partition assignment.
-///
-/// `unsettled` can over-report: it can list a marker that never landed.
-/// It must not under-report after `checks` is set: it must not miss a durable
-/// marker. Update `unsettled` before `checks` to enforce this invariant.
-/// A settle removes the marker and keeps `checks` set.
-/// The disk-backed check set prevents unbounded keyed RAM use.
-///
-/// A check-set row is valid only for a store whose `unsettled` map saw that
-/// collection's marker read. Production gives each partition assignment one
-/// store and one check set from that assignment's new workspace. A store that
-/// models a new assignment must start with a cold check set for the collections
-/// it reads. A check-set error reads as unchecked and causes one extra durable
-/// marker read.
-#[derive(Debug)]
-struct MarkerMemo {
-    unsettled: scc::HashMap<CollectionId, EventMarker, RandomState>,
-    checks: MarkerCheckSet,
-}
-
-impl MarkerMemo {
-    fn new(checks: MarkerCheckSet) -> Self {
-        Self {
-            unsettled: scc::HashMap::default(),
-            checks,
-        }
-    }
-}
-
 /// Cassandra-backed uniform cell store.
 #[derive(Clone, Debug)]
-pub struct CassandraStore<O> {
+pub struct CassandraStore {
     session: CassandraSession,
     queries: Arc<CellQueries>,
-    resolver: Resolver<O>,
-    memo: Arc<MarkerMemo>,
+    registry: Arc<CollectionDefRegistry>,
     #[cfg(test)]
-    counters: Arc<RecoveryReadCounts>,
+    counters: Arc<CellReadCounts>,
 }
+
+#[cfg(test)]
+pub(in crate::state) use batch::{
+    settle_batches as crash_settle_batches, stage_batches as crash_stage_batches,
+    stage_chunk as crash_stage_chunk,
+};

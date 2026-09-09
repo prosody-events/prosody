@@ -119,13 +119,6 @@ where
             .await
     }
 
-    fn provisional_cells<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
-        self.inner.provisional_cells(collection)
-    }
-
     fn provisional_cell_at<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -178,13 +171,6 @@ where
         collection: &'a CollectionId,
     ) -> Result<MarkerState, Self::Error> {
         self.inner.marker_state(collection).await
-    }
-
-    fn unsettled_marker<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-    ) -> impl Future<Output = Result<Option<EventMarker>, Self::Error>> + Send + 'a {
-        self.inner.unsettled_marker(collection)
     }
 
     async fn commit_provisional<'a>(

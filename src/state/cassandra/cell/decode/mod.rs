@@ -20,7 +20,7 @@
 //! | Coordinate | Payload | Decode |
 //! | --- | --- | --- |
 //! | `[]` | data, encoding, version, event | `Staged`, payload version 1 or 2 |
-//! | `[1]` | event | `Committed`; ignore payload metadata |
+//! | `[1]` | data, encoding, version, event | `Committed`, version 2 without cells or clears |
 //! | other | any | permanent marker-coordinate corruption |
 //!
 //! Point reads and recovery reads use the same row-shape validation. Recovery
@@ -54,7 +54,9 @@ use crate::state::cassandra::error::CassandraCellStoreError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Cell, Committed, ProvisionalCell};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
-use crate::state::marker::{EventMarker, MarkerState, MarkerVersion, decode_marker_payload};
+use crate::state::marker::{
+    CommittedMarker, EventMarker, MarkerState, MarkerVersion, decode_marker_payload,
+};
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use thiserror::Error;
@@ -164,11 +166,14 @@ pub(super) fn decode_marker_row(
             )?);
         }
         [1] => {
-            state.committed = Some(
-                event
-                    .ok_or(CellCorruptReason::IncompleteMarker)?
-                    .try_into_event()?,
-            );
+            let marker = try_decode_marker((data, encoding, version, event), legacy_ttl)?;
+            if marker.version() != MarkerVersion::V2
+                || !marker.staged().is_empty()
+                || !marker.clears().is_empty()
+            {
+                return Err(CellCorruptReason::IncompleteMarker.into());
+            }
+            state.committed = Some(CommittedMarker::from(&marker));
         }
         _ => return Err(CellCorruptReason::MarkerCoordinate.into()),
     }
@@ -372,7 +377,7 @@ pub enum CellCorruptReason {
     #[error("a cell blob is non-NULL but encoding is NULL")]
     BlobWithoutEncoding,
 
-    /// A marker row lacks its event, or Staged lacks its payload.
+    /// A marker row lacks its event, or it lacks its payload.
     #[error("an event-marker row is missing its event or payload")]
     IncompleteMarker,
 }

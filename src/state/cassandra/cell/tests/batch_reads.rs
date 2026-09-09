@@ -1,4 +1,5 @@
 use super::*;
+use crate::state::marker::AttemptId;
 
 /// Batch-read parity over the live `CassandraStore`: the single-`IN`-query
 /// override answers each position exactly as the sequential point-`get` oracle
@@ -10,9 +11,8 @@ use super::*;
 fn prop_cassandra_batch_read_parity() {
     async fn run(trace: BatchReadTrace) -> Result<bool> {
         let fx = fixture().await?;
-        let oracle = ScriptedOracle::default();
-        let store = fx.bottom_store(oracle.clone())?;
-        Box::pin(run_batch_read_parity_trace(store, oracle, trace)).await
+        let store = fx.bottom_store();
+        Box::pin(run_batch_read_parity_trace(store, trace)).await
     }
 
     init_test_logging();
@@ -28,10 +28,7 @@ fn prop_cassandra_batch_read_parity() {
 async fn cassandra_batch_duplicate_co_observation() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    Box::pin(run_batch_duplicate_co_observation(
-        fx.bottom_store(ScriptedOracle::default())?,
-    ))
-    .await
+    Box::pin(run_batch_duplicate_co_observation(fx.bottom_store())).await
 }
 
 /// Every input position answered over two chunks on the live store.
@@ -39,10 +36,7 @@ async fn cassandra_batch_duplicate_co_observation() -> Result<()> {
 async fn cassandra_batch_preserves_input_positions() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    Box::pin(run_batch_alignment(
-        fx.bottom_store(ScriptedOracle::default())?,
-    ))
-    .await
+    Box::pin(run_batch_alignment(fx.bottom_store())).await
 }
 
 /// Seeds two raw-CQL corrupt cells (unreachable through the store verbs) in
@@ -115,7 +109,7 @@ async fn first_error_is_first_input_position() -> Result<()> {
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default())?;
+    let store = fx.bottom_store();
     let c = collection("resolve-order")?;
     let id = c.id();
     let own = event(9);
@@ -270,7 +264,7 @@ async fn resolved_corrupt_rows_fail_before_blob_decode() -> Result<()> {
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default())?;
+    let store = fx.bottom_store();
     let c = collection("resolved-corrupt-error")?;
     let id = c.id();
     seed_prev_without_event_and_blob_without_encoding(fx.cassandra.session(), id).await?;
@@ -298,7 +292,7 @@ async fn resolved_corrupt_rows_fail_before_blob_decode() -> Result<()> {
 async fn cassandra_raw_batch_is_one_query() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    let seed = fx.bottom_store(ScriptedOracle::default())?;
+    let seed = fx.bottom_store();
     let c = collection("raw-one-query")?;
     let id = c.id();
     let staging = event(0x11);
@@ -311,12 +305,20 @@ async fn cassandra_raw_batch_is_one_query() -> Result<()> {
             ProvisionalWrite::new(Some(bytes(b * 10)), prev, staging),
         ));
     }
-    let marker = EventMarker::frozen(staging, &writes, &[], &[].into(), None);
+    let marker = EventMarker::frozen(
+        staging,
+        &writes,
+        &[],
+        &[].into(),
+        None,
+        None,
+        AttemptId::new(),
+    );
     seed.write_provisional(&c, &writes, Some(&marker)).await?;
 
     // A fresh store: cold counters shared across its clones.
-    let reader = fx.bottom_store(ScriptedOracle::default())?;
-    let counters = reader.recovery_reads();
+    let reader = fx.bottom_store();
+    let counters = reader.read_counts();
     let batch = CoordinateBatch::chunks([1u8, 2].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
@@ -340,93 +342,6 @@ async fn cassandra_raw_batch_is_one_query() -> Result<()> {
     Ok(())
 }
 
-/// Cold recovery `provisional_cells` batches by section at the `CELL_BATCH`
-/// boundary: staging `n` provisional cells and draining the sweep issues
-/// exactly `ceil(n / CELL_BATCH)` raw `IN` queries and ZERO per-coordinate
-/// point reads at n = 127/128/129, plus one query per additional section — the
-/// query-count formula `raw_batch_reads = Σ_s ceil(n_s / CELL_BATCH)`,
-/// `raw_point_reads = 0`. One store per case so its `recovery_reads` counters
-/// start clean; staging never touches `provisional_in_queries`, so the drain's
-/// count is the whole assertion.
-#[tokio::test]
-async fn cassandra_recovery_batches_by_section_at_boundary() -> Result<()> {
-    use crate::state::store::CELL_BATCH;
-
-    init_test_logging();
-    let fx = fixture().await?;
-    let staging = event(0x22);
-
-    for n in [127u32, 128, 129] {
-        let store = fx.bottom_store(ScriptedOracle::default())?;
-        let c = collection(&format!("recovery-boundary-{n}"))?;
-        let counters = store.recovery_reads();
-        let writes: Vec<(CellKey, ProvisionalWrite)> = (0..n)
-            .map(|i| {
-                (
-                    cell_i(i),
-                    ProvisionalWrite::new(Some(bytes(1)), Committed::new(None), staging),
-                )
-            })
-            .collect();
-        let marker = EventMarker::frozen(staging, &writes, &[], &[].into(), None);
-        store.write_provisional(&c, &writes, Some(&marker)).await?;
-
-        let found = provisional_cells(&store, c.id()).await?;
-        assert_eq!(
-            found.len(),
-            n as usize,
-            "every staged cell recovers (n={n})"
-        );
-        assert_eq!(
-            counters.provisional_in_queries.load(Ordering::Relaxed),
-            n.div_ceil(CELL_BATCH as u32) as usize,
-            "one IN query per <=CELL_BATCH chunk, not #cells (n={n})"
-        );
-        assert_eq!(
-            counters.cell_point_reads.load(Ordering::Relaxed),
-            0,
-            "the batched sweep issues no per-coordinate point reads (n={n})"
-        );
-    }
-
-    // Two sections: 129 in section 0 (two chunks) + 1 in section 1 (one chunk)
-    // ⇒ ceil(129/128) + ceil(1/128) = 3 IN queries.
-    let store = fx.bottom_store(ScriptedOracle::default())?;
-    let c = collection("recovery-boundary-two-sections")?;
-    let counters = store.recovery_reads();
-    let mut writes: Vec<(CellKey, ProvisionalWrite)> = (0..129u32)
-        .map(|i| {
-            (
-                cell_i(i),
-                ProvisionalWrite::new(Some(bytes(1)), Committed::new(None), staging),
-            )
-        })
-        .collect();
-    writes.push((
-        CellKey {
-            section: Section::new(1),
-            coordinate: Coordinate::from_bytes(vec![0, 0, 0, 0]),
-        },
-        ProvisionalWrite::new(Some(bytes(2)), Committed::new(None), staging),
-    ));
-    let marker = EventMarker::frozen(staging, &writes, &[], &[].into(), None);
-    store.write_provisional(&c, &writes, Some(&marker)).await?;
-
-    let found = provisional_cells(&store, c.id()).await?;
-    assert_eq!(found.len(), 130, "all cells across both sections recover");
-    assert_eq!(
-        counters.provisional_in_queries.load(Ordering::Relaxed),
-        3,
-        "ceil(129/128) + ceil(1/128) = 2 + 1"
-    );
-    assert_eq!(
-        counters.cell_point_reads.load(Ordering::Relaxed),
-        0,
-        "no per-coordinate point reads across sections"
-    );
-    Ok(())
-}
-
 /// Raw-provisional batch parity over the bare live store: `provisional_many`
 /// returns exactly the survivors the sequential `provisional_cell_at` loop
 /// does.
@@ -434,7 +349,7 @@ async fn cassandra_recovery_batches_by_section_at_boundary() -> Result<()> {
 fn prop_cassandra_raw_batch_parity() {
     async fn run(trace: RawBatchTrace) -> Result<bool> {
         let fx = fixture().await?;
-        let store = fx.bottom_store(ScriptedOracle::default())?;
+        let store = fx.bottom_store();
         Box::pin(run_raw_batch_parity_trace(store, trace)).await
     }
 
@@ -453,10 +368,7 @@ fn prop_cassandra_raw_batch_parity() {
 async fn cassandra_raw_batch_ascending_output() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    Box::pin(run_raw_batch_ascending_output(
-        fx.bottom_store(ScriptedOracle::default())?,
-    ))
-    .await
+    Box::pin(run_raw_batch_ascending_output(fx.bottom_store())).await
 }
 
 /// No-side-effects test over the live store built on a [`CountingOracle`]:
@@ -465,7 +377,6 @@ async fn cassandra_raw_batch_ascending_output() -> Result<()> {
 async fn cassandra_raw_batch_no_side_effects() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    let oracle = CountingOracle::default();
-    let store = fx.bottom_store(oracle.clone())?;
-    Box::pin(run_raw_batch_no_side_effects(store, oracle)).await
+    let store = fx.bottom_store();
+    Box::pin(run_raw_batch_no_side_effects(store)).await
 }

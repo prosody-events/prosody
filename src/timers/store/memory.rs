@@ -559,19 +559,19 @@ impl TriggerOperations for InMemoryTriggerStore {
         Ok(())
     }
 
-    async fn current_tag(
+    async fn current_trigger(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> Result<Option<i32>, Self::Error> {
+    ) -> Result<Option<Trigger>, Self::Error> {
         let partition_key = (self.segment.id, key.clone());
         let clustering_key = (timer_type, time);
         let Some(entry) = self.inner.key_triggers.get_async(&partition_key).await else {
             return Ok(None);
         };
         // entry.get() returns &BTreeMap<...>; then look up by clustering key.
-        Ok(entry.get().get(&clustering_key).map(|t| t.tag))
+        Ok(entry.get().get(&clustering_key).cloned())
     }
 
     // -- V1 migration methods --
@@ -613,7 +613,7 @@ pub fn memory_store(segment: Segment) -> TableAdapter<InMemoryTriggerStore> {
 /// [`MemoryDeduplicationStoreProvider`]. A fresh store per call would make
 /// every "durable" row vanish with the store that wrote it. All maps are
 /// keyed by [`SegmentId`], so sharing across segments cannot collide. (The
-/// keyed-state commit oracle does not mint from here — it receives a clone
+/// state manager does not create stores here — it receives a clone
 /// of the partition's store handle.)
 ///
 /// [`MemoryDeduplicationStoreProvider`]:

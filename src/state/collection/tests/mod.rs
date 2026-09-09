@@ -35,10 +35,9 @@ use crate::state::fjall::test_db;
 use crate::state::identity::CollectionId;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
-use crate::state::registry::CollectionDefRegistry;
 use crate::state::session::sealed::StateLifecycle;
 use crate::state::store::CELL_BATCH;
-use crate::state::tests::support::{CountingCellStore, FixedOracle};
+use crate::state::tests::support::CountingCellStore;
 use crate::state::{CollectionKindId, StateAccessError, StateKey, StateType};
 use crate::test_util::TEST_RUNTIME;
 use bytes::Bytes;
@@ -702,11 +701,7 @@ fn warm_reads_perform_no_additional_lower_reads() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let descriptor: ValueDescriptor<I64Codec> = value_state("warm-value");
         let registry = value_registry(&descriptor)?;
-        let lower = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            FixedOracle::committed(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let lower = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let cached = Cached::new(test_db::cache("collection-warm")?, lower.clone());
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("warm-key"));
         let session = session_over(MemoryLoader::new(), registry, state_key, cached);

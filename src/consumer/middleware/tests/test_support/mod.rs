@@ -2,6 +2,7 @@
 //! scripted handler double and error, message/trigger fixtures, the defer
 //! outcome trio, and the recording-session harness.
 
+use crate::state::tests::support::StageInspection;
 use std::convert::Infallible;
 use std::future::{self, Future};
 use std::marker::PhantomData;
@@ -22,6 +23,7 @@ use crate::Key;
 use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
 use crate::consumer::handler::EventHandler;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, UncommittedMessage};
+use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::middleware::{
     DemandType, FallibleHandler, RepinProof, Settlement, SettlementHandler,
 };
@@ -30,11 +32,10 @@ use crate::consumer::{Keyed, Uncommitted};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::{MemoryLoader, MessageLoader};
 use crate::state::cell::Committed;
-use crate::state::descriptor::tests::{FixedOracle, TestSession, test_session_parts};
+use crate::state::descriptor::tests::{TestSession, test_session_parts};
 use crate::state::descriptor::{Registered, StateDescriptor, ValueDescriptor, value_state};
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
-use crate::state::oracle::CommitOracle;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::{
     EventSession, KeyedStateSession, LifecycleAccess, SessionParts, TerminationWatch,
@@ -42,9 +43,7 @@ use crate::state::session::{
 use crate::state::store::CellStore;
 use crate::state::tests::cell_suite::value_cell;
 use crate::state::tests::support::UnavailableState;
-use crate::state::{
-    CollectionId, CommitDecision, EventRef, PartitionBackend, StateKey, StateName, StateType,
-};
+use crate::state::{CollectionId, EventRef, PartitionBackend, StateKey, StateName, StateType};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger, UncommittedTimer};
@@ -116,7 +115,7 @@ pub fn cart() -> ValueDescriptor {
 /// before the write.
 pub async fn buffered(
     configure: impl FnOnce(Ctx) -> Ctx,
-) -> color_eyre::Result<(Ctx, MemoryCellStore<FixedOracle>, CollectionId)> {
+) -> color_eyre::Result<(Ctx, MemoryCellStore, CollectionId)> {
     let mut registry = CollectionDefRegistry::default();
     registry.register(&cart(), CollectionDef::new(None))?;
     let state_key = StateKey::new(Uuid::from_u128(0x7), Arc::from("user-1"));
@@ -137,17 +136,17 @@ pub async fn buffered(
 
 /// Reports whether `id` still has a provisional cell.
 pub async fn is_provisional(
-    cell_store: &MemoryCellStore<FixedOracle>,
+    cell_store: &MemoryCellStore,
     id: &CollectionId,
 ) -> color_eyre::Result<bool> {
-    let stream = cell_store.provisional_cells(id);
+    let stream = cell_store.staged_cells(id);
     futures::pin_mut!(stream);
     Ok(stream.next().await.transpose()?.is_some())
 }
 
 /// Returns the resolved value from a settled `cart` cell.
 pub async fn committed_value(
-    cell_store: &MemoryCellStore<FixedOracle>,
+    cell_store: &MemoryCellStore,
     id: &CollectionId,
 ) -> color_eyre::Result<Option<Bytes>> {
     let probe = EventRef::Message {
@@ -160,12 +159,7 @@ pub async fn committed_value(
         .map_err(|error| color_eyre::eyre::eyre!("read committed: {error}"))
 }
 
-/// Timer-operation error the mock injects on demand, carrying the category to
-/// classify as. The backstop arm is must-succeed (invariant 8), so it retries
-/// **every** category forever — a `with_timer_failures(k, category)` context
-/// exercises the retry-forever self-heal for each, including `Terminal` (which
-/// `retry_step` retries rather than abandons) and `Permanent` (which the arm's
-/// own loop retries past `retry_step`'s `Skip`).
+/// Mock context with timer, shutdown, and state controls.
 mod context;
 pub use context::*;
 mod handlers;

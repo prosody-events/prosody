@@ -1,6 +1,8 @@
 use super::*;
 use crate::cassandra::TABLE_KEYED_STATE_CELL;
+use crate::state::marker::AttemptId;
 use crate::state::marker::MarkerRow;
+use crate::state::tests::support::StageInspection;
 
 async fn read_cell_blob(fx: &Fixture, id: &CollectionId) -> Result<(Vec<u8>, i16)> {
     let cql = format!(
@@ -38,7 +40,7 @@ async fn read_cell_blob(fx: &Fixture, id: &CollectionId) -> Result<(Vec<u8>, i16
 async fn legacy_null_null_residue_reads_committed_none() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default())?;
+    let store = fx.bottom_store();
     let c = collection("legacy-residue")?;
     let cell = value_cell();
     let id = c.id();
@@ -80,7 +82,7 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default())?;
+    let store = fx.bottom_store();
     let c = collection("cart")?;
     let cell = value_cell();
     let payload = Bytes::from(vec![0xAB_u8; 16 * 1024 + 1]);
@@ -117,7 +119,7 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
 async fn cassandra_data_column_is_raw_through_the_block_size() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default())?;
+    let store = fx.bottom_store();
     let c = collection("raw-format")?;
     let cell = value_cell();
     let payload = Bytes::from_static(b"raw durable payload");
@@ -149,7 +151,7 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default())?;
+    let store = fx.bottom_store();
     let c = collection("corrupt-timer")?;
     let id = c.id();
 
@@ -169,7 +171,15 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
             event(1),
         ),
     )];
-    let marker = EventMarker::frozen(event(1), &writes, &[], &[].into(), None);
+    let marker = EventMarker::frozen(
+        event(1),
+        &writes,
+        &[],
+        &[].into(),
+        None,
+        None,
+        AttemptId::new(),
+    );
     store.write_provisional(&c, &writes, Some(&marker)).await?;
     let corrupt_cell = format!(
         "UPDATE {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} SET event = {{kind: 1, msg_dedup_id: \
@@ -189,7 +199,7 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
         .query_unpaged(corrupt_cell, binds)
         .await?;
 
-    let stream = store.provisional_cells(id);
+    let stream = store.staged_cells(id);
     futures::pin_mut!(stream);
     let err = loop {
         match stream.next().await {
@@ -216,7 +226,7 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
 fn prop_cassandra_present_cell_is_uniquely_owned() {
     async fn check(payload: Vec<u8>) -> Result<bool> {
         let fx = fixture().await?;
-        let store = fx.bottom_store(ScriptedOracle::default())?;
+        let store = fx.bottom_store();
         let c = collection("uniq")?;
         let cell = value_cell();
         let data = Bytes::from(payload);
@@ -258,7 +268,7 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
 
     async fn check(payloads: Vec<Vec<u8>>, finite: bool) -> Result<bool> {
         let fx = fixture().await?;
-        let store = fx.bottom_store(ScriptedOracle::default())?;
+        let store = fx.bottom_store();
         let id = CollectionId::new(
             StateKey::new(Uuid::new_v4(), Arc::from("k")),
             StateType::Application,

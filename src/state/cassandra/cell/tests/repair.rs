@@ -1,12 +1,12 @@
 use super::*;
 use crate::cassandra::TABLE_KEYED_STATE_CELL;
+use crate::state::marker::AttemptId;
+use crate::state::tests::support::seed_commit_evidence;
 
-async fn corrupt_cleared_window(
-    name: &str,
-) -> Result<(Fixture, CassandraStore<ScriptedOracle>, CollectionRef)> {
+async fn corrupt_cleared_window(name: &str) -> Result<(Fixture, CassandraStore, CollectionRef)> {
     let fx = fixture().await?;
-    let oracle = ScriptedOracle::default();
-    let store = fx.bottom_store(oracle.clone())?;
+    let dedup = MemoryDeduplicationStore::default();
+    let store = fx.bottom_store();
     let collection = collection(name)?;
     let id = collection.id();
 
@@ -25,11 +25,19 @@ async fn corrupt_cleared_window(
     let foreign = event(0xF0);
     let survivors = [(cell_in(0, 2), Some(bytes(2)))];
     let clear = SectionClear::frozen_resolved(SECTIONS[0], &survivors);
-    let marker = EventMarker::frozen(foreign, &[], slice::from_ref(&clear), &[].into(), None);
+    let marker = EventMarker::frozen(
+        foreign,
+        &[],
+        slice::from_ref(&clear),
+        &[].into(),
+        None,
+        None,
+        AttemptId::new(),
+    );
     store
         .write_provisional(&collection, &[], Some(&marker))
         .await?;
-    oracle.record_message(Uuid::from_u128(0xF0)).await?;
+    seed_commit_evidence(&store, &collection).await?;
 
     let stale = cell_in(0, 1);
     let corrupt = format!(
@@ -52,13 +60,13 @@ async fn corrupt_cleared_window(
         )
         .await?;
 
+    assert!(admit_collection(&store, &dedup, &collection).await?);
     Ok((fx, store, collection))
 }
 
-/// A point read repairs its unsettled section clear before it decodes the stale
-/// row that the clear removes.
+/// Admission applies a committed clear before the point read decodes rows.
 #[tokio::test]
-async fn point_read_repairs_before_decode() -> Result<()> {
+async fn admit_removes_corrupt_cleared_rows_before_point_read() -> Result<()> {
     init_test_logging();
     let (_fx, store, collection) = corrupt_cleared_window("point-repair-order").await?;
 
@@ -69,10 +77,9 @@ async fn point_read_repairs_before_decode() -> Result<()> {
     Ok(())
 }
 
-/// A batch read repairs its unsettled section clear before it decodes any stale
-/// row that the clear removes.
+/// Admission applies a committed clear before the batch read decodes rows.
 #[tokio::test]
-async fn batch_read_repairs_before_decode() -> Result<()> {
+async fn admit_removes_corrupt_cleared_rows_before_batch_read() -> Result<()> {
     init_test_logging();
     let (_fx, store, collection) = corrupt_cleared_window("batch-repair-order").await?;
     let batch = CoordinateBatch::chunks([1_u8, 2, 3].map(|b| Coordinate::from_bytes(vec![b])))

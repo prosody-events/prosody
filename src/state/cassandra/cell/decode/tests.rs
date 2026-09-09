@@ -20,6 +20,7 @@ use crate::state::cassandra::cell::INITIAL_VERSION;
 use crate::state::cassandra::error::CassandraCellStoreError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Cell, Committed, ProvisionalCell};
+use crate::state::marker::AttemptId;
 use crate::state::marker::{EventMarker, MarkerState, encode_marker_payload};
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
@@ -456,11 +457,19 @@ fn blob_ttl_coalesces_the_present_blobs_ttl() {
     assert_eq!(blob_ttl(None, None), None);
 }
 
-/// Coordinates select the payload decoder; committed metadata is irrelevant.
+/// Coordinates select the marker shape. Both rows require a valid payload.
 #[test]
 fn prop_marker_slice_decodes_by_coordinate() {
     fn prop(coordinate: Vec<u8>, legacy: bool, metadata: i32) -> Result<bool> {
-        let marker = EventMarker::frozen(message_event(), &[], &[], &[].into(), None);
+        let marker = EventMarker::frozen(
+            message_event(),
+            &[],
+            &[],
+            &[].into(),
+            None,
+            None,
+            AttemptId::new(),
+        );
         let payload = encode_marker_payload(&marker)?;
         let mut state = MarkerState::default();
         let legacy_ttl = Some(CompactDuration::new(3600));
@@ -484,12 +493,29 @@ fn prop_marker_slice_decodes_by_coordinate() {
             state.staged.as_ref().map(EventMarker::evidence_ttl),
             Some(if legacy { legacy_ttl } else { None })
         );
+        assert!(
+            decode_marker_row(
+                &mut state,
+                (&[1], None, Some(-1), Some(metadata), Some(raw_event())),
+                None,
+            )
+            .is_err()
+        );
         decode_marker_row(
             &mut state,
-            (&[1], None, Some(-1), Some(metadata), Some(raw_event())),
+            (
+                &[1],
+                Some(&payload),
+                Some(i16::from(Encoding::Raw)),
+                Some(2_i32),
+                Some(raw_event()),
+            ),
             None,
         )?;
-        assert_eq!(state.committed, Some(message_event()));
+        assert_eq!(
+            state.committed.as_ref().map(|marker| marker.event),
+            Some(message_event())
+        );
         // Prefix every generated coordinate with 2, outside both valid addresses.
         let invalid: Vec<_> = [2_u8].into_iter().chain(coordinate).collect();
         Ok(matches!(

@@ -247,12 +247,27 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     ///
     /// Returns `None` if the row is absent ("committed" in oracle terms).
     /// Returns `Some(0)` for rows with a `NULL` tag (pre-migration rows).
+    fn current_trigger(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> impl Future<Output = Result<Option<Trigger>, Self::Error>> + Send;
+
+    /// Reads the tag of the current key row.
     fn current_tag(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> impl Future<Output = Result<Option<i32>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Option<i32>, Self::Error>> + Send {
+        async move {
+            Ok(self
+                .current_trigger(key, time, timer_type)
+                .await?
+                .map(|trigger| trigger.tag))
+        }
+    }
 
     // =========================================================================
     // Version Management (1 method)

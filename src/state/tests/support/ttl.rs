@@ -47,13 +47,6 @@ impl CellStore for TtlStub {
         stream::empty()
     }
 
-    fn provisional_cells<'a>(
-        &'a self,
-        _collection: &'a CollectionId,
-    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
-        stream::empty()
-    }
-
     fn provisional_cell_at<'a>(
         &'a self,
         _collection: &'a CollectionId,
@@ -103,13 +96,6 @@ impl CellStore for TtlStub {
         _collection: &'a CollectionId,
     ) -> impl Future<Output = Result<MarkerState, Self::Error>> + Send + 'a {
         ready(Ok(MarkerState::default()))
-    }
-
-    fn unsettled_marker<'a>(
-        &'a self,
-        _collection: &'a CollectionId,
-    ) -> impl Future<Output = Result<Option<EventMarker>, Self::Error>> + Send + 'a {
-        ready(Ok(None))
     }
 
     fn commit_provisional<'a>(

@@ -1,4 +1,4 @@
-//! A collection stores two marker rows: `Staged` carries recovery data and
+//! A collection stores two marker rows: `Staged` carries residue data and
 //! `Committed` carries positive commit evidence. Only a promote writes
 //! evidence.
 //!
@@ -9,7 +9,7 @@
 //!
 //! Staged uses the collection TTL. Committed uses [`evidence_ttl`].
 //!
-//! The stage write captures the staged list and survivor lists; recovery never
+//! The stage write captures the staged list and survivor lists; admission never
 //! derives them again. These lists contain coordinates, never values.
 //! The event marker is distinct from the dedup commit marker and the in-RAM
 //! dirty clear marker. Always use the qualified name.
@@ -24,9 +24,22 @@ use bytes::Bytes;
 use std::str::from_utf8;
 use std::sync::Arc;
 use thiserror::Error;
+use uuid::Uuid;
 
 /// Width of the `u32` big-endian count/length prefixes in the frozen payload.
 const LEN_PREFIX: usize = 4;
+
+/// Identifies one stage across all collections of one settle.
+/// A Committed row certifies a Staged row exactly when their attempt ids match.
+/// The event and touched list do not select this decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AttemptId(Uuid);
+
+impl AttemptId {
+    pub(crate) fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
 
 /// The two addresses in a collection's marker slice.
 ///
@@ -51,7 +64,34 @@ impl MarkerRow {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MarkerState {
     pub(crate) staged: Option<EventMarker>,
-    pub(crate) committed: Option<EventRef>,
+    pub(crate) committed: Option<CommittedMarker>,
+}
+
+/// Commit evidence retains the discovery path after Staged disappears.
+/// This value cannot carry staged cells or section clears.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CommittedMarker {
+    pub(crate) attempt: AttemptId,
+    pub(crate) event: EventRef,
+    pub(crate) dedup: Option<Uuid>,
+    pub(crate) touched: Arc<[(StateType, StateName)]>,
+}
+
+impl CommittedMarker {
+    pub(crate) fn certifies(&self, marker: &EventMarker) -> bool {
+        self.attempt == marker.attempt()
+    }
+}
+
+impl From<&EventMarker> for CommittedMarker {
+    fn from(marker: &EventMarker) -> Self {
+        Self {
+            attempt: marker.attempt(),
+            event: marker.event(),
+            dedup: marker.dedup(),
+            touched: marker.inner.touched.clone(),
+        }
+    }
 }
 
 /// Evidence retained for one external read or scan.
@@ -67,13 +107,15 @@ pub(crate) struct ReaderEvidence {
 
 impl ReaderEvidence {
     pub(crate) fn committed(&self, event: EventRef) -> bool {
-        self.state.committed == Some(event)
-            || self.staged_committed
-                && self
-                    .state
-                    .staged
-                    .as_ref()
-                    .is_some_and(|marker| marker.event() == event)
+        self.state.staged.as_ref().is_some_and(|staged| {
+            staged.event() == event
+                && (self.staged_committed
+                    || self
+                        .state
+                        .committed
+                        .as_ref()
+                        .is_some_and(|marker| marker.certifies(staged)))
+        })
     }
 
     pub(crate) fn survives(&self, cell: &CellKey) -> bool {
@@ -89,7 +131,7 @@ impl ReaderEvidence {
 }
 
 /// The format selected by the staged row's version column.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MarkerVersion {
     V1,
     V2,
@@ -134,8 +176,8 @@ impl SectionClear {
     /// coordinates of that section's staged cells whose data is present,
     /// ascending. The one survivor definition — the session's `finalize`
     /// builds these from its staged record, the stage freezes them into the
-    /// payload verbatim, and the settle/sweep replay them from the payload
-    /// verbatim.
+    /// payload verbatim, and the settle and admission replay them from the
+    /// payload verbatim.
     #[must_use]
     pub(in crate::state) fn frozen(
         section: Section,
@@ -204,6 +246,8 @@ pub struct EventMarker {
 
 #[derive(Debug, PartialEq, Eq)]
 struct EventMarkerData {
+    version: MarkerVersion,
+    attempt: AttemptId,
     event: EventRef,
     staged: Vec<CellKey>,
     clears: Vec<SectionClear>,
@@ -212,6 +256,7 @@ struct EventMarkerData {
     /// finds no Committed row there and moves on.
     touched: Arc<[(StateType, StateName)]>,
     evidence_ttl: Option<CompactDuration>,
+    dedup: Option<Uuid>,
 }
 
 impl EventMarker {
@@ -226,36 +271,55 @@ impl EventMarker {
         clears: &[SectionClear],
         touched: &Arc<[(StateType, StateName)]>,
         evidence_ttl: Option<CompactDuration>,
+        dedup: Option<Uuid>,
+        attempt: AttemptId,
     ) -> Self {
         let mut coordinates: Vec<CellKey> = staged.iter().map(|(cell, _)| cell.clone()).collect();
         coordinates.sort_unstable();
-        Self::from_parts(
+        Self::from_parts(EventMarkerData {
+            version: MarkerVersion::V2,
+            attempt,
             event,
-            coordinates,
-            clears.to_vec(),
-            Arc::clone(touched),
+            staged: coordinates,
+            clears: clears.to_vec(),
+            touched: Arc::clone(touched),
             evidence_ttl,
-        )
+            dedup,
+        })
     }
 
-    /// Reconstructs a marker from decoded parts (the payload decoder).
-    #[must_use]
-    fn from_parts(
-        event: EventRef,
-        staged: Vec<CellKey>,
-        clears: Vec<SectionClear>,
-        touched: Arc<[(StateType, StateName)]>,
-        evidence_ttl: Option<CompactDuration>,
-    ) -> Self {
+    fn from_parts(data: EventMarkerData) -> Self {
         Self {
-            inner: Arc::new(EventMarkerData {
-                event,
-                staged,
-                clears,
-                touched,
-                evidence_ttl,
-            }),
+            inner: Arc::new(data),
         }
+    }
+
+    pub(crate) fn attempt(&self) -> AttemptId {
+        self.inner.attempt
+    }
+
+    /// The durable format selects the commit rule for old residue.
+    pub(crate) fn version(&self) -> MarkerVersion {
+        self.inner.version
+    }
+
+    /// Builds the payload that remains after this collection promotes.
+    pub(crate) fn committed_payload(&self) -> Self {
+        Self::from_parts(EventMarkerData {
+            version: MarkerVersion::V2,
+            attempt: self.attempt(),
+            event: self.event(),
+            staged: Vec::new(),
+            clears: Vec::new(),
+            touched: self.inner.touched.clone(),
+            evidence_ttl: self.evidence_ttl(),
+            dedup: self.dedup(),
+        })
+    }
+
+    /// The dedup row to record after the promote.
+    pub(crate) fn dedup(&self) -> Option<Uuid> {
+        self.inner.dedup
     }
 
     /// The owning event.
@@ -285,21 +349,6 @@ impl EventMarker {
     pub(crate) fn evidence_ttl(&self) -> Option<CompactDuration> {
         self.inner.evidence_ttl
     }
-
-    /// Reports whether the marker carries at least one section clear.
-    #[must_use]
-    pub(crate) fn has_clears(&self) -> bool {
-        !self.inner.clears.is_empty()
-    }
-
-    /// Reports whether the marker is another event's marker with a section
-    /// clear.
-    ///
-    /// A read by `own` must resolve such a marker before it reads.
-    #[must_use]
-    pub(crate) fn is_prior_clear(&self, own: EventRef) -> bool {
-        self.event() != own && self.has_clears()
-    }
 }
 
 /// Encodes an [`EventMarker`]'s payload — everything but its `event` — to the
@@ -317,6 +366,9 @@ impl EventMarker {
 /// [touched_count: u32 BE]
 ///   touched_count × [state_type: i8][name_len: u32 BE][UTF-8 name]
 /// [evidence_ttl_secs: u32 BE] // 0 means no expiry
+/// [dedup_present: u8] // 0 means absent; nonzero means present
+/// [dedup: 16 bytes] // only when present
+/// [attempt: 16 bytes]
 /// ```
 ///
 /// Frozen and pinned; the Cassandra Staged row is its production caller (the
@@ -347,6 +399,7 @@ pub(in crate::state) fn encode_marker_payload(
             .iter()
             .map(|(_, name)| 1 + LEN_PREFIX + name.as_str().len())
             .sum::<usize>();
+    len += 16 + 1 + marker.dedup().map_or(0, |_| 16);
     let mut buf = Vec::with_capacity(len);
     buf.extend_from_slice(&len_u32(marker.staged().len())?.to_be_bytes());
     for cell in marker.staged() {
@@ -373,6 +426,11 @@ pub(in crate::state) fn encode_marker_payload(
             .map_or(0, CompactDuration::seconds)
             .to_be_bytes(),
     );
+    buf.push(u8::from(marker.dedup().is_some()));
+    if let Some(dedup) = marker.dedup() {
+        buf.extend_from_slice(dedup.as_bytes());
+    }
+    buf.extend_from_slice(marker.attempt().0.as_bytes());
     Ok(Bytes::from(buf))
 }
 
@@ -418,8 +476,15 @@ pub(in crate::state) fn decode_marker_payload(
         clears.push(SectionClear { section, survivors });
     }
 
-    let (mut touched, ttl) = match version {
-        MarkerVersion::V1 => (Vec::new(), legacy_ttl),
+    let (mut touched, ttl, dedup) = match version {
+        MarkerVersion::V1 => (
+            Vec::new(),
+            legacy_ttl,
+            match event {
+                EventRef::Message { dedup_id } => Some(dedup_id),
+                EventRef::Timer(_) => None,
+            },
+        ),
         MarkerVersion::V2 => {
             let count = cursor.take_u32()? as usize;
             let mut touched = Vec::with_capacity(count.min(cursor.remaining()));
@@ -433,30 +498,54 @@ pub(in crate::state) fn decode_marker_payload(
                 ));
             }
             let seconds = cursor.take_u32()?;
+            let dedup = match cursor.take_section()? {
+                0 => None,
+                _ => Some(Uuid::from_bytes(
+                    cursor
+                        .take(16)?
+                        .try_into()
+                        .map_err(|_| MarkerPayloadError::Truncated)?,
+                )),
+            };
             (
                 touched,
                 (seconds != 0).then(|| CompactDuration::new(seconds)),
+                dedup,
             )
         }
+    };
+    let attempt = match version {
+        MarkerVersion::V1 => AttemptId::new(),
+        MarkerVersion::V2 => AttemptId(Uuid::from_bytes(
+            cursor
+                .take(16)?
+                .try_into()
+                .map_err(|_| MarkerPayloadError::Truncated)?,
+        )),
     };
     if !cursor.is_empty() {
         return Err(MarkerPayloadError::TrailingGarbage);
     }
     touched.sort_unstable();
     touched.dedup();
-    Ok(EventMarker::from_parts(
+    Ok(EventMarker::from_parts(EventMarkerData {
+        version,
+        attempt,
         event,
         staged,
         clears,
-        touched.into(),
-        ttl,
-    ))
+        touched: touched.into(),
+        evidence_ttl: ttl,
+        dedup,
+    }))
 }
 
 /// Fields shared by all collection stages of one event.
 pub(crate) struct EventEvidence {
+    pub(crate) attempt: AttemptId,
     pub(crate) touched: Arc<[(StateType, StateName)]>,
     pub(crate) evidence_ttl: Option<CompactDuration>,
+    pub(crate) dedup: Option<Uuid>,
 }
 
 /// Selects the longest touched TTL, or no expiry if any touched collection has
@@ -468,10 +557,11 @@ pub(crate) struct EventEvidence {
 /// collection's permanent residue. An empty set returns None. An event without
 /// touched collections stages no marker.
 pub(crate) fn evidence_ttl(
+    dedup_ttl: CompactDuration,
     mut ttls: impl Iterator<Item = Option<CompactDuration>>,
 ) -> Option<CompactDuration> {
     let first = ttls.next()??;
-    ttls.try_fold(first, |maximum, ttl| Some(maximum.max(ttl?)))
+    ttls.try_fold(first.max(dedup_ttl), |maximum, ttl| Some(maximum.max(ttl?)))
 }
 
 /// A `usize` length as the `u32` wire prefix, or

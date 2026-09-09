@@ -405,11 +405,5 @@ impl TestHarness {
         self.context.has_scheduled_timer(TimerType::DeferredTimer)
     }
 }
-/// The timer-defer swallow through the settle boundary: the inner attempt
-/// buffers a `cart` write and fails Transient; `defer_first_timer` swallows
-/// that error into `Ok(Deferred)` — classified `Bypassed`, so the trigger
-/// commits while nothing stages, no marker records, and **no `StateRecovery`
-/// backstop arms** (the empty-finalize `Clean`-never-arms parity: arming is
-/// possession-driven, and a bypassed dispatch never mints a receipt). A
-/// clean success that staged nothing arms nothing either.
+/// A bypassed deferred timer commits its source without state or dedup.
 mod defer_swallow;

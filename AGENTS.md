@@ -195,7 +195,7 @@ designs are where bloat and bug re-introduction live:
   that file and goes stale when the plan is renumbered or deleted. Name the
   concept instead, or link a durable symbol (`[`CollectionDef`]`). Stable
   cross-references to invariants/findings **documented in AGENTS.md itself**
-  (e.g. "invariant 8", "finding F2") are fine — those live in a durable doc.
+  are valid because those references remain in a durable document.
 
 **Style:**
 
@@ -400,7 +400,7 @@ terminates the chain with the handler as the **INNERMOST** component.
 - The block built by `build_common_middleware`
   (`telemetry.layer(timeout).layer(scheduler).layer(cancellation).layer(dedup)`)
   is the **innermost** block, directly outside the handler. It carries every
-  cross-mode concern — including the mandatory `dedup` commit oracle — so modes
+  cross-mode concern — including the mandatory `dedup` filter — so modes
   layer only their mode-specific middleware OUTSIDE it. Within the block
   OUTER→INNER is
   `dedup → cancellation → scheduler → timeout → telemetry → handler`.
@@ -420,33 +420,18 @@ hardcoding `Final`) decides `Final` vs `Bypassed` before the error category is
 consulted; the message commit marker is read from the session's event identity
 (`message_marker()` — the message `EventRef`'s dedup id, or the
 deferred-reload's last-wins identity override), never deposited by middleware.
-The full stage → arm-backstop → marker-record → commit → promote order, its
-crash-window argument, and the sweep's mirrored posture are documented once on
-their owning items — `settle`/`settle_committed`, `arm_backstop`/`ArmOutcome`,
-and `StateManager::recover` — read those doc comments before touching any of
-it. The anchors code comments cite by name:
+The boundary stages cells, promotes them, records the message dedup id, and commits the source.
+Read `settle_committed`, `Staged::promote`, and `PartitionStateManager::admit` before changes to this sequence.
 
-- **Invariant 8:** arming the backstop is must-succeed. `arm_backstop` retries
-  every non-shutdown failure and can only report `ShuttingDown`, so "abort in
-  normal operation" is structurally unwritable at the boundary.
-- **Finding F2:** neither the boundary nor the sweep ever unschedules a
-  backstop — per-key `StateRecovery` timers are only ever pulled sooner
-  (arm-if-sooner), so one event can never clear or loosen another event's
-  still-needed backstop. There is no `unschedule_all`; do not reintroduce one.
-- **Posture:** retry transient AND terminal store failures forever; skip only
-  permanent data-rejections; abort only on shutdown; never emit Terminal.
-- **No WAL, ever.** State is one provisional cell per value. The in-memory
-  `DirtyStore` (one shared per-partition workspace; race-free per-event
-  key-range clears) is never a durability or recovery source — recovery is
-  Cassandra provisional cells + the commit oracle. Do not re-add a disk-backed
-  dirty store; fjall remains only the committed-value cache (`FjallCellCache`).
-  The marker record sits textually after the stage inside one function, so
-  "marker before durable state" is unwritable.
+The collection's `Committed` row supplies positive evidence. It certifies a `Staged` row only through the attempt identity.
+The promote writes evidence before cell changes. Each stage chunk writes its discovery row atomically with its cells.
+Admission runs before the key's first dispatch. It resolves residue and retires committed sources.
+The disk-backed check set records complete admission. A failed stage or promote removes that proof.
+No new event arms a `StateRecovery` timer. An old timer runs admission and commits its trigger.
 
-The collection's `Committed` row supplies additive evidence written by the
-promote, before cell changes. The commit point remains the dedup marker.
-Standalone readers use collection evidence to resolve provisional values.
-The backstop and commit oracle still govern owner recovery.
+**No WAL.** Durable state consists of provisional cells and collection commit evidence.
+The shared in-memory `DirtyStore` is never a recovery source. Fjall holds the committed-value cache and admission checks.
+Store operations retry transient and terminal failures. Permanent data rejections can skip a step. Shutdown can stop the sequence.
 
 Two residual order facts govern middleware placement:
   - `retry` stays OUTERMOST so each attempt is a fresh dispatch, isolated by

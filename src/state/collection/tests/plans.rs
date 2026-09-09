@@ -410,7 +410,6 @@ fn gate_session(ladder: Arc<GateLadder>) -> Result<GateSession> {
         GateLoader(ladder),
         value_registry(&descriptor)?,
         StateKey::new(Uuid::new_v4(), Arc::from("gate")),
-        Arc::default(),
         false,
     );
     Ok(KeyedStateSession::new(parts))

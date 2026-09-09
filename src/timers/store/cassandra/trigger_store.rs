@@ -956,34 +956,48 @@ impl TriggerOperations for CassandraTriggerStore {
     /// concurrent promote/demote cannot interleave between the state check and
     /// the row read.
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
-    async fn current_tag(
+    async fn current_trigger(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> Result<Option<i32>, Self::Error> {
+    ) -> Result<Option<Trigger>, Self::Error> {
         let segment_id = self.segment.id;
         let (handle, cached) = self.resolve_state(&segment_id, key, timer_type).await?;
         Span::current().record("state_cached", cached);
 
         let guard = handle.lock().await;
         match &*guard {
-            TimerState::Inline(timer) if timer.time == time => Ok(Some(timer.tag)),
+            TimerState::Inline(timer) if timer.time == time => Ok(Some(Trigger::restored(
+                key.clone(),
+                time,
+                timer_type,
+                timer.tag,
+                self.propagator().extract(&timer.span),
+            ))),
             TimerState::Inline(_) | TimerState::Absent => Ok(None),
             TimerState::Overflow => {
                 let row = self
                     .session()
                     .execute_unpaged(
-                        &self.queries().current_tag_key,
+                        &self.queries().current_trigger_key,
                         (&segment_id, key.as_ref(), timer_type, time),
                     )
                     .await
                     .map_err(CassandraStoreError::from)?
                     .into_rows_result()
                     .map_err(CassandraStoreError::from)?
-                    .maybe_first_row::<(Option<i32>,)>()
+                    .maybe_first_row::<(Option<i32>, HashMap<String, String>)>()
                     .map_err(CassandraStoreError::from)?;
-                Ok(row.map(|(tag_opt,)| tag_opt.unwrap_or(0_i32)))
+                Ok(row.map(|(tag, span)| {
+                    Trigger::restored(
+                        key.clone(),
+                        time,
+                        timer_type,
+                        tag.unwrap_or(0_i32),
+                        self.propagator().extract(&span),
+                    )
+                }))
             }
         }
     }

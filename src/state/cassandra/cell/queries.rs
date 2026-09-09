@@ -186,9 +186,10 @@ cassandra_queries! {
             TABLE_KEYED_STATE_CELL
         ),
 
-        /// Writes only the committed event with the evidence TTL.
+        /// Writes the committed event and discovery payload with the evidence TTL.
         committed_write: (
-            "UPDATE $keyspace.{} USING TTL ? SET event = ? \
+            "UPDATE $keyspace.{} USING TTL ? \
+             SET data = ?, encoding = ?, version = ?, event = ? \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL

@@ -256,6 +256,8 @@ struct Fixture {
     triggers: TriggerQueue,
     /// Authoritative per-trigger model.
     expected: TriggerModels,
+    /// Gives each add command a distinct input tag.
+    next_tag: i32,
     /// Anchored at construction so all ops within one iteration use a
     /// stable `now_slab_id` regardless of wall-clock drift.
     now_slab: SlabId,
@@ -286,6 +288,7 @@ impl Fixture {
             state,
             triggers,
             expected: TriggerModels::default(),
+            next_tag: 0,
             now_slab,
             universe,
         })
@@ -309,29 +312,9 @@ impl Fixture {
 
     async fn apply_schedule(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
         let (key, time, ty) = spec.resolve(self.now_slab);
-        let trigger = Trigger::new(key.clone(), time, ty, Span::current());
+        self.next_tag += 1_i32;
+        let trigger = Trigger::with_tag(key.clone(), time, ty, self.next_tag, Span::current());
         let current_model = self.model_for(&key, time, ty);
-
-        // Reviving an Aborted timer with the same identity is an in-memory
-        // state transition: the store row already exists, so just flip the
-        // state back to Scheduled and re-queue.
-        if current_model.active_state == Some(ModelActiveState::Aborted) {
-            self.triggers
-                .active_triggers()
-                .set_state(&key, time, ty, TimerState::Scheduled)
-                .await;
-            self.triggers.insert_queue_only(trigger);
-            self.set_model(
-                key,
-                time,
-                ty,
-                TriggerModel {
-                    in_store: true,
-                    active_state: Some(ModelActiveState::Scheduled),
-                },
-            );
-            return Ok(());
-        }
 
         let slab_id = Slab::from_time(self.segment.slab_size, time).id();
         let past_unregistered = self
@@ -356,7 +339,7 @@ impl Fixture {
 
         let mut model = current_model;
         model.in_store = true;
-        if owns_slab(&self.state, slab_id) && model.active_state.is_none() {
+        if owns_slab(&self.state, slab_id) {
             model.active_state = Some(ModelActiveState::Scheduled);
         }
         self.set_model(key, time, ty, model);
@@ -832,8 +815,19 @@ async fn test_cleanup_preserves_aborted_timer_slab_and_reload_schedules_it() -> 
 
 async fn run_property(ops: Vec<Op>) -> StdResult<(), String> {
     let mut fixture = Fixture::new().await?;
-    let history = ops.clone();
-    for (i, op) in ops.into_iter().enumerate() {
+    let same = TriggerSpec {
+        key_idx: 0,
+        slab_offset: -1,
+        timer_type: TimerType::DeferredMessage,
+    };
+    let prefix = [
+        Op::Schedule(same),
+        Op::LoadStep,
+        Op::Fire(same),
+        Op::Schedule(same),
+    ];
+    let history: Vec<_> = prefix.into_iter().chain(ops).collect();
+    for (i, op) in history.iter().cloned().enumerate() {
         fixture
             .apply(op.clone())
             .await
@@ -849,7 +843,11 @@ async fn run_property(ops: Vec<Op>) -> StdResult<(), String> {
 #[test]
 fn prop_scheduler_invariants() {
     fn property(seq: OpSequence) -> TestResult {
-        let runtime = match RuntimeBuilder::new_current_thread().enable_all().build() {
+        let runtime = match RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+        {
             Ok(r) => r,
             Err(e) => return TestResult::error(format!("runtime build: {e:?}")),
         };

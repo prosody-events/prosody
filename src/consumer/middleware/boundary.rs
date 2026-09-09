@@ -7,55 +7,15 @@ use crate::consumer::message::UncommittedMessage;
 use crate::consumer::{DemandType, EventHandler};
 use crate::timers::UncommittedTimer;
 
-/// Marks a [`FallibleHandler`] as the **durability boundary**, getting the
-/// blanket [`EventHandler`] impl below.
-///
-/// # The durability sequence has one owner: `settle`
-///
-/// The blanket impl invokes the inner `FallibleHandler` method **exactly
-/// once**, then hands the single result to `settle` — the one place that
-/// runs the keyed-state durability sequence in straight-line code:
-///
-/// ```text
-/// Bypassed final                → commit → after_commit (no stage, no marker)
-/// Final Ok  → stage provisional cells / write resolved (retry transient failures in place)
-///           → arm StateRecovery backstop (clear_and_schedule; per-key singleton)
-///           → record the message marker (read from the session's event
-///             identity; STRICTLY after the stage)
-///           → commit the offset / trigger marker
-///           → promote the staged cells (the backstop stays armed; the sweep
-///             self-clears once the key goes quiet)
-///           → after_commit(Ok)
-/// Final Err Transient/Permanent → record marker iff Permanent → commit → after_commit(Err)
-/// Err Terminal                  → abort → after_abort
-/// ```
-///
-/// Because the marker record is textually *after* the stage in one function,
-/// the marker-before-durable-state bug class is **unwritable**, not merely
-/// avoided. The crash-window argument for the full step order — including
-/// why promotion runs strictly after the commit — lives on
-/// `settle_committed` in `settle.rs`. The timer marker (trigger tag) is
-/// written outside the stack by the marker commit; the message marker here
-/// restores message/timer symmetry.
-///
-/// [`RetryHandler`](crate::consumer::middleware::retry::RetryHandler) is a
-/// second durability boundary (it owns its own `EventHandler` impl so it can
-/// map shutdown to abort rather than commit); it routes its final outcome
-/// through the **same** `settle` / `abandon` functions, so the sequence still
-/// has a single owner. No other middleware should implement `EventHandler`
-/// directly.
-///
-/// **Stack contract:** whether a dispatch settles the event is a pure
-/// function of the *final* result the stack returns — the crate-internal
-/// `settlement()` classification. A middleware that swallows or rescues (a
-/// defer swallow into `Ok(Deferred)`, a DLQ route into `Ok(Routed)`, a dedup
-/// skip into `Ok(None)`) classifies its own variants `Bypassed`, so nothing
-/// stages and no marker records for the swallowed attempt; there is no reset
-/// protocol to remember. The blanket impl below therefore requires both this
-/// trait and `SettlementHandler`.
-///
-/// Per-invocation apply-hook correctness is preserved: one inner invocation
-/// pairs with exactly one `after_commit` / `after_abort` firing.
+/// Runs a fallible handler through the shared settlement boundary.
+/// Each invocation produces one result and one apply hook.
+/// Successful final results stage cells, promote, record dedup, then commit the
+/// source. Bypassed results commit the source without state writes.
+/// Permanent errors record dedup best-effort; transient errors commit without
+/// it. Terminal errors abort the source.
+/// [`RetryHandler`](crate::consumer::middleware::retry::RetryHandler) uses the
+/// same boundary. The internal settlement classification decides whether a
+/// result needs settlement.
 pub trait FallibleEventHandler: FallibleHandler {
     /// Called when message processing fails.
     fn on_message_error(&self, _error: &Self::Error) {}

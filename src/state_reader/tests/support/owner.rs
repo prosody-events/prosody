@@ -6,13 +6,12 @@ use crate::loader::MemoryLoader;
 use crate::segment::partition_segment_id;
 use crate::state::descriptor::StateDescriptor;
 use crate::state::identity::StateKey;
-use crate::state::manager::ArmedKeys;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-use crate::state::session::sealed::{ApplyOutcome, StateLifecycle};
+use crate::state::session::sealed::StateLifecycle;
 use crate::state::session::{Finalized, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
-use crate::state::tests::support::{FixedOracle, probe};
+use crate::state::tests::support::{MemoryDeduplicationStore, probe};
 use crate::state::{EventRef, PartitionBackend};
 use crate::state_reader::PartitionCount;
 use crate::state_reader::partition_for_key;
@@ -31,9 +30,9 @@ use tokio::sync::watch;
 /// never resolves a foreign provisional. The identity type is phantom: the
 /// session never reads it. See [`SessionParts`] for why one type serves
 /// every backend. Only `C` varies: [`MemoryCellStore`] for the memory
-/// reader, `CassandraStore<FixedOracle>` for the live-Cassandra reader.
+/// reader, `CassandraStore` for the live-Cassandra reader.
 pub(in crate::state_reader::tests) type OwnerBackend<C> =
-    PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, C>;
+    PartitionBackend<MemoryDeduplicationStore, MemoryDescriptorIdentityStore, C, ()>;
 
 /// The real per-event session the seeding handles bind over, generic over
 /// cell store `C`.
@@ -81,13 +80,13 @@ fn owner_session<C: CellStore>(
     KeyedStateSession::new(SessionParts::<OwnerBackend<C>, _> {
         cell,
         dirty: Arc::default(),
-        oracle: FixedOracle::committed(),
+        dedup: MemoryDeduplicationStore::new(),
         loader: MemoryLoader::new(),
         registry: registry.clone(),
         state_key: state_key.clone(),
         event,
-        recovery_delay: CompactDuration::new(30),
-        armed: ArmedKeys::default(),
+        dedup_ttl: CompactDuration::new(30),
+        checks: (),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     })
 }
@@ -102,7 +101,7 @@ async fn promote<C: CellStore>(session: OwnerSession<C>) -> Result<()> {
         .finalize()
         .await
         .map_err(|e| eyre!("finalize: {e}"))?
-        && staged.certify().promote().await != ApplyOutcome::Resolved
+        && !staged.promote(|| false).await
     {
         bail!("promote incomplete on a healthy store");
     }
@@ -159,10 +158,10 @@ pub(crate) async fn owner_commit<D, F, Fut>(
 ) -> Result<()>
 where
     D: StateDescriptor,
-    F: FnOnce(D::Handle<OwnerSession<MemoryCellStore<FixedOracle>>>) -> Fut,
+    F: FnOnce(D::Handle<OwnerSession<MemoryCellStore>>) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    let cell = MemoryCellStore::new(cells.clone(), FixedOracle::committed(), registry.clone());
+    let cell = MemoryCellStore::new(cells.clone());
     owner_commit_cell(cell, registry, state_key, descriptor, event, ops).await
 }
 
@@ -178,10 +177,10 @@ pub(in crate::state_reader::tests) async fn owner_stage<D, F, Fut>(
 ) -> Result<()>
 where
     D: StateDescriptor,
-    F: FnOnce(D::Handle<OwnerSession<MemoryCellStore<FixedOracle>>>) -> Fut,
+    F: FnOnce(D::Handle<OwnerSession<MemoryCellStore>>) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    let cell = MemoryCellStore::new(cells.clone(), FixedOracle::committed(), registry.clone());
+    let cell = MemoryCellStore::new(cells.clone());
     let session = owner_session(cell, registry, state_key, probe(event));
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     ops(handle).await?;

@@ -401,8 +401,8 @@ cassandra_queries! {
         ),
 
         /// Reads the tag from a single clustering row.
-        current_tag_key: (
-            "SELECT tag FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ? LIMIT 1",
+        current_trigger_key: (
+            "SELECT tag, span FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ? LIMIT 1",
             TABLE_TYPED_KEYS
         ),
 

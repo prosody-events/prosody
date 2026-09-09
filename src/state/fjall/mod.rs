@@ -56,6 +56,7 @@ pub(crate) use workspace::{FjallClient, FjallWorkspace};
 
 use self::codec::Read;
 use crate::state::CollectionId;
+use crate::state::backend::AdmissionChecks;
 use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Section};
 use crate::state::store::{CellBuffer, CommittedBatch, CoordinateBatch};
@@ -161,23 +162,6 @@ pub(crate) struct FjallCellCache {
     #[cfg(test)]
     #[educe(Debug(ignore))]
     fail_puts: Arc<AtomicBool>,
-    /// Test-only fault seam: when set, [`index_snapshot`](Self::index_snapshot)
-    /// returns an engine error, so a test can force the warm coords read to
-    /// fail while the collection stays seeded — the branch that must
-    /// degrade the recovery sweep to the cold durable re-seed rather than
-    /// fabricate an empty (clean) sweep that would strand a provisional
-    /// cell.
-    #[cfg(test)]
-    #[educe(Debug(ignore))]
-    fail_index_snapshot: Arc<AtomicBool>,
-    /// Test-only fault seam: when set, [`index_record`](Self::index_record)
-    /// and [`index_record_batch`](Self::index_record_batch)
-    /// return an engine error, so a test can force a cold-seed record to fail
-    /// and assert the collection is left **unseeded** (the next sweep re-seeds)
-    /// rather than latched seeded over an incomplete coords set.
-    #[cfg(test)]
-    #[educe(Debug(ignore))]
-    fail_index_record: Arc<AtomicBool>,
     /// Test-only fault seam: a countdown of delete-side calls to fail — each
     /// failure decrements it — consulted by
     /// [`delete_batch`](Self::delete_batch),
@@ -324,10 +308,6 @@ impl FjallCellCache {
             #[cfg(test)]
             fail_puts: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
-            fail_index_snapshot: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            fail_index_record: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
             fail_deletes: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             fail_reads: Arc::new(AtomicBool::new(false)),
@@ -362,22 +342,6 @@ impl FjallCellCache {
     #[must_use]
     pub fn fail_puts(&self) -> Arc<AtomicBool> {
         self.fail_puts.clone()
-    }
-
-    /// Test handle on the [`index_snapshot`](Self::index_snapshot) fault seam:
-    /// the shared flag a test sets to force the warm coords read to fail.
-    #[cfg(test)]
-    #[must_use]
-    pub fn fail_index_snapshot(&self) -> Arc<AtomicBool> {
-        self.fail_index_snapshot.clone()
-    }
-
-    /// Test handle on the [`index_record`](Self::index_record) fault seam: the
-    /// shared flag a test sets to force a cold-seed record to fail.
-    #[cfg(test)]
-    #[must_use]
-    pub fn fail_index_record(&self) -> Arc<AtomicBool> {
-        self.fail_index_record.clone()
     }
 
     /// Test handle on the delete-side fault seam: the shared countdown of
@@ -755,10 +719,8 @@ impl FjallCellCache {
     /// [`Cached::commit_provisional`](crate::state::cached::Cached)); every
     /// other caller passes `&[]` for a whole-section delete. The exclusion set
     /// is encoded **once, in the committed-cell key form** (`codec::cell_key`
-    /// — the same form the walk yields; the provisional-*index* encoding
-    /// carries an extra kind byte and would never match, silently deleting the
-    /// staged survivors) and held hashed, so each walked key costs O(1)
-    /// expected and memory stays O(|exclude| + one hop).
+    /// — the same form the walk yields) and held hashed, so each walked key
+    /// costs O(1) expected and memory stays O(|exclude| + one hop).
     pub(crate) async fn delete_section(
         &self,
         collection: &CollectionId,
@@ -821,155 +783,6 @@ impl FjallCellCache {
         }
     }
 
-    // --- Warm index: provisional coordinates + cold-seed latch ---------------
-    //
-    // The warm provisional-coordinate cache the recovery sweep short-circuits
-    // on. It lives
-    // in the per-partition `index` keyspace, cold at a fresh assignment and
-    // dropped at revocation. It is the disk-spilling relocation of the former
-    // in-RAM `ProvisionalIndex`; the durable Cassandra event marker remains
-    // the authoritative cold-recovery source (a fresh assignment re-seeds
-    // from it).
-
-    /// Whether `collection`'s one-time cold seed has run (the seeded latch).
-    pub(crate) async fn index_seeded(
-        &self,
-        collection: &CollectionId,
-    ) -> Result<bool, FjallCellCacheError> {
-        let raw = read_cell(
-            self.inner.index_handle(),
-            codec::index_seeded_key(collection),
-        )
-        .await?;
-        Ok(raw.is_some())
-    }
-
-    /// Marks `collection` seeded once its bounded cold seed read completes.
-    pub(crate) async fn index_mark_seeded(
-        &self,
-        collection: &CollectionId,
-    ) -> Result<(), FjallCellCacheError> {
-        write_index_empty(
-            self.inner.index_handle(),
-            codec::index_seeded_key(collection),
-        )
-        .await
-    }
-
-    /// Drops `collection`'s seeded latch, forcing the next sweep to re-seed
-    /// from the durable index (used when a stage write fails and a
-    /// coordinate may have landed durably that the coords set now misses).
-    /// A delete-side op: must-succeed at its call sites (a latch left true
-    /// over an incomplete snapshot would short-circuit every later sweep), so
-    /// it honors the shared delete fault seam.
-    pub(crate) async fn index_unseed(
-        &self,
-        collection: &CollectionId,
-    ) -> Result<(), FjallCellCacheError> {
-        #[cfg(test)]
-        self.injected_delete_failure()?;
-        let handle = self.inner.index_handle().clone();
-        let key = codec::index_seeded_key(collection);
-        spawn_blocking(move || handle.remove(key.as_slice())).await??;
-        Ok(())
-    }
-
-    /// Records `cell` as a live provisional coordinate of `collection`.
-    pub(crate) async fn index_record(
-        &self,
-        collection: &CollectionId,
-        cell: &CellKey,
-    ) -> Result<(), FjallCellCacheError> {
-        #[cfg(test)]
-        if self.fail_index_record.load(Ordering::Relaxed) {
-            return Err(FjallCellCacheError::Injected);
-        }
-        write_index_empty(
-            self.inner.index_handle(),
-            codec::index_coord_key(collection, cell),
-        )
-        .await
-    }
-
-    /// Records a batch of live provisional coordinates of `collection` in one
-    /// atomic [`OwnedWriteBatch`] — the settle-time counterpart of the
-    /// streaming single-key [`index_record`](Self::index_record), collapsing N
-    /// blocking hops to one. All-or-nothing: on a failure the caller cannot
-    /// know which coordinates landed durably, so it drops the seeded latch
-    /// ([`index_unseed`](Self::index_unseed)) and the next sweep re-seeds.
-    pub(crate) async fn index_record_batch<'a, I>(
-        &self,
-        collection: &CollectionId,
-        cells: I,
-    ) -> Result<(), FjallCellCacheError>
-    where
-        I: ExactSizeIterator<Item = &'a CellKey>,
-    {
-        #[cfg(test)]
-        if self.fail_index_record.load(Ordering::Relaxed) {
-            return Err(FjallCellCacheError::Injected);
-        }
-        let keys = index_keys(collection, cells);
-        let handle = self.inner.index_handle().clone();
-        let capacity = keys.len();
-        self.run_batch(handle, capacity, move |batch, handle| {
-            for key in &keys {
-                batch.insert(handle, key.as_slice(), [].as_slice());
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    /// Clears a batch of resolved provisional coordinates from `collection` in
-    /// one atomic [`OwnedWriteBatch`]. A failure is a harmless over-report:
-    /// the sweep's point-read filter drops already-resolved coordinates.
-    pub(crate) async fn index_clear_batch<'a, I>(
-        &self,
-        collection: &CollectionId,
-        cells: I,
-    ) -> Result<(), FjallCellCacheError>
-    where
-        I: ExactSizeIterator<Item = &'a CellKey>,
-    {
-        let keys = index_keys(collection, cells);
-        let handle = self.inner.index_handle().clone();
-        let capacity = keys.len();
-        self.run_batch(handle, capacity, move |batch, handle| {
-            for key in &keys {
-                batch.remove(handle, key.as_slice());
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    /// Snapshots `collection`'s live provisional coordinates — the recovery
-    /// drain buffer, sized to `#provisional`. Empty ⟹ the warm sweep issues no
-    /// Cassandra reads. Collected in one [`spawn_blocking`] over the bounded
-    /// `Coord` prefix range (the guard cannot cross an `.await`).
-    pub(crate) async fn index_snapshot(
-        &self,
-        collection: &CollectionId,
-    ) -> Result<Vec<CellKey>, FjallCellCacheError> {
-        #[cfg(test)]
-        if self.fail_index_snapshot.load(Ordering::Relaxed) {
-            return Err(FjallCellCacheError::Injected);
-        }
-        let handle = self.inner.index_handle().clone();
-        let prefix = codec::index_coord_prefix(collection);
-        spawn_blocking(move || {
-            // A `Vec`: unbounded (∝ #provisional) → `Vec` is correct.
-            let mut out: Vec<CellKey> = Vec::new();
-            for guard in handle.prefix(prefix) {
-                let (key, _) = guard.into_inner()?;
-                out.push(codec::coord_cell_key(&key));
-            }
-            Ok(out)
-        })
-        .await?
-    }
-
     /// Runs `fill` over a fresh [`OwnedWriteBatch`] against `handle` and
     /// commits it, all in a single blocking hop — the shared ceremony behind
     /// every all-or-nothing batch mutator except
@@ -995,16 +808,8 @@ impl FjallCellCache {
     }
 }
 
-/// Records which collections had their durable event marker read this
-/// assignment.
-///
-/// The rows live in the per-assignment `index` keyspace. The workspace `Drop`
-/// and the startup orphan sweep reclaim them. A RAM set would grow without
-/// bound over a weeks-long assignment.
-///
-/// An error leaves the collection unchecked.
-/// The next check reads the durable marker again.
-/// A disabled cache stops reads and writes through this handle.
+/// Stores admission proofs in the assignment's disk workspace.
+/// Workspace deletion and the startup orphan sweep reclaim the rows.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub(crate) struct MarkerCheckSet {
@@ -1014,31 +819,40 @@ pub(crate) struct MarkerCheckSet {
     disabled: Arc<AtomicBool>,
 }
 
-impl MarkerCheckSet {
-    /// Reports whether this assignment checked the collection's durable marker.
-    pub(crate) async fn contains(&self, collection: &CollectionId) -> bool {
+impl AdmissionChecks for MarkerCheckSet {
+    type Error = FjallCellCacheError;
+
+    async fn contains(&self, key: &crate::Key) -> Result<bool, Self::Error> {
         if self.disabled.load(Ordering::Relaxed) {
-            return false;
+            return Ok(false);
         }
-        match read_cell(&self.index, codec::marker_check_key(collection)).await {
-            Ok(raw) => raw.is_some(),
-            Err(error) => {
-                warn!(%error, "marker check failed; the collection remains unchecked");
-                false
-            }
-        }
+        let index = self.index.clone();
+        let key = key.clone();
+        Ok(spawn_blocking(move || index.contains_key(key.as_bytes())).await??)
     }
 
-    /// Records a completed durable marker check for the collection.
-    pub(crate) async fn set(&self, collection: &CollectionId) {
+    async fn mark(&self, key: &crate::Key) -> Result<(), Self::Error> {
         if self.disabled.load(Ordering::Relaxed) {
-            return;
+            return Ok(());
         }
-        if let Err(error) =
-            write_index_empty(&self.index, codec::marker_check_key(collection)).await
-        {
-            warn!(%error, "marker check record failed; the collection remains unchecked");
+        let index = self.index.clone();
+        let key = key.clone();
+        spawn_blocking(move || index.insert(key.as_bytes(), [])).await??;
+        Ok(())
+    }
+
+    async fn unmark(&self, key: &crate::Key) -> Result<(), Self::Error> {
+        let index = self.index.clone();
+        let key = key.clone();
+        let result = async {
+            spawn_blocking(move || index.remove(key.as_bytes())).await??;
+            Ok(())
         }
+        .await;
+        if result.is_err() {
+            self.disabled.store(true, Ordering::Relaxed);
+        }
+        result
     }
 }
 
@@ -1049,20 +863,6 @@ fn encode_frame(payload: Option<&Bytes>, expiry: u64) -> Bytes {
         Some(payload) => codec::encode_present_cell(payload, expiry),
         None => codec::encode_absent_cell(expiry),
     }
-}
-
-/// The encoded warm-index keys of a batch of coordinates — built up front on a
-/// [`CellBuffer`] inline buffer (bounded, sized once) so the common small write
-/// set stays on the stack and the blocking batch closure only touches fjall.
-fn index_keys<'a>(
-    collection: &CollectionId,
-    cells: impl ExactSizeIterator<Item = &'a CellKey>,
-) -> CellBuffer<SmallVec<[u8; 32]>> {
-    let mut keys: CellBuffer<SmallVec<[u8; 32]>> = SmallVec::with_capacity(cells.len());
-    for cell in cells {
-        keys.push(codec::index_coord_key(collection, cell));
-    }
-    keys
 }
 
 /// Reads the raw cell at `key`, or `None` when the key is absent — one
@@ -1086,18 +886,6 @@ async fn write_cell(
 ) -> Result<(), FjallCellCacheError> {
     let cache = cache.clone();
     spawn_blocking(move || cache.insert(key.as_ref(), cell.as_ref())).await??;
-    Ok(())
-}
-
-/// Inserts an empty-valued warm-index key (presence-as-boolean), one blocking
-/// hop. Generic over the key so a fixed-size `[u8; N]` index key inserts
-/// without a bridging copy.
-async fn write_index_empty(
-    handle: &Keyspace,
-    key: impl AsRef<[u8]> + Send + 'static,
-) -> Result<(), FjallCellCacheError> {
-    let handle = handle.clone();
-    spawn_blocking(move || handle.insert(key.as_ref(), [].as_slice())).await??;
     Ok(())
 }
 

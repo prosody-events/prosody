@@ -420,19 +420,6 @@ pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
         self.with_collection_def(def)
     }
 
-    /// Sets the collection's recovery-convergence bound: guarantee its
-    /// provisional cells are swept back to committed within `d` of the commit,
-    /// tightening how long an external (non-owner) reader can observe the
-    /// prior committed value. Only ever *tightens* the per-key backstop; a
-    /// value above the always-on `recovery_delay` floor is clamped by it.
-    /// See [`CollectionDef`].
-    #[must_use]
-    fn recovery_within(self, d: CompactDuration) -> Self {
-        let mut def = self.collection_def();
-        def.recovery_within = Some(d);
-        self.with_collection_def(def)
-    }
-
     /// Selects [`CommitMode::ReadUncommitted`]: writes apply to committed
     /// state on handler success, with at-least-once semantics.
     #[must_use]

@@ -257,30 +257,35 @@ impl CassandraStore {
         let ranges: SmallVec<[Range<usize>; 1]> =
             chunk_boundaries(units.iter().map(BatchUnit::weight), max_bytes, max_count).collect();
         stream::iter(ranges)
-            .map(|range| async move {
-                // One flatten pass over the chunk's units builds the statement
-                // list and the value list in lockstep via `unzip`, so
-                // `batch.statements[i]` binds `values[i]` — each row's own
-                // statement against its own columns. A misaligned flatten would
-                // bind against the wrong statement's columns *silently* (scylla
-                // falls back to an empty context on a count/order mismatch), so
-                // the single-pass lockstep is load-bearing.
-                let (statements, values): (Vec<BatchStatement>, Vec<&R>) = units[range]
-                    .iter()
-                    .flat_map(|unit| unit.rows.iter())
-                    .map(|row| (BatchStatement::from(row.statement().clone()), row))
-                    .unzip();
-                let mut batch = Batch::new_with_statements(BatchType::Unlogged, statements);
-                batch.set_is_idempotent(true);
-                self.session()
-                    .batch(&batch, &values)
-                    .await
-                    .map(drop)
-                    .map_err(CassandraStoreError::from)
-            })
+            .map(|range| async move { self.execute_unlogged_batch(units[range].iter()).await })
             .buffer_unordered(concurrency)
             .try_collect::<()>()
             .await
+    }
+
+    /// Executes one atomic mutation for a single partition.
+    pub(crate) async fn execute_unlogged_batch<'a, R: BatchRow + Sync + 'a>(
+        &self,
+        units: impl Iterator<Item = &'a BatchUnit<R>>,
+    ) -> Result<(), CassandraStoreError> {
+        // One flatten pass over the chunk's units builds the statement
+        // list and the value list in lockstep via `unzip`, so
+        // `batch.statements[i]` binds `values[i]` — each row's own
+        // statement against its own columns. A misaligned flatten would
+        // bind against the wrong statement's columns *silently* (scylla
+        // falls back to an empty context on a count/order mismatch), so
+        // the single-pass lockstep is load-bearing.
+        let (statements, values): (Vec<BatchStatement>, Vec<&R>) = units
+            .flat_map(|unit| unit.rows.iter())
+            .map(|row| (BatchStatement::from(row.statement().clone()), row))
+            .unzip();
+        let mut batch = Batch::new_with_statements(BatchType::Unlogged, statements);
+        batch.set_is_idempotent(true);
+        self.session()
+            .batch(&batch, &values)
+            .await
+            .map(drop)
+            .map_err(CassandraStoreError::from)
     }
 }
 
@@ -329,7 +334,7 @@ impl<R> BatchUnit<R> {
 /// Because cells keep their order (the partition is partitioned contiguously),
 /// greedily extending each chunk to a limit yields the provably minimal chunk
 /// count: no contiguous partition into fewer parts can exist.
-fn chunk_boundaries(
+pub(crate) fn chunk_boundaries(
     weights: impl Iterator<Item = u64>,
     max_bytes: u64,
     max_count: usize,

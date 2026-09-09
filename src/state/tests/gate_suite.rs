@@ -24,7 +24,6 @@ use super::super::descriptor::{
     CellStateError, MapStateError, StateDescriptor, deque, deque_state, map, map_state, value_state,
 };
 use super::super::dirty::DirtyStore;
-use super::super::manager::ArmedKeys;
 use super::super::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use super::super::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use super::super::registry::{CollectionDef, CollectionDefRegistry};
@@ -35,7 +34,7 @@ use super::super::{
     CollectionId, CollectionRef, Direction, PartitionBackend, StateAccessError, StateKey,
     StateName, StateType, StoreOutcome,
 };
-use super::cell_suite::{ScriptedOracle, value_cell};
+use super::cell_suite::{MemoryDeduplicationStore, value_cell};
 use super::collection_suite::finalize_and_promote;
 use super::support::{CountingCellStore, HoldingCellStore, Holds, probe};
 use crate::codec::{JsonCodec, JsonCodecError};
@@ -82,29 +81,32 @@ async fn let_task_park() {
 }
 
 /// The gate suite's lower store: holds beneath counters beneath memory.
-type GateStore = HoldingCellStore<CountingCellStore<MemoryCellStore<ScriptedOracle>>>;
+type GateStore = HoldingCellStore<CountingCellStore<MemoryCellStore>>;
 
 /// The per-partition backend the gate-suite sessions run over.
-type GateBackend =
-    PartitionBackend<ScriptedOracle, MemoryDescriptorIdentityStore, Cached<GateStore>>;
+type GateBackend = PartitionBackend<
+    MemoryDeduplicationStore,
+    MemoryDescriptorIdentityStore,
+    Cached<GateStore>,
+    (),
+>;
 
 /// One test's fixture: the composed cache, its seams, and session minting.
 struct GateFixture {
     cached: Cached<GateStore>,
-    counting: CountingCellStore<MemoryCellStore<ScriptedOracle>>,
+    counting: CountingCellStore<MemoryCellStore>,
     holds: Arc<Holds>,
     cells: MemoryCells,
-    oracle: ScriptedOracle,
+    dedup: MemoryDeduplicationStore,
     registry: Arc<CollectionDefRegistry>,
     state_key: StateKey,
-    armed: ArmedKeys,
 }
 
 impl GateFixture {
     /// Builds the fixture over the shared fjall database keyspace `name`,
     /// registering the suite's value/map/deque collections.
     fn new(name: &str) -> Result<Self> {
-        let oracle = ScriptedOracle::default();
+        let dedup = MemoryDeduplicationStore::default();
         let cells = MemoryCells::new();
         let mut registry = CollectionDefRegistry::default();
         registry.register(&value_state::<JsonCodec>("v"), CollectionDef::new(None))?;
@@ -121,11 +123,7 @@ impl GateFixture {
             },
         )?;
         let registry = Arc::new(registry);
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            cells.clone(),
-            oracle.clone(),
-            registry.clone(),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(cells.clone()));
         let holding = HoldingCellStore::new(counting.clone());
         let holds = holding.holds();
         let cached = Cached::new(test_db::cache(name)?, holding);
@@ -134,10 +132,9 @@ impl GateFixture {
             counting,
             holds,
             cells,
-            oracle,
+            dedup,
             registry,
             state_key: StateKey::new(Uuid::new_v4(), Arc::from("key")),
-            armed: Arc::default(),
         })
     }
 
@@ -159,13 +156,13 @@ impl GateFixture {
         KeyedStateSession::new(SessionParts::<GateBackend, _> {
             cell: self.cached.clone(),
             dirty,
-            oracle: self.oracle.clone(),
+            dedup: self.dedup.clone(),
             loader: MemoryLoader::new(),
             registry: self.registry.clone(),
             state_key: self.state_key.clone(),
             event: probe(n),
-            recovery_delay: CompactDuration::new(30),
-            armed: self.armed.clone(),
+            dedup_ttl: CompactDuration::new(30),
+            checks: (),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
         })
     }
@@ -322,7 +319,7 @@ fn gate_serializes_set_against_commit_drain() -> Result<()> {
         // buffered after the drain, not swallowed by it.
         finalize_and_promote(
             &session,
-            &fx.oracle,
+            &fx.dedup,
             Uuid::from_u128(1),
             &fx.cells,
             &fx.id("m")?,
@@ -434,7 +431,7 @@ fn gate_serializes_set_against_clear() -> Result<()> {
         // Settle, then probe the physical state: no live entry may survive with
         // an absent keyset. With the gate the outcome is set-then-clear (empty);
         // the injected race strands entry 1 with a cleared keyset.
-        finalize_and_promote(&session, &fx.oracle, Uuid::from_u128(1), &fx.cells, &id).await?;
+        finalize_and_promote(&session, &fx.dedup, Uuid::from_u128(1), &fx.cells, &id).await?;
         let verify = fx.session(2);
         let fresh = map_state::<I64KeyCodec, JsonCodec>("m")
             .bind(&verify)
@@ -498,7 +495,7 @@ fn gate_serializes_racing_keyset_rmw() -> Result<()> {
 
         finalize_and_promote(
             &session,
-            &fx.oracle,
+            &fx.dedup,
             Uuid::from_u128(1),
             &fx.cells,
             &fx.id("m")?,
@@ -625,7 +622,7 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
             .map_err(|_| eyre!("set(4) hung"))??
             .map_err(|e| eyre!("set(4): {e}"))?;
 
-        finalize_and_promote(&session, &fx.oracle, Uuid::from_u128(1), &fx.cells, &id).await?;
+        finalize_and_promote(&session, &fx.dedup, Uuid::from_u128(1), &fx.cells, &id).await?;
 
         // The serial second set exceeds the limit → Overflowed.
         let keyset = fx
@@ -695,7 +692,7 @@ fn map_keyset_rotating_stays_tracked() -> Result<()> {
                 .set(step, Value::from(step))
                 .await
                 .map_err(|e| eyre!("{e}"))?;
-            finalize_and_promote(&session, &fx.oracle, event, &fx.cells, &id).await?;
+            finalize_and_promote(&session, &fx.dedup, event, &fx.cells, &id).await?;
         }
 
         // A fresh stream over the live window {3,4,5} takes the Tracked arm.
@@ -771,7 +768,7 @@ fn map_keyset_removal_heals_oversized() -> Result<()> {
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
         handle.remove(&1).await.map_err(|e| eyre!("{e}"))?;
         handle.remove(&2).await.map_err(|e| eyre!("{e}"))?;
-        finalize_and_promote(&session, &fx.oracle, Uuid::from_u128(2), &fx.cells, &id).await?;
+        finalize_and_promote(&session, &fx.dedup, Uuid::from_u128(2), &fx.cells, &id).await?;
 
         // The healed frame ({3,4,5}) takes the point-get arm — no scan.
         fx.counting.reset();
@@ -1467,7 +1464,7 @@ fn closed_session_fences_mutators_but_serves_hook_reads() -> Result<()> {
             .map_err(|e| eyre!("set: {e}"))?;
         finalize_and_promote(
             &session,
-            &fx.oracle,
+            &fx.dedup,
             Uuid::from_u128(1),
             &fx.cells,
             &fx.id("v")?,
@@ -1541,7 +1538,7 @@ async fn settle_and_verify(
 ) -> Result<()> {
     finalize_and_promote(
         session,
-        &fx.oracle,
+        &fx.dedup,
         Uuid::from_u128(1),
         &fx.cells,
         &fx.id("v")?,

@@ -56,14 +56,8 @@ impl TimerEventRef {
     }
 }
 
-/// Oracle verdict on a provisional cell's event.
-///
-/// Returned by the commit oracle when it resolves a provisional cell's
-/// [`EventRef`] against the upstream commit source (deduplication store for
-/// messages, timer-row tag for timers — see
-/// [`CommitOracle`](crate::state::oracle::CommitOracle)). Distinct from
-/// [`StoreOutcome`], which reports whether a call took effect: the oracle
-/// decides, the store — or the buffer drain — acts.
+/// The explicit admission decision for one staged event.
+/// Store operations apply this decision to the frozen stage.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum CommitDecision {
     /// The event's provisional write committed: promote it to the committed

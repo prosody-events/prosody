@@ -13,6 +13,7 @@ use super::{CassandraTriggerStore, cassandra_store};
 use super::{InlineTimer, TimerState};
 use crate::Key;
 use crate::cassandra::CassandraStore;
+use crate::test_util::TEST_RUNTIME;
 use crate::test_util::{integration_test_count, sampled_remote_context, test_cassandra_config};
 use crate::timers::TimerType;
 use crate::timers::Trigger;
@@ -38,7 +39,7 @@ use uuid::Uuid;
 
 /// Creates a test store and segment, returning `(store, segment_id)`.
 async fn setup_test_store(name: &str) -> Result<(CassandraTriggerStore, SegmentId)> {
-    setup_test_store_with_version(name, SegmentVersion::V3).await
+    setup_test_store_with_version(name, SegmentVersion::V4).await
 }
 
 /// Creates a test store and segment with the given version, returning `(store,
@@ -80,6 +81,50 @@ trigger_store_tests!(
     },
     integration_test_count(25)
 );
+
+/// Acquisition stamps V4 durably and rejects an unknown future layout.
+#[test]
+fn prop_segment_layout_fence() {
+    async fn run(slab_size: u16) -> Result<bool> {
+        use crate::error::{ClassifyError, ErrorCategory};
+        let (store, id) = setup_test_store_with_version("layout-fence", SegmentVersion::V3).await?;
+        let slab_size = CompactDuration::new(u32::from(slab_size).max(1));
+        store
+            .update_segment_version(SegmentVersion::V3, slab_size)
+            .await?;
+        let acquired = store
+            .get_segment()
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("segment missing"))?;
+        assert_eq!(acquired.version, SegmentVersion::V4);
+        let durable = store
+            .get_segment_unchecked(&id)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("segment missing"))?;
+        assert_eq!(durable.version, SegmentVersion::V4);
+        store
+            .session()
+            .execute_unpaged(
+                &store.queries().update_segment_version,
+                (5_i8, store.segment.slab_size, id),
+            )
+            .await?;
+        let error = store
+            .get_segment()
+            .await
+            .err()
+            .ok_or_else(|| color_eyre::eyre::eyre!("future layout was accepted"))?;
+        assert_eq!(error.classify_error(), ErrorCategory::Terminal);
+        store.delete_segment().await?;
+        Ok(true)
+    }
+    fn property(size: u16) -> Result<bool> {
+        TEST_RUNTIME.block_on(run(size))
+    }
+    quickcheck::QuickCheck::new()
+        .tests(integration_test_count(25))
+        .quickcheck(property as fn(u16) -> Result<bool>);
+}
 
 #[tokio::test]
 async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
@@ -1148,7 +1193,6 @@ async fn test_key_triggers_all_types_preserves_inline_tags() -> Result<()> {
 /// `(key, timer_type)` combination against the reference model.
 #[test]
 fn test_prop_timer_state_invariant() {
-    use crate::test_util::TEST_RUNTIME;
     use quickcheck::{QuickCheck, TestResult};
     use tracing::Instrument;
 
@@ -1266,8 +1310,7 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
 #[tokio::test]
 async fn oracle_reads_through_the_writers_store() -> Result<()> {
     use super::CassandraTriggerStoreProvider;
-    use crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStore;
-    use crate::state::commit::{CommitManager, StoreTagSource};
+
     use crate::timers::store::{TriggerStore, TriggerStoreProvider};
     init_test_logging();
 
@@ -1276,10 +1319,6 @@ async fn oracle_reads_through_the_writers_store() -> Result<()> {
     let provider = CassandraTriggerStoreProvider::with_store(base, &config.keyspace).await?;
     let segment = test_segment("oracle_writer_handle", 60_u32);
     let writer = provider.create_store(segment);
-    let oracle = CommitManager::new(
-        MemoryDeduplicationStore::new(),
-        StoreTagSource(writer.clone()),
-    );
 
     let key: Key = format!("oracle-writer-{}", Uuid::new_v4()).into();
     let timer_type = TimerType::Application;
@@ -1291,9 +1330,7 @@ async fn oracle_reads_through_the_writers_store() -> Result<()> {
     // observes it (NotCommitted → the event refires) and warms the cache.
     writer.add_trigger(trigger).await?;
     assert!(
-        !oracle
-            .is_timer_committed(&key, timer_type, time, wal_tag)
-            .await?,
+        writer.current_tag(&key, time, timer_type).await? == Some(wal_tag),
         "standing trigger row must read NotCommitted"
     );
 
@@ -1302,9 +1339,7 @@ async fn oracle_reads_through_the_writers_store() -> Result<()> {
     // the previous consult warmed the cache.
     writer.remove_trigger(&key, time, timer_type).await?;
     assert!(
-        oracle
-            .is_timer_committed(&key, timer_type, time, wal_tag)
-            .await?,
+        (writer.current_tag(&key, time, timer_type).await? != Some(wal_tag)),
         "commit through the writer must flip the warmed oracle to committed"
     );
 
@@ -1313,16 +1348,12 @@ async fn oracle_reads_through_the_writers_store() -> Result<()> {
     let second = Trigger::new(key.clone(), time, timer_type, tracing::Span::current());
     let second_tag = second.tag;
     assert!(
-        oracle
-            .is_timer_committed(&key, timer_type, time, second_tag)
-            .await?,
+        (writer.current_tag(&key, time, timer_type).await? != Some(second_tag)),
         "absent row reads committed before the reschedule"
     );
     writer.add_trigger(second).await?;
     assert!(
-        !oracle
-            .is_timer_committed(&key, timer_type, time, second_tag)
-            .await?,
+        writer.current_tag(&key, time, timer_type).await? == Some(second_tag),
         "schedule through the writer must read NotCommitted"
     );
 

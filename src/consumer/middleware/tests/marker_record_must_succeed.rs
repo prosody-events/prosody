@@ -9,6 +9,7 @@
 //! message session records its `EventRef` dedup id; a pure timer session
 //! records nothing.
 use super::*;
+use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::cell::Committed;
@@ -16,13 +17,12 @@ use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
-use crate::state::oracle::CommitOracle;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
+use crate::state::tests::support::StageInspection;
 use crate::state::{
-    CollectionId, CommitDecision, EventRef, PartitionBackend, StateKey, StateName, StateType,
-    TimerEventRef,
+    CollectionId, EventRef, PartitionBackend, StateKey, StateName, StateType, TimerEventRef,
 };
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -51,13 +51,13 @@ impl ClassifyError for MockMarkerError {
 /// configured category before succeeding, logging every recorded id;
 /// `resolve` always answers Committed.
 #[derive(Clone)]
-struct FlakyMarkerOracle {
+struct FlakyMarkerDedup {
     remaining: Arc<AtomicUsize>,
     category: ErrorCategory,
     recorded: Arc<Mutex<Vec<Uuid>>>,
 }
 
-impl FlakyMarkerOracle {
+impl FlakyMarkerDedup {
     fn new(fail_count: usize, category: ErrorCategory) -> Self {
         Self {
             remaining: Arc::new(AtomicUsize::new(fail_count)),
@@ -71,10 +71,10 @@ impl FlakyMarkerOracle {
     }
 }
 
-impl CommitOracle for FlakyMarkerOracle {
+impl DeduplicationStore for FlakyMarkerDedup {
     type Error = MockMarkerError;
 
-    fn record_message(&self, dedup_id: Uuid) -> impl Future<Output = Result<(), Self::Error>> {
+    fn insert(&self, dedup_id: Uuid) -> impl Future<Output = Result<(), Self::Error>> {
         // While the countdown is positive, decrement it and inject one
         // more failure; once exhausted, record the marker.
         if self
@@ -88,20 +88,13 @@ impl CommitOracle for FlakyMarkerOracle {
         ready(Ok(()))
     }
 
-    fn resolve<'a>(
-        &'a self,
-        _state_key: &'a StateKey,
-        _event: EventRef,
-    ) -> impl Future<Output = Result<CommitDecision, Self::Error>> {
-        ready(Ok(CommitDecision::Committed))
+    fn exists(&self, id: Uuid) -> impl Future<Output = Result<bool, Self::Error>> {
+        ready(Ok(self.recorded.lock().contains(&id)))
     }
 }
 
-type FlakyBackend = PartitionBackend<
-    FlakyMarkerOracle,
-    MemoryDescriptorIdentityStore,
-    MemoryCellStore<FlakyMarkerOracle>,
->;
+type FlakyBackend =
+    PartitionBackend<FlakyMarkerDedup, MemoryDescriptorIdentityStore, MemoryCellStore, ()>;
 type FlakySession = KeyedStateSession<FlakyBackend, MemoryLoader<serde_json::Value>>;
 
 /// The fixed message dedup id the sessions below carry on their
@@ -116,30 +109,26 @@ fn cart() -> ValueDescriptor {
 /// `oracle`, plus the shared durable cell store and the `cart`
 /// collection id for post-settle inspection.
 fn flaky_session(
-    oracle: FlakyMarkerOracle,
+    dedup: FlakyMarkerDedup,
     event: EventRef,
-) -> Result<(
-    FlakySession,
-    MemoryCellStore<FlakyMarkerOracle>,
-    CollectionId,
-)> {
+) -> Result<(FlakySession, MemoryCellStore, CollectionId)> {
     let mut registry = CollectionDefRegistry::default();
     registry.register(&cart(), CollectionDef::new(None))?;
     let registry = Arc::new(registry);
-    let cell_store = MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone());
+    let cell_store = MemoryCellStore::new(MemoryCells::new());
     let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
     let (_cancel_tx, cancel_rx) = watch::channel(false);
     let state_key = StateKey::new(Uuid::from_u128(0xD), Arc::from("user-1"));
     let session = KeyedStateSession::new(SessionParts {
         cell: cell_store.clone(),
         dirty: Arc::new(DirtyStore::new()),
-        oracle,
+        dedup,
         loader: MemoryLoader::new(),
         registry,
         state_key: state_key.clone(),
         event,
-        recovery_delay: CompactDuration::new(30),
-        armed: Arc::default(),
+        dedup_ttl: CompactDuration::new(30),
+        checks: (),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     });
     let cart_id = CollectionId::new(
@@ -154,10 +143,10 @@ fn flaky_session(
 /// provisional cell nor a committed value — via raw probes that no
 /// resolving read can heal.
 async fn assert_no_durable_cart(
-    cell_store: &MemoryCellStore<FlakyMarkerOracle>,
+    cell_store: &MemoryCellStore,
     cart_id: &CollectionId,
 ) -> Result<()> {
-    let provisional = cell_store.provisional_cells(cart_id);
+    let provisional = cell_store.staged_cells(cart_id);
     futures::pin_mut!(provisional);
     assert!(
         provisional.next().await.transpose()?.is_none(),
@@ -185,9 +174,9 @@ async fn assert_no_durable_cart(
 /// failure on every redelivery.
 #[tokio::test]
 async fn err_permanent_records_the_marker_with_no_stage() -> Result<()> {
-    let oracle = FlakyMarkerOracle::new(0, ErrorCategory::Transient);
+    let dedup = FlakyMarkerDedup::new(0, ErrorCategory::Transient);
     let (session, cell_store, cart_id) =
-        flaky_session(oracle.clone(), EventRef::Message { dedup_id: DEDUP_ID })?;
+        flaky_session(dedup.clone(), EventRef::Message { dedup_id: DEDUP_ID })?;
     let context = MockEventContext::new().with_session(session);
     // Stage a dirty write so "no stage" is a real claim, not vacuous.
     let handle = context
@@ -207,7 +196,7 @@ async fn err_permanent_records_the_marker_with_no_stage() -> Result<()> {
     .await;
 
     assert_eq!(
-        oracle.recorded(),
+        dedup.recorded(),
         vec![DEDUP_ID],
         "a final Permanent error must record the message marker so the failure deduplicates",
     );
@@ -222,9 +211,9 @@ async fn err_permanent_records_the_marker_with_no_stage() -> Result<()> {
 /// handled, so its marker must not certify anything.
 #[tokio::test]
 async fn err_transient_never_records_the_marker() -> Result<()> {
-    let oracle = FlakyMarkerOracle::new(0, ErrorCategory::Transient);
+    let dedup = FlakyMarkerDedup::new(0, ErrorCategory::Transient);
     let (session, cell_store, cart_id) =
-        flaky_session(oracle.clone(), EventRef::Message { dedup_id: DEDUP_ID })?;
+        flaky_session(dedup.clone(), EventRef::Message { dedup_id: DEDUP_ID })?;
     let context = MockEventContext::new().with_session(session);
     let handle = context
         .state(Registered::new(cart()))
@@ -243,7 +232,7 @@ async fn err_transient_never_records_the_marker() -> Result<()> {
     .await;
 
     assert!(
-        oracle.recorded().is_empty(),
+        dedup.recorded().is_empty(),
         "a Transient final error must NOT record a marker over never-staged state",
     );
     assert_no_durable_cart(&cell_store, &cart_id).await?;
@@ -264,13 +253,13 @@ async fn pure_timer_never_records_a_message_marker() -> Result<()> {
         Err(TestError(ErrorCategory::Transient, "final")),
     ];
     for result in finals {
-        let oracle = FlakyMarkerOracle::new(0, ErrorCategory::Transient);
+        let dedup = FlakyMarkerDedup::new(0, ErrorCategory::Transient);
         let timer = EventRef::Timer(TimerEventRef::new(
             TimerType::Application,
             CompactDateTime::from(1000_u32),
             0,
         ));
-        let (session, _cell_store, _cart_id) = flaky_session(oracle.clone(), timer)?;
+        let (session, _cell_store, _cart_id) = flaky_session(dedup.clone(), timer)?;
         let context = MockEventContext::new().with_session(session);
         let handler = ProbeHandler::ok(0);
         let (guard, committed, aborted) = RecordingGuard::new();
@@ -278,7 +267,7 @@ async fn pure_timer_never_records_a_message_marker() -> Result<()> {
         settle(&handler, context, guard, result).await;
 
         assert!(
-            oracle.recorded().is_empty(),
+            dedup.recorded().is_empty(),
             "a pure timer must never record a message marker",
         );
         assert_eq!(committed.load(Ordering::SeqCst), 1, "the trigger commits");
@@ -310,9 +299,9 @@ fn prop_marker_record_self_heals_to_certified_commit() {
             return TestResult::error("failed to build paused runtime");
         };
         runtime.block_on(async move {
-            let oracle = FlakyMarkerOracle::new(fail_count, category);
+            let dedup = FlakyMarkerDedup::new(fail_count, category);
             let event = EventRef::Message { dedup_id: DEDUP_ID };
-            let (session, cell_store, cart_id) = match flaky_session(oracle.clone(), event) {
+            let (session, cell_store, cart_id) = match flaky_session(dedup.clone(), event) {
                 Ok(parts) => parts,
                 Err(e) => return TestResult::error(format!("setup: {e}")),
             };
@@ -331,8 +320,8 @@ fn prop_marker_record_self_heals_to_certified_commit() {
 
             let committed = committed.load(Ordering::SeqCst);
             let aborted = aborted.load(Ordering::SeqCst);
-            let recorded = oracle.recorded();
-            let provisional = cell_store.provisional_cells(&cart_id);
+            let recorded = dedup.recorded();
+            let provisional = cell_store.staged_cells(&cart_id);
             futures::pin_mut!(provisional);
             let still_provisional = matches!(provisional.next().await, Some(Ok(_)));
             let probe = EventRef::Message {

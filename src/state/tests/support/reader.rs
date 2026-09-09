@@ -1,5 +1,6 @@
 use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
+use crate::state::marker::AttemptId;
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::store::{CellStore, CoordinateBatch};
 use crate::state::tests::support::probe;
@@ -22,16 +23,8 @@ pub(crate) async fn reader_residue<S: CellStore, R: CommittedCellSource>(
     let committed = mode & 1 != 0;
     let clear = mode & 2 != 0;
     let other = mode & 4 != 0;
-    let id = CollectionId::new(
-        state_key.clone(),
-        StateType::Application,
-        StateName::try_new("residue")?,
-    );
-    let remote = CollectionId::new(
-        state_key.clone(),
-        StateType::Application,
-        StateName::try_new("evidence")?,
-    );
+    let id = residue_id(state_key, "residue")?;
+    let remote = residue_id(state_key, "evidence")?;
     let collection = CollectionRef::new(id.clone(), None);
     let section = Section::new(7);
     let cells = [0, 1, 2].map(|i| CellKey {
@@ -67,10 +60,18 @@ pub(crate) async fn reader_residue<S: CellStore, R: CommittedCellSource>(
         .map(|id| (id.state_type(), id.name().clone()))
         .to_vec();
     touched.sort_unstable();
-    let marker = EventMarker::frozen(event, &writes, &clears, &touched.into(), None);
+    let marker = EventMarker::frozen(
+        event,
+        &writes,
+        &clears,
+        &touched.into(),
+        None,
+        None,
+        AttemptId::new(),
+    );
     if committed {
         let anchor = CollectionRef::new(if other { remote } else { id.clone() }, None);
-        let evidence = EventMarker::frozen(event, &[], &[], &[].into(), None);
+        let evidence = marker.committed_payload();
         store.commit_provisional(&anchor, &evidence, &[]).await?;
     }
     store
@@ -116,4 +117,12 @@ pub(crate) async fn reader_residue<S: CellStore, R: CommittedCellSource>(
     }
     store.abort_provisional(&collection, &writes).await?;
     Ok(true)
+}
+
+fn residue_id(key: &StateKey, name: &str) -> Result<CollectionId> {
+    Ok(CollectionId::new(
+        key.clone(),
+        StateType::Application,
+        StateName::try_new(name)?,
+    ))
 }

@@ -8,6 +8,7 @@ use super::{
 use crate::state::cell::{Cell, resolve_for_reader};
 use crate::state::marker::ReaderEvidence;
 use futures::{StreamExt, stream};
+use tokio::task::coop::cooperative;
 
 impl CassandraCellResources {
     /// Bundles the shared session and prepared cell statements.
@@ -29,15 +30,19 @@ impl CassandraCellResources {
                 let (state_type, name) = &marker.touched()[index];
                 *state_type != id.state_type() || name != id.name()
             }))
-            .map(|index| async move {
-                let (state_type, name) = &marker.touched()[index];
-                let touched = CollectionId::new(id.state_key().clone(), *state_type, name.clone());
-                Ok::<_, CassandraCellStoreError>(
-                    fetch_marker_state(&self.session, &self.queries, &touched, None)
-                        .await?
-                        .committed
-                        == Some(marker.event()),
-                )
+            .map(|index| {
+                cooperative(async move {
+                    let (state_type, name) = &marker.touched()[index];
+                    let touched =
+                        CollectionId::new(id.state_key().clone(), *state_type, name.clone());
+                    Ok::<_, CassandraCellStoreError>(
+                        fetch_marker_state(&self.session, &self.queries, &touched, None)
+                            .await?
+                            .committed
+                            .as_ref()
+                            .is_some_and(|evidence| evidence.certifies(marker)),
+                    )
+                })
             })
             .buffer_unordered(marker.touched().len().max(1));
             staged_committed = reads

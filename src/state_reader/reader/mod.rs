@@ -55,8 +55,8 @@ use tokio::task::coop::cooperative;
 /// Each operation reads one source. Positive collection evidence makes a
 /// committed provisional value visible before the owner applies it.
 /// Committed clears restrict scans to their frozen survivors.
-/// The read-cache TTL still bounds cached value age. `recovery_within` does
-/// not bound reader staleness; readers use evidence without an owner sweep.
+/// The read-cache TTL bounds cached value age. Store reads use evidence without
+/// an owner admission.
 ///
 /// The reader is generic over the collection descriptor `D` and the message
 /// codec `C`. The read methods live in descriptor-specialized impl blocks for

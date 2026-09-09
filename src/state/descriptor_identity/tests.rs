@@ -318,15 +318,11 @@ async fn state_type_namespaces_cells() -> Result<()> {
     use crate::state::cell_key::{CellKey, Coordinate, Section};
     use crate::state::memory::MemoryCells;
     use crate::state::store::CellStore;
-    use crate::state::tests::cell_suite::ScriptedOracle;
+
     use crate::state::{CollectionId, CollectionRef, EventRef, StateKey};
     use bytes::Bytes;
 
-    let store = MemoryCellStore::new(
-        MemoryCells::new(),
-        ScriptedOracle::default(),
-        Arc::new(CollectionDefRegistry::default()),
-    );
+    let store = MemoryCellStore::new(MemoryCells::new());
     let key: crate::Key = Arc::from("k");
     let state_key = StateKey::new(Uuid::new_v4(), key);
     let name = StateName::try_new("cart")?;

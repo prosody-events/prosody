@@ -59,7 +59,10 @@ impl MemoryCells {
             marker.touched().iter().any(|(state_type, name)| {
                 let id =
                     CollectionId::new(collection.state_key().clone(), *state_type, name.clone());
-                self.marker_state(&id).committed == Some(marker.event())
+                self.marker_state(&id)
+                    .committed
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.certifies(marker))
             })
         });
         ReaderEvidence {

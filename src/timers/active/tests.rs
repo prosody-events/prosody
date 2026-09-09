@@ -11,10 +11,10 @@
 
 use super::*;
 use crate::Key;
+use crate::test_util::TEST_RUNTIME;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
-use futures::executor;
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::collections::HashSet;
 use strum::VariantArray;
@@ -277,7 +277,7 @@ async fn run_trace(trace: Trace) {
 #[test]
 fn prop_active_triggers_track_model() {
     fn property(trace: Trace) {
-        executor::block_on(run_trace(trace));
+        TEST_RUNTIME.block_on(run_trace(trace));
     }
     QuickCheck::new().quickcheck(property as fn(Trace));
 }
