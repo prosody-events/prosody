@@ -1357,17 +1357,14 @@ where
         let lower = self.inner.overlay.lower();
         let state_key = &self.inner.state_key;
         let mut marker_touched = Vec::with_capacity(touched.len());
-        let mut has_clears = false;
-        for ((state_type, name), cleared, _) in &touched {
+        for ((state_type, name), ..) in &touched {
             if registry.commit_mode_for(*state_type, name) == CommitMode::ReadCommitted {
                 marker_touched.push((*state_type, name.clone()));
-                has_clears |= !cleared.is_empty();
             }
         }
         marker_touched.sort_unstable();
         marker_touched.dedup();
         let ttl = evidence_ttl(
-            has_clears,
             marker_touched
                 .iter()
                 .map(|(state_type, name)| registry.ttl_for(*state_type, name)),

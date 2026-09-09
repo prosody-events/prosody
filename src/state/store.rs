@@ -340,6 +340,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// Staged carries frozen clear survivors that [`Self::commit_provisional`]
     /// applies at settle. Recovery uses only that durable payload.
     /// The session derives the survivors from each collection's staged writes.
+    /// After an operator shortens the TTL, older cells can outlive a committed,
+    /// unapplied clear and then expire independently.
     ///
     /// # Errors
     ///

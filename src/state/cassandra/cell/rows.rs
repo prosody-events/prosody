@@ -121,7 +121,7 @@ pub(super) enum RowShape<'a> {
     /// Write a resolved value (`kind=Cell`): committed `data` +
     /// encoding/version, nulling `prev_data`/`event`.
     Resolved(ResolvedRow<'a>),
-    /// Writes Staged with the event's evidence TTL.
+    /// Writes Staged with the collection TTL.
     MarkerWrite(MarkerWriteRow<'a>),
     /// Writes the Committed event with the evidence TTL.
     CommittedWrite(CommittedWriteRow<'a>),

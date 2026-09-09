@@ -43,7 +43,7 @@ where
         blobs.push(encode_cell_blobs(write.data(), write.prev()).map_err(ResolveCellError::Store)?);
     }
 
-    // Cells bind the collection TTL; the Staged row binds the evidence TTL.
+    // Cells and the Staged row bind the collection TTL.
     let ttl = bind_ttl(collection.ttl());
     // The marker unit leads; each cell unit is one row. `units` stays a
     // `Vec` (not a `CellBuffer`) — see the `run_batches` ruling.
@@ -53,7 +53,7 @@ where
         smallvec![CellBatchRow {
             statement: &store.queries.marker_write,
             row: RowShape::MarkerWrite(MarkerWriteRow {
-                ttl: bind_ttl(marker.evidence_ttl()),
+                ttl,
                 payload: marker_blob.payload.as_ref(),
                 encoding: marker_blob.payload.encoding(),
                 event: marker_blob.event,

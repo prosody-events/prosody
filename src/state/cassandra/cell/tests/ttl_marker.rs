@@ -49,16 +49,15 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
     Ok(())
 }
 
-/// Both marker rows retain the event's longest TTL. Clears retain evidence
-/// without expiry.
+/// Staged uses the collection TTL. Committed covers each sibling's retention.
 #[test]
 fn marker_rows_carry_evidence_ttl() {
-    fn prop(first: u16, second: u16, clear: bool) -> TestResult {
+    fn prop(first: u16, second: Option<u16>, clear: bool) -> TestResult {
         finish(TEST_RUNTIME.block_on(async {
             let fx = fixture().await?;
             let store = fx.bottom_store(ScriptedOracle::default())?;
             let first = CompactDuration::new(u32::from(first) + 60);
-            let second = CompactDuration::new(u32::from(second) + 60);
+            let second = second.map(|seconds| CompactDuration::new(u32::from(seconds) + 60));
             let c =
                 CollectionRef::new(collection("marker-evidence-ttl")?.id().clone(), Some(first));
             let writes = [(
@@ -73,20 +72,30 @@ fn marker_rows_carry_evidence_ttl() {
                 .then(|| SectionClear::frozen(value_cell().section, &writes))
                 .into_iter()
                 .collect();
-            let ttl = evidence_ttl(clear, [Some(first), Some(second)].into_iter());
+            let ttl = evidence_ttl([Some(first), second].into_iter());
             let marker = EventMarker::frozen(event(1), &writes, &clears, &[].into(), ttl);
             store.write_provisional(&c, &writes, Some(&marker)).await?;
             for coordinate in [&[][..], &[1_u8][..]] {
                 if !coordinate.is_empty() {
                     store.commit_provisional(&c, &marker, &writes).await?;
                 }
+                let column = if coordinate.is_empty() {
+                    "data"
+                } else {
+                    "event"
+                };
+                let expected = if coordinate.is_empty() {
+                    Some(first)
+                } else {
+                    ttl
+                };
                 let pk = Pk::of(c.id());
                 let row = fx
                     .cassandra
                     .session()
                     .query_unpaged(
                         format!(
-                            "SELECT TTL(event) FROM {TEST_KEYSPACE}.keyed_state_cell WHERE \
+                            "SELECT TTL({column}) FROM {TEST_KEYSPACE}.keyed_state_cell WHERE \
                              segment_id = ? AND key = ? AND state_type = ? AND name = ? AND kind \
                              = ? AND section = ? AND coordinate = ?"
                         ),
@@ -103,15 +112,15 @@ fn marker_rows_carry_evidence_ttl() {
                     .await?
                     .into_rows_result()?
                     .single_row::<(Option<i32>,)>()?;
-                if clear {
-                    assert_eq!(row.0, None);
-                } else {
-                    let remaining = row.0.ok_or_else(|| eyre!("missing evidence TTL"))?;
-                    let expected = first.max(second).seconds() as i32;
+                if let Some(expected) = expected {
+                    let remaining = row.0.ok_or_else(|| eyre!("missing marker TTL"))?;
+                    let expected = expected.seconds() as i32;
                     assert!(
                         remaining <= expected && remaining > expected - 60_i32,
-                        "remaining={remaining}, expected={expected}"
+                        "column={column}, remaining={remaining}, expected={expected}"
                     );
+                } else {
+                    assert_eq!(row.0, None);
                 }
             }
             Ok(true)
@@ -120,7 +129,7 @@ fn marker_rows_carry_evidence_ttl() {
     init_test_logging();
     QuickCheck::new()
         .tests(integration_test_count(25))
-        .quickcheck(prop as fn(u16, u16, bool) -> TestResult);
+        .quickcheck(prop as fn(u16, Option<u16>, bool) -> TestResult);
 }
 
 /// The `Cached` stage-boundary marker eviction: event A stages two coordinates

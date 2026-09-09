@@ -176,7 +176,7 @@ cassandra_queries! {
             TABLE_KEYED_STATE_CELL
         ),
 
-        /// Writes Staged with the evidence TTL, frozen payload, and event.
+        /// Writes Staged with the collection TTL, frozen payload, and event.
         /// It leaves `prev_data` untouched to avoid a needless tombstone.
         marker_write: (
             "UPDATE $keyspace.{} USING TTL ? \

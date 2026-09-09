@@ -305,26 +305,23 @@ fn trailing_garbage_is_rejected() -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// Evidence outlives every finite touched TTL; clears and unbounded retention
-/// dominate.
+/// Evidence covers every touched TTL; a collection without expiry prevents
+/// expiry.
 #[test]
 fn prop_evidence_ttl_covers_all_collections() {
-    fn prop(has_clears: bool, seconds: Vec<u32>, unbounded: bool) -> bool {
-        let expected = if has_clears || unbounded {
+    fn prop(seconds: Vec<u32>, unbounded: bool) -> bool {
+        let expected = if unbounded {
             None
         } else {
             seconds.iter().max().copied().map(CompactDuration::new)
         };
-        evidence_ttl(
-            has_clears,
-            seconds.into_iter().enumerate().map(|(index, ttl)| {
-                if unbounded && index == 0 {
-                    None
-                } else {
-                    Some(CompactDuration::new(ttl))
-                }
-            }),
-        ) == expected
+        evidence_ttl(seconds.into_iter().enumerate().map(|(index, ttl)| {
+            if unbounded && index == 0 {
+                None
+            } else {
+                Some(CompactDuration::new(ttl))
+            }
+        })) == expected
     }
-    QuickCheck::new().quickcheck(prop as fn(bool, Vec<u32>, bool) -> bool);
+    QuickCheck::new().quickcheck(prop as fn(Vec<u32>, bool) -> bool);
 }

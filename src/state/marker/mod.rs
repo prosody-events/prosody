@@ -7,9 +7,7 @@
 //! The row's version column selects the format; the payload has no version
 //! byte.
 //!
-//! Evidence must outlive provisional residue. [`evidence_ttl`] selects the
-//! longest cell retention. Clears or a collection without expiry require
-//! evidence without expiry. Both marker rows use that retention.
+//! Staged uses the collection TTL. Committed uses [`evidence_ttl`].
 //!
 //! The stage write captures the staged list and survivor lists; recovery never
 //! derives them again. These lists contain coordinates, never values.
@@ -461,16 +459,17 @@ pub(crate) struct EventEvidence {
     pub(crate) evidence_ttl: Option<CompactDuration>,
 }
 
-/// Selects the maximum TTL, or no expiry for clears or any collection without
-/// expiry. An empty set returns None. An event without touched collections
-/// stages no marker.
+/// Selects the longest touched TTL, or no expiry if any touched collection has
+/// none.
+///
+/// Committed outlives every Staged row it certifies: Staged uses its collection
+/// TTL. A TTL collection retains permanent evidence only for an event that also
+/// touched a collection without expiry. This evidence certifies that other
+/// collection's permanent residue. An empty set returns None. An event without
+/// touched collections stages no marker.
 pub(crate) fn evidence_ttl(
-    has_clears: bool,
     mut ttls: impl Iterator<Item = Option<CompactDuration>>,
 ) -> Option<CompactDuration> {
-    if has_clears {
-        return None;
-    }
     let first = ttls.next()??;
     ttls.try_fold(first, |maximum, ttl| Some(maximum.max(ttl?)))
 }
