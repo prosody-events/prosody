@@ -177,34 +177,22 @@ pub(crate) async fn settle<T, C, G>(
         // equivalent to finalizing an emptied buffer: an empty finalize
         // yields `Finalized::Clean`, which has no provisional work.
         Settlement::Bypassed => {
-            guard.commit().await;
-            discard_uncommitted(lifecycle.as_ref());
-            drop(permit);
-            fire_apply_hook(handler, context, true, result).await;
+            commit_and_finish(handler, context, guard, result, lifecycle.as_ref(), permit).await;
         }
         Settlement::Final => match category {
-            // A failed-but-final message: record its marker best-effort (no
-            // stage exists — finalize runs only on Ok) so redelivery
-            // dedup-filters the known-permanent failure, then commit.
-            Some(ErrorCategory::Permanent) => {
-                if let Some(lifecycle) = &lifecycle
+            // A permanent final failure records its marker best-effort, so
+            // dedup filters redelivery. Finalize runs only on success.
+            // A transient final failure has no marker. Commit and call the hook.
+            // Terminal failures already returned above.
+            Some(category) => {
+                if category == ErrorCategory::Permanent
+                    && let Some(lifecycle) = &lifecycle
                     && let Some(marker) = lifecycle.message_marker()
                 {
                     record_marker_best_effort(&context, lifecycle, marker).await;
                 }
-                guard.commit().await;
-                discard_uncommitted(lifecycle.as_ref());
-                drop(permit);
-                fire_apply_hook(handler, context, true, result).await;
-            }
-            // Transient final (no retry layer below took it): no marker —
-            // the event is not handled — just commit and fire the hook.
-            // (Terminal returned above.)
-            Some(_) => {
-                guard.commit().await;
-                discard_uncommitted(lifecycle.as_ref());
-                drop(permit);
-                fire_apply_hook(handler, context, true, result).await;
+                commit_and_finish(handler, context, guard, result, lifecycle.as_ref(), permit)
+                    .await;
             }
             // Success: run the full durability sequence.
             None => {
@@ -214,22 +202,31 @@ pub(crate) async fn settle<T, C, G>(
     }
 }
 
-/// Discards this event's uncommitted dirty overlay, on every settle path that
-/// did **not** successfully finalize (final permanent/transient, Bypassed,
-/// permanent finalize-failure, finalize / marker-record shutdown, and the
-/// direct [`abandon`]). Defined by the *absence* of successful finalization,
-/// not an error-category list: a successful
-/// [`finalize`](StateLifecycle::finalize) drains the buffer as part of the
-/// stage, so the success path never reaches here.
-///
-/// Called under the still-held closed-gate permit, before the permit drops and
-/// the apply hooks fire, so an apply hook or a leaked hook-window read observes
-/// fully-settled committed truth with no aborted-attempt residue. The
-/// commit-now floor survives untouched: an explicit mid-handler `commit()`
-/// durably applies **and** drains its cells at commit time, so this clears only
-/// the remaining uncommitted ops. Provisional cells live in the durable store,
-/// so this never touches them. A stateless / invalidated context (`None`) has
-/// no overlay.
+/// Commits the source and discards dirty state before the permit drops and the
+/// apply hook runs. A successful finalize already drains the overlay; the
+/// repeated discard is harmless.
+async fn commit_and_finish<'a, T, C, G>(
+    handler: &T,
+    context: C,
+    guard: G,
+    result: Result<T::Output, T::Error>,
+    lifecycle: Option<&'a C::State>,
+    permit: Option<OpPermit<'a>>,
+) where
+    T: FallibleHandler,
+    C: EventContext<Payload = T::Payload>,
+    G: Uncommitted + Send,
+{
+    guard.commit().await;
+    discard_uncommitted(lifecycle);
+    drop(permit);
+    fire_apply_hook(handler, context, true, result).await;
+}
+
+/// Discards the uncommitted overlay under the closed gate before hook reads can
+/// proceed. A mid-handler `commit()` already applies and drains its cells; this
+/// discard preserves those values and all durable provisional cells.
+/// An invalidated context has no overlay.
 fn discard_uncommitted<S: StateLifecycle>(lifecycle: Option<&S>) {
     if let Some(lifecycle) = lifecycle {
         lifecycle.discard_dirty();
@@ -257,9 +254,7 @@ async fn settle_committed<'a, T, C, G>(
 {
     let Some(lifecycle) = lifecycle else {
         // Invalidated / stateless context: just commit and fire the hook.
-        guard.commit().await;
-        drop(permit);
-        fire_apply_hook(handler, context, true, result).await;
+        commit_and_finish(handler, context, guard, result, None, permit).await;
         return;
     };
 
@@ -276,13 +271,8 @@ async fn settle_committed<'a, T, C, G>(
             if let Some(marker) = lifecycle.message_marker() {
                 record_marker_best_effort(&context, lifecycle, marker).await;
             }
-            guard.commit().await;
-            // Not a successful finalize (`finalize`'s failure paths leave
-            // the buffer whole); `discard_uncommitted` owns the
-            // permit-held / commit-now-floor contract.
-            discard_uncommitted(Some(lifecycle));
-            drop(permit);
-            fire_apply_hook(handler, context, true, result).await;
+            // Finalize failed and left the dirty overlay intact.
+            commit_and_finish(handler, context, guard, result, Some(lifecycle), permit).await;
             return;
         }
         StepOutcome::Abandon => {
@@ -306,6 +296,7 @@ async fn settle_committed<'a, T, C, G>(
 
     // Record the message identity after all promote attempts finish.
     if let Some(marker) = lifecycle.message_marker() {
+        // The record must succeed, so the outer loop retries permanent errors too.
         loop {
             match retry_step(
                 || context.is_shutdown(),
@@ -328,10 +319,7 @@ async fn settle_committed<'a, T, C, G>(
     }
 
     // Commit the source offset or trigger.
-    guard.commit().await;
-
-    drop(permit);
-    fire_apply_hook(handler, context, true, result).await;
+    commit_and_finish(handler, context, guard, result, Some(lifecycle), permit).await;
 }
 
 /// Abandons the source and calls `after_abort`.

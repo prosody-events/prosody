@@ -21,6 +21,8 @@
 //!       the watermark lowers the watermark, preserves compact ownership, and
 //!       activates the trigger.
 
+pub(crate) mod support;
+
 use super::actor::{
     ActorState, MIN_PRELOAD, calculate_preload, calculate_wait_time, cleanup_step,
     collect_active_slab_ids, handle_add, load_step, next_unloaded_slab_id, owns_slab,

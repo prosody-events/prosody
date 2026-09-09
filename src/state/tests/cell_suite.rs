@@ -21,10 +21,8 @@ use super::support::{CountingCellStore, batch_of};
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell::Cell::Provisional;
-use crate::state::marker::AttemptId;
-use crate::state::marker::MarkerState;
-use crate::state::tests::support::admit_collection;
-use crate::state::tests::support::seed_commit_evidence;
+use crate::state::marker::{AttemptId, EventEvidence, MarkerState};
+use crate::state::tests::support::{admit_collection, empty_evidence, seed_commit_evidence};
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::eyre;
@@ -590,8 +588,17 @@ where
             .iter()
             .map(|&s| SectionClear::frozen(SECTIONS[s as usize], &cell_writes))
             .collect();
-        let marker =
-            EventMarker::frozen(event, &cell_writes, &clears, &touched, None, dedup, attempt);
+        let marker = EventMarker::frozen(
+            event,
+            &cell_writes,
+            &clears,
+            &EventEvidence {
+                touched: touched.clone(),
+                evidence_ttl: None,
+                dedup,
+                attempt,
+            },
+        );
         let collection = &refs[*coll as usize];
         if split && cell_writes.len() >= 2 {
             let mid = cell_writes.len() / 2;
@@ -766,15 +773,7 @@ where
         staged.clone(),
         ProvisionalWrite::new(Some(bytes(1)), prev, event_a),
     )];
-    let marker = EventMarker::frozen(
-        event_a,
-        &writes,
-        &[],
-        &[].into(),
-        None,
-        None,
-        AttemptId::new(),
-    );
+    let marker = EventMarker::frozen(event_a, &writes, &[], &empty_evidence());
     store
         .write_provisional(&refs[0], &writes, Some(&marker))
         .await?;
@@ -894,15 +893,7 @@ where
             }
             cell_writes.push((key, ProvisionalWrite::new(mutation.value(), prev, event)));
         }
-        let marker = EventMarker::frozen(
-            event,
-            &cell_writes,
-            &[],
-            &[].into(),
-            None,
-            None,
-            AttemptId::new(),
-        );
+        let marker = EventMarker::frozen(event, &cell_writes, &[], &empty_evidence());
         store
             .write_provisional(
                 &refs[slot],
@@ -1710,15 +1701,7 @@ where
         let keys: BTreeSet<(u8, u8)> = base.keys().copied().collect();
         return assert_apply_settled(&store, probe, &id, &base, &keys).await;
     }
-    let marker = EventMarker::frozen(
-        event,
-        &writes,
-        &clears,
-        &[].into(),
-        None,
-        None,
-        AttemptId::new(),
-    );
+    let marker = EventMarker::frozen(event, &writes, &clears, &empty_evidence());
     store
         .write_provisional(&collection, &writes, Some(&marker))
         .await?;
@@ -2232,15 +2215,7 @@ async fn seed_batch<S: CellStore>(
                 ProvisionalWrite::new(Some(bytes(*data)), prev, event),
             ));
         }
-        let marker = EventMarker::frozen(
-            event,
-            &writes,
-            &[],
-            &[].into(),
-            None,
-            None,
-            AttemptId::new(),
-        );
+        let marker = EventMarker::frozen(event, &writes, &[], &empty_evidence());
         store
             .write_provisional(collection, &writes, Some(&marker))
             .await?;
@@ -2700,10 +2675,12 @@ async fn stage_clock_crash<S: CellStore>(
         event,
         &writes,
         &[],
-        &touched,
-        evidence,
-        None,
-        AttemptId::new(),
+        &EventEvidence {
+            touched,
+            evidence_ttl: evidence,
+            dedup: None,
+            attempt: AttemptId::new(),
+        },
     );
     let units: Vec<_> = (0..=writes.len())
         .map(|index| BatchUnit::<()>::new(index as u64, smallvec::SmallVec::new()))

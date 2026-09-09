@@ -1,5 +1,5 @@
 use super::*;
-use crate::state::marker::AttemptId;
+use crate::state::tests::support::empty_evidence;
 
 /// Stage a set, observe it provisional, promote, read back resolved — the
 /// hot-path round-trip — then a direct resolved clear reads back absent. A fast
@@ -18,15 +18,7 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
         cell.clone(),
         ProvisionalWrite::new(Some(data.clone()), Committed::new(None), event(1)),
     )];
-    let marker = EventMarker::frozen(
-        event(1),
-        &writes,
-        &[],
-        &[].into(),
-        None,
-        None,
-        AttemptId::new(),
-    );
+    let marker = EventMarker::frozen(event(1), &writes, &[], &empty_evidence());
     store.write_provisional(&c, &writes, Some(&marker)).await?;
     let staged = provisional_cells(&store, c.id()).await?;
     let (key, prov) = staged
@@ -74,15 +66,7 @@ async fn committed_clear_deletes_the_row() -> Result<()> {
         .await?;
     let write = ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(2));
     let writes = [(cell.clone(), write.clone())];
-    let marker = EventMarker::frozen(
-        event(2),
-        &writes,
-        &[],
-        &[].into(),
-        None,
-        None,
-        AttemptId::new(),
-    );
+    let marker = EventMarker::frozen(event(2), &writes, &[], &empty_evidence());
     store.write_provisional(&c, &writes, Some(&marker)).await?;
     let staged = provisional_cells(&store, c.id()).await?;
     let (_, prov) = staged

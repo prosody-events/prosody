@@ -73,10 +73,9 @@ pub(super) fn extend_gap_units<'u>(
     }
 }
 
-/// The one-row batch unit deleting a collection's Staged row at its
-/// fixed address, appended last by
-/// [`super::CassandraStore::issue_markers`], the shared tail of both settle
-/// verbs.
+/// Deletes Staged at its fixed address in one batch unit.
+/// [`super::CassandraStore::issue_markers`] appends this unit last for both
+/// settle operations.
 pub(super) fn marker_delete_unit<'u>(
     pk: Pk<'u>,
     queries: &'u CellQueries,

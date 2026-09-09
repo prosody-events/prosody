@@ -130,19 +130,15 @@ where
     }
 }
 
-/// Per-partition keyed-state manager minted by a
-/// [`PartitionStateProvider`].
+/// A [`PartitionStateProvider`] creates this keyed-state manager for one
+/// partition. It admits each key before dispatch and creates one session per
+/// event. The partition loop supplies each [`EventRef`], including the message
+/// dedup id; the manager does not depend on Kafka.
 ///
-/// Mints one session per event from an already-resolved [`EventRef`] and
-/// admits each key before dispatch. The manager is Kafka-agnostic: building
-/// the `EventRef` (including a message's dedup id) is the partition loop's
-/// job.
-///
-/// Kept as a trait for type-parameter compression and pattern symmetry with
-/// [`TriggerStoreProvider`](crate::timers::store::TriggerStoreProvider): the
-/// associated `Session` type lets callers name only the manager, not its
-/// backend and loader. It is deliberately not collapsed onto its single
-/// production impl [`StateManager`].
+/// The trait retains type-parameter compression and symmetry with
+/// [`TriggerStoreProvider`](crate::timers::store::TriggerStoreProvider).
+/// Its associated `Session` lets callers name the manager without its backend
+/// and loader, even with one production implementation, [`StateManager`].
 pub trait PartitionStateManager: Clone + Send + Sync + 'static {
     /// Session type minted per event.
     type Session: EventSession;
@@ -209,16 +205,14 @@ pub trait PartitionStateProvider<T>: Clone + Send + Sync + 'static {
     /// Error raised when a partition's manager cannot be acquired.
     type AcquireError: ClassifyError + Error + Send + Sync + 'static;
 
-    /// Acquires the manager for `(topic, partition)`, eagerly validating
-    /// descriptor identities against the group-global identity table.
-    /// `triggers` is the partition's trigger-store handle, forwarded to the
-    /// backend factory for partition acquisition.
+    /// Acquires the manager for `(topic, partition)` and validates descriptor
+    /// identities against the group-wide identity table.
+    /// Passes the partition's `triggers` handle to the backend factory.
     ///
     /// # Errors
     ///
-    /// Returns [`Self::AcquireError`] when the backend cannot be minted or
-    /// identity validation fails; the partition loop retries until
-    /// shutdown.
+    /// Returns [`Self::AcquireError`] if backend creation or identity
+    /// validation fails. The partition loop retries until shutdown.
     fn acquire(
         &self,
         topic: Topic,
@@ -245,10 +239,9 @@ where
     checks: B::Checks,
 }
 
-/// The real per-partition state manager: owns the partition-lifetime
-/// cell store, dedup store, dirty workspace, and loader; mints per-event
-/// [`KeyedStateSession`]s sharing them. Parameterized by the one
-/// `StateBackend` bundle `B` and the loader `L`.
+/// Owns a partition's cell store, dedup store, dirty workspace, and loader.
+/// Creates per-event [`KeyedStateSession`]s that share these resources.
+/// `B` selects the `StateBackend` bundle; `L` selects the loader.
 pub struct StateManager<B, L>
 where
     B: StateBackend,
@@ -323,6 +316,9 @@ impl<B, L> StateManager<B, L>
 where
     B: StateBackend,
 {
+    /// Discovers collection markers and certifies Staged rows through commit
+    /// evidence. Resolves the discovered residue.
+    /// Retires committed sources before dispatch.
     async fn admit_unchecked<T: TriggerStore>(
         &self,
         key: &Key,
@@ -500,21 +496,21 @@ pub struct StateManagerProvider<F, L, P = NoPublisher> {
 impl<F, L, P> StateManagerProvider<F, L, P> {
     /// Creates the provider.
     ///
-    /// `publisher` uses the assignment that this provider receives. It does
-    /// not observe Kafka or track assignments itself.
+    /// `publisher` uses the assignment that this provider receives. It does not
+    /// observe Kafka or track assignments itself.
     ///
-    /// `consumer_group` derives the partition's segment id for **state-cell
-    /// identity** via the crate-internal
-    /// `segment::partition_segment_id` — the *same*
-    /// derivation the defer stores use, so a partition's defer and state rows
-    /// share one id for operational lookup. It is *also* the `group_id`
-    /// partition key of the group-global descriptor-identity table, validated
-    /// once per process at the first acquire. Timers currently derive their
-    /// segment id with a separate legacy formula
-    /// ([`Segment::for_partition`](crate::timers::store::Segment::for_partition),
-    /// `NAMESPACE_URL`) pending a follow-up migration onto this id.
+    /// `consumer_group` supplies state-cell identity through
+    /// `segment::partition_segment_id`.
+    /// Defer stores use the same derivation, so a partition's defer and state
+    /// rows share one id for operational lookup.
+    /// It also supplies the descriptor-identity table's `group_id` partition
+    /// key. The first acquire validates that identity once per process.
+    ///
+    /// Timers retain the separate
+    /// [`Segment::for_partition`](crate::timers::store::Segment::for_partition)
+    /// formula with `NAMESPACE_URL` until migration.
     /// Timer retirement and legacy admission use the partition's trigger store.
-    /// They address timers by key, type, and time, never by the state segment
+    /// They address timers by key, type, and time, never by state segment
     /// id.
     #[must_use]
     pub(crate) fn new(

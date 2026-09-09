@@ -5,6 +5,7 @@ use super::{
 use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::event_ref::EventRef;
+use crate::state::marker::EventEvidence;
 use crate::state::tests::support::arb_coordinate;
 use crate::state::{StateName, StateType};
 use crate::timers::duration::CompactDuration;
@@ -69,10 +70,12 @@ impl Arbitrary for ArbMarker {
             event(),
             &staged,
             &clears,
-            &[].into(),
-            None,
-            None,
-            AttemptId(Uuid::from_u128(0xA77E)),
+            &EventEvidence {
+                touched: [].into(),
+                evidence_ttl: None,
+                dedup: None,
+                attempt: AttemptId(Uuid::from_u128(0xA77E)),
+            },
         ))
     }
 }
@@ -231,19 +234,23 @@ fn frozen_marker_payload_bytes() -> color_eyre::Result<()> {
         event(),
         &staged,
         from_ref(&clear),
-        &[].into(),
-        Some(CompactDuration::new(3600)),
-        None,
-        AttemptId(Uuid::from_u128(0xA77E)),
+        &EventEvidence {
+            touched: [].into(),
+            evidence_ttl: Some(CompactDuration::new(3600)),
+            dedup: None,
+            attempt: AttemptId(Uuid::from_u128(0xA77E)),
+        },
     );
     let marker = EventMarker::frozen(
         event(),
         &staged,
         &[clear],
-        &vec![(StateType::Application, StateName::try_new("x")?)].into(),
-        Some(CompactDuration::new(3600)),
-        Some(Uuid::from_u128(0xD3D0)),
-        AttemptId(Uuid::from_u128(0xA77E)),
+        &EventEvidence {
+            touched: vec![(StateType::Application, StateName::try_new("x")?)].into(),
+            evidence_ttl: Some(CompactDuration::new(3600)),
+            dedup: Some(Uuid::from_u128(0xD3D0)),
+            attempt: AttemptId(Uuid::from_u128(0xA77E)),
+        },
     );
 
     let expected: Vec<u8> = vec![
@@ -319,10 +326,12 @@ fn trailing_garbage_is_rejected() -> color_eyre::Result<()> {
         event(),
         &[],
         &[],
-        &[].into(),
-        None,
-        None,
-        AttemptId(Uuid::from_u128(0xA77E)),
+        &EventEvidence {
+            touched: [].into(),
+            evidence_ttl: None,
+            dedup: None,
+            attempt: AttemptId(Uuid::from_u128(0xA77E)),
+        },
     );
     let mut bytes = encode_marker_payload(&marker)?.to_vec();
     bytes.push(0xFF);

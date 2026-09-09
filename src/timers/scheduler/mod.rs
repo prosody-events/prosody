@@ -35,7 +35,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 mod actor;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Size of the internal command and trigger channels.
 const BUFFER_SIZE: usize = 64;
@@ -235,6 +235,3 @@ where
         }
     }
 }
-
-#[cfg(test)]
-pub(crate) mod admission_tests;

@@ -1,5 +1,5 @@
 use super::*;
-use crate::state::marker::AttemptId;
+use crate::state::tests::support::empty_evidence;
 
 /// Positional binding-order proof (the one silent-failure surface):
 /// `scylla::Batch` binds its statement list 1:1 with the value list, and on a
@@ -45,15 +45,7 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
         cell_b.clone(),
         ProvisionalWrite::new(Some(data_b.clone()), Committed::new(None), event(1)),
     )];
-    let marker_b = EventMarker::frozen(
-        event(1),
-        &writes_b,
-        &[],
-        &[].into(),
-        None,
-        None,
-        AttemptId::new(),
-    );
+    let marker_b = EventMarker::frozen(event(1), &writes_b, &[], &empty_evidence());
     store
         .write_provisional(&c, &writes_b, Some(&marker_b))
         .await?;
@@ -75,10 +67,7 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
         event(2),
         &staged_a,
         &[],
-        &[].into(),
-        None,
-        None,
-        AttemptId::new(),
+        &empty_evidence(),
     ))?;
     let payload = encode(&marker_payload)?;
     let marker_blob = MarkerBlob {

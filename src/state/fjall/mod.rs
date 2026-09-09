@@ -620,8 +620,8 @@ impl FjallCellCache {
     ///
     /// The promote preserves the durable cell's expiry. This transform retains
     /// the cached expiry, so a repeated transform cannot extend retention.
-    /// Missing or unreadable entries are removed. The next read loads them
-    /// from the durable store.
+    /// The transform removes missing or unreadable entries. The next read loads
+    /// them from the durable store.
     ///
     /// Any failure returns `Err` so the caller removes the affected entries.
     pub(crate) async fn commit_batch(
@@ -686,21 +686,20 @@ impl FjallCellCache {
         .await
     }
 
-    /// Deletes one `(collection, section)`'s committed cell entries, walking
-    /// the section's key range in fixed hops of [`SCAN_HOP_ROWS`]: each hop is
-    /// one [`spawn_blocking`] that collects at most a hop of keys, deletes
-    /// them in one bounded write batch, and re-seeks past the last key it
-    /// examined. Never one whole-section batch — that would hold O(cached
-    /// cells) keys in RAM (the bounded-RAM invariant). Idempotent (a deleted
-    /// key is not found again), so a must-succeed retry re-walks safely.
+    /// Deletes committed entries from one collection section in hops of at most
+    /// [`SCAN_HOP_ROWS`] keys.
+    /// Each hop uses [`spawn_blocking`], deletes keys in one bounded batch, and
+    /// resumes after the last examined key.
+    /// The operation never holds the whole section in RAM. Deleted keys
+    /// disappear, so retries can safely repeat the scan.
     ///
-    /// `exclude` names cells whose entries survive the delete — the commit
-    /// site's staged coordinates (the set equation on
-    /// [`Cached::commit_provisional`](crate::state::cached::Cached)); every
-    /// other caller passes `&[]` for a whole-section delete. The exclusion set
-    /// is encoded **once, in the committed-cell key form** (`codec::cell_key`
-    /// — the same form the walk yields) and held hashed, so each walked key
-    /// costs O(1) expected and memory stays O(|exclude| + one hop).
+    /// `exclude` names the staged coordinates that survive
+    /// [`Cached::commit_provisional`](crate::state::cached::Cached).
+    /// Other callers pass `&[]` to delete the whole section.
+    /// The exclusion set encodes each coordinate once with `codec::cell_key`,
+    /// the same form that the scan returns.
+    /// A hash set gives expected O(1) work per scanned key and O(|exclude| +
+    /// one hop) memory.
     pub(crate) async fn delete_section(
         &self,
         collection: &CollectionId,

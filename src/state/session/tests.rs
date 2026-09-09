@@ -18,15 +18,16 @@ use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::descriptor::value_state;
 use crate::state::dirty::{DirtyStore, DirtyVal};
 use crate::state::manager::EventStateScope;
-use crate::state::marker::EventMarker;
+use crate::state::marker::{EventEvidence, EventMarker};
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::{CELL_BATCH, CellStore};
 use crate::state::tests::cell_suite::{
     FailingCellStore, MemoryDeduplicationStore, Poison, PoisonHandle, cell_at, value_cell,
 };
-use crate::state::tests::support::admit_collection;
-use crate::state::tests::support::{CountingCellStore, assert_no_settlement_residue, probe};
+use crate::state::tests::support::{
+    CountingCellStore, admit_collection, assert_no_settlement_residue, probe,
+};
 use crate::state::{
     CollectionId, CollectionRef, CommitMode, EventRef, PartitionBackend, StateKey, StateName,
     StateType, StoreOutcome,
@@ -653,10 +654,12 @@ fn finalize_matches_model(
                 event,
                 &collection.writes,
                 collection.marker.clears(),
-                &vec![(StateType::Application, fx.value_id().name().clone())].into(),
-                None,
-                collection.marker.dedup(),
-                collection.marker.attempt(),
+                &EventEvidence {
+                    touched: vec![(StateType::Application, fx.value_id().name().clone())].into(),
+                    evidence_ttl: None,
+                    dedup: collection.marker.dedup(),
+                    attempt: collection.marker.attempt(),
+                },
             );
             (fx.cells.unsettled_marker_of(&fx.value_id()) != Some(expected))
                 .then_some("the receipt's frozen records diverge from the durable event marker")

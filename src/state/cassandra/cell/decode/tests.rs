@@ -20,8 +20,8 @@ use crate::state::cassandra::cell::INITIAL_VERSION;
 use crate::state::cassandra::error::CassandraCellStoreError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Cell, Committed, ProvisionalCell};
-use crate::state::marker::AttemptId;
 use crate::state::marker::{EventMarker, MarkerState, encode_marker_payload};
+use crate::state::tests::support::empty_evidence;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, bail};
@@ -461,15 +461,7 @@ fn blob_ttl_coalesces_the_present_blobs_ttl() {
 #[test]
 fn prop_marker_slice_decodes_by_coordinate() {
     fn prop(coordinate: Vec<u8>, legacy: bool, metadata: i32) -> Result<bool> {
-        let marker = EventMarker::frozen(
-            message_event(),
-            &[],
-            &[],
-            &[].into(),
-            None,
-            None,
-            AttemptId::new(),
-        );
+        let marker = EventMarker::frozen(message_event(), &[], &[], &empty_evidence());
         let payload = encode_marker_payload(&marker)?;
         let mut state = MarkerState::default();
         let legacy_ttl = Some(CompactDuration::new(3600));

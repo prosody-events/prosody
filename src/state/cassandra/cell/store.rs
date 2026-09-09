@@ -70,25 +70,18 @@ impl CassandraStore {
         .await
     }
 
-    /// Executes the packed same-partition `UNLOGGED BATCH`es for a multi-cell
-    /// mutation — the shared tail of the cell mutators. Each [`BatchUnit`] is
-    /// one row (a cell mutation, or either marker row), packed into the fewest
-    /// batches under the byte and statement budgets; every batch is
-    /// row-disjoint by construction (the marker address is disjoint from every
-    /// cell row by `kind`), so no same-batch timestamp tie can pit a delete
-    /// against a write of one row.
+    /// Executes same-partition `UNLOGGED BATCH` statements for cell mutations.
+    /// Each [`BatchUnit`] changes one cell or marker row. The packer uses the
+    /// fewest batches within byte and statement budgets.
+    /// Rows within a batch are disjoint; `kind` separates marker and cell
+    /// addresses. Thus, equal timestamps cannot make a delete compete with
+    /// a write to the same row.
     ///
-    /// Allocation ruling (write-path buffer audit): every mutator's `units`
-    /// buffer — and the `blobs` its rows borrow — stays a `Vec`, never a
-    /// [`crate::state::store::CellBuffer`]/`SmallVec`.
-    /// `BatchUnit<CellBatchRow>` is 320 B and `CellBlobs` 80 B, and both live
-    /// across this `.await`; an inline capacity would embed hundreds of bytes
-    /// to kilobytes in every stage/settle future the way `StagedCollection`
-    /// tripped clippy `large_futures` (`crate::state::session`). Write sets are
-    /// not `CELL_BATCH`-bounded (the packer splits by byte/statement budget
-    /// downstream), and each build site is already exactly-sized
-    /// `Vec::with_capacity`, so a conversion removes at most one allocation and
-    /// cannot earn the footprint.
+    /// The `units` and borrowed `blobs` buffers retain exactly sized `Vec`
+    /// allocations to limit future sizes.
+    /// Inline buffers would enlarge every stage and settle future across this
+    /// await. Write sets have no `CELL_BATCH` limit; the packer splits them
+    /// downstream.
     pub(super) async fn run_batches(
         &self,
         units: &[BatchUnit<CellBatchRow<'_>>],

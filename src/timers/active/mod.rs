@@ -108,13 +108,12 @@ pub(crate) enum TimerOp {
     ClearReplaced,
 }
 
-/// Scheduler-side effect of a [`Transition`].
+/// The scheduler effect of a [`Transition`].
 ///
-/// `Dequeue` touches only the `DelayQueue`; `Insert`/`Remove` are
-/// the full scheduler commands, which also create/delete the
-/// [`ActiveTriggers`] entry (and, for `Insert`, persist slab metadata).
-/// These commands and `Deactivate` are the only effects that create or delete
-/// registry entries — [`Transition`]s never invent state any other way.
+/// `Dequeue` changes only the `DelayQueue`. `Insert` and `Remove` also create
+/// or delete the [`ActiveTriggers`] entry.
+/// `Insert` persists slab metadata. Only these commands and `Deactivate` create
+/// or delete registry entries.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) enum QueueEffect {
     /// No queue change.

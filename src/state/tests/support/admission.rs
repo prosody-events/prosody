@@ -3,6 +3,7 @@ use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
 use crate::state::descriptor::{DescriptorIdentity, value_state};
 use crate::state::manager::{Admission, PartitionStateManager, test_manager};
+use crate::state::marker::EventEvidence;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::timers::test_support::setup_timer_manager;
 use std::slice::from_ref;
@@ -82,15 +83,13 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
             cell.clone(),
             ProvisionalWrite::new(Some(bytes(value)), Committed::new(None), e),
         )];
-        let marker = EventMarker::frozen(
-            e,
-            &writes,
-            &[],
-            &touched,
-            None,
-            Some(Uuid::from_u128(1)),
+        let evidence = EventEvidence {
+            touched: touched.clone(),
+            evidence_ttl: None,
+            dedup: Some(Uuid::from_u128(1)),
             attempt,
-        );
+        };
+        let marker = EventMarker::frozen(e, &writes, &[], &evidence);
         store
             .write_provisional(collection, &writes, Some(&marker))
             .await?;
@@ -105,15 +104,13 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
         cell.clone(),
         ProvisionalWrite::new(Some(newer.clone()), Committed::new(Some(bytes(value))), c),
     )];
-    let marker = EventMarker::frozen(
-        c,
-        &writes,
-        &[],
-        &touched,
-        None,
-        Some(Uuid::from_u128(2)),
-        AttemptId::new(),
-    );
+    let evidence = EventEvidence {
+        touched: touched.clone(),
+        evidence_ttl: None,
+        dedup: Some(Uuid::from_u128(2)),
+        attempt: AttemptId::new(),
+    };
+    let marker = EventMarker::frozen(c, &writes, &[], &evidence);
     store
         .write_provisional(&collections[0], &writes, Some(&marker))
         .await?;
@@ -126,15 +123,13 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
         cell.clone(),
         ProvisionalWrite::new(Some(replay.clone()), Committed::new(Some(newer.clone())), e),
     )];
-    let marker = EventMarker::frozen(
-        e,
-        &writes,
-        &[],
-        &touched,
-        None,
-        Some(Uuid::from_u128(1)),
-        AttemptId::new(),
-    );
+    let evidence = EventEvidence {
+        touched: touched.clone(),
+        evidence_ttl: None,
+        dedup: Some(Uuid::from_u128(1)),
+        attempt: AttemptId::new(),
+    };
+    let marker = EventMarker::frozen(e, &writes, &[], &evidence);
     store
         .write_provisional(&collections[0], &writes, Some(&marker))
         .await?;
@@ -211,18 +206,16 @@ async fn deregistration<S: CellStore>(
         value_cell(),
         ProvisionalWrite::new(Some(bytes(value)), Committed::new(None), event),
     )];
-    let marker = EventMarker::frozen(
-        event,
-        &writes,
-        &[],
-        &touched,
-        None,
-        match event {
+    let evidence = EventEvidence {
+        touched: touched.clone(),
+        evidence_ttl: None,
+        dedup: match event {
             EventRef::Message { dedup_id } => Some(dedup_id),
             EventRef::Timer(_) => None,
         },
-        AttemptId::new(),
-    );
+        attempt: AttemptId::new(),
+    };
+    let marker = EventMarker::frozen(event, &writes, &[], &evidence);
     for collection in &collections {
         store
             .write_provisional(collection, &writes, Some(&marker))
@@ -248,15 +241,13 @@ async fn deregistration<S: CellStore>(
             event,
         ),
     )];
-    let marker = EventMarker::frozen(
-        event,
-        &next,
-        &[],
-        &vec![(StateType::Application, collections[0].id().name().clone())].into(),
-        None,
-        marker.dedup(),
-        AttemptId::new(),
-    );
+    let evidence = EventEvidence {
+        touched: vec![(StateType::Application, collections[0].id().name().clone())].into(),
+        evidence_ttl: None,
+        dedup: marker.dedup(),
+        attempt: AttemptId::new(),
+    };
+    let marker = EventMarker::frozen(event, &next, &[], &evidence);
     store
         .write_provisional(&collections[0], &next, Some(&marker))
         .await?;

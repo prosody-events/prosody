@@ -12,7 +12,7 @@ use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
 use crate::state::collection::{MutationJournal, StateSession, WritableStateSession, sealed};
 use crate::state::descriptor::{CellResolver, StructuralIdentity};
-use crate::state::marker::{EventMarker, SectionClear};
+use crate::state::marker::{AttemptId, EventEvidence, EventMarker, SectionClear};
 use crate::state::memory::MemoryPublicationStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::publication::{PublicationRows, PublicationStore, StatePublication};
@@ -376,3 +376,13 @@ pub(crate) use admission::{
 
 mod inspection;
 pub(crate) use inspection::StageInspection;
+
+/// Creates evidence without touched collections, expiry, or dedup identity.
+pub(crate) fn empty_evidence() -> EventEvidence {
+    EventEvidence {
+        attempt: AttemptId::new(),
+        touched: [].into(),
+        evidence_ttl: None,
+        dedup: None,
+    }
+}

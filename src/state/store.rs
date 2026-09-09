@@ -29,28 +29,24 @@ pub use super::store_types::{CacheBatch, CellBuffer, CommittedBatch, CoordinateB
 
 /// Uniform durable storage for the cells of one collection partition.
 ///
-/// `get` is a resolving point read and `scan_cells` a resolving single-section
-/// range stream. The
-/// three mutators take a collection's touched cells as a batch and map onto the
-/// durability sequence:
+/// `get` resolves one cell. `scan_cells` resolves a section range.
+/// Three mutators implement the durability sequence:
 ///
-/// * [`Self::write_provisional`] — *stage*: writes `data | prev | event` for
-///   each cell (the `ReadCommitted` outcome path).
-/// * [`Self::write_resolved`] — writes committed values with `event` and `prev`
-///   null (the `ReadUncommitted` direct write, the mid-handler `commit()`, and
-///   abort resolution, where the committed value written back is the staged
-///   `prev`).
-/// * [`Self::mark_resolved`] — *promote*: nulls `event` and `prev`, keeping
-///   `data`. O(1) regardless of value size.
+/// * [`Self::write_provisional`] stages `data`, `prev`, and `event` for
+///   `ReadCommitted`.
+/// * [`Self::write_resolved`] writes committed values with null `event` and
+///   `prev`. `ReadUncommitted`, mid-handler `commit()`, and abort use this
+///   operation. Abort restores the staged `prev`.
+/// * [`Self::mark_resolved`] clears `event` and `prev` but preserves `data`.
+///   Its cost is O(1), regardless of value size.
 ///
 /// # Committed absence is row absence
 ///
-/// **Invariant:** a committed-absent cell is stored as *no row*. Every path
-/// that resolves a cell to absent deletes the row rather than leaving a
-/// null-blob residue. This is why [`Self::write_resolved`] partitions on data
-/// presence (a `None` value deletes) and why [`Self::commit_provisional`]
-/// routes an absent-data promote to `write_resolved(cell, None)` instead of the
-/// value-preserving [`Self::mark_resolved`] verb.
+/// A committed-absent cell has no row. Every operation that resolves a cell to
+/// absence deletes its row.
+/// Thus, [`Self::write_resolved`] deletes cells with `None` data.
+/// [`Self::commit_provisional`] uses that delete for absent data and
+/// [`Self::mark_resolved`] for present data.
 pub trait CellStore: Clone + Send + Sync + 'static {
     /// Error type for cell-store operations.
     type Error: ClassifyError + Error + Send + Sync + 'static;
@@ -101,41 +97,33 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         async move { Ok((self.get(collection, cell).await?, None)) }
     }
 
-    /// Batch twin of [`Self::get`]: resolves one section's coordinates in one
-    /// backend hop, answering each input position by index (`result[i]` answers
-    /// `batch[i]`; a missing row is `Committed(None)`).
+    /// Reads one section's coordinates and returns one committed value per
+    /// input position.
+    /// A missing row returns `Committed(None)`.
     ///
-    /// # Read contract (the observation rules)
+    /// # Read contract
     ///
-    /// This is **not** naive point-sequence equivalence — it is the weaker,
-    /// backend-uniform contract every implementation upholds:
+    /// * The result has exactly `batch.len()` entries. `result[i]` answers
+    ///   `batch[i]`.
+    /// * Each repeated coordinate requires one read. All its positions return
+    ///   the same value.
+    /// * Unique coordinates resolve in first-occurrence order. Row corruption
+    ///   or evidence errors fail the batch at the earliest affected input
+    ///   position. A backend can fail the whole batch before row resolution.
+    ///   Cassandra query and marker failures carry no input position, as with
+    ///   [`Self::get`].
     ///
-    /// * **Input positions** — the result has exactly `batch.len()` entries.
-    ///   `result[i]` answers `batch[i]`.
-    /// * **Dedup + co-observation** — a repeated coordinate is read once; all
-    ///   its positions answer identically.
-    /// * **First-occurrence ordering** — unique coordinates are resolved in the
-    ///   order of their first appearance in `batch`, so among the **per-row
-    ///   semantic failures** (a corrupt row shape, an evidence read) the one
-    ///   surfaced is the earliest input position's. A backend may additionally
-    ///   fail the batch as a whole *before* any row resolves (the Cassandra
-    ///   override's `IN` query or its marker read); such a whole-collection
-    ///   failure carries **no** input position, exactly as the point
-    ///   [`Self::get`] surfaces the same failure with no cell attribution.
-    ///
-    /// The default reads each unique coordinate through [`Self::get`] in
-    /// first-occurrence order and expands the answer to every duplicate
-    /// position; a failing coordinate fails the whole batch at its earliest
-    /// occurrence. The memory backend shares evidence across its raw reads. The
-    /// Cassandra backend overrides this method with one `IN` query. All
-    /// internal scratch buffers use [`CellBuffer`], so small calls stay
-    /// inline while a full batch spills rather than inflating this future.
+    /// The default calls [`Self::get`] once per unique coordinate in
+    /// first-occurrence order and copies each answer to duplicate
+    /// positions. The memory backend shares evidence across raw reads.
+    /// Cassandra uses one `IN` query.
+    /// [`CellBuffer`] keeps small scratch buffers inline; a full batch uses
+    /// heap space to limit the future's size.
     ///
     /// # Errors
     ///
-    /// Returns [`Self::Error`] on the first per-row failure [`Self::get`] would
-    /// (at the earliest input position) or a whole-collection read failure (no
-    /// position).
+    /// Returns [`Self::Error`] for the earliest affected input position, or a
+    /// whole-collection failure without a position.
     fn get_many<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -156,23 +144,21 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         }
     }
 
-    /// Cache-fill batch twin of [`Self::get_for_cache`]: the batch read plus
-    /// each position's remaining TTL, for the
-    /// [`Cached`](super::cached::Cached) write-through cache to mirror.
-    /// Same input-position contract as [`Self::get_many`].
+    /// Reads committed values and remaining TTLs for
+    /// [`Cached`](super::cached::Cached). Uses the input-position contract
+    /// of [`Self::get_many`].
     ///
-    /// The default reads each unique coordinate through [`Self::get_for_cache`]
-    /// (**not** [`Self::get_many`] with `None` TTLs — that would silently drop
-    /// a backend's TTL metadata, the `commit_provisional`-wrapper bug
-    /// class) in first-occurrence order and expands the `(value, ttl)`
-    /// pair to every duplicate position. The Cassandra store shares one
-    /// prepared statement with [`Self::get_many`]. The memory store uses
-    /// its batch read with no TTL.
+    /// The default calls [`Self::get_for_cache`] in first-occurrence order and
+    /// copies each `(value, ttl)` pair to duplicate positions.
+    /// It preserves backend TTL metadata; a call to [`Self::get_many`] with
+    /// added `None` TTLs would lose that metadata.
+    /// Cassandra shares a prepared statement with [`Self::get_many`]. Memory
+    /// uses its batch read with no TTL.
     ///
     /// # Errors
     ///
-    /// Returns [`Self::Error`] on the first failure [`Self::get_for_cache`]
-    /// would, at the earliest input position.
+    /// Returns [`Self::Error`] on the first failure from
+    /// [`Self::get_for_cache`], at the earliest input position.
     fn get_many_for_cache<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -210,39 +196,29 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         cell: &'a CellKey,
     ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + 'a;
 
-    /// Batch twin of [`Self::provisional_cell_at`]: the provisional cells among
-    /// the batch's **distinct** coordinates in one section, each tagged with
-    /// its coordinate, in **ascending coordinate order**.
+    /// Reads distinct provisional cells from one collection section in
+    /// ascending coordinate order.
+    /// Each result includes its coordinate. Input coordinates can repeat or
+    /// arrive out of order. [`CoordinateBatch`] requires non-empty input.
     ///
-    /// Order is defined on the OUTPUT, so a duplicate coordinate is
-    /// indistinguishable from a single mention and there is no sorted-unique
-    /// input precondition; [`CoordinateBatch`] is non-empty, so there is no
-    /// empty-input case. Absent and already-resolved coordinates are omitted
-    /// (over-report-safe), with exact [`Self::provisional_cell_at`] parity for
-    /// malformed / partially-expired rows — the raw decoder, never a visible
-    /// resolve. Surviving rows retain
-    /// `data`/`prev`/[`EventRef`](super::event_ref::EventRef) **without
-    /// writing durable state or publishing into the
-    /// committed-value cache** — this is the raw residue read,
-    /// not a resolving one.
+    /// The raw decoder omits absent and resolved cells, with exact
+    /// [`Self::provisional_cell_at`] parity for malformed or partially expired
+    /// rows. Results retain `data`, `prev`, and
+    /// [`EventRef`](super::event_ref::EventRef). This operation changes
+    /// neither durable state nor the committed-value cache.
     ///
-    /// A whole-batch failure carries no input position (as
-    /// [`Self::get_many`]'s whole-collection failures). A per-row decode
-    /// failure fails the batch with the **lowest failing coordinate's**
-    /// error — the backends read in ascending coordinate order so this is
-    /// deterministic. One collection partition and one section per call.
-    ///
-    /// Required with no default: a default inherited by a wrapper (notably
-    /// [`Cached`](super::cached::Cached), whose committed-value cache cannot
-    /// answer a raw provisional read) would loop [`Self::provisional_cell_at`]
-    /// — N uncached point reads that silently defeat the batch. Making it
-    /// required turns a forgotten forward into a compile error, as the
-    /// settle verbs do.
+    /// This method requires an implementation. A wrapper must forward it to
+    /// preserve native batch reads.
+    /// A default point loop would cause N uncached reads through
+    /// [`Cached`](super::cached::Cached), whose cache cannot answer raw
+    /// provisional reads.
     ///
     /// # Errors
     ///
-    /// Returns [`Self::Error`] on a store failure or a per-row decode failure
-    /// (at the lowest failing coordinate).
+    /// Returns [`Self::Error`] on a store or row decode failure.
+    /// A whole-batch failure has no input position. A row failure reports the
+    /// lowest affected coordinate, because backends decode in ascending
+    /// order.
     fn provisional_many<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -288,21 +264,17 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         marker: Option<&'a EventMarker>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
-    /// Writes each `(cell, data)` as a resolved cell in one same-partition
-    /// batch, binding `collection`'s TTL, partitioning internally on data
-    /// presence: `Some(data)` writes the committed value (`event`/`prev` null);
-    /// `None` **deletes the row** (the row-absence invariant). Handles the
-    /// `ReadUncommitted` direct clear, the mid-handler `commit()` of a clear,
-    /// and rollback-to-absent. Never touches the Staged row (see
-    /// [`write_provisional`](Self::write_provisional)).
+    /// Writes resolved cells in a same-partition batch with the collection TTL.
+    /// `Some(data)` writes a committed value with null `event` and `prev`.
+    /// `None` deletes the row.
+    /// This operation supports `ReadUncommitted` clears, mid-handler `commit()`
+    /// clears, and rollback to absence. It never changes Staged.
     ///
-    /// `clears` names sections to erase before `cells` land — the direct-apply
-    /// twin of a staged clear: every non-survivor row of each cleared section
-    /// is deleted (on Cassandra as gap range tombstones between the sorted
-    /// survivors), with survivors excluded **positionally** via the frozen
-    /// list. The caller derives each clear's survivors from `cells`' own
-    /// present-data coordinates — the single survivor definition — so no
-    /// written row can overlap a gap range (batches stay row-disjoint).
+    /// `clears` removes each section's non-survivor rows before cell writes.
+    /// Cassandra deletes gaps between sorted survivors. The caller freezes
+    /// survivors from the present-data coordinates in `cells`.
+    /// These positions exclude every written row from the gap ranges, so batch
+    /// rows remain disjoint.
     ///
     /// # Unsettled section clears
     ///
@@ -349,35 +321,30 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         cells: &'a [CellKey],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
-    /// Writes Committed evidence, promotes the staged values and frozen clears,
-    /// then deletes Staged. The Staged payload supplies the event and evidence
-    /// TTL. Promotion preserves each cell's TTL, and deletes bind no TTL.
+    /// Writes Committed evidence, promotes staged values and frozen clears,
+    /// then deletes Staged.
+    /// The Staged payload supplies the event and evidence TTL. Promotion
+    /// preserves each cell's TTL; deletes bind no TTL.
     /// Admission can thus promote unregistered collections without a registry
     /// TTL.
     ///
-    /// Required with no default (present data promotes via
-    /// [`Self::mark_resolved`], absent data deletes its row via the raw
-    /// resolved apply, and Staged is deleted last — the memory backend
-    /// routes to its own raw apply so the settle never re-enters the
-    /// clear resolution boundary on the Staged row it deletes; the Cassandra
-    /// backend implements the identical routing natively with
-    /// same-partition batches): with markers, a
-    /// defaulted override behind a trait default is a landmine — a wrapper
-    /// store that forgot to forward the verb would fall into a default routing
-    /// through the *wrapper's* verbs and bypass the inner store's Staged
-    /// delete, a leaked Staged row with no compile error. Making both settle
-    /// verbs required makes that bug class uncompilable.
+    /// Both settle methods require implementations. A wrapper must forward
+    /// them; a default could bypass the inner store's Staged delete and
+    /// leak residue. Memory promotes present data through
+    /// [`Self::mark_resolved`] and deletes absent data through its raw
+    /// apply operation. The raw apply avoids recursive clear resolution on
+    /// Staged. Cassandra uses the same sequence in same-partition batches.
     ///
-    /// The Staged payload's frozen clears are **applied here**: each cleared
-    /// section's non-survivor rows are erased — on Cassandra as the n+1 gap
-    /// range deletes between sorted survivors. The Staged delete is issued
-    /// only after every cell resolution and gap delete has completed, unless
-    /// one same-partition batch carries all of them atomically. Erasing a
-    /// still-provisional **prior event** row is correct: single-writer ordering
-    /// puts the committed clear after every pre-existing row, so a
-    /// non-survivor's post-clear state is absent regardless of its unresolved
-    /// history (the erasure argument). Survivors are protected positionally by
-    /// the frozen list, never temporally. Admission can retry this operation.
+    /// The frozen clears remove each section's non-survivor rows. Cassandra
+    /// uses n+1 gap deletes between n sorted survivors.
+    /// Staged disappears after all cell changes and gap deletes, unless one
+    /// atomic batch contains the entire operation.
+    /// A committed clear follows every prior row under the single-writer rule.
+    /// It therefore removes prior provisional non-survivors regardless of
+    /// their unresolved history.
+    ///
+    /// The frozen positions protect survivors without timestamp comparisons.
+    /// Admission can retry this operation.
     ///
     /// # Errors
     ///
@@ -389,12 +356,12 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
-    /// Settles a staged set as **aborted** AND deletes the collection's
-    /// Staged row: each cell's committed base `prev` is written back as the
-    /// resolved value. Required with no default, for the reason on
-    /// [`commit_provisional`](Self::commit_provisional). The base was never
-    /// touched by the stage, so the rollback is exact and needs no per-section
-    /// discard. Admission can retry this operation.
+    /// Restores each staged cell's committed base `prev` as its resolved value,
+    /// then deletes Staged.
+    /// The stage preserves the base, so rollback needs no section discard.
+    /// Admission can retry this operation.
+    /// This method requires an implementation for the reason in
+    /// [`Self::commit_provisional`].
     ///
     /// # Errors
     ///

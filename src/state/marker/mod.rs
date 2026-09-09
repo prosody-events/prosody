@@ -172,12 +172,10 @@ pub struct SectionClear {
 }
 
 impl SectionClear {
-    /// Freezes `section`'s survivors from the event's staged cells: the
-    /// coordinates of that section's staged cells whose data is present,
-    /// ascending. The one survivor definition — the session's `finalize`
-    /// builds these from its staged record, the stage freezes them into the
-    /// payload verbatim, and the settle and admission replay them from the
-    /// payload verbatim.
+    /// Freezes the ascending coordinates of `section`'s staged cells with
+    /// present data. The session's `finalize` derives survivors from its
+    /// staged record. The stage stores them unchanged; settle and admission
+    /// replay them unchanged.
     #[must_use]
     pub(in crate::state) fn frozen(
         section: Section,
@@ -269,22 +267,19 @@ impl EventMarker {
         event: EventRef,
         staged: &[(CellKey, ProvisionalWrite)],
         clears: &[SectionClear],
-        touched: &Arc<[(StateType, StateName)]>,
-        evidence_ttl: Option<CompactDuration>,
-        dedup: Option<Uuid>,
-        attempt: AttemptId,
+        evidence: &EventEvidence,
     ) -> Self {
         let mut coordinates: Vec<CellKey> = staged.iter().map(|(cell, _)| cell.clone()).collect();
         coordinates.sort_unstable();
         Self::from_parts(EventMarkerData {
             version: MarkerVersion::V2,
-            attempt,
+            attempt: evidence.attempt,
             event,
             staged: coordinates,
             clears: clears.to_vec(),
-            touched: Arc::clone(touched),
-            evidence_ttl,
-            dedup,
+            touched: Arc::clone(&evidence.touched),
+            evidence_ttl: evidence.evidence_ttl,
+            dedup: evidence.dedup,
         })
     }
 
@@ -351,11 +346,10 @@ impl EventMarker {
     }
 }
 
-/// Encodes an [`EventMarker`]'s payload — everything but its `event` — to the
-/// frozen wire bytes. Deterministic: the lists are already in
-/// sorted order.
+/// Encodes an [`EventMarker`]'s payload without its `event` into frozen wire
+/// bytes. Sorted lists make the encoding deterministic.
 ///
-/// Wire format (fixed-width big-endian, matching the fjall-codec house style):
+/// The format uses fixed-width big-endian fields, as the fjall codec does:
 ///
 /// ```text
 /// [staged_count: u32 BE]
@@ -371,13 +365,13 @@ impl EventMarker {
 /// [attempt: 16 bytes]
 /// ```
 ///
-/// Frozen and pinned; the Cassandra Staged row is its production caller (the
-/// payload rides the row's `data`/`encoding`/`version` columns).
+/// Cassandra stores this frozen payload through the Staged row's `data`,
+/// `encoding`, and `version` columns.
 ///
 /// # Errors
 ///
 /// Returns [`MarkerPayloadError::TooLarge`] if a count or coordinate length
-/// exceeds the `u32` the wire format carries — never a silent truncation.
+/// exceeds the wire format's `u32` limit. The encoder never truncates a field.
 pub(in crate::state) fn encode_marker_payload(
     marker: &EventMarker,
 ) -> Result<Bytes, MarkerPayloadError> {
@@ -434,13 +428,13 @@ pub(in crate::state) fn encode_marker_payload(
     Ok(Bytes::from(buf))
 }
 
-/// Decodes a marker payload produced by [`encode_marker_payload`], binding it
-/// to `event` (which rides the Staged row's own column, not the payload).
+/// Decodes a payload from [`encode_marker_payload`] and associates it with
+/// `event`. The Staged row stores `event` in a separate column.
 ///
 /// # Errors
 ///
-/// Returns [`MarkerPayloadError`] on a truncated buffer or trailing garbage —
-/// both classify [`Permanent`](ErrorCategory::Permanent), a data rejection.
+/// Returns [`MarkerPayloadError`] for truncated input or trailing bytes. Both
+/// errors classify as [`Permanent`](ErrorCategory::Permanent) data rejections.
 pub(in crate::state) fn decode_marker_payload(
     event: EventRef,
     bytes: &[u8],
@@ -476,7 +470,7 @@ pub(in crate::state) fn decode_marker_payload(
         clears.push(SectionClear { section, survivors });
     }
 
-    let (mut touched, ttl, dedup) = match version {
+    let (mut touched, ttl, dedup, attempt) = match version {
         MarkerVersion::V1 => (
             Vec::new(),
             legacy_ttl,
@@ -484,6 +478,7 @@ pub(in crate::state) fn decode_marker_payload(
                 EventRef::Message { dedup_id } => Some(dedup_id),
                 EventRef::Timer(_) => None,
             },
+            AttemptId::new(),
         ),
         MarkerVersion::V2 => {
             let count = cursor.take_u32()? as usize;
@@ -507,21 +502,19 @@ pub(in crate::state) fn decode_marker_payload(
                         .map_err(|_| MarkerPayloadError::Truncated)?,
                 )),
             };
+            let attempt = AttemptId(Uuid::from_bytes(
+                cursor
+                    .take(16)?
+                    .try_into()
+                    .map_err(|_| MarkerPayloadError::Truncated)?,
+            ));
             (
                 touched,
                 (seconds != 0).then(|| CompactDuration::new(seconds)),
                 dedup,
+                attempt,
             )
         }
-    };
-    let attempt = match version {
-        MarkerVersion::V1 => AttemptId::new(),
-        MarkerVersion::V2 => AttemptId(Uuid::from_bytes(
-            cursor
-                .take(16)?
-                .try_into()
-                .map_err(|_| MarkerPayloadError::Truncated)?,
-        )),
     };
     if !cursor.is_empty() {
         return Err(MarkerPayloadError::TrailingGarbage);

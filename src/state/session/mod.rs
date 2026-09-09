@@ -1486,15 +1486,7 @@ where
                 .iter()
                 .map(|&section| SectionClear::frozen(section, &writes))
                 .collect();
-            let marker = EventMarker::frozen(
-                event,
-                &writes,
-                &clears,
-                &evidence.touched,
-                evidence.evidence_ttl,
-                evidence.dedup,
-                evidence.attempt,
-            );
+            let marker = EventMarker::frozen(event, &writes, &clears, evidence);
             lower
                 .write_provisional(&collection_ref, &writes, Some(&marker))
                 .await

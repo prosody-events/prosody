@@ -1,7 +1,6 @@
 use super::*;
 use crate::cassandra::TABLE_KEYED_STATE_CELL;
-use crate::state::marker::AttemptId;
-use crate::state::tests::support::seed_commit_evidence;
+use crate::state::tests::support::{empty_evidence, seed_commit_evidence};
 
 async fn corrupt_cleared_window(name: &str) -> Result<(Fixture, CassandraStore, CollectionRef)> {
     let fx = fixture().await?;
@@ -25,15 +24,7 @@ async fn corrupt_cleared_window(name: &str) -> Result<(Fixture, CassandraStore, 
     let foreign = event(0xF0);
     let survivors = [(cell_in(0, 2), Some(bytes(2)))];
     let clear = SectionClear::frozen_resolved(SECTIONS[0], &survivors);
-    let marker = EventMarker::frozen(
-        foreign,
-        &[],
-        slice::from_ref(&clear),
-        &[].into(),
-        None,
-        None,
-        AttemptId::new(),
-    );
+    let marker = EventMarker::frozen(foreign, &[], slice::from_ref(&clear), &empty_evidence());
     store
         .write_provisional(&collection, &[], Some(&marker))
         .await?;

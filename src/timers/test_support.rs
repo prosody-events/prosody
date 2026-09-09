@@ -8,7 +8,7 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::telemetry::Telemetry;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-pub(crate) use crate::timers::scheduler::admission_tests::retirement_trace;
+pub(crate) use crate::timers::scheduler::tests::support::retirement_trace;
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
 use crate::timers::store::{Segment, SegmentVersion};
