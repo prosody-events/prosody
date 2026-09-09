@@ -884,77 +884,8 @@ impl TriggerOperations for CassandraTriggerStore {
         Ok(())
     }
 
-    /// Rotates the commit-oracle tag on an existing timer at `time`.
-    ///
-    /// **Precondition:** the caller must have observed the timer at `(key,
-    /// time, timer_type)` as currently scheduled (today: from
-    /// `complete()`-from-`FiringRescheduled`, where the row was just loaded
-    /// into the active scheduler). Holding the per-key mutex serialises
-    /// against concurrent in-process writers, so the row is guaranteed to
-    /// exist for the duration of the write.
-    ///
-    /// Uses `resolve_state` (cache-first):
-    /// - **Inline(timer), time matches**: rewrite the UDT in place.
-    /// - **Inline(_), time mismatch** or **Absent**: no-op (target absent).
-    /// - **Overflow**: bare `UPDATE` on the clustering row — no LWT, no
-    ///   existence check.
-    #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
-    async fn update_tag(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-        new_tag: i32,
-    ) -> Result<(), Self::Error> {
-        let segment_id = self.segment.id;
-        let (handle, cached) = self.resolve_state(&segment_id, key, timer_type).await?;
-        Span::current().record("state_cached", cached);
-
-        let mut guard = handle.lock().await;
-        match &*guard {
-            TimerState::Inline(timer) if timer.time == time => {
-                let new_state = TimerState::Inline(InlineTimer {
-                    time: timer.time,
-                    span: timer.span.clone(),
-                    tag: new_tag,
-                });
-                tokio::try_join!(
-                    self.set_state_inline(&segment_id, key, timer_type, &new_state),
-                    self.update_slab_tag(key, time, timer_type, new_tag),
-                )?;
-                *guard = new_state;
-            }
-            // Concurrent `clear_and_schedule` won the lock first and rewrote
-            // the UDT to a different timer (or cleared it entirely). The new
-            // Inline timer carries its own freshly-minted tag from
-            // `Trigger::new`, so our rotation is moot. Do NOT assert/warn —
-            // this race is legitimate under normal reschedule contention.
-            TimerState::Inline(_) | TimerState::Absent => {}
-            TimerState::Overflow => {
-                tokio::try_join!(
-                    self.execute_unpaged_discard(
-                        &self.queries().update_tag,
-                        (new_tag, &segment_id, key.as_ref(), timer_type, time),
-                    ),
-                    self.update_slab_tag(key, time, timer_type, new_tag),
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Reads the commit-oracle tag for a single timer at `time`.
-    ///
-    /// Cache-first via `resolve_state`: a hit answers with zero DB reads.
-    /// This is sound because the partition's single writer is the only
-    /// mutator of this instance's `state_cache`, and the keyed-state commit
-    /// oracle consults through a **clone of this instance** (handle passing
-    /// at partition acquisition — see `StateBackendFactory::for_partition`), so
-    /// writer and oracle share one cache; per-key serialization orders every
-    /// consult against the mutations it must observe. On `Overflow`, the
-    /// clustering row's tag column is read under the per-key mutex so a
-    /// concurrent promote/demote cannot interleave between the state check and
-    /// the row read.
+    /// Reads the current trigger through the partition writer's shared cache.
+    /// Per-key serialization orders admission after every prior store mutation.
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn current_trigger(
         &self,

@@ -70,12 +70,6 @@ enum Op {
         ty: TimerType,
         state: TimerState,
     },
-    SetTag {
-        key: Key,
-        time: CompactDateTime,
-        ty: TimerType,
-        tag: i32,
-    },
 }
 
 impl Op {
@@ -85,8 +79,7 @@ impl Op {
         match self {
             Op::Insert { key, time, ty, .. }
             | Op::Remove { key, time, ty }
-            | Op::SetState { key, time, ty, .. }
-            | Op::SetTag { key, time, ty, .. } => (key.clone(), *time, *ty),
+            | Op::SetState { key, time, ty, .. } => (key.clone(), *time, *ty),
         }
     }
 }
@@ -97,7 +90,7 @@ impl Arbitrary for Op {
         let time =
             CompactDateTime::from(TIME_POOL[usize::from(u8::arbitrary(g)) % TIME_POOL.len()]);
         let ty = TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
-        match u8::arbitrary(g) % 4 {
+        match u8::arbitrary(g) % 3 {
             0 => Op::Insert {
                 key,
                 time,
@@ -105,17 +98,11 @@ impl Arbitrary for Op {
                 tag: i32::arbitrary(g),
             },
             1 => Op::Remove { key, time, ty },
-            2 => Op::SetState {
+            _ => Op::SetState {
                 key,
                 time,
                 ty,
                 state: STATES[usize::from(u8::arbitrary(g)) % STATES.len()],
-            },
-            _ => Op::SetTag {
-                key,
-                time,
-                ty,
-                tag: i32::arbitrary(g),
             },
         }
     }
@@ -141,7 +128,7 @@ impl Arbitrary for Trace {
 }
 
 /// Asserts every reader of the registry agrees with the model: per-triple
-/// `get_state`/`get_tag`/`contains`/`is_scheduled`, the `scan_active_times`
+/// `get_state`/`get`/`contains`/`is_scheduled`, the `scan_active_times`
 /// multiset, and the `snapshot` fold — the last recomputed independently, not
 /// by calling `snapshot` again.
 async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
@@ -151,7 +138,10 @@ async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
             active.get_state(key, *time, *ty).await,
             entry.map(|e| e.state)
         );
-        assert_eq!(active.get_tag(key, *time, *ty).await, entry.map(|e| e.tag));
+        assert_eq!(
+            active.get(key, *time, *ty).await.map(|entry| entry.tag),
+            entry.map(|e| e.tag)
+        );
         assert_eq!(active.contains(key, *time, *ty).await, entry.is_some());
         assert_eq!(
             active.is_scheduled(key, *time, *ty).await,
@@ -200,7 +190,7 @@ async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
 }
 
 /// Applies each op to the registry and the model in lockstep, asserting
-/// equivalence on the empty state and after every op. `set_state`/`set_tag`
+/// equivalence on the empty state and after every op. `set_state`
 /// return values are compared inline, where the model's pre-op membership is
 /// known.
 async fn run_trace(trace: Trace) {
@@ -253,17 +243,6 @@ async fn run_trace(trace: Trace) {
                 };
                 assert_eq!(got, want, "set_state return");
             }
-            Op::SetTag { key, time, ty, tag } => {
-                let got = active.set_tag(&key, time, ty, tag).await;
-                let want = match model.get_mut(&(key, time, ty)) {
-                    Some(entry) => {
-                        entry.tag = tag;
-                        true
-                    }
-                    None => false,
-                };
-                assert_eq!(got, want, "set_tag return");
-            }
         }
 
         assert_equiv(&active, &model, &seen).await;
@@ -271,7 +250,7 @@ async fn run_trace(trace: Trace) {
 }
 
 /// The registry tracks a plain `HashMap` model op-for-op across
-/// Insert/Remove/SetState/SetTag, and every reader (`get_state`, `get_tag`,
+/// Insert/Remove/SetState, and every reader (`get_state`, `get`,
 /// `contains`, `is_scheduled`, `scan_active_times`, `snapshot`) agrees after
 /// every op.
 #[test]

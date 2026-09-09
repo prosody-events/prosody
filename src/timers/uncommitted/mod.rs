@@ -205,25 +205,13 @@ where
     /// `Firing` state. If the timer was cancelled while queued, returns
     /// `None` and the timer is marked as completed.
     ///
-    /// The `FiringTimer`'s trigger carries the canonical tag from
-    /// `ActiveTriggers` at the moment of dispatch. This tag may differ from
-    /// the tag on the queue-popped trigger if a `complete()`-from-
-    /// `FiringRescheduled` rotation occurred while this entry was in the
-    /// delay queue.
+    /// The trigger keeps its queued tag, including tags loaded from older
+    /// layouts.
     pub async fn fire(mut self) -> Option<FiringTimer<T>> {
-        // Attempt to transition from Scheduled → Firing, reading the canonical
-        // tag from ActiveTriggers under the trigger-lock.
-        let Some(canonical_tag) = self.uncommitted.fire_with_tag().await else {
+        if !self.uncommitted.manager.fire(&self.trigger).await {
             self.uncommitted.completed = true;
             return None;
-        };
-
-        // Re-stamp the trigger with the canonical tag so provisional-cell
-        // writers can embed the observed-at-dispatch value. `tag` is excluded
-        // from `Hash/Eq/Ord` (see `Trigger` doc), so the in-place write
-        // preserves the `(key, time, timer_type)` identity used by any
-        // downstream map keys.
-        self.trigger.tag = canonical_tag;
+        }
 
         Some(FiringTimer {
             trigger: self.trigger,
@@ -368,18 +356,6 @@ impl<T> UncommittedTrigger<T>
 where
     T: TriggerStore,
 {
-    /// Attempt to transition the timer from `Scheduled` to `Firing` state,
-    /// returning the value observed at the transition; see
-    /// [`PendingTimer::fire`] for what "canonical" means here.
-    ///
-    /// Returns `None` if the transition failed (timer was cancelled or is not
-    /// in `Scheduled` state).
-    async fn fire_with_tag(&self) -> Option<i32> {
-        self.manager
-            .fire_with_tag(&self.key, self.time, self.timer_type)
-            .await
-    }
-
     /// Permanently remove the timer from storage and deactivate it.
     ///
     /// Retries indefinitely on failures, waiting `RETRY_DURATION` between

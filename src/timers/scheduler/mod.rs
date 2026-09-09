@@ -81,11 +81,7 @@ pub(super) enum CommandOperation {
     Remove,
     /// Remove the coordinate only if no replacement tag stands.
     RetireCommitted,
-    /// Add a trigger to the `DelayQueue` only (used when the caller has
-    /// already transitioned `ActiveTriggers` to `FiringRescheduled`).
-    AddToQueue,
-    /// Remove a trigger from the `DelayQueue` only (cancel an earlier
-    /// `AddToQueue`).
+    /// Remove the queue entry and preserve its registry state.
     RemoveFromQueue,
 }
 
@@ -164,15 +160,6 @@ where
             .await
     }
 
-    /// Add a trigger to the `DelayQueue` without modifying `ActiveTriggers`.
-    pub(crate) async fn add_to_queue(
-        &self,
-        trigger: Trigger,
-    ) -> Result<(), TimerSchedulerError<E>> {
-        self.send_command(CommandOperation::AddToQueue, trigger)
-            .await
-    }
-
     /// Remove a trigger from the `DelayQueue` without modifying
     /// `ActiveTriggers`.
     pub(crate) async fn remove_from_queue(
@@ -186,23 +173,8 @@ where
     /// Transitions a timer from `Scheduled` to `Firing` state.
     ///
     /// Returns `true` if the transition succeeded.
-    pub(crate) async fn fire(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> bool {
-        use crate::timers::active::TimerState;
-
-        if let Some(TimerState::Scheduled) =
-            self.active_triggers.get_state(key, time, timer_type).await
-        {
-            self.active_triggers
-                .set_state(key, time, timer_type, TimerState::Firing)
-                .await
-        } else {
-            false
-        }
+    pub(crate) async fn fire(&self, trigger: &Trigger) -> bool {
+        self.active_triggers.fire(trigger).await
     }
 
     /// Deactivate a trigger without removing it from the persistent queue.

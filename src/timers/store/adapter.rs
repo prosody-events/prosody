@@ -208,18 +208,6 @@ where
         Ok(())
     }
 
-    async fn update_tag(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-        new_tag: i32,
-    ) -> Result<(), Self::Error> {
-        self.operations
-            .update_tag(key, time, timer_type, new_tag)
-            .await
-    }
-
     async fn current_trigger(
         &self,
         key: &Key,

@@ -66,7 +66,7 @@ pub(super) type CachedState = Arc<AsyncMutex<TimerState>>;
 /// Timer data for a single inlined timer.
 ///
 /// This is the resolved domain type for a key with exactly one timer.
-/// The `tag` field mirrors the commit-oracle tag stored on the `Trigger`.
+/// The `tag` field preserves the queued attempt identity from the `Trigger`.
 /// Pre-migration rows have `tag = NULL` which normalises to `0`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InlineTimer {
@@ -74,7 +74,7 @@ pub struct InlineTimer {
     pub time: CompactDateTime,
     /// OpenTelemetry span context for trace continuity.
     pub span: HashMap<String, String>,
-    /// Commit-oracle tag. `0` for pre-migration rows (tag column absent).
+    /// Queued attempt identity. `0` for pre-migration rows (tag column absent).
     pub tag: i32,
 }
 
@@ -108,7 +108,7 @@ struct RawTimerState {
     time: Option<CompactDateTime>,
     /// Span context (present only when `inline = true`).
     span: Option<HashMap<String, String>>,
-    /// Commit-oracle tag (added by the `20260506_add_tag` migration).
+    /// Queued attempt identity (added by the `20260506_add_tag` migration).
     /// `None` for rows written before migration; normalised to `0`.
     tag: Option<i32>,
 }

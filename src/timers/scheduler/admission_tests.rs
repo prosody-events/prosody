@@ -104,11 +104,15 @@ where
     handled?;
     load_step(&mut state, &mut queue).await;
     let expected = (!mode.is_multiple_of(3)).then_some(tag + 1_i32);
+    let entry = active.get(&old.key, time, old.timer_type).await;
     ensure!(
-        active.get_tag(&old.key, time, old.timer_type).await == expected,
+        entry.map(|entry| entry.tag) == expected,
         "retirement left the wrong queued attempt"
     );
-    ensure!(store.current_tag(&old.key, time, old.timer_type).await? == expected);
+    let current = store
+        .current_trigger(&old.key, time, old.timer_type)
+        .await?;
+    ensure!(current.map(|trigger| trigger.tag) == expected);
     let rows: Vec<_> = store
         .get_slab_triggers_all_types(slab.id())
         .map_ok(|t| t.tag)

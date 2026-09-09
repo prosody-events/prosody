@@ -205,15 +205,12 @@ pub(super) async fn process_command<T>(
         CommandOperation::RetireCommitted => {
             let tag = triggers
                 .active_triggers()
-                .get_tag(&trigger.key, trigger.time, trigger.timer_type)
-                .await;
+                .get(&trigger.key, trigger.time, trigger.timer_type)
+                .await
+                .map(|entry| entry.tag);
             if tag.is_none_or(|tag| tag == trigger.tag) {
                 triggers.remove(&trigger).await;
             }
-            Ok(())
-        }
-        CommandOperation::AddToQueue => {
-            triggers.insert_queue_only(trigger);
             Ok(())
         }
         CommandOperation::RemoveFromQueue => {
@@ -294,8 +291,9 @@ where
         // The add command carries the authoritative tag from the key row.
         let tag = triggers
             .active_triggers()
-            .get_tag(&trigger.key, trigger.time, trigger.timer_type)
-            .await;
+            .get(&trigger.key, trigger.time, trigger.timer_type)
+            .await
+            .map(|entry| entry.tag);
         if tag.is_some_and(|tag| tag != trigger.tag) {
             triggers.remove(&trigger).await;
         }

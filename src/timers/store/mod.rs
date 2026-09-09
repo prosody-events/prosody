@@ -396,21 +396,8 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // ===================================================================
-    // Timer identity reads and updates
+    // Timer identity read
     // ===================================================================
-
-    /// Updates the `tag` on both persisted timer indices.
-    ///
-    /// No-op if the row is absent. Used by
-    /// `complete()`-from-`FiringRescheduled` to rotate the tag so the
-    /// completed attempt and its queued replacement have distinct identities.
-    fn update_tag(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-        new_tag: i32,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Reads the authoritative trigger from the key index.
     /// Returns None when the row is absent. Legacy null tags decode as zero.
@@ -421,19 +408,4 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<Option<Trigger>, Self::Error>> + Send;
-
-    /// Reads the tag of the current key row.
-    fn current_tag(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> impl Future<Output = Result<Option<i32>, Self::Error>> + Send {
-        async move {
-            Ok(self
-                .current_trigger(key, time, timer_type)
-                .await?
-                .map(|trigger| trigger.tag))
-        }
-    }
 }
