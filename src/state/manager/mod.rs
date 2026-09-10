@@ -52,14 +52,22 @@ use tokio::task::coop::cooperative;
 use tracing::error;
 use uuid::Uuid;
 
+/// Counts each marker read that admission skips after a permanent rejection.
 static CORRUPT_MARKER: LazyLock<Counter<u64>> = LazyLock::new(|| {
     meter("prosody")
-        .u64_counter("keyed_state.admission.corrupt_marker")
+        .u64_counter("prosody.state.admission.corrupt_marker")
+        .with_description("Marker reads that admission skips after a permanent rejection")
+        .with_unit("{marker}")
         .build()
 });
+
+/// Counts each committed-marker resolution that admission rolls back after a
+/// permanent rejection.
 static ADMISSION_TORN: LazyLock<Counter<u64>> = LazyLock::new(|| {
     meter("prosody")
-        .u64_counter("keyed_state.admission.torn")
+        .u64_counter("prosody.state.admission.torn")
+        .with_description("Permanent rejections of committed-marker resolutions during admission")
+        .with_unit("{resolve}")
         .build()
 });
 
@@ -172,12 +180,25 @@ pub trait PartitionStateManager: Clone + Send + Sync + 'static {
         termination: TerminationWatch,
     ) -> EventStateScope<Self::Session>;
 
-    /// Resolves residue and retires committed sources before dispatch.
-    /// Committed residue promotes in every discovered collection, registered or
-    /// not. Uncommitted registered residue aborts with the registry TTL.
-    /// Unregistered version 2 residue remains untouched; version 1 residue
-    /// loses its Staged row. Permanent rejections receive local repair.
-    /// Shutdown prevents dispatch.
+    /// Repairs the key's durable state before its first dispatch.
+    ///
+    /// An interrupted settle leaves a Staged row and provisional cells in each
+    /// collection it touched. Admission reads the marker rows of every
+    /// discovered collection and decides each Staged row. A Committed row with
+    /// the same attempt id certifies a version 2 row. The old commit point
+    /// certifies a version 1 row.
+    ///
+    /// - A certified row promotes, registered or not.
+    /// - An uncertified row in a registered collection aborts with the registry
+    ///   TTL.
+    /// - An uncertified version 2 row in an unregistered collection stays
+    ///   untouched.
+    /// - Admission deletes an uncertified version 1 row in an unregistered
+    ///   collection.
+    ///
+    /// Admission then retires each committed source: the message dedup id or
+    /// the timer trigger. A permanent store rejection skips its step and does
+    /// not block dispatch. Shutdown returns [`Admission::Abandoned`].
     fn admit<T>(
         &self,
         key: Key,

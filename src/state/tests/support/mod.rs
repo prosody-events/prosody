@@ -377,6 +377,21 @@ pub(crate) use admission::{
 mod inspection;
 pub(crate) use inspection::StageInspection;
 
+/// The marker's evidence with no staged cells and no clears.
+pub(crate) fn evidence_only(marker: &EventMarker) -> EventMarker {
+    EventMarker::frozen(
+        marker.event(),
+        &[],
+        &[],
+        &EventEvidence {
+            attempt: marker.attempt(),
+            touched: marker.touched().into(),
+            evidence_ttl: marker.evidence_ttl(),
+            dedup: marker.dedup(),
+        },
+    )
+}
+
 /// Creates one hour of evidence for a new test attempt.
 pub(crate) fn evidence(
     touched: Arc<[(StateType, StateName)]>,

@@ -29,9 +29,13 @@ use crate::state::descriptor::Registered;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{Finalized, LifecycleAccess, MessageMarker, OpPermit, Promoted};
 
+/// Counts each event whose promote succeeds for some collections and rejects
+/// others.
 static PROMOTE_TORN: LazyLock<Counter<u64>> = LazyLock::new(|| {
     meter("prosody")
-        .u64_counter("keyed_state.promote.torn")
+        .u64_counter("prosody.state.promote.torn")
+        .with_description("Events whose promote succeeds for some collections and rejects others")
+        .with_unit("{promote}")
         .build()
 });
 

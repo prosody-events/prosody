@@ -2669,29 +2669,28 @@ async fn stage_clock_crash<S: CellStore>(
             attempt: AttemptId::new(),
         },
     );
-    let units: Vec<_> = (0..=writes.len())
+    let marker_unit = BatchUnit::<()>::new(0, smallvec::SmallVec::new());
+    let units: Vec<_> = (1..=writes.len())
         .map(|index| BatchUnit::<()>::new(index as u64, smallvec::SmallVec::new()))
         .collect();
     let mut now = 0_u32;
     let step = u32::from(trace.clock) * 100;
     let mut marker_expiry = 0_u32;
     let mut cell_expiry = [0_u32; 4];
-    for range in crash_stage_batches(&units, u64::MAX, 2).take(usize::from(trace.cut % 5)) {
-        let members: Vec<_> = crash_stage_chunk(&units, range.clone())
+    for range in
+        crash_stage_batches(&marker_unit, &units, u64::MAX, 2).take(usize::from(trace.cut % 5))
+    {
+        let members: Vec<_> = crash_stage_chunk(&marker_unit, &units, range.clone())
             .map(BatchUnit::weight)
             .collect();
         ensure!(members.first() == Some(&0), "stage chunk lost its marker");
         let expiry = ttl.map_or(u32::MAX, |ttl| now + ttl.seconds());
         marker_expiry = expiry;
         for slot in range.clone() {
-            cell_expiry[slot - 1] = expiry;
+            cell_expiry[slot] = expiry;
         }
         store
-            .write_provisional(
-                &collection,
-                &writes[range.start - 1..range.end - 1],
-                Some(&marker),
-            )
+            .write_provisional(&collection, &writes[range.clone()], Some(&marker))
             .await?;
         now += step;
     }

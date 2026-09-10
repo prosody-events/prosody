@@ -1,6 +1,6 @@
-//! A collection stores two marker rows: `Staged` carries residue data and
-//! `Committed` carries positive commit evidence. Only a promote writes
-//! evidence.
+//! A collection stores two marker rows. `Staged` lists the residue: the
+//! provisional cells that an interrupted settle leaves behind. `Committed`
+//! carries positive commit evidence. Only a promote writes evidence.
 //!
 //! The frozen payload lists staged coordinates, clear survivors, and touched
 //! collections. Version 2 adds touched collections and the shared evidence TTL.
@@ -302,20 +302,6 @@ impl EventMarker {
         self.inner.version
     }
 
-    /// Builds the payload that remains after this collection promotes.
-    pub(crate) fn committed_payload(&self) -> Self {
-        Self::from_parts(EventMarkerData {
-            version: MarkerVersion::V2,
-            attempt: self.attempt(),
-            event: self.event(),
-            staged: Vec::new(),
-            clears: Vec::new(),
-            touched: self.inner.touched.clone(),
-            evidence_ttl: self.evidence_ttl(),
-            dedup: self.dedup(),
-        })
-    }
-
     /// Supplies current retention before admission promotes a legacy stage.
     pub(crate) fn for_admission(&self, dedup_ttl: CompactDuration) -> Self {
         if self.version() == MarkerVersion::V1 {
@@ -391,12 +377,28 @@ impl EventMarker {
 pub(in crate::state) fn encode_marker_payload(
     marker: &EventMarker,
 ) -> Result<Bytes, MarkerPayloadError> {
+    encode_payload(marker, marker.staged(), marker.clears())
+}
+
+/// Encodes the Committed row: the marker's evidence with no staged cells and no
+/// clears. Shares the wire format and errors with [`encode_marker_payload`].
+pub(in crate::state) fn encode_committed_payload(
+    marker: &EventMarker,
+) -> Result<Bytes, MarkerPayloadError> {
+    encode_payload(marker, &[], &[])
+}
+
+fn encode_payload(
+    marker: &EventMarker,
+    staged: &[CellKey],
+    clears: &[SectionClear],
+) -> Result<Bytes, MarkerPayloadError> {
     let mut len = LEN_PREFIX;
-    for cell in marker.staged() {
+    for cell in staged {
         len += 1 + LEN_PREFIX + cell.coordinate.as_bytes().len();
     }
     len += LEN_PREFIX;
-    for clear in marker.clears() {
+    for clear in clears {
         len += 1 + LEN_PREFIX;
         for coordinate in &clear.survivors {
             len += LEN_PREFIX + coordinate.as_bytes().len();
@@ -411,13 +413,13 @@ pub(in crate::state) fn encode_marker_payload(
             .sum::<usize>();
     len += 16 + 1 + marker.dedup().map_or(0, |_| 16);
     let mut buf = Vec::with_capacity(len);
-    buf.extend_from_slice(&len_u32(marker.staged().len())?.to_be_bytes());
-    for cell in marker.staged() {
+    buf.extend_from_slice(&len_u32(staged.len())?.to_be_bytes());
+    for cell in staged {
         buf.push(i8::from(cell.section).cast_unsigned());
         push_len_prefixed(&mut buf, &cell.coordinate)?;
     }
-    buf.extend_from_slice(&len_u32(marker.clears().len())?.to_be_bytes());
-    for clear in marker.clears() {
+    buf.extend_from_slice(&len_u32(clears.len())?.to_be_bytes());
+    for clear in clears {
         buf.push(i8::from(clear.section).cast_unsigned());
         buf.extend_from_slice(&len_u32(clear.survivors.len())?.to_be_bytes());
         for coordinate in &clear.survivors {

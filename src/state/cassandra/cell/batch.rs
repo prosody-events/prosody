@@ -4,6 +4,7 @@ use super::{
 };
 use crate::cassandra::chunk_boundaries;
 use crate::state::marker::MarkerRow;
+use std::iter;
 use std::ops::Range;
 
 /// The number of gap rows needed to erase `clears` while excluding survivors.
@@ -116,34 +117,36 @@ pub(in crate::state) fn settle_batches<R>(
     (middle, phases)
 }
 
-/// Every stage chunk includes Staged and its cells in one atomic mutation.
-/// Reserve the marker weight and statement before cells enter a chunk.
-/// A clear-only stage still writes the marker.
+/// Splits cells into ranges with space for the marker in every batch.
+/// The caller must include the marker when it executes each range.
+/// No cells produces one marker-only batch.
 pub(in crate::state) fn stage_batches<R>(
-    units: &[BatchUnit<R>],
+    marker: &BatchUnit<R>,
+    cells: &[BatchUnit<R>],
     max_bytes: u64,
     max_count: usize,
 ) -> impl Iterator<Item = Range<usize>> {
-    let marker_weight = units.first().map_or(0, BatchUnit::weight);
-    let cells = chunk_boundaries(
-        units.iter().skip(1).map(BatchUnit::weight),
-        max_bytes.saturating_sub(marker_weight),
-        if marker_weight > max_bytes {
-            1
-        } else {
-            max_count.saturating_sub(1)
-        },
-    )
-    .map(|range| range.start + 1..range.end + 1);
-    (units.len() == 1).then_some(1..1).into_iter().chain(cells)
+    let cell_bytes = max_bytes.saturating_sub(marker.weight());
+    let cell_limit = if marker.weight() > max_bytes {
+        // An oversized marker permits only one cell, even when cells weigh zero.
+        1
+    } else {
+        max_count.saturating_sub(1)
+    };
+
+    let ranges = chunk_boundaries(cells.iter().map(BatchUnit::weight), cell_bytes, cell_limit);
+
+    let marker_only = cells.is_empty().then_some(0..0);
+    marker_only.into_iter().chain(ranges)
 }
 
-/// Binds the discovery row to every atomic stage mutation.
-pub(in crate::state) fn stage_chunk<R>(
-    units: &[BatchUnit<R>],
+/// Binds the marker to every atomic stage mutation.
+pub(in crate::state) fn stage_chunk<'u, R>(
+    marker: &'u BatchUnit<R>,
+    cells: &'u [BatchUnit<R>],
     range: Range<usize>,
-) -> impl Iterator<Item = &BatchUnit<R>> {
-    units.first().into_iter().chain(units[range].iter())
+) -> impl Iterator<Item = &'u BatchUnit<R>> {
+    iter::once(marker).chain(cells[range].iter())
 }
 
 /// Reports whether all rows fit one atomic batch.

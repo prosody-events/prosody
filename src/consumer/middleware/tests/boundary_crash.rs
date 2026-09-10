@@ -388,7 +388,7 @@ fn prop_admit_dispatch_soundness() {
         TEST_RUNTIME.block_on(async {
             let count = || -> Result<i64> {
                 Ok(METRICS
-                    .points("keyed_state.admission.corrupt_marker")?
+                    .points("prosody.state.admission.corrupt_marker")?
                     .iter()
                     .map(|(_, count)| count)
                     .sum())

@@ -1,6 +1,6 @@
 use super::{
     AttemptId, EventMarker, EventMarkerData, MarkerPayloadError, MarkerVersion, SectionClear,
-    decode_marker_payload, encode_marker_payload,
+    decode_marker_payload, encode_committed_payload, encode_marker_payload,
 };
 use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
@@ -80,10 +80,9 @@ impl Arbitrary for ArbMarker {
     }
 }
 
-/// A constructor-normalized marker round-trips through its frozen payload:
-/// `decode(event, encode(m)) == m` over the whole coordinate/survivor/clear
-/// space, including empty coordinates, empty staged lists, and empty survivor
-/// lists.
+/// Both payload encoders preserve the marker's evidence.
+/// The stage payload also preserves staged cells and clears across empty and
+/// nonempty lists. The committed payload contains no staged cells or clears.
 #[test]
 fn prop_marker_payload_round_trips() {
     fn prop(
@@ -129,7 +128,22 @@ fn prop_marker_payload_round_trips() {
             Err(e) => return TestResult::error(format!("encode failed: {e}")),
         };
         match decode_marker_payload(event(), &bytes, MarkerVersion::V2, None) {
-            Ok(decoded) => TestResult::from_bool(decoded == marker),
+            Ok(decoded) if decoded == marker => {}
+            Ok(_) => return TestResult::failed(),
+            Err(e) => return TestResult::error(format!("decode failed: {e}")),
+        }
+
+        let bytes = match encode_committed_payload(&marker) {
+            Ok(bytes) => bytes,
+            Err(e) => return TestResult::error(format!("encode failed: {e}")),
+        };
+        let expected = EventMarker::from_parts(EventMarkerData {
+            staged: Vec::new(),
+            clears: Vec::new(),
+            ..(*marker.inner).clone()
+        });
+        match decode_marker_payload(event(), &bytes, MarkerVersion::V2, None) {
+            Ok(decoded) => TestResult::from_bool(decoded == expected),
             Err(e) => TestResult::error(format!("decode failed: {e}")),
         }
     }

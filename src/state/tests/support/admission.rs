@@ -163,7 +163,7 @@ pub(crate) async fn seed_commit_evidence<S: CellStore>(
         .staged
         .ok_or_else(|| color_eyre::eyre::eyre!("evidence needs a staged attempt"))?;
     store
-        .commit_provisional(collection, &marker.committed_payload(), &[])
+        .commit_provisional(collection, &evidence_only(&marker), &[])
         .await?;
     store
         .write_provisional(collection, &[], Some(&marker))

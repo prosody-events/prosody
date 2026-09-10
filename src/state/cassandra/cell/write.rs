@@ -46,10 +46,9 @@ pub(super) async fn write_provisional(
 
     // Cells and the Staged row bind the collection TTL.
     let ttl = bind_ttl(collection.ttl());
-    // The marker unit leads; each cell unit is one row. `units` stays a
-    // `Vec` (not a `CellBuffer`) — see the `run_batches` ruling.
-    let mut units: Vec<BatchUnit<CellBatchRow>> = Vec::with_capacity(writes.len() + 1);
-    units.push(BatchUnit::new(
+    // The marker unit joins every chunk; each cell unit is one row. `units`
+    // stays a `Vec` (not a `CellBuffer`) — see the `run_batches` ruling.
+    let marker = BatchUnit::new(
         marker_blob.payload.as_ref().len() as u64 + PER_STATEMENT_OVERHEAD,
         smallvec![CellBatchRow {
             statement: &store.queries.marker_write,
@@ -61,7 +60,8 @@ pub(super) async fn write_provisional(
                 addr: CellAddr::marker(pk, MarkerRow::Staged),
             }),
         }],
-    ));
+    );
+    let mut units: Vec<BatchUnit<CellBatchRow>> = Vec::with_capacity(writes.len());
     units.extend(blobs.iter().zip(writes).map(|(blob, (cell, write))| {
         let addr = CellAddr::new(pk, cell);
         BatchUnit::new(
@@ -82,10 +82,11 @@ pub(super) async fn write_provisional(
     }));
 
     let chunks: SmallVec<[Range<usize>; 1]> =
-        super::batch::stage_batches(&units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS).collect();
+        super::batch::stage_batches(&marker, &units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS)
+            .collect();
     stream::iter(chunks)
         .map(|range| {
-            let rows = super::batch::stage_chunk(&units, range);
+            let rows = super::batch::stage_chunk(&marker, &units, range);
             store.session.execute_unlogged_batch(rows)
         })
         .buffer_unordered(SHARD_FANOUT_CONCURRENCY)

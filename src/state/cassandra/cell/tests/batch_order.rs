@@ -62,19 +62,21 @@ fn prop_marker_batch_phases() {
         if observed != expected {
             return false;
         }
-        let stage: Vec<_> = [19]
-            .into_iter()
-            .chain(weights.iter().map(|&w| u64::from(w)))
-            .map(unit)
-            .collect();
-        let chunks: Vec<_> =
-            stage_batches(&stage, u64::from(max_bytes), usize::from(max_count)).collect();
+        let marker = unit(19);
+        let cells: Vec<_> = weights.iter().map(|&w| unit(u64::from(w))).collect();
+        let chunks: Vec<_> = stage_batches(
+            &marker,
+            &cells,
+            u64::from(max_bytes),
+            usize::from(max_count),
+        )
+        .collect();
         let mut observed = Vec::with_capacity(weights.len());
         for chunk in &chunks {
-            if chunk.start == 0 || chunk.end > stage.len() {
+            if chunk.end > cells.len() {
                 return false;
             }
-            let bound: Vec<_> = super::super::batch::stage_chunk(&stage, chunk.clone())
+            let bound: Vec<_> = super::super::batch::stage_chunk(&marker, &cells, chunk.clone())
                 .map(BatchUnit::weight)
                 .collect();
             if bound.first() != Some(&19) || bound.len() != chunk.len() + 1 {
@@ -82,7 +84,7 @@ fn prop_marker_batch_phases() {
             }
             let count = chunk.len() + 1;
             let bytes = 19
-                + stage[chunk.clone()]
+                + cells[chunk.clone()]
                     .iter()
                     .map(BatchUnit::weight)
                     .sum::<u64>();
@@ -90,7 +92,7 @@ fn prop_marker_batch_phases() {
             if chunk.len() > 1 && (count > usize::from(max_count) || bytes > u64::from(max_bytes)) {
                 return false;
             }
-            observed.extend(stage[chunk.clone()].iter().map(BatchUnit::weight));
+            observed.extend(cells[chunk.clone()].iter().map(BatchUnit::weight));
         }
         !chunks.is_empty() && observed == weights.into_iter().map(u64::from).collect::<Vec<_>>()
     }

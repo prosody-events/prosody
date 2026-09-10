@@ -12,8 +12,8 @@ use super::{
     expand_to_input_order, extend_gap_units, gap_count, match_batch_rows_to_coordinates, smallvec,
     sorted_unique_coordinates, ttl_seconds_to_duration, write_provisional,
 };
-use super::{CassandraCellStoreError, MarkerWriteRow, encode, encode_marker_payload};
-use crate::state::marker::{MarkerRow, MarkerState};
+use super::{CassandraCellStoreError, MarkerWriteRow, encode};
+use crate::state::marker::{MarkerRow, MarkerState, encode_committed_payload};
 
 impl CellStore for CassandraStore {
     type Error = CellStoreError;
@@ -236,7 +236,7 @@ impl CellStore for CassandraStore {
         marker: &'a EventMarker,
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
-        let payload = encode_marker_payload(&marker.committed_payload())
+        let payload = encode_committed_payload(marker)
             .map_err(CassandraCellStoreError::from)
             .map_err(ResolveCellError::Store)?;
         let payload = encode(&payload)
