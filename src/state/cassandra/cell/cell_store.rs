@@ -276,7 +276,7 @@ impl CellStore for CassandraStore {
             smallvec![CellBatchRow {
                 statement: &self.queries.committed_write,
                 row: RowShape::MarkerWrite(MarkerWriteRow {
-                    ttl: bind_ttl(marker.evidence_ttl()),
+                    ttl: bind_ttl(Some(marker.evidence_ttl())),
                     payload: payload.as_ref(),
                     encoding: payload.encoding(),
                     event: marker.event(),

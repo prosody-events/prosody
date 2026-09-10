@@ -16,10 +16,10 @@ use std::sync::Arc;
 use tokio::task::coop::cooperative;
 
 pub(super) type CellMap = scc::HashMap<(CollectionId, CellKey), StoredCell, RandomState>;
-/// This map is the memory store itself, not a memo beside a durable store.
-/// The memory backend never expires cells or marker entries.
-/// Abort removes entries without evidence; other entries live until the store
-/// drops.
+/// This map is the memory store itself.
+/// The test and mock store has no clock. It retains Committed evidence for its
+/// lifetime. This is the only retention that a clockless store can express.
+/// Abort removes entries without evidence.
 type MarkerMap = scc::HashMap<CollectionId, MarkerState, RandomState>;
 
 /// A process-shared in-memory cell map.

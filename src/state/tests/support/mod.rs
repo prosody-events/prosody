@@ -377,7 +377,7 @@ pub(crate) use admission::{
 mod inspection;
 pub(crate) use inspection::StageInspection;
 
-/// Creates evidence for a new attempt without expiry.
+/// Creates one hour of evidence for a new test attempt.
 pub(crate) fn evidence(
     touched: Arc<[(StateType, StateName)]>,
     dedup: Option<Uuid>,
@@ -385,7 +385,7 @@ pub(crate) fn evidence(
     EventEvidence {
         attempt: AttemptId::new(),
         touched,
-        evidence_ttl: None,
+        evidence_ttl: CompactDuration::new(3600),
         dedup,
     }
 }

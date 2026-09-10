@@ -483,7 +483,7 @@ fn prop_marker_slice_decodes_by_coordinate() {
         )?;
         assert_eq!(
             state.staged.as_ref().map(EventMarker::evidence_ttl),
-            Some(if legacy { legacy_ttl } else { None })
+            Some(CompactDuration::new(3600))
         );
         assert!(
             decode_marker_row(

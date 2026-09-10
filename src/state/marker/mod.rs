@@ -7,7 +7,7 @@
 //! The row's version column selects the format; the payload has no version
 //! byte.
 //!
-//! Staged uses the collection TTL. Committed uses [`evidence_ttl`].
+//! Staged uses the collection TTL. Committed uses the finite dedup TTL.
 //!
 //! The stage write captures the staged list and survivor lists; admission never
 //! derives them again. These lists contain coordinates, never values.
@@ -18,6 +18,7 @@ use super::cell::ProvisionalWrite;
 use super::cell_key::{CellKey, Coordinate, Section};
 use super::event_ref::EventRef;
 use super::identity::{StateName, StateType, StateTypeError};
+use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
@@ -245,7 +246,7 @@ pub struct EventMarker {
     inner: Arc<EventMarkerData>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct EventMarkerData {
     version: MarkerVersion,
     attempt: AttemptId,
@@ -256,7 +257,7 @@ struct EventMarkerData {
     /// unique. A collection that stages nothing stays listed; a reader
     /// finds no Committed row there and moves on.
     touched: Arc<[(StateType, StateName)]>,
-    evidence_ttl: Option<CompactDuration>,
+    evidence_ttl: CompactDuration,
     dedup: Option<Uuid>,
 }
 
@@ -315,6 +316,18 @@ impl EventMarker {
         })
     }
 
+    /// Supplies current retention before admission promotes a legacy stage.
+    pub(crate) fn for_admission(&self, dedup_ttl: CompactDuration) -> Self {
+        if self.version() == MarkerVersion::V1 {
+            Self::from_parts(EventMarkerData {
+                evidence_ttl: dedup_ttl,
+                ..(*self.inner).clone()
+            })
+        } else {
+            self.clone()
+        }
+    }
+
     /// The dedup row to record after the promote.
     pub(crate) fn dedup(&self) -> Option<Uuid> {
         self.inner.dedup
@@ -343,8 +356,8 @@ impl EventMarker {
         &self.inner.touched
     }
 
-    /// Shared retention for the event's staged and committed rows.
-    pub(crate) fn evidence_ttl(&self) -> Option<CompactDuration> {
+    /// The finite retention for committed evidence.
+    pub(crate) fn evidence_ttl(&self) -> CompactDuration {
         self.inner.evidence_ttl
     }
 }
@@ -362,7 +375,7 @@ impl EventMarker {
 ///                  survivor_count × [coord_len: u32 BE][coord bytes]
 /// [touched_count: u32 BE]
 ///   touched_count × [state_type: i8][name_len: u32 BE][UTF-8 name]
-/// [evidence_ttl_secs: u32 BE] // 0 means no expiry
+/// [evidence_ttl_secs_minus_one: u32 BE] // finite retention only
 /// [dedup_present: u8] // 0 means absent; nonzero means present
 /// [dedup: 16 bytes] // only when present
 /// [attempt: 16 bytes]
@@ -417,12 +430,13 @@ pub(in crate::state) fn encode_marker_payload(
         buf.extend_from_slice(&len_u32(name.as_str().len())?.to_be_bytes());
         buf.extend_from_slice(name.as_str().as_bytes());
     }
-    buf.extend_from_slice(
-        &marker
-            .evidence_ttl()
-            .map_or(0, CompactDuration::seconds)
-            .to_be_bytes(),
-    );
+    let ttl = marker
+        .evidence_ttl()
+        .seconds()
+        .checked_sub(1)
+        .filter(|seconds| i64::from(*seconds) < MAX_CASSANDRA_TTL_SECS)
+        .ok_or(MarkerPayloadError::TooLarge)?;
+    buf.extend_from_slice(&ttl.to_be_bytes());
     buf.push(u8::from(marker.dedup().is_some()));
     if let Some(dedup) = marker.dedup() {
         buf.extend_from_slice(dedup.as_bytes());
@@ -476,7 +490,7 @@ pub(in crate::state) fn decode_marker_payload(
     let (mut touched, ttl, dedup, attempt) = match version {
         MarkerVersion::V1 => (
             Vec::new(),
-            legacy_ttl,
+            legacy_ttl.unwrap_or(CompactDuration::new(0)),
             match event {
                 EventRef::Message { dedup_id } => Some(dedup_id),
                 EventRef::Timer(_) => None,
@@ -495,7 +509,11 @@ pub(in crate::state) fn decode_marker_payload(
                     StateName::try_new(name).map_err(|_| MarkerPayloadError::Name)?,
                 ));
             }
-            let seconds = cursor.take_u32()?;
+            let seconds = cursor
+                .take_u32()?
+                .checked_add(1)
+                .filter(|seconds| i64::from(*seconds) <= MAX_CASSANDRA_TTL_SECS)
+                .ok_or(MarkerPayloadError::TooLarge)?;
             let dedup = match cursor.take_section()? {
                 0 => None,
                 _ => Some(Uuid::from_bytes(
@@ -511,12 +529,7 @@ pub(in crate::state) fn decode_marker_payload(
                     .try_into()
                     .map_err(|_| MarkerPayloadError::Truncated)?,
             ));
-            (
-                touched,
-                (seconds != 0).then(|| CompactDuration::new(seconds)),
-                dedup,
-                attempt,
-            )
+            (touched, CompactDuration::new(seconds), dedup, attempt)
         }
     };
     if !cursor.is_empty() {
@@ -537,27 +550,17 @@ pub(in crate::state) fn decode_marker_payload(
 }
 
 /// Fields shared by all collection stages of one event.
+/// Committed evidence uses the finite dedup TTL, regardless of collection TTLs.
+/// Interrupted settlement leaves the source uncommitted, so redelivery runs
+/// admission. The dedup TTL bounds that redelivery window.
+/// Evidence precedes the dedup row and expires no later than that row.
+/// Thus retained evidence without a dedup row requires recovery of the dedup
+/// record.
 pub(crate) struct EventEvidence {
     pub(crate) attempt: AttemptId,
     pub(crate) touched: Arc<[(StateType, StateName)]>,
-    pub(crate) evidence_ttl: Option<CompactDuration>,
+    pub(crate) evidence_ttl: CompactDuration,
     pub(crate) dedup: Option<Uuid>,
-}
-
-/// Selects the longest touched TTL, or no expiry if any touched collection has
-/// none.
-///
-/// Committed outlives every Staged row it certifies: Staged uses its collection
-/// TTL. A TTL collection retains permanent evidence only for an event that also
-/// touched a collection without expiry. This evidence certifies that other
-/// collection's permanent residue. An empty set returns None. An event without
-/// touched collections stages no marker.
-pub(crate) fn evidence_ttl(
-    dedup_ttl: CompactDuration,
-    mut ttls: impl Iterator<Item = Option<CompactDuration>>,
-) -> Option<CompactDuration> {
-    let first = ttls.next()??;
-    ttls.try_fold(first.max(dedup_ttl), |maximum, ttl| Some(maximum.max(ttl?)))
 }
 
 /// A `usize` length as the `u32` wire prefix, or
@@ -642,9 +645,8 @@ pub enum MarkerPayloadError {
     #[error("event-marker payload has trailing garbage")]
     TrailingGarbage,
 
-    /// A count or coordinate length exceeded the `u32` the wire format
-    /// carries (encode-side; a stage this size is unreachable in practice).
-    #[error("event-marker payload field exceeds the u32 wire limit")]
+    /// A count, coordinate length, or TTL cannot fit its wire range.
+    #[error("event-marker payload field is outside its wire range")]
     TooLarge,
 }
 

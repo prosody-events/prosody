@@ -28,6 +28,7 @@ use super::actor::{
     collect_active_slab_ids, handle_add, load_step, next_unloaded_slab_id, owns_slab,
 };
 use crate::Key;
+use crate::state::TimerEventRef;
 use crate::timers::active::TimerState;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -862,4 +863,25 @@ fn prop_scheduler_invariants() {
     // Iteration count is read from the `QUICKCHECK_TESTS` env var, with
     // quickcheck's built-in default applying when unset. Never hardcoded.
     QuickCheck::new().quickcheck(property as fn(OpSequence) -> TestResult);
+}
+
+/// Repeated retirement preserves one replacement in both indexes and the queue.
+#[test]
+fn prop_retirement_idempotence() {
+    fn property(mode: u8, tag: i16) -> Result<()> {
+        RuntimeBuilder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()?
+            .block_on(support::retirement_trace(
+                mode,
+                i32::from(tag),
+                |manager, trigger| async move {
+                    let event = TimerEventRef::new(trigger.timer_type, trigger.time, trigger.tag);
+                    manager.retire_committed(&trigger.key, event).await?;
+                    Ok(())
+                },
+            ))
+    }
+    QuickCheck::new().quickcheck(property as fn(u8, i16) -> Result<()>);
 }

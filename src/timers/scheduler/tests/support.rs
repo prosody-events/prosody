@@ -2,6 +2,7 @@
 
 use super::super::TriggerScheduler;
 use super::super::actor::{ActorState, load_step, process_command};
+use crate::state::TimerEventRef;
 use crate::timers::duration::CompactDuration;
 use crate::timers::manager::TimerManager;
 use crate::timers::queue::TriggerQueue;
@@ -12,7 +13,7 @@ use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::test_support::test_segment;
 use crate::timers::{CompactDateTime, TimerType, Trigger};
-use color_eyre::eyre::{Result, ensure, eyre};
+use color_eyre::eyre::{Result, ensure};
 use futures::TryStreamExt;
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -82,21 +83,29 @@ where
             .highest_loaded_slab_id
             .is_some_and(|end| end >= slab.id())
     );
-    let admission = admit(manager, old.clone());
+    let admission = async {
+        admit(manager.clone(), old.clone()).await?;
+        let event = TimerEventRef::new(old.timer_type, old.time, old.tag);
+        manager.retire_committed(&old.key, event).await?;
+        manager.retire_committed(&old.key, event).await?;
+        drop(manager);
+        Result::<()>::Ok(())
+    };
     let actor = async {
-        let command = commands
-            .recv()
-            .await
-            .ok_or_else(|| eyre!("admission sent no timer command"))?;
-        let rows: Vec<_> = store
-            .get_slab_triggers_all_types(slab.id())
-            .try_collect()
-            .await?;
-        let expected = (!mode.is_multiple_of(3)).then_some(tag + 1_i32);
-        let repaired = rows.iter().map(|t| t.tag).collect::<Vec<_>>()
-            == expected.into_iter().collect::<Vec<_>>();
-        process_command(&mut state, &mut queue, command).await;
-        ensure!(repaired, "command preceded repair");
+        let mut handled = 0_u8;
+        while let Some(command) = commands.recv().await {
+            let rows: Vec<_> = store
+                .get_slab_triggers_all_types(slab.id())
+                .try_collect()
+                .await?;
+            let expected = (!mode.is_multiple_of(3)).then_some(tag + 1_i32);
+            let repaired = rows.iter().map(|t| t.tag).collect::<Vec<_>>()
+                == expected.into_iter().collect::<Vec<_>>();
+            process_command(&mut state, &mut queue, command).await;
+            ensure!(repaired, "command preceded repair");
+            handled += 1;
+        }
+        ensure!(handled == 3, "retirement did not acknowledge every command");
         Result::<()>::Ok(())
     };
     let (admitted, handled) = tokio::join!(admission, actor);
@@ -104,13 +113,26 @@ where
     handled?;
     load_step(&mut state, &mut queue).await;
     let expected = (!mode.is_multiple_of(3)).then_some(tag + 1_i32);
-    let entry = active.get(&old.key, time, old.timer_type).await;
+    assert_retired(&store, &mut queue, &old, &slab, expected).await
+}
+
+async fn assert_retired(
+    store: &TableAdapter<InMemoryTriggerStore>,
+    queue: &mut TriggerQueue,
+    old: &Trigger,
+    slab: &Slab,
+    expected: Option<i32>,
+) -> Result<()> {
+    let entry = queue
+        .active_triggers()
+        .get(&old.key, old.time, old.timer_type)
+        .await;
     ensure!(
         entry.map(|entry| entry.tag) == expected,
         "retirement left the wrong queued attempt"
     );
     let current = store
-        .current_trigger(&old.key, time, old.timer_type)
+        .current_trigger(&old.key, old.time, old.timer_type)
         .await?;
     ensure!(current.map(|trigger| trigger.tag) == expected);
     let rows: Vec<_> = store
@@ -126,5 +148,14 @@ where
             .await?;
         ensure!(metadata.len() == 1, "replacement lost slab metadata");
     }
+    let queued = queue.next().await;
+    ensure!(
+        queued.map(|trigger| trigger.tag) == expected,
+        "retirement lost the queued attempt"
+    );
+    ensure!(
+        queue.next().await.is_none(),
+        "retirement queued the same attempt twice"
+    );
     Ok(())
 }

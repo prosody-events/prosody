@@ -2634,7 +2634,6 @@ async fn stage_clock_crash<S: CellStore>(
 ) -> Result<()> {
     use crate::cassandra::BatchUnit;
     use crate::state::cassandra::{crash_stage_batches, crash_stage_chunk};
-    use crate::state::marker::evidence_ttl;
 
     let ttl = trace
         .ttl
@@ -2658,7 +2657,6 @@ async fn stage_clock_crash<S: CellStore>(
             )
         })
         .collect();
-    let evidence = evidence_ttl(CompactDuration::new(30), [ttl].into_iter());
     let touched = vec![(StateType::Application, collection.id().name().clone())].into();
     let marker = EventMarker::frozen(
         event,
@@ -2666,7 +2664,7 @@ async fn stage_clock_crash<S: CellStore>(
         &[],
         &EventEvidence {
             touched,
-            evidence_ttl: evidence,
+            evidence_ttl: CompactDuration::new(3600),
             dedup: None,
             attempt: AttemptId::new(),
         },

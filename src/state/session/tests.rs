@@ -657,7 +657,7 @@ fn finalize_matches_model(
                 collection.marker.clears(),
                 &EventEvidence {
                     touched: vec![(StateType::Application, fx.value_id().name().clone())].into(),
-                    evidence_ttl: None,
+                    evidence_ttl: CompactDuration::new(30),
                     dedup: collection.marker.dedup(),
                     attempt: collection.marker.attempt(),
                 },

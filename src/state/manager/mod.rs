@@ -445,13 +445,14 @@ where
                 continue;
             }
 
+            let marker = marker.for_admission(self.inner.dedup_ttl);
             let decision = if is_committed {
                 CommitDecision::Committed
             } else {
                 CommitDecision::NotCommitted
             };
             let resolved = admission_step(cancelled, key, collection.id().name().as_str(), || {
-                resolve_event_marker(&self.inner.cell, collection, marker, decision)
+                resolve_event_marker(&self.inner.cell, collection, &marker, decision)
             })
             .await?;
             if resolved.is_none() && is_committed {
@@ -460,7 +461,7 @@ where
                     resolve_event_marker(
                         &self.inner.cell,
                         collection,
-                        marker,
+                        &marker,
                         CommitDecision::NotCommitted,
                     )
                 })

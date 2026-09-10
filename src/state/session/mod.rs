@@ -32,7 +32,7 @@ use crate::state::descriptor::{
 };
 use crate::state::dirty::{CellSnapshot, ClearedSections, DirtyStore, DirtyVal, ResolvedCells};
 use crate::state::identity::{CollectionId, CollectionRef};
-use crate::state::marker::{AttemptId, EventEvidence, EventMarker, SectionClear, evidence_ttl};
+use crate::state::marker::{AttemptId, EventEvidence, EventMarker, SectionClear};
 use crate::state::overlay::Overlay;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::resolve::resolve_event_marker;
@@ -1267,19 +1267,13 @@ where
         }
         marker_touched.sort_unstable();
         marker_touched.dedup();
-        let ttl = evidence_ttl(
-            self.inner.dedup_ttl,
-            marker_touched
-                .iter()
-                .map(|(state_type, name)| registry.ttl_for(*state_type, name)),
-        );
         // Sized once to the touched-collection cardinality — the fold in
         // place of an unconstrained `try_collect` keeps the receipt's vector
         // from re-growing on the per-event hot path (bounded-allocation rule).
         let evidence = EventEvidence {
             attempt: *self.inner.stage_attempt.get_or_init(AttemptId::new),
             touched: marker_touched.into(),
-            evidence_ttl: ttl,
+            evidence_ttl: self.inner.dedup_ttl,
             dedup: self.message_marker().map(MessageMarker::into_uuid),
         };
         let capacity = touched.len();

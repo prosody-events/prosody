@@ -1,6 +1,6 @@
 use super::{
     AttemptId, EventMarker, EventMarkerData, MarkerPayloadError, MarkerVersion, SectionClear,
-    decode_marker_payload, encode_marker_payload, evidence_ttl,
+    decode_marker_payload, encode_marker_payload,
 };
 use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
@@ -72,7 +72,7 @@ impl Arbitrary for ArbMarker {
             &clears,
             &EventEvidence {
                 touched: [].into(),
-                evidence_ttl: None,
+                evidence_ttl: CompactDuration::new(3600),
                 dedup: None,
                 attempt: AttemptId(Uuid::from_u128(0xA77E)),
             },
@@ -121,7 +121,7 @@ fn prop_marker_payload_round_trips() {
             staged: marker.staged().to_vec(),
             clears: marker.clears().to_vec(),
             touched: touched.into(),
-            evidence_ttl: ttl.map(|seconds| CompactDuration::new(seconds.max(1))),
+            evidence_ttl: CompactDuration::new(ttl.unwrap_or(0) % 630_720_000 + 1),
             dedup: dedup.map(Uuid::from_u128),
         });
         let bytes = match encode_marker_payload(&marker) {
@@ -236,7 +236,7 @@ fn frozen_marker_payload_bytes() -> color_eyre::Result<()> {
         from_ref(&clear),
         &EventEvidence {
             touched: [].into(),
-            evidence_ttl: Some(CompactDuration::new(3600)),
+            evidence_ttl: CompactDuration::new(3600),
             dedup: None,
             attempt: AttemptId(Uuid::from_u128(0xA77E)),
         },
@@ -247,7 +247,7 @@ fn frozen_marker_payload_bytes() -> color_eyre::Result<()> {
         &[clear],
         &EventEvidence {
             touched: vec![(StateType::Application, StateName::try_new("x")?)].into(),
-            evidence_ttl: Some(CompactDuration::new(3600)),
+            evidence_ttl: CompactDuration::new(3600),
             dedup: Some(Uuid::from_u128(0xD3D0)),
             attempt: AttemptId(Uuid::from_u128(0xA77E)),
         },
@@ -277,7 +277,7 @@ fn frozen_marker_payload_bytes() -> color_eyre::Result<()> {
     assert_eq!(decoded.dedup(), Some(Uuid::from_u128(0xFEED)));
     assert!(decoded.touched().is_empty());
     let mut expected_v2 = expected;
-    expected_v2.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 1, b'x', 0, 0, 14, 16, 1]);
+    expected_v2.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 1, b'x', 0, 0, 14, 15, 1]);
     expected_v2.extend_from_slice(Uuid::from_u128(0xD3D0).as_bytes());
     expected_v2.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xA7, 0x7E]);
     assert_eq!(
@@ -328,7 +328,7 @@ fn trailing_garbage_is_rejected() -> color_eyre::Result<()> {
         &[],
         &EventEvidence {
             touched: [].into(),
-            evidence_ttl: None,
+            evidence_ttl: CompactDuration::new(3600),
             dedup: None,
             attempt: AttemptId(Uuid::from_u128(0xA77E)),
         },
@@ -340,35 +340,4 @@ fn trailing_garbage_is_rejected() -> color_eyre::Result<()> {
         Err(MarkerPayloadError::TrailingGarbage)
     );
     Ok(())
-}
-
-/// Evidence covers every touched TTL and the dedup floor. No expiry wins.
-#[test]
-fn prop_evidence_ttl_covers_all_collections() {
-    fn prop(seconds: Vec<u32>, unbounded: bool, offset: u16, above: bool) -> bool {
-        let seconds: Vec<_> = seconds.into_iter().map(|ttl| ttl % 1_000_000 + 1).collect();
-        let maximum = seconds.iter().copied().max();
-        let maximum_secs = maximum.unwrap_or(1);
-        let floor = if above {
-            maximum_secs + u32::from(offset) + 1
-        } else {
-            maximum_secs.saturating_sub(u32::from(offset) + 1)
-        };
-        let expected = if unbounded {
-            None
-        } else {
-            maximum.map(|ttl| CompactDuration::new(ttl.max(floor)))
-        };
-        evidence_ttl(
-            CompactDuration::new(floor),
-            seconds.into_iter().enumerate().map(|(index, ttl)| {
-                if unbounded && index == 0 {
-                    None
-                } else {
-                    Some(CompactDuration::new(ttl))
-                }
-            }),
-        ) == expected
-    }
-    QuickCheck::new().quickcheck(prop as fn(Vec<u32>, bool, u16, bool) -> bool);
 }

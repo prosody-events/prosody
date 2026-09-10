@@ -1,5 +1,5 @@
 use super::*;
-use crate::state::marker::{AttemptId, EventEvidence, evidence_ttl};
+use crate::state::marker::{AttemptId, EventEvidence};
 use crate::state::tests::support::evidence;
 use crate::timers::duration::CompactDuration;
 
@@ -44,7 +44,7 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
     Ok(())
 }
 
-/// Staged uses the collection TTL. Committed covers each sibling's retention.
+/// Staged uses the collection TTL. Committed uses only the finite dedup TTL.
 #[test]
 fn marker_rows_carry_evidence_ttl() {
     fn prop(first: u16, second: Option<u16>, clear: bool, floor: u16) -> TestResult {
@@ -67,73 +67,76 @@ fn marker_rows_carry_evidence_ttl() {
                 .then(|| SectionClear::frozen(value_cell().section, &writes))
                 .into_iter()
                 .collect();
-            let floor = CompactDuration::new(
-                first
-                    .seconds()
-                    .max(second.map_or(0, CompactDuration::seconds))
-                    + u32::from(floor)
-                    + 120,
+            let floor = CompactDuration::new(u32::from(floor) + 60);
+            let sibling = CollectionRef::new(
+                CollectionId::new(
+                    c.id().state_key().clone(),
+                    c.id().state_type(),
+                    collection("marker-ttl-sibling")?.id().name().clone(),
+                ),
+                second,
             );
-            let expected_evidence = second.map(|second| first.max(second).max(floor));
-            let ttl = evidence_ttl(floor, [Some(first), second].into_iter());
             let marker = EventMarker::frozen(
                 event(1),
                 &writes,
                 &clears,
                 &EventEvidence {
-                    touched: [].into(),
-                    evidence_ttl: ttl,
+                    touched: [
+                        (c.id().state_type(), c.id().name().clone()),
+                        (sibling.id().state_type(), sibling.id().name().clone()),
+                    ]
+                    .into(),
+                    evidence_ttl: floor,
                     dedup: None,
                     attempt: AttemptId::new(),
                 },
             );
-            store.write_provisional(&c, &writes, Some(&marker)).await?;
-            for coordinate in [&[][..], &[1_u8][..]] {
-                if !coordinate.is_empty() {
-                    store.commit_provisional(&c, &marker, &writes).await?;
-                }
-                let column = if coordinate.is_empty() {
-                    "data"
-                } else {
-                    "event"
-                };
-                let expected = if coordinate.is_empty() {
-                    Some(first)
-                } else {
-                    expected_evidence
-                };
-                let pk = Pk::of(c.id());
-                let row = fx
-                    .cassandra
-                    .session()
-                    .query_unpaged(
-                        format!(
-                            "SELECT TTL({column}) FROM {TEST_KEYSPACE}.keyed_state_cell WHERE \
-                             segment_id = ? AND key = ? AND state_type = ? AND name = ? AND kind \
-                             = ? AND section = ? AND coordinate = ?"
-                        ),
-                        (
-                            pk.segment_id,
-                            pk.key,
-                            pk.state_type,
-                            pk.name,
-                            CellKind::Marker,
-                            0_i8,
-                            coordinate,
-                        ),
-                    )
-                    .await?
-                    .into_rows_result()?
-                    .single_row::<(Option<i32>,)>()?;
-                if let Some(expected) = expected {
-                    let remaining = row.0.ok_or_else(|| eyre!("missing marker TTL"))?;
-                    let expected = expected.seconds() as i32;
-                    assert!(
-                        remaining <= expected && remaining > expected - 60_i32,
-                        "column={column}, remaining={remaining}, expected={expected}"
-                    );
-                } else {
-                    assert_eq!(row.0, None);
+            for collection in [&c, &sibling] {
+                store
+                    .write_provisional(collection, &writes, Some(&marker))
+                    .await?;
+                for (coordinate, column, expected) in [
+                    (&[][..], "data", collection.ttl()),
+                    (&[1_u8][..], "event", Some(floor)),
+                ] {
+                    if !coordinate.is_empty() {
+                        store
+                            .commit_provisional(collection, &marker, &writes)
+                            .await?;
+                    }
+                    let pk = Pk::of(collection.id());
+                    let row = fx
+                        .cassandra
+                        .session()
+                        .query_unpaged(
+                            format!(
+                                "SELECT TTL({column}) FROM {TEST_KEYSPACE}.keyed_state_cell WHERE \
+                                 segment_id = ? AND key = ? AND state_type = ? AND name = ? AND \
+                                 kind = ? AND section = ? AND coordinate = ?"
+                            ),
+                            (
+                                pk.segment_id,
+                                pk.key,
+                                pk.state_type,
+                                pk.name,
+                                CellKind::Marker,
+                                0_i8,
+                                coordinate,
+                            ),
+                        )
+                        .await?
+                        .into_rows_result()?
+                        .single_row::<(Option<i32>,)>()?;
+                    if let Some(expected) = expected {
+                        let remaining = row.0.ok_or_else(|| eyre!("missing marker TTL"))?;
+                        let expected = expected.seconds() as i32;
+                        assert!(
+                            remaining <= expected && remaining > expected - 60_i32,
+                            "column={column}, remaining={remaining}, expected={expected}"
+                        );
+                    } else {
+                        assert_eq!(row.0, None);
+                    }
                 }
             }
             Ok(true)
