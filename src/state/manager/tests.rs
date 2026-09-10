@@ -171,11 +171,16 @@ async fn seed_legacy_timer(
 }
 
 #[test]
-fn prop_legacy_and_timer_admit_soundness() {
+fn prop_legacy_and_timer_admit_soundness() -> Result<()> {
     fn property(value: u8, mode: u8) -> Result<bool> {
         TEST_RUNTIME.block_on(legacy_and_timer_residue(value, mode))
     }
+    assert!(
+        property(1, 7)?,
+        "committed attempts at one coordinate must retire together"
+    );
     QuickCheck::new().quickcheck(property as fn(u8, u8) -> Result<bool>);
+    Ok(())
 }
 
 /// Admission removes discovered V1 markers before a later delivery can record
@@ -384,38 +389,40 @@ async fn retire_timer_residue(
     use crate::state::registry::CollectionDef;
     use color_eyre::eyre::ensure;
     use uuid::Uuid;
-    retirement_trace(mode, i32::from(value), |timers, trigger| async move {
-        let key = StateKey::new(Uuid::new_v4(), trigger.key.clone());
-        let collection = CollectionRef::new(
-            CollectionId::new(
-                key.clone(),
-                StateType::Application,
-                StateName::try_new("a")?,
-            ),
-            None,
-        );
-        let event = EventRef::Timer(TimerEventRef::new(
-            trigger.timer_type,
-            trigger.time,
-            trigger.tag,
-        ));
-        let marker = EventMarker::frozen(
-            event,
-            &[],
-            &[],
-            &evidence(
-                [(StateType::Application, collection.id().name().clone())].into(),
-                None,
-            ),
-        );
-        store.commit_provisional(&collection, &marker, &[]).await?;
-        let mut registry = CollectionDefRegistry::default();
-        registry.register(&value_state::<JsonCodec>("a"), CollectionDef::new(None))?;
-        let manager = test_manager(store, dedup, Arc::new(registry), key.segment_id, (), ());
-        let (_tx, shutdown) = watch::channel(ShutdownPhase::default());
-        ensure!(manager.admit(key.key, &timers, &shutdown).await == Admission::Fresh);
-        Ok(())
-    })
+    let retire_replacement = value & 1 != 0;
+    retirement_trace(
+        mode,
+        i32::from(value),
+        retire_replacement,
+        |timers, trigger| async move {
+            let key = StateKey::new(Uuid::new_v4(), trigger.key.clone());
+            let mut registry = CollectionDefRegistry::default();
+            for name in ["a", "b"]
+                .into_iter()
+                .take(1 + usize::from(retire_replacement))
+            {
+                registry.register(&value_state::<JsonCodec>(name), CollectionDef::new(None))?;
+            }
+            // Seed the old attempt in the first discovered collection.
+            for (index, (_, name)) in registry.collections().enumerate() {
+                let collection = CollectionRef::new(
+                    CollectionId::new(key.clone(), StateType::Application, name.clone()),
+                    None,
+                );
+                let event = EventRef::Timer(TimerEventRef::new(
+                    trigger.timer_type,
+                    trigger.time,
+                    trigger.tag + i32::try_from(index)?,
+                ));
+                let marker = EventMarker::frozen(event, &[], &[], &evidence([].into(), None));
+                store.commit_provisional(&collection, &marker, &[]).await?;
+            }
+            let manager = test_manager(store, dedup, Arc::new(registry), key.segment_id, (), ());
+            let (_tx, shutdown) = watch::channel(ShutdownPhase::default());
+            ensure!(manager.admit(key.key, &timers, &shutdown).await == Admission::Fresh);
+            Ok(())
+        },
+    )
     .await?;
     Ok(())
 }

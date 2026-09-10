@@ -877,6 +877,7 @@ fn prop_retirement_idempotence() {
             .block_on(support::retirement_trace(
                 mode,
                 i32::from(tag),
+                false,
                 |manager, trigger| async move {
                     let event = TimerEventRef::new(trigger.timer_type, trigger.time, trigger.tag);
                     manager.retire_committed(&trigger.key, event).await?;

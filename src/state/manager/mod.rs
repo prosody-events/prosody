@@ -470,8 +470,22 @@ where
             .buffer_unordered(STATE_FANOUT_CONCURRENCY)
             .try_collect::<()>()
             .await?;
-        stream::iter(sources)
-            .map(|source| cooperative(self.retire_source(key, source, &legacy, timers, shutdown)))
+        let independent = (0..sources.len()).filter(|&index| {
+            !sources[..index]
+                .iter()
+                .any(|&other| same_timer_coordinate(other, sources[index]))
+        });
+        stream::iter(independent)
+            .map(|index| {
+                cooperative(self.retire_source(
+                    key,
+                    sources[index],
+                    &sources,
+                    &legacy,
+                    timers,
+                    shutdown,
+                ))
+            })
             .buffer_unordered(STATE_FANOUT_CONCURRENCY)
             .try_collect::<()>()
             .await
@@ -524,6 +538,7 @@ where
         &self,
         key: &Key,
         source: EventRef,
+        sources: &[EventRef],
         legacy: &[(EventRef, Option<bool>)],
         timers: &TimerManager<T>,
         shutdown: &watch::Receiver<ShutdownPhase>,
@@ -554,11 +569,18 @@ where
                     .await?;
                 }
             }
-            EventRef::Timer(timer) => {
-                admission_step(cancelled, key, "timer retirement", || {
-                    timers.retire_committed(key, timer)
-                })
-                .await?;
+            EventRef::Timer(_) => {
+                // Attempts at one coordinate share durable rows. Retire them in order.
+                for &other in sources {
+                    if let EventRef::Timer(timer) = other
+                        && same_timer_coordinate(source, other)
+                    {
+                        admission_step(cancelled, key, "timer retirement", || {
+                            timers.retire_committed(key, timer)
+                        })
+                        .await?;
+                    }
+                }
             }
         }
         Ok(())
@@ -593,6 +615,16 @@ where
                 Ok(tag.map(|tag| tag != Some(timer.tag)))
             }
         }
+    }
+}
+
+/// Compares durable timer coordinates within one admitted key.
+fn same_timer_coordinate(left: EventRef, right: EventRef) -> bool {
+    match (left, right) {
+        (EventRef::Timer(left), EventRef::Timer(right)) => {
+            left.time == right.time && left.timer_type == right.timer_type
+        }
+        _ => false,
     }
 }
 

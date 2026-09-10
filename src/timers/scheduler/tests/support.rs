@@ -1,7 +1,7 @@
 //! Explicit actor steps for admission after partial timer writes.
 
-use super::super::TriggerScheduler;
 use super::super::actor::{ActorState, load_step, process_command};
+use super::super::{CommandOperation, TriggerScheduler};
 use crate::state::TimerEventRef;
 use crate::timers::duration::CompactDuration;
 use crate::timers::manager::TimerManager;
@@ -24,7 +24,12 @@ use tracing::Span;
 
 /// Loads before and after admission to check both durable indexes and the
 /// queue.
-pub(crate) async fn retirement_trace<F, Fut>(mode: u8, tag: i32, admit: F) -> Result<()>
+pub(crate) async fn retirement_trace<F, Fut>(
+    mode: u8,
+    tag: i32,
+    retire_replacement: bool,
+    admit: F,
+) -> Result<()>
 where
     F: FnOnce(TimerManager<TableAdapter<InMemoryTriggerStore>>, Trigger) -> Fut,
     Fut: Future<Output = Result<()>>,
@@ -93,26 +98,34 @@ where
     };
     let actor = async {
         let mut handled = 0_u8;
+        let mut repaired = true;
         while let Some(command) = commands.recv().await {
             let rows: Vec<_> = store
                 .get_slab_triggers_all_types(slab.id())
                 .try_collect()
                 .await?;
-            let expected = (!mode.is_multiple_of(3)).then_some(tag + 1_i32);
-            let repaired = rows.iter().map(|t| t.tag).collect::<Vec<_>>()
+            let expected =
+                matches!(command.operation, CommandOperation::Add).then_some(command.trigger.tag);
+            repaired &= matches!(
+                command.operation,
+                CommandOperation::Add | CommandOperation::RetireCommitted
+            ) && rows.iter().map(|t| t.tag).collect::<Vec<_>>()
                 == expected.into_iter().collect::<Vec<_>>();
             process_command(&mut state, &mut queue, command).await;
-            ensure!(repaired, "command preceded repair");
             handled += 1;
         }
-        ensure!(handled == 3, "retirement did not acknowledge every command");
+        ensure!(repaired, "command preceded repair");
+        ensure!(
+            handled == 3 + u8::from(retire_replacement),
+            "retirement did not acknowledge every command"
+        );
         Result::<()>::Ok(())
     };
     let (admitted, handled) = tokio::join!(admission, actor);
     admitted?;
     handled?;
     load_step(&mut state, &mut queue).await;
-    let expected = (!mode.is_multiple_of(3)).then_some(tag + 1_i32);
+    let expected = (!retire_replacement && !mode.is_multiple_of(3)).then_some(tag + 1_i32);
     assert_retired(&store, &mut queue, &old, &slab, expected).await
 }
 
