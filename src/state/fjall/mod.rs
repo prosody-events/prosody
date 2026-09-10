@@ -329,10 +329,7 @@ impl FjallCellCache {
     ///
     /// A disabled cache sends all operations to durable storage.
     pub(crate) fn disable(&self) {
-        if !self.disabled.swap(true, Ordering::Relaxed) {
-            warn!("keyed-state cell cache disabled for this assignment; using durable reads");
-            CACHE_DISABLED.add(1, &[]);
-        }
+        self.marker_checks().disable();
     }
 
     /// Test handle on the [`put`](Self::put) fault seam: returns the shared
@@ -798,6 +795,16 @@ pub(crate) struct MarkerCheckSet {
     disabled: Arc<AtomicBool>,
 }
 
+impl MarkerCheckSet {
+    /// Disables this assignment once, with its log and counter.
+    fn disable(&self) {
+        if !self.disabled.swap(true, Ordering::Relaxed) {
+            warn!("keyed-state cell cache disabled for this assignment; using durable reads");
+            CACHE_DISABLED.add(1, &[]);
+        }
+    }
+}
+
 impl AdmissionChecks for MarkerCheckSet {
     type Error = FjallCellCacheError;
 
@@ -829,7 +836,7 @@ impl AdmissionChecks for MarkerCheckSet {
         }
         .await;
         if result.is_err() {
-            self.disabled.store(true, Ordering::Relaxed);
+            self.disable();
         }
         result
     }

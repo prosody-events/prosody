@@ -1577,6 +1577,7 @@ fn fjall_read_failure_degrades_that_get() -> Result<()> {
 /// Admission must use durable marker state.
 #[test]
 fn cache_disablement_applies_to_all_workspace_clones() -> Result<()> {
+    let metrics = GlobalMetrics::install_global();
     TEST_RUNTIME.block_on(async {
         let dedup = MemoryDeduplicationStore::default();
         let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
@@ -1610,6 +1611,17 @@ fn cache_disablement_applies_to_all_workspace_clones() -> Result<()> {
         assert!(
             fjall.is_disabled(),
             "the cleanup failure disabled the cache"
+        );
+
+        assert_eq!(
+            metrics.points("prosody.state.cell.cache.disabled_assignments")?,
+            vec![(labels([]), 1)]
+        );
+        fjall.disable();
+        assert_eq!(
+            metrics.points("prosody.state.cell.cache.disabled_assignments")?,
+            vec![(labels([]), 1)],
+            "repeated disable must not count the assignment twice"
         );
 
         // Clone B must not return the old cached value.
