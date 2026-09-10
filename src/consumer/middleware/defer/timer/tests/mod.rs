@@ -239,7 +239,7 @@ impl OutcomeHandler {
     /// Returns the recorded timer calls and clears the log.
     #[must_use]
     fn take_timer_calls(&self) -> Vec<(Key, DemandType)> {
-        mem::take(&mut self.timer_calls.lock())
+        mem::take(&mut *self.timer_calls.lock())
     }
 
     /// Returns the `(ambient, trigger-span)` id pairs recorded per call.
