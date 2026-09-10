@@ -45,7 +45,7 @@ use crate::state::tests::support::ScriptedPublicationStore;
 #[cfg(test)]
 use crate::state_reader::tests::support::{CountingIdentityStore, ScriptedCellSource};
 
-/// Committed cell reads that never consult the owner's commit oracle.
+/// Reads committed cells through collection evidence without a partition owner.
 pub trait CommittedCellSource: Clone + Send + Sync + 'static {
     /// Read failure.
     type Error: ClassifyError + Error + Send + Sync + 'static;

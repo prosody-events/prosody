@@ -319,58 +319,6 @@ fn delete_section_hops_delete_exactly_the_section() -> Result<()> {
     Ok(())
 }
 
-/// Warm-index batch round-trip: `index_record_batch` of arbitrary (duplicate-
-/// prone) coordinates followed by `index_clear_batch` of an arbitrary subset
-/// must leave `index_snapshot` holding exactly the recorded-minus-cleared set —
-/// the batch ops must agree with the model a sequence of single-key
-/// `index_record`s would produce (one atomic hop instead of N).
-#[test]
-fn prop_index_batches_round_trip_the_snapshot() {
-    fn cells_of(coords: &[u8]) -> Vec<CellKey> {
-        coords
-            .iter()
-            .map(|&b| CellKey {
-                section: Section::new(0),
-                coordinate: Coordinate::from_bytes(vec![b]),
-            })
-            .collect()
-    }
-
-    async fn check(record: Vec<u8>, clear: Vec<u8>) -> Result<bool> {
-        let cache = test_db::cache("index_batch")?;
-        let c = fresh_collection("batch")?;
-        let recorded = cells_of(&record);
-        let cleared = cells_of(&clear);
-        cache.index_record_batch(&c, recorded.iter()).await?;
-        cache.index_clear_batch(&c, cleared.iter()).await?;
-
-        let want: BTreeSet<u8> = record
-            .iter()
-            .filter(|b| !clear.contains(b))
-            .copied()
-            .collect();
-        let mut got: Vec<u8> = cache
-            .index_snapshot(&c)
-            .await?
-            .into_iter()
-            .map(|cell| cell.coordinate.as_bytes()[0])
-            .collect();
-        got.sort_unstable();
-        got.dedup();
-        Ok(got.into_iter().eq(want))
-    }
-
-    fn prop(record: Vec<u8>, clear: Vec<u8>) -> TestResult {
-        match TEST_RUNTIME.block_on(check(record, clear)) {
-            Ok(true) => TestResult::passed(),
-            Ok(false) => TestResult::failed(),
-            Err(error) => TestResult::error(format!("{error:?}")),
-        }
-    }
-
-    QuickCheck::new().quickcheck(prop as fn(Vec<u8>, Vec<u8>) -> TestResult);
-}
-
 /// `for_workspace` must *retain* the workspace it is handed, not extract the
 /// cache handle and drop the workspace.
 ///

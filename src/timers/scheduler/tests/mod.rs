@@ -21,11 +21,15 @@
 //!       the watermark lowers the watermark, preserves compact ownership, and
 //!       activates the trigger.
 
+pub(crate) mod support;
+
 use super::actor::{
     ActorState, MIN_PRELOAD, calculate_preload, calculate_wait_time, cleanup_step,
-    collect_active_slab_ids, handle_add, load_step, next_unloaded_slab_id, owns_slab,
+    collect_active_slab_ids, drain_slab_range, handle_add, load_step, next_unloaded_slab_id,
+    owns_slab,
 };
 use crate::Key;
+use crate::state::TimerEventRef;
 use crate::timers::active::TimerState;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -37,7 +41,7 @@ use crate::timers::store::{Segment, TriggerStore};
 use crate::timers::test_support::test_segment;
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, ensure, eyre};
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::collections::BTreeSet;
@@ -256,6 +260,8 @@ struct Fixture {
     triggers: TriggerQueue,
     /// Authoritative per-trigger model.
     expected: TriggerModels,
+    /// Gives each add command a distinct input tag.
+    next_tag: i32,
     /// Anchored at construction so all ops within one iteration use a
     /// stable `now_slab_id` regardless of wall-clock drift.
     now_slab: SlabId,
@@ -286,6 +292,7 @@ impl Fixture {
             state,
             triggers,
             expected: TriggerModels::default(),
+            next_tag: 0,
             now_slab,
             universe,
         })
@@ -309,29 +316,9 @@ impl Fixture {
 
     async fn apply_schedule(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
         let (key, time, ty) = spec.resolve(self.now_slab);
-        let trigger = Trigger::new(key.clone(), time, ty, Span::current());
+        self.next_tag += 1_i32;
+        let trigger = Trigger::with_tag(key.clone(), time, ty, self.next_tag, Span::current());
         let current_model = self.model_for(&key, time, ty);
-
-        // Reviving an Aborted timer with the same identity is an in-memory
-        // state transition: the store row already exists, so just flip the
-        // state back to Scheduled and re-queue.
-        if current_model.active_state == Some(ModelActiveState::Aborted) {
-            self.triggers
-                .active_triggers()
-                .set_state(&key, time, ty, TimerState::Scheduled)
-                .await;
-            self.triggers.insert_queue_only(trigger);
-            self.set_model(
-                key,
-                time,
-                ty,
-                TriggerModel {
-                    in_store: true,
-                    active_state: Some(ModelActiveState::Scheduled),
-                },
-            );
-            return Ok(());
-        }
 
         let slab_id = Slab::from_time(self.segment.slab_size, time).id();
         let past_unregistered = self
@@ -356,7 +343,7 @@ impl Fixture {
 
         let mut model = current_model;
         model.in_store = true;
-        if owns_slab(&self.state, slab_id) && model.active_state.is_none() {
+        if owns_slab(&self.state, slab_id) {
             model.active_state = Some(ModelActiveState::Scheduled);
         }
         self.set_model(key, time, ty, model);
@@ -832,8 +819,19 @@ async fn test_cleanup_preserves_aborted_timer_slab_and_reload_schedules_it() -> 
 
 async fn run_property(ops: Vec<Op>) -> StdResult<(), String> {
     let mut fixture = Fixture::new().await?;
-    let history = ops.clone();
-    for (i, op) in ops.into_iter().enumerate() {
+    let same = TriggerSpec {
+        key_idx: 0,
+        slab_offset: -1,
+        timer_type: TimerType::DeferredMessage,
+    };
+    let prefix = [
+        Op::Schedule(same),
+        Op::LoadStep,
+        Op::Fire(same),
+        Op::Schedule(same),
+    ];
+    let history: Vec<_> = prefix.into_iter().chain(ops).collect();
+    for (i, op) in history.iter().cloned().enumerate() {
         fixture
             .apply(op.clone())
             .await
@@ -849,7 +847,11 @@ async fn run_property(ops: Vec<Op>) -> StdResult<(), String> {
 #[test]
 fn prop_scheduler_invariants() {
     fn property(seq: OpSequence) -> TestResult {
-        let runtime = match RuntimeBuilder::new_current_thread().enable_all().build() {
+        let runtime = match RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+        {
             Ok(r) => r,
             Err(e) => return TestResult::error(format!("runtime build: {e:?}")),
         };
@@ -862,4 +864,91 @@ fn prop_scheduler_invariants() {
     // Iteration count is read from the `QUICKCHECK_TESTS` env var, with
     // quickcheck's built-in default applying when unset. Never hardcoded.
     QuickCheck::new().quickcheck(property as fn(OpSequence) -> TestResult);
+}
+
+/// Repeated retirement preserves one replacement in both indexes and the queue.
+#[test]
+fn prop_retirement_idempotence() {
+    fn property(mode: u8, tag: i16) -> Result<()> {
+        RuntimeBuilder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()?
+            .block_on(support::retirement_trace(
+                mode,
+                i32::from(tag),
+                false,
+                |manager, trigger| async move {
+                    let event = TimerEventRef::new(trigger.timer_type, trigger.time, trigger.tag);
+                    manager.retire_committed(&trigger.key, event).await?;
+                    Ok(())
+                },
+            ))
+    }
+    QuickCheck::new().quickcheck(property as fn(u8, i16) -> Result<()>);
+}
+
+/// A partial load cannot preserve an old tag after the durable schedule
+/// changes.
+#[test]
+fn prop_failed_load_reschedule() {
+    fn property(tag: i16, kind: u8, delivered: bool) -> Result<()> {
+        RuntimeBuilder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()?
+            .block_on(async {
+                let segment = test_segment("failed-load", SLAB_SIZE_SECS);
+                let store = memory_store(segment.clone());
+                store.insert_segment().await?;
+                let time = CompactDateTime::from(
+                    CompactDateTime::now()?.epoch_seconds().saturating_sub(600),
+                );
+                let slab = Slab::from_time(segment.slab_size, time);
+                let timer_type = TimerType::VARIANTS[usize::from(kind) % TimerType::VARIANTS.len()];
+                let old = Trigger::with_tag(
+                    Key::from("replacement"),
+                    time,
+                    timer_type,
+                    i32::from(tag),
+                    Span::current(),
+                );
+                let mut state = fresh_state(store.clone(), segment);
+                let mut queue = TriggerQueue::new();
+                store.add_trigger(old.clone()).await?;
+                handle_add(&mut state, &mut queue, old.clone()).await?;
+
+                // Seed the successful drain before a later slab read fails.
+                // The failed tick does not advance ownership.
+                drain_slab_range(
+                    &store,
+                    slab.id()..=slab.id(),
+                    &mut queue,
+                    &mut state.known_slab_ids,
+                )
+                .await?;
+                ensure!(!owns_slab(&state, slab.id()));
+                if delivered {
+                    ensure!(queue.next().await.is_some());
+                }
+                let mut replacement = old;
+                replacement.tag += 1_i32;
+                store.add_trigger(replacement.clone()).await?;
+                handle_add(&mut state, &mut queue, replacement.clone()).await?;
+
+                load_step(&mut state, &mut queue).await;
+                let expired = queue
+                    .next()
+                    .await
+                    .ok_or_else(|| eyre!("replacement disappeared from the queue"))?;
+                ensure!(expired.tag == replacement.tag);
+                ensure!(
+                    queue.active_triggers().fire(&expired).await,
+                    "stale registry tag rejected the replacement"
+                );
+                ensure!(queue.next().await.is_none());
+                Ok(())
+            })
+    }
+    QuickCheck::new().quickcheck(property as fn(i16, u8, bool) -> Result<()>);
 }

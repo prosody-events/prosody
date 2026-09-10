@@ -12,7 +12,7 @@ use super::super::encoding::{
 };
 use super::{
     BorrowedCellTtlRow, CellCorruptReason, FramedKeyedCellRow, RawCellRow, blob_ttl,
-    try_decode_cell, try_decode_keyed_cell, try_decode_provisional_cell_ttl,
+    decode_marker_row, try_decode_cell, try_decode_keyed_cell, try_decode_provisional_cell_ttl,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::EventRef;
@@ -20,6 +20,9 @@ use crate::state::cassandra::cell::INITIAL_VERSION;
 use crate::state::cassandra::error::CassandraCellStoreError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Cell, Committed, ProvisionalCell};
+use crate::state::marker::{EventMarker, MarkerState, encode_marker_payload};
+use crate::state::tests::support::evidence;
+use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, bail};
 use quickcheck::{QuickCheck, TestResult};
@@ -452,4 +455,71 @@ fn blob_ttl_coalesces_the_present_blobs_ttl() {
     assert_eq!(blob_ttl(Some(5_i32), Some(9_i32)), Some(5_i32));
     assert_eq!(blob_ttl(None, Some(9_i32)), Some(9_i32));
     assert_eq!(blob_ttl(None, None), None);
+}
+
+/// Coordinates select the marker shape. Both rows require a valid payload.
+#[test]
+fn prop_marker_slice_decodes_by_coordinate() {
+    fn prop(coordinate: Vec<u8>, legacy: bool, metadata: i32) -> Result<bool> {
+        let marker = EventMarker::frozen(message_event(), &[], &[], &evidence([].into(), None));
+        let payload = encode_marker_payload(&marker)?;
+        let mut state = MarkerState::default();
+        let legacy_ttl = Some(CompactDuration::new(3600));
+        let data = if legacy {
+            &payload[..8]
+        } else {
+            payload.as_ref()
+        };
+        decode_marker_row(
+            &mut state,
+            (
+                &[],
+                Some(data),
+                Some(i16::from(Encoding::Raw)),
+                Some(if legacy { 1_i32 } else { 2_i32 }),
+                Some(raw_event()),
+            ),
+            legacy_ttl,
+        )?;
+        assert_eq!(
+            state.staged.as_ref().map(EventMarker::evidence_ttl),
+            Some(CompactDuration::new(3600))
+        );
+        assert!(
+            decode_marker_row(
+                &mut state,
+                (&[1], None, Some(-1), Some(metadata), Some(raw_event())),
+                None,
+            )
+            .is_err()
+        );
+        decode_marker_row(
+            &mut state,
+            (
+                &[1],
+                Some(&payload),
+                Some(i16::from(Encoding::Raw)),
+                Some(2_i32),
+                Some(raw_event()),
+            ),
+            None,
+        )?;
+        assert_eq!(
+            state.committed.as_ref().map(|marker| marker.event),
+            Some(message_event())
+        );
+        // Prefix every generated coordinate with 2, outside both valid addresses.
+        let invalid: Vec<_> = [2_u8].into_iter().chain(coordinate).collect();
+        Ok(matches!(
+            decode_marker_row(
+                &mut state,
+                (&invalid, None, None, None, Some(raw_event())),
+                None
+            ),
+            Err(CassandraCellStoreError::CorruptCell(
+                CellCorruptReason::MarkerCoordinate
+            ))
+        ))
+    }
+    QuickCheck::new().quickcheck(prop as fn(Vec<u8>, bool, i32) -> Result<bool>);
 }

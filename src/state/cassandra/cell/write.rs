@@ -1,19 +1,21 @@
 use super::{
-    BatchUnit, CassandraStore, CellAddr, CellBatchRow, CellKey, CellStoreError, CollectionRef,
-    CommitOracle, EventMarker, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, MarkerWriteRow,
-    PER_STATEMENT_OVERHEAD, Pk, ProvisionalWrite, ResolveCellError, RowShape, StageRow,
-    blob_weight, encode_cell_blobs, fits_one_batch, smallvec, ttl_to_i32,
+    BatchUnit, CassandraCellStoreError, CassandraStore, CellAddr, CellBatchRow, CellKey,
+    CellStoreError, CollectionRef, EventMarker, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS,
+    MarkerWriteRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalWrite, ResolveCellError, RowShape,
+    StageRow, bind_ttl, blob_weight, encode_cell_blobs, smallvec,
 };
+use crate::state::SHARD_FANOUT_CONCURRENCY;
+use crate::state::marker::MarkerRow;
+use futures::{StreamExt, TryStreamExt, stream};
+use smallvec::SmallVec;
+use std::ops::Range;
 
-pub(super) async fn write_provisional<O>(
-    store: &CassandraStore<O>,
+pub(super) async fn write_provisional(
+    store: &CassandraStore,
     collection: &CollectionRef,
     writes: &[(CellKey, ProvisionalWrite)],
     marker: Option<&EventMarker>,
-) -> Result<(), CellStoreError<O::Error>>
-where
-    O: CommitOracle,
-{
+) -> Result<(), CellStoreError> {
     // `None` ⇒ the explicit empty-stage no-op: no marker, no boundary
     // check (nothing to strand). A clears-only stage passes a marker with
     // empty `staged()` and runs the boundary like any stage.
@@ -21,17 +23,17 @@ where
         marker.is_some() || writes.is_empty(),
         "a markerless stage must write nothing"
     );
+    let Some(marker) = marker else {
+        return Ok(());
+    };
     debug_assert!(
-        marker.is_none_or(|marker| writes
+        writes
             .iter()
-            .all(|(cell, _)| marker.staged().binary_search(cell).is_ok())),
+            .all(|(cell, _)| marker.staged().binary_search(cell).is_ok()),
         "every staged write must be listed by the event marker"
     );
     let pk = Pk::of(collection.id());
-    let marker_blob: Option<MarkerBlob> = match marker {
-        None => None,
-        Some(marker) => Some(store.stage_marker(collection, marker).await?),
-    };
+    let marker_blob = super::store::stage_marker(marker)?;
 
     // Encode every cell's blobs up front (this Vec owns the `Bytes`); the
     // bound rows borrow into it and into each input cell's coordinate slice,
@@ -42,46 +44,30 @@ where
         blobs.push(encode_cell_blobs(write.data(), write.prev()).map_err(ResolveCellError::Store)?);
     }
 
-    // The collection TTL is uniform, so the with-TTL vs no-TTL choice — and
-    // hence which statement each row carries — is made once for the whole
-    // batch, never per cell. The marker row shares the TTL (co-expiry with
-    // the newest staged cell).
-    let ttl = collection.ttl().map(ttl_to_i32);
-    let (cell_stmt, marker_stmt) = if ttl.is_some() {
-        (
-            &store.queries.write_provisional,
-            &store.queries.marker_write,
-        )
-    } else {
-        (
-            &store.queries.write_provisional_no_ttl,
-            &store.queries.marker_write_no_ttl,
-        )
-    };
-    // The marker unit leads; each cell unit is one row. `units` stays a
-    // `Vec` (not a `CellBuffer`) — see the `run_batches` ruling.
-    let mut units: Vec<BatchUnit<CellBatchRow>> = Vec::with_capacity(writes.len() + 1);
-    if let Some(blob) = &marker_blob {
-        units.push(BatchUnit::new(
-            blob.payload.as_ref().len() as u64 + PER_STATEMENT_OVERHEAD,
-            smallvec![CellBatchRow {
-                statement: marker_stmt,
-                row: RowShape::MarkerWrite(MarkerWriteRow {
-                    ttl,
-                    payload: blob.payload.as_ref(),
-                    encoding: blob.payload.encoding(),
-                    event: blob.event,
-                    addr: CellAddr::marker(pk),
-                }),
-            }],
-        ));
-    }
+    // Cells and the Staged row bind the collection TTL.
+    let ttl = bind_ttl(collection.ttl());
+    // The marker unit joins every chunk; each cell unit is one row. `units`
+    // stays a `Vec` (not a `CellBuffer`) — see the `run_batches` ruling.
+    let marker = BatchUnit::new(
+        marker_blob.payload.as_ref().len() as u64 + PER_STATEMENT_OVERHEAD,
+        smallvec![CellBatchRow {
+            statement: &store.queries.marker_write,
+            row: RowShape::MarkerWrite(MarkerWriteRow {
+                ttl,
+                payload: marker_blob.payload.as_ref(),
+                encoding: marker_blob.payload.encoding(),
+                event: marker_blob.event,
+                addr: CellAddr::marker(pk, MarkerRow::Staged),
+            }),
+        }],
+    );
+    let mut units: Vec<BatchUnit<CellBatchRow>> = Vec::with_capacity(writes.len());
     units.extend(blobs.iter().zip(writes).map(|(blob, (cell, write))| {
         let addr = CellAddr::new(pk, cell);
         BatchUnit::new(
             blob_weight(blob),
             smallvec![CellBatchRow {
-                statement: cell_stmt,
+                statement: &store.queries.write_provisional,
                 row: RowShape::Stage(StageRow {
                     ttl,
                     data: blob.data(),
@@ -95,31 +81,18 @@ where
         )
     }));
 
-    // Marker-first ordering. Within one batch the marker rides atomically;
-    // an over-budget stage MUST await the marker batch to completion
-    // before issuing the cell batches, because `execute_unlogged_batches`
-    // runs its chunks `buffer_unordered` (chunk order is NOT guaranteed).
-    // Marker-without-cells is the over-report-safe crash shape;
-    // cells-without-marker would strand them from recovery.
-    if marker_blob.is_none()
-        || fits_one_batch(
-            units.iter().map(BatchUnit::weight),
-            MAX_BATCH_BYTES,
-            MAX_BATCH_STATEMENTS,
-        )
-    {
-        store
-            .run_batches(&units)
-            .await
-            .map_err(ResolveCellError::Store)
-    } else {
-        store
-            .run_batches(&units[..1])
-            .await
-            .map_err(ResolveCellError::Store)?;
-        store
-            .run_batches(&units[1..])
-            .await
-            .map_err(ResolveCellError::Store)
-    }
+    let chunks: SmallVec<[Range<usize>; 1]> =
+        super::batch::stage_batches(&marker, &units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS)
+            .collect();
+    stream::iter(chunks)
+        .map(|range| {
+            let rows = super::batch::stage_chunk(&marker, &units, range);
+            store.session.execute_unlogged_batch(rows)
+        })
+        .buffer_unordered(SHARD_FANOUT_CONCURRENCY)
+        .try_collect::<()>()
+        .await
+        .map_err(CassandraCellStoreError::from)
+        .map_err(ResolveCellError::Store)?;
+    Ok(())
 }

@@ -13,17 +13,13 @@
 //! - `Overflow → Inline`: a BATCH that deletes all clustering rows and sets the
 //!   new inline state atomically — one round-trip, zero residual tombstones.
 //!
-//! `resolve_state` is the cache-first entry point used by all higher-level
-//! operations, the commit-oracle read `current_tag` included (sound because
-//! the oracle reads through a clone of the partition's writing store — see
-//! its doc): it returns an `Arc<AsyncMutex<TimerState>>` that callers lock
-//! before reading and hold through the write, serialising mutations per
-//! `(key, timer_type)` without a global lock.
+//! `resolve_state` shares cached state across clones of the partition's store.
+//! Callers hold the returned lock through each read or write for that key and
+//! type.
 
 use crate::Key;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::slab::Slab;
 use crate::timers::store::SegmentId;
 use crate::timers::store::cassandra::CassandraTriggerStore;
 use crate::timers::store::cassandra::error::CassandraTriggerStoreError;
@@ -187,33 +183,19 @@ impl CassandraTriggerStore {
         state: &TimerState,
     ) -> Result<(), CassandraTriggerStoreError> {
         let timer = require_inline(state)?;
-        self.execute_with_optional_ttl(
-            timer.time,
+        let ttl = self.calculate_ttl(timer.time);
+        self.execute_unpaged_discard(
             &self.queries().batch_clear_and_set_inline,
-            &self.queries().batch_clear_and_set_inline_no_ttl,
-            |ttl| {
-                (
-                    segment_id,
-                    key.as_ref(),
-                    timer_type,
-                    ttl,
-                    timer_type,
-                    state,
-                    segment_id,
-                    key.as_ref(),
-                )
-            },
-            || {
-                (
-                    segment_id,
-                    key.as_ref(),
-                    timer_type,
-                    timer_type,
-                    state,
-                    segment_id,
-                    key.as_ref(),
-                )
-            },
+            (
+                segment_id,
+                key.as_ref(),
+                timer_type,
+                ttl,
+                timer_type,
+                state,
+                segment_id,
+                key.as_ref(),
+            ),
         )
         .await
     }
@@ -238,35 +220,20 @@ impl CassandraTriggerStore {
         state: &TimerState,
     ) -> Result<(), CassandraTriggerStoreError> {
         let timer = require_inline(state)?;
-        self.execute_with_optional_ttl(
-            timer.time,
+        let ttl = self.calculate_ttl(timer.time);
+        self.execute_unpaged_discard(
             &self.queries().batch_demote_to_inline,
-            &self.queries().batch_demote_to_inline_no_ttl,
-            |ttl| {
-                (
-                    segment_id,
-                    key.as_ref(),
-                    timer_type,
-                    time_to_delete,
-                    ttl,
-                    timer_type,
-                    state,
-                    segment_id,
-                    key.as_ref(),
-                )
-            },
-            || {
-                (
-                    segment_id,
-                    key.as_ref(),
-                    timer_type,
-                    time_to_delete,
-                    timer_type,
-                    state,
-                    segment_id,
-                    key.as_ref(),
-                )
-            },
+            (
+                segment_id,
+                key.as_ref(),
+                timer_type,
+                time_to_delete,
+                ttl,
+                timer_type,
+                state,
+                segment_id,
+                key.as_ref(),
+            ),
         )
         .await
     }
@@ -286,12 +253,10 @@ impl CassandraTriggerStore {
         state: &TimerState,
     ) -> Result<(), CassandraTriggerStoreError> {
         let timer = require_inline(state)?;
-        self.execute_with_optional_ttl(
-            timer.time,
+        let ttl = self.calculate_ttl(timer.time);
+        self.execute_unpaged_discard(
             &self.queries().set_state_inline,
-            &self.queries().set_state_inline_no_ttl,
-            |ttl| (ttl, timer_type, state, segment_id, key.as_ref()),
-            || (timer_type, state, segment_id, key.as_ref()),
+            (ttl, timer_type, state, segment_id, key.as_ref()),
         )
         .await
     }
@@ -310,58 +275,18 @@ impl CassandraTriggerStore {
         timer_type: TimerType,
         ttl_time: CompactDateTime,
     ) -> Result<(), CassandraTriggerStoreError> {
-        self.execute_with_optional_ttl(
-            ttl_time,
-            &self.queries().set_state_overflow_with_ttl,
+        let ttl = self.calculate_ttl(ttl_time);
+        self.execute_unpaged_discard(
             &self.queries().set_state_overflow,
-            |ttl| {
-                (
-                    ttl,
-                    timer_type,
-                    &TimerState::Overflow,
-                    segment_id,
-                    key.as_ref(),
-                )
-            },
-            || (timer_type, &TimerState::Overflow, segment_id, key.as_ref()),
+            (
+                ttl,
+                timer_type,
+                &TimerState::Overflow,
+                segment_id,
+                key.as_ref(),
+            ),
         )
         .await
-    }
-
-    /// Rotates the commit-oracle tag on the slab index for an existing timer.
-    ///
-    /// Callers must only invoke this for timers they have observed as
-    /// scheduled. Like the key-index clustering update, a missed target would
-    /// write a partial row in Cassandra.
-    #[instrument(level = "debug", skip(self), err)]
-    pub(super) async fn update_slab_tag(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-        new_tag: i32,
-    ) -> Result<(), CassandraTriggerStoreError> {
-        let slab = Slab::from_time(self.segment.slab_size, time);
-        let slab_size = slab.size().seconds() as i32;
-        let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
-
-        self.session()
-            .execute_unpaged(
-                &self.queries().update_slab_tag,
-                (
-                    new_tag,
-                    &self.segment.id,
-                    slab_size,
-                    slab_id,
-                    timer_type,
-                    key.as_ref(),
-                    time,
-                ),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?;
-
-        Ok(())
     }
 
     /// Removes a state entry for a single timer type (returns to Absent).
@@ -537,43 +462,24 @@ impl CassandraTriggerStore {
     ) -> Result<(), CassandraTriggerStoreError> {
         let timer = require_inline(state)?;
         let key_ref = key.as_ref();
-        self.execute_with_optional_ttl(
-            timer.time,
+        let ttl = self.calculate_ttl(timer.time);
+        self.execute_unpaged_discard(
             &self.queries().batch_delete_to_inline,
-            &self.queries().batch_delete_to_inline_no_ttl,
-            |ttl| {
-                (
-                    segment_id,
-                    key_ref,
-                    timer_type,
-                    target_time,
-                    segment_id,
-                    key_ref,
-                    timer_type,
-                    surviving_time,
-                    ttl,
-                    timer_type,
-                    state,
-                    segment_id,
-                    key_ref,
-                )
-            },
-            || {
-                (
-                    segment_id,
-                    key_ref,
-                    timer_type,
-                    target_time,
-                    segment_id,
-                    key_ref,
-                    timer_type,
-                    surviving_time,
-                    timer_type,
-                    state,
-                    segment_id,
-                    key_ref,
-                )
-            },
+            (
+                segment_id,
+                key_ref,
+                timer_type,
+                target_time,
+                segment_id,
+                key_ref,
+                timer_type,
+                surviving_time,
+                ttl,
+                timer_type,
+                state,
+                segment_id,
+                key_ref,
+            ),
         )
         .await
     }
@@ -671,13 +577,12 @@ impl CassandraTriggerStore {
         let ttl_time = promoted.time.max(new.time);
         let key_ref = key.as_ref();
 
-        // `PromoteOverflowParams` is needed for the TTL variant because the
-        // bind value count exceeds the 16-element `SerializeRow` tuple limit.
-        self.execute_with_optional_ttl(
-            ttl_time,
+        // The bind count exceeds the 16-element `SerializeRow` tuple limit,
+        // so `PromoteOverflowParams` carries the parameters.
+        let ttl = self.calculate_ttl(ttl_time);
+        self.execute_unpaged_discard(
             &self.queries().batch_promote_and_set_overflow,
-            &self.queries().batch_promote_and_set_overflow_no_ttl,
-            |ttl| PromoteOverflowParams {
+            PromoteOverflowParams {
                 p_segment_id: segment_id,
                 p_key: key_ref,
                 p_timer_type: timer_type,
@@ -697,26 +602,6 @@ impl CassandraTriggerStore {
                 s_state: &overflow_state,
                 s_segment_id: segment_id,
                 s_key: key_ref,
-            },
-            || {
-                (
-                    segment_id,
-                    key_ref,
-                    timer_type,
-                    promoted.time,
-                    promoted.span,
-                    promoted.tag,
-                    segment_id,
-                    key_ref,
-                    timer_type,
-                    new.time,
-                    new.span,
-                    new.tag,
-                    timer_type,
-                    &overflow_state,
-                    segment_id,
-                    key_ref,
-                )
             },
         )
         .await
@@ -739,12 +624,10 @@ impl CassandraTriggerStore {
         let timer_type = trigger.timer_type;
         let tag = trigger.tag;
 
-        self.execute_with_optional_ttl(
-            trigger.time,
+        let ttl = self.calculate_ttl(trigger.time);
+        self.execute_unpaged_discard(
             &self.queries().insert_key_trigger_clustering,
-            &self.queries().insert_key_trigger_clustering_no_ttl,
-            |ttl| (segment_id, key, timer_type, time, &span_map, tag, ttl),
-            || (segment_id, key, timer_type, time, &span_map, tag),
+            (segment_id, key, timer_type, time, &span_map, tag, ttl),
         )
         .await
     }

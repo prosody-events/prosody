@@ -15,7 +15,6 @@ use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::cell_key::Direction;
 use crate::state::dirty::DirtyStore;
-use crate::state::manager::ArmedKeys;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::order_codec::{I64KeyCodec, Utf8KeyCodec};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
@@ -26,7 +25,6 @@ use crate::test_util::{ArbJson, TEST_RUNTIME, captured_spans};
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, eyre};
 use futures::TryStreamExt;
-use futures::executor;
 use opentelemetry_sdk::trace::SpanData;
 use quickcheck::{QuickCheck, TestResult};
 use serde::{Deserialize, Serialize};
@@ -36,9 +34,8 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-// Re-exported so contexts that mount a get-out-of-the-way oracle (here and the
-// middleware tests) name one canonical type.
-pub(crate) use crate::state::tests::support::FixedOracle;
+// Test contexts share one deduplication store type.
+pub(crate) use crate::state::tests::support::MemoryDeduplicationStore;
 
 /// Converts a property body's `Result<bool>` into a `TestResult`, surfacing
 /// the offending input on failure.
@@ -90,27 +87,16 @@ pub(crate) fn test_session_parts(
     loader: MemoryLoader<Value>,
     registry: CollectionDefRegistry,
     state_key: StateKey,
-) -> (TestSession, MemoryCellStore<FixedOracle>) {
-    test_session_with_armed(loader, registry, state_key, Arc::default())
-}
-
-/// Like [`test_session_parts`] but shares an explicit `armed` set across
-/// sessions, so a test can drive several events on the same key through one
-/// per-partition backstop-amortization state.
-pub(crate) fn test_session_with_armed(
-    loader: MemoryLoader<Value>,
-    registry: CollectionDefRegistry,
-    state_key: StateKey,
-    armed: ArmedKeys,
-) -> (TestSession, MemoryCellStore<FixedOracle>) {
-    let (parts, cell_store) = session_parts(loader, registry, state_key, armed, false);
+) -> (TestSession, MemoryCellStore) {
+    let (parts, cell_store) = session_parts(loader, registry, state_key, false);
     (KeyedStateSession::new(parts), cell_store)
 }
 
 /// The partition backend every test-session fixture in this module shares: the
-/// memory cell store resolving through a get-out-of-the-way [`FixedOracle`].
+/// memory cell store resolving through a get-out-of-the-way
+/// [`MemoryDeduplicationStore`].
 pub(crate) type TestBackend =
-    PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, MemoryCellStore<FixedOracle>>;
+    PartitionBackend<MemoryDeduplicationStore, MemoryDescriptorIdentityStore, MemoryCellStore, ()>;
 
 /// Builds a test session over an arbitrary loader payload — the generic twin of
 /// [`test_session`] (which pins the loader to `MemoryLoader<Value>`). The
@@ -124,15 +110,14 @@ pub(crate) fn test_session_for<L>(
         loader,
         registry,
         StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
-        Arc::default(),
         false,
     );
     KeyedStateSession::new(parts)
 }
 
 /// Assembles the [`SessionParts`] shared by every test-session fixture — a
-/// fresh memory cell store over `registry`, the committed oracle, and the given
-/// `loader`/`state_key`/`armed`. When `cancelled`, the per-event cancellation
+/// fresh memory cell store, the registry, loader, and state key.
+/// When `cancelled`, the per-event cancellation
 /// watch starts tripped (binding still succeeds — bind validates registration,
 /// not liveness — but every typed op then guards to
 /// [`StateAccessError::Terminated`]). Returns the parts plus a store clone
@@ -144,29 +129,24 @@ pub(crate) fn session_parts<L>(
     loader: L,
     registry: CollectionDefRegistry,
     state_key: StateKey,
-    armed: ArmedKeys,
     cancelled: bool,
-) -> (SessionParts<TestBackend, L>, MemoryCellStore<FixedOracle>) {
+) -> (SessionParts<TestBackend, L>, MemoryCellStore) {
     let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
     let (_cancel_tx, cancel_rx) = watch::channel(cancelled);
     let registry = Arc::new(registry);
-    let cell_store = MemoryCellStore::new(
-        MemoryCells::new(),
-        FixedOracle::committed(),
-        registry.clone(),
-    );
+    let cell_store = MemoryCellStore::new(MemoryCells::new());
     let parts = SessionParts {
         cell: cell_store.clone(),
         dirty: Arc::new(DirtyStore::new()),
-        oracle: FixedOracle::committed(),
+        dedup: MemoryDeduplicationStore::new(),
         loader,
         registry,
         state_key,
         event: EventRef::Message {
             dedup_id: Uuid::new_v4(),
         },
-        recovery_delay: CompactDuration::new(30),
-        armed,
+        dedup_ttl: CompactDuration::new(30),
+        checks: (),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     };
     (parts, cell_store)
@@ -187,7 +167,7 @@ pub(crate) fn session_with_dirty(
     registry: CollectionDefRegistry,
     state_key: StateKey,
 ) -> (TestSession, Arc<DirtyStore>) {
-    let (parts, _cells) = session_parts(loader, registry, state_key, Arc::default(), false);
+    let (parts, _cells) = session_parts(loader, registry, state_key, false);
     let dirty = parts.dirty.clone();
     (KeyedStateSession::new(parts), dirty)
 }
@@ -195,7 +175,7 @@ pub(crate) fn session_with_dirty(
 /// A test session over an arbitrary cell store `C` — the twin of
 /// [`TestSession`], whose store is pinned to the plain memory one.
 pub(crate) type SessionOver<C> = KeyedStateSession<
-    PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, C>,
+    PartitionBackend<MemoryDeduplicationStore, MemoryDescriptorIdentityStore, C, ()>,
     MemoryLoader<Value>,
 >;
 
@@ -212,15 +192,15 @@ pub(crate) fn session_over<C: CellStore>(
     KeyedStateSession::new(SessionParts {
         cell,
         dirty: Arc::new(DirtyStore::new()),
-        oracle: FixedOracle::committed(),
+        dedup: MemoryDeduplicationStore::new(),
         loader,
         registry: Arc::new(registry),
         state_key,
         event: EventRef::Message {
             dedup_id: Uuid::new_v4(),
         },
-        recovery_delay: CompactDuration::new(30),
-        armed: Arc::default(),
+        dedup_ttl: CompactDuration::new(30),
+        checks: (),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     })
 }
@@ -243,7 +223,7 @@ async fn roundtrip(value: Value) -> Result<bool> {
 fn prop_descriptor_set_get_roundtrip() {
     fn prop(value: ArbJson) -> TestResult {
         let input_dbg = format!("{value:#?}");
-        let result = executor::block_on(roundtrip(value.0));
+        let result = TEST_RUNTIME.block_on(roundtrip(value.0));
         finish_trace(result, "typed roundtrip lost", &input_dbg)
     }
     QuickCheck::new().quickcheck(prop as fn(ArbJson) -> TestResult);
@@ -742,7 +722,7 @@ mod scope_containment {
         fn prop(a: ArbJson, b: ArbJson) -> TestResult {
             let input = format!("a={:#?} b={:#?}", a.0, b.0);
             finish_trace(
-                executor::block_on(check(a.0, b.0)),
+                TEST_RUNTIME.block_on(check(a.0, b.0)),
                 "sibling leakage",
                 &input,
             )
@@ -803,7 +783,6 @@ fn terminated_session(loader: MemoryLoader<Value>, registry: CollectionDefRegist
         loader,
         registry,
         StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
-        Arc::default(),
         true,
     );
     KeyedStateSession::new(parts)

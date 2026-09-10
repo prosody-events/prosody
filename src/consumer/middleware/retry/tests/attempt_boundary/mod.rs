@@ -2,7 +2,7 @@ use super::*;
 use crate::codec::{JsonCodec, JsonCodecError};
 use crate::consumer::event_context::StateAccessError;
 use crate::consumer::middleware::tests::test_support::{
-    RecordingOracle, RecordingSession, committed_json_value, recording_session,
+    RecordingSession, committed_json_value, recording_session,
 };
 use crate::consumer::middleware::{Settlement, SettlementHandler};
 use crate::state::descriptor::{CellStateError, Registered, ValueDescriptor, value_state};
@@ -327,7 +327,7 @@ fn hook_fixture(
     handler_registry: impl FnOnce(&mut CollectionDefRegistry) -> Result<()>,
 ) -> Result<(
     MockEventContext<Value, RecordingSession>,
-    MemoryCellStore<RecordingOracle>,
+    MemoryCellStore,
     StateKey,
 )> {
     let mut registry = CollectionDefRegistry::default();

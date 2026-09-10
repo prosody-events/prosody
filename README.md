@@ -238,7 +238,7 @@ let current = count.get().await?.and_then(|value| value.as_u64()).unwrap_or(0);
 count.set(json!(current + 1)).await?;
 ```
 
-Keyed-state cache and recovery settings are listed in [CONFIGURATION.md](CONFIGURATION.md#keyed-state-pipeline-mode).
+Keyed-state cache settings are listed in [CONFIGURATION.md](CONFIGURATION.md#keyed-state).
 
 ### Reading another group's state
 

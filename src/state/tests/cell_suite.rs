@@ -1,38 +1,8 @@
-//! Backend-generic property suite for the uniform cell store.
-//!
-//! Every runner is generic over the [`CellStore`] backend and takes a
-//! `make_store` closure (or a pre-built lower store) so memory
-//! ([`Overlay<MemoryCellStore>`]) and Cassandra
-//! ([`Overlay<Cached<CassandraStore>>`]) prove the *same* invariants from one
-//! body — backend parity by transitivity through a deliberately simple model.
-//!
-//! The flagship is **crash-recovery equivalence**: a generated
-//! trace stages provisional writes and resolves them one of five ways — clean
-//! promote, clean inline rollback, or a crash at one of three points followed
-//! by recovery through the sweep *or* first-touch. After every event the
-//! committed projection must equal the model, whichever path ran. Companions
-//! test implicit overwrite (resolution-on-read); the **unified overlay view**
-//! (`run_overlay_trace`), where point `get`s, range `scan`s, dirty buffering,
-//! and committed writes are **intermixed** in one trace so their interaction is
-//! exercised — dirty-wins, clear-hides, scan bounds / direction / limit /
-//! early-stop (unified-view soundness and oracle-correctness); the bottom-store
-//! scan primitive; and sweep idempotence.
-//!
-//! Faithfulness to production:
-//!
-//! * **A "crash" is `make_store()` again over the same warm backing** — the
-//!   durable rows and the oracle's committed set survive; a fresh store starts
-//!   with a cold in-process cache, exactly as after a restart. Nothing is ever
-//!   leaked or forgotten to fake a crash (the CLAUDE.md memory rule).
-//! * **`get` resolves in the backend, so it MUTATES a provisional cell; a
-//!   `scan` resolves READ-ONLY** (no durable write-back — a scan runs gate-free
-//!   over a snapshot, so a repair computed from it could clobber a newer
-//!   `commit()`; point-read / first-touch / sweep own repair). Provisional
-//!   state is therefore observed only through `provisional_cells`; committed
-//!   seeds for the overlay/scan suites are written **resolved**
-//!   (`write_resolved`, no event) so reads stay pure dirty-over-committed.
-//! * **`prev` always comes from `store.get`**, never minted — the staged `prev`
-//!   is the resolved committed base, the same path `finalize` uses.
+//! Shared property suites for memory, cached memory, and Cassandra cells.
+//! Crash traces preserve durable rows and rebuild the store with a cold cache.
+//! Admission resolves residue through collection evidence before the next
+//! event. Physical probes check marker rows, provisional cells, and committed
+//! absence.
 
 use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
@@ -40,31 +10,31 @@ use super::super::dirty::DirtyStore;
 use super::super::identity::{CollectionId, CollectionRef};
 use super::super::marker::{EventMarker, SectionClear};
 use super::super::memory::MemoryCells;
-use super::super::oracle::CommitOracle;
 use super::super::overlay::Overlay;
-use super::super::resolve::{resolve_cell, resolve_event_marker, sweep_provisional};
+use super::super::resolve::{EvidenceLookup, resolve_event_marker};
 use super::super::store::{
     CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, provisional_point_loop,
 };
 use super::super::{CommitDecision, EventRef, StateKey, StateName, StateType};
-use super::support::{CountingCellStore, CountingOracle, batch_of};
+pub(crate) use super::support::MemoryDeduplicationStore;
+use super::support::{CountingCellStore, batch_of};
+use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::cell::Cell::Provisional;
+use crate::state::marker::{AttemptId, EventEvidence, MarkerState};
+use crate::state::tests::support::{admit_collection, evidence, seed_commit_evidence};
 use crate::timers::duration::CompactDuration;
-use ahash::RandomState;
 use bytes::Bytes;
+use color_eyre::eyre::eyre;
 use color_eyre::eyre::{Result, ensure};
 use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen};
 use std::collections::{BTreeMap, BTreeSet};
-use std::convert::Infallible;
 use std::error::Error;
 use std::future::{Future, ready};
 use std::iter;
-use std::pin::Pin;
 use std::slice;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
 use uuid::Uuid;
 
 /// Distinct collections a crash/overwrite trace cycles through. Small so events
@@ -140,16 +110,6 @@ fn section_idx(s: u8) -> u8 {
     s % SECTIONS.len() as u8
 }
 
-/// The [`SECTIONS`] pool index of a sampled section — the inverse of
-/// [`cell_in`]'s folding. Every trace section is drawn from the pool, so the
-/// lookup always hits; the `unwrap_or_default` merely keeps it total.
-fn section_slot(section: Section) -> u8 {
-    SECTIONS
-        .iter()
-        .position(|&s| s == section)
-        .unwrap_or_default() as u8
-}
-
 /// The first coordinate byte of a scanned cell (the suites use single-byte
 /// coordinates).
 fn coord_of(key: &CellKey) -> u8 {
@@ -160,117 +120,6 @@ fn coord_of(key: &CellKey) -> u8 {
 /// probes' and models' shared comparison currency.
 pub(crate) fn row_key(key: &CellKey) -> (i8, u8) {
     (i8::from(key.section), coord_of(key))
-}
-
-/// A committed-marker oracle backed by an in-memory set of dedup ids.
-///
-/// Models the durable deduplication store: `record_message` writes the marker,
-/// and `resolve` answers `Committed` iff the staged event's marker is present.
-/// The set is shared across clones, so it survives the simulated crash exactly
-/// as the durable dedup store does.
-#[derive(Clone, Default)]
-pub(crate) struct ScriptedOracle {
-    committed: Arc<scc::HashSet<Uuid, RandomState>>,
-}
-
-impl CommitOracle for ScriptedOracle {
-    type Error = Infallible;
-
-    async fn record_message(&self, dedup_id: Uuid) -> Result<(), Self::Error> {
-        // `insert_async` returns `Err(key)` if already present — harmless; the
-        // marker is idempotent.
-        let _ = self.committed.insert_async(dedup_id).await;
-        Ok(())
-    }
-
-    async fn resolve<'a>(
-        &'a self,
-        _state_key: &'a StateKey,
-        event: EventRef,
-    ) -> Result<CommitDecision, Self::Error> {
-        let committed = match event {
-            EventRef::Message { dedup_id } => self.committed.contains_async(&dedup_id).await,
-            EventRef::Timer(_) => false,
-        };
-        Ok(if committed {
-            CommitDecision::Committed
-        } else {
-            CommitDecision::NotCommitted
-        })
-    }
-}
-
-/// A commit oracle whose `resolve` YIELDS ONCE then fails `Transient`, counting
-/// consults. The single yield is load-bearing for the overlap-precedence
-/// falsification (`resolve_event_marker_double_failure_surfaces_oracle`): it
-/// forces `resolve` to observe `Pending` on the first poll pass while the
-/// (ready) batch read errors, so `resolve_event_marker`'s
-/// [`join`](futures::future::join)-plus-oracle-first surfaces the ORACLE error,
-/// whereas a first-error-short-circuiting combinator would surface the STORE
-/// error. `record_message` is inert.
-#[derive(Clone, Default)]
-pub(crate) struct FailingOracle(Arc<AtomicUsize>);
-
-impl FailingOracle {
-    /// Resolutions counted so far.
-    pub(crate) fn resolves(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
-    }
-}
-
-impl CommitOracle for FailingOracle {
-    type Error = FailingOracleError;
-
-    fn record_message(
-        &self,
-        _dedup_id: Uuid,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        ready(Ok(()))
-    }
-
-    async fn resolve<'a>(
-        &'a self,
-        _state_key: &'a StateKey,
-        _event: EventRef,
-    ) -> Result<CommitDecision, Self::Error> {
-        YieldOnce::default().await;
-        self.0.fetch_add(1, Ordering::Relaxed);
-        Err(FailingOracleError::Injected)
-    }
-}
-
-/// A runtime-agnostic "`Pending` on the first poll, `Ready` after" future —
-/// robust under `futures::executor::block_on` (which the memory tests use),
-/// unlike `tokio::task::yield_now`. Wakes itself so the executor re-polls.
-#[derive(Default)]
-struct YieldOnce(bool);
-
-impl Future for YieldOnce {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.0 {
-            Poll::Ready(())
-        } else {
-            self.0 = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
-}
-
-/// Error of a [`FailingOracle`]: a single injected transient failure.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum FailingOracleError {
-    /// The injected resolve failure.
-    #[error("injected oracle failure")]
-    Injected,
-}
-
-impl ClassifyError for FailingOracleError {
-    fn classify_error(&self) -> ErrorCategory {
-        ErrorCategory::Transient
-    }
 }
 
 /// A set of physical `(section, coordinate byte)` row keys ([`row_key`]).
@@ -320,10 +169,10 @@ pub(crate) fn probed_parts(marker: &EventMarker) -> (RowKeys, ClearMap) {
 ///
 /// Only [`run_crash_equivalence_trace`], [`run_bottom_scan_trace`], and
 /// [`run_apply_idempotence`] take a probe: they drive every physical settle
-/// primitive (clean promote, clean abort, crash→sweep, crash→first-touch, the
+/// primitive (clean promote, clean abort, crash followed by admission, the
 /// direct `write_resolved(None)` clear, and the section-clear gap erase).
 /// `run_overlay_trace`/`run_overwrite_trace` add no new physical path — their
-/// committed mutations and first-touch resolutions go through those same
+/// committed mutations and committed reads go through those same
 /// primitives — so hooking them would only add live round-trips.
 pub(crate) trait ShapeProbe {
     async fn cell_rows(&self, id: &CollectionId) -> Result<RowKeys>;
@@ -405,28 +254,6 @@ impl Arbitrary for Mutation {
     }
 }
 
-/// Where an injected settle failure fires: at the **wrapper** (outside the
-/// store under test — the settle provably never reaches it, so durable state
-/// and any warm cache entries stay exactly as staged), or at the **lower**
-/// store (beneath any cache in the composition — a `Cached` instantiation
-/// runs its delete-first repair legs before the lower store rejects). For a
-/// bare store the two depths coincide.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FaultDepth {
-    Wrapper,
-    Lower,
-}
-
-impl Arbitrary for FaultDepth {
-    fn arbitrary(g: &mut Gen) -> Self {
-        if bool::arbitrary(g) {
-            Self::Wrapper
-        } else {
-            Self::Lower
-        }
-    }
-}
-
 /// How an event resolved — the six distinct outcomes.
 #[derive(Clone, Copy, Debug)]
 enum Outcome {
@@ -449,14 +276,14 @@ enum Outcome {
     /// `Cached` instantiation, `Wrapper` depth leaves the settle transform
     /// unrun, and `Lower` depth leaves it run with the cleared sections
     /// deleted).
-    SettleFailure(FaultDepth),
+    SettleFailure,
 }
 
 impl Outcome {
     fn marker_flushed(self) -> bool {
         matches!(
             self,
-            Self::CleanCommitted | Self::CrashAfterMarker | Self::SettleFailure(_)
+            Self::CleanCommitted | Self::CrashAfterMarker | Self::SettleFailure
         )
     }
 
@@ -480,32 +307,8 @@ impl Arbitrary for Outcome {
             2 => Self::CrashAfterStage,
             3 => Self::CrashAfterMarker,
             4 => Self::CrashMidFanOut,
-            _ => Self::SettleFailure(FaultDepth::arbitrary(g)),
+            _ => Self::SettleFailure,
         }
-    }
-}
-
-/// How a crash event recovers — or deliberately doesn't.
-#[derive(Clone, Copy, Debug)]
-enum Recovery {
-    /// The backstop sweep resolves every pooled collection.
-    Sweep,
-    /// Reads of the crashed event's staged cells first-touch-resolve them;
-    /// the unsettled event marker lingers (first-touch is marker-free — the
-    /// over-report the model keeps).
-    FirstTouch,
-    /// No immediate recovery: the unsettled event marker and provisional cells
-    /// linger into subsequent events, resolved at the next stage boundary or
-    /// a later sweep — the fresh-assignee shape (the crash rebuild models the
-    /// cold new assignee).
-    Defer,
-}
-
-impl Arbitrary for Recovery {
-    fn arbitrary(g: &mut Gen) -> Self {
-        g.choose(&[Self::Sweep, Self::FirstTouch, Self::Defer])
-            .copied()
-            .unwrap_or(Self::Sweep)
     }
 }
 
@@ -537,7 +340,6 @@ struct TraceEvent {
     /// arise organically.
     clears: Vec<(u8, u8)>,
     outcome: Outcome,
-    recovery: Recovery,
     split: bool,
     /// When set, the event's first planned stage is rejected at the lower
     /// store (a transient `write_provisional` fault) and the event is never
@@ -569,7 +371,6 @@ impl Arbitrary for TraceEvent {
             blind,
             clears,
             outcome: Outcome::arbitrary(g),
-            recovery: Recovery::arbitrary(g),
             split: bool::arbitrary(g),
             stage_fault: u8::arbitrary(g) % 8 == 0,
         }
@@ -613,18 +414,38 @@ impl Arbitrary for TraceEvent {
 #[derive(Clone, Debug)]
 pub(crate) struct Trace {
     events: Vec<TraceEvent>,
+    ttl: Option<u16>,
+    clock: u8,
+    cut: u8,
 }
 
 impl Arbitrary for Trace {
     fn arbitrary(g: &mut Gen) -> Self {
         Self {
             events: capped_vec(g, MAX_TRACE_OPS),
+            ttl: Option::arbitrary(g),
+            clock: u8::arbitrary(g),
+            cut: u8::arbitrary(g),
         }
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         // Shortening the trace is the highest-value reduction.
-        Box::new(self.events.shrink().map(|events| Self { events }))
+        let base = self.clone();
+        let events = self.events.shrink().map(move |events| Self {
+            events,
+            ..base.clone()
+        });
+        let base = self.clone();
+        let clock = (self.ttl, self.clock, self.cut)
+            .shrink()
+            .map(move |(ttl, clock, cut)| Self {
+                ttl,
+                clock,
+                cut,
+                ..base.clone()
+            });
+        Box::new(events.chain(clock))
     }
 }
 
@@ -635,10 +456,6 @@ type PlannedStage = (u8, Vec<((u8, u8), Mutation)>, Vec<u8>);
 
 /// One event's stage plan, grouped by collection.
 type StagePlan = Vec<PlannedStage>;
-
-/// One collection's blind-write plan entry: the pool slot and its collapsed
-/// `((section idx, coord), mutation)` cell set (blind writes carry no clears).
-type PlannedBlind = (u8, Vec<((u8, u8), Mutation)>);
 
 /// Groups an event's flat writes by collection (first-seen order, repeats of a
 /// cell collapsed last-writer-wins) and merges in its durable clears — a
@@ -702,60 +519,6 @@ fn pooled_collections() -> Result<(Vec<CollectionId>, Vec<CollectionRef>)> {
     Ok((ids, refs))
 }
 
-/// Asserts every non-skipped pooled collection is fully resolved (no
-/// provisional lingers) and each modelled cell projects its committed value.
-/// `skip[i]` marks a collection with a deliberately lingering (deferred)
-/// stage: reading it would first-touch-resolve the cells and destroy the very
-/// shape the deferral exists to exercise, so its checks wait for resolution.
-async fn assert_converged<S>(
-    store: &S,
-    ids: &[CollectionId],
-    model: &[BTreeMap<(u8, u8), Option<Bytes>>],
-    skip: &[bool],
-) -> Result<bool>
-where
-    S: CellStore,
-{
-    // A probe event distinct from every trace event so own-event never
-    // short-circuits.
-    let probe = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX / 2),
-    };
-    for (slot, (id, expected)) in ids.iter().zip(model).enumerate() {
-        if skip[slot] {
-            continue;
-        }
-        // Check raw provisional state first — `get` would resolve a lingering
-        // provisional cell and mask a non-convergence.
-        if provisional_count(store, id).await? != 0 {
-            return Ok(false);
-        }
-        for (&(s, c), value) in expected {
-            let committed = store.get(id, &cell_in(s, c), probe).await?;
-            if committed.into_inner() != *value {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
-}
-
-/// The number of still-provisional cells in a collection (the public,
-/// non-resolving way to observe staged state).
-async fn provisional_count<S>(store: &S, id: &CollectionId) -> Result<usize>
-where
-    S: CellStore,
-{
-    let stream = store.provisional_cells(id);
-    futures::pin_mut!(stream);
-    let mut count = 0usize;
-    while let Some(item) = stream.next().await {
-        item?;
-        count += 1;
-    }
-    Ok(count)
-}
-
 /// The per-collection staged state an event produces: for each touched
 /// collection, its pool index, the `(cell, write)` set staged atomically, and
 /// the frozen [`SectionClear`]s its marker carries.
@@ -783,7 +546,7 @@ type StagedWrites = Vec<(u8, Vec<(CellKey, ProvisionalWrite)>, Vec<SectionClear>
 async fn stage_event<S>(
     store: &S,
     refs: &[CollectionRef],
-    staged: &StagePlan,
+    staged: &[PlannedStage],
     model: &[BTreeMap<(u8, u8), Option<Bytes>>],
     event: EventRef,
     split: bool,
@@ -792,12 +555,25 @@ async fn stage_event<S>(
 where
     S: CellStore,
 {
+    let mut touched: Vec<_> = staged
+        .iter()
+        .map(|(slot, ..)| {
+            let id = refs[usize::from(*slot)].id();
+            (id.state_type(), id.name().clone())
+        })
+        .collect();
+    touched.sort_unstable();
+    let dedup = match event {
+        EventRef::Message { dedup_id } => Some(dedup_id),
+        EventRef::Timer(_) => None,
+    };
+    let evidence = evidence(touched.into(), dedup);
     let mut staged_writes = Vec::with_capacity(staged.len());
     for (coll, cells, cleared) in staged {
         let mut cell_writes: Vec<(CellKey, ProvisionalWrite)> = Vec::with_capacity(cells.len());
         for &((s, c), mutation) in cells {
             let key = cell_in(s, c);
-            let prev = store.get(refs[*coll as usize].id(), &key, event).await?;
+            let prev = store.get(refs[*coll as usize].id(), &key).await?;
             if !stale_prev_ok[*coll as usize]
                 && prev.get().cloned() != model[*coll as usize].get(&(s, c)).cloned().flatten()
             {
@@ -811,7 +587,7 @@ where
             .iter()
             .map(|&s| SectionClear::frozen(SECTIONS[s as usize], &cell_writes))
             .collect();
-        let marker = EventMarker::frozen(event, &cell_writes, &clears);
+        let marker = EventMarker::frozen(event, &cell_writes, &clears, &evidence);
         let collection = &refs[*coll as usize];
         if split && cell_writes.len() >= 2 {
             let mid = cell_writes.len() / 2;
@@ -831,491 +607,11 @@ where
     Ok(Some(staged_writes))
 }
 
-/// One collection's lingering (deferred) stage: its staged writes (whose
-/// `prev`s a rollback restores), whether the owning event committed, and
-/// whether the stage lingers over the **warm** in-process store (a settle
-/// failure) rather than a crash rebuild — warm deferral is what makes a stale
-/// warm prev-read reachable on the next restage.
-struct Deferred {
-    writes: Vec<(CellKey, ProvisionalWrite)>,
-    committed: bool,
-    warm: bool,
-}
-
-/// Tracks committed values, unsettled markers, and deferred stages.
-struct TraceState {
-    model: Vec<BTreeMap<(u8, u8), Option<Bytes>>>,
-    marker_model: Vec<Option<(u128, RowKeys, ClearMap)>>,
-    deferred: Vec<Option<Deferred>>,
-}
-
-impl TraceState {
-    fn new() -> Self {
-        Self {
-            model: vec![BTreeMap::new(); POOL as usize],
-            marker_model: vec![None; POOL as usize],
-            deferred: (0..POOL).map(|_| None).collect(),
-        }
-    }
-
-    /// Applies the rollback outcome to the model: each staged cell's
-    /// coordinate becomes the **staged prev** — exactly what
-    /// `abort_provisional` / first-touch rollback durably restores. Normally
-    /// a no-op (the staged prev was checked equal to the model); in the
-    /// accepted warm unsettled-clear window it faithfully captures the
-    /// restage's stale-read rollback.
-    fn apply_rollback(&mut self, slot: usize, writes: &[(CellKey, ProvisionalWrite)]) {
-        for (cell, write) in writes {
-            let key = (i8::from(cell.section).cast_unsigned(), coord_of(cell));
-            self.model[slot].insert(key, write.prev().cloned());
-        }
-    }
-
-    /// Advances the model for a committed event's clears + staged mutations:
-    /// every modelled cell of a cleared section reads absent (the gap erase —
-    /// kept as an explicit `None` so convergence verifies erasure via `get`),
-    /// then the staged mutations land (survivors return).
-    fn apply_committed(&mut self, slot: usize, cells: &[((u8, u8), Mutation)], cleared: &[u8]) {
-        for &s in cleared {
-            for ((sect, _), value) in &mut self.model[slot] {
-                if *sect == s {
-                    *value = None;
-                }
-            }
-        }
-        for &((s, c), mutation) in cells {
-            self.model[slot].insert((s, c), mutation.value());
-        }
-    }
-
-    /// Models clear resolution before a resolved write.
-    ///
-    /// The model settles an unsettled section clear before it writes cells.
-    /// unsettled (the boundary no-ops on it), so this leaves `deferred[slot]`
-    /// intact for the later resolution — the caller then trims the
-    /// blind-overwritten cells from it. Mirrors `note_read_help`, but per-slot
-    /// and deferral-settling.
-    fn apply_write_help(&mut self, slot: usize) {
-        if self.marker_model[slot]
-            .as_ref()
-            .is_some_and(|(_, _, clears)| !clears.is_empty())
-        {
-            if let Some(d) = self.deferred[slot].take()
-                && !d.committed
-            {
-                self.apply_rollback(slot, &d.writes);
-            }
-            self.marker_model[slot] = None;
-        }
-    }
-
-    /// Issues one event's blind resolved writes against `store` (the
-    /// mid-handler `commit()` / `ReadUncommitted` direct apply) and keeps
-    /// the model in step. Grouped by collection (last-writer-wins per
-    /// cell); each collection's write settles any unsettled marker with clears
-    /// in the model ([`Self::apply_write_help`]) before the cells
-    /// land, then the blind cells advance the model. A clears-FREE marker's
-    /// deferral survives the boundary no-op, so the blind-overwritten cells
-    /// are trimmed from it — the marker's eventual resolution drops them
-    /// via the ownership check (sound on both verdict arms — the blind ops
-    /// carry no clears).
-    async fn apply_blind_writes<S>(
-        &mut self,
-        store: &FailingCellStore<S>,
-        refs: &[CollectionRef],
-        blind: &[(u8, u8, u8, Mutation)],
-    ) -> Result<()>
-    where
-        S: CellStore,
-    {
-        let mut plan: Vec<PlannedBlind> = Vec::new();
-        for &(coll, s, c, mutation) in blind {
-            match plan.iter_mut().find(|(p, _)| *p == coll) {
-                Some((_, cells)) => collapse_cell_into(cells, (s, c), mutation),
-                None => plan.push((coll, vec![((s, c), mutation)])),
-            }
-        }
-        for (coll, cells) in &plan {
-            let slot = *coll as usize;
-            self.apply_write_help(slot);
-            let resolved: Vec<(CellKey, Option<Bytes>)> = cells
-                .iter()
-                .map(|&((s, c), mutation)| (cell_in(s, c), mutation.value()))
-                .collect();
-            store.write_resolved(&refs[slot], &resolved, &[]).await?;
-            for &((s, c), mutation) in cells {
-                self.model[slot].insert((s, c), mutation.value());
-            }
-            if let Some(d) = self.deferred[slot].as_mut() {
-                d.writes
-                    .retain(|(cell, _)| !cells.iter().any(|&((s, c), _)| cell_in(s, c) == *cell));
-            }
-        }
-        Ok(())
-    }
-
-    /// Removes markers that convergence reads must resolve.
-    fn note_read_help(&mut self) {
-        for slot in 0..self.deferred.len() {
-            if self.deferred[slot].is_none()
-                && !self.model[slot].is_empty()
-                && self.marker_model[slot]
-                    .as_ref()
-                    .is_some_and(|(_, _, clears)| !clears.is_empty())
-            {
-                self.marker_model[slot] = None;
-            }
-        }
-    }
-
-    /// Resolves every lingering deferral in the model (a sweep settled them
-    /// all): an uncommitted deferral rolls back to its staged prevs, a
-    /// committed one already advanced the model at its flush.
-    fn resolve_deferrals(&mut self) {
-        for slot in 0..self.deferred.len() {
-            if let Some(d) = self.deferred[slot].take()
-                && !d.committed
-            {
-                self.apply_rollback(slot, &d.writes);
-            }
-        }
-    }
-
-    /// The crash arm: recovers the freshly rebuilt `store` along the event's
-    /// generated recovery path, keeping the models in step.
-    async fn recover_crash<S>(
-        &mut self,
-        store: &FailingCellStore<S>,
-        oracle: &ScriptedOracle,
-        refs: &[CollectionRef],
-        staged_writes: &StagedWrites,
-        ev: &TraceEvent,
-        index: usize,
-    ) -> Result<bool>
-    where
-        S: CellStore,
-    {
-        // Any warm deferral is now cold: the rebuild dropped the in-process
-        // cache, so subsequent reads resolve durably.
-        for d in self.deferred.iter_mut().flatten() {
-            d.warm = false;
-        }
-        match ev.recovery {
-            Recovery::Sweep => {
-                for r in refs {
-                    if !sweep_provisional(store, oracle, r).await? {
-                        return Ok(false);
-                    }
-                }
-                // The sweep's marker leg resolves every unsettled marker —
-                // this event's stage AND any earlier deferral. A committed
-                // marker's clear half applies its gaps here (the model
-                // already advanced at flush).
-                self.resolve_deferrals();
-                if !ev.outcome.marker_flushed() {
-                    for (coll, cell_writes, _) in staged_writes {
-                        self.apply_rollback(*coll as usize, cell_writes);
-                    }
-                }
-                self.marker_model.fill(None);
-            }
-            Recovery::FirstTouch => {
-                // First-touch under a fresh event so own-event never
-                // short-circuits; the read resolves each staged provisional
-                // cell. A clears-free marker lingers (first-touch is
-                // marker-free — the over-report the model keeps); a
-                // marker with clears is resolved complete by the first get
-                // (clear resolution), which `note_read_help` accounts for after the
-                // convergence pass.
-                let recovery_event = EventRef::Message {
-                    dedup_id: Uuid::from_u128(u128::MAX - index as u128),
-                };
-                for (coll, cell_writes, _) in staged_writes {
-                    for (cell, _) in cell_writes {
-                        store
-                            .get(refs[*coll as usize].id(), cell, recovery_event)
-                            .await?;
-                    }
-                }
-                if !ev.outcome.marker_flushed() {
-                    for (coll, cell_writes, _) in staged_writes {
-                        self.apply_rollback(*coll as usize, cell_writes);
-                    }
-                }
-            }
-            Recovery::Defer => {
-                // No recovery: the stage lingers into subsequent events
-                // (cold — the rebuild models the fresh assignee). The
-                // unsettled marker's clear half is asserted by the probe while
-                // it lingers.
-                for (coll, cell_writes, _) in staged_writes {
-                    self.deferred[*coll as usize] = Some(Deferred {
-                        writes: cell_writes.clone(),
-                        committed: ev.outcome.marker_flushed(),
-                        warm: false,
-                    });
-                }
-            }
-        }
-        Ok(true)
-    }
-
-    /// The non-crash settle arms: clean promote, clean rollback, or the
-    /// poisoned settle failure at its generated [`FaultDepth`].
-    async fn settle<S>(
-        &mut self,
-        store: &FailingCellStore<S>,
-        oracle: &ScriptedOracle,
-        lower: &PoisonHandle,
-        refs: &[CollectionRef],
-        staged_writes: &StagedWrites,
-        ev: &TraceEvent,
-    ) -> Result<bool>
-    where
-        S: CellStore,
-    {
-        for (coll, cell_writes, clears) in staged_writes {
-            let slot = *coll as usize;
-            match ev.outcome {
-                Outcome::SettleFailure(depth) => {
-                    // Committed, then the settle fails under the armed poison
-                    // — the unsettled-clear window over the WARM store.
-                    // `Wrapper` fires outside the store under test (the settle
-                    // provably never reaches it: durable state and any warm
-                    // entries stay exactly as staged); `Lower` fires beneath
-                    // any cache (a `Cached` instantiation runs its transform
-                    // and section deletes before the lower store rejects).
-                    // Injected faults are not runtime errors: the armed settle
-                    // MUST return `Err` — an `Ok` is a red property.
-                    let poison = Poison::Collection(
-                        refs[slot].id().name().clone(),
-                        ErrorCategory::Transient,
-                    );
-                    match depth {
-                        FaultDepth::Wrapper => store.set_poison(Some(poison)),
-                        FaultDepth::Lower => *lower.lock() = Some(poison),
-                    }
-                    let settled = store
-                        .commit_provisional(&refs[slot], cell_writes, clears)
-                        .await;
-                    store.set_poison(None);
-                    *lower.lock() = None;
-                    if settled.is_ok() {
-                        return Ok(false);
-                    }
-                    if depth == FaultDepth::Lower && !clears.is_empty() {
-                        // Directed post-failure reads: the pre-call repairs
-                        // (the settle transform + the scoped section deletes)
-                        // mean a Lower-depth apply failure leaves every read
-                        // of the cleared sections serving marker-resolved
-                        // truth — a warm staged cell holds the verdict's
-                        // `data`, an evicted one falls through and
-                        // clear resolution-resolves (the model advanced at flush —
-                        // committed ⇒ post-clear values); a wrong, missing, or
-                        // late repair serves stale pre-clear values ⇒
-                        // divergence.
-                        let probe = EventRef::Message {
-                            dedup_id: Uuid::from_u128(u128::MAX / 2),
-                        };
-                        for clear in clears {
-                            let s = section_slot(clear.section());
-                            for c in 0..CRASH_CELLS {
-                                let got = store
-                                    .get(refs[slot].id(), &cell_in(s, c), probe)
-                                    .await?
-                                    .into_inner();
-                                let want = self.model[slot].get(&(s, c)).cloned().flatten();
-                                if got != want {
-                                    return Ok(false);
-                                }
-                            }
-                        }
-                        // Warm staged cells never reach the lower store, so
-                        // the reads alone may leave the marker unsettled (the
-                        // commit-warmth contract); resolve it the way
-                        // production does — the armed sweep — which is a
-                        // no-op where a fall-through read already settled it.
-                        sweep_provisional(store, oracle, &refs[slot]).await?;
-                        self.marker_model[slot] = None;
-                    } else {
-                        self.deferred[slot] = Some(Deferred {
-                            writes: cell_writes.clone(),
-                            committed: true,
-                            warm: true,
-                        });
-                    }
-                }
-                Outcome::CleanCommitted => {
-                    // Promote through the settle path (publishes `data` and
-                    // applies the clears' gap erase); the settle deletes the
-                    // collection's marker.
-                    store
-                        .commit_provisional(&refs[slot], cell_writes, clears)
-                        .await?;
-                    self.marker_model[slot] = None;
-                }
-                _ => {
-                    // Clean inline rollback through the settle path (restores
-                    // each staged prev; clears staged nothing destructive, so
-                    // rollback needs no clear leg); the settle deletes the
-                    // marker.
-                    store.abort_provisional(&refs[slot], cell_writes).await?;
-                    self.marker_model[slot] = None;
-                    self.apply_rollback(slot, cell_writes);
-                }
-            }
-        }
-        Ok(true)
-    }
-}
-
-/// The per-event physical-shape assertions, all raw probe reads:
-///
-/// * **Row absence** (skipped for deferred collections — their rows are
-///   legitimately provisional): the stored `kind=Cell` rows equal the model's
-///   present set exactly, so a residue row or a lost row both surface — and a
-///   committed clear whose gaps never landed shows up as extra rows.
-/// * **Marker shape** (always): the unsettled event marker matches the model —
-///   owning event, frozen staged row keys, AND the payload's clear half — or is
-///   absent.
-/// * **Marker completeness** (always — the universal marker-first invariant):
-///   every physically provisional row is listed by the unsettled marker; with
-///   no marker unsettled, no provisional row exists. A violation is a strand.
-async fn assert_physical<P>(probe: &P, ids: &[CollectionId], state: &TraceState) -> Result<bool>
-where
-    P: ShapeProbe,
-{
-    for (slot, id) in ids.iter().enumerate() {
-        if state.deferred[slot].is_none() {
-            let present: RowKeys = state.model[slot]
-                .iter()
-                .filter(|(_, value)| value.is_some())
-                .map(|(&(s, c), _)| row_key(&cell_in(s, c)))
-                .collect();
-            if probe.cell_rows(id).await? != present {
-                return Ok(false);
-            }
-        }
-        let observed = probe.unsettled_marker(id).await?;
-        let expected = state.marker_model[slot]
-            .as_ref()
-            .map(|(index, staged, clears)| {
-                (
-                    EventRef::Message {
-                        dedup_id: Uuid::from_u128(*index),
-                    },
-                    staged.clone(),
-                    clears.clone(),
-                )
-            });
-        if observed != expected {
-            return Ok(false);
-        }
-        let provisional = probe.provisional_rows(id).await?;
-        match &observed {
-            Some((_, listed, _)) => {
-                if !provisional.is_subset(listed) {
-                    return Ok(false);
-                }
-            }
-            None => {
-                if !provisional.is_empty() {
-                    return Ok(false);
-                }
-            }
-        }
-    }
-    Ok(true)
-}
-
-/// The per-event closing pass: convergence + row shape wait for deferred
-/// collections; marker shape and marker completeness never wait (read-only
-/// probes). The convergence pass's own reads resolve prior event markers with
-/// clears (clear resolution), which `note_read_help` folds into the marker
-/// model before the physical probe.
-async fn assert_event_end<S, P>(
-    store: &S,
-    ids: &[CollectionId],
-    probe: &P,
-    state: &mut TraceState,
-) -> Result<bool>
-where
-    S: CellStore,
-    P: ShapeProbe,
-{
-    let skip: Vec<bool> = state.deferred.iter().map(Option::is_some).collect();
-    if !assert_converged(store, ids, &state.model, &skip).await? {
-        return Ok(false);
-    }
-    state.note_read_help();
-    assert_physical(probe, ids, state).await
-}
-
-/// The stage-fault arm: attempts one collection's stage with the lower fault
-/// seam armed (`Poison::WriteProvisional`, transient), requiring the stage to
-/// be rejected — the injected fault is not a runtime error: an `Ok` is a red
-/// property. Prevs come from the model, never from store reads — a prev-read
-/// could first-touch-resolve a lingering prior event stage the fault must leave
-/// lingering; the rejected write lands nothing, so the staged prevs are never
-/// observed.
-async fn reject_stage<S>(
-    store: &FailingCellStore<S>,
-    lower: &PoisonHandle,
-    refs: &[CollectionRef],
-    state: &TraceState,
-    event: EventRef,
-    (coll, cells, cleared): &PlannedStage,
-) -> Result<bool>
-where
-    S: CellStore,
-{
-    let slot = *coll as usize;
-    let cell_writes: Vec<(CellKey, ProvisionalWrite)> = cells
-        .iter()
-        .map(|&((s, c), mutation)| {
-            let prev = Committed::new(state.model[slot].get(&(s, c)).cloned().flatten());
-            (
-                cell_in(s, c),
-                ProvisionalWrite::new(mutation.value(), prev, event),
-            )
-        })
-        .collect();
-    let clears: Vec<SectionClear> = cleared
-        .iter()
-        .map(|&s| SectionClear::frozen(SECTIONS[s as usize], &cell_writes))
-        .collect();
-    let marker = EventMarker::frozen(event, &cell_writes, &clears);
-    *lower.lock() = Some(Poison::WriteProvisional(
-        refs[slot].id().name().clone(),
-        ErrorCategory::Transient,
-    ));
-    let attempted = store
-        .write_provisional(&refs[slot], &cell_writes, Some(&marker))
-        .await;
-    *lower.lock() = None;
-    Ok(attempted.is_err())
-}
-
-/// Compares each generated operation with the committed-state model.
-///
-/// A simulated crash rebuilds the store over the same durable state.
-/// The final recovery must remove all unsettled state.
-///
-/// The trace checks these invariants after every event:
-/// - The committed projection equals the model for every collection without a
-///   deferred settle, and for every collection after the final recovery.
-/// - The unsettled marker model (owner, staged set, clears) satisfies the
-///   marker-completeness postcondition (`assert_physical`).
-/// - A section clear removes only non-survivor cells, and the clear's delete
-///   runs before the new writes land.
-/// - A write that lands after a committed clear survives the clear's resolution
-///   (the `blind` dimension).
-/// - After a `SettleFailure`, later reads and the sweep repair the state.
-///
-/// A final sweep and assertion pass closes every trace.
+/// A crash preserves the last committed value across every collection.
+/// Admission resolves each stage from durable evidence before the next event.
 pub(crate) async fn run_crash_equivalence_trace<S, F, P>(
     make_store: F,
-    oracle: ScriptedOracle,
+    dedup: MemoryDeduplicationStore,
     trace: Trace,
     probe: &P,
 ) -> Result<bool>
@@ -1324,207 +620,122 @@ where
     F: Fn(&PoisonHandle) -> Result<S>,
     P: ShapeProbe,
 {
+    use crate::state::manager::Admission;
+    use crate::state::tests::support::admit_registered;
     let (ids, refs) = pooled_collections()?;
-    let poison: PoisonHandle = Arc::default();
     let lower: PoisonHandle = Arc::default();
-    let mut store = FailingCellStore::with_handle(make_store(&lower)?, poison.clone());
-    let mut state = TraceState::new();
+    let mut store = make_store(&lower)?;
+    stage_clock_crash(&store, &dedup, &trace).await?;
+    let mut model = vec![BTreeMap::new(); POOL as usize];
+    let mut certificates = vec![None; POOL as usize];
 
     for (index, ev) in trace.events.into_iter().enumerate() {
-        let dedup_id = Uuid::from_u128(index as u128);
-        let event = EventRef::Message { dedup_id };
-
-        // Blind resolved writes run at the TOP of the event, before any stage —
-        // the mid-handler `commit()` / `ReadUncommitted` direct apply — so each
-        // lands after the write-side boundary resolves any unsettled
-        // marker with clears (the defect this phase closes).
-        state.apply_blind_writes(&store, &refs, &ev.blind).await?;
-
-        // Mid-fan-out tears at CELL granularity: a whole-cell prefix of the
-        // stage landed, never a torn cell. Model it by dropping the last
-        // touched collection's final cell (the cell whose batch never
-        // committed), then dropping any collection left with neither cells
-        // nor clears. The event marker of a torn stage lists exactly what it
-        // staged, so the marker model uses the same truncated set.
-        let mut staged = event_plan(&ev);
+        let event = EventRef::Message {
+            dedup_id: Uuid::from_u128(index as u128),
+        };
+        ensure!(admit_registered(&store, &dedup, &refs).await? == Admission::Fresh);
+        for &(collection, section, coordinate, mutation) in &ev.blind {
+            let slot = usize::from(collection);
+            store
+                .write_resolved(
+                    &refs[slot],
+                    &[(cell_in(section, coordinate), mutation.value())],
+                    &[],
+                )
+                .await?;
+            model[slot].insert((section, coordinate), mutation.value());
+        }
+        let mut planned = event_plan(&ev);
         if ev.outcome.mid_fan_out() {
-            if let Some((_, cells, _)) = staged.last_mut() {
+            if let Some((_, cells, _)) = planned.last_mut() {
                 cells.pop();
             }
-            staged.retain(|(_, cells, cleared)| !cells.is_empty() || !cleared.is_empty());
+            planned.retain(|(_, cells, clears)| !cells.is_empty() || !clears.is_empty());
         }
-
-        // Stage fault: the event's first planned stage is rejected at the
-        // lower store and the event is never dispatched — every model stays
-        // untouched. Decided before the deferral-take below (a rejected
-        // stage's boundary resolve never reached the bottom store, so a
-        // lingering prior event stage still lingers). The convergence and
-        // physical passes still run: this is where a phantom publish or a
-        // lost unsettled marker would surface.
         if ev.stage_fault
-            && let Some(plan) = staged.first()
+            && let Some((collection, ..)) = planned.first()
         {
-            if !reject_stage(&store, &lower, &refs, &state, event, plan).await?
-                || !assert_event_end(&store, &ids, probe, &mut state).await?
-            {
-                return Ok(false);
-            }
-            continue;
+            *lower.lock() = Some(Poison::WriteProvisional(
+                refs[usize::from(*collection)].id().name().clone(),
+                ErrorCategory::Transient,
+            ));
+            let stage = stage_event(
+                &store,
+                &refs,
+                &planned[..1],
+                &model,
+                event,
+                ev.split,
+                &[false; POOL as usize],
+            )
+            .await;
+            *lower.lock() = None;
+            ensure!(
+                stage.is_err(),
+                "the stage fault did not reach the lower store"
+            );
+            planned.clear();
         }
-
-        // Restaging a deferred collection resolves its lingering stage — the
-        // prev-reads first-touch-resolve overlapping cells (clear resolution resolves
-        // a marker with clears whole) and the stage boundary mops up the
-        // rest, so apply the deferred verdict to the model before the prev
-        // check. A warm deferral additionally permits a stale prev-read (see
-        // `stage_event`).
-        let mut stale_prev_ok = vec![false; POOL as usize];
-        for (coll, ..) in &staged {
-            if let Some(d) = state.deferred[*coll as usize].take() {
-                stale_prev_ok[*coll as usize] = d.warm;
-                if !d.committed {
-                    state.apply_rollback(*coll as usize, &d.writes);
-                }
-            }
-        }
-
-        // Stage each collection's cell set over its committed base
-        // (prev-is-committed at stage time). Keep the staged
-        // `(cell, ProvisionalWrite)` set + frozen clears per collection so the
-        // settle arms run through `commit_provisional` / `abort_provisional`
-        // in one call too (carrying the projection the write-through cache
-        // publishes).
-        let Some(staged_writes) = stage_event(
+        let staged = stage_event(
             &store,
             &refs,
-            &staged,
-            &state.model,
+            &planned,
+            &model,
             event,
             ev.split,
-            &stale_prev_ok,
+            &[false; POOL as usize],
         )
         .await?
-        else {
-            return Ok(false);
-        };
-        // Each stage overwrites any lingering prior event marker with this event's
-        // marker listing its full staged set and clear half.
-        for (coll, cell_writes, clears) in &staged_writes {
-            let (staged_set, clear_map) =
-                probed_parts(&EventMarker::frozen(event, cell_writes, clears));
-            state.marker_model[*coll as usize] = Some((index as u128, staged_set, clear_map));
-        }
-
-        // Commit marker strictly after staging; advance the model for
-        // committed clears + cells (a committed clear's section reads absent
-        // even while its gaps are still unapplied — reads are marker-resolved
-        // truth).
-        if ev.outcome.marker_flushed() {
-            oracle.record_message(dedup_id).await?;
-            for (coll, cells, cleared) in &staged {
-                state.apply_committed(*coll as usize, cells, cleared);
-            }
-        }
-
-        // Resolve along the outcome's path.
-        if ev.outcome.is_crash() {
-            // Crash = a cold store over the same warm backing.
-            store = FailingCellStore::with_handle(make_store(&lower)?, poison.clone());
-            if !state
-                .recover_crash(&store, &oracle, &refs, &staged_writes, &ev, index)
-                .await?
-            {
-                return Ok(false);
-            }
-        } else if !state
-            .settle(&store, &oracle, &lower, &refs, &staged_writes, &ev)
-            .await?
+        .ok_or_else(|| eyre!("stage read differs from the committed model"))?;
+        let mut committed = false;
+        if ev.outcome.marker_flushed()
+            && let Some((collection, writes, _)) = staged.first()
         {
-            return Ok(false);
+            committed = promote_prefix(
+                &store,
+                &refs[usize::from(*collection)],
+                writes,
+                usize::from(ev.split) + 1,
+            )
+            .await?;
         }
-
-        if !assert_event_end(&store, &ids, probe, &mut state).await? {
-            return Ok(false);
+        if committed {
+            commit_model(&planned, &mut model, &mut certificates, event);
+        }
+        if ev.outcome.is_crash() {
+            store = make_store(&lower)?;
+        }
+        ensure!(admit_registered(&store, &dedup, &refs).await? == Admission::Fresh);
+        assert_crash_state(&store, probe, &ids, &model, &certificates).await?;
+        if committed {
+            ensure!(
+                dedup.exists(Uuid::from_u128(index as u128)).await?,
+                "admit did not retire the committed message"
+            );
         }
     }
-
-    // Final settle-everything pass: sweep every collection, resolve remaining
-    // deferrals in the model, then run the full convergence + shape
-    // assertions — no trace ends unchecked.
-    for r in &refs {
-        if !sweep_provisional(&store, &oracle, r).await? {
-            return Ok(false);
-        }
-    }
-    state.resolve_deferrals();
-    state.marker_model.fill(None);
-    let none = vec![false; POOL as usize];
-    if !assert_converged(&store, &ids, &state.model, &none).await? {
-        return Ok(false);
-    }
-    assert_physical(probe, &ids, &state).await
+    Ok(true)
 }
 
-/// Proves that a resolved write survives an earlier unsettled section clear.
-///
-/// The store resolves the clear before it writes the new cell.
-/// timestamp and erases the blind cell (the falsification: remove the boundary
-/// from the store under test → the survival assertion makes this test fail).
-pub(crate) async fn run_blind_write_survives_stale_clear<S>(
-    store: S,
-    oracle: ScriptedOracle,
-) -> Result<()>
-where
-    S: CellStore,
-{
-    let (_ids, refs) = pooled_collections()?;
-    let event_a = EventRef::Message {
-        dedup_id: Uuid::from_u128(1),
-    };
-
-    // Stage collection 0's committed marker with clears and leave it unsettled
-    // (do NOT settle) — exactly the shape a failed settle leaves behind.
-    let survivor = cell_in(0, 0);
-    let prev = store.get(refs[0].id(), &survivor, event_a).await?;
-    let writes = vec![(
-        survivor.clone(),
-        ProvisionalWrite::new(Some(bytes(1)), prev, event_a),
-    )];
-    let clears = vec![SectionClear::frozen(SECTIONS[0], &writes)];
-    let marker = EventMarker::frozen(event_a, &writes, &clears);
-    store
-        .write_provisional(&refs[0], &writes, Some(&marker))
-        .await?;
-    oracle.record_message(Uuid::from_u128(1)).await?;
-
-    // Blind-write a NON-survivor coordinate of the cleared section. With the
-    // boundary, marker A resolves first (its gap erase runs before this cell
-    // exists), then this cell lands on top.
-    let blind = cell_in(0, 5);
-    store
-        .write_resolved(&refs[0], &[(blind.clone(), Some(bytes(9)))], &[])
-        .await?;
-
-    // Resolve the marker the way production does; with the boundary the marker
-    // is already gone (a no-op), without it the erasing clears replay HERE.
-    sweep_provisional(&store, &oracle, &refs[0]).await?;
-
-    let probe = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX / 2),
-    };
-    ensure!(
-        store.get(refs[0].id(), &blind, probe).await?.into_inner() == Some(bytes(9)),
-        "blind write erased by a stale clears replay"
-    );
-    ensure!(
-        store
-            .get(refs[0].id(), &survivor, probe)
-            .await?
-            .into_inner()
-            == Some(bytes(1)),
-        "the staged survivor did not promote to its committed value"
-    );
-    Ok(())
+/// Applies one committed event to the reference model.
+fn commit_model(
+    planned: &[PlannedStage],
+    model: &mut [BTreeMap<(u8, u8), Option<Bytes>>],
+    certificates: &mut [Option<EventRef>],
+    event: EventRef,
+) {
+    for (collection, cells, clears) in planned {
+        let slot = usize::from(*collection);
+        for ((section, _), value) in &mut model[slot] {
+            if clears.contains(section) {
+                *value = None;
+            }
+        }
+        for &((section, coordinate), mutation) in cells {
+            model[slot].insert((section, coordinate), mutation.value());
+        }
+        certificates[slot] = Some(event);
+    }
 }
 
 /// Proves that a resolved write does not settle a marker without section
@@ -1546,12 +757,12 @@ where
     // Stage a clears-FREE marker; the commit is deliberately NOT recorded (a
     // clears-free marker is never consulted, so the verdict is irrelevant).
     let staged = cell_in(0, 0);
-    let prev = store.get(id, &staged, event_a).await?;
+    let prev = store.get(id, &staged).await?;
     let writes = vec![(
         staged.clone(),
         ProvisionalWrite::new(Some(bytes(1)), prev, event_a),
     )];
-    let marker = EventMarker::frozen(event_a, &writes, &[]);
+    let marker = EventMarker::frozen(event_a, &writes, &[], &evidence([].into(), None));
     store
         .write_provisional(&refs[0], &writes, Some(&marker))
         .await?;
@@ -1579,220 +790,13 @@ where
     // The blind cell reads back, and the marker STILL stands after the read
     // (clear resolution leaves clears-free markers unsettled too — parity with
     // reads).
-    let read_event = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX / 2),
-    };
     ensure!(
-        store.get(id, &blind, read_event).await?.into_inner() == Some(bytes(9)),
+        store.get(id, &blind).await?.into_inner() == Some(bytes(9)),
         "the blind write did not read back"
     );
     ensure!(
         probe.unsettled_marker(id).await? == Some((event_a, expected_staged, expected_clears)),
         "reading a clears-free marker's collection must leave it unsettled"
-    );
-    Ok(())
-}
-
-/// Stages the defect shape a deferred repair must survive, shared by the two
-/// repair-provenance tests below: seed `x` = resolved `bytes(7)`, stage event F
-/// over `{x}` then RESTAGE F over `{y}` (the same-event restage overwrites F's
-/// marker WITHOUT resolving it — the stage boundary resolves only prior event
-/// markers — so `x` is left provisional and UNLISTED by any marker), then stage
-/// event E over survivor `s` whose marker clears `SECTIONS[0]` (E's
-/// stage boundary aborts the now-prior event `F:{y}` marker; `x` stays
-/// untouched and unlisted). F is never recorded (it crashed before its dedup
-/// record), so its verdict is `NotCommitted`. Returns `(x, s, event_e)`.
-///
-/// Expressing the same-event restage with divergent staged sets in the
-/// `Trace`/`CellModel` generator is structural surgery (unlisted-cell
-/// bookkeeping the model does not carry), so this invariant is verified
-/// deterministically here rather than folded into the crash/overwrite property.
-pub(crate) async fn stage_deferred_repair_shape<S>(
-    store: &S,
-    cref: &CollectionRef,
-) -> Result<(CellKey, CellKey, EventRef)>
-where
-    S: CellStore,
-{
-    let id = cref.id();
-    let event_f = EventRef::Message {
-        dedup_id: Uuid::from_u128(1),
-    };
-    let event_e = EventRef::Message {
-        dedup_id: Uuid::from_u128(2),
-    };
-    let x = cell_in(0, 5);
-    let y = cell_in(0, 3);
-    let s = cell_in(0, 0);
-
-    // Seed x = resolved bytes(7) (no marker unsettled → the clear resolution
-    // boundary is a no-op), then read the still-clean bases before any
-    // provisional stage.
-    store
-        .write_resolved(cref, &[(x.clone(), Some(bytes(7)))], &[])
-        .await?;
-    let prev_x = store.get(id, &x, event_f).await?;
-    let prev_y = store.get(id, &y, event_f).await?;
-    let prev_s = store.get(id, &s, event_e).await?;
-
-    // Stage F over {x}, then restage F over {y}: same-event, so the stage
-    // boundary does not resolve F's own unsettled marker and x is orphaned
-    // provisional, unlisted by the overwriting F:{y} marker.
-    let f_first = vec![(
-        x.clone(),
-        ProvisionalWrite::new(Some(bytes(2)), prev_x, event_f),
-    )];
-    let f_first_marker = EventMarker::frozen(event_f, &f_first, &[]);
-    store
-        .write_provisional(cref, &f_first, Some(&f_first_marker))
-        .await?;
-    let f_second = vec![(
-        y.clone(),
-        ProvisionalWrite::new(Some(bytes(4)), prev_y, event_f),
-    )];
-    let f_second_marker = EventMarker::frozen(event_f, &f_second, &[]);
-    store
-        .write_provisional(cref, &f_second, Some(&f_second_marker))
-        .await?;
-
-    // Stage E over survivor s with a marker with clears: the stage boundary
-    // resolves the now-prior event F:{y} marker (F unrecorded → NotCommitted →
-    // abort), leaving E's marker unsettled and x still orphaned provisional.
-    let e_writes = vec![(
-        s.clone(),
-        ProvisionalWrite::new(Some(bytes(1)), prev_s, event_e),
-    )];
-    let e_clears = vec![SectionClear::frozen(SECTIONS[0], &e_writes)];
-    let e_marker = EventMarker::frozen(event_e, &e_writes, &e_clears);
-    store
-        .write_provisional(cref, &e_writes, Some(&e_marker))
-        .await?;
-
-    Ok((x, s, event_e))
-}
-
-/// Deterministic regression test (both backends): a repair whose payload
-/// predates an unsettled marker with clears must not land after that marker
-/// resolves. Beneath E's committed marker with clears, `resolve_cell`
-/// degrades `x`'s repair to peek semantics (value-only, no durable write), so
-/// E's marker remains unsettled and the marker's own resolution — the committed
-/// positional clear — erases `x` instead of a stale repair resurrecting it.
-///
-/// F committed nothing, E committed. The read of `x` (own = E) declines
-/// clear resolution (own marker) and reaches `resolve_cell`, which defers. The
-/// sweep then resolves E: `s` promotes, the `SECTIONS[0]` gap erase deletes the
-/// non-survivor `x`.
-///
-/// The shape is staged through `stage` — the **prior assignment's** store — so
-/// that `x` never warms the cache above the reading assembly and the
-/// assembly-under-test read of `x` is a genuine cold miss that reaches
-/// `resolve_cell` (a warm hit would serve the correct projection without ever
-/// invoking the guard, so the test would not exercise the fix on a cached
-/// backend). For the bare memory store `stage` and `store` are two handles over
-/// the same cells; for Cassandra `stage` stages under its own marker check
-/// and `store` is the `Cached` assembly of a **fresh cold assignment** over the
-/// same durable rows (a cold presence + cold cache — the post-rebalance
-/// recovery posture), so its reads cold-seed from durable truth.
-///
-/// Proves that an old repair waits for an unsettled section clear.
-pub(crate) async fn run_repair_defers_beneath_stale_clear<St, S, P>(
-    stage: &St,
-    store: S,
-    oracle: ScriptedOracle,
-    probe: &P,
-) -> Result<()>
-where
-    St: CellStore,
-    S: CellStore,
-    P: ShapeProbe,
-{
-    let (_ids, refs) = pooled_collections()?;
-    let cref = &refs[0];
-    let id = cref.id();
-    let (x, s, event_e) = stage_deferred_repair_shape(stage, cref).await?;
-    oracle.record_message(Uuid::from_u128(2)).await?;
-
-    // The own-event read declines clear resolution and reaches the deferred repair:
-    // the prev projection is served with no durable write, so E's marker stands.
-    ensure!(
-        store.get(id, &x, event_e).await?.into_inner() == Some(bytes(7)),
-        "the deferred repair must serve the committed-base projection"
-    );
-    ensure!(
-        probe.unsettled_marker(id).await?.map(|(ev, ..)| ev) == Some(event_e),
-        "the repair must not resolve E's unsettled marker with clears"
-    );
-
-    // Resolving E the way production does replays its positional clear, erasing
-    // the non-survivor x (deferred, never durably repaired) and promoting s.
-    let read = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX / 2),
-    };
-    sweep_provisional(&store, &oracle, cref).await?;
-    ensure!(
-        store.get(id, &x, read).await?.into_inner().is_none(),
-        "the committed clear must erase the deferred repair, not a resurrected row"
-    );
-    ensure!(
-        store.get(id, &s, read).await?.into_inner() == Some(bytes(1)),
-        "the staged survivor must promote to its committed value"
-    );
-    Ok(())
-}
-
-/// Deterministic convergence test (both backends): the deferral wedges nothing
-/// — when the unsettled marker's event aborts, no clear applies and `x`'s
-/// committed projection stays its base, served correctly.
-///
-/// Same shape as [`run_repair_defers_beneath_stale_clear`] but E is never
-/// recorded (`NotCommitted`). The own-event read of `x` defers (E's marker
-/// stands — the falsifiable guard test); the sweep aborts E (survivor `s` rolls
-/// back, no clear) and deletes the marker, so nothing blocks. `x` then projects
-/// its committed base (`bytes(7)`) — no committed clear ever ran, so the defect
-/// shape simply drains.
-///
-/// Proves that repair converges after an unsettled marker aborts.
-///
-/// Both backends must remove the marker and return the committed value.
-pub(crate) async fn run_repair_after_marker_abort_converges<St, S, P>(
-    stage: &St,
-    store: S,
-    oracle: ScriptedOracle,
-    probe: &P,
-) -> Result<()>
-where
-    St: CellStore,
-    S: CellStore,
-    P: ShapeProbe,
-{
-    let (_ids, refs) = pooled_collections()?;
-    let cref = &refs[0];
-    let id = cref.id();
-    let (x, _s, event_e) = stage_deferred_repair_shape(stage, cref).await?;
-    // E is deliberately NOT recorded: the marker resolves NotCommitted.
-
-    ensure!(
-        store.get(id, &x, event_e).await?.into_inner() == Some(bytes(7)),
-        "the deferred repair serves the committed-base projection"
-    );
-    ensure!(
-        probe.unsettled_marker(id).await?.map(|(ev, ..)| ev) == Some(event_e),
-        "the repair must not resolve E's unsettled marker"
-    );
-
-    // The sweep aborts E (no clear applied) and drains the marker; x's
-    // committed projection stays its base.
-    sweep_provisional(&store, &oracle, cref).await?;
-    ensure!(
-        probe.unsettled_marker(id).await?.is_none(),
-        "the abort must resolve E's marker away — the deferral wedges nothing"
-    );
-    let read = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX / 2),
-    };
-    ensure!(
-        store.get(id, &x, read).await?.into_inner() == Some(bytes(7)),
-        "x's committed projection stays its base after the marker aborts"
     );
     Ok(())
 }
@@ -1842,19 +846,12 @@ impl Arbitrary for OverwriteTrace {
     }
 }
 
-/// Drives events that NEVER promote or roll back explicitly: each event reads
-/// its committed base through a **cold** store (`make_store`), so a
-/// predecessor's still-provisional cell is resolved through the oracle — the
-/// implicit-overwrite / first-touch path. A predecessor is resolved either at
-/// the **next stage of its collection** (the stage-boundary resolve of the
-/// unsettled prior event marker) or, when its collection is never re-staged, by
-/// the final read. The staged `prev` must equal the model committed base, and
-/// at the end every cell must equal the model. Both oracle arms run: a
-/// committing predecessor promotes to its `data`, a non-committing one rolls
-/// back to its `prev`.
+/// Admission resolves the previous stage before each overwrite.
+/// A cold store reads the committed base for every new stage.
+/// The final admission must produce the model's values in every collection.
 pub(crate) async fn run_overwrite_trace<S, F>(
     make_store: F,
-    oracle: ScriptedOracle,
+    dedup: MemoryDeduplicationStore,
     trace: OverwriteTrace,
 ) -> Result<bool>
 where
@@ -1871,6 +868,7 @@ where
         // A fresh cold store: reads never hit a warm in-process cache, so every
         // overwrite resolves its predecessor's provisional cell durably.
         let store = make_store()?;
+        admit_collection(&store, &dedup, &refs[slot]).await?;
 
         // The whole cell set stages in one `write_provisional`; each cell's
         // staged `prev` must equal its committed base.
@@ -1878,13 +876,13 @@ where
         let mut cell_writes: Vec<(CellKey, ProvisionalWrite)> = Vec::with_capacity(cells.len());
         for &(coord, mutation) in &cells {
             let key = cell_at(coord);
-            let prev = store.get(&ids[slot], &key, event).await?;
+            let prev = store.get(&ids[slot], &key).await?;
             if prev.get().cloned() != model[slot].get(&coord).cloned().flatten() {
                 return Ok(false);
             }
             cell_writes.push((key, ProvisionalWrite::new(mutation.value(), prev, event)));
         }
-        let marker = EventMarker::frozen(event, &cell_writes, &[]);
+        let marker = EventMarker::frozen(event, &cell_writes, &[], &evidence([].into(), None));
         store
             .write_provisional(
                 &refs[slot],
@@ -1893,7 +891,9 @@ where
             )
             .await?;
         if op.commit {
-            oracle.record_message(dedup_id).await?;
+            if !cell_writes.is_empty() {
+                seed_commit_evidence(&store, &refs[slot]).await?;
+            }
             for &(coord, mutation) in &cells {
                 model[slot].insert(coord, mutation.value());
             }
@@ -1904,16 +904,9 @@ where
     // boundary resolved it), resolved by this final read, converges.
     let store = make_store()?;
     for (i, id) in ids.iter().enumerate() {
-        let final_event = EventRef::Message {
-            dedup_id: Uuid::from_u128(u128::MAX - i as u128),
-        };
+        admit_collection(&store, &dedup, &refs[i]).await?;
         for (&coord, value) in &model[i] {
-            if store
-                .get(id, &cell_at(coord), final_event)
-                .await?
-                .into_inner()
-                != *value
-            {
+            if store.get(id, &cell_at(coord)).await?.into_inner() != *value {
                 return Ok(false);
             }
         }
@@ -2055,9 +1048,6 @@ where
         StateName::try_new("entries")?,
     );
     let collection_ref = CollectionRef::new(id.clone(), None);
-    let own = EventRef::Message {
-        dedup_id: Uuid::from_u128(1),
-    };
     let overlay = Overlay::new(Arc::new(DirtyStore::new()), lower);
     let mut model = CellModel::default();
 
@@ -2110,11 +1100,11 @@ where
                     // follow-up full scan still yields the complete result
                     // (dropping a scan mid-stream corrupts nothing).
                     let k = (k as usize).min(expected.len());
-                    if collect_scan(&overlay, &id, &req, own, Some(k)).await? != expected[..k] {
+                    if collect_scan(&overlay, &id, &req, Some(k)).await? != expected[..k] {
                         return Ok(false);
                     }
                 }
-                if collect_scan(&overlay, &id, &req, own, None).await? != expected {
+                if collect_scan(&overlay, &id, &req, None).await? != expected {
                     return Ok(false);
                 }
             }
@@ -2126,8 +1116,7 @@ where
         // dirty/committed interaction is checked cell-by-cell.
         for s in 0..SECTIONS.len() as u8 {
             for c in 0..CELLS {
-                if overlay.get(&id, &cell_in(s, c), own).await?.into_inner() != model.visible(s, c)
-                {
+                if overlay.get(&id, &cell_in(s, c)).await?.into_inner() != model.visible(s, c) {
                     return Ok(false);
                 }
             }
@@ -2141,9 +1130,7 @@ where
             // `CELLS + 1` (= 13) ≤ `CELL_BATCH`, so `chunks` yields one batch;
             // `CELLS ≥ 1` makes the iterator non-empty, so `next()` is `Some`.
             let batch = batch_of((0..CELLS).chain(iter::once(0)))?;
-            let got = overlay
-                .get_many(&id, SECTIONS[s as usize], &batch, own)
-                .await?;
+            let got = overlay.get_many(&id, SECTIONS[s as usize], &batch).await?;
             if got.len() != CELLS as usize + 1 {
                 return Ok(false);
             }
@@ -2174,9 +1161,6 @@ pub(crate) async fn run_overlay_precedence_pin<S: CellStore>(
         StateName::try_new("entries")?,
     );
     let collection_ref = CollectionRef::new(id.clone(), None);
-    let own = EventRef::Message {
-        dedup_id: Uuid::from_u128(3),
-    };
     let overlay = Overlay::new(Arc::new(DirtyStore::new()), counting.clone());
     // Committed base under the section.
     overlay
@@ -2188,7 +1172,7 @@ pub(crate) async fn run_overlay_precedence_pin<S: CellStore>(
     overlay.dirty().clear_section(&id, SECTIONS[0]);
     overlay.dirty().set(&id, &cell_in(0, 5), &bytes(7));
     let batch = batch_of([5, 5])?;
-    let got = overlay.get_many(&id, SECTIONS[0], &batch, own).await?;
+    let got = overlay.get_many(&id, SECTIONS[0], &batch).await?;
     assert_eq!(got.len(), 2, "every input position is answered");
     assert_eq!(
         got[0].clone().into_inner(),
@@ -2449,7 +1433,6 @@ async fn collect_scan<S>(
     overlay: &Overlay<S>,
     id: &CollectionId,
     req: &ScanReq,
-    own: EventRef,
     take: Option<usize>,
 ) -> Result<Vec<(u8, Bytes)>>
 where
@@ -2457,7 +1440,7 @@ where
 {
     let start = Coordinate::from_bytes(vec![req.start]);
     let end = Coordinate::from_bytes(vec![req.end]);
-    let stream = overlay.scan_cells(id, scan_of(*req, &start, &end), own);
+    let stream = overlay.scan_cells(id, scan_of(*req, &start, &end));
     futures::pin_mut!(stream);
     let mut out = Vec::new();
     while take.is_none_or(|k| out.len() < k)
@@ -2494,9 +1477,6 @@ where
         StateName::try_new("entries")?,
     );
     let collection_ref = CollectionRef::new(id.clone(), None);
-    let own = EventRef::Message {
-        dedup_id: Uuid::from_u128(1),
-    };
     let mut model = CellModel::default();
 
     for step in trace.steps {
@@ -2523,7 +1503,7 @@ where
                 let expected = scan_oracle(&model, req);
                 let start = Coordinate::from_bytes(vec![req.start]);
                 let end = Coordinate::from_bytes(vec![req.end]);
-                let stream = store.scan_cells(&id, scan_of(req, &start, &end), own);
+                let stream = store.scan_cells(&id, scan_of(req, &start, &end));
                 futures::pin_mut!(stream);
                 let mut got = Vec::new();
                 while let Some(item) = stream.next().await {
@@ -2559,17 +1539,15 @@ where
 // ─────────────────────────── apply idempotence
 // ────────────────────────────────
 
-/// One step of the generated apply interleaving.
+/// One step of the generated apply sequence.
 #[derive(Clone, Copy, Debug)]
 enum ApplyOp {
-    /// Resolve the unsettled marker as a unit (the sweep's marker leg) — a
-    /// re-resolve after settlement exercises the exhausted-marker path.
+    /// Resolves the marker as one unit, including an already settled marker.
     ResolveMarker,
     /// Re-apply the verdict-matching settle over the full staged set.
     Settle,
-    /// First-touch one staged cell through `resolve_cell` (skipped when the
-    /// cell is already resolved — the over-report-safe drop).
-    FirstTouch(u8),
+    /// Reads one cell through the committed-value resolver.
+    ReadCell(u8),
 }
 
 impl Arbitrary for ApplyOp {
@@ -2577,7 +1555,7 @@ impl Arbitrary for ApplyOp {
         match u8::arbitrary(g) % 3 {
             0 => Self::ResolveMarker,
             1 => Self::Settle,
-            _ => Self::FirstTouch(u8::arbitrary(g)),
+            _ => Self::ReadCell(u8::arbitrary(g)),
         }
     }
 }
@@ -2585,7 +1563,7 @@ impl Arbitrary for ApplyOp {
 /// Generated input for the apply-idempotence property: a committed pre-clear
 /// base, one event's staged set + cleared sections (survivors frozen from the
 /// staged set), a verdict, and a shuffled interleaving of re-applies and
-/// first-touches.
+/// reads.
 #[derive(Clone, Debug)]
 pub(crate) struct ApplyTrace {
     /// Committed base rows as `(section idx, coord, value)`.
@@ -2653,7 +1631,6 @@ impl Arbitrary for ApplyTrace {
 /// The final state must contain no unsettled marker or provisional cell.
 pub(crate) async fn run_apply_idempotence<S, P>(
     store: S,
-    oracle: ScriptedOracle,
     input: ApplyTrace,
     probe: &P,
 ) -> Result<bool>
@@ -2713,12 +1690,12 @@ where
         let keys: BTreeSet<(u8, u8)> = base.keys().copied().collect();
         return assert_apply_settled(&store, probe, &id, &base, &keys).await;
     }
-    let marker = EventMarker::frozen(event, &writes, &clears);
+    let marker = EventMarker::frozen(event, &writes, &clears, &evidence([].into(), None));
     store
         .write_provisional(&collection, &writes, Some(&marker))
         .await?;
     if input.committed {
-        oracle.record_message(Uuid::from_u128(1)).await?;
+        seed_commit_evidence(&store, &collection).await?;
     }
 
     // The generated interleaving, then one final verdict-matching settle so
@@ -2726,42 +1703,39 @@ where
     for op in &input.ops {
         match op {
             ApplyOp::ResolveMarker => {
-                resolve_event_marker(&store, &oracle, &collection, &marker).await?;
+                resolve_event_marker(
+                    &store,
+                    &collection,
+                    &marker,
+                    if input.committed {
+                        CommitDecision::Committed
+                    } else {
+                        CommitDecision::NotCommitted
+                    },
+                )
+                .await?;
             }
             ApplyOp::Settle => {
-                reapply_settle(&store, &collection, input.committed, &writes, &clears).await?;
+                reapply_settle(&store, &collection, input.committed, &writes, &marker).await?;
             }
-            ApplyOp::FirstTouch(i) => {
+            ApplyOp::ReadCell(i) => {
                 let Some((cell, _)) = writes.get(*i as usize % writes.len().max(1)) else {
                     continue;
                 };
                 if let Some(provisional) = store.provisional_cell_at(&id, cell).await? {
-                    resolve_cell(&store, &oracle, &collection, cell, provisional).await?;
+                    EvidenceLookup::new(&store, collection.id())
+                        .resolve(Provisional(provisional))
+                        .await?;
                 }
             }
         }
     }
-    reapply_settle(&store, &collection, input.committed, &writes, &clears).await?;
+    reapply_settle(&store, &collection, input.committed, &writes, &marker).await?;
 
     // The verdict state: committed ⇒ cleared sections collapse to survivors
     // and staged mutations land; aborted ⇒ exactly the pre-stage base.
     let keys: BTreeSet<(u8, u8)> = base.keys().chain(staged_map.keys()).copied().collect();
-    let mut expected = base;
-    if input.committed {
-        for &s in &input.cleared {
-            expected.retain(|&(sect, _), _| sect != s);
-        }
-        for (&(s, c), mutation) in &staged_map {
-            match mutation.value() {
-                Some(value) => {
-                    expected.insert((s, c), value);
-                }
-                None => {
-                    expected.remove(&(s, c));
-                }
-            }
-        }
-    }
+    let expected = apply_model(base, &staged_map, &input);
     assert_apply_settled(&store, probe, &id, &expected, &keys).await
 }
 
@@ -2772,13 +1746,13 @@ async fn reapply_settle<S>(
     collection: &CollectionRef,
     committed: bool,
     writes: &[(CellKey, ProvisionalWrite)],
-    clears: &[SectionClear],
+    marker: &EventMarker,
 ) -> Result<(), S::Error>
 where
     S: CellStore,
 {
     if committed {
-        store.commit_provisional(collection, writes, clears).await
+        store.commit_provisional(collection, marker, writes).await
     } else {
         store.abort_provisional(collection, writes).await
     }
@@ -2811,11 +1785,8 @@ where
     if !probe.provisional_rows(id).await?.is_empty() {
         return Ok(false);
     }
-    let probe_event = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX / 2),
-    };
     for &(s, c) in keys {
-        let committed = store.get(id, &cell_in(s, c), probe_event).await?;
+        let committed = store.get(id, &cell_in(s, c)).await?;
         if committed.into_inner() != expected.get(&(s, c)).cloned() {
             return Ok(false);
         }
@@ -2823,24 +1794,17 @@ where
     Ok(true)
 }
 
-// ─────────────────────────── sweep idempotence
+// ─────────────────────────── admission idempotence
 // ────────────────────────────────
 
 /// Which surface a [`FailingCellStore`] poisons, and for what target.
 #[derive(Clone)]
 pub(crate) enum Poison {
-    /// Promote path: `mark_resolved` fails with the given category for every
-    /// cell of one named collection — the receipt's best-effort `promote`
-    /// and the manager's recovery sweep.
+    /// Rejects the marker read before any handler can start.
+    MarkerRead(ErrorCategory),
+    /// Rejects promotes for one collection with the given error category.
     Collection(StateName, ErrorCategory),
-    /// Promote path: `mark_resolved` fails for the chosen single-byte
-    /// coordinates, each with its mapped category — a mixed per-cell sweep
-    /// where unpoisoned siblings must still resolve.
-    Cells(BTreeMap<u8, ErrorCategory>),
-    /// Stage path: `write_provisional` fails with the given category for one
-    /// named collection — drives the settle boundary's permanent-finalize-skip
-    /// arm (offset still commits, marker skipped, backstop armed) and the
-    /// crash trace's stage-fault dimension.
+    /// Rejects stage writes for one collection with the given error category.
     WriteProvisional(StateName, ErrorCategory),
     /// Direct-apply path: `write_resolved` fails with the given category for
     /// one named collection — the establish-then-publish test's lower-write
@@ -2852,11 +1816,6 @@ pub(crate) enum Poison {
     /// batch after earlier positions succeeded (the read-fill error arm: a
     /// failed lower batch publishes nothing).
     GetForCache(BTreeMap<u8, ErrorCategory>),
-    /// Raw recovery-reconstruction read path: `provisional_many` fails with the
-    /// given category (`Ready(Err)` on the first poll) for one named
-    /// collection — the overlap-precedence test's cell-read leg, run
-    /// concurrently with a failing oracle.
-    ProvisionalMany(StateName, ErrorCategory),
 }
 
 /// A runtime-armable poison slot shared by a [`FailingCellStore`], its
@@ -2864,14 +1823,8 @@ pub(crate) enum Poison {
 /// settle and disarms after): `None` delegates cleanly.
 pub(crate) type PoisonHandle = Arc<parking_lot::Mutex<Option<Poison>>>;
 
-/// A [`CellStore`] wrapper whose `mark_resolved`/`commit_provisional`
-/// (promote path) or `write_provisional` (stage path) fails for a chosen
-/// target, delegating everything else to `inner`. Drives the receipt's
-/// best-effort `promote` (one poisoned cell yields `Incomplete` without
-/// cancelling siblings), the manager's no-strand recovery (a failed
-/// resolution leaves the backstop armed), the sweep's per-cell `try_fold`
-/// failure arm, the settle boundary's finalize-`Skip` arm, and the generated
-/// trace alphabet's settle-failure outcome (via the runtime [`PoisonHandle`]).
+/// Rejects selected stage, promote, direct-write, or read operations.
+/// The shared [`PoisonHandle`] selects the operation and error category.
 #[derive(Clone)]
 pub(crate) struct FailingCellStore<S> {
     inner: S,
@@ -2885,17 +1838,9 @@ impl<S> FailingCellStore<S> {
         Self::new_with_category(inner, poison, ErrorCategory::Permanent)
     }
 
-    /// Wraps `inner`, poisoning `mark_resolved` with `category` for every cell
-    /// of the `poison` collection — e.g. `Transient` to drive the recovery
-    /// sweep's reschedule path.
+    /// Rejects promotes for `poison` with `category`.
     pub(crate) fn new_with_category(inner: S, poison: StateName, category: ErrorCategory) -> Self {
         Self::armed(inner, Poison::Collection(poison, category))
-    }
-
-    /// Wraps `inner`, poisoning `mark_resolved` for each single-byte coordinate
-    /// in `cells` with its mapped category (others resolve normally).
-    pub(crate) fn with_cells(inner: S, cells: BTreeMap<u8, ErrorCategory>) -> Self {
-        Self::armed(inner, Poison::Cells(cells))
     }
 
     /// Wraps `inner`, poisoning `write_provisional` with `category` for the
@@ -2915,18 +1860,6 @@ impl<S> FailingCellStore<S> {
         Self::armed(inner, Poison::GetForCache(cells))
     }
 
-    /// Wraps `inner`, poisoning `provisional_many` with `category` for the
-    /// `poison` collection — the raw recovery-reconstruction read
-    /// (`provisional_cell_at` and `write_provisional` stay healthy, so seeding
-    /// a marker is unaffected by the arm).
-    pub(crate) fn armed_provisional_many(
-        inner: S,
-        poison: StateName,
-        category: ErrorCategory,
-    ) -> Self {
-        Self::armed(inner, Poison::ProvisionalMany(poison, category))
-    }
-
     /// Wraps `inner` around a shared runtime `poison` slot — the trace
     /// runner's constructor, re-wrapping each crash-rebuilt store around one
     /// handle.
@@ -2944,94 +1877,37 @@ impl<S> FailingCellStore<S> {
         *self.poison.lock() = poison;
     }
 
-    /// The category to inject when `mark_resolved` touches `cells`, or `None`.
-    fn injected(&self, collection: &CollectionRef, cells: &[CellKey]) -> Option<ErrorCategory> {
+    fn injected(&self, collection: &CollectionRef, _cells: &[CellKey]) -> Option<ErrorCategory> {
         match &*self.poison.lock() {
-            Some(Poison::Collection(name, category)) => {
-                (*collection.id().name() == *name).then_some(*category)
+            Some(Poison::Collection(name, category)) if collection.id().name() == name => {
+                Some(*category)
             }
-            Some(Poison::Cells(targets)) => cells
-                .iter()
-                .find_map(|c| targets.get(&coord_of(c)).copied()),
-            Some(
-                Poison::WriteProvisional(..)
-                | Poison::WriteResolved(..)
-                | Poison::GetForCache(..)
-                | Poison::ProvisionalMany(..),
-            )
-            | None => None,
+            _ => None,
         }
     }
 
-    /// The category to inject when `write_provisional` touches `collection`,
-    /// or `None`.
     fn injected_stage(&self, collection: &CollectionRef) -> Option<ErrorCategory> {
         match &*self.poison.lock() {
-            Some(Poison::WriteProvisional(name, category)) => {
-                (*collection.id().name() == *name).then_some(*category)
+            Some(Poison::WriteProvisional(name, category)) if collection.id().name() == name => {
+                Some(*category)
             }
-            Some(
-                Poison::Collection(..)
-                | Poison::Cells(..)
-                | Poison::WriteResolved(..)
-                | Poison::GetForCache(..)
-                | Poison::ProvisionalMany(..),
-            )
-            | None => None,
+            _ => None,
         }
     }
 
-    /// The category to inject when `write_resolved` touches `collection`,
-    /// or `None`.
     fn injected_resolved(&self, collection: &CollectionRef) -> Option<ErrorCategory> {
         match &*self.poison.lock() {
-            Some(Poison::WriteResolved(name, category)) => {
-                (*collection.id().name() == *name).then_some(*category)
+            Some(Poison::WriteResolved(name, category)) if collection.id().name() == name => {
+                Some(*category)
             }
-            Some(
-                Poison::Collection(..)
-                | Poison::Cells(..)
-                | Poison::WriteProvisional(..)
-                | Poison::GetForCache(..)
-                | Poison::ProvisionalMany(..),
-            )
-            | None => None,
+            _ => None,
         }
     }
 
-    /// The category to inject when `get_for_cache` reads `cell`, or `None` —
-    /// the read-fill fault the default `get_many_for_cache` loop surfaces
-    /// per coordinate.
     fn injected_read(&self, cell: &CellKey) -> Option<ErrorCategory> {
         match &*self.poison.lock() {
             Some(Poison::GetForCache(targets)) => targets.get(&coord_of(cell)).copied(),
-            Some(
-                Poison::Collection(..)
-                | Poison::Cells(..)
-                | Poison::WriteProvisional(..)
-                | Poison::WriteResolved(..)
-                | Poison::ProvisionalMany(..),
-            )
-            | None => None,
-        }
-    }
-
-    /// The category to inject when `provisional_many` reads `collection`, or
-    /// `None` — the raw recovery-read fault, mirroring
-    /// [`Self::injected_stage`].
-    fn injected_provisional_many(&self, collection: &CollectionId) -> Option<ErrorCategory> {
-        match &*self.poison.lock() {
-            Some(Poison::ProvisionalMany(name, category)) => {
-                (*collection.name() == *name).then_some(*category)
-            }
-            Some(
-                Poison::Collection(..)
-                | Poison::Cells(..)
-                | Poison::WriteProvisional(..)
-                | Poison::WriteResolved(..)
-                | Poison::GetForCache(..),
-            )
-            | None => None,
+            _ => None,
         }
     }
 }
@@ -3075,10 +1951,9 @@ where
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-        own: EventRef,
     ) -> Result<Committed, Self::Error> {
         self.inner
-            .get(collection, cell, own)
+            .get(collection, cell)
             .await
             .map_err(FailCellError::Inner)
     }
@@ -3087,7 +1962,6 @@ where
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-        own: EventRef,
     ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
         // The default `get_many_for_cache` loops this per coordinate in
         // first-occurrence order, so a poisoned position fails the whole batch
@@ -3096,7 +1970,7 @@ where
             return Err(FailCellError::Poison(category));
         }
         self.inner
-            .get_for_cache(collection, cell, own)
+            .get_for_cache(collection, cell)
             .await
             .map_err(FailCellError::Inner)
     }
@@ -3105,19 +1979,9 @@ where
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-        own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         self.inner
-            .scan_cells(collection, scan, own)
-            .map(|item| item.map_err(FailCellError::Inner))
-    }
-
-    fn provisional_cells<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
-        self.inner
-            .provisional_cells(collection)
+            .scan_cells(collection, scan)
             .map(|item| item.map_err(FailCellError::Inner))
     }
 
@@ -3142,9 +2006,6 @@ where
         // overlap-precedence test's cell-read leg). Otherwise inherit the inner
         // store's survivors through this wrapper's `provisional_cell_at` (which
         // wraps the inner error).
-        if let Some(category) = self.injected_provisional_many(collection) {
-            return Err(FailCellError::Poison(category));
-        }
         provisional_point_loop(self, collection, section, batch).await
     }
 
@@ -3192,12 +2053,15 @@ where
             .map_err(FailCellError::Inner)
     }
 
-    async fn unsettled_marker<'a>(
+    async fn marker_state<'a>(
         &'a self,
         collection: &'a CollectionId,
-    ) -> Result<Option<EventMarker>, Self::Error> {
+    ) -> Result<MarkerState, Self::Error> {
+        if let Some(Poison::MarkerRead(category)) = self.poison.lock().as_ref() {
+            return Err(FailCellError::Poison(*category));
+        }
         self.inner
-            .unsettled_marker(collection)
+            .marker_state(collection)
             .await
             .map_err(FailCellError::Inner)
     }
@@ -3205,10 +2069,10 @@ where
     async fn commit_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
+        marker: &'a EventMarker,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        // A settle arriving via the sweep's marker leg routes through the inner
+        // A settle arriving via the admission's marker leg routes through the inner
         // store's `mark_resolved` on the *inner* store, bypassing the poison on
         // this wrapper's `mark_resolved`. Re-check the poison here against the
         // promoted (present-data) cells so a per-cell promote poison still fires
@@ -3222,7 +2086,7 @@ where
             return Err(FailCellError::Poison(category));
         }
         self.inner
-            .commit_provisional(collection, writes, clears)
+            .commit_provisional(collection, marker, writes)
             .await
             .map_err(FailCellError::Inner)
     }
@@ -3249,8 +2113,7 @@ enum BatchCellState {
     /// A committed-absent cell — no row (the parity oracle answers
     /// `Committed(None)`).
     Absent,
-    /// A cell staged provisional by the one trace event, resolved on read
-    /// through the oracle per the trace's verdict.
+    /// A provisional cell that reads through the trace's commit evidence.
     Provisional(u8),
 }
 
@@ -3273,7 +2136,7 @@ impl Arbitrary for BatchCellState {
 pub(crate) struct BatchReadTrace {
     /// `(section idx, coord byte, state)`; later writers win per coordinate.
     population: Vec<(u8, u8, BatchCellState)>,
-    /// The staging event's oracle verdict (`true` ⇒ its provisional cells
+    /// The staging event's commit decision (`true` ⇒ its provisional cells
     /// resolve to their staged data, `false` ⇒ to their `prev`).
     event_committed: bool,
     /// The section the read list scans.
@@ -3335,13 +2198,13 @@ async fn seed_batch<S: CellStore>(
     if !provisional.is_empty() {
         let mut writes = Vec::with_capacity(provisional.len());
         for (cell, data) in provisional {
-            let prev = store.get(collection.id(), cell, event).await?;
+            let prev = store.get(collection.id(), cell).await?;
             writes.push((
                 cell.clone(),
                 ProvisionalWrite::new(Some(bytes(*data)), prev, event),
             ));
         }
-        let marker = EventMarker::frozen(event, &writes, &[]);
+        let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
         store
             .write_provisional(collection, &writes, Some(&marker))
             .await?;
@@ -3349,20 +2212,11 @@ async fn seed_batch<S: CellStore>(
     Ok(())
 }
 
-/// Backend-generic batch-read parity: `get_many` over one collection answers
-/// each position exactly as the sequential point `get` oracle over an
-/// identically-seeded sibling collection does — proving the batch read (dedup,
-/// scatter, first-occurrence resolution, the Cassandra `IN` override) upholds
-/// the observation rules across duplicates, unknowns, absence, and provisional
-/// resolution.
-///
-/// Two DISTINCT collections are required because `get`/`get_many` resolve
-/// in place: a single collection would let the oracle loop pre-resolve every
-/// cell before `get_many` ran, so `get_many` would never exercise its own
-/// resolution. Distinct `StateKey`s isolate the row sets on both backends.
+/// Compares batch reads with point reads over equivalent collections.
+/// Both reads must agree across duplicates, absent rows, and provisional cells.
+/// Each collection keeps its own rows and cache entries.
 pub(crate) async fn run_batch_read_parity_trace<S: CellStore>(
     store: S,
-    oracle: ScriptedOracle,
     trace: BatchReadTrace,
 ) -> Result<bool> {
     let (resolved, provisional) = collapse_population(&trace.population);
@@ -3370,12 +2224,6 @@ pub(crate) async fn run_batch_read_parity_trace<S: CellStore>(
     let event = EventRef::Message {
         dedup_id: Uuid::from_u128(0x5EED),
     };
-    let own = EventRef::Message {
-        dedup_id: Uuid::from_u128(0x0B5E_0B5E),
-    };
-    if trace.event_committed {
-        oracle.record_message(Uuid::from_u128(0x5EED)).await?;
-    }
 
     // Fresh, distinct segments per invocation: the two collections isolate on
     // both backends (per-key row isolation on the shared Cassandra keyspace,
@@ -3394,24 +2242,24 @@ pub(crate) async fn run_batch_read_parity_trace<S: CellStore>(
     let batch_coll = mk()?;
     seed_batch(&store, &expected_coll, &resolved, &provisional, event).await?;
     seed_batch(&store, &batch_coll, &resolved, &provisional, event).await?;
+    if trace.event_committed && !provisional.is_empty() {
+        seed_commit_evidence(&store, &expected_coll).await?;
+        seed_commit_evidence(&store, &batch_coll).await?;
+    }
 
     let section = SECTIONS[trace.read_section as usize % SECTIONS.len()];
     let mut expected: Vec<Committed> = Vec::with_capacity(trace.reads.len());
     for &b in &trace.reads {
         expected.push(
             store
-                .get(expected_coll.id(), &cell_in(trace.read_section, b), own)
+                .get(expected_coll.id(), &cell_in(trace.read_section, b))
                 .await?,
         );
     }
     let coords = trace.reads.iter().map(|&b| Coordinate::from_bytes(vec![b]));
     let mut got: Vec<Committed> = Vec::with_capacity(trace.reads.len());
     for batch in CoordinateBatch::chunks(coords) {
-        got.extend(
-            store
-                .get_many(batch_coll.id(), section, &batch, own)
-                .await?,
-        );
+        got.extend(store.get_many(batch_coll.id(), section, &batch).await?);
     }
     Ok(got.len() == trace.reads.len() && got == expected)
 }
@@ -3424,9 +2272,6 @@ pub(crate) async fn run_batch_duplicate_co_observation<S: CellStore>(store: S) -
         StateName::try_new("entries")?,
     );
     let collection = CollectionRef::new(id.clone(), None);
-    let own = EventRef::Message {
-        dedup_id: Uuid::from_u128(7),
-    };
     store
         .write_resolved(
             &collection,
@@ -3438,7 +2283,7 @@ pub(crate) async fn run_batch_duplicate_co_observation<S: CellStore>(store: S) -
         )
         .await?;
     let batch = batch_of([5, 9, 5])?;
-    let got = store.get_many(&id, SECTIONS[0], &batch, own).await?;
+    let got = store.get_many(&id, SECTIONS[0], &batch).await?;
     assert_eq!(got.len(), 3, "every position answered");
     assert_eq!(got[0], got[2], "duplicate coordinate co-observes one value");
     assert_eq!(
@@ -3466,9 +2311,6 @@ pub(crate) async fn run_batch_alignment<S: CellStore>(store: S) -> Result<()> {
         StateName::try_new("entries")?,
     );
     let collection = CollectionRef::new(id.clone(), None);
-    let own = EventRef::Message {
-        dedup_id: Uuid::from_u128(11),
-    };
     store
         .write_resolved(
             &collection,
@@ -3487,15 +2329,15 @@ pub(crate) async fn run_batch_alignment<S: CellStore>(store: S) -> Result<()> {
     ];
     let mut expected: Vec<Committed> = Vec::with_capacity(read_bytes.len());
     for &b in &read_bytes {
-        expected.push(store.get(&id, &cell_in(0, b), own).await?);
+        expected.push(store.get(&id, &cell_in(0, b)).await?);
     }
     let coords = read_bytes.iter().map(|&b| Coordinate::from_bytes(vec![b]));
     let mut got: Vec<Committed> = Vec::new();
     for batch in CoordinateBatch::chunks(coords) {
-        got.extend(store.get_many(&id, SECTIONS[0], &batch, own).await?);
+        got.extend(store.get_many(&id, SECTIONS[0], &batch).await?);
     }
     assert_eq!(got.len(), read_bytes.len(), "every input position answered");
-    assert_eq!(got, expected, "each position matches the point-get oracle");
+    assert_eq!(got, expected, "each position matches the point-get dedup");
     Ok(())
 }
 
@@ -3504,7 +2346,7 @@ pub(crate) async fn run_batch_alignment<S: CellStore>(store: S) -> Result<()> {
 /// Generated input for the raw-provisional batch property. Like
 /// [`BatchReadTrace`] but reads are capped at ONE chunk (`provisional_many` is
 /// a single-batch verb) and there is no commit verdict — the raw verbs never
-/// resolve, so a staged cell stays provisional regardless of the oracle.
+/// resolve, so a staged cell stays provisional regardless of commit evidence.
 #[derive(Clone, Debug)]
 pub(crate) struct RawBatchTrace {
     /// `(section idx, coord byte, state)`; later writers win per coordinate.
@@ -3664,10 +2506,7 @@ pub(crate) async fn run_raw_batch_ascending_output<S: CellStore>(store: S) -> Re
 }
 
 /// Proves that provisional batch reads do not change state or check events.
-pub(crate) async fn run_raw_batch_no_side_effects<S: CellStore>(
-    store: S,
-    oracle: CountingOracle,
-) -> Result<()> {
+pub(crate) async fn run_raw_batch_no_side_effects<S: CellStore>(store: S) -> Result<()> {
     let event = EventRef::Message {
         dedup_id: Uuid::from_u128(0x5EED),
     };
@@ -3696,11 +2535,6 @@ pub(crate) async fn run_raw_batch_no_side_effects<S: CellStore>(
     assert!(
         before == after,
         "provisional_many mutated the raw provisional set or the unsettled marker"
-    );
-    assert_eq!(
-        oracle.resolves(),
-        0,
-        "provisional_many consulted the commit oracle"
     );
 
     // The survivors are exactly the provisional cells among the read coords,
@@ -3736,344 +2570,217 @@ async fn raw_snapshot<S: CellStore>(
     for &b in read_bytes {
         cells.push(store.provisional_cell_at(id, &cell_in(0, b)).await?);
     }
-    let marker = store.unsettled_marker(id).await?;
+    let marker = store.marker_state(id).await?.staged;
     Ok((cells, marker))
 }
 
-#[cfg(test)]
-mod sweep {
-    use super::super::super::memory::{MemoryCellStore, MemoryCells};
-    use super::super::super::registry::CollectionDefRegistry;
-    use super::*;
-    use futures::executor;
-    use quickcheck::QuickCheck;
-    use std::collections::BTreeSet;
-    use std::slice;
-
-    /// A staged cell's promote outcome, assigned at random by the sweep
-    /// failure-arm property: resolve cleanly, fail `Permanent` (skipped by the
-    /// sweep), or fail transiently (aborts the sweep).
-    #[derive(Clone, Copy, Debug)]
-    enum Promote {
-        Resolve,
-        SkipPermanent,
-        FailTransient,
-    }
-
-    impl Promote {
-        /// The failure category injected for this cell's `mark_resolved`, or
-        /// `None` to let it resolve.
-        fn category(self) -> Option<ErrorCategory> {
-            match self {
-                Self::Resolve => None,
-                Self::SkipPermanent => Some(ErrorCategory::Permanent),
-                Self::FailTransient => Some(ErrorCategory::Transient),
+/// Executes a prefix of the production promote plan, then observes its commit
+/// point.
+async fn promote_prefix<S: CellStore>(
+    store: &S,
+    collection: &CollectionRef,
+    writes: &[(CellKey, ProvisionalWrite)],
+    count: usize,
+) -> Result<bool> {
+    use crate::cassandra::BatchUnit;
+    use crate::state::cassandra::crash_settle_batches;
+    use crate::state::tests::support::seed_commit_evidence;
+    let marker = store
+        .marker_state(collection.id())
+        .await?
+        .staged
+        .ok_or_else(|| eyre!("the promote prefix needs a stage"))?;
+    // Weights identify the operations while the real planner determines their
+    // order.
+    let unit = |weight| BatchUnit::<()>::new(weight, smallvec::SmallVec::new());
+    let (units, phases) = crash_settle_batches(Some(unit(1)), vec![unit(2)], unit(3), 1, 1);
+    for index in phases.into_iter().flatten().take(count) {
+        match units[index].weight() {
+            1 => seed_commit_evidence(store, collection).await?,
+            2 => {
+                for (cell, write) in writes {
+                    if write.data().is_some() {
+                        store
+                            .mark_resolved(collection, slice::from_ref(cell))
+                            .await?;
+                    } else {
+                        store
+                            .write_resolved(collection, &[(cell.clone(), None)], &[])
+                            .await?;
+                    }
+                }
+                store
+                    .write_resolved(collection, &[], marker.clears())
+                    .await?;
             }
+            3 => store.abort_provisional(collection, &[]).await?,
+            _ => return Err(eyre!("unknown promote operation")),
         }
     }
+    Ok(store
+        .marker_state(collection.id())
+        .await?
+        .committed
+        .is_some_and(|evidence| evidence.certifies(&marker)))
+}
 
-    impl Arbitrary for Promote {
-        fn arbitrary(g: &mut Gen) -> Self {
-            match u8::arbitrary(g) % 3 {
-                0 => Self::SkipPermanent,
-                1 => Self::FailTransient,
-                _ => Self::Resolve,
-            }
-        }
-    }
+/// Seeds a crash after ordered stage chunks with a virtual expiry clock.
+/// The production planner selects each atomic mutation. Direct deletes
+/// reproduce elapsed TTLs without wall-clock waits.
+async fn stage_clock_crash<S: CellStore>(
+    store: &S,
+    dedup: &MemoryDeduplicationStore,
+    trace: &Trace,
+) -> Result<()> {
+    use crate::cassandra::BatchUnit;
+    use crate::state::cassandra::{crash_stage_batches, crash_stage_chunk};
 
-    /// A random per-cell outcome assignment, capped so coordinates stay
-    /// distinct single bytes and traces stay small.
-    #[derive(Clone, Debug)]
-    struct SweepOutcomes(Vec<Promote>);
-
-    impl Arbitrary for SweepOutcomes {
-        fn arbitrary(g: &mut Gen) -> Self {
-            Self(capped_vec(g, 16))
-        }
-
-        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-            Box::new(self.0.shrink().map(Self))
-        }
-    }
-
-    /// Drives one random outcome assignment through `sweep_provisional` and
-    /// checks its contract. Stages **all** the outcomes' cells under **one**
-    /// committed event in a single `write_provisional` (the stage-boundary rule
-    /// makes multiple events' provisional cells coexisting on one collection
-    /// unreachable — a later stage would boundary-resolve its predecessor), so
-    /// the sweep resolves them as one marker leg followed by the per-cell
-    /// mop-up. Poisons the chosen cells, then asserts the sweep's return
-    /// matches the assignment. Converted from the prior one-event-per-cell
-    /// shape: same failure-arm invariant, now a reachable staging shape.
-    async fn run_sweep_failure(SweepOutcomes(outcomes): SweepOutcomes) -> Result<bool> {
-        let oracle = ScriptedOracle::default();
-        let registry = Arc::new(CollectionDefRegistry::default());
-        let inner = MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry);
-        let collection = CollectionRef::new(
-            CollectionId::new(
-                StateKey::new(Uuid::new_v4(), Arc::from("k")),
-                StateType::Application,
-                StateName::try_new("sweep-fail")?,
-            ),
-            None,
-        );
-
-        // All cells staged under one committed event, at distinct coordinates.
-        let dedup_id = Uuid::from_u128(0);
-        let event = EventRef::Message { dedup_id };
-        let mut writes: Vec<(CellKey, ProvisionalWrite)> = Vec::with_capacity(outcomes.len());
-        for c in 0..outcomes.len() as u8 {
-            let cell = cell_at(c);
-            let prev = inner.get(collection.id(), &cell, event).await?;
-            writes.push((cell, ProvisionalWrite::new(Some(bytes(c)), prev, event)));
-        }
-        let marker = EventMarker::frozen(event, &writes, &[]);
-        inner
-            .write_provisional(&collection, &writes, Some(&marker))
-            .await?;
-        oracle.record_message(dedup_id).await?;
-
-        let poison: BTreeMap<u8, ErrorCategory> = outcomes
-            .iter()
-            .enumerate()
-            .filter_map(|(i, outcome)| outcome.category().map(|category| (i as u8, category)))
-            .collect();
-        let permanent = poison
-            .values()
-            .filter(|&&category| category == ErrorCategory::Permanent)
-            .count();
-        let has_transient = poison.values().any(|&c| c == ErrorCategory::Transient);
-
-        let store = FailingCellStore::with_cells(inner, poison);
-        match sweep_provisional(&store, &oracle, &collection).await {
-            // A transient failure must surface as an error; nothing else may.
-            Err(_) => Ok(has_transient),
-            // No transient: the sweep reports all-resolved iff nothing was
-            // skipped, and exactly the Permanent-skipped cells linger — every
-            // sibling resolved regardless of submission order.
-            Ok(all_resolved) => {
-                let lingering = provisional_count(&store, collection.id()).await?;
-                Ok(!has_transient && all_resolved == (permanent == 0) && lingering == permanent)
-            }
-        }
-    }
-
-    /// `sweep_provisional`'s failure-arm contract, the invariant the `try_fold`
-    /// rewrite must preserve over the old sequential loop: a `Permanent` cell
-    /// is skipped (the sweep still resolves its siblings and reports
-    /// `false`), while any transient cell aborts the whole sweep.
-    /// Order-independent, so the concurrent `buffer_unordered` pipeline
-    /// answers exactly as the loop did.
-    #[test]
-    fn prop_sweep_failure_arm() {
-        fn property(outcomes: SweepOutcomes) -> Result<bool> {
-            executor::block_on(run_sweep_failure(outcomes))
-        }
-        QuickCheck::new().quickcheck(property as fn(SweepOutcomes) -> Result<bool>);
-    }
-
-    /// The first sweep over staged provisional cells resolves them; a second
-    /// sweep performs **zero durable writes** — `provisional_cells` yields
-    /// nothing once every cell is resolved, so `sweep_provisional`
-    /// short-circuits before touching the backend (sweep idempotence).
-    #[tokio::test]
-    async fn second_sweep_is_a_no_op() -> Result<()> {
-        let oracle = ScriptedOracle::default();
-        let registry = Arc::new(CollectionDefRegistry::default());
-        let store = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle.clone(),
-            registry,
-        ));
-        let (ids, refs) = pooled_collections()?;
-        let cell = value_cell();
-
-        // Stage a committed provisional cell on every collection.
-        for (i, (id, r)) in ids.iter().zip(&refs).enumerate() {
-            let dedup_id = Uuid::from_u128(i as u128);
-            let event = EventRef::Message { dedup_id };
-            let prev = store.get(id, &cell, event).await?;
-            let writes = [(
-                cell.clone(),
-                ProvisionalWrite::new(Some(bytes(7)), prev, event),
-            )];
-            let marker = EventMarker::frozen(event, &writes, &[]);
-            store.write_provisional(r, &writes, Some(&marker)).await?;
-            oracle.record_message(dedup_id).await?;
-        }
-
-        // First sweep resolves every cell — via the marker leg's one settle per
-        // collection, so `durable_writes` counts the folded `commit_provisional`.
-        for r in &refs {
-            assert!(sweep_provisional(&store, &oracle, r).await?);
-        }
-        assert!(
-            store.durable_writes() > 0,
-            "first sweep must resolve provisional cells"
-        );
-        // Meaningful: the sweep read each collection's unsettled marker once.
-        assert_eq!(
-            store.marker_reads(),
-            refs.len(),
-            "first sweep reads each collection's unsettled marker exactly once"
-        );
-
-        // Second sweep is a no-op: no provisional cell remains to resolve and no
-        // marker stands (the first sweep's settle deleted it), so the marker leg
-        // and the per-cell leg both issue zero durable writes.
-        store.reset();
-        for r in &refs {
-            assert!(sweep_provisional(&store, &oracle, r).await?);
-        }
-        assert_eq!(store.durable_writes(), 0);
-        // The sweep still *entered* both legs once per collection — the counters
-        // that make the durable-write assertion meaningful.
-        assert_eq!(store.recovery_sweeps(), refs.len());
-        assert_eq!(store.marker_reads(), refs.len());
-        Ok(())
-    }
-
-    /// One provisional-set maintenance op the agreement property drives.
-    #[derive(Clone, Copy, Debug)]
-    enum SetOp {
-        /// Stage a provisional cell and leave it unresolved (it must linger in
-        /// the set).
-        StageOnly(u8),
-        /// Stage then promote (the set entry must clear).
-        Promote(u8),
-        /// Stage then roll back to `prev` (the set entry must clear).
-        Rollback(u8),
-    }
-
-    impl SetOp {
-        fn coord(self) -> u8 {
-            match self {
-                Self::StageOnly(c) | Self::Promote(c) | Self::Rollback(c) => c % CELLS,
-            }
-        }
-    }
-
-    impl Arbitrary for SetOp {
-        fn arbitrary(g: &mut Gen) -> Self {
-            let c = u8::arbitrary(g);
-            match u8::arbitrary(g) % 3 {
-                0 => Self::Promote(c),
-                1 => Self::Rollback(c),
-                _ => Self::StageOnly(c),
-            }
-        }
-    }
-
-    /// A capped random op sequence over a single collection.
-    #[derive(Clone, Debug)]
-    struct SetOps(Vec<SetOp>);
-
-    impl Arbitrary for SetOps {
-        fn arbitrary(g: &mut Gen) -> Self {
-            Self(capped_vec(g, 24))
-        }
-
-        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-            Box::new(self.0.shrink().map(Self))
-        }
-    }
-
-    /// The provisional cell coordinates a store reports, as an
-    /// order-independent set — the warm store reads its in-memory set, a
-    /// cold store full-scans.
-    async fn provisional_key_set<S>(store: &S, id: &CollectionId) -> Result<BTreeSet<CellKey>>
-    where
-        S: CellStore,
+    let ttl = trace
+        .ttl
+        .map(|seconds| CompactDuration::new(u32::from(seconds) + 3600));
+    let collection = CollectionRef::new(
+        CollectionId::new(
+            StateKey::new(Uuid::new_v4(), Arc::from("clock")),
+            StateType::Application,
+            StateName::try_new("clock")?,
+        ),
+        ttl,
+    );
+    let event = EventRef::Message {
+        dedup_id: Uuid::new_v4(),
+    };
+    let writes: Vec<_> = (0..4_u8)
+        .map(|coordinate| {
+            (
+                cell_in(0, coordinate),
+                ProvisionalWrite::new(Some(bytes(coordinate)), Committed::new(None), event),
+            )
+        })
+        .collect();
+    let touched = vec![(StateType::Application, collection.id().name().clone())].into();
+    let marker = EventMarker::frozen(
+        event,
+        &writes,
+        &[],
+        &EventEvidence {
+            touched,
+            evidence_ttl: CompactDuration::new(3600),
+            dedup: None,
+            attempt: AttemptId::new(),
+        },
+    );
+    let marker_unit = BatchUnit::<()>::new(0, smallvec::SmallVec::new());
+    let units: Vec<_> = (1..=writes.len())
+        .map(|index| BatchUnit::<()>::new(index as u64, smallvec::SmallVec::new()))
+        .collect();
+    let mut now = 0_u32;
+    let step = u32::from(trace.clock) * 100;
+    let mut marker_expiry = 0_u32;
+    let mut cell_expiry = [0_u32; 4];
+    for range in
+        crash_stage_batches(&marker_unit, &units, u64::MAX, 2).take(usize::from(trace.cut % 5))
     {
-        let stream = store.provisional_cells(id);
-        futures::pin_mut!(stream);
-        let mut set = BTreeSet::new();
-        while let Some(item) = stream.next().await {
-            let (key, _) = item?;
-            set.insert(key);
+        let members: Vec<_> = crash_stage_chunk(&marker_unit, &units, range.clone())
+            .map(BatchUnit::weight)
+            .collect();
+        ensure!(members.first() == Some(&0), "stage chunk lost its marker");
+        let expiry = ttl.map_or(u32::MAX, |ttl| now + ttl.seconds());
+        marker_expiry = expiry;
+        for slot in range.clone() {
+            cell_expiry[slot] = expiry;
         }
-        Ok(set)
+        store
+            .write_provisional(&collection, &writes[range.clone()], Some(&marker))
+            .await?;
+        now += step;
     }
-
-    /// Runs one op sequence against a **seeded** (warm) store, then checks its
-    /// incrementally-maintained provisional set against ground truth: a fresh
-    /// **cold** store over the same backing that enumerates the durable
-    /// provisional cells from scratch. Equality proves the set neither
-    /// under-reports (a provisional cell it missed → a strand) nor over-reports
-    /// beyond what the point-read filter drops (the incremental set must stay
-    /// ⟺ the durable provisional cells). Minting the cold store fresh over the
-    /// shared cells is the memory cold-window.
-    ///
-    /// Because each stage's boundary resolves the predecessor's unsettled
-    /// marker, **only the final op's cell can still be provisional**: a
-    /// trailing `StageOnly` lingers, any trailing settle clears it. So the
-    /// property also asserts both sets against that exact expected set,
-    /// keeping teeth even when the intermediate sets collapse to trivial.
-    async fn run_set_agreement(SetOps(ops): SetOps) -> Result<bool> {
-        let oracle = ScriptedOracle::default();
-        let cells = MemoryCells::new();
-        let registry = Arc::new(CollectionDefRegistry::default());
-        let warm = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
-        let collection = CollectionRef::new(
-            CollectionId::new(
-                StateKey::new(Uuid::new_v4(), Arc::from("k")),
-                StateType::Application,
-                StateName::try_new("agree")?,
-            ),
-            None,
-        );
-
-        // Seed the warm store's latch (empty), so subsequent ops exercise the
-        // incrementally-maintained set, not another cold scan.
-        let _ = provisional_key_set(&warm, collection.id()).await?;
-
-        // At most the final op's cell survives the stage-boundary resolves.
-        let expected: BTreeSet<CellKey> = match ops.last() {
-            Some(op @ SetOp::StageOnly(_)) => BTreeSet::from([cell_at(op.coord())]),
-            _ => BTreeSet::new(),
-        };
-
-        for (i, op) in ops.into_iter().enumerate() {
-            let event = EventRef::Message {
-                dedup_id: Uuid::from_u128(i as u128),
-            };
-            let cell = cell_at(op.coord());
-            let prev = warm.get(collection.id(), &cell, event).await?;
-            let prev_value = prev.get().cloned();
-            let writes = [(
-                cell.clone(),
-                ProvisionalWrite::new(Some(bytes(i as u8)), prev, event),
-            )];
-            let marker = EventMarker::frozen(event, &writes, &[]);
-            warm.write_provisional(&collection, &writes, Some(&marker))
+    let committed = !trace.cut.is_multiple_of(2) && marker_expiry > 0;
+    if committed {
+        seed_commit_evidence(store, &collection).await?;
+    }
+    now += step;
+    for (slot, expiry) in cell_expiry.iter().enumerate() {
+        if *expiry > 0 && *expiry <= now {
+            store
+                .write_resolved(&collection, &[(writes[slot].0.clone(), None)], &[])
                 .await?;
-            match op {
-                SetOp::StageOnly(_) => {}
-                SetOp::Promote(_) => {
-                    warm.mark_resolved(&collection, slice::from_ref(&cell))
-                        .await?;
+        }
+        if *expiry > now {
+            ensure!(
+                marker_expiry > now,
+                "a live cell outlasted its discovery row"
+            );
+        }
+    }
+    if marker_expiry > 0 && marker_expiry <= now {
+        store.abort_provisional(&collection, &[]).await?;
+    }
+    ensure!(admit_collection(store, dedup, &collection).await?);
+    for (slot, expiry) in cell_expiry.iter().enumerate() {
+        let expected = (committed && *expiry > now).then(|| bytes(slot as u8));
+        ensure!(
+            store.get(collection.id(), &writes[slot].0).await?.get() == expected.as_ref(),
+            "expiry changed a committed value"
+        );
+    }
+    ensure!(store.marker_state(collection.id()).await?.staged.is_none());
+    Ok(())
+}
+
+async fn assert_crash_state<S: CellStore, P: ShapeProbe>(
+    store: &S,
+    probe: &P,
+    ids: &[CollectionId],
+    model: &[BTreeMap<(u8, u8), Option<Bytes>>],
+    certificates: &[Option<EventRef>],
+) -> Result<()> {
+    for (slot, id) in ids.iter().enumerate() {
+        let marker = store.marker_state(id).await?;
+        ensure!(marker.staged.is_none(), "admit left a stage");
+        ensure!(marker.committed.as_ref().map(|marker| marker.event) == certificates[slot]);
+        for section in 0..SECTIONS.len() as u8 {
+            for coordinate in 0..CRASH_CELLS {
+                let value = model[slot]
+                    .get(&(section, coordinate))
+                    .and_then(Option::as_ref);
+                ensure!(store.get(id, &cell_in(section, coordinate)).await?.get() == value);
+            }
+        }
+        let expected: RowKeys = model[slot]
+            .iter()
+            .filter(|(_, value)| value.is_some())
+            .map(|(&(section, coordinate), _)| row_key(&cell_in(section, coordinate)))
+            .collect();
+        ensure!(
+            probe.cell_rows(id).await? == expected,
+            "the durable row set differs from the model"
+        );
+        ensure!(probe.provisional_rows(id).await?.is_empty());
+        ensure!(probe.unsettled_marker(id).await?.is_none());
+    }
+    Ok(())
+}
+
+fn apply_model(
+    base: BTreeMap<(u8, u8), Bytes>,
+    staged_map: &BTreeMap<(u8, u8), Mutation>,
+    input: &ApplyTrace,
+) -> BTreeMap<(u8, u8), Bytes> {
+    let mut expected = base;
+    if input.committed {
+        for &s in &input.cleared {
+            expected.retain(|&(sect, _), _| sect != s);
+        }
+        for (&(s, c), mutation) in staged_map {
+            match mutation.value() {
+                Some(value) => {
+                    expected.insert((s, c), value);
                 }
-                SetOp::Rollback(_) => {
-                    warm.write_resolved(&collection, &[(cell.clone(), prev_value)], &[])
-                        .await?;
+                None => {
+                    expected.remove(&(s, c));
                 }
             }
         }
-
-        let warm_set = provisional_key_set(&warm, collection.id()).await?;
-        let cold = MemoryCellStore::new(cells, oracle, registry);
-        let cold_set = provisional_key_set(&cold, collection.id()).await?;
-        Ok(warm_set == expected && cold_set == expected)
     }
-
-    /// The seeded in-memory provisional set agrees with the durable provisional
-    /// cells after any stage/promote/rollback sequence.
-    #[test]
-    fn prop_provisional_set_agreement() {
-        fn property(ops: SetOps) -> Result<bool> {
-            executor::block_on(run_set_agreement(ops))
-        }
-        QuickCheck::new().quickcheck(property as fn(SetOps) -> Result<bool>);
-    }
+    expected
 }

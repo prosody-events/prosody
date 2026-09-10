@@ -1,9 +1,14 @@
+use super::read::fetch_marker_state;
 use super::{
     Arc, Bytes, CassandraCellResources, CassandraCellStoreError, CassandraSession, CellBuffer,
     CellKey, CellQueries, CollectionId, CoordinateBatch, Scan, Section, Stream, TryStreamExt,
     dedupe, expand_to_input_order, fetch_and_decode_cell, fetch_cells_batch, page_cells, pin_mut,
     try_stream,
 };
+use crate::state::cell::resolve_for_reader;
+use crate::state::marker::ReaderEvidence;
+use crate::state::resolve::sibling_committed;
+use futures::try_join;
 
 impl CassandraCellResources {
     /// Bundles the shared session and prepared cell statements.
@@ -12,11 +17,34 @@ impl CassandraCellResources {
         Self { session, queries }
     }
 
+    async fn reader_evidence(
+        &self,
+        id: &CollectionId,
+    ) -> Result<ReaderEvidence, CassandraCellStoreError> {
+        // Outside readers do not use evidence TTL; version 1 therefore decodes with
+        // None.
+        let state = fetch_marker_state(&self.session, &self.queries, id, None).await?;
+        let staged_committed = match &state.staged {
+            Some(marker) => {
+                sibling_committed(id, marker, |sibling| async move {
+                    fetch_marker_state(&self.session, &self.queries, &sibling, None).await
+                })
+                .await?
+            }
+            None => false,
+        };
+        Ok(ReaderEvidence {
+            state,
+            staged_committed,
+        })
+    }
+
     /// Returns one cell for a standalone reader.
     ///
     /// This read does not resolve markers or change durable state.
-    /// It returns `prev` for a provisional cell.
-    /// It returns `None` for an absent cell.
+    /// Positive evidence selects a provisional value; otherwise it returns
+    /// `prev`. An absent cell or a cell removed by a committed clear reads
+    /// `None`.
     ///
     /// # Errors
     ///
@@ -27,12 +55,13 @@ impl CassandraCellResources {
         id: &CollectionId,
         cell: &CellKey,
     ) -> Result<Option<Bytes>, CassandraCellStoreError> {
-        let Some(cell) =
-            fetch_and_decode_cell(&self.session, &self.queries.read_cell, id, cell).await?
-        else {
-            return Ok(None);
-        };
-        Ok(cell.project_committed().cloned())
+        let (value, evidence) = try_join!(
+            fetch_and_decode_cell(&self.session, &self.queries.read_cell, id, cell),
+            self.reader_evidence(id)
+        )?;
+        Ok(value
+            .filter(|_| evidence.survives(cell))
+            .and_then(|value| resolve_for_reader(&value, &evidence).cloned()))
     }
 
     /// The batch form of [`Self::read_committed`]. Reads one section's
@@ -53,17 +82,27 @@ impl CassandraCellResources {
         batch: &CoordinateBatch,
     ) -> Result<CellBuffer<Option<Bytes>>, CassandraCellStoreError> {
         let (unique_coordinates, input_indices) = dedupe(batch);
-        let rows = fetch_cells_batch(
-            &self.session,
-            &self.queries,
-            id,
-            section,
-            &unique_coordinates,
-        )
-        .await?;
+        let (rows, evidence) = try_join!(
+            fetch_cells_batch(
+                &self.session,
+                &self.queries,
+                id,
+                section,
+                &unique_coordinates
+            ),
+            self.reader_evidence(id)
+        )?;
         let unique_answers: CellBuffer<Option<Bytes>> = rows
             .into_iter()
-            .map(|row| row.and_then(|(cell, _)| cell.project_committed().cloned()))
+            .zip(unique_coordinates)
+            .map(|(row, coordinate)| {
+                let key = CellKey {
+                    section,
+                    coordinate: coordinate.clone(),
+                };
+                row.filter(|_| evidence.survives(&key))
+                    .and_then(|(cell, _)| resolve_for_reader(&cell, &evidence).cloned())
+            })
             .collect();
         Ok(expand_to_input_order(&input_indices, &unique_answers))
     }
@@ -74,15 +113,7 @@ impl CassandraCellResources {
     /// It returns cells in coordinate order.
     /// The limit counts only returned cells.
     ///
-    /// This scan does not resolve an unsettled section clear.
-    /// The projection is still sound: a provisional row's `prev`
-    /// is committed by construction, and a resolved row's `data` was committed
-    /// at some earlier point. So a resolved row written before a committed but
-    /// not-yet-applied section clear reads a value that was once committed but
-    /// is now stale, until the owner applies the clear. That staleness is
-    /// bounded (see
-    /// [`Cell::project_committed`](crate::state::cell::Cell::project_committed)).
-    /// It is never an uncommitted read.
+    /// A committed clear restricts results to its frozen survivors.
     pub(crate) fn scan_committed<'a>(
         &'a self,
         id: &'a CollectionId,
@@ -92,15 +123,17 @@ impl CassandraCellResources {
         try_stream! {
             let pages = page_cells(&self.session, &self.queries, id, scan);
             pin_mut!(pages);
+            let (evidence, mut row) = try_join!(self.reader_evidence(id), pages.try_next())?;
             let mut yielded = 0usize;
-            while let Some((key, cell)) = pages.try_next().await? {
+            while let Some((key, cell)) = row {
                 if limit.is_some_and(|n| yielded >= n) {
                     break;
                 }
-                if let Some(bytes) = cell.project_committed().cloned() {
+                if evidence.survives(&key) && let Some(bytes) = resolve_for_reader(&cell, &evidence).cloned() {
                     yield (key, bytes);
                     yielded += 1;
                 }
+                row = pages.try_next().await?;
             }
         }
     }

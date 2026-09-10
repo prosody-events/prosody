@@ -15,7 +15,7 @@ use crate::consumer::middleware::defer::message::store::memory::MemoryMessageDef
 use crate::consumer::middleware::providers::FallibleCloneProvider;
 use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
 use crate::consumer::middleware::tests::test_support::{
-    RecordingOracle, RecordingSession, RecordingTimer, StagingError, committed_json_value,
+    RecordingSession, RecordingTimer, StagingError, committed_json_value,
     recording_session_with_loader,
 };
 use crate::consumer::middleware::{
@@ -48,7 +48,7 @@ use uuid::Uuid;
 /// store, the shared dirty store, and the oracle's recorded-marker log.
 type SessionParts = (
     RecordingSession,
-    MemoryCellStore<RecordingOracle>,
+    MemoryCellStore,
     Arc<DirtyStore>,
     Arc<Mutex<Vec<Uuid>>>,
 );

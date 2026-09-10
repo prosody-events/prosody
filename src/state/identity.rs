@@ -87,6 +87,19 @@ impl From<StateType> for i8 {
     }
 }
 
+impl TryFrom<i8> for StateType {
+    type Error = StateTypeError;
+
+    fn try_from(value: i8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Application),
+            #[cfg(test)]
+            1 => Ok(Self::Framework),
+            _ => Err(StateTypeError(value)),
+        }
+    }
+}
+
 /// Human-readable state collection name.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StateName(Arc<str>);
@@ -187,32 +200,27 @@ impl CollectionId {
     }
 }
 
-/// Lightweight typed reference to a collection plus the application's
-/// per-collection TTL.
+/// A typed collection reference with the application's collection TTL.
 ///
-/// The TTL is `Option<CompactDuration>`: `Some(d)` binds a TTL via
-/// `USING TTL ?` on every Cassandra write the store issues for this
-/// collection; `None` writes via the `*_no_ttl` query variants and means the
-/// application opted into indefinite retention. An over-ceiling `Some(d)`
-/// (Cassandra rejects `USING TTL ?` values above `630_720_000` seconds) is
-/// rejected at `CollectionDefRegistry::register` time — never silently
-/// collapsed to `None`, which would turn a finite retention into permanent
-/// storage.
+/// `Some(d)` binds `USING TTL ?` on collection writes. `None` binds 0 for
+/// indefinite retention.
+/// `CollectionDefRegistry::register` rejects TTLs above Cassandra's
+/// `630_720_000`-second limit.
+/// It never converts an excessive TTL to `None`, which would make finite
+/// retention permanent.
 ///
-/// The per-collection TTL is sourced from the shared
-/// `CollectionDefRegistry`: the
-/// session builds a `CollectionRef` at stage time, and the bottom store builds
-/// one for its resolution write-backs, so both bind the same TTL. `None` is a
-/// deliberate value (indefinite retention), not a forgotten one. Reads do not
-/// see the TTL.
+/// The shared `CollectionDefRegistry` supplies the TTL. The session constructs
+/// a reference at stage time; the bottom store constructs one for resolution
+/// writes. Both use the same TTL. `None` deliberately selects indefinite
+/// retention. Reads do not use this TTL.
 ///
 /// # Identity invariant
 ///
-/// Equality, hashing, and ordering use **only** the inner [`CollectionId`].
-/// Two refs to the same logical collection compare equal regardless of TTL;
-/// the TTL is a per-write hint, not part of the collection's identity. The
-/// `Hash`/`Eq` impls are hand-rolled (not derived) to keep a future change
-/// to the struct from silently folding `ttl` into equality.
+/// Equality, hashing, and ordering use only [`CollectionId`]. References to the
+/// same collection compare equal regardless of TTL.
+/// The TTL controls writes, not identity. Explicit `Hash` and `Eq`
+/// implementations prevent a future field change from silently including TTL in
+/// equality.
 #[derive(Clone, Debug)]
 pub struct CollectionRef {
     id: CollectionId,
@@ -266,3 +274,8 @@ impl ClassifyError for StateNameError {
         ErrorCategory::Permanent
     }
 }
+
+/// An unknown persisted state namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+#[error("unknown state type {0}")]
+pub struct StateTypeError(pub(crate) i8);

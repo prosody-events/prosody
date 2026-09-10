@@ -27,6 +27,7 @@ use crate::timers::store::cassandra::CassandraTriggerStoreProvider;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use crate::{Codec, EventIdentity, EventType};
 use std::sync::Arc;
+use std::time::Duration;
 use validator::Validate;
 
 impl<C: Codec> ProsodyConsumer<C>
@@ -87,6 +88,7 @@ where
             keyed_state_config,
             consumer_config,
             DEFAULT_IDEMPOTENCE_VERSION,
+            Duration::ZERO,
         )?;
 
         let managers = Arc::default();

@@ -72,7 +72,7 @@ impl Arbitrary for SegmentTestInput {
                 _ => {
                     if inserted {
                         SegmentOperation::UpdateVersion {
-                            version: SegmentVersion::V3,
+                            version: SegmentVersion::V4,
                             slab_size,
                         }
                     } else {
@@ -227,7 +227,16 @@ where
     let mut model = SegmentModel::new(operations.segment().clone());
 
     // Apply all operations to both store and model, verifying queries inline
-    for (op_idx, op) in input.operations.iter().enumerate() {
+    let prefix = [
+        SegmentOperation::Insert,
+        SegmentOperation::Get,
+        SegmentOperation::UpdateVersion {
+            version: SegmentVersion::V4,
+            slab_size: input.slab_size,
+        },
+        SegmentOperation::Get,
+    ];
+    for (op_idx, op) in prefix.iter().chain(&input.operations).enumerate() {
         model.apply(op);
         match op {
             SegmentOperation::Insert => {

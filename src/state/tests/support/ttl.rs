@@ -1,6 +1,7 @@
 //! Fixed-TTL cell store used by cache metadata tests.
 
 use super::*;
+use crate::state::marker::MarkerState;
 use std::future::ready;
 
 #[derive(Clone)]
@@ -22,7 +23,6 @@ impl CellStore for TtlStub {
         &'a self,
         _collection: &'a CollectionId,
         _cell: &'a CellKey,
-        _own: EventRef,
     ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
         ready(Ok(Committed::new(Some(self.value.clone()))))
     }
@@ -31,7 +31,6 @@ impl CellStore for TtlStub {
         &'a self,
         _collection: &'a CollectionId,
         _cell: &'a CellKey,
-        _own: EventRef,
     ) -> impl Future<Output = Result<(Committed, Option<CompactDuration>), Self::Error>> + Send + 'a
     {
         ready(Ok((Committed::new(Some(self.value.clone())), self.ttl)))
@@ -41,15 +40,7 @@ impl CellStore for TtlStub {
         &'a self,
         _collection: &'a CollectionId,
         _scan: Scan<'a>,
-        _own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        stream::empty()
-    }
-
-    fn provisional_cells<'a>(
-        &'a self,
-        _collection: &'a CollectionId,
-    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
         stream::empty()
     }
 
@@ -97,18 +88,18 @@ impl CellStore for TtlStub {
         ready(Ok(()))
     }
 
-    fn unsettled_marker<'a>(
+    fn marker_state<'a>(
         &'a self,
         _collection: &'a CollectionId,
-    ) -> impl Future<Output = Result<Option<EventMarker>, Self::Error>> + Send + 'a {
-        ready(Ok(None))
+    ) -> impl Future<Output = Result<MarkerState, Self::Error>> + Send + 'a {
+        ready(Ok(MarkerState::default()))
     }
 
     fn commit_provisional<'a>(
         &'a self,
         _collection: &'a CollectionRef,
+        _marker: &'a EventMarker,
         _writes: &'a [(CellKey, ProvisionalWrite)],
-        _clears: &'a [SectionClear],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
         ready(Ok(()))
     }

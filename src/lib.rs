@@ -19,9 +19,9 @@
 //!   uniform cell store, registered per collection and bound by handlers
 //!   through the event context. Durability is one provisional cell per value
 //!   with no write-ahead log: after the middleware stack returns, a single
-//!   settle boundary stages the event's writes, arms the recovery backstop
-//!   timer, records the dedup marker, commits, and promotes; recovery resolves
-//!   durable provisional cells through the commit oracle.
+//!   settle boundary stages and promotes the writes, records dedup, and commits
+//!   the source. Admission resolves residue through collection evidence before
+//!   dispatch.
 
 #![allow(
     clippy::multiple_crate_versions,

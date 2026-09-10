@@ -11,6 +11,7 @@
 //! `segment_id` (and the property suites mint one per iteration) so rows never
 //! collide across runs.
 
+use crate::state::tests::support::StageInspection;
 mod batch_bind;
 mod batch_order;
 mod batch_reads;
@@ -20,37 +21,37 @@ mod properties;
 mod repair;
 mod ttl_marker;
 
+use super::batch::{fits_one_batch, marker_delete_unit, settle_batches, stage_batches};
 use super::decode::try_decode_marker;
 use super::{
     CassandraStore, CellAddr, CellBatchRow, CellBlobs, CellCorruptReason, CellKind, CellQueries,
     KeyRow, MarkerBlob, MarkerWriteRow, Pk, ResolvedRow, RowShape, StageRow, blob_weight,
-    decode_rows_for_coordinates, encode_cell_blobs, fits_one_batch, marker_delete_unit,
-    marker_last_split, sorted_unique_coordinates, ttl_seconds_to_duration,
+    decode_rows_for_coordinates, encode_cell_blobs, sorted_unique_coordinates,
+    ttl_seconds_to_duration,
 };
 use super::{decode, encoding};
 use crate::cassandra::{BatchUnit, CassandraStore as CassandraSession};
+use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::state::cached::Cached;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
-use crate::state::fjall::{MarkerCheckSet, test_db};
+use crate::state::cell_key::{CellKey, Coordinate, Section};
+use crate::state::fjall::test_db;
 use crate::state::marker::{EventMarker, SectionClear};
-use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::resolve::sweep_provisional;
 use crate::state::store::CellStore;
 use crate::state::store::CoordinateBatch;
 use crate::state::tests::cell_suite::{
-    ApplyTrace, BatchReadTrace, FailingCellStore, OverlayTrace, OverwriteTrace, PoisonHandle,
-    ProbedMarker, RawBatchTrace, SECTIONS, ScanTrace, ScriptedOracle, ShapeProbe, Trace, bytes,
-    cell_in, probed_parts, run_apply_idempotence, run_batch_alignment,
+    ApplyTrace, BatchReadTrace, FailingCellStore, MemoryDeduplicationStore, OverlayTrace,
+    OverwriteTrace, PoisonHandle, ProbedMarker, RawBatchTrace, SECTIONS, ScanTrace, ShapeProbe,
+    Trace, bytes, cell_in, probed_parts, run_apply_idempotence, run_batch_alignment,
     run_batch_duplicate_co_observation, run_batch_read_parity_trace,
-    run_blind_write_leaves_clears_free_marker, run_blind_write_survives_stale_clear,
-    run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_trace, run_overwrite_trace,
-    run_raw_batch_ascending_output, run_raw_batch_no_side_effects, run_raw_batch_parity_trace,
-    run_repair_after_marker_abort_converges, run_repair_defers_beneath_stale_clear, value_cell,
+    run_blind_write_leaves_clears_free_marker, run_bottom_scan_trace, run_crash_equivalence_trace,
+    run_overlay_trace, run_overwrite_trace, run_raw_batch_ascending_output,
+    run_raw_batch_no_side_effects, run_raw_batch_parity_trace, value_cell,
 };
-use crate::state::tests::support::{CountingOracle, fresh_collection, probe as event};
+use crate::state::tests::support::admit_collection;
+use crate::state::tests::support::{fresh_collection, probe as event};
 use crate::state::{
     CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateKey, StateName, StateType,
 };
@@ -71,7 +72,6 @@ use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
 use compatibility::mixed_binding_batch;
-use lifecycle::cell_i;
 use properties::finish;
 
 #[test]
@@ -104,7 +104,7 @@ fn row_encoding_uses_the_larger_present_payload() -> Result<()> {
 /// Reads physical Cassandra rows for shared store tests.
 ///
 /// This probe reads only the test trace's partition.
-/// It checks cell rows, one fixed marker row, and provisional rows.
+/// It checks cell rows, both marker addresses, and provisional rows.
 struct CassandraShapeProbe {
     session: CassandraSession,
 }
@@ -167,29 +167,28 @@ impl ShapeProbe for CassandraShapeProbe {
             .query_unpaged(cql, pk_binds(id))
             .await?
             .into_rows_result()?;
-        let mut rows: Vec<MarkerSliceRow> = Vec::new();
+        let mut staged = None;
+        let mut count = 0_usize;
         for row in result.rows::<MarkerSliceRow>()? {
-            rows.push(row?);
+            let (section, coordinate, data, encoding, version, raw_event) = row?;
+            count += 1_usize;
+            if section != 0 || count > 2_usize {
+                return Err(eyre!("invalid marker slice"));
+            }
+            match coordinate.as_slice() {
+                [] => {
+                    let marker = try_decode_marker((data, encoding, version, raw_event), None)?;
+                    let (cells, clears) = probed_parts(&marker);
+                    staged = Some((marker.event(), cells, clears));
+                }
+                [1] => {
+                    let marker = try_decode_marker((data, encoding, version, raw_event), None)?;
+                    assert!(marker.staged().is_empty() && marker.clears().is_empty());
+                }
+                _ => return Err(eyre!("unknown marker coordinate")),
+            }
         }
-        // The structural postcondition: the whole marker slice is at most ONE
-        // row, at the fixed address — zero per-coordinate rows exist.
-        if rows.len() > 1 {
-            return Err(eyre!(
-                "marker slice holds {} rows, expected ≤ 1",
-                rows.len()
-            ));
-        }
-        let Some((section, coordinate, data, encoding, version, raw_event)) = rows.pop() else {
-            return Ok(None);
-        };
-        if section != 0 || !coordinate.is_empty() {
-            return Err(eyre!(
-                "marker row off the fixed address: section {section}, coordinate {coordinate:?}"
-            ));
-        }
-        let marker = try_decode_marker((data, encoding, version, raw_event))?;
-        let (staged, clears) = probed_parts(&marker);
-        Ok(Some((marker.event(), staged, clears)))
+        Ok(staged)
     }
 
     async fn provisional_rows(&self, id: &CollectionId) -> Result<BTreeSet<(i8, u8)>> {
@@ -220,12 +219,12 @@ impl ShapeProbe for CassandraShapeProbe {
 
 /// The production committed bottom assembly: fjall write-through over the
 /// resolving Cassandra cell store.
-type Bottom = Cached<CassandraStore<ScriptedOracle>>;
+type Bottom = Cached<CassandraStore>;
 
 /// [`Bottom`] with the crash trace's lower fault seam between the cache and
 /// the resolving store, so generated lower-store faults fire beneath the
 /// cache.
-type FaultyBottom = Cached<FailingCellStore<CassandraStore<ScriptedOracle>>>;
+type FaultyBottom = Cached<FailingCellStore<CassandraStore>>;
 
 /// The shared driver session and prepared cell statements — the
 /// partition-independent half both the bottom store and the property assemblies
@@ -250,22 +249,11 @@ async fn fixture() -> Result<Fixture> {
 impl Fixture {
     /// Returns a Cassandra store with a cold check set.
     /// Each store models a new assignment.
-    fn bottom_store<O: CommitOracle>(&self, oracle: O) -> Result<CassandraStore<O>> {
-        Ok(self.bottom_store_with(oracle, test_db::cold_marker_checks()?))
-    }
-
-    /// Returns a Cassandra store with an explicit marker-check set.
-    fn bottom_store_with<O: CommitOracle>(
-        &self,
-        oracle: O,
-        marker_checks: MarkerCheckSet,
-    ) -> CassandraStore<O> {
+    fn bottom_store(&self) -> CassandraStore {
         CassandraStore::new(
             self.cassandra.clone(),
             self.queries.clone(),
-            oracle,
             self.registry.clone(),
-            marker_checks,
         )
     }
 }
@@ -284,7 +272,7 @@ async fn provisional_cells<S>(
 where
     S: CellStore,
 {
-    let stream = store.provisional_cells(id);
+    let stream = store.staged_cells(id);
     futures::pin_mut!(stream);
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {

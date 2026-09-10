@@ -2,8 +2,8 @@
 //!
 //! The [`CassandraReaderBackend`] seeds committed state through the **real**
 //! owner [`KeyedStateSession`](crate::state::session::KeyedStateSession) over a
-//! `CassandraStore<FixedOracle>` and reads it back through the production
-//! oracle-free carriers ([`CassandraCellResources`]). The same
+//! `CassandraStore` and reads it back through the production
+//! shared cell resources ([`CassandraCellResources`]). The same
 //! `run_reader_{value,map,deque}_trace` runner the memory suite uses
 //! ([`reader_suite`](super::reader_suite)) runs here over live CQL, adding
 //! Cassandra coverage for Value, Map, Deque, scans, and the two-group probe.
@@ -41,7 +41,6 @@ use crate::state::order_codec::I64KeyCodec;
 use crate::state::publication::{PublicationStore, StatePublication};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::tests::collection_suite::{DequeOp, MapOp, Trace};
-use crate::state::tests::support::FixedOracle;
 use crate::state::{StateName, StateType};
 use crate::state_reader::backend::ReaderComponents;
 use crate::state_reader::cache::ReaderCache;
@@ -60,12 +59,12 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// The live-Cassandra [`ReaderBackend`]. It holds one
-/// `CassandraStore<FixedOracle>`, which bundles a shared session, prepared
-/// queries, and one `MarkerMemo`/`MarkerCheckSet` lifecycle. That store is
+/// `CassandraStore`, which bundles a shared session, prepared
+/// queries, and one assignment workspace. That store is
 /// cloned into a fresh owner session for each event. The reader reads through
 /// [`CassandraCellResources`] over the same session and the same queries.
 struct CassandraReaderBackend {
-    store: CassandraCellStore<FixedOracle>,
+    store: CassandraCellStore,
     cells: CassandraCellResources,
     publications: CassandraPublicationStore,
     identities: CassandraDescriptorIdentityStore,
@@ -80,7 +79,7 @@ impl ReaderBackend for CassandraReaderBackend {
         CassandraDescriptorIdentityStore,
         MemoryLoader<Value>,
     >;
-    type OwnerCell = CassandraCellStore<FixedOracle>;
+    type OwnerCell = CassandraCellStore;
 
     fn registry(&self) -> Arc<CollectionDefRegistry> {
         self.registry.clone()
@@ -182,14 +181,8 @@ async fn cassandra_backend() -> Result<CassandraReaderBackend> {
     )?;
     let registry = Arc::new(registry);
 
-    let presence = test_db::marker_checks("state_reader_cassandra_presence")?;
-    let store = CassandraCellStore::new(
-        conn.clone(),
-        cell_queries.clone(),
-        FixedOracle::committed(),
-        registry.clone(),
-        presence,
-    );
+    let _presence = test_db::marker_checks("state_reader_cassandra_presence")?;
+    let store = CassandraCellStore::new(conn.clone(), cell_queries.clone(), registry.clone());
     let cells = CassandraCellResources::new(conn.clone(), cell_queries);
     let publications = CassandraPublicationStore::new(conn.clone(), publication_queries);
     let identities = CassandraDescriptorIdentityStore::new(conn, identity_queries);

@@ -15,6 +15,14 @@
 //! | `version` present and ≠ [`INITIAL_VERSION`]              | `VersionMismatch`                  |
 //! | semantically-corrupt `event` UDT (e.g. `kind == 7`)      | `CorruptUdt`                       |
 //!
+//! The marker slice has separate shapes:
+//!
+//! | Coordinate | Payload | Decode |
+//! | --- | --- | --- |
+//! | `[]` | data, encoding, version, event | `Staged`, payload version 1 or 2 |
+//! | `[1]` | data, encoding, version, event | `Committed`, version 2 without cells or clears |
+//! | other | any | permanent marker-coordinate corruption |
+//!
 //! Point reads and recovery reads use the same row-shape validation. Recovery
 //! skips only the body decode for a valid resolved row.
 //!
@@ -46,7 +54,10 @@ use crate::state::cassandra::error::CassandraCellStoreError;
 use crate::state::cassandra::udt::RawEventRef;
 use crate::state::cell::{Cell, Committed, ProvisionalCell};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
-use crate::state::marker::{EventMarker, decode_marker_payload};
+use crate::state::marker::{
+    CommittedMarker, EventMarker, MarkerState, MarkerVersion, decode_marker_payload,
+};
+use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use thiserror::Error;
 
@@ -123,9 +134,7 @@ pub(super) fn split_keyed_cell_ttl(
     )
 }
 
-/// Four-column shape produced by the `marker_read` point read of the
-/// fixed-address event-marker row: the frozen payload blob, its shared
-/// `encoding`/`version`, and the staging event.
+/// The staged payload columns, after the slice decoder removes the coordinate.
 pub(super) type MarkerRow<B = Vec<u8>> = (
     Option<B>,           // data (the frozen marker payload)
     Option<i16>,         // encoding
@@ -133,8 +142,43 @@ pub(super) type MarkerRow<B = Vec<u8>> = (
     Option<RawEventRef>, // event (the staging event)
 );
 
-/// Marker point-read row that borrows its payload from the response frame.
-pub(super) type BorrowedMarkerRow<'frame> = MarkerRow<&'frame [u8]>;
+/// A marker-slice row with a borrowed coordinate and payload.
+pub(super) type BorrowedMarkerRow<'frame> = (
+    &'frame [u8],
+    Option<&'frame [u8]>,
+    Option<i16>,
+    Option<i32>,
+    Option<RawEventRef>,
+);
+
+/// Decodes one row into the shared marker-slice result.
+pub(super) fn decode_marker_row(
+    state: &mut MarkerState,
+    row: BorrowedMarkerRow<'_>,
+    legacy_ttl: Option<CompactDuration>,
+) -> Result<(), CassandraCellStoreError> {
+    let (coordinate, data, encoding, version, event) = row;
+    match coordinate {
+        [] => {
+            state.staged = Some(try_decode_marker(
+                (data, encoding, version, event),
+                legacy_ttl,
+            )?);
+        }
+        [1] => {
+            let marker = try_decode_marker((data, encoding, version, event), legacy_ttl)?;
+            if marker.version() != MarkerVersion::V2
+                || !marker.staged().is_empty()
+                || !marker.clears().is_empty()
+            {
+                return Err(CellCorruptReason::IncompleteMarker.into());
+            }
+            state.committed = Some(CommittedMarker::from(&marker));
+        }
+        _ => return Err(CellCorruptReason::MarkerCoordinate.into()),
+    }
+    Ok(())
+}
 
 /// Builds the [`CellKey`] a scanned row's clustering columns address.
 /// Infallible: the clustering key is opaque to the cell layer (validated, if
@@ -146,16 +190,16 @@ pub(super) fn clustered_cell_key(section: i8, coordinate: Vec<u8>) -> CellKey {
     }
 }
 
-/// Decodes the event-marker row into an [`EventMarker`]. An existing marker
-/// row must carry both its `event` and its payload `data` — the marker
-/// statement writes them together — so a NULL in either is a corrupt marker
-/// ([`CellCorruptReason::IncompleteMarker`], Permanent), never tolerated: the
-/// shape is unwritten by any build (the marker design shipped unreleased).
+/// Decodes Staged into an [`EventMarker`]. Missing event or payload data is
+/// permanent corruption: the stage statement writes both together.
+/// Like cell reads, this decoder accepts a NULL version; it uses version 1
+/// although no stage statement writes that shape.
 pub(super) fn try_decode_marker<B: AsRef<[u8]>>(
     row: MarkerRow<B>,
+    legacy_ttl: Option<CompactDuration>,
 ) -> Result<EventMarker, CassandraCellStoreError> {
     let (data, encoding, version, event) = row;
-    validate_version(version)?;
+    let version = MarkerVersion::try_from(version.unwrap_or(INITIAL_VERSION))?;
     let Some(raw_event) = event else {
         return Err(CellCorruptReason::IncompleteMarker.into());
     };
@@ -164,7 +208,7 @@ pub(super) fn try_decode_marker<B: AsRef<[u8]>>(
     let Some(payload) = decode_blob(data, encoding)? else {
         return Err(CellCorruptReason::IncompleteMarker.into());
     };
-    Ok(decode_marker_payload(event, &payload)?)
+    Ok(decode_marker_payload(event, &payload, version, legacy_ttl)?)
 }
 
 /// Decodes a keyed cell row into its [`CellKey`] and [`Cell`], for the
@@ -319,6 +363,9 @@ fn validate_version(version: Option<i32>) -> Result<(), CassandraCellStoreError>
 /// Specific cell-row corruption shape.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
 pub enum CellCorruptReason {
+    /// The marker slice contains an unknown coordinate.
+    #[error("unknown marker coordinate")]
+    MarkerCoordinate,
     /// `event` is NULL but `prev_data` is non-NULL. No statement writes this
     /// shape: `prev_data` is only ever set alongside `event` by a provisional
     /// write, and both are nulled together on resolution.
@@ -330,9 +377,7 @@ pub enum CellCorruptReason {
     #[error("a cell blob is non-NULL but encoding is NULL")]
     BlobWithoutEncoding,
 
-    /// An event-marker row exists but is missing its `event` or payload
-    /// `data`. The marker statement writes both together; no build produces
-    /// this shape.
+    /// A marker row lacks its event, or it lacks its payload.
     #[error("an event-marker row is missing its event or payload")]
     IncompleteMarker,
 }

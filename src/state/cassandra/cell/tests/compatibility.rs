@@ -1,5 +1,7 @@
 use super::*;
 use crate::cassandra::TABLE_KEYED_STATE_CELL;
+use crate::state::marker::MarkerRow;
+use crate::state::tests::support::{StageInspection, evidence};
 
 async fn read_cell_blob(fx: &Fixture, id: &CollectionId) -> Result<(Vec<u8>, i16)> {
     let cql = format!(
@@ -37,7 +39,7 @@ async fn read_cell_blob(fx: &Fixture, id: &CollectionId) -> Result<(Vec<u8>, i16
 async fn legacy_null_null_residue_reads_committed_none() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default())?;
+    let store = fx.bottom_store();
     let c = collection("legacy-residue")?;
     let cell = value_cell();
     let id = c.id();
@@ -64,7 +66,7 @@ async fn legacy_null_null_residue_reads_committed_none() -> Result<()> {
         .await?;
 
     assert_eq!(
-        store.get(id, &cell, event(1)).await?,
+        store.get(id, &cell).await?,
         Committed::new(None),
         "the decoder must read the legacy residue as committed-absence"
     );
@@ -79,7 +81,7 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default())?;
+    let store = fx.bottom_store();
     let c = collection("cart")?;
     let cell = value_cell();
     let payload = Bytes::from(vec![0xAB_u8; 16 * 1024 + 1]);
@@ -116,7 +118,7 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
 async fn cassandra_data_column_is_raw_through_the_block_size() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default())?;
+    let store = fx.bottom_store();
     let c = collection("raw-format")?;
     let cell = value_cell();
     let payload = Bytes::from_static(b"raw durable payload");
@@ -148,7 +150,7 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default())?;
+    let store = fx.bottom_store();
     let c = collection("corrupt-timer")?;
     let id = c.id();
 
@@ -168,7 +170,7 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
             event(1),
         ),
     )];
-    let marker = EventMarker::frozen(event(1), &writes, &[]);
+    let marker = EventMarker::frozen(event(1), &writes, &[], &evidence([].into(), None));
     store.write_provisional(&c, &writes, Some(&marker)).await?;
     let corrupt_cell = format!(
         "UPDATE {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} SET event = {{kind: 1, msg_dedup_id: \
@@ -188,7 +190,7 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
         .query_unpaged(corrupt_cell, binds)
         .await?;
 
-    let stream = store.provisional_cells(id);
+    let stream = store.staged_cells(id);
     futures::pin_mut!(stream);
     let err = loop {
         match stream.next().await {
@@ -215,14 +217,14 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
 fn prop_cassandra_present_cell_is_uniquely_owned() {
     async fn check(payload: Vec<u8>) -> Result<bool> {
         let fx = fixture().await?;
-        let store = fx.bottom_store(ScriptedOracle::default())?;
+        let store = fx.bottom_store();
         let c = collection("uniq")?;
         let cell = value_cell();
         let data = Bytes::from(payload);
         store
             .write_resolved(&c, &[(cell.clone(), Some(data))], &[])
             .await?;
-        let Some(bytes) = store.get(c.id(), &cell, event(1)).await?.into_inner() else {
+        let Some(bytes) = store.get(c.id(), &cell).await?.into_inner() else {
             return Err(eyre!("expected a present committed value"));
         };
         Ok(bytes.try_into_mut().is_ok())
@@ -245,32 +247,25 @@ fn prop_cassandra_present_cell_is_uniquely_owned() {
         .quickcheck(prop as fn(Vec<u8>) -> TestResult);
 }
 
-/// Co-anchoring regression-prover: every cell of one multi-cell
-/// write under a collection TTL must share a single write timestamp **and**
-/// TTL. One same-partition `UNLOGGED BATCH` carries one batch write timestamp
-/// and one coordinator TTL anchor, so `WRITETIME(data)` and `TTL(data)` are
-/// identical across the cells; the old per-cell `execute()` loop stamped each
-/// statement with a *distinct* monotonic client timestamp, so this fails
-/// **deterministically** against it — the discriminator is the timestamp, not
-/// wall-clock TTL drift, so there is no second-boundary flakiness. Run over
-/// multi-cell writes of varying cardinality and payload sizes.
+/// One batch shares a write timestamp and TTL. A zero TTL leaves every value
+/// without expiry.
+/// The batch write timestamp, independent of wall-clock TTL drift, makes a
+/// per-statement write loop fail every time.
 #[test]
 fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
     use crate::cassandra::TABLE_KEYED_STATE_CELL;
     use crate::state::cell_key::Coordinate;
     use crate::timers::duration::CompactDuration;
 
-    async fn check(payloads: Vec<Vec<u8>>) -> Result<bool> {
+    async fn check(payloads: Vec<Vec<u8>>, finite: bool) -> Result<bool> {
         let fx = fixture().await?;
-        let store = fx.bottom_store(ScriptedOracle::default())?;
+        let store = fx.bottom_store();
         let id = CollectionId::new(
             StateKey::new(Uuid::new_v4(), Arc::from("k")),
             StateType::Application,
             StateName::try_new("co-anchor")?,
         );
-        // A collection TTL so the `USING TTL` path is exercised; the batch must
-        // apply one coordinator anchor across every cell.
-        let c = CollectionRef::new(id.clone(), Some(CompactDuration::new(3_600)));
+        let c = CollectionRef::new(id.clone(), finite.then_some(CompactDuration::new(3_600)));
         let cells: Vec<(CellKey, Option<Bytes>)> = payloads
             .iter()
             .enumerate()
@@ -284,8 +279,7 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
             .collect();
         store.write_resolved(&c, &cells, &[]).await?;
 
-        // `WRITETIME`/`TTL` are read functions (no schema change); both are
-        // non-null because every cell wrote a present `data`.
+        // Read the timestamp and expiry of each stored value.
         let cql = format!(
             "SELECT WRITETIME(data), TTL(data) FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? AND kind = 0 AND \
@@ -306,8 +300,8 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
             )
             .await?
             .into_rows_result()?;
-        let mut writetimes: Vec<Option<i64>> = Vec::new();
-        let mut ttls: Vec<Option<i32>> = Vec::new();
+        let mut writetimes: Vec<Option<i64>> = Vec::with_capacity(cells.len());
+        let mut ttls: Vec<Option<i32>> = Vec::with_capacity(cells.len());
         for row in result.rows::<(Option<i64>, Option<i32>)>()? {
             let (writetime, ttl) = row?;
             writetimes.push(writetime);
@@ -316,16 +310,26 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
         // One batch ⇒ every cell shares the batch timestamp and the TTL anchor.
         let writetime_equal = writetimes.windows(2).all(|w| w[0] == w[1]);
         let ttl_equal = ttls.windows(2).all(|w| w[0] == w[1]);
-        Ok(writetime_equal && ttl_equal)
+        Ok(writetimes.len() == cells.len()
+            && writetimes.iter().all(Option::is_some)
+            && writetime_equal
+            && ttl_equal
+            && ttls.iter().all(|ttl| {
+                if finite {
+                    ttl.is_some_and(|ttl| (1_i32..=3_600_i32).contains(&ttl))
+                } else {
+                    ttl.is_none()
+                }
+            }))
     }
 
-    fn prop(payloads: Vec<Vec<u8>>) -> TestResult {
+    fn prop(payloads: Vec<Vec<u8>>, finite: bool) -> TestResult {
         // ≥2 cells for "equal across cells" to discriminate; ≤256 so the
         // index-as-coordinate-byte stays unique.
         if payloads.len() < 2 || payloads.len() > 256 {
             return TestResult::discard();
         }
-        match TEST_RUNTIME.block_on(check(payloads)) {
+        match TEST_RUNTIME.block_on(check(payloads, finite)) {
             Ok(true) => TestResult::passed(),
             Ok(false) => TestResult::error(
                 "cells of one multi-cell write had differing WRITETIME/TTL — not one batch",
@@ -337,7 +341,7 @@ fn prop_multi_cell_write_co_anchors_writetime_and_ttl() {
     init_test_logging();
     QuickCheck::new()
         .tests(integration_test_count(25))
-        .quickcheck(prop as fn(Vec<Vec<u8>>) -> TestResult);
+        .quickcheck(prop as fn(Vec<Vec<u8>>, bool) -> TestResult);
 }
 
 /// Builds the mixed-statement batch for the binding-order test: five one-row
@@ -372,9 +376,9 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.write_provisional_no_ttl,
+                statement: &q.write_provisional,
                 row: RowShape::Stage(StageRow {
-                    ttl: None,
+                    ttl: 0,
                     data: blob_a.data(),
                     prev_data: None,
                     encoding: blob_a.encoding(),
@@ -397,9 +401,9 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.write_resolved_no_ttl,
+                statement: &q.write_resolved,
                 row: RowShape::Resolved(ResolvedRow {
-                    ttl: None,
+                    ttl: 0,
                     data: blob_c.data(),
                     encoding: blob_c.encoding(),
                     version: blob_c.version(),
@@ -420,13 +424,13 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.marker_write_no_ttl,
+                statement: &q.marker_write,
                 row: RowShape::MarkerWrite(MarkerWriteRow {
-                    ttl: None,
+                    ttl: 0,
                     payload: marker_blob.payload.as_ref(),
                     encoding: marker_blob.payload.encoding(),
                     event: event(2),
-                    addr: CellAddr::marker(pk),
+                    addr: CellAddr::marker(pk, MarkerRow::Staged),
                 }),
             }],
         ),

@@ -1,66 +1,29 @@
 //! Per-event keyed-state sessions.
 //!
-//! A session is the per-event view over a partition's keyed-state cell store:
-//! byte-cell reads and writes buffer in a per-event dirty overlay, and the
-//! framework drives the stage/promote lifecycle through sealed supertraits
-//! that downstream crates can neither implement nor call.
+//! A session owns an overlay over the partition's committed cell store. Clones
+//! share the dirty workspace and event identity. Collection handles use scoped
+//! operations through the session gate. The gate serializes operations and
+//! fences stale attempt handles.
 //!
-//! [`KeyedStateSession`] is the real session, minted per event by the
-//! partition's state manager. It holds **one uniform
-//! `Overlay`** (the per-event `DirtyStore` over the partition's committed
-//! cell store): clones share the per-event dirty overlay and reload-marker
-//! override plus the cross-event singletons (the commit oracle, the armed
-//! backstop, the event, the registry), so repeated descriptor binds of one
-//! collection accumulate into one write.
+//! The framework closes the gate after the handler returns. Finalize stages
+//! each `ReadCommitted` collection and returns a linear receipt.
+//! `ReadUncommitted` collections write resolved values during finalize. The
+//! boundary promotes the receipt before it records dedup evidence and commits
+//! the source.
 //!
-//! # The session surface
-//!
-//! The session's reads and staged mutations are crate-private inherent methods
-//! on [`KeyedStateSession`]. Their only production caller is the owner engine
-//! (`crate::state::collection::owner`): a collection handle opens one scoped
-//! operation, and the engine turns that operation into those calls. The suites
-//! reach them through the `#[cfg(test)]` seeding seams further down this file.
-//! No trait carries one, so nothing outside `crate::state` can reach a cell.
-//!
-//! Two sealed traits hold the framework's own moves. `sealed::StateLifecycle`
-//! is the manager-driven lifecycle (`finalize` and the attempt/teardown verbs —
-//! settling moved onto the receipt `finalize` returns).
-//! `sealed::MarkerIdentity` is the boundary-readable message-marker identity.
-//!
-//! [`EventSession`] bundles those two with [`WritableStateSession`]. It is the
-//! bound the framework threads through every per-event signature, including
-//! [`EventContext::State`]. It names no cell and no permit, and its sealed
-//! supertraits mean a downstream crate can name it but can never supply one.
-//!
-//! # Lifecycle
-//!
-//! The framework's per-event sequence, driven by the durability boundary
-//! (`crate::consumer::middleware`'s blanket `EventHandler` impl) in
-//! straight-line code:
-//!
-//! 1. Handler ops buffer into the dirty overlay.
-//! 2. On a final handler success, `finalize` groups the one dirty map by
-//!    collection and stages each in one same-partition batch — `ReadCommitted`
-//!    collections stage provisional cells, `ReadUncommitted` ones write
-//!    resolved values — draining the event's dirty range (the stage consumes
-//!    the buffered ops) and returning the staged work as a linear `Finalized`
-//!    receipt.
-//! 3. Strictly after the stage, the boundary records the message commit marker
-//!    read from the session's event identity — the message `EventRef`'s dedup
-//!    id, or the deferred-reload override (`message_marker`) — through the
-//!    commit oracle. After the offset/trigger commit the boundary consumes the
-//!    receipt: `certify().promote()` promotes the staged cells; on an
-//!    arm-shutdown abort `rollback()` restores their committed bases.
-//! 4. At attempt boundaries the retry loop runs the `next_attempt` verb, whose
-//!    `reset` transition discards this event's dirty buffer (under the gate)
-//!    and bumps the attempt epoch, so the next attempt starts clean and any
-//!    handle leaked from the failed attempt is fenced; the identity override
-//!    persists by design (it is identity, not decision).
+//! `EventSession` bundles the writable session with sealed lifecycle and marker
+//! interfaces. Downstream code cannot implement those interfaces. Retry resets
+//! the overlay and advances the attempt epoch. A deferred reload retains its
+//! last message identity across that reset.
 
 use crate::consumer::event_context::EventContext;
+use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::middleware::{MarkerWrite, RepinProof};
 use crate::consumer::partition::ShutdownPhase;
+use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::CommitDecision;
 use crate::state::access::StateAccessError;
+use crate::state::backend::AdmissionChecks;
 use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::collection::{StateSession, WritableStateSession};
@@ -69,30 +32,30 @@ use crate::state::descriptor::{
 };
 use crate::state::dirty::{CellSnapshot, ClearedSections, DirtyStore, DirtyVal, ResolvedCells};
 use crate::state::identity::{CollectionId, CollectionRef};
-use crate::state::manager::ArmedKeys;
-use crate::state::marker::{EventMarker, SectionClear};
-use crate::state::oracle::CommitOracle;
+use crate::state::marker::{AttemptId, EventEvidence, EventMarker, SectionClear};
 use crate::state::overlay::Overlay;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+use crate::state::resolve::resolve_event_marker;
+use crate::state::retry::{StepOutcome, retry_step};
 use crate::state::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch};
 use crate::state::{
     CollectionKindId, CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY,
     StateBackend, StateKey, StateName, StateType, StoreOutcome,
 };
-use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use parking_lot::{Mutex as SyncMutex, RwLock};
 pub(in crate::state) use sealed::MutatePermit;
-pub(crate) use sealed::{Finalized, MessageMarker, OpPermit, SessionGate};
-use sealed::{MarkerIdentity, StagedCollection, StagedState, StateLifecycle};
+pub(crate) use sealed::{Finalized, MessageMarker, OpPermit, Promoted, SessionGate};
+use sealed::{MarkerIdentity, Staged, StagedCollection, StateLifecycle};
+use smallvec::SmallVec;
 use std::fmt;
 use std::future::Future;
 use std::iter::from_fn;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::coop::cooperative;
@@ -122,16 +85,19 @@ impl<S: StateLifecycle + MarkerIdentity + WritableStateSession> EventSession for
 /// surfaces: staging, promoting, and discarding are framework-only moves.
 pub(crate) mod sealed {
     use super::{
-        CellKey, CellStore, CollectionRef, CompactDateTime, CompactDuration, Duration, Future,
-        MarkerWrite, ProvisionalWrite, RepinProof, SectionClear, StateAccessError, Uuid,
-        resolve_collections,
+        AdmissionChecks, CellKey, CellStore, CollectionRef, Duration, EventMarker, Future,
+        MarkerWrite, ProvisionalWrite, RepinProof, STATE_FANOUT_CONCURRENCY, StateAccessError,
+        StepOutcome, Uuid, resolve_collections, retry_step,
     };
+    use futures::{StreamExt, stream};
     use opentelemetry::global::meter;
     use opentelemetry::metrics::Counter;
     use std::ops::{Deref, DerefMut};
     use std::sync::LazyLock;
     use tokio::sync::{Mutex as TokioMutex, MutexGuard};
+    use tokio::task::coop::cooperative;
     use tokio::time::timeout;
+    use tracing::{error, warn};
 
     /// How long a settle-boundary gate acquire waits between rate-limited
     /// warnings while a still-running session op holds the gate.
@@ -180,9 +146,9 @@ pub(crate) mod sealed {
     ///
     /// A *scan-path* stream takes the gate only for its init metadata read, and
     /// is per-item live thereafter. Its per-item resolution is a pure **read**:
-    /// a scan never writes a resolution back durably, because the point-read,
-    /// first-touch, and recovery-sweep paths own repair. A concurrent
-    /// mid-stream `commit()` on a scanned cell is therefore never clobbered.
+    /// a scan never writes a resolution back durably, because admission owns
+    /// residue resolution. A concurrent mid-stream `commit()` on a scanned
+    /// cell is therefore never clobbered.
     ///
     /// A mutator that races a live stream (`join!`, or a handler that mutates
     /// its own collection between stream items) waits at most one chunk fetch
@@ -373,16 +339,9 @@ pub(crate) mod sealed {
         }
     }
 
-    /// The message commit-marker identity: the dedup id the settlement
-    /// boundary records through the commit oracle and the deduplication
-    /// filter reads. A newtype so it cannot be confused with any other
-    /// `Uuid` at the oracle-write signature.
-    ///
-    /// Two sources feed it, one accessor reads it
-    /// ([`MarkerIdentity::message_marker`]): a message session's own
-    /// [`EventRef::Message`](crate::state::EventRef) dedup id, or the
-    /// deferred-reload identity override
-    /// ([`MarkerIdentity::set_reload_marker`]) on a timer session.
+    /// The message dedup id that settlement records and the duplicate filter
+    /// reads. Message sessions use their event id. Deferred reloads supply
+    /// an override through [`MarkerIdentity::set_reload_marker`].
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct MessageMarker(Uuid);
 
@@ -393,35 +352,18 @@ pub(crate) mod sealed {
             Self(dedup_id)
         }
 
-        /// The raw dedup id, for the oracle write and the dedup-store lookup.
+        /// The raw id for dedup writes and lookups.
         #[must_use]
         pub(crate) fn into_uuid(self) -> Uuid {
             self.0
         }
     }
 
-    /// One collection's frozen settlement record: the provisional cells
-    /// `finalize` staged (the ref carries the TTL) plus the frozen
-    /// [`SectionClear`]s its event marker carries — what the receipt promotes
-    /// or rolls back.
-    ///
-    /// Built exactly once per collection, at `finalize`, from the
-    /// post-`commit()` dirty buffer — `commit()`-landed cells are already
-    /// durably committed and never marker-listed, so the record lists exactly
-    /// the cells recovery owns. Only a retry attempt re-running `finalize`
-    /// rebuilds it, overwriting the same-event marker idempotently. Only
-    /// `ReadCommitted` collections appear; `ReadUncommitted` writes resolve at
-    /// stage time with nothing to settle. Survivors nest inside their
-    /// [`SectionClear`] — never a parallel vector — so promote/rollback
-    /// structurally cannot recompute them from live provisional rows. The
-    /// record and the skinny durable marker payload deliberately do not
-    /// merge: the marker persists coordinates (recovery rebuilds writes by
-    /// point-read); the record holds the full [`ProvisionalWrite`]s for the
-    /// inline promote/rollback. Each `(cell, write)`'s `data` is the value to
-    /// promote to, `prev` the committed base to roll back to; the clears
-    /// apply on the commit arm only (rollback needs no clear leg — the stage
-    /// touched nothing destructive). A clears-only collection appears with an
-    /// empty write set — the entry that arms the recovery backstop.
+    /// One collection's staged cells and frozen marker, retained for promote.
+    /// Only `ReadCommitted` collections enter this receipt. A clear-only
+    /// collection has no cell writes. The durable marker stores
+    /// coordinates. This receipt retains values so promote needs no cell
+    /// reload.
     // `Vec`, not `SmallVec`, deliberately: the receipt is held across the
     // settle boundary's awaits, so inline entries bloat every such future past
     // clippy's `large_futures` bound. The `with_capacity` folds at the build
@@ -429,111 +371,90 @@ pub(crate) mod sealed {
     pub struct StagedCollection {
         pub(super) collection: CollectionRef,
         pub(super) writes: Vec<(CellKey, ProvisionalWrite)>,
-        pub(super) clears: Vec<SectionClear>,
+        pub(super) marker: EventMarker,
     }
 
-    /// Whether `finalize` staged any provisional cells — and, when it did,
-    /// the linear receipt that owns settling them. Mintable only by
-    /// `finalize` (module-private fields, non-`Clone`), so possession of a
-    /// [`StagedState`] proves a successful stage: apply-before-finalize,
-    /// double-settle, and the recovery-delay of a never-staged event are
-    /// unrepresentable.
+    /// The provisional work that a successful stage produced.
     #[must_use]
-    pub enum Finalized<S: CellStore> {
-        /// Nothing staged: no collection was dirtied, or every dirty
-        /// collection was `ReadUncommitted` and written resolved during
-        /// `finalize`.
+    pub enum Finalized<S: CellStore, K: AdmissionChecks> {
+        /// No provisional work remains.
         Clean,
-
-        /// At least one `ReadCommitted` collection staged; the boundary must
-        /// arm the `StateRecovery` backstop and consume the receipt.
-        Staged(StagedState<S>),
+        /// Promote the staged collections before the dedup row.
+        Staged(Staged<S, K>),
     }
 
-    /// The linear settlement receipt for one event's staged cells. Consumed
-    /// exactly once: [`Self::rollback`] before any marker record attempt, or
-    /// [`Self::certify`] → [`Promotable::promote`] after the commit.
+    /// One event's staged collections. Only finalize constructs this value.
     #[must_use]
-    pub struct StagedState<S: CellStore> {
-        /// Clone of the partition's lower committed store (an `Arc`-backed
-        /// handle).
+    pub struct Staged<S: CellStore, K: AdmissionChecks> {
         pub(super) store: S,
         pub(super) collections: Vec<StagedCollection>,
-        /// The `recovery_delay` floor tightened once, at finalize, by the
-        /// smallest `recovery_within` among the staged collections.
-        pub(super) recovery_delay: CompactDuration,
+        pub(super) checks: K,
+        pub(super) key: crate::Key,
     }
 
-    impl<S: CellStore> StagedState<S> {
-        /// Delay between this stage and its `StateRecovery` sweep.
-        pub(crate) fn recovery_delay(&self) -> CompactDuration {
-            self.recovery_delay
-        }
-
-        /// Rolls every staged cell back to its committed base (`prev`) after
-        /// the event aborted. Best-effort: each collection is driven to
-        /// completion regardless of siblings, per-collection failures warn,
-        /// and anything left provisional is the armed sweep's (or
-        /// first-touch's) to resolve — there is no caller decision to feed,
-        /// so no outcome is returned.
-        pub(crate) async fn rollback(self) {
-            resolve_collections(&self.store, self.collections, false).await;
-        }
-
-        /// Certifies the stage for promotion — entering the marker record
-        /// phase forfeits rollback. Before any record attempt, rolling back to
-        /// the committed base is sound; after one it is not: a record
-        /// write-timeout is ambiguous — the marker may be durable — so a
-        /// rollback could erase a committed write that redelivery then
-        /// dedup-filters away. In that window the staged cells stay
-        /// provisional and the (already-armed) sweep resolves them through
-        /// the oracle, which reads whether the marker landed. Consuming the
-        /// receipt here makes the rule structural: a [`Promotable`] has no
-        /// rollback.
-        pub(crate) fn certify(self) -> Promotable<S> {
-            Promotable(self)
-        }
+    /// The promote result retains rejected collections for rollback.
+    pub(crate) enum Promoted<S: CellStore, K: AdmissionChecks> {
+        Complete,
+        Torn(Staged<S, K>),
+        Rejected(Staged<S, K>),
+        Abandoned,
     }
 
-    /// A certified stage: after the durability-marker commit, the one
-    /// remaining move is [`Self::promote`].
-    #[must_use]
-    pub struct Promotable<S: CellStore>(StagedState<S>);
-
-    impl<S: CellStore> Promotable<S> {
-        /// Promotes the staged cells to their committed data (null
-        /// `event`/`prev`, O(1) per cell) after the event committed; the
-        /// commit arm also applies the frozen clears' gap erase. Best-effort:
-        /// failures warn per collection and fold into
-        /// [`ApplyOutcome::Incomplete`] (the backstop, always left armed,
-        /// lets the sweep retry).
-        pub(crate) async fn promote(self) -> ApplyOutcome {
-            let StagedState {
-                store, collections, ..
-            } = self.0;
-            if resolve_collections(&store, collections, true).await {
-                ApplyOutcome::Resolved
+    impl<S: CellStore, K: AdmissionChecks> Staged<S, K> {
+        /// Returns rejected collections for rollback.
+        /// Shutdown removes the admission proof.
+        pub(crate) async fn promote(
+            mut self,
+            shutdown: impl Fn() -> bool + Sync,
+        ) -> Promoted<S, K> {
+            let total = self.collections.len();
+            self.collections = resolve_collections(&self.store, self.collections, &shutdown).await;
+            if shutdown() {
+                if let Err(error) = self.checks.unmark(&self.key).await {
+                    warn!(%error, key = %self.key, "cannot remove admission proof");
+                }
+                Promoted::Abandoned
+            } else if self.collections.is_empty() {
+                Promoted::Complete
+            } else if self.collections.len() == total {
+                Promoted::Rejected(self)
             } else {
-                ApplyOutcome::Incomplete
+                Promoted::Torn(self)
             }
         }
-    }
 
-    /// Result of consuming a [`Promotable`] with [`Promotable::promote`].
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    #[must_use]
-    pub enum ApplyOutcome {
-        /// Every staged cell promoted to its committed data.
-        Resolved,
-
-        /// At least one resolution failed. Recovery is guaranteed without any
-        /// point-clear: the durability boundary never unschedules the per-key
-        /// `StateRecovery` backstop (only the sweep's own fire clears it), so
-        /// the standing backstop fires and the sweep retries; a
-        /// transient sweep failure reschedules a fresh backstop, a
-        /// permanent per-cell skip is left to first-touch and the key's
-        /// next commit. The backstop aborts only on shutdown.
-        Incomplete,
+        /// Restores the rejected collections before the boundary commits the
+        /// source.
+        pub(crate) async fn abort(self, shutdown: impl Fn() -> bool + Sync) -> bool {
+            let names: smallvec::SmallVec<[&str; 8]> = self
+                .collections
+                .iter()
+                .map(|staged| staged.collection.id().name().as_str())
+                .collect();
+            error!(key = %self.key, collections = ?names,
+                "promote rejected collections; restore committed state");
+            let complete = stream::iter(0..self.collections.len())
+                .map(|index| {
+                    let staged = &self.collections[index];
+                    cooperative(async {
+                        !matches!(
+                            retry_step(&shutdown, "keyed-state rollback", || {
+                                self.store
+                                    .abort_provisional(&staged.collection, &staged.writes)
+                            })
+                            .await,
+                            StepOutcome::Abandon
+                        )
+                    })
+                })
+                .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+                .fold(true, |all, done| async move { all && done })
+                .await;
+            if let Err(error) = self.checks.unmark(&self.key).await {
+                warn!(%error, key = %self.key, "cannot remove admission proof");
+            }
+            complete
+        }
     }
 
     /// Framework-only lifecycle over a per-event session: the settle boundary's
@@ -543,6 +464,9 @@ pub(crate) mod sealed {
         /// [`KeyedStateSession`](super::KeyedStateSession) projects its
         /// backend's store (`B::Cell`).
         type Cell: CellStore;
+
+        /// The admission proof store.
+        type Checks: AdmissionChecks;
 
         /// The session's operation gate (KV4) — the engine acquires each
         /// operation's permit through this accessor. On the sealed lifecycle
@@ -571,12 +495,10 @@ pub(crate) mod sealed {
         /// a retried `finalize` re-stages idempotently.
         fn finalize(
             &self,
-        ) -> impl Future<Output = Result<Finalized<Self::Cell>, StateAccessError>> + Send;
+        ) -> impl Future<Output = Result<Finalized<Self::Cell, Self::Checks>, StateAccessError>> + Send;
 
-        /// Records `marker` through the commit oracle. Idempotent — the
-        /// oracle write is a bare upsert — so the boundary retries failures
-        /// freely. [`MarkerWrite`] is constructible only inside the
-        /// settlement module, so this does not compile anywhere else.
+        /// Records the message dedup id with an idempotent upsert.
+        /// The boundary retries failures before it commits the source.
         fn record_marker(
             &self,
             marker: MessageMarker,
@@ -624,25 +546,6 @@ pub(crate) mod sealed {
         /// (the `next_attempt` verb and the settle final-hook stamp) can
         /// produce a live attempt-N+1 (or stamped-final) view.
         fn repin(&self, proof: RepinProof) -> Self;
-
-        /// The always-on `recovery_delay` floor (a plain config read). The
-        /// per-event tightened delay lives on the receipt
-        /// ([`StagedState::recovery_delay`], folded once at finalize); the
-        /// floor is for the defensive arm after a permanent finalize failure,
-        /// where no receipt exists.
-        fn recovery_floor(&self) -> CompactDuration;
-
-        /// The fire time of the `StateRecovery` backstop recorded as standing
-        /// for this session's key, or `None` when none has been recorded this
-        /// acquisition. `None` means *unknown*, not *unarmed*: the durable
-        /// trigger store may still hold a prior epoch's backstop, which
-        /// `arm_backstop` consults (and records here) before deciding.
-        /// `arm_backstop` re-arms only when its new fire is sooner.
-        fn backstop_armed(&self) -> impl Future<Output = Option<CompactDateTime>> + Send;
-
-        /// Records that a `StateRecovery` backstop firing at `fire` now stands
-        /// for this session's key (overwriting any earlier standing fire).
-        fn mark_backstop_armed(&self, fire: CompactDateTime) -> impl Future<Output = ()> + Send;
     }
 
     /// The message commit-marker identity surface — the sole home of
@@ -717,10 +620,8 @@ where
     /// cleared at each attempt/settle boundary.
     pub dirty: Arc<DirtyStore>,
 
-    /// Partition-lifetime commit oracle; the settle boundary records the
-    /// message commit row through it via `record_marker`. The same instance is
-    /// baked into `cell`.
-    pub oracle: B::Oracle,
+    /// The dedup store for this partition.
+    pub dedup: B::Dedup,
 
     /// Opaque per-session capability slot a [`CellResolver`] reads at resolve
     /// time.
@@ -737,11 +638,11 @@ where
     /// The event whose stages this session owns.
     pub event: EventRef,
 
-    /// Delay between staging and the `StateRecovery` sweep.
-    pub recovery_delay: CompactDuration,
+    /// The minimum retention for commit evidence.
+    pub(crate) dedup_ttl: CompactDuration,
 
-    /// Per-partition set of keys with a standing `StateRecovery` backstop.
-    pub armed: ArmedKeys,
+    /// The partition's admission checks.
+    pub(crate) checks: B::Checks,
 
     /// Termination signals captured at mint.
     pub termination: TerminationWatch,
@@ -776,13 +677,14 @@ where
     B: StateBackend,
 {
     overlay: Overlay<B::Cell>,
-    oracle: B::Oracle,
+    dedup: B::Dedup,
     loader: L,
     registry: Arc<CollectionDefRegistry>,
     state_key: StateKey,
     event: EventRef,
-    recovery_delay: CompactDuration,
-    armed: ArmedKeys,
+    stage_attempt: OnceLock<AttemptId>,
+    dedup_ttl: CompactDuration,
+    checks: B::Checks,
     termination: TerminationWatch,
     /// The deferred-reload identity override: the dedup id of the message
     /// the current dispatch loaded, on a timer session. Last-wins and never
@@ -870,25 +772,26 @@ where
         let SessionParts {
             cell,
             dirty,
-            oracle,
+            dedup,
             loader,
             registry,
             state_key,
             event,
-            recovery_delay,
-            armed,
+            dedup_ttl,
+            checks,
             termination,
         } = parts;
         Self {
             inner: Arc::new(SessionInner {
+                stage_attempt: OnceLock::new(),
                 overlay: Overlay::new(dirty, cell),
-                oracle,
+                dedup,
                 loader,
                 registry,
                 state_key,
                 event,
-                recovery_delay,
-                armed,
+                dedup_ttl,
+                checks,
                 termination,
                 reload_marker: SyncMutex::new(None),
                 terminated: AtomicBool::new(false),
@@ -991,7 +894,7 @@ where
 
     /// Reads a cell's currently visible committed value within this event's
     /// transaction (cleared/absent → `None`) — the dirty overlay resolved
-    /// against the oracle.
+    /// through collection evidence.
     ///
     /// # Errors
     ///
@@ -1006,7 +909,7 @@ where
         let committed = self
             .inner
             .overlay
-            .get(&id, cell, self.inner.event)
+            .get(&id, cell)
             .await
             .map_err(|e| StateAccessError::store(&e))?;
         Ok(committed.into_inner())
@@ -1032,7 +935,7 @@ where
         let committed = self
             .inner
             .overlay
-            .get_many(&id, section, batch, self.inner.event)
+            .get_many(&id, section, batch)
             .await
             .map_err(|e| StateAccessError::store(&e))?;
         Ok(committed.into_iter().map(Committed::into_inner).collect())
@@ -1047,13 +950,12 @@ where
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
         let id = self.id_for(state_type, name);
-        let event = self.inner.event;
         // `id` is local to the generator, so `scan_cells` unifies its lifetime
         // with an owned overlay; the caller's `Copy` `Scan<'a>` rides in
         // directly (it is covariant, so it coerces to that shorter scope).
         let overlay = self.inner.overlay.clone();
         try_stream! {
-            let inner = overlay.scan_cells(&id, scan, event);
+            let inner = overlay.scan_cells(&id, scan);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 yield item.map_err(|e| StateAccessError::store(&e))?;
@@ -1324,6 +1226,7 @@ where
     L: Clone + Send + Sync + 'static,
 {
     type Cell = B::Cell;
+    type Checks = B::Checks;
 
     fn gate(&self) -> &SessionGate {
         &self.inner.gate
@@ -1346,7 +1249,7 @@ where
             .await
     }
 
-    async fn finalize(&self) -> Result<Finalized<B::Cell>, StateAccessError> {
+    async fn finalize(&self) -> Result<Finalized<B::Cell, B::Checks>, StateAccessError> {
         let touched = self
             .inner
             .overlay
@@ -1356,47 +1259,68 @@ where
         let registry = &self.inner.registry;
         let lower = self.inner.overlay.lower();
         let state_key = &self.inner.state_key;
+        let mut marker_touched = Vec::with_capacity(touched.len());
+        for ((state_type, name), ..) in &touched {
+            if registry.commit_mode_for(*state_type, name) == CommitMode::ReadCommitted {
+                marker_touched.push((*state_type, name.clone()));
+            }
+        }
+        marker_touched.sort_unstable();
+        marker_touched.dedup();
         // Sized once to the touched-collection cardinality — the fold in
         // place of an unconstrained `try_collect` keeps the receipt's vector
         // from re-growing on the per-event hot path (bounded-allocation rule).
+        let evidence = EventEvidence {
+            attempt: *self.inner.stage_attempt.get_or_init(AttemptId::new),
+            touched: marker_touched.into(),
+            evidence_ttl: self.inner.dedup_ttl,
+            dedup: self.message_marker().map(MessageMarker::into_uuid),
+        };
         let capacity = touched.len();
-        let collections: Vec<StagedCollection> = stream::iter(touched)
+        let collections = stream::iter(touched)
             .map(|((state_type, name), cleared, cells)| {
                 let id = CollectionId::new(state_key.clone(), state_type, name);
-                // `cooperative` adds a per-collection coop-budget yield point
-                // so a key touching many collections does not drain the batch
-                // in one poll; `buffer_unordered` keeps full concurrency.
-                cooperative(stage_collection(lower, registry, event, id, cleared, cells))
+                cooperative(stage_collection(
+                    lower, registry, event, id, cleared, cells, &evidence,
+                ))
             })
             .buffer_unordered(STATE_FANOUT_CONCURRENCY)
-            .try_fold(Vec::with_capacity(capacity), |mut acc, staged| async move {
-                acc.extend(staged);
-                Ok(acc)
+            .fold(Ok(Vec::with_capacity(capacity)), |acc, staged| async move {
+                match (acc, staged) {
+                    (Ok(mut acc), Ok(staged)) => {
+                        acc.extend(staged);
+                        Ok(acc)
+                    }
+                    (Err(error), _) | (_, Err(error)) => Err(error),
+                }
             })
-            .await?;
-        // Drain-on-success (invariant owned by the `finalize` trait doc): one
-        // whole-key clear, strictly after the per-collection aggregate — a
-        // mid-stage failure exits via the `?` above with the buffer whole.
-        // Nothing past this point is fallible or `.await`s a store.
+            .await;
+        let collections = match collections {
+            Ok(collections) => collections,
+            Err(error) => {
+                if error.classify_error() == ErrorCategory::Permanent {
+                    abort_stages(lower, registry, state_key, &evidence.touched, || {
+                        self.is_terminated()
+                    })
+                    .await;
+                }
+                if let Err(unmark_error) = self.inner.checks.unmark(&self.inner.state_key.key).await
+                {
+                    warn!(error = %unmark_error, key = %self.inner.state_key.key,
+                        "cannot remove admission proof after stage failure");
+                }
+                return Err(error);
+            }
+        };
         self.discard_dirty();
         if collections.is_empty() {
             return Ok(Finalized::Clean);
         }
-        // Tighten the always-on floor by the smallest `recovery_within` among
-        // the staged collections — folded exactly once, here, onto the
-        // receipt. `recovery_within` on a `ReadUncommitted` collection is
-        // inert: such collections never appear in the receipt.
-        let recovery_delay = collections
-            .iter()
-            .filter_map(|staged| {
-                let id = staged.collection.id();
-                registry.recovery_within_for(id.state_type(), id.name())
-            })
-            .fold(self.inner.recovery_delay, CompactDuration::min);
-        Ok(Finalized::Staged(StagedState {
+        Ok(Finalized::Staged(Staged {
             store: lower.clone(),
             collections,
-            recovery_delay,
+            checks: self.inner.checks.clone(),
+            key: self.inner.state_key.key.clone(),
         }))
     }
 
@@ -1406,8 +1330,8 @@ where
         _proof: MarkerWrite,
     ) -> Result<(), StateAccessError> {
         self.inner
-            .oracle
-            .record_message(marker.into_uuid())
+            .dedup
+            .insert(marker.into_uuid())
             .await
             .map_err(|e| StateAccessError::store(&e))
     }
@@ -1448,24 +1372,6 @@ where
             inner: self.inner.clone(),
             pinned: self.current_epoch(),
         }
-    }
-
-    fn recovery_floor(&self) -> CompactDuration {
-        self.inner.recovery_delay
-    }
-
-    async fn backstop_armed(&self) -> Option<CompactDateTime> {
-        self.inner
-            .armed
-            .read_async(&self.inner.state_key.key, |_, &fire| fire)
-            .await
-    }
-
-    async fn mark_backstop_armed(&self, fire: CompactDateTime) {
-        self.inner
-            .armed
-            .upsert_async(self.inner.state_key.key.clone(), fire)
-            .await;
     }
 }
 
@@ -1549,6 +1455,7 @@ async fn stage_collection<S>(
     id: CollectionId,
     cleared: ClearedSections,
     cells: CellSnapshot,
+    evidence: &EventEvidence,
 ) -> Result<Option<StagedCollection>, StateAccessError>
 where
     S: CellStore,
@@ -1590,7 +1497,7 @@ where
                             records,
                         } = chunk;
                         let bases = lower
-                            .get_many(id, section, &batch, event)
+                            .get_many(id, section, &batch)
                             .await
                             .map_err(|e| StateAccessError::store(&e))?;
                         // `get_many`'s contract: bases.len() == batch.len()
@@ -1635,13 +1542,12 @@ where
             // `writes = []` under a marker whose `clears()` is non-empty: the
             // durable marker still lands and the stage-boundary
             // foreign-marker resolve still runs, and the returned entry makes
-            // `finalize` return [`Finalized::Staged`] so the boundary arms
-            // the `StateRecovery` backstop.
+            // `finalize` returns a staged receipt so the boundary promotes the clear.
             let clears: Vec<SectionClear> = cleared
                 .iter()
                 .map(|&section| SectionClear::frozen(section, &writes))
                 .collect();
-            let marker = EventMarker::frozen(event, &writes, &clears);
+            let marker = EventMarker::frozen(event, &writes, &clears, evidence);
             lower
                 .write_provisional(&collection_ref, &writes, Some(&marker))
                 .await
@@ -1649,7 +1555,7 @@ where
             Ok(Some(StagedCollection {
                 collection: collection_ref,
                 writes,
-                clears,
+                marker,
             }))
         }
         CommitMode::ReadUncommitted => {
@@ -1662,7 +1568,7 @@ where
                 return Ok(None);
             }
             // The direct apply: cells plus the frozen gap erase in one write.
-            // RU never stages, so there is nothing for recovery to arm —
+            // RU writes resolved values directly.
             // return `None` even for a clears-only collection.
             let clears: Vec<SectionClear> = cleared
                 .iter()
@@ -1677,49 +1583,72 @@ where
     }
 }
 
-/// Resolves every staged collection after the event's outcome is known:
-/// `committed` ⇒ promote each cell's `data` and apply the frozen clears' gap
-/// erase (the cell store's
-/// [`commit_provisional`](CellStore::commit_provisional) /
-/// [`abort_provisional`](CellStore::abort_provisional) carry the projection so
-/// the write-through cache can publish it), otherwise roll each back to its
-/// `prev` (the abort arm ignores the clears — rollback needs no clear leg).
-/// Best-effort: drives every per-collection resolution to completion
-/// regardless of siblings, returning whether all resolved.
-async fn resolve_collections<S>(
+/// Restores stage residue after every concurrent stage call has returned.
+async fn abort_stages<S: CellStore>(
+    store: &S,
+    registry: &CollectionDefRegistry,
+    key: &StateKey,
+    touched: &[(StateType, StateName)],
+    shutdown: impl Fn() -> bool + Sync,
+) {
+    stream::iter(0..touched.len())
+        .map(|index| {
+            let (kind, name) = &touched[index];
+            let shutdown = &shutdown;
+            cooperative(async move {
+                let collection = CollectionRef::new(
+                    CollectionId::new(key.clone(), *kind, name.clone()),
+                    registry.ttl_for(*kind, name),
+                );
+                let _ = retry_step(shutdown, "rejected stage rollback", || async {
+                    if let Some(marker) = store.marker_state(collection.id()).await?.staged {
+                        resolve_event_marker(
+                            store,
+                            &collection,
+                            &marker,
+                            CommitDecision::NotCommitted,
+                        )
+                        .await?;
+                    }
+                    Ok::<_, S::Error>(())
+                })
+                .await;
+            })
+        })
+        .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+        .collect::<()>()
+        .await;
+}
+
+/// Returns the collections whose promote did not complete.
+async fn resolve_collections<S: CellStore>(
     store: &S,
     collections: Vec<StagedCollection>,
-    committed: bool,
-) -> bool
-where
-    S: CellStore,
-{
+    shutdown: &(impl Fn() -> bool + Sync),
+) -> Vec<StagedCollection> {
     stream::iter(collections)
-        .map(
-            |StagedCollection {
-                 collection,
-                 writes,
-                 clears,
-             }| {
-                cooperative(async move {
-                    let result = if committed {
-                        store.commit_provisional(&collection, &writes, &clears).await
-                    } else {
-                        store.abort_provisional(&collection, &writes).await
-                    };
-                    match result {
-                        Ok(()) => true,
-                        Err(error) => {
-                            warn!(error = ?error, "cell resolution failed; leaving provisional for the sweep");
-                            false
-                        }
-                    }
+        .map(|staged| {
+            cooperative(async move {
+                let outcome = retry_step(shutdown, "keyed-state promote", || {
+                    store.commit_provisional(&staged.collection, &staged.marker, &staged.writes)
                 })
+                .await;
+                match outcome {
+                    StepOutcome::Done(()) => None,
+                    StepOutcome::Skip | StepOutcome::Abandon => Some(staged),
+                }
+            })
+        })
+        .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+        .fold(
+            SmallVec::<[StagedCollection; 1]>::new(),
+            |mut rejected, staged| async move {
+                rejected.extend(staged);
+                rejected
             },
         )
-        .buffer_unordered(STATE_FANOUT_CONCURRENCY)
-        .fold(true, |all, ok| async move { all && ok })
         .await
+        .into_vec()
 }
 
 /// Crate-private descriptor reaching a session through the one public

@@ -1,6 +1,7 @@
 //! Deterministic response gates for state-store concurrency tests.
 
 use super::*;
+use crate::state::marker::MarkerState;
 
 #[derive(Clone)]
 pub(crate) struct HoldingCellStore<S> {
@@ -92,37 +93,27 @@ where
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-        own: EventRef,
     ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
-        self.inner.get(collection, cell, own)
+        self.inner.get(collection, cell)
     }
 
     fn scan_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-        own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        self.inner.scan_cells(collection, scan, own)
+        self.inner.scan_cells(collection, scan)
     }
 
     async fn get_for_cache<'a>(
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-        own: EventRef,
     ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
         self.holds
             .get_for_cache
-            .pass(self.inner.get_for_cache(collection, cell, own))
+            .pass(self.inner.get_for_cache(collection, cell))
             .await
-    }
-
-    fn provisional_cells<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
-        self.inner.provisional_cells(collection)
     }
 
     fn provisional_cell_at<'a>(
@@ -172,22 +163,22 @@ where
         self.inner.mark_resolved(collection, cells)
     }
 
-    fn unsettled_marker<'a>(
+    async fn marker_state<'a>(
         &'a self,
         collection: &'a CollectionId,
-    ) -> impl Future<Output = Result<Option<EventMarker>, Self::Error>> + Send + 'a {
-        self.inner.unsettled_marker(collection)
+    ) -> Result<MarkerState, Self::Error> {
+        self.inner.marker_state(collection).await
     }
 
     async fn commit_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
+        marker: &'a EventMarker,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
         self.holds
             .commit_provisional
-            .pass(self.inner.commit_provisional(collection, writes, clears))
+            .pass(self.inner.commit_provisional(collection, marker, writes))
             .await
     }
 

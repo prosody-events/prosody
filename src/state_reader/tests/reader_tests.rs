@@ -8,7 +8,7 @@
 //! identity validation; and the boundary errors.
 //!
 //! Committed state is seeded through the real owner session. The reader
-//! reads it back through the stores that bypass the commit oracle, under the
+//! reads it back through the stores that read collection evidence, under the
 //! segment the owner wrote.
 
 use super::reader_suite::{

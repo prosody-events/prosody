@@ -8,10 +8,8 @@
 
 use crate::cassandra::config::CassandraConfiguration;
 use crate::consumer::config::TypedConsumerSetup;
-use crate::consumer::config::{
-    CommonConfiguration, ConsumerConfiguration, ConsumerSetup, validate_recovery_ttl_margin,
-};
-use crate::consumer::error::{ConsumerError, KeyedStateInitError};
+use crate::consumer::config::{CommonConfiguration, ConsumerConfiguration, ConsumerSetup};
+use crate::consumer::error::ConsumerError;
 use crate::consumer::middleware::cancellation::CancellationMiddleware;
 use crate::consumer::middleware::deduplication::{
     DeduplicationMiddleware, DeduplicationStoreProvider,
@@ -81,12 +79,13 @@ where
     let keyed_state_config = setup.common.keyed_state.clone();
     keyed_state_config.validate()?;
     let dedup = setup.common.dedup.clone();
-    if keyed_state_config.has_registrations() {
-        validate_recovery_ttl_margin(dedup.ttl, keyed_state_config.recovery_delay)
-            .map_err(KeyedStateInitError::from)?;
-    }
     let heartbeats = setup.deps.heartbeats().clone();
-    let keyed_state = KeyedStateInputs::new(keyed_state_config, setup.consumer, &dedup.version)?;
+    let keyed_state = KeyedStateInputs::new(
+        keyed_state_config,
+        setup.consumer,
+        &dedup.version,
+        dedup.ttl,
+    )?;
     let observer = KafkaObserver::new(&setup.consumer.group_id);
     let components = setup
         .deps
@@ -146,10 +145,9 @@ where
 /// common-middleware component is constructed.
 ///
 /// This is the whole cross-mode set: telemetry, timeout, scheduler,
-/// cancellation, and **deduplication** (the mandatory commit oracle, here a
-/// stateless duplicate filter over `context.message_marker()`; the `settle`
-/// boundary records the marker directly, gated on the typed `Settlement`
-/// classification — not in this stack). It runs outer→inner as
+/// cancellation, and deduplication. The dedup filter reads the message marker.
+/// The settle boundary records the marker after promote.
+/// The common block runs outer to inner as
 /// `dedup → cancellation → scheduler → timeout → telemetry → handler`. Each
 /// mode layers only its *mode-specific* middleware (retry, monopolization,
 /// defer, failure-topic, log) OUTSIDE the returned block.

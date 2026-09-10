@@ -2,6 +2,10 @@ use super::{
     BatchUnit, CellAddr, CellBatchRow, CellKind, CellQueries, GapBetweenRow, GapEdgeRow,
     GapSectionRow, KeyRow, PER_STATEMENT_OVERHEAD, Pk, RowShape, SectionClear, smallvec,
 };
+use crate::cassandra::chunk_boundaries;
+use crate::state::marker::MarkerRow;
+use std::iter;
+use std::ops::Range;
 
 /// The number of gap rows needed to erase `clears` while excluding survivors.
 pub(super) fn gap_count(clears: &[SectionClear]) -> usize {
@@ -70,10 +74,9 @@ pub(super) fn extend_gap_units<'u>(
     }
 }
 
-/// The one-row batch unit deleting a collection's event-marker row at its
-/// fixed address, appended last by
-/// [`super::CassandraStore::issue_marker_last`], the shared tail of both settle
-/// verbs.
+/// Deletes Staged at its fixed address in one batch unit.
+/// [`super::CassandraStore::issue_markers`] appends this unit last for both
+/// settle operations.
 pub(super) fn marker_delete_unit<'u>(
     pk: Pk<'u>,
     queries: &'u CellQueries,
@@ -84,43 +87,69 @@ pub(super) fn marker_delete_unit<'u>(
             statement: &queries.marker_delete,
             row: RowShape::Key(KeyRow {
                 kind: CellKind::Marker,
-                addr: CellAddr::marker(pk),
+                addr: CellAddr::marker(pk, MarkerRow::Staged),
             }),
         }],
     )
 }
 
-/// Returns the boundary between settle's cell/gap work and its final marker
-/// delete. Everything returns in the first slice when one batch can carry all
-/// rows atomically; otherwise the marker is the second slice's sole unit, so it
-/// is issued only after every recovery-relevant mutation has completed.
-///
-/// **Precondition:** the marker delete is the LAST unit — the split is
-/// positional (`units.len() - 1`), so a marker placed elsewhere, or a caller
-/// awaiting the tail before the prefix, would issue the marker before the
-/// recovery-relevant rows.
-/// [`super::CassandraStore::issue_marker_last`] owns that ordering;
-/// this function only decides where the split falls.
-pub(super) fn marker_last_split<R>(
-    units: &[BatchUnit<R>],
+/// Builds the promote or abort phases under the batch budgets.
+/// The leading evidence and final Staged delete remain outside split middle
+/// chunks.
+pub(in crate::state) fn settle_batches<R>(
+    leading: Option<BatchUnit<R>>,
+    mut middle: Vec<BatchUnit<R>>,
+    trailing: BatchUnit<R>,
     max_bytes: u64,
     max_count: usize,
-) -> usize {
-    if fits_one_batch(units.iter().map(BatchUnit::weight), max_bytes, max_count) {
-        units.len()
-    } else {
-        units.len().saturating_sub(1)
+) -> (Vec<BatchUnit<R>>, [Range<usize>; 3]) {
+    let start = usize::from(leading.is_some());
+    if let Some(leading) = leading {
+        middle.insert(0, leading);
     }
+    middle.push(trailing);
+    let end = middle.len();
+    let phases = if fits_one_batch(middle.iter().map(BatchUnit::weight), max_bytes, max_count) {
+        [0..end, end..end, end..end]
+    } else {
+        [0..start, start..end - 1, end - 1..end]
+    };
+    (middle, phases)
 }
 
-/// Whether `weights` pack into a **single** batch under the byte and count
-/// budgets: `chunk_boundaries` provably yields one chunk iff the weight sum
-/// fits `max_bytes` and the count fits `max_count`. This one predicate
-/// underlies both marker-ordering decisions — the stage's marker-FIRST choice
-/// (`write_provisional`) and the settle's marker-LAST split
-/// ([`marker_last_split`]): when everything fits one atomic batch the marker
-/// rides along; otherwise it is isolated to its own batch — issued first at
-/// stage, last at settle.
+/// Splits cells into ranges with space for the marker in every batch.
+/// The caller must include the marker when it executes each range.
+/// No cells produces one marker-only batch.
+pub(in crate::state) fn stage_batches<R>(
+    marker: &BatchUnit<R>,
+    cells: &[BatchUnit<R>],
+    max_bytes: u64,
+    max_count: usize,
+) -> impl Iterator<Item = Range<usize>> {
+    let cell_bytes = max_bytes.saturating_sub(marker.weight());
+    let cell_limit = if marker.weight() > max_bytes {
+        // An oversized marker permits only one cell, even when cells weigh zero.
+        1
+    } else {
+        max_count.saturating_sub(1)
+    };
+
+    let ranges = chunk_boundaries(cells.iter().map(BatchUnit::weight), cell_bytes, cell_limit);
+
+    let marker_only = cells.is_empty().then_some(0..0);
+    marker_only.into_iter().chain(ranges)
+}
+
+/// Binds the marker to every atomic stage mutation.
+pub(in crate::state) fn stage_chunk<'u, R>(
+    marker: &'u BatchUnit<R>,
+    cells: &'u [BatchUnit<R>],
+    range: Range<usize>,
+) -> impl Iterator<Item = &'u BatchUnit<R>> {
+    iter::once(marker).chain(cells[range].iter())
+}
+
+/// Reports whether all rows fit one atomic batch.
 pub(super) fn fits_one_batch(
     weights: impl Iterator<Item = u64>,
     max_bytes: u64,

@@ -7,9 +7,8 @@
 //! identity **immutable**. Once a collection has been used, a user can never
 //! silently change any of those axes; a process carrying an incompatible
 //! descriptor fails loudly (`Permanent`) instead of misreading cells. It is
-//! **not** a sweep index, a migration ledger, or an enumeration source — the
-//! recovery sweep sources names from the in-process registry, the
-//! authoritative declared set.
+//! Admission discovers collections through the registry and durable marker
+//! payloads. It does not enumerate this identity table.
 //!
 //! The resolver is deliberately absent: it is application *behavior* over
 //! decoded payloads, not a property of the data, and

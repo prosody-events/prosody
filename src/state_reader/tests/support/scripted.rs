@@ -20,7 +20,7 @@ use crate::state::publication::StatePublication;
 use crate::state::registry::CollectionDef;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::{CellBuffer, CoordinateBatch};
-use crate::state::tests::support::{FixedOracle, ScriptedPublicationStore};
+use crate::state::tests::support::ScriptedPublicationStore;
 use crate::state::{StateName, StateType};
 use crate::state_reader::backend::{ReaderComponents, ScriptedReaderBackend};
 use crate::state_reader::cache::ReaderCache;
@@ -373,7 +373,7 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
         ops: F,
     ) -> Result<StateKey>
     where
-        F: FnOnce(D::Handle<OwnerSession<MemoryCellStore<FixedOracle>>>) -> Fut,
+        F: FnOnce(D::Handle<OwnerSession<MemoryCellStore>>) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
         let state_key = source_state_key(tp, group, key, self.count)?;
