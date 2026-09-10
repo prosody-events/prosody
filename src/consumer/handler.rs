@@ -17,12 +17,13 @@ pub enum DemandType {
     Failure {
         /// The estimated retry ordinal: 1 on the first retry.
         ///
-        /// Each retry or defer middleware adds its own retries to the ordinal
-        /// it received. The ordinal restarts when an event moves from
-        /// retry middleware to defer middleware, so it can fall. It is
-        /// monotone only within one layer. A message that waits behind
-        /// a deferred message reports 1 on its first handler call. Keep
-        /// an exact retry count in keyed state if necessary.
+        /// Immediate retries report 1, 2, 3, and so on. The first deferred
+        /// retry reports 1 again, and each later deferred retry adds one.
+        ///
+        /// A message held behind a deferred message with the same key also
+        /// reports 1 on its first delivery.
+        ///
+        /// Keep an exact retry count in keyed state if the handler needs one.
         retry: u32,
     },
 }
