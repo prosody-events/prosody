@@ -15,10 +15,12 @@ pub enum DemandType {
     Normal,
     /// An attempt after one or more failures.
     Failure {
-        /// The estimated retry ordinal: 1 on the first retry.
+        /// The estimated retry ordinal: 1 on the first retry, one more on
+        /// each later retry.
         ///
-        /// Immediate retries report 1, 2, 3, and so on. The first deferred
-        /// retry reports 1 again, and each later deferred retry adds one.
+        /// In-process retries run only while failure rate gating disables
+        /// deferral. When gating lifts and the event defers, the ordinal
+        /// restarts at 1.
         ///
         /// A message held behind a deferred message with the same key also
         /// reports 1 on its first delivery.
