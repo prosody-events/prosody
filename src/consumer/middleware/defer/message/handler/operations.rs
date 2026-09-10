@@ -152,6 +152,7 @@ where
         message_key: &Key,
         offset: Offset,
         retry_count: u32,
+        demand: DemandType,
         error: T::Error,
     ) -> DeferResult<MessageDeferOutput<T::Output, T::Error>, M::Error, T::Error, L::Error>
     where
@@ -179,7 +180,7 @@ where
                 self.sender.message_failed(
                     message_key.clone(),
                     offset,
-                    DemandType::Failure,
+                    demand,
                     self.source.clone(),
                     error_category,
                     exception,
@@ -212,7 +213,7 @@ where
                 self.sender.message_failed(
                     message_key.clone(),
                     offset,
-                    DemandType::Failure,
+                    demand,
                     self.source.clone(),
                     error_category,
                     exception,
@@ -224,7 +225,7 @@ where
                 self.sender.message_failed(
                     message_key.clone(),
                     offset,
-                    DemandType::Failure,
+                    demand,
                     self.source.clone(),
                     error_category,
                     exception,
@@ -386,34 +387,32 @@ where
         &self,
         context: C,
         trigger: &Trigger,
-        message_key: &Key,
         offset: Offset,
         retry_count: u32,
+        demand: DemandType,
         message: ConsumerMessage<H::MessagePayload>,
     ) -> DeferResult<MessageDeferOutput<T::Output, T::Error>, M::Error, T::Error, L::Error>
     where
         C: EventContext<Payload = T::Payload>,
         H: HandlerMethod<T>,
     {
+        let message_key = &trigger.key;
+
         self.sender.timer_dispatched(
             trigger.key.clone(),
             trigger.time,
             trigger.timer_type,
-            DemandType::Failure,
+            demand,
             self.source.clone(),
         );
 
-        self.sender.message_dispatched(
-            message_key.clone(),
-            offset,
-            DemandType::Failure,
-            self.source.clone(),
-        );
+        self.sender
+            .message_dispatched(message_key.clone(), offset, demand, self.source.clone());
 
         // Instrument with the reload span so the retried handler runs inside
         // it ambiently, mirroring the partition dispatch arms.
         let load_span = message.span();
-        match H::call(&self.handler, context.clone(), message, DemandType::Failure)
+        match H::call(&self.handler, context.clone(), message, demand)
             .instrument(load_span)
             .await
         {
@@ -422,13 +421,13 @@ where
                     trigger.key.clone(),
                     trigger.time,
                     trigger.timer_type,
-                    DemandType::Failure,
+                    demand,
                     self.source.clone(),
                 );
                 self.sender.message_succeeded(
                     message_key.clone(),
                     offset,
-                    DemandType::Failure,
+                    demand,
                     self.source.clone(),
                 );
                 self.complete_and_advance(&context, message_key, offset)
@@ -448,7 +447,7 @@ where
                 let exception = format!("{error:?}").into_boxed_str();
                 self.sender.emit_timer(
                     TimerEventType::Failed {
-                        demand_type: DemandType::Failure,
+                        demand_type: demand,
                         error_category,
                         exception,
                     },
@@ -457,7 +456,7 @@ where
                     trigger.timer_type,
                     self.source.clone(),
                 );
-                self.handle_retry_failure(&context, message_key, offset, retry_count, error)
+                self.handle_retry_failure(&context, message_key, offset, retry_count, demand, error)
                     .await
             }
         }

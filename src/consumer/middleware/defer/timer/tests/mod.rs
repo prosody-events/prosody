@@ -28,6 +28,7 @@ use parking_lot::Mutex;
 use std::convert::Infallible;
 use std::fmt::{self, Debug};
 use std::future::{Future, pending, ready};
+use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::span::Id;
@@ -206,7 +207,7 @@ type AmbientPair = (Option<Id>, Option<Id>);
 #[derive(Clone)]
 struct OutcomeHandler {
     outcome: OutcomeSlot,
-    timer_calls: Arc<Mutex<Vec<Key>>>,
+    timer_calls: Arc<Mutex<Vec<(Key, DemandType)>>>,
     /// Pairs observed inside each `on_timer` call — pins that dispatch
     /// entered the trigger's span.
     ambient_pairs: Arc<Mutex<Vec<AmbientPair>>>,
@@ -228,7 +229,17 @@ impl OutcomeHandler {
 
     #[must_use]
     fn timer_calls(&self) -> Vec<Key> {
-        self.timer_calls.lock().clone()
+        self.timer_calls
+            .lock()
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// Returns the recorded timer calls and clears the log.
+    #[must_use]
+    fn take_timer_calls(&self) -> Vec<(Key, DemandType)> {
+        mem::take(&mut *self.timer_calls.lock())
     }
 
     /// Returns the `(ambient, trigger-span)` id pairs recorded per call.
@@ -289,13 +300,13 @@ impl FallibleHandler for OutcomeHandler {
         &self,
         _context: C,
         trigger: Trigger,
-        _demand_type: DemandType,
+        demand: DemandType,
     ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
         ready(()).map(move |()| {
-            self.timer_calls.lock().push(trigger.key.clone());
+            self.timer_calls.lock().push((trigger.key.clone(), demand));
             self.ambient_pairs
                 .lock()
                 .push((tracing::Span::current().id(), trigger.span().id()));

@@ -18,6 +18,7 @@ use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger};
 use crate::tracing::init_test_logging;
 use ahash::HashMap;
+use color_eyre::eyre::eyre;
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use std::collections::BTreeSet;
@@ -305,7 +306,7 @@ async fn execute_event(harness: &TestHarness, event: &TimerTraceEvent) -> color_
             execute_application_timer(harness, app_event).await
         }
         TimerTraceEvent::DeferredTimer(def_event) => {
-            execute_deferred_timer(harness, def_event).await
+            execute_deferred_timer(harness, def_event, DemandType::Normal).await
         }
     }
 }
@@ -386,6 +387,7 @@ fn verify_application_timer_result(
 async fn execute_deferred_timer(
     harness: &TestHarness,
     event: &DeferredTimerEvent,
+    demand: DemandType,
 ) -> color_eyre::Result<()> {
     let key = test_key(event.key_idx);
     // DeferredTimer fires - time is the scheduled retry time, not original time
@@ -411,7 +413,7 @@ async fn execute_deferred_timer(
 
     let result = harness
         .handler
-        .on_timer(harness.context().clone(), trigger, DemandType::Normal)
+        .on_timer(harness.context().clone(), trigger, demand)
         .await;
 
     // Verify result matches expectation
@@ -539,68 +541,41 @@ fn prop_backoff_bounds(retry_count_raw: u8) -> color_eyre::Result<()> {
     })
 }
 
-/// Property: Retry count increments correctly after transient failures.
-///
-/// **Invariant**: When a deferred timer retry fails with a transient error,
-/// the `retry_count` must be incremented by exactly 1.
+/// A reload reports the stored retry count, plus one for the failure that
+/// deferred the event, plus the outer demand's retry ordinal. A transient
+/// failure increments the stored retry count by one.
 #[quickcheck]
-fn prop_retry_increment(trace: TimerTrace) -> color_eyre::Result<()> {
+fn prop_retry_increment(trace: TimerTrace, demand: DemandType) -> color_eyre::Result<()> {
     init_test_logging();
-    let TimerTrace { events, key_count } = trace;
+    let TimerTrace { events, .. } = trace;
 
     TEST_RUNTIME.block_on(async {
         let harness = TestHarness::new()?;
-        let mut model = TraceModel::new();
 
         for event in &events {
-            // Track expected retry counts before execution
             if let TimerTraceEvent::DeferredTimer(def_event) = event {
                 let key = test_key(def_event.key_idx);
-
-                // Get retry count before this event
-                let before_count = model.deferred.get(&key).map_or(0, |(_, c)| *c);
-
-                // Execute event
-                let result = execute_event(&harness, event).await;
-                if let Err(e) = &result
-                    && !is_expected_error(e)
-                {
-                    return result;
-                }
-
-                // Update model
-                update_model(&mut model, event);
-
-                // Verify retry count change based on outcome
-                let after_count = model.deferred.get(&key).map_or(0, |(_, c)| *c);
-
-                match &def_event.outcome {
-                    DeferredTimerOutcome::Transient => {
-                        // Transient failure increments by 1
-                        assert_eq!(
-                            after_count,
-                            before_count.saturating_add(1),
-                            "Transient failure should increment retry_count by 1"
-                        );
-                    }
-                    DeferredTimerOutcome::Success | DeferredTimerOutcome::Permanent => {
-                        // Success/permanent resets or removes - model handles
-                        // this
-                    }
+                let before = harness
+                    .get_retry_count(&key)
+                    .await?
+                    .ok_or_else(|| eyre!("Deferred head is absent"))?;
+                // Drain the calls of earlier events.
+                let _ = harness.inner_handler.take_timer_calls();
+                execute_deferred_timer(&harness, def_event, demand).await?;
+                let calls = harness.inner_handler.take_timer_calls();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(
+                    calls[0].1.retry(),
+                    before.saturating_add(1).saturating_add(demand.retry())
+                );
+                if matches!(def_event.outcome, DeferredTimerOutcome::Transient) {
+                    assert_eq!(harness.get_retry_count(&key).await?, Some(before + 1));
                 }
             } else {
-                // Execute and update model for non-deferred events
-                let result = execute_event(&harness, event).await;
-                if let Err(e) = &result
-                    && !is_expected_error(e)
-                {
-                    return result;
-                }
-                update_model(&mut model, event);
+                execute_event(&harness, event).await?;
             }
         }
 
-        let _ = key_count; // Used by trace validation
         Ok(())
     })
 }
