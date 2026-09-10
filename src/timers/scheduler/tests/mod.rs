@@ -25,7 +25,8 @@ pub(crate) mod support;
 
 use super::actor::{
     ActorState, MIN_PRELOAD, calculate_preload, calculate_wait_time, cleanup_step,
-    collect_active_slab_ids, handle_add, load_step, next_unloaded_slab_id, owns_slab,
+    collect_active_slab_ids, drain_slab_range, handle_add, load_step, next_unloaded_slab_id,
+    owns_slab,
 };
 use crate::Key;
 use crate::state::TimerEventRef;
@@ -40,7 +41,7 @@ use crate::timers::store::{Segment, TriggerStore};
 use crate::timers::test_support::test_segment;
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, ensure, eyre};
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::collections::BTreeSet;
@@ -884,4 +885,69 @@ fn prop_retirement_idempotence() {
             ))
     }
     QuickCheck::new().quickcheck(property as fn(u8, i16) -> Result<()>);
+}
+
+/// A partial load cannot preserve an old tag after the durable schedule
+/// changes.
+#[test]
+fn prop_failed_load_reschedule() {
+    fn property(tag: i16, kind: u8, delivered: bool) -> Result<()> {
+        RuntimeBuilder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()?
+            .block_on(async {
+                let segment = test_segment("failed-load", SLAB_SIZE_SECS);
+                let store = memory_store(segment.clone());
+                store.insert_segment().await?;
+                let time = CompactDateTime::from(
+                    CompactDateTime::now()?.epoch_seconds().saturating_sub(600),
+                );
+                let slab = Slab::from_time(segment.slab_size, time);
+                let timer_type = TimerType::VARIANTS[usize::from(kind) % TimerType::VARIANTS.len()];
+                let old = Trigger::with_tag(
+                    Key::from("replacement"),
+                    time,
+                    timer_type,
+                    i32::from(tag),
+                    Span::current(),
+                );
+                let mut state = fresh_state(store.clone(), segment);
+                let mut queue = TriggerQueue::new();
+                store.add_trigger(old.clone()).await?;
+                handle_add(&mut state, &mut queue, old.clone()).await?;
+
+                // Seed the successful drain before a later slab read fails.
+                // The failed tick does not advance ownership.
+                drain_slab_range(
+                    &store,
+                    slab.id()..=slab.id(),
+                    &mut queue,
+                    &mut state.known_slab_ids,
+                )
+                .await?;
+                ensure!(!owns_slab(&state, slab.id()));
+                if delivered {
+                    ensure!(queue.next().await.is_some());
+                }
+                let mut replacement = old;
+                replacement.tag += 1_i32;
+                store.add_trigger(replacement.clone()).await?;
+                handle_add(&mut state, &mut queue, replacement.clone()).await?;
+
+                load_step(&mut state, &mut queue).await;
+                let expired = queue
+                    .next()
+                    .await
+                    .ok_or_else(|| eyre!("replacement disappeared from the queue"))?;
+                ensure!(expired.tag == replacement.tag);
+                ensure!(
+                    queue.active_triggers().fire(&expired).await,
+                    "stale registry tag rejected the replacement"
+                );
+                ensure!(queue.next().await.is_none());
+                Ok(())
+            })
+    }
+    QuickCheck::new().quickcheck(property as fn(i16, u8, bool) -> Result<()>);
 }

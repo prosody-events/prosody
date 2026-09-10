@@ -287,16 +287,17 @@ where
         }
     }
 
+    // The key row supplies the tag, even when a partial drain has not advanced
+    // ownership.
+    let tag = triggers
+        .active_triggers()
+        .get(&trigger.key, trigger.time, trigger.timer_type)
+        .await
+        .map(|entry| entry.tag);
+    if tag.is_some_and(|tag| tag != trigger.tag) {
+        triggers.remove(&trigger).await;
+    }
     if is_owned {
-        // The add command carries the authoritative tag from the key row.
-        let tag = triggers
-            .active_triggers()
-            .get(&trigger.key, trigger.time, trigger.timer_type)
-            .await
-            .map(|entry| entry.tag);
-        if tag.is_some_and(|tag| tag != trigger.tag) {
-            triggers.remove(&trigger).await;
-        }
         triggers.insert(trigger).await;
     }
 
@@ -496,7 +497,7 @@ where
 /// The slab metadata scan happens here, in the load loop. Empty slab rows are
 /// still recorded in `known_slab_ids` so cleanup can delete them later without
 /// reading the slab table again.
-async fn drain_slab_range<T>(
+pub(super) async fn drain_slab_range<T>(
     store: &T,
     range: RangeInclusive<SlabId>,
     triggers: &mut TriggerQueue,
