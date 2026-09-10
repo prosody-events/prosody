@@ -22,7 +22,7 @@ use crate::state::descriptor_identity::{
     DescriptorIdentityError, DescriptorIdentityStore, acquire_descriptor_identities,
 };
 use crate::state::dirty::DirtyStore;
-use crate::state::marker::{CommittedMarker, EventMarker, MarkerState, MarkerVersion};
+use crate::state::marker::{EventMarker, MarkerState, MarkerVersion};
 use crate::state::publisher::{AssignmentPublisher, NoPublisher};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::resolve_event_marker;
@@ -30,8 +30,8 @@ use crate::state::retry::{StepOutcome, retry_step};
 use crate::state::session::{EventSession, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
 use crate::state::{
-    CollectionId, CollectionRef, EventRef, StateBackend, StateBackendFactory, StateKey, StateName,
-    StateType,
+    CollectionId, CollectionRef, EventRef, STATE_FANOUT_CONCURRENCY, StateBackend,
+    StateBackendFactory, StateKey, StateName, StateType,
 };
 #[cfg(test)]
 use crate::state::{PartitionBackend, memory::MemoryDescriptorIdentityStore};
@@ -50,6 +50,7 @@ use thiserror::Error;
 use tokio::sync::{OnceCell, watch};
 use tokio::task::coop::cooperative;
 use tracing::error;
+use uuid::Uuid;
 
 static CORRUPT_MARKER: LazyLock<Counter<u64>> = LazyLock::new(|| {
     meter("prosody")
@@ -350,7 +351,6 @@ where
             SmallVec::with_capacity(pending.len());
 
         while !pending.is_empty() {
-            let count = pending.len();
             let loaded = stream::iter(pending.drain(..))
                 .map(|(kind, name)| {
                     let ttl = registry.ttl_for(kind, &name);
@@ -370,7 +370,7 @@ where
                         Ok::<_, Admission>((collection, state))
                     })
                 })
-                .buffer_unordered(count)
+                .buffer_unordered(STATE_FANOUT_CONCURRENCY)
                 .try_collect::<SmallVec<[_; 8]>>()
                 .await?;
             states.extend(loaded);
@@ -405,97 +405,162 @@ where
         timers: &TimerManager<T>,
         shutdown: &watch::Receiver<ShutdownPhase>,
     ) -> Result<(), Admission> {
-        let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
-        let registry = &self.inner.registry;
         let states = self.load_markers(key, shutdown).await?;
-
-        let mut committed: SmallVec<[CommittedMarker; 8]> = SmallVec::with_capacity(states.len());
-        for (_, state) in &states {
-            if let Some(marker) = &state.committed {
-                committed.push(marker.clone());
+        let mut legacy_events: SmallVec<[EventRef; 8]> = SmallVec::with_capacity(states.len());
+        for marker in states.iter().filter_map(|(_, state)| state.staged.as_ref()) {
+            if marker.version() == MarkerVersion::V1 && !legacy_events.contains(&marker.event()) {
+                legacy_events.push(marker.event());
             }
         }
+        let decisions = SmallVec::<[_; 8]>::with_capacity(legacy_events.len());
+        let legacy = stream::iter(legacy_events)
+            .map(|event| {
+                cooperative(async move {
+                    Ok::<_, Admission>((
+                        event,
+                        self.legacy_committed(key, event, timers, shutdown).await?,
+                    ))
+                })
+            })
+            .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+            .try_fold(decisions, |mut decisions, entry| async move {
+                decisions.push(entry);
+                Ok(decisions)
+            })
+            .await?;
 
+        // Freeze decisions before any resolve changes the durable evidence.
+        // Each collection has two markers, each with at most two sources.
+        let mut sources: SmallVec<[EventRef; 32]> = SmallVec::with_capacity(states.len() * 4);
+        let mut resolutions: SmallVec<[_; 8]> = SmallVec::with_capacity(states.len());
         for (collection, state) in &states {
+            if let Some(marker) = &state.committed {
+                retain_sources(&mut sources, marker.event, marker.dedup);
+            }
             let Some(marker) = &state.staged else {
                 continue;
             };
-
-            let is_committed = if marker.version() == MarkerVersion::V1 {
-                self.legacy_committed(key, marker.event(), timers, shutdown)
-                    .await?
+            let committed = if marker.version() == MarkerVersion::V1 {
+                legacy
+                    .iter()
+                    .any(|(event, decision)| *event == marker.event() && *decision == Some(true))
             } else {
-                committed.iter().any(|entry| entry.certifies(marker))
+                states
+                    .iter()
+                    .filter_map(|(_, state)| state.committed.as_ref())
+                    .any(|entry| entry.certifies(marker))
             };
-            if is_committed && !committed.iter().any(|entry| entry.event == marker.event()) {
-                committed.push(CommittedMarker::from(marker));
-            }
-
-            if !is_committed
-                && !registry.collections().any(|(kind, name)| {
-                    kind == collection.id().state_type() && name == collection.id().name()
-                })
-            {
-                if marker.version() == MarkerVersion::V1 {
-                    admission_step(cancelled, key, collection.id().name().as_str(), || {
-                        self.inner.cell.abort_provisional(collection, &[])
-                    })
-                    .await?;
-                }
-                continue;
-            }
-
-            let marker = marker.for_admission(self.inner.dedup_ttl);
-            let decision = if is_committed {
+            let decision = if committed {
+                retain_sources(&mut sources, marker.event(), marker.dedup());
                 CommitDecision::Committed
             } else {
                 CommitDecision::NotCommitted
             };
-            let resolved = admission_step(cancelled, key, collection.id().name().as_str(), || {
-                resolve_event_marker(&self.inner.cell, collection, &marker, decision)
+            resolutions.push((collection.clone(), marker.clone(), decision));
+        }
+
+        // Owned shared handles avoid higher-ranked closures and large future buffers.
+        stream::iter(resolutions)
+            .map(|(collection, marker, decision)| {
+                cooperative(async move {
+                    self.resolve_admission(key, &collection, &marker, decision, shutdown)
+                        .await
+                })
             })
+            .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+            .try_collect::<()>()
             .await?;
-            if resolved.is_none() && is_committed {
-                ADMISSION_TORN.add(1, &[]);
+        stream::iter(sources)
+            .map(|source| cooperative(self.retire_source(key, source, &legacy, timers, shutdown)))
+            .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+            .try_collect::<()>()
+            .await
+    }
+
+    async fn resolve_admission(
+        &self,
+        key: &Key,
+        collection: &CollectionRef,
+        marker: &EventMarker,
+        decision: CommitDecision,
+        shutdown: &watch::Receiver<ShutdownPhase>,
+    ) -> Result<(), Admission> {
+        let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
+        if decision == CommitDecision::NotCommitted
+            && !self.inner.registry.collections().any(|(kind, name)| {
+                kind == collection.id().state_type() && name == collection.id().name()
+            })
+        {
+            if marker.version() == MarkerVersion::V1 {
                 admission_step(cancelled, key, collection.id().name().as_str(), || {
-                    resolve_event_marker(
-                        &self.inner.cell,
-                        collection,
-                        &marker,
-                        CommitDecision::NotCommitted,
-                    )
+                    self.inner.cell.abort_provisional(collection, &[])
                 })
                 .await?;
             }
+            return Ok(());
         }
 
-        for marker in committed {
-            if let Some(dedup) = marker.dedup
-                && admission_step(
-                    cancelled,
-                    key,
-                    "dedup read rejected; redelivery can reach the handler",
-                    || self.inner.dedup.exists(dedup),
+        let marker = marker.for_admission(self.inner.dedup_ttl);
+        let resolved = admission_step(cancelled, key, collection.id().name().as_str(), || {
+            resolve_event_marker(&self.inner.cell, collection, &marker, decision)
+        })
+        .await?;
+        if resolved.is_none() && decision == CommitDecision::Committed {
+            ADMISSION_TORN.add(1, &[]);
+            admission_step(cancelled, key, collection.id().name().as_str(), || {
+                resolve_event_marker(
+                    &self.inner.cell,
+                    collection,
+                    &marker,
+                    CommitDecision::NotCommitted,
                 )
-                .await?
-                    == Some(false)
-            {
-                admission_step(
-                    cancelled,
-                    key,
-                    "dedup write rejected; redelivery can reach the handler",
-                    || self.inner.dedup.insert(dedup),
-                )
-                .await?;
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn retire_source<T: TriggerStore>(
+        &self,
+        key: &Key,
+        source: EventRef,
+        legacy: &[(EventRef, Option<bool>)],
+        timers: &TimerManager<T>,
+        shutdown: &watch::Receiver<ShutdownPhase>,
+    ) -> Result<(), Admission> {
+        let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
+        match source {
+            EventRef::Message { dedup_id } => {
+                // Reuse legacy reads, including Permanent rejections.
+                let exists = match legacy.iter().find(|(event, _)| *event == source) {
+                    Some((_, exists)) => *exists,
+                    None => {
+                        admission_step(
+                            cancelled,
+                            key,
+                            "dedup read rejected; redelivery can reach the handler",
+                            || self.inner.dedup.exists(dedup_id),
+                        )
+                        .await?
+                    }
+                };
+                if exists == Some(false) {
+                    admission_step(
+                        cancelled,
+                        key,
+                        "dedup write rejected; redelivery can reach the handler",
+                        || self.inner.dedup.insert(dedup_id),
+                    )
+                    .await?;
+                }
             }
-            if let EventRef::Timer(timer) = marker.event {
+            EventRef::Timer(timer) => {
                 admission_step(cancelled, key, "timer retirement", || {
                     timers.retire_committed(key, timer)
                 })
                 .await?;
             }
         }
-
         Ok(())
     }
 
@@ -508,24 +573,41 @@ where
         event: EventRef,
         timers: &TimerManager<T>,
         shutdown: &watch::Receiver<ShutdownPhase>,
-    ) -> Result<bool, Admission> {
+    ) -> Result<Option<bool>, Admission> {
         let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
         match event {
-            EventRef::Message { dedup_id } => Ok(admission_step(
-                cancelled,
-                key,
-                "legacy dedup read; redelivery can reach the handler",
-                || self.inner.dedup.exists(dedup_id),
-            )
-            .await?
-                == Some(true)),
+            EventRef::Message { dedup_id } => {
+                admission_step(
+                    cancelled,
+                    key,
+                    "legacy dedup read; redelivery can reach the handler",
+                    || self.inner.dedup.exists(dedup_id),
+                )
+                .await
+            }
             EventRef::Timer(timer) => {
                 let tag = admission_step(cancelled, key, "legacy timer read", || {
                     timers.current_timer_tag(key, timer.time, timer.timer_type)
                 })
                 .await?;
-                Ok(tag.is_some_and(|tag| tag != Some(timer.tag)))
+                Ok(tag.map(|tag| tag != Some(timer.tag)))
             }
+        }
+    }
+}
+
+/// Retains each dedup id and timer attempt once for this admission.
+fn retain_sources(sources: &mut SmallVec<[EventRef; 32]>, event: EventRef, dedup: Option<Uuid>) {
+    let timer = match event {
+        EventRef::Timer(_) => Some(event),
+        EventRef::Message { .. } => None,
+    };
+    for source in [dedup.map(|dedup_id| EventRef::Message { dedup_id }), timer]
+        .into_iter()
+        .flatten()
+    {
+        if !sources.contains(&source) {
+            sources.push(source);
         }
     }
 }
