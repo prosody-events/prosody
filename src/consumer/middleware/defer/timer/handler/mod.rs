@@ -149,7 +149,10 @@ where
             TimerDeferContext::new(context, self.store.clone(), trigger.key.clone());
 
         match trigger.timer_type {
-            TimerType::DeferredTimer => self.handle_deferred_timer(wrapped_context, trigger).await,
+            TimerType::DeferredTimer => {
+                self.handle_deferred_timer(wrapped_context, trigger, demand_type)
+                    .await
+            }
             TimerType::Application => {
                 self.handle_application_timer(wrapped_context, trigger, demand_type)
                     .await

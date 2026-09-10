@@ -5,24 +5,53 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::UncommittedMessage;
 use crate::timers::UncommittedTimer;
 use crate::{Partition, Topic};
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use std::future::Future;
 
-/// Represents the type of demand being processed.
-///
-/// Demand types allow the system to distinguish between normal processing
-/// and failure handling scenarios, enabling different processing behaviors
-/// for the same event type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// The demand a dispatch serves: the first attempt at an event, or a retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DemandType {
-    /// Normal demand represents the initial processing attempt of an event.
+    /// The first attempt at an event.
     Normal,
+    /// An attempt after one or more failures.
+    Failure {
+        /// The estimated retry ordinal: 1 on the first retry.
+        ///
+        /// Each retry or defer middleware adds its retries to the outer
+        /// demand's count. The ordinal can differ by one when an event
+        /// crosses layers. A message queued behind a deferred head
+        /// reports 1 on its first handler call. Keep an exact count in
+        /// keyed state if necessary.
+        retry: u32,
+    },
+}
 
-    /// Failure demand represents retry processing after a previous failure.
-    /// This is typically created by retry middleware when an event fails
-    /// and needs to be reprocessed.
-    Failure,
+impl DemandType {
+    /// The retry ordinal: 0 for [`Normal`](Self::Normal).
+    #[must_use]
+    pub fn retry(self) -> u32 {
+        match self {
+            Self::Normal => 0,
+            Self::Failure { retry } => retry,
+        }
+    }
+
+    /// The demand after additional failures. `retries` must be at least 1.
+    #[must_use]
+    pub(crate) fn retried(self, retries: u32) -> Self {
+        Self::Failure {
+            retry: self.retry().saturating_add(retries),
+        }
+    }
+}
+
+impl Serialize for DemandType {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::Normal => "normal",
+            Self::Failure { .. } => "failure",
+        })
+    }
 }
 
 /// This trait is implemented by message types that have a key field,

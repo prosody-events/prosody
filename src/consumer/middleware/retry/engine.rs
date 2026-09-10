@@ -115,11 +115,11 @@ impl<T> RetryHandler<T> {
         let mut attempt: u32 = 0;
         loop {
             attempt = attempt.saturating_add(1);
-            // First attempt uses the original demand type; retries surface as Failure.
+            // Attempt `n` reports `n - 1` retries on top of the incoming demand.
             let demand = if attempt == 1 {
                 demand_type
             } else {
-                DemandType::Failure
+                demand_type.retried(attempt - 1)
             };
             let error = match invoke(current.clone(), demand).await {
                 Ok(output) => return (Resolution::Commit(Ok(output)), current),

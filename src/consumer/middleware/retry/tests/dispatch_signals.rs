@@ -332,9 +332,9 @@ async fn fallible_inner_sees_one_apply_hook_per_attempt_when_retries_then_succee
         vec![
             ScriptedHook::Invoke(DemandType::Normal),
             ScriptedHook::AfterAbort(Err(ErrorCategory::Transient)),
-            ScriptedHook::Invoke(DemandType::Failure),
+            ScriptedHook::Invoke(DemandType::Failure { retry: 1 }),
             ScriptedHook::AfterAbort(Err(ErrorCategory::Transient)),
-            ScriptedHook::Invoke(DemandType::Failure),
+            ScriptedHook::Invoke(DemandType::Failure { retry: 2 }),
             ScriptedHook::AfterCommit(Ok(())),
         ],
         "each invocation must be paired with exactly one apply hook on the inner",
@@ -379,9 +379,9 @@ async fn fallible_inner_sees_one_apply_hook_per_attempt_when_max_retries_exhaust
         vec![
             ScriptedHook::Invoke(DemandType::Normal),
             ScriptedHook::AfterAbort(Err(ErrorCategory::Transient)),
-            ScriptedHook::Invoke(DemandType::Failure),
+            ScriptedHook::Invoke(DemandType::Failure { retry: 1 }),
             ScriptedHook::AfterAbort(Err(ErrorCategory::Transient)),
-            ScriptedHook::Invoke(DemandType::Failure),
+            ScriptedHook::Invoke(DemandType::Failure { retry: 2 }),
             ScriptedHook::AfterCommit(Err(ErrorCategory::Transient)),
         ],
         "max-retries-exhausted: 3 invocations, each paired with exactly one apply hook; final \

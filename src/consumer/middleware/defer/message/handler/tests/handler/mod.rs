@@ -24,13 +24,15 @@ use tracing::span::Id;
 
 pub use crate::consumer::middleware::tests::test_support::{HandlerOutcome, OutcomeError};
 
-/// A processed message record: (key, offset).
+/// A message and the demand its handler received.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessedMessage {
     /// The key of the processed message.
     pub key: Key,
     /// The offset of the processed message.
     pub offset: Offset,
+    /// The demand received by the handler.
+    pub demand: DemandType,
 }
 
 // ============================================================================
@@ -62,7 +64,11 @@ pub struct OutcomeHandler {
 }
 
 impl OutcomeHandler {
-    fn handle_message<P>(&self, message: &ConsumerMessage<P>) -> Result<(), OutcomeError> {
+    fn handle_message<P>(
+        &self,
+        message: &ConsumerMessage<P>,
+        demand: DemandType,
+    ) -> Result<(), OutcomeError> {
         use crate::consumer::Keyed;
         let key = message.key().clone();
         let offset = message.offset();
@@ -73,7 +79,11 @@ impl OutcomeHandler {
             offset,
             outcome
         );
-        self.record_processed(key, offset);
+        self.processed.push(ProcessedMessage {
+            key,
+            offset,
+            demand,
+        });
         self.ambient_pairs
             .lock()
             .push((tracing::Span::current().id(), message.span().id()));
@@ -125,11 +135,6 @@ impl OutcomeHandler {
         result
     }
 
-    /// Records a processed message.
-    fn record_processed(&self, key: Key, offset: Offset) {
-        self.processed.push(ProcessedMessage { key, offset });
-    }
-
     /// Returns the `(ambient, message-span)` id pairs recorded per call.
     #[must_use]
     pub fn ambient_pairs(&self) -> Vec<AmbientPair> {
@@ -169,24 +174,24 @@ impl FallibleHandler for OutcomeHandler {
         &self,
         _context: C,
         message: ConsumerMessage<()>,
-        _demand_type: DemandType,
+        demand: DemandType,
     ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        ready(()).map(move |()| self.handle_message(&message))
+        ready(()).map(move |()| self.handle_message(&message, demand))
     }
 
     fn on_message<C>(
         &self,
         _context: C,
         message: ConsumerMessage<serde_json::Value>,
-        _demand_type: DemandType,
+        demand: DemandType,
     ) -> impl Future<Output = Result<Self::Output, Self::Error>>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        ready(()).map(move |()| self.handle_message(&message))
+        ready(()).map(move |()| self.handle_message(&message, demand))
     }
 
     fn on_timer<C>(
