@@ -15,15 +15,14 @@ pub enum DemandType {
     Normal,
     /// An attempt after one or more failures.
     Failure {
-        /// The estimated retry ordinal: 1 on the first retry, one more on
+        /// The retry ordinal is 1 on the first retry and increases by 1 on
         /// each later retry.
         ///
-        /// In-process retries run only while failure rate gating disables
-        /// deferral. When gating lifts and the event defers, the ordinal
-        /// restarts at 1.
-        ///
-        /// A message held behind a deferred message with the same key also
-        /// reports 1 on its first delivery.
+        /// If Prosody defers an event after immediate retries, the ordinal
+        /// restarts at 1. In pipeline mode, immediate retries occur while
+        /// failure rate gating stops deferral. A message that waits behind a
+        /// deferred message with the same key also reports 1 on its first
+        /// handler call.
         ///
         /// Keep an exact retry count in keyed state if the handler needs one.
         retry: u32,
