@@ -15,7 +15,8 @@ use crate::state::manager::{Admission, PartitionStateManager, test_manager};
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::MessageMarker;
-use crate::state::session::sealed::MarkerIdentity;
+use crate::state::session::Promoted;
+use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{EventSession, Finalized, TerminationWatch};
 use crate::state::store::CellStore;
 use crate::state::tests::support::seed_commit_evidence;
@@ -28,6 +29,7 @@ use crate::timers::test_support::setup_timer_manager;
 use color_eyre::eyre::{Result, ensure, eyre};
 use quickcheck::QuickCheck;
 use serde_json::{Value, json};
+use std::future::Future;
 use tokio::sync::watch::channel;
 use uuid::Uuid;
 
@@ -164,7 +166,7 @@ async fn crash<S: EventSession<Loader: MessageLoader<Payload = Value>>>(
                 let Finalized::Staged(staged) = finalized else {
                     return Err(eyre!("the handler did not stage"));
                 };
-                ensure!(staged.promote(|| false).await);
+                ensure!(matches!(staged.promote(|| false).await, Promoted::Complete));
             }
         }
         4 => {
@@ -315,9 +317,8 @@ fn prop_boundary_crash_exactly_once() {
     QuickCheck::new().quickcheck(property as fn(u8, u8, u8) -> Result<bool>);
 }
 
-/// A permanent admission rejection commits the source without a handler or
-/// hook.
-async fn poisoned_dispatch(poisoned: bool) -> Result<()> {
+/// Admission repairs corrupt markers and dispatches the next event.
+async fn repaired_dispatch(poisoned: bool) -> Result<()> {
     use crate::consumer::Keyed;
     use crate::consumer::message::UncommittedEvent;
     use crate::consumer::middleware::deduplication::{DedupIdentity, dedup_uuid_for_message};
@@ -365,11 +366,11 @@ async fn poisoned_dispatch(poisoned: bool) -> Result<()> {
     )
     .await;
     ensure!(
-        handler.log.lock().len() == if poisoned { 0 } else { 2 },
-        "admission dispatched a rejected event"
+        handler.log.lock().len() == 2,
+        "admission blocked the next event"
     );
     ensure!(dedup.exists(id).await?);
-    ensure!(checks.contains(&key).await? != poisoned);
+    ensure!(checks.contains(&key).await?);
     ensure!(
         tracker.shutdown().await.is_some(),
         "admission did not commit the source"
@@ -380,11 +381,141 @@ async fn poisoned_dispatch(poisoned: bool) -> Result<()> {
 
 #[test]
 fn prop_admit_dispatch_soundness() {
+    use crate::test_util::GlobalMetrics;
+    use std::sync::LazyLock;
+    static METRICS: LazyLock<GlobalMetrics> = LazyLock::new(GlobalMetrics::install_global);
     fn property(poisoned: bool) -> Result<bool> {
         TEST_RUNTIME.block_on(async {
-            poisoned_dispatch(poisoned).await?;
+            let count = || -> Result<i64> {
+                Ok(METRICS
+                    .points("keyed_state.admission.corrupt_marker")?
+                    .iter()
+                    .map(|(_, count)| count)
+                    .sum())
+            };
+            let before = count()?;
+            repaired_dispatch(poisoned).await?;
+            ensure!(
+                count()? - before == i64::from(poisoned),
+                "corrupt marker repair did not increment its counter"
+            );
             Ok(true)
         })
     }
     QuickCheck::new().quickcheck(property as fn(bool) -> Result<bool>);
+}
+
+/// Rejects proof removal so the stage error must retain its classification.
+#[derive(Clone)]
+struct RejectedUnmark;
+
+impl AdmissionChecks for RejectedUnmark {
+    type Error = TestError;
+
+    fn contains(&self, _key: &crate::Key) -> impl Future<Output = Result<bool, Self::Error>> {
+        ready(Ok(false))
+    }
+
+    fn mark(&self, _key: &crate::Key) -> impl Future<Output = Result<(), Self::Error>> {
+        ready(Ok(()))
+    }
+
+    fn unmark(&self, _key: &crate::Key) -> impl Future<Output = Result<(), Self::Error>> {
+        ready(Err(TestError(ErrorCategory::Transient, "unmark")))
+    }
+}
+
+/// A rejected stage or promote leaves no residue and records no skipped event.
+#[test]
+fn prop_boundary_permanent_rejection() {
+    async fn run(mode: u8, value: u8) -> Result<bool> {
+        use crate::codec::JsonCodec;
+        use crate::state::descriptor::value_state;
+        use crate::state::tests::cell_suite::{FailingCellStore, Poison, value_cell};
+
+        let mode = mode % 3;
+        let raw = MemoryCellStore::new(MemoryCells::new());
+        let cell = FailingCellStore::with_handle(raw.clone(), Arc::default());
+        let dedup = MemoryDeduplicationStore::new();
+        let mut registry = CollectionDefRegistry::default();
+        let names = [StateName::try_new("cart")?, StateName::try_new("sibling")?];
+        for name in &names {
+            registry.register(
+                &value_state::<JsonCodec>(name.as_str()),
+                CollectionDef::new(None),
+            )?;
+        }
+        let key = StateKey::new(Uuid::new_v4(), Arc::from("user-1"));
+        let manager = test_manager(
+            cell.clone(),
+            dedup.clone(),
+            Arc::new(registry),
+            key.segment_id,
+            RejectedUnmark,
+            MemoryLoader::<Value>::new(),
+        );
+        let (_stream, timers, shutdown) = setup_timer_manager().await?;
+        let (_cancel, cancel) = channel(false);
+        let id = Uuid::new_v4();
+        let scope = manager.session(
+            key.key.clone(),
+            EventRef::Message { dedup_id: id },
+            TerminationWatch::new(shutdown.subscribe(), cancel),
+        );
+        let session = scope.handle();
+        let context = MockEventContext::new().with_session(session.clone());
+        let count = if mode == 1 { 1 } else { 2 };
+        for name in &names[..count] {
+            context
+                .state(Registered::new(value_state::<JsonCodec>(name.as_str())))?
+                .set(json!(value))
+                .await?;
+        }
+        cell.set_poison(Some(if mode == 0 {
+            Poison::WriteProvisional(names[0].clone(), ErrorCategory::Permanent)
+        } else {
+            Poison::Collection(names[0].clone(), ErrorCategory::Permanent)
+        }));
+        if mode == 0 {
+            let Err(error) = session.finalize().await else {
+                return Err(eyre!("the stage must reject"));
+            };
+            ensure!(
+                error.classify_error() == ErrorCategory::Permanent,
+                "proof removal replaced the stage error"
+            );
+        }
+        let (guard, committed, aborted) = RecordingGuard::new();
+        settle(&ProbeHandler::ok(0), context, guard, Ok(0)).await;
+        ensure!(committed.load(Ordering::SeqCst) == 1);
+        ensure!(aborted.load(Ordering::SeqCst) == 0);
+        ensure!(
+            dedup.exists(id).await? == (mode == 2),
+            "a skip recorded dedup evidence"
+        );
+        for (index, name) in names[..count].iter().enumerate() {
+            let collection = CollectionId::new(key.clone(), StateType::Application, name.clone());
+            ensure!(
+                raw.marker_state(&collection).await?.staged.is_none(),
+                "rejected state retained residue"
+            );
+            ensure!(
+                raw.get(&collection, &value_cell()).await?.get().is_some()
+                    == (mode == 2 && index == 1)
+            );
+        }
+        cell.set_poison(None);
+        ensure!(
+            manager
+                .admit(key.key.clone(), &timers, &shutdown.subscribe())
+                .await
+                == Admission::Fresh
+        );
+        shutdown.send_replace(ShutdownPhase::Cancelling);
+        Ok(true)
+    }
+    fn property(mode: u8, value: u8) -> Result<bool> {
+        TEST_RUNTIME.block_on(run(mode, value))
+    }
+    QuickCheck::new().quickcheck(property as fn(u8, u8) -> Result<bool>);
 }

@@ -8,6 +8,7 @@ use crate::state::descriptor::StateDescriptor;
 use crate::state::identity::StateKey;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+use crate::state::session::Promoted;
 use crate::state::session::sealed::StateLifecycle;
 use crate::state::session::{Finalized, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
@@ -97,7 +98,7 @@ async fn promote<C: CellStore>(session: OwnerSession<C>) -> Result<()> {
         .finalize()
         .await
         .map_err(|e| eyre!("finalize: {e}"))?
-        && !staged.promote(|| false).await
+        && !matches!(staged.promote(|| false).await, Promoted::Complete)
     {
         bail!("promote incomplete on a healthy store");
     }

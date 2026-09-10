@@ -40,13 +40,27 @@ use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
 use crate::{Key, Partition, SegmentId, Topic};
 use futures::stream::{self, StreamExt, TryStreamExt};
+use opentelemetry::global::meter;
+use opentelemetry::metrics::Counter;
 use smallvec::SmallVec;
 use std::error::Error;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use thiserror::Error;
 use tokio::sync::{OnceCell, watch};
 use tokio::task::coop::cooperative;
+use tracing::error;
+
+static CORRUPT_MARKER: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    meter("prosody")
+        .u64_counter("keyed_state.admission.corrupt_marker")
+        .build()
+});
+static ADMISSION_TORN: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    meter("prosody")
+        .u64_counter("keyed_state.admission.torn")
+        .build()
+});
 
 /// The identity store error of a backend.
 type IdentityErr<B> = <<B as StateBackend>::Identity as DescriptorIdentityStore>::Error;
@@ -161,8 +175,8 @@ pub trait PartitionStateManager: Clone + Send + Sync + 'static {
     /// Committed residue promotes in every discovered collection, registered or
     /// not. Uncommitted registered residue aborts with the registry TTL.
     /// Unregistered version 2 residue remains untouched; version 1 residue
-    /// loses its Staged row. Fresh guarantees that no registered collection
-    /// has unresolved residue.
+    /// loses its Staged row. Permanent rejections receive local repair.
+    /// Shutdown prevents dispatch.
     fn admit<T>(
         &self,
         key: Key,
@@ -174,15 +188,11 @@ pub trait PartitionStateManager: Clone + Send + Sync + 'static {
 }
 
 /// Admission decides whether an event can dispatch.
-/// Poisoned records message dedup evidence best-effort, commits the source, and
-/// logs the key at error level. It leaves the key unchecked and invokes neither
-/// a handler nor an apply hook.
+/// Permanent store rejections receive local repair and do not prevent dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
     /// The key can dispatch an event.
     Fresh,
-    /// A permanent store rejection prevents dispatch.
-    Poisoned,
     /// Shutdown stopped admission.
     Abandoned,
 }
@@ -297,16 +307,24 @@ where
         T: TriggerStore,
     {
         let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
-        match admission_step(cancelled, || self.inner.checks.contains(&key)).await {
-            Ok(true) => return Admission::Fresh,
-            Ok(false) => {}
+        match admission_step(cancelled, &key, "checks.contains", || {
+            self.inner.checks.contains(&key)
+        })
+        .await
+        {
+            Ok(Some(true)) => return Admission::Fresh,
+            Ok(Some(false) | None) => {}
             Err(admission) => return admission,
         }
         if let Err(admission) = self.admit_unchecked(&key, timers, shutdown).await {
             return admission;
         }
-        match admission_step(cancelled, || self.inner.checks.mark(&key)).await {
-            Ok(()) => Admission::Fresh,
+        match admission_step(cancelled, &key, "checks.mark", || {
+            self.inner.checks.mark(&key)
+        })
+        .await
+        {
+            Ok(_) => Admission::Fresh,
             Err(admission) => admission,
         }
     }
@@ -316,15 +334,11 @@ impl<B, L> StateManager<B, L>
 where
     B: StateBackend,
 {
-    /// Discovers collection markers and certifies Staged rows through commit
-    /// evidence. Resolves the discovered residue.
-    /// Retires committed sources before dispatch.
-    async fn admit_unchecked<T: TriggerStore>(
+    async fn load_markers(
         &self,
         key: &Key,
-        timers: &TimerManager<T>,
         shutdown: &watch::Receiver<ShutdownPhase>,
-    ) -> Result<(), Admission> {
+    ) -> Result<SmallVec<[(CollectionRef, MarkerState); 8]>, Admission> {
         let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
         let registry = &self.inner.registry;
         let state_key = StateKey::new(self.inner.segment_id, key.clone());
@@ -342,8 +356,16 @@ where
                     let ttl = registry.ttl_for(kind, &name);
                     let id = CollectionId::new(state_key.clone(), kind, name);
                     cooperative(async move {
-                        let state =
-                            admission_step(cancelled, || self.inner.cell.marker_state(&id)).await?;
+                        let state = admission_step(cancelled, key, id.name().as_str(), || {
+                            self.inner.cell.marker_state(&id)
+                        })
+                        .await?;
+                        // A corrupt marker cannot name cells for repair. Keep those cells
+                        // unchanged.
+                        let state = state.unwrap_or_else(|| {
+                            CORRUPT_MARKER.add(1, &[]);
+                            MarkerState::default()
+                        });
                         let collection = CollectionRef::new(id, ttl);
                         Ok::<_, Admission>((collection, state))
                     })
@@ -370,6 +392,22 @@ where
                 }
             }
         }
+
+        Ok(states)
+    }
+
+    /// Discovers collection markers and certifies Staged rows through commit
+    /// evidence. Resolves the discovered residue.
+    /// Retires committed sources before dispatch.
+    async fn admit_unchecked<T: TriggerStore>(
+        &self,
+        key: &Key,
+        timers: &TimerManager<T>,
+        shutdown: &watch::Receiver<ShutdownPhase>,
+    ) -> Result<(), Admission> {
+        let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
+        let registry = &self.inner.registry;
+        let states = self.load_markers(key, shutdown).await?;
 
         let mut committed: SmallVec<[CommittedMarker; 8]> = SmallVec::with_capacity(states.len());
         for (_, state) in &states {
@@ -399,7 +437,7 @@ where
                 })
             {
                 if marker.version() == MarkerVersion::V1 {
-                    admission_step(cancelled, || {
+                    admission_step(cancelled, key, collection.id().name().as_str(), || {
                         self.inner.cell.abort_provisional(collection, &[])
                     })
                     .await?;
@@ -412,20 +450,48 @@ where
             } else {
                 CommitDecision::NotCommitted
             };
-            admission_step(cancelled, || {
+            let resolved = admission_step(cancelled, key, collection.id().name().as_str(), || {
                 resolve_event_marker(&self.inner.cell, collection, marker, decision)
             })
             .await?;
+            if resolved.is_none() && is_committed {
+                ADMISSION_TORN.add(1, &[]);
+                admission_step(cancelled, key, collection.id().name().as_str(), || {
+                    resolve_event_marker(
+                        &self.inner.cell,
+                        collection,
+                        marker,
+                        CommitDecision::NotCommitted,
+                    )
+                })
+                .await?;
+            }
         }
 
         for marker in committed {
             if let Some(dedup) = marker.dedup
-                && !admission_step(cancelled, || self.inner.dedup.exists(dedup)).await?
+                && admission_step(
+                    cancelled,
+                    key,
+                    "dedup read rejected; redelivery can reach the handler",
+                    || self.inner.dedup.exists(dedup),
+                )
+                .await?
+                    == Some(false)
             {
-                admission_step(cancelled, || self.inner.dedup.insert(dedup)).await?;
+                admission_step(
+                    cancelled,
+                    key,
+                    "dedup write rejected; redelivery can reach the handler",
+                    || self.inner.dedup.insert(dedup),
+                )
+                .await?;
             }
             if let EventRef::Timer(timer) = marker.event {
-                admission_step(cancelled, || timers.retire_committed(key, timer)).await?;
+                admission_step(cancelled, key, "timer retirement", || {
+                    timers.retire_committed(key, timer)
+                })
+                .await?;
             }
         }
 
@@ -444,15 +510,20 @@ where
     ) -> Result<bool, Admission> {
         let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
         match event {
-            EventRef::Message { dedup_id } => {
-                admission_step(cancelled, || self.inner.dedup.exists(dedup_id)).await
-            }
+            EventRef::Message { dedup_id } => Ok(admission_step(
+                cancelled,
+                key,
+                "legacy dedup read; redelivery can reach the handler",
+                || self.inner.dedup.exists(dedup_id),
+            )
+            .await?
+                == Some(true)),
             EventRef::Timer(timer) => {
-                let tag = admission_step(cancelled, || {
+                let tag = admission_step(cancelled, key, "legacy timer read", || {
                     timers.current_timer_tag(key, timer.time, timer.timer_type)
                 })
                 .await?;
-                Ok(tag != Some(timer.tag))
+                Ok(tag.is_some_and(|tag| tag != Some(timer.tag)))
             }
         }
     }
@@ -460,15 +531,28 @@ where
 
 async fn admission_step<R, E, Fut>(
     cancelled: impl Fn() -> bool,
-    step: impl FnMut() -> Fut,
-) -> Result<R, Admission>
+    key: &Key,
+    collection: &str,
+    mut step: impl FnMut() -> Fut,
+) -> Result<Option<R>, Admission>
 where
     Fut: Future<Output = Result<R, E>>,
     E: ClassifyError + Error,
 {
-    match retry_step(cancelled, "keyed-state admission", step).await {
-        StepOutcome::Done(value) => Ok(value),
-        StepOutcome::Skip => Err(Admission::Poisoned),
+    match retry_step(cancelled, "keyed-state admission", || {
+        let result = step();
+        async move {
+            let result = result.await;
+            if let Err(error) = &result
+                && error.classify_error() == ErrorCategory::Permanent
+            {
+                error!(%error, %key, collection, "admission rejected store operation; continue with local repair");
+            }
+            result
+        }
+    }).await {
+        StepOutcome::Done(value) => Ok(Some(value)),
+        StepOutcome::Skip => Ok(None),
         StepOutcome::Abandon => Err(Admission::Abandoned),
     }
 }

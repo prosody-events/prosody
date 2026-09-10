@@ -133,6 +133,7 @@ impl ReaderEvidence {
 }
 
 /// The format selected by the staged row's version column.
+/// A future payload version must ship with a new `SegmentVersion`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MarkerVersion {
     V1,

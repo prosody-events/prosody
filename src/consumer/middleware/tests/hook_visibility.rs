@@ -267,10 +267,11 @@ async fn dedup_shutdown_hook_reads_the_committed_value() -> Result<()> {
     Ok(())
 }
 
-/// The commit hook reads certified values after an incomplete promote.
-/// Its reads leave the unpromoted collection provisional.
+/// The commit hook reads repaired values after a torn promote.
+/// Rejected collections contain their previous committed values without
+/// residue.
 #[tokio::test]
-async fn incomplete_promote_hook_reads_all_committed_collections() -> Result<()> {
+async fn rejected_promote_hook_reads_repaired_collections() -> Result<()> {
     type SplitStore = FailingCellStore<MemoryCellStore>;
     type SplitBackend =
         PartitionBackend<RecordingDedup, MemoryDescriptorIdentityStore, SplitStore, ()>;
@@ -350,19 +351,18 @@ async fn incomplete_promote_hook_reads_all_committed_collections() -> Result<()>
         vec![(
             Hook::Commit,
             vec![
-                // Unpromoted: the sibling certificate exposes the new value.
-                Ok(Some(Bytes::from_static(b"A1"))),
+                // Rejected: rollback restored the committed base.
+                Ok(Some(Bytes::from_static(b"A0"))),
                 // Promoted: the new committed value.
                 Ok(Some(Bytes::from_static(b"B1"))),
             ],
         )],
-        "after_commit reads both committed values",
+        "after_commit reads the repaired and promoted values",
     );
-    // Raw residue probes: the hook read issued no durable write — cart is
-    // still provisional for admission; wishlist has promoted.
+    // Both collections have resolved state before the hook returns.
     assert!(
-        !cells.provisional_coordinates(&cart_id).is_empty(),
-        "cart stays provisional after the failed promote",
+        cells.provisional_coordinates(&cart_id).is_empty(),
+        "rollback removed the rejected stage",
     );
     assert!(
         cells.provisional_coordinates(&wishlist_id).is_empty(),

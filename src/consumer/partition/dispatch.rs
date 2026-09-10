@@ -1,4 +1,3 @@
-use crate::consumer::middleware::reject_admission;
 use std::future::{Future, Ready, ready};
 use std::panic::{AssertUnwindSafe, resume_unwind};
 
@@ -44,9 +43,6 @@ pub(crate) async fn process_event<T, S, M, P>(
     let admission = state_manager
         .admit(event.key().clone(), timer_manager, shutdown_rx)
         .await;
-    if admission == Admission::Poisoned {
-        error!(key = %event.key(), "keyed-state admission rejected the event");
-    }
     match event {
         UncommittedEvent::Message(message) => {
             process_record(
@@ -129,10 +125,6 @@ async fn process_record<S, M, Q, F, Fut>(
         timer_manager.clone(),
         scope.handle(),
     );
-    if admission == Admission::Poisoned {
-        reject_admission(&context, message).await;
-        return;
-    }
     let cloned_context = context.clone();
     let _guard = message.process_scope();
     // Use the receive span so handler spans and `Span::current()` captures nest
@@ -165,7 +157,7 @@ async fn process_timer<T, S, M, P>(
     };
     firing.set_dispatch_span(timer_spans);
 
-    if firing.timer_type() == TimerType::StateRecovery || admission == Admission::Poisoned {
+    if firing.timer_type() == TimerType::StateRecovery {
         firing.commit().await;
         return;
     }

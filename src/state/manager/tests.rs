@@ -7,6 +7,7 @@ use crate::state::backend::AdmissionChecks;
 use crate::state::fjall::test_db::cold_marker_checks;
 use crate::state::marker::decode_marker_payload;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
+use crate::state::session::Promoted;
 use crate::state::tests::support::{MemoryDeduplicationStore, evidence, run_admit_soundness};
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::Trigger;
@@ -261,105 +262,113 @@ async fn legacy_deregistration(value: u8) -> Result<()> {
     Ok(())
 }
 
-/// Failed stage and promote exits remove the proof before the key can dispatch
-/// again.
-#[test]
-fn prop_settle_preserves_admission_proof() {
-    async fn run(mode: u8, value: u8) -> Result<bool> {
-        use crate::codec::JsonCodec;
-        use crate::state::descriptor::value_state;
-        use crate::state::registry::CollectionDef;
-        use crate::state::session::{Finalized, sealed::StateLifecycle};
-        use crate::state::tests::cell_suite::{FailingCellStore, Poison, value_cell};
-        use crate::timers::test_support::setup_timer_manager;
-        use color_eyre::eyre::ensure;
-        use uuid::Uuid;
+/// Failed stages and repaired promotes remove the admission proof.
+async fn run_settle_proof(mode: u8, value: u8) -> Result<bool> {
+    use crate::codec::JsonCodec;
+    use crate::state::descriptor::value_state;
+    use crate::state::registry::CollectionDef;
+    use crate::state::session::{Finalized, sealed::StateLifecycle};
+    use crate::state::tests::cell_suite::{FailingCellStore, Poison, value_cell};
+    use crate::timers::test_support::setup_timer_manager;
+    use color_eyre::eyre::ensure;
+    use uuid::Uuid;
 
-        let raw = MemoryCellStore::new(MemoryCells::new());
-        let cell = FailingCellStore::with_handle(raw.clone(), Arc::default());
-        let checks = cold_marker_checks()?;
-        let key = StateKey::new(Uuid::new_v4(), Arc::from("proof"));
-        let mut registry = CollectionDefRegistry::default();
-        let names = [StateName::try_new("a")?, StateName::try_new("b")?];
-        for name in &names {
-            registry.register(
-                &value_state::<JsonCodec>(name.as_str()),
-                CollectionDef::new(None),
-            )?;
-        }
-        let manager = test_manager(
-            cell.clone(),
-            MemoryDeduplicationStore::new(),
-            Arc::new(registry),
-            key.segment_id,
-            checks.clone(),
-            (),
+    let raw = MemoryCellStore::new(MemoryCells::new());
+    let cell = FailingCellStore::with_handle(raw.clone(), Arc::default());
+    let checks = cold_marker_checks()?;
+    let key = StateKey::new(Uuid::new_v4(), Arc::from("proof"));
+    let mut registry = CollectionDefRegistry::default();
+    let names = [StateName::try_new("a")?, StateName::try_new("b")?];
+    for name in &names {
+        registry.register(
+            &value_state::<JsonCodec>(name.as_str()),
+            CollectionDef::new(None),
+        )?;
+    }
+    let manager = test_manager(
+        cell.clone(),
+        MemoryDeduplicationStore::new(),
+        Arc::new(registry),
+        key.segment_id,
+        checks.clone(),
+        (),
+    );
+    let (_stream, timers, shutdown) = setup_timer_manager().await?;
+    for _ in 0_u8..2 {
+        ensure!(
+            manager
+                .admit(key.key.clone(), &timers, &shutdown.subscribe())
+                .await
+                == Admission::Fresh
         );
-        let (_stream, timers, shutdown) = setup_timer_manager().await?;
-        for _ in 0_u8..2 {
-            ensure!(
-                manager
-                    .admit(key.key.clone(), &timers, &shutdown.subscribe())
-                    .await
-                    == Admission::Fresh
-            );
-            ensure!(checks.contains(&key.key).await?);
-            let (_cancel, cancel) = watch::channel(false);
-            let scope = manager.session(
-                key.key.clone(),
-                EventRef::Message {
-                    dedup_id: Uuid::new_v4(),
-                },
-                TerminationWatch::new(shutdown.subscribe(), cancel),
-            );
-            let session = scope.handle();
-            for name in &names {
-                session
-                    .seed(StateType::Application, name, &value_cell(), Some(&[value]))
-                    .await;
-            }
-            if mode.is_multiple_of(4) {
-                cell.set_poison(Some(Poison::WriteProvisional(
+        ensure!(checks.contains(&key.key).await?);
+        let (_cancel, cancel) = watch::channel(false);
+        let scope = manager.session(
+            key.key.clone(),
+            EventRef::Message {
+                dedup_id: Uuid::new_v4(),
+            },
+            TerminationWatch::new(shutdown.subscribe(), cancel),
+        );
+        let session = scope.handle();
+        for name in &names {
+            session
+                .seed(StateType::Application, name, &value_cell(), Some(&[value]))
+                .await;
+        }
+        if mode.is_multiple_of(4) {
+            cell.set_poison(Some(Poison::WriteProvisional(
+                names[0].clone(),
+                ErrorCategory::Permanent,
+            )));
+        }
+        let finalized = session.finalize().await;
+        if mode.is_multiple_of(4) {
+            ensure!(finalized.is_err());
+        } else {
+            let Finalized::Staged(staged) = finalized? else {
+                return Ok(false);
+            };
+            if mode % 4 == 1 {
+                cell.set_poison(Some(Poison::Collection(
                     names[0].clone(),
                     ErrorCategory::Permanent,
                 )));
             }
-            let finalized = session.finalize().await;
-            if mode.is_multiple_of(4) {
-                ensure!(finalized.is_err());
-            } else {
-                let Finalized::Staged(staged) = finalized? else {
-                    return Ok(false);
-                };
-                if mode % 4 == 1 {
-                    cell.set_poison(Some(Poison::Collection(
-                        names[0].clone(),
-                        ErrorCategory::Permanent,
-                    )));
+            match staged.promote(|| mode % 4 == 2).await {
+                Promoted::Complete => ensure!(mode % 4 == 3),
+                Promoted::Torn(rejected) => {
+                    ensure!(mode % 4 == 1);
+                    ensure!(rejected.abort(|| false).await);
                 }
-                ensure!(staged.promote(|| mode % 4 == 2).await == (mode % 4 != 2));
-            }
-            cell.set_poison(None);
-            ensure!(
-                checks.contains(&key.key).await? == (mode % 4 == 3),
-                "a failed settle retained its admission proof"
-            );
-            ensure!(
-                manager
-                    .admit(key.key.clone(), &timers, &shutdown.subscribe())
-                    .await
-                    == Admission::Fresh
-            );
-            for name in &names {
-                let id = CollectionId::new(key.clone(), StateType::Application, name.clone());
-                ensure!(raw.marker_state(&id).await?.staged.is_none());
+                Promoted::Abandoned => ensure!(mode % 4 == 2),
+                Promoted::Rejected(_) => return Ok(false),
             }
         }
-        shutdown.send_replace(ShutdownPhase::Cancelling);
-        Ok(true)
+        cell.set_poison(None);
+        ensure!(
+            checks.contains(&key.key).await? == (mode % 4 == 3),
+            "a failed settle retained its admission proof"
+        );
+        ensure!(
+            manager
+                .admit(key.key.clone(), &timers, &shutdown.subscribe())
+                .await
+                == Admission::Fresh
+        );
+        for name in &names {
+            let id = CollectionId::new(key.clone(), StateType::Application, name.clone());
+            ensure!(raw.marker_state(&id).await?.staged.is_none());
+        }
     }
+    shutdown.send_replace(ShutdownPhase::Cancelling);
+    Ok(true)
+}
+
+#[test]
+fn prop_settle_preserves_admission_proof() {
     fn property(mode: u8, value: u8) -> Result<bool> {
-        TEST_RUNTIME.block_on(run(mode, value))
+        TEST_RUNTIME.block_on(run_settle_proof(mode, value))
     }
     QuickCheck::new().quickcheck(property as fn(u8, u8) -> Result<bool>);
 }

@@ -44,6 +44,7 @@ use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+use crate::state::session::Promoted;
 use crate::state::session::sealed::StateLifecycle;
 use crate::state::session::{Finalized, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::{CELL_BATCH, CellStore};
@@ -426,7 +427,7 @@ async fn resolve_event(
     match outcome {
         Outcome::Commit => {
             if let Finalized::Staged(staged) = finalized
-                && !staged.promote(|| false).await
+                && !matches!(staged.promote(|| false).await, Promoted::Complete)
             {
                 return Err(eyre!("promote incomplete on a healthy store"));
             }
@@ -487,7 +488,7 @@ where
         .await
         .map_err(|e| eyre!("marker: {e}"))?;
     if let Finalized::Staged(staged) = finalized {
-        if !staged.promote(|| false).await {
+        if !matches!(staged.promote(|| false).await, Promoted::Complete) {
             bail!("promote incomplete on a healthy store");
         }
         assert_no_settlement_residue(cells, collection)?;

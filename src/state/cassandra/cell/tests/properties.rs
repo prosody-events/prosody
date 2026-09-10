@@ -1,5 +1,7 @@
 use super::*;
+use crate::state::cassandra::cell::TABLE_KEYED_STATE_CELL;
 use crate::state::tests::support::run_admit_soundness;
+use color_eyre::eyre::ensure;
 
 /// Converts a property body's `Result<bool>` into a `TestResult`, surfacing the
 /// error on failure (a store/setup error is a broken environment, not a
@@ -205,7 +207,32 @@ fn prop_cassandra_admit_soundness() {
         finish(TEST_RUNTIME.block_on(async {
             let fx = fixture().await?;
             let dedup = MemoryDeduplicationStore::new();
-            run_admit_soundness(fx.bottom_store(), dedup, value, committed).await
+            let store = fx.bottom_store();
+            let c = collection("corrupt-admission")?;
+            let id = c.id();
+            let corrupt = format!(
+                "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, \
+                 state_type, name, kind, section, coordinate, version) VALUES (?, ?, ?, ?, 1, 0, \
+                 0x02, 99)"
+            );
+            fx.cassandra
+                .session()
+                .query_unpaged(
+                    corrupt,
+                    (
+                        id.state_key().segment_id,
+                        id.state_key().key.as_ref(),
+                        id.state_type(),
+                        id.name().as_str(),
+                    ),
+                )
+                .await?;
+            ensure!(store.marker_state(id).await.is_err());
+            ensure!(
+                admit_collection(&store, &dedup, &c).await?,
+                "corrupt marker blocked admission"
+            );
+            run_admit_soundness(store, dedup, value, committed).await
         }))
     }
     QuickCheck::new()

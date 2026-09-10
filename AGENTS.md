@@ -426,7 +426,10 @@ Read `settle_committed`, `Staged::promote`, and `PartitionStateManager::admit` b
 The collection's `Committed` row supplies positive evidence. It certifies a `Staged` row only through the attempt identity.
 The promote writes evidence before cell changes. Each stage chunk writes its discovery row atomically with its cells.
 Admission runs before the key's first dispatch. It resolves residue and retires committed sources.
-The disk-backed check set records complete admission. A failed stage or promote removes that proof.
+The disk-backed check set records complete admission. Failed stages and interrupted promotes remove that proof.
+Permanent admission errors receive local repair and do not block dispatch.
+Permanent stage and promote rejections restore affected collections before the source commits.
+A fully rejected event records no dedup id.
 No new event arms a `StateRecovery` timer. An old timer runs admission and commits its trigger.
 
 **No WAL.** Durable state consists of provisional cells and collection commit evidence.

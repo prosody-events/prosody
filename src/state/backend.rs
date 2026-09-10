@@ -166,11 +166,11 @@ where
 }
 
 /// Stores admission proofs for one partition assignment.
-/// A checked key has resolved residue and retired committed sources.
-/// Each later settle completes all promotes or removes the proof.
-/// Finalize removes it after a failed stage; `Staged::promote` removes it after
-/// an incomplete promote. A failed unmark must disable the proof before it
-/// returns an error.
+/// A checked key has completed admission, including local repairs for Permanent
+/// errors. Each later settle resolves its collections or removes the proof.
+/// Finalize removes it after a failed stage. Staged removes it when shutdown
+/// interrupts promotion or rollback. A failed unmark must disable the proof
+/// before it returns an error.
 pub trait AdmissionChecks: Clone + Send + Sync + 'static {
     /// The classified storage error.
     type Error: ClassifyError + Error + Send + Sync + 'static;

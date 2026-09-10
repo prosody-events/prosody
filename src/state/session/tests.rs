@@ -21,6 +21,7 @@ use crate::state::manager::EventStateScope;
 use crate::state::marker::{EventEvidence, EventMarker};
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+use crate::state::session::Promoted;
 use crate::state::store::{CELL_BATCH, CellStore};
 use crate::state::tests::cell_suite::{
     FailingCellStore, MemoryDeduplicationStore, Poison, PoisonHandle, cell_at, value_cell,
@@ -687,7 +688,7 @@ async fn checked_finalize(
     Ok(finalized)
 }
 
-/// A permanent promote failure leaves the attempt for admission.
+/// A permanent promote failure restores the committed base.
 async fn promote_receipt(
     fx: &Fixture,
     staged: super::sealed::Staged<TestStore, ()>,
@@ -699,12 +700,16 @@ async fn promote_receipt(
             ErrorCategory::Permanent,
         )));
     }
-    let completed = staged.promote(|| false).await;
-    fx.set_poison(None);
-    assert!(completed, "a promote stopped without shutdown");
-    if !fail_promote {
-        assert_no_settlement_residue(&fx.cells, &fx.value_id())?;
+    match staged.promote(|| false).await {
+        Promoted::Complete => assert!(!fail_promote),
+        Promoted::Rejected(rejected) => {
+            assert!(fail_promote);
+            assert!(rejected.abort(|| false).await);
+        }
+        _ => bail!("unexpected promote result"),
     }
+    fx.set_poison(None);
+    assert_no_settlement_residue(&fx.cells, &fx.value_id())?;
     Ok(())
 }
 
@@ -908,7 +913,7 @@ async fn failed_finalize_keeps_the_buffer_whole_for_retry() -> Result<()> {
         bail!("the healed retry must re-stage from the intact buffer");
     };
     fx.dedup.insert(dedup_id).await?;
-    assert!(staged.promote(|| false).await);
+    assert!(matches!(staged.promote(|| false).await, Promoted::Complete));
     for (name, expected) in [(&cart, b"c1"), (&wishlist, b"w1")] {
         let id = CollectionId::new(fx.state_key.clone(), StateType::Application, name.clone());
         assert_eq!(
@@ -985,7 +990,7 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
     );
 
     fx.dedup.insert(dedup_id).await?;
-    assert!(staged.promote(|| false).await);
+    assert!(matches!(staged.promote(|| false).await, Promoted::Complete));
 
     assert_eq!(
         fx.committed_value().await?,
@@ -1138,7 +1143,7 @@ impl CountingFixture {
     async fn settle(&self, finalized: Finalized<CountingCell, ()>) -> Result<()> {
         if let Finalized::Staged(staged) = finalized {
             self.dedup.insert(self.dedup_id).await?;
-            assert!(staged.promote(|| false).await);
+            assert!(matches!(staged.promote(|| false).await, Promoted::Complete));
         }
         Ok(())
     }
@@ -1482,7 +1487,7 @@ async fn stage_restores_distinct_bases_on_abort() -> Result<()> {
         bail!("the seeding event must stage");
     };
     fx.dedup.insert(dedup).await?;
-    assert!(staged.promote(|| false).await);
+    assert!(matches!(staged.promote(|| false).await, Promoted::Complete));
 
     // Overwrite both, then abort: each cell rolls back to its own base.
     let (event, _dedup) = message(2);
@@ -1754,7 +1759,7 @@ async fn run_multi_section(trace: MultiTrace) -> Result<()> {
                     let finalized = session.finalize().await?;
                     fx.dedup.insert(dedup).await?;
                     if let Finalized::Staged(staged) = finalized {
-                        assert!(staged.promote(|| false).await);
+                        assert!(matches!(staged.promote(|| false).await, Promoted::Complete));
                     }
                     commit_into_model(&mut model, &cells, &cleared, &surviving_clears);
                 }

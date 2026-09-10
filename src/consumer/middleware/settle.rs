@@ -6,10 +6,16 @@
 //! determines whether the boundary stages state. The blanket `EventHandler`
 //! implementation and `RetryHandler` use this same boundary.
 //!
+//! State rejection records no dedup id. The source commits only after state
+//! resolution.
+//!
 //! Apply hooks run after the permit drops. The boundary re-pins their context
 //! so reads observe the settled state.
 
+use opentelemetry::global::meter;
+use opentelemetry::metrics::Counter;
 use std::future::Future;
+use std::sync::LazyLock;
 
 use crate::state::retry::{DURABILITY_RETRY_DELAY, StepOutcome, retry_step};
 use tokio::time::sleep;
@@ -21,7 +27,13 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::access::StateAccessError;
 use crate::state::descriptor::Registered;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
-use crate::state::session::{Finalized, LifecycleAccess, MessageMarker, OpPermit};
+use crate::state::session::{Finalized, LifecycleAccess, MessageMarker, OpPermit, Promoted};
+
+static PROMOTE_TORN: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    meter("prosody")
+        .u64_counter("keyed_state.promote.torn")
+        .build()
+});
 
 /// Gives the settlement boundary access to the sealed session lifecycle.
 /// Other middleware uses the narrower message-marker interface.
@@ -268,8 +280,10 @@ async fn settle_committed<'a, T, C, G>(
     {
         StepOutcome::Done(finalized) => finalized,
         StepOutcome::Skip => {
-            if let Some(marker) = lifecycle.message_marker() {
-                record_marker_best_effort(&context, lifecycle, marker).await;
+            if context.is_shutdown() {
+                drop(permit);
+                abandon(handler, context, guard, result).await;
+                return;
             }
             // Finalize failed and left the dirty overlay intact.
             commit_and_finish(handler, context, guard, result, Some(lifecycle), permit).await;
@@ -286,12 +300,29 @@ async fn settle_committed<'a, T, C, G>(
     };
 
     // The first successful promote is the commit point.
-    if let Finalized::Staged(staged) = finalized
-        && !staged.promote(|| context.is_shutdown()).await
-    {
-        drop(permit);
-        abandon(handler, context, guard, result).await;
-        return;
+    if let Finalized::Staged(staged) = finalized {
+        let outcome = staged.promote(|| context.is_shutdown()).await;
+        let complete = match outcome {
+            Promoted::Complete => true,
+            Promoted::Abandoned => false,
+            Promoted::Rejected(rejected) => {
+                if rejected.abort(|| context.is_shutdown()).await {
+                    commit_and_finish(handler, context, guard, result, Some(lifecycle), permit)
+                        .await;
+                    return;
+                }
+                false
+            }
+            Promoted::Torn(rejected) => {
+                PROMOTE_TORN.add(1, &[]);
+                rejected.abort(|| context.is_shutdown()).await
+            }
+        };
+        if !complete {
+            drop(permit);
+            abandon(handler, context, guard, result).await;
+            return;
+        }
     }
 
     // Record the message identity after all promote attempts finish.
@@ -377,19 +408,6 @@ async fn fire_apply_hook<T, C>(
     } else {
         handler.after_abort(stamped, result).await;
     }
-}
-
-/// Commits an event rejected by admission, without a handler or an apply hook.
-pub(crate) async fn reject_admission<C: EventContext, G: Uncommitted + Send>(
-    context: &C,
-    guard: G,
-) {
-    if let Ok(lifecycle) = context.settle_lifecycle()
-        && let Some(marker) = lifecycle.message_marker()
-    {
-        record_marker_best_effort(context, &lifecycle, marker).await;
-    }
-    guard.commit().await;
 }
 
 /// Records `marker` best-effort, retrying transient failures; a permanent

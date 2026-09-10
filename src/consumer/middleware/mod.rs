@@ -181,9 +181,7 @@ pub use boundary::FallibleEventHandler;
 pub use composition::{ComposedMiddleware, FallibleHandlerProvider, HandlerMiddleware};
 pub use handler::FallibleHandler;
 pub use providers::{CloneProvider, FallibleCloneProvider, LeafHandler};
-pub(crate) use settle::{
-    MarkerWrite, NextAttempt, Settlement, SettlementHandler, abandon, reject_admission, settle,
-};
+pub(crate) use settle::{MarkerWrite, NextAttempt, Settlement, SettlementHandler, abandon, settle};
 // `RepinProof` is named by the public `EventContext::redispatch` signature, so
 // it must be publicly reachable — its constructor stays module-private, so the
 // re-export exposes only an unconstructable token (the `MarkerWrite` idiom).

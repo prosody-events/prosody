@@ -20,6 +20,8 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::middleware::{MarkerWrite, RepinProof};
 use crate::consumer::partition::ShutdownPhase;
+use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::CommitDecision;
 use crate::state::access::StateAccessError;
 use crate::state::backend::AdmissionChecks;
 use crate::state::cell::{Committed, ProvisionalWrite};
@@ -33,6 +35,7 @@ use crate::state::identity::{CollectionId, CollectionRef};
 use crate::state::marker::{AttemptId, EventEvidence, EventMarker, SectionClear, evidence_ttl};
 use crate::state::overlay::Overlay;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+use crate::state::resolve::resolve_event_marker;
 use crate::state::retry::{StepOutcome, retry_step};
 use crate::state::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch};
 use crate::state::{
@@ -45,8 +48,9 @@ use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use parking_lot::{Mutex as SyncMutex, RwLock};
 pub(in crate::state) use sealed::MutatePermit;
-pub(crate) use sealed::{Finalized, MessageMarker, OpPermit, SessionGate};
+pub(crate) use sealed::{Finalized, MessageMarker, OpPermit, Promoted, SessionGate};
 use sealed::{MarkerIdentity, Staged, StagedCollection, StateLifecycle};
+use smallvec::SmallVec;
 use std::fmt;
 use std::future::Future;
 use std::iter::from_fn;
@@ -82,14 +86,18 @@ impl<S: StateLifecycle + MarkerIdentity + WritableStateSession> EventSession for
 pub(crate) mod sealed {
     use super::{
         AdmissionChecks, CellKey, CellStore, CollectionRef, Duration, EventMarker, Future,
-        MarkerWrite, ProvisionalWrite, RepinProof, StateAccessError, Uuid, resolve_collections,
+        MarkerWrite, ProvisionalWrite, RepinProof, STATE_FANOUT_CONCURRENCY, StateAccessError,
+        StepOutcome, Uuid, resolve_collections, retry_step,
     };
+    use futures::{StreamExt, stream};
     use opentelemetry::global::meter;
     use opentelemetry::metrics::Counter;
     use std::ops::{Deref, DerefMut};
     use std::sync::LazyLock;
     use tokio::sync::{Mutex as TokioMutex, MutexGuard};
+    use tokio::task::coop::cooperative;
     use tokio::time::timeout;
+    use tracing::{error, warn};
 
     /// How long a settle-boundary gate acquire waits between rate-limited
     /// warnings while a still-running session op holds the gate.
@@ -384,17 +392,68 @@ pub(crate) mod sealed {
         pub(super) key: crate::Key,
     }
 
+    /// The promote result retains rejected collections for rollback.
+    pub(crate) enum Promoted<S: CellStore, K: AdmissionChecks> {
+        Complete,
+        Torn(Staged<S, K>),
+        Rejected(Staged<S, K>),
+        Abandoned,
+    }
+
     impl<S: CellStore, K: AdmissionChecks> Staged<S, K> {
-        /// Promotes all collections. Retries store failures until shutdown or
-        /// permanent rejection. A failed promote removes the admission
-        /// proof. Finalize owns the other removal site. Thus a checked
-        /// key has no unresolved residue from an earlier settle.
-        pub(crate) async fn promote(self, shutdown: impl Fn() -> bool + Sync) -> bool {
-            let complete = resolve_collections(&self.store, self.collections, &shutdown).await;
-            if !complete && self.checks.unmark(&self.key).await.is_err() {
-                return false;
+        /// Returns rejected collections for rollback.
+        /// Shutdown removes the admission proof.
+        pub(crate) async fn promote(
+            mut self,
+            shutdown: impl Fn() -> bool + Sync,
+        ) -> Promoted<S, K> {
+            let total = self.collections.len();
+            self.collections = resolve_collections(&self.store, self.collections, &shutdown).await;
+            if shutdown() {
+                if let Err(error) = self.checks.unmark(&self.key).await {
+                    warn!(%error, key = %self.key, "cannot remove admission proof");
+                }
+                Promoted::Abandoned
+            } else if self.collections.is_empty() {
+                Promoted::Complete
+            } else if self.collections.len() == total {
+                Promoted::Rejected(self)
+            } else {
+                Promoted::Torn(self)
             }
-            !shutdown()
+        }
+
+        /// Restores the rejected collections before the boundary commits the
+        /// source.
+        pub(crate) async fn abort(self, shutdown: impl Fn() -> bool + Sync) -> bool {
+            let names: smallvec::SmallVec<[&str; 8]> = self
+                .collections
+                .iter()
+                .map(|staged| staged.collection.id().name().as_str())
+                .collect();
+            error!(key = %self.key, collections = ?names,
+                "promote rejected collections; restore committed state");
+            let complete = stream::iter(0..self.collections.len())
+                .map(|index| {
+                    let staged = &self.collections[index];
+                    cooperative(async {
+                        !matches!(
+                            retry_step(&shutdown, "keyed-state rollback", || {
+                                self.store
+                                    .abort_provisional(&staged.collection, &staged.writes)
+                            })
+                            .await,
+                            StepOutcome::Abandon
+                        )
+                    })
+                })
+                .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+                .fold(true, |all, done| async move { all && done })
+                .await;
+            if let Err(error) = self.checks.unmark(&self.key).await {
+                warn!(%error, key = %self.key, "cannot remove admission proof");
+            }
+            complete
         }
     }
 
@@ -1227,27 +1286,35 @@ where
         let collections = stream::iter(touched)
             .map(|((state_type, name), cleared, cells)| {
                 let id = CollectionId::new(state_key.clone(), state_type, name);
-                // `cooperative` adds a per-collection coop-budget yield point
-                // so a key touching many collections does not drain the batch
-                // in one poll; `buffer_unordered` keeps full concurrency.
                 cooperative(stage_collection(
                     lower, registry, event, id, cleared, cells, &evidence,
                 ))
             })
             .buffer_unordered(STATE_FANOUT_CONCURRENCY)
-            .try_fold(Vec::with_capacity(capacity), |mut acc, staged| async move {
-                acc.extend(staged);
-                Ok(acc)
+            .fold(Ok(Vec::with_capacity(capacity)), |acc, staged| async move {
+                match (acc, staged) {
+                    (Ok(mut acc), Ok(staged)) => {
+                        acc.extend(staged);
+                        Ok(acc)
+                    }
+                    (Err(error), _) | (_, Err(error)) => Err(error),
+                }
             })
             .await;
         let collections = match collections {
             Ok(collections) => collections,
             Err(error) => {
-                self.inner
-                    .checks
-                    .unmark(&self.inner.state_key.key)
-                    .await
-                    .map_err(|error| StateAccessError::store(&error))?;
+                if error.classify_error() == ErrorCategory::Permanent {
+                    abort_stages(lower, registry, state_key, &evidence.touched, || {
+                        self.is_terminated()
+                    })
+                    .await;
+                }
+                if let Err(unmark_error) = self.inner.checks.unmark(&self.inner.state_key.key).await
+                {
+                    warn!(error = %unmark_error, key = %self.inner.state_key.key,
+                        "cannot remove admission proof after stage failure");
+                }
                 return Err(error);
             }
         };
@@ -1522,28 +1589,72 @@ where
     }
 }
 
-/// Promotes each collection independently. Permanent errors leave residue for
-/// admission.
+/// Restores stage residue after every concurrent stage call has returned.
+async fn abort_stages<S: CellStore>(
+    store: &S,
+    registry: &CollectionDefRegistry,
+    key: &StateKey,
+    touched: &[(StateType, StateName)],
+    shutdown: impl Fn() -> bool + Sync,
+) {
+    stream::iter(0..touched.len())
+        .map(|index| {
+            let (kind, name) = &touched[index];
+            let shutdown = &shutdown;
+            cooperative(async move {
+                let collection = CollectionRef::new(
+                    CollectionId::new(key.clone(), *kind, name.clone()),
+                    registry.ttl_for(*kind, name),
+                );
+                let _ = retry_step(shutdown, "rejected stage rollback", || async {
+                    if let Some(marker) = store.marker_state(collection.id()).await?.staged {
+                        resolve_event_marker(
+                            store,
+                            &collection,
+                            &marker,
+                            CommitDecision::NotCommitted,
+                        )
+                        .await?;
+                    }
+                    Ok::<_, S::Error>(())
+                })
+                .await;
+            })
+        })
+        .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+        .collect::<()>()
+        .await;
+}
+
+/// Returns the collections whose promote did not complete.
 async fn resolve_collections<S: CellStore>(
     store: &S,
     collections: Vec<StagedCollection>,
     shutdown: &(impl Fn() -> bool + Sync),
-) -> bool {
+) -> Vec<StagedCollection> {
     stream::iter(collections)
         .map(|staged| {
             cooperative(async move {
-                matches!(
-                    retry_step(shutdown, "keyed-state promote", || {
-                        store.commit_provisional(&staged.collection, &staged.marker, &staged.writes)
-                    })
-                    .await,
-                    StepOutcome::Done(())
-                )
+                let outcome = retry_step(shutdown, "keyed-state promote", || {
+                    store.commit_provisional(&staged.collection, &staged.marker, &staged.writes)
+                })
+                .await;
+                match outcome {
+                    StepOutcome::Done(()) => None,
+                    StepOutcome::Skip | StepOutcome::Abandon => Some(staged),
+                }
             })
         })
         .buffer_unordered(STATE_FANOUT_CONCURRENCY)
-        .fold(true, |all, complete| async move { all && complete })
+        .fold(
+            SmallVec::<[StagedCollection; 1]>::new(),
+            |mut rejected, staged| async move {
+                rejected.extend(staged);
+                rejected
+            },
+        )
         .await
+        .into_vec()
 }
 
 /// Crate-private descriptor reaching a session through the one public
