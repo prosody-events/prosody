@@ -107,16 +107,9 @@ fn prop_fifo_order(trace: Trace) -> TestResult {
 /// Each reload adds the stored failures and the outer demand's retry ordinal.
 /// A transient failure increments the stored count by one.
 #[quickcheck]
-fn prop_retry_increment(trace: Trace, incoming: u8) -> color_eyre::Result<()> {
+fn prop_retry_increment(trace: Trace, demand: DemandType) -> color_eyre::Result<()> {
     init_test_logging();
     let Trace { events, key_count } = trace;
-    let demand = match incoming % 10 {
-        0 => DemandType::Normal,
-        9 => DemandType::Failure { retry: u32::MAX },
-        retry => DemandType::Failure {
-            retry: u32::from(retry),
-        },
-    };
 
     TEST_RUNTIME.block_on(async {
         let mut harness = TestHarness::new(key_count)?;

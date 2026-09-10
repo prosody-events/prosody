@@ -28,6 +28,7 @@ use parking_lot::Mutex;
 use std::convert::Infallible;
 use std::fmt::{self, Debug};
 use std::future::{Future, pending, ready};
+use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::span::Id;
@@ -233,6 +234,12 @@ impl OutcomeHandler {
             .iter()
             .map(|(key, _)| key.clone())
             .collect()
+    }
+
+    /// Returns the recorded timer calls and clears the log.
+    #[must_use]
+    fn take_timer_calls(&self) -> Vec<(Key, DemandType)> {
+        mem::take(&mut self.timer_calls.lock())
     }
 
     /// Returns the `(ambient, trigger-span)` id pairs recorded per call.

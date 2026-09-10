@@ -544,16 +544,9 @@ fn prop_backoff_bounds(retry_count_raw: u8) -> color_eyre::Result<()> {
 /// Each reload adds the stored failures and the outer demand's retry ordinal.
 /// A transient failure increments the stored count by one.
 #[quickcheck]
-fn prop_retry_increment(trace: TimerTrace, incoming: u8) -> color_eyre::Result<()> {
+fn prop_retry_increment(trace: TimerTrace, demand: DemandType) -> color_eyre::Result<()> {
     init_test_logging();
     let TimerTrace { events, .. } = trace;
-    let demand = match incoming % 10 {
-        0 => DemandType::Normal,
-        9 => DemandType::Failure { retry: u32::MAX },
-        retry => DemandType::Failure {
-            retry: u32::from(retry),
-        },
-    };
 
     TEST_RUNTIME.block_on(async {
         let harness = TestHarness::new()?;
@@ -565,15 +558,13 @@ fn prop_retry_increment(trace: TimerTrace, incoming: u8) -> color_eyre::Result<(
                     .get_retry_count(&key)
                     .await?
                     .ok_or_else(|| eyre!("Deferred head is absent"))?;
-                harness.inner_handler.timer_calls.lock().clear();
+                // Drain the calls of earlier events.
+                let _ = harness.inner_handler.take_timer_calls();
                 execute_deferred_timer(&harness, def_event, demand).await?;
-                // The block releases the lock before the next await.
+                let calls = harness.inner_handler.take_timer_calls();
+                assert_eq!(calls.len(), 1);
                 assert_eq!(
-                    {
-                        let calls = harness.inner_handler.timer_calls.lock();
-                        assert_eq!(calls.len(), 1);
-                        calls[0].1.retry()
-                    },
+                    calls[0].1.retry(),
                     before.saturating_add(1).saturating_add(demand.retry())
                 );
                 if matches!(def_event.outcome, DeferredTimerOutcome::Transient) {

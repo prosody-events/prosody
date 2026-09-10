@@ -5,6 +5,8 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::UncommittedMessage;
 use crate::timers::UncommittedTimer;
 use crate::{Partition, Topic};
+#[cfg(test)]
+use quickcheck::{Arbitrary, Gen};
 use serde::{Serialize, Serializer};
 use std::future::Future;
 
@@ -18,10 +20,12 @@ pub enum DemandType {
         /// The estimated retry ordinal: 1 on the first retry.
         ///
         /// Each retry or defer middleware adds its retries to the outer
-        /// demand's count. The ordinal can differ by one when an event
-        /// crosses layers. A message queued behind a deferred head
-        /// reports 1 on its first handler call. Keep an exact count in
-        /// keyed state if necessary.
+        /// demand's count. The ordinal restarts when an event moves
+        /// from retry middleware to defer middleware, so it can fall.
+        /// It is monotone only within one layer.
+        /// A message queued behind a deferred head reports 1 on its first
+        /// handler call. Keep an exact count in keyed state if
+        /// necessary.
         retry: u32,
     },
 }
@@ -36,11 +40,28 @@ impl DemandType {
         }
     }
 
-    /// The demand after additional failures. `retries` must be at least 1.
+    /// The demand after additional failures; zero failures leave this demand
+    /// unchanged.
     #[must_use]
     pub(crate) fn retried(self, retries: u32) -> Self {
-        Self::Failure {
-            retry: self.retry().saturating_add(retries),
+        match retries {
+            0 => self,
+            _ => Self::Failure {
+                retry: self.retry().saturating_add(retries),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+impl Arbitrary for DemandType {
+    fn arbitrary(g: &mut Gen) -> Self {
+        match u8::arbitrary(g) % 10 {
+            0 => Self::Normal,
+            9 => Self::Failure { retry: u32::MAX },
+            retry => Self::Failure {
+                retry: u32::from(retry),
+            },
         }
     }
 }

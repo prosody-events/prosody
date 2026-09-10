@@ -42,17 +42,10 @@ fn prop_retry_classification_arithmetic() {
         max_retries: u32,
         demand: DemandType,
     ) -> (usize, bool, Vec<DemandType>) {
-        let mut demand_types = Vec::new();
+        let mut demand_types = vec![demand];
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            demand_types.push(if attempt == 1 {
-                demand
-            } else {
-                DemandType::Failure {
-                    retry: demand.retry().saturating_add(attempt - 1),
-                }
-            });
             let Some(&category) = failures.get((attempt - 1) as usize) else {
                 return (attempt as usize, false, demand_types);
             };
@@ -60,10 +53,13 @@ fn prop_retry_classification_arithmetic() {
                 ErrorCategory::Transient if attempt <= max_retries => {}
                 _ => return (attempt as usize, true, demand_types),
             }
+            demand_types.push(DemandType::Failure {
+                retry: demand.retry().saturating_add(attempt),
+            });
         }
     }
 
-    fn property(raw_failures: Vec<u8>, max_retries_raw: u8, incoming: u8) -> TestResult {
+    fn property(raw_failures: Vec<u8>, max_retries_raw: u8, demand: DemandType) -> TestResult {
         // Bound both axes so each iteration's paused-clock retry loop stays
         // fast while still crossing the zero/non-zero and
         // exhausted/not-exhausted boundaries.
@@ -77,13 +73,6 @@ fn prop_retry_classification_arithmetic() {
             })
             .collect();
         let max_retries = u32::from(max_retries_raw % 4);
-        let demand = match incoming % 10 {
-            0 => DemandType::Normal,
-            9 => DemandType::Failure { retry: u32::MAX },
-            retry => DemandType::Failure {
-                retry: u32::from(retry),
-            },
-        };
         let (expected_calls, expected_err, expected_demand_types) =
             expected_outcome(&failures, max_retries, demand);
 
@@ -128,7 +117,7 @@ fn prop_retry_classification_arithmetic() {
         })
     }
 
-    QuickCheck::new().quickcheck(property as fn(Vec<u8>, u8, u8) -> TestResult);
+    QuickCheck::new().quickcheck(property as fn(Vec<u8>, u8, DemandType) -> TestResult);
 }
 
 /// Named anchor: pins the exact "1 + `max_retries`" call count as a literal,
