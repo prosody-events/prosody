@@ -69,7 +69,7 @@ pub(crate) async fn reader_residue<S: CellStore, R: CommittedCellSource>(
         .write_provisional(&collection, &writes, Some(&marker))
         .await?;
     let expected = if committed {
-        [Some(next), None, Some(base.clone())]
+        [Some(next), None, (!clear).then_some(base.clone())]
     } else {
         [Some(base.clone()), Some(base.clone()), Some(base)]
     };
@@ -95,9 +95,7 @@ pub(crate) async fn reader_residue<S: CellStore, R: CommittedCellSource>(
         let mut wanted: Vec<_> = cells
             .iter()
             .zip(&expected)
-            .enumerate()
-            .filter(|(index, _)| !committed || !clear || *index == 0)
-            .filter_map(|(_, (cell, value))| value.clone().map(|value| (cell.clone(), value)))
+            .filter_map(|(cell, value)| value.clone().map(|value| (cell.clone(), value)))
             .collect();
         if dir == Direction::Backward {
             wanted.reverse();

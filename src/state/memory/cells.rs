@@ -79,13 +79,11 @@ impl MemoryCells {
         collection: &CollectionId,
         cell: &CellKey,
     ) -> Option<Bytes> {
-        let cell = self.read_committed_cell(collection, cell);
-        let evidence = if matches!(cell, Cell::Provisional(_)) {
-            self.reader_evidence(collection)
-        } else {
-            ReaderEvidence::default()
-        };
-        resolve_for_reader(&cell, &evidence).cloned()
+        let evidence = self.reader_evidence(collection);
+        if !evidence.survives(cell) {
+            return None;
+        }
+        resolve_for_reader(&self.read_committed_cell(collection, cell), &evidence).cloned()
     }
 
     pub(crate) fn read_committed_many(
@@ -94,29 +92,19 @@ impl MemoryCells {
         section: Section,
         batch: &CoordinateBatch,
     ) -> CellBuffer<Option<Bytes>> {
-        let cells: CellBuffer<Cell> = batch
+        let evidence = self.reader_evidence(collection);
+        batch
             .iter()
             .map(|coordinate| {
-                self.read_committed_cell(
-                    collection,
-                    &CellKey {
-                        section,
-                        coordinate: coordinate.clone(),
-                    },
-                )
+                let key = CellKey {
+                    section,
+                    coordinate: coordinate.clone(),
+                };
+                if !evidence.survives(&key) {
+                    return None;
+                }
+                resolve_for_reader(&self.read_committed_cell(collection, &key), &evidence).cloned()
             })
-            .collect();
-        let evidence = if cells
-            .iter()
-            .any(|cell| matches!(cell, Cell::Provisional(_)))
-        {
-            self.reader_evidence(collection)
-        } else {
-            ReaderEvidence::default()
-        };
-        cells
-            .iter()
-            .map(|cell| resolve_for_reader(cell, &evidence).cloned())
             .collect()
     }
 
