@@ -50,7 +50,7 @@ fn create_task(key: &str, demand_type: DemandType, age_secs: u64) -> Task {
 fn account(selector: &mut Selector, task: &Task, duration: Duration) {
     match task.demand_type {
         DemandType::Normal => selector.success_time += duration,
-        DemandType::Failure => selector.failure_time += duration,
+        DemandType::Failure { .. } => selector.failure_time += duration,
     }
     selector.increment_key_time(&task.tp_key, duration);
 }
@@ -92,13 +92,13 @@ fn only_normal_tasks_selects_normal() -> Result<()> {
 #[test]
 fn only_failure_tasks_selects_failure() -> Result<()> {
     let mut selector = create_selector()?;
-    selector.enqueue_task(create_task("key1", DemandType::Failure, 0));
-    selector.enqueue_task(create_task("key2", DemandType::Failure, 0));
+    selector.enqueue_task(create_task("key1", DemandType::Failure { retry: 1 }, 0));
+    selector.enqueue_task(create_task("key2", DemandType::Failure { retry: 1 }, 0));
 
     let Some(selected) = selector.get_next_task() else {
         bail!("Expected task but got None");
     };
-    assert_eq!(selected.demand_type, DemandType::Failure);
+    assert_eq!(selected.demand_type, DemandType::Failure { retry: 1 });
     Ok(())
 }
 
@@ -163,12 +163,16 @@ fn underserved_class_wins() -> Result<()> {
     selector.failure_time = Duration::from_millis(100).into();
 
     selector.enqueue_task(create_task("normal_key", DemandType::Normal, 0));
-    selector.enqueue_task(create_task("failure_key", DemandType::Failure, 0));
+    selector.enqueue_task(create_task(
+        "failure_key",
+        DemandType::Failure { retry: 1 },
+        0,
+    ));
 
     let Some(selected) = selector.get_next_task() else {
         bail!("Expected task but got None");
     };
-    assert_eq!(selected.demand_type, DemandType::Failure);
+    assert_eq!(selected.demand_type, DemandType::Failure { retry: 1 });
     Ok(())
 }
 
@@ -180,7 +184,11 @@ fn overserved_class_loses() -> Result<()> {
     selector.failure_time = Duration::from_millis(700).into();
 
     selector.enqueue_task(create_task("normal_key", DemandType::Normal, 0));
-    selector.enqueue_task(create_task("failure_key", DemandType::Failure, 0));
+    selector.enqueue_task(create_task(
+        "failure_key",
+        DemandType::Failure { retry: 1 },
+        0,
+    ));
 
     let Some(selected) = selector.get_next_task() else {
         bail!("Expected task but got None");
@@ -195,13 +203,25 @@ fn overserved_class_loses() -> Result<()> {
 #[test]
 fn zero_weight_class_starved_until_alone() -> Result<()> {
     for (failure_weight, served, starved) in [
-        (0.0_f64, DemandType::Normal, DemandType::Failure),
-        (1.0_f64, DemandType::Failure, DemandType::Normal),
+        (
+            0.0_f64,
+            DemandType::Normal,
+            DemandType::Failure { retry: 1 },
+        ),
+        (
+            1.0_f64,
+            DemandType::Failure { retry: 1 },
+            DemandType::Normal,
+        ),
     ] {
         let mut selector = create_selector_with(failure_weight)?;
         for index in 0_i32..5_i32 {
             selector.enqueue_task(create_task(&format!("n{index}"), DemandType::Normal, 0));
-            selector.enqueue_task(create_task(&format!("f{index}"), DemandType::Failure, 0));
+            selector.enqueue_task(create_task(
+                &format!("f{index}"),
+                DemandType::Failure { retry: 1 },
+                0,
+            ));
         }
 
         for _ in 0_i32..5_i32 {
@@ -346,7 +366,11 @@ fn empty_class_work_conservation() -> Result<()> {
 
     // Add only failure tasks
     for i in 0_i32..5_i32 {
-        selector.enqueue_task(create_task(&format!("f{i}"), DemandType::Failure, 0));
+        selector.enqueue_task(create_task(
+            &format!("f{i}"),
+            DemandType::Failure { retry: 1 },
+            0,
+        ));
     }
 
     // Should select from failure class now
@@ -356,7 +380,7 @@ fn empty_class_work_conservation() -> Result<()> {
         };
         assert_eq!(
             task.demand_type,
-            DemandType::Failure,
+            DemandType::Failure { retry: 1 },
             "Should select from Failure class when Normal is empty"
         );
     }
@@ -456,7 +480,7 @@ fn prop_failure_service_share_converges(trial: ProportionTrial) -> Result<()> {
     // Adversarial prefix: single-class bursts, enqueued then fully drained.
     for (burst_index, burst) in bursts.iter().enumerate() {
         let class = if burst.failure_class {
-            DemandType::Failure
+            DemandType::Failure { retry: 1 }
         } else {
             DemandType::Normal
         };
@@ -481,7 +505,7 @@ fn prop_failure_service_share_converges(trial: ProportionTrial) -> Result<()> {
 
     // Steady generator: one pending task per class, replaced on selection.
     selector.enqueue_task(create_task("steady_n", DemandType::Normal, 0));
-    selector.enqueue_task(create_task("steady_f", DemandType::Failure, 0));
+    selector.enqueue_task(create_task("steady_f", DemandType::Failure { retry: 1 }, 0));
 
     let mut window_normal = Duration::ZERO;
     let mut window_failure = Duration::ZERO;
@@ -491,13 +515,13 @@ fn prop_failure_service_share_converges(trial: ProportionTrial) -> Result<()> {
         };
         let duration = match task.demand_type {
             DemandType::Normal => Duration::from_millis(normal_ms),
-            DemandType::Failure => Duration::from_millis(failure_ms),
+            DemandType::Failure { .. } => Duration::from_millis(failure_ms),
         };
         account(&mut selector, &task, duration);
         if selection >= BURN_IN {
             match task.demand_type {
                 DemandType::Normal => window_normal += duration,
-                DemandType::Failure => window_failure += duration,
+                DemandType::Failure { .. } => window_failure += duration,
             }
         }
         selector.enqueue_task(create_task(task.tp_key.key.as_ref(), task.demand_type, 0));
@@ -728,7 +752,7 @@ fn assert_completion_updates_class_time(demand_type: DemandType, state: KeyState
     };
     let class_time = |selector: &Selector| match demand_type {
         DemandType::Normal => selector.success_time.at(complete_time),
-        DemandType::Failure => selector.failure_time.at(complete_time),
+        DemandType::Failure { .. } => selector.failure_time.at(complete_time),
     };
 
     selector.process_telemetry(event(invoke_time, KeyState::HandlerInvoked));
@@ -753,7 +777,7 @@ fn telemetry_updates_success_time_and_key_vt() -> Result<()> {
 
 #[test]
 fn telemetry_updates_failure_time_on_handler_failed() -> Result<()> {
-    assert_completion_updates_class_time(DemandType::Failure, KeyState::HandlerFailed)
+    assert_completion_updates_class_time(DemandType::Failure { retry: 1 }, KeyState::HandlerFailed)
 }
 
 #[test]

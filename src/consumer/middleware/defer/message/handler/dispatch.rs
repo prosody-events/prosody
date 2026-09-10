@@ -219,14 +219,16 @@ where
             "Loaded deferred message - attempting retry"
         );
 
+        let demand = demand_type.retried(retry_count.saturating_add(1));
+
         match message {
             ConsumerRecord::Message(message) => {
                 self.retry_deferred_message::<OnMessage, _>(
                     context,
                     &trigger,
-                    message_key,
                     offset,
                     retry_count,
+                    demand,
                     message,
                 )
                 .await
@@ -235,9 +237,9 @@ where
                 self.retry_deferred_message::<OnExcise, _>(
                     context,
                     &trigger,
-                    message_key,
                     offset,
                     retry_count,
+                    demand,
                     message,
                 )
                 .await

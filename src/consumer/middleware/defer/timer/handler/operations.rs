@@ -91,6 +91,7 @@ where
         &self,
         context: C,
         trigger: Trigger,
+        demand: DemandType,
     ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
         C: EventContext<Payload = T::Payload>,
@@ -138,12 +139,14 @@ where
             "Loaded deferred timer - attempting retry"
         );
 
+        let demand = demand.retried(retry_count.saturating_add(1));
+
         // Emit dispatched for the DeferredTimer that actually fired.
         self.sender.timer_dispatched(
             trigger.key.clone(),
             trigger.time,
             trigger.timer_type,
-            DemandType::Failure,
+            demand,
             self.source.clone(),
         );
 
@@ -151,14 +154,21 @@ where
         // it ambiently, mirroring the partition dispatch arms.
         let output = match self
             .handler
-            .on_timer(context.clone(), stored_trigger.clone(), DemandType::Failure)
+            .on_timer(context.clone(), stored_trigger.clone(), demand)
             .instrument(stored_trigger.span())
             .await
         {
             Ok(output) => output,
             Err(error) => {
                 return self
-                    .handle_retry_failure(&context, &trigger, &stored_trigger, retry_count, error)
+                    .handle_retry_failure(
+                        &context,
+                        &trigger,
+                        &stored_trigger,
+                        retry_count,
+                        demand,
+                        error,
+                    )
                     .await;
             }
         };
@@ -167,7 +177,7 @@ where
             trigger.key.clone(),
             trigger.time,
             trigger.timer_type,
-            DemandType::Failure,
+            demand,
             self.source.clone(),
         );
 
@@ -261,6 +271,7 @@ where
         deferred_trigger: &Trigger,
         stored_trigger: &Trigger,
         retry_count: u32,
+        demand: DemandType,
         error: T::Error,
     ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
@@ -282,7 +293,7 @@ where
 
                 self.sender.emit_timer(
                     TimerEventType::Failed {
-                        demand_type: DemandType::Failure,
+                        demand_type: demand,
                         error_category,
                         exception,
                     },
@@ -317,7 +328,7 @@ where
 
                 self.sender.emit_timer(
                     TimerEventType::Failed {
-                        demand_type: DemandType::Failure,
+                        demand_type: demand,
                         error_category,
                         exception,
                     },
@@ -332,7 +343,7 @@ where
             ErrorCategory::Terminal => {
                 self.sender.emit_timer(
                     TimerEventType::Failed {
-                        demand_type: DemandType::Failure,
+                        demand_type: demand,
                         error_category,
                         exception,
                     },

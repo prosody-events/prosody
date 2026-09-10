@@ -13,6 +13,7 @@ use bytes::Bytes;
 use educe::Educe;
 use futures::StreamExt;
 use parking_lot::Mutex;
+use quickcheck::{Arbitrary, Gen};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::{Semaphore, oneshot, watch};
@@ -101,6 +102,18 @@ impl Uncommitted for GatedGuard {
     async fn abort(self) {
         self.aborted.fetch_add(1, Ordering::SeqCst);
         drop(self.entered);
+    }
+}
+
+impl Arbitrary for DemandType {
+    fn arbitrary(g: &mut Gen) -> Self {
+        match u8::arbitrary(g) % 10 {
+            0 => Self::Normal,
+            9 => Self::Failure { retry: u32::MAX },
+            retry => Self::Failure {
+                retry: u32::from(retry),
+            },
+        }
     }
 }
 

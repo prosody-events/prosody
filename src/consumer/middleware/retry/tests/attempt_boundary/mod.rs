@@ -91,7 +91,7 @@ impl AttemptAwareHandler {
                     .map_err(|_| TestError(ErrorCategory::Terminal))?;
                 Err(TestError(ErrorCategory::Transient))
             }
-            DemandType::Failure => {
+            DemandType::Failure { .. } => {
                 let handle = context
                     .state(Registered::new(wishlist()))
                     .map_err(|_| TestError(ErrorCategory::Terminal))?;
@@ -246,7 +246,7 @@ impl FinalHookReadHandler {
     {
         match demand_type {
             DemandType::Normal => Err(TestError(ErrorCategory::Transient)),
-            DemandType::Failure => {
+            DemandType::Failure { .. } => {
                 let handle = context
                     .state(Registered::new(wishlist()))
                     .map_err(|_| TestError(ErrorCategory::Terminal))?;
