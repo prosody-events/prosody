@@ -115,7 +115,7 @@ impl<T> RetryHandler<T> {
         let mut attempt: u32 = 0;
         loop {
             attempt = attempt.saturating_add(1);
-            // Add `n - 1` retries on attempt `n`; zero preserves the incoming demand.
+            // Attempt `n` adds `n - 1` retries to the incoming demand.
             let demand = demand_type.retried(attempt - 1);
             let error = match invoke(current.clone(), demand).await {
                 Ok(output) => return (Resolution::Commit(Ok(output)), current),

@@ -17,12 +17,12 @@ pub enum DemandType {
     Failure {
         /// The estimated retry ordinal: 1 on the first retry.
         ///
-        /// Each retry or defer middleware adds its retries to the outer
-        /// demand's count. The ordinal restarts when an event moves from
+        /// Each retry or defer middleware adds its own retries to the ordinal
+        /// it received. The ordinal restarts when an event moves from
         /// retry middleware to defer middleware, so it can fall. It is
-        /// monotone only within one layer. A message queued behind a deferred
-        /// head reports 1 on its first handler call. Keep an exact count in
-        /// keyed state if necessary.
+        /// monotone only within one layer. A message that waits behind
+        /// a deferred message reports 1 on its first handler call. Keep
+        /// an exact retry count in keyed state if necessary.
         retry: u32,
     },
 }
@@ -37,8 +37,9 @@ impl DemandType {
         }
     }
 
-    /// The demand after additional failures; zero failures leave this demand
-    /// unchanged.
+    /// The demand after `retries` additional failures.
+    ///
+    /// Zero leaves this demand unchanged.
     #[must_use]
     pub(crate) fn retried(self, retries: u32) -> Self {
         match retries {

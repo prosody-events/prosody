@@ -541,8 +541,9 @@ fn prop_backoff_bounds(retry_count_raw: u8) -> color_eyre::Result<()> {
     })
 }
 
-/// Each reload adds the stored failures and the outer demand's retry ordinal.
-/// A transient failure increments the stored count by one.
+/// A reload reports the stored retry count, plus one for the failure that
+/// deferred the event, plus the outer demand's retry ordinal. A transient
+/// failure increments the stored retry count by one.
 #[quickcheck]
 fn prop_retry_increment(trace: TimerTrace, demand: DemandType) -> color_eyre::Result<()> {
     init_test_logging();
