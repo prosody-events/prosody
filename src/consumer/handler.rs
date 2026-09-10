@@ -20,9 +20,7 @@ pub enum DemandType {
         ///
         /// If Prosody defers an event after immediate retries, the ordinal
         /// restarts at 1. In pipeline mode, immediate retries occur while
-        /// failure rate gating stops deferral. A message that waits behind a
-        /// deferred message with the same key also reports 1 on its first
-        /// handler call.
+        /// failure rate gating stops deferral.
         ///
         /// Keep an exact retry count in keyed state if the handler needs one.
         retry: u32,
