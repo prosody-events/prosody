@@ -108,6 +108,49 @@ impl<L> Cached<L> {
         self.fjall.stored_expiry(collection, cell).await
     }
 
+    /// Reads the lower batch and publishes every position with its co-expiry
+    /// stamp. Value reads and presence reads share this fill.
+    async fn fill_batch(
+        &self,
+        collection: &CollectionId,
+        section: Section,
+        batch: &CoordinateBatch,
+        op: &'static str,
+    ) -> Result<CommittedBatch, L::Error>
+    where
+        L: CellStore,
+    {
+        // Sample time before the lower read so cache entries cannot outlive durable
+        // rows.
+        let stamped_at = self.fjall.clock().now_ms();
+        // A failed lower read publishes no cache entries.
+        let filled: CacheBatch = self
+            .lower
+            .get_many_for_cache(collection, section, batch)
+            .await?;
+        // Publish present and absent cells atomically. A failed fill preserves existing
+        // entries.
+        let projected =
+            batch
+                .iter()
+                .zip(filled.iter())
+                .map(|(coordinate, (committed, remaining))| {
+                    (
+                        CellKey {
+                            section,
+                            coordinate: coordinate.clone(),
+                        },
+                        committed.clone(),
+                        expiry_at(stamped_at, *remaining),
+                    )
+                });
+        if let Err(error) = self.fjall.put_batch(collection, projected).await {
+            warn_skip("populate batch", &error);
+            self.metrics.cache_error(op, "fill");
+        }
+        Ok(filled.into_iter().map(|(committed, _)| committed).collect())
+    }
+
     /// Removes cache entries that a Staged payload can change.
     ///
     /// A failed removal disables the cache.
@@ -294,49 +337,16 @@ where
                 CacheResult::Error
             }
         };
-        let loaded = async {
-            // All-hits-or-refetch: any non-hit discards every sampled value and
-            // reads the whole batch from durable storage.
-            // Anchor the co-expiry on a clock read taken before the durable read
-            // (see the module's TTL co-expiry doc): a wide batch resolution can only
-            // stamp entries EARLY, never past their durable row death.
-            let stamped_at = self.fjall.clock().now_ms();
-            // On Err: publish NOTHING (a negative/Absent entry is published only from
-            // a fully successful batch).
-            let filled: CacheBatch = self
-                .lower
-                .get_many_for_cache(collection, section, batch)
-                .await?;
-            // Publish every cell (present AND absent), one atomic batch, NO delete on
-            // failure (the read-fill no-delete degrade — distinct from the mutator
-            // failed-publish cache guard delete-on-failure). Each `CellKey` is
-            // built inline — no scratch buffer.
-            let projected =
-                batch
-                    .iter()
-                    .zip(filled.iter())
-                    .map(|(coordinate, (committed, remaining))| {
-                        (
-                            CellKey {
-                                section,
-                                coordinate: coordinate.clone(),
-                            },
-                            committed.clone(),
-                            expiry_at(stamped_at, *remaining),
-                        )
-                    });
-            if let Err(error) = self.fjall.put_batch(collection, projected).await {
-                warn_skip("populate batch", &error);
-                self.metrics.cache_error("get_many", "fill");
-            }
-            Ok(filled.into_iter().map(|(committed, _)| committed).collect())
-        }
-        .await;
+        let loaded = self
+            .fill_batch(collection, section, batch, "get_many")
+            .await;
         self.metrics
             .batch(batch.len(), started, Source::Store, cache_result, &loaded);
         loaded
     }
 
+    /// A third presence frame adds codec and commit logic to save only one cold
+    /// payload transfer.
     async fn contains_many<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -378,31 +388,10 @@ where
                 CacheResult::Error
             }
         };
-        let loaded = async {
-            let stamped_at = self.fjall.clock().now_ms();
-            let presence = self.lower.contains_many(collection, section, batch).await?;
-            // A presence read has no value bytes. Cache only absent positions.
-            let absent = batch
-                .iter()
-                .zip(&presence)
-                .filter(|(_, present)| !**present)
-                .map(|(coordinate, _)| {
-                    (
-                        CellKey {
-                            section,
-                            coordinate: coordinate.clone(),
-                        },
-                        Committed::new(None),
-                        expiry_at(stamped_at, None),
-                    )
-                });
-            if let Err(error) = self.fjall.put_batch(collection, absent).await {
-                warn_skip("populate presence batch", &error);
-                self.metrics.cache_error("contains_many", "fill");
-            }
-            Ok(presence)
-        }
-        .await;
+        let loaded = self
+            .fill_batch(collection, section, batch, "contains_many")
+            .await
+            .map(|cells| cells.into_iter().map(|c| c.get().is_some()).collect());
         self.metrics
             .presence(batch.len(), started, Source::Store, cache_result, &loaded);
         loaded

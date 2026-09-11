@@ -49,13 +49,10 @@ fn cached_over(cells: &MemoryCells, name: &str) -> Result<Cached<MemoryCellStore
     Ok(Cached::new(test_db::cache(name)?, lower))
 }
 
-/// A memory-backed [`CellStore`] that surfaces each present row's remaining TTL
-/// the way Cassandra's `TTL(data)` does — whole seconds, FLOORED, computed
-/// against the shared fixed [`Clock`] from one absolute `death` — so the
-/// cache's read-fill re-stamp (`expiry_for`) is reachable over memory. The
-/// plain memory store reports `None`, which makes that arithmetic structurally
-/// unreachable. Every other operation delegates to an inner
-/// [`CountingCellStore`], preserving its read/scan counters.
+/// A memory store that supplies a fixed row expiry for every projection.
+/// An absent projection can retain a row TTL, as a provisional cell can.
+/// The shared clock supplies the remaining whole seconds.
+/// Other operations preserve the inner store's counters.
 #[derive(Clone)]
 struct TtlAwareCellStore<S> {
     inner: CountingCellStore<S>,
@@ -135,13 +132,7 @@ where
         cell: &'a CellKey,
     ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
         let (committed, _) = self.inner.get_for_cache(collection, cell).await?;
-        // A present row carries a live remaining TTL; an absent row has none.
-        let remaining = committed
-            .get()
-            .is_some()
-            .then(|| self.remaining())
-            .flatten();
-        Ok((committed, remaining))
+        Ok((committed, self.remaining()))
     }
 
     fn provisional_cell_at<'a>(
@@ -382,6 +373,25 @@ fn expired_entry_reads_as_miss_and_refills() -> Result<()> {
             stamped.is_some_and(|e| e <= ROW_DEATH),
             "the re-stamped expiry must not overhang the durable row death"
         );
+
+        lower
+            .write_resolved(&cref, &[(cell_at(8), Some(bytes(8)))], &[])
+            .await?;
+        cached
+            .contains_many(&id, SECTION, &batch_of([8, 9])?)
+            .await?;
+        for key in [8, 9] {
+            let stamped = cached.stored_expiry(&id, &cell_at(key)).await?;
+            assert_eq!(
+                stamped,
+                Some(want_expiry),
+                "presence uses the remaining TTL"
+            );
+            assert!(
+                stamped.is_some_and(|expiry| expiry <= ROW_DEATH),
+                "presence expires before the durable row"
+            );
+        }
 
         // The fall-through re-published a fresh entry; a get now serves `70`
         // from fjall again (KV5 restored).
@@ -961,28 +971,34 @@ fn absent_get_is_cached() -> Result<()> {
     })
 }
 
-/// KV2 negative caching: two presence reads of a never-written cell issue one
-/// lower read. The second read uses the cached Absent tag.
+/// Two presence reads share one fill for present and absent cells.
 #[test]
-fn absent_presence_is_cached() -> Result<()> {
+fn presence_is_cached() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let (cached, counting, id) = counting_cached("absent-presence")?;
-        let batch = batch_of([9])?;
-
+        let (cached, counting, id) = counting_cached("presence")?;
+        counting
+            .write_resolved(
+                &CollectionRef::new(id.clone(), None),
+                &[(cell_at(1), Some(bytes(1)))],
+                &[],
+            )
+            .await?;
+        let batch = batch_of([1, 2])?;
         counting.reset();
-        assert_eq!(
-            cached.contains_many(&id, SECTION, &batch).await?,
-            PresenceBatch::from_iter([false]),
-        );
-        assert_eq!(
-            cached.contains_many(&id, SECTION, &batch).await?,
-            PresenceBatch::from_iter([false]),
-        );
-        assert_eq!(
-            counting.presence_reads(),
-            1,
-            "two absent presence reads pay one durable read"
-        );
+        for _ in 0_u8..2 {
+            assert_eq!(
+                cached.contains_many(&id, SECTION, &batch).await?,
+                PresenceBatch::from_iter([true, false])
+            );
+            assert_eq!(
+                counting.lower_reads()
+                    + counting.batch_reads()
+                    + counting.batch_cache_reads()
+                    + counting.presence_reads(),
+                1,
+                "presence reads share one durable fill"
+            );
+        }
         Ok(())
     })
 }
@@ -2168,9 +2184,11 @@ impl Replay {
                 "presence diverged: subject {presence:?}, twin {expected:?}"
             ));
         }
-        if !self.fault_puts {
-            for (&key, &present) in keys.iter().zip(&presence) {
-                if !present {
+        if keys.iter().any(|&key| !self.is_warm(key)) {
+            for &key in &keys {
+                if self.fault_puts {
+                    self.warm.remove(&key);
+                } else {
                     self.warm.insert(key, u64::MAX);
                 }
             }
@@ -2512,28 +2530,6 @@ fn prop_cached_scan_presence_parity() {
         TEST_RUNTIME.block_on(run_bottom_scan_trace(cached, trace, &probe))
     }
     QuickCheck::new().quickcheck(property as fn(ScanTrace) -> Result<bool>);
-}
-
-/// A fully warm presence batch uses present and absent cache entries.
-#[test]
-fn batch_presence_all_hits_reads_nothing() -> Result<()> {
-    TEST_RUNTIME.block_on(async {
-        let (cached, counting, id) = counting_cached("presence-all-hits")?;
-        let collection = CollectionRef::new(id.clone(), None);
-        counting
-            .write_resolved(&collection, &[(cell_at(1), Some(bytes(1)))], &[])
-            .await?;
-        let batch = batch_of([1, 2])?;
-        cached.get_many(&id, SECTION, &batch).await?;
-        counting.reset();
-
-        assert_eq!(
-            cached.contains_many(&id, SECTION, &batch).await?,
-            PresenceBatch::from_iter([true, false]),
-        );
-        assert_eq!(counting.presence_reads(), 0, "warm hits need no lower read");
-        Ok(())
-    })
 }
 
 /// T-a all-hits: a `CELL_BATCH`-wide chunk whose every coordinate is warm
