@@ -18,7 +18,7 @@ pub trait DeduplicationStore: Clone + Send + Sync + 'static {
     /// Error type for store operations.
     ///
     /// Bounded [`ClassifyError`] (mirroring [`TriggerStore::Error`]) so the
-    /// commit oracle can delegate its classification to the underlying store
+    /// admission can preserve the underlying store classification
     /// rather than flattening every read failure to a single category.
     ///
     /// [`TriggerStore::Error`]: crate::timers::store::TriggerStore::Error

@@ -132,7 +132,7 @@ impl MigrationModel {
     pub fn from_input(input: &MigrationTestInput) -> Self {
         // V1 goes V1→V2→V3 (both phases run sequentially).
         // V2 goes V2→V3. V3 stays V3 (no migration needed).
-        let expected_version = SegmentVersion::V3;
+        let expected_version = SegmentVersion::V4;
 
         let segment = Segment {
             id: input.segment_id,
@@ -147,7 +147,9 @@ impl MigrationModel {
             // Apply timer type transformation based on initial version
             let timer_type = match input.initial_version {
                 SegmentVersion::V1 => TimerType::Application, // V1 has no timer_type
-                SegmentVersion::V2 | SegmentVersion::V3 => trigger_data.timer_type, /* V2/V3 preserve timer_type */
+                SegmentVersion::V2 | SegmentVersion::V3 | SegmentVersion::V4 => {
+                    trigger_data.timer_type
+                } // V2/V3 preserve timer_type
             };
 
             triggers.insert((trigger_data.key.clone(), trigger_data.time, timer_type));
@@ -725,7 +727,7 @@ pub async fn prop_migration_invariants(
                     .await?;
             setup_v2_state(&cassandra_store, &input).await?;
         }
-        SegmentVersion::V3 => {
+        SegmentVersion::V3 | SegmentVersion::V4 => {
             // Write V3 layout: triggers go through the full state-aware path.
             let config = test_cassandra_config(TEST_KEYSPACE);
             let cassandra_base = CassandraStore::new(&config).await?;

@@ -17,6 +17,12 @@ pub struct MemoryDeduplicationStore {
 }
 
 impl MemoryDeduplicationStore {
+    /// Simulates a dedup row's expiry without a wall-clock wait.
+    #[cfg(test)]
+    pub(crate) async fn expire(&self, id: Uuid) {
+        self.set.remove_async(&id).await;
+    }
+
     /// Creates a new empty store.
     #[must_use]
     pub fn new() -> Self {

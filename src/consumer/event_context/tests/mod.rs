@@ -34,13 +34,13 @@ use crate::state::order_codec::Utf8KeyCodec;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CELL_BATCH;
-use crate::state::tests::support::{CountingCellStore, FixedOracle};
+use crate::state::tests::support::{CountingCellStore, MemoryDeduplicationStore};
 use crate::state::{EventRef, PartitionBackend, StateKey};
 use crate::test_util::ArbJson;
+use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;
 use crate::{Key, Topic};
 use color_eyre::eyre::{Result, eyre};
-use futures::executor;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult, empty_shrinker};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -254,7 +254,7 @@ fn run_value_parity<P>(ops: &[ValueOp]) -> Result<bool>
 where
     P: ParityPayload + Send + Sync + 'static,
 {
-    executor::block_on(async {
+    TEST_RUNTIME.block_on(async {
         let ctx = parity_context::<P>()?;
         let handle = ctx
             .value_state(VALUE_NAME)

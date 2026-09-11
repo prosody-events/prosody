@@ -1,11 +1,13 @@
 //! Store and resolver counters used by query-budget tests.
 
 use super::*;
+use crate::state::marker::MarkerState;
 
 #[derive(Clone)]
 pub(crate) struct CountingCellStore<S> {
     inner: S,
     counts: Arc<OpCounts>,
+    marker_counts: Arc<[(CollectionId, AtomicUsize)]>,
 }
 
 #[derive(Default)]
@@ -15,14 +17,13 @@ struct OpCounts {
     mark_resolved: AtomicUsize,
     commit_provisional: AtomicUsize,
     abort_provisional: AtomicUsize,
-    unsettled_marker: AtomicUsize,
+    marker_state: AtomicUsize,
     get: AtomicUsize,
     get_many: AtomicUsize,
     get_many_for_cache: AtomicUsize,
     contains_many: AtomicUsize,
     scan_cells: AtomicUsize,
     scan_keys: AtomicUsize,
-    provisional_cells: AtomicUsize,
     provisional_cell_at: AtomicUsize,
     provisional_many: AtomicUsize,
 }
@@ -32,7 +33,24 @@ impl<S> CountingCellStore<S> {
         Self {
             inner,
             counts: Arc::new(OpCounts::default()),
+            marker_counts: Arc::default(),
         }
+    }
+
+    /// Counts each marker in a fixed collection set for this test.
+    pub(crate) fn with_marker_counts(mut self, collections: &[CollectionRef]) -> Self {
+        self.marker_counts = collections
+            .iter()
+            .map(|collection| (collection.id().clone(), AtomicUsize::new(0)))
+            .collect();
+        self
+    }
+
+    pub(crate) fn marker_reads_for(&self, collection: &CollectionId) -> usize {
+        self.marker_counts
+            .iter()
+            .find(|(id, _)| id == collection)
+            .map_or(0, |(_, count)| count.load(Ordering::Relaxed))
     }
 
     pub(crate) fn durable_writes(&self) -> usize {
@@ -44,7 +62,7 @@ impl<S> CountingCellStore<S> {
     }
 
     pub(crate) fn marker_reads(&self) -> usize {
-        self.counts.unsettled_marker.load(Ordering::Relaxed)
+        self.counts.marker_state.load(Ordering::Relaxed)
     }
 
     pub(crate) fn lower_reads(&self) -> usize {
@@ -75,14 +93,6 @@ impl<S> CountingCellStore<S> {
         self.counts.contains_many.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn recovery_sweeps(&self) -> usize {
-        self.counts.provisional_cells.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn warm_point_reads(&self) -> usize {
-        self.counts.provisional_cell_at.load(Ordering::Relaxed)
-    }
-
     pub(crate) fn raw_point_reads(&self) -> usize {
         self.counts.provisional_cell_at.load(Ordering::Relaxed)
     }
@@ -92,19 +102,21 @@ impl<S> CountingCellStore<S> {
     }
 
     pub(crate) fn reset(&self) {
+        for (_, count) in self.marker_counts.iter() {
+            count.store(0, Ordering::Relaxed);
+        }
         self.counts.write_provisional.store(0, Ordering::Relaxed);
         self.counts.write_resolved.store(0, Ordering::Relaxed);
         self.counts.mark_resolved.store(0, Ordering::Relaxed);
         self.counts.commit_provisional.store(0, Ordering::Relaxed);
         self.counts.abort_provisional.store(0, Ordering::Relaxed);
-        self.counts.unsettled_marker.store(0, Ordering::Relaxed);
+        self.counts.marker_state.store(0, Ordering::Relaxed);
         self.counts.get.store(0, Ordering::Relaxed);
         self.counts.get_many.store(0, Ordering::Relaxed);
         self.counts.get_many_for_cache.store(0, Ordering::Relaxed);
         self.counts.contains_many.store(0, Ordering::Relaxed);
         self.counts.scan_cells.store(0, Ordering::Relaxed);
         self.counts.scan_keys.store(0, Ordering::Relaxed);
-        self.counts.provisional_cells.store(0, Ordering::Relaxed);
         self.counts.provisional_cell_at.store(0, Ordering::Relaxed);
         self.counts.provisional_many.store(0, Ordering::Relaxed);
     }
@@ -117,10 +129,9 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-        own: EventRef,
     ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
         self.counts.get.fetch_add(1, Ordering::Relaxed);
-        self.inner.get(collection, cell, own)
+        self.inner.get(collection, cell)
     }
 
     fn get_many<'a>(
@@ -128,10 +139,9 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-        own: EventRef,
     ) -> impl Future<Output = Result<CommittedBatch, Self::Error>> + Send + 'a {
         self.counts.get_many.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_many(collection, section, batch, own)
+        self.inner.get_many(collection, section, batch)
     }
 
     fn get_many_for_cache<'a>(
@@ -139,33 +149,29 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-        own: EventRef,
     ) -> impl Future<Output = Result<CacheBatch, Self::Error>> + Send + 'a {
         self.counts
             .get_many_for_cache
             .fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .get_many_for_cache(collection, section, batch, own)
+        self.inner.get_many_for_cache(collection, section, batch)
     }
 
     fn scan_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-        own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         self.counts.scan_cells.fetch_add(1, Ordering::Relaxed);
-        self.inner.scan_cells(collection, scan, own)
+        self.inner.scan_cells(collection, scan)
     }
 
     fn scan_keys<'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-        own: EventRef,
     ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
         self.counts.scan_keys.fetch_add(1, Ordering::Relaxed);
-        self.inner.scan_keys(collection, scan, own)
+        self.inner.scan_keys(collection, scan)
     }
 
     fn contains_many<'a>(
@@ -173,20 +179,9 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-        own: EventRef,
     ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send + 'a {
         self.counts.contains_many.fetch_add(1, Ordering::Relaxed);
-        self.inner.contains_many(collection, section, batch, own)
-    }
-
-    fn provisional_cells<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
-        self.counts
-            .provisional_cells
-            .fetch_add(1, Ordering::Relaxed);
-        self.inner.provisional_cells(collection)
+        self.inner.contains_many(collection, section, batch)
     }
 
     async fn provisional_cell_at<'a>(
@@ -244,25 +239,28 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
         self.inner.mark_resolved(collection, cells).await
     }
 
-    async fn unsettled_marker<'a>(
+    async fn marker_state<'a>(
         &'a self,
         collection: &'a CollectionId,
-    ) -> Result<Option<EventMarker>, Self::Error> {
-        self.counts.unsettled_marker.fetch_add(1, Ordering::Relaxed);
-        self.inner.unsettled_marker(collection).await
+    ) -> Result<MarkerState, Self::Error> {
+        self.counts.marker_state.fetch_add(1, Ordering::Relaxed);
+        if let Some((_, count)) = self.marker_counts.iter().find(|(id, _)| id == collection) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.marker_state(collection).await
     }
 
     async fn commit_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
+        marker: &'a EventMarker,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
         self.counts
             .commit_provisional
             .fetch_add(1, Ordering::Relaxed);
         self.inner
-            .commit_provisional(collection, writes, clears)
+            .commit_provisional(collection, marker, writes)
             .await
     }
 
@@ -317,31 +315,25 @@ impl CellResolver for CountingResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::registry::CollectionDefRegistry;
 
     #[tokio::test]
     async fn counters_increment_once_per_store_call() -> Result<()> {
-        let store = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            FixedOracle::committed(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let store = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let id = fresh_collection("counter-probe")?;
         let cell = CellKey {
             section: Section::new(0),
             coordinate: Coordinate::from_bytes(vec![0]),
         };
-        let own = probe(1);
 
         store.reset();
-        store.get(&id, &cell, own).await?;
+        store.get(&id, &cell).await?;
         assert_eq!(store.visible_point_reads(), 1);
         assert_eq!(store.batch_reads(), 0);
         assert_eq!(store.raw_point_reads(), 0);
 
         store.reset();
         let batch = batch_of([0])?;
-        store.get_many(&id, Section::new(0), &batch, own).await?;
+        store.get_many(&id, Section::new(0), &batch).await?;
         assert_eq!(store.batch_reads(), 1);
         assert_eq!(store.visible_point_reads(), 0);
         assert_eq!(store.raw_point_reads(), 0);

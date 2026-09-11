@@ -91,17 +91,6 @@ impl TriggerQueue {
             .await;
     }
 
-    /// Adds a [`Trigger`] to the `DelayQueue` without modifying
-    /// `ActiveTriggers`.
-    ///
-    /// Used for rescheduling: the caller has already set the state to
-    /// `FiringRescheduled` and only needs the timer re-added to the queue.
-    /// If the same [`Trigger`] is already in the queue, the queued trigger
-    /// adopts the new trigger's trace.
-    pub(crate) fn insert_queue_only(&mut self, trigger: Trigger) {
-        self.enqueue(trigger);
-    }
-
     /// Adds a trigger to the delay queue, returning `true` if newly inserted.
     ///
     /// If the trigger already exists (same key, time, and type), the queued

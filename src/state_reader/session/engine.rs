@@ -14,8 +14,8 @@
 //! the write scope exists only for a session whose engine has one, so a reader
 //! collection has no mutation to refuse. What the engine can reach is likewise
 //! a matter of type, not of runtime checks: [`ReaderBackend`] offers a
-//! committed cell source and a loader, and no oracle or writable store, so
-//! gaining either behavior takes a dependency change.
+//! committed cell source and a loader. Writes require a different backend
+//! interface.
 
 use super::{PinnedSource, ReadSession};
 use crate::codec::Codec;

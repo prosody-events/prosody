@@ -89,7 +89,7 @@ impl Arbitrary for Segment {
             id,
             name,
             slab_size,
-            version: SegmentVersion::V3,
+            version: SegmentVersion::V4,
         }
     }
 }

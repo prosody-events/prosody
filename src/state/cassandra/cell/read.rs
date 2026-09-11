@@ -1,10 +1,12 @@
+use super::decode::{BorrowedMarkerRow, decode_marker_row};
 use super::{
     BorrowedKeyedCellTtlRow, CassandraCellStoreError, CassandraSession, CassandraStoreError, Cell,
-    CellBuffer, CellKey, CellKind, CellQueries, CellStoreError, CollectionId, Coordinate,
-    Direction, Error, Pk, PreparedStatement, QueryRowsResult, ResolveCellError, Scan, ScanEdge,
-    Section, SmallVec, Stream, TryStreamExt, cooperative, decode, pin_mut, split_keyed_cell_ttl,
-    try_stream,
+    CellBuffer, CellKey, CellKind, CellQueries, CollectionId, Coordinate, Direction, Pk,
+    PreparedStatement, QueryRowsResult, Scan, ScanEdge, Section, SmallVec, Stream, TryStreamExt,
+    cooperative, decode, pin_mut, split_keyed_cell_ttl, try_stream,
 };
+use crate::state::marker::MarkerState;
+use crate::timers::duration::CompactDuration;
 use scylla::deserialize::row::DeserializeRow;
 
 pub(super) type DecodedCellBatch = CellBuffer<Option<(Cell, Option<i32>)>>;
@@ -44,12 +46,6 @@ impl<'a> ScanStatements<'a> {
             backward_all: &queries.scan_presence_backward_all,
         }
     }
-}
-
-/// Maps a raw Cassandra error into the resolving store error, generic only over
-/// the oracle error type `E` the caller's stream carries.
-pub(super) fn into_store_err<E: Error + 'static>(error: CassandraStoreError) -> CellStoreError<E> {
-    ResolveCellError::Store(CassandraCellStoreError::from(error))
 }
 
 pub(super) async fn fetch_and_decode_cell(
@@ -263,17 +259,9 @@ fn match_rows_to_coordinates<Row>(
     out
 }
 
-/// The shared section-scan row pager. It opens the prepared statement for the
-/// scan bounds (the six-arm `(dir, start)` selection), builds the
-/// [`FramedKeyedCellRow`] stream, and yields each decoded `(CellKey, Cell)`
-/// with the in-code `past_end` cutoff applied. It applies no limit and no
-/// resolution. The limit counts present cells after projection, so each
-/// consumer keeps it in its own loop. Two callers consume this. The owner scan
-/// ([`super::CassandraStore::scan_inner`]) then applies `peek_read`; the reader
-/// scan ([`super::CassandraCellResources::scan_committed`]) then applies
-/// `project_committed`. Sharing this pager keeps their physical paging from
-/// drifting apart. Each `try_next` is wrapped in [`cooperative`] so a drain of
-/// ready rows yields to the runtime every ~128 items.
+/// Pages value or presence rows within the scan bounds.
+/// Callers apply commit evidence and limits after this decoder.
+/// Each row uses [`cooperative`] so ready pages yield to other tasks.
 pub(super) fn page_cells<'a, Row>(
     session: &'a CassandraSession,
     statements: ScanStatements<'a>,
@@ -354,4 +342,42 @@ pub(super) fn past_end(dir: Direction, key: &CellKey, end: ScanEdge<&Coordinate>
         (Direction::Backward, ScanEdge::Excluded(end)) => coordinate <= end.as_bytes(),
         (_, ScanEdge::Unbounded) => false,
     }
+}
+
+/// Reads the whole marker slice. Both marker verbs use this decoder.
+pub(super) async fn fetch_marker_state(
+    session: &CassandraSession,
+    queries: &CellQueries,
+    id: &CollectionId,
+    legacy_ttl: Option<CompactDuration>,
+) -> Result<MarkerState, CassandraCellStoreError> {
+    let pk = Pk::of(id);
+    let result = session
+        .session()
+        .execute_unpaged(
+            &queries.marker_state,
+            (
+                pk.segment_id,
+                pk.key,
+                pk.state_type,
+                pk.name,
+                CellKind::Marker,
+            ),
+        )
+        .await
+        .map_err(CassandraStoreError::from)?
+        .into_rows_result()
+        .map_err(CassandraStoreError::from)?;
+    let mut state = MarkerState::default();
+    for row in result
+        .rows::<BorrowedMarkerRow<'_>>()
+        .map_err(CassandraStoreError::from)?
+    {
+        decode_marker_row(
+            &mut state,
+            row.map_err(CassandraStoreError::from)?,
+            legacy_ttl,
+        )?;
+    }
+    Ok(state)
 }

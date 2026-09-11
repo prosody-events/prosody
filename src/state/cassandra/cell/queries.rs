@@ -3,32 +3,27 @@ use super::{CassandraStore, ScanEdge};
 use super::{TABLE_KEYED_STATE_CELL, cassandra_queries};
 
 cassandra_queries! {
-    /// Container for the prepared CQL statements used by [`CassandraStore`].
+    /// Prepared CQL statements for [`CassandraStore`].
     ///
-    /// Every statement binds the leading clustering `kind` as a constant
-    /// (`CellKind::Cell` for the cell statements, `CellKind::Marker` for the
-    /// marker statements) — a clustering-prefix column cannot be skipped.
-    /// Each cell mutation is one `UPDATE`/`INSERT`/`DELETE` of one row; a
-    /// multi-cell collection write binds these once per cell into one
-    /// same-partition `UNLOGGED BATCH` (via `execute_unlogged_batches`), so all
-    /// its cells share one write timestamp and TTL anchor. TTL/no-TTL pairs
-    /// exist because Cassandra cannot bind `NULL` to `USING TTL ?`. The scans
-    /// are single-section clustering ranges within the `kind=Cell` slice: the
-    /// `ORDER BY` direction cannot be bound (forward/backward), and the
-    /// **start-side comparator** cannot be bound either, so each direction
-    /// carries two start variants — inclusive (`>=`/`<=`) and exclusive
-    /// (`>`/`<`, for exclusive anchors). A start edge is therefore either a
-    /// bound coordinate (the four incl/excl statements) or
-    /// [`Unbounded`](ScanEdge::Unbounded) (the two section-only `_all`
-    /// statements, which carry no start comparator). The end bound is enforced
-    /// in code (`past_end`), so it needs no statement variant. The `marker_*`
-    /// statements maintain and point-read the one fixed-address event-marker row
-    /// that bounds recovery. The `gap_*` statements are the section-clear range
-    /// deletes (`extend_gap_units`) — writes, never reads. Scan issuance is gated: the
-    /// four cell mutators each write exactly one row shape, so the only reader
-    /// that walks a whole section (and thus can meet a tombstone field) is an
-    /// `_all` scan, reached solely by the map's degraded full-section fallback —
-    /// the accepted degraded cost. None use `ALLOW FILTERING`.
+    /// Every statement binds the leading clustering column `kind`: `CellKind::Cell` for
+    /// cells or `CellKind::Marker` for markers.
+    /// CQL requires this clustering prefix. Each cell mutation changes one row.
+    /// `execute_unlogged_batches` groups collection writes into same-partition
+    /// `UNLOGGED BATCH` statements with a shared timestamp and TTL anchor.
+    /// Bind 0 to `USING TTL ?` for no expiry.
+    ///
+    /// Scans address one section of the `kind=Cell` slice. CQL cannot bind the scan
+    /// direction or start comparator.
+    /// Each direction has inclusive and exclusive coordinate statements, plus an `_all`
+    /// statement for [`Unbounded`](ScanEdge::Unbounded) starts.
+    /// `past_end` enforces the end bound in code.
+    ///
+    /// The `marker_*` statements maintain both marker rows and read their slice. The
+    /// `gap_*` statements delete section-clear gaps through `extend_gap_units`.
+    /// Each of the four cell mutators writes one row shape. Only the map's degraded
+    /// full-section fallback issues `_all` scans that can encounter tombstone fields.
+    /// This fallback accepts the full-section cost. No statement uses `ALLOW
+    /// FILTERING`.
     pub struct CellQueries {
         /// Reads one cell's columns (Resolved/Provisional/Corrupt shapes).
         read_cell: (
@@ -206,28 +201,10 @@ cassandra_queries! {
             TABLE_KEYED_STATE_CELL
         ),
 
-        /// Stages a provisional cell without TTL.
-        write_provisional_no_ttl: (
-            "UPDATE $keyspace.{} \
-             SET data = ?, prev_data = ?, encoding = ?, version = ?, event = ? \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND kind = ? AND section = ? AND coordinate = ?",
-            TABLE_KEYED_STATE_CELL
-        ),
-
         /// Writes a resolved cell with TTL: the committed `data` plus its
         /// encoding/version, nulling `prev_data` and `event`.
         write_resolved: (
             "UPDATE $keyspace.{} USING TTL ? \
-             SET data = ?, encoding = ?, version = ?, prev_data = null, event = null \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND kind = ? AND section = ? AND coordinate = ?",
-            TABLE_KEYED_STATE_CELL
-        ),
-
-        /// Writes a resolved cell without TTL.
-        write_resolved_no_ttl: (
-            "UPDATE $keyspace.{} \
              SET data = ?, encoding = ?, version = ?, prev_data = null, event = null \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate = ?",
@@ -258,12 +235,8 @@ cassandra_queries! {
             TABLE_KEYED_STATE_CELL
         ),
 
-        /// Upserts the collection's event-marker row with TTL (co-expiry with
-        /// the staged cells): the frozen payload in `data`/`encoding`/`version`
-        /// and the staging event in `event`. Deliberately does NOT touch
-        /// `prev_data` — a marker row never carries one, and binding an
-        /// explicit null would write a needless column tombstone at the fixed
-        /// address on every stage.
+        /// Writes Staged with the collection TTL, frozen payload, and event.
+        /// It leaves `prev_data` untouched to avoid a needless tombstone.
         marker_write: (
             "UPDATE $keyspace.{} USING TTL ? \
              SET data = ?, encoding = ?, version = ?, event = ? \
@@ -272,28 +245,26 @@ cassandra_queries! {
             TABLE_KEYED_STATE_CELL
         ),
 
-        /// Upserts the event-marker row without TTL.
-        marker_write_no_ttl: (
-            "UPDATE $keyspace.{} \
+        /// Writes the committed event and discovery payload with the evidence TTL.
+        committed_write: (
+            "UPDATE $keyspace.{} USING TTL ? \
              SET data = ?, encoding = ?, version = ?, event = ? \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? AND coordinate = ?",
             TABLE_KEYED_STATE_CELL
         ),
 
-        /// Point-reads the event-marker row at its fixed address — the cold
-        /// recovery seed (cost: one point read at a compaction-merged
-        /// position, never a range over a tombstone field).
-        marker_read: (
-            "SELECT data, encoding, version, event \
+        /// Reads both rows of the marker slice.
+        marker_state: (
+            "SELECT coordinate, data, encoding, version, event \
              FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND kind = ? AND section = ? AND coordinate = ?",
+             AND kind = ?",
             TABLE_KEYED_STATE_CELL
         ),
 
-        /// Row-level delete of the event-marker row (on settle — the whole
-        /// stage resolved). Deleting an absent marker is a harmless no-op.
+        /// Deletes Staged after the whole stage resolves. An absent marker makes the
+        /// delete a no-op.
         marker_delete: (
             "DELETE FROM $keyspace.{} \
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \

@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 use tracing::{debug, error, instrument};
 
-mod dispatch;
+pub(crate) mod dispatch;
 mod keyed;
 mod metrics;
 pub mod offsets;

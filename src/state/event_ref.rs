@@ -1,8 +1,8 @@
-//! Event identity and store/oracle verdicts.
+//! Event identity, admission decisions, and store outcomes.
 //!
 //! [`EventRef`] is the durable reference to the upstream event that owns a
-//! provisional cell. [`CommitDecision`] is the oracle's recovery-time verdict
-//! on a provisional cell; [`StoreOutcome`] reports whether a mid-handler
+//! provisional cell. [`CommitDecision`] supplies the admission decision
+//! for a staged event; [`StoreOutcome`] reports whether a mid-handler
 //! `commit()`/`rollback()` call took effect.
 
 use crate::timers::TimerType;
@@ -14,7 +14,7 @@ use uuid::Uuid;
 pub enum EventRef {
     /// Kafka message event identified by its deduplication marker.
     Message {
-        /// Deduplication row identifier written at the event commit point.
+        /// Identifier of the message deduplication row.
         dedup_id: Uuid,
     },
 
@@ -56,14 +56,8 @@ impl TimerEventRef {
     }
 }
 
-/// Oracle verdict on a provisional cell's event.
-///
-/// Returned by the commit oracle when it resolves a provisional cell's
-/// [`EventRef`] against the upstream commit source (deduplication store for
-/// messages, timer-row tag for timers — see
-/// [`CommitOracle`](crate::state::oracle::CommitOracle)). Distinct from
-/// [`StoreOutcome`], which reports whether a call took effect: the oracle
-/// decides, the store — or the buffer drain — acts.
+/// The explicit admission decision for one staged event.
+/// Store operations apply this decision to the frozen stage.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum CommitDecision {
     /// The event's provisional write committed: promote it to the committed
@@ -83,8 +77,8 @@ pub enum CommitDecision {
 /// them to the committed value, `rollback()` discards them. It is
 /// [`StoreOutcome::NoOp`] when nothing was buffered.
 ///
-/// Distinct from [`CommitDecision`]: the oracle decides whether a provisional
-/// cell should commit, this reports whether the call actually took effect.
+/// [`CommitDecision`] selects promotion or rollback during admission.
+/// This value reports whether the call took effect.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum StoreOutcome {
     /// The call took effect.

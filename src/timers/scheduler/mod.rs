@@ -35,7 +35,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 mod actor;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Size of the internal command and trigger channels.
 const BUFFER_SIZE: usize = 64;
@@ -79,11 +79,9 @@ pub(super) enum CommandOperation {
     Add,
     /// Remove a trigger from both `DelayQueue` and `ActiveTriggers`.
     Remove,
-    /// Add a trigger to the `DelayQueue` only (used when the caller has
-    /// already transitioned `ActiveTriggers` to `FiringRescheduled`).
-    AddToQueue,
-    /// Remove a trigger from the `DelayQueue` only (cancel an earlier
-    /// `AddToQueue`).
+    /// Remove the coordinate only if no replacement tag stands.
+    RetireCommitted,
+    /// Remove the queue entry and preserve its registry state.
     RemoveFromQueue,
 }
 
@@ -153,12 +151,12 @@ where
         self.send_command(CommandOperation::Remove, trigger).await
     }
 
-    /// Add a trigger to the `DelayQueue` without modifying `ActiveTriggers`.
-    pub(crate) async fn add_to_queue(
+    /// Removes a committed attempt and preserves a replacement tag.
+    pub(crate) async fn retire_committed(
         &self,
         trigger: Trigger,
     ) -> Result<(), TimerSchedulerError<E>> {
-        self.send_command(CommandOperation::AddToQueue, trigger)
+        self.send_command(CommandOperation::RetireCommitted, trigger)
             .await
     }
 
@@ -175,23 +173,8 @@ where
     /// Transitions a timer from `Scheduled` to `Firing` state.
     ///
     /// Returns `true` if the transition succeeded.
-    pub(crate) async fn fire(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> bool {
-        use crate::timers::active::TimerState;
-
-        if let Some(TimerState::Scheduled) =
-            self.active_triggers.get_state(key, time, timer_type).await
-        {
-            self.active_triggers
-                .set_state(key, time, timer_type, TimerState::Firing)
-                .await
-        } else {
-            false
-        }
+    pub(crate) async fn fire(&self, trigger: &Trigger) -> bool {
+        self.active_triggers.fire(trigger).await
     }
 
     /// Deactivate a trigger without removing it from the persistent queue.

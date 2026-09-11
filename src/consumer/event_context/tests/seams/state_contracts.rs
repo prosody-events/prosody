@@ -26,11 +26,12 @@ fn never_terminal_fold() {
 // --- Cursor laziness (against a counting store) -----------------------------
 
 /// The read-counting cell store the cursor-laziness pin drives.
-type CountingStore = CountingCellStore<MemoryCellStore<FixedOracle>>;
+type CountingStore = CountingCellStore<MemoryCellStore>;
 
 /// The backend the cursor-laziness pin drives: a memory cell store wrapped in a
 /// read-counting decorator, so a single `next()`'s durable reads are bounded.
-type CountingBackend = PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, CountingStore>;
+type CountingBackend =
+    PartitionBackend<MemoryDeduplicationStore, MemoryDescriptorIdentityStore, CountingStore, ()>;
 
 /// The context the cursor-laziness pin drives.
 type CountingContext =
@@ -41,25 +42,21 @@ type CountingContext =
 /// counter.
 fn counting_context(registry: CollectionDefRegistry) -> (CountingContext, CountingStore) {
     let registry = Arc::new(registry);
-    let counting = CountingCellStore::new(MemoryCellStore::new(
-        MemoryCells::new(),
-        FixedOracle::committed(),
-        registry.clone(),
-    ));
+    let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
     let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
     let (_cancel_tx, cancel_rx) = watch::channel(false);
     let parts = SessionParts::<CountingBackend, _> {
         cell: counting.clone(),
         dirty: Arc::new(DirtyStore::new()),
-        oracle: FixedOracle::committed(),
+        dedup: MemoryDeduplicationStore::new(),
         loader: MemoryLoader::<Value>::new(),
         registry,
         state_key: StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
         event: EventRef::Message {
             dedup_id: Uuid::new_v4(),
         },
-        recovery_delay: CompactDuration::new(30),
-        armed: Arc::default(),
+        dedup_ttl: CompactDuration::new(30),
+        checks: (),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     };
     let ctx = MockEventContext::<Value>::new().with_session(KeyedStateSession::new(parts));

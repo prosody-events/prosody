@@ -67,6 +67,25 @@ impl CellMetrics {
         self.record(cells, "get_many", started, source, cache_result, outcome);
     }
 
+    /// Records all cells in one presence load.
+    pub(super) fn presence<T, E: ClassifyError>(
+        &self,
+        cells: usize,
+        started: Instant,
+        source: Source,
+        cache_result: CacheResult,
+        outcome: &Result<T, E>,
+    ) {
+        self.record(
+            cells,
+            "contains_many",
+            started,
+            source,
+            cache_result,
+            outcome,
+        );
+    }
+
     fn record<T, E: ClassifyError>(
         &self,
         cells: usize,

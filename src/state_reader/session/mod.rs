@@ -8,9 +8,8 @@
 //! one source. Call this the `SingleSourceCoherence` invariant.
 //!
 //! Every guarantee here is structural. `ReadOnlyHandleCannotMutate` holds
-//! because no mutator bound exists. Committed-only holds because the only value
-//! a session can materialize is
-//! [`Cell::project_committed`](crate::state::cell::Cell::project_committed).
+//! because no mutator bound exists. The [`CommittedCellSource`] contract
+//! supplies committed values and presence through collection evidence.
 //!
 //! `SingleSourceCoherence` holds two ways. Within one invocation, the
 //! `&mut Option<PinnedSource>` that every engine path threads (see [`engine`])

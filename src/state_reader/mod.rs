@@ -3,10 +3,10 @@
 //! A sibling of [`producer`](crate::producer) and
 //! [`consumer`](crate::consumer): a [`StateReader`] observes a collection's
 //! **committed** state from another consumer group, without owning the
-//! partition or running the write machinery. Every value it returns comes from
-//! [`Cell::project_committed`](crate::state::cell::Cell::project_committed):
-//! never an in-flight provisional value, never owner-side repair. Each logical
-//! operation reads from at most one publication source (probe-and-pin).
+//! partition. Reads project provisional cells through collection commit
+//! evidence. Committed clears restrict results to their frozen survivors. Reads
+//! do not change durable state. Each operation reads from at most one
+//! publication source.
 //!
 //! Construct a [`StateReaderClient`] from one [`StateReaderDependencies`]
 //! bundle. The client shares that bundle's stores, loader, heartbeat registry,

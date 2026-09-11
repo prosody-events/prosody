@@ -321,6 +321,7 @@ fn retain_manager(
         KeyedStateConfiguration::builder().build()?,
         config,
         DEFAULT_IDEMPOTENCE_VERSION,
+        Duration::from_secs(30),
     )?;
     let partition_config = PartitionConfiguration {
         group_id: Arc::from(config.group_id.as_str()),
@@ -408,6 +409,7 @@ async fn start<R: ResultRequestReader + 'static>(
         KeyedStateConfiguration::builder().build()?,
         config,
         DEFAULT_IDEMPOTENCE_VERSION,
+        Duration::from_secs(30),
     )?;
     let state = memory_state_provider::<JsonCodec>(
         &keyed_state,

@@ -48,7 +48,7 @@
 
 use super::error::FjallCellCacheError;
 use crate::state::CollectionId;
-use crate::state::cell_key::{CellKey, Coordinate, Section};
+use crate::state::cell_key::{CellKey, Section};
 use bytes::Bytes;
 use smallvec::SmallVec;
 use xxhash_rust::xxh3::Xxh3;
@@ -56,40 +56,6 @@ use xxhash_rust::xxh3::Xxh3;
 /// Length of the collection hash prefix that leads every fjall key (cell and
 /// index alike).
 const COLLECTION_PREFIX_LEN: usize = 16;
-
-/// The row family within the per-partition warm `index` keyspace, discriminated
-/// by the byte immediately after the 16-byte collection hash so each family
-/// forms a contiguous prefix range.
-///
-/// A serialize-only discriminator (`From<_> for u8`) that leads each key we
-/// write. Reads are always prefix-scoped to one family (a `Coord` range, or a
-/// `Seeded`/`Presence` point key), so the discriminator is never decoded back —
-/// the family is known from the range that produced the key.
-///
-/// Discriminant `0x02` is retired (it keyed the deleted design's stored
-/// interval rows) and needs no tombstone: the index keyspace is
-/// assignment-scoped, so no persisted `0x02` row can outlive the design that
-/// wrote it. `Presence` deliberately stays `0x03` — never renumber a persisted
-/// discriminant.
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IndexKind {
-    /// A live provisional coordinate: key `[hash][Coord][section][coordinate]`,
-    /// empty value. Presence ⟺ `(collection, cell)` is durably provisional.
-    Coord = 0x00,
-    /// The one-time cold-seed latch: key `[hash][Seeded]`, empty value.
-    Seeded = 0x01,
-    /// Records a completed durable marker check.
-    ///
-    /// The key is `[hash][Presence]`. The value is empty.
-    Presence = 0x03,
-}
-
-impl From<IndexKind> for u8 {
-    fn from(kind: IndexKind) -> Self {
-        kind as u8
-    }
-}
 
 /// The cache's three-valued read, decoded from a stored cell frame by
 /// [`decode_cell`].
@@ -160,68 +126,6 @@ pub(super) fn section_prefix(id: &CollectionId, section: Section) -> [u8; SECTIO
     prefix[..COLLECTION_PREFIX_LEN].copy_from_slice(&collection_prefix(id));
     prefix[COLLECTION_PREFIX_LEN] = i8::from(section).cast_unsigned();
     prefix
-}
-
-/// The `[hash][kind]` head every warm-index family starts with — the whole key
-/// of a single-entry family (`Seeded`, `Presence`) and the range prefix of a
-/// multi-entry one (`Coord`). A compile-time-size stack array: fixed-size keys
-/// never heap-allocate.
-fn index_family_head(id: &CollectionId, kind: IndexKind) -> [u8; COLLECTION_PREFIX_LEN + 1] {
-    let mut key = [0; COLLECTION_PREFIX_LEN + 1];
-    key[..COLLECTION_PREFIX_LEN].copy_from_slice(&collection_prefix(id));
-    key[COLLECTION_PREFIX_LEN] = kind.into();
-    key
-}
-
-/// The warm-index key for a provisional coordinate:
-/// `[hash][Coord][section][coordinate]`. Presence ⟺ the cell is provisional.
-///
-/// Built per settle-time index write — the same steady-state cardinality and
-/// spill behavior as [`cell_key`] — so it rides the same `SmallVec` inline
-/// buffer, staying on the stack at Value (18 B), Deque (26 B), and short-key
-/// Map sizes.
-#[must_use]
-pub(super) fn index_coord_key(id: &CollectionId, cell: &CellKey) -> SmallVec<[u8; 32]> {
-    let coordinate = cell.coordinate.as_bytes();
-    let mut key = SmallVec::with_capacity(COLLECTION_PREFIX_LEN + 2 + coordinate.len());
-    key.extend_from_slice(&collection_prefix(id));
-    key.push(IndexKind::Coord.into());
-    key.push(i8::from(cell.section).cast_unsigned());
-    key.extend_from_slice(coordinate);
-    key
-}
-
-/// The `[hash][Coord]` prefix bounding a collection's provisional-coordinate
-/// range — the ascending scan `snapshot` drains.
-#[must_use]
-pub(super) fn index_coord_prefix(id: &CollectionId) -> [u8; COLLECTION_PREFIX_LEN + 1] {
-    index_family_head(id, IndexKind::Coord)
-}
-
-/// Reconstructs a [`CellKey`] from a `Coord` index key produced by
-/// [`index_coord_key`]: the byte after the collection hash is the family
-/// discriminator, the next is the section, and the tail is the coordinate.
-#[must_use]
-pub(super) fn coord_cell_key(key: &[u8]) -> CellKey {
-    let section = Section::new(key[COLLECTION_PREFIX_LEN + 1].cast_signed());
-    let coordinate = Coordinate::from_bytes(key[COLLECTION_PREFIX_LEN + 2..].to_vec());
-    CellKey {
-        section,
-        coordinate,
-    }
-}
-
-/// The warm-index key for a collection's one-time cold-seed latch:
-/// `[hash][Seeded]`. Presence ⟺ the seed has run.
-#[must_use]
-pub(super) fn index_seeded_key(id: &CollectionId) -> [u8; COLLECTION_PREFIX_LEN + 1] {
-    index_family_head(id, IndexKind::Seeded)
-}
-
-/// Returns the key for a completed durable marker check.
-#[must_use]
-pub(super) fn marker_check_key(id: &CollectionId) -> [u8; COLLECTION_PREFIX_LEN + 1] {
-    index_family_head(id, IndexKind::Presence)
 }
 
 /// Returns the 16-byte collection prefix for a collection identity.

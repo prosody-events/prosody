@@ -45,7 +45,7 @@ use crate::state::tests::support::ScriptedPublicationStore;
 #[cfg(test)]
 use crate::state_reader::tests::support::{CountingIdentityStore, ScriptedCellSource};
 
-/// Committed cell reads that never consult the owner's commit oracle.
+/// Reads committed cells through collection evidence without a partition owner.
 pub trait CommittedCellSource: Clone + Send + Sync + 'static {
     /// Read failure.
     type Error: ClassifyError + Error + Send + Sync + 'static;
@@ -73,7 +73,6 @@ pub trait CommittedCellSource: Clone + Send + Sync + 'static {
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a;
 
     /// Streams keys with a committed cell projection in `scan` order.
-    /// This read does not consult the oracle or run owner-side repair.
     fn scan_presence<'a>(
         &'a self,
         id: &'a CollectionId,
@@ -81,7 +80,6 @@ pub trait CommittedCellSource: Clone + Send + Sync + 'static {
     ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a;
 
     /// Reads index-aligned committed presence values.
-    /// This read does not consult the oracle or run owner-side repair.
     fn load_presence_many(
         &self,
         id: &CollectionId,

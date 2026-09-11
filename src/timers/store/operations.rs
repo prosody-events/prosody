@@ -1,7 +1,7 @@
 //! Internal trait for primitive storage operations.
 //!
 //! This module defines the `TriggerOperations` trait used by Cassandra and
-//! Memory implementations. It provides 22 primitive methods that operate on
+//! Memory implementations. Its primitive methods operate on
 //! individual tables without coordinating across tables.
 //!
 //! **Not part of the public API.** Use `TriggerStore` instead.
@@ -21,7 +21,7 @@ use std::ops::RangeInclusive;
 
 /// Internal trait for primitive storage operations.
 ///
-/// This trait provides 22 primitive methods that operate on individual
+/// This trait provides primitive methods that operate on individual
 /// tables without coordinating across tables. It is the trait bound for
 /// `TableAdapter<T>`, which is part of the public API.
 ///
@@ -223,36 +223,14 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
         key: &Key,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    // =========================================================================
-    // Tag Operations (2 methods)
-    // =========================================================================
-
-    /// Rotates the `tag` on an existing scheduled timer in every persisted
-    /// index maintained by this operation implementation.
-    ///
-    /// **Precondition:** the caller must have observed the timer at `(key,
-    /// time, timer_type)` as currently scheduled. Today's only caller is
-    /// `complete()`-from-`FiringRescheduled`, which has just loaded the timer
-    /// from storage. Implementations may treat a missing row as a no-op or as
-    /// undefined, so callers must not depend on either behaviour.
-    fn update_tag(
+    /// Reads the authoritative trigger from the key index.
+    /// Returns `None` for an absent row. Legacy null tags decode as zero.
+    fn current_trigger(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
-        new_tag: i32,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Reads the `tag` from a key-index clustering row.
-    ///
-    /// Returns `None` if the row is absent ("committed" in oracle terms).
-    /// Returns `Some(0)` for rows with a `NULL` tag (pre-migration rows).
-    fn current_tag(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> impl Future<Output = Result<Option<i32>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Option<Trigger>, Self::Error>> + Send;
 
     // =========================================================================
     // Version Management (1 method)

@@ -40,7 +40,6 @@
 use super::cell::Committed;
 use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::dirty::{DirtyStore, DirtyVal};
-use super::event_ref::EventRef;
 use super::identity::CollectionId;
 use super::store::{CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch};
 use async_stream::try_stream;
@@ -96,7 +95,6 @@ where
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-        own: EventRef,
     ) -> Result<Committed, L::Error> {
         match self.dirty.lookup(collection, cell) {
             Some(DirtyVal::Set(bytes)) => Ok(Committed::new(Some(bytes))),
@@ -107,7 +105,7 @@ where
             None if self.dirty.section_cleared(collection, cell.section) => {
                 Ok(Committed::new(None))
             }
-            None => self.lower.get(collection, cell, own).await,
+            None => self.lower.get(collection, cell).await,
         }
     }
 
@@ -129,7 +127,6 @@ where
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-        own: EventRef,
     ) -> Result<CommittedBatch, L::Error> {
         let (dirty_answers, untouched, untouched_pos) =
             self.classify_batch(collection, section, batch);
@@ -147,7 +144,7 @@ where
         for lower_batch in CoordinateBatch::chunks(untouched) {
             let lower = self
                 .lower
-                .get_many(collection, section, &lower_batch, own)
+                .get_many(collection, section, &lower_batch)
                 .await?;
             for (committed, &pos) in lower.into_iter().zip(untouched_pos.iter()) {
                 answers[pos] = Some(committed);
@@ -172,7 +169,6 @@ where
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-        own: EventRef,
     ) -> Result<PresenceBatch, L::Error> {
         let (dirty_answers, untouched, untouched_pos) =
             self.classify_batch(collection, section, batch);
@@ -183,7 +179,7 @@ where
         for lower_batch in CoordinateBatch::chunks(untouched) {
             let lower = self
                 .lower
-                .contains_many(collection, section, &lower_batch, own)
+                .contains_many(collection, section, &lower_batch)
                 .await?;
             for (present, &pos) in lower.into_iter().zip(untouched_pos.iter()) {
                 answers[pos] = Some(present);
@@ -242,7 +238,6 @@ where
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-        own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a {
         // Strip the lower limit because dirty cells can add or hide results.
         // The merge applies the limit to its output.
@@ -252,7 +247,6 @@ where
                 limit: None,
                 ..scan
             },
-            own,
         );
         self.merge_cells(collection, scan, bottom)
     }
@@ -262,7 +256,6 @@ where
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-        own: EventRef,
     ) -> impl Stream<Item = Result<CellKey, L::Error>> + Send + 'a {
         let bottom = self
             .lower
@@ -272,7 +265,6 @@ where
                     limit: None,
                     ..scan
                 },
-                own,
             )
             .map_ok(|key| (key, Bytes::new()));
         self.merge_cells(collection, scan, bottom)

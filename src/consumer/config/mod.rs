@@ -1,5 +1,5 @@
-//! Consumer and mode configuration, plus the recovery-TTL margin the
-//! keyed-state commit oracle depends on.
+//! Consumer and mode configuration, including shared keyed-state and dedup
+//! settings.
 
 use crate::Codec;
 use crate::consumer::middleware::deduplication::DeduplicationConfiguration;
@@ -14,7 +14,6 @@ use crate::loader::KafkaLoaderConfiguration;
 use crate::otel::SpanRelation;
 use crate::state::config::KeyedStateConfiguration;
 use crate::state_reader::StateReaderDependencies;
-use crate::timers::duration::CompactDuration;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
     from_option_env_with_fallback, from_optional_vec_env, from_vec_env,
@@ -27,16 +26,6 @@ use validator::{Validate, ValidationError};
 
 /// Environment variable name for the Kafka consumer group ID.
 const PROSODY_GROUP_ID: &str = "PROSODY_GROUP_ID";
-
-/// Multiplier on `recovery_delay` for the minimum deduplication TTL: the
-/// dedup marker is the commit oracle, so it must outlive the recovery window
-/// by a wide margin to survive rebalances and retries. See
-/// [`validate_recovery_ttl_margin`].
-const RECOVERY_TTL_DELAY_MULTIPLIER: u64 = 48;
-
-/// Absolute floor for the deduplication TTL when state is registered, in
-/// seconds (1 hour) — the larger of this and `48 × recovery_delay` applies.
-const MIN_RECOVERY_EVIDENCE_TTL_SECONDS: u64 = 3_600;
 
 /// Default statistics reporting interval. See
 /// [`ConsumerConfiguration::statistics_interval`].
@@ -291,9 +280,7 @@ pub struct CommonConfiguration {
     pub timeout: TimeoutConfiguration,
     /// Deduplication configuration.
     ///
-    /// Deduplication runs in **every** consumer mode: it is the commit oracle
-    /// the keyed-state recovery path reads (a message's dedup row existing
-    /// means it committed), so it cannot be pipeline-specific.
+    /// Every consumer mode filters duplicates through this store.
     pub dedup: DeduplicationConfiguration,
     /// Keyed-state configuration (mode-independent, always-on; inert when no
     /// collections are registered).
@@ -397,59 +384,10 @@ fn validate_statistics_interval(interval: &Duration) -> Result<(), ValidationErr
     Ok(())
 }
 
-/// Validates that the deduplication TTL clears the keyed-state recovery
-/// window (resolution-before-evidence-expiry): `dedup.ttl ≥
-/// max(48 × recovery_delay, 1h)`. The dedup marker is the commit oracle a
-/// provisional cell is resolved against, so if the marker expires first the
-/// cell can no longer be resolved correctly and a committed write is lost.
-/// Returns [`RecoveryTtlMarginError`] when the dedup TTL is below the margin.
-pub(in crate::consumer) fn validate_recovery_ttl_margin(
-    dedup_ttl: Duration,
-    recovery_delay: CompactDuration,
-) -> Result<(), RecoveryTtlMarginError> {
-    let recovery_delay_seconds = u64::from(recovery_delay.seconds());
-    let required_seconds = recovery_delay_seconds
-        .saturating_mul(RECOVERY_TTL_DELAY_MULTIPLIER)
-        .max(MIN_RECOVERY_EVIDENCE_TTL_SECONDS);
-    let dedup_ttl_seconds = dedup_ttl.as_secs();
-    if dedup_ttl_seconds < required_seconds {
-        return Err(RecoveryTtlMarginError {
-            dedup_ttl: dedup_ttl_seconds,
-            recovery_delay: recovery_delay_seconds,
-            required: required_seconds,
-        });
-    }
-    Ok(())
-}
-
 /// The `PROSODY_MOCK` environment value is not a boolean.
 #[derive(Debug, Error)]
 #[error("invalid mock-mode configuration: {0}")]
 pub struct MockConfigurationError(String);
-
-/// The deduplication TTL is below the keyed-state recovery margin: a
-/// provisional cell could outlive its commit-oracle marker and be lost under
-/// crash recovery. Returned at consumer build when state collections are
-/// registered. Raise `PROSODY_IDEMPOTENCE_TTL` or lower
-/// `recovery_delay` so `dedup.ttl ≥ max(48 × recovery_delay, 1h)` holds.
-///
-/// All fields are in seconds.
-#[derive(Debug, Error)]
-#[error(
-    "deduplication TTL {dedup_ttl} seconds is below the keyed-state recovery margin of {required} \
-     seconds (the larger of 48 × recovery_delay {recovery_delay}s and 3600s); a provisional cell \
-     could outlive its commit-oracle marker and be lost"
-)]
-pub struct RecoveryTtlMarginError {
-    /// The configured deduplication TTL.
-    dedup_ttl: u64,
-
-    /// The configured keyed-state recovery delay.
-    recovery_delay: u64,
-
-    /// The minimum deduplication TTL the configuration must meet.
-    required: u64,
-}
 
 #[cfg(test)]
 mod tests;

@@ -31,7 +31,7 @@
 //!
 //! The dirty store is volatile and discarded at each settle/attempt boundary —
 //! it is **never** a durability or recovery source. Crash recovery runs off the
-//! Cassandra provisional cells and the commit oracle.
+//! Cassandra provisional cells and collection evidence.
 //!
 //! [`Overlay`]: crate::state::overlay::Overlay
 
