@@ -59,6 +59,7 @@ use crate::state_reader::partition_for_key;
 use crate::state_reader::source::{Source, ValidatedPublications};
 use bytes::Bytes;
 use futures::stream::{FuturesOrdered, Stream, StreamExt};
+use smallvec::smallvec;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -402,7 +403,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
             selection,
             ordered,
             |buffer| buffer.iter().any(|present| *present),
-            || (0..batch.len()).map(|_| false).collect(),
+            || smallvec![false; batch.len()],
         )
         .await
     }
@@ -427,7 +428,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
             selection,
             ordered,
             |buffer| buffer.iter().any(Option::is_some),
-            || (0..batch.len()).map(|_| None).collect(),
+            || smallvec![None; batch.len()],
         )
         .await
     }

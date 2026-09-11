@@ -34,7 +34,6 @@ use futures::stream::{self, Stream};
 use parking_lot::Mutex;
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
-use smallvec::smallvec;
 use std::convert::Infallible;
 use std::fmt;
 use std::future::{Future, ready};

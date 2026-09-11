@@ -16,7 +16,7 @@ use super::marker::{EventMarker, MarkerState, SectionClear};
 use crate::error::ClassifyError;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
-use futures::Stream;
+use futures::{Stream, TryStreamExt};
 use std::error::Error;
 use std::future::Future;
 
@@ -85,7 +85,9 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a;
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
+        self.scan_cells(collection, scan).map_ok(|(key, _)| key)
+    }
 
     /// Cache-fill point read: the committed value **plus** the durable cell's
     /// remaining TTL, for the [`Cached`](super::cached::Cached) write-through
@@ -167,7 +169,16 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send + 'a {
+        async move {
+            Ok(self
+                .get_many(collection, section, batch)
+                .await?
+                .iter()
+                .map(|c| c.get().is_some())
+                .collect())
+        }
+    }
 
     /// Reads committed values and remaining TTLs for
     /// [`Cached`](super::cached::Cached). Uses the input-position contract

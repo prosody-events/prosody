@@ -5,13 +5,13 @@ use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::marker::{EventMarker, MarkerState, SectionClear};
 use super::resolve::{EvidenceLookup, ResolveCellError};
 use super::store::{
-    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch, dedupe,
+    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe,
     expand_to_input_order, provisional_point_loop,
 };
 use super::{CollectionId, CollectionRef};
 use async_stream::try_stream;
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use scc::hash_map::Entry;
 use smallvec::SmallVec;
 use std::convert::Infallible;
@@ -195,29 +195,6 @@ impl CellStore for MemoryCellStore {
                 }
             }
         }
-    }
-
-    fn scan_keys<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
-        self.scan_cells(collection, scan)
-            .map(|item| item.map(|(key, _)| key))
-    }
-
-    async fn contains_many<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> Result<PresenceBatch, Self::Error> {
-        Ok(self
-            .get_many(collection, section, batch)
-            .await?
-            .iter()
-            .map(|cell| cell.get().is_some())
-            .collect())
     }
 
     fn provisional_cell_at<'a>(

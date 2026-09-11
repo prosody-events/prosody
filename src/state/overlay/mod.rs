@@ -175,7 +175,12 @@ where
             self.classify_batch(collection, section, batch);
         let mut answers: CellBuffer<Option<bool>> = dirty_answers
             .into_iter()
-            .map(|answer| answer.map(|value| matches!(value, DirtyVal::Set(_))))
+            .map(|answer| {
+                answer.map(|value| match value {
+                    DirtyVal::Set(_) => true,
+                    DirtyVal::Cleared => false,
+                })
+            })
             .collect();
         for lower_batch in CoordinateBatch::chunks(untouched) {
             let lower = self

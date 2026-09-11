@@ -15,14 +15,14 @@
 //! planning command chose. That span is the whole section or one bounded
 //! window.
 
-use super::operation::read_keys_bytes;
+use super::operation::{read_keys_bytes, read_keys_presence};
 use super::{StateSession, resolve_batch, resolve_cell, sealed};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::descriptor::{
     CellCodecError, CellStateError, CellType, ContextOf, FromSession, KeyOf, ResolvedOf,
 };
 use crate::state::order_codec::OrderedKeyCodec;
-use crate::state::store::{CELL_BATCH, CellBuffer, CoordinateBatch};
+use crate::state::store::{CELL_BATCH, CellBuffer};
 use crate::state::{SHARD_FANOUT_CONCURRENCY, StateAccessError, StateName, StateType};
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -425,37 +425,6 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
             }
         }
     }
-}
-
-/// Reads key presence in aligned batches without value payloads.
-pub(super) async fn read_keys_presence<S, T>(
-    session: &S,
-    inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
-    state_type: StateType,
-    name: &StateName,
-    section: Section,
-    keys: &[KeyOf<T>],
-) -> Result<CellBuffer<bool>, StateAccessError>
-where
-    S: StateSession,
-    T: CellType,
-{
-    let coordinates = keys.iter().map(<T::Key as OrderedKeyCodec>::encode);
-    let mut presence = CellBuffer::with_capacity(keys.len());
-    for batch in CoordinateBatch::chunks(coordinates) {
-        presence.extend(
-            <S::Engine as sealed::ReadEngine<S>>::read_presence_batch(
-                session, inner, state_type, name, section, &batch,
-            )
-            .await?,
-        );
-    }
-    debug_assert_eq!(
-        presence.len(),
-        keys.len(),
-        "batch read answers every input position"
-    );
-    Ok(presence)
 }
 
 /// The managed stream fence adapter — the SOLE home of a managed stream's

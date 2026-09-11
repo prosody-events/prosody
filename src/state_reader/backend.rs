@@ -30,7 +30,7 @@ use crate::state::store::{CellBuffer, CoordinateBatch, PresenceBatch};
 use crate::timers::store::cassandra::CassandraTriggerStoreProvider;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::{Stream, TryStreamExt};
 use std::convert::Infallible;
 use std::error::Error;
 use std::future::ready;
@@ -77,7 +77,9 @@ pub trait CommittedCellSource: Clone + Send + Sync + 'static {
         &'a self,
         id: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a;
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
+        self.scan(id, scan).map_ok(|(key, _)| key)
+    }
 
     /// Reads index-aligned committed presence values.
     fn load_presence_many(
@@ -85,7 +87,16 @@ pub trait CommittedCellSource: Clone + Send + Sync + 'static {
         id: &CollectionId,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send {
+        async move {
+            Ok(self
+                .load_many(id, section, batch)
+                .await?
+                .iter()
+                .map(Option::is_some)
+                .collect())
+        }
+    }
 }
 
 impl CommittedCellSource for CassandraCellResources {
@@ -157,26 +168,6 @@ impl CommittedCellSource for MemoryCells {
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         Self::scan_committed(self, id, scan)
     }
-
-    fn scan_presence<'a>(
-        &'a self,
-        id: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
-        Self::scan_committed(self, id, scan).map(|item| item.map(|(key, _)| key))
-    }
-
-    fn load_presence_many(
-        &self,
-        id: &CollectionId,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send {
-        ready(Ok(Self::read_committed_many(self, id, section, batch)
-            .into_iter()
-            .map(|value| value.is_some())
-            .collect()))
-    }
 }
 
 #[cfg(test)]
@@ -206,26 +197,6 @@ impl CommittedCellSource for ScriptedCellSource {
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
         Self::scan_committed(self, id, scan)
-    }
-
-    fn scan_presence<'a>(
-        &'a self,
-        id: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
-        Self::scan_committed(self, id, scan).map(|item| item.map(|(key, _)| key))
-    }
-
-    fn load_presence_many(
-        &self,
-        id: &CollectionId,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send {
-        ready(
-            Self::read_committed_many(self, id, section, batch)
-                .map(|values| values.into_iter().map(|value| value.is_some()).collect()),
-        )
     }
 }
 

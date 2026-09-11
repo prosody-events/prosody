@@ -1,6 +1,6 @@
 //! The two scoped operation types and the invocation-local write journal.
 
-use super::stream::{PlanBase, read_keys_presence};
+use super::stream::PlanBase;
 use super::{
     CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, CoordinatePlan,
     RangePlan, StateSession, WritableStateSession, cell_key, encode_cell, resolve_batch,
@@ -487,20 +487,16 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         } = self;
         async move {
             let expected = pending.len();
-            let mut answers = CellBuffer::with_capacity(expected);
-            for batch in CoordinateBatch::chunks(pending) {
-                answers.extend(
-                    <S::Engine as sealed::ReadEngine<S>>::read_presence_batch(
-                        collection.session(),
-                        &mut **inner,
-                        collection.state_type(),
-                        collection.name(),
-                        section,
-                        &batch,
-                    )
-                    .await?,
-                );
-            }
+            let answers = read_coordinate_presence(
+                collection.session(),
+                &mut **inner,
+                collection.state_type(),
+                collection.name(),
+                section,
+                pending,
+                expected,
+            )
+            .await?;
             let received = answers.len();
             let mut answers = answers.into_iter();
             slots
@@ -540,15 +536,13 @@ async fn read_presence<S: StateSession>(
     section: Section,
     coordinate: Coordinate,
 ) -> Result<bool, StateAccessError> {
-    let batch = CoordinateBatch::one(coordinate);
-    let answers = <S::Engine as sealed::ReadEngine<S>>::read_presence_batch(
-        session, inner, state_type, name, section, &batch,
-    )
-    .await?;
+    let answers =
+        read_coordinate_presence(session, inner, state_type, name, section, [coordinate], 1)
+            .await?;
     answers
         .first()
         .copied()
-        .ok_or_else(|| StateAccessError::misaligned_batch(answers.len(), batch.len()))
+        .ok_or_else(|| StateAccessError::misaligned_batch(answers.len(), 1))
 }
 
 impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
@@ -698,6 +692,63 @@ async fn batched_bytes<S: StateSession>(
             Slot::Pending(_) => answers.next().flatten(),
         })
         .collect())
+}
+
+/// Reads key presence in aligned batches.
+pub(super) async fn read_keys_presence<S, T>(
+    session: &S,
+    inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
+    state_type: StateType,
+    name: &StateName,
+    section: Section,
+    keys: &[KeyOf<T>],
+) -> Result<CellBuffer<bool>, StateAccessError>
+where
+    S: StateSession,
+    T: CellType,
+{
+    let coordinates = keys.iter().map(<T::Key as OrderedKeyCodec>::encode);
+    read_coordinate_presence(
+        session,
+        inner,
+        state_type,
+        name,
+        section,
+        coordinates,
+        keys.len(),
+    )
+    .await
+}
+
+/// Reads coordinate presence in aligned batches under one operation.
+async fn read_coordinate_presence<S, I>(
+    session: &S,
+    inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
+    state_type: StateType,
+    name: &StateName,
+    section: Section,
+    coordinates: I,
+    expected: usize,
+) -> Result<CellBuffer<bool>, StateAccessError>
+where
+    S: StateSession,
+    I: IntoIterator<Item = Coordinate>,
+{
+    let mut presence = CellBuffer::with_capacity(expected);
+    for batch in CoordinateBatch::chunks(coordinates) {
+        presence.extend(
+            <S::Engine as sealed::ReadEngine<S>>::read_presence_batch(
+                session, inner, state_type, name, section, &batch,
+            )
+            .await?,
+        );
+    }
+    debug_assert_eq!(
+        presence.len(),
+        expected,
+        "batch read answers every input position"
+    );
+    Ok(presence)
 }
 
 /// Reads visible committed bytes for typed entry reads.

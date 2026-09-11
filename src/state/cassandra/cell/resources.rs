@@ -139,8 +139,9 @@ impl CassandraCellResources {
                         section,
                         coordinate: coordinate.clone(),
                     };
-                    evidence.survives(&key)
-                        && row.is_some_and(|cell| resolve_for_reader(&cell, &evidence).is_some())
+                    row.is_some_and(|cell| {
+                        evidence.survives(&key) && resolve_for_reader(&cell, &evidence).is_some()
+                    })
                 })
                 .collect();
         Ok(expand_to_input_order(&input_indices, &unique_answers))
