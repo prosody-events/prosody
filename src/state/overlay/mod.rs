@@ -47,6 +47,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt, TryStreamExt};
 use smallvec::{SmallVec, smallvec};
 use std::cmp::Ordering;
+use std::convert::identity;
 use std::sync::Arc;
 
 /// A dirty overlay over a lower committed [`CellStore`].
@@ -248,7 +249,7 @@ where
                 ..scan
             },
         );
-        self.merge_cells(collection, scan, bottom)
+        self.merge_cells(collection, scan, bottom, identity)
     }
 
     /// Matches [`Self::scan_cells`] but streams only cell presence.
@@ -266,19 +267,20 @@ where
                     ..scan
                 },
             )
-            .map_ok(|key| (key, Bytes::new()));
-        self.merge_cells(collection, scan, bottom)
-            .map_ok(|(key, _)| key)
+            .map_ok(|key| (key, ()));
+        self.merge_cells(collection, scan, bottom, drop_bytes)
+            .map_ok(|(key, ())| key)
     }
 
-    fn merge_cells<'a, S>(
+    fn merge_cells<'a, S, P: Send + 'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
         bottom: S,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a
+        project: fn(Bytes) -> P,
+    ) -> impl Stream<Item = Result<(CellKey, P), L::Error>> + Send + 'a
     where
-        S: Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a,
+        S: Stream<Item = Result<(CellKey, P), L::Error>> + Send + 'a,
     {
         let cleared = self.dirty.section_cleared(collection, scan.section);
         let mut top = self.dirty.section_snapshot(collection, scan.section);
@@ -301,7 +303,7 @@ where
                         break;
                     }
                     if let DirtyVal::Set(bytes) = value {
-                        yield (key.clone(), bytes.clone());
+                        yield (key.clone(), project(bytes.clone()));
                         yielded += 1;
                     }
                 }
@@ -333,7 +335,7 @@ where
                         let (key, value) = &top[ti];
                         ti += 1;
                         if let DirtyVal::Set(bytes) = value {
-                            yield (key.clone(), bytes.clone());
+                            yield (key.clone(), project(bytes.clone()));
                             yielded += 1;
                         }
                     }
@@ -343,7 +345,7 @@ where
                         ti += 1;
                         let _ = bottom.as_mut().next().await.transpose()?;
                         if let DirtyVal::Set(bytes) = value {
-                            yield (key.clone(), bytes.clone());
+                            yield (key.clone(), project(bytes.clone()));
                             yielded += 1;
                         }
                     }
@@ -359,6 +361,8 @@ where
         }
     }
 }
+
+fn drop_bytes(_: Bytes) {}
 
 /// Ordering of two coordinates in the scan direction: the one that should be
 /// yielded *first* compares [`Ordering::Less`].

@@ -1869,7 +1869,7 @@ fn prop_resolve_reads_each_marker_once() {
                 let mut lookup = EvidenceLookup::new(&store, &id);
                 assert_eq!(
                     lookup
-                        .resolve(Cell::Resolved(Committed::new(None)))
+                        .resolve(Cell::Resolved(Committed::<Bytes>::new(None)))
                         .await?
                         .into_inner(),
                     None

@@ -25,7 +25,7 @@ fn project_committed_is_prev_for_provisional_and_data_for_resolved() {
         Some(&data),
     );
     assert_eq!(
-        Cell::Resolved(Committed::new(None)).project_committed(),
+        Cell::Resolved(Committed::<Bytes>::new(None)).project_committed(),
         None,
     );
 
@@ -50,7 +50,7 @@ fn project_committed_is_prev_for_provisional_and_data_for_resolved() {
     // A provisional clear over an absent base (both blobs null) projects
     // absence.
     assert_eq!(
-        Cell::Provisional(ProvisionalCell::new(None, None, event())).project_committed(),
+        Cell::Provisional(ProvisionalCell::<Bytes>::new(None, None, event())).project_committed(),
         None,
     );
 }

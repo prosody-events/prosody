@@ -61,6 +61,10 @@ use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use thiserror::Error;
 
+/// Decodes one keyed row into its payload projection.
+pub(super) type CellDecoder<Row, P> =
+    fn(Row) -> Result<(CellKey, Cell<P>), CassandraCellStoreError>;
+
 /// Five-column shape produced by `SELECT data, prev_data, encoding,
 /// version, event` against `keyed_state_cell`.
 ///
@@ -247,10 +251,10 @@ pub(super) fn try_decode_keyed_cell(
     Ok((key, cell))
 }
 
-/// Decodes a presence scan row into its key and sentinel cell.
+/// Decodes a presence scan row into its key and unit payload.
 pub(super) fn try_decode_keyed_presence(
     row: FramedKeyedPresenceRow,
-) -> Result<(CellKey, Cell), CassandraCellStoreError> {
+) -> Result<(CellKey, Cell<()>), CassandraCellStoreError> {
     let (section, coordinate, data, prev, encoding, version, event) = row;
     Ok((
         clustered_cell_key(section, coordinate),
@@ -341,11 +345,11 @@ pub(super) fn try_decode_cell<B: AsRef<[u8]>>(
     }
 }
 
-/// Decodes write-time presence into a sentinel [`Cell`]. A live write time
-/// becomes `Some(Bytes::new())`; a dead write time becomes `None`. The sentinel
-/// never crosses a store boundary. Presence reads project commit evidence
-/// without durable writes. A write could replace real bytes with the sentinel.
-pub(super) fn try_decode_presence(row: RawPresenceRow) -> Result<Cell, CassandraCellStoreError> {
+/// Decodes write-time presence into a cell with a unit payload.
+/// A live write time becomes `Some(())`. A dead write time becomes `None`.
+pub(super) fn try_decode_presence(
+    row: RawPresenceRow,
+) -> Result<Cell<()>, CassandraCellStoreError> {
     let (data, prev, encoding, version, event) = row;
     validate_row_shape(
         data.as_ref(),
@@ -354,8 +358,8 @@ pub(super) fn try_decode_presence(row: RawPresenceRow) -> Result<Cell, Cassandra
         version,
         event.as_ref(),
     )?;
-    let data = data.map(|_| Bytes::new());
-    let prev = prev.map(|_| Bytes::new());
+    let data = data.map(|_| ());
+    let prev = prev.map(|_| ());
     match event {
         None => Ok(Cell::Resolved(Committed::new(data))),
         Some(raw) => Ok(Cell::Provisional(ProvisionalCell::new(

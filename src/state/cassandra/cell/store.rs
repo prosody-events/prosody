@@ -1,5 +1,6 @@
 #[cfg(test)]
 use super::CellReadCounts;
+use super::decode::CellDecoder;
 use super::{
     Arc, BatchUnit, Bytes, CassandraCellStoreError, CassandraSession, CassandraStore, Cell,
     CellAddr, CellBatchRow, CellBlobs, CellKey, CellKind, CellQueries, CellStoreError,
@@ -141,13 +142,13 @@ impl CassandraStore {
     /// The single resolving section scan, yielding each present cell's
     /// committed bytes — the body behind
     /// [`scan_cells`](super::CellStore::scan_cells).
-    pub(super) fn scan_inner<'a, Row>(
+    pub(super) fn scan_inner<'a, Row, P: Clone + Send + 'a>(
         &'a self,
         statements: ScanStatements<'a>,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-        decode_row: fn(Row) -> Result<(CellKey, Cell), CassandraCellStoreError>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), CellStoreError>> + Send + 'a
+        decode_row: CellDecoder<Row, P>,
+    ) -> impl Stream<Item = Result<(CellKey, P), CellStoreError>> + Send + 'a
     where
         Row: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata> + Send + 'a,
     {

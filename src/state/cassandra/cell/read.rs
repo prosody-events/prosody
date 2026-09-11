@@ -1,3 +1,4 @@
+use super::decode::CellDecoder;
 use super::decode::{BorrowedMarkerRow, decode_marker_row};
 use super::{
     BorrowedKeyedCellTtlRow, CassandraCellStoreError, CassandraSession, CassandraStoreError, Cell,
@@ -11,7 +12,7 @@ use scylla::deserialize::row::DeserializeRow;
 
 pub(super) type DecodedCellBatch = CellBuffer<Option<(Cell, Option<i32>)>>;
 /// Presence cells aligned with the unique coordinate batch.
-pub(super) type DecodedPresenceBatch = CellBuffer<Option<Cell>>;
+pub(super) type DecodedPresenceBatch = CellBuffer<Option<Cell<()>>>;
 
 #[derive(Clone, Copy)]
 pub(super) struct ScanStatements<'a> {
@@ -262,13 +263,13 @@ fn match_rows_to_coordinates<Row>(
 /// Pages value or presence rows within the scan bounds.
 /// Callers apply commit evidence and limits after this decoder.
 /// Each row uses [`cooperative`] so ready pages yield to other tasks.
-pub(super) fn page_cells<'a, Row>(
+pub(super) fn page_cells<'a, Row, P: Send + 'a>(
     session: &'a CassandraSession,
     statements: ScanStatements<'a>,
     collection: &'a CollectionId,
     scan: Scan<'a>,
-    decode_row: fn(Row) -> Result<(CellKey, Cell), CassandraCellStoreError>,
-) -> impl Stream<Item = Result<(CellKey, Cell), CassandraCellStoreError>> + Send + 'a
+    decode_row: CellDecoder<Row, P>,
+) -> impl Stream<Item = Result<(CellKey, Cell<P>), CassandraCellStoreError>> + Send + 'a
 where
     Row: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata> + Send + 'a,
 {

@@ -17,49 +17,39 @@
 //!
 //! # Invariants
 //!
-//! * **Prev-is-committed** — a [`ProvisionalCell::prev`] (and a
-//!   [`ProvisionalWrite`]'s `prev`) holds the committed value before the stage.
-//!   Readers use collection evidence to select this base or the staged value.
-//!   The type system enforces the committed base: [`ProvisionalWrite`] cannot
-//!   be built without a [`Committed`], and [`Committed`] is mintable only
-//!   inside `crate::state` — by the resolved read paths.
-//! * **Invalid shapes unrepresentable after decode** — a backend decoder
-//!   collapses every physical column shape into one of these two variants or a
-//!   typed corruption error; nothing downstream sees a half-built cell.
+//! `P` is the payload projection. A presence cell (`P = ()`) carries no bytes.
+//! It cannot be written back as a value.
+//! A [`ProvisionalWrite`] requires a committed byte value for its prior value.
+//! Decoders reject invalid column shapes before they construct a cell.
 
 use super::event_ref::EventRef;
 use super::marker::ReaderEvidence;
 use bytes::Bytes;
 
-/// A committed value: the authoritative bytes (or known-absence) that
-/// internal and external readers observe.
+/// A committed payload projection, or known absence.
 ///
-/// The inner constructor is `pub(in crate::state)`, so a `Committed` can be
-/// minted only by the resolved read paths inside the state module — never
-/// fabricated from an arbitrary value. That privacy is the enforcement of
-/// the prev-is-committed invariant: every [`ProvisionalWrite::new`] requires
-/// one, and the only way to get one is to have established the value is
-/// committed (a [`Cell::Resolved`] read or a [`super::resolve`] decision).
+/// `Committed<Bytes>` is mintable only inside `crate::state` by resolved read
+/// paths. [`ProvisionalWrite::new`] requires this proof for its prior value.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Committed(Option<Bytes>);
+pub struct Committed<P = Bytes>(Option<P>);
 
-impl Committed {
+impl<P> Committed<P> {
     /// Mints a committed value. Restricted to the state module so only the
     /// resolved read paths can vouch that `value` is committed.
     #[must_use]
-    pub(in crate::state) fn new(value: Option<Bytes>) -> Self {
+    pub(in crate::state) fn new(value: Option<P>) -> Self {
         Self(value)
     }
 
-    /// The committed bytes, or `None` when the value is known-absent.
+    /// The committed projection, or `None` for known absence.
     #[must_use]
-    pub fn get(&self) -> Option<&Bytes> {
+    pub fn get(&self) -> Option<&P> {
         self.0.as_ref()
     }
 
-    /// Decomposes into the committed bytes.
+    /// Returns the committed projection.
     #[must_use]
-    pub fn into_inner(self) -> Option<Bytes> {
+    pub fn into_inner(self) -> Option<P> {
         self.0
     }
 }
@@ -67,20 +57,20 @@ impl Committed {
 /// One durable cell: either resolved (committed) or provisional (an event's
 /// outcome staged over the prior committed value).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Cell {
+pub enum Cell<P = Bytes> {
     /// No event in flight; `data` is committed.
-    Resolved(Committed),
+    Resolved(Committed<P>),
 
     /// An event staged a write whose commit is not yet resolved.
-    Provisional(ProvisionalCell),
+    Provisional(ProvisionalCell<P>),
 }
 
-impl Cell {
+impl<P> Cell<P> {
     /// The pure committed-value projection: `prev` for a provisional cell,
     /// `data` for a resolved one. No oracle, no mutation — sound because of
     /// the prev-is-committed invariant.
     #[must_use]
-    pub fn project_committed(&self) -> Option<&Bytes> {
+    pub fn project_committed(&self) -> Option<&P> {
         match self {
             Self::Resolved(committed) => committed.get(),
             Self::Provisional(cell) => cell.prev(),
@@ -89,10 +79,10 @@ impl Cell {
 }
 
 /// Resolves one external read from positive evidence, without a durable write.
-pub(crate) fn resolve_for_reader<'a>(
-    cell: &'a Cell,
+pub(crate) fn resolve_for_reader<'a, P>(
+    cell: &'a Cell<P>,
     evidence: &ReaderEvidence,
-) -> Option<&'a Bytes> {
+) -> Option<&'a P> {
     match cell {
         Cell::Provisional(cell) if evidence.committed(cell.event()) => cell.data(),
         // Legacy split stages and legacy residue orphaned by admit can leave cells without a Staged
@@ -107,29 +97,29 @@ pub(crate) fn resolve_for_reader<'a>(
 /// A staged-but-unresolved cell: the event's outcome (`data`), the committed
 /// value it superseded (`prev`), and the owning event.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProvisionalCell {
-    data: Option<Bytes>,
-    prev: Option<Bytes>,
+pub struct ProvisionalCell<P = Bytes> {
+    data: Option<P>,
+    prev: Option<P>,
     event: EventRef,
 }
 
-impl ProvisionalCell {
+impl<P> ProvisionalCell<P> {
     /// Reconstructs a provisional cell from decoded columns. Restricted to
     /// the state module: only a backend decoder mints one.
     #[must_use]
-    pub(in crate::state) fn new(data: Option<Bytes>, prev: Option<Bytes>, event: EventRef) -> Self {
+    pub(in crate::state) fn new(data: Option<P>, prev: Option<P>, event: EventRef) -> Self {
         Self { data, prev, event }
     }
 
     /// The event's staged outcome.
     #[must_use]
-    pub fn data(&self) -> Option<&Bytes> {
+    pub fn data(&self) -> Option<&P> {
         self.data.as_ref()
     }
 
     /// The committed value the event superseded.
     #[must_use]
-    pub fn prev(&self) -> Option<&Bytes> {
+    pub fn prev(&self) -> Option<&P> {
         self.prev.as_ref()
     }
 
@@ -141,13 +131,13 @@ impl ProvisionalCell {
 
     /// The staged outcome, consuming the cell (commit resolution).
     #[must_use]
-    pub fn into_data(self) -> Option<Bytes> {
+    pub fn into_data(self) -> Option<P> {
         self.data
     }
 
     /// The committed base, consuming the cell (rollback / own-event base).
     #[must_use]
-    pub fn into_prev(self) -> Option<Bytes> {
+    pub fn into_prev(self) -> Option<P> {
         self.prev
     }
 }

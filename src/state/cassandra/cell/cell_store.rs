@@ -141,7 +141,7 @@ impl CellStore for CassandraStore {
             scan,
             decode::try_decode_keyed_presence,
         )
-        .map(|item| item.map(|(key, _)| key))
+        .map(|item| item.map(|(key, ())| key))
     }
 
     async fn provisional_cell_at<'a>(

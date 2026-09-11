@@ -33,7 +33,10 @@ impl<'a, S: CellStore> EvidenceLookup<'a, S> {
         }
     }
 
-    pub(crate) async fn resolve(&mut self, raw: Cell) -> Result<Committed, S::Error> {
+    pub(crate) async fn resolve<P: Clone + Send>(
+        &mut self,
+        raw: Cell<P>,
+    ) -> Result<Committed<P>, S::Error> {
         if let Cell::Resolved(committed) = raw {
             return Ok(committed);
         }

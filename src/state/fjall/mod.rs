@@ -132,11 +132,14 @@ impl Clock {
     }
 }
 
+/// Decodes a cache frame into its expiry and payload projection.
+type CellDecoder<P> = fn(Option<&[u8]>) -> Result<(u64, Read<P>), FjallCellCacheError>;
+
 /// The three-state result of a [`FjallCellCache::get`].
 #[derive(Clone, Debug)]
-pub(crate) enum CacheRead {
+pub(crate) enum CacheRead<P = Bytes> {
     /// An unexpired entry (a `Present` value or an authoritative `Absent`).
-    Hit(Committed),
+    Hit(Committed<P>),
     /// An entry exists but its stamped expiry has passed; the caller falls
     /// through to the lower store and re-publishes a fresh entry.
     Expired,
@@ -457,18 +460,8 @@ impl FjallCellCache {
         section: Section,
         batch: &CoordinateBatch,
     ) -> Result<Option<CommittedBatch>, FjallCellCacheError> {
-        let raws = self.read_batch(collection, section, batch).await?;
-        // One clock sample classifies every position; decode failures propagate.
-        let now = self.clock.now_ms();
-        let mut hits: CommittedBatch = SmallVec::new();
-        for raw in raws {
-            let (expiry, read) = codec::decode_cell(raw.as_deref())?;
-            match classify(expiry, read, now) {
-                CacheRead::Hit(committed) => hits.push(committed),
-                CacheRead::Miss | CacheRead::Expired => return Ok(None),
-            }
-        }
-        Ok(Some(hits))
+        self.probe_batch(collection, section, batch, codec::decode_cell)
+            .await
     }
 
     /// Reads batch presence without copying present payload bytes.
@@ -481,16 +474,28 @@ impl FjallCellCache {
         section: Section,
         batch: &CoordinateBatch,
     ) -> Result<Option<PresenceBatch>, FjallCellCacheError> {
+        Ok(self
+            .probe_batch(collection, section, batch, codec::decode_presence)
+            .await?
+            .map(|cells| cells.into_iter().map(|c| c.get().is_some()).collect()))
+    }
+
+    async fn probe_batch<P>(
+        &self,
+        collection: &CollectionId,
+        section: Section,
+        batch: &CoordinateBatch,
+        decode: CellDecoder<P>,
+    ) -> Result<Option<CellBuffer<Committed<P>>>, FjallCellCacheError> {
         let raws = self.read_batch(collection, section, batch).await?;
+        // One clock sample classifies every position; decode failures propagate.
         let now = self.clock.now_ms();
-        let mut hits = PresenceBatch::with_capacity(raws.len());
+        let mut hits = CellBuffer::with_capacity(raws.len());
         for raw in raws {
-            let (expiry, read) = codec::decode_presence(raw.as_deref())?;
-            match read {
-                Read::Unknown => return Ok(None),
-                _ if expired(expiry, now) => return Ok(None),
-                Read::Present(()) => hits.push(true),
-                Read::Absent => hits.push(false),
+            let (expiry, read) = decode(raw.as_deref())?;
+            match classify(expiry, read, now) {
+                CacheRead::Hit(committed) => hits.push(committed),
+                CacheRead::Miss | CacheRead::Expired => return Ok(None),
             }
         }
         Ok(Some(hits))
@@ -919,11 +924,9 @@ fn expired(expiry: u64, now: u64) -> bool {
 /// [`Expired`](CacheRead::Expired) when the stamped expiry has passed, else a
 /// [`Hit`](CacheRead::Hit) on the present value or authoritative absent tag.
 ///
-/// The single classifier shared by the point [`get`](FjallCellCache::get) and
-/// the batch [`get_batch`](FjallCellCache::get_batch) probe, so the stale-serve
-/// rules (a `Read::Unknown` is a miss; a passed expiry is never a hit) cannot
-/// drift between the two paths.
-fn classify(expiry: u64, read: Read<Bytes>, now: u64) -> CacheRead {
+/// The point [`get`](FjallCellCache::get) and batch
+/// [`probe_batch`](FjallCellCache::probe_batch) share this classifier.
+fn classify<P>(expiry: u64, read: Read<P>, now: u64) -> CacheRead<P> {
     match read {
         Read::Unknown => CacheRead::Miss,
         _ if expired(expiry, now) => CacheRead::Expired,

@@ -1,10 +1,11 @@
+use super::decode::CellDecoder;
 use super::read::fetch_marker_state;
 use super::{
-    Arc, Bytes, CassandraCellResources, CassandraCellStoreError, CassandraSession, Cell,
-    CellBuffer, CellKey, CellQueries, CollectionId, CoordinateBatch, DeserializeRow, PresenceBatch,
-    Scan, ScanStatements, Section, Stream, StreamExt, TryStreamExt, decode,
-    decode_presence_batch_rows, dedupe, expand_to_input_order, fetch_and_decode_cell,
-    fetch_cells_batch, fetch_presence_batch_result, page_cells, pin_mut, try_stream,
+    Arc, Bytes, CassandraCellResources, CassandraCellStoreError, CassandraSession, CellBuffer,
+    CellKey, CellQueries, CollectionId, CoordinateBatch, DeserializeRow, PresenceBatch, Scan,
+    ScanStatements, Section, Stream, StreamExt, TryStreamExt, decode, decode_presence_batch_rows,
+    dedupe, expand_to_input_order, fetch_and_decode_cell, fetch_cells_batch,
+    fetch_presence_batch_result, page_cells, pin_mut, try_stream,
 };
 use crate::state::cell::resolve_for_reader;
 use crate::state::marker::ReaderEvidence;
@@ -177,19 +178,19 @@ impl CassandraCellResources {
             scan,
             decode::try_decode_keyed_presence,
         )
-        .map(|item| item.map(|(key, _)| key))
+        .map(|item| item.map(|(key, ())| key))
     }
 
     /// Projects values or presence through commit evidence without durable
     /// writes. The limit counts only present results after committed
     /// clears.
-    fn scan_committed_inner<'a, Row>(
+    fn scan_committed_inner<'a, Row, P: Clone + Send + 'a>(
         &'a self,
         statements: ScanStatements<'a>,
         id: &'a CollectionId,
         scan: Scan<'a>,
-        decode_row: fn(Row) -> Result<(CellKey, Cell), CassandraCellStoreError>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), CassandraCellStoreError>> + Send + 'a
+        decode_row: CellDecoder<Row, P>,
+    ) -> impl Stream<Item = Result<(CellKey, P), CassandraCellStoreError>> + Send + 'a
     where
         Row: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata> + Send + 'a,
     {
