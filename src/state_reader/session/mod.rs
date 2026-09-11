@@ -261,8 +261,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         }
     }
 
-    /// Matches [`Self::cached_batch`] but reads only cell presence. A miss
-    /// populates nothing by design.
+    /// Uses the value cache when a read TTL applies.
     async fn cached_presence_batch(
         &self,
         selected: Option<&CollectionId>,
@@ -270,11 +269,13 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         section: Section,
         batch: &CoordinateBatch,
     ) -> Result<PresenceBatch, StateAccessError> {
-        if let Some(ttl) = self.context.def.read_cache_ttl {
-            let keys = self.batch_cache_keys(source, section, batch);
-            if let Some(hits) = self.context.cache.presence_many(&keys, ttl) {
-                return Ok(hits);
-            }
+        if self.context.def.read_cache_ttl.is_some() {
+            return Ok(self
+                .cached_batch(selected, source, section, batch)
+                .await?
+                .iter()
+                .map(Option::is_some)
+                .collect());
         }
         let id = self.resolved_id(selected, source)?;
         let buffer = self

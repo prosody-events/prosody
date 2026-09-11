@@ -20,7 +20,7 @@
 use crate::Key;
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::CellKey;
-use crate::state::store::{CellBuffer, PresenceBatch};
+use crate::state::store::CellBuffer;
 use crate::state::{StateName, StateType};
 use crate::state_reader::source::SourceId;
 use bytes::Bytes;
@@ -224,13 +224,6 @@ impl ReaderCache {
             cooperative(self.write_through(key, issued, value.clone())).await;
         }
         Ok(fresh)
-    }
-
-    /// Returns presence when every key has a fresh cached value.
-    pub(crate) fn presence_many(&self, keys: &[CacheKey], ttl: Duration) -> Option<PresenceBatch> {
-        keys.iter()
-            .map(|key| self.fresh_entry(key, ttl).map(|(_, value)| value.is_some()))
-            .collect()
     }
 
     /// Writes `value` for `key`. A fill replaces an observation issued earlier.

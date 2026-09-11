@@ -15,8 +15,8 @@ use super::reader_suite::{
     ReaderCase, ValueOp, run_reader_deque_trace, run_reader_map_trace, run_reader_value_trace,
 };
 use super::support::{
-    GROUP_A, MemoryHarness, MemoryReaderBackend, mock_count, owner_commit, owner_stage,
-    publish_source, registry_of, source_state_key, state_name, subsystem, topic,
+    GROUP_A, MemoryHarness, MemoryReaderBackend, ScriptedEnv, mock_count, owner_commit,
+    owner_stage, publish_source, registry_of, source_state_key, state_name, subsystem, topic,
 };
 use crate::Key;
 use crate::codec::JsonCodec;
@@ -203,6 +203,35 @@ async fn reader_reads_prev_in_commit_window() -> Result<()> {
         Some(Value::from(1i64)),
         "reader sees committed prev, not the in-flight provisional"
     );
+    Ok(())
+}
+
+/// A read TTL caches both present and absent map entries.
+#[tokio::test]
+async fn reader_presence_uses_read_cache() -> Result<()> {
+    let env = ScriptedEnv::new(
+        map_state::<I64KeyCodec, JsonCodec>("presence-cache").read_cache(Duration::from_secs(60)),
+    )?;
+    let key = Key::from("presence-user");
+    let tp = topic("orders");
+    let state_key = env
+        .commit(GROUP_A, tp, &key, 1, |map| async move {
+            map.set(1, Value::from(7_i32)).await?;
+            Ok(())
+        })
+        .await?;
+    env.publish(GROUP_A, tp).await;
+    let reader = env.reader_eager()?;
+    for (map_key, expected, reads) in [(1, true, 1), (2, false, 2)] {
+        for _ in 0_u8..2 {
+            assert_eq!(reader.contains_key(key.clone(), &map_key).await?, expected);
+            assert_eq!(
+                env.cells.reads(state_key.segment_id),
+                reads,
+                "each entry needs one source load"
+            );
+        }
+    }
     Ok(())
 }
 
