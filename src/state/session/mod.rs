@@ -1503,20 +1503,16 @@ where
     match registry.commit_mode_for(id.state_type(), id.name()) {
         CommitMode::ReadCommitted => {
             let id = &id;
-            // Read each surviving cell's committed base in per-section batches
-            // instead of one point read per cell. Passing `event` as
-            // `get_many` returns this event's `prev` while its
-            // provisional cell stands, so a retry re-stages over the same base
-            // (idempotent) — a `Set` cell in a cleared section keeps its
-            // committed pre-clear `prev` this way. `cooperative` adds a
-            // per-batch coop-budget yield point; `buffered` keeps full
-            // concurrency while preserving order — inert (marker/clear freezing
-            // sort internally and settle is row-disjoint), with only
-            // `≤SHARD_FANOUT_CONCURRENCY` result buffers in flight. Cells
-            // subsumed by a section clear are dropped first, keeping the batch
-            // row-disjoint (survivors == the section's present cells). Sized
-            // once to the pre-filter snapshot cardinality (the filter can only
-            // shrink it) — bounded-allocation rule.
+            // Read each surviving cell's committed base in per-section batches.
+            // `lower` is the pre-overlay store.
+            // The committed projection of a cell this event staged is its `prev`.
+            // Thus, a retry re-stages over the same base (idempotent).
+            // A `Set` cell in a cleared section keeps its committed pre-clear `prev` this
+            // way.
+
+            // `cooperative` adds a yield point per batch. `buffered` preserves order and
+            // bounds concurrency. Drop cells that a section clear subsumes.
+            // Size the buffer from the initial snapshot.
             let capacity = cells.len();
             let survivors = cells
                 .into_iter()

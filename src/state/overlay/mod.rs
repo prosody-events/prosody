@@ -235,11 +235,11 @@ where
         (answers, untouched, untouched_pos)
     }
 
-    /// Scans a range through the overlay, lazily merging the dirty leg
-    /// against `lower.scan_cells` in `coordinate` order — dirty wins on a key
-    /// tie, a dirty `Cleared` hides the lower cell. A standing dirty clear
-    /// marker hides the whole lower section: the lower leg is never issued
-    /// and the stream is the dirty snapshot filtered to the range.
+    /// Merges the dirty snapshot with the lower scan in coordinate order.
+    /// A dirty value replaces the lower value. A dirty clear hides the lower
+    /// cell. A standing dirty clear marker hides the whole lower section.
+    /// The merge drops the lower stream unpolled, so no lower query runs.
+    /// The stream then contains only the dirty snapshot filtered to the range.
     pub fn scan_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
