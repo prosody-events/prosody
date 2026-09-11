@@ -18,7 +18,6 @@ mod batch_reads;
 mod compatibility;
 mod lifecycle;
 mod properties;
-mod query_shape;
 mod repair;
 mod ttl_marker;
 
