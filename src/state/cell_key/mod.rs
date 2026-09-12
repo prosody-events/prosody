@@ -165,7 +165,7 @@ impl ScanEdge<&Coordinate> {
 }
 
 impl<T> ScanEdge<T> {
-    /// Returns the statement index for this edge.
+    /// Returns the kind of this edge.
     pub(crate) fn kind(&self) -> EdgeKind {
         match self {
             Self::Included(_) => EdgeKind::Included,

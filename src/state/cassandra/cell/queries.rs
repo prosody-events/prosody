@@ -2,6 +2,7 @@ use super::projection::CassandraProjection;
 use super::{CassandraStoreError, TABLE_KEYED_STATE_CELL, cassandra_queries};
 use crate::cassandra::macros::{format_sql, prepare_statement};
 use crate::state::cell::{Presence, Values};
+use crate::state::cell_key::{Direction, EdgeKind};
 use educe::Educe;
 use futures::try_join;
 use scylla::client::session::Session;
@@ -16,12 +17,6 @@ const BATCH: &str = "SELECT coordinate, {}, encoding, version, event, TTL(data),
 const SCAN: &str = "SELECT section, coordinate, {}, encoding, version, event FROM $keyspace.{} \
                     WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? AND kind = ? \
                     AND section = ? AND coordinate {} ? ORDER BY coordinate {}";
-/// Shapes use `[Direction][EdgeKind]` indices; both unbounded slots bind an
-/// empty anchor.
-const SCAN_SHAPES: [[(&str, &str); 3]; 2] = [
-    [(">=", "ASC"), (">", "ASC"), (">=", "ASC")],
-    [("<=", "DESC"), ("<", "DESC"), (">=", "DESC")],
-];
 
 /// Prepared cell reads, mutations, and collection evidence queries.
 #[derive(Debug)]
@@ -31,7 +26,7 @@ pub struct CellQueries {
     pub(super) presence: ReadStatements,
 }
 
-/// Read statements indexed by direction and start edge.
+/// Prepared reads for one projection.
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct ReadStatements {
@@ -40,7 +35,17 @@ pub struct ReadStatements {
     #[educe(Debug(ignore))]
     pub(super) batch: PreparedStatement,
     #[educe(Debug(ignore))]
-    pub(super) scan: [[PreparedStatement; 3]; 2],
+    pub(super) scan: ScanStatements,
+}
+
+/// Prepared scans for each direction and start edge.
+pub(super) struct ScanStatements {
+    forward_included: PreparedStatement,
+    forward_excluded: PreparedStatement,
+    forward_unbounded: PreparedStatement,
+    backward_included: PreparedStatement,
+    backward_excluded: PreparedStatement,
+    backward_unbounded: PreparedStatement,
 }
 
 impl CellQueries {
@@ -84,10 +89,6 @@ impl ReadStatements {
             )
             .await
         };
-        let [
-            [forward_included, forward_excluded, forward_unbounded],
-            [backward_included, backward_excluded, backward_unbounded],
-        ] = SCAN_SHAPES;
         let (
             forward_included,
             forward_excluded,
@@ -96,21 +97,51 @@ impl ReadStatements {
             backward_excluded,
             backward_unbounded,
         ) = try_join!(
-            prepare_scan(forward_included),
-            prepare_scan(forward_excluded),
-            prepare_scan(forward_unbounded),
-            prepare_scan(backward_included),
-            prepare_scan(backward_excluded),
-            prepare_scan(backward_unbounded)
+            prepare_scan(shape(Direction::Forward, EdgeKind::Included)),
+            prepare_scan(shape(Direction::Forward, EdgeKind::Excluded)),
+            prepare_scan(shape(Direction::Forward, EdgeKind::Unbounded)),
+            prepare_scan(shape(Direction::Backward, EdgeKind::Included)),
+            prepare_scan(shape(Direction::Backward, EdgeKind::Excluded)),
+            prepare_scan(shape(Direction::Backward, EdgeKind::Unbounded))
         )?;
         Ok(Self {
             point,
             batch,
-            scan: [
-                [forward_included, forward_excluded, forward_unbounded],
-                [backward_included, backward_excluded, backward_unbounded],
-            ],
+            scan: ScanStatements {
+                forward_included,
+                forward_excluded,
+                forward_unbounded,
+                backward_included,
+                backward_excluded,
+                backward_unbounded,
+            },
         })
+    }
+}
+
+impl ScanStatements {
+    /// Selects the prepared scan for this direction and start edge.
+    pub(super) fn select(&self, direction: Direction, start: EdgeKind) -> &PreparedStatement {
+        match (direction, start) {
+            (Direction::Forward, EdgeKind::Included) => &self.forward_included,
+            (Direction::Forward, EdgeKind::Excluded) => &self.forward_excluded,
+            (Direction::Forward, EdgeKind::Unbounded) => &self.forward_unbounded,
+            (Direction::Backward, EdgeKind::Included) => &self.backward_included,
+            (Direction::Backward, EdgeKind::Excluded) => &self.backward_excluded,
+            (Direction::Backward, EdgeKind::Unbounded) => &self.backward_unbounded,
+        }
+    }
+}
+
+/// Returns the comparator and order. Unbounded starts bind the minimum
+/// coordinate.
+const fn shape(direction: Direction, start: EdgeKind) -> (&'static str, &'static str) {
+    match (direction, start) {
+        (Direction::Forward, EdgeKind::Included | EdgeKind::Unbounded) => (">=", "ASC"),
+        (Direction::Forward, EdgeKind::Excluded) => (">", "ASC"),
+        (Direction::Backward, EdgeKind::Included) => ("<=", "DESC"),
+        (Direction::Backward, EdgeKind::Excluded) => ("<", "DESC"),
+        (Direction::Backward, EdgeKind::Unbounded) => (">=", "DESC"),
     }
 }
 

@@ -130,7 +130,7 @@ pub(super) fn page<'a, P: CassandraProjection>(
     let end = scan.end.cloned();
     try_stream! {
         let pk = Pk::of(collection);
-        let statement = &statements.scan[dir as usize][start.kind() as usize];
+        let statement = statements.scan.select(dir, start.kind());
         let pager = session
             .session()
             .execute_iter(
