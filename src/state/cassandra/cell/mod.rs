@@ -7,6 +7,7 @@ mod cell_store;
 mod decode;
 mod encoding;
 mod helpers;
+mod projection;
 mod queries;
 mod read;
 mod resources;
@@ -18,13 +19,6 @@ mod write;
 use batch::{extend_gap_units, gap_count};
 use helpers::{blob_weight, decode_provisional_batch, encode_cell_blobs, ttl_seconds_to_duration};
 pub use queries::CellQueries;
-#[cfg(test)]
-use read::decode_rows_for_coordinates;
-use read::{
-    ScanStatements, decode_batch_rows, decode_cell_ttl_result, decode_presence_batch_rows,
-    fetch_and_decode_cell, fetch_cell_rows_result, fetch_cells_batch, fetch_cells_batch_result,
-    fetch_presence_batch_result, match_batch_rows_to_coordinates, page_cells,
-};
 use rows::{
     CellAddr, CellBatchRow, CellBlobs, GapBetweenRow, GapEdgeRow, GapSectionRow, KeyRow,
     MarkerBlob, MarkerWriteRow, Pk, ResolvedRow, RowShape, StageRow,
@@ -55,11 +49,8 @@ use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateT
 use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
 use bytes::Bytes;
-use decode::{BorrowedKeyedCellTtlRow, split_keyed_cell_ttl};
 use encoding::{EncodedBlob, encode, encode_payload, select_encoding};
 use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
-use scylla::deserialize::row::DeserializeRow;
-use scylla::response::query_result::QueryRowsResult;
 use scylla::serialize::SerializationError;
 use scylla::serialize::row::{RowSerializationContext, SerializeRow};
 use scylla::serialize::writers::RowWriter;

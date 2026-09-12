@@ -142,7 +142,38 @@ pub enum ScanEdge<T> {
     Unbounded,
 }
 
+/// The start edge used to select a scan statement.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum EdgeKind {
+    /// Include the anchor coordinate.
+    Included,
+    /// Exclude the anchor coordinate.
+    Excluded,
+    /// Scan the whole section.
+    Unbounded,
+}
+
+impl ScanEdge<&Coordinate> {
+    /// Returns the anchor. An unbounded start uses the minimum coordinate.
+    pub(crate) fn anchor(&self) -> &Coordinate {
+        static EMPTY: Coordinate = Coordinate::empty();
+        match self {
+            Self::Included(coordinate) | Self::Excluded(coordinate) => coordinate,
+            Self::Unbounded => &EMPTY,
+        }
+    }
+}
+
 impl<T> ScanEdge<T> {
+    /// Returns the statement index for this edge.
+    pub(crate) fn kind(&self) -> EdgeKind {
+        match self {
+            Self::Included(_) => EdgeKind::Included,
+            Self::Excluded(_) => EdgeKind::Excluded,
+            Self::Unbounded => EdgeKind::Unbounded,
+        }
+    }
+
     /// Borrows the inner value, preserving inclusivity — the borrow half of the
     /// `as_ref().cloned()` pair, parallelling [`Bound::as_ref`].
     #[must_use]

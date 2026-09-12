@@ -21,6 +21,7 @@ use crate::state::cassandra::{
     CassandraCellResources, CassandraCellStoreError, CassandraDescriptorIdentityStore,
     CassandraPublicationStore,
 };
+use crate::state::cell::{Presence, Values};
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::descriptor_identity::DescriptorIdentityStore;
 use crate::state::identity::CollectionId;
@@ -103,7 +104,7 @@ impl CommittedCellSource for CassandraCellResources {
     type Error = CassandraCellStoreError;
 
     async fn load(&self, id: &CollectionId, cell: &CellKey) -> Result<Option<Bytes>, Self::Error> {
-        Self::read_committed(self, id, cell).await
+        Self::read_committed::<Values>(self, id, cell).await
     }
 
     async fn load_many(
@@ -112,7 +113,7 @@ impl CommittedCellSource for CassandraCellResources {
         section: Section,
         batch: &CoordinateBatch,
     ) -> Result<CellBuffer<Option<Bytes>>, Self::Error> {
-        Self::read_committed_many(self, id, section, batch).await
+        Self::read_committed_many::<Values>(self, id, section, batch).await
     }
 
     fn scan<'a>(
@@ -120,7 +121,7 @@ impl CommittedCellSource for CassandraCellResources {
         id: &'a CollectionId,
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        Self::scan_committed(self, id, scan)
+        Self::scan_committed::<Values>(self, id, scan)
     }
 
     fn scan_presence<'a>(
@@ -128,7 +129,7 @@ impl CommittedCellSource for CassandraCellResources {
         id: &'a CollectionId,
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
-        Self::scan_committed_keys(self, id, scan)
+        Self::scan_committed::<Presence>(self, id, scan).map_ok(|(key, ())| key)
     }
 
     async fn load_presence_many(
@@ -137,7 +138,13 @@ impl CommittedCellSource for CassandraCellResources {
         section: Section,
         batch: &CoordinateBatch,
     ) -> Result<PresenceBatch, Self::Error> {
-        Self::read_committed_presence_many(self, id, section, batch).await
+        Ok(
+            Self::read_committed_many::<Presence>(self, id, section, batch)
+                .await?
+                .into_iter()
+                .map(|value| value.is_some())
+                .collect(),
+        )
     }
 }
 

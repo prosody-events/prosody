@@ -1,4 +1,5 @@
 use super::*;
+use crate::state::cassandra::CassandraCellStoreError;
 use crate::state::tests::support::evidence;
 
 /// Batch-read parity over the live `CassandraStore`: the single-`IN`-query
@@ -104,7 +105,6 @@ async fn seed_prev_without_event_and_blob_without_encoding(
 #[tokio::test]
 async fn first_error_is_first_input_position() -> Result<()> {
     use super::CellCorruptReason;
-    use crate::state::cassandra::CassandraCellStoreError;
     use crate::state::resolve::ResolveCellError;
 
     init_test_logging();
@@ -152,28 +152,33 @@ async fn first_error_is_first_input_position() -> Result<()> {
     Ok(())
 }
 
-/// Sort-necessity unit test (no cluster): a SHUFFLED raw batch with two corrupt
-/// rows — low coord `0x01` = `PrevWithoutEvent`, high coord `0xFE` =
-/// `BlobWithoutEncoding`, pushed high-then-low — must surface the LOWEST
-/// coordinate's error after the borrowed batch follows input resolution order.
-/// A live test cannot prove this because `IN` returns clustering order.
+/// Shuffled rows decode in input order and report the first coordinate's error.
+/// A live query returns clustering order and cannot prove this rule.
 #[test]
 fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
+    use super::super::read::{match_rows_to_coordinates, split_point};
     use super::CellCorruptReason;
-    use super::decode::BorrowedCellTtlRow;
-    use super::decode_rows_for_coordinates;
+    use super::decode::{PointRow, decode_body};
     use super::encoding::{Encoding, encode_payload};
-    use crate::state::cassandra::CassandraCellStoreError;
+    use crate::state::cell::Values;
     use crate::state::store::CellBuffer;
     use smallvec::SmallVec;
 
     let prev_blob = encode_payload(&bytes(0xAA), Encoding::Zstd)?;
     // event = None throughout, so no RawEventRef construction is needed.
     let high_bytes = [0xBB];
-    let high: BorrowedCellTtlRow<'_> = (Some(&high_bytes), None, None, None, None, None, None);
-    let low: BorrowedCellTtlRow<'_> = (
+    let high: PointRow<Values> = (
+        Some(Bytes::copy_from_slice(&high_bytes)),
         None,
-        Some(prev_blob.as_ref()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let low: PointRow<Values> = (
+        None,
+        Some(prev_blob),
         Some(4_i16),
         Some(1_i32),
         None,
@@ -182,10 +187,17 @@ fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
     );
     let high_coordinate = Coordinate::from_bytes(vec![0xFE]);
     let low_coordinate = Coordinate::from_bytes(vec![0x01]);
-    let mut rows: CellBuffer<(&[u8], BorrowedCellTtlRow<'_>)> = SmallVec::new();
-    rows.push((high_coordinate.as_bytes(), high));
-    rows.push((low_coordinate.as_bytes(), low));
-    match decode_rows_for_coordinates(rows, &[&low_coordinate, &high_coordinate]) {
+    let mut rows: CellBuffer<(Bytes, PointRow<Values>)> = SmallVec::new();
+    rows.push((Bytes::copy_from_slice(high_coordinate.as_bytes()), high));
+    rows.push((Bytes::copy_from_slice(low_coordinate.as_bytes()), low));
+    let decoded = match_rows_to_coordinates(rows, &[&low_coordinate, &high_coordinate])
+        .into_iter()
+        .map(|row| {
+            row.map(|row| decode_body::<Values>(split_point::<Values>(row).0))
+                .transpose()
+        })
+        .collect::<Result<CellBuffer<_>, CassandraCellStoreError>>();
+    match decoded {
         Err(CassandraCellStoreError::CorruptCell(reason)) => assert_eq!(
             reason,
             CellCorruptReason::PrevWithoutEvent,
@@ -198,30 +210,45 @@ fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
 
 #[test]
 fn borrowed_batch_matches_requested_coordinates() -> Result<()> {
-    use super::decode::BorrowedCellTtlRow;
-    use super::decode_rows_for_coordinates;
+    use super::super::read::{match_rows_to_coordinates, split_point};
+    use super::decode::{PointRow, decode_body};
+    use crate::state::cell::Values;
     use crate::state::store::CellBuffer;
     use smallvec::smallvec;
 
     let low_data = [0x11];
     let high_data = [0x33];
-    let row = |data| -> BorrowedCellTtlRow<'_> {
-        (Some(data), None, Some(1_i16), Some(1_i32), None, None, None)
+    let row = |data: &[u8]| -> PointRow<Values> {
+        (
+            Some(Bytes::copy_from_slice(data)),
+            None,
+            Some(1_i16),
+            Some(1_i32),
+            None,
+            None,
+            None,
+        )
     };
     let low = Coordinate::from_bytes(vec![1]);
     let absent = Coordinate::from_bytes(vec![2]);
     let high = Coordinate::from_bytes(vec![3]);
     let rows: CellBuffer<_> = smallvec![
-        (high.as_bytes(), row(&high_data)),
-        (low.as_bytes(), row(&low_data)),
+        (Bytes::copy_from_slice(high.as_bytes()), row(&high_data)),
+        (Bytes::copy_from_slice(low.as_bytes()), row(&low_data)),
     ];
 
-    let decoded = decode_rows_for_coordinates(rows, &[&low, &absent, &high])?;
+    let decoded = match_rows_to_coordinates(rows, &[&low, &absent, &high])
+        .into_iter()
+        .map(|row| {
+            row.map(|row| decode_body::<Values>(split_point::<Values>(row).0))
+                .transpose()
+        })
+        .collect::<Result<CellBuffer<_>, CassandraCellStoreError>>()?;
     assert_eq!(decoded.len(), 3);
     assert_eq!(
         decoded[0]
             .as_ref()
-            .and_then(|(cell, _)| cell.project_committed())
+            .and_then(|cell| cell.project_committed())
             .map(Bytes::as_ref),
         Some(&low_data[..])
     );
@@ -229,7 +256,7 @@ fn borrowed_batch_matches_requested_coordinates() -> Result<()> {
     assert_eq!(
         decoded[2]
             .as_ref()
-            .and_then(|(cell, _)| cell.project_committed())
+            .and_then(|cell| cell.project_committed())
             .map(Bytes::as_ref),
         Some(&high_data[..])
     );
@@ -258,7 +285,6 @@ fn provisional_batch_coordinates_are_sorted_and_distinct() -> Result<()> {
 #[tokio::test]
 async fn resolved_corrupt_rows_fail_before_blob_decode() -> Result<()> {
     use super::CellCorruptReason;
-    use crate::state::cassandra::CassandraCellStoreError;
     use crate::state::resolve::ResolveCellError;
 
     init_test_logging();

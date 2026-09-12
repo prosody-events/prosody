@@ -26,8 +26,7 @@ use super::decode::try_decode_marker;
 use super::{
     CassandraStore, CellAddr, CellBatchRow, CellBlobs, CellCorruptReason, CellKind, CellQueries,
     KeyRow, MarkerBlob, MarkerWriteRow, Pk, ResolvedRow, RowShape, StageRow, blob_weight,
-    decode_rows_for_coordinates, encode_cell_blobs, sorted_unique_coordinates,
-    ttl_seconds_to_duration,
+    encode_cell_blobs, sorted_unique_coordinates, ttl_seconds_to_duration,
 };
 use super::{decode, encoding};
 use crate::cassandra::{BatchUnit, CassandraStore as CassandraSession};

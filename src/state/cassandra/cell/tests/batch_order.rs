@@ -119,7 +119,7 @@ async fn markerless_provisional_reads_its_committed_base() -> Result<()> {
     let unit = [BatchUnit::new(
         blob_weight(&blob),
         smallvec![CellBatchRow {
-            statement: &fx.queries.write_provisional,
+            statement: &fx.queries.cells.write_provisional,
             row: RowShape::Stage(StageRow {
                 ttl: 0,
                 data: blob.data(),

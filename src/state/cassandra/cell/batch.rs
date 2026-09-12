@@ -28,7 +28,7 @@ pub(super) fn extend_gap_units<'u>(
             units.push(BatchUnit::new(
                 PER_STATEMENT_OVERHEAD,
                 smallvec![CellBatchRow {
-                    statement: &queries.gap_section,
+                    statement: &queries.cells.gap_section,
                     row: RowShape::GapSection(GapSectionRow { pk, section }),
                 }],
             ));
@@ -37,7 +37,7 @@ pub(super) fn extend_gap_units<'u>(
         units.push(BatchUnit::new(
             first.as_bytes().len() as u64 + PER_STATEMENT_OVERHEAD,
             smallvec![CellBatchRow {
-                statement: &queries.gap_below,
+                statement: &queries.cells.gap_below,
                 row: RowShape::GapEdge(GapEdgeRow {
                     pk,
                     section,
@@ -50,7 +50,7 @@ pub(super) fn extend_gap_units<'u>(
                 (pair[0].as_bytes().len() + pair[1].as_bytes().len()) as u64
                     + PER_STATEMENT_OVERHEAD,
                 smallvec![CellBatchRow {
-                    statement: &queries.gap_between,
+                    statement: &queries.cells.gap_between,
                     row: RowShape::GapBetween(GapBetweenRow {
                         pk,
                         section,
@@ -63,7 +63,7 @@ pub(super) fn extend_gap_units<'u>(
         units.push(BatchUnit::new(
             last.as_bytes().len() as u64 + PER_STATEMENT_OVERHEAD,
             smallvec![CellBatchRow {
-                statement: &queries.gap_above,
+                statement: &queries.cells.gap_above,
                 row: RowShape::GapEdge(GapEdgeRow {
                     pk,
                     section,
@@ -84,7 +84,7 @@ pub(super) fn marker_delete_unit<'u>(
     BatchUnit::new(
         PER_STATEMENT_OVERHEAD,
         smallvec![CellBatchRow {
-            statement: &queries.marker_delete,
+            statement: &queries.cells.marker_delete,
             row: RowShape::Key(KeyRow {
                 kind: CellKind::Marker,
                 addr: CellAddr::marker(pk, MarkerRow::Staged),

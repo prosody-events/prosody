@@ -1,90 +1,29 @@
-use super::decode::CellDecoder;
-use super::decode::{BorrowedMarkerRow, decode_marker_row};
-use super::{
-    BorrowedKeyedCellTtlRow, CassandraCellStoreError, CassandraSession, CassandraStoreError, Cell,
-    CellBuffer, CellKey, CellKind, CellQueries, CollectionId, Coordinate, Direction, Pk,
-    PreparedStatement, QueryRowsResult, Scan, ScanEdge, Section, SmallVec, Stream, TryStreamExt,
-    cooperative, decode, pin_mut, split_keyed_cell_ttl, try_stream,
+use super::decode::{
+    BatchRow, Body, BorrowedMarkerRow, PointRow, ScanRow, blob_ttl, decode_body, decode_marker_row,
 };
-use crate::state::cell::{Presence, Projection};
+use super::projection::CassandraProjection;
+use super::queries::ReadStatements;
+use super::{
+    CassandraCellStoreError, CassandraSession, CassandraStoreError, Cell, CellBuffer, CellKey,
+    CellKind, CellQueries, CollectionId, Coordinate, Direction, Pk, Scan, ScanEdge, Section,
+    Stream, TryStreamExt, cooperative, pin_mut, try_stream,
+};
 use crate::state::marker::MarkerState;
 use crate::timers::duration::CompactDuration;
-use scylla::deserialize::row::DeserializeRow;
+use bytes::Bytes;
 
-pub(super) type DecodedCellBatch = CellBuffer<Option<(Cell, Option<i32>)>>;
-/// Presence cells aligned with the unique coordinate batch.
-pub(super) type DecodedPresenceBatch = CellBuffer<Option<Cell<Presence>>>;
-
-#[derive(Clone, Copy)]
-pub(super) struct ScanStatements<'a> {
-    forward_incl: &'a PreparedStatement,
-    forward_excl: &'a PreparedStatement,
-    backward_incl: &'a PreparedStatement,
-    backward_excl: &'a PreparedStatement,
-    forward_all: &'a PreparedStatement,
-    backward_all: &'a PreparedStatement,
-}
-
-impl<'a> ScanStatements<'a> {
-    pub(super) fn values(queries: &'a CellQueries) -> Self {
-        Self {
-            forward_incl: &queries.scan_forward_incl,
-            forward_excl: &queries.scan_forward_excl,
-            backward_incl: &queries.scan_backward_incl,
-            backward_excl: &queries.scan_backward_excl,
-            forward_all: &queries.scan_forward_all,
-            backward_all: &queries.scan_backward_all,
-        }
-    }
-
-    /// Selects the six payload-free presence scan statements.
-    pub(super) fn presence(queries: &'a CellQueries) -> Self {
-        Self {
-            forward_incl: &queries.scan_presence_forward_incl,
-            forward_excl: &queries.scan_presence_forward_excl,
-            backward_incl: &queries.scan_presence_backward_incl,
-            backward_excl: &queries.scan_presence_backward_excl,
-            forward_all: &queries.scan_presence_forward_all,
-            backward_all: &queries.scan_presence_backward_all,
-        }
-    }
-}
-
-pub(super) async fn fetch_and_decode_cell(
+/// Fetches one projected cell with its durable TTL columns.
+pub(super) async fn fetch_point<P: CassandraProjection>(
     session: &CassandraSession,
-    statement: &PreparedStatement,
+    statements: &ReadStatements,
     id: &CollectionId,
     cell: &CellKey,
-) -> Result<Option<Cell>, CassandraCellStoreError> {
-    let result = fetch_cell_rows_result(session, statement, id, cell).await?;
-    result
-        .maybe_first_row::<decode::BorrowedRawCellRow<'_>>()
-        .map_err(CassandraStoreError::from)?
-        .map(decode::try_decode_cell)
-        .transpose()
-}
-
-pub(super) fn decode_cell_ttl_result(
-    result: &QueryRowsResult,
-) -> Result<Option<(Cell, Option<i32>)>, CassandraCellStoreError> {
-    result
-        .maybe_first_row::<decode::BorrowedCellTtlRow<'_>>()
-        .map_err(CassandraStoreError::from)?
-        .map(decode::try_decode_cell_ttl)
-        .transpose()
-}
-
-pub(super) async fn fetch_cell_rows_result(
-    session: &CassandraSession,
-    statement: &PreparedStatement,
-    id: &CollectionId,
-    cell: &CellKey,
-) -> Result<QueryRowsResult, CassandraCellStoreError> {
+) -> Result<Option<PointRow<P>>, CassandraCellStoreError> {
     let pk = Pk::of(id);
-    let result = session
+    Ok(session
         .session()
         .execute_unpaged(
-            statement,
+            &statements.point,
             (
                 pk.segment_id,
                 pk.key,
@@ -96,161 +35,64 @@ pub(super) async fn fetch_cell_rows_result(
             ),
         )
         .await
+        .map_err(CassandraStoreError::from)?
+        .into_rows_result()
+        .map_err(CassandraStoreError::from)?
+        .maybe_first_row::<PointRow<P>>()
+        .map_err(CassandraStoreError::from)?)
+}
+
+/// Fetches one batch and preserves input order before semantic decode.
+pub(super) async fn fetch_batch<P: CassandraProjection>(
+    session: &CassandraSession,
+    statements: &ReadStatements,
+    id: &CollectionId,
+    section: Section,
+    coordinates: &[&Coordinate],
+) -> Result<CellBuffer<Option<PointRow<P>>>, CassandraCellStoreError> {
+    let pk = Pk::of(id);
+    let result = session
+        .session()
+        .execute_unpaged(
+            &statements.batch,
+            (
+                pk.segment_id,
+                pk.key,
+                pk.state_type,
+                pk.name,
+                CellKind::Cell,
+                i8::from(section),
+                coordinates,
+            ),
+        )
+        .await
+        .map_err(CassandraStoreError::from)?
+        .into_rows_result()
         .map_err(CassandraStoreError::from)?;
-    result
-        .into_rows_result()
-        .map_err(CassandraStoreError::from)
-        .map_err(CassandraCellStoreError::from)
-}
-
-/// Reads and decodes one bounded `IN` query in input resolution order.
-/// The result owns no reference to the Scylla response frame.
-pub(super) async fn fetch_cells_batch(
-    session: &CassandraSession,
-    queries: &CellQueries,
-    id: &CollectionId,
-    section: Section,
-    unique_coordinates: &[&Coordinate],
-) -> Result<DecodedCellBatch, CassandraCellStoreError> {
-    let result =
-        fetch_cells_batch_result(session, queries, id, section, unique_coordinates).await?;
-    decode_batch_rows(&result, unique_coordinates)
-}
-
-pub(super) async fn fetch_cells_batch_result(
-    session: &CassandraSession,
-    queries: &CellQueries,
-    id: &CollectionId,
-    section: Section,
-    unique_coordinates: &[&Coordinate],
-) -> Result<QueryRowsResult, CassandraCellStoreError> {
-    let pk = Pk::of(id);
-    session
-        .session()
-        .execute_unpaged(
-            &queries.read_cells_batch,
-            (
-                pk.segment_id,
-                pk.key,
-                pk.state_type,
-                pk.name,
-                CellKind::Cell,
-                i8::from(section),
-                unique_coordinates,
-            ),
-        )
-        .await
-        .map_err(CassandraStoreError::from)?
-        .into_rows_result()
-        .map_err(CassandraStoreError::from)
-        .map_err(CassandraCellStoreError::from)
-}
-
-/// Reads one bounded payload-free presence batch.
-pub(super) async fn fetch_presence_batch_result(
-    session: &CassandraSession,
-    queries: &CellQueries,
-    id: &CollectionId,
-    section: Section,
-    unique_coordinates: &[&Coordinate],
-) -> Result<QueryRowsResult, CassandraCellStoreError> {
-    let pk = Pk::of(id);
-    session
-        .session()
-        .execute_unpaged(
-            &queries.read_presence_batch,
-            (
-                pk.segment_id,
-                pk.key,
-                pk.state_type,
-                pk.name,
-                CellKind::Cell,
-                i8::from(section),
-                unique_coordinates,
-            ),
-        )
-        .await
-        .map_err(CassandraStoreError::from)?
-        .into_rows_result()
-        .map_err(CassandraStoreError::from)
-        .map_err(CassandraCellStoreError::from)
-}
-
-/// Decodes and aligns one payload-free presence batch.
-pub(super) fn decode_presence_batch_rows(
-    result: &QueryRowsResult,
-    coordinates: &[&Coordinate],
-) -> Result<DecodedPresenceBatch, CassandraCellStoreError> {
-    let mut rows = SmallVec::with_capacity(coordinates.len());
+    let mut rows = CellBuffer::with_capacity(coordinates.len());
     for row in result
-        .rows::<decode::BorrowedKeyedPresenceRow<'_>>()
+        .rows::<BatchRow<P>>()
         .map_err(CassandraStoreError::from)?
     {
-        let (coordinate, data, prev, encoding, version, event) =
+        let (coordinate, data, prev, encoding, version, event, ttl_data, ttl_prev) =
             row.map_err(CassandraStoreError::from)?;
-        rows.push((coordinate, (data, prev, encoding, version, event)));
-    }
-    match_rows_to_coordinates(rows, coordinates)
-        .into_iter()
-        .map(|row| row.map(decode::try_decode_presence).transpose())
-        .collect()
-}
-
-pub(super) fn decode_batch_rows(
-    result: &QueryRowsResult,
-    unique_coordinates: &[&Coordinate],
-) -> Result<DecodedCellBatch, CassandraCellStoreError> {
-    decode_optional_rows(match_batch_rows_to_coordinates(result, unique_coordinates)?)
-}
-
-#[cfg(test)]
-pub(super) fn decode_rows_for_coordinates<'frame>(
-    rows: CellBuffer<(&'frame [u8], decode::BorrowedCellTtlRow<'frame>)>,
-    coordinates: &[&Coordinate],
-) -> Result<DecodedCellBatch, CassandraCellStoreError> {
-    decode_optional_rows(match_rows_to_coordinates(rows, coordinates))
-}
-
-fn decode_optional_rows(
-    rows: CellBuffer<Option<decode::BorrowedCellTtlRow<'_>>>,
-) -> Result<DecodedCellBatch, CassandraCellStoreError> {
-    rows.into_iter()
-        .map(|row| row.map(decode::try_decode_cell_ttl).transpose())
-        .collect()
-}
-
-/// Matches each requested coordinate to its borrowed batch row.
-pub(super) fn match_batch_rows_to_coordinates<'frame>(
-    result: &'frame QueryRowsResult,
-    coordinates: &[&Coordinate],
-) -> Result<CellBuffer<Option<decode::BorrowedCellTtlRow<'frame>>>, CassandraCellStoreError> {
-    // At most one row per unique coordinate, so size once at the IN-list upper
-    // bound rather than growing an inline buffer up to `CELL_BATCH`.
-    let mut rows: CellBuffer<(&[u8], decode::BorrowedCellTtlRow<'_>)> =
-        SmallVec::with_capacity(coordinates.len());
-    for row in result
-        .rows::<BorrowedKeyedCellTtlRow<'_>>()
-        .map_err(CassandraStoreError::from)?
-    {
-        rows.push(split_keyed_cell_ttl(
-            row.map_err(CassandraStoreError::from)?,
+        rows.push((
+            coordinate,
+            (data, prev, encoding, version, event, ttl_data, ttl_prev),
         ));
     }
-
     Ok(match_rows_to_coordinates(rows, coordinates))
 }
 
-fn match_rows_to_coordinates<Row>(
-    mut rows: CellBuffer<(&[u8], Row)>,
+pub(super) fn match_rows_to_coordinates<Row>(
+    mut rows: CellBuffer<(Bytes, Row)>,
     coordinates: &[&Coordinate],
 ) -> CellBuffer<Option<Row>> {
-    // Match the result here so every caller receives one slot per requested
-    // coordinate. Cassandra can reorder an `IN` result and omit absent rows.
     let mut out = CellBuffer::with_capacity(coordinates.len());
     for &coordinate in coordinates {
         let Some(pos) = rows
             .iter()
-            .position(|(found, _)| *found == coordinate.as_bytes())
+            .position(|(found, _)| found.as_ref() == coordinate.as_bytes())
         else {
             out.push(None);
             continue;
@@ -261,71 +103,40 @@ fn match_rows_to_coordinates<Row>(
     out
 }
 
-/// Pages value or presence rows within the scan bounds.
-/// Callers apply commit evidence and limits after this decoder.
-/// Each row uses [`cooperative`] so ready pages yield to other tasks.
-pub(super) fn page_cells<'a, Row, P: Projection>(
+/// Separates a point row's body and co-expiry before semantic decode.
+pub(super) fn split_point<P: CassandraProjection>(row: PointRow<P>) -> (Body<P>, Option<i32>) {
+    let (data, prev, encoding, version, event, ttl_data, ttl_prev) = row;
+    (
+        (data, prev, encoding, version, event),
+        blob_ttl(ttl_data, ttl_prev),
+    )
+}
+
+/// Pages projected rows within the scan bounds.
+/// Callers apply commit evidence and limits after decode.
+pub(super) fn page<'a, P: CassandraProjection>(
     session: &'a CassandraSession,
-    statements: ScanStatements<'a>,
+    statements: &'a ReadStatements,
     collection: &'a CollectionId,
     scan: Scan<'a>,
-    decode_row: CellDecoder<Row, P>,
-) -> impl Stream<Item = Result<(CellKey, Cell<P>), CassandraCellStoreError>> + Send + 'a
-where
-    Row: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata> + Send + 'a,
-{
+) -> impl Stream<Item = Result<(CellKey, Cell<P>), CassandraCellStoreError>> + Send + 'a {
     let section = i8::from(scan.section);
     let dir = scan.dir;
-    // Both edges are held as owned `Coordinate`s across the stream's awaits —
-    // O(1) refcount bumps (`Coordinate` is `Bytes`), never byte copies.
     let start = scan.start.cloned();
     let end = scan.end.cloned();
     try_stream! {
         let pk = Pk::of(collection);
-        // The section-prefix bind values every scan statement shares.
-        let prefix = (pk.segment_id, pk.key, pk.state_type, pk.name, CellKind::Cell, section);
-        let (seg, key, st, name, cell_kind, sect) = prefix;
-        // Statement selection and binding are one match. A bounded arm appends
-        // the anchor coordinate for a 7-tuple. An `Unbounded` arm binds only the
-        // section prefix for a 6-tuple. Those are distinct Rust types, so the
-        // pager must open inside each arm.
-        let pager = match (dir, start.as_ref()) {
-            (Direction::Forward, ScanEdge::Included(c)) => {
-                session.session().execute_iter(statements.forward_incl.clone(),
-                    (seg, key, st, name, cell_kind, sect, c)).await
-            }
-            (Direction::Forward, ScanEdge::Excluded(c)) => {
-                session.session().execute_iter(statements.forward_excl.clone(),
-                    (seg, key, st, name, cell_kind, sect, c)).await
-            }
-            (Direction::Backward, ScanEdge::Included(c)) => {
-                session.session().execute_iter(statements.backward_incl.clone(),
-                    (seg, key, st, name, cell_kind, sect, c)).await
-            }
-            (Direction::Backward, ScanEdge::Excluded(c)) => {
-                session.session().execute_iter(statements.backward_excl.clone(),
-                    (seg, key, st, name, cell_kind, sect, c)).await
-            }
-            (Direction::Forward, ScanEdge::Unbounded) => {
-                session.session().execute_iter(statements.forward_all.clone(), prefix).await
-            }
-            (Direction::Backward, ScanEdge::Unbounded) => {
-                session.session().execute_iter(statements.backward_all.clone(), prefix).await
-            }
-        };
-        let stream = pager
-            .map_err(CassandraStoreError::from)?
-            .rows_stream::<Row>()
-            .map_err(CassandraStoreError::from)?;
+        let statement = &statements.scan[dir as usize][start.kind() as usize];
+        let pager = session.session().execute_iter(statement.clone(),
+            (pk.segment_id, pk.key, pk.state_type, pk.name, CellKind::Cell, section, start.as_ref().anchor()),
+        ).await.map_err(CassandraStoreError::from)?;
+        let stream = pager.rows_stream::<ScanRow<P>>().map_err(CassandraStoreError::from)?;
         pin_mut!(stream);
-        while let Some(row) = cooperative(stream.try_next())
-            .await
-            .map_err(CassandraStoreError::from)?
-        {
-            let (key, cell) = decode_row(row)?;
-            if past_end(dir, &key, end.as_ref()) {
-                break;
-            }
+        while let Some(row) = cooperative(stream.try_next()).await.map_err(CassandraStoreError::from)? {
+            let (section, coordinate, data, prev, encoding, version, event) = row;
+            let key = CellKey { section: Section::new(section), coordinate: Coordinate::from_bytes(coordinate) };
+            let cell = decode_body::<P>((data, prev, encoding, version, event))?;
+            if past_end(dir, &key, end.as_ref()) { break; }
             yield (key, cell);
         }
     }
@@ -357,7 +168,7 @@ pub(super) async fn fetch_marker_state(
     let result = session
         .session()
         .execute_unpaged(
-            &queries.marker_state,
+            &queries.cells.marker_state,
             (
                 pk.segment_id,
                 pk.key,

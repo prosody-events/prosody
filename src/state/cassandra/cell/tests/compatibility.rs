@@ -376,7 +376,7 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.write_provisional,
+                statement: &q.cells.write_provisional,
                 row: RowShape::Stage(StageRow {
                     ttl: 0,
                     data: blob_a.data(),
@@ -391,7 +391,7 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.mark_resolved,
+                statement: &q.cells.mark_resolved,
                 row: RowShape::Key(KeyRow {
                     kind: CellKind::Cell,
                     addr: addr_b,
@@ -401,7 +401,7 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.write_resolved,
+                statement: &q.cells.write_resolved,
                 row: RowShape::Resolved(ResolvedRow {
                     ttl: 0,
                     data: blob_c.data(),
@@ -414,7 +414,7 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.cell_delete,
+                statement: &q.cells.cell_delete,
                 row: RowShape::Key(KeyRow {
                     kind: CellKind::Cell,
                     addr: addr_d,
@@ -424,7 +424,7 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.marker_write,
+                statement: &q.cells.marker_write,
                 row: RowShape::MarkerWrite(MarkerWriteRow {
                     ttl: 0,
                     payload: marker_blob.payload.as_ref(),

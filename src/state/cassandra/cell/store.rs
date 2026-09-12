@@ -1,18 +1,18 @@
 #[cfg(test)]
 use super::CellReadCounts;
-use super::decode::CellDecoder;
+use super::decode::decode_body;
+use super::projection::CassandraProjection;
+use super::read::{fetch_batch, fetch_point, page, split_point};
 use super::{
-    Arc, BatchUnit, Bytes, CassandraCellStoreError, CassandraSession, CassandraStore, Cell,
-    CellAddr, CellBatchRow, CellBlobs, CellKey, CellKind, CellQueries, CellStoreError,
-    CollectionDefRegistry, CollectionId, Coordinate, DeserializeRow, EventMarker, EvidenceLookup,
-    KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, Pk, PreparedStatement,
-    QueryRowsResult, ResolveCellError, ResolvedRow, RowShape, SHARD_FANOUT_CONCURRENCY, Scan,
-    ScanStatements, Section, Stream, TryStreamExt, blob_weight, encode, encode_marker_payload,
-    fetch_and_decode_cell, fetch_cell_rows_result, fetch_cells_batch_result, page_cells, pin_mut,
-    smallvec, try_stream,
+    Arc, BatchUnit, Bytes, CacheBatch, CassandraCellStoreError, CassandraSession, CassandraStore,
+    Cell, CellAddr, CellBatchRow, CellBlobs, CellKey, CellKind, CellQueries, CellStoreError,
+    CollectionDefRegistry, CollectionId, Committed, CoordinateBatch, EventMarker, EvidenceLookup,
+    KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, Pk, ResolveCellError, ResolvedRow,
+    RowShape, SHARD_FANOUT_CONCURRENCY, Scan, Section, Stream, TryStreamExt, blob_weight, dedupe,
+    encode, encode_marker_payload, expand_to_input_order, pin_mut, smallvec, try_stream,
+    ttl_seconds_to_duration,
 };
-
-use crate::state::cell::Projection;
+use crate::state::store_types::Durable;
 
 impl CassandraStore {
     /// Creates a Cassandra cell store for one partition assignment.
@@ -40,38 +40,62 @@ impl CassandraStore {
         self.counters.clone()
     }
 
-    pub(super) async fn point_read_cell(
+    /// Reads one committed projection and its remaining durable TTL.
+    pub(super) async fn read<P: CassandraProjection>(
         &self,
-        statement: &PreparedStatement,
         id: &CollectionId,
         cell: &CellKey,
-    ) -> Result<Option<Cell>, CassandraCellStoreError> {
-        fetch_and_decode_cell(&self.session, statement, id, cell).await
+    ) -> Result<Durable<P>, CellStoreError> {
+        let row = fetch_point::<P>(&self.session, P::statements(&self.queries), id, cell)
+            .await
+            .map_err(ResolveCellError::Store)?;
+        let (raw, ttl) = match row {
+            Some(row) => {
+                let (body, ttl) = split_point::<P>(row);
+                (
+                    decode_body::<P>(body).map_err(ResolveCellError::Store)?,
+                    ttl,
+                )
+            }
+            None => (Cell::Resolved(Committed::new(None)), None),
+        };
+        let committed = EvidenceLookup::new(self, id).resolve(raw).await?;
+        Ok((committed, ttl_seconds_to_duration(ttl)))
     }
 
-    pub(super) async fn point_read_cell_result(
-        &self,
-        statement: &PreparedStatement,
-        id: &CollectionId,
-        cell: &CellKey,
-    ) -> Result<QueryRowsResult, CassandraCellStoreError> {
-        fetch_cell_rows_result(&self.session, statement, id, cell).await
-    }
-
-    pub(super) async fn batch_read_result(
+    /// Resolves each unique coordinate once and expands answers to input order.
+    pub(super) async fn read_many<P: CassandraProjection>(
         &self,
         id: &CollectionId,
         section: Section,
-        unique_coordinates: &[&Coordinate],
-    ) -> Result<QueryRowsResult, CassandraCellStoreError> {
-        fetch_cells_batch_result(
+        batch: &CoordinateBatch,
+    ) -> Result<CacheBatch<P>, CellStoreError> {
+        let (coordinates, indices) = dedupe(batch);
+        let rows = fetch_batch::<P>(
             &self.session,
-            &self.queries,
+            P::statements(&self.queries),
             id,
             section,
-            unique_coordinates,
+            &coordinates,
         )
         .await
+        .map_err(ResolveCellError::Store)?;
+        let mut answers = CacheBatch::<P>::with_capacity(coordinates.len());
+        let mut lookup = EvidenceLookup::new(self, id);
+        for row in rows {
+            let (raw, ttl) = match row {
+                Some(row) => {
+                    let (body, ttl) = split_point::<P>(row);
+                    (
+                        decode_body::<P>(body).map_err(ResolveCellError::Store)?,
+                        ttl,
+                    )
+                }
+                None => (Cell::Resolved(Committed::new(None)), None),
+            };
+            answers.push((lookup.resolve(raw).await?, ttl_seconds_to_duration(ttl)));
+        }
+        Ok(expand_to_input_order(&indices, &answers))
     }
 
     /// Executes same-partition `UNLOGGED BATCH` statements for cell mutations.
@@ -120,7 +144,7 @@ impl CassandraStore {
             let addr = CellAddr::new(pk, cell);
             let row = match blob.data() {
                 Some(_) => CellBatchRow {
-                    statement: &self.queries.write_resolved,
+                    statement: &self.queries.cells.write_resolved,
                     row: RowShape::Resolved(ResolvedRow {
                         ttl,
                         data: blob.data(),
@@ -130,7 +154,7 @@ impl CassandraStore {
                     }),
                 },
                 None => CellBatchRow {
-                    statement: &self.queries.cell_delete,
+                    statement: &self.queries.cells.cell_delete,
                     row: RowShape::Key(KeyRow {
                         kind: CellKind::Cell,
                         addr,
@@ -144,28 +168,14 @@ impl CassandraStore {
     /// The single resolving section scan, yielding each present cell's
     /// committed bytes — the body behind
     /// [`scan_cells`](super::CellStore::scan_cells).
-    pub(super) fn scan_inner<'a, Row, P: Projection>(
+    pub(super) fn scan_inner<'a, P: CassandraProjection>(
         &'a self,
-        statements: ScanStatements<'a>,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-        decode_row: CellDecoder<Row, P>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), CellStoreError>> + Send + 'a
-    where
-        Row: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata> + Send + 'a,
-    {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), CellStoreError>> + Send + 'a {
         let limit = scan.limit;
         try_stream! {
-            // The shared paging core (`page_cells`): it selects the per-bound
-            // statement, decodes each row, and applies `past_end`. It applies
-            // no resolution and no limit.
-            let pages = page_cells(
-                &self.session,
-                statements,
-                collection,
-                scan,
-                decode_row,
-            );
+            let pages = page::<P>(&self.session, P::statements(&self.queries), collection, scan);
             pin_mut!(pages);
 
             let mut lookup = EvidenceLookup::new(self, collection);
