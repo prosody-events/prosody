@@ -10,9 +10,8 @@
 //! [`prop_cached_is_transparent`] compares cached and uncached stores.
 //! Both stores must return the same result after every generated operation.
 
-use crate::state::cell::{Presence, Values};
-use crate::state::store::CommittedBatch;
-use crate::state::store::{CellBackend, CellRead, Durable};
+use crate::state::cell::{CacheEntry, Presence, Projection, Read, Values};
+use crate::state::store::{CacheBatch, CellBackend, CellRead, CommittedBatch, Durable};
 
 use super::super::cached::{Cached, DELETE_RETRY_BUDGET};
 use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
@@ -106,6 +105,20 @@ impl<S: CellRead<P>, P: CountProjection> CellRead<P> for TtlAwareCellStore<S> {
             let (committed, _) = CellRead::<P>::read(&self.inner, collection, cell).await?;
             Ok((committed, self.remaining()))
         }
+    }
+
+    async fn read_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+    ) -> Result<CacheBatch<P>, Self::Error> {
+        let mut cells = CellRead::<P>::read_many(&self.inner, collection, section, batch).await?;
+        let remaining = self.remaining();
+        for (_, ttl) in &mut cells {
+            *ttl = remaining;
+        }
+        Ok(cells)
     }
 
     fn scan<'a>(
@@ -369,14 +382,18 @@ fn expired_entry_reads_as_miss_and_refills() -> Result<()> {
         lower
             .write_resolved(&cref, &[(cell_at(8), Some(bytes(8)))], &[])
             .await?;
-        CellRead::<Presence>::read_many(&cached, &id, SECTION, &batch_of([8, 9])?)
-            .await
-            .map(|cells| {
-                cells
-                    .into_iter()
-                    .map(|(committed, _)| committed.get().is_some())
-                    .collect::<PresenceBatch>()
-            })?;
+        lower.reset();
+        CellRead::<Presence>::read_many(&cached, &id, SECTION, &batch_of([8, 9])?).await?;
+        assert_eq!(
+            lower.inner.presence_reads(),
+            1,
+            "the expiry comes from a presence read"
+        );
+        assert_eq!(
+            lower.inner.batch_cache_reads(),
+            0,
+            "the fill does not fetch values"
+        );
         for key in [8, 9] {
             let stamped = cached.stored_expiry(&id, &cell_at(key)).await?;
             assert_eq!(
@@ -1070,9 +1087,15 @@ fn presence_is_cached() -> Result<()> {
                 PresenceBatch::from_iter([true, false])
             );
             assert_eq!(
-                counting.lower_reads() + counting.batch_cache_reads() + counting.presence_reads(),
+                counting.presence_reads(),
                 1,
-                "presence reads share one durable fill"
+                "presence reads share one presence fill"
+            );
+            assert_eq!(counting.lower_reads(), 0, "presence does not read values");
+            assert_eq!(
+                counting.batch_cache_reads(),
+                0,
+                "presence does not fetch a value batch"
             );
         }
         Ok(())
@@ -1936,6 +1959,8 @@ enum CacheOp {
     Promote,
     /// A point read of one pool key.
     Get(u8),
+    /// A presence read of one pool key.
+    Contains(u8),
     /// A full-section scan.
     Scan,
     /// Advance the fixed clock by N milliseconds (sub-second-grain, so the
@@ -2013,7 +2038,8 @@ impl Arbitrary for CacheTrace {
                         }
                     }
                 }
-                7..=10 => CacheOp::Get(u8::arbitrary(g) % POOL),
+                7..=8 => CacheOp::Get(u8::arbitrary(g) % POOL),
+                9..=10 => CacheOp::Contains(u8::arbitrary(g) % POOL),
                 11 => CacheOp::Scan,
                 12..=13 => CacheOp::Advance(u16::arbitrary(g) % 12_000),
                 14 => CacheOp::FaultPuts(bool::arbitrary(g)),
@@ -2050,17 +2076,15 @@ struct Staged {
     clears: Vec<SectionClear>,
 }
 
-/// The KV5 warm-set model: cell → the expiry its entry carries (`u64::MAX`
-/// unsettled in for a fill's effectively-unreachable stamp). A cell present
-/// and unexpired here MUST be a fjall hit; anything else is excluded by
-/// construction.
-type WarmModel = HashMap<u8, u64>;
+/// The cache knowledge and expiry for each modeled cell.
+type WarmModel = HashMap<u8, (u64, CacheEntry<Bytes>)>;
 
 /// The one-shot replay state of [`prop_cached_is_transparent`], carried
 /// through every op and the per-op verification passes.
 struct Replay {
     subject: Cached<TtlAwareCellStore<MemoryCellStore>>,
     twin: MemoryCellStore,
+    counting: CountingCellStore<MemoryCellStore>,
     id: CollectionId,
     cref: CollectionRef,
     twin_ref: CollectionRef,
@@ -2083,22 +2107,24 @@ impl Replay {
     }
 
     /// Whether the warm model says `key` is a live hit at the current clock.
-    fn is_warm(&self, key: u8) -> bool {
-        self.warm
-            .get(&key)
-            .is_some_and(|&expiry| expiry == u64::MAX || self.clock < expiry)
+    fn is_warm<P: Projection>(&self, key: u8) -> bool {
+        self.warm.get(&key).is_some_and(|(expiry, entry)| {
+            (*expiry == u64::MAX || self.clock < *expiry)
+                && !matches!(P::from_cached(entry.clone()), Read::Unknown)
+        })
     }
 
     /// Publish-through model update: the batch either warms every cell (a
     /// clean atomic publish) or — under the puts fault — lands nothing and
     /// failed-publish cache guard deletes every cell.
-    fn model_publish(&mut self, keys: impl IntoIterator<Item = u8>) {
+    fn model_publish(&mut self, cells: impl IntoIterator<Item = (u8, Option<Bytes>)>) {
         let expiry = self.write_expiry();
-        for key in keys {
+        for (key, value) in cells {
             if self.fault_puts {
                 self.warm.remove(&key);
             } else {
-                self.warm.insert(key, expiry);
+                self.warm
+                    .insert(key, (expiry, Values::into_cached(Committed::new(value))));
             }
         }
     }
@@ -2133,7 +2159,7 @@ impl Replay {
         self.model_publish(
             resolved
                 .iter()
-                .map(|(cell, _)| cell.coordinate.as_bytes()[0]),
+                .map(|(cell, value)| (cell.coordinate.as_bytes()[0], value.clone())),
         );
         Ok(())
     }
@@ -2169,7 +2195,11 @@ impl Replay {
             .write_provisional(&self.twin_ref, &staged, Some(&marker))
             .await
             .map_err(|e| eyre!("twin stage: {e:?}"))?;
-        self.model_publish(staged.iter().map(|(cell, _)| cell.coordinate.as_bytes()[0]));
+        self.model_publish(
+            staged
+                .iter()
+                .map(|(cell, write)| (cell.coordinate.as_bytes()[0], write.prev().cloned())),
+        );
         self.staged = Some(Staged {
             writes: staged,
             clears,
@@ -2215,8 +2245,11 @@ impl Replay {
                         self.warm.remove(key);
                     }
                 }
-                // A successful transform keeps the staged cells warm at their
-                // stage-anchored expiry — already in the model from the stage.
+                for (cell, write) in &staged.writes {
+                    if let Some((_, entry)) = self.warm.get_mut(&cell.coordinate.as_bytes()[0]) {
+                        *entry = Values::into_cached(Committed::new(write.data().cloned()));
+                    }
+                }
             }
             CacheOp::Abort => {
                 let Some(staged) = self.staged.take() else {
@@ -2231,10 +2264,9 @@ impl Replay {
                     .await
                     .map_err(|e| eyre!("twin abort: {e:?}"))?;
                 self.model_publish(
-                    staged
-                        .writes
-                        .iter()
-                        .map(|(cell, _)| cell.coordinate.as_bytes()[0]),
+                    staged.writes.iter().map(|(cell, write)| {
+                        (cell.coordinate.as_bytes()[0], write.prev().cloned())
+                    }),
                 );
             }
             CacheOp::Promote => {
@@ -2257,6 +2289,7 @@ impl Replay {
                 }
             }
             CacheOp::Get(key) => self.check_get(*key).await?,
+            CacheOp::Contains(key) => self.check_presence(slice::from_ref(key)).await?,
             CacheOp::Scan => self.check_scan().await?,
             CacheOp::Advance(ms) => {
                 self.clock += u64::from(*ms);
@@ -2275,7 +2308,12 @@ impl Replay {
 
     /// One parity get of `key`, updating the warm model with the fill.
     async fn check_get(&mut self, key: u8) -> Result<()> {
-        let falls_through = !self.is_warm(key);
+        let falls_through = !self.is_warm::<Values>(key);
+        let before = self.counting.lower_reads();
+        let other_reads = (
+            self.counting.batch_cache_reads(),
+            self.counting.presence_reads(),
+        );
         let subject = CellRead::<Values>::read(&self.subject, &self.id, &cell_at(key))
             .await
             .map(|(committed, _)| committed)
@@ -2291,67 +2329,105 @@ impl Replay {
                 twin.get()
             ));
         }
-        if falls_through {
-            // The fill published (or failed to): fills stamp the remaining
-            // TTL of a far-future death — effectively never.
-            if self.fault_puts {
-                self.warm.remove(&key);
-            } else {
-                self.warm.insert(key, u64::MAX);
-            }
+        assert_eq!(
+            self.counting.lower_reads() - before,
+            usize::from(falls_through),
+            "the model predicts each value read"
+        );
+        assert_eq!(
+            (
+                self.counting.batch_cache_reads(),
+                self.counting.presence_reads()
+            ),
+            other_reads,
+            "a value point does not fetch another projection or batch"
+        );
+        if falls_through && !self.fault_puts {
+            self.warm.insert(key, (u64::MAX, Values::into_cached(twin)));
         }
         Ok(())
     }
 
     /// Compares full-section scans without a cache update.
     async fn check_scan(&mut self) -> Result<()> {
+        let before = self.counting.lower_scans();
+        let reads = (
+            self.counting.lower_reads(),
+            self.counting.batch_cache_reads(),
+            self.counting.presence_reads(),
+            self.counting.presence_scans(),
+        );
         let subject = scan_forward(&self.subject, &self.id, 0, ScanEdge::Included(255)).await?;
         let twin = scan_forward(&self.twin, &self.id, 0, ScanEdge::Included(255)).await?;
         if subject != twin {
             return Err(eyre!("scan diverged: subject {subject:?}, twin {twin:?}"));
         }
+        assert_eq!(
+            self.counting.lower_scans() - before,
+            1,
+            "each scan reads the lower store"
+        );
+        assert_eq!(
+            (
+                self.counting.lower_reads(),
+                self.counting.batch_cache_reads(),
+                self.counting.presence_reads(),
+                self.counting.presence_scans()
+            ),
+            reads,
+            "a scan adds no other reads"
+        );
         Ok(())
     }
 
-    /// The after-every-op verification: every pool cell's get and one
-    /// full-section scan answer identically.
-    async fn verify(&mut self) -> Result<()> {
-        let keys: Vec<_> = (0..POOL).rev().chain([0, POOL]).collect();
+    /// Checks presence answers, cache knowledge, and lower read counts.
+    async fn check_presence(&mut self, keys: &[u8]) -> Result<()> {
         let batch = batch_of(keys.iter().copied())?;
-        let presence = CellRead::<Presence>::read_many(&self.subject, &self.id, SECTION, &batch)
-            .await
-            .map(|cells| {
-                cells
-                    .into_iter()
-                    .map(|(committed, _)| committed.get().is_some())
-                    .collect::<PresenceBatch>()
-            })?;
-        let expected: PresenceBatch =
-            CellRead::<Values>::read_many(&self.twin, &self.id, SECTION, &batch)
-                .await
-                .map(|cells| {
-                    cells
-                        .into_iter()
-                        .map(|(committed, _)| committed)
-                        .collect::<CommittedBatch>()
-                })?
-                .iter()
-                .map(|cell| cell.get().is_some())
-                .collect();
-        if presence != expected {
-            return Err(eyre!(
-                "presence diverged: subject {presence:?}, twin {expected:?}"
-            ));
-        }
-        if keys.iter().any(|&key| !self.is_warm(key)) {
-            for &key in &keys {
-                if self.fault_puts {
-                    self.warm.remove(&key);
-                } else {
-                    self.warm.insert(key, u64::MAX);
-                }
+        let missed: CellBuffer<u8> = keys
+            .iter()
+            .copied()
+            .filter(|key| !self.is_warm::<Presence>(*key))
+            .collect();
+        let before = self.counting.presence_reads();
+        let value_reads = (
+            self.counting.lower_reads(),
+            self.counting.batch_cache_reads(),
+        );
+        let presence =
+            CellRead::<Presence>::read_many(&self.subject, &self.id, SECTION, &batch).await?;
+        let expected = CellRead::<Values>::read_many(&self.twin, &self.id, SECTION, &batch).await?;
+        assert_eq!(
+            self.counting.presence_reads() - before,
+            usize::from(!missed.is_empty()),
+            "the model predicts each presence batch"
+        );
+        assert_eq!(
+            (
+                self.counting.lower_reads(),
+                self.counting.batch_cache_reads()
+            ),
+            value_reads,
+            "presence does not fetch values"
+        );
+        assert_eq!(presence.len(), expected.len());
+        for ((key, (present, _)), (value, _)) in keys.iter().zip(presence).zip(expected) {
+            assert_eq!(
+                present.get().is_some(),
+                value.get().is_some(),
+                "presence differs at {key}"
+            );
+            if missed.contains(key) && !self.fault_puts {
+                self.warm
+                    .insert(*key, (u64::MAX, Presence::into_cached(present)));
             }
         }
+        Ok(())
+    }
+
+    /// Checks both projections and the full scan after each operation.
+    async fn verify(&mut self) -> Result<()> {
+        let keys: Vec<_> = (0..POOL).rev().chain([0, POOL]).collect();
+        self.check_presence(&keys).await?;
         for key in 0..POOL {
             self.check_get(key).await?;
         }
@@ -2395,6 +2471,7 @@ fn prop_cached_is_transparent() {
             let mut replay = Replay {
                 subject,
                 twin,
+                counting,
                 cref: CollectionRef::new(id.clone(), ttl),
                 twin_ref: CollectionRef::new(id.clone(), ttl),
                 id,
@@ -2428,7 +2505,7 @@ fn prop_cached_is_transparent() {
             replay.fault_puts = false;
             replay.verify().await.map_err(|e| eyre!("heal pass: {e}"))?;
             for key in 0..POOL {
-                if !replay.is_warm(key) {
+                if !replay.is_warm::<Values>(key) {
                     continue;
                 }
                 ttl_lower.reset();

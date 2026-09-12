@@ -182,7 +182,7 @@ impl<L: CellBackend> CellBackend for Cached<L> {
     type Error = L::Error;
 }
 
-impl<L: CellRead<P> + CellRead<Values>, P: Projection> CellRead<P> for Cached<L> {
+impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
     async fn read<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -217,11 +217,10 @@ impl<L: CellRead<P> + CellRead<Values>, P: Projection> CellRead<P> for Cached<L>
         };
         let stamped_at = self.fjall.clock().now_ms();
         let loaded = async {
-            let (committed, remaining) =
-                CellRead::<Values>::read(&self.lower, collection, cell).await?;
+            let (committed, remaining) = CellRead::<P>::read(&self.lower, collection, cell).await?;
             if let Err(error) = self
                 .fjall
-                .put::<Values>(
+                .put::<P>(
                     collection,
                     cell,
                     committed.clone(),
@@ -232,10 +231,7 @@ impl<L: CellRead<P> + CellRead<Values>, P: Projection> CellRead<P> for Cached<L>
                 warn_skip("populate", &error);
                 self.metrics.cache_error("get", "fill");
             }
-            Ok((
-                Committed::new(committed.into_inner().map(P::from_value)),
-                remaining,
-            ))
+            Ok((committed, remaining))
         }
         .await;
         self.metrics
@@ -246,6 +242,8 @@ impl<L: CellRead<P> + CellRead<Values>, P: Projection> CellRead<P> for Cached<L>
     /// Reads the whole lower batch after any miss and publishes only probe
     /// misses. Partial refetch requires a benchmark before it can replace
     /// this rule.
+    /// Concurrent fills can replace a value frame with a presence frame.
+    /// That replacement loses cache warmth, but it preserves the answer.
     async fn read_many<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -297,8 +295,7 @@ impl<L: CellRead<P> + CellRead<Values>, P: Projection> CellRead<P> for Cached<L>
         };
         let stamped_at = self.fjall.clock().now_ms();
         let loaded = async {
-            let filled =
-                CellRead::<Values>::read_many(&self.lower, collection, section, batch).await?;
+            let filled = CellRead::<P>::read_many(&self.lower, collection, section, batch).await?;
             let projected = batch
                 .iter()
                 .zip(&filled)
@@ -314,19 +311,11 @@ impl<L: CellRead<P> + CellRead<Values>, P: Projection> CellRead<P> for Cached<L>
                         expiry_at(stamped_at, *remaining),
                     )
                 });
-            if let Err(error) = self.fjall.put_batch::<Values>(collection, projected).await {
+            if let Err(error) = self.fjall.put_batch::<P>(collection, projected).await {
                 warn_skip("populate batch", &error);
                 self.metrics.cache_error("get_many", "fill");
             }
-            Ok(filled
-                .into_iter()
-                .map(|(committed, ttl)| {
-                    (
-                        Committed::new(committed.into_inner().map(P::from_value)),
-                        ttl,
-                    )
-                })
-                .collect())
+            Ok(filled)
         }
         .await;
         self.metrics.batch(
