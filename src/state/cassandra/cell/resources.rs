@@ -1,6 +1,5 @@
-use super::decode::decode_body;
 use super::projection::CassandraProjection;
-use super::read::{fetch_batch, fetch_marker_state, fetch_point, page, split_point};
+use super::read::{decode_point, fetch_batch, fetch_marker_state, fetch_point, page};
 use super::{
     Arc, CassandraCellResources, CassandraCellStoreError, CassandraSession, CellBuffer, CellKey,
     CellQueries, CollectionId, CoordinateBatch, Scan, Section, Stream, TryStreamExt, dedupe,
@@ -52,8 +51,9 @@ impl CassandraCellResources {
             self.reader_evidence(id),
         )?;
         let value = row
-            .map(|row| decode_body::<P>(split_point::<P>(row).0))
-            .transpose()?;
+            .map(decode_point::<P>)
+            .transpose()?
+            .map(|(cell, _)| cell);
         Ok(value
             .filter(|_| evidence.survives(cell))
             .and_then(|value| resolve_for_reader(&value, &evidence).cloned()))
@@ -86,8 +86,9 @@ impl CassandraCellResources {
                     coordinate: coordinate.clone(),
                 };
                 let cell = row
-                    .map(|row| decode_body::<P>(split_point::<P>(row).0))
-                    .transpose()?;
+                    .map(decode_point::<P>)
+                    .transpose()?
+                    .map(|(cell, _)| cell);
                 Ok(cell
                     .filter(|_| evidence.survives(&key))
                     .and_then(|cell| resolve_for_reader(&cell, &evidence).cloned()))

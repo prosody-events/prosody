@@ -174,9 +174,9 @@ async fn first_error_is_first_input_position() -> Result<()> {
 /// A live query returns clustering order and cannot prove this rule.
 #[test]
 fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
-    use super::super::read::{match_rows_to_coordinates, split_point};
+    use super::super::read::{decode_point, match_rows_to_coordinates};
     use super::CellCorruptReason;
-    use super::decode::{PointRow, decode_body};
+    use super::decode::PointRow;
     use super::encoding::{Encoding, encode_payload};
     use crate::state::cell::Values;
     use crate::state::store::CellBuffer;
@@ -211,8 +211,9 @@ fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
     let decoded = match_rows_to_coordinates(rows, &[&low_coordinate, &high_coordinate])
         .into_iter()
         .map(|row| {
-            row.map(|row| decode_body::<Values>(split_point::<Values>(row).0))
+            row.map(decode_point::<Values>)
                 .transpose()
+                .map(|cell| cell.map(|(cell, _)| cell))
         })
         .collect::<Result<CellBuffer<_>, CassandraCellStoreError>>();
     match decoded {
@@ -228,8 +229,8 @@ fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
 
 #[test]
 fn borrowed_batch_matches_requested_coordinates() -> Result<()> {
-    use super::super::read::{match_rows_to_coordinates, split_point};
-    use super::decode::{PointRow, decode_body};
+    use super::super::read::{decode_point, match_rows_to_coordinates};
+    use super::decode::PointRow;
     use crate::state::cell::Values;
     use crate::state::store::CellBuffer;
     use smallvec::smallvec;
@@ -258,8 +259,9 @@ fn borrowed_batch_matches_requested_coordinates() -> Result<()> {
     let decoded = match_rows_to_coordinates(rows, &[&low, &absent, &high])
         .into_iter()
         .map(|row| {
-            row.map(|row| decode_body::<Values>(split_point::<Values>(row).0))
+            row.map(decode_point::<Values>)
                 .transpose()
+                .map(|cell| cell.map(|(cell, _)| cell))
         })
         .collect::<Result<CellBuffer<_>, CassandraCellStoreError>>()?;
     assert_eq!(decoded.len(), 3);

@@ -1,9 +1,8 @@
 #[cfg(test)]
 use super::Ordering;
 use super::batch::marker_delete_unit;
-use super::decode::decode_body;
 use super::projection::CassandraProjection;
-use super::read::{fetch_batch, fetch_marker_state, fetch_point, split_point};
+use super::read::{decode_point, fetch_batch, fetch_marker_state, fetch_point};
 use super::{
     BatchUnit, Bytes, CassandraStore, Cell, CellAddr, CellBatchRow, CellBuffer, CellKey, CellKind,
     CellStore, CellStoreError, CollectionId, CollectionRef, Coordinate, CoordinateBatch,
@@ -44,8 +43,7 @@ impl CellStore for CassandraStore {
         else {
             return Ok(None);
         };
-        let raw =
-            decode_body::<Values>(split_point::<Values>(row).0).map_err(ResolveCellError::Store)?;
+        let (raw, _) = decode_point::<Values>(row).map_err(ResolveCellError::Store)?;
         match raw {
             Cell::Provisional(provisional) => Ok(Some(provisional)),
             Cell::Resolved(_) => Ok(None),

@@ -1,8 +1,7 @@
 #[cfg(test)]
 use super::CellReadCounts;
-use super::decode::decode_body;
 use super::projection::CassandraProjection;
-use super::read::{fetch_batch, fetch_point, page, split_point};
+use super::read::{decode_point, fetch_batch, fetch_point, page};
 use super::{
     Arc, BatchUnit, Bytes, CacheBatch, CassandraCellStoreError, CassandraSession, CassandraStore,
     Cell, CellAddr, CellBatchRow, CellBlobs, CellKey, CellKind, CellQueries, CellStoreError,
@@ -155,13 +154,7 @@ impl<P: CassandraProjection> CellRead<P> for CassandraStore {
             .await
             .map_err(ResolveCellError::Store)?;
         let (raw, ttl) = match row {
-            Some(row) => {
-                let (body, ttl) = split_point::<P>(row);
-                (
-                    decode_body::<P>(body).map_err(ResolveCellError::Store)?,
-                    ttl,
-                )
-            }
+            Some(row) => decode_point::<P>(row).map_err(ResolveCellError::Store)?,
             None => (Cell::Resolved(Committed::new(None)), None),
         };
         let committed = EvidenceLookup::new(self, id).resolve(raw).await?;
@@ -189,13 +182,7 @@ impl<P: CassandraProjection> CellRead<P> for CassandraStore {
         let mut lookup = EvidenceLookup::new(self, id);
         for row in rows {
             let (raw, ttl) = match row {
-                Some(row) => {
-                    let (body, ttl) = split_point::<P>(row);
-                    (
-                        decode_body::<P>(body).map_err(ResolveCellError::Store)?,
-                        ttl,
-                    )
-                }
+                Some(row) => decode_point::<P>(row).map_err(ResolveCellError::Store)?,
                 None => (Cell::Resolved(Committed::new(None)), None),
             };
             answers.push((lookup.resolve(raw).await?, ttl_seconds_to_duration(ttl)));

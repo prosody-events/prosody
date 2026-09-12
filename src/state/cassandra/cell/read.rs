@@ -1,5 +1,5 @@
 use super::decode::{
-    BatchRow, Body, BorrowedMarkerRow, PointRow, ScanRow, blob_ttl, decode_body, decode_marker_row,
+    BatchRow, BorrowedMarkerRow, PointRow, ScanRow, blob_ttl, decode_body, decode_marker_row,
 };
 use super::projection::CassandraProjection;
 use super::queries::ReadStatements;
@@ -98,13 +98,13 @@ pub(super) fn match_rows_to_coordinates<Row>(
     out
 }
 
-/// Separates a point row's body and co-expiry before semantic decode.
-pub(super) fn split_point<P: CassandraProjection>(row: PointRow<P>) -> (Body<P>, Option<i32>) {
+/// Decodes a point row into its cell and the remaining durable TTL.
+pub(super) fn decode_point<P: CassandraProjection>(
+    row: PointRow<P>,
+) -> Result<(Cell<P>, Option<i32>), CassandraCellStoreError> {
     let (data, prev, encoding, version, event, ttl_data, ttl_prev) = row;
-    (
-        (data, prev, encoding, version, event),
-        blob_ttl(ttl_data, ttl_prev),
-    )
+    let cell = decode_body::<P>((data, prev, encoding, version, event))?;
+    Ok((cell, blob_ttl(ttl_data, ttl_prev)))
 }
 
 /// Separates a batch row's coordinate from its point row.
