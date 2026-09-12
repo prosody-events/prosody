@@ -17,7 +17,8 @@
 //!   structured error.
 //! * **Cache lattice**: fills preserve known value payloads.
 //!   [`CacheEntry::downgrades`] detects replacement of `Value` with `Exists`.
-//!   The disk cache documents its concurrent-fill exception on `Cached`.
+//!   The disk cache relies on the session gate's exclusive hold (KV4 on
+//!   `Cached`); the reader cache checks under its own lock.
 
 use super::event_ref::EventRef;
 use super::marker::ReaderEvidence;

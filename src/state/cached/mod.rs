@@ -14,7 +14,9 @@
 //!   change the cache.
 //! - **KV4 — a fill cannot overwrite a newer write.** Per-key dispatch and the
 //!   session operation gate serialize reads and writes. Admission and
-//!   settlement do not overlap handler operations.
+//!   settlement do not overlap handler operations. The gate is an exclusive
+//!   hold, so two fills of one cell never overlap either. This is what keeps a
+//!   presence fill from replacing a concurrent value fill.
 //! - **KV5 — a successful update retains warmth.** Expiry, reassignment,
 //!   clears, and cache errors can force a durable read.
 //!
@@ -247,7 +249,6 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
     /// Reads the whole lower batch after any miss and publishes only probe
     /// misses. Partial refetch requires a benchmark before it can replace
     /// this rule.
-    /// [`Cached`] documents the concurrent-fill exception.
     /// A probe error publishes every position.
     async fn read_many<'a>(
         &'a self,
