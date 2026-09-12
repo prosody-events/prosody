@@ -10,8 +10,9 @@
 //! source result without another age check or read.
 //!
 //! Point reads share one fill for each missing key.
-//! Batch reads probe every key and publish only unanswered positions.
-//! Cache admission does not change a successful source result into an error.
+//! Batch reads probe every key and write every filled position through the
+//! lattice. Cache admission does not change a successful source result into an
+//! error.
 
 use crate::Key;
 use crate::state::access::StateAccessError;
@@ -130,9 +131,9 @@ impl ReaderCache {
         self.clock.now().duration_since(issued) < ttl
     }
 
-    /// The read-through point read. Serve a fresh hit. Expire a stale hit,
-    /// removing it only if it still carries the observed issue time. Then
-    /// refill single-flight through `fill`.
+    /// Serves a fresh answer. Retains a fresh entry that cannot answer this
+    /// projection, then fills and writes through the result. Removes a stale
+    /// entry only if its issue time is unchanged, then refills single-flight.
     ///
     /// # Errors
     ///
@@ -154,13 +155,17 @@ impl ReaderCache {
                         match P::from_cached(value) {
                             Read::Present(value) => return Ok(Some(value)),
                             Read::Absent => return Ok(None),
-                            Read::Unknown => {}
+                            Read::Unknown => {
+                                let issued = self.clock.now();
+                                let value = fill().await?;
+                                self.write_through(&key, issued, P::into_cached(value.clone()))
+                                    .await;
+                                return Ok(value);
+                            }
                         }
                     }
-                    self.inner.remove_if(&key, |(observed, entry)| {
-                        *observed == issued
-                            && (!self.fresh(*observed, ttl)
-                                || matches!(P::from_cached(entry.clone()), Read::Unknown))
+                    self.inner.remove_if(&key, |(observed, _)| {
+                        *observed == issued && !self.fresh(*observed, ttl)
                     });
                 }
                 Err(guard) => {
@@ -177,7 +182,7 @@ impl ReaderCache {
 
     /// The read-through batch read, index-aligned to `keys`. Serves the batch
     /// entirely from the cache when every key is a fresh hit. Otherwise it
-    /// issues one batch store read through `fill`, writes each missed key, and
+    /// issues one batch store read through `fill`, writes every position, and
     /// returns the store answers.
     ///
     /// # Errors
@@ -223,10 +228,8 @@ impl ReaderCache {
         if fresh.len() != keys.len() {
             return Err(StateAccessError::misaligned_batch(fresh.len(), keys.len()));
         }
-        for ((key, value), hit) in keys.iter().zip(&fresh).zip(hits) {
-            if matches!(hit, Read::Unknown) {
-                cooperative(self.write_through(key, issued, P::into_cached(value.clone()))).await;
-            }
+        for (key, value) in keys.iter().zip(&fresh) {
+            cooperative(self.write_through(key, issued, P::into_cached(value.clone()))).await;
         }
         Ok(fresh)
     }

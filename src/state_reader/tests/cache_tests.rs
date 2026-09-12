@@ -2,10 +2,10 @@
 //!
 //! [`prop_cache_staleness`] proves the staleness rules together over random
 //! clock and get schedules, checked against a plain `HashMap` model: the
-//! issue-time age, expiry, negative caching, and cache-key isolation. The
-//! focused tests below pin invariants that schedule cannot express: concurrent
-//! single-flight, a fill that advances the clock while it runs, and the
-//! byte-budget bound. Its key pool includes two namespaces with the same
+//! issue-time age, expiry, batch refresh, negative caching, and cache-key
+//! isolation. The focused tests below pin invariants that schedule cannot
+//! express: concurrent single-flight, failed presence upgrades, slow fills, and
+//! the byte-budget bound. Its key pool includes two namespaces with the same
 //! collection name, proving `StateType` participates in cache identity.
 //!
 //! Every test drives a mocked monotonic clock instead of sleeping, so timing
@@ -87,11 +87,10 @@ const ADVANCE_POOL: [Duration; 4] = [
     Duration::from_secs(10),
 ];
 
-/// Upper bound on schedule length.
+/// Upper bound on random steps before the mixed batch sequence.
 const MAX_CACHE_STEPS: usize = 24;
 
-/// One step: advance the injected clock, or issue a cached get for a pooled
-/// key, filling `Some`/`None`.
+/// One step advances the clock or reads one key or a batch.
 #[derive(Clone, Copy, Debug)]
 enum CacheStep {
     /// Advance the clock by `ADVANCE_POOL[idx]`.
@@ -99,17 +98,23 @@ enum CacheStep {
     /// Get pooled key `key`; a fill returns `Some` when `present`, else the
     /// negative `None`.
     Get { key: u8, present: bool },
+    /// Read three positions. One miss refills every position.
+    Batch { keys: [u8; 3], present: bool },
 }
 
 impl Arbitrary for CacheStep {
     fn arbitrary(g: &mut Gen) -> Self {
-        if bool::arbitrary(g) {
-            Self::Advance(u8::arbitrary(g) % ADVANCE_POOL.len() as u8)
-        } else {
-            Self::Get {
-                key: u8::arbitrary(g) % CACHE_KEYS.len() as u8,
+        let key = |g: &mut Gen| u8::arbitrary(g) % CACHE_KEYS.len() as u8;
+        match u8::arbitrary(g) % 3 {
+            0 => Self::Advance(u8::arbitrary(g) % ADVANCE_POOL.len() as u8),
+            1 => Self::Get {
+                key: key(g),
                 present: bool::arbitrary(g),
-            }
+            },
+            _ => Self::Batch {
+                keys: [key(g), key(g), key(g)],
+                present: bool::arbitrary(g),
+            },
         }
     }
 }
@@ -122,12 +127,36 @@ struct CacheSchedule {
 
 impl Arbitrary for CacheSchedule {
     fn arbitrary(g: &mut Gen) -> Self {
-        Self {
-            steps: Vec::<CacheStep>::arbitrary(g)
-                .into_iter()
-                .take(MAX_CACHE_STEPS)
-                .collect(),
-        }
+        let mut steps: Vec<_> = Vec::<CacheStep>::arbitrary(g)
+            .into_iter()
+            .take(MAX_CACHE_STEPS)
+            .collect();
+        let first = u8::arbitrary(g) % CACHE_KEYS.len() as u8;
+        let second = (first + 1) % CACHE_KEYS.len() as u8;
+        let present = bool::arbitrary(g);
+        // A mixed batch must refresh its fresh position after it evicts a stale
+        // position.
+        steps.extend([
+            CacheStep::Advance(2),
+            CacheStep::Get {
+                key: second,
+                present,
+            },
+            CacheStep::Advance(2),
+            CacheStep::Get {
+                key: first,
+                present: !present,
+            },
+            CacheStep::Batch {
+                keys: [first, second, first],
+                present,
+            },
+            CacheStep::Get {
+                key: first,
+                present,
+            },
+        ]);
+        Self { steps }
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
@@ -143,8 +172,9 @@ fn fill_value(key: u8, present: bool) -> Option<Bytes> {
 }
 
 /// One property proves the staleness rules and cache-key isolation together:
-/// issue-time age, expiry, negative-entry refresh, source topology, namespace,
-/// and name isolation.
+/// issue-time age, expiry, batch refresh, negative-entry refresh, source
+/// topology, namespace, and name isolation.
+/// A batch miss updates every modeled position at one issue time.
 ///
 /// A plain `HashMap<key, (issued, value)>` model predicts, for every get,
 /// both the served value and whether a fill fires. A get is a hit served
@@ -181,6 +211,38 @@ async fn run_cache_schedule(schedule: CacheSchedule) -> Result<bool> {
     for step in schedule.steps {
         match step {
             CacheStep::Advance(idx) => mock.increment(ADVANCE_POOL[idx as usize]),
+            CacheStep::Batch {
+                keys: indices,
+                present,
+            } => {
+                mock.increment(Duration::from_nanos(1));
+                let issued = clock.now();
+                let all_fresh = indices.iter().all(|key| {
+                    model
+                        .get(key)
+                        .is_some_and(|(time, _)| issued.duration_since(*time) < CACHE_TTL)
+                });
+                let batch: CellBuffer<_> =
+                    indices.iter().map(|i| keys[*i as usize].clone()).collect();
+                let filled: CellBuffer<_> =
+                    indices.iter().map(|i| fill_value(*i, present)).collect();
+                if !all_fresh {
+                    expected_fills += 1;
+                    for (key, value) in indices.iter().zip(&filled) {
+                        model.insert(*key, (issued, value.clone()));
+                    }
+                }
+                let expected: CellBuffer<_> =
+                    indices.iter().map(|key| model[key].1.clone()).collect();
+                let served = cache
+                    .get_many_cached::<Values, _, _>(&batch, CACHE_TTL, || async {
+                        fills.fetch_add(1, Ordering::Relaxed);
+                        Ok(filled)
+                    })
+                    .await?;
+                assert_eq!(served, expected);
+                assert_eq!(fills.load(Ordering::Relaxed), expected_fills);
+            }
             CacheStep::Get { key, present } => {
                 let cur = clock.now();
                 let filled = fill_value(key, present);
@@ -223,7 +285,7 @@ async fn run_cache_schedule(schedule: CacheSchedule) -> Result<bool> {
 // --- Focused survivors (invariants the serial schedule cannot express) ------
 
 /// A slow fill enters already-aged, so it cannot launder an old value into a
-/// fresh window for a later reader.
+/// fresh window for a later reader. A failed value fill retains fresh presence.
 ///
 /// Falsify: record the entry at fill completion instead of issue. The second
 /// read then sees age zero and `fills` stays one.
@@ -262,6 +324,26 @@ async fn slow_fill_cannot_launder() -> Result<()> {
         2,
         "the slow fill was timed from issue, so it expired for the next reader"
     );
+    // The value-only schedule cannot represent a failed upgrade of presence.
+    let k = key("failed-upgrade")?;
+    cache
+        .get_cached::<Presence, _, _>(k.clone(), ttl, || async { Ok(Some(())) })
+        .await?;
+    let failed = cache
+        .get_cached::<Values, _, _>(k.clone(), ttl, || async {
+            Err(StateAccessError::Terminated)
+        })
+        .await;
+    assert!(matches!(failed, Err(StateAccessError::Terminated)));
+    let before = fills.load(Ordering::Relaxed);
+    let presence = cache
+        .get_cached::<Presence, _, _>(k, ttl, || async {
+            fills.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        })
+        .await?;
+    assert_eq!(presence, Some(()));
+    assert_eq!(fills.load(Ordering::Relaxed), before);
     Ok(())
 }
 
