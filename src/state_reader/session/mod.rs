@@ -26,7 +26,7 @@
 //! first one it makes back to that shared cell. A managed stream carries the
 //! selection its planning command captured. The precedence is uniform: a
 //! captured selection wins, an uncaptured one defers to the shared cell, and
-//! only a wholly unselected point or batch read probes.
+//! a read probes only when neither selection exists.
 //!
 //! Probe-and-pin is the reader's source-selection strategy:
 //!
@@ -37,8 +37,8 @@
 //!   never beat a slow `Some` from the owner. A source that errors is skipped
 //!   and its error remembered. Data beats a skipped error. No data plus at
 //!   least one error is an error.
-//! * **Range page** never probes. It addresses the source the operation already
-//!   selected.
+//! * **Range page** uses the selected source or probes each source for its
+//!   first row. The first source with a row supplies the complete stream.
 //!
 //! Once pinned, every later call addresses the pinned source directly, even on
 //! `None` or `Err`. The probe never reruns within an operation. Determinism is
@@ -405,19 +405,29 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         first_err.map_or_else(|| Ok(absent()), Err)
     }
 
-    /// One operation's committed range page over the selected source.
-    ///
-    /// A captured `Some(selected)` always wins: a continuation addresses the
-    /// source its planning command chose. A `None` falls back to the
-    /// session-shared pin **sampled at first poll**, so a stream constructed
-    /// before a sibling read pinned still addresses that selection rather than
-    /// opening a second source.
-    ///
-    /// A range page never probes. Every range plan follows a metadata point
-    /// read that already pinned, so a wholly unselected one is unconstructable
-    /// through the collection API. Such a plan terminates the stream with
-    /// [`StateAccessError::Unavailable`] instead of opening a source the
-    /// operation did not select.
+    /// Streams one source's committed cells under the projection.
+    fn source_scan<'a, P: Projection>(
+        &'a self,
+        id: CollectionId,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a
+    where
+        B::Cells: CommittedCellSource<P>,
+    {
+        async_stream::try_stream! {
+            let inner = CommittedCellSource::<P>::scan(self.context.backend.cells(), &id, scan);
+            futures::pin_mut!(inner);
+            while let Some(item) = cooperative(inner.next()).await {
+                yield item.map_err(|error| StateAccessError::store(&error))?;
+            }
+        }
+    }
+
+    /// Uses the captured source, then the shared source, or probes in source
+    /// order. The first source with a row supplies the complete stream and
+    /// the shared pin. An unpinned probe allocates one stream box per
+    /// source, bounded by `MAX_PUBLICATION_SOURCES`. The box keeps the
+    /// selected stream alive after its first row.
     fn scan_from<'a, P: Projection>(
         &'a self,
         selected: Option<&'a PinnedSource>,
@@ -427,14 +437,33 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         B::Cells: CommittedCellSource<P>,
     {
         async_stream::try_stream! {
-            let pin = selected
-                .or_else(|| self.pin.get())
-                .ok_or(StateAccessError::Unavailable)?;
-            let id = pin.collection.clone();
-            let inner = CommittedCellSource::<P>::scan(self.context.backend.cells(), &id, scan);
-            futures::pin_mut!(inner);
-            while let Some(item) = cooperative(inner.next()).await {
-                yield item.map_err(|error| StateAccessError::store(&error))?;
+            if let Some(pin) = selected.or_else(|| self.pin.get()) {
+                let inner = self.source_scan::<P>(pin.collection.clone(), scan);
+                futures::pin_mut!(inner);
+                while let Some(item) = cooperative(inner.next()).await {
+                    yield item?;
+                }
+                return;
+            }
+
+            let mut selection = None;
+            let found = self.resolve_probe(
+                &mut selection,
+                |source| async move {
+                    let id = self.collection_id_for(source)?;
+                    let mut stream = Box::pin(self.source_scan::<P>(id, scan));
+                    let first = cooperative(stream.next()).await.transpose()?;
+                    Ok(first.map(|row| (row, stream)))
+                },
+                Option::is_some,
+                || None,
+            ).await?;
+            engine::publish(self, selection.as_ref());
+            if let Some((first, mut stream)) = found {
+                yield first;
+                while let Some(item) = cooperative(stream.next()).await {
+                    yield item?;
+                }
             }
         }
     }

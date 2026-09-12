@@ -1623,7 +1623,22 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
 
         block_on(async {
             assert!(!handle.is_empty().await?);
-            assert_presence_route_calls(&counting, tracked_route);
+            assert_eq!(
+                counting.visible_point_reads(),
+                0,
+                "is_empty reads no values"
+            );
+            assert_eq!(counting.batch_reads(), 0, "is_empty reads no value batch");
+            assert_eq!(
+                counting.presence_reads(),
+                0,
+                "is_empty reads no presence batch"
+            );
+            assert_eq!(
+                counting.presence_scans(),
+                1,
+                "is_empty uses one presence scan"
+            );
             counting.reset();
             assert!(
                 handle.contains_key(&key).await.map_err(|e| eyre!("{e}"))?,
@@ -2130,8 +2145,8 @@ fn map_first_set_writes_keyset() -> Result<()> {
     Ok(())
 }
 
-/// A live entry without its keyset stays hidden until a handler reconstructs
-/// the keyset. Both key-only reads must use the same residual posture.
+/// Key enumeration hides a live entry without its keyset.
+/// The direct emptiness check still finds the entry.
 #[test]
 fn map_missing_keyset_hides_a_live_entry() -> Result<()> {
     use bytes::Bytes;
@@ -2155,7 +2170,7 @@ fn map_missing_keyset_hides_a_live_entry() -> Result<()> {
     let session = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
-        assert!(handle.is_empty().await?);
+        assert!(!handle.is_empty().await?);
         assert!(
             collect_map_keys(&handle, Direction::Forward)
                 .await?

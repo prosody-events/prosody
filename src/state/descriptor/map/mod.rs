@@ -776,7 +776,11 @@ where
     /// Returns a key codec error or an access error from the session.
     #[instrument(name = "map.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err)]
     pub async fn is_empty(&self) -> Result<bool, MapStateError<CellCodecError<V>>> {
-        let keys = self.stream_plan(Direction::Forward).await?.keys();
+        let plan = self
+            .cells
+            .read(async |op| op.range(MapKind::<KC, V>::ENTRIES, Direction::Forward))
+            .await;
+        let keys = plan.keys();
         futures::pin_mut!(keys);
         Ok(keys.next().await.transpose()?.is_none())
     }

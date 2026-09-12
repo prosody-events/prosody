@@ -266,6 +266,36 @@ async fn reader_presence_uses_read_cache() -> Result<()> {
     Ok(())
 }
 
+/// A range probe skips an empty source and keeps the source that supplies data.
+#[tokio::test]
+async fn reader_range_probe_pins_second_source() -> Result<()> {
+    let env = ScriptedEnv::new(
+        map_state::<I64KeyCodec, JsonCodec>("range-probe").read_cache(ReadCachePolicy::Disabled),
+    )?;
+    let key = Key::from("range-user");
+    let first_topic = topic("empty");
+    let second_topic = topic("populated");
+    let first = source_state_key(first_topic, "group-000", &key, env.count)?.segment_id;
+    env.publish("group-000", first_topic).await;
+    let second = env
+        .commit(GROUP_A, second_topic, &key, 1, |map| async move {
+            map.set(1, Value::from(7_i32)).await?;
+            Ok(())
+        })
+        .await?
+        .segment_id;
+    env.publish(GROUP_A, second_topic).await;
+
+    let reader = env.reader_eager()?;
+    let session = reader.session(key).await?;
+    let handle = env.descriptor.bind(&session)?;
+    assert!(!handle.is_empty().await?);
+    assert_eq!((env.cells.reads(first), env.cells.reads(second)), (1, 1));
+    assert_eq!(handle.get(&1).await?, Some(Value::from(7_i32)));
+    assert_eq!((env.cells.reads(first), env.cells.reads(second)), (1, 2));
+    Ok(())
+}
+
 /// An inherited policy uses the bundle-wide default TTL. A disabled policy
 /// bypasses that default. Within an effective TTL the reader keeps serving the
 /// cached committed value after the owner commits a newer one.

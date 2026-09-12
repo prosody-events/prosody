@@ -165,7 +165,7 @@ where
 /// later invocation on the same session addresses the same source. Discarding
 /// the `set` result is safe: one operation's reads are sequential, so no other
 /// selection can have landed in between.
-fn publish<C: Codec, B: ReaderBackend<C>>(
+pub(super) fn publish<C: Codec, B: ReaderBackend<C>>(
     session: &ReadSession<C, B>,
     selection: Option<&PinnedSource>,
 ) {
