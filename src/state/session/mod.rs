@@ -1511,8 +1511,11 @@ where
             // way.
 
             // `cooperative` adds a yield point per batch. `buffered` preserves order and
-            // bounds concurrency. Drop cells that a section clear subsumes.
-            // Size the buffer from the initial snapshot.
+            // bounds concurrency; order is inert here because marker and clear
+            // freezing sort internally and settle is row-disjoint. Drop cells that a
+            // section clear subsumes first, so the batch stays row-disjoint.
+            // Size the buffer once from the pre-filter snapshot; the filter can only
+            // shrink it.
             let capacity = cells.len();
             let survivors = cells
                 .into_iter()

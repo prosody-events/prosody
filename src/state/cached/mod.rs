@@ -345,8 +345,12 @@ where
         loaded
     }
 
-    /// A third presence frame adds codec and commit logic to save only one cold
-    /// payload transfer.
+    /// Probes presence without a payload copy. A miss fills through the value
+    /// path: fjall holds presence only as a value entry, so a payload-free
+    /// fill would leave a present cell cold for every later read.
+    ///
+    /// Ruling: a third "present, bytes unknown" frame tag was rejected. It
+    /// adds codec and commit logic to save one cold payload transfer.
     async fn contains_many<'a>(
         &'a self,
         collection: &'a CollectionId,

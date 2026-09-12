@@ -262,7 +262,10 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         }
     }
 
-    /// Uses the value cache when a read TTL applies.
+    /// One source's committed presence read. With a read TTL it fills
+    /// through [`Self::cached_batch`]: the reader cache holds presence only
+    /// as a value entry, so a payload-free fill would cache nothing. Without
+    /// a TTL it reads presence directly.
     async fn cached_presence_batch(
         &self,
         selected: Option<&CollectionId>,

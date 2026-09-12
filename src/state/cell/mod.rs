@@ -17,10 +17,18 @@
 //!
 //! # Invariants
 //!
-//! `P` is the payload projection. A presence cell (`P = ()`) carries no bytes.
-//! It cannot be written back as a value.
-//! A [`ProvisionalWrite`] requires a committed byte value for its prior value.
-//! Decoders reject invalid column shapes before they construct a cell.
+//! * **Prev-is-committed** — a [`ProvisionalCell::prev`] (and a
+//!   [`ProvisionalWrite`]'s `prev`) holds the committed value before the stage.
+//!   Readers use collection evidence to select this base or the staged value.
+//!   The type system enforces the committed base: [`ProvisionalWrite`] cannot
+//!   be built without a [`Committed`], and `Committed<Bytes>` is mintable only
+//!   inside `crate::state` — by the resolved read paths.
+//! * **Presence carries no bytes** — `P` is the payload projection a decoder
+//!   produced: `Bytes` for a value read, `()` for a presence read. A presence
+//!   cell has no bytes to write back, so no presence path can persist a value.
+//! * **Invalid shapes unrepresentable after decode** — a backend decoder
+//!   collapses every physical column shape into one of these two variants or a
+//!   typed corruption error; nothing downstream sees a half-built cell.
 
 use super::event_ref::EventRef;
 use super::marker::ReaderEvidence;

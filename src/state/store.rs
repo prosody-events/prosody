@@ -80,7 +80,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// direction, edges, and limit to present keys.
     ///
     /// This read uses the marker-resolved presence rules on
-    /// [`Self::contains_many`].
+    /// [`Self::contains_many`]. The default projects [`Self::scan_cells`];
+    /// Cassandra overrides it with a payload-free scan.
     fn scan_keys<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -163,7 +164,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// Results follow the observation contract on [`Self::get_many`].
     ///
     /// Applies the committed projection of [`Self::get`] without durable
-    /// writes.
+    /// writes. The default projects [`Self::get_many`]; Cassandra overrides
+    /// it with a payload-free query.
     fn contains_many<'a>(
         &'a self,
         collection: &'a CollectionId,

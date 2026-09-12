@@ -480,6 +480,9 @@ impl FjallCellCache {
             .map(|cells| cells.into_iter().map(|c| c.get().is_some()).collect()))
     }
 
+    /// Probes one batch in one blocking hop and classifies every position
+    /// with one clock sample. `Ok(Some(_))` only when every position is a
+    /// hit; the payload projection follows `decode`.
     async fn probe_batch<P>(
         &self,
         collection: &CollectionId,
