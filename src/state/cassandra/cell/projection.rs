@@ -40,6 +40,8 @@ impl CassandraProjection for Values {
     }
 }
 
+/// Presence reads the write time only and does not validate the payload body.
+/// A cell with a corrupt payload is present.
 impl CassandraProjection for Presence {
     type Column = i64;
 

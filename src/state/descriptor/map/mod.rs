@@ -771,6 +771,10 @@ where
 
     /// Reports whether the map holds no live entries.
     ///
+    /// This reads the entries section, not the keyset. After a split commit
+    /// leaves keyset residue, it can report a live entry that `keys` does not
+    /// list.
+    ///
     /// # Errors
     ///
     /// Returns a key codec error or an access error from the session.
