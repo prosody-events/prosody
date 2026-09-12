@@ -56,9 +56,11 @@ pub(crate) use workspace::{FjallClient, FjallWorkspace};
 
 use crate::state::CollectionId;
 use crate::state::backend::AdmissionChecks;
-use crate::state::cell::{Committed, Presence, Projection, ProvisionalWrite, Read, Values};
+use crate::state::cell::{CacheEntry, Committed, Projection, ProvisionalWrite, Read, Values};
 use crate::state::cell_key::{CellKey, Section};
-use crate::state::store::{CellBuffer, CommittedBatch, CoordinateBatch, PresenceBatch};
+use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store_types::Durable;
+use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
 use bytes::Bytes;
 use educe::Educe;
@@ -131,15 +133,11 @@ impl Clock {
     }
 }
 
-/// Decodes a cache frame into its expiry and payload projection.
-type CellDecoder<P> =
-    fn(Option<&[u8]>) -> Result<(u64, Read<<P as Projection>::Payload>), FjallCellCacheError>;
-
 /// The three-state result of a [`FjallCellCache::get`].
 #[derive(Clone, Debug)]
 pub(crate) enum CacheRead<P: Projection = Values> {
     /// An unexpired entry (a `Present` value or an authoritative `Absent`).
-    Hit(Committed<P>),
+    Hit(Durable<P>),
     /// An entry exists but its stamped expiry has passed; the caller falls
     /// through to the lower store and re-publishes a fresh entry.
     Expired,
@@ -419,89 +417,41 @@ impl FjallCellCache {
         }
     }
 
-    /// Looks up one cell's committed value as a three-state [`CacheRead`]: a
-    /// [`Hit`](CacheRead::Hit) on an unexpired `Present`/`Absent` entry, an
-    /// [`Expired`](CacheRead::Expired) when the entry exists but its stamped
-    /// expiry has passed, or a [`Miss`](CacheRead::Miss) when no entry exists.
-    ///
-    /// The caller distinguishes these because a coordinate may have no entry
-    /// (nothing was ever published — a `Miss`) or an entry that floor-expired
-    /// (fall through and re-fetch — an `Expired`). Both differ from a present
-    /// `Absent` tag (`Hit(Committed(None))`), which is an authoritative answer.
-    pub(crate) async fn get(
+    /// Reads one projection and its remaining TTL from an unexpired frame.
+    pub(crate) async fn get<P: Projection>(
         &self,
         collection: &CollectionId,
         cell: &CellKey,
-    ) -> Result<CacheRead, FjallCellCacheError> {
-        let (expiry, read) = self.read_decoded(collection, cell).await?;
-        Ok(classify(expiry, read, self.clock.now_ms()))
+    ) -> Result<CacheRead<P>, FjallCellCacheError> {
+        let raw = read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
+        let (expiry, entry) = codec::decode_frame(raw.as_deref())?;
+        Ok(classify::<P>(
+            expiry,
+            entry.map_or(Read::Unknown, P::from_cached),
+            self.clock.now_ms(),
+        ))
     }
 
-    /// Batch twin of [`get`](Self::get): probes every coordinate of one
-    /// `(collection, section)` batch in a SINGLE [`spawn_blocking`] hop — never
-    /// one per cell, so a warm chunk costs one blocking-pool round-trip, not
-    /// one per position.
-    ///
-    /// `Ok(Some(values))` iff EVERY position is an unexpired hit (a `Present`
-    /// value or an authoritative `Absent` tag), index-aligned to `batch`.
-    /// `Ok(None)` if any position is a miss (no entry) or floor-expired — the
-    /// caller then refetches the whole batch from durable truth. `Err` on a
-    /// join failure, a per-key engine error, or a decode failure — the caller
-    /// degrades that read to a durable one, exactly as the point path does on a
-    /// fjall read error.
-    ///
-    /// The closure reads all keys before returning (no short-circuit at the
-    /// first miss) so the whole batch costs one hop; classification then
-    /// samples the clock ONCE and may short-circuit `Ok(None)` at the first
-    /// non-hit.
-    pub(crate) async fn get_batch(
+    /// Probes every coordinate in one blocking call and returns one result per
+    /// position.
+    pub(crate) async fn get_batch<P: Projection>(
         &self,
         collection: &CollectionId,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<Option<CommittedBatch>, FjallCellCacheError> {
-        self.probe_batch::<Values>(collection, section, batch, codec::decode_cell)
-            .await
-    }
-
-    /// Reads batch presence without copying present payload bytes.
-    ///
-    /// This method applies the same absence and expiry rules as
-    /// [`Self::get_batch`].
-    pub(crate) async fn get_presence_batch(
-        &self,
-        collection: &CollectionId,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<Option<PresenceBatch>, FjallCellCacheError> {
-        Ok(self
-            .probe_batch::<Presence>(collection, section, batch, codec::decode_presence)
-            .await?
-            .map(|cells| cells.into_iter().map(|c| c.get().is_some()).collect()))
-    }
-
-    /// Probes one batch in one blocking hop and classifies every position
-    /// with one clock sample. `Ok(Some(_))` only when every position is a
-    /// hit; the payload projection follows `decode`.
-    async fn probe_batch<P: Projection>(
-        &self,
-        collection: &CollectionId,
-        section: Section,
-        batch: &CoordinateBatch,
-        decode: CellDecoder<P>,
-    ) -> Result<Option<CellBuffer<Committed<P>>>, FjallCellCacheError> {
+    ) -> Result<CellBuffer<CacheRead<P>>, FjallCellCacheError> {
         let raws = self.read_batch(collection, section, batch).await?;
-        // One clock sample classifies every position; decode failures propagate.
         let now = self.clock.now_ms();
         let mut hits = CellBuffer::with_capacity(raws.len());
         for raw in raws {
-            let (expiry, read) = decode(raw.as_deref())?;
-            match classify::<P>(expiry, read, now) {
-                CacheRead::Hit(committed) => hits.push(committed),
-                CacheRead::Miss | CacheRead::Expired => return Ok(None),
-            }
+            let (expiry, entry) = codec::decode_frame(raw.as_deref())?;
+            hits.push(classify::<P>(
+                expiry,
+                entry.map_or(Read::Unknown, P::from_cached),
+                now,
+            ));
         }
-        Ok(Some(hits))
+        Ok(hits)
     }
 
     async fn read_batch(
@@ -565,23 +515,8 @@ impl FjallCellCache {
         collection: &CollectionId,
         cell: &CellKey,
     ) -> Result<Option<u64>, FjallCellCacheError> {
-        let (expiry, read) = self.read_decoded(collection, cell).await?;
-        Ok(match read {
-            Read::Unknown => None,
-            _ => Some(expiry),
-        })
-    }
-
-    /// Reads and decodes one cell's raw fjall frame: the shared prologue
-    /// behind [`get`](Self::get) and `stored_expiry`,
-    /// which differ only in how they treat an expired stamp.
-    async fn read_decoded(
-        &self,
-        collection: &CollectionId,
-        cell: &CellKey,
-    ) -> Result<(u64, Read<Bytes>), FjallCellCacheError> {
         let raw = read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
-        codec::decode_cell(raw.as_deref())
+        codec::frame_expiry(raw.as_deref())
     }
 
     /// Write-through: publishes one cell's committed projection with an
@@ -589,18 +524,18 @@ impl FjallCellCache {
     /// cell; a known-absent value writes the `Absent` tag. The expiry
     /// mirrors the durable row's TTL death so the entry co-expires
     /// (FLOOR-rounded, so it never outlives the durable value).
-    pub(crate) async fn put(
+    pub(crate) async fn put<P: Projection>(
         &self,
         collection: &CollectionId,
         cell: &CellKey,
-        value: &Committed,
+        value: Committed<P>,
         expiry: u64,
     ) -> Result<(), FjallCellCacheError> {
         #[cfg(test)]
         if self.fail_puts.load(Ordering::Relaxed) {
             return Err(FjallCellCacheError::Injected);
         }
-        let frame = encode_frame(value.get(), expiry);
+        let frame = encode_frame(&P::into_cached(value), expiry);
         write_cell(
             self.inner.handle(),
             codec::cell_key(collection, cell),
@@ -619,10 +554,10 @@ impl FjallCellCache {
     /// The caller owns the repair: a write-through caller removes the old
     /// entries (`Cached::publish_written`); a read-fill caller does not
     /// (`Cached::get_many`).
-    pub(crate) async fn put_batch(
+    pub(crate) async fn put_batch<P: Projection>(
         &self,
         collection: &CollectionId,
-        cells: impl IntoIterator<Item = (CellKey, Committed, u64)>,
+        cells: impl IntoIterator<Item = (CellKey, Committed<P>, u64)>,
     ) -> Result<(), FjallCellCacheError> {
         #[cfg(test)]
         if self.fail_puts.load(Ordering::Relaxed) {
@@ -637,7 +572,7 @@ impl FjallCellCache {
             .map(|(cell, value, expiry)| {
                 (
                     codec::cell_key(collection, &cell),
-                    encode_frame(value.get(), expiry),
+                    encode_frame(&P::into_cached(value), expiry),
                 )
             })
             .collect();
@@ -686,7 +621,11 @@ impl FjallCellCache {
             for (key, data) in &inputs {
                 match stage_expiry(&handle, key) {
                     Some(expiry) => {
-                        let frame = encode_frame(data.as_ref(), expiry);
+                        let frame = codec::encode_frame(
+                            data.as_deref()
+                                .map_or(CacheEntry::Absent, CacheEntry::Value),
+                            expiry,
+                        );
                         batch.insert(&handle, key.as_slice(), frame.as_ref());
                     }
                     // Missing/unreadable stage entry: delete it in the same
@@ -884,13 +823,14 @@ impl AdmissionChecks for MarkerCheckSet {
     }
 }
 
-/// Encodes a cell's presence/absence into its stored frame at `expiry`: a
-/// present `payload` writes the payload cell, `None` writes the `Absent` tag.
-fn encode_frame(payload: Option<&Bytes>, expiry: u64) -> Bytes {
-    match payload {
-        Some(payload) => codec::encode_present_cell(payload, expiry),
-        None => codec::encode_absent_cell(expiry),
-    }
+/// Borrows the owned payload for frame encoding.
+fn encode_frame(entry: &CacheEntry<Bytes>, expiry: u64) -> Bytes {
+    let borrowed = match entry {
+        CacheEntry::Absent => CacheEntry::Absent,
+        CacheEntry::Exists => CacheEntry::Exists,
+        CacheEntry::Value(bytes) => CacheEntry::Value(bytes.as_ref()),
+    };
+    codec::encode_frame(borrowed, expiry)
 }
 
 /// Reads the raw cell at `key`, or `None` when the key is absent — one
@@ -928,13 +868,16 @@ fn expired(expiry: u64, now: u64) -> bool {
 /// [`Hit`](CacheRead::Hit) on the present value or authoritative absent tag.
 ///
 /// The point [`get`](FjallCellCache::get) and batch
-/// [`probe_batch`](FjallCellCache::probe_batch) share this classifier.
+/// [`get_batch`](FjallCellCache::get_batch) share this classifier.
 fn classify<P: Projection>(expiry: u64, read: Read<P::Payload>, now: u64) -> CacheRead<P> {
+    let remaining = (expiry != codec::NEVER_EXPIRES).then(|| {
+        CompactDuration::new(u32::try_from(expiry.saturating_sub(now) / 1_000).unwrap_or(u32::MAX))
+    });
     match read {
         Read::Unknown => CacheRead::Miss,
         _ if expired(expiry, now) => CacheRead::Expired,
-        Read::Present(payload) => CacheRead::Hit(Committed::new(Some(payload))),
-        Read::Absent => CacheRead::Hit(Committed::new(None)),
+        Read::Present(payload) => CacheRead::Hit((Committed::new(Some(payload)), remaining)),
+        Read::Absent => CacheRead::Hit((Committed::new(None), remaining)),
     }
 }
 
@@ -952,9 +895,8 @@ fn stage_expiry(handle: &Keyspace, key: &[u8]) -> Option<u64> {
             return None;
         }
     };
-    match codec::decode_cell(raw.as_deref()) {
-        Ok((_, Read::Unknown)) => None,
-        Ok((expiry, _)) => Some(expiry),
+    match codec::frame_expiry(raw.as_deref()) {
+        Ok(expiry) => expiry,
         Err(error) => {
             warn!(%error, "committed-value cache commit expiry decode failed; degrading");
             None

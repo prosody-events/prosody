@@ -50,10 +50,28 @@ pub trait Projection: Copy + Send + Sync + 'static + sealed::Sealed {
     fn from_value(bytes: Bytes) -> Self::Payload;
 
     /// Reads a cache entry. [`Read::Unknown`] means the entry cannot answer.
-    fn from_cached<B: Into<Bytes>>(cached: CacheEntry<B>) -> Read<Self::Payload>;
+    fn from_cached<B: IntoBytes>(cached: CacheEntry<B>) -> Read<Self::Payload>;
 
     /// Returns the cache entry for one committed read.
     fn into_cached(committed: Committed<Self>) -> CacheEntry<Bytes>;
+}
+
+/// Converts a cache payload to owned bytes.
+pub trait IntoBytes {
+    /// Copies a borrowed slice or returns owned bytes unchanged.
+    fn into_bytes(self) -> Bytes;
+}
+
+impl IntoBytes for &[u8] {
+    fn into_bytes(self) -> Bytes {
+        Bytes::copy_from_slice(self)
+    }
+}
+
+impl IntoBytes for Bytes {
+    fn into_bytes(self) -> Bytes {
+        self
+    }
 }
 
 /// Reads the committed bytes of a present cell.
@@ -65,7 +83,7 @@ pub struct Values;
 pub struct Presence;
 
 /// What a cache knows about one cell. `Value` refines `Exists`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheEntry<B> {
     /// The cell is absent.
     Absent,
@@ -103,9 +121,9 @@ impl Projection for Values {
         bytes
     }
 
-    fn from_cached<B: Into<Bytes>>(cached: CacheEntry<B>) -> Read<Self::Payload> {
+    fn from_cached<B: IntoBytes>(cached: CacheEntry<B>) -> Read<Self::Payload> {
         match cached {
-            CacheEntry::Value(bytes) => Read::Present(bytes.into()),
+            CacheEntry::Value(bytes) => Read::Present(bytes.into_bytes()),
             CacheEntry::Absent => Read::Absent,
             CacheEntry::Exists => Read::Unknown,
         }
@@ -125,7 +143,7 @@ impl Projection for Presence {
 
     fn from_value(_bytes: Bytes) -> Self::Payload {}
 
-    fn from_cached<B: Into<Bytes>>(cached: CacheEntry<B>) -> Read<Self::Payload> {
+    fn from_cached<B: IntoBytes>(cached: CacheEntry<B>) -> Read<Self::Payload> {
         match cached {
             CacheEntry::Value(_) | CacheEntry::Exists => Read::Present(()),
             CacheEntry::Absent => Read::Absent,

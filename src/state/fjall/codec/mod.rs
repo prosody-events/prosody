@@ -39,7 +39,7 @@
 //! `expiry` is an absolute wall-clock millisecond deadline mirroring the
 //! durable Cassandra row's TTL death; `0` means "never expires" (a `None`-TTL
 //! collection). Fjall has no native per-entry TTL, so the cache enforces it on
-//! read: [`decode_cell`] returns the expiry and the caller treats `now >=
+//! read: [`decode_frame`] returns the expiry and the caller treats `now >=
 //! expiry` (a non-zero expiry) as a miss/skip — exactly as the oracle resolves
 //! the expired durable row to absent. Stamping rounds **down** (the expiry is
 //! `now + remaining` where `remaining` is the row's whole-second `TTL(data)`),
@@ -48,7 +48,7 @@
 
 use super::error::FjallCellCacheError;
 use crate::state::CollectionId;
-use crate::state::cell::Read;
+use crate::state::cell::CacheEntry;
 use crate::state::cell_key::{CellKey, Section};
 use bytes::Bytes;
 use smallvec::SmallVec;
@@ -64,6 +64,9 @@ const CACHE_TAG_ABSENT: u8 = 0x00;
 /// Tag byte for "known present" entries.
 const CACHE_TAG_PRESENT: u8 = 0x01;
 
+/// Tag byte for presence without a payload.
+const CACHE_TAG_EXISTS: u8 = 0x02;
+
 /// Width of the absolute-expiry header (`u64` big-endian millis) carried after
 /// the tag byte by every cell frame. `0` means "never expires".
 const EXPIRY_LEN: usize = 8;
@@ -77,6 +80,8 @@ pub(super) const NEVER_EXPIRES: u64 = 0;
 /// A range scan over `[section_prefix, …]` stays within one section of one
 /// collection; the order-preserving coordinate bytes follow.
 pub(super) const SECTION_PREFIX_LEN: usize = COLLECTION_PREFIX_LEN + 1;
+
+type DecodedFrame<'a> = (u64, Option<CacheEntry<&'a [u8]>>);
 
 /// Returns the full fjall key for one cell: the 16-byte collection prefix
 /// followed by the cell's `section` byte and order-preserving `coordinate`
@@ -142,80 +147,25 @@ pub(super) fn collection_prefix(id: &CollectionId) -> [u8; COLLECTION_PREFIX_LEN
     hasher.digest128().to_be_bytes()
 }
 
-/// Encodes an `Absent` cache cell with its absolute `expiry` (`0` = never).
+/// Encodes a cache entry with its absolute expiry. Zero means no expiry.
 #[must_use]
-pub(super) fn encode_absent_cell(expiry: u64) -> Bytes {
-    let mut buf = Vec::with_capacity(1 + EXPIRY_LEN);
-    buf.push(CACHE_TAG_ABSENT);
-    buf.extend_from_slice(&expiry.to_be_bytes());
-    Bytes::from(buf)
-}
-
-/// Encodes a `Present` cache cell from raw payload bytes and its absolute
-/// `expiry` (`0` = never).
-///
-/// The cell is framed `[CACHE_TAG_PRESENT][expiry: u64 BE][raw payload]` — the
-/// payload is stored verbatim, with no app-level compression. fjall
-/// block-compresses the containing data block (LZ4) on disk at
-/// flush/compaction, so a redundant per-cell codec layer is neither needed nor
-/// applied.
-#[must_use]
-pub(super) fn encode_present_cell(payload: &[u8], expiry: u64) -> Bytes {
+pub(super) fn encode_frame(entry: CacheEntry<&[u8]>, expiry: u64) -> Bytes {
+    let (tag, payload) = match entry {
+        CacheEntry::Absent => (CACHE_TAG_ABSENT, &[][..]),
+        CacheEntry::Exists => (CACHE_TAG_EXISTS, &[][..]),
+        CacheEntry::Value(payload) => (CACHE_TAG_PRESENT, payload),
+    };
     let mut buf = Vec::with_capacity(1 + EXPIRY_LEN + payload.len());
-    buf.push(CACHE_TAG_PRESENT);
+    buf.push(tag);
     buf.extend_from_slice(&expiry.to_be_bytes());
     buf.extend_from_slice(payload);
     Bytes::from(buf)
 }
 
-/// Decodes a cache cell into its absolute expiry and three-valued read. The
-/// caller checks the expiry against its clock (`now >= expiry`, expiry non-zero
-/// ⇒ treat as a miss/skip); keeping the check in the caller lets one clock
-/// drive every read.
-///
-/// Returns:
-/// - `Ok((0, Read::Unknown))` only when the cache had no entry (caller signals
-///   this by passing `None` here).
-/// - `Ok((expiry, Read::Absent))` for a `0x00`-tagged cell.
-/// - `Ok((expiry, Read::Present(payload)))` for a `0x01`-tagged cell with the
-///   raw payload tail (which may be empty — a `Set` of empty bytes is a present
-///   value distinct from `Absent`).
-/// - `Err(_)` for any malformed cell (buffer too short for the tag + expiry
-///   header, unknown tag).
-///
-/// The returned `Bytes` is a fresh `copy_from_slice` of the payload tail, so
-/// it is uniquely owned — preserving the `try_into_mut` read fast path the
-/// handle relies on.
-pub(super) fn decode_cell(bytes: Option<&[u8]>) -> Result<(u64, Read<Bytes>), FjallCellCacheError> {
-    let (expiry, read) = decode_cell_parts(bytes)?;
-    Ok((
-        expiry,
-        match read {
-            Read::Present(payload) => Read::Present(Bytes::copy_from_slice(payload)),
-            Read::Absent => Read::Absent,
-            Read::Unknown => Read::Unknown,
-        },
-    ))
-}
-
-/// Decodes presence and expiry without copying the payload bytes.
-pub(super) fn decode_presence(
-    bytes: Option<&[u8]>,
-) -> Result<(u64, Read<()>), FjallCellCacheError> {
-    let (expiry, read) = decode_cell_parts(bytes)?;
-    Ok((
-        expiry,
-        match read {
-            Read::Present(_) => Read::Present(()),
-            Read::Absent => Read::Absent,
-            Read::Unknown => Read::Unknown,
-        },
-    ))
-}
-
-fn decode_cell_parts(bytes: Option<&[u8]>) -> Result<(u64, Read<&[u8]>), FjallCellCacheError> {
+/// Decodes a frame without a payload copy. A missing entry returns `None`.
+pub(super) fn decode_frame(bytes: Option<&[u8]>) -> Result<DecodedFrame<'_>, FjallCellCacheError> {
     let Some(bytes) = bytes else {
-        return Ok((NEVER_EXPIRES, Read::Unknown));
+        return Ok((NEVER_EXPIRES, None));
     };
     let (tag, rest) = bytes
         .split_first()
@@ -223,17 +173,25 @@ fn decode_cell_parts(bytes: Option<&[u8]>) -> Result<(u64, Read<&[u8]>), FjallCe
     // The expiry header follows the tag for both Present and Absent frames.
     let expiry_bytes: [u8; EXPIRY_LEN] = rest
         .get(..EXPIRY_LEN)
-        .and_then(|s| s.try_into().ok())
-        .ok_or(FjallCellCacheError::EmptyCacheCell)?;
+        .ok_or(FjallCellCacheError::EmptyCacheCell)?
+        .try_into()
+        .map_err(|_| FjallCellCacheError::EmptyCacheCell)?;
     let expiry = u64::from_be_bytes(expiry_bytes);
     let payload = &rest[EXPIRY_LEN..];
     match *tag {
-        CACHE_TAG_ABSENT => Ok((expiry, Read::Absent)),
+        CACHE_TAG_ABSENT => Ok((expiry, Some(CacheEntry::Absent))),
         // An empty payload tail is valid: a `Set` of empty bytes frames as
         // `[0x01][expiry]`, so do NOT re-add an "empty tail ⇒ corrupt" guard.
-        CACHE_TAG_PRESENT => Ok((expiry, Read::Present(payload))),
+        CACHE_TAG_PRESENT => Ok((expiry, Some(CacheEntry::Value(payload)))),
+        CACHE_TAG_EXISTS => Ok((expiry, Some(CacheEntry::Exists))),
         other => Err(FjallCellCacheError::UnknownCacheTag(other)),
     }
+}
+
+/// Returns the expiry of any frame. A missing entry has no expiry.
+pub(super) fn frame_expiry(bytes: Option<&[u8]>) -> Result<Option<u64>, FjallCellCacheError> {
+    let (expiry, entry) = decode_frame(bytes)?;
+    Ok(entry.map(|_| expiry))
 }
 
 #[cfg(test)]
