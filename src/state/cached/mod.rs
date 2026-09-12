@@ -20,6 +20,8 @@
 //! - **KV5 — a successful update retains warmth.** Expiry, reassignment,
 //!   clears, and cache errors can force a durable read.
 //!
+//! A probe error publishes nothing. A corrupt frame is overwritten as a repair.
+//!
 //! Mutators publish values after the durable write succeeds. Direct writes
 //! remove old entries before the write. Promotion retains the expiry from the
 //! stage. Cancellation during promotion disables the cache until the assignment
@@ -67,9 +69,6 @@ const DELETE_RETRY_DELAY: Duration = Duration::ZERO;
 pub(crate) const DELETE_RETRY_BUDGET: usize = 5;
 
 /// A shared cache over a durable store for one partition assignment.
-///
-/// Concurrent value and presence fills can replace a value frame with a
-/// presence frame. This loses cache warmth but preserves the answer.
 #[derive(Clone)]
 pub struct Cached<L> {
     fjall: FjallCellCache,
@@ -216,10 +215,17 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
             }
             Ok(CacheRead::Miss) => CacheResult::Miss,
             Ok(CacheRead::Expired) => CacheResult::Expired,
+            Ok(CacheRead::Corrupt) => {
+                self.metrics.cache_error("get", "lookup");
+                CacheResult::Error
+            }
             Err(error) => {
                 warn_skip("read", &error);
                 self.metrics.cache_error("get", "lookup");
-                CacheResult::Error
+                let loaded = CellRead::<P>::read(&self.lower, collection, cell).await;
+                self.metrics
+                    .point(P::NAME, started, Source::Store, CacheResult::Error, &loaded);
+                return loaded;
             }
         };
         let stamped_at = self.fjall.clock().now_ms();
@@ -249,7 +255,6 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
     /// Reads the whole lower batch after any miss and publishes only probe
     /// misses. Partial refetch requires a benchmark before it can replace
     /// this rule.
-    /// A probe error publishes every position.
     async fn read_many<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -269,36 +274,45 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
             );
             return loaded;
         }
-        let (probes, cache_result) =
-            match self.fjall.get_batch::<P>(collection, section, batch).await {
-                Ok(probes) => {
-                    let hits: Option<CacheBatch<P>> = probes
-                        .iter()
-                        .map(|probe| match probe {
-                            CacheRead::Hit(hit) => Some(hit.clone()),
-                            CacheRead::Miss | CacheRead::Expired => None,
-                        })
-                        .collect();
-                    if let Some(hits) = hits {
-                        let loaded = Ok(hits);
-                        self.metrics.batch(
-                            batch.len(),
-                            P::NAME,
-                            started,
-                            Source::Cache,
-                            CacheResult::Hit,
-                            &loaded,
-                        );
-                        return loaded;
-                    }
-                    (probes, CacheResult::NotAllHit)
+        let probes = match self.fjall.get_batch::<P>(collection, section, batch).await {
+            Ok(probes) => {
+                let hits: Option<CacheBatch<P>> = probes
+                    .iter()
+                    .map(|probe| match probe {
+                        CacheRead::Hit(hit) => Some(hit.clone()),
+                        CacheRead::Miss | CacheRead::Expired | CacheRead::Corrupt => None,
+                    })
+                    .collect();
+                if let Some(hits) = hits {
+                    let loaded = Ok(hits);
+                    self.metrics.batch(
+                        batch.len(),
+                        P::NAME,
+                        started,
+                        Source::Cache,
+                        CacheResult::Hit,
+                        &loaded,
+                    );
+                    return loaded;
                 }
-                Err(error) => {
-                    warn_skip("read batch", &error);
-                    self.metrics.cache_error("get_many", "lookup");
-                    (CellBuffer::new(), CacheResult::Error)
-                }
-            };
+                probes
+            }
+            Err(error) => {
+                warn_skip("read batch", &error);
+                self.metrics.cache_error("get_many", "lookup");
+                let loaded =
+                    CellRead::<P>::read_many(&self.lower, collection, section, batch).await;
+                self.metrics.batch(
+                    batch.len(),
+                    P::NAME,
+                    started,
+                    Source::Store,
+                    CacheResult::Error,
+                    &loaded,
+                );
+                return loaded;
+            }
+        };
         let stamped_at = self.fjall.clock().now_ms();
         let loaded = async {
             let filled = CellRead::<P>::read_many(&self.lower, collection, section, batch).await?;
@@ -329,7 +343,7 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
             P::NAME,
             started,
             Source::Store,
-            cache_result,
+            CacheResult::NotAllHit,
             &loaded,
         );
         loaded

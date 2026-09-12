@@ -16,8 +16,8 @@ use crate::state::store::{CacheBatch, CellBackend, CellRead, CommittedBatch, Dur
 use super::super::cached::{Cached, DELETE_RETRY_BUDGET};
 use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
-use super::super::fjall::Clock;
 use super::super::fjall::test_db;
+use super::super::fjall::{Clock, FjallCellCache};
 use super::super::marker::{EventMarker, SectionClear};
 use super::super::memory::{MemoryCellStore, MemoryCells};
 use super::super::store::{CellBuffer, CellStore, CoordinateBatch};
@@ -2437,6 +2437,66 @@ impl Replay {
     }
 }
 
+/// Failed point and batch probes preserve every warm value frame.
+async fn check_failed_probes(replay: &Replay, fjall: &FjallCellCache) -> Result<()> {
+    let cells: Vec<_> = (0..POOL)
+        .map(|key| (cell_at(key), Some(bytes(key))))
+        .collect();
+    replay
+        .subject
+        .write_resolved(&replay.cref, &cells, &[])
+        .await?;
+    let batch = batch_of((0..POOL).rev().chain([0]))?;
+    for fail_puts in [false, true] {
+        fjall.fail_puts().store(fail_puts, Ordering::Relaxed);
+        fjall.fail_reads().store(true, Ordering::Relaxed);
+        replay.counting.reset();
+        let presence =
+            CellRead::<Presence>::read_many(&replay.subject, &replay.id, SECTION, &batch).await?;
+        assert!(presence.iter().all(|(value, _)| value.get().is_some()));
+        assert_eq!(replay.counting.presence_reads(), 1);
+        fjall.fail_reads().store(false, Ordering::Relaxed);
+        replay.counting.reset();
+        let values =
+            CellRead::<Values>::read_many(&replay.subject, &replay.id, SECTION, &batch).await?;
+        assert!(values.iter().all(|(value, _)| value.get().is_some()));
+        assert_eq!(
+            replay.counting.batch_cache_reads(),
+            0,
+            "failed batch probes preserve values"
+        );
+        assert_eq!(replay.counting.lower_reads(), 0);
+
+        for key in 0..POOL {
+            fjall.fail_reads().store(true, Ordering::Relaxed);
+            replay.counting.reset();
+            assert!(
+                CellRead::<Presence>::read(&replay.subject, &replay.id, &cell_at(key))
+                    .await?
+                    .0
+                    .get()
+                    .is_some()
+            );
+            assert_eq!(replay.counting.presence_reads(), 1);
+            fjall.fail_reads().store(false, Ordering::Relaxed);
+            replay.counting.reset();
+            assert_eq!(
+                CellRead::<Values>::read(&replay.subject, &replay.id, &cell_at(key))
+                    .await?
+                    .0
+                    .get(),
+                Some(&bytes(key))
+            );
+            assert_eq!(
+                replay.counting.lower_reads(),
+                0,
+                "failed point probes preserve values"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// **The transparency property** — the whole contract of a transparent cache
 /// in one differential: one generated cell-op trace (writes, provisional
 /// stage/commit/abort, raw promotes, clears, gets, scans, clock movement,
@@ -2466,7 +2526,7 @@ fn prop_cached_is_transparent() {
             let fjall = test_db::cache_with_clock("transparent", Clock::Fixed(now.clone()))?;
             let fail_puts = fjall.fail_puts();
             let fail_deletes = fjall.fail_deletes();
-            let subject = Cached::new(fjall, ttl_lower.clone());
+            let subject = Cached::new(fjall.clone(), ttl_lower.clone());
             let twin = MemoryCellStore::new(MemoryCells::new());
             let id = collection("transparent")?;
             let ttl = trace.ttl.map(CompactDuration::new);
@@ -2522,6 +2582,7 @@ fn prop_cached_is_transparent() {
                     ));
                 }
             }
+            check_failed_probes(&replay, &fjall).await?;
             Ok(true)
         })
     }

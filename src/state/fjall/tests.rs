@@ -12,9 +12,12 @@ use super::codec::cell_key;
 use super::test_db;
 use super::{CacheRead, Clock, FjallCellCache, FjallClient, FjallClientError};
 use crate::Topic;
+use crate::state::CollectionId;
+use crate::state::cached::Cached;
 use crate::state::cell::{Committed, Presence, Values};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
-use crate::state::store::CELL_BATCH;
+use crate::state::memory::{MemoryCellStore, MemoryCells};
+use crate::state::store::{CELL_BATCH, CellRead};
 use crate::state::tests::cell_suite::{bytes, value_cell};
 use crate::state::tests::support::{batch_of, fresh_collection};
 use crate::test_util::TEST_RUNTIME;
@@ -280,19 +283,68 @@ fn get_batch_classifies_hits_misses_expiry_and_errors() -> Result<()> {
         );
         cache.fail_reads().store(false, Ordering::Relaxed);
 
-        // (5) A corrupt frame at a position fails the decode.
-        cache
-            .seed_raw_cell(&c, &batch_cell(4), Bytes::from_static(b"\x05corrupt"))
+        check_corrupt_repair(&cache, &c).await?;
+
+        now.store(3_000, Ordering::Relaxed);
+        assert!(matches!(
+            cache.get::<Values>(&c, &batch_cell(5)).await?,
+            CacheRead::Expired
+        ));
+        let probes = cache
+            .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 5])?)
             .await?;
-        assert!(
-            cache
-                .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 4])?)
-                .await
-                .is_err(),
-            "a corrupt frame degrades the batch to Err"
-        );
+        assert!(matches!(
+            probes.as_slice(),
+            [CacheRead::Hit(_), CacheRead::Expired]
+        ));
         Ok::<_, Report>(())
     })?;
+    Ok(())
+}
+
+/// A corrupt position does not change its neighbors. A fill repairs it.
+async fn check_corrupt_repair(cache: &FjallCellCache, c: &CollectionId) -> Result<()> {
+    cache
+        .inner
+        .handle()
+        .insert(cell_key(c, &batch_cell(4)).as_slice(), [0x05; 9])?;
+    assert!(matches!(
+        cache.get::<Values>(c, &batch_cell(4)).await?,
+        CacheRead::Corrupt
+    ));
+    let probes = cache
+        .get_batch::<Values>(c, Section::new(0), &batch_of([0, 4, 2, 3])?)
+        .await?;
+    assert!(matches!(
+        probes.as_slice(),
+        [
+            CacheRead::Hit(_),
+            CacheRead::Corrupt,
+            CacheRead::Miss,
+            CacheRead::Expired
+        ]
+    ));
+
+    let cached = Cached::new(cache.clone(), MemoryCellStore::new(MemoryCells::new()));
+    CellRead::<Values>::read(&cached, c, &batch_cell(4)).await?;
+    assert!(matches!(
+        cache.get::<Values>(c, &batch_cell(4)).await?,
+        CacheRead::Hit((value, _)) if value.get().is_none()
+    ));
+    cache
+        .inner
+        .handle()
+        .insert(cell_key(c, &batch_cell(4)).as_slice(), [0x05; 9])?;
+    CellRead::<Presence>::read_many(&cached, c, Section::new(0), &batch_of([0, 4])?).await?;
+    assert!(matches!(
+        cache.get::<Values>(c, &batch_cell(4)).await?,
+        CacheRead::Hit((value, _)) if value.get().is_none()
+    ));
+    assert!(matches!(
+        cache.get::<Values>(c, &batch_cell(0)).await?,
+        CacheRead::Hit((value, _)) if value.get() == Some(&bytes(0))
+    ));
+
     Ok(())
 }
 

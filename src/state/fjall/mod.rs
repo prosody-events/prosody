@@ -4,9 +4,9 @@
 //! [`Projection`] converts each frame into the requested answer.
 //! A value frame can answer either projection. A presence frame cannot answer a
 //! value read. Presence reads borrow frames without a payload copy.
-//! [`CacheRead`] distinguishes a hit, an expired answer, and an unknown answer.
-//! [`Cached`](crate::state::cached::Cached) supplies durable reads when this
-//! cache cannot answer.
+//! [`CacheRead`] distinguishes hits, expired answers, unknown answers, and
+//! corrupt frames. [`Cached`](crate::state::cached::Cached) supplies durable
+//! reads when this cache cannot answer.
 //!
 //! The workspace also stores provisional cells and completed admission checks.
 //! All components share one cache-disabled state.
@@ -121,7 +121,7 @@ impl Clock {
     }
 }
 
-/// The three-state result of a [`FjallCellCache::get`].
+/// The four-state result of a [`FjallCellCache::get`].
 #[derive(Clone, Debug)]
 pub(crate) enum CacheRead<P: Projection = Values> {
     /// An unexpired answer with its remaining durable TTL.
@@ -131,6 +131,8 @@ pub(crate) enum CacheRead<P: Projection = Values> {
     Expired,
     /// The entry is missing or cannot answer this projection.
     Miss,
+    /// The frame at this position does not decode. A fill overwrites it.
+    Corrupt,
 }
 
 /// Fjall-backed cell cache.
@@ -160,10 +162,7 @@ pub(crate) struct FjallCellCache {
     #[cfg(test)]
     #[educe(Debug(ignore))]
     fail_deletes: Arc<AtomicU64>,
-    /// Test-only fault seam: when set, [`get_batch`](Self::get_batch)'s
-    /// blocking probe returns an engine error for the whole hop, so a test
-    /// can force the batch probe to error over a live entry (the read-fill
-    /// no-delete degrade).
+    /// Test-only fault: point and batch probes return an engine error when set.
     #[cfg(test)]
     #[educe(Debug(ignore))]
     fail_reads: Arc<AtomicBool>,
@@ -339,9 +338,7 @@ impl FjallCellCache {
         self.fail_deletes.clone()
     }
 
-    /// Test handle on the [`get_batch`](Self::get_batch) fault seam: the shared
-    /// flag a test sets to force the batch probe's whole blocking hop to error
-    /// (then unsets to heal).
+    /// The shared fault flag for point and batch probes.
     #[cfg(test)]
     #[must_use]
     pub fn fail_reads(&self) -> Arc<AtomicBool> {
@@ -405,13 +402,25 @@ impl FjallCellCache {
     }
 
     /// Reads one projection and its remaining TTL from an unexpired frame.
+    /// A decode failure returns `Corrupt`. Only engine and join failures return
+    /// `Err`.
     pub(crate) async fn get<P: Projection>(
         &self,
         collection: &CollectionId,
         cell: &CellKey,
     ) -> Result<CacheRead<P>, FjallCellCacheError> {
+        #[cfg(test)]
+        if self.fail_reads.load(Ordering::Relaxed) {
+            return Err(FjallCellCacheError::Injected);
+        }
         let raw = read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
-        let (expiry, entry) = codec::decode_frame(raw.as_deref())?;
+        let (expiry, entry) = match codec::decode_frame(raw.as_deref()) {
+            Ok(frame) => frame,
+            Err(error) => {
+                warn!(%error, "cell cache frame does not decode");
+                return Ok(CacheRead::Corrupt);
+            }
+        };
         Ok(classify::<P>(
             expiry,
             entry.map_or(Read::Unknown, P::from_cached),
@@ -420,7 +429,8 @@ impl FjallCellCache {
     }
 
     /// Probes every coordinate in one blocking call and returns one result per
-    /// position.
+    /// position. A decode failure returns `Corrupt` at that position.
+    /// Only engine and join failures return `Err`.
     pub(crate) async fn get_batch<P: Projection>(
         &self,
         collection: &CollectionId,
@@ -431,7 +441,14 @@ impl FjallCellCache {
         let now = self.clock.now_ms();
         let mut reads = CellBuffer::with_capacity(raws.len());
         for raw in raws {
-            let (expiry, entry) = codec::decode_frame(raw.as_deref())?;
+            let (expiry, entry) = match codec::decode_frame(raw.as_deref()) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    warn!(%error, "cell cache frame does not decode");
+                    reads.push(CacheRead::Corrupt);
+                    continue;
+                }
+            };
             reads.push(classify::<P>(
                 expiry,
                 entry.map_or(Read::Unknown, P::from_cached),
@@ -845,8 +862,8 @@ fn classify<P: Projection>(expiry: u64, read: Read<P::Payload>, now: u64) -> Cac
         })
     };
     match read {
-        Read::Unknown => CacheRead::Miss,
         _ if expired(expiry, now) => CacheRead::Expired,
+        Read::Unknown => CacheRead::Miss,
         Read::Present(payload) => CacheRead::Hit((Committed::new(Some(payload)), remaining())),
         Read::Absent => CacheRead::Hit((Committed::new(None), remaining())),
     }
