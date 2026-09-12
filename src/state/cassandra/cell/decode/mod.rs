@@ -71,7 +71,7 @@ pub(super) type Body<P> = (
 );
 
 /// One cell body and its two durable TTL columns.
-pub(super) type PointRow<P = Values> = (
+pub(super) type PointRow<P> = (
     Option<<P as CassandraProjection>::Column>,
     Option<<P as CassandraProjection>::Column>,
     Option<i16>,

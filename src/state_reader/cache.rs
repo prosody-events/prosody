@@ -247,10 +247,9 @@ impl ReaderCache {
         let outcome = self
             .inner
             .entry_async(key, |_, existing: &mut CacheVal| {
-                if !value.downgrades(&existing.1)
-                    && (issued > existing.0
-                        || (issued == existing.0 && existing.1.downgrades(&value)))
-                {
+                // Equal issue times permit a value to refine presence.
+                let refines_presence = issued == existing.0 && existing.1.downgrades(&value);
+                if !value.downgrades(&existing.1) && (issued > existing.0 || refines_presence) {
                     *existing = (issued, value.clone());
                 }
                 EntryAction::Retain(())

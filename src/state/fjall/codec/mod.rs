@@ -61,8 +61,8 @@ const COLLECTION_PREFIX_LEN: usize = 16;
 /// Tag byte for "known absent" entries.
 const CACHE_TAG_ABSENT: u8 = 0x00;
 
-/// Tag byte for "known present" entries.
-const CACHE_TAG_PRESENT: u8 = 0x01;
+/// Tag byte for a value with its payload.
+const CACHE_TAG_VALUE: u8 = 0x01;
 
 /// Tag byte for presence without a payload.
 const CACHE_TAG_EXISTS: u8 = 0x02;
@@ -153,7 +153,7 @@ pub(super) fn encode_frame(entry: CacheEntry<&[u8]>, expiry: u64) -> Bytes {
     let (tag, payload) = match entry {
         CacheEntry::Absent => (CACHE_TAG_ABSENT, &[][..]),
         CacheEntry::Exists => (CACHE_TAG_EXISTS, &[][..]),
-        CacheEntry::Value(payload) => (CACHE_TAG_PRESENT, payload),
+        CacheEntry::Value(payload) => (CACHE_TAG_VALUE, payload),
     };
     let mut buf = Vec::with_capacity(1 + EXPIRY_LEN + payload.len());
     buf.push(tag);
@@ -170,7 +170,7 @@ pub(super) fn decode_frame(bytes: Option<&[u8]>) -> Result<DecodedFrame<'_>, Fja
     let (tag, rest) = bytes
         .split_first()
         .ok_or(FjallCellCacheError::EmptyCacheCell)?;
-    // The expiry header follows the tag for both Present and Absent frames.
+    // The expiry header follows the tag in every frame.
     let expiry_bytes: [u8; EXPIRY_LEN] = rest
         .get(..EXPIRY_LEN)
         .ok_or(FjallCellCacheError::EmptyCacheCell)?
@@ -182,7 +182,7 @@ pub(super) fn decode_frame(bytes: Option<&[u8]>) -> Result<DecodedFrame<'_>, Fja
         CACHE_TAG_ABSENT => Ok((expiry, Some(CacheEntry::Absent))),
         // An empty payload tail is valid: a `Set` of empty bytes frames as
         // `[0x01][expiry]`, so do NOT re-add an "empty tail ⇒ corrupt" guard.
-        CACHE_TAG_PRESENT => Ok((expiry, Some(CacheEntry::Value(payload)))),
+        CACHE_TAG_VALUE => Ok((expiry, Some(CacheEntry::Value(payload)))),
         CACHE_TAG_EXISTS => Ok((expiry, Some(CacheEntry::Exists))),
         other => Err(FjallCellCacheError::UnknownCacheTag(other)),
     }

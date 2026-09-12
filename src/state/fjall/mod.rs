@@ -442,16 +442,16 @@ impl FjallCellCache {
     ) -> Result<CellBuffer<CacheRead<P>>, FjallCellCacheError> {
         let raws = self.read_batch(collection, section, batch).await?;
         let now = self.clock.now_ms();
-        let mut hits = CellBuffer::with_capacity(raws.len());
+        let mut reads = CellBuffer::with_capacity(raws.len());
         for raw in raws {
             let (expiry, entry) = codec::decode_frame(raw.as_deref())?;
-            hits.push(classify::<P>(
+            reads.push(classify::<P>(
                 expiry,
                 entry.map_or(Read::Unknown, P::from_cached),
                 now,
             ));
         }
-        Ok(hits)
+        Ok(reads)
     }
 
     async fn read_batch(
@@ -870,14 +870,18 @@ fn expired(expiry: u64, now: u64) -> bool {
 /// The point [`get`](FjallCellCache::get) and batch
 /// [`get_batch`](FjallCellCache::get_batch) share this classifier.
 fn classify<P: Projection>(expiry: u64, read: Read<P::Payload>, now: u64) -> CacheRead<P> {
-    let remaining = (expiry != codec::NEVER_EXPIRES).then(|| {
-        CompactDuration::new(u32::try_from(expiry.saturating_sub(now) / 1_000).unwrap_or(u32::MAX))
-    });
+    let remaining = || {
+        (expiry != codec::NEVER_EXPIRES).then(|| {
+            CompactDuration::new(
+                u32::try_from(expiry.saturating_sub(now) / 1_000).unwrap_or(u32::MAX),
+            )
+        })
+    };
     match read {
         Read::Unknown => CacheRead::Miss,
         _ if expired(expiry, now) => CacheRead::Expired,
-        Read::Present(payload) => CacheRead::Hit((Committed::new(Some(payload)), remaining)),
-        Read::Absent => CacheRead::Hit((Committed::new(None), remaining)),
+        Read::Present(payload) => CacheRead::Hit((Committed::new(Some(payload)), remaining())),
+        Read::Absent => CacheRead::Hit((Committed::new(None), remaining())),
     }
 }
 

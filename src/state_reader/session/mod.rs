@@ -451,6 +451,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                 &mut selection,
                 |source| async move {
                     let id = self.collection_id_for(source)?;
+                    // Like resolve_probe nodes, stream boxes are bounded by MAX_PUBLICATION_SOURCES per operation, not per cell.
                     let mut stream = Box::pin(self.source_scan::<P>(id, scan));
                     let first = cooperative(stream.next()).await.transpose()?;
                     Ok(first.map(|row| (row, stream)))

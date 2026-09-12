@@ -2758,7 +2758,7 @@ fn counting_cached(name: &str) -> Result<(Cached<CountingLower>, CountingLower, 
 
 /// Presence scans through the cache match value scan keys.
 #[test]
-fn prop_cached_scan_presence_parity() {
+fn prop_cached_projection_scan_parity() {
     fn property(trace: ScanTrace) -> Result<bool> {
         let cells = MemoryCells::new();
         let name = uuid::Uuid::new_v4().to_string();

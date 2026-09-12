@@ -74,12 +74,7 @@ pub(super) async fn fetch_batch<P: CassandraProjection>(
         .rows::<BatchRow<P>>()
         .map_err(CassandraStoreError::from)?
     {
-        let (coordinate, data, prev, encoding, version, event, ttl_data, ttl_prev) =
-            row.map_err(CassandraStoreError::from)?;
-        rows.push((
-            coordinate,
-            (data, prev, encoding, version, event, ttl_data, ttl_prev),
-        ));
+        rows.push(split_batch::<P>(row.map_err(CassandraStoreError::from)?));
     }
     Ok(match_rows_to_coordinates(rows, coordinates))
 }
@@ -112,6 +107,15 @@ pub(super) fn split_point<P: CassandraProjection>(row: PointRow<P>) -> (Body<P>,
     )
 }
 
+/// Separates a batch row's coordinate from its point row.
+fn split_batch<P: CassandraProjection>(row: BatchRow<P>) -> (Bytes, PointRow<P>) {
+    let (coordinate, data, prev, encoding, version, event, ttl_data, ttl_prev) = row;
+    (
+        coordinate,
+        (data, prev, encoding, version, event, ttl_data, ttl_prev),
+    )
+}
+
 /// Pages projected rows within the scan bounds.
 /// Callers apply commit evidence and limits after decode.
 pub(super) fn page<'a, P: CassandraProjection>(
@@ -127,16 +131,40 @@ pub(super) fn page<'a, P: CassandraProjection>(
     try_stream! {
         let pk = Pk::of(collection);
         let statement = &statements.scan[dir as usize][start.kind() as usize];
-        let pager = session.session().execute_iter(statement.clone(),
-            (pk.segment_id, pk.key, pk.state_type, pk.name, CellKind::Cell, section, start.as_ref().anchor()),
-        ).await.map_err(CassandraStoreError::from)?;
-        let stream = pager.rows_stream::<ScanRow<P>>().map_err(CassandraStoreError::from)?;
+        let pager = session
+            .session()
+            .execute_iter(
+                statement.clone(),
+                (
+                    pk.segment_id,
+                    pk.key,
+                    pk.state_type,
+                    pk.name,
+                    CellKind::Cell,
+                    section,
+                    start.as_ref().anchor(),
+                ),
+            )
+            .await
+            .map_err(CassandraStoreError::from)?;
+        let stream = pager
+            .rows_stream::<ScanRow<P>>()
+            .map_err(CassandraStoreError::from)?;
         pin_mut!(stream);
-        while let Some(row) = cooperative(stream.try_next()).await.map_err(CassandraStoreError::from)? {
+
+        while let Some(row) = cooperative(stream.try_next())
+            .await
+            .map_err(CassandraStoreError::from)?
+        {
             let (section, coordinate, data, prev, encoding, version, event) = row;
-            let key = CellKey { section: Section::new(section), coordinate: Coordinate::from_bytes(coordinate) };
+            let key = CellKey {
+                section: Section::new(section),
+                coordinate: Coordinate::from_bytes(coordinate),
+            };
             let cell = decode_body::<P>((data, prev, encoding, version, event))?;
-            if past_end(dir, &key, end.as_ref()) { break; }
+            if past_end(dir, &key, end.as_ref()) {
+                break;
+            }
             yield (key, cell);
         }
     }

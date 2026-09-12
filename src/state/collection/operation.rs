@@ -621,7 +621,7 @@ where
     Ok(slots
         .into_iter()
         .map(|slot| match slot {
-            Slot::Answered(bytes) => bytes,
+            Slot::Answered(payload) => payload,
             // The engine answers every batched position in order, so the
             // answers line up with the pending slots.
             Slot::Pending(_) => answers.next().flatten(),
@@ -643,8 +643,8 @@ pub(super) async fn read_keys<S, T, P: Projection>(
     keys: &[KeyOf<T>],
 ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
 where
-    S::Engine: sealed::Reads<S, P>,
     S: StateSession,
+    S::Engine: sealed::Reads<S, P>,
     T: CellType,
 {
     // Mapped as a function item, so the lowering carries no closure whose
@@ -674,8 +674,8 @@ async fn read_coordinates<S, P: Projection>(
     expected: usize,
 ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
 where
-    S::Engine: sealed::Reads<S, P>,
     S: StateSession,
+    S::Engine: sealed::Reads<S, P>,
 {
     let mut answers: CellBuffer<Option<P::Payload>> = SmallVec::with_capacity(expected);
     for batch in CoordinateBatch::chunks(coordinates) {

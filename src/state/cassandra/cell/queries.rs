@@ -16,6 +16,8 @@ const BATCH: &str = "SELECT coordinate, {}, encoding, version, event, TTL(data),
 const SCAN: &str = "SELECT section, coordinate, {}, encoding, version, event FROM $keyspace.{} \
                     WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? AND kind = ? \
                     AND section = ? AND coordinate {} ? ORDER BY coordinate {}";
+/// Shapes use `[Direction][EdgeKind]` indices; both unbounded slots bind an
+/// empty anchor.
 const SCAN_SHAPES: [[(&str, &str); 3]; 2] = [
     [(">=", "ASC"), (">", "ASC"), (">=", "ASC")],
     [("<=", "DESC"), ("<", "DESC"), (">=", "DESC")],

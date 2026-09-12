@@ -10,12 +10,16 @@ use scylla::deserialize::value::DeserializeValue;
 /// Public visibility permits generic bounds; the private module keeps this
 /// sealed trait internal.
 pub trait CassandraProjection: Projection {
+    /// The driver type for one projected blob column.
     type Column: for<'frame, 'metadata> DeserializeValue<'frame, 'metadata> + Send + 'static;
+    /// The column expressions for `data` and `prev_data`, in that order.
     const SELECT: &'static str;
+    /// Decodes one column with the shared row encoding.
     fn decode_column(
         column: Option<Self::Column>,
         encoding: Option<Encoding>,
     ) -> Result<Option<Self::Payload>, CassandraCellStoreError>;
+    /// Returns the prepared statements for this projection.
     fn statements(queries: &CellQueries) -> &ReadStatements;
 }
 
