@@ -9,6 +9,7 @@ use super::{
 use crate::state::cell::resolve_for_reader;
 use crate::state::marker::ReaderEvidence;
 use crate::state::resolve::sibling_committed;
+use crate::state_reader::{CellSource, CommittedCellSource};
 use futures::try_join;
 
 impl CassandraCellResources {
@@ -120,5 +121,36 @@ impl CassandraCellResources {
                 row = pages.try_next().await?;
             }
         }
+    }
+}
+
+impl CellSource for CassandraCellResources {
+    type Error = CassandraCellStoreError;
+}
+
+impl<P: CassandraProjection> CommittedCellSource<P> for CassandraCellResources {
+    async fn load(
+        &self,
+        id: &CollectionId,
+        cell: &CellKey,
+    ) -> Result<Option<P::Payload>, Self::Error> {
+        self.read_committed::<P>(id, cell).await
+    }
+
+    async fn load_many(
+        &self,
+        id: &CollectionId,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<CellBuffer<Option<P::Payload>>, Self::Error> {
+        self.read_committed_many::<P>(id, section, batch).await
+    }
+
+    fn scan<'a>(
+        &'a self,
+        id: &'a CollectionId,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+        self.scan_committed::<P>(id, scan)
     }
 }

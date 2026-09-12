@@ -2123,8 +2123,7 @@ impl Replay {
             if self.fault_puts {
                 self.warm.remove(&key);
             } else {
-                self.warm
-                    .insert(key, (expiry, Values::into_cached(Committed::new(value))));
+                self.warm.insert(key, (expiry, Values::into_cached(value)));
             }
         }
     }
@@ -2247,7 +2246,7 @@ impl Replay {
                 }
                 for (cell, write) in &staged.writes {
                     if let Some((_, entry)) = self.warm.get_mut(&cell.coordinate.as_bytes()[0]) {
-                        *entry = Values::into_cached(Committed::new(write.data().cloned()));
+                        *entry = Values::into_cached(write.data().cloned());
                     }
                 }
             }
@@ -2343,7 +2342,8 @@ impl Replay {
             "a value point does not fetch another projection or batch"
         );
         if falls_through && !self.fault_puts {
-            self.warm.insert(key, (u64::MAX, Values::into_cached(twin)));
+            self.warm
+                .insert(key, (u64::MAX, Values::into_cached(twin.into_inner())));
         }
         Ok(())
     }
@@ -2417,8 +2417,10 @@ impl Replay {
                 "presence differs at {key}"
             );
             if missed.contains(key) && !self.fault_puts {
-                self.warm
-                    .insert(*key, (u64::MAX, Presence::into_cached(present)));
+                self.warm.insert(
+                    *key,
+                    (u64::MAX, Presence::into_cached(present.into_inner())),
+                );
             }
         }
         Ok(())

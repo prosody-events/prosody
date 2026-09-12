@@ -53,7 +53,7 @@ pub trait Projection: Copy + Send + Sync + 'static + sealed::Sealed {
     fn from_cached<B: IntoBytes>(cached: CacheEntry<B>) -> Read<Self::Payload>;
 
     /// Returns the cache entry for one committed read.
-    fn into_cached(committed: Committed<Self>) -> CacheEntry<Bytes>;
+    fn into_cached(payload: Option<Self::Payload>) -> CacheEntry<Bytes>;
 }
 
 /// Converts a cache payload to owned bytes.
@@ -129,10 +129,8 @@ impl Projection for Values {
         }
     }
 
-    fn into_cached(committed: Committed<Self>) -> CacheEntry<Bytes> {
-        committed
-            .into_inner()
-            .map_or(CacheEntry::Absent, CacheEntry::Value)
+    fn into_cached(payload: Option<Self::Payload>) -> CacheEntry<Bytes> {
+        payload.map_or(CacheEntry::Absent, CacheEntry::Value)
     }
 }
 
@@ -150,10 +148,8 @@ impl Projection for Presence {
         }
     }
 
-    fn into_cached(committed: Committed<Self>) -> CacheEntry<Bytes> {
-        committed
-            .into_inner()
-            .map_or(CacheEntry::Absent, |()| CacheEntry::Exists)
+    fn into_cached(payload: Option<Self::Payload>) -> CacheEntry<Bytes> {
+        payload.map_or(CacheEntry::Absent, |()| CacheEntry::Exists)
     }
 }
 

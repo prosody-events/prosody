@@ -64,8 +64,8 @@ fn prop_projection_cache_lattice() {
         let bytes = Bytes::from(payload);
         let value = present.then(|| bytes.clone());
         let presence = present.then_some(());
-        let value_entry = Values::into_cached(Committed::new(value.clone()));
-        let presence_entry = Presence::into_cached(Committed::new(presence));
+        let value_entry = Values::into_cached(value.clone());
+        let presence_entry = Presence::into_cached(presence);
         assert_eq!(Values::from_value(bytes.clone()), bytes);
         assert_eq!(
             Values::from_cached(value_entry.clone()),

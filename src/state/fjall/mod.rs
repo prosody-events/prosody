@@ -535,7 +535,7 @@ impl FjallCellCache {
         if self.fail_puts.load(Ordering::Relaxed) {
             return Err(FjallCellCacheError::Injected);
         }
-        let frame = encode_frame(&P::into_cached(value), expiry);
+        let frame = encode_frame(&P::into_cached(value.into_inner()), expiry);
         write_cell(
             self.inner.handle(),
             codec::cell_key(collection, cell),
@@ -572,7 +572,7 @@ impl FjallCellCache {
             .map(|(cell, value, expiry)| {
                 (
                     codec::cell_key(collection, &cell),
-                    encode_frame(&P::into_cached(value), expiry),
+                    encode_frame(&P::into_cached(value.into_inner()), expiry),
                 )
             })
             .collect();

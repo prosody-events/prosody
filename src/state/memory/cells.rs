@@ -1,6 +1,6 @@
 //! Process-shared in-memory cells and committed reader projections.
 
-use crate::state::cell::{Cell, Committed, ProvisionalCell, resolve_for_reader};
+use crate::state::cell::{Cell, Committed, Projection, ProvisionalCell, resolve_for_reader};
 use crate::state::cell_key::{CellKey, Direction, Scan, Section};
 #[cfg(test)]
 use crate::state::marker::EventMarker;
@@ -86,12 +86,12 @@ impl MemoryCells {
         resolve_for_reader(&self.read_committed_cell(collection, cell), &evidence).cloned()
     }
 
-    pub(crate) fn read_committed_many(
+    pub(crate) fn read_committed_many<P: Projection>(
         &self,
         collection: &CollectionId,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> CellBuffer<Option<Bytes>> {
+    ) -> CellBuffer<Option<P::Payload>> {
         let evidence = self.reader_evidence(collection);
         batch
             .iter()
@@ -103,7 +103,9 @@ impl MemoryCells {
                 if !evidence.survives(&key) {
                     return None;
                 }
-                resolve_for_reader(&self.read_committed_cell(collection, &key), &evidence).cloned()
+                resolve_for_reader(&self.read_committed_cell(collection, &key), &evidence)
+                    .cloned()
+                    .map(P::from_value)
             })
             .collect()
     }

@@ -10,13 +10,13 @@
 //!
 //! Every test drives a mocked monotonic clock instead of sleeping, so timing
 //! stays deterministic. The cache is exercised directly, with no
-//! stores underneath, so each invariant is isolated. Each fill closure is
-//! written inline because the cache's `Fn() -> impl Future` bound needs a
-//! concrete future, not a boxed `dyn`.
+//! stores underneath, so each invariant is isolated.
+//! Each fill closure supplies the concrete future type that the cache requires.
 
 use super::support::{mock_clock_cache, topic};
 use crate::Key;
 use crate::state::access::StateAccessError;
+use crate::state::cell::{Presence, Values};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::store::CellBuffer;
 use crate::state::{StateName, StateType};
@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 /// A cache key for the given collection name at cell coordinate `coord`.
 fn key_at(
@@ -197,7 +198,7 @@ async fn run_cache_schedule(schedule: CacheSchedule) -> Result<bool> {
 
                 let counter = fills.clone();
                 let served = cache
-                    .get_cached(keys[key as usize].clone(), CACHE_TTL, move || {
+                    .get_cached::<Values, _, _>(keys[key as usize].clone(), CACHE_TTL, move || {
                         let counter = counter.clone();
                         let filled = filled.clone();
                         async move {
@@ -245,13 +246,17 @@ async fn slow_fill_cannot_launder() -> Result<()> {
     };
 
     // Issued at t=0, completes at t=10s; the fill serves its own result.
-    let got = cache.get_cached(k.clone(), ttl, fill).await?;
+    let got = cache
+        .get_cached::<Values, _, _>(k.clone(), ttl, fill)
+        .await?;
     assert_eq!(got, Some(Bytes::from_static(b"v")));
     assert_eq!(fills.load(Ordering::Relaxed), 1);
 
     // A later reader at t=10s: age 10s >= ttl → miss → refill. The refill
     // advances the clock again, which only ages it further.
-    cache.get_cached(k.clone(), ttl, fill).await?;
+    cache
+        .get_cached::<Values, _, _>(k.clone(), ttl, fill)
+        .await?;
     assert_eq!(
         fills.load(Ordering::Relaxed),
         2,
@@ -280,8 +285,8 @@ async fn cold_miss_is_single_flight() -> Result<()> {
 
     let ttl = Duration::from_secs(1);
     let (a, b) = tokio::join!(
-        cache.get_cached(k.clone(), ttl, fill),
-        cache.get_cached(k.clone(), ttl, fill),
+        cache.get_cached::<Values, _, _>(k.clone(), ttl, fill),
+        cache.get_cached::<Values, _, _>(k.clone(), ttl, fill),
     );
     assert_eq!(a?, Some(Bytes::from_static(b"v")));
     assert_eq!(b?, Some(Bytes::from_static(b"v")));
@@ -317,12 +322,34 @@ async fn get_many_cached_shortcuts_when_all_fresh() -> Result<()> {
         }
     };
 
-    // Cold: one batch fill seeds both keys at t=0.
-    cache.get_many_cached(&keys, ttl, fill).await?;
+    // A newer presence fill finishes after an older value fill.
+    let presence_started = Notify::new();
+    let value_done = Notify::new();
+    let values = async {
+        let result = cache
+            .get_many_cached::<Values, _, _>(&keys, ttl, || async {
+                mock.increment(Duration::from_nanos(1));
+                presence_started.notified().await;
+                fill().await
+            })
+            .await;
+        value_done.notify_one();
+        result
+    };
+    let presence = cache.get_many_cached::<Presence, _, _>(&keys, ttl, || async {
+        presence_started.notify_one();
+        value_done.notified().await;
+        Ok(smallvec![Some(()), Some(())])
+    });
+    let (values, presence) = tokio::join!(biased; values, presence);
+    values?;
+    assert_eq!(presence?.as_slice(), [Some(()), Some(())]);
     assert_eq!(fills.load(Ordering::Relaxed), 1, "cold batch fills once");
 
-    // Both still fresh at t=0: the all-hits shortcut serves from cache.
-    let served = cache.get_many_cached(&keys, ttl, fill).await?;
+    // Both entries remain fresh. The cache answers without a fill.
+    let served = cache
+        .get_many_cached::<Values, _, _>(&keys, ttl, fill)
+        .await?;
     let expected: CellBuffer<Option<Bytes>> = smallvec![
         Some(Bytes::from_static(b"a")),
         Some(Bytes::from_static(b"b"))
@@ -337,7 +364,9 @@ async fn get_many_cached_shortcuts_when_all_fresh() -> Result<()> {
     // Advance to the ttl: age == ttl is stale (the strict-`<` boundary), so
     // exactly one whole-batch refill fires (a single fill, not one per key).
     mock.increment(ttl);
-    cache.get_many_cached(&keys, ttl, fill).await?;
+    cache
+        .get_many_cached::<Values, _, _>(&keys, ttl, fill)
+        .await?;
     assert_eq!(
         fills.load(Ordering::Relaxed),
         2,
@@ -361,7 +390,7 @@ async fn declared_weight_bounded_by_budget() -> Result<()> {
         )?;
         let value = value.clone();
         cache
-            .get_cached(k, Duration::from_secs(1000), || {
+            .get_cached::<Values, _, _>(k, Duration::from_secs(1000), || {
                 let value = value.clone();
                 async move { Ok::<_, StateAccessError>(Some(value)) }
             })

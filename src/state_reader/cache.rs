@@ -19,6 +19,7 @@
 
 use crate::Key;
 use crate::state::access::StateAccessError;
+use crate::state::cell::{CacheEntry, Projection, Read};
 use crate::state::cell_key::CellKey;
 use crate::state::store::CellBuffer;
 use crate::state::{StateName, StateType};
@@ -43,9 +44,8 @@ const READER_CACHE_ENTRY_INLINE_BYTES: u64 = (size_of::<CacheKey>() + size_of::<
 /// an entry never aliases another source across a snapshot reorder.
 pub(crate) type CacheKey = (SourceId, StateType, StateName, Key, CellKey);
 
-/// The cached value: the issue time and the committed bytes (or cached
-/// known-absence).
-type CacheVal = (Instant, Option<Bytes>);
+/// The issue time and the committed cache knowledge.
+type CacheVal = (Instant, CacheEntry<Bytes>);
 
 /// The concrete `quick_cache` instance the reader shares, byte-weighted and
 /// `ahash`-hashed.
@@ -67,7 +67,10 @@ impl Weighter<CacheKey, CacheVal> for ReaderWeighter {
             + 1
             + 1
             + cell.coordinate.as_bytes().len();
-        let val_bytes = val.1.as_ref().map_or(0, Bytes::len);
+        let val_bytes = match &val.1 {
+            CacheEntry::Value(bytes) => bytes.len(),
+            CacheEntry::Absent | CacheEntry::Exists => 0,
+        };
         key_bytes as u64 + val_bytes as u64 + READER_CACHE_ENTRY_INLINE_BYTES
     }
 }
@@ -136,12 +139,6 @@ impl ReaderCache {
         self.clock.now().duration_since(issued) < ttl
     }
 
-    fn fresh_entry(&self, key: &CacheKey, ttl: Duration) -> Option<CacheVal> {
-        self.inner
-            .get(key)
-            .filter(|(issued, _)| self.fresh(*issued, ttl))
-    }
-
     /// The read-through point read. Serve a fresh hit. Expire a stale hit,
     /// removing it only if it still carries the observed issue time. Then
     /// refill single-flight through `fill`.
@@ -149,33 +146,38 @@ impl ReaderCache {
     /// # Errors
     ///
     /// Propagates the store error from `fill`.
-    pub(crate) async fn get_cached<F, Fut>(
+    pub(crate) async fn get_cached<P: Projection, F, Fut>(
         &self,
         key: CacheKey,
         ttl: Duration,
         fill: F,
-    ) -> Result<Option<Bytes>, StateAccessError>
+    ) -> Result<Option<P::Payload>, StateAccessError>
     where
         F: Fn() -> Fut,
-        Fut: Future<Output = Result<Option<Bytes>, StateAccessError>>,
+        Fut: Future<Output = Result<Option<P::Payload>, StateAccessError>>,
     {
         loop {
             match self.inner.get_value_or_guard_async(&key).await {
                 Ok((issued, value)) => {
                     if self.fresh(issued, ttl) {
-                        return Ok(value);
+                        match P::from_cached(value) {
+                            Read::Present(value) => return Ok(Some(value)),
+                            Read::Absent => return Ok(None),
+                            Read::Unknown => {}
+                        }
                     }
-                    // Equal clock readings are interchangeable cache
-                    // observations. Removing either can only cause a refill.
-                    self.inner
-                        .remove_if(&key, |(observed, _)| *observed == issued);
+                    self.inner.remove_if(&key, |(observed, entry)| {
+                        *observed == issued
+                            && (!self.fresh(*observed, ttl)
+                                || matches!(P::from_cached(entry.clone()), Read::Unknown))
+                    });
                 }
                 Err(guard) => {
                     // Single-flight: we own the fill. Record its issue time.
                     let issued = self.clock.now();
                     let value = fill().await?;
                     // The store answer remains valid if admission loses a race.
-                    drop(guard.insert((issued, value.clone())));
+                    drop(guard.insert((issued, P::into_cached(value.clone()))));
                     return Ok(value);
                 }
             }
@@ -184,33 +186,43 @@ impl ReaderCache {
 
     /// The read-through batch read, index-aligned to `keys`. Serves the batch
     /// entirely from the cache when every key is a fresh hit. Otherwise it
-    /// issues one batch store read through `fill`, writes each key back, and
+    /// issues one batch store read through `fill`, writes each missed key, and
     /// returns the store answers.
     ///
     /// # Errors
     ///
     /// Propagates the store error from `fill`.
-    pub(crate) async fn get_many_cached<F, Fut>(
+    pub(crate) async fn get_many_cached<P: Projection, F, Fut>(
         &self,
         keys: &[CacheKey],
         ttl: Duration,
         fill: F,
-    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError>
+    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<CellBuffer<Option<Bytes>>, StateAccessError>>,
+        Fut: Future<Output = Result<CellBuffer<Option<P::Payload>>, StateAccessError>>,
     {
-        let mut hits: CellBuffer<Option<Bytes>> = CellBuffer::with_capacity(keys.len());
+        let mut hits = CellBuffer::with_capacity(keys.len());
         for key in keys {
-            match self.fresh_entry(key, ttl) {
-                Some((_, value)) => hits.push(value),
-                // A single miss refetches the whole batch, so probing the
-                // remaining keys is wasted work — stop at the first.
-                _ => break,
-            }
+            let hit = match self.inner.get(key) {
+                Some((issued, entry)) if self.fresh(issued, ttl) => P::from_cached(entry),
+                Some((issued, _)) => {
+                    self.inner
+                        .remove_if(key, |(observed, _)| *observed == issued);
+                    Read::Unknown
+                }
+                None => Read::Unknown,
+            };
+            hits.push(hit);
         }
-        if hits.len() == keys.len() {
-            return Ok(hits);
+        if hits.iter().all(|hit| !matches!(hit, Read::Unknown)) {
+            return Ok(hits
+                .into_iter()
+                .map(|hit| match hit {
+                    Read::Present(value) => Some(value),
+                    Read::Absent | Read::Unknown => None,
+                })
+                .collect());
         }
         // One shared issue time for the whole batch fill.
         let issued = self.clock.now();
@@ -220,19 +232,25 @@ impl ReaderCache {
         if fresh.len() != keys.len() {
             return Err(StateAccessError::misaligned_batch(fresh.len(), keys.len()));
         }
-        for (key, value) in keys.iter().zip(fresh.iter()) {
-            cooperative(self.write_through(key, issued, value.clone())).await;
+        for ((key, value), hit) in keys.iter().zip(&fresh).zip(hits) {
+            if matches!(hit, Read::Unknown) {
+                cooperative(self.write_through(key, issued, P::into_cached(value.clone()))).await;
+            }
         }
         Ok(fresh)
     }
 
     /// Writes `value` for `key`. A fill replaces an observation issued earlier.
-    /// Equal instants are interchangeable cache observations.
-    async fn write_through(&self, key: &CacheKey, issued: Instant, value: Option<Bytes>) {
+    /// Equal instants permit a value to refine presence. A presence fill never
+    /// discards a cached value.
+    async fn write_through(&self, key: &CacheKey, issued: Instant, value: CacheEntry<Bytes>) {
         let outcome = self
             .inner
             .entry_async(key, |_, existing: &mut CacheVal| {
-                if issued > existing.0 {
+                if !value.downgrades(&existing.1)
+                    && (issued > existing.0
+                        || (issued == existing.0 && existing.1.downgrades(&value)))
+                {
                     *existing = (issued, value.clone());
                 }
                 EntryAction::Retain(())

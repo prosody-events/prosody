@@ -1,4 +1,4 @@
-use crate::state::cell::{Committed, ProvisionalWrite};
+use crate::state::cell::{Committed, Presence, ProvisionalWrite, Values};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::store::{CellStore, CoordinateBatch};
@@ -10,7 +10,10 @@ use color_eyre::Result;
 use futures::TryStreamExt;
 
 /// Checks value and presence projections before the owner removes residue.
-pub(crate) async fn reader_residue<S: CellStore, R: CommittedCellSource>(
+pub(crate) async fn reader_residue<
+    S: CellStore,
+    R: CommittedCellSource<Values> + CommittedCellSource<Presence>,
+>(
     store: S,
     source: &R,
     state_key: &StateKey,
@@ -73,19 +76,16 @@ pub(crate) async fn reader_residue<S: CellStore, R: CommittedCellSource>(
         [Some(base.clone()), Some(base.clone()), Some(base)]
     };
     for (cell, expected) in cells.iter().zip(&expected) {
-        if source.load(&id, cell).await? != *expected {
+        if CommittedCellSource::<Values>::load(source, &id, cell).await? != *expected {
             return Ok(false);
         }
     }
-    let expected_presence = expected.each_ref().map(Option::is_some);
+    let expected_presence = expected.each_ref().map(|value| value.as_ref().map(|_| ()));
     for batch in CoordinateBatch::chunks(cells.iter().map(|cell| cell.coordinate.clone())) {
-        if source.load_many(&id, section, &batch).await?.as_slice() != expected
-            || source
-                .load_presence_many(&id, section, &batch)
-                .await?
-                .as_slice()
-                != expected_presence
-        {
+        let values = CommittedCellSource::<Values>::load_many(source, &id, section, &batch).await?;
+        let presence =
+            CommittedCellSource::<Presence>::load_many(source, &id, section, &batch).await?;
+        if values.as_slice() != expected || presence.as_slice() != expected_presence {
             return Ok(false);
         }
     }
@@ -97,7 +97,9 @@ pub(crate) async fn reader_residue<S: CellStore, R: CommittedCellSource>(
             dir,
             limit: None,
         };
-        let observed: Vec<_> = source.scan(&id, scan).try_collect().await?;
+        let observed: Vec<_> = CommittedCellSource::<Values>::scan(source, &id, scan)
+            .try_collect()
+            .await?;
         let mut wanted: Vec<_> = cells
             .iter()
             .zip(&expected)
@@ -106,9 +108,11 @@ pub(crate) async fn reader_residue<S: CellStore, R: CommittedCellSource>(
         if dir == Direction::Backward {
             wanted.reverse();
         }
-        let presence: Vec<_> = source.scan_presence(&id, scan).try_collect().await?;
-        let wanted_keys: Vec<_> = wanted.iter().map(|(key, _)| key.clone()).collect();
-        if observed != wanted || presence != wanted_keys {
+        let presence: Vec<_> = CommittedCellSource::<Presence>::scan(source, &id, scan)
+            .map_ok(|(key, ())| key)
+            .try_collect()
+            .await?;
+        if observed != wanted || !presence.iter().eq(wanted.iter().map(|(key, _)| key)) {
             return Ok(false);
         }
     }

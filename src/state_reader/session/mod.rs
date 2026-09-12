@@ -50,14 +50,14 @@ use crate::Key;
 use crate::codec::Codec;
 use crate::segment::partition_segment_id;
 use crate::state::access::StateAccessError;
+use crate::state::cell::Projection;
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::identity::{CollectionId, StateKey};
-use crate::state::store::{CellBuffer, CoordinateBatch, PresenceBatch};
+use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state_reader::backend::{CommittedCellSource, ReaderBackend};
 use crate::state_reader::cache::CacheKey;
 use crate::state_reader::partition_for_key;
 use crate::state_reader::source::{Source, ValidatedPublications};
-use bytes::Bytes;
 use futures::stream::{FuturesOrdered, Stream, StreamExt};
 use smallvec::smallvec;
 use std::future::Future;
@@ -175,19 +175,19 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     /// One source's committed point read, cached per policy. `selected` is the
     /// operation's already-routed collection id for this source, if any, so a
     /// selected read reuses it instead of re-routing the key.
-    async fn cached_point(
+    async fn cached_point<P: Projection>(
         &self,
         selected: Option<&CollectionId>,
         source: &Source,
         cell: &CellKey,
-    ) -> Result<Option<Bytes>, StateAccessError> {
+    ) -> Result<Option<P::Payload>, StateAccessError>
+    where
+        B::Cells: CommittedCellSource<P>,
+    {
         match self.context.def.read_cache_ttl {
             None => {
                 let id = self.resolved_id(selected, source)?;
-                self.context
-                    .backend
-                    .cells()
-                    .load(&id, cell)
+                CommittedCellSource::<P>::load(self.context.backend.cells(), &id, cell)
                     .await
                     .map_err(|error| StateAccessError::store(&error))
             }
@@ -198,12 +198,9 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                 // miss, never on a hit.
                 self.context
                     .cache
-                    .get_cached(key, ttl, || async {
+                    .get_cached::<P, _, _>(key, ttl, || async {
                         let id = self.resolved_id(selected, source)?;
-                        self.context
-                            .backend
-                            .cells()
-                            .load(&id, cell)
+                        CommittedCellSource::<P>::load(self.context.backend.cells(), &id, cell)
                             .await
                             .map_err(|error| StateAccessError::store(&error))
                     })
@@ -214,23 +211,27 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
 
     /// One source's committed batch read, cached per policy (index-aligned to
     /// `batch`).
-    async fn cached_batch(
+    async fn cached_batch<P: Projection>(
         &self,
         selected: Option<&CollectionId>,
         source: &Source,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
+    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
+    where
+        B::Cells: CommittedCellSource<P>,
+    {
         match self.context.def.read_cache_ttl {
             None => {
                 let id = self.resolved_id(selected, source)?;
-                let buffer = self
-                    .context
-                    .backend
-                    .cells()
-                    .load_many(&id, section, batch)
-                    .await
-                    .map_err(|error| StateAccessError::store(&error))?;
+                let buffer = CommittedCellSource::<P>::load_many(
+                    self.context.backend.cells(),
+                    &id,
+                    section,
+                    batch,
+                )
+                .await
+                .map_err(|error| StateAccessError::store(&error))?;
                 // `CommittedCellSource` is a downstream trait, so check the
                 // alignment its contract promises in every build. The cached
                 // arm gets the same check inside `get_many_cached`.
@@ -248,54 +249,20 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                 // miss), never when the batch is served entirely from the cache.
                 self.context
                     .cache
-                    .get_many_cached(&keys, ttl, || async {
+                    .get_many_cached::<P, _, _>(&keys, ttl, || async {
                         let id = self.resolved_id(selected, source)?;
-                        self.context
-                            .backend
-                            .cells()
-                            .load_many(&id, section, batch)
-                            .await
-                            .map_err(|error| StateAccessError::store(&error))
+                        CommittedCellSource::<P>::load_many(
+                            self.context.backend.cells(),
+                            &id,
+                            section,
+                            batch,
+                        )
+                        .await
+                        .map_err(|error| StateAccessError::store(&error))
                     })
                     .await
             }
         }
-    }
-
-    /// One source's committed presence read. With a read TTL it fills
-    /// through [`Self::cached_batch`]: the reader cache holds presence only
-    /// as a value entry, so a payload-free fill would cache nothing. Without
-    /// a TTL it reads presence directly.
-    async fn cached_presence_batch(
-        &self,
-        selected: Option<&CollectionId>,
-        source: &Source,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<PresenceBatch, StateAccessError> {
-        if self.context.def.read_cache_ttl.is_some() {
-            return Ok(self
-                .cached_batch(selected, source, section, batch)
-                .await?
-                .iter()
-                .map(Option::is_some)
-                .collect());
-        }
-        let id = self.resolved_id(selected, source)?;
-        let buffer = self
-            .context
-            .backend
-            .cells()
-            .load_presence_many(&id, section, batch)
-            .await
-            .map_err(|error| StateAccessError::store(&error))?;
-        if buffer.len() != batch.len() {
-            return Err(StateAccessError::misaligned_batch(
-                buffer.len(),
-                batch.len(),
-            ));
-        }
-        Ok(buffer)
     }
 
     /// Builds one bounded batch of cache keys.
@@ -325,111 +292,72 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
 
     /// One operation's committed point read: address the already-selected
     /// source, or probe for one.
-    async fn point_read(
+    async fn point_read<P: Projection>(
         &self,
         selection: &mut Option<PinnedSource>,
         cell: &CellKey,
-    ) -> Result<Option<Bytes>, StateAccessError> {
+    ) -> Result<Option<P::Payload>, StateAccessError>
+    where
+        B::Cells: CommittedCellSource<P>,
+    {
         if let Some(pin) = selection.as_ref() {
             return self
-                .cached_point(Some(&pin.collection), &pin.source, cell)
+                .cached_point::<P>(Some(&pin.collection), &pin.source, cell)
                 .await;
         }
-        self.probe_point(selection, cell).await
+        self.probe_point::<P>(selection, cell).await
     }
 
     /// Uses [`Self::resolve_probe`] for a point read.
-    async fn probe_point(
+    async fn probe_point<P: Projection>(
         &self,
         selection: &mut Option<PinnedSource>,
         cell: &CellKey,
-    ) -> Result<Option<Bytes>, StateAccessError> {
-        let mut ordered = FuturesOrdered::new();
-        for source in self.snapshot.sources() {
-            ordered.push_back(cooperative(async move {
-                (source, self.cached_point(None, source, cell).await)
-            }));
-        }
-        self.resolve_probe(selection, ordered, Option::is_some, || None)
-            .await
-    }
-
-    /// One operation's committed batch read, index-aligned to `batch`: address
-    /// the already-selected source, or probe for one.
-    async fn batch_read(
-        &self,
-        selection: &mut Option<PinnedSource>,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
-        if let Some(pin) = selection.as_ref() {
-            return self
-                .cached_batch(Some(&pin.collection), &pin.source, section, batch)
-                .await;
-        }
-        self.probe_batch(selection, section, batch).await
-    }
-
-    /// One operation's committed presence batch read.
-    async fn presence_batch_read(
-        &self,
-        selection: &mut Option<PinnedSource>,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<PresenceBatch, StateAccessError> {
-        if let Some(pin) = selection.as_ref() {
-            return self
-                .cached_presence_batch(Some(&pin.collection), &pin.source, section, batch)
-                .await;
-        }
-        self.probe_presence_batch(selection, section, batch).await
-    }
-
-    /// Uses [`Self::resolve_probe`] for a presence batch.
-    async fn probe_presence_batch(
-        &self,
-        selection: &mut Option<PinnedSource>,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<PresenceBatch, StateAccessError> {
-        let mut ordered = FuturesOrdered::new();
-        for source in self.snapshot.sources() {
-            ordered.push_back(cooperative(async move {
-                (
-                    source,
-                    self.cached_presence_batch(None, source, section, batch)
-                        .await,
-                )
-            }));
-        }
+    ) -> Result<Option<P::Payload>, StateAccessError>
+    where
+        B::Cells: CommittedCellSource<P>,
+    {
         self.resolve_probe(
             selection,
-            ordered,
-            |buffer| buffer.iter().any(|present| *present),
-            || smallvec![false; batch.len()],
+            |source| self.cached_point::<P>(None, source, cell),
+            Option::is_some,
+            || None,
         )
         .await
     }
 
-    /// Uses [`Self::resolve_probe`] for a value batch.
-    async fn probe_batch(
+    /// One operation's committed batch read, index-aligned to `batch`: address
+    /// the already-selected source, or probe for one.
+    async fn batch_read<P: Projection>(
         &self,
         selection: &mut Option<PinnedSource>,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
-        let mut ordered = FuturesOrdered::new();
-        for source in self.snapshot.sources() {
-            ordered.push_back(cooperative(async move {
-                (
-                    source,
-                    self.cached_batch(None, source, section, batch).await,
-                )
-            }));
+    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
+    where
+        B::Cells: CommittedCellSource<P>,
+    {
+        if let Some(pin) = selection.as_ref() {
+            return self
+                .cached_batch::<P>(Some(&pin.collection), &pin.source, section, batch)
+                .await;
         }
+        self.probe_batch::<P>(selection, section, batch).await
+    }
+
+    /// Uses [`Self::resolve_probe`] for a value batch.
+    async fn probe_batch<P: Projection>(
+        &self,
+        selection: &mut Option<PinnedSource>,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
+    where
+        B::Cells: CommittedCellSource<P>,
+    {
         self.resolve_probe(
             selection,
-            ordered,
+            |source| self.cached_batch::<P>(None, source, section, batch),
             |buffer| buffer.iter().any(Option::is_some),
             || smallvec![None; batch.len()],
         )
@@ -442,17 +370,23 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     /// first error outranks an all-absent result. [`FuturesOrdered`] allocates
     /// one node per source, bounded by `MAX_PUBLICATION_SOURCES`. This bounded
     /// allocation is acceptable beside the source I/O.
-    async fn resolve_probe<'a, T, F, A>(
-        &self,
+    async fn resolve_probe<'a, T, F, Fut, A>(
+        &'a self,
         selection: &mut Option<PinnedSource>,
-        mut ordered: FuturesOrdered<F>,
+        fetch: F,
         has_data: fn(&T) -> bool,
         absent: A,
     ) -> Result<T, StateAccessError>
     where
-        F: Future<Output = (&'a Source, Result<T, StateAccessError>)>,
+        F: Fn(&'a Source) -> Fut,
+        Fut: Future<Output = Result<T, StateAccessError>>,
         A: FnOnce() -> T,
     {
+        let mut ordered = FuturesOrdered::new();
+        for source in self.snapshot.sources() {
+            let read = fetch(source);
+            ordered.push_back(cooperative(async move { (source, read.await) }));
+        }
         let mut first_err = None;
         while let Some((source, result)) = cooperative(ordered.next()).await {
             match result {
@@ -484,36 +418,20 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     /// through the collection API. Such a plan terminates the stream with
     /// [`StateAccessError::Unavailable`] instead of opening a source the
     /// operation did not select.
-    fn scan_from<'a>(
+    fn scan_from<'a, P: Projection>(
         &'a self,
         selected: Option<&'a PinnedSource>,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a
+    where
+        B::Cells: CommittedCellSource<P>,
+    {
         async_stream::try_stream! {
             let pin = selected
                 .or_else(|| self.pin.get())
                 .ok_or(StateAccessError::Unavailable)?;
             let id = pin.collection.clone();
-            let inner = self.context.backend.cells().scan(&id, scan);
-            futures::pin_mut!(inner);
-            while let Some(item) = cooperative(inner.next()).await {
-                yield item.map_err(|error| StateAccessError::store(&error))?;
-            }
-        }
-    }
-
-    /// Matches [`Self::scan_from`] but streams only cell presence.
-    fn scan_presence_from<'a>(
-        &'a self,
-        selected: Option<&'a PinnedSource>,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, StateAccessError>> + Send + 'a {
-        async_stream::try_stream! {
-            let pin = selected
-                .or_else(|| self.pin.get())
-                .ok_or(StateAccessError::Unavailable)?;
-            let id = pin.collection.clone();
-            let inner = self.context.backend.cells().scan_presence(&id, scan);
+            let inner = CommittedCellSource::<P>::scan(self.context.backend.cells(), &id, scan);
             futures::pin_mut!(inner);
             while let Some(item) = cooperative(inner.next()).await {
                 yield item.map_err(|error| StateAccessError::store(&error))?;

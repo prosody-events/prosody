@@ -20,6 +20,7 @@ use super::support::{
 };
 use crate::Key;
 use crate::codec::JsonCodec;
+use crate::state::cell::{Presence, Values};
 use crate::state::cell_key::{Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::descriptor::{
     DescriptorIdentity, StateDescriptor, deque_state, map_state, value_state,
@@ -161,11 +162,13 @@ async fn reader_reads_prev_in_commit_window() -> Result<()> {
     let batch = CoordinateBatch::chunks([Coordinate::empty(), Coordinate::from_bytes("missing")])
         .next()
         .ok_or_else(|| eyre!("the test batch is empty"))?;
-    let values = harness.cells.load_many(&id, section, &batch).await?;
-    let presence = harness
-        .cells
-        .load_presence_many(&id, section, &batch)
-        .await?;
+    let values =
+        CommittedCellSource::<Values>::load_many(&harness.cells, &id, section, &batch).await?;
+    let presence = CommittedCellSource::<Presence>::load_many(&harness.cells, &id, section, &batch)
+        .await?
+        .iter()
+        .map(Option::is_some)
+        .collect::<Vec<_>>();
     let expected: Vec<bool> = values.into_iter().map(|value| value.is_some()).collect();
     assert_eq!(presence.as_slice(), expected);
     let scan = Scan {
@@ -175,11 +178,11 @@ async fn reader_reads_prev_in_commit_window() -> Result<()> {
         end: ScanEdge::Unbounded,
         limit: None,
     };
-    let values = harness.cells.scan(&id, scan).map_ok(|(cell, _)| cell);
+    let values =
+        CommittedCellSource::<Values>::scan(&harness.cells, &id, scan).map_ok(|(cell, _)| cell);
     assert_eq!(
-        harness
-            .cells
-            .scan_presence(&id, scan)
+        CommittedCellSource::<Presence>::scan(&harness.cells, &id, scan)
+            .map_ok(|(key, ())| key)
             .try_collect::<Vec<_>>()
             .await?,
         values.try_collect::<Vec<_>>().await?
@@ -232,6 +235,34 @@ async fn reader_presence_uses_read_cache() -> Result<()> {
             );
         }
     }
+    assert_eq!(reader.get(key.clone(), &1).await?, Some(Value::from(7_i32)));
+    assert_eq!(
+        env.cells.reads(state_key.segment_id),
+        3,
+        "values refine presence"
+    );
+    assert_eq!(reader.get(key.clone(), &2).await?, None);
+    assert_eq!(
+        env.cells.reads(state_key.segment_id),
+        3,
+        "absence answers both projections"
+    );
+    assert_eq!(
+        reader.contains_many(key.clone(), &[1, 3]).await?,
+        [true, false]
+    );
+    assert_eq!(
+        env.cells.reads(state_key.segment_id),
+        4,
+        "one miss fills the batch"
+    );
+    assert_eq!(reader.get(key.clone(), &1).await?, Some(Value::from(7_i32)));
+    assert!(reader.contains_key(key, &1).await?);
+    assert_eq!(
+        env.cells.reads(state_key.segment_id),
+        4,
+        "presence preserves the cached value"
+    );
     Ok(())
 }
 
