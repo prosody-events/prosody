@@ -1,9 +1,13 @@
-//! A write-through cache of committed cells over durable storage.
+//! A write-through cache of committed cell projections over durable storage.
+//!
+//! [`CellRead`] uses one projection for the cache probe, durable read, and
+//! fill. A presence fill stores no payload. Value frames can also answer
+//! presence reads.
 //!
 //! The cache follows five invariants:
 //!
-//! - **KV1 — a hit is current.** Each live entry equals the committed cell. A
-//!   failed required removal disables the cache.
+//! - **KV1 — a hit is current.** Each hit equals the requested committed
+//!   projection. A failed required removal disables the cache.
 //! - **KV2 — a miss is unknown.** A miss reads durable storage and caches its
 //!   result, including absence.
 //! - **KV3 — scans bypass the cache.** A scan uses durable storage and does not
@@ -60,9 +64,10 @@ const DELETE_RETRY_DELAY: Duration = Duration::ZERO;
 /// Maximum cache removal attempts before cache disablement.
 pub(crate) const DELETE_RETRY_BUDGET: usize = 5;
 
-/// A write-through fjall K/V cache over a lower committed `CellStore`.
+/// A shared cache over a durable store for one partition assignment.
 ///
-/// A shared cache handle for one partition assignment.
+/// Concurrent value and presence fills can replace a value frame with a
+/// presence frame. This loses cache warmth but preserves the answer.
 #[derive(Clone)]
 pub struct Cached<L> {
     fjall: FjallCellCache,
@@ -71,7 +76,7 @@ pub struct Cached<L> {
 }
 
 impl<L> Cached<L> {
-    /// Composes a committed-value cache over `lower`.
+    /// Constructs a cache for committed projections over `lower`.
     #[must_use]
     pub fn new(fjall: FjallCellCache, lower: L) -> Self {
         Self {
@@ -242,8 +247,7 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
     /// Reads the whole lower batch after any miss and publishes only probe
     /// misses. Partial refetch requires a benchmark before it can replace
     /// this rule.
-    /// Concurrent fills can replace a value frame with a presence frame.
-    /// That replacement loses cache warmth, but it preserves the answer.
+    /// [`Cached`] documents the concurrent-fill exception.
     /// A probe error publishes every position.
     async fn read_many<'a>(
         &'a self,

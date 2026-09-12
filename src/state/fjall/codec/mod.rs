@@ -1,50 +1,26 @@
-//! Cache key + cell codec for the fjall cell cache.
+//! Keys and frames for the fjall cell cache.
 //!
-//! Two requirements drive the cache key shape:
+//! A key contains a 16-byte collection hash, one section byte, and the
+//! coordinate bytes. The section and coordinate preserve order within a
+//! collection.
 //!
-//! 1. **Point reads (Value).** Cheap, well-defined lookups by full collection
-//!    identifier.
-//! 2. **Prefix scans (Map, Deque).** "All entries for one collection" must be a
-//!    contiguous range; range queries within a collection must preserve user
-//!    ordering.
+//! The collection hash uses `xxh3_128` over the collection identity.
+//! The input starts with `segment_id` and the one-byte `state_type`.
+//! Each variable field follows its length: `key_len`, `key`, `name_len`, then
+//! `name`. Lengths use eight big-endian bytes. The hash also uses big-endian
+//! bytes. Length prefixes prevent distinct identities from sharing the same
+//! hash input. The cache does not detect hash collisions.
 //!
-//! The hierarchy is `[16-byte collection hash][1-byte section][coordinate
-//! bytes]`:
+//! # Cell frames
 //!
-//! - The collection hash is `xxh3_128` over an **injective** encoding of the
-//!   collection identity: the fixed-width fields first (`segment_id` then the
-//!   one-byte `state_type`), then each variable-length field length-prefixed
-//!   (`key_len` as 8 big-endian bytes, then `key`; `name_len`, then `name`).
-//!   The hash is serialized **big-endian** for stable cross-platform ordering.
-//!   Length-prefixing (rather than a delimiter byte) keeps the encoding
-//!   injective even when `key` or `name` contain the delimiter — Kafka keys are
-//!   arbitrary bytes — so distinct collections cannot share an input buffer and
-//!   the only residual collision risk is the hash's own ≈ 2⁻⁶⁴.
-//! - The **section** byte ([`Section`]'s `i8` discriminant) groups one
-//!   collection's cells by section, so a section range scan is contiguous.
-//! - The **coordinate** tail is the cell's order-preserving coordinate bytes
-//!   (empty for Value, the `EncodedMapKey` for Map, the big-endian index for
-//!   Deque), so a Map/Deque prefix range preserves user order.
+//! A frame contains `[tag][expiry_millis: u64 BE][payload]`.
+//! The tags encode [`CacheEntry`]: `0x00` means absent, `0x01` carries a value,
+//! and `0x02` means present without a payload. Zero expiry means no expiry.
+//! [`decode_frame`] borrows the payload and returns the expiry. The caller
+//! applies its projection and checks the expiry. [`frame_expiry`] reads the
+//! expiry without a projection.
 //!
-//! Collision probability for `xxh3_128` is ≈ 2⁻⁶⁴ (birthday bound) — well
-//! below practical concern for non-adversarial caches. Collisions resolve
-//! via miss-then-populate cycles; the read path does not verify
-//! collisions.
-//!
-//! "Drop all cache state on partition revocation" = drop the fjall keyspace.
-//!
-//! # Cell frame and TTL co-expiry
-//!
-//! Each stored cell is framed `[tag][expiry_millis: u64 BE][payload]`. The
-//! `expiry` is an absolute wall-clock millisecond deadline mirroring the
-//! durable Cassandra row's TTL death; `0` means "never expires" (a `None`-TTL
-//! collection). Fjall has no native per-entry TTL, so the cache enforces it on
-//! read: [`decode_frame`] returns the expiry and the caller treats `now >=
-//! expiry` (a non-zero expiry) as a miss/skip — exactly as the oracle resolves
-//! the expired durable row to absent. Stamping rounds **down** (the expiry is
-//! `now + remaining` where `remaining` is the row's whole-second `TTL(data)`),
-//! so a fjall entry never outlives its durable value; an entry that expires
-//! slightly early falls through and re-populates.
+//! The assignment owns these frames. Its workspace removes them at revocation.
 
 use super::error::FjallCellCacheError;
 use crate::state::CollectionId;

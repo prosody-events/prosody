@@ -1,16 +1,19 @@
-//! Standalone read-only access to published keyed state.
+//! Standalone access to published committed state.
 //!
-//! A sibling of [`producer`](crate::producer) and
-//! [`consumer`](crate::consumer): a [`StateReader`] observes a collection's
-//! **committed** state from another consumer group, without owning the
-//! partition. Reads project provisional cells through collection commit
-//! evidence. Committed clears restrict results to their frozen survivors. Reads
-//! do not change durable state. Each operation reads from at most one
-//! publication source.
+//! A [`StateReader`] reads another consumer group's collection without
+//! partition ownership. [`CommittedCellSource`] supplies value and presence
+//! projections through collection evidence. Committed clears restrict results
+//! to their frozen survivors. Reads do not change durable state.
+//!
+//! Each operation captures the publication sources and selects at most one
+//! source. Point, batch, and range reads can select that source.
+//! Later reads in the operation retain the selection, including after an absent
+//! result or an error. [`ReadSession`] owns this selection contract.
 //!
 //! Construct a [`StateReaderClient`] from one [`StateReaderDependencies`]
-//! bundle. The client shares that bundle's stores, loader, heartbeat registry,
-//! and byte-budgeted cache across every collection reader it creates.
+//! bundle. The client shares its stores, loader, heartbeat registry, and
+//! bounded cache across collection readers. The cache stores values, presence,
+//! and absence under one projection interface.
 
 mod backend;
 mod cache;

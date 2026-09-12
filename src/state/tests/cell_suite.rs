@@ -1122,7 +1122,7 @@ where
                     return Ok(false);
                 }
                 let expected_keys: Vec<u8> = expected.iter().map(|(key, _)| *key).collect();
-                if collect_scan_keys(&overlay, &id, &req).await? != expected_keys {
+                if collect_scan_coordinates(&overlay, &id, &req).await? != expected_keys {
                     return Ok(false);
                 }
             }
@@ -1491,7 +1491,7 @@ where
 }
 
 /// Collects the payload-free twin of [`collect_scan`].
-async fn collect_scan_keys<S>(
+async fn collect_scan_coordinates<S>(
     overlay: &Overlay<S>,
     id: &CollectionId,
     req: &ScanReq,
@@ -1510,15 +1510,9 @@ where
     Ok(out)
 }
 
-/// Drives interleaved committed seeds, durable section clears, and scans
-/// **directly over a bottom store's `scan_cells`** (no overlay), pinning the
-/// backend's own ordering, clustering-range bounds, and limit handling — the
-/// Cassandra `ORDER BY ASC/DESC` + `coordinate` range the overlay merge
-/// delegates to and the limit/end the overlay strips before delegating — plus
-/// post-clear (gap-tombstoned) section states across the full Direction ×
-/// edge-kind (inclusive/exclusive/unbounded) × limit space. Every seed is
-/// committed (`write_resolved`), so
-/// the oracle is committed-only.
+/// Compares both scan projections with a committed model after interleaved
+/// writes and section clears. The trace covers both directions, all edge kinds,
+/// and scan limits.
 pub(crate) async fn run_bottom_scan_trace<S, P>(
     store: S,
     trace: ScanTrace,
@@ -1879,12 +1873,10 @@ pub(crate) enum Poison {
     /// one named collection — the establish-then-publish test's lower-write
     /// fault (a failed lower write must leave the cache untouched).
     WriteResolved(StateName, ErrorCategory),
-    /// Read-fill path: `get_for_cache` fails for the chosen single-byte
-    /// coordinates, each with its mapped category — so the default
-    /// `get_many_for_cache` loops it and one poisoned position fails the whole
-    /// batch after earlier positions succeeded (the read-fill error arm: a
-    /// failed lower batch publishes nothing).
-    GetForCache(BTreeMap<u8, ErrorCategory>),
+    /// Rejects selected coordinates during projected reads.
+    /// The default batch read propagates the first coordinate error and
+    /// publishes nothing.
+    Read(BTreeMap<u8, ErrorCategory>),
 }
 
 /// A runtime-armable poison slot shared by a [`FailingCellStore`], its
@@ -1922,11 +1914,10 @@ impl<S> FailingCellStore<S> {
         Self::armed(inner, Poison::WriteProvisional(poison, category))
     }
 
-    /// Wraps `inner`, poisoning `get_for_cache` for each single-byte coordinate
-    /// in `cells` with its mapped category — the read-fill path (a batch fill
-    /// that errors on one position after earlier ones succeeded).
-    pub(crate) fn failing_get_for_cache(inner: S, cells: BTreeMap<u8, ErrorCategory>) -> Self {
-        Self::armed(inner, Poison::GetForCache(cells))
+    /// Rejects reads for each coordinate in `cells` with its assigned error
+    /// category.
+    pub(crate) fn failing_read(inner: S, cells: BTreeMap<u8, ErrorCategory>) -> Self {
+        Self::armed(inner, Poison::Read(cells))
     }
 
     /// Wraps `inner` around a shared runtime `poison` slot — the trace
@@ -1975,7 +1966,7 @@ impl<S> FailingCellStore<S> {
 
     fn injected_read(&self, cell: &CellKey) -> Option<ErrorCategory> {
         match &*self.poison.lock() {
-            Some(Poison::GetForCache(targets)) => targets.get(&coord_of(cell)).copied(),
+            Some(Poison::Read(targets)) => targets.get(&coord_of(cell)).copied(),
             _ => None,
         }
     }

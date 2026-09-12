@@ -1206,7 +1206,7 @@ fn cell_load_metrics_report_source_and_cache_result() -> Result<()> {
         );
 
         let failed_metrics = GlobalMetrics::install();
-        let failed_lower = FailingCellStore::failing_get_for_cache(
+        let failed_lower = FailingCellStore::failing_read(
             MemoryCellStore::new(MemoryCells::new()),
             BTreeMap::from([(8, ErrorCategory::Transient)]),
         );
@@ -1698,7 +1698,7 @@ fn absent_fill_over_aborted_foreign_provisional_publishes_absent() -> Result<()>
 /// Admission reads marker slices and listed coordinates without a cell scan.
 /// The counting store checks the exact operation set.
 #[test]
-fn admission_issues_no_scan_cells() -> Result<()> {
+fn admission_issues_no_scans() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let dedup = MemoryDeduplicationStore::default();
         let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
@@ -2868,7 +2868,7 @@ fn batch_get_completes_after_cache_disablement() -> Result<()> {
         let task = {
             let cached = cached.clone();
             let id = id.clone();
-            holds.get_for_cache().arm(1);
+            holds.read().arm(1);
             tokio::spawn(async move {
                 CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of([0])?)
                     .await
@@ -2881,9 +2881,9 @@ fn batch_get_completes_after_cache_disablement() -> Result<()> {
                     .map_err(color_eyre::Report::from)
             })
         };
-        holds.get_for_cache().entered().await;
+        holds.read().entered().await;
         fjall.disable();
-        holds.get_for_cache().release();
+        holds.read().release();
         assert_eq!(task.await??.len(), 1);
         assert!(
             fjall.stored_expiry(&id, &cell_at(0)).await?.is_some(),
@@ -3096,7 +3096,7 @@ fn batch_get_expiry_boundary_degrade_never_serves_stale() -> Result<()> {
         // Park the refetch's fill after the target's durable read lands, advance
         // the clock past the entry's floor expiry while parked, then resume: the
         // warm entry expires DURING the delayed lower read.
-        holds.get_for_cache().arm(1);
+        holds.read().arm(1);
         let batch = batch_of(coords.iter().copied())?;
         let task = tokio::spawn({
             let cached = cached.clone();
@@ -3113,9 +3113,9 @@ fn batch_get_expiry_boundary_degrade_never_serves_stale() -> Result<()> {
                     .map_err(|error| eyre!("{error:?}"))
             }
         });
-        holds.get_for_cache().entered().await;
+        holds.read().entered().await;
         now.store(AFTER_EXPIRY, Ordering::Relaxed);
-        holds.get_for_cache().release();
+        holds.read().release();
         let out = task.await??;
         assert_eq!(
             out[0].get(),
@@ -3202,7 +3202,7 @@ fn batch_get_publishes_absence_only_from_successful_batch() -> Result<()> {
 
         // ---- Erroring arm: a mid-fill error publishes nothing. --------------
         let counting_b = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
-        let failing = FailingCellStore::failing_get_for_cache(
+        let failing = FailingCellStore::failing_read(
             counting_b.clone(),
             BTreeMap::from([(1u8, ErrorCategory::Transient)]),
         );
@@ -3210,7 +3210,7 @@ fn batch_get_publishes_absence_only_from_successful_batch() -> Result<()> {
         let id_b = collection("batch-neg-err")?;
 
         // A (coord 0) is absent; B (coord 1) is poisoned. The default fill loops
-        // get_for_cache, reads A, then errors on B — so put_batch never runs.
+        // read, reads A, then errors on B — so put_batch never runs.
         let err = CellRead::<Values>::read_many(&cached_b, &id_b, SECTION, &batch_of([0, 1])?)
             .await
             .map(|cells| {
@@ -3251,7 +3251,7 @@ fn batch_get_publishes_absence_only_from_successful_batch() -> Result<()> {
 /// clock advances while the fill's response is parked. The stamp is anchored
 /// before the lower read, so a slow resolution can only stamp early.
 ///
-/// Moving the anchor to after `get_many_for_cache` makes this test fail:
+/// Moving the anchor to after `read_many` makes this test fail:
 /// for a delay crossing a second, `floor(T0 + delay) + remaining > death`.
 #[test]
 fn prop_batch_fill_expiry_never_overhangs() {
@@ -3309,7 +3309,7 @@ fn prop_batch_fill_expiry_never_overhangs() {
                 .await?;
 
             // Spawn a singleton batch fill; park its lower response.
-            holds.get_for_cache().arm(1);
+            holds.read().arm(1);
             let task = tokio::spawn({
                 let cached = cached.clone();
                 let id = id.clone();
@@ -3326,10 +3326,10 @@ fn prop_batch_fill_expiry_never_overhangs() {
                         .map_err(|error| eyre!("{error:?}"))
                 }
             });
-            holds.get_for_cache().entered().await;
+            holds.read().entered().await;
             // Advance the clock while the fill's response is parked, then resume.
             now.store(t0 + delay, Ordering::Relaxed);
-            holds.get_for_cache().release();
+            holds.read().release();
             task.await??;
 
             // The remaining computed at T0, floored to Cassandra's second grain.

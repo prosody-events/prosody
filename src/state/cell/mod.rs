@@ -1,35 +1,23 @@
-//! The provisional-cell durability model.
+//! Durable cells and their read projections.
 //!
-//! Each durable value is one **cell** holding both a committed value and,
-//! while an event's outcome is still in flight, that event's provisional
-//! write side by side:
-//!
-//! * [`Cell::Resolved`] — no event is in flight; the carried [`Committed`]
-//!   value is authoritative.
-//! * [`Cell::Provisional`] — an event staged a write: `data` is that event's
-//!   outcome, `prev` the committed value before it, `event` the owner. The
-//!   collection evidence selects the committed value.
-//!
-//! The model replaces the write-ahead log: rather than persisting a *recipe*
-//! (ops) to re-derive the outcome durably later, both finished outcomes are
-//! persisted at write time — the single-writer-per-key invariant guarantees
-//! the committed base is known in-process, so no replay is ever needed.
+//! [`Cell::Resolved`] carries the committed answer.
+//! [`Cell::Provisional`] carries the staged outcome, its prior committed value,
+//! and the event identity. Collection evidence selects the visible outcome.
+//! [`Projection`] determines the payload type throughout a read.
 //!
 //! # Invariants
 //!
-//! * **Prev-is-committed** — a [`ProvisionalCell::prev`] (and a
-//!   [`ProvisionalWrite`]'s `prev`) holds the committed value before the stage.
-//!   Readers use collection evidence to select this base or the staged value.
-//!   The type system enforces the committed base: [`ProvisionalWrite`] cannot
-//!   be built without a [`Committed`], and `Committed<Values>` is mintable only
-//!   inside `crate::state` — by the resolved read paths.
-//! * **Presence carries no bytes** — [`Values`] yields bytes; [`Presence`]
-//!   yields `()`. A presence cell has no bytes to write back.
-//! * **Invalid shapes unrepresentable after decode** — a backend decoder
-//!   collapses every physical column shape into one of these two variants or a
-//!   typed corruption error; nothing downstream sees a half-built cell.
-//! * **Cache lattice** — a cache never replaces a `Value` entry with an
-//!   `Exists` entry.
+//! * **Prev-is-committed**: [`ProvisionalCell::prev`] holds the committed value
+//!   before the stage. [`ProvisionalWrite`] requires [`Committed`] as proof of
+//!   that base. Only resolved read paths inside `crate::state` can construct
+//!   that proof.
+//! * **Presence carries no bytes**: [`Values`] yields bytes; [`Presence`]
+//!   yields `()`. A presence cell cannot supply a payload for a durable write.
+//! * **Valid decoded shapes**: a backend returns a complete cell variant or a
+//!   structured error.
+//! * **Cache lattice**: fills preserve known value payloads.
+//!   [`CacheEntry::downgrades`] detects replacement of `Value` with `Exists`.
+//!   The disk cache documents its concurrent-fill exception on `Cached`.
 
 use super::event_ref::EventRef;
 use super::marker::ReaderEvidence;

@@ -1,14 +1,21 @@
-//! Durable cells and collection commit evidence.
+//! Durable reads, cell writes, and collection commit evidence.
 //!
-//! Collection handles address cells through this uniform store interface.
-//! Admission resolves residue before the handler runs. Reads project
-//! provisional cells through collection evidence without durable writes.
+//! [`CellBackend`] supplies one error type for all operations.
+//! [`CellRead`] selects a projection for point, batch, and range reads.
+//! Point and batch answers carry the remaining durable TTL.
+//! [`CellStore`] supports both projections and supplies the durability
+//! operations. Collection operations select projections through their engine.
+//!
+//! Admission resolves residue before the handler runs.
+//! Reads use collection evidence to resolve provisional cells without durable
+//! writes.
 //!
 //! Cassandra uses atomic batches within each collection partition.
-//! Oversized writes use multiple chunks. Each stage chunk includes its
-//! discovery row. Promote writes evidence before destructive chunks and deletes
-//! Staged last. An oversized resolved write can remain partial after a crash
-//! because it has no provisional state to reconstruct.
+//! Each stage chunk includes its discovery row.
+//! Promotion writes evidence before destructive chunks and deletes Staged last.
+//! An oversized resolved write can remain partial after a crash because it has
+//! no provisional state to reconstruct.
+
 use super::cell::{Presence, Projection, ProvisionalCell, ProvisionalWrite, Values};
 use super::cell_key::{CellKey, Coordinate, Scan, Section};
 use super::identity::{CollectionId, CollectionRef};

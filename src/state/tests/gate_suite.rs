@@ -217,12 +217,12 @@ fn gate_serializes_fill_against_commit() -> Result<()> {
             .map_err(|e| eyre!("bind: {e}"))?;
 
         // Suspend the fill after its lower read, before its publish.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let get_task = tokio::spawn({
             let handle = handle.clone();
             async move { handle.get().await }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("the fill never reached its hold"))?;
 
@@ -236,7 +236,7 @@ fn gate_serializes_fill_against_commit() -> Result<()> {
             }
         });
         let_task_park().await;
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
 
         let got = timeout(HANG_GUARD, get_task)
             .await
@@ -401,12 +401,12 @@ fn gate_serializes_set_against_clear() -> Result<()> {
         // set(1) parks at its cold keyset read (a held lower read) while HOLDING
         // the gate. 1 is already tracked, so once it resumes its only write is
         // the entry.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let set_task = tokio::spawn({
             let handle = handle.clone();
             async move { handle.set(1, Value::from(99_i64)).await }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("the set never reached its hold"))?;
 
@@ -417,7 +417,7 @@ fn gate_serializes_set_against_clear() -> Result<()> {
         futures::pin_mut!(clear);
         let first_clear_poll = futures::poll!(clear.as_mut());
 
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
         timeout(HANG_GUARD, set_task)
             .await
             .map_err(|_| eyre!("set hung"))??
@@ -471,12 +471,12 @@ fn gate_serializes_racing_keyset_rmw() -> Result<()> {
 
         // set(1) parks at its keyset read while holding the gate; set(9) parks
         // on the gate behind it.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let first = tokio::spawn({
             let handle = handle.clone();
             async move { handle.set(1, Value::from(1_i64)).await }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("set(1) never reached its hold"))?;
         let second = tokio::spawn({
@@ -484,7 +484,7 @@ fn gate_serializes_racing_keyset_rmw() -> Result<()> {
             async move { handle.set(9, Value::from(9_i64)).await }
         });
         let_task_park().await;
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
         timeout(HANG_GUARD, first)
             .await
             .map_err(|_| eyre!("set(1) hung"))??
@@ -599,12 +599,12 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
 
         // set(3) parks in its cold meta read while holding the gate; set(4)
         // parks on the gate behind it.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let first = tokio::spawn({
             let handle = handle.clone();
             async move { handle.set(3, Value::from(3_i64)).await }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("set(3) never reached its hold"))?;
         let second = tokio::spawn({
@@ -612,7 +612,7 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
             async move { handle.set(4, Value::from(4_i64)).await }
         });
         let_task_park().await;
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
         timeout(HANG_GUARD, first)
             .await
             .map_err(|_| eyre!("set(3) hung"))??
@@ -880,7 +880,7 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
 
         // The stream's FIRST cold read is the keyset cell — park it there,
         // holding the gate.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let stream_task = tokio::spawn({
             let handle = handle.clone();
             async move {
@@ -893,7 +893,7 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
                 Ok::<_, MapStateError<JsonCodecError>>(out)
             }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("the stream never reached its keyset hold"))?;
 
@@ -903,7 +903,7 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
             async move { handle.set(1, Value::from(99_i64)).await }
         });
         let_task_park().await;
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
 
         let yielded = timeout(HANG_GUARD, stream_task)
             .await
@@ -968,13 +968,13 @@ fn map_get_many_holds_gate_across_sub_batches() -> Result<()> {
 
         // Park get_many in sub-batch 1's cold cache-fill (its first lower read),
         // holding the gate.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let reader = tokio::spawn({
             let map = map.clone();
             let keys = keys.clone();
             async move { Box::pin(map.get_many(&keys)).await }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("get_many never reached the sub-batch-1 hold"))?;
 
@@ -986,7 +986,7 @@ fn map_get_many_holds_gate_across_sub_batches() -> Result<()> {
         let_task_park().await;
 
         // Release the hold; correct code keeps the gate across the boundary.
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
         let out = timeout(HANG_GUARD, reader)
             .await
             .map_err(|_| eyre!("get_many hung"))??
@@ -1084,18 +1084,18 @@ async fn parked_set(name: &str, terminate: bool) -> Result<ParkedSet> {
 
     // Park in the keyset read's cold cache-fill: past the read's liveness
     // guard, holding write admission, with both stages still ahead.
-    fx.holds.get_for_cache().arm(1);
+    fx.holds.read().arm(1);
     let writer = tokio::spawn({
         let map = map.clone();
         async move { map.set(9, Value::from(9_i64)).await }
     });
-    timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+    timeout(HANG_GUARD, fx.holds.read().entered())
         .await
         .map_err(|_| eyre!("the set never reached the keyset-read hold"))?;
     if terminate {
         session.terminate();
     }
-    fx.holds.get_for_cache().release();
+    fx.holds.read().release();
     let outcome = timeout(HANG_GUARD, writer)
         .await
         .map_err(|_| eyre!("the set hung"))??;
@@ -1286,12 +1286,12 @@ fn dropped_session_op_releases_the_gate() -> Result<()> {
             .map_err(|e| eyre!("bind: {e}"))?;
 
         // Drop a HOLDING op: a get parked in its withheld fill, gate held.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let holding = tokio::spawn({
             let handle = handle.clone();
             async move { handle.get().await }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("the holding op never reached its hold"))?;
         holding.abort();
@@ -1314,12 +1314,12 @@ fn dropped_session_op_releases_the_gate() -> Result<()> {
         let map = map_state::<I64KeyCodec, JsonCodec>("m")
             .bind(&session)
             .map_err(|e| eyre!("bind: {e}"))?;
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let holding = tokio::spawn({
             let map = map.clone();
             async move { map.get(&42).await }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("the second holding op never reached its hold"))?;
         let queued = tokio::spawn({
@@ -1329,7 +1329,7 @@ fn dropped_session_op_releases_the_gate() -> Result<()> {
         let_task_park().await;
         queued.abort();
         assert!(queued.await.is_err(), "the queued op was dropped");
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
         timeout(HANG_GUARD, holding)
             .await
             .map_err(|_| eyre!("the holding op hung"))??
@@ -1382,7 +1382,7 @@ fn dropped_stream_chunk_fetch_releases_the_gate() -> Result<()> {
 
         // Drop a HOLDING stream: its chunk fetch parks in the withheld entry
         // read, gate held.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let stream_task = tokio::spawn({
             let handle = handle.clone();
             async move {
@@ -1391,7 +1391,7 @@ fn dropped_stream_chunk_fetch_releases_the_gate() -> Result<()> {
                 let _ = stream.next().await;
             }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("the chunk fetch never reached its hold"))?;
         stream_task.abort();
@@ -1410,7 +1410,7 @@ fn dropped_stream_chunk_fetch_releases_the_gate() -> Result<()> {
 
         // Drop a QUEUED next(): A (a chunk fetch) holds, a queued op B waits, B
         // is dropped, A completes, and settle's close still proceeds.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let holding = tokio::spawn({
             let handle = handle.clone();
             async move {
@@ -1419,7 +1419,7 @@ fn dropped_stream_chunk_fetch_releases_the_gate() -> Result<()> {
                 stream.next().await.transpose()
             }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("the second chunk fetch never reached its hold"))?;
         let queued = tokio::spawn({
@@ -1429,7 +1429,7 @@ fn dropped_stream_chunk_fetch_releases_the_gate() -> Result<()> {
         let_task_park().await;
         queued.abort();
         assert!(queued.await.is_err(), "the queued op was dropped");
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
         timeout(HANG_GUARD, holding)
             .await
             .map_err(|_| eyre!("the holding stream hung"))??
@@ -1796,12 +1796,12 @@ fn racing_set_never_joins_next_attempt() -> Result<()> {
 
         // Park a fill holding the gate (epoch still N, so its own `ensure_live`
         // admitted it before the bump).
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let get_task = tokio::spawn({
             let stale = stale.clone();
             async move { stale.get().await }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("the fill never parked on the gate"))?;
 
@@ -1819,7 +1819,7 @@ fn racing_set_never_joins_next_attempt() -> Result<()> {
         let_task_park().await;
 
         // Release the fill: reset acquires (discard+bump), then the set.
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
         timeout(HANG_GUARD, get_task)
             .await
             .map_err(|_| eyre!("get hung"))??

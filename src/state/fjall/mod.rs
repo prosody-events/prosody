@@ -1,44 +1,32 @@
-//! Fjall-backed cell cache.
+//! A disk cache for committed cell projections.
 //!
-//! [`FjallCellCache`] stores one tagged cell per [`CellKey`] in a fjall
-//! keyspace: the committed-cell K/V store
-//! [`Cached`](crate::state::cached::Cached) serves point hits from. It does
-//! **not** implement `CellStore`: it is a
-//! concrete *partial* upper (it can only answer what it has mirrored), so a
-//! bare cache view can never be mistaken for a complete store — a miss asserts
-//! nothing and always falls through (KV2, owned by `Cached`).
+//! [`FjallCellCache`] stores [`CacheEntry`] frames for point and batch reads.
+//! [`Projection`] converts each frame into the requested answer.
+//! A value frame can answer either projection. A presence frame cannot answer a
+//! value read. Presence reads borrow frames without a payload copy.
+//! [`CacheRead`] distinguishes a hit, an expired answer, and an unknown answer.
+//! [`Cached`](crate::state::cached::Cached) supplies durable reads when this
+//! cache cannot answer.
 //!
-//! Three components share this workspace.
-//! The cache stores committed cells.
-//! The index stores provisional cells and completed marker checks.
-//! All components use one cache-disabled state.
+//! The workspace also stores provisional cells and completed admission checks.
+//! All components share one cache-disabled state.
 //!
 //! # Workspace ownership
 //!
-//! In production the cache **owns** its [`FjallWorkspace`] (built via
-//! [`FjallCellCache::for_workspace`]). The workspace's `Drop` deletes the fjall
-//! keyspace, so the cache must hold it alive for the whole partition
-//! assignment — it lives in the partition's state manager and drops only at
-//! revocation. Test caches built from a bare handle ([`FjallCellCache::new`])
-//! own no workspace.
+//! [`FjallCellCache::for_workspace`] retains its [`FjallWorkspace`] for the
+//! partition assignment. The workspace removes its keyspace when the assignment
+//! ends. Test caches from [`FjallCellCache::new`] use a shared database without
+//! an owned workspace.
 //!
-//! # Three-valued reads and TTL co-expiry
+//! # Expiry and storage
 //!
-//! Unlike the durable stores (Memory/Cassandra) whose `get` returns only
-//! `Present`/`Absent`, the cache observes a third state: an entry that has
-//! never been populated. That state is encoded as the **absence of an entry**
-//! in the fjall keyspace, and decodes as the codec's three-valued
-//! `Read::Unknown` (see the `codec` module's cell-frame doc for the tag/expiry
-//! wire layout). The cache enforces the TTL on read against its `Clock` (an
-//! expired entry reads as a miss). The payload is stored verbatim — fjall
-//! block-compresses the on-disk data block via LZ4, so there is no per-cell
-//! codec layer.
+//! Each frame carries an absolute expiry. [`Clock`] checks that expiry during
+//! reads. Hits carry the remaining TTL. The codec stores value payloads
+//! verbatim. The cache follows the expiry contract in
+//! [`Cached`](crate::state::cached::Cached).
 //!
-//! # Blocking I/O
-//!
-//! fjall's public API is synchronous, so the cache's reads and writes are
-//! dispatched through [`tokio::task::spawn_blocking`], which clones the cheap
-//! `Arc`-backed handle into each blocking closure.
+//! Fjall uses synchronous I/O. Reads and writes use
+//! [`tokio::task::spawn_blocking`].
 
 mod codec;
 mod error;
@@ -136,13 +124,12 @@ impl Clock {
 /// The three-state result of a [`FjallCellCache::get`].
 #[derive(Clone, Debug)]
 pub(crate) enum CacheRead<P: Projection = Values> {
-    /// An unexpired entry (a `Present` value or an authoritative `Absent`).
+    /// An unexpired answer with its remaining durable TTL.
     Hit(Durable<P>),
     /// An entry exists but its stamped expiry has passed; the caller falls
     /// through to the lower store and re-publishes a fresh entry.
     Expired,
-    /// No entry exists (the cell was never published, or its entry was
-    /// deleted by a repair).
+    /// The entry is missing or cannot answer this projection.
     Miss,
 }
 
@@ -498,17 +485,9 @@ impl FjallCellCache {
         .await?
     }
 
-    /// The absolute expiry (millis; `0` = never) stamped on the cell's current
-    /// fjall entry, or `None` when no entry exists. Unlike `get`,
-    /// it does **not** treat a passed stamp as a miss: the caller is about to
-    /// **re-publish** the cell and wants to *preserve* its existing co-expiry
-    /// anchor. The promote (`commit_provisional`) uses this so the committed
-    /// value inherits the death set at stage time (`mark_resolved` does not
-    /// re-stamp the durable TTL), rather than overhanging it with a fresh
-    /// stamp.
-    ///
-    /// Test-only: the sole caller is the `#[cfg(test)]`
-    /// `Cached::stored_expiry` co-expiry probe.
+    /// Returns the stored expiry, including expired frames, or `None` for a
+    /// missing entry. Zero means no expiry. Tests use this to check the
+    /// durable expiry contract.
     #[cfg(test)]
     pub(crate) async fn stored_expiry(
         &self,
@@ -519,11 +498,9 @@ impl FjallCellCache {
         codec::frame_expiry(raw.as_deref())
     }
 
-    /// Write-through: publishes one cell's committed projection with an
-    /// absolute `expiry` (`0` = never). A present value writes the payload
-    /// cell; a known-absent value writes the `Absent` tag. The expiry
-    /// mirrors the durable row's TTL death so the entry co-expires
-    /// (FLOOR-rounded, so it never outlives the durable value).
+    /// Publishes one committed projection with an absolute expiry.
+    /// [`Projection::into_cached`] selects the frame contents. Zero expiry
+    /// means no expiry.
     pub(crate) async fn put<P: Projection>(
         &self,
         collection: &CollectionId,
@@ -544,16 +521,11 @@ impl FjallCellCache {
         .await
     }
 
-    /// Write-through publish of a *batch* of committed cell projections in a
-    /// **single** [`spawn_blocking`] over one atomic [`OwnedWriteBatch`]
-    /// (the shared `run_batch` ceremony).
-    ///
-    /// Writes all specified cells in one cache update.
-    ///
+    /// Publishes committed projections in one atomic [`OwnedWriteBatch`].
     /// A failed commit leaves the cache unchanged.
-    /// The caller owns the repair: a write-through caller removes the old
-    /// entries (`Cached::publish_written`); a read-fill caller does not
-    /// (`Cached::get_many`).
+    /// A durable write caller removes old entries after a failed cache update.
+    /// A read fill caller retains old entries because durable state did not
+    /// change.
     pub(crate) async fn put_batch<P: Projection>(
         &self,
         collection: &CollectionId,
@@ -862,13 +834,8 @@ fn expired(expiry: u64, now: u64) -> bool {
     expiry != codec::NEVER_EXPIRES && now >= expiry
 }
 
-/// Classifies a decoded cell frame `(expiry, read)` sampled at `now` into a
-/// [`CacheRead`]: a [`Miss`](CacheRead::Miss) when no entry exists, an
-/// [`Expired`](CacheRead::Expired) when the stamped expiry has passed, else a
-/// [`Hit`](CacheRead::Hit) on the present value or authoritative absent tag.
-///
-/// The point [`get`](FjallCellCache::get) and batch
-/// [`get_batch`](FjallCellCache::get_batch) share this classifier.
+/// Classifies a projected frame at `now` and gives each hit its remaining TTL.
+/// Point and batch reads share this classifier.
 fn classify<P: Projection>(expiry: u64, read: Read<P::Payload>, now: u64) -> CacheRead<P> {
     let remaining = || {
         (expiry != codec::NEVER_EXPIRES).then(|| {

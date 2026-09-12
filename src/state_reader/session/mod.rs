@@ -1,50 +1,24 @@
-//! The per-operation read session that runs probe-and-pin.
+//! One committed read operation over a fixed publication snapshot.
 //!
-//! A [`ReadSession`] binds an engine with no write half, so a handle built from
-//! a reader cannot express a mutation. Call this the
-//! `ReadOnlyHandleCannotMutate` invariant. One session is built per
-//! `StateReader` operation and captures an immutable snapshot. One logical
-//! operation therefore resolves against one exact source set and pins at most
-//! one source. Call this the `SingleSourceCoherence` invariant.
+//! A [`ReadSession`] has no mutation interface.
+//! This enforces `ReadOnlyHandleCannotMutate`.
+//! [`CommittedCellSource`] supplies both projections through collection
+//! evidence.
 //!
-//! Every guarantee here is structural. `ReadOnlyHandleCannotMutate` holds
-//! because no mutator bound exists. The [`CommittedCellSource`] contract
-//! supplies committed values and presence through collection evidence.
+//! `SingleSourceCoherence` requires each session to select at most one source.
+//! Each engine invocation borrows its selection exclusively and publishes the
+//! result to the session. A captured selection takes precedence over the shared
+//! selection. A read probes only when neither selection exists.
 //!
-//! `SingleSourceCoherence` holds two ways. Within one invocation, the
-//! `&mut Option<PinnedSource>` that every engine path threads (see [`engine`])
-//! stops two overlapping unpinned reads from compiling, so a probe always
-//! reaches its pin before the next read starts. A probe is concurrent across
-//! *sources*, never across reads: `probe_batch` fans one batch out to every
-//! source at once, and still resolves to one pin. Across invocations, the
-//! session-shared pin has exactly one writer, `engine::publish`, so the second
-//! invocation addresses the first selection.
+//! A probe reads all sources concurrently and resolves results in source order.
+//! The first source with data supplies the pin. Data takes precedence over
+//! errors from other sources. If no source returns data, any source error
+//! becomes the result. A point probe checks one cell. A batch probe checks all
+//! requested coordinates. A range probe retains the selected source's stream
+//! after its first row.
 //!
-//! The selection reaches the read paths two ways, and the two agree. A scoped
-//! collection operation carries its own invocation-local selection: the reader
-//! engine seeds it from the session-shared [`PinnedSource`] and publishes the
-//! first one it makes back to that shared cell. A managed stream carries the
-//! selection its planning command captured. The precedence is uniform: a
-//! captured selection wins, an uncaptured one defers to the shared cell, and
-//! a read probes only when neither selection exists.
-//!
-//! Probe-and-pin is the reader's source-selection strategy:
-//!
-//! * **Point read and `get_many`** issue the read to every source concurrently
-//!   and resolve in source order with early exit. A [`FuturesOrdered`] yields
-//!   in push order regardless of completion timing, so the lowest-ordered
-//!   source with data always wins the pin. A fast `None` from a non-owner can
-//!   never beat a slow `Some` from the owner. A source that errors is skipped
-//!   and its error remembered. Data beats a skipped error. No data plus at
-//!   least one error is an error.
-//! * **Range page** uses the selected source or probes each source for its
-//!   first row. The first source with a row supplies the complete stream.
-//!
-//! Once pinned, every later call addresses the pinned source directly, even on
-//! `None` or `Err`. The probe never reruns within an operation. Determinism is
-//! source-preference order, not a stable pin under transient faults: with
-//! `A=Err` and `B=Some` the pin is B, and a later run with `A=Some` pins A.
-//! That is an availability difference, never a committed-only violation.
+//! Every later read uses the pinned source, even after absence or an error.
+//! The probe does not run again after selection.
 
 use crate::Key;
 use crate::codec::Codec;

@@ -11,7 +11,7 @@ pub(crate) struct HoldingCellStore<S> {
 
 #[derive(Default)]
 pub(crate) struct Holds {
-    get_for_cache: Hold,
+    read: Hold,
     write_resolved: Hold,
     commit_provisional: Hold,
 }
@@ -70,8 +70,8 @@ impl<S> HoldingCellStore<S> {
 }
 
 impl Holds {
-    pub(crate) fn get_for_cache(&self) -> &Hold {
-        &self.get_for_cache
+    pub(crate) fn read(&self) -> &Hold {
+        &self.read
     }
 
     pub(crate) fn write_resolved(&self) -> &Hold {
@@ -94,7 +94,7 @@ impl<S: CellRead<P>, P: Projection> CellRead<P> for HoldingCellStore<S> {
         cell: &'a CellKey,
     ) -> Result<Durable<P>, Self::Error> {
         self.holds
-            .get_for_cache
+            .read
             .pass(CellRead::<P>::read(&self.inner, collection, cell))
             .await
     }

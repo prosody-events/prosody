@@ -163,9 +163,8 @@ fn prop_memory_overlay_view() {
     QuickCheck::new().quickcheck(property as fn(OverlayTrace) -> Result<bool>);
 }
 
-/// Scan correctness directly over `MemoryCellStore::scan_cells` (no overlay):
-/// the backend's own ordering, range bounds, and limit handling match the
-/// committed-only oracle — including post-clear (gap-erased) section states.
+/// Both memory scan projections match the committed model across bounds and
+/// section clears.
 #[test]
 fn prop_memory_bottom_scan() {
     fn property(trace: ScanTrace) -> Result<bool> {
@@ -758,10 +757,7 @@ async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bo
     Ok(())
 }
 
-/// A store overriding only `get_for_cache` (returning a TTL) inherits the
-/// default `get_many_for_cache`, which must carry that TTL metadata through for
-/// every position — the guard against defaulting the cache-fill batch to
-/// `get_many` + `None` TTLs (the `commit_provisional`-wrapper bug class).
+/// The default batch read preserves the TTL from each projected point read.
 #[test]
 fn forwarding_default_preserves_ttl() -> Result<()> {
     use self::support::TtlStub;

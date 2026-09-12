@@ -1,21 +1,17 @@
-//! The reader's read-through, byte-budgeted, TTL cache.
+//! A bounded cache for committed reader projections.
 //!
-//! `quick_cache` has no native TTL, so this module supplies one over it.
+//! Each entry records the read issue time and [`CacheEntry`] knowledge.
+//! [`Projection`] selects the answer. Presence reads do not copy cached
+//! payloads. The cache follows the lattice contract in [`crate::state::cell`].
 //!
-//! The cache records when each store read begins, not when it completes. TTL
-//! therefore bounds the age since the read began. A slow fill enters
-//! already-aged, so it cannot pass an old value off as fresh to a future
-//! reader.
+//! TTL bounds age from the start of the source read.
+//! A slow fill therefore enters the cache with its elapsed age.
+//! Expired entries cannot answer later reads. A completed fill returns its
+//! source result without another age check or read.
 //!
-//! The `age >= ttl` gate applies to cache hits only. A fill always serves the
-//! store result it just read. That result reflects committed state as of the
-//! fill's completion, so it is fresh no matter how long the fill took. Using
-//! the issue time only makes the cached entry expire conservatively for later
-//! readers. A completed fill is never re-checked and never re-run. The
-//! retry in [`ReaderCache::get_cached`] re-reads the key only after evicting
-//! the stale entry it just observed, so each pass either drops an entry or
-//! takes the fill guard. Cache admission is best-effort and never changes a
-//! successful store result into an error.
+//! Point reads share one fill for each missing key.
+//! Batch reads probe every key and publish only unanswered positions.
+//! Cache admission does not change a successful source result into an error.
 
 use crate::Key;
 use crate::state::access::StateAccessError;
@@ -75,13 +71,8 @@ impl Weighter<CacheKey, CacheVal> for ReaderWeighter {
     }
 }
 
-/// One read-through, TTL-bounded, byte-budgeted cache, shared by every reader
-/// drawing from a bundle. Clone shares the underlying `Arc`s.
-///
-/// A cache hit costs one allocation downstream. The shared cell decode copies
-/// its input when that input is shared, and the cache keeps a reference, so a
-/// hit's `Bytes` is always shared. The uncached store path stays zero-copy. The
-/// cache itself is zero-copy: every value is a `Bytes` refcount bump.
+/// One cache with a byte budget and TTL, shared across collection readers.
+/// Clones share the cache and clock. Value hits clone the `Bytes` handle.
 #[derive(Clone)]
 pub(crate) struct ReaderCache {
     inner: Arc<ReaderCacheInner>,
@@ -241,8 +232,7 @@ impl ReaderCache {
     }
 
     /// Writes `value` for `key`. A fill replaces an observation issued earlier.
-    /// Equal instants permit a value to refine presence. A presence fill never
-    /// discards a cached value.
+    /// Replacements follow the lattice contract in [`crate::state::cell`].
     async fn write_through(&self, key: &CacheKey, issued: Instant, value: CacheEntry<Bytes>) {
         let outcome = self
             .inner

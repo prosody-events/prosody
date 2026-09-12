@@ -14,10 +14,7 @@
 //! descriptor backed by a Kafka message reference takes the same path because
 //! the session's loader is selected by its backend family.
 //!
-//! Source discovery itself — the cached snapshot, its refresh, and retry
-//! pacing — lives in [`acquisition`]. `clippy::multiple_inherent_impl` fires on
-//! inherent impls sharing a self type across files, so one module-level
-//! expectation covers the whole subtree.
+//! [`acquisition`] owns source discovery, snapshot refresh, and retries.
 
 #![expect(
     clippy::multiple_inherent_impl,

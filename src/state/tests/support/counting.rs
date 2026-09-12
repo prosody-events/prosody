@@ -21,11 +21,11 @@ pub(crate) struct OpCounts {
     commit_provisional: AtomicUsize,
     abort_provisional: AtomicUsize,
     marker_state: AtomicUsize,
-    get: AtomicUsize,
-    get_many: AtomicUsize,
-    contains_many: AtomicUsize,
-    scan_cells: AtomicUsize,
-    scan_keys: AtomicUsize,
+    value_reads: AtomicUsize,
+    value_batches: AtomicUsize,
+    presence_reads: AtomicUsize,
+    value_scans: AtomicUsize,
+    presence_scans: AtomicUsize,
     provisional_cell_at: AtomicUsize,
     provisional_many: AtomicUsize,
 }
@@ -37,28 +37,28 @@ pub(crate) trait CountProjection: Projection {
 }
 impl CountProjection for Values {
     fn point(counts: &OpCounts) -> &AtomicUsize {
-        &counts.get
+        &counts.value_reads
     }
 
     fn batch(counts: &OpCounts) -> &AtomicUsize {
-        &counts.get_many
+        &counts.value_batches
     }
 
     fn scan(counts: &OpCounts) -> &AtomicUsize {
-        &counts.scan_cells
+        &counts.value_scans
     }
 }
 impl CountProjection for Presence {
     fn point(counts: &OpCounts) -> &AtomicUsize {
-        &counts.contains_many
+        &counts.presence_reads
     }
 
     fn batch(counts: &OpCounts) -> &AtomicUsize {
-        &counts.contains_many
+        &counts.presence_reads
     }
 
     fn scan(counts: &OpCounts) -> &AtomicUsize {
-        &counts.scan_keys
+        &counts.presence_scans
     }
 }
 
@@ -100,31 +100,31 @@ impl<S> CountingCellStore<S> {
     }
 
     pub(crate) fn lower_reads(&self) -> usize {
-        self.counts.get.load(Ordering::Relaxed)
+        self.counts.value_reads.load(Ordering::Relaxed)
     }
 
     pub(crate) fn visible_point_reads(&self) -> usize {
-        self.counts.get.load(Ordering::Relaxed)
+        self.counts.value_reads.load(Ordering::Relaxed)
     }
 
     pub(crate) fn batch_reads(&self) -> usize {
-        self.counts.get_many.load(Ordering::Relaxed)
+        self.counts.value_batches.load(Ordering::Relaxed)
     }
 
     pub(crate) fn batch_cache_reads(&self) -> usize {
-        self.counts.get_many.load(Ordering::Relaxed)
+        self.counts.value_batches.load(Ordering::Relaxed)
     }
 
     pub(crate) fn lower_scans(&self) -> usize {
-        self.counts.scan_cells.load(Ordering::Relaxed)
+        self.counts.value_scans.load(Ordering::Relaxed)
     }
 
     pub(crate) fn presence_scans(&self) -> usize {
-        self.counts.scan_keys.load(Ordering::Relaxed)
+        self.counts.presence_scans.load(Ordering::Relaxed)
     }
 
     pub(crate) fn presence_reads(&self) -> usize {
-        self.counts.contains_many.load(Ordering::Relaxed)
+        self.counts.presence_reads.load(Ordering::Relaxed)
     }
 
     pub(crate) fn raw_point_reads(&self) -> usize {
@@ -145,11 +145,11 @@ impl<S> CountingCellStore<S> {
         self.counts.commit_provisional.store(0, Ordering::Relaxed);
         self.counts.abort_provisional.store(0, Ordering::Relaxed);
         self.counts.marker_state.store(0, Ordering::Relaxed);
-        self.counts.get.store(0, Ordering::Relaxed);
-        self.counts.get_many.store(0, Ordering::Relaxed);
-        self.counts.contains_many.store(0, Ordering::Relaxed);
-        self.counts.scan_cells.store(0, Ordering::Relaxed);
-        self.counts.scan_keys.store(0, Ordering::Relaxed);
+        self.counts.value_reads.store(0, Ordering::Relaxed);
+        self.counts.value_batches.store(0, Ordering::Relaxed);
+        self.counts.presence_reads.store(0, Ordering::Relaxed);
+        self.counts.value_scans.store(0, Ordering::Relaxed);
+        self.counts.presence_scans.store(0, Ordering::Relaxed);
         self.counts.provisional_cell_at.store(0, Ordering::Relaxed);
         self.counts.provisional_many.store(0, Ordering::Relaxed);
     }
