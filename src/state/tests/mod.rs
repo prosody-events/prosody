@@ -28,7 +28,7 @@ use self::collection_suite::{
 };
 use self::publication_suite::{PublicationTrace, run_publication_trace};
 use self::support::{CountingCellStore, CountingResolver, ResolveCounter, fresh_collection};
-use super::cell::{Cell, Committed, ProvisionalWrite};
+use super::cell::{Cell, Committed, ProvisionalWrite, Values};
 use super::cell_key::CellKey;
 use super::descriptor::{StateDescriptor, WithResolver, deque, deque_state, map_state};
 use super::marker::EventMarker;
@@ -1869,7 +1869,7 @@ fn prop_resolve_reads_each_marker_once() {
                 let mut lookup = EvidenceLookup::new(&store, &id);
                 assert_eq!(
                     lookup
-                        .resolve(Cell::Resolved(Committed::<Bytes>::new(None)))
+                        .resolve(Cell::Resolved(Committed::<Values>::new(None)))
                         .await?
                         .into_inner(),
                     None

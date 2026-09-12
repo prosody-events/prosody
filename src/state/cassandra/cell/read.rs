@@ -6,13 +6,14 @@ use super::{
     PreparedStatement, QueryRowsResult, Scan, ScanEdge, Section, SmallVec, Stream, TryStreamExt,
     cooperative, decode, pin_mut, split_keyed_cell_ttl, try_stream,
 };
+use crate::state::cell::{Presence, Projection};
 use crate::state::marker::MarkerState;
 use crate::timers::duration::CompactDuration;
 use scylla::deserialize::row::DeserializeRow;
 
 pub(super) type DecodedCellBatch = CellBuffer<Option<(Cell, Option<i32>)>>;
 /// Presence cells aligned with the unique coordinate batch.
-pub(super) type DecodedPresenceBatch = CellBuffer<Option<Cell<()>>>;
+pub(super) type DecodedPresenceBatch = CellBuffer<Option<Cell<Presence>>>;
 
 #[derive(Clone, Copy)]
 pub(super) struct ScanStatements<'a> {
@@ -263,7 +264,7 @@ fn match_rows_to_coordinates<Row>(
 /// Pages value or presence rows within the scan bounds.
 /// Callers apply commit evidence and limits after this decoder.
 /// Each row uses [`cooperative`] so ready pages yield to other tasks.
-pub(super) fn page_cells<'a, Row, P: Send + 'a>(
+pub(super) fn page_cells<'a, Row, P: Projection>(
     session: &'a CassandraSession,
     statements: ScanStatements<'a>,
     collection: &'a CollectionId,

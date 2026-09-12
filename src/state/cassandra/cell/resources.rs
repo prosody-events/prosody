@@ -7,7 +7,7 @@ use super::{
     dedupe, expand_to_input_order, fetch_and_decode_cell, fetch_cells_batch,
     fetch_presence_batch_result, page_cells, pin_mut, try_stream,
 };
-use crate::state::cell::resolve_for_reader;
+use crate::state::cell::{Projection, resolve_for_reader};
 use crate::state::marker::ReaderEvidence;
 use crate::state::resolve::sibling_committed;
 use futures::try_join;
@@ -185,13 +185,13 @@ impl CassandraCellResources {
     /// Projects values or presence through commit evidence without durable
     /// writes. The limit counts only present results after committed
     /// clears.
-    fn scan_committed_inner<'a, Row, P: Clone + Send + 'a>(
+    fn scan_committed_inner<'a, Row, P: Projection>(
         &'a self,
         statements: ScanStatements<'a>,
         id: &'a CollectionId,
         scan: Scan<'a>,
         decode_row: CellDecoder<Row, P>,
-    ) -> impl Stream<Item = Result<(CellKey, P), CassandraCellStoreError>> + Send + 'a
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), CassandraCellStoreError>> + Send + 'a
     where
         Row: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata> + Send + 'a,
     {

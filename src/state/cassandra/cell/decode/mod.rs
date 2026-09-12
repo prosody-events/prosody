@@ -52,7 +52,7 @@ use super::encoding::{Encoding, decode_payload};
 use crate::state::cassandra::cell::INITIAL_VERSION;
 use crate::state::cassandra::error::CassandraCellStoreError;
 use crate::state::cassandra::udt::RawEventRef;
-use crate::state::cell::{Cell, Committed, ProvisionalCell};
+use crate::state::cell::{Cell, Committed, Presence, ProvisionalCell};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::marker::{
     CommittedMarker, EventMarker, MarkerState, MarkerVersion, decode_marker_payload,
@@ -254,7 +254,7 @@ pub(super) fn try_decode_keyed_cell(
 /// Decodes a presence scan row into its key and unit payload.
 pub(super) fn try_decode_keyed_presence(
     row: FramedKeyedPresenceRow,
-) -> Result<(CellKey, Cell<()>), CassandraCellStoreError> {
+) -> Result<(CellKey, Cell<Presence>), CassandraCellStoreError> {
     let (section, coordinate, data, prev, encoding, version, event) = row;
     Ok((
         clustered_cell_key(section, coordinate),
@@ -349,7 +349,7 @@ pub(super) fn try_decode_cell<B: AsRef<[u8]>>(
 /// A live write time becomes `Some(())`. A dead write time becomes `None`.
 pub(super) fn try_decode_presence(
     row: RawPresenceRow,
-) -> Result<Cell<()>, CassandraCellStoreError> {
+) -> Result<Cell<Presence>, CassandraCellStoreError> {
     let (data, prev, encoding, version, event) = row;
     validate_row_shape(
         data.as_ref(),

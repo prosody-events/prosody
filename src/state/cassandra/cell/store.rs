@@ -12,6 +12,8 @@ use super::{
     smallvec, try_stream,
 };
 
+use crate::state::cell::Projection;
+
 impl CassandraStore {
     /// Creates a Cassandra cell store for one partition assignment.
     ///
@@ -142,13 +144,13 @@ impl CassandraStore {
     /// The single resolving section scan, yielding each present cell's
     /// committed bytes — the body behind
     /// [`scan_cells`](super::CellStore::scan_cells).
-    pub(super) fn scan_inner<'a, Row, P: Clone + Send + 'a>(
+    pub(super) fn scan_inner<'a, Row, P: Projection>(
         &'a self,
         statements: ScanStatements<'a>,
         collection: &'a CollectionId,
         scan: Scan<'a>,
         decode_row: CellDecoder<Row, P>,
-    ) -> impl Stream<Item = Result<(CellKey, P), CellStoreError>> + Send + 'a
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), CellStoreError>> + Send + 'a
     where
         Row: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata> + Send + 'a,
     {

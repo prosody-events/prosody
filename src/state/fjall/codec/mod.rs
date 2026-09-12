@@ -48,6 +48,7 @@
 
 use super::error::FjallCellCacheError;
 use crate::state::CollectionId;
+use crate::state::cell::Read;
 use crate::state::cell_key::{CellKey, Section};
 use bytes::Bytes;
 use smallvec::SmallVec;
@@ -56,24 +57,6 @@ use xxhash_rust::xxh3::Xxh3;
 /// Length of the collection hash prefix that leads every fjall key (cell and
 /// index alike).
 const COLLECTION_PREFIX_LEN: usize = 16;
-
-/// The cache's three-valued read, decoded from a stored cell frame by
-/// [`decode_cell`].
-///
-/// `Unknown` (no entry) is what makes the cache a pass-through layer: only a
-/// stored frame may answer `Present`/`Absent`, so a miss always falls through
-/// to the durable store instead of being mistaken for a known-absent value.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Read<T> {
-    /// Value is present.
-    Present(T),
-
-    /// Value is known absent.
-    Absent,
-
-    /// This layer has not observed the value.
-    Unknown,
-}
 
 /// Tag byte for "known absent" entries.
 const CACHE_TAG_ABSENT: u8 = 0x00;

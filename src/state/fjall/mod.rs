@@ -54,10 +54,9 @@ pub(crate) use error::FjallCellCacheError;
 pub(crate) use workspace::FjallClientError;
 pub(crate) use workspace::{FjallClient, FjallWorkspace};
 
-use self::codec::Read;
 use crate::state::CollectionId;
 use crate::state::backend::AdmissionChecks;
-use crate::state::cell::{Committed, ProvisionalWrite};
+use crate::state::cell::{Committed, Presence, Projection, ProvisionalWrite, Read, Values};
 use crate::state::cell_key::{CellKey, Section};
 use crate::state::store::{CellBuffer, CommittedBatch, CoordinateBatch, PresenceBatch};
 use ahash::RandomState;
@@ -133,11 +132,12 @@ impl Clock {
 }
 
 /// Decodes a cache frame into its expiry and payload projection.
-type CellDecoder<P> = fn(Option<&[u8]>) -> Result<(u64, Read<P>), FjallCellCacheError>;
+type CellDecoder<P> =
+    fn(Option<&[u8]>) -> Result<(u64, Read<<P as Projection>::Payload>), FjallCellCacheError>;
 
 /// The three-state result of a [`FjallCellCache::get`].
 #[derive(Clone, Debug)]
-pub(crate) enum CacheRead<P = Bytes> {
+pub(crate) enum CacheRead<P: Projection = Values> {
     /// An unexpired entry (a `Present` value or an authoritative `Absent`).
     Hit(Committed<P>),
     /// An entry exists but its stamped expiry has passed; the caller falls
@@ -460,7 +460,7 @@ impl FjallCellCache {
         section: Section,
         batch: &CoordinateBatch,
     ) -> Result<Option<CommittedBatch>, FjallCellCacheError> {
-        self.probe_batch(collection, section, batch, codec::decode_cell)
+        self.probe_batch::<Values>(collection, section, batch, codec::decode_cell)
             .await
     }
 
@@ -475,7 +475,7 @@ impl FjallCellCache {
         batch: &CoordinateBatch,
     ) -> Result<Option<PresenceBatch>, FjallCellCacheError> {
         Ok(self
-            .probe_batch(collection, section, batch, codec::decode_presence)
+            .probe_batch::<Presence>(collection, section, batch, codec::decode_presence)
             .await?
             .map(|cells| cells.into_iter().map(|c| c.get().is_some()).collect()))
     }
@@ -483,7 +483,7 @@ impl FjallCellCache {
     /// Probes one batch in one blocking hop and classifies every position
     /// with one clock sample. `Ok(Some(_))` only when every position is a
     /// hit; the payload projection follows `decode`.
-    async fn probe_batch<P>(
+    async fn probe_batch<P: Projection>(
         &self,
         collection: &CollectionId,
         section: Section,
@@ -496,7 +496,7 @@ impl FjallCellCache {
         let mut hits = CellBuffer::with_capacity(raws.len());
         for raw in raws {
             let (expiry, read) = decode(raw.as_deref())?;
-            match classify(expiry, read, now) {
+            match classify::<P>(expiry, read, now) {
                 CacheRead::Hit(committed) => hits.push(committed),
                 CacheRead::Miss | CacheRead::Expired => return Ok(None),
             }
@@ -929,7 +929,7 @@ fn expired(expiry: u64, now: u64) -> bool {
 ///
 /// The point [`get`](FjallCellCache::get) and batch
 /// [`probe_batch`](FjallCellCache::probe_batch) share this classifier.
-fn classify<P>(expiry: u64, read: Read<P>, now: u64) -> CacheRead<P> {
+fn classify<P: Projection>(expiry: u64, read: Read<P::Payload>, now: u64) -> CacheRead<P> {
     match read {
         Read::Unknown => CacheRead::Miss,
         _ if expired(expiry, now) => CacheRead::Expired,

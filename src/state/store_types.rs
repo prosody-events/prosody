@@ -1,5 +1,5 @@
 use super::CELLS_INLINE;
-use super::cell::Committed;
+use super::cell::{Committed, Values};
 use super::cell_key::Coordinate;
 use crate::timers::duration::CompactDuration;
 use smallvec::SmallVec;
@@ -56,10 +56,13 @@ impl CoordinateBatch {
 pub type CellBuffer<T> = SmallVec<[T; CELLS_INLINE]>;
 
 /// The index-aligned result of a committed batch read.
-pub type CommittedBatch = CellBuffer<Committed>;
+pub type CommittedBatch<P = Values> = CellBuffer<Committed<P>>;
 
 /// One presence bit per input position.
 pub type PresenceBatch = CellBuffer<bool>;
 
 /// The index-aligned result of a cache-fill batch read.
-pub type CacheBatch = CellBuffer<(Committed, Option<CompactDuration>)>;
+pub type CacheBatch<P = Values> = CellBuffer<Durable<P>>;
+
+/// One committed cell with the remaining TTL of its durable row.
+pub type Durable<P = Values> = (Committed<P>, Option<CompactDuration>);

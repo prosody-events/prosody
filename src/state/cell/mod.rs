@@ -21,43 +21,154 @@
 //!   [`ProvisionalWrite`]'s `prev`) holds the committed value before the stage.
 //!   Readers use collection evidence to select this base or the staged value.
 //!   The type system enforces the committed base: [`ProvisionalWrite`] cannot
-//!   be built without a [`Committed`], and `Committed<Bytes>` is mintable only
+//!   be built without a [`Committed`], and `Committed<Values>` is mintable only
 //!   inside `crate::state` — by the resolved read paths.
-//! * **Presence carries no bytes** — `P` is the payload projection a decoder
-//!   produced: `Bytes` for a value read, `()` for a presence read. A presence
-//!   cell has no bytes to write back, so no presence path can persist a value.
+//! * **Presence carries no bytes** — [`Values`] yields bytes; [`Presence`]
+//!   yields `()`. A presence cell has no bytes to write back.
 //! * **Invalid shapes unrepresentable after decode** — a backend decoder
 //!   collapses every physical column shape into one of these two variants or a
 //!   typed corruption error; nothing downstream sees a half-built cell.
+//! * **Cache lattice** — a cache never replaces a `Value` entry with an
+//!   `Exists` entry.
 
 use super::event_ref::EventRef;
 use super::marker::ReaderEvidence;
 use bytes::Bytes;
+use std::fmt::Debug;
+
+/// What a cell read yields for a present cell.
+///
+/// The trait is sealed. [`Values`] yields bytes. [`Presence`] yields `()`.
+pub trait Projection: Copy + Send + Sync + 'static + sealed::Sealed {
+    /// The payload of one present cell.
+    type Payload: Clone + Debug + Eq + Send + Sync + 'static;
+
+    /// The projection name for metrics and spans.
+    const NAME: &'static str;
+
+    /// Projects a stored value.
+    fn from_value(bytes: Bytes) -> Self::Payload;
+
+    /// Reads a cache entry. [`Read::Unknown`] means the entry cannot answer.
+    fn from_cached<B: Into<Bytes>>(cached: CacheEntry<B>) -> Read<Self::Payload>;
+
+    /// Returns the cache entry for one committed read.
+    fn into_cached(committed: Committed<Self>) -> CacheEntry<Bytes>;
+}
+
+/// Reads the committed bytes of a present cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Values;
+
+/// Reads presence without a payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Presence;
+
+/// What a cache knows about one cell. `Value` refines `Exists`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CacheEntry<B> {
+    /// The cell is absent.
+    Absent,
+    /// The cell exists, but the cache has no payload.
+    Exists,
+    /// The cell exists with this payload.
+    Value(B),
+}
+
+/// A cache answer, or an unknown result that requires a durable read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Read<T> {
+    /// The cell is present.
+    Present(T),
+    /// The cell is absent.
+    Absent,
+    /// The cache cannot answer this read.
+    Unknown,
+}
+
+impl<B> CacheEntry<B> {
+    /// Returns whether this entry would discard a known payload.
+    #[must_use]
+    pub fn downgrades(&self, existing: &Self) -> bool {
+        matches!((self, existing), (Self::Exists, Self::Value(_)))
+    }
+}
+
+impl Projection for Values {
+    type Payload = Bytes;
+
+    const NAME: &'static str = "values";
+
+    fn from_value(bytes: Bytes) -> Self::Payload {
+        bytes
+    }
+
+    fn from_cached<B: Into<Bytes>>(cached: CacheEntry<B>) -> Read<Self::Payload> {
+        match cached {
+            CacheEntry::Value(bytes) => Read::Present(bytes.into()),
+            CacheEntry::Absent => Read::Absent,
+            CacheEntry::Exists => Read::Unknown,
+        }
+    }
+
+    fn into_cached(committed: Committed<Self>) -> CacheEntry<Bytes> {
+        committed
+            .into_inner()
+            .map_or(CacheEntry::Absent, CacheEntry::Value)
+    }
+}
+
+impl Projection for Presence {
+    type Payload = ();
+
+    const NAME: &'static str = "presence";
+
+    fn from_value(_bytes: Bytes) -> Self::Payload {}
+
+    fn from_cached<B: Into<Bytes>>(cached: CacheEntry<B>) -> Read<Self::Payload> {
+        match cached {
+            CacheEntry::Value(_) | CacheEntry::Exists => Read::Present(()),
+            CacheEntry::Absent => Read::Absent,
+        }
+    }
+
+    fn into_cached(committed: Committed<Self>) -> CacheEntry<Bytes> {
+        committed
+            .into_inner()
+            .map_or(CacheEntry::Absent, |()| CacheEntry::Exists)
+    }
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::Values {}
+    impl Sealed for super::Presence {}
+}
 
 /// A committed payload projection, or known absence.
 ///
-/// `Committed<Bytes>` is mintable only inside `crate::state` by resolved read
+/// `Committed<Values>` is mintable only inside `crate::state` by resolved read
 /// paths. [`ProvisionalWrite::new`] requires this proof for its prior value.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Committed<P = Bytes>(Option<P>);
+pub struct Committed<P: Projection = Values>(Option<P::Payload>);
 
-impl<P> Committed<P> {
+impl<P: Projection> Committed<P> {
     /// Mints a committed value. Restricted to the state module so only the
     /// resolved read paths can vouch that `value` is committed.
     #[must_use]
-    pub(in crate::state) fn new(value: Option<P>) -> Self {
+    pub(in crate::state) fn new(value: Option<P::Payload>) -> Self {
         Self(value)
     }
 
     /// The committed projection, or `None` for known absence.
     #[must_use]
-    pub fn get(&self) -> Option<&P> {
+    pub fn get(&self) -> Option<&P::Payload> {
         self.0.as_ref()
     }
 
     /// Returns the committed projection.
     #[must_use]
-    pub fn into_inner(self) -> Option<P> {
+    pub fn into_inner(self) -> Option<P::Payload> {
         self.0
     }
 }
@@ -65,7 +176,7 @@ impl<P> Committed<P> {
 /// One durable cell: either resolved (committed) or provisional (an event's
 /// outcome staged over the prior committed value).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Cell<P = Bytes> {
+pub enum Cell<P: Projection = Values> {
     /// No event in flight; `data` is committed.
     Resolved(Committed<P>),
 
@@ -73,12 +184,12 @@ pub enum Cell<P = Bytes> {
     Provisional(ProvisionalCell<P>),
 }
 
-impl<P> Cell<P> {
+impl<P: Projection> Cell<P> {
     /// The pure committed-value projection: `prev` for a provisional cell,
     /// `data` for a resolved one. No oracle, no mutation — sound because of
     /// the prev-is-committed invariant.
     #[must_use]
-    pub fn project_committed(&self) -> Option<&P> {
+    pub fn project_committed(&self) -> Option<&P::Payload> {
         match self {
             Self::Resolved(committed) => committed.get(),
             Self::Provisional(cell) => cell.prev(),
@@ -87,10 +198,10 @@ impl<P> Cell<P> {
 }
 
 /// Resolves one external read from positive evidence, without a durable write.
-pub(crate) fn resolve_for_reader<'a, P>(
+pub(crate) fn resolve_for_reader<'a, P: Projection>(
     cell: &'a Cell<P>,
     evidence: &ReaderEvidence,
-) -> Option<&'a P> {
+) -> Option<&'a P::Payload> {
     match cell {
         Cell::Provisional(cell) if evidence.committed(cell.event()) => cell.data(),
         // Legacy split stages and legacy residue orphaned by admit can leave cells without a Staged
@@ -105,29 +216,33 @@ pub(crate) fn resolve_for_reader<'a, P>(
 /// A staged-but-unresolved cell: the event's outcome (`data`), the committed
 /// value it superseded (`prev`), and the owning event.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProvisionalCell<P = Bytes> {
-    data: Option<P>,
-    prev: Option<P>,
+pub struct ProvisionalCell<P: Projection = Values> {
+    data: Option<P::Payload>,
+    prev: Option<P::Payload>,
     event: EventRef,
 }
 
-impl<P> ProvisionalCell<P> {
+impl<P: Projection> ProvisionalCell<P> {
     /// Reconstructs a provisional cell from decoded columns. Restricted to
     /// the state module: only a backend decoder mints one.
     #[must_use]
-    pub(in crate::state) fn new(data: Option<P>, prev: Option<P>, event: EventRef) -> Self {
+    pub(in crate::state) fn new(
+        data: Option<P::Payload>,
+        prev: Option<P::Payload>,
+        event: EventRef,
+    ) -> Self {
         Self { data, prev, event }
     }
 
     /// The event's staged outcome.
     #[must_use]
-    pub fn data(&self) -> Option<&P> {
+    pub fn data(&self) -> Option<&P::Payload> {
         self.data.as_ref()
     }
 
     /// The committed value the event superseded.
     #[must_use]
-    pub fn prev(&self) -> Option<&P> {
+    pub fn prev(&self) -> Option<&P::Payload> {
         self.prev.as_ref()
     }
 
@@ -139,13 +254,13 @@ impl<P> ProvisionalCell<P> {
 
     /// The staged outcome, consuming the cell (commit resolution).
     #[must_use]
-    pub fn into_data(self) -> Option<P> {
+    pub fn into_data(self) -> Option<P::Payload> {
         self.data
     }
 
     /// The committed base, consuming the cell (rollback / own-event base).
     #[must_use]
-    pub fn into_prev(self) -> Option<P> {
+    pub fn into_prev(self) -> Option<P::Payload> {
         self.prev
     }
 }
