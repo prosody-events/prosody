@@ -21,7 +21,7 @@ use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{Finalized, MessageMarker, OpPermit, SessionGate};
 use crate::state::store::{
     CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable,
-    PresenceBatch, provisional_point_loop,
+    provisional_point_loop,
 };
 use crate::state::{
     CollectionId, CollectionRef, EventRef, StateKey, StateName, StateType, StoreOutcome,
@@ -151,13 +151,26 @@ where
 
     async fn begin_read(_session: &UnavailableState<P>) {}
 
+    fn capture((): &()) {}
+
+    async fn resume(_session: &UnavailableState<P>, (): &()) {}
+
+    fn fence(_session: &UnavailableState<P>) -> Result<(), StateAccessError> {
+        Ok(())
+    }
+}
+
+impl<P, Q: Projection> sealed::Reads<UnavailableState<P>, Q> for UnavailableEngine
+where
+    P: Clone + Send + Sync + 'static,
+{
     fn read_point(
         _session: &UnavailableState<P>,
         _inner: &mut Self::ReadInner<'_>,
         _state_type: StateType,
         _name: &StateName,
         _cell: &CellKey,
-    ) -> impl Future<Output = Result<Option<Bytes>, StateAccessError>> {
+    ) -> impl Future<Output = Result<Option<Q::Payload>, StateAccessError>> {
         ready(Err(StateAccessError::Unavailable))
     }
 
@@ -168,24 +181,9 @@ where
         _name: &StateName,
         _section: Section,
         _batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<Option<Bytes>>, StateAccessError>> {
+    ) -> impl Future<Output = Result<CellBuffer<Option<Q::Payload>>, StateAccessError>> {
         ready(Err(StateAccessError::Unavailable))
     }
-
-    fn read_presence_batch(
-        _session: &UnavailableState<P>,
-        _inner: &mut Self::ReadInner<'_>,
-        _state_type: StateType,
-        _name: &StateName,
-        _section: Section,
-        _batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<PresenceBatch, StateAccessError>> + Send {
-        ready(Err(StateAccessError::Unavailable))
-    }
-
-    fn capture((): &()) {}
-
-    async fn resume(_session: &UnavailableState<P>, (): &()) {}
 
     fn page<'a>(
         _session: &'a UnavailableState<P>,
@@ -193,22 +191,8 @@ where
         _state_type: StateType,
         _name: &'a StateName,
         _scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, Q::Payload), StateAccessError>> + Send + 'a {
         stream::once(async { Err(StateAccessError::Unavailable) })
-    }
-
-    fn page_keys<'a>(
-        _session: &'a UnavailableState<P>,
-        (): &'a (),
-        _state_type: StateType,
-        _name: &'a StateName,
-        _scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, StateAccessError>> + Send + 'a {
-        stream::once(async { Err(StateAccessError::Unavailable) })
-    }
-
-    fn fence(_session: &UnavailableState<P>) -> Result<(), StateAccessError> {
-        Ok(())
     }
 }
 

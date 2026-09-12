@@ -16,8 +16,7 @@ use super::super::memory::MemoryCells;
 use super::super::overlay::Overlay;
 use super::super::resolve::{EvidenceLookup, resolve_event_marker};
 use super::super::store::{
-    CELL_BATCH, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch,
-    provisional_point_loop,
+    CELL_BATCH, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, provisional_point_loop,
 };
 use super::super::{CommitDecision, EventRef, StateKey, StateName, StateType};
 pub(crate) use super::support::MemoryDeduplicationStore;
@@ -1135,7 +1134,12 @@ where
         // dirty/committed interaction is checked cell-by-cell.
         for s in 0..SECTIONS.len() as u8 {
             for c in 0..CELLS {
-                if overlay.get(&id, &cell_in(s, c)).await?.into_inner() != model.visible(s, c) {
+                if overlay
+                    .get::<Values>(&id, &cell_in(s, c))
+                    .await?
+                    .into_inner()
+                    != model.visible(s, c)
+                {
                     return Ok(false);
                 }
             }
@@ -1149,11 +1153,13 @@ where
             // `CELLS + 1` (= 13) ≤ `CELL_BATCH`, so `chunks` yields one batch;
             // `CELLS ≥ 1` makes the iterator non-empty, so `next()` is `Some`.
             let batch = batch_of((0..CELLS).chain(iter::once(0)))?;
-            let got = overlay.get_many(&id, SECTIONS[s as usize], &batch).await?;
-            let presence = overlay
-                .contains_many(&id, SECTIONS[s as usize], &batch)
+            let got = overlay
+                .get_many::<Values>(&id, SECTIONS[s as usize], &batch)
                 .await?;
-            if presence != presence_of(&got) {
+            let presence = overlay
+                .get_many::<Presence>(&id, SECTIONS[s as usize], &batch)
+                .await?;
+            if presence_of(&presence) != presence_of(&got) {
                 return Ok(false);
             }
             if got.len() != CELLS as usize + 1 {
@@ -1173,7 +1179,7 @@ where
     Ok(true)
 }
 
-fn presence_of(batch: &CommittedBatch) -> PresenceBatch {
+fn presence_of<P: Projection>(batch: &CommittedBatch<P>) -> CellBuffer<bool> {
     batch
         .iter()
         .map(|committed| committed.get().is_some())
@@ -1204,7 +1210,7 @@ pub(crate) async fn run_overlay_precedence_pin<S: CellStore>(
     overlay.dirty().clear_section(&id, SECTIONS[0]);
     overlay.dirty().set(&id, &cell_in(0, 5), &bytes(7));
     let batch = batch_of([5, 5])?;
-    let got = overlay.get_many(&id, SECTIONS[0], &batch).await?;
+    let got = overlay.get_many::<Values>(&id, SECTIONS[0], &batch).await?;
     assert_eq!(got.len(), 2, "every input position is answered");
     assert_eq!(
         got[0].clone().into_inner(),
@@ -1472,7 +1478,7 @@ where
 {
     let start = Coordinate::from_bytes(vec![req.start]);
     let end = Coordinate::from_bytes(vec![req.end]);
-    let stream = overlay.scan_cells(id, scan_of(*req, &start, &end));
+    let stream = overlay.scan::<Values>(id, scan_of(*req, &start, &end));
     futures::pin_mut!(stream);
     let mut out = Vec::new();
     while take.is_none_or(|k| out.len() < k)
@@ -1495,11 +1501,11 @@ where
 {
     let start = Coordinate::from_bytes(vec![req.start]);
     let end = Coordinate::from_bytes(vec![req.end]);
-    let stream = overlay.scan_keys(id, scan_of(*req, &start, &end));
+    let stream = overlay.scan::<Presence>(id, scan_of(*req, &start, &end));
     futures::pin_mut!(stream);
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
-        out.push(coord_of(&item?));
+        out.push(coord_of(&item?.0));
     }
     Ok(out)
 }
@@ -2335,7 +2341,7 @@ pub(crate) async fn run_batch_read_parity_trace<S: CellStore>(
                     cells
                         .into_iter()
                         .map(|(committed, _)| committed.get().is_some())
-                        .collect::<PresenceBatch>()
+                        .collect::<CellBuffer<bool>>()
                 })?,
         );
     }

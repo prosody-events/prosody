@@ -24,9 +24,7 @@ pub(crate) use super::store_helpers::{
     sorted_unique_coordinates,
 };
 pub(crate) use super::store_types::CELL_BATCH;
-pub use super::store_types::{
-    CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch, Durable, PresenceBatch,
-};
+pub use super::store_types::{CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch, Durable};
 
 /// One error type for every cell read and mutation.
 pub trait CellBackend: Clone + Send + Sync + 'static {

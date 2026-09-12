@@ -20,7 +20,7 @@ use super::super::fjall::Clock;
 use super::super::fjall::test_db;
 use super::super::marker::{EventMarker, SectionClear};
 use super::super::memory::{MemoryCellStore, MemoryCells};
-use super::super::store::{CellBuffer, CellStore, CoordinateBatch, PresenceBatch};
+use super::super::store::{CellBuffer, CellStore, CoordinateBatch};
 use super::super::{CollectionId, CollectionRef, EventRef};
 use super::cell_suite::{
     FailingCellStore, MemoryDeduplicationStore, MemoryShapeProbe, OverlayTrace, Poison,
@@ -1083,8 +1083,8 @@ fn presence_is_cached() -> Result<()> {
                     .map(|cells| cells
                         .into_iter()
                         .map(|(committed, _)| committed.get().is_some())
-                        .collect::<PresenceBatch>())?,
-                PresenceBatch::from_iter([true, false])
+                        .collect::<CellBuffer<bool>>())?,
+                CellBuffer::from_iter([true, false])
             );
             assert_eq!(
                 counting.presence_reads(),
@@ -1126,8 +1126,8 @@ fn blown_fuse_presence_reads_durable_truth() -> Result<()> {
                 .map(|cells| cells
                     .into_iter()
                     .map(|(committed, _)| committed.get().is_some())
-                    .collect::<PresenceBatch>())?,
-            PresenceBatch::from_iter([false]),
+                    .collect::<CellBuffer<bool>>())?,
+            CellBuffer::from_iter([false]),
         );
         assert_eq!(counting.presence_reads(), 1, "the fused read delegates");
         Ok(())

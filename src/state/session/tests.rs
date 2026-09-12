@@ -181,7 +181,7 @@ impl Fixture {
         let scope = self.session(probe);
         Ok(scope
             .handle()
-            .get(StateType::Application, &self.value_name, &value_cell())
+            .get::<Values>(StateType::Application, &self.value_name, &value_cell())
             .await?)
     }
 
@@ -312,7 +312,7 @@ async fn rollback_restores_the_commit_floor_without_durable_writes() -> Result<(
     // The read is the floor V again.
     assert_eq!(
         session
-            .get(StateType::Application, &cart, &value_cell())
+            .get::<Values>(StateType::Application, &cart, &value_cell())
             .await?,
         Some(Bytes::from_static(b"V")),
     );
@@ -387,7 +387,7 @@ async fn rollback_on_a_terminated_session_is_noop() -> Result<()> {
     assert!(!fx.dirty.touched(&fx.state_key.key).is_empty());
     assert_eq!(
         session
-            .get(StateType::Application, &fx.value_name, &value_cell())
+            .get::<Values>(StateType::Application, &fx.value_name, &value_cell())
             .await?,
         Some(Bytes::from_static(b"W")),
     );
@@ -629,7 +629,7 @@ async fn apply_value_op(
     // the scratch model, so a missed rollback discard or a lost buffered write
     // surfaces at the op that caused it.
     let read = session
-        .get(StateType::Application, name, &value_cell())
+        .get::<Values>(StateType::Application, name, &value_cell())
         .await?;
     Ok(read == model.scratch)
 }

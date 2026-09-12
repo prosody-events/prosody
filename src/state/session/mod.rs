@@ -24,7 +24,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::CommitDecision;
 use crate::state::access::StateAccessError;
 use crate::state::backend::AdmissionChecks;
-use crate::state::cell::{Committed, ProvisionalWrite, Values};
+use crate::state::cell::{Committed, Projection, ProvisionalWrite, Values};
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::collection::{StateSession, WritableStateSession};
 use crate::state::descriptor::{
@@ -37,9 +37,7 @@ use crate::state::overlay::Overlay;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::resolve::resolve_event_marker;
 use crate::state::retry::{StepOutcome, retry_step};
-use crate::state::store::{
-    CELL_BATCH, CellBuffer, CellRead, CellStore, CoordinateBatch, PresenceBatch,
-};
+use crate::state::store::{CELL_BATCH, CellBuffer, CellRead, CellStore, CoordinateBatch};
 use crate::state::{
     CollectionKindId, CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY,
     StateBackend, StateKey, StateName, StateType, StoreOutcome,
@@ -894,107 +892,76 @@ where
         Ok(state_name.clone())
     }
 
-    /// Reads a cell's currently visible committed value within this event's
-    /// transaction (cleared/absent → `None`) — the dirty overlay resolved
-    /// through collection evidence.
+    /// Reads one projected cell through the event overlay.
     ///
     /// # Errors
     ///
-    /// Returns [`StateAccessError::Store`] when the underlying store fails.
-    pub(in crate::state) async fn get(
+    /// Returns the store error.
+    pub(in crate::state) async fn get<P: Projection>(
         &self,
         state_type: StateType,
         name: &StateName,
         cell: &CellKey,
-    ) -> Result<Option<Bytes>, StateAccessError> {
+    ) -> Result<Option<P::Payload>, StateAccessError>
+    where
+        B::Cell: CellRead<P>,
+    {
         let id = self.id_for(state_type, name);
         let committed = self
             .inner
             .overlay
-            .get(&id, cell)
+            .get::<P>(&id, cell)
             .await
             .map_err(|e| StateAccessError::store(&e))?;
         Ok(committed.into_inner())
     }
 
-    /// Batch twin of [`Self::get`]: reads one `section`'s coordinates in one
-    /// backend hop, aligned index-wise (`result[i]` answers `batch[i]`;
-    /// duplicate coordinates co-observe; absent → `None`). The section is
-    /// explicit alongside the batch — the point read carries it inside the
-    /// [`CellKey`].
+    /// Reads one projected answer for each coordinate in input order.
     ///
     /// # Errors
     ///
-    /// Returns [`StateAccessError::Store`] when the underlying store fails.
-    pub(in crate::state) async fn get_many(
+    /// Returns the store error.
+    pub(in crate::state) async fn get_many<P: Projection>(
         &self,
         state_type: StateType,
         name: &StateName,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
+    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
+    where
+        B::Cell: CellRead<P>,
+    {
         let id = self.id_for(state_type, name);
         let committed = self
             .inner
             .overlay
-            .get_many(&id, section, batch)
+            .get_many::<P>(&id, section, batch)
             .await
             .map_err(|e| StateAccessError::store(&e))?;
         Ok(committed.into_iter().map(Committed::into_inner).collect())
     }
 
-    /// Reads one section's presence values through the event overlay.
-    pub(in crate::state) async fn contains_many(
-        &self,
-        state_type: StateType,
-        name: &StateName,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<PresenceBatch, StateAccessError> {
-        let id = self.id_for(state_type, name);
-        self.inner
-            .overlay
-            .contains_many(&id, section, batch)
-            .await
-            .map_err(|error| StateAccessError::store(&error))
-    }
-
     /// The single-section, start-anchored, bidirectional range primitive: a
     /// lazy stream of the visible committed cells in `coordinate` byte order.
-    pub(in crate::state) fn scan<'a>(
+    pub(in crate::state) fn scan<'a, P: Projection>(
         &'a self,
         state_type: StateType,
         name: &'a StateName,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a
+    where
+        B::Cell: CellRead<P>,
+    {
         let id = self.id_for(state_type, name);
-        // `id` is local to the generator, so `scan_cells` unifies its lifetime
+        // `id` is local to the generator, so `scan` unifies its lifetime
         // with an owned overlay; the caller's `Copy` `Scan<'a>` rides in
         // directly (it is covariant, so it coerces to that shorter scope).
         let overlay = self.inner.overlay.clone();
         try_stream! {
-            let inner = overlay.scan_cells(&id, scan);
+            let inner = overlay.scan::<P>(&id, scan);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 yield item.map_err(|e| StateAccessError::store(&e))?;
-            }
-        }
-    }
-
-    /// Streams visible keys without value payloads.
-    pub(in crate::state) fn scan_keys<'a>(
-        &'a self,
-        state_type: StateType,
-        name: &'a StateName,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, StateAccessError>> + Send + 'a {
-        let id = self.id_for(state_type, name);
-        let overlay = self.inner.overlay.clone();
-        try_stream! {
-            let inner = overlay.scan_keys(&id, scan);
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().await {
-                yield item.map_err(|error| StateAccessError::store(&error))?;
             }
         }
     }
@@ -1252,7 +1219,7 @@ where
         name: &StateName,
         cell: &CellKey,
     ) -> Result<Option<Bytes>, StateAccessError> {
-        self.get(state_type, name, cell).await
+        self.get::<Values>(state_type, name, cell).await
     }
 }
 
