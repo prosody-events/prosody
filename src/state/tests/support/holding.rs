@@ -83,56 +83,35 @@ impl Holds {
     }
 }
 
+impl<S: CellBackend> CellBackend for HoldingCellStore<S> {
+    type Error = S::Error;
+}
+
+impl<S: CellRead<P>, P: Projection> CellRead<P> for HoldingCellStore<S> {
+    async fn read<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+    ) -> Result<Durable<P>, Self::Error> {
+        self.holds
+            .get_for_cache
+            .pass(CellRead::<P>::read(&self.inner, collection, cell))
+            .await
+    }
+
+    fn scan<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+        CellRead::<P>::scan(&self.inner, collection, scan)
+    }
+}
+
 impl<S> CellStore for HoldingCellStore<S>
 where
     S: CellStore,
 {
-    type Error = S::Error;
-
-    fn get<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        cell: &'a CellKey,
-    ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
-        self.inner.get(collection, cell)
-    }
-
-    fn scan_cells<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        self.inner.scan_cells(collection, scan)
-    }
-
-    fn scan_keys<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
-        self.inner.scan_keys(collection, scan)
-    }
-
-    fn contains_many<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send + 'a {
-        self.inner.contains_many(collection, section, batch)
-    }
-
-    async fn get_for_cache<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        cell: &'a CellKey,
-    ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
-        self.holds
-            .get_for_cache
-            .pass(self.inner.get_for_cache(collection, cell))
-            .await
-    }
-
     fn provisional_cell_at<'a>(
         &'a self,
         collection: &'a CollectionId,

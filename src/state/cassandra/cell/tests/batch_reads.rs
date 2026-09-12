@@ -1,5 +1,8 @@
 use super::*;
 use crate::state::cassandra::CassandraCellStoreError;
+use crate::state::cell::Values;
+use crate::state::store::CellRead;
+use crate::state::store::CommittedBatch;
 use crate::state::tests::support::evidence;
 
 /// Batch-read parity over the live `CassandraStore`: the single-`IN`-query
@@ -118,7 +121,9 @@ async fn first_error_is_first_input_position() -> Result<()> {
     // The two rows are distinguishable through the sequential oracle.
     assert!(
         matches!(
-            store.get(id, &cell_a).await,
+            CellRead::<Values>::read(&store, id, &cell_a)
+                .await
+                .map(|(committed, _)| committed),
             Err(ResolveCellError::Store(
                 CassandraCellStoreError::CorruptCell(CellCorruptReason::PrevWithoutEvent)
             ))
@@ -127,7 +132,9 @@ async fn first_error_is_first_input_position() -> Result<()> {
     );
     assert!(
         matches!(
-            store.get(id, &cell_b).await,
+            CellRead::<Values>::read(&store, id, &cell_b)
+                .await
+                .map(|(committed, _)| committed),
             Err(ResolveCellError::Store(
                 CassandraCellStoreError::CorruptCell(CellCorruptReason::BlobWithoutEncoding)
             ))
@@ -139,7 +146,18 @@ async fn first_error_is_first_input_position() -> Result<()> {
     let batch = CoordinateBatch::chunks([0xFEu8, 0x01].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    match Box::pin(store.get_many(id, SECTIONS[0], &batch)).await {
+    match Box::pin(async {
+        CellRead::<Values>::read_many(&store, id, SECTIONS[0], &batch)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed)
+                    .collect::<CommittedBatch>()
+            })
+    })
+    .await
+    {
         Err(ResolveCellError::Store(CassandraCellStoreError::CorruptCell(reason))) => {
             assert_eq!(
                 reason,
@@ -322,7 +340,7 @@ async fn cassandra_raw_batch_is_one_query() -> Result<()> {
     let mut writes = Vec::new();
     for b in [1u8, 2] {
         let cell = cell_in(0, b);
-        let prev = seed.get(id, &cell).await?;
+        let prev = CellRead::<Values>::read(&seed, id, &cell).await?.0;
         writes.push((
             cell,
             ProvisionalWrite::new(Some(bytes(b * 10)), prev, staging),

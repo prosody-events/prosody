@@ -1,4 +1,6 @@
 use crate::state::CommitDecision;
+use crate::state::store::CellRead;
+use crate::state::store::CommittedBatch;
 use crate::state::tests::support::{StageInspection, evidence};
 use crate::test_util::TEST_RUNTIME;
 mod cached_suite;
@@ -403,17 +405,17 @@ fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
 
         // Resolved cells return the committed value directly.
         assert_eq!(
-            store
-                .get(&id, &cell_in(0, 7))
+            CellRead::<Values>::read(&store, &id, &cell_in(0, 7))
                 .await
+                .map(|(committed, _)| committed)
                 .map_err(|e| eyre!("get s0: {e}"))?,
             Committed::new(Some(bytes(70))),
             "the section-0 survivor commits at (0, 7)"
         );
         assert_eq!(
-            store
-                .get(&id, &cell_in(1, 7))
+            CellRead::<Values>::read(&store, &id, &cell_in(1, 7))
                 .await
+                .map(|(committed, _)| committed)
                 .map_err(|e| eyre!("get s1: {e}"))?,
             Committed::new(Some(bytes(90))),
             "the section-1 survivor commits at (1, 7), not collided onto (0, 7)"
@@ -774,7 +776,9 @@ fn forwarding_default_preserves_ttl() -> Result<()> {
     let batch = CoordinateBatch::chunks([0u8, 1].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    let got = TEST_RUNTIME.block_on(store.get_many_for_cache(&id, SECTIONS[0], &batch))?;
+    let got = TEST_RUNTIME.block_on(async {
+        CellRead::<Values>::read_many(&store, &id, SECTIONS[0], &batch).await
+    })?;
     assert_eq!(got.len(), 2, "every position answered");
     for (_, remaining) in &got {
         assert_eq!(
@@ -1925,15 +1929,20 @@ async fn check_memory_read_parity(
     let batch = CoordinateBatch::chunks(writes.iter().map(|(cell, _)| cell.coordinate.clone()))
         .next()
         .ok_or_else(|| eyre!("batch missing"))?;
-    let values = store.get_many(id, writes[0].0.section, &batch).await?;
+    let values = CellRead::<Values>::read_many(store, id, writes[0].0.section, &batch)
+        .await
+        .map(|cells| {
+            cells
+                .into_iter()
+                .map(|(committed, _)| committed)
+                .collect::<CommittedBatch>()
+        })?;
     assert_eq!(values.len(), batch.len());
     for value in values {
         assert_eq!(value.into_inner().as_ref(), expected);
     }
 
-    let values = store
-        .get_many_for_cache(id, writes[0].0.section, &batch)
-        .await?;
+    let values = CellRead::<Values>::read_many(store, id, writes[0].0.section, &batch).await?;
     assert_eq!(values.len(), batch.len());
     for (value, ttl) in values {
         assert_eq!(value.into_inner().as_ref(), expected);
@@ -1948,7 +1957,9 @@ async fn check_memory_read_parity(
             dir,
             limit: None,
         };
-        let rows: Vec<_> = store.scan_cells(id, scan).try_collect().await?;
+        let rows: Vec<_> = CellRead::<Values>::scan(store, id, scan)
+            .try_collect()
+            .await?;
         assert_eq!(rows.len(), writes.len());
         for (_, value) in rows {
             assert_eq!(Some(&value), expected);

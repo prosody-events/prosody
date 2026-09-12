@@ -1,9 +1,11 @@
 use super::*;
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
+use crate::state::cell::Values;
 use crate::state::descriptor::{DescriptorIdentity, value_state};
 use crate::state::manager::{Admission, PartitionStateManager, test_manager};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+use crate::state::store::CellRead;
 use crate::timers::test_support::setup_timer_manager;
 use std::slice::from_ref;
 
@@ -133,10 +135,20 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
     ensure!(admit_registered(&counted, &dedup, &collections).await? == Admission::Fresh);
     let expected = if committed { replay } else { newer };
     ensure!(
-        store.get(collections[0].id(), &cell).await?.get() == Some(&expected),
+        CellRead::<Values>::read(&store, collections[0].id(), &cell)
+            .await?
+            .0
+            .get()
+            == Some(&expected),
         "an old certificate certified a replay"
     );
-    ensure!(store.get(collections[1].id(), &cell).await?.get() == Some(&bytes(value)));
+    ensure!(
+        CellRead::<Values>::read(&store, collections[1].id(), &cell)
+            .await?
+            .0
+            .get()
+            == Some(&bytes(value))
+    );
     for collection in &collections {
         ensure!(store.marker_state(collection.id()).await?.staged.is_none());
     }
@@ -239,9 +251,9 @@ async fn deregistration<S: CellStore>(
         .await?;
     let expected = committed.then(|| bytes(value));
     ensure!(
-        store
-            .get(collections[1].id(), &value_cell())
+        CellRead::<Values>::read(store, collections[1].id(), &value_cell())
             .await?
+            .0
             .into_inner()
             == expected,
         "a replay certified residue from another attempt"
@@ -255,9 +267,9 @@ async fn deregistration<S: CellStore>(
             .is_none()
     );
     ensure!(
-        store
-            .get(collections[1].id(), &value_cell())
+        CellRead::<Values>::read(store, collections[1].id(), &value_cell())
             .await?
+            .0
             .into_inner()
             == expected
     );

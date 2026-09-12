@@ -8,7 +8,7 @@ use crate::consumer::middleware::{MarkerWrite, RepinProof};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
-use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
+use crate::state::cell::{Committed, Presence, Projection, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
 use crate::state::collection::{MutationJournal, StateSession, WritableStateSession, sealed};
 use crate::state::descriptor::{CellResolver, StructuralIdentity};
@@ -20,8 +20,8 @@ use crate::state::registry::CollectionDef;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{Finalized, MessageMarker, OpPermit, SessionGate};
 use crate::state::store::{
-    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch,
-    provisional_point_loop,
+    CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable,
+    PresenceBatch, provisional_point_loop,
 };
 use crate::state::{
     CollectionId, CollectionRef, EventRef, StateKey, StateName, StateType, StoreOutcome,
@@ -51,7 +51,7 @@ mod holding;
 mod publication;
 mod ttl;
 
-pub(crate) use counting::{CountingCellStore, CountingResolver, ResolveCounter};
+pub(crate) use counting::{CountProjection, CountingCellStore, CountingResolver, ResolveCounter};
 pub(crate) use holding::{HoldingCellStore, Holds};
 pub(crate) use publication::{ParkedRead, ScriptedPublicationStore};
 pub(crate) use ttl::TtlStub;

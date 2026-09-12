@@ -47,30 +47,27 @@ impl CellMetrics {
     /// Records one point load.
     pub(super) fn point<T, E: ClassifyError>(
         &self,
+        projection: &'static str,
         started: Instant,
         source: Source,
         cache_result: CacheResult,
         outcome: &Result<T, E>,
     ) {
-        self.record(1, "get", started, source, cache_result, outcome);
+        self.record(
+            1,
+            ("get", projection),
+            started,
+            source,
+            cache_result,
+            outcome,
+        );
     }
 
     /// Records all cells in one batch load.
     pub(super) fn batch<T, E: ClassifyError>(
         &self,
         cells: usize,
-        started: Instant,
-        source: Source,
-        cache_result: CacheResult,
-        outcome: &Result<T, E>,
-    ) {
-        self.record(cells, "get_many", started, source, cache_result, outcome);
-    }
-
-    /// Records all cells in one presence load.
-    pub(super) fn presence<T, E: ClassifyError>(
-        &self,
-        cells: usize,
+        projection: &'static str,
         started: Instant,
         source: Source,
         cache_result: CacheResult,
@@ -78,7 +75,7 @@ impl CellMetrics {
     ) {
         self.record(
             cells,
-            "contains_many",
+            ("get_many", projection),
             started,
             source,
             cache_result,
@@ -89,7 +86,7 @@ impl CellMetrics {
     fn record<T, E: ClassifyError>(
         &self,
         cells: usize,
-        operation: &'static str,
+        (operation, projection): (&'static str, &'static str),
         started: Instant,
         source: Source,
         result: CacheResult,
@@ -98,6 +95,7 @@ impl CellMetrics {
         let cells = cells as u64;
         let attributes = [
             KeyValue::new(OPERATION, operation),
+            KeyValue::new("prosody.state.cell.projection", projection),
             KeyValue::new(SOURCE, source.as_str()),
             KeyValue::new(CACHE_RESULT, result.as_str()),
         ];
@@ -113,6 +111,7 @@ impl CellMetrics {
                     attributes[0].clone(),
                     attributes[1].clone(),
                     attributes[2].clone(),
+                    attributes[3].clone(),
                     KeyValue::new(ERROR_CATEGORY, error_category(error.classify_error())),
                 ],
             ),

@@ -42,15 +42,15 @@ use crate::state::marker::{EventMarker, SectionClear, encode_marker_payload};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{EvidenceLookup, ResolveCellError};
 use crate::state::store::{
-    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch, dedupe,
-    expand_to_input_order, sorted_unique_coordinates,
+    CacheBatch, CellBuffer, CellStore, CoordinateBatch, dedupe, expand_to_input_order,
+    sorted_unique_coordinates,
 };
 use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
 use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
 use bytes::Bytes;
 use encoding::{EncodedBlob, encode, encode_payload, select_encoding};
-use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
+use futures::{Stream, TryStreamExt, pin_mut};
 use scylla::serialize::SerializationError;
 use scylla::serialize::row::{RowSerializationContext, SerializeRow};
 use scylla::serialize::writers::RowWriter;

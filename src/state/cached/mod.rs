@@ -32,13 +32,13 @@
 pub(crate) mod metrics;
 
 use self::metrics::{CacheResult, CellMetrics, Source};
-use super::cell::{Committed, Presence, Projection, ProvisionalCell, ProvisionalWrite, Values};
+use super::cell::{Committed, Projection, ProvisionalCell, ProvisionalWrite, Values};
 use super::cell_key::{CellKey, Coordinate, Scan, Section};
 use super::fjall::{CacheRead, FjallCellCache, FjallCellCacheError};
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::{EventMarker, MarkerState, SectionClear};
 use super::store::{
-    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch,
+    CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable,
 };
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
@@ -88,14 +88,6 @@ impl<L> Cached<L> {
         self
     }
 
-    /// The fjall expiry for a cell **read back** from the lower store now: the
-    /// clock is read at fill time and `remaining` is the already-decremented
-    /// `TTL(data)`, so [`expiry_at`] stamps `floor(now) + remaining` (see the
-    /// module's TTL co-expiry doc).
-    fn expiry_for(&self, remaining: Option<CompactDuration>) -> u64 {
-        expiry_at(self.fjall.clock().now_ms(), remaining)
-    }
-
     /// The absolute expiry stamped on a cell's current fjall entry (`None` if
     /// absent) — the co-expiry-anchor property asserts this equals the modeled
     /// durable death after every mutation.
@@ -106,51 +98,6 @@ impl<L> Cached<L> {
         cell: &CellKey,
     ) -> Result<Option<u64>, FjallCellCacheError> {
         self.fjall.stored_expiry(collection, cell).await
-    }
-
-    /// Reads the lower batch and publishes probe misses with their co-expiry
-    /// stamps.
-    async fn fill_batch<P: Projection>(
-        &self,
-        collection: &CollectionId,
-        section: Section,
-        batch: &CoordinateBatch,
-        op: &'static str,
-        probes: &[CacheRead<P>],
-    ) -> Result<CommittedBatch, L::Error>
-    where
-        L: CellStore,
-    {
-        // Sample time before the lower read so cache entries cannot outlive durable
-        // rows.
-        let stamped_at = self.fjall.clock().now_ms();
-        // A failed lower read publishes no cache entries.
-        let filled: CacheBatch = self
-            .lower
-            .get_many_for_cache(collection, section, batch)
-            .await?;
-        // Publish present and absent cells atomically. A failed fill preserves existing
-        // entries.
-        let projected = batch
-            .iter()
-            .zip(filled.iter())
-            .enumerate()
-            .filter(|(i, _)| !matches!(probes.get(*i), Some(CacheRead::Hit(_))))
-            .map(|(_, (coordinate, (committed, remaining)))| {
-                (
-                    CellKey {
-                        section,
-                        coordinate: coordinate.clone(),
-                    },
-                    committed.clone(),
-                    expiry_at(stamped_at, *remaining),
-                )
-            });
-        if let Err(error) = self.fjall.put_batch::<Values>(collection, projected).await {
-            warn_skip("populate batch", &error);
-            self.metrics.cache_error(op, "fill");
-        }
-        Ok(filled.into_iter().map(|(committed, _)| committed).collect())
     }
 
     /// Removes cache entries that a Staged payload can change.
@@ -231,91 +178,86 @@ impl Drop for PromoteCacheGuard<'_> {
     }
 }
 
-impl<L> CellStore for Cached<L>
-where
-    L: CellStore,
-{
+impl<L: CellBackend> CellBackend for Cached<L> {
     type Error = L::Error;
+}
 
-    async fn get<'a>(
+impl<L: CellRead<P> + CellRead<Values>, P: Projection> CellRead<P> for Cached<L> {
+    async fn read<'a>(
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-    ) -> Result<Committed, Self::Error> {
+    ) -> Result<Durable<P>, Self::Error> {
         let started = Instant::now();
-        // Send the read to durable storage when the cache is disabled.
         if self.fjall.is_disabled() {
-            let loaded = self.lower.get(collection, cell).await;
-            self.metrics
-                .point(started, Source::Store, CacheResult::Disabled, &loaded);
+            let loaded = CellRead::<P>::read(&self.lower, collection, cell).await;
+            self.metrics.point(
+                P::NAME,
+                started,
+                Source::Store,
+                CacheResult::Disabled,
+                &loaded,
+            );
             return loaded;
         }
-        let cache_result = match self.fjall.get::<Values>(collection, cell).await {
-            // A hit (Present value or Absent tag) is the current committed
-            // projection (KV1); serve it verbatim with zero lower reads.
-            Ok(CacheRead::Hit((committed, _))) => {
-                let loaded = Ok(committed);
+        let cache_result = match self.fjall.get::<P>(collection, cell).await {
+            Ok(CacheRead::Hit(hit)) => {
+                let loaded = Ok(hit);
                 self.metrics
-                    .point(started, Source::Cache, CacheResult::Hit, &loaded);
+                    .point(P::NAME, started, Source::Cache, CacheResult::Hit, &loaded);
                 return loaded;
             }
-            // A Miss asserts nothing and an Expired entry is a co-expiry gap
-            // (KV2): fall through and re-publish.
             Ok(CacheRead::Miss) => CacheResult::Miss,
             Ok(CacheRead::Expired) => CacheResult::Expired,
-            // A fjall read failure degrades this one read to a durable one.
             Err(error) => {
                 warn_skip("read", &error);
                 self.metrics.cache_error("get", "lookup");
                 CacheResult::Error
             }
         };
+        let stamped_at = self.fjall.clock().now_ms();
         let loaded = async {
-            let (committed, remaining) = self.lower.get_for_cache(collection, cell).await?;
-            // Cache the durable result with its remaining lifetime.
-            // A failed update keeps an equal live entry or no entry.
-            let expiry = self.expiry_for(remaining);
+            let (committed, remaining) =
+                CellRead::<Values>::read(&self.lower, collection, cell).await?;
             if let Err(error) = self
                 .fjall
-                .put::<Values>(collection, cell, committed.clone(), expiry)
+                .put::<Values>(
+                    collection,
+                    cell,
+                    committed.clone(),
+                    expiry_at(stamped_at, remaining),
+                )
                 .await
             {
                 warn_skip("populate", &error);
                 self.metrics.cache_error("get", "fill");
             }
-            Ok(committed)
+            Ok((
+                Committed::new(committed.into_inner().map(P::from_value)),
+                remaining,
+            ))
         }
         .await;
         self.metrics
-            .point(started, Source::Store, cache_result, &loaded);
+            .point(P::NAME, started, Source::Store, cache_result, &loaded);
         loaded
     }
 
-    /// Reads a batch from the cache only when every entry is current.
-    ///
-    /// One missing or expired entry reloads the complete batch.
-    /// A batch of hits consults no marker. This is sound for three reasons. The
-    /// settle transform installs committed values after the durable promote.
-    /// Per-key dispatch serializes events on a key. Every assignment starts
-    /// with a cold cache.
-    ///
-    /// Ruling: partial refetch (keep the hits, load only the misses) stays
-    /// deferred until a benchmark shows a material Cassandra gain. Such a
-    /// design must pin the committed-but-unpromoted window with a property
-    /// test.
-    async fn get_many<'a>(
+    /// Reads the whole lower batch after any miss and publishes only probe
+    /// misses. Partial refetch requires a benchmark before it can replace
+    /// this rule.
+    async fn read_many<'a>(
         &'a self,
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-    ) -> Result<CommittedBatch, Self::Error> {
+    ) -> Result<CacheBatch<P>, Self::Error> {
         let started = Instant::now();
-        // Check the disabled state once when this operation starts.
-        // Complete accepted cache work if another operation disables the cache.
         if self.fjall.is_disabled() {
-            let loaded = self.lower.get_many(collection, section, batch).await;
+            let loaded = CellRead::<P>::read_many(&self.lower, collection, section, batch).await;
             self.metrics.batch(
                 batch.len(),
+                P::NAME,
                 started,
                 Source::Store,
                 CacheResult::Disabled,
@@ -323,25 +265,19 @@ where
             );
             return loaded;
         }
-        // Probe: ONE blocking hop, exhaustive.
         let mut probes = CellBuffer::new();
-        let cache_result = match self
-            .fjall
-            .get_batch::<Values>(collection, section, batch)
-            .await
-        {
-            // Every position is a hit (Present value or Absent tag), the current
-            // committed projection (KV1): serve it without a lower read.
+        let cache_result = match self.fjall.get_batch::<P>(collection, section, batch).await {
             Ok(hits) if hits.iter().all(|hit| matches!(hit, CacheRead::Hit(_))) => {
                 let loaded = Ok(hits
                     .into_iter()
                     .filter_map(|hit| match hit {
-                        CacheRead::Hit((committed, _)) => Some(committed),
+                        CacheRead::Hit(hit) => Some(hit),
                         _ => None,
                     })
                     .collect());
                 self.metrics.batch(
                     batch.len(),
+                    P::NAME,
                     started,
                     Source::Cache,
                     CacheResult::Hit,
@@ -349,103 +285,71 @@ where
                 );
                 return loaded;
             }
-            // Any miss/expired (KV2): fall through and refetch the complete batch.
             Ok(hits) => {
                 probes = hits;
                 CacheResult::NotAllHit
             }
-            // A fjall probe failure degrades this read to a durable one.
             Err(error) => {
                 warn_skip("read batch", &error);
                 self.metrics.cache_error("get_many", "lookup");
                 CacheResult::Error
             }
         };
-        let loaded = self
-            .fill_batch(collection, section, batch, "get_many", &probes)
-            .await;
-        self.metrics
-            .batch(batch.len(), started, Source::Store, cache_result, &loaded);
-        loaded
-    }
-
-    /// Reads cached presence and fills probe misses with committed values.
-    async fn contains_many<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> Result<PresenceBatch, Self::Error> {
-        let started = Instant::now();
-        if self.fjall.is_disabled() {
-            let loaded = self.lower.contains_many(collection, section, batch).await;
-            self.metrics.presence(
-                batch.len(),
-                started,
-                Source::Store,
-                CacheResult::Disabled,
-                &loaded,
-            );
-            return loaded;
+        let stamped_at = self.fjall.clock().now_ms();
+        let loaded = async {
+            let filled =
+                CellRead::<Values>::read_many(&self.lower, collection, section, batch).await?;
+            let projected = batch
+                .iter()
+                .zip(&filled)
+                .enumerate()
+                .filter(|(i, _)| !matches!(probes.get(*i), Some(CacheRead::Hit(_))))
+                .map(|(_, (coordinate, (committed, remaining)))| {
+                    (
+                        CellKey {
+                            section,
+                            coordinate: coordinate.clone(),
+                        },
+                        committed.clone(),
+                        expiry_at(stamped_at, *remaining),
+                    )
+                });
+            if let Err(error) = self.fjall.put_batch::<Values>(collection, projected).await {
+                warn_skip("populate batch", &error);
+                self.metrics.cache_error("get_many", "fill");
+            }
+            Ok(filled
+                .into_iter()
+                .map(|(committed, ttl)| {
+                    (
+                        Committed::new(committed.into_inner().map(P::from_value)),
+                        ttl,
+                    )
+                })
+                .collect())
         }
-        let mut probes = CellBuffer::new();
-        let cache_result = match self
-            .fjall
-            .get_batch::<Presence>(collection, section, batch)
-            .await
-        {
-            Ok(hits) if hits.iter().all(|hit| matches!(hit, CacheRead::Hit(_))) => {
-                let loaded = Ok(hits
-                    .into_iter()
-                    .filter_map(|hit| match hit {
-                        CacheRead::Hit((committed, _)) => Some(committed.get().is_some()),
-                        _ => None,
-                    })
-                    .collect());
-                self.metrics.presence(
-                    batch.len(),
-                    started,
-                    Source::Cache,
-                    CacheResult::Hit,
-                    &loaded,
-                );
-                return loaded;
-            }
-            Ok(hits) => {
-                probes = hits;
-                CacheResult::NotAllHit
-            }
-            Err(error) => {
-                warn_skip("read presence batch", &error);
-                self.metrics.cache_error("contains_many", "lookup");
-                CacheResult::Error
-            }
-        };
-        let loaded = self
-            .fill_batch(collection, section, batch, "contains_many", &probes)
-            .await
-            .map(|cells| cells.into_iter().map(|c| c.get().is_some()).collect());
-        self.metrics
-            .presence(batch.len(), started, Source::Store, cache_result, &loaded);
+        .await;
+        self.metrics.batch(
+            batch.len(),
+            P::NAME,
+            started,
+            Source::Store,
+            cache_result,
+            &loaded,
+        );
         loaded
     }
 
-    fn scan_cells<'a>(
+    fn scan<'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        self.lower.scan_cells(collection, scan)
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+        CellRead::<P>::scan(&self.lower, collection, scan)
     }
+}
 
-    fn scan_keys<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
-        self.lower.scan_keys(collection, scan)
-    }
-
+impl<L: CellStore> CellStore for Cached<L> {
     async fn provisional_cell_at<'a>(
         &'a self,
         collection: &'a CollectionId,

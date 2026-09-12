@@ -42,6 +42,8 @@ use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::dirty::{DirtyStore, DirtyVal};
 use super::identity::CollectionId;
 use super::store::{CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch};
+use crate::state::cell::{Presence, Values};
+use crate::state::store::CellRead;
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -106,7 +108,9 @@ where
             None if self.dirty.section_cleared(collection, cell.section) => {
                 Ok(Committed::new(None))
             }
-            None => self.lower.get(collection, cell).await,
+            None => CellRead::<Values>::read(&self.lower, collection, cell)
+                .await
+                .map(|(cell, _)| cell),
         }
     }
 
@@ -143,11 +147,10 @@ where
         // `untouched.len() ≤ batch.len() ≤ CELL_BATCH`, so this yields zero or
         // one lower batch; `untouched_pos` aligns 1:1 with its answers.
         for lower_batch in CoordinateBatch::chunks(untouched) {
-            let lower = self
-                .lower
-                .get_many(collection, section, &lower_batch)
-                .await?;
-            for (committed, &pos) in lower.into_iter().zip(untouched_pos.iter()) {
+            let lower =
+                CellRead::<Values>::read_many(&self.lower, collection, section, &lower_batch)
+                    .await?;
+            for ((committed, _), &pos) in lower.into_iter().zip(untouched_pos.iter()) {
                 answers[pos] = Some(committed);
             }
         }
@@ -183,12 +186,11 @@ where
             })
             .collect();
         for lower_batch in CoordinateBatch::chunks(untouched) {
-            let lower = self
-                .lower
-                .contains_many(collection, section, &lower_batch)
-                .await?;
-            for (present, &pos) in lower.into_iter().zip(untouched_pos.iter()) {
-                answers[pos] = Some(present);
+            let lower =
+                CellRead::<Presence>::read_many(&self.lower, collection, section, &lower_batch)
+                    .await?;
+            for ((present, _), &pos) in lower.into_iter().zip(untouched_pos.iter()) {
+                answers[pos] = Some(present.get().is_some());
             }
         }
         let out: PresenceBatch = answers.into_iter().flatten().collect();
@@ -247,7 +249,8 @@ where
     ) -> impl Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a {
         // Strip the lower limit because dirty cells can add or hide results.
         // The merge applies the limit to its output.
-        let bottom = self.lower.scan_cells(
+        let bottom = CellRead::<Values>::scan(
+            &self.lower,
             collection,
             Scan {
                 limit: None,
@@ -263,16 +266,14 @@ where
         collection: &'a CollectionId,
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<CellKey, L::Error>> + Send + 'a {
-        let bottom = self
-            .lower
-            .scan_keys(
-                collection,
-                Scan {
-                    limit: None,
-                    ..scan
-                },
-            )
-            .map_ok(|key| (key, ()));
+        let bottom = CellRead::<Presence>::scan(
+            &self.lower,
+            collection,
+            Scan {
+                limit: None,
+                ..scan
+            },
+        );
         self.merge_cells(collection, scan, bottom, drop_bytes)
             .map_ok(|(key, ())| key)
     }

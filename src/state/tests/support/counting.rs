@@ -1,7 +1,10 @@
 //! Store and resolver counters used by query-budget tests.
 
 use super::*;
+use crate::state::cell::Values;
 use crate::state::marker::MarkerState;
+use crate::state::store::CellRead;
+use crate::state::store::CommittedBatch;
 
 #[derive(Clone)]
 pub(crate) struct CountingCellStore<S> {
@@ -11,7 +14,7 @@ pub(crate) struct CountingCellStore<S> {
 }
 
 #[derive(Default)]
-struct OpCounts {
+pub(crate) struct OpCounts {
     write_provisional: AtomicUsize,
     write_resolved: AtomicUsize,
     mark_resolved: AtomicUsize,
@@ -20,12 +23,43 @@ struct OpCounts {
     marker_state: AtomicUsize,
     get: AtomicUsize,
     get_many: AtomicUsize,
-    get_many_for_cache: AtomicUsize,
     contains_many: AtomicUsize,
     scan_cells: AtomicUsize,
     scan_keys: AtomicUsize,
     provisional_cell_at: AtomicUsize,
     provisional_many: AtomicUsize,
+}
+
+pub(crate) trait CountProjection: Projection {
+    fn point(counts: &OpCounts) -> &AtomicUsize;
+    fn batch(counts: &OpCounts) -> &AtomicUsize;
+    fn scan(counts: &OpCounts) -> &AtomicUsize;
+}
+impl CountProjection for Values {
+    fn point(counts: &OpCounts) -> &AtomicUsize {
+        &counts.get
+    }
+
+    fn batch(counts: &OpCounts) -> &AtomicUsize {
+        &counts.get_many
+    }
+
+    fn scan(counts: &OpCounts) -> &AtomicUsize {
+        &counts.scan_cells
+    }
+}
+impl CountProjection for Presence {
+    fn point(counts: &OpCounts) -> &AtomicUsize {
+        &counts.contains_many
+    }
+
+    fn batch(counts: &OpCounts) -> &AtomicUsize {
+        &counts.contains_many
+    }
+
+    fn scan(counts: &OpCounts) -> &AtomicUsize {
+        &counts.scan_keys
+    }
 }
 
 impl<S> CountingCellStore<S> {
@@ -78,7 +112,7 @@ impl<S> CountingCellStore<S> {
     }
 
     pub(crate) fn batch_cache_reads(&self) -> usize {
-        self.counts.get_many_for_cache.load(Ordering::Relaxed)
+        self.counts.get_many.load(Ordering::Relaxed)
     }
 
     pub(crate) fn lower_scans(&self) -> usize {
@@ -113,7 +147,6 @@ impl<S> CountingCellStore<S> {
         self.counts.marker_state.store(0, Ordering::Relaxed);
         self.counts.get.store(0, Ordering::Relaxed);
         self.counts.get_many.store(0, Ordering::Relaxed);
-        self.counts.get_many_for_cache.store(0, Ordering::Relaxed);
         self.counts.contains_many.store(0, Ordering::Relaxed);
         self.counts.scan_cells.store(0, Ordering::Relaxed);
         self.counts.scan_keys.store(0, Ordering::Relaxed);
@@ -122,68 +155,45 @@ impl<S> CountingCellStore<S> {
     }
 }
 
-impl<S: CellStore> CellStore for CountingCellStore<S> {
+impl<S: CellBackend> CellBackend for CountingCellStore<S> {
     type Error = S::Error;
+}
 
-    fn get<'a>(
+impl<S: CellRead<P>, P: CountProjection> CellRead<P> for CountingCellStore<S> {
+    async fn read<'a>(
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-    ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
-        self.counts.get.fetch_add(1, Ordering::Relaxed);
-        self.inner.get(collection, cell)
+    ) -> Result<Durable<P>, Self::Error> {
+        {
+            P::point(&self.counts).fetch_add(1, Ordering::Relaxed);
+            CellRead::<P>::read(&self.inner, collection, cell).await
+        }
     }
 
-    fn get_many<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CommittedBatch, Self::Error>> + Send + 'a {
-        self.counts.get_many.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_many(collection, section, batch)
-    }
-
-    fn get_many_for_cache<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CacheBatch, Self::Error>> + Send + 'a {
-        self.counts
-            .get_many_for_cache
-            .fetch_add(1, Ordering::Relaxed);
-        self.inner.get_many_for_cache(collection, section, batch)
-    }
-
-    fn scan_cells<'a>(
+    fn scan<'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        self.counts.scan_cells.fetch_add(1, Ordering::Relaxed);
-        self.inner.scan_cells(collection, scan)
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+        {
+            P::scan(&self.counts).fetch_add(1, Ordering::Relaxed);
+            CellRead::<P>::scan(&self.inner, collection, scan)
+        }
     }
 
-    fn scan_keys<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
-        self.counts.scan_keys.fetch_add(1, Ordering::Relaxed);
-        self.inner.scan_keys(collection, scan)
-    }
-
-    fn contains_many<'a>(
+    async fn read_many<'a>(
         &'a self,
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send + 'a {
-        self.counts.contains_many.fetch_add(1, Ordering::Relaxed);
-        self.inner.contains_many(collection, section, batch)
+    ) -> Result<CacheBatch<P>, Self::Error> {
+        P::batch(&self.counts).fetch_add(1, Ordering::Relaxed);
+        CellRead::<P>::read_many(&self.inner, collection, section, batch).await
     }
+}
 
+impl<S: CellStore> CellStore for CountingCellStore<S> {
     async fn provisional_cell_at<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -326,14 +336,21 @@ mod tests {
         };
 
         store.reset();
-        store.get(&id, &cell).await?;
+        CellRead::<Values>::read(&store, &id, &cell).await?;
         assert_eq!(store.visible_point_reads(), 1);
         assert_eq!(store.batch_reads(), 0);
         assert_eq!(store.raw_point_reads(), 0);
 
         store.reset();
         let batch = batch_of([0])?;
-        store.get_many(&id, Section::new(0), &batch).await?;
+        CellRead::<Values>::read_many(&store, &id, Section::new(0), &batch)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed)
+                    .collect::<CommittedBatch>()
+            })?;
         assert_eq!(store.batch_reads(), 1);
         assert_eq!(store.visible_point_reads(), 0);
         assert_eq!(store.raw_point_reads(), 0);

@@ -36,6 +36,7 @@ use crate::codec::{Codec, JsonCodec};
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
+use crate::state::cell::Values;
 use crate::state::collection::StateSession;
 use crate::state::descriptor::map::{entry_cell_for, keyset_cell};
 use crate::state::descriptor::{
@@ -48,6 +49,7 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::Promoted;
 use crate::state::session::sealed::StateLifecycle;
 use crate::state::session::{Finalized, KeyedStateSession, SessionParts, TerminationWatch};
+use crate::state::store::CellRead;
 use crate::state::store::{CELL_BATCH, CellStore};
 use crate::state::tests::support::admit_collection;
 use crate::state::tests::support::seed_commit_evidence;
@@ -863,7 +865,10 @@ pub(crate) async fn run_map_keyset_exact_trace(trace: MapTrace) -> Result<bool> 
         // frame must equal `tracked_frame(live)`; an absent keyset is the
         // live-empty case (a fresh or `clear`ed map).
         let live: Vec<i64> = model.keys().copied().collect();
-        let stored = store.get(id, &keyset_cell()).await?.into_inner();
+        let stored = CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await?
+            .0
+            .into_inner();
         let exact = match stored {
             Some(bytes) => bytes[..] == tracked_frame(&live)[..],
             None => model.is_empty(),
@@ -1247,7 +1252,11 @@ async fn deque_no_committed_orphans(
     id: &CollectionId,
     span: usize,
 ) -> Result<bool> {
-    let Some(bounds) = store.get(id, &deque::meta_cell()).await?.into_inner() else {
+    let Some(bounds) = CellRead::<Values>::read(store, id, &deque::meta_cell())
+        .await?
+        .0
+        .into_inner()
+    else {
         bail!("bounds cell missing after the convergence pushes");
     };
     let head = i64::from_be_bytes(bounds[0..8].try_into()?);
@@ -1255,9 +1264,9 @@ async fn deque_no_committed_orphans(
     for i in 0..span as i64 {
         let outside = i < head || i >= tail;
         if outside
-            && store
-                .get(id, &deque::entry_cell_for(&I64KeyCodec::encode(&i)))
+            && CellRead::<Values>::read(store, id, &deque::entry_cell_for(&I64KeyCodec::encode(&i)))
                 .await?
+                .0
                 .into_inner()
                 .is_some()
         {
@@ -1702,7 +1711,12 @@ fn deque_meta_cell_bytes_are_frozen() -> Result<()> {
         StateType::Application,
         StateName::try_new("dq")?,
     );
-    let Some(bytes) = block_on(store.get(&id, &meta_cell()))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, &id, &meta_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("bounds cell missing at the frozen address");
     };
     assert_eq!(
@@ -1768,7 +1782,12 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     })?;
 
     let store = MemoryCellStore::new(cells.clone());
-    let Some(bytes) = block_on(store.get(id, &meta_cell()))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &meta_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("bounds cell missing after the committed clear-then-push");
     };
     assert_eq!(
@@ -1782,13 +1801,23 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     // the leak the API can never surface.
     let stale = entry_cell_for(&I64KeyCodec::encode(&1));
     assert_eq!(
-        block_on(store.get(id, &stale))?.into_inner(),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &stale)
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner(),
         None,
         "the committed clear must physically erase the out-of-window row"
     );
     let reused = entry_cell_for(&I64KeyCodec::encode(&0));
     assert_eq!(
-        block_on(store.get(id, &reused))?.into_inner(),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &reused)
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner(),
         Some(Bytes::from(serde_json::to_vec(&Value::from(9_u8))?)),
         "the reused index holds exactly the post-clear push"
     );
@@ -1907,7 +1936,12 @@ fn deque_push_on_an_over_wide_window_succeeds() -> Result<()> {
             Ok::<_, color_eyre::Report>(())
         })?;
 
-        let Some(bounds) = block_on(store.get(id, &meta_cell()))?.into_inner() else {
+        let Some(bounds) = block_on(async {
+            CellRead::<Values>::read(&store, id, &meta_cell())
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner() else {
             bail!("bounds cell missing after the over-wide push");
         };
         let head = i64::from_be_bytes(bounds[0..8].try_into()?);
@@ -2005,13 +2039,23 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
     assert_eq!(
-        block_on(store.get(id, &keyset_cell()))?.into_inner(),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &keyset_cell())
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner(),
         None,
         "the committed clear must erase the keyset cell"
     );
     for cell in &legacy {
         assert_eq!(
-            block_on(store.get(id, cell))?.into_inner(),
+            block_on(async {
+                CellRead::<Values>::read(&store, id, cell)
+                    .await
+                    .map(|(committed, _)| committed)
+            })?
+            .into_inner(),
             None,
             "the whole-layout reset must erase every retired meta coordinate too"
         );
@@ -2031,7 +2075,12 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
     assert_eq!(
-        block_on(store.get(id, &keyset_cell()))?.into_inner(),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &keyset_cell())
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner(),
         Some(bytes::Bytes::from(tracked_frame(&[7]))),
         "a set after clear writes a fresh single-key Tracked keyset"
     );
@@ -2175,7 +2224,12 @@ fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
         finalize_and_promote(&session, &dedup, event_dedup(event1), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell()))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("the committed sets must have written a keyset cell");
     };
     // Golden literal on purpose — independent of `tracked_frame`, so a helper
@@ -2200,7 +2254,12 @@ fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
         finalize_and_promote(&session, &dedup, event_dedup(event2), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell()))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("the overflowing set must have written a keyset cell");
     };
     assert_eq!(
@@ -2251,9 +2310,13 @@ fn map_keyset_stays_tracked_under_ttl() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
     assert_eq!(
-        block_on(store.get(id, &keyset_cell()))?
-            .into_inner()
-            .map(|b| b.to_vec()),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &keyset_cell())
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner()
+        .map(|b| b.to_vec()),
         Some(tracked_frame(&[1, 2])),
         "a TTL'd map keeps a Tracked keyset, never collapses to Overflowed"
     );
@@ -2273,9 +2336,13 @@ fn map_keyset_stays_tracked_under_ttl() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
     assert_eq!(
-        block_on(store.get(id, &keyset_cell()))?
-            .into_inner()
-            .map(|b| b.to_vec()),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &keyset_cell())
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner()
+        .map(|b| b.to_vec()),
         Some(tracked_frame(&[1, 2])),
         "re-setting a tracked key on a TTL'd map keeps the Tracked frame, never Overflowed"
     );
@@ -2340,7 +2407,12 @@ fn map_keyset_malformed_frame_degrades_and_heals() -> Result<()> {
         finalize_and_promote(&session, &dedup, event_dedup(event2), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell()))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("the healing set must have written a keyset cell");
     };
     assert_eq!(
@@ -2416,7 +2488,12 @@ fn map_keyset_oversized_frame_collapses_before_fast_path() -> Result<()> {
         finalize_and_promote(&session, &dedup, event_dedup(event), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell()))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("the set must have written a keyset cell");
     };
     assert_eq!(
@@ -2457,7 +2534,12 @@ fn map_keyset_byte_ceiling_overflows() -> Result<()> {
         finalize_and_promote(&session, &dedup, event_dedup(event), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell()))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("the sets must have written a keyset cell");
     };
     assert_eq!(

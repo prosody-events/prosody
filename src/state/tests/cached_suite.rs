@@ -10,6 +10,10 @@
 //! [`prop_cached_is_transparent`] compares cached and uncached stores.
 //! Both stores must return the same result after every generated operation.
 
+use crate::state::cell::{Presence, Values};
+use crate::state::store::CommittedBatch;
+use crate::state::store::{CellBackend, CellRead, Durable};
+
 use super::super::cached::{Cached, DELETE_RETRY_BUDGET};
 use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
@@ -25,7 +29,8 @@ use super::cell_suite::{
     run_crash_equivalence_trace, run_overlay_trace,
 };
 use super::support::{
-    CountingCellStore, HoldingCellStore, batch_of, fresh_collection as collection, probe,
+    CountProjection, CountingCellStore, HoldingCellStore, batch_of, fresh_collection as collection,
+    probe,
 };
 use crate::error::ErrorCategory;
 use crate::state::marker::MarkerState;
@@ -87,54 +92,35 @@ impl<S> TtlAwareCellStore<S> {
     }
 }
 
+impl<S: CellBackend> CellBackend for TtlAwareCellStore<S> {
+    type Error = S::Error;
+}
+
+impl<S: CellRead<P>, P: CountProjection> CellRead<P> for TtlAwareCellStore<S> {
+    async fn read<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+    ) -> Result<Durable<P>, Self::Error> {
+        {
+            let (committed, _) = CellRead::<P>::read(&self.inner, collection, cell).await?;
+            Ok((committed, self.remaining()))
+        }
+    }
+
+    fn scan<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+        CellRead::<P>::scan(&self.inner, collection, scan)
+    }
+}
+
 impl<S> CellStore for TtlAwareCellStore<S>
 where
     S: CellStore,
 {
-    type Error = S::Error;
-
-    fn get<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        cell: &'a CellKey,
-    ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
-        self.inner.get(collection, cell)
-    }
-
-    fn scan_cells<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        self.inner.scan_cells(collection, scan)
-    }
-
-    fn scan_keys<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
-        self.inner.scan_keys(collection, scan)
-    }
-
-    fn contains_many<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send + 'a {
-        self.inner.contains_many(collection, section, batch)
-    }
-
-    async fn get_for_cache<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        cell: &'a CellKey,
-    ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
-        let (committed, _) = self.inner.get_for_cache(collection, cell).await?;
-        Ok((committed, self.remaining()))
-    }
-
     fn provisional_cell_at<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -240,7 +226,7 @@ where
         end: end_c.as_ref(),
         limit: None,
     };
-    let stream = store.scan_cells(id, scan);
+    let stream = CellRead::<Values>::scan(store, id, scan);
     futures::pin_mut!(stream);
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
@@ -334,7 +320,10 @@ fn expired_entry_reads_as_miss_and_refills() -> Result<()> {
             .await?;
         lower.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(7)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(7))
+                .await?
+                .0
+                .get(),
             Some(&bytes(7)),
             "a live warm value serves from fjall"
         );
@@ -350,7 +339,10 @@ fn expired_entry_reads_as_miss_and_refills() -> Result<()> {
             .await?;
         lower.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(7)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(7))
+                .await?
+                .0
+                .get(),
             Some(&bytes(70)),
             "an expired get falls through to the fresh durable value"
         );
@@ -377,9 +369,14 @@ fn expired_entry_reads_as_miss_and_refills() -> Result<()> {
         lower
             .write_resolved(&cref, &[(cell_at(8), Some(bytes(8)))], &[])
             .await?;
-        cached
-            .contains_many(&id, SECTION, &batch_of([8, 9])?)
-            .await?;
+        CellRead::<Presence>::read_many(&cached, &id, SECTION, &batch_of([8, 9])?)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed.get().is_some())
+                    .collect::<PresenceBatch>()
+            })?;
         for key in [8, 9] {
             let stamped = cached.stored_expiry(&id, &cell_at(key)).await?;
             assert_eq!(
@@ -397,7 +394,10 @@ fn expired_entry_reads_as_miss_and_refills() -> Result<()> {
         // from fjall again (KV5 restored).
         lower.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(7)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(7))
+                .await?
+                .0
+                .get(),
             Some(&bytes(70)),
             "the re-published value serves from fjall"
         );
@@ -420,7 +420,9 @@ fn cached_provisional_many_does_not_publish() -> Result<()> {
         // Stage a provisional cell in the LOWER store directly, so fjall stays
         // untouched (a cached stage would publish the cell's `prev`).
         let event = probe(0x5EED);
-        let prev = counting.get(&id, &cell_at(2)).await?;
+        let prev = CellRead::<Values>::read(&counting, &id, &cell_at(2))
+            .await?
+            .0;
         let writes = [(
             cell_at(2),
             ProvisionalWrite::new(Some(bytes(20)), prev, event),
@@ -445,7 +447,7 @@ fn cached_provisional_many_does_not_publish() -> Result<()> {
         // Nothing was published, so a point get of the read coordinate still
         // falls through to the lower store (a fjall miss).
         counting.reset();
-        cached.get(&id, &cell_at(2)).await?;
+        CellRead::<Values>::read(&cached, &id, &cell_at(2)).await?;
         assert!(
             counting.lower_reads() >= 1,
             "provisional_many must not warm the committed-value cache"
@@ -472,7 +474,13 @@ fn failed_publish_deletes_the_stale_entry() -> Result<()> {
             .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))], &[])
             .await?;
         counting.reset();
-        assert_eq!(cached.get(&id, &cell_at(1)).await?.get(), Some(&bytes(1)));
+        assert_eq!(
+            CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
+            Some(&bytes(1))
+        );
         assert_eq!(counting.lower_reads(), 0, "the seeded entry is warm");
 
         // Now force every publish to fail. The lower write still succeeds
@@ -489,7 +497,10 @@ fn failed_publish_deletes_the_stale_entry() -> Result<()> {
         fail.store(false, Ordering::Relaxed);
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(1)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
             Some(&bytes(2)),
             "a failed publish deletes the entry, so the next read self-heals"
         );
@@ -500,7 +511,10 @@ fn failed_publish_deletes_the_stale_entry() -> Result<()> {
         );
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(1)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
             Some(&bytes(2)),
             "the fall-through re-warmed the cell"
         );
@@ -527,7 +541,13 @@ fn failed_batch_publish_deletes_every_batch_cell() -> Result<()> {
         // One multi-cell write-through publishes cleanly and warms both cells.
         cached.write_resolved(&cref, &seed, &[]).await?;
         for (c, v) in [(1u8, 1u8), (2, 2)] {
-            assert_eq!(cached.get(&id, &cell_at(c)).await?.get(), Some(&bytes(v)));
+            assert_eq!(
+                CellRead::<Values>::read(&cached, &id, &cell_at(c))
+                    .await?
+                    .0
+                    .get(),
+                Some(&bytes(v))
+            );
         }
 
         // Force the batch commit to fail. The lower write still succeeds
@@ -541,7 +561,10 @@ fn failed_batch_publish_deletes_every_batch_cell() -> Result<()> {
         fail.store(false, Ordering::Relaxed);
         for (c, v) in [(1u8, 11u8), (2, 22)] {
             assert_eq!(
-                cached.get(&id, &cell_at(c)).await?.get(),
+                CellRead::<Values>::read(&cached, &id, &cell_at(c))
+                    .await?
+                    .0
+                    .get(),
                 Some(&bytes(v)),
                 "a failed batch deletes every coordinate, so each read self-heals"
             );
@@ -569,7 +592,7 @@ fn promote_delete_retries_before_cache_disablement() -> Result<()> {
         cached
             .write_resolved(&cref, &[(cell_at(0), Some(bytes(1)))], &[])
             .await?;
-        let prev = cached.get(&id, &cell_at(0)).await?;
+        let prev = CellRead::<Values>::read(&cached, &id, &cell_at(0)).await?.0;
         let writes = [(
             cell_at(0),
             ProvisionalWrite::new(Some(bytes(5)), prev, event),
@@ -592,7 +615,10 @@ fn promote_delete_retries_before_cache_disablement() -> Result<()> {
             "an in-budget removal does not disable the cache"
         );
         assert_eq!(
-            cached.get(&id, &cell_at(0)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(5)),
             "a failed delete must not leave the stale pre-promote value warm"
         );
@@ -634,7 +660,10 @@ fn write_path_delete_recovers_within_budget() -> Result<()> {
             "a within-budget removal does not disable the cache"
         );
         assert_eq!(
-            cached.get(&id, &cell_at(1)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
             Some(&bytes(2)),
             "a doubly-failed publish+delete must still evict, so the read self-heals"
         );
@@ -671,7 +700,10 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
             .await?;
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(1)),
             "the seeded base serves warm"
         );
@@ -696,7 +728,10 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
         *handle.lock() = None;
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(1)),
             "the failed write serves the PRE-write value"
         );
@@ -708,7 +743,10 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
         );
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(1)),
             "the fall-through re-warmed the pre-write value"
         );
@@ -728,7 +766,10 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
         *handle.lock() = None;
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(1)),
             "delete-first on a failed apply degrades to a correct slow read, never a wrong one"
         );
@@ -739,7 +780,10 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
         );
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(1)),
             "the fall-through re-warmed the coordinate"
         );
@@ -773,7 +817,10 @@ fn dropped_write_resolved_leaves_no_stale_entry() -> Result<()> {
             .await?;
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(1)),
             "A is warm"
         );
@@ -806,7 +853,10 @@ fn dropped_write_resolved_leaves_no_stale_entry() -> Result<()> {
         // the durable NEW value `B` = 2 — never a warm stale `A`.
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(2)),
             "a dropped write_resolved must not leave the stale pre-write value warm"
         );
@@ -911,7 +961,10 @@ fn delete_section_removes_exactly_the_cleared_section() -> Result<()> {
         // absent, and the read pays the one cold fall-through.
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             None,
             "the committed clear erased the non-survivor"
         );
@@ -923,7 +976,10 @@ fn delete_section_removes_exactly_the_cleared_section() -> Result<()> {
         // The survivor re-warmed via the post-clear publish.
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(5)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(5))
+                .await?
+                .0
+                .get(),
             Some(&bytes(50)),
             "the survivor serves the post-clear value"
         );
@@ -931,12 +987,18 @@ fn delete_section_removes_exactly_the_cleared_section() -> Result<()> {
         // The sibling section and the sibling collection stay warm.
         counting.reset();
         assert_eq!(
-            cached.get(&id, &sect1_cell(0)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &sect1_cell(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(20)),
             "the sibling section survives the clear"
         );
         assert_eq!(
-            cached.get(&other, &cell_at(0)).await?.get(),
+            CellRead::<Values>::read(&cached, &other, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(30)),
             "the sibling collection survives the clear"
         );
@@ -960,8 +1022,20 @@ fn absent_get_is_cached() -> Result<()> {
         let id = collection("absent")?;
 
         counting.reset();
-        assert_eq!(cached.get(&id, &cell_at(9)).await?.get(), None);
-        assert_eq!(cached.get(&id, &cell_at(9)).await?.get(), None);
+        assert_eq!(
+            CellRead::<Values>::read(&cached, &id, &cell_at(9))
+                .await?
+                .0
+                .get(),
+            None
+        );
+        assert_eq!(
+            CellRead::<Values>::read(&cached, &id, &cell_at(9))
+                .await?
+                .0
+                .get(),
+            None
+        );
         assert_eq!(
             counting.lower_reads(),
             1,
@@ -987,14 +1061,16 @@ fn presence_is_cached() -> Result<()> {
         counting.reset();
         for _ in 0_u8..2 {
             assert_eq!(
-                cached.contains_many(&id, SECTION, &batch).await?,
+                CellRead::<Presence>::read_many(&cached, &id, SECTION, &batch)
+                    .await
+                    .map(|cells| cells
+                        .into_iter()
+                        .map(|(committed, _)| committed.get().is_some())
+                        .collect::<PresenceBatch>())?,
                 PresenceBatch::from_iter([true, false])
             );
             assert_eq!(
-                counting.lower_reads()
-                    + counting.batch_reads()
-                    + counting.batch_cache_reads()
-                    + counting.presence_reads(),
+                counting.lower_reads() + counting.batch_cache_reads() + counting.presence_reads(),
                 1,
                 "presence reads share one durable fill"
             );
@@ -1022,7 +1098,12 @@ fn blown_fuse_presence_reads_durable_truth() -> Result<()> {
         counting.reset();
 
         assert_eq!(
-            cached.contains_many(&id, SECTION, &batch_of([1])?).await?,
+            CellRead::<Presence>::read_many(&cached, &id, SECTION, &batch_of([1])?)
+                .await
+                .map(|cells| cells
+                    .into_iter()
+                    .map(|(committed, _)| committed.get().is_some())
+                    .collect::<PresenceBatch>())?,
             PresenceBatch::from_iter([false]),
         );
         assert_eq!(counting.presence_reads(), 1, "the fused read delegates");
@@ -1042,33 +1123,34 @@ fn cell_load_metrics_report_source_and_cache_result() -> Result<()> {
         let cached = Cached::new(fjall, counting).with_metrics(metrics.cell_metrics());
         let id = collection("cell-load-metrics")?;
 
-        cached.get(&id, &cell_at(1)).await?;
-        cached.get(&id, &cell_at(1)).await?;
+        CellRead::<Values>::read(&cached, &id, &cell_at(1)).await?;
+        CellRead::<Values>::read(&cached, &id, &cell_at(1)).await?;
         let batch = batch_of(2u8..5)?;
-        cached.get_many(&id, SECTION, &batch).await?;
-        cached.get_many(&id, SECTION, &batch).await?;
+        CellRead::<Values>::read_many(&cached, &id, SECTION, &batch).await?;
+        CellRead::<Values>::read_many(&cached, &id, SECTION, &batch).await?;
 
         let presence_batch = batch_of(5u8..8)?;
-        cached.contains_many(&id, SECTION, &presence_batch).await?;
-        cached.contains_many(&id, SECTION, &presence_batch).await?;
+        CellRead::<Presence>::read_many(&cached, &id, SECTION, &presence_batch).await?;
+        CellRead::<Presence>::read_many(&cached, &id, SECTION, &presence_batch).await?;
 
         let points = metrics.points("prosody.state.cell.loads")?;
         assert_eq!(
             points,
             [
-                (("contains_many", "cache", "hit"), 3),
-                (("get", "cache", "hit"), 1),
-                (("get_many", "cache", "hit"), 3),
-                (("get", "store", "miss"), 1),
-                (("contains_many", "store", "not_all_hit"), 3),
-                (("get_many", "store", "not_all_hit"), 3),
+                (("get", "values", "cache", "hit"), 1),
+                (("get_many", "presence", "cache", "hit"), 3),
+                (("get_many", "values", "cache", "hit"), 3),
+                (("get", "values", "store", "miss"), 1),
+                (("get_many", "presence", "store", "not_all_hit"), 3),
+                (("get_many", "values", "store", "not_all_hit"), 3),
             ]
             .into_iter()
-            .map(|((operation, source, result), value)| {
+            .map(|((operation, projection, source, result), value)| {
                 (
                     labels([
                         ("prosody.state.cell.cache.result", result),
                         ("prosody.state.cell.operation.name", operation),
+                        ("prosody.state.cell.projection", projection),
                         ("prosody.state.cell.load.source", source),
                     ]),
                     value,
@@ -1088,7 +1170,7 @@ fn cell_load_metrics_report_source_and_cache_result() -> Result<()> {
         assert!(metrics.is_exponential_histogram("prosody.request.duration")?);
 
         fail_puts.store(true, Ordering::Relaxed);
-        cached.get(&id, &cell_at(9)).await?;
+        CellRead::<Values>::read(&cached, &id, &cell_at(9)).await?;
         assert_eq!(
             metrics.points("prosody.state.cell.cache.errors")?,
             vec![(
@@ -1108,12 +1190,17 @@ fn cell_load_metrics_report_source_and_cache_result() -> Result<()> {
         let failed = Cached::new(test_db::cache("cell-load-error-metrics")?, failed_lower)
             .with_metrics(failed_metrics.cell_metrics());
         let failed_id = collection("cell-load-error-metrics")?;
-        assert!(failed.get(&failed_id, &cell_at(8)).await.is_err());
+        assert!(
+            CellRead::<Values>::read(&failed, &failed_id, &cell_at(8))
+                .await
+                .is_err()
+        );
         assert_eq!(
             failed_metrics.points("prosody.state.cell.load.duration")?,
             vec![(
                 labels([
                     ("prosody.error.category", "transient"),
+                    ("prosody.state.cell.projection", "values"),
                     ("prosody.state.cell.cache.result", "miss"),
                     ("prosody.state.cell.load.source", "store"),
                     ("prosody.state.cell.operation.name", "get"),
@@ -1144,7 +1231,7 @@ where
     }
     let mut writes = Vec::new();
     for c in [1u8, 2, 3] {
-        let prev = cached.get(id, &cell_at(c)).await?;
+        let prev = CellRead::<Values>::read(cached, id, &cell_at(c)).await?.0;
         writes.push((
             cell_at(c),
             ProvisionalWrite::new(Some(bytes(100 + c)), prev, event),
@@ -1187,7 +1274,10 @@ fn promote_publishes_after_durable_write() -> Result<()> {
         counting.reset();
         for c in [1u8, 2, 3] {
             assert_eq!(
-                cached.get(&id, &cell_at(c)).await?.get(),
+                CellRead::<Values>::read(&cached, &id, &cell_at(c))
+                    .await?
+                    .0
+                    .get(),
                 Some(&bytes(c)),
                 "a failed promote preserves the committed base"
             );
@@ -1229,7 +1319,10 @@ fn promote_publishes_after_durable_write() -> Result<()> {
         counting_b.reset();
         for c in [1u8, 2, 3] {
             assert_eq!(
-                cached_b.get(&id_b, &cell_at(c)).await?.get(),
+                CellRead::<Values>::read(&cached_b, &id_b, &cell_at(c))
+                    .await?
+                    .0
+                    .get(),
                 Some(&bytes(c)),
                 "the cache preserves the prior projection until the response returns"
             );
@@ -1242,7 +1335,10 @@ fn promote_publishes_after_durable_write() -> Result<()> {
         counting_b.reset();
         for c in [1u8, 2, 3] {
             assert_eq!(
-                cached_b.get(&id_b, &cell_at(c)).await?.get(),
+                CellRead::<Values>::read(&cached_b, &id_b, &cell_at(c))
+                    .await?
+                    .0
+                    .get(),
                 Some(&bytes(100 + c)),
                 "cell {c} serves the committed data across the dropped settle"
             );
@@ -1302,7 +1398,10 @@ fn d5_transform_batch_failure_degrades_to_delete() -> Result<()> {
         counting.reset();
         for c in [1u8, 2, 3] {
             assert_eq!(
-                cached.get(&id, &cell_at(c)).await?.get(),
+                CellRead::<Values>::read(&cached, &id, &cell_at(c))
+                    .await?
+                    .0
+                    .get(),
                 Some(&bytes(100 + c)),
                 "cell {c} resolves durably to the committed data"
             );
@@ -1315,7 +1414,10 @@ fn d5_transform_batch_failure_degrades_to_delete() -> Result<()> {
         counting.reset();
         for c in [1u8, 2, 3] {
             assert_eq!(
-                cached.get(&id, &cell_at(c)).await?.get(),
+                CellRead::<Values>::read(&cached, &id, &cell_at(c))
+                    .await?
+                    .0
+                    .get(),
                 Some(&bytes(100 + c)),
                 "cell {c} re-warmed from the cold fall-through"
             );
@@ -1363,7 +1465,10 @@ fn d5_transform_retry_is_byte_equivalent() -> Result<()> {
                 "cell {c}'s expiry is unchanged by the retry (stage-anchored reuse)"
             );
             assert_eq!(
-                cached.get(&id, &cell_at(c)).await?.get(),
+                CellRead::<Values>::read(&cached, &id, &cell_at(c))
+                    .await?
+                    .0
+                    .get(),
                 Some(&bytes(100 + c)),
                 "cell {c}'s value is unchanged by the retry"
             );
@@ -1417,7 +1522,7 @@ fn d5_clear_and_repopulate_keeps_staged_cells_warm() -> Result<()> {
         ];
         let mut writes = Vec::new();
         for (i, staged) in staged_cells.iter().enumerate() {
-            let prev = cached.get(&id, staged).await?;
+            let prev = CellRead::<Values>::read(&cached, &id, staged).await?.0;
             writes.push((
                 staged.clone(),
                 ProvisionalWrite::new(Some(bytes(200 + u8::try_from(i)?)), prev, event),
@@ -1438,7 +1543,10 @@ fn d5_clear_and_repopulate_keeps_staged_cells_warm() -> Result<()> {
         counting.reset();
         for (i, staged) in staged_cells.iter().enumerate() {
             assert_eq!(
-                cached.get(&id, staged).await?.get(),
+                CellRead::<Values>::read(&cached, &id, staged)
+                    .await?
+                    .0
+                    .get(),
                 Some(&bytes(200 + u8::try_from(i)?)),
                 "staged cell {i} keeps commit warmth through the clear"
             );
@@ -1452,7 +1560,10 @@ fn d5_clear_and_repopulate_keeps_staged_cells_warm() -> Result<()> {
         // clear; the cache pays the cold fall-through to absence).
         for victim in &victims {
             assert_eq!(
-                cached.get(&id, victim).await?.get(),
+                CellRead::<Values>::read(&cached, &id, victim)
+                    .await?
+                    .0
+                    .get(),
                 None,
                 "the cleared sections' other entries are gone"
             );
@@ -1488,14 +1599,20 @@ fn absent_fill_over_committed_foreign_provisional_publishes_present() -> Result<
 
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(4)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(4))
+                .await?
+                .0
+                .get(),
             Some(&bytes(44)),
             "the fill resolves the committed prior event provisional to present"
         );
         assert!(counting.lower_reads() >= 1, "the first get falls through");
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(4)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(4))
+                .await?
+                .0
+                .get(),
             Some(&bytes(44)),
             "the resolved value was published"
         );
@@ -1529,14 +1646,20 @@ fn absent_fill_over_aborted_foreign_provisional_publishes_absent() -> Result<()>
 
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(4)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(4))
+                .await?
+                .0
+                .get(),
             None,
             "the fill resolves the aborted prior event provisional to its absent prev"
         );
         assert!(counting.lower_reads() >= 1, "the first get falls through");
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(4)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(4))
+                .await?
+                .0
+                .get(),
             None,
             "absence stays correct"
         );
@@ -1601,21 +1724,36 @@ fn fill_publish_failure_costs_one_read_each() -> Result<()> {
         fail_puts.store(true, Ordering::Relaxed);
         for _ in 0..N {
             assert_eq!(
-                cached.get(&id, &cell_at(1)).await?.get(),
+                CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                    .await?
+                    .0
+                    .get(),
                 Some(&bytes(7)),
                 "a degraded fill still answers correctly"
             );
         }
         fail_puts.store(false, Ordering::Relaxed);
         // The (N+1)th read heals: one more durable read, then zero.
-        assert_eq!(cached.get(&id, &cell_at(1)).await?.get(), Some(&bytes(7)));
+        assert_eq!(
+            CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
+            Some(&bytes(7))
+        );
         assert_eq!(
             counting.lower_reads(),
             N + 1,
             "N failed publishes cost exactly N+1 durable reads"
         );
         counting.reset();
-        assert_eq!(cached.get(&id, &cell_at(1)).await?.get(), Some(&bytes(7)));
+        assert_eq!(
+            CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
+            Some(&bytes(7))
+        );
         assert_eq!(
             counting.lower_reads(),
             0,
@@ -1647,14 +1785,20 @@ fn fjall_read_failure_degrades_that_get() -> Result<()> {
 
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(1)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
             Some(&bytes(7)),
             "a fjall read failure degrades the get to a durable read, never fails it"
         );
         assert_eq!(counting.lower_reads(), 1, "exactly one degraded read");
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(1)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
             Some(&bytes(7)),
             "the fill overwrote the corrupt frame"
         );
@@ -1689,7 +1833,9 @@ fn cache_disablement_applies_to_all_workspace_clones() -> Result<()> {
             .await?;
         fail_deletes.store(u64::try_from(DELETE_RETRY_BUDGET + 2)?, Ordering::Relaxed);
         fail_puts.store(true, Ordering::Relaxed);
-        let prev1 = counting.get(&id, &cell_at(1)).await?;
+        let prev1 = CellRead::<Values>::read(&counting, &id, &cell_at(1))
+            .await?
+            .0;
         let stage = [(
             cell_at(1),
             ProvisionalWrite::new(Some(bytes(2)), prev1, event),
@@ -1720,14 +1866,19 @@ fn cache_disablement_applies_to_all_workspace_clones() -> Result<()> {
         // Clone B must not return the old cached value.
         counting.reset();
         assert_eq!(
-            cached_b.get(&id, &cell_at(1)).await?.get(),
+            CellRead::<Values>::read(&cached_b, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
             Some(&bytes(1)),
             "clone B reads the committed value from durable storage"
         );
         assert!(counting.lower_reads() >= 1, "B's get is a durable read");
         // A repeated read must also use durable storage.
         counting.reset();
-        let _ = cached_b.get(&id, &cell_at(1)).await?;
+        let _ = CellRead::<Values>::read(&cached_b, &id, &cell_at(1))
+            .await?
+            .0;
         assert!(
             counting.lower_reads() >= 1,
             "clone B does not update a disabled cache"
@@ -1739,7 +1890,9 @@ fn cache_disablement_applies_to_all_workspace_clones() -> Result<()> {
 
         // Add a provisional cell after cache disablement.
         // Admission must resolve its durable marker.
-        let prev3 = counting.get(&id, &cell_at(3)).await?;
+        let prev3 = CellRead::<Values>::read(&counting, &id, &cell_at(3))
+            .await?
+            .0;
         let post = [(
             cell_at(3),
             ProvisionalWrite::new(Some(bytes(5)), prev3, event),
@@ -1994,10 +2147,9 @@ impl Replay {
             // The committed base read, off the twin — identical to the
             // subject's by the parity just asserted, and it leaves the
             // subject's cache untouched.
-            let prev = self
-                .twin
-                .get(&self.id, &cell_at(*key))
+            let prev = CellRead::<Values>::read(&self.twin, &self.id, &cell_at(*key))
                 .await
+                .map(|(committed, _)| committed)
                 .map_err(|e| eyre!("twin prev read: {e:?}"))?;
             staged.push((
                 cell_at(*key),
@@ -2124,15 +2276,13 @@ impl Replay {
     /// One parity get of `key`, updating the warm model with the fill.
     async fn check_get(&mut self, key: u8) -> Result<()> {
         let falls_through = !self.is_warm(key);
-        let subject = self
-            .subject
-            .get(&self.id, &cell_at(key))
+        let subject = CellRead::<Values>::read(&self.subject, &self.id, &cell_at(key))
             .await
+            .map(|(committed, _)| committed)
             .map_err(|e| eyre!("subject get: {e:?}"))?;
-        let twin = self
-            .twin
-            .get(&self.id, &cell_at(key))
+        let twin = CellRead::<Values>::read(&self.twin, &self.id, &cell_at(key))
             .await
+            .map(|(committed, _)| committed)
             .map_err(|e| eyre!("twin get: {e:?}"))?;
         if subject.get() != twin.get() {
             return Err(eyre!(
@@ -2168,17 +2318,26 @@ impl Replay {
     async fn verify(&mut self) -> Result<()> {
         let keys: Vec<_> = (0..POOL).rev().chain([0, POOL]).collect();
         let batch = batch_of(keys.iter().copied())?;
-        let presence = self
-            .subject
-            .contains_many(&self.id, SECTION, &batch)
-            .await?;
-        let expected: PresenceBatch = self
-            .twin
-            .get_many(&self.id, SECTION, &batch)
-            .await?
-            .iter()
-            .map(|cell| cell.get().is_some())
-            .collect();
+        let presence = CellRead::<Presence>::read_many(&self.subject, &self.id, SECTION, &batch)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed.get().is_some())
+                    .collect::<PresenceBatch>()
+            })?;
+        let expected: PresenceBatch =
+            CellRead::<Values>::read_many(&self.twin, &self.id, SECTION, &batch)
+                .await
+                .map(|cells| {
+                    cells
+                        .into_iter()
+                        .map(|(committed, _)| committed)
+                        .collect::<CommittedBatch>()
+                })?
+                .iter()
+                .map(|cell| cell.get().is_some())
+                .collect();
         if presence != expected {
             return Err(eyre!(
                 "presence diverged: subject {presence:?}, twin {expected:?}"
@@ -2273,10 +2432,9 @@ fn prop_cached_is_transparent() {
                     continue;
                 }
                 ttl_lower.reset();
-                let _ = replay
-                    .subject
-                    .get(&replay.id, &cell_at(key))
+                let _ = CellRead::<Values>::read(&replay.subject, &replay.id, &cell_at(key))
                     .await
+                    .map(|(committed, _)| committed)
                     .map_err(|e| eyre!("budget get({key}): {e:?}"))?;
                 if ttl_lower.lower_reads() != 0 {
                     return Err(eyre!(
@@ -2532,11 +2690,7 @@ fn prop_cached_scan_presence_parity() {
     QuickCheck::new().quickcheck(property as fn(ScanTrace) -> Result<bool>);
 }
 
-/// T-a all-hits: a `CELL_BATCH`-wide chunk whose every coordinate is warm
-/// serves from fjall in one blocking hop with ZERO lower reads of any kind.
-///
-/// Dropping the `Ok(Some) => return` arm (always refetch) makes this test fail
-/// this: `batch_cache_reads()` would climb to 1.
+/// A warm batch returns every value without a lower read.
 #[test]
 fn batch_get_all_hits_reads_nothing() -> Result<()> {
     TEST_RUNTIME.block_on(async {
@@ -2548,7 +2702,14 @@ fn batch_get_all_hits_reads_nothing() -> Result<()> {
         cached.write_resolved(&cref, &warm, &[]).await?;
 
         counting.reset();
-        let out = cached.get_many(&id, SECTION, &batch_of(0u8..16)?).await?;
+        let out = CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of(0u8..16)?)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed)
+                    .collect::<CommittedBatch>()
+            })?;
         assert_eq!(out.len(), 16, "every position answered");
         for c in 0u8..16 {
             assert_eq!(
@@ -2559,11 +2720,6 @@ fn batch_get_all_hits_reads_nothing() -> Result<()> {
         }
         assert_eq!(counting.lower_reads(), 0, "all-hits reads no point durable");
         assert_eq!(
-            counting.batch_reads(),
-            0,
-            "all-hits issues no lower get_many"
-        );
-        assert_eq!(
             counting.batch_cache_reads(),
             0,
             "all-hits issues no lower cache-fill batch"
@@ -2572,12 +2728,7 @@ fn batch_get_all_hits_reads_nothing() -> Result<()> {
     })
 }
 
-/// T-a any-miss: one cold coordinate in an otherwise-warm chunk forces EXACTLY
-/// ONE lower cache-fill batch read (never the non-TTL `get_many`), and the
-/// served values are durable truth.
-///
-/// Routing the miss arm to `lower.get_many` (dropping the fill's TTL) makes
-/// this test fail this: `batch_reads()==1, batch_cache_reads()==0`.
+/// One cold position causes one lower batch read with durable TTLs.
 #[test]
 fn batch_get_any_miss_is_one_lower_batch_read() -> Result<()> {
     TEST_RUNTIME.block_on(async {
@@ -2589,7 +2740,14 @@ fn batch_get_any_miss_is_one_lower_batch_read() -> Result<()> {
         cached.write_resolved(&cref, &warm, &[]).await?;
 
         counting.reset();
-        let out = cached.get_many(&id, SECTION, &batch_of(0u8..16)?).await?;
+        let out = CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of(0u8..16)?)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed)
+                    .collect::<CommittedBatch>()
+            })?;
         assert_eq!(out.len(), 16, "every position answered");
         for c in 0u8..15 {
             assert_eq!(
@@ -2607,11 +2765,6 @@ fn batch_get_any_miss_is_one_lower_batch_read() -> Result<()> {
             counting.batch_cache_reads(),
             1,
             "any-miss refetches the whole batch via one cache-fill read"
-        );
-        assert_eq!(
-            counting.batch_reads(),
-            0,
-            "the miss arm never uses lower get_many"
         );
         assert_eq!(
             counting.lower_reads(),
@@ -2638,9 +2791,14 @@ fn batch_get_completes_after_cache_disablement() -> Result<()> {
             let id = id.clone();
             holds.get_for_cache().arm(1);
             tokio::spawn(async move {
-                cached
-                    .get_many(&id, SECTION, &batch_of([0])?)
+                CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of([0])?)
                     .await
+                    .map(|cells| {
+                        cells
+                            .into_iter()
+                            .map(|(committed, _)| committed)
+                            .collect::<CommittedBatch>()
+                    })
                     .map_err(color_eyre::Report::from)
             })
         };
@@ -2677,7 +2835,14 @@ fn batch_get_discards_sampled_hits_on_any_miss() -> Result<()> {
 
         // Batch [A (Hit), B (Miss)]: the miss forces a refetch that discards the
         // sampled A=Some(42) and re-reads post-clear truth — A is absent.
-        let out = cached.get_many(&id, SECTION, &batch_of([0, 1])?).await?;
+        let out = CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of([0, 1])?)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed)
+                    .collect::<CommittedBatch>()
+            })?;
         assert_eq!(out.len(), 2, "every position answered");
         assert_eq!(
             out[0].get(),
@@ -2707,7 +2872,14 @@ fn batch_get_failed_publish_keeps_hidden_live_entry_warm() -> Result<()> {
         // Probe errors (over the live A entry) AND the publish fails.
         fjall.fail_reads().store(true, Ordering::Relaxed);
         fjall.fail_puts().store(true, Ordering::Relaxed);
-        let out = cached.get_many(&id, SECTION, &batch_of([0])?).await?;
+        let out = CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of([0])?)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed)
+                    .collect::<CommittedBatch>()
+            })?;
         assert_eq!(out.len(), 1, "the single position answered");
         assert_eq!(
             out[0].get(),
@@ -2726,7 +2898,10 @@ fn batch_get_failed_publish_keeps_hidden_live_entry_warm() -> Result<()> {
         fjall.fail_puts().store(false, Ordering::Relaxed);
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(9)),
             "the failed publish deleted nothing: A stayed warm"
         );
@@ -2769,7 +2944,14 @@ fn batch_get_treats_expired_probe_as_refetch() -> Result<()> {
             .write_resolved(&cref, &[(cell_at(0), Some(bytes(2)))], &[])
             .await?;
 
-        let out = cached.get_many(&id, SECTION, &batch_of([0])?).await?;
+        let out = CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of([0])?)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed)
+                    .collect::<CommittedBatch>()
+            })?;
         assert_eq!(
             out[0].get(),
             Some(&bytes(2)),
@@ -2841,9 +3023,14 @@ fn batch_get_expiry_boundary_degrade_never_serves_stale() -> Result<()> {
             let cached = cached.clone();
             let id = id.clone();
             async move {
-                cached
-                    .get_many(&id, SECTION, &batch)
+                CellRead::<Values>::read_many(&cached, &id, SECTION, &batch)
                     .await
+                    .map(|cells| {
+                        cells
+                            .into_iter()
+                            .map(|(committed, _)| committed)
+                            .collect::<CommittedBatch>()
+                    })
                     .map_err(|error| eyre!("{error:?}"))
             }
         });
@@ -2872,7 +3059,10 @@ fn batch_get_expiry_boundary_degrade_never_serves_stale() -> Result<()> {
         // The surviving (now-expired) V1 entry must not be served: the point
         // read re-classifies it Expired and refetches V2.
         assert_eq!(
-            cached.get(&id, &cell_at(0)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(2)),
             "the surviving expired entry is never served; the point read refetches V2"
         );
@@ -2903,7 +3093,14 @@ fn batch_get_publishes_absence_only_from_successful_batch() -> Result<()> {
         // ---- Positive arm: absence is cached from a successful batch. -------
         let (cached, counting, id) = counting_cached("batch-neg-ok")?;
         counting.reset();
-        let out = cached.get_many(&id, SECTION, &batch_of([0])?).await?;
+        let out = CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of([0])?)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed)
+                    .collect::<CommittedBatch>()
+            })?;
         assert_eq!(out[0].get(), None, "the never-written cell is absent");
         assert_eq!(
             counting.batch_cache_reads(),
@@ -2911,7 +3108,10 @@ fn batch_get_publishes_absence_only_from_successful_batch() -> Result<()> {
             "the first batch paid one cache-fill read"
         );
         assert_eq!(
-            cached.get(&id, &cell_at(0)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             None,
             "the second read serves the cached Absent tag"
         );
@@ -2932,7 +3132,14 @@ fn batch_get_publishes_absence_only_from_successful_batch() -> Result<()> {
 
         // A (coord 0) is absent; B (coord 1) is poisoned. The default fill loops
         // get_for_cache, reads A, then errors on B — so put_batch never runs.
-        let err = cached_b.get_many(&id_b, SECTION, &batch_of([0, 1])?).await;
+        let err = CellRead::<Values>::read_many(&cached_b, &id_b, SECTION, &batch_of([0, 1])?)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed)
+                    .collect::<CommittedBatch>()
+            });
         assert!(
             err.is_err(),
             "a poisoned fill position fails the whole batch"
@@ -2943,7 +3150,10 @@ fn batch_get_publishes_absence_only_from_successful_batch() -> Result<()> {
         failing.set_poison(None);
         counting_b.reset();
         assert_eq!(
-            cached_b.get(&id_b, &cell_at(0)).await?.get(),
+            CellRead::<Values>::read(&cached_b, &id_b, &cell_at(0))
+                .await?
+                .0
+                .get(),
             None,
             "A resolves absent on the healed read"
         );
@@ -3026,9 +3236,14 @@ fn prop_batch_fill_expiry_never_overhangs() {
                 let id = id.clone();
                 async move {
                     let batch = batch_of([7])?;
-                    cached
-                        .get_many(&id, SECTION, &batch)
+                    CellRead::<Values>::read_many(&cached, &id, SECTION, &batch)
                         .await
+                        .map(|cells| {
+                            cells
+                                .into_iter()
+                                .map(|(committed, _)| committed)
+                                .collect::<CommittedBatch>()
+                        })
                         .map_err(|error| eyre!("{error:?}"))
                 }
             });

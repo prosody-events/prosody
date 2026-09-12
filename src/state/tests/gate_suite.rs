@@ -41,6 +41,8 @@ use crate::codec::{JsonCodec, JsonCodecError};
 use crate::consumer::middleware::RepinProof;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
+use crate::state::cell::Values;
+use crate::state::store::CellRead;
 
 use super::super::fjall::test_db;
 use crate::timers::duration::CompactDuration;
@@ -437,10 +439,9 @@ fn gate_serializes_set_against_clear() -> Result<()> {
             .bind(&verify)
             .map_err(|e| eyre!("bind: {e}"))?;
         let entry = fresh.get(&1).await.map_err(|e| eyre!("{e}"))?;
-        let keyset = fx
-            .counting
-            .get(&id, &map::keyset_cell())
+        let keyset = CellRead::<Values>::read(&fx.counting, &id, &map::keyset_cell())
             .await?
+            .0
             .into_inner();
         assert!(
             entry.is_none() || keyset.is_some(),
@@ -522,10 +523,9 @@ fn gate_serializes_racing_keyset_rmw() -> Result<()> {
 
         // The keyset is the UNION {1, 9}, not a last-wins singleton.
         let id = fx.id("m")?;
-        let keyset = fx
-            .counting
-            .get(&id, &map::keyset_cell())
+        let keyset = CellRead::<Values>::read(&fx.counting, &id, &map::keyset_cell())
             .await?
+            .0
             .into_inner()
             .ok_or_else(|| eyre!("missing keyset cell"))?;
         assert_eq!(
@@ -625,10 +625,9 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
         finalize_and_promote(&session, &fx.dedup, Uuid::from_u128(1), &fx.cells, &id).await?;
 
         // The serial second set exceeds the limit → Overflowed.
-        let keyset = fx
-            .counting
-            .get(&id, &map::keyset_cell())
+        let keyset = CellRead::<Values>::read(&fx.counting, &id, &map::keyset_cell())
             .await?
+            .0
             .into_inner()
             .ok_or_else(|| eyre!("missing keyset cell"))?;
         assert_eq!(

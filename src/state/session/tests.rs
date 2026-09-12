@@ -14,6 +14,7 @@ use crate::codec::JsonCodec;
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::ErrorCategory;
+use crate::state::cell::Values;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::descriptor::value_state;
 use crate::state::dirty::{DirtyStore, DirtyVal};
@@ -22,7 +23,8 @@ use crate::state::marker::{EventEvidence, EventMarker};
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::Promoted;
-use crate::state::store::{CELL_BATCH, CellStore};
+use crate::state::store::CELL_BATCH;
+use crate::state::store::CellRead;
 use crate::state::tests::cell_suite::{
     FailingCellStore, MemoryDeduplicationStore, Poison, PoisonHandle, cell_at, value_cell,
 };
@@ -193,11 +195,12 @@ impl Fixture {
 
     /// Returns the durable committed Value bytes.
     async fn committed_value(&self) -> Result<Option<Bytes>> {
-        Ok(self
-            .cell_store()
-            .get(&self.value_id(), &value_cell())
-            .await?
-            .into_inner())
+        Ok(
+            CellRead::<Values>::read(&self.cell_store(), &self.value_id(), &value_cell())
+                .await?
+                .0
+                .into_inner(),
+        )
     }
 }
 
@@ -239,9 +242,9 @@ async fn commit_drains_only_its_collection() -> Result<()> {
     // Cart's write is committed durably; wishlist's is still only buffered.
     let cart_id = CollectionId::new(fx.state_key.clone(), StateType::Application, cart);
     assert_eq!(
-        fx.cell_store()
-            .get(&cart_id, &value_cell())
+        CellRead::<Values>::read(&fx.cell_store(), &cart_id, &value_cell())
             .await?
+            .0
             .into_inner(),
         Some(Bytes::from_static(b"a")),
     );
@@ -251,9 +254,9 @@ async fn commit_drains_only_its_collection() -> Result<()> {
         wishlist.clone(),
     );
     assert_eq!(
-        fx.cell_store()
-            .get(&wishlist_id, &value_cell())
+        CellRead::<Values>::read(&fx.cell_store(), &wishlist_id, &value_cell())
             .await?
+            .0
             .into_inner(),
         None,
         "the sibling collection's buffered op must not be written through",
@@ -318,9 +321,9 @@ async fn rollback_restores_the_commit_floor_without_durable_writes() -> Result<(
     // no provisional cell or event marker was created.
     let cart_id = CollectionId::new(fx.state_key.clone(), StateType::Application, cart);
     assert_eq!(
-        fx.cell_store()
-            .get(&cart_id, &value_cell())
+        CellRead::<Values>::read(&fx.cell_store(), &cart_id, &value_cell())
             .await?
+            .0
             .into_inner(),
         Some(Bytes::from_static(b"V")),
     );
@@ -917,7 +920,10 @@ async fn failed_finalize_keeps_the_buffer_whole_for_retry() -> Result<()> {
     for (name, expected) in [(&cart, b"c1"), (&wishlist, b"w1")] {
         let id = CollectionId::new(fx.state_key.clone(), StateType::Application, name.clone());
         assert_eq!(
-            fx.cell_store().get(&id, &value_cell()).await?.into_inner(),
+            CellRead::<Values>::read(&fx.cell_store(), &id, &value_cell())
+                .await?
+                .0
+                .into_inner(),
             Some(Bytes::from_static(expected)),
             "{name:?} must commit its buffered value on the healed retry",
         );
@@ -998,9 +1004,9 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
         "the retried attempt's value wins"
     );
     assert_eq!(
-        fx.cell_store()
-            .get(&fx.value_id(), &extra)
+        CellRead::<Values>::read(&fx.cell_store(), &fx.value_id(), &extra)
             .await?
+            .0
             .into_inner(),
         Some(Bytes::from_static(b"w")),
         "the retry's extra cell commits with the rest of its stage"
@@ -1150,7 +1156,10 @@ impl CountingFixture {
 
     /// Returns the durable committed value of `cell`.
     async fn committed(&self, cell: &CellKey) -> Result<Option<Bytes>> {
-        Ok(self.counting.get(&self.id, cell).await?.into_inner())
+        Ok(CellRead::<Values>::read(&self.counting, &self.id, cell)
+            .await?
+            .0
+            .into_inner())
     }
 }
 
@@ -1510,12 +1519,18 @@ async fn stage_restores_distinct_bases_on_abort() -> Result<()> {
     .await?;
 
     assert_eq!(
-        fx.cell_store().get(&fx.value_id(), &c0).await?.into_inner(),
+        CellRead::<Values>::read(&fx.cell_store(), &fx.value_id(), &c0)
+            .await?
+            .0
+            .into_inner(),
         Some(Bytes::from_static(b"A")),
         "c0 restored to its own base",
     );
     assert_eq!(
-        fx.cell_store().get(&fx.value_id(), &c1).await?.into_inner(),
+        CellRead::<Values>::read(&fx.cell_store(), &fx.value_id(), &c1)
+            .await?
+            .0
+            .into_inner(),
         Some(Bytes::from_static(b"B")),
         "c1 restored to its own base",
     );
@@ -1773,10 +1788,9 @@ async fn run_multi_section(trace: MultiTrace) -> Result<()> {
         )
         .await?;
         for cell in &all {
-            let committed = fx
-                .cell_store()
-                .get(&fx.value_id(), cell)
+            let committed = CellRead::<Values>::read(&fx.cell_store(), &fx.value_id(), cell)
                 .await?
+                .0
                 .into_inner();
             let expected = model.get(cell).cloned();
             if committed != expected {

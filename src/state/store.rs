@@ -9,14 +9,13 @@
 //! discovery row. Promote writes evidence before destructive chunks and deletes
 //! Staged last. An oversized resolved write can remain partial after a crash
 //! because it has no provisional state to reconstruct.
-use super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
+use super::cell::{Presence, Projection, ProvisionalCell, ProvisionalWrite, Values};
 use super::cell_key::{CellKey, Coordinate, Scan, Section};
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::{EventMarker, MarkerState, SectionClear};
 use crate::error::ClassifyError;
-use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
-use futures::{Stream, TryStreamExt};
+use futures::Stream;
 use std::error::Error;
 use std::future::Future;
 
@@ -26,197 +25,63 @@ pub(crate) use super::store_helpers::{
 };
 pub(crate) use super::store_types::CELL_BATCH;
 pub use super::store_types::{
-    CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch, PresenceBatch,
+    CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch, Durable, PresenceBatch,
 };
 
-/// Uniform durable storage for the cells of one collection partition.
-///
-/// `get` resolves one cell. `scan_cells` resolves a section range.
-/// Three mutators implement the durability sequence:
-///
-/// * [`Self::write_provisional`] stages `data`, `prev`, and `event` for
-///   `ReadCommitted`.
-/// * [`Self::write_resolved`] writes committed values with null `event` and
-///   `prev`. `ReadUncommitted`, mid-handler `commit()`, and abort use this
-///   operation. Abort restores the staged `prev`.
-/// * [`Self::mark_resolved`] clears `event` and `prev` but preserves `data`.
-///   Its cost is O(1), regardless of value size.
-///
-/// # Committed absence is row absence
-///
-/// A committed-absent cell has no row. Every operation that resolves a cell to
-/// absence deletes its row.
-/// Thus, [`Self::write_resolved`] deletes cells with `None` data.
-/// [`Self::commit_provisional`] uses that delete for absent data and
-/// [`Self::mark_resolved`] for present data.
-pub trait CellStore: Clone + Send + Sync + 'static {
-    /// Error type for cell-store operations.
+/// One error type for every cell read and mutation.
+pub trait CellBackend: Clone + Send + Sync + 'static {
+    /// The backend error.
     type Error: ClassifyError + Error + Send + Sync + 'static;
+}
 
-    /// Reads the committed projection without a durable write.
-    /// A missing row returns `Committed(None)`.
-    /// The current event reads `prev` for a provisional cell.
-    /// Admission resolves registered residue before dispatch. The event stages
-    /// only at settle.
-    ///
-    /// # Errors
-    ///
-    /// Returns the store error for failed reads or corrupt rows.
-    fn get<'a>(
+/// Reads committed cells under one projection with their remaining durable TTL.
+pub trait CellRead<P: Projection>: CellBackend {
+    /// Reads one cell. A missing row returns committed absence without a TTL.
+    fn read<'a>(
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-    ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<Durable<P>, Self::Error>> + Send + 'a;
 
-    /// Scans one section in coordinate order and yields present committed
-    /// values. Provisional cells use the same projection as [`Self::get`].
-    fn scan_cells<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a;
-
-    /// Scans visible committed keys in coordinate order. The scan applies its
-    /// direction, edges, and limit to present keys.
+    /// Reads one section's coordinates in input order.
     ///
-    /// This read uses the marker-resolved presence rules on
-    /// [`Self::contains_many`]. The default projects [`Self::scan_cells`];
-    /// Cassandra overrides it with a payload-free scan.
-    fn scan_keys<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
-        self.scan_cells(collection, scan).map_ok(|(key, _)| key)
-    }
-
-    /// Cache-fill point read: the committed value **plus** the durable cell's
-    /// remaining TTL, for the [`Cached`](super::cached::Cached) write-through
-    /// cache to mirror with a co-expiring fjall entry. `None` TTL means the
-    /// durable row has no expiry (the fjall entry is stamped "never expires").
-    ///
-    /// Backends with no per-write TTL inherit the default: the committed value
-    /// from [`Self::get`] with a `None` TTL. Only the Cassandra store overrides
-    /// it (selecting the TTL of whichever blob resolution returns); the TTL is
-    /// a best-effort hint, so a wrong or missing value only makes the cache
-    /// fall through early, never stale.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Self::Error`] on any failure [`Self::get`] would.
-    fn get_for_cache<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        cell: &'a CellKey,
-    ) -> impl Future<Output = Result<(Committed, Option<CompactDuration>), Self::Error>> + Send + 'a
-    {
-        async move { Ok((self.get(collection, cell).await?, None)) }
-    }
-
-    /// Reads one section's coordinates and returns one committed value per
-    /// input position.
-    /// A missing row returns `Committed(None)`.
-    ///
-    /// # Read contract
-    ///
-    /// * The result has exactly `batch.len()` entries. `result[i]` answers
-    ///   `batch[i]`.
-    /// * Each repeated coordinate requires one read. All its positions return
-    ///   the same value.
-    /// * Unique coordinates resolve in first-occurrence order. Row corruption
-    ///   or evidence errors fail the batch at the earliest affected input
-    ///   position. A backend can fail the whole batch before row resolution.
-    ///   Cassandra query and marker failures carry no input position, as with
-    ///   [`Self::get`].
-    ///
-    /// The default calls [`Self::get`] once per unique coordinate in
-    /// first-occurrence order and copies each answer to duplicate
-    /// positions. The memory backend shares evidence across raw reads.
-    /// Cassandra uses one `IN` query.
-    /// [`CellBuffer`] keeps small scratch buffers inline; a full batch uses
-    /// heap space to limit the future's size.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Self::Error`] for the earliest affected input position, or a
-    /// whole-collection failure without a position.
-    fn get_many<'a>(
+    /// Each result answers the input at the same position. Duplicate
+    /// coordinates share one read. Unique coordinates resolve in
+    /// first-occurrence order. The earliest affected position supplies the
+    /// error. A backend can fail the whole batch before row resolution.
+    fn read_many<'a>(
         &'a self,
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CommittedBatch, Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<CacheBatch<P>, Self::Error>> + Send + 'a {
         async move {
-            let (unique_coordinates, input_indices) = dedupe(batch);
-            let mut unique_answers = CommittedBatch::with_capacity(unique_coordinates.len());
-            for &coordinate in &unique_coordinates {
+            let (coordinates, indices) = dedupe(batch);
+            let mut answers = CacheBatch::<P>::with_capacity(coordinates.len());
+            for coordinate in coordinates {
                 let cell = CellKey {
                     section,
                     coordinate: Coordinate::clone(coordinate),
                 };
-                unique_answers.push(self.get(collection, &cell).await?);
+                answers.push(self.read(collection, &cell).await?);
             }
-            Ok(expand_to_input_order(&input_indices, &unique_answers))
+            Ok(expand_to_input_order(&indices, &answers))
         }
     }
 
-    /// Tests presence for one section's coordinates in one backend hop.
-    /// Results follow the observation contract on [`Self::get_many`].
-    ///
-    /// Applies the committed projection of [`Self::get`] without durable
-    /// writes. The default projects [`Self::get_many`]; Cassandra overrides
-    /// it with a payload-free query.
-    fn contains_many<'a>(
+    /// Scans present committed cells in coordinate order within one section.
+    fn scan<'a>(
         &'a self,
         collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send + 'a {
-        async move {
-            Ok(self
-                .get_many(collection, section, batch)
-                .await?
-                .iter()
-                .map(|c| c.get().is_some())
-                .collect())
-        }
-    }
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a;
+}
 
-    /// Reads committed values and remaining TTLs for
-    /// [`Cached`](super::cached::Cached). Uses the input-position contract
-    /// of [`Self::get_many`].
-    ///
-    /// The default calls [`Self::get_for_cache`] in first-occurrence order and
-    /// copies each `(value, ttl)` pair to duplicate positions.
-    /// It preserves backend TTL metadata; a call to [`Self::get_many`] with
-    /// added `None` TTLs would lose that metadata.
-    /// Cassandra shares a prepared statement with [`Self::get_many`]. Memory
-    /// uses its batch read with no TTL.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Self::Error`] on the first failure from
-    /// [`Self::get_for_cache`], at the earliest input position.
-    fn get_many_for_cache<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CacheBatch, Self::Error>> + Send + 'a {
-        async move {
-            let (unique_coordinates, input_indices) = dedupe(batch);
-            let mut unique_answers = CacheBatch::with_capacity(unique_coordinates.len());
-            for &coordinate in &unique_coordinates {
-                let cell = CellKey {
-                    section,
-                    coordinate: Coordinate::clone(coordinate),
-                };
-                unique_answers.push(self.get_for_cache(collection, &cell).await?);
-            }
-            Ok(expand_to_input_order(&input_indices, &unique_answers))
-        }
-    }
-
+/// Stores durable cells and collection commit evidence.
+///
+/// A committed-absent cell has no row. Each operation that resolves a cell to
+/// absence deletes its row.
+pub trait CellStore: CellRead<Values> + CellRead<Presence> {
     /// Point-reads one coordinate's provisional cell, or `None` when it is
     /// absent or resolved (over-report-safe). The single-coordinate primitive
     /// that [`provisional_point_loop`] fans out over to

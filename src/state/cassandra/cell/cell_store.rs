@@ -5,96 +5,23 @@ use super::decode::decode_body;
 use super::projection::CassandraProjection;
 use super::read::{fetch_batch, fetch_marker_state, fetch_point, split_point};
 use super::{
-    BatchUnit, Bytes, CacheBatch, CassandraStore, Cell, CellAddr, CellBatchRow, CellBuffer,
-    CellKey, CellKind, CellStore, CellStoreError, CollectionId, CollectionRef, Committed,
-    CommittedBatch, CompactDuration, Coordinate, CoordinateBatch, EventMarker, KeyRow,
-    PER_STATEMENT_OVERHEAD, Pk, PresenceBatch, ProvisionalCell, ProvisionalWrite, ResolveCellError,
-    RowShape, Scan, Section, SectionClear, Stream, StreamExt, bind_ttl, decode_provisional_batch,
+    BatchUnit, Bytes, CassandraStore, Cell, CellAddr, CellBatchRow, CellBuffer, CellKey, CellKind,
+    CellStore, CellStoreError, CollectionId, CollectionRef, Coordinate, CoordinateBatch,
+    EventMarker, KeyRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell, ProvisionalWrite,
+    ResolveCellError, RowShape, Section, SectionClear, bind_ttl, decode_provisional_batch,
     encode_cell_blobs, extend_gap_units, gap_count, smallvec, sorted_unique_coordinates,
     write_provisional,
 };
 use super::{CassandraCellStoreError, MarkerWriteRow, encode};
-use crate::state::cell::{Presence, Values};
+use crate::state::cell::Values;
 use crate::state::marker::{MarkerRow, MarkerState, encode_committed_payload};
+use crate::state::store::CellBackend;
+
+impl CellBackend for CassandraStore {
+    type Error = CellStoreError;
+}
 
 impl CellStore for CassandraStore {
-    type Error = CellStoreError;
-
-    async fn get<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        cell: &'a CellKey,
-    ) -> Result<Committed, Self::Error> {
-        // The committed value is exactly the cache-fill read minus its co-expiry
-        // TTL; production only ever calls this via `Cached` (which uses
-        // `get_for_cache`), so `get` is a thin convenience for direct callers.
-        Ok(self.get_for_cache(collection, cell).await?.0)
-    }
-
-    async fn get_for_cache<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        cell: &'a CellKey,
-    ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
-        self.read::<Values>(collection, cell).await
-    }
-
-    async fn get_many<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> Result<CommittedBatch, Self::Error> {
-        // Mirrors `get` → `get_for_cache`: the committed value is the batch
-        // cache-fill read minus its co-expiry TTLs.
-        Ok(self
-            .get_many_for_cache(collection, section, batch)
-            .await?
-            .into_iter()
-            .map(|(committed, _)| committed)
-            .collect())
-    }
-
-    async fn get_many_for_cache<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> Result<CacheBatch, Self::Error> {
-        self.read_many::<Values>(collection, section, batch).await
-    }
-
-    async fn contains_many<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> Result<PresenceBatch, Self::Error> {
-        Ok(self
-            .read_many::<Presence>(collection, section, batch)
-            .await?
-            .into_iter()
-            .map(|(cell, _)| cell.get().is_some())
-            .collect())
-    }
-
-    fn scan_cells<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        self.scan_inner::<Values>(collection, scan)
-    }
-
-    fn scan_keys<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
-        self.scan_inner::<Presence>(collection, scan)
-            .map(|item| item.map(|(key, ())| key))
-    }
-
     async fn provisional_cell_at<'a>(
         &'a self,
         collection: &'a CollectionId,

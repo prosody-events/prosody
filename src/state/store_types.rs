@@ -21,7 +21,7 @@ const _: () = assert!(
 /// It yields no empty batch. Callers cannot create an invalid batch.
 ///
 /// Duplicates and unknown coordinates are valid. The read contract on
-/// [`super::store::CellStore::get_many`] defines each result position.
+/// [`super::store::CellRead::read_many`] defines each result position.
 pub struct CoordinateBatch(CellBuffer<Coordinate>);
 
 impl CoordinateBatch {

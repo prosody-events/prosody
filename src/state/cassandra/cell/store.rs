@@ -12,6 +12,7 @@ use super::{
     encode, encode_marker_payload, expand_to_input_order, pin_mut, smallvec, try_stream,
     ttl_seconds_to_duration,
 };
+use crate::state::store::CellRead;
 use crate::state::store_types::Durable;
 
 impl CassandraStore {
@@ -38,64 +39,6 @@ impl CassandraStore {
     #[must_use]
     pub(crate) fn read_counts(&self) -> Arc<CellReadCounts> {
         self.counters.clone()
-    }
-
-    /// Reads one committed projection and its remaining durable TTL.
-    pub(super) async fn read<P: CassandraProjection>(
-        &self,
-        id: &CollectionId,
-        cell: &CellKey,
-    ) -> Result<Durable<P>, CellStoreError> {
-        let row = fetch_point::<P>(&self.session, P::statements(&self.queries), id, cell)
-            .await
-            .map_err(ResolveCellError::Store)?;
-        let (raw, ttl) = match row {
-            Some(row) => {
-                let (body, ttl) = split_point::<P>(row);
-                (
-                    decode_body::<P>(body).map_err(ResolveCellError::Store)?,
-                    ttl,
-                )
-            }
-            None => (Cell::Resolved(Committed::new(None)), None),
-        };
-        let committed = EvidenceLookup::new(self, id).resolve(raw).await?;
-        Ok((committed, ttl_seconds_to_duration(ttl)))
-    }
-
-    /// Resolves each unique coordinate once and expands answers to input order.
-    pub(super) async fn read_many<P: CassandraProjection>(
-        &self,
-        id: &CollectionId,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<CacheBatch<P>, CellStoreError> {
-        let (coordinates, indices) = dedupe(batch);
-        let rows = fetch_batch::<P>(
-            &self.session,
-            P::statements(&self.queries),
-            id,
-            section,
-            &coordinates,
-        )
-        .await
-        .map_err(ResolveCellError::Store)?;
-        let mut answers = CacheBatch::<P>::with_capacity(coordinates.len());
-        let mut lookup = EvidenceLookup::new(self, id);
-        for row in rows {
-            let (raw, ttl) = match row {
-                Some(row) => {
-                    let (body, ttl) = split_point::<P>(row);
-                    (
-                        decode_body::<P>(body).map_err(ResolveCellError::Store)?,
-                        ttl,
-                    )
-                }
-                None => (Cell::Resolved(Committed::new(None)), None),
-            };
-            answers.push((lookup.resolve(raw).await?, ttl_seconds_to_duration(ttl)));
-        }
-        Ok(expand_to_input_order(&indices, &answers))
     }
 
     /// Executes same-partition `UNLOGGED BATCH` statements for cell mutations.
@@ -165,37 +108,6 @@ impl CassandraStore {
         })
     }
 
-    /// The single resolving section scan, yielding each present cell's
-    /// committed bytes — the body behind
-    /// [`scan_cells`](super::CellStore::scan_cells).
-    pub(super) fn scan_inner<'a, P: CassandraProjection>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), CellStoreError>> + Send + 'a {
-        let limit = scan.limit;
-        try_stream! {
-            let pages = page::<P>(&self.session, P::statements(&self.queries), collection, scan);
-            pin_mut!(pages);
-
-            let mut lookup = EvidenceLookup::new(self, collection);
-            let mut yielded = 0usize;
-            while let Some((key, raw)) = pages.try_next().await.map_err(ResolveCellError::Store)? {
-                // The limit bounds *yielded* (present) cells; check it before
-                // processing the next row so `Some(0)` yields nothing (an absent
-                // cell never consumes a slot — only a present yield does).
-                if limit.is_some_and(|n| yielded >= n) {
-                    break;
-                }
-                let committed = lookup.resolve(raw).await?;
-                if let Some(bytes) = committed.into_inner() {
-                    yield (key, bytes);
-                    yielded += 1;
-                }
-            }
-        }
-    }
-
     /// Writes evidence before destructive promote chunks and deletes Staged
     /// last. A resolved cell without evidence, or residue without Staged,
     /// cannot result from a partial promote. An abort has no leading
@@ -234,4 +146,89 @@ pub(super) fn stage_marker(marker: &EventMarker) -> Result<MarkerBlob, CellStore
         payload,
         event: marker.event(),
     })
+}
+
+impl<P: CassandraProjection> CellRead<P> for CassandraStore {
+    /// Reads one committed projection and its remaining durable TTL.
+    async fn read(&self, id: &CollectionId, cell: &CellKey) -> Result<Durable<P>, CellStoreError> {
+        let row = fetch_point::<P>(&self.session, P::statements(&self.queries), id, cell)
+            .await
+            .map_err(ResolveCellError::Store)?;
+        let (raw, ttl) = match row {
+            Some(row) => {
+                let (body, ttl) = split_point::<P>(row);
+                (
+                    decode_body::<P>(body).map_err(ResolveCellError::Store)?,
+                    ttl,
+                )
+            }
+            None => (Cell::Resolved(Committed::new(None)), None),
+        };
+        let committed = EvidenceLookup::new(self, id).resolve(raw).await?;
+        Ok((committed, ttl_seconds_to_duration(ttl)))
+    }
+
+    /// Resolves each unique coordinate once and expands answers to input order.
+    async fn read_many(
+        &self,
+        id: &CollectionId,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<CacheBatch<P>, CellStoreError> {
+        let (coordinates, indices) = dedupe(batch);
+        let rows = fetch_batch::<P>(
+            &self.session,
+            P::statements(&self.queries),
+            id,
+            section,
+            &coordinates,
+        )
+        .await
+        .map_err(ResolveCellError::Store)?;
+        let mut answers = CacheBatch::<P>::with_capacity(coordinates.len());
+        let mut lookup = EvidenceLookup::new(self, id);
+        for row in rows {
+            let (raw, ttl) = match row {
+                Some(row) => {
+                    let (body, ttl) = split_point::<P>(row);
+                    (
+                        decode_body::<P>(body).map_err(ResolveCellError::Store)?,
+                        ttl,
+                    )
+                }
+                None => (Cell::Resolved(Committed::new(None)), None),
+            };
+            answers.push((lookup.resolve(raw).await?, ttl_seconds_to_duration(ttl)));
+        }
+        Ok(expand_to_input_order(&indices, &answers))
+    }
+
+    /// Scans one section under the selected projection.
+    fn scan<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), CellStoreError>> + Send + 'a {
+        let limit = scan.limit;
+        try_stream! {
+            let pages = page::<P>(&self.session, P::statements(&self.queries), collection, scan);
+            pin_mut!(pages);
+
+            let mut lookup = EvidenceLookup::new(self, collection);
+            let mut yielded = 0usize;
+            while let Some((key, raw)) = pages.try_next().await.map_err(ResolveCellError::Store)? {
+                // The limit bounds *yielded* (present) cells; check it before
+                // processing the next row so `Some(0)` yields nothing (an absent
+                // cell never consumes a slot — only a present yield does).
+                if limit.is_some_and(|n| yielded >= n) {
+                    break;
+                }
+                let committed = lookup.resolve(raw).await?;
+                if let Some(bytes) = committed.into_inner() {
+                    yield (key, bytes);
+                    yielded += 1;
+                }
+            }
+        }
+    }
 }

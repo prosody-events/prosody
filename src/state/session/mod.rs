@@ -24,7 +24,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::CommitDecision;
 use crate::state::access::StateAccessError;
 use crate::state::backend::AdmissionChecks;
-use crate::state::cell::{Committed, ProvisionalWrite};
+use crate::state::cell::{Committed, ProvisionalWrite, Values};
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::collection::{StateSession, WritableStateSession};
 use crate::state::descriptor::{
@@ -37,7 +37,9 @@ use crate::state::overlay::Overlay;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::resolve::resolve_event_marker;
 use crate::state::retry::{StepOutcome, retry_step};
-use crate::state::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, PresenceBatch};
+use crate::state::store::{
+    CELL_BATCH, CellBuffer, CellRead, CellStore, CoordinateBatch, PresenceBatch,
+};
 use crate::state::{
     CollectionKindId, CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY,
     StateBackend, StateKey, StateName, StateType, StoreOutcome,
@@ -1529,8 +1531,7 @@ where
                             batch,
                             records,
                         } = chunk;
-                        let bases = lower
-                            .get_many(id, section, &batch)
+                        let bases = CellRead::<Values>::read_many(lower, id, section, &batch)
                             .await
                             .map_err(|e| StateAccessError::store(&e))?;
                         // `get_many`'s contract: bases.len() == batch.len()
@@ -1547,7 +1548,7 @@ where
                         );
                         let chunk_writes: CellBuffer<(CellKey, ProvisionalWrite)> = records
                             .into_iter()
-                            .zip(bases)
+                            .zip(bases.into_iter().map(|(committed, _)| committed))
                             .map(|((cell, data), prev)| {
                                 (cell, ProvisionalWrite::new(data, prev, event))
                             })
