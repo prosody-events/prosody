@@ -15,8 +15,9 @@
 //! planning command chose. That span is the whole section or one bounded
 //! window.
 
-use super::operation::read_keys_bytes;
+use super::operation::read_keys;
 use super::{StateSession, resolve_batch, resolve_cell, sealed};
+use crate::state::cell::{Presence, Projection, Values};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::descriptor::{
     CellCodecError, CellStateError, CellType, ContextOf, FromSession, KeyOf, ResolvedOf,
@@ -25,7 +26,6 @@ use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::store::{CELL_BATCH, CellBuffer};
 use crate::state::{SHARD_FANOUT_CONCURRENCY, StateAccessError, StateName, StateType};
 use async_stream::try_stream;
-use bytes::Bytes;
 use futures::future::Either;
 use futures::stream::{self, Stream, StreamExt};
 use std::marker::PhantomData;
@@ -203,7 +203,7 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
                             &base.plan,
                         )
                         .await;
-                        read_keys_bytes::<S, T>(
+                        read_keys::<S, T, Values>(
                             &base.session,
                             &mut inner,
                             base.state_type,
@@ -236,8 +236,8 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
         }
     }
 
-    /// The unfenced presence-only body: the same chunking, with the value bytes
-    /// used as a presence bit and discarded.
+    /// The unfenced presence-only body uses the same chunking. It reads one
+    /// presence bit for each key.
     fn key_source(self) -> impl Stream<Item = KeyItem<T>> + Send {
         try_stream! {
             let Self { base, keys } = self;
@@ -249,7 +249,7 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
                 let chunk: CellBuffer<KeyOf<T>> = keys.by_ref().take(CELL_BATCH).collect();
                 // Pair each key with its slot so the emission stage can drop
                 // absent keys AND checkpoint per key.
-                let paired = read_keys_bytes::<S, T>(
+                let paired = read_keys::<S, T, Presence>(
                     &base.session,
                     &mut inner,
                     base.state_type,
@@ -262,7 +262,7 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
                     chunk
                         .into_iter()
                         .zip(slots)
-                        .collect::<CellBuffer<(KeyOf<T>, Option<Bytes>)>>()
+                        .collect::<CellBuffer<(KeyOf<T>, Option<()>)>>()
                 });
                 Some((paired, keys))
             });
@@ -281,7 +281,7 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
                     .map(|(key, slot)| {
                         cooperative(async move {
                             Ok::<Option<KeyOf<T>>, CellStateError<CellCodecError<T>>>(
-                                slot.map(|_| key),
+                                slot.map(|()| key),
                             )
                         })
                     })
@@ -321,7 +321,12 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
     /// Opens the plan's durable page over its planned span. It borrows the
     /// whole plan once, so the [`Scan`]'s edges name the plan's own owned
     /// coordinates.
-    fn page(&self) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + '_ {
+    fn page<P: Projection>(
+        &self,
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + '_
+    where
+        S::Engine: sealed::Reads<S, P>,
+    {
         let scan = Scan {
             section: self.base.section,
             start: self.start.as_ref(),
@@ -329,7 +334,7 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
             end: self.end.as_ref(),
             limit: self.limit,
         };
-        <S::Engine as sealed::ReadEngine<S>>::page(
+        <S::Engine as sealed::Reads<S, P>>::page(
             &self.base.session,
             &self.base.plan,
             self.base.state_type,
@@ -347,8 +352,8 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
         fenced::<S, _, T>(session, self.entry_source())
     }
 
-    /// Streams the section's live keys in `dir` order, **without decoding or
-    /// resolving any value** — the paged envelope's value bytes are discarded.
+    /// Streams the section's live keys in `dir` order through presence-only
+    /// pages. It does not transfer, decode, or resolve a value.
     pub(crate) fn keys(self) -> impl Stream<Item = KeyItem<T>> + Send {
         let session = self.base.session.clone();
         fenced::<S, _, T>(session, self.key_source())
@@ -367,7 +372,7 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
             // `cooperative` inline in the producing closure (a
             // `.map(cooperative)` stage trips a higher-ranked-lifetime error on
             // the non-`'static` per-item futures); `buffered` keeps key order.
-            let inner = plan.page()
+            let inner = plan.page::<Values>()
                 .map(|item| {
                     cooperative(async move {
                         let (cell, bytes) = item?;
@@ -391,10 +396,10 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
         try_stream! {
             let plan = self;
             <S::Engine as sealed::ReadEngine<S>>::fence(&plan.base.session)?;
-            let inner = plan.page()
+            let inner = plan.page::<Presence>()
                 .map(|item| {
                     cooperative(async move {
-                        let (cell, _bytes) = item?; // value bytes discarded — never decoded
+                        let (cell, ()) = item?;
                         let key = <T::Key as OrderedKeyCodec>::decode(cell.coordinate.as_bytes())
                             .map_err(CellStateError::Key)?;
                         Ok::<KeyOf<T>, CellStateError<CellCodecError<T>>>(key)

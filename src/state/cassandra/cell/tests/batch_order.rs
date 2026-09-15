@@ -1,4 +1,6 @@
 use super::*;
+use crate::state::cell::Values;
+use crate::state::store::CellRead;
 
 /// A batch fits only when both its byte and statement counts fit.
 #[test]
@@ -119,7 +121,7 @@ async fn markerless_provisional_reads_its_committed_base() -> Result<()> {
     let unit = [BatchUnit::new(
         blob_weight(&blob),
         smallvec![CellBatchRow {
-            statement: &fx.queries.write_provisional,
+            statement: &fx.queries.cells.write_provisional,
             row: RowShape::Stage(StageRow {
                 ttl: 0,
                 data: blob.data(),
@@ -146,7 +148,7 @@ async fn markerless_provisional_reads_its_committed_base() -> Result<()> {
         "admission left the unlisted provisional cell untouched"
     );
     assert_eq!(
-        store.get(c.id(), &cell).await?,
+        CellRead::<Values>::read(&store, c.id(), &cell).await?.0,
         Committed::new(None),
         "a markerless legacy cell reads its committed base"
     );

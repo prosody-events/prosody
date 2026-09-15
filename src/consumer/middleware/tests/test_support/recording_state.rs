@@ -1,4 +1,6 @@
 use super::*;
+use crate::state::cell::Values;
+use crate::state::store::CellRead;
 use std::future::ready;
 
 // =========================================================================
@@ -123,7 +125,11 @@ pub async fn committed_json_value(
     name: &str,
 ) -> color_eyre::Result<Option<Value>> {
     let id = CollectionId::new(state_key, StateType::Application, StateName::try_new(name)?);
-    match Committed::into_inner(cell_store.get(&id, &value_cell()).await?) {
+    match Committed::into_inner(
+        CellRead::<Values>::read(cell_store, &id, &value_cell())
+            .await?
+            .0,
+    ) {
         Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         None => Ok(None),
     }

@@ -592,6 +592,7 @@ fn collection_ops_export_operation_spans() -> Result<()> {
             map.set("k1".to_owned(), json!(1_i32)).await?;
             map.get(&"k1".to_owned()).await?;
             let _entries: Vec<_> = map.stream(Direction::Forward).try_collect().await?;
+            map.is_empty().await?;
             map.remove(&"k1".to_owned()).await?;
 
             let deque = bind_registered(deque_state::<JsonCodec>("dq"), MemoryLoader::new())?;
@@ -602,6 +603,20 @@ fn collection_ops_export_operation_spans() -> Result<()> {
         });
     });
     outcome.into_inner()?;
+
+    assert_eq!(
+        spans
+            .iter()
+            .filter(|span| span.name == "map.is_empty")
+            .count(),
+        1,
+        "one call exports one map.is_empty span"
+    );
+    assert_eq!(
+        spans.iter().filter(|span| span.name == "map.keys").count(),
+        0,
+        "only direct keys calls export map.keys spans"
+    );
 
     let handler_id = spans
         .iter()

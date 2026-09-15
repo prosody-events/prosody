@@ -186,7 +186,11 @@ async fn assert_keys_visible<P: ParityPayload>(
             return Ok(false);
         }
     }
-    Ok(true)
+    Ok(handle
+        .is_empty()
+        .await
+        .map_err(|e| eyre!("is_empty: {e}"))?
+        == visible.is_empty())
 }
 
 // --- Value parity -----------------------------------------------------------

@@ -1,7 +1,9 @@
+use super::decode::PointRow;
 use super::{
     Bytes, CassandraCellStoreError, CellBlobs, CellBuffer, CompactDuration, Coordinate,
     PER_STATEMENT_OVERHEAD, ProvisionalCell, SmallVec, encode_payload, select_encoding,
 };
+use crate::state::cell::Values;
 
 /// Encodes a cell's `data` and `prev` payloads into their bound columns.
 /// It selects one shared encoding from the larger payload because the row has
@@ -50,7 +52,7 @@ pub(super) fn ttl_seconds_to_duration(ttl: Option<i32>) -> Option<CompactDuratio
 /// Keeps provisional cells from a recovery batch and discards their TTLs.
 /// The input already follows ascending coordinate order.
 pub(super) fn decode_provisional_batch(
-    rows: CellBuffer<Option<super::decode::BorrowedCellTtlRow<'_>>>,
+    rows: CellBuffer<Option<PointRow<Values>>>,
     coordinates: &[&Coordinate],
 ) -> Result<CellBuffer<(Coordinate, ProvisionalCell)>, CassandraCellStoreError> {
     let mut out: CellBuffer<(Coordinate, ProvisionalCell)> = SmallVec::with_capacity(rows.len());

@@ -30,11 +30,13 @@
 //! entirely in the descriptor layer above it.
 
 use super::cell_suite::{MAX_TRACE_OPS, MemoryDeduplicationStore, capped_vec};
+use super::support::CountingCellStore;
 use super::support::assert_no_settlement_residue;
 use crate::codec::{Codec, JsonCodec};
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
+use crate::state::cell::Values;
 use crate::state::collection::StateSession;
 use crate::state::descriptor::map::{entry_cell_for, keyset_cell};
 use crate::state::descriptor::{
@@ -47,6 +49,7 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::Promoted;
 use crate::state::session::sealed::StateLifecycle;
 use crate::state::session::{Finalized, KeyedStateSession, SessionParts, TerminationWatch};
+use crate::state::store::CellRead;
 use crate::state::store::{CELL_BATCH, CellStore};
 use crate::state::tests::support::admit_collection;
 use crate::state::tests::support::seed_commit_evidence;
@@ -177,6 +180,7 @@ pub(crate) enum MapOp {
     Set(i64, u8),
     Remove(i64),
     Get(i64),
+    IsEmpty,
     Clear,
     Commit,
 }
@@ -184,11 +188,12 @@ pub(crate) enum MapOp {
 impl Arbitrary for MapOp {
     fn arbitrary(g: &mut Gen) -> Self {
         let key = g.choose(&KEY_POOL).copied().unwrap_or(0);
-        match u8::arbitrary(g) % 6 {
+        match u8::arbitrary(g) % 7 {
             0 | 1 => Self::Set(key, u8::arbitrary(g)),
             2 => Self::Remove(key),
             3 => Self::Get(key),
-            4 => Self::Clear,
+            4 => Self::IsEmpty,
+            5 => Self::Clear,
             _ => Self::Commit,
         }
     }
@@ -707,6 +712,9 @@ pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> R
                     got == scratch.get(&k).cloned() && present == got.is_some(),
                 ))
             }
+            MapOp::IsEmpty => Ok(mismatch_unless(
+                handle.is_empty().await? == scratch.is_empty(),
+            )),
             MapOp::Clear => {
                 handle.clear().await?;
                 scratch.clear();
@@ -778,6 +786,9 @@ pub(crate) async fn run_map_ttl_keyset_refresh_trace(trace: MapTrace) -> Result<
                 MapOp::Get(k) => {
                     handle.get(&k).await?;
                 }
+                MapOp::IsEmpty => {
+                    handle.is_empty().await?;
+                }
                 MapOp::Clear => handle.clear().await?,
                 MapOp::Commit => {
                     handle.commit().await?;
@@ -836,6 +847,9 @@ pub(crate) async fn run_map_keyset_exact_trace(trace: MapTrace) -> Result<bool> 
                 MapOp::Get(k) => {
                     handle.get(&k).await?;
                 }
+                MapOp::IsEmpty => {
+                    handle.is_empty().await?;
+                }
                 MapOp::Clear => {
                     handle.clear().await?;
                     model.clear();
@@ -851,7 +865,10 @@ pub(crate) async fn run_map_keyset_exact_trace(trace: MapTrace) -> Result<bool> 
         // frame must equal `tracked_frame(live)`; an absent keyset is the
         // live-empty case (a fresh or `clear`ed map).
         let live: Vec<i64> = model.keys().copied().collect();
-        let stored = store.get(id, &keyset_cell()).await?.into_inner();
+        let stored = CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await?
+            .0
+            .into_inner();
         let exact = match stored {
             Some(bytes) => bytes[..] == tracked_frame(&live)[..],
             None => model.is_empty(),
@@ -919,8 +936,9 @@ impl Arbitrary for MapGetManyInput {
     }
 }
 
-/// `Map::get_many(keys)` parity against the already-trusted point path:
-/// `get_many(queries)` answers each position exactly as `queries.map(get)`,
+/// Map batch-read parity against the already-trusted point paths:
+/// `get_many(queries)` answers each position exactly as `queries.map(get)`, and
+/// `contains_many(queries)` answers each position as `queries.map(contains)`.
 /// including duplicate, present, and absent keys, across the sub-batch
 /// boundary. No TTL is in play and the JSON identity resolver is deterministic,
 /// so the observation rules collapse to exact point-parity and this isolates
@@ -948,7 +966,9 @@ pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Res
 
     // Read arm: the same (dirty) session, or a fresh event after committing 0.
     let batch;
+    let presence;
     let mut point = Vec::with_capacity(input.queries.len());
+    let mut point_presence = Vec::with_capacity(input.queries.len());
     if input.commit {
         finalize_and_promote(&session0, &dedup, event_dedup(ev0), &cells, id).await?;
         let ev1 = EventRef::Message {
@@ -957,13 +977,17 @@ pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Res
         let session1 = make_session(&cells, &dedup, &registry, &state_key, ev1);
         let handle1 = descriptor.bind(&session1).map_err(|e| eyre!("bind: {e}"))?;
         batch = Box::pin(handle1.get_many(&input.queries)).await?;
+        presence = Box::pin(handle1.contains_many(&input.queries)).await?;
         for q in &input.queries {
             point.push(handle1.get(q).await?);
+            point_presence.push(handle1.contains_key(q).await?);
         }
     } else {
         batch = Box::pin(handle0.get_many(&input.queries)).await?;
+        presence = Box::pin(handle0.contains_many(&input.queries)).await?;
         for q in &input.queries {
             point.push(handle0.get(q).await?);
+            point_presence.push(handle0.contains_key(q).await?);
         }
     }
 
@@ -971,7 +995,7 @@ pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Res
     if batch.len() != input.queries.len() {
         return Ok(false);
     }
-    Ok(batch == point)
+    Ok(batch == point && presence == point_presence)
 }
 
 /// Seeds a deque window directly into `store`: the `head ‖ tail` meta frame for
@@ -1228,7 +1252,11 @@ async fn deque_no_committed_orphans(
     id: &CollectionId,
     span: usize,
 ) -> Result<bool> {
-    let Some(bounds) = store.get(id, &deque::meta_cell()).await?.into_inner() else {
+    let Some(bounds) = CellRead::<Values>::read(store, id, &deque::meta_cell())
+        .await?
+        .0
+        .into_inner()
+    else {
         bail!("bounds cell missing after the convergence pushes");
     };
     let head = i64::from_be_bytes(bounds[0..8].try_into()?);
@@ -1236,9 +1264,9 @@ async fn deque_no_committed_orphans(
     for i in 0..span as i64 {
         let outside = i < head || i >= tail;
         if outside
-            && store
-                .get(id, &deque::entry_cell_for(&I64KeyCodec::encode(&i)))
+            && CellRead::<Values>::read(store, id, &deque::entry_cell_for(&I64KeyCodec::encode(&i)))
                 .await?
+                .0
                 .into_inner()
                 .is_some()
         {
@@ -1317,6 +1345,9 @@ pub(crate) async fn run_map_key_scan_holes(shape: MapKeyHoles) -> Result<bool> {
             .map(|(key, _)| key)
             .collect();
         if stream_keys != present {
+            return Ok(false);
+        }
+        if handle.is_empty().await? != present.is_empty() {
             return Ok(false);
         }
     }
@@ -1453,7 +1484,10 @@ where
         return Ok(false);
     }
     let descending_keys: Vec<i64> = model.keys().rev().copied().collect();
-    Ok(collect_map_keys(handle, Direction::Backward).await? == descending_keys)
+    Ok(
+        collect_map_keys(handle, Direction::Backward).await? == descending_keys
+            && handle.is_empty().await? == model.is_empty(),
+    )
 }
 
 /// Collects a map handle's `stream(dir)` into a `(key, value)` vector.
@@ -1558,7 +1592,7 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
     // reach the same present-but-undecodable cell.
     let tracked = Bytes::from(tracked_frame(&[key]));
     let overflowed = Bytes::from(OVERFLOWED_FRAME.to_vec());
-    for keyset_frame in [tracked, overflowed] {
+    for (tracked_route, keyset_frame) in [(true, tracked), (false, overflowed)] {
         let dedup = MemoryDeduplicationStore::default();
         let cells = MemoryCells::new();
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
@@ -1572,8 +1606,8 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
                 ..CollectionDef::new(None)
             },
         )?;
-        let store = MemoryCellStore::new(cells.clone());
-        block_on(store.write_resolved(
+        let counting = CountingCellStore::new(MemoryCellStore::new(cells.clone()));
+        block_on(counting.write_resolved(
             &collection_ref,
             &[
                 (keyset_cell(), Some(keyset_frame)),
@@ -1582,20 +1616,44 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
             &[],
         ))?;
 
-        let session = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
+        counting.reset();
+        let session =
+            super::counting_session(&counting, &dedup, &registry, &state_key, read_event(0));
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
         block_on(async {
-            // Presence reads see the cell — no decode, no error.
+            assert!(!handle.is_empty().await?);
+            assert_eq!(
+                counting.visible_point_reads(),
+                0,
+                "is_empty reads no values"
+            );
+            assert_eq!(counting.batch_reads(), 0, "is_empty reads no value batch");
+            assert_eq!(
+                counting.presence_reads(),
+                0,
+                "is_empty reads no presence batch"
+            );
+            assert_eq!(
+                counting.presence_scans(),
+                1,
+                "is_empty uses one presence scan"
+            );
+            counting.reset();
             assert!(
                 handle.contains_key(&key).await.map_err(|e| eyre!("{e}"))?,
                 "contains_key answers about the cell, not the value"
             );
+            assert_eq!(counting.presence_reads(), 1);
+            assert_eq!(counting.batch_reads(), 0);
+            assert_eq!(counting.presence_scans(), 0, "contains_key does not scan");
+            counting.reset();
             assert_eq!(
                 collect_map_keys(&handle, Direction::Forward).await?,
                 vec![key],
                 "keys() yields the key of an undecodable-value cell"
             );
+            assert_presence_route_calls(&counting, tracked_route);
 
             // Value reads surface the decode failure as `Permanent`.
             let got = handle.get(&key).await;
@@ -1622,6 +1680,13 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+fn assert_presence_route_calls(counting: &CountingCellStore<MemoryCellStore>, tracked_route: bool) {
+    assert_eq!(counting.presence_reads(), usize::from(tracked_route));
+    assert_eq!(counting.presence_scans(), usize::from(!tracked_route));
+    assert_eq!(counting.batch_reads(), 0);
+    assert_eq!(counting.lower_scans(), 0);
 }
 
 /// Durable meta-frame golden (Deque): after real pushes `commit()`, the raw
@@ -1661,7 +1726,12 @@ fn deque_meta_cell_bytes_are_frozen() -> Result<()> {
         StateType::Application,
         StateName::try_new("dq")?,
     );
-    let Some(bytes) = block_on(store.get(&id, &meta_cell()))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, &id, &meta_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("bounds cell missing at the frozen address");
     };
     assert_eq!(
@@ -1727,7 +1797,12 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     })?;
 
     let store = MemoryCellStore::new(cells.clone());
-    let Some(bytes) = block_on(store.get(id, &meta_cell()))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &meta_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("bounds cell missing after the committed clear-then-push");
     };
     assert_eq!(
@@ -1741,13 +1816,23 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     // the leak the API can never surface.
     let stale = entry_cell_for(&I64KeyCodec::encode(&1));
     assert_eq!(
-        block_on(store.get(id, &stale))?.into_inner(),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &stale)
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner(),
         None,
         "the committed clear must physically erase the out-of-window row"
     );
     let reused = entry_cell_for(&I64KeyCodec::encode(&0));
     assert_eq!(
-        block_on(store.get(id, &reused))?.into_inner(),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &reused)
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner(),
         Some(Bytes::from(serde_json::to_vec(&Value::from(9_u8))?)),
         "the reused index holds exactly the post-clear push"
     );
@@ -1866,7 +1951,12 @@ fn deque_push_on_an_over_wide_window_succeeds() -> Result<()> {
             Ok::<_, color_eyre::Report>(())
         })?;
 
-        let Some(bounds) = block_on(store.get(id, &meta_cell()))?.into_inner() else {
+        let Some(bounds) = block_on(async {
+            CellRead::<Values>::read(&store, id, &meta_cell())
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner() else {
             bail!("bounds cell missing after the over-wide push");
         };
         let head = i64::from_be_bytes(bounds[0..8].try_into()?);
@@ -1964,13 +2054,23 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
     assert_eq!(
-        block_on(store.get(id, &keyset_cell()))?.into_inner(),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &keyset_cell())
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner(),
         None,
         "the committed clear must erase the keyset cell"
     );
     for cell in &legacy {
         assert_eq!(
-            block_on(store.get(id, cell))?.into_inner(),
+            block_on(async {
+                CellRead::<Values>::read(&store, id, cell)
+                    .await
+                    .map(|(committed, _)| committed)
+            })?
+            .into_inner(),
             None,
             "the whole-layout reset must erase every retired meta coordinate too"
         );
@@ -1990,7 +2090,12 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
     assert_eq!(
-        block_on(store.get(id, &keyset_cell()))?.into_inner(),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &keyset_cell())
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner(),
         Some(bytes::Bytes::from(tracked_frame(&[7]))),
         "a set after clear writes a fresh single-key Tracked keyset"
     );
@@ -2038,6 +2143,41 @@ fn map_first_set_writes_keyset() -> Result<()> {
         "the entry is live"
     );
     Ok(())
+}
+
+/// Key enumeration hides a live entry without its keyset.
+/// The direct emptiness check still finds the entry.
+#[test]
+fn map_missing_keyset_hides_a_live_entry() -> Result<()> {
+    use bytes::Bytes;
+    use futures::executor::block_on;
+
+    let dedup = MemoryDeduplicationStore::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+    let (registry, collection_ref) =
+        registry_and_ref(&descriptor, "mp", &state_key, CollectionDef::new(None))?;
+    let store = MemoryCellStore::new(cells.clone());
+    let coordinate = I64KeyCodec::encode(&7);
+    let value = Bytes::from(serde_json::to_vec(&Value::from(1_u8))?);
+    block_on(store.write_resolved(
+        &collection_ref,
+        &[(entry_cell_for(&coordinate), Some(value))],
+        &[],
+    ))?;
+
+    let session = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        assert!(!handle.is_empty().await?);
+        assert!(
+            collect_map_keys(&handle, Direction::Forward)
+                .await?
+                .is_empty()
+        );
+        Ok::<_, color_eyre::Report>(())
+    })
 }
 
 /// The exact `Tracked` frame bytes over `i64` keys (assumed ascending): tag
@@ -2099,7 +2239,12 @@ fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
         finalize_and_promote(&session, &dedup, event_dedup(event1), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell()))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("the committed sets must have written a keyset cell");
     };
     // Golden literal on purpose — independent of `tracked_frame`, so a helper
@@ -2124,7 +2269,12 @@ fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
         finalize_and_promote(&session, &dedup, event_dedup(event2), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell()))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("the overflowing set must have written a keyset cell");
     };
     assert_eq!(
@@ -2175,9 +2325,13 @@ fn map_keyset_stays_tracked_under_ttl() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
     assert_eq!(
-        block_on(store.get(id, &keyset_cell()))?
-            .into_inner()
-            .map(|b| b.to_vec()),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &keyset_cell())
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner()
+        .map(|b| b.to_vec()),
         Some(tracked_frame(&[1, 2])),
         "a TTL'd map keeps a Tracked keyset, never collapses to Overflowed"
     );
@@ -2197,9 +2351,13 @@ fn map_keyset_stays_tracked_under_ttl() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
     assert_eq!(
-        block_on(store.get(id, &keyset_cell()))?
-            .into_inner()
-            .map(|b| b.to_vec()),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &keyset_cell())
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner()
+        .map(|b| b.to_vec()),
         Some(tracked_frame(&[1, 2])),
         "re-setting a tracked key on a TTL'd map keeps the Tracked frame, never Overflowed"
     );
@@ -2264,7 +2422,12 @@ fn map_keyset_malformed_frame_degrades_and_heals() -> Result<()> {
         finalize_and_promote(&session, &dedup, event_dedup(event2), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell()))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("the healing set must have written a keyset cell");
     };
     assert_eq!(
@@ -2340,7 +2503,12 @@ fn map_keyset_oversized_frame_collapses_before_fast_path() -> Result<()> {
         finalize_and_promote(&session, &dedup, event_dedup(event), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell()))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("the set must have written a keyset cell");
     };
     assert_eq!(
@@ -2381,7 +2549,12 @@ fn map_keyset_byte_ceiling_overflows() -> Result<()> {
         finalize_and_promote(&session, &dedup, event_dedup(event), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell()))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("the sets must have written a keyset cell");
     };
     assert_eq!(

@@ -12,12 +12,16 @@ use super::codec::cell_key;
 use super::test_db;
 use super::{CacheRead, Clock, FjallCellCache, FjallClient, FjallClientError};
 use crate::Topic;
-use crate::state::cell::Committed;
+use crate::state::CollectionId;
+use crate::state::cached::Cached;
+use crate::state::cell::{Committed, Presence, Values};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
-use crate::state::store::CELL_BATCH;
+use crate::state::memory::{MemoryCellStore, MemoryCells};
+use crate::state::store::{CELL_BATCH, CellRead};
 use crate::state::tests::cell_suite::{bytes, value_cell};
 use crate::state::tests::support::{batch_of, fresh_collection};
 use crate::test_util::TEST_RUNTIME;
+use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Report, Result, eyre};
 use fjall::{Database, KeyspaceCreateOptions};
@@ -45,9 +49,9 @@ fn prop_fjall_present_cell_is_uniquely_owned() {
         let c = fresh_collection("uniq")?;
         let cell = value_cell();
         store
-            .put(&c, &cell, &Committed::new(Some(Bytes::from(payload))), 0)
+            .put::<Values>(&c, &cell, Committed::new(Some(Bytes::from(payload))), 0)
             .await?;
-        let CacheRead::Hit(committed) = store.get(&c, &cell).await? else {
+        let CacheRead::Hit((committed, _)) = store.get::<Values>(&c, &cell).await? else {
             return Err(eyre!("expected a cache hit"));
         };
         let Some(bytes) = committed.into_inner() else {
@@ -89,10 +93,10 @@ fn stored_cells_are_raw_tagged_payload_with_expiry() -> Result<()> {
     let cell = value_cell();
 
     let cache = FjallCellCache::new(database, cache_partition.clone(), index_partition);
-    TEST_RUNTIME.block_on(cache.put(
+    TEST_RUNTIME.block_on(cache.put::<Values>(
         &c,
         &cell,
-        &Committed::new(Some(Bytes::copy_from_slice(payload))),
+        Committed::new(Some(Bytes::copy_from_slice(payload))),
         EXPIRY,
     ))?;
     let cache_raw = cache_partition
@@ -117,27 +121,29 @@ fn expired_entry_reads_as_miss() -> Result<()> {
     let cache = test_db::cache_with_clock("ttl_value", Clock::Fixed(now.clone()))?;
     let c = fresh_collection("ttl")?;
     let cell = value_cell();
-    let payload = Committed::new(Some(Bytes::from_static(b"v")));
+    let payload = Committed::<Values>::new(Some(Bytes::from_static(b"v")));
 
     TEST_RUNTIME.block_on(async {
         // Stamp an entry that expires at 2_000ms.
-        cache.put(&c, &cell, &payload, 2_000).await?;
+        cache
+            .put::<Values>(&c, &cell, payload.clone(), 2_000)
+            .await?;
         // Before expiry: a hit.
         assert!(
-            matches!(cache.get(&c, &cell).await?, CacheRead::Hit(_)),
+            matches!(cache.get::<Values>(&c, &cell).await?, CacheRead::Hit(_)),
             "live entry must hit"
         );
         // At/after expiry: reported Expired (an entry exists, floor-expired).
         now.store(2_000, Ordering::Relaxed);
         assert!(
-            matches!(cache.get(&c, &cell).await?, CacheRead::Expired),
+            matches!(cache.get::<Values>(&c, &cell).await?, CacheRead::Expired),
             "expired entry must read as Expired"
         );
         // A `never` (0) expiry never expires, even far in the future.
-        cache.put(&c, &cell, &payload, 0).await?;
+        cache.put::<Values>(&c, &cell, payload.clone(), 0).await?;
         now.store(u64::MAX, Ordering::Relaxed);
         assert!(
-            matches!(cache.get(&c, &cell).await?, CacheRead::Hit(_)),
+            matches!(cache.get::<Values>(&c, &cell).await?, CacheRead::Hit(_)),
             "a never-expiry entry must always hit"
         );
         Ok::<_, Report>(())
@@ -163,19 +169,21 @@ fn get_batch_probes_the_whole_batch_in_one_blocking_hop() -> Result<()> {
         // identical payloads would false-pass a reorder bug.
         for b in 0..u8::try_from(CELL_BATCH).unwrap_or(u8::MAX) {
             cache
-                .put(&c, &batch_cell(b), &Committed::new(Some(bytes(b))), 0)
+                .put::<Values>(&c, &batch_cell(b), Committed::new(Some(bytes(b))), 0)
                 .await?;
         }
         let batch = batch_of(0..u8::try_from(CELL_BATCH).unwrap_or(u8::MAX))?;
         let hits = cache
-            .get_batch(&c, Section::new(0), &batch)
-            .await?
-            .ok_or_else(|| eyre!("every warm position must hit"))?;
+            .get_batch::<Values>(&c, Section::new(0), &batch)
+            .await?;
         assert_eq!(hits.len(), CELL_BATCH, "every position answered");
         for (i, hit) in hits.iter().enumerate() {
             let want = bytes(u8::try_from(i).unwrap_or(u8::MAX));
+            let CacheRead::Hit((committed, _)) = hit else {
+                return Err(eyre!("every warm position must hit"));
+            };
             assert_eq!(
-                hit.get(),
+                committed.get(),
                 Some(&want),
                 "position {i} serves its own coordinate's value, index-aligned"
             );
@@ -190,52 +198,77 @@ fn get_batch_probes_the_whole_batch_in_one_blocking_hop() -> Result<()> {
     Ok(())
 }
 
-/// `get_batch` classification: an all-hit batch is `Ok(Some)`; a missing
-/// coordinate or a floor-expired entry is `Ok(None)` (refetch); an injected
-/// read fault or a corrupt frame is `Err` (degrade). Fixed clock, no sleep.
-///
-/// Classifying `Read::Unknown` as a hit reddens the miss case; dropping the
-/// `expired` guard reddens the expiry case — a stale serve either way.
+/// Batch probes preserve each position's value, presence, expiry, and error.
 #[test]
 fn get_batch_classifies_hits_misses_expiry_and_errors() -> Result<()> {
     let now = Arc::new(AtomicU64::new(1_000));
     let cache = test_db::cache_with_clock("get_batch_classify", Clock::Fixed(now.clone()))?;
     let c = fresh_collection("classify")?;
-    let present = Committed::new(Some(Bytes::from_static(b"v")));
+    let present = Committed::<Values>::new(Some(Bytes::from_static(b"v")));
 
     TEST_RUNTIME.block_on(async {
         // (1) Two present coordinates with DISTINCT payloads: an all-hit batch,
         // each position index-aligned to its own coordinate's value.
         cache
-            .put(&c, &batch_cell(0), &Committed::new(Some(bytes(0))), 0)
+            .put::<Values>(&c, &batch_cell(0), Committed::new(Some(bytes(0))), 0)
             .await?;
         cache
-            .put(&c, &batch_cell(1), &Committed::new(Some(bytes(1))), 0)
+            .put::<Values>(&c, &batch_cell(1), Committed::new(Some(bytes(1))), 0)
             .await?;
         let hits = cache
-            .get_batch(&c, Section::new(0), &batch_of([0, 1])?)
-            .await?
-            .ok_or_else(|| eyre!("an all-present batch classifies as Some"))?;
+            .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 1])?)
+            .await?;
         assert_eq!(hits.len(), 2, "both positions answered");
-        assert_eq!(hits[0].get(), Some(&bytes(0)), "position 0 serves coord 0");
-        assert_eq!(hits[1].get(), Some(&bytes(1)), "position 1 serves coord 1");
+        for (i, hit) in hits.iter().enumerate() {
+            let CacheRead::Hit((committed, _)) = hit else {
+                return Err(eyre!("every warm position must hit"));
+            };
+            assert_eq!(committed.get(), Some(&bytes(u8::try_from(i)?)));
+        }
+
+        cache
+            .put::<Presence>(&c, &batch_cell(5), Committed::new(Some(())), 3_000)
+            .await?;
+        assert!(matches!(
+            cache.get::<Values>(&c, &batch_cell(5)).await?,
+            CacheRead::Miss
+        ));
+        let CacheRead::Hit((presence, ttl)) = cache.get::<Presence>(&c, &batch_cell(5)).await?
+        else {
+            return Err(eyre!("presence frame must answer presence"));
+        };
+        assert_eq!(presence.get(), Some(&()));
+        assert_eq!(ttl, Some(CompactDuration::new(2)));
+        assert_eq!(cache.stored_expiry(&c, &batch_cell(5)).await?, Some(3_000));
+        let hits = cache
+            .get_batch::<Presence>(&c, Section::new(0), &batch_of([0, 5])?)
+            .await?;
+        assert!(
+            hits.iter().all(
+                |hit| matches!(hit, CacheRead::Hit((committed, _)) if committed.get().is_some())
+            )
+        );
 
         // (2) A coordinate that was never put: the batch misses.
         assert!(
             cache
-                .get_batch(&c, Section::new(0), &batch_of([0, 2])?)
+                .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 2])?)
                 .await?
-                .is_none(),
+                .iter()
+                .any(|hit| matches!(hit, CacheRead::Miss)),
             "an unwritten coordinate makes the batch a miss"
         );
 
         // (3) A floor-expired entry (stamped at 500, clock at 1_000): refetch.
-        cache.put(&c, &batch_cell(3), &present, 500).await?;
+        cache
+            .put::<Values>(&c, &batch_cell(3), present.clone(), 500)
+            .await?;
         assert!(
             cache
-                .get_batch(&c, Section::new(0), &batch_of([0, 3])?)
+                .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 3])?)
                 .await?
-                .is_none(),
+                .iter()
+                .any(|hit| matches!(hit, CacheRead::Expired)),
             "a floor-expired entry makes the batch a miss, never a stale hit"
         );
 
@@ -243,26 +276,75 @@ fn get_batch_classifies_hits_misses_expiry_and_errors() -> Result<()> {
         cache.fail_reads().store(true, Ordering::Relaxed);
         assert!(
             cache
-                .get_batch(&c, Section::new(0), &batch_of([0, 1])?)
+                .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 1])?)
                 .await
                 .is_err(),
             "an engine read fault degrades the batch to Err"
         );
         cache.fail_reads().store(false, Ordering::Relaxed);
 
-        // (5) A corrupt frame at a position fails the decode.
-        cache
-            .seed_raw_cell(&c, &batch_cell(4), Bytes::from_static(b"\x05corrupt"))
+        check_corrupt_repair(&cache, &c).await?;
+
+        now.store(3_000, Ordering::Relaxed);
+        assert!(matches!(
+            cache.get::<Values>(&c, &batch_cell(5)).await?,
+            CacheRead::Expired
+        ));
+        let probes = cache
+            .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 5])?)
             .await?;
-        assert!(
-            cache
-                .get_batch(&c, Section::new(0), &batch_of([0, 4])?)
-                .await
-                .is_err(),
-            "a corrupt frame degrades the batch to Err"
-        );
+        assert!(matches!(
+            probes.as_slice(),
+            [CacheRead::Hit(_), CacheRead::Expired]
+        ));
         Ok::<_, Report>(())
     })?;
+    Ok(())
+}
+
+/// A corrupt position does not change its neighbors. A fill repairs it.
+async fn check_corrupt_repair(cache: &FjallCellCache, c: &CollectionId) -> Result<()> {
+    cache
+        .inner
+        .handle()
+        .insert(cell_key(c, &batch_cell(4)).as_slice(), [0x05; 9])?;
+    assert!(matches!(
+        cache.get::<Values>(c, &batch_cell(4)).await?,
+        CacheRead::Corrupt
+    ));
+    let probes = cache
+        .get_batch::<Values>(c, Section::new(0), &batch_of([0, 4, 2, 3])?)
+        .await?;
+    assert!(matches!(
+        probes.as_slice(),
+        [
+            CacheRead::Hit(_),
+            CacheRead::Corrupt,
+            CacheRead::Miss,
+            CacheRead::Expired
+        ]
+    ));
+
+    let cached = Cached::new(cache.clone(), MemoryCellStore::new(MemoryCells::new()));
+    CellRead::<Values>::read(&cached, c, &batch_cell(4)).await?;
+    assert!(matches!(
+        cache.get::<Values>(c, &batch_cell(4)).await?,
+        CacheRead::Hit((value, _)) if value.get().is_none()
+    ));
+    cache
+        .inner
+        .handle()
+        .insert(cell_key(c, &batch_cell(4)).as_slice(), [0x05; 9])?;
+    CellRead::<Presence>::read_many(&cached, c, Section::new(0), &batch_of([0, 4])?).await?;
+    assert!(matches!(
+        cache.get::<Values>(c, &batch_cell(4)).await?,
+        CacheRead::Hit((value, _)) if value.get().is_none()
+    ));
+    assert!(matches!(
+        cache.get::<Values>(c, &batch_cell(0)).await?,
+        CacheRead::Hit((value, _)) if value.get() == Some(&bytes(0))
+    ));
+
     Ok(())
 }
 
@@ -285,21 +367,30 @@ fn delete_section_hops_delete_exactly_the_section() -> Result<()> {
             u32::try_from(i).unwrap_or(u32::MAX).to_be_bytes().to_vec(),
         ),
     };
-    let payload = Committed::new(Some(Bytes::from_static(b"v")));
+    let payload = Committed::<Values>::new(Some(Bytes::from_static(b"v")));
 
     TEST_RUNTIME.block_on(async {
         for i in 0..total {
-            cache.put(&c, &cell_in(0, i), &payload, 0).await?;
+            cache
+                .put::<Values>(&c, &cell_in(0, i), payload.clone(), 0)
+                .await?;
         }
-        cache.put(&c, &cell_in(1, 7), &payload, 0).await?;
-        cache.put(&other, &cell_in(0, 7), &payload, 0).await?;
+        cache
+            .put::<Values>(&c, &cell_in(1, 7), payload.clone(), 0)
+            .await?;
+        cache
+            .put::<Values>(&other, &cell_in(0, 7), payload.clone(), 0)
+            .await?;
 
         // Exclude two survivors, one in each hop region.
         let excluded = [cell_in(0, 3), cell_in(0, super::SCAN_HOP_ROWS + 9)];
         cache.delete_section(&c, Section::new(0), &excluded).await?;
 
         for i in 0..total {
-            let hit = matches!(cache.get(&c, &cell_in(0, i)).await?, CacheRead::Hit(_));
+            let hit = matches!(
+                cache.get::<Values>(&c, &cell_in(0, i)).await?,
+                CacheRead::Hit(_)
+            );
             let survives = excluded.iter().any(|cell| *cell == cell_in(0, i));
             assert_eq!(
                 hit, survives,
@@ -307,11 +398,17 @@ fn delete_section_hops_delete_exactly_the_section() -> Result<()> {
             );
         }
         assert!(
-            matches!(cache.get(&c, &cell_in(1, 7)).await?, CacheRead::Hit(_)),
+            matches!(
+                cache.get::<Values>(&c, &cell_in(1, 7)).await?,
+                CacheRead::Hit(_)
+            ),
             "the sibling section survives"
         );
         assert!(
-            matches!(cache.get(&other, &cell_in(0, 7)).await?, CacheRead::Hit(_)),
+            matches!(
+                cache.get::<Values>(&other, &cell_in(0, 7)).await?,
+                CacheRead::Hit(_)
+            ),
             "the sibling collection survives"
         );
         Ok::<_, Report>(())

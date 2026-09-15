@@ -183,9 +183,15 @@ pub trait DynMapState<Item: Send + 'static>: Send + Sync {
     /// running the resolver (a presence read through the dirty overlay).
     async fn contains_key(&self, key: String) -> Result<bool, ErasedStateError>;
 
-    /// Reads each key in input order as one isolated batch. Absent keys yield
+    /// Whether the map holds no live entries.
+    async fn is_empty(&self) -> Result<bool, ErasedStateError>;
+
+    /// Reads each key in input order as one aligned batch. Absent keys yield
     /// `None`, and duplicate keys retain their positions.
     async fn get_many(&self, keys: Vec<String>) -> Result<Vec<Option<Item>>, ErasedStateError>;
+
+    /// Tests each key for presence in input order as one aligned batch.
+    async fn contains_many(&self, keys: Vec<String>) -> Result<Vec<bool>, ErasedStateError>;
 
     /// Inserts or overwrites `key`. Rejects the JSON-null sentinel
     /// (`Permanent`).
@@ -694,12 +700,26 @@ where
             .map_err(|e| ErasedStateError::from_classified(&e))
     }
 
+    async fn is_empty(&self) -> Result<bool, ErasedStateError> {
+        self.handle
+            .is_empty()
+            .await
+            .map_err(|e| ErasedStateError::from_classified(&e))
+    }
+
     async fn get_many(
         &self,
         keys: Vec<String>,
     ) -> Result<Vec<Option<ResolvedOf<T>>>, ErasedStateError> {
         self.handle
             .get_many(&keys)
+            .await
+            .map_err(|e| ErasedStateError::from_classified(&e))
+    }
+
+    async fn contains_many(&self, keys: Vec<String>) -> Result<Vec<bool>, ErasedStateError> {
+        self.handle
+            .contains_many(&keys)
             .await
             .map_err(|e| ErasedStateError::from_classified(&e))
     }

@@ -2,6 +2,8 @@
 //! scripted handler double and error, message/trigger fixtures, the defer
 //! outcome trio, and the recording-session harness.
 
+use crate::state::cell::Values;
+use crate::state::store::CellRead;
 use crate::state::tests::support::StageInspection;
 use std::convert::Infallible;
 use std::future::{self, Future};
@@ -41,7 +43,6 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::{
     EventSession, KeyedStateSession, LifecycleAccess, SessionParts, TerminationWatch,
 };
-use crate::state::store::CellStore;
 use crate::state::tests::cell_suite::value_cell;
 use crate::state::tests::support::UnavailableState;
 use crate::state::{CollectionId, EventRef, PartitionBackend, StateKey, StateName, StateType};
@@ -162,9 +163,9 @@ pub async fn committed_value(
     cell_store: &MemoryCellStore,
     id: &CollectionId,
 ) -> color_eyre::Result<Option<Bytes>> {
-    cell_store
-        .get(id, &value_cell())
+    CellRead::<Values>::read(cell_store, id, &value_cell())
         .await
+        .map(|(committed, _)| committed)
         .map(Committed::into_inner)
         .map_err(|error| color_eyre::eyre::eyre!("read committed: {error}"))
 }

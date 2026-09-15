@@ -1,24 +1,22 @@
-//! The reader's read-through, byte-budgeted, TTL cache.
+//! A bounded cache for committed reader projections.
 //!
-//! `quick_cache` has no native TTL, so this module supplies one over it.
+//! Each entry records the read issue time and [`CacheEntry`] knowledge.
+//! [`Projection`] selects the answer. Presence reads do not copy cached
+//! payloads. The cache follows the lattice contract in [`crate::state::cell`].
 //!
-//! The cache records when each store read begins, not when it completes. TTL
-//! therefore bounds the age since the read began. A slow fill enters
-//! already-aged, so it cannot pass an old value off as fresh to a future
-//! reader.
+//! TTL bounds age from the start of the source read.
+//! A slow fill therefore enters the cache with its elapsed age.
+//! Expired entries cannot answer later reads. A completed fill returns its
+//! source result without another age check or read.
 //!
-//! The `age >= ttl` gate applies to cache hits only. A fill always serves the
-//! store result it just read. That result reflects committed state as of the
-//! fill's completion, so it is fresh no matter how long the fill took. Using
-//! the issue time only makes the cached entry expire conservatively for later
-//! readers. A completed fill is never re-checked and never re-run. The
-//! retry in [`ReaderCache::get_cached`] re-reads the key only after evicting
-//! the stale entry it just observed, so each pass either drops an entry or
-//! takes the fill guard. Cache admission is best-effort and never changes a
-//! successful store result into an error.
+//! Point reads share one fill for each missing key.
+//! Batch reads probe every key and write every filled position through the
+//! lattice. Cache admission does not change a successful source result into an
+//! error.
 
 use crate::Key;
 use crate::state::access::StateAccessError;
+use crate::state::cell::{CacheEntry, Projection, Read};
 use crate::state::cell_key::CellKey;
 use crate::state::store::CellBuffer;
 use crate::state::{StateName, StateType};
@@ -43,9 +41,8 @@ const READER_CACHE_ENTRY_INLINE_BYTES: u64 = (size_of::<CacheKey>() + size_of::<
 /// an entry never aliases another source across a snapshot reorder.
 pub(crate) type CacheKey = (SourceId, StateType, StateName, Key, CellKey);
 
-/// The cached value: the issue time and the committed bytes (or cached
-/// known-absence).
-type CacheVal = (Instant, Option<Bytes>);
+/// The issue time and the committed cache knowledge.
+type CacheVal = (Instant, CacheEntry<Bytes>);
 
 /// The concrete `quick_cache` instance the reader shares, byte-weighted and
 /// `ahash`-hashed.
@@ -67,18 +64,16 @@ impl Weighter<CacheKey, CacheVal> for ReaderWeighter {
             + 1
             + 1
             + cell.coordinate.as_bytes().len();
-        let val_bytes = val.1.as_ref().map_or(0, Bytes::len);
+        let val_bytes = match &val.1 {
+            CacheEntry::Value(bytes) => bytes.len(),
+            CacheEntry::Absent | CacheEntry::Exists => 0,
+        };
         key_bytes as u64 + val_bytes as u64 + READER_CACHE_ENTRY_INLINE_BYTES
     }
 }
 
-/// One read-through, TTL-bounded, byte-budgeted cache, shared by every reader
-/// drawing from a bundle. Clone shares the underlying `Arc`s.
-///
-/// A cache hit costs one allocation downstream. The shared cell decode copies
-/// its input when that input is shared, and the cache keeps a reference, so a
-/// hit's `Bytes` is always shared. The uncached store path stays zero-copy. The
-/// cache itself is zero-copy: every value is a `Bytes` refcount bump.
+/// One cache with a byte budget and TTL, shared across collection readers.
+/// Clones share the cache and clock. Value hits clone the `Bytes` handle.
 #[derive(Clone)]
 pub(crate) struct ReaderCache {
     inner: Arc<ReaderCacheInner>,
@@ -136,75 +131,100 @@ impl ReaderCache {
         self.clock.now().duration_since(issued) < ttl
     }
 
-    /// The read-through point read. Serve a fresh hit. Expire a stale hit,
-    /// removing it only if it still carries the observed issue time. Then
-    /// refill single-flight through `fill`.
+    /// Returns a fresh answer.
+    /// A placeholder replaces a stale entry or a fresh entry that cannot answer
+    /// this projection, so concurrent readers share one fill.
+    /// A failed fill restores the fresh entry.
     ///
     /// # Errors
     ///
     /// Propagates the store error from `fill`.
-    pub(crate) async fn get_cached<F, Fut>(
+    pub(crate) async fn get_cached<P: Projection, F, Fut>(
         &self,
         key: CacheKey,
         ttl: Duration,
         fill: F,
-    ) -> Result<Option<Bytes>, StateAccessError>
+    ) -> Result<Option<P::Payload>, StateAccessError>
     where
-        F: Fn() -> Fut,
-        Fut: Future<Output = Result<Option<Bytes>, StateAccessError>>,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Option<P::Payload>, StateAccessError>>,
     {
-        loop {
-            match self.inner.get_value_or_guard_async(&key).await {
-                Ok((issued, value)) => {
-                    if self.fresh(issued, ttl) {
-                        return Ok(value);
-                    }
-                    // Equal clock readings are interchangeable cache
-                    // observations. Removing either can only cause a refill.
-                    self.inner
-                        .remove_if(&key, |(observed, _)| *observed == issued);
+        let outcome = self
+            .inner
+            .entry_async(&key, |_, (issued, entry): &mut CacheVal| {
+                if !self.fresh(*issued, ttl) {
+                    return EntryAction::ReplaceWithGuard;
                 }
-                Err(guard) => {
-                    // Single-flight: we own the fill. Record its issue time.
-                    let issued = self.clock.now();
-                    let value = fill().await?;
-                    // The store answer remains valid if admission loses a race.
-                    drop(guard.insert((issued, value.clone())));
-                    return Ok(value);
+                match P::from_cached(entry.clone()) {
+                    Read::Present(value) => EntryAction::Retain(Some(value)),
+                    Read::Absent => EntryAction::Retain(None),
+                    Read::Unknown => EntryAction::ReplaceWithGuard,
                 }
+            })
+            .await;
+        let (guard, restore) = match outcome {
+            EntryResult::Retained(answer) => return Ok(answer),
+            // Restore fresh knowledge if the fill fails.
+            EntryResult::Replaced(guard, old) => (guard, self.fresh(old.0, ttl).then_some(old)),
+            EntryResult::Vacant(guard) => (guard, None),
+            // The callback never removes, and the async entry never times out.
+            // Answer from the store.
+            EntryResult::Removed(..) | EntryResult::Timeout => return fill().await,
+        };
+        let issued = self.clock.now();
+        match fill().await {
+            Ok(value) => {
+                drop(guard.insert((issued, P::into_cached(value.clone()))));
+                Ok(value)
+            }
+            Err(error) => {
+                if let Some(old) = restore {
+                    drop(guard.insert(old));
+                }
+                Err(error)
             }
         }
     }
 
     /// The read-through batch read, index-aligned to `keys`. Serves the batch
     /// entirely from the cache when every key is a fresh hit. Otherwise it
-    /// issues one batch store read through `fill`, writes each key back, and
+    /// issues one batch store read through `fill`, writes every position, and
     /// returns the store answers.
     ///
     /// # Errors
     ///
     /// Propagates the store error from `fill`.
-    pub(crate) async fn get_many_cached<F, Fut>(
+    pub(crate) async fn get_many_cached<P: Projection, F, Fut>(
         &self,
         keys: &[CacheKey],
         ttl: Duration,
         fill: F,
-    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError>
+    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<CellBuffer<Option<Bytes>>, StateAccessError>>,
+        Fut: Future<Output = Result<CellBuffer<Option<P::Payload>>, StateAccessError>>,
     {
-        let mut hits: CellBuffer<Option<Bytes>> = CellBuffer::with_capacity(keys.len());
+        let mut hits = CellBuffer::with_capacity(keys.len());
         for key in keys {
-            match self.inner.get(key) {
-                Some((issued, value)) if self.fresh(issued, ttl) => hits.push(value),
-                // A single miss refetches the whole batch, so probing the
-                // remaining keys is wasted work — stop at the first.
-                _ => break,
-            }
+            let hit = match self.inner.get(key) {
+                Some((issued, entry)) if self.fresh(issued, ttl) => P::from_cached(entry),
+                Some((issued, _)) => {
+                    self.inner
+                        .remove_if(key, |(observed, _)| *observed == issued);
+                    Read::Unknown
+                }
+                None => Read::Unknown,
+            };
+            hits.push(hit);
         }
-        if hits.len() == keys.len() {
-            return Ok(hits);
+        if hits.iter().all(|hit| !matches!(hit, Read::Unknown)) {
+            return Ok(hits
+                .into_iter()
+                .map(|hit| match hit {
+                    Read::Present(value) => Some(value),
+                    Read::Absent | Read::Unknown => None,
+                })
+                .collect());
         }
         // One shared issue time for the whole batch fill.
         let issued = self.clock.now();
@@ -214,19 +234,21 @@ impl ReaderCache {
         if fresh.len() != keys.len() {
             return Err(StateAccessError::misaligned_batch(fresh.len(), keys.len()));
         }
-        for (key, value) in keys.iter().zip(fresh.iter()) {
-            cooperative(self.write_through(key, issued, value.clone())).await;
+        for (key, value) in keys.iter().zip(&fresh) {
+            cooperative(self.write_through(key, issued, P::into_cached(value.clone()))).await;
         }
         Ok(fresh)
     }
 
     /// Writes `value` for `key`. A fill replaces an observation issued earlier.
-    /// Equal instants are interchangeable cache observations.
-    async fn write_through(&self, key: &CacheKey, issued: Instant, value: Option<Bytes>) {
+    /// Replacements follow the lattice contract in [`crate::state::cell`].
+    async fn write_through(&self, key: &CacheKey, issued: Instant, value: CacheEntry<Bytes>) {
         let outcome = self
             .inner
             .entry_async(key, |_, existing: &mut CacheVal| {
-                if issued > existing.0 {
+                // Equal issue times permit a value to refine presence.
+                let refines_presence = issued == existing.0 && existing.1.downgrades(&value);
+                if !value.downgrades(&existing.1) && (issued > existing.0 || refines_presence) {
                     *existing = (issued, value.clone());
                 }
                 EntryAction::Retain(())

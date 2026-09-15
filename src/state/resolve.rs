@@ -2,7 +2,9 @@
 
 use super::CommitDecision;
 use super::SHARD_FANOUT_CONCURRENCY;
-use super::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite, resolve_for_reader};
+use super::cell::{
+    Cell, Committed, Projection, ProvisionalCell, ProvisionalWrite, resolve_for_reader,
+};
 use super::cell_key::CellKey;
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::{EventMarker, MarkerState, ReaderEvidence};
@@ -33,7 +35,10 @@ impl<'a, S: CellStore> EvidenceLookup<'a, S> {
         }
     }
 
-    pub(crate) async fn resolve(&mut self, raw: Cell) -> Result<Committed, S::Error> {
+    pub(crate) async fn resolve<P: Projection>(
+        &mut self,
+        raw: Cell<P>,
+    ) -> Result<Committed<P>, S::Error> {
         if let Cell::Resolved(committed) = raw {
             return Ok(committed);
         }

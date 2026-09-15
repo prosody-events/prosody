@@ -1,13 +1,14 @@
-use super::read::fetch_marker_state;
+use super::projection::CassandraProjection;
+use super::read::{decode_point, fetch_batch, fetch_marker_state, fetch_point, page};
 use super::{
-    Arc, Bytes, CassandraCellResources, CassandraCellStoreError, CassandraSession, CellBuffer,
-    CellKey, CellQueries, CollectionId, CoordinateBatch, Scan, Section, Stream, TryStreamExt,
-    dedupe, expand_to_input_order, fetch_and_decode_cell, fetch_cells_batch, page_cells, pin_mut,
-    try_stream,
+    Arc, CassandraCellResources, CassandraCellStoreError, CassandraSession, CellBuffer, CellKey,
+    CellQueries, CollectionId, CoordinateBatch, Scan, Section, Stream, TryStreamExt, dedupe,
+    expand_to_input_order, pin_mut, try_stream,
 };
 use crate::state::cell::resolve_for_reader;
 use crate::state::marker::ReaderEvidence;
 use crate::state::resolve::sibling_committed;
+use crate::state_reader::{CellSource, CommittedCellSource};
 use futures::try_join;
 
 impl CassandraCellResources {
@@ -39,89 +40,68 @@ impl CassandraCellResources {
         })
     }
 
-    /// Returns one cell for a standalone reader.
-    ///
-    /// This read does not resolve markers or change durable state.
-    /// Positive evidence selects a provisional value; otherwise it returns
-    /// `prev`. An absent cell or a cell removed by a committed clear reads
-    /// `None`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CassandraCellStoreError`] on a store failure or a corrupt row
-    /// shape.
-    pub(crate) async fn read_committed(
+    /// Reads one projection through commit evidence without a durable write.
+    pub(crate) async fn read_committed<P: CassandraProjection>(
         &self,
         id: &CollectionId,
         cell: &CellKey,
-    ) -> Result<Option<Bytes>, CassandraCellStoreError> {
-        let (value, evidence) = try_join!(
-            fetch_and_decode_cell(&self.session, &self.queries.read_cell, id, cell),
-            self.reader_evidence(id)
+    ) -> Result<Option<P::Payload>, CassandraCellStoreError> {
+        let (row, evidence) = try_join!(
+            fetch_point::<P>(&self.session, &self.queries, id, cell),
+            self.reader_evidence(id),
         )?;
+        let value = row
+            .map(decode_point::<P>)
+            .transpose()?
+            .map(|(cell, _)| cell);
         Ok(value
             .filter(|_| evidence.survives(cell))
             .and_then(|value| resolve_for_reader(&value, &evidence).cloned()))
     }
 
-    /// The batch form of [`Self::read_committed`]. Reads one section's
-    /// coordinates in one `IN` query. `result[i]` answers `batch[i]`.
-    /// Duplicate coordinates share one
-    /// lookup, and an absent coordinate reads `None`. Only the committed value
-    /// is projected. The TTL column is ignored: the reader has no write-through
-    /// cache to mirror it into.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CassandraCellStoreError`] on a store failure or a corrupt row
-    /// shape.
-    pub(crate) async fn read_committed_many(
+    /// Reads one section's coordinates and returns answers in input order.
+    pub(crate) async fn read_committed_many<P: CassandraProjection>(
         &self,
         id: &CollectionId,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, CassandraCellStoreError> {
-        let (unique_coordinates, input_indices) = dedupe(batch);
+    ) -> Result<CellBuffer<Option<P::Payload>>, CassandraCellStoreError> {
+        let (coordinates, indices) = dedupe(batch);
         let (rows, evidence) = try_join!(
-            fetch_cells_batch(
-                &self.session,
-                &self.queries,
-                id,
-                section,
-                &unique_coordinates
-            ),
-            self.reader_evidence(id)
+            fetch_batch::<P>(&self.session, &self.queries, id, section, &coordinates),
+            self.reader_evidence(id),
         )?;
-        let unique_answers: CellBuffer<Option<Bytes>> = rows
+        let answers: CellBuffer<Option<P::Payload>> = rows
             .into_iter()
-            .zip(unique_coordinates)
+            .zip(coordinates)
             .map(|(row, coordinate)| {
                 let key = CellKey {
                     section,
                     coordinate: coordinate.clone(),
                 };
-                row.filter(|_| evidence.survives(&key))
-                    .and_then(|(cell, _)| resolve_for_reader(&cell, &evidence).cloned())
+                let cell = row
+                    .map(decode_point::<P>)
+                    .transpose()?
+                    .map(|(cell, _)| cell);
+                Ok(cell
+                    .filter(|_| evidence.survives(&key))
+                    .and_then(|cell| resolve_for_reader(&cell, &evidence).cloned()))
             })
-            .collect();
-        Ok(expand_to_input_order(&input_indices, &unique_answers))
+            .collect::<Result<_, CassandraCellStoreError>>()?;
+        Ok(expand_to_input_order(&indices, &answers))
     }
 
-    /// Scans cells for a standalone reader.
-    ///
-    /// This scan does not resolve markers or change durable state.
-    /// It returns cells in coordinate order.
-    /// The limit counts only returned cells.
-    ///
-    /// A committed clear restricts results to its frozen survivors.
-    pub(crate) fn scan_committed<'a>(
+    /// Scans committed projections in coordinate order through one evidence
+    /// snapshot.
+    pub(crate) fn scan_committed<'a, P: CassandraProjection>(
         &'a self,
         id: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), CassandraCellStoreError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), CassandraCellStoreError>> + Send + 'a
+    {
         let limit = scan.limit;
         try_stream! {
-            let pages = page_cells(&self.session, &self.queries, id, scan);
+            let pages = page::<P>(&self.session, &self.queries, id, scan);
             pin_mut!(pages);
             let (evidence, mut row) = try_join!(self.reader_evidence(id), pages.try_next())?;
             let mut yielded = 0usize;
@@ -136,5 +116,36 @@ impl CassandraCellResources {
                 row = pages.try_next().await?;
             }
         }
+    }
+}
+
+impl CellSource for CassandraCellResources {
+    type Error = CassandraCellStoreError;
+}
+
+impl<P: CassandraProjection> CommittedCellSource<P> for CassandraCellResources {
+    async fn load(
+        &self,
+        id: &CollectionId,
+        cell: &CellKey,
+    ) -> Result<Option<P::Payload>, Self::Error> {
+        self.read_committed::<P>(id, cell).await
+    }
+
+    async fn load_many(
+        &self,
+        id: &CollectionId,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<CellBuffer<Option<P::Payload>>, Self::Error> {
+        self.read_committed_many::<P>(id, section, batch).await
+    }
+
+    fn scan<'a>(
+        &'a self,
+        id: &'a CollectionId,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+        self.scan_committed::<P>(id, scan)
     }
 }

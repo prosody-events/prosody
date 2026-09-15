@@ -12,12 +12,13 @@ use crate::consumer::middleware::tests::test_support::TestLifecycleAccess;
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
 use crate::state::cell::Committed;
+use crate::state::cell::Values;
 use crate::state::descriptor::tests::{TestSession, test_session_parts};
 use crate::state::descriptor::{CellStateError, Registered, ValueHandle, value_state};
 use crate::state::memory::MemoryCellStore;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::sealed::StateLifecycle;
-use crate::state::store::CellStore;
+use crate::state::store::CellRead;
 use crate::state::tests::cell_suite::value_cell;
 use crate::state::{CollectionId, EventRef, StateKey, StateName, StateType, StoreOutcome};
 use color_eyre::eyre::{Result, bail, eyre};
@@ -233,9 +234,9 @@ async fn two_collections() -> Result<(Ctx, MemoryCellStore, CollectionId, Collec
 /// durable store — read through a foreign probe event, so a still-buffered
 /// write is invisible.
 async fn durably_present(cell_store: &MemoryCellStore, id: &CollectionId) -> Result<bool> {
-    cell_store
-        .get(id, &value_cell())
+    CellRead::<Values>::read(cell_store, id, &value_cell())
         .await
+        .map(|(committed, _)| committed)
         .map(|c| Committed::into_inner(c).is_some())
         .map_err(|e| eyre!("committed read: {e}"))
 }
