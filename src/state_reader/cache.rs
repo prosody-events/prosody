@@ -131,9 +131,10 @@ impl ReaderCache {
         self.clock.now().duration_since(issued) < ttl
     }
 
-    /// Serves a fresh answer. Retains a fresh entry that cannot answer this
-    /// projection, then fills and writes through the result. Removes a stale
-    /// entry only if its issue time is unchanged, then refills single-flight.
+    /// Returns a fresh answer.
+    /// A placeholder replaces a stale entry or a fresh entry that cannot answer
+    /// this projection, so concurrent readers share one fill.
+    /// A failed fill restores the fresh entry.
     ///
     /// # Errors
     ///
@@ -145,37 +146,42 @@ impl ReaderCache {
         fill: F,
     ) -> Result<Option<P::Payload>, StateAccessError>
     where
-        F: Fn() -> Fut,
+        F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Option<P::Payload>, StateAccessError>>,
     {
-        loop {
-            match self.inner.get_value_or_guard_async(&key).await {
-                Ok((issued, value)) => {
-                    if self.fresh(issued, ttl) {
-                        match P::from_cached(value) {
-                            Read::Present(value) => return Ok(Some(value)),
-                            Read::Absent => return Ok(None),
-                            Read::Unknown => {
-                                let issued = self.clock.now();
-                                let value = fill().await?;
-                                self.write_through(&key, issued, P::into_cached(value.clone()))
-                                    .await;
-                                return Ok(value);
-                            }
-                        }
-                    }
-                    self.inner.remove_if(&key, |(observed, _)| {
-                        *observed == issued && !self.fresh(*observed, ttl)
-                    });
+        let outcome = self
+            .inner
+            .entry_async(&key, |_, (issued, entry): &mut CacheVal| {
+                if !self.fresh(*issued, ttl) {
+                    return EntryAction::ReplaceWithGuard;
                 }
-                Err(guard) => {
-                    // Single-flight: we own the fill. Record its issue time.
-                    let issued = self.clock.now();
-                    let value = fill().await?;
-                    // The store answer remains valid if admission loses a race.
-                    drop(guard.insert((issued, P::into_cached(value.clone()))));
-                    return Ok(value);
+                match P::from_cached(entry.clone()) {
+                    Read::Present(value) => EntryAction::Retain(Some(value)),
+                    Read::Absent => EntryAction::Retain(None),
+                    Read::Unknown => EntryAction::ReplaceWithGuard,
                 }
+            })
+            .await;
+        let (guard, restore) = match outcome {
+            EntryResult::Retained(answer) => return Ok(answer),
+            // Restore fresh knowledge if the fill fails.
+            EntryResult::Replaced(guard, old) => (guard, self.fresh(old.0, ttl).then_some(old)),
+            EntryResult::Vacant(guard) => (guard, None),
+            // The callback never removes, and the async entry never times out.
+            // Answer from the store.
+            EntryResult::Removed(..) | EntryResult::Timeout => return fill().await,
+        };
+        let issued = self.clock.now();
+        match fill().await {
+            Ok(value) => {
+                drop(guard.insert((issued, P::into_cached(value.clone()))));
+                Ok(value)
+            }
+            Err(error) => {
+                if let Some(old) = restore {
+                    drop(guard.insert(old));
+                }
+                Err(error)
             }
         }
     }

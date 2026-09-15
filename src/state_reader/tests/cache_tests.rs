@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::task::yield_now;
 
 /// A cache key for the given collection name at cell coordinate `coord`.
 fn key_at(
@@ -347,11 +348,10 @@ async fn slow_fill_cannot_launder() -> Result<()> {
     Ok(())
 }
 
-/// Two concurrent cold gets of one key issue exactly ONE store fill
-/// (single-flight through the guard).
+/// Two concurrent value reads share one fill for a cold key or fresh presence.
 ///
-/// Falsify: replace `get_value_or_guard_async` with an unconditional read —
-/// both fill, `fills == 2`.
+/// Falsify: let `Read::Unknown` call `fill` without a guard.
+/// The presence upgrade then adds two fills instead of one.
 #[tokio::test]
 async fn cold_miss_is_single_flight() -> Result<()> {
     let (cache, _mock) = mock_clock_cache(1 << 20);
@@ -376,6 +376,28 @@ async fn cold_miss_is_single_flight() -> Result<()> {
         fills.load(Ordering::Relaxed),
         1,
         "single-flight: one fill serves both"
+    );
+
+    let k = key("single-flight-upgrade")?;
+    cache
+        .get_cached::<Presence, _, _>(k.clone(), ttl, || async { Ok(Some(())) })
+        .await?;
+    let before = fills.load(Ordering::Relaxed);
+    let upgrade = || async {
+        fills.fetch_add(1, Ordering::Relaxed);
+        yield_now().await;
+        Ok::<_, StateAccessError>(Some(Bytes::from_static(b"v")))
+    };
+    let (a, b) = tokio::join!(
+        cache.get_cached::<Values, _, _>(k.clone(), ttl, upgrade),
+        cache.get_cached::<Values, _, _>(k, ttl, upgrade),
+    );
+    assert_eq!(a?, Some(Bytes::from_static(b"v")));
+    assert_eq!(b?, Some(Bytes::from_static(b"v")));
+    assert_eq!(
+        fills.load(Ordering::Relaxed) - before,
+        1,
+        "one fill upgrades presence for both value readers"
     );
     Ok(())
 }
