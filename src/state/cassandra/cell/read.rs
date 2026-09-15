@@ -1,8 +1,10 @@
+//! Each projection selects its own statements, so a decoder cannot receive
+//! another projection's statements.
+
 use super::decode::{
     BatchRow, BorrowedMarkerRow, PointRow, ScanRow, blob_ttl, decode_body, decode_marker_row,
 };
 use super::projection::CassandraProjection;
-use super::queries::ReadStatements;
 use super::{
     CassandraCellStoreError, CassandraSession, CassandraStoreError, Cell, CellBuffer, CellKey,
     CellKind, CellQueries, CollectionId, Coordinate, Direction, Pk, Scan, ScanEdge, Section,
@@ -15,7 +17,7 @@ use bytes::Bytes;
 /// Fetches one projected cell with its durable TTL columns.
 pub(super) async fn fetch_point<P: CassandraProjection>(
     session: &CassandraSession,
-    statements: &ReadStatements,
+    queries: &CellQueries,
     id: &CollectionId,
     cell: &CellKey,
 ) -> Result<Option<PointRow<P>>, CassandraCellStoreError> {
@@ -23,7 +25,7 @@ pub(super) async fn fetch_point<P: CassandraProjection>(
     Ok(session
         .session()
         .execute_unpaged(
-            &statements.point,
+            &P::statements(queries).point,
             (
                 pk.segment_id,
                 pk.key,
@@ -45,7 +47,7 @@ pub(super) async fn fetch_point<P: CassandraProjection>(
 /// Fetches one batch and preserves input order before semantic decode.
 pub(super) async fn fetch_batch<P: CassandraProjection>(
     session: &CassandraSession,
-    statements: &ReadStatements,
+    queries: &CellQueries,
     id: &CollectionId,
     section: Section,
     coordinates: &[&Coordinate],
@@ -54,7 +56,7 @@ pub(super) async fn fetch_batch<P: CassandraProjection>(
     let result = session
         .session()
         .execute_unpaged(
-            &statements.batch,
+            &P::statements(queries).batch,
             (
                 pk.segment_id,
                 pk.key,
@@ -120,7 +122,7 @@ fn split_batch<P: CassandraProjection>(row: BatchRow<P>) -> (Bytes, PointRow<P>)
 /// Callers apply commit evidence and limits after decode.
 pub(super) fn page<'a, P: CassandraProjection>(
     session: &'a CassandraSession,
-    statements: &'a ReadStatements,
+    queries: &'a CellQueries,
     collection: &'a CollectionId,
     scan: Scan<'a>,
 ) -> impl Stream<Item = Result<(CellKey, Cell<P>), CassandraCellStoreError>> + Send + 'a {
@@ -130,7 +132,7 @@ pub(super) fn page<'a, P: CassandraProjection>(
     let end = scan.end.cloned();
     try_stream! {
         let pk = Pk::of(collection);
-        let statement = statements.scan.select(dir, start.kind());
+        let statement = P::statements(queries).scan.select(dir, start.kind());
         let pager = session
             .session()
             .execute_iter(

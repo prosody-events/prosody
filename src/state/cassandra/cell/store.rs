@@ -150,7 +150,7 @@ pub(super) fn stage_marker(marker: &EventMarker) -> Result<MarkerBlob, CellStore
 impl<P: CassandraProjection> CellRead<P> for CassandraStore {
     /// Reads one committed projection and its remaining durable TTL.
     async fn read(&self, id: &CollectionId, cell: &CellKey) -> Result<Durable<P>, CellStoreError> {
-        let row = fetch_point::<P>(&self.session, P::statements(&self.queries), id, cell)
+        let row = fetch_point::<P>(&self.session, &self.queries, id, cell)
             .await
             .map_err(ResolveCellError::Store)?;
         let (raw, ttl) = match row {
@@ -169,15 +169,9 @@ impl<P: CassandraProjection> CellRead<P> for CassandraStore {
         batch: &CoordinateBatch,
     ) -> Result<CacheBatch<P>, CellStoreError> {
         let (coordinates, indices) = dedupe(batch);
-        let rows = fetch_batch::<P>(
-            &self.session,
-            P::statements(&self.queries),
-            id,
-            section,
-            &coordinates,
-        )
-        .await
-        .map_err(ResolveCellError::Store)?;
+        let rows = fetch_batch::<P>(&self.session, &self.queries, id, section, &coordinates)
+            .await
+            .map_err(ResolveCellError::Store)?;
         let mut answers = CacheBatch::<P>::with_capacity(coordinates.len());
         let mut lookup = EvidenceLookup::new(self, id);
         for row in rows {
@@ -198,7 +192,7 @@ impl<P: CassandraProjection> CellRead<P> for CassandraStore {
     ) -> impl Stream<Item = Result<(CellKey, P::Payload), CellStoreError>> + Send + 'a {
         let limit = scan.limit;
         try_stream! {
-            let pages = page::<P>(&self.session, P::statements(&self.queries), collection, scan);
+            let pages = page::<P>(&self.session, &self.queries, collection, scan);
             pin_mut!(pages);
 
             let mut lookup = EvidenceLookup::new(self, collection);

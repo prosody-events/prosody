@@ -1,7 +1,6 @@
 #[cfg(test)]
 use super::Ordering;
 use super::batch::marker_delete_unit;
-use super::projection::CassandraProjection;
 use super::read::{decode_point, fetch_batch, fetch_marker_state, fetch_point};
 use super::{
     BatchUnit, Bytes, CassandraStore, Cell, CellAddr, CellBatchRow, CellBuffer, CellKey, CellKind,
@@ -32,14 +31,9 @@ impl CellStore for CassandraStore {
         self.counters
             .cell_point_reads
             .fetch_add(1, Ordering::Relaxed);
-        let Some(row) = fetch_point::<Values>(
-            &self.session,
-            Values::statements(&self.queries),
-            collection,
-            cell,
-        )
-        .await
-        .map_err(ResolveCellError::Store)?
+        let Some(row) = fetch_point::<Values>(&self.session, &self.queries, collection, cell)
+            .await
+            .map_err(ResolveCellError::Store)?
         else {
             return Ok(None);
         };
@@ -67,7 +61,7 @@ impl CellStore for CassandraStore {
         // It leaves marker state unchanged, as `provisional_cell_at` does.
         let rows = fetch_batch::<Values>(
             &self.session,
-            Values::statements(&self.queries),
+            &self.queries,
             collection,
             section,
             &unique_coordinates,

@@ -47,7 +47,7 @@ impl CassandraCellResources {
         cell: &CellKey,
     ) -> Result<Option<P::Payload>, CassandraCellStoreError> {
         let (row, evidence) = try_join!(
-            fetch_point::<P>(&self.session, P::statements(&self.queries), id, cell),
+            fetch_point::<P>(&self.session, &self.queries, id, cell),
             self.reader_evidence(id),
         )?;
         let value = row
@@ -68,13 +68,7 @@ impl CassandraCellResources {
     ) -> Result<CellBuffer<Option<P::Payload>>, CassandraCellStoreError> {
         let (coordinates, indices) = dedupe(batch);
         let (rows, evidence) = try_join!(
-            fetch_batch::<P>(
-                &self.session,
-                P::statements(&self.queries),
-                id,
-                section,
-                &coordinates
-            ),
+            fetch_batch::<P>(&self.session, &self.queries, id, section, &coordinates),
             self.reader_evidence(id),
         )?;
         let answers: CellBuffer<Option<P::Payload>> = rows
@@ -107,7 +101,7 @@ impl CassandraCellResources {
     {
         let limit = scan.limit;
         try_stream! {
-            let pages = page::<P>(&self.session, P::statements(&self.queries), id, scan);
+            let pages = page::<P>(&self.session, &self.queries, id, scan);
             pin_mut!(pages);
             let (evidence, mut row) = try_join!(self.reader_evidence(id), pages.try_next())?;
             let mut yielded = 0usize;
