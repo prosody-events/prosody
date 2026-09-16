@@ -264,10 +264,9 @@ impl Codec for MapKeysetKey {
 ///
 /// # Invariant: `KeysetPresence`
 ///
-/// A **live entry cell implies a present keyset cell** — equivalently, an
-/// absent keyset implies no live entries, so `stream` may return empty with
-/// zero entry reads (an empty coordinate plan — zero
-/// coordinates, so no point gets and no scan). Three rules hold it:
+/// A **live entry cell implies a present keyset cell**. An absent keyset
+/// implies no live entries, so `stream` returns an empty coordinate plan.
+/// That plan performs no entry reads or scans. Three rules hold it:
 ///
 /// * every `set` leaves a keyset cell present. It writes one whenever the
 ///   pre-write read is `Absent` or `Malformed`, or whenever the frame must
@@ -690,11 +689,10 @@ where
     /// point-got in chunks. A query limit sizes the first chunk; later chunks
     /// double up to `CELL_BATCH`. A whole chunk projects before it emits, so a
     /// limit also moves the first error boundary. Keys added after init are not
-    /// yielded; **values are read live, chunk by chunk** — a key
-    /// removed/cleared/expired after init reads absent (skipped, the
-    /// current-membership skip) and an overwritten key yields the newer value
-    /// when its chunk is fetched. So a warm small map streams entirely from
-    /// cache with zero durable scans.
+    /// yielded. **Values are read live, chunk by chunk**. Removed, cleared, or
+    /// expired keys read as absent and are skipped. Overwritten keys yield the
+    /// newer value when their chunk is fetched. A warm small map streams
+    /// entirely from cache with zero durable scans.
     ///
     /// An `Overflowed`, malformed, oversized, or otherwise undecodable keyset
     /// degrades to a **full-section** (`Unbounded`-edged) scan. That scan pages
@@ -712,11 +710,9 @@ where
     /// (point) arm then takes it once per chunk. Admission covers the batch
     /// fetch and is released before the chunk is decoded and resolved. The
     /// degraded scan arm takes no admission after init and pages gate-free.
-    /// Neither arm holds admission across a yield, for items and errors alike,
-    /// so a handler may mutate this map between stream items without deadlock
-    /// (`StreamYieldFree`, over the per-event session operation gate). A
-    /// failing chunk yields none of its items. A chunk emits all its live
-    /// entries or only its error.
+    /// Neither arm holds admission across an item or error yield.
+    /// A handler may mutate this map between items without deadlock under
+    /// `StreamYieldFree`. A chunk emits all its live entries or only its error.
     pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapStreamItem<KC, V>> + '_
     where
         for<'s> ContextOf<'s, V>: FromSession<'s, S>,

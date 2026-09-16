@@ -150,11 +150,10 @@ pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
 pub(crate) const SHARD_FANOUT_CONCURRENCY: usize = 8;
 
 /// Maximum concurrent typed resolves within an aligned batch read or a range
-/// scan's resolution window. This bounds the loader fan-out for each read. A
-/// resolve reads the collection's source (a Kafka message for a loader-backed
-/// collection), which does not contend on the
-/// collection's Scylla shard, so it is not bounded by
-/// [`SHARD_FANOUT_CONCURRENCY`] (that bounds same-shard round-trip overlap).
+/// scan's resolution window. This bounds the loader fan-out for each read.
+/// A resolve reads the collection's source, such as a Kafka message.
+/// It does not contend on the collection's Scylla shard.
+/// [`SHARD_FANOUT_CONCURRENCY`] bounds overlapping round trips to that shard.
 /// A batch's resolves fan out across the WHOLE call under this window, so the
 /// resolves overlap rather than serialize per store sub-batch.
 ///

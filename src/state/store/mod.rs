@@ -38,6 +38,10 @@ pub use super::store_types::{CacheBatch, CellBuffer, CommittedBatch, CoordinateB
 /// expectation, capped at the transport maximum. Each later fetch doubles,
 /// up to that maximum. Rows a filter hides therefore cost O(log n) extra
 /// round trips, never one round trip per hidden row.
+///
+/// Do not add a first-fetch floor. A value page carries payloads, so a floor
+/// would spend bandwidth on every small query. It saves round trips only
+/// when many rows are hidden.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FetchSchedule {
     next: NonZeroUsize,
