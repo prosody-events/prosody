@@ -14,9 +14,11 @@ use crate::state::marker::MarkerState;
 use crate::state::store::FetchSchedule;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
+use futures::future::Either;
+use futures::{TryStreamExt, pin_mut};
 use scylla::response::PagingState;
+use scylla::serialize::row::SerializeRow;
 use scylla::statement::prepared::PreparedStatement;
-use std::future::ready;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
@@ -138,44 +140,75 @@ pub(super) fn page<'a, P: CassandraProjection>(
     let end = scan.end.cloned();
     try_stream! {
         let pk = Pk::of(collection);
-        let statement = P::statements(queries).scan.select(dir, start.kind());
+        let prepared = P::statements(queries).scan.select(dir, start.kind());
+        let start = start.as_ref();
+        let values = (
+            pk.segment_id, pk.key, pk.state_type, pk.name,
+            CellKind::Cell, section, start.anchor(),
+        );
+        // Unbounded demand streams through the driver pager, which reads one
+        // page ahead in its own task. Bounded demand fetches a page schedule
+        // sized to the demand; after the limit ends paging, a prefetched page
+        // would be wasted.
+        let rows = match scan.fetch_hint {
+            None => {
+                let pager = session
+                    .session()
+                    .execute_iter(prepared.clone(), values)
+                    .await
+                    .map_err(CassandraStoreError::from)?;
+                Either::Left(
+                    pager
+                        .rows_stream::<ScanRow<P>>()
+                        .map_err(CassandraStoreError::from)?
+                        .map_err(CassandraStoreError::from)
+                        .map_err(CassandraCellStoreError::from),
+                )
+            }
+            Some(first) => Either::Right(scheduled_rows::<P, _>(
+                session, prepared, values, first,
+            )),
+        };
+        pin_mut!(rows);
+        while let Some(row) = cooperative(rows.try_next()).await? {
+            let (section, coordinate, data, prev, encoding, version, event) = row;
+            let key = CellKey {
+                section: Section::new(section),
+                coordinate: Coordinate::from_bytes(coordinate),
+            };
+            let cell = decode_body::<P>((data, prev, encoding, version, event))?;
+            if past_end(dir, &key, end.as_ref()) {
+                break;
+            }
+            yield (key, cell);
+        }
+    }
+}
+
+/// Fetches pages one at a time. The first page holds `first` rows and each
+/// later page doubles, up to the prepared statement's page size.
+fn scheduled_rows<P: CassandraProjection, V: SerializeRow + Send + Sync>(
+    session: &CassandraSession,
+    prepared: &PreparedStatement,
+    values: V,
+    first: NonZeroUsize,
+) -> impl Stream<Item = Result<ScanRow<P>, CassandraCellStoreError>> + Send {
+    try_stream! {
         // Scylla rejects a non-positive page size, so this fallback is unreachable.
-        let page_size = NonZeroUsize::new(usize::try_from(statement.get_page_size()).unwrap_or(0))
+        let page_size = NonZeroUsize::new(usize::try_from(prepared.get_page_size()).unwrap_or(0))
             .unwrap_or(NonZeroUsize::MIN);
-        let mut fetch = FetchSchedule::new(scan.fetch_hint, page_size);
+        let mut fetch = FetchSchedule::new(Some(first), page_size);
         let mut paging_state = PagingState::start();
-        'pages: loop {
-            let statement = scan_statement(statement, fetch.next());
+        loop {
+            let statement = scan_statement(prepared, fetch.next());
             let (result, response) = session
                 .session()
-                .execute_single_page(
-                    &statement,
-                    (
-                        pk.segment_id,
-                        pk.key,
-                        pk.state_type,
-                        pk.name,
-                        CellKind::Cell,
-                        section,
-                        start.as_ref().anchor(),
-                    ),
-                    paging_state,
-                )
+                .execute_single_page(&statement, &values, paging_state)
                 .await
                 .map_err(CassandraStoreError::from)?;
             let rows = result.into_rows_result().map_err(CassandraStoreError::from)?;
             for row in rows.rows::<ScanRow<P>>().map_err(CassandraStoreError::from)? {
-                let row = cooperative(ready(row)).await.map_err(CassandraStoreError::from)?;
-                let (section, coordinate, data, prev, encoding, version, event) = row;
-                let key = CellKey {
-                    section: Section::new(section),
-                    coordinate: Coordinate::from_bytes(coordinate),
-                };
-                let cell = decode_body::<P>((data, prev, encoding, version, event))?;
-                if past_end(dir, &key, end.as_ref()) {
-                    break 'pages;
-                }
-                yield (key, cell);
+                yield row.map_err(CassandraStoreError::from)?;
             }
             match response.into_paging_control_flow() {
                 ControlFlow::Break(()) => break,
