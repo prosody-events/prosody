@@ -191,7 +191,8 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
     }
 }
 
-/// Reads aligned chunks under admission. The first chunk is sized to the limit.
+/// Reads aligned chunks under admission. [`Projection::demand`] sizes the
+/// first chunk from the limit.
 /// Each later chunk doubles up to `CELL_BATCH`, so a hole in the keyset costs
 /// at most one extra round trip per doubling. A whole chunk must project
 /// successfully before it emits any item.
@@ -294,7 +295,9 @@ where
             // window, so a small query starts no more resolves than it needs.
             // Ruling: the range window matches the coordinate arm. Resolves read
             // the loader, not the shard, so `SHARD_FANOUT_CONCURRENCY` does not
-            // apply here.
+            // apply here. An unlimited stream that stops early has already
+            // started up to a window of resolves. A caller that stops early
+            // bounds its demand with a limit.
             .buffered(window);
         futures::pin_mut!(inner);
         while let Some(item) = inner.next().await {

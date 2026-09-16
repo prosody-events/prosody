@@ -1040,18 +1040,13 @@ impl CellModel {
     }
 }
 
-/// Drives random ops over an [`Overlay`] of a multi-cell collection — dirty
-/// buffering, section clears, committed writes, and range scans
-/// **intermixed** — asserting both the range leg (each `Scan` op vs the
-/// sorted-map oracle, incl. early-stop) and the point leg (`get` per cell of
-/// every sampled section vs the dirty-over-committed oracle, after **every**
-/// op). This is the unified view property: point reads, range reads, and
-/// writes interleave so their interaction is exercised, not just each in
-/// isolation (dirty-wins, clear-hides, the dirty clear marker hiding the
-/// lower leg **of exactly its section** — the [`SECTIONS`] sampling makes a
-/// marker consulted at the wrong section visible to both legs — bounds,
-/// direction, limit; unified-view soundness and oracle-correctness
-/// properties).
+/// Checks interleaved operations on a multi-cell [`Overlay`] against a
+/// sorted-map oracle. The trace mixes dirty writes, section clears,
+/// committed writes, and scans with varied bounds, direction, and fetch hints.
+/// Each scan checks the visible range, including early stops.
+/// After every operation, point reads check every cell in each sampled section.
+/// Dirty writes win, and clears hide only their own section's lower cells.
+/// [`SECTIONS`] sampling detects a marker read from the wrong section.
 pub(crate) async fn run_overlay_trace<S>(lower: S, trace: OverlayTrace) -> Result<bool>
 where
     S: CellStore,

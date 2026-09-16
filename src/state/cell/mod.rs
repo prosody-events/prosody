@@ -116,8 +116,8 @@ impl<B> CacheEntry<B> {
 impl Projection for Values {
     type Payload = Bytes;
 
-    const NAME: &'static str = "values";
     const FETCH_FLOOR: NonZeroUsize = NonZeroUsize::MIN;
+    const NAME: &'static str = "values";
 
     fn from_value(bytes: Bytes) -> Self::Payload {
         bytes
@@ -139,8 +139,8 @@ impl Projection for Values {
 impl Projection for Presence {
     type Payload = ();
 
-    const NAME: &'static str = "presence";
     const FETCH_FLOOR: NonZeroUsize = CELL_BATCH;
+    const NAME: &'static str = "presence";
 
     fn from_value(_bytes: Bytes) -> Self::Payload {}
 
