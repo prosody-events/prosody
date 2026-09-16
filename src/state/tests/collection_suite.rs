@@ -1630,7 +1630,7 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
     // A valid `I64KeyCodec` coordinate (8 bytes) whose value bytes are not
     // valid JSON — present to a presence read, undecodable to a value read.
     let key = 0_i64;
-    let coordinate = I64KeyCodec::encode(&key);
+    let coordinates = [key, key + 1, key + 2].map(|key| I64KeyCodec::encode(&key));
     let bad_value = Bytes::from(vec![0xFF, 0xFF]);
 
     // Tracked lists the key; Overflowed degrades to the full-section scan. Both
@@ -1656,15 +1656,9 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
             &collection_ref,
             &[
                 (keyset_cell(), Some(keyset_frame)),
-                (entry_cell_for(&coordinate), Some(bad_value.clone())),
-                (
-                    entry_cell_for(&I64KeyCodec::encode(&(key + 1))),
-                    Some(bad_value.clone()),
-                ),
-                (
-                    entry_cell_for(&I64KeyCodec::encode(&(key + 2))),
-                    Some(bad_value.clone()),
-                ),
+                (entry_cell_for(&coordinates[0]), Some(bad_value.clone())),
+                (entry_cell_for(&coordinates[1]), Some(bad_value.clone())),
+                (entry_cell_for(&coordinates[2]), Some(bad_value.clone())),
             ],
             &[],
         ))?;

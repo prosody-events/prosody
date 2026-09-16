@@ -43,6 +43,7 @@ pub trait Projection: Copy + Send + Sync + 'static + sealed::Sealed {
     const FETCH_FLOOR: NonZeroUsize;
 
     /// Sizes the first fetch from a result limit.
+    #[must_use]
     fn demand(limit: Option<NonZeroUsize>) -> Option<NonZeroUsize> {
         limit.map(|n| n.max(Self::FETCH_FLOOR))
     }
