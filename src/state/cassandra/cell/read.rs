@@ -197,10 +197,11 @@ fn scheduled_rows<P: CassandraProjection, V: SerializeRow + Send + Sync>(
     page_size: NonZeroUsize,
 ) -> impl Stream<Item = Result<ScanRow<P>, CassandraCellStoreError>> + Send {
     try_stream! {
+        let mut statement = prepared.clone();
         let mut fetch = FetchSchedule::new(Some(first), page_size);
         let mut paging_state = PagingState::start();
         loop {
-            let statement = scan_statement(prepared, fetch.next());
+            statement.set_page_size(i32::try_from(fetch.next().get()).unwrap_or(i32::MAX));
             let (result, response) = session
                 .session()
                 .execute_single_page(&statement, &values, paging_state)
@@ -216,16 +217,6 @@ fn scheduled_rows<P: CassandraProjection, V: SerializeRow + Send + Sync>(
             }
         }
     }
-}
-
-/// Sets the fetch size on a cloned prepared statement.
-pub(super) fn scan_statement(
-    statement: &PreparedStatement,
-    size: NonZeroUsize,
-) -> PreparedStatement {
-    let mut statement = statement.clone();
-    statement.set_page_size(i32::try_from(size.get()).unwrap_or(i32::MAX));
-    statement
 }
 
 /// Whether `key` has walked past the in-code `end` edge for the scan

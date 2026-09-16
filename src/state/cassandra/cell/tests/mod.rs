@@ -17,7 +17,6 @@ mod batch_order;
 mod batch_reads;
 mod compatibility;
 mod lifecycle;
-mod paging;
 mod properties;
 mod repair;
 mod ttl_marker;
