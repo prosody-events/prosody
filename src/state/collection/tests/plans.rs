@@ -12,6 +12,7 @@
 use crate::codec::{I64Codec, I64CodecError};
 use crate::consumer::middleware::RepinProof;
 use crate::loader::MemoryLoader;
+use crate::state::cell::Values;
 use crate::state::cell_key::{CellKey, Direction};
 use crate::state::collection::{
     Collection, CollectionRead, CollectionWrite, StateSession, collection_layout,
@@ -270,7 +271,7 @@ fn range_plan_terminates_at_first_error() -> Result<()> {
         let plan = cells
             .read(async |op| op.range(PlainLayout::CELLS, Direction::Forward))
             .await;
-        let stream = plan.entries();
+        let stream = plan.projected::<Values>();
         futures::pin_mut!(stream);
         let mut items = Vec::new();
         while let Some(item) = stream.next().await {
@@ -309,7 +310,7 @@ async fn coordinate_plan_fences_after_its_last_item() -> Result<()> {
     let plan = cells
         .read(async |op| op.coordinates(PlainLayout::CELLS, vec![7_i64]))
         .await;
-    let stream = plan.entries();
+    let stream = plan.projected::<Values>();
     futures::pin_mut!(stream);
     match stream.next().await {
         Some(Ok((7, 7))) => {}
@@ -393,11 +394,11 @@ fn plan_streams_are_send() -> Result<()> {
         let range = cells
             .read(async |op| op.range(GatedLayout::CELLS, Direction::Forward))
             .await;
-        assert_send(range.entries());
+        assert_send(range.projected::<Values>());
         let points = cells
             .read(async |op| op.coordinates(GatedLayout::CELLS, Vec::new()))
             .await;
-        assert_send(points.entries());
+        assert_send(points.projected::<Values>());
         Ok(())
     })
 }
@@ -410,7 +411,6 @@ fn gate_session(ladder: Arc<GateLadder>) -> Result<GateSession> {
         GateLoader(ladder),
         value_registry(&descriptor)?,
         StateKey::new(Uuid::new_v4(), Arc::from("gate")),
-        Arc::default(),
         false,
     );
     Ok(KeyedStateSession::new(parts))
@@ -477,7 +477,7 @@ async fn ranged_keys(release: &[usize]) -> Result<Vec<i64>> {
         .read(async |op| op.range(GatedLayout::CELLS, Direction::Forward))
         .await;
     let collector = async {
-        let stream = plan.entries();
+        let stream = plan.projected::<Values>();
         futures::pin_mut!(stream);
         let mut keys = Vec::new();
         while let Some(item) = stream.next().await {

@@ -10,32 +10,34 @@
 //! [`prop_cached_is_transparent`] compares cached and uncached stores.
 //! Both stores must return the same result after every generated operation.
 
+use crate::state::cell::{CacheEntry, Presence, Projection, Read, Values};
+use crate::state::store::{CacheBatch, CellBackend, CellRead, CommittedBatch, Durable};
+
 use super::super::cached::{Cached, DELETE_RETRY_BUDGET};
 use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
-use super::super::fjall::Clock;
 use super::super::fjall::test_db;
+use super::super::fjall::{Clock, FjallCellCache};
 use super::super::marker::{EventMarker, SectionClear};
 use super::super::memory::{MemoryCellStore, MemoryCells};
-use super::super::oracle::CommitOracle;
-use super::super::registry::CollectionDefRegistry;
-use super::super::resolve::sweep_provisional;
-use super::super::store::{CellBuffer, CellStore, CoordinateBatch, PresenceBatch};
+use super::super::store::{CellBuffer, CellStore, CoordinateBatch};
 use super::super::{CollectionId, CollectionRef, EventRef};
 use super::cell_suite::{
-    BatchReadTrace, FailingCellStore, MemoryShapeProbe, OverlayTrace, Poison, PoisonHandle,
-    SECTION, ScanTrace, ScriptedOracle, Trace, bytes, cell_at, run_batch_read_parity_trace,
-    run_bottom_scan_trace, run_crash_equivalence_trace, run_overlay_trace,
-    stage_deferred_repair_shape,
+    FailingCellStore, MemoryDeduplicationStore, MemoryShapeProbe, OverlayTrace, Poison,
+    PoisonHandle, SECTION, ScanTrace, Trace, bytes, cell_at, run_bottom_scan_trace,
+    run_crash_equivalence_trace, run_overlay_trace,
 };
 use super::support::{
-    CountingCellStore, HoldingCellStore, batch_of, fresh_collection as collection, probe,
+    CountProjection, CountingCellStore, HoldingCellStore, batch_of, fresh_collection as collection,
+    probe,
 };
 use crate::error::ErrorCategory;
+use crate::state::marker::MarkerState;
+use crate::state::tests::support::{admit_collection, evidence, seed_commit_evidence};
 use crate::test_util::{GlobalMetrics, TEST_RUNTIME, labels};
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
-use color_eyre::eyre::{Result, ensure, eyre};
+use color_eyre::eyre::{Result, eyre};
 use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -43,30 +45,18 @@ use std::future::Future;
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use uuid::Uuid;
 
 /// Builds a production-shaped `Cached` over the shared fjall database (the
 /// `name` warm-reuse keyspace pair) and the shared memory cells.
-fn cached_over(
-    cells: &MemoryCells,
-    oracle: &ScriptedOracle,
-    name: &str,
-) -> Result<Cached<MemoryCellStore<ScriptedOracle>>> {
-    let lower = MemoryCellStore::new(
-        cells.clone(),
-        oracle.clone(),
-        Arc::new(CollectionDefRegistry::default()),
-    );
+fn cached_over(cells: &MemoryCells, name: &str) -> Result<Cached<MemoryCellStore>> {
+    let lower = MemoryCellStore::new(cells.clone());
     Ok(Cached::new(test_db::cache(name)?, lower))
 }
 
-/// A memory-backed [`CellStore`] that surfaces each present row's remaining TTL
-/// the way Cassandra's `TTL(data)` does — whole seconds, FLOORED, computed
-/// against the shared fixed [`Clock`] from one absolute `death` — so the
-/// cache's read-fill re-stamp (`expiry_for`) is reachable over memory. The
-/// plain memory store reports `None`, which makes that arithmetic structurally
-/// unreachable. Every other operation delegates to an inner
-/// [`CountingCellStore`], preserving its read/scan counters.
+/// A memory store that supplies a fixed row expiry for every projection.
+/// An absent projection can retain a row TTL, as a provisional cell can.
+/// The shared clock supplies the remaining whole seconds.
+/// Other operations preserve the inner store's counters.
 #[derive(Clone)]
 struct TtlAwareCellStore<S> {
     inner: CountingCellStore<S>,
@@ -101,72 +91,49 @@ impl<S> TtlAwareCellStore<S> {
     }
 }
 
-impl<S> CellStore for TtlAwareCellStore<S>
-where
-    S: CellStore,
-{
+impl<S: CellBackend> CellBackend for TtlAwareCellStore<S> {
     type Error = S::Error;
+}
 
-    fn get<'a>(
+impl<S: CellRead<P>, P: CountProjection> CellRead<P> for TtlAwareCellStore<S> {
+    async fn read<'a>(
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-        own: EventRef,
-    ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
-        self.inner.get(collection, cell, own)
+    ) -> Result<Durable<P>, Self::Error> {
+        {
+            let (committed, _) = CellRead::<P>::read(&self.inner, collection, cell).await?;
+            Ok((committed, self.remaining()))
+        }
     }
 
-    fn scan_cells<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-        own: EventRef,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        self.inner.scan_cells(collection, scan, own)
-    }
-
-    fn scan_keys<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-        own: EventRef,
-    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
-        self.inner.scan_keys(collection, scan, own)
-    }
-
-    fn contains_many<'a>(
+    async fn read_many<'a>(
         &'a self,
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-        own: EventRef,
-    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send + 'a {
-        self.inner.contains_many(collection, section, batch, own)
+    ) -> Result<CacheBatch<P>, Self::Error> {
+        let mut cells = CellRead::<P>::read_many(&self.inner, collection, section, batch).await?;
+        let remaining = self.remaining();
+        for (_, ttl) in &mut cells {
+            *ttl = remaining;
+        }
+        Ok(cells)
     }
 
-    async fn get_for_cache<'a>(
+    fn scan<'a>(
         &'a self,
         collection: &'a CollectionId,
-        cell: &'a CellKey,
-        own: EventRef,
-    ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
-        let (committed, _) = self.inner.get_for_cache(collection, cell, own).await?;
-        // A present row carries a live remaining TTL; an absent row has none.
-        let remaining = committed
-            .get()
-            .is_some()
-            .then(|| self.remaining())
-            .flatten();
-        Ok((committed, remaining))
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+        CellRead::<P>::scan(&self.inner, collection, scan)
     }
+}
 
-    fn provisional_cells<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
-        self.inner.provisional_cells(collection)
-    }
-
+impl<S> CellStore for TtlAwareCellStore<S>
+where
+    S: CellStore,
+{
     fn provisional_cell_at<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -211,20 +178,20 @@ where
         self.inner.mark_resolved(collection, cells)
     }
 
-    fn unsettled_marker<'a>(
+    async fn marker_state<'a>(
         &'a self,
         collection: &'a CollectionId,
-    ) -> impl Future<Output = Result<Option<EventMarker>, Self::Error>> + Send + 'a {
-        self.inner.unsettled_marker(collection)
+    ) -> Result<MarkerState, Self::Error> {
+        self.inner.marker_state(collection).await
     }
 
     fn commit_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
+        marker: &'a EventMarker,
         writes: &'a [(CellKey, ProvisionalWrite)],
-        clears: &'a [SectionClear],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
-        self.inner.commit_provisional(collection, writes, clears)
+        self.inner.commit_provisional(collection, marker, writes)
     }
 
     fn abort_provisional<'a>(
@@ -244,9 +211,8 @@ where
 #[test]
 fn prop_memory_cached_overlay_view() {
     fn property(trace: OverlayTrace) -> Result<bool> {
-        let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let lower = cached_over(&cells, &oracle, "overlay")?;
+        let lower = cached_over(&cells, "overlay")?;
         TEST_RUNTIME.block_on(run_overlay_trace(lower, trace))
     }
     QuickCheck::new().quickcheck(property as fn(OverlayTrace) -> Result<bool>);
@@ -260,7 +226,6 @@ async fn scan_forward<S>(
     id: &CollectionId,
     start: u8,
     end: ScanEdge<u8>,
-    own: EventRef,
 ) -> Result<Vec<(Vec<u8>, Bytes)>>
 where
     S: CellStore,
@@ -273,250 +238,15 @@ where
         dir: Direction::Forward,
         end: end_c.as_ref(),
         limit: None,
+        fetch_hint: None,
     };
-    let stream = store.scan_cells(id, scan, own);
+    let stream = CellRead::<Values>::scan(store, id, scan);
     futures::pin_mut!(stream);
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
         let (key, value) = item?;
         out.push((key.coordinate.as_bytes().to_vec(), value));
     }
-    Ok(out)
-}
-
-/// Warm survival within an assignment: a `Cached` rebuilt over the **same**
-/// fjall workspace (not a fresh assignment) is warm — its disk-backed
-/// provisional-coordinate cache and committed-cell entries both survive. The
-/// rebuilt cache's recovery sweep answers from the local fjall index with
-/// **zero** cold `provisional_cells` sweeps (rebuilding via a single
-/// `provisional_many` lower batch, never a per-coordinate point read),
-/// and a warm `get` serves with zero lower reads. This is the
-/// in-assignment-warm proxy the crash case (a fresh assignment) is the cold
-/// complement of.
-#[test]
-fn warm_entries_and_index_survive_same_workspace_rebuild() -> Result<()> {
-    TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let cells = MemoryCells::new();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            cells,
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
-        let id = collection("warm")?;
-        let cref = CollectionRef::new(id.clone(), None);
-        let event = probe(1);
-
-        // First cache instance: warm a value and leave a provisional cell.
-        let cached = Cached::new(test_db::cache("warm")?, counting.clone());
-        cached
-            .write_resolved(&cref, &[(cell_at(9), Some(bytes(9)))], &[])
-            .await?;
-        let prev = cached.get(&id, &cell_at(3), event).await?;
-        let writes = [(
-            cell_at(3),
-            ProvisionalWrite::new(Some(bytes(5)), prev, event),
-        )];
-        let marker = EventMarker::frozen(event, &writes, &[]);
-        cached
-            .write_provisional(&cref, &writes, Some(&marker))
-            .await?;
-
-        // Prime the warm provisional-coordinate cache: the first sweep is a cold
-        // seed (one `provisional_cells` call), which records the coordinate into
-        // fjall and marks the collection seeded.
-        counting.reset();
-        let cold = drain_provisional(&cached, &id).await?;
-        assert_eq!(cold, vec![3], "the cold sweep finds the provisional cell");
-        assert_eq!(
-            counting.recovery_sweeps(),
-            1,
-            "the first sweep is a cold seed"
-        );
-
-        // Rebuild `Cached` over the SAME workspace (a session clone within one
-        // assignment). The disk-backed warm index + cell entries survive.
-        let restarted = Cached::new(test_db::cache("warm")?, counting.clone());
-        counting.reset();
-
-        // The rebuilt sweep is WARM: zero cold `provisional_cells` sweeps, and it
-        // still finds the provisional cell via a single `provisional_many` lower
-        // batch (zero per-coordinate point reads).
-        let warm = drain_provisional(&restarted, &id).await?;
-        assert_eq!(
-            warm,
-            vec![3],
-            "the warm sweep still finds the provisional cell"
-        );
-        assert_eq!(
-            counting.recovery_sweeps(),
-            0,
-            "a warm sweep issues NO cold provisional_cells read"
-        );
-        assert_eq!(
-            counting.warm_point_reads(),
-            0,
-            "the warm sweep issues no per-coordinate point read"
-        );
-        assert_eq!(
-            counting.raw_batch_reads(),
-            1,
-            "the warm sweep rebuilds the one provisional coordinate via a single lower batch"
-        );
-
-        // The committed-cell entry also survives: the warm `9` serves from
-        // fjall with no lower read.
-        counting.reset();
-        assert_eq!(
-            restarted.get(&id, &cell_at(9), probe(2)).await?.get(),
-            Some(&bytes(9)),
-            "the warm value survives the rebuild and serves from fjall"
-        );
-        assert_eq!(
-            counting.lower_reads(),
-            0,
-            "a warm get after a same-workspace rebuild reads nothing"
-        );
-        Ok(())
-    })
-}
-
-/// A warm-index read failure must degrade the recovery sweep to the cold
-/// durable re-seed — never fabricate an empty (clean) sweep. Forcing
-/// `index_snapshot` to fail while the collection stays *seeded* exercises the
-/// exact branch that would otherwise report zero provisional cells and let the
-/// backstop unschedule, stranding a live provisional cell (F2 / no-strand).
-#[test]
-fn warm_snapshot_failure_degrades_to_cold_reseed() -> Result<()> {
-    TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
-        let id = collection("degrade")?;
-        let cref = CollectionRef::new(id.clone(), None);
-        let event = probe(1);
-
-        let fjall = test_db::cache("degrade")?;
-        let fail_snapshot = fjall.fail_index_snapshot();
-        let cached = Cached::new(fjall, counting.clone());
-
-        // Leave a provisional cell, then seed the warm index with a cold sweep
-        // (records the coordinate into fjall and marks the collection seeded).
-        let prev = cached.get(&id, &cell_at(3), event).await?;
-        let writes = [(
-            cell_at(3),
-            ProvisionalWrite::new(Some(bytes(5)), prev, event),
-        )];
-        let marker = EventMarker::frozen(event, &writes, &[]);
-        cached
-            .write_provisional(&cref, &writes, Some(&marker))
-            .await?;
-        assert_eq!(
-            drain_provisional(&cached, &id).await?,
-            vec![3],
-            "the cold seed finds the provisional cell"
-        );
-
-        // Force the warm coords read to fail while the collection stays seeded.
-        // The sweep must fall through to a cold `provisional_cells` re-seed that
-        // still finds the cell — not report an empty, clean sweep.
-        counting.reset();
-        fail_snapshot.store(true, Ordering::Relaxed);
-        assert_eq!(
-            drain_provisional(&cached, &id).await?,
-            vec![3],
-            "a warm snapshot failure re-seeds from the durable index, never an empty sweep"
-        );
-        assert_eq!(
-            counting.recovery_sweeps(),
-            1,
-            "the failed warm read degrades to a cold provisional_cells re-seed"
-        );
-        fail_snapshot.store(false, Ordering::Relaxed);
-        Ok(())
-    })
-}
-
-/// A cold-seed `index_record` failure must leave the collection **unseeded** so
-/// the next sweep re-seeds from the durable index — never latch `seeded` over
-/// an incomplete on-disk coords set, which would drop the unrecorded coordinate
-/// from every later warm sweep and strand it. Symmetric with
-/// `write_provisional`'s unseed-on-record-failure.
-#[test]
-fn cold_seed_record_failure_leaves_collection_unseeded() -> Result<()> {
-    TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
-        let id = collection("reseed")?;
-        let cref = CollectionRef::new(id.clone(), None);
-        let event = probe(1);
-
-        let fjall = test_db::cache("reseed")?;
-        let fail_record = fjall.fail_index_record();
-        let cached = Cached::new(fjall, counting.clone());
-
-        // Leave a provisional cell.
-        let prev = cached.get(&id, &cell_at(3), event).await?;
-        let writes = [(
-            cell_at(3),
-            ProvisionalWrite::new(Some(bytes(5)), prev, event),
-        )];
-        let marker = EventMarker::frozen(event, &writes, &[]);
-        cached
-            .write_provisional(&cref, &writes, Some(&marker))
-            .await?;
-
-        // Cold seed with a failing `index_record`: the sweep still finds the
-        // cell (from the durable lower), but the failed record must not be
-        // papered over by marking the collection seeded.
-        counting.reset();
-        fail_record.store(true, Ordering::Relaxed);
-        assert_eq!(
-            drain_provisional(&cached, &id).await?,
-            vec![3],
-            "the cold seed still yields the provisional cell"
-        );
-        fail_record.store(false, Ordering::Relaxed);
-
-        // The next sweep must be COLD again (re-seed) — proving the collection
-        // was left unseeded. A wrongly-latched `seeded` would take the warm path
-        // over the empty (unrecorded) snapshot and yield nothing, stranding it.
-        counting.reset();
-        assert_eq!(
-            drain_provisional(&cached, &id).await?,
-            vec![3],
-            "the next sweep re-seeds and finds the cell, not an empty warm snapshot"
-        );
-        assert_eq!(
-            counting.recovery_sweeps(),
-            1,
-            "the collection was left unseeded, so the next sweep re-seeds cold"
-        );
-        Ok(())
-    })
-}
-
-/// Drains a `provisional_cells` sweep into the ascending list of coordinate
-/// first-bytes it yields.
-async fn drain_provisional<L>(cached: &Cached<L>, id: &CollectionId) -> Result<Vec<u8>>
-where
-    L: CellStore,
-{
-    let stream = cached.provisional_cells(id);
-    futures::pin_mut!(stream);
-    let mut out = Vec::new();
-    while let Some(item) = stream.next().await {
-        let (cell, _) = item.map_err(|e| eyre!("provisional sweep failed: {e:?}"))?;
-        out.push(cell.coordinate.as_bytes()[0]);
-    }
-    out.sort_unstable();
     Ok(out)
 }
 
@@ -533,10 +263,10 @@ where
 #[test]
 fn prop_memory_cached_crash_equivalence() {
     fn property(trace: Trace) -> Result<bool> {
-        let oracle = ScriptedOracle::default();
+        let dedup = MemoryDeduplicationStore::default();
         let cells = MemoryCells::new();
         // Each `make` yields a cold cache over the same warm memory cells +
-        // oracle, so a crash drops the cache but not durable state; the
+        // dedup store, so a crash drops the cache but not durable state; the
         // runner's lower fault seam sits between the cache and the bottom
         // store. `test_db::cold_cache` reuses the `crash` keyspace pair on
         // the shared database and CLEARS it (a cheap journal marker, no
@@ -544,14 +274,8 @@ fn prop_memory_cached_crash_equivalence() {
         // per make. Distinct v4 segments per iteration keep the shared
         // keyspace's crashes disjoint.
         let make = |handle: &PoisonHandle| {
-            let lower = FailingCellStore::with_handle(
-                MemoryCellStore::new(
-                    cells.clone(),
-                    oracle.clone(),
-                    Arc::new(CollectionDefRegistry::default()),
-                ),
-                handle.clone(),
-            );
+            let lower =
+                FailingCellStore::with_handle(MemoryCellStore::new(cells.clone()), handle.clone());
             Ok(Cached::new(test_db::cold_cache("crash")?, lower))
         };
         // The durable physical shape lives in the shared memory cells (fjall is
@@ -559,7 +283,7 @@ fn prop_memory_cached_crash_equivalence() {
         let probe = MemoryShapeProbe(cells.clone());
         TEST_RUNTIME.block_on(run_crash_equivalence_trace(
             make,
-            oracle.clone(),
+            dedup.clone(),
             trace,
             &probe,
         ))
@@ -590,14 +314,9 @@ fn expired_entry_reads_as_miss_and_refills() -> Result<()> {
 
     TEST_RUNTIME.block_on(async {
         let now = Arc::new(AtomicU64::new(1_000));
-        let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
         let lower = TtlAwareCellStore::new(
-            CountingCellStore::new(MemoryCellStore::new(
-                cells,
-                oracle,
-                Arc::new(CollectionDefRegistry::default()),
-            )),
+            CountingCellStore::new(MemoryCellStore::new(cells)),
             Clock::Fixed(now.clone()),
             ROW_DEATH,
         );
@@ -615,7 +334,10 @@ fn expired_entry_reads_as_miss_and_refills() -> Result<()> {
             .await?;
         lower.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(7), probe(1)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(7))
+                .await?
+                .0
+                .get(),
             Some(&bytes(7)),
             "a live warm value serves from fjall"
         );
@@ -631,7 +353,10 @@ fn expired_entry_reads_as_miss_and_refills() -> Result<()> {
             .await?;
         lower.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(7), probe(2)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(7))
+                .await?
+                .0
+                .get(),
             Some(&bytes(70)),
             "an expired get falls through to the fresh durable value"
         );
@@ -655,11 +380,42 @@ fn expired_entry_reads_as_miss_and_refills() -> Result<()> {
             "the re-stamped expiry must not overhang the durable row death"
         );
 
+        lower
+            .write_resolved(&cref, &[(cell_at(8), Some(bytes(8)))], &[])
+            .await?;
+        lower.reset();
+        CellRead::<Presence>::read_many(&cached, &id, SECTION, &batch_of([8, 9])?).await?;
+        assert_eq!(
+            lower.inner.presence_reads(),
+            1,
+            "the expiry comes from a presence read"
+        );
+        assert_eq!(
+            lower.inner.batch_cache_reads(),
+            0,
+            "the fill does not fetch values"
+        );
+        for key in [8, 9] {
+            let stamped = cached.stored_expiry(&id, &cell_at(key)).await?;
+            assert_eq!(
+                stamped,
+                Some(want_expiry),
+                "presence uses the remaining TTL"
+            );
+            assert!(
+                stamped.is_some_and(|expiry| expiry <= ROW_DEATH),
+                "presence expires before the durable row"
+            );
+        }
+
         // The fall-through re-published a fresh entry; a get now serves `70`
         // from fjall again (KV5 restored).
         lower.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(7), probe(3)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(7))
+                .await?
+                .0
+                .get(),
             Some(&bytes(70)),
             "the re-published value serves from fjall"
         );
@@ -676,23 +432,20 @@ fn expired_entry_reads_as_miss_and_refills() -> Result<()> {
 #[test]
 fn cached_provisional_many_does_not_publish() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle,
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let id = collection("cached-no-publish")?;
         let cref = CollectionRef::new(id.clone(), None);
         // Stage a provisional cell in the LOWER store directly, so fjall stays
         // untouched (a cached stage would publish the cell's `prev`).
         let event = probe(0x5EED);
-        let prev = counting.get(&id, &cell_at(2), event).await?;
+        let prev = CellRead::<Values>::read(&counting, &id, &cell_at(2))
+            .await?
+            .0;
         let writes = [(
             cell_at(2),
             ProvisionalWrite::new(Some(bytes(20)), prev, event),
         )];
-        let marker = EventMarker::frozen(event, &writes, &[]);
+        let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
         counting
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -712,7 +465,7 @@ fn cached_provisional_many_does_not_publish() -> Result<()> {
         // Nothing was published, so a point get of the read coordinate still
         // falls through to the lower store (a fjall miss).
         counting.reset();
-        cached.get(&id, &cell_at(2), probe(7)).await?;
+        CellRead::<Values>::read(&cached, &id, &cell_at(2)).await?;
         assert!(
             counting.lower_reads() >= 1,
             "provisional_many must not warm the committed-value cache"
@@ -727,14 +480,9 @@ fn cached_provisional_many_does_not_publish() -> Result<()> {
 #[test]
 fn failed_publish_deletes_the_stale_entry() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
         let fjall = test_db::cache("fault")?;
         let fail = fjall.fail_puts();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle,
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let cached = Cached::new(fjall, counting.clone());
         let id = collection("fault")?;
         let cref = CollectionRef::new(id.clone(), None);
@@ -745,7 +493,10 @@ fn failed_publish_deletes_the_stale_entry() -> Result<()> {
             .await?;
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(1), probe(1)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
             Some(&bytes(1))
         );
         assert_eq!(counting.lower_reads(), 0, "the seeded entry is warm");
@@ -764,7 +515,10 @@ fn failed_publish_deletes_the_stale_entry() -> Result<()> {
         fail.store(false, Ordering::Relaxed);
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(1), probe(2)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
             Some(&bytes(2)),
             "a failed publish deletes the entry, so the next read self-heals"
         );
@@ -775,7 +529,10 @@ fn failed_publish_deletes_the_stale_entry() -> Result<()> {
         );
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(1), probe(3)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
             Some(&bytes(2)),
             "the fall-through re-warmed the cell"
         );
@@ -788,11 +545,10 @@ fn failed_publish_deletes_the_stale_entry() -> Result<()> {
 #[test]
 fn failed_batch_publish_deletes_every_batch_cell() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
         let fjall = test_db::cache("batch-fault")?;
         let fail = fjall.fail_puts();
-        let lower = MemoryCellStore::new(cells, oracle, Arc::new(CollectionDefRegistry::default()));
+        let lower = MemoryCellStore::new(cells);
         let cached = Cached::new(fjall, lower);
         let id = collection("batch-fault")?;
         let cref = CollectionRef::new(id.clone(), None);
@@ -804,9 +560,9 @@ fn failed_batch_publish_deletes_every_batch_cell() -> Result<()> {
         cached.write_resolved(&cref, &seed, &[]).await?;
         for (c, v) in [(1u8, 1u8), (2, 2)] {
             assert_eq!(
-                cached
-                    .get(&id, &cell_at(c), probe(u128::from(c)))
+                CellRead::<Values>::read(&cached, &id, &cell_at(c))
                     .await?
+                    .0
                     .get(),
                 Some(&bytes(v))
             );
@@ -823,9 +579,9 @@ fn failed_batch_publish_deletes_every_batch_cell() -> Result<()> {
         fail.store(false, Ordering::Relaxed);
         for (c, v) in [(1u8, 11u8), (2, 22)] {
             assert_eq!(
-                cached
-                    .get(&id, &cell_at(c), probe(u128::from(c) + 100))
+                CellRead::<Values>::read(&cached, &id, &cell_at(c))
                     .await?
+                    .0
                     .get(),
                 Some(&bytes(v)),
                 "a failed batch deletes every coordinate, so each read self-heals"
@@ -841,14 +597,9 @@ fn failed_batch_publish_deletes_every_batch_cell() -> Result<()> {
 #[test]
 fn promote_delete_retries_before_cache_disablement() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
         let fjall = test_db::cache("promote-delete")?;
         let fail_deletes = fjall.fail_deletes();
-        let lower = MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle,
-            Arc::new(CollectionDefRegistry::default()),
-        );
+        let lower = MemoryCellStore::new(MemoryCells::new());
         let cached = Cached::new(fjall.clone(), lower);
         let id = collection("promote-delete")?;
         let cref = CollectionRef::new(id.clone(), None);
@@ -859,12 +610,12 @@ fn promote_delete_retries_before_cache_disablement() -> Result<()> {
         cached
             .write_resolved(&cref, &[(cell_at(0), Some(bytes(1)))], &[])
             .await?;
-        let prev = cached.get(&id, &cell_at(0), event).await?;
+        let prev = CellRead::<Values>::read(&cached, &id, &cell_at(0)).await?.0;
         let writes = [(
             cell_at(0),
             ProvisionalWrite::new(Some(bytes(5)), prev, event),
         )];
-        let marker = EventMarker::frozen(event, &writes, &[]);
+        let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
         cached
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
@@ -882,7 +633,10 @@ fn promote_delete_retries_before_cache_disablement() -> Result<()> {
             "an in-budget removal does not disable the cache"
         );
         assert_eq!(
-            cached.get(&id, &cell_at(0), probe(2)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(5)),
             "a failed delete must not leave the stale pre-promote value warm"
         );
@@ -894,15 +648,10 @@ fn promote_delete_retries_before_cache_disablement() -> Result<()> {
 #[test]
 fn write_path_delete_recovers_within_budget() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
         let fjall = test_db::cache("write-delete")?;
         let fail_puts = fjall.fail_puts();
         let fail_deletes = fjall.fail_deletes();
-        let lower = MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle,
-            Arc::new(CollectionDefRegistry::default()),
-        );
+        let lower = MemoryCellStore::new(MemoryCells::new());
         let cached = Cached::new(fjall.clone(), lower);
         let id = collection("write-delete")?;
         let cref = CollectionRef::new(id.clone(), None);
@@ -929,7 +678,10 @@ fn write_path_delete_recovers_within_budget() -> Result<()> {
             "a within-budget removal does not disable the cache"
         );
         assert_eq!(
-            cached.get(&id, &cell_at(1), probe(1)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
             Some(&bytes(2)),
             "a doubly-failed publish+delete must still evict, so the read self-heals"
         );
@@ -949,12 +701,7 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
     use crate::state::StateName;
 
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle,
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let handle: PoisonHandle = Arc::default();
         let cached = Cached::new(
             test_db::cache("establish_fault")?,
@@ -971,7 +718,10 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
             .await?;
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0), probe(1)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(1)),
             "the seeded base serves warm"
         );
@@ -996,7 +746,10 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
         *handle.lock() = None;
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0), probe(2)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(1)),
             "the failed write serves the PRE-write value"
         );
@@ -1008,7 +761,10 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
         );
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0), probe(20)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(1)),
             "the fall-through re-warmed the pre-write value"
         );
@@ -1028,7 +784,10 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
         *handle.lock() = None;
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0), probe(3)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(1)),
             "delete-first on a failed apply degrades to a correct slow read, never a wrong one"
         );
@@ -1039,114 +798,14 @@ fn failed_lower_write_leaves_cache_serving_pre_write_value() -> Result<()> {
         );
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0), probe(4)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(1)),
             "the fall-through re-warmed the coordinate"
         );
         assert_eq!(counting.lower_reads(), 0, "the re-warmed get reads nothing");
-        Ok(())
-    })
-}
-
-/// Proves that a resolved write removes entries affected by an unsettled clear.
-///
-/// A later read cannot return the old cached value.
-#[test]
-fn blind_write_deletes_beneath_resolved_marker_window() -> Result<()> {
-    TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
-        let cached = Cached::new(test_db::cache("blind-d3")?, counting);
-        let id = collection("blind-d3")?;
-        let cref = CollectionRef::new(id.clone(), None);
-        let event_a = probe(1);
-
-        // Seed a base value (no marker → boundary no-op); the write-through
-        // warms it.
-        cached
-            .write_resolved(&cref, &[(cell_at(0), Some(bytes(1)))], &[])
-            .await?;
-
-        // Stage a committed marker with clears through the cache and leave
-        // it unsettled (no settle). The cache now holds the published `prev`
-        // (bytes(1)) for the staged coordinate.
-        let prev = cached.get(&id, &cell_at(0), event_a).await?;
-        let writes = vec![(
-            cell_at(0),
-            ProvisionalWrite::new(Some(bytes(2)), prev, event_a),
-        )];
-        let clears = vec![SectionClear::frozen(SECTION, &writes)];
-        let marker = EventMarker::frozen(event_a, &writes, &clears);
-        cached
-            .write_provisional(&cref, &writes, Some(&marker))
-            .await?;
-        oracle.record_message(Uuid::from_u128(1)).await?;
-
-        // Blind-write a different coordinate: the lower write resolves marker A
-        // beneath the cache (promoting cell_at(0) to bytes(2) durably), and prior-clear
-        // cache guard deletes the staged coordinate's stale warm entry.
-        cached
-            .write_resolved(&cref, &[(cell_at(1), Some(bytes(9)))], &[])
-            .await?;
-
-        let read = probe(u128::MAX / 2);
-        ensure!(
-            cached.get(&id, &cell_at(0), read).await?.get() == Some(&bytes(2)),
-            "the staged coordinate must read the beneath-resolved value, not the stale prev"
-        );
-        ensure!(
-            cached.get(&id, &cell_at(1), read).await?.get() == Some(&bytes(9)),
-            "the blind write did not read back"
-        );
-        Ok(())
-    })
-}
-
-/// Proves that settlement removes a cached value from a cleared section.
-///
-/// The next read must report that the cell is absent.
-#[test]
-fn repair_defers_then_clear_evicts_stale_fill() -> Result<()> {
-    TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
-        let cached = Cached::new(test_db::cache("repair-defer")?, counting.clone());
-        let cref = CollectionRef::new(collection("repair-defer")?, None);
-
-        // Stage the defect shape through the lower store so x stays cold in the
-        // cache; record E committed.
-        let (x, s, event_e) = stage_deferred_repair_shape(&counting, &cref).await?;
-        oracle.record_message(Uuid::from_u128(2)).await?;
-
-        // The cold fill defers the repair (own-marker clear resolution declines below)
-        // and caches the peek projection with no durable write.
-        ensure!(
-            cached.get(cref.id(), &x, event_e).await?.get() == Some(&bytes(7)),
-            "the deferred fill serves the committed-base projection"
-        );
-
-        // Resolving E evicts the stale fill (section-clear cache guard) and erases x
-        // durably (gap).
-        sweep_provisional(&cached, &oracle, &cref)
-            .await
-            .map_err(|e| eyre!("sweep failed: {e:?}"))?;
-        let read = probe(u128::MAX / 2);
-        ensure!(
-            cached.get(cref.id(), &x, read).await?.get().is_none(),
-            "the committed clear must evict the stale fill and leave x absent"
-        );
-        ensure!(
-            cached.get(cref.id(), &s, read).await?.get() == Some(&bytes(1)),
-            "the survivor must promote to its committed value"
-        );
         Ok(())
     })
 }
@@ -1162,12 +821,7 @@ fn repair_defers_then_clear_evicts_stale_fill() -> Result<()> {
 #[test]
 fn dropped_write_resolved_leaves_no_stale_entry() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle,
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let holding = HoldingCellStore::new(counting.clone());
         let holds = holding.holds();
         let cached = Cached::new(test_db::cache("drop_write")?, holding);
@@ -1181,7 +835,10 @@ fn dropped_write_resolved_leaves_no_stale_entry() -> Result<()> {
             .await?;
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0), probe(1)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(1)),
             "A is warm"
         );
@@ -1214,7 +871,10 @@ fn dropped_write_resolved_leaves_no_stale_entry() -> Result<()> {
         // the durable NEW value `B` = 2 — never a warm stale `A`.
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0), probe(2)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(2)),
             "a dropped write_resolved must not leave the stale pre-write value warm"
         );
@@ -1229,44 +889,36 @@ fn dropped_write_resolved_leaves_no_stale_entry() -> Result<()> {
 
 /// Proves that a scan does not change a provisional cell.
 ///
-/// A later point read or recovery sweep can repair the cell.
+/// Admission can resolve the cell. Point reads also leave it unchanged.
 #[test]
 fn scan_resolution_is_read_only() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let lower = MemoryCellStore::new(
-            cells.clone(),
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        );
+        let lower = MemoryCellStore::new(cells.clone());
         let id = collection("scan-readonly")?;
         let cref = CollectionRef::new(id.clone(), None);
         let prior_event = probe(7);
 
-        // Seed a prior event committed provisional at x: a clear (data = None) over
-        // committed base `A` = 1, owned by `prior event`, which the oracle says
-        // committed. The point-read repair arm would `write_resolved(x, None)`,
-        // a durable delete; the scan must not.
+        // Seed a certified provisional clear. The read must preserve its row.
         let writes = [(
             cell_at(4),
             ProvisionalWrite::new(None, Committed::new(Some(bytes(1))), prior_event),
         )];
-        let marker = EventMarker::frozen(prior_event, &writes, &[]);
+        let marker = EventMarker::frozen(prior_event, &writes, &[], &evidence([].into(), None));
         lower
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
-        oracle.record_message(Uuid::from_u128(7)).await?;
+        seed_commit_evidence(&lower, &cref).await?;
         assert_eq!(
             cells.provisional_coordinates(&id),
             vec![cell_at(4)],
             "the prior event committed provisional is seeded"
         );
 
-        // Scan the section (a distinct own event). The cell resolves to its
+        // Scan the section. The cell resolves to its
         // committed view — absent, since data = None — so the scan yields
         // nothing, but must leave the durable cell provisional.
-        let seen = scan_forward(&lower, &id, 0, ScanEdge::Included(255), probe(99)).await?;
+        let seen = scan_forward(&lower, &id, 0, ScanEdge::Included(255)).await?;
         assert!(
             seen.is_empty(),
             "the committed clear resolves to absent, so the scan yields nothing"
@@ -1294,12 +946,7 @@ fn delete_section_removes_exactly_the_cleared_section() -> Result<()> {
     }
 
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle,
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let cached = Cached::new(test_db::cache("clear_delete")?, counting.clone());
         let id = collection("clear-delete")?;
         let other = collection("clear-delete-other")?;
@@ -1332,7 +979,10 @@ fn delete_section_removes_exactly_the_cleared_section() -> Result<()> {
         // absent, and the read pays the one cold fall-through.
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0), probe(2)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             None,
             "the committed clear erased the non-survivor"
         );
@@ -1344,7 +994,10 @@ fn delete_section_removes_exactly_the_cleared_section() -> Result<()> {
         // The survivor re-warmed via the post-clear publish.
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(5), probe(3)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(5))
+                .await?
+                .0
+                .get(),
             Some(&bytes(50)),
             "the survivor serves the post-clear value"
         );
@@ -1352,12 +1005,18 @@ fn delete_section_removes_exactly_the_cleared_section() -> Result<()> {
         // The sibling section and the sibling collection stay warm.
         counting.reset();
         assert_eq!(
-            cached.get(&id, &sect1_cell(0), probe(4)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &sect1_cell(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(20)),
             "the sibling section survives the clear"
         );
         assert_eq!(
-            cached.get(&other, &cell_at(0), probe(5)).await?.get(),
+            CellRead::<Values>::read(&cached, &other, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(30)),
             "the sibling collection survives the clear"
         );
@@ -1376,18 +1035,25 @@ fn delete_section_removes_exactly_the_cleared_section() -> Result<()> {
 #[test]
 fn absent_get_is_cached() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle,
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let cached = Cached::new(test_db::cache("absent")?, counting.clone());
         let id = collection("absent")?;
 
         counting.reset();
-        assert_eq!(cached.get(&id, &cell_at(9), probe(1)).await?.get(), None);
-        assert_eq!(cached.get(&id, &cell_at(9), probe(2)).await?.get(), None);
+        assert_eq!(
+            CellRead::<Values>::read(&cached, &id, &cell_at(9))
+                .await?
+                .0
+                .get(),
+            None
+        );
+        assert_eq!(
+            CellRead::<Values>::read(&cached, &id, &cell_at(9))
+                .await?
+                .0
+                .get(),
+            None
+        );
         assert_eq!(
             counting.lower_reads(),
             1,
@@ -1397,28 +1063,42 @@ fn absent_get_is_cached() -> Result<()> {
     })
 }
 
-/// KV2 negative caching: two presence reads of a never-written cell issue one
-/// lower read. The second read uses the cached Absent tag.
+/// Two presence reads share one fill for present and absent cells.
 #[test]
-fn absent_presence_is_cached() -> Result<()> {
+fn presence_is_cached() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let (cached, counting, id) = counting_cached("absent-presence")?;
-        let batch = batch_of([9])?;
-
+        let (cached, counting, id) = counting_cached("presence")?;
+        counting
+            .write_resolved(
+                &CollectionRef::new(id.clone(), None),
+                &[(cell_at(1), Some(bytes(1)))],
+                &[],
+            )
+            .await?;
+        let batch = batch_of([1, 2])?;
         counting.reset();
-        assert_eq!(
-            cached.contains_many(&id, SECTION, &batch, probe(1)).await?,
-            PresenceBatch::from_iter([false]),
-        );
-        assert_eq!(
-            cached.contains_many(&id, SECTION, &batch, probe(2)).await?,
-            PresenceBatch::from_iter([false]),
-        );
-        assert_eq!(
-            counting.presence_reads(),
-            1,
-            "two absent presence reads pay one durable read"
-        );
+        for _ in 0_u8..2 {
+            assert_eq!(
+                CellRead::<Presence>::read_many(&cached, &id, SECTION, &batch)
+                    .await
+                    .map(|cells| cells
+                        .into_iter()
+                        .map(|(committed, _)| committed.get().is_some())
+                        .collect::<CellBuffer<bool>>())?,
+                CellBuffer::from_iter([true, false])
+            );
+            assert_eq!(
+                counting.presence_reads(),
+                1,
+                "presence reads share one presence fill"
+            );
+            assert_eq!(counting.lower_reads(), 0, "presence does not read values");
+            assert_eq!(
+                counting.batch_cache_reads(),
+                0,
+                "presence does not fetch a value batch"
+            );
+        }
         Ok(())
     })
 }
@@ -1427,11 +1107,7 @@ fn absent_presence_is_cached() -> Result<()> {
 #[test]
 fn blown_fuse_presence_reads_durable_truth() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            ScriptedOracle::default(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let fjall = test_db::cache("presence-fuse")?;
         let cached = Cached::new(fjall.clone(), counting.clone());
         let id = collection("presence-fuse")?;
@@ -1446,10 +1122,13 @@ fn blown_fuse_presence_reads_durable_truth() -> Result<()> {
         counting.reset();
 
         assert_eq!(
-            cached
-                .contains_many(&id, SECTION, &batch_of([1])?, probe(1))
-                .await?,
-            PresenceBatch::from_iter([false]),
+            CellRead::<Presence>::read_many(&cached, &id, SECTION, &batch_of([1])?)
+                .await
+                .map(|cells| cells
+                    .into_iter()
+                    .map(|(committed, _)| committed.get().is_some())
+                    .collect::<CellBuffer<bool>>())?,
+            CellBuffer::from_iter([false]),
         );
         assert_eq!(counting.presence_reads(), 1, "the fused read delegates");
         Ok(())
@@ -1462,37 +1141,40 @@ fn blown_fuse_presence_reads_durable_truth() -> Result<()> {
 fn cell_load_metrics_report_source_and_cache_result() -> Result<()> {
     let metrics = GlobalMetrics::install();
     TEST_RUNTIME.block_on(async {
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            ScriptedOracle::default(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let fjall = test_db::cache("cell-load-metrics")?;
         let fail_puts = fjall.fail_puts();
         let cached = Cached::new(fjall, counting).with_metrics(metrics.cell_metrics());
         let id = collection("cell-load-metrics")?;
 
-        cached.get(&id, &cell_at(1), probe(1)).await?;
-        cached.get(&id, &cell_at(1), probe(2)).await?;
+        CellRead::<Values>::read(&cached, &id, &cell_at(1)).await?;
+        CellRead::<Values>::read(&cached, &id, &cell_at(1)).await?;
         let batch = batch_of(2u8..5)?;
-        cached.get_many(&id, SECTION, &batch, probe(3)).await?;
-        cached.get_many(&id, SECTION, &batch, probe(4)).await?;
+        CellRead::<Values>::read_many(&cached, &id, SECTION, &batch).await?;
+        CellRead::<Values>::read_many(&cached, &id, SECTION, &batch).await?;
+
+        let presence_batch = batch_of(5u8..8)?;
+        CellRead::<Presence>::read_many(&cached, &id, SECTION, &presence_batch).await?;
+        CellRead::<Presence>::read_many(&cached, &id, SECTION, &presence_batch).await?;
 
         let points = metrics.points("prosody.state.cell.loads")?;
         assert_eq!(
             points,
             [
-                (("get", "cache", "hit"), 1),
-                (("get_many", "cache", "hit"), 3),
-                (("get", "store", "miss"), 1),
-                (("get_many", "store", "not_all_hit"), 3),
+                (("get", "values", "cache", "hit"), 1),
+                (("get_many", "presence", "cache", "hit"), 3),
+                (("get_many", "values", "cache", "hit"), 3),
+                (("get", "values", "store", "miss"), 1),
+                (("get_many", "presence", "store", "not_all_hit"), 3),
+                (("get_many", "values", "store", "not_all_hit"), 3),
             ]
             .into_iter()
-            .map(|((operation, source, result), value)| {
+            .map(|((operation, projection, source, result), value)| {
                 (
                     labels([
                         ("prosody.state.cell.cache.result", result),
                         ("prosody.state.cell.operation.name", operation),
+                        ("prosody.state.cell.projection", projection),
                         ("prosody.state.cell.load.source", source),
                     ]),
                     value,
@@ -1512,7 +1194,7 @@ fn cell_load_metrics_report_source_and_cache_result() -> Result<()> {
         assert!(metrics.is_exponential_histogram("prosody.request.duration")?);
 
         fail_puts.store(true, Ordering::Relaxed);
-        cached.get(&id, &cell_at(9), probe(5)).await?;
+        CellRead::<Values>::read(&cached, &id, &cell_at(9)).await?;
         assert_eq!(
             metrics.points("prosody.state.cell.cache.errors")?,
             vec![(
@@ -1525,23 +1207,24 @@ fn cell_load_metrics_report_source_and_cache_result() -> Result<()> {
         );
 
         let failed_metrics = GlobalMetrics::install();
-        let failed_lower = FailingCellStore::failing_get_for_cache(
-            MemoryCellStore::new(
-                MemoryCells::new(),
-                ScriptedOracle::default(),
-                Arc::new(CollectionDefRegistry::default()),
-            ),
+        let failed_lower = FailingCellStore::failing_read(
+            MemoryCellStore::new(MemoryCells::new()),
             BTreeMap::from([(8, ErrorCategory::Transient)]),
         );
         let failed = Cached::new(test_db::cache("cell-load-error-metrics")?, failed_lower)
             .with_metrics(failed_metrics.cell_metrics());
         let failed_id = collection("cell-load-error-metrics")?;
-        assert!(failed.get(&failed_id, &cell_at(8), probe(6)).await.is_err());
+        assert!(
+            CellRead::<Values>::read(&failed, &failed_id, &cell_at(8))
+                .await
+                .is_err()
+        );
         assert_eq!(
             failed_metrics.points("prosody.state.cell.load.duration")?,
             vec![(
                 labels([
                     ("prosody.error.category", "transient"),
+                    ("prosody.state.cell.projection", "values"),
                     ("prosody.state.cell.cache.result", "miss"),
                     ("prosody.state.cell.load.source", "store"),
                     ("prosody.state.cell.operation.name", "get"),
@@ -1553,16 +1236,13 @@ fn cell_load_metrics_report_source_and_cache_result() -> Result<()> {
     })
 }
 
-/// Stages a 3-cell marker (`data` = 100+c over committed base `c`) through
-/// `cached` and records its commit verdict — the shared prologue of the
-/// settlement cache update tests. Returns the staged writes and the frozen
-/// marker.
+/// Stages three cells with `data` = 100+c over committed base `c`.
+/// Returns the staged writes and their marker.
 async fn stage_committed_marker<L>(
     cached: &Cached<L>,
-    oracle: &ScriptedOracle,
     cref: &CollectionRef,
     dedup: u128,
-) -> Result<Vec<(CellKey, ProvisionalWrite)>>
+) -> Result<(Vec<(CellKey, ProvisionalWrite)>, EventMarker)>
 where
     L: CellStore,
 {
@@ -1575,36 +1255,28 @@ where
     }
     let mut writes = Vec::new();
     for c in [1u8, 2, 3] {
-        let prev = cached.get(id, &cell_at(c), event).await?;
+        let prev = CellRead::<Values>::read(cached, id, &cell_at(c)).await?.0;
         writes.push((
             cell_at(c),
             ProvisionalWrite::new(Some(bytes(100 + c)), prev, event),
         ));
     }
-    let marker = EventMarker::frozen(event, &writes, &[]);
+    let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
     cached
         .write_provisional(cref, &writes, Some(&marker))
         .await?;
-    // The verdict is fixed before commit_provisional ever runs (the settle
-    // boundary records the marker first) — the settlement cache update
-    // precondition.
-    oracle.record_message(Uuid::from_u128(dedup)).await?;
-    Ok(writes)
+
+    Ok((writes, marker))
 }
 
-/// Proves that settlement caches committed data before durable promotion.
+/// Proves that the cache publishes only after the durable response returns.
 ///
-/// Cached cells must not return their prior values.
+/// Failed and cancelled responses remove the affected cache entries.
 #[test]
-fn d5_transform_installs_committed_data_precall() -> Result<()> {
+fn promote_publishes_after_durable_write() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         // ---- Window (a): the lower promote fails. --------------------------
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let handle: PoisonHandle = Arc::default();
         let cached = Cached::new(
             test_db::cache("d5_precall")?,
@@ -1612,46 +1284,43 @@ fn d5_transform_installs_committed_data_precall() -> Result<()> {
         );
         let id = collection("d5-precall")?;
         let cref = CollectionRef::new(id.clone(), None);
-        let writes = stage_committed_marker(&cached, &oracle, &cref, 1).await?;
+        let (writes, marker) = stage_committed_marker(&cached, &cref, 1).await?;
 
         *handle.lock() = Some(Poison::Collection(
             id.name().clone(),
             ErrorCategory::Transient,
         ));
-        let result = cached.commit_provisional(&cref, &writes, &[]).await;
+        let result = cached.commit_provisional(&cref, &marker, &writes).await;
         assert!(result.is_err(), "the poisoned lower promote must surface");
         *handle.lock() = None;
 
-        // Every staged cell reads back WARM with the committed data — never
-        // `prev`, and with zero lower reads (the transform ran pre-call).
+        // The failed promote evicts each entry. Lower reads return the base.
         counting.reset();
         for c in [1u8, 2, 3] {
             assert_eq!(
-                cached.get(&id, &cell_at(c), probe(50)).await?.get(),
-                Some(&bytes(100 + c)),
-                "cell {c} serves the oracle-committed data, never prev"
+                CellRead::<Values>::read(&cached, &id, &cell_at(c))
+                    .await?
+                    .0
+                    .get(),
+                Some(&bytes(c)),
+                "a failed promote preserves the committed base"
             );
         }
         assert_eq!(
             counting.lower_reads(),
-            0,
-            "the transform kept every staged cell warm through the failed promote"
+            3,
+            "the failed promote evicts every staged cell"
         );
 
         // ---- Window (b): the settle future is DROPPED after the lower batch
         // landed (response withheld, then the task aborted). -----------------
-        let oracle_b = ScriptedOracle::default();
-        let counting_b = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle_b.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting_b = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let holding = HoldingCellStore::new(counting_b.clone());
         let holds = holding.holds();
         let cached_b = Cached::new(test_db::cache("d5_drop")?, holding);
         let id_b = collection("d5-drop")?;
         let cref_b = CollectionRef::new(id_b.clone(), None);
-        let writes_b = stage_committed_marker(&cached_b, &oracle_b, &cref_b, 2).await?;
+        let (writes_b, marker_b) = stage_committed_marker(&cached_b, &cref_b, 2).await?;
 
         holds.commit_provisional().arm(1);
         let landed_before = holds.commit_provisional().landed();
@@ -1659,55 +1328,51 @@ fn d5_transform_installs_committed_data_precall() -> Result<()> {
             let cached_b = cached_b.clone();
             let cref_b = cref_b.clone();
             let writes_b = writes_b.clone();
-            async move { cached_b.commit_provisional(&cref_b, &writes_b, &[]).await }
+            async move {
+                cached_b
+                    .commit_provisional(&cref_b, &marker_b, &writes_b)
+                    .await
+            }
         });
-        // Wait until the lower batch LANDED and the response is withheld, then
-        // drop the settle future mid-flight.
+        // Inspect the cache while the lower response remains blocked.
         holds.commit_provisional().entered().await;
         assert!(
             holds.commit_provisional().landed() > landed_before,
             "the lower batch landed before the drop"
         );
+        counting_b.reset();
+        for c in [1u8, 2, 3] {
+            assert_eq!(
+                CellRead::<Values>::read(&cached_b, &id_b, &cell_at(c))
+                    .await?
+                    .0
+                    .get(),
+                Some(&bytes(c)),
+                "the cache preserves the prior projection until the response returns"
+            );
+        }
+        assert_eq!(counting_b.lower_reads(), 0, "the prior values stay cached");
+
         task.abort();
         assert!(task.await.is_err(), "the settle future was dropped");
 
         counting_b.reset();
         for c in [1u8, 2, 3] {
             assert_eq!(
-                cached_b.get(&id_b, &cell_at(c), probe(51)).await?.get(),
+                CellRead::<Values>::read(&cached_b, &id_b, &cell_at(c))
+                    .await?
+                    .0
+                    .get(),
                 Some(&bytes(100 + c)),
                 "cell {c} serves the committed data across the dropped settle"
             );
         }
         assert_eq!(
             counting_b.lower_reads(),
-            0,
-            "the pre-call transform kept the cells warm across the drop"
+            3,
+            "a dropped response cannot publish to the cache"
         );
 
-        // ---- The cold arm (marker-grain lemma): force-delete one cell's
-        // entry (the transform's delete fallback shape); it pays exactly one
-        // durable read and still resolves to data, while the siblings stay
-        // warm and never serve prev. This sub-assert is green-is-correct for
-        // the deleted cell: a deleted entry cannot serve a ghost by
-        // construction. ------------------------------------------------------
-        cached_b.evict_for_tests(&id_b, &[cell_at(2)]).await?;
-        counting_b.reset();
-        assert_eq!(
-            cached_b.get(&id_b, &cell_at(2), probe(52)).await?.get(),
-            Some(&bytes(102)),
-            "the force-deleted cell resolves durably to the committed data"
-        );
-        assert_eq!(counting_b.lower_reads(), 1, "the deleted cell is cold");
-        counting_b.reset();
-        for c in [1u8, 3] {
-            assert_eq!(
-                cached_b.get(&id_b, &cell_at(c), probe(53)).await?.get(),
-                Some(&bytes(100 + c)),
-                "sibling {c} never serves prev beside a cold cell"
-            );
-        }
-        assert_eq!(counting_b.lower_reads(), 0, "the siblings stay warm");
         Ok(())
     })
 }
@@ -1718,12 +1383,7 @@ fn d5_transform_installs_committed_data_precall() -> Result<()> {
 #[test]
 fn d5_transform_batch_failure_degrades_to_delete() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let handle: PoisonHandle = Arc::default();
         let fjall = test_db::cache("d5_fallback")?;
         let fail_puts = fjall.fail_puts();
@@ -1733,7 +1393,7 @@ fn d5_transform_batch_failure_degrades_to_delete() -> Result<()> {
         );
         let id = collection("d5-fallback")?;
         let cref = CollectionRef::new(id.clone(), None);
-        let writes = stage_committed_marker(&cached, &oracle, &cref, 3).await?;
+        let (writes, marker) = stage_committed_marker(&cached, &cref, 3).await?;
 
         // Poisoned lower + failed transform: the POISON surfaces, verbatim.
         fail_puts.store(true, Ordering::Relaxed);
@@ -1741,7 +1401,7 @@ fn d5_transform_batch_failure_degrades_to_delete() -> Result<()> {
             id.name().clone(),
             ErrorCategory::Transient,
         ));
-        let result = cached.commit_provisional(&cref, &writes, &[]).await;
+        let result = cached.commit_provisional(&cref, &marker, &writes).await;
         assert!(
             matches!(result, Err(ref e) if format!("{e}").contains("poison")),
             "the lower error returns verbatim — a fjall failure is never folded in"
@@ -1749,7 +1409,7 @@ fn d5_transform_batch_failure_degrades_to_delete() -> Result<()> {
         *handle.lock() = None;
 
         // Healthy lower + still-failing transform: Ok, verbatim.
-        let result = cached.commit_provisional(&cref, &writes, &[]).await;
+        let result = cached.commit_provisional(&cref, &marker, &writes).await;
         assert!(
             result.is_ok(),
             "a fjall transform failure never folds into the lower Ok"
@@ -1762,7 +1422,10 @@ fn d5_transform_batch_failure_degrades_to_delete() -> Result<()> {
         counting.reset();
         for c in [1u8, 2, 3] {
             assert_eq!(
-                cached.get(&id, &cell_at(c), probe(60)).await?.get(),
+                CellRead::<Values>::read(&cached, &id, &cell_at(c))
+                    .await?
+                    .0
+                    .get(),
                 Some(&bytes(100 + c)),
                 "cell {c} resolves durably to the committed data"
             );
@@ -1775,7 +1438,10 @@ fn d5_transform_batch_failure_degrades_to_delete() -> Result<()> {
         counting.reset();
         for c in [1u8, 2, 3] {
             assert_eq!(
-                cached.get(&id, &cell_at(c), probe(61)).await?.get(),
+                CellRead::<Values>::read(&cached, &id, &cell_at(c))
+                    .await?
+                    .0
+                    .get(),
                 Some(&bytes(100 + c)),
                 "cell {c} re-warmed from the cold fall-through"
             );
@@ -1790,12 +1456,7 @@ fn d5_transform_batch_failure_degrades_to_delete() -> Result<()> {
 fn d5_transform_retry_is_byte_equivalent() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let now = Arc::new(AtomicU64::new(1_000));
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let cached = Cached::new(
             test_db::cache_with_clock("d5_retry", Clock::Fixed(now.clone()))?,
             counting.clone(),
@@ -1804,9 +1465,9 @@ fn d5_transform_retry_is_byte_equivalent() -> Result<()> {
         // A TTL'd collection, so the stage stamps a finite expiry the retry
         // must REUSE (a fresh now+ttl would differ after the clock advance).
         let cref = CollectionRef::new(id.clone(), Some(CompactDuration::new(60)));
-        let writes = stage_committed_marker(&cached, &oracle, &cref, 4).await?;
+        let (writes, marker) = stage_committed_marker(&cached, &cref, 4).await?;
 
-        cached.commit_provisional(&cref, &writes, &[]).await?;
+        cached.commit_provisional(&cref, &marker, &writes).await?;
         let first: Vec<Option<u64>> = {
             let mut out = Vec::new();
             for c in [1u8, 2, 3] {
@@ -1816,9 +1477,9 @@ fn d5_transform_retry_is_byte_equivalent() -> Result<()> {
         };
 
         // Advance the clock (a fresh now+ttl restamp would now differ), then
-        // run the transform again — the sweep-retry shape.
+        // run the transform again — admission-retry shape.
         now.store(5_500, Ordering::Relaxed);
-        cached.commit_provisional(&cref, &writes, &[]).await?;
+        cached.commit_provisional(&cref, &marker, &writes).await?;
 
         counting.reset();
         for (i, c) in [1u8, 2, 3].into_iter().enumerate() {
@@ -1828,7 +1489,10 @@ fn d5_transform_retry_is_byte_equivalent() -> Result<()> {
                 "cell {c}'s expiry is unchanged by the retry (stage-anchored reuse)"
             );
             assert_eq!(
-                cached.get(&id, &cell_at(c), probe(70)).await?.get(),
+                CellRead::<Values>::read(&cached, &id, &cell_at(c))
+                    .await?
+                    .0
+                    .get(),
                 Some(&bytes(100 + c)),
                 "cell {c}'s value is unchanged by the retry"
             );
@@ -1855,12 +1519,7 @@ fn d5_clear_and_repopulate_keeps_staged_cells_warm() -> Result<()> {
     }
 
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let cached = Cached::new(test_db::cache("set_equation")?, counting.clone());
         let id = collection("set-equation")?;
         let cref = CollectionRef::new(id.clone(), None);
@@ -1887,7 +1546,7 @@ fn d5_clear_and_repopulate_keeps_staged_cells_warm() -> Result<()> {
         ];
         let mut writes = Vec::new();
         for (i, staged) in staged_cells.iter().enumerate() {
-            let prev = cached.get(&id, staged, event).await?;
+            let prev = CellRead::<Values>::read(&cached, &id, staged).await?.0;
             writes.push((
                 staged.clone(),
                 ProvisionalWrite::new(Some(bytes(200 + u8::try_from(i)?)), prev, event),
@@ -1897,19 +1556,21 @@ fn d5_clear_and_repopulate_keeps_staged_cells_warm() -> Result<()> {
             SectionClear::frozen(Section::new(0), &writes),
             SectionClear::frozen(Section::new(1), &writes),
         ];
-        let marker = EventMarker::frozen(event, &writes, &clears);
+        let marker = EventMarker::frozen(event, &writes, &clears, &evidence([].into(), None));
         cached
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
-        oracle.record_message(Uuid::from_u128(5)).await?;
 
-        cached.commit_provisional(&cref, &writes, &clears).await?;
+        cached.commit_provisional(&cref, &marker, &writes).await?;
 
         // S: every staged cell reads back WARM with `data` — zero lower reads.
         counting.reset();
         for (i, staged) in staged_cells.iter().enumerate() {
             assert_eq!(
-                cached.get(&id, staged, probe(80)).await?.get(),
+                CellRead::<Values>::read(&cached, &id, staged)
+                    .await?
+                    .0
+                    .get(),
                 Some(&bytes(200 + u8::try_from(i)?)),
                 "staged cell {i} keeps commit warmth through the clear"
             );
@@ -1923,7 +1584,10 @@ fn d5_clear_and_repopulate_keeps_staged_cells_warm() -> Result<()> {
         // clear; the cache pays the cold fall-through to absence).
         for victim in &victims {
             assert_eq!(
-                cached.get(&id, victim, probe(81)).await?.get(),
+                CellRead::<Values>::read(&cached, &id, victim)
+                    .await?
+                    .0
+                    .get(),
                 None,
                 "the cleared sections' other entries are gone"
             );
@@ -1939,12 +1603,7 @@ fn d5_clear_and_repopulate_keeps_staged_cells_warm() -> Result<()> {
 #[test]
 fn absent_fill_over_committed_foreign_provisional_publishes_present() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let cached = Cached::new(test_db::cache("neg_committed")?, counting.clone());
         let id = collection("neg-committed")?;
         let cref = CollectionRef::new(id.clone(), None);
@@ -1956,22 +1615,28 @@ fn absent_fill_over_committed_foreign_provisional_publishes_present() -> Result<
             cell_at(4),
             ProvisionalWrite::new(Some(bytes(44)), Committed::new(None), a),
         )];
-        let marker = EventMarker::frozen(a, &writes, &[]);
+        let marker = EventMarker::frozen(a, &writes, &[], &evidence([].into(), None));
         counting
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
-        oracle.record_message(Uuid::from_u128(1)).await?;
+        seed_commit_evidence(&counting, &cref).await?;
 
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(4), probe(2)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(4))
+                .await?
+                .0
+                .get(),
             Some(&bytes(44)),
             "the fill resolves the committed prior event provisional to present"
         );
         assert!(counting.lower_reads() >= 1, "the first get falls through");
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(4), probe(3)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(4))
+                .await?
+                .0
+                .get(),
             Some(&bytes(44)),
             "the resolved value was published"
         );
@@ -1987,12 +1652,7 @@ fn absent_fill_over_committed_foreign_provisional_publishes_present() -> Result<
 #[test]
 fn absent_fill_over_aborted_foreign_provisional_publishes_absent() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let cached = Cached::new(test_db::cache("neg_aborted")?, counting.clone());
         let id = collection("neg-aborted")?;
         let cref = CollectionRef::new(id.clone(), None);
@@ -2002,22 +1662,28 @@ fn absent_fill_over_aborted_foreign_provisional_publishes_absent() -> Result<()>
             cell_at(4),
             ProvisionalWrite::new(Some(bytes(44)), Committed::new(None), a),
         )];
-        let marker = EventMarker::frozen(a, &writes, &[]);
+        let marker = EventMarker::frozen(a, &writes, &[], &evidence([].into(), None));
         counting
             .write_provisional(&cref, &writes, Some(&marker))
             .await?;
-        // No record: the oracle resolves the event NotCommitted (aborted).
+        // No certificate exists, so the cell reads its committed base.
 
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(4), probe(2)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(4))
+                .await?
+                .0
+                .get(),
             None,
             "the fill resolves the aborted prior event provisional to its absent prev"
         );
         assert!(counting.lower_reads() >= 1, "the first get falls through");
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(4), probe(3)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(4))
+                .await?
+                .0
+                .get(),
             None,
             "absence stays correct"
         );
@@ -2030,39 +1696,32 @@ fn absent_fill_over_aborted_foreign_provisional_publishes_absent() -> Result<()>
     })
 }
 
-/// The recovery sweep never calls `scan_cells` — it rides `unsettled_marker`,
-/// the warm index, and `provisional_many` batch reads — so "scans are
-/// durable" (KV3) adds zero recovery cost. Falsified through the
-/// counting-store seam: the exact op set is asserted, never the sweep
-/// rewritten.
+/// Admission reads marker slices and listed coordinates without a cell scan.
+/// The counting store checks the exact operation set.
 #[test]
-fn sweep_issues_no_scan_cells() -> Result<()> {
+fn admission_issues_no_scans() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
-        let cached = Cached::new(test_db::cache("sweep_budget")?, counting.clone());
-        let id = collection("sweep-budget")?;
+        let dedup = MemoryDeduplicationStore::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
+        let cached = Cached::new(test_db::cache("admission_budget")?, counting.clone());
+        let id = collection("admission-budget")?;
         let cref = CollectionRef::new(id.clone(), None);
-        let writes = stage_committed_marker(&cached, &oracle, &cref, 6).await?;
+        let (writes, _marker) = stage_committed_marker(&cached, &cref, 6).await?;
         drop(writes);
 
         counting.reset();
-        let resolved = sweep_provisional(&cached, &oracle, &cref)
+        let resolved = admit_collection(&cached, &dedup, &cref)
             .await
-            .map_err(|e| eyre!("sweep failed: {e:?}"))?;
-        assert!(resolved, "the sweep resolved the staged marker");
+            .map_err(|e| eyre!("admission failed: {e:?}"))?;
+        assert!(resolved, "admission resolved the staged marker");
         assert_eq!(
             counting.lower_scans(),
             0,
-            "the sweep issues no scan_cells — recovery rides marker + batch reads only"
+            "admission uses marker and batch reads without a cell scan"
         );
         assert!(
             counting.marker_reads() >= 1,
-            "the sweep rode the unsettled-marker leg"
+            "admission rode the unsettled-marker leg"
         );
         Ok(())
     })
@@ -2075,12 +1734,7 @@ fn fill_publish_failure_costs_one_read_each() -> Result<()> {
     const N: usize = 3;
 
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle,
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let fjall = test_db::cache("fill_budget")?;
         let fail_puts = fjall.fail_puts();
         let cached = Cached::new(fjall, counting.clone());
@@ -2092,11 +1746,11 @@ fn fill_publish_failure_costs_one_read_each() -> Result<()> {
 
         counting.reset();
         fail_puts.store(true, Ordering::Relaxed);
-        for n in 0..N {
+        for _ in 0..N {
             assert_eq!(
-                cached
-                    .get(&id, &cell_at(1), probe(u128::try_from(n)?))
+                CellRead::<Values>::read(&cached, &id, &cell_at(1))
                     .await?
+                    .0
                     .get(),
                 Some(&bytes(7)),
                 "a degraded fill still answers correctly"
@@ -2105,7 +1759,10 @@ fn fill_publish_failure_costs_one_read_each() -> Result<()> {
         fail_puts.store(false, Ordering::Relaxed);
         // The (N+1)th read heals: one more durable read, then zero.
         assert_eq!(
-            cached.get(&id, &cell_at(1), probe(90)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
             Some(&bytes(7))
         );
         assert_eq!(
@@ -2115,7 +1772,10 @@ fn fill_publish_failure_costs_one_read_each() -> Result<()> {
         );
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(1), probe(91)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
             Some(&bytes(7))
         );
         assert_eq!(
@@ -2133,12 +1793,7 @@ fn fill_publish_failure_costs_one_read_each() -> Result<()> {
 #[test]
 fn fjall_read_failure_degrades_that_get() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle,
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let fjall = test_db::cache("read_degrade")?;
         let cached = Cached::new(fjall.clone(), counting.clone());
         let id = collection("read-degrade")?;
@@ -2154,14 +1809,20 @@ fn fjall_read_failure_degrades_that_get() -> Result<()> {
 
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(1), probe(1)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
             Some(&bytes(7)),
             "a fjall read failure degrades the get to a durable read, never fails it"
         );
         assert_eq!(counting.lower_reads(), 1, "exactly one degraded read");
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(1), probe(2)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
             Some(&bytes(7)),
             "the fill overwrote the corrupt frame"
         );
@@ -2174,56 +1835,39 @@ fn fjall_read_failure_degrades_that_get() -> Result<()> {
 ///
 /// A removal failure disables clone A.
 /// Clone B must then use durable storage.
-/// Recovery must ignore an incomplete cache index.
+/// Admission must use durable marker state.
 #[test]
 fn cache_disablement_applies_to_all_workspace_clones() -> Result<()> {
+    let metrics = GlobalMetrics::install_global();
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let dedup = MemoryDeduplicationStore::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let fjall = test_db::cache("disabled")?;
         let fail_puts = fjall.fail_puts();
         let fail_deletes = fjall.fail_deletes();
-        let fail_index_record = fjall.fail_index_record();
         let cached_a = Cached::new(fjall.clone(), counting.clone());
         let cached_b = cached_a.clone();
         let id = collection("disabled")?;
         let cref = CollectionRef::new(id.clone(), None);
         let event = probe(1);
 
-        // Add a cached value and create a complete provisional index.
+        // Add a cached value before the failed stage publication.
         cached_a
             .write_resolved(&cref, &[(cell_at(1), Some(bytes(1)))], &[])
             .await?;
-        let prev = cached_a.get(&id, &cell_at(0), event).await?;
-        let early = [(
-            cell_at(0),
-            ProvisionalWrite::new(Some(bytes(9)), prev, event),
-        )];
-        let marker = EventMarker::frozen(event, &early, &[]);
-        cached_a
-            .write_provisional(&cref, &early, Some(&marker))
-            .await?;
-        let seeded = drain_provisional(&cached_a, &id).await?;
-        assert_eq!(seeded, vec![0], "the first recovery created the index");
-
-        // Make the index update and its required cleanup fail.
-        fail_index_record.store(true, Ordering::Relaxed);
         fail_deletes.store(u64::try_from(DELETE_RETRY_BUDGET + 2)?, Ordering::Relaxed);
         fail_puts.store(true, Ordering::Relaxed);
-        let prev1 = counting.get(&id, &cell_at(1), event).await?;
+        let prev1 = CellRead::<Values>::read(&counting, &id, &cell_at(1))
+            .await?
+            .0;
         let stage = [(
             cell_at(1),
             ProvisionalWrite::new(Some(bytes(2)), prev1, event),
         )];
-        let marker2 = EventMarker::frozen(event, &stage, &[]);
+        let marker2 = EventMarker::frozen(event, &stage, &[], &evidence([].into(), None));
         cached_a
             .write_provisional(&cref, &stage, Some(&marker2))
             .await?;
-        fail_index_record.store(false, Ordering::Relaxed);
         fail_puts.store(false, Ordering::Relaxed);
         fail_deletes.store(0, Ordering::Relaxed);
 
@@ -2232,17 +1876,33 @@ fn cache_disablement_applies_to_all_workspace_clones() -> Result<()> {
             "the cleanup failure disabled the cache"
         );
 
+        assert_eq!(
+            metrics.points("prosody.state.cell.cache.disabled_assignments")?,
+            vec![(labels([]), 1)]
+        );
+        fjall.disable();
+        assert_eq!(
+            metrics.points("prosody.state.cell.cache.disabled_assignments")?,
+            vec![(labels([]), 1)],
+            "repeated disable must not count the assignment twice"
+        );
+
         // Clone B must not return the old cached value.
         counting.reset();
         assert_eq!(
-            cached_b.get(&id, &cell_at(1), event).await?.get(),
+            CellRead::<Values>::read(&cached_b, &id, &cell_at(1))
+                .await?
+                .0
+                .get(),
             Some(&bytes(1)),
             "clone B reads the committed value from durable storage"
         );
         assert!(counting.lower_reads() >= 1, "B's get is a durable read");
         // A repeated read must also use durable storage.
         counting.reset();
-        let _ = cached_b.get(&id, &cell_at(1), event).await?;
+        let _ = CellRead::<Values>::read(&cached_b, &id, &cell_at(1))
+            .await?
+            .0;
         assert!(
             counting.lower_reads() >= 1,
             "clone B does not update a disabled cache"
@@ -2253,21 +1913,20 @@ fn cache_disablement_applies_to_all_workspace_clones() -> Result<()> {
         );
 
         // Add a provisional cell after cache disablement.
-        // Recovery must read durable state instead of the incomplete index.
-        let prev3 = counting.get(&id, &cell_at(3), event).await?;
+        // Admission must resolve its durable marker.
+        let prev3 = CellRead::<Values>::read(&counting, &id, &cell_at(3))
+            .await?
+            .0;
         let post = [(
             cell_at(3),
             ProvisionalWrite::new(Some(bytes(5)), prev3, event),
         )];
-        let marker3 = EventMarker::frozen(event, &post, &[]);
+        let marker3 = EventMarker::frozen(event, &post, &[], &evidence([].into(), None));
         cached_b
             .write_provisional(&cref, &post, Some(&marker3))
             .await?;
-        let swept = drain_provisional(&cached_b, &id).await?;
-        assert!(
-            swept.contains(&3),
-            "recovery finds the cell that the disabled cache did not index"
-        );
+        assert!(admit_collection(&cached_b, &dedup, &cref).await?);
+        assert!(counting.marker_state(&id).await?.staged.is_none());
         Ok(())
     })
 }
@@ -2293,15 +1952,16 @@ enum CacheOp {
     /// `write_provisional` of present-data writes under a frozen marker;
     /// `clear` freezes a [`SECTION`] clear into it.
     Stage { writes: Vec<(u8, u8)>, clear: bool },
-    /// Record the unsettled stage's verdict, then `commit_provisional`.
+    /// Promotes the unsettled stage through `commit_provisional`.
     Commit,
     /// `abort_provisional` of the unsettled stage.
     Abort,
-    /// Raw `mark_resolved` of the unsettled stage's cells (the sweep's promote
-    /// path) — leaves the marker unsettled, as the raw verb does.
+    /// Resolves cells through the raw verb and leaves the marker unchanged.
     Promote,
     /// A point read of one pool key.
     Get(u8),
+    /// A presence read of one pool key.
+    Contains(u8),
     /// A full-section scan.
     Scan,
     /// Advance the fixed clock by N milliseconds (sub-second-grain, so the
@@ -2379,7 +2039,8 @@ impl Arbitrary for CacheTrace {
                         }
                     }
                 }
-                7..=10 => CacheOp::Get(u8::arbitrary(g) % POOL),
+                7..=8 => CacheOp::Get(u8::arbitrary(g) % POOL),
+                9..=10 => CacheOp::Contains(u8::arbitrary(g) % POOL),
                 11 => CacheOp::Scan,
                 12..=13 => CacheOp::Advance(u16::arbitrary(g) % 12_000),
                 14 => CacheOp::FaultPuts(bool::arbitrary(g)),
@@ -2412,29 +2073,19 @@ impl Arbitrary for CacheTrace {
 
 /// An unsettled stage's replay bookkeeping.
 struct Staged {
-    dedup: u128,
     writes: Vec<(CellKey, ProvisionalWrite)>,
     clears: Vec<SectionClear>,
 }
 
-/// A consumed-but-unsettled marker (left unsettled by [`CacheOp::Promote`]).
-struct StaleMarker {
-    staged: Vec<CellKey>,
-    clears: bool,
-}
-
-/// The KV5 warm-set model: cell → the expiry its entry carries (`u64::MAX`
-/// unsettled in for a fill's effectively-unreachable stamp). A cell present
-/// and unexpired here MUST be a fjall hit; anything else is excluded by
-/// construction.
-type WarmModel = HashMap<u8, u64>;
+/// The cache knowledge and expiry for each modeled cell.
+type WarmModel = HashMap<u8, (u64, CacheEntry<Bytes>)>;
 
 /// The one-shot replay state of [`prop_cached_is_transparent`], carried
 /// through every op and the per-op verification passes.
 struct Replay {
-    subject: Cached<TtlAwareCellStore<MemoryCellStore<ScriptedOracle>>>,
-    twin: MemoryCellStore<ScriptedOracle>,
-    oracle: ScriptedOracle,
+    subject: Cached<TtlAwareCellStore<MemoryCellStore>>,
+    twin: MemoryCellStore,
+    counting: CountingCellStore<MemoryCellStore>,
     id: CollectionId,
     cref: CollectionRef,
     twin_ref: CollectionRef,
@@ -2443,7 +2094,6 @@ struct Replay {
     clock: u64,
     stage_seq: u128,
     staged: Option<Staged>,
-    stale: Option<StaleMarker>,
     fault_puts: bool,
     warm: WarmModel,
     fail_puts: Arc<AtomicBool>,
@@ -2451,16 +2101,6 @@ struct Replay {
 }
 
 impl Replay {
-    /// The `own` event verification reads use: the unsettled stage's event
-    /// while one stands (an own-event read short-circuits to `prev` without
-    /// resolving the stage), a fixed prior event reader otherwise.
-    fn reader(&self) -> EventRef {
-        match &self.staged {
-            Some(staged) => probe(staged.dedup),
-            None => probe(u128::MAX),
-        }
-    }
-
     /// The modeled fjall expiry of a write-through landing now.
     fn write_expiry(&self) -> u64 {
         self.ttl_ms
@@ -2468,35 +2108,23 @@ impl Replay {
     }
 
     /// Whether the warm model says `key` is a live hit at the current clock.
-    fn is_warm(&self, key: u8) -> bool {
-        self.warm
-            .get(&key)
-            .is_some_and(|&expiry| expiry == u64::MAX || self.clock < expiry)
+    fn is_warm<P: Projection>(&self, key: u8) -> bool {
+        self.warm.get(&key).is_some_and(|(expiry, entry)| {
+            (*expiry == u64::MAX || self.clock < *expiry)
+                && !matches!(P::from_cached(entry.clone()), Read::Unknown)
+        })
     }
 
     /// Publish-through model update: the batch either warms every cell (a
     /// clean atomic publish) or — under the puts fault — lands nothing and
     /// failed-publish cache guard deletes every cell.
-    fn model_publish(&mut self, keys: impl IntoIterator<Item = u8>) {
+    fn model_publish(&mut self, cells: impl IntoIterator<Item = (u8, Option<Bytes>)>) {
         let expiry = self.write_expiry();
-        for key in keys {
+        for (key, value) in cells {
             if self.fault_puts {
                 self.warm.remove(&key);
             } else {
-                self.warm.insert(key, expiry);
-            }
-        }
-    }
-
-    /// Removes model entries that marker resolution can change.
-    fn model_stale_resolved(&mut self) {
-        if let Some(stale) = self.stale.take() {
-            if stale.clears {
-                self.warm.clear();
-            } else {
-                for cell in &stale.staged {
-                    self.warm.remove(&cell.coordinate.as_bytes()[0]);
-                }
+                self.warm.insert(key, (expiry, Values::into_cached(value)));
             }
         }
     }
@@ -2531,13 +2159,12 @@ impl Replay {
         self.model_publish(
             resolved
                 .iter()
-                .map(|(cell, _)| cell.coordinate.as_bytes()[0]),
+                .map(|(cell, value)| (cell.coordinate.as_bytes()[0], value.clone())),
         );
         Ok(())
     }
 
-    /// One `write_provisional` through both stores, updating the warm model
-    /// (including the boundary prior-clear cache guard over a stale marker).
+    /// Stages cells through both stores and updates the warm model.
     async fn step_stage(&mut self, writes: &[(u8, u8)], clear: bool) -> Result<()> {
         self.stage_seq += 1;
         let event = probe(self.stage_seq);
@@ -2546,10 +2173,9 @@ impl Replay {
             // The committed base read, off the twin — identical to the
             // subject's by the parity just asserted, and it leaves the
             // subject's cache untouched.
-            let prev = self
-                .twin
-                .get(&self.id, &cell_at(*key), event)
+            let prev = CellRead::<Values>::read(&self.twin, &self.id, &cell_at(*key))
                 .await
+                .map(|(committed, _)| committed)
                 .map_err(|e| eyre!("twin prev read: {e:?}"))?;
             staged.push((
                 cell_at(*key),
@@ -2560,10 +2186,7 @@ impl Replay {
             .then(|| SectionClear::frozen(SECTION, &staged))
             .into_iter()
             .collect();
-        let marker = EventMarker::frozen(event, &staged, &clears);
-        // The subject's stage boundary resolves a stale prior event marker
-        // beneath and fires the boundary prior-clear cache guard.
-        let stale_pending = self.stale.is_some();
+        let marker = EventMarker::frozen(event, &staged, &clears, &evidence([].into(), None));
         self.subject
             .write_provisional(&self.cref, &staged, Some(&marker))
             .await
@@ -2572,15 +2195,12 @@ impl Replay {
             .write_provisional(&self.twin_ref, &staged, Some(&marker))
             .await
             .map_err(|e| eyre!("twin stage: {e:?}"))?;
-        if stale_pending {
-            // The boundary delete is verdict-blind and unconditional on
-            // clears: staged coordinates always drop; a stale marker with
-            // clears drops its section wholesale.
-            self.model_stale_resolved();
-        }
-        self.model_publish(staged.iter().map(|(cell, _)| cell.coordinate.as_bytes()[0]));
+        self.model_publish(
+            staged
+                .iter()
+                .map(|(cell, write)| (cell.coordinate.as_bytes()[0], write.prev().cloned())),
+        );
         self.staged = Some(Staged {
-            dedup: self.stage_seq,
             writes: staged,
             clears,
         });
@@ -2596,15 +2216,18 @@ impl Replay {
                 let Some(staged) = self.staged.take() else {
                     return Err(eyre!("commit without an unsettled stage"));
                 };
-                self.oracle
-                    .record_message(Uuid::from_u128(staged.dedup))
-                    .await?;
+                let marker = self
+                    .twin
+                    .marker_state(self.twin_ref.id())
+                    .await?
+                    .staged
+                    .ok_or_else(|| eyre!("commit needs the staged marker"))?;
                 self.subject
-                    .commit_provisional(&self.cref, &staged.writes, &staged.clears)
+                    .commit_provisional(&self.cref, &marker, &staged.writes)
                     .await
                     .map_err(|e| eyre!("subject commit: {e:?}"))?;
                 self.twin
-                    .commit_provisional(&self.twin_ref, &staged.writes, &staged.clears)
+                    .commit_provisional(&self.twin_ref, &marker, &staged.writes)
                     .await
                     .map_err(|e| eyre!("twin commit: {e:?}"))?;
                 let staged_keys: Vec<u8> = staged
@@ -2622,8 +2245,11 @@ impl Replay {
                         self.warm.remove(key);
                     }
                 }
-                // A successful transform keeps the staged cells warm at their
-                // stage-anchored expiry — already in the model from the stage.
+                for (cell, write) in &staged.writes {
+                    if let Some((_, entry)) = self.warm.get_mut(&cell.coordinate.as_bytes()[0]) {
+                        *entry = Values::into_cached(write.data().cloned());
+                    }
+                }
             }
             CacheOp::Abort => {
                 let Some(staged) = self.staged.take() else {
@@ -2638,10 +2264,9 @@ impl Replay {
                     .await
                     .map_err(|e| eyre!("twin abort: {e:?}"))?;
                 self.model_publish(
-                    staged
-                        .writes
-                        .iter()
-                        .map(|(cell, _)| cell.coordinate.as_bytes()[0]),
+                    staged.writes.iter().map(|(cell, write)| {
+                        (cell.coordinate.as_bytes()[0], write.prev().cloned())
+                    }),
                 );
             }
             CacheOp::Promote => {
@@ -2658,18 +2283,13 @@ impl Replay {
                     .mark_resolved(&self.twin_ref, &cells)
                     .await
                     .map_err(|e| eyre!("twin promote: {e:?}"))?;
-                // promotion cache guard deleted the promoted entries; the raw verb leaves the
-                // marker unsettled (consumed later by a read or the next
-                // stage's boundary).
+                // Raw promotion removes cached entries and leaves the marker unchanged.
                 for cell in &cells {
                     self.warm.remove(&cell.coordinate.as_bytes()[0]);
                 }
-                self.stale = Some(StaleMarker {
-                    staged: cells,
-                    clears: !staged.clears.is_empty(),
-                });
             }
             CacheOp::Get(key) => self.check_get(*key).await?,
+            CacheOp::Contains(key) => self.check_presence(slice::from_ref(key)).await?,
             CacheOp::Scan => self.check_scan().await?,
             CacheOp::Advance(ms) => {
                 self.clock += u64::from(*ms);
@@ -2688,26 +2308,19 @@ impl Replay {
 
     /// One parity get of `key`, updating the warm model with the fill.
     async fn check_get(&mut self, key: u8) -> Result<()> {
-        let own = self.reader();
-        // A fall-through read of a stale marker with clears fires prior-clear cache
-        // guard and resolves the marker beneath; a warm hit touches neither.
-        let falls_through = !self.is_warm(key);
-        if falls_through
-            && let Some(stale) = &self.stale
-            && stale.clears
-            && self.staged.is_none()
-        {
-            self.model_stale_resolved();
-        }
-        let subject = self
-            .subject
-            .get(&self.id, &cell_at(key), own)
+        let falls_through = !self.is_warm::<Values>(key);
+        let before = self.counting.lower_reads();
+        let other_reads = (
+            self.counting.batch_cache_reads(),
+            self.counting.presence_reads(),
+        );
+        let subject = CellRead::<Values>::read(&self.subject, &self.id, &cell_at(key))
             .await
+            .map(|(committed, _)| committed)
             .map_err(|e| eyre!("subject get: {e:?}"))?;
-        let twin = self
-            .twin
-            .get(&self.id, &cell_at(key), own)
+        let twin = CellRead::<Values>::read(&self.twin, &self.id, &cell_at(key))
             .await
+            .map(|(committed, _)| committed)
             .map_err(|e| eyre!("twin get: {e:?}"))?;
         if subject.get() != twin.get() {
             return Err(eyre!(
@@ -2716,41 +2329,108 @@ impl Replay {
                 twin.get()
             ));
         }
-        if falls_through {
-            // The fill published (or failed to): fills stamp the remaining
-            // TTL of a far-future death — effectively never.
-            if self.fault_puts {
-                self.warm.remove(&key);
-            } else {
-                self.warm.insert(key, u64::MAX);
+        assert_eq!(
+            self.counting.lower_reads() - before,
+            usize::from(falls_through),
+            "the model predicts each value read"
+        );
+        assert_eq!(
+            (
+                self.counting.batch_cache_reads(),
+                self.counting.presence_reads()
+            ),
+            other_reads,
+            "a value point does not fetch another projection or batch"
+        );
+        if falls_through && !self.fault_puts {
+            self.warm
+                .insert(key, (u64::MAX, Values::into_cached(twin.into_inner())));
+        }
+        Ok(())
+    }
+
+    /// Compares full-section scans without a cache update.
+    async fn check_scan(&mut self) -> Result<()> {
+        let before = self.counting.lower_scans();
+        let reads = (
+            self.counting.lower_reads(),
+            self.counting.batch_cache_reads(),
+            self.counting.presence_reads(),
+            self.counting.presence_scans(),
+        );
+        let subject = scan_forward(&self.subject, &self.id, 0, ScanEdge::Included(255)).await?;
+        let twin = scan_forward(&self.twin, &self.id, 0, ScanEdge::Included(255)).await?;
+        if subject != twin {
+            return Err(eyre!("scan diverged: subject {subject:?}, twin {twin:?}"));
+        }
+        assert_eq!(
+            self.counting.lower_scans() - before,
+            1,
+            "each scan reads the lower store"
+        );
+        assert_eq!(
+            (
+                self.counting.lower_reads(),
+                self.counting.batch_cache_reads(),
+                self.counting.presence_reads(),
+                self.counting.presence_scans()
+            ),
+            reads,
+            "a scan adds no other reads"
+        );
+        Ok(())
+    }
+
+    /// Checks presence answers, cache knowledge, and lower read counts.
+    async fn check_presence(&mut self, keys: &[u8]) -> Result<()> {
+        let batch = batch_of(keys.iter().copied())?;
+        let missed: CellBuffer<u8> = keys
+            .iter()
+            .copied()
+            .filter(|key| !self.is_warm::<Presence>(*key))
+            .collect();
+        let before = self.counting.presence_reads();
+        let value_reads = (
+            self.counting.lower_reads(),
+            self.counting.batch_cache_reads(),
+        );
+        let presence =
+            CellRead::<Presence>::read_many(&self.subject, &self.id, SECTION, &batch).await?;
+        let expected = CellRead::<Values>::read_many(&self.twin, &self.id, SECTION, &batch).await?;
+        assert_eq!(
+            self.counting.presence_reads() - before,
+            usize::from(!missed.is_empty()),
+            "the model predicts each presence batch"
+        );
+        assert_eq!(
+            (
+                self.counting.lower_reads(),
+                self.counting.batch_cache_reads()
+            ),
+            value_reads,
+            "presence does not fetch values"
+        );
+        assert_eq!(presence.len(), expected.len());
+        for ((key, (present, _)), (value, _)) in keys.iter().zip(presence).zip(expected) {
+            assert_eq!(
+                present.get().is_some(),
+                value.get().is_some(),
+                "presence differs at {key}"
+            );
+            if missed.contains(key) && !self.fault_puts {
+                self.warm.insert(
+                    *key,
+                    (u64::MAX, Presence::into_cached(present.into_inner())),
+                );
             }
         }
         Ok(())
     }
 
-    /// One parity full-section scan. Scans fire prior-clear cache guard on a
-    /// stale marker with clears and resolve it beneath, but publish
-    /// nothing (KV3).
-    async fn check_scan(&mut self) -> Result<()> {
-        let own = self.reader();
-        if let Some(stale) = &self.stale
-            && stale.clears
-            && self.staged.is_none()
-        {
-            self.model_stale_resolved();
-        }
-        let subject =
-            scan_forward(&self.subject, &self.id, 0, ScanEdge::Included(255), own).await?;
-        let twin = scan_forward(&self.twin, &self.id, 0, ScanEdge::Included(255), own).await?;
-        if subject != twin {
-            return Err(eyre!("scan diverged: subject {subject:?}, twin {twin:?}"));
-        }
-        Ok(())
-    }
-
-    /// The after-every-op verification: every pool cell's get and one
-    /// full-section scan answer identically.
+    /// Checks both projections and the full scan after each operation.
     async fn verify(&mut self) -> Result<()> {
+        let keys: Vec<_> = (0..POOL).rev().chain([0, POOL]).collect();
+        self.check_presence(&keys).await?;
         for key in 0..POOL {
             self.check_get(key).await?;
         }
@@ -2758,14 +2438,74 @@ impl Replay {
     }
 }
 
+/// Failed point and batch probes preserve every warm value frame.
+async fn check_failed_probes(replay: &Replay, fjall: &FjallCellCache) -> Result<()> {
+    let cells: Vec<_> = (0..POOL)
+        .map(|key| (cell_at(key), Some(bytes(key))))
+        .collect();
+    replay
+        .subject
+        .write_resolved(&replay.cref, &cells, &[])
+        .await?;
+    let batch = batch_of((0..POOL).rev().chain([0]))?;
+    for fail_puts in [false, true] {
+        fjall.fail_puts().store(fail_puts, Ordering::Relaxed);
+        fjall.fail_reads().store(true, Ordering::Relaxed);
+        replay.counting.reset();
+        let presence =
+            CellRead::<Presence>::read_many(&replay.subject, &replay.id, SECTION, &batch).await?;
+        assert!(presence.iter().all(|(value, _)| value.get().is_some()));
+        assert_eq!(replay.counting.presence_reads(), 1);
+        fjall.fail_reads().store(false, Ordering::Relaxed);
+        replay.counting.reset();
+        let values =
+            CellRead::<Values>::read_many(&replay.subject, &replay.id, SECTION, &batch).await?;
+        assert!(values.iter().all(|(value, _)| value.get().is_some()));
+        assert_eq!(
+            replay.counting.batch_cache_reads(),
+            0,
+            "failed batch probes preserve values"
+        );
+        assert_eq!(replay.counting.lower_reads(), 0);
+
+        for key in 0..POOL {
+            fjall.fail_reads().store(true, Ordering::Relaxed);
+            replay.counting.reset();
+            assert!(
+                CellRead::<Presence>::read(&replay.subject, &replay.id, &cell_at(key))
+                    .await?
+                    .0
+                    .get()
+                    .is_some()
+            );
+            assert_eq!(replay.counting.presence_reads(), 1);
+            fjall.fail_reads().store(false, Ordering::Relaxed);
+            replay.counting.reset();
+            assert_eq!(
+                CellRead::<Values>::read(&replay.subject, &replay.id, &cell_at(key))
+                    .await?
+                    .0
+                    .get(),
+                Some(&bytes(key))
+            );
+            assert_eq!(
+                replay.counting.lower_reads(),
+                0,
+                "failed point probes preserve values"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// **The transparency property** — the whole contract of a transparent cache
 /// in one differential: one generated cell-op trace (writes, provisional
 /// stage/commit/abort, raw promotes, clears, gets, scans, clock movement,
 /// TTL'd and not) through `Cached` over a memory store AND through a bare
-/// memory twin sharing one scripted oracle; after **every** op, every pool
-/// cell's `get` and a full-section scan answer identically. Bounded fjall
-/// fault injection (`fail_puts`, an in-budget `fail_deletes` countdown) runs
-/// degraded-cache paths inside the property, not beside it.
+/// memory twin with equivalent commit evidence; after **every** op, every pool
+/// cell's value, batch presence, and section scan answer identically. Bounded
+/// fjall fault injection (`fail_puts`, an in-budget `fail_deletes` countdown)
+/// runs degraded-cache paths inside the property, not beside it.
 ///
 /// The second arm is the **KV5 budget**: after the trace (fault seams healed
 /// and one model-updating verification pass run), re-getting every pool cell
@@ -2781,29 +2521,20 @@ fn prop_cached_is_transparent() {
             const DEATH: u64 = u64::MAX / 2;
 
             let now = Arc::new(AtomicU64::new(START));
-            let oracle = ScriptedOracle::default();
-            let counting = CountingCellStore::new(MemoryCellStore::new(
-                MemoryCells::new(),
-                oracle.clone(),
-                Arc::new(CollectionDefRegistry::default()),
-            ));
+            let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
             let ttl_lower =
                 TtlAwareCellStore::new(counting.clone(), Clock::Fixed(now.clone()), DEATH);
             let fjall = test_db::cache_with_clock("transparent", Clock::Fixed(now.clone()))?;
             let fail_puts = fjall.fail_puts();
             let fail_deletes = fjall.fail_deletes();
-            let subject = Cached::new(fjall, ttl_lower.clone());
-            let twin = MemoryCellStore::new(
-                MemoryCells::new(),
-                oracle.clone(),
-                Arc::new(CollectionDefRegistry::default()),
-            );
+            let subject = Cached::new(fjall.clone(), ttl_lower.clone());
+            let twin = MemoryCellStore::new(MemoryCells::new());
             let id = collection("transparent")?;
             let ttl = trace.ttl.map(CompactDuration::new);
             let mut replay = Replay {
                 subject,
                 twin,
-                oracle,
+                counting,
                 cref: CollectionRef::new(id.clone(), ttl),
                 twin_ref: CollectionRef::new(id.clone(), ttl),
                 id,
@@ -2812,7 +2543,6 @@ fn prop_cached_is_transparent() {
                 clock: START,
                 stage_seq: 0,
                 staged: None,
-                stale: None,
                 fault_puts: false,
                 warm: WarmModel::new(),
                 fail_puts,
@@ -2831,23 +2561,20 @@ fn prop_cached_is_transparent() {
             }
 
             // The KV5 budget arm: heal the seams, run one model-updating
-            // verification pass (re-warming what the faults left cold and
-            // consuming any stale marker), then assert every warm-model cell
+            // verification pass to refill cold entries, then assert every warm-model cell
             // re-gets with zero lower reads.
             replay.fail_puts.store(false, Ordering::Relaxed);
             replay.fail_deletes.store(0, Ordering::Relaxed);
             replay.fault_puts = false;
             replay.verify().await.map_err(|e| eyre!("heal pass: {e}"))?;
             for key in 0..POOL {
-                if !replay.is_warm(key) {
+                if !replay.is_warm::<Values>(key) {
                     continue;
                 }
                 ttl_lower.reset();
-                let own = replay.reader();
-                let _ = replay
-                    .subject
-                    .get(&replay.id, &cell_at(key), own)
+                let _ = CellRead::<Values>::read(&replay.subject, &replay.id, &cell_at(key))
                     .await
+                    .map(|(committed, _)| committed)
                     .map_err(|e| eyre!("budget get({key}): {e:?}"))?;
                 if ttl_lower.lower_reads() != 0 {
                     return Err(eyre!(
@@ -2856,6 +2583,7 @@ fn prop_cached_is_transparent() {
                     ));
                 }
             }
+            check_failed_probes(&replay, &fjall).await?;
             Ok(true)
         })
     }
@@ -2969,10 +2697,8 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
         TEST_RUNTIME.block_on(async move {
             const START: u64 = 1_000;
             let now = Arc::new(AtomicU64::new(START));
-            let oracle = ScriptedOracle::default();
             let cells = MemoryCells::new();
-            let lower =
-                MemoryCellStore::new(cells, oracle, Arc::new(CollectionDefRegistry::default()));
+            let lower = MemoryCellStore::new(cells);
             let cached = Cached::new(
                 test_db::cache_with_clock("ttl-anchor", Clock::Fixed(now.clone()))?,
                 lower,
@@ -3015,7 +2741,7 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
                             event,
                         );
                         let writes = [(cell_at(key), write)];
-                        let marker = EventMarker::frozen(event, &writes, &[]);
+                        let marker = ttl_marker(event, &writes);
                         cached
                             .write_provisional(&cref, &writes, Some(&marker))
                             .await?;
@@ -3031,9 +2757,9 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
                             prev_of(&committed, key),
                             event,
                         );
-                        cached
-                            .commit_provisional(&cref, &[(cell_at(key), write)], &[])
-                            .await?;
+                        let writes = [(cell_at(key), write)];
+                        let marker = ttl_marker(event, &writes);
+                        cached.commit_provisional(&cref, &marker, &writes).await?;
                         committed.insert(key, Committed::new(Some(bytes(value))));
                         // The settle transform reuses the stage stamp → death
                         // unchanged.
@@ -3080,17 +2806,13 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
 // ─────────────────────────── batch reads (get_many) ────────────────────────
 
 /// A memory lower store wrapped in the batch tests' read counter.
-type CountingLower = CountingCellStore<MemoryCellStore<ScriptedOracle>>;
+type CountingLower = CountingCellStore<MemoryCellStore>;
 
 /// Builds a `Cached` over a [`CountingLower`] on the shared fjall database,
 /// returning the cache handle, the counting handle, and the collection — the
 /// batch tests' shared arrange.
 fn counting_cached(name: &str) -> Result<(Cached<CountingLower>, CountingLower, CollectionId)> {
-    let counting = CountingCellStore::new(MemoryCellStore::new(
-        MemoryCells::new(),
-        ScriptedOracle::default(),
-        Arc::new(CollectionDefRegistry::default()),
-    ));
+    let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
     let cached = Cached::new(test_db::cache(name)?, counting.clone());
     let id = collection(name)?;
     Ok((cached, counting, id))
@@ -3098,63 +2820,18 @@ fn counting_cached(name: &str) -> Result<(Cached<CountingLower>, CountingLower, 
 
 /// Presence scans through the cache match value scan keys.
 #[test]
-fn prop_cached_scan_presence_parity() {
+fn prop_cached_projection_scan_parity() {
     fn property(trace: ScanTrace) -> Result<bool> {
         let cells = MemoryCells::new();
-        let oracle = ScriptedOracle::default();
-        let name = Uuid::new_v4().to_string();
-        let cached = cached_over(&cells, &oracle, &name)?;
+        let name = uuid::Uuid::new_v4().to_string();
+        let cached = cached_over(&cells, &name)?;
         let probe = MemoryShapeProbe(cells);
         TEST_RUNTIME.block_on(run_bottom_scan_trace(cached, trace, &probe))
     }
     QuickCheck::new().quickcheck(property as fn(ScanTrace) -> Result<bool>);
 }
 
-/// Presence batches through the cache match value batch reads.
-#[test]
-fn prop_cached_batch_presence_parity() {
-    fn property(trace: BatchReadTrace) -> Result<bool> {
-        let cells = MemoryCells::new();
-        let oracle = ScriptedOracle::default();
-        let name = Uuid::new_v4().to_string();
-        let bottom = MemoryCellStore::new(
-            cells.clone(),
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        );
-        let cached = cached_over(&cells, &oracle, &name)?;
-        TEST_RUNTIME.block_on(run_batch_read_parity_trace(bottom, cached, oracle, trace))
-    }
-    QuickCheck::new().quickcheck(property as fn(BatchReadTrace) -> Result<bool>);
-}
-
-/// A fully warm presence batch uses present and absent cache entries.
-#[test]
-fn batch_presence_all_hits_reads_nothing() -> Result<()> {
-    TEST_RUNTIME.block_on(async {
-        let (cached, counting, id) = counting_cached("presence-all-hits")?;
-        let collection = CollectionRef::new(id.clone(), None);
-        counting
-            .write_resolved(&collection, &[(cell_at(1), Some(bytes(1)))], &[])
-            .await?;
-        let batch = batch_of([1, 2])?;
-        cached.get_many(&id, SECTION, &batch, probe(1)).await?;
-        counting.reset();
-
-        assert_eq!(
-            cached.contains_many(&id, SECTION, &batch, probe(2)).await?,
-            PresenceBatch::from_iter([true, false]),
-        );
-        assert_eq!(counting.presence_reads(), 0, "warm hits need no lower read");
-        Ok(())
-    })
-}
-
-/// T-a all-hits: a `CELL_BATCH`-wide chunk whose every coordinate is warm
-/// serves from fjall in one blocking hop with ZERO lower reads of any kind.
-///
-/// Dropping the `Ok(Some) => return` arm (always refetch) makes this test fail
-/// this: `batch_cache_reads()` would climb to 1.
+/// A warm batch returns every value without a lower read.
 #[test]
 fn batch_get_all_hits_reads_nothing() -> Result<()> {
     TEST_RUNTIME.block_on(async {
@@ -3166,9 +2843,14 @@ fn batch_get_all_hits_reads_nothing() -> Result<()> {
         cached.write_resolved(&cref, &warm, &[]).await?;
 
         counting.reset();
-        let out = cached
-            .get_many(&id, SECTION, &batch_of(0u8..16)?, probe(1))
-            .await?;
+        let out = CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of(0u8..16)?)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed)
+                    .collect::<CommittedBatch>()
+            })?;
         assert_eq!(out.len(), 16, "every position answered");
         for c in 0u8..16 {
             assert_eq!(
@@ -3179,11 +2861,6 @@ fn batch_get_all_hits_reads_nothing() -> Result<()> {
         }
         assert_eq!(counting.lower_reads(), 0, "all-hits reads no point durable");
         assert_eq!(
-            counting.batch_reads(),
-            0,
-            "all-hits issues no lower get_many"
-        );
-        assert_eq!(
             counting.batch_cache_reads(),
             0,
             "all-hits issues no lower cache-fill batch"
@@ -3192,12 +2869,7 @@ fn batch_get_all_hits_reads_nothing() -> Result<()> {
     })
 }
 
-/// T-a any-miss: one cold coordinate in an otherwise-warm chunk forces EXACTLY
-/// ONE lower cache-fill batch read (never the non-TTL `get_many`), and the
-/// served values are durable truth.
-///
-/// Routing the miss arm to `lower.get_many` (dropping the fill's TTL) makes
-/// this test fail this: `batch_reads()==1, batch_cache_reads()==0`.
+/// One cold position causes one lower batch read with durable TTLs.
 #[test]
 fn batch_get_any_miss_is_one_lower_batch_read() -> Result<()> {
     TEST_RUNTIME.block_on(async {
@@ -3209,9 +2881,14 @@ fn batch_get_any_miss_is_one_lower_batch_read() -> Result<()> {
         cached.write_resolved(&cref, &warm, &[]).await?;
 
         counting.reset();
-        let out = cached
-            .get_many(&id, SECTION, &batch_of(0u8..16)?, probe(1))
-            .await?;
+        let out = CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of(0u8..16)?)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed)
+                    .collect::<CommittedBatch>()
+            })?;
         assert_eq!(out.len(), 16, "every position answered");
         for c in 0u8..15 {
             assert_eq!(
@@ -3231,11 +2908,6 @@ fn batch_get_any_miss_is_one_lower_batch_read() -> Result<()> {
             "any-miss refetches the whole batch via one cache-fill read"
         );
         assert_eq!(
-            counting.batch_reads(),
-            0,
-            "the miss arm never uses lower get_many"
-        );
-        assert_eq!(
             counting.lower_reads(),
             0,
             "the fill loops the inner store, not this get"
@@ -3250,44 +2922,34 @@ fn batch_get_any_miss_is_one_lower_batch_read() -> Result<()> {
 #[test]
 fn batch_get_completes_after_cache_disablement() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let lower = HoldingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
+        let holds = lower.holds();
         let fjall = test_db::cache("batch-admitted")?;
-        let cached = Cached::new(fjall.clone(), counting.clone());
+        let cached = Cached::new(fjall.clone(), lower);
         let id = collection("batch-admitted")?;
-        let cref = CollectionRef::new(id.clone(), None);
-
-        // Stand a prior-event committed clears-only marker over the section (empty
-        // survivors) so a fall-through read triggers the prior-clear cache guard
-        // delete.
-        let prior_event = probe(7);
-        let clear = SectionClear::frozen_resolved(SECTION, &[]);
-        let marker = EventMarker::frozen(prior_event, &[], slice::from_ref(&clear));
-        cached.write_provisional(&cref, &[], Some(&marker)).await?;
-        oracle.record_message(Uuid::from_u128(7)).await?;
-
-        // Every must-succeed delete now fails: the prior-clear cache guard delete
-        // exhausts its budget and disables the cache during the operation.
-        fjall.fail_deletes().store(u64::MAX, Ordering::Relaxed);
-        counting.reset();
-        cached
-            .get_many(&id, SECTION, &batch_of([0])?, probe(99))
-            .await?;
-
-        // The injected failure disabled the cache.
-        assert!(
-            fjall.is_disabled(),
-            "the exhausted prior-clear cache guard delete must disable the cache during the \
-             operation"
-        );
-        // Yet the admitted verb still published the fill to fjall.
+        let task = {
+            let cached = cached.clone();
+            let id = id.clone();
+            holds.read().arm(1);
+            tokio::spawn(async move {
+                CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of([0])?)
+                    .await
+                    .map(|cells| {
+                        cells
+                            .into_iter()
+                            .map(|(committed, _)| committed)
+                            .collect::<CommittedBatch>()
+                    })
+                    .map_err(color_eyre::Report::from)
+            })
+        };
+        holds.read().entered().await;
+        fjall.disable();
+        holds.read().release();
+        assert_eq!(task.await??.len(), 1);
         assert!(
             fjall.stored_expiry(&id, &cell_at(0)).await?.is_some(),
-            "an admitted batch completes its publish after disablement"
+            "an accepted batch completes its publish after disablement"
         );
         Ok(())
     })
@@ -3299,12 +2961,7 @@ fn batch_get_completes_after_cache_disablement() -> Result<()> {
 #[test]
 fn batch_get_discards_sampled_hits_on_any_miss() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle.clone(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let cached = Cached::new(test_db::cache("batch-discard")?, counting.clone());
         let id = collection("batch-discard")?;
         let cref = CollectionRef::new(id.clone(), None);
@@ -3313,20 +2970,20 @@ fn batch_get_discards_sampled_hits_on_any_miss() -> Result<()> {
         cached
             .write_resolved(&cref, &[(cell_at(0), Some(bytes(42)))], &[])
             .await?;
-        // (2)+(3) A prior event's unsettled committed clears-only marker over the
-        // section (A is not a survivor), leaving A warm but its durable truth
-        // resolving to absent.
-        let prior_event = probe(7);
-        let clear = SectionClear::frozen_resolved(SECTION, &[]);
-        let marker = EventMarker::frozen(prior_event, &[], slice::from_ref(&clear));
-        cached.write_provisional(&cref, &[], Some(&marker)).await?;
-        oracle.record_message(Uuid::from_u128(7)).await?;
+        counting
+            .write_resolved(&cref, &[(cell_at(0), None)], &[])
+            .await?;
 
         // Batch [A (Hit), B (Miss)]: the miss forces a refetch that discards the
         // sampled A=Some(42) and re-reads post-clear truth — A is absent.
-        let out = cached
-            .get_many(&id, SECTION, &batch_of([0, 1])?, probe(99))
-            .await?;
+        let out = CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of([0, 1])?)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed)
+                    .collect::<CommittedBatch>()
+            })?;
         assert_eq!(out.len(), 2, "every position answered");
         assert_eq!(
             out[0].get(),
@@ -3342,12 +2999,7 @@ fn batch_get_discards_sampled_hits_on_any_miss() -> Result<()> {
 #[test]
 fn batch_get_failed_publish_keeps_hidden_live_entry_warm() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle,
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let fjall = test_db::cache("batch-hidden")?;
         let cached = Cached::new(fjall.clone(), counting.clone());
         let id = collection("batch-hidden")?;
@@ -3361,9 +3013,14 @@ fn batch_get_failed_publish_keeps_hidden_live_entry_warm() -> Result<()> {
         // Probe errors (over the live A entry) AND the publish fails.
         fjall.fail_reads().store(true, Ordering::Relaxed);
         fjall.fail_puts().store(true, Ordering::Relaxed);
-        let out = cached
-            .get_many(&id, SECTION, &batch_of([0])?, probe(1))
-            .await?;
+        let out = CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of([0])?)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed)
+                    .collect::<CommittedBatch>()
+            })?;
         assert_eq!(out.len(), 1, "the single position answered");
         assert_eq!(
             out[0].get(),
@@ -3382,7 +3039,10 @@ fn batch_get_failed_publish_keeps_hidden_live_entry_warm() -> Result<()> {
         fjall.fail_puts().store(false, Ordering::Relaxed);
         counting.reset();
         assert_eq!(
-            cached.get(&id, &cell_at(0), probe(2)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(9)),
             "the failed publish deleted nothing: A stayed warm"
         );
@@ -3405,12 +3065,7 @@ fn batch_get_treats_expired_probe_as_refetch() -> Result<()> {
 
     TEST_RUNTIME.block_on(async {
         let now = Arc::new(AtomicU64::new(T0));
-        let oracle = ScriptedOracle::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            oracle,
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let cached = Cached::new(
             test_db::cache_with_clock("batch-expired", Clock::Fixed(now.clone()))?,
             counting.clone(),
@@ -3430,9 +3085,14 @@ fn batch_get_treats_expired_probe_as_refetch() -> Result<()> {
             .write_resolved(&cref, &[(cell_at(0), Some(bytes(2)))], &[])
             .await?;
 
-        let out = cached
-            .get_many(&id, SECTION, &batch_of([0])?, probe(2))
-            .await?;
+        let out = CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of([0])?)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed)
+                    .collect::<CommittedBatch>()
+            })?;
         assert_eq!(
             out[0].get(),
             Some(&bytes(2)),
@@ -3470,8 +3130,6 @@ fn batch_get_expiry_boundary_degrade_never_serves_stale() -> Result<()> {
         let clock = Clock::Fixed(now.clone());
         let lower = HoldingCellStore::new(CountingCellStore::new(MemoryCellStore::new(
             MemoryCells::new(),
-            ScriptedOracle::default(),
-            Arc::new(CollectionDefRegistry::default()),
         )));
         let holds = lower.holds();
         let fjall = test_db::cache_with_clock(name, clock)?;
@@ -3500,21 +3158,26 @@ fn batch_get_expiry_boundary_degrade_never_serves_stale() -> Result<()> {
         // Park the refetch's fill after the target's durable read lands, advance
         // the clock past the entry's floor expiry while parked, then resume: the
         // warm entry expires DURING the delayed lower read.
-        holds.get_for_cache().arm(1);
+        holds.read().arm(1);
         let batch = batch_of(coords.iter().copied())?;
         let task = tokio::spawn({
             let cached = cached.clone();
             let id = id.clone();
             async move {
-                cached
-                    .get_many(&id, SECTION, &batch, probe(99))
+                CellRead::<Values>::read_many(&cached, &id, SECTION, &batch)
                     .await
+                    .map(|cells| {
+                        cells
+                            .into_iter()
+                            .map(|(committed, _)| committed)
+                            .collect::<CommittedBatch>()
+                    })
                     .map_err(|error| eyre!("{error:?}"))
             }
         });
-        holds.get_for_cache().entered().await;
+        holds.read().entered().await;
         now.store(AFTER_EXPIRY, Ordering::Relaxed);
-        holds.get_for_cache().release();
+        holds.read().release();
         let out = task.await??;
         assert_eq!(
             out[0].get(),
@@ -3537,7 +3200,10 @@ fn batch_get_expiry_boundary_degrade_never_serves_stale() -> Result<()> {
         // The surviving (now-expired) V1 entry must not be served: the point
         // read re-classifies it Expired and refetches V2.
         assert_eq!(
-            cached.get(&id, &cell_at(0), probe(100)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             Some(&bytes(2)),
             "the surviving expired entry is never served; the point read refetches V2"
         );
@@ -3568,9 +3234,14 @@ fn batch_get_publishes_absence_only_from_successful_batch() -> Result<()> {
         // ---- Positive arm: absence is cached from a successful batch. -------
         let (cached, counting, id) = counting_cached("batch-neg-ok")?;
         counting.reset();
-        let out = cached
-            .get_many(&id, SECTION, &batch_of([0])?, probe(1))
-            .await?;
+        let out = CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of([0])?)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed)
+                    .collect::<CommittedBatch>()
+            })?;
         assert_eq!(out[0].get(), None, "the never-written cell is absent");
         assert_eq!(
             counting.batch_cache_reads(),
@@ -3578,7 +3249,10 @@ fn batch_get_publishes_absence_only_from_successful_batch() -> Result<()> {
             "the first batch paid one cache-fill read"
         );
         assert_eq!(
-            cached.get(&id, &cell_at(0), probe(2)).await?.get(),
+            CellRead::<Values>::read(&cached, &id, &cell_at(0))
+                .await?
+                .0
+                .get(),
             None,
             "the second read serves the cached Absent tag"
         );
@@ -3589,12 +3263,8 @@ fn batch_get_publishes_absence_only_from_successful_batch() -> Result<()> {
         );
 
         // ---- Erroring arm: a mid-fill error publishes nothing. --------------
-        let counting_b = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            ScriptedOracle::default(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
-        let failing = FailingCellStore::failing_get_for_cache(
+        let counting_b = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
+        let failing = FailingCellStore::failing_read(
             counting_b.clone(),
             BTreeMap::from([(1u8, ErrorCategory::Transient)]),
         );
@@ -3602,10 +3272,15 @@ fn batch_get_publishes_absence_only_from_successful_batch() -> Result<()> {
         let id_b = collection("batch-neg-err")?;
 
         // A (coord 0) is absent; B (coord 1) is poisoned. The default fill loops
-        // get_for_cache, reads A, then errors on B — so put_batch never runs.
-        let err = cached_b
-            .get_many(&id_b, SECTION, &batch_of([0, 1])?, probe(3))
-            .await;
+        // read, reads A, then errors on B — so put_batch never runs.
+        let err = CellRead::<Values>::read_many(&cached_b, &id_b, SECTION, &batch_of([0, 1])?)
+            .await
+            .map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|(committed, _)| committed)
+                    .collect::<CommittedBatch>()
+            });
         assert!(
             err.is_err(),
             "a poisoned fill position fails the whole batch"
@@ -3616,7 +3291,10 @@ fn batch_get_publishes_absence_only_from_successful_batch() -> Result<()> {
         failing.set_poison(None);
         counting_b.reset();
         assert_eq!(
-            cached_b.get(&id_b, &cell_at(0), probe(4)).await?.get(),
+            CellRead::<Values>::read(&cached_b, &id_b, &cell_at(0))
+                .await?
+                .0
+                .get(),
             None,
             "A resolves absent on the healed read"
         );
@@ -3635,7 +3313,7 @@ fn batch_get_publishes_absence_only_from_successful_batch() -> Result<()> {
 /// clock advances while the fill's response is parked. The stamp is anchored
 /// before the lower read, so a slow resolution can only stamp early.
 ///
-/// Moving the anchor to after `get_many_for_cache` makes this test fail:
+/// Moving the anchor to after `read_many` makes this test fail:
 /// for a delay crossing a second, `floor(T0 + delay) + remaining > death`.
 #[test]
 fn prop_batch_fill_expiry_never_overhangs() {
@@ -3674,11 +3352,7 @@ fn prop_batch_fill_expiry_never_overhangs() {
             let now = Arc::new(AtomicU64::new(t0));
             let clock = Clock::Fixed(now.clone());
             let lower = HoldingCellStore::new(TtlAwareCellStore::new(
-                CountingCellStore::new(MemoryCellStore::new(
-                    MemoryCells::new(),
-                    ScriptedOracle::default(),
-                    Arc::new(CollectionDefRegistry::default()),
-                )),
+                CountingCellStore::new(MemoryCellStore::new(MemoryCells::new())),
                 clock.clone(),
                 DEATH,
             ));
@@ -3697,22 +3371,27 @@ fn prop_batch_fill_expiry_never_overhangs() {
                 .await?;
 
             // Spawn a singleton batch fill; park its lower response.
-            holds.get_for_cache().arm(1);
+            holds.read().arm(1);
             let task = tokio::spawn({
                 let cached = cached.clone();
                 let id = id.clone();
                 async move {
                     let batch = batch_of([7])?;
-                    cached
-                        .get_many(&id, SECTION, &batch, probe(1))
+                    CellRead::<Values>::read_many(&cached, &id, SECTION, &batch)
                         .await
+                        .map(|cells| {
+                            cells
+                                .into_iter()
+                                .map(|(committed, _)| committed)
+                                .collect::<CommittedBatch>()
+                        })
                         .map_err(|error| eyre!("{error:?}"))
                 }
             });
-            holds.get_for_cache().entered().await;
+            holds.read().entered().await;
             // Advance the clock while the fill's response is parked, then resume.
             now.store(t0 + delay, Ordering::Relaxed);
-            holds.get_for_cache().release();
+            holds.read().release();
             task.await??;
 
             // The remaining computed at T0, floored to Cassandra's second grain.
@@ -3724,4 +3403,8 @@ fn prop_batch_fill_expiry_never_overhangs() {
     }
 
     QuickCheck::new().quickcheck(property as fn(Timing) -> Result<bool>);
+}
+
+fn ttl_marker(event: EventRef, writes: &[(CellKey, ProvisionalWrite)]) -> EventMarker {
+    EventMarker::frozen(event, writes, &[], &evidence([].into(), None))
 }

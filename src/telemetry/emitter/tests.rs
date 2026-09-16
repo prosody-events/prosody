@@ -171,7 +171,7 @@ fn serialize_timer_cancelled_omits_optional_fields() -> Result<()> {
 #[test]
 fn serialize_timer_failed_includes_error_fields() -> Result<()> {
     let event_type = TimerEventType::Failed {
-        demand_type: DemandType::Failure,
+        demand_type: DemandType::Failure { retry: 3 },
         error_category: ErrorCategory::Permanent,
         exception: "boom".into(),
     };

@@ -75,6 +75,7 @@ use super::{
 };
 use crate::codec::{Codec, JsonCodec};
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::cell::{Presence, Values};
 #[cfg(test)]
 use crate::state::cell_key::CellKey;
 use crate::state::cell_key::{Coordinate, Direction};
@@ -432,7 +433,7 @@ where
     V: CellType<Key = UnitKey>,
 {
     /// Sets the maximum number of present items that the stream yields.
-    /// Absent rows are free. Fetch sizing cannot change an answer.
+    /// Missing cells do not consume the limit.
     pub fn limit(mut self, limit: NonZeroUsize) -> Self {
         self.limit = Some(limit);
         self
@@ -443,12 +444,8 @@ where
     where
         for<'s> ContextOf<'s, V>: FromSession<'s, S>,
     {
-        // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
-        // so each inner await is instrumented with a clone instead; the
-        // span's recorded time is the stream's own work. Unlike the sibling
-        // ops' `err`, failures are yielded per item rather than recorded on
-        // the span — a failing chunk ends with an OK-status span, and the
-        // yielded `Err` surfaces to the caller inside this span's scope.
+        // Streams need an explicit span around each awaited step.
+        // Errors reach the caller as items; the span does not record their status.
         let span = info_span!(
             "map.stream",
             collection = self.handle.cells.name().as_str(),
@@ -462,7 +459,7 @@ where
                 Some(limit) => plan.with_limit(limit),
                 None => plan,
             };
-            let inner = plan.entries();
+            let inner = plan.projected::<Values>();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
                 yield item?;
@@ -483,7 +480,7 @@ where
                 Some(limit) => plan.with_limit(limit),
                 None => plan,
             };
-            let inner = plan.keys();
+            let inner = plan.projected::<Presence>();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
                 yield item?;
@@ -830,15 +827,23 @@ where
 
     /// Reports whether the map holds no live entries.
     ///
+    /// This reads the entries section, not the keyset. After a split commit
+    /// leaves keyset residue, it can report a live entry that `keys` does not
+    /// list.
+    ///
     /// # Errors
     ///
     /// Returns a key codec error or an access error from the session.
     #[instrument(name = "map.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err)]
     pub async fn is_empty(&self) -> Result<bool, MapStateError<CellCodecError<V>>> {
-        let keys = self
-            .query(Direction::Forward)
-            .limit(NonZeroUsize::MIN)
-            .keys();
+        let plan = self
+            .cells
+            .read(async |op| {
+                op.range(MapKind::<KC, V>::ENTRIES, Direction::Forward)
+                    .with_limit(NonZeroUsize::MIN)
+            })
+            .await;
+        let keys = plan.keys();
         futures::pin_mut!(keys);
         Ok(keys.next().await.transpose()?.is_none())
     }

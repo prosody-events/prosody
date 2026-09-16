@@ -13,9 +13,11 @@ use super::{
     acquire_descriptor_identities, validate,
 };
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::cell::Values;
 use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, value_state};
 use crate::state::memory::{MemoryCellStore, MemoryDescriptorIdentityStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+use crate::state::store::CellRead;
 use crate::state::tests::identity_suite::{
     IdentityTrace, run_concurrent_conflicting, run_concurrent_identical, run_identity_trace,
 };
@@ -318,15 +320,11 @@ async fn state_type_namespaces_cells() -> Result<()> {
     use crate::state::cell_key::{CellKey, Coordinate, Section};
     use crate::state::memory::MemoryCells;
     use crate::state::store::CellStore;
-    use crate::state::tests::cell_suite::ScriptedOracle;
-    use crate::state::{CollectionId, CollectionRef, EventRef, StateKey};
+
+    use crate::state::{CollectionId, CollectionRef, StateKey};
     use bytes::Bytes;
 
-    let store = MemoryCellStore::new(
-        MemoryCells::new(),
-        ScriptedOracle::default(),
-        Arc::new(CollectionDefRegistry::default()),
-    );
+    let store = MemoryCellStore::new(MemoryCells::new());
     let key: crate::Key = Arc::from("k");
     let state_key = StateKey::new(Uuid::new_v4(), key);
     let name = StateName::try_new("cart")?;
@@ -354,16 +352,12 @@ async fn state_type_namespaces_cells() -> Result<()> {
         .write_resolved(&fw, &[(cell.clone(), Some(Bytes::from_static(b"fw")))], &[])
         .await?;
 
-    // A resolved cell never consults the oracle, so the probe event is inert.
-    let probe = EventRef::Message {
-        dedup_id: Uuid::from_u128(0),
-    };
     assert_eq!(
-        store.get(app.id(), &cell, probe).await?,
+        CellRead::<Values>::read(&store, app.id(), &cell).await?.0,
         Committed::new(Some(Bytes::from_static(b"app"))),
     );
     assert_eq!(
-        store.get(fw.id(), &cell, probe).await?,
+        CellRead::<Values>::read(&store, fw.id(), &cell).await?.0,
         Committed::new(Some(Bytes::from_static(b"fw"))),
         "the framework-namespaced cell holds its own value",
     );

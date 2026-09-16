@@ -1,93 +1,78 @@
-//! Per-partition keyed-state manager: a peer of the timer manager.
+//! The partition's keyed-state manager.
 //!
-//! The partition loop acquires one [`StateManager`] per assignment through
-//! a [`PartitionStateProvider`] (mirroring
-//! [`TriggerStoreProvider`](crate::timers::store::TriggerStoreProvider)),
-//! then mints one [`KeyedStateSession`] per event from it. The manager owns the
-//! partition-lifetime parts — the uniform cell store
-//! (`StateBackend::Cell`), the commit oracle, the shared dirty workspace, and
-//! the message loader — while each session gets `Arc`-clones and wraps the cell
-//! store in its own per-event `Overlay`. The
-//! recovery sweep resolves provisional cells through the *same* cell store and
-//! oracle.
+//! Acquisition validates descriptor identities and publishes assignment routing
+//! before it returns a manager. Admission resolves durable residue and retires
+//! committed sources before the key can dispatch. Each dispatched event
+//! receives a session over the shared cell store, dedup store, registry,
+//! loader, and dirty workspace.
 //!
-//! Acquisition is **eager**. Descriptor identities validate against the
-//! group-global identity table. The publication owner then replaces routing
-//! rows. The manager exists only after both operations succeed. The partition
-//! loop retries failed acquisitions until shutdown.
-//!
-//! State is **always wired** — there is no no-state mode. The manager is
-//! Kafka-agnostic: it mints a session for an already-resolved [`EventRef`],
-//! never from a transport message. The partition loop builds the
-//! [`EventRef`] (deriving a message's dedup id with the deduplication
-//! writer's canonical derivation) and hands it in.
+//! Kafka partition ownership provides exclusive access. The partition loop
+//! derives each `EventRef` and supplies it to the manager.
 
 #[cfg(test)]
 mod tests;
 
+use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::segment::partition_segment_id;
+use crate::state::CommitDecision;
+use crate::state::backend::AdmissionChecks;
 use crate::state::descriptor_identity::{
     DescriptorIdentityError, DescriptorIdentityStore, acquire_descriptor_identities,
 };
 use crate::state::dirty::DirtyStore;
-use crate::state::oracle::CommitOracle;
+use crate::state::marker::{EventMarker, MarkerState, MarkerVersion};
 use crate::state::publisher::{AssignmentPublisher, NoPublisher};
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::resolve::{ResolveCellError, sweep_provisional};
+use crate::state::resolve::resolve_event_marker;
+use crate::state::retry::{StepOutcome, retry_step};
 use crate::state::session::{EventSession, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
 use crate::state::{
     CollectionId, CollectionRef, EventRef, STATE_FANOUT_CONCURRENCY, StateBackend,
     StateBackendFactory, StateKey, StateName, StateType,
 };
-use crate::timers::datetime::CompactDateTime;
+#[cfg(test)]
+use crate::state::{PartitionBackend, memory::MemoryDescriptorIdentityStore};
+use crate::timers::TimerManager;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
-use crate::timers::{TimerManager, TimerRequest, TimerType};
 use crate::{Key, Partition, SegmentId, Topic};
-use ahash::RandomState;
 use futures::stream::{self, StreamExt, TryStreamExt};
-use scc::HashMap as ConcurrentHashMap;
+use opentelemetry::global::meter;
+use opentelemetry::metrics::Counter;
+use smallvec::SmallVec;
 use std::error::Error;
 use std::future::Future;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, LazyLock};
 use thiserror::Error;
 use tokio::sync::{OnceCell, watch};
 use tokio::task::coop::cooperative;
-use tokio::time::sleep;
-use tracing::{Span, error};
+use tracing::error;
+use uuid::Uuid;
 
-/// Delay between retries of a transient failure while rescheduling a fresh
-/// `StateRecovery` backstop after a failed sweep. Mirrors the durability-step
-/// retry cadence in [`crate::consumer::middleware`].
-const RESCHEDULE_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Counts each marker read that admission skips after a permanent rejection.
+static CORRUPT_MARKER: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    meter("prosody")
+        .u64_counter("prosody.state.admission.corrupt_marker")
+        .with_description("Marker reads that admission skips after a permanent rejection")
+        .with_unit("{marker}")
+        .build()
+});
 
-/// Floor on a rescheduled backstop's fire delay, so a zero (or sub-second)
-/// `recovery_within` cannot turn a persistently failing sweep into a hot
-/// refire loop. Matches [`RESCHEDULE_RETRY_DELAY`].
-const RESCHEDULE_FLOOR: CompactDuration = CompactDuration::new(1);
+/// Counts each committed-marker resolution that admission rolls back after a
+/// permanent rejection.
+static ADMISSION_TORN: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    meter("prosody")
+        .u64_counter("prosody.state.admission.torn")
+        .with_description("Permanent rejections of committed-marker resolutions during admission")
+        .with_unit("{resolve}")
+        .build()
+});
 
-/// The shared descriptor-identity store's error of a [`StateBackend`] bundle.
+/// The identity store error of a backend.
 type IdentityErr<B> = <<B as StateBackend>::Identity as DescriptorIdentityStore>::Error;
-
-/// Shared per-partition map from a key to the fire time of its standing
-/// `StateRecovery` backstop.
-///
-/// A lock-free [`scc::HashMap`](ConcurrentHashMap) (not a `Mutex<HashMap>`):
-/// the durability boundary touches it on every stateful commit, concurrently
-/// across the partition's keys, so a single mutex would serialize unrelated
-/// keys. The stored fire lets `arm_backstop` re-arm only when a newly-staged
-/// commit's fire is *sooner* than the standing one (the tightening the
-/// per-collection `recovery_within` bound needs); the map is still
-/// self-draining ([`PartitionStateManager::recover`] removes the key when the
-/// sweep fires), so it never grows without bound. Minted empty per acquisition:
-/// an absent key means *unknown*, not *unarmed* — `arm_backstop` seeds it from
-/// the durable trigger store on a key's first arm, so a prior epoch's standing
-/// backstop is never loosened.
-pub(crate) type ArmedKeys = Arc<ConcurrentHashMap<Key, CompactDateTime, RandomState>>;
 
 /// The owned, per-event lifetime of a keyed-state session.
 ///
@@ -168,19 +153,15 @@ where
     }
 }
 
-/// Per-partition keyed-state manager minted by a
-/// [`PartitionStateProvider`].
+/// A [`PartitionStateProvider`] creates this keyed-state manager for one
+/// partition. It admits each key before dispatch and creates one session per
+/// event. The partition loop supplies each [`EventRef`], including the message
+/// dedup id; the manager does not depend on Kafka.
 ///
-/// Mints one session per event from an already-resolved [`EventRef`] and
-/// runs the `StateRecovery` sweep. The manager is Kafka-agnostic: building
-/// the `EventRef` (including a message's dedup id) is the partition loop's
-/// job.
-///
-/// Kept as a trait for type-parameter compression and pattern symmetry with
-/// [`TriggerStoreProvider`](crate::timers::store::TriggerStoreProvider): the
-/// associated `Session` type lets callers name only the manager, not its
-/// backend and loader. It is deliberately not collapsed onto its single
-/// production impl [`StateManager`].
+/// The trait retains type-parameter compression and symmetry with
+/// [`TriggerStoreProvider`](crate::timers::store::TriggerStoreProvider).
+/// Its associated `Session` lets callers name the manager without its backend
+/// and loader, even with one production implementation, [`StateManager`].
 pub trait PartitionStateManager: Clone + Send + Sync + 'static {
     /// Session type minted per event.
     type Session: EventSession;
@@ -199,43 +180,43 @@ pub trait PartitionStateManager: Clone + Send + Sync + 'static {
         termination: TerminationWatch,
     ) -> EventStateScope<Self::Session>;
 
-    /// Runs the `StateRecovery` sweep for `key` and decides what the fired
-    /// trigger's commit guard should do.
+    /// Repairs the key's durable state before its first dispatch.
     ///
-    /// **Never aborts the trigger except on shutdown** (retry forever; abort
-    /// only on shutdown). A fully resolved sweep, and a sweep that skips a
-    /// per-cell *permanent* failure, both return [`SweepResolution::Commit`]:
-    /// the fired trigger commits and nothing is rescheduled (a permanent cell
-    /// never resolves, so rescheduling would only spin a refire loop —
-    /// first-touch and the key's next commit recover it). A *transient* or
-    /// *terminal* store failure reschedules a fresh backstop
-    /// (`clear_and_schedule` at the `recovery_delay` floor tightened by the
-    /// registered collections' `recovery_within` bounds, retried until it
-    /// lands or shutdown) so a future sweep retries, then commits. Only when
-    /// shutdown interrupts a reschedule before it lands does this return
-    /// [`SweepResolution::Abort`], so the trigger refires and re-sweeps on the
-    /// next partition acquisition.
-    fn recover<T>(
+    /// An interrupted settle leaves a Staged row and provisional cells in each
+    /// collection it touched. Admission reads the marker rows of every
+    /// discovered collection and decides each Staged row. A Committed row with
+    /// the same attempt id certifies a version 2 row. The old commit point
+    /// certifies a version 1 row.
+    ///
+    /// - A certified row promotes, registered or not.
+    /// - An uncertified row in a registered collection aborts with the registry
+    ///   TTL.
+    /// - An uncertified version 2 row in an unregistered collection stays
+    ///   untouched.
+    /// - Admission deletes an uncertified version 1 row in an unregistered
+    ///   collection.
+    ///
+    /// Admission then retires each committed source: the message dedup id or
+    /// the timer trigger. A permanent store rejection skips its step and does
+    /// not block dispatch. Shutdown returns [`Admission::Abandoned`].
+    fn admit<T>(
         &self,
         key: Key,
         timers: &TimerManager<T>,
         shutdown: &watch::Receiver<ShutdownPhase>,
-    ) -> impl Future<Output = SweepResolution> + Send
+    ) -> impl Future<Output = Admission> + Send
     where
         T: TriggerStore;
 }
 
-/// What the fired `StateRecovery` trigger's commit guard should do once
-/// [`PartitionStateManager::recover`] returns.
+/// Admission decides whether an event can dispatch.
+/// Permanent store rejections receive local repair and do not prevent dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SweepResolution {
-    /// Commit the fired trigger — the sweep made progress (resolved, a
-    /// permanent per-cell skip, or a fresh backstop rescheduled).
-    Commit,
-
-    /// Abort the fired trigger — shutdown interrupted a reschedule, so let the
-    /// trigger refire (and re-sweep) on the next partition acquisition.
-    Abort,
+pub enum Admission {
+    /// The key can dispatch an event.
+    Fresh,
+    /// Shutdown stopped admission.
+    Abandoned,
 }
 
 /// Process-wide factory for per-partition [`PartitionStateManager`]s,
@@ -256,16 +237,14 @@ pub trait PartitionStateProvider<T>: Clone + Send + Sync + 'static {
     /// Error raised when a partition's manager cannot be acquired.
     type AcquireError: ClassifyError + Error + Send + Sync + 'static;
 
-    /// Acquires the manager for `(topic, partition)`, eagerly validating
-    /// descriptor identities against the group-global identity table.
-    /// `triggers` is the partition's trigger-store handle, forwarded to the
-    /// backend factory for the commit oracle's timer half.
+    /// Acquires the manager for `(topic, partition)` and validates descriptor
+    /// identities against the group-wide identity table.
+    /// Passes the partition's `triggers` handle to the backend factory.
     ///
     /// # Errors
     ///
-    /// Returns [`Self::AcquireError`] when the backend cannot be minted or
-    /// identity validation fails; the partition loop retries until
-    /// shutdown.
+    /// Returns [`Self::AcquireError`] if backend creation or identity
+    /// validation fails. The partition loop retries until shutdown.
     fn acquire(
         &self,
         topic: Topic,
@@ -284,23 +263,17 @@ where
     ///
     /// [`Overlay`]: crate::state::overlay::Overlay
     dirty: Arc<DirtyStore>,
-    oracle: B::Oracle,
+    dedup: B::Dedup,
     loader: L,
     registry: Arc<CollectionDefRegistry>,
     segment_id: SegmentId,
-    recovery_delay: CompactDuration,
-    /// Keys mapped to the fire time of their standing `StateRecovery` backstop.
-    /// Sessions read it to re-arm only when a newer commit's fire is sooner
-    /// (the `recovery_within` tightening); `recover` removes the key when
-    /// the sweep fires. Semantics of an absent key are owned by [`ArmedKeys`]:
-    /// unknown, not unarmed.
-    armed: ArmedKeys,
+    dedup_ttl: CompactDuration,
+    checks: B::Checks,
 }
 
-/// The real per-partition state manager: owns the partition-lifetime cell
-/// store, oracle, dirty workspace, and loader; mints per-event
-/// [`KeyedStateSession`]s sharing them. Parameterized by the one
-/// `StateBackend` bundle `B` and the loader `L`.
+/// Owns a partition's cell store, dedup store, dirty workspace, and loader.
+/// Creates per-event [`KeyedStateSession`]s that share these resources.
+/// `B` selects the `StateBackend` bundle; `L` selects the loader.
 pub struct StateManager<B, L>
 where
     B: StateBackend,
@@ -335,66 +308,46 @@ where
         EventStateScope::new(KeyedStateSession::new(SessionParts {
             cell: self.inner.cell.clone(),
             dirty: self.inner.dirty.clone(),
-            oracle: self.inner.oracle.clone(),
+            dedup: self.inner.dedup.clone(),
             loader: self.inner.loader.clone(),
             registry: self.inner.registry.clone(),
             state_key: StateKey::new(self.inner.segment_id, key),
             event,
-            recovery_delay: self.inner.recovery_delay,
-            armed: self.inner.armed.clone(),
+            dedup_ttl: self.inner.dedup_ttl,
+            checks: self.inner.checks.clone(),
             termination,
         }))
     }
 
-    async fn recover<T>(
+    async fn admit<T>(
         &self,
         key: Key,
         timers: &TimerManager<T>,
         shutdown: &watch::Receiver<ShutdownPhase>,
-    ) -> SweepResolution
+    ) -> Admission
     where
         T: TriggerStore,
     {
-        let state_key = StateKey::new(self.inner.segment_id, key.clone());
-        // Sweep↔debounce ordering (finding F2): clear the armed flag BEFORE
-        // reading the provisional set, so the key's next stateful commit (or the
-        // reschedule below) re-arms a fresh backstop. Per-key serialization — a
-        // key's message and timer events run through one `KeyManager` queue —
-        // means no `arm_backstop` / `mark_backstop_armed` on this key runs while
-        // this sweep does, so this clear cannot race a re-arm. The boundary never
-        // point-clears another event's backstop: only this fired sweep clears,
-        // and only its own.
-        self.inner.armed.remove_async(&key).await;
-        match sweep_partition(
-            &self.inner.cell,
-            &self.inner.oracle,
-            &self.inner.registry,
-            &state_key,
-        )
+        let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
+        match admission_step(cancelled, &key, "checks.contains", || {
+            self.inner.checks.contains(&key)
+        })
         .await
         {
-            // Resolved, or a per-cell Permanent skip: commit and reschedule
-            // nothing (see the trait doc for why).
-            Ok(()) => SweepResolution::Commit,
-            // Whole-sweep permanent failure: commit to stop refiring; first-touch
-            // still recovers.
-            Err(error) if error.classify_error() == ErrorCategory::Permanent => {
-                error!(
-                    key = ?key,
-                    "keyed-state recovery sweep failed permanently: {error:#}; \
-                     committing trigger (first-touch still recovers)"
-                );
-                SweepResolution::Commit
-            }
-            // Transient/terminal failure: reschedule a fresh backstop, then
-            // commit (never abort — see the trait doc).
-            Err(error) => {
-                error!(
-                    key = ?key,
-                    "keyed-state recovery sweep failed: {error:#}; rescheduling a fresh backstop"
-                );
-                self.reschedule_backstop(&key, timers, shutdown).await
-            }
+            Ok(Some(true)) => return Admission::Fresh,
+            Ok(Some(false) | None) => {}
+            Err(admission) => return admission,
+        }
+        if let Err(admission) = self.admit_unchecked(&key, timers, shutdown).await {
+            return admission;
+        }
+        match admission_step(cancelled, &key, "checks.mark", || {
+            self.inner.checks.mark(&key)
+        })
+        .await
+        {
+            Ok(_) => Admission::Fresh,
+            Err(admission) => admission,
         }
     }
 }
@@ -403,71 +356,340 @@ impl<B, L> StateManager<B, L>
 where
     B: StateBackend,
 {
-    /// Reschedules a fresh `StateRecovery` backstop after a failed sweep,
-    /// retrying every non-shutdown failure until it lands.
-    ///
-    /// The fire delay is the `recovery_delay` floor tightened by the smallest
-    /// `recovery_within` among the registered collections — the same
-    /// tightening `finalize` folds onto the receipt's recovery delay, so a
-    /// transient sweep failure does not stretch a tightly bounded
-    /// collection's convergence out to the full floor. Which
-    /// collections still hold provisional cells is unknown here (the sweep
-    /// failed), so folding the whole registered set is the conservative
-    /// direction: it can only fire sooner, and an early sweep that finds
-    /// nothing resolves trivially. Floored at [`RESCHEDULE_FLOOR`].
-    ///
-    /// A rescheduled backstop is durable in the trigger store — it survives
-    /// shutdown and fires on reacquisition — so once it lands this returns
-    /// [`SweepResolution::Commit`] even if shutdown is now in progress. It
-    /// returns [`SweepResolution::Abort`] only when shutdown interrupts
-    /// *before* the backstop lands; then the fired trigger refires and
-    /// re-sweeps on the next acquisition, so the cell is never orphaned.
-    async fn reschedule_backstop<T>(
+    async fn load_markers(
+        &self,
+        key: &Key,
+        shutdown: &watch::Receiver<ShutdownPhase>,
+    ) -> Result<SmallVec<[(CollectionRef, MarkerState); 8]>, Admission> {
+        let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
+        let registry = &self.inner.registry;
+        let state_key = StateKey::new(self.inner.segment_id, key.clone());
+        let mut pending: SmallVec<[(StateType, StateName); 8]> = registry
+            .collections()
+            .map(|(kind, name)| (kind, name.clone()))
+            .collect();
+        let mut states: SmallVec<[(CollectionRef, MarkerState); 8]> =
+            SmallVec::with_capacity(pending.len());
+
+        while !pending.is_empty() {
+            let loaded = stream::iter(pending.drain(..))
+                .map(|(kind, name)| {
+                    let ttl = registry.ttl_for(kind, &name);
+                    let id = CollectionId::new(state_key.clone(), kind, name);
+                    cooperative(async move {
+                        let state = admission_step(cancelled, key, id.name().as_str(), || {
+                            self.inner.cell.marker_state(&id)
+                        })
+                        .await?;
+                        // A corrupt marker cannot name cells for repair. Keep those cells
+                        // unchanged.
+                        let state = state.unwrap_or_else(|| {
+                            CORRUPT_MARKER.add(1, &[]);
+                            MarkerState::default()
+                        });
+                        let collection = CollectionRef::new(id, ttl);
+                        Ok::<_, Admission>((collection, state))
+                    })
+                })
+                .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+                .try_collect::<SmallVec<[_; 8]>>()
+                .await?;
+            states.extend(loaded);
+
+            for (_, state) in &states {
+                let touched = state.staged.iter().flat_map(EventMarker::touched).chain(
+                    state
+                        .committed
+                        .iter()
+                        .flat_map(|marker| marker.touched.iter()),
+                );
+                for (kind, name) in touched {
+                    if !states.iter().any(|(collection, _)| {
+                        collection.id().state_type() == *kind && collection.id().name() == name
+                    }) && !pending.contains(&(*kind, name.clone()))
+                    {
+                        pending.push((*kind, name.clone()));
+                    }
+                }
+            }
+        }
+
+        Ok(states)
+    }
+
+    /// Discovers collection markers and certifies Staged rows through commit
+    /// evidence. Resolves the discovered residue.
+    /// Retires committed sources before dispatch.
+    async fn admit_unchecked<T: TriggerStore>(
         &self,
         key: &Key,
         timers: &TimerManager<T>,
         shutdown: &watch::Receiver<ShutdownPhase>,
-    ) -> SweepResolution
-    where
-        T: TriggerStore,
-    {
-        let delay = self
-            .inner
-            .registry
-            .collections()
-            .filter_map(|(state_type, name)| {
-                self.inner.registry.recovery_within_for(state_type, name)
-            })
-            .fold(self.inner.recovery_delay, CompactDuration::min)
-            .max(RESCHEDULE_FLOOR);
-        loop {
-            if *shutdown.borrow() >= ShutdownPhase::Cancelling {
-                return SweepResolution::Abort;
+    ) -> Result<(), Admission> {
+        let states = self.load_markers(key, shutdown).await?;
+        let mut legacy_events: SmallVec<[EventRef; 8]> = SmallVec::with_capacity(states.len());
+        for marker in states.iter().filter_map(|(_, state)| state.staged.as_ref()) {
+            if marker.version() == MarkerVersion::V1 && !legacy_events.contains(&marker.event()) {
+                legacy_events.push(marker.event());
             }
-            let fire = match CompactDateTime::now().and_then(|now| now.add_duration(delay)) {
-                Ok(fire) => fire,
-                Err(error) => {
-                    error!(error = %error, "failed to compute StateRecovery reschedule time; retrying");
-                    sleep(RESCHEDULE_RETRY_DELAY).await;
-                    continue;
-                }
+        }
+        let decisions = SmallVec::<[_; 8]>::with_capacity(legacy_events.len());
+        let legacy = stream::iter(legacy_events)
+            .map(|event| {
+                cooperative(async move {
+                    Ok::<_, Admission>((
+                        event,
+                        self.legacy_committed(key, event, timers, shutdown).await?,
+                    ))
+                })
+            })
+            .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+            .try_fold(decisions, |mut decisions, entry| async move {
+                decisions.push(entry);
+                Ok(decisions)
+            })
+            .await?;
+
+        // Freeze decisions before any resolve changes the durable evidence.
+        // Each collection has two markers, each with at most two sources.
+        let mut sources: SmallVec<[EventRef; 32]> = SmallVec::with_capacity(states.len() * 4);
+        let mut resolutions: SmallVec<[_; 8]> = SmallVec::with_capacity(states.len());
+        for (collection, state) in &states {
+            if let Some(marker) = &state.committed {
+                retain_sources(&mut sources, marker.event, marker.dedup);
+            }
+            let Some(marker) = &state.staged else {
+                continue;
             };
-            let request =
-                TimerRequest::new(key.clone(), fire, TimerType::StateRecovery, Span::current());
-            match timers.clear_and_schedule(request).await {
-                Ok(()) => {
-                    // The rescheduled backstop is now the standing one; record
-                    // its fire so the arm-if-sooner path on the key's next commit
-                    // sees it (mirrors `mark_backstop_armed`).
-                    self.inner.armed.upsert_async(key.clone(), fire).await;
-                    return SweepResolution::Commit;
+            let committed = if marker.version() == MarkerVersion::V1 {
+                legacy
+                    .iter()
+                    .any(|(event, decision)| *event == marker.event() && *decision == Some(true))
+            } else {
+                states
+                    .iter()
+                    .filter_map(|(_, state)| state.committed.as_ref())
+                    .any(|entry| entry.certifies(marker))
+            };
+            let decision = if committed {
+                retain_sources(&mut sources, marker.event(), marker.dedup());
+                CommitDecision::Committed
+            } else {
+                CommitDecision::NotCommitted
+            };
+            resolutions.push((collection.clone(), marker.clone(), decision));
+        }
+
+        // Owned shared handles avoid higher-ranked closures and large future buffers.
+        stream::iter(resolutions)
+            .map(|(collection, marker, decision)| {
+                cooperative(async move {
+                    self.resolve_admission(key, &collection, &marker, decision, shutdown)
+                        .await
+                })
+            })
+            .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+            .try_collect::<()>()
+            .await?;
+        let independent = (0..sources.len()).filter(|&index| {
+            !sources[..index]
+                .iter()
+                .any(|&other| same_timer_coordinate(other, sources[index]))
+        });
+        stream::iter(independent)
+            .map(|index| {
+                cooperative(self.retire_source(
+                    key,
+                    sources[index],
+                    &sources,
+                    &legacy,
+                    timers,
+                    shutdown,
+                ))
+            })
+            .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+            .try_collect::<()>()
+            .await
+    }
+
+    async fn resolve_admission(
+        &self,
+        key: &Key,
+        collection: &CollectionRef,
+        marker: &EventMarker,
+        decision: CommitDecision,
+        shutdown: &watch::Receiver<ShutdownPhase>,
+    ) -> Result<(), Admission> {
+        let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
+        if decision == CommitDecision::NotCommitted
+            && !self.inner.registry.collections().any(|(kind, name)| {
+                kind == collection.id().state_type() && name == collection.id().name()
+            })
+        {
+            if marker.version() == MarkerVersion::V1 {
+                admission_step(cancelled, key, collection.id().name().as_str(), || {
+                    self.inner.cell.abort_provisional(collection, &[])
+                })
+                .await?;
+            }
+            return Ok(());
+        }
+
+        let marker = marker.for_admission(self.inner.dedup_ttl);
+        let resolved = admission_step(cancelled, key, collection.id().name().as_str(), || {
+            resolve_event_marker(&self.inner.cell, collection, &marker, decision)
+        })
+        .await?;
+        if resolved.is_none() && decision == CommitDecision::Committed {
+            ADMISSION_TORN.add(1, &[]);
+            admission_step(cancelled, key, collection.id().name().as_str(), || {
+                resolve_event_marker(
+                    &self.inner.cell,
+                    collection,
+                    &marker,
+                    CommitDecision::NotCommitted,
+                )
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn retire_source<T: TriggerStore>(
+        &self,
+        key: &Key,
+        source: EventRef,
+        sources: &[EventRef],
+        legacy: &[(EventRef, Option<bool>)],
+        timers: &TimerManager<T>,
+        shutdown: &watch::Receiver<ShutdownPhase>,
+    ) -> Result<(), Admission> {
+        let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
+        match source {
+            EventRef::Message { dedup_id } => {
+                // Reuse legacy reads, including Permanent rejections.
+                let exists = match legacy.iter().find(|(event, _)| *event == source) {
+                    Some((_, exists)) => *exists,
+                    None => {
+                        admission_step(
+                            cancelled,
+                            key,
+                            "dedup read rejected; redelivery can reach the handler",
+                            || self.inner.dedup.exists(dedup_id),
+                        )
+                        .await?
+                    }
+                };
+                if exists == Some(false) {
+                    admission_step(
+                        cancelled,
+                        key,
+                        "dedup write rejected; redelivery can reach the handler",
+                        || self.inner.dedup.insert(dedup_id),
+                    )
+                    .await?;
                 }
-                Err(error) => {
-                    error!(error = %error, "failed to reschedule StateRecovery backstop; retrying");
-                    sleep(RESCHEDULE_RETRY_DELAY).await;
+            }
+            EventRef::Timer(_) => {
+                // Attempts at one coordinate share durable rows. Retire them in order.
+                for &other in sources {
+                    if let EventRef::Timer(timer) = other
+                        && same_timer_coordinate(source, other)
+                    {
+                        admission_step(cancelled, key, "timer retirement", || {
+                            timers.retire_committed(key, timer)
+                        })
+                        .await?;
+                    }
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Reads the old commit point for residue staged before the V4 layout.
+    /// This rule remains necessary while an idle key can retain a version 1
+    /// payload without expiry.
+    async fn legacy_committed<T: TriggerStore>(
+        &self,
+        key: &Key,
+        event: EventRef,
+        timers: &TimerManager<T>,
+        shutdown: &watch::Receiver<ShutdownPhase>,
+    ) -> Result<Option<bool>, Admission> {
+        let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
+        match event {
+            EventRef::Message { dedup_id } => {
+                admission_step(
+                    cancelled,
+                    key,
+                    "legacy dedup read; redelivery can reach the handler",
+                    || self.inner.dedup.exists(dedup_id),
+                )
+                .await
+            }
+            EventRef::Timer(timer) => {
+                let tag = admission_step(cancelled, key, "legacy timer read", || {
+                    timers.current_timer_tag(key, timer.time, timer.timer_type)
+                })
+                .await?;
+                Ok(tag.map(|tag| tag != Some(timer.tag)))
+            }
+        }
+    }
+}
+
+/// Compares durable timer coordinates within one admitted key.
+fn same_timer_coordinate(left: EventRef, right: EventRef) -> bool {
+    match (left, right) {
+        (EventRef::Timer(left), EventRef::Timer(right)) => {
+            left.time == right.time && left.timer_type == right.timer_type
+        }
+        _ => false,
+    }
+}
+
+/// Retains each dedup id and timer attempt once for this admission.
+fn retain_sources(sources: &mut SmallVec<[EventRef; 32]>, event: EventRef, dedup: Option<Uuid>) {
+    let timer = match event {
+        EventRef::Timer(_) => Some(event),
+        EventRef::Message { .. } => None,
+    };
+    for source in [dedup.map(|dedup_id| EventRef::Message { dedup_id }), timer]
+        .into_iter()
+        .flatten()
+    {
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+    }
+}
+
+async fn admission_step<R, E, Fut>(
+    cancelled: impl Fn() -> bool,
+    key: &Key,
+    collection: &str,
+    mut step: impl FnMut() -> Fut,
+) -> Result<Option<R>, Admission>
+where
+    Fut: Future<Output = Result<R, E>>,
+    E: ClassifyError + Error,
+{
+    match retry_step(cancelled, "keyed-state admission", || {
+        let result = step();
+        async move {
+            let result = result.await;
+            if let Err(error) = &result
+                && error.classify_error() == ErrorCategory::Permanent
+            {
+                error!(%error, %key, collection, "admission rejected store operation; continue with local repair");
+            }
+            result
+        }
+    }).await {
+        StepOutcome::Done(value) => Ok(Some(value)),
+        StepOutcome::Skip => Ok(None),
+        StepOutcome::Abandon => Err(Admission::Abandoned),
     }
 }
 
@@ -481,7 +703,7 @@ pub struct StateManagerProvider<F, L, P = NoPublisher> {
     publisher: P,
     registry: Arc<CollectionDefRegistry>,
     consumer_group: Arc<str>,
-    recovery_delay: CompactDuration,
+    dedup_ttl: CompactDuration,
     /// Process-level latch for descriptor-identity validation. The identity
     /// table is group-global, so validating the registry against it is a
     /// once-per-process concern, not per-partition. Shared across provider
@@ -494,22 +716,22 @@ pub struct StateManagerProvider<F, L, P = NoPublisher> {
 impl<F, L, P> StateManagerProvider<F, L, P> {
     /// Creates the provider.
     ///
-    /// `publisher` uses the assignment that this provider receives. It does
-    /// not observe Kafka or track assignments itself.
+    /// `publisher` uses the assignment that this provider receives. It does not
+    /// observe Kafka or track assignments itself.
     ///
-    /// `consumer_group` derives the partition's segment id for **state-cell
-    /// identity** via the crate-internal
-    /// `segment::partition_segment_id` — the *same*
-    /// derivation the defer stores use, so a partition's defer and state rows
-    /// share one id for operational lookup. It is *also* the `group_id`
-    /// partition key of the group-global descriptor-identity table, validated
-    /// once per process at the first acquire. Timers currently derive their
-    /// segment id with a separate legacy formula
-    /// ([`Segment::for_partition`](crate::timers::store::Segment::for_partition),
-    /// `NAMESPACE_URL`) pending a follow-up migration onto this id.
-    /// The tables remain independent: the commit oracle resolves a timer
-    /// `EventRef` by `(key, timer_type, time)` against the per-partition
-    /// trigger store, never by the state segment id — don't join them in code.
+    /// `consumer_group` supplies state-cell identity through
+    /// `segment::partition_segment_id`.
+    /// Defer stores use the same derivation, so a partition's defer and state
+    /// rows share one id for operational lookup.
+    /// It also supplies the descriptor-identity table's `group_id` partition
+    /// key. The first acquire validates that identity once per process.
+    ///
+    /// Timers retain the separate
+    /// [`Segment::for_partition`](crate::timers::store::Segment::for_partition)
+    /// formula with `NAMESPACE_URL` until migration.
+    /// Timer retirement and legacy admission use the partition's trigger store.
+    /// They address timers by key, type, and time, never by state segment
+    /// id.
     #[must_use]
     pub(crate) fn new(
         backend: F,
@@ -517,7 +739,7 @@ impl<F, L, P> StateManagerProvider<F, L, P> {
         publisher: P,
         registry: Arc<CollectionDefRegistry>,
         consumer_group: Arc<str>,
-        recovery_delay: CompactDuration,
+        dedup_ttl: CompactDuration,
     ) -> Self {
         Self {
             backend,
@@ -525,7 +747,7 @@ impl<F, L, P> StateManagerProvider<F, L, P> {
             publisher,
             registry,
             consumer_group,
-            recovery_delay,
+            dedup_ttl,
             validated: Arc::new(OnceCell::new()),
         }
     }
@@ -552,7 +774,7 @@ where
             .backend
             .for_partition(topic, partition, triggers)
             .map_err(StateAcquireError::Factory)?;
-        let oracle = backend.oracle();
+        let dedup = backend.dedup();
         // Invariant: no state op executes under an unvalidated identity —
         // the manager does not exist until the registered descriptors match
         // the group's frozen identity rows. The identity table is group-global,
@@ -575,63 +797,15 @@ where
             inner: Arc::new(StateManagerInner {
                 cell: backend.cell(),
                 dirty: Arc::new(DirtyStore::new()),
-                oracle,
+                dedup,
                 loader: self.loader.clone(),
                 registry: self.registry.clone(),
                 segment_id,
-                recovery_delay: self.recovery_delay,
-                armed: Arc::default(),
+                dedup_ttl: self.dedup_ttl,
+                checks: backend.checks(),
             }),
         })
     }
-}
-
-/// Sweeps every registered collection on `(segment, key)`, resolving any
-/// provisional cell through the oracle. The swept set comes from `registry` —
-/// the in-process authoritative declared set; a collection whose descriptor was
-/// removed is dormant, not swept (an accepted non-concern). Each collection's
-/// TTL comes from `registry`.
-///
-/// A never-touched name streams no provisional cell and resolves trivially. A
-/// per-cell Permanent failure is logged and skipped inside
-/// [`sweep_provisional`](crate::state::resolve), left for first-touch or a
-/// later sweep; a transient/terminal failure propagates via `Err` for
-/// [`PartitionStateManager::recover`] to reschedule against.
-async fn sweep_partition<S, O>(
-    cell: &S,
-    oracle: &O,
-    registry: &CollectionDefRegistry,
-    state_key: &StateKey,
-) -> Result<(), ResolveCellError<S::Error, O::Error>>
-where
-    S: CellStore,
-    O: CommitOracle,
-{
-    // Own the `(state_type, name)` set up front: streaming the borrowed
-    // `registry.collections()` items straight into the concurrent fan-out
-    // trips a higher-ranked-lifetime bound on the per-item closure, and the
-    // owned set is small (the registered collection count).
-    let collections: Vec<(StateType, StateName)> = registry
-        .collections()
-        .map(|(state_type, name)| (state_type, name.clone()))
-        .collect();
-    // Each name is its own Cassandra partition, so the per-collection sweeps
-    // fan out concurrently. `try_for_each` short-circuits on a
-    // transient/terminal error (propagated via `?`); per-cell Permanent
-    // failures are logged and skipped inside `sweep_provisional`. `cooperative`
-    // wraps each sweep so the fan-out yields to the runtime every ~128
-    // collections rather than draining in one poll.
-    stream::iter(collections)
-        .map(|(state_type, name)| {
-            cooperative(async move {
-                let ttl = registry.ttl_for(state_type, &name);
-                let id = CollectionId::new(state_key.clone(), state_type, name);
-                sweep_provisional(cell, oracle, &CollectionRef::new(id, ttl)).await
-            })
-        })
-        .buffer_unordered(STATE_FANOUT_CONCURRENCY)
-        .try_for_each(|_resolved| async move { Ok(()) })
-        .await
 }
 
 /// Error raised when a [`StateManagerProvider`] cannot acquire a
@@ -672,5 +846,28 @@ where
             Self::Factory(e) => e.classify_error(),
             Self::Identity(e) => e.classify_error(),
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_manager<S: CellStore, D: DeduplicationStore, L, K: AdmissionChecks>(
+    cell: S,
+    dedup: D,
+    registry: Arc<CollectionDefRegistry>,
+    segment_id: SegmentId,
+    checks: K,
+    loader: L,
+) -> StateManager<PartitionBackend<D, MemoryDescriptorIdentityStore, S, K>, L> {
+    StateManager {
+        inner: Arc::new(StateManagerInner {
+            cell,
+            dirty: Arc::new(DirtyStore::new()),
+            dedup,
+            loader,
+            registry,
+            segment_id,
+            dedup_ttl: CompactDuration::new(30),
+            checks,
+        }),
     }
 }

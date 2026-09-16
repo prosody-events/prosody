@@ -4,7 +4,7 @@
 //! [`KeyedStateSession`] lifecycle — handler ops buffer into the dirty overlay,
 //! `finalize` stages them in one co-stamped batch, then the event commits
 //! (promote), aborts (rollback), or crashes (a fresh store over the same warm
-//! `MemoryCells` recovers through the quiescence sweep). After every event the
+//! `MemoryCells` recovers through the admission). After every event the
 //! collection's observable state must equal a plain `VecDeque`/`BTreeMap` model
 //! — and intermediate `pop`/`get` return values are asserted as they happen, so
 //! a mutation that corrupts the return but heals the final shape is still
@@ -29,27 +29,30 @@
 //! Cassandra parity for the underlying store, and the collection logic lives
 //! entirely in the descriptor layer above it.
 
-use super::cell_suite::{MAX_TRACE_OPS, ScriptedOracle, capped_vec};
+use super::cell_suite::{MAX_TRACE_OPS, MemoryDeduplicationStore, capped_vec};
 use super::support::CountingCellStore;
 use super::support::assert_no_settlement_residue;
 use crate::codec::{Codec, JsonCodec};
+use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
+use crate::state::cell::Values;
 use crate::state::collection::StateSession;
 use crate::state::descriptor::map::{entry_cell_for, keyset_cell};
 use crate::state::descriptor::{
     DequeHandle, MapHandle, StateDescriptor, deque, deque_state, map_state,
 };
 use crate::state::dirty::DirtyStore;
-use crate::state::manager::ArmedKeys;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
-use crate::state::oracle::CommitOracle;
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-use crate::state::resolve::sweep_provisional;
-use crate::state::session::sealed::{ApplyOutcome, StateLifecycle};
+use crate::state::session::Promoted;
+use crate::state::session::sealed::StateLifecycle;
 use crate::state::session::{Finalized, KeyedStateSession, SessionParts, TerminationWatch};
+use crate::state::store::CellRead;
 use crate::state::store::{CELL_BATCH, CellStore};
+use crate::state::tests::support::admit_collection;
+use crate::state::tests::support::seed_commit_evidence;
 use crate::state::{
     CollectionId, CollectionRef, CommitMode, Direction, EventRef, PartitionBackend, StateKey,
     StateName, StateType,
@@ -83,13 +86,10 @@ const INTERLEAVE_HANG_GUARD: Duration = Duration::from_secs(30);
 /// collections take the chunked point-get arm.
 const INTERLEAVE_SEED: usize = 20;
 
-/// The per-partition backend for the suites: a memory cell store and a scripted
-/// commit oracle, behind the standard [`PartitionBackend`] bundle.
-type SuiteBackend = PartitionBackend<
-    ScriptedOracle,
-    MemoryDescriptorIdentityStore,
-    MemoryCellStore<ScriptedOracle>,
->;
+/// The per-partition backend for the suites: a memory cell store and dedup
+/// store, behind the standard [`PartitionBackend`] bundle.
+type SuiteBackend =
+    PartitionBackend<MemoryDeduplicationStore, MemoryDescriptorIdentityStore, MemoryCellStore, ()>;
 
 /// The real per-event session the handles bind over.
 type SuiteSession = KeyedStateSession<SuiteBackend, MemoryLoader<Value>>;
@@ -107,13 +107,13 @@ const MAX_EVENT_OPS: usize = 4;
 /// real coverage of the rollback and crash-recovery arms.
 #[derive(Clone, Copy, Debug)]
 enum Outcome {
-    /// Marker recorded, promoted inline.
+    /// Promoted inline.
     Commit,
-    /// No marker, rolled back inline.
+    /// Admission rolls back the stage.
     Abort,
-    /// Staged, marker recorded, crash → sweep promotes.
+    /// Committed evidence survives a crash; admission promotes the residue.
     CrashCommitted,
-    /// Staged, no marker, crash → sweep rolls back.
+    /// No committed evidence survives a crash; admission rolls back the stage.
     CrashAborted,
 }
 
@@ -359,21 +359,12 @@ impl Arbitrary for MapKeyHoles {
 /// so the session reads as non-terminated.
 fn make_session(
     cells: &MemoryCells,
-    oracle: &ScriptedOracle,
+    dedup: &MemoryDeduplicationStore,
     registry: &Arc<CollectionDefRegistry>,
     state_key: &StateKey,
-    armed: &ArmedKeys,
     event: EventRef,
 ) -> SuiteSession {
-    make_session_with_dirty(
-        cells,
-        oracle,
-        registry,
-        state_key,
-        armed,
-        event,
-        Arc::default(),
-    )
+    make_session_with_dirty(cells, dedup, registry, state_key, event, Arc::default())
 }
 
 /// [`make_session`] over a caller-owned dirty workspace, so a test can snapshot
@@ -381,31 +372,30 @@ fn make_session(
 /// what `finalize` will stage through it).
 fn make_session_with_dirty(
     cells: &MemoryCells,
-    oracle: &ScriptedOracle,
+    dedup: &MemoryDeduplicationStore,
     registry: &Arc<CollectionDefRegistry>,
     state_key: &StateKey,
-    armed: &ArmedKeys,
     event: EventRef,
     dirty: Arc<DirtyStore>,
 ) -> SuiteSession {
     let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
     let (_cancel_tx, cancel_rx) = watch::channel(false);
     KeyedStateSession::new(SessionParts::<SuiteBackend, _> {
-        cell: MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone()),
+        cell: MemoryCellStore::new(cells.clone()),
         dirty,
-        oracle: oracle.clone(),
+        dedup: dedup.clone(),
         loader: MemoryLoader::new(),
         registry: registry.clone(),
         state_key: state_key.clone(),
         event,
-        recovery_delay: CompactDuration::new(30),
-        armed: armed.clone(),
+        dedup_ttl: CompactDuration::new(30),
+        checks: (),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     })
 }
 
-/// Registers `name` under `def` and returns the shared registry plus the sweep
-/// ref.
+/// Registers `name` under `def` and returns the registry and collection
+/// reference.
 fn registry_and_ref<D>(
     descriptor: &D,
     name: &str,
@@ -428,63 +418,65 @@ where
     Ok((Arc::new(registry), collection_ref))
 }
 
-/// Resolves the event along its outcome's path: consume the `finalize`
-/// receipt inline (promote/rollback), or crash → fresh store → sweep.
-/// Returns `false` only if a sweep strands a cell.
+/// Promotes the event or runs admission after a rollback or crash.
+/// Returns `false` if admission fails or leaves residue.
 async fn resolve_event(
     session: SuiteSession,
-    finalized: Finalized<MemoryCellStore<ScriptedOracle>>,
+    finalized: Finalized<MemoryCellStore, ()>,
     outcome: Outcome,
     cells: &MemoryCells,
-    oracle: &ScriptedOracle,
-    registry: &Arc<CollectionDefRegistry>,
+    dedup: &MemoryDeduplicationStore,
+    _registry: &Arc<CollectionDefRegistry>,
     collection_ref: &CollectionRef,
 ) -> Result<bool> {
     match outcome {
         Outcome::Commit => {
             if let Finalized::Staged(staged) = finalized
-                && staged.certify().promote().await != ApplyOutcome::Resolved
+                && !matches!(staged.promote(|| false).await, Promoted::Complete)
             {
                 return Err(eyre!("promote incomplete on a healthy store"));
             }
         }
         Outcome::Abort => {
             if let Finalized::Staged(staged) = finalized {
-                staged.rollback().await;
+                drop(staged);
+                admit_collection(&MemoryCellStore::new(cells.clone()), dedup, collection_ref)
+                    .await?;
             }
         }
         Outcome::CrashCommitted | Outcome::CrashAborted => {
             // Dropping the receipt (and session) IS the crash: the durable
-            // staged cells and the oracle survive; the in-memory record dies.
+            // staged cells and the dedup store survive; the in-memory record dies.
+            if matches!(outcome, Outcome::CrashCommitted)
+                && matches!(finalized, Finalized::Staged(_))
+            {
+                seed_commit_evidence(&MemoryCellStore::new(cells.clone()), collection_ref).await?;
+            }
             drop(finalized);
             drop(session);
             // A cold store over the same warm backing — exactly a restart.
-            let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
-            if !sweep_provisional(&store, oracle, collection_ref)
+            let store = MemoryCellStore::new(cells.clone());
+            if !admit_collection(&store, dedup, collection_ref)
                 .await
-                .map_err(|e| eyre!("sweep: {e}"))?
+                .map_err(|e| eyre!("admission: {e}"))?
             {
                 return Ok(false);
             }
         }
     }
     // Every outcome in this runner's alphabet settles fully (promote and
-    // rollback delete the marker; the sweep resolves it), so no settlement
+    // rollback delete the marker; admission resolves it), so no settlement
     // residue may remain — checked raw, before the resolving read-back below
     // heals a skipped settle to identical bytes and masks it.
     assert_no_settlement_residue(cells, collection_ref.id())?;
     Ok(true)
 }
 
-/// Settles one committed event end-to-end for a directed pin: `finalize`,
-/// record the event's marker, then consume the receipt with
-/// `certify().promote()` — erroring if a healthy store reports `Incomplete`,
-/// and asserting the promote left no settlement residue in `cells` (the raw
-/// probe a resolving read cannot make; see [`assert_no_settlement_residue`]).
-/// A `Clean` finalize just records the marker (nothing to promote).
+/// Finalizes and promotes an event, then records its dedup id.
+/// The physical cells must contain no settlement residue afterward.
 pub(crate) async fn finalize_and_promote<L>(
     session: &L,
-    oracle: &ScriptedOracle,
+    dedup: &MemoryDeduplicationStore,
     dedup_id: Uuid,
     cells: &MemoryCells,
     collection: &CollectionId,
@@ -496,12 +488,12 @@ where
         .finalize()
         .await
         .map_err(|e| eyre!("finalize: {e}"))?;
-    oracle
-        .record_message(dedup_id)
+    dedup
+        .insert(dedup_id)
         .await
         .map_err(|e| eyre!("marker: {e}"))?;
     if let Finalized::Staged(staged) = finalized {
-        if staged.certify().promote().await != ApplyOutcome::Resolved {
+        if !matches!(staged.promote(|| false).await, Promoted::Complete) {
             bail!("promote incomplete on a healthy store");
         }
         assert_no_settlement_residue(cells, collection)?;
@@ -523,8 +515,8 @@ struct Backing<'a> {
 /// bind a fresh session per event, apply each op (`apply_op`, which also
 /// asserts mid-trace `pop`/`get` returns and reports mid-handler commits),
 /// `finalize`, resolve along the event's outcome (promote / rollback / crash →
-/// sweep), advance the model — the full scratch on a commit (or always, for a
-/// `ReadUncommitted` collection, whose `finalize` commits everything), the
+/// admission), advance the model — the full scratch on a commit (or always, for
+/// a `ReadUncommitted` collection, whose `finalize` commits everything), the
 /// last `commit()`-landed snapshot otherwise — then assert the committed
 /// collection through a fresh read-back session (`assert`, which absorbs any
 /// kind-specific check such as Map's `KeysetPresence`).
@@ -544,11 +536,10 @@ where
     Assert: AsyncFn(&D::Handle<SuiteSession>, &M, &Backing<'_>) -> Result<bool>,
 {
     let commit_mode = def.commit_mode;
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let (registry, collection_ref) = registry_and_ref(&descriptor, name, &state_key, def)?;
-    let armed: ArmedKeys = Arc::default();
     let backing = Backing {
         cells: &cells,
         state_key: &state_key,
@@ -559,7 +550,7 @@ where
         let event = EventRef::Message {
             dedup_id: Uuid::from_u128(index as u128),
         };
-        let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
+        let session = make_session(&cells, &dedup, &registry, &state_key, event);
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
         let mut scratch = model.clone();
@@ -580,8 +571,8 @@ where
             .await
             .map_err(|e| eyre!("finalize: {e}"))?;
         if ev.outcome.commits() {
-            oracle
-                .record_message(event_dedup(event))
+            dedup
+                .insert(event_dedup(event))
                 .await
                 .map_err(|e| eyre!("marker: {e}"))?;
         }
@@ -590,7 +581,7 @@ where
             finalized,
             ev.outcome,
             &cells,
-            &oracle,
+            &dedup,
             &registry,
             &collection_ref,
         )
@@ -601,7 +592,7 @@ where
         model = if commit_mode == CommitMode::ReadUncommitted || ev.outcome.commits() {
             // ReadUncommitted commits everything at `finalize` — any outcome
             // that reached it takes the full scratch (nothing provisional
-            // exists to roll back or sweep).
+            // exists for admission to resolve).
             scratch
         } else {
             // Abort / crash-rollback revert only the post-commit
@@ -611,14 +602,7 @@ where
         };
 
         // Read back through a fresh session (clean overlay) — pure committed.
-        let read = make_session(
-            &cells,
-            &oracle,
-            &registry,
-            &state_key,
-            &armed,
-            read_event(index),
-        );
+        let read = make_session(&cells, &dedup, &registry, &state_key, read_event(index));
         let read_handle = descriptor
             .bind(&read)
             .map_err(|e| eyre!("bind read: {e}"))?;
@@ -633,10 +617,10 @@ where
 /// every event and that each `pop` returns the model's value. A
 /// `Some(capacity)` registers a bounded deque and applies the **identical**
 /// capped-trim rule to the model (a plain loop, never a call to `evictions`),
-/// so the oracle tracks the handle's lazy push-only eviction op-for-op — the
-/// abort/crash arms then exercise rollback of those evictions. A dense no-TTL
-/// window keeps `VecDeque::len` equal to the handle's window span, so the model
-/// stays exact.
+/// so the dedup store tracks the handle's lazy push-only eviction op-for-op —
+/// the abort/crash arms then exercise rollback of those evictions. A dense
+/// no-TTL window keeps `VecDeque::len` equal to the handle's window span, so
+/// the model stays exact.
 pub(crate) async fn run_deque_trace(
     trace: DequeTrace,
     commit_mode: CommitMode,
@@ -699,52 +683,29 @@ pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> R
     run_map_trace_inner(trace, commit_mode, 3, None).await
 }
 
-pub(crate) async fn run_map_keys_prefix_trace(
-    trace: MapTrace,
-    limit: NonZeroUsize,
-) -> Result<bool> {
-    run_map_prefix_trace(trace, limit, PrefixFamily::Keys).await
-}
-
-pub(crate) async fn run_map_entries_prefix_trace(
-    trace: MapTrace,
-    limit: NonZeroUsize,
-) -> Result<bool> {
-    run_map_prefix_trace(trace, limit, PrefixFamily::Entries).await
-}
-
-async fn run_map_prefix_trace(
-    trace: MapTrace,
-    limit: NonZeroUsize,
-    family: PrefixFamily,
-) -> Result<bool> {
-    if !run_map_trace_inner(
-        trace.clone(),
-        CommitMode::ReadCommitted,
-        4096,
-        Some((limit, family)),
-    )
-    .await?
-    {
-        return Ok(false);
+/// Checks both query outputs on tracked and range plans.
+pub(crate) async fn run_map_prefix_trace(trace: MapTrace, limit: NonZeroUsize) -> Result<bool> {
+    for mode in [CommitMode::ReadCommitted, CommitMode::ReadUncommitted] {
+        for keyset_limit in [0, 4096] {
+            if !run_map_trace_inner(trace.clone(), mode, keyset_limit, Some(limit)).await? {
+                return Ok(false);
+            }
+        }
     }
-    run_map_trace_inner(trace, CommitMode::ReadCommitted, 0, Some((limit, family))).await
+    Ok(true)
 }
 
 async fn run_map_trace_inner(
     trace: MapTrace,
     commit_mode: CommitMode,
     keyset_limit: usize,
-    prefix: Option<(NonZeroUsize, PrefixFamily)>,
+    prefix: Option<NonZeroUsize>,
 ) -> Result<bool> {
     run_collection_trace(
         trace,
         map_state::<I64KeyCodec, JsonCodec>("mp"),
         "mp",
-        // A small keyset limit under the 5-key pool, so generated traces cross
-        // Tracked → Overflowed, hit the already-tracked fast path, and
-        // interleave removes/clears — while the BTreeMap model stays oblivious
-        // to the keyset's existence (the property proves it cannot tell).
+        // The keyset limit selects one source or permits a transition between sources.
         CollectionDef {
             commit_mode,
             keyset_limit,
@@ -790,12 +751,6 @@ async fn run_map_trace_inner(
     .await
 }
 
-#[derive(Clone, Copy)]
-enum PrefixFamily {
-    Keys,
-    Entries,
-}
-
 /// Map TTL keyset-refresh (what `finalize` stages): on a collection **with a
 /// TTL**, every `set` buffers the keyset cell — even a re-set of an
 /// already-tracked key, and even once the map has overflowed — so its TTL is
@@ -806,7 +761,7 @@ enum PrefixFamily {
 /// suppressed-refresh regression on the no-write fast paths (already-tracked
 /// and `Overflowed`, both reached with pool 5 / limit 3).
 pub(crate) async fn run_map_ttl_keyset_refresh_trace(trace: MapTrace) -> Result<bool> {
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
@@ -824,7 +779,6 @@ pub(crate) async fn run_map_ttl_keyset_refresh_trace(trace: MapTrace) -> Result<
         StateType::Application,
         StateName::try_new("mp")?,
     );
-    let armed: ArmedKeys = Arc::default();
     let keyset_cell = keyset_cell();
 
     for (index, ev) in trace.events.into_iter().enumerate() {
@@ -832,15 +786,8 @@ pub(crate) async fn run_map_ttl_keyset_refresh_trace(trace: MapTrace) -> Result<
             dedup_id: Uuid::from_u128(index as u128),
         };
         let dirty = Arc::new(DirtyStore::new());
-        let session = make_session_with_dirty(
-            &cells,
-            &oracle,
-            &registry,
-            &state_key,
-            &armed,
-            event,
-            dirty.clone(),
-        );
+        let session =
+            make_session_with_dirty(&cells, &dedup, &registry, &state_key, event, dirty.clone());
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
         for op in &ev.ops {
             match *op {
@@ -866,7 +813,7 @@ pub(crate) async fn run_map_ttl_keyset_refresh_trace(trace: MapTrace) -> Result<
                 }
             }
         }
-        finalize_and_promote(&session, &oracle, event_dedup(event), &cells, &id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event), &cells, &id).await?;
     }
     Ok(true)
 }
@@ -881,7 +828,7 @@ pub(crate) async fn run_map_ttl_keyset_refresh_trace(trace: MapTrace) -> Result<
 /// empty set (a fresh or `clear`ed map); a removed-to-empty map instead holds
 /// the empty `Tracked` frame — both are the live-empty case.
 pub(crate) async fn run_map_keyset_exact_trace(trace: MapTrace) -> Result<bool> {
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
@@ -895,15 +842,14 @@ pub(crate) async fn run_map_keyset_exact_trace(trace: MapTrace) -> Result<bool> 
         },
     )?;
     let id = collection_ref.id();
-    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
-    let armed: ArmedKeys = Arc::default();
+    let store = MemoryCellStore::new(cells.clone());
     let mut model: BTreeMap<i64, Value> = BTreeMap::new();
 
     for (index, ev) in trace.events.into_iter().enumerate() {
         let event = EventRef::Message {
             dedup_id: Uuid::from_u128(index as u128),
         };
-        let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
+        let session = make_session(&cells, &dedup, &registry, &state_key, event);
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
         for op in &ev.ops {
             match *op {
@@ -931,15 +877,15 @@ pub(crate) async fn run_map_keyset_exact_trace(trace: MapTrace) -> Result<bool> 
                 }
             }
         }
-        finalize_and_promote(&session, &oracle, event_dedup(event), &cells, id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event), &cells, id).await?;
 
         // The committed keyset must be exactly the live key set: a present
         // frame must equal `tracked_frame(live)`; an absent keyset is the
         // live-empty case (a fresh or `clear`ed map).
         let live: Vec<i64> = model.keys().copied().collect();
-        let stored = store
-            .get(id, &keyset_cell(), read_event(index))
+        let stored = CellRead::<Values>::read(&store, id, &keyset_cell())
             .await?
+            .0
             .into_inner();
         let exact = match stored {
             Some(bytes) => bytes[..] == tracked_frame(&live)[..],
@@ -1018,20 +964,19 @@ impl Arbitrary for MapGetManyInput {
 /// concatenation, and ordered `buffered` resolution).
 /// Proven over both the dirty-overlay arm (uncommitted) and the committed arm.
 pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Result<bool> {
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
     let (registry, collection_ref) =
         registry_and_ref(&descriptor, "mp", &state_key, CollectionDef::new(None))?;
     let id = collection_ref.id();
-    let armed: ArmedKeys = Arc::default();
 
     // Event 0: populate.
     let ev0 = EventRef::Message {
         dedup_id: Uuid::from_u128(0),
     };
-    let session0 = make_session(&cells, &oracle, &registry, &state_key, &armed, ev0);
+    let session0 = make_session(&cells, &dedup, &registry, &state_key, ev0);
     let handle0 = descriptor.bind(&session0).map_err(|e| eyre!("bind: {e}"))?;
     for (k, b) in &input.entries {
         handle0.set(*k, Value::from(*b)).await?;
@@ -1043,11 +988,11 @@ pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Res
     let mut point = Vec::with_capacity(input.queries.len());
     let mut point_presence = Vec::with_capacity(input.queries.len());
     if input.commit {
-        finalize_and_promote(&session0, &oracle, event_dedup(ev0), &cells, id).await?;
+        finalize_and_promote(&session0, &dedup, event_dedup(ev0), &cells, id).await?;
         let ev1 = EventRef::Message {
             dedup_id: Uuid::from_u128(1),
         };
-        let session1 = make_session(&cells, &oracle, &registry, &state_key, &armed, ev1);
+        let session1 = make_session(&cells, &dedup, &registry, &state_key, ev1);
         let handle1 = descriptor.bind(&session1).map_err(|e| eyre!("bind: {e}"))?;
         batch = Box::pin(handle1.get_many(&input.queries)).await?;
         presence = Box::pin(handle1.contains_many(&input.queries)).await?;
@@ -1120,25 +1065,17 @@ async fn seed_deque_window<S: CellStore>(
 /// interior). Seeded directly — never via wall-clock TTL — the only way to
 /// reach a holed window the handle itself never produces.
 pub(crate) async fn run_deque_holes(shape: DequeHoles) -> Result<bool> {
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = deque_state::<JsonCodec>("dq");
     let (registry, collection_ref) =
         registry_and_ref(&descriptor, "dq", &state_key, CollectionDef::new(None))?;
-    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let store = MemoryCellStore::new(cells.clone());
 
     seed_deque_window(&store, &collection_ref, shape.head, &shape.cells).await?;
 
-    let armed: ArmedKeys = Arc::default();
-    let session = make_session(
-        &cells,
-        &oracle,
-        &registry,
-        &state_key,
-        &armed,
-        read_event(0),
-    );
+    let session = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
     let len = shape.cells.len();
@@ -1170,7 +1107,7 @@ pub(crate) async fn run_deque_holes(shape: DequeHoles) -> Result<bool> {
 /// Evicts the deque's capped-trim prelude to a push on a plain window model —
 /// at most `TRIM_MAX` slots from the far end (front for a back push, back for a
 /// front push) toward `cap`. Deliberately **not** a call to the production
-/// `evictions`, keeping the oracle an independent check.
+/// `evictions`, keeping the dedup store an independent check.
 fn evict_for_push<T>(model: &mut VecDeque<T>, cap: usize, from_back: bool) {
     let mut evicted = 0;
     while model.len() + 1 > cap && evicted < deque::TRIM_MAX {
@@ -1211,7 +1148,7 @@ pub(crate) async fn run_deque_capacity_convergence(shape: DequeCapacityShape) ->
         cells,
         from_back,
     } = shape;
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let store_cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = deque_state::<JsonCodec>("dq");
@@ -1225,18 +1162,9 @@ pub(crate) async fn run_deque_capacity_convergence(shape: DequeCapacityShape) ->
         },
     )?;
     let id = collection_ref.id();
-    let store = MemoryCellStore::new(store_cells.clone(), oracle.clone(), registry.clone());
-    let armed: ArmedKeys = Arc::default();
-    let read_session = |idx: usize| {
-        make_session(
-            &store_cells,
-            &oracle,
-            &registry,
-            &state_key,
-            &armed,
-            read_event(idx),
-        )
-    };
+    let store = MemoryCellStore::new(store_cells.clone());
+    let read_session =
+        |idx: usize| make_session(&store_cells, &dedup, &registry, &state_key, read_event(idx));
 
     // Seed the (possibly over-wide, possibly holed) window directly at index 0 —
     // the handle never produces a window wider than the cap, so it must be seeded.
@@ -1269,10 +1197,9 @@ pub(crate) async fn run_deque_capacity_convergence(shape: DequeCapacityShape) ->
         let dirty = Arc::new(DirtyStore::new());
         let session = make_session_with_dirty(
             &store_cells,
-            &oracle,
+            &dedup,
             &registry,
             &state_key,
-            &armed,
             event,
             dirty.clone(),
         );
@@ -1301,7 +1228,7 @@ pub(crate) async fn run_deque_capacity_convergence(shape: DequeCapacityShape) ->
             return Ok(false);
         }
 
-        finalize_and_promote(&session, &oracle, event_dedup(event), &store_cells, id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event), &store_cells, id).await?;
 
         // Committed read-back: the span equals the model (holes included).
         let read = read_session(i + 1);
@@ -1339,13 +1266,13 @@ pub(crate) async fn run_deque_capacity_convergence(shape: DequeCapacityShape) ->
 /// `0..span` can orphan. Mirrors `deque_clear_resets_the_index_space`'s leak
 /// guard.
 async fn deque_no_committed_orphans(
-    store: &MemoryCellStore<ScriptedOracle>,
+    store: &MemoryCellStore,
     id: &CollectionId,
     span: usize,
 ) -> Result<bool> {
-    let Some(bounds) = store
-        .get(id, &deque::meta_cell(), read_event(0))
+    let Some(bounds) = CellRead::<Values>::read(store, id, &deque::meta_cell())
         .await?
+        .0
         .into_inner()
     else {
         bail!("bounds cell missing after the convergence pushes");
@@ -1355,13 +1282,9 @@ async fn deque_no_committed_orphans(
     for i in 0..span as i64 {
         let outside = i < head || i >= tail;
         if outside
-            && store
-                .get(
-                    id,
-                    &deque::entry_cell_for(&I64KeyCodec::encode(&i)),
-                    read_event(0),
-                )
+            && CellRead::<Values>::read(store, id, &deque::entry_cell_for(&I64KeyCodec::encode(&i)))
                 .await?
+                .0
                 .into_inner()
                 .is_some()
         {
@@ -1398,7 +1321,7 @@ pub(crate) async fn run_map_key_scan_holes(shape: MapKeyHoles) -> Result<bool> {
     let tracked = Bytes::from(tracked_frame(&all_keys));
     let overflowed = Bytes::from(OVERFLOWED_FRAME.to_vec());
     for keyset_frame in [tracked, overflowed] {
-        let oracle = ScriptedOracle::default();
+        let dedup = MemoryDeduplicationStore::default();
         let cells = MemoryCells::new();
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
         let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
@@ -1411,7 +1334,7 @@ pub(crate) async fn run_map_key_scan_holes(shape: MapKeyHoles) -> Result<bool> {
                 ..CollectionDef::new(None)
             },
         )?;
-        let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+        let store = MemoryCellStore::new(cells.clone());
 
         let mut seed = vec![(keyset_cell(), Some(keyset_frame))];
         for (i, cell) in shape.cells.iter().enumerate() {
@@ -1423,15 +1346,7 @@ pub(crate) async fn run_map_key_scan_holes(shape: MapKeyHoles) -> Result<bool> {
         }
         store.write_resolved(&collection_ref, &seed, &[]).await?;
 
-        let armed: ArmedKeys = Arc::default();
-        let session = make_session(
-            &cells,
-            &oracle,
-            &registry,
-            &state_key,
-            &armed,
-            read_event(0),
-        );
+        let session = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
         // Presence-only: holed (absent) keys never appear, in either direction.
@@ -1449,6 +1364,17 @@ pub(crate) async fn run_map_key_scan_holes(shape: MapKeyHoles) -> Result<bool> {
             .collect();
         if stream_keys != present {
             return Ok(false);
+        }
+        for dir in [Direction::Forward, Direction::Backward] {
+            let all = collect_map(&handle, dir).await?;
+            let limit = NonZeroUsize::new(all.len() / 2 + 1).unwrap_or(NonZeroUsize::MIN);
+            let expected: Vec<_> = all.into_iter().take(limit.get()).collect();
+            if drain(handle.query(dir).limit(limit).entries()).await? != expected
+                || drain(handle.query(dir).limit(limit).keys()).await?
+                    != expected.iter().map(|(key, _)| *key).collect::<Vec<_>>()
+            {
+                return Ok(false);
+            }
         }
         if handle.is_empty().await? != present.is_empty() {
             return Ok(false);
@@ -1559,7 +1485,7 @@ where
 async fn assert_map<S>(
     handle: &MapHandle<S, I64KeyCodec, JsonCodec>,
     model: &BTreeMap<i64, Value>,
-    prefix: Option<(NonZeroUsize, PrefixFamily)>,
+    prefix: Option<NonZeroUsize>,
 ) -> Result<bool>
 where
     S: StateSession,
@@ -1591,21 +1517,16 @@ where
     if collect_map_keys(handle, Direction::Backward).await? != descending_keys {
         return Ok(false);
     }
-    if let Some((limit, family)) = prefix {
-        for dir in [Direction::Forward, Direction::Backward] {
-            let matches = match family {
-                PrefixFamily::Keys => {
-                    let unlimited = collect_map_keys(handle, dir).await?;
-                    drain(handle.query(dir).limit(limit).keys()).await?
-                        == unlimited.into_iter().take(limit.get()).collect::<Vec<_>>()
-                }
-                PrefixFamily::Entries => {
-                    let unlimited = collect_map(handle, dir).await?;
-                    drain(handle.query(dir).limit(limit).entries()).await?
-                        == unlimited.into_iter().take(limit.get()).collect::<Vec<_>>()
-                }
-            };
-            if !matches {
+    if let Some(limit) = prefix {
+        for (dir, expected) in [
+            (Direction::Forward, ascending),
+            (Direction::Backward, descending),
+        ] {
+            let expected: Vec<_> = expected.into_iter().take(limit.get()).collect();
+            if drain(handle.query(dir).limit(limit).entries()).await? != expected
+                || drain(handle.query(dir).limit(limit).keys()).await?
+                    != expected.iter().map(|(key, _)| *key).collect::<Vec<_>>()
+            {
                 return Ok(false);
             }
         }
@@ -1649,13 +1570,13 @@ fn map_stream_classifies_corrupt_coordinate_permanent() -> Result<()> {
     use bytes::Bytes;
     use futures::executor::block_on;
 
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
     let (registry, collection_ref) =
         registry_and_ref(&descriptor, "mp", &state_key, CollectionDef::new(None))?;
-    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let store = MemoryCellStore::new(cells.clone());
 
     // An `Overflowed` keyset forces the full-section scan, which reaches the
     // corrupt entry — a 3-byte coordinate that cannot decode as `I64KeyCodec`
@@ -1673,15 +1594,7 @@ fn map_stream_classifies_corrupt_coordinate_permanent() -> Result<()> {
         &[],
     ))?;
 
-    let armed: ArmedKeys = Arc::default();
-    let session = make_session(
-        &cells,
-        &oracle,
-        &registry,
-        &state_key,
-        &armed,
-        read_event(0),
-    );
+    let session = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     let error = block_on(async {
         let stream = handle.stream(Direction::Forward);
@@ -1721,10 +1634,10 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
 
     // Tracked lists the key; Overflowed degrades to the full-section scan. Both
     // reach the same present-but-undecodable cell.
-    let tracked = Bytes::from(tracked_frame(&[key]));
+    let tracked = Bytes::from(tracked_frame(&[key, key + 1]));
     let overflowed = Bytes::from(OVERFLOWED_FRAME.to_vec());
     for (tracked_route, keyset_frame) in [(true, tracked), (false, overflowed)] {
-        let oracle = ScriptedOracle::default();
+        let dedup = MemoryDeduplicationStore::default();
         let cells = MemoryCells::new();
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
         let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
@@ -1737,11 +1650,7 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
                 ..CollectionDef::new(None)
             },
         )?;
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            cells.clone(),
-            oracle.clone(),
-            registry.clone(),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(cells.clone()));
         block_on(counting.write_resolved(
             &collection_ref,
             &[
@@ -1751,26 +1660,23 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
             &[],
         ))?;
 
-        let armed: ArmedKeys = Arc::default();
         counting.reset();
-        let session = super::counting_session(
-            &counting,
-            &oracle,
-            &registry,
-            &state_key,
-            &armed,
-            read_event(0),
-        );
+        let session =
+            super::counting_session(&counting, &dedup, &registry, &state_key, read_event(0));
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
         block_on(async {
             assert!(!handle.is_empty().await?);
-            assert_presence_route_calls(&counting, tracked_route);
+            assert_eq!(counting.scan_hint(), 1);
             assert_eq!(
-                counting.presence_batch_width(),
-                usize::from(tracked_route),
-                "tracked is_empty reads one coordinate"
+                counting.scan_limit(),
+                0,
+                "the overlay removes the result limit"
             );
+            assert_eq!(counting.visible_point_reads(), 0);
+            assert_eq!(counting.batch_reads(), 0);
+            assert_eq!(counting.presence_reads(), 0);
+            assert_eq!(counting.presence_scans(), 1);
             counting.reset();
             assert!(
                 handle.contains_key(&key).await.map_err(|e| eyre!("{e}"))?,
@@ -1786,6 +1692,31 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
                 "keys() yields the key of an undecodable-value cell"
             );
             assert_presence_route_calls(&counting, tracked_route);
+            counting.reset();
+            assert_eq!(
+                drain(
+                    handle
+                        .query(Direction::Forward)
+                        .limit(NonZeroUsize::MIN)
+                        .keys()
+                )
+                .await?,
+                vec![key]
+            );
+            assert_limited_fetch(&counting, tracked_route);
+
+            counting.reset();
+            assert!(
+                drain(
+                    handle
+                        .query(Direction::Forward)
+                        .limit(NonZeroUsize::MIN)
+                        .entries()
+                )
+                .await
+                .is_err()
+            );
+            assert_limited_fetch(&counting, tracked_route);
 
             // Value reads surface the decode failure as `Permanent`.
             let got = handle.get(&key).await;
@@ -1793,31 +1724,23 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
             if let Err(error) = got {
                 assert_eq!(error.classify_error(), ErrorCategory::Permanent);
             }
-            let stream_ends_in_error = {
-                let stream = handle.stream(Direction::Forward);
-                futures::pin_mut!(stream);
-                let mut errored = false;
-                while let Some(item) = stream.next().await {
-                    if item.is_err() {
-                        errored = true;
-                    }
-                }
-                errored
-            };
-            assert!(
-                stream_ends_in_error,
-                "stream must surface the value decode failure"
-            );
+            assert!(drain(handle.stream(Direction::Forward)).await.is_err());
             Ok::<_, color_eyre::Report>(())
         })?;
     }
     Ok(())
 }
 
-fn assert_presence_route_calls(
-    counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
-    tracked_route: bool,
-) {
+fn assert_limited_fetch(counting: &CountingCellStore<MemoryCellStore>, tracked: bool) {
+    if tracked {
+        assert_eq!(counting.batch_width(), 1);
+    } else {
+        assert_eq!(counting.scan_hint(), 1);
+        assert_eq!(counting.scan_limit(), 0);
+    }
+}
+
+fn assert_presence_route_calls(counting: &CountingCellStore<MemoryCellStore>, tracked_route: bool) {
     assert_eq!(counting.presence_reads(), usize::from(tracked_route));
     assert_eq!(counting.presence_scans(), usize::from(!tracked_route));
     assert_eq!(counting.batch_reads(), 0);
@@ -1837,14 +1760,13 @@ fn deque_meta_cell_bytes_are_frozen() -> Result<()> {
     use crate::state::descriptor::deque::meta_cell;
     use futures::executor::block_on;
 
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = deque_state::<JsonCodec>("dq");
     let (registry, _) = registry_and_ref(&descriptor, "dq", &state_key, CollectionDef::new(None))?;
-    let armed: ArmedKeys = Arc::default();
     let event = read_event(0);
-    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
+    let session = make_session(&cells, &dedup, &registry, &state_key, event);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
     // `push_back` then `push_front`: the window becomes `head = -1, tail = 1`,
@@ -1856,13 +1778,18 @@ fn deque_meta_cell_bytes_are_frozen() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
 
-    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let store = MemoryCellStore::new(cells.clone());
     let id = CollectionId::new(
         state_key.clone(),
         StateType::Application,
         StateName::try_new("dq")?,
     );
-    let Some(bytes) = block_on(store.get(&id, &meta_cell(), event))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, &id, &meta_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("bounds cell missing at the frozen address");
     };
     assert_eq!(
@@ -1893,25 +1820,24 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     use bytes::Bytes;
     use futures::executor::block_on;
 
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = deque_state::<JsonCodec>("dq");
     let (registry, collection_ref) =
         registry_and_ref(&descriptor, "dq", &state_key, CollectionDef::new(None))?;
     let id = collection_ref.id();
-    let armed: ArmedKeys = Arc::default();
 
     // Event 1: two pushes, committed — the window becomes [0, 2).
     let event1 = EventRef::Message {
         dedup_id: Uuid::from_u128(1),
     };
-    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event1);
+    let session = make_session(&cells, &dedup, &registry, &state_key, event1);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.push_back(Value::from(1_u8)).await?;
         handle.push_back(Value::from(2_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event1), &cells, id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event1), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
 
@@ -1919,17 +1845,22 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     let event2 = EventRef::Message {
         dedup_id: Uuid::from_u128(2),
     };
-    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event2);
+    let session = make_session(&cells, &dedup, &registry, &state_key, event2);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.clear().await?;
         handle.push_back(Value::from(9_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event2), &cells, id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event2), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
 
-    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
-    let Some(bytes) = block_on(store.get(id, &meta_cell(), read_event(0)))?.into_inner() else {
+    let store = MemoryCellStore::new(cells.clone());
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &meta_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("bounds cell missing after the committed clear-then-push");
     };
     assert_eq!(
@@ -1943,13 +1874,23 @@ fn deque_clear_resets_the_index_space() -> Result<()> {
     // the leak the API can never surface.
     let stale = entry_cell_for(&I64KeyCodec::encode(&1));
     assert_eq!(
-        block_on(store.get(id, &stale, read_event(0)))?.into_inner(),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &stale)
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner(),
         None,
         "the committed clear must physically erase the out-of-window row"
     );
     let reused = entry_cell_for(&I64KeyCodec::encode(&0));
     assert_eq!(
-        block_on(store.get(id, &reused, read_event(0)))?.into_inner(),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &reused)
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner(),
         Some(Bytes::from(serde_json::to_vec(&Value::from(9_u8))?)),
         "the reused index holds exactly the post-clear push"
     );
@@ -1968,13 +1909,13 @@ fn deque_peeks_match_get_on_an_over_wide_window() -> Result<()> {
     use bytes::Bytes;
     use futures::executor::block_on;
 
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = deque_state::<JsonCodec>("dq");
     let (registry, collection_ref) =
         registry_and_ref(&descriptor, "dq", &state_key, CollectionDef::new(None))?;
-    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let store = MemoryCellStore::new(cells.clone());
     block_on(store.write_resolved(
         &collection_ref,
         &[(
@@ -1984,15 +1925,7 @@ fn deque_peeks_match_get_on_an_over_wide_window() -> Result<()> {
         &[],
     ))?;
 
-    let armed: ArmedKeys = Arc::default();
-    let session = make_session(
-        &cells,
-        &oracle,
-        &registry,
-        &state_key,
-        &armed,
-        read_event(0),
-    );
+    let session = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
     let overflows = |result| {
@@ -2043,7 +1976,7 @@ fn deque_push_on_an_over_wide_window_succeeds() -> Result<()> {
         want_head: i64,
         want_tail: i64,
     ) -> Result<()> {
-        let oracle = ScriptedOracle::default();
+        let dedup = MemoryDeduplicationStore::default();
         let cells = MemoryCells::new();
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
         let descriptor = deque_state::<JsonCodec>("dq");
@@ -2056,7 +1989,7 @@ fn deque_push_on_an_over_wide_window_succeeds() -> Result<()> {
                 ..CollectionDef::new(None)
             },
         )?;
-        let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+        let store = MemoryCellStore::new(cells.clone());
         let id = collection_ref.id();
         block_on(store.write_resolved(
             &collection_ref,
@@ -2067,9 +2000,8 @@ fn deque_push_on_an_over_wide_window_succeeds() -> Result<()> {
             &[],
         ))?;
 
-        let armed: ArmedKeys = Arc::default();
         let event = read_event(0);
-        let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
+        let session = make_session(&cells, &dedup, &registry, &state_key, event);
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
         block_on(async {
             handle.push_back(Value::from(1_u8)).await?;
@@ -2077,7 +2009,12 @@ fn deque_push_on_an_over_wide_window_succeeds() -> Result<()> {
             Ok::<_, color_eyre::Report>(())
         })?;
 
-        let Some(bounds) = block_on(store.get(id, &meta_cell(), event))?.into_inner() else {
+        let Some(bounds) = block_on(async {
+            CellRead::<Values>::read(&store, id, &meta_cell())
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner() else {
             bail!("bounds cell missing after the over-wide push");
         };
         let head = i64::from_be_bytes(bounds[0..8].try_into()?);
@@ -2127,25 +2064,24 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
     use crate::state::cell_key::{CellKey, Coordinate};
     use futures::executor::block_on;
 
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
     let (registry, collection_ref) =
         registry_and_ref(&descriptor, "mp", &state_key, CollectionDef::new(None))?;
     let id = collection_ref.id();
-    let armed: ArmedKeys = Arc::default();
-    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let store = MemoryCellStore::new(cells.clone());
 
     // Event 1: one committed set stamps the keyset cell.
     let event1 = EventRef::Message {
         dedup_id: Uuid::from_u128(1),
     };
-    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event1);
+    let session = make_session(&cells, &dedup, &registry, &state_key, event1);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.set(7, Value::from(1_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event1), &cells, id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event1), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
 
@@ -2168,21 +2104,31 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
     let event2 = EventRef::Message {
         dedup_id: Uuid::from_u128(2),
     };
-    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event2);
+    let session = make_session(&cells, &dedup, &registry, &state_key, event2);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.clear().await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event2), &cells, id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event2), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
     assert_eq!(
-        block_on(store.get(id, &keyset_cell(), read_event(0)))?.into_inner(),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &keyset_cell())
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner(),
         None,
         "the committed clear must erase the keyset cell"
     );
     for cell in &legacy {
         assert_eq!(
-            block_on(store.get(id, cell, read_event(0)))?.into_inner(),
+            block_on(async {
+                CellRead::<Values>::read(&store, id, cell)
+                    .await
+                    .map(|(committed, _)| committed)
+            })?
+            .into_inner(),
             None,
             "the whole-layout reset must erase every retired meta coordinate too"
         );
@@ -2194,15 +2140,20 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
     let event3 = EventRef::Message {
         dedup_id: Uuid::from_u128(3),
     };
-    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event3);
+    let session = make_session(&cells, &dedup, &registry, &state_key, event3);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.set(7, Value::from(1_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event3), &cells, id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event3), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
     assert_eq!(
-        block_on(store.get(id, &keyset_cell(), read_event(1)))?.into_inner(),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &keyset_cell())
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner(),
         Some(bytes::Bytes::from(tracked_frame(&[7]))),
         "a set after clear writes a fresh single-key Tracked keyset"
     );
@@ -2219,23 +2170,22 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
 fn map_first_set_writes_keyset() -> Result<()> {
     use futures::executor::block_on;
 
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
     let (registry, collection_ref) =
         registry_and_ref(&descriptor, "mp", &state_key, CollectionDef::new(None))?;
     let id = collection_ref.id();
-    let armed: ArmedKeys = Arc::default();
 
     let event = EventRef::Message {
         dedup_id: Uuid::from_u128(1),
     };
-    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
+    let session = make_session(&cells, &dedup, &registry, &state_key, event);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.set(7, Value::from(1_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event), &cells, id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
     assert!(
@@ -2243,14 +2193,7 @@ fn map_first_set_writes_keyset() -> Result<()> {
         "the first committed set writes a physical keyset cell"
     );
 
-    let read = make_session(
-        &cells,
-        &oracle,
-        &registry,
-        &state_key,
-        &armed,
-        read_event(0),
-    );
+    let read = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
     let read_handle = descriptor.bind(&read).map_err(|e| eyre!("bind: {e}"))?;
     assert_eq!(
         block_on(read_handle.get(&7))?,
@@ -2260,20 +2203,20 @@ fn map_first_set_writes_keyset() -> Result<()> {
     Ok(())
 }
 
-/// A live entry without its keyset stays hidden until a handler reconstructs
-/// the keyset. Both key-only reads must use the same residual posture.
+/// Key enumeration hides a live entry without its keyset.
+/// The direct emptiness check still finds the entry.
 #[test]
 fn map_missing_keyset_hides_a_live_entry() -> Result<()> {
     use bytes::Bytes;
     use futures::executor::block_on;
 
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
     let (registry, collection_ref) =
         registry_and_ref(&descriptor, "mp", &state_key, CollectionDef::new(None))?;
-    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let store = MemoryCellStore::new(cells.clone());
     let coordinate = I64KeyCodec::encode(&7);
     let value = Bytes::from(serde_json::to_vec(&Value::from(1_u8))?);
     block_on(store.write_resolved(
@@ -2282,18 +2225,10 @@ fn map_missing_keyset_hides_a_live_entry() -> Result<()> {
         &[],
     ))?;
 
-    let armed: ArmedKeys = Arc::default();
-    let session = make_session(
-        &cells,
-        &oracle,
-        &registry,
-        &state_key,
-        &armed,
-        read_event(0),
-    );
+    let session = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
-        assert!(handle.is_empty().await?);
+        assert!(!handle.is_empty().await?);
         assert!(
             collect_map_keys(&handle, Direction::Forward)
                 .await?
@@ -2334,7 +2269,7 @@ const OVERFLOWED_FRAME: [u8; 1] = [1];
 fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
     use futures::executor::block_on;
 
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
@@ -2348,22 +2283,26 @@ fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
         },
     )?;
     let id = collection_ref.id();
-    let armed: ArmedKeys = Arc::default();
-    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let store = MemoryCellStore::new(cells.clone());
 
     // Event 1: keys 1 and 2 fill the limit-2 keyset — a two-key Tracked frame.
     let event1 = EventRef::Message {
         dedup_id: Uuid::from_u128(1),
     };
-    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event1);
+    let session = make_session(&cells, &dedup, &registry, &state_key, event1);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.set(1, Value::from(1_u8)).await?;
         handle.set(2, Value::from(2_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event1), &cells, id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event1), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(0)))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("the committed sets must have written a keyset cell");
     };
     // Golden literal on purpose — independent of `tracked_frame`, so a helper
@@ -2381,14 +2320,19 @@ fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
     let event2 = EventRef::Message {
         dedup_id: Uuid::from_u128(2),
     };
-    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event2);
+    let session = make_session(&cells, &dedup, &registry, &state_key, event2);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.set(3, Value::from(3_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event2), &cells, id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event2), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(1)))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("the overflowing set must have written a keyset cell");
     };
     assert_eq!(
@@ -2411,7 +2355,7 @@ fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
 fn map_keyset_stays_tracked_under_ttl() -> Result<()> {
     use futures::executor::block_on;
 
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
@@ -2425,24 +2369,27 @@ fn map_keyset_stays_tracked_under_ttl() -> Result<()> {
         },
     )?;
     let id = collection_ref.id();
-    let armed: ArmedKeys = Arc::default();
-    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let store = MemoryCellStore::new(cells.clone());
 
     let event = EventRef::Message {
         dedup_id: Uuid::from_u128(1),
     };
-    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
+    let session = make_session(&cells, &dedup, &registry, &state_key, event);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.set(1, Value::from(1_u8)).await?;
         handle.set(2, Value::from(2_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event), &cells, id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
     assert_eq!(
-        block_on(store.get(id, &keyset_cell(), read_event(0)))?
-            .into_inner()
-            .map(|b| b.to_vec()),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &keyset_cell())
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner()
+        .map(|b| b.to_vec()),
         Some(tracked_frame(&[1, 2])),
         "a TTL'd map keeps a Tracked keyset, never collapses to Overflowed"
     );
@@ -2454,17 +2401,21 @@ fn map_keyset_stays_tracked_under_ttl() -> Result<()> {
     let event2 = EventRef::Message {
         dedup_id: Uuid::from_u128(2),
     };
-    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event2);
+    let session = make_session(&cells, &dedup, &registry, &state_key, event2);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.set(1, Value::from(1_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event2), &cells, id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event2), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
     assert_eq!(
-        block_on(store.get(id, &keyset_cell(), read_event(1)))?
-            .into_inner()
-            .map(|b| b.to_vec()),
+        block_on(async {
+            CellRead::<Values>::read(&store, id, &keyset_cell())
+                .await
+                .map(|(committed, _)| committed)
+        })?
+        .into_inner()
+        .map(|b| b.to_vec()),
         Some(tracked_frame(&[1, 2])),
         "re-setting a tracked key on a TTL'd map keeps the Tracked frame, never Overflowed"
     );
@@ -2478,26 +2429,25 @@ fn map_keyset_malformed_frame_degrades_and_heals() -> Result<()> {
     use bytes::Bytes;
     use futures::executor::block_on;
 
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
     let (registry, collection_ref) =
         registry_and_ref(&descriptor, "mp", &state_key, CollectionDef::new(None))?;
     let id = collection_ref.id();
-    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
-    let armed: ArmedKeys = Arc::default();
+    let store = MemoryCellStore::new(cells.clone());
 
     // Event 1: a committed two-key map (writes a valid Tracked keyset).
     let event1 = EventRef::Message {
         dedup_id: Uuid::from_u128(1),
     };
-    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event1);
+    let session = make_session(&cells, &dedup, &registry, &state_key, event1);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.set(1, Value::from(1_u8)).await?;
         handle.set(2, Value::from(2_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event1), &cells, id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event1), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
 
@@ -2510,14 +2460,7 @@ fn map_keyset_malformed_frame_degrades_and_heals() -> Result<()> {
 
     // A fresh stream degrades to the full-section scan and yields both entries
     // (no error).
-    let read = make_session(
-        &cells,
-        &oracle,
-        &registry,
-        &state_key,
-        &armed,
-        read_event(0),
-    );
+    let read = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
     let read_handle = descriptor.bind(&read).map_err(|e| eyre!("bind: {e}"))?;
     let items = block_on(collect_map(&read_handle, Direction::Forward))?;
     assert_eq!(
@@ -2530,14 +2473,19 @@ fn map_keyset_malformed_frame_degrades_and_heals() -> Result<()> {
     let event2 = EventRef::Message {
         dedup_id: Uuid::from_u128(2),
     };
-    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event2);
+    let session = make_session(&cells, &dedup, &registry, &state_key, event2);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.set(1, Value::from(9_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event2), &cells, id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event2), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(1)))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("the healing set must have written a keyset cell");
     };
     assert_eq!(
@@ -2559,7 +2507,7 @@ fn map_keyset_oversized_frame_collapses_before_fast_path() -> Result<()> {
     use bytes::Bytes;
     use futures::executor::block_on;
 
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
@@ -2573,8 +2521,7 @@ fn map_keyset_oversized_frame_collapses_before_fast_path() -> Result<()> {
         },
     )?;
     let id = collection_ref.id();
-    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
-    let armed: ArmedKeys = Arc::default();
+    let store = MemoryCellStore::new(cells.clone());
 
     // Seed a valid 5-key Tracked keyset (over limit 3) plus its 5 entries.
     let mut seed = vec![(
@@ -2593,14 +2540,7 @@ fn map_keyset_oversized_frame_collapses_before_fast_path() -> Result<()> {
 
     // The oversized Tracked keyset degrades to the full-section scan (yields
     // all 5).
-    let read = make_session(
-        &cells,
-        &oracle,
-        &registry,
-        &state_key,
-        &armed,
-        read_event(0),
-    );
+    let read = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
     let read_handle = descriptor.bind(&read).map_err(|e| eyre!("bind: {e}"))?;
     let items = block_on(collect_map(&read_handle, Direction::Forward))?;
     assert_eq!(
@@ -2614,14 +2554,19 @@ fn map_keyset_oversized_frame_collapses_before_fast_path() -> Result<()> {
     let event = EventRef::Message {
         dedup_id: Uuid::from_u128(1),
     };
-    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
+    let session = make_session(&cells, &dedup, &registry, &state_key, event);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.set(1, Value::from(11_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event), &cells, id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(1)))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("the set must have written a keyset cell");
     };
     assert_eq!(
@@ -2640,30 +2585,34 @@ fn map_keyset_byte_ceiling_overflows() -> Result<()> {
     use crate::state::order_codec::Utf8KeyCodec;
     use futures::executor::block_on;
 
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<Utf8KeyCodec, JsonCodec>("mp");
     let (registry, collection_ref) =
         registry_and_ref(&descriptor, "mp", &state_key, CollectionDef::new(None))?;
     let id = collection_ref.id();
-    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
-    let armed: ArmedKeys = Arc::default();
+    let store = MemoryCellStore::new(cells.clone());
 
     let big_a = "a".repeat(40 * 1024);
     let big_b = "b".repeat(40 * 1024);
     let event = EventRef::Message {
         dedup_id: Uuid::from_u128(1),
     };
-    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event);
+    let session = make_session(&cells, &dedup, &registry, &state_key, event);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.set(big_a, Value::from(1_u8)).await?;
         handle.set(big_b, Value::from(2_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event), &cells, id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event), &cells, id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
-    let Some(bytes) = block_on(store.get(id, &keyset_cell(), read_event(0)))?.into_inner() else {
+    let Some(bytes) = block_on(async {
+        CellRead::<Values>::read(&store, id, &keyset_cell())
+            .await
+            .map(|(committed, _)| committed)
+    })?
+    .into_inner() else {
         bail!("the sets must have written a keyset cell");
     };
     assert_eq!(
@@ -2683,7 +2632,7 @@ fn map_keyset_byte_ceiling_overflows() -> Result<()> {
 fn map_keyset_subtracts_on_remove() -> Result<()> {
     use futures::executor::block_on;
 
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
@@ -2695,17 +2644,16 @@ fn map_keyset_subtracts_on_remove() -> Result<()> {
         StateType::Application,
         StateName::try_new("mp")?,
     );
-    let armed: ArmedKeys = Arc::default();
 
     // Event 1: set key 7 committed (a fresh single-key Tracked keyset).
     let event1 = EventRef::Message {
         dedup_id: Uuid::from_u128(1),
     };
-    let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event1);
+    let session = make_session(&cells, &dedup, &registry, &state_key, event1);
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.set(7, Value::from(1_u8)).await?;
-        finalize_and_promote(&session, &oracle, event_dedup(event1), &cells, &id).await?;
+        finalize_and_promote(&session, &dedup, event_dedup(event1), &cells, &id).await?;
         Ok::<_, color_eyre::Report>(())
     })?;
 
@@ -2714,15 +2662,8 @@ fn map_keyset_subtracts_on_remove() -> Result<()> {
         dedup_id: Uuid::from_u128(2),
     };
     let dirty = Arc::new(DirtyStore::new());
-    let session = make_session_with_dirty(
-        &cells,
-        &oracle,
-        &registry,
-        &state_key,
-        &armed,
-        event2,
-        dirty.clone(),
-    );
+    let session =
+        make_session_with_dirty(&cells, &dedup, &registry, &state_key, event2, dirty.clone());
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         handle.set(7, Value::from(2_u8)).await?;
@@ -2767,8 +2708,7 @@ fn event_dedup(event: EventRef) -> Uuid {
     }
 }
 
-/// A read-back event distinct from every staging event so own-event resolution
-/// never short-circuits the read.
+/// Identifies a read session independently from each staged event.
 fn read_event(index: usize) -> EventRef {
     EventRef::Message {
         dedup_id: Uuid::from_u128(u128::MAX - index as u128),
@@ -2965,7 +2905,7 @@ pub(crate) async fn run_map_stream_interleave(input: MapInterleave) -> Result<bo
     } else {
         Direction::Forward
     };
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, JsonCodec>("iv");
@@ -2980,14 +2920,13 @@ pub(crate) async fn run_map_stream_interleave(input: MapInterleave) -> Result<bo
         },
     )?;
     let id = collection_ref.id();
-    let armed: ArmedKeys = Arc::default();
 
     // Seed a committed map of INTERLEAVE_SEED keys; `ever_held` records each.
     let mut ever_held: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
     let seed_event = EventRef::Message {
         dedup_id: Uuid::from_u128(1),
     };
-    let seed_session = make_session(&cells, &oracle, &registry, &state_key, &armed, seed_event);
+    let seed_session = make_session(&cells, &dedup, &registry, &state_key, seed_event);
     let seed = descriptor
         .bind(&seed_session)
         .map_err(|e| eyre!("bind: {e}"))?;
@@ -2996,18 +2935,11 @@ pub(crate) async fn run_map_stream_interleave(input: MapInterleave) -> Result<bo
         seed.set(key, Value::from(key)).await?;
         ever_held.entry(key).or_default().insert(key);
     }
-    finalize_and_promote(&seed_session, &oracle, Uuid::from_u128(1), &cells, id).await?;
+    finalize_and_promote(&seed_session, &dedup, Uuid::from_u128(1), &cells, id).await?;
     let init_keys: BTreeSet<i64> = (0..i64::try_from(INTERLEAVE_SEED)?).collect();
 
     // A fresh live session; the stream and its racing mutators share it.
-    let session = make_session(
-        &cells,
-        &oracle,
-        &registry,
-        &state_key,
-        &armed,
-        read_event(0),
-    );
+    let session = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     let stream = handle.stream(dir);
     futures::pin_mut!(stream);
@@ -3073,14 +3005,13 @@ pub(crate) async fn run_deque_stream_interleave(input: DequeInterleave) -> Resul
     } else {
         Direction::Forward
     };
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = deque_state::<JsonCodec>("iv");
     let (registry, collection_ref) =
         registry_and_ref(&descriptor, "iv", &state_key, CollectionDef::new(None))?;
     let id = collection_ref.id();
-    let armed: ArmedKeys = Arc::default();
 
     // Seed a committed window of INTERLEAVE_SEED elements; `ever_pushed` records
     // every value the deque ever held.
@@ -3088,7 +3019,7 @@ pub(crate) async fn run_deque_stream_interleave(input: DequeInterleave) -> Resul
     let seed_event = EventRef::Message {
         dedup_id: Uuid::from_u128(1),
     };
-    let seed_session = make_session(&cells, &oracle, &registry, &state_key, &armed, seed_event);
+    let seed_session = make_session(&cells, &dedup, &registry, &state_key, seed_event);
     let seed = descriptor
         .bind(&seed_session)
         .map_err(|e| eyre!("bind: {e}"))?;
@@ -3097,16 +3028,9 @@ pub(crate) async fn run_deque_stream_interleave(input: DequeInterleave) -> Resul
         seed.push_back(Value::from(value)).await?;
         ever_pushed.insert(value);
     }
-    finalize_and_promote(&seed_session, &oracle, Uuid::from_u128(1), &cells, id).await?;
+    finalize_and_promote(&seed_session, &dedup, Uuid::from_u128(1), &cells, id).await?;
 
-    let session = make_session(
-        &cells,
-        &oracle,
-        &registry,
-        &state_key,
-        &armed,
-        read_event(0),
-    );
+    let session = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     let stream = handle.stream(dir);
     futures::pin_mut!(stream);

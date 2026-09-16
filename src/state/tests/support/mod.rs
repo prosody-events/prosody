@@ -3,32 +3,30 @@
 //! runners and their trace types stay in `cell_suite`/`collection_suite`/
 //! `identity_suite`; this module holds the standalone doubles they don't own.
 
+use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::middleware::{MarkerWrite, RepinProof};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
-use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
+use crate::state::cell::{Committed, Presence, Projection, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
 use crate::state::collection::{MutationJournal, StateSession, WritableStateSession, sealed};
 use crate::state::descriptor::{CellResolver, StructuralIdentity};
-use crate::state::marker::{EventMarker, SectionClear};
+use crate::state::marker::{AttemptId, EventEvidence, EventMarker, SectionClear};
 use crate::state::memory::MemoryPublicationStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
-use crate::state::oracle::CommitOracle;
 use crate::state::publication::{PublicationRows, PublicationStore, StatePublication};
 use crate::state::registry::CollectionDef;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{Finalized, MessageMarker, OpPermit, SessionGate};
 use crate::state::store::{
-    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch,
+    CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable,
     provisional_point_loop,
 };
 use crate::state::{
-    CollectionId, CollectionRef, CommitDecision, EventRef, StateKey, StateName, StateType,
-    StoreOutcome,
+    CollectionId, CollectionRef, EventRef, StateKey, StateName, StateType, StoreOutcome,
 };
 use crate::subsystem::SubsystemName;
-use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, bail, eyre};
@@ -36,7 +34,6 @@ use futures::stream::{self, Stream};
 use parking_lot::Mutex;
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
-use smallvec::smallvec;
 use std::convert::Infallible;
 use std::fmt;
 use std::future::{Future, ready};
@@ -47,79 +44,19 @@ use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
 
+mod reader;
+pub(crate) use reader::reader_residue;
 mod counting;
 mod holding;
 mod publication;
 mod ttl;
 
-pub(crate) use counting::{CountingCellStore, CountingResolver, ResolveCounter};
+pub(crate) use counting::{CountProjection, CountingCellStore, CountingResolver, ResolveCounter};
 pub(crate) use holding::{HoldingCellStore, Holds};
 pub(crate) use publication::{ParkedRead, ScriptedPublicationStore};
 pub(crate) use ttl::TtlStub;
 
-/// Get-out-of-the-way commit oracle: `record_message` is a no-op and every
-/// event resolves to the one fixed decision. Use it where the test is not
-/// about commit resolution; the commit-tracking double is
-/// [`ScriptedOracle`](super::cell_suite::ScriptedOracle).
-#[derive(Clone)]
-pub struct FixedOracle(CommitDecision);
-
-impl FixedOracle {
-    pub(crate) fn committed() -> Self {
-        Self(CommitDecision::Committed)
-    }
-
-    pub(crate) fn not_committed() -> Self {
-        Self(CommitDecision::NotCommitted)
-    }
-}
-
-impl CommitOracle for FixedOracle {
-    type Error = Infallible;
-
-    fn record_message(&self, _dedup_id: Uuid) -> impl Future<Output = Result<(), Self::Error>> {
-        ready(Ok(()))
-    }
-
-    fn resolve<'a>(
-        &'a self,
-        _state_key: &'a StateKey,
-        _event: EventRef,
-    ) -> impl Future<Output = Result<CommitDecision, Self::Error>> {
-        ready(Ok(self.0))
-    }
-}
-
-/// A commit oracle counting every `resolve` consult — the no-oracle tests'
-/// probe: a verb that must never resolve leaves the counter at zero.
-/// `record_message` is a no-op; `resolve` bumps and returns a fixed
-/// `NotCommitted`.
-#[derive(Clone, Default)]
-pub(crate) struct CountingOracle(Arc<AtomicUsize>);
-
-impl CountingOracle {
-    /// Resolutions counted so far.
-    pub(crate) fn resolves(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
-    }
-}
-
-impl CommitOracle for CountingOracle {
-    type Error = Infallible;
-
-    fn record_message(&self, _dedup_id: Uuid) -> impl Future<Output = Result<(), Self::Error>> {
-        ready(Ok(()))
-    }
-
-    fn resolve<'a>(
-        &'a self,
-        _state_key: &'a StateKey,
-        _event: EventRef,
-    ) -> impl Future<Output = Result<CommitDecision, Self::Error>> {
-        self.0.fetch_add(1, Ordering::Relaxed);
-        ready(Ok(CommitDecision::NotCommitted))
-    }
-}
+pub(crate) use crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStore;
 
 /// Stateless session stub: every state op reports
 /// [`StateAccessError::Unavailable`] and the lifecycle is inert. Mounted by
@@ -214,13 +151,26 @@ where
 
     async fn begin_read(_session: &UnavailableState<P>) {}
 
+    fn capture((): &()) {}
+
+    async fn resume(_session: &UnavailableState<P>, (): &()) {}
+
+    fn fence(_session: &UnavailableState<P>) -> Result<(), StateAccessError> {
+        Ok(())
+    }
+}
+
+impl<P, Q: Projection> sealed::Reads<UnavailableState<P>, Q> for UnavailableEngine
+where
+    P: Clone + Send + Sync + 'static,
+{
     fn read_point(
         _session: &UnavailableState<P>,
         _inner: &mut Self::ReadInner<'_>,
         _state_type: StateType,
         _name: &StateName,
         _cell: &CellKey,
-    ) -> impl Future<Output = Result<Option<Bytes>, StateAccessError>> {
+    ) -> impl Future<Output = Result<Option<Q::Payload>, StateAccessError>> {
         ready(Err(StateAccessError::Unavailable))
     }
 
@@ -231,24 +181,9 @@ where
         _name: &StateName,
         _section: Section,
         _batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<Option<Bytes>>, StateAccessError>> {
+    ) -> impl Future<Output = Result<CellBuffer<Option<Q::Payload>>, StateAccessError>> {
         ready(Err(StateAccessError::Unavailable))
     }
-
-    fn read_presence_batch(
-        _session: &UnavailableState<P>,
-        _inner: &mut Self::ReadInner<'_>,
-        _state_type: StateType,
-        _name: &StateName,
-        _section: Section,
-        _batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<PresenceBatch, StateAccessError>> + Send {
-        ready(Err(StateAccessError::Unavailable))
-    }
-
-    fn capture((): &()) {}
-
-    async fn resume(_session: &UnavailableState<P>, (): &()) {}
 
     fn page<'a>(
         _session: &'a UnavailableState<P>,
@@ -256,22 +191,8 @@ where
         _state_type: StateType,
         _name: &'a StateName,
         _scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, Q::Payload), StateAccessError>> + Send + 'a {
         stream::once(async { Err(StateAccessError::Unavailable) })
-    }
-
-    fn page_keys<'a>(
-        _session: &'a UnavailableState<P>,
-        (): &'a (),
-        _state_type: StateType,
-        _name: &'a StateName,
-        _scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, StateAccessError>> + Send + 'a {
-        stream::once(async { Err(StateAccessError::Unavailable) })
-    }
-
-    fn fence(_session: &UnavailableState<P>) -> Result<(), StateAccessError> {
-        Ok(())
     }
 }
 
@@ -347,7 +268,8 @@ impl<P> StateLifecycle for UnavailableState<P>
 where
     P: Clone + Send + Sync + 'static,
 {
-    type Cell = MemoryCellStore<FixedOracle>;
+    type Cell = MemoryCellStore;
+    type Checks = ();
 
     fn gate(&self) -> &SessionGate {
         &self.gate
@@ -358,7 +280,9 @@ where
         self.gate.close(|_waited_s| {}).await
     }
 
-    fn finalize(&self) -> impl Future<Output = Result<Finalized<Self::Cell>, StateAccessError>> {
+    fn finalize(
+        &self,
+    ) -> impl Future<Output = Result<Finalized<Self::Cell, ()>, StateAccessError>> {
         ready(Ok(Finalized::Clean))
     }
 
@@ -379,16 +303,6 @@ where
     fn repin(&self, _proof: RepinProof) -> Self {
         self.clone()
     }
-
-    fn recovery_floor(&self) -> CompactDuration {
-        CompactDuration::MIN
-    }
-
-    fn backstop_armed(&self) -> impl Future<Output = Option<CompactDateTime>> {
-        ready(None)
-    }
-
-    async fn mark_backstop_armed(&self, _fire: CompactDateTime) {}
 }
 
 impl<P> MarkerIdentity for UnavailableState<P>
@@ -413,18 +327,6 @@ where
 pub(crate) fn fresh_collection(name: &str) -> Result<CollectionId> {
     Ok(CollectionId::new(
         StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
-        StateType::Application,
-        StateName::try_new(name)?,
-    ))
-}
-
-/// A collection identity with a fixed, deterministic `StateKey`
-/// (`Uuid::from_u128(0xA1B2_C3D4)`, key `"user-1"`) — for codec-pinning tests
-/// whose value is reproducible identity bytes. Never use it where tests share
-/// a store; that is [`fresh_collection`]'s contract.
-pub(crate) fn fixed_collection(name: &str) -> Result<CollectionId> {
-    Ok(CollectionId::new(
-        StateKey::new(Uuid::from_u128(0xA1B2_C3D4), Arc::from("user-1")),
         StateType::Application,
         StateName::try_new(name)?,
     ))
@@ -459,18 +361,10 @@ pub(crate) fn probe(n: u128) -> EventRef {
     }
 }
 
-/// Asserts an explicit settle (promote, rollback, or sweep) left nothing
-/// behind for `id`: no provisional cell and no unsettled event marker, read
-/// **raw** from the durable maps. A resolving read cannot make this check —
-/// it heals a still-provisional cell to the same bytes a correct settle
-/// writes, so a skipped settle reads back identically. The marker leg is
-/// load-bearing for clears-only stages, which stage zero provisional cells:
-/// there the stranded marker is the only raw evidence of a skipped settle.
-///
-/// Call only where the harness guarantees the collection is fully settled;
-/// first-touch heals leave the marker unsettled by design, so an event that
-/// deliberately abandons its stage (reset, final-error) leaves residue a
-/// later resolving read absorbs — don't probe across such an event.
+/// Checks durable cells and marker state after a complete settlement.
+/// Raw reads also detect clears-only residue, which has no provisional cells.
+/// Do not call this after an interrupted settlement; admission owns that
+/// residue.
 pub(crate) fn assert_no_settlement_residue(cells: &MemoryCells, id: &CollectionId) -> Result<()> {
     if !cells.provisional_coordinates(id).is_empty() {
         bail!("settlement left a provisional cell unsettled");
@@ -479,4 +373,40 @@ pub(crate) fn assert_no_settlement_residue(cells: &MemoryCells, id: &CollectionI
         bail!("settlement left an event marker unsettled");
     }
     Ok(())
+}
+
+mod admission;
+pub(crate) use admission::{
+    admit_collection, admit_registered, run_admit_soundness, seed_commit_evidence,
+};
+
+mod inspection;
+pub(crate) use inspection::StageInspection;
+
+/// The marker's evidence with no staged cells and no clears.
+pub(crate) fn evidence_only(marker: &EventMarker) -> EventMarker {
+    EventMarker::frozen(
+        marker.event(),
+        &[],
+        &[],
+        &EventEvidence {
+            attempt: marker.attempt(),
+            touched: marker.touched().into(),
+            evidence_ttl: marker.evidence_ttl(),
+            dedup: marker.dedup(),
+        },
+    )
+}
+
+/// Creates one hour of evidence for a new test attempt.
+pub(crate) fn evidence(
+    touched: Arc<[(StateType, StateName)]>,
+    dedup: Option<Uuid>,
+) -> EventEvidence {
+    EventEvidence {
+        attempt: AttemptId::new(),
+        touched,
+        evidence_ttl: CompactDuration::new(3600),
+        dedup,
+    }
 }

@@ -1,4 +1,7 @@
 use super::*;
+use crate::state::cassandra::cell::TABLE_KEYED_STATE_CELL;
+use crate::state::tests::support::run_admit_soundness;
+use color_eyre::eyre::ensure;
 
 /// Converts a property body's `Result<bool>` into a `TestResult`, surfacing the
 /// error on failure (a store/setup error is a broken environment, not a
@@ -18,7 +21,7 @@ pub(super) fn finish(result: Result<bool>) -> TestResult {
 fn prop_cassandra_cell_crash_equivalence() {
     async fn run(trace: Trace) -> Result<bool> {
         let fx = fixture().await?;
-        let oracle = ScriptedOracle::default();
+        let dedup = MemoryDeduplicationStore::default();
         // Each `make` is a crash: a cold fjall cache over the same durable
         // Cassandra rows, with the runner's lower fault seam between them.
         // `cold_cache` clears the shared `cassandra_crash` keyspace pair (a
@@ -30,13 +33,9 @@ fn prop_cassandra_cell_crash_equivalence() {
         // minted from that same cold cache.
         let make = |handle: &PoisonHandle| -> Result<FaultyBottom> {
             let cache = test_db::cold_cache("cassandra_crash")?;
-            let presence = cache.marker_checks();
             Ok(Cached::new(
                 cache,
-                FailingCellStore::with_handle(
-                    fx.bottom_store_with(oracle.clone(), presence),
-                    handle.clone(),
-                ),
+                FailingCellStore::with_handle(fx.bottom_store(), handle.clone()),
             ))
         };
         let probe = CassandraShapeProbe {
@@ -44,7 +43,7 @@ fn prop_cassandra_cell_crash_equivalence() {
         };
         Box::pin(run_crash_equivalence_trace(
             make,
-            oracle.clone(),
+            dedup.clone(),
             trace,
             &probe,
         ))
@@ -57,20 +56,6 @@ fn prop_cassandra_cell_crash_equivalence() {
         .quickcheck((|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(Trace) -> TestResult);
 }
 
-/// Proves that a resolved write survives an earlier unsettled section clear.
-#[test]
-fn cassandra_blind_write_survives_stale_clear() -> Result<()> {
-    init_test_logging();
-    TEST_RUNTIME.block_on(async {
-        let fx = fixture().await?;
-        let oracle = ScriptedOracle::default();
-        let cache = test_db::cold_cache("cassandra_blind_write")?;
-        let presence = cache.marker_checks();
-        let store = Cached::new(cache, fx.bottom_store_with(oracle.clone(), presence));
-        run_blind_write_survives_stale_clear(store, oracle).await
-    })
-}
-
 /// Posture-parity test over the bare live store: a blind `write_resolved`
 /// leaves an unsettled clears-FREE marker unsettled.
 #[test]
@@ -78,7 +63,7 @@ fn cassandra_blind_write_leaves_clears_free_marker() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let fx = fixture().await?;
-        let store = fx.bottom_store(ScriptedOracle::default())?;
+        let store = fx.bottom_store();
         let probe = CassandraShapeProbe {
             session: fx.cassandra.clone(),
         };
@@ -86,66 +71,18 @@ fn cassandra_blind_write_leaves_clears_free_marker() -> Result<()> {
     })
 }
 
-/// Regression test over the production `Cached<CassandraStore>` assembly: a
-/// repair whose payload predates a committed but unsettled marker with clears
-/// defers to peek semantics beneath the cache, so the marker's own resolution
-/// (the committed positional clear) erases the cell instead of a stale repair
-/// resurrecting it. The section-clear cache guard clear-eviction beats the
-/// earlier deferred fill. Falsify by deleting the `deferred` guard in
-/// `resolve_cell`.
-#[test]
-fn cassandra_repair_defers_beneath_stale_clear() -> Result<()> {
-    init_test_logging();
-    TEST_RUNTIME.block_on(async {
-        let fx = fixture().await?;
-        let oracle = ScriptedOracle::default();
-        // Stage under the fixture's presence (the prior assignment). The reader
-        // is a fresh cold assignment: a cold cache whose own marker check is
-        // cold, so `x` never warms it and the Cached read cold-seeds from
-        // durable truth, reaching `resolve_cell`.
-        let stage = fx.bottom_store(oracle.clone())?;
-        let cache = test_db::cold_cache("cassandra_repair_defer")?;
-        let presence = cache.marker_checks();
-        let store = Cached::new(cache, fx.bottom_store_with(oracle.clone(), presence));
-        let probe = CassandraShapeProbe {
-            session: fx.cassandra.clone(),
-        };
-        run_repair_defers_beneath_stale_clear(&stage, store, oracle, &probe).await
-    })
-}
-
-/// Convergence test over `Cached<CassandraStore>`: the deferral wedges nothing
-/// — when the unsettled marker aborts, x's committed projection stays its base.
-#[test]
-fn cassandra_repair_after_marker_abort_converges() -> Result<()> {
-    init_test_logging();
-    TEST_RUNTIME.block_on(async {
-        let fx = fixture().await?;
-        let oracle = ScriptedOracle::default();
-        let stage = fx.bottom_store(oracle.clone())?;
-        let cache = test_db::cold_cache("cassandra_repair_abort")?;
-        let presence = cache.marker_checks();
-        let store = Cached::new(cache, fx.bottom_store_with(oracle.clone(), presence));
-        let probe = CassandraShapeProbe {
-            session: fx.cassandra.clone(),
-        };
-        run_repair_after_marker_abort_converges(&stage, store, oracle, &probe).await
-    })
-}
-
 /// Apply idempotence over the bare live store: any generated interleaving of
 /// marker resolution, verdict-matching settle re-applies, and per-cell
-/// first-touches over one staged set with durable section clears converges to
+/// reads over one staged set with durable section clears converges to
 /// the verdict state — no marker, no provisional residue, exact row shape.
 #[test]
 fn prop_cassandra_apply_idempotence() {
     async fn run(input: ApplyTrace) -> Result<bool> {
         let fx = fixture().await?;
-        let oracle = ScriptedOracle::default();
         let probe = CassandraShapeProbe {
             session: fx.cassandra.clone(),
         };
-        run_apply_idempotence(fx.bottom_store(oracle.clone())?, oracle, input, &probe).await
+        run_apply_idempotence(fx.bottom_store(), input, &probe).await
     }
 
     init_test_logging();
@@ -157,13 +94,12 @@ fn prop_cassandra_apply_idempotence() {
 }
 
 /// Implicit-overwrite soundness over `Cached<CassandraStore>`: each overwrite
-/// resolves its predecessor's provisional cell through the oracle on read, with
-/// no explicit promote or rollback.
+/// resolves prior residue through admission before the next stage.
 #[test]
 fn prop_cassandra_cell_implicit_overwrite() {
     async fn run(trace: OverwriteTrace) -> Result<bool> {
         let fx = fixture().await?;
-        let oracle = ScriptedOracle::default();
+        let dedup = MemoryDeduplicationStore::default();
         // Each op reads its committed base through a fresh COLD store, so
         // `make` clears the shared `cassandra_overwrite` keyspace pair (no
         // keyspace-creation fsync); distinct v4 segments per iteration keep it
@@ -172,13 +108,9 @@ fn prop_cassandra_cell_implicit_overwrite() {
         // is minted from that same cold cache.
         let make = || -> Result<Bottom> {
             let cache = test_db::cold_cache("cassandra_overwrite")?;
-            let presence = cache.marker_checks();
-            Ok(Cached::new(
-                cache,
-                fx.bottom_store_with(oracle.clone(), presence),
-            ))
+            Ok(Cached::new(cache, fx.bottom_store()))
         };
-        run_overwrite_trace(make, oracle.clone(), trace).await
+        run_overwrite_trace(make, dedup.clone(), trace).await
     }
 
     init_test_logging();
@@ -195,7 +127,7 @@ fn prop_cassandra_cell_implicit_overwrite() {
 fn assembly(fx: &Fixture) -> Result<Bottom> {
     Ok(Cached::new(
         test_db::cache("cassandra_overlay")?,
-        fx.bottom_store(ScriptedOracle::default())?,
+        fx.bottom_store(),
     ))
 }
 
@@ -220,9 +152,8 @@ fn prop_cassandra_overlay_view() {
         );
 }
 
-/// Scan correctness directly over `CassandraStore::scan_cells` — the live
-/// `ORDER BY ASC/DESC`, clustering-range bounds, and `LIMIT`/in-code `end` the
-/// overlay merge delegates to.
+/// Both Cassandra scan projections match the committed model across bounds and
+/// section clears.
 #[test]
 fn prop_cassandra_bottom_scan() {
     async fn run(trace: ScanTrace) -> Result<bool> {
@@ -230,12 +161,7 @@ fn prop_cassandra_bottom_scan() {
         let probe = CassandraShapeProbe {
             session: fx.cassandra.clone(),
         };
-        Box::pin(run_bottom_scan_trace(
-            fx.bottom_store(ScriptedOracle::default())?,
-            trace,
-            &probe,
-        ))
-        .await
+        Box::pin(run_bottom_scan_trace(fx.bottom_store(), trace, &probe)).await
     }
 
     init_test_logging();
@@ -272,4 +198,43 @@ fn ttl_seconds_surfacing_distinguishes_no_ttl_from_sub_second() {
         Some(CompactDuration::new(0)),
         "a defensive negative also stamps an immediate expiry, not never"
     );
+}
+
+#[test]
+fn prop_cassandra_admit_soundness() {
+    fn property(value: u8, committed: bool) -> TestResult {
+        finish(TEST_RUNTIME.block_on(async {
+            let fx = fixture().await?;
+            let dedup = MemoryDeduplicationStore::new();
+            let store = fx.bottom_store();
+            let c = collection("corrupt-admission")?;
+            let id = c.id();
+            let corrupt = format!(
+                "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, \
+                 state_type, name, kind, section, coordinate, version) VALUES (?, ?, ?, ?, 1, 0, \
+                 0x02, 99)"
+            );
+            fx.cassandra
+                .session()
+                .query_unpaged(
+                    corrupt,
+                    (
+                        id.state_key().segment_id,
+                        id.state_key().key.as_ref(),
+                        id.state_type(),
+                        id.name().as_str(),
+                    ),
+                )
+                .await?;
+            ensure!(store.marker_state(id).await.is_err());
+            ensure!(
+                admit_collection(&store, &dedup, &c).await?,
+                "corrupt marker blocked admission"
+            );
+            run_admit_soundness(store, dedup, value, committed).await
+        }))
+    }
+    QuickCheck::new()
+        .tests(integration_test_count(25))
+        .quickcheck(property as fn(u8, bool) -> TestResult);
 }

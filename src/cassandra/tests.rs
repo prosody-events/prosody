@@ -10,6 +10,26 @@ use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
 use std::ops::Range;
 
+/// TTLs within the ceiling retain their seconds. Missing and larger TTLs bind
+/// 0.
+#[quickcheck]
+fn ttl_bindings_preserve_finite_retention(seconds: Option<u32>) -> bool {
+    use super::{MAX_CASSANDRA_TTL_SECS, bind_ttl};
+    use crate::timers::duration::CompactDuration;
+
+    let bound = i64::from(bind_ttl(seconds.map(CompactDuration::new)));
+    match seconds {
+        None => bound == 0,
+        Some(seconds) => {
+            if i64::from(seconds) <= MAX_CASSANDRA_TTL_SECS {
+                bound == i64::from(seconds)
+            } else {
+                bound == 0
+            }
+        }
+    }
+}
+
 /// The packer yields the **fewest contiguous** chunks within both limits — the
 /// "as few batches as possible" invariant, proven offline.
 ///

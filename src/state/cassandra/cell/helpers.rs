@@ -1,7 +1,9 @@
+use super::decode::PointRow;
 use super::{
     Bytes, CassandraCellStoreError, CellBlobs, CellBuffer, CompactDuration, Coordinate,
     PER_STATEMENT_OVERHEAD, ProvisionalCell, SmallVec, encode_payload, select_encoding,
 };
+use crate::state::cell::Values;
 
 /// Encodes a cell's `data` and `prev` payloads into their bound columns.
 /// It selects one shared encoding from the larger payload because the row has
@@ -35,13 +37,6 @@ pub(super) fn blob_weight(blob: &CellBlobs) -> u64 {
     PER_STATEMENT_OVERHEAD + blob_bytes
 }
 
-/// Converts a per-write TTL to the `i32` the driver binds to `USING TTL ?`.
-/// The input is pre-validated against Cassandra's ceiling at registration, so
-/// the saturating conversion is only a defensive floor.
-pub(super) fn ttl_to_i32(ttl: CompactDuration) -> i32 {
-    ttl.seconds().try_into().unwrap_or(i32::MAX)
-}
-
 /// Converts a blob-TTL read (`decode`'s `blob_ttl`) into the cache-fill
 /// remaining duration. A NULL (`None`) means the cell has no TTL — it never
 /// expires. A present value is the whole remaining seconds (a FLOOR), so a
@@ -57,7 +52,7 @@ pub(super) fn ttl_seconds_to_duration(ttl: Option<i32>) -> Option<CompactDuratio
 /// Keeps provisional cells from a recovery batch and discards their TTLs.
 /// The input already follows ascending coordinate order.
 pub(super) fn decode_provisional_batch(
-    rows: CellBuffer<Option<super::decode::BorrowedCellTtlRow<'_>>>,
+    rows: CellBuffer<Option<PointRow<Values>>>,
     coordinates: &[&Coordinate],
 ) -> Result<CellBuffer<(Coordinate, ProvisionalCell)>, CassandraCellStoreError> {
     let mut out: CellBuffer<(Coordinate, ProvisionalCell)> = SmallVec::with_capacity(rows.len());

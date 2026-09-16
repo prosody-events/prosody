@@ -14,10 +14,7 @@
 //! descriptor backed by a Kafka message reference takes the same path because
 //! the session's loader is selected by its backend family.
 //!
-//! Source discovery itself — the cached snapshot, its refresh, and retry
-//! pacing — lives in [`acquisition`]. `clippy::multiple_inherent_impl` fires on
-//! inherent impls sharing a self type across files, so one module-level
-//! expectation covers the whole subtree.
+//! [`acquisition`] owns source discovery, snapshot refresh, and retries.
 
 #![expect(
     clippy::multiple_inherent_impl,
@@ -53,15 +50,11 @@ use tokio::task::coop::cooperative;
 /// A cross-group, read-only view over a published keyed-state collection.
 ///
 /// Built from a [`StateReaderDependencies`] bundle with [`StateReader::new`].
-/// Reads observe
-/// only [`Cell::project_committed`](crate::state::cell::Cell::project_committed)
-/// of one source per operation, with honest bounded staleness. Two independent
-/// sources bound that staleness. The descriptor's read-cache TTL bounds a
-/// cached value's age. The owner's commit-to-apply window bounds the second: a
-/// value can be committed before the owner applies it, so a read may return
-/// that once-committed value early (see `project_committed` above). The second
-/// source converges via the owner's recovery sweep or its next commit, not via
-/// the read cache.
+/// Each operation reads one source. Positive collection evidence makes a
+/// committed provisional value visible before the owner applies it.
+/// Committed clears restrict scans to their frozen survivors.
+/// The read-cache TTL bounds cached value age. Store reads use evidence without
+/// an owner admission.
 ///
 /// The reader is generic over the collection descriptor `D` and the message
 /// codec `C`. The read methods live in descriptor-specialized impl blocks for
@@ -205,6 +198,7 @@ where
 // --- Map reads --------------------------------------------------------------
 
 /// A directional map stream query for a standalone reader.
+/// Terminals acquire a session before they return an owned stream.
 ///
 /// See [`crate::state::descriptor::map::MapQuery::limit`] for the limit
 /// contract.
@@ -224,7 +218,6 @@ where
     KC: OrderedKeyCodec + 'static,
     KC::Key: Display,
     V: CellType<Key = UnitKey>,
-    for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
 {
     /// Sets the maximum number of present items that the stream yields.
     pub fn limit(mut self, limit: NonZeroUsize) -> Self {
@@ -246,6 +239,7 @@ where
     where
         V: 'static,
         ResolvedOf<V>: 'static,
+        for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
     {
         let session = self.reader.session(self.key).await?;
         let handle: MapHandle<_, KC, V> = self.reader.descriptor.bind(&session)?;

@@ -1,8 +1,10 @@
 //! Process-shared in-memory cells and committed reader projections.
 
-use crate::state::cell::{Cell, Committed, ProvisionalCell};
+use crate::state::cell::{Cell, Committed, Projection, ProvisionalCell, resolve_for_reader};
 use crate::state::cell_key::{CellKey, Direction, Scan, Section};
+#[cfg(test)]
 use crate::state::marker::EventMarker;
+use crate::state::marker::{MarkerState, ReaderEvidence};
 use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::{CollectionId, EventRef};
 use ahash::RandomState;
@@ -14,7 +16,11 @@ use std::sync::Arc;
 use tokio::task::coop::cooperative;
 
 pub(super) type CellMap = scc::HashMap<(CollectionId, CellKey), StoredCell, RandomState>;
-type MarkerMap = scc::HashMap<CollectionId, EventMarker, RandomState>;
+/// This map is the memory store itself.
+/// The test and mock store has no clock. It retains Committed evidence for its
+/// lifetime. This is the only retention that a clockless store can express.
+/// Abort removes entries without evidence.
+type MarkerMap = scc::HashMap<CollectionId, MarkerState, RandomState>;
 
 /// A process-shared in-memory cell map.
 ///
@@ -41,32 +47,65 @@ impl MemoryCells {
             .unwrap_or_else(|| Cell::Resolved(Committed::new(None)))
     }
 
+    pub(crate) fn marker_state(&self, collection: &CollectionId) -> MarkerState {
+        self.markers
+            .read_sync(collection, |_, state| state.clone())
+            .unwrap_or_default()
+    }
+
+    fn reader_evidence(&self, collection: &CollectionId) -> ReaderEvidence {
+        let state = self.marker_state(collection);
+        let staged_committed = state.staged.as_ref().is_some_and(|marker| {
+            marker.touched().iter().any(|(state_type, name)| {
+                if *state_type == collection.state_type() && name == collection.name() {
+                    return false;
+                }
+                let id =
+                    CollectionId::new(collection.state_key().clone(), *state_type, name.clone());
+                self.marker_state(&id)
+                    .committed
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.certifies(marker))
+            })
+        });
+        ReaderEvidence {
+            state,
+            staged_committed,
+        }
+    }
+
     pub(crate) fn read_committed(
         &self,
         collection: &CollectionId,
         cell: &CellKey,
     ) -> Option<Bytes> {
-        self.read_committed_cell(collection, cell)
-            .project_committed()
-            .cloned()
+        let evidence = self.reader_evidence(collection);
+        if !evidence.survives(cell) {
+            return None;
+        }
+        resolve_for_reader(&self.read_committed_cell(collection, cell), &evidence).cloned()
     }
 
-    pub(crate) fn read_committed_many(
+    pub(crate) fn read_committed_many<P: Projection>(
         &self,
         collection: &CollectionId,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> CellBuffer<Option<Bytes>> {
+    ) -> CellBuffer<Option<P::Payload>> {
+        let evidence = self.reader_evidence(collection);
         batch
             .iter()
             .map(|coordinate| {
-                self.read_committed(
-                    collection,
-                    &CellKey {
-                        section,
-                        coordinate: coordinate.clone(),
-                    },
-                )
+                let key = CellKey {
+                    section,
+                    coordinate: coordinate.clone(),
+                };
+                if !evidence.survives(&key) {
+                    return None;
+                }
+                resolve_for_reader(&self.read_committed_cell(collection, &key), &evidence)
+                    .cloned()
+                    .map(P::from_value)
             })
             .collect()
     }
@@ -77,6 +116,7 @@ impl MemoryCells {
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Infallible>> + Send + 'a {
         try_stream! {
+            let evidence = self.reader_evidence(collection);
             let mut raw: Vec<(CellKey, Cell)> = Vec::new();
             self.inner.iter_sync(|(id, cell), stored| {
                 if id == collection
@@ -97,8 +137,9 @@ impl MemoryCells {
                 if limit.is_some_and(|n| yielded >= n) {
                     break;
                 }
+                if !evidence.survives(&cell) { continue; }
                 if let Some(bytes) =
-                    cooperative(async move { stored.project_committed().cloned() }).await
+                    cooperative(async { resolve_for_reader(&stored, &evidence).cloned() }).await
                 {
                     yield (cell, bytes);
                     yielded += 1;
@@ -134,7 +175,8 @@ impl MemoryCells {
     #[cfg(test)]
     pub(crate) fn unsettled_marker_of(&self, collection: &CollectionId) -> Option<EventMarker> {
         self.markers
-            .read_sync(collection, |_, marker| marker.clone())
+            .read_sync(collection, |_, marker| marker.staged.clone())
+            .flatten()
     }
 }
 

@@ -161,8 +161,7 @@ impl ModeConfiguration {
         let retry = builders.retry.build()?;
         let scheduler = builders.scheduler.build()?;
         let timeout = builders.timeout.build()?;
-        // Deduplication is the commit oracle for every mode, so it lives in the
-        // common configuration rather than pipeline-only.
+        // Every mode uses the common dedup configuration.
         let dedup = builders.dedup.build()?;
 
         // Build the common configuration shared by every mode. Keyed state is

@@ -8,6 +8,7 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::telemetry::Telemetry;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
+pub(crate) use crate::timers::scheduler::tests::support::retirement_trace;
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
 use crate::timers::store::{Segment, SegmentVersion};
@@ -31,13 +32,13 @@ pub(crate) fn test_semaphores() -> Arc<TimerSemaphores> {
     }))
 }
 
-/// Fresh V3 [`Segment`] with a random id.
+/// Fresh V4 [`Segment`] with a random id.
 pub(crate) fn test_segment(name: &str, slab_size: impl Into<CompactDuration>) -> Segment {
     Segment {
         id: Uuid::new_v4(),
         name: name.to_owned(),
         slab_size: slab_size.into(),
-        version: SegmentVersion::V3,
+        version: SegmentVersion::V4,
     }
 }
 
@@ -84,7 +85,20 @@ pub(crate) async fn setup_timer_manager_at(
     TimerManager<TableAdapter<InMemoryTriggerStore>>,
     watch::Sender<ShutdownPhase>,
 )> {
-    let store = memory_store(test_segment("test-segment", 300_u32));
+    setup_timer_manager_with_store(memory_store(test_segment("test-segment", 300_u32)), initial)
+        .await
+}
+
+/// Creates a manager over a store that the test can seed through table
+/// operations.
+pub(crate) async fn setup_timer_manager_with_store(
+    store: TableAdapter<InMemoryTriggerStore>,
+    initial: ShutdownPhase,
+) -> Result<(
+    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
+    TimerManager<TableAdapter<InMemoryTriggerStore>>,
+    watch::Sender<ShutdownPhase>,
+)> {
     let (shutdown_tx, shutdown_rx) = watch::channel(initial);
     let telemetry = Telemetry::new();
 

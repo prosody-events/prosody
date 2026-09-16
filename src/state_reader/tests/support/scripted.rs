@@ -8,6 +8,7 @@ use crate::codec::JsonCodec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
+use crate::state::cell::Projection;
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::descriptor::StateDescriptor;
 use crate::state::descriptor_identity::{
@@ -20,7 +21,7 @@ use crate::state::publication::StatePublication;
 use crate::state::registry::CollectionDef;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::{CellBuffer, CoordinateBatch};
-use crate::state::tests::support::{FixedOracle, ScriptedPublicationStore};
+use crate::state::tests::support::ScriptedPublicationStore;
 use crate::state::{StateName, StateType};
 use crate::state_reader::backend::{ReaderComponents, ScriptedReaderBackend};
 use crate::state_reader::cache::ReaderCache;
@@ -36,6 +37,7 @@ use futures::{Stream, StreamExt};
 use scc::hash_map::Entry;
 use std::convert::Infallible;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -97,6 +99,8 @@ pub(in crate::state_reader::tests) enum FaultPoint {
 #[derive(Clone, Default)]
 pub(crate) struct ScriptedCellSource {
     inner: MemoryCells,
+    scan_hint: Arc<AtomicUsize>,
+    scan_limit: Arc<AtomicUsize>,
     faults: Arc<scc::HashMap<SegmentId, FaultPoint, RandomState>>,
     /// Per-source committed-read counter — the source-call trace. Cloning
     /// shares it, so a test reads the count after moving the source into a
@@ -151,6 +155,13 @@ impl ScriptedCellSource {
             .unwrap_or(0)
     }
 
+    pub(in crate::state_reader::tests) fn scan_bounds(&self) -> (usize, usize) {
+        (
+            self.scan_hint.load(Ordering::Relaxed),
+            self.scan_limit.load(Ordering::Relaxed),
+        )
+    }
+
     fn record_read(&self, segment: SegmentId) {
         match self.reads.entry_sync(segment) {
             Entry::Vacant(slot) => {
@@ -173,19 +184,19 @@ impl ScriptedCellSource {
         Ok(self.inner.read_committed(id, cell))
     }
 
-    pub(crate) fn read_committed_many(
+    pub(crate) fn read_committed_many<P: Projection>(
         &self,
         id: &CollectionId,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
+    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError> {
         let segment = id.state_key().segment_id;
         self.record_read(segment);
         let fault = self.fault_of(segment);
         if matches!(fault, Some(FaultPoint::AtOpen)) {
             return Err(StateAccessError::store(&ScriptedFaultError));
         }
-        let mut buffer = self.inner.read_committed_many(id, section, batch);
+        let mut buffer = self.inner.read_committed_many::<P>(id, section, batch);
         if matches!(fault, Some(FaultPoint::ShortBatch)) {
             buffer.pop();
         }
@@ -197,6 +208,12 @@ impl ScriptedCellSource {
         id: &'a CollectionId,
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+        self.scan_hint.store(
+            scan.fetch_hint.map_or(0, NonZeroUsize::get),
+            Ordering::Relaxed,
+        );
+        self.scan_limit
+            .store(scan.limit.unwrap_or(0), Ordering::Relaxed);
         let segment = id.state_key().segment_id;
         self.record_read(segment);
         let fault = self.fault_of(segment);
@@ -373,7 +390,7 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
         ops: F,
     ) -> Result<StateKey>
     where
-        F: FnOnce(D::Handle<OwnerSession<MemoryCellStore<FixedOracle>>>) -> Fut,
+        F: FnOnce(D::Handle<OwnerSession<MemoryCellStore>>) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
         let state_key = source_state_key(tp, group, key, self.count)?;

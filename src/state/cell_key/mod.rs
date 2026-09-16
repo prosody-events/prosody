@@ -18,6 +18,7 @@
 //! [`order_codec`]: crate::state::order_codec
 
 use bytes::Bytes;
+use std::num::NonZeroUsize;
 use std::ops::Bound;
 
 /// Disjoint, orderable sub-grouping of one collection's cells.
@@ -142,7 +143,38 @@ pub enum ScanEdge<T> {
     Unbounded,
 }
 
+/// The start edge used to select a scan statement.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum EdgeKind {
+    /// Include the anchor coordinate.
+    Included,
+    /// Exclude the anchor coordinate.
+    Excluded,
+    /// Scan the whole section.
+    Unbounded,
+}
+
+impl ScanEdge<&Coordinate> {
+    /// Returns the anchor. An unbounded start uses the minimum coordinate.
+    pub(crate) fn anchor(&self) -> &Coordinate {
+        static EMPTY: Coordinate = Coordinate::empty();
+        match self {
+            Self::Included(coordinate) | Self::Excluded(coordinate) => coordinate,
+            Self::Unbounded => &EMPTY,
+        }
+    }
+}
+
 impl<T> ScanEdge<T> {
+    /// Returns the kind of this edge.
+    pub(crate) fn kind(&self) -> EdgeKind {
+        match self {
+            Self::Included(_) => EdgeKind::Included,
+            Self::Excluded(_) => EdgeKind::Excluded,
+            Self::Unbounded => EdgeKind::Unbounded,
+        }
+    }
+
     /// Borrows the inner value, preserving inclusivity — the borrow half of the
     /// `as_ref().cloned()` pair, parallelling [`Bound::as_ref`].
     #[must_use]
@@ -212,6 +244,10 @@ pub struct Scan<'a> {
 
     /// The optional maximum number of cells to yield.
     pub limit: Option<usize>,
+
+    /// The preferred number of cells per fetch. Backends can add headroom.
+    /// This hint never limits results and survives an overlay's limit removal.
+    pub fetch_hint: Option<NonZeroUsize>,
 }
 
 impl Scan<'_> {

@@ -56,6 +56,7 @@
 
 use crate::codec::{Codec, SerializeBufGuard};
 use crate::state::access::StateAccessError;
+use crate::state::cell::{Presence, Projection, Values};
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::descriptor::{
     CellCodecError, CellResolver, CellStateError, CellType, CollectionSpec, ContextOf, FromSession,
@@ -63,7 +64,7 @@ use crate::state::descriptor::{
 };
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::registry::CollectionDef;
-use crate::state::store::{CellBuffer, CoordinateBatch, PresenceBatch};
+use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::{RESOLVE_FANOUT, StateName, StateType, StoreOutcome};
 use bytes::{Bytes, BytesMut};
 use educe::Educe;
@@ -101,9 +102,9 @@ pub(crate) use stream::{CoordinatePlan, Plan, RangePlan};
 /// name.
 pub(crate) mod sealed {
     use super::{
-        Bytes, CellBuffer, CellKey, CollectionDef, CoordinateBatch, MutationJournal, PresenceBatch,
+        CellBuffer, CellKey, CollectionDef, CoordinateBatch, MutationJournal, Presence, Projection,
         Scan, Section, StateAccessError, StateName, StateType, StoreOutcome, Stream,
-        StructuralIdentity,
+        StructuralIdentity, Values,
     };
     use std::future::Future;
     use std::ops::DerefMut;
@@ -113,15 +114,14 @@ pub(crate) mod sealed {
     /// runtime branch.
     pub trait Session: Sized {
         /// This session's engine.
-        type Engine: ReadEngine<Self>;
+        type Engine: ReadEngine<Self> + Reads<Self, Values> + Reads<Self, Presence>;
     }
 
     /// A session whose engine can also mutate. `WriteOperation` exists only
     /// for these, so "mutate through read admission" is unrepresentable.
     pub trait WritableSession: Session<Engine: WriteEngine<Self>> {}
 
-    /// The read half of one engine: how an invocation acquires its state and
-    /// how it reads one cell's visible committed bytes through it.
+    /// Owns read admission, plan capture, and the dispatch fence.
     pub trait ReadEngine<S: ?Sized> {
         /// The per-invocation state: the owner's gate permit, or the reader's
         /// operation-local source selection.
@@ -161,42 +161,6 @@ pub(crate) mod sealed {
         /// Acquires this invocation's read state.
         fn begin_read(session: &S) -> impl Future<Output = Self::ReadInner<'_>> + Send;
 
-        /// Reads one cell's visible committed bytes, advancing the
-        /// invocation's state (the reader pins its source here).
-        fn read_point(
-            session: &S,
-            inner: &mut Self::ReadInner<'_>,
-            state_type: StateType,
-            name: &StateName,
-            cell: &CellKey,
-        ) -> impl Future<Output = Result<Option<Bytes>, StateAccessError>> + Send;
-
-        /// Reads one section's `batch` in one lower hop, index-aligned to
-        /// `batch`, advancing the invocation's state exactly as
-        /// [`Self::read_point`] does.
-        fn read_batch(
-            session: &S,
-            inner: &mut Self::ReadInner<'_>,
-            state_type: StateType,
-            name: &StateName,
-            section: Section,
-            batch: &CoordinateBatch,
-        ) -> impl Future<Output = Result<CellBuffer<Option<Bytes>>, StateAccessError>> + Send;
-
-        /// Reads presence for one aligned batch.
-        ///
-        /// This method matches [`Self::read_batch`] for admission, state
-        /// advancement, source selection, and error order. It returns only
-        /// the `is_some` projection of each visible cell.
-        fn read_presence_batch(
-            session: &S,
-            inner: &mut Self::ReadInner<'_>,
-            state_type: StateType,
-            name: &StateName,
-            section: Section,
-            batch: &CoordinateBatch,
-        ) -> impl Future<Output = Result<PresenceBatch, StateAccessError>> + Send;
-
         /// Freezes this invocation's state into the plan a managed stream
         /// driver runs on. Total: there is no unplannable invocation, so no
         /// driver carries an unreachable arm.
@@ -210,26 +174,6 @@ pub(crate) mod sealed {
             plan: &Self::Plan,
         ) -> impl Future<Output = Self::ReadInner<'a>> + Send;
 
-        /// Pages a durable range under a captured plan, gate-free — the range
-        /// driver's only lower hop, and the one command that cannot repair.
-        fn page<'a>(
-            session: &'a S,
-            plan: &'a Self::Plan,
-            state_type: StateType,
-            name: &'a StateName,
-            scan: Scan<'a>,
-        ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a;
-
-        /// Pages visible keys under the same plan and fence contract as
-        /// [`Self::page`]. It returns no value payload.
-        fn page_keys<'a>(
-            session: &'a S,
-            plan: &'a Self::Plan,
-            state_type: StateType,
-            name: &'a StateName,
-            scan: Scan<'a>,
-        ) -> impl Stream<Item = Result<CellKey, StateAccessError>> + Send + 'a;
-
         /// The per-emission fence a managed stream runs after every source
         /// completion, before the item or error escapes. Vacuous on the
         /// published reader, which has no attempt to leak past.
@@ -239,6 +183,38 @@ pub(crate) mod sealed {
         /// [`StateAccessError::Terminated`] once the stream outlived its
         /// dispatch attempt.
         fn fence(session: &S) -> Result<(), StateAccessError>;
+    }
+
+    /// Reads one projection under the engine's admission and plan.
+    pub trait Reads<S: ?Sized, P: Projection>: ReadEngine<S> {
+        /// Reads one projected cell and updates the invocation state.
+        fn read_point(
+            session: &S,
+            inner: &mut Self::ReadInner<'_>,
+            state_type: StateType,
+            name: &StateName,
+            cell: &CellKey,
+        ) -> impl Future<Output = Result<Option<P::Payload>, StateAccessError>> + Send;
+
+        /// Reads an aligned batch and updates the invocation state.
+        fn read_batch(
+            session: &S,
+            inner: &mut Self::ReadInner<'_>,
+            state_type: StateType,
+            name: &StateName,
+            section: Section,
+            batch: &CoordinateBatch,
+        ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, StateAccessError>> + Send;
+
+        /// Pages a durable range under a captured plan, gate-free — the range
+        /// driver's only lower hop, and the one command that cannot repair.
+        fn page<'a>(
+            session: &'a S,
+            plan: &'a Self::Plan,
+            state_type: StateType,
+            name: &'a StateName,
+            scan: Scan<'a>,
+        ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a;
     }
 
     /// The write half of one engine: admission, the final fence, journal

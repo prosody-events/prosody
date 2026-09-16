@@ -44,12 +44,15 @@ use crate::state::descriptor_identity::DurableDescriptorIdentity;
 use crate::state::identity::StateKey;
 use crate::state::order_codec::I64KeyCodec;
 use crate::state::tests::collection_suite::{DequeOp, KEY_POOL, MapOp, Trace};
+use crate::state::tests::support::reader_residue;
+use crate::state_reader::backend::ReaderBackend as CoreReaderBackend;
 use crate::state_reader::{PartitionCount, StateReader};
 use crate::subsystem::SubsystemName;
 use color_eyre::eyre::{Result, eyre};
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
+use std::num::NonZeroUsize;
 
 /// The fixed routing coordinates one trace runs under. The owner writes
 /// through them and the reader independently recomputes them. Bundled so a
@@ -75,16 +78,27 @@ pub(crate) struct ReaderCase<'a> {
 pub(crate) enum ValueOp {
     /// Overwrite the committed value with `Value::from(b)`.
     Set(u8),
+    /// Raw residue with a generated value, verdict, clear, and evidence
+    /// location.
+    Residue(u8, u8),
 }
 
 impl Arbitrary for ValueOp {
     fn arbitrary(g: &mut Gen) -> Self {
-        Self::Set(u8::arbitrary(g))
+        if bool::arbitrary(g) {
+            Self::Set(u8::arbitrary(g))
+        } else {
+            Self::Residue(u8::arbitrary(g), u8::arbitrary(g) % 8)
+        }
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        let Self::Set(b) = *self;
-        Box::new(b.shrink().map(Self::Set))
+        match *self {
+            Self::Set(b) => Box::new(b.shrink().map(Self::Set)),
+            Self::Residue(b, mode) => {
+                Box::new((b, mode).shrink().map(|(b, mode)| Self::Residue(b, mode)))
+            }
+        }
     }
 }
 
@@ -136,18 +150,36 @@ pub(super) async fn run_reader_value_trace<B: ReaderBackend>(
             descriptor,
             index as u128,
             move |handle| async move {
-                for ValueOp::Set(b) in for_handle {
-                    handle
-                        .set(Value::from(b))
-                        .await
-                        .map_err(|e| eyre!("set: {e}"))?;
+                for op in for_handle {
+                    if let ValueOp::Set(b) = op {
+                        handle
+                            .set(Value::from(b))
+                            .await
+                            .map_err(|e| eyre!("set: {e}"))?;
+                    }
                 }
                 Ok(())
             },
         )
         .await?;
-        for ValueOp::Set(b) in staged {
-            model = Some(Value::from(b));
+        for (op_index, op) in staged.into_iter().enumerate() {
+            match op {
+                ValueOp::Set(b) => model = Some(Value::from(b)),
+                ValueOp::Residue(value, mode) => {
+                    if !reader_residue(
+                        backend.owner_cell(),
+                        backend.deps().backend().cells(),
+                        &state_key,
+                        (index * 1000 + op_index) as u128,
+                        value,
+                        mode,
+                    )
+                    .await?
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
         }
 
         let deps = backend.deps();
@@ -247,7 +279,36 @@ async fn assert_map<B: ReaderBackend>(
     .await?;
     let mut expect_backward = expect_forward;
     expect_backward.reverse();
-    Ok(backward == expect_backward)
+    if backward != expect_backward {
+        return Ok(false);
+    }
+    for (dir, expected) in [
+        (Direction::Forward, forward),
+        (Direction::Backward, backward),
+    ] {
+        let limit = NonZeroUsize::new(expected.len() / 2 + 1).unwrap_or(NonZeroUsize::MIN);
+        let entries = Box::pin(collect_stream(
+            reader
+                .query(case.key.clone(), dir)
+                .limit(limit)
+                .entries()
+                .await?,
+        ))
+        .await?;
+        let keys = Box::pin(collect_stream(
+            reader
+                .query(case.key.clone(), dir)
+                .limit(limit)
+                .keys()
+                .await?,
+        ))
+        .await?;
+        let expected: Vec<_> = expected.into_iter().take(limit.get()).collect();
+        if entries != expected || keys != expected.iter().map(|(key, _)| *key).collect::<Vec<_>>() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Drives a Map trace: commit each event's `Set`/`Remove`/`Clear`, mirror into
