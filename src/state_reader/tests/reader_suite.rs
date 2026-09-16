@@ -52,6 +52,7 @@ use color_eyre::eyre::{Result, eyre};
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
+use std::num::NonZeroUsize;
 
 /// The fixed routing coordinates one trace runs under. The owner writes
 /// through them and the reader independently recomputes them. Bundled so a
@@ -278,7 +279,36 @@ async fn assert_map<B: ReaderBackend>(
     .await?;
     let mut expect_backward = expect_forward;
     expect_backward.reverse();
-    Ok(backward == expect_backward)
+    if backward != expect_backward {
+        return Ok(false);
+    }
+    for (dir, expected) in [
+        (Direction::Forward, forward),
+        (Direction::Backward, backward),
+    ] {
+        let limit = NonZeroUsize::new(expected.len() / 2 + 1).unwrap_or(NonZeroUsize::MIN);
+        let entries = Box::pin(collect_stream(
+            reader
+                .query(case.key.clone(), dir)
+                .limit(limit)
+                .entries()
+                .await?,
+        ))
+        .await?;
+        let keys = Box::pin(collect_stream(
+            reader
+                .query(case.key.clone(), dir)
+                .limit(limit)
+                .keys()
+                .await?,
+        ))
+        .await?;
+        let expected: Vec<_> = expected.into_iter().take(limit.get()).collect();
+        if entries != expected || keys != expected.iter().map(|(key, _)| *key).collect::<Vec<_>>() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Drives a Map trace: commit each event's `Set`/`Remove`/`Clear`, mirror into

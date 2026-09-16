@@ -131,10 +131,9 @@ fn assembly(fx: &Fixture) -> Result<Bottom> {
     ))
 }
 
-/// Unified view soundness over `Overlay<Cached<CassandraStore>>`: point `get`s,
-/// range `scan`s (bounds, direction, limit, early-stop), dirty buffering, and
-/// committed writes intermixed in one trace, all vs the sorted-map oracle
-/// (unified-view soundness and oracle-correctness properties).
+/// Checks `Overlay<Cached<CassandraStore>>` against the sorted-map oracle.
+/// The trace mixes point reads, range scans, dirty writes, and committed
+/// writes. Scans vary bounds, direction, and early stops.
 #[test]
 fn prop_cassandra_overlay_view() {
     async fn run(trace: OverlayTrace) -> Result<bool> {

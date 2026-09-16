@@ -69,12 +69,18 @@
 //! newest entry. A non-TTL'd map writes the keyset only on a content change;
 //! nothing expires, so the invariant holds vacuously.
 
+mod query;
+
+pub use query::MapQuery;
+pub(crate) use query::Query;
+
 use super::{
     CellCodecError, CellStateError, CellType, CollectionSpec, ContextOf, Descriptor, FromSession,
     Keyed, ResolvedOf, WriteOf,
 };
 use crate::codec::{Codec, JsonCodec};
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::cell::Presence;
 #[cfg(test)]
 use crate::state::cell_key::CellKey;
 use crate::state::cell_key::{Coordinate, Direction};
@@ -85,15 +91,15 @@ use crate::state::collection::{
 };
 use crate::state::order_codec::{I64KeyCodec, KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::{CollectionKindId, StateAccessError, StoreOutcome};
-use async_stream::try_stream;
 use bytes::{Bytes, BytesMut};
 use educe::Educe;
 use futures::stream::{Stream, StreamExt};
 use std::error::Error;
 use std::fmt::Display;
+use std::num::NonZeroUsize;
 use std::slice::from_ref;
 use thiserror::Error;
-use tracing::{Instrument, info_span, instrument, warn};
+use tracing::{instrument, warn};
 
 collection_layout! {
     /// The Map collection kind: one keyset cell plus one cell per key. The key
@@ -258,10 +264,9 @@ impl Codec for MapKeysetKey {
 ///
 /// # Invariant: `KeysetPresence`
 ///
-/// A **live entry cell implies a present keyset cell** — equivalently, an
-/// absent keyset implies no live entries, so `stream` may return empty with
-/// zero entry reads (an empty [`Points`](Plan::Points) plan — zero
-/// coordinates, so no point gets and no scan). Three rules hold it:
+/// A **live entry cell implies a present keyset cell**. An absent keyset
+/// implies no live entries, so `stream` returns an empty coordinate plan.
+/// That plan performs no entry reads or scans. Three rules hold it:
 ///
 /// * every `set` leaves a keyset cell present. It writes one whenever the
 ///   pre-write read is `Absent` or `Malformed`, or whenever the frame must
@@ -619,7 +624,7 @@ where
     ///
     /// An **absent** keyset means no live entries
     /// ([`KeysetPresence`](Keyset)). The stream then takes an empty
-    /// [`Points`](Plan::Points) plan: zero coordinates, so zero point gets and
+    /// coordinate plan: zero coordinates, so zero point gets and
     /// no scan.
     ///
     /// A `Tracked` keyset becomes the chunked point-get arm, with the keys in
@@ -640,14 +645,12 @@ where
             // Absent ⇒ no live entries: an empty tracked plan — zero
             // coordinates, so zero point gets and no scan.
             PriorKeyset::Absent => {
-                return Ok(Plan::Points(
-                    op.coordinates(MapKind::<KC, V>::ENTRIES, Vec::new()),
-                ));
+                return Ok(op.coordinates(MapKind::<KC, V>::ENTRIES, Vec::new()));
             }
             // Overflowed falls to the scan with no warning; Malformed already
             // warned in `read_keyset_state`.
             PriorKeyset::Malformed | PriorKeyset::Decoded(Keyset::Overflowed) => {
-                return Ok(Plan::Scan(op.range(MapKind::<KC, V>::ENTRIES, dir)));
+                return Ok(op.range(MapKind::<KC, V>::ENTRIES, dir));
             }
             PriorKeyset::Decoded(Keyset::Tracked(coordinates)) => coordinates,
         };
@@ -657,7 +660,7 @@ where
                 "map keyset frame is oversized for the registered limit; degrading to the \
                  full-section scan until the next set heals it"
             );
-            return Ok(Plan::Scan(op.range(MapKind::<KC, V>::ENTRIES, dir)));
+            return Ok(op.range(MapKind::<KC, V>::ENTRIES, dir));
         }
         let Some(mut keys) = decoded_key_list::<KC>(&coordinates) else {
             warn!(
@@ -665,16 +668,14 @@ where
                 "map keyset holds a coordinate that is not canonical for its key codec; degrading \
                  to the full-section scan until the next set heals it"
             );
-            return Ok(Plan::Scan(op.range(MapKind::<KC, V>::ENTRIES, dir)));
+            return Ok(op.range(MapKind::<KC, V>::ENTRIES, dir));
         };
         // Coordinates are stored strictly ascending, so forward is key order
         // and backward is its reverse — no read-time sort.
         if dir == Direction::Backward {
             keys.reverse();
         }
-        Ok(Plan::Points(
-            op.coordinates(MapKind::<KC, V>::ENTRIES, keys),
-        ))
+        Ok(op.coordinates(MapKind::<KC, V>::ENTRIES, keys))
     }
 
     /// Streams the live entries in key order — ascending for
@@ -684,13 +685,14 @@ where
     /// # Per-arm consistency (a paged read, not a snapshot)
     ///
     /// A `Tracked` keyset within its bound is the fast arm: **key membership is
-    /// snapshotted at init** (the one keyset read), then the listed keys are
-    /// point-got in chunks of `CELL_BATCH`. Keys added after init are not
-    /// yielded; **values are read live, chunk by chunk** — a key
-    /// removed/cleared/expired after init reads absent (skipped, the
-    /// current-membership skip) and an overwritten key yields the newer value
-    /// when its chunk is fetched. So a warm small map streams entirely from
-    /// cache with zero durable scans.
+    /// snapshotted at init** (the one keyset read). The listed keys are
+    /// point-got in chunks. A query limit sizes the first chunk; later chunks
+    /// double up to `CELL_BATCH`. A whole chunk projects before it emits, so a
+    /// limit also moves the first error boundary. Keys added after init are not
+    /// yielded. **Values are read live, chunk by chunk**. Removed, cleared, or
+    /// expired keys read as absent and are skipped. Overwritten keys yield the
+    /// newer value when their chunk is fetched. A warm small map streams
+    /// entirely from cache with zero durable scans.
     ///
     /// An `Overflowed`, malformed, oversized, or otherwise undecodable keyset
     /// degrades to a **full-section** (`Unbounded`-edged) scan. That scan pages
@@ -705,39 +707,17 @@ where
     /// scan.
     ///
     /// Session admission is taken at init for the keyset read. The tracked
-    /// (point) arm then takes it once per chunk, at most `CELL_BATCH` point
-    /// reads each: a chunk's admission covers its batch fetch, and is released
-    /// before the chunk is decoded and resolved. The degraded scan arm takes no
-    /// admission after init and pages gate-free. Neither arm holds admission
-    /// across a yield, for items and errors alike, so a handler may mutate this
-    /// map between stream items without deadlock (`StreamYieldFree`, over the
-    /// per-event session operation gate). Errors are chunk-atomic: a failing
-    /// chunk yields none of its items (all its live entries, or only its
-    /// error).
+    /// (point) arm then takes it once per chunk. Admission covers the batch
+    /// fetch and is released before the chunk is decoded and resolved. The
+    /// degraded scan arm takes no admission after init and pages gate-free.
+    /// Neither arm holds admission across an item or error yield.
+    /// A handler may mutate this map between items without deadlock under
+    /// `StreamYieldFree`. A chunk emits all its live entries or only its error.
     pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapStreamItem<KC, V>> + '_
     where
         for<'s> ContextOf<'s, V>: FromSession<'s, S>,
     {
-        // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
-        // so each inner await is instrumented with a clone instead; the
-        // span's recorded time is the stream's own work. Unlike the sibling
-        // ops' `err`, failures are yielded per item rather than recorded on
-        // the span — a failing chunk ends with an OK-status span, and the
-        // yielded `Err` surfaces to the caller inside this span's scope.
-        let span = info_span!(
-            "map.stream",
-            collection = self.cells.name().as_str(),
-            direction = ?dir,
-        );
-        try_stream! {
-            // Init: `stream_plan` reads the keyset under an admission it drops
-            // as it returns, before this `?` observes the result.
-            let inner = self.stream_plan(dir).instrument(span.clone()).await?.entries();
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().instrument(span.clone()).await {
-                yield item?;
-            }
-        }
+        self.query(dir).entries()
     }
 
     /// Streams the live entries' **keys** in key order (ascending for
@@ -755,18 +735,12 @@ where
     /// [`stream`](Self::stream)'s (same keyset-plan decision); only the value
     /// work is dropped.
     pub fn keys(&self, dir: Direction) -> impl Stream<Item = MapKeyItem<KC, V>> + '_ {
-        let span = info_span!(
-            "map.keys",
-            collection = self.cells.name().as_str(),
-            direction = ?dir,
-        );
-        try_stream! {
-            let inner = self.stream_plan(dir).instrument(span.clone()).await?.keys();
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().instrument(span.clone()).await {
-                yield item?;
-            }
-        }
+        self.query(dir).keys()
+    }
+
+    /// Builds a directional stream query.
+    pub fn query(&self, dir: Direction) -> MapQuery<'_, S, KC, V> {
+        MapQuery::new(self, Query { dir, limit: None })
     }
 
     /// Reports whether the map holds no live entries.
@@ -782,9 +756,12 @@ where
     pub async fn is_empty(&self) -> Result<bool, MapStateError<CellCodecError<V>>> {
         let plan = self
             .cells
-            .read(async |op| op.range(MapKind::<KC, V>::ENTRIES, Direction::Forward))
+            .read(async |op| {
+                op.range(MapKind::<KC, V>::ENTRIES, Direction::Forward)
+                    .with_limit(Some(NonZeroUsize::MIN))
+            })
             .await;
-        let keys = plan.keys();
+        let keys = plan.projected::<Presence>();
         futures::pin_mut!(keys);
         Ok(keys.next().await.transpose()?.is_none())
     }

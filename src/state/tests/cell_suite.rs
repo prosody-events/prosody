@@ -36,6 +36,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::future::{Future, ready};
 use std::iter;
+use std::num::NonZeroUsize;
 use std::slice;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -1039,18 +1040,13 @@ impl CellModel {
     }
 }
 
-/// Drives random ops over an [`Overlay`] of a multi-cell collection — dirty
-/// buffering, section clears, committed writes, and range scans
-/// **intermixed** — asserting both the range leg (each `Scan` op vs the
-/// sorted-map oracle, incl. early-stop) and the point leg (`get` per cell of
-/// every sampled section vs the dirty-over-committed oracle, after **every**
-/// op). This is the unified view property: point reads, range reads, and
-/// writes interleave so their interaction is exercised, not just each in
-/// isolation (dirty-wins, clear-hides, the dirty clear marker hiding the
-/// lower leg **of exactly its section** — the [`SECTIONS`] sampling makes a
-/// marker consulted at the wrong section visible to both legs — bounds,
-/// direction, limit; unified-view soundness and oracle-correctness
-/// properties).
+/// Checks interleaved operations on a multi-cell [`Overlay`] against a
+/// sorted-map oracle. The trace mixes dirty writes, section clears,
+/// committed writes, and scans with varied bounds, direction, and fetch hints.
+/// Each scan checks the visible range, including early stops.
+/// After every operation, point reads check every cell in each sampled section.
+/// Dirty writes win, and clears hide only their own section's lower cells.
+/// [`SECTIONS`] sampling detects a marker read from the wrong section.
 pub(crate) async fn run_overlay_trace<S>(lower: S, trace: OverlayTrace) -> Result<bool>
 where
     S: CellStore,
@@ -1349,7 +1345,7 @@ impl Arbitrary for EdgeKind {
 }
 
 /// A scan request over one sampled section with random anchor, direction, per-
-/// edge kind ([`EdgeKind`]), optional end and limit, and an optional early-stop
+/// edge kind ([`EdgeKind`]), optional end, and an optional early-stop
 /// prefix length.
 #[derive(Clone, Copy, Debug)]
 struct ScanReq {
@@ -1359,7 +1355,7 @@ struct ScanReq {
     start_kind: EdgeKind,
     end_kind: EdgeKind,
     end: u8,
-    limit: Option<u8>,
+    fetch_hint: Option<u8>,
     partial: Option<u8>,
 }
 
@@ -1374,8 +1370,7 @@ impl Arbitrary for ScanReq {
             start_kind: EdgeKind::arbitrary(g),
             end_kind: EdgeKind::arbitrary(g),
             end: u8::arbitrary(g) % (CELLS + 1),
-            // Includes 0 and values > the cell count.
-            limit: bool::arbitrary(g).then(|| u8::arbitrary(g) % (CELLS + 4)),
+            fetch_hint: Option::<u8>::arbitrary(g),
             partial: bool::arbitrary(g).then(|| u8::arbitrary(g) % (CELLS + 1)),
         }
     }
@@ -1400,8 +1395,7 @@ impl Arbitrary for ScanTrace {
 }
 
 /// The oracle scan result: `model`'s visible cells of the request's section
-/// filtered to its range, ordered in the scan direction, truncated to the
-/// limit.
+/// filtered to its range and ordered in the scan direction.
 fn scan_oracle(model: &CellModel, req: ScanReq) -> Vec<(u8, Bytes)> {
     let mut cells: Vec<(u8, Bytes)> = model
         .visible_ordered(req.sect)
@@ -1410,9 +1404,6 @@ fn scan_oracle(model: &CellModel, req: ScanReq) -> Vec<(u8, Bytes)> {
         .collect();
     if !req.forward {
         cells.reverse();
-    }
-    if let Some(limit) = req.limit {
-        cells.truncate(limit as usize);
     }
     cells
 }
@@ -1460,7 +1451,9 @@ fn scan_of<'a>(req: ScanReq, start: &'a Coordinate, end: &'a Coordinate) -> Scan
             Direction::Backward
         },
         end,
-        limit: req.limit.map(usize::from),
+        fetch_hint: req
+            .fetch_hint
+            .and_then(|n| NonZeroUsize::new(usize::from(n))),
     }
 }
 
@@ -1512,7 +1505,7 @@ where
 
 /// Compares both scan projections with a committed model after interleaved
 /// writes and section clears. The trace covers both directions, all edge kinds,
-/// and scan limits.
+/// and fetch hints.
 pub(crate) async fn run_bottom_scan_trace<S, P>(
     store: S,
     trace: ScanTrace,
@@ -2199,7 +2192,7 @@ pub(crate) struct BatchReadTrace {
 impl Arbitrary for BatchReadTrace {
     fn arbitrary(g: &mut Gen) -> Self {
         // Read lists up to ~3× CELL_BATCH so multi-chunk fan-out is exercised.
-        let reads: Vec<u8> = capped_vec::<u8>(g, CELL_BATCH * 3)
+        let reads: Vec<u8> = capped_vec::<u8>(g, CELL_BATCH.get() * 3)
             .into_iter()
             .map(|b| b % CELLS)
             .collect();
@@ -2461,7 +2454,7 @@ pub(crate) struct RawBatchTrace {
 
 impl Arbitrary for RawBatchTrace {
     fn arbitrary(g: &mut Gen) -> Self {
-        let reads: Vec<u8> = capped_vec::<u8>(g, CELL_BATCH)
+        let reads: Vec<u8> = capped_vec::<u8>(g, CELL_BATCH.get())
             .into_iter()
             .map(|b| b % CELLS)
             .collect();

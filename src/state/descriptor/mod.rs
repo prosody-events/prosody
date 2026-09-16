@@ -94,7 +94,7 @@ pub mod map;
 mod value;
 
 pub use deque::{DequeDescriptor, DequeHandle, DequeStateError, deque_state};
-pub use map::{MapDescriptor, MapHandle, MapStateError, map_state};
+pub use map::{MapDescriptor, MapHandle, MapQuery, MapStateError, map_state};
 pub use value::{ValueDescriptor, ValueHandle, ValueKind, value_state};
 
 /// A resolver: how a decoded cell (`Stored`) maps to and from the value a

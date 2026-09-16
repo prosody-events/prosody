@@ -237,7 +237,7 @@ where
         start: ScanEdge::Included(&start_c),
         dir: Direction::Forward,
         end: end_c.as_ref(),
-        limit: None,
+        fetch_hint: None,
     };
     let stream = CellRead::<Values>::scan(store, id, scan);
     futures::pin_mut!(stream);

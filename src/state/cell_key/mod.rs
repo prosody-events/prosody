@@ -18,6 +18,7 @@
 //! [`order_codec`]: crate::state::order_codec
 
 use bytes::Bytes;
+use std::num::NonZeroUsize;
 use std::ops::Bound;
 
 /// Disjoint, orderable sub-grouping of one collection's cells.
@@ -241,8 +242,9 @@ pub struct Scan<'a> {
     /// The edge the scan stops at (high side forward, low side backward).
     pub end: ScanEdge<&'a Coordinate>,
 
-    /// The optional maximum number of cells to yield.
-    pub limit: Option<usize>,
+    /// The preferred size of the first fetch. A backend sizes its first page or
+    /// batch from it and grows later fetches. It never limits results.
+    pub fetch_hint: Option<NonZeroUsize>,
 }
 
 impl Scan<'_> {

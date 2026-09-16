@@ -22,11 +22,11 @@ use self::cell_suite::{
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
-    DequeCapacityShape, DequeHoles, DequeInterleave, DequeTrace, MapGetManyInput, MapInterleave,
-    MapKeyHoles, MapTrace, finalize_and_promote, run_deque_capacity_convergence, run_deque_holes,
-    run_deque_stream_interleave, run_deque_trace, run_map_get_many_parity_trace,
-    run_map_key_scan_holes, run_map_keyset_exact_trace, run_map_stream_interleave, run_map_trace,
-    run_map_ttl_keyset_refresh_trace,
+    DequeCapacityShape, DequeHoles, DequeInterleave, DequeTrace, KEY_POOL, MapGetManyInput,
+    MapInterleave, MapKeyHoles, MapTrace, finalize_and_promote, run_deque_capacity_convergence,
+    run_deque_holes, run_deque_stream_interleave, run_deque_trace, run_map_get_many_parity_trace,
+    run_map_key_scan_holes, run_map_keyset_exact_trace, run_map_prefix_trace,
+    run_map_stream_interleave, run_map_trace, run_map_ttl_keyset_refresh_trace,
 };
 use self::publication_suite::{PublicationTrace, run_publication_trace};
 use self::support::{CountingCellStore, CountingResolver, ResolveCounter, fresh_collection};
@@ -148,12 +148,9 @@ fn prop_memory_cell_implicit_overwrite() {
     QuickCheck::new().quickcheck(property as fn(OverwriteTrace) -> Result<bool>);
 }
 
-/// Unified view soundness over `Overlay<MemoryCellStore>`: point `get`s, range
-/// `scan`s (bounded, bidirectional, limited, early-stopped), dirty buffering,
-/// and committed writes **intermixed** in one trace all match the
-/// dirty-over-committed oracle — dirty-wins, clear-hides, the dirty leg bounded
-/// to the scan range, the limit applied to the merge (unified-view soundness
-/// with point-range interleaving and oracle-correctness properties).
+/// Point reads and range scans match the dirty-over-committed oracle.
+/// The trace mixes bounded scans, both directions, early stops, dirty writes,
+/// and committed writes. Dirty values win, and dirty clears hide cells.
 #[test]
 fn prop_memory_overlay_view() {
     fn property(trace: OverlayTrace) -> Result<bool> {
@@ -189,7 +186,7 @@ fn prop_chunk_reassembly() {
         let batches: Vec<CoordinateBatch> = CoordinateBatch::chunks(input.clone()).collect();
         let mut flat: Vec<Coordinate> = Vec::new();
         for batch in &batches {
-            if batch.len() == 0 || batch.len() > CELL_BATCH {
+            if batch.len() == 0 || batch.len() > CELL_BATCH.get() {
                 return false;
             }
             flat.extend(batch.as_slice().iter().cloned());
@@ -197,7 +194,7 @@ fn prop_chunk_reassembly() {
         // All but the last batch are exactly CELL_BATCH.
         let full_prefix = batches
             .split_last()
-            .is_none_or(|(_, rest)| rest.iter().all(|b| b.len() == CELL_BATCH));
+            .is_none_or(|(_, rest)| rest.iter().all(|b| b.len() == CELL_BATCH.get()));
         flat == input && full_prefix && (input.is_empty() == batches.is_empty())
     }
     QuickCheck::new().quickcheck(property as fn(Vec<u8>) -> bool);
@@ -210,8 +207,8 @@ fn cell_buffers_spill_before_full_batch() {
     let small: CellBuffer<usize> = (0..CELLS_INLINE).collect();
     assert!(!small.spilled(), "the common small case stays inline");
 
-    let full: CellBuffer<usize> = (0..CELL_BATCH).collect();
-    assert_eq!(full.len(), CELL_BATCH);
+    let full: CellBuffer<usize> = (0..CELL_BATCH.get()).collect();
+    assert_eq!(full.len(), CELL_BATCH.get());
     assert!(
         full.spilled(),
         "a full batch must not remain inline in an async state machine"
@@ -451,7 +448,7 @@ fn memory_overlay_precedence_set_beats_section_clear() -> Result<()> {
 /// exactly ONE lower batch read for its entries — a full-width scan chunk is
 /// one [`CoordinateBatch`], one lower `get_many`; only the keyset meta cell
 /// stays a point read.
-/// Falsification: Replace `CoordinatePlan` batch reads with per-key `get`
+/// Falsification: Replace coordinate batch reads with per-key `get`
 /// calls. Then `batch_reads` becomes zero and both read-count asserts fail.
 #[test]
 fn map_cold_chunk_is_one_batch_read() -> Result<()> {
@@ -490,7 +487,7 @@ fn map_cold_chunk_is_one_batch_read() -> Result<()> {
             ResolveCounter::default(),
         );
         let seed = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
-        for i in 0..CELL_BATCH as i64 {
+        for i in 0..CELL_BATCH.get() as i64 {
             seed.set(i, Value::from(i))
                 .await
                 .map_err(|e| eyre!("{e}"))?;
@@ -520,7 +517,7 @@ fn map_cold_chunk_is_one_batch_read() -> Result<()> {
             }
             out
         };
-        assert_eq!(drained.len(), CELL_BATCH, "all entries drained");
+        assert_eq!(drained.len(), CELL_BATCH.get(), "all entries drained");
         assert_eq!(
             counting.batch_reads(),
             1,
@@ -890,6 +887,17 @@ fn prop_map_collection_lifecycle_read_uncommitted() {
         TEST_RUNTIME.block_on(run_map_trace(trace, CommitMode::ReadUncommitted))
     }
     QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
+}
+
+/// Both limited outputs equal the model prefix in either direction and plan.
+#[test]
+fn prop_map_query_limit_is_present_prefix() {
+    fn property(trace: MapTrace, limit: u8) -> Result<bool> {
+        let limit =
+            NonZeroUsize::new(usize::from(limit) % KEY_POOL.len()).unwrap_or(NonZeroUsize::MIN);
+        TEST_RUNTIME.block_on(run_map_prefix_trace(trace, limit))
+    }
+    QuickCheck::new().quickcheck(property as fn(MapTrace, u8) -> Result<bool>);
 }
 
 /// Keyset exactness: over an arbitrary committed trace on a non-overflowing
@@ -1484,7 +1492,7 @@ fn resolve_session(
 /// fetches and the counting resolver bounds the resolutions. Both counters sit
 /// at the lowest layer, so nothing masks a materialization.
 ///
-/// Falsification: Make `CoordinatePlan::entry_source` consume all tracked keys.
+/// Falsification: Make the coordinate source consume all tracked keys.
 /// Then the read and resolver counts exceed their bounds, and both asserts
 /// fail. A larger `CELL_BATCH` cannot falsify: the bound moves with it.
 async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
@@ -1560,7 +1568,7 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
         "take(k) yields exactly k.min(n) entries"
     );
     assert!(
-        counting.batch_reads() <= k.div_ceil(CELL_BATCH) + 1,
+        counting.batch_reads() <= k.div_ceil(CELL_BATCH.get()) + 1,
         "a lazy map take(k) issues at most one batch read beyond k (batches={}, k={k}, n={n})",
         counting.batch_reads()
     );
@@ -1572,7 +1580,7 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
         counting.lower_reads()
     );
     assert!(
-        resolves.resolves() <= k + CELL_BATCH,
+        resolves.resolves() <= k + CELL_BATCH.get(),
         "a lazy map take(k) resolves at most k + one chunk (resolves={}, k={k}, n={n})",
         resolves.resolves()
     );
@@ -1585,7 +1593,7 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
 /// batch verb; only the bounds meta cell is a point read) and at most
 /// `k + CELL_BATCH` resolved.
 ///
-/// Falsification: Make `CoordinatePlan::entry_source` consume all tracked keys.
+/// Falsification: Make the coordinate source consume all tracked keys.
 /// Then the read and resolver counts exceed their bounds, and both asserts
 /// fail. A larger `CELL_BATCH` cannot falsify: the bound moves with it.
 async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
@@ -1653,7 +1661,7 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
         "take(k) yields exactly k.min(n) elements"
     );
     assert!(
-        counting.batch_reads() <= k.div_ceil(CELL_BATCH) + 1,
+        counting.batch_reads() <= k.div_ceil(CELL_BATCH.get()) + 1,
         "a lazy deque take(k) issues at most one batch read beyond k (batches={}, k={k}, n={n})",
         counting.batch_reads()
     );
@@ -1665,7 +1673,7 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
         counting.lower_reads()
     );
     assert!(
-        resolves.resolves() <= k + CELL_BATCH,
+        resolves.resolves() <= k + CELL_BATCH.get(),
         "a lazy deque take(k) resolves at most k + one chunk (resolves={}, k={k}, n={n})",
         resolves.resolves()
     );
@@ -1951,7 +1959,7 @@ async fn check_memory_read_parity(
             start: ScanEdge::Unbounded,
             end: ScanEdge::Unbounded,
             dir,
-            limit: None,
+            fetch_hint: None,
         };
         let rows: Vec<_> = CellRead::<Values>::scan(store, id, scan)
             .try_collect()

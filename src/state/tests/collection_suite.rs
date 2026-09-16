@@ -680,17 +680,36 @@ pub(crate) async fn run_deque_trace(
 /// `contains_key` agrees with it, and that `KeysetPresence` holds (any live
 /// entry implies a present keyset cell).
 pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> Result<bool> {
+    run_map_trace_inner(trace, commit_mode, 3, None).await
+}
+
+/// Checks both query outputs on a range-only plan and on a plan that crosses
+/// from tracked to overflowed.
+pub(crate) async fn run_map_prefix_trace(trace: MapTrace, limit: NonZeroUsize) -> Result<bool> {
+    for mode in [CommitMode::ReadCommitted, CommitMode::ReadUncommitted] {
+        for keyset_limit in [0, 3] {
+            if !run_map_trace_inner(trace.clone(), mode, keyset_limit, Some(limit)).await? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+async fn run_map_trace_inner(
+    trace: MapTrace,
+    commit_mode: CommitMode,
+    keyset_limit: usize,
+    prefix: Option<NonZeroUsize>,
+) -> Result<bool> {
     run_collection_trace(
         trace,
         map_state::<I64KeyCodec, JsonCodec>("mp"),
         "mp",
-        // A small keyset limit under the 5-key pool, so generated traces cross
-        // Tracked → Overflowed, hit the already-tracked fast path, and
-        // interleave removes/clears — while the BTreeMap model stays oblivious
-        // to the keyset's existence (the property proves it cannot tell).
+        // The keyset limit selects one source or permits a transition between sources.
         CollectionDef {
             commit_mode,
-            keyset_limit: 3,
+            keyset_limit,
             ..CollectionDef::new(None)
         },
         async |handle, op, scratch: &mut BTreeMap<i64, Value>| match op {
@@ -726,7 +745,7 @@ pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> R
             }
         },
         async |handle, model, backing: &Backing<'_>| {
-            Ok(assert_map(handle, model).await?
+            Ok(assert_map(handle, model, prefix).await?
                 && assert_keyset_present(backing.cells, backing.state_key, model)?)
         },
     )
@@ -892,7 +911,7 @@ const GET_MANY_QUERY_HI: i64 = 24;
 /// Max query-list length. Derived from [`CELL_BATCH`] rather than hand-numbered
 /// so the "spans more than one sub-batch" claim below cannot rot when the store
 /// batch width moves.
-const GET_MANY_MAX_QUERIES: usize = CELL_BATCH + 32;
+const GET_MANY_MAX_QUERIES: usize = CELL_BATCH.get() + 32;
 
 /// A random map population plus a random query list for the `Map::get_many`
 /// parity property. The independent pools guarantee absent keys; a small query
@@ -1347,6 +1366,17 @@ pub(crate) async fn run_map_key_scan_holes(shape: MapKeyHoles) -> Result<bool> {
         if stream_keys != present {
             return Ok(false);
         }
+        for dir in [Direction::Forward, Direction::Backward] {
+            let all = collect_map(&handle, dir).await?;
+            let limit = NonZeroUsize::new(all.len() / 2 + 1).unwrap_or(NonZeroUsize::MIN);
+            let expected: Vec<_> = all.into_iter().take(limit.get()).collect();
+            if drain(handle.query(dir).limit(limit).entries()).await? != expected
+                || drain(handle.query(dir).limit(limit).keys()).await?
+                    != expected.iter().map(|(key, _)| *key).collect::<Vec<_>>()
+            {
+                return Ok(false);
+            }
+        }
         if handle.is_empty().await? != present.is_empty() {
             return Ok(false);
         }
@@ -1456,6 +1486,7 @@ where
 async fn assert_map<S>(
     handle: &MapHandle<S, I64KeyCodec, JsonCodec>,
     model: &BTreeMap<i64, Value>,
+    prefix: Option<NonZeroUsize>,
 ) -> Result<bool>
 where
     S: StateSession,
@@ -1484,10 +1515,24 @@ where
         return Ok(false);
     }
     let descending_keys: Vec<i64> = model.keys().rev().copied().collect();
-    Ok(
-        collect_map_keys(handle, Direction::Backward).await? == descending_keys
-            && handle.is_empty().await? == model.is_empty(),
-    )
+    if collect_map_keys(handle, Direction::Backward).await? != descending_keys {
+        return Ok(false);
+    }
+    if let Some(limit) = prefix {
+        for (dir, expected) in [
+            (Direction::Forward, ascending),
+            (Direction::Backward, descending),
+        ] {
+            let expected: Vec<_> = expected.into_iter().take(limit.get()).collect();
+            if drain(handle.query(dir).limit(limit).entries()).await? != expected
+                || drain(handle.query(dir).limit(limit).keys()).await?
+                    != expected.iter().map(|(key, _)| *key).collect::<Vec<_>>()
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(handle.is_empty().await? == model.is_empty())
 }
 
 /// Collects a map handle's `stream(dir)` into a `(key, value)` vector.
@@ -1585,12 +1630,12 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
     // A valid `I64KeyCodec` coordinate (8 bytes) whose value bytes are not
     // valid JSON — present to a presence read, undecodable to a value read.
     let key = 0_i64;
-    let coordinate = I64KeyCodec::encode(&key);
+    let coordinates = [key, key + 1, key + 2].map(|key| I64KeyCodec::encode(&key));
     let bad_value = Bytes::from(vec![0xFF, 0xFF]);
 
     // Tracked lists the key; Overflowed degrades to the full-section scan. Both
     // reach the same present-but-undecodable cell.
-    let tracked = Bytes::from(tracked_frame(&[key]));
+    let tracked = Bytes::from(tracked_frame(&[key - 1, key, key + 1, key + 2]));
     let overflowed = Bytes::from(OVERFLOWED_FRAME.to_vec());
     for (tracked_route, keyset_frame) in [(true, tracked), (false, overflowed)] {
         let dedup = MemoryDeduplicationStore::default();
@@ -1611,7 +1656,9 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
             &collection_ref,
             &[
                 (keyset_cell(), Some(keyset_frame)),
-                (entry_cell_for(&coordinate), Some(bad_value.clone())),
+                (entry_cell_for(&coordinates[0]), Some(bad_value.clone())),
+                (entry_cell_for(&coordinates[1]), Some(bad_value.clone())),
+                (entry_cell_for(&coordinates[2]), Some(bad_value.clone())),
             ],
             &[],
         ))?;
@@ -1623,22 +1670,11 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
 
         block_on(async {
             assert!(!handle.is_empty().await?);
-            assert_eq!(
-                counting.visible_point_reads(),
-                0,
-                "is_empty reads no values"
-            );
-            assert_eq!(counting.batch_reads(), 0, "is_empty reads no value batch");
-            assert_eq!(
-                counting.presence_reads(),
-                0,
-                "is_empty reads no presence batch"
-            );
-            assert_eq!(
-                counting.presence_scans(),
-                1,
-                "is_empty uses one presence scan"
-            );
+            assert_eq!(counting.scan_hint(), CELL_BATCH.get());
+            assert_eq!(counting.visible_point_reads(), 0);
+            assert_eq!(counting.batch_reads(), 0);
+            assert_eq!(counting.presence_reads(), 0);
+            assert_eq!(counting.presence_scans(), 1);
             counting.reset();
             assert!(
                 handle.contains_key(&key).await.map_err(|e| eyre!("{e}"))?,
@@ -1650,10 +1686,41 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
             counting.reset();
             assert_eq!(
                 collect_map_keys(&handle, Direction::Forward).await?,
-                vec![key],
-                "keys() yields the key of an undecodable-value cell"
+                vec![key, key + 1, key + 2],
+                "keys() yields the keys of undecodable-value cells"
             );
             assert_presence_route_calls(&counting, tracked_route);
+            counting.reset();
+            assert_eq!(
+                drain(
+                    handle
+                        .query(Direction::Forward)
+                        .limit(NonZeroUsize::MIN.saturating_add(1))
+                        .keys()
+                )
+                .await?,
+                vec![key, key + 1]
+            );
+            assert_limited_fetch(&counting, tracked_route, &[4], CELL_BATCH.get());
+            if !tracked_route {
+                assert_eq!(counting.scan_rows(), 2);
+            }
+
+            counting.reset();
+            assert!(
+                drain(
+                    handle
+                        .query(Direction::Forward)
+                        .limit(NonZeroUsize::MIN)
+                        .entries()
+                )
+                .await
+                .is_err()
+            );
+            // Four keys: the second chunk `[key, key + 1]` satisfies the limit while
+            // `key + 2` remains unread, so `[1, 2]` proves the schedule stops at the
+            // limit and not at exhaustion.
+            assert_limited_fetch(&counting, tracked_route, &[1, 2], 1);
 
             // Value reads surface the decode failure as `Permanent`.
             let got = handle.get(&key).await;
@@ -1661,25 +1728,24 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
             if let Err(error) = got {
                 assert_eq!(error.classify_error(), ErrorCategory::Permanent);
             }
-            let stream_ends_in_error = {
-                let stream = handle.stream(Direction::Forward);
-                futures::pin_mut!(stream);
-                let mut errored = false;
-                while let Some(item) = stream.next().await {
-                    if item.is_err() {
-                        errored = true;
-                    }
-                }
-                errored
-            };
-            assert!(
-                stream_ends_in_error,
-                "stream must surface the value decode failure"
-            );
+            assert!(drain(handle.stream(Direction::Forward)).await.is_err());
             Ok::<_, color_eyre::Report>(())
         })?;
     }
     Ok(())
+}
+
+fn assert_limited_fetch(
+    counting: &CountingCellStore<MemoryCellStore>,
+    tracked: bool,
+    widths: &[usize],
+    hint: usize,
+) {
+    if tracked {
+        assert_eq!(counting.batch_widths(), widths);
+    } else {
+        assert_eq!(counting.scan_hint(), hint);
+    }
 }
 
 fn assert_presence_route_calls(counting: &CountingCellStore<MemoryCellStore>, tracked_route: bool) {
@@ -2835,11 +2901,8 @@ fn check_map_yield(
 /// before any mutator runs, so a yielded key must be a seed key and its value
 /// one held there at some point (values are read live, chunk by chunk). Every
 /// op is bounded by [`INTERLEAVE_HANG_GUARD`] — the only deadline, never the
-/// assertion. Falsification: hold the chunk's admission across the yield by
-/// returning it in `CoordinatePlan`'s unfold state (`Some((entries, inner,
-/// keys))`) so it lives into the forwarding loop → the first mutator after an
-/// `Advance` blocks on the gate the suspended generator holds → the hang-guard
-/// elapses → red.
+/// assertion. To falsify this test, hold chunk admission across a yield.
+/// The next mutation then blocks until the test deadline expires.
 pub(crate) async fn run_map_stream_interleave(input: MapInterleave) -> Result<bool> {
     let MapInterleave { steps, backward } = input;
     let dir = if backward {

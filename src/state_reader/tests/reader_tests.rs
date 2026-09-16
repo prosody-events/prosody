@@ -30,7 +30,7 @@ use crate::state::identity::CollectionId;
 use crate::state::order_codec::I64KeyCodec;
 use crate::state::publication::PublicationStore;
 use crate::state::registry::CollectionDef;
-use crate::state::store::CoordinateBatch;
+use crate::state::store::{CELL_BATCH, CoordinateBatch};
 use crate::state::tests::collection_suite::{DequeOp, MapOp, Trace};
 use crate::state::{ReadCachePolicy, StateType};
 use crate::state_reader::CommittedCellSource;
@@ -176,7 +176,7 @@ async fn reader_reads_prev_in_commit_window() -> Result<()> {
         start: ScanEdge::Unbounded,
         dir: Direction::Forward,
         end: ScanEdge::Unbounded,
-        limit: None,
+        fetch_hint: None,
     };
     let values =
         CommittedCellSource::<Values>::scan(&harness.cells, &id, scan).map_ok(|(cell, _)| cell);
@@ -290,6 +290,7 @@ async fn reader_range_probe_pins_second_source() -> Result<()> {
     let session = reader.session(key).await?;
     let handle = env.descriptor.bind(&session)?;
     assert!(!handle.is_empty().await?);
+    assert_eq!(env.cells.scan_hint(), CELL_BATCH.get());
     assert_eq!((env.cells.reads(first), env.cells.reads(second)), (1, 1));
     assert_eq!(handle.get(&1).await?, Some(Value::from(7_i32)));
     assert_eq!((env.cells.reads(first), env.cells.reads(second)), (1, 2));

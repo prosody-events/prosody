@@ -1426,7 +1426,7 @@ fn stage_chunks(
         let section = it.peek()?.0.section;
         let mut records: CellBuffer<(CellKey, Option<Bytes>)> = CellBuffer::new();
         while let Some(record) =
-            it.next_if(|(cell, _)| cell.section == section && records.len() < CELL_BATCH)
+            it.next_if(|(cell, _)| cell.section == section && records.len() < CELL_BATCH.get())
         {
             records.push(record);
         }

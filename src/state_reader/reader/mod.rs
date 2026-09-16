@@ -23,11 +23,15 @@
 
 pub(crate) mod acquisition;
 mod admission;
+mod query;
+
+pub use query::MapReaderQuery;
 
 use crate::Key;
 use crate::codec::Codec;
 use crate::state::StateName;
 use crate::state::cell_key::Direction;
+use crate::state::descriptor::map::Query;
 use crate::state::descriptor::{
     CellType, ContextOf, DequeDescriptor, DequeHandle, FromSession, MapDescriptor, MapHandle,
     ResolvedOf, StateDescriptor, ValueDescriptor,
@@ -168,8 +172,6 @@ fn validate_read_cache(ttl: Option<Duration>) -> Result<(), StateReaderError> {
     Ok(())
 }
 
-// --- Value (and Kafka-message-ref) reads -----------------------------------
-
 impl<T, C, B> StateReader<ValueDescriptor<T>, C, B>
 where
     C: Codec,
@@ -193,8 +195,6 @@ where
         handle.get().await.map_err(|e| StateReaderError::store(&e))
     }
 }
-
-// --- Map reads --------------------------------------------------------------
 
 impl<KC, V, C, B> StateReader<MapDescriptor<KC, V>, C, B>
 where
@@ -319,15 +319,7 @@ where
         V: 'static,
         ResolvedOf<V>: 'static,
     {
-        let session = self.session(key.into()).await?;
-        let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
-        Ok(async_stream::try_stream! {
-            let inner = handle.stream(dir);
-            futures::pin_mut!(inner);
-            while let Some(item) = cooperative(inner.next()).await {
-                yield item.map_err(|e| StateReaderError::store(&e))?;
-            }
-        })
+        self.query(key, dir).entries().await
     }
 
     /// Streams committed live keys without decoding or resolving values.
@@ -345,19 +337,18 @@ where
         V: 'static,
         KC::Key: 'static,
     {
-        let session = self.session(key.into()).await?;
-        let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
-        Ok(async_stream::try_stream! {
-            let inner = handle.keys(dir);
-            futures::pin_mut!(inner);
-            while let Some(item) = cooperative(inner.next()).await {
-                yield item.map_err(|e| StateReaderError::store(&e))?;
-            }
-        })
+        self.query(key, dir).keys().await
+    }
+
+    /// Builds a directional stream query for partition `key`.
+    pub fn query<K: Into<Key>>(&self, key: K, dir: Direction) -> MapReaderQuery<'_, KC, V, C, B> {
+        MapReaderQuery {
+            reader: self,
+            key: key.into(),
+            query: Query { dir, limit: None },
+        }
     }
 }
-
-// --- Deque reads ------------------------------------------------------------
 
 impl<T, C, B> StateReader<DequeDescriptor<T>, C, B>
 where

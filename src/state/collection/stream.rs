@@ -1,5 +1,5 @@
 //! Managed stream plans: the owned state a collection's stream method carries
-//! out of its planning invocation, and the four drivers that run it.
+//! out of its planning invocation, and the two drivers that run it.
 //!
 //! A stream method is not a scoped operation — it outlives one. It runs a short
 //! `#[read(op)]` planning method (a Map reads its keyset, a Deque its bounds),
@@ -11,33 +11,70 @@
 //! A plan carries no admission and no operation. The owner reacquires the gate
 //! per coordinate chunk and pages a range gate-free; the reader carries the
 //! source its planning command selected, so a chunk can never re-probe or
-//! change source mid-stream. A range plan also carries the span that its
-//! planning command chose. That span is the whole section or one bounded
-//! window.
+//! change source mid-stream. A range source carries the whole section
+//! or the bounded window that its planning command chose.
 
 use super::operation::read_keys;
-use super::{StateSession, resolve_batch, resolve_cell, sealed};
+use super::{StateSession, resolve_cell, sealed};
 use crate::state::cell::{Presence, Projection, Values};
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
+use crate::state::cell_key::{Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::descriptor::{
     CellCodecError, CellStateError, CellType, ContextOf, FromSession, KeyOf, ResolvedOf,
 };
 use crate::state::order_codec::OrderedKeyCodec;
-use crate::state::store::{CELL_BATCH, CellBuffer};
-use crate::state::{SHARD_FANOUT_CONCURRENCY, StateAccessError, StateName, StateType};
+use crate::state::store::{CELL_BATCH, CellBuffer, FetchSchedule};
+use crate::state::{RESOLVE_FANOUT, StateName, StateType};
 use async_stream::try_stream;
 use futures::future::Either;
-use futures::stream::{self, Stream, StreamExt};
-use std::marker::PhantomData;
+use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use std::future::{Future, ready};
+use std::num::NonZeroUsize;
 use tokio::task::coop::cooperative;
 
-/// One item a resolving managed stream yields: a decoded key paired with its
-/// resolved value, or the error that ended the stream.
-pub(crate) type ScanItem<T> = Result<(KeyOf<T>, ResolvedOf<T>), CellStateError<CellCodecError<T>>>;
+/// The typed output of a projected collection stream.
+/// Presence does not decode values or require a resolver context.
+pub(crate) trait StreamProjection<S: StateSession, T: CellType>: Projection {
+    type Item: Send;
 
-/// One item a presence-only managed stream yields: a decoded key, or the error
-/// that ended the stream. The value-free twin of [`ScanItem`].
-pub(crate) type KeyItem<T> = Result<KeyOf<T>, CellStateError<CellCodecError<T>>>;
+    fn finish(
+        session: &S,
+        key: KeyOf<T>,
+        payload: Self::Payload,
+    ) -> impl Future<Output = Result<Self::Item, CellStateError<CellCodecError<T>>>> + Send;
+}
+
+impl<S, T> StreamProjection<S, T> for Values
+where
+    S: StateSession,
+    T: CellType,
+    for<'s> ContextOf<'s, T>: FromSession<'s, S>,
+{
+    type Item = (KeyOf<T>, ResolvedOf<T>);
+
+    async fn finish(
+        session: &S,
+        key: KeyOf<T>,
+        payload: Self::Payload,
+    ) -> Result<Self::Item, CellStateError<CellCodecError<T>>> {
+        Ok((key, resolve_cell::<S, T>(session, payload).await?))
+    }
+}
+
+impl<S: StateSession, T: CellType> StreamProjection<S, T> for Presence {
+    type Item = KeyOf<T>;
+
+    fn finish(
+        _session: &S,
+        key: KeyOf<T>,
+        (): Self::Payload,
+    ) -> impl Future<Output = Result<Self::Item, CellStateError<CellCodecError<T>>>> + Send {
+        ready(Ok(key))
+    }
+}
+
+/// One projected item or the error that ends its stream.
+pub(crate) type ProjectedItem<S, T, P> =
+    Result<<P as StreamProjection<S, T>>::Item, CellStateError<CellCodecError<T>>>;
 
 /// The engine state one invocation froze for its plan.
 type PlanOf<S> = <<S as sealed::Session>::Engine as sealed::ReadEngine<S>>::Plan;
@@ -73,343 +110,198 @@ impl<S: StateSession> PlanBase<S> {
     }
 }
 
-/// A managed point-get plan: the keys a metadata command enumerated, read back
-/// in gate-scoped chunks of [`CELL_BATCH`], skipping the ones that read absent.
-/// This driver owns the point-get chunk width, and every collection's point-get
-/// stream arm runs on it.
-///
-/// The chunk width is the granularity of both the per-chunk admission and the
-/// batch read. ONE aligned batch read fetches a chunk's cells (one Cassandra
-/// query, or one fjall hop), and the typed resolves then fan out under
-/// `RESOLVE_FANOUT`. Admission covers that raw batch read only: the owner takes
-/// one per chunk and releases it before the chunk's resolves, and a published
-/// reader holds no gate at all.
-///
-/// Membership is snapshotted at planning; values are read live, chunk by chunk.
-/// A key that disappears between planning and its chunk reads absent and is
-/// skipped — the uniform skip every coordinate source applies to TTL holes,
-/// popped positions, and membership races alike.
-pub(crate) struct CoordinatePlan<S: StateSession, T: CellType> {
-    base: PlanBase<S>,
-    keys: Vec<KeyOf<T>>,
+/// A stream source contains either ordered keys or direction-relative range
+/// bounds. The collection selects it from stored metadata before execution
+/// starts.
+enum Source<K> {
+    Points(Vec<K>),
+    Range {
+        start: ScanEdge<Coordinate>,
+        dir: Direction,
+        end: ScanEdge<Coordinate>,
+    },
 }
 
-/// A managed durable-range plan: one contiguous span of one section, walked in
-/// `dir` order. It pages gate-free and cannot repair. A collection takes this
-/// plan when it has no coordinate enumeration to point-get.
+/// A captured collection read with a source and an optional result limit.
 ///
-/// The planning command chooses the span. `Unbounded` edges with no limit walk
-/// the whole section. That is the fallback for a collection that cannot say
-/// where its cells are.
-///
-/// A collection with a contiguous coordinate window plans a narrower span
-/// instead. A Deque converts its half-open window `[head, tail)` to the
-/// inclusive span `[head, tail − 1]` and adds the window's own limit. The walk
-/// then reads no row outside the window.
-pub(crate) struct RangePlan<S: StateSession, T> {
+/// Each terminal applies the limit after absent cells have been removed.
+/// The final attempt fence covers every completion, including exhaustion.
+/// Source drivers cannot emit directly to the caller.
+pub(crate) struct Plan<S: StateSession, T: CellType> {
     base: PlanBase<S>,
-    start: ScanEdge<Coordinate>,
-    dir: Direction,
-    end: ScanEdge<Coordinate>,
-    limit: Option<usize>,
-    _cell: PhantomData<fn() -> T>,
-}
-
-/// The arm a collection's stream method takes, as the owned plan its planning
-/// invocation captured. The two members carry the per-kind semantics; a
-/// collection chooses between them in its planning method and drives the choice
-/// through here.
-///
-/// A collection that enumerated no live coordinate plans an empty
-/// [`Points`](Self::Points) arm: zero point gets and no scan. Its exhaustion
-/// still passes the stream fence.
-pub(crate) enum Plan<S: StateSession, T: CellType> {
-    /// Point-get each planned coordinate, in plan order. A backward stream
-    /// reverses the coordinate list at plan time.
-    Points(CoordinatePlan<S, T>),
-
-    /// Walk one durable range.
-    Scan(RangePlan<S, T>),
+    source: Source<KeyOf<T>>,
+    limit: Option<NonZeroUsize>,
 }
 
 impl<S: StateSession, T: CellType> Plan<S, T> {
-    /// Drives the planned arm and resolves each live entry.
-    pub(crate) fn entries(self) -> impl Stream<Item = ScanItem<T>> + Send
-    where
-        for<'s> ContextOf<'s, T>: FromSession<'s, S>,
-    {
-        match self {
-            Self::Points(plan) => Either::Left(plan.entries()),
-            Self::Scan(plan) => Either::Right(plan.entries()),
+    /// Captures keys in their required output order. An empty list performs no
+    /// read.
+    pub(super) fn coordinates(base: PlanBase<S>, keys: Vec<KeyOf<T>>) -> Self {
+        Self {
+            base,
+            source: Source::Points(keys),
+            limit: None,
         }
     }
 
-    /// Drives the planned arm presence-only. It yields keys and never touches a
-    /// value.
-    pub(crate) fn keys(self) -> impl Stream<Item = KeyItem<T>> + Send {
-        match self {
-            Self::Points(plan) => Either::Left(plan.keys()),
-            Self::Scan(plan) => Either::Right(plan.keys()),
+    /// Captures one range within the collection section.
+    pub(super) fn range(
+        base: PlanBase<S>,
+        start: ScanEdge<Coordinate>,
+        dir: Direction,
+        end: ScanEdge<Coordinate>,
+    ) -> Self {
+        Self {
+            base,
+            source: Source::Range { start, dir, end },
+            limit: None,
         }
+    }
+
+    /// Bounds the present items the plan yields. A tighter limit wins, so a
+    /// caller limit can never widen a source window.
+    pub(crate) fn with_limit(mut self, limit: Option<NonZeroUsize>) -> Self {
+        self.limit = self.limit.into_iter().chain(limit).min();
+        self
+    }
+
+    /// Selects one concrete driver, then applies the shared limit and attempt
+    /// fence.
+    pub(crate) fn projected<P>(self) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
+    where
+        P: StreamProjection<S, T>,
+        S::Engine: sealed::Reads<S, P>,
+    {
+        let Self {
+            base,
+            source,
+            limit,
+        } = self;
+        let session = base.session.clone();
+        let inner = match source {
+            Source::Points(keys) => Either::Left(coordinate_source::<S, T, P>(base, keys, limit)),
+            Source::Range { start, dir, end } => {
+                Either::Right(range_source::<S, T, P>(base, start, dir, end, limit))
+            }
+        };
+        fenced::<S, _, T>(
+            session,
+            inner.take(limit.map_or(usize::MAX, NonZeroUsize::get)),
+        )
     }
 }
 
-impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
-    /// Builds the plan over the planning invocation's captured state.
-    pub(super) fn new(base: PlanBase<S>, keys: Vec<KeyOf<T>>) -> Self {
-        Self { base, keys }
-    }
-
-    /// Streams each planned key's live entry, resolved, in plan order.
-    pub(crate) fn entries(self) -> impl Stream<Item = ScanItem<T>> + Send
-    where
-        for<'s> ContextOf<'s, T>: FromSession<'s, S>,
-    {
-        let session = self.base.session.clone();
-        fenced::<S, _, T>(session, self.entry_source())
-    }
-
-    /// Streams the planned keys whose cell is present, **without decoding or
-    /// resolving any value** — so a message-backed collection enumerates keys
-    /// with zero loader fetches.
-    pub(crate) fn keys(self) -> impl Stream<Item = KeyItem<T>> + Send {
-        let session = self.base.session.clone();
-        fenced::<S, _, T>(session, self.key_source())
-    }
-
-    /// The unfenced resolving body: one admission-scoped batch read, then one
-    /// bounded resolve fan-out, per chunk.
-    fn entry_source(self) -> impl Stream<Item = ScanItem<T>> + Send
-    where
-        for<'s> ContextOf<'s, T>: FromSession<'s, S>,
-    {
-        try_stream! {
-            let Self { base, keys } = self;
-            let base = &base;
-            let chunks = stream::unfold(keys.into_iter().peekable(), |mut keys| async move {
-                keys.peek()?; // exhausted ⇒ unfold ends
-                let chunk: CellBuffer<KeyOf<T>> = keys.by_ref().take(CELL_BATCH).collect();
-                // Admission spans the chunk's raw batch read ONLY: it is
-                // released before the chunk's bounded resolve fan-out — which
-                // touches no collection state and may reach a loader — and so
-                // long before any of the chunk's items reach the caller. An
-                // attempt boundary therefore serializes after a chunk's read
-                // and never tears one; a boundary during resolution is caught
-                // by the per-emission fence before any item escapes.
-                let entries = async {
-                    let bytes = {
-                        let mut inner = <S::Engine as sealed::ReadEngine<S>>::resume(
-                            &base.session,
-                            &base.plan,
-                        )
-                        .await;
-                        read_keys::<S, T, Values>(
-                            &base.session,
-                            &mut inner,
-                            base.state_type,
-                            &base.name,
-                            base.section,
-                            &chunk,
-                        )
-                        .await
-                        .map_err(CellStateError::Access)?
-                    };
-                    let values = resolve_batch::<S, T>(&base.session, bytes).await?;
-                    // A `None` is an absent cell: skipped, never an error.
-                    Ok::<_, CellStateError<CellCodecError<T>>>(
-                        chunk
-                            .into_iter()
-                            .zip(values)
-                            .filter_map(|(key, value)| value.map(|v| (key, v)))
-                            .collect::<CellBuffer<_>>(),
-                    )
-                }
-                .await;
-                Some((entries, keys))
-            });
-            futures::pin_mut!(chunks);
-            while let Some(chunk) = chunks.next().await {
-                for entry in chunk? {
-                    yield entry;
-                }
-            }
-        }
-    }
-
-    /// The unfenced presence-only body uses the same chunking. It reads one
-    /// presence bit for each key.
-    fn key_source(self) -> impl Stream<Item = KeyItem<T>> + Send {
-        try_stream! {
-            let Self { base, keys } = self;
-            let base = &base;
-            let chunks = stream::unfold(keys.into_iter().peekable(), |mut keys| async move {
-                keys.peek()?;
-                let mut inner =
-                    <S::Engine as sealed::ReadEngine<S>>::resume(&base.session, &base.plan).await;
-                let chunk: CellBuffer<KeyOf<T>> = keys.by_ref().take(CELL_BATCH).collect();
-                // Pair each key with its slot so the emission stage can drop
-                // absent keys AND checkpoint per key.
-                let paired = read_keys::<S, T, Presence>(
+/// Reads aligned chunks under admission. [`Projection::demand`] sizes the
+/// first chunk from the limit.
+/// Each later chunk doubles up to `CELL_BATCH`, so a hole in the keyset costs
+/// at most one extra round trip per doubling. A whole chunk must project
+/// successfully before it emits any item.
+fn coordinate_source<S, T, P>(
+    base: PlanBase<S>,
+    keys: Vec<KeyOf<T>>,
+    limit: Option<NonZeroUsize>,
+) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
+where
+    S: StateSession,
+    T: CellType,
+    P: StreamProjection<S, T>,
+    S::Engine: sealed::Reads<S, P>,
+{
+    try_stream! {
+        let mut keys = keys.into_iter().peekable();
+        let mut fetch = FetchSchedule::new(P::demand(limit), CELL_BATCH);
+        while keys.peek().is_some() {
+            let chunk: CellBuffer<_> = keys.by_ref().take(fetch.next().get()).collect();
+            let slots = {
+                let mut inner = <S::Engine as sealed::ReadEngine<S>>::resume(
+                    &base.session,
+                    &base.plan,
+                ).await;
+                read_keys::<S, T, P>(
                     &base.session,
                     &mut inner,
                     base.state_type,
                     &base.name,
                     base.section,
                     &chunk,
-                )
-                .await
-                .map(|slots| {
-                    chunk
-                        .into_iter()
-                        .zip(slots)
-                        .collect::<CellBuffer<(KeyOf<T>, Option<()>)>>()
-                });
-                Some((paired, keys))
-            });
-            futures::pin_mut!(chunks);
-            while let Some(chunk) = chunks.next().await {
-                // Per-key coop checkpoint under an ordered window: the presence
-                // filter is synchronous, so a warm chunk of ready keys would
-                // otherwise drain the coop budget in one poll (the resolving
-                // twin spends the budget per item inside its resolve fan-out).
-                // `buffered` keeps key order; absent keys are dropped here. The
-                // fan-out is a no-op wrapper on purpose: `cooperative` is the
-                // only per-item budget checkpoint reachable here, since tokio's
-                // `rt` feature is off and `consume_budget` is therefore
-                // uncallable. Do not re-litigate the empty `buffered` window.
-                let emit = stream::iter(chunk?)
-                    .map(|(key, slot)| {
-                        cooperative(async move {
-                            Ok::<Option<KeyOf<T>>, CellStateError<CellCodecError<T>>>(
-                                slot.map(|()| key),
-                            )
-                        })
-                    })
-                    .buffered(SHARD_FANOUT_CONCURRENCY);
-                futures::pin_mut!(emit);
-                while let Some(item) = emit.next().await {
-                    if let Some(key) = item? {
-                        yield key;
+                ).await.map_err(CellStateError::Access)?
+            };
+
+            let session = &base.session;
+            let buffer = CellBuffer::with_capacity(chunk.len());
+            // `cooperative` is the only per-item budget checkpoint here. Tokio's `rt`
+            // feature is off, so `consume_budget` is uncallable. For `Presence` the
+            // wrapped future is a no-op; keep the wrapper. Do not re-litigate the window.
+            let items = stream::iter(chunk.into_iter().zip(slots))
+                .map(|(key, slot)| cooperative(async move {
+                    match slot {
+                        Some(payload) => P::finish(session, key, payload).await.map(Some),
+                        None => Ok(None),
                     }
-                }
+                }))
+                .buffered(RESOLVE_FANOUT)
+                .try_fold(buffer, |mut items, item| {
+                    if let Some(item) = item {
+                        items.push(item);
+                    }
+                    ready(Ok(items))
+                }).await?;
+            for item in items {
+                yield item;
             }
         }
     }
 }
 
-impl<S: StateSession, T: CellType> RangePlan<S, T> {
-    /// Builds the plan over the planning invocation's captured state. The plan
-    /// walks `[start, end]` and yields at most `limit` cells. The edges are
-    /// direction-relative, exactly as [`Scan`] defines them.
-    pub(super) fn new(
-        base: PlanBase<S>,
-        start: ScanEdge<Coordinate>,
-        dir: Direction,
-        end: ScanEdge<Coordinate>,
-        limit: Option<usize>,
-    ) -> Self {
-        Self {
-            base,
-            start,
-            dir,
-            end,
-            limit,
-            _cell: PhantomData,
-        }
-    }
-
-    /// Opens the plan's durable page over its planned span. It borrows the
-    /// whole plan once, so the [`Scan`]'s edges name the plan's own owned
-    /// coordinates.
-    fn page<P: Projection>(
-        &self,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + '_
-    where
-        S::Engine: sealed::Reads<S, P>,
-    {
+/// Scans without admission and projects cells through an ordered window.
+fn range_source<S, T, P>(
+    base: PlanBase<S>,
+    start: ScanEdge<Coordinate>,
+    dir: Direction,
+    end: ScanEdge<Coordinate>,
+    limit: Option<NonZeroUsize>,
+) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
+where
+    S: StateSession,
+    T: CellType,
+    P: StreamProjection<S, T>,
+    S::Engine: sealed::Reads<S, P>,
+{
+    try_stream! {
+        <S::Engine as sealed::ReadEngine<S>>::fence(&base.session)?;
+        let window = limit.map_or(RESOLVE_FANOUT, |n| n.get().min(RESOLVE_FANOUT));
         let scan = Scan {
-            section: self.base.section,
-            start: self.start.as_ref(),
-            dir: self.dir,
-            end: self.end.as_ref(),
-            limit: self.limit,
+            section: base.section,
+            start: start.as_ref(),
+            dir,
+            end: end.as_ref(),
+            fetch_hint: P::demand(limit),
         };
-        <S::Engine as sealed::Reads<S, P>>::page(
-            &self.base.session,
-            &self.base.plan,
-            self.base.state_type,
-            &self.base.name,
-            scan,
+        // Every backend page yields present cells only, so the limit ends paging
+        // here, before resolution. The plan's own `take` stays the result bound.
+        let page = <S::Engine as sealed::Reads<S, P>>::page(
+            &base.session, &base.plan, base.state_type, &base.name, scan,
         )
-    }
-
-    /// Streams the section's live entries, resolved, in `dir` order.
-    pub(crate) fn entries(self) -> impl Stream<Item = ScanItem<T>> + Send
-    where
-        for<'s> ContextOf<'s, T>: FromSession<'s, S>,
-    {
-        let session = self.base.session.clone();
-        fenced::<S, _, T>(session, self.entry_source())
-    }
-
-    /// Streams the section's live keys in `dir` order through presence-only
-    /// pages. It does not transfer, decode, or resolve a value.
-    pub(crate) fn keys(self) -> impl Stream<Item = KeyItem<T>> + Send {
-        let session = self.base.session.clone();
-        fenced::<S, _, T>(session, self.key_source())
-    }
-
-    /// The unfenced resolving body: gate-free paging through an ordered
-    /// resolution window.
-    fn entry_source(self) -> impl Stream<Item = ScanItem<T>> + Send
-    where
-        for<'s> ContextOf<'s, T>: FromSession<'s, S>,
-    {
-        try_stream! {
-            let plan = self;
-            <S::Engine as sealed::ReadEngine<S>>::fence(&plan.base.session)?;
-            let session = &plan.base.session;
-            // `cooperative` inline in the producing closure (a
-            // `.map(cooperative)` stage trips a higher-ranked-lifetime error on
-            // the non-`'static` per-item futures); `buffered` keeps key order.
-            let inner = plan.page::<Values>()
-                .map(|item| {
-                    cooperative(async move {
-                        let (cell, bytes) = item?;
-                        let key = <T::Key as OrderedKeyCodec>::decode(cell.coordinate.as_bytes())
-                            .map_err(CellStateError::Key)?;
-                        let resolved = resolve_cell::<S, T>(session, bytes).await?;
-                        Ok::<_, CellStateError<CellCodecError<T>>>((key, resolved))
-                    })
-                })
-                .buffered(SHARD_FANOUT_CONCURRENCY);
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().await {
-                yield item?;
-            }
-        }
-    }
-
-    /// The unfenced presence-only body: the same paging, decoding only the
-    /// coordinate.
-    fn key_source(self) -> impl Stream<Item = KeyItem<T>> + Send {
-        try_stream! {
-            let plan = self;
-            <S::Engine as sealed::ReadEngine<S>>::fence(&plan.base.session)?;
-            let inner = plan.page::<Presence>()
-                .map(|item| {
-                    cooperative(async move {
-                        let (cell, ()) = item?;
-                        let key = <T::Key as OrderedKeyCodec>::decode(cell.coordinate.as_bytes())
-                            .map_err(CellStateError::Key)?;
-                        Ok::<KeyOf<T>, CellStateError<CellCodecError<T>>>(key)
-                    })
-                })
-                .buffered(SHARD_FANOUT_CONCURRENCY);
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().await {
-                yield item?;
-            }
+        .take(limit.map_or(usize::MAX, NonZeroUsize::get));
+        let session = &base.session;
+        let inner = page
+            .map(|item| cooperative(async move {
+                let (cell, payload) = item?;
+                let key = <T::Key as OrderedKeyCodec>::decode(cell.coordinate.as_bytes())
+                    .map_err(CellStateError::Key)?;
+                P::finish(session, key, payload).await
+            }))
+            // Both drivers resolve under `RESOLVE_FANOUT`. The limit bounds the
+            // window, so a small query starts no more resolves than it needs.
+            // Ruling: the range window matches the coordinate arm. Resolves read
+            // the loader, not the shard, so `SHARD_FANOUT_CONCURRENCY` does not
+            // apply here. An unlimited stream that stops early has already
+            // started up to a window of resolves. A caller that stops early
+            // bounds its demand with a limit.
+            .buffered(window);
+        futures::pin_mut!(inner);
+        while let Some(item) = inner.next().await {
+            yield item?;
         }
     }
 }
@@ -447,7 +339,7 @@ where
     X: Send,
     T: CellType,
 {
-    // Heap-hold the source's state machine (the chunk unfold or the `buffered`
+    // Heap-hold the source's state machine (the chunk loop or the `buffered`
     // resolution window): it is the large part, so boxing it keeps the fence
     // adapter — and every collection stream that embeds it — a small future
     // (large-future stack bloat, not a per-item cost). One bounded allocation

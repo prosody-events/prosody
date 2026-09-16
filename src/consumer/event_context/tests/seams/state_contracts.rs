@@ -71,7 +71,7 @@ fn counting_context(registry: CollectionDefRegistry) -> (CountingContext, Counti
 #[tokio::test]
 async fn map_cursor_is_lazy() -> Result<()> {
     // Seed enough entries that a full drain far exceeds one chunk.
-    let entries = CELL_BATCH * 3;
+    let entries = CELL_BATCH.get() * 3;
     let mut registry = CollectionDefRegistry::default();
     registry.register(
         &map_state::<Utf8KeyCodec, JsonCodec>(MAP_NAME),
@@ -101,9 +101,9 @@ async fn map_cursor_is_lazy() -> Result<()> {
     let reads = counting.lower_reads();
     // One keyset read plus at most one chunk of point reads.
     assert!(
-        reads <= CELL_BATCH + 1,
+        reads <= CELL_BATCH.get() + 1,
         "one next() read {reads} cells; expected <= one chunk ({}) plus the keyset",
-        CELL_BATCH + 1
+        CELL_BATCH.get() + 1
     );
     assert!(
         reads < entries,

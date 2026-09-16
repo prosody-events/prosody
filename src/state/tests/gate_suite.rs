@@ -63,14 +63,11 @@ use uuid::Uuid;
 /// The hang-guard for acquisitions that must proceed — never the assertion.
 const HANG_GUARD: Duration = Duration::from_secs(30);
 
-/// The `*_stream_error_yield_releases_the_gate` pins seed exactly two items and
-/// assert the first yielded item is the `Err` — chunk-atomicity, which requires
-/// both items to land in one point-get chunk. At `CELL_BATCH == 1` each key
-/// is its own chunk, the valid entry's `Ok` surfaces first, and the pins would
-/// go red on correct code; enforce the premise so breaking it is uncompilable.
+/// The stream error tests put a valid item before a corrupt item in one chunk.
+/// A failing chunk yields only its error. Both items must fit in one chunk.
 const _: () = assert!(
-    CELL_BATCH >= 2,
-    "the *_stream_error_yield pins need two items in one chunk to prove chunk-atomicity"
+    CELL_BATCH.get() >= 2,
+    "the stream error tests require two items in one chunk"
 );
 
 /// Yields until a just-spawned task has reached its park point (the gate
@@ -942,9 +939,9 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
 #[test]
 fn map_get_many_holds_gate_across_sub_batches() -> Result<()> {
     /// Two sub-batches: the first full `CELL_BATCH` chunk, then the remainder.
-    const N: i64 = CELL_BATCH as i64 + 2;
+    const N: i64 = CELL_BATCH.get() as i64 + 2;
     /// First key of sub-batch 2 — the one the concurrent set targets.
-    const TARGET: i64 = CELL_BATCH as i64;
+    const TARGET: i64 = CELL_BATCH.get() as i64;
 
     runtime()?.block_on(async {
         let fx = GateFixture::new("gate_get_many_isolation")?;
@@ -1119,13 +1116,10 @@ async fn parked_set(name: &str, terminate: bool) -> Result<ParkedSet> {
 /// forwarding loop's `chunk?` yields the `Err`, so the gate is released before
 /// the `Err` reaches user code.
 ///
-/// This pin **also pins chunk-atomicity**: a valid lower-sorting entry (key 3)
-/// precedes the corrupt key (7) in the same chunk, so prefix-yield semantics
-/// would surface key 3's `Ok` first and fail `first.is_err()`. Two red
-/// recipes: (i) chunk-atomicity — make the chunk yield per-item instead of
-/// collecting; (ii) gate-release — hold the permit across the yield by
-/// returning it in the unfold state (`Some((chunk, permit, keys))`) so the
-/// follow-up `get` hangs.
+/// A failing chunk yields none of its items. Valid key 3 precedes corrupt
+/// key 7 in one chunk. If the chunk emits items before projection completes,
+/// key 3 appears first and fails `first.is_err()`. If the stream holds the
+/// permit across the error yield, the next `get` cannot acquire the gate.
 #[test]
 fn map_stream_error_yield_releases_the_gate() -> Result<()> {
     runtime()?.block_on(async {
@@ -1133,10 +1127,8 @@ fn map_stream_error_yield_releases_the_gate() -> Result<()> {
         let id = fx.id("m")?;
         let cref = CollectionRef::new(id.clone(), None);
 
-        // Seed a two-key `Tracked` keyset: a valid lower-sorting entry (3) ahead
-        // of the corrupt entry (7) in the same chunk, so a chunk-atomic error
-        // surfaces the corrupt key's `Err` first (prefix-yield would leak 3's
-        // `Ok`), and the corrupt bytes fail to decode under the chunk permit.
+        // Valid key 3 precedes corrupt key 7 in the same tracked chunk.
+        // The chunk must emit only the error from key 7.
         let valid = 3_i64;
         let corrupt = 7_i64;
         fx.counting
@@ -1167,16 +1159,14 @@ fn map_stream_error_yield_releases_the_gate() -> Result<()> {
 
         let stream = handle.stream(Direction::Forward);
         futures::pin_mut!(stream);
-        // Both keys land in one chunk; the chunk-atomic collect short-circuits
-        // at the corrupt key, so the FIRST yielded item is the `Err` — key 3's
-        // `Ok` is never surfaced.
+        // Projection fails at key 7 before the chunk emits any item.
         let first = stream
             .next()
             .await
             .ok_or_else(|| eyre!("the stream ended without yielding the decode error"))?;
         assert!(
             first.is_err(),
-            "the corrupt entry must surface as the first (chunk-atomic) Err item, not key 3's Ok"
+            "the failing chunk must emit only the error from key 7"
         );
 
         // The stream is still alive (held in scope, not dropped). A follow-up op
@@ -1202,9 +1192,9 @@ fn map_stream_error_yield_releases_the_gate() -> Result<()> {
 /// whose element holds undecodable bytes yields `Err` and MUST release the gate
 /// before the yield. Same mechanism (corrupt bytes fetch AND fail to decode
 /// under the chunk permit, which dies with the chunk future before `chunk?`
-/// yields the `Err`), and — with index 0 valid ahead of the corrupt index 1 in
-/// one chunk — it likewise pins chunk-atomicity: prefix-yield would surface
-/// index 0's `Ok` first. Same reds, on the structural twin.
+/// yields the `Err`). Valid index 0 precedes corrupt index 1 in one chunk.
+/// A failing chunk yields none of its items. If index 0 appears first, the
+/// assertion fails.
 #[test]
 fn deque_stream_error_yield_releases_the_gate() -> Result<()> {
     runtime()?.block_on(async {
@@ -1212,10 +1202,8 @@ fn deque_stream_error_yield_releases_the_gate() -> Result<()> {
         let id = fx.id("d")?;
         let dref = CollectionRef::new(id.clone(), None);
 
-        // Seed a two-element window `[0, 2)`: index 0 valid, index 1 corrupt, so
-        // a chunk-atomic error surfaces index 1's `Err` first (prefix-yield
-        // would leak index 0's `Ok`), and the corrupt bytes fail to decode under
-        // the chunk permit.
+        // Valid index 0 precedes corrupt index 1 in the same chunk.
+        // The chunk must emit only the error from index 1.
         fx.counting
             .write_resolved(
                 &dref,
@@ -1244,17 +1232,14 @@ fn deque_stream_error_yield_releases_the_gate() -> Result<()> {
 
         let stream = handle.stream(Direction::Forward);
         futures::pin_mut!(stream);
-        // Both indices land in one chunk; the chunk-atomic collect short-circuits
-        // at index 1, so the FIRST yielded item is the `Err` — index 0's `Ok` is
-        // never surfaced.
+        // Projection fails at index 1 before the chunk emits any item.
         let first = stream
             .next()
             .await
             .ok_or_else(|| eyre!("the stream ended without yielding the decode error"))?;
         assert!(
             first.is_err(),
-            "the corrupt element must surface as the first (chunk-atomic) Err item, not index 0's \
-             Ok"
+            "the failing chunk must emit only the error from index 1"
         );
 
         // The stream is still alive: a follow-up op must not be starved.
@@ -1862,7 +1847,7 @@ fn map_item_terminated(item: &MapStateError<JsonCodecError>) -> bool {
 /// not the source (which keeps producing). The first item crosses pre-bump; the
 /// range source holds no admission, so the `reset` between pulls bumps
 /// immediately. Red proven by dropping the `fenced(...)` wrapper in
-/// `RangePlan::entries` (return the raw source): the post-bump pull then
+/// `Plan::projected` (return the raw source): the post-bump pull then
 /// yields a second `Ok` item.
 #[test]
 fn range_scan_stream_fences_after_bump() -> Result<()> {
@@ -1909,7 +1894,7 @@ fn range_scan_stream_fences_after_bump() -> Result<()> {
 /// yield; a buffered entry never crosses the fence after an observed bump. Both
 /// keys land in one chunk (`CELL_BATCH >= 2`), so the first entry's fence
 /// check passes pre-bump and the second's runs post-bump. Red proven by
-/// dropping the `fenced(...)` wrapper in `CoordinatePlan::entries`: the
+/// dropping the `fenced(...)` wrapper in `Plan::projected`: the
 /// buffered second entry then crosses as an `Ok`.
 #[test]
 fn coordinate_stream_fences_buffered_entries_after_bump() -> Result<()> {

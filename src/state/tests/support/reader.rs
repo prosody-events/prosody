@@ -95,7 +95,7 @@ pub(crate) async fn reader_residue<
             start: ScanEdge::Unbounded,
             end: ScanEdge::Unbounded,
             dir,
-            limit: None,
+            fetch_hint: None,
         };
         let observed: Vec<_> = CommittedCellSource::<Values>::scan(source, &id, scan)
             .try_collect()

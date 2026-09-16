@@ -140,8 +140,8 @@ pub(crate) use backend::{PartitionBackend, StateBackend, StateBackendFactory};
 pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
 
 /// Bounds concurrent requests within one collection, which is one Cassandra
-/// partition. It covers write chunks, admission reads, staged-base reads, and
-/// typed cell resolution. It nests inside [`STATE_FANOUT_CONCURRENCY`].
+/// partition. It covers write chunks, admission reads, and staged-base reads.
+/// It nests inside [`STATE_FANOUT_CONCURRENCY`].
 ///
 /// Ruling: keep eight until a benchmark compares `1, 2, 4, 8, 16, 32, 64`.
 /// Include cold stage reads, admission, oversized writes, and simultaneous
@@ -149,12 +149,11 @@ pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
 /// pressure. Add configuration only if deployments require different bounds.
 pub(crate) const SHARD_FANOUT_CONCURRENCY: usize = 8;
 
-/// Maximum concurrent typed resolves in flight within one aligned batch read —
-/// the loader (Kafka message) fan-out for that read. A resolve reads
-/// the collection's source (a Kafka message for a loader-backed collection),
-/// which does not contend on the
-/// collection's Scylla shard, so it is not bounded by
-/// [`SHARD_FANOUT_CONCURRENCY`] (that bounds same-shard round-trip overlap).
+/// Maximum concurrent typed resolves within an aligned batch read or a range
+/// scan's resolution window. This bounds the loader fan-out for each read.
+/// A resolve reads the collection's source, such as a Kafka message.
+/// It does not contend on the collection's Scylla shard.
+/// [`SHARD_FANOUT_CONCURRENCY`] bounds overlapping round trips to that shard.
 /// A batch's resolves fan out across the WHOLE call under this window, so the
 /// resolves overlap rather than serialize per store sub-batch.
 ///

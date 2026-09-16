@@ -169,25 +169,15 @@ impl<P: Projection> CellRead<P> for MemoryCellStore {
             if scan.dir == Direction::Backward {
                 raw.reverse();
             }
-            let limit = scan.limit;
-            // The limit bounds *yielded* (present) cells, not raw rows: a cleared
-            // or rolled-back-to-absent cell in range is skipped without consuming
-            // a limit slot (matching the Cassandra scan's `yielded` counter).
-            //
             // The resolved fast path touches no tokio leaf, so a large in-memory
             // scan would drain in one poll; a per-item `cooperative` yield point
             // fires every ~128 items.
             let mut lookup = EvidenceLookup::new(self, collection);
-            let mut yielded = 0usize;
             for (cell, stored) in raw {
-                if limit.is_some_and(|n| yielded >= n) {
-                    break;
-                }
                 let committed =
                     cooperative(lookup.resolve(stored)).await?;
                 if let Some(bytes) = committed.into_inner() {
                     yield (cell, P::from_value(bytes));
-                    yielded += 1;
                 }
             }
         }

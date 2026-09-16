@@ -37,6 +37,7 @@ use futures::{Stream, StreamExt};
 use scc::hash_map::Entry;
 use std::convert::Infallible;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -98,6 +99,7 @@ pub(in crate::state_reader::tests) enum FaultPoint {
 #[derive(Clone, Default)]
 pub(crate) struct ScriptedCellSource {
     inner: MemoryCells,
+    scan_hint: Arc<AtomicUsize>,
     faults: Arc<scc::HashMap<SegmentId, FaultPoint, RandomState>>,
     /// Per-source committed-read counter — the source-call trace. Cloning
     /// shares it, so a test reads the count after moving the source into a
@@ -152,6 +154,10 @@ impl ScriptedCellSource {
             .unwrap_or(0)
     }
 
+    pub(in crate::state_reader::tests) fn scan_hint(&self) -> usize {
+        self.scan_hint.load(Ordering::Relaxed)
+    }
+
     fn record_read(&self, segment: SegmentId) {
         match self.reads.entry_sync(segment) {
             Entry::Vacant(slot) => {
@@ -198,6 +204,10 @@ impl ScriptedCellSource {
         id: &'a CollectionId,
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+        self.scan_hint.store(
+            scan.fetch_hint.map_or(0, NonZeroUsize::get),
+            Ordering::Relaxed,
+        );
         let segment = id.state_key().segment_id;
         self.record_read(segment);
         let fault = self.fault_of(segment);

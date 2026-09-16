@@ -1139,7 +1139,10 @@ impl CountingFixture {
                 *per_section.entry(cell.section).or_default() += 1;
             }
         }
-        per_section.values().map(|n| n.div_ceil(CELL_BATCH)).sum()
+        per_section
+            .values()
+            .map(|n| n.div_ceil(CELL_BATCH.get()))
+            .sum()
     }
 
     /// Settles a finalized receipt so the committed projection is readable: a

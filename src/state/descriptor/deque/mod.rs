@@ -79,6 +79,7 @@ use super::{
 };
 use crate::codec::{I64Codec, I64CodecError, JsonCodec, PairCodecError};
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::cell::Values;
 use crate::state::cell_key::Direction;
 #[cfg(test)]
 use crate::state::cell_key::{CellKey, Coordinate};
@@ -386,10 +387,13 @@ where
     ) -> Result<Plan<S, Keyed<I64KeyCodec, T>>, DequeStateError<CellCodecError<T>>> {
         let window = bounds(op).await?;
         let len = window.len()?;
-        if len > DEQUE_POINT_ITERATION_MAX {
+        // The wide-window guard supplies a positive limit for the plan.
+        if let Some(limit) = NonZeroUsize::new(len).filter(|n| n.get() > DEQUE_POINT_ITERATION_MAX)
+        {
             // Wide window: one durable range scan, anchored on the window.
             // It runs from the front `head` to the back `tail − 1`, and
-            // mirrors backward. `len > 0` proves `tail − 1` does not underflow.
+            // mirrors backward. A wide window is nonempty, so `tail − 1` does
+            // not underflow.
             let last = window
                 .tail
                 .checked_sub(1)
@@ -398,13 +402,7 @@ where
                 Direction::Forward => (window.head, last),
                 Direction::Backward => (last, window.head),
             };
-            return Ok(Plan::Scan(op.range_within(
-                DequeKind::<T>::ENTRIES,
-                &start,
-                dir,
-                &end,
-                len,
-            )));
+            return Ok(op.range_within(DequeKind::<T>::ENTRIES, &start, dir, &end, limit));
         }
         // Point-get arm. `absolute` is monotone in the position. One check of
         // the extreme index therefore proves that every position in `[0, len)`
@@ -422,9 +420,7 @@ where
         if dir == Direction::Backward {
             indices.reverse();
         }
-        Ok(Plan::Points(
-            op.coordinates(DequeKind::<T>::ENTRIES, indices),
-        ))
+        Ok(op.coordinates(DequeKind::<T>::ENTRIES, indices))
     }
 
     /// Streams the live elements in index order — front to back for
@@ -481,7 +477,7 @@ where
         try_stream! {
             // Init: `stream_plan` reads the bounds cell under an admission
             // that it drops as it returns, before this `?` sees the result.
-            let inner = self.stream_plan(dir).instrument(span.clone()).await?.entries();
+            let inner = self.stream_plan(dir).instrument(span.clone()).await?.projected::<Values>();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
                 // The driver yields the decoded index. The module's window
