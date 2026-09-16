@@ -177,16 +177,7 @@ impl<L> Overlay<L> {
     where
         L: CellRead<P>,
     {
-        // Strip the lower limit because dirty cells can add or hide results.
-        // The merge applies the limit to its output.
-        let bottom = CellRead::<P>::scan(
-            &self.lower,
-            collection,
-            Scan {
-                limit: None,
-                ..scan
-            },
-        );
+        let bottom = CellRead::<P>::scan(&self.lower, collection, scan);
         self.merge_cells::<_, P>(collection, scan, bottom)
     }
 
@@ -214,15 +205,10 @@ impl<L> Overlay<L> {
         try_stream! {
             if cleared {
                 // The dirty clear marker hides the lower section: yield only
-                // the post-clear dirty `Set`s, honoring the limit.
-                let mut yielded = 0usize;
+                // the post-clear dirty `Set`s.
                 for (key, value) in &top {
-                    if scan.limit.is_some_and(|n| yielded >= n) {
-                        break;
-                    }
                     if let DirtyVal::Set(bytes) = value {
                         yield (key.clone(), P::from_value(bytes.clone()));
-                        yielded += 1;
                     }
                 }
                 return;
@@ -230,13 +216,8 @@ impl<L> Overlay<L> {
             // `top` is an owned, pre-sorted snapshot (the guard was dropped when
             // it was built), walked by index; `bottom` stays a lazy stream.
             let mut ti = 0usize;
-            let mut yielded = 0usize;
             let mut bottom = std::pin::pin!(bottom.peekable());
             loop {
-                // Apply the merged-output limit (handles `Some(0)` → yield none).
-                if scan.limit.is_some_and(|n| yielded >= n) {
-                    break;
-                }
                 let order = match (top.get(ti), bottom.as_mut().peek().await) {
                     (None, None) => break,
                     // Dirty-only: take dirty.
@@ -254,7 +235,6 @@ impl<L> Overlay<L> {
                         ti += 1;
                         if let DirtyVal::Set(bytes) = value {
                             yield (key.clone(), P::from_value(bytes.clone()));
-                            yielded += 1;
                         }
                     }
                     // Tie: dirty wins, the shadowed lower cell is dropped.
@@ -264,14 +244,12 @@ impl<L> Overlay<L> {
                         let _ = bottom.as_mut().next().await.transpose()?;
                         if let DirtyVal::Set(bytes) = value {
                             yield (key.clone(), P::from_value(bytes.clone()));
-                            yielded += 1;
                         }
                     }
                     // Lower cell comes first (untouched by this handler): emit it.
                     Ordering::Greater => {
                         if let Some(item) = bottom.as_mut().next().await {
                             yield item?;
-                            yielded += 1;
                         }
                     }
                 }

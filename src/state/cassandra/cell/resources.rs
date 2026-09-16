@@ -99,19 +99,13 @@ impl CassandraCellResources {
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, P::Payload), CassandraCellStoreError>> + Send + 'a
     {
-        let limit = scan.limit;
         try_stream! {
             let pages = page::<P>(&self.session, &self.queries, id, scan);
             pin_mut!(pages);
             let (evidence, mut row) = try_join!(self.reader_evidence(id), pages.try_next())?;
-            let mut yielded = 0usize;
             while let Some((key, cell)) = row {
-                if limit.is_some_and(|n| yielded >= n) {
-                    break;
-                }
                 if evidence.survives(&key) && let Some(bytes) = resolve_for_reader(&cell, &evidence).cloned() {
                     yield (key, bytes);
-                    yielded += 1;
                 }
                 row = pages.try_next().await?;
             }

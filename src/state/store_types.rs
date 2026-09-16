@@ -4,15 +4,11 @@ use super::cell_key::Coordinate;
 use crate::timers::duration::CompactDuration;
 use smallvec::SmallVec;
 use std::iter::from_fn;
+use std::num::NonZeroUsize;
 use std::slice;
 
 /// The maximum number of coordinates a batch read carries in one hop.
-pub(crate) const CELL_BATCH: usize = 128;
-
-const _: () = assert!(
-    CELL_BATCH > 0,
-    "CELL_BATCH must be positive or every stream-unfold chunk source stalls on empty chunks"
-);
+pub(crate) const CELL_BATCH: NonZeroUsize = NonZeroUsize::MIN.saturating_add(127);
 
 /// A non-empty, bounded (`1..=CELL_BATCH`) run of coordinates for one batch
 /// read.
@@ -31,7 +27,7 @@ impl CoordinateBatch {
     ) -> impl Iterator<Item = CoordinateBatch> {
         let mut it = coords.into_iter();
         from_fn(move || {
-            let batch: CellBuffer<Coordinate> = it.by_ref().take(CELL_BATCH).collect();
+            let batch: CellBuffer<Coordinate> = it.by_ref().take(CELL_BATCH.get()).collect();
             (!batch.is_empty()).then_some(CoordinateBatch(batch))
         })
     }

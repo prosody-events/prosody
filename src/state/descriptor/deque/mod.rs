@@ -386,8 +386,7 @@ where
     ) -> Result<Plan<S, Keyed<I64KeyCodec, T>>, DequeStateError<CellCodecError<T>>> {
         let window = bounds(op).await?;
         let len = window.len()?;
-        // The wide-window guard yields the scan limit as `NonZeroUsize`, so a
-        // zero limit is uncompilable here rather than checked.
+        // The wide-window guard supplies a positive limit for the plan.
         if let Some(limit) = NonZeroUsize::new(len).filter(|n| n.get() > DEQUE_POINT_ITERATION_MAX)
         {
             // Wide window: one durable range scan, anchored on the window.

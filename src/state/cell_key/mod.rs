@@ -242,11 +242,8 @@ pub struct Scan<'a> {
     /// The edge the scan stops at (high side forward, low side backward).
     pub end: ScanEdge<&'a Coordinate>,
 
-    /// The optional maximum number of cells to yield.
-    pub limit: Option<usize>,
-
-    /// The preferred number of cells per fetch. Backends can add headroom.
-    /// This hint never limits results and survives an overlay's limit removal.
+    /// The preferred size of the first fetch. A backend sizes its first page or
+    /// batch from it and grows later fetches. It never limits results.
     pub fetch_hint: Option<NonZeroUsize>,
 }
 

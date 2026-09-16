@@ -131,18 +131,12 @@ impl MemoryCells {
             if scan.dir == Direction::Backward {
                 raw.reverse();
             }
-            let limit = scan.limit;
-            let mut yielded = 0usize;
             for (cell, stored) in raw {
-                if limit.is_some_and(|n| yielded >= n) {
-                    break;
-                }
                 if !evidence.survives(&cell) { continue; }
                 if let Some(bytes) =
                     cooperative(async { resolve_for_reader(&stored, &evidence).cloned() }).await
                 {
                     yield (cell, bytes);
-                    yielded += 1;
                 }
             }
         }

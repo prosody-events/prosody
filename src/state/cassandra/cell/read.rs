@@ -8,13 +8,17 @@ use super::projection::CassandraProjection;
 use super::{
     CassandraCellStoreError, CassandraSession, CassandraStoreError, Cell, CellBuffer, CellKey,
     CellKind, CellQueries, CollectionId, Coordinate, Direction, Pk, Scan, ScanEdge, Section,
-    Stream, TryStreamExt, cooperative, pin_mut, try_stream,
+    Stream, cooperative, try_stream,
 };
 use crate::state::marker::MarkerState;
+use crate::state::store::FetchSchedule;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
+use scylla::response::PagingState;
 use scylla::statement::prepared::PreparedStatement;
+use std::future::ready;
 use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 
 /// Fetches one projected cell with its durable TTL columns.
 pub(super) async fn fetch_point<P: CassandraProjection>(
@@ -121,7 +125,7 @@ fn split_batch<P: CassandraProjection>(row: BatchRow<P>) -> (Bytes, PointRow<P>)
 }
 
 /// Pages projected rows within the scan bounds.
-/// Callers apply commit evidence and limits after decode.
+/// Callers apply commit evidence after decode.
 pub(super) fn page<'a, P: CassandraProjection>(
     session: &'a CassandraSession,
     queries: &'a CellQueries,
@@ -135,56 +139,59 @@ pub(super) fn page<'a, P: CassandraProjection>(
     try_stream! {
         let pk = Pk::of(collection);
         let statement = P::statements(queries).scan.select(dir, start.kind());
-        let pager = session
-            .session()
-            .execute_iter(
-                scan_statement(statement, scan.fetch_hint),
-                (
-                    pk.segment_id,
-                    pk.key,
-                    pk.state_type,
-                    pk.name,
-                    CellKind::Cell,
-                    section,
-                    start.as_ref().anchor(),
-                ),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?;
-        let stream = pager
-            .rows_stream::<ScanRow<P>>()
-            .map_err(CassandraStoreError::from)?;
-        pin_mut!(stream);
-
-        while let Some(row) = cooperative(stream.try_next())
-            .await
-            .map_err(CassandraStoreError::from)?
-        {
-            let (section, coordinate, data, prev, encoding, version, event) = row;
-            let key = CellKey {
-                section: Section::new(section),
-                coordinate: Coordinate::from_bytes(coordinate),
-            };
-            let cell = decode_body::<P>((data, prev, encoding, version, event))?;
-            if past_end(dir, &key, end.as_ref()) {
-                break;
+        // Scylla rejects a non-positive page size, so this fallback is unreachable.
+        let page_size = NonZeroUsize::new(usize::try_from(statement.get_page_size()).unwrap_or(0))
+            .unwrap_or(NonZeroUsize::MIN);
+        let mut fetch = FetchSchedule::new(scan.fetch_hint, page_size);
+        let mut paging_state = PagingState::start();
+        'pages: loop {
+            let statement = scan_statement(statement, fetch.next());
+            let (result, response) = session
+                .session()
+                .execute_single_page(
+                    &statement,
+                    (
+                        pk.segment_id,
+                        pk.key,
+                        pk.state_type,
+                        pk.name,
+                        CellKind::Cell,
+                        section,
+                        start.as_ref().anchor(),
+                    ),
+                    paging_state,
+                )
+                .await
+                .map_err(CassandraStoreError::from)?;
+            let rows = result.into_rows_result().map_err(CassandraStoreError::from)?;
+            for row in rows.rows::<ScanRow<P>>().map_err(CassandraStoreError::from)? {
+                let row = cooperative(ready(row)).await.map_err(CassandraStoreError::from)?;
+                let (section, coordinate, data, prev, encoding, version, event) = row;
+                let key = CellKey {
+                    section: Section::new(section),
+                    coordinate: Coordinate::from_bytes(coordinate),
+                };
+                let cell = decode_body::<P>((data, prev, encoding, version, event))?;
+                if past_end(dir, &key, end.as_ref()) {
+                    break 'pages;
+                }
+                yield (key, cell);
             }
-            yield (key, cell);
+            match response.into_paging_control_flow() {
+                ControlFlow::Break(()) => break,
+                ControlFlow::Continue(next) => paging_state = next,
+            }
         }
     }
 }
 
-/// Applies a fetch hint to a cloned prepared statement. It does not cap
-/// results.
+/// Sets the fetch size on a cloned prepared statement.
 pub(super) fn scan_statement(
     statement: &PreparedStatement,
-    hint: Option<NonZeroUsize>,
+    size: NonZeroUsize,
 ) -> PreparedStatement {
     let mut statement = statement.clone();
-    if let Some(hint) = hint {
-        let requested = i32::try_from(hint.get().saturating_add(8)).unwrap_or(i32::MAX);
-        statement.set_page_size(requested.min(statement.get_page_size()));
-    }
+    statement.set_page_size(i32::try_from(size.get()).unwrap_or(i32::MAX));
     statement
 }
 

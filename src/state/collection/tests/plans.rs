@@ -319,7 +319,7 @@ async fn plan_fences_after_its_last_item() -> Result<()> {
                 })
                 .await;
             let plan = match limit {
-                Some(limit) => plan.with_limit(limit),
+                Some(limit) => plan.with_limit(Some(limit)),
                 None => plan,
             };
             let stream = plan.projected::<Values>();

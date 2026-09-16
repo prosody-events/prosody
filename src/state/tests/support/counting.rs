@@ -29,9 +29,8 @@ pub(crate) struct OpCounts {
     presence_scans: AtomicUsize,
     provisional_cell_at: AtomicUsize,
     provisional_many: AtomicUsize,
-    batch_width: AtomicUsize,
+    batch_widths: Mutex<Vec<usize>>,
     scan_hint: AtomicUsize,
-    scan_limit: AtomicUsize,
 }
 
 pub(crate) trait CountProjection: Projection {
@@ -139,16 +138,12 @@ impl<S> CountingCellStore<S> {
         self.counts.provisional_many.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn batch_width(&self) -> usize {
-        self.counts.batch_width.load(Ordering::Relaxed)
+    pub(crate) fn batch_widths(&self) -> Vec<usize> {
+        self.counts.batch_widths.lock().clone()
     }
 
     pub(crate) fn scan_hint(&self) -> usize {
         self.counts.scan_hint.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn scan_limit(&self) -> usize {
-        self.counts.scan_limit.load(Ordering::Relaxed)
     }
 
     pub(crate) fn reset(&self) {
@@ -168,9 +163,8 @@ impl<S> CountingCellStore<S> {
         self.counts.presence_scans.store(0, Ordering::Relaxed);
         self.counts.provisional_cell_at.store(0, Ordering::Relaxed);
         self.counts.provisional_many.store(0, Ordering::Relaxed);
-        self.counts.batch_width.store(0, Ordering::Relaxed);
+        self.counts.batch_widths.lock().clear();
         self.counts.scan_hint.store(0, Ordering::Relaxed);
-        self.counts.scan_limit.store(0, Ordering::Relaxed);
     }
 }
 
@@ -201,9 +195,6 @@ impl<S: CellRead<P>, P: CountProjection> CellRead<P> for CountingCellStore<S> {
                 scan.fetch_hint.map_or(0, NonZeroUsize::get),
                 Ordering::Relaxed,
             );
-            self.counts
-                .scan_limit
-                .store(scan.limit.unwrap_or(0), Ordering::Relaxed);
             CellRead::<P>::scan(&self.inner, collection, scan)
         }
     }
@@ -215,9 +206,7 @@ impl<S: CellRead<P>, P: CountProjection> CellRead<P> for CountingCellStore<S> {
         batch: &'a CoordinateBatch,
     ) -> Result<CacheBatch<P>, Self::Error> {
         P::batch(&self.counts).fetch_add(1, Ordering::Relaxed);
-        self.counts
-            .batch_width
-            .store(batch.len(), Ordering::Relaxed);
+        self.counts.batch_widths.lock().push(batch.len());
         CellRead::<P>::read_many(&self.inner, collection, section, batch).await
     }
 }

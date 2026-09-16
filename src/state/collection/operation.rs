@@ -117,7 +117,6 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
             ScanEdge::Unbounded,
             dir,
             ScanEdge::Unbounded,
-            None,
         )
     }
 
@@ -144,8 +143,8 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
             ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode(start)),
             dir,
             ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode(end)),
-            Some(limit),
         )
+        .with_limit(Some(limit))
     }
 
     /// The binding and captured engine state every managed plan carries.

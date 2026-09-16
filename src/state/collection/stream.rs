@@ -22,8 +22,8 @@ use crate::state::descriptor::{
     CellCodecError, CellStateError, CellType, ContextOf, FromSession, KeyOf, ResolvedOf,
 };
 use crate::state::order_codec::OrderedKeyCodec;
-use crate::state::store::{CELL_BATCH, CellBuffer};
-use crate::state::{RESOLVE_FANOUT, SHARD_FANOUT_CONCURRENCY, StateName, StateType};
+use crate::state::store::{CELL_BATCH, CellBuffer, FetchSchedule};
+use crate::state::{RESOLVE_FANOUT, StateName, StateType};
 use async_stream::try_stream;
 use futures::future::Either;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
@@ -158,18 +158,18 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
         start: ScanEdge<Coordinate>,
         dir: Direction,
         end: ScanEdge<Coordinate>,
-        limit: Option<NonZeroUsize>,
     ) -> Self {
         Self {
             base,
             source: Source::Range { start, dir, end },
-            limit,
+            limit: None,
         }
     }
 
-    /// Sets the maximum number of present items that the plan can yield.
-    pub(crate) fn with_limit(mut self, limit: NonZeroUsize) -> Self {
-        self.limit = Some(limit);
+    /// Bounds the present items the plan yields. A tighter limit wins, so a
+    /// caller limit can never widen a source window.
+    pub(crate) fn with_limit(mut self, limit: Option<NonZeroUsize>) -> Self {
+        self.limit = self.limit.into_iter().chain(limit).min();
         self
     }
 
@@ -212,13 +212,14 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
     }
 }
 
-/// Reads aligned chunks under admission. Projection starts after admission
-/// ends. Membership comes from the captured keys; each chunk reads current
-/// values. A whole chunk must project successfully before it emits any item.
+/// Reads aligned chunks under admission. The first chunk is sized to the
+/// limit, and each later chunk doubles up to `CELL_BATCH`, so a hole in the
+/// keyset costs at most one extra round trip per doubling. A whole chunk must
+/// project successfully before it emits any item.
 fn coordinate_source<S, T, P>(
     base: PlanBase<S>,
     keys: Vec<KeyOf<T>>,
-    fetch_hint: Option<NonZeroUsize>,
+    limit: Option<NonZeroUsize>,
 ) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
 where
     S: StateSession,
@@ -228,11 +229,9 @@ where
 {
     try_stream! {
         let mut keys = keys.into_iter().peekable();
-        let mut width = fetch_hint.map_or(CELL_BATCH, |limit| limit.get().min(CELL_BATCH));
+        let mut fetch = FetchSchedule::new(limit, CELL_BATCH);
         while keys.peek().is_some() {
-            let chunk: CellBuffer<_> = keys.by_ref().take(width).collect();
-            // Holes do not consume the result limit. Later fetches use full chunks.
-            width = CELL_BATCH;
+            let chunk: CellBuffer<_> = keys.by_ref().take(fetch.next().get()).collect();
             let slots = {
                 let mut inner = <S::Engine as sealed::ReadEngine<S>>::resume(
                     &base.session,
@@ -250,6 +249,9 @@ where
 
             let session = &base.session;
             let buffer = CellBuffer::with_capacity(chunk.len());
+            // `cooperative` is the only per-item budget checkpoint here. Tokio's `rt`
+            // feature is off, so `consume_budget` is uncallable. For `Presence` the
+            // wrapped future is a no-op; keep the wrapper. Do not re-litigate the window.
             let items = stream::iter(chunk.into_iter().zip(slots))
                 .map(|(key, slot)| cooperative(async move {
                     match slot {
@@ -287,13 +289,13 @@ where
 {
     try_stream! {
         <S::Engine as sealed::ReadEngine<S>>::fence(&base.session)?;
+        let window = limit.map_or(RESOLVE_FANOUT, |n| n.get().min(RESOLVE_FANOUT));
         let scan = Scan {
             section: base.section,
             start: start.as_ref(),
             dir,
             end: end.as_ref(),
-            limit: limit.map(NonZeroUsize::get),
-            fetch_hint: limit,
+            fetch_hint: limit.map(|n| n.saturating_add(window)),
         };
         let page = <S::Engine as sealed::Reads<S, P>>::page(
             &base.session, &base.plan, base.state_type, &base.name, scan,
@@ -306,7 +308,11 @@ where
                     .map_err(CellStateError::Key)?;
                 P::finish(session, key, payload).await
             }))
-            .buffered(SHARD_FANOUT_CONCURRENCY);
+            // Both drivers resolve under `RESOLVE_FANOUT`; the limit bounds the window
+            // so a small query does not over-pull the pager. `buffered` pulls up to
+            // `window` rows past the last yielded item, so the first page includes that
+            // headroom and an exact-limit query never fetches a second page.
+            .buffered(window);
         futures::pin_mut!(inner);
         while let Some(item) = inner.next().await {
             yield item?;

@@ -132,7 +132,7 @@ fn assembly(fx: &Fixture) -> Result<Bottom> {
 }
 
 /// Unified view soundness over `Overlay<Cached<CassandraStore>>`: point `get`s,
-/// range `scan`s (bounds, direction, limit, early-stop), dirty buffering, and
+/// range `scan`s (bounds, direction, early-stop), dirty buffering, and
 /// committed writes intermixed in one trace, all vs the sorted-map oracle
 /// (unified-view soundness and oracle-correctness properties).
 #[test]

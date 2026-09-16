@@ -432,8 +432,9 @@ where
     KC::Key: Display,
     V: CellType<Key = UnitKey>,
 {
-    /// Sets the maximum number of present items that the stream yields.
-    /// Missing cells do not consume the limit.
+    /// Bounds the present items the stream yields. Missing cells do not consume
+    /// the limit. The limit sizes the first fetch, so it also sets the first
+    /// error boundary.
     pub fn limit(mut self, limit: NonZeroUsize) -> Self {
         self.limit = Some(limit);
         self
@@ -456,7 +457,7 @@ where
             // as it returns, before this `?` observes the result.
             let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
             let plan = match self.limit {
-                Some(limit) => plan.with_limit(limit),
+                Some(limit) => plan.with_limit(Some(limit)),
                 None => plan,
             };
             let inner = plan.projected::<Values>();
@@ -477,7 +478,7 @@ where
         try_stream! {
             let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
             let plan = match self.limit {
-                Some(limit) => plan.with_limit(limit),
+                Some(limit) => plan.with_limit(Some(limit)),
                 None => plan,
             };
             let inner = plan.projected::<Presence>();
@@ -757,8 +758,10 @@ where
     /// # Per-arm consistency (a paged read, not a snapshot)
     ///
     /// A `Tracked` keyset within its bound is the fast arm: **key membership is
-    /// snapshotted at init** (the one keyset read), then the listed keys are
-    /// point-got in chunks of `CELL_BATCH`. Keys added after init are not
+    /// snapshotted at init** (the one keyset read). The listed keys are
+    /// point-got in chunks. A query limit sizes the first chunk; later chunks
+    /// double up to `CELL_BATCH`. A whole chunk projects before it emits, so a
+    /// limit also moves the first error boundary. Keys added after init are not
     /// yielded; **values are read live, chunk by chunk** — a key
     /// removed/cleared/expired after init reads absent (skipped, the
     /// current-membership skip) and an overwritten key yields the newer value
@@ -778,15 +781,14 @@ where
     /// scan.
     ///
     /// Session admission is taken at init for the keyset read. The tracked
-    /// (point) arm then takes it once per chunk, at most `CELL_BATCH` point
-    /// reads each: a chunk's admission covers its batch fetch, and is released
-    /// before the chunk is decoded and resolved. The degraded scan arm takes no
-    /// admission after init and pages gate-free. Neither arm holds admission
-    /// across a yield, for items and errors alike, so a handler may mutate this
-    /// map between stream items without deadlock (`StreamYieldFree`, over the
-    /// per-event session operation gate). Errors are chunk-atomic: a failing
-    /// chunk yields none of its items (all its live entries, or only its
-    /// error).
+    /// (point) arm then takes it once per chunk. Admission covers the batch
+    /// fetch and is released before the chunk is decoded and resolved. The
+    /// degraded scan arm takes no admission after init and pages gate-free.
+    /// Neither arm holds admission across a yield, for items and errors alike,
+    /// so a handler may mutate this map between stream items without deadlock
+    /// (`StreamYieldFree`, over the per-event session operation gate). A
+    /// failing chunk yields none of its items. A chunk emits all its live
+    /// entries or only its error.
     pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapStreamItem<KC, V>> + '_
     where
         for<'s> ContextOf<'s, V>: FromSession<'s, S>,
@@ -836,7 +838,7 @@ where
             .cells
             .read(async |op| {
                 op.range(MapKind::<KC, V>::ENTRIES, Direction::Forward)
-                    .with_limit(NonZeroUsize::MIN)
+                    .with_limit(Some(NonZeroUsize::MIN))
             })
             .await;
         let keys = plan.keys();

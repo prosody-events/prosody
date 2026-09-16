@@ -167,16 +167,16 @@ fn get_batch_probes_the_whole_batch_in_one_blocking_hop() -> Result<()> {
         // Each coordinate holds a DISTINCT payload (its own byte), so a
         // scattered/reversed result reddens the index-aligned asserts below —
         // identical payloads would false-pass a reorder bug.
-        for b in 0..u8::try_from(CELL_BATCH).unwrap_or(u8::MAX) {
+        for b in 0..u8::try_from(CELL_BATCH.get()).unwrap_or(u8::MAX) {
             cache
                 .put::<Values>(&c, &batch_cell(b), Committed::new(Some(bytes(b))), 0)
                 .await?;
         }
-        let batch = batch_of(0..u8::try_from(CELL_BATCH).unwrap_or(u8::MAX))?;
+        let batch = batch_of(0..u8::try_from(CELL_BATCH.get()).unwrap_or(u8::MAX))?;
         let hits = cache
             .get_batch::<Values>(&c, Section::new(0), &batch)
             .await?;
-        assert_eq!(hits.len(), CELL_BATCH, "every position answered");
+        assert_eq!(hits.len(), CELL_BATCH.get(), "every position answered");
         for (i, hit) in hits.iter().enumerate() {
             let want = bytes(u8::try_from(i).unwrap_or(u8::MAX));
             let CacheRead::Hit((committed, _)) = hit else {

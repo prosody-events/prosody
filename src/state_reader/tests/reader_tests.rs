@@ -176,7 +176,6 @@ async fn reader_reads_prev_in_commit_window() -> Result<()> {
         start: ScanEdge::Unbounded,
         dir: Direction::Forward,
         end: ScanEdge::Unbounded,
-        limit: None,
         fetch_hint: None,
     };
     let values =
@@ -291,7 +290,7 @@ async fn reader_range_probe_pins_second_source() -> Result<()> {
     let session = reader.session(key).await?;
     let handle = env.descriptor.bind(&session)?;
     assert!(!handle.is_empty().await?);
-    assert_eq!(env.cells.scan_bounds(), (1, 1));
+    assert_eq!(env.cells.scan_hint(), 2);
     assert_eq!((env.cells.reads(first), env.cells.reads(second)), (1, 1));
     assert_eq!(handle.get(&1).await?, Some(Value::from(7_i32)));
     assert_eq!((env.cells.reads(first), env.cells.reads(second)), (1, 2));

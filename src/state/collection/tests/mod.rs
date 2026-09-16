@@ -779,7 +779,7 @@ fn warm_reads_perform_no_additional_lower_reads() -> Result<()> {
 fn batch_reads_stay_aligned_across_the_store_batch_boundary() -> Result<()> {
     // One past a full batch, so the query spans exactly two sub-batches and
     // lands on the 127/128/129 boundary.
-    let populated = CELL_BATCH as i64 + 1;
+    let populated = CELL_BATCH.get() as i64 + 1;
     TEST_RUNTIME.block_on(async {
         let registry = value_registry(&probe_descriptor())?;
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("probe-key"));
@@ -797,9 +797,9 @@ fn batch_reads_stay_aligned_across_the_store_batch_boundary() -> Result<()> {
 
         // The boundary key at both ends, so a dropped or reordered sub-batch
         // cannot be masked by a palindromic query.
-        let queries: Vec<i64> = once(CELL_BATCH as i64)
+        let queries: Vec<i64> = once(CELL_BATCH.get() as i64)
             .chain(0..populated)
-            .chain(once(CELL_BATCH as i64))
+            .chain(once(CELL_BATCH.get() as i64))
             .collect();
         let answers = handle
             .cells

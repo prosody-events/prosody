@@ -190,24 +190,15 @@ impl<P: CassandraProjection> CellRead<P> for CassandraStore {
         collection: &'a CollectionId,
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, P::Payload), CellStoreError>> + Send + 'a {
-        let limit = scan.limit;
         try_stream! {
             let pages = page::<P>(&self.session, &self.queries, collection, scan);
             pin_mut!(pages);
 
             let mut lookup = EvidenceLookup::new(self, collection);
-            let mut yielded = 0usize;
             while let Some((key, raw)) = pages.try_next().await.map_err(ResolveCellError::Store)? {
-                // The limit bounds *yielded* (present) cells; check it before
-                // processing the next row so `Some(0)` yields nothing (an absent
-                // cell never consumes a slot — only a present yield does).
-                if limit.is_some_and(|n| yielded >= n) {
-                    break;
-                }
                 let committed = lookup.resolve(raw).await?;
                 if let Some(bytes) = committed.into_inner() {
                     yield (key, bytes);
-                    yielded += 1;
                 }
             }
         }

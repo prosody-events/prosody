@@ -148,12 +148,9 @@ fn prop_memory_cell_implicit_overwrite() {
     QuickCheck::new().quickcheck(property as fn(OverwriteTrace) -> Result<bool>);
 }
 
-/// Unified view soundness over `Overlay<MemoryCellStore>`: point `get`s, range
-/// `scan`s (bounded, bidirectional, limited, early-stopped), dirty buffering,
-/// and committed writes **intermixed** in one trace all match the
-/// dirty-over-committed oracle — dirty-wins, clear-hides, the dirty leg bounded
-/// to the scan range, the limit applied to the merge (unified-view soundness
-/// with point-range interleaving and oracle-correctness properties).
+/// Point reads and range scans match the dirty-over-committed oracle.
+/// The trace mixes bounded scans, both directions, early stops, dirty writes,
+/// and committed writes. Dirty values win, and dirty clears hide cells.
 #[test]
 fn prop_memory_overlay_view() {
     fn property(trace: OverlayTrace) -> Result<bool> {
@@ -189,7 +186,7 @@ fn prop_chunk_reassembly() {
         let batches: Vec<CoordinateBatch> = CoordinateBatch::chunks(input.clone()).collect();
         let mut flat: Vec<Coordinate> = Vec::new();
         for batch in &batches {
-            if batch.len() == 0 || batch.len() > CELL_BATCH {
+            if batch.len() == 0 || batch.len() > CELL_BATCH.get() {
                 return false;
             }
             flat.extend(batch.as_slice().iter().cloned());
@@ -197,7 +194,7 @@ fn prop_chunk_reassembly() {
         // All but the last batch are exactly CELL_BATCH.
         let full_prefix = batches
             .split_last()
-            .is_none_or(|(_, rest)| rest.iter().all(|b| b.len() == CELL_BATCH));
+            .is_none_or(|(_, rest)| rest.iter().all(|b| b.len() == CELL_BATCH.get()));
         flat == input && full_prefix && (input.is_empty() == batches.is_empty())
     }
     QuickCheck::new().quickcheck(property as fn(Vec<u8>) -> bool);
@@ -210,8 +207,8 @@ fn cell_buffers_spill_before_full_batch() {
     let small: CellBuffer<usize> = (0..CELLS_INLINE).collect();
     assert!(!small.spilled(), "the common small case stays inline");
 
-    let full: CellBuffer<usize> = (0..CELL_BATCH).collect();
-    assert_eq!(full.len(), CELL_BATCH);
+    let full: CellBuffer<usize> = (0..CELL_BATCH.get()).collect();
+    assert_eq!(full.len(), CELL_BATCH.get());
     assert!(
         full.spilled(),
         "a full batch must not remain inline in an async state machine"
@@ -490,7 +487,7 @@ fn map_cold_chunk_is_one_batch_read() -> Result<()> {
             ResolveCounter::default(),
         );
         let seed = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
-        for i in 0..CELL_BATCH as i64 {
+        for i in 0..CELL_BATCH.get() as i64 {
             seed.set(i, Value::from(i))
                 .await
                 .map_err(|e| eyre!("{e}"))?;
@@ -520,7 +517,7 @@ fn map_cold_chunk_is_one_batch_read() -> Result<()> {
             }
             out
         };
-        assert_eq!(drained.len(), CELL_BATCH, "all entries drained");
+        assert_eq!(drained.len(), CELL_BATCH.get(), "all entries drained");
         assert_eq!(
             counting.batch_reads(),
             1,
@@ -1570,7 +1567,7 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
         "take(k) yields exactly k.min(n) entries"
     );
     assert!(
-        counting.batch_reads() <= k.div_ceil(CELL_BATCH) + 1,
+        counting.batch_reads() <= k.div_ceil(CELL_BATCH.get()) + 1,
         "a lazy map take(k) issues at most one batch read beyond k (batches={}, k={k}, n={n})",
         counting.batch_reads()
     );
@@ -1582,7 +1579,7 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
         counting.lower_reads()
     );
     assert!(
-        resolves.resolves() <= k + CELL_BATCH,
+        resolves.resolves() <= k + CELL_BATCH.get(),
         "a lazy map take(k) resolves at most k + one chunk (resolves={}, k={k}, n={n})",
         resolves.resolves()
     );
@@ -1663,7 +1660,7 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
         "take(k) yields exactly k.min(n) elements"
     );
     assert!(
-        counting.batch_reads() <= k.div_ceil(CELL_BATCH) + 1,
+        counting.batch_reads() <= k.div_ceil(CELL_BATCH.get()) + 1,
         "a lazy deque take(k) issues at most one batch read beyond k (batches={}, k={k}, n={n})",
         counting.batch_reads()
     );
@@ -1675,7 +1672,7 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
         counting.lower_reads()
     );
     assert!(
-        resolves.resolves() <= k + CELL_BATCH,
+        resolves.resolves() <= k + CELL_BATCH.get(),
         "a lazy deque take(k) resolves at most k + one chunk (resolves={}, k={k}, n={n})",
         resolves.resolves()
     );
@@ -1961,7 +1958,6 @@ async fn check_memory_read_parity(
             start: ScanEdge::Unbounded,
             end: ScanEdge::Unbounded,
             dir,
-            limit: None,
             fetch_hint: None,
         };
         let rows: Vec<_> = CellRead::<Values>::scan(store, id, scan)

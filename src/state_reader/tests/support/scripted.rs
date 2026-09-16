@@ -100,7 +100,6 @@ pub(in crate::state_reader::tests) enum FaultPoint {
 pub(crate) struct ScriptedCellSource {
     inner: MemoryCells,
     scan_hint: Arc<AtomicUsize>,
-    scan_limit: Arc<AtomicUsize>,
     faults: Arc<scc::HashMap<SegmentId, FaultPoint, RandomState>>,
     /// Per-source committed-read counter — the source-call trace. Cloning
     /// shares it, so a test reads the count after moving the source into a
@@ -155,11 +154,8 @@ impl ScriptedCellSource {
             .unwrap_or(0)
     }
 
-    pub(in crate::state_reader::tests) fn scan_bounds(&self) -> (usize, usize) {
-        (
-            self.scan_hint.load(Ordering::Relaxed),
-            self.scan_limit.load(Ordering::Relaxed),
-        )
+    pub(in crate::state_reader::tests) fn scan_hint(&self) -> usize {
+        self.scan_hint.load(Ordering::Relaxed)
     }
 
     fn record_read(&self, segment: SegmentId) {
@@ -212,8 +208,6 @@ impl ScriptedCellSource {
             scan.fetch_hint.map_or(0, NonZeroUsize::get),
             Ordering::Relaxed,
         );
-        self.scan_limit
-            .store(scan.limit.unwrap_or(0), Ordering::Relaxed);
         let segment = id.state_key().segment_id;
         self.record_read(segment);
         let fault = self.fault_of(segment);

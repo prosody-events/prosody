@@ -910,7 +910,7 @@ const GET_MANY_QUERY_HI: i64 = 24;
 /// Max query-list length. Derived from [`CELL_BATCH`] rather than hand-numbered
 /// so the "spans more than one sub-batch" claim below cannot rot when the store
 /// batch width moves.
-const GET_MANY_MAX_QUERIES: usize = CELL_BATCH + 32;
+const GET_MANY_MAX_QUERIES: usize = CELL_BATCH.get() + 32;
 
 /// A random map population plus a random query list for the `Map::get_many`
 /// parity property. The independent pools guarantee absent keys; a small query
@@ -1634,7 +1634,7 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
 
     // Tracked lists the key; Overflowed degrades to the full-section scan. Both
     // reach the same present-but-undecodable cell.
-    let tracked = Bytes::from(tracked_frame(&[key, key + 1]));
+    let tracked = Bytes::from(tracked_frame(&[key - 1, key, key + 1, key + 2]));
     let overflowed = Bytes::from(OVERFLOWED_FRAME.to_vec());
     for (tracked_route, keyset_frame) in [(true, tracked), (false, overflowed)] {
         let dedup = MemoryDeduplicationStore::default();
@@ -1667,12 +1667,7 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
 
         block_on(async {
             assert!(!handle.is_empty().await?);
-            assert_eq!(counting.scan_hint(), 1);
-            assert_eq!(
-                counting.scan_limit(),
-                0,
-                "the overlay removes the result limit"
-            );
+            assert_eq!(counting.scan_hint(), 2);
             assert_eq!(counting.visible_point_reads(), 0);
             assert_eq!(counting.batch_reads(), 0);
             assert_eq!(counting.presence_reads(), 0);
@@ -1733,10 +1728,9 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
 
 fn assert_limited_fetch(counting: &CountingCellStore<MemoryCellStore>, tracked: bool) {
     if tracked {
-        assert_eq!(counting.batch_width(), 1);
+        assert_eq!(counting.batch_widths(), [1, 2]);
     } else {
-        assert_eq!(counting.scan_hint(), 1);
-        assert_eq!(counting.scan_limit(), 0);
+        assert_eq!(counting.scan_hint(), 2);
     }
 }
 

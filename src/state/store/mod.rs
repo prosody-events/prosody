@@ -25,6 +25,7 @@ use bytes::Bytes;
 use futures::Stream;
 use std::error::Error;
 use std::future::Future;
+use std::num::NonZeroUsize;
 
 pub(crate) use super::store_helpers::{
     dedupe, expand_to_input_order, provisional_point_loop, section_batches,
@@ -32,6 +33,36 @@ pub(crate) use super::store_helpers::{
 };
 pub(crate) use super::store_types::CELL_BATCH;
 pub use super::store_types::{CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch, Durable};
+
+/// Sizes the fetches of one read. The first fetch equals the caller's
+/// expectation, capped at the transport maximum. Each later fetch doubles,
+/// up to that maximum. Rows a filter hides therefore cost O(log n) extra
+/// round trips, never one round trip per hidden row.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FetchSchedule {
+    next: NonZeroUsize,
+    max: NonZeroUsize,
+}
+
+impl FetchSchedule {
+    /// `first` is the expected result count. `None` means no expectation, so
+    /// every fetch is `max`.
+    pub(crate) fn new(first: Option<NonZeroUsize>, max: NonZeroUsize) -> Self {
+        Self {
+            next: first.unwrap_or(max).min(max),
+            max,
+        }
+    }
+
+    /// Returns the size of the next fetch and advances the schedule.
+    pub(crate) fn next(&mut self) -> NonZeroUsize {
+        let next = self.next;
+        self.next = next
+            .saturating_mul(NonZeroUsize::MIN.saturating_add(1))
+            .min(self.max);
+        next
+    }
+}
 
 /// One error type for every cell read and mutation.
 pub trait CellBackend: Clone + Send + Sync + 'static {
@@ -280,3 +311,6 @@ pub trait CellStore: CellRead<Values> + CellRead<Presence> {
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 }
+
+#[cfg(test)]
+mod tests;
