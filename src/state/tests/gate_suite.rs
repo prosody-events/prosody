@@ -1862,7 +1862,7 @@ fn map_item_terminated(item: &MapStateError<JsonCodecError>) -> bool {
 /// not the source (which keeps producing). The first item crosses pre-bump; the
 /// range source holds no admission, so the `reset` between pulls bumps
 /// immediately. Red proven by dropping the `fenced(...)` wrapper in
-/// `RangePlan::entries` (return the raw source): the post-bump pull then
+/// `Plan::projected` (return the raw source): the post-bump pull then
 /// yields a second `Ok` item.
 #[test]
 fn range_scan_stream_fences_after_bump() -> Result<()> {
@@ -1909,7 +1909,7 @@ fn range_scan_stream_fences_after_bump() -> Result<()> {
 /// yield; a buffered entry never crosses the fence after an observed bump. Both
 /// keys land in one chunk (`CELL_BATCH >= 2`), so the first entry's fence
 /// check passes pre-bump and the second's runs post-bump. Red proven by
-/// dropping the `fenced(...)` wrapper in `CoordinatePlan::entries`: the
+/// dropping the `fenced(...)` wrapper in `Plan::projected`: the
 /// buffered second entry then crosses as an `Ok`.
 #[test]
 fn coordinate_stream_fences_buffered_entries_after_bump() -> Result<()> {

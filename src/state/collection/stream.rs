@@ -11,27 +11,23 @@
 //! A plan carries no admission and no operation. The owner reacquires the gate
 //! per coordinate chunk and pages a range gate-free; the reader carries the
 //! source its planning command selected, so a chunk can never re-probe or
-//! change source mid-stream. A range plan also carries the span that its
-//! planning command chose. That span is the whole section or one bounded
-//! window.
+//! change source mid-stream. A range source carries the whole section
+//! or the bounded window that its planning command chose.
 
 use super::operation::read_keys;
 use super::{StateSession, resolve_cell, sealed};
 use crate::state::cell::{Presence, Projection, Values};
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
+use crate::state::cell_key::{Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::descriptor::{
     CellCodecError, CellStateError, CellType, ContextOf, FromSession, KeyOf, ResolvedOf,
 };
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::store::{CELL_BATCH, CellBuffer};
-use crate::state::{
-    RESOLVE_FANOUT, SHARD_FANOUT_CONCURRENCY, StateAccessError, StateName, StateType,
-};
+use crate::state::{RESOLVE_FANOUT, SHARD_FANOUT_CONCURRENCY, StateName, StateType};
 use async_stream::try_stream;
 use futures::future::Either;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use std::future::{Future, ready};
-use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use tokio::task::coop::cooperative;
 
@@ -122,184 +118,42 @@ impl<S: StateSession> PlanBase<S> {
     }
 }
 
-/// A managed point-get plan: the keys a metadata command enumerated, read back
-/// in gate-scoped chunks of [`CELL_BATCH`], skipping the ones that read absent.
-/// This driver owns the point-get chunk width, and every collection's point-get
-/// stream arm runs on it.
-///
-/// The chunk width is the granularity of both the per-chunk admission and the
-/// batch read. ONE aligned batch read fetches a chunk's cells (one Cassandra
-/// query, or one fjall hop), and the typed resolves then fan out under
-/// `RESOLVE_FANOUT`. Admission covers that raw batch read only: the owner takes
-/// one per chunk and releases it before the chunk's resolves, and a published
-/// reader holds no gate at all.
-///
-/// Membership is snapshotted at planning; values are read live, chunk by chunk.
-/// A key that disappears between planning and its chunk reads absent and is
-/// skipped — the uniform skip every coordinate source applies to TTL holes,
-/// popped positions, and membership races alike.
-pub(crate) struct CoordinatePlan<S: StateSession, T: CellType> {
-    base: PlanBase<S>,
-    keys: Vec<KeyOf<T>>,
-    limit: Option<NonZeroUsize>,
+/// A stream source contains either ordered keys or direction-relative range
+/// bounds. The collection selects it from stored metadata before execution
+/// starts.
+enum Source<K> {
+    Points(Vec<K>),
+    Range {
+        start: ScanEdge<Coordinate>,
+        dir: Direction,
+        end: ScanEdge<Coordinate>,
+    },
 }
 
-/// A managed durable-range plan: one contiguous span of one section, walked in
-/// `dir` order. It pages gate-free and cannot repair. A collection takes this
-/// plan when it has no coordinate enumeration to point-get.
+/// A captured collection read with a source and an optional result limit.
 ///
-/// The planning command chooses the span. `Unbounded` edges with no limit walk
-/// the whole section. That is the fallback for a collection that cannot say
-/// where its cells are.
-///
-/// A collection with a contiguous coordinate window plans a narrower span
-/// instead. A Deque converts its half-open window `[head, tail)` to the
-/// inclusive span `[head, tail − 1]` and adds the window's own limit. The walk
-/// then reads no row outside the window.
-pub(crate) struct RangePlan<S: StateSession, T> {
+/// Each terminal applies the limit after absent cells have been removed.
+/// The final attempt fence covers every completion, including exhaustion.
+/// Source drivers cannot emit directly to the caller.
+pub(crate) struct Plan<S: StateSession, T: CellType> {
     base: PlanBase<S>,
-    start: ScanEdge<Coordinate>,
-    dir: Direction,
-    end: ScanEdge<Coordinate>,
+    source: Source<KeyOf<T>>,
     limit: Option<NonZeroUsize>,
-    _cell: PhantomData<fn() -> T>,
-}
-
-/// The arm a collection's stream method takes, as the owned plan its planning
-/// invocation captured. The two members carry the per-kind semantics; a
-/// collection chooses between them in its planning method and drives the choice
-/// through here.
-///
-/// A collection that enumerated no live coordinate plans an empty
-/// [`Points`](Self::Points) arm: zero point gets and no scan. Its exhaustion
-/// still passes the stream fence.
-pub(crate) enum Plan<S: StateSession, T: CellType> {
-    /// Point-get each planned coordinate, in plan order. A backward stream
-    /// reverses the coordinate list at plan time.
-    Points(CoordinatePlan<S, T>),
-
-    /// Walk one durable range.
-    Scan(RangePlan<S, T>),
 }
 
 impl<S: StateSession, T: CellType> Plan<S, T> {
-    /// Sets the maximum number of present items that the plan can yield.
-    ///
-    /// Both query terminals apply this limit to either plan.
-    pub(crate) fn with_limit(mut self, limit: NonZeroUsize) -> Self {
-        match &mut self {
-            Self::Points(plan) => plan.limit = Some(limit),
-            Self::Scan(plan) => plan.limit = Some(limit),
-        }
-        self
-    }
-
-    /// Drives the selected source with one compile-time projection.
-    pub(crate) fn projected<P>(self) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
-    where
-        P: StreamProjection<S, T>,
-        S::Engine: sealed::Reads<S, P>,
-    {
-        match self {
-            Self::Points(plan) => Either::Left(plan.projected::<P>()),
-            Self::Scan(plan) => Either::Right(plan.projected::<P>()),
-        }
-    }
-
-    /// Drives the planned arm and resolves each live entry.
-    pub(crate) fn entries(self) -> impl Stream<Item = ScanItem<T>> + Send
-    where
-        for<'s> ContextOf<'s, T>: FromSession<'s, S>,
-    {
-        self.projected::<Values>()
-    }
-}
-
-impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
-    /// Builds the plan over the planning invocation's captured state.
-    pub(super) fn new(base: PlanBase<S>, keys: Vec<KeyOf<T>>) -> Self {
+    /// Captures keys in their required output order. An empty list performs no
+    /// read.
+    pub(super) fn coordinates(base: PlanBase<S>, keys: Vec<KeyOf<T>>) -> Self {
         Self {
             base,
-            keys,
+            source: Source::Points(keys),
             limit: None,
         }
     }
 
-    /// Streams projected items under the per-emission attempt fence.
-    pub(crate) fn projected<P>(self) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
-    where
-        P: StreamProjection<S, T>,
-        S::Engine: sealed::Reads<S, P>,
-    {
-        let session = self.base.session.clone();
-        let limit = self.limit.map_or(usize::MAX, NonZeroUsize::get);
-        fenced::<S, _, T>(session, self.source::<P>().take(limit))
-    }
-
-    /// Reads each chunk under admission, then resolves it before any emission.
-    fn source<P>(self) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
-    where
-        P: StreamProjection<S, T>,
-        S::Engine: sealed::Reads<S, P>,
-    {
-        try_stream! {
-            let Self { base, keys, limit } = self;
-            let mut keys = keys.into_iter().peekable();
-            let mut width = limit.map_or(CELL_BATCH, |limit| limit.get().min(CELL_BATCH));
-            while keys.peek().is_some() {
-                let chunk: CellBuffer<_> = keys.by_ref().take(width).collect();
-                // Holes do not consume the result limit. Later fetches use full chunks.
-                width = CELL_BATCH;
-                let slots = {
-                    let mut inner = <S::Engine as sealed::ReadEngine<S>>::resume(
-                        &base.session,
-                        &base.plan,
-                    ).await;
-                    read_keys::<S, T, P>(
-                        &base.session,
-                        &mut inner,
-                        base.state_type,
-                        &base.name,
-                        base.section,
-                        &chunk,
-                    ).await.map_err(CellStateError::Access)?
-                };
-
-                let session = &base.session;
-                let buffer = CellBuffer::with_capacity(chunk.len());
-                let items = stream::iter(chunk.into_iter().zip(slots))
-                    .map(|(key, slot)| cooperative(async move {
-                        match slot {
-                            Some(payload) => P::finish(session, key, payload).await.map(Some),
-                            None => Ok(None),
-                        }
-                    }))
-                    .buffered(RESOLVE_FANOUT)
-                    .try_fold(buffer, |mut items, item| {
-                        if let Some(item) = item {
-                            items.push(item);
-                        }
-                        ready(Ok(items))
-                    }).await?;
-                for item in items {
-                    yield item;
-                }
-            }
-        }
-    }
-}
-
-impl<S: StateSession, T: CellType> RangePlan<S, T> {
-    /// Sets the maximum number of present cells and the preferred fetch size.
-    pub(crate) fn with_limit(mut self, limit: NonZeroUsize) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    /// Builds the plan over the planning invocation's captured state. The plan
-    /// walks `[start, end]` and yields at most `limit` cells. The edges are
-    /// direction-relative, exactly as [`Scan`] defines them.
-    pub(super) fn new(
+    /// Captures one range within the collection section.
+    pub(super) fn range(
         base: PlanBase<S>,
         start: ScanEdge<Coordinate>,
         dir: Direction,
@@ -308,76 +162,154 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
     ) -> Self {
         Self {
             base,
-            start,
-            dir,
-            end,
+            source: Source::Range { start, dir, end },
             limit,
-            _cell: PhantomData,
         }
     }
 
-    /// Opens the plan's durable page over its planned span. It borrows the
-    /// whole plan once, so the [`Scan`]'s edges name the plan's own owned
-    /// coordinates.
-    fn page<P: Projection>(
-        &self,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + '_
-    where
-        S::Engine: sealed::Reads<S, P>,
-    {
-        let scan = Scan {
-            section: self.base.section,
-            start: self.start.as_ref(),
-            dir: self.dir,
-            end: self.end.as_ref(),
-            limit: self.limit.map(NonZeroUsize::get),
-            fetch_hint: self.limit,
-        };
-        <S::Engine as sealed::Reads<S, P>>::page(
-            &self.base.session,
-            &self.base.plan,
-            self.base.state_type,
-            &self.base.name,
-            scan,
-        )
+    /// Sets the maximum number of present items that the plan can yield.
+    pub(crate) fn with_limit(mut self, limit: NonZeroUsize) -> Self {
+        self.limit = Some(limit);
+        self
     }
 
-    /// Streams projected items under the per-emission attempt fence.
+    /// Selects one concrete driver, then applies the shared limit and attempt
+    /// fence.
     pub(crate) fn projected<P>(self) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
     where
         P: StreamProjection<S, T>,
         S::Engine: sealed::Reads<S, P>,
     {
-        let session = self.base.session.clone();
-        fenced::<S, _, T>(session, self.source::<P>())
+        let Self {
+            base,
+            source,
+            limit,
+        } = self;
+        let session = base.session.clone();
+        let inner = match source {
+            Source::Points(keys) => Either::Left(coordinate_source::<S, T, P>(base, keys, limit)),
+            Source::Range { start, dir, end } => {
+                Either::Right(range_source::<S, T, P>(base, start, dir, end, limit))
+            }
+        };
+        fenced::<S, _, T>(
+            session,
+            inner.take(limit.map_or(usize::MAX, NonZeroUsize::get)),
+        )
+    }
+
+    /// Resolves each live entry in source order.
+    pub(crate) fn entries(self) -> impl Stream<Item = ScanItem<T>> + Send
+    where
+        for<'s> ContextOf<'s, T>: FromSession<'s, S>,
+    {
+        self.projected::<Values>()
     }
 
     /// Streams live keys without value decode or resolution.
     pub(crate) fn keys(self) -> impl Stream<Item = KeyItem<T>> + Send {
         self.projected::<Presence>()
     }
+}
 
-    /// Decodes coordinates and projects each cell through an ordered window.
-    fn source<P>(self) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
-    where
-        P: StreamProjection<S, T>,
-        S::Engine: sealed::Reads<S, P>,
-    {
-        try_stream! {
-            <S::Engine as sealed::ReadEngine<S>>::fence(&self.base.session)?;
-            let session = &self.base.session;
-            let inner = self.page::<P>()
-                .map(|item| cooperative(async move {
-                    let (cell, payload) = item?;
-                    let key = <T::Key as OrderedKeyCodec>::decode(cell.coordinate.as_bytes())
-                        .map_err(CellStateError::Key)?;
-                    P::finish(session, key, payload).await
+/// Reads aligned chunks under admission. Projection starts after admission
+/// ends. Membership comes from the captured keys; each chunk reads current
+/// values. A whole chunk must project successfully before it emits any item.
+fn coordinate_source<S, T, P>(
+    base: PlanBase<S>,
+    keys: Vec<KeyOf<T>>,
+    fetch_hint: Option<NonZeroUsize>,
+) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
+where
+    S: StateSession,
+    T: CellType,
+    P: StreamProjection<S, T>,
+    S::Engine: sealed::Reads<S, P>,
+{
+    try_stream! {
+        let mut keys = keys.into_iter().peekable();
+        let mut width = fetch_hint.map_or(CELL_BATCH, |limit| limit.get().min(CELL_BATCH));
+        while keys.peek().is_some() {
+            let chunk: CellBuffer<_> = keys.by_ref().take(width).collect();
+            // Holes do not consume the result limit. Later fetches use full chunks.
+            width = CELL_BATCH;
+            let slots = {
+                let mut inner = <S::Engine as sealed::ReadEngine<S>>::resume(
+                    &base.session,
+                    &base.plan,
+                ).await;
+                read_keys::<S, T, P>(
+                    &base.session,
+                    &mut inner,
+                    base.state_type,
+                    &base.name,
+                    base.section,
+                    &chunk,
+                ).await.map_err(CellStateError::Access)?
+            };
+
+            let session = &base.session;
+            let buffer = CellBuffer::with_capacity(chunk.len());
+            let items = stream::iter(chunk.into_iter().zip(slots))
+                .map(|(key, slot)| cooperative(async move {
+                    match slot {
+                        Some(payload) => P::finish(session, key, payload).await.map(Some),
+                        None => Ok(None),
+                    }
                 }))
-                .buffered(SHARD_FANOUT_CONCURRENCY);
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().await {
-                yield item?;
+                .buffered(RESOLVE_FANOUT)
+                .try_fold(buffer, |mut items, item| {
+                    if let Some(item) = item {
+                        items.push(item);
+                    }
+                    ready(Ok(items))
+                }).await?;
+            for item in items {
+                yield item;
             }
+        }
+    }
+}
+
+/// Scans without admission and projects cells through an ordered window.
+fn range_source<S, T, P>(
+    base: PlanBase<S>,
+    start: ScanEdge<Coordinate>,
+    dir: Direction,
+    end: ScanEdge<Coordinate>,
+    limit: Option<NonZeroUsize>,
+) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
+where
+    S: StateSession,
+    T: CellType,
+    P: StreamProjection<S, T>,
+    S::Engine: sealed::Reads<S, P>,
+{
+    try_stream! {
+        <S::Engine as sealed::ReadEngine<S>>::fence(&base.session)?;
+        let scan = Scan {
+            section: base.section,
+            start: start.as_ref(),
+            dir,
+            end: end.as_ref(),
+            limit: limit.map(NonZeroUsize::get),
+            fetch_hint: limit,
+        };
+        let page = <S::Engine as sealed::Reads<S, P>>::page(
+            &base.session, &base.plan, base.state_type, &base.name, scan,
+        );
+        let session = &base.session;
+        let inner = page
+            .map(|item| cooperative(async move {
+                let (cell, payload) = item?;
+                let key = <T::Key as OrderedKeyCodec>::decode(cell.coordinate.as_bytes())
+                    .map_err(CellStateError::Key)?;
+                P::finish(session, key, payload).await
+            }))
+            .buffered(SHARD_FANOUT_CONCURRENCY);
+        futures::pin_mut!(inner);
+        while let Some(item) = inner.next().await {
+            yield item?;
         }
     }
 }
@@ -415,7 +347,7 @@ where
     X: Send,
     T: CellType,
 {
-    // Heap-hold the source's state machine (the chunk unfold or the `buffered`
+    // Heap-hold the source's state machine (the chunk loop or the `buffered`
     // resolution window): it is the large part, so boxing it keeps the fence
     // adapter — and every collection stream that embeds it — a small future
     // (large-future stack bloat, not a per-item cost). One bounded allocation

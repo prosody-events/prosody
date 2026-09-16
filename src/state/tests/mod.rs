@@ -451,7 +451,7 @@ fn memory_overlay_precedence_set_beats_section_clear() -> Result<()> {
 /// exactly ONE lower batch read for its entries — a full-width scan chunk is
 /// one [`CoordinateBatch`], one lower `get_many`; only the keyset meta cell
 /// stays a point read.
-/// Falsification: Replace `CoordinatePlan` batch reads with per-key `get`
+/// Falsification: Replace coordinate batch reads with per-key `get`
 /// calls. Then `batch_reads` becomes zero and both read-count asserts fail.
 #[test]
 fn map_cold_chunk_is_one_batch_read() -> Result<()> {
@@ -1494,7 +1494,7 @@ fn resolve_session(
 /// fetches and the counting resolver bounds the resolutions. Both counters sit
 /// at the lowest layer, so nothing masks a materialization.
 ///
-/// Falsification: Make `CoordinatePlan::source` consume all tracked keys.
+/// Falsification: Make the coordinate source consume all tracked keys.
 /// Then the read and resolver counts exceed their bounds, and both asserts
 /// fail. A larger `CELL_BATCH` cannot falsify: the bound moves with it.
 async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
@@ -1595,7 +1595,7 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
 /// batch verb; only the bounds meta cell is a point read) and at most
 /// `k + CELL_BATCH` resolved.
 ///
-/// Falsification: Make `CoordinatePlan::source` consume all tracked keys.
+/// Falsification: Make the coordinate source consume all tracked keys.
 /// Then the read and resolver counts exceed their bounds, and both asserts
 /// fail. A larger `CELL_BATCH` cannot falsify: the bound moves with it.
 async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {

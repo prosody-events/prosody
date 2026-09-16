@@ -2,9 +2,8 @@
 
 use super::stream::PlanBase;
 use super::{
-    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, CoordinatePlan,
-    RangePlan, StateSession, WritableStateSession, cell_key, encode_cell, resolve_batch,
-    resolve_cell, sealed, sealed_ops,
+    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, Plan, StateSession,
+    WritableStateSession, cell_key, encode_cell, resolve_batch, resolve_cell, sealed, sealed_ops,
 };
 use crate::state::access::StateAccessError;
 use crate::state::cell::{Presence, Projection, Values};
@@ -101,8 +100,8 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
         &self,
         family: CellFamily<L, T>,
         keys: Vec<KeyOf<T>>,
-    ) -> CoordinatePlan<S, T> {
-        CoordinatePlan::new(self.plan_base(family.section()), keys)
+    ) -> Plan<S, T> {
+        Plan::coordinates(self.plan_base(family.section()), keys)
     }
 
     /// Plans a managed durable range over the whole of `family`'s section, in
@@ -112,8 +111,8 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
         &self,
         family: CellFamily<L, T>,
         dir: Direction,
-    ) -> RangePlan<S, T> {
-        RangePlan::new(
+    ) -> Plan<S, T> {
+        Plan::range(
             self.plan_base(family.section()),
             ScanEdge::Unbounded,
             dir,
@@ -139,8 +138,8 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
         dir: Direction,
         end: &KeyOf<T>,
         limit: NonZeroUsize,
-    ) -> RangePlan<S, T> {
-        RangePlan::new(
+    ) -> Plan<S, T> {
+        Plan::range(
             self.plan_base(family.section()),
             ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode(start)),
             dir,

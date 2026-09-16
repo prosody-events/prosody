@@ -2893,11 +2893,8 @@ fn check_map_yield(
 /// before any mutator runs, so a yielded key must be a seed key and its value
 /// one held there at some point (values are read live, chunk by chunk). Every
 /// op is bounded by [`INTERLEAVE_HANG_GUARD`] — the only deadline, never the
-/// assertion. Falsification: hold the chunk's admission across the yield by
-/// returning it in `CoordinatePlan`'s unfold state (`Some((entries, inner,
-/// keys))`) so it lives into the forwarding loop → the first mutator after an
-/// `Advance` blocks on the gate the suspended generator holds → the hang-guard
-/// elapses → red.
+/// assertion. To falsify this test, hold chunk admission across a yield.
+/// The next mutation then blocks until the test deadline expires.
 pub(crate) async fn run_map_stream_interleave(input: MapInterleave) -> Result<bool> {
     let MapInterleave { steps, backward } = input;
     let dir = if backward {

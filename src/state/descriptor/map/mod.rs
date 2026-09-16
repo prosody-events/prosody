@@ -262,7 +262,7 @@ impl Codec for MapKeysetKey {
 ///
 /// A **live entry cell implies a present keyset cell** — equivalently, an
 /// absent keyset implies no live entries, so `stream` may return empty with
-/// zero entry reads (an empty [`Points`](Plan::Points) plan — zero
+/// zero entry reads (an empty coordinate plan — zero
 /// coordinates, so no point gets and no scan). Three rules hold it:
 ///
 /// * every `set` leaves a keyset cell present. It writes one whenever the
@@ -696,7 +696,7 @@ where
     ///
     /// An **absent** keyset means no live entries
     /// ([`KeysetPresence`](Keyset)). The stream then takes an empty
-    /// [`Points`](Plan::Points) plan: zero coordinates, so zero point gets and
+    /// coordinate plan: zero coordinates, so zero point gets and
     /// no scan.
     ///
     /// A `Tracked` keyset becomes the chunked point-get arm, with the keys in
@@ -717,14 +717,12 @@ where
             // Absent ⇒ no live entries: an empty tracked plan — zero
             // coordinates, so zero point gets and no scan.
             PriorKeyset::Absent => {
-                return Ok(Plan::Points(
-                    op.coordinates(MapKind::<KC, V>::ENTRIES, Vec::new()),
-                ));
+                return Ok(op.coordinates(MapKind::<KC, V>::ENTRIES, Vec::new()));
             }
             // Overflowed falls to the scan with no warning; Malformed already
             // warned in `read_keyset_state`.
             PriorKeyset::Malformed | PriorKeyset::Decoded(Keyset::Overflowed) => {
-                return Ok(Plan::Scan(op.range(MapKind::<KC, V>::ENTRIES, dir)));
+                return Ok(op.range(MapKind::<KC, V>::ENTRIES, dir));
             }
             PriorKeyset::Decoded(Keyset::Tracked(coordinates)) => coordinates,
         };
@@ -734,7 +732,7 @@ where
                 "map keyset frame is oversized for the registered limit; degrading to the \
                  full-section scan until the next set heals it"
             );
-            return Ok(Plan::Scan(op.range(MapKind::<KC, V>::ENTRIES, dir)));
+            return Ok(op.range(MapKind::<KC, V>::ENTRIES, dir));
         }
         let Some(mut keys) = decoded_key_list::<KC>(&coordinates) else {
             warn!(
@@ -742,16 +740,14 @@ where
                 "map keyset holds a coordinate that is not canonical for its key codec; degrading \
                  to the full-section scan until the next set heals it"
             );
-            return Ok(Plan::Scan(op.range(MapKind::<KC, V>::ENTRIES, dir)));
+            return Ok(op.range(MapKind::<KC, V>::ENTRIES, dir));
         };
         // Coordinates are stored strictly ascending, so forward is key order
         // and backward is its reverse — no read-time sort.
         if dir == Direction::Backward {
             keys.reverse();
         }
-        Ok(Plan::Points(
-            op.coordinates(MapKind::<KC, V>::ENTRIES, keys),
-        ))
+        Ok(op.coordinates(MapKind::<KC, V>::ENTRIES, keys))
     }
 
     /// Streams the live entries in key order — ascending for

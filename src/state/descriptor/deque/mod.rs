@@ -402,13 +402,7 @@ where
                 Direction::Forward => (window.head, last),
                 Direction::Backward => (last, window.head),
             };
-            return Ok(Plan::Scan(op.range_within(
-                DequeKind::<T>::ENTRIES,
-                &start,
-                dir,
-                &end,
-                limit,
-            )));
+            return Ok(op.range_within(DequeKind::<T>::ENTRIES, &start, dir, &end, limit));
         }
         // Point-get arm. `absolute` is monotone in the position. One check of
         // the extreme index therefore proves that every position in `[0, len)`
@@ -426,9 +420,7 @@ where
         if dir == Direction::Backward {
             indices.reverse();
         }
-        Ok(Plan::Points(
-            op.coordinates(DequeKind::<T>::ENTRIES, indices),
-        ))
+        Ok(op.coordinates(DequeKind::<T>::ENTRIES, indices))
     }
 
     /// Streams the live elements in index order — front to back for
