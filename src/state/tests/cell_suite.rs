@@ -4,6 +4,9 @@
 //! event. Physical probes check marker rows, provisional cells, and committed
 //! absence.
 
+use crate::state::cell::{Presence, Projection, Values};
+use crate::state::store::{CellBackend, CellRead, Durable};
+
 use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use super::super::dirty::DirtyStore;
@@ -13,7 +16,7 @@ use super::super::memory::MemoryCells;
 use super::super::overlay::Overlay;
 use super::super::resolve::{EvidenceLookup, resolve_event_marker};
 use super::super::store::{
-    CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, provisional_point_loop,
+    CELL_BATCH, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, provisional_point_loop,
 };
 use super::super::{CommitDecision, EventRef, StateKey, StateName, StateType};
 pub(crate) use super::support::MemoryDeduplicationStore;
@@ -573,7 +576,9 @@ where
         let mut cell_writes: Vec<(CellKey, ProvisionalWrite)> = Vec::with_capacity(cells.len());
         for &((s, c), mutation) in cells {
             let key = cell_in(s, c);
-            let prev = store.get(refs[*coll as usize].id(), &key).await?;
+            let prev = CellRead::<Values>::read(store, refs[*coll as usize].id(), &key)
+                .await?
+                .0;
             if !stale_prev_ok[*coll as usize]
                 && prev.get().cloned() != model[*coll as usize].get(&(s, c)).cloned().flatten()
             {
@@ -757,7 +762,7 @@ where
     // Stage a clears-FREE marker; the commit is deliberately NOT recorded (a
     // clears-free marker is never consulted, so the verdict is irrelevant).
     let staged = cell_in(0, 0);
-    let prev = store.get(id, &staged).await?;
+    let prev = CellRead::<Values>::read(&store, id, &staged).await?.0;
     let writes = vec![(
         staged.clone(),
         ProvisionalWrite::new(Some(bytes(1)), prev, event_a),
@@ -791,7 +796,11 @@ where
     // (clear resolution leaves clears-free markers unsettled too — parity with
     // reads).
     ensure!(
-        store.get(id, &blind).await?.into_inner() == Some(bytes(9)),
+        CellRead::<Values>::read(&store, id, &blind)
+            .await?
+            .0
+            .into_inner()
+            == Some(bytes(9)),
         "the blind write did not read back"
     );
     ensure!(
@@ -876,7 +885,7 @@ where
         let mut cell_writes: Vec<(CellKey, ProvisionalWrite)> = Vec::with_capacity(cells.len());
         for &(coord, mutation) in &cells {
             let key = cell_at(coord);
-            let prev = store.get(&ids[slot], &key).await?;
+            let prev = CellRead::<Values>::read(&store, &ids[slot], &key).await?.0;
             if prev.get().cloned() != model[slot].get(&coord).cloned().flatten() {
                 return Ok(false);
             }
@@ -906,7 +915,12 @@ where
     for (i, id) in ids.iter().enumerate() {
         admit_collection(&store, &dedup, &refs[i]).await?;
         for (&coord, value) in &model[i] {
-            if store.get(id, &cell_at(coord)).await?.into_inner() != *value {
+            if CellRead::<Values>::read(&store, id, &cell_at(coord))
+                .await?
+                .0
+                .into_inner()
+                != *value
+            {
                 return Ok(false);
             }
         }
@@ -1107,6 +1121,10 @@ where
                 if collect_scan(&overlay, &id, &req, None).await? != expected {
                     return Ok(false);
                 }
+                let expected_keys: Vec<u8> = expected.iter().map(|(key, _)| *key).collect();
+                if collect_scan_coordinates(&overlay, &id, &req).await? != expected_keys {
+                    return Ok(false);
+                }
             }
         }
 
@@ -1116,7 +1134,12 @@ where
         // dirty/committed interaction is checked cell-by-cell.
         for s in 0..SECTIONS.len() as u8 {
             for c in 0..CELLS {
-                if overlay.get(&id, &cell_in(s, c)).await?.into_inner() != model.visible(s, c) {
+                if overlay
+                    .get::<Values>(&id, &cell_in(s, c))
+                    .await?
+                    .into_inner()
+                    != model.visible(s, c)
+                {
                     return Ok(false);
                 }
             }
@@ -1130,7 +1153,15 @@ where
             // `CELLS + 1` (= 13) ≤ `CELL_BATCH`, so `chunks` yields one batch;
             // `CELLS ≥ 1` makes the iterator non-empty, so `next()` is `Some`.
             let batch = batch_of((0..CELLS).chain(iter::once(0)))?;
-            let got = overlay.get_many(&id, SECTIONS[s as usize], &batch).await?;
+            let got = overlay
+                .get_many::<Values>(&id, SECTIONS[s as usize], &batch)
+                .await?;
+            let presence = overlay
+                .get_many::<Presence>(&id, SECTIONS[s as usize], &batch)
+                .await?;
+            if presence_of(&presence) != presence_of(&got) {
+                return Ok(false);
+            }
             if got.len() != CELLS as usize + 1 {
                 return Ok(false);
             }
@@ -1146,6 +1177,13 @@ where
         }
     }
     Ok(true)
+}
+
+fn presence_of<P: Projection>(batch: &CommittedBatch<P>) -> CellBuffer<bool> {
+    batch
+        .iter()
+        .map(|committed| committed.get().is_some())
+        .collect()
 }
 
 /// Proves that a dirty value takes priority over a dirty section clear.
@@ -1172,7 +1210,7 @@ pub(crate) async fn run_overlay_precedence_pin<S: CellStore>(
     overlay.dirty().clear_section(&id, SECTIONS[0]);
     overlay.dirty().set(&id, &cell_in(0, 5), &bytes(7));
     let batch = batch_of([5, 5])?;
-    let got = overlay.get_many(&id, SECTIONS[0], &batch).await?;
+    let got = overlay.get_many::<Values>(&id, SECTIONS[0], &batch).await?;
     assert_eq!(got.len(), 2, "every input position is answered");
     assert_eq!(
         got[0].clone().into_inner(),
@@ -1440,7 +1478,7 @@ where
 {
     let start = Coordinate::from_bytes(vec![req.start]);
     let end = Coordinate::from_bytes(vec![req.end]);
-    let stream = overlay.scan_cells(id, scan_of(*req, &start, &end));
+    let stream = overlay.scan::<Values>(id, scan_of(*req, &start, &end));
     futures::pin_mut!(stream);
     let mut out = Vec::new();
     while take.is_none_or(|k| out.len() < k)
@@ -1452,15 +1490,29 @@ where
     Ok(out)
 }
 
-/// Drives interleaved committed seeds, durable section clears, and scans
-/// **directly over a bottom store's `scan_cells`** (no overlay), pinning the
-/// backend's own ordering, clustering-range bounds, and limit handling — the
-/// Cassandra `ORDER BY ASC/DESC` + `coordinate` range the overlay merge
-/// delegates to and the limit/end the overlay strips before delegating — plus
-/// post-clear (gap-tombstoned) section states across the full Direction ×
-/// edge-kind (inclusive/exclusive/unbounded) × limit space. Every seed is
-/// committed (`write_resolved`), so
-/// the oracle is committed-only.
+/// Collects the payload-free twin of [`collect_scan`].
+async fn collect_scan_coordinates<S>(
+    overlay: &Overlay<S>,
+    id: &CollectionId,
+    req: &ScanReq,
+) -> Result<Vec<u8>>
+where
+    S: CellStore,
+{
+    let start = Coordinate::from_bytes(vec![req.start]);
+    let end = Coordinate::from_bytes(vec![req.end]);
+    let stream = overlay.scan::<Presence>(id, scan_of(*req, &start, &end));
+    futures::pin_mut!(stream);
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        out.push(coord_of(&item?.0));
+    }
+    Ok(out)
+}
+
+/// Compares both scan projections with a committed model after interleaved
+/// writes and section clears. The trace covers both directions, all edge kinds,
+/// and scan limits.
 pub(crate) async fn run_bottom_scan_trace<S, P>(
     store: S,
     trace: ScanTrace,
@@ -1503,7 +1555,8 @@ where
                 let expected = scan_oracle(&model, req);
                 let start = Coordinate::from_bytes(vec![req.start]);
                 let end = Coordinate::from_bytes(vec![req.end]);
-                let stream = store.scan_cells(&id, scan_of(req, &start, &end));
+                let scan = scan_of(req, &start, &end);
+                let stream = CellRead::<Values>::scan(&store, &id, scan);
                 futures::pin_mut!(stream);
                 let mut got = Vec::new();
                 while let Some(item) = stream.next().await {
@@ -1511,6 +1564,16 @@ where
                     got.push((coord_of(&key), value));
                 }
                 if got != expected {
+                    return Ok(false);
+                }
+                let keys = CellRead::<Presence>::scan(&store, &id, scan)
+                    .map(|row| row.map(|(cell, ())| cell));
+                futures::pin_mut!(keys);
+                let mut got_keys = Vec::new();
+                while let Some(key) = keys.next().await {
+                    got_keys.push(coord_of(&key?));
+                }
+                if got_keys != expected.iter().map(|(key, _)| *key).collect::<Vec<_>>() {
                     return Ok(false);
                 }
             }
@@ -1786,7 +1849,7 @@ where
         return Ok(false);
     }
     for &(s, c) in keys {
-        let committed = store.get(id, &cell_in(s, c)).await?;
+        let committed = CellRead::<Values>::read(store, id, &cell_in(s, c)).await?.0;
         if committed.into_inner() != expected.get(&(s, c)).cloned() {
             return Ok(false);
         }
@@ -1810,12 +1873,10 @@ pub(crate) enum Poison {
     /// one named collection — the establish-then-publish test's lower-write
     /// fault (a failed lower write must leave the cache untouched).
     WriteResolved(StateName, ErrorCategory),
-    /// Read-fill path: `get_for_cache` fails for the chosen single-byte
-    /// coordinates, each with its mapped category — so the default
-    /// `get_many_for_cache` loops it and one poisoned position fails the whole
-    /// batch after earlier positions succeeded (the read-fill error arm: a
-    /// failed lower batch publishes nothing).
-    GetForCache(BTreeMap<u8, ErrorCategory>),
+    /// Rejects selected coordinates during projected reads.
+    /// The default batch read propagates the first coordinate error and
+    /// publishes nothing.
+    Read(BTreeMap<u8, ErrorCategory>),
 }
 
 /// A runtime-armable poison slot shared by a [`FailingCellStore`], its
@@ -1853,11 +1914,10 @@ impl<S> FailingCellStore<S> {
         Self::armed(inner, Poison::WriteProvisional(poison, category))
     }
 
-    /// Wraps `inner`, poisoning `get_for_cache` for each single-byte coordinate
-    /// in `cells` with its mapped category — the read-fill path (a batch fill
-    /// that errors on one position after earlier ones succeeded).
-    pub(crate) fn failing_get_for_cache(inner: S, cells: BTreeMap<u8, ErrorCategory>) -> Self {
-        Self::armed(inner, Poison::GetForCache(cells))
+    /// Rejects reads for each coordinate in `cells` with its assigned error
+    /// category.
+    pub(crate) fn failing_read(inner: S, cells: BTreeMap<u8, ErrorCategory>) -> Self {
+        Self::armed(inner, Poison::Read(cells))
     }
 
     /// Wraps `inner` around a shared runtime `poison` slot — the trace
@@ -1906,7 +1966,7 @@ impl<S> FailingCellStore<S> {
 
     fn injected_read(&self, cell: &CellKey) -> Option<ErrorCategory> {
         match &*self.poison.lock() {
-            Some(Poison::GetForCache(targets)) => targets.get(&coord_of(cell)).copied(),
+            Some(Poison::Read(targets)) => targets.get(&coord_of(cell)).copied(),
             _ => None,
         }
     }
@@ -1941,50 +2001,40 @@ where
     }
 }
 
+impl<S: CellBackend> CellBackend for FailingCellStore<S> {
+    type Error = FailCellError<S::Error>;
+}
+
+impl<S: CellRead<P>, P: Projection> CellRead<P> for FailingCellStore<S> {
+    async fn read<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        cell: &'a CellKey,
+    ) -> Result<Durable<P>, Self::Error> {
+        {
+            if let Some(category) = self.injected_read(cell) {
+                return Err(FailCellError::Poison(category));
+            }
+            CellRead::<P>::read(&self.inner, collection, cell)
+                .await
+                .map_err(FailCellError::Inner)
+        }
+    }
+
+    fn scan<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+        CellRead::<P>::scan(&self.inner, collection, scan)
+            .map(|item| item.map_err(FailCellError::Inner))
+    }
+}
+
 impl<S> CellStore for FailingCellStore<S>
 where
     S: CellStore,
 {
-    type Error = FailCellError<S::Error>;
-
-    async fn get<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        cell: &'a CellKey,
-    ) -> Result<Committed, Self::Error> {
-        self.inner
-            .get(collection, cell)
-            .await
-            .map_err(FailCellError::Inner)
-    }
-
-    async fn get_for_cache<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        cell: &'a CellKey,
-    ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
-        // The default `get_many_for_cache` loops this per coordinate in
-        // first-occurrence order, so a poisoned position fails the whole batch
-        // only after earlier positions have already succeeded.
-        if let Some(category) = self.injected_read(cell) {
-            return Err(FailCellError::Poison(category));
-        }
-        self.inner
-            .get_for_cache(collection, cell)
-            .await
-            .map_err(FailCellError::Inner)
-    }
-
-    fn scan_cells<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        self.inner
-            .scan_cells(collection, scan)
-            .map(|item| item.map_err(FailCellError::Inner))
-    }
-
     async fn provisional_cell_at<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -2198,7 +2248,9 @@ async fn seed_batch<S: CellStore>(
     if !provisional.is_empty() {
         let mut writes = Vec::with_capacity(provisional.len());
         for (cell, data) in provisional {
-            let prev = store.get(collection.id(), cell).await?;
+            let prev = CellRead::<Values>::read(store, collection.id(), cell)
+                .await?
+                .0;
             writes.push((
                 cell.clone(),
                 ProvisionalWrite::new(Some(bytes(*data)), prev, event),
@@ -2240,28 +2292,57 @@ pub(crate) async fn run_batch_read_parity_trace<S: CellStore>(
     };
     let expected_coll = mk()?;
     let batch_coll = mk()?;
+    let presence_coll = mk()?;
     seed_batch(&store, &expected_coll, &resolved, &provisional, event).await?;
     seed_batch(&store, &batch_coll, &resolved, &provisional, event).await?;
+    seed_batch(&store, &presence_coll, &resolved, &provisional, event).await?;
     if trace.event_committed && !provisional.is_empty() {
         seed_commit_evidence(&store, &expected_coll).await?;
         seed_commit_evidence(&store, &batch_coll).await?;
+        seed_commit_evidence(&store, &presence_coll).await?;
     }
 
     let section = SECTIONS[trace.read_section as usize % SECTIONS.len()];
     let mut expected: Vec<Committed> = Vec::with_capacity(trace.reads.len());
     for &b in &trace.reads {
         expected.push(
-            store
-                .get(expected_coll.id(), &cell_in(trace.read_section, b))
-                .await?,
+            CellRead::<Values>::read(&store, expected_coll.id(), &cell_in(trace.read_section, b))
+                .await?
+                .0,
         );
     }
     let coords = trace.reads.iter().map(|&b| Coordinate::from_bytes(vec![b]));
     let mut got: Vec<Committed> = Vec::with_capacity(trace.reads.len());
+    let mut presence = Vec::with_capacity(trace.reads.len());
     for batch in CoordinateBatch::chunks(coords) {
-        got.extend(store.get_many(batch_coll.id(), section, &batch).await?);
+        got.extend(
+            CellRead::<Values>::read_many(&store, batch_coll.id(), section, &batch)
+                .await
+                .map(|cells| {
+                    cells
+                        .into_iter()
+                        .map(|(committed, _)| committed)
+                        .collect::<CommittedBatch>()
+                })?,
+        );
+        presence.extend(
+            CellRead::<Presence>::read_many(&store, presence_coll.id(), section, &batch)
+                .await
+                .map(|cells| {
+                    cells
+                        .into_iter()
+                        .map(|(committed, _)| committed.get().is_some())
+                        .collect::<CellBuffer<bool>>()
+                })?,
+        );
     }
-    Ok(got.len() == trace.reads.len() && got == expected)
+    Ok(got.len() == trace.reads.len()
+        && got == expected
+        && presence
+            == expected
+                .iter()
+                .map(|cell| cell.get().is_some())
+                .collect::<Vec<_>>())
 }
 
 /// Proves that duplicate batch positions return the same cell value.
@@ -2283,7 +2364,14 @@ pub(crate) async fn run_batch_duplicate_co_observation<S: CellStore>(store: S) -
         )
         .await?;
     let batch = batch_of([5, 9, 5])?;
-    let got = store.get_many(&id, SECTIONS[0], &batch).await?;
+    let got = CellRead::<Values>::read_many(&store, &id, SECTIONS[0], &batch)
+        .await
+        .map(|cells| {
+            cells
+                .into_iter()
+                .map(|(committed, _)| committed)
+                .collect::<CommittedBatch>()
+        })?;
     assert_eq!(got.len(), 3, "every position answered");
     assert_eq!(got[0], got[2], "duplicate coordinate co-observes one value");
     assert_eq!(
@@ -2329,12 +2417,25 @@ pub(crate) async fn run_batch_alignment<S: CellStore>(store: S) -> Result<()> {
     ];
     let mut expected: Vec<Committed> = Vec::with_capacity(read_bytes.len());
     for &b in &read_bytes {
-        expected.push(store.get(&id, &cell_in(0, b)).await?);
+        expected.push(
+            CellRead::<Values>::read(&store, &id, &cell_in(0, b))
+                .await?
+                .0,
+        );
     }
     let coords = read_bytes.iter().map(|&b| Coordinate::from_bytes(vec![b]));
     let mut got: Vec<Committed> = Vec::new();
     for batch in CoordinateBatch::chunks(coords) {
-        got.extend(store.get_many(&id, SECTIONS[0], &batch).await?);
+        got.extend(
+            CellRead::<Values>::read_many(&store, &id, SECTIONS[0], &batch)
+                .await
+                .map(|cells| {
+                    cells
+                        .into_iter()
+                        .map(|(committed, _)| committed)
+                        .collect::<CommittedBatch>()
+                })?,
+        );
     }
     assert_eq!(got.len(), read_bytes.len(), "every input position answered");
     assert_eq!(got, expected, "each position matches the point-get dedup");
@@ -2719,7 +2820,11 @@ async fn stage_clock_crash<S: CellStore>(
     for (slot, expiry) in cell_expiry.iter().enumerate() {
         let expected = (committed && *expiry > now).then(|| bytes(slot as u8));
         ensure!(
-            store.get(collection.id(), &writes[slot].0).await?.get() == expected.as_ref(),
+            CellRead::<Values>::read(store, collection.id(), &writes[slot].0)
+                .await?
+                .0
+                .get()
+                == expected.as_ref(),
             "expiry changed a committed value"
         );
     }
@@ -2743,7 +2848,13 @@ async fn assert_crash_state<S: CellStore, P: ShapeProbe>(
                 let value = model[slot]
                     .get(&(section, coordinate))
                     .and_then(Option::as_ref);
-                ensure!(store.get(id, &cell_in(section, coordinate)).await?.get() == value);
+                ensure!(
+                    CellRead::<Values>::read(store, id, &cell_in(section, coordinate))
+                        .await?
+                        .0
+                        .get()
+                        == value
+                );
             }
         }
         let expected: RowKeys = model[slot]

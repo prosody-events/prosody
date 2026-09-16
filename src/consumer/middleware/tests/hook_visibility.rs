@@ -5,7 +5,8 @@ use crate::consumer::middleware::tests::test_support::RecordingDedup;
 use crate::consumer::middleware::tests::test_support::TestLifecycleAccess;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
-use crate::state::collection::sealed::{ReadEngine, Session};
+use crate::state::cell::Values;
+use crate::state::collection::sealed::{ReadEngine, Reads, Session};
 use crate::state::descriptor::value_state;
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
@@ -72,7 +73,7 @@ impl HookProbe {
                 let mut inner = Engine::<C::State>::begin_read(&session).await;
                 for name in &self.names {
                     values.push(
-                        Engine::<C::State>::read_point(
+                        <Engine<C::State> as Reads<C::State, Values>>::read_point(
                             &session,
                             &mut inner,
                             StateType::Application,

@@ -1,4 +1,6 @@
 use crate::state::CommitDecision;
+use crate::state::store::CellRead;
+use crate::state::store::CommittedBatch;
 use crate::state::tests::support::{StageInspection, evidence};
 use crate::test_util::TEST_RUNTIME;
 mod cached_suite;
@@ -28,7 +30,7 @@ use self::collection_suite::{
 };
 use self::publication_suite::{PublicationTrace, run_publication_trace};
 use self::support::{CountingCellStore, CountingResolver, ResolveCounter, fresh_collection};
-use super::cell::{Cell, Committed, ProvisionalWrite};
+use super::cell::{Cell, Committed, ProvisionalWrite, Values};
 use super::cell_key::CellKey;
 use super::descriptor::{StateDescriptor, WithResolver, deque, deque_state, map_state};
 use super::marker::EventMarker;
@@ -161,9 +163,8 @@ fn prop_memory_overlay_view() {
     QuickCheck::new().quickcheck(property as fn(OverlayTrace) -> Result<bool>);
 }
 
-/// Scan correctness directly over `MemoryCellStore::scan_cells` (no overlay):
-/// the backend's own ordering, range bounds, and limit handling match the
-/// committed-only oracle — including post-clear (gap-erased) section states.
+/// Both memory scan projections match the committed model across bounds and
+/// section clears.
 #[test]
 fn prop_memory_bottom_scan() {
     fn property(trace: ScanTrace) -> Result<bool> {
@@ -403,17 +404,17 @@ fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
 
         // Resolved cells return the committed value directly.
         assert_eq!(
-            store
-                .get(&id, &cell_in(0, 7))
+            CellRead::<Values>::read(&store, &id, &cell_in(0, 7))
                 .await
+                .map(|(committed, _)| committed)
                 .map_err(|e| eyre!("get s0: {e}"))?,
             Committed::new(Some(bytes(70))),
             "the section-0 survivor commits at (0, 7)"
         );
         assert_eq!(
-            store
-                .get(&id, &cell_in(1, 7))
+            CellRead::<Values>::read(&store, &id, &cell_in(1, 7))
                 .await
+                .map(|(committed, _)| committed)
                 .map_err(|e| eyre!("get s1: {e}"))?,
             Committed::new(Some(bytes(90))),
             "the section-1 survivor commits at (1, 7), not collided onto (0, 7)"
@@ -630,11 +631,10 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
             .set(K3, Value::from(K3))
             .await
             .map_err(|e| eyre!("{e}"))?;
-        assert!(
-            handle.contains_key(&K3).await.map_err(|e| eyre!("{e}"))?,
-            "set after clear -> true"
-        );
-        assert_eq!(resolves.resolves(), 0, "no contains_key resolved");
+        assert!(handle.contains_key(&K3).await.map_err(|e| eyre!("{e}"))?);
+        assert_eq!(resolves.resolves(), 0);
+        assert_eq!(counting.presence_reads(), 2);
+        assert_eq!(counting.batch_reads(), 0);
 
         // Contrast: the K3 cell IS resolvable, so the zero above is a real skip.
         assert!(handle.get(&K3).await.map_err(|e| eyre!("{e}"))?.is_some());
@@ -723,6 +723,8 @@ async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bo
     );
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
+    assert!(!handle.is_empty().await.map_err(|e| eyre!("{e}"))?);
+
     for dir in [Direction::Forward, Direction::Backward] {
         let drained: Vec<i64> = {
             let stream = handle.keys(dir);
@@ -745,7 +747,7 @@ async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bo
     assert_eq!(
         resolves.resolves(),
         0,
-        "keys() resolves nothing on either arm"
+        "is_empty and keys resolve nothing on either arm"
     );
 
     if get_contrast {
@@ -755,10 +757,7 @@ async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bo
     Ok(())
 }
 
-/// A store overriding only `get_for_cache` (returning a TTL) inherits the
-/// default `get_many_for_cache`, which must carry that TTL metadata through for
-/// every position — the guard against defaulting the cache-fill batch to
-/// `get_many` + `None` TTLs (the `commit_provisional`-wrapper bug class).
+/// The default batch read preserves the TTL from each projected point read.
 #[test]
 fn forwarding_default_preserves_ttl() -> Result<()> {
     use self::support::TtlStub;
@@ -773,7 +772,9 @@ fn forwarding_default_preserves_ttl() -> Result<()> {
     let batch = CoordinateBatch::chunks([0u8, 1].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    let got = TEST_RUNTIME.block_on(store.get_many_for_cache(&id, SECTIONS[0], &batch))?;
+    let got = TEST_RUNTIME.block_on(async {
+        CellRead::<Values>::read_many(&store, &id, SECTIONS[0], &batch).await
+    })?;
     assert_eq!(got.len(), 2, "every position answered");
     for (_, remaining) in &got {
         assert_eq!(
@@ -904,11 +905,10 @@ fn prop_map_keyset_exact() {
     QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
 }
 
-/// `Map::get_many` parity: it answers each position exactly as the point `get`
-/// over random populations and query lists (duplicates, absent keys, and
-/// `> CELL_BATCH` lengths crossing sub-batches), in both the dirty-overlay and
-/// committed arms. See `run_map_get_many_parity_trace` for why the point path
-/// is a valid oracle here.
+/// Map batch-read parity: values and presence answer each position exactly as
+/// their point twins over random populations and query lists. The inputs cover
+/// duplicates, absent keys, and lengths above `CELL_BATCH` in dirty and
+/// committed arms.
 #[test]
 fn prop_map_get_many_parity() {
     fn property(input: MapGetManyInput) -> Result<bool> {
@@ -1018,7 +1018,7 @@ fn session_with_loader<L>(
 
 /// Mints a session over `counting` for one event with the default in-memory
 /// loader.
-fn counting_session(
+pub(super) fn counting_session(
     counting: &CountingCellStore<MemoryCellStore>,
     dedup: &MemoryDeduplicationStore,
     registry: &Arc<CollectionDefRegistry>,
@@ -1190,6 +1190,14 @@ fn map_overflowed_stream_issues_one_scan() -> Result<()> {
             dedup_id: Uuid::from_u128(u128::MAX - 100),
         };
         let session = counting_session(&counting, &dedup, &registry, &state_key, event);
+        let handle = map_state::<I64KeyCodec, JsonCodec>("mp-of")
+            .bind(&session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        assert!(
+            !handle.is_empty().await?,
+            "a live overflowed map is not empty"
+        );
+        counting.reset();
         let out = drain_map_stream(&session, "mp-of", Direction::Forward).await?;
         assert_eq!(
             out,
@@ -1205,6 +1213,38 @@ fn map_overflowed_stream_issues_one_scan() -> Result<()> {
             counting.lower_reads(),
             1,
             "the single keyset get — no bound reads"
+        );
+
+        handle.remove(&0).await?;
+        finalize_and_promote(
+            &session,
+            &dedup,
+            Uuid::from_u128(u128::MAX - 100),
+            &cells,
+            &of_id,
+        )
+        .await?;
+        counting.reset();
+        let empty_session = counting_session(
+            &counting,
+            &dedup,
+            &registry,
+            &state_key,
+            EventRef::Message {
+                dedup_id: Uuid::from_u128(u128::MAX - 99),
+            },
+        );
+        let empty = map_state::<I64KeyCodec, JsonCodec>("mp-of")
+            .bind(&empty_session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        assert!(
+            empty.is_empty().await?,
+            "a removed overflowed entry leaves an empty map"
+        );
+        assert_eq!(
+            counting.presence_scans(),
+            1,
+            "the empty overflowed map scans once"
         );
         Ok(())
     })
@@ -1829,7 +1869,7 @@ fn prop_resolve_reads_each_marker_once() {
                 let mut lookup = EvidenceLookup::new(&store, &id);
                 assert_eq!(
                     lookup
-                        .resolve(Cell::Resolved(Committed::new(None)))
+                        .resolve(Cell::Resolved(Committed::<Values>::new(None)))
                         .await?
                         .into_inner(),
                     None
@@ -1885,15 +1925,20 @@ async fn check_memory_read_parity(
     let batch = CoordinateBatch::chunks(writes.iter().map(|(cell, _)| cell.coordinate.clone()))
         .next()
         .ok_or_else(|| eyre!("batch missing"))?;
-    let values = store.get_many(id, writes[0].0.section, &batch).await?;
+    let values = CellRead::<Values>::read_many(store, id, writes[0].0.section, &batch)
+        .await
+        .map(|cells| {
+            cells
+                .into_iter()
+                .map(|(committed, _)| committed)
+                .collect::<CommittedBatch>()
+        })?;
     assert_eq!(values.len(), batch.len());
     for value in values {
         assert_eq!(value.into_inner().as_ref(), expected);
     }
 
-    let values = store
-        .get_many_for_cache(id, writes[0].0.section, &batch)
-        .await?;
+    let values = CellRead::<Values>::read_many(store, id, writes[0].0.section, &batch).await?;
     assert_eq!(values.len(), batch.len());
     for (value, ttl) in values {
         assert_eq!(value.into_inner().as_ref(), expected);
@@ -1908,7 +1953,9 @@ async fn check_memory_read_parity(
             dir,
             limit: None,
         };
-        let rows: Vec<_> = store.scan_cells(id, scan).try_collect().await?;
+        let rows: Vec<_> = CellRead::<Values>::scan(store, id, scan)
+            .try_collect()
+            .await?;
         assert_eq!(rows.len(), writes.len());
         for (_, value) in rows {
             assert_eq!(Some(&value), expected);

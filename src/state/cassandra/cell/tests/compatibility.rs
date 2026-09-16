@@ -1,6 +1,8 @@
 use super::*;
 use crate::cassandra::TABLE_KEYED_STATE_CELL;
+use crate::state::cell::Values;
 use crate::state::marker::MarkerRow;
+use crate::state::store::CellRead;
 use crate::state::tests::support::{StageInspection, evidence};
 
 async fn read_cell_blob(fx: &Fixture, id: &CollectionId) -> Result<(Vec<u8>, i16)> {
@@ -66,7 +68,7 @@ async fn legacy_null_null_residue_reads_committed_none() -> Result<()> {
         .await?;
 
     assert_eq!(
-        store.get(id, &cell).await?,
+        CellRead::<Values>::read(&store, id, &cell).await?.0,
         Committed::new(None),
         "the decoder must read the legacy residue as committed-absence"
     );
@@ -224,7 +226,11 @@ fn prop_cassandra_present_cell_is_uniquely_owned() {
         store
             .write_resolved(&c, &[(cell.clone(), Some(data))], &[])
             .await?;
-        let Some(bytes) = store.get(c.id(), &cell).await?.into_inner() else {
+        let Some(bytes) = CellRead::<Values>::read(&store, c.id(), &cell)
+            .await?
+            .0
+            .into_inner()
+        else {
             return Err(eyre!("expected a present committed value"));
         };
         Ok(bytes.try_into_mut().is_ok())
@@ -376,7 +382,7 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.write_provisional,
+                statement: &q.cells.write_provisional,
                 row: RowShape::Stage(StageRow {
                     ttl: 0,
                     data: blob_a.data(),
@@ -391,7 +397,7 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.mark_resolved,
+                statement: &q.cells.mark_resolved,
                 row: RowShape::Key(KeyRow {
                     kind: CellKind::Cell,
                     addr: addr_b,
@@ -401,7 +407,7 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.write_resolved,
+                statement: &q.cells.write_resolved,
                 row: RowShape::Resolved(ResolvedRow {
                     ttl: 0,
                     data: blob_c.data(),
@@ -414,7 +420,7 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.cell_delete,
+                statement: &q.cells.cell_delete,
                 row: RowShape::Key(KeyRow {
                     kind: CellKind::Cell,
                     addr: addr_d,
@@ -424,7 +430,7 @@ pub(super) fn mixed_binding_batch<'a>(
         BatchUnit::new(
             1_024,
             smallvec![CellBatchRow {
-                statement: &q.marker_write,
+                statement: &q.cells.marker_write,
                 row: RowShape::MarkerWrite(MarkerWriteRow {
                     ttl: 0,
                     payload: marker_blob.payload.as_ref(),

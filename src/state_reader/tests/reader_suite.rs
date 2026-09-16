@@ -211,7 +211,7 @@ async fn apply_map_ops<B: ReaderBackend>(
                 .map_err(|e| eyre!("set: {e}"))?,
             MapOp::Remove(k) => handle.remove(&k).await.map_err(|e| eyre!("remove: {e}"))?,
             MapOp::Clear => handle.clear().await.map_err(|e| eyre!("clear: {e}"))?,
-            MapOp::Get(_) | MapOp::Commit => {}
+            MapOp::Get(_) | MapOp::IsEmpty | MapOp::Commit => {}
         }
     }
     Ok(())
@@ -228,7 +228,7 @@ fn model_map_ops(model: &mut BTreeMap<i64, Value>, ops: &[MapOp]) {
                 model.remove(&k);
             }
             MapOp::Clear => model.clear(),
-            MapOp::Get(_) | MapOp::Commit => {}
+            MapOp::Get(_) | MapOp::IsEmpty | MapOp::Commit => {}
         }
     }
 }
@@ -242,6 +242,9 @@ async fn assert_map<B: ReaderBackend>(
 ) -> Result<bool> {
     let deps = backend.deps();
     let reader = StateReader::new(&deps, case.sub.clone(), descriptor)?;
+    if reader.is_empty(case.key.clone()).await? != model.is_empty() {
+        return Ok(false);
+    }
     for &k in &KEY_POOL {
         if reader.get(case.key.clone(), &k).await? != model.get(&k).cloned() {
             return Ok(false);

@@ -1,11 +1,11 @@
 //! In-memory keyed-state stores.
 
-use super::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
+use super::cell::{Cell, Committed, Projection, ProvisionalCell, ProvisionalWrite};
 use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::marker::{EventMarker, MarkerState, SectionClear};
 use super::resolve::{EvidenceLookup, ResolveCellError};
 use super::store::{
-    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe,
+    CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable, dedupe,
     expand_to_input_order, provisional_point_loop,
 };
 use super::{CollectionId, CollectionRef};
@@ -108,57 +108,53 @@ impl MemoryCellStore {
     }
 }
 
-impl CellStore for MemoryCellStore {
+impl CellBackend for MemoryCellStore {
     type Error = ResolveCellError<Infallible>;
+}
 
-    async fn get<'a>(
+impl<P: Projection> CellRead<P> for MemoryCellStore {
+    async fn read<'a>(
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-    ) -> Result<Committed, Self::Error> {
-        EvidenceLookup::new(self, collection)
+    ) -> Result<Durable<P>, Self::Error> {
+        let committed = EvidenceLookup::new(self, collection)
             .resolve(self.read_raw(collection, cell))
-            .await
+            .await?;
+        Ok((
+            Committed::new(committed.into_inner().map(P::from_value)),
+            None,
+        ))
     }
 
-    async fn get_many<'a>(
+    async fn read_many<'a>(
         &'a self,
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-    ) -> Result<CommittedBatch, Self::Error> {
+    ) -> Result<CacheBatch<P>, Self::Error> {
         let (coordinates, indices) = dedupe(batch);
-        let mut answers = CommittedBatch::with_capacity(coordinates.len());
+        let mut answers = CacheBatch::<P>::with_capacity(coordinates.len());
         let mut lookup = EvidenceLookup::new(self, collection);
         for coordinate in coordinates {
             let cell = CellKey {
                 section,
                 coordinate: coordinate.clone(),
             };
-            answers.push(cooperative(lookup.resolve(self.read_raw(collection, &cell))).await?);
+            let committed = cooperative(lookup.resolve(self.read_raw(collection, &cell))).await?;
+            answers.push((
+                Committed::new(committed.into_inner().map(P::from_value)),
+                None,
+            ));
         }
         Ok(expand_to_input_order(&indices, &answers))
     }
 
-    async fn get_many_for_cache<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> Result<CacheBatch, Self::Error> {
-        Ok(self
-            .get_many(collection, section, batch)
-            .await?
-            .into_iter()
-            .map(|value| (value, None))
-            .collect())
-    }
-
-    fn scan_cells<'a>(
+    fn scan<'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
         try_stream! {
             // Snapshot the matching raw cells synchronously (scc holds no
             // borrowing iterator across an await), then resolve each lazily.
@@ -190,13 +186,15 @@ impl CellStore for MemoryCellStore {
                 let committed =
                     cooperative(lookup.resolve(stored)).await?;
                 if let Some(bytes) = committed.into_inner() {
-                    yield (cell, bytes);
+                    yield (cell, P::from_value(bytes));
                     yielded += 1;
                 }
             }
         }
     }
+}
 
+impl CellStore for MemoryCellStore {
     fn provisional_cell_at<'a>(
         &'a self,
         collection: &'a CollectionId,

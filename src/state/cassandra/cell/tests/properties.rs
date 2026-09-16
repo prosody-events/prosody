@@ -152,9 +152,8 @@ fn prop_cassandra_overlay_view() {
         );
 }
 
-/// Scan correctness directly over `CassandraStore::scan_cells` — the live
-/// `ORDER BY ASC/DESC`, clustering-range bounds, and `LIMIT`/in-code `end` the
-/// overlay merge delegates to.
+/// Both Cassandra scan projections match the committed model across bounds and
+/// section clears.
 #[test]
 fn prop_cassandra_bottom_scan() {
     async fn run(trace: ScanTrace) -> Result<bool> {
@@ -162,7 +161,7 @@ fn prop_cassandra_bottom_scan() {
         let probe = CassandraShapeProbe {
             session: fx.cassandra.clone(),
         };
-        run_bottom_scan_trace(fx.bottom_store(), trace, &probe).await
+        Box::pin(run_bottom_scan_trace(fx.bottom_store(), trace, &probe)).await
     }
 
     init_test_logging();

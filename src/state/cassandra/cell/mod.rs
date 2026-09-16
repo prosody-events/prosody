@@ -7,6 +7,7 @@ mod cell_store;
 mod decode;
 mod encoding;
 mod helpers;
+mod projection;
 mod queries;
 mod read;
 mod resources;
@@ -18,12 +19,6 @@ mod write;
 use batch::{extend_gap_units, gap_count};
 use helpers::{blob_weight, decode_provisional_batch, encode_cell_blobs, ttl_seconds_to_duration};
 pub use queries::CellQueries;
-#[cfg(test)]
-use read::decode_rows_for_coordinates;
-use read::{
-    decode_batch_rows, decode_cell_ttl_result, fetch_and_decode_cell, fetch_cell_rows_result,
-    fetch_cells_batch, fetch_cells_batch_result, match_batch_rows_to_coordinates, page_cells,
-};
 use rows::{
     CellAddr, CellBatchRow, CellBlobs, GapBetweenRow, GapEdgeRow, GapSectionRow, KeyRow,
     MarkerBlob, MarkerWriteRow, Pk, ResolvedRow, RowShape, StageRow,
@@ -47,17 +42,15 @@ use crate::state::marker::{EventMarker, SectionClear, encode_marker_payload};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{EvidenceLookup, ResolveCellError};
 use crate::state::store::{
-    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe,
-    expand_to_input_order, sorted_unique_coordinates,
+    CacheBatch, CellBuffer, CellStore, CoordinateBatch, dedupe, expand_to_input_order,
+    sorted_unique_coordinates,
 };
 use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
 use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
 use bytes::Bytes;
-use decode::{BorrowedKeyedCellTtlRow, FramedKeyedCellRow, split_keyed_cell_ttl};
 use encoding::{EncodedBlob, encode, encode_payload, select_encoding};
 use futures::{Stream, TryStreamExt, pin_mut};
-use scylla::response::query_result::QueryRowsResult;
 use scylla::serialize::SerializationError;
 use scylla::serialize::row::{RowSerializationContext, SerializeRow};
 use scylla::serialize::writers::RowWriter;

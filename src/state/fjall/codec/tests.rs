@@ -1,4 +1,5 @@
-use super::{Read, collection_prefix, decode_cell, encode_absent_cell, encode_present_cell};
+use super::{collection_prefix, decode_frame, encode_frame};
+use crate::state::cell::CacheEntry;
 use crate::state::{CollectionId, StateKey, StateName, StateType};
 use bytes::Bytes;
 use color_eyre::eyre::Result;
@@ -12,28 +13,32 @@ const EXPIRY: u64 = 1_700_000_000_000;
 
 #[test]
 fn absent_round_trip() -> Result<()> {
-    let cell = encode_absent_cell(EXPIRY);
-    assert_eq!(decode_cell(Some(cell.as_ref()))?, (EXPIRY, Read::Absent));
+    let cell = encode_frame(CacheEntry::Absent, EXPIRY);
+    assert_eq!(
+        decode_frame(Some(cell.as_ref()))?,
+        (EXPIRY, Some(CacheEntry::Absent))
+    );
     Ok(())
 }
 
-/// Any payload + expiry round-trips through `encode_present_cell` →
-/// `decode_cell` as `(expiry, Read::Present)` with identical bytes — the cache
-/// codec is lossless over the whole byte space and the expiry header, including
-/// the empty payload a `Set` of empty bytes produces, not just one fixed
-/// example.
+/// Every cache entry preserves its payload and expiry through the codec.
 #[test]
 fn present_round_trip() {
     fn prop(payload: Vec<u8>, expiry: u64) -> TestResult {
         let payload = Bytes::from(payload);
-        let cell = encode_present_cell(&payload, expiry);
-        match decode_cell(Some(cell.as_ref())) {
-            Ok((e, Read::Present(decoded))) => {
-                TestResult::from_bool(e == expiry && decoded == payload)
+        for entry in [
+            CacheEntry::Absent,
+            CacheEntry::Exists,
+            CacheEntry::Value(payload.as_ref()),
+        ] {
+            let cell = encode_frame(entry, expiry);
+            match decode_frame(Some(cell.as_ref())) {
+                Ok(decoded) if decoded == (expiry, Some(entry)) => {}
+                Ok(other) => return TestResult::error(format!("round-trip produced {other:?}")),
+                Err(e) => return TestResult::error(format!("decode_frame failed: {e}")),
             }
-            Ok(other) => TestResult::error(format!("round-trip produced {other:?}, not Present")),
-            Err(e) => TestResult::error(format!("decode_cell failed: {e}")),
         }
+        TestResult::passed()
     }
 
     QuickCheck::new().quickcheck(prop as fn(Vec<u8>, u64) -> TestResult);
@@ -46,11 +51,18 @@ fn present_round_trip() {
 #[test]
 fn present_cell_is_raw_tagged_payload_with_expiry() {
     let payload = b"profile-payload-not-compressed".as_slice();
-    let cell = encode_present_cell(payload, EXPIRY);
+    let cell = encode_frame(CacheEntry::Value(payload), EXPIRY);
     let mut expected = vec![0x01_u8];
     expected.extend_from_slice(&EXPIRY.to_be_bytes());
     expected.extend_from_slice(payload);
     assert_eq!(cell.as_ref(), expected.as_slice());
+    for (entry, tag) in [(CacheEntry::Absent, 0x00), (CacheEntry::Exists, 0x02)] {
+        let cell = encode_frame(entry, EXPIRY);
+        let mut expected = [0_u8; 9];
+        expected[0] = tag;
+        expected[1..].copy_from_slice(&EXPIRY.to_be_bytes());
+        assert_eq!(cell.as_ref(), expected);
+    }
 }
 
 /// A `Set` of empty bytes is a present cell distinct from `Absent`, and must
@@ -60,30 +72,30 @@ fn present_cell_is_raw_tagged_payload_with_expiry() {
 /// dice.
 #[test]
 fn empty_payload_round_trips_as_present() -> Result<()> {
-    let cell = encode_present_cell(&[], 0);
+    let cell = encode_frame(CacheEntry::Value(&[]), 0);
     assert_eq!(
-        decode_cell(Some(cell.as_ref()))?,
-        (0, Read::Present(Bytes::new()))
+        decode_frame(Some(cell.as_ref()))?,
+        (0, Some(CacheEntry::Value(&[][..])))
     );
     Ok(())
 }
 
 #[test]
 fn missing_entry_decodes_as_unknown() -> Result<()> {
-    assert_eq!(decode_cell(None)?, (0, Read::Unknown));
+    assert_eq!(decode_frame(None)?, (0, None));
     Ok(())
 }
 
 #[test]
 fn empty_cell_is_rejected() {
-    assert!(decode_cell(Some(&[])).is_err());
+    assert!(decode_frame(Some(&[])).is_err());
 }
 
 /// A frame with a tag but a truncated expiry header (fewer than 8 bytes) is
 /// rejected — the decoder needs the whole header before the payload.
 #[test]
 fn truncated_expiry_header_is_rejected() {
-    assert!(decode_cell(Some(&[0x01, 0x00, 0x00])).is_err());
+    assert!(decode_frame(Some(&[0x01, 0x00, 0x00])).is_err());
 }
 
 #[test]
@@ -91,7 +103,7 @@ fn unknown_tag_byte_is_rejected() {
     // A full 9-byte frame (tag + expiry) with an unknown tag.
     let mut frame = vec![0xFE_u8];
     frame.extend_from_slice(&0u64.to_be_bytes());
-    let result = decode_cell(Some(&frame));
+    let result = decode_frame(Some(&frame));
     assert!(
         matches!(
             result,

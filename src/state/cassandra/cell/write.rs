@@ -51,7 +51,7 @@ pub(super) async fn write_provisional(
     let marker = BatchUnit::new(
         marker_blob.payload.as_ref().len() as u64 + PER_STATEMENT_OVERHEAD,
         smallvec![CellBatchRow {
-            statement: &store.queries.marker_write,
+            statement: &store.queries.cells.marker_write,
             row: RowShape::MarkerWrite(MarkerWriteRow {
                 ttl,
                 payload: marker_blob.payload.as_ref(),
@@ -67,7 +67,7 @@ pub(super) async fn write_provisional(
         BatchUnit::new(
             blob_weight(blob),
             smallvec![CellBatchRow {
-                statement: &store.queries.write_provisional,
+                statement: &store.queries.cells.write_provisional,
                 row: RowShape::Stage(StageRow {
                     ttl,
                     data: blob.data(),

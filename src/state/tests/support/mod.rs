@@ -8,7 +8,7 @@ use crate::consumer::middleware::{MarkerWrite, RepinProof};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
-use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
+use crate::state::cell::{Committed, Presence, Projection, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
 use crate::state::collection::{MutationJournal, StateSession, WritableStateSession, sealed};
 use crate::state::descriptor::{CellResolver, StructuralIdentity};
@@ -20,7 +20,8 @@ use crate::state::registry::CollectionDef;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{Finalized, MessageMarker, OpPermit, SessionGate};
 use crate::state::store::{
-    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, provisional_point_loop,
+    CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable,
+    provisional_point_loop,
 };
 use crate::state::{
     CollectionId, CollectionRef, EventRef, StateKey, StateName, StateType, StoreOutcome,
@@ -50,7 +51,7 @@ mod holding;
 mod publication;
 mod ttl;
 
-pub(crate) use counting::{CountingCellStore, CountingResolver, ResolveCounter};
+pub(crate) use counting::{CountProjection, CountingCellStore, CountingResolver, ResolveCounter};
 pub(crate) use holding::{HoldingCellStore, Holds};
 pub(crate) use publication::{ParkedRead, ScriptedPublicationStore};
 pub(crate) use ttl::TtlStub;
@@ -150,13 +151,26 @@ where
 
     async fn begin_read(_session: &UnavailableState<P>) {}
 
+    fn capture((): &()) {}
+
+    async fn resume(_session: &UnavailableState<P>, (): &()) {}
+
+    fn fence(_session: &UnavailableState<P>) -> Result<(), StateAccessError> {
+        Ok(())
+    }
+}
+
+impl<P, Q: Projection> sealed::Reads<UnavailableState<P>, Q> for UnavailableEngine
+where
+    P: Clone + Send + Sync + 'static,
+{
     fn read_point(
         _session: &UnavailableState<P>,
         _inner: &mut Self::ReadInner<'_>,
         _state_type: StateType,
         _name: &StateName,
         _cell: &CellKey,
-    ) -> impl Future<Output = Result<Option<Bytes>, StateAccessError>> {
+    ) -> impl Future<Output = Result<Option<Q::Payload>, StateAccessError>> {
         ready(Err(StateAccessError::Unavailable))
     }
 
@@ -167,13 +181,9 @@ where
         _name: &StateName,
         _section: Section,
         _batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<Option<Bytes>>, StateAccessError>> {
+    ) -> impl Future<Output = Result<CellBuffer<Option<Q::Payload>>, StateAccessError>> {
         ready(Err(StateAccessError::Unavailable))
     }
-
-    fn capture((): &()) {}
-
-    async fn resume(_session: &UnavailableState<P>, (): &()) {}
 
     fn page<'a>(
         _session: &'a UnavailableState<P>,
@@ -181,12 +191,8 @@ where
         _state_type: StateType,
         _name: &'a StateName,
         _scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, Q::Payload), StateAccessError>> + Send + 'a {
         stream::once(async { Err(StateAccessError::Unavailable) })
-    }
-
-    fn fence(_session: &UnavailableState<P>) -> Result<(), StateAccessError> {
-        Ok(())
     }
 }
 

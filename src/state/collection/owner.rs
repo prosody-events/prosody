@@ -11,13 +11,14 @@
 
 use super::{Mutation, MutationJournal, StateSession, WritableStateSession, sealed};
 use crate::state::access::StateAccessError;
+use crate::state::cell::Projection;
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::registry::CollectionDef;
 use crate::state::session::{KeyedStateSession, MutatePermit, OpPermit};
+use crate::state::store::CellRead;
 use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::{StateBackend, StateName, StateType, StoreOutcome};
-use bytes::Bytes;
 use futures::stream::Stream;
 
 /// The engine every per-event session binds.
@@ -66,34 +67,6 @@ where
         session.permit().await
     }
 
-    /// The `_inner` permit is the admission witness the read demands; the
-    /// session call does not take it, but the returned future captures the
-    /// borrow, so the gate stays held while the read runs.
-    async fn read_point(
-        session: &KeyedStateSession<B, L>,
-        _inner: &mut Self::ReadInner<'_>,
-        state_type: StateType,
-        name: &StateName,
-        cell: &CellKey,
-    ) -> Result<Option<Bytes>, StateAccessError> {
-        ensure_live(session)?;
-        session.get(state_type, name, cell).await
-    }
-
-    /// The batch twin of [`Self::read_point`], with the same witness and the
-    /// same guard.
-    async fn read_batch(
-        session: &KeyedStateSession<B, L>,
-        _inner: &mut Self::ReadInner<'_>,
-        state_type: StateType,
-        name: &StateName,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
-        ensure_live(session)?;
-        session.get_many(state_type, name, section, batch).await
-    }
-
     fn capture(_inner: &OpPermit<'_>) {}
 
     /// Reacquires the gate for one continuation — the same acquire
@@ -103,20 +76,55 @@ where
         session.permit().await
     }
 
+    fn fence(session: &KeyedStateSession<B, L>) -> Result<(), StateAccessError> {
+        ensure_live(session)
+    }
+}
+
+impl<B, L, P> sealed::Reads<KeyedStateSession<B, L>, P> for OwnerEngine
+where
+    B: StateBackend,
+    B::Cell: CellRead<P>,
+    L: Clone + Send + Sync + 'static,
+    P: Projection,
+{
+    /// The read keeps the admission permit until the future completes.
+    async fn read_point(
+        session: &KeyedStateSession<B, L>,
+        _inner: &mut Self::ReadInner<'_>,
+        state_type: StateType,
+        name: &StateName,
+        cell: &CellKey,
+    ) -> Result<Option<P::Payload>, StateAccessError> {
+        ensure_live(session)?;
+        session.get::<P>(state_type, name, cell).await
+    }
+
+    /// Uses the same admission permit as [`Self::read_point`].
+    async fn read_batch(
+        session: &KeyedStateSession<B, L>,
+        _inner: &mut Self::ReadInner<'_>,
+        state_type: StateType,
+        name: &StateName,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError> {
+        ensure_live(session)?;
+        session
+            .get_many::<P>(state_type, name, section, batch)
+            .await
+    }
+
     fn page<'a>(
         session: &'a KeyedStateSession<B, L>,
         (): &'a (),
         state_type: StateType,
         name: &'a StateName,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a {
         // Unwitnessed by design: a range pages gate-free, taking the gate only
         // for the planning command that preceded it.
-        session.scan(state_type, name, scan)
-    }
-
-    fn fence(session: &KeyedStateSession<B, L>) -> Result<(), StateAccessError> {
-        ensure_live(session)
+        session.scan::<P>(state_type, name, scan)
     }
 }
 

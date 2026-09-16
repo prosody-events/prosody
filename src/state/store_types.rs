@@ -1,5 +1,5 @@
 use super::CELLS_INLINE;
-use super::cell::Committed;
+use super::cell::{Committed, Values};
 use super::cell_key::Coordinate;
 use crate::timers::duration::CompactDuration;
 use smallvec::SmallVec;
@@ -21,7 +21,7 @@ const _: () = assert!(
 /// It yields no empty batch. Callers cannot create an invalid batch.
 ///
 /// Duplicates and unknown coordinates are valid. The read contract on
-/// [`super::store::CellStore::get_many`] defines each result position.
+/// [`super::store::CellRead::read_many`] defines each result position.
 pub struct CoordinateBatch(CellBuffer<Coordinate>);
 
 impl CoordinateBatch {
@@ -56,7 +56,10 @@ impl CoordinateBatch {
 pub type CellBuffer<T> = SmallVec<[T; CELLS_INLINE]>;
 
 /// The index-aligned result of a committed batch read.
-pub type CommittedBatch = CellBuffer<Committed>;
+pub type CommittedBatch<P = Values> = CellBuffer<Committed<P>>;
 
 /// The index-aligned result of a cache-fill batch read.
-pub type CacheBatch = CellBuffer<(Committed, Option<CompactDuration>)>;
+pub type CacheBatch<P = Values> = CellBuffer<Durable<P>>;
+
+/// One committed cell with the remaining TTL of its durable row.
+pub type Durable<P = Values> = (Committed<P>, Option<CompactDuration>);

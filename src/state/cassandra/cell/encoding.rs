@@ -61,7 +61,7 @@ impl ZstdContexts {
 /// released build persisted value 1 in `keyed_state_cell`, so Raw can use it.
 #[repr(i16)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub(in crate::state::cassandra) enum Encoding {
+pub enum Encoding {
     /// Raw codec bytes without application compression.
     Raw = 1,
     /// Raw codec bytes compressed with Zstd.

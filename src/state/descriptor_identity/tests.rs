@@ -13,9 +13,11 @@ use super::{
     acquire_descriptor_identities, validate,
 };
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::cell::Values;
 use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, value_state};
 use crate::state::memory::{MemoryCellStore, MemoryDescriptorIdentityStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+use crate::state::store::CellRead;
 use crate::state::tests::identity_suite::{
     IdentityTrace, run_concurrent_conflicting, run_concurrent_identical, run_identity_trace,
 };
@@ -351,11 +353,11 @@ async fn state_type_namespaces_cells() -> Result<()> {
         .await?;
 
     assert_eq!(
-        store.get(app.id(), &cell).await?,
+        CellRead::<Values>::read(&store, app.id(), &cell).await?.0,
         Committed::new(Some(Bytes::from_static(b"app"))),
     );
     assert_eq!(
-        store.get(fw.id(), &cell).await?,
+        CellRead::<Values>::read(&store, fw.id(), &cell).await?.0,
         Committed::new(Some(Bytes::from_static(b"fw"))),
         "the framework-namespaced cell holds its own value",
     );

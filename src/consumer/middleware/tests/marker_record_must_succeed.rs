@@ -12,13 +12,14 @@ use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::cell::Committed;
+use crate::state::cell::Values;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
-use crate::state::store::CellStore;
+use crate::state::store::CellRead;
 use crate::state::tests::support::StageInspection;
 use crate::state::{
     CollectionId, EventRef, PartitionBackend, StateKey, StateName, StateType, TimerEventRef,
@@ -156,7 +157,11 @@ async fn assert_no_durable_cart(
         coordinate: Coordinate::empty(),
     };
     assert_eq!(
-        Committed::into_inner(cell_store.get(cart_id, &cell).await?),
+        Committed::into_inner(
+            CellRead::<Values>::read(cell_store, cart_id, &cell)
+                .await?
+                .0
+        ),
         None,
         "no committed value may exist",
     );
@@ -317,15 +322,16 @@ fn prop_marker_record_self_heals_to_certified_commit() {
             let provisional = cell_store.staged_cells(&cart_id);
             futures::pin_mut!(provisional);
             let still_provisional = matches!(provisional.next().await, Some(Ok(_)));
-            let value = match cell_store
-                .get(
-                    &cart_id,
-                    &CellKey {
-                        section: Section::new(0),
-                        coordinate: Coordinate::empty(),
-                    },
-                )
-                .await
+            let value = match CellRead::<Values>::read(
+                &cell_store,
+                &cart_id,
+                &CellKey {
+                    section: Section::new(0),
+                    coordinate: Coordinate::empty(),
+                },
+            )
+            .await
+            .map(|(committed, _)| committed)
             {
                 Ok(committed) => Committed::into_inner(committed),
                 Err(e) => return TestResult::error(format!("read back: {e}")),

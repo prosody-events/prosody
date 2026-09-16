@@ -1,133 +1,153 @@
-#[cfg(doc)]
-use super::{CassandraStore, ScanEdge};
-use super::{TABLE_KEYED_STATE_CELL, cassandra_queries};
+use super::projection::CassandraProjection;
+use super::{CassandraStoreError, TABLE_KEYED_STATE_CELL, cassandra_queries};
+use crate::cassandra::macros::{format_sql, prepare_statement};
+use crate::state::cell::{Presence, Values};
+use crate::state::cell_key::{Direction, EdgeKind};
+use educe::Educe;
+use futures::try_join;
+use scylla::client::session::Session;
+use scylla::statement::prepared::PreparedStatement;
+
+const POINT: &str = "SELECT {}, encoding, version, event, TTL(data), TTL(prev_data) FROM \
+                     $keyspace.{} WHERE segment_id = ? AND key = ? AND state_type = ? AND name = \
+                     ? AND kind = ? AND section = ? AND coordinate = ?";
+const BATCH: &str = "SELECT coordinate, {}, encoding, version, event, TTL(data), TTL(prev_data) \
+                     FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND state_type = ? AND \
+                     name = ? AND kind = ? AND section = ? AND coordinate IN ?";
+const SCAN: &str = "SELECT section, coordinate, {}, encoding, version, event FROM $keyspace.{} \
+                    WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? AND kind = ? \
+                    AND section = ? AND coordinate {} ? ORDER BY coordinate {}";
+
+/// Prepared cell reads, mutations, and collection evidence queries.
+#[derive(Debug)]
+pub struct CellQueries {
+    pub(super) cells: CellStatements,
+    pub(super) values: ReadStatements,
+    pub(super) presence: ReadStatements,
+}
+
+/// Prepared reads for one projection.
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct ReadStatements {
+    #[educe(Debug(ignore))]
+    pub(super) point: PreparedStatement,
+    #[educe(Debug(ignore))]
+    pub(super) batch: PreparedStatement,
+    #[educe(Debug(ignore))]
+    pub(super) scan: ScanStatements,
+}
+
+/// Prepared scans for each direction and start edge.
+pub(super) struct ScanStatements {
+    forward_included: PreparedStatement,
+    forward_excluded: PreparedStatement,
+    forward_unbounded: PreparedStatement,
+    backward_included: PreparedStatement,
+    backward_excluded: PreparedStatement,
+    backward_unbounded: PreparedStatement,
+}
+
+impl CellQueries {
+    /// Prepares all cell statements.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if preparation fails.
+    pub async fn new(session: &Session, keyspace: &str) -> Result<Self, CassandraStoreError> {
+        Ok(Self {
+            cells: CellStatements::new(session, keyspace).await?,
+            values: ReadStatements::prepare::<Values>(session, keyspace).await?,
+            presence: ReadStatements::prepare::<Presence>(session, keyspace).await?,
+        })
+    }
+}
+
+impl ReadStatements {
+    async fn prepare<P: CassandraProjection>(
+        session: &Session,
+        keyspace: &str,
+    ) -> Result<Self, CassandraStoreError> {
+        let point = prepare_statement(
+            session,
+            &format_sql(POINT, keyspace, &[P::SELECT, TABLE_KEYED_STATE_CELL]),
+        )
+        .await?;
+        let batch = prepare_statement(
+            session,
+            &format_sql(BATCH, keyspace, &[P::SELECT, TABLE_KEYED_STATE_CELL]),
+        )
+        .await?;
+        let prepare_scan = |(comparator, order)| async move {
+            prepare_statement(
+                session,
+                &format_sql(
+                    SCAN,
+                    keyspace,
+                    &[P::SELECT, TABLE_KEYED_STATE_CELL, comparator, order],
+                ),
+            )
+            .await
+        };
+        let (
+            forward_included,
+            forward_excluded,
+            forward_unbounded,
+            backward_included,
+            backward_excluded,
+            backward_unbounded,
+        ) = try_join!(
+            prepare_scan(shape(Direction::Forward, EdgeKind::Included)),
+            prepare_scan(shape(Direction::Forward, EdgeKind::Excluded)),
+            prepare_scan(shape(Direction::Forward, EdgeKind::Unbounded)),
+            prepare_scan(shape(Direction::Backward, EdgeKind::Included)),
+            prepare_scan(shape(Direction::Backward, EdgeKind::Excluded)),
+            prepare_scan(shape(Direction::Backward, EdgeKind::Unbounded))
+        )?;
+        Ok(Self {
+            point,
+            batch,
+            scan: ScanStatements {
+                forward_included,
+                forward_excluded,
+                forward_unbounded,
+                backward_included,
+                backward_excluded,
+                backward_unbounded,
+            },
+        })
+    }
+}
+
+impl ScanStatements {
+    /// Selects the prepared scan for this direction and start edge.
+    pub(super) fn select(&self, direction: Direction, start: EdgeKind) -> &PreparedStatement {
+        match (direction, start) {
+            (Direction::Forward, EdgeKind::Included) => &self.forward_included,
+            (Direction::Forward, EdgeKind::Excluded) => &self.forward_excluded,
+            (Direction::Forward, EdgeKind::Unbounded) => &self.forward_unbounded,
+            (Direction::Backward, EdgeKind::Included) => &self.backward_included,
+            (Direction::Backward, EdgeKind::Excluded) => &self.backward_excluded,
+            (Direction::Backward, EdgeKind::Unbounded) => &self.backward_unbounded,
+        }
+    }
+}
+
+/// Returns the comparator and order. Unbounded starts bind the minimum
+/// coordinate.
+const fn shape(direction: Direction, start: EdgeKind) -> (&'static str, &'static str) {
+    match (direction, start) {
+        (Direction::Forward, EdgeKind::Included | EdgeKind::Unbounded) => (">=", "ASC"),
+        (Direction::Forward, EdgeKind::Excluded) => (">", "ASC"),
+        (Direction::Backward, EdgeKind::Included) => ("<=", "DESC"),
+        (Direction::Backward, EdgeKind::Excluded) => ("<", "DESC"),
+        (Direction::Backward, EdgeKind::Unbounded) => (">=", "DESC"),
+    }
+}
 
 cassandra_queries! {
-    /// Prepared CQL statements for [`CassandraStore`].
-    ///
-    /// Every statement binds the leading clustering column `kind`: `CellKind::Cell` for
-    /// cells or `CellKind::Marker` for markers.
-    /// CQL requires this clustering prefix. Each cell mutation changes one row.
-    /// `execute_unlogged_batches` groups collection writes into same-partition
-    /// `UNLOGGED BATCH` statements with a shared timestamp and TTL anchor.
-    /// Bind 0 to `USING TTL ?` for no expiry.
-    ///
-    /// Scans address one section of the `kind=Cell` slice. CQL cannot bind the scan
-    /// direction or start comparator.
-    /// Each direction has inclusive and exclusive coordinate statements, plus an `_all`
-    /// statement for [`Unbounded`](ScanEdge::Unbounded) starts.
-    /// `past_end` enforces the end bound in code.
-    ///
-    /// The `marker_*` statements maintain both marker rows and read their slice. The
-    /// `gap_*` statements delete section-clear gaps through `extend_gap_units`.
-    /// Each of the four cell mutators writes one row shape. Only the map's degraded
-    /// full-section fallback issues `_all` scans that can encounter tombstone fields.
-    /// This fallback accepts the full-section cost. No statement uses `ALLOW
-    /// FILTERING`.
-    pub struct CellQueries {
-        /// Reads one cell's columns (Resolved/Provisional/Corrupt shapes).
-        read_cell: (
-            "SELECT data, prev_data, encoding, version, event \
-             FROM $keyspace.{} \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND kind = ? AND section = ? AND coordinate = ?",
-            TABLE_KEYED_STATE_CELL
-        ),
-
-        /// Reads one cell's columns plus each blob's remaining TTL, for the
-        /// cache-fill point read. `TTL(column)` is a read function (no schema
-        /// change); it returns NULL when the column is NULL or the row has no
-        /// TTL. Both blobs are selected so the co-expiry can follow whichever
-        /// blob resolution returns (the `decode` module's `blob_ttl`).
-        read_cell_ttl: (
-            "SELECT data, prev_data, encoding, version, event, TTL(data), TTL(prev_data) \
-             FROM $keyspace.{} \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND kind = ? AND section = ? AND coordinate = ?",
-            TABLE_KEYED_STATE_CELL
-        ),
-
-        /// Batch twin of [`read_cell_ttl`](Self::read_cell_ttl): one section's
-        /// cells for a bounded (`1..=CELL_BATCH`) coordinate list, plus each
-        /// blob's remaining TTL. `IN` returns matching clustering rows in
-        /// coordinate order (not input order) and omits absent coordinates, so
-        /// the reader carries the `coordinate` column to re-key each row to its
-        /// input position and treats a missing coordinate as an absent row.
-        /// One same-partition, single-shard query — never a cross-partition
-        /// `IN` (the partition key is fully bound).
-        read_cells_batch: (
-            "SELECT coordinate, data, prev_data, encoding, version, event, \
-             TTL(data), TTL(prev_data) \
-             FROM $keyspace.{} \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND kind = ? AND section = ? AND coordinate IN ?",
-            TABLE_KEYED_STATE_CELL
-        ),
-
-        /// Forward single-section scan from an inclusive `coordinate` anchor.
-        scan_forward_incl: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event \
-             FROM $keyspace.{} \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND kind = ? AND section = ? AND coordinate >= ? \
-             ORDER BY coordinate ASC",
-            TABLE_KEYED_STATE_CELL
-        ),
-
-        /// Forward single-section scan from an exclusive `coordinate` anchor.
-        scan_forward_excl: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event \
-             FROM $keyspace.{} \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND kind = ? AND section = ? AND coordinate > ? \
-             ORDER BY coordinate ASC",
-            TABLE_KEYED_STATE_CELL
-        ),
-
-        /// Backward single-section scan from an inclusive `coordinate` anchor.
-        scan_backward_incl: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event \
-             FROM $keyspace.{} \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND kind = ? AND section = ? AND coordinate <= ? \
-             ORDER BY coordinate DESC",
-            TABLE_KEYED_STATE_CELL
-        ),
-
-        /// Backward single-section scan from an exclusive `coordinate` anchor.
-        scan_backward_excl: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event \
-             FROM $keyspace.{} \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND kind = ? AND section = ? AND coordinate < ? \
-             ORDER BY coordinate DESC",
-            TABLE_KEYED_STATE_CELL
-        ),
-
-        /// Section-only forward scan (an [`Unbounded`](ScanEdge::Unbounded)
-        /// start edge): no start comparator, walks the whole `kind=Cell` slice
-        /// of the section in ascending `coordinate` order.
-        scan_forward_all: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event \
-             FROM $keyspace.{} \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND kind = ? AND section = ? \
-             ORDER BY coordinate ASC",
-            TABLE_KEYED_STATE_CELL
-        ),
-
-        /// Section-only backward scan (an [`Unbounded`](ScanEdge::Unbounded)
-        /// start edge): no start comparator, walks the whole `kind=Cell` slice
-        /// of the section in descending `coordinate` order.
-        scan_backward_all: (
-            "SELECT section, coordinate, data, prev_data, encoding, version, event \
-             FROM $keyspace.{} \
-             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
-             AND kind = ? AND section = ? \
-             ORDER BY coordinate DESC",
-            TABLE_KEYED_STATE_CELL
-        ),
-
+    /// Statements without a projection axis. Each mutation changes one partition.
+    pub(super) struct CellStatements {
         /// Stages a provisional cell with TTL (the full `data | prev_data |
         /// event` shape plus the shared encoding/version columns).
         write_provisional: (

@@ -24,7 +24,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::CommitDecision;
 use crate::state::access::StateAccessError;
 use crate::state::backend::AdmissionChecks;
-use crate::state::cell::{Committed, ProvisionalWrite};
+use crate::state::cell::{Committed, Projection, ProvisionalWrite, Values};
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::collection::{StateSession, WritableStateSession};
 use crate::state::descriptor::{
@@ -37,7 +37,7 @@ use crate::state::overlay::Overlay;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::resolve::resolve_event_marker;
 use crate::state::retry::{StepOutcome, retry_step};
-use crate::state::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch};
+use crate::state::store::{CELL_BATCH, CellBuffer, CellRead, CellStore, CoordinateBatch};
 use crate::state::{
     CollectionKindId, CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY,
     StateBackend, StateKey, StateName, StateType, StoreOutcome,
@@ -892,50 +892,50 @@ where
         Ok(state_name.clone())
     }
 
-    /// Reads a cell's currently visible committed value within this event's
-    /// transaction (cleared/absent → `None`) — the dirty overlay resolved
-    /// through collection evidence.
+    /// Reads one projected cell through the event overlay.
     ///
     /// # Errors
     ///
-    /// Returns [`StateAccessError::Store`] when the underlying store fails.
-    pub(in crate::state) async fn get(
+    /// Returns the store error.
+    pub(in crate::state) async fn get<P: Projection>(
         &self,
         state_type: StateType,
         name: &StateName,
         cell: &CellKey,
-    ) -> Result<Option<Bytes>, StateAccessError> {
+    ) -> Result<Option<P::Payload>, StateAccessError>
+    where
+        B::Cell: CellRead<P>,
+    {
         let id = self.id_for(state_type, name);
         let committed = self
             .inner
             .overlay
-            .get(&id, cell)
+            .get::<P>(&id, cell)
             .await
             .map_err(|e| StateAccessError::store(&e))?;
         Ok(committed.into_inner())
     }
 
-    /// Batch twin of [`Self::get`]: reads one `section`'s coordinates in one
-    /// backend hop, aligned index-wise (`result[i]` answers `batch[i]`;
-    /// duplicate coordinates co-observe; absent → `None`). The section is
-    /// explicit alongside the batch — the point read carries it inside the
-    /// [`CellKey`].
+    /// Reads one projected answer for each coordinate in input order.
     ///
     /// # Errors
     ///
-    /// Returns [`StateAccessError::Store`] when the underlying store fails.
-    pub(in crate::state) async fn get_many(
+    /// Returns the store error.
+    pub(in crate::state) async fn get_many<P: Projection>(
         &self,
         state_type: StateType,
         name: &StateName,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
+    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
+    where
+        B::Cell: CellRead<P>,
+    {
         let id = self.id_for(state_type, name);
         let committed = self
             .inner
             .overlay
-            .get_many(&id, section, batch)
+            .get_many::<P>(&id, section, batch)
             .await
             .map_err(|e| StateAccessError::store(&e))?;
         Ok(committed.into_iter().map(Committed::into_inner).collect())
@@ -943,19 +943,22 @@ where
 
     /// The single-section, start-anchored, bidirectional range primitive: a
     /// lazy stream of the visible committed cells in `coordinate` byte order.
-    pub(in crate::state) fn scan<'a>(
+    pub(in crate::state) fn scan<'a, P: Projection>(
         &'a self,
         state_type: StateType,
         name: &'a StateName,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a
+    where
+        B::Cell: CellRead<P>,
+    {
         let id = self.id_for(state_type, name);
-        // `id` is local to the generator, so `scan_cells` unifies its lifetime
+        // `id` is local to the generator, so `scan` unifies its lifetime
         // with an owned overlay; the caller's `Copy` `Scan<'a>` rides in
         // directly (it is covariant, so it coerces to that shorter scope).
         let overlay = self.inner.overlay.clone();
         try_stream! {
-            let inner = overlay.scan_cells(&id, scan);
+            let inner = overlay.scan::<P>(&id, scan);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 yield item.map_err(|e| StateAccessError::store(&e))?;
@@ -1216,7 +1219,7 @@ where
         name: &StateName,
         cell: &CellKey,
     ) -> Result<Option<Bytes>, StateAccessError> {
-        self.get(state_type, name, cell).await
+        self.get::<Values>(state_type, name, cell).await
     }
 }
 
@@ -1469,20 +1472,19 @@ where
     match registry.commit_mode_for(id.state_type(), id.name()) {
         CommitMode::ReadCommitted => {
             let id = &id;
-            // Read each surviving cell's committed base in per-section batches
-            // instead of one point read per cell. Passing `event` as
-            // `get_many`'s `own` returns this event's `prev` while its
-            // provisional cell stands, so a retry re-stages over the same base
-            // (idempotent) — a `Set` cell in a cleared section keeps its
-            // committed pre-clear `prev` this way. `cooperative` adds a
-            // per-batch coop-budget yield point; `buffered` keeps full
-            // concurrency while preserving order — inert (marker/clear freezing
-            // sort internally and settle is row-disjoint), with only
-            // `≤SHARD_FANOUT_CONCURRENCY` result buffers in flight. Cells
-            // subsumed by a section clear are dropped first, keeping the batch
-            // row-disjoint (survivors == the section's present cells). Sized
-            // once to the pre-filter snapshot cardinality (the filter can only
-            // shrink it) — bounded-allocation rule.
+            // Read each surviving cell's committed base in per-section batches.
+            // `lower` is the pre-overlay store.
+            // The committed projection of a cell this event staged is its `prev`.
+            // Thus, a retry re-stages over the same base (idempotent).
+            // A `Set` cell in a cleared section keeps its committed pre-clear `prev` this
+            // way.
+
+            // `cooperative` adds a yield point per batch. `buffered` preserves order and
+            // bounds concurrency; order is inert here because marker and clear
+            // freezing sort internally and settle is row-disjoint. Drop cells that a
+            // section clear subsumes first, so the batch stays row-disjoint.
+            // Size the buffer once from the pre-filter snapshot; the filter can only
+            // shrink it.
             let capacity = cells.len();
             let survivors = cells
                 .into_iter()
@@ -1496,8 +1498,7 @@ where
                             batch,
                             records,
                         } = chunk;
-                        let bases = lower
-                            .get_many(id, section, &batch)
+                        let bases = CellRead::<Values>::read_many(lower, id, section, &batch)
                             .await
                             .map_err(|e| StateAccessError::store(&e))?;
                         // `get_many`'s contract: bases.len() == batch.len()
@@ -1514,7 +1515,7 @@ where
                         );
                         let chunk_writes: CellBuffer<(CellKey, ProvisionalWrite)> = records
                             .into_iter()
-                            .zip(bases)
+                            .zip(bases.into_iter().map(|(committed, _)| committed))
                             .map(|((cell, data), prev)| {
                                 (cell, ProvisionalWrite::new(data, prev, event))
                             })

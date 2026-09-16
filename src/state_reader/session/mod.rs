@@ -1,56 +1,30 @@
-//! The per-operation read session that runs probe-and-pin.
+//! One committed read operation over a fixed publication snapshot.
 //!
-//! A [`ReadSession`] binds an engine with no write half, so a handle built from
-//! a reader cannot express a mutation. Call this the
-//! `ReadOnlyHandleCannotMutate` invariant. One session is built per
-//! `StateReader` operation and captures an immutable snapshot. One logical
-//! operation therefore resolves against one exact source set and pins at most
-//! one source. Call this the `SingleSourceCoherence` invariant.
+//! A [`ReadSession`] has no mutation interface.
+//! This enforces `ReadOnlyHandleCannotMutate`.
+//! [`CommittedCellSource`] supplies both projections through collection
+//! evidence.
 //!
-//! Every guarantee here is structural. `ReadOnlyHandleCannotMutate` holds
-//! because no mutator bound exists. Committed-only holds because the only value
-//! a session can materialize is
-//! [`Cell::project_committed`](crate::state::cell::Cell::project_committed).
+//! `SingleSourceCoherence` requires each session to select at most one source.
+//! Each engine invocation borrows its selection exclusively and publishes the
+//! result to the session. A captured selection takes precedence over the shared
+//! selection. A read probes only when neither selection exists.
 //!
-//! `SingleSourceCoherence` holds two ways. Within one invocation, the
-//! `&mut Option<PinnedSource>` that every engine path threads (see [`engine`])
-//! stops two overlapping unpinned reads from compiling, so a probe always
-//! reaches its pin before the next read starts. A probe is concurrent across
-//! *sources*, never across reads: `probe_batch` fans one batch out to every
-//! source at once, and still resolves to one pin. Across invocations, the
-//! session-shared pin has exactly one writer, `engine::publish`, so the second
-//! invocation addresses the first selection.
+//! A probe reads all sources concurrently and resolves results in source order.
+//! The first source with data supplies the pin. Data takes precedence over
+//! errors from other sources. If no source returns data, any source error
+//! becomes the result. A point probe checks one cell. A batch probe checks all
+//! requested coordinates. A range probe retains the selected source's stream
+//! after its first row.
 //!
-//! The selection reaches the read paths two ways, and the two agree. A scoped
-//! collection operation carries its own invocation-local selection: the reader
-//! engine seeds it from the session-shared [`PinnedSource`] and publishes the
-//! first one it makes back to that shared cell. A managed stream carries the
-//! selection its planning command captured. The precedence is uniform: a
-//! captured selection wins, an uncaptured one defers to the shared cell, and
-//! only a wholly unselected point or batch read probes.
-//!
-//! Probe-and-pin is the reader's source-selection strategy:
-//!
-//! * **Point read and `get_many`** issue the read to every source concurrently
-//!   and resolve in source order with early exit. A [`FuturesOrdered`] yields
-//!   in push order regardless of completion timing, so the lowest-ordered
-//!   source with data always wins the pin. A fast `None` from a non-owner can
-//!   never beat a slow `Some` from the owner. A source that errors is skipped
-//!   and its error remembered. Data beats a skipped error. No data plus at
-//!   least one error is an error.
-//! * **Range page** never probes. It addresses the source the operation already
-//!   selected.
-//!
-//! Once pinned, every later call addresses the pinned source directly, even on
-//! `None` or `Err`. The probe never reruns within an operation. Determinism is
-//! source-preference order, not a stable pin under transient faults: with
-//! `A=Err` and `B=Some` the pin is B, and a later run with `A=Some` pins A.
-//! That is an availability difference, never a committed-only violation.
+//! Every later read uses the pinned source, even after absence or an error.
+//! The probe does not run again after selection.
 
 use crate::Key;
 use crate::codec::Codec;
 use crate::segment::partition_segment_id;
 use crate::state::access::StateAccessError;
+use crate::state::cell::Projection;
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::identity::{CollectionId, StateKey};
 use crate::state::store::{CellBuffer, CoordinateBatch};
@@ -58,8 +32,9 @@ use crate::state_reader::backend::{CommittedCellSource, ReaderBackend};
 use crate::state_reader::cache::CacheKey;
 use crate::state_reader::partition_for_key;
 use crate::state_reader::source::{Source, ValidatedPublications};
-use bytes::Bytes;
 use futures::stream::{FuturesOrdered, Stream, StreamExt};
+use smallvec::smallvec;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::task::coop::cooperative;
@@ -174,19 +149,19 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     /// One source's committed point read, cached per policy. `selected` is the
     /// operation's already-routed collection id for this source, if any, so a
     /// selected read reuses it instead of re-routing the key.
-    async fn cached_point(
+    async fn cached_point<P: Projection>(
         &self,
         selected: Option<&CollectionId>,
         source: &Source,
         cell: &CellKey,
-    ) -> Result<Option<Bytes>, StateAccessError> {
+    ) -> Result<Option<P::Payload>, StateAccessError>
+    where
+        B::Cells: CommittedCellSource<P>,
+    {
         match self.context.def.read_cache_ttl {
             None => {
                 let id = self.resolved_id(selected, source)?;
-                self.context
-                    .backend
-                    .cells()
-                    .load(&id, cell)
+                CommittedCellSource::<P>::load(self.context.backend.cells(), &id, cell)
                     .await
                     .map_err(|error| StateAccessError::store(&error))
             }
@@ -197,12 +172,9 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                 // miss, never on a hit.
                 self.context
                     .cache
-                    .get_cached(key, ttl, || async {
+                    .get_cached::<P, _, _>(key, ttl, || async {
                         let id = self.resolved_id(selected, source)?;
-                        self.context
-                            .backend
-                            .cells()
-                            .load(&id, cell)
+                        CommittedCellSource::<P>::load(self.context.backend.cells(), &id, cell)
                             .await
                             .map_err(|error| StateAccessError::store(&error))
                     })
@@ -213,23 +185,27 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
 
     /// One source's committed batch read, cached per policy (index-aligned to
     /// `batch`).
-    async fn cached_batch(
+    async fn cached_batch<P: Projection>(
         &self,
         selected: Option<&CollectionId>,
         source: &Source,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
+    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
+    where
+        B::Cells: CommittedCellSource<P>,
+    {
         match self.context.def.read_cache_ttl {
             None => {
                 let id = self.resolved_id(selected, source)?;
-                let buffer = self
-                    .context
-                    .backend
-                    .cells()
-                    .load_many(&id, section, batch)
-                    .await
-                    .map_err(|error| StateAccessError::store(&error))?;
+                let buffer = CommittedCellSource::<P>::load_many(
+                    self.context.backend.cells(),
+                    &id,
+                    section,
+                    batch,
+                )
+                .await
+                .map_err(|error| StateAccessError::store(&error))?;
                 // `CommittedCellSource` is a downstream trait, so check the
                 // alignment its contract promises in every build. The cached
                 // arm gets the same check inside `get_many_cached`.
@@ -242,207 +218,227 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                 Ok(buffer)
             }
             Some(ttl) => {
-                // A stream chunk is up to `CELL_BATCH`, well past
-                // `CELLS_INLINE`, so this buffer spills to the heap on the
-                // common path. Accepted: it is one allocation, sized once from
-                // the batch and bounded by it, in front of a network-bound or
-                // fjall-bound store read. The keys ARE the cache lookup. A
-                // wider `CELLS_INLINE` is the wrong fix, because it would
-                // inflate every `CellBuffer` on every path.
-                let keys: CellBuffer<CacheKey> = batch
-                    .iter()
-                    .map(|coordinate| {
-                        self.cache_key(
-                            source,
-                            &CellKey {
-                                section,
-                                coordinate: coordinate.clone(),
-                            },
-                        )
-                    })
-                    .collect();
+                let keys = self.batch_cache_keys(source, section, batch);
                 // `collection_id_for` runs only when the batch fill fires (a
                 // miss), never when the batch is served entirely from the cache.
                 self.context
                     .cache
-                    .get_many_cached(&keys, ttl, || async {
+                    .get_many_cached::<P, _, _>(&keys, ttl, || async {
                         let id = self.resolved_id(selected, source)?;
-                        self.context
-                            .backend
-                            .cells()
-                            .load_many(&id, section, batch)
-                            .await
-                            .map_err(|error| StateAccessError::store(&error))
+                        CommittedCellSource::<P>::load_many(
+                            self.context.backend.cells(),
+                            &id,
+                            section,
+                            batch,
+                        )
+                        .await
+                        .map_err(|error| StateAccessError::store(&error))
                     })
                     .await
             }
         }
     }
 
-    /// One operation's committed point read: address the already-selected
-    /// source, or probe for one.
-    async fn point_read(
+    /// Builds one bounded batch of cache keys.
+    ///
+    /// A stream chunk can exceed `CELLS_INLINE`, so this buffer can spill to
+    /// the heap. The allocation is sized once and bounded by the batch.
+    /// Increasing `CELLS_INLINE` would inflate every `CellBuffer` instead.
+    fn batch_cache_keys(
         &self,
-        selection: &mut Option<PinnedSource>,
-        cell: &CellKey,
-    ) -> Result<Option<Bytes>, StateAccessError> {
-        if let Some(pin) = selection.as_ref() {
-            return self
-                .cached_point(Some(&pin.collection), &pin.source, cell)
-                .await;
-        }
-        self.probe_point(selection, cell).await
+        source: &Source,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> CellBuffer<CacheKey> {
+        batch
+            .iter()
+            .map(|coordinate| {
+                self.cache_key(
+                    source,
+                    &CellKey {
+                        section,
+                        coordinate: coordinate.clone(),
+                    },
+                )
+            })
+            .collect()
     }
 
-    /// Probe-and-pin for one point read: issue the read to every source
-    /// concurrently and resolve in source order with early exit, selecting the
-    /// first source that answers with data.
-    ///
-    /// A [`FuturesOrdered`] yields in push order regardless of completion
-    /// timing, so the lowest-ordered source with data always wins: a fast
-    /// `None` from a non-owner can never beat a slow `Some` from the owner. A
-    /// source that errors is skipped and its error remembered; data beats a
-    /// skipped error, and no data plus at least one error is an error.
-    async fn probe_point(
+    /// One operation's committed point read: address the already-selected
+    /// source, or probe for one.
+    async fn point_read<P: Projection>(
         &self,
         selection: &mut Option<PinnedSource>,
         cell: &CellKey,
-    ) -> Result<Option<Bytes>, StateAccessError> {
-        let sources = self.snapshot.sources();
-        // `FuturesOrdered` heap-allocates one node per source, bounded by
-        // `MAX_PUBLICATION_SOURCES`. This is a per-operation, I/O-bound
-        // cross-group read, not the per-message or per-cell steady state the
-        // allocation rule targets. A bounded 16-node allocation alongside the
-        // store reads is acceptable here. Do not replace it with a hand-rolled
-        // poll loop over a `SmallVec` to avoid the allocation.
-        // Each future yields the source it read, so the selection never
-        // depends on the completion order matching the source order.
+    ) -> Result<Option<P::Payload>, StateAccessError>
+    where
+        B::Cells: CommittedCellSource<P>,
+    {
+        if let Some(pin) = selection.as_ref() {
+            return self
+                .cached_point::<P>(Some(&pin.collection), &pin.source, cell)
+                .await;
+        }
+        self.probe_point::<P>(selection, cell).await
+    }
+
+    /// Uses [`Self::resolve_probe`] for a point read.
+    async fn probe_point<P: Projection>(
+        &self,
+        selection: &mut Option<PinnedSource>,
+        cell: &CellKey,
+    ) -> Result<Option<P::Payload>, StateAccessError>
+    where
+        B::Cells: CommittedCellSource<P>,
+    {
+        self.resolve_probe(
+            selection,
+            |source| self.cached_point::<P>(None, source, cell),
+            Option::is_some,
+            || None,
+        )
+        .await
+    }
+
+    /// One operation's committed batch read, index-aligned to `batch`: address
+    /// the already-selected source, or probe for one.
+    async fn batch_read<P: Projection>(
+        &self,
+        selection: &mut Option<PinnedSource>,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
+    where
+        B::Cells: CommittedCellSource<P>,
+    {
+        if let Some(pin) = selection.as_ref() {
+            return self
+                .cached_batch::<P>(Some(&pin.collection), &pin.source, section, batch)
+                .await;
+        }
+        self.probe_batch::<P>(selection, section, batch).await
+    }
+
+    /// Uses [`Self::resolve_probe`] for a value batch.
+    async fn probe_batch<P: Projection>(
+        &self,
+        selection: &mut Option<PinnedSource>,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
+    where
+        B::Cells: CommittedCellSource<P>,
+    {
+        self.resolve_probe(
+            selection,
+            |source| self.cached_batch::<P>(None, source, section, batch),
+            |buffer| buffer.iter().any(Option::is_some),
+            || smallvec![None; batch.len()],
+        )
+        .await
+    }
+
+    /// Resolves one concurrent source probe in source order.
+    ///
+    /// The first source with data wins. Data outranks earlier errors, and the
+    /// first error outranks an all-absent result. [`FuturesOrdered`] allocates
+    /// one node per source, bounded by `MAX_PUBLICATION_SOURCES`. This bounded
+    /// allocation is acceptable beside the source I/O.
+    async fn resolve_probe<'a, T, F, Fut, A>(
+        &'a self,
+        selection: &mut Option<PinnedSource>,
+        fetch: F,
+        has_data: fn(&T) -> bool,
+        absent: A,
+    ) -> Result<T, StateAccessError>
+    where
+        F: Fn(&'a Source) -> Fut,
+        Fut: Future<Output = Result<T, StateAccessError>>,
+        A: FnOnce() -> T,
+    {
         let mut ordered = FuturesOrdered::new();
-        for source in sources {
-            ordered.push_back(cooperative(async move {
-                (source, self.cached_point(None, source, cell).await)
-            }));
+        for source in self.snapshot.sources() {
+            let read = fetch(source);
+            ordered.push_back(cooperative(async move { (source, read.await) }));
         }
         let mut first_err = None;
         while let Some((source, result)) = cooperative(ordered.next()).await {
             match result {
-                Ok(Some(value)) => {
+                Ok(value) if has_data(&value) => {
                     let collection = self.collection_id_for(source)?;
                     *selection = Some(PinnedSource {
                         source: source.clone(),
                         collection,
                     });
-                    return Ok(Some(value));
+                    return Ok(value);
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    if first_err.is_none() {
-                        first_err = Some(error);
-                    }
-                }
+                Err(error) if first_err.is_none() => first_err = Some(error),
+                Ok(_) | Err(_) => {}
             }
         }
-        match first_err {
-            Some(error) => Err(error),
-            None => Ok(None),
-        }
+        first_err.map_or_else(|| Ok(absent()), Err)
     }
 
-    /// One operation's committed batch read, index-aligned to `batch`: address
-    /// the already-selected source, or probe for one.
-    async fn batch_read(
-        &self,
-        selection: &mut Option<PinnedSource>,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
-        if let Some(pin) = selection.as_ref() {
-            return self
-                .cached_batch(Some(&pin.collection), &pin.source, section, batch)
-                .await;
-        }
-        self.probe_batch(selection, section, batch).await
-    }
-
-    /// Probe-and-pin for one batch read — [`Self::probe_point`]'s batch twin.
-    /// A buffer holding data anywhere pins its source; among the remaining
-    /// outcomes an error outranks an all-absent buffer, because absence cannot
-    /// be proven through a source that failed.
-    async fn probe_batch(
-        &self,
-        selection: &mut Option<PinnedSource>,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
-        let sources = self.snapshot.sources();
-        // Bounded per-operation fan-out; see the ruling on the point-read
-        // `FuturesOrdered` above.
-        let mut ordered = FuturesOrdered::new();
-        for source in sources {
-            ordered.push_back(cooperative(async move {
-                (
-                    source,
-                    self.cached_batch(None, source, section, batch).await,
-                )
-            }));
-        }
-        let mut first_err = None;
-        while let Some((source, result)) = cooperative(ordered.next()).await {
-            match result {
-                Ok(buffer) => {
-                    if buffer.iter().any(Option::is_some) {
-                        let collection = self.collection_id_for(source)?;
-                        *selection = Some(PinnedSource {
-                            source: source.clone(),
-                            collection,
-                        });
-                        return Ok(buffer);
-                    }
-                }
-                Err(error) => {
-                    if first_err.is_none() {
-                        first_err = Some(error);
-                    }
-                }
-            }
-        }
-        match first_err {
-            Some(error) => Err(error),
-            // Every source that answered answered all-absent, which the
-            // index-aligned contract makes exactly `batch.len()` `None`s — so
-            // no buffer needs keeping. This is also the empty-source arm, which
-            // the non-empty snapshot forbids.
-            None => Ok((0..batch.len()).map(|_| None).collect()),
-        }
-    }
-
-    /// One operation's committed range page over the selected source.
-    ///
-    /// A captured `Some(selected)` always wins: a continuation addresses the
-    /// source its planning command chose. A `None` falls back to the
-    /// session-shared pin **sampled at first poll**, so a stream constructed
-    /// before a sibling read pinned still addresses that selection rather than
-    /// opening a second source.
-    ///
-    /// A range page never probes. Every range plan follows a metadata point
-    /// read that already pinned, so a wholly unselected one is unconstructable
-    /// through the collection API. Such a plan terminates the stream with
-    /// [`StateAccessError::Unavailable`] instead of opening a source the
-    /// operation did not select.
-    fn scan_from<'a>(
+    /// Streams one source's committed cells under the projection.
+    fn source_scan<'a, P: Projection>(
         &'a self,
-        selected: Option<&'a PinnedSource>,
+        id: CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a
+    where
+        B::Cells: CommittedCellSource<P>,
+    {
         async_stream::try_stream! {
-            let pin = selected
-                .or_else(|| self.pin.get())
-                .ok_or(StateAccessError::Unavailable)?;
-            let id = pin.collection.clone();
-            let inner = self.context.backend.cells().scan(&id, scan);
+            let inner = CommittedCellSource::<P>::scan(self.context.backend.cells(), &id, scan);
             futures::pin_mut!(inner);
             while let Some(item) = cooperative(inner.next()).await {
                 yield item.map_err(|error| StateAccessError::store(&error))?;
+            }
+        }
+    }
+
+    /// Uses the captured source, then the shared source, or probes in source
+    /// order. The first source with a row supplies the complete stream and
+    /// the shared pin. An unpinned probe allocates one stream box per
+    /// source, bounded by `MAX_PUBLICATION_SOURCES`. The box keeps the
+    /// selected stream alive after its first row.
+    fn scan_from<'a, P: Projection>(
+        &'a self,
+        selected: Option<&'a PinnedSource>,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a
+    where
+        B::Cells: CommittedCellSource<P>,
+    {
+        async_stream::try_stream! {
+            if let Some(pin) = selected.or_else(|| self.pin.get()) {
+                let inner = self.source_scan::<P>(pin.collection.clone(), scan);
+                futures::pin_mut!(inner);
+                while let Some(item) = cooperative(inner.next()).await {
+                    yield item?;
+                }
+                return;
+            }
+
+            let mut selection = None;
+            let found = self.resolve_probe(
+                &mut selection,
+                |source| async move {
+                    let id = self.collection_id_for(source)?;
+                    // Like resolve_probe nodes, stream boxes are bounded by MAX_PUBLICATION_SOURCES per operation, not per cell.
+                    let mut stream = Box::pin(self.source_scan::<P>(id, scan));
+                    let first = cooperative(stream.next()).await.transpose()?;
+                    Ok(first.map(|row| (row, stream)))
+                },
+                Option::is_some,
+                || None,
+            ).await?;
+            engine::publish(self, selection.as_ref());
+            if let Some((first, mut stream)) = found {
+                yield first;
+                while let Some(item) = cooperative(stream.next()).await {
+                    yield item?;
+                }
             }
         }
     }

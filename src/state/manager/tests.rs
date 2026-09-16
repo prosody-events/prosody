@@ -4,10 +4,12 @@
 use super::*;
 use crate::codec::JsonCodec;
 use crate::state::backend::AdmissionChecks;
+use crate::state::cell::Values;
 use crate::state::fjall::test_db::cold_marker_checks;
 use crate::state::marker::decode_marker_payload;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::session::Promoted;
+use crate::state::store::CellRead;
 use crate::state::tests::support::{MemoryDeduplicationStore, evidence, run_admit_soundness};
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::Trigger;
@@ -130,7 +132,11 @@ async fn legacy_and_timer_residue(value: u8, mode: u8) -> Result<bool> {
         value.wrapping_add(1)
     });
     ensure!(
-        store.get(collection.id(), &value_cell()).await?.get() == Some(&expected),
+        CellRead::<Values>::read(&store, collection.id(), &value_cell())
+            .await?
+            .0
+            .get()
+            == Some(&expected),
         "legacy admission changed the commit decision"
     );
     ensure!(
@@ -260,7 +266,10 @@ async fn legacy_deregistration(value: u8) -> Result<()> {
     dedup.insert(dedup_id).await?;
     ensure!(admit_registered(&store, &dedup, &collections).await? == Admission::Fresh);
     ensure!(
-        store.get(collections[1].id(), &value_cell()).await?.get()
+        CellRead::<Values>::read(&store, collections[1].id(), &value_cell())
+            .await?
+            .0
+            .get()
             == Some(&bytes(value.wrapping_add(1))),
         "an orphan cell exposed uncommitted data"
     );

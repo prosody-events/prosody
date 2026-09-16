@@ -16,34 +16,32 @@ impl TtlStub {
     }
 }
 
-impl CellStore for TtlStub {
+impl CellBackend for TtlStub {
     type Error = Infallible;
+}
 
-    fn get<'a>(
+impl<P: Projection> CellRead<P> for TtlStub {
+    fn read<'a>(
         &'a self,
         _collection: &'a CollectionId,
         _cell: &'a CellKey,
-    ) -> impl Future<Output = Result<Committed, Self::Error>> + Send + 'a {
-        ready(Ok(Committed::new(Some(self.value.clone()))))
+    ) -> impl Future<Output = Result<Durable<P>, Self::Error>> + Send + 'a {
+        ready(Ok((
+            Committed::new(Some(P::from_value(self.value.clone()))),
+            self.ttl,
+        )))
     }
 
-    fn get_for_cache<'a>(
-        &'a self,
-        _collection: &'a CollectionId,
-        _cell: &'a CellKey,
-    ) -> impl Future<Output = Result<(Committed, Option<CompactDuration>), Self::Error>> + Send + 'a
-    {
-        ready(Ok((Committed::new(Some(self.value.clone())), self.ttl)))
-    }
-
-    fn scan_cells<'a>(
+    fn scan<'a>(
         &'a self,
         _collection: &'a CollectionId,
         _scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
         stream::empty()
     }
+}
 
+impl CellStore for TtlStub {
     fn provisional_cell_at<'a>(
         &'a self,
         _collection: &'a CollectionId,

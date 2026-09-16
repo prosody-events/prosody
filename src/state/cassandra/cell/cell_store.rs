@@ -1,120 +1,43 @@
 #[cfg(test)]
 use super::Ordering;
 use super::batch::marker_delete_unit;
-use super::read::fetch_marker_state;
+use super::read::{decode_point, fetch_batch, fetch_marker_state, fetch_point};
 use super::{
-    BatchUnit, Bytes, CacheBatch, CassandraStore, Cell, CellAddr, CellBatchRow, CellBuffer,
-    CellKey, CellKind, CellStore, CellStoreError, CollectionId, CollectionRef, Committed,
-    CommittedBatch, CompactDuration, Coordinate, CoordinateBatch, EventMarker, EvidenceLookup,
-    KeyRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell, ProvisionalWrite, ResolveCellError,
-    RowShape, Scan, Section, SectionClear, SmallVec, Stream, bind_ttl, decode_batch_rows,
-    decode_cell_ttl_result, decode_provisional_batch, dedupe, encode_cell_blobs,
-    expand_to_input_order, extend_gap_units, gap_count, match_batch_rows_to_coordinates, smallvec,
-    sorted_unique_coordinates, ttl_seconds_to_duration, write_provisional,
+    BatchUnit, Bytes, CassandraStore, Cell, CellAddr, CellBatchRow, CellBuffer, CellKey, CellKind,
+    CellStore, CellStoreError, CollectionId, CollectionRef, Coordinate, CoordinateBatch,
+    EventMarker, KeyRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell, ProvisionalWrite,
+    ResolveCellError, RowShape, Section, SectionClear, bind_ttl, decode_provisional_batch,
+    encode_cell_blobs, extend_gap_units, gap_count, smallvec, sorted_unique_coordinates,
+    write_provisional,
 };
 use super::{CassandraCellStoreError, MarkerWriteRow, encode};
+use crate::state::cell::Values;
 use crate::state::marker::{MarkerRow, MarkerState, encode_committed_payload};
+use crate::state::store::CellBackend;
+
+impl CellBackend for CassandraStore {
+    type Error = CellStoreError;
+}
 
 impl CellStore for CassandraStore {
-    type Error = CellStoreError;
-
-    async fn get<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        cell: &'a CellKey,
-    ) -> Result<Committed, Self::Error> {
-        // The committed value is exactly the cache-fill read minus its co-expiry
-        // TTL; production only ever calls this via `Cached` (which uses
-        // `get_for_cache`), so `get` is a thin convenience for direct callers.
-        Ok(self.get_for_cache(collection, cell).await?.0)
-    }
-
-    async fn get_for_cache<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        cell: &'a CellKey,
-    ) -> Result<(Committed, Option<CompactDuration>), Self::Error> {
-        let row = self
-            .point_read_cell_result(&self.queries.read_cell_ttl, collection, cell)
-            .await
-            .map_err(ResolveCellError::Store)?;
-        let (raw, ttl) = match decode_cell_ttl_result(&row).map_err(ResolveCellError::Store)? {
-            Some(decoded) => decoded,
-            None => (Cell::Resolved(Committed::new(None)), None),
-        };
-        let committed = EvidenceLookup::new(self, collection).resolve(raw).await?;
-        Ok((committed, ttl_seconds_to_duration(ttl)))
-    }
-
-    async fn get_many<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> Result<CommittedBatch, Self::Error> {
-        // Mirrors `get` → `get_for_cache`: the committed value is the batch
-        // cache-fill read minus its co-expiry TTLs.
-        Ok(self
-            .get_many_for_cache(collection, section, batch)
-            .await?
-            .into_iter()
-            .map(|(committed, _)| committed)
-            .collect())
-    }
-
-    async fn get_many_for_cache<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> Result<CacheBatch, Self::Error> {
-        let (unique_coordinates, input_indices) = dedupe(batch);
-        let rows = self
-            .batch_read_result(collection, section, &unique_coordinates)
-            .await
-            .map_err(ResolveCellError::Store)?;
-        let rows =
-            decode_batch_rows(&rows, &unique_coordinates).map_err(ResolveCellError::Store)?;
-        let mut unique_answers: CacheBatch = SmallVec::with_capacity(unique_coordinates.len());
-        let mut lookup = EvidenceLookup::new(self, collection);
-        for row in rows {
-            let (raw, ttl) = match row {
-                Some((cell, ttl)) => (cell, ttl),
-                None => (Cell::Resolved(Committed::new(None)), None),
-            };
-            let committed = lookup.resolve(raw).await?;
-            unique_answers.push((committed, ttl_seconds_to_duration(ttl)));
-        }
-        Ok(expand_to_input_order(&input_indices, &unique_answers))
-    }
-
-    fn scan_cells<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        self.scan_inner(collection, scan)
-    }
-
     async fn provisional_cell_at<'a>(
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
     ) -> Result<Option<ProvisionalCell>, Self::Error> {
         // Point-read the `kind=Cell` row and keep only a genuinely provisional
-        // shape; an absent or resolved coordinate reads `None` (over-report-safe
-        // — a coordinate the warm index over-reports is dropped here).
+        // shape. An absent or resolved coordinate returns `None`.
         #[cfg(test)]
         self.counters
             .cell_point_reads
             .fetch_add(1, Ordering::Relaxed);
-        let Some(raw) = self
-            .point_read_cell(&self.queries.read_cell, collection, cell)
+        let Some(row) = fetch_point::<Values>(&self.session, &self.queries, collection, cell)
             .await
             .map_err(ResolveCellError::Store)?
         else {
             return Ok(None);
         };
+        let (raw, _) = decode_point::<Values>(row).map_err(ResolveCellError::Store)?;
         match raw {
             Cell::Provisional(provisional) => Ok(Some(provisional)),
             Cell::Resolved(_) => Ok(None),
@@ -136,12 +59,15 @@ impl CellStore for CassandraStore {
         // One IN query, reusing the TTL-bearing batch read; TTL is discarded in
         // the decoder. This read neither resolves cells nor writes state.
         // It leaves marker state unchanged, as `provisional_cell_at` does.
-        let result = self
-            .batch_read_result(collection, section, &unique_coordinates)
-            .await
-            .map_err(ResolveCellError::Store)?;
-        let rows = match_batch_rows_to_coordinates(&result, &unique_coordinates)
-            .map_err(ResolveCellError::Store)?;
+        let rows = fetch_batch::<Values>(
+            &self.session,
+            &self.queries,
+            collection,
+            section,
+            &unique_coordinates,
+        )
+        .await
+        .map_err(ResolveCellError::Store)?;
         decode_provisional_batch(rows, &unique_coordinates).map_err(ResolveCellError::Store)
     }
 
@@ -197,7 +123,7 @@ impl CellStore for CassandraStore {
                 BatchUnit::new(
                     PER_STATEMENT_OVERHEAD,
                     smallvec![CellBatchRow {
-                        statement: &self.queries.mark_resolved,
+                        statement: &self.queries.cells.mark_resolved,
                         row: RowShape::Key(KeyRow {
                             kind: CellKind::Cell,
                             addr,
@@ -255,9 +181,9 @@ impl CellStore for CassandraStore {
         units.extend(writes.iter().map(|(cell, write)| {
             let addr = CellAddr::new(pk, cell);
             let statement = if write.data().is_some() {
-                &self.queries.mark_resolved
+                &self.queries.cells.mark_resolved
             } else {
-                &self.queries.cell_delete
+                &self.queries.cells.cell_delete
             };
             BatchUnit::new(
                 PER_STATEMENT_OVERHEAD,
@@ -274,7 +200,7 @@ impl CellStore for CassandraStore {
         let evidence = BatchUnit::new(
             payload.as_ref().len() as u64 + PER_STATEMENT_OVERHEAD,
             smallvec![CellBatchRow {
-                statement: &self.queries.committed_write,
+                statement: &self.queries.cells.committed_write,
                 row: RowShape::MarkerWrite(MarkerWriteRow {
                     ttl: bind_ttl(Some(marker.evidence_ttl())),
                     payload: payload.as_ref(),

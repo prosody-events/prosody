@@ -9,6 +9,7 @@ use crate::consumer::partition::ShutdownPhase;
 use crate::loader::{MemoryLoader, MessageLoader};
 use crate::otel::SpanRelation;
 use crate::state::backend::AdmissionChecks;
+use crate::state::cell::Values;
 use crate::state::descriptor::Registered;
 use crate::state::fjall::test_db::cold_marker_checks;
 use crate::state::manager::{Admission, PartitionStateManager, test_manager};
@@ -18,6 +19,7 @@ use crate::state::session::MessageMarker;
 use crate::state::session::Promoted;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{EventSession, Finalized, TerminationWatch};
+use crate::state::store::CellRead;
 use crate::state::store::CellStore;
 use crate::state::tests::support::seed_commit_evidence;
 use crate::state::{
@@ -500,7 +502,11 @@ fn prop_boundary_permanent_rejection() {
                 "rejected state retained residue"
             );
             ensure!(
-                raw.get(&collection, &value_cell()).await?.get().is_some()
+                CellRead::<Values>::read(&raw, &collection, &value_cell())
+                    .await?
+                    .0
+                    .get()
+                    .is_some()
                     == (mode == 2 && index == 1)
             );
         }

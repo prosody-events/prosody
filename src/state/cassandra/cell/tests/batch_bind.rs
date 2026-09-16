@@ -1,4 +1,6 @@
 use super::*;
+use crate::state::cell::Values;
+use crate::state::store::CellRead;
 use crate::state::tests::support::evidence;
 
 /// Positional binding-order proof (the one silent-failure surface):
@@ -105,16 +107,19 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     // columns); C written fresh resolved to its own payload (the resolved-write
     // row bound its columns).
     assert_eq!(
-        reader.get(&id, &cell_b).await?,
+        CellRead::<Values>::read(&reader, &id, &cell_b).await?.0,
         Committed::new(Some(data_b))
     );
     assert_eq!(
-        reader.get(&id, &cell_c).await?,
+        CellRead::<Values>::read(&reader, &id, &cell_c).await?.0,
         Committed::new(Some(data_c))
     );
     // D's row was deleted (the `cell_delete` bound its own `kind=Cell` key
     // columns, not the marker slice's `kind=Marker`), so it reads absent.
-    assert_eq!(reader.get(&id, &cell_d).await?, Committed::new(None));
+    assert_eq!(
+        CellRead::<Values>::read(&reader, &id, &cell_d).await?.0,
+        Committed::new(None)
+    );
 
     // Follow-up batch: `marker_delete` removes the fixed-address marker row —
     // a second fresh store's cold recovery then finds no marker at all.

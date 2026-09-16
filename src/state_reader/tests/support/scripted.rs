@@ -8,6 +8,7 @@ use crate::codec::JsonCodec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
+use crate::state::cell::Projection;
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::descriptor::StateDescriptor;
 use crate::state::descriptor_identity::{
@@ -173,19 +174,19 @@ impl ScriptedCellSource {
         Ok(self.inner.read_committed(id, cell))
     }
 
-    pub(crate) fn read_committed_many(
+    pub(crate) fn read_committed_many<P: Projection>(
         &self,
         id: &CollectionId,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
+    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError> {
         let segment = id.state_key().segment_id;
         self.record_read(segment);
         let fault = self.fault_of(segment);
         if matches!(fault, Some(FaultPoint::AtOpen)) {
             return Err(StateAccessError::store(&ScriptedFaultError));
         }
-        let mut buffer = self.inner.read_committed_many(id, section, batch);
+        let mut buffer = self.inner.read_committed_many::<P>(id, section, batch);
         if matches!(fault, Some(FaultPoint::ShortBatch)) {
             buffer.pop();
         }
