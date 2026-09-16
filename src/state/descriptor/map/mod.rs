@@ -69,13 +69,17 @@
 //! newest entry. A non-TTL'd map writes the keyset only on a content change;
 //! nothing expires, so the invariant holds vacuously.
 
+mod query;
+
+pub use query::MapQuery;
+pub(crate) use query::Query;
+
 use super::{
     CellCodecError, CellStateError, CellType, CollectionSpec, ContextOf, Descriptor, FromSession,
     Keyed, ResolvedOf, WriteOf,
 };
 use crate::codec::{Codec, JsonCodec};
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::cell::{Presence, Values};
 #[cfg(test)]
 use crate::state::cell_key::CellKey;
 use crate::state::cell_key::{Coordinate, Direction};
@@ -86,7 +90,6 @@ use crate::state::collection::{
 };
 use crate::state::order_codec::{I64KeyCodec, KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::{CollectionKindId, StateAccessError, StoreOutcome};
-use async_stream::try_stream;
 use bytes::{Bytes, BytesMut};
 use educe::Educe;
 use futures::stream::{Stream, StreamExt};
@@ -95,7 +98,7 @@ use std::fmt::Display;
 use std::num::NonZeroUsize;
 use std::slice::from_ref;
 use thiserror::Error;
-use tracing::{Instrument, info_span, instrument, warn};
+use tracing::{instrument, warn};
 
 collection_layout! {
     /// The Map collection kind: one keyset cell plus one cell per key. The key
@@ -412,82 +415,6 @@ where
 #[educe(Clone(bound = "S: Clone"))]
 pub struct MapHandle<S, KC, V> {
     cells: Collection<S, MapKind<KC, V>>,
-}
-
-/// A directional map stream query.
-///
-/// Build one with [`MapHandle::query`]. Finish with [`keys`](Self::keys) or
-/// [`entries`](Self::entries).
-#[must_use]
-pub struct MapQuery<'a, S, KC, V> {
-    handle: &'a MapHandle<S, KC, V>,
-    dir: Direction,
-    limit: Option<NonZeroUsize>,
-}
-
-impl<'a, S, KC, V> MapQuery<'a, S, KC, V>
-where
-    S: StateSession,
-    KC: OrderedKeyCodec + 'static,
-    KC::Key: Display,
-    V: CellType<Key = UnitKey>,
-{
-    /// Bounds the present items the stream yields. Missing cells do not consume
-    /// the limit. The limit sizes the first fetch, so it also sets the first
-    /// error boundary.
-    pub fn limit(mut self, limit: NonZeroUsize) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    /// Streams live entries in the query direction.
-    pub fn entries(self) -> impl Stream<Item = MapStreamItem<KC, V>> + 'a
-    where
-        for<'s> ContextOf<'s, V>: FromSession<'s, S>,
-    {
-        // Streams need an explicit span around each awaited step.
-        // Errors reach the caller as items; the span does not record their status.
-        let span = info_span!(
-            "map.stream",
-            collection = self.handle.cells.name().as_str(),
-            direction = ?self.dir,
-        );
-        try_stream! {
-            // Init: `stream_plan` reads the keyset under an admission it drops
-            // as it returns, before this `?` observes the result.
-            let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
-            let plan = match self.limit {
-                Some(limit) => plan.with_limit(Some(limit)),
-                None => plan,
-            };
-            let inner = plan.projected::<Values>();
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().instrument(span.clone()).await {
-                yield item?;
-            }
-        }
-    }
-
-    /// Streams live keys in the query direction.
-    pub fn keys(self) -> impl Stream<Item = MapKeyItem<KC, V>> + 'a {
-        let span = info_span!(
-            "map.keys",
-            collection = self.handle.cells.name().as_str(),
-            direction = ?self.dir,
-        );
-        try_stream! {
-            let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
-            let plan = match self.limit {
-                Some(limit) => plan.with_limit(Some(limit)),
-                None => plan,
-            };
-            let inner = plan.projected::<Presence>();
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().instrument(span.clone()).await {
-                yield item?;
-            }
-        }
-    }
 }
 
 // `KC::Key: Display` exists only so the operation spans can record the map
@@ -818,8 +745,7 @@ where
     pub fn query(&self, dir: Direction) -> MapQuery<'_, S, KC, V> {
         MapQuery {
             handle: self,
-            dir,
-            limit: None,
+            query: Query { dir, limit: None },
         }
     }
 

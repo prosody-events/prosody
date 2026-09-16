@@ -21,7 +21,7 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterState
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
 use crate::state::{CommitMode, EventRef, PartitionBackend, StateKey, StateName, StateType};
-use crate::test_util::{ArbJson, TEST_RUNTIME, captured_spans};
+use crate::test_util::{ArbJson, TEST_RUNTIME, captured_spans, named};
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, eyre};
 use futures::TryStreamExt;
@@ -592,6 +592,7 @@ fn collection_ops_export_operation_spans() -> Result<()> {
             map.set("k1".to_owned(), json!(1_i32)).await?;
             map.get(&"k1".to_owned()).await?;
             let _entries: Vec<_> = map.stream(Direction::Forward).try_collect().await?;
+            let _keys: Vec<_> = map.keys(Direction::Forward).try_collect().await?;
             map.is_empty().await?;
             map.remove(&"k1".to_owned()).await?;
 
@@ -612,18 +613,19 @@ fn collection_ops_export_operation_spans() -> Result<()> {
         1,
         "one call exports one map.is_empty span"
     );
+    let mut projections: Vec<_> = spans
+        .iter()
+        .filter(|span| span.name == "map.stream")
+        .map(|span| span_attr(span, "projection"))
+        .collect();
+    projections.sort_unstable();
     assert_eq!(
-        spans.iter().filter(|span| span.name == "map.keys").count(),
-        0,
-        "only direct keys calls export map.keys spans"
+        projections,
+        [Some("presence".to_owned()), Some("values".to_owned())],
+        "map streams export one span per projection under one name"
     );
 
-    let handler_id = spans
-        .iter()
-        .find(|s| s.name == "handler")
-        .ok_or_else(|| eyre!("handler span not exported"))?
-        .span_context
-        .span_id();
+    let handler_id = named(&spans, "handler")?.span_context.span_id();
 
     for (name, collection) in [
         ("value.set", "cart"),
