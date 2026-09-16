@@ -177,6 +177,24 @@ designs are where bloat and bug re-introduction live:
 - Write doc comments for a reader unfamiliar with the codebase: help them
   navigate the concept. Lead with what the reader needs — what the thing is,
   how to use it, what guarantee it gives — not the internal mechanism.
+- **Short declarative sentences, one idea each.** The banned shape is the
+  six-line sentence that chains clauses with dashes and nests parentheticals
+  three deep. At most one parenthetical aside per comment, never nested; a
+  sentence that needs a second dash or parenthesis gets split instead.
+- **Never argue with an imagined reviewer.** "X rather than Y (which would
+  break Z), mirroring W" is design-review prose. State what the code does and
+  the invariant it upholds. Mention a rejected alternative only when a
+  maintainer would plausibly reintroduce it, as its own plain sentence: "Do
+  not swap in fresh stores here: mock read-your-writes depends on sharing."
+- **No invented compound jargon.** Ad-hoc hyphenated noun chains
+  ("incoherent-backend bug", "reads-your-writes bundle",
+  "unreachable-by-construction") compress meaning the reader does not yet
+  have; spell the idea out in ordinary words. Established terms that name one
+  precise mechanism (last-write-wins, read-your-writes as a consistency level)
+  keep their standard form.
+- **Read-aloud test:** a comment you cannot read aloud in one breath, or that
+  a colleague could not paraphrase back after one hearing, gets rewritten
+  before it lands.
 - Docs address the future reader, never the current conversation: no
   review-response prose, no "the reviewer/advisor said", no phrasing copied
   from scratch plans or design docs. Restate the invariant in the code's own
@@ -217,16 +235,43 @@ designs are where bloat and bug re-introduction live:
   constraints that function actually needs — not a superset for the whole
   type. The struct should compile and be usable without the bound unless
   every reachable method requires it.
+- Avoid overused idioms and vague metaphor-filler in prose, comments, docs,
+  commit/PR text, and chat — they read as LLM boilerplate and carry no
+  information. Banned as decoration: "pin"/"pin down", "altitude"/"at a high
+  altitude", "zoom in/out", "double-click", "north star", "surface area",
+  "lean into", "first-class citizen", "load-bearing" as a throwaway, and the
+  like. Say the concrete thing instead ("decide X", "at a high level",
+  "the public API"). This governs *decorative* usage only: a word that names
+  a precise mechanism with a concrete referent keeps its meaning — the
+  probe-and-**pin** source commitment in the reader design is a real
+  operation, not filler, and stays.
 
 **Git:**
 
 - Never add self-attribution to branch names, commits, PR titles, PR descriptions, or code comments.
 - Use conventional commits for commit titles and PR titles (e.g., `fix:`, `feat:`, `docs:`, `refactor:`).
 - PR titles and descriptions are written for a reader who is **not** intimately familiar with the project. Be readable, well written, and well styled. Lead with what changed and why; assume nothing about the reader's session context.
+- **Never hard-wrap paragraphs in GitHub PR descriptions, PR comments, or issue text.** GitHub renders literal newlines, so a paragraph wrapped at 80 columns displays as ragged broken lines instead of flowing to the layout. Each prose paragraph is one single line; blank lines separate paragraphs. (Column-wrapping stays correct where it belongs: code, commit message bodies, and markdown files read in editors.)
 - **PR descriptions never include a test plan or a list of verification steps.** Reviewers don't need a checklist of what you ran — they need to understand what changed and why. Test coverage belongs in the tests themselves.
 - **Never run `git reset` or `git checkout` that would destroy uncommitted or committed changes without explicit human permission.** This includes `git reset --hard`, `git checkout -- <path>`, and switching branches over a dirty working tree. Prefer `git stash`, an explicit commit, or `git restore --staged <path>` when the goal is just to unstage. Read-only git commands (`status`, `diff`, `log`) are always fine.
 
 ## Code Organization
+
+**Maximum file size: 500 lines.** A file that exceeds it is subdivided into
+modules. Split along a seam the code already has — a group of methods serving
+one concern, a type and its impls, a family of related free functions — and
+give each module a doc comment naming what it owns. Re-export from the parent
+`mod.rs` so the split is invisible to callers and no import churns. A split
+that only balances line counts, cutting a coherent unit in half, is worse than
+the long file; find the real seam.
+
+**Prefer one-word module names.** `config`, `wiring`, `handler`, `poll`,
+`settle`, `modes`. A name that needs two words usually means one of two things:
+the module owns more than one concern and should be split, or the name restates
+its parent's path (`consumer::kafka_observer` says Kafka twice — inside
+`consumer`, it is `observer`). Rename the concept until one word carries it.
+A compound name is right only when the compound *is* the domain term:
+`first_write`, `low_latency`, `event_context`.
 
 **Order within files (topological by dependencies):**
 
