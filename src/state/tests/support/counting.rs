@@ -5,6 +5,7 @@ use crate::state::cell::Values;
 use crate::state::marker::MarkerState;
 use crate::state::store::CellRead;
 use crate::state::store::CommittedBatch;
+use futures::StreamExt;
 use std::num::NonZeroUsize;
 
 #[derive(Clone)]
@@ -31,6 +32,7 @@ pub(crate) struct OpCounts {
     provisional_many: AtomicUsize,
     batch_widths: Mutex<Vec<usize>>,
     scan_hint: AtomicUsize,
+    scan_rows: AtomicUsize,
 }
 
 pub(crate) trait CountProjection: Projection {
@@ -146,6 +148,10 @@ impl<S> CountingCellStore<S> {
         self.counts.scan_hint.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn scan_rows(&self) -> usize {
+        self.counts.scan_rows.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn reset(&self) {
         for (_, count) in self.marker_counts.iter() {
             count.store(0, Ordering::Relaxed);
@@ -165,6 +171,7 @@ impl<S> CountingCellStore<S> {
         self.counts.provisional_many.store(0, Ordering::Relaxed);
         self.counts.batch_widths.lock().clear();
         self.counts.scan_hint.store(0, Ordering::Relaxed);
+        self.counts.scan_rows.store(0, Ordering::Relaxed);
     }
 }
 
@@ -195,7 +202,9 @@ impl<S: CellRead<P>, P: CountProjection> CellRead<P> for CountingCellStore<S> {
                 scan.fetch_hint.map_or(0, NonZeroUsize::get),
                 Ordering::Relaxed,
             );
-            CellRead::<P>::scan(&self.inner, collection, scan)
+            CellRead::<P>::scan(&self.inner, collection, scan).inspect(move |_| {
+                self.counts.scan_rows.fetch_add(1, Ordering::Relaxed);
+            })
         }
     }
 

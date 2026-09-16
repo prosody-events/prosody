@@ -1657,6 +1657,14 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
             &[
                 (keyset_cell(), Some(keyset_frame)),
                 (entry_cell_for(&coordinate), Some(bad_value.clone())),
+                (
+                    entry_cell_for(&I64KeyCodec::encode(&(key + 1))),
+                    Some(bad_value.clone()),
+                ),
+                (
+                    entry_cell_for(&I64KeyCodec::encode(&(key + 2))),
+                    Some(bad_value.clone()),
+                ),
             ],
             &[],
         ))?;
@@ -1684,8 +1692,8 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
             counting.reset();
             assert_eq!(
                 collect_map_keys(&handle, Direction::Forward).await?,
-                vec![key],
-                "keys() yields the key of an undecodable-value cell"
+                vec![key, key + 1, key + 2],
+                "keys() yields the keys of undecodable-value cells"
             );
             assert_presence_route_calls(&counting, tracked_route);
             counting.reset();
@@ -1693,13 +1701,16 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
                 drain(
                     handle
                         .query(Direction::Forward)
-                        .limit(NonZeroUsize::MIN)
+                        .limit(NonZeroUsize::MIN.saturating_add(1))
                         .keys()
                 )
                 .await?,
-                vec![key]
+                vec![key, key + 1]
             );
             assert_limited_fetch(&counting, tracked_route, &[4], CELL_BATCH.get());
+            if !tracked_route {
+                assert_eq!(counting.scan_rows(), 2);
+            }
 
             counting.reset();
             assert!(
