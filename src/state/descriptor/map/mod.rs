@@ -80,6 +80,7 @@ use super::{
 };
 use crate::codec::{Codec, JsonCodec};
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::cell::Presence;
 #[cfg(test)]
 use crate::state::cell_key::CellKey;
 use crate::state::cell_key::{Coordinate, Direction};
@@ -743,10 +744,7 @@ where
 
     /// Builds a directional stream query.
     pub fn query(&self, dir: Direction) -> MapQuery<'_, S, KC, V> {
-        MapQuery {
-            handle: self,
-            query: Query { dir, limit: None },
-        }
+        MapQuery::new(self, Query { dir, limit: None })
     }
 
     /// Reports whether the map holds no live entries.
@@ -767,7 +765,7 @@ where
                     .with_limit(Some(NonZeroUsize::MIN))
             })
             .await;
-        let keys = plan.keys();
+        let keys = plan.projected::<Presence>();
         futures::pin_mut!(keys);
         Ok(keys.next().await.transpose()?.is_none())
     }

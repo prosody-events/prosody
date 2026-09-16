@@ -178,19 +178,6 @@ impl<L> Overlay<L> {
         L: CellRead<P>,
     {
         let bottom = CellRead::<P>::scan(&self.lower, collection, scan);
-        self.merge_cells::<_, P>(collection, scan, bottom)
-    }
-
-    fn merge_cells<'a, S, P: Projection>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-        bottom: S,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), L::Error>> + Send + 'a
-    where
-        L: CellRead<P>,
-        S: Stream<Item = Result<(CellKey, P::Payload), L::Error>> + Send + 'a,
-    {
         let cleared = self.dirty.section_cleared(collection, scan.section);
         let mut top = self.dirty.section_snapshot(collection, scan.section);
         // Bound the dirty leg to the scan's range in `dir` before merging:

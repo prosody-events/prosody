@@ -57,9 +57,7 @@ impl FetchSchedule {
     /// Returns the size of the next fetch and advances the schedule.
     pub(crate) fn next(&mut self) -> NonZeroUsize {
         let next = self.next;
-        self.next = next
-            .saturating_mul(NonZeroUsize::MIN.saturating_add(1))
-            .min(self.max);
+        self.next = next.saturating_add(next.get()).min(self.max);
         next
     }
 }

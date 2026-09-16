@@ -31,14 +31,6 @@ use std::future::{Future, ready};
 use std::num::NonZeroUsize;
 use tokio::task::coop::cooperative;
 
-/// One item a resolving managed stream yields: a decoded key paired with its
-/// resolved value, or the error that ended the stream.
-pub(crate) type ScanItem<T> = Result<(KeyOf<T>, ResolvedOf<T>), CellStateError<CellCodecError<T>>>;
-
-/// One item a presence-only managed stream yields: a decoded key, or the error
-/// that ended the stream. The value-free twin of [`ScanItem`].
-pub(crate) type KeyItem<T> = Result<KeyOf<T>, CellStateError<CellCodecError<T>>>;
-
 /// The typed output of a projected collection stream.
 /// Presence does not decode values or require a resolver context.
 pub(crate) trait StreamProjection<S: StateSession, T: CellType>: Projection {
@@ -196,19 +188,6 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
             session,
             inner.take(limit.map_or(usize::MAX, NonZeroUsize::get)),
         )
-    }
-
-    /// Resolves each live entry in source order.
-    pub(crate) fn entries(self) -> impl Stream<Item = ScanItem<T>> + Send
-    where
-        for<'s> ContextOf<'s, T>: FromSession<'s, S>,
-    {
-        self.projected::<Values>()
-    }
-
-    /// Streams live keys without value decode or resolution.
-    pub(crate) fn keys(self) -> impl Stream<Item = KeyItem<T>> + Send {
-        self.projected::<Presence>()
     }
 }
 

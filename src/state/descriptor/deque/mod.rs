@@ -79,6 +79,7 @@ use super::{
 };
 use crate::codec::{I64Codec, I64CodecError, JsonCodec, PairCodecError};
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::cell::Values;
 use crate::state::cell_key::Direction;
 #[cfg(test)]
 use crate::state::cell_key::{CellKey, Coordinate};
@@ -476,7 +477,7 @@ where
         try_stream! {
             // Init: `stream_plan` reads the bounds cell under an admission
             // that it drops as it returns, before this `?` sees the result.
-            let inner = self.stream_plan(dir).instrument(span.clone()).await?.entries();
+            let inner = self.stream_plan(dir).instrument(span.clone()).await?.projected::<Values>();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
                 // The driver yields the decoded index. The module's window

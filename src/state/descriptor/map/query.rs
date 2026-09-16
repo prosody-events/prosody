@@ -25,8 +25,8 @@ pub(crate) struct Query {
 /// [`entries`](Self::entries).
 #[must_use]
 pub struct MapQuery<'a, S, KC, V> {
-    pub(super) handle: &'a MapHandle<S, KC, V>,
-    pub(super) query: Query,
+    handle: &'a MapHandle<S, KC, V>,
+    query: Query,
 }
 
 impl<'a, S, KC, V> MapQuery<'a, S, KC, V>
@@ -36,6 +36,12 @@ where
     KC::Key: Display,
     V: CellType<Key = UnitKey>,
 {
+    /// Binds `query` to `handle`. The reader builds one after it binds a
+    /// handle to an acquired session.
+    pub(crate) fn new(handle: &'a MapHandle<S, KC, V>, query: Query) -> Self {
+        Self { handle, query }
+    }
+
     /// Bounds the present items the stream yields. Missing cells do not consume
     /// the limit. The limit sizes the first fetch, so it also sets the first
     /// error boundary.
@@ -49,39 +55,32 @@ where
     where
         for<'s> ContextOf<'s, V>: FromSession<'s, S>,
     {
-        self.query.run::<Values, _, _, _>(self.handle)
+        self.projected::<Values>()
     }
 
     /// Streams live keys in the query direction.
     pub fn keys(self) -> impl Stream<Item = MapKeyItem<KC, V>> + 'a {
-        self.query.run::<Presence, _, _, _>(self.handle)
+        self.projected::<Presence>()
     }
-}
 
-impl Query {
-    /// Runs the query against `handle` under projection `P`.
+    /// Runs the query under projection `P`.
     /// This is the one home of the `map.stream` span.
-    pub(crate) fn run<P, S, KC, V>(
+    pub(crate) fn projected<P>(
         self,
-        handle: &MapHandle<S, KC, V>,
-    ) -> impl Stream<Item = Result<P::Item, MapStateError<CellCodecError<V>>>> + '_
+    ) -> impl Stream<Item = Result<P::Item, MapStateError<CellCodecError<V>>>> + 'a
     where
-        S: StateSession,
-        KC: OrderedKeyCodec + 'static,
-        KC::Key: Display,
-        V: CellType<Key = UnitKey>,
         P: StreamProjection<S, Keyed<KC, V>>,
         S::Engine: sealed::Reads<S, P>,
     {
         let span = info_span!(
             "map.stream",
-            collection = handle.cells.name().as_str(),
-            direction = ?self.dir,
+            collection = self.handle.cells.name().as_str(),
+            direction = ?self.query.dir,
             projection = P::NAME,
         );
         try_stream! {
-            let plan = handle.stream_plan(self.dir).instrument(span.clone()).await?;
-            let inner = plan.with_limit(self.limit).projected::<P>();
+            let plan = self.handle.stream_plan(self.query.dir).instrument(span.clone()).await?;
+            let inner = plan.with_limit(self.query.limit).projected::<P>();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
                 yield item?;

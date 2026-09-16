@@ -7,7 +7,8 @@ use crate::state::cell::{Presence, Values};
 use crate::state::collection::{StreamProjection, sealed};
 use crate::state::descriptor::map::Query;
 use crate::state::descriptor::{
-    CellType, ContextOf, FromSession, Keyed, MapDescriptor, MapHandle, ResolvedOf, StateDescriptor,
+    CellType, ContextOf, FromSession, Keyed, MapDescriptor, MapHandle, MapQuery, ResolvedOf,
+    StateDescriptor,
 };
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
 use crate::state_reader::error::StateReaderError;
@@ -92,7 +93,7 @@ where
         let handle: MapHandle<_, KC, V> = self.reader.descriptor.bind(&session)?;
         let query = self.query;
         Ok(try_stream! {
-            let inner = query.run::<P, _, _, _>(&handle);
+            let inner = MapQuery::new(&handle, query).projected::<P>();
             futures::pin_mut!(inner);
             while let Some(item) = cooperative(inner.next()).await {
                 yield item.map_err(|e| StateReaderError::store(&e))?;
