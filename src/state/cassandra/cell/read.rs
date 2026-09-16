@@ -146,12 +146,17 @@ pub(super) fn page<'a, P: CassandraProjection>(
             pk.segment_id, pk.key, pk.state_type, pk.name,
             CellKind::Cell, section, start.anchor(),
         );
-        // Unbounded demand streams through the driver pager, which reads one
-        // page ahead in its own task. Bounded demand fetches a page schedule
-        // sized to the demand; after the limit ends paging, a prefetched page
-        // would be wasted.
+        // Scylla rejects a non-positive page size, so this fallback is unreachable.
+        let page_size = NonZeroUsize::new(usize::try_from(prepared.get_page_size()).unwrap_or(0))
+            .unwrap_or(NonZeroUsize::MIN);
+        // Demand below one page fetches a page schedule sized to the demand.
+        // Unbounded demand, or demand of a page or more, streams through the
+        // driver pager, which reads one page ahead in its own task.
         let rows = match scan.fetch_hint {
-            None => {
+            Some(first) if first < page_size => Either::Right(scheduled_rows::<P, _>(
+                session, prepared, values, first, page_size,
+            )),
+            _ => {
                 let pager = session
                     .session()
                     .execute_iter(prepared.clone(), values)
@@ -165,9 +170,6 @@ pub(super) fn page<'a, P: CassandraProjection>(
                         .map_err(CassandraCellStoreError::from),
                 )
             }
-            Some(first) => Either::Right(scheduled_rows::<P, _>(
-                session, prepared, values, first,
-            )),
         };
         pin_mut!(rows);
         while let Some(row) = cooperative(rows.try_next()).await? {
@@ -186,17 +188,15 @@ pub(super) fn page<'a, P: CassandraProjection>(
 }
 
 /// Fetches pages one at a time. The first page holds `first` rows and each
-/// later page doubles, up to the prepared statement's page size.
+/// later page doubles, up to `page_size`.
 fn scheduled_rows<P: CassandraProjection, V: SerializeRow + Send + Sync>(
     session: &CassandraSession,
     prepared: &PreparedStatement,
     values: V,
     first: NonZeroUsize,
+    page_size: NonZeroUsize,
 ) -> impl Stream<Item = Result<ScanRow<P>, CassandraCellStoreError>> + Send {
     try_stream! {
-        // Scylla rejects a non-positive page size, so this fallback is unreachable.
-        let page_size = NonZeroUsize::new(usize::try_from(prepared.get_page_size()).unwrap_or(0))
-            .unwrap_or(NonZeroUsize::MIN);
         let mut fetch = FetchSchedule::new(Some(first), page_size);
         let mut paging_state = PagingState::start();
         loop {
