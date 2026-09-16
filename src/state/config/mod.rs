@@ -5,10 +5,8 @@ use crate::ByteSize;
 use crate::state::descriptor::{Registered, StateDescriptor, StructuralIdentity};
 use crate::state::{StateName, StateType};
 use crate::subsystem::SubsystemName;
-use crate::timers::duration::CompactDuration;
 use crate::util::{
-    from_duration_env_with_fallback, from_env_with_fallback,
-    from_option_duration_env_with_fallback, from_option_env,
+    from_env_with_fallback, from_option_duration_env_with_fallback, from_option_env,
 };
 use derive_builder::Builder;
 use std::env;
@@ -36,22 +34,13 @@ const SUBSYSTEM_ENV: &str = "PROSODY_SUBSYSTEM";
 
 /// Built-in default read-cache TTL, applied when the client composes readers
 /// and no other TTL is set. Five seconds trades a small staleness window for
-/// fewer repeated store reads on hot keys. It stays well within the delay
-/// reads already tolerate. The recovery sweep converges committed values
-/// within [`DEFAULT_RECOVERY_DELAY_SECS`] seconds, and routing snapshots
-/// refresh every 60 seconds.
+/// fewer repeated store reads on hot keys.
 const DEFAULT_READ_CACHE_TTL: Duration = Duration::from_secs(5);
 
 const DEFAULT_READER_CACHE_SIZE: ByteSize = match NonZeroU64::new(1_048_576) {
     Some(budget) => ByteSize::new(budget),
     None => ByteSize::new(NonZeroU64::MIN),
 };
-
-/// Environment variable for the `StateRecovery` backstop delay.
-const RECOVERY_DELAY_ENV: &str = "PROSODY_STATE_RECOVERY_DELAY";
-
-/// Default delay between staging a cell and the `StateRecovery` sweep.
-const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
 
 /// Configuration for the pipeline consumer's keyed-state layer.
 ///
@@ -95,21 +84,6 @@ pub struct KeyedStateConfiguration {
     #[validate(custom(function = "validate_cache_dir"))]
     pub cache_dir: PathBuf,
 
-    /// Delay between staging a provisional cell and the `StateRecovery`
-    /// backstop sweep that resolves any cell the eager post-commit promote
-    /// did not. Every registered collection's TTL must strictly exceed this
-    /// (checked at consumer build) so a provisional cell cannot expire before
-    /// the sweep reaches it.
-    ///
-    /// Environment variable: `PROSODY_STATE_RECOVERY_DELAY`. Accepts a
-    /// duration at second granularity and defaults to 30 seconds. Must be at
-    /// least one second: a zero delay would schedule the sweep to run
-    /// immediately, leaving no window for the fast post-commit path to resolve
-    /// the cell first.
-    #[builder(default = "recovery_delay_from_env()?")]
-    #[validate(custom(function = "validate_recovery_delay"))]
-    pub recovery_delay: CompactDuration,
-
     /// Capacity of the in-memory keyed-state cache, in **bytes**.
     ///
     /// `None` (the default) leaves the storage engine to choose its own
@@ -139,8 +113,7 @@ pub struct KeyedStateConfiguration {
 
     /// Default read-cache TTL for the readers this client composes. It sets how
     /// long a `StateReader` may serve a collection's reads from cache before
-    /// re-reading the store. Defaults to 5 seconds, well inside the delay reads
-    /// already tolerate (see the recovery sweep on [`Self::recovery_delay`]).
+    /// a fresh store read. Defaults to 5 seconds.
     ///
     /// `None` disables the inherited default. A descriptor can replace this
     /// TTL or select
@@ -243,32 +216,13 @@ impl KeyedStateConfiguration {
         !self.registrations.is_empty()
     }
 
-    /// Builds the collection registry from the registrations.
-    ///
-    /// Each registration's TTL is checked against `recovery_delay` here, the
-    /// one boundary that knows both: a provisional cell carries the
-    /// collection's TTL, so it must outlive the `StateRecovery` sweep or a
-    /// committed write could expire before recovery resolves it (invariant
-    /// 10). The intrinsic per-collection checks (name, Cassandra TTL ceiling,
-    /// identity conflict) stay in [`CollectionDefRegistry::register_identity`].
-    ///
-    /// Fails with [`RegisterStateError`] on an empty descriptor name, a TTL
-    /// over Cassandra's `USING TTL` ceiling, a TTL at or below
-    /// `recovery_delay`, a `Published` collection with no configured subsystem,
-    /// or an identity conflict.
+    /// Builds the registry and checks descriptor identities, TTLs, and
+    /// publication settings. Rejects empty names, zero or excessive TTLs,
+    /// identity conflicts, and published collections without a subsystem.
     pub(crate) fn build_registry(&self) -> Result<CollectionDefRegistry, RegisterStateError> {
         let mut registry = CollectionDefRegistry::default();
         for (state_type, name, identity, def) in &self.registrations {
             validate_publication(name, *def, self.subsystem.as_ref())?;
-            if let Some(ttl) = def.ttl
-                && ttl.seconds() <= self.recovery_delay.seconds()
-            {
-                return Err(RegisterStateError::TtlBelowRecoveryDelay {
-                    name: StateName::try_new(name)?,
-                    ttl_seconds: ttl.seconds(),
-                    recovery_seconds: self.recovery_delay.seconds(),
-                });
-            }
             registry.register_identity(*state_type, name, identity.clone(), *def)?;
         }
         Ok(registry)
@@ -300,29 +254,9 @@ fn default_cache_dir() -> PathBuf {
         .join(Uuid::new_v4().simple().to_string())
 }
 
-/// Reads [`RECOVERY_DELAY_ENV`] as a duration, falling back to
-/// [`DEFAULT_RECOVERY_DELAY_SECS`] seconds when unset. Sub-second values round
-/// to the nearest second per [`CompactDuration`]'s `Duration` conversion.
-fn recovery_delay_from_env() -> Result<CompactDuration, String> {
-    let fallback = Duration::from_secs(u64::from(DEFAULT_RECOVERY_DELAY_SECS));
-    let duration = from_duration_env_with_fallback(RECOVERY_DELAY_ENV, fallback)?;
-    CompactDuration::try_from(duration).map_err(|error| error.to_string())
-}
-
 fn validate_cache_dir(cache_dir: &Path) -> Result<(), ValidationError> {
     if cache_dir.as_os_str().is_empty() {
         return Err(ValidationError::new("cache_dir_empty"));
-    }
-    Ok(())
-}
-
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "the validator derive invokes custom functions by reference"
-)]
-fn validate_recovery_delay(recovery_delay: &CompactDuration) -> Result<(), ValidationError> {
-    if recovery_delay.seconds() == 0 {
-        return Err(ValidationError::new("recovery_delay_zero"));
     }
     Ok(())
 }

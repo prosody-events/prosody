@@ -13,7 +13,6 @@ use crate::state::memory::{
 use crate::state::publication::{PublicationStore, StatePublication};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellStore;
-use crate::state::tests::support::FixedOracle;
 use crate::state::{StateName, StateType};
 use crate::state_reader::deps::StateReaderDependencies;
 use crate::state_reader::{
@@ -127,7 +126,7 @@ impl MemoryHarness {
 /// control-plane seeding; and the reader's `deps` bundle.
 pub(in crate::state_reader::tests) trait ReaderBackend {
     /// The owner-seed cell store: [`MemoryCellStore`] for memory, the shared
-    /// `CassandraStore<FixedOracle>` for Cassandra.
+    /// `CassandraStore` for Cassandra.
     type OwnerCell: CellStore;
     /// Concrete standalone-reader component family.
     type DepsBackend: CoreReaderBackend<JsonCodec>;
@@ -137,7 +136,7 @@ pub(in crate::state_reader::tests) trait ReaderBackend {
 
     /// A cell store to seed one event through. Cloning shares the committed
     /// backing, memory cells or Cassandra rows, across a trace's events. On
-    /// Cassandra, cloning also shares the one `MarkerMemo`/`MarkerCheckSet`
+    /// Cassandra, cloning also shares the one assignment workspace
     /// lifecycle the store owns.
     fn owner_cell(&self) -> Self::OwnerCell;
 
@@ -181,18 +180,14 @@ impl MemoryReaderBackend {
 
 impl ReaderBackend for MemoryReaderBackend {
     type DepsBackend = CoreMemoryReaderBackend<JsonCodec>;
-    type OwnerCell = MemoryCellStore<FixedOracle>;
+    type OwnerCell = MemoryCellStore;
 
     fn registry(&self) -> Arc<CollectionDefRegistry> {
         self.registry.clone()
     }
 
     fn owner_cell(&self) -> Self::OwnerCell {
-        MemoryCellStore::new(
-            self.harness.cells.clone(),
-            FixedOracle::committed(),
-            self.registry.clone(),
-        )
+        MemoryCellStore::new(self.harness.cells.clone())
     }
 
     async fn publish(

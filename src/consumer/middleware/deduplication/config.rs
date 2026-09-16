@@ -22,9 +22,8 @@ pub const IDEMPOTENCE_VERSION_ENV: &str = "PROSODY_IDEMPOTENCE_VERSION";
 pub const DEFAULT_IDEMPOTENCE_VERSION: &str = "1";
 
 /// Default dedup cache capacity as a non-zero value, derived from the shared
-/// [`DEFAULT_IDEMPOTENCE_CACHE_SIZE`]. Deduplication is mandatory (the
-/// keyed-state commit oracle), so — unlike the producer cache — it cannot be
-/// disabled by setting the capacity to zero.
+/// [`DEFAULT_IDEMPOTENCE_CACHE_SIZE`]. Deduplication is mandatory in every
+/// mode. The cache cannot be disabled by setting the capacity to zero.
 const DEFAULT_DEDUP_CACHE_CAPACITY: NonZeroUsize =
     match NonZeroUsize::new(DEFAULT_IDEMPOTENCE_CACHE_SIZE) {
         Some(capacity) => capacity,
@@ -46,7 +45,7 @@ pub struct DeduplicationConfiguration {
     pub version: String,
 
     /// Global shared cache capacity across all partitions. Deduplication is
-    /// mandatory (the keyed-state commit oracle), so the capacity is
+    /// mandatory in every mode, so the capacity is
     /// `NonZeroUsize`: a zero capacity is unrepresentable rather than
     /// validated away. Setting `PROSODY_IDEMPOTENCE_CACHE_SIZE=0` is rejected
     /// when the configuration is built.

@@ -26,7 +26,6 @@ use std::time::Duration;
 use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
 
-use super::settle::{ArmOutcome, arm_backstop};
 use super::*;
 use crate::consumer::EventHandler;
 use crate::consumer::Uncommitted;
@@ -455,16 +454,9 @@ async fn pass_through_middleware_forwards_after_abort_on_terminal() -> color_eyr
     Ok(())
 }
 
-/// The settle boundary's single staged-rollback site: shutdown at the
-/// backstop arm — after a successful stage, before any marker record attempt —
-/// rolls the staged cells back to their committed base. `abandon` has no
-/// state access, and a rollback past `certify` does not compile
-/// (`Promotable` has no rollback), so rollback-after-a-marker-record-attempt
-/// is unwritable rather than tested.
+/// A permanent stage failure preserves committed state for the apply hook.
 mod staged_rollback;
 
-mod arm_backstop;
-mod backstop_amortization;
 /// Post-settle hook visibility: `finalize` drains the event's dirty overlay
 /// on success, so the apply hooks read the **lower store** — the per-cell
 /// committed projection, where an own-event provisional cell answers its
@@ -478,3 +470,5 @@ mod hook_visibility;
 mod marker_record_must_succeed;
 mod settled_view;
 mod settlement_classification;
+
+mod boundary_crash;

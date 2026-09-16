@@ -41,9 +41,9 @@
 //! sort. A `set` that would push a `Tracked` frame past the registered
 //! `keyset_limit`, or past the module's encoded-byte ceiling, writes the
 //! one-way `Overflowed` sentinel instead. Iteration then falls back to the
-//! full-section (`Unbounded`-edged) scan until `clear`, or until the whole map
-//! dies of TTL. A frame that a *lowered* `keyset_limit` left above the new
-//! bound degrades the same way, until removals shrink it back under.
+//! range scan within the query bounds until `clear`, or until the map expires.
+//! A frame that a *lowered* `keyset_limit` left above the new bound degrades
+//! the same way, until removals shrink it back under.
 //!
 //! The bound is the **live distinct-key count**. Because `remove` subtracts, a
 //! rotating map whose live size stays under the limit keeps cached iteration
@@ -53,7 +53,7 @@
 //! is deliberately not implemented, so recovery needs `clear` or TTL death.
 //!
 //! The keyset is an optimization cell, so a malformed or oversized stored frame
-//! **degrades** iteration to the full-section scan (with a warning) and is
+//! **degrades** iteration to the range scan (with a warning) and is
 //! healed by the next `set` — it never errors upward. Membership is durable
 //! data co-staged with the entry writes under one settle marker, so there is
 //! no in-RAM structure to bound.
@@ -69,23 +69,28 @@
 //! newest entry. A non-TTL'd map writes the keyset only on a content change;
 //! nothing expires, so the invariant holds vacuously.
 
+mod query;
+
+pub use query::MapQuery;
+pub(crate) use query::Query;
+
 use super::{
     CellCodecError, CellStateError, CellType, CollectionSpec, ContextOf, Descriptor, FromSession,
     Keyed, ResolvedOf, WriteOf,
 };
 use crate::codec::{Codec, JsonCodec};
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::cell::Presence;
 #[cfg(test)]
 use crate::state::cell_key::CellKey;
 use crate::state::cell_key::{Coordinate, Direction, ScanEdge};
 use crate::state::collection::{
-    Collection, CollectionLayout, CollectionRead, CollectionWrite, Constraints, JOURNAL_INLINE,
-    Plan, StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
+    Collection, CollectionLayout, CollectionRead, CollectionWrite, JOURNAL_INLINE, Plan,
+    StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
     spec_matches,
 };
 use crate::state::order_codec::{I64KeyCodec, KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::{CollectionKindId, StateAccessError, StoreOutcome};
-use async_stream::try_stream;
 use bytes::{Bytes, BytesMut};
 use educe::Educe;
 use futures::stream::{Stream, StreamExt};
@@ -94,7 +99,7 @@ use std::fmt::Display;
 use std::num::NonZeroUsize;
 use std::slice::from_ref;
 use thiserror::Error;
-use tracing::{Instrument, info_span, instrument, warn};
+use tracing::{instrument, warn};
 
 collection_layout! {
     /// The Map collection kind: one keyset cell plus one cell per key. The key
@@ -250,19 +255,18 @@ impl Codec for MapKeysetKey {
 /// unique). The count and [`KEYSET_BYTE_CEILING`] bounds are enforced at
 /// `set`: a `set` that would push the frame past either writes `Overflowed`
 /// instead — the one-way sentinel, after which iteration falls back to the
-/// full-section (`Unbounded`-edged) scan until `clear` (or TTL death of the
+/// range scan within the query bounds until `clear` (or TTL death of the
 /// whole map). Because the bound is read from the *current* registration, a
 /// redeploy that lowers `keyset_limit` can leave a stored `Tracked` frame above
-/// it; reads then degrade to the same full-section scan until removals shrink
+/// it; reads then degrade to the same range scan until removals shrink
 /// the frame back under the bound or a `set` collapses it. See the module's
 /// current-membership invariant.
 ///
 /// # Invariant: `KeysetPresence`
 ///
-/// A **live entry cell implies a present keyset cell** — equivalently, an
-/// absent keyset implies no live entries, so `stream` may return empty with
-/// zero entry reads (an empty [`Points`](Plan::Points) plan — zero
-/// coordinates, so no point gets and no scan). Three rules hold it:
+/// A **live entry cell implies a present keyset cell**. An absent keyset
+/// implies no live entries, so `stream` returns an empty coordinate plan.
+/// That plan performs no entry reads or scans. Three rules hold it:
 ///
 /// * every `set` leaves a keyset cell present. It writes one whenever the
 ///   pre-write read is `Absent` or `Malformed`, or whenever the frame must
@@ -411,113 +415,6 @@ where
 #[educe(Clone(bound = "S: Clone"))]
 pub struct MapHandle<S, KC, V> {
     cells: Collection<S, MapKind<KC, V>>,
-}
-
-/// A directional map stream query.
-///
-/// Build one with [`MapHandle::query`]. Finish with [`keys`](Self::keys) or
-/// [`entries`](Self::entries). `from` and `to` include their key. `after` and
-/// `before` exclude their key. State all edges in iteration order. A later call
-/// for the same edge replaces the earlier call. A start past the end yields an
-/// empty stream.
-#[must_use]
-pub struct MapQuery<'a, S, KC, V> {
-    handle: &'a MapHandle<S, KC, V>,
-    dir: Direction,
-    constraints: Constraints,
-}
-
-impl<'a, S, KC, V> MapQuery<'a, S, KC, V>
-where
-    S: StateSession,
-    KC: OrderedKeyCodec + 'static,
-    KC::Key: Display,
-    V: CellType<Key = UnitKey>,
-{
-    /// Starts at `key`.
-    pub fn from(mut self, key: &KC::Key) -> Self {
-        self.constraints.start = ScanEdge::Included(KC::encode(key));
-        self
-    }
-
-    /// Starts after `key`.
-    pub fn after(mut self, key: &KC::Key) -> Self {
-        self.constraints.start = ScanEdge::Excluded(KC::encode(key));
-        self
-    }
-
-    /// Stops at `key`.
-    pub fn to(mut self, key: &KC::Key) -> Self {
-        self.constraints.end = ScanEdge::Included(KC::encode(key));
-        self
-    }
-
-    /// Stops before `key`.
-    pub fn before(mut self, key: &KC::Key) -> Self {
-        self.constraints.end = ScanEdge::Excluded(KC::encode(key));
-        self
-    }
-
-    /// Sets the maximum number of present items that the stream yields.
-    /// Absent rows do not count toward the limit. Fetch sizing cannot change an
-    /// answer.
-    pub fn limit(mut self, limit: NonZeroUsize) -> Self {
-        self.constraints.limit = Some(limit);
-        self
-    }
-
-    /// Replaces the whole constraint set with one that an outer layer
-    /// lowered. The reader and the erased surfaces apply their configs
-    /// through this one method.
-    pub(crate) fn with_constraints(mut self, constraints: Constraints) -> Self {
-        self.constraints = constraints;
-        self
-    }
-
-    /// Streams live entries in the query direction.
-    pub fn entries(self) -> impl Stream<Item = MapStreamItem<KC, V>> + 'a
-    where
-        for<'s> ContextOf<'s, V>: FromSession<'s, S>,
-    {
-        // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
-        // so each inner await is instrumented with a clone instead; the
-        // span's recorded time is the stream's own work. Unlike the sibling
-        // ops' `err`, failures are yielded per item rather than recorded on
-        // the span — a failing chunk ends with an OK-status span, and the
-        // yielded `Err` surfaces to the caller inside this span's scope.
-        let span = info_span!(
-            "map.stream",
-            collection = self.handle.cells.name().as_str(),
-            direction = ?self.dir,
-        );
-        try_stream! {
-            // Init: `stream_plan` reads the keyset under an admission it drops
-            // as it returns, before this `?` observes the result.
-            let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
-            let inner = plan.entries(self.constraints);
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().instrument(span.clone()).await {
-                yield item?;
-            }
-        }
-    }
-
-    /// Streams live keys in the query direction.
-    pub fn keys(self) -> impl Stream<Item = MapKeyItem<KC, V>> + 'a {
-        let span = info_span!(
-            "map.keys",
-            collection = self.handle.cells.name().as_str(),
-            direction = ?self.dir,
-        );
-        try_stream! {
-            let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
-            let inner = plan.keys(self.constraints);
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().instrument(span.clone()).await {
-                yield item?;
-            }
-        }
-    }
 }
 
 // `KC::Key: Display` exists only so the operation spans can record the map
@@ -723,109 +620,73 @@ where
         Ok(())
     }
 
-    /// Reads the keyset cell and captures the stream's arm as an owned plan.
-    ///
-    /// An **absent** keyset means no live entries
-    /// ([`KeysetPresence`](Keyset)). The stream then takes an empty
-    /// [`Points`](Plan::Points) plan: zero coordinates, so zero point gets and
-    /// no scan.
-    ///
-    /// A `Tracked` keyset becomes the chunked point-get arm, with the keys in
-    /// `dir` order. It must sit within the registered limit and the byte
-    /// ceiling, and every coordinate must decode to a canonical key.
-    ///
-    /// Anything else degrades to the full-section scan: `Overflowed`,
-    /// malformed, oversized, or a coordinate that fails to decode or re-encode.
-    /// Each degradation that is not simply overflowed also warns.
-    ///
-    /// A keyset-read access error propagates. It never silently degrades.
+    /// Captures the query source from the keyset.
+    /// An absent keyset produces no entry reads. A valid tracked keyset selects
+    /// point reads. Other keysets select a scan within the query bounds.
+    /// Access errors propagate. Malformed or oversized keysets also emit a
+    /// warning.
     #[read(op)]
     async fn stream_plan(
         &self,
-        dir: Direction,
+        query: &Query,
     ) -> Result<Plan<S, Keyed<KC, V>>, MapStateError<CellCodecError<V>>> {
-        let coordinates = match read_keyset_state(op).await? {
-            // Absent ⇒ no live entries: an empty tracked plan — zero
-            // coordinates, so zero point gets and no scan.
+        let keyset = read_keyset_state(op).await?;
+        let range = || {
+            op.range(
+                MapKind::<KC, V>::ENTRIES,
+                query.start.clone(),
+                query.dir,
+                query.end.clone(),
+            )
+        };
+        let coordinates = match keyset {
             PriorKeyset::Absent => {
-                return Ok(Plan::Points(op.coordinates(
-                    MapKind::<KC, V>::ENTRIES,
-                    Vec::new(),
-                    dir,
-                )));
+                return Ok(op.coordinates(MapKind::<KC, V>::ENTRIES, Vec::new().into_iter()));
             }
             // Overflowed falls to the scan with no warning; Malformed already
             // warned in `read_keyset_state`.
             PriorKeyset::Malformed | PriorKeyset::Decoded(Keyset::Overflowed) => {
-                return Ok(Plan::Scan(op.range(MapKind::<KC, V>::ENTRIES, dir)));
+                return Ok(range());
             }
             PriorKeyset::Decoded(Keyset::Tracked(coordinates)) => coordinates,
         };
         if is_oversized(&coordinates, op.keyset_limit()) {
             warn!(
                 collection = op.name().as_str(),
-                "map keyset frame is oversized for the registered limit; degrading to the \
-                 full-section scan until the next set heals it"
+                "map keyset frame is oversized for the registered limit; degrading to the range \
+                 scan until the next set heals it"
             );
-            return Ok(Plan::Scan(op.range(MapKind::<KC, V>::ENTRIES, dir)));
+            return Ok(range());
         }
-        let Some(mut keys) = decoded_key_list::<KC>(&coordinates) else {
+        let Some(keys) = query.keys::<KC>(&coordinates) else {
             warn!(
                 collection = op.name().as_str(),
                 "map keyset holds a coordinate that is not canonical for its key codec; degrading \
-                 to the full-section scan until the next set heals it"
+                 to the range scan until the next set heals it"
             );
-            return Ok(Plan::Scan(op.range(MapKind::<KC, V>::ENTRIES, dir)));
+            return Ok(range());
         };
-        // Coordinates are stored strictly ascending, so forward is key order
-        // and backward is its reverse — no read-time sort.
-        if dir == Direction::Backward {
-            keys.reverse();
-        }
-        Ok(Plan::Points(op.coordinates(
-            MapKind::<KC, V>::ENTRIES,
-            keys,
-            dir,
-        )))
+        Ok(op.coordinates(MapKind::<KC, V>::ENTRIES, keys))
     }
 
-    /// Streams the live entries in key order — ascending for
-    /// [`Direction::Forward`], descending for [`Direction::Backward`]. Each
-    /// entry's value is resolved as it is yielded.
+    /// Streams live entries in key order, ascending for [`Direction::Forward`].
     ///
-    /// # Per-arm consistency (a paged read, not a snapshot)
+    /// A tracked keyset fixes membership when the stream starts. Values remain
+    /// live: each chunk reads current values and skips absent cells. Later key
+    /// additions do not appear. A chunk resolves all its values before
+    /// emission; a failed chunk emits only its error. [`MapQuery::limit`]
+    /// sizes each fetch.
     ///
-    /// A `Tracked` keyset within its bound is the fast arm: **key membership is
-    /// snapshotted at init** (the one keyset read), then the listed keys are
-    /// point-got in chunks of `CELL_BATCH`. Keys added after init are not
-    /// yielded; **values are read live, chunk by chunk** — a key
-    /// removed/cleared/expired after init reads absent (skipped, the
-    /// current-membership skip) and an overwritten key yields the newer value
-    /// when its chunk is fetched. So a warm small map streams entirely from
-    /// cache with zero durable scans.
+    /// An overflowed or invalid keyset selects a range scan. This scan captures
+    /// the dirty writes when it starts and reads durable pages as needed.
+    /// It hides cleared cells but can observe later commits ahead of the
+    /// cursor. An absent keyset produces an empty stream without entry
+    /// reads.
     ///
-    /// An `Overflowed`, malformed, oversized, or otherwise undecodable keyset
-    /// degrades to a **full-section** (`Unbounded`-edged) scan. That scan pages
-    /// live: it snapshots the own dirty writes at init and reads the durable
-    /// leg lazily. It hides cleared cells. It can also observe entries the
-    /// handler itself mid-handler-commits ahead of the cursor. It still
-    /// terminates, because a finite handler inserts finitely many coordinates
-    /// ahead. That is a visibility semantic, not a termination hazard.
-    ///
-    /// An **absent** keyset means no live entries (the current-membership
-    /// invariant), so the stream yields nothing with zero entry reads and no
-    /// scan.
-    ///
-    /// Session admission is taken at init for the keyset read. The tracked
-    /// (point) arm then takes it once per chunk, at most `CELL_BATCH` point
-    /// reads each: a chunk's admission covers its batch fetch, and is released
-    /// before the chunk is decoded and resolved. The degraded scan arm takes no
-    /// admission after init and pages gate-free. Neither arm holds admission
-    /// across a yield, for items and errors alike, so a handler may mutate this
-    /// map between stream items without deadlock (`StreamYieldFree`, over the
-    /// per-event session operation gate). Errors are chunk-atomic: a failing
-    /// chunk yields none of its items (all its live entries, or only its
-    /// error).
+    /// Planning and point fetches hold session admission. Resolution and yields
+    /// hold no admission; range scans run without admission after planning.
+    /// The handler can mutate this map between items. Every completion checks
+    /// the attempt fence, including errors and exhaustion.
     pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapStreamItem<KC, V>> + '_
     where
         for<'s> ContextOf<'s, V>: FromSession<'s, S>,
@@ -833,44 +694,43 @@ where
         self.query(dir).entries()
     }
 
-    /// Streams the live entries' **keys** in key order (ascending for
-    /// [`Direction::Forward`], descending for [`Direction::Backward`]) —
-    /// **without decoding or resolving any value**. So a message-backed map
-    /// enumerates keys with **zero Kafka fetches**: the guarantee is "no value
-    /// decode, no resolver run," not "no I/O" (the tracked arm still does a
-    /// presence-only batch read; the degrade arm uses a presence-only scan).
-    ///
-    /// Presence-only: a key is yielded for every present cell, even one whose
-    /// value would fail to decode or resolve (unlike [`stream`](Self::stream),
-    /// which errors on such a value) — presence is about the cell, not the
-    /// value (mirrors [`contains_key`](Self::contains_key)). The arm choice,
-    /// per-arm consistency, and admission/fence posture are exactly
-    /// [`stream`](Self::stream)'s (same keyset-plan decision); only the value
-    /// work is dropped.
+    /// Streams live keys without value decoding or resolution.
+    /// Message-backed maps perform no Kafka fetches. Storage presence reads
+    /// still occur, and a corrupt value does not hide its key.
+    /// Source selection, consistency, and admission follow [`Self::stream`].
     pub fn keys(&self, dir: Direction) -> impl Stream<Item = MapKeyItem<KC, V>> + '_ {
         self.query(dir).keys()
     }
 
     /// Builds a directional stream query.
     pub fn query(&self, dir: Direction) -> MapQuery<'_, S, KC, V> {
-        MapQuery {
-            handle: self,
-            dir,
-            constraints: Constraints::default(),
-        }
+        MapQuery::new(self, Query::new(dir))
     }
 
     /// Reports whether the map holds no live entries.
+    ///
+    /// This reads the entries section, not the keyset. After a split commit
+    /// leaves keyset residue, it can report a live entry that `keys` does not
+    /// list.
     ///
     /// # Errors
     ///
     /// Returns a key codec error or an access error from the session.
     #[instrument(name = "map.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err)]
     pub async fn is_empty(&self) -> Result<bool, MapStateError<CellCodecError<V>>> {
-        let keys = self
-            .query(Direction::Forward)
-            .limit(NonZeroUsize::MIN)
-            .keys();
+        let plan = self
+            .cells
+            .read(async |op| {
+                op.range(
+                    MapKind::<KC, V>::ENTRIES,
+                    ScanEdge::Unbounded,
+                    Direction::Forward,
+                    ScanEdge::Unbounded,
+                )
+                .with_limit(Some(NonZeroUsize::MIN))
+            })
+            .await;
+        let keys = plan.projected::<Presence>();
         futures::pin_mut!(keys);
         Ok(keys.next().await.transpose()?.is_none())
     }
@@ -944,8 +804,8 @@ where
         Err(CellStateError::Codec(_)) => {
             warn!(
                 collection = op.name().as_str(),
-                "map keyset frame did not decode; degrading to the full-section scan until the \
-                 next set heals it"
+                "map keyset frame did not decode; degrading to the range scan until the next set \
+                 heals it"
             );
             Ok(PriorKeyset::Malformed)
         }
@@ -1130,30 +990,6 @@ fn is_oversized(keys: &[Coordinate], limit: usize) -> bool {
     keys.len() > limit || tracked_frame_len(keys).is_none_or(|len| len > KEYSET_BYTE_CEILING)
 }
 
-/// Decodes each stored coordinate to its logical key, returning `None` if any
-/// coordinate fails [`KC::decode`](OrderedKeyCodec::decode) or is not canonical
-/// (re-encoding the decoded key must reproduce the stored bytes — a
-/// contract-breaking aliasing codec could otherwise collapse two coordinates
-/// onto one key and yield an entry twice). The caller degrades the stream to
-/// the scan on `None`. Sized once (`with_capacity`), bounded by the keyset
-/// limit.
-///
-/// The canonicality re-encode costs one [`Coordinate`] per tracked key —
-/// bounded by the registered limit and paid once per stream construction, not
-/// per item — and is accepted over trusting the codec's byte-identity law,
-/// because an aliasing codec would otherwise silently double-yield an entry.
-fn decoded_key_list<KC: OrderedKeyCodec>(coordinates: &[Coordinate]) -> Option<Vec<KC::Key>> {
-    let mut keys = Vec::with_capacity(coordinates.len());
-    for coordinate in coordinates {
-        let key = KC::decode(coordinate.as_bytes()).ok()?;
-        if KC::encode(&key) != *coordinate {
-            return None;
-        }
-        keys.push(key);
-    }
-    Some(keys)
-}
-
 /// Parses an untrusted keyset frame. Every length is bounds-checked with
 /// overflow-safe arithmetic, `with_capacity` is capped by what the remaining
 /// bytes can hold (never the raw count field), coordinates are sliced zero-copy
@@ -1249,7 +1085,7 @@ pub(crate) fn keyset_cell() -> CellKey {
 
 impl<KC, V> Descriptor<MapKind<KC, V>> {
     /// Sets the Map keyset bound: the number of **live** distinct keys this map
-    /// tracks before overflowing to the full-section scan. Default `128`,
+    /// tracks before overflowing to the range scan. Default `128`,
     /// validated `<= 4096` at registration; `0` disables tracking (every map
     /// overflows on its first `set`). Because `remove` subtracts, a rotating
     /// map whose live size stays under the bound keeps cached iteration; a

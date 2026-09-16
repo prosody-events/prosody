@@ -27,17 +27,10 @@ fn create_retry_handler<T>(handler: T, max_retries: u32) -> RetryHandler<T> {
     }
 }
 
-// === Classification Property ===
-//
-// `RetryHandler::run` makes one decision per attempt: retry (Transient,
-// attempts left), stop-with-error (Permanent/Terminal, or Transient with
-// attempts exhausted), or stop-with-success. `expected_outcome` walks a
-// scripted failure sequence through that same decision and predicts the
-// call count, the final Ok/Err, and the demand-type sequence
-// (`Normal` on attempt 1, `Failure` on every retry) — one property replaces
-// five single-path examples (success-first-try, transient-then-succeeds,
-// permanent-immediate, terminal-immediate, first-attempt-demand-type).
-// `transient_error_fails_after_max_retries` stays as a literal anchor.
+// On each attempt, `RetryHandler::run` retries, stops with an error, or stops
+// with success. `expected_outcome` predicts the call count, final result,
+// and demand for each attempt, including the retry ordinal.
+// `transient_error_fails_after_max_retries` remains the literal anchor.
 
 #[test]
 fn prop_retry_classification_arithmetic() {
@@ -47,16 +40,12 @@ fn prop_retry_classification_arithmetic() {
     fn expected_outcome(
         failures: &[ErrorCategory],
         max_retries: u32,
+        demand: DemandType,
     ) -> (usize, bool, Vec<DemandType>) {
-        let mut demand_types = Vec::new();
+        let mut demand_types = vec![demand];
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            demand_types.push(if attempt == 1 {
-                DemandType::Normal
-            } else {
-                DemandType::Failure
-            });
             let Some(&category) = failures.get((attempt - 1) as usize) else {
                 return (attempt as usize, false, demand_types);
             };
@@ -64,10 +53,13 @@ fn prop_retry_classification_arithmetic() {
                 ErrorCategory::Transient if attempt <= max_retries => {}
                 _ => return (attempt as usize, true, demand_types),
             }
+            demand_types.push(DemandType::Failure {
+                retry: demand.retry().saturating_add(attempt),
+            });
         }
     }
 
-    fn property(raw_failures: Vec<u8>, max_retries_raw: u8) -> TestResult {
+    fn property(raw_failures: Vec<u8>, max_retries_raw: u8, demand: DemandType) -> TestResult {
         // Bound both axes so each iteration's paused-clock retry loop stays
         // fast while still crossing the zero/non-zero and
         // exhausted/not-exhausted boundaries.
@@ -82,7 +74,7 @@ fn prop_retry_classification_arithmetic() {
             .collect();
         let max_retries = u32::from(max_retries_raw % 4);
         let (expected_calls, expected_err, expected_demand_types) =
-            expected_outcome(&failures, max_retries);
+            expected_outcome(&failures, max_retries, demand);
 
         let runtime = Builder::new_current_thread()
             .enable_time()
@@ -101,8 +93,7 @@ fn prop_retry_classification_arithmetic() {
             };
 
             let result =
-                FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal)
-                    .await;
+                FallibleHandler::on_message(&retry_handler, context, message, demand).await;
 
             if result.is_err() != expected_err {
                 return TestResult::error(format!(
@@ -126,7 +117,7 @@ fn prop_retry_classification_arithmetic() {
         })
     }
 
-    QuickCheck::new().quickcheck(property as fn(Vec<u8>, u8) -> TestResult);
+    QuickCheck::new().quickcheck(property as fn(Vec<u8>, u8, DemandType) -> TestResult);
 }
 
 /// Named anchor: pins the exact "1 + `max_retries`" call count as a literal,

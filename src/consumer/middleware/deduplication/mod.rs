@@ -89,7 +89,7 @@ pub struct DeduplicationMiddleware<S: DeduplicationStoreProvider, P> {
 impl<S: DeduplicationStoreProvider, P> DeduplicationMiddleware<S, P> {
     /// Creates a new middleware.
     ///
-    /// Deduplication is mandatory: it is the commit oracle for keyed state, so
+    /// Deduplication is mandatory in every mode, so
     /// there is no disabled variant.
     ///
     /// # Errors

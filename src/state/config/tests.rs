@@ -50,20 +50,6 @@ fn empty_cache_dir_is_rejected() -> Result<()> {
     Ok(())
 }
 
-/// A zero `recovery_delay` is rejected: a zero delay would fire the sweep
-/// immediately, leaving no window for the fast post-commit path.
-#[test]
-fn zero_recovery_delay_is_rejected() -> Result<()> {
-    let config = KeyedStateConfiguration::builder()
-        .recovery_delay(CompactDuration::new(0))
-        .build()?;
-    assert!(
-        config.validate().is_err(),
-        "a zero recovery_delay must fail validation"
-    );
-    Ok(())
-}
-
 /// A zero read-cache TTL would make every cached entry born stale. Validation
 /// rejects it here, mirroring the check applied when the reader is constructed.
 /// A sub-millisecond TTL is valid — reader age is measured against a
@@ -92,89 +78,51 @@ fn zero_read_cache_ttl_is_rejected() -> Result<()> {
     Ok(())
 }
 
-/// Indefinite retention (`None`) is always allowed — the TTL ceiling
-/// guards only oversized `Some` values, never the opt-out.
+/// Registration accepts no expiry or a TTL that binds within the Cassandra
+/// range.
 #[test]
-fn collection_ttl_none_is_allowed() -> Result<()> {
-    let mut config = KeyedStateConfiguration::builder().build()?;
-    let _ = config.register(cart());
-    assert!(config.build_registry().is_ok());
-    Ok(())
-}
+fn prop_collection_ttl_registration() {
+    fn prop(seconds: u32, nanos: u32) -> TestResult {
+        let check = || -> Result<()> {
+            use std::time::Duration;
 
-#[test]
-fn collection_ttl_at_the_ceiling_is_allowed() -> Result<()> {
-    let ttl = CompactDuration::new(CEILING_SECS);
-    let mut config = KeyedStateConfiguration::builder().build()?;
-    let _ = config.register(cart().ttl(ttl));
-    assert!(config.build_registry().is_ok());
-    Ok(())
-}
-
-#[test]
-fn collection_ttl_over_the_ceiling_is_rejected() -> Result<()> {
-    let over = CEILING_SECS + 1;
-    let mut config = KeyedStateConfiguration::builder().build()?;
-    let _ = config.register(cart().ttl(CompactDuration::new(over)));
-    assert!(matches!(
-        config.build_registry(),
-        Err(RegisterStateError::Ttl { seconds, .. }) if seconds == over
-    ));
-    Ok(())
-}
-
-/// A TTL equal to the recovery delay is rejected: the cell must *outlive*
-/// the sweep, so the floor is strict (`>`), not `>=`.
-#[test]
-fn collection_ttl_at_the_recovery_delay_is_rejected() -> Result<()> {
-    let delay = CompactDuration::new(60);
-    let mut config = KeyedStateConfiguration::builder()
-        .recovery_delay(delay)
-        .build()?;
-    let _ = config.register(cart().ttl(delay));
-    assert!(matches!(
-        config.build_registry(),
-        Err(RegisterStateError::TtlBelowRecoveryDelay {
-            ttl_seconds,
-            recovery_seconds,
-            ..
-        }) if ttl_seconds == 60 && recovery_seconds == 60
-    ));
-    Ok(())
-}
-
-/// A TTL one second above the recovery delay clears the floor.
-#[test]
-fn collection_ttl_above_the_recovery_delay_is_allowed() -> Result<()> {
-    let mut config = KeyedStateConfiguration::builder()
-        .recovery_delay(CompactDuration::new(60))
-        .build()?;
-    let _ = config.register(cart().ttl(CompactDuration::new(61)));
-    assert!(config.build_registry().is_ok());
-    Ok(())
-}
-
-/// Round-trip: whatever `recovery_within` a descriptor is built with is
-/// exactly what `recovery_within_for` reads back after registration (unset ⇒
-/// `None`). Proves the fluent config reaches the registry unaltered and that
-/// the bound needs no validation (`build_registry` accepts any duration,
-/// since it is tightening-only against the recovery-delay floor).
-#[test]
-fn prop_recovery_within_round_trips_through_the_registry() {
-    fn prop(within: Option<u32>) -> TestResult {
-        let bound = within.map(CompactDuration::new);
-        let mut descriptor = cart();
-        if let Some(d) = bound {
-            descriptor = descriptor.recovery_within(d);
-        }
-
-        match round_trip(descriptor) {
-            Ok(read) if read == bound => TestResult::passed(),
-            Ok(read) => TestResult::error(format!("expected {bound:?}, read {read:?}")),
-            Err(e) => TestResult::error(format!("registry build failed: {e}")),
+            let samples = [
+                None,
+                Some(CompactDuration::MIN),
+                Some(Duration::from_nanos(u64::from(nanos % 500_000_000)).try_into()?),
+                Some(Duration::from_millis(999).try_into()?),
+                Some(CompactDuration::new(1)),
+                Some(CompactDuration::new(60)),
+                Some(CompactDuration::new(CEILING_SECS)),
+                Some(CompactDuration::new(CEILING_SECS + 1)),
+                Some(CompactDuration::new(seconds)),
+            ];
+            for ttl in samples {
+                let mut config = KeyedStateConfiguration::builder().build()?;
+                let descriptor = ttl.map_or_else(cart, |ttl| cart().ttl(ttl));
+                let _ = config.register(descriptor);
+                let result = config.build_registry();
+                match ttl {
+                    Some(ttl) if ttl.is_zero() || ttl.seconds() > CEILING_SECS => {
+                        assert!(
+                            matches!(result, Err(RegisterStateError::Ttl { seconds, .. })
+                            if seconds == ttl.seconds()),
+                            "TTL {ttl:?}: {result:?}"
+                        );
+                    }
+                    _ => {
+                        result?;
+                    }
+                }
+            }
+            Ok(())
+        };
+        match check() {
+            Ok(()) => TestResult::passed(),
+            Err(error) => TestResult::error(error.to_string()),
         }
     }
-    QuickCheck::new().quickcheck(prop as fn(Option<u32>) -> TestResult);
+    QuickCheck::new().quickcheck(prop as fn(u32, u32) -> TestResult);
 }
 
 /// A Map keyset limit over the `4096` ceiling is rejected at build; the
@@ -236,16 +184,4 @@ fn prop_published_requires_subsystem() {
         }
     }
     QuickCheck::new().quickcheck(prop as fn(bool, bool) -> TestResult);
-}
-
-/// Registers `descriptor` and reads its `recovery_within` back from the
-/// built registry.
-fn round_trip(descriptor: ValueDescriptor) -> Result<Option<CompactDuration>> {
-    use crate::state::{StateName, StateType};
-
-    let mut config = KeyedStateConfiguration::builder().build()?;
-    let _ = config.register(descriptor);
-    Ok(config
-        .build_registry()?
-        .recovery_within_for(StateType::Application, &StateName::try_new("cart")?))
 }

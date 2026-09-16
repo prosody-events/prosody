@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_util::TEST_RUNTIME;
 
 // --- Map parity -------------------------------------------------------------
 
@@ -120,7 +121,7 @@ fn run_map_parity<P>(ops: &[MapOp]) -> Result<bool>
 where
     P: ParityPayload + Send + Sync + 'static,
 {
-    executor::block_on(async {
+    TEST_RUNTIME.block_on(async {
         let ctx = parity_context::<P>()?;
         let handle = ctx
             .map_state(MAP_NAME)

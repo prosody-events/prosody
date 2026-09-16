@@ -36,10 +36,11 @@ use crate::consumer::message::ConsumerMessage;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MessageLoader;
 use crate::state::cell_key::{Direction, ScanEdge};
-use crate::state::collection::{Constraints, WritableStateSession};
+use crate::state::collection::WritableStateSession;
+use crate::state::descriptor::map::Query;
 use crate::state::descriptor::{
     CellCodecError, CellStateError, CellType, ContextOf, DequeHandle, DequeStateError, FromSession,
-    MapHandle, MapStateError, ResolvedOf, ValueHandle,
+    MapHandle, MapQuery, MapStateError, ResolvedOf, ValueHandle,
 };
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey, Utf8KeyCodec};
 
@@ -797,9 +798,7 @@ where
     fn scan(&self, config: MapScanConfig) -> BoxStateCursor<(String, ResolvedOf<T>)> {
         let handle = self.handle.clone();
         let stream = try_stream! {
-            let inner = handle
-                .query(config.dir)
-                .with_constraints(map_constraints(config))
+            let inner = MapQuery::new(&handle, map_query(config))
                 .entries();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
@@ -813,9 +812,7 @@ where
     fn keys(&self, config: MapScanConfig) -> BoxStateCursor<String> {
         let handle = self.handle.clone();
         let stream = try_stream! {
-            let inner = handle
-                .query(config.dir)
-                .with_constraints(map_constraints(config))
+            let inner = MapQuery::new(&handle, map_query(config))
                 .keys();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
@@ -964,14 +961,15 @@ fn bound_usize(bound: Bound<u64>) -> Bound<usize> {
     bound.map(|value| usize::try_from(value).unwrap_or(usize::MAX))
 }
 
-/// Lowers an erased [`MapScanConfig`] to typed [`Constraints`].
-fn map_constraints(config: MapScanConfig) -> Constraints {
+/// Encodes the map bounds once before the stream starts.
+fn map_query(config: MapScanConfig) -> Query {
     let edge = |bound: Bound<String>| match bound {
         Bound::Included(key) => ScanEdge::Included(Utf8KeyCodec::encode(&key)),
         Bound::Excluded(key) => ScanEdge::Excluded(Utf8KeyCodec::encode(&key)),
         Bound::Unbounded => ScanEdge::Unbounded,
     };
-    Constraints {
+    Query {
+        dir: config.dir,
         start: edge(config.start),
         end: edge(config.end),
         limit: config.limit,

@@ -94,7 +94,7 @@ pub mod map;
 mod value;
 
 pub use deque::{DequeDescriptor, DequeHandle, DequeQuery, DequeStateError, deque_state};
-pub use map::{MapDescriptor, MapHandle, MapStateError, map_state};
+pub use map::{MapDescriptor, MapHandle, MapQuery, MapStateError, map_state};
 pub use value::{ValueDescriptor, ValueHandle, ValueKind, value_state};
 
 /// A resolver: how a decoded cell (`Stored`) maps to and from the value a
@@ -408,8 +408,8 @@ pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
 
     /// Sets the collection's durable write TTL: the per-write Cassandra
     /// `USING TTL` that bounds how long stored state is retained. Registration
-    /// validates it against the ceiling and the recovery delay. The granularity
-    /// is seconds ([`CompactDuration`]), matching what Cassandra can store.
+    /// rejects values below one second or above the Cassandra ceiling.
+    /// The granularity is seconds ([`CompactDuration`]), as Cassandra requires.
     ///
     /// This governs retention only, never read freshness. The read-only
     /// client's cache TTL is the separate [`Self::read_cache`] policy.
@@ -417,19 +417,6 @@ pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
     fn ttl(self, ttl: CompactDuration) -> Self {
         let mut def = self.collection_def();
         def.ttl = Some(ttl);
-        self.with_collection_def(def)
-    }
-
-    /// Sets the collection's recovery-convergence bound: guarantee its
-    /// provisional cells are swept back to committed within `d` of the commit,
-    /// tightening how long an external (non-owner) reader can observe the
-    /// prior committed value. Only ever *tightens* the per-key backstop; a
-    /// value above the always-on `recovery_delay` floor is clamped by it.
-    /// See [`CollectionDef`].
-    #[must_use]
-    fn recovery_within(self, d: CompactDuration) -> Self {
-        let mut def = self.collection_def();
-        def.recovery_within = Some(d);
         self.with_collection_def(def)
     }
 

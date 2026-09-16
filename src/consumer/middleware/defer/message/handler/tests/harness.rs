@@ -290,7 +290,11 @@ impl TestHarness {
     }
 
     /// Executes a timer event using the real `MessageDeferHandler`.
-    pub async fn execute_timer(&mut self, event: &TimerEvent) -> color_eyre::Result<()> {
+    pub async fn execute_timer(
+        &mut self,
+        event: &TimerEvent,
+        demand: DemandType,
+    ) -> color_eyre::Result<()> {
         let key = &self.keys[event.key_idx];
 
         // Log state before execution
@@ -353,10 +357,7 @@ impl TestHarness {
         let trigger = Trigger::for_testing(key.clone(), trigger_time, TimerType::DeferredMessage);
 
         // Call the real MessageDeferHandler::on_timer
-        let result = self
-            .handler
-            .on_timer(key_context, trigger, DemandType::Normal)
-            .await;
+        let result = self.handler.on_timer(key_context, trigger, demand).await;
 
         // Timer event outcomes:
         // - Success: completes, schedules next if queue not empty, returns Ok
@@ -394,7 +395,7 @@ impl TestHarness {
     pub async fn execute_event(&mut self, event: &TraceEvent) -> color_eyre::Result<()> {
         match event {
             TraceEvent::Message(msg) => self.execute_message(msg).await,
-            TraceEvent::Timer(timer) => self.execute_timer(timer).await,
+            TraceEvent::Timer(timer) => self.execute_timer(timer, DemandType::Normal).await,
         }
     }
 

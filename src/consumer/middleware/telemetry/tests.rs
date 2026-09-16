@@ -404,7 +404,7 @@ async fn on_timer_failure_emits_timer_failed_with_error_fields() {
     let trigger = create_test_trigger_with("fail-timer", 9000, TimerType::DeferredMessage);
 
     let _ = telemetry_handler
-        .on_timer(context, trigger, DemandType::Failure)
+        .on_timer(context, trigger, DemandType::Failure { retry: 1 })
         .await;
 
     let events = collect_events(&mut rx);
@@ -426,7 +426,7 @@ async fn on_timer_failure_emits_timer_failed_with_error_fields() {
         matches!(
             f.map(|t| &t.event_type),
             Some(TimerEventType::Failed {
-                demand_type: DemandType::Failure,
+                demand_type: DemandType::Failure { retry: 1 },
                 error_category: ErrorCategory::Transient,
                 ..
             })

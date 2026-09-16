@@ -27,6 +27,7 @@ use crate::timers::duration::CompactDuration;
 use crate::{ByteSize, Codec, ConsumerGroup, EventIdentity, EventType, Topic};
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub(crate) type MemoryStateProvider<P> = StateManagerProvider<
     MemoryStateBackendFactory<MemoryDeduplicationStoreProvider>,
@@ -48,6 +49,7 @@ pub(crate) struct KeyedStateInputs {
     registry: Arc<CollectionDefRegistry>,
     topics: Option<PublicationTopics>,
     mock: bool,
+    dedup_ttl: CompactDuration,
 }
 
 impl KeyedStateInputs {
@@ -58,6 +60,7 @@ impl KeyedStateInputs {
         config: KeyedStateConfiguration,
         consumer_config: &ConsumerConfiguration,
         dedup_version: &str,
+        dedup_ttl: Duration,
     ) -> Result<Self, ConsumerError> {
         // Fail before backend I/O instead of waiting for the first rebalance.
         CompactDuration::try_from(consumer_config.slab_size)
@@ -75,6 +78,7 @@ impl KeyedStateInputs {
             registry,
             topics: PublicationTopics::new(topics),
             mock: consumer_config.mock,
+            dedup_ttl: CompactDuration::new(u32::try_from(dedup_ttl.as_secs()).unwrap_or(u32::MAX)),
         })
     }
 
@@ -94,7 +98,7 @@ impl KeyedStateInputs {
             publisher,
             self.registry.clone(),
             self.group.clone(),
-            self.config.recovery_delay,
+            self.dedup_ttl,
         )
     }
 
@@ -159,10 +163,7 @@ impl KeyedStateInputs {
 /// and the caller's in-memory message loader, wrapped in the partition state
 /// provider. The pipeline also hands this loader to message defer. Other arms
 /// take their concrete bundle's loader.
-/// The factory is store-type agnostic — the commit oracle's trigger store
-/// handle arrives per partition via
-/// [`PartitionStateProvider::acquire`](crate::state::manager::PartitionStateProvider::acquire)
-/// — so the concrete return type serves any trigger backend.
+/// The returned provider supports any trigger backend.
 pub(in crate::consumer) fn memory_state_provider<C: Codec>(
     keyed_state: &KeyedStateInputs,
     dedup_provider: MemoryDeduplicationStoreProvider,
@@ -179,7 +180,6 @@ where
     let backend = MemoryStateBackendFactory::new(
         cells,
         identities,
-        keyed_state.registry.clone(),
         dedup_provider,
         keyed_state.group.clone(),
     );
@@ -247,7 +247,7 @@ mod tests {
             .subscribed_topics(&["orders".to_owned()])
             .mock(false)
             .build()?;
-        let inputs = KeyedStateInputs::new(state, &consumer, "v1")?;
+        let inputs = KeyedStateInputs::new(state, &consumer, "v1", Duration::from_secs(30))?;
 
         let result = inputs.memory_publication_setup(MemoryPublicationStore::new());
 

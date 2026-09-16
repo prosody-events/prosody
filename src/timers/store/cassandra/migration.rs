@@ -106,6 +106,13 @@ pub(crate) async fn migrate_segment_if_needed(
         segment = migrate_key_states(store, segment).await?;
     }
 
+    if segment.version == SegmentVersion::V3 {
+        store
+            .update_segment_version(SegmentVersion::V4, segment.slab_size)
+            .await?;
+        segment.version = SegmentVersion::V4;
+    }
+
     Ok(segment)
 }
 
@@ -534,7 +541,10 @@ pub(crate) async fn migrate_slab_size(
     let old_slab_size = segment.slab_size;
 
     // Verify segment is v2 or v3 (V3 is a superset of V2 — schema-compatible)
-    if !matches!(segment.version, SegmentVersion::V2 | SegmentVersion::V3) {
+    if !matches!(
+        segment.version,
+        SegmentVersion::V2 | SegmentVersion::V3 | SegmentVersion::V4
+    ) {
         warn!(
             "Cannot migrate slab_size for segment {segment_id}: segment is not v2/v3 (version = \
              {:?}). Run version migration first.",

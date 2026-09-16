@@ -35,3 +35,6 @@ pub use identity::{
     CassandraDescriptorIdentityError, CassandraDescriptorIdentityStore, IdentityQueries,
 };
 pub use publication::{CassandraPublicationError, CassandraPublicationStore, PublicationQueries};
+
+#[cfg(test)]
+pub(in crate::state) use cell::{crash_settle_batches, crash_stage_batches, crash_stage_chunk};

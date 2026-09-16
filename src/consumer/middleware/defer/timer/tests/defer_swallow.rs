@@ -60,12 +60,12 @@ fn defer_handler<T>(
 }
 
 /// Part A — the swallow: a staged-then-transient inner attempt swallowed
-/// into `Ok(Deferred)` arms NO backstop, stages nothing, records nothing,
+/// into `Ok(Deferred)` arms NO recovery timer, stages nothing, records nothing,
 /// and commits the trigger; the dirty residue dies with the scope drop.
 /// Part B — the parity control: a clean success that staged nothing arms
 /// nothing either (`Finalized::Clean` never arms).
 #[tokio::test]
-async fn defer_swallow_arms_no_backstop_and_stages_nothing() -> color_eyre::Result<()> {
+async fn defer_swallow_stages_nothing() -> color_eyre::Result<()> {
     use crate::state::manager::EventStateScope;
 
     let topic = Topic::from("test-topic");
@@ -111,7 +111,7 @@ async fn defer_swallow_arms_no_backstop_and_stages_nothing() -> color_eyre::Resu
     assert_eq!(
         context.count_scheduled(TimerType::StateRecovery),
         0,
-        "a bypassed dispatch must arm NO StateRecovery backstop (Clean-never-arms parity)",
+        "a bypassed dispatch must arm NO StateRecovery recovery timer",
     );
     assert_eq!(
         committed_json_value(&cell_store, state_key, "cart").await?,
@@ -166,7 +166,7 @@ async fn defer_swallow_arms_no_backstop_and_stages_nothing() -> color_eyre::Resu
     assert_eq!(
         clean_context.count_scheduled(TimerType::StateRecovery),
         0,
-        "a clean (nothing-staged) success arms no backstop",
+        "a clean (nothing-staged) success arms no recovery timer",
     );
     assert_eq!(clean_committed.load(Ordering::SeqCst), 1);
     Ok(())

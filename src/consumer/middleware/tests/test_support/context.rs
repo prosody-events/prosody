@@ -44,26 +44,17 @@ pub struct MockEventContext<P = Value, S = UnavailableState<P>> {
     timer_operations: Option<Arc<Mutex<Vec<TimerOperation>>>>,
 
     /// Durable timer rows the mock's timer ops maintain, so `scheduled`
-    /// answers from the same state `schedule`/`clear_and_schedule` mutate —
-    /// like the real trigger store. Seed with
-    /// [`with_durable_timer`](Self::with_durable_timer) to simulate a prior
-    /// epoch's timer surviving a partition reacquisition; observe what an op
-    /// left standing with [`durable_scheduled`](Self::durable_scheduled).
+    /// Shares the timer state that schedule and clear operations change.
     durable_timers: Arc<Mutex<Vec<(CompactDateTime, TimerType)>>>,
 
     /// Number of leading timer schedules that fail (with
     /// [`Self::timer_fail_category`]) before schedules start succeeding —
-    /// drives the arm's retry-forever self-heal. Shared so a clone observes
+    /// tests schedule retries. Shared so a clone observes
     /// the same countdown.
     timer_fail_count: Arc<AtomicUsize>,
 
     /// The category the leading failures classify as.
     timer_fail_category: ErrorCategory,
-
-    /// When set, the next `scheduled()` read flips the shutdown watch as a
-    /// side effect — see
-    /// [`with_shutdown_on_timer_read`](Self::with_shutdown_on_timer_read).
-    shutdown_on_timer_read: bool,
 
     /// Keyed-state session descriptor binds route to; defaults to the
     /// [`UnavailableState`] stub.
@@ -102,7 +93,6 @@ where
             durable_timers: Arc::new(Mutex::new(Vec::new())),
             timer_fail_count: Arc::new(AtomicUsize::new(0)),
             timer_fail_category: ErrorCategory::Permanent,
-            shutdown_on_timer_read: false,
             session: UnavailableState::new(),
             _payload: PhantomData,
         }
@@ -122,18 +112,9 @@ impl<P, S> MockEventContext<P, S> {
             durable_timers: self.durable_timers,
             timer_fail_count: self.timer_fail_count,
             timer_fail_category: self.timer_fail_category,
-            shutdown_on_timer_read: self.shutdown_on_timer_read,
             session,
             _payload: PhantomData,
         }
-    }
-
-    /// Seeds a durable timer standing before the test runs — simulating a
-    /// prior epoch's trigger surviving a partition reacquisition.
-    #[must_use]
-    pub fn with_durable_timer(self, time: CompactDateTime, timer_type: TimerType) -> Self {
-        self.durable_timers.lock().push((time, timer_type));
-        self
     }
 
     /// The durable scheduled times of `timer_type` (what `scheduled` answers).
@@ -148,7 +129,7 @@ impl<P, S> MockEventContext<P, S> {
     }
 
     /// Make the first `count` timer schedules fail with `category`, then
-    /// succeed — so the backstop arm's retry-forever loop self-heals after
+    /// succeed. The retry loop recovers after
     /// `count` retries. Run on a paused clock so the retry backoff advances
     /// instantly.
     #[must_use]
@@ -167,18 +148,6 @@ impl<P, S> MockEventContext<P, S> {
     pub fn with_shutdown(self) -> Self {
         self.shutdown_tx.send_replace(ShutdownPhase::Cancelling);
         self
-    }
-
-    /// Flip the shutdown watch as a side effect of every `scheduled()` read —
-    /// deterministic "shutdown arrives during the backstop arm" for the settle
-    /// boundary's arm-shutdown rollback test (the read completes, then the
-    /// arm's next retry step sees shutdown at its loop top).
-    #[must_use]
-    pub fn with_shutdown_on_timer_read(self) -> Self {
-        Self {
-            shutdown_on_timer_read: true,
-            ..self
-        }
     }
 
     /// Enable timer operation tracking.
@@ -307,7 +276,6 @@ where
             durable_timers: self.durable_timers.clone(),
             timer_fail_count: self.timer_fail_count.clone(),
             timer_fail_category: self.timer_fail_category,
-            shutdown_on_timer_read: self.shutdown_on_timer_read,
             session: self.session.repin(proof),
             _payload: PhantomData,
         }
@@ -390,9 +358,6 @@ where
         &self,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
-        if self.shutdown_on_timer_read {
-            self.request_shutdown();
-        }
         future::ready(Ok(self.durable_scheduled(timer_type)))
     }
 }
@@ -401,7 +366,7 @@ where
 /// for the deleted crate-wide `lifecycle()`. Production enforcement holds — the
 /// settlement surface is reachable in shipping code only through settle's own
 /// private `SettlementAccess` — while tests that legitimately drive
-/// `finalize` / `get` / backstop accessors through the event's own session
+/// `finalize` and `get` through the event's own session
 /// keep a one-call binder. The North Star is production leak-fencing; tests are
 /// allowed broad access.
 pub trait TestLifecycleAccess: EventContext {

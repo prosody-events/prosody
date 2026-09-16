@@ -13,7 +13,7 @@ use crate::state::manager::StateManagerProvider;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::publisher::NoPublisher;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::tests::support::FixedOracle;
+use crate::state::tests::support::MemoryDeduplicationStore;
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
@@ -45,7 +45,7 @@ trait HasProcessedOffsets {
 /// tests: state is always wired, so even tests that never touch state mint a
 /// real (empty-registry) provider over the in-memory backend.
 type MemoryStateProvider = StateManagerProvider<
-    SharedStateBackend<MemoryCellStore<FixedOracle>, MemoryDescriptorIdentityStore, FixedOracle>,
+    SharedStateBackend<MemoryCellStore, MemoryDescriptorIdentityStore, MemoryDeduplicationStore>,
     MemoryLoader<serde_json::Value>,
 >;
 
@@ -54,13 +54,9 @@ fn memory_state_provider(registry: CollectionDefRegistry) -> MemoryStateProvider
     let registry = Arc::new(registry);
     StateManagerProvider::new(
         SharedStateBackend::new(
-            MemoryCellStore::new(
-                MemoryCells::new(),
-                FixedOracle::committed(),
-                registry.clone(),
-            ),
+            MemoryCellStore::new(MemoryCells::new()),
             MemoryDescriptorIdentityStore::new(),
-            FixedOracle::committed(),
+            MemoryDeduplicationStore::new(),
         ),
         MemoryLoader::new(),
         NoPublisher,

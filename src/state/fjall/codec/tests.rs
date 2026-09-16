@@ -1,9 +1,5 @@
-use super::{
-    Read, collection_prefix, coord_cell_key, decode_cell, encode_absent_cell, encode_present_cell,
-    index_coord_key, index_seeded_key, marker_check_key,
-};
-use crate::state::cell_key::{CellKey, Coordinate, Section};
-use crate::state::tests::support::fixed_collection;
+use super::{collection_prefix, decode_frame, encode_frame};
+use crate::state::cell::CacheEntry;
 use crate::state::{CollectionId, StateKey, StateName, StateType};
 use bytes::Bytes;
 use color_eyre::eyre::Result;
@@ -17,28 +13,32 @@ const EXPIRY: u64 = 1_700_000_000_000;
 
 #[test]
 fn absent_round_trip() -> Result<()> {
-    let cell = encode_absent_cell(EXPIRY);
-    assert_eq!(decode_cell(Some(cell.as_ref()))?, (EXPIRY, Read::Absent));
+    let cell = encode_frame(CacheEntry::Absent, EXPIRY);
+    assert_eq!(
+        decode_frame(Some(cell.as_ref()))?,
+        (EXPIRY, Some(CacheEntry::Absent))
+    );
     Ok(())
 }
 
-/// Any payload + expiry round-trips through `encode_present_cell` →
-/// `decode_cell` as `(expiry, Read::Present)` with identical bytes — the cache
-/// codec is lossless over the whole byte space and the expiry header, including
-/// the empty payload a `Set` of empty bytes produces, not just one fixed
-/// example.
+/// Every cache entry preserves its payload and expiry through the codec.
 #[test]
 fn present_round_trip() {
     fn prop(payload: Vec<u8>, expiry: u64) -> TestResult {
         let payload = Bytes::from(payload);
-        let cell = encode_present_cell(&payload, expiry);
-        match decode_cell(Some(cell.as_ref())) {
-            Ok((e, Read::Present(decoded))) => {
-                TestResult::from_bool(e == expiry && decoded == payload)
+        for entry in [
+            CacheEntry::Absent,
+            CacheEntry::Exists,
+            CacheEntry::Value(payload.as_ref()),
+        ] {
+            let cell = encode_frame(entry, expiry);
+            match decode_frame(Some(cell.as_ref())) {
+                Ok(decoded) if decoded == (expiry, Some(entry)) => {}
+                Ok(other) => return TestResult::error(format!("round-trip produced {other:?}")),
+                Err(e) => return TestResult::error(format!("decode_frame failed: {e}")),
             }
-            Ok(other) => TestResult::error(format!("round-trip produced {other:?}, not Present")),
-            Err(e) => TestResult::error(format!("decode_cell failed: {e}")),
         }
+        TestResult::passed()
     }
 
     QuickCheck::new().quickcheck(prop as fn(Vec<u8>, u64) -> TestResult);
@@ -51,11 +51,18 @@ fn present_round_trip() {
 #[test]
 fn present_cell_is_raw_tagged_payload_with_expiry() {
     let payload = b"profile-payload-not-compressed".as_slice();
-    let cell = encode_present_cell(payload, EXPIRY);
+    let cell = encode_frame(CacheEntry::Value(payload), EXPIRY);
     let mut expected = vec![0x01_u8];
     expected.extend_from_slice(&EXPIRY.to_be_bytes());
     expected.extend_from_slice(payload);
     assert_eq!(cell.as_ref(), expected.as_slice());
+    for (entry, tag) in [(CacheEntry::Absent, 0x00), (CacheEntry::Exists, 0x02)] {
+        let cell = encode_frame(entry, EXPIRY);
+        let mut expected = [0_u8; 9];
+        expected[0] = tag;
+        expected[1..].copy_from_slice(&EXPIRY.to_be_bytes());
+        assert_eq!(cell.as_ref(), expected);
+    }
 }
 
 /// A `Set` of empty bytes is a present cell distinct from `Absent`, and must
@@ -65,30 +72,30 @@ fn present_cell_is_raw_tagged_payload_with_expiry() {
 /// dice.
 #[test]
 fn empty_payload_round_trips_as_present() -> Result<()> {
-    let cell = encode_present_cell(&[], 0);
+    let cell = encode_frame(CacheEntry::Value(&[]), 0);
     assert_eq!(
-        decode_cell(Some(cell.as_ref()))?,
-        (0, Read::Present(Bytes::new()))
+        decode_frame(Some(cell.as_ref()))?,
+        (0, Some(CacheEntry::Value(&[][..])))
     );
     Ok(())
 }
 
 #[test]
 fn missing_entry_decodes_as_unknown() -> Result<()> {
-    assert_eq!(decode_cell(None)?, (0, Read::Unknown));
+    assert_eq!(decode_frame(None)?, (0, None));
     Ok(())
 }
 
 #[test]
 fn empty_cell_is_rejected() {
-    assert!(decode_cell(Some(&[])).is_err());
+    assert!(decode_frame(Some(&[])).is_err());
 }
 
 /// A frame with a tag but a truncated expiry header (fewer than 8 bytes) is
 /// rejected — the decoder needs the whole header before the payload.
 #[test]
 fn truncated_expiry_header_is_rejected() {
-    assert!(decode_cell(Some(&[0x01, 0x00, 0x00])).is_err());
+    assert!(decode_frame(Some(&[0x01, 0x00, 0x00])).is_err());
 }
 
 #[test]
@@ -96,7 +103,7 @@ fn unknown_tag_byte_is_rejected() {
     // A full 9-byte frame (tag + expiry) with an unknown tag.
     let mut frame = vec![0xFE_u8];
     frame.extend_from_slice(&0u64.to_be_bytes());
-    let result = decode_cell(Some(&frame));
+    let result = decode_frame(Some(&frame));
     assert!(
         matches!(
             result,
@@ -236,120 +243,3 @@ fn null_in_key_or_name_does_not_shift_field_boundary() -> Result<()> {
 }
 
 // --- Warm-index key codec ---------------------------------------------------
-
-/// The frozen wire bytes of a coord key, a seeded key, and a presence key —
-/// any persisted encoding gets a verified-bytes test. Also proves a coord key
-/// round-trips back to its `CellKey`. (Index discriminant `0x02` is retired
-/// with the deleted design's interval rows; `Presence` stays `0x03`.)
-#[test]
-fn frozen_warm_index_bytes() -> Result<()> {
-    let id = fixed_collection("frozen")?;
-    let prefix = collection_prefix(&id);
-    let cell = CellKey {
-        section: Section::new(7),
-        coordinate: Coordinate::from_bytes(vec![0xAB, 0xCD]),
-    };
-
-    // coord key: [hash][Coord=0x00][section=0x07][coordinate].
-    let coord = index_coord_key(&id, &cell);
-    let mut expected = prefix.to_vec();
-    expected.extend_from_slice(&[0x00, 0x07, 0xAB, 0xCD]);
-    assert_eq!(coord.as_slice(), expected.as_slice(), "coord key layout");
-    assert_eq!(coord_cell_key(&coord), cell, "coord key round-trips");
-
-    // seeded key: [hash][Seeded=0x01].
-    let seeded = index_seeded_key(&id);
-    let mut expected = prefix.to_vec();
-    expected.push(0x01);
-    assert_eq!(seeded.as_slice(), expected.as_slice(), "seeded key layout");
-
-    // presence key: [hash][Presence=0x03].
-    let presence = marker_check_key(&id);
-    let mut expected = prefix.to_vec();
-    expected.push(0x03);
-    assert_eq!(
-        presence.as_slice(),
-        expected.as_slice(),
-        "presence key layout"
-    );
-    Ok(())
-}
-
-/// The provisional-index coord key is byte-for-byte `[hash][Coord=0x00]
-/// [section][coordinate]` over random identities, sections, and coordinates,
-/// round-trips back to its `CellKey`, and stays inline exactly when its encoded
-/// length fits the 32-byte `SmallVec` buffer (only a long Map coordinate
-/// spills). Byte parity is the ordering proof: fjall range order is a pure
-/// function of these bytes.
-#[test]
-fn prop_index_coord_key_bytes_spill_and_round_trip() {
-    fn prop(fields: PrefixFields, section: i8, coord: Vec<u8>) -> TestResult {
-        let id = match id_from(fields) {
-            Ok(id) => id,
-            Err(e) => return TestResult::error(format!("invalid identity: {e}")),
-        };
-        let mut expected = collection_prefix(&id).to_vec();
-        expected.push(0x00); // IndexKind::Coord discriminant
-        expected.push(section.cast_unsigned());
-        expected.extend_from_slice(&coord);
-
-        let cell = CellKey {
-            section: Section::new(section),
-            coordinate: Coordinate::from_bytes(coord),
-        };
-        let key = index_coord_key(&id, &cell);
-
-        if key.as_slice() != expected.as_slice() {
-            return TestResult::error(format!(
-                "bytes diverged: got {:?}, want {:?}",
-                key.as_slice(),
-                expected.as_slice()
-            ));
-        }
-        let expect_spill = expected.len() > 32;
-        if key.spilled() != expect_spill {
-            return TestResult::error(format!(
-                "spill mismatch: len {} spilled {} want {}",
-                expected.len(),
-                key.spilled(),
-                expect_spill
-            ));
-        }
-        if coord_cell_key(&key) != cell {
-            return TestResult::error("coord key did not round-trip".to_owned());
-        }
-        TestResult::from_bool(true)
-    }
-    QuickCheck::new().quickcheck(prop as fn(PrefixFields, i8, Vec<u8>) -> TestResult);
-}
-
-/// Pins the coord key's 32-byte inline capacity unconditionally at its exact
-/// spill boundary: a `[hash=16][Coord][section]` head is 18 bytes, so a 14-byte
-/// coordinate fills the buffer exactly (stays inline) and a 15-byte one is the
-/// first to spill. The property above only lands on this edge
-/// probabilistically; shrinking the `SmallVec` inline size regresses this
-/// deterministically.
-#[test]
-fn index_coord_key_spill_boundary() -> Result<()> {
-    let id = fixed_collection("spill-boundary")?;
-    for (coord_len, want_spill) in [(14usize, false), (15usize, true)] {
-        let cell = CellKey {
-            section: Section::new(3),
-            coordinate: Coordinate::from_bytes(vec![0xEE; coord_len]),
-        };
-        let key = index_coord_key(&id, &cell);
-        assert_eq!(
-            key.len(),
-            18 + coord_len,
-            "encoded length (coord {coord_len})"
-        );
-        assert_eq!(
-            key.spilled(),
-            want_spill,
-            "spill at coord {coord_len} (encoded {})",
-            key.len()
-        );
-        assert_eq!(coord_cell_key(&key), cell, "round-trip (coord {coord_len})");
-    }
-    Ok(())
-}

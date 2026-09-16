@@ -7,6 +7,7 @@ use crate::tracing::exponential_histograms;
 use color_eyre::Result;
 use color_eyre::eyre::{bail, ensure};
 use opentelemetry::KeyValue;
+use opentelemetry::global::set_meter_provider;
 use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
@@ -41,6 +42,13 @@ impl GlobalMetrics {
             metrics,
             cell_metrics,
         }
+    }
+
+    /// Captures global instruments in a test process.
+    pub(crate) fn install_global() -> Self {
+        let capture = Self::install();
+        set_meter_provider(capture.provider.clone());
+        capture
     }
 
     /// The peer instruments bound to this capture.
