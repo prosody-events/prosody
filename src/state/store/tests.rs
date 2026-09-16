@@ -14,7 +14,7 @@ quickcheck! {
         }
         for _ in 0..usize::BITS {
             let next = fetch.next();
-            if !(1..=max.get()).contains(&next.get()) || next < previous {
+            if next != previous.saturating_add(previous.get()).min(max) {
                 return false;
             }
             previous = next;

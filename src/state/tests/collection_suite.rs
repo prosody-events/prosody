@@ -1635,6 +1635,9 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
 
     // Tracked lists the key; Overflowed degrades to the full-section scan. Both
     // reach the same present-but-undecodable cell.
+    // Four keys: the second chunk `[key, key + 1]` satisfies the limit while
+    // `key + 2` remains unread, so `[1, 2]` proves the schedule stops at the
+    // limit and not at exhaustion.
     let tracked = Bytes::from(tracked_frame(&[key - 1, key, key + 1, key + 2]));
     let overflowed = Bytes::from(OVERFLOWED_FRAME.to_vec());
     for (tracked_route, keyset_frame) in [(true, tracked), (false, overflowed)] {

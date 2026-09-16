@@ -3,7 +3,7 @@
 use super::fixture;
 use crate::state::cassandra::cell::read::scan_statement;
 use crate::state::cell_key::{Direction, EdgeKind};
-use crate::state::store::{CELL_BATCH, FetchSchedule};
+use crate::state::store::CELL_BATCH;
 use color_eyre::Result;
 use std::num::NonZeroUsize;
 
@@ -20,17 +20,6 @@ async fn scan_fetch_hint_preserves_prepared_defaults() -> Result<()> {
                     let statement = scan_statement(prepared, size);
                     assert_eq!(statement.get_page_size(), i32::try_from(size.get())?);
                     assert_eq!(prepared.get_page_size(), i32::try_from(default.get())?);
-                }
-                let mut fetch = FetchSchedule::new(NonZeroUsize::new(1), default);
-                let mut expected = NonZeroUsize::MIN;
-                loop {
-                    assert_eq!(fetch.next(), expected);
-                    if expected == default {
-                        break;
-                    }
-                    expected = expected
-                        .saturating_mul(NonZeroUsize::MIN.saturating_add(1))
-                        .min(default);
                 }
             }
         }
