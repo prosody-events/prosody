@@ -683,10 +683,11 @@ pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> R
     run_map_trace_inner(trace, commit_mode, 3, None).await
 }
 
-/// Checks both query outputs on tracked and range plans.
+/// Checks both query outputs on a range-only plan and on a plan that crosses
+/// from tracked to overflowed.
 pub(crate) async fn run_map_prefix_trace(trace: MapTrace, limit: NonZeroUsize) -> Result<bool> {
     for mode in [CommitMode::ReadCommitted, CommitMode::ReadUncommitted] {
-        for keyset_limit in [0, 4096] {
+        for keyset_limit in [0, 3] {
             if !run_map_trace_inner(trace.clone(), mode, keyset_limit, Some(limit)).await? {
                 return Ok(false);
             }

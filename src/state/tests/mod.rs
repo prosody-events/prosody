@@ -22,9 +22,9 @@ use self::cell_suite::{
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
-    DequeCapacityShape, DequeHoles, DequeInterleave, DequeTrace, MapGetManyInput, MapInterleave,
-    MapKeyHoles, MapTrace, finalize_and_promote, run_deque_capacity_convergence, run_deque_holes,
-    run_deque_stream_interleave, run_deque_trace, run_map_get_many_parity_trace,
+    DequeCapacityShape, DequeHoles, DequeInterleave, DequeTrace, KEY_POOL, MapGetManyInput,
+    MapInterleave, MapKeyHoles, MapTrace, finalize_and_promote, run_deque_capacity_convergence,
+    run_deque_holes, run_deque_stream_interleave, run_deque_trace, run_map_get_many_parity_trace,
     run_map_key_scan_holes, run_map_keyset_exact_trace, run_map_prefix_trace,
     run_map_stream_interleave, run_map_trace, run_map_ttl_keyset_refresh_trace,
 };
@@ -893,7 +893,8 @@ fn prop_map_collection_lifecycle_read_uncommitted() {
 #[test]
 fn prop_map_query_limit_is_present_prefix() {
     fn property(trace: MapTrace, limit: u8) -> Result<bool> {
-        let limit = NonZeroUsize::new(usize::from(limit % 8)).unwrap_or(NonZeroUsize::MIN);
+        let limit =
+            NonZeroUsize::new(usize::from(limit) % KEY_POOL.len()).unwrap_or(NonZeroUsize::MIN);
         TEST_RUNTIME.block_on(run_map_prefix_trace(trace, limit))
     }
     QuickCheck::new().quickcheck(property as fn(MapTrace, u8) -> Result<bool>);
