@@ -1668,7 +1668,7 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
 
         block_on(async {
             assert!(!handle.is_empty().await?);
-            assert_eq!(counting.scan_hint(), 2);
+            assert_eq!(counting.scan_hint(), 1);
             assert_eq!(counting.visible_point_reads(), 0);
             assert_eq!(counting.batch_reads(), 0);
             assert_eq!(counting.presence_reads(), 0);
@@ -1731,7 +1731,7 @@ fn assert_limited_fetch(counting: &CountingCellStore<MemoryCellStore>, tracked: 
     if tracked {
         assert_eq!(counting.batch_widths(), [1, 2]);
     } else {
-        assert_eq!(counting.scan_hint(), 2);
+        assert_eq!(counting.scan_hint(), 1);
     }
 }
 

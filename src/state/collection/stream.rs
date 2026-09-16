@@ -274,11 +274,14 @@ where
             start: start.as_ref(),
             dir,
             end: end.as_ref(),
-            fetch_hint: limit.map(|n| n.saturating_add(window)),
+            fetch_hint: limit,
         };
+        // Every backend page yields present cells only, so the limit ends paging
+        // here, before resolution. The plan's own `take` stays the result bound.
         let page = <S::Engine as sealed::Reads<S, P>>::page(
             &base.session, &base.plan, base.state_type, &base.name, scan,
-        );
+        )
+        .take(limit.map_or(usize::MAX, NonZeroUsize::get));
         let session = &base.session;
         let inner = page
             .map(|item| cooperative(async move {
@@ -287,10 +290,8 @@ where
                     .map_err(CellStateError::Key)?;
                 P::finish(session, key, payload).await
             }))
-            // Both drivers resolve under `RESOLVE_FANOUT`; the limit bounds the window
-            // so a small query does not over-pull the pager. `buffered` pulls up to
-            // `window` rows past the last yielded item, so the first page includes that
-            // headroom and an exact-limit query never fetches a second page.
+            // Both drivers resolve under `RESOLVE_FANOUT`. The limit bounds the
+            // window, so a small query starts no more resolves than it needs.
             .buffered(window);
         futures::pin_mut!(inner);
         while let Some(item) = inner.next().await {
