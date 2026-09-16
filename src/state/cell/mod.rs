@@ -22,8 +22,10 @@
 
 use super::event_ref::EventRef;
 use super::marker::ReaderEvidence;
+use super::store_types::CELL_BATCH;
 use bytes::Bytes;
 use std::fmt::Debug;
+use std::num::NonZeroUsize;
 
 /// What a cell read yields for a present cell.
 ///
@@ -34,6 +36,16 @@ pub trait Projection: Copy + Send + Sync + 'static + sealed::Sealed {
 
     /// The projection name for metrics and spans.
     const NAME: &'static str;
+
+    /// The smallest first fetch. A fetch sized to a small limit saves payload
+    /// bandwidth, so `Values` has no floor. A presence row carries no payload,
+    /// so `Presence` fetches at least one batch.
+    const FETCH_FLOOR: NonZeroUsize;
+
+    /// Sizes the first fetch from a result limit.
+    fn demand(limit: Option<NonZeroUsize>) -> Option<NonZeroUsize> {
+        limit.map(|n| n.max(Self::FETCH_FLOOR))
+    }
 
     /// Projects a stored value.
     fn from_value(bytes: Bytes) -> Self::Payload;
@@ -105,6 +117,7 @@ impl Projection for Values {
     type Payload = Bytes;
 
     const NAME: &'static str = "values";
+    const FETCH_FLOOR: NonZeroUsize = NonZeroUsize::MIN;
 
     fn from_value(bytes: Bytes) -> Self::Payload {
         bytes
@@ -127,6 +140,7 @@ impl Projection for Presence {
     type Payload = ();
 
     const NAME: &'static str = "presence";
+    const FETCH_FLOOR: NonZeroUsize = CELL_BATCH;
 
     fn from_value(_bytes: Bytes) -> Self::Payload {}
 

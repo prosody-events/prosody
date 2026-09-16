@@ -1635,9 +1635,6 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
 
     // Tracked lists the key; Overflowed degrades to the full-section scan. Both
     // reach the same present-but-undecodable cell.
-    // Four keys: the second chunk `[key, key + 1]` satisfies the limit while
-    // `key + 2` remains unread, so `[1, 2]` proves the schedule stops at the
-    // limit and not at exhaustion.
     let tracked = Bytes::from(tracked_frame(&[key - 1, key, key + 1, key + 2]));
     let overflowed = Bytes::from(OVERFLOWED_FRAME.to_vec());
     for (tracked_route, keyset_frame) in [(true, tracked), (false, overflowed)] {
@@ -1671,7 +1668,7 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
 
         block_on(async {
             assert!(!handle.is_empty().await?);
-            assert_eq!(counting.scan_hint(), 1);
+            assert_eq!(counting.scan_hint(), CELL_BATCH.get());
             assert_eq!(counting.visible_point_reads(), 0);
             assert_eq!(counting.batch_reads(), 0);
             assert_eq!(counting.presence_reads(), 0);
@@ -1702,7 +1699,7 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
                 .await?,
                 vec![key]
             );
-            assert_limited_fetch(&counting, tracked_route);
+            assert_limited_fetch(&counting, tracked_route, &[4], CELL_BATCH.get());
 
             counting.reset();
             assert!(
@@ -1715,7 +1712,10 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
                 .await
                 .is_err()
             );
-            assert_limited_fetch(&counting, tracked_route);
+            // Four keys: the second chunk `[key, key + 1]` satisfies the limit while
+            // `key + 2` remains unread, so `[1, 2]` proves the schedule stops at the
+            // limit and not at exhaustion.
+            assert_limited_fetch(&counting, tracked_route, &[1, 2], 1);
 
             // Value reads surface the decode failure as `Permanent`.
             let got = handle.get(&key).await;
@@ -1730,11 +1730,16 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
     Ok(())
 }
 
-fn assert_limited_fetch(counting: &CountingCellStore<MemoryCellStore>, tracked: bool) {
+fn assert_limited_fetch(
+    counting: &CountingCellStore<MemoryCellStore>,
+    tracked: bool,
+    widths: &[usize],
+    hint: usize,
+) {
     if tracked {
-        assert_eq!(counting.batch_widths(), [1, 2]);
+        assert_eq!(counting.batch_widths(), widths);
     } else {
-        assert_eq!(counting.scan_hint(), 1);
+        assert_eq!(counting.scan_hint(), hint);
     }
 }
 

@@ -208,7 +208,7 @@ where
 {
     try_stream! {
         let mut keys = keys.into_iter().peekable();
-        let mut fetch = FetchSchedule::new(limit, CELL_BATCH);
+        let mut fetch = FetchSchedule::new(P::demand(limit), CELL_BATCH);
         while keys.peek().is_some() {
             let chunk: CellBuffer<_> = keys.by_ref().take(fetch.next().get()).collect();
             let slots = {
@@ -274,7 +274,7 @@ where
             start: start.as_ref(),
             dir,
             end: end.as_ref(),
-            fetch_hint: limit,
+            fetch_hint: P::demand(limit),
         };
         // Every backend page yields present cells only, so the limit ends paging
         // here, before resolution. The plan's own `take` stays the result bound.
