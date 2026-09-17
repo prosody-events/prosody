@@ -3,7 +3,7 @@
 //! Only stream plans read the keyset. Point and batch reads address member
 //! cells directly and never consult it.
 
-use super::keyset::{KEYSET_BYTE_CEILING, is_oversized, tracked_frame_len};
+use super::keyset::is_oversized;
 use super::{Keyset, KeysetFrameError, MapKeysetCodec, MapKeysetKey, MapStateError, Query};
 use crate::state::StateName;
 use crate::state::cell::Presence;
@@ -199,9 +199,8 @@ impl PriorKeyset {
             Self::Decoded(Keyset::Overflowed) => return ttl.then_some(Keyset::Overflowed),
             Self::Decoded(Keyset::Tracked(keys)) => keys,
         };
-        let frame_len = tracked_frame_len(&keys);
         // Apply a lowered bound before duplicate detection.
-        if keys.len() > limit || frame_len.is_none_or(|len| len > KEYSET_BYTE_CEILING) {
+        if is_oversized(&keys, limit) {
             warn!(
                 collection = collection.as_str(),
                 "keyset exceeds its bound; store Overflowed"
@@ -211,13 +210,10 @@ impl PriorKeyset {
         match keys.binary_search(coordinate) {
             Ok(_) => ttl.then_some(Keyset::Tracked(keys)),
             Err(position) => {
-                let len = frame_len
-                    .and_then(|len| len.checked_add(4))
-                    .and_then(|len| len.checked_add(coordinate.as_bytes().len()));
-                if keys.len() == limit || len.is_none_or(|len| len > KEYSET_BYTE_CEILING) {
+                keys.insert(position, coordinate.clone());
+                if is_oversized(&keys, limit) {
                     return Some(Keyset::Overflowed);
                 }
-                keys.insert(position, coordinate.clone());
                 Some(Keyset::Tracked(keys))
             }
         }

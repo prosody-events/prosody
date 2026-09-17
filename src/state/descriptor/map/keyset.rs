@@ -149,7 +149,7 @@ fn encode_keyset(payload: &Keyset, buf: &mut Vec<u8>) -> Result<(), KeysetFrameE
 }
 
 /// Returns the encoded size, or `None` when the size overflows.
-pub(super) fn tracked_frame_len(keys: &[Coordinate]) -> Option<usize> {
+fn tracked_frame_len(keys: &[Coordinate]) -> Option<usize> {
     let mut total = 1usize.checked_add(4)?;
     for coordinate in keys {
         total = total
@@ -160,6 +160,7 @@ pub(super) fn tracked_frame_len(keys: &[Coordinate]) -> Option<usize> {
 }
 
 /// Tests both the registered count limit and the encoded byte limit.
+/// The read plan and the keyset write share this one boundary.
 pub(super) fn is_oversized(keys: &[Coordinate], limit: usize) -> bool {
     keys.len() > limit || tracked_frame_len(keys).is_none_or(|len| len > KEYSET_BYTE_CEILING)
 }
