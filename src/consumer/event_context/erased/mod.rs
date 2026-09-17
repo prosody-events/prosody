@@ -301,6 +301,8 @@ pub type BoxDequeState<Item> = Box<dyn DynDequeState<Item>>;
 /// Boxed [`StateCursor`] a `scan` returns.
 pub type BoxStateCursor<Item> = Box<StateCursor<Item>>;
 
+/// Each erased stream method builds its own `try_stream!` over a cloned
+/// handle. A shared generic helper needs more bounds than it saves.
 fn cursor<T>(
     stream: impl Stream<Item = Result<T, ErasedStateError>> + Send + 'static,
 ) -> StateCursor<T> {
