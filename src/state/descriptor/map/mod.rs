@@ -621,8 +621,9 @@ where
     }
 
     /// Captures the query source from the keyset.
-    /// An absent keyset produces no entry reads. A valid tracked keyset selects
-    /// point reads. Other keysets select a scan within the query bounds.
+    /// An absent keyset produces no entry reads. A tracked keyset within its
+    /// bound selects point reads on the coordinates within the query bounds.
+    /// Other keysets select a scan within the query bounds.
     /// Access errors propagate. Malformed or oversized keysets also emit a
     /// warning.
     #[read(op)]
@@ -658,15 +659,7 @@ where
             );
             return Ok(range());
         }
-        let Some(keys) = query.keys::<KC>(&coordinates) else {
-            warn!(
-                collection = op.name().as_str(),
-                "map keyset holds a coordinate that is not canonical for its key codec; degrading \
-                 to the range scan until the next set heals it"
-            );
-            return Ok(range());
-        };
-        Ok(op.coordinates(MapKind::<KC, V>::ENTRIES, keys))
+        Ok(op.coordinates(MapKind::<KC, V>::ENTRIES, query.select(coordinates)))
     }
 
     /// Streams live entries in key order, ascending for [`Direction::Forward`].

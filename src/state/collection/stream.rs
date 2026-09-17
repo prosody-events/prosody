@@ -4,7 +4,7 @@
 //! Readers retain their chosen source for the whole plan.
 //! Session and projection types select the read behavior at compile time.
 
-use super::operation::read_keys;
+use super::operation::read_coordinates;
 use super::{StateSession, resolve_cell, sealed};
 use crate::state::cell::{Presence, Projection, Values};
 use crate::state::cell_key::{Coordinate, Direction, Scan, ScanEdge, Section};
@@ -18,6 +18,7 @@ use async_stream::try_stream;
 use futures::future::Either;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use std::future::{Future, ready};
+use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use tokio::task::coop::cooperative;
 
@@ -100,11 +101,11 @@ impl<S: StateSession> PlanBase<S> {
     }
 }
 
-/// A stream source contains either ordered keys or direction-relative range
-/// bounds. The collection selects it from stored metadata before execution
-/// starts.
-enum Source<K> {
-    Points(Vec<K>),
+/// A stream source contains either ordered coordinates or direction-relative
+/// range bounds. The collection selects it from stored metadata before
+/// execution starts.
+enum Source {
+    Points(Vec<Coordinate>),
     Range {
         start: ScanEdge<Coordinate>,
         dir: Direction,
@@ -119,18 +120,21 @@ enum Source<K> {
 /// Source drivers cannot emit directly to the caller.
 pub(crate) struct Plan<S: StateSession, T: CellType> {
     base: PlanBase<S>,
-    source: Source<KeyOf<T>>,
+    source: Source,
     limit: Option<NonZeroUsize>,
+    /// The cell type the plan projects. The source holds only coordinates.
+    cell: PhantomData<fn() -> T>,
 }
 
 impl<S: StateSession, T: CellType> Plan<S, T> {
-    /// Captures keys in their required output order. An empty list performs no
-    /// read.
-    pub(super) fn coordinates(base: PlanBase<S>, keys: Vec<KeyOf<T>>) -> Self {
+    /// Captures coordinates in their required output order. An empty list
+    /// performs no read.
+    pub(super) fn coordinates(base: PlanBase<S>, coordinates: Vec<Coordinate>) -> Self {
         Self {
             base,
-            source: Source::Points(keys),
+            source: Source::Points(coordinates),
             limit: None,
+            cell: PhantomData,
         }
     }
 
@@ -145,6 +149,7 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
             base,
             source: Source::Range { start, dir, end },
             limit: None,
+            cell: PhantomData,
         }
     }
 
@@ -166,10 +171,13 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
             base,
             source,
             limit,
+            ..
         } = self;
         let session = base.session.clone();
         let inner = match source {
-            Source::Points(keys) => Either::Left(coordinate_source::<S, T, P>(base, keys, limit)),
+            Source::Points(coordinates) => {
+                Either::Left(coordinate_source::<S, T, P>(base, coordinates, limit))
+            }
             Source::Range { start, dir, end } => {
                 Either::Right(range_source::<S, T, P>(base, start, dir, end, limit))
             }
@@ -188,7 +196,7 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
 /// successfully before it emits any item.
 fn coordinate_source<S, T, P>(
     base: PlanBase<S>,
-    keys: Vec<KeyOf<T>>,
+    coordinates: Vec<Coordinate>,
     limit: Option<NonZeroUsize>,
 ) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
 where
@@ -198,22 +206,23 @@ where
     S::Engine: sealed::Reads<S, P>,
 {
     try_stream! {
-        let mut keys = keys.into_iter().peekable();
+        let mut coordinates = coordinates.into_iter().peekable();
         let mut fetch = FetchSchedule::new(P::demand(limit), CELL_BATCH);
-        while keys.peek().is_some() {
-            let chunk: CellBuffer<_> = keys.by_ref().take(fetch.next().get()).collect();
+        while coordinates.peek().is_some() {
+            let chunk: CellBuffer<_> = coordinates.by_ref().take(fetch.next().get()).collect();
             let slots = {
                 let mut inner = <S::Engine as sealed::ReadEngine<S>>::resume(
                     &base.session,
                     &base.plan,
                 ).await;
-                read_keys::<S, T, P>(
+                read_coordinates::<S, P>(
                     &base.session,
                     &mut inner,
                     base.state_type,
                     &base.name,
                     base.section,
-                    &chunk,
+                    chunk.iter().cloned(),
+                    chunk.len(),
                 ).await.map_err(CellStateError::Access)?
             };
 
@@ -223,9 +232,11 @@ where
             // feature is off, so `consume_budget` is uncallable. For `Presence` the
             // wrapped future is a no-op; keep the wrapper. Do not re-litigate the window.
             let items = stream::iter(chunk.into_iter().zip(slots))
-                .map(|(key, slot)| cooperative(async move {
+                .map(|(coordinate, slot)| cooperative(async move {
                     match slot {
-                        Some(payload) => P::finish(session, key, payload).await.map(Some),
+                        Some(payload) => project::<S, T, P>(session, &coordinate, payload)
+                            .await
+                            .map(Some),
                         None => Ok(None),
                     }
                 }))
@@ -277,9 +288,7 @@ where
         let inner = page
             .map(|item| cooperative(async move {
                 let (cell, payload) = item?;
-                let key = <T::Key as OrderedKeyCodec>::decode(cell.coordinate.as_bytes())
-                    .map_err(CellStateError::Key)?;
-                P::finish(session, key, payload).await
+                project::<S, T, P>(session, &cell.coordinate, payload).await
             }))
             // Resolvers read the loader, so use RESOLVE_FANOUT, not shard fanout.
             // The limit bounds concurrent resolutions. Without a limit, early
@@ -290,6 +299,22 @@ where
             yield item?;
         }
     }
+}
+
+/// Decodes one present cell's key and finishes its projection.
+async fn project<S, T, P>(
+    session: &S,
+    coordinate: &Coordinate,
+    payload: P::Payload,
+) -> Result<P::Item, CellStateError<CellCodecError<T>>>
+where
+    S: StateSession,
+    T: CellType,
+    P: StreamProjection<S, T>,
+{
+    let key =
+        <T::Key as OrderedKeyCodec>::decode(coordinate.as_bytes()).map_err(CellStateError::Key)?;
+    P::finish(session, key, payload).await
 }
 
 /// Checks the attempt fence after every source completion, before emission.

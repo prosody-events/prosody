@@ -127,13 +127,9 @@ impl Query {
         }
     }
 
-    /// Selects the stored coordinates within the query bounds and decodes
-    /// them in query order. Every selected key must encode back to its
-    /// coordinate. A key that does not selects a scan.
-    pub(super) fn keys<KC: OrderedKeyCodec>(
-        &self,
-        coordinates: &[Coordinate],
-    ) -> Option<Vec<KC::Key>> {
+    /// Keeps the ascending stored coordinates within the query bounds, in
+    /// query order. The trim reuses the stored vector.
+    pub(super) fn select(&self, mut coordinates: Vec<Coordinate>) -> Vec<Coordinate> {
         let (low, high) = match self.dir {
             Direction::Forward => (&self.start, &self.end),
             Direction::Backward => (&self.end, &self.start),
@@ -148,21 +144,11 @@ impl Query {
             ScanEdge::Excluded(edge) => coordinates.partition_point(|c| c < edge),
             ScanEdge::Unbounded => coordinates.len(),
         };
-        let selected = coordinates.get(start..end).unwrap_or_default();
-
-        let mut keys = Vec::with_capacity(selected.len());
-        for coordinate in selected {
-            let Ok(key) = KC::decode(coordinate.as_bytes()) else {
-                return None;
-            };
-            if KC::encode(&key) != *coordinate {
-                return None;
-            }
-            keys.push(key);
-        }
+        coordinates.truncate(end.max(start));
+        coordinates.drain(..start);
         if self.dir == Direction::Backward {
-            keys.reverse();
+            coordinates.reverse();
         }
-        Some(keys)
+        coordinates
     }
 }

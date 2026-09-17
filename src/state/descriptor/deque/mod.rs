@@ -87,9 +87,7 @@ use crate::state::collection::{
     StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
     spec_matches,
 };
-#[cfg(test)]
-use crate::state::order_codec::OrderedKeyCodec;
-use crate::state::order_codec::{I64KeyCodec, UnitKey};
+use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec, UnitKey};
 use crate::state::{CollectionKindId, StateAccessError, StoreOutcome};
 use educe::Educe;
 use futures::stream::Stream;
@@ -413,13 +411,13 @@ where
             return Ok(op.range_within(DequeKind::<T>::ENTRIES, &start, dir, &end, limit));
         }
         // Both endpoints are valid, so interior index arithmetic cannot overflow.
-        // Allocate at most 128 indices once per stream, before item reads.
-        let mut indices: Vec<i64> = Vec::with_capacity(len);
-        indices.extend((0..len).map(|offset| first + offset as i64));
+        // Allocate at most 128 coordinates once per stream, before item reads.
+        let mut coordinates = Vec::with_capacity(len);
+        coordinates.extend((0..len).map(|offset| I64KeyCodec::encode(&(first + offset as i64))));
         if dir == Direction::Backward {
-            indices.reverse();
+            coordinates.reverse();
         }
-        Ok(op.coordinates(DequeKind::<T>::ENTRIES, indices))
+        Ok(op.coordinates(DequeKind::<T>::ENTRIES, coordinates))
     }
 
     /// Streams live values from front to back for [`Direction::Forward`].

@@ -92,16 +92,16 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
         Self { collection, inner }
     }
 
-    /// Plans a managed point-get stream over `keys` in `family`, in the given
-    /// order. Freezing this invocation's engine state into the plan is what
-    /// lets each chunk resume on the same source (reader) or reacquire the gate
-    /// (owner) without re-running the planning command.
+    /// Plans a managed point-get stream over `coordinates` in `family`, in the
+    /// given order. Freezing this invocation's engine state into the plan is
+    /// what lets each chunk resume on the same source (reader) or reacquire the
+    /// gate (owner) without re-running the planning command.
     pub(crate) fn coordinates<T: CellType>(
         &self,
         family: CellFamily<L, T>,
-        keys: Vec<KeyOf<T>>,
+        coordinates: Vec<Coordinate>,
     ) -> Plan<S, T> {
-        Plan::coordinates(self.plan_base(family.section()), keys)
+        Plan::coordinates(self.plan_base(family.section()), coordinates)
     }
 
     /// Plans a scan over encoded edges in the declared family.
@@ -658,7 +658,7 @@ where
 
 /// Reads one projected answer per coordinate. `expected` is the input count.
 /// Batches run sequentially because owner reads can repair the same collection.
-async fn read_coordinates<S, P: Projection>(
+pub(super) async fn read_coordinates<S, P: Projection>(
     session: &S,
     inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
     state_type: StateType,

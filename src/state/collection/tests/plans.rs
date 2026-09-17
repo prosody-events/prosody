@@ -326,7 +326,10 @@ async fn plan_fences_after_its_last_item() -> Result<()> {
                             ScanEdge::Unbounded,
                         )
                     } else {
-                        op.coordinates(PlainLayout::CELLS, vec![7_i64, 8])
+                        op.coordinates(
+                            PlainLayout::CELLS,
+                            vec![I64KeyCodec::encode(&7), I64KeyCodec::encode(&8)],
+                        )
                     }
                 })
                 .await;
