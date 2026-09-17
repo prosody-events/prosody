@@ -1,11 +1,10 @@
 //! Set membership follows the model through each event and query.
 
 use super::*;
-use crate::state::descriptor::{SetHandle, SetQuery, set_state};
+use crate::state::descriptor::{SetHandle, set_state};
 use crate::test_util::TEST_RUNTIME;
 use quickcheck::QuickCheck;
 use std::collections::BTreeSet;
-use std::ops::Bound;
 
 async fn run_set_trace(
     trace: MapTrace,
@@ -152,31 +151,11 @@ async fn assert_set<S: StateSession>(
         expected.retain(|key| constraints.contains(*key, dir));
         expected.truncate(constraints.limit.map_or(usize::MAX, NonZeroUsize::get));
         assert_eq!(
-            drain(constrain(handle.query(dir), constraints).keys()).await?,
+            drain(constraints.apply(handle.query(dir)).keys()).await?,
             expected
         );
     }
     Ok(())
-}
-
-fn constrain<S: StateSession>(
-    mut query: SetQuery<'_, S, I64KeyCodec>,
-    constraints: StreamConstraints,
-) -> SetQuery<'_, S, I64KeyCodec> {
-    query = match constraints.start {
-        Bound::Included(k) => query.from(&k),
-        Bound::Excluded(k) => query.after(&k),
-        Bound::Unbounded => query,
-    };
-    query = match constraints.end {
-        Bound::Included(k) => query.to(&k),
-        Bound::Excluded(k) => query.before(&k),
-        Bound::Unbounded => query,
-    };
-    if let Some(limit) = constraints.limit {
-        query = query.limit(limit);
-    }
-    query
 }
 
 /// Set membership and keyset bytes agree through queries, commits, and

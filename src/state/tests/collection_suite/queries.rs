@@ -4,9 +4,10 @@ use super::{deque, drain, make_session, read_event, registry_and_ref, seed_deque
 use crate::codec::JsonCodec;
 use crate::consumer::middleware::deduplication::MemoryDeduplicationStore;
 use crate::state::collection::StateSession;
-use crate::state::descriptor::{MapQuery, StateDescriptor, deque_state};
+use crate::state::descriptor::map::KeysetQuery;
+use crate::state::descriptor::{CellType, CollectionSpec, StateDescriptor, deque_state};
 use crate::state::memory::{MemoryCellStore, MemoryCells};
-use crate::state::order_codec::I64KeyCodec;
+use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::registry::CollectionDef;
 use crate::state::{Direction, StateKey};
 use color_eyre::Result;
@@ -46,10 +47,12 @@ impl StreamConstraints {
         .contains(&key)
     }
 
-    pub(super) fn apply<S: StateSession>(
-        self,
-        mut query: MapQuery<'_, S, I64KeyCodec, JsonCodec>,
-    ) -> MapQuery<'_, S, I64KeyCodec, JsonCodec> {
+    pub(super) fn apply<S, L>(self, mut query: KeysetQuery<'_, S, L>) -> KeysetQuery<'_, S, L>
+    where
+        S: StateSession,
+        L: CollectionSpec,
+        <L::Cell as CellType>::Key: OrderedKeyCodec<Key = i64>,
+    {
         query = match self.start {
             Bound::Included(key) => query.from(&key),
             Bound::Excluded(key) => query.after(&key),
