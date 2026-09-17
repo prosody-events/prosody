@@ -16,8 +16,7 @@ pub(super) const TRACKED_TAG: u8 = 0;
 /// The durable tag for unknown membership.
 pub(super) const OVERFLOWED_TAG: u8 = 1;
 
-/// Maximum initial reservation for decoded coordinates. Each entry requires a
-/// four-byte length.
+/// Maximum decoded coordinate count. Each entry requires a four-byte length.
 const KEYSET_MAX_ENTRIES: usize = KEYSET_BYTE_CEILING / 4;
 
 /// The shared keyset address, coordinate `[2]`.
@@ -190,15 +189,15 @@ fn decode_tracked(bytes: &Bytes) -> Result<Keyset, KeysetFrameError> {
         .try_into()
         .map_err(|_| KeysetFrameError::Truncated)?;
     let count = u32::from_be_bytes(count_bytes) as usize;
-    // Every entry costs ≥ 4 bytes of length prefix, so the capacity the frame
-    // can actually hold is `remaining / 4` — never the raw count field, which an
-    // adversary could inflate to `u32::MAX`. Also cap by the most entries any
-    // acceptable frame holds, so a pathological oversized stored frame cannot
-    // drive a prealloc that panics or aborts (the parse degrades regardless).
-    let cap = count
-        .min(buf.len().saturating_sub(5) / 4)
-        .min(KEYSET_MAX_ENTRIES);
-    let mut keys: Vec<Coordinate> = Vec::with_capacity(cap);
+    // Reject impossible counts before allocation. Each coordinate needs a length.
+    if count > buf.len().saturating_sub(5) / 4 {
+        return Err(KeysetFrameError::Truncated);
+    }
+    if count > KEYSET_MAX_ENTRIES {
+        return Err(KeysetFrameError::CountOverflow);
+    }
+    // Point plans reuse this vector. Extra capacity penalizes read-only calls.
+    let mut keys = Vec::with_capacity(count);
     let mut offset = 5usize;
     let mut prev: Option<&[u8]> = None;
     for _ in 0..count {
@@ -250,9 +249,8 @@ pub enum KeysetFrameError {
     #[error("map keyset coordinates are not strictly ascending")]
     Unsorted,
 
-    /// A key count or coordinate length exceeded `u32` (structurally
-    /// unreachable behind the registration limit).
-    #[error("map keyset count exceeds u32")]
+    /// A frame exceeded the coordinate count or length bound.
+    #[error("map keyset count or length exceeds its bound")]
     CountOverflow,
 }
 

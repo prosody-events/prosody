@@ -101,8 +101,8 @@ fn stage_pair<C>(op: &mut C, key: i64, left: i64, right: i64) -> Result<(), Prob
 where
     C: CollectionWrite<Layout = PairLayout>,
 {
-    op.set(PairLayout::LEFT, &key, left)?;
-    op.set(PairLayout::RIGHT, &key, right)
+    op.set(PairLayout::LEFT.at(&key), left)?;
+    op.set(PairLayout::RIGHT.at(&key), right)
 }
 
 #[collection_methods(field = cells, session = S)]
@@ -144,7 +144,7 @@ where
     #[write(op)]
     async fn take_swallowing(&self, key: i64, marker: i64) -> Result<bool, ProbeError> {
         let took = op.take(PairLayout::LEFT, &key).await.is_ok();
-        op.set(PairLayout::RIGHT, &key, marker)?;
+        op.set(PairLayout::RIGHT.at(&key), marker)?;
         Ok(took)
     }
 }
@@ -383,11 +383,11 @@ where
     for command in commands {
         match command {
             &Command::Set(family, key, value) => {
-                op.set(family.token(), &key, value)?;
+                op.set(family.token().at(&key), value)?;
                 model.cells.insert((family.section(), key), Some(value));
             }
             &Command::Clear(family, key) => {
-                op.clear(family.token(), &key);
+                op.clear(family.token().at(&key));
                 model.cells.insert((family.section(), key), None);
             }
             &Command::Get(family, key) => {
@@ -469,7 +469,7 @@ async fn run_invocation(case: Invocation) -> Result<()> {
     for &(family, key, value) in &case.seeded {
         handle
             .cells
-            .write(async move |op| op.set(family.token(), &key, value))
+            .write(async move |op| op.set(family.token().at(&key), value))
             .await?;
         seeded.cells.insert((family.section(), key), Some(value));
     }
@@ -482,9 +482,9 @@ async fn run_invocation(case: Invocation) -> Result<()> {
         .cells
         .write(async move |op| {
             let mut model = seeded;
-            op.set(PairLayout::LEFT, &2, 1)?;
+            op.set(PairLayout::LEFT.at(&2), 1)?;
             model.cells.insert((Family::Left.section(), 2), Some(1));
-            op.clear(PairLayout::LEFT, &2);
+            op.clear(PairLayout::LEFT.at(&2));
             model.cells.insert((Family::Left.section(), 2), None);
             assert_eq!(
                 op.contains_many(PairLayout::LEFT, &[2, 3, 2])
@@ -697,7 +697,7 @@ fn cancelled_write_drops_the_journal_and_releases_admission() -> Result<()> {
 
         let parked = Notify::new();
         let mut invocation = Box::pin(handle.cells.write(async |op| {
-            op.set(PairLayout::LEFT, &2, 77)?;
+            op.set(PairLayout::LEFT.at(&2), 77)?;
             parked.notified().await;
             Ok::<(), ProbeError>(())
         }));
@@ -789,7 +789,7 @@ fn batch_reads_stay_aligned_across_the_store_batch_boundary() -> Result<()> {
             .cells
             .write(async |op| {
                 for key in 0..populated {
-                    op.set(PairLayout::LEFT, &key, key * 10)?;
+                    op.set(PairLayout::LEFT.at(&key), key * 10)?;
                 }
                 Ok::<(), ProbeError>(())
             })

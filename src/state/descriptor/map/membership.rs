@@ -7,11 +7,9 @@ use crate::state::collection::{
     CellFamily, CollectionRead, CollectionWrite, Plan, ReadOperation, StateSession,
 };
 use crate::state::descriptor::{
-    CellCodecError, CellStateError, CellType, CollectionSpec, KeyOf, Keyed, WriteOf,
+    CellCodecError, CellStateError, CollectionSpec, KeyOf, Keyed, WriteOf,
 };
-use crate::state::order_codec::OrderedKeyCodec;
 use std::error::Error;
-use std::slice::from_ref;
 use tracing::warn;
 
 /// A collection whose keyset and members share one atomic mutation.
@@ -38,10 +36,11 @@ where
     C: CollectionWrite,
     C::Layout: KeysetLayout,
 {
-    let coordinate = <MemberOf<C> as CellType>::Key::encode(key);
     let prior = read_keyset_state(op).await?;
-    op.set(C::Layout::MEMBERS, key, value)?;
-    update_keyset(op, coordinate, prior)
+    let address = C::Layout::MEMBERS.at(key);
+    let keyset = prior.insert(address.coordinate(), op.keyset_limit(), op.has_ttl());
+    write_keyset(op, keyset)?;
+    op.set(address, value).map_err(Into::into)
 }
 
 /// Removes the member and updates its keyset in one admitted operation.
@@ -53,10 +52,11 @@ where
     C: CollectionWrite,
     C::Layout: KeysetLayout,
 {
-    let coordinate = <MemberOf<C> as CellType>::Key::encode(key);
     let prior = read_keyset_state(op).await?;
-    op.clear(C::Layout::MEMBERS, key);
-    subtract_keyset(op, &coordinate, prior)
+    let address = C::Layout::MEMBERS.at(key);
+    write_keyset(op, prior.remove(address.coordinate()))?;
+    op.clear(address);
+    Ok(())
 }
 
 /// The keyset before a member mutation. Invalid frames select a scan and heal
@@ -112,11 +112,12 @@ where
 }
 
 /// Reads the keyset. Invalid frames select a scan; access errors propagate.
-async fn read_keyset_state<C, E>(op: &mut C) -> Result<PriorKeyset, MapStateError<E>>
+async fn read_keyset_state<C>(
+    op: &mut C,
+) -> Result<PriorKeyset, MapStateError<CellCodecError<MemberOf<C>>>>
 where
     C: CollectionRead,
     C::Layout: KeysetLayout,
-    E: Error + Send + Sync + 'static,
 {
     match op.get(C::Layout::KEYSET, &()).await {
         Ok(None) => Ok(PriorKeyset::Absent),
@@ -132,125 +133,66 @@ where
     }
 }
 
-/// Adds a coordinate and enforces both keyset bounds.
-/// Every insertion with a TTL refreshes the keyset, including unchanged or
-/// overflowed membership.
-fn update_keyset<C, E>(
-    op: &mut C,
-    coordinate: Coordinate,
-    prior: PriorKeyset,
-) -> Result<(), MapStateError<E>>
-where
-    C: CollectionWrite,
-    C::Layout: KeysetLayout,
-    E: Error + Send + Sync + 'static,
-{
-    let limit = op.keyset_limit();
-    let ttl = op.has_ttl();
-    match prior {
-        // Malformed → heal to Overflowed (already warned at read).
-        PriorKeyset::Malformed => write_keyset(op, Keyset::Overflowed),
-        // A fresh singleton must fit both bounds.
-        PriorKeyset::Absent => {
-            if is_oversized(from_ref(&coordinate), limit) {
-                write_keyset(op, Keyset::Overflowed)
-            } else {
-                write_keyset(op, Keyset::Tracked(vec![coordinate]))
-            }
+impl PriorKeyset {
+    /// Returns a replacement only when membership or its TTL changes.
+    fn insert(self, coordinate: &Coordinate, limit: usize, ttl: bool) -> Option<Keyset> {
+        let mut keys = match self {
+            Self::Absent => Vec::new(),
+            Self::Malformed => return Some(Keyset::Overflowed),
+            Self::Decoded(Keyset::Overflowed) => return ttl.then_some(Keyset::Overflowed),
+            Self::Decoded(Keyset::Tracked(keys)) => keys,
+        };
+        let frame_len = tracked_frame_len(&keys);
+        // Apply a lowered bound before duplicate detection.
+        if keys.len() > limit || frame_len.is_none_or(|len| len > KEYSET_BYTE_CEILING) {
+            warn!("keyset exceeds its bound; store Overflowed");
+            return Some(Keyset::Overflowed);
         }
-        // Overflowed is one-way: no write, except the TTL refresh.
-        PriorKeyset::Decoded(Keyset::Overflowed) => {
-            if ttl {
-                write_keyset(op, Keyset::Overflowed)
-            } else {
-                Ok(())
-            }
-        }
-        PriorKeyset::Decoded(Keyset::Tracked(keys)) => {
-            update_tracked(op, coordinate, keys, limit, ttl)
-        }
-    }
-}
-
-/// Removes a tracked coordinate. Removal can reduce an oversized frame below
-/// its limit. Unknown membership stays overflowed until clear or expiry.
-fn subtract_keyset<C, E>(
-    op: &mut C,
-    coordinate: &Coordinate,
-    prior: PriorKeyset,
-) -> Result<(), MapStateError<E>>
-where
-    C: CollectionWrite,
-    C::Layout: KeysetLayout,
-    E: Error + Send + Sync + 'static,
-{
-    match prior {
-        PriorKeyset::Malformed => write_keyset(op, Keyset::Overflowed),
-        PriorKeyset::Decoded(Keyset::Tracked(mut keys)) => match keys.binary_search(coordinate) {
-            Ok(position) => {
-                keys.remove(position);
-                write_keyset(op, Keyset::Tracked(keys))
-            }
-            Err(_) => Ok(()),
-        },
-        PriorKeyset::Absent | PriorKeyset::Decoded(Keyset::Overflowed) => Ok(()),
-    }
-}
-
-/// Checks bounds before duplicate detection, then inserts a new coordinate in
-/// order.
-fn update_tracked<C, E>(
-    op: &mut C,
-    coordinate: Coordinate,
-    mut keys: Vec<Coordinate>,
-    limit: usize,
-    ttl: bool,
-) -> Result<(), MapStateError<E>>
-where
-    C: CollectionWrite,
-    C::Layout: KeysetLayout,
-    E: Error + Send + Sync + 'static,
-{
-    // Oversized first — collapse even when `coordinate` is already listed.
-    if is_oversized(&keys, limit) {
-        warn!(
-            collection = op.name().as_str(),
-            "keyset exceeds its bound; store Overflowed"
-        );
-        return write_keyset(op, Keyset::Overflowed);
-    }
-    match keys.binary_search(&coordinate) {
-        // Already tracked: no content change — rewrite only to refresh TTL.
-        Ok(_) => {
-            if ttl {
-                write_keyset(op, Keyset::Tracked(keys))
-            } else {
-                Ok(())
-            }
-        }
-        Err(position) => {
-            let would_exceed = keys.len() + 1 > limit
-                || tracked_frame_len(&keys)
+        match keys.binary_search(coordinate) {
+            Ok(_) => ttl.then_some(Keyset::Tracked(keys)),
+            Err(position) => {
+                let len = frame_len
                     .and_then(|len| len.checked_add(4))
-                    .and_then(|len| len.checked_add(coordinate.as_bytes().len()))
-                    .is_none_or(|len| len > KEYSET_BYTE_CEILING);
-            if would_exceed {
-                return write_keyset(op, Keyset::Overflowed);
+                    .and_then(|len| len.checked_add(coordinate.as_bytes().len()));
+                if keys.len() == limit || len.is_none_or(|len| len > KEYSET_BYTE_CEILING) {
+                    return Some(Keyset::Overflowed);
+                }
+                keys.insert(position, coordinate.clone());
+                Some(Keyset::Tracked(keys))
             }
-            keys.insert(position, coordinate);
-            write_keyset(op, Keyset::Tracked(keys))
+        }
+    }
+
+    /// Removes known membership. Invalid frames become overflowed.
+    fn remove(self, coordinate: &Coordinate) -> Option<Keyset> {
+        match self {
+            Self::Malformed => Some(Keyset::Overflowed),
+            Self::Decoded(Keyset::Tracked(mut keys)) => {
+                let Ok(position) = keys.binary_search(coordinate) else {
+                    return None;
+                };
+                keys.remove(position);
+                Some(Keyset::Tracked(keys))
+            }
+            Self::Absent | Self::Decoded(Keyset::Overflowed) => None,
         }
     }
 }
 
-/// Stages the shared keyset frame.
-fn write_keyset<C, E>(op: &mut C, keyset: Keyset) -> Result<(), MapStateError<E>>
+/// Stages a replacement frame in the member's admitted operation.
+fn write_keyset<C>(
+    op: &mut C,
+    keyset: Option<Keyset>,
+) -> Result<(), MapStateError<CellCodecError<MemberOf<C>>>>
 where
     C: CollectionWrite,
     C::Layout: KeysetLayout,
-    E: Error + Send + Sync + 'static,
 {
-    op.set(C::Layout::KEYSET, &(), keyset).map_err(keyset_err)
+    if let Some(keyset) = keyset {
+        op.set(C::Layout::KEYSET.at(&()), keyset)
+            .map_err(keyset_err)?;
+    }
+    Ok(())
 }
 
 /// Preserves access and key errors. Maps frame errors to the separate keyset

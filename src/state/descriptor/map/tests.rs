@@ -7,7 +7,7 @@
 
 use super::*;
 use bytes::BytesMut;
-use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+use quickcheck::{QuickCheck, TestResult};
 
 /// The frozen cell addresses (a durable contract — the keyset family lowers to
 /// section `0` and encodes to coordinate `[2]`, the entries family to section
@@ -36,32 +36,6 @@ fn map_layout_is_frozen() {
     );
 }
 
-/// A short coordinate over a tiny null-prone alphabet, so the keyset frame's
-/// length-delimited scheme is exercised at the empty coordinate and at bytes a
-/// naive parser might mishandle.
-fn arb_coordinate(g: &mut Gen) -> Coordinate {
-    const ALPHABET: [u8; 3] = [0x00, 0x01, 0xFF];
-    let len = usize::arbitrary(g) % 4;
-    let bytes: Vec<u8> = (0..len)
-        .map(|_| g.choose(&ALPHABET).copied().unwrap_or(0))
-        .collect();
-    Coordinate::from_bytes(bytes)
-}
-
-/// A strictly-ascending coordinate list, the shape a `Tracked` keyset stores.
-#[derive(Clone, Debug)]
-struct SortedCoords(Vec<Coordinate>);
-
-impl Arbitrary for SortedCoords {
-    fn arbitrary(g: &mut Gen) -> Self {
-        let n = usize::arbitrary(g) % 6;
-        let mut coords: Vec<Coordinate> = (0..n).map(|_| arb_coordinate(g)).collect();
-        coords.sort();
-        coords.dedup();
-        Self(coords)
-    }
-}
-
 /// Serialize then deserialize a keyset through the real [`MapKeysetCodec`].
 fn round_trip(keyset: &Keyset) -> Result<Keyset, KeysetFrameError> {
     let mut codec = MapKeysetCodec;
@@ -70,31 +44,26 @@ fn round_trip(keyset: &Keyset) -> Result<Keyset, KeysetFrameError> {
     let mut borrowed = Vec::new();
     codec.serialize_ref(keyset, &mut borrowed)?;
     assert_eq!(borrowed, buf, "both serializers must write the same bytes");
-    let owned = codec.deserialize_owned(BytesMut::from(buf.as_slice()))?;
+    let frame = BytesMut::from(buf.as_slice());
+    let start = frame.as_ptr() as usize;
+    let end = start + frame.len();
+    let owned = codec.deserialize_owned(frame)?;
+    if let Keyset::Tracked(keys) = &owned {
+        assert!(keys.iter().all(|key| {
+            let pointer = key.as_bytes().as_ptr() as usize;
+            (start..=end).contains(&pointer) && key.as_bytes().len() <= end - pointer
+        }));
+    }
     let decoded = codec.deserialize(&mut buf)?;
     assert_eq!(owned, decoded, "both decoders must read the same value");
     Ok(decoded)
 }
 
+/// An empty coordinate can point one byte past the frame's last byte.
 #[test]
-fn owned_keyset_decode_reuses_frame_storage() -> color_eyre::Result<()> {
-    let keyset = Keyset::Tracked(vec![
-        Coordinate::from_bytes("alpha"),
-        Coordinate::from_bytes("omega"),
-    ]);
-    let mut encoded = Vec::new();
-    MapKeysetCodec.serialize(keyset, &mut encoded)?;
-    let frame = BytesMut::from(encoded.as_slice());
-    let start = frame.as_ptr() as usize;
-    let end = start + frame.len();
-
-    let Keyset::Tracked(coordinates) = MapKeysetCodec.deserialize_owned(frame)? else {
-        color_eyre::eyre::bail!("tracked frame decoded as overflowed");
-    };
-    assert!(coordinates.iter().all(|coordinate| {
-        let pointer = coordinate.as_bytes().as_ptr() as usize;
-        (start..end).contains(&pointer)
-    }));
+fn empty_coordinate_round_trip() -> color_eyre::Result<()> {
+    let keyset = Keyset::Tracked(vec![Coordinate::empty()]);
+    assert_eq!(round_trip(&keyset)?, keyset);
     Ok(())
 }
 
@@ -104,23 +73,24 @@ fn decode(mut bytes: Vec<u8>) -> Result<Keyset, KeysetFrameError> {
     codec.deserialize(&mut bytes)
 }
 
-/// The keyset codec round-trips both variants: `Overflowed`, and any
-/// strictly-ascending `Tracked` list (including empty) through the exact-length
-/// serializer and the zero-copy parser.
+/// Keyset frames round-trip and retain their owned storage.
 #[test]
 fn prop_keyset_frame_round_trip() {
-    fn prop(input: SortedCoords, overflowed: bool) -> TestResult {
+    fn prop(input: Vec<Vec<u8>>, overflowed: bool) -> TestResult {
+        let mut coordinates: Vec<_> = input.into_iter().map(Coordinate::from_bytes).collect();
+        coordinates.sort();
+        coordinates.dedup();
         let keyset = if overflowed {
             Keyset::Overflowed
         } else {
-            Keyset::Tracked(input.0)
+            Keyset::Tracked(coordinates)
         };
         match round_trip(&keyset) {
             Ok(decoded) => TestResult::from_bool(decoded == keyset),
             Err(e) => TestResult::error(format!("round-trip failed: {e}")),
         }
     }
-    QuickCheck::new().quickcheck(prop as fn(SortedCoords, bool) -> TestResult);
+    QuickCheck::new().quickcheck(prop as fn(Vec<Vec<u8>>, bool) -> TestResult);
 }
 
 /// Every malformed keyset frame is rejected with `Err` — none panic — so the
@@ -161,6 +131,14 @@ fn keyset_frame_rejects_malformed() {
     assert!(matches!(
         decode(vec![0, 0, 0, 0, 2, 0, 0, 0, 1, 0x01, 0, 0, 0, 1, 0x01]),
         Err(KeysetFrameError::Unsorted)
+    ));
+    // Reject a count above the allocation bound before the parse can grow it.
+    let count = (keyset::KEYSET_BYTE_CEILING / 4 + 1) as u32;
+    let mut oversized = vec![0; 5 + count as usize * 4];
+    oversized[1..5].copy_from_slice(&count.to_be_bytes());
+    assert!(matches!(
+        decode(oversized),
+        Err(KeysetFrameError::CountOverflow)
     ));
     // Trailing bytes after the Overflowed sentinel.
     assert!(matches!(
