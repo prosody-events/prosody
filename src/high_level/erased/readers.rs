@@ -13,8 +13,8 @@ use crate::high_level::{
 use crate::state::ReadCachePolicy;
 use crate::state::cell_key::Direction;
 use crate::state::descriptor::{
-    DequeDescriptor, MapDescriptor, StateDescriptor, ValueDescriptor, deque_state, map_state,
-    value_state,
+    DequeDescriptor, MapDescriptor, SetDescriptor, StateDescriptor, ValueDescriptor, deque_state,
+    map_state, set_state, value_state,
 };
 use crate::state::order_codec::Utf8KeyCodec;
 use crate::state::registry::MAX_KEYSET_LIMIT;
@@ -51,10 +51,10 @@ impl From<ErasedReadCache> for ReadCachePolicy {
 /// Ordering for a foreign-language state scan.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ErasedDirection {
-    /// Ascending map keys or front-to-back deque elements.
+    /// Ascending map keys, set members, or front-to-back deque elements.
     #[default]
     Forward,
-    /// Descending map keys or back-to-front deque elements.
+    /// Descending map keys, set members, or back-to-front deque elements.
     Backward,
 }
 
@@ -114,6 +114,33 @@ pub trait ErasedMapReader<C: Codec>: Send + Sync {
 
 /// Shared map-reader representation stored by native FFI wrappers.
 pub type SharedMapReader<C> = Arc<dyn ErasedMapReader<C>>;
+
+/// Read-only access to a published string-keyed set collection.
+#[async_trait]
+pub trait ErasedSetReader: Send + Sync {
+    /// Reports whether the committed set contains `member`.
+    async fn contains(&self, key: String, member: String) -> Result<bool, ErasedStateError>;
+
+    /// Tests committed membership aligned with `members`.
+    async fn contains_many(
+        &self,
+        key: String,
+        members: Vec<String>,
+    ) -> Result<Vec<bool>, ErasedStateError>;
+
+    /// Reports whether the committed set has no members.
+    async fn is_empty(&self, key: String) -> Result<bool, ErasedStateError>;
+
+    /// Streams committed members in key order.
+    async fn keys(
+        &self,
+        key: String,
+        direction: ErasedDirection,
+    ) -> Result<BoxStateCursor<String>, ErasedStateError>;
+}
+
+/// Shared set-reader representation stored by native FFI wrappers.
+pub type SharedSetReader = Arc<dyn ErasedSetReader>;
 
 /// Read-only access to a published deque collection.
 #[async_trait]
@@ -187,6 +214,23 @@ where
     let descriptor = map_state::<Utf8KeyCodec, StateCodec<T>>(name).read_cache(cache);
     let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
     Ok(Arc::new(MapReader(reader)))
+}
+
+pub(in crate::high_level) async fn set<T, B>(
+    client: &HighLevelClient<T, B>,
+    subsystem: String,
+    name: &str,
+    cache: ErasedReadCache,
+) -> Result<SharedSetReader, ErasedReaderBuildError<MessageCodecError<T>>>
+where
+    T: ClientHandler,
+    T::Payload: Clone + ErasedStateCodec + EventIdentity + Send + Sync + 'static,
+    B: ClientBackend<MessageCodec<T>>,
+    B::Reader: ConsumerReaderBackend<MessageCodec<T>>,
+{
+    let descriptor = set_state::<Utf8KeyCodec>(name).read_cache(cache);
+    let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
+    Ok(Arc::new(SetReader(reader)))
 }
 
 pub(in crate::high_level) async fn deque<T, B>(
@@ -280,6 +324,52 @@ where
             .await
             .map_err(ErasedStateError::from)?;
         Ok(Box::new(state_cursor(stream)))
+    }
+
+    async fn keys(
+        &self,
+        key: String,
+        direction: ErasedDirection,
+    ) -> Result<BoxStateCursor<String>, ErasedStateError> {
+        let stream = self
+            .0
+            .keys(Key::from(key), direction.into())
+            .await
+            .map_err(ErasedStateError::from)?;
+        Ok(Box::new(state_cursor(stream)))
+    }
+}
+
+struct SetReader<W: Codec, B: ReaderBackend<W>>(StateReader<SetDescriptor<Utf8KeyCodec>, W, B>);
+
+#[async_trait]
+impl<W, B> ErasedSetReader for SetReader<W, B>
+where
+    W: Codec,
+    W::Payload: Clone,
+    B: ReaderBackend<W>,
+{
+    async fn contains(&self, key: String, member: String) -> Result<bool, ErasedStateError> {
+        self.0
+            .contains(Key::from(key), &member)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn contains_many(
+        &self,
+        key: String,
+        members: Vec<String>,
+    ) -> Result<Vec<bool>, ErasedStateError> {
+        validate_get_many_len(members.len())?;
+        self.0
+            .contains_many(Key::from(key), &members)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn is_empty(&self, key: String) -> Result<bool, ErasedStateError> {
+        self.0.is_empty(Key::from(key)).await.map_err(Into::into)
     }
 
     async fn keys(

@@ -719,9 +719,9 @@ fn map_keyset_rotating_stays_tracked() -> Result<()> {
 /// `Tracked` frame degrades the stream to a full-section scan, but once
 /// `remove` subtracts enough keys to bring the frame back under the limit, a
 /// fresh stream takes the point-get arm again. Red-proven by making
-/// `PriorKeyset::remove` write `Overflowed` instead of the shrunk frame: removal
-/// never heals, so the post-remove stream still degrades (`lower_scans() ==
-/// 1`).
+/// `PriorKeyset::remove` write `Overflowed` instead of the shrunk frame:
+/// removal never heals, so the post-remove stream still degrades
+/// (`lower_scans() == 1`).
 #[test]
 fn map_keyset_removal_heals_oversized() -> Result<()> {
     runtime()?.block_on(async {

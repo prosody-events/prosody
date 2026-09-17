@@ -27,11 +27,12 @@ mod implementation;
 mod readers;
 
 use implementation::ErasedClient;
-pub(super) use readers::{deque, map, value};
+pub(super) use readers::{deque, map, set, value};
 
 pub use readers::{
     ErasedDequeReader, ErasedDirection, ErasedMapReader, ErasedReadCache, ErasedReaderBuildError,
-    ErasedValueReader, SharedDequeReader, SharedMapReader, SharedValueReader,
+    ErasedSetReader, ErasedValueReader, SharedDequeReader, SharedMapReader, SharedSetReader,
+    SharedValueReader,
 };
 
 /// Consumer lifecycle state materialized across an FFI boundary.
@@ -118,6 +119,14 @@ where
         name: String,
         cache: ErasedReadCache,
     ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec;
+    async fn set_state(
+        &self,
+        subsystem: String,
+        name: String,
+        cache: ErasedReadCache,
+    ) -> Result<SharedSetReader, ErasedReaderBuildError<MessageCodecError<T>>>
     where
         T::Payload: ErasedStateCodec;
     async fn deque_state(
@@ -336,6 +345,25 @@ where
         let guard = self.client.read().await;
         let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
         client.map_state(subsystem, name, cache).await
+    }
+
+    /// Builds a read-only view of one published set collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is shut down or the reader is invalid.
+    pub async fn set_state(
+        &self,
+        subsystem: String,
+        name: String,
+        cache: ErasedReadCache,
+    ) -> Result<SharedSetReader, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
+    {
+        let guard = self.client.read().await;
+        let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
+        client.set_state(subsystem, name, cache).await
     }
 
     /// Builds a read-only view of one published deque collection.

@@ -8,8 +8,8 @@ use super::{
     ConsumerReaderBackend, ConsumerState, ErasedConsumerState, ErasedHighLevelClient,
     ErasedReadCache, ErasedReaderBuildError, ErasedStateCodec, EventIdentity, EventType,
     HighLevelClient, HighLevelClientError, MessageCodec, MessageCodecError, ProducerConfiguration,
-    RequestError, SharedDequeReader, SharedMapReader, SharedValueReader, StateCodec, SubsystemName,
-    SubsystemOutcomes, Topic, deque, erased_config, map, value,
+    RequestError, SharedDequeReader, SharedMapReader, SharedSetReader, SharedValueReader,
+    StateCodec, SubsystemName, SubsystemOutcomes, Topic, deque, erased_config, map, set, value,
 };
 use crate::high_level::{ClientBackend, ClientHandler};
 
@@ -128,6 +128,18 @@ where
         T::Payload: ErasedStateCodec,
     {
         map(&self.0, subsystem, &name, cache).await
+    }
+
+    async fn set_state(
+        &self,
+        subsystem: String,
+        name: String,
+        cache: ErasedReadCache,
+    ) -> Result<SharedSetReader, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
+    {
+        set(&self.0, subsystem, &name, cache).await
     }
 
     async fn deque_state(
