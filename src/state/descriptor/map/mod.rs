@@ -641,7 +641,7 @@ where
         };
         let coordinates = match keyset {
             PriorKeyset::Absent => {
-                return Ok(op.coordinates(MapKind::<KC, V>::ENTRIES, Vec::new().into_iter()));
+                return Ok(op.coordinates(MapKind::<KC, V>::ENTRIES, Vec::new()));
             }
             // Overflowed falls to the scan with no warning; Malformed already
             // warned in `read_keyset_state`.

@@ -35,14 +35,13 @@ use crate::consumer::kafka_state::MessageCell;
 use crate::consumer::message::ConsumerMessage;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MessageLoader;
-use crate::state::cell_key::{Direction, ScanEdge};
-use crate::state::collection::WritableStateSession;
-use crate::state::descriptor::map::Query;
+use crate::state::cell_key::Direction;
+use crate::state::collection::{StateSession, WritableStateSession};
 use crate::state::descriptor::{
     CellCodecError, CellStateError, CellType, ContextOf, DequeHandle, DequeStateError, FromSession,
     MapHandle, MapQuery, MapStateError, ResolvedOf, ValueHandle,
 };
-use crate::state::order_codec::{OrderedKeyCodec, UnitKey, Utf8KeyCodec};
+use crate::state::order_codec::{UnitKey, Utf8KeyCodec};
 
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -72,44 +71,27 @@ pub enum ErasedCategory {
     Transient,
 }
 
-/// Erased map scan constraints.
+/// Erased scan constraints over edges of type `E`.
+/// The default scans forward, unbounded, and without a limit.
 #[derive(Clone, Debug)]
-pub struct MapScanConfig {
+pub struct ScanConfig<E> {
     /// The scan direction.
     pub dir: Direction,
     /// The maximum number of present items.
     pub limit: Option<NonZeroUsize>,
-    /// The direction-relative start edge.
-    pub start: Bound<String>,
-    /// The direction-relative end edge.
-    pub end: Bound<String>,
+    /// The inclusive, exclusive, or open range start.
+    pub start: Bound<E>,
+    /// The inclusive, exclusive, or open range end.
+    pub end: Bound<E>,
 }
 
-impl Default for MapScanConfig {
-    fn default() -> Self {
-        Self {
-            dir: Direction::Forward,
-            limit: None,
-            start: Bound::Unbounded,
-            end: Bound::Unbounded,
-        }
-    }
-}
+/// Map scan constraints. The key edges follow the scan direction.
+pub type MapScanConfig = ScanConfig<String>;
 
-/// Erased deque scan constraints.
-#[derive(Clone, Debug)]
-pub struct DequeScanConfig {
-    /// The scan direction.
-    pub dir: Direction,
-    /// The maximum number of present items.
-    pub limit: Option<NonZeroUsize>,
-    /// The inclusive or exclusive front-relative range start.
-    pub start: Bound<u64>,
-    /// The inclusive or exclusive front-relative range end.
-    pub end: Bound<u64>,
-}
+/// Deque scan constraints. The position edges count from the front.
+pub type DequeScanConfig = ScanConfig<u64>;
 
-impl Default for DequeScanConfig {
+impl<E> Default for ScanConfig<E> {
     fn default() -> Self {
         Self {
             dir: Direction::Forward,
@@ -798,8 +780,7 @@ where
     fn scan(&self, config: MapScanConfig) -> BoxStateCursor<(String, ResolvedOf<T>)> {
         let handle = self.handle.clone();
         let stream = try_stream! {
-            let inner = MapQuery::new(&handle, map_query(config))
-                .entries();
+            let inner = map_query(&handle, config).entries();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 let (key, value) = item.map_err(|e| ErasedStateError::from_classified(&e))?;
@@ -812,8 +793,7 @@ where
     fn keys(&self, config: MapScanConfig) -> BoxStateCursor<String> {
         let handle = self.handle.clone();
         let stream = try_stream! {
-            let inner = MapQuery::new(&handle, map_query(config))
-                .keys();
+            let inner = map_query(&handle, config).keys();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 let key = item.map_err(|e| ErasedStateError::from_classified(&e))?;
@@ -961,18 +941,29 @@ fn bound_usize(bound: Bound<u64>) -> Bound<usize> {
     bound.map(|value| usize::try_from(value).unwrap_or(usize::MAX))
 }
 
-/// Encodes the map bounds once before the stream starts.
-fn map_query(config: MapScanConfig) -> Query {
-    let edge = |bound: Bound<String>| match bound {
-        Bound::Included(key) => ScanEdge::Included(Utf8KeyCodec::encode(&key)),
-        Bound::Excluded(key) => ScanEdge::Excluded(Utf8KeyCodec::encode(&key)),
-        Bound::Unbounded => ScanEdge::Unbounded,
+/// Applies the erased bounds and limit to a map query.
+fn map_query<S, T>(
+    handle: &MapHandle<S, Utf8KeyCodec, T>,
+    config: MapScanConfig,
+) -> MapQuery<'_, S, Utf8KeyCodec, T>
+where
+    S: StateSession,
+    T: CellType<Key = UnitKey>,
+{
+    let query = handle.query(config.dir);
+    let query = match config.start {
+        Bound::Included(key) => query.from(&key),
+        Bound::Excluded(key) => query.after(&key),
+        Bound::Unbounded => query,
     };
-    Query {
-        dir: config.dir,
-        start: edge(config.start),
-        end: edge(config.end),
-        limit: config.limit,
+    let query = match config.end {
+        Bound::Included(key) => query.to(&key),
+        Bound::Excluded(key) => query.before(&key),
+        Bound::Unbounded => query,
+    };
+    match config.limit {
+        Some(limit) => query.limit(limit),
+        None => query,
     }
 }
 

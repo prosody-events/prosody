@@ -326,7 +326,7 @@ async fn plan_fences_after_its_last_item() -> Result<()> {
                             ScanEdge::Unbounded,
                         )
                     } else {
-                        op.coordinates(PlainLayout::CELLS, vec![7_i64, 8].into_iter())
+                        op.coordinates(PlainLayout::CELLS, vec![7_i64, 8])
                     }
                 })
                 .await;
@@ -434,7 +434,7 @@ fn plan_streams_are_send() -> Result<()> {
             .await;
         assert_send(range.projected::<Values>());
         let points = cells
-            .read(async |op| op.coordinates(GatedLayout::CELLS, Vec::new().into_iter()))
+            .read(async |op| op.coordinates(GatedLayout::CELLS, Vec::new()))
             .await;
         assert_send(points.projected::<Values>());
         Ok(())

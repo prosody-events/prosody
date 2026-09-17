@@ -10,7 +10,6 @@ use async_stream::try_stream;
 use futures::{Stream, StreamExt};
 use std::fmt::Display;
 use std::num::NonZeroUsize;
-use std::vec::IntoIter;
 use tracing::{Instrument, info_span};
 
 /// The encoded bounds, direction, and result limit of a map query.
@@ -128,15 +127,31 @@ impl Query {
         }
     }
 
-    /// Validates stored coordinates, then selects keys within the query bounds.
-    /// Every key must encode back to its stored coordinate. Failure selects a
-    /// scan. Trimming moves no keys and allocates no additional buffer.
+    /// Selects the stored coordinates within the query bounds and decodes
+    /// them in query order. Every selected key must encode back to its
+    /// coordinate. A key that does not selects a scan.
     pub(super) fn keys<KC: OrderedKeyCodec>(
         &self,
         coordinates: &[Coordinate],
-    ) -> Option<IntoIter<KC::Key>> {
-        let mut keys = Vec::with_capacity(coordinates.len());
-        for coordinate in coordinates {
+    ) -> Option<Vec<KC::Key>> {
+        let (low, high) = match self.dir {
+            Direction::Forward => (&self.start, &self.end),
+            Direction::Backward => (&self.end, &self.start),
+        };
+        let start = match low {
+            ScanEdge::Included(edge) => coordinates.partition_point(|c| c < edge),
+            ScanEdge::Excluded(edge) => coordinates.partition_point(|c| c <= edge),
+            ScanEdge::Unbounded => 0,
+        };
+        let end = match high {
+            ScanEdge::Included(edge) => coordinates.partition_point(|c| c <= edge),
+            ScanEdge::Excluded(edge) => coordinates.partition_point(|c| c < edge),
+            ScanEdge::Unbounded => coordinates.len(),
+        };
+        let selected = coordinates.get(start..end).unwrap_or_default();
+
+        let mut keys = Vec::with_capacity(selected.len());
+        for coordinate in selected {
             let Ok(key) = KC::decode(coordinate.as_bytes()) else {
                 return None;
             };
@@ -145,29 +160,8 @@ impl Query {
             }
             keys.push(key);
         }
-        let (low, high) = match self.dir {
-            Direction::Forward => (&self.start, &self.end),
-            Direction::Backward => (&self.end, &self.start),
-        };
-        let start = match low {
-            ScanEdge::Included(edge) => coordinates.partition_point(|key| key < edge),
-            ScanEdge::Excluded(edge) => coordinates.partition_point(|key| key <= edge),
-            ScanEdge::Unbounded => 0,
-        };
-        let end = match high {
-            ScanEdge::Included(edge) => coordinates.partition_point(|key| key <= edge),
-            ScanEdge::Excluded(edge) => coordinates.partition_point(|key| key < edge),
-            ScanEdge::Unbounded => keys.len(),
-        };
-        let mut keys = keys.into_iter();
-        if end < keys.len() {
-            let _ = keys.nth_back(keys.len() - end - 1);
-        }
-        if start > 0 {
-            let _ = keys.nth(start - 1);
-        }
         if self.dir == Direction::Backward {
-            keys.as_mut_slice().reverse();
+            keys.reverse();
         }
         Some(keys)
     }

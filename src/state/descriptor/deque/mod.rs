@@ -398,7 +398,7 @@ where
         }
         .min(window_len);
         if start >= end {
-            return Ok(op.coordinates(DequeKind::<T>::ENTRIES, Vec::new().into_iter()));
+            return Ok(op.coordinates(DequeKind::<T>::ENTRIES, Vec::new()));
         }
         let len = end - start;
         let first = window.absolute(start)?;
@@ -419,7 +419,7 @@ where
         if dir == Direction::Backward {
             indices.reverse();
         }
-        Ok(op.coordinates(DequeKind::<T>::ENTRIES, indices.into_iter()))
+        Ok(op.coordinates(DequeKind::<T>::ENTRIES, indices))
     }
 
     /// Streams live values from front to back for [`Direction::Forward`].

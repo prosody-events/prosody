@@ -19,7 +19,6 @@ use futures::future::Either;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use std::future::{Future, ready};
 use std::num::NonZeroUsize;
-use std::vec::IntoIter;
 use tokio::task::coop::cooperative;
 
 /// The typed output of a projected collection stream.
@@ -105,7 +104,7 @@ impl<S: StateSession> PlanBase<S> {
 /// bounds. The collection selects it from stored metadata before execution
 /// starts.
 enum Source<K> {
-    Points(IntoIter<K>),
+    Points(Vec<K>),
     Range {
         start: ScanEdge<Coordinate>,
         dir: Direction,
@@ -127,7 +126,7 @@ pub(crate) struct Plan<S: StateSession, T: CellType> {
 impl<S: StateSession, T: CellType> Plan<S, T> {
     /// Captures keys in their required output order. An empty list performs no
     /// read.
-    pub(super) fn coordinates(base: PlanBase<S>, keys: IntoIter<KeyOf<T>>) -> Self {
+    pub(super) fn coordinates(base: PlanBase<S>, keys: Vec<KeyOf<T>>) -> Self {
         Self {
             base,
             source: Source::Points(keys),
@@ -189,7 +188,7 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
 /// successfully before it emits any item.
 fn coordinate_source<S, T, P>(
     base: PlanBase<S>,
-    keys: IntoIter<KeyOf<T>>,
+    keys: Vec<KeyOf<T>>,
     limit: Option<NonZeroUsize>,
 ) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
 where
@@ -199,7 +198,7 @@ where
     S::Engine: sealed::Reads<S, P>,
 {
     try_stream! {
-        let mut keys = keys.peekable();
+        let mut keys = keys.into_iter().peekable();
         let mut fetch = FetchSchedule::new(P::demand(limit), CELL_BATCH);
         while keys.peek().is_some() {
             let chunk: CellBuffer<_> = keys.by_ref().take(fetch.next().get()).collect();

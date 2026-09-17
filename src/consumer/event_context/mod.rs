@@ -44,7 +44,8 @@ mod erased;
 
 pub use erased::{
     BoxDequeState, BoxMapState, BoxStateCursor, BoxValueState, DequeScanConfig, DynDequeState,
-    DynMapState, DynValueState, ErasedCategory, ErasedStateError, MapScanConfig, StateCursor,
+    DynMapState, DynValueState, ErasedCategory, ErasedStateError, MapScanConfig, ScanConfig,
+    StateCursor,
 };
 use erased::{ErasedDeque, ErasedMap, ErasedValue};
 

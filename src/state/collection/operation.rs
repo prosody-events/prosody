@@ -19,7 +19,6 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 use std::future::Future;
 use std::num::NonZeroUsize;
-use std::vec::IntoIter;
 
 /// Inline capacity of one invocation's mutation journal.
 ///
@@ -100,7 +99,7 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
     pub(crate) fn coordinates<T: CellType>(
         &self,
         family: CellFamily<L, T>,
-        keys: IntoIter<KeyOf<T>>,
+        keys: Vec<KeyOf<T>>,
     ) -> Plan<S, T> {
         Plan::coordinates(self.plan_base(family.section()), keys)
     }
