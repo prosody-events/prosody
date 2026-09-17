@@ -1,4 +1,7 @@
 //! Shared map and set membership transitions and query plans.
+//!
+//! Only stream plans read the keyset. Point and batch reads address member
+//! cells directly and never consult it.
 
 use super::keyset::{KEYSET_BYTE_CEILING, is_oversized, tracked_frame_len};
 use super::{Keyset, KeysetFrameError, MapKeysetCodec, MapKeysetKey, MapStateError, Query};

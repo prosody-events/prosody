@@ -178,6 +178,10 @@ where
 
     /// Reports whether the set has no live members.
     ///
+    /// This reads the member section, not the keyset. After a split commit
+    /// leaves keyset residue, it can report a live member that `keys` does not
+    /// list.
+    ///
     /// # Errors
     ///
     /// Returns a key codec error or a session access error.
@@ -219,8 +223,8 @@ where
 }
 
 impl<KC> Descriptor<SetKind<KC>> {
-    /// Sets the maximum member count for tracked reads.
-    /// Larger sets use range scans until clear or expiry.
+    /// Sets the number of live members the set tracks before overflow.
+    /// The map descriptor's `keyset_limit` documents the shared contract.
     #[must_use]
     pub fn keyset_limit(mut self, limit: usize) -> Self {
         self.def.keyset_limit = limit;

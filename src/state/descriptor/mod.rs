@@ -537,8 +537,8 @@ pub trait CollectionSpec: SealedSpec + Sized {
 
 /// The one descriptor skeleton every collection kind shares: an interned name,
 /// operational settings, and a zero-sized [`CollectionSpec`] `K` supplying the
-/// per-kind identity and handle. The three public names
-/// ([`ValueDescriptor`]/[`MapDescriptor`]/[`DequeDescriptor`]) are aliases over
+/// per-kind identity and handle. The public names ([`ValueDescriptor`],
+/// [`MapDescriptor`], [`SetDescriptor`], [`DequeDescriptor`]) are aliases over
 /// this type.
 ///
 /// A plain `Copy` value (the name is interned — see [`Descriptor::new`] for

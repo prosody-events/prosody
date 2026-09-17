@@ -145,7 +145,8 @@ where
 
     /// Reads one value per input key, in input order. Duplicate keys retain
     /// their positions. One scoped operation prevents session mutations
-    /// between batch reads.
+    /// between batch reads. Keys are addressed directly. A key outside the
+    /// tracked keyset reads `None`.
     ///
     /// # Errors
     ///

@@ -12,8 +12,8 @@
 //! sorts by them, and scopes scans to them; it never interprets their meaning.
 //! That meaning is owned by the collection layer: each collection defines its
 //! own section enum and coordinate encoding and lowers them to the wire
-//! `i8`/bytes. So these types name no collection family — Value/Map/Deque never
-//! appear here — and the cell layer cannot dispatch on or escape its partition.
+//! `i8`/bytes. So these types name no collection family — no collection kind
+//! appears here — and the cell layer cannot dispatch on or escape its partition.
 //!
 //! [`order_codec`]: crate::state::order_codec
 

@@ -719,7 +719,7 @@ fn map_keyset_rotating_stays_tracked() -> Result<()> {
 /// `Tracked` frame degrades the stream to a full-section scan, but once
 /// `remove` subtracts enough keys to bring the frame back under the limit, a
 /// fresh stream takes the point-get arm again. Red-proven by making
-/// `subtract_keyset` write `Overflowed` instead of the shrunk frame: removal
+/// `PriorKeyset::remove` write `Overflowed` instead of the shrunk frame: removal
 /// never heals, so the post-remove stream still degrades (`lower_scans() ==
 /// 1`).
 #[test]
