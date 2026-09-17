@@ -15,7 +15,7 @@
 //!
 //! The trace generators are reused wholesale from
 //! [`collection_suite`](crate::state::tests::collection_suite) (`MapOp`,
-//! `SetOp`, `DequeOp`, `Trace`, `KEY_POOL`). Only the degenerate [`ValueOp`] is
+//! `DequeOp`, `Trace`, `KEY_POOL`). Only the degenerate [`ValueOp`] is
 //! new, since a Value has no removal. The runner ignores the generators'
 //! mid-handler commit and read operations. A reader only observes committed
 //! state, and the runner already promotes every event, so those ops add no new

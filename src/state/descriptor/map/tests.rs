@@ -74,10 +74,24 @@ fn decode(mut bytes: Vec<u8>) -> Result<Keyset, KeysetFrameError> {
 }
 
 /// Keyset frames round-trip and retain their owned storage.
+/// Short coordinates over a null-prone alphabet exercise empty coordinates and
+/// bytes that a naive length parser mishandles.
 #[test]
 fn prop_keyset_frame_round_trip() {
     fn prop(input: Vec<Vec<u8>>, overflowed: bool) -> TestResult {
-        let mut coordinates: Vec<_> = input.into_iter().map(Coordinate::from_bytes).collect();
+        const ALPHABET: [u8; 3] = [0x00, 0x01, 0xFF];
+        let mut coordinates: Vec<_> = input
+            .into_iter()
+            .map(|coordinate| {
+                Coordinate::from_bytes(
+                    coordinate
+                        .into_iter()
+                        .take(3)
+                        .map(|byte| ALPHABET[usize::from(byte % 3)])
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
         coordinates.sort();
         coordinates.dedup();
         let keyset = if overflowed {

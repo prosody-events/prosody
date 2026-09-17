@@ -789,11 +789,9 @@ fn map_keyset_removal_heals_oversized() -> Result<()> {
     })
 }
 
-/// An absent keyset streams nothing with zero entry reads (the `Absent → Empty`
-/// fast path resting on `KeysetPresence`): a truly empty collection yields
-/// nothing and issues no scan, and the only lower read is the single keyset get
-/// itself. Red-proven by changing `stream_plan`'s `Absent` arm to `Scan`: an
-/// empty map then issues a full-section scan (`lower_scans() == 1`).
+/// An absent keyset produces no entry reads or scans.
+/// Only the keyset read reaches storage.
+/// A scan in the membership plan's absent-keyset arm fails this test.
 #[test]
 fn map_absent_keyset_streams_zero_reads() -> Result<()> {
     runtime()?.block_on(async {

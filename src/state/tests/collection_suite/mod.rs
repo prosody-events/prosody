@@ -1508,7 +1508,7 @@ where
         return Ok(false);
     }
     // `keys()` yields the same live key set as `stream()`, value-free and in
-    // the same order, over whichever arm `stream_plan` selected.
+    // the same order, from the source that the membership plan selected.
     let ascending_keys: Vec<i64> = model.keys().copied().collect();
     if collect_map_keys(handle, Direction::Forward).await? != ascending_keys {
         return Ok(false);

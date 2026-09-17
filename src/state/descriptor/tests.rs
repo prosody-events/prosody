@@ -471,9 +471,8 @@ fn reregistration_is_rejected_as_duplicate() -> Result<()> {
     Ok(())
 }
 
-/// The Map-only `keyset_limit` fluent method threads into the collection def
-/// (uncompilable on a Value or Deque, which is a type-level property, not a
-/// runtime one).
+/// The map and set `keyset_limit` method changes the collection definition.
+/// Value and deque descriptors do not expose this method.
 #[test]
 fn keyset_limit_threads_into_the_collection_def() {
     let descriptor: MapDescriptor<I64KeyCodec> = map_state("m");

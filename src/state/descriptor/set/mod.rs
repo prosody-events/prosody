@@ -227,6 +227,3 @@ impl<KC> Descriptor<SetKind<KC>> {
         self
     }
 }
-
-#[cfg(test)]
-mod tests;

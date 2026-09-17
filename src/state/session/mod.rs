@@ -125,7 +125,7 @@ pub(crate) mod sealed {
     /// serial order — which also closes two lost-update races the dirty
     /// store's old "no handler op is in flight" comment papered
     /// over: `commit()`'s snapshot→drain window dropping a concurrent `set`,
-    /// and the map keyset read-modify-write under `join!`-ed sets.
+    /// and the map or set keyset updates under concurrent member writes.
     ///
     /// **A stream acquires the gate at init and once per chunk**, each permit
     /// dropped before the next; every other public op acquires it once for its
@@ -135,14 +135,15 @@ pub(crate) mod sealed {
     ///
     /// **Streams hold the gate only per chunk (`StreamYieldFree`).** A
     /// point-get stream covers a sub-threshold deque window, or a `Tracked` map
-    /// keyset within its bound. It takes the gate for its init metadata read
-    /// (the map keyset cell, or the deque window cell) and releases it. It then
-    /// fetches the listed entries in gate-scoped chunks: one permit per chunk,
-    /// and ONE batch read each. Only the init metadata read stays a point read.
-    /// One permit covers a chunk's fetch, decode, and resolve. The chunk
-    /// future's scope drops that permit before any of the chunk's items reach
-    /// user code. The permit is therefore **never held across a yield to user
-    /// code, for items and errors alike**.
+    /// or set keyset within its bound. It takes the gate for its init
+    /// metadata read (the map or set keyset cell, or the deque window cell)
+    /// and releases it. It then fetches the listed entries in gate-scoped
+    /// chunks: one permit per chunk, and ONE batch read each. Only the init
+    /// metadata read stays a point read. One permit covers a chunk's fetch,
+    /// decode, and resolve. The chunk future's scope drops that permit
+    /// before any of the chunk's items reach user code. The permit is
+    /// therefore **never held across a yield to user code, for items and
+    /// errors alike**.
     ///
     /// A *scan-path* stream takes the gate only for its init metadata read, and
     /// is per-item live thereafter. Its per-item resolution is a pure **read**:

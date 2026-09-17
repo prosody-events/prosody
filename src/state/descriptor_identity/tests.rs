@@ -14,8 +14,9 @@ use super::{
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell::Values;
-use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, value_state};
+use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, set_state, value_state};
 use crate::state::memory::{MemoryCellStore, MemoryDescriptorIdentityStore};
+use crate::state::order_codec::I64KeyCodec;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellRead;
 use crate::state::tests::identity_suite::{
@@ -92,11 +93,8 @@ fn prop_memory_concurrent_conflicting_registration() {
     QuickCheck::new().quickcheck(prop as fn(u8) -> TestResult);
 }
 
-/// Wire-format freeze: the `keyed_state_identity` row's discriminants are a
-/// durable contract compared on every read, so changing any value silently
-/// bricks existing collections (a renamed variant still round-trips). Pin the
-/// literals so such a change fails loudly here, not in production. The format
-/// tokens are frozen in their own codecs' tests.
+/// Identity discriminants and codec tokens must stay frozen to keep existing
+/// collections readable.
 #[test]
 fn durable_identity_wire_contract_is_frozen() {
     use crate::state::CollectionKindId;
@@ -109,6 +107,13 @@ fn durable_identity_wire_contract_is_frozen() {
     assert_eq!(i8::from(CollectionKindId::Map), 2);
     assert_eq!(i8::from(CollectionKindId::Deque), 3);
     assert_eq!(i8::from(CollectionKindId::Set), 4);
+
+    // A set has no payload, so its unit codec token must stay frozen to keep
+    // existing sets readable.
+    let set = set_state::<I64KeyCodec>("s").structural_identity();
+    assert_eq!(set.format_id, "unit");
+    assert_eq!(set.key_format_id, "i64.v1");
+
     // Value is single-cell: its key axis is the unit codec, and that token must
     // stay frozen or existing Value collections silently brick.
     assert_eq!(cart().structural_identity().key_format_id, "unit.v1");

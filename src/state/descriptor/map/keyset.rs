@@ -82,7 +82,8 @@ pub(crate) enum Keyset {
     /// The distinct-key coordinates currently tracked, strictly ascending.
     Tracked(Vec<Coordinate>),
 
-    /// The map overflowed its keyset bound; membership is no longer tracked.
+    /// The map or set overflowed its keyset bound; membership is no longer
+    /// tracked.
     Overflowed,
 }
 
@@ -233,24 +234,24 @@ fn decode_tracked(bytes: &Bytes) -> Result<Keyset, KeysetFrameError> {
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum KeysetFrameError {
     /// The frame's leading tag byte was neither `Tracked` nor `Overflowed`.
-    #[error("unknown map keyset tag: {0}")]
+    #[error("unknown keyset tag: {0}")]
     UnknownTag(u8),
 
     /// The frame ended before a declared count or coordinate length.
-    #[error("truncated map keyset frame")]
+    #[error("truncated keyset frame")]
     Truncated,
 
     /// Bytes remained after the frame's declared contents.
-    #[error("trailing bytes after map keyset frame")]
+    #[error("trailing bytes after keyset frame")]
     TrailingBytes,
 
     /// Two coordinates were out of strictly-ascending order (unsorted or a
     /// duplicate).
-    #[error("map keyset coordinates are not strictly ascending")]
+    #[error("keyset coordinates are not strictly ascending")]
     Unsorted,
 
     /// A frame exceeded the coordinate count or length bound.
-    #[error("map keyset count or length exceeds its bound")]
+    #[error("keyset count or length exceeds its bound")]
     CountOverflow,
 }
 
