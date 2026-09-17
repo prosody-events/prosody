@@ -415,3 +415,44 @@ async fn cassandra_raw_batch_no_side_effects() -> Result<()> {
     let store = fx.bottom_store();
     Box::pin(run_raw_batch_no_side_effects(store)).await
 }
+
+/// A bounded scan must not decode a corrupt row beyond its end.
+#[tokio::test]
+async fn scan_excludes_corrupt_endpoint() -> Result<()> {
+    use crate::state::cell::Presence;
+    use crate::state::cell_key::{Direction, Scan, ScanEdge};
+    use futures::TryStreamExt;
+    use std::num::NonZeroUsize;
+
+    let fx = fixture().await?;
+    let store = fx.bottom_store();
+    let collection = collection("bounded-corruption")?;
+    let (low, high) =
+        seed_prev_without_event_and_blob_without_encoding(fx.cassandra.session(), collection.id())
+            .await?;
+    let middle = cell_in(0, 0x80);
+    store
+        .write_resolved(&collection, &[(middle.clone(), Some(bytes(42)))], &[])
+        .await?;
+
+    for (dir, end) in [(Direction::Forward, high), (Direction::Backward, low)] {
+        for fetch_hint in [None, Some(NonZeroUsize::MIN)] {
+            let scan = Scan {
+                section: middle.section,
+                start: ScanEdge::Included(&middle.coordinate),
+                dir,
+                end: ScanEdge::Excluded(&end.coordinate),
+                fetch_hint,
+            };
+            let values: Vec<_> = CellRead::<Values>::scan(&store, collection.id(), scan)
+                .try_collect()
+                .await?;
+            assert_eq!(values, vec![(middle.clone(), bytes(42))]);
+            let keys: Vec<_> = CellRead::<Presence>::scan(&store, collection.id(), scan)
+                .try_collect()
+                .await?;
+            assert_eq!(keys, vec![(middle.clone(), ())]);
+        }
+    }
+    Ok(())
+}

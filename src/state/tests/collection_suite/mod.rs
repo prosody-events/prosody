@@ -74,6 +74,9 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 use uuid::Uuid;
 
+mod queries;
+pub(crate) use queries::{DequeConstraints, StreamConstraints, run_deque_constraint_parity};
+
 /// The interleave pins' hang-guard: the ONLY deadline in
 /// [`run_map_stream_interleave`] / [`run_deque_stream_interleave`], and never
 /// an assertion — a legal interleaving completes instantly, so this fires only
@@ -675,20 +678,15 @@ pub(crate) async fn run_deque_trace(
     .await
 }
 
-/// Drives a map trace, asserting the handle equals a `BTreeMap` model after
-/// every event, that each mid-trace `get` returns the model's value and
-/// `contains_key` agrees with it, and that `KeysetPresence` holds (any live
-/// entry implies a present keyset cell).
-pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> Result<bool> {
-    run_map_trace_inner(trace, commit_mode, 3, None).await
-}
-
 /// Checks both query outputs on a range-only plan and on a plan that crosses
 /// from tracked to overflowed.
-pub(crate) async fn run_map_prefix_trace(trace: MapTrace, limit: NonZeroUsize) -> Result<bool> {
+pub(crate) async fn run_map_query_trace(
+    trace: MapTrace,
+    constraints: StreamConstraints,
+) -> Result<bool> {
     for mode in [CommitMode::ReadCommitted, CommitMode::ReadUncommitted] {
         for keyset_limit in [0, 3] {
-            if !run_map_trace_inner(trace.clone(), mode, keyset_limit, Some(limit)).await? {
+            if !run_map_trace_inner(trace.clone(), mode, keyset_limit, constraints).await? {
                 return Ok(false);
             }
         }
@@ -700,7 +698,7 @@ async fn run_map_trace_inner(
     trace: MapTrace,
     commit_mode: CommitMode,
     keyset_limit: usize,
-    prefix: Option<NonZeroUsize>,
+    constraints: StreamConstraints,
 ) -> Result<bool> {
     run_collection_trace(
         trace,
@@ -745,7 +743,7 @@ async fn run_map_trace_inner(
             }
         },
         async |handle, model, backing: &Backing<'_>| {
-            Ok(assert_map(handle, model, prefix).await?
+            Ok(assert_map(handle, model, constraints).await?
                 && assert_keyset_present(backing.cells, backing.state_key, model)?)
         },
     )
@@ -1486,7 +1484,7 @@ where
 async fn assert_map<S>(
     handle: &MapHandle<S, I64KeyCodec, JsonCodec>,
     model: &BTreeMap<i64, Value>,
-    prefix: Option<NonZeroUsize>,
+    constraints: StreamConstraints,
 ) -> Result<bool>
 where
     S: StateSession,
@@ -1518,18 +1516,20 @@ where
     if collect_map_keys(handle, Direction::Backward).await? != descending_keys {
         return Ok(false);
     }
-    if let Some(limit) = prefix {
-        for (dir, expected) in [
-            (Direction::Forward, ascending),
-            (Direction::Backward, descending),
-        ] {
-            let expected: Vec<_> = expected.into_iter().take(limit.get()).collect();
-            if drain(handle.query(dir).limit(limit).entries()).await? != expected
-                || drain(handle.query(dir).limit(limit).keys()).await?
-                    != expected.iter().map(|(key, _)| *key).collect::<Vec<_>>()
-            {
-                return Ok(false);
-            }
+    for (dir, expected) in [
+        (Direction::Forward, ascending),
+        (Direction::Backward, descending),
+    ] {
+        let expected: Vec<_> = expected
+            .into_iter()
+            .filter(|(key, _)| constraints.contains(*key, dir))
+            .take(constraints.limit.map_or(usize::MAX, NonZeroUsize::get))
+            .collect();
+        if drain(constraints.apply(handle.query(dir)).entries()).await? != expected
+            || drain(constraints.apply(handle.query(dir)).keys()).await?
+                != expected.iter().map(|(key, _)| *key).collect::<Vec<_>>()
+        {
+            return Ok(false);
         }
     }
     Ok(handle.is_empty().await? == model.is_empty())
@@ -1691,36 +1691,36 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
             );
             assert_presence_route_calls(&counting, tracked_route);
             counting.reset();
-            assert_eq!(
-                drain(
-                    handle
-                        .query(Direction::Forward)
-                        .limit(NonZeroUsize::MIN.saturating_add(1))
-                        .keys()
-                )
-                .await?,
-                vec![key, key + 1]
-            );
+            let keys = handle
+                .query(Direction::Forward)
+                .limit(NonZeroUsize::MIN.saturating_add(1))
+                .keys();
+            assert_eq!(drain(keys).await?, vec![key, key + 1]);
             assert_limited_fetch(&counting, tracked_route, &[4], CELL_BATCH.get());
             if !tracked_route {
                 assert_eq!(counting.scan_rows(), 2);
             }
 
             counting.reset();
-            assert!(
-                drain(
-                    handle
-                        .query(Direction::Forward)
-                        .limit(NonZeroUsize::MIN)
-                        .entries()
-                )
-                .await
-                .is_err()
-            );
+            let entries = handle
+                .query(Direction::Forward)
+                .limit(NonZeroUsize::MIN)
+                .entries();
+            assert!(drain(entries).await.is_err());
             // Four keys: the second chunk `[key, key + 1]` satisfies the limit while
             // `key + 2` remains unread, so `[1, 2]` proves the schedule stops at the
             // limit and not at exhaustion.
             assert_limited_fetch(&counting, tracked_route, &[1, 2], 1);
+
+            for dir in [Direction::Forward, Direction::Backward] {
+                counting.reset();
+                let keys = handle.query(dir).from(&(key + 1)).to(&(key + 1)).keys();
+                assert_eq!(drain(keys).await?, vec![key + 1]);
+                assert_limited_fetch(&counting, tracked_route, &[1], 0);
+                if !tracked_route {
+                    assert_eq!(counting.scan_rows(), 1);
+                }
+            }
 
             // Value reads surface the decode failure as `Permanent`.
             let got = handle.get(&key).await;

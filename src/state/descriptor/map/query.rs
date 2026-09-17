@@ -2,7 +2,7 @@
 
 use super::{MapHandle, MapKeyItem, MapStateError, MapStreamItem};
 use crate::state::cell::{Presence, Values};
-use crate::state::cell_key::Direction;
+use crate::state::cell_key::{Coordinate, Direction, ScanEdge};
 use crate::state::collection::{StateSession, StreamProjection, sealed};
 use crate::state::descriptor::{CellCodecError, CellType, ContextOf, FromSession, Keyed};
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
@@ -12,17 +12,21 @@ use std::fmt::Display;
 use std::num::NonZeroUsize;
 use tracing::{Instrument, info_span};
 
-/// What a map stream reads: the key order and the result bound.
-#[derive(Clone, Copy, Debug)]
+/// The encoded bounds, direction, and result limit of a map query.
+#[derive(Clone, Debug)]
 pub(crate) struct Query {
     pub(crate) dir: Direction,
     pub(crate) limit: Option<NonZeroUsize>,
+    pub(crate) start: ScanEdge<Coordinate>,
+    pub(crate) end: ScanEdge<Coordinate>,
 }
 
 /// A directional map stream query.
 ///
 /// Build one with [`MapHandle::query`]. Finish with [`keys`](Self::keys) or
 /// [`entries`](Self::entries).
+/// Edges follow the query direction. A later call replaces the same edge.
+/// A start past the end produces an empty stream.
 #[must_use]
 pub struct MapQuery<'a, S, KC, V> {
     handle: &'a MapHandle<S, KC, V>,
@@ -40,6 +44,30 @@ where
     /// handle to an acquired session.
     pub(crate) fn new(handle: &'a MapHandle<S, KC, V>, query: Query) -> Self {
         Self { handle, query }
+    }
+
+    /// Starts at `key`.
+    pub fn from(mut self, key: &KC::Key) -> Self {
+        self.query.start = ScanEdge::Included(KC::encode(key));
+        self
+    }
+
+    /// Starts after `key`.
+    pub fn after(mut self, key: &KC::Key) -> Self {
+        self.query.start = ScanEdge::Excluded(KC::encode(key));
+        self
+    }
+
+    /// Stops at `key`.
+    pub fn to(mut self, key: &KC::Key) -> Self {
+        self.query.end = ScanEdge::Included(KC::encode(key));
+        self
+    }
+
+    /// Stops before `key`.
+    pub fn before(mut self, key: &KC::Key) -> Self {
+        self.query.end = ScanEdge::Excluded(KC::encode(key));
+        self
     }
 
     /// Bounds the present items the stream yields. Missing cells do not consume
@@ -79,12 +107,48 @@ where
             projection = P::NAME,
         );
         try_stream! {
-            let plan = self.handle.stream_plan(self.query.dir).instrument(span.clone()).await?;
+            let plan = self.handle.stream_plan(&self.query).instrument(span.clone()).await?;
             let inner = plan.with_limit(self.query.limit).projected::<P>();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
                 yield item?;
             }
         }
+    }
+}
+
+impl Query {
+    pub(crate) fn new(dir: Direction) -> Self {
+        Self {
+            dir,
+            limit: None,
+            start: ScanEdge::Unbounded,
+            end: ScanEdge::Unbounded,
+        }
+    }
+
+    /// Keeps the ascending stored coordinates within the query bounds, in
+    /// query order. The trim reuses the stored vector.
+    pub(super) fn select(&self, mut coordinates: Vec<Coordinate>) -> Vec<Coordinate> {
+        let (low, high) = match self.dir {
+            Direction::Forward => (&self.start, &self.end),
+            Direction::Backward => (&self.end, &self.start),
+        };
+        let start = match low {
+            ScanEdge::Included(edge) => coordinates.partition_point(|c| c < edge),
+            ScanEdge::Excluded(edge) => coordinates.partition_point(|c| c <= edge),
+            ScanEdge::Unbounded => 0,
+        };
+        let end = match high {
+            ScanEdge::Included(edge) => coordinates.partition_point(|c| c <= edge),
+            ScanEdge::Excluded(edge) => coordinates.partition_point(|c| c < edge),
+            ScanEdge::Unbounded => coordinates.len(),
+        };
+        coordinates.truncate(end.max(start));
+        coordinates.drain(..start);
+        if self.dir == Direction::Backward {
+            coordinates.reverse();
+        }
+        coordinates
     }
 }

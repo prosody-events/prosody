@@ -631,7 +631,7 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     fn has_ttl(&self) -> bool;
 
     /// The Map keyset bound: how many live distinct keys a map tracks before
-    /// overflowing to the full-section scan. Read from the binding's captured
+    /// overflowing to a range scan. Read from the binding's captured
     /// settings; no I/O.
     fn keyset_limit(&self) -> usize;
 

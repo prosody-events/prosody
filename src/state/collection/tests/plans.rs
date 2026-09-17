@@ -13,7 +13,7 @@ use crate::codec::{I64Codec, I64CodecError};
 use crate::consumer::middleware::RepinProof;
 use crate::loader::MemoryLoader;
 use crate::state::cell::Values;
-use crate::state::cell_key::{CellKey, Direction};
+use crate::state::cell_key::{CellKey, Direction, ScanEdge};
 use crate::state::collection::{
     Collection, CollectionRead, CollectionWrite, StateSession, collection_layout,
 };
@@ -270,7 +270,14 @@ fn range_plan_terminates_at_first_error() -> Result<()> {
 
         let cells = bind_plain(&session)?;
         let plan = cells
-            .read(async |op| op.range(PlainLayout::CELLS, Direction::Forward))
+            .read(async |op| {
+                op.range(
+                    PlainLayout::CELLS,
+                    ScanEdge::Unbounded,
+                    Direction::Forward,
+                    ScanEdge::Unbounded,
+                )
+            })
             .await;
         let stream = plan.projected::<Values>();
         futures::pin_mut!(stream);
@@ -312,9 +319,17 @@ async fn plan_fences_after_its_last_item() -> Result<()> {
             let plan = cells
                 .read(async |op| {
                     if use_range {
-                        op.range(PlainLayout::CELLS, Direction::Forward)
+                        op.range(
+                            PlainLayout::CELLS,
+                            ScanEdge::Unbounded,
+                            Direction::Forward,
+                            ScanEdge::Unbounded,
+                        )
                     } else {
-                        op.coordinates(PlainLayout::CELLS, vec![7_i64, 8])
+                        op.coordinates(
+                            PlainLayout::CELLS,
+                            vec![I64KeyCodec::encode(&7), I64KeyCodec::encode(&8)],
+                        )
                     }
                 })
                 .await;
@@ -411,7 +426,14 @@ fn plan_streams_are_send() -> Result<()> {
         let session = gate_session(Arc::new(GateLadder::new(0)))?;
         let cells = bind_gated(&session)?;
         let range = cells
-            .read(async |op| op.range(GatedLayout::CELLS, Direction::Forward))
+            .read(async |op| {
+                op.range(
+                    GatedLayout::CELLS,
+                    ScanEdge::Unbounded,
+                    Direction::Forward,
+                    ScanEdge::Unbounded,
+                )
+            })
             .await;
         assert_send(range.projected::<Values>());
         let points = cells
@@ -493,7 +515,14 @@ async fn ranged_keys(release: &[usize]) -> Result<Vec<i64>> {
     seed_gated(&cells, n).await?;
 
     let plan = cells
-        .read(async |op| op.range(GatedLayout::CELLS, Direction::Forward))
+        .read(async |op| {
+            op.range(
+                GatedLayout::CELLS,
+                ScanEdge::Unbounded,
+                Direction::Forward,
+                ScanEdge::Unbounded,
+            )
+        })
         .await;
     let collector = async {
         let stream = plan.projected::<Values>();

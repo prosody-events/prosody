@@ -1,20 +1,10 @@
-//! Managed stream plans: the owned state a collection's stream method carries
-//! out of its planning invocation, and the two drivers that run it.
-//!
-//! A stream method is not a scoped operation — it outlives one. It runs a short
-//! `#[read(op)]` planning method (a Map reads its keyset, a Deque its bounds),
-//! and that invocation hands back a plan: the binding, the addressed section,
-//! and the engine state frozen by [`ReadEngine::capture`](sealed::ReadEngine).
-//! Driving the plan then re-enters the engine per chunk, so owner and published
-//! reader share one stream implementation with no runtime branch.
-//!
-//! A plan carries no admission and no operation. The owner reacquires the gate
-//! per coordinate chunk and pages a range gate-free; the reader carries the
-//! source its planning command selected, so a chunk can never re-probe or
-//! change source mid-stream. A range source carries the whole section
-//! or the bounded window that its planning command chose.
+//! Managed collection reads share one plan and two source drivers.
+//! Planning captures engine state without retaining admission.
+//! Owners reacquire admission per point chunk; range scans run without it.
+//! Readers retain their chosen source for the whole plan.
+//! Session and projection types select the read behavior at compile time.
 
-use super::operation::read_keys;
+use super::operation::read_coordinates;
 use super::{StateSession, resolve_cell, sealed};
 use crate::state::cell::{Presence, Projection, Values};
 use crate::state::cell_key::{Coordinate, Direction, Scan, ScanEdge, Section};
@@ -28,6 +18,7 @@ use async_stream::try_stream;
 use futures::future::Either;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use std::future::{Future, ready};
+use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use tokio::task::coop::cooperative;
 
@@ -110,11 +101,11 @@ impl<S: StateSession> PlanBase<S> {
     }
 }
 
-/// A stream source contains either ordered keys or direction-relative range
-/// bounds. The collection selects it from stored metadata before execution
-/// starts.
-enum Source<K> {
-    Points(Vec<K>),
+/// A stream source contains either ordered coordinates or direction-relative
+/// range bounds. The collection selects it from stored metadata before
+/// execution starts.
+enum Source {
+    Points(Vec<Coordinate>),
     Range {
         start: ScanEdge<Coordinate>,
         dir: Direction,
@@ -129,18 +120,21 @@ enum Source<K> {
 /// Source drivers cannot emit directly to the caller.
 pub(crate) struct Plan<S: StateSession, T: CellType> {
     base: PlanBase<S>,
-    source: Source<KeyOf<T>>,
+    source: Source,
     limit: Option<NonZeroUsize>,
+    /// The cell type the plan projects. The source holds only coordinates.
+    cell: PhantomData<fn() -> T>,
 }
 
 impl<S: StateSession, T: CellType> Plan<S, T> {
-    /// Captures keys in their required output order. An empty list performs no
-    /// read.
-    pub(super) fn coordinates(base: PlanBase<S>, keys: Vec<KeyOf<T>>) -> Self {
+    /// Captures coordinates in their required output order. An empty list
+    /// performs no read.
+    pub(super) fn coordinates(base: PlanBase<S>, coordinates: Vec<Coordinate>) -> Self {
         Self {
             base,
-            source: Source::Points(keys),
+            source: Source::Points(coordinates),
             limit: None,
+            cell: PhantomData,
         }
     }
 
@@ -155,6 +149,7 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
             base,
             source: Source::Range { start, dir, end },
             limit: None,
+            cell: PhantomData,
         }
     }
 
@@ -176,10 +171,13 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
             base,
             source,
             limit,
+            ..
         } = self;
         let session = base.session.clone();
         let inner = match source {
-            Source::Points(keys) => Either::Left(coordinate_source::<S, T, P>(base, keys, limit)),
+            Source::Points(coordinates) => {
+                Either::Left(coordinate_source::<S, T, P>(base, coordinates, limit))
+            }
             Source::Range { start, dir, end } => {
                 Either::Right(range_source::<S, T, P>(base, start, dir, end, limit))
             }
@@ -198,7 +196,7 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
 /// successfully before it emits any item.
 fn coordinate_source<S, T, P>(
     base: PlanBase<S>,
-    keys: Vec<KeyOf<T>>,
+    coordinates: Vec<Coordinate>,
     limit: Option<NonZeroUsize>,
 ) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
 where
@@ -208,22 +206,23 @@ where
     S::Engine: sealed::Reads<S, P>,
 {
     try_stream! {
-        let mut keys = keys.into_iter().peekable();
+        let mut coordinates = coordinates.into_iter().peekable();
         let mut fetch = FetchSchedule::new(P::demand(limit), CELL_BATCH);
-        while keys.peek().is_some() {
-            let chunk: CellBuffer<_> = keys.by_ref().take(fetch.next().get()).collect();
+        while coordinates.peek().is_some() {
+            let chunk: CellBuffer<_> = coordinates.by_ref().take(fetch.next().get()).collect();
             let slots = {
                 let mut inner = <S::Engine as sealed::ReadEngine<S>>::resume(
                     &base.session,
                     &base.plan,
                 ).await;
-                read_keys::<S, T, P>(
+                read_coordinates::<S, P>(
                     &base.session,
                     &mut inner,
                     base.state_type,
                     &base.name,
                     base.section,
-                    &chunk,
+                    chunk.iter().cloned(),
+                    chunk.len(),
                 ).await.map_err(CellStateError::Access)?
             };
 
@@ -233,9 +232,11 @@ where
             // feature is off, so `consume_budget` is uncallable. For `Presence` the
             // wrapped future is a no-op; keep the wrapper. Do not re-litigate the window.
             let items = stream::iter(chunk.into_iter().zip(slots))
-                .map(|(key, slot)| cooperative(async move {
+                .map(|(coordinate, slot)| cooperative(async move {
                     match slot {
-                        Some(payload) => P::finish(session, key, payload).await.map(Some),
+                        Some(payload) => project::<S, T, P>(session, &coordinate, payload)
+                            .await
+                            .map(Some),
                         None => Ok(None),
                     }
                 }))
@@ -287,17 +288,11 @@ where
         let inner = page
             .map(|item| cooperative(async move {
                 let (cell, payload) = item?;
-                let key = <T::Key as OrderedKeyCodec>::decode(cell.coordinate.as_bytes())
-                    .map_err(CellStateError::Key)?;
-                P::finish(session, key, payload).await
+                project::<S, T, P>(session, &cell.coordinate, payload).await
             }))
-            // Both drivers resolve under `RESOLVE_FANOUT`. The limit bounds the
-            // window, so a small query starts no more resolves than it needs.
-            // Ruling: the range window matches the coordinate arm. Resolves read
-            // the loader, not the shard, so `SHARD_FANOUT_CONCURRENCY` does not
-            // apply here. An unlimited stream that stops early has already
-            // started up to a window of resolves. A caller that stops early
-            // bounds its demand with a limit.
+            // Resolvers read the loader, so use RESOLVE_FANOUT, not shard fanout.
+            // The limit bounds concurrent resolutions. Without a limit, early
+            // cancellation can leave one window of resolutions already started.
             .buffered(window);
         futures::pin_mut!(inner);
         while let Some(item) = inner.next().await {
@@ -306,30 +301,28 @@ where
     }
 }
 
-/// The managed stream fence adapter — the SOLE home of a managed stream's
-/// per-emission attempt fence.
+/// Decodes one present cell's key and finishes its projection.
+async fn project<S, T, P>(
+    session: &S,
+    coordinate: &Coordinate,
+    payload: P::Payload,
+) -> Result<P::Item, CellStateError<CellCodecError<T>>>
+where
+    S: StateSession,
+    T: CellType,
+    P: StreamProjection<S, T>,
+{
+    let key =
+        <T::Key as OrderedKeyCodec>::decode(coordinate.as_bytes()).map_err(CellStateError::Key)?;
+    P::finish(session, key, payload).await
+}
+
+/// Checks the attempt fence after every source completion, before emission.
+/// This includes errors and exhaustion, so stale empty streams also fail.
 ///
-/// It wraps a driver's source. It then runs
-/// [`ReadEngine::fence`](sealed::ReadEngine::fence) after EVERY `inner.next()`
-/// completion — `Some`, `Err`, and the exhaustion `None` alike — and BEFORE it
-/// matches that completion. A stream leaked past its handler attempt therefore
-/// errors [`Terminated`](crate::state::StateAccessError::Terminated) at its
-/// next emission. A spawned task, an un-awaited future, and a foreign promise
-/// all leak this way. An empty source still passes the fence on exhaustion, so
-/// a leaked empty-plan stream errors instead of reporting a clean end.
-///
-/// # Invariant — no await, no buffering between the fence and the caller
-///
-/// Every source buffer sits BELOW this adapter: a coordinate chunk's buffer,
-/// and a range source's `buffered` resolution window. A collection adds only
-/// synchronous per-item transforms above it.
-///
-/// The check is a LINEARIZATION point, not a wall-clock wall. A completion
-/// whose synchronous fence passed linearized before any concurrent attempt
-/// boundary. The check holds no admission, because it is synchronous. A
-/// concurrent reset needs the gate exclusively, and for a coordinate source it
-/// queues behind the chunk's batch-read admission. Whether its bump landed
-/// before a completion's check is what orders the two.
+/// No await or buffer can follow the check before emission. The check orders
+/// each completion against a concurrent attempt reset. Source buffers stay
+/// below this adapter, and collection adapters perform only synchronous work.
 fn fenced<S, X, T>(
     session: S,
     inner: impl Stream<Item = Result<X, CellStateError<CellCodecError<T>>>> + Send,
@@ -339,19 +332,12 @@ where
     X: Send,
     T: CellType,
 {
-    // Heap-hold the source's state machine (the chunk loop or the `buffered`
-    // resolution window): it is the large part, so boxing it keeps the fence
-    // adapter — and every collection stream that embeds it — a small future
-    // (large-future stack bloat, not a per-item cost). One bounded allocation
-    // per stream construction, never the steady-state per-item path;
-    // `Pin<Box<_>>` is `Unpin`, so no `pin_mut!`. The boxed type is the
-    // concrete source, not a `dyn Stream`.
+    // Box the concrete source once to bound the enclosing future's stack size.
+    // This allocation occurs at construction, never per item.
     let mut inner = Box::pin(inner);
     try_stream! {
         loop {
             let item = inner.next().await;
-            // Fence BEFORE matching the completion — `Some`, `Err`, and the
-            // exhaustion `None` alike.
             <S::Engine as sealed::ReadEngine<S>>::fence(&session)?;
             match item {
                 Some(item) => yield item?,

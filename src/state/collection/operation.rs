@@ -92,32 +92,28 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
         Self { collection, inner }
     }
 
-    /// Plans a managed point-get stream over `keys` in `family`, in the given
-    /// order. Freezing this invocation's engine state into the plan is what
-    /// lets each chunk resume on the same source (reader) or reacquire the gate
-    /// (owner) without re-running the planning command.
+    /// Plans a managed point-get stream over `coordinates` in `family`, in the
+    /// given order. Freezing this invocation's engine state into the plan is
+    /// what lets each chunk resume on the same source (reader) or reacquire the
+    /// gate (owner) without re-running the planning command.
     pub(crate) fn coordinates<T: CellType>(
         &self,
         family: CellFamily<L, T>,
-        keys: Vec<KeyOf<T>>,
+        coordinates: Vec<Coordinate>,
     ) -> Plan<S, T> {
-        Plan::coordinates(self.plan_base(family.section()), keys)
+        Plan::coordinates(self.plan_base(family.section()), coordinates)
     }
 
-    /// Plans a managed durable range over the whole of `family`'s section, in
-    /// `dir` order — the fallback for a collection with no coordinate
-    /// enumeration to point-get.
+    /// Plans a scan over encoded edges in the declared family.
+    /// The edges follow `dir` and can include, exclude, or omit an endpoint.
     pub(crate) fn range<T: CellType>(
         &self,
         family: CellFamily<L, T>,
+        start: ScanEdge<Coordinate>,
         dir: Direction,
+        end: ScanEdge<Coordinate>,
     ) -> Plan<S, T> {
-        Plan::range(
-            self.plan_base(family.section()),
-            ScanEdge::Unbounded,
-            dir,
-            ScanEdge::Unbounded,
-        )
+        Plan::range(self.plan_base(family.section()), start, dir, end)
     }
 
     /// Plans a managed durable range over one inclusive typed span of
@@ -138,8 +134,8 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
         end: &KeyOf<T>,
         limit: NonZeroUsize,
     ) -> Plan<S, T> {
-        Plan::range(
-            self.plan_base(family.section()),
+        self.range(
+            family,
             ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode(start)),
             dir,
             ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode(end)),
@@ -662,7 +658,7 @@ where
 
 /// Reads one projected answer per coordinate. `expected` is the input count.
 /// Batches run sequentially because owner reads can repair the same collection.
-async fn read_coordinates<S, P: Projection>(
+pub(super) async fn read_coordinates<S, P: Projection>(
     session: &S,
     inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
     state_type: StateType,

@@ -43,8 +43,9 @@ use tracing::{Instrument, Span, error, field::Empty, field::display};
 mod erased;
 
 pub use erased::{
-    BoxDequeState, BoxMapState, BoxStateCursor, BoxValueState, DynDequeState, DynMapState,
-    DynValueState, ErasedCategory, ErasedStateError, StateCursor,
+    BoxDequeState, BoxMapState, BoxStateCursor, BoxValueState, DequeScanConfig, DynDequeState,
+    DynMapState, DynValueState, ErasedCategory, ErasedStateError, MapScanConfig, ScanConfig,
+    StateCursor,
 };
 use erased::{ErasedDeque, ErasedMap, ErasedValue};
 

@@ -23,7 +23,9 @@
 
 pub(crate) mod acquisition;
 mod admission;
+mod deque;
 mod query;
+pub use deque::DequeReaderQuery;
 
 pub use query::MapReaderQuery;
 
@@ -43,12 +45,12 @@ use crate::state_reader::session::{ReadSession, ReaderCollectionDef, ReaderConte
 use crate::state_reader::{MemoryReaderBackend, ReaderBackend};
 use crate::subsystem::SubsystemName;
 use acquisition::{DEFAULT_REFRESH_INTERVAL, PublicationSnapshot};
-use futures::stream::{Stream, StreamExt};
+use futures::stream::Stream;
 use quanta::Clock;
 use std::fmt::Display;
+use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::task::coop::cooperative;
 
 /// A cross-group, read-only view over a published keyed-state collection.
 ///
@@ -298,9 +300,7 @@ where
     /// Streams the committed live entries of the map under partition `key` in
     /// key order (ascending for [`Direction::Forward`]).
     ///
-    /// The session is acquired up front and moved into the stream, so the
-    /// returned stream is self-contained (owns its handles) and a binding can
-    /// hold it beyond the reader's borrow.
+    /// The stream owns its session and can outlive the reader's borrow.
     ///
     /// # Errors
     ///
@@ -345,7 +345,7 @@ where
         MapReaderQuery {
             reader: self,
             key: key.into(),
-            query: Query { dir, limit: None },
+            query: Query::new(dir),
         }
     }
 }
@@ -439,9 +439,7 @@ where
     /// Streams the committed live elements under partition `key` in index order
     /// (front to back for [`Direction::Forward`]).
     ///
-    /// The session is acquired up front and moved into the stream, so the
-    /// returned stream is self-contained (owns its handles) and a binding can
-    /// hold it beyond the reader's borrow.
+    /// The stream owns its session and can outlive the reader's borrow.
     ///
     /// # Errors
     ///
@@ -460,15 +458,19 @@ where
         T: 'static,
         ResolvedOf<T>: 'static,
     {
-        let session = self.session(key.into()).await?;
-        let handle: DequeHandle<_, T> = self.descriptor.bind(&session)?;
-        Ok(async_stream::try_stream! {
-            let inner = handle.stream(dir);
-            futures::pin_mut!(inner);
-            while let Some(item) = cooperative(inner.next()).await {
-                yield item.map_err(|e| StateReaderError::store(&e))?;
-            }
-        })
+        self.query(key, dir).values().await
+    }
+
+    /// Builds a directional deque query for the partition key.
+    pub fn query<K: Into<Key>>(&self, key: K, dir: Direction) -> DequeReaderQuery<'_, T, C, B> {
+        DequeReaderQuery {
+            reader: self,
+            key: key.into(),
+            dir,
+            start: Bound::Unbounded,
+            end: Bound::Unbounded,
+            limit: None,
+        }
     }
 }
 

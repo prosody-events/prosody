@@ -4,6 +4,7 @@ use super::StateReader;
 use crate::Key;
 use crate::codec::Codec;
 use crate::state::cell::{Presence, Values};
+use crate::state::cell_key::ScanEdge;
 use crate::state::collection::{StreamProjection, sealed};
 use crate::state::descriptor::map::Query;
 use crate::state::descriptor::{
@@ -40,6 +41,30 @@ where
     KC::Key: Display,
     V: CellType<Key = UnitKey>,
 {
+    /// Starts at `key`.
+    pub fn from(mut self, key: &KC::Key) -> Self {
+        self.query.start = ScanEdge::Included(KC::encode(key));
+        self
+    }
+
+    /// Starts after `key`.
+    pub fn after(mut self, key: &KC::Key) -> Self {
+        self.query.start = ScanEdge::Excluded(KC::encode(key));
+        self
+    }
+
+    /// Stops at `key`.
+    pub fn to(mut self, key: &KC::Key) -> Self {
+        self.query.end = ScanEdge::Included(KC::encode(key));
+        self
+    }
+
+    /// Stops before `key`.
+    pub fn before(mut self, key: &KC::Key) -> Self {
+        self.query.end = ScanEdge::Excluded(KC::encode(key));
+        self
+    }
+
     /// Sets the maximum number of present items that the stream yields.
     pub fn limit(mut self, limit: NonZeroUsize) -> Self {
         self.query.limit = Some(limit);

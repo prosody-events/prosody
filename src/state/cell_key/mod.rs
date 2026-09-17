@@ -108,29 +108,10 @@ pub enum Direction {
     Backward,
 }
 
-/// One edge of a [`Scan`]: an inclusive or exclusive endpoint at a known
-/// coordinate, or `Unbounded` — an open endpoint at no coordinate at all.
-///
-/// `Unbounded` is **direction-relative** like the other edges: as a `start` it
-/// opens the low side (forward) or high side (backward); as an `end` it opens
-/// the opposite side. It exists for the map's `Overflowed`/degraded fallback,
-/// where the keyset holds no complete key enumeration to fence the scan from,
-/// so iteration must walk the whole section. A scan with both edges `Unbounded`
-/// therefore walks an entire section — including, on a TTL'd or freshly-cleared
-/// section, a field of tombstones. That is the accepted degraded cost of the
-/// fallback, not a hazard: the fast (bounded-coordinate) arms of every
-/// collection stay pinned to their live extent, and only the map's degrade path
-/// ever constructs an `Unbounded` edge.
-///
-/// The exclusive edge exists for callers that need an endpoint-exclusive
-/// range — e.g. resuming a scan just past the last coordinate seen. No
-/// production caller constructs it today; it is reached through the
-/// `Direction` × `ScanEdge` comparator dispatch in the Cassandra cell
-/// store, and property tests drive all three variants.
-///
-/// Generic over the inner so one type serves both an owned plan edge
-/// (`ScanEdge<Coordinate>`) and a borrowed store-facing edge
-/// (`ScanEdge<&Coordinate>`, what a [`Scan`] carries).
+/// One inclusive, exclusive, or unbounded coordinate edge.
+/// Edges follow the scan direction. An unbounded start opens the low side
+/// in forward order and the high side in backward order.
+/// Owned plans hold coordinates. Store requests borrow those coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanEdge<T> {
     /// The endpoint coordinate is part of the range.

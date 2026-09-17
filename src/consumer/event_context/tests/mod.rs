@@ -15,8 +15,8 @@
 //! in `state/descriptor/tests.rs`.
 
 use super::{
-    BoxDequeState, BoxMapState, DynEventContext, ErasedCategory, ErasedStateError, EventContext,
-    StateCursor,
+    BoxDequeState, BoxMapState, DequeScanConfig, DynEventContext, ErasedCategory, ErasedStateError,
+    EventContext, MapScanConfig, StateCursor,
 };
 use crate::codec::{BinaryPayload, ErasedStateCodec, JsonCodec};
 use crate::consumer::kafka_state::{message_deque_state, message_map_state, message_state};
@@ -45,6 +45,8 @@ use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult, empty_shrinker};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::iter::once;
+use std::num::NonZeroUsize;
+use std::ops::Bound;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::watch;

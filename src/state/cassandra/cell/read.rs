@@ -127,6 +127,7 @@ fn split_batch<P: CassandraProjection>(row: BatchRow<P>) -> (Bytes, PointRow<P>)
 }
 
 /// Pages projected rows within the scan bounds.
+/// Rows beyond the end do not enter semantic decode.
 /// Callers apply commit evidence after decode.
 pub(super) fn page<'a, P: CassandraProjection>(
     session: &'a CassandraSession,
@@ -178,10 +179,10 @@ pub(super) fn page<'a, P: CassandraProjection>(
                 section: Section::new(section),
                 coordinate: Coordinate::from_bytes(coordinate),
             };
-            let cell = decode_body::<P>((data, prev, encoding, version, event))?;
             if past_end(dir, &key, end.as_ref()) {
                 break;
             }
+            let cell = decode_body::<P>((data, prev, encoding, version, event))?;
             yield (key, cell);
         }
     }

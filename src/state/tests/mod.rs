@@ -22,11 +22,12 @@ use self::cell_suite::{
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
-    DequeCapacityShape, DequeHoles, DequeInterleave, DequeTrace, KEY_POOL, MapGetManyInput,
-    MapInterleave, MapKeyHoles, MapTrace, finalize_and_promote, run_deque_capacity_convergence,
-    run_deque_holes, run_deque_stream_interleave, run_deque_trace, run_map_get_many_parity_trace,
-    run_map_key_scan_holes, run_map_keyset_exact_trace, run_map_prefix_trace,
-    run_map_stream_interleave, run_map_trace, run_map_ttl_keyset_refresh_trace,
+    DequeCapacityShape, DequeConstraints, DequeHoles, DequeInterleave, DequeTrace, MapGetManyInput,
+    MapInterleave, MapKeyHoles, MapTrace, StreamConstraints, finalize_and_promote,
+    run_deque_capacity_convergence, run_deque_constraint_parity, run_deque_holes,
+    run_deque_stream_interleave, run_deque_trace, run_map_get_many_parity_trace,
+    run_map_key_scan_holes, run_map_keyset_exact_trace, run_map_query_trace,
+    run_map_stream_interleave, run_map_ttl_keyset_refresh_trace,
 };
 use self::publication_suite::{PublicationTrace, run_publication_trace};
 use self::support::{CountingCellStore, CountingResolver, ResolveCounter, fresh_collection};
@@ -861,43 +862,23 @@ fn prop_deque_capacity_convergence() {
     QuickCheck::new().quickcheck(property as fn(DequeCapacityShape) -> Result<bool>);
 }
 
-/// Map collection soundness over the real session lifecycle: random
-/// set/remove/get/clear/mid-handler-commit traces with commit/abort/crash
-/// outcomes keep the handle's `get` and key-ordered `stream` in step with a
-/// `BTreeMap` oracle — the current-membership keyset (cleared with the
-/// entries; `KeysetPresence`), crash atomicity, the at-least-once `commit()`
-/// contract (`commit()`-landed ops survive abort/crash-rollback; post-commit
-/// ops roll back — so a commit-then-clear-then-abort trace restores the
-/// `commit()`-landed state), and `contains_key` parity (`contains_key(k) ==
-/// get(k).is_some()`) at every step.
+/// Map reads and bounded queries match the model through the full lifecycle.
+/// Both commit modes cover tracked keysets, range scans, aborts, and recovery.
 #[test]
-fn prop_map_collection_lifecycle() {
-    fn property(trace: MapTrace) -> Result<bool> {
-        TEST_RUNTIME.block_on(run_map_trace(trace, CommitMode::ReadCommitted))
+fn prop_map_query_matches_model() {
+    fn property(trace: MapTrace, constraints: StreamConstraints) -> Result<bool> {
+        TEST_RUNTIME.block_on(run_map_query_trace(trace, constraints))
     }
-    QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
+    QuickCheck::new().quickcheck(property as fn(MapTrace, StreamConstraints) -> Result<bool>);
 }
 
-/// The map lifecycle property in `ReadUncommitted` mode: `finalize` commits
-/// everything, so every outcome that reaches it — including crash-abort —
-/// converges to the full scratch model.
+/// Both deque sources match the model across holes and position bounds.
 #[test]
-fn prop_map_collection_lifecycle_read_uncommitted() {
-    fn property(trace: MapTrace) -> Result<bool> {
-        TEST_RUNTIME.block_on(run_map_trace(trace, CommitMode::ReadUncommitted))
+fn prop_deque_constraint_parity() {
+    fn property(shape: DequeConstraints) -> Result<bool> {
+        TEST_RUNTIME.block_on(run_deque_constraint_parity(shape))
     }
-    QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
-}
-
-/// Both limited outputs equal the model prefix in either direction and plan.
-#[test]
-fn prop_map_query_limit_is_present_prefix() {
-    fn property(trace: MapTrace, limit: u8) -> Result<bool> {
-        let limit =
-            NonZeroUsize::new(usize::from(limit) % KEY_POOL.len()).unwrap_or(NonZeroUsize::MIN);
-        TEST_RUNTIME.block_on(run_map_prefix_trace(trace, limit))
-    }
-    QuickCheck::new().quickcheck(property as fn(MapTrace, u8) -> Result<bool>);
+    QuickCheck::new().quickcheck(property as fn(DequeConstraints) -> Result<bool>);
 }
 
 /// Keyset exactness: over an arbitrary committed trace on a non-overflowing
