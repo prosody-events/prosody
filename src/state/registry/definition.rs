@@ -7,7 +7,7 @@ use crate::timers::duration::CompactDuration;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-/// Default Map keyset bound — the number of live distinct keys a map tracks
+/// Default keyset bound: the number of distinct members a map or set tracks
 /// before it overflows to the full-section scan. Applied to any collection not
 /// overriding it and to names absent from the registry.
 pub(crate) const DEFAULT_KEYSET_LIMIT: usize = 128;
@@ -19,12 +19,9 @@ pub(crate) const DEFAULT_KEYSET_LIMIT: usize = 128;
 /// guarantee they give, not by the mechanism.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommitMode {
-    /// Atomic with the event, and crash-recoverable. On handler success the
-    /// buffered write stages as a provisional cell beside the prior committed
-    /// value, before the event's commit marker, then promotes to committed once
-    /// that marker is durable. Crash recovery resolves the cell through the
-    /// commit oracle. A handler that fails or redelivers never exposes its
-    /// writes: readers observe committed values only.
+    /// Commits atomically with the event. The stage retains the previous value.
+    /// The promote writes collection evidence before it changes cells.
+    /// Admission resolves crash residue through that evidence before dispatch.
     ReadCommitted,
 
     /// Cheaper, at-least-once. The buffered write applies straight to the
@@ -101,14 +98,6 @@ impl ReadCachePolicy {
 /// identity comes only from the descriptor, so a definition can never assert an
 /// identity its descriptor does not have. Changing any setting here needs no
 /// migration.
-///
-/// `recovery_within` is a reader-convergence bound, not a durability knob. It
-/// only ever pulls the single per-key recovery backstop *sooner*: the effective
-/// fire is `min(recovery_delay, tightest touched recovery_within)`. A value
-/// above the always-on `recovery_delay` floor is clamped by it, and a value on
-/// a [`CommitMode::ReadUncommitted`] collection is inert, since those writes
-/// stage no provisional cell to converge. Being tightening-only, it needs no
-/// ceiling: the floor already sits strictly below every collection's TTL.
 #[derive(Clone, Copy, Debug)]
 pub struct CollectionDef {
     /// Per-collection TTL. `None` is explicit indefinite retention. A value
@@ -119,11 +108,7 @@ pub struct CollectionDef {
     /// Per-collection commit mode.
     pub commit_mode: CommitMode,
 
-    /// Per-collection recovery-convergence bound (see the type doc).
-    /// `None` uses the always-on `recovery_delay` floor.
-    pub recovery_within: Option<CompactDuration>,
-
-    /// Map keyset bound: the number of **live** distinct keys a map tracks in
+    /// Keyset bound: the number of live members a map or set tracks in
     /// its keyset cell before overflowing to the full-section scan (`remove`
     /// subtracts, so this is current membership, not a running total).
     /// Meaningful for Map collections only; ignored by Value and Deque. `0`
@@ -150,15 +135,13 @@ pub struct CollectionDef {
 }
 
 impl CollectionDef {
-    /// Creates a collection definition with the supplied TTL; commit
-    /// mode defaults to [`CommitMode::ReadCommitted`] and the
-    /// recovery-convergence bound to `None` (the `recovery_delay` floor).
+    /// Creates a collection with the supplied TTL and
+    /// [`CommitMode::ReadCommitted`].
     #[must_use]
     pub fn new(ttl: Option<CompactDuration>) -> Self {
         Self {
             ttl,
             commit_mode: CommitMode::ReadCommitted,
-            recovery_within: None,
             keyset_limit: DEFAULT_KEYSET_LIMIT,
             capacity: None,
             visibility: StateVisibility::default(),

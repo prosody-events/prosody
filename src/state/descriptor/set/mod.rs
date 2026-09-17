@@ -3,17 +3,16 @@
 //! A set stores one zero-byte cell per member. It shares the map keyset
 //! format and keeps the same membership rules.
 
-use super::map::{
-    Keyset, KeysetLayout, MapKeysetCodec, MapKeysetKey, MapStateError, PriorKeyset,
-    decoded_key_list, is_oversized, read_keyset_state, subtract_keyset, update_keyset,
-};
+use super::map::membership::{self, KeysetLayout};
+use super::map::{MapKeysetCodec, MapKeysetKey, MapStateError, Query};
 use super::{CollectionSpec, Descriptor, Keyed};
 use crate::codec::{UnitCodec, UnitCodecError};
+use crate::state::cell::Presence;
 use crate::state::cell_key::{Direction, ScanEdge};
 use crate::state::collection::{
-    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, Constraints,
-    JOURNAL_INLINE, Plan, StateSession, WritableStateSession, collection_layout,
-    collection_methods, same_token, spec_matches,
+    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, JOURNAL_INLINE,
+    Plan, StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
+    spec_matches,
 };
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use crate::state::{CollectionKindId, StoreOutcome};
@@ -38,6 +37,7 @@ collection_layout! {
 
 impl<KC: OrderedKeyCodec> KeysetLayout for SetKind<KC> {
     const KEYSET: CellFamily<Self, Keyed<MapKeysetKey, MapKeysetCodec>> = Self::KEYSET;
+    const MEMBERS: CellFamily<Self, Self::Cell> = Self::MEMBERS;
 }
 
 type FrozenLayout = SetKind<I64KeyCodec>;
@@ -111,8 +111,7 @@ pub struct SetHandle<S, KC> {
 #[must_use]
 pub struct SetQuery<'a, S, KC> {
     handle: &'a SetHandle<S, KC>,
-    dir: Direction,
-    constraints: Constraints,
+    query: Query,
 }
 
 impl<'a, S, KC> SetQuery<'a, S, KC>
@@ -123,38 +122,36 @@ where
 {
     /// Starts at `key`.
     pub fn from(mut self, key: &KC::Key) -> Self {
-        self.constraints.start = ScanEdge::Included(KC::encode(key));
+        self.query.start = ScanEdge::Included(KC::encode(key));
         self
     }
 
     /// Starts after `key`.
     pub fn after(mut self, key: &KC::Key) -> Self {
-        self.constraints.start = ScanEdge::Excluded(KC::encode(key));
+        self.query.start = ScanEdge::Excluded(KC::encode(key));
         self
     }
 
     /// Stops at `key`.
     pub fn to(mut self, key: &KC::Key) -> Self {
-        self.constraints.end = ScanEdge::Included(KC::encode(key));
+        self.query.end = ScanEdge::Included(KC::encode(key));
         self
     }
 
     /// Stops before `key`.
     pub fn before(mut self, key: &KC::Key) -> Self {
-        self.constraints.end = ScanEdge::Excluded(KC::encode(key));
+        self.query.end = ScanEdge::Excluded(KC::encode(key));
         self
     }
 
     /// Sets the maximum number of present members.
     pub fn limit(mut self, limit: NonZeroUsize) -> Self {
-        self.constraints.limit = Some(limit);
+        self.query.limit = Some(limit);
         self
     }
 
-    /// Replaces all query constraints.
-    pub(crate) fn with_constraints(mut self, constraints: Constraints) -> Self {
-        self.constraints = constraints;
-        self
+    pub(crate) fn new(handle: &'a SetHandle<S, KC>, query: Query) -> Self {
+        Self { handle, query }
     }
 
     /// Streams live members in the query direction.
@@ -162,11 +159,11 @@ where
         let span = info_span!(
             "set.keys",
             collection = self.handle.cells.name().as_str(),
-            direction = ?self.dir,
+            direction = ?self.query.dir,
         );
         try_stream! {
-            let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
-            let inner = plan.keys(self.constraints);
+            let plan = self.handle.stream_plan(&self.query).instrument(span.clone()).await?;
+            let inner = plan.with_limit(self.query.limit).projected::<Presence>();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
                 yield item?;
@@ -190,10 +187,7 @@ where
     #[instrument(name = "set.insert", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
     #[write(op)]
     pub async fn insert(&self, key: KC::Key) -> Result<(), SetStateError> {
-        let coordinate = KC::encode(&key);
-        let prior = read_keyset_state(op).await?;
-        op.set(SetKind::<KC>::MEMBERS, &key, ())?;
-        update_keyset(op, coordinate, prior)
+        membership::insert(op, &key, ()).await
     }
 
     /// Removes `key` from the set.
@@ -204,10 +198,7 @@ where
     #[instrument(name = "set.remove", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
     #[write(op)]
     pub async fn remove(&self, key: &KC::Key) -> Result<(), SetStateError> {
-        let coordinate = KC::encode(key);
-        let prior = read_keyset_state(op).await?;
-        op.clear(SetKind::<KC>::MEMBERS, key);
-        subtract_keyset(op, &coordinate, prior)
+        membership::remove(op, key).await
     }
 
     /// Tests whether `key` belongs to the set.
@@ -250,37 +241,9 @@ where
     #[read(op)]
     async fn stream_plan(
         &self,
-        dir: Direction,
+        query: &Query,
     ) -> Result<Plan<S, Keyed<KC, UnitCodec>>, SetStateError> {
-        // Keep this plan local because its member family differs from Map's value
-        // family.
-        let coordinates = match read_keyset_state(op).await? {
-            PriorKeyset::Absent => {
-                return Ok(Plan::Points(op.coordinates(
-                    SetKind::<KC>::MEMBERS,
-                    Vec::new(),
-                    dir,
-                )));
-            }
-            PriorKeyset::Malformed | PriorKeyset::Decoded(Keyset::Overflowed) => {
-                return Ok(Plan::Scan(op.range(SetKind::<KC>::MEMBERS, dir)));
-            }
-            PriorKeyset::Decoded(Keyset::Tracked(coordinates)) => coordinates,
-        };
-        if is_oversized(&coordinates, op.keyset_limit()) {
-            return Ok(Plan::Scan(op.range(SetKind::<KC>::MEMBERS, dir)));
-        }
-        let Some(mut keys) = decoded_key_list::<KC>(&coordinates) else {
-            return Ok(Plan::Scan(op.range(SetKind::<KC>::MEMBERS, dir)));
-        };
-        if dir == Direction::Backward {
-            keys.reverse();
-        }
-        Ok(Plan::Points(op.coordinates(
-            SetKind::<KC>::MEMBERS,
-            keys,
-            dir,
-        )))
+        membership::plan(op, query).await
     }
 
     /// Streams live members in the direction `dir`.
@@ -290,11 +253,7 @@ where
 
     /// Builds a directional set query.
     pub fn query(&self, dir: Direction) -> SetQuery<'_, S, KC> {
-        SetQuery {
-            handle: self,
-            dir,
-            constraints: Constraints::default(),
-        }
+        SetQuery::new(self, Query::new(dir))
     }
 
     /// Reports whether the set has no live members.
@@ -304,10 +263,19 @@ where
     /// Returns a key codec error or a session access error.
     #[instrument(name = "set.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err)]
     pub async fn is_empty(&self) -> Result<bool, SetStateError> {
-        let keys = self
-            .query(Direction::Forward)
-            .limit(NonZeroUsize::MIN)
-            .keys();
+        let plan = self
+            .cells
+            .read(async |op| {
+                op.range(
+                    SetKind::<KC>::MEMBERS,
+                    ScanEdge::Unbounded,
+                    Direction::Forward,
+                    ScanEdge::Unbounded,
+                )
+                .with_limit(Some(NonZeroUsize::MIN))
+            })
+            .await;
+        let keys = plan.projected::<Presence>();
         futures::pin_mut!(keys);
         Ok(keys.next().await.transpose()?.is_none())
     }

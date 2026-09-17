@@ -109,9 +109,8 @@ pub(super) async fn run_actor<T>(
     loop {
         heartbeat.beat();
 
-        // Serve commands through `Draining` — in-flight handlers still arm
-        // recovery backstops as they settle, and their contexts permit timer
-        // ops until `Cancelling`. Exit only once `Cancelling` is visible. This
+        // Serve commands through Draining. Handler contexts permit timer
+        // operations until Cancelling. Exit when Cancelling is visible. This
         // gate owns the exit decision; the `changed()` arms below merely wake
         // a parked actor and route back here. It also bounds the transition
         // race: `select!` is unbiased, so with commands continuously ready the
@@ -186,7 +185,7 @@ pub(super) async fn run_actor<T>(
 }
 
 /// Processes a single command from the command channel.
-async fn process_command<T>(
+pub(super) async fn process_command<T>(
     state: &mut ActorState<T>,
     triggers: &mut TriggerQueue,
     Command {
@@ -203,8 +202,15 @@ async fn process_command<T>(
             triggers.remove(&trigger).await;
             Ok(())
         }
-        CommandOperation::AddToQueue => {
-            triggers.insert_queue_only(trigger);
+        CommandOperation::RetireCommitted => {
+            let tag = triggers
+                .active_triggers()
+                .get(&trigger.key, trigger.time, trigger.timer_type)
+                .await
+                .map(|entry| entry.tag);
+            if tag.is_none_or(|tag| tag == trigger.tag) {
+                triggers.remove(&trigger).await;
+            }
             Ok(())
         }
         CommandOperation::RemoveFromQueue => {
@@ -281,6 +287,16 @@ where
         }
     }
 
+    // The key row supplies the tag, even when a partial drain has not advanced
+    // ownership.
+    let tag = triggers
+        .active_triggers()
+        .get(&trigger.key, trigger.time, trigger.timer_type)
+        .await
+        .map(|entry| entry.tag);
+    if tag.is_some_and(|tag| tag != trigger.tag) {
+        triggers.remove(&trigger).await;
+    }
     if is_owned {
         triggers.insert(trigger).await;
     }
@@ -481,7 +497,7 @@ where
 /// The slab metadata scan happens here, in the load loop. Empty slab rows are
 /// still recorded in `known_slab_ids` so cleanup can delete them later without
 /// reading the slab table again.
-async fn drain_slab_range<T>(
+pub(super) async fn drain_slab_range<T>(
     store: &T,
     range: RangeInclusive<SlabId>,
     triggers: &mut TriggerQueue,

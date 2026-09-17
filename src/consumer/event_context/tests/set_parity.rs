@@ -3,7 +3,7 @@ use super::*;
 type SetOp = (u8, usize);
 
 fn run_set_parity(ops: &[SetOp]) -> Result<bool> {
-    executor::block_on(async {
+    TEST_RUNTIME.block_on(async {
         let context = parity_context::<Value>()?;
         let handle = context.set_state(SET_NAME)?;
         let mut floor = BTreeSet::new();
@@ -71,10 +71,4 @@ fn prop_erased_set_parity() {
         }
     }
     QuickCheck::new().quickcheck(prop as fn(Vec<SetOp>) -> TestResult);
-}
-
-#[test]
-fn erased_set_parity() -> Result<()> {
-    assert!(run_set_parity(&[(1, 1), (1, 0), (0, 0), (2, 0), (3, 0)])?);
-    Ok(())
 }

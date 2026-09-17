@@ -83,22 +83,23 @@ use crate::state::cell_key::Direction;
 #[cfg(test)]
 use crate::state::cell_key::{CellKey, Coordinate};
 use crate::state::collection::{
-    Collection, CollectionLayout, CollectionRead, CollectionWrite, Constraints, JOURNAL_INLINE,
-    Plan, StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
+    Collection, CollectionLayout, CollectionRead, CollectionWrite, JOURNAL_INLINE, Plan,
+    StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
     spec_matches,
 };
-#[cfg(test)]
-use crate::state::order_codec::OrderedKeyCodec;
-use crate::state::order_codec::{I64KeyCodec, UnitKey};
+use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec, UnitKey};
 use crate::state::{CollectionKindId, StateAccessError, StoreOutcome};
-use async_stream::try_stream;
 use educe::Educe;
-use futures::stream::{Stream, StreamExt};
+use futures::stream::Stream;
 use std::error::Error;
 use std::num::NonZeroUsize;
-use std::ops::{Bound, RangeBounds};
+use std::ops::Bound;
+
 use thiserror::Error;
-use tracing::{Instrument, Span, field::Empty, info_span, instrument};
+use tracing::{Span, field::Empty, instrument};
+
+mod query;
+pub use query::DequeQuery;
 
 collection_layout! {
     /// The Deque collection kind: one head/tail bounds cell, plus one cell per
@@ -244,78 +245,6 @@ pub struct DequeHandle<S, T> {
     cells: Collection<S, DequeKind<T>>,
 }
 
-/// A directional deque stream query over front-relative positions.
-///
-/// Build one with [`DequeHandle::query`]. Finish it with
-/// [`values`](Self::values).
-#[must_use]
-pub struct DequeQuery<'a, S, T> {
-    handle: &'a DequeHandle<S, T>,
-    dir: Direction,
-    start: Bound<usize>,
-    end: Bound<usize>,
-    limit: Option<NonZeroUsize>,
-}
-
-impl<'a, S, T> DequeQuery<'a, S, T>
-where
-    S: StateSession,
-    T: CellType<Key = UnitKey>,
-{
-    /// Sets the front-relative position range.
-    pub fn range<R: RangeBounds<usize>>(mut self, range: R) -> Self {
-        self.start = range.start_bound().cloned();
-        self.end = range.end_bound().cloned();
-        self
-    }
-
-    /// Sets the maximum number of present values.
-    pub fn limit(mut self, limit: NonZeroUsize) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    /// Streams the query's live values.
-    pub fn values(
-        self,
-    ) -> impl Stream<Item = Result<ResolvedOf<T>, DequeStateError<CellCodecError<T>>>> + 'a
-    where
-        for<'s> ContextOf<'s, T>: FromSession<'s, S>,
-    {
-        // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
-        // so each inner await is instrumented with a clone instead; the
-        // span's recorded time is the stream's own work. Unlike the sibling
-        // ops' `err`, failures are yielded per item rather than recorded on
-        // the span — a failing chunk ends with an OK-status span, and the
-        // yielded `Err` surfaces to the caller inside this span's scope.
-        let span = info_span!(
-            "deque.stream",
-            collection = self.handle.cells.name().as_str(),
-            direction = ?self.dir,
-        );
-        try_stream! {
-            // Init: `stream_plan` reads the bounds cell under an admission
-            // that it drops as it returns, before this `?` sees the result.
-            let plan = self.handle
-                .stream_plan(self.dir, &self.start, &self.end)
-                .instrument(span.clone())
-                .await?;
-            let inner = plan.entries(Constraints {
-                limit: self.limit,
-                ..Constraints::default()
-            });
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().instrument(span.clone()).await {
-                // The driver yields the decoded index. The module's window
-                // invariant makes that index redundant, so expose only the
-                // resolved element.
-                let (_, value) = item?;
-                yield value;
-            }
-        }
-    }
-}
-
 #[collection_methods(field = cells, session = S)]
 impl<S, T> DequeHandle<S, T>
 where
@@ -442,16 +371,9 @@ where
         Ok(op.get(DequeKind::<T>::ENTRIES, &last).await?)
     }
 
-    /// Reads the bounds cell and captures the stream's arm as an owned plan.
-    ///
-    /// A window of at most [`DEQUE_POINT_ITERATION_MAX`] entries gives the
-    /// chunked point-get arm over the window's absolute indices in `dir` order.
-    /// A wider window gives one durable range scan over exactly
-    /// `[head, tail − 1]`, under the window's own limit. That scan therefore
-    /// reads no row outside the window.
-    ///
-    /// An empty window gives an empty point-get plan. It does zero reads, and
-    /// its exhaustion still passes the stream fence.
+    /// Clamps the query to the stored window and captures its read plan.
+    /// At most [`DEQUE_POINT_ITERATION_MAX`] positions use point reads.
+    /// Wider selections use a bounded scan. Empty selections read no entries.
     #[read(op)]
     async fn stream_plan(
         &self,
@@ -474,87 +396,44 @@ where
         }
         .min(window_len);
         if start >= end {
-            return Ok(Plan::Points(op.coordinates(
-                DequeKind::<T>::ENTRIES,
-                Vec::new(),
-                dir,
-            )));
+            return Ok(op.coordinates(DequeKind::<T>::ENTRIES, Vec::new()));
         }
         let len = end - start;
         let first = window.absolute(start)?;
         let last = window.absolute(end - 1)?;
-        // The wide-window guard yields the scan limit as `NonZeroUsize`, so a
-        // zero limit is uncompilable here rather than checked.
+        // The scan limit cannot exceed the selected position count.
         if let Some(limit) = NonZeroUsize::new(len).filter(|n| n.get() > DEQUE_POINT_ITERATION_MAX)
         {
-            // Wide window: one durable range scan, anchored on the window.
-            // It runs from the front `head` to the back `tail − 1`, and
-            // mirrors backward. A wide window is nonempty, so `tail − 1` does
-            // not underflow.
             let (start, end) = match dir {
                 Direction::Forward => (first, last),
                 Direction::Backward => (last, first),
             };
-            return Ok(Plan::Scan(op.range_within(
-                DequeKind::<T>::ENTRIES,
-                &start,
-                dir,
-                &end,
-                limit,
-            )));
+            return Ok(op.range_within(DequeKind::<T>::ENTRIES, &start, dir, &end, limit));
         }
-        // Point-get arm. `absolute` is monotone in the position, and `first`
-        // and `last` checked both extremes above, so every interior index is
-        // `first + offset` with no overflow possible.
-        // `DEQUE_POINT_ITERATION_MAX` bounds this buffer at 128 × 8 B ≈ 1 KiB.
-        // This code sizes it once and pays it once per stream construction,
-        // never in the per-item steady state. Owned indices are what let one
-        // driver serve both the owner and the reader.
-        let mut indices: Vec<i64> = Vec::with_capacity(len);
-        indices.extend((0..len).map(|offset| first + offset as i64));
+        // Both endpoints are valid, so interior index arithmetic cannot overflow.
+        // Allocate at most 128 coordinates once per stream, before item reads.
+        let mut coordinates = Vec::with_capacity(len);
+        coordinates.extend((0..len).map(|offset| I64KeyCodec::encode(&(first + offset as i64))));
         if dir == Direction::Backward {
-            indices.reverse();
+            coordinates.reverse();
         }
-        Ok(Plan::Points(op.coordinates(
-            DequeKind::<T>::ENTRIES,
-            indices,
-            dir,
-        )))
+        Ok(op.coordinates(DequeKind::<T>::ENTRIES, coordinates))
     }
 
-    /// Streams the live elements in index order — front to back for
-    /// [`Direction::Forward`], back to front for [`Direction::Backward`]. Each
-    /// element is resolved as it is yielded.
+    /// Streams live values from front to back for [`Direction::Forward`].
     ///
-    /// # Per-arm consistency (position identity, a paged read, not a snapshot)
+    /// The initial bounds read fixes positions, not values. Each fetch reads
+    /// current values and skips absent positions. If a pop and push reuse a
+    /// position before its fetch, the stream yields its new value.
     ///
-    /// The one bounds read at init snapshots the **position window**
-    /// `[head, tail)`. That gives **position identity, not element identity**.
-    /// Each position yields what its cell holds when the stream fetches its
-    /// chunk. A pop before that fetch therefore reads absent, and the stream
-    /// **skips** the position. This is the skip that a TTL hole already
-    /// requires, never an error. A pop and then a push that reuses the position
-    /// yields the new occupant.
+    /// Small windows use point reads; wider windows use range scans.
+    /// Both sources preserve order and skip absent cells. Earlier chunks can
+    /// emit before a later fetch fails. A failed point chunk emits no values.
     ///
-    /// A window of at most `DEQUE_POINT_ITERATION_MAX` entries point-reads each
-    /// absolute index in chunks of `CELL_BATCH`. A wider window falls back to
-    /// one durable range scan over the same window. Both arms give identical
-    /// items in identical order, live pages, and the same skip-absent rule.
-    ///
-    /// A bounded-arm read failure can surface **after** a yielded prefix.
-    /// Chunked point gets yield the earlier chunks before a later chunk's read
-    /// fails. The scan arm behaves the same way: it yields a prefix before it
-    /// fails at a page boundary. Within a chunk the error is atomic, so a
-    /// failing chunk yields none of its items.
-    ///
-    /// The stream takes session admission at init for the bounds read. The
-    /// point arm then takes it once per chunk, at most `CELL_BATCH` point
-    /// reads each: a chunk's admission covers its batch fetch, and the stream
-    /// releases it before it decodes and resolves the chunk. The scan arm takes
-    /// no admission after init and pages gate-free. Neither arm holds admission
-    /// across a yield, for items and errors alike, so a handler may mutate this
-    /// deque between stream items without deadlock (`StreamYieldFree`, over the
-    /// per-event session operation gate).
+    /// Planning and point fetches hold session admission. Resolution and yields
+    /// hold no admission; range scans run without admission after planning.
+    /// The handler can mutate this deque between items. Every completion checks
+    /// the attempt fence, including errors and exhaustion.
     pub fn stream(
         &self,
         dir: Direction,

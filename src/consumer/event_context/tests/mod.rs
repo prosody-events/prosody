@@ -36,13 +36,13 @@ use crate::state::order_codec::Utf8KeyCodec;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CELL_BATCH;
-use crate::state::tests::support::{CountingCellStore, FixedOracle};
+use crate::state::tests::support::{CountingCellStore, MemoryDeduplicationStore};
 use crate::state::{EventRef, PartitionBackend, StateKey};
 use crate::test_util::ArbJson;
+use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;
 use crate::{Key, Topic};
 use color_eyre::eyre::{Result, eyre};
-use futures::executor;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult, empty_shrinker};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -55,7 +55,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 /// One collection name per kind — distinct, since a name is unique within a
-/// state type and the three kinds assert different structural identities.
+/// state type and the four kinds assert different structural identities.
 /// Name-resolution is pinned by the unregistered-name test.
 const VALUE_NAME: &str = "v";
 const MAP_NAME: &str = "m";
@@ -263,7 +263,7 @@ fn run_value_parity<P>(ops: &[ValueOp]) -> Result<bool>
 where
     P: ParityPayload + Send + Sync + 'static,
 {
-    executor::block_on(async {
+    TEST_RUNTIME.block_on(async {
         let ctx = parity_context::<P>()?;
         let handle = ctx
             .value_state(VALUE_NAME)

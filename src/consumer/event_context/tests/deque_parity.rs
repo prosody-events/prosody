@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_util::TEST_RUNTIME;
 
 // --- Deque parity -----------------------------------------------------------
 
@@ -114,7 +115,7 @@ fn run_deque_parity<P>(ops: &[DequeOp]) -> Result<bool>
 where
     P: ParityPayload + Send + Sync + 'static,
 {
-    executor::block_on(async {
+    TEST_RUNTIME.block_on(async {
         let ctx = parity_context::<P>()?;
         let handle = ctx
             .deque_state(DEQUE_NAME)

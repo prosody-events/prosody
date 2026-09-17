@@ -2,17 +2,18 @@
 //!
 //! The [`CassandraReaderBackend`] seeds committed state through the **real**
 //! owner [`KeyedStateSession`](crate::state::session::KeyedStateSession) over a
-//! `CassandraStore<FixedOracle>` and reads it back through the production
-//! oracle-free carriers ([`CassandraCellResources`]). The same
+//! `CassandraStore` and reads it back through the production
+//! shared cell resources ([`CassandraCellResources`]). The same
 //! `run_reader_{value,map,set,deque}_trace` runner the memory suite uses
 //! ([`reader_suite`](super::reader_suite)) runs here over live CQL, adding
-//! Cassandra coverage for Value, Map, Set, Deque, scans, and source selection.
+//! Cassandra coverage for Value, Map, Set, Deque, scans, and the two-group
+//! probe.
 //!
 //! Isolation follows TESTING.md's Cassandra row rule. Each evaluation runs in
 //! the shared `prosody_test` keyspace and generates a fresh subsystem, group,
 //! and key token before it starts. `partition_count` is always `1`, so
 //! `partition_for_key` trivially agrees with the owner's write partition. Each
-//! kind uses a fixed descriptor name. The four names differ, so their
+//! kind uses a fixed descriptor name, and the four names differ so their
 //! `structural_identity` values differ too. A fresh group id yields a fresh
 //! `UUIDv5` segment, so cell rows stay disjoint. A fresh subsystem yields a
 //! fresh publication partition, and a fresh key isolates the reader cache.
@@ -43,8 +44,7 @@ use crate::state::fjall::test_db;
 use crate::state::order_codec::I64KeyCodec;
 use crate::state::publication::{PublicationStore, StatePublication};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-use crate::state::tests::collection_suite::{DequeOp, MapOp, SetOp, Trace};
-use crate::state::tests::support::FixedOracle;
+use crate::state::tests::collection_suite::{DequeOp, MapOp, Trace};
 use crate::state::{StateName, StateType};
 use crate::state_reader::backend::ReaderComponents;
 use crate::state_reader::cache::ReaderCache;
@@ -63,12 +63,12 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// The live-Cassandra [`ReaderBackend`]. It holds one
-/// `CassandraStore<FixedOracle>`, which bundles a shared session, prepared
-/// queries, and one `MarkerMemo`/`MarkerCheckSet` lifecycle. That store is
+/// `CassandraStore`, which bundles a shared session, prepared
+/// queries, and one assignment workspace. That store is
 /// cloned into a fresh owner session for each event. The reader reads through
 /// [`CassandraCellResources`] over the same session and the same queries.
 struct CassandraReaderBackend {
-    store: CassandraCellStore<FixedOracle>,
+    store: CassandraCellStore,
     cells: CassandraCellResources,
     publications: CassandraPublicationStore,
     identities: CassandraDescriptorIdentityStore,
@@ -83,7 +83,7 @@ impl ReaderBackend for CassandraReaderBackend {
         CassandraDescriptorIdentityStore,
         MemoryLoader<Value>,
     >;
-    type OwnerCell = CassandraCellStore<FixedOracle>;
+    type OwnerCell = CassandraCellStore;
 
     fn registry(&self) -> Arc<CollectionDefRegistry> {
         self.registry.clone()
@@ -162,8 +162,8 @@ fn reader_topic() -> Topic {
 }
 
 /// Builds the heavy environment: a session, prepared queries, a process
-/// marker check, and a registry carrying the four per-kind defs, plus the
-/// shared owner cell store and the reader's carriers.
+/// marker check, and a registry carrying the four per-kind definitions, plus
+/// the shared owner cell store and the reader's carriers.
 async fn cassandra_backend() -> Result<CassandraReaderBackend> {
     let conn = CassandraConn::new(&test_cassandra_config()).await?;
     let cell_queries = Arc::new(CellQueries::new(conn.session(), TEST_KEYSPACE).await?);
@@ -190,14 +190,8 @@ async fn cassandra_backend() -> Result<CassandraReaderBackend> {
     )?;
     let registry = Arc::new(registry);
 
-    let presence = test_db::marker_checks("state_reader_cassandra_presence")?;
-    let store = CassandraCellStore::new(
-        conn.clone(),
-        cell_queries.clone(),
-        FixedOracle::committed(),
-        registry.clone(),
-        presence,
-    );
+    let _presence = test_db::marker_checks("state_reader_cassandra_presence")?;
+    let store = CassandraCellStore::new(conn.clone(), cell_queries.clone(), registry.clone());
     let cells = CassandraCellResources::new(conn.clone(), cell_queries);
     let publications = CassandraPublicationStore::new(conn.clone(), publication_queries);
     let identities = CassandraDescriptorIdentityStore::new(conn, identity_queries);
@@ -287,7 +281,7 @@ cassandra_reader_prop!(
 // The Set property checks committed membership and ordered keys.
 cassandra_reader_prop!(
     prop_cassandra_reader_set,
-    SetOp,
+    MapOp,
     set_state::<I64KeyCodec>,
     SET_NAME,
     run_reader_set_trace

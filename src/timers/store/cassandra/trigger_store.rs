@@ -192,14 +192,9 @@ impl TriggerOperations for CassandraTriggerStore {
         let segment_id = self.segment.id;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
 
-        self.execute_with_optional_ttl(
-            slab.range().end,
-            &self.queries().insert_slab,
-            &self.queries().insert_slab_no_ttl,
-            |ttl| (segment_id, slab_id, ttl),
-            || (segment_id, slab_id),
-        )
-        .await
+        let ttl = self.calculate_ttl(slab.range().end);
+        self.execute_unpaged_discard(&self.queries().insert_slab, (segment_id, slab_id, ttl))
+            .await
     }
 
     #[instrument(level = "debug", skip(self), err)]
@@ -244,12 +239,10 @@ impl TriggerOperations for CassandraTriggerStore {
         // same lifetime as `insert_slab` and slab triggers.
         let anchor_time = anchor_after_watermark(watermark, self.segment.slab_size);
 
-        self.execute_with_optional_ttl(
-            anchor_time,
+        let ttl = self.calculate_ttl(anchor_time);
+        self.execute_unpaged_discard(
             &self.queries().set_slab_watermark,
-            &self.queries().set_slab_watermark_no_ttl,
-            |ttl| (ttl, watermark_i32, segment_id),
-            || (watermark_i32, segment_id),
+            (ttl, watermark_i32, segment_id),
         )
         .await
     }
@@ -271,12 +264,10 @@ impl TriggerOperations for CassandraTriggerStore {
         // without finding them already TTL'd out.
         let anchor_time = slab.range().end;
 
-        self.execute_with_optional_ttl(
-            anchor_time,
+        let ttl = self.calculate_ttl(anchor_time);
+        self.execute_unpaged_discard(
             &self.queries().batch_insert_slab_with_watermark,
-            &self.queries().batch_insert_slab_with_watermark_no_ttl,
-            |ttl| (segment_id, slab_id, ttl, ttl, watermark_i32, segment_id),
-            || (segment_id, slab_id, watermark_i32, segment_id),
+            (segment_id, slab_id, ttl, ttl, watermark_i32, segment_id),
         )
         .await
     }
@@ -360,20 +351,12 @@ impl TriggerOperations for CassandraTriggerStore {
         let timer_type = trigger.timer_type;
         let tag = trigger.tag;
 
-        self.execute_with_optional_ttl(
-            slab.range().end,
+        let ttl = self.calculate_ttl(slab.range().end);
+        self.execute_unpaged_discard(
             &self.queries().insert_slab_trigger,
-            &self.queries().insert_slab_trigger_no_ttl,
-            |ttl| {
-                (
-                    segment_id, slab_size, slab_id, timer_type, key, time, &span_map, tag, ttl,
-                )
-            },
-            || {
-                (
-                    segment_id, slab_size, slab_id, timer_type, key, time, &span_map, tag,
-                )
-            },
+            (
+                segment_id, slab_size, slab_id, timer_type, key, time, &span_map, tag, ttl,
+            ),
         )
         .await
     }
@@ -901,106 +884,51 @@ impl TriggerOperations for CassandraTriggerStore {
         Ok(())
     }
 
-    /// Rotates the commit-oracle tag on an existing timer at `time`.
-    ///
-    /// **Precondition:** the caller must have observed the timer at `(key,
-    /// time, timer_type)` as currently scheduled (today: from
-    /// `complete()`-from-`FiringRescheduled`, where the row was just loaded
-    /// into the active scheduler). Holding the per-key mutex serialises
-    /// against concurrent in-process writers, so the row is guaranteed to
-    /// exist for the duration of the write.
-    ///
-    /// Uses `resolve_state` (cache-first):
-    /// - **Inline(timer), time matches**: rewrite the UDT in place.
-    /// - **Inline(_), time mismatch** or **Absent**: no-op (target absent).
-    /// - **Overflow**: bare `UPDATE` on the clustering row — no LWT, no
-    ///   existence check.
+    /// Reads the current trigger through the partition writer's shared cache.
+    /// Per-key serialization orders admission after every prior store mutation.
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
-    async fn update_tag(
+    async fn current_trigger(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
-        new_tag: i32,
-    ) -> Result<(), Self::Error> {
-        let segment_id = self.segment.id;
-        let (handle, cached) = self.resolve_state(&segment_id, key, timer_type).await?;
-        Span::current().record("state_cached", cached);
-
-        let mut guard = handle.lock().await;
-        match &*guard {
-            TimerState::Inline(timer) if timer.time == time => {
-                let new_state = TimerState::Inline(InlineTimer {
-                    time: timer.time,
-                    span: timer.span.clone(),
-                    tag: new_tag,
-                });
-                tokio::try_join!(
-                    self.set_state_inline(&segment_id, key, timer_type, &new_state),
-                    self.update_slab_tag(key, time, timer_type, new_tag),
-                )?;
-                *guard = new_state;
-            }
-            // Concurrent `clear_and_schedule` won the lock first and rewrote
-            // the UDT to a different timer (or cleared it entirely). The new
-            // Inline timer carries its own freshly-minted tag from
-            // `Trigger::new`, so our rotation is moot. Do NOT assert/warn —
-            // this race is legitimate under normal reschedule contention.
-            TimerState::Inline(_) | TimerState::Absent => {}
-            TimerState::Overflow => {
-                tokio::try_join!(
-                    self.execute_unpaged_discard(
-                        &self.queries().update_tag,
-                        (new_tag, &segment_id, key.as_ref(), timer_type, time),
-                    ),
-                    self.update_slab_tag(key, time, timer_type, new_tag),
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Reads the commit-oracle tag for a single timer at `time`.
-    ///
-    /// Cache-first via `resolve_state`: a hit answers with zero DB reads.
-    /// This is sound because the partition's single writer is the only
-    /// mutator of this instance's `state_cache`, and the keyed-state commit
-    /// oracle consults through a **clone of this instance** (handle passing
-    /// at partition acquisition — see `StateBackendFactory::for_partition`), so
-    /// writer and oracle share one cache; per-key serialization orders every
-    /// consult against the mutations it must observe. On `Overflow`, the
-    /// clustering row's tag column is read under the per-key mutex so a
-    /// concurrent promote/demote cannot interleave between the state check and
-    /// the row read.
-    #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
-    async fn current_tag(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> Result<Option<i32>, Self::Error> {
+    ) -> Result<Option<Trigger>, Self::Error> {
         let segment_id = self.segment.id;
         let (handle, cached) = self.resolve_state(&segment_id, key, timer_type).await?;
         Span::current().record("state_cached", cached);
 
         let guard = handle.lock().await;
         match &*guard {
-            TimerState::Inline(timer) if timer.time == time => Ok(Some(timer.tag)),
+            TimerState::Inline(timer) if timer.time == time => Ok(Some(Trigger::restored(
+                key.clone(),
+                time,
+                timer_type,
+                timer.tag,
+                self.propagator().extract(&timer.span),
+            ))),
             TimerState::Inline(_) | TimerState::Absent => Ok(None),
             TimerState::Overflow => {
                 let row = self
                     .session()
                     .execute_unpaged(
-                        &self.queries().current_tag_key,
+                        &self.queries().current_trigger_key,
                         (&segment_id, key.as_ref(), timer_type, time),
                     )
                     .await
                     .map_err(CassandraStoreError::from)?
                     .into_rows_result()
                     .map_err(CassandraStoreError::from)?
-                    .maybe_first_row::<(Option<i32>,)>()
+                    .maybe_first_row::<(Option<i32>, HashMap<String, String>)>()
                     .map_err(CassandraStoreError::from)?;
-                Ok(row.map(|(tag_opt,)| tag_opt.unwrap_or(0_i32)))
+                Ok(row.map(|(tag, span)| {
+                    Trigger::restored(
+                        key.clone(),
+                        time,
+                        timer_type,
+                        tag.unwrap_or(0_i32),
+                        self.propagator().extract(&span),
+                    )
+                }))
             }
         }
     }
@@ -1099,32 +1027,19 @@ impl PendingKeyTrigger {
         store: &CassandraTriggerStore,
         segment_id: &SegmentId,
     ) -> Result<(), CassandraTriggerStoreError> {
+        let ttl = store.calculate_ttl(self.id.time);
         store
-            .execute_with_optional_ttl(
-                self.id.time,
+            .execute_unpaged_discard(
                 &store.queries().insert_key_trigger_clustering,
-                &store.queries().insert_key_trigger_clustering_no_ttl,
-                |ttl| {
-                    (
-                        segment_id,
-                        self.id.key.as_ref(),
-                        self.id.timer_type,
-                        self.id.time,
-                        &self.span_map,
-                        self.tag,
-                        ttl,
-                    )
-                },
-                || {
-                    (
-                        segment_id,
-                        self.id.key.as_ref(),
-                        self.id.timer_type,
-                        self.id.time,
-                        &self.span_map,
-                        self.tag,
-                    )
-                },
+                (
+                    segment_id,
+                    self.id.key.as_ref(),
+                    self.id.timer_type,
+                    self.id.time,
+                    &self.span_map,
+                    self.tag,
+                    ttl,
+                ),
             )
             .await
     }

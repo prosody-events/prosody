@@ -85,7 +85,7 @@ fn simple_defer_and_retry_succeeds() -> color_eyre::Result<()> {
             offset: Offset::from(1_i64),
             outcome: TimerOutcome::Success,
         };
-        harness.execute_timer(&timer).await?;
+        harness.execute_timer(&timer, DemandType::Normal).await?;
 
         // Key should not be deferred
         let retry_count = harness.get_retry_count(0).await?;
@@ -114,7 +114,7 @@ fn queues_messages_while_key_deferred() -> color_eyre::Result<()> {
             offset: Offset::from(1_i64),
             outcome: TimerOutcome::Success,
         };
-        harness.execute_timer(&timer1).await?;
+        harness.execute_timer(&timer1, DemandType::Normal).await?;
 
         // Key should still be deferred (has second message)
         let retry_count = harness.get_retry_count(0).await?;
@@ -153,7 +153,7 @@ fn increments_retry_count_on_transient_failure() -> color_eyre::Result<()> {
                 max_backoff: CompactDuration::new(120),
             },
         };
-        harness.execute_timer(&timer).await?;
+        harness.execute_timer(&timer, DemandType::Normal).await?;
 
         // Retry count should be incremented
         let retry_count = harness
@@ -200,7 +200,7 @@ fn redeferred_retry_is_a_single_timer_at_the_backoff_floor() -> color_eyre::Resu
                 max_backoff: CompactDuration::new(60),
             },
         };
-        harness.execute_timer(&timer).await?;
+        harness.execute_timer(&timer, DemandType::Normal).await?;
 
         // Re-deferred at retry_count=1 with exactly one standing timer...
         let retry_count = harness
@@ -233,7 +233,7 @@ fn redeferred_retry_is_a_single_timer_at_the_backoff_floor() -> color_eyre::Resu
             offset: Offset::from(1_i64),
             outcome: TimerOutcome::Success,
         };
-        harness.execute_timer(&timer).await?;
+        harness.execute_timer(&timer, DemandType::Normal).await?;
         assert!(harness.get_retry_count(0).await?.is_none());
         assert_eq!(harness.capture().key_timer_count(&key), 0);
 
@@ -337,7 +337,7 @@ fn permanent_error_schedules_timer_for_next_message() -> color_eyre::Result<()> 
             offset: Offset::from(1_i64),
             outcome: TimerOutcome::Permanent,
         };
-        harness.execute_timer(&timer).await?;
+        harness.execute_timer(&timer, DemandType::Normal).await?;
 
         // Timer should still be active for the next queued message
         assert!(
@@ -582,7 +582,7 @@ fn retried_message_handler_runs_inside_the_load_span() -> color_eyre::Result<()>
                 offset: Offset::from(1_i64),
                 outcome: TimerOutcome::Success,
             };
-            harness.execute_timer(&timer).await?;
+            harness.execute_timer(&timer, DemandType::Normal).await?;
 
             // The second dispatch is the retry: its ambient span must be the
             // reloaded message's own span, by id.

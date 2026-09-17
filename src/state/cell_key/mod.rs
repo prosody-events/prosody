@@ -108,29 +108,10 @@ pub enum Direction {
     Backward,
 }
 
-/// One edge of a [`Scan`]: an inclusive or exclusive endpoint at a known
-/// coordinate, or `Unbounded` — an open endpoint at no coordinate at all.
-///
-/// `Unbounded` is **direction-relative** like the other edges: as a `start` it
-/// opens the low side (forward) or high side (backward); as an `end` it opens
-/// the opposite side. It exists for the map's `Overflowed`/degraded fallback,
-/// where the keyset holds no complete key enumeration to fence the scan from,
-/// so iteration must walk the whole section. A scan with both edges `Unbounded`
-/// therefore walks an entire section — including, on a TTL'd or freshly-cleared
-/// section, a field of tombstones. That is the accepted degraded cost of the
-/// fallback, not a hazard: the fast (bounded-coordinate) arms of every
-/// collection stay pinned to their live extent, and only the map's degrade path
-/// ever constructs an `Unbounded` edge.
-///
-/// The exclusive edge exists for callers that need an endpoint-exclusive
-/// range — e.g. resuming a scan just past the last coordinate seen. No
-/// production caller constructs it today; it is reached through the
-/// `Direction` × `ScanEdge` comparator dispatch in the Cassandra cell
-/// store, and property tests drive all three variants.
-///
-/// Generic over the inner so one type serves both an owned plan edge
-/// (`ScanEdge<Coordinate>`) and a borrowed store-facing edge
-/// (`ScanEdge<&Coordinate>`, what a [`Scan`] carries).
+/// One inclusive, exclusive, or unbounded coordinate edge.
+/// Edges follow the scan direction. An unbounded start opens the low side
+/// in forward order and the high side in backward order.
+/// Owned plans hold coordinates. Store requests borrow those coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanEdge<T> {
     /// The endpoint coordinate is part of the range.
@@ -143,7 +124,38 @@ pub enum ScanEdge<T> {
     Unbounded,
 }
 
+/// The start edge used to select a scan statement.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum EdgeKind {
+    /// Include the anchor coordinate.
+    Included,
+    /// Exclude the anchor coordinate.
+    Excluded,
+    /// Scan the whole section.
+    Unbounded,
+}
+
+impl ScanEdge<&Coordinate> {
+    /// Returns the anchor. An unbounded start uses the minimum coordinate.
+    pub(crate) fn anchor(&self) -> &Coordinate {
+        static EMPTY: Coordinate = Coordinate::empty();
+        match self {
+            Self::Included(coordinate) | Self::Excluded(coordinate) => coordinate,
+            Self::Unbounded => &EMPTY,
+        }
+    }
+}
+
 impl<T> ScanEdge<T> {
+    /// Returns the kind of this edge.
+    pub(crate) fn kind(&self) -> EdgeKind {
+        match self {
+            Self::Included(_) => EdgeKind::Included,
+            Self::Excluded(_) => EdgeKind::Excluded,
+            Self::Unbounded => EdgeKind::Unbounded,
+        }
+    }
+
     /// Borrows the inner value, preserving inclusivity — the borrow half of the
     /// `as_ref().cloned()` pair, parallelling [`Bound::as_ref`].
     #[must_use]
@@ -196,100 +208,27 @@ impl<T> From<ScanEdge<T>> for Bound<T> {
 /// `start` (the high side) toward `end` (the low side). Either edge may be
 /// [`ScanEdge::Unbounded`] (open on that side), so a scan is still single-
 /// section but need not be pinned to a known coordinate range.
-///
-/// Build a scan with [`Scan::over`]. Prepositions that name a coordinate
-/// include it (`from` and `to`). Prepositions that name a relation exclude it
-/// (`after` and `before`). State all edges in iteration order. A later call for
-/// the same edge replaces the earlier call.
 #[derive(Clone, Copy)]
 pub struct Scan<'a> {
-    section: Section,
-    start: ScanEdge<&'a Coordinate>,
-    dir: Direction,
-    end: ScanEdge<&'a Coordinate>,
-    limit: Option<NonZeroUsize>,
+    /// The section whose cells the scan walks.
+    pub section: Section,
+
+    /// The edge the scan starts walking from (low side forward, high side
+    /// backward).
+    pub start: ScanEdge<&'a Coordinate>,
+
+    /// The direction the scan walks from `start`.
+    pub dir: Direction,
+
+    /// The edge the scan stops at (high side forward, low side backward).
+    pub end: ScanEdge<&'a Coordinate>,
+
+    /// The preferred size of the first fetch. A backend sizes its first page or
+    /// batch from it and grows later fetches. It never limits results.
+    pub fetch_hint: Option<NonZeroUsize>,
 }
 
-impl<'a> Scan<'a> {
-    /// Builds an unbounded scan over one section.
-    #[must_use]
-    pub fn over(section: Section, dir: Direction) -> Self {
-        Self {
-            section,
-            start: ScanEdge::Unbounded,
-            dir,
-            end: ScanEdge::Unbounded,
-            limit: None,
-        }
-    }
-
-    /// Starts at `coordinate`.
-    #[must_use]
-    pub fn from(mut self, coordinate: &'a Coordinate) -> Self {
-        self.start = ScanEdge::Included(coordinate);
-        self
-    }
-
-    /// Starts after `coordinate`.
-    #[must_use]
-    pub fn after(mut self, coordinate: &'a Coordinate) -> Self {
-        self.start = ScanEdge::Excluded(coordinate);
-        self
-    }
-
-    /// Stops at `coordinate`.
-    #[must_use]
-    pub fn to(mut self, coordinate: &'a Coordinate) -> Self {
-        self.end = ScanEdge::Included(coordinate);
-        self
-    }
-
-    /// Stops before `coordinate`.
-    #[must_use]
-    pub fn before(mut self, coordinate: &'a Coordinate) -> Self {
-        self.end = ScanEdge::Excluded(coordinate);
-        self
-    }
-
-    /// Sets the maximum result count.
-    #[must_use]
-    pub fn limit(mut self, limit: NonZeroUsize) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    /// Removes the maximum result count.
-    #[must_use]
-    pub(crate) fn without_limit(mut self) -> Self {
-        self.limit = None;
-        self
-    }
-
-    #[must_use]
-    pub(crate) fn section(&self) -> Section {
-        self.section
-    }
-
-    #[must_use]
-    pub(crate) fn start(&self) -> ScanEdge<&'a Coordinate> {
-        self.start
-    }
-
-    #[must_use]
-    pub(crate) fn direction(&self) -> Direction {
-        self.dir
-    }
-
-    #[must_use]
-    pub(crate) fn end(&self) -> ScanEdge<&'a Coordinate> {
-        self.end
-    }
-
-    #[must_use]
-    pub(crate) fn result_limit(&self) -> Option<NonZeroUsize> {
-        self.limit
-    }
-
+impl Scan<'_> {
     /// The scan's direction-relative edges resolved to absolute `(low, high)`:
     /// forward keeps `(start, end)`, backward swaps to `(end, start)`.
     #[must_use]

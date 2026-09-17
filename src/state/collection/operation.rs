@@ -1,12 +1,12 @@
 //! The two scoped operation types and the invocation-local write journal.
 
-use super::stream::{PlanBase, read_keys_presence, read_presence_coordinates};
+use super::stream::PlanBase;
 use super::{
-    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, CoordinatePlan,
-    RangePlan, StateSession, WritableStateSession, cell_key, encode_cell, resolve_batch,
-    resolve_cell, sealed, sealed_ops,
+    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, Plan, StateSession,
+    WritableStateSession, cell_key, encode_cell, resolve_batch, resolve_cell, sealed, sealed_ops,
 };
 use crate::state::access::StateAccessError;
+use crate::state::cell::{Presence, Projection, Values};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, ScanEdge, Section};
 use crate::state::descriptor::{
     CellCodecError, CellResolver, CellStateError, CellType, ContextOf, FromSession, KeyOf,
@@ -92,34 +92,28 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
         Self { collection, inner }
     }
 
-    /// Plans a managed point-get stream over `keys` in `family`, in the given
-    /// order. Freezing this invocation's engine state into the plan is what
-    /// lets each chunk resume on the same source (reader) or reacquire the gate
-    /// (owner) without re-running the planning command.
+    /// Plans a managed point-get stream over `coordinates` in `family`, in the
+    /// given order. Freezing this invocation's engine state into the plan is
+    /// what lets each chunk resume on the same source (reader) or reacquire the
+    /// gate (owner) without re-running the planning command.
     pub(crate) fn coordinates<T: CellType>(
         &self,
         family: CellFamily<L, T>,
-        keys: Vec<KeyOf<T>>,
-        dir: Direction,
-    ) -> CoordinatePlan<S, T> {
-        CoordinatePlan::new(self.plan_base(family.section()), keys, dir)
+        coordinates: Vec<Coordinate>,
+    ) -> Plan<S, T> {
+        Plan::coordinates(self.plan_base(family.section()), coordinates)
     }
 
-    /// Plans a managed durable range over the whole of `family`'s section, in
-    /// `dir` order — the fallback for a collection with no coordinate
-    /// enumeration to point-get.
+    /// Plans a scan over encoded edges in the declared family.
+    /// The edges follow `dir` and can include, exclude, or omit an endpoint.
     pub(crate) fn range<T: CellType>(
         &self,
         family: CellFamily<L, T>,
+        start: ScanEdge<Coordinate>,
         dir: Direction,
-    ) -> RangePlan<S, T> {
-        RangePlan::new(
-            self.plan_base(family.section()),
-            ScanEdge::Unbounded,
-            dir,
-            ScanEdge::Unbounded,
-            None,
-        )
+        end: ScanEdge<Coordinate>,
+    ) -> Plan<S, T> {
+        Plan::range(self.plan_base(family.section()), start, dir, end)
     }
 
     /// Plans a managed durable range over one inclusive typed span of
@@ -139,14 +133,14 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
         dir: Direction,
         end: &KeyOf<T>,
         limit: NonZeroUsize,
-    ) -> RangePlan<S, T> {
-        RangePlan::new(
-            self.plan_base(family.section()),
+    ) -> Plan<S, T> {
+        self.range(
+            family,
             ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode(start)),
             dir,
             ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode(end)),
-            Some(limit),
         )
+        .with_limit(Some(limit))
     }
 
     /// The binding and captured engine state every managed plan carries.
@@ -244,6 +238,48 @@ impl<'a, S: WritableStateSession, L> WriteOperation<'a, S, L> {
             })
     }
 
+    /// Projects the journal answer for each key before the engine reads.
+    fn slots<T: CellType, P: Projection>(
+        &self,
+        family: CellFamily<L, T>,
+        keys: &[KeyOf<T>],
+    ) -> CellBuffer<Slot<P>> {
+        keys.iter()
+            .map(|key| {
+                let cell = cell_key(family, key);
+                match self.staged(&cell) {
+                    Some(Staged::Present(bytes)) => Slot::Answered(Some(P::from_value(bytes))),
+                    Some(Staged::Absent) => Slot::Answered(None),
+                    None => Slot::Pending(cell.coordinate),
+                }
+            })
+            .collect()
+    }
+
+    /// Reads the journal answer or one projected engine answer.
+    async fn staged_or_read<P: Projection>(
+        &mut self,
+        cell: &CellKey,
+    ) -> Result<Option<P::Payload>, StateAccessError>
+    where
+        S::Engine: sealed::Reads<S, P>,
+    {
+        match self.staged(cell) {
+            Some(Staged::Present(bytes)) => Ok(Some(P::from_value(bytes))),
+            Some(Staged::Absent) => Ok(None),
+            None => {
+                <S::Engine as sealed::Reads<S, P>>::read_point(
+                    self.collection.session(),
+                    &mut *self.inner,
+                    self.collection.state_type(),
+                    self.collection.name(),
+                    cell,
+                )
+                .await
+            }
+        }
+    }
+
     /// How many mutations this invocation has staged.
     #[cfg(test)]
     pub(crate) fn journal_len(&self) -> usize {
@@ -310,20 +346,18 @@ impl<S: StateSession, L> CollectionRead for ReadOperation<'_, S, L> {
         family: CellFamily<L, T>,
         key: &KeyOf<T>,
     ) -> impl Future<Output = Result<bool, StateAccessError>> + Send {
-        let section = family.section();
-        let coordinate = <T::Key as OrderedKeyCodec>::encode(key);
+        let cell = cell_key(family, key);
         let Self { collection, inner } = self;
-        let session = collection.session();
         async move {
-            read_presence(
-                session,
+            Ok(<S::Engine as sealed::Reads<S, Presence>>::read_point(
+                collection.session(),
                 inner,
                 collection.state_type(),
                 collection.name(),
-                section,
-                coordinate,
+                &cell,
             )
-            .await
+            .await?
+            .is_some())
         }
     }
 
@@ -334,14 +368,20 @@ impl<S: StateSession, L> CollectionRead for ReadOperation<'_, S, L> {
     ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send {
         let section = family.section();
         let Self { collection, inner } = self;
-        read_keys_presence::<S, T>(
-            collection.session(),
-            inner,
-            collection.state_type(),
-            collection.name(),
-            section,
-            keys,
-        )
+        async move {
+            Ok(read_keys::<S, T, Presence>(
+                collection.session(),
+                inner,
+                collection.state_type(),
+                collection.name(),
+                section,
+                keys,
+            )
+            .await?
+            .into_iter()
+            .map(|value| value.is_some())
+            .collect())
+        }
     }
 
     fn get<T>(
@@ -359,7 +399,7 @@ impl<S: StateSession, L> CollectionRead for ReadOperation<'_, S, L> {
         let Self { collection, inner } = self;
         let session = collection.session();
         async move {
-            let bytes = <S::Engine as sealed::ReadEngine<S>>::read_point(
+            let bytes = <S::Engine as sealed::Reads<S, Values>>::read_point(
                 session,
                 inner,
                 collection.state_type(),
@@ -407,22 +447,13 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         let section = family.section();
-        // Fold the journal per position first: a staged answer never reaches
-        // the engine, and only the journal-silent positions enter the batch.
-        let slots: CellBuffer<Slot> = keys
-            .iter()
-            .map(|key| match self.staged(&cell_key(family, key)) {
-                Some(Staged::Present(bytes)) => Slot::Answered(Some(bytes)),
-                Some(Staged::Absent) => Slot::Answered(None),
-                None => Slot::Pending(<T::Key as OrderedKeyCodec>::encode(key)),
-            })
-            .collect();
+        let slots = self.slots::<T, Values>(family, keys);
         let Self {
             collection, inner, ..
         } = self;
         let session = collection.session();
         async move {
-            let bytes = batched_bytes::<S>(
+            let bytes = batched::<S, Values>(
                 session,
                 &mut **inner,
                 collection.state_type(),
@@ -441,28 +472,7 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         key: &KeyOf<T>,
     ) -> impl Future<Output = Result<bool, StateAccessError>> + Send {
         let cell = cell_key(family, key);
-        let staged = self.staged(&cell);
-        let Self {
-            collection, inner, ..
-        } = self;
-        let session = collection.session();
-        async move {
-            match staged {
-                Some(Staged::Present(_)) => Ok(true),
-                Some(Staged::Absent) => Ok(false),
-                None => {
-                    read_presence(
-                        session,
-                        &mut **inner,
-                        collection.state_type(),
-                        collection.name(),
-                        cell.section,
-                        cell.coordinate,
-                    )
-                    .await
-                }
-            }
-        }
+        async move { Ok(self.staged_or_read::<Presence>(&cell).await?.is_some()) }
     }
 
     fn contains_many<T: CellType>(
@@ -471,39 +481,23 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         keys: &[KeyOf<T>],
     ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send {
         let section = family.section();
-        let mut slots = CellBuffer::with_capacity(keys.len());
-        let mut pending = CellBuffer::with_capacity(keys.len());
-        for key in keys {
-            match self.staged(&cell_key(family, key)) {
-                Some(Staged::Present(_)) => slots.push(Some(true)),
-                Some(Staged::Absent) => slots.push(Some(false)),
-                None => {
-                    slots.push(None);
-                    pending.push(<T::Key as OrderedKeyCodec>::encode(key));
-                }
-            }
-        }
+        let slots = self.slots::<T, Presence>(family, keys);
         let Self {
             collection, inner, ..
         } = self;
         async move {
-            let expected = pending.len();
-            let answers = read_presence_coordinates::<S>(
+            Ok(batched::<S, Presence>(
                 collection.session(),
                 &mut **inner,
                 collection.state_type(),
                 collection.name(),
                 section,
-                pending.into_iter(),
+                slots,
             )
-            .await?;
-            let received = answers.len();
-            let mut answers = answers.into_iter();
-            slots
-                .into_iter()
-                .map(|slot| slot.or_else(|| answers.next()))
-                .collect::<Option<CellBuffer<bool>>>()
-                .ok_or_else(|| StateAccessError::misaligned_batch(received, expected))
+            .await?
+            .into_iter()
+            .map(|value| value.is_some())
+            .collect())
         }
     }
 
@@ -517,34 +511,15 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         let cell = cell_key(family, key);
-        let staged = self.staged(&cell);
-        let Self {
-            collection, inner, ..
-        } = self;
-        // The owned cell moves into the future. Only the cell crosses the
-        // engine await, never the borrowed key.
-        async move { read_staged::<S, T, L>(collection, &mut **inner, staged, &cell).await }
+        async move {
+            match self.staged_or_read::<Values>(&cell).await? {
+                Some(bytes) => Ok(Some(
+                    resolve_cell::<S, T>(self.collection.session(), bytes).await?,
+                )),
+                None => Ok(None),
+            }
+        }
     }
-}
-
-/// Reads one coordinate through the engine's presence batch.
-async fn read_presence<S: StateSession>(
-    session: &S,
-    inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
-    state_type: StateType,
-    name: &StateName,
-    section: Section,
-    coordinate: Coordinate,
-) -> Result<bool, StateAccessError> {
-    let batch = CoordinateBatch::one(coordinate);
-    let answers = <S::Engine as sealed::ReadEngine<S>>::read_presence_batch(
-        session, inner, state_type, name, section, &batch,
-    )
-    .await?;
-    answers
-        .first()
-        .copied()
-        .ok_or_else(|| StateAccessError::misaligned_batch(answers.len(), batch.len()))
 }
 
 impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
@@ -558,17 +533,13 @@ impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         let cell = cell_key(family, key);
-        let staged = self.staged(&cell);
-        let Self {
-            collection,
-            inner,
-            journal,
-        } = self;
         async move {
-            let value = read_staged::<S, T, L>(collection, &mut **inner, staged, &cell).await?;
-            // Only a completed read stages the clear. A read error leaves the
-            // journal silent. `Ok(None)` still clears the addressed residue.
-            journal.push(Mutation::Clear { cell });
+            let value = match self.staged_or_read::<Values>(&cell).await? {
+                Some(bytes) => Some(resolve_cell::<S, T>(self.collection.session(), bytes).await?),
+                None => None,
+            };
+            // A failed read leaves the journal unchanged.
+            self.journal.push(Mutation::Clear { cell });
             Ok(value)
         }
     }
@@ -605,59 +576,11 @@ impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
     }
 }
 
-/// The typed point read of a write invocation. It returns the journal's answer
-/// when the journal has one. If not, it does one engine point read. Both paths
-/// then run the shared decode and resolve.
-///
-/// This function uses the desugared `-> impl Future + Send` form for the reason
-/// [`resolve_cell`] states: the future holds the resolver's [`ContextOf`]
-/// projection across the resolve await.
-///
-/// # Errors
-///
-/// An access error from the engine, a codec error (Permanent), or a resolution
-/// error.
-fn read_staged<'a, S, T, L>(
-    collection: &'a Collection<S, L>,
-    inner: &'a mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
-    staged: Option<Staged>,
-    cell: &'a CellKey,
-) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send + 'a
-where
-    S: StateSession,
-    T: CellType,
-    for<'s> ContextOf<'s, T>: FromSession<'s, S>,
-{
-    let session = collection.session();
-    async move {
-        let bytes = match staged {
-            Some(Staged::Present(bytes)) => Some(bytes),
-            Some(Staged::Absent) => None,
-            // The write state derefs to the read state, so the write operation
-            // reuses the read driver unchanged.
-            None => {
-                <S::Engine as sealed::ReadEngine<S>>::read_point(
-                    session,
-                    inner,
-                    collection.state_type(),
-                    collection.name(),
-                    cell,
-                )
-                .await?
-            }
-        };
-        match bytes {
-            Some(bytes) => Ok(Some(resolve_cell::<S, T>(session, bytes).await?)),
-            None => Ok(None),
-        }
-    }
-}
-
 /// One position of an aligned batch read: either already answered from the
 /// invocation's journal, or awaiting the engine at its coordinate.
-enum Slot {
+enum Slot<P: Projection> {
     /// The journal already answers this position.
-    Answered(Option<Bytes>),
+    Answered(Option<P::Payload>),
     /// The engine must read this coordinate.
     Pending(Coordinate),
 }
@@ -665,15 +588,18 @@ enum Slot {
 /// Fills every pending slot from the engine and returns the answers aligned to
 /// `slots` — the journal-aware batch read a write invocation performs, where
 /// only the journal-silent positions reach the engine. It reads them through
-/// [`read_coordinate_bytes`].
-async fn batched_bytes<S: StateSession>(
+/// [`read_coordinates`].
+async fn batched<S: StateSession, P: Projection>(
     session: &S,
     inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
     state_type: StateType,
     name: &StateName,
     section: Section,
-    slots: CellBuffer<Slot>,
-) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
+    slots: CellBuffer<Slot<P>>,
+) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
+where
+    S::Engine: sealed::Reads<S, P>,
+{
     let pending: CellBuffer<Coordinate> = slots
         .iter()
         .filter_map(|slot| match slot {
@@ -683,12 +609,13 @@ async fn batched_bytes<S: StateSession>(
         .collect();
     let expected = pending.len();
     let answers =
-        read_coordinate_bytes(session, inner, state_type, name, section, pending, expected).await?;
+        read_coordinates::<S, P>(session, inner, state_type, name, section, pending, expected)
+            .await?;
     let mut answers = answers.into_iter();
     Ok(slots
         .into_iter()
         .map(|slot| match slot {
-            Slot::Answered(bytes) => bytes,
+            Slot::Answered(payload) => payload,
             // The engine answers every batched position in order, so the
             // answers line up with the pending slots.
             Slot::Pending(_) => answers.next().flatten(),
@@ -696,28 +623,28 @@ async fn batched_bytes<S: StateSession>(
         .collect())
 }
 
-/// Reads visible committed bytes for typed entry reads.
-/// The result aligns with `keys` and does not decode values.
+/// Reads one projected answer per key in input order.
 ///
 /// # Errors
 ///
 /// An access error from the engine.
-pub(super) async fn read_keys_bytes<S, T>(
+pub(super) async fn read_keys<S, T, P: Projection>(
     session: &S,
     inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
     state_type: StateType,
     name: &StateName,
     section: Section,
     keys: &[KeyOf<T>],
-) -> Result<CellBuffer<Option<Bytes>>, StateAccessError>
+) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
 where
     S: StateSession,
+    S::Engine: sealed::Reads<S, P>,
     T: CellType,
 {
     // Mapped as a function item, so the lowering carries no closure whose
     // higher-ranked capture would defeat the future's `Send` proof.
     let coordinates = keys.iter().map(<T::Key as OrderedKeyCodec>::encode);
-    read_coordinate_bytes(
+    read_coordinates::<S, P>(
         session,
         inner,
         state_type,
@@ -729,43 +656,39 @@ where
     .await
 }
 
-/// Reads `coordinates` from the engine and returns the bytes, index-aligned to
-/// the input. `expected` is the coordinate count, known to every caller.
-///
-/// The read is split into maximal batches and the batches are issued
-/// **sequentially**: two repair-capable owner reads over one collection must
-/// not overlap.
-async fn read_coordinate_bytes<S, I>(
+/// Reads one projected answer per coordinate. `expected` is the input count.
+/// Batches run sequentially because owner reads can repair the same collection.
+pub(super) async fn read_coordinates<S, P: Projection>(
     session: &S,
     inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
     state_type: StateType,
     name: &StateName,
     section: Section,
-    coordinates: I,
+    coordinates: impl IntoIterator<Item = Coordinate>,
     expected: usize,
-) -> Result<CellBuffer<Option<Bytes>>, StateAccessError>
+) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
 where
     S: StateSession,
-    I: IntoIterator<Item = Coordinate>,
+    S::Engine: sealed::Reads<S, P>,
 {
-    let mut bytes: CellBuffer<Option<Bytes>> = SmallVec::with_capacity(expected);
+    let mut answers: CellBuffer<Option<P::Payload>> = SmallVec::with_capacity(expected);
     for batch in CoordinateBatch::chunks(coordinates) {
-        bytes.extend(
-            <S::Engine as sealed::ReadEngine<S>>::read_batch(
+        answers.extend(
+            <S::Engine as sealed::Reads<S, P>>::read_batch(
                 session, inner, state_type, name, section, &batch,
             )
             .await?,
         );
     }
     debug_assert_eq!(
-        bytes.len(),
+        answers.len(),
         expected,
         "batch read answers every input position"
     );
-    Ok(bytes)
+    Ok(answers)
 }
 
-/// [`read_keys_bytes`] plus the typed decode and resolution — the whole of a
+/// [`read_keys`] plus the typed decode and resolution — the whole of a
 /// journal-free batch get, performed under the invocation's admission.
 ///
 /// # Errors
@@ -785,6 +708,6 @@ where
     T: CellType,
     for<'s> ContextOf<'s, T>: FromSession<'s, S>,
 {
-    let bytes = read_keys_bytes::<S, T>(session, inner, state_type, name, section, keys).await?;
+    let bytes = read_keys::<S, T, Values>(session, inner, state_type, name, section, keys).await?;
     resolve_batch::<S, T>(session, bytes).await
 }

@@ -23,6 +23,7 @@ use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use color_eyre::Result;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// A no-op handler. The startup tests build a real consumer but deliver nothing
 /// to it.
@@ -39,6 +40,7 @@ pub(super) async fn initialize_with(
         KeyedStateConfiguration::builder().build()?,
         config,
         DEFAULT_IDEMPOTENCE_VERSION,
+        Duration::from_secs(30),
     )?;
     let state_provider = memory_state_provider::<JsonCodec>(
         &keyed_state,

@@ -38,19 +38,20 @@ use crate::Topic;
 use crate::codec::JsonCodec;
 use crate::state::cell_key::Direction;
 use crate::state::descriptor::{
-    DequeDescriptor, DequeHandle, DescriptorIdentity, MapDescriptor, MapHandle, SetDescriptor,
-    SetHandle, ValueDescriptor,
+    DequeDescriptor, DequeHandle, DescriptorIdentity, MapDescriptor, MapHandle, ValueDescriptor,
 };
 use crate::state::descriptor_identity::DurableDescriptorIdentity;
 use crate::state::identity::StateKey;
 use crate::state::order_codec::I64KeyCodec;
-use crate::state::tests::collection_suite::{DequeOp, KEY_POOL, MapOp, SetOp, Trace};
+use crate::state::tests::collection_suite::{DequeOp, KEY_POOL, MapOp, Trace};
+use crate::state::tests::support::reader_residue;
+use crate::state_reader::backend::ReaderBackend as CoreReaderBackend;
 use crate::state_reader::{PartitionCount, StateReader};
 use crate::subsystem::SubsystemName;
 use color_eyre::eyre::{Result, eyre};
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroUsize;
 
 /// The fixed routing coordinates one trace runs under. The owner writes
@@ -67,27 +68,6 @@ pub(crate) struct ReaderCase<'a> {
     pub(crate) key: &'a Key,
     /// The topic's partition count.
     pub(crate) count: PartitionCount,
-}
-
-/// A degenerate value mutation: overwrite with a JSON number. A Value has no
-/// removal, so `Set` is the only op a trace can generate. That is enough to
-/// check the committed round-trip: the reader either observes the last
-/// committed value, or `None` before the first commit.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum ValueOp {
-    /// Overwrite the committed value with `Value::from(b)`.
-    Set(u8),
-}
-
-impl Arbitrary for ValueOp {
-    fn arbitrary(g: &mut Gen) -> Self {
-        Self::Set(u8::arbitrary(g))
-    }
-
-    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        let Self::Set(b) = *self;
-        Box::new(b.shrink().map(Self::Set))
-    }
 }
 
 /// Publishes `descriptor`'s routing and freezes its identity so the reader
@@ -112,139 +92,12 @@ where
     source_state_key(case.topic, case.group, case.key, case.count)
 }
 
-/// Drives a Value trace: commit each event, mirror it into an `Option<Value>`
-/// model, and after every event assert `reader.get(key)` equals the model.
-///
-/// FALSIFICATION: perturb `ReadSession::collection_id_for` (session.rs) to bind
-/// the wrong partition/state-type → the point `get` reads an empty/foreign
-/// collection → mismatch on the first committed event.
-pub(super) async fn run_reader_value_trace<B: ReaderBackend>(
-    backend: &B,
-    descriptor: ValueDescriptor<JsonCodec>,
-    case: &ReaderCase<'_>,
-    trace: Trace<ValueOp>,
-) -> Result<bool> {
-    let registry = backend.registry();
-    let state_key = seed_source(backend, descriptor, case).await?;
-
-    let mut model: Option<Value> = None;
-    for (index, ops) in trace.events_ops().enumerate() {
-        let staged: Vec<ValueOp> = ops.to_vec();
-        let for_handle = staged.clone();
-        owner_commit_cell(
-            backend.owner_cell(),
-            &registry,
-            &state_key,
-            descriptor,
-            index as u128,
-            move |handle| async move {
-                for ValueOp::Set(b) in for_handle {
-                    handle
-                        .set(Value::from(b))
-                        .await
-                        .map_err(|e| eyre!("set: {e}"))?;
-                }
-                Ok(())
-            },
-        )
-        .await?;
-        for ValueOp::Set(b) in staged {
-            model = Some(Value::from(b));
-        }
-
-        let deps = backend.deps();
-        let reader = StateReader::new(&deps, case.sub.clone(), descriptor)?;
-        if reader.get(case.key.clone()).await? != model {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 /// The concrete Map handle the owner session binds.
 type OwnerMapHandle<B> =
     MapHandle<OwnerSession<<B as ReaderBackend>::OwnerCell>, I64KeyCodec, JsonCodec>;
 
 /// The concrete Deque handle the owner session binds.
 type OwnerDequeHandle<B> = DequeHandle<OwnerSession<<B as ReaderBackend>::OwnerCell>, JsonCodec>;
-
-type OwnerSetHandle<B> = SetHandle<OwnerSession<<B as ReaderBackend>::OwnerCell>, I64KeyCodec>;
-
-/// Drives committed set writes and checks every reader surface.
-pub(super) async fn run_reader_set_trace<B: ReaderBackend>(
-    backend: &B,
-    descriptor: SetDescriptor<I64KeyCodec>,
-    case: &ReaderCase<'_>,
-    trace: Trace<SetOp>,
-) -> Result<bool> {
-    let registry = backend.registry();
-    let state_key = seed_source(backend, descriptor, case).await?;
-    let mut model = BTreeSet::new();
-    for (index, ops) in trace.events_ops().enumerate() {
-        let staged = ops.to_vec();
-        let for_handle = staged.clone();
-        owner_commit_cell(
-            backend.owner_cell(),
-            &registry,
-            &state_key,
-            descriptor,
-            index as u128,
-            move |handle: OwnerSetHandle<B>| async move {
-                for op in for_handle {
-                    match op {
-                        SetOp::Insert(key) => handle
-                            .insert(key)
-                            .await
-                            .map_err(|error| eyre!("insert: {error}"))?,
-                        SetOp::Remove(key) => handle
-                            .remove(&key)
-                            .await
-                            .map_err(|error| eyre!("remove: {error}"))?,
-                        SetOp::Clear => handle
-                            .clear()
-                            .await
-                            .map_err(|error| eyre!("clear: {error}"))?,
-                        SetOp::Contains(_) | SetOp::IsEmpty | SetOp::Commit => {}
-                    }
-                }
-                Ok(())
-            },
-        )
-        .await?;
-        for op in staged {
-            match op {
-                SetOp::Insert(key) => {
-                    model.insert(key);
-                }
-                SetOp::Remove(key) => {
-                    model.remove(&key);
-                }
-                SetOp::Clear => model.clear(),
-                SetOp::Contains(_) | SetOp::IsEmpty | SetOp::Commit => {}
-            }
-        }
-        let deps = backend.deps();
-        let reader = StateReader::new(&deps, case.sub.clone(), descriptor)?;
-        if reader.is_empty(case.key.clone()).await? != model.is_empty() {
-            return Ok(false);
-        }
-        let expected = KEY_POOL.map(|member| model.contains(&member)).to_vec();
-        if reader.contains_many(case.key.clone(), &KEY_POOL).await? != expected {
-            return Ok(false);
-        }
-        let forward =
-            collect_stream(reader.keys(case.key.clone(), Direction::Forward).await?).await?;
-        if forward != model.iter().copied().collect::<Vec<_>>() {
-            return Ok(false);
-        }
-        let backward =
-            collect_stream(reader.keys(case.key.clone(), Direction::Backward).await?).await?;
-        if backward != model.iter().rev().copied().collect::<Vec<_>>() {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
 
 /// Applies one Map event's ops to the owner `handle` (ignoring the generators'
 /// mid-handler `Get`/`Commit`, which are no-ops for a committed read).
@@ -357,7 +210,36 @@ async fn assert_map<B: ReaderBackend>(
     .await?;
     let mut expect_backward = expect_forward;
     expect_backward.reverse();
-    Ok(backward == expect_backward)
+    if backward != expect_backward {
+        return Ok(false);
+    }
+    for (dir, expected) in [
+        (Direction::Forward, forward),
+        (Direction::Backward, backward),
+    ] {
+        let limit = NonZeroUsize::new(expected.len() / 2 + 1).unwrap_or(NonZeroUsize::MIN);
+        let entries = Box::pin(collect_stream(
+            reader
+                .query(case.key.clone(), dir)
+                .limit(limit)
+                .entries()
+                .await?,
+        ))
+        .await?;
+        let keys = Box::pin(collect_stream(
+            reader
+                .query(case.key.clone(), dir)
+                .limit(limit)
+                .keys()
+                .await?,
+        ))
+        .await?;
+        let expected: Vec<_> = expected.into_iter().take(limit.get()).collect();
+        if entries != expected || keys != expected.iter().map(|(key, _)| *key).collect::<Vec<_>>() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Drives a Map trace: commit each event's `Set`/`Remove`/`Clear`, mirror into
@@ -559,3 +441,10 @@ pub(super) async fn run_reader_deque_trace<B: ReaderBackend>(
     }
     Ok(true)
 }
+
+mod set;
+pub(super) use set::run_reader_set_trace;
+
+mod value;
+pub(crate) use value::ValueOp;
+pub(super) use value::run_reader_value_trace;

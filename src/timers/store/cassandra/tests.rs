@@ -13,6 +13,7 @@ use super::{CassandraTriggerStore, cassandra_store};
 use super::{InlineTimer, TimerState};
 use crate::Key;
 use crate::cassandra::CassandraStore;
+use crate::test_util::TEST_RUNTIME;
 use crate::test_util::{integration_test_count, sampled_remote_context, test_cassandra_config};
 use crate::timers::TimerType;
 use crate::timers::Trigger;
@@ -38,7 +39,7 @@ use uuid::Uuid;
 
 /// Creates a test store and segment, returning `(store, segment_id)`.
 async fn setup_test_store(name: &str) -> Result<(CassandraTriggerStore, SegmentId)> {
-    setup_test_store_with_version(name, SegmentVersion::V3).await
+    setup_test_store_with_version(name, SegmentVersion::V4).await
 }
 
 /// Creates a test store and segment with the given version, returning `(store,
@@ -80,6 +81,50 @@ trigger_store_tests!(
     },
     integration_test_count(25)
 );
+
+/// Acquisition stamps V4 durably and rejects an unknown future layout.
+#[test]
+fn prop_segment_layout_fence() {
+    async fn run(slab_size: u16) -> Result<bool> {
+        use crate::error::{ClassifyError, ErrorCategory};
+        let (store, id) = setup_test_store_with_version("layout-fence", SegmentVersion::V3).await?;
+        let slab_size = CompactDuration::new(u32::from(slab_size).max(1));
+        store
+            .update_segment_version(SegmentVersion::V3, slab_size)
+            .await?;
+        let acquired = store
+            .get_segment()
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("segment missing"))?;
+        assert_eq!(acquired.version, SegmentVersion::V4);
+        let durable = store
+            .get_segment_unchecked(&id)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("segment missing"))?;
+        assert_eq!(durable.version, SegmentVersion::V4);
+        store
+            .session()
+            .execute_unpaged(
+                &store.queries().update_segment_version,
+                (5_i8, store.segment.slab_size, id),
+            )
+            .await?;
+        let error = store
+            .get_segment()
+            .await
+            .err()
+            .ok_or_else(|| color_eyre::eyre::eyre!("future layout was accepted"))?;
+        assert_eq!(error.classify_error(), ErrorCategory::Terminal);
+        store.delete_segment().await?;
+        Ok(true)
+    }
+    fn property(size: u16) -> Result<bool> {
+        TEST_RUNTIME.block_on(run(size))
+    }
+    quickcheck::QuickCheck::new()
+        .tests(integration_test_count(25))
+        .quickcheck(property as fn(u16) -> Result<bool>);
+}
 
 #[tokio::test]
 async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
@@ -410,12 +455,7 @@ async fn test_state_transitions_schedule_promote_demote() -> Result<()> {
 /// Regression: `Inline→Overflow` promotion must preserve the old timer's
 /// tag, and the tag must survive a subsequent `Overflow→Inline` demotion.
 ///
-/// The commit oracle classifies a WAL entry by comparing its tag against
-/// the live row's tag. If promotion zeroes the old tag, `current_tag` will
-/// return `0` for a still-pending timer — the oracle reads "tag mismatch"
-/// and (incorrectly) concludes the timer was committed-and-rescheduled.
-/// Demotion then bakes the wrong tag back into Inline state, making the
-/// loss permanent.
+/// A transition from Inline to Overflow preserves each stored attempt identity.
 #[tokio::test]
 async fn test_promote_preserves_tag() -> Result<()> {
     use crate::timers::store::TriggerStore;
@@ -434,7 +474,10 @@ async fn test_promote_preserves_tag() -> Result<()> {
     let tag1 = trigger1.tag;
     store.add_trigger(trigger1).await?;
     assert_eq!(
-        store.current_tag(&key, t1, tt).await?,
+        store
+            .current_trigger(&key, t1, tt)
+            .await?
+            .map(|trigger| trigger.tag),
         Some(tag1),
         "tag1 must be queryable while Inline"
     );
@@ -447,12 +490,18 @@ async fn test_promote_preserves_tag() -> Result<()> {
     store.add_trigger(trigger2).await?;
 
     assert_eq!(
-        store.current_tag(&key, t1, tt).await?,
+        store
+            .current_trigger(&key, t1, tt)
+            .await?
+            .map(|trigger| trigger.tag),
         Some(tag1),
         "promotion must preserve tag1 in the clustering row"
     );
     assert_eq!(
-        store.current_tag(&key, t2, tt).await?,
+        store
+            .current_trigger(&key, t2, tt)
+            .await?
+            .map(|trigger| trigger.tag),
         Some(tag2),
         "new clustering row must carry tag2"
     );
@@ -462,7 +511,10 @@ async fn test_promote_preserves_tag() -> Result<()> {
     // permanently stamped into Inline.
     store.remove_trigger(&key, t2, tt).await?;
     assert_eq!(
-        store.current_tag(&key, t1, tt).await?,
+        store
+            .current_trigger(&key, t1, tt)
+            .await?
+            .map(|trigger| trigger.tag),
         Some(tag1),
         "demotion must round-trip tag1 from clustering row back to Inline state"
     );
@@ -969,19 +1021,19 @@ async fn test_inline_state_round_trip() -> Result<()> {
     Ok(())
 }
 
-/// Regression test: `current_tag` must return the correct tag for Inline
+/// Regression test: `current_trigger` must return the correct tag for Inline
 /// timers (single trigger stored in `state` static column).
 ///
 /// The quickcheck property test found that after `upsert_key_trigger` (which
-/// stores the trigger as Inline in the `state` column), `current_tag` returned
-/// `None` (only checked clustering rows). This test pins the fix: Inline
-/// triggers must be queryable via `current_tag`.
+/// stores the trigger as Inline in the `state` column), `current_trigger`
+/// returned `None` (only checked clustering rows). This test pins the fix:
+/// Inline triggers must be queryable via `current_trigger`.
 #[tokio::test]
-async fn test_current_tag_inline_trigger() -> Result<()> {
+async fn test_current_trigger_inline_trigger() -> Result<()> {
     use crate::timers::store::TriggerStore;
     use crate::timers::store::adapter::TableAdapter;
     init_test_logging();
-    let (store, _segment_id) = setup_test_store("current_tag_inline").await?;
+    let (store, _segment_id) = setup_test_store("current_trigger_inline").await?;
     let store = TableAdapter::new(store);
 
     let key: Key = format!("tag-inline-{}", Uuid::new_v4()).into();
@@ -993,22 +1045,36 @@ async fn test_current_tag_inline_trigger() -> Result<()> {
     // add_trigger produces an Inline state (first trigger for this key/type).
     store.add_trigger(trigger).await?;
 
-    // current_tag must return Some(expected_tag), not None.
-    let actual_tag = store.current_tag(&key, time, timer_type).await?;
+    // current_trigger must return Some(expected_tag), not None.
+    let actual_tag = store
+        .current_trigger(&key, time, timer_type)
+        .await?
+        .map(|trigger| trigger.tag);
     assert_eq!(
         actual_tag,
         Some(expected_tag),
-        "current_tag must return the tag for an Inline trigger"
+        "current_trigger must return the tag for an Inline trigger"
     );
 
-    // update_tag must update the tag even in Inline mode.
+    // A replacement writes its identity to both indexes.
     let new_tag = expected_tag.wrapping_add(1);
-    store.update_tag(&key, time, timer_type, new_tag).await?;
-    let updated = store.current_tag(&key, time, timer_type).await?;
+    store
+        .add_trigger(Trigger::with_tag(
+            key.clone(),
+            time,
+            timer_type,
+            new_tag,
+            tracing::Span::current(),
+        ))
+        .await?;
+    let updated = store
+        .current_trigger(&key, time, timer_type)
+        .await?
+        .map(|trigger| trigger.tag);
     assert_eq!(
         updated,
         Some(new_tag),
-        "update_tag must rotate the tag for an Inline trigger"
+        "replacement must update the Inline trigger"
     );
 
     let all_type_triggers: Vec<Trigger> = store
@@ -1034,7 +1100,7 @@ async fn test_current_tag_inline_trigger() -> Result<()> {
     assert_eq!(
         slab_tag,
         Some(new_tag),
-        "update_tag must rotate the tag in the slab index"
+        "replacement must update the slab index"
     );
 
     store.remove_trigger(&key, time, timer_type).await?;
@@ -1148,7 +1214,6 @@ async fn test_key_triggers_all_types_preserves_inline_tags() -> Result<()> {
 /// `(key, timer_type)` combination against the reference model.
 #[test]
 fn test_prop_timer_state_invariant() {
-    use crate::test_util::TEST_RUNTIME;
     use quickcheck::{QuickCheck, TestResult};
     use tracing::Instrument;
 
@@ -1255,57 +1320,44 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
     Ok(())
 }
 
-/// The keyed-state commit oracle reads timer tags through a **clone of the
-/// partition's writing store** (handle passing at partition acquisition —
-/// see `StateBackendFactory::for_partition`). `current_tag` is cache-first,
-/// so the answer must still flip when a mutation lands through the writer:
-/// the clone shares the writer's `state_cache`. Each consult here first
-/// warms the cache, then the writer mutates, and the next consult must
-/// observe the mutation — an answer pinned by the warmed cache would roll a
-/// committed write back (or resurrect an uncommitted one).
+/// A warm current-trigger read observes later mutations through the same store.
 #[tokio::test]
-async fn oracle_reads_through_the_writers_store() -> Result<()> {
+async fn current_trigger_observes_writer_mutations() -> Result<()> {
     use super::CassandraTriggerStoreProvider;
-    use crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStore;
-    use crate::state::commit::{CommitManager, StoreTagSource};
+
     use crate::timers::store::{TriggerStore, TriggerStoreProvider};
     init_test_logging();
 
     let config = test_cassandra_config();
     let base = CassandraStore::new(&config).await?;
     let provider = CassandraTriggerStoreProvider::with_store(base, &config.keyspace).await?;
-    let segment = test_segment("oracle_writer_handle", 60_u32);
+    let segment = test_segment("writer_handle", 60_u32);
     let writer = provider.create_store(segment);
-    let oracle = CommitManager::new(
-        MemoryDeduplicationStore::new(),
-        StoreTagSource(writer.clone()),
-    );
 
-    let key: Key = format!("oracle-writer-{}", Uuid::new_v4()).into();
+    let key: Key = format!("writer-{}", Uuid::new_v4()).into();
     let timer_type = TimerType::Application;
     let time = CompactDateTime::from(1_500_000u32);
     let trigger = Trigger::new(key.clone(), time, timer_type, tracing::Span::current());
-    let wal_tag = trigger.tag;
+    let first_tag = trigger.tag;
 
-    // Stage → crash: the trigger row stands. Recovery's first-touch consult
-    // observes it (NotCommitted → the event refires) and warms the cache.
     writer.add_trigger(trigger).await?;
     assert!(
-        !oracle
-            .is_timer_committed(&key, timer_type, time, wal_tag)
-            .await?,
-        "standing trigger row must read NotCommitted"
+        writer
+            .current_trigger(&key, time, timer_type)
+            .await?
+            .map(|trigger| trigger.tag)
+            == Some(first_tag),
+        "current trigger must preserve the first identity"
     );
 
-    // The refired event commits the trigger through the partition's store
-    // (row removed). The sweep's consult must observe the commit even though
-    // the previous consult warmed the cache.
     writer.remove_trigger(&key, time, timer_type).await?;
     assert!(
-        oracle
-            .is_timer_committed(&key, timer_type, time, wal_tag)
-            .await?,
-        "commit through the writer must flip the warmed oracle to committed"
+        (writer
+            .current_trigger(&key, time, timer_type)
+            .await?
+            .map(|trigger| trigger.tag)
+            != Some(first_tag)),
+        "removal must invalidate the cached trigger"
     );
 
     // Reverse flip: a consult that observed (and cached) absence must see a
@@ -1313,24 +1365,28 @@ async fn oracle_reads_through_the_writers_store() -> Result<()> {
     let second = Trigger::new(key.clone(), time, timer_type, tracing::Span::current());
     let second_tag = second.tag;
     assert!(
-        oracle
-            .is_timer_committed(&key, timer_type, time, second_tag)
-            .await?,
-        "absent row reads committed before the reschedule"
+        (writer
+            .current_trigger(&key, time, timer_type)
+            .await?
+            .map(|trigger| trigger.tag)
+            != Some(second_tag)),
+        "row must remain absent before the next schedule"
     );
     writer.add_trigger(second).await?;
     assert!(
-        !oracle
-            .is_timer_committed(&key, timer_type, time, second_tag)
-            .await?,
-        "schedule through the writer must read NotCommitted"
+        writer
+            .current_trigger(&key, time, timer_type)
+            .await?
+            .map(|trigger| trigger.tag)
+            == Some(second_tag),
+        "current trigger must preserve the replacement identity"
     );
 
     writer.remove_trigger(&key, time, timer_type).await?;
     Ok(())
 }
 
-/// Asserts `current_tag` matches `expected_tags` for every entry on the
+/// Asserts `current_trigger` matches `expected_tags` for every entry on the
 /// given `(key, timer_type)`. Used by the property test to catch any
 /// write path that drops or rewrites a tag.
 async fn verify_tags_for_key_type(
@@ -1343,11 +1399,14 @@ async fn verify_tags_for_key_type(
         if k != key || *tt != timer_type {
             continue;
         }
-        let observed = store.current_tag(key, *time, timer_type).await?;
+        let observed = store
+            .current_trigger(key, *time, timer_type)
+            .await?
+            .map(|trigger| trigger.tag);
         assert_eq!(
             observed,
             Some(*expected_tag),
-            "current_tag mismatch: key={key:?} time={time:?} type={timer_type:?} expected \
+            "current_trigger mismatch: key={key:?} time={time:?} type={timer_type:?} expected \
              Some({expected_tag}) got {observed:?}",
         );
     }
@@ -1435,9 +1494,12 @@ async fn snapshot_tag(
     time: CompactDateTime,
 ) -> Result<()> {
     let tag = store
-        .current_tag(key, time, timer_type)
+        .current_trigger(key, time, timer_type)
         .await?
-        .ok_or_else(|| color_eyre::eyre::eyre!("current_tag returned None right after write"))?;
+        .map(|trigger| trigger.tag)
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!("current_trigger returned None right after write")
+        })?;
     expected_tags.insert((key.clone(), timer_type, time), tag);
     Ok(())
 }

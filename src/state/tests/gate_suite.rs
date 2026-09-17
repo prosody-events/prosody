@@ -24,7 +24,6 @@ use super::super::descriptor::{
     CellStateError, MapStateError, StateDescriptor, deque, deque_state, map, map_state, value_state,
 };
 use super::super::dirty::DirtyStore;
-use super::super::manager::ArmedKeys;
 use super::super::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use super::super::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use super::super::registry::{CollectionDef, CollectionDefRegistry};
@@ -35,13 +34,15 @@ use super::super::{
     CollectionId, CollectionRef, Direction, PartitionBackend, StateAccessError, StateKey,
     StateName, StateType, StoreOutcome,
 };
-use super::cell_suite::{ScriptedOracle, value_cell};
+use super::cell_suite::{MemoryDeduplicationStore, value_cell};
 use super::collection_suite::finalize_and_promote;
 use super::support::{CountingCellStore, HoldingCellStore, Holds, probe};
 use crate::codec::{JsonCodec, JsonCodecError};
 use crate::consumer::middleware::RepinProof;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
+use crate::state::cell::Values;
+use crate::state::store::CellRead;
 
 use super::super::fjall::test_db;
 use crate::timers::duration::CompactDuration;
@@ -62,14 +63,11 @@ use uuid::Uuid;
 /// The hang-guard for acquisitions that must proceed — never the assertion.
 const HANG_GUARD: Duration = Duration::from_secs(30);
 
-/// The `*_stream_error_yield_releases_the_gate` pins seed exactly two items and
-/// assert the first yielded item is the `Err` — chunk-atomicity, which requires
-/// both items to land in one point-get chunk. At `CELL_BATCH == 1` each key
-/// is its own chunk, the valid entry's `Ok` surfaces first, and the pins would
-/// go red on correct code; enforce the premise so breaking it is uncompilable.
+/// The stream error tests put a valid item before a corrupt item in one chunk.
+/// A failing chunk yields only its error. Both items must fit in one chunk.
 const _: () = assert!(
-    CELL_BATCH >= 2,
-    "the *_stream_error_yield pins need two items in one chunk to prove chunk-atomicity"
+    CELL_BATCH.get() >= 2,
+    "the stream error tests require two items in one chunk"
 );
 
 /// Yields until a just-spawned task has reached its park point (the gate
@@ -82,29 +80,32 @@ async fn let_task_park() {
 }
 
 /// The gate suite's lower store: holds beneath counters beneath memory.
-type GateStore = HoldingCellStore<CountingCellStore<MemoryCellStore<ScriptedOracle>>>;
+type GateStore = HoldingCellStore<CountingCellStore<MemoryCellStore>>;
 
 /// The per-partition backend the gate-suite sessions run over.
-type GateBackend =
-    PartitionBackend<ScriptedOracle, MemoryDescriptorIdentityStore, Cached<GateStore>>;
+type GateBackend = PartitionBackend<
+    MemoryDeduplicationStore,
+    MemoryDescriptorIdentityStore,
+    Cached<GateStore>,
+    (),
+>;
 
 /// One test's fixture: the composed cache, its seams, and session minting.
 struct GateFixture {
     cached: Cached<GateStore>,
-    counting: CountingCellStore<MemoryCellStore<ScriptedOracle>>,
+    counting: CountingCellStore<MemoryCellStore>,
     holds: Arc<Holds>,
     cells: MemoryCells,
-    oracle: ScriptedOracle,
+    dedup: MemoryDeduplicationStore,
     registry: Arc<CollectionDefRegistry>,
     state_key: StateKey,
-    armed: ArmedKeys,
 }
 
 impl GateFixture {
     /// Builds the fixture over the shared fjall database keyspace `name`,
     /// registering the suite's value/map/deque collections.
     fn new(name: &str) -> Result<Self> {
-        let oracle = ScriptedOracle::default();
+        let dedup = MemoryDeduplicationStore::default();
         let cells = MemoryCells::new();
         let mut registry = CollectionDefRegistry::default();
         registry.register(&value_state::<JsonCodec>("v"), CollectionDef::new(None))?;
@@ -121,11 +122,7 @@ impl GateFixture {
             },
         )?;
         let registry = Arc::new(registry);
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            cells.clone(),
-            oracle.clone(),
-            registry.clone(),
-        ));
+        let counting = CountingCellStore::new(MemoryCellStore::new(cells.clone()));
         let holding = HoldingCellStore::new(counting.clone());
         let holds = holding.holds();
         let cached = Cached::new(test_db::cache(name)?, holding);
@@ -134,10 +131,9 @@ impl GateFixture {
             counting,
             holds,
             cells,
-            oracle,
+            dedup,
             registry,
             state_key: StateKey::new(Uuid::new_v4(), Arc::from("key")),
-            armed: Arc::default(),
         })
     }
 
@@ -159,13 +155,13 @@ impl GateFixture {
         KeyedStateSession::new(SessionParts::<GateBackend, _> {
             cell: self.cached.clone(),
             dirty,
-            oracle: self.oracle.clone(),
+            dedup: self.dedup.clone(),
             loader: MemoryLoader::new(),
             registry: self.registry.clone(),
             state_key: self.state_key.clone(),
             event: probe(n),
-            recovery_delay: CompactDuration::new(30),
-            armed: self.armed.clone(),
+            dedup_ttl: CompactDuration::new(30),
+            checks: (),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
         })
     }
@@ -218,12 +214,12 @@ fn gate_serializes_fill_against_commit() -> Result<()> {
             .map_err(|e| eyre!("bind: {e}"))?;
 
         // Suspend the fill after its lower read, before its publish.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let get_task = tokio::spawn({
             let handle = handle.clone();
             async move { handle.get().await }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("the fill never reached its hold"))?;
 
@@ -237,7 +233,7 @@ fn gate_serializes_fill_against_commit() -> Result<()> {
             }
         });
         let_task_park().await;
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
 
         let got = timeout(HANG_GUARD, get_task)
             .await
@@ -322,7 +318,7 @@ fn gate_serializes_set_against_commit_drain() -> Result<()> {
         // buffered after the drain, not swallowed by it.
         finalize_and_promote(
             &session,
-            &fx.oracle,
+            &fx.dedup,
             Uuid::from_u128(1),
             &fx.cells,
             &fx.id("m")?,
@@ -402,12 +398,12 @@ fn gate_serializes_set_against_clear() -> Result<()> {
         // set(1) parks at its cold keyset read (a held lower read) while HOLDING
         // the gate. 1 is already tracked, so once it resumes its only write is
         // the entry.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let set_task = tokio::spawn({
             let handle = handle.clone();
             async move { handle.set(1, Value::from(99_i64)).await }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("the set never reached its hold"))?;
 
@@ -418,7 +414,7 @@ fn gate_serializes_set_against_clear() -> Result<()> {
         futures::pin_mut!(clear);
         let first_clear_poll = futures::poll!(clear.as_mut());
 
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
         timeout(HANG_GUARD, set_task)
             .await
             .map_err(|_| eyre!("set hung"))??
@@ -434,16 +430,15 @@ fn gate_serializes_set_against_clear() -> Result<()> {
         // Settle, then probe the physical state: no live entry may survive with
         // an absent keyset. With the gate the outcome is set-then-clear (empty);
         // the injected race strands entry 1 with a cleared keyset.
-        finalize_and_promote(&session, &fx.oracle, Uuid::from_u128(1), &fx.cells, &id).await?;
+        finalize_and_promote(&session, &fx.dedup, Uuid::from_u128(1), &fx.cells, &id).await?;
         let verify = fx.session(2);
         let fresh = map_state::<I64KeyCodec, JsonCodec>("m")
             .bind(&verify)
             .map_err(|e| eyre!("bind: {e}"))?;
         let entry = fresh.get(&1).await.map_err(|e| eyre!("{e}"))?;
-        let keyset = fx
-            .counting
-            .get(&id, &map::keyset_cell(), probe(99))
+        let keyset = CellRead::<Values>::read(&fx.counting, &id, &map::keyset_cell())
             .await?
+            .0
             .into_inner();
         assert!(
             entry.is_none() || keyset.is_some(),
@@ -473,12 +468,12 @@ fn gate_serializes_racing_keyset_rmw() -> Result<()> {
 
         // set(1) parks at its keyset read while holding the gate; set(9) parks
         // on the gate behind it.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let first = tokio::spawn({
             let handle = handle.clone();
             async move { handle.set(1, Value::from(1_i64)).await }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("set(1) never reached its hold"))?;
         let second = tokio::spawn({
@@ -486,7 +481,7 @@ fn gate_serializes_racing_keyset_rmw() -> Result<()> {
             async move { handle.set(9, Value::from(9_i64)).await }
         });
         let_task_park().await;
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
         timeout(HANG_GUARD, first)
             .await
             .map_err(|_| eyre!("set(1) hung"))??
@@ -498,7 +493,7 @@ fn gate_serializes_racing_keyset_rmw() -> Result<()> {
 
         finalize_and_promote(
             &session,
-            &fx.oracle,
+            &fx.dedup,
             Uuid::from_u128(1),
             &fx.cells,
             &fx.id("m")?,
@@ -525,10 +520,9 @@ fn gate_serializes_racing_keyset_rmw() -> Result<()> {
 
         // The keyset is the UNION {1, 9}, not a last-wins singleton.
         let id = fx.id("m")?;
-        let keyset = fx
-            .counting
-            .get(&id, &map::keyset_cell(), probe(99))
+        let keyset = CellRead::<Values>::read(&fx.counting, &id, &map::keyset_cell())
             .await?
+            .0
             .into_inner()
             .ok_or_else(|| eyre!("missing keyset cell"))?;
         assert_eq!(
@@ -602,12 +596,12 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
 
         // set(3) parks in its cold meta read while holding the gate; set(4)
         // parks on the gate behind it.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let first = tokio::spawn({
             let handle = handle.clone();
             async move { handle.set(3, Value::from(3_i64)).await }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("set(3) never reached its hold"))?;
         let second = tokio::spawn({
@@ -615,7 +609,7 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
             async move { handle.set(4, Value::from(4_i64)).await }
         });
         let_task_park().await;
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
         timeout(HANG_GUARD, first)
             .await
             .map_err(|_| eyre!("set(3) hung"))??
@@ -625,13 +619,12 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
             .map_err(|_| eyre!("set(4) hung"))??
             .map_err(|e| eyre!("set(4): {e}"))?;
 
-        finalize_and_promote(&session, &fx.oracle, Uuid::from_u128(1), &fx.cells, &id).await?;
+        finalize_and_promote(&session, &fx.dedup, Uuid::from_u128(1), &fx.cells, &id).await?;
 
         // The serial second set exceeds the limit → Overflowed.
-        let keyset = fx
-            .counting
-            .get(&id, &map::keyset_cell(), probe(99))
+        let keyset = CellRead::<Values>::read(&fx.counting, &id, &map::keyset_cell())
             .await?
+            .0
             .into_inner()
             .ok_or_else(|| eyre!("missing keyset cell"))?;
         assert_eq!(
@@ -695,7 +688,7 @@ fn map_keyset_rotating_stays_tracked() -> Result<()> {
                 .set(step, Value::from(step))
                 .await
                 .map_err(|e| eyre!("{e}"))?;
-            finalize_and_promote(&session, &fx.oracle, event, &fx.cells, &id).await?;
+            finalize_and_promote(&session, &fx.dedup, event, &fx.cells, &id).await?;
         }
 
         // A fresh stream over the live window {3,4,5} takes the Tracked arm.
@@ -771,7 +764,7 @@ fn map_keyset_removal_heals_oversized() -> Result<()> {
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
         handle.remove(&1).await.map_err(|e| eyre!("{e}"))?;
         handle.remove(&2).await.map_err(|e| eyre!("{e}"))?;
-        finalize_and_promote(&session, &fx.oracle, Uuid::from_u128(2), &fx.cells, &id).await?;
+        finalize_and_promote(&session, &fx.dedup, Uuid::from_u128(2), &fx.cells, &id).await?;
 
         // The healed frame ({3,4,5}) takes the point-get arm — no scan.
         fx.counting.reset();
@@ -884,7 +877,7 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
 
         // The stream's FIRST cold read is the keyset cell — park it there,
         // holding the gate.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let stream_task = tokio::spawn({
             let handle = handle.clone();
             async move {
@@ -897,7 +890,7 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
                 Ok::<_, MapStateError<JsonCodecError>>(out)
             }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("the stream never reached its keyset hold"))?;
 
@@ -907,7 +900,7 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
             async move { handle.set(1, Value::from(99_i64)).await }
         });
         let_task_park().await;
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
 
         let yielded = timeout(HANG_GUARD, stream_task)
             .await
@@ -946,9 +939,9 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
 #[test]
 fn map_get_many_holds_gate_across_sub_batches() -> Result<()> {
     /// Two sub-batches: the first full `CELL_BATCH` chunk, then the remainder.
-    const N: i64 = CELL_BATCH as i64 + 2;
+    const N: i64 = CELL_BATCH.get() as i64 + 2;
     /// First key of sub-batch 2 — the one the concurrent set targets.
-    const TARGET: i64 = CELL_BATCH as i64;
+    const TARGET: i64 = CELL_BATCH.get() as i64;
 
     runtime()?.block_on(async {
         let fx = GateFixture::new("gate_get_many_isolation")?;
@@ -972,13 +965,13 @@ fn map_get_many_holds_gate_across_sub_batches() -> Result<()> {
 
         // Park get_many in sub-batch 1's cold cache-fill (its first lower read),
         // holding the gate.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let reader = tokio::spawn({
             let map = map.clone();
             let keys = keys.clone();
             async move { Box::pin(map.get_many(&keys)).await }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("get_many never reached the sub-batch-1 hold"))?;
 
@@ -990,7 +983,7 @@ fn map_get_many_holds_gate_across_sub_batches() -> Result<()> {
         let_task_park().await;
 
         // Release the hold; correct code keeps the gate across the boundary.
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
         let out = timeout(HANG_GUARD, reader)
             .await
             .map_err(|_| eyre!("get_many hung"))??
@@ -1088,18 +1081,18 @@ async fn parked_set(name: &str, terminate: bool) -> Result<ParkedSet> {
 
     // Park in the keyset read's cold cache-fill: past the read's liveness
     // guard, holding write admission, with both stages still ahead.
-    fx.holds.get_for_cache().arm(1);
+    fx.holds.read().arm(1);
     let writer = tokio::spawn({
         let map = map.clone();
         async move { map.set(9, Value::from(9_i64)).await }
     });
-    timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+    timeout(HANG_GUARD, fx.holds.read().entered())
         .await
         .map_err(|_| eyre!("the set never reached the keyset-read hold"))?;
     if terminate {
         session.terminate();
     }
-    fx.holds.get_for_cache().release();
+    fx.holds.read().release();
     let outcome = timeout(HANG_GUARD, writer)
         .await
         .map_err(|_| eyre!("the set hung"))??;
@@ -1123,13 +1116,10 @@ async fn parked_set(name: &str, terminate: bool) -> Result<ParkedSet> {
 /// forwarding loop's `chunk?` yields the `Err`, so the gate is released before
 /// the `Err` reaches user code.
 ///
-/// This pin **also pins chunk-atomicity**: a valid lower-sorting entry (key 3)
-/// precedes the corrupt key (7) in the same chunk, so prefix-yield semantics
-/// would surface key 3's `Ok` first and fail `first.is_err()`. Two red
-/// recipes: (i) chunk-atomicity — make the chunk yield per-item instead of
-/// collecting; (ii) gate-release — hold the permit across the yield by
-/// returning it in the unfold state (`Some((chunk, permit, keys))`) so the
-/// follow-up `get` hangs.
+/// A failing chunk yields none of its items. Valid key 3 precedes corrupt
+/// key 7 in one chunk. If the chunk emits items before projection completes,
+/// key 3 appears first and fails `first.is_err()`. If the stream holds the
+/// permit across the error yield, the next `get` cannot acquire the gate.
 #[test]
 fn map_stream_error_yield_releases_the_gate() -> Result<()> {
     runtime()?.block_on(async {
@@ -1137,10 +1127,8 @@ fn map_stream_error_yield_releases_the_gate() -> Result<()> {
         let id = fx.id("m")?;
         let cref = CollectionRef::new(id.clone(), None);
 
-        // Seed a two-key `Tracked` keyset: a valid lower-sorting entry (3) ahead
-        // of the corrupt entry (7) in the same chunk, so a chunk-atomic error
-        // surfaces the corrupt key's `Err` first (prefix-yield would leak 3's
-        // `Ok`), and the corrupt bytes fail to decode under the chunk permit.
+        // Valid key 3 precedes corrupt key 7 in the same tracked chunk.
+        // The chunk must emit only the error from key 7.
         let valid = 3_i64;
         let corrupt = 7_i64;
         fx.counting
@@ -1171,16 +1159,14 @@ fn map_stream_error_yield_releases_the_gate() -> Result<()> {
 
         let stream = handle.stream(Direction::Forward);
         futures::pin_mut!(stream);
-        // Both keys land in one chunk; the chunk-atomic collect short-circuits
-        // at the corrupt key, so the FIRST yielded item is the `Err` — key 3's
-        // `Ok` is never surfaced.
+        // Projection fails at key 7 before the chunk emits any item.
         let first = stream
             .next()
             .await
             .ok_or_else(|| eyre!("the stream ended without yielding the decode error"))?;
         assert!(
             first.is_err(),
-            "the corrupt entry must surface as the first (chunk-atomic) Err item, not key 3's Ok"
+            "the failing chunk must emit only the error from key 7"
         );
 
         // The stream is still alive (held in scope, not dropped). A follow-up op
@@ -1206,9 +1192,9 @@ fn map_stream_error_yield_releases_the_gate() -> Result<()> {
 /// whose element holds undecodable bytes yields `Err` and MUST release the gate
 /// before the yield. Same mechanism (corrupt bytes fetch AND fail to decode
 /// under the chunk permit, which dies with the chunk future before `chunk?`
-/// yields the `Err`), and — with index 0 valid ahead of the corrupt index 1 in
-/// one chunk — it likewise pins chunk-atomicity: prefix-yield would surface
-/// index 0's `Ok` first. Same reds, on the structural twin.
+/// yields the `Err`). Valid index 0 precedes corrupt index 1 in one chunk.
+/// A failing chunk yields none of its items. If index 0 appears first, the
+/// assertion fails.
 #[test]
 fn deque_stream_error_yield_releases_the_gate() -> Result<()> {
     runtime()?.block_on(async {
@@ -1216,10 +1202,8 @@ fn deque_stream_error_yield_releases_the_gate() -> Result<()> {
         let id = fx.id("d")?;
         let dref = CollectionRef::new(id.clone(), None);
 
-        // Seed a two-element window `[0, 2)`: index 0 valid, index 1 corrupt, so
-        // a chunk-atomic error surfaces index 1's `Err` first (prefix-yield
-        // would leak index 0's `Ok`), and the corrupt bytes fail to decode under
-        // the chunk permit.
+        // Valid index 0 precedes corrupt index 1 in the same chunk.
+        // The chunk must emit only the error from index 1.
         fx.counting
             .write_resolved(
                 &dref,
@@ -1248,17 +1232,14 @@ fn deque_stream_error_yield_releases_the_gate() -> Result<()> {
 
         let stream = handle.stream(Direction::Forward);
         futures::pin_mut!(stream);
-        // Both indices land in one chunk; the chunk-atomic collect short-circuits
-        // at index 1, so the FIRST yielded item is the `Err` — index 0's `Ok` is
-        // never surfaced.
+        // Projection fails at index 1 before the chunk emits any item.
         let first = stream
             .next()
             .await
             .ok_or_else(|| eyre!("the stream ended without yielding the decode error"))?;
         assert!(
             first.is_err(),
-            "the corrupt element must surface as the first (chunk-atomic) Err item, not index 0's \
-             Ok"
+            "the failing chunk must emit only the error from index 1"
         );
 
         // The stream is still alive: a follow-up op must not be starved.
@@ -1290,12 +1271,12 @@ fn dropped_session_op_releases_the_gate() -> Result<()> {
             .map_err(|e| eyre!("bind: {e}"))?;
 
         // Drop a HOLDING op: a get parked in its withheld fill, gate held.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let holding = tokio::spawn({
             let handle = handle.clone();
             async move { handle.get().await }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("the holding op never reached its hold"))?;
         holding.abort();
@@ -1318,12 +1299,12 @@ fn dropped_session_op_releases_the_gate() -> Result<()> {
         let map = map_state::<I64KeyCodec, JsonCodec>("m")
             .bind(&session)
             .map_err(|e| eyre!("bind: {e}"))?;
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let holding = tokio::spawn({
             let map = map.clone();
             async move { map.get(&42).await }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("the second holding op never reached its hold"))?;
         let queued = tokio::spawn({
@@ -1333,7 +1314,7 @@ fn dropped_session_op_releases_the_gate() -> Result<()> {
         let_task_park().await;
         queued.abort();
         assert!(queued.await.is_err(), "the queued op was dropped");
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
         timeout(HANG_GUARD, holding)
             .await
             .map_err(|_| eyre!("the holding op hung"))??
@@ -1386,7 +1367,7 @@ fn dropped_stream_chunk_fetch_releases_the_gate() -> Result<()> {
 
         // Drop a HOLDING stream: its chunk fetch parks in the withheld entry
         // read, gate held.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let stream_task = tokio::spawn({
             let handle = handle.clone();
             async move {
@@ -1395,7 +1376,7 @@ fn dropped_stream_chunk_fetch_releases_the_gate() -> Result<()> {
                 let _ = stream.next().await;
             }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("the chunk fetch never reached its hold"))?;
         stream_task.abort();
@@ -1414,7 +1395,7 @@ fn dropped_stream_chunk_fetch_releases_the_gate() -> Result<()> {
 
         // Drop a QUEUED next(): A (a chunk fetch) holds, a queued op B waits, B
         // is dropped, A completes, and settle's close still proceeds.
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let holding = tokio::spawn({
             let handle = handle.clone();
             async move {
@@ -1423,7 +1404,7 @@ fn dropped_stream_chunk_fetch_releases_the_gate() -> Result<()> {
                 stream.next().await.transpose()
             }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("the second chunk fetch never reached its hold"))?;
         let queued = tokio::spawn({
@@ -1433,7 +1414,7 @@ fn dropped_stream_chunk_fetch_releases_the_gate() -> Result<()> {
         let_task_park().await;
         queued.abort();
         assert!(queued.await.is_err(), "the queued op was dropped");
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
         timeout(HANG_GUARD, holding)
             .await
             .map_err(|_| eyre!("the holding stream hung"))??
@@ -1467,7 +1448,7 @@ fn closed_session_fences_mutators_but_serves_hook_reads() -> Result<()> {
             .map_err(|e| eyre!("set: {e}"))?;
         finalize_and_promote(
             &session,
-            &fx.oracle,
+            &fx.dedup,
             Uuid::from_u128(1),
             &fx.cells,
             &fx.id("v")?,
@@ -1541,7 +1522,7 @@ async fn settle_and_verify(
 ) -> Result<()> {
     finalize_and_promote(
         session,
-        &fx.oracle,
+        &fx.dedup,
         Uuid::from_u128(1),
         &fx.cells,
         &fx.id("v")?,
@@ -1800,12 +1781,12 @@ fn racing_set_never_joins_next_attempt() -> Result<()> {
 
         // Park a fill holding the gate (epoch still N, so its own `ensure_live`
         // admitted it before the bump).
-        fx.holds.get_for_cache().arm(1);
+        fx.holds.read().arm(1);
         let get_task = tokio::spawn({
             let stale = stale.clone();
             async move { stale.get().await }
         });
-        timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("the fill never parked on the gate"))?;
 
@@ -1823,7 +1804,7 @@ fn racing_set_never_joins_next_attempt() -> Result<()> {
         let_task_park().await;
 
         // Release the fill: reset acquires (discard+bump), then the set.
-        fx.holds.get_for_cache().release();
+        fx.holds.read().release();
         timeout(HANG_GUARD, get_task)
             .await
             .map_err(|_| eyre!("get hung"))??
@@ -1866,7 +1847,7 @@ fn map_item_terminated(item: &MapStateError<JsonCodecError>) -> bool {
 /// not the source (which keeps producing). The first item crosses pre-bump; the
 /// range source holds no admission, so the `reset` between pulls bumps
 /// immediately. Red proven by dropping the `fenced(...)` wrapper in
-/// `RangePlan::entries` (return the raw source): the post-bump pull then
+/// `Plan::projected` (return the raw source): the post-bump pull then
 /// yields a second `Ok` item.
 #[test]
 fn range_scan_stream_fences_after_bump() -> Result<()> {
@@ -1913,7 +1894,7 @@ fn range_scan_stream_fences_after_bump() -> Result<()> {
 /// yield; a buffered entry never crosses the fence after an observed bump. Both
 /// keys land in one chunk (`CELL_BATCH >= 2`), so the first entry's fence
 /// check passes pre-bump and the second's runs post-bump. Red proven by
-/// dropping the `fenced(...)` wrapper in `CoordinatePlan::entries`: the
+/// dropping the `fenced(...)` wrapper in `Plan::projected`: the
 /// buffered second entry then crosses as an `Ok`.
 #[test]
 fn coordinate_stream_fences_buffered_entries_after_bump() -> Result<()> {

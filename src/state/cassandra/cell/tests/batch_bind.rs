@@ -1,4 +1,7 @@
 use super::*;
+use crate::state::cell::Values;
+use crate::state::store::CellRead;
+use crate::state::tests::support::evidence;
 
 /// Positional binding-order proof (the one silent-failure surface):
 /// `scylla::Batch` binds its statement list 1:1 with the value list, and on a
@@ -23,7 +26,7 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
 
     init_test_logging();
     let fx = fixture().await?;
-    let store = fx.bottom_store(ScriptedOracle::default())?;
+    let store = fx.bottom_store();
     let c = collection("mixed-batch")?;
     let id = c.id().clone();
 
@@ -44,7 +47,7 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
         cell_b.clone(),
         ProvisionalWrite::new(Some(data_b.clone()), Committed::new(None), event(1)),
     )];
-    let marker_b = EventMarker::frozen(event(1), &writes_b, &[]);
+    let marker_b = EventMarker::frozen(event(1), &writes_b, &[], &evidence([].into(), None));
     store
         .write_provisional(&c, &writes_b, Some(&marker_b))
         .await?;
@@ -62,7 +65,12 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
         cell_a.clone(),
         ProvisionalWrite::new(Some(data_a.clone()), Committed::new(None), event(2)),
     )];
-    let marker_payload = encode_marker_payload(&EventMarker::frozen(event(2), &staged_a, &[]))?;
+    let marker_payload = encode_marker_payload(&EventMarker::frozen(
+        event(2),
+        &staged_a,
+        &[],
+        &evidence([].into(), None),
+    ))?;
     let payload = encode(&marker_payload)?;
     let marker_blob = MarkerBlob {
         payload,
@@ -88,31 +96,28 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     // columns). B was promoted out of the provisional set by the key-only
     // promote row.
     //
-    let reader = fx.bottom_store(ScriptedOracle::default())?;
+    let reader = fx.bottom_store();
     let staged = provisional_cells(&reader, &id).await?;
-    assert_eq!(staged.len(), 1, "only A stays provisional: {staged:?}");
-    let (key, prov) = staged
-        .into_iter()
-        .next()
-        .ok_or_else(|| eyre!("expected A provisional"))?;
-    assert_eq!(key, cell_a);
+    assert_eq!(staged.len(), 1);
+    let (key, prov) = &staged[0];
+    assert_eq!(key, &cell_a);
     assert_eq!(prov.data(), Some(&data_a));
 
     // B promoted to its own payload (the key-only promote row bound its
     // columns); C written fresh resolved to its own payload (the resolved-write
     // row bound its columns).
     assert_eq!(
-        reader.get(&id, &cell_b, event(3)).await?,
+        CellRead::<Values>::read(&reader, &id, &cell_b).await?.0,
         Committed::new(Some(data_b))
     );
     assert_eq!(
-        reader.get(&id, &cell_c, event(3)).await?,
+        CellRead::<Values>::read(&reader, &id, &cell_c).await?.0,
         Committed::new(Some(data_c))
     );
     // D's row was deleted (the `cell_delete` bound its own `kind=Cell` key
     // columns, not the marker slice's `kind=Marker`), so it reads absent.
     assert_eq!(
-        reader.get(&id, &cell_d, event(3)).await?,
+        CellRead::<Values>::read(&reader, &id, &cell_d).await?.0,
         Committed::new(None)
     );
 
@@ -122,7 +127,7 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     fx.cassandra
         .execute_unlogged_batches(&delete, 1 << 20, 4_096, SHARD_FANOUT_CONCURRENCY)
         .await?;
-    let reader = fx.bottom_store(ScriptedOracle::default())?;
+    let reader = fx.bottom_store();
     assert!(
         provisional_cells(&reader, &id).await?.is_empty(),
         "marker_delete removed the marker row, so cold recovery lists nothing"

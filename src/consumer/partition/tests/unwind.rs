@@ -35,7 +35,7 @@ type Handle = ValueHandle<TestSession, JsonCodec>;
 /// Shared durable + dirty state so the event session and a fresh observer
 /// session read the same overlay — the residue probe.
 struct Fixture {
-    cell: MemoryCellStore<FixedOracle>,
+    cell: MemoryCellStore,
     dirty: Arc<DirtyStore>,
     state_key: StateKey,
     registry: Arc<CollectionDefRegistry>,
@@ -46,11 +46,7 @@ impl Fixture {
         let mut registry = CollectionDefRegistry::default();
         registry.register(&value_state::<JsonCodec>(NAME), CollectionDef::new(None))?;
         let registry = Arc::new(registry);
-        let cell = MemoryCellStore::new(
-            MemoryCells::new(),
-            FixedOracle::committed(),
-            registry.clone(),
-        );
+        let cell = MemoryCellStore::new(MemoryCells::new());
         Ok(Self {
             cell,
             dirty: Arc::new(DirtyStore::new()),
@@ -67,15 +63,15 @@ impl Fixture {
         KeyedStateSession::new(SessionParts {
             cell: self.cell.clone(),
             dirty: self.dirty.clone(),
-            oracle: FixedOracle::committed(),
+            dedup: MemoryDeduplicationStore::new(),
             loader: MemoryLoader::new(),
             registry: self.registry.clone(),
             state_key: self.state_key.clone(),
             event: EventRef::Message {
                 dedup_id: Uuid::new_v4(),
             },
-            recovery_delay: CompactDuration::new(30),
-            armed: Arc::default(),
+            dedup_ttl: CompactDuration::new(30),
+            checks: (),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
         })
     }

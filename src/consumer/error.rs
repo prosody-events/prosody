@@ -1,6 +1,5 @@
 //! Errors raised while building and running a consumer.
 
-use crate::consumer::config::RecoveryTtlMarginError;
 use crate::consumer::middleware::defer::DeferInitError;
 use crate::consumer::middleware::monopolization::MonopolizationInitError;
 use crate::consumer::middleware::scheduler::SchedulerInitError;
@@ -201,11 +200,6 @@ pub enum KeyedStateInitError {
     /// A descriptor registration was invalid or conflicted.
     #[error(transparent)]
     Register(#[from] RegisterStateError),
-
-    /// The deduplication TTL is too short to outlive the keyed-state
-    /// recovery window.
-    #[error(transparent)]
-    RecoveryTtlMargin(#[from] RecoveryTtlMarginError),
 
     /// The local keyed-state cache's disk workspace could not be opened.
     ///

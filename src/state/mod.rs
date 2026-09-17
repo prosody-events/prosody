@@ -3,7 +3,7 @@
 //! This module defines the shared collection identity and cell shapes used by
 //! the keyed-state cell store. The cell layer is **uniform and
 //! untyped** — it addresses cells by [`CellKey`] and names no collection
-//! family; typed collection handles (Value, Map, Deque) are built
+//! family; typed collection handles (Value, Map, Set, Deque) are built
 //! atop it in [`descriptor`].
 //!
 //! The shapes themselves live in leaf-to-root submodules and are
@@ -88,7 +88,6 @@ pub mod cassandra;
 pub mod cell;
 pub mod cell_key;
 pub mod collection;
-pub(crate) mod commit;
 pub mod config;
 pub mod descriptor;
 pub mod descriptor_identity;
@@ -99,7 +98,6 @@ pub mod identity;
 pub mod manager;
 pub(crate) mod marker;
 pub mod memory;
-pub mod oracle;
 pub mod order_codec;
 pub(crate) mod overlay;
 pub(crate) mod production;
@@ -107,6 +105,7 @@ pub mod publication;
 pub(crate) mod publisher;
 pub mod registry;
 pub mod resolve;
+pub(crate) mod retry;
 pub mod session;
 pub(crate) mod store;
 mod store_helpers;
@@ -136,39 +135,25 @@ pub(crate) use backend::SharedStateBackend;
 pub(crate) use backend::{PartitionBackend, StateBackend, StateBackendFactory};
 
 /// Maximum concurrent per-collection durable operations in the keyed-state
-/// lifecycle (finalize stage, commit promote, rollback, recovery sweep).
+/// lifecycle (stage, promote, rollback, admission).
 /// Each collection is its own Cassandra partition, so the fan-out is safe.
 pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
 
-/// Maximum concurrent in-flight requests within a *single* collection
-/// (one Cassandra partition → one Scylla shard): the batch-chunk submission
-/// of one durable write, the recovery sweep's per-cell resolution, a
-/// stage's committed-base reads, and the ordered resolution window of a typed
-/// cell scan (each scanned cell is decoded and its resolver/loader fan-out run
-/// up to this many items ahead of the consumer). Same shard, so this bounds
-/// round-trip / oracle-consult *overlap* (latency), not throughput; kept modest
-/// because it nests inside the per-collection `STATE_FANOUT_CONCURRENCY`
-/// fan-out, so the product is the per-shard in-flight depth.
+/// Bounds concurrent requests within one collection, which is one Cassandra
+/// partition. It covers write chunks, admission reads, and staged-base reads.
+/// It nests inside [`STATE_FANOUT_CONCURRENCY`].
 ///
-/// Ruling: retained at eight pending a benchmark sweep over candidate values
-/// `1, 2, 4, 8, 16, 32, 64`, exercised under cold multi-chunk stage reads,
-/// cold and warm-index recovery spanning multiple chunks, oracle-resolving
-/// provisional write-back, over-budget provisional/resolved/promote/abort
-/// writes, and simultaneous events across many keys (to expose global shard
-/// pressure, not one isolated shard). Batching moved what this bounds — it is
-/// now concurrent batch chunks, recovery resolution, and over-budget write
-/// batches against one shard, never point-query multiplication — so a value
-/// picked before batching would have tuned the wrong thing. Not made
-/// configurable speculatively: if the optimum proves strongly
-/// deployment-dependent, a separately validated config field is the follow-up.
+/// Ruling: keep eight until a benchmark compares `1, 2, 4, 8, 16, 32, 64`.
+/// Include cold stage reads, admission, oversized writes, and simultaneous
+/// events across keys. These workloads measure batch concurrency and shard
+/// pressure. Add configuration only if deployments require different bounds.
 pub(crate) const SHARD_FANOUT_CONCURRENCY: usize = 8;
 
-/// Maximum concurrent typed resolves in flight within one aligned batch read —
-/// the loader (Kafka message) fan-out for that read. A resolve reads
-/// the collection's source (a Kafka message for a loader-backed collection),
-/// which does not contend on the
-/// collection's Scylla shard, so it is not bounded by
-/// [`SHARD_FANOUT_CONCURRENCY`] (that bounds same-shard round-trip overlap).
+/// Maximum concurrent typed resolves within an aligned batch read or a range
+/// scan's resolution window. This bounds the loader fan-out for each read.
+/// A resolve reads the collection's source, such as a Kafka message.
+/// It does not contend on the collection's Scylla shard.
+/// [`SHARD_FANOUT_CONCURRENCY`] bounds overlapping round trips to that shard.
 /// A batch's resolves fan out across the WHOLE call under this window, so the
 /// resolves overlap rather than serialize per store sub-batch.
 ///

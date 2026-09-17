@@ -177,6 +177,24 @@ designs are where bloat and bug re-introduction live:
 - Write doc comments for a reader unfamiliar with the codebase: help them
   navigate the concept. Lead with what the reader needs — what the thing is,
   how to use it, what guarantee it gives — not the internal mechanism.
+- **Short declarative sentences, one idea each.** The banned shape is the
+  six-line sentence that chains clauses with dashes and nests parentheticals
+  three deep. At most one parenthetical aside per comment, never nested; a
+  sentence that needs a second dash or parenthesis gets split instead.
+- **Never argue with an imagined reviewer.** "X rather than Y (which would
+  break Z), mirroring W" is design-review prose. State what the code does and
+  the invariant it upholds. Mention a rejected alternative only when a
+  maintainer would plausibly reintroduce it, as its own plain sentence: "Do
+  not swap in fresh stores here: mock read-your-writes depends on sharing."
+- **No invented compound jargon.** Ad-hoc hyphenated noun chains
+  ("incoherent-backend bug", "reads-your-writes bundle",
+  "unreachable-by-construction") compress meaning the reader does not yet
+  have; spell the idea out in ordinary words. Established terms that name one
+  precise mechanism (last-write-wins, read-your-writes as a consistency level)
+  keep their standard form.
+- **Read-aloud test:** a comment you cannot read aloud in one breath, or that
+  a colleague could not paraphrase back after one hearing, gets rewritten
+  before it lands.
 - Docs address the future reader, never the current conversation: no
   review-response prose, no "the reviewer/advisor said", no phrasing copied
   from scratch plans or design docs. Restate the invariant in the code's own
@@ -195,7 +213,7 @@ designs are where bloat and bug re-introduction live:
   that file and goes stale when the plan is renumbered or deleted. Name the
   concept instead, or link a durable symbol (`[`CollectionDef`]`). Stable
   cross-references to invariants/findings **documented in AGENTS.md itself**
-  (e.g. "invariant 8", "finding F2") are fine — those live in a durable doc.
+  are valid because those references remain in a durable document.
 
 **Style:**
 
@@ -217,16 +235,43 @@ designs are where bloat and bug re-introduction live:
   constraints that function actually needs — not a superset for the whole
   type. The struct should compile and be usable without the bound unless
   every reachable method requires it.
+- Avoid overused idioms and vague metaphor-filler in prose, comments, docs,
+  commit/PR text, and chat — they read as LLM boilerplate and carry no
+  information. Banned as decoration: "pin"/"pin down", "altitude"/"at a high
+  altitude", "zoom in/out", "double-click", "north star", "surface area",
+  "lean into", "first-class citizen", "load-bearing" as a throwaway, and the
+  like. Say the concrete thing instead ("decide X", "at a high level",
+  "the public API"). This governs *decorative* usage only: a word that names
+  a precise mechanism with a concrete referent keeps its meaning — the
+  probe-and-**pin** source commitment in the reader design is a real
+  operation, not filler, and stays.
 
 **Git:**
 
 - Never add self-attribution to branch names, commits, PR titles, PR descriptions, or code comments.
 - Use conventional commits for commit titles and PR titles (e.g., `fix:`, `feat:`, `docs:`, `refactor:`).
 - PR titles and descriptions are written for a reader who is **not** intimately familiar with the project. Be readable, well written, and well styled. Lead with what changed and why; assume nothing about the reader's session context.
+- **Never hard-wrap paragraphs in GitHub PR descriptions, PR comments, or issue text.** GitHub renders literal newlines, so a paragraph wrapped at 80 columns displays as ragged broken lines instead of flowing to the layout. Each prose paragraph is one single line; blank lines separate paragraphs. (Column-wrapping stays correct where it belongs: code, commit message bodies, and markdown files read in editors.)
 - **PR descriptions never include a test plan or a list of verification steps.** Reviewers don't need a checklist of what you ran — they need to understand what changed and why. Test coverage belongs in the tests themselves.
 - **Never run `git reset` or `git checkout` that would destroy uncommitted or committed changes without explicit human permission.** This includes `git reset --hard`, `git checkout -- <path>`, and switching branches over a dirty working tree. Prefer `git stash`, an explicit commit, or `git restore --staged <path>` when the goal is just to unstage. Read-only git commands (`status`, `diff`, `log`) are always fine.
 
 ## Code Organization
+
+**Maximum file size: 500 lines.** A file that exceeds it is subdivided into
+modules. Split along a seam the code already has — a group of methods serving
+one concern, a type and its impls, a family of related free functions — and
+give each module a doc comment naming what it owns. Re-export from the parent
+`mod.rs` so the split is invisible to callers and no import churns. A split
+that only balances line counts, cutting a coherent unit in half, is worse than
+the long file; find the real seam.
+
+**Prefer one-word module names.** `config`, `wiring`, `handler`, `poll`,
+`settle`, `modes`. A name that needs two words usually means one of two things:
+the module owns more than one concern and should be split, or the name restates
+its parent's path (`consumer::kafka_observer` says Kafka twice — inside
+`consumer`, it is `observer`). Rename the concept until one word carries it.
+A compound name is right only when the compound *is* the domain term:
+`first_write`, `low_latency`, `event_context`.
 
 **Order within files (topological by dependencies):**
 
@@ -400,7 +445,7 @@ terminates the chain with the handler as the **INNERMOST** component.
 - The block built by `build_common_middleware`
   (`telemetry.layer(timeout).layer(scheduler).layer(cancellation).layer(dedup)`)
   is the **innermost** block, directly outside the handler. It carries every
-  cross-mode concern — including the mandatory `dedup` commit oracle — so modes
+  cross-mode concern — including the mandatory `dedup` filter — so modes
   layer only their mode-specific middleware OUTSIDE it. Within the block
   OUTER→INNER is
   `dedup → cancellation → scheduler → timeout → telemetry → handler`.
@@ -420,28 +465,21 @@ hardcoding `Final`) decides `Final` vs `Bypassed` before the error category is
 consulted; the message commit marker is read from the session's event identity
 (`message_marker()` — the message `EventRef`'s dedup id, or the
 deferred-reload's last-wins identity override), never deposited by middleware.
-The full stage → arm-backstop → marker-record → commit → promote order, its
-crash-window argument, and the sweep's mirrored posture are documented once on
-their owning items — `settle`/`settle_committed`, `arm_backstop`/`ArmOutcome`,
-and `StateManager::recover` — read those doc comments before touching any of
-it. The anchors code comments cite by name:
+The boundary stages cells, promotes them, records the message dedup id, and commits the source.
+Read `settle_committed`, `Staged::promote`, and `PartitionStateManager::admit` before changes to this sequence.
 
-- **Invariant 8:** arming the backstop is must-succeed. `arm_backstop` retries
-  every non-shutdown failure and can only report `ShuttingDown`, so "abort in
-  normal operation" is structurally unwritable at the boundary.
-- **Finding F2:** neither the boundary nor the sweep ever unschedules a
-  backstop — per-key `StateRecovery` timers are only ever pulled sooner
-  (arm-if-sooner), so one event can never clear or loosen another event's
-  still-needed backstop. There is no `unschedule_all`; do not reintroduce one.
-- **Posture:** retry transient AND terminal store failures forever; skip only
-  permanent data-rejections; abort only on shutdown; never emit Terminal.
-- **No WAL, ever.** State is one provisional cell per value. The in-memory
-  `DirtyStore` (one shared per-partition workspace; race-free per-event
-  key-range clears) is never a durability or recovery source — recovery is
-  Cassandra provisional cells + the commit oracle. Do not re-add a disk-backed
-  dirty store; fjall remains only the committed-value cache (`FjallCellCache`).
-  The marker record sits textually after the stage inside one function, so
-  "marker before durable state" is unwritable.
+The collection's `Committed` row supplies positive evidence. It certifies a `Staged` row only through the attempt identity.
+The promote writes evidence before cell changes. Each stage chunk writes its discovery row atomically with its cells.
+Admission runs before the key's first dispatch. It resolves residue and retires committed sources.
+The disk-backed check set records complete admission. Failed stages and interrupted promotes remove that proof.
+Permanent admission errors receive local repair and do not block dispatch.
+Permanent stage and promote rejections restore affected collections before the source commits.
+A fully rejected event records no dedup id.
+No new event arms a `StateRecovery` timer. An old timer runs admission and commits its trigger.
+
+**No WAL.** Durable state consists of provisional cells and collection commit evidence.
+The shared in-memory `DirtyStore` is never a recovery source. Fjall holds the committed-value cache and admission checks.
+Store operations retry transient and terminal failures. Permanent data rejections can skip a step. Shutdown can stop the sequence.
 
 Two residual order facts govern middleware placement:
   - `retry` stays OUTERMOST so each attempt is a fresh dispatch, isolated by

@@ -1,44 +1,32 @@
-//! Fjall-backed cell cache.
+//! A disk cache for committed cell projections.
 //!
-//! [`FjallCellCache`] stores one tagged cell per [`CellKey`] in a fjall
-//! keyspace: the committed-cell K/V store
-//! [`Cached`](crate::state::cached::Cached) serves point hits from. It does
-//! **not** implement `CellStore`: it is a
-//! concrete *partial* upper (it can only answer what it has mirrored), so a
-//! bare cache view can never be mistaken for a complete store — a miss asserts
-//! nothing and always falls through (KV2, owned by `Cached`).
+//! [`FjallCellCache`] stores [`CacheEntry`] frames for point and batch reads.
+//! [`Projection`] converts each frame into the requested answer.
+//! A value frame can answer either projection. A presence frame cannot answer a
+//! value read. Presence reads borrow frames without a payload copy.
+//! [`CacheRead`] distinguishes hits, expired answers, unknown answers, and
+//! corrupt frames. [`Cached`](crate::state::cached::Cached) supplies durable
+//! reads when this cache cannot answer.
 //!
-//! Three components share this workspace.
-//! The cache stores committed cells.
-//! The index stores provisional cells and completed marker checks.
-//! All components use one cache-disabled state.
+//! The workspace also stores provisional cells and completed admission checks.
+//! All components share one cache-disabled state.
 //!
 //! # Workspace ownership
 //!
-//! In production the cache **owns** its [`FjallWorkspace`] (built via
-//! [`FjallCellCache::for_workspace`]). The workspace's `Drop` deletes the fjall
-//! keyspace, so the cache must hold it alive for the whole partition
-//! assignment — it lives in the partition's state manager and drops only at
-//! revocation. Test caches built from a bare handle ([`FjallCellCache::new`])
-//! own no workspace.
+//! [`FjallCellCache::for_workspace`] retains its [`FjallWorkspace`] for the
+//! partition assignment. The workspace removes its keyspace when the assignment
+//! ends. Test caches from [`FjallCellCache::new`] use a shared database without
+//! an owned workspace.
 //!
-//! # Three-valued reads and TTL co-expiry
+//! # Expiry and storage
 //!
-//! Unlike the durable stores (Memory/Cassandra) whose `get` returns only
-//! `Present`/`Absent`, the cache observes a third state: an entry that has
-//! never been populated. That state is encoded as the **absence of an entry**
-//! in the fjall keyspace, and decodes as the codec's three-valued
-//! `Read::Unknown` (see the `codec` module's cell-frame doc for the tag/expiry
-//! wire layout). The cache enforces the TTL on read against its `Clock` (an
-//! expired entry reads as a miss). The payload is stored verbatim — fjall
-//! block-compresses the on-disk data block via LZ4, so there is no per-cell
-//! codec layer.
+//! Each frame carries an absolute expiry. [`Clock`] checks that expiry during
+//! reads. Hits carry the remaining TTL. The codec stores value payloads
+//! verbatim. The cache follows the expiry contract in
+//! [`Cached`](crate::state::cached::Cached).
 //!
-//! # Blocking I/O
-//!
-//! fjall's public API is synchronous, so the cache's reads and writes are
-//! dispatched through [`tokio::task::spawn_blocking`], which clones the cheap
-//! `Arc`-backed handle into each blocking closure.
+//! Fjall uses synchronous I/O. Reads and writes use
+//! [`tokio::task::spawn_blocking`].
 
 mod codec;
 mod error;
@@ -54,11 +42,13 @@ pub(crate) use error::FjallCellCacheError;
 pub(crate) use workspace::FjallClientError;
 pub(crate) use workspace::{FjallClient, FjallWorkspace};
 
-use self::codec::Read;
 use crate::state::CollectionId;
-use crate::state::cell::{Committed, ProvisionalWrite};
+use crate::state::backend::AdmissionChecks;
+use crate::state::cell::{CacheEntry, Committed, Projection, ProvisionalWrite, Read, Values};
 use crate::state::cell_key::{CellKey, Section};
-use crate::state::store::{CellBuffer, CommittedBatch, CoordinateBatch, PresenceBatch};
+use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store_types::Durable;
+use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
 use bytes::Bytes;
 use educe::Educe;
@@ -131,17 +121,18 @@ impl Clock {
     }
 }
 
-/// The three-state result of a [`FjallCellCache::get`].
+/// The four-state result of a [`FjallCellCache::get`].
 #[derive(Clone, Debug)]
-pub(crate) enum CacheRead {
-    /// An unexpired entry (a `Present` value or an authoritative `Absent`).
-    Hit(Committed),
+pub(crate) enum CacheRead<P: Projection = Values> {
+    /// An unexpired answer with its remaining durable TTL.
+    Hit(Durable<P>),
     /// An entry exists but its stamped expiry has passed; the caller falls
     /// through to the lower store and re-publishes a fresh entry.
     Expired,
-    /// No entry exists (the cell was never published, or its entry was
-    /// deleted by a repair).
+    /// The entry is missing or cannot answer this projection.
     Miss,
+    /// The frame at this position does not decode. A fill overwrites it.
+    Corrupt,
 }
 
 /// Fjall-backed cell cache.
@@ -161,23 +152,6 @@ pub(crate) struct FjallCellCache {
     #[cfg(test)]
     #[educe(Debug(ignore))]
     fail_puts: Arc<AtomicBool>,
-    /// Test-only fault seam: when set, [`index_snapshot`](Self::index_snapshot)
-    /// returns an engine error, so a test can force the warm coords read to
-    /// fail while the collection stays seeded — the branch that must
-    /// degrade the recovery sweep to the cold durable re-seed rather than
-    /// fabricate an empty (clean) sweep that would strand a provisional
-    /// cell.
-    #[cfg(test)]
-    #[educe(Debug(ignore))]
-    fail_index_snapshot: Arc<AtomicBool>,
-    /// Test-only fault seam: when set, [`index_record`](Self::index_record)
-    /// and [`index_record_batch`](Self::index_record_batch)
-    /// return an engine error, so a test can force a cold-seed record to fail
-    /// and assert the collection is left **unseeded** (the next sweep re-seeds)
-    /// rather than latched seeded over an incomplete coords set.
-    #[cfg(test)]
-    #[educe(Debug(ignore))]
-    fail_index_record: Arc<AtomicBool>,
     /// Test-only fault seam: a countdown of delete-side calls to fail — each
     /// failure decrements it — consulted by
     /// [`delete_batch`](Self::delete_batch),
@@ -188,10 +162,7 @@ pub(crate) struct FjallCellCache {
     #[cfg(test)]
     #[educe(Debug(ignore))]
     fail_deletes: Arc<AtomicU64>,
-    /// Test-only fault seam: when set, [`get_batch`](Self::get_batch)'s
-    /// blocking probe returns an engine error for the whole hop, so a test
-    /// can force the batch probe to error over a live entry (the read-fill
-    /// no-delete degrade).
+    /// Test-only fault: point and batch probes return an engine error when set.
     #[cfg(test)]
     #[educe(Debug(ignore))]
     fail_reads: Arc<AtomicBool>,
@@ -324,10 +295,6 @@ impl FjallCellCache {
             #[cfg(test)]
             fail_puts: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
-            fail_index_snapshot: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            fail_index_record: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
             fail_deletes: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             fail_reads: Arc::new(AtomicBool::new(false)),
@@ -349,10 +316,7 @@ impl FjallCellCache {
     ///
     /// A disabled cache sends all operations to durable storage.
     pub(crate) fn disable(&self) {
-        if !self.disabled.swap(true, Ordering::Relaxed) {
-            warn!("keyed-state cell cache disabled for this assignment; using durable reads");
-            CACHE_DISABLED.add(1, &[]);
-        }
+        self.marker_checks().disable();
     }
 
     /// Test handle on the [`put`](Self::put) fault seam: returns the shared
@@ -362,22 +326,6 @@ impl FjallCellCache {
     #[must_use]
     pub fn fail_puts(&self) -> Arc<AtomicBool> {
         self.fail_puts.clone()
-    }
-
-    /// Test handle on the [`index_snapshot`](Self::index_snapshot) fault seam:
-    /// the shared flag a test sets to force the warm coords read to fail.
-    #[cfg(test)]
-    #[must_use]
-    pub fn fail_index_snapshot(&self) -> Arc<AtomicBool> {
-        self.fail_index_snapshot.clone()
-    }
-
-    /// Test handle on the [`index_record`](Self::index_record) fault seam: the
-    /// shared flag a test sets to force a cold-seed record to fail.
-    #[cfg(test)]
-    #[must_use]
-    pub fn fail_index_record(&self) -> Arc<AtomicBool> {
-        self.fail_index_record.clone()
     }
 
     /// Test handle on the delete-side fault seam: the shared countdown of
@@ -390,9 +338,7 @@ impl FjallCellCache {
         self.fail_deletes.clone()
     }
 
-    /// Test handle on the [`get_batch`](Self::get_batch) fault seam: the shared
-    /// flag a test sets to force the batch probe's whole blocking hop to error
-    /// (then unsets to heal).
+    /// The shared fault flag for point and batch probes.
     #[cfg(test)]
     #[must_use]
     pub fn fail_reads(&self) -> Arc<AtomicBool> {
@@ -455,84 +401,61 @@ impl FjallCellCache {
         }
     }
 
-    /// Looks up one cell's committed value as a three-state [`CacheRead`]: a
-    /// [`Hit`](CacheRead::Hit) on an unexpired `Present`/`Absent` entry, an
-    /// [`Expired`](CacheRead::Expired) when the entry exists but its stamped
-    /// expiry has passed, or a [`Miss`](CacheRead::Miss) when no entry exists.
-    ///
-    /// The caller distinguishes these because a coordinate may have no entry
-    /// (nothing was ever published — a `Miss`) or an entry that floor-expired
-    /// (fall through and re-fetch — an `Expired`). Both differ from a present
-    /// `Absent` tag (`Hit(Committed(None))`), which is an authoritative answer.
-    pub(crate) async fn get(
+    /// Reads one projection and its remaining TTL from an unexpired frame.
+    /// A decode failure returns `Corrupt`. Only engine and join failures return
+    /// `Err`.
+    pub(crate) async fn get<P: Projection>(
         &self,
         collection: &CollectionId,
         cell: &CellKey,
-    ) -> Result<CacheRead, FjallCellCacheError> {
-        let (expiry, read) = self.read_decoded(collection, cell).await?;
-        Ok(classify(expiry, read, self.clock.now_ms()))
+    ) -> Result<CacheRead<P>, FjallCellCacheError> {
+        #[cfg(test)]
+        if self.fail_reads.load(Ordering::Relaxed) {
+            return Err(FjallCellCacheError::Injected);
+        }
+        let raw = read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
+        let (expiry, entry) = match codec::decode_frame(raw.as_deref()) {
+            Ok(frame) => frame,
+            Err(error) => {
+                warn!(%error, "cell cache frame does not decode");
+                return Ok(CacheRead::Corrupt);
+            }
+        };
+        Ok(classify::<P>(
+            expiry,
+            entry.map_or(Read::Unknown, P::from_cached),
+            self.clock.now_ms(),
+        ))
     }
 
-    /// Batch twin of [`get`](Self::get): probes every coordinate of one
-    /// `(collection, section)` batch in a SINGLE [`spawn_blocking`] hop — never
-    /// one per cell, so a warm chunk costs one blocking-pool round-trip, not
-    /// one per position.
-    ///
-    /// `Ok(Some(values))` iff EVERY position is an unexpired hit (a `Present`
-    /// value or an authoritative `Absent` tag), index-aligned to `batch`.
-    /// `Ok(None)` if any position is a miss (no entry) or floor-expired — the
-    /// caller then refetches the whole batch from durable truth. `Err` on a
-    /// join failure, a per-key engine error, or a decode failure — the caller
-    /// degrades that read to a durable one, exactly as the point path does on a
-    /// fjall read error.
-    ///
-    /// The closure reads all keys before returning (no short-circuit at the
-    /// first miss) so the whole batch costs one hop; classification then
-    /// samples the clock ONCE and may short-circuit `Ok(None)` at the first
-    /// non-hit.
-    pub(crate) async fn get_batch(
+    /// Probes every coordinate in one blocking call and returns one result per
+    /// position. A decode failure returns `Corrupt` at that position.
+    /// Only engine and join failures return `Err`.
+    pub(crate) async fn get_batch<P: Projection>(
         &self,
         collection: &CollectionId,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<Option<CommittedBatch>, FjallCellCacheError> {
-        let raws = self.read_batch(collection, section, batch).await?;
-        // One clock sample classifies every position; decode failures propagate.
-        let now = self.clock.now_ms();
-        let mut hits: CommittedBatch = SmallVec::new();
-        for raw in raws {
-            let (expiry, read) = codec::decode_cell(raw.as_deref())?;
-            match classify(expiry, read, now) {
-                CacheRead::Hit(committed) => hits.push(committed),
-                CacheRead::Miss | CacheRead::Expired => return Ok(None),
-            }
-        }
-        Ok(Some(hits))
-    }
-
-    /// Reads batch presence without copying present payload bytes.
-    ///
-    /// This method applies the same absence and expiry rules as
-    /// [`Self::get_batch`].
-    pub(crate) async fn get_presence_batch(
-        &self,
-        collection: &CollectionId,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<Option<PresenceBatch>, FjallCellCacheError> {
+    ) -> Result<CellBuffer<CacheRead<P>>, FjallCellCacheError> {
         let raws = self.read_batch(collection, section, batch).await?;
         let now = self.clock.now_ms();
-        let mut hits = PresenceBatch::with_capacity(raws.len());
+        let mut reads = CellBuffer::with_capacity(raws.len());
         for raw in raws {
-            let (expiry, read) = codec::decode_presence(raw.as_deref())?;
-            match read {
-                Read::Unknown => return Ok(None),
-                _ if expired(expiry, now) => return Ok(None),
-                Read::Present(()) => hits.push(true),
-                Read::Absent => hits.push(false),
-            }
+            let (expiry, entry) = match codec::decode_frame(raw.as_deref()) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    warn!(%error, "cell cache frame does not decode");
+                    reads.push(CacheRead::Corrupt);
+                    continue;
+                }
+            };
+            reads.push(classify::<P>(
+                expiry,
+                entry.map_or(Read::Unknown, P::from_cached),
+                now,
+            ));
         }
-        Ok(Some(hits))
+        Ok(reads)
     }
 
     async fn read_batch(
@@ -579,59 +502,34 @@ impl FjallCellCache {
         .await?
     }
 
-    /// The absolute expiry (millis; `0` = never) stamped on the cell's current
-    /// fjall entry, or `None` when no entry exists. Unlike `get`,
-    /// it does **not** treat a passed stamp as a miss: the caller is about to
-    /// **re-publish** the cell and wants to *preserve* its existing co-expiry
-    /// anchor. The promote (`commit_provisional`) uses this so the committed
-    /// value inherits the death set at stage time (`mark_resolved` does not
-    /// re-stamp the durable TTL), rather than overhanging it with a fresh
-    /// stamp.
-    ///
-    /// Test-only: the sole caller is the `#[cfg(test)]`
-    /// `Cached::stored_expiry` co-expiry probe.
+    /// Returns the stored expiry, including expired frames, or `None` for a
+    /// missing entry. Zero means no expiry. Tests use this to check the
+    /// durable expiry contract.
     #[cfg(test)]
     pub(crate) async fn stored_expiry(
         &self,
         collection: &CollectionId,
         cell: &CellKey,
     ) -> Result<Option<u64>, FjallCellCacheError> {
-        let (expiry, read) = self.read_decoded(collection, cell).await?;
-        Ok(match read {
-            Read::Unknown => None,
-            _ => Some(expiry),
-        })
-    }
-
-    /// Reads and decodes one cell's raw fjall frame: the shared prologue
-    /// behind [`get`](Self::get) and `stored_expiry`,
-    /// which differ only in how they treat an expired stamp.
-    async fn read_decoded(
-        &self,
-        collection: &CollectionId,
-        cell: &CellKey,
-    ) -> Result<(u64, Read<Bytes>), FjallCellCacheError> {
         let raw = read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
-        codec::decode_cell(raw.as_deref())
+        codec::frame_expiry(raw.as_deref())
     }
 
-    /// Write-through: publishes one cell's committed projection with an
-    /// absolute `expiry` (`0` = never). A present value writes the payload
-    /// cell; a known-absent value writes the `Absent` tag. The expiry
-    /// mirrors the durable row's TTL death so the entry co-expires
-    /// (FLOOR-rounded, so it never outlives the durable value).
-    pub(crate) async fn put(
+    /// Publishes one committed projection with an absolute expiry.
+    /// [`Projection::into_cached`] selects the frame contents. Zero expiry
+    /// means no expiry.
+    pub(crate) async fn put<P: Projection>(
         &self,
         collection: &CollectionId,
         cell: &CellKey,
-        value: &Committed,
+        value: Committed<P>,
         expiry: u64,
     ) -> Result<(), FjallCellCacheError> {
         #[cfg(test)]
         if self.fail_puts.load(Ordering::Relaxed) {
             return Err(FjallCellCacheError::Injected);
         }
-        let frame = encode_frame(value.get(), expiry);
+        let frame = encode_frame(&P::into_cached(value.into_inner()), expiry);
         write_cell(
             self.inner.handle(),
             codec::cell_key(collection, cell),
@@ -640,20 +538,15 @@ impl FjallCellCache {
         .await
     }
 
-    /// Write-through publish of a *batch* of committed cell projections in a
-    /// **single** [`spawn_blocking`] over one atomic [`OwnedWriteBatch`]
-    /// (the shared `run_batch` ceremony).
-    ///
-    /// Writes all specified cells in one cache update.
-    ///
+    /// Publishes committed projections in one atomic [`OwnedWriteBatch`].
     /// A failed commit leaves the cache unchanged.
-    /// The caller owns the repair: a write-through caller removes the old
-    /// entries (`Cached::publish_written`); a read-fill caller does not
-    /// (`Cached::get_many`).
-    pub(crate) async fn put_batch(
+    /// A durable write caller removes old entries after a failed cache update.
+    /// A read fill caller retains old entries because durable state did not
+    /// change.
+    pub(crate) async fn put_batch<P: Projection>(
         &self,
         collection: &CollectionId,
-        cells: impl IntoIterator<Item = (CellKey, Committed, u64)>,
+        cells: impl IntoIterator<Item = (CellKey, Committed<P>, u64)>,
     ) -> Result<(), FjallCellCacheError> {
         #[cfg(test)]
         if self.fail_puts.load(Ordering::Relaxed) {
@@ -668,7 +561,7 @@ impl FjallCellCache {
             .map(|(cell, value, expiry)| {
                 (
                     codec::cell_key(collection, &cell),
-                    encode_frame(value.get(), expiry),
+                    encode_frame(&P::into_cached(value.into_inner()), expiry),
                 )
             })
             .collect();
@@ -683,37 +576,17 @@ impl FjallCellCache {
         .await
     }
 
-    /// The **settle transform** (settlement cache update): rewrites each staged
-    /// cell's entry `prev → data` at its **stage-anchored** expiry,
-    /// atomically, in a single [`spawn_blocking`] over one
-    /// [`OwnedWriteBatch`]. Called by
-    /// [`Cached::commit_provisional`](crate::state::cached::Cached) strictly
-    /// **before** the lower promote — the commit verdict is already fixed when
-    /// that verb runs, so `data` *is* the logical committed projection and
-    /// installing it pre-call keeps the staged cells warm and correct even if
-    /// the promote then fails or the settle future is dropped. Reusing the
-    /// stage expiry is load-bearing: the lower promote keeps `data`'s death
-    /// set at stage time, so a fresh `now + ttl` would overhang the durable
-    /// row's death.
+    /// Publishes each staged cell's committed value at its stage expiry.
+    /// One atomic [`OwnedWriteBatch`] runs in [`spawn_blocking`].
+    /// [`Cached`](crate::state::cached::Cached) calls this after the durable
+    /// promote returns. It disables the cache if publication does not complete.
     ///
-    /// **Idempotent because the frame is not marked.** fjall frames carry no
-    /// stage/committed discriminator — `stage_expiry` decodes any valid cell
-    /// frame — so a sweep-retried transform re-reads the stage-anchored expiry
-    /// it wrote the first time and rewrites byte-equivalent bytes. The delete
-    /// arm (a missing or unreadable entry is removed in the same atomic batch)
-    /// is reached only by genuinely missing/corrupt entries, never by a retry.
-    /// The supporting routing lemma: between transform attempts no successful
-    /// fill can restamp a coordinate still eligible for the next transform — a
-    /// fall-through read of a still-listed provisional coordinate must
-    /// *resolve* it first, and the sweep rebuilds its write set from durable
-    /// provisional state, so a resolved coordinate drops out before the retry
-    /// ever sees it. A drop between this transform and the commit site's
-    /// scoped section delete is equivalent to a drop before the verb: the
-    /// armed sweep re-runs both, and both are idempotent.
+    /// The promote preserves the durable cell's expiry. This transform retains
+    /// the cached expiry, so a repeated transform cannot extend retention.
+    /// The transform removes missing or unreadable entries. The next read loads
+    /// them from the durable store.
     ///
-    /// Any failure — including the `fail_puts` seam and a join error — returns
-    /// `Err` so the caller runs its must-succeed delete fallback over the same
-    /// entries.
+    /// Any failure returns `Err` so the caller removes the affected entries.
     pub(crate) async fn commit_batch(
         &self,
         collection: &CollectionId,
@@ -737,7 +610,11 @@ impl FjallCellCache {
             for (key, data) in &inputs {
                 match stage_expiry(&handle, key) {
                     Some(expiry) => {
-                        let frame = encode_frame(data.as_ref(), expiry);
+                        let frame = codec::encode_frame(
+                            data.as_deref()
+                                .map_or(CacheEntry::Absent, CacheEntry::Value),
+                            expiry,
+                        );
                         batch.insert(&handle, key.as_slice(), frame.as_ref());
                     }
                     // Missing/unreadable stage entry: delete it in the same
@@ -776,23 +653,20 @@ impl FjallCellCache {
         .await
     }
 
-    /// Deletes one `(collection, section)`'s committed cell entries, walking
-    /// the section's key range in fixed hops of [`SCAN_HOP_ROWS`]: each hop is
-    /// one [`spawn_blocking`] that collects at most a hop of keys, deletes
-    /// them in one bounded write batch, and re-seeks past the last key it
-    /// examined. Never one whole-section batch — that would hold O(cached
-    /// cells) keys in RAM (the bounded-RAM invariant). Idempotent (a deleted
-    /// key is not found again), so a must-succeed retry re-walks safely.
+    /// Deletes committed entries from one collection section in hops of at most
+    /// [`SCAN_HOP_ROWS`] keys.
+    /// Each hop uses [`spawn_blocking`], deletes keys in one bounded batch, and
+    /// resumes after the last examined key.
+    /// The operation never holds the whole section in RAM. Deleted keys
+    /// disappear, so retries can safely repeat the scan.
     ///
-    /// `exclude` names cells whose entries survive the delete — the commit
-    /// site's staged coordinates (the set equation on
-    /// [`Cached::commit_provisional`](crate::state::cached::Cached)); every
-    /// other caller passes `&[]` for a whole-section delete. The exclusion set
-    /// is encoded **once, in the committed-cell key form** (`codec::cell_key`
-    /// — the same form the walk yields; the provisional-*index* encoding
-    /// carries an extra kind byte and would never match, silently deleting the
-    /// staged survivors) and held hashed, so each walked key costs O(1)
-    /// expected and memory stays O(|exclude| + one hop).
+    /// `exclude` names the staged coordinates that survive
+    /// [`Cached::commit_provisional`](crate::state::cached::Cached).
+    /// Other callers pass `&[]` to delete the whole section.
+    /// The exclusion set encodes each coordinate once with `codec::cell_key`,
+    /// the same form that the scan returns.
+    /// A hash set gives expected O(1) work per scanned key and O(|exclude| +
+    /// one hop) memory.
     pub(crate) async fn delete_section(
         &self,
         collection: &CollectionId,
@@ -855,155 +729,6 @@ impl FjallCellCache {
         }
     }
 
-    // --- Warm index: provisional coordinates + cold-seed latch ---------------
-    //
-    // The warm provisional-coordinate cache the recovery sweep short-circuits
-    // on. It lives
-    // in the per-partition `index` keyspace, cold at a fresh assignment and
-    // dropped at revocation. It is the disk-spilling relocation of the former
-    // in-RAM `ProvisionalIndex`; the durable Cassandra event marker remains
-    // the authoritative cold-recovery source (a fresh assignment re-seeds
-    // from it).
-
-    /// Whether `collection`'s one-time cold seed has run (the seeded latch).
-    pub(crate) async fn index_seeded(
-        &self,
-        collection: &CollectionId,
-    ) -> Result<bool, FjallCellCacheError> {
-        let raw = read_cell(
-            self.inner.index_handle(),
-            codec::index_seeded_key(collection),
-        )
-        .await?;
-        Ok(raw.is_some())
-    }
-
-    /// Marks `collection` seeded once its bounded cold seed read completes.
-    pub(crate) async fn index_mark_seeded(
-        &self,
-        collection: &CollectionId,
-    ) -> Result<(), FjallCellCacheError> {
-        write_index_empty(
-            self.inner.index_handle(),
-            codec::index_seeded_key(collection),
-        )
-        .await
-    }
-
-    /// Drops `collection`'s seeded latch, forcing the next sweep to re-seed
-    /// from the durable index (used when a stage write fails and a
-    /// coordinate may have landed durably that the coords set now misses).
-    /// A delete-side op: must-succeed at its call sites (a latch left true
-    /// over an incomplete snapshot would short-circuit every later sweep), so
-    /// it honors the shared delete fault seam.
-    pub(crate) async fn index_unseed(
-        &self,
-        collection: &CollectionId,
-    ) -> Result<(), FjallCellCacheError> {
-        #[cfg(test)]
-        self.injected_delete_failure()?;
-        let handle = self.inner.index_handle().clone();
-        let key = codec::index_seeded_key(collection);
-        spawn_blocking(move || handle.remove(key.as_slice())).await??;
-        Ok(())
-    }
-
-    /// Records `cell` as a live provisional coordinate of `collection`.
-    pub(crate) async fn index_record(
-        &self,
-        collection: &CollectionId,
-        cell: &CellKey,
-    ) -> Result<(), FjallCellCacheError> {
-        #[cfg(test)]
-        if self.fail_index_record.load(Ordering::Relaxed) {
-            return Err(FjallCellCacheError::Injected);
-        }
-        write_index_empty(
-            self.inner.index_handle(),
-            codec::index_coord_key(collection, cell),
-        )
-        .await
-    }
-
-    /// Records a batch of live provisional coordinates of `collection` in one
-    /// atomic [`OwnedWriteBatch`] — the settle-time counterpart of the
-    /// streaming single-key [`index_record`](Self::index_record), collapsing N
-    /// blocking hops to one. All-or-nothing: on a failure the caller cannot
-    /// know which coordinates landed durably, so it drops the seeded latch
-    /// ([`index_unseed`](Self::index_unseed)) and the next sweep re-seeds.
-    pub(crate) async fn index_record_batch<'a, I>(
-        &self,
-        collection: &CollectionId,
-        cells: I,
-    ) -> Result<(), FjallCellCacheError>
-    where
-        I: ExactSizeIterator<Item = &'a CellKey>,
-    {
-        #[cfg(test)]
-        if self.fail_index_record.load(Ordering::Relaxed) {
-            return Err(FjallCellCacheError::Injected);
-        }
-        let keys = index_keys(collection, cells);
-        let handle = self.inner.index_handle().clone();
-        let capacity = keys.len();
-        self.run_batch(handle, capacity, move |batch, handle| {
-            for key in &keys {
-                batch.insert(handle, key.as_slice(), [].as_slice());
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    /// Clears a batch of resolved provisional coordinates from `collection` in
-    /// one atomic [`OwnedWriteBatch`]. A failure is a harmless over-report:
-    /// the sweep's point-read filter drops already-resolved coordinates.
-    pub(crate) async fn index_clear_batch<'a, I>(
-        &self,
-        collection: &CollectionId,
-        cells: I,
-    ) -> Result<(), FjallCellCacheError>
-    where
-        I: ExactSizeIterator<Item = &'a CellKey>,
-    {
-        let keys = index_keys(collection, cells);
-        let handle = self.inner.index_handle().clone();
-        let capacity = keys.len();
-        self.run_batch(handle, capacity, move |batch, handle| {
-            for key in &keys {
-                batch.remove(handle, key.as_slice());
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    /// Snapshots `collection`'s live provisional coordinates — the recovery
-    /// drain buffer, sized to `#provisional`. Empty ⟹ the warm sweep issues no
-    /// Cassandra reads. Collected in one [`spawn_blocking`] over the bounded
-    /// `Coord` prefix range (the guard cannot cross an `.await`).
-    pub(crate) async fn index_snapshot(
-        &self,
-        collection: &CollectionId,
-    ) -> Result<Vec<CellKey>, FjallCellCacheError> {
-        #[cfg(test)]
-        if self.fail_index_snapshot.load(Ordering::Relaxed) {
-            return Err(FjallCellCacheError::Injected);
-        }
-        let handle = self.inner.index_handle().clone();
-        let prefix = codec::index_coord_prefix(collection);
-        spawn_blocking(move || {
-            // A `Vec`: unbounded (∝ #provisional) → `Vec` is correct.
-            let mut out: Vec<CellKey> = Vec::new();
-            for guard in handle.prefix(prefix) {
-                let (key, _) = guard.into_inner()?;
-                out.push(codec::coord_cell_key(&key));
-            }
-            Ok(out)
-        })
-        .await?
-    }
-
     /// Runs `fill` over a fresh [`OwnedWriteBatch`] against `handle` and
     /// commits it, all in a single blocking hop — the shared ceremony behind
     /// every all-or-nothing batch mutator except
@@ -1029,16 +754,8 @@ impl FjallCellCache {
     }
 }
 
-/// Records which collections had their durable event marker read this
-/// assignment.
-///
-/// The rows live in the per-assignment `index` keyspace. The workspace `Drop`
-/// and the startup orphan sweep reclaim them. A RAM set would grow without
-/// bound over a weeks-long assignment.
-///
-/// An error leaves the collection unchecked.
-/// The next check reads the durable marker again.
-/// A disabled cache stops reads and writes through this handle.
+/// Stores admission proofs in the assignment's disk workspace.
+/// Workspace deletion and the startup orphan sweep reclaim the rows.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub(crate) struct MarkerCheckSet {
@@ -1049,54 +766,60 @@ pub(crate) struct MarkerCheckSet {
 }
 
 impl MarkerCheckSet {
-    /// Reports whether this assignment checked the collection's durable marker.
-    pub(crate) async fn contains(&self, collection: &CollectionId) -> bool {
-        if self.disabled.load(Ordering::Relaxed) {
-            return false;
-        }
-        match read_cell(&self.index, codec::marker_check_key(collection)).await {
-            Ok(raw) => raw.is_some(),
-            Err(error) => {
-                warn!(%error, "marker check failed; the collection remains unchecked");
-                false
-            }
-        }
-    }
-
-    /// Records a completed durable marker check for the collection.
-    pub(crate) async fn set(&self, collection: &CollectionId) {
-        if self.disabled.load(Ordering::Relaxed) {
-            return;
-        }
-        if let Err(error) =
-            write_index_empty(&self.index, codec::marker_check_key(collection)).await
-        {
-            warn!(%error, "marker check record failed; the collection remains unchecked");
+    /// Disables this assignment once, with its log and counter.
+    fn disable(&self) {
+        if !self.disabled.swap(true, Ordering::Relaxed) {
+            warn!("keyed-state cell cache disabled for this assignment; using durable reads");
+            CACHE_DISABLED.add(1, &[]);
         }
     }
 }
 
-/// Encodes a cell's presence/absence into its stored frame at `expiry`: a
-/// present `payload` writes the payload cell, `None` writes the `Absent` tag.
-fn encode_frame(payload: Option<&Bytes>, expiry: u64) -> Bytes {
-    match payload {
-        Some(payload) => codec::encode_present_cell(payload, expiry),
-        None => codec::encode_absent_cell(expiry),
+impl AdmissionChecks for MarkerCheckSet {
+    type Error = FjallCellCacheError;
+
+    async fn contains(&self, key: &crate::Key) -> Result<bool, Self::Error> {
+        if self.disabled.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let index = self.index.clone();
+        let key = key.clone();
+        Ok(spawn_blocking(move || index.contains_key(key.as_bytes())).await??)
+    }
+
+    async fn mark(&self, key: &crate::Key) -> Result<(), Self::Error> {
+        if self.disabled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let index = self.index.clone();
+        let key = key.clone();
+        spawn_blocking(move || index.insert(key.as_bytes(), [])).await??;
+        Ok(())
+    }
+
+    async fn unmark(&self, key: &crate::Key) -> Result<(), Self::Error> {
+        let index = self.index.clone();
+        let key = key.clone();
+        let result = async {
+            spawn_blocking(move || index.remove(key.as_bytes())).await??;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            self.disable();
+        }
+        result
     }
 }
 
-/// The encoded warm-index keys of a batch of coordinates — built up front on a
-/// [`CellBuffer`] inline buffer (bounded, sized once) so the common small write
-/// set stays on the stack and the blocking batch closure only touches fjall.
-fn index_keys<'a>(
-    collection: &CollectionId,
-    cells: impl ExactSizeIterator<Item = &'a CellKey>,
-) -> CellBuffer<SmallVec<[u8; 32]>> {
-    let mut keys: CellBuffer<SmallVec<[u8; 32]>> = SmallVec::with_capacity(cells.len());
-    for cell in cells {
-        keys.push(codec::index_coord_key(collection, cell));
-    }
-    keys
+/// Borrows the owned payload for frame encoding.
+fn encode_frame(entry: &CacheEntry<Bytes>, expiry: u64) -> Bytes {
+    let borrowed = match entry {
+        CacheEntry::Absent => CacheEntry::Absent,
+        CacheEntry::Exists => CacheEntry::Exists,
+        CacheEntry::Value(bytes) => CacheEntry::Value(bytes.as_ref()),
+    };
+    codec::encode_frame(borrowed, expiry)
 }
 
 /// Reads the raw cell at `key`, or `None` when the key is absent — one
@@ -1123,38 +846,26 @@ async fn write_cell(
     Ok(())
 }
 
-/// Inserts an empty-valued warm-index key (presence-as-boolean), one blocking
-/// hop. Generic over the key so a fixed-size `[u8; N]` index key inserts
-/// without a bridging copy.
-async fn write_index_empty(
-    handle: &Keyspace,
-    key: impl AsRef<[u8]> + Send + 'static,
-) -> Result<(), FjallCellCacheError> {
-    let handle = handle.clone();
-    spawn_blocking(move || handle.insert(key.as_ref(), [].as_slice())).await??;
-    Ok(())
-}
-
 /// Whether an absolute `expiry` (millis; `0` = never) has passed at `now`.
 fn expired(expiry: u64, now: u64) -> bool {
     expiry != codec::NEVER_EXPIRES && now >= expiry
 }
 
-/// Classifies a decoded cell frame `(expiry, read)` sampled at `now` into a
-/// [`CacheRead`]: a [`Miss`](CacheRead::Miss) when no entry exists, an
-/// [`Expired`](CacheRead::Expired) when the stamped expiry has passed, else a
-/// [`Hit`](CacheRead::Hit) on the present value or authoritative absent tag.
-///
-/// The single classifier shared by the point [`get`](FjallCellCache::get) and
-/// the batch [`get_batch`](FjallCellCache::get_batch) probe, so the stale-serve
-/// rules (a `Read::Unknown` is a miss; a passed expiry is never a hit) cannot
-/// drift between the two paths.
-fn classify(expiry: u64, read: Read<Bytes>, now: u64) -> CacheRead {
+/// Classifies a projected frame at `now` and gives each hit its remaining TTL.
+/// Point and batch reads share this classifier.
+fn classify<P: Projection>(expiry: u64, read: Read<P::Payload>, now: u64) -> CacheRead<P> {
+    let remaining = || {
+        (expiry != codec::NEVER_EXPIRES).then(|| {
+            CompactDuration::new(
+                u32::try_from(expiry.saturating_sub(now) / 1_000).unwrap_or(u32::MAX),
+            )
+        })
+    };
     match read {
-        Read::Unknown => CacheRead::Miss,
         _ if expired(expiry, now) => CacheRead::Expired,
-        Read::Present(payload) => CacheRead::Hit(Committed::new(Some(payload))),
-        Read::Absent => CacheRead::Hit(Committed::new(None)),
+        Read::Unknown => CacheRead::Miss,
+        Read::Present(payload) => CacheRead::Hit((Committed::new(Some(payload)), remaining())),
+        Read::Absent => CacheRead::Hit((Committed::new(None), remaining())),
     }
 }
 
@@ -1172,9 +883,8 @@ fn stage_expiry(handle: &Keyspace, key: &[u8]) -> Option<u64> {
             return None;
         }
     };
-    match codec::decode_cell(raw.as_deref()) {
-        Ok((_, Read::Unknown)) => None,
-        Ok((expiry, _)) => Some(expiry),
+    match codec::frame_expiry(raw.as_deref()) {
+        Ok(expiry) => expiry,
         Err(error) => {
             warn!(%error, "committed-value cache commit expiry decode failed; degrading");
             None

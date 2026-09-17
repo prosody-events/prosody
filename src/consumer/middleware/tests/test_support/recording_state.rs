@@ -1,4 +1,6 @@
 use super::*;
+use crate::state::cell::Values;
+use crate::state::store::CellRead;
 use std::future::ready;
 
 // =========================================================================
@@ -15,11 +17,11 @@ use std::future::ready;
 /// Oracle that logs every marker `settle` records and always resolves
 /// Committed, so a test can read back exactly which markers `settle` certified.
 #[derive(Clone)]
-pub struct RecordingOracle {
+pub struct RecordingDedup {
     recorded: Arc<Mutex<Vec<Uuid>>>,
 }
 
-impl RecordingOracle {
+impl RecordingDedup {
     /// A fresh oracle with an empty log.
     #[must_use]
     pub fn new() -> Self {
@@ -35,35 +37,28 @@ impl RecordingOracle {
     }
 }
 
-impl Default for RecordingOracle {
+impl Default for RecordingDedup {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl CommitOracle for RecordingOracle {
+impl DeduplicationStore for RecordingDedup {
     type Error = Infallible;
 
-    fn record_message(&self, dedup_id: Uuid) -> impl Future<Output = Result<(), Self::Error>> {
+    fn insert(&self, dedup_id: Uuid) -> impl Future<Output = Result<(), Self::Error>> {
         self.recorded.lock().push(dedup_id);
         ready(Ok(()))
     }
 
-    fn resolve<'a>(
-        &'a self,
-        _state_key: &'a StateKey,
-        _event: EventRef,
-    ) -> impl Future<Output = Result<CommitDecision, Self::Error>> {
-        ready(Ok(CommitDecision::Committed))
+    fn exists(&self, id: Uuid) -> impl Future<Output = Result<bool, Self::Error>> {
+        ready(Ok(self.recorded.lock().contains(&id)))
     }
 }
 
 /// Backend of a [`recording_session`].
-pub type RecordingBackend = PartitionBackend<
-    RecordingOracle,
-    MemoryDescriptorIdentityStore,
-    MemoryCellStore<RecordingOracle>,
->;
+pub type RecordingBackend =
+    PartitionBackend<RecordingDedup, MemoryDescriptorIdentityStore, MemoryCellStore, ()>;
 
 /// Session type built by [`recording_session`].
 pub type RecordingSession = KeyedStateSession<RecordingBackend, MemoryLoader<Value>>;
@@ -74,7 +69,7 @@ pub type RecordingSession = KeyedStateSession<RecordingBackend, MemoryLoader<Val
 /// settlement-boundary marker tests assert on.
 pub type RecordingParts = (
     RecordingSession,
-    MemoryCellStore<RecordingOracle>,
+    MemoryCellStore,
     Arc<DirtyStore>,
     Arc<Mutex<Vec<Uuid>>>,
 );
@@ -101,22 +96,22 @@ pub fn recording_session_with_loader(
     loader: MemoryLoader<Value>,
 ) -> RecordingParts {
     let registry = Arc::new(registry);
-    let oracle = RecordingOracle::new();
-    let recorded = oracle.recorded();
-    let cell_store = MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone());
+    let dedup = RecordingDedup::new();
+    let recorded = dedup.recorded();
+    let cell_store = MemoryCellStore::new(MemoryCells::new());
     let dirty = Arc::new(DirtyStore::new());
     let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
     let (_cancel_tx, cancel_rx) = watch::channel(false);
     let session = KeyedStateSession::new(SessionParts {
         cell: cell_store.clone(),
         dirty: dirty.clone(),
-        oracle,
+        dedup,
         loader,
         registry,
         state_key,
         event,
-        recovery_delay: CompactDuration::new(30),
-        armed: Arc::default(),
+        dedup_ttl: CompactDuration::new(30),
+        checks: (),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     });
     (session, cell_store, dirty, recorded)
@@ -125,15 +120,16 @@ pub fn recording_session_with_loader(
 /// The committed value at the single Value cell of `name` under `state_key`,
 /// failing on a store read error or undecodable bytes.
 pub async fn committed_json_value(
-    cell_store: &MemoryCellStore<RecordingOracle>,
+    cell_store: &MemoryCellStore,
     state_key: StateKey,
     name: &str,
 ) -> color_eyre::Result<Option<Value>> {
     let id = CollectionId::new(state_key, StateType::Application, StateName::try_new(name)?);
-    let probe = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX),
-    };
-    match Committed::into_inner(cell_store.get(&id, &value_cell(), probe).await?) {
+    match Committed::into_inner(
+        CellRead::<Values>::read(cell_store, &id, &value_cell())
+            .await?
+            .0,
+    ) {
         Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         None => Ok(None),
     }

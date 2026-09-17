@@ -14,10 +14,7 @@
 //! descriptor backed by a Kafka message reference takes the same path because
 //! the session's loader is selected by its backend family.
 //!
-//! Source discovery itself — the cached snapshot, its refresh, and retry
-//! pacing — lives in [`acquisition`]. `clippy::multiple_inherent_impl` fires on
-//! inherent impls sharing a self type across files, so one module-level
-//! expectation covers the whole subtree.
+//! [`acquisition`] owns source discovery, snapshot refresh, and retries.
 
 #![expect(
     clippy::multiple_inherent_impl,
@@ -26,15 +23,21 @@
 
 pub(crate) mod acquisition;
 mod admission;
+mod deque;
+mod query;
+mod set;
+pub use deque::DequeReaderQuery;
+
+pub use query::MapReaderQuery;
 
 use crate::Key;
 use crate::codec::Codec;
 use crate::state::StateName;
-use crate::state::cell_key::{Direction, ScanEdge};
-use crate::state::collection::Constraints;
+use crate::state::cell_key::Direction;
+use crate::state::descriptor::map::Query;
 use crate::state::descriptor::{
     CellType, ContextOf, DequeDescriptor, DequeHandle, FromSession, MapDescriptor, MapHandle,
-    ResolvedOf, SetDescriptor, SetHandle, StateDescriptor, ValueDescriptor,
+    ResolvedOf, StateDescriptor, ValueDescriptor,
 };
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
 use crate::state_reader::deps::StateReaderDependencies;
@@ -43,32 +46,26 @@ use crate::state_reader::session::{ReadSession, ReaderCollectionDef, ReaderConte
 use crate::state_reader::{MemoryReaderBackend, ReaderBackend};
 use crate::subsystem::SubsystemName;
 use acquisition::{DEFAULT_REFRESH_INTERVAL, PublicationSnapshot};
-use futures::stream::{Stream, StreamExt};
+use futures::stream::Stream;
 use quanta::Clock;
 use std::fmt::Display;
-use std::num::NonZeroUsize;
-use std::ops::{Bound, RangeBounds};
+use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::task::coop::cooperative;
 
 /// A cross-group, read-only view over a published keyed-state collection.
 ///
 /// Built from a [`StateReaderDependencies`] bundle with [`StateReader::new`].
-/// Reads observe
-/// only [`Cell::project_committed`](crate::state::cell::Cell::project_committed)
-/// of one source per operation, with honest bounded staleness. Two independent
-/// sources bound that staleness. The descriptor's read-cache TTL bounds a
-/// cached value's age. The owner's commit-to-apply window bounds the second: a
-/// value can be committed before the owner applies it, so a read may return
-/// that once-committed value early (see `project_committed` above). The second
-/// source converges via the owner's recovery sweep or its next commit, not via
-/// the read cache.
+/// Each operation reads one source. Positive collection evidence makes a
+/// committed provisional value visible before the owner applies it.
+/// Committed clears restrict scans to their frozen survivors.
+/// The read-cache TTL bounds cached value age. Store reads use evidence without
+/// an owner admission.
 ///
 /// The reader is generic over the collection descriptor `D` and the message
 /// codec `C`. The read methods live in descriptor-specialized impl blocks for
-/// Value, Map, and Deque. Each is a thin bind-and-delegate over the shared read
-/// machinery.
+/// Value, Map, Set, and Deque. Each is a thin bind-and-delegate over the shared
+/// read machinery.
 pub struct StateReader<D, C: Codec, B = MemoryReaderBackend<C>> {
     descriptor: D,
     subsystem: SubsystemName,
@@ -178,8 +175,6 @@ fn validate_read_cache(ttl: Option<Duration>) -> Result<(), StateReaderError> {
     Ok(())
 }
 
-// --- Value (and Kafka-message-ref) reads -----------------------------------
-
 impl<T, C, B> StateReader<ValueDescriptor<T>, C, B>
 where
     C: Codec,
@@ -201,118 +196,6 @@ where
         let session = self.session(key.into()).await?;
         let handle = self.descriptor.bind(&session)?;
         handle.get().await.map_err(|e| StateReaderError::store(&e))
-    }
-}
-
-// --- Map reads --------------------------------------------------------------
-
-/// A directional map stream query for a standalone reader.
-///
-/// Build one with [`StateReader::query`]. Finish it with
-/// [`entries`](Self::entries) or [`keys`](Self::keys). See
-/// [`crate::state::descriptor::map::MapQuery::limit`] for the limit
-/// contract.
-#[must_use]
-pub struct MapReaderQuery<'a, KC, V, C: Codec, B = MemoryReaderBackend<C>> {
-    reader: &'a StateReader<MapDescriptor<KC, V>, C, B>,
-    key: Key,
-    dir: Direction,
-    constraints: Constraints,
-}
-
-impl<KC, V, C, B> MapReaderQuery<'_, KC, V, C, B>
-where
-    C: Codec,
-    B: ReaderBackend<C>,
-    C::Payload: Clone,
-    KC: OrderedKeyCodec + 'static,
-    KC::Key: Display,
-    V: CellType<Key = UnitKey>,
-    for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
-{
-    /// Starts at `key`.
-    pub fn from(mut self, key: &KC::Key) -> Self {
-        self.constraints.start = ScanEdge::Included(KC::encode(key));
-        self
-    }
-
-    /// Starts after `key`.
-    pub fn after(mut self, key: &KC::Key) -> Self {
-        self.constraints.start = ScanEdge::Excluded(KC::encode(key));
-        self
-    }
-
-    /// Stops at `key`.
-    pub fn to(mut self, key: &KC::Key) -> Self {
-        self.constraints.end = ScanEdge::Included(KC::encode(key));
-        self
-    }
-
-    /// Stops before `key`.
-    pub fn before(mut self, key: &KC::Key) -> Self {
-        self.constraints.end = ScanEdge::Excluded(KC::encode(key));
-        self
-    }
-
-    /// Sets the maximum number of present items that the stream yields.
-    pub fn limit(mut self, limit: NonZeroUsize) -> Self {
-        self.constraints.limit = Some(limit);
-        self
-    }
-
-    /// Streams committed live entries in the query direction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when session acquisition or handle binding fails.
-    pub async fn entries(
-        self,
-    ) -> Result<
-        impl Stream<Item = Result<(KC::Key, ResolvedOf<V>), StateReaderError>> + 'static,
-        StateReaderError,
-    >
-    where
-        V: 'static,
-        ResolvedOf<V>: 'static,
-    {
-        let session = self.reader.session(self.key).await?;
-        let handle: MapHandle<_, KC, V> = self.reader.descriptor.bind(&session)?;
-        Ok(async_stream::try_stream! {
-            let inner = handle
-                .query(self.dir)
-                .with_constraints(self.constraints)
-                .entries();
-            futures::pin_mut!(inner);
-            while let Some(item) = cooperative(inner.next()).await {
-                yield item.map_err(|e| StateReaderError::store(&e))?;
-            }
-        })
-    }
-
-    /// Streams committed live keys in the query direction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when session acquisition or handle binding fails.
-    pub async fn keys(
-        self,
-    ) -> Result<impl Stream<Item = Result<KC::Key, StateReaderError>> + 'static, StateReaderError>
-    where
-        V: 'static,
-        KC::Key: 'static,
-    {
-        let session = self.reader.session(self.key).await?;
-        let handle: MapHandle<_, KC, V> = self.reader.descriptor.bind(&session)?;
-        Ok(async_stream::try_stream! {
-            let inner = handle
-                .query(self.dir)
-                .with_constraints(self.constraints)
-                .keys();
-            futures::pin_mut!(inner);
-            while let Some(item) = cooperative(inner.next()).await {
-                yield item.map_err(|e| StateReaderError::store(&e))?;
-            }
-        })
     }
 }
 
@@ -418,9 +301,7 @@ where
     /// Streams the committed live entries of the map under partition `key` in
     /// key order (ascending for [`Direction::Forward`]).
     ///
-    /// The session is acquired up front and moved into the stream, so the
-    /// returned stream is self-contained (owns its handles) and a binding can
-    /// hold it beyond the reader's borrow.
+    /// The stream owns its session and can outlive the reader's borrow.
     ///
     /// # Errors
     ///
@@ -465,156 +346,8 @@ where
         MapReaderQuery {
             reader: self,
             key: key.into(),
-            dir,
-            constraints: Constraints::default(),
+            query: Query::new(dir),
         }
-    }
-}
-
-impl<KC, C, B> StateReader<SetDescriptor<KC>, C, B>
-where
-    C: Codec,
-    B: ReaderBackend<C>,
-    C::Payload: Clone,
-    KC: OrderedKeyCodec + 'static,
-    KC::Key: Display + 'static,
-{
-    /// Reports whether the committed set contains `member`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when session acquisition or handle binding fails.
-    pub async fn contains<K: Into<Key>>(
-        &self,
-        key: K,
-        member: &KC::Key,
-    ) -> Result<bool, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle: SetHandle<_, KC> = self.descriptor.bind(&session)?;
-        handle
-            .contains(member)
-            .await
-            .map_err(|error| StateReaderError::store(&error))
-    }
-
-    /// Tests committed membership for each input key.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when session acquisition or handle binding fails.
-    pub async fn contains_many<K: Into<Key>>(
-        &self,
-        key: K,
-        members: &[KC::Key],
-    ) -> Result<Vec<bool>, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle: SetHandle<_, KC> = self.descriptor.bind(&session)?;
-        handle
-            .contains_many(members)
-            .await
-            .map_err(|error| StateReaderError::store(&error))
-    }
-
-    /// Reports whether the committed set has no members.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when session acquisition or handle binding fails.
-    pub async fn is_empty<K: Into<Key>>(&self, key: K) -> Result<bool, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle: SetHandle<_, KC> = self.descriptor.bind(&session)?;
-        handle
-            .is_empty()
-            .await
-            .map_err(|error| StateReaderError::store(&error))
-    }
-
-    /// Streams committed set members in the direction `dir`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when session acquisition or handle binding fails.
-    pub async fn keys<K: Into<Key>>(
-        &self,
-        key: K,
-        dir: Direction,
-    ) -> Result<impl Stream<Item = Result<KC::Key, StateReaderError>> + 'static, StateReaderError>
-    {
-        let session = self.session(key.into()).await?;
-        let handle: SetHandle<_, KC> = self.descriptor.bind(&session)?;
-        Ok(async_stream::try_stream! {
-            let inner = handle.keys(dir);
-            futures::pin_mut!(inner);
-            while let Some(item) = cooperative(inner.next()).await {
-                yield item.map_err(|error| StateReaderError::store(&error))?;
-            }
-        })
-    }
-}
-
-// --- Deque reads ------------------------------------------------------------
-
-/// A directional deque stream query for a standalone reader.
-#[must_use]
-pub struct DequeReaderQuery<'a, T, C: Codec, B = MemoryReaderBackend<C>> {
-    reader: &'a StateReader<DequeDescriptor<T>, C, B>,
-    key: Key,
-    dir: Direction,
-    start: Bound<usize>,
-    end: Bound<usize>,
-    limit: Option<NonZeroUsize>,
-}
-
-impl<T, C, B> DequeReaderQuery<'_, T, C, B>
-where
-    C: Codec,
-    B: ReaderBackend<C>,
-    C::Payload: Clone,
-    T: CellType<Key = UnitKey>,
-    for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
-{
-    /// Sets the front-relative position range.
-    pub fn range<R: RangeBounds<usize>>(mut self, range: R) -> Self {
-        self.start = range.start_bound().cloned();
-        self.end = range.end_bound().cloned();
-        self
-    }
-
-    /// Sets the maximum number of present values.
-    pub fn limit(mut self, limit: NonZeroUsize) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    /// Streams committed values in the query direction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when session acquisition or handle binding fails.
-    pub async fn values(
-        self,
-    ) -> Result<
-        impl Stream<Item = Result<ResolvedOf<T>, StateReaderError>> + 'static,
-        StateReaderError,
-    >
-    where
-        T: 'static,
-        ResolvedOf<T>: 'static,
-    {
-        let session = self.reader.session(self.key).await?;
-        let handle: DequeHandle<_, T> = self.reader.descriptor.bind(&session)?;
-        Ok(async_stream::try_stream! {
-            let query = handle.query(self.dir).range((self.start, self.end));
-            let query = match self.limit {
-                Some(limit) => query.limit(limit),
-                None => query,
-            };
-            let inner = query.values();
-            futures::pin_mut!(inner);
-            while let Some(item) = cooperative(inner.next()).await {
-                yield item.map_err(|error| StateReaderError::store(&error))?;
-            }
-        })
     }
 }
 
@@ -707,9 +440,7 @@ where
     /// Streams the committed live elements under partition `key` in index order
     /// (front to back for [`Direction::Forward`]).
     ///
-    /// The session is acquired up front and moved into the stream, so the
-    /// returned stream is self-contained (owns its handles) and a binding can
-    /// hold it beyond the reader's borrow.
+    /// The stream owns its session and can outlive the reader's borrow.
     ///
     /// # Errors
     ///
@@ -731,7 +462,7 @@ where
         self.query(key, dir).values().await
     }
 
-    /// Builds a directional stream query for partition `key`.
+    /// Builds a directional deque query for the partition key.
     pub fn query<K: Into<Key>>(&self, key: K, dir: Direction) -> DequeReaderQuery<'_, T, C, B> {
         DequeReaderQuery {
             reader: self,

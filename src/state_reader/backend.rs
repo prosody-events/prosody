@@ -18,19 +18,18 @@ use crate::consumer::{
 use crate::error::ClassifyError;
 use crate::loader::{KafkaLoader, MemoryLoader, MessageLoader};
 use crate::state::cassandra::{
-    CassandraCellResources, CassandraCellStoreError, CassandraDescriptorIdentityStore,
-    CassandraPublicationStore,
+    CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
 };
+use crate::state::cell::{Presence, Projection, Values};
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::descriptor_identity::DescriptorIdentityStore;
 use crate::state::identity::CollectionId;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state::publication::PublicationStore;
-use crate::state::store::{CellBuffer, CoordinateBatch, PresenceBatch};
+use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::timers::store::cassandra::CassandraTriggerStoreProvider;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
-use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::{Stream, TryStreamExt};
 use std::convert::Infallible;
 use std::error::Error;
 use std::future::ready;
@@ -45,102 +44,48 @@ use crate::state::tests::support::ScriptedPublicationStore;
 #[cfg(test)]
 use crate::state_reader::tests::support::{CountingIdentityStore, ScriptedCellSource};
 
-/// Committed cell reads that never consult the owner's commit oracle.
-pub trait CommittedCellSource: Clone + Send + Sync + 'static {
+/// Supplies the error type for committed cell reads.
+pub trait CellSource: Clone + Send + Sync + 'static {
     /// Read failure.
     type Error: ClassifyError + Error + Send + Sync + 'static;
+}
 
+/// Reads one projection through collection evidence without a partition owner.
+pub trait CommittedCellSource<P: Projection>: CellSource {
     /// Reads one committed cell.
     fn load(
         &self,
         id: &CollectionId,
         cell: &CellKey,
-    ) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Option<P::Payload>, Self::Error>> + Send;
 
-    /// Reads an index-aligned batch of committed cells.
+    /// Returns one committed answer for each input coordinate, in input order.
     fn load_many(
         &self,
         id: &CollectionId,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<Option<Bytes>>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, Self::Error>> + Send;
 
-    /// Streams committed cells in `scan` order.
+    /// Streams committed cells in scan order.
     fn scan<'a>(
         &'a self,
         id: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a;
-
-    /// Streams keys with a committed cell projection in `scan` order.
-    /// This read does not consult the oracle or run owner-side repair.
-    fn scan_presence<'a>(
-        &'a self,
-        id: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a;
-
-    /// Reads index-aligned committed presence values.
-    /// This read does not consult the oracle or run owner-side repair.
-    fn load_presence_many(
-        &self,
-        id: &CollectionId,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a;
 }
 
-impl CommittedCellSource for CassandraCellResources {
-    type Error = CassandraCellStoreError;
-
-    async fn load(&self, id: &CollectionId, cell: &CellKey) -> Result<Option<Bytes>, Self::Error> {
-        Self::read_committed(self, id, cell).await
-    }
-
-    async fn load_many(
-        &self,
-        id: &CollectionId,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, Self::Error> {
-        Self::read_committed_many(self, id, section, batch).await
-    }
-
-    fn scan<'a>(
-        &'a self,
-        id: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        Self::scan_committed(self, id, scan)
-    }
-
-    fn scan_presence<'a>(
-        &'a self,
-        id: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
-        Self::scan_committed_keys(self, id, scan)
-    }
-
-    async fn load_presence_many(
-        &self,
-        id: &CollectionId,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<PresenceBatch, Self::Error> {
-        Self::read_committed_presence_many(self, id, section, batch).await
-    }
-}
-
-impl CommittedCellSource for MemoryCells {
+impl CellSource for MemoryCells {
     type Error = Infallible;
+}
 
+impl<P: Projection> CommittedCellSource<P> for MemoryCells {
     fn load(
         &self,
         id: &CollectionId,
         cell: &CellKey,
-    ) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> + Send {
-        ready(Ok(Self::read_committed(self, id, cell)))
+    ) -> impl Future<Output = Result<Option<P::Payload>, Self::Error>> + Send {
+        ready(Ok(self.read_committed(id, cell).map(P::from_value)))
     }
 
     fn load_many(
@@ -148,49 +93,36 @@ impl CommittedCellSource for MemoryCells {
         id: &CollectionId,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<Option<Bytes>>, Self::Error>> + Send {
-        ready(Ok(Self::read_committed_many(self, id, section, batch)))
+    ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, Self::Error>> + Send {
+        ready(Ok(self.read_committed_many::<P>(id, section, batch)))
     }
 
     fn scan<'a>(
         &'a self,
         id: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        Self::scan_committed(self, id, scan)
-    }
-
-    fn scan_presence<'a>(
-        &'a self,
-        id: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
-        Self::scan_committed(self, id, scan).map(|item| item.map(|(key, _)| key))
-    }
-
-    fn load_presence_many(
-        &self,
-        id: &CollectionId,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send {
-        ready(Ok(Self::read_committed_many(self, id, section, batch)
-            .into_iter()
-            .map(|value| value.is_some())
-            .collect()))
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+        self.scan_committed(id, scan)
+            .map_ok(|(key, value)| (key, P::from_value(value)))
     }
 }
 
 #[cfg(test)]
-impl CommittedCellSource for ScriptedCellSource {
+impl CellSource for ScriptedCellSource {
     type Error = StateAccessError;
+}
 
-    async fn load(&self, id: &CollectionId, cell: &CellKey) -> Result<Option<Bytes>, Self::Error> {
-        let read = Self::read_committed(self, id, cell);
-        // After the read, before the answer: a concurrency test can require
-        // every reader to arrive here before any of them leaves.
+#[cfg(test)]
+impl<P: Projection> CommittedCellSource<P> for ScriptedCellSource {
+    async fn load(
+        &self,
+        id: &CollectionId,
+        cell: &CellKey,
+    ) -> Result<Option<P::Payload>, Self::Error> {
+        let read = self.read_committed(id, cell);
+        // The test barrier holds each reader after its read and before its answer.
         self.meet().await;
-        read
+        read.map(|value| value.map(P::from_value))
     }
 
     fn load_many(
@@ -198,36 +130,17 @@ impl CommittedCellSource for ScriptedCellSource {
         id: &CollectionId,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<Option<Bytes>>, Self::Error>> + Send {
-        ready(Self::read_committed_many(self, id, section, batch))
+    ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, Self::Error>> + Send {
+        ready(self.read_committed_many::<P>(id, section, batch))
     }
 
     fn scan<'a>(
         &'a self,
         id: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a {
-        Self::scan_committed(self, id, scan)
-    }
-
-    fn scan_presence<'a>(
-        &'a self,
-        id: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
-        Self::scan_committed(self, id, scan).map(|item| item.map(|(key, _)| key))
-    }
-
-    fn load_presence_many(
-        &self,
-        id: &CollectionId,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send {
-        ready(
-            Self::read_committed_many(self, id, section, batch)
-                .map(|values| values.into_iter().map(|value| value.is_some()).collect()),
-        )
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+        self.scan_committed(id, scan)
+            .map_ok(|(key, value)| (key, P::from_value(value)))
     }
 }
 
@@ -237,7 +150,7 @@ where
     C: Codec,
 {
     /// Committed cell source.
-    type Cells: CommittedCellSource;
+    type Cells: CommittedCellSource<Values> + CommittedCellSource<Presence>;
     /// Routing-row store.
     type Publications: PublicationStore;
     /// Frozen descriptor-identity store.
@@ -301,7 +214,7 @@ impl<C, S, P, I, L> ReaderComponents<C, S, P, I, L> {
 impl<C, S, P, I, L> ReaderBackend<C> for ReaderComponents<C, S, P, I, L>
 where
     C: Codec,
-    S: CommittedCellSource,
+    S: CommittedCellSource<Values> + CommittedCellSource<Presence>,
     P: PublicationStore,
     I: DescriptorIdentityStore,
     L: MessageLoader<Payload = C::Payload> + 'static,

@@ -78,6 +78,17 @@
 //!         timer.commit().await;
 //!     }
 //!
+//!     async fn on_excise<C>(
+//!         &self,
+//!         _context: C,
+//!         message: UncommittedMessage<()>,
+//!         _demand_type: DemandType,
+//!     ) where
+//!         C: EventContext,
+//!     {
+//!         message.commit().await;
+//!     }
+//!
 //!     async fn shutdown(self) {
 //!         // Clean up resources
 //!     }
@@ -120,7 +131,7 @@ pub(crate) use crate::consumer::config::TypedConsumerSetup;
 pub use crate::consumer::config::{
     CommonConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilder,
     ConsumerConfigurationBuilderError, ConsumerSetup, LowLatencyMiddlewareConfiguration,
-    MockConfigurationError, PipelineMiddlewareConfiguration, RecoveryTtlMarginError,
+    MockConfigurationError, PipelineMiddlewareConfiguration,
 };
 pub use crate::consumer::error::{
     ConsumerError, KeyedStateInitError, PeerInitError, ShutdownError,

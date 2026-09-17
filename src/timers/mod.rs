@@ -47,6 +47,17 @@
 //!         timer.commit().await;
 //!     }
 //!
+//!     async fn on_excise<C>(
+//!         &self,
+//!         _context: C,
+//!         message: UncommittedMessage<()>,
+//!         _demand_type: DemandType,
+//!     ) where
+//!         C: EventContext,
+//!     {
+//!         message.commit().await;
+//!     }
+//!
 //!     async fn shutdown(self) {
 //!         // Cleanup resources
 //!     }
@@ -116,9 +127,8 @@ pub enum TimerType {
     DeferredMessage = 1,
     /// Internal: timer scheduled by defer middleware to retry a failed timer.
     DeferredTimer = 2,
-    /// Internal: keyed-state recovery sweep scheduled by the keyed-state
-    /// middleware after stage. Routes back into the middleware on fire and is
-    /// never dispatched to user handlers.
+    /// Internal: legacy timer from an older layout. No new event arms it.
+    /// An old timer runs admission and commits its trigger for every result.
     StateRecovery = 3,
 }
 
@@ -182,7 +192,7 @@ pub type TimerSemaphores = [Arc<Semaphore>; TimerType::COUNT];
 /// Application request to schedule a timer.
 ///
 /// This is the public scheduling shape: callers provide the logical timer
-/// identity and tracing context, while the timer system owns the commit-oracle
+/// identity and tracing context, while the timer system owns the attempt
 /// tag. Persisted and delivered timers use [`Trigger`] internally.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
@@ -218,12 +228,6 @@ impl TimerRequest {
     pub(crate) fn into_trigger(self) -> Trigger {
         Trigger::new(self.key, self.time, self.timer_type, self.span)
     }
-
-    /// Converts this request into a tagged internal trigger with `tag`.
-    #[must_use]
-    pub(crate) fn into_trigger_with_tag(self, tag: i32) -> Trigger {
-        Trigger::with_tag(self.key, self.time, self.timer_type, tag, self.span)
-    }
 }
 
 /// Tracing state of a [`Trigger`], from scheduling to dispatch.
@@ -251,11 +255,9 @@ pub(crate) enum TriggerTrace {
 /// timer that will fire at a specific moment. The `trace` and `tag` fields
 /// are excluded from equality and ordering comparisons.
 ///
-/// `tag` is excluded from `Hash/Eq/Ord` to preserve the schema's primary-key
-/// invariant `(key, time, timer_type)`: two `Trigger`s for the same logical
-/// timer compare equal regardless of their tag, so `queue_keys`' occupied-entry
-/// upsert continues to work correctly when the tag is rotated after a
-/// `complete()`-from-`FiringRescheduled`.
+/// Equality and ordering identify the coordinate: key, time, and timer type.
+/// The tag identifies an attempt at that coordinate. See
+/// `timers::active::transition`.
 #[derive(Clone, Debug, Educe)]
 #[educe(Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Trigger {
@@ -268,7 +270,7 @@ pub struct Trigger {
     /// Timer type classification.
     pub timer_type: TimerType,
 
-    /// Random 32-bit identity rotated by `complete()` from `FiringRescheduled`.
+    /// Random 32-bit identity of the queued attempt.
     /// Excluded from `Hash/Eq/Ord` — see struct doc.
     #[educe(Hash(ignore), PartialEq(ignore), PartialOrd(ignore))]
     pub tag: i32,
@@ -292,8 +294,7 @@ pub(crate) struct TriggerId {
 impl Trigger {
     /// Creates a new timer trigger for scheduled execution.
     ///
-    /// Generates a fresh random `tag` via `rand::rng().random::<i32>()` so
-    /// every newly constructed trigger has a unique identity.
+    /// Generates a random 32-bit attempt tag.
     #[must_use]
     pub fn new(key: Key, time: CompactDateTime, timer_type: TimerType, span: Span) -> Self {
         Self::with_tag(key, time, timer_type, rand::rng().random::<i32>(), span)

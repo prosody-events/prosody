@@ -12,12 +12,13 @@ use crate::consumer::middleware::tests::test_support::TestLifecycleAccess;
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
 use crate::state::cell::Committed;
-use crate::state::descriptor::tests::{FixedOracle, TestSession, test_session_parts};
+use crate::state::cell::Values;
+use crate::state::descriptor::tests::{TestSession, test_session_parts};
 use crate::state::descriptor::{CellStateError, Registered, ValueHandle, value_state};
 use crate::state::memory::MemoryCellStore;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::sealed::StateLifecycle;
-use crate::state::store::CellStore;
+use crate::state::store::CellRead;
 use crate::state::tests::cell_suite::value_cell;
 use crate::state::{CollectionId, EventRef, StateKey, StateName, StateType, StoreOutcome};
 use color_eyre::eyre::{Result, bail, eyre};
@@ -197,12 +198,7 @@ where
 /// (durable, drained from the buffer — the commit-now floor), `pending` is
 /// set but left buffered (uncommitted). Returns the ready context, the
 /// durable store, and both collection ids.
-async fn two_collections() -> Result<(
-    Ctx,
-    MemoryCellStore<FixedOracle>,
-    CollectionId,
-    CollectionId,
-)> {
+async fn two_collections() -> Result<(Ctx, MemoryCellStore, CollectionId, CollectionId)> {
     let mut registry = CollectionDefRegistry::default();
     registry.register(&value_state::<JsonCodec>(FLOOR), CollectionDef::new(None))?;
     registry.register(&value_state::<JsonCodec>(PENDING), CollectionDef::new(None))?;
@@ -237,16 +233,10 @@ async fn two_collections() -> Result<(
 /// Whether a collection's Value cell holds any committed bytes on the
 /// durable store — read through a foreign probe event, so a still-buffered
 /// write is invisible.
-async fn durably_present(
-    cell_store: &MemoryCellStore<FixedOracle>,
-    id: &CollectionId,
-) -> Result<bool> {
-    let probe = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX),
-    };
-    cell_store
-        .get(id, &value_cell(), probe)
+async fn durably_present(cell_store: &MemoryCellStore, id: &CollectionId) -> Result<bool> {
+    CellRead::<Values>::read(cell_store, id, &value_cell())
         .await
+        .map(|(committed, _)| committed)
         .map(|c| Committed::into_inner(c).is_some())
         .map_err(|e| eyre!("committed read: {e}"))
 }
@@ -379,7 +369,7 @@ async fn non_finalized_arms_discard_overlay_keeping_commit_floor() -> Result<()>
 /// arm of `settle_committed`: `pending` reads the buffered `"pending"`.
 #[tokio::test]
 async fn permanent_finalize_failure_discards_overlay_keeping_floor() -> Result<()> {
-    use crate::consumer::middleware::tests::test_support::RecordingOracle;
+    use crate::consumer::middleware::tests::test_support::RecordingDedup;
     use crate::consumer::partition::ShutdownPhase;
     use crate::state::PartitionBackend;
     use crate::state::dirty::DirtyStore;
@@ -389,19 +379,20 @@ async fn permanent_finalize_failure_discards_overlay_keeping_floor() -> Result<(
     use crate::timers::duration::CompactDuration;
     use tokio::sync::watch;
 
-    type SkipStore = FailingCellStore<MemoryCellStore<RecordingOracle>>;
-    type SkipBackend = PartitionBackend<RecordingOracle, MemoryDescriptorIdentityStore, SkipStore>;
+    type SkipStore = FailingCellStore<MemoryCellStore>;
+    type SkipBackend =
+        PartitionBackend<RecordingDedup, MemoryDescriptorIdentityStore, SkipStore, ()>;
     type SkipSession = KeyedStateSession<SkipBackend, MemoryLoader<Value>>;
 
     let mut registry = CollectionDefRegistry::default();
     registry.register(&value_state::<JsonCodec>(FLOOR), CollectionDef::new(None))?;
     registry.register(&value_state::<JsonCodec>(PENDING), CollectionDef::new(None))?;
     let registry = Arc::new(registry);
-    let oracle = RecordingOracle::new();
+    let dedup = RecordingDedup::new();
     // Poison PENDING's stage so `settle`'s own `finalize` hits Skip; FLOOR's
     // mid-handler `commit()` uses `write_resolved` and is untouched.
     let cell_store = FailingCellStore::failing_write_provisional(
-        MemoryCellStore::new(MemoryCells::new(), oracle.clone(), registry.clone()),
+        MemoryCellStore::new(MemoryCells::new()),
         StateName::try_new(PENDING)?,
         ErrorCategory::Permanent,
     );
@@ -410,15 +401,15 @@ async fn permanent_finalize_failure_discards_overlay_keeping_floor() -> Result<(
     let session: SkipSession = KeyedStateSession::new(SessionParts {
         cell: cell_store,
         dirty: Arc::new(DirtyStore::new()),
-        oracle,
+        dedup,
         loader: MemoryLoader::new(),
         registry,
         state_key: StateKey::new(Uuid::from_u128(0x5D5), Arc::from("user-1")),
         event: EventRef::Message {
             dedup_id: Uuid::new_v4(),
         },
-        recovery_delay: CompactDuration::new(30),
-        armed: Arc::default(),
+        dedup_ttl: CompactDuration::new(30),
+        checks: (),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     });
     let context = MockEventContext::new()

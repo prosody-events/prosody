@@ -252,7 +252,7 @@ impl Selector {
 
                 match demand_type {
                     DemandType::Normal => self.success_time += duration,
-                    DemandType::Failure => self.failure_time += duration,
+                    DemandType::Failure { .. } => self.failure_time += duration,
                 }
 
                 self.increment_key_time(&tp_key, duration);
@@ -285,7 +285,7 @@ impl Selector {
                             update_min_priority(n_best, index, priority, task.timestamp),
                             f_best,
                         ),
-                        DemandType::Failure => (
+                        DemandType::Failure { .. } => (
                             n_best,
                             update_min_priority(f_best, index, priority, task.timestamp),
                         ),
