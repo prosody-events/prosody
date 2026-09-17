@@ -30,21 +30,21 @@ where
         self.handle
             .get()
             .await
-            .map_err(|e| ErasedStateError::from_classified(&e))
+            .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
     async fn set(&self, item: ResolvedOf<T>) -> Result<(), ErasedStateError> {
         T::reject_null(&item)?;
         T::value_set(&self.handle, item)
             .await
-            .map_err(|e| ErasedStateError::from_classified(&e))
+            .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
     async fn clear(&self) -> Result<(), ErasedStateError> {
         self.handle
             .clear()
             .await
-            .map_err(|e| ErasedStateError::from_classified(&e))
+            .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
     async fn commit(&self) -> Result<(), ErasedStateError> {
@@ -52,7 +52,7 @@ where
             .commit()
             .await
             .map(drop)
-            .map_err(|e| ErasedStateError::from_classified(&e))
+            .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
     async fn rollback(&self) {

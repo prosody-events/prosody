@@ -77,16 +77,16 @@ where
         handle.set(item)
     }
 
-    fn map_set<'a, S>(
+    async fn map_set<'a, S>(
         handle: &'a MapHandle<S, Utf8KeyCodec, Self>,
         key: String,
         item: C::Payload,
-    ) -> impl Future<Output = Result<(), MapStateError<CellCodecError<Self>>>> + Send + 'a
+    ) -> Result<(), MapStateError<CellCodecError<Self>>>
     where
         S: WritableStateSession,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>,
     {
-        handle.set(key, item)
+        handle.set(&key, item).await
     }
 
     fn deque_push_back<'a, S>(
@@ -142,7 +142,7 @@ impl<L: MessageLoader + 'static> ErasedWrite for MessageCell<L> {
         S: WritableStateSession,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>,
     {
-        handle.set(key, &item).await
+        handle.set(&key, &item).await
     }
 
     async fn deque_push_back<'a, S>(

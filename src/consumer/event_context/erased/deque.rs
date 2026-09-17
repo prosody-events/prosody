@@ -2,14 +2,13 @@
 
 use super::write::ErasedWrite;
 use super::{
-    BoxStateCursor, DequeScanConfig, DynDequeState, ErasedStateError, StateCursor, bound_usize,
+    BoxStateCursor, DequeScanConfig, DynDequeState, ErasedStateError, bound_usize, cursor,
 };
 use crate::state::collection::WritableStateSession;
 use crate::state::descriptor::{CellType, ContextOf, DequeHandle, FromSession, ResolvedOf};
 use crate::state::order_codec::UnitKey;
 use async_stream::try_stream;
 use async_trait::async_trait;
-use futures::StreamExt;
 
 /// Erased deque wrapper over a typed [`DequeHandle`].
 pub(in crate::consumer::event_context) struct ErasedDeque<S, T> {
@@ -34,89 +33,85 @@ where
         self.handle
             .len()
             .await
-            .map_err(|e| ErasedStateError::from_classified(&e))
+            .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
     async fn is_empty(&self) -> Result<bool, ErasedStateError> {
         self.handle
             .is_empty()
             .await
-            .map_err(|e| ErasedStateError::from_classified(&e))
+            .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
     async fn get(&self, index: usize) -> Result<Option<ResolvedOf<T>>, ErasedStateError> {
         self.handle
             .get(index)
             .await
-            .map_err(|e| ErasedStateError::from_classified(&e))
+            .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
     async fn push_back(&self, item: ResolvedOf<T>) -> Result<(), ErasedStateError> {
         T::reject_null(&item)?;
         T::deque_push_back(&self.handle, item)
             .await
-            .map_err(|e| ErasedStateError::from_classified(&e))
+            .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
     async fn push_front(&self, item: ResolvedOf<T>) -> Result<(), ErasedStateError> {
         T::reject_null(&item)?;
         T::deque_push_front(&self.handle, item)
             .await
-            .map_err(|e| ErasedStateError::from_classified(&e))
+            .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
     async fn pop_front(&self) -> Result<Option<ResolvedOf<T>>, ErasedStateError> {
         self.handle
             .pop_front()
             .await
-            .map_err(|e| ErasedStateError::from_classified(&e))
+            .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
     async fn pop_back(&self) -> Result<Option<ResolvedOf<T>>, ErasedStateError> {
         self.handle
             .pop_back()
             .await
-            .map_err(|e| ErasedStateError::from_classified(&e))
+            .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
     async fn peek_front(&self) -> Result<Option<ResolvedOf<T>>, ErasedStateError> {
         self.handle
             .peek_front()
             .await
-            .map_err(|e| ErasedStateError::from_classified(&e))
+            .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
     async fn peek_back(&self) -> Result<Option<ResolvedOf<T>>, ErasedStateError> {
         self.handle
             .peek_back()
             .await
-            .map_err(|e| ErasedStateError::from_classified(&e))
+            .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
     async fn clear(&self) -> Result<(), ErasedStateError> {
         self.handle
             .clear()
             .await
-            .map_err(|e| ErasedStateError::from_classified(&e))
+            .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
     fn scan(&self, config: DequeScanConfig) -> BoxStateCursor<ResolvedOf<T>> {
         let handle = self.handle.clone();
-        let stream = try_stream! {
+        Box::new(cursor(try_stream! {
             let start = bound_usize(config.start);
             let end = bound_usize(config.end);
             let mut query = handle.query(config.dir).range((start, end));
             if let Some(limit) = config.limit {
                 query = query.limit(limit);
             }
-            let inner = query.values();
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().await {
-                let value = item.map_err(|e| ErasedStateError::from_classified(&e))?;
-                yield value;
+            for await item in query.values() {
+                yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
             }
-        };
-        Box::new(StateCursor::new(Box::pin(stream)))
+        }))
     }
 
     async fn commit(&self) -> Result<(), ErasedStateError> {
@@ -124,7 +119,7 @@ where
             .commit()
             .await
             .map(drop)
-            .map_err(|e| ErasedStateError::from_classified(&e))
+            .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
     async fn rollback(&self) {

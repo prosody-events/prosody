@@ -589,7 +589,7 @@ fn collection_ops_export_operation_spans() -> Result<()> {
                 map_state::<Utf8KeyCodec, JsonCodec>("counts"),
                 MemoryLoader::new(),
             )?;
-            map.set("k1".to_owned(), json!(1_i32)).await?;
+            map.set(&"k1".to_owned(), json!(1_i32)).await?;
             map.get(&"k1".to_owned()).await?;
             let _entries: Vec<_> = map.stream(Direction::Forward).try_collect().await?;
             let _keys: Vec<_> = map.keys(Direction::Forward).try_collect().await?;
@@ -724,7 +724,7 @@ mod scope_containment {
             // Distinct writes to each sibling, interleaved.
             cart.set(a.clone()).await?;
             wishlist.set(b.clone()).await?;
-            counts.set("qty".to_owned(), b.clone()).await?;
+            counts.set(&"qty".to_owned(), b.clone()).await?;
             log.push_back(a.clone()).await?;
 
             // Each handle reads back exactly its own collection's data — no

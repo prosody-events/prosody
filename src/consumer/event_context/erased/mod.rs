@@ -9,6 +9,7 @@ use crate::state::cell_key::{Direction, ScanEdge};
 use crate::state::descriptor::map::Query;
 use crate::state::order_codec::{OrderedKeyCodec, Utf8KeyCodec};
 use async_trait::async_trait;
+use futures::Stream;
 use std::fmt::Display;
 use std::num::NonZeroUsize;
 use std::ops::Bound;
@@ -215,20 +216,28 @@ pub trait DynMapState<Item: Send + 'static>: Send + Sync {
 pub trait DynSetState: Send + Sync {
     /// Tests whether `key` belongs to the set.
     async fn contains(&self, key: String) -> Result<bool, ErasedStateError>;
+
     /// Tests each key for membership in input order.
     async fn contains_many(&self, keys: Vec<String>) -> Result<Vec<bool>, ErasedStateError>;
+
     /// Reports whether the set has no live members.
     async fn is_empty(&self) -> Result<bool, ErasedStateError>;
+
     /// Inserts `key` into the set.
     async fn insert(&self, key: String) -> Result<(), ErasedStateError>;
+
     /// Removes `key` from the set.
     async fn remove(&self, key: String) -> Result<(), ErasedStateError>;
+
     /// Removes all members.
     async fn clear(&self) -> Result<(), ErasedStateError>;
+
     /// Returns a demand-driven cursor over live keys.
     fn keys(&self, config: KeyScanConfig) -> BoxStateCursor<String>;
+
     /// Commits buffered set operations.
     async fn commit(&self) -> Result<(), ErasedStateError>;
+
     /// Discards buffered set operations.
     async fn rollback(&self);
 }
@@ -291,6 +300,12 @@ pub type BoxDequeState<Item> = Box<dyn DynDequeState<Item>>;
 
 /// Boxed [`StateCursor`] a `scan` returns.
 pub type BoxStateCursor<Item> = Box<StateCursor<Item>>;
+
+fn cursor<T>(
+    stream: impl Stream<Item = Result<T, ErasedStateError>> + Send + 'static,
+) -> StateCursor<T> {
+    StateCursor::new(Box::pin(stream))
+}
 
 fn bound_usize(bound: Bound<u64>) -> Bound<usize> {
     bound.map(|value| usize::try_from(value).unwrap_or(usize::MAX))

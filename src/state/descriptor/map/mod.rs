@@ -206,10 +206,10 @@ where
     #[write(op)]
     pub async fn set(
         &self,
-        key: KC::Key,
+        key: &KC::Key,
         value: WriteOf<'_, V>,
     ) -> Result<(), MapStateError<CellCodecError<V>>> {
-        membership::insert(op, &key, value).await
+        membership::insert(op, key, value).await
     }
 
     /// Removes `key` and subtracts it from the tracked keyset.

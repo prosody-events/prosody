@@ -1,12 +1,12 @@
 //! The erased set adapter.
 
-use super::{BoxStateCursor, DynSetState, ErasedStateError, KeyScanConfig, StateCursor, key_query};
+use super::{BoxStateCursor, DynSetState, ErasedStateError, KeyScanConfig, cursor, key_query};
 use crate::state::collection::WritableStateSession;
-use crate::state::descriptor::{SetHandle, SetQuery};
+use crate::state::descriptor::SetHandle;
+use crate::state::descriptor::map::KeysetQuery;
 use crate::state::order_codec::Utf8KeyCodec;
 use async_stream::try_stream;
 use async_trait::async_trait;
-use futures::StreamExt;
 
 /// Erased set wrapper over a typed UTF-8 set.
 pub(in crate::consumer::event_context) struct ErasedSet<S> {
@@ -47,7 +47,7 @@ where
 
     async fn insert(&self, key: String) -> Result<(), ErasedStateError> {
         self.handle
-            .insert(key)
+            .insert(&key)
             .await
             .map_err(|error| ErasedStateError::from_classified(&error))
     }
@@ -68,14 +68,11 @@ where
 
     fn keys(&self, config: KeyScanConfig) -> BoxStateCursor<String> {
         let handle = self.handle.clone();
-        let stream = try_stream! {
-            let inner = SetQuery::new(handle.cells(), key_query(config)).keys();
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().await {
+        Box::new(cursor(try_stream! {
+            for await item in KeysetQuery::new(handle.cells(), key_query(config)).keys() {
                 yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
             }
-        };
-        Box::new(StateCursor::new(Box::pin(stream)))
+        }))
     }
 
     async fn commit(&self) -> Result<(), ErasedStateError> {

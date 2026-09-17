@@ -28,7 +28,7 @@ async fn run_set_trace(
                 async |handle, op, model: &mut BTreeSet<i64>| {
                     let outcome = match op {
                         MapOp::Set(key, _) => {
-                            handle.insert(key).await?;
+                            handle.insert(&key).await?;
                             model.insert(key);
                             OpOutcome::Continue
                         }
@@ -104,7 +104,7 @@ async fn assert_batch(input: &MapGetManyInput, constraints: StreamConstraints) -
     let handle = descriptor.bind(&session)?;
     let mut model = BTreeSet::new();
     for &(member, _) in &input.entries {
-        handle.insert(member).await?;
+        handle.insert(&member).await?;
         model.insert(member);
     }
     if input.commit {

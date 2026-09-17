@@ -114,8 +114,8 @@ where
     /// Returns a codec error or a session access error.
     #[instrument(name = "set.insert", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
     #[write(op)]
-    pub async fn insert(&self, key: KC::Key) -> Result<(), SetStateError> {
-        membership::insert(op, &key, ()).await
+    pub async fn insert(&self, key: &KC::Key) -> Result<(), SetStateError> {
+        membership::insert(op, key, ()).await
     }
 
     /// Removes `key` from the set.

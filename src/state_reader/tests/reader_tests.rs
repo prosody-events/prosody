@@ -229,7 +229,7 @@ async fn reader_presence_uses_read_cache() -> Result<()> {
     let tp = topic("orders");
     let state_key = env
         .commit(GROUP_A, tp, &key, 1, |map| async move {
-            map.set(1, Value::from(7_i32)).await?;
+            map.set(&1, Value::from(7_i32)).await?;
             Ok(())
         })
         .await?;
@@ -289,7 +289,7 @@ async fn reader_range_probe_pins_second_source() -> Result<()> {
     env.publish("group-000", first_topic).await;
     let second = env
         .commit(GROUP_A, second_topic, &key, 1, |map| async move {
-            map.set(1, Value::from(7_i32)).await?;
+            map.set(&1, Value::from(7_i32)).await?;
             Ok(())
         })
         .await?

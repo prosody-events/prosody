@@ -29,7 +29,7 @@ pub(in crate::state_reader::tests) async fn run_reader_set_trace<B: ReaderBacken
                 for op in for_handle {
                     match op {
                         MapOp::Set(key, _) => handle
-                            .insert(key)
+                            .insert(&key)
                             .await
                             .map_err(|error| eyre!("insert: {error}"))?,
                         MapOp::Remove(key) => handle

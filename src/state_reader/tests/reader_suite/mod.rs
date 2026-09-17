@@ -108,7 +108,7 @@ async fn apply_map_ops<B: ReaderBackend>(
     for op in ops {
         match op {
             MapOp::Set(k, b) => handle
-                .set(k, Value::from(b))
+                .set(&k, Value::from(b))
                 .await
                 .map_err(|e| eyre!("set: {e}"))?,
             MapOp::Remove(k) => handle.remove(&k).await.map_err(|e| eyre!("remove: {e}"))?,
