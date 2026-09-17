@@ -4,9 +4,7 @@ use super::StateReader;
 use crate::Key;
 use crate::codec::Codec;
 use crate::state::cell_key::Direction;
-use crate::state::descriptor::{
-    CellType, ContextOf, DequeDescriptor, DequeHandle, FromSession, ResolvedOf, StateDescriptor,
-};
+use crate::state::descriptor::{CellType, ContextOf, DequeDescriptor, FromSession, ResolvedOf};
 use crate::state::order_codec::UnitKey;
 use crate::state_reader::error::StateReaderError;
 use crate::state_reader::session::ReadSession;
@@ -63,8 +61,7 @@ where
         ResolvedOf<T>: 'static,
         for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
     {
-        let session = self.reader.session(self.key).await?;
-        let handle: DequeHandle<_, T> = self.reader.descriptor.bind(&session)?;
+        let handle = self.reader.bound(self.key).await?;
         Ok(async_stream::try_stream! {
             let query = handle.query(self.dir).range((self.start, self.end));
             let query = match self.limit {

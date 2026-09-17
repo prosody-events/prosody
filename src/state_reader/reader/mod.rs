@@ -7,12 +7,10 @@
 //! source per operation (probe-and-pin; see
 //! [`ReadSession`](super::session::ReadSession)).
 //!
-//! The read methods carry **zero per-descriptor logic**. Each builds a
-//! [`ReadSession`], binds the descriptor to it, and delegates to the resulting
-//! collection handle. That handle is the same one the owning consumer's
-//! handlers use, so owner and reader share one read implementation. A
-//! descriptor backed by a Kafka message reference takes the same path because
-//! the session's loader is selected by its backend family.
+//! Point reads acquire a session and bind a collection handle.
+//! Queries bind the collection directly and use the shared query executor.
+//! Owner and reader sessions use the same collection methods.
+//! Message reference cells use the loader from the session's backend.
 //!
 //! [`acquisition`] owns source discovery, snapshot refresh, and retries.
 
@@ -28,7 +26,7 @@ mod query;
 mod set;
 pub use deque::DequeReaderQuery;
 
-pub use query::MapReaderQuery;
+pub use query::{MapReaderQuery, SetReaderQuery};
 
 use crate::Key;
 use crate::codec::Codec;
@@ -36,8 +34,8 @@ use crate::state::StateName;
 use crate::state::cell_key::Direction;
 use crate::state::descriptor::map::Query;
 use crate::state::descriptor::{
-    CellType, ContextOf, DequeDescriptor, DequeHandle, FromSession, MapDescriptor, MapHandle,
-    ResolvedOf, StateDescriptor, ValueDescriptor,
+    CellType, ContextOf, DequeDescriptor, FromSession, MapDescriptor, ResolvedOf, StateDescriptor,
+    ValueDescriptor,
 };
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
 use crate::state_reader::deps::StateReaderDependencies;
@@ -149,6 +147,11 @@ where
         })
     }
 
+    async fn bound(&self, key: Key) -> Result<D::Handle<ReadSession<C, B>>, StateReaderError> {
+        let session = self.session(key).await?;
+        Ok(self.descriptor.bind(&session)?)
+    }
+
     /// Builds a per-operation [`ReadSession`] over the current snapshot, with a
     /// fresh source pin. Rejects an empty key first: an empty or NULL key has
     /// no deterministic partition to route to.
@@ -193,8 +196,7 @@ where
         &self,
         key: K,
     ) -> Result<Option<ResolvedOf<T>>, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle = self.descriptor.bind(&session)?;
+        let handle = self.bound(key.into()).await?;
         handle.get().await.map_err(|e| StateReaderError::store(&e))
     }
 }
@@ -220,8 +222,7 @@ where
         key: K,
         map_key: &KC::Key,
     ) -> Result<Option<ResolvedOf<V>>, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
+        let handle = self.bound(key.into()).await?;
         handle
             .get(map_key)
             .await
@@ -238,8 +239,7 @@ where
         key: K,
         map_key: &KC::Key,
     ) -> Result<bool, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
+        let handle = self.bound(key.into()).await?;
         handle
             .contains_key(map_key)
             .await
@@ -252,8 +252,7 @@ where
     ///
     /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
     pub async fn is_empty<K: Into<Key>>(&self, key: K) -> Result<bool, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
+        let handle = self.bound(key.into()).await?;
         handle
             .is_empty()
             .await
@@ -271,8 +270,7 @@ where
         key: K,
         map_keys: &[KC::Key],
     ) -> Result<Vec<Option<ResolvedOf<V>>>, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
+        let handle = self.bound(key.into()).await?;
         handle
             .get_many(map_keys)
             .await
@@ -290,8 +288,7 @@ where
         key: K,
         map_keys: &[KC::Key],
     ) -> Result<Vec<bool>, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
+        let handle = self.bound(key.into()).await?;
         handle
             .contains_many(map_keys)
             .await
@@ -370,8 +367,7 @@ where
         key: K,
         index: usize,
     ) -> Result<Option<ResolvedOf<T>>, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle: DequeHandle<_, T> = self.descriptor.bind(&session)?;
+        let handle = self.bound(key.into()).await?;
         handle
             .get(index)
             .await
@@ -384,8 +380,7 @@ where
     ///
     /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
     pub async fn len<K: Into<Key>>(&self, key: K) -> Result<usize, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle: DequeHandle<_, T> = self.descriptor.bind(&session)?;
+        let handle = self.bound(key.into()).await?;
         handle.len().await.map_err(|e| StateReaderError::store(&e))
     }
 
@@ -395,8 +390,7 @@ where
     ///
     /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
     pub async fn is_empty<K: Into<Key>>(&self, key: K) -> Result<bool, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle: DequeHandle<_, T> = self.descriptor.bind(&session)?;
+        let handle = self.bound(key.into()).await?;
         handle
             .is_empty()
             .await
@@ -412,8 +406,7 @@ where
         &self,
         key: K,
     ) -> Result<Option<ResolvedOf<T>>, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle: DequeHandle<_, T> = self.descriptor.bind(&session)?;
+        let handle = self.bound(key.into()).await?;
         handle
             .peek_front()
             .await
@@ -429,8 +422,7 @@ where
         &self,
         key: K,
     ) -> Result<Option<ResolvedOf<T>>, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle: DequeHandle<_, T> = self.descriptor.bind(&session)?;
+        let handle = self.bound(key.into()).await?;
         handle
             .peek_back()
             .await

@@ -92,7 +92,7 @@ where
     fn scan(&self, config: KeyScanConfig) -> BoxStateCursor<(String, ResolvedOf<T>)> {
         let handle = self.handle.clone();
         let stream = try_stream! {
-            let inner = MapQuery::new(&handle, key_query(config)).entries();
+            let inner = MapQuery::new(handle.cells(), key_query(config)).entries();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 let (key, value) = item.map_err(|e| ErasedStateError::from_classified(&e))?;
@@ -105,7 +105,7 @@ where
     fn keys(&self, config: KeyScanConfig) -> BoxStateCursor<String> {
         let handle = self.handle.clone();
         let stream = try_stream! {
-            let inner = MapQuery::new(&handle, key_query(config)).keys();
+            let inner = MapQuery::new(handle.cells(), key_query(config)).keys();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 let key = item.map_err(|e| ErasedStateError::from_classified(&e))?;

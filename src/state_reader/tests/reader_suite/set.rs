@@ -79,6 +79,19 @@ pub(in crate::state_reader::tests) async fn run_reader_set_trace<B: ReaderBacken
         if forward != model.iter().copied().collect::<Vec<_>>() {
             return Ok(false);
         }
+        assert_eq!(
+            collect_stream(
+                reader
+                    .query(case.key.clone(), Direction::Forward)
+                    .after(&-2)
+                    .to(&1)
+                    .limit(NonZeroUsize::MIN)
+                    .keys()
+                    .await?
+            )
+            .await?,
+            model.range(-1..=1).take(1).copied().collect::<Vec<_>>()
+        );
         let backward =
             collect_stream(reader.keys(case.key.clone(), Direction::Backward).await?).await?;
         if backward != model.iter().rev().copied().collect::<Vec<_>>() {

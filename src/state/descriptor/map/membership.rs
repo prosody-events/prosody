@@ -2,28 +2,71 @@
 
 use super::keyset::{KEYSET_BYTE_CEILING, is_oversized, tracked_frame_len};
 use super::{Keyset, KeysetFrameError, MapKeysetCodec, MapKeysetKey, MapStateError, Query};
-use crate::state::cell_key::Coordinate;
+use crate::state::StateName;
+use crate::state::cell::Presence;
+use crate::state::cell_key::{Coordinate, Direction, ScanEdge};
 use crate::state::collection::{
-    CellFamily, CollectionRead, CollectionWrite, Plan, ReadOperation, StateSession,
+    CellFamily, Collection, CollectionRead, CollectionWrite, JOURNAL_INLINE, Plan, ReadOperation,
+    StateSession,
 };
 use crate::state::descriptor::{
     CellCodecError, CellStateError, CollectionSpec, KeyOf, Keyed, WriteOf,
 };
+use futures::StreamExt;
 use std::error::Error;
-use tracing::warn;
+use std::num::NonZeroUsize;
+use tracing::{Span, warn};
+
+/// Insert and remove each stage one member mutation and one keyset write.
+/// Clear stages one layout reset.
+const KEYSET_MAX_MUTATIONS: usize = 2;
+const _: () = assert!(
+    KEYSET_MAX_MUTATIONS <= JOURNAL_INLINE,
+    "a map or set operation must fit in the inline journal"
+);
 
 /// A collection whose keyset and members share one atomic mutation.
 /// The layout fixes both families at compile time.
+/// Concrete descriptor and query methods keep this trait out of public bounds.
 pub(crate) trait KeysetLayout: CollectionSpec {
     /// The family whose cells define membership.
     const MEMBERS: CellFamily<Self, Self::Cell>;
 
     /// The keyset family for this layout.
     const KEYSET: CellFamily<Self, Keyed<MapKeysetKey, MapKeysetCodec>>;
+
+    /// The span every stream under this layout runs in.
+    /// A span name must be a literal, so a trait constant cannot replace this
+    /// function.
+    fn stream_span(collection: &StateName, dir: Direction, projection: &'static str) -> Span;
 }
 
 /// The member cell selected by an operation's layout.
 type MemberOf<C> = <<C as CollectionRead>::Layout as CollectionSpec>::Cell;
+
+/// Reports whether the member family has no live cells.
+pub(crate) async fn is_empty<S, L>(
+    cells: &Collection<S, L>,
+) -> Result<bool, MapStateError<CellCodecError<L::Cell>>>
+where
+    S: StateSession,
+    L: KeysetLayout,
+{
+    let plan = cells
+        .read(async |op| {
+            op.range(
+                L::MEMBERS,
+                ScanEdge::Unbounded,
+                Direction::Forward,
+                ScanEdge::Unbounded,
+            )
+            .with_limit(Some(NonZeroUsize::MIN))
+        })
+        .await;
+    let keys = plan.projected::<Presence>();
+    futures::pin_mut!(keys);
+    Ok(keys.next().await.transpose()?.is_none())
+}
 
 /// Stages the member and keyset in one admitted operation.
 /// Read the prior keyset before the member write becomes visible.
@@ -38,7 +81,12 @@ where
 {
     let prior = read_keyset_state(op).await?;
     let address = C::Layout::MEMBERS.at(key);
-    let keyset = prior.insert(address.coordinate(), op.keyset_limit(), op.has_ttl());
+    let keyset = prior.insert(
+        address.coordinate(),
+        op.keyset_limit(),
+        op.has_ttl(),
+        op.name(),
+    );
     write_keyset(op, keyset)?;
     op.set(address, value).map_err(Into::into)
 }
@@ -135,9 +183,15 @@ where
 
 impl PriorKeyset {
     /// Returns a replacement only when membership or its TTL changes.
-    fn insert(self, coordinate: &Coordinate, limit: usize, ttl: bool) -> Option<Keyset> {
+    fn insert(
+        self,
+        coordinate: &Coordinate,
+        limit: usize,
+        ttl: bool,
+        collection: &StateName,
+    ) -> Option<Keyset> {
         let mut keys = match self {
-            Self::Absent => Vec::new(),
+            Self::Absent => Vec::with_capacity(1),
             Self::Malformed => return Some(Keyset::Overflowed),
             Self::Decoded(Keyset::Overflowed) => return ttl.then_some(Keyset::Overflowed),
             Self::Decoded(Keyset::Tracked(keys)) => keys,
@@ -145,7 +199,10 @@ impl PriorKeyset {
         let frame_len = tracked_frame_len(&keys);
         // Apply a lowered bound before duplicate detection.
         if keys.len() > limit || frame_len.is_none_or(|len| len > KEYSET_BYTE_CEILING) {
-            warn!("keyset exceeds its bound; store Overflowed");
+            warn!(
+                collection = collection.as_str(),
+                "keyset exceeds its bound; store Overflowed"
+            );
             return Some(Keyset::Overflowed);
         }
         match keys.binary_search(coordinate) {

@@ -8,7 +8,7 @@ use bytes::{Bytes, BytesMut};
 use thiserror::Error;
 
 /// Maximum encoded keyset size. Insertions above this bound write `Overflowed`.
-pub(crate) const KEYSET_BYTE_CEILING: usize = 64 * 1024;
+pub(super) const KEYSET_BYTE_CEILING: usize = 64 * 1024;
 
 /// The durable tag for tracked membership.
 pub(super) const TRACKED_TAG: u8 = 0;
@@ -148,7 +148,7 @@ fn encode_keyset(payload: &Keyset, buf: &mut Vec<u8>) -> Result<(), KeysetFrameE
 }
 
 /// Returns the encoded size, or `None` when the size overflows.
-pub(crate) fn tracked_frame_len(keys: &[Coordinate]) -> Option<usize> {
+pub(super) fn tracked_frame_len(keys: &[Coordinate]) -> Option<usize> {
     let mut total = 1usize.checked_add(4)?;
     for coordinate in keys {
         total = total
@@ -159,7 +159,7 @@ pub(crate) fn tracked_frame_len(keys: &[Coordinate]) -> Option<usize> {
 }
 
 /// Tests both the registered count limit and the encoded byte limit.
-pub(crate) fn is_oversized(keys: &[Coordinate], limit: usize) -> bool {
+pub(super) fn is_oversized(keys: &[Coordinate], limit: usize) -> bool {
     keys.len() > limit || tracked_frame_len(keys).is_none_or(|len| len > KEYSET_BYTE_CEILING)
 }
 

@@ -1,15 +1,15 @@
 //! Standalone reads of committed set membership.
 
-use super::StateReader;
+use super::{SetReaderQuery, StateReader};
 use crate::Key;
 use crate::codec::Codec;
 use crate::state::cell_key::Direction;
-use crate::state::descriptor::{SetDescriptor, SetHandle, StateDescriptor};
+use crate::state::descriptor::SetDescriptor;
+use crate::state::descriptor::map::Query;
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state_reader::{ReaderBackend, StateReaderError};
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use std::fmt::Display;
-use tokio::task::coop::cooperative;
 
 impl<KC, C, B> StateReader<SetDescriptor<KC>, C, B>
 where
@@ -29,8 +29,7 @@ where
         key: K,
         member: &KC::Key,
     ) -> Result<bool, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle: SetHandle<_, KC> = self.descriptor.bind(&session)?;
+        let handle = self.bound(key.into()).await?;
         handle
             .contains(member)
             .await
@@ -47,8 +46,7 @@ where
         key: K,
         members: &[KC::Key],
     ) -> Result<Vec<bool>, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle: SetHandle<_, KC> = self.descriptor.bind(&session)?;
+        let handle = self.bound(key.into()).await?;
         handle
             .contains_many(members)
             .await
@@ -61,8 +59,7 @@ where
     ///
     /// Returns an error when session acquisition or handle binding fails.
     pub async fn is_empty<K: Into<Key>>(&self, key: K) -> Result<bool, StateReaderError> {
-        let session = self.session(key.into()).await?;
-        let handle: SetHandle<_, KC> = self.descriptor.bind(&session)?;
+        let handle = self.bound(key.into()).await?;
         handle
             .is_empty()
             .await
@@ -80,14 +77,15 @@ where
         dir: Direction,
     ) -> Result<impl Stream<Item = Result<KC::Key, StateReaderError>> + 'static, StateReaderError>
     {
-        let session = self.session(key.into()).await?;
-        let handle: SetHandle<_, KC> = self.descriptor.bind(&session)?;
-        Ok(async_stream::try_stream! {
-            let inner = handle.keys(dir);
-            futures::pin_mut!(inner);
-            while let Some(item) = cooperative(inner.next()).await {
-                yield item.map_err(|error| StateReaderError::store(&error))?;
-            }
-        })
+        self.query(key, dir).keys().await
+    }
+
+    /// Builds a directional set query for partition `key`.
+    pub fn query<K: Into<Key>>(&self, key: K, dir: Direction) -> SetReaderQuery<'_, KC, C, B> {
+        SetReaderQuery {
+            reader: self,
+            key: key.into(),
+            query: Query::new(dir),
+        }
     }
 }

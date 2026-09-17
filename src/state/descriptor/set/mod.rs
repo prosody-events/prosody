@@ -3,25 +3,22 @@
 //! A set stores one zero-byte cell per member. It shares the map keyset
 //! format and keeps the same membership rules.
 
+pub use super::map::SetQuery;
 use super::map::membership::{self, KeysetLayout};
-use super::map::{MapKeysetCodec, MapKeysetKey, MapStateError, Query};
+use super::map::{KeyItem, KeysetQuery, MapKeysetCodec, MapKeysetKey, MapStateError, Query};
 use super::{CollectionSpec, Descriptor, Keyed};
 use crate::codec::{UnitCodec, UnitCodecError};
-use crate::state::cell::Presence;
-use crate::state::cell_key::{Direction, ScanEdge};
+use crate::state::cell_key::Direction;
 use crate::state::collection::{
-    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, JOURNAL_INLINE,
-    Plan, StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
-    spec_matches,
+    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, StateSession,
+    WritableStateSession, collection_layout, collection_methods, same_token, spec_matches,
 };
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
-use crate::state::{CollectionKindId, StoreOutcome};
-use async_stream::try_stream;
+use crate::state::{CollectionKindId, StateName, StoreOutcome};
 use educe::Educe;
-use futures::stream::{Stream, StreamExt};
+use futures::stream::Stream;
 use std::fmt::Display;
-use std::num::NonZeroUsize;
-use tracing::{Instrument, info_span, instrument};
+use tracing::{Span, info_span, instrument};
 
 collection_layout! {
     /// The set collection kind has one keyset cell and one cell per member.
@@ -38,14 +35,13 @@ collection_layout! {
 impl<KC: OrderedKeyCodec> KeysetLayout for SetKind<KC> {
     const KEYSET: CellFamily<Self, Keyed<MapKeysetKey, MapKeysetCodec>> = Self::KEYSET;
     const MEMBERS: CellFamily<Self, Self::Cell> = Self::MEMBERS;
+
+    fn stream_span(collection: &StateName, dir: Direction, projection: &'static str) -> Span {
+        info_span!("set.stream", collection = collection.as_str(), direction = ?dir, projection)
+    }
 }
 
 type FrozenLayout = SetKind<I64KeyCodec>;
-const SET_MAX_MUTATIONS: usize = 2;
-const _: () = assert!(
-    SET_MAX_MUTATIONS <= JOURNAL_INLINE,
-    "a set operation must fit in the inline journal"
-);
 const _: () = {
     let families = <FrozenLayout as CollectionLayout>::DESCRIPTOR;
     assert!(families.len() == 2, "Set has two cell families");
@@ -72,8 +68,6 @@ const _: () = {
         "Set has no reserved sections"
     );
 };
-
-type SetItem<KC> = Result<<KC as OrderedKeyCodec>::Key, SetStateError>;
 
 /// Descriptor for a presence-only ordered set.
 pub type SetDescriptor<KC> = Descriptor<SetKind<KC>>;
@@ -102,76 +96,6 @@ pub struct SetHandle<S, KC> {
     cells: Collection<S, SetKind<KC>>,
 }
 
-/// A directional set member stream query.
-///
-/// Build one with [`SetHandle::query`]. Finish it with [`keys`](Self::keys).
-/// `from` and `to` include their member. `after` and `before` exclude their
-/// member. State all edges in iteration order. A later call for the same edge
-/// replaces the earlier call. A start past the end yields an empty stream.
-#[must_use]
-pub struct SetQuery<'a, S, KC> {
-    handle: &'a SetHandle<S, KC>,
-    query: Query,
-}
-
-impl<'a, S, KC> SetQuery<'a, S, KC>
-where
-    S: StateSession,
-    KC: OrderedKeyCodec + 'static,
-    KC::Key: Display,
-{
-    /// Starts at `key`.
-    pub fn from(mut self, key: &KC::Key) -> Self {
-        self.query.start = ScanEdge::Included(KC::encode(key));
-        self
-    }
-
-    /// Starts after `key`.
-    pub fn after(mut self, key: &KC::Key) -> Self {
-        self.query.start = ScanEdge::Excluded(KC::encode(key));
-        self
-    }
-
-    /// Stops at `key`.
-    pub fn to(mut self, key: &KC::Key) -> Self {
-        self.query.end = ScanEdge::Included(KC::encode(key));
-        self
-    }
-
-    /// Stops before `key`.
-    pub fn before(mut self, key: &KC::Key) -> Self {
-        self.query.end = ScanEdge::Excluded(KC::encode(key));
-        self
-    }
-
-    /// Sets the maximum number of present members.
-    pub fn limit(mut self, limit: NonZeroUsize) -> Self {
-        self.query.limit = Some(limit);
-        self
-    }
-
-    pub(crate) fn new(handle: &'a SetHandle<S, KC>, query: Query) -> Self {
-        Self { handle, query }
-    }
-
-    /// Streams live members in the query direction.
-    pub fn keys(self) -> impl Stream<Item = SetItem<KC>> + 'a {
-        let span = info_span!(
-            "set.keys",
-            collection = self.handle.cells.name().as_str(),
-            direction = ?self.query.dir,
-        );
-        try_stream! {
-            let plan = self.handle.stream_plan(&self.query).instrument(span.clone()).await?;
-            let inner = plan.with_limit(self.query.limit).projected::<Presence>();
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().instrument(span.clone()).await {
-                yield item?;
-            }
-        }
-    }
-}
-
 #[collection_methods(field = cells, session = S)]
 impl<S, KC> SetHandle<S, KC>
 where
@@ -179,6 +103,10 @@ where
     KC: OrderedKeyCodec + 'static,
     KC::Key: Display,
 {
+    pub(crate) fn cells(&self) -> &Collection<S, SetKind<KC>> {
+        &self.cells
+    }
+
     /// Inserts `key` into the set.
     ///
     /// # Errors
@@ -238,22 +166,14 @@ where
         Ok(())
     }
 
-    #[read(op)]
-    async fn stream_plan(
-        &self,
-        query: &Query,
-    ) -> Result<Plan<S, Keyed<KC, UnitCodec>>, SetStateError> {
-        membership::plan(op, query).await
-    }
-
     /// Streams live members in the direction `dir`.
-    pub fn keys(&self, dir: Direction) -> impl Stream<Item = SetItem<KC>> + '_ {
+    pub fn keys(&self, dir: Direction) -> impl Stream<Item = KeyItem<SetKind<KC>>> + '_ {
         self.query(dir).keys()
     }
 
     /// Builds a directional set query.
     pub fn query(&self, dir: Direction) -> SetQuery<'_, S, KC> {
-        SetQuery::new(self, Query::new(dir))
+        KeysetQuery::new(&self.cells, Query::new(dir))
     }
 
     /// Reports whether the set has no live members.
@@ -263,21 +183,7 @@ where
     /// Returns a key codec error or a session access error.
     #[instrument(name = "set.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err)]
     pub async fn is_empty(&self) -> Result<bool, SetStateError> {
-        let plan = self
-            .cells
-            .read(async |op| {
-                op.range(
-                    SetKind::<KC>::MEMBERS,
-                    ScanEdge::Unbounded,
-                    Direction::Forward,
-                    ScanEdge::Unbounded,
-                )
-                .with_limit(Some(NonZeroUsize::MIN))
-            })
-            .await;
-        let keys = plan.projected::<Presence>();
-        futures::pin_mut!(keys);
-        Ok(keys.next().await.transpose()?.is_none())
+        membership::is_empty(&self.cells).await
     }
 
     /// Commits buffered set operations.
@@ -313,8 +219,8 @@ where
 }
 
 impl<KC> Descriptor<SetKind<KC>> {
-    /// Sets the maximum member count for tracked reads. Larger sets use
-    /// scans.
+    /// Sets the maximum member count for tracked reads.
+    /// Larger sets use range scans until clear or expiry.
     #[must_use]
     pub fn keyset_limit(mut self, limit: usize) -> Self {
         self.def.keyset_limit = limit;

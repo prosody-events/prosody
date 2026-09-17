@@ -2,11 +2,14 @@
 
 use super::{Keyed, KeysetLayout, MapKeysetCodec, MapKeysetKey};
 use crate::codec::JsonCodec;
+use crate::state::StateName;
+use crate::state::cell_key::Direction;
 use crate::state::collection::{
-    CellFamily, CollectionLayout, JOURNAL_INLINE, collection_layout, same_token, spec_matches,
+    CellFamily, CollectionLayout, collection_layout, same_token, spec_matches,
 };
 use crate::state::descriptor::CellType;
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec, UnitKey};
+use tracing::{Span, info_span};
 
 collection_layout! {
     /// The Map collection kind: one keyset cell plus one cell per key. The key
@@ -29,6 +32,10 @@ where
 {
     const KEYSET: CellFamily<Self, Keyed<MapKeysetKey, MapKeysetCodec>> = Self::KEYSET;
     const MEMBERS: CellFamily<Self, Self::Cell> = Self::ENTRIES;
+
+    fn stream_span(collection: &StateName, dir: Direction, projection: &'static str) -> Span {
+        info_span!("map.stream", collection = collection.as_str(), direction = ?dir, projection)
+    }
 }
 
 /// The instantiation the frozen-layout pin and the test-only cell-address
@@ -36,17 +43,6 @@ where
 /// section and its declared codecs come from the layout, never from the type
 /// parameters, so every instantiation answers identically.
 pub(super) type FrozenLayout = MapKind<I64KeyCodec, JsonCodec>;
-
-/// Map's declared per-invocation mutation maximum: `set` and `remove` each
-/// stage one entry mutation plus one keyset write; `clear` stages one
-/// whole-layout reset. The assertion below pins the declaration against
-/// [`JOURNAL_INLINE`]'s budget.
-const MAP_MAX_MUTATIONS: usize = 2;
-
-const _: () = assert!(
-    MAP_MAX_MUTATIONS <= JOURNAL_INLINE,
-    "a Map invocation must stay inside the journal's inline capacity"
-);
 
 /// Map's durable layout, frozen. The ids and the keyset family's format tokens
 /// below address every Map cell ever written; changing one silently re-points

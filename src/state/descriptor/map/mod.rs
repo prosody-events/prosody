@@ -16,14 +16,14 @@ mod query;
 use layout::FrozenLayout;
 pub use layout::MapKind;
 mod keyset;
-pub(crate) mod membership;
+pub(super) mod membership;
 use keyset::Keyset;
 pub use keyset::KeysetFrameError;
 pub(crate) use keyset::{MapKeysetCodec, MapKeysetKey};
-use membership::KeysetLayout;
+pub(crate) use membership::KeysetLayout;
 
-pub use query::MapQuery;
 pub(crate) use query::Query;
+pub use query::{KeyItem, KeysetQuery, MapQuery, MapStreamItem, SetQuery};
 
 use super::{
     CellCodecError, CellStateError, CellType, CollectionSpec, ContextOf, Descriptor, FromSession,
@@ -33,34 +33,23 @@ use super::{
 use crate::codec::Codec;
 use crate::codec::JsonCodec;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::cell::Presence;
+use crate::state::cell_key::Direction;
 #[cfg(test)]
 use crate::state::cell_key::{CellKey, Coordinate};
-use crate::state::cell_key::{Direction, ScanEdge};
 #[cfg(test)]
 use crate::state::collection::CollectionLayout;
 use crate::state::collection::{
-    Collection, CollectionRead, CollectionWrite, Plan, StateSession, WritableStateSession,
+    Collection, CollectionRead, CollectionWrite, StateSession, WritableStateSession,
     collection_methods,
 };
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
 use crate::state::{CollectionKindId, StateAccessError, StoreOutcome};
 use educe::Educe;
-use futures::stream::{Stream, StreamExt};
+use futures::stream::Stream;
 use std::error::Error;
 use std::fmt::Display;
-use std::num::NonZeroUsize;
 use thiserror::Error;
 use tracing::instrument;
-
-/// One item [`MapHandle::stream`] yields: a decoded key paired with its
-/// resolved value, or the error that ended the stream.
-type MapStreamItem<KC, V> =
-    Result<(<KC as OrderedKeyCodec>::Key, ResolvedOf<V>), MapStateError<CellCodecError<V>>>;
-
-/// One item [`MapHandle::keys`] yields: a decoded key, or the error that ended
-/// the stream. The presence-only, value-free twin of [`MapStreamItem`].
-type MapKeyItem<KC, V> = Result<<KC as OrderedKeyCodec>::Key, MapStateError<CellCodecError<V>>>;
 
 /// Descriptor for a codec-backed ordered map collection. Generic over an
 /// [`OrderedKeyCodec`] `KC` (the key encoding, frozen into the identity) and a
@@ -108,6 +97,10 @@ where
     KC::Key: Display,
     V: CellType<Key = UnitKey>,
 {
+    pub(crate) fn cells(&self) -> &Collection<S, MapKind<KC, V>> {
+        &self.cells
+    }
+
     /// Reads and resolves the value for `key` (`None` when absent).
     ///
     /// # Errors
@@ -255,20 +248,6 @@ where
         Ok(())
     }
 
-    /// Captures the query source from the keyset.
-    /// An absent keyset produces no entry reads. A tracked keyset within its
-    /// bound selects point reads on the coordinates within the query bounds.
-    /// Other keysets select a scan within the query bounds.
-    /// Access errors propagate. Malformed or oversized keysets also emit a
-    /// warning.
-    #[read(op)]
-    async fn stream_plan(
-        &self,
-        query: &Query,
-    ) -> Result<Plan<S, Keyed<KC, V>>, MapStateError<CellCodecError<V>>> {
-        membership::plan(op, query).await
-    }
-
     /// Streams live entries in key order, ascending for [`Direction::Forward`].
     ///
     /// A tracked keyset fixes membership when the stream starts. Values remain
@@ -298,13 +277,13 @@ where
     /// Message-backed maps perform no Kafka fetches. Storage presence reads
     /// still occur, and a corrupt value does not hide its key.
     /// Source selection, consistency, and admission follow [`Self::stream`].
-    pub fn keys(&self, dir: Direction) -> impl Stream<Item = MapKeyItem<KC, V>> + '_ {
+    pub fn keys(&self, dir: Direction) -> impl Stream<Item = KeyItem<MapKind<KC, V>>> + '_ {
         self.query(dir).keys()
     }
 
     /// Builds a directional stream query.
     pub fn query(&self, dir: Direction) -> MapQuery<'_, S, KC, V> {
-        MapQuery::new(self, Query::new(dir))
+        KeysetQuery::new(&self.cells, Query::new(dir))
     }
 
     /// Reports whether the map holds no live entries.
@@ -318,21 +297,7 @@ where
     /// Returns a key codec error or an access error from the session.
     #[instrument(name = "map.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err)]
     pub async fn is_empty(&self) -> Result<bool, MapStateError<CellCodecError<V>>> {
-        let plan = self
-            .cells
-            .read(async |op| {
-                op.range(
-                    MapKind::<KC, V>::ENTRIES,
-                    ScanEdge::Unbounded,
-                    Direction::Forward,
-                    ScanEdge::Unbounded,
-                )
-                .with_limit(Some(NonZeroUsize::MIN))
-            })
-            .await;
-        let keys = plan.projected::<Presence>();
-        futures::pin_mut!(keys);
-        Ok(keys.next().await.transpose()?.is_none())
+        membership::is_empty(&self.cells).await
     }
 
     /// Durably commits this map's buffered ops mid-handler — entries and keyset
@@ -408,21 +373,18 @@ pub(crate) fn keyset_cell() -> CellKey {
 }
 
 impl<KC, V> Descriptor<MapKind<KC, V>> {
-    /// Sets the Map keyset bound: the number of **live** distinct keys this map
-    /// tracks before overflowing to the range scan. Default `128`,
-    /// validated `<= 4096` at registration; `0` disables tracking (every map
-    /// overflows on its first `set`). Because `remove` subtracts, a rotating
-    /// map whose live size stays under the bound keeps cached iteration; a
-    /// map that ever exceeds the bound in one incarnation overflows
-    /// permanently (until `clear` or TTL death), so a monotonically growing
-    /// key universe should not expect cached iteration.
+    /// Sets the number of live distinct keys a map or set tracks before
+    /// overflow. The default is `128`. Registration rejects limits above
+    /// `4096`. A limit of `0` makes the first member write overflow.
+    /// Removal subtracts membership, so collections within the bound keep
+    /// tracked reads. An overflowed collection uses range scans until clear
+    /// or expiry.
     ///
-    /// The bound shapes the **owner's** arm choice only. A published reader
-    /// binds the same map at the global validated ceiling, so a tracked keyset
-    /// the owner's lowered bound degrades still streams as point gets there.
-    ///
-    /// Available on Map registrations only — a keyset bound on a Value or Deque
-    /// is uncompilable, since this inherent method exists only at this type.
+    /// The bound controls source selection for owner reads only.
+    /// Standalone readers use the global validated ceiling for the same map or
+    /// set. Thus, they can use tracked reads when the owner's lower bound
+    /// selects a scan. Value and deque descriptors do not expose this
+    /// method.
     #[must_use]
     pub fn keyset_limit(mut self, limit: usize) -> Self {
         self.def.keyset_limit = limit;

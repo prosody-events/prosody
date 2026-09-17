@@ -1,18 +1,21 @@
-//! Map query values and their projected stream executor.
+//! Map and set query values and their projected stream executor.
 
-use super::{MapHandle, MapKeyItem, MapStateError, MapStreamItem};
+use super::membership::{self, KeysetLayout};
+use super::{MapKind, MapStateError};
 use crate::state::cell::{Presence, Values};
 use crate::state::cell_key::{Coordinate, Direction, ScanEdge};
-use crate::state::collection::{StateSession, StreamProjection, sealed};
-use crate::state::descriptor::{CellCodecError, CellType, ContextOf, FromSession, Keyed};
+use crate::state::collection::{Collection, StateSession, StreamProjection, sealed};
+use crate::state::descriptor::set::SetKind;
+use crate::state::descriptor::{
+    CellCodecError, CellType, CollectionSpec, ContextOf, FromSession, KeyOf, ResolvedOf,
+};
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
 use async_stream::try_stream;
 use futures::{Stream, StreamExt};
-use std::fmt::Display;
 use std::num::NonZeroUsize;
-use tracing::{Instrument, info_span};
+use tracing::Instrument;
 
-/// The encoded bounds, direction, and result limit of a map query.
+/// The encoded bounds, direction, and result limit of a map or set query.
 #[derive(Clone, Debug)]
 pub(crate) struct Query {
     pub(crate) dir: Direction,
@@ -21,52 +24,62 @@ pub(crate) struct Query {
     pub(crate) end: ScanEdge<Coordinate>,
 }
 
-/// A directional map stream query.
-///
-/// Build one with [`MapHandle::query`]. Finish with [`keys`](Self::keys) or
-/// [`entries`](Self::entries).
+/// One decoded key or the error that ended the stream.
+pub type KeyItem<L> = Result<
+    KeyOf<<L as CollectionSpec>::Cell>,
+    MapStateError<CellCodecError<<L as CollectionSpec>::Cell>>,
+>;
+
+/// One decoded map entry or the error that ended the stream.
+pub type MapStreamItem<KC, V> =
+    Result<(<KC as OrderedKeyCodec>::Key, ResolvedOf<V>), MapStateError<CellCodecError<V>>>;
+
+/// A directional map query.
+pub type MapQuery<'a, S, KC, V> = KeysetQuery<'a, S, MapKind<KC, V>>;
+
+/// A directional set query.
+pub type SetQuery<'a, S, KC> = KeysetQuery<'a, S, SetKind<KC>>;
+
+/// A directional map or set query.
 /// Edges follow the query direction. A later call replaces the same edge.
 /// A start past the end produces an empty stream.
 #[must_use]
-pub struct MapQuery<'a, S, KC, V> {
-    handle: &'a MapHandle<S, KC, V>,
+pub struct KeysetQuery<'a, S, L> {
+    cells: &'a Collection<S, L>,
     query: Query,
 }
 
-impl<'a, S, KC, V> MapQuery<'a, S, KC, V>
+impl<'a, S, L> KeysetQuery<'a, S, L>
 where
     S: StateSession,
-    KC: OrderedKeyCodec + 'static,
-    KC::Key: Display,
-    V: CellType<Key = UnitKey>,
+    L: CollectionSpec,
 {
-    /// Binds `query` to `handle`. The reader builds one after it binds a
-    /// handle to an acquired session.
-    pub(crate) fn new(handle: &'a MapHandle<S, KC, V>, query: Query) -> Self {
-        Self { handle, query }
+    /// Binds the query to a collection.
+    pub(crate) fn new(cells: &'a Collection<S, L>, query: Query) -> Self {
+        Self { cells, query }
     }
 
     /// Starts at `key`.
-    pub fn from(mut self, key: &KC::Key) -> Self {
-        self.query.start = ScanEdge::Included(KC::encode(key));
+    pub fn from(mut self, key: &KeyOf<L::Cell>) -> Self {
+        self.query.start = ScanEdge::Included(<L::Cell as CellType>::Key::encode(key));
         self
     }
 
     /// Starts after `key`.
-    pub fn after(mut self, key: &KC::Key) -> Self {
-        self.query.start = ScanEdge::Excluded(KC::encode(key));
+    pub fn after(mut self, key: &KeyOf<L::Cell>) -> Self {
+        self.query.start = ScanEdge::Excluded(<L::Cell as CellType>::Key::encode(key));
         self
     }
 
     /// Stops at `key`.
-    pub fn to(mut self, key: &KC::Key) -> Self {
-        self.query.end = ScanEdge::Included(KC::encode(key));
+    pub fn to(mut self, key: &KeyOf<L::Cell>) -> Self {
+        self.query.end = ScanEdge::Included(<L::Cell as CellType>::Key::encode(key));
         self
     }
 
     /// Stops before `key`.
-    pub fn before(mut self, key: &KC::Key) -> Self {
-        self.query.end = ScanEdge::Excluded(KC::encode(key));
+    pub fn before(mut self, key: &KeyOf<L::Cell>) -> Self {
+        self.query.end = ScanEdge::Excluded(<L::Cell as CellType>::Key::encode(key));
         self
     }
 
@@ -78,6 +91,38 @@ where
         self
     }
 
+    /// Runs the query under projection `P`.
+    pub(crate) fn projected<P>(
+        self,
+    ) -> impl Stream<Item = Result<P::Item, MapStateError<CellCodecError<L::Cell>>>> + 'a
+    where
+        L: KeysetLayout,
+        P: StreamProjection<S, L::Cell>,
+        S::Engine: sealed::Reads<S, P>,
+    {
+        let span = L::stream_span(self.cells.name(), self.query.dir, P::NAME);
+        try_stream! {
+            let plan = self.cells.read(async |op| membership::plan(op, &self.query).await).instrument(span.clone()).await?;
+            let inner = plan.with_limit(self.query.limit).projected::<P>();
+            futures::pin_mut!(inner);
+            while let Some(item) = inner.next().instrument(span.clone()).await {
+                yield item?;
+            }
+        }
+    }
+}
+
+impl<'a, S, KC, V> KeysetQuery<'a, S, MapKind<KC, V>>
+where
+    S: StateSession,
+    KC: OrderedKeyCodec + 'static,
+    V: CellType<Key = UnitKey>,
+{
+    /// Streams live keys in the query direction.
+    pub fn keys(self) -> impl Stream<Item = KeyItem<MapKind<KC, V>>> + 'a {
+        self.projected::<Presence>()
+    }
+
     /// Streams live entries in the query direction.
     pub fn entries(self) -> impl Stream<Item = MapStreamItem<KC, V>> + 'a
     where
@@ -85,35 +130,16 @@ where
     {
         self.projected::<Values>()
     }
+}
 
+impl<'a, S, KC> KeysetQuery<'a, S, SetKind<KC>>
+where
+    S: StateSession,
+    KC: OrderedKeyCodec + 'static,
+{
     /// Streams live keys in the query direction.
-    pub fn keys(self) -> impl Stream<Item = MapKeyItem<KC, V>> + 'a {
+    pub fn keys(self) -> impl Stream<Item = KeyItem<SetKind<KC>>> + 'a {
         self.projected::<Presence>()
-    }
-
-    /// Runs the query under projection `P`.
-    /// This is the one home of the `map.stream` span.
-    pub(crate) fn projected<P>(
-        self,
-    ) -> impl Stream<Item = Result<P::Item, MapStateError<CellCodecError<V>>>> + 'a
-    where
-        P: StreamProjection<S, Keyed<KC, V>>,
-        S::Engine: sealed::Reads<S, P>,
-    {
-        let span = info_span!(
-            "map.stream",
-            collection = self.handle.cells.name().as_str(),
-            direction = ?self.query.dir,
-            projection = P::NAME,
-        );
-        try_stream! {
-            let plan = self.handle.stream_plan(&self.query).instrument(span.clone()).await?;
-            let inner = plan.with_limit(self.query.limit).projected::<P>();
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().instrument(span.clone()).await {
-                yield item?;
-            }
-        }
     }
 }
 

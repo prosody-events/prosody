@@ -69,7 +69,7 @@ where
     fn keys(&self, config: KeyScanConfig) -> BoxStateCursor<String> {
         let handle = self.handle.clone();
         let stream = try_stream! {
-            let inner = SetQuery::new(&handle, key_query(config)).keys();
+            let inner = SetQuery::new(handle.cells(), key_query(config)).keys();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
