@@ -1,7 +1,7 @@
 //! Typed cell families and their encoded addresses.
 
 use crate::state::cell_key::{CellKey, Coordinate, Section};
-use crate::state::descriptor::{CellType, KeyOf};
+use crate::state::descriptor::{BorrowedKeyOf, CellType};
 use crate::state::order_codec::OrderedKeyCodec;
 use std::marker::PhantomData;
 
@@ -48,7 +48,7 @@ impl<L, T> CellFamily<L, T> {
     }
 
     /// Encodes one key and binds its address to this family.
-    pub(crate) fn at(self, key: &KeyOf<T>) -> CellAddress<L, T>
+    pub(crate) fn at(self, key: &BorrowedKeyOf<T>) -> CellAddress<L, T>
     where
         T: CellType,
     {

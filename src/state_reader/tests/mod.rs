@@ -17,14 +17,15 @@
 //! reader in [`reader_tests`] and against a **live Cassandra** reader in
 //! [`cassandra_tests`], following the same pattern as `cell_suite`. Fault,
 //! refresh, and cache invariants stay scripted and clock-only, since
-//! production backends cannot inject faults. They live in [`probe_tests`],
+//! production backends cannot inject faults. They live in [`probe`],
 //! [`refresh_tests`], and [`cache_tests`].
 
 pub(crate) mod support;
 
+mod borrowed;
 mod cache_tests;
 mod cassandra_tests;
-mod probe_tests;
+mod probe;
 mod reader_suite;
 mod reader_tests;
 mod refresh_tests;

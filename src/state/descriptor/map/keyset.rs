@@ -25,6 +25,7 @@ const KEYSET_MAX_ENTRIES: usize = KEYSET_BYTE_CEILING / 4;
 pub(crate) struct MapKeysetKey;
 
 impl OrderedKeyCodec for MapKeysetKey {
+    type Borrowed = ();
     type Key = ();
 
     fn encode((): &()) -> Coordinate {

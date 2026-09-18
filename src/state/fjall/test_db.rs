@@ -88,11 +88,6 @@ pub fn cold_marker_checks() -> Result<MarkerCheckSet> {
     })
 }
 
-/// Returns a marker-check handle for the named test workspace.
-pub fn marker_checks(name: &str) -> Result<MarkerCheckSet> {
-    Ok(cache(name)?.marker_checks())
-}
-
 /// A **cold** [`FjallCellCache`]: get-or-create the `name` keyspace pair, then
 /// [`clear`](Keyspace::clear) both — modeling a fresh assignment (a cold
 /// cache over the same warm durable backing) without a keyspace-creation

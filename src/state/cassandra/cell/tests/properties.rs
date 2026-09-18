@@ -3,17 +3,6 @@ use crate::state::cassandra::cell::TABLE_KEYED_STATE_CELL;
 use crate::state::tests::support::run_admit_soundness;
 use color_eyre::eyre::ensure;
 
-/// Converts a property body's `Result<bool>` into a `TestResult`, surfacing the
-/// error on failure (a store/setup error is a broken environment, not a
-/// shrinkable property failure).
-pub(super) fn finish(result: Result<bool>) -> TestResult {
-    match result {
-        Ok(true) => TestResult::passed(),
-        Ok(false) => TestResult::failed(),
-        Err(error) => TestResult::error(format!("{error:?}")),
-    }
-}
-
 /// Proves recovery parity for the production Cassandra cache.
 ///
 /// Each simulated crash creates a new cache over the same durable rows.
@@ -53,7 +42,7 @@ fn prop_cassandra_cell_crash_equivalence() {
     init_test_logging();
     QuickCheck::new()
         .tests(integration_test_count(25))
-        .quickcheck((|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(Trace) -> TestResult);
+        .quickcheck(ModelProperty(|trace| TEST_RUNTIME.block_on(run(trace))));
 }
 
 /// Posture-parity test over the bare live store: a blind `write_resolved`
@@ -88,9 +77,7 @@ fn prop_cassandra_apply_idempotence() {
     init_test_logging();
     QuickCheck::new()
         .tests(integration_test_count(25))
-        .quickcheck(
-            (|input| finish(TEST_RUNTIME.block_on(run(input)))) as fn(ApplyTrace) -> TestResult,
-        );
+        .quickcheck(ModelProperty(|input| TEST_RUNTIME.block_on(run(input))));
 }
 
 /// Implicit-overwrite soundness over `Cached<CassandraStore>`: each overwrite
@@ -116,9 +103,7 @@ fn prop_cassandra_cell_implicit_overwrite() {
     init_test_logging();
     QuickCheck::new()
         .tests(integration_test_count(25))
-        .quickcheck(
-            (|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(OverwriteTrace) -> TestResult,
-        );
+        .quickcheck(ModelProperty(|trace| TEST_RUNTIME.block_on(run(trace))));
 }
 
 /// A single `Cached<CassandraStore>` over the shared `cassandra_overlay`
@@ -140,15 +125,13 @@ fn prop_cassandra_overlay_view() {
         let fx = fixture().await?;
         // Box the future: the assembly + trace exceed clippy's large-future
         // threshold on the stack.
-        Box::pin(run_overlay_trace(assembly(&fx)?, trace)).await
+        Box::pin(run_overlay_trace(assembly(fx)?, trace)).await
     }
 
     init_test_logging();
     QuickCheck::new()
         .tests(integration_test_count(25))
-        .quickcheck(
-            (|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(OverlayTrace) -> TestResult,
-        );
+        .quickcheck(ModelProperty(|trace| TEST_RUNTIME.block_on(run(trace))));
 }
 
 /// Both Cassandra scan projections match the committed model across bounds and
@@ -166,9 +149,7 @@ fn prop_cassandra_bottom_scan() {
     init_test_logging();
     QuickCheck::new()
         .tests(integration_test_count(25))
-        .quickcheck(
-            (|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(ScanTrace) -> TestResult,
-        );
+        .quickcheck(ModelProperty(|trace| TEST_RUNTIME.block_on(run(trace))));
 }
 
 /// `TTL(data)` surfacing for the co-expiry stamp (no cluster needed — pure
@@ -201,8 +182,8 @@ fn ttl_seconds_surfacing_distinguishes_no_ttl_from_sub_second() {
 
 #[test]
 fn prop_cassandra_admit_soundness() {
-    fn property(value: u8, committed: bool) -> TestResult {
-        finish(TEST_RUNTIME.block_on(async {
+    fn property((value, committed): (u8, bool)) -> Result<bool> {
+        TEST_RUNTIME.block_on(async {
             let fx = fixture().await?;
             let dedup = MemoryDeduplicationStore::new();
             let store = fx.bottom_store();
@@ -231,9 +212,9 @@ fn prop_cassandra_admit_soundness() {
                 "corrupt marker blocked admission"
             );
             run_admit_soundness(store, dedup, value, committed).await
-        }))
+        })
     }
     QuickCheck::new()
         .tests(integration_test_count(25))
-        .quickcheck(property as fn(u8, bool) -> TestResult);
+        .quickcheck(ModelProperty(property));
 }

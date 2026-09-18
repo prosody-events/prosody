@@ -1,52 +1,39 @@
 //! Order-preserving key codecs.
 //!
-//! The load-bearing contract: **clustering byte-order == logical key order**.
-//! A codec maps a logical key to a [`Coordinate`] whose unsigned lexicographic
-//! (memcmp) byte order matches the key's [`Ord`], so a forward clustering scan
-//! visits cells in ascending logical order without sorting in code. This is a
-//! *tested* contract (the per-codec monotonicity property), not a compiler
-//! proof: a non-monotone codec silently misorders scans.
+//! Encoded byte order must match logical key order. Collection scans rely on
+//! this contract to return ordered keys without a separate sort.
 
 use crate::codec::Codec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::Coordinate;
 use bytes::{Bytes, BytesMut};
+use std::borrow::Borrow;
 use std::str::{Utf8Error, from_utf8};
 use thiserror::Error;
 
-/// Maps a logical key to an order-preserving [`Coordinate`] and back.
+/// Encodes borrowed keys and decodes owned keys in logical key order.
 ///
-/// Every key codec is also a [`Codec`] over the same type — the supertrait
-/// equalities pin `Payload = Key` — under the **byte-identity law**:
-/// `serialize` writes exactly `encode`'s bytes and `deserialize` is `decode`.
-/// A key can therefore ride as a cell *payload* with no adapter, and
-/// [`Codec::FORMAT_ID`] is the one
-/// durable token a key encoding freezes into a collection's identity.
+/// `Key` is the owned form and `Borrowed` is the input form. UTF-8 keys use
+/// `String` and `str`.
+/// [`Borrow`] requires both forms to have the same ordering.
 ///
-/// The invariants every impl must satisfy (enforced by the per-codec
-/// monotonicity and byte-identity property tests, not the type system):
-/// - **Order preservation:** `a.cmp(b) ==
-///   encode(a).as_bytes().cmp(encode(b).as_bytes())`.
-/// - **Key round-trip:** `decode(encode(k).as_bytes()) == Ok(k)`.
-/// - **Byte round-trip:** for any `b` a codec itself produced,
-///   `encode(&decode(b)?).as_bytes() == b`. This is what makes a typed scan
-///   durable-compatible: decoding a stored coordinate and re-encoding it
-///   reproduces the exact stored bytes.
-/// - **Byte identity:** `serialize(k)` appends exactly `encode(k).as_bytes()`.
-///   Held by construction when `serialize`/`deserialize` delegate to
-///   `encode`/`decode`, as every impl here does.
+/// Each implementation must satisfy these invariants:
+/// - Encoded byte order equals logical key order.
+/// - `decode(encode(key.borrow()).as_bytes())` returns the original owned key.
+/// - Decoding and re-encoding a coordinate preserves its bytes.
+/// - [`Codec`] serializes a key to the same bytes as `encode`.
+///
+/// [`Codec::FORMAT_ID`] identifies these bytes in the durable collection
+/// identity.
 pub trait OrderedKeyCodec: Codec<Payload = Self::Key, Error = KeyCodecError> {
-    /// The logical key type, ordered to match its encoded byte order.
-    ///
-    /// `Send + Sync + 'static`, not merely `Ord`: a typed scan yields the
-    /// decoded key in a `Send` stream (so it must be `Send`), and a key can
-    /// ride as a [`Codec`] payload (so it must be
-    /// `Sync + 'static`). Every real key (`String`, `i64`, `u64`, `()`)
-    /// already satisfies it.
-    type Key: Ord + Send + Sync + 'static;
+    /// The owned key returned by decoders and streams.
+    type Key: Borrow<Self::Borrowed> + Ord + Send + Sync + 'static;
+
+    /// The key view accepted by point operations and query bounds.
+    type Borrowed: Ord + Sync + ?Sized + 'static;
 
     /// Encodes a key to its order-preserving bytes.
-    fn encode(key: &Self::Key) -> Coordinate;
+    fn encode(key: &Self::Borrowed) -> Coordinate;
 
     /// Decodes order-preserving bytes back to the logical key.
     ///
@@ -73,9 +60,10 @@ pub trait OrderedKeyCodec: Codec<Payload = Self::Key, Error = KeyCodecError> {
 pub struct UnitKey;
 
 impl OrderedKeyCodec for UnitKey {
+    type Borrowed = ();
     type Key = ();
 
-    fn encode((): &Self::Key) -> Coordinate {
+    fn encode((): &Self::Borrowed) -> Coordinate {
         Coordinate::empty()
     }
 
@@ -140,10 +128,11 @@ pub fn order_preserving_i64_decode(bytes: [u8; 8]) -> i64 {
 pub struct Utf8KeyCodec;
 
 impl OrderedKeyCodec for Utf8KeyCodec {
+    type Borrowed = str;
     type Key = String;
 
-    fn encode(key: &Self::Key) -> Coordinate {
-        Coordinate::from_bytes(key.clone().into_bytes())
+    fn encode(key: &Self::Borrowed) -> Coordinate {
+        Coordinate::from_bytes(key.as_bytes().to_vec())
     }
 
     fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError> {
@@ -199,9 +188,10 @@ impl Codec for Utf8KeyCodec {
 pub struct I64KeyCodec;
 
 impl OrderedKeyCodec for I64KeyCodec {
+    type Borrowed = i64;
     type Key = i64;
 
-    fn encode(key: &Self::Key) -> Coordinate {
+    fn encode(key: &Self::Borrowed) -> Coordinate {
         Coordinate::from_bytes(order_preserving_i64(*key).to_vec())
     }
 
@@ -242,9 +232,10 @@ impl Codec for I64KeyCodec {
 pub struct U64KeyCodec;
 
 impl OrderedKeyCodec for U64KeyCodec {
+    type Borrowed = u64;
     type Key = u64;
 
-    fn encode(key: &Self::Key) -> Coordinate {
+    fn encode(key: &Self::Borrowed) -> Coordinate {
         Coordinate::from_bytes(key.to_be_bytes().to_vec())
     }
 

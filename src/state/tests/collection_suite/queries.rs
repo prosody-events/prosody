@@ -51,7 +51,7 @@ impl StreamConstraints {
     where
         S: StateSession,
         L: CollectionSpec,
-        <L::Cell as CellType>::Key: OrderedKeyCodec<Key = i64>,
+        <L::Cell as CellType>::Key: OrderedKeyCodec<Key = i64, Borrowed = i64>,
     {
         query = match self.start {
             Bound::Included(key) => query.from(&key),

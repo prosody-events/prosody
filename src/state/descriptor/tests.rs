@@ -12,6 +12,7 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::kafka_state::message_state;
 use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::partition::ShutdownPhase;
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
 use crate::state::cell_key::Direction;
 use crate::state::dirty::DirtyStore;
@@ -573,19 +574,22 @@ async fn run_collection_ops() -> Result<()> {
         map_state::<Utf8KeyCodec, JsonCodec>("counts"),
         MemoryLoader::new(),
     )?;
-    map.set(&"k1".to_owned(), json!(1_i32)).await?;
-    map.get(&"k1".to_owned()).await?;
+    map.set("k1", json!(1_i32)).await?;
+    map.get("k1").await?;
+    map.get_many(&["k1", "k2"]).await?;
+    map.contains_many(&["k1", "k2"]).await?;
     let _entries: Vec<_> = map.stream(Direction::Forward).try_collect().await?;
     let _keys: Vec<_> = map.keys(Direction::Forward).try_collect().await?;
     map.is_empty().await?;
-    map.remove(&"k1".to_owned()).await?;
+    map.remove("k1").await?;
 
     let set = bind_registered(set_state::<Utf8KeyCodec>("tags"), MemoryLoader::new())?;
-    set.insert(&"k1".to_owned()).await?;
-    set.contains(&"k1".to_owned()).await?;
+    set.insert("k1").await?;
+    set.contains("k1").await?;
+    set.contains_many(&["k1", "k2"]).await?;
     let _members: Vec<_> = set.keys(Direction::Forward).try_collect().await?;
     set.is_empty().await?;
-    set.remove(&"k1".to_owned()).await?;
+    set.remove("k1").await?;
 
     let deque = bind_registered(deque_state::<JsonCodec>("dq"), MemoryLoader::new())?;
     deque.push_back(json!(7_i32)).await?;
@@ -640,6 +644,13 @@ fn collection_ops_export_operation_spans() -> Result<()> {
         [Some("presence".to_owned())],
         "set streams export one presence span"
     );
+
+    for name in ["map.get_many", "map.contains_many", "set.contains_many"] {
+        assert_eq!(
+            span_attr(named(&spans, name)?, "keys").as_deref(),
+            Some("2")
+        );
+    }
 
     let handler_id = named(&spans, "handler")?.span_context.span_id();
 
@@ -753,21 +764,21 @@ mod scope_containment {
             // Distinct writes to each sibling, interleaved.
             cart.set(a.clone()).await?;
             wishlist.set(b.clone()).await?;
-            counts.set(&"qty".to_owned(), b.clone()).await?;
-            tags.insert(&"tag".to_owned()).await?;
+            counts.set("qty", b.clone()).await?;
+            tags.insert("tag").await?;
             log.push_back(a.clone()).await?;
 
             // Each handle reads back exactly its own collection's data — no
             // cross-collection or cross-section bleed.
             Ok(cart.get().await? == Some(a.clone())
                 && wishlist.get().await? == Some(b.clone())
-                && counts.get(&"qty".to_owned()).await? == Some(b)
-                && counts.get(&"missing".to_owned()).await?.is_none()
+                && counts.get("qty").await? == Some(b)
+                && counts.get("missing").await?.is_none()
                 && log.get(0).await? == Some(a)
                 && log.len().await? == 1
-                && tags.contains(&"tag".to_owned()).await?
-                && !tags.contains(&"qty".to_owned()).await?
-                && counts.get(&"tag".to_owned()).await?.is_none())
+                && tags.contains("tag").await?
+                && !tags.contains("qty").await?
+                && counts.get("tag").await?.is_none())
         }
         fn prop(a: ArbJson, b: ArbJson) -> TestResult {
             let input = format!("a={:#?} b={:#?}", a.0, b.0);
@@ -811,7 +822,7 @@ async fn terminated_session_refuses_typed_ops_in_every_kind() -> Result<()> {
 
     let map_handle = map.bind(&session).map_err(|e| eyre!("bind map: {e}"))?;
     assert!(matches!(
-        map_handle.get(&"k".to_owned()).await,
+        map_handle.get("k").await,
         Err(MapStateError::Cell(CellStateError::Access(
             StateAccessError::Terminated
         )))
@@ -819,7 +830,7 @@ async fn terminated_session_refuses_typed_ops_in_every_kind() -> Result<()> {
 
     let set_handle = set.bind(&session).map_err(|e| eyre!("bind set: {e}"))?;
     assert!(matches!(
-        set_handle.contains(&"k".to_owned()).await,
+        set_handle.contains("k").await,
         Err(MapStateError::Cell(CellStateError::Access(
             StateAccessError::Terminated
         )))

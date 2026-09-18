@@ -222,7 +222,6 @@ where
                     &base.name,
                     base.section,
                     chunk.iter().cloned(),
-                    chunk.len(),
                 ).await.map_err(CellStateError::Access)?
             };
 
