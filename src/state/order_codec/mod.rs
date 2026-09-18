@@ -13,7 +13,8 @@ use thiserror::Error;
 
 /// Encodes borrowed keys and decodes owned keys in logical key order.
 ///
-/// `Key` borrows the codec's input type. UTF-8 keys use `String` and `str`.
+/// `Key` is the owned form and `Borrowed` is the input form. UTF-8 keys use
+/// `String` and `str`.
 /// [`Borrow`] requires both forms to have the same ordering.
 ///
 /// Each implementation must satisfy these invariants:

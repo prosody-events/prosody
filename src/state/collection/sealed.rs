@@ -24,9 +24,9 @@ use futures::Stream;
 use std::future::Future;
 use std::ops::DerefMut;
 
-/// The engine a session type binds. Selecting the engine is what makes
-/// owner and published-reader behavior a compile-time choice rather than a
-/// runtime branch.
+/// The engine a session type binds. The engine selection makes owner and
+/// published-reader behavior a compile-time choice. No runtime branch
+/// separates them.
 pub trait Session: Sized {
     /// This session's engine.
     type Engine: ReadEngine<Self> + Reads<Self, Values> + Reads<Self, Presence>;
@@ -45,16 +45,15 @@ pub trait ReadEngine<S: ?Sized> {
         S: 'a;
 
     /// The owned state a managed stream plan carries out of the invocation
-    /// that built it. The owner keeps nothing (each chunk reacquires
-    /// admission); the reader keeps its selected source, so a chunk resumes
-    /// on exactly the source the planning command chose.
+    /// that built it. The owner plan keeps nothing, because each chunk
+    /// reacquires admission. The reader plan keeps its selected source, so
+    /// each chunk resumes on the source the planning command chose.
     type Plan: Clone + Send + Sync + 'static;
 
     /// Validates the collection named `name` against this engine's
     /// authority and returns its canonical name. The owner validates
-    /// registration and structural identity against the registry; the
-    /// published reader consumes the validation its source acquisition
-    /// already performed.
+    /// registration and structural identity against the registry. The
+    /// published reader reuses the validation from its source acquisition.
     ///
     /// # Errors
     ///
@@ -67,9 +66,9 @@ pub trait ReadEngine<S: ?Sized> {
         identity: &StructuralIdentity,
     ) -> Result<StateName, StateAccessError>;
 
-    /// The collection's operational settings **as this engine sees them**;
-    /// each impl documents its own source. Captured once at bind, so every
-    /// configuration query inside a scoped operation answers from one
+    /// The collection's operational settings as this engine sees them. Each
+    /// impl documents its source. The engine captures them once at bind, so
+    /// every configuration query inside a scoped operation answers from one
     /// snapshot.
     fn collection_def(session: &S, state_type: StateType, name: &StateName) -> CollectionDef;
 

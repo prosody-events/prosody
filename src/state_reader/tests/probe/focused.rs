@@ -3,10 +3,9 @@
 use super::*;
 
 /// A mid-stream error after the scan has pinned a source terminates with
-/// `Err`. There is no silent restart that would double-yield or skip data.
-/// This needs the range-scan arm and a precise fault position, and the fault
-/// script [`prop_probe_and_pin`] draws from has no mid-stream fault point to
-/// express it.
+/// `Err`. There is no silent restart that would repeat or skip data. This test
+/// needs the range-scan arm and a precise fault position. The fault script
+/// behind [`prop_probe_and_pin`] has no mid-stream fault point.
 ///
 /// Falsify: restart on a post-pin error. The reader would then yield a
 /// duplicated prefix or swallow the error.
@@ -42,13 +41,12 @@ async fn scan_midstream_error_propagates() -> Result<()> {
     Ok(())
 }
 
-/// When the lowest source errors and the next source answers with an
-/// all-`None` buffer, `get_many` returns `Err`. The all-`None` buffer means B
-/// holds none of the batch's cells, but absence is not provable through a
-/// failed source. This mirrors how a point read treats no data plus an error.
-/// The deque fault script never exercises this batch case, so it gets its
-/// own test: source A (lowest) faults at open, and source B is admitted but
-/// empty.
+/// `get_many` returns `Err` when the lowest source errors and the next source
+/// answers all `None`. The all-`None` buffer means source B holds none of the
+/// batch's cells. Absence is not provable through a failed source. A point
+/// read treats no data plus an error the same way. The deque fault script
+/// never exercises this batch case, so it gets its own test. Source A, the
+/// lowest, faults at open, and source B is admitted but empty.
 ///
 /// Falsify: return the remembered all-`None` buffer instead of the error.
 /// That would mask a transient store failure as a false absence for the
@@ -60,8 +58,8 @@ async fn get_many_error_beats_all_none() -> Result<()> {
     let tp_a = topic("topic-a");
     let tp_b = topic("topic-b");
 
-    // A (lowest) faults at open; B is published but holds none of the batch
-    // cells, so it answers an all-`None` buffer.
+    // Source A, the lowest, faults at open. Source B is published but holds
+    // none of the batch cells, so it answers an all-`None` buffer.
     env.fault(GROUP_A, tp_a, &key, FaultPoint::AtOpen)?;
     env.publish(GROUP_A, tp_a).await;
     env.publish(GROUP_B, tp_b).await;
@@ -73,11 +71,11 @@ async fn get_many_error_beats_all_none() -> Result<()> {
     }
 }
 
-/// A contract-violating source answers a batch read with fewer values than
-/// the batch requested. The uncached batch path checks that alignment in
-/// every build, so the read fails instead of zipping the short buffer into a
-/// truncated, misaligned answer. `CommittedCellSource` is a downstream trait,
-/// so a debug assertion cannot hold this line in a release build.
+/// A source that violates its contract answers a batch read with fewer values
+/// than requested. The uncached batch path checks that alignment in every
+/// build. The read fails instead of zipping the short buffer into a misaligned
+/// answer. `CommittedCellSource` is a downstream trait, so a debug assertion
+/// cannot hold this line in a release build.
 ///
 /// Falsify: remove the length check from the uncached arm of `cached_batch`.
 /// `get_many` then answers a two-cell batch with one value.
@@ -111,10 +109,9 @@ async fn short_batch_buffer_fails_the_uncached_read() -> Result<()> {
 }
 
 /// The lowest-ordered source with any `Some` answers the entire `get_many`
-/// batch. There is no per-cell splice from a different source. Source A
-/// (lowest) holds only key 0; source B holds only key 1. The batch resolves
-/// entirely from A, so key 1 reads `None`, A's answer, never B's tagged
-/// value.
+/// batch. There is no per-cell splice from a different source. Source A, the
+/// lowest, holds only key 0. Source B holds only key 1. The batch resolves
+/// entirely from A, so key 1 reads A's `None` and never B's tagged value.
 ///
 /// Falsify: splice per cell, filling each absent slot from the next source.
 /// Key 1 would then carry B's value and the `None` assert goes red.
@@ -218,16 +215,16 @@ async fn scan_reads_only_pinned_source() -> Result<()> {
 /// Two reads on one reader overlap: they drive cell I/O concurrently, sharing
 /// no admission.
 ///
-/// The source holds every committed point read at a two-party meeting point,
-/// so both reads must arrive before either returns. Serializing them would
-/// park the first there forever; the deadline is only the hang guard, and the
-/// rendezvous is the assertion. The read cache is disabled so its same-key
-/// single-flight cannot collapse the two reads into one.
+/// The source holds every committed point read at a two-party meeting point.
+/// Both reads must arrive before either returns. Serialized reads would park
+/// the first read there forever. The deadline is only the hang guard, and the
+/// meeting point is the assertion. The read cache is disabled, so its same-key
+/// single flight cannot merge the two reads.
 ///
-/// Falsify: route both reads through one shared admission — take a single
-/// session-wide permit around the read instead of building an independent
-/// session per operation. The second read then never reaches the meeting
-/// point and the deadline fires.
+/// Falsify: route both reads through one shared admission. Take a single
+/// session-wide permit around the read instead of one session per operation.
+/// The second read then never reaches the meeting point, and the deadline
+/// fires.
 #[tokio::test]
 async fn concurrent_reads_on_one_reader_overlap() -> Result<()> {
     let mut env = ScriptedEnv::new(
@@ -267,14 +264,14 @@ async fn concurrent_reads_on_one_reader_overlap() -> Result<()> {
 }
 
 /// One session selects its source once. The first scoped operation probes for
-/// a source and publishes its selection onto the session; every later
-/// operation on that session seeds from that selection and addresses it
-/// directly, so no source below it is probed again.
+/// a source and publishes its selection onto the session. Every later
+/// operation on that session starts from that selection and addresses it
+/// directly. No source below it is probed again.
 ///
-/// The lowest source is published but holds nothing, which is what makes the
-/// re-probe observable: the probe must read it (and get `None`) before
-/// reaching the source that answers, so a second probe shows up as a second
-/// read of the empty source.
+/// The lowest source is published but holds nothing. That makes a second
+/// probe observable. The probe must read the empty source and get `None`
+/// before it reaches the source that answers. A second probe therefore shows
+/// up as a second read of the empty source.
 ///
 /// Falsify: have the reader engine start each invocation unselected, or stop
 /// publishing the first selection back to the session. The second `get` then

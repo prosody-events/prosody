@@ -41,8 +41,8 @@ pub trait CellResolver {
     /// `buffered` scan window in a `Send` stream.
     type Resolved: Send;
 
-    /// What a handle's `set` takes. A GAT so a borrowing resolver (e.g. "store
-    /// a reference to the message in hand") can take `&'a T` while a
+    /// What a handle's `set` takes. The lifetime lets a borrowing resolver
+    /// take `&'a T`, for example a reference to the message in hand. A
     /// passthrough takes an owned value.
     type Write<'a>;
 
@@ -51,13 +51,13 @@ pub trait CellResolver {
     /// by [`FromSession`], so the resolver itself stays session-free.
     type Context<'s>: Send;
 
-    /// The resolver's token, or `None` for a passthrough (the stored value
-    /// *is* the exposed value). Rides
-    /// [`StructuralIdentity`](super::StructuralIdentity) for the
-    /// **in-process** bind-time check (`verify_state_registration`), catching
-    /// two same-named descriptors with different resolvers in one binary. It
-    /// is deliberately not part of the durable identity. Resolvers are
-    /// behavior, not data (see the trait doc).
+    /// The resolver's token. A passthrough reports `None`, because its stored
+    /// value is the exposed value.
+    /// [`StructuralIdentity`](super::StructuralIdentity) carries the token for
+    /// the in-process bind-time check in `verify_state_registration`. That
+    /// check catches two same-named descriptors with different resolvers in
+    /// one binary. The token is not part of the durable identity. Resolvers
+    /// are behavior, not data (see the trait doc).
     const RESOLVER_ID: Option<&'static str>;
 
     /// Resolves a decoded cell into the exposed value, using only the borrowed
@@ -117,13 +117,15 @@ impl<C: Codec> CellResolver for C {
     }
 }
 
-/// The complete typed contract of a cell, composed on three axes: an
-/// [`OrderedKeyCodec`] address, a [`Codec`] payload (`bytes ↔ stored`), and a
-/// [`CellResolver`] (`stored ↔ exposed`). Codec/resolver compatibility
-/// (`Resolver::Stored = Codec::Payload`) is enforced here, once. Users never
-/// write a `CellType` impl: a plain codec satisfies it directly (unit-addressed
-/// passthrough), [`WithResolver`] pairs a codec with a resolver ad hoc, and
-/// [`Keyed`] lifts either into a key-addressed family.
+/// The complete typed contract of a cell. It composes an [`OrderedKeyCodec`]
+/// address, a [`Codec`] payload, and a [`CellResolver`]. The codec maps bytes
+/// to the stored value, and the resolver maps the stored value to the exposed
+/// value. The `Resolver::Stored = Codec::Payload` bound enforces their
+/// compatibility here, once.
+///
+/// Users never write a `CellType` impl. A plain codec satisfies it as a
+/// unit-addressed passthrough. [`WithResolver`] pairs a codec with a resolver,
+/// and [`Keyed`] lifts either into a key-addressed family.
 pub trait CellType {
     /// The address codec. It is [`UnitKey`] for a single-cell type and a real
     /// key codec once lifted through [`Keyed`].
@@ -137,8 +139,8 @@ pub trait CellType {
     type Resolver: CellResolver<Stored = <Self::Codec as Codec>::Payload>;
 }
 
-/// A plain codec is a complete single-cell type: unit address + codec + itself
-/// as passthrough resolver.
+/// A plain codec is a complete single-cell type. It has a unit address and is
+/// its own passthrough resolver.
 impl<C: Codec> CellType for C {
     type Codec = C;
     type Key = UnitKey;

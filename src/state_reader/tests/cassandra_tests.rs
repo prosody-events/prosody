@@ -62,9 +62,8 @@ use std::thread;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-/// Names for the four registered kinds. Each name is distinct, so each
-/// kind's `structural_identity` differs instead of collapsing onto whichever
-/// kind registered first.
+/// Names for the four registered kinds. Each name is distinct, so each kind
+/// registers its own `structural_identity`.
 const VALUE_NAME: &str = "reader-value";
 const MAP_NAME: &str = "reader-map";
 const SET_NAME: &str = "reader-set";

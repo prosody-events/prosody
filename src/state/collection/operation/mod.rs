@@ -41,9 +41,8 @@ pub const JOURNAL_INLINE: usize = 4;
 /// One invocation's staged mutations, in authored order.
 pub type MutationJournal = SmallVec<[Mutation; JOURNAL_INLINE]>;
 
-/// One staged mutation. `Set` carries its already-encoded payload: the single
-/// owned copy the dirty store requires either way, made once at the command and
-/// moved into the overlay at merge.
+/// One staged mutation. `Set` carries its encoded payload. The command encodes
+/// the payload once, and merge moves that one copy into the overlay.
 pub enum Mutation {
     /// Stage `bytes` at `cell`.
     Set {
@@ -84,8 +83,8 @@ enum Staged {
 /// outside it. Only owned data crosses the boundary.
 ///
 /// The type is neither `Clone` nor `Copy`. Its only constructor acquires engine
-/// state and builds the complete value, so no API pairs an independently
-/// obtained guard, permit, or inner value with a collection.
+/// state and builds the complete value. No API pairs a separately obtained
+/// guard, permit, or inner value with a collection.
 pub struct ReadOperation<'a, S: StateSession, L> {
     collection: &'a Collection<S, L>,
     inner: <S::Engine as sealed::ReadEngine<S>>::ReadInner<'a>,
@@ -99,9 +98,9 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
     }
 
     /// Plans a managed point-get stream over `coordinates` in `family`, in the
-    /// given order. Freezing this invocation's engine state into the plan is
-    /// what lets each chunk resume on the same source (reader) or reacquire the
-    /// gate (owner) without re-running the planning command.
+    /// given order. The plan freezes this invocation's engine state. Each
+    /// reader chunk then resumes on the same source, and each owner chunk
+    /// reacquires the gate, without a second planning command.
     pub(crate) fn coordinates<T: CellType>(
         &self,
         family: CellFamily<L, T>,
@@ -126,11 +125,11 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
     /// `family`'s section. The plan walks `[start, end]` in `dir` order and
     /// yields at most `limit` cells.
     ///
-    /// A collection with a contiguous coordinate window takes this plan instead
-    /// of an enumeration of every coordinate in the window. `start` and `end`
+    /// A collection with a contiguous coordinate window takes this plan. It
+    /// does not enumerate every coordinate in the window. `start` and `end`
     /// are direction-relative, exactly as
     /// [`Scan`](crate::state::cell_key::Scan) defines them. Only inclusive
-    /// edges exist here: a collection that knows its window also knows both of
+    /// edges exist here. A collection that knows its window also knows both of
     /// its occupied endpoints.
     pub(crate) fn range_within<T: CellType>(
         &self,
@@ -194,10 +193,11 @@ impl<'a, S: WritableStateSession, L> WriteOperation<'a, S, L> {
     /// rejects. No runtime state check is needed.
     ///
     /// The held write admission excludes the settle boundary's close and the
-    /// attempt boundary's reset between the fence and the replay, so no
-    /// partially replayed invocation is observable. Termination is *sampled*
-    /// at the fence: teardown is ungated by design, and that residual is owned
-    /// by [`EventStateScope`](crate::state::manager::EventStateScope).
+    /// attempt boundary's reset between the fence and the replay. No partially
+    /// replayed invocation is observable. The fence samples termination once.
+    /// Teardown is not gated, and
+    /// [`EventStateScope`](crate::state::manager::EventStateScope) owns that
+    /// residual.
     ///
     /// # Errors
     ///
@@ -221,9 +221,9 @@ impl<'a, S: WritableStateSession, L> WriteOperation<'a, S, L> {
     /// This invocation's staged view of `cell`, or `None` when the journal
     /// says nothing about it.
     ///
-    /// Reverse order is what gives staged mutations ordinary last-write-wins
-    /// and read-your-writes semantics; forward replay at merge reproduces
-    /// exactly the same result.
+    /// The reverse walk gives staged mutations last-write-wins and
+    /// read-your-writes semantics. Forward replay at merge reproduces the same
+    /// result.
     fn staged(&self, cell: &CellKey) -> Option<Staged> {
         self.journal
             .iter()

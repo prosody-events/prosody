@@ -5,8 +5,8 @@
 //! source that errored on open. Data always beats a skipped error. An
 //! all-empty source set reads `None` or empty. No data plus at least one
 //! source error reads `Err`. [`prop_probe_and_pin`] proves all of this
-//! together over random fault scripts, for both the point fan-out (`get` and
-//! `len`) and the pinned scan (`stream`). [`prop_probe_and_pin_set`] proves
+//! together over random fault scripts. It covers the point reads `get` and
+//! `len` and the pinned scan `stream`. [`prop_probe_and_pin_set`] proves
 //! the same selection for set reads. A failed read never reports an empty set,
 //! and the store error keeps its category.
 //!
@@ -44,8 +44,8 @@ use std::iter::{empty, once};
 use std::time::Duration;
 use tokio::time::timeout;
 
-/// A deque length above the point-get ceiling, forcing the range-scan stream
-/// arm to be exercised.
+/// A deque length above the point-get ceiling. It exercises the range-scan
+/// stream arm.
 const SCAN_ARM_LEN: usize = 130;
 
 // --- Probe-and-pin property -------------------------------------------------
@@ -56,8 +56,8 @@ const SCAN_ARM_LEN: usize = 130;
 const GROUP_POOL: [&str; 4] = ["probe-g0", "probe-g1", "probe-g2", "probe-g3"];
 
 /// The per-source deque lengths the script draws from. The small lengths
-/// exercise the chunked point-get stream arm; [`SCAN_ARM_LEN`] is one past
-/// the range-scan ceiling, exercising that arm too.
+/// exercise the chunked point-get stream arm. [`SCAN_ARM_LEN`] is one past
+/// the range-scan ceiling and exercises that arm.
 const LEN_POOL: [usize; 4] = [1, 2, 3, SCAN_ARM_LEN];
 
 /// One source's disposition.
@@ -102,7 +102,7 @@ struct FaultScript {
 
 impl Arbitrary for FaultScript {
     fn arbitrary(g: &mut Gen) -> Self {
-        // At least one source; at most the group pool.
+        // Use at least one source and at most the group pool.
         let n = 1 + usize::arbitrary(g) % GROUP_POOL.len();
         Self {
             sources: (0..n).map(|_| SourceDisposition::arbitrary(g)).collect(),
@@ -110,7 +110,7 @@ impl Arbitrary for FaultScript {
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        // Keep at least one source; an empty snapshot is a different,
+        // Keep at least one source, because an empty snapshot is a different
         // structural case. Otherwise shrink each disposition and drop
         // trailing sources.
         let sources = self.sources.clone();
@@ -134,7 +134,7 @@ fn member(idx: usize, j: usize) -> String {
     format!("{idx:02}-{j:04}")
 }
 
-/// The selection the point fan-out resolves to under a script. If any source
+/// The selection the point reads resolve to under a script. If any source
 /// has data, it is the first one in `SourceId` (index) order. Otherwise the
 /// selection depends on whether an earlier source errored.
 enum Selection {
@@ -167,11 +167,11 @@ fn selection(script: &FaultScript) -> Selection {
     }
 }
 
-/// The lowest-`SourceId` source with committed data answers every read. An
-/// errored source is skipped; data beats a skipped error. All sources empty
-/// gives `None`/empty, and no data plus an earlier error gives `Err`. This
-/// holds for the point fan-out (`get`/`len`) and for the pinned scan,
-/// `stream` in both directions.
+/// The lowest-`SourceId` source with committed data answers every read.
+/// Selection skips an errored source, and data beats a skipped error. All
+/// sources empty reads `None` or empty. No data plus an earlier error reads
+/// `Err`. This holds for the point reads `get` and `len` and for the pinned
+/// scan `stream` in both directions.
 ///
 /// FALSIFICATION: short-circuit `Err` at the first source in
 /// `ReadSession::probe_point` instead of skipping. A `FaultOpen`-then-`Data`
@@ -221,9 +221,8 @@ async fn run_probe_and_pin(script: FaultScript) -> Result<bool> {
 /// The concrete deque reader the probe property drives.
 type DequeReader = StateReader<DequeDescriptor<JsonCodec>, JsonCodec, ScriptedReaderBackend>;
 
-/// Asserts the reader's point reads and scan match the point-fan-out
-/// selection the script resolves to. Point reads are `len` and `get`; the
-/// scan is `stream`.
+/// Asserts the reader's point reads and scan match the selection the script
+/// resolves to. The point reads are `len` and `get`. The scan is `stream`.
 async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> Result<bool> {
     match selection {
         Selection::Pinned { idx, len } => {

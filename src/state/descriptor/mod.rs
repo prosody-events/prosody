@@ -1,79 +1,82 @@
 //! Typed descriptors for keyed-state collections.
 //!
-//! A descriptor names a typed keyed-state collection — a plain `Copy` value
-//! (names are interned). Build it with [`value_state`], registering it with
-//! the consumer to mint a [`Registered`] capability handle. A handler binds
-//! that handle via
+//! A descriptor names a typed keyed-state collection. It is a plain `Copy`
+//! value, because names are interned. Build one with [`value_state`] and
+//! register it with the consumer to mint a [`Registered`] capability handle.
+//! A handler binds that handle through
 //! [`EventContext::state`](crate::consumer::event_context::EventContext::state)
-//! to get a typed handle. That handle's `get` reads the value visible to this
-//! event, and its `set` stages a write into the invocation's journal. `state`
-//! takes the handle, never a raw descriptor, so a handler can reach only the
-//! collections it registered.
+//! and gets a typed handle.
+//!
+//! The typed handle's `get` reads the value visible to this event. Its `set`
+//! stages a write into the invocation's journal. `state` takes the registered
+//! handle, never a raw descriptor, so a handler reaches only the collections
+//! it registered.
 //!
 //! # Composed cell types
 //!
-//! A cell's typing is a [`CellType`] — the complete typed contract of a cell,
-//! composed on three axes:
+//! A [`CellType`] is the complete typed contract of a cell. It composes three
+//! parts:
 //!
 //! - **Address:** an
-//!   [`OrderedKeyCodec`](crate::state::order_codec::OrderedKeyCodec) (`logical
-//!   key ↔ order-preserving bytes`) —
-//!   [`UnitKey`](crate::state::order_codec::UnitKey) for a single-cell
-//!   collection, a real key codec for a keyed one.
-//! - **Payload:** a [`Codec`] (`bytes ↔ stored`, synchronous — the codec **is**
-//!   the stored typing).
-//! - **Resolution:** a [`CellResolver`] (`stored ↔ exposed`, asynchronous).
+//!   [`OrderedKeyCodec`](crate::state::order_codec::OrderedKeyCodec) maps a
+//!   logical key to order-preserving bytes.
+//!   [`UnitKey`](crate::state::order_codec::UnitKey) addresses a single-cell
+//!   collection, and a real key codec addresses a keyed one.
+//! - **Payload:** a [`Codec`] maps bytes to the stored value synchronously. The
+//!   codec is the stored typing.
+//! - **Resolution:** a [`CellResolver`] maps the stored value to the exposed
+//!   value asynchronously.
 //!
-//! Every plain [`Codec`] is *already* a complete cell type: the blanket impls
-//! address it with [`UnitKey`](crate::state::order_codec::UnitKey) and make it
-//! its own passthrough resolver, so a value collection over `CartCodec:
-//! Codec<Payload = Cart>` needs no other layer. To model a *reference* cell —
-//! bytes that decode to a durable pointer a resolver then loads into a full
-//! value — pair a codec with a resolver via [`WithResolver`]; the consumer
-//! layer's Kafka message cell is exactly that pairing. To address a family of
-//! cells by a key, lift a single-cell type through [`Keyed`]. `src/state` never
-//! speaks a cell's bytes — key or value — directly; only its codecs do. The one
-//! decode/encode pair every typed cell passes through lives in
-//! [`crate::state::collection`], which owns that boundary.
+//! Every plain [`Codec`] is a complete cell type. The blanket impls address it
+//! with [`UnitKey`](crate::state::order_codec::UnitKey) and make it its own
+//! passthrough resolver. A value collection over `CartCodec: Codec<Payload =
+//! Cart>` needs no other layer. A reference cell stores a durable pointer that
+//! a resolver loads into a full value. Pair a codec with a resolver through
+//! [`WithResolver`] to model one. The consumer layer's Kafka message cell is
+//! that pairing.
 //!
-//! A [`CellResolver`] is **session-free**: it declares the capability it needs
-//! as [`CellResolver::Context`] and the framework extracts that context from
-//! the session via [`FromSession`]. Passing the whole session to a resolver was
-//! the complection that once forced its durable token onto a separate trait;
-//! with the context split out, [`CellResolver::RESOLVER_ID`] sits on the one
-//! resolver trait as a plain const, symmetric with [`Codec::FORMAT_ID`].
+//! Lift a single-cell type through [`Keyed`] to address a family of cells by
+//! key. `src/state` never reads or writes a cell's key or value bytes
+//! directly. Only the codecs do, through the one decode/encode pair in
+//! [`crate::state::collection`].
 //!
-//! Every descriptor asserts a [`StructuralIdentity`] — the frozen
-//! `(kind, codec id, resolver id, key codec id)` tuple. Swapping any of them
-//! silently would change what a cell means: the codec types the stored cell,
-//! the resolver maps it to and from the exposed value, and the key codec orders
-//! keyed kinds. The codec and key-codec tokens are part of the *durable*
-//! contract; the resolver token is checked in process only (see
+//! A [`CellResolver`] is session-free. It declares the capability it needs as
+//! [`CellResolver::Context`], and the framework extracts that context from the
+//! session through [`FromSession`]. [`CellResolver::RESOLVER_ID`] is a plain
+//! const on the resolver trait, symmetric with [`Codec::FORMAT_ID`].
+//!
+//! Every descriptor asserts a [`StructuralIdentity`]. It is the frozen
+//! `(kind, codec id, resolver id, key codec id)` tuple. A silent change to any
+//! part would change what a cell means. The codec types the stored cell, the
+//! resolver maps it to the exposed value, and the key codec orders keyed
+//! kinds. The codec and key-codec tokens are part of the durable contract. The
+//! resolver token is checked in process only (see
 //! [`StructuralIdentity::resolver_id`]).
-//! The identity is checked at registration (same `(state_type, name)` ⇒ same
-//! identity), at bind, and against the group-global durable identity table on
-//! first use, so a process carrying an incompatible descriptor fails loudly
-//! instead of silently misreading cells.
+//!
+//! Registration checks that one `(state_type, name)` always carries one
+//! identity. Bind checks it again, and first use checks it against the
+//! group-global durable identity table. A process that carries an
+//! incompatible descriptor fails loudly instead of misreading cells.
 //!
 //! # Exposure
 //!
-//! Users define codecs, resolvers, and cell types (all public). Defining
-//! collection *kinds* stays deliberately unexposed. [`CollectionSpec`] is
-//! nameable downstream, because it names a public associated type, but a marker
-//! that only the layout macro emits *seals* it. A kind can therefore exist only
-//! inside this crate, and never without a declared durable layout.
+//! Users define codecs, resolvers, and cell types. All three are public.
+//! Collection kinds stay unexposed. [`CollectionSpec`] is nameable downstream,
+//! because it names a public associated type. A marker that only the layout
+//! macro emits seals it. A kind can therefore exist only inside this crate,
+//! and never without a declared durable layout.
 //!
 //! [`StateDescriptor`] is sealed the same way, by the crate-private
 //! `SealedDescriptor` supertrait. A downstream crate can register and bind the
-//! framework's descriptors but cannot add its own impl. That is what keeps
-//! identity honest: [`DescriptorIdentity`] is unsealed and
-//! [`StructuralIdentity`]'s fields are `pub`, so without the seal a downstream
-//! type could claim any (kind, format, resolver, key format) tuple for any name
-//! and hand it to
+//! framework's descriptors but cannot add its own impl. The seal keeps
+//! identity honest. [`DescriptorIdentity`] is unsealed and
+//! [`StructuralIdentity`]'s fields are `pub`. Without the seal a downstream
+//! type could claim any identity tuple for any name and hand it to
 //! [`KeyedStateConfiguration::register`](crate::consumer::KeyedStateConfiguration::register)
 //! or [`EventContext::state`](crate::consumer::event_context::EventContext::state).
-//! The two seals cover different things — [`CollectionSpec`] seals cell *reach*
-//! for kinds, this seals descriptor *authorship*.
+//!
+//! The two seals cover different things. [`CollectionSpec`] seals cell reach
+//! for kinds. `SealedDescriptor` seals descriptor authorship.
 
 use crate::codec::Codec;
 use crate::state::StateAccessError;

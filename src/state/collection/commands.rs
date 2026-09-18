@@ -28,13 +28,13 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     /// the subject of a collection's degrade warnings.
     fn name(&self) -> &StateName;
 
-    /// Whether the collection carries a durable TTL. Read from the binding's
-    /// captured settings; no I/O.
+    /// Whether the collection carries a durable TTL. The binding's captured
+    /// settings answer this without I/O.
     fn has_ttl(&self) -> bool;
 
     /// The keyset bound: how many live members a map or set tracks before
-    /// overflowing to a range scan. Read from the binding's captured
-    /// settings; no I/O.
+    /// overflowing to a range scan. The binding's captured settings answer
+    /// this without I/O.
     fn keyset_limit(&self) -> usize;
 
     /// The Deque push cap. A push evicts from the far end above this many
@@ -65,9 +65,9 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     /// answers `keys[i]`, duplicates are answered per position, and an absent
     /// cell reads `None`.
     ///
-    /// The lower reads are sub-batched and sequential (two repair-capable owner
-    /// reads must not race one collection's marker); the typed resolves fan out
-    /// across the whole call in an order-preserving window.
+    /// The cell reads run in sequential sub-batches. Two owner reads that can
+    /// repair must not race on one collection's marker. The typed resolves fan
+    /// out across the whole call in an order-preserving window.
     ///
     /// # Errors
     ///
@@ -162,10 +162,9 @@ pub(crate) trait CollectionWrite: CollectionRead {
         Self::Layout: CollectionLayout;
 }
 
-/// Seals the author-facing command traits: they are implemented for the two
-/// operation types and nothing else, so a helper bounded by them can only ever
-/// receive real admission.
+/// Seals the author-facing command traits. Only the two operation types
+/// implement them, so a helper bounded by them always receives real admission.
 pub(crate) mod sealed_ops {
-    /// The seal marker; see the module item's doc.
+    /// The seal marker. See the module doc.
     pub trait CollectionOperation {}
 }

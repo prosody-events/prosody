@@ -188,8 +188,8 @@ where
     ///
     /// # Errors
     ///
-    /// Any [`StateReaderError`]: acquisition/identity failures, an empty key,
-    /// or a store/decode failure from the bound handle.
+    /// Any [`StateReaderError`]: an acquisition or identity failure, an empty
+    /// key, or a store or decode failure from the bound handle.
     pub async fn get<K: Into<Key>>(
         &self,
         key: K,
@@ -287,9 +287,9 @@ where
     ///
     /// # Errors
     ///
-    /// Any [`StateReaderError`] from acquiring the session (empty key,
-    /// acquisition/identity failures); per-source read failures surface as
-    /// stream items.
+    /// Any [`StateReaderError`] from acquiring the session: an empty key, or
+    /// an acquisition or identity failure. Per-source read failures surface
+    /// as stream items.
     pub async fn stream<K: Into<Key>>(
         &self,
         key: K,

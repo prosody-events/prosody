@@ -129,9 +129,9 @@ where
     ///
     /// # Errors
     ///
-    /// Any [`StateReaderError`] from acquiring the session (empty key,
-    /// acquisition/identity failures); per-source read failures surface as
-    /// stream items.
+    /// Any [`StateReaderError`] from acquiring the session: an empty key, or
+    /// an acquisition or identity failure. Per-source read failures surface
+    /// as stream items.
     pub async fn stream<K: Into<Key>>(
         &self,
         key: K,
