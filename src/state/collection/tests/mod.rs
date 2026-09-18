@@ -18,14 +18,15 @@
 mod plans;
 
 use super::{
-    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, Constraints,
-    JOURNAL_INLINE, StateSession, collection_layout, collection_methods, decode_cell,
+    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, JOURNAL_INLINE,
+    StateSession, collection_layout, collection_methods, decode_cell,
 };
 use crate::codec::{I64Codec, I64CodecError};
 use crate::consumer::middleware::RepinProof;
 use crate::loader::MemoryLoader;
 use crate::state::cached::Cached;
-use crate::state::cell_key::{CellKey, Direction};
+use crate::state::cell::Values;
+use crate::state::cell_key::CellKey;
 use crate::state::descriptor::tests::{session_over, session_with_dirty, value_registry};
 use crate::state::descriptor::{
     CellStateError, Keyed, StateDescriptor, StructuralIdentity, ValueDescriptor, value_state,
@@ -35,10 +36,9 @@ use crate::state::fjall::test_db;
 use crate::state::identity::CollectionId;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
-use crate::state::registry::CollectionDefRegistry;
 use crate::state::session::sealed::StateLifecycle;
 use crate::state::store::CELL_BATCH;
-use crate::state::tests::support::{CountingCellStore, FixedOracle};
+use crate::state::tests::support::CountingCellStore;
 use crate::state::{CollectionKindId, StateAccessError, StateKey, StateType};
 use crate::test_util::TEST_RUNTIME;
 use bytes::Bytes;
@@ -101,8 +101,8 @@ fn stage_pair<C>(op: &mut C, key: i64, left: i64, right: i64) -> Result<(), Prob
 where
     C: CollectionWrite<Layout = PairLayout>,
 {
-    op.set(PairLayout::LEFT, &key, left)?;
-    op.set(PairLayout::RIGHT, &key, right)
+    op.set(PairLayout::LEFT.at(&key), left)?;
+    op.set(PairLayout::RIGHT.at(&key), right)
 }
 
 #[collection_methods(field = cells, session = S)]
@@ -144,7 +144,7 @@ where
     #[write(op)]
     async fn take_swallowing(&self, key: i64, marker: i64) -> Result<bool, ProbeError> {
         let took = op.take(PairLayout::LEFT, &key).await.is_ok();
-        op.set(PairLayout::RIGHT, &key, marker)?;
+        op.set(PairLayout::RIGHT.at(&key), marker)?;
         Ok(took)
     }
 }
@@ -383,11 +383,11 @@ where
     for command in commands {
         match command {
             &Command::Set(family, key, value) => {
-                op.set(family.token(), &key, value)?;
+                op.set(family.token().at(&key), value)?;
                 model.cells.insert((family.section(), key), Some(value));
             }
             &Command::Clear(family, key) => {
-                op.clear(family.token(), &key);
+                op.clear(family.token().at(&key));
                 model.cells.insert((family.section(), key), None);
             }
             &Command::Get(family, key) => {
@@ -469,7 +469,7 @@ async fn run_invocation(case: Invocation) -> Result<()> {
     for &(family, key, value) in &case.seeded {
         handle
             .cells
-            .write(async move |op| op.set(family.token(), &key, value))
+            .write(async move |op| op.set(family.token().at(&key), value))
             .await?;
         seeded.cells.insert((family.section(), key), Some(value));
     }
@@ -482,9 +482,9 @@ async fn run_invocation(case: Invocation) -> Result<()> {
         .cells
         .write(async move |op| {
             let mut model = seeded;
-            op.set(PairLayout::LEFT, &2, 1)?;
+            op.set(PairLayout::LEFT.at(&2), 1)?;
             model.cells.insert((Family::Left.section(), 2), Some(1));
-            op.clear(PairLayout::LEFT, &2);
+            op.clear(PairLayout::LEFT.at(&2));
             model.cells.insert((Family::Left.section(), 2), None);
             assert_eq!(
                 op.contains_many(PairLayout::LEFT, &[2, 3, 2])
@@ -697,7 +697,7 @@ fn cancelled_write_drops_the_journal_and_releases_admission() -> Result<()> {
 
         let parked = Notify::new();
         let mut invocation = Box::pin(handle.cells.write(async |op| {
-            op.set(PairLayout::LEFT, &2, 77)?;
+            op.set(PairLayout::LEFT.at(&2), 77)?;
             parked.notified().await;
             Ok::<(), ProbeError>(())
         }));
@@ -731,11 +731,7 @@ fn warm_reads_perform_no_additional_lower_reads() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let descriptor: ValueDescriptor<I64Codec> = value_state("warm-value");
         let registry = value_registry(&descriptor)?;
-        let lower = CountingCellStore::new(MemoryCellStore::new(
-            MemoryCells::new(),
-            FixedOracle::committed(),
-            Arc::new(CollectionDefRegistry::default()),
-        ));
+        let lower = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let cached = Cached::new(test_db::cache("collection-warm")?, lower.clone());
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("warm-key"));
         let session = session_over(MemoryLoader::new(), registry, state_key, cached);
@@ -783,7 +779,7 @@ fn warm_reads_perform_no_additional_lower_reads() -> Result<()> {
 fn batch_reads_stay_aligned_across_the_store_batch_boundary() -> Result<()> {
     // One past a full batch, so the query spans exactly two sub-batches and
     // lands on the 127/128/129 boundary.
-    let populated = CELL_BATCH as i64 + 1;
+    let populated = CELL_BATCH.get() as i64 + 1;
     TEST_RUNTIME.block_on(async {
         let registry = value_registry(&probe_descriptor())?;
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("probe-key"));
@@ -793,7 +789,7 @@ fn batch_reads_stay_aligned_across_the_store_batch_boundary() -> Result<()> {
             .cells
             .write(async |op| {
                 for key in 0..populated {
-                    op.set(PairLayout::LEFT, &key, key * 10)?;
+                    op.set(PairLayout::LEFT.at(&key), key * 10)?;
                 }
                 Ok::<(), ProbeError>(())
             })
@@ -801,9 +797,9 @@ fn batch_reads_stay_aligned_across_the_store_batch_boundary() -> Result<()> {
 
         // The boundary key at both ends, so a dropped or reordered sub-batch
         // cannot be masked by a palindromic query.
-        let queries: Vec<i64> = once(CELL_BATCH as i64)
+        let queries: Vec<i64> = once(CELL_BATCH.get() as i64)
             .chain(0..populated)
-            .chain(once(CELL_BATCH as i64))
+            .chain(once(CELL_BATCH.get() as i64))
             .collect();
         let answers = handle
             .cells
@@ -834,11 +830,11 @@ fn empty_coordinate_plan_fences_on_exhaustion() -> Result<()> {
 
         let plan = handle
             .cells
-            .read(async |op| op.coordinates(PairLayout::LEFT, Vec::new(), Direction::Forward))
+            .read(async |op| op.coordinates(PairLayout::LEFT, Vec::new()))
             .await;
         session.reset(RepinProof::for_test()).await;
 
-        let stream = plan.entries(Constraints::default());
+        let stream = plan.projected::<Values>();
         futures::pin_mut!(stream);
         match stream.next().await {
             Some(Err(CellStateError::Access(StateAccessError::Terminated))) => Ok(()),

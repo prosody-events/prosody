@@ -1,3 +1,8 @@
+use crate::state::CommitDecision;
+use crate::state::store::CellRead;
+use crate::state::store::CommittedBatch;
+use crate::state::tests::support::{StageInspection, evidence};
+use crate::test_util::TEST_RUNTIME;
 mod cached_suite;
 pub(crate) mod cell_suite;
 pub(crate) mod collection_suite;
@@ -7,43 +12,35 @@ pub(crate) mod publication_suite;
 pub(crate) mod support;
 
 use self::cell_suite::{
-    ApplyTrace, BatchReadTrace, FailingCellStore, FailingOracle, MemoryShapeProbe, OverlayTrace,
-    OverwriteTrace, PoisonHandle, RawBatchTrace, ScanTrace, ScriptedOracle, Trace,
+    ApplyTrace, BatchReadTrace, FailingCellStore, MemoryDeduplicationStore, MemoryShapeProbe,
+    OverlayTrace, OverwriteTrace, PoisonHandle, RawBatchTrace, ScanTrace, Trace,
     run_apply_idempotence, run_batch_alignment, run_batch_duplicate_co_observation,
-    run_batch_read_parity_trace, run_blind_write_leaves_clears_free_marker,
-    run_blind_write_survives_stale_clear, run_bottom_scan_trace, run_crash_equivalence_trace,
-    run_overlay_precedence_pin, run_overlay_trace, run_overwrite_trace,
-    run_raw_batch_ascending_output, run_raw_batch_no_side_effects, run_raw_batch_parity_trace,
-    run_repair_after_marker_abort_converges, run_repair_defers_beneath_stale_clear,
+    run_batch_read_parity_trace, run_blind_write_leaves_clears_free_marker, run_bottom_scan_trace,
+    run_crash_equivalence_trace, run_overlay_precedence_pin, run_overlay_trace,
+    run_overwrite_trace, run_raw_batch_ascending_output, run_raw_batch_no_side_effects,
+    run_raw_batch_parity_trace,
 };
 use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
-    DequeCapacityShape, DequeHoles, DequeInterleave, DequePlanConstraints, DequeTrace,
-    MapGetManyInput, MapInterleave, MapKeyHoles, MapTrace, SetTrace, StreamConstraints,
-    finalize_and_promote, run_deque_capacity_convergence, run_deque_constraint_parity,
-    run_deque_holes, run_deque_stream_interleave, run_deque_trace, run_map_entries_prefix_trace,
-    run_map_get_many_parity_trace, run_map_key_scan_holes, run_map_keys_prefix_trace,
-    run_map_keyset_exact_trace, run_map_stream_interleave, run_map_trace,
-    run_map_ttl_keyset_refresh_trace, run_set_contains_many_parity_trace,
-    run_set_keys_prefix_trace, run_set_keyset_exact_trace, run_set_trace,
+    DequeCapacityShape, DequeConstraints, DequeHoles, DequeInterleave, DequeTrace, MapGetManyInput,
+    MapInterleave, MapKeyHoles, MapTrace, StreamConstraints, finalize_and_promote,
+    run_deque_capacity_convergence, run_deque_constraint_parity, run_deque_holes,
+    run_deque_stream_interleave, run_deque_trace, run_map_get_many_parity_trace,
+    run_map_key_scan_holes, run_map_keyset_exact_trace, run_map_query_trace,
+    run_map_stream_interleave, run_map_ttl_keyset_refresh_trace,
 };
 use self::publication_suite::{PublicationTrace, run_publication_trace};
-use self::support::{
-    CountingCellStore, CountingOracle, CountingResolver, FixedOracle, ResolveCounter,
-    fresh_collection,
-};
-use super::cell::{Committed, ProvisionalWrite};
+use self::support::{CountingCellStore, CountingResolver, ResolveCounter, fresh_collection};
+use super::cell::{Cell, Committed, ProvisionalWrite, Values};
 use super::cell_key::CellKey;
 use super::descriptor::{StateDescriptor, WithResolver, deque, deque_state, map_state};
-use super::manager::ArmedKeys;
-use super::marker::{EventMarker, SectionClear};
+use super::marker::EventMarker;
 use super::memory::{
     MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore,
 };
-use super::oracle::CommitOracle;
 use super::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use super::registry::{CollectionDef, CollectionDefRegistry};
-use super::resolve::{ResolveCellError, resolve_event_marker};
+use super::resolve::{EvidenceLookup, resolve_event_marker};
 use super::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use super::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, dedupe};
 use super::{
@@ -52,13 +49,11 @@ use super::{
 };
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
-use crate::error::ErrorCategory;
 use crate::loader::MemoryLoader;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
-use futures::StreamExt;
-use futures::executor;
+use futures::{StreamExt, pin_mut, stream};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use serde_json::Value;
 use std::num::NonZeroUsize;
@@ -104,31 +99,23 @@ fn collection_ref_eq_and_hash_ignore_ttl() -> Result<()> {
     Ok(())
 }
 
-/// A fresh memory cell store over shared cells, resolving through `oracle`.
-fn memory_store(cells: MemoryCells, oracle: ScriptedOracle) -> MemoryCellStore<ScriptedOracle> {
-    MemoryCellStore::new(cells, oracle, Arc::new(CollectionDefRegistry::default()))
-}
-
-/// Crash-recovery equivalence over the memory cell store: every resolution path
-/// (clean promote, inline rollback, crash → sweep / first-touch) converges each
-/// cell's committed projection to the model (crash-recovery equivalence and
-/// oracle-correctness properties). For a bare store the runner's lower fault
-/// seam wraps the bottom store directly (wrapper and lower depth coincide).
+/// A crash preserves committed values across stage and promote cuts.
+/// Admission resolves residue before the next event.
 #[test]
 fn prop_memory_cell_crash_equivalence() {
     fn property(trace: Trace) -> Result<bool> {
-        let oracle = ScriptedOracle::default();
+        let dedup = MemoryDeduplicationStore::default();
         let cells = MemoryCells::new();
         let make = |lower: &PoisonHandle| {
             Ok(FailingCellStore::with_handle(
-                memory_store(cells.clone(), oracle.clone()),
+                MemoryCellStore::new(cells.clone()),
                 lower.clone(),
             ))
         };
         let probe = MemoryShapeProbe(cells.clone());
-        executor::block_on(run_crash_equivalence_trace(
+        TEST_RUNTIME.block_on(run_crash_equivalence_trace(
             make,
-            oracle.clone(),
+            dedup.clone(),
             trace,
             &probe,
         ))
@@ -136,98 +123,53 @@ fn prop_memory_cell_crash_equivalence() {
     QuickCheck::new().quickcheck(property as fn(Trace) -> Result<bool>);
 }
 
-/// Proves that a resolved write survives an earlier unsettled section clear.
-#[test]
-fn blind_write_survives_stale_clear() -> Result<()> {
-    let oracle = ScriptedOracle::default();
-    let store = memory_store(MemoryCells::new(), oracle.clone());
-    executor::block_on(run_blind_write_survives_stale_clear(store, oracle))
-}
-
 /// Posture-parity test over the memory store: a blind `write_resolved` leaves a
 /// unsettled clears-FREE marker unsettled (the boundary triggers on clears
 /// only).
 #[test]
 fn blind_write_leaves_clears_free_marker() -> Result<()> {
-    let oracle = ScriptedOracle::default();
     let cells = MemoryCells::new();
-    let store = memory_store(cells.clone(), oracle);
+    let store = MemoryCellStore::new(cells.clone());
     let probe = MemoryShapeProbe(cells);
-    executor::block_on(run_blind_write_leaves_clears_free_marker(store, &probe))
-}
-
-/// Regression test over the memory store: a repair whose payload predates a
-/// committed but unsettled marker with clears defers to peek semantics, so the
-/// marker's own resolution erases the cell rather than a stale repair
-/// resurrecting it. Falsify by deleting the `deferred` guard in `resolve_cell`.
-#[test]
-fn repair_defers_beneath_stale_clear() -> Result<()> {
-    let oracle = ScriptedOracle::default();
-    let cells = MemoryCells::new();
-    let stage = memory_store(cells.clone(), oracle.clone());
-    let store = memory_store(cells.clone(), oracle.clone());
-    let probe = MemoryShapeProbe(cells);
-    executor::block_on(run_repair_defers_beneath_stale_clear(
-        &stage, store, oracle, &probe,
-    ))
-}
-
-/// Convergence test over the memory store: the deferral wedges nothing — when
-/// the unsettled marker aborts, x's committed projection stays its base.
-#[test]
-fn repair_after_marker_abort_converges() -> Result<()> {
-    let oracle = ScriptedOracle::default();
-    let cells = MemoryCells::new();
-    let stage = memory_store(cells.clone(), oracle.clone());
-    let store = memory_store(cells.clone(), oracle.clone());
-    let probe = MemoryShapeProbe(cells);
-    executor::block_on(run_repair_after_marker_abort_converges(
-        &stage, store, oracle, &probe,
-    ))
+    TEST_RUNTIME.block_on(run_blind_write_leaves_clears_free_marker(store, &probe))
 }
 
 /// Implicit-overwrite soundness over the memory cell store: a sequence of
 /// events that never promote or roll back explicitly converges every cell to
 /// the model, each overwrite resolving its predecessor's provisional cell
-/// through the oracle (both arms) on read.
+/// through collection evidence on read.
 #[test]
 fn prop_memory_cell_implicit_overwrite() {
     fn property(trace: OverwriteTrace) -> Result<bool> {
-        let oracle = ScriptedOracle::default();
+        let dedup = MemoryDeduplicationStore::default();
         let cells = MemoryCells::new();
-        let make = || Ok(memory_store(cells.clone(), oracle.clone()));
-        executor::block_on(run_overwrite_trace(make, oracle.clone(), trace))
+        let make = || Ok(MemoryCellStore::new(cells.clone()));
+        TEST_RUNTIME.block_on(run_overwrite_trace(make, dedup.clone(), trace))
     }
     QuickCheck::new().quickcheck(property as fn(OverwriteTrace) -> Result<bool>);
 }
 
-/// Unified view soundness over `Overlay<MemoryCellStore>`: point `get`s, range
-/// `scan`s (bounded, bidirectional, limited, early-stopped), dirty buffering,
-/// and committed writes **intermixed** in one trace all match the
-/// dirty-over-committed oracle — dirty-wins, clear-hides, the dirty leg bounded
-/// to the scan range, the limit applied to the merge (unified-view soundness
-/// with point-range interleaving and oracle-correctness properties).
+/// Point reads and range scans match the dirty-over-committed oracle.
+/// The trace mixes bounded scans, both directions, early stops, dirty writes,
+/// and committed writes. Dirty values win, and dirty clears hide cells.
 #[test]
 fn prop_memory_overlay_view() {
     fn property(trace: OverlayTrace) -> Result<bool> {
-        let oracle = ScriptedOracle::default();
-        let lower = memory_store(MemoryCells::new(), oracle);
-        executor::block_on(run_overlay_trace(lower, trace))
+        let lower = MemoryCellStore::new(MemoryCells::new());
+        TEST_RUNTIME.block_on(run_overlay_trace(lower, trace))
     }
     QuickCheck::new().quickcheck(property as fn(OverlayTrace) -> Result<bool>);
 }
 
-/// Scan correctness directly over `MemoryCellStore::scan_cells` (no overlay):
-/// the backend's own ordering, range bounds, and limit handling match the
-/// committed-only oracle — including post-clear (gap-erased) section states.
+/// Both memory scan projections match the committed model across bounds and
+/// section clears.
 #[test]
 fn prop_memory_bottom_scan() {
     fn property(trace: ScanTrace) -> Result<bool> {
-        let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let store = memory_store(cells.clone(), oracle);
+        let store = MemoryCellStore::new(cells.clone());
         let probe = MemoryShapeProbe(cells);
-        executor::block_on(run_bottom_scan_trace(store, trace, &probe))
+        TEST_RUNTIME.block_on(run_bottom_scan_trace(store, trace, &probe))
     }
     QuickCheck::new().quickcheck(property as fn(ScanTrace) -> Result<bool>);
 }
@@ -245,7 +187,7 @@ fn prop_chunk_reassembly() {
         let batches: Vec<CoordinateBatch> = CoordinateBatch::chunks(input.clone()).collect();
         let mut flat: Vec<Coordinate> = Vec::new();
         for batch in &batches {
-            if batch.len() == 0 || batch.len() > CELL_BATCH {
+            if batch.len() == 0 || batch.len() > CELL_BATCH.get() {
                 return false;
             }
             flat.extend(batch.as_slice().iter().cloned());
@@ -253,7 +195,7 @@ fn prop_chunk_reassembly() {
         // All but the last batch are exactly CELL_BATCH.
         let full_prefix = batches
             .split_last()
-            .is_none_or(|(_, rest)| rest.iter().all(|b| b.len() == CELL_BATCH));
+            .is_none_or(|(_, rest)| rest.iter().all(|b| b.len() == CELL_BATCH.get()));
         flat == input && full_prefix && (input.is_empty() == batches.is_empty())
     }
     QuickCheck::new().quickcheck(property as fn(Vec<u8>) -> bool);
@@ -266,8 +208,8 @@ fn cell_buffers_spill_before_full_batch() {
     let small: CellBuffer<usize> = (0..CELLS_INLINE).collect();
     assert!(!small.spilled(), "the common small case stays inline");
 
-    let full: CellBuffer<usize> = (0..CELL_BATCH).collect();
-    assert_eq!(full.len(), CELL_BATCH);
+    let full: CellBuffer<usize> = (0..CELL_BATCH.get()).collect();
+    assert_eq!(full.len(), CELL_BATCH.get());
     assert!(
         full.spilled(),
         "a full batch must not remain inline in an async state machine"
@@ -305,14 +247,8 @@ fn dedupe_uniques_and_plan() -> Result<()> {
 #[test]
 fn prop_memory_batch_read_parity() {
     fn property(trace: BatchReadTrace) -> Result<bool> {
-        let oracle = ScriptedOracle::default();
-        let store = memory_store(MemoryCells::new(), oracle.clone());
-        executor::block_on(run_batch_read_parity_trace(
-            store.clone(),
-            store,
-            oracle,
-            trace,
-        ))
+        let store = MemoryCellStore::new(MemoryCells::new());
+        TEST_RUNTIME.block_on(run_batch_read_parity_trace(store, trace))
     }
     QuickCheck::new().quickcheck(property as fn(BatchReadTrace) -> Result<bool>);
 }
@@ -323,8 +259,8 @@ fn prop_memory_batch_read_parity() {
 #[test]
 fn prop_memory_raw_batch_parity() {
     fn property(trace: RawBatchTrace) -> Result<bool> {
-        let store = memory_store(MemoryCells::new(), ScriptedOracle::default());
-        executor::block_on(run_raw_batch_parity_trace(store, trace))
+        let store = MemoryCellStore::new(MemoryCells::new());
+        TEST_RUNTIME.block_on(run_raw_batch_parity_trace(store, trace))
     }
     QuickCheck::new().quickcheck(property as fn(RawBatchTrace) -> Result<bool>);
 }
@@ -334,36 +270,30 @@ fn prop_memory_raw_batch_parity() {
 /// collapses to input byte order.
 #[test]
 fn memory_raw_batch_ascending_output() -> Result<()> {
-    let store = memory_store(MemoryCells::new(), ScriptedOracle::default());
-    executor::block_on(run_raw_batch_ascending_output(store))
+    let store = MemoryCellStore::new(MemoryCells::new());
+    TEST_RUNTIME.block_on(run_raw_batch_ascending_output(store))
 }
 
-/// No-side-effects test over the memory store built on a [`CountingOracle`]:
-/// `provisional_many` never resolves, writes, or caches.
+/// Raw batch reads leave provisional rows unchanged.
 #[test]
 fn memory_raw_batch_no_side_effects() -> Result<()> {
-    let oracle = CountingOracle::default();
-    let store = MemoryCellStore::new(
-        MemoryCells::new(),
-        oracle.clone(),
-        Arc::new(CollectionDefRegistry::default()),
-    );
-    executor::block_on(run_raw_batch_no_side_effects(store, oracle))
+    let store = MemoryCellStore::new(MemoryCells::new());
+    TEST_RUNTIME.block_on(run_raw_batch_no_side_effects(store))
 }
 
 /// Within-batch duplicate co-observation + scatter alignment over the memory
 /// store (deterministic).
 #[test]
 fn memory_batch_duplicate_co_observation() -> Result<()> {
-    let store = memory_store(MemoryCells::new(), ScriptedOracle::default());
-    executor::block_on(run_batch_duplicate_co_observation(store))
+    let store = MemoryCellStore::new(MemoryCells::new());
+    TEST_RUNTIME.block_on(run_batch_duplicate_co_observation(store))
 }
 
 /// Every input position is answered over two chunks (deterministic alignment).
 #[test]
 fn memory_batch_alignment() -> Result<()> {
-    let store = memory_store(MemoryCells::new(), ScriptedOracle::default());
-    executor::block_on(run_batch_alignment(store))
+    let store = MemoryCellStore::new(MemoryCells::new());
+    TEST_RUNTIME.block_on(run_batch_alignment(store))
 }
 
 /// Proves that marker resolution reads provisional cells in bounded batches.
@@ -374,10 +304,8 @@ fn memory_batch_alignment() -> Result<()> {
 /// Then `raw_batch_reads` becomes zero and the read-count asserts fail.
 #[test]
 fn memory_resolve_event_marker_batches_reads() -> Result<()> {
-    executor::block_on(async {
-        let counting =
-            CountingCellStore::new(memory_store(MemoryCells::new(), ScriptedOracle::default()));
-        let oracle = CountingOracle::default();
+    TEST_RUNTIME.block_on(async {
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
         let id = fresh_collection("resolve-marker-batches")?;
         let cref = CollectionRef::new(id.clone(), None);
         let event = EventRef::Message {
@@ -398,16 +326,15 @@ fn memory_resolve_event_marker_batches_reads() -> Result<()> {
                 ProvisionalWrite::new(Some(bytes(2)), Committed::new(None), event),
             )
         }));
-        let marker = EventMarker::frozen(event, &writes, &[]);
+        let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
         counting
             .write_provisional(&cref, &writes, Some(&marker))
             .await
             .map_err(|e| eyre!("stage: {e}"))?;
 
-        // The oracle answers NotCommitted ⇒ abort; the verdict is irrelevant to
-        // the read counts this test measures.
+        // Count raw batch reads during a committed resolution.
         counting.reset();
-        resolve_event_marker(&counting, &oracle, &cref, &marker)
+        resolve_event_marker(&counting, &cref, &marker, CommitDecision::Committed)
             .await
             .map_err(|e| eyre!("resolve_event_marker: {e}"))?;
 
@@ -421,7 +348,7 @@ fn memory_resolve_event_marker_batches_reads() -> Result<()> {
             0,
             "the marker leg issues no per-coordinate point read"
         );
-        assert_eq!(oracle.resolves(), 1, "exactly one oracle verdict");
+
         Ok(())
     })
 }
@@ -436,12 +363,8 @@ fn memory_resolve_event_marker_batches_reads() -> Result<()> {
 /// fails.
 #[test]
 fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
-    executor::block_on(async {
-        let store = MemoryCellStore::new(
-            MemoryCells::new(),
-            FixedOracle::committed(),
-            Arc::new(CollectionDefRegistry::default()),
-        );
+    TEST_RUNTIME.block_on(async {
+        let store = MemoryCellStore::new(MemoryCells::new());
         let id = fresh_collection("resolve-marker-rekey")?;
         let cref = CollectionRef::new(id.clone(), None);
         let event = EventRef::Message {
@@ -457,21 +380,17 @@ fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
                 ProvisionalWrite::new(Some(bytes(90)), Committed::new(None), event),
             ),
         ];
-        let marker = EventMarker::frozen(event, &writes, &[]);
+        let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
         store
             .write_provisional(&cref, &writes, Some(&marker))
             .await
             .map_err(|e| eyre!("stage: {e}"))?;
 
-        let oracle = FixedOracle::committed();
-        resolve_event_marker(&store, &oracle, &cref, &marker)
+        resolve_event_marker(&store, &cref, &marker, CommitDecision::Committed)
             .await
             .map_err(|e| eyre!("resolve_event_marker: {e}"))?;
 
-        // Observe `resolve_event_marker`'s own output before any `get`: nothing may be
-        // left provisional. A `get` here would self-heal a survivor the collapse
-        // regression left provisional (see the doc comment), so this drain must
-        // run first.
+        // Check raw rows: visible reads can hide unresolved provisional cells.
         let remaining = drain_memory_provisional(&store, &id)
             .await
             .map_err(|e| eyre!("drain: {e}"))?;
@@ -481,23 +400,19 @@ fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
              {remaining:?}"
         );
 
-        // A prior event reader event: the cells are already resolved, so `get`
-        // returns the committed value directly.
-        let reader = EventRef::Message {
-            dedup_id: Uuid::from_u128(2),
-        };
+        // Resolved cells return the committed value directly.
         assert_eq!(
-            store
-                .get(&id, &cell_in(0, 7), reader)
+            CellRead::<Values>::read(&store, &id, &cell_in(0, 7))
                 .await
+                .map(|(committed, _)| committed)
                 .map_err(|e| eyre!("get s0: {e}"))?,
             Committed::new(Some(bytes(70))),
             "the section-0 survivor commits at (0, 7)"
         );
         assert_eq!(
-            store
-                .get(&id, &cell_in(1, 7), reader)
+            CellRead::<Values>::read(&store, &id, &cell_in(1, 7))
                 .await
+                .map(|(committed, _)| committed)
                 .map_err(|e| eyre!("get s1: {e}"))?,
             Committed::new(Some(bytes(90))),
             "the section-1 survivor commits at (1, 7), not collided onto (0, 7)"
@@ -506,63 +421,13 @@ fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
     })
 }
 
-/// Proves that an event-check error takes priority over a cell-read error.
-///
-/// Falsification: Replace the joined reads with `try_join!`.
-/// Then the store error wins and the `matches!` assert fails.
-#[test]
-fn resolve_event_marker_double_failure_surfaces_oracle() -> Result<()> {
-    executor::block_on(async {
-        let id = fresh_collection("resolve-marker-double-fail")?;
-        let name = id.name().clone();
-        let cref = CollectionRef::new(id.clone(), None);
-        // Arm the raw-read poison from the start; it targets `provisional_many`
-        // only, so seeding the marker via `write_provisional` still works.
-        let counting = CountingCellStore::new(FailingCellStore::armed_provisional_many(
-            memory_store(MemoryCells::new(), ScriptedOracle::default()),
-            name,
-            ErrorCategory::Transient,
-        ));
-        let event = EventRef::Message {
-            dedup_id: Uuid::from_u128(1),
-        };
-        let writes = [(
-            cell_in(0, 1),
-            ProvisionalWrite::new(Some(bytes(1)), Committed::new(None), event),
-        )];
-        let marker = EventMarker::frozen(event, &writes, &[]);
-        counting
-            .write_provisional(&cref, &writes, Some(&marker))
-            .await
-            .map_err(|e| eyre!("stage: {e}"))?;
-
-        counting.reset();
-        let oracle = FailingOracle::default();
-        let err = match resolve_event_marker(&counting, &oracle, &cref, &marker).await {
-            Ok(()) => return Err(eyre!("expected a double failure, got Ok")),
-            Err(err) => err,
-        };
-        assert!(
-            matches!(err, ResolveCellError::Oracle(_)),
-            "a double failure surfaces the oracle error, got {err:?}"
-        );
-        assert_eq!(oracle.resolves(), 1, "the oracle is consulted exactly once");
-        assert_eq!(
-            counting.raw_batch_reads(),
-            1,
-            "the overlap leaves the raw-batch-read count unchanged (one chunk)"
-        );
-        Ok(())
-    })
-}
-
-/// Drains a memory store's `provisional_cells` sweep into its yielded cells,
+/// Reads the provisional cells listed by the memory store's current marker,
 /// for the recovery tests that assert nothing is left provisional.
 async fn drain_memory_provisional<S: CellStore>(
     store: &S,
     id: &CollectionId,
 ) -> Result<Vec<CellKey>, S::Error> {
-    let stream = store.provisional_cells(id);
+    let stream = store.staged_cells(id);
     futures::pin_mut!(stream);
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
@@ -576,21 +441,20 @@ async fn drain_memory_provisional<S: CellStore>(
 /// dirty-answered positions never reach the lower batch.
 #[test]
 fn memory_overlay_precedence_set_beats_section_clear() -> Result<()> {
-    let counting =
-        CountingCellStore::new(memory_store(MemoryCells::new(), ScriptedOracle::default()));
-    executor::block_on(run_overlay_precedence_pin(counting))
+    let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
+    TEST_RUNTIME.block_on(run_overlay_precedence_pin(counting))
 }
 
 /// A cold, dense `CELL_BATCH`-entry `Tracked` map streamed to exhaustion issues
 /// exactly ONE lower batch read for its entries — a full-width scan chunk is
 /// one [`CoordinateBatch`], one lower `get_many`; only the keyset meta cell
 /// stays a point read.
-/// Falsification: Replace `CoordinatePlan` batch reads with per-key `get`
+/// Falsification: Replace coordinate batch reads with per-key `get`
 /// calls. Then `batch_reads` becomes zero and both read-count asserts fail.
 #[test]
 fn map_cold_chunk_is_one_batch_read() -> Result<()> {
-    executor::block_on(async {
-        let oracle = ScriptedOracle::default();
+    TEST_RUNTIME.block_on(async {
+        let dedup = MemoryDeduplicationStore::default();
         let cells = MemoryCells::new();
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
         let descriptor =
@@ -604,12 +468,7 @@ fn map_cold_chunk_is_one_batch_read() -> Result<()> {
             },
         )?;
         let registry = Arc::new(registry);
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            cells.clone(),
-            oracle.clone(),
-            registry.clone(),
-        ));
-        let armed: ArmedKeys = Arc::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(cells.clone()));
         let id = CollectionId::new(
             state_key.clone(),
             StateType::Application,
@@ -622,20 +481,19 @@ fn map_cold_chunk_is_one_batch_read() -> Result<()> {
         };
         let session = resolve_session(
             &counting,
-            &oracle,
+            &dedup,
             &registry,
             &state_key,
-            &armed,
             event,
             ResolveCounter::default(),
         );
         let seed = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
-        for i in 0..CELL_BATCH as i64 {
+        for i in 0..CELL_BATCH.get() as i64 {
             seed.set(&i, Value::from(i))
                 .await
                 .map_err(|e| eyre!("{e}"))?;
         }
-        finalize_and_promote(&session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
+        finalize_and_promote(&session, &dedup, Uuid::from_u128(1), &cells, &id).await?;
 
         // Fresh cold session, zeroed counters; drain the complete stream.
         counting.reset();
@@ -644,10 +502,9 @@ fn map_cold_chunk_is_one_batch_read() -> Result<()> {
         };
         let session = resolve_session(
             &counting,
-            &oracle,
+            &dedup,
             &registry,
             &state_key,
-            &armed,
             event,
             ResolveCounter::default(),
         );
@@ -661,7 +518,7 @@ fn map_cold_chunk_is_one_batch_read() -> Result<()> {
             }
             out
         };
-        assert_eq!(drained.len(), CELL_BATCH, "all entries drained");
+        assert_eq!(drained.len(), CELL_BATCH.get(), "all entries drained");
         assert_eq!(
             counting.batch_reads(),
             1,
@@ -691,8 +548,8 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
     const K3: i64 = 3;
     const K_ABSENT: i64 = 99;
 
-    executor::block_on(async {
-        let oracle = ScriptedOracle::default();
+    TEST_RUNTIME.block_on(async {
+        let dedup = MemoryDeduplicationStore::default();
         let cells = MemoryCells::new();
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
         let descriptor =
@@ -700,12 +557,7 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
         let mut registry = CollectionDefRegistry::default();
         registry.register(&descriptor, CollectionDef::new(None))?;
         let registry = Arc::new(registry);
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            cells.clone(),
-            oracle.clone(),
-            registry.clone(),
-        ));
-        let armed: ArmedKeys = Arc::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(cells.clone()));
         let id = CollectionId::new(
             state_key.clone(),
             StateType::Application,
@@ -718,10 +570,9 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
         };
         let seed_session = resolve_session(
             &counting,
-            &oracle,
+            &dedup,
             &registry,
             &state_key,
-            &armed,
             event,
             ResolveCounter::default(),
         );
@@ -731,7 +582,7 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
         seed.set(&K1, Value::from(K1))
             .await
             .map_err(|e| eyre!("{e}"))?;
-        finalize_and_promote(&seed_session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
+        finalize_and_promote(&seed_session, &dedup, Uuid::from_u128(1), &cells, &id).await?;
 
         // Fresh cold session, fresh resolve counter, one live dirty overlay.
         counting.reset();
@@ -741,10 +592,9 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
         };
         let session = resolve_session(
             &counting,
-            &oracle,
+            &dedup,
             &registry,
             &state_key,
-            &armed,
             event,
             resolves.clone(),
         );
@@ -800,7 +650,7 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
 /// Then the resolver count becomes nonzero and the count assert fails.
 #[test]
 fn map_keys_no_resolve() -> Result<()> {
-    executor::block_on(async {
+    TEST_RUNTIME.block_on(async {
         // Tracked arm: keyset_limit >= n keeps the map Tracked; contrast get().
         map_keys_drain_resolves(4096, 6, true).await?;
         // Degrade arm: keyset_limit < n overflows → the full-section scan.
@@ -814,7 +664,7 @@ fn map_keys_no_resolve() -> Result<()> {
 /// zero times. With `get_contrast`, also asserts a `get()` on a present key
 /// resolves — so the zero above is a real skip on a resolvable cell.
 async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bool) -> Result<()> {
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, WithResolver<JsonCodec, CountingResolver>>("kz");
@@ -827,12 +677,7 @@ async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bo
         },
     )?;
     let registry = Arc::new(registry);
-    let counting = CountingCellStore::new(MemoryCellStore::new(
-        cells.clone(),
-        oracle.clone(),
-        registry.clone(),
-    ));
-    let armed: ArmedKeys = Arc::default();
+    let counting = CountingCellStore::new(MemoryCellStore::new(cells.clone()));
     let id = CollectionId::new(
         state_key.clone(),
         StateType::Application,
@@ -845,10 +690,9 @@ async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bo
     };
     let session = resolve_session(
         &counting,
-        &oracle,
+        &dedup,
         &registry,
         &state_key,
-        &armed,
         event,
         ResolveCounter::default(),
     );
@@ -859,7 +703,7 @@ async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bo
             .await
             .map_err(|e| eyre!("{e}"))?;
     }
-    finalize_and_promote(&session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
+    finalize_and_promote(&session, &dedup, Uuid::from_u128(1), &cells, &id).await?;
 
     // Fresh cold session, zeroed resolve counter; drain keys() both directions.
     counting.reset();
@@ -869,21 +713,15 @@ async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bo
     };
     let session = resolve_session(
         &counting,
-        &oracle,
+        &dedup,
         &registry,
         &state_key,
-        &armed,
         event,
         resolves.clone(),
     );
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
     assert!(!handle.is_empty().await.map_err(|e| eyre!("{e}"))?);
-    assert_eq!(
-        counting.presence_batch_width(),
-        usize::from(get_contrast),
-        "tracked is_empty reads one coordinate"
-    );
 
     for dir in [Direction::Forward, Direction::Backward] {
         let drained: Vec<i64> = {
@@ -917,10 +755,7 @@ async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bo
     Ok(())
 }
 
-/// A store overriding only `get_for_cache` (returning a TTL) inherits the
-/// default `get_many_for_cache`, which must carry that TTL metadata through for
-/// every position — the guard against defaulting the cache-fill batch to
-/// `get_many` + `None` TTLs (the `commit_provisional`-wrapper bug class).
+/// The default batch read preserves the TTL from each projected point read.
 #[test]
 fn forwarding_default_preserves_ttl() -> Result<()> {
     use self::support::TtlStub;
@@ -932,13 +767,12 @@ fn forwarding_default_preserves_ttl() -> Result<()> {
         StateType::Application,
         StateName::try_new("entries")?,
     );
-    let own = EventRef::Message {
-        dedup_id: Uuid::from_u128(3),
-    };
     let batch = CoordinateBatch::chunks([0u8, 1].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    let got = executor::block_on(store.get_many_for_cache(&id, SECTIONS[0], &batch, own))?;
+    let got = TEST_RUNTIME.block_on(async {
+        CellRead::<Values>::read_many(&store, &id, SECTIONS[0], &batch).await
+    })?;
     assert_eq!(got.len(), 2, "every position answered");
     for (_, remaining) in &got {
         assert_eq!(
@@ -961,7 +795,7 @@ fn forwarding_default_preserves_ttl() -> Result<()> {
 #[test]
 fn prop_deque_collection_lifecycle() {
     fn property(trace: DequeTrace) -> Result<bool> {
-        executor::block_on(run_deque_trace(trace, CommitMode::ReadCommitted, None))
+        TEST_RUNTIME.block_on(run_deque_trace(trace, CommitMode::ReadCommitted, None))
     }
     QuickCheck::new().quickcheck(property as fn(DequeTrace) -> Result<bool>);
 }
@@ -972,7 +806,7 @@ fn prop_deque_collection_lifecycle() {
 #[test]
 fn prop_deque_collection_lifecycle_read_uncommitted() {
     fn property(trace: DequeTrace) -> Result<bool> {
-        executor::block_on(run_deque_trace(trace, CommitMode::ReadUncommitted, None))
+        TEST_RUNTIME.block_on(run_deque_trace(trace, CommitMode::ReadUncommitted, None))
     }
     QuickCheck::new().quickcheck(property as fn(DequeTrace) -> Result<bool>);
 }
@@ -990,7 +824,7 @@ fn prop_deque_collection_lifecycle_read_uncommitted() {
 #[test]
 fn prop_deque_bounded_lifecycle() {
     fn property(trace: DequeTrace) -> Result<bool> {
-        executor::block_on(run_deque_trace(
+        TEST_RUNTIME.block_on(run_deque_trace(
             trace,
             CommitMode::ReadCommitted,
             Some(BOUNDED_TEST_CAP),
@@ -1003,7 +837,7 @@ fn prop_deque_bounded_lifecycle() {
 #[test]
 fn prop_deque_bounded_lifecycle_read_uncommitted() {
     fn property(trace: DequeTrace) -> Result<bool> {
-        executor::block_on(run_deque_trace(
+        TEST_RUNTIME.block_on(run_deque_trace(
             trace,
             CommitMode::ReadUncommitted,
             Some(BOUNDED_TEST_CAP),
@@ -1023,114 +857,28 @@ fn prop_deque_bounded_lifecycle_read_uncommitted() {
 #[test]
 fn prop_deque_capacity_convergence() {
     fn property(shape: DequeCapacityShape) -> Result<bool> {
-        executor::block_on(run_deque_capacity_convergence(shape))
+        TEST_RUNTIME.block_on(run_deque_capacity_convergence(shape))
     }
     QuickCheck::new().quickcheck(property as fn(DequeCapacityShape) -> Result<bool>);
 }
 
-/// Map collection soundness over the real session lifecycle: random
-/// set/remove/get/clear/mid-handler-commit traces with commit/abort/crash
-/// outcomes keep the handle's `get` and key-ordered `stream` in step with a
-/// `BTreeMap` oracle — the current-membership keyset (cleared with the
-/// entries; `KeysetPresence`), crash atomicity, the at-least-once `commit()`
-/// contract (`commit()`-landed ops survive abort/crash-rollback; post-commit
-/// ops roll back — so a commit-then-clear-then-abort trace restores the
-/// `commit()`-landed state), and `contains_key` parity (`contains_key(k) ==
-/// get(k).is_some()`) at every step.
+/// Map reads and bounded queries match the model through the full lifecycle.
+/// Both commit modes cover tracked keysets, range scans, aborts, and recovery.
 #[test]
-fn prop_map_collection_lifecycle() {
-    fn property(trace: MapTrace) -> Result<bool> {
-        executor::block_on(run_map_trace(trace, CommitMode::ReadCommitted))
-    }
-    QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
-}
-
-/// The map lifecycle property in `ReadUncommitted` mode: `finalize` commits
-/// everything, so every outcome that reaches it — including crash-abort —
-/// converges to the full scratch model.
-#[test]
-fn prop_map_collection_lifecycle_read_uncommitted() {
-    fn property(trace: MapTrace) -> Result<bool> {
-        executor::block_on(run_map_trace(trace, CommitMode::ReadUncommitted))
-    }
-    QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
-}
-
-/// Set lifecycle parity in read-committed mode.
-/// FALSIFICATION: make `SetHandle::remove` skip its member clear.
-#[test]
-fn prop_set_collection_lifecycle() {
-    fn property(trace: SetTrace) -> Result<bool> {
-        executor::block_on(run_set_trace(trace, CommitMode::ReadCommitted))
-    }
-    QuickCheck::new().quickcheck(property as fn(SetTrace) -> Result<bool>);
-}
-
-/// Set lifecycle parity in read-uncommitted mode.
-/// FALSIFICATION: make the set trace keep its prior model after finalize.
-#[test]
-fn prop_set_collection_lifecycle_read_uncommitted() {
-    fn property(trace: SetTrace) -> Result<bool> {
-        executor::block_on(run_set_trace(trace, CommitMode::ReadUncommitted))
-    }
-    QuickCheck::new().quickcheck(property as fn(SetTrace) -> Result<bool>);
-}
-
-/// Set query constraints match a filtered unlimited prefix.
-/// FALSIFICATION: ignore the set query limit in `SetQuery::limit`.
-#[test]
-fn prop_set_keys_constraint_parity() {
-    fn property(trace: SetTrace, constraints: StreamConstraints) -> Result<bool> {
-        executor::block_on(run_set_keys_prefix_trace(trace, constraints))
-    }
-    QuickCheck::new().quickcheck(property as fn(SetTrace, StreamConstraints) -> Result<bool>);
-}
-
-/// Set batch membership matches the `BTreeSet` model.
-/// FALSIFICATION: invert one result in `SetHandle::contains_many`.
-#[test]
-fn prop_set_contains_many_parity() {
-    fn property(input: MapGetManyInput) -> Result<bool> {
-        executor::block_on(run_set_contains_many_parity_trace(input))
-    }
-    QuickCheck::new().quickcheck(property as fn(MapGetManyInput) -> Result<bool>);
-}
-
-/// The stored set keyset equals the live member set.
-/// FALSIFICATION: make `SetHandle::remove` skip keyset subtraction.
-#[test]
-fn prop_set_keyset_exact() {
-    fn property(trace: SetTrace) -> Result<bool> {
-        executor::block_on(run_set_keyset_exact_trace(trace))
-    }
-    QuickCheck::new().quickcheck(property as fn(SetTrace) -> Result<bool>);
-}
-
-/// Constrained map keys match an unlimited filtered prefix on both plan arms.
-#[test]
-fn prop_map_keys_constraint_parity() {
+fn prop_map_query_matches_model() {
     fn property(trace: MapTrace, constraints: StreamConstraints) -> Result<bool> {
-        executor::block_on(run_map_keys_prefix_trace(trace, constraints))
+        TEST_RUNTIME.block_on(run_map_query_trace(trace, constraints))
     }
     QuickCheck::new().quickcheck(property as fn(MapTrace, StreamConstraints) -> Result<bool>);
 }
 
-/// Constrained entries match an unlimited filtered prefix on both plan arms.
-#[test]
-fn prop_map_entries_constraint_parity() {
-    fn property(trace: MapTrace, constraints: StreamConstraints) -> Result<bool> {
-        executor::block_on(run_map_entries_prefix_trace(trace, constraints))
-    }
-    QuickCheck::new().quickcheck(property as fn(MapTrace, StreamConstraints) -> Result<bool>);
-}
-
-/// Constrained deque values match a filtered prefix on both plan arms.
+/// Both deque sources match the model across holes and position bounds.
 #[test]
 fn prop_deque_constraint_parity() {
-    fn property(constraints: DequePlanConstraints) -> Result<bool> {
-        executor::block_on(run_deque_constraint_parity(constraints))
+    fn property(shape: DequeConstraints) -> Result<bool> {
+        TEST_RUNTIME.block_on(run_deque_constraint_parity(shape))
     }
-    QuickCheck::new().quickcheck(property as fn(DequePlanConstraints) -> Result<bool>);
+    QuickCheck::new().quickcheck(property as fn(DequeConstraints) -> Result<bool>);
 }
 
 /// Keyset exactness: over an arbitrary committed trace on a non-overflowing
@@ -1141,7 +889,7 @@ fn prop_deque_constraint_parity() {
 #[test]
 fn prop_map_keyset_exact() {
     fn property(trace: MapTrace) -> Result<bool> {
-        executor::block_on(run_map_keyset_exact_trace(trace))
+        TEST_RUNTIME.block_on(run_map_keyset_exact_trace(trace))
     }
     QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
 }
@@ -1153,7 +901,7 @@ fn prop_map_keyset_exact() {
 #[test]
 fn prop_map_get_many_parity() {
     fn property(input: MapGetManyInput) -> Result<bool> {
-        executor::block_on(run_map_get_many_parity_trace(input))
+        TEST_RUNTIME.block_on(run_map_get_many_parity_trace(input))
     }
     QuickCheck::new().quickcheck(property as fn(MapGetManyInput) -> Result<bool>);
 }
@@ -1165,7 +913,7 @@ fn prop_map_get_many_parity() {
 #[test]
 fn prop_map_ttl_keyset_refresh() {
     fn property(trace: MapTrace) -> Result<bool> {
-        executor::block_on(run_map_ttl_keyset_refresh_trace(trace))
+        TEST_RUNTIME.block_on(run_map_ttl_keyset_refresh_trace(trace))
     }
     QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
 }
@@ -1178,7 +926,7 @@ fn prop_map_ttl_keyset_refresh() {
 #[test]
 fn prop_map_key_scan_holes() {
     fn property(shape: MapKeyHoles) -> Result<bool> {
-        executor::block_on(run_map_key_scan_holes(shape))
+        TEST_RUNTIME.block_on(run_map_key_scan_holes(shape))
     }
     QuickCheck::new().quickcheck(property as fn(MapKeyHoles) -> Result<bool>);
 }
@@ -1189,207 +937,22 @@ fn prop_map_key_scan_holes() {
 #[test]
 fn prop_deque_ttl_holes() {
     fn property(shape: DequeHoles) -> Result<bool> {
-        executor::block_on(run_deque_holes(shape))
+        TEST_RUNTIME.block_on(run_deque_holes(shape))
     }
     QuickCheck::new().quickcheck(property as fn(DequeHoles) -> Result<bool>);
 }
 
-/// Stage event A (dedup 1) at section-0 coordinates {0, 1} over an empty base,
-/// optionally recording its commit, then crash with no recovery: returns a
-/// fresh store over the same warm `MemoryCells`, so A's provisional cells and
-/// marker survive. The shared prologue of the two prior event-marker boundary
-/// tests; each caller then stages event B and asserts the stage boundary
-/// resolved A.
-async fn stage_a_then_crash(
-    name: &str,
-    a_committed: bool,
-) -> Result<(MemoryCellStore<ScriptedOracle>, MemoryCells, CollectionId)> {
-    let oracle = ScriptedOracle::default();
-    let cells = MemoryCells::new();
-    let id = fresh_collection(name)?;
-    let collection = CollectionRef::new(id.clone(), None);
-    let store = memory_store(cells.clone(), oracle.clone());
-
-    let a_dedup = Uuid::from_u128(1);
-    let a = EventRef::Message { dedup_id: a_dedup };
-    let prev0 = store.get(&id, &cell_in(0, 0), a).await?;
-    let prev1 = store.get(&id, &cell_in(0, 1), a).await?;
-    let writes_a = [
-        (
-            cell_in(0, 0),
-            ProvisionalWrite::new(Some(bytes(10)), prev0, a),
-        ),
-        (
-            cell_in(0, 1),
-            ProvisionalWrite::new(Some(bytes(11)), prev1, a),
-        ),
-    ];
-    let marker_a = EventMarker::frozen(a, &writes_a, &[]);
-    store
-        .write_provisional(&collection, &writes_a, Some(&marker_a))
-        .await?;
-    if a_committed {
-        oracle.record_message(a_dedup).await?;
-    }
-
-    // Crash with no recovery: a fresh store over the same warm cells (A's
-    // provisional cells and marker survive in `MemoryCells`).
-    Ok((memory_store(cells.clone(), oracle), cells, id))
-}
-
-/// Proves that a new stage resolves a prior event marker first.
-async fn boundary_resolve_pin(a_committed: bool) -> Result<()> {
-    let (store, cells, id) = stage_a_then_crash("boundary", a_committed).await?;
-    let collection = CollectionRef::new(id.clone(), None);
-
-    // Stage event B at coordinate {1}; the boundary resolves A's marker.
-    let b = EventRef::Message {
-        dedup_id: Uuid::from_u128(2),
-    };
-    let prev_b = store.get(&id, &cell_in(0, 1), b).await?;
-    let writes_b = [(
-        cell_in(0, 1),
-        ProvisionalWrite::new(Some(bytes(21)), prev_b, b),
-    )];
-    let marker_b = EventMarker::frozen(b, &writes_b, &[]);
-    store
-        .write_provisional(&collection, &writes_b, Some(&marker_b))
-        .await?;
-
-    // Exactly B's one staged cell remains provisional — checked before any
-    // resolving read, so a skipped boundary resolve (A's coordinate 0 left
-    // provisional) surfaces here rather than being masked by a later `get`.
-    let mut provisional = 0usize;
-    let stream = store.provisional_cells(&id);
-    futures::pin_mut!(stream);
-    while let Some(item) = stream.next().await {
-        item?;
-        provisional += 1;
-    }
-    assert_eq!(
-        provisional, 1,
-        "the boundary resolved A's cells; only B's staged cell is provisional"
-    );
-
-    // B's marker replaces A's.
-    assert_eq!(
-        cells.unsettled_marker_of(&id).map(|marker| marker.event()),
-        Some(b),
-        "B's marker stands after the boundary overwrite"
-    );
-
-    // A's untouched coordinate 0 is resolved per A's verdict: A's data on
-    // commit, exact absence (A's `None` base) on abort.
-    let probe = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX),
-    };
-    let resolved0 = store.get(&id, &cell_in(0, 0), probe).await?.into_inner();
-    assert_eq!(
-        resolved0,
-        a_committed.then(|| bytes(10)),
-        "A's coordinate 0 resolves per A's verdict at B's stage boundary"
-    );
-    Ok(())
-}
-
-/// Boundary resolve when A committed: A's coordinate 0 promotes to A's data.
-#[test]
-fn boundary_resolves_committed_foreign_marker() -> Result<()> {
-    executor::block_on(boundary_resolve_pin(true))
-}
-
-/// Boundary resolve when A aborted: A's coordinate 0 rolls back to its absent
-/// base.
-#[test]
-fn boundary_resolves_aborted_foreign_marker() -> Result<()> {
-    executor::block_on(boundary_resolve_pin(false))
-}
-
-/// The clears-only stage boundary: event A stages cells {0, 1}, the process
-/// crashes with no recovery, then event B stages **clears only** — an empty
-/// write set whose marker carries a cleared section. The boundary must resolve
-/// A's marker exactly as a writing stage would (A's cells settle per A's
-/// verdict, nothing of A stays provisional) while B's marker with clears
-/// stands. The crash-trace generator's clears dimension produces this shape
-/// organically; this test is its fast deterministic falsifier, matching the
-/// documented role of [`boundary_resolve_pin`].
-///
-/// Deliberately kept parallel to [`boundary_resolve_pin`] (B stages a
-/// **clears-only** marker here, cell writes there) rather than folded: a shared
-/// body would thread a "writes vs clears" flag through a ~60-line B stage — a
-/// flag-parameter contortion the net-negative bar rejects.
-async fn clears_only_boundary_pin(a_committed: bool) -> Result<()> {
-    let (store, cells, id) = stage_a_then_crash("clears-only-boundary", a_committed).await?;
-    let collection = CollectionRef::new(id.clone(), None);
-
-    // Event B stages CLEARS ONLY on section 1: writes = [], marker with one
-    // cleared section (no survivors).
-    let b = EventRef::Message {
-        dedup_id: Uuid::from_u128(2),
-    };
-    let clears_b = [SectionClear::frozen(SECTIONS[1], &[])];
-    let marker_b = EventMarker::frozen(b, &[], &clears_b);
-    store
-        .write_provisional(&collection, &[], Some(&marker_b))
-        .await?;
-
-    // Raw probes before any resolving read — a `get` would clear resolution-resolve
-    // B's marker with clears and destroy the shape under test.
-    let unsettled = cells
-        .unsettled_marker_of(&id)
-        .ok_or_else(|| eyre!("B's clears-only marker must stand after the stage"))?;
-    assert_eq!(unsettled.event(), b, "B's marker replaced A's");
-    assert_eq!(
-        unsettled.clears().len(),
-        1,
-        "B's marker carries its cleared section"
-    );
-    assert!(
-        cells.provisional_coordinates(&id).is_empty(),
-        "the boundary resolved all of A's cells; B staged nothing"
-    );
-
-    // A's cells settled per A's verdict (these reads resolve B's marker via
-    // clear resolution — after the shape assertions above, and section 0 is
-    // untouched by B's section-1 clear either way).
-    let probe = EventRef::Message {
-        dedup_id: Uuid::from_u128(u128::MAX),
-    };
-    for (c, value) in [(0, bytes(10)), (1, bytes(11))] {
-        let resolved = store.get(&id, &cell_in(0, c), probe).await?.into_inner();
-        assert_eq!(
-            resolved,
-            a_committed.then(|| value.clone()),
-            "A's coordinate {c} resolves per A's verdict at B's clears-only boundary"
-        );
-    }
-    Ok(())
-}
-
-/// Clears-only boundary resolve when A committed.
-#[test]
-fn clears_only_boundary_resolves_committed_foreign_marker() -> Result<()> {
-    executor::block_on(clears_only_boundary_pin(true))
-}
-
-/// Clears-only boundary resolve when A aborted.
-#[test]
-fn clears_only_boundary_resolves_aborted_foreign_marker() -> Result<()> {
-    executor::block_on(clears_only_boundary_pin(false))
-}
-
 /// Apply idempotence over the memory cell store: any generated interleaving of
 /// marker resolution, verdict-matching settle re-applies, and per-cell
-/// first-touches over one staged set with durable section clears converges to
+/// reads over one staged set with durable section clears converges to
 /// the verdict state — no marker, no provisional residue, exact row shape.
 #[test]
 fn prop_memory_apply_idempotence() {
     fn property(input: ApplyTrace) -> Result<bool> {
-        let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
-        let store = memory_store(cells.clone(), oracle.clone());
+        let store = MemoryCellStore::new(cells.clone());
         let probe = MemoryShapeProbe(cells);
-        executor::block_on(run_apply_idempotence(store, oracle, input, &probe))
+        TEST_RUNTIME.block_on(run_apply_idempotence(store, input, &probe))
     }
     QuickCheck::new().quickcheck(property as fn(ApplyTrace) -> Result<bool>);
 }
@@ -1402,7 +965,7 @@ fn prop_memory_publication_trace() {
     fn property(trace: PublicationTrace) -> Result<bool> {
         let store = MemoryPublicationStore::new();
         let token = Uuid::new_v4().to_string();
-        executor::block_on(run_publication_trace(&store, &token, trace))
+        TEST_RUNTIME.block_on(run_publication_trace(&store, &token, trace))
     }
     QuickCheck::new().quickcheck(property as fn(PublicationTrace) -> Result<bool>);
 }
@@ -1410,19 +973,19 @@ fn prop_memory_publication_trace() {
 /// The per-partition backend over a [`CountingCellStore`], so a directed test
 /// can test the lower-store scan count a collection op issues.
 type CountingBackend = PartitionBackend<
-    ScriptedOracle,
+    MemoryDeduplicationStore,
     MemoryDescriptorIdentityStore,
-    CountingCellStore<MemoryCellStore<ScriptedOracle>>,
+    CountingCellStore<MemoryCellStore>,
+    (),
 >;
 
 /// Mints a session over `counting` carrying `loader` for one event. Dropped
 /// senders are fine — `watch::Receiver::borrow` keeps returning the last value.
 fn session_with_loader<L>(
-    counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
-    oracle: &ScriptedOracle,
+    counting: &CountingCellStore<MemoryCellStore>,
+    dedup: &MemoryDeduplicationStore,
     registry: &Arc<CollectionDefRegistry>,
     state_key: &StateKey,
-    armed: &ArmedKeys,
     event: EventRef,
     loader: L,
 ) -> KeyedStateSession<CountingBackend, L> {
@@ -1431,13 +994,13 @@ fn session_with_loader<L>(
     KeyedStateSession::new(SessionParts::<CountingBackend, _> {
         cell: counting.clone(),
         dirty: Arc::default(),
-        oracle: oracle.clone(),
+        dedup: dedup.clone(),
         loader,
         registry: registry.clone(),
         state_key: state_key.clone(),
         event,
-        recovery_delay: CompactDuration::new(30),
-        armed: armed.clone(),
+        dedup_ttl: CompactDuration::new(30),
+        checks: (),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     })
 }
@@ -1445,19 +1008,17 @@ fn session_with_loader<L>(
 /// Mints a session over `counting` for one event with the default in-memory
 /// loader.
 pub(super) fn counting_session(
-    counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
-    oracle: &ScriptedOracle,
+    counting: &CountingCellStore<MemoryCellStore>,
+    dedup: &MemoryDeduplicationStore,
     registry: &Arc<CollectionDefRegistry>,
     state_key: &StateKey,
-    armed: &ArmedKeys,
     event: EventRef,
 ) -> KeyedStateSession<CountingBackend, MemoryLoader<Value>> {
     session_with_loader(
         counting,
-        oracle,
+        dedup,
         registry,
         state_key,
-        armed,
         event,
         MemoryLoader::new(),
     )
@@ -1491,8 +1052,8 @@ async fn drain_map_stream(
 /// `map_overflowed_stream_issues_one_scan`.
 #[test]
 fn map_stream_issues_no_scans() -> Result<()> {
-    executor::block_on(async {
-        let oracle = ScriptedOracle::default();
+    TEST_RUNTIME.block_on(async {
+        let dedup = MemoryDeduplicationStore::default();
         let cells = MemoryCells::new();
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
         let mut registry = CollectionDefRegistry::default();
@@ -1501,18 +1062,13 @@ fn map_stream_issues_no_scans() -> Result<()> {
             CollectionDef::new(None),
         )?;
         let registry = Arc::new(registry);
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            cells.clone(),
-            oracle.clone(),
-            registry.clone(),
-        ));
-        let armed: ArmedKeys = Arc::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(cells.clone()));
 
         // Empty-map arm: absent keyset ⇒ Empty ⇒ no scan (KeysetPresence).
         let event = EventRef::Message {
             dedup_id: Uuid::from_u128(0),
         };
-        let session = counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
+        let session = counting_session(&counting, &dedup, &registry, &state_key, event);
         let drained = drain_map_stream(&session, "mp", Direction::Forward).await?;
         assert!(drained.is_empty(), "an unwritten map yields no entries");
         assert_eq!(
@@ -1525,7 +1081,7 @@ fn map_stream_issues_no_scans() -> Result<()> {
         let event = EventRef::Message {
             dedup_id: Uuid::from_u128(1),
         };
-        let session = counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
+        let session = counting_session(&counting, &dedup, &registry, &state_key, event);
         let handle = map_state::<I64KeyCodec, JsonCodec>("mp")
             .bind(&session)
             .map_err(|e| eyre!("bind: {e}"))?;
@@ -1537,7 +1093,7 @@ fn map_stream_issues_no_scans() -> Result<()> {
             StateType::Application,
             StateName::try_new("mp")?,
         );
-        finalize_and_promote(&session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
+        finalize_and_promote(&session, &dedup, Uuid::from_u128(1), &cells, &id).await?;
 
         // Warm-Tracked arm: pure point gets in key order, both directions.
         for (n, (dir, expected)) in [
@@ -1551,8 +1107,7 @@ fn map_stream_issues_no_scans() -> Result<()> {
             let event = EventRef::Message {
                 dedup_id: Uuid::from_u128(u128::MAX - n as u128),
             };
-            let session =
-                counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
+            let session = counting_session(&counting, &dedup, &registry, &state_key, event);
             let out = drain_map_stream(&session, "mp", dir).await?;
             let want: Vec<(i64, Value)> = expected
                 .into_iter()
@@ -1588,8 +1143,8 @@ fn map_stream_issues_no_scans() -> Result<()> {
 /// scan (plus the single keyset get — bounds are gone).
 #[test]
 fn map_overflowed_stream_issues_one_scan() -> Result<()> {
-    executor::block_on(async {
-        let oracle = ScriptedOracle::default();
+    TEST_RUNTIME.block_on(async {
+        let dedup = MemoryDeduplicationStore::default();
         let cells = MemoryCells::new();
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
         let mut registry = CollectionDefRegistry::default();
@@ -1601,17 +1156,12 @@ fn map_overflowed_stream_issues_one_scan() -> Result<()> {
             },
         )?;
         let registry = Arc::new(registry);
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            cells.clone(),
-            oracle.clone(),
-            registry.clone(),
-        ));
-        let armed: ArmedKeys = Arc::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(cells.clone()));
 
         let event = EventRef::Message {
             dedup_id: Uuid::from_u128(0),
         };
-        let session = counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
+        let session = counting_session(&counting, &dedup, &registry, &state_key, event);
         map_state::<I64KeyCodec, JsonCodec>("mp-of")
             .bind(&session)
             .map_err(|e| eyre!("bind: {e}"))?
@@ -1622,13 +1172,13 @@ fn map_overflowed_stream_issues_one_scan() -> Result<()> {
             StateType::Application,
             StateName::try_new("mp-of")?,
         );
-        finalize_and_promote(&session, &oracle, Uuid::from_u128(0), &cells, &of_id).await?;
+        finalize_and_promote(&session, &dedup, Uuid::from_u128(0), &cells, &of_id).await?;
 
         counting.reset();
         let event = EventRef::Message {
             dedup_id: Uuid::from_u128(u128::MAX - 100),
         };
-        let session = counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
+        let session = counting_session(&counting, &dedup, &registry, &state_key, event);
         let handle = map_state::<I64KeyCodec, JsonCodec>("mp-of")
             .bind(&session)
             .map_err(|e| eyre!("bind: {e}"))?;
@@ -1657,7 +1207,7 @@ fn map_overflowed_stream_issues_one_scan() -> Result<()> {
         handle.remove(&0).await?;
         finalize_and_promote(
             &session,
-            &oracle,
+            &dedup,
             Uuid::from_u128(u128::MAX - 100),
             &cells,
             &of_id,
@@ -1666,10 +1216,9 @@ fn map_overflowed_stream_issues_one_scan() -> Result<()> {
         counting.reset();
         let empty_session = counting_session(
             &counting,
-            &oracle,
+            &dedup,
             &registry,
             &state_key,
-            &armed,
             EventRef::Message {
                 dedup_id: Uuid::from_u128(u128::MAX - 99),
             },
@@ -1719,7 +1268,7 @@ async fn drain_deque_stream(
 /// section then holds a row that the window does not. A scan over the whole
 /// section, instead of exactly `[head, tail − 1]`, would yield that row.
 async fn seed_wide_deque(
-    counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
+    counting: &CountingCellStore<MemoryCellStore>,
     state_key: &StateKey,
     name: &str,
     width: usize,
@@ -1753,8 +1302,8 @@ async fn seed_wide_deque(
 /// the fallback arm.
 #[test]
 fn deque_stream_issues_no_scans() -> Result<()> {
-    executor::block_on(async {
-        let oracle = ScriptedOracle::default();
+    TEST_RUNTIME.block_on(async {
+        let dedup = MemoryDeduplicationStore::default();
         let cells = MemoryCells::new();
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
         let mut registry = CollectionDefRegistry::default();
@@ -1764,18 +1313,13 @@ fn deque_stream_issues_no_scans() -> Result<()> {
             CollectionDef::new(None),
         )?;
         let registry = Arc::new(registry);
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            cells.clone(),
-            oracle.clone(),
-            registry.clone(),
-        ));
-        let armed: ArmedKeys = Arc::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(cells.clone()));
 
         // One committed event of pushes and pops: the deque reads [0, 1, 2].
         let event = EventRef::Message {
             dedup_id: Uuid::from_u128(1),
         };
-        let session = counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
+        let session = counting_session(&counting, &dedup, &registry, &state_key, event);
         let handle = deque_state::<JsonCodec>("dq")
             .bind(&session)
             .map_err(|e| eyre!("bind: {e}"))?;
@@ -1789,7 +1333,7 @@ fn deque_stream_issues_no_scans() -> Result<()> {
             StateType::Application,
             StateName::try_new("dq")?,
         );
-        finalize_and_promote(&session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
+        finalize_and_promote(&session, &dedup, Uuid::from_u128(1), &cells, &id).await?;
 
         // Stream in both directions; each is a pure sequence of point gets.
         for (n, (dir, expected)) in [
@@ -1803,8 +1347,7 @@ fn deque_stream_issues_no_scans() -> Result<()> {
             let event = EventRef::Message {
                 dedup_id: Uuid::from_u128(u128::MAX - n as u128),
             };
-            let session =
-                counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
+            let session = counting_session(&counting, &dedup, &registry, &state_key, event);
             let out = drain_deque_stream(&session, "dq", dir).await?;
             let expected: Vec<Value> = expected.into_iter().map(Value::from).collect();
             assert_eq!(out, expected, "{dir:?} stream yields the committed window");
@@ -1825,8 +1368,7 @@ fn deque_stream_issues_no_scans() -> Result<()> {
             );
         }
 
-        assert_wide_deque_scan_is_window_bounded(&counting, &oracle, &registry, &state_key, &armed)
-            .await
+        assert_wide_deque_scan_is_window_bounded(&counting, &dedup, &registry, &state_key).await
     })
 }
 
@@ -1842,11 +1384,10 @@ fn deque_stream_issues_no_scans() -> Result<()> {
 /// the edges hides forward and shows backward. Forward, the limit stops the
 /// walk short of the extra row. Backward, the extra row becomes the first item.
 async fn assert_wide_deque_scan_is_window_bounded(
-    counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
-    oracle: &ScriptedOracle,
+    counting: &CountingCellStore<MemoryCellStore>,
+    dedup: &MemoryDeduplicationStore,
     registry: &Arc<CollectionDefRegistry>,
     state_key: &StateKey,
-    armed: &ArmedKeys,
 ) -> Result<()> {
     let width = deque::DEQUE_POINT_ITERATION_MAX + 1;
     seed_wide_deque(counting, state_key, "dq-wide", width).await?;
@@ -1865,7 +1406,7 @@ async fn assert_wide_deque_scan_is_window_bounded(
         let event = EventRef::Message {
             dedup_id: Uuid::from_u128(u128::MAX - 2 - n as u128),
         };
-        let session = counting_session(counting, oracle, registry, state_key, armed, event);
+        let session = counting_session(counting, dedup, registry, state_key, event);
         let drained = drain_deque_stream(&session, "dq-wide", dir).await?;
         let mut expected = ascending.clone();
         if dir == Direction::Backward {
@@ -1914,15 +1455,14 @@ impl Arbitrary for StreamPrefix {
 /// Mints a session over `counting` carrying a [`ResolveCounter`] loader, so a
 /// stream-laziness test can bound resolutions independently of fetches.
 fn resolve_session(
-    counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
-    oracle: &ScriptedOracle,
+    counting: &CountingCellStore<MemoryCellStore>,
+    dedup: &MemoryDeduplicationStore,
     registry: &Arc<CollectionDefRegistry>,
     state_key: &StateKey,
-    armed: &ArmedKeys,
     event: EventRef,
     loader: ResolveCounter,
 ) -> KeyedStateSession<CountingBackend, ResolveCounter> {
-    session_with_loader(counting, oracle, registry, state_key, armed, event, loader)
+    session_with_loader(counting, dedup, registry, state_key, event, loader)
 }
 
 /// The stream-laziness property (map): a `stream(dir).take(k)` over a **dense**
@@ -1933,11 +1473,11 @@ fn resolve_session(
 /// fetches and the counting resolver bounds the resolutions. Both counters sit
 /// at the lowest layer, so nothing masks a materialization.
 ///
-/// Falsification: Make `CoordinatePlan::entry_source` consume all tracked keys.
+/// Falsification: Make the coordinate source consume all tracked keys.
 /// Then the read and resolver counts exceed their bounds, and both asserts
 /// fail. A larger `CELL_BATCH` cannot falsify: the bound moves with it.
 async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = map_state::<I64KeyCodec, WithResolver<JsonCodec, CountingResolver>>("lz");
@@ -1951,12 +1491,7 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
         },
     )?;
     let registry = Arc::new(registry);
-    let counting = CountingCellStore::new(MemoryCellStore::new(
-        cells.clone(),
-        oracle.clone(),
-        registry.clone(),
-    ));
-    let armed: ArmedKeys = Arc::default();
+    let counting = CountingCellStore::new(MemoryCellStore::new(cells.clone()));
     let id = CollectionId::new(
         state_key.clone(),
         StateType::Application,
@@ -1969,10 +1504,9 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
     };
     let session = resolve_session(
         &counting,
-        &oracle,
+        &dedup,
         &registry,
         &state_key,
-        &armed,
         event,
         ResolveCounter::default(),
     );
@@ -1983,7 +1517,7 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
             .await
             .map_err(|e| eyre!("{e}"))?;
     }
-    finalize_and_promote(&session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
+    finalize_and_promote(&session, &dedup, Uuid::from_u128(1), &cells, &id).await?;
 
     // Fresh cold session, zeroed counters; drain only the k-prefix.
     counting.reset();
@@ -1993,10 +1527,9 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
     };
     let session = resolve_session(
         &counting,
-        &oracle,
+        &dedup,
         &registry,
         &state_key,
-        &armed,
         event,
         resolves.clone(),
     );
@@ -2016,7 +1549,7 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
         "take(k) yields exactly k.min(n) entries"
     );
     assert!(
-        counting.batch_reads() <= k.div_ceil(CELL_BATCH) + 1,
+        counting.batch_reads() <= k.div_ceil(CELL_BATCH.get()) + 1,
         "a lazy map take(k) issues at most one batch read beyond k (batches={}, k={k}, n={n})",
         counting.batch_reads()
     );
@@ -2028,7 +1561,7 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
         counting.lower_reads()
     );
     assert!(
-        resolves.resolves() <= k + CELL_BATCH,
+        resolves.resolves() <= k + CELL_BATCH.get(),
         "a lazy map take(k) resolves at most k + one chunk (resolves={}, k={k}, n={n})",
         resolves.resolves()
     );
@@ -2041,23 +1574,18 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
 /// batch verb; only the bounds meta cell is a point read) and at most
 /// `k + CELL_BATCH` resolved.
 ///
-/// Falsification: Make `CoordinatePlan::entry_source` consume all tracked keys.
+/// Falsification: Make the coordinate source consume all tracked keys.
 /// Then the read and resolver counts exceed their bounds, and both asserts
 /// fail. A larger `CELL_BATCH` cannot falsify: the bound moves with it.
 async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
-    let oracle = ScriptedOracle::default();
+    let dedup = MemoryDeduplicationStore::default();
     let cells = MemoryCells::new();
     let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
     let descriptor = deque_state::<WithResolver<JsonCodec, CountingResolver>>("lz");
     let mut registry = CollectionDefRegistry::default();
     registry.register(&descriptor, CollectionDef::new(None))?;
     let registry = Arc::new(registry);
-    let counting = CountingCellStore::new(MemoryCellStore::new(
-        cells.clone(),
-        oracle.clone(),
-        registry.clone(),
-    ));
-    let armed: ArmedKeys = Arc::default();
+    let counting = CountingCellStore::new(MemoryCellStore::new(cells.clone()));
     let id = CollectionId::new(
         state_key.clone(),
         StateType::Application,
@@ -2071,10 +1599,9 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
     };
     let session = resolve_session(
         &counting,
-        &oracle,
+        &dedup,
         &registry,
         &state_key,
-        &armed,
         event,
         ResolveCounter::default(),
     );
@@ -2084,7 +1611,7 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
             .await
             .map_err(|e| eyre!("{e}"))?;
     }
-    finalize_and_promote(&session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
+    finalize_and_promote(&session, &dedup, Uuid::from_u128(1), &cells, &id).await?;
 
     counting.reset();
     let resolves = ResolveCounter::default();
@@ -2093,10 +1620,9 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
     };
     let session = resolve_session(
         &counting,
-        &oracle,
+        &dedup,
         &registry,
         &state_key,
-        &armed,
         event,
         resolves.clone(),
     );
@@ -2116,7 +1642,7 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
         "take(k) yields exactly k.min(n) elements"
     );
     assert!(
-        counting.batch_reads() <= k.div_ceil(CELL_BATCH) + 1,
+        counting.batch_reads() <= k.div_ceil(CELL_BATCH.get()) + 1,
         "a lazy deque take(k) issues at most one batch read beyond k (batches={}, k={k}, n={n})",
         counting.batch_reads()
     );
@@ -2128,7 +1654,7 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
         counting.lower_reads()
     );
     assert!(
-        resolves.resolves() <= k + CELL_BATCH,
+        resolves.resolves() <= k + CELL_BATCH.get(),
         "a lazy deque take(k) resolves at most k + one chunk (resolves={}, k={k}, n={n})",
         resolves.resolves()
     );
@@ -2145,8 +1671,8 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
 /// Then the evicted slot resolves and the zero-count assert fails.
 #[test]
 fn deque_bounded_eviction_does_not_resolve() -> Result<()> {
-    executor::block_on(async {
-        let oracle = ScriptedOracle::default();
+    TEST_RUNTIME.block_on(async {
+        let dedup = MemoryDeduplicationStore::default();
         let cells = MemoryCells::new();
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
         let descriptor = deque_state::<WithResolver<JsonCodec, CountingResolver>>("cap");
@@ -2159,12 +1685,7 @@ fn deque_bounded_eviction_does_not_resolve() -> Result<()> {
             },
         )?;
         let registry = Arc::new(registry);
-        let counting = CountingCellStore::new(MemoryCellStore::new(
-            cells.clone(),
-            oracle.clone(),
-            registry.clone(),
-        ));
-        let armed: ArmedKeys = Arc::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(cells.clone()));
         let id = CollectionId::new(
             state_key.clone(),
             StateType::Application,
@@ -2177,10 +1698,9 @@ fn deque_bounded_eviction_does_not_resolve() -> Result<()> {
         };
         let session = resolve_session(
             &counting,
-            &oracle,
+            &dedup,
             &registry,
             &state_key,
-            &armed,
             seed_event,
             ResolveCounter::default(),
         );
@@ -2189,7 +1709,7 @@ fn deque_bounded_eviction_does_not_resolve() -> Result<()> {
             .push_back(Value::from(1_u8))
             .await
             .map_err(|e| eyre!("{e}"))?;
-        finalize_and_promote(&session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
+        finalize_and_promote(&session, &dedup, Uuid::from_u128(1), &cells, &id).await?;
 
         // Fresh event: push a second value, evicting the front (the capacity is 1).
         let resolves = ResolveCounter::default();
@@ -2198,10 +1718,9 @@ fn deque_bounded_eviction_does_not_resolve() -> Result<()> {
         };
         let session = resolve_session(
             &counting,
-            &oracle,
+            &dedup,
             &registry,
             &state_key,
-            &armed,
             event,
             resolves.clone(),
         );
@@ -2235,7 +1754,7 @@ fn deque_bounded_eviction_does_not_resolve() -> Result<()> {
 fn stream_take_is_lazy() {
     fn property(input: StreamPrefix) -> Result<bool> {
         let StreamPrefix { n, k } = input;
-        executor::block_on(async move {
+        TEST_RUNTIME.block_on(async move {
             for dir in [Direction::Forward, Direction::Backward] {
                 run_map_stream_prefix_lazy(n, k, dir).await?;
                 run_deque_stream_prefix_lazy(n, k, dir).await?;
@@ -2273,4 +1792,163 @@ fn deque_stream_interleave_is_yield_free() {
             .block_on(run_deque_stream_interleave(input))
     }
     QuickCheck::new().quickcheck(property as fn(DequeInterleave) -> Result<bool>);
+}
+
+/// Batches and scans share one marker snapshot and preserve reader parity.
+#[test]
+fn prop_resolve_reads_each_marker_once() {
+    fn property(value: u8, siblings: u8, certificate: u8, length: u8) -> Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let cells = MemoryCells::new();
+            let id = fresh_collection("read-budget")?;
+            let count = usize::from(siblings % 8) + 1;
+            let mut collections = Vec::with_capacity(count);
+            collections.push(CollectionRef::new(id.clone(), None));
+            for index in 1..count {
+                collections.push(CollectionRef::new(
+                    CollectionId::new(
+                        id.state_key().clone(),
+                        id.state_type(),
+                        StateName::try_new(format!("sibling-{index}"))?,
+                    ),
+                    None,
+                ));
+            }
+            let memory = MemoryCellStore::new(cells.clone());
+            let store = CountingCellStore::new(memory.clone()).with_marker_counts(&collections);
+            let touched = collections
+                .iter()
+                .map(CollectionRef::id)
+                .map(|id| (id.state_type(), id.name().clone()))
+                .collect();
+            let evidence = evidence(touched, None);
+            let event = support::probe(1);
+            let data = bytes(value);
+            let prev = bytes(value.wrapping_add(1));
+            let length = length % 32 + 2;
+            let writes: Vec<_> = (0..length)
+                .map(|index| {
+                    (
+                        cell_in(0, index),
+                        ProvisionalWrite::new(
+                            Some(data.clone()),
+                            Committed::new(Some(prev.clone())),
+                            event,
+                        ),
+                    )
+                })
+                .collect();
+            let marker = EventMarker::frozen(event, &writes, &[], &evidence);
+            for collection in &collections {
+                store
+                    .write_provisional(collection, &writes, Some(&marker))
+                    .await?;
+            }
+            let certificate = usize::from(certificate) % (count + 1);
+            if let Some(collection) = collections.get(certificate) {
+                support::seed_commit_evidence(&store, collection).await?;
+            }
+            let expected = Some(if certificate < count { data } else { prev });
+
+            check_memory_read_parity(&memory, &id, &writes, expected.as_ref()).await?;
+
+            // Exercise a batch and both scan directions with separate lookups.
+            for direction in [None, Some(Direction::Forward), Some(Direction::Backward)] {
+                store.reset();
+                let mut lookup = EvidenceLookup::new(&store, &id);
+                assert_eq!(
+                    lookup
+                        .resolve(Cell::Resolved(Committed::<Values>::new(None)))
+                        .await?
+                        .into_inner(),
+                    None
+                );
+                assert_eq!(store.marker_reads(), 0, "resolved cells need no evidence");
+                let mut keys: Vec<_> = writes.iter().map(|(cell, _)| cell.clone()).collect();
+                if direction == Some(Direction::Backward) {
+                    keys.reverse();
+                }
+                if direction.is_none() {
+                    keys.extend_from_within(..);
+                }
+                let rows = stream::iter(keys);
+                pin_mut!(rows);
+                while let Some(cell) = rows.next().await {
+                    let actual = lookup
+                        .resolve(Cell::Provisional(
+                            store
+                                .provisional_cell_at(&id, &cell)
+                                .await?
+                                .ok_or_else(|| eyre!("provisional cell missing"))?,
+                        ))
+                        .await?
+                        .into_inner();
+                    assert_eq!(actual, expected);
+                    assert_eq!(actual, cells.read_committed(&id, &cell));
+                }
+                assert_eq!(store.marker_reads(), count, "one snapshot per call");
+                for collection in &collections {
+                    assert_eq!(
+                        store.marker_reads_for(collection.id()),
+                        1,
+                        "read each marker once"
+                    );
+                }
+                assert_eq!(store.durable_writes(), 0, "reads preserve durable state");
+            }
+            Ok(())
+        })
+    }
+    QuickCheck::new().quickcheck(property as fn(u8, u8, u8, u8) -> Result<()>);
+}
+
+async fn check_memory_read_parity(
+    store: &MemoryCellStore,
+    id: &CollectionId,
+    writes: &[(CellKey, ProvisionalWrite)],
+    expected: Option<&Bytes>,
+) -> Result<()> {
+    use super::{Scan, ScanEdge};
+    use futures::TryStreamExt;
+
+    let batch = CoordinateBatch::chunks(writes.iter().map(|(cell, _)| cell.coordinate.clone()))
+        .next()
+        .ok_or_else(|| eyre!("batch missing"))?;
+    let values = CellRead::<Values>::read_many(store, id, writes[0].0.section, &batch)
+        .await
+        .map(|cells| {
+            cells
+                .into_iter()
+                .map(|(committed, _)| committed)
+                .collect::<CommittedBatch>()
+        })?;
+    assert_eq!(values.len(), batch.len());
+    for value in values {
+        assert_eq!(value.into_inner().as_ref(), expected);
+    }
+
+    let values = CellRead::<Values>::read_many(store, id, writes[0].0.section, &batch).await?;
+    assert_eq!(values.len(), batch.len());
+    for (value, ttl) in values {
+        assert_eq!(value.into_inner().as_ref(), expected);
+        assert_eq!(ttl, None);
+    }
+
+    for dir in [Direction::Forward, Direction::Backward] {
+        let scan = Scan {
+            section: writes[0].0.section,
+            start: ScanEdge::Unbounded,
+            end: ScanEdge::Unbounded,
+            dir,
+            fetch_hint: None,
+        };
+        let rows: Vec<_> = CellRead::<Values>::scan(store, id, scan)
+            .try_collect()
+            .await?;
+        assert_eq!(rows.len(), writes.len());
+        for (_, value) in rows {
+            assert_eq!(Some(&value), expected);
+        }
+    }
+    Ok(())
 }

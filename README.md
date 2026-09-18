@@ -31,7 +31,7 @@ chain. Handler timeouts cancel handlers that exceed their deadline, preventing a
 - **Kafka Consumer**: Per-key ordering with cross-key concurrency, offset management, consumer groups.
 - **Kafka Producer**: Idempotent delivery with configurable retries.
 - **Timer System**: Persistent scheduled execution backed by Cassandra or in-memory store.
-- **Keyed State**: Durable Value, Map, and Deque collections scoped to each Kafka message key.
+- **Keyed State**: Durable Value, Map, Set, and Deque collections scoped to each Kafka message key.
 - **Quality of Service**: Fair scheduling limits concurrency and prevents failures from starving fresh traffic. Pipeline
   mode adds deferred retry and monopolization detection.
 - **Deferred Retry**: Moves transiently-failing keys to timer-based retry, unblocking the partition to continue
@@ -111,7 +111,7 @@ impl FallibleHandler for MyHandler {
     async fn on_excise<C>(
         &self,
         _context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
@@ -238,7 +238,7 @@ let current = count.get().await?.and_then(|value| value.as_u64()).unwrap_or(0);
 count.set(json!(current + 1)).await?;
 ```
 
-Keyed-state cache and recovery settings are listed in [CONFIGURATION.md](CONFIGURATION.md#keyed-state-pipeline-mode).
+Keyed-state cache settings are listed in [CONFIGURATION.md](CONFIGURATION.md#keyed-state).
 
 ### Reading another group's state
 

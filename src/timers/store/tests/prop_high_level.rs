@@ -95,21 +95,8 @@ pub enum HighLevelOperation {
         /// The replacement trigger.
         new_trigger: Trigger,
     },
-    /// Update the tag on a specific trigger (`update_tag`).
-    UpdateTag {
-        /// The segment.
-        segment: Segment,
-        /// The key of the trigger to update.
-        key: Key,
-        /// The scheduled time.
-        time: CompactDateTime,
-        /// The timer type.
-        timer_type: TimerType,
-        /// The new tag value to write.
-        new_tag: i32,
-    },
-    /// Query the current tag for a trigger (`current_tag`).
-    CurrentTag {
+    /// Query the current tag for a trigger (`current_trigger`).
+    CurrentTrigger {
         /// The segment.
         segment: Segment,
         /// The key.
@@ -160,7 +147,7 @@ fn model_tag_for_trigger(
     segment_id: SegmentId,
     trigger: &Trigger,
 ) -> Option<i32> {
-    model.get_tag(segment_id, &trigger.key, trigger.timer_type, trigger.time)
+    model.tag(segment_id, &trigger.key, trigger.timer_type, trigger.time)
 }
 
 /// Generates an `AddTrigger` operation.
@@ -324,34 +311,8 @@ fn generate_get_slab_range(g: &mut Gen, segment: &Segment) -> HighLevelOperation
     }
 }
 
-/// Generates an `UpdateTag` operation targeting an existing trigger.
-///
-/// `update_tag` requires the caller to have observed the target as
-/// currently scheduled — the Cassandra store would write a partial row
-/// otherwise. The generator encodes this precondition by only picking from
-/// `existing_triggers`; if none exist, no `UpdateTag` op is generated.
-fn generate_update_tag(
-    g: &mut Gen,
-    segment: &Segment,
-    existing_triggers: &ExistingTriggers,
-) -> Option<HighLevelOperation> {
-    if existing_triggers.is_empty() {
-        return None;
-    }
-    let new_tag = i32::arbitrary(g);
-    let keys: Vec<_> = existing_triggers.iter().cloned().collect();
-    let (_, _, key, time, timer_type) = &keys[usize::arbitrary(g) % keys.len()];
-    Some(HighLevelOperation::UpdateTag {
-        segment: segment.clone(),
-        key: key.clone(),
-        time: *time,
-        timer_type: *timer_type,
-        new_tag,
-    })
-}
-
-/// Generates a `CurrentTag` query operation.
-fn generate_current_tag(
+/// Generates a `CurrentTrigger` query operation.
+fn generate_current_trigger(
     g: &mut Gen,
     segment: &Segment,
     existing_triggers: &ExistingTriggers,
@@ -359,14 +320,14 @@ fn generate_current_tag(
     if !existing_triggers.is_empty() && bool::arbitrary(g) {
         let keys: Vec<_> = existing_triggers.iter().cloned().collect();
         let (_, _, key, time, timer_type) = &keys[usize::arbitrary(g) % keys.len()];
-        return HighLevelOperation::CurrentTag {
+        return HighLevelOperation::CurrentTrigger {
             segment: segment.clone(),
             key: key.clone(),
             time: *time,
             timer_type: *timer_type,
         };
     }
-    HighLevelOperation::CurrentTag {
+    HighLevelOperation::CurrentTrigger {
         segment: segment.clone(),
         key: random_key(g),
         time: CompactDateTime::arbitrary(g),
@@ -386,7 +347,7 @@ impl Arbitrary for HighLevelTestInput {
             id: Uuid::new_v4(),
             name: "segment-0".to_owned(),
             slab_size,
-            version: SegmentVersion::V3,
+            version: SegmentVersion::V4,
         };
 
         // Generate 10-50 operations
@@ -401,7 +362,7 @@ impl Arbitrary for HighLevelTestInput {
         for _ in 0..op_count {
             let segment = &segment;
 
-            let op = match u8::arbitrary(g) % 10 {
+            let op = match u8::arbitrary(g) % 9 {
                 0 => {
                     let op = generate_add_trigger(g, segment, &mut existing_triggers);
                     if let HighLevelOperation::AddTrigger { ref trigger, .. } = op {
@@ -444,13 +405,7 @@ impl Arbitrary for HighLevelTestInput {
                 5 => generate_get_key_times(g, segment),
                 6 => generate_get_key_triggers(g, segment),
                 7 => generate_get_slab_range(g, segment),
-                8 => match generate_update_tag(g, segment, &existing_triggers) {
-                    Some(op) => op,
-                    // No existing triggers yet — fall back to a query op so this
-                    // iteration still produces something useful.
-                    None => generate_current_tag(g, segment, &existing_triggers),
-                },
-                _ => generate_current_tag(g, segment, &existing_triggers),
+                _ => generate_current_trigger(g, segment, &existing_triggers),
             };
 
             operations.push(op);
@@ -500,7 +455,7 @@ impl HighLevelModel {
 
     /// Returns the model's current tag for a row, or `None` if absent.
     #[must_use]
-    pub fn get_tag(
+    pub fn tag(
         &self,
         segment_id: SegmentId,
         key: &Key,
@@ -512,7 +467,7 @@ impl HighLevelModel {
             .copied()
     }
 
-    fn set_tag(
+    fn record_tag(
         &mut self,
         segment_id: SegmentId,
         key: Key,
@@ -553,7 +508,7 @@ impl HighLevelModel {
                     .entry(segment.id)
                     .or_default()
                     .insert(slab_id);
-                self.set_tag(
+                self.record_tag(
                     segment.id,
                     trigger.key.clone(),
                     trigger.timer_type,
@@ -586,17 +541,6 @@ impl HighLevelModel {
             } => {
                 self.apply_clear_and_schedule(segment, new_trigger);
             }
-            HighLevelOperation::UpdateTag {
-                segment,
-                key,
-                time,
-                timer_type,
-                new_tag,
-            } => {
-                if self.get_tag(segment.id, key, *timer_type, *time).is_some() {
-                    self.set_tag(segment.id, key.clone(), *timer_type, *time, *new_tag);
-                }
-            }
             HighLevelOperation::DeleteSlab {
                 segment_id,
                 slab_id,
@@ -609,7 +553,7 @@ impl HighLevelModel {
             | HighLevelOperation::GetKeyTimes { .. }
             | HighLevelOperation::GetKeyTriggers { .. }
             | HighLevelOperation::GetSlabRange { .. }
-            | HighLevelOperation::CurrentTag { .. } => {}
+            | HighLevelOperation::CurrentTrigger { .. } => {}
         }
     }
 
@@ -641,7 +585,7 @@ impl HighLevelModel {
                 s.retain(|(k, t, _)| k != key || *t != *old_time);
             }
         }
-        self.set_tag(
+        self.record_tag(
             segment.id,
             key.clone(),
             timer_type,
@@ -721,11 +665,12 @@ where
 
     for trigger in &actual {
         let key_tag = store
-            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+            .current_trigger(&trigger.key, trigger.time, trigger.timer_type)
             .await
+            .map(|trigger| trigger.map(|trigger| trigger.tag))
             .map_err(|e| {
                 color_eyre::eyre::eyre!(
-                    "Op #{op_idx} GetSlabTriggersAllTypes current_tag failed: {e:?}"
+                    "Op #{op_idx} GetSlabTriggersAllTypes current_trigger failed: {e:?}"
                 )
             })?;
         let Some(key_tag) = key_tag else {
@@ -891,8 +836,8 @@ where
     Ok(())
 }
 
-/// Verifies `current_tag` against the model's tag index.
-async fn verify_current_tag<S>(
+/// Verifies `current_trigger` against the model's tag index.
+async fn verify_current_trigger<S>(
     store: &S,
     model: &HighLevelModel,
     segment: &Segment,
@@ -905,15 +850,16 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    let expected = model.get_tag(segment.id, key, timer_type, time);
+    let expected = model.tag(segment.id, key, timer_type, time);
     let actual = store
-        .current_tag(key, time, timer_type)
+        .current_trigger(key, time, timer_type)
         .await
-        .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} CurrentTag failed: {e:?}"))?;
+        .map(|trigger| trigger.map(|trigger| trigger.tag))
+        .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} CurrentTrigger failed: {e:?}"))?;
 
     if expected != actual {
         return Err(color_eyre::eyre::eyre!(
-            "Op #{op_idx} CurrentTag mismatch key={key} time={time:?} type={timer_type:?}: \
+            "Op #{op_idx} CurrentTrigger mismatch key={key} time={time:?} type={timer_type:?}: \
              model={expected:?}, store={actual:?}"
         ));
     }
@@ -937,7 +883,6 @@ where
                 | HighLevelOperation::RemoveTrigger { .. }
                 | HighLevelOperation::DeleteSlab { .. }
                 | HighLevelOperation::ClearAndSchedule { .. }
-                | HighLevelOperation::UpdateTag { .. }
         );
 
         match op {
@@ -996,26 +941,14 @@ where
             HighLevelOperation::GetSlabRange { segment_id, range } => {
                 verify_slab_range(store, model, segment_id, range, op_idx).await?;
             }
-            HighLevelOperation::UpdateTag {
-                key,
-                time,
-                timer_type,
-                new_tag,
-                ..
-            } => {
-                model.apply(op);
-                store
-                    .update_tag(key, *time, *timer_type, *new_tag)
-                    .await
-                    .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} UpdateTag failed: {e:?}"))?;
-            }
-            HighLevelOperation::CurrentTag {
+            HighLevelOperation::CurrentTrigger {
                 segment,
                 key,
                 time,
                 timer_type,
             } => {
-                verify_current_tag(store, model, segment, key, *time, *timer_type, op_idx).await?;
+                verify_current_trigger(store, model, segment, key, *time, *timer_type, op_idx)
+                    .await?;
             }
         }
 
@@ -1181,19 +1114,20 @@ where
     S::Error: Debug,
 {
     for ((segment_id, key, timer_type, time), expected_tag) in &model.tag_index {
-        let current_tag = store
-            .current_tag(key, *time, *timer_type)
+        let current_trigger = store
+            .current_trigger(key, *time, *timer_type)
             .await
+            .map(|trigger| trigger.map(|trigger| trigger.tag))
             .map_err(|e| {
                 color_eyre::eyre::eyre!(
-                    "Failed to read current_tag during consistency check: {e:?}"
+                    "Failed to read current_trigger during consistency check: {e:?}"
                 )
             })?;
 
-        if current_tag != Some(*expected_tag) {
+        if current_trigger != Some(*expected_tag) {
             return Err(color_eyre::eyre::eyre!(
-                "Key-index current_tag mismatch: key={key:?} time={time:?} type={timer_type:?} \
-                 expected Some({expected_tag}), got {current_tag:?}"
+                "Key-index current_trigger mismatch: key={key:?} time={time:?} \
+                 type={timer_type:?} expected Some({expected_tag}), got {current_trigger:?}"
             ));
         }
 

@@ -31,7 +31,7 @@
 //!
 //! The dirty store is volatile and discarded at each settle/attempt boundary —
 //! it is **never** a durability or recovery source. Crash recovery runs off the
-//! Cassandra provisional cells and the commit oracle.
+//! Cassandra provisional cells and collection evidence.
 //!
 //! [`Overlay`]: crate::state::overlay::Overlay
 
@@ -204,15 +204,10 @@ impl DirtyStore {
             .peek_with(&dirty_key(collection, cell), |_, value| value.clone())
     }
 
-    /// An owned, coordinate-ordered snapshot of one collection-section's dirty
-    /// cells — the [`Overlay`] scan's dirty leg.
-    ///
-    /// Copies the narrow `(key, state_type, name, section)` sub-range into an
-    /// owned `SmallVec` and drops the `!Send` [`Guard`] before returning, so
-    /// the overlay merge holds nothing `!Send` across an `.await` (the `+
-    /// Send` requirement on the scan stream — see [`Overlay`]'s `scan_cells`).
-    ///
-    /// [`Overlay`]: crate::state::overlay::Overlay
+    /// Returns owned dirty cells from one collection section in coordinate
+    /// order. The snapshot releases the [`Guard`] before the overlay awaits
+    /// its merge. [`crate::state::overlay::Overlay::scan`] uses this
+    /// snapshot for either projection.
     #[must_use]
     pub fn section_snapshot(&self, collection: &CollectionId, section: Section) -> CellSnapshot {
         let guard = Guard::new();

@@ -28,10 +28,11 @@
 //!
 //! # Mid-handler durability
 //!
-//! Every collection handle exposes `commit()` and `rollback()`. Value, Map, and
-//! Deque all do, and every future collection kind must too. The contract stays
-//! here rather than on `Collection::commit` and `Collection::rollback`: those
-//! two are `pub(crate)`, so the public handle docs cannot link to them.
+//! Every collection handle exposes `commit()` and `rollback()`. Value, Map,
+//! Set, and Deque all do, and every future collection kind must too. The
+//! contract stays here rather than on `Collection::commit` and
+//! `Collection::rollback`: those two are `pub(crate)`, so the public handle
+//! docs cannot link to them.
 //!
 //! `commit()` durably commits the collection's buffered changes mid-handler, so
 //! they survive a restart after failure. A large or complex handler keeps
@@ -56,24 +57,22 @@
 
 use crate::codec::{Codec, SerializeBufGuard};
 use crate::state::access::StateAccessError;
-use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
+use crate::state::cell_key::Section;
 use crate::state::descriptor::{
-    BorrowedKeyOf, CellCodecError, CellResolver, CellStateError, CellType, CollectionSpec,
-    ContextOf, FromSession, ResolvedOf, StructuralIdentity, WriteOf,
+    CellCodecError, CellResolver, CellStateError, CellType, CollectionSpec, ContextOf, FromSession,
+    ResolvedOf, StructuralIdentity,
 };
-use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::registry::CollectionDef;
-use crate::state::store::{CellBuffer, CoordinateBatch, PresenceBatch};
+use crate::state::store::CellBuffer;
 use crate::state::{RESOLVE_FANOUT, StateName, StateType, StoreOutcome};
 use bytes::{Bytes, BytesMut};
 use educe::Educe;
-use futures::stream::{Stream, StreamExt, TryStreamExt, iter};
-use std::borrow::Borrow;
+use futures::stream::{StreamExt, TryStreamExt, iter};
 use std::future::Future;
 use std::marker::PhantomData;
-use std::num::NonZeroUsize;
 use tokio::task::coop::cooperative;
 
+mod address;
 mod operation;
 pub(crate) mod owner;
 mod stream;
@@ -81,229 +80,14 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use address::{CellAddress, CellFamily};
 pub(crate) use operation::{
     JOURNAL_INLINE, Mutation, MutationJournal, ReadOperation, WriteOperation,
 };
 pub(crate) use prosody_macros::{collection_layout, collection_methods};
-pub(crate) use stream::{Constraints, CoordinatePlan, Plan, RangePlan};
+pub(crate) use stream::{Plan, StreamProjection};
 
-/// Framework-internal engine authority: admission, the raw byte reads,
-/// mutation replay, and the mid-handler durable pair.
-///
-/// These traits carry `pub` only to keep the public session bounds above them
-/// from tripping `private_bounds`. The module's own `pub(crate)` visibility is
-/// the seal. Downstream code can project and bound `S::Engine`, but it cannot
-/// name the traits. Their associated functions are therefore uncallable, and no
-/// outside type can claim to have acquired owner admission.
-///
-/// A private *supertrait* of a public trait would not seal a callable command,
-/// because Rust permits that call through the public subtrait. Every command
-/// that carries authority therefore lives one layer below anything a caller can
-/// name.
-pub(crate) mod sealed {
-    use super::{
-        Bytes, CellBuffer, CellKey, CollectionDef, CoordinateBatch, MutationJournal, PresenceBatch,
-        Scan, Section, StateAccessError, StateName, StateType, StoreOutcome, Stream,
-        StructuralIdentity,
-    };
-    use std::future::Future;
-    use std::ops::DerefMut;
-
-    /// The engine a session type binds. Selecting the engine is what makes
-    /// owner and published-reader behavior a compile-time choice rather than a
-    /// runtime branch.
-    pub trait Session: Sized {
-        /// This session's engine.
-        type Engine: ReadEngine<Self>;
-    }
-
-    /// A session whose engine can also mutate. `WriteOperation` exists only
-    /// for these, so "mutate through read admission" is unrepresentable.
-    pub trait WritableSession: Session<Engine: WriteEngine<Self>> {}
-
-    /// The read half of one engine: how an invocation acquires its state and
-    /// how it reads one cell's visible committed bytes through it.
-    pub trait ReadEngine<S: ?Sized> {
-        /// The per-invocation state: the owner's gate permit, or the reader's
-        /// operation-local source selection.
-        type ReadInner<'a>: Send
-        where
-            S: 'a;
-
-        /// The owned state a managed stream plan carries out of the invocation
-        /// that built it. The owner keeps nothing (each chunk reacquires
-        /// admission); the reader keeps its selected source, so a chunk resumes
-        /// on exactly the source the planning command chose.
-        type Plan: Clone + Send + Sync + 'static;
-
-        /// Validates the collection named `name` against this engine's
-        /// authority and returns its canonical name. The owner validates
-        /// registration and structural identity against the registry; the
-        /// published reader consumes the validation its source acquisition
-        /// already performed.
-        ///
-        /// # Errors
-        ///
-        /// Whatever the engine's validation refuses — for the owner, an
-        /// unregistered name or a structural-identity mismatch.
-        fn verify_registration(
-            session: &S,
-            name: &'static str,
-            state_type: StateType,
-            identity: &StructuralIdentity,
-        ) -> Result<StateName, StateAccessError>;
-
-        /// The collection's operational settings **as this engine sees them**;
-        /// each impl documents its own source. Captured once at bind, so every
-        /// configuration query inside a scoped operation answers from one
-        /// snapshot.
-        fn collection_def(session: &S, state_type: StateType, name: &StateName) -> CollectionDef;
-
-        /// Acquires this invocation's read state.
-        fn begin_read(session: &S) -> impl Future<Output = Self::ReadInner<'_>> + Send;
-
-        /// Reads one cell's visible committed bytes, advancing the
-        /// invocation's state (the reader pins its source here).
-        fn read_point(
-            session: &S,
-            inner: &mut Self::ReadInner<'_>,
-            state_type: StateType,
-            name: &StateName,
-            cell: &CellKey,
-        ) -> impl Future<Output = Result<Option<Bytes>, StateAccessError>> + Send;
-
-        /// Reads one section's `batch` in one lower hop, index-aligned to
-        /// `batch`, advancing the invocation's state exactly as
-        /// [`Self::read_point`] does.
-        fn read_batch(
-            session: &S,
-            inner: &mut Self::ReadInner<'_>,
-            state_type: StateType,
-            name: &StateName,
-            section: Section,
-            batch: &CoordinateBatch,
-        ) -> impl Future<Output = Result<CellBuffer<Option<Bytes>>, StateAccessError>> + Send;
-
-        /// Reads presence for one aligned batch.
-        ///
-        /// This method matches [`Self::read_batch`] for admission, state
-        /// advancement, source selection, and error order. It returns only
-        /// the `is_some` projection of each visible cell.
-        fn read_presence_batch(
-            session: &S,
-            inner: &mut Self::ReadInner<'_>,
-            state_type: StateType,
-            name: &StateName,
-            section: Section,
-            batch: &CoordinateBatch,
-        ) -> impl Future<Output = Result<PresenceBatch, StateAccessError>> + Send;
-
-        /// Freezes this invocation's state into the plan a managed stream
-        /// driver runs on. Total: there is no unplannable invocation, so no
-        /// driver carries an unreachable arm.
-        fn capture(inner: &Self::ReadInner<'_>) -> Self::Plan;
-
-        /// Re-enters an invocation under a captured plan — one coordinate
-        /// chunk's admission. The owner reacquires the gate here, which is what
-        /// keeps a coordinate stream free of a gate hold across a yield.
-        fn resume<'a>(
-            session: &'a S,
-            plan: &Self::Plan,
-        ) -> impl Future<Output = Self::ReadInner<'a>> + Send;
-
-        /// Pages a durable range under a captured plan, gate-free — the range
-        /// driver's only lower hop, and the one command that cannot repair.
-        fn page<'a>(
-            session: &'a S,
-            plan: &'a Self::Plan,
-            state_type: StateType,
-            name: &'a StateName,
-            scan: Scan<'a>,
-        ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a;
-
-        /// Pages visible keys under the same plan and fence contract as
-        /// [`Self::page`]. It returns no value payload.
-        fn page_keys<'a>(
-            session: &'a S,
-            plan: &'a Self::Plan,
-            state_type: StateType,
-            name: &'a StateName,
-            scan: Scan<'a>,
-        ) -> impl Stream<Item = Result<CellKey, StateAccessError>> + Send + 'a;
-
-        /// The per-emission fence a managed stream runs after every source
-        /// completion, before the item or error escapes. Vacuous on the
-        /// published reader, which has no attempt to leak past.
-        ///
-        /// # Errors
-        ///
-        /// [`StateAccessError::Terminated`] once the stream outlived its
-        /// dispatch attempt.
-        fn fence(session: &S) -> Result<(), StateAccessError>;
-    }
-
-    /// The write half of one engine: admission, the final fence, journal
-    /// replay, and the mid-handler durable pair.
-    pub trait WriteEngine<S: ?Sized>: ReadEngine<S> {
-        /// The per-invocation write state. `DerefMut` to the read state is the
-        /// one-way relation from write admission to the read admission it
-        /// subsumes — which is how a write operation reuses the read driver
-        /// unchanged, with no runtime variant and no inverse conversion.
-        type WriteInner<'a>: DerefMut<Target = Self::ReadInner<'a>> + Send
-        where
-            S: 'a;
-
-        /// Acquires this invocation's write state.
-        ///
-        /// # Errors
-        ///
-        /// Whatever the engine's admission refuses — for the owner, a stale
-        /// attempt, a closed session, or termination.
-        fn begin_write(
-            session: &S,
-        ) -> impl Future<Output = Result<Self::WriteInner<'_>, StateAccessError>> + Send;
-
-        /// Rechecks admission at the end of the invocation, immediately before
-        /// replay.
-        ///
-        /// # Errors
-        ///
-        /// As [`Self::begin_write`].
-        fn validate_write(
-            session: &S,
-            inner: &Self::WriteInner<'_>,
-        ) -> Result<(), StateAccessError>;
-
-        /// Replays a validated journal into the event overlay. Synchronous and
-        /// infallible by contract: there is no suspension point between the
-        /// fence and the last staged mutation.
-        fn apply(
-            session: &S,
-            state_type: StateType,
-            name: &StateName,
-            inner: &Self::WriteInner<'_>,
-            journal: MutationJournal,
-        );
-
-        /// Durably commits the collection's buffered changes mid-invocation.
-        ///
-        /// # Errors
-        ///
-        /// Admission refusal, or a store failure.
-        fn commit(
-            session: &S,
-            state_type: StateType,
-            name: &StateName,
-        ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + Send;
-
-        /// Discards the collection's buffered changes mid-invocation.
-        fn rollback(
-            session: &S,
-            state_type: StateType,
-            name: &StateName,
-        ) -> impl Future<Output = StoreOutcome> + Send;
-    }
-}
+pub(crate) mod sealed;
 
 /// Seals [`CollectionSpec`](crate::state::descriptor::CollectionSpec): the
 /// layout macro emits this marker, so a collection kind cannot exist without a
@@ -427,45 +211,6 @@ pub(crate) const fn spec_matches<S: CollectionSpec>(entry: LayoutEntry) -> bool 
         <<S::Cell as CellType>::Codec as Codec>::FORMAT_ID,
         entry.format(),
     )
-}
-
-/// A declared cell family: the layout it belongs to, the durable section it
-/// addresses, and the cell type it stores.
-///
-/// A command's family argument is checked against the operation's own layout,
-/// so a family borrowed from another collection does not compile even when its
-/// section and cell type happen to match. Tokens carry no collection or
-/// session identity, allocate nothing, and are mintable only by the layout
-/// macro — an undeclared section is unaddressable.
-pub(crate) struct CellFamily<L, T> {
-    section: Section,
-    _type: PhantomData<fn() -> (L, T)>,
-}
-
-// Manual, so a family token does not inherit `L: Copy` / `T: Copy` bounds from
-// a derive.
-impl<L, T> Copy for CellFamily<L, T> {}
-
-impl<L, T> Clone for CellFamily<L, T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<L, T> CellFamily<L, T> {
-    /// Declares the family at durable section `id`. Called only from generated
-    /// layout code.
-    pub(crate) const fn declare(id: i8) -> Self {
-        Self {
-            section: Section::new(id),
-            _type: PhantomData,
-        }
-    }
-
-    /// The durable section this family addresses.
-    pub(crate) const fn section(self) -> Section {
-        self.section
-    }
 }
 
 /// A session bound to exactly one registered collection with layout `L`.
@@ -633,201 +378,8 @@ impl<S: WritableStateSession, L> Collection<S, L> {
     }
 }
 
-/// The read commands every scoped operation offers. Implemented by both
-/// operation types, so one collection algorithm serves the owner session and
-/// the published reader.
-///
-/// Every command takes `&mut self`: one public invocation is one explicit
-/// top-to-bottom algorithm, and overlapping commands do not compile. Commands
-/// that need concurrency provide it internally, after taking the one borrow.
-pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
-    /// The bound session type, which the resolver context is extracted from.
-    type Session: StateSession;
-
-    /// The layout brand every family argument is checked against.
-    type Layout;
-
-    /// The collection's canonical name — the operation-span field and the
-    /// subject of a collection's degrade warnings.
-    fn name(&self) -> &StateName;
-
-    /// Whether the collection carries a durable TTL. Read from the binding's
-    /// captured settings; no I/O.
-    fn has_ttl(&self) -> bool;
-
-    /// The Map keyset bound: how many live distinct keys a map tracks before
-    /// overflowing to the full-section scan. Read from the binding's captured
-    /// settings; no I/O.
-    fn keyset_limit(&self) -> usize;
-
-    /// The Deque push cap. A push evicts from the far end above this many
-    /// window slots. `None` means unbounded. Reads the binding's captured
-    /// settings, with no I/O.
-    ///
-    /// Only a write calls it today, as with [`has_ttl`](Self::has_ttl). Both
-    /// stay here so the three binding-config accessors read as one group, and
-    /// a read does call [`keyset_limit`](Self::keyset_limit).
-    fn capacity(&self) -> Option<NonZeroUsize>;
-
-    /// Reads, decodes, and resolves the visible value at `key`.
-    ///
-    /// # Errors
-    ///
-    /// An access error from the engine, a codec error (Permanent) when the
-    /// cell bytes do not decode, or a resolution error from the resolver.
-    fn get<T, Q>(
-        &mut self,
-        family: CellFamily<Self::Layout, T>,
-        key: &Q,
-    ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send
-    where
-        T: CellType,
-        Q: Borrow<BorrowedKeyOf<T>> + ?Sized,
-        for<'s> ContextOf<'s, T>: FromSession<'s, Self::Session>;
-
-    /// Reads, decodes, and resolves `keys` as one aligned batch: `result[i]`
-    /// answers `keys[i]`, duplicates are answered per position, and an absent
-    /// cell reads `None`.
-    ///
-    /// The lower reads are sub-batched and sequential (two repair-capable owner
-    /// reads must not race one collection's marker); the typed resolves fan out
-    /// across the whole call in an order-preserving window.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::get`].
-    fn get_many<'a, T, Q, I>(
-        &mut self,
-        family: CellFamily<Self::Layout, T>,
-        keys: I,
-    ) -> impl Future<
-        Output = Result<CellBuffer<Option<ResolvedOf<T>>>, CellStateError<CellCodecError<T>>>,
-    > + Send
-    where
-        T: CellType,
-        Q: Borrow<BorrowedKeyOf<T>> + Sync + ?Sized + 'a,
-        I: IntoIterator<Item = &'a Q>,
-        I::IntoIter: Send,
-        for<'s> ContextOf<'s, T>: FromSession<'s, Self::Session>;
-
-    /// Tests `keys` for presence as one aligned batch. Each result answers the
-    /// same input position. Duplicate keys keep their positions.
-    ///
-    /// # Errors
-    ///
-    /// Returns an engine access error.
-    fn contains_many<'a, T: CellType, Q, I>(
-        &mut self,
-        family: CellFamily<Self::Layout, T>,
-        keys: I,
-    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send
-    where
-        Q: Borrow<BorrowedKeyOf<T>> + Sync + ?Sized + 'a,
-        I: IntoIterator<Item = &'a Q>,
-        I::IntoIter: Send;
-
-    /// Whether a stored cell exists at `key`, **without decoding its value or
-    /// running the resolver**. The guarantee is "no decode, no resolve", not
-    /// "no I/O": a cold cache still reaches the store.
-    ///
-    /// # Errors
-    ///
-    /// An access error from the engine.
-    fn contains<T: CellType, Q>(
-        &mut self,
-        family: CellFamily<Self::Layout, T>,
-        key: &Q,
-    ) -> impl Future<Output = Result<bool, StateAccessError>> + Send
-    where
-        Q: Borrow<BorrowedKeyOf<T>> + ?Sized;
-}
-
-/// The mutation commands, implemented only by the write operation.
-///
-/// `set` and `clear` are synchronous. They encode and stage, and do no I/O, so
-/// a future would add a suspension point without work. `set` can fail only at
-/// typed encoding, and a point clear cannot fail after admission.
-/// [`take`](Self::take) is the one exception, because it reads first.
-pub(crate) trait CollectionWrite: CollectionRead {
-    /// Reads, decodes, and resolves the value at `key`, then stages a clear of
-    /// that cell. This is the one supported read-then-mutate composite.
-    ///
-    /// The read completes first. A read error stages nothing. `Ok(None)` still
-    /// clears the addressed residue.
-    ///
-    /// The trait declares this method and gives no default body. A default body
-    /// over an opaque `Self` cannot prove the returned future `Send` for its
-    /// `&mut Self` and `&KeyOf<T>` captures.
-    ///
-    /// # Errors
-    ///
-    /// As [`CollectionRead::get`].
-    fn take<T, Q>(
-        &mut self,
-        family: CellFamily<Self::Layout, T>,
-        key: &Q,
-    ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send
-    where
-        T: CellType,
-        Q: Borrow<BorrowedKeyOf<T>> + ?Sized,
-        for<'s> ContextOf<'s, T>: FromSession<'s, Self::Session>;
-
-    /// Stages a write of `value` at `key`.
-    ///
-    /// # Errors
-    ///
-    /// A codec error (Permanent) when the value fails to encode.
-    fn set<T: CellType, Q>(
-        &mut self,
-        family: CellFamily<Self::Layout, T>,
-        key: &Q,
-        value: WriteOf<'_, T>,
-    ) -> Result<(), CellStateError<CellCodecError<T>>>
-    where
-        Q: Borrow<BorrowedKeyOf<T>> + ?Sized;
-
-    /// Stages a clear of the cell at `key`.
-    fn clear<T: CellType, Q>(&mut self, family: CellFamily<Self::Layout, T>, key: &Q)
-    where
-        Q: Borrow<BorrowedKeyOf<T>> + ?Sized;
-
-    /// Stages an absence over the collection's **whole declared layout** — one
-    /// payload-free journal entry that expands to every active and reserved
-    /// section at merge, so a removed family's legacy rows are erased too. From
-    /// this program point the collection reads empty, and later commands in the
-    /// same invocation repopulate it.
-    fn clear_collection(&mut self)
-    where
-        Self::Layout: CollectionLayout;
-}
-
-/// Seals the author-facing command traits: they are implemented for the two
-/// operation types and nothing else, so a helper bounded by them can only ever
-/// receive real admission.
-pub(crate) mod sealed_ops {
-    /// The seal marker; see the module item's doc.
-    pub trait CollectionOperation {}
-}
-
-/// The full cell address for `key` in `family` — the sole place a collection's
-/// typed key is lowered to its order-preserving coordinate.
-fn cell_key<L, T: CellType, Q>(family: CellFamily<L, T>, key: &Q) -> CellKey
-where
-    Q: Borrow<BorrowedKeyOf<T>> + ?Sized,
-{
-    CellKey {
-        section: family.section(),
-        coordinate: <T::Key as OrderedKeyCodec>::encode(key.borrow()),
-    }
-}
-
-/// Encodes one key from any type that borrows the codec's key view.
-fn encode_borrowed<T: CellType, Q>(key: &Q) -> Coordinate
-where
-    Q: Borrow<BorrowedKeyOf<T>> + ?Sized,
-{
-    <T::Key as OrderedKeyCodec>::encode(key.borrow())
-}
+mod commands;
+pub(crate) use commands::{CollectionRead, CollectionWrite, sealed_ops};
 
 /// Decodes and resolves raw cell bytes into the exposed application value.
 ///

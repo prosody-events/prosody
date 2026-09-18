@@ -15,31 +15,27 @@ use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::cell_key::Direction;
 use crate::state::dirty::DirtyStore;
-use crate::state::manager::ArmedKeys;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::order_codec::{I64KeyCodec, Utf8KeyCodec};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
 use crate::state::{CommitMode, EventRef, PartitionBackend, StateKey, StateName, StateType};
-use crate::test_util::{ArbJson, TEST_RUNTIME, captured_spans};
+use crate::test_util::{ArbJson, TEST_RUNTIME, captured_spans, named};
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, eyre};
 use futures::TryStreamExt;
-use futures::executor;
 use opentelemetry_sdk::trace::SpanData;
 use quickcheck::{QuickCheck, TestResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
-use std::iter::once;
 use std::sync::Arc;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-// Re-exported so contexts that mount a get-out-of-the-way oracle (here and the
-// middleware tests) name one canonical type.
-pub(crate) use crate::state::tests::support::FixedOracle;
+// Test contexts share one deduplication store type.
+pub(crate) use crate::state::tests::support::MemoryDeduplicationStore;
 
 /// Converts a property body's `Result<bool>` into a `TestResult`, surfacing
 /// the offending input on failure.
@@ -91,27 +87,16 @@ pub(crate) fn test_session_parts(
     loader: MemoryLoader<Value>,
     registry: CollectionDefRegistry,
     state_key: StateKey,
-) -> (TestSession, MemoryCellStore<FixedOracle>) {
-    test_session_with_armed(loader, registry, state_key, Arc::default())
-}
-
-/// Like [`test_session_parts`] but shares an explicit `armed` set across
-/// sessions, so a test can drive several events on the same key through one
-/// per-partition backstop-amortization state.
-pub(crate) fn test_session_with_armed(
-    loader: MemoryLoader<Value>,
-    registry: CollectionDefRegistry,
-    state_key: StateKey,
-    armed: ArmedKeys,
-) -> (TestSession, MemoryCellStore<FixedOracle>) {
-    let (parts, cell_store) = session_parts(loader, registry, state_key, armed, false);
+) -> (TestSession, MemoryCellStore) {
+    let (parts, cell_store) = session_parts(loader, registry, state_key, false);
     (KeyedStateSession::new(parts), cell_store)
 }
 
 /// The partition backend every test-session fixture in this module shares: the
-/// memory cell store resolving through a get-out-of-the-way [`FixedOracle`].
+/// memory cell store resolving through a get-out-of-the-way
+/// [`MemoryDeduplicationStore`].
 pub(crate) type TestBackend =
-    PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, MemoryCellStore<FixedOracle>>;
+    PartitionBackend<MemoryDeduplicationStore, MemoryDescriptorIdentityStore, MemoryCellStore, ()>;
 
 /// Builds a test session over an arbitrary loader payload — the generic twin of
 /// [`test_session`] (which pins the loader to `MemoryLoader<Value>`). The
@@ -125,15 +110,14 @@ pub(crate) fn test_session_for<L>(
         loader,
         registry,
         StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
-        Arc::default(),
         false,
     );
     KeyedStateSession::new(parts)
 }
 
 /// Assembles the [`SessionParts`] shared by every test-session fixture — a
-/// fresh memory cell store over `registry`, the committed oracle, and the given
-/// `loader`/`state_key`/`armed`. When `cancelled`, the per-event cancellation
+/// fresh memory cell store, the registry, loader, and state key.
+/// When `cancelled`, the per-event cancellation
 /// watch starts tripped (binding still succeeds — bind validates registration,
 /// not liveness — but every typed op then guards to
 /// [`StateAccessError::Terminated`]). Returns the parts plus a store clone
@@ -145,29 +129,24 @@ pub(crate) fn session_parts<L>(
     loader: L,
     registry: CollectionDefRegistry,
     state_key: StateKey,
-    armed: ArmedKeys,
     cancelled: bool,
-) -> (SessionParts<TestBackend, L>, MemoryCellStore<FixedOracle>) {
+) -> (SessionParts<TestBackend, L>, MemoryCellStore) {
     let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
     let (_cancel_tx, cancel_rx) = watch::channel(cancelled);
     let registry = Arc::new(registry);
-    let cell_store = MemoryCellStore::new(
-        MemoryCells::new(),
-        FixedOracle::committed(),
-        registry.clone(),
-    );
+    let cell_store = MemoryCellStore::new(MemoryCells::new());
     let parts = SessionParts {
         cell: cell_store.clone(),
         dirty: Arc::new(DirtyStore::new()),
-        oracle: FixedOracle::committed(),
+        dedup: MemoryDeduplicationStore::new(),
         loader,
         registry,
         state_key,
         event: EventRef::Message {
             dedup_id: Uuid::new_v4(),
         },
-        recovery_delay: CompactDuration::new(30),
-        armed,
+        dedup_ttl: CompactDuration::new(30),
+        checks: (),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     };
     (parts, cell_store)
@@ -188,7 +167,7 @@ pub(crate) fn session_with_dirty(
     registry: CollectionDefRegistry,
     state_key: StateKey,
 ) -> (TestSession, Arc<DirtyStore>) {
-    let (parts, _cells) = session_parts(loader, registry, state_key, Arc::default(), false);
+    let (parts, _cells) = session_parts(loader, registry, state_key, false);
     let dirty = parts.dirty.clone();
     (KeyedStateSession::new(parts), dirty)
 }
@@ -196,7 +175,7 @@ pub(crate) fn session_with_dirty(
 /// A test session over an arbitrary cell store `C` — the twin of
 /// [`TestSession`], whose store is pinned to the plain memory one.
 pub(crate) type SessionOver<C> = KeyedStateSession<
-    PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, C>,
+    PartitionBackend<MemoryDeduplicationStore, MemoryDescriptorIdentityStore, C, ()>,
     MemoryLoader<Value>,
 >;
 
@@ -213,15 +192,15 @@ pub(crate) fn session_over<C: CellStore>(
     KeyedStateSession::new(SessionParts {
         cell,
         dirty: Arc::new(DirtyStore::new()),
-        oracle: FixedOracle::committed(),
+        dedup: MemoryDeduplicationStore::new(),
         loader,
         registry: Arc::new(registry),
         state_key,
         event: EventRef::Message {
             dedup_id: Uuid::new_v4(),
         },
-        recovery_delay: CompactDuration::new(30),
-        armed: Arc::default(),
+        dedup_ttl: CompactDuration::new(30),
+        checks: (),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     })
 }
@@ -244,7 +223,7 @@ async fn roundtrip(value: Value) -> Result<bool> {
 fn prop_descriptor_set_get_roundtrip() {
     fn prop(value: ArbJson) -> TestResult {
         let input_dbg = format!("{value:#?}");
-        let result = executor::block_on(roundtrip(value.0));
+        let result = TEST_RUNTIME.block_on(roundtrip(value.0));
         finish_trace(result, "typed roundtrip lost", &input_dbg)
     }
     QuickCheck::new().quickcheck(prop as fn(ArbJson) -> TestResult);
@@ -492,9 +471,8 @@ fn reregistration_is_rejected_as_duplicate() -> Result<()> {
     Ok(())
 }
 
-/// The Map-only `keyset_limit` fluent method threads into the collection def
-/// (uncompilable on a Value or Deque, which is a type-level property, not a
-/// runtime one).
+/// The map and set `keyset_limit` method changes the collection definition.
+/// Value and deque descriptors do not expose this method.
 #[test]
 fn keyset_limit_threads_into_the_collection_def() {
     let descriptor: MapDescriptor<I64KeyCodec> = map_state("m");
@@ -585,12 +563,41 @@ fn span_attr(span: &SpanData, key: &str) -> Option<String> {
         .map(|kv| kv.value.to_string())
 }
 
-/// A representative operation of every kind and shape (value read/write,
-/// keyed map ops, deque mutators, both stream twins) exports a span named
-/// for the operation, carrying the `collection` attribute (plus `map.key` /
-/// `direction` where applicable), and parented on the ambient span — so a
-/// handler's state access is visible and self-describing under its event
-/// span without any explicit parenting.
+/// Runs value, map, set, and deque operations under the current span.
+async fn run_collection_ops() -> Result<()> {
+    let value = bind_registered(cart(), MemoryLoader::new())?;
+    value.set(json!({"qty": 1_i32})).await?;
+    value.get().await?;
+
+    let map = bind_registered(
+        map_state::<Utf8KeyCodec, JsonCodec>("counts"),
+        MemoryLoader::new(),
+    )?;
+    map.set(&"k1".to_owned(), json!(1_i32)).await?;
+    map.get(&"k1".to_owned()).await?;
+    let _entries: Vec<_> = map.stream(Direction::Forward).try_collect().await?;
+    let _keys: Vec<_> = map.keys(Direction::Forward).try_collect().await?;
+    map.is_empty().await?;
+    map.remove(&"k1".to_owned()).await?;
+
+    let set = bind_registered(set_state::<Utf8KeyCodec>("tags"), MemoryLoader::new())?;
+    set.insert(&"k1".to_owned()).await?;
+    set.contains(&"k1".to_owned()).await?;
+    let _members: Vec<_> = set.keys(Direction::Forward).try_collect().await?;
+    set.is_empty().await?;
+    set.remove(&"k1".to_owned()).await?;
+
+    let deque = bind_registered(deque_state::<JsonCodec>("dq"), MemoryLoader::new())?;
+    deque.push_back(json!(7_i32)).await?;
+    let _elements: Vec<_> = deque.stream(Direction::Forward).try_collect().await?;
+    deque.pop_front().await?;
+    Ok(())
+}
+
+/// Value reads and writes, keyed map and set ops, and deque ops export spans.
+/// Each span names its operation and collection under the ambient handler span.
+/// Map and set point operations include their key. Each stream includes its
+/// direction. Map and set streams include their projection.
 #[test]
 fn collection_ops_export_operation_spans() -> Result<()> {
     let outcome: RefCell<Result<()>> = RefCell::new(Ok(()));
@@ -601,35 +608,40 @@ fn collection_ops_export_operation_spans() -> Result<()> {
         // block_ons its export on span end, which may not nest inside a
         // `LocalPool`. The root future runs on this thread, so the entered
         // `handler` span stays ambient.
-        *outcome.borrow_mut() = TEST_RUNTIME.block_on(async {
-            let value = bind_registered(cart(), MemoryLoader::new())?;
-            value.set(json!({"qty": 1_i32})).await?;
-            value.get().await?;
-
-            let map = bind_registered(
-                map_state::<Utf8KeyCodec, JsonCodec>("counts"),
-                MemoryLoader::new(),
-            )?;
-            map.set("k1", json!(1_i32)).await?;
-            map.get(&"k1".to_owned()).await?;
-            let _entries: Vec<_> = map.stream(Direction::Forward).try_collect().await?;
-            map.remove(&"k1".to_owned()).await?;
-
-            let deque = bind_registered(deque_state::<JsonCodec>("dq"), MemoryLoader::new())?;
-            deque.push_back(json!(7_i32)).await?;
-            let _elements: Vec<_> = deque.stream(Direction::Forward).try_collect().await?;
-            deque.pop_front().await?;
-            Ok(())
-        });
+        *outcome.borrow_mut() = TEST_RUNTIME.block_on(run_collection_ops());
     });
     outcome.into_inner()?;
 
-    let handler_id = spans
+    for name in ["map.is_empty", "set.is_empty"] {
+        assert_eq!(
+            spans.iter().filter(|span| span.name == name).count(),
+            1,
+            "one call exports one {name} span"
+        );
+    }
+    let mut projections: Vec<_> = spans
         .iter()
-        .find(|s| s.name == "handler")
-        .ok_or_else(|| eyre!("handler span not exported"))?
-        .span_context
-        .span_id();
+        .filter(|span| span.name == "map.stream")
+        .map(|span| span_attr(span, "projection"))
+        .collect();
+    projections.sort_unstable();
+    assert_eq!(
+        projections,
+        [Some("presence".to_owned()), Some("values".to_owned())],
+        "map streams export one span per projection under one name"
+    );
+
+    assert_eq!(
+        spans
+            .iter()
+            .filter(|span| span.name == "set.stream")
+            .map(|span| span_attr(span, "projection"))
+            .collect::<Vec<_>>(),
+        [Some("presence".to_owned())],
+        "set streams export one presence span"
+    );
+
+    let handler_id = named(&spans, "handler")?.span_context.span_id();
 
     for (name, collection) in [
         ("value.set", "cart"),
@@ -638,6 +650,10 @@ fn collection_ops_export_operation_spans() -> Result<()> {
         ("map.get", "counts"),
         ("map.stream", "counts"),
         ("map.remove", "counts"),
+        ("set.insert", "tags"),
+        ("set.contains", "tags"),
+        ("set.stream", "tags"),
+        ("set.remove", "tags"),
         ("deque.push_back", "dq"),
         ("deque.stream", "dq"),
         ("deque.pop_front", "dq"),
@@ -655,15 +671,20 @@ fn collection_ops_export_operation_spans() -> Result<()> {
             span.parent_span_id, handler_id,
             "{name} must nest under the ambient span"
         );
-        if name.starts_with("map.") && name != "map.stream" {
+        let key_attr = match name.split_once('.') {
+            Some(("map", op)) if op != "stream" => Some("map.key"),
+            Some(("set", op)) if op != "stream" => Some("set.key"),
+            _ => None,
+        };
+        if let Some(attr) = key_attr {
             assert_eq!(
-                span_attr(span, "map.key").as_deref(),
+                span_attr(span, attr).as_deref(),
                 Some("k1"),
-                "{name} must carry the map key"
+                "{name} must carry its key"
             );
         }
     }
-    for name in ["map.stream", "deque.stream"] {
+    for name in ["map.stream", "set.stream", "deque.stream"] {
         let stream = spans
             .iter()
             .find(|s| s.name == name)
@@ -693,6 +714,10 @@ mod scope_containment {
         map_state("counts")
     }
 
+    fn tags() -> SetDescriptor<Utf8KeyCodec> {
+        set_state("tags")
+    }
+
     fn log() -> DequeDescriptor {
         deque_state("log")
     }
@@ -703,15 +728,14 @@ mod scope_containment {
         registry.register(&cart(), CollectionDef::new(None))?;
         registry.register(&wishlist(), CollectionDef::new(None))?;
         registry.register(&counts(), CollectionDef::new(None))?;
+        registry.register(&tags(), CollectionDef::new(None))?;
         registry.register(&log(), CollectionDef::new(None))?;
         Ok(registry)
     }
 
-    /// Sibling descriptors of every kind bound against one session address
-    /// disjoint cells — a write to one never leaks into another's read, even
-    /// though Value/Map/Deque reuse the same section discriminants (`0`/`1`)
-    /// and coordinate spaces. The binding pins `(state_type, name)`, so the
-    /// handles cannot collide sharing a session and a key.
+    /// Sibling descriptors address disjoint cells, though every kind reuses
+    /// sections and coordinates. The collection binding separates each name
+    /// within the same session and key.
     #[test]
     fn prop_sibling_descriptors_do_not_leak() {
         async fn check(a: Value, b: Value) -> Result<bool> {
@@ -723,12 +747,14 @@ mod scope_containment {
             let counts = counts()
                 .bind(&session)
                 .map_err(|e| eyre!("bind counts: {e}"))?;
+            let tags = tags().bind(&session).map_err(|e| eyre!("bind tags: {e}"))?;
             let log = log().bind(&session).map_err(|e| eyre!("bind log: {e}"))?;
 
             // Distinct writes to each sibling, interleaved.
             cart.set(a.clone()).await?;
             wishlist.set(b.clone()).await?;
-            counts.set("qty", b.clone()).await?;
+            counts.set(&"qty".to_owned(), b.clone()).await?;
+            tags.insert(&"tag".to_owned()).await?;
             log.push_back(a.clone()).await?;
 
             // Each handle reads back exactly its own collection's data — no
@@ -738,81 +764,21 @@ mod scope_containment {
                 && counts.get(&"qty".to_owned()).await? == Some(b)
                 && counts.get(&"missing".to_owned()).await?.is_none()
                 && log.get(0).await? == Some(a)
-                && log.len().await? == 1)
+                && log.len().await? == 1
+                && tags.contains(&"tag".to_owned()).await?
+                && !tags.contains(&"qty".to_owned()).await?
+                && counts.get(&"tag".to_owned()).await?.is_none())
         }
         fn prop(a: ArbJson, b: ArbJson) -> TestResult {
             let input = format!("a={:#?} b={:#?}", a.0, b.0);
             finish_trace(
-                executor::block_on(check(a.0, b.0)),
+                TEST_RUNTIME.block_on(check(a.0, b.0)),
                 "sibling leakage",
                 &input,
             )
         }
         QuickCheck::new().quickcheck(prop as fn(ArbJson, ArbJson) -> TestResult);
     }
-}
-
-#[test]
-fn prop_borrowed_utf8_keys_address_maps_and_sets() {
-    async fn check(key: String, value: Value) -> Result<bool> {
-        let map = map_state::<Utf8KeyCodec, JsonCodec>("map");
-        let set = set_state::<Utf8KeyCodec>("set");
-        let mut registry = CollectionDefRegistry::default();
-        registry.register(&map, CollectionDef::new(None))?;
-        registry.register(&set, CollectionDef::new(None))?;
-        let session = test_session(MemoryLoader::new(), registry);
-        let map = map.bind(&session)?;
-        let set = set.bind(&session)?;
-        let key_ref = key.as_str();
-
-        map.set(key_ref, value.clone()).await?;
-        let point = map.get(key_ref).await?;
-        let present = map.contains_key(key_ref).await?;
-        let batch = map.get_many(once(key_ref).filter(|_| true)).await?;
-        let map_keys = map
-            .query(Direction::Forward)
-            .from(key_ref)
-            .to(key_ref)
-            .keys()
-            .try_collect::<Vec<_>>()
-            .await?;
-        map.remove(key_ref).await?;
-        let removed = !map.contains_key(key_ref).await?;
-
-        set.insert(key_ref).await?;
-        let member = set.contains(key_ref).await?;
-        let members = set.contains_many(once(key_ref).filter(|_| true)).await?;
-        let set_keys = set
-            .query(Direction::Forward)
-            .from(key_ref)
-            .to(key_ref)
-            .keys()
-            .try_collect::<Vec<_>>()
-            .await?;
-        set.remove(key_ref).await?;
-        let member_removed = !set.contains(key_ref).await?;
-
-        Ok(point == Some(value.clone())
-            && present
-            && batch == vec![Some(value)]
-            && map_keys == vec![key.clone()]
-            && removed
-            && member
-            && members == vec![true]
-            && set_keys == vec![key]
-            && member_removed)
-    }
-
-    fn prop(key: String, value: ArbJson) -> TestResult {
-        let input = format!("key={key:?} value={:#?}", value.0);
-        finish_trace(
-            executor::block_on(check(key, value.0)),
-            "borrowed UTF-8 key parity",
-            &input,
-        )
-    }
-
-    QuickCheck::new().quickcheck(prop as fn(String, ArbJson) -> TestResult);
 }
 
 /// Every typed op enforces the termination guard, and the guard holds in each
@@ -823,10 +789,12 @@ fn prop_borrowed_utf8_keys_address_maps_and_sets() {
 async fn terminated_session_refuses_typed_ops_in_every_kind() -> Result<()> {
     let value = value_state::<JsonCodec>("term_value");
     let map = map_state::<Utf8KeyCodec, JsonCodec>("term_map");
+    let set = set_state::<Utf8KeyCodec>("term_set");
     let deque = deque_state::<JsonCodec>("term_deque");
     let mut registry = CollectionDefRegistry::default();
     registry.register(&value, CollectionDef::new(None))?;
     registry.register(&map, CollectionDef::new(None))?;
+    registry.register(&set, CollectionDef::new(None))?;
     registry.register(&deque, CollectionDef::new(None))?;
     let session = terminated_session(MemoryLoader::new(), registry);
 
@@ -844,6 +812,14 @@ async fn terminated_session_refuses_typed_ops_in_every_kind() -> Result<()> {
     let map_handle = map.bind(&session).map_err(|e| eyre!("bind map: {e}"))?;
     assert!(matches!(
         map_handle.get(&"k".to_owned()).await,
+        Err(MapStateError::Cell(CellStateError::Access(
+            StateAccessError::Terminated
+        )))
+    ));
+
+    let set_handle = set.bind(&session).map_err(|e| eyre!("bind set: {e}"))?;
+    assert!(matches!(
+        set_handle.contains(&"k".to_owned()).await,
         Err(MapStateError::Cell(CellStateError::Access(
             StateAccessError::Terminated
         )))
@@ -867,7 +843,6 @@ fn terminated_session(loader: MemoryLoader<Value>, registry: CollectionDefRegist
         loader,
         registry,
         StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
-        Arc::default(),
         true,
     );
     KeyedStateSession::new(parts)

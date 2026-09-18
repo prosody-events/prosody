@@ -47,7 +47,7 @@ mod erased;
 pub use erased::{
     BoxDequeState, BoxMapState, BoxSetState, BoxStateCursor, BoxValueState, DequeScanConfig,
     DynDequeState, DynMapState, DynSetState, DynValueState, ErasedCategory, ErasedStateError,
-    KeyScanConfig, StateCursor,
+    KeyScanConfig, ScanConfig, StateCursor,
 };
 use erased::{ErasedDeque, ErasedMap, ErasedSet, ErasedValue};
 
@@ -937,7 +937,7 @@ where
             .state(Registered::new(value_state::<
                 <C::Payload as ErasedStateCodec>::Codec,
             >(name)))
-            .map_err(|e| ErasedStateError::from_classified(&e))?;
+            .map_err(|error| ErasedStateError::from_classified(&error))?;
         Ok(Box::new(ErasedValue::new(handle)))
     }
 
@@ -947,7 +947,7 @@ where
                 Utf8KeyCodec,
                 <C::Payload as ErasedStateCodec>::Codec,
             >(name)))
-            .map_err(|e| ErasedStateError::from_classified(&e))?;
+            .map_err(|error| ErasedStateError::from_classified(&error))?;
         Ok(Box::new(ErasedMap::new(handle)))
     }
 
@@ -963,7 +963,7 @@ where
             .state(Registered::new(deque_state::<
                 <C::Payload as ErasedStateCodec>::Codec,
             >(name)))
-            .map_err(|e| ErasedStateError::from_classified(&e))?;
+            .map_err(|error| ErasedStateError::from_classified(&error))?;
         Ok(Box::new(ErasedDeque::new(handle)))
     }
 
@@ -975,7 +975,7 @@ where
             .state(Registered::new(message_state::<
                 <C::State as StateSession>::Loader,
             >(name)))
-            .map_err(|e| ErasedStateError::from_classified(&e))?;
+            .map_err(|error| ErasedStateError::from_classified(&error))?;
         Ok(Box::new(ErasedValue::new(handle)))
     }
 
@@ -988,7 +988,7 @@ where
                 Utf8KeyCodec,
                 <C::State as StateSession>::Loader,
             >(name)))
-            .map_err(|e| ErasedStateError::from_classified(&e))?;
+            .map_err(|error| ErasedStateError::from_classified(&error))?;
         Ok(Box::new(ErasedMap::new(handle)))
     }
 
@@ -1000,7 +1000,7 @@ where
             .state(Registered::new(message_deque_state::<
                 <C::State as StateSession>::Loader,
             >(name)))
-            .map_err(|e| ErasedStateError::from_classified(&e))?;
+            .map_err(|error| ErasedStateError::from_classified(&error))?;
         Ok(Box::new(ErasedDeque::new(handle)))
     }
 }

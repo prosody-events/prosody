@@ -12,9 +12,10 @@
 use crate::codec::{I64Codec, I64CodecError};
 use crate::consumer::middleware::RepinProof;
 use crate::loader::MemoryLoader;
-use crate::state::cell_key::{CellKey, Direction};
+use crate::state::cell::Values;
+use crate::state::cell_key::{CellKey, Direction, ScanEdge};
 use crate::state::collection::{
-    Collection, CollectionRead, CollectionWrite, Constraints, StateSession, collection_layout,
+    Collection, CollectionRead, CollectionWrite, StateSession, collection_layout,
 };
 use crate::state::descriptor::tests::{TestBackend, session_parts, test_session, value_registry};
 use crate::state::descriptor::{
@@ -34,6 +35,7 @@ use futures::StreamExt;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use serde_json::Value;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -268,9 +270,16 @@ fn range_plan_terminates_at_first_error() -> Result<()> {
 
         let cells = bind_plain(&session)?;
         let plan = cells
-            .read(async |op| op.range(PlainLayout::CELLS, Direction::Forward))
+            .read(async |op| {
+                op.range(
+                    PlainLayout::CELLS,
+                    ScanEdge::Unbounded,
+                    Direction::Forward,
+                    ScanEdge::Unbounded,
+                )
+            })
             .await;
-        let stream = plan.entries(Constraints::default());
+        let stream = plan.projected::<Values>();
         futures::pin_mut!(stream);
         let mut items = Vec::new();
         while let Some(item) = stream.next().await {
@@ -290,40 +299,66 @@ fn range_plan_terminates_at_first_error() -> Result<()> {
     })
 }
 
-/// The coordinate driver's fence runs on the exhaustion `None`, not on items
-/// alone. The test bumps the attempt epoch after the plan's last item, and the
-/// plan then yields `Terminated` rather than a clean end. The test captures the
-/// plan before the bump, so only the per-emission fence can raise that error.
-///
-/// Its empty-plan twin is `empty_coordinate_plan_fences_on_exhaustion` in the
-/// parent module.
+/// Every source fences exhaustion, including exhaustion caused by a result
+/// limit. Reset after the last permitted item must produce `Terminated`.
+/// The parent module covers empty coordinate plans separately.
 #[tokio::test]
-async fn coordinate_plan_fences_after_its_last_item() -> Result<()> {
-    let session = plain_session()?;
-    let cells = bind_plain(&session)?;
-    cells
-        .write(async |op| op.set(PlainLayout::CELLS, &7, 7))
-        .await
-        .map_err(|e| eyre!("seed: {e}"))?;
+async fn plan_fences_after_its_last_item() -> Result<()> {
+    for use_range in [true, false] {
+        for limit in [Some(NonZeroUsize::MIN), None] {
+            let session = plain_session()?;
+            let cells = bind_plain(&session)?;
+            cells
+                .write(async |op| {
+                    op.set(PlainLayout::CELLS.at(&7), 7)?;
+                    op.set(PlainLayout::CELLS.at(&8), 8)
+                })
+                .await
+                .map_err(|e| eyre!("seed: {e}"))?;
 
-    let plan = cells
-        .read(async |op| op.coordinates(PlainLayout::CELLS, vec![7_i64], Direction::Forward))
-        .await;
-    let stream = plan.entries(Constraints::default());
-    futures::pin_mut!(stream);
-    match stream.next().await {
-        Some(Ok((7, 7))) => {}
-        other => return Err(eyre!("first pull must be the seeded item, got {other:?}")),
+            let plan = cells
+                .read(async |op| {
+                    if use_range {
+                        op.range(
+                            PlainLayout::CELLS,
+                            ScanEdge::Unbounded,
+                            Direction::Forward,
+                            ScanEdge::Unbounded,
+                        )
+                    } else {
+                        op.coordinates(
+                            PlainLayout::CELLS,
+                            vec![I64KeyCodec::encode(&7), I64KeyCodec::encode(&8)],
+                        )
+                    }
+                })
+                .await;
+            let plan = match limit {
+                Some(limit) => plan.with_limit(Some(limit)),
+                None => plan,
+            };
+            let stream = plan.projected::<Values>();
+            futures::pin_mut!(stream);
+            let count = limit.map_or(2, NonZeroUsize::get);
+            for expected in 7..7 + i64::try_from(count)? {
+                match stream.next().await {
+                    Some(Ok((key, value))) if key == expected && value == expected => {}
+                    other => return Err(eyre!("expected {expected}, got {other:?}")),
+                }
+            }
+
+            session.reset(RepinProof::for_test()).await;
+            match stream.next().await {
+                Some(Err(CellStateError::Access(StateAccessError::Terminated))) => {}
+                other => {
+                    return Err(eyre!(
+                        "the post-reset pull must be Terminated, got {other:?}"
+                    ));
+                }
+            }
+        }
     }
-    // Bump the attempt epoch. The buffered chunk is already drained, so the
-    // next pull drives the source to exhaustion and the fence catches it.
-    session.reset(RepinProof::for_test()).await;
-    match stream.next().await {
-        Some(Err(CellStateError::Access(StateAccessError::Terminated))) => Ok(()),
-        other => Err(eyre!(
-            "the post-bump exhaustion pull must be Terminated, got {other:?}"
-        )),
-    }
+    Ok(())
 }
 
 /// One full resolve window runs concurrently. Every gated resolver of a
@@ -391,13 +426,20 @@ fn plan_streams_are_send() -> Result<()> {
         let session = gate_session(Arc::new(GateLadder::new(0)))?;
         let cells = bind_gated(&session)?;
         let range = cells
-            .read(async |op| op.range(GatedLayout::CELLS, Direction::Forward))
+            .read(async |op| {
+                op.range(
+                    GatedLayout::CELLS,
+                    ScanEdge::Unbounded,
+                    Direction::Forward,
+                    ScanEdge::Unbounded,
+                )
+            })
             .await;
-        assert_send(range.entries(Constraints::default()));
+        assert_send(range.projected::<Values>());
         let points = cells
-            .read(async |op| op.coordinates(GatedLayout::CELLS, Vec::new(), Direction::Forward))
+            .read(async |op| op.coordinates(GatedLayout::CELLS, Vec::new()))
             .await;
-        assert_send(points.entries(Constraints::default()));
+        assert_send(points.projected::<Values>());
         Ok(())
     })
 }
@@ -410,7 +452,6 @@ fn gate_session(ladder: Arc<GateLadder>) -> Result<GateSession> {
         GateLoader(ladder),
         value_registry(&descriptor)?,
         StateKey::new(Uuid::new_v4(), Arc::from("gate")),
-        Arc::default(),
         false,
     );
     Ok(KeyedStateSession::new(parts))
@@ -455,7 +496,7 @@ async fn seed_gated(cells: &Collection<GateSession, GatedLayout>, n: usize) -> R
     cells
         .write(async |op| {
             for key in 0..n as i64 {
-                op.set(GatedLayout::CELLS, &key, key)?;
+                op.set(GatedLayout::CELLS.at(&key), key)?;
             }
             Ok::<(), CellStateError<I64CodecError>>(())
         })
@@ -474,10 +515,17 @@ async fn ranged_keys(release: &[usize]) -> Result<Vec<i64>> {
     seed_gated(&cells, n).await?;
 
     let plan = cells
-        .read(async |op| op.range(GatedLayout::CELLS, Direction::Forward))
+        .read(async |op| {
+            op.range(
+                GatedLayout::CELLS,
+                ScanEdge::Unbounded,
+                Direction::Forward,
+                ScanEdge::Unbounded,
+            )
+        })
         .await;
     let collector = async {
-        let stream = plan.entries(Constraints::default());
+        let stream = plan.projected::<Values>();
         futures::pin_mut!(stream);
         let mut keys = Vec::new();
         while let Some(item) = stream.next().await {

@@ -14,20 +14,20 @@
 //! the write scope exists only for a session whose engine has one, so a reader
 //! collection has no mutation to refuse. What the engine can reach is likewise
 //! a matter of type, not of runtime checks: [`ReaderBackend`] offers a
-//! committed cell source and a loader, and no oracle or writable store, so
-//! gaining either behavior takes a dependency change.
+//! committed cell source and a loader. Writes require a different backend
+//! interface.
 
 use super::{PinnedSource, ReadSession};
 use crate::codec::Codec;
 use crate::state::access::StateAccessError;
+use crate::state::cell::Projection;
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::collection::{StateSession, sealed};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::registry::{CollectionDef, MAX_KEYSET_LIMIT};
-use crate::state::store::{CellBuffer, CoordinateBatch, PresenceBatch};
+use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::{StateName, StateType};
-use crate::state_reader::backend::ReaderBackend;
-use bytes::Bytes;
+use crate::state_reader::backend::{CommittedCellSource, ReaderBackend};
 use futures::stream::Stream;
 use std::future::ready;
 
@@ -96,15 +96,38 @@ impl<C: Codec, B: ReaderBackend<C>> sealed::ReadEngine<ReadSession<C, B>> for Re
         ready(session.pin.get().cloned())
     }
 
+    fn capture(inner: &Self::ReadInner<'_>) -> Self::Plan {
+        inner.clone()
+    }
+
+    fn resume<'a>(
+        _session: &'a ReadSession<C, B>,
+        plan: &Self::Plan,
+    ) -> impl Future<Output = Self::ReadInner<'a>> + Send {
+        ready(plan.clone())
+    }
+
+    /// Vacuous: a published reader has no attempt, no cancellation, and no
+    /// teardown to leak past.
+    fn fence(_session: &ReadSession<C, B>) -> Result<(), StateAccessError> {
+        Ok(())
+    }
+}
+
+impl<C: Codec, B: ReaderBackend<C>, P: Projection> sealed::Reads<ReadSession<C, B>, P>
+    for ReaderEngine
+where
+    B::Cells: CommittedCellSource<P>,
+{
     async fn read_point(
         session: &ReadSession<C, B>,
         inner: &mut Self::ReadInner<'_>,
         _state_type: StateType,
         _name: &StateName,
         cell: &CellKey,
-    ) -> Result<Option<Bytes>, StateAccessError> {
+    ) -> Result<Option<P::Payload>, StateAccessError> {
         let unselected = inner.is_none();
-        let result = session.point_read(inner, cell).await;
+        let result = session.point_read::<P>(inner, cell).await;
         if unselected {
             publish(session, inner.as_ref());
         }
@@ -118,40 +141,13 @@ impl<C: Codec, B: ReaderBackend<C>> sealed::ReadEngine<ReadSession<C, B>> for Re
         _name: &StateName,
         section: Section,
         batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
+    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError> {
         let unselected = inner.is_none();
-        let result = session.batch_read(inner, section, batch).await;
+        let result = session.batch_read::<P>(inner, section, batch).await;
         if unselected {
             publish(session, inner.as_ref());
         }
         result
-    }
-
-    async fn read_presence_batch(
-        session: &ReadSession<C, B>,
-        inner: &mut Self::ReadInner<'_>,
-        _state_type: StateType,
-        _name: &StateName,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<PresenceBatch, StateAccessError> {
-        let unselected = inner.is_none();
-        let result = session.presence_batch_read(inner, section, batch).await;
-        if unselected {
-            publish(session, inner.as_ref());
-        }
-        result
-    }
-
-    fn capture(inner: &Self::ReadInner<'_>) -> Self::Plan {
-        inner.clone()
-    }
-
-    fn resume<'a>(
-        _session: &'a ReadSession<C, B>,
-        plan: &Self::Plan,
-    ) -> impl Future<Output = Self::ReadInner<'a>> + Send {
-        ready(plan.clone())
     }
 
     fn page<'a>(
@@ -160,24 +156,8 @@ impl<C: Codec, B: ReaderBackend<C>> sealed::ReadEngine<ReadSession<C, B>> for Re
         _state_type: StateType,
         _name: &'a StateName,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
-        session.scan_from(plan.as_ref(), scan)
-    }
-
-    fn page_keys<'a>(
-        session: &'a ReadSession<C, B>,
-        plan: &'a Self::Plan,
-        _state_type: StateType,
-        _name: &'a StateName,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<CellKey, StateAccessError>> + Send + 'a {
-        session.scan_presence_from(plan.as_ref(), scan)
-    }
-
-    /// Vacuous: a published reader has no attempt, no cancellation, and no
-    /// teardown to leak past.
-    fn fence(_session: &ReadSession<C, B>) -> Result<(), StateAccessError> {
-        Ok(())
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a {
+        session.scan_from::<P>(plan.as_ref(), scan)
     }
 }
 
@@ -185,7 +165,7 @@ impl<C: Codec, B: ReaderBackend<C>> sealed::ReadEngine<ReadSession<C, B>> for Re
 /// later invocation on the same session addresses the same source. Discarding
 /// the `set` result is safe: one operation's reads are sequential, so no other
 /// selection can have landed in between.
-fn publish<C: Codec, B: ReaderBackend<C>>(
+pub(super) fn publish<C: Codec, B: ReaderBackend<C>>(
     session: &ReadSession<C, B>,
     selection: Option<&PinnedSource>,
 ) {

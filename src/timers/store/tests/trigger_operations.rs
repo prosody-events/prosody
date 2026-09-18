@@ -41,10 +41,11 @@ where
         .await
         .map_err(|e| format!("duplicate add failed: {e:?}"))?;
 
-    let current_tag = store
-        .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+    let current_trigger = store
+        .current_trigger(&trigger.key, trigger.time, trigger.timer_type)
         .await
-        .map_err(|e| format!("current_tag after duplicate add failed: {e:?}"))?;
+        .map(|trigger| trigger.map(|trigger| trigger.tag))
+        .map_err(|e| format!("current_trigger after duplicate add failed: {e:?}"))?;
     let key_triggers: Vec<Trigger> = store
         .get_key_triggers(trigger.timer_type, &trigger.key)
         .try_collect()
@@ -64,7 +65,7 @@ where
         .map(|t| t.tag);
 
     for (surface, tag) in [
-        ("current_tag", current_tag),
+        ("current_trigger", current_trigger),
         ("key trigger", key_tag),
         ("slab trigger", slab_tag),
     ] {
@@ -149,7 +150,7 @@ where
     }
 
     // A duplicate add with the same key/time/type must replace the metadata (tag)
-    // across `current_tag` and both indices.
+    // across `current_trigger` and both indices.
     verify_duplicate_add_replaces_metadata(store, &input.segment, trigger).await?;
 
     remove_trigger(store, &trigger.key, trigger.time, trigger.timer_type).await?;

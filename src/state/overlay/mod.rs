@@ -1,56 +1,29 @@
-//! The dirty overlay over a committed cell store.
+//! Reads projected cells through the event's dirty overlay.
 //!
-//! [`Overlay`] is the transactional view a session reads and writes through: a
-//! per-event [`DirtyStore`] buffering this handler's `set`/`clear` outcomes,
-//! layered over a lower committed [`CellStore`] (`Cached<CassandraStore>` in
-//! production, `MemoryCellStore` in tests). Backend genericity comes from the
-//! `L: CellStore` bound on the read methods.
+//! Dirty values take precedence over committed values. Dirty clears hide cells.
+//! A section clear hides every lower cell until the event writes it again.
+//! Point and batch reads send only untouched positions to the lower store.
+//! Scans merge an owned dirty snapshot with the lazy lower stream in coordinate
+//! order.
 //!
-//! - `get` short-circuits the dirty leg: a buffered `Set` returns those bytes,
-//!   a `Cleared` returns known-absence, an untouched cell falls through to
-//!   `lower.get`.
-//! - `get_many` applies that same dirty short-circuit per position across a
-//!   [`CoordinateBatch`], then reads only the untouched positions through one
-//!   `lower.get_many` sub-batch and scatters the answers back into alignment.
-//! - `scan_cells` lazily merges the dirty leg against `lower.scan_cells` in
-//!   `coordinate` order — **dirty wins on a key tie**, a dirty `Cleared`
-//!   **hides** the lower cell, an untouched cell falls through.
-//! - a standing **dirty clear marker** ([`DirtyStore::clear_section`]) hides
-//!   the whole lower section: `get` answers known-absence on a dirty-cell miss,
-//!   and `scan_cells` never issues the lower leg — the stream is the dirty
-//!   snapshot filtered to the range.
-//!
-//! The overlay deliberately does **not** implement [`CellStore`]: it exposes
-//! only the transactional reads, so cache-fill and promote paths cannot
-//! route through it — a `Cached<Overlay<…>>` composition or a cache fill of
-//! this handler's uncommitted dirty value is uncompilable, and durable writes
-//! go through [`Overlay::lower`] by construction.
-//!
-//! # `Send`
-//!
-//! The merge must stay `Send` (the `+ Send` bound on the `scan_cells`
-//! signature). [`scc::TreeIndex`]'s range iterator borrows a `!Send` guard, so
-//! the dirty leg is taken as an **owned** sorted snapshot
-//! ([`DirtyStore::section_snapshot`], which drops the guard before returning)
-//! and merged synchronously against the still-lazy lower stream — nothing
-//! `!Send` is held across an `.await`. The snapshot is bounded by what *this*
-//! handler buffered (O(handler writes), not O(partition)), so materializing it
-//! is not the collect-then-merge the design forbids for large backing ranges.
+//! The overlay exposes no durable writes. Cache fills and promotion use the
+//! lower store directly. The owned snapshot releases its tree guard before the
+//! stream suspends. Its size cannot exceed the event's buffered writes.
 
-use super::cell::Committed;
+use super::cell::{Committed, Projection};
 use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::dirty::{DirtyStore, DirtyVal};
-use super::event_ref::EventRef;
 use super::identity::CollectionId;
-use super::store::{CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch};
+use super::store::{CellBuffer, CommittedBatch, CoordinateBatch};
+use crate::state::store::CellRead;
 use async_stream::try_stream;
-use bytes::Bytes;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt};
 use smallvec::{SmallVec, smallvec};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-/// A dirty overlay over a lower committed [`CellStore`].
+/// A dirty overlay over a lower committed
+/// [`CellStore`](super::store::CellStore).
 #[derive(Clone)]
 pub struct Overlay<L> {
     dirty: Arc<DirtyStore>,
@@ -78,28 +51,22 @@ impl<L> Overlay<L> {
     pub fn lower(&self) -> &L {
         &self.lower
     }
-}
 
-impl<L> Overlay<L>
-where
-    L: CellStore,
-{
-    /// Reads one cell through the overlay: a buffered `Set` returns those
-    /// bytes, a `Cleared` returns known-absence, an untouched cell falls
-    /// through to `lower.get`.
+    /// Reads one projected cell through the dirty overlay.
     ///
     /// # Errors
     ///
-    /// Propagates the lower store's error on a dirty miss (the dirty leg
-    /// itself is infallible).
-    pub async fn get<'a>(
+    /// Returns the lower store error when the dirty overlay has no answer.
+    pub async fn get<'a, P: Projection>(
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-        own: EventRef,
-    ) -> Result<Committed, L::Error> {
+    ) -> Result<Committed<P>, L::Error>
+    where
+        L: CellRead<P>,
+    {
         match self.dirty.lookup(collection, cell) {
-            Some(DirtyVal::Set(bytes)) => Ok(Committed::new(Some(bytes))),
+            Some(DirtyVal::Set(bytes)) => Ok(Committed::new(Some(P::from_value(bytes)))),
             Some(DirtyVal::Cleared) => Ok(Committed::new(None)),
             // A standing dirty clear marker answers known-absence for the
             // whole section: the cell was erased at the clear and has not
@@ -107,37 +74,35 @@ where
             None if self.dirty.section_cleared(collection, cell.section) => {
                 Ok(Committed::new(None))
             }
-            None => self.lower.get(collection, cell, own).await,
+            None => CellRead::<P>::read(&self.lower, collection, cell)
+                .await
+                .map(|(cell, _)| cell),
         }
     }
 
-    /// Batch twin of [`Self::get`]: classifies each position exactly as `get`
-    /// (a dirty `Set` answers its bytes — checked FIRST, so a `Set` inside a
-    /// dirty-cleared section still answers its bytes; a dirty `Cleared` or a
-    /// standing section-clear answers absence; else untouched), sends ONLY the
-    /// untouched positions down as ONE re-batched lower `get_many` (a subset of
-    /// a batch is `≤ CELL_BATCH`, so exactly one lower call, or zero when every
-    /// position is dirty-answered), and scatters the answers back
-    /// index-aligned.
+    /// Reads one projected answer for each coordinate in input order.
+    /// Dirty answers take precedence. One lower batch reads the untouched
+    /// positions.
     ///
     /// # Errors
     ///
-    /// Propagates the lower store's error on the untouched batch read (the
-    /// dirty leg itself is infallible).
-    pub async fn get_many<'a>(
+    /// Returns the lower store error when the dirty overlay has no answer.
+    pub async fn get_many<'a, P: Projection>(
         &'a self,
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-        own: EventRef,
-    ) -> Result<CommittedBatch, L::Error> {
+    ) -> Result<CommittedBatch<P>, L::Error>
+    where
+        L: CellRead<P>,
+    {
         let (dirty_answers, untouched, untouched_pos) =
             self.classify_batch(collection, section, batch);
-        let mut answers: CellBuffer<Option<Committed>> = dirty_answers
+        let mut answers: CellBuffer<Option<Committed<P>>> = dirty_answers
             .into_iter()
             .map(|answer| {
                 answer.map(|value| match value {
-                    DirtyVal::Set(bytes) => Committed::new(Some(bytes)),
+                    DirtyVal::Set(bytes) => Committed::new(Some(P::from_value(bytes))),
                     DirtyVal::Cleared => Committed::new(None),
                 })
             })
@@ -145,11 +110,9 @@ where
         // `untouched.len() ≤ batch.len() ≤ CELL_BATCH`, so this yields zero or
         // one lower batch; `untouched_pos` aligns 1:1 with its answers.
         for lower_batch in CoordinateBatch::chunks(untouched) {
-            let lower = self
-                .lower
-                .get_many(collection, section, &lower_batch, own)
-                .await?;
-            for (committed, &pos) in lower.into_iter().zip(untouched_pos.iter()) {
+            let lower =
+                CellRead::<P>::read_many(&self.lower, collection, section, &lower_batch).await?;
+            for ((committed, _), &pos) in lower.into_iter().zip(untouched_pos.iter()) {
                 answers[pos] = Some(committed);
             }
         }
@@ -157,39 +120,7 @@ where
         // `flatten` drops nothing; a short lower result — a lower-store
         // alignment violation, the same bug the store layer's own `get_many`
         // default guards — would leave a hole the debug assert catches.
-        let out: CommittedBatch = answers.into_iter().flatten().collect();
-        debug_assert_eq!(
-            out.len(),
-            batch.len(),
-            "batch read must answer every input position"
-        );
-        Ok(out)
-    }
-
-    /// Matches [`Self::get_many`] but reads only cell presence.
-    pub async fn contains_many<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-        own: EventRef,
-    ) -> Result<PresenceBatch, L::Error> {
-        let (dirty_answers, untouched, untouched_pos) =
-            self.classify_batch(collection, section, batch);
-        let mut answers: CellBuffer<Option<bool>> = dirty_answers
-            .into_iter()
-            .map(|answer| answer.map(|value| matches!(value, DirtyVal::Set(_))))
-            .collect();
-        for lower_batch in CoordinateBatch::chunks(untouched) {
-            let lower = self
-                .lower
-                .contains_many(collection, section, &lower_batch, own)
-                .await?;
-            for (present, &pos) in lower.into_iter().zip(untouched_pos.iter()) {
-                answers[pos] = Some(present);
-            }
-        }
-        let out: PresenceBatch = answers.into_iter().flatten().collect();
+        let out: CommittedBatch<P> = answers.into_iter().flatten().collect();
         debug_assert_eq!(
             out.len(),
             batch.len(),
@@ -233,70 +164,38 @@ where
         (answers, untouched, untouched_pos)
     }
 
-    /// Scans a range through the overlay, lazily merging the dirty leg
-    /// against `lower.scan_cells` in `coordinate` order — dirty wins on a key
-    /// tie, a dirty `Cleared` hides the lower cell. A standing dirty clear
-    /// marker hides the whole lower section: the lower leg is never issued
-    /// and the stream is the dirty snapshot filtered to the range.
-    pub fn scan_cells<'a>(
+    /// Merges the dirty snapshot with the lower scan in coordinate order.
+    /// A dirty value replaces the lower value. A dirty clear hides the lower
+    /// cell. A standing dirty clear marker hides the whole lower section.
+    /// The merge drops the lower stream unpolled, so no lower query runs.
+    /// The stream then contains only the dirty snapshot filtered to the range.
+    pub fn scan<'a, P: Projection>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-        own: EventRef,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a {
-        // Strip the lower limit because dirty cells can add or hide results.
-        // The merge applies the limit to its output.
-        let bottom = self.lower.scan_cells(collection, scan.without_limit(), own);
-        self.merge_cells(collection, scan, bottom)
-    }
-
-    /// Matches [`Self::scan_cells`] but streams only cell presence.
-    pub fn scan_keys<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-        own: EventRef,
-    ) -> impl Stream<Item = Result<CellKey, L::Error>> + Send + 'a {
-        let bottom = self
-            .lower
-            .scan_keys(collection, scan.without_limit(), own)
-            .map_ok(|key| (key, Bytes::new()));
-        self.merge_cells(collection, scan, bottom)
-            .map_ok(|(key, _)| key)
-    }
-
-    fn merge_cells<'a, S>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-        bottom: S,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), L::Error>> + Send + 'a
     where
-        S: Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a,
+        L: CellRead<P>,
     {
-        let cleared = self.dirty.section_cleared(collection, scan.section());
-        let mut top = self.dirty.section_snapshot(collection, scan.section());
+        let bottom = CellRead::<P>::scan(&self.lower, collection, scan);
+        let cleared = self.dirty.section_cleared(collection, scan.section);
+        let mut top = self.dirty.section_snapshot(collection, scan.section);
         // Bound the dirty leg to the scan's range in `dir` before merging:
         // `section_snapshot` yields the whole section, so without this a dirty
         // cell outside the range (or on the wrong side of `start`) would leak
         // into a bounded scan. The lower leg is already range-bounded.
         top.retain(|(key, _)| scan.contains(&key.coordinate));
         // The snapshot is ascending; the lower leg is in `dir` order, so align.
-        if scan.direction() == Direction::Backward {
+        if scan.dir == Direction::Backward {
             top.reverse();
         }
         try_stream! {
             if cleared {
                 // The dirty clear marker hides the lower section: yield only
-                // the post-clear dirty `Set`s, honoring the limit.
-                let mut yielded = 0usize;
+                // the post-clear dirty `Set`s.
                 for (key, value) in &top {
-                    if scan.result_limit().is_some_and(|n| yielded >= n.get()) {
-                        break;
-                    }
                     if let DirtyVal::Set(bytes) = value {
-                        yield (key.clone(), bytes.clone());
-                        yielded += 1;
+                        yield (key.clone(), P::from_value(bytes.clone()));
                     }
                 }
                 return;
@@ -304,12 +203,8 @@ where
             // `top` is an owned, pre-sorted snapshot (the guard was dropped when
             // it was built), walked by index; `bottom` stays a lazy stream.
             let mut ti = 0usize;
-            let mut yielded = 0usize;
             let mut bottom = std::pin::pin!(bottom.peekable());
             loop {
-                if scan.result_limit().is_some_and(|n| yielded >= n.get()) {
-                    break;
-                }
                 let order = match (top.get(ti), bottom.as_mut().peek().await) {
                     (None, None) => break,
                     // Dirty-only: take dirty.
@@ -317,7 +212,7 @@ where
                     // Lower-only, or lower errored (surfaced when consumed below).
                     (None, Some(_)) | (Some(_), Some(Err(_))) => Ordering::Greater,
                     (Some((tk, _)), Some(Ok((bk, _)))) => {
-                        front_cmp(scan.direction(), &tk.coordinate, &bk.coordinate)
+                        front_cmp(scan.dir, &tk.coordinate, &bk.coordinate)
                     }
                 };
                 match order {
@@ -326,8 +221,7 @@ where
                         let (key, value) = &top[ti];
                         ti += 1;
                         if let DirtyVal::Set(bytes) = value {
-                            yield (key.clone(), bytes.clone());
-                            yielded += 1;
+                            yield (key.clone(), P::from_value(bytes.clone()));
                         }
                     }
                     // Tie: dirty wins, the shadowed lower cell is dropped.
@@ -336,15 +230,13 @@ where
                         ti += 1;
                         let _ = bottom.as_mut().next().await.transpose()?;
                         if let DirtyVal::Set(bytes) = value {
-                            yield (key.clone(), bytes.clone());
-                            yielded += 1;
+                            yield (key.clone(), P::from_value(bytes.clone()));
                         }
                     }
                     // Lower cell comes first (untouched by this handler): emit it.
                     Ordering::Greater => {
                         if let Some(item) = bottom.as_mut().next().await {
                             yield item?;
-                            yielded += 1;
                         }
                     }
                 }

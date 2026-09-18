@@ -12,6 +12,7 @@ use super::{
 use crate::error::{ClassifyError, ErrorCategory};
 use bytes::BytesMut;
 use quickcheck::{QuickCheck, TestResult};
+use std::borrow::Borrow;
 
 /// Asserts both halves of the order-preserving invariant for one codec over a
 /// key pair: monotonicity (`a.cmp(b) == encode(a).cmp(encode(b))`) and
@@ -21,8 +22,8 @@ where
     C: OrderedKeyCodec,
     C::Key: Clone,
 {
-    let ea = C::encode_owned(&a);
-    let eb = C::encode_owned(&b);
+    let ea = C::encode(a.borrow());
+    let eb = C::encode(b.borrow());
     let monotone = a.cmp(&b) == ea.as_bytes().cmp(eb.as_bytes());
     let round_trips =
         C::decode(ea.as_bytes()).as_ref() == Ok(&a) && C::decode(eb.as_bytes()).as_ref() == Ok(&b);
@@ -180,7 +181,7 @@ fn prop_key_codec_payload_bytes_are_coordinate_bytes() {
         let mut borrowed = Vec::new();
         codec.serialize_ref(&key, &mut borrowed).is_ok()
             && borrowed == buf
-            && buf == KC::encode_owned(&key).as_bytes()
+            && buf == KC::encode(key.borrow()).as_bytes()
             && codec.deserialize(&mut buf.clone()) == Ok(key.clone())
             && codec.deserialize_owned(BytesMut::from(buf.as_slice())) == Ok(key)
     }

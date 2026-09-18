@@ -13,9 +13,12 @@ use super::{
     acquire_descriptor_identities, validate,
 };
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, value_state};
+use crate::state::cell::Values;
+use crate::state::descriptor::{DescriptorIdentity, ValueDescriptor, set_state, value_state};
 use crate::state::memory::{MemoryCellStore, MemoryDescriptorIdentityStore};
+use crate::state::order_codec::I64KeyCodec;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+use crate::state::store::CellRead;
 use crate::state::tests::identity_suite::{
     IdentityTrace, run_concurrent_conflicting, run_concurrent_identical, run_identity_trace,
 };
@@ -90,11 +93,8 @@ fn prop_memory_concurrent_conflicting_registration() {
     QuickCheck::new().quickcheck(prop as fn(u8) -> TestResult);
 }
 
-/// Wire-format freeze: the `keyed_state_identity` row's discriminants are a
-/// durable contract compared on every read, so changing any value silently
-/// bricks existing collections (a renamed variant still round-trips). Pin the
-/// literals so such a change fails loudly here, not in production. The format
-/// tokens are frozen in their own codecs' tests.
+/// Identity discriminants and codec tokens must stay frozen to keep existing
+/// collections readable.
 #[test]
 fn durable_identity_wire_contract_is_frozen() {
     use crate::state::CollectionKindId;
@@ -107,6 +107,13 @@ fn durable_identity_wire_contract_is_frozen() {
     assert_eq!(i8::from(CollectionKindId::Map), 2);
     assert_eq!(i8::from(CollectionKindId::Deque), 3);
     assert_eq!(i8::from(CollectionKindId::Set), 4);
+
+    // A set has no payload, so its unit codec token must stay frozen to keep
+    // existing sets readable.
+    let set = set_state::<I64KeyCodec>("s").structural_identity();
+    assert_eq!(set.format_id, "unit");
+    assert_eq!(set.key_format_id, "i64.v1");
+
     // Value is single-cell: its key axis is the unit codec, and that token must
     // stay frozen or existing Value collections silently brick.
     assert_eq!(cart().structural_identity().key_format_id, "unit.v1");
@@ -319,15 +326,11 @@ async fn state_type_namespaces_cells() -> Result<()> {
     use crate::state::cell_key::{CellKey, Coordinate, Section};
     use crate::state::memory::MemoryCells;
     use crate::state::store::CellStore;
-    use crate::state::tests::cell_suite::ScriptedOracle;
-    use crate::state::{CollectionId, CollectionRef, EventRef, StateKey};
+
+    use crate::state::{CollectionId, CollectionRef, StateKey};
     use bytes::Bytes;
 
-    let store = MemoryCellStore::new(
-        MemoryCells::new(),
-        ScriptedOracle::default(),
-        Arc::new(CollectionDefRegistry::default()),
-    );
+    let store = MemoryCellStore::new(MemoryCells::new());
     let key: crate::Key = Arc::from("k");
     let state_key = StateKey::new(Uuid::new_v4(), key);
     let name = StateName::try_new("cart")?;
@@ -355,16 +358,12 @@ async fn state_type_namespaces_cells() -> Result<()> {
         .write_resolved(&fw, &[(cell.clone(), Some(Bytes::from_static(b"fw")))], &[])
         .await?;
 
-    // A resolved cell never consults the oracle, so the probe event is inert.
-    let probe = EventRef::Message {
-        dedup_id: Uuid::from_u128(0),
-    };
     assert_eq!(
-        store.get(app.id(), &cell, probe).await?,
+        CellRead::<Values>::read(&store, app.id(), &cell).await?.0,
         Committed::new(Some(Bytes::from_static(b"app"))),
     );
     assert_eq!(
-        store.get(fw.id(), &cell, probe).await?,
+        CellRead::<Values>::read(&store, fw.id(), &cell).await?.0,
         Committed::new(Some(Bytes::from_static(b"fw"))),
         "the framework-namespaced cell holds its own value",
     );

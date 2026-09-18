@@ -28,9 +28,9 @@ homes — per-file scaffolding clones are how this test tree once doubled:
 | --- | --- |
 | Crate-wide (`integration_test_count`, `test_cassandra_config`; span capture: `captured_spans{,_filtered}`, `GlobalSpans`, `assert_span_relation`, `named`, `sampled_remote_context`) | `src/tests/test_util/mod.rs` |
 | Metric capture (`GlobalMetrics`, `label`, `assert_distinct_labels`) | `src/tests/test_util/metrics.rs` |
-| Consumer middleware (mock contexts, handlers, fixtures) | `src/consumer/middleware/tests/test_support.rs` |
+| Consumer middleware (mock contexts, handlers, fixtures) | `src/consumer/middleware/tests/test_support/mod.rs` |
 | Kafka observation (statistics fixtures: `observing`, `observe`, `unobserved`) | `src/consumer/observer/tests/support.rs` |
-| Keyed state (oracles, cells, collections, `UnavailableState`) | `src/state/tests/support.rs` |
+| Keyed state (cells, collections, `UnavailableState`) | `src/state/tests/support/mod.rs` |
 | Timers (segment/trigger factories, in-memory `TimerManager` harness) | `src/timers/test_support.rs` |
 | Timer stores (store helpers, `KEY_POOL`, suite macros) | `src/timers/store/tests/` |
 | Integration (keyspace/runtime in `mod.rs`; handlers, Kafka fixtures, channel helpers in children) | `tests/common/` |
@@ -51,7 +51,7 @@ shapes and where to see them proven:
 | Round-trip | `decode(encode(x)) == x` | `present_round_trip` in `src/state/fjall/codec/tests.rs` |
 | Oracle correctness | Real impl tracks a simple model op-for-op | `CellModel` + the `run_*_trace` runners in `src/state/tests/cell_suite.rs` |
 | Parity | Two implementations answer identically | `src/consumer/middleware/deduplication/tests/prop_dedup_store.rs` |
-| Idempotence | A second sweep issues zero durable writes | `second_sweep_is_a_no_op` in `src/state/tests/cell_suite.rs` |
+| Idempotence | A second admission preserves state | `prop_admit_soundness` in `src/state/manager/tests.rs` |
 | Crash-recovery equivalence | Recovery converges to committed-or-rolled-back, never half-applied | `run_crash_equivalence_trace` in `src/state/tests/cell_suite.rs` |
 | Monotonicity | Watermarks never move backwards | `src/consumer/partition/offsets/test.rs` |
 
@@ -205,11 +205,10 @@ implementation — e.g. any dedup store vs. `MemoryDeduplicationStore` in
 ### Crash-recovery simulation
 
 A "crash" is modeled by rebuilding the store (`make_store()`) over the same
-warm durable backing — the durable rows and the commit oracle's committed set
+warm durable backing — the durable cells and collection commit evidence
 survive, while the fresh store starts with a cold in-process cache, exactly as
-after a restart. Recovery then runs through the sweep or first-touch; the
-`ScriptedOracle`'s recorded markers decide commit-vs-rollback so both arms are
-exercised. **Never simulate a crash by leaking or forgetting a value** —
+after a restart. Admission resolves the residue through durable collection evidence.
+The trace covers both committed and uncommitted stages. **Never simulate a crash by leaking or forgetting a value** —
 reproduce the on-disk / on-wire state directly (see the Memory rule in
 CLAUDE.md).
 
@@ -221,7 +220,7 @@ To test recovery paths that normal execution cannot produce (a pending
 provisional cell with its event marker and no WAL, a pre-existing identity
 row), write the rows through the store's low-level API — bypassing the type
 whose lifecycle would normally prevent the state — then assert the
-sweep/recovery path cleans it up.
+admission resolves it.
 
 Exemplar: the seed-stale-identity acquire path in
 `src/state/descriptor_identity/tests.rs` (a frozen identity row written
@@ -248,7 +247,7 @@ time manually. A paused-time runtime cannot be shared across iterations
 (state leaks between cases). Ordinary suites share the multi-threaded
 `TEST_RUNTIME` in `tests/common/mod.rs`.
 
-Exemplars: `src/timers/manager/tests.rs`,
+Exemplars: `src/timers/manager/tests/identity.rs`,
 `src/consumer/partition/offsets/test.rs`.
 
 ### Iteration counts from the environment

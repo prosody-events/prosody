@@ -1,25 +1,22 @@
-//! Pure unit tests for the cell-row shape table.
-//!
-//! [`try_decode_cell`] is a pure function over the [`RawCellRow`] tuple, so
-//! every shape — including the legacy null-null residue and the
-//! corruption arms — is checked here without a cluster. This is the cheap guard
-//! against the shape-table regressions a live-Cassandra run would otherwise be
-//! the first to catch.
+//! Cell rows decode valid shapes and reject corrupt metadata.
 
 use super::super::encoding::{
     CASSANDRA_COMPRESSION_BLOCK_BYTES, Encoding, EncodingError, decode_payload, decode_scratch,
     encode_payload, reset_encoding_state, select_encoding, validate_decompression_bound,
 };
 use super::{
-    BorrowedCellTtlRow, CellCorruptReason, FramedKeyedCellRow, RawCellRow, blob_ttl,
-    try_decode_cell, try_decode_keyed_cell, try_decode_provisional_cell_ttl,
+    Body, CellCorruptReason, PointRow, blob_ttl, decode_body, decode_marker_row,
+    try_decode_provisional_cell_ttl,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::EventRef;
 use crate::state::cassandra::cell::INITIAL_VERSION;
 use crate::state::cassandra::error::CassandraCellStoreError;
 use crate::state::cassandra::udt::RawEventRef;
-use crate::state::cell::{Cell, Committed, ProvisionalCell};
+use crate::state::cell::{Cell, Committed, ProvisionalCell, Values};
+use crate::state::marker::{EventMarker, MarkerState, encode_marker_payload};
+use crate::state::tests::support::evidence;
+use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, bail};
 use quickcheck::{QuickCheck, TestResult};
@@ -59,8 +56,11 @@ fn ver() -> i32 {
 
 /// Encodes a payload exactly as the cell store would, so the decoder's
 /// `decode_payload` round-trips it.
-fn blob(s: &str) -> Result<Vec<u8>> {
-    Ok(encode_payload(&Bytes::copy_from_slice(s.as_bytes()), Encoding::Zstd)?.to_vec())
+fn blob(s: &str) -> Result<Bytes> {
+    Ok(encode_payload(
+        &Bytes::copy_from_slice(s.as_bytes()),
+        Encoding::Zstd,
+    )?)
 }
 
 fn message_event() -> EventRef {
@@ -76,8 +76,8 @@ fn raw_event() -> RawEventRef {
 /// `event` NULL, present `data`, no `prev_data` → committed value.
 #[test]
 fn resolved_present() -> Result<()> {
-    let row: RawCellRow = (Some(blob("v")?), None, Some(enc()), Some(ver()), None);
-    let cell = try_decode_cell(row)?;
+    let row: Body<Values> = (Some(blob("v")?), None, Some(enc()), Some(ver()), None);
+    let cell = decode_body::<Values>(row)?;
     assert_eq!(
         cell,
         Cell::Resolved(Committed::new(Some(Bytes::from_static(b"v"))))
@@ -91,8 +91,8 @@ fn resolved_present() -> Result<()> {
 /// its row); the decoder tolerates it for rows written by earlier builds.
 #[test]
 fn resolved_clear_residue_is_not_corrupt() -> Result<()> {
-    let row: RawCellRow = (None, None, Some(enc()), Some(ver()), None);
-    let cell = try_decode_cell(row)?;
+    let row: Body<Values> = (None, None, Some(enc()), Some(ver()), None);
+    let cell = decode_body::<Values>(row)?;
     assert_eq!(cell, Cell::Resolved(Committed::new(None)));
     Ok(())
 }
@@ -100,22 +100,25 @@ fn resolved_clear_residue_is_not_corrupt() -> Result<()> {
 /// A fully-null row decodes to known-absent.
 #[test]
 fn resolved_all_null() -> Result<()> {
-    let row: RawCellRow = (None, None, None, None, None);
-    assert_eq!(try_decode_cell(row)?, Cell::Resolved(Committed::new(None)));
+    let row: Body<Values> = (None, None, None, None, None);
+    assert_eq!(
+        decode_body::<Values>(row)?,
+        Cell::Resolved(Committed::new(None))
+    );
     Ok(())
 }
 
 /// `event` non-NULL, set-over-absent.
 #[test]
 fn provisional_set_over_absent() -> Result<()> {
-    let row: RawCellRow = (
+    let row: Body<Values> = (
         Some(blob("new")?),
         None,
         Some(enc()),
         Some(ver()),
         Some(raw_event()),
     );
-    let cell = try_decode_cell(row)?;
+    let cell = decode_body::<Values>(row)?;
     assert_eq!(
         cell,
         Cell::Provisional(ProvisionalCell::new(
@@ -132,8 +135,8 @@ fn provisional_set_over_absent() -> Result<()> {
 /// over a never-set cell).
 #[test]
 fn provisional_clear_over_absent() -> Result<()> {
-    let row: RawCellRow = (None, None, None, None, Some(raw_event()));
-    let cell = try_decode_cell(row)?;
+    let row: Body<Values> = (None, None, None, None, Some(raw_event()));
+    let cell = decode_body::<Values>(row)?;
     assert_eq!(
         cell,
         Cell::Provisional(ProvisionalCell::new(None, None, message_event()))
@@ -145,14 +148,14 @@ fn provisional_clear_over_absent() -> Result<()> {
 /// The shared encoding describes `prev_data`.
 #[test]
 fn provisional_clear_over_present() -> Result<()> {
-    let row: RawCellRow = (
+    let row: Body<Values> = (
         None,
         Some(blob("old")?),
         Some(enc()),
         Some(ver()),
         Some(raw_event()),
     );
-    let cell = try_decode_cell(row)?;
+    let cell = decode_body::<Values>(row)?;
     assert_eq!(
         cell,
         Cell::Provisional(ProvisionalCell::new(
@@ -167,14 +170,14 @@ fn provisional_clear_over_present() -> Result<()> {
 /// `event` non-NULL, set-over-present: both blobs share the encoding.
 #[test]
 fn provisional_set_over_present() -> Result<()> {
-    let row: RawCellRow = (
+    let row: Body<Values> = (
         Some(blob("new")?),
         Some(blob("old")?),
         Some(enc()),
         Some(ver()),
         Some(raw_event()),
     );
-    let cell = try_decode_cell(row)?;
+    let cell = decode_body::<Values>(row)?;
     assert_eq!(
         cell,
         Cell::Provisional(ProvisionalCell::new(
@@ -190,9 +193,9 @@ fn provisional_set_over_present() -> Result<()> {
 /// this shape.
 #[test]
 fn prev_without_event_is_corrupt() -> Result<()> {
-    let row: RawCellRow = (None, Some(blob("old")?), Some(enc()), Some(ver()), None);
+    let row: Body<Values> = (None, Some(blob("old")?), Some(enc()), Some(ver()), None);
     assert!(matches!(
-        try_decode_cell(row),
+        decode_body::<Values>(row),
         Err(CassandraCellStoreError::CorruptCell(
             CellCorruptReason::PrevWithoutEvent
         ))
@@ -203,9 +206,9 @@ fn prev_without_event_is_corrupt() -> Result<()> {
 /// A present blob with a NULL shared encoding is corrupt (undecodable).
 #[test]
 fn blob_without_encoding_is_corrupt() -> Result<()> {
-    let row: RawCellRow = (Some(blob("v")?), None, None, Some(ver()), None);
+    let row: Body<Values> = (Some(blob("v")?), None, None, Some(ver()), None);
     assert!(matches!(
-        try_decode_cell(row),
+        decode_body::<Values>(row),
         Err(CassandraCellStoreError::CorruptCell(
             CellCorruptReason::BlobWithoutEncoding
         ))
@@ -216,9 +219,9 @@ fn blob_without_encoding_is_corrupt() -> Result<()> {
 /// An unknown `version` stamp is rejected Permanent.
 #[test]
 fn unknown_version_is_rejected() -> Result<()> {
-    let row: RawCellRow = (Some(blob("v")?), None, Some(enc()), Some(2_i32), None);
+    let row: Body<Values> = (Some(blob("v")?), None, Some(enc()), Some(2_i32), None);
     assert!(matches!(
-        try_decode_cell(row),
+        decode_body::<Values>(row),
         Err(CassandraCellStoreError::VersionMismatch {
             stored: 2_i32,
             expected: INITIAL_VERSION
@@ -238,9 +241,9 @@ fn corrupt_event_udt_is_rejected() -> Result<()> {
         time: None,
         tag: None,
     };
-    let row: RawCellRow = (Some(blob("v")?), None, Some(enc()), Some(ver()), Some(bad));
+    let row: Body<Values> = (Some(blob("v")?), None, Some(enc()), Some(ver()), Some(bad));
     assert!(matches!(
-        try_decode_cell(row),
+        decode_body::<Values>(row),
         Err(CassandraCellStoreError::CorruptUdt(_))
     ));
     Ok(())
@@ -357,8 +360,8 @@ fn failed_stream_decode_does_not_poison_the_next_frame() -> Result<()> {
 #[test]
 fn resolved_corrupt_body_is_skipped_only_by_recovery() -> Result<()> {
     let corrupt = [0_u8];
-    let recovery_row: BorrowedCellTtlRow<'_> = (
-        Some(&corrupt),
+    let recovery_row: PointRow<Values> = (
+        Some(Bytes::copy_from_slice(&corrupt)),
         None,
         Some(i16::from(Encoding::Zstd)),
         Some(INITIAL_VERSION),
@@ -368,8 +371,8 @@ fn resolved_corrupt_body_is_skipped_only_by_recovery() -> Result<()> {
     );
     assert_eq!(try_decode_provisional_cell_ttl(recovery_row)?, None);
 
-    let live = try_decode_cell((
-        Some(&corrupt),
+    let live = decode_body::<Values>((
+        Some(Bytes::copy_from_slice(&corrupt)),
         None,
         Some(i16::from(Encoding::Zstd)),
         Some(INITIAL_VERSION),
@@ -403,16 +406,14 @@ fn decoded_cell_does_not_retain_its_response_frame() -> Result<()> {
         bytes: b"prefixrawsuffix".to_vec(),
         dropped: dropped.clone(),
     });
-    let row: FramedKeyedCellRow = (
-        0,
-        vec![1],
+    let row: Body<Values> = (
         Some(frame.slice(6..9)),
         None,
         Some(i16::from(Encoding::Raw)),
         Some(INITIAL_VERSION),
         None,
     );
-    let (_, cell) = try_decode_keyed_cell(row)?;
+    let cell = decode_body::<Values>(row)?;
     drop(frame);
 
     assert!(dropped.load(Ordering::Relaxed));
@@ -452,4 +453,71 @@ fn blob_ttl_coalesces_the_present_blobs_ttl() {
     assert_eq!(blob_ttl(Some(5_i32), Some(9_i32)), Some(5_i32));
     assert_eq!(blob_ttl(None, Some(9_i32)), Some(9_i32));
     assert_eq!(blob_ttl(None, None), None);
+}
+
+/// Coordinates select the marker shape. Both rows require a valid payload.
+#[test]
+fn prop_marker_slice_decodes_by_coordinate() {
+    fn prop(coordinate: Vec<u8>, legacy: bool, metadata: i32) -> Result<bool> {
+        let marker = EventMarker::frozen(message_event(), &[], &[], &evidence([].into(), None));
+        let payload = encode_marker_payload(&marker)?;
+        let mut state = MarkerState::default();
+        let legacy_ttl = Some(CompactDuration::new(3600));
+        let data = if legacy {
+            &payload[..8]
+        } else {
+            payload.as_ref()
+        };
+        decode_marker_row(
+            &mut state,
+            (
+                &[],
+                Some(data),
+                Some(i16::from(Encoding::Raw)),
+                Some(if legacy { 1_i32 } else { 2_i32 }),
+                Some(raw_event()),
+            ),
+            legacy_ttl,
+        )?;
+        assert_eq!(
+            state.staged.as_ref().map(EventMarker::evidence_ttl),
+            Some(CompactDuration::new(3600))
+        );
+        assert!(
+            decode_marker_row(
+                &mut state,
+                (&[1], None, Some(-1), Some(metadata), Some(raw_event())),
+                None,
+            )
+            .is_err()
+        );
+        decode_marker_row(
+            &mut state,
+            (
+                &[1],
+                Some(&payload),
+                Some(i16::from(Encoding::Raw)),
+                Some(2_i32),
+                Some(raw_event()),
+            ),
+            None,
+        )?;
+        assert_eq!(
+            state.committed.as_ref().map(|marker| marker.event),
+            Some(message_event())
+        );
+        // Prefix every generated coordinate with 2, outside both valid addresses.
+        let invalid: Vec<_> = [2_u8].into_iter().chain(coordinate).collect();
+        Ok(matches!(
+            decode_marker_row(
+                &mut state,
+                (&invalid, None, None, None, Some(raw_event())),
+                None
+            ),
+            Err(CassandraCellStoreError::CorruptCell(
+                CellCorruptReason::MarkerCoordinate
+            ))
+        ))
+    }
+    QuickCheck::new().quickcheck(prop as fn(Vec<u8>, bool, i32) -> Result<bool>);
 }

@@ -1,48 +1,22 @@
-//! The cross-cutting per-partition backend abstraction for keyed state.
-//!
-//! [`StateBackend`] bundles the three per-partition stores behind one type
-//! parameter; [`PartitionBackend`] is its one concrete shape; and
-//! [`StateBackendFactory`] mints it per partition. These belong to no leaf
-//! store, so they live here.
-//!
-//! The module is `pub(crate)`: the bundle trait and its factory bound the
-//! `pub` [`StateManager`](super::manager::StateManager) and
-//! [`SessionParts`](super::session::SessionParts), so they stay nominally
-//! `pub` (a literal `pub(crate) trait` would trip `private_bounds` on those
-//! public structs), but capping the module keeps every name here
-//! crate-internal — none is reachable from the crate root, and the untyped
-//! [`CellStore`] read surface never leaks out.
+//! Bundles the partition stores and admission checks behind one type parameter.
+//! The module remains private because these dependencies serve framework code.
 
 use super::store::CellStore;
+use crate::Key;
+use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::error::ClassifyError;
 use crate::state::descriptor_identity::DescriptorIdentityStore;
-use crate::state::oracle::CommitOracle;
 use crate::{Partition, Topic};
-#[cfg(test)]
 use std::convert::Infallible;
 use std::error::Error;
+use std::future::{Future, ready};
 
-/// The per-partition backend bundle: the one uniform durable cell store, the
-/// shared commit oracle, and the shared descriptor-identity store — behind one
-/// type parameter so the session and manager name only `B`.
-///
-/// The bundling exists for **type-parameter compression**: the three stores
-/// travel behind one `B`, so [`StateManager`](super::manager::StateManager) and
-/// the session name a single parameter instead of threading the
-/// [`PartitionBackend`] `<O, I, C>` shape through every generic signature. A
-/// deliberate ruling — do not inline the three back out.
-///
-/// Minted as one unit by [`StateBackendFactory::for_partition`] so the oracle
-/// the sessions stage against (for the dedup marker) and the oracle the cell
-/// store resolves provisional cells through are the *same* instance, and the
-/// fjall workspace backing the committed-value cache is opened once. The
-/// per-event dirty workspace is not part of the backend — it is the in-memory
-/// `DirtyStore` the session's `Overlay` owns and clears per event, never a
-/// durability or recovery source.
+/// Bundles partition dependencies behind one type parameter.
+/// This trait exists for type-parameter compression across managers and
+/// sessions.
 pub trait StateBackend: Send + Sync + 'static {
-    /// The commit oracle, shared with the cell store, so a provisional cell
-    /// resolves against the exact commit record the one marker certifies.
-    type Oracle: CommitOracle;
+    /// The shared message dedup store.
+    type Dedup: DeduplicationStore;
 
     /// The shared descriptor-identity control-plane store, validated eagerly
     /// at acquisition. It is decoupled from the cell data store — the cell
@@ -53,9 +27,14 @@ pub trait StateBackend: Send + Sync + 'static {
     /// production, `MemoryCellStore` in tests). The session wraps it in the
     /// per-event dirty `Overlay`.
     type Cell: CellStore;
-    /// The shared commit oracle (the settle boundary records the marker
-    /// through it).
-    fn oracle(&self) -> Self::Oracle;
+    /// Returns the shared message dedup store.
+    fn dedup(&self) -> Self::Dedup;
+
+    /// The assignment admission proof store.
+    type Checks: AdmissionChecks;
+
+    /// Returns the assignment admission proof store.
+    fn checks(&self) -> Self::Checks;
 
     /// The shared descriptor-identity store.
     fn identity(&self) -> Self::Identity;
@@ -67,36 +46,44 @@ pub trait StateBackend: Send + Sync + 'static {
 /// The one concrete backend every factory mints; [`StateBackend`] projects its
 /// store type so callers name only `B`.
 #[derive(Clone, Debug)]
-pub struct PartitionBackend<O, I, C> {
-    oracle: O,
+pub struct PartitionBackend<D, I, C, K> {
+    dedup: D,
     identity: I,
     cell: C,
+    checks: K,
 }
 
-impl<O, I, C> PartitionBackend<O, I, C> {
-    /// Bundles the shared oracle, descriptor-identity store, and cell store.
+impl<D, I, C, K> PartitionBackend<D, I, C, K> {
+    /// Bundles the stores and admission checks.
     #[must_use]
-    pub fn new(oracle: O, identity: I, cell: C) -> Self {
+    pub fn new(dedup: D, identity: I, cell: C, checks: K) -> Self {
         Self {
-            oracle,
+            dedup,
             identity,
             cell,
+            checks,
         }
     }
 }
 
-impl<O, I, C> StateBackend for PartitionBackend<O, I, C>
+impl<D, I, C, K> StateBackend for PartitionBackend<D, I, C, K>
 where
-    O: CommitOracle,
+    D: DeduplicationStore,
     I: DescriptorIdentityStore + Clone,
     C: CellStore,
+    K: AdmissionChecks,
 {
     type Cell = C;
+    type Checks = K;
+    type Dedup = D;
     type Identity = I;
-    type Oracle = O;
 
-    fn oracle(&self) -> O {
-        self.oracle.clone()
+    fn dedup(&self) -> D {
+        self.dedup.clone()
+    }
+
+    fn checks(&self) -> K {
+        self.checks.clone()
     }
 
     fn identity(&self) -> I {
@@ -108,21 +95,8 @@ where
     }
 }
 
-/// Process-wide factory minting the per-partition keyed-state [`StateBackend`].
-///
-/// Both the commit oracle's timer-tag reads and the cell store are
-/// partition-scoped (timer tags live in segment-keyed tables; the fjall
-/// workspace is per assignment), so the backend cannot be a single global
-/// value — the keyed-state manager calls [`Self::for_partition`] at partition
-/// acquisition and surfaces failures on the retry-until-shutdown loop.
-///
-/// `T` is the partition's trigger-store handle, passed down from the
-/// partition loop so the backend's commit oracle reads timer tags **through
-/// the same store instance the partition writes through** — one identity,
-/// one value. Minting a sibling store from a provider is not equivalent: a
-/// store may answer tag reads from a per-instance cache that only its own
-/// writes keep current. Factories whose oracle is supplied whole (e.g. the
-/// test-only `SharedStateBackend`) ignore the handle and accept any `T`.
+/// Creates the keyed-state dependencies for each partition assignment.
+/// The workspace lives until partition revocation.
 pub trait StateBackendFactory<T>: Clone + Send + Sync + 'static {
     /// The per-partition backend bundle this factory mints.
     type Backend: StateBackend;
@@ -130,14 +104,11 @@ pub trait StateBackendFactory<T>: Clone + Send + Sync + 'static {
     /// Error returned when a partition's backend cannot be materialized.
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
-    /// Mints the backend for `(topic, partition)`, wiring `triggers` — the
-    /// partition's trigger-store handle — into the commit oracle's timer
-    /// half.
+    /// Creates the backend for the partition.
     ///
     /// # Errors
     ///
-    /// Returns [`Self::Error`] when partition-scoped state (e.g. the
-    /// fjall workspace) cannot be opened.
+    /// Returns an error if the assignment workspace cannot open.
     fn for_partition(
         &self,
         topic: Topic,
@@ -146,45 +117,37 @@ pub trait StateBackendFactory<T>: Clone + Send + Sync + 'static {
     ) -> Result<Self::Backend, Self::Error>;
 }
 
-/// Partition-agnostic [`StateBackendFactory`]: clones the same cell store,
-/// identity store, and oracle for every partition.
-///
-/// Test-only: suits memory-backed compositions whose stores are not
-/// partition-scoped; production uses the partition-scoped factories in
-/// [`production`](super::production). The supplied `cell` must already embed
-/// `oracle` (it resolves provisional cells through it), so the two are the same
-/// instance.
+/// Clones shared test stores for each partition.
 #[cfg(test)]
 #[derive(Clone, Debug)]
-pub struct SharedStateBackend<S, I, O> {
+pub struct SharedStateBackend<S, I, D> {
     cell: S,
     identity: I,
-    oracle: O,
+    dedup: D,
 }
 
 #[cfg(test)]
-impl<S, I, O> SharedStateBackend<S, I, O> {
+impl<S, I, D> SharedStateBackend<S, I, D> {
     /// Creates a backend factory that hands out clones of the supplied parts.
     #[must_use]
-    pub fn new(cell: S, identity: I, oracle: O) -> Self {
+    pub fn new(cell: S, identity: I, dedup: D) -> Self {
         Self {
             cell,
             identity,
-            oracle,
+            dedup,
         }
     }
 }
 
-/// The oracle is supplied whole at construction, so the partition's
-/// trigger-store handle is ignored and any `T` is accepted.
+/// Shared test stores do not use the trigger handle.
 #[cfg(test)]
-impl<S, I, O, T> StateBackendFactory<T> for SharedStateBackend<S, I, O>
+impl<S, I, D, T> StateBackendFactory<T> for SharedStateBackend<S, I, D>
 where
     S: CellStore + Clone,
     I: DescriptorIdentityStore + Clone,
-    O: CommitOracle,
+    D: DeduplicationStore,
 {
-    type Backend = PartitionBackend<O, I, S>;
+    type Backend = PartitionBackend<D, I, S, ()>;
     type Error = Infallible;
 
     fn for_partition(
@@ -194,9 +157,47 @@ where
         _triggers: T,
     ) -> Result<Self::Backend, Self::Error> {
         Ok(PartitionBackend::new(
-            self.oracle.clone(),
+            self.dedup.clone(),
             self.identity.clone(),
             self.cell.clone(),
+            (),
         ))
+    }
+}
+
+/// Stores admission proofs for one partition assignment.
+/// A checked key has completed admission, including local repairs for Permanent
+/// errors. Each later settle resolves its collections or removes the proof.
+/// Finalize removes it after a failed stage. Staged removes it when shutdown
+/// interrupts promotion or rollback. A failed unmark must disable the proof
+/// before it returns an error.
+pub trait AdmissionChecks: Clone + Send + Sync + 'static {
+    /// The classified storage error.
+    type Error: ClassifyError + Error + Send + Sync + 'static;
+
+    /// Tests whether admission completed for this key.
+    fn contains(&self, key: &Key) -> impl Future<Output = Result<bool, Self::Error>> + Send;
+
+    /// Records complete admission.
+    fn mark(&self, key: &Key) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Removes admission proof before another dispatch can use it.
+    fn unmark(&self, key: &Key) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// Memory stores have no assignment workspace. Each event admits again.
+impl AdmissionChecks for () {
+    type Error = Infallible;
+
+    fn contains(&self, _key: &Key) -> impl Future<Output = Result<bool, Self::Error>> {
+        ready(Ok(false))
+    }
+
+    fn mark(&self, _key: &Key) -> impl Future<Output = Result<(), Self::Error>> {
+        ready(Ok(()))
+    }
+
+    fn unmark(&self, _key: &Key) -> impl Future<Output = Result<(), Self::Error>> {
+        ready(Ok(()))
     }
 }

@@ -3,27 +3,23 @@
 //! A set stores one zero-byte cell per member. It shares the map keyset
 //! format and keeps the same membership rules.
 
-use super::map::{
-    Keyset, KeysetLayout, MapKeysetCodec, MapKeysetKey, MapStateError, PriorKeyset,
-    decoded_key_list, is_oversized, read_keyset_state, subtract_keyset, update_keyset,
-};
+pub use super::map::SetQuery;
+use super::map::membership::{self, KeysetLayout};
+use super::map::{KeyItem, KeysetQuery, MapKeysetCodec, MapKeysetKey, MapStateError, Query};
 use super::{CollectionSpec, Descriptor, Keyed};
 use crate::codec::{UnitCodec, UnitCodecError};
-use crate::state::cell_key::{Direction, ScanEdge};
+use crate::state::cell_key::Direction;
 use crate::state::collection::{
-    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, Constraints,
-    JOURNAL_INLINE, Plan, StateSession, WritableStateSession, collection_layout,
-    collection_methods, same_token, spec_matches,
+    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, StateSession,
+    WritableStateSession, collection_layout, collection_methods, same_token, spec_matches,
 };
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
-use crate::state::{CollectionKindId, StoreOutcome};
-use async_stream::try_stream;
+use crate::state::{CollectionKindId, StateName, StoreOutcome};
 use educe::Educe;
-use futures::stream::{Stream, StreamExt};
+use futures::stream::Stream;
 use std::borrow::Borrow;
 use std::fmt::Display;
-use std::num::NonZeroUsize;
-use tracing::{Instrument, info_span, instrument};
+use tracing::{Span, info_span, instrument};
 
 collection_layout! {
     /// The set collection kind has one keyset cell and one cell per member.
@@ -39,14 +35,14 @@ collection_layout! {
 
 impl<KC: OrderedKeyCodec> KeysetLayout for SetKind<KC> {
     const KEYSET: CellFamily<Self, Keyed<MapKeysetKey, MapKeysetCodec>> = Self::KEYSET;
+    const MEMBERS: CellFamily<Self, Self::Cell> = Self::MEMBERS;
+
+    fn stream_span(collection: &StateName, dir: Direction, projection: &'static str) -> Span {
+        info_span!("set.stream", collection = collection.as_str(), direction = ?dir, projection)
+    }
 }
 
 type FrozenLayout = SetKind<I64KeyCodec>;
-const SET_MAX_MUTATIONS: usize = 2;
-const _: () = assert!(
-    SET_MAX_MUTATIONS <= JOURNAL_INLINE,
-    "a set operation must fit in the inline journal"
-);
 const _: () = {
     let families = <FrozenLayout as CollectionLayout>::DESCRIPTOR;
     assert!(families.len() == 2, "Set has two cell families");
@@ -73,8 +69,6 @@ const _: () = {
         "Set has no reserved sections"
     );
 };
-
-type SetItem<KC> = Result<<KC as OrderedKeyCodec>::Key, SetStateError>;
 
 /// Descriptor for a presence-only ordered set.
 pub type SetDescriptor<KC> = Descriptor<SetKind<KC>>;
@@ -103,113 +97,29 @@ pub struct SetHandle<S, KC> {
     cells: Collection<S, SetKind<KC>>,
 }
 
-/// A directional set member stream query.
-///
-/// Build one with [`SetHandle::query`]. Finish it with [`keys`](Self::keys).
-/// `from` and `to` include their member. `after` and `before` exclude their
-/// member. State all edges in iteration order. A later call for the same edge
-/// replaces the earlier call. A start past the end yields an empty stream.
-#[must_use]
-pub struct SetQuery<'a, S, KC> {
-    handle: &'a SetHandle<S, KC>,
-    dir: Direction,
-    constraints: Constraints,
-}
-
-impl<'a, S, KC> SetQuery<'a, S, KC>
-where
-    S: StateSession,
-    KC: OrderedKeyCodec + 'static,
-    KC::Borrowed: Display,
-{
-    /// Starts at `key`.
-    pub fn from<Q>(mut self, key: &Q) -> Self
-    where
-        Q: Borrow<KC::Borrowed> + ?Sized,
-    {
-        self.constraints.start = ScanEdge::Included(KC::encode(key.borrow()));
-        self
-    }
-
-    /// Starts after `key`.
-    pub fn after<Q>(mut self, key: &Q) -> Self
-    where
-        Q: Borrow<KC::Borrowed> + ?Sized,
-    {
-        self.constraints.start = ScanEdge::Excluded(KC::encode(key.borrow()));
-        self
-    }
-
-    /// Stops at `key`.
-    pub fn to<Q>(mut self, key: &Q) -> Self
-    where
-        Q: Borrow<KC::Borrowed> + ?Sized,
-    {
-        self.constraints.end = ScanEdge::Included(KC::encode(key.borrow()));
-        self
-    }
-
-    /// Stops before `key`.
-    pub fn before<Q>(mut self, key: &Q) -> Self
-    where
-        Q: Borrow<KC::Borrowed> + ?Sized,
-    {
-        self.constraints.end = ScanEdge::Excluded(KC::encode(key.borrow()));
-        self
-    }
-
-    /// Sets the maximum number of present members.
-    pub fn limit(mut self, limit: NonZeroUsize) -> Self {
-        self.constraints.limit = Some(limit);
-        self
-    }
-
-    /// Replaces all query constraints.
-    pub(crate) fn with_constraints(mut self, constraints: Constraints) -> Self {
-        self.constraints = constraints;
-        self
-    }
-
-    /// Streams live members in the query direction.
-    pub fn keys(self) -> impl Stream<Item = SetItem<KC>> + 'a {
-        let span = info_span!(
-            "set.keys",
-            collection = self.handle.cells.name().as_str(),
-            direction = ?self.dir,
-        );
-        try_stream! {
-            let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
-            let inner = plan.keys(self.constraints);
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().instrument(span.clone()).await {
-                yield item?;
-            }
-        }
-    }
-}
-
 #[collection_methods(field = cells, session = S)]
 impl<S, KC> SetHandle<S, KC>
 where
     S: StateSession,
     KC: OrderedKeyCodec + 'static,
-    KC::Borrowed: Display,
 {
+    pub(crate) fn cells(&self) -> &Collection<S, SetKind<KC>> {
+        &self.cells
+    }
+
     /// Inserts `key` into the set.
     ///
     /// # Errors
     ///
     /// Returns a codec error or a session access error.
-    #[instrument(name = "set.insert", skip_all, fields(collection = self.cells.name().as_str(), set.key = %<Q as Borrow<KC::Borrowed>>::borrow(key)), err)]
+    #[instrument(name = "set.insert", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key.borrow()), err)]
     #[write(op)]
     pub async fn insert<Q>(&self, key: &Q) -> Result<(), SetStateError>
     where
         Q: Borrow<KC::Borrowed> + ?Sized,
+        KC::Borrowed: Display,
     {
-        let coordinate = KC::encode(key.borrow());
-        let prior = read_keyset_state(op).await?;
-        op.set(SetKind::<KC>::MEMBERS, key, ())?;
-        update_keyset(op, coordinate, prior)
+        membership::insert(op, key.borrow(), ()).await
     }
 
     /// Removes `key` from the set.
@@ -217,16 +127,14 @@ where
     /// # Errors
     ///
     /// Returns a session access error.
-    #[instrument(name = "set.remove", skip_all, fields(collection = self.cells.name().as_str(), set.key = %<Q as Borrow<KC::Borrowed>>::borrow(key)), err)]
+    #[instrument(name = "set.remove", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key.borrow()), err)]
     #[write(op)]
     pub async fn remove<Q>(&self, key: &Q) -> Result<(), SetStateError>
     where
         Q: Borrow<KC::Borrowed> + ?Sized,
+        KC::Borrowed: Display,
     {
-        let coordinate = KC::encode(key.borrow());
-        let prior = read_keyset_state(op).await?;
-        op.clear(SetKind::<KC>::MEMBERS, key);
-        subtract_keyset(op, &coordinate, prior)
+        membership::remove(op, key.borrow()).await
     }
 
     /// Tests whether `key` belongs to the set.
@@ -234,31 +142,31 @@ where
     /// # Errors
     ///
     /// Returns a session access error.
-    #[instrument(name = "set.contains", skip_all, fields(collection = self.cells.name().as_str(), set.key = %<Q as Borrow<KC::Borrowed>>::borrow(key)), err)]
+    #[instrument(name = "set.contains", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key.borrow()), err)]
     #[read(op)]
     pub async fn contains<Q>(&self, key: &Q) -> Result<bool, SetStateError>
     where
         Q: Borrow<KC::Borrowed> + ?Sized,
+        KC::Borrowed: Display,
     {
-        Ok(op.contains(SetKind::<KC>::MEMBERS, key).await?)
+        Ok(op.contains(SetKind::<KC>::MEMBERS, key.borrow()).await?)
     }
 
-    /// Tests each key for membership in input order. The result reserves the
-    /// iterator's lower size bound. An exact-size iterator allocates once.
+    /// Tests each key for membership in input order.
     ///
     /// # Errors
     ///
     /// Returns a session access error.
     #[instrument(name = "set.contains_many", skip_all, fields(collection = self.cells.name().as_str()), err)]
     #[read(op)]
-    pub async fn contains_many<'a, I, Q>(&self, keys: I) -> Result<Vec<bool>, SetStateError>
+    pub async fn contains_many<'a, Q, I>(&self, keys: I) -> Result<Vec<bool>, SetStateError>
     where
+        Q: Borrow<KC::Borrowed> + Sync + ?Sized + 'a,
         I: IntoIterator<Item = &'a Q>,
         I::IntoIter: Send,
-        Q: Borrow<KC::Borrowed> + Sync + ?Sized + 'a,
     {
         Ok(op
-            .contains_many(SetKind::<KC>::MEMBERS, keys.into_iter())
+            .contains_many(SetKind::<KC>::MEMBERS, keys.into_iter().map(Borrow::borrow))
             .await?
             .into_vec())
     }
@@ -275,69 +183,28 @@ where
         Ok(())
     }
 
-    #[read(op)]
-    async fn stream_plan(
-        &self,
-        dir: Direction,
-    ) -> Result<Plan<S, Keyed<KC, UnitCodec>>, SetStateError> {
-        // Keep this plan local because its member family differs from Map's value
-        // family.
-        let coordinates = match read_keyset_state(op).await? {
-            PriorKeyset::Absent => {
-                return Ok(Plan::Points(op.coordinates(
-                    SetKind::<KC>::MEMBERS,
-                    Vec::new(),
-                    dir,
-                )));
-            }
-            PriorKeyset::Malformed | PriorKeyset::Decoded(Keyset::Overflowed) => {
-                return Ok(Plan::Scan(op.range(SetKind::<KC>::MEMBERS, dir)));
-            }
-            PriorKeyset::Decoded(Keyset::Tracked(coordinates)) => coordinates,
-        };
-        if is_oversized(&coordinates, op.keyset_limit()) {
-            return Ok(Plan::Scan(op.range(SetKind::<KC>::MEMBERS, dir)));
-        }
-        let Some(mut keys) = decoded_key_list::<KC>(&coordinates) else {
-            return Ok(Plan::Scan(op.range(SetKind::<KC>::MEMBERS, dir)));
-        };
-        if dir == Direction::Backward {
-            keys.reverse();
-        }
-        Ok(Plan::Points(op.coordinates(
-            SetKind::<KC>::MEMBERS,
-            keys,
-            dir,
-        )))
-    }
-
     /// Streams live members in the direction `dir`.
-    pub fn keys(&self, dir: Direction) -> impl Stream<Item = SetItem<KC>> + '_ {
+    pub fn keys(&self, dir: Direction) -> impl Stream<Item = KeyItem<SetKind<KC>>> + '_ {
         self.query(dir).keys()
     }
 
     /// Builds a directional set query.
     pub fn query(&self, dir: Direction) -> SetQuery<'_, S, KC> {
-        SetQuery {
-            handle: self,
-            dir,
-            constraints: Constraints::default(),
-        }
+        KeysetQuery::new(&self.cells, Query::new(dir))
     }
 
     /// Reports whether the set has no live members.
+    ///
+    /// This reads the member section, not the keyset. After a split commit
+    /// leaves keyset residue, it can report a live member that `keys` does not
+    /// list.
     ///
     /// # Errors
     ///
     /// Returns a key codec error or a session access error.
     #[instrument(name = "set.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err)]
     pub async fn is_empty(&self) -> Result<bool, SetStateError> {
-        let keys = self
-            .query(Direction::Forward)
-            .limit(NonZeroUsize::MIN)
-            .keys();
-        futures::pin_mut!(keys);
-        Ok(keys.next().await.transpose()?.is_none())
+        membership::is_empty(&self.cells).await
     }
 
     /// Commits buffered set operations.
@@ -373,14 +240,11 @@ where
 }
 
 impl<KC> Descriptor<SetKind<KC>> {
-    /// Sets the maximum member count for tracked reads. Larger sets use
-    /// scans.
+    /// Sets the number of live members the set tracks before overflow.
+    /// The map descriptor's `keyset_limit` documents the shared contract.
     #[must_use]
     pub fn keyset_limit(mut self, limit: usize) -> Self {
         self.def.keyset_limit = limit;
         self
     }
 }
-
-#[cfg(test)]
-mod tests;
