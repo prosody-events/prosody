@@ -259,9 +259,3 @@ impl FallibleHandler for StagingTransientHandler {
 
     async fn shutdown(self) {}
 }
-
-impl SettlementHandler for StagingTransientHandler {
-    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
-        Settlement::Final
-    }
-}

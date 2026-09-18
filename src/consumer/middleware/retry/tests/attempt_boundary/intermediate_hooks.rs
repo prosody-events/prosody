@@ -90,12 +90,6 @@ impl FallibleHandler for IntermediateHookHandler {
     async fn shutdown(self) {}
 }
 
-impl SettlementHandler for IntermediateHookHandler {
-    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
-        Settlement::Final
-    }
-}
-
 /// The intermediate hook is state-dead: the between-attempts `after_abort`
 /// holds the EXPIRED pre-verb context (pinned at the failed attempt, the
 /// epoch already bumped), so both its `get()` and its `commit()` error

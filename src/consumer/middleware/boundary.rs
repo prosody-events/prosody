@@ -9,13 +9,12 @@ use crate::timers::UncommittedTimer;
 
 /// Runs a fallible handler through the shared settlement boundary.
 /// Each invocation produces one result and one apply hook.
-/// Successful final results stage cells, promote, record dedup, then commit the
-/// source. Bypassed results commit the source without state writes.
-/// Permanent errors record dedup best-effort; transient errors commit without
-/// it. Terminal errors abort the source.
+/// `Final` stages cells, promotes them, records the marker, and commits the
+/// source. `Rejected` discards state, records the marker best effort, and
+/// commits the source. `Bypassed` discards state and commits the source without
+/// a marker. `Abandoned` discards state and aborts the source without a marker.
 /// [`RetryHandler`](crate::consumer::middleware::retry::RetryHandler) uses the
-/// same boundary. The internal settlement classification decides whether a
-/// result needs settlement.
+/// same boundary.
 pub trait FallibleEventHandler: FallibleHandler {
     /// Called when message processing fails.
     fn on_message_error(&self, _error: &Self::Error) {}

@@ -276,24 +276,17 @@ where
         match result {
             // Inner ran and succeeded: its result is the dispatch's outcome.
             Ok(FailureTopicOutput::Inner(output)) => T::settlement(Ok(output)),
-            // Routed to the DLQ: the outcome lives there — nothing here may
-            // stage or record.
+            // The failure topic durably owns the outcome.
             Ok(FailureTopicOutput::Routed(_)) => Settlement::Bypassed,
             // Inner ran and its error surfaced un-rescued.
             Err(FailureTopicError::Handler(error)) => T::settlement(Err(error)),
-            // Marker eligibility follows the INNER error, guarded by its
-            // category, even though the retry-facing classification is the
-            // producer's:
-            // - a Permanent inner would have certified on its own (it is final regardless of the
-            //   DLQ), so delegate its settlement;
-            // - a Transient inner never certifies — the message is neither handled nor in the DLQ,
-            //   so a marker here would silently filter its redelivery under a Permanent producer
-            //   error. An unconditional delegate would bottom out at the leaf's `Final` and do
-            //   exactly that.
-            Err(FailureTopicError::DlqSendFailed { inner, .. }) => match inner.classify_error() {
-                ErrorCategory::Permanent => T::settlement(Err(inner)),
-                _ => Settlement::Bypassed,
-            },
+            Err(FailureTopicError::DlqSendFailed { producer, inner }) => {
+                match producer.classify_error() {
+                    // The failure record cannot send. Keep the inner action.
+                    ErrorCategory::Permanent => T::settlement(Err(inner)),
+                    ErrorCategory::Transient | ErrorCategory::Terminal => Settlement::Abandoned,
+                }
+            }
         }
     }
 }

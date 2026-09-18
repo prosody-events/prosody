@@ -44,6 +44,18 @@ pub use error::{CassandraDeferStoreError, DeferInitError};
 pub use message::MessageDeferMiddleware;
 pub use timer::{TimerDeferMiddleware, TimerDeferProvider};
 
+/// The inner result that selects a defer handler's apply hook.
+#[derive(Debug)]
+pub enum DeferOutput<O, E> {
+    /// Forward the surrounding hook with the inner output.
+    Inner(O),
+    /// The inner handler did not run. Suppress both hooks.
+    NoInner,
+    /// The defer layer captured an inner error for retry.
+    /// Call `after_abort` with this error.
+    Deferred(E),
+}
+
 // ============================================================================
 // Utility Functions
 // ============================================================================

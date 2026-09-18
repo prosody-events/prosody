@@ -17,21 +17,22 @@
 //! 5. **Success/Failure**: On success advance queue, on transient re-defer, on
 //!    permanent skip
 //!
-//! # Apply hooks
+//! Deferred keys have a retry timer for pending work.
+//! A bookkeeping failure abandons the source.
+//! Each queue append re-arms a missing timer.
+//! Completed deferral commits the source without state changes or a message
+//! marker.
 //!
-//! The inner is invoked at most once per dispatch. [`TimerDeferOutput`]
-//! encodes the routing: `Inner` forwards the framework's chosen hook,
-//! `Deferred` always fires `after_abort` (the original timer's retry is
-//! coming even though this dispatch's own commit still advances — `Bypassed`,
-//! no message marker records), and `NoInner` suppresses both.
+//! The inner handler runs at most once per dispatch.
+//! [`DeferOutput`] selects its apply hook.
 
 use super::context::TimerDeferContext;
 use super::store::TimerDeferStore;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::DeferralDecider;
 use crate::consumer::middleware::defer::error::DeferError;
+use crate::consumer::middleware::defer::{DeferConfiguration, DeferOutput};
 use crate::consumer::middleware::{FallibleHandler, Settlement, SettlementHandler};
 use crate::consumer::{DemandType, Keyed};
 use crate::telemetry::partition::TelemetryPartitionSender;
@@ -40,22 +41,6 @@ use crate::{Partition, Topic};
 use std::sync::Arc;
 
 mod operations;
-
-/// Output of [`TimerDeferHandler`] dispatches; drives apply-hook routing.
-///
-/// See the module-level apply-hooks section.
-#[derive(Debug)]
-pub enum TimerDeferOutput<O, E> {
-    /// Inner ran and produced an output; forward the surrounding hook.
-    Inner(O),
-    /// Inner did not run (orphan `DeferredTimer` or queue-append for an
-    /// already-deferred key) — suppress both apply hooks.
-    NoInner,
-    /// Inner ran and returned a transient error captured for retry. Both
-    /// hooks fire `after_abort(Err(e))`: the `DeferredTimer` will
-    /// re-dispatch the same logical event.
-    Deferred(E),
-}
 
 /// Per-partition handler wrapping an inner handler with timer defer logic.
 ///
@@ -93,8 +78,8 @@ where
 {
     type Error = DeferError<S::Error, T::Error>;
     /// Encodes the inner's outcome; drives apply-hook routing. See
-    /// [`TimerDeferOutput`].
-    type Output = TimerDeferOutput<T::Output, T::Error>;
+    /// [`DeferOutput`].
+    type Output = DeferOutput<T::Output, T::Error>;
     type Payload = T::Payload;
 
     async fn on_message<C>(
@@ -113,7 +98,7 @@ where
         self.handler
             .on_message(wrapped_context, message, demand_type)
             .await
-            .map(TimerDeferOutput::Inner)
+            .map(DeferOutput::Inner)
             .map_err(DeferError::Handler)
     }
 
@@ -131,7 +116,7 @@ where
         self.handler
             .on_excise(context, message, demand_type)
             .await
-            .map(TimerDeferOutput::Inner)
+            .map(DeferOutput::Inner)
             .map_err(DeferError::Handler)
     }
 
@@ -167,7 +152,7 @@ where
                 .handler
                 .on_timer(wrapped_context, trigger, demand_type)
                 .await
-                .map(TimerDeferOutput::Inner)
+                .map(DeferOutput::Inner)
                 .map_err(DeferError::Handler),
         }
     }
@@ -185,16 +170,16 @@ where
         // - Store/Timer/...: defer-layer error before/after inner work; no inner apply
         //   work to forward -> suppress.
         match result {
-            Ok(TimerDeferOutput::Inner(output)) => {
+            Ok(DeferOutput::Inner(output)) => {
                 self.handler.after_commit(context, Ok(output)).await;
             }
-            Ok(TimerDeferOutput::Deferred(inner_err)) => {
+            Ok(DeferOutput::Deferred(inner_err)) => {
                 self.handler.after_abort(context, Err(inner_err)).await;
             }
             Err(DeferError::Handler(error)) => {
                 self.handler.after_commit(context, Err(error)).await;
             }
-            Ok(TimerDeferOutput::NoInner) | Err(_) => {}
+            Ok(DeferOutput::NoInner) | Err(_) => {}
         }
     }
 
@@ -207,16 +192,16 @@ where
         // dispatch is being rolled back regardless of whether the outer
         // commit/abort decision advanced this dispatch's own commit.
         match result {
-            Ok(TimerDeferOutput::Inner(output)) => {
+            Ok(DeferOutput::Inner(output)) => {
                 self.handler.after_abort(context, Ok(output)).await;
             }
-            Ok(TimerDeferOutput::Deferred(inner_err)) => {
+            Ok(DeferOutput::Deferred(inner_err)) => {
                 self.handler.after_abort(context, Err(inner_err)).await;
             }
             Err(DeferError::Handler(error)) => {
                 self.handler.after_abort(context, Err(error)).await;
             }
-            Ok(TimerDeferOutput::NoInner) | Err(_) => {}
+            Ok(DeferOutput::NoInner) | Err(_) => {}
         }
     }
 
@@ -234,21 +219,18 @@ where
     fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
         match result {
             // Inner ran: its result is the dispatch's outcome.
-            Ok(TimerDeferOutput::Inner(output)) => T::settlement(Ok(output)),
+            Ok(DeferOutput::Inner(output)) => T::settlement(Ok(output)),
             // Inner ran and its error surfaced.
             Err(DeferError::Handler(error)) => T::settlement(Err(error)),
-            // `Deferred`/`NoInner` — parked for retry / queued behind /
-            // orphan cleanup: the outcome lives in the defer queue, so
-            // nothing here may stage or record. The error rows are the defer
-            // layer's own rescue failing (store/timer/loader/backoff
-            // computation) — a layer failure, never the event's outcome.
-            Ok(TimerDeferOutput::Deferred(_) | TimerDeferOutput::NoInner)
-            | Err(
+            // The defer layer completed its queue and timer bookkeeping.
+            Ok(DeferOutput::Deferred(_) | DeferOutput::NoInner) => Settlement::Bypassed,
+            // Failed defer bookkeeping abandons the source.
+            Err(
                 DeferError::Store(_)
                 | DeferError::Timer(_)
                 | DeferError::Loader(_)
                 | DeferError::CompactTime(_),
-            ) => Settlement::Bypassed,
+            ) => Settlement::Abandoned,
         }
     }
 }

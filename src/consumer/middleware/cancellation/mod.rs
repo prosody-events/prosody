@@ -268,20 +268,13 @@ where
 {
     fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
         match result {
-            // Inner ran: delegate. `ShutdownAfterInner` carries the inner's
-            // own error, so its settlement is the inner's — though the
-            // variant classifies Terminal, and settle's Terminal-first check
-            // abandons before this classification is consulted.
             Ok(output) => T::settlement(Ok(output)),
+            Err(CancellationError::Handler(error)) => T::settlement(Err(error)),
             Err(
-                CancellationError::Handler(error) | CancellationError::ShutdownAfterInner(error),
-            ) => T::settlement(Err(error)),
-            // Pre-inner admission rejections: the inner never ran, so the
-            // result is this layer's, not the event's. (Belt and braces for
-            // `Shutdown` — Terminal-first already owns its abandon.)
-            Err(CancellationError::Shutdown | CancellationError::MessageCancelled) => {
-                Settlement::Bypassed
-            }
+                CancellationError::ShutdownAfterInner(_)
+                | CancellationError::Shutdown
+                | CancellationError::MessageCancelled,
+            ) => Settlement::Abandoned,
         }
     }
 }

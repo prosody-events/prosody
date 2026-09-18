@@ -4,10 +4,11 @@
 use super::super::{RespondHandler, Responded};
 use super::{Fixture, ResultProbeCodec, offset_tracker, requesting, requesting_excise};
 use crate::consumer::middleware::providers::LeafHandler;
+use crate::consumer::middleware::tests::test_support::settlement_name;
 use crate::consumer::middleware::tests::test_support::{
     BypassedHandler, MockEventContext, ScriptedHandler, TestError,
 };
-use crate::consumer::middleware::{FallibleHandler, Settlement, SettlementHandler};
+use crate::consumer::middleware::{FallibleHandler, SettlementHandler};
 use crate::consumer::{DemandType, EventHandler};
 use crate::error::ErrorCategory;
 use crate::peer::response::RequestId;
@@ -91,14 +92,7 @@ fn excise_returns_one_response() -> Result<()> {
     })
 }
 
-/// The layer answers the settlement boundary with its inner handler's own
-/// classification, on both result arms.
-///
-/// Production always nests the layer around the chain's leaf adapter, whose
-/// classification is final on both arms. The bypassed rows therefore pin this
-/// implementation rather than a reachable production state — the layer stays
-/// correct over any inner handler, which is why it delegates instead of
-/// answering final.
+/// The wrapper forwards each inner action on both result arms.
 #[test]
 fn settlement_delegates_both_result_arms() {
     let output = Responded {
@@ -115,18 +109,22 @@ fn settlement_delegates_both_result_arms() {
         RespondHandler::<BypassedHandler, ResultProbeCodec, TestRouter>::settlement(Err(&failure)),
     ];
     assert_eq!(
-        bypassed,
-        [Settlement::Bypassed, Settlement::Bypassed],
+        bypassed.map(settlement_name),
+        ["Bypassed", "Bypassed"],
         "a bypassing inner keeps its classification through the layer",
     );
 
     let settled = [
-        RespondHandler::<ScriptedHandler, ResultProbeCodec, TestRouter>::settlement(Ok(&output)),
-        RespondHandler::<ScriptedHandler, ResultProbeCodec, TestRouter>::settlement(Err(&failure)),
+        RespondHandler::<LeafHandler<ScriptedHandler>, ResultProbeCodec, TestRouter>::settlement(
+            Ok(&output),
+        ),
+        RespondHandler::<LeafHandler<ScriptedHandler>, ResultProbeCodec, TestRouter>::settlement(
+            Err(&failure),
+        ),
     ];
     assert_eq!(
-        settled,
-        [Settlement::Final, Settlement::Final],
+        settled.map(settlement_name),
+        ["Final", "Rejected"],
         "a settling inner keeps its classification through the layer",
     );
 }

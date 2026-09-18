@@ -75,17 +75,6 @@ impl MockContext {
         }
     }
 
-    #[must_use]
-    fn has_scheduled_timer(&self, timer_type: TimerType) -> bool {
-        self.operations.lock().iter().any(|op| {
-            matches!(
-                op,
-                TimerOperation::Schedule(_, t) | TimerOperation::ClearAndSchedule(_, t)
-                if *t == timer_type
-            )
-        })
-    }
-
     fn clear_operations(&self) {
         self.operations.lock().clear();
     }
@@ -190,9 +179,29 @@ impl EventContext for MockContext {
 
     fn scheduled(
         &self,
-        _timer_type: TimerType,
+        timer_type: TimerType,
     ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
-        ready(Ok(Vec::new()))
+        let operations = self.operations.lock();
+        let mut times = Vec::with_capacity(operations.len());
+        for operation in operations.iter() {
+            match *operation {
+                TimerOperation::Schedule(time, kind) if kind == timer_type => {
+                    times.push(time);
+                }
+                TimerOperation::ClearAndSchedule(time, kind) if kind == timer_type => {
+                    times.clear();
+                    times.push(time);
+                }
+                TimerOperation::Unschedule(time, kind) if kind == timer_type => {
+                    if let Some(index) = times.iter().position(|scheduled| *scheduled == time) {
+                        times.remove(index);
+                    }
+                }
+                TimerOperation::ClearScheduled(kind) if kind == timer_type => times.clear(),
+                _ => {}
+            }
+        }
+        ready(Ok(times))
     }
 }
 
@@ -333,6 +342,9 @@ struct TestHarness {
     store: MemoryTimerDeferStore,
     /// Context for timer operations.
     context: MockContext,
+    /// One timer context per trace key. The trace owns and drops these
+    /// contexts.
+    contexts: Vec<context::KeyedMockContext>,
 }
 
 impl TestHarness {
@@ -379,6 +391,7 @@ impl TestHarness {
             decider,
             store,
             context,
+            contexts: Vec::new(),
         })
     }
 
@@ -411,9 +424,13 @@ impl TestHarness {
             .map_err(|e| eyre!("store error: {e}"))
     }
 
-    #[must_use]
-    fn has_deferred_timer(&self) -> bool {
-        self.context.has_scheduled_timer(TimerType::DeferredTimer)
+    /// Creates a fixed context pool for one trace.
+    fn for_trace(key_count: usize) -> color_eyre::Result<Self> {
+        let mut harness = Self::new()?;
+        harness.contexts = (0..key_count)
+            .map(|idx| context::KeyedMockContext::new(&format!("timer-test-key-{idx}")))
+            .collect();
+        Ok(harness)
     }
 }
 /// A bypassed deferred timer commits its source without state or dedup.

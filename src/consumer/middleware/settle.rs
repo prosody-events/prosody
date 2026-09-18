@@ -1,16 +1,16 @@
 //! The event settlement boundary.
 //!
-//! The boundary closes the session gate after the middleware stack returns.
-//! A successful final result stages state, promotes it, records the message
-//! dedup id, and commits the source. The final or bypassed classification
-//! determines whether the boundary stages state. The blanket `EventHandler`
-//! implementation and `RetryHandler` use this same boundary.
+//! The leaf adapter maps the handler's error category to one [`Settlement`]
+//! action. Wrappers forward that action or name an action for their own
+//! outcomes. `Final` stages state, promotes it, records the marker, and commits
+//! the source. `Rejected` discards state, records the marker best effort, and
+//! commits the source. `Bypassed` discards state and commits the source without
+//! a marker. `Abandoned` discards state and aborts the source without a marker.
 //!
-//! State rejection records no dedup id. The source commits only after state
+//! The source verb selects `after_commit` or `after_abort`.
+//! Apply hooks run after the permit drops. [`stamp`] re-pins their context.
+//! State rejection records no marker. The source commits only after state
 //! resolution.
-//!
-//! Apply hooks run after the permit drops. The boundary re-pins their context
-//! so reads observe the settled state.
 
 use opentelemetry::global::meter;
 use opentelemetry::metrics::Counter;
@@ -52,35 +52,32 @@ trait SettlementAccess: EventContext {
 
 impl<C: EventContext> SettlementAccess for C {}
 
-/// How the settlement boundary treats the stack's final result.
+/// Only the leaf adapter creates this proof. Wrappers forward it unchanged.
+/// The private field prevents wrappers from constructing it directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LeafProof(());
+
+/// The action the settlement boundary takes on an event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Settlement {
-    /// The event's final result. Success stages, promotes, records dedup, and
-    /// commits the source. A permanent rejection records dedup and commits
-    /// the source without state changes.
-    Final,
-
-    /// Another operation owns the outcome. Commit the source and discard the
-    /// dirty overlay. This dispatch stages no state and records no dedup
-    /// id.
+    /// Stage and promote state. Record the marker, then commit the source.
+    Final(LeafProof),
+    /// Discard state. Record the marker best effort, then commit the source.
+    Rejected(LeafProof),
+    /// Discard state and commit the source without a marker.
     Bypassed,
+    /// Discard state and abort the source without a marker.
+    Abandoned,
 }
 
-/// Crate-internal middleware-chain surface: classifies the final result for
-/// the settlement boundary.
+/// Selects `Final`, `Rejected`, `Bypassed`, or `Abandoned` for the boundary.
 ///
-/// Required and non-defaulted so a future swallowing middleware cannot
-/// inherit [`Settlement::Final`] by omission — a swallow classified `Final`
-/// records the swallowed message's marker and dedup-filters its own retry,
-/// the lost-write bug class this trait exists to close. For the same reason
-/// there is deliberately **no blanket impl** over all [`FallibleHandler`]s:
-/// exactly one concrete leaf adapter
-/// ([`LeafHandler`](super::providers::LeafHandler), minted at
-/// `into_provider`) hardcodes `Final`, and every framework wrapper writes one
-/// explicit impl classifying its own Output and error variants (delegating on
-/// pass-through shapes).
+/// The leaf adapter maps the handler's error category. Wrappers forward inner
+/// results or name an action for their own outcomes.
+/// Plain wrapper error arms keep public signatures simpler than a generic error
+/// enum.
 pub(crate) trait SettlementHandler: FallibleHandler {
-    /// Classifies the stack's final result — both sides — for [`settle`].
+    /// Selects the action for the stack's final result.
     fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement;
 }
 
@@ -89,28 +86,34 @@ pub(crate) trait SettlementHandler: FallibleHandler {
 /// it in its write signature.
 pub struct MarkerWrite(());
 
-/// The attempt-boundary re-pin privilege. Opaque (the `MarkerWrite` idiom):
-/// its tuple field is private to this module, so `RepinProof(())` is
-/// constructible only here — the two production mint sites are the
-/// `next_attempt` verb and the `fire_apply_hook` settle stamp.
-/// A partial reset (a lone epoch bump with no matching re-pin, or a re-pin with
-/// no reset) is therefore unwritable anywhere else, and a leaked stale context
-/// clone can never re-pin itself back to life.
-///
-/// Nominally `pub` — and re-exported publicly — because
-/// [`EventContext::redispatch`]
-/// names it in a public signature; its effective visibility stays
-/// crate-internal because no one outside this module can construct one.
+/// Permits a context re-pin after reset or settlement.
+/// Only this module creates production proofs, through `next_attempt` and
+/// `stamp`. A leaked stale context cannot re-pin itself.
+/// The public `EventContext::redispatch` signature requires public visibility.
 pub struct RepinProof(());
 
 impl RepinProof {
-    /// Mints a proof for in-crate typed-layer tests that drive
-    /// `reset`/`repin`/`redispatch` directly (the production mint sites are the
-    /// two above). Test-only, so the privilege stays unforgeable in shipping
-    /// code.
+    /// Creates a proof for tests that drive reset, re-pin, or redispatch
+    /// directly.
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
         Self(())
+    }
+}
+
+/// Maps the leaf handler's own result to its action. Only the leaf
+/// adapter calls this. Wrappers forward the result.
+pub(in crate::consumer::middleware) fn leaf_settlement<O, E: ClassifyError>(
+    result: Result<&O, &E>,
+) -> Settlement {
+    match result {
+        Ok(_) => Settlement::Final(LeafProof(())),
+        Err(error) => match error.classify_error() {
+            ErrorCategory::Permanent => Settlement::Rejected(LeafProof(())),
+            // The retry layer stopped and logged the discard.
+            ErrorCategory::Transient => Settlement::Bypassed,
+            ErrorCategory::Terminal => Settlement::Abandoned,
+        },
     }
 }
 
@@ -131,21 +134,16 @@ pub(crate) trait NextAttempt: EventContext {
 impl<C: EventContext> NextAttempt for C {
     async fn next_attempt(self) -> Self {
         // A stateless / invalidated context has no lifecycle to reset; the
-        // re-pin below is then a no-op rebuild. Mint site 1a (reset/bump).
+        // re-pin below is then a no-op rebuild. Create the reset proof here.
         if let Ok(session) = self.settle_lifecycle() {
             session.reset(RepinProof(())).await;
         }
-        // Mint site 1b (re-pin to the just-bumped epoch).
+        // Re-pin to the new epoch.
         self.redispatch(RepinProof(()))
     }
 }
 
-/// Settles one final result and calls one apply hook.
-///
-/// A final success stages state, promotes it, records dedup, and commits the
-/// source. A permanent rejection records dedup without state changes. A
-/// bypassed or transient result commits the source without state or dedup.
-/// A terminal result abandons the source before classification.
+/// Applies the selected [`Settlement`] action and calls one source hook.
 pub(crate) async fn settle<T, C, G>(
     handler: &T,
     context: C,
@@ -160,16 +158,6 @@ pub(crate) async fn settle<T, C, G>(
     // the durability steps' cancel-guarded timer ops aren't short-circuited
     // (mirrors the timeout middleware uncancelling after the inner returns).
     context.uncancel();
-
-    let category = result.as_ref().err().map(ClassifyError::classify_error);
-    // Terminal: the marker aborts; the event redelivers and re-runs. Nothing
-    // staged (finalize runs only on a Final Ok), and abandon touches no
-    // state. Checked before the settlement classification so a Terminal
-    // error abandons even when a wrapper classifies it Bypassed.
-    if category == Some(ErrorCategory::Terminal) {
-        abandon(handler, context, guard, result).await;
-        return;
-    }
 
     // Reach the event's lifecycle handle. Every live context carries one —
     // `LifecycleAccess` binds unconditionally — so `None` means only an
@@ -188,33 +176,24 @@ pub(crate) async fn settle<T, C, G>(
     };
 
     match T::settlement(result.as_ref()) {
-        // The outcome lives elsewhere: no stage, no marker; commit the
-        // offset/trigger and fire the hook. Skipping `finalize` here is
-        // equivalent to finalizing an emptied buffer: an empty finalize
-        // yields `Finalized::Clean`, which has no provisional work.
+        Settlement::Final(_) => {
+            settle_committed(handler, context, guard, result, lifecycle.as_ref(), permit).await;
+        }
+        Settlement::Rejected(_) => {
+            if let Some(lifecycle) = &lifecycle
+                && let Some(marker) = lifecycle.message_marker()
+            {
+                record_marker_best_effort(&context, lifecycle, marker).await;
+            }
+            commit_and_finish(handler, context, guard, result, lifecycle.as_ref(), permit).await;
+        }
         Settlement::Bypassed => {
             commit_and_finish(handler, context, guard, result, lifecycle.as_ref(), permit).await;
         }
-        Settlement::Final => match category {
-            // A permanent final failure records its marker best-effort, so
-            // dedup filters redelivery. Finalize runs only on success.
-            // A transient final failure has no marker. Commit and call the hook.
-            // Terminal failures already returned above.
-            Some(category) => {
-                if category == ErrorCategory::Permanent
-                    && let Some(lifecycle) = &lifecycle
-                    && let Some(marker) = lifecycle.message_marker()
-                {
-                    record_marker_best_effort(&context, lifecycle, marker).await;
-                }
-                commit_and_finish(handler, context, guard, result, lifecycle.as_ref(), permit)
-                    .await;
-            }
-            // Success: run the full durability sequence.
-            None => {
-                settle_committed(handler, context, guard, result, lifecycle.as_ref(), permit).await;
-            }
-        },
+        Settlement::Abandoned => {
+            drop(permit);
+            abandon(handler, context, guard, result).await;
+        }
     }
 }
 
@@ -236,7 +215,7 @@ async fn commit_and_finish<'a, T, C, G>(
     guard.commit().await;
     discard_uncommitted(lifecycle);
     drop(permit);
-    fire_apply_hook(handler, context, true, result).await;
+    handler.after_commit(stamp(&context), result).await;
 }
 
 /// Discards the uncommitted overlay under the closed gate before hook reads can
@@ -384,34 +363,16 @@ pub(crate) async fn abandon<T, C, G>(
     guard.abort().await;
     discard_uncommitted(lifecycle.as_ref());
     drop(permit);
-    fire_apply_hook(handler, context, false, result).await;
+    handler.after_abort(stamp(&context), result).await;
 }
 
-/// The single site both apply hooks fire through. Stamps the hook's context
-/// view **current** — one bump-free re-pin (the second [`RepinProof`] mint
-/// site) — before invoking, so a final hook's reads see settled state
-/// regardless of how many attempts ran or how deeply retry was nested. Inner
-/// resets advance the shared epoch during the outer attempt, leaving the
-/// boundary-owned final context pinned at a stale epoch; threading that context
-/// through unchanged would fail every hook read `Terminated`. The stamp writes
-/// **no** epoch — settlement has closed the gate and no further attempt can
-/// begin, so re-pinning to the live epoch only re-enables the boundary's own
-/// context, never a genuinely-leaked stale clone (which keeps its old pin).
-async fn fire_apply_hook<T, C>(
-    handler: &T,
-    context: C,
-    commit: bool,
-    result: Result<T::Output, T::Error>,
-) where
-    T: FallibleHandler,
-    C: EventContext<Payload = T::Payload>,
-{
-    let stamped = context.redispatch(RepinProof(()));
-    if commit {
-        handler.after_commit(stamped, result).await;
-    } else {
-        handler.after_abort(stamped, result).await;
-    }
+/// Re-pins the hook context so reads observe settled state.
+///
+/// Inner retries advance the shared epoch and leave the boundary context stale.
+/// The gate is closed, so this re-pin changes no epoch and permits no mutation.
+/// Leaked context clones keep their old epoch and remain fenced.
+fn stamp<C: EventContext>(context: &C) -> C {
+    context.redispatch(RepinProof(()))
 }
 
 /// Records `marker` best-effort, retrying transient failures; a permanent

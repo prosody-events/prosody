@@ -398,11 +398,10 @@ where
             // Inner ran: its result is the dispatch's outcome.
             Ok(Some(output)) => T::settlement(Ok(output)),
             Err(DeduplicationError::Inner(error)) => T::settlement(Err(error)),
-            // `Ok(None)` — dedup hit: the message already committed on an
-            // earlier dispatch; nothing here may stage or re-record.
-            // `Store(_)` — the filter's read failed before the inner ran: a
-            // layer failure, not the event's outcome.
-            Ok(None) | Err(DeduplicationError::Store(_)) => Settlement::Bypassed,
+            // The message already committed on an earlier dispatch.
+            Ok(None) => Settlement::Bypassed,
+            // The filter read failed before the inner ran, so the source must redeliver.
+            Err(DeduplicationError::Store(_)) => Settlement::Abandoned,
         }
     }
 }

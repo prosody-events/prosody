@@ -1,7 +1,7 @@
 use tracing::{Instrument, debug, info, warn};
 
 use super::super::store::{TimerDeferStore, TimerRetryCompletionResult};
-use super::{TimerDeferHandler, TimerDeferOutput};
+use super::{DeferOutput, TimerDeferHandler};
 use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::middleware::FallibleHandler;
@@ -23,13 +23,13 @@ where
     /// enabled.
     ///
     /// Returns:
-    /// - [`TimerDeferOutput::NoInner`] when the key was already deferred and
-    ///   this trigger is appended to its queue (inner not invoked).
-    /// - [`TimerDeferOutput::Inner`] when the inner handler ran and produced an
+    /// - [`DeferOutput::NoInner`] when the key was already deferred and this
+    ///   trigger is appended to its queue (inner not invoked).
+    /// - [`DeferOutput::Inner`] when the inner handler ran and produced an
     ///   output.
-    /// - [`TimerDeferOutput::Deferred`] when the inner ran, returned a
-    ///   transient error, and the middleware enqueued a retry. The wrapped
-    ///   inner error must be threaded into `after_abort` on the inner.
+    /// - [`DeferOutput::Deferred`] when the inner ran, returned a transient
+    ///   error, and the middleware enqueued a retry. The wrapped inner error
+    ///   must be threaded into `after_abort` on the inner.
     /// - `Err(DeferError::Handler(e))` when the inner ran and the error must
     ///   surface (non-transient, or transient but deferral disabled).
     pub(super) async fn handle_application_timer<C>(
@@ -37,19 +37,20 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
+    ) -> Result<DeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
         C: EventContext<Payload = T::Payload>,
     {
         // Check if key is already deferred - queue behind existing entry
-        if self
+        if let Some(retry_count) = self
             .store
             .is_deferred(&trigger.key)
             .await
             .map_err(DeferError::Store)?
-            .is_some()
         {
-            return self.append_to_deferred_queue(&trigger).await;
+            return self
+                .append_to_deferred_queue(&context, &trigger, retry_count)
+                .await;
         }
 
         // Try handler, defer on transient failure if enabled
@@ -58,7 +59,7 @@ where
             .on_timer(context.clone(), trigger.clone(), demand_type)
             .await
         {
-            Ok(output) => return Ok(TimerDeferOutput::Inner(output)),
+            Ok(output) => return Ok(DeferOutput::Inner(output)),
             Err(error) => error,
         };
 
@@ -92,7 +93,7 @@ where
         context: C,
         trigger: Trigger,
         demand: DemandType,
-    ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
+    ) -> Result<DeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
         C: EventContext<Payload = T::Payload>,
     {
@@ -127,7 +128,7 @@ where
                 .await
                 .map_err(DeferError::Store)?;
 
-            return Ok(TimerDeferOutput::NoInner);
+            return Ok(DeferOutput::NoInner);
         };
 
         debug!(
@@ -192,14 +193,14 @@ where
             "Deferred timer retry succeeded"
         );
 
-        Ok(TimerDeferOutput::Inner(output))
+        Ok(DeferOutput::Inner(output))
     }
 
     /// Defers a timer for the first time after the inner handler returned a
     /// transient error. Schedules retry timer before storing to ensure timer
     /// still fires on partial failure.
     ///
-    /// Returns [`TimerDeferOutput::Deferred`] carrying the inner error so the
+    /// Returns [`DeferOutput::Deferred`] carrying the inner error so the
     /// apply hooks can drive `after_abort(Err(inner_err))` on the inner: the
     /// inner's prior dispatch is being rolled back even though our defer
     /// marker commits.
@@ -208,7 +209,7 @@ where
         context: C,
         trigger: &Trigger,
         inner_err: T::Error,
-    ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
+    ) -> Result<DeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
         C: EventContext<Payload = T::Payload>,
     {
@@ -228,20 +229,42 @@ where
             "Deferred timer for timer-based retry"
         );
 
-        Ok(TimerDeferOutput::Deferred(inner_err))
+        Ok(DeferOutput::Deferred(inner_err))
     }
 
-    /// Appends timer to an already-deferred key's queue (maintains ordering).
-    /// The inner handler is not invoked for this dispatch — the trigger is a
-    /// pure side-effect on the defer queue.
-    pub(super) async fn append_to_deferred_queue(
+    /// Appends a timer and re-arms a missing retry timer.
+    ///
+    /// The queue is the source of truth for pending work. The timer derives
+    /// from it. Each append re-arms an absent timer because no single write
+    /// spans both stores. Returns [`DeferOutput::NoInner`] without
+    /// an inner dispatch.
+    pub(super) async fn append_to_deferred_queue<C>(
         &self,
+        context: &C,
         trigger: &Trigger,
-    ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>> {
-        self.store
-            .defer_additional_timer(trigger)
-            .await
-            .map_err(DeferError::Store)?;
+        retry_count: u32,
+    ) -> Result<DeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
+    where
+        C: EventContext<Payload = T::Payload>,
+    {
+        let (appended, scheduled) = tokio::join!(
+            self.store.defer_additional_timer(trigger),
+            context.scheduled(TimerType::DeferredTimer),
+        );
+        appended.map_err(DeferError::Store)?;
+        let scheduled = scheduled.map_err(|e| DeferError::Timer(Box::new(e)))?;
+
+        if scheduled.is_empty() {
+            self.schedule_retry_timer(context, retry_count).await?;
+            info!(
+                key = ?trigger.key,
+                time = %trigger.time,
+                retry_count = retry_count,
+                topic = %self.topic,
+                partition = self.partition,
+                "Re-armed retry timer for a deferred key that had none"
+            );
+        }
 
         debug!(
             key = ?trigger.key,
@@ -251,7 +274,7 @@ where
             "Queued timer behind already-deferred key"
         );
 
-        Ok(TimerDeferOutput::NoInner)
+        Ok(DeferOutput::NoInner)
     }
 
     /// Handles retry failures by error category.
@@ -260,7 +283,7 @@ where
     /// telemetry). `stored_trigger` is the original `Application` timer
     /// retrieved from the store (used for store operations).
     ///
-    /// On a transient error this returns [`TimerDeferOutput::Deferred`]
+    /// On a transient error this returns [`DeferOutput::Deferred`]
     /// carrying the inner error so the apply hooks route to
     /// `after_abort(Err(inner_err))` on the inner — the inner's retry attempt
     /// is being rolled back and another `DeferredTimer` will re-dispatch it.
@@ -273,7 +296,7 @@ where
         retry_count: u32,
         demand: DemandType,
         error: T::Error,
-    ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
+    ) -> Result<DeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
         C: EventContext<Payload = T::Payload>,
     {
@@ -312,7 +335,7 @@ where
                     "Re-deferred timer after transient failure"
                 );
 
-                Ok(TimerDeferOutput::Deferred(error))
+                Ok(DeferOutput::Deferred(error))
             }
             ErrorCategory::Permanent => {
                 warn!(

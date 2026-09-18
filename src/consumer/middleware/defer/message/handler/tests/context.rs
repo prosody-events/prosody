@@ -1,28 +1,38 @@
-//! Capturing context for trace-based property testing.
-//!
-//! Provides [`CapturingContext`] that implements [`EventContext`] and records
-//! all timer operations for verification. Used to verify timer coverage,
-//! cleanup, and backoff timing invariants.
+//! Records timer operations and injects timer faults.
 
+use super::FaultKind;
 use super::types::OutputEvent;
 use crate::Key;
 use crate::consumer::TerminationSignals;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::event_context::StateAccessError;
 use crate::consumer::middleware::RepinProof;
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::state::tests::support::UnavailableState;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use ahash::RandomState;
+use parking_lot::Mutex;
 use std::collections::BTreeSet;
-use std::convert::Infallible;
 use std::future::{self, Future, ready};
 use std::sync::Arc;
+use thiserror::Error;
 
-// ============================================================================
 // Timer Capture State (shared across all contexts)
-// ============================================================================
+
+/// Selects the timer call that receives a fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerOp {
+    /// Adds a timer.
+    Schedule,
+    /// Replaces the key timers.
+    ClearAndSchedule,
+    /// Removes the key timers.
+    ClearScheduled,
+    /// Reads the key timers.
+    Scheduled,
+}
 
 /// Shared state for capturing timer operations across all keys.
 ///
@@ -35,6 +45,7 @@ use std::sync::Arc;
 pub struct TimerCapture {
     /// Recorded operations in order (for debugging/verification).
     events: Arc<scc::Queue<OutputEvent>>,
+    next_fault: Arc<Mutex<Option<(TimerOp, FaultKind)>>>,
     /// Currently active timers: key -> set of scheduled times.
     active_timers: Arc<scc::HashMap<Key, BTreeSet<CompactDateTime>, RandomState>>,
 }
@@ -43,6 +54,7 @@ impl Default for TimerCapture {
     fn default() -> Self {
         Self {
             events: Arc::new(scc::Queue::default()),
+            next_fault: Arc::default(),
             active_timers: Arc::new(scc::HashMap::with_hasher(RandomState::new())),
         }
     }
@@ -53,6 +65,32 @@ impl TimerCapture {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Arms one timer fault for the next dispatch.
+    pub fn set_fault(&self, fault: Option<(TimerOp, FaultKind)>) {
+        *self.next_fault.lock() = fault;
+    }
+
+    /// Reports whether a fault still awaits its selected call.
+    pub fn fault_pending(&self) -> bool {
+        self.next_fault.lock().is_some()
+    }
+
+    fn check(&self, op: TimerOp) -> Result<(), TimerError> {
+        let mut slot = self.next_fault.lock();
+        if let Some((target, kind)) = *slot
+            && target == op
+        {
+            *slot = None;
+            return Err(TimerError(kind));
+        }
+        Ok(())
+    }
+
+    /// Removes active timers without a handler operation.
+    pub fn drop_timers(&self, key: &Key) {
+        let _ = self.active_timers.remove_sync(key);
     }
 
     /// Records a timer schedule operation for a specific (key, time).
@@ -102,6 +140,14 @@ impl TimerCapture {
         self.events.push(OutputEvent::Cleared { key: key.clone() });
 
         let _ = self.active_timers.remove_sync(key);
+    }
+
+    /// Detaches the fired source without a handler operation.
+    pub fn take_timer(&self, key: &Key, time: CompactDateTime) {
+        let _ = self.active_timers.remove_if_sync(key, |times| {
+            times.remove(&time);
+            times.is_empty()
+        });
     }
 
     /// Pops and returns the oldest recorded event, if any.
@@ -162,9 +208,7 @@ impl TimerCapture {
     }
 }
 
-// ============================================================================
 // Keyed Capturing Context (per-key EventContext implementation)
-// ============================================================================
 
 /// Context for a specific key that captures timer operations.
 ///
@@ -218,7 +262,7 @@ impl TerminationSignals for KeyedCapturingContext {
 }
 
 impl EventContext for KeyedCapturingContext {
-    type Error = Infallible;
+    type Error = TimerError;
     type Payload = serde_json::Value;
     type State = UnavailableState<serde_json::Value>;
 
@@ -250,6 +294,9 @@ impl EventContext for KeyedCapturingContext {
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        if let Err(error) = self.capture.check(TimerOp::Schedule) {
+            return ready(Err(error));
+        }
         if timer_type == TimerType::DeferredMessage {
             self.capture.record_schedule(self.key.clone(), time);
         }
@@ -261,6 +308,9 @@ impl EventContext for KeyedCapturingContext {
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        if let Err(error) = self.capture.check(TimerOp::ClearAndSchedule) {
+            return ready(Err(error));
+        }
         if timer_type == TimerType::DeferredMessage {
             // Clear all timers for this key first, then schedule new one
             self.capture.record_clear_all(&self.key);
@@ -285,6 +335,9 @@ impl EventContext for KeyedCapturingContext {
         &self,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        if let Err(error) = self.capture.check(TimerOp::ClearScheduled) {
+            return ready(Err(error));
+        }
         if timer_type == TimerType::DeferredMessage {
             // Remove all timers for this key
             self.capture.record_clear_all(&self.key);
@@ -302,9 +355,34 @@ impl EventContext for KeyedCapturingContext {
 
     fn scheduled(
         &self,
-        _timer_type: TimerType,
+        timer_type: TimerType,
     ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
-        ready(Ok(Vec::new()))
+        if let Err(error) = self.capture.check(TimerOp::Scheduled) {
+            return ready(Err(error));
+        }
+        let times = if timer_type == TimerType::DeferredMessage {
+            self.capture
+                .active_timers
+                .read_sync(&self.key, |_, times| times.iter().copied().collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        ready(Ok(times))
+    }
+}
+
+/// Reports a timer fault before the capture changes.
+#[derive(Debug, Error)]
+#[error("injected timer failure: {0:?}")]
+pub struct TimerError(FaultKind);
+
+impl ClassifyError for TimerError {
+    fn classify_error(&self) -> ErrorCategory {
+        match self.0 {
+            FaultKind::Transient => ErrorCategory::Transient,
+            FaultKind::Permanent => ErrorCategory::Permanent,
+        }
     }
 }
 

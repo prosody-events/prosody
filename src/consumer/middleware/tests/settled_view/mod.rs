@@ -24,7 +24,6 @@ use crate::state::{CollectionId, EventRef, StateKey, StateName, StateType, Store
 use color_eyre::eyre::{Result, bail, eyre};
 use serde_json::{Value, json};
 use std::future::ready;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -33,24 +32,6 @@ type Handle = ValueHandle<TestSession, JsonCodec>;
 
 const FLOOR: &str = "floor";
 const PENDING: &str = "pending";
-
-/// The settlement classification a [`ViewProbe`] reports, as a ZST marker
-/// so the associated (self-less) `settlement()` can read it.
-trait Classify: Clone + Send + Sync + 'static {
-    const SETTLEMENT: Settlement;
-}
-
-#[derive(Clone)]
-struct AsFinal;
-impl Classify for AsFinal {
-    const SETTLEMENT: Settlement = Settlement::Final;
-}
-
-#[derive(Clone)]
-struct AsBypassed;
-impl Classify for AsBypassed {
-    const SETTLEMENT: Settlement = Settlement::Bypassed;
-}
 
 /// The name of the [`StateAccessError`] variant a fenced op hit, so an
 /// assertion names the exact fence rather than matching an opaque value.
@@ -79,19 +60,16 @@ struct HookObservation {
 }
 
 /// Probe reading `floor` + `pending` and attempting a mutation/rollback
-/// through typed handles inside whichever apply hook fires, classifying
-/// settlement by `M`.
+/// through typed handles inside either apply hook.
 #[derive(Clone)]
-struct ViewProbe<M> {
+struct ViewProbe {
     seen: Arc<Mutex<Option<HookObservation>>>,
-    _marker: PhantomData<fn() -> M>,
 }
 
-impl<M: Classify> ViewProbe<M> {
+impl ViewProbe {
     fn new() -> Self {
         Self {
             seen: Arc::default(),
-            _marker: PhantomData,
         }
     }
 
@@ -119,7 +97,7 @@ impl<M: Classify> ViewProbe<M> {
     }
 }
 
-impl<M: Classify> FallibleHandler for ViewProbe<M> {
+impl FallibleHandler for ViewProbe {
     type Error = TestError;
     type Output = u64;
     type Payload = Value;
@@ -175,12 +153,6 @@ impl<M: Classify> FallibleHandler for ViewProbe<M> {
     }
 
     async fn shutdown(self) {}
-}
-
-impl<M: Classify> SettlementHandler for ViewProbe<M> {
-    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
-        M::SETTLEMENT
-    }
 }
 
 /// Binds `name`'s typed Value handle off `context` — exactly what a user
@@ -251,28 +223,17 @@ fn guard() -> (RecordingGuard, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     (g, committed, aborted)
 }
 
-async fn run_and_observe<M: Classify>(
-    probe: &ViewProbe<M>,
-    context: Ctx,
-    g: RecordingGuard,
-    result: Result<u64, TestError>,
-) -> Result<HookObservation> {
-    settle(probe, context, g, result).await;
-    probe.observation().ok_or_else(|| eyre!("a hook must fire"))
-}
-
 /// Drives one non-finalized arm end to end: buffers the floor+pending,
 /// settles the probe with `result`, and asserts the settled-view discard,
 /// the commit-now floor, and the apply-hook contract.
-async fn run_arm<M: Classify>(
-    arm: &str,
-    result: Result<u64, TestError>,
-    commits: bool,
-) -> Result<()> {
+async fn run_arm(arm: &str, result: Result<u64, TestError>, commits: bool) -> Result<()> {
     let (context, cell_store, floor_id, pending_id) = two_collections().await?;
     let (g, committed, aborted) = guard();
-    let probe = ViewProbe::<M>::new();
-    let obs = run_and_observe(&probe, context, g, result).await?;
+    let probe = ViewProbe::new();
+    settle(&LeafHandler::new(probe.clone()), context, g, result).await;
+    let obs = probe
+        .observation()
+        .ok_or_else(|| eyre!("a hook must fire"))?;
     assert_arm(arm, &obs, &committed, &aborted, commits)?;
     // Durable truth: the floor is committed, the discarded pending is not.
     assert!(
@@ -324,34 +285,26 @@ fn assert_arm(
     Ok(())
 }
 
-/// Non-finalized arms — no aborted-overlay residue and the apply-hook
-/// contract, over final Permanent, final Transient,
-/// `Bypassed`, and the direct `abandon` (Terminal). Each fires its hook
-/// after the boundary discards the uncommitted overlay, so the hook sees
-/// `pending == None` (base, residue gone) and `floor == "floor"`
-/// (commit-now floor survived); a hook mutation is fenced `SessionClosed`
-/// and `rollback()` is a `NoOp`; and `pending` is not durable while `floor`
-/// is. Falsify by deleting the `discard_uncommitted` line on the arm under
-/// test in `settle.rs`: `pending` then reads the buffered `"pending"`.
+/// Rejected, Bypassed, and Abandoned discard pending state and preserve
+/// committed state. Each hook reads committed values. Hook mutations fail with
+/// `SessionClosed`.
 #[tokio::test]
 async fn non_finalized_arms_discard_overlay_keeping_commit_floor() -> Result<()> {
-    // Final Permanent, final Transient, and Bypassed all commit the guard;
-    // the direct abandon (Terminal) aborts it. Each fires a hook.
-    run_arm::<AsFinal>(
-        "final-permanent",
+    // Rejected and Bypassed commit the source. Abandoned aborts it.
+    run_arm(
+        "Rejected",
         Err(TestError(ErrorCategory::Permanent, "final")),
         true,
     )
     .await?;
-    run_arm::<AsFinal>(
-        "final-transient",
+    run_arm(
+        "Bypassed",
         Err(TestError(ErrorCategory::Transient, "final")),
         true,
     )
     .await?;
-    run_arm::<AsBypassed>("bypassed", Ok(0), true).await?;
-    run_arm::<AsFinal>(
-        "terminal-abandon",
+    run_arm(
+        "Abandoned",
         Err(TestError(ErrorCategory::Terminal, "final")),
         false,
     )
@@ -429,8 +382,8 @@ async fn permanent_finalize_failure_discards_overlay_keeping_floor() -> Result<(
         .await?;
 
     let (g, committed, aborted) = guard();
-    let probe = ViewProbe::<AsFinal>::new();
-    settle(&probe, context, g, Ok(0)).await;
+    let probe = ViewProbe::new();
+    settle(&LeafHandler::new(probe.clone()), context, g, Ok(0)).await;
 
     let obs = probe.observation().ok_or_else(|| eyre!("hook fires"))?;
     // The permanent-skip arm commits defensively.

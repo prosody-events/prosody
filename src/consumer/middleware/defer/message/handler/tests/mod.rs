@@ -9,7 +9,11 @@ mod harness;
 mod integration;
 mod loader;
 mod properties;
+mod replay;
+mod store;
 mod types;
+
+pub use store::{FailableStore, FaultKind, StoreOp};
 
 pub use loader::{FailableLoader, FailableLoaderError, LoaderFailureType};
 

@@ -1,167 +1,122 @@
-//! Core types for trace-based property testing of defer middleware.
-//!
-//! Traces describe expected behavior - test inputs become sequences of
-//! [`MessageEvent`] and [`TimerEvent`] with explicit outcomes. Verification
-//! happens against real store state and [`OutputEvent`] records.
+//! The harness interprets each step against the real store.
+//! No event is predicted. Every check reads real state.
 
+use super::context::TimerOp;
+use super::{FaultKind, StoreOp};
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::duration::CompactDuration;
 use crate::{Key, Offset};
 
-// ============================================================================
-// Output Events (recorded by CapturingContext)
-// ============================================================================
-
-/// Timer operation recorded by [`CapturingContext`] for verification.
-///
-/// The middleware schedules and clears timers through [`EventContext`].
-/// We capture these operations to verify timer coverage and cleanup invariants.
+/// A timer operation that the context recorded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutputEvent {
-    /// Timer scheduled for key at specified time.
+    /// The context scheduled a timer.
     Scheduled {
-        /// Message key that was deferred.
+        /// The timer key.
         key: Key,
-        /// Scheduled retry time.
+        /// The scheduled time.
         time: CompactDateTime,
     },
-    /// Timer cleared for key (queue empty).
+    /// The context cleared timers.
     Cleared {
-        /// Message key whose timer was cleared.
+        /// The timer key.
         key: Key,
     },
 }
 
-// ============================================================================
-// Message Event Types
-// ============================================================================
+/// A fault before one dispatch.
+#[derive(Clone, Copy, Debug)]
+pub enum Fault {
+    /// Fails one store operation.
+    Store(StoreOp, FaultKind),
+    /// Fails one timer operation.
+    Timer(TimerOp, FaultKind),
+    /// The timer vanished outside the handler.
+    LostTimer,
+    /// A loader error precedes a timer error in one dispatch.
+    LoaderThenTimer(FaultKind, TimerOp, FaultKind),
+}
 
-/// Specifies how the handler should behave and whether to defer.
-///
-/// This is set by the trace before each message arrives, controlling
-/// both handler outcome and deferral decision.
+/// Selects the handler result and initial deferral decision.
 #[derive(Clone, Debug)]
 pub enum MessageOutcome {
-    /// Handler succeeds - message complete.
+    /// The handler succeeds.
     Success,
-
-    /// Handler fails permanently - message complete, no deferral.
+    /// The handler fails permanently.
     Permanent,
-
-    /// Handler fails transiently.
+    /// The handler fails transiently.
     Transient {
-        /// Maximum backoff for verification (actual: 0..=max due to jitter).
-        max_backoff: CompactDuration,
-        /// Whether deferral is enabled (controls [`TraceBasedDecider`]).
+        /// Enables initial deferral.
         defer: bool,
     },
-
-    /// Key already deferred - message queued without handler call.
+    /// The message joins an existing queue.
     Queued,
 }
 
-/// Describes a message arrival and expected outcome.
-///
-/// The test harness executes this by:
-/// 1. Setting [`TraceBasedDecider`] state (if `Transient`)
-/// 2. Constructing and processing the message
-/// 3. Verifying the outcome matches expectations
+/// A message arrival with a selected outcome.
 #[derive(Clone, Debug)]
 pub struct MessageEvent {
-    /// Index into test key pool (0..N).
+    /// A fault for the first dispatch.
+    pub fault: Option<Fault>,
+    /// Index into the key pool.
     pub key_idx: usize,
-    /// Kafka message offset.
+    /// The message offset.
     pub offset: Offset,
-    /// Expected handler result and deferral decision.
+    /// The selected outcome.
     pub outcome: MessageOutcome,
 }
 
-// ============================================================================
-// Timer Event Types
-// ============================================================================
-
-/// Specifies how the retry should behave.
-///
-/// No `defer` flag needed - key is already deferred when timer fires.
+/// Selects the result of a deferred reload.
 #[derive(Clone, Debug)]
 pub enum TimerOutcome {
-    // Handler outcomes (loader succeeded, handler executed)
-    /// Retry succeeds - offset complete, next message or clear.
+    /// The handler succeeds.
     Success,
-
-    /// Retry fails permanently - offset complete, next message or clear.
+    /// The handler fails permanently.
     Permanent,
-
-    /// Retry fails transiently - reschedule with backoff.
-    Transient {
-        /// Maximum backoff for verification.
-        max_backoff: CompactDuration,
-    },
-
-    // Loader outcomes (handler NOT executed)
-    /// Loader fails permanently - offset complete, next message or clear.
-    /// Same state transition as `Success`/`Permanent`.
+    /// The handler fails transiently.
+    Transient,
+    /// The loader fails permanently.
     LoaderPermanent,
-
-    /// Loader fails transiently - reschedule with backoff.
-    /// Unlike handler `Transient`, does NOT increment retry count.
-    LoaderTransient {
-        /// Maximum backoff for verification (based on current `retry_count`,
-        /// not incremented).
-        max_backoff: CompactDuration,
-    },
+    /// The loader fails transiently.
+    LoaderTransient,
 }
 
-/// Describes a timer fire and expected retry outcome.
-///
-/// The test harness executes this by:
-/// 1. Verifying FIFO order (offset at queue head)
-/// 2. Firing the timer
-/// 3. Verifying retry count and timer state
+/// A timer fire for the real queue head.
 #[derive(Clone, Debug)]
 pub struct TimerEvent {
-    /// Index into test key pool.
+    /// A fault for the first dispatch.
+    pub fault: Option<Fault>,
+    /// Index into the key pool.
     pub key_idx: usize,
-    /// Expected offset at queue head (FIFO verification).
-    pub offset: Offset,
-    /// Expected retry result.
+    /// The selected outcome.
     pub outcome: TimerOutcome,
 }
 
-// ============================================================================
-// Trace Types
-// ============================================================================
-
-/// A single event in a test trace.
+/// An event that the harness interprets from a step.
 #[derive(Clone, Debug)]
 pub enum TraceEvent {
-    /// Message arrives for processing.
+    /// A message arrives.
     Message(MessageEvent),
-    /// Retry timer fires.
+    /// A retry timer fires.
     Timer(TimerEvent),
 }
 
-/// Complete test input - sequence of events with expected outcomes.
-///
-/// # Validity Invariants
-///
-/// These are enforced by [`TraceBuilder`] during generation:
-///
-/// 1. `MessageEvent.key_idx < key_count`
-/// 2. `TimerEvent.key_idx < key_count`
-/// 3. `TimerEvent` only when key is deferred with matching offset at head
-/// 4. `MessageOutcome::Queued` only when key is already deferred
-/// 5. `MessageOutcome::{Success,Permanent,Transient}` only when key NOT
-///    deferred
-///
-/// # `QuickCheck` Integration
-///
-/// Implements `Arbitrary` for random generation with shrinking that preserves
-/// validity. See [`generator`] module.
+/// One random choice. The harness reads the real store and creates a
+/// [`TraceEvent`].
+#[derive(Clone, Copy, Debug)]
+pub struct Step {
+    /// Selects a key modulo the key count.
+    pub key_idx: u8,
+    /// Selects the outcome.
+    pub roll: u8,
+    /// A fault for the first dispatch.
+    pub fault: Option<Fault>,
+}
+
+/// A list of steps over a fixed key pool.
 #[derive(Clone, Debug)]
 pub struct Trace {
-    /// Ordered sequence of events.
-    pub events: Vec<TraceEvent>,
-    /// Number of distinct keys (1..N).
+    /// Choices that the harness interprets in order.
+    pub steps: Vec<Step>,
+    /// The number of keys.
     pub key_count: usize,
 }

@@ -149,12 +149,6 @@ impl FallibleHandler for HookProbe {
     async fn shutdown(self) {}
 }
 
-impl SettlementHandler for HookProbe {
-    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
-        Settlement::Final
-    }
-}
-
 /// Every dedup write requests shutdown and returns a transient error.
 #[derive(Clone)]
 struct FlushTripDedup {
@@ -243,7 +237,7 @@ async fn dedup_shutdown_hook_reads_the_committed_value() -> Result<()> {
     let handler = HookProbe::new(vec![cart]);
     let (guard, committed, aborted) = RecordingGuard::new();
 
-    settle(&handler, context, guard, Ok(0)).await;
+    settle(&LeafHandler::new(handler.clone()), context, guard, Ok(0)).await;
 
     assert_eq!(
         aborted.load(Ordering::SeqCst),
@@ -338,7 +332,7 @@ async fn rejected_promote_hook_reads_repaired_collections() -> Result<()> {
     let handler = HookProbe::new(vec![cart, wishlist]);
     let (guard, committed, aborted) = RecordingGuard::new();
 
-    settle(&handler, context, guard, Ok(0)).await;
+    settle(&LeafHandler::new(handler.clone()), context, guard, Ok(0)).await;
 
     assert_eq!(committed.load(Ordering::SeqCst), 1, "the event committed");
     assert_eq!(aborted.load(Ordering::SeqCst), 0);

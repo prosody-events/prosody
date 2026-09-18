@@ -177,3 +177,13 @@ mod handlers;
 pub use handlers::*;
 mod recording_state;
 pub use recording_state::*;
+
+/// Returns the action name without exposing the leaf proof.
+pub(crate) fn settlement_name(action: Settlement) -> &'static str {
+    match action {
+        Settlement::Final(_) => "Final",
+        Settlement::Rejected(_) => "Rejected",
+        Settlement::Bypassed => "Bypassed",
+        Settlement::Abandoned => "Abandoned",
+    }
+}

@@ -57,6 +57,18 @@ impl FailableLoader {
         *self.next_failure.lock() = failure;
     }
 
+    /// Returns the failure that still awaits a load.
+    #[must_use]
+    pub fn pending_failure(&self) -> Option<LoaderFailureType> {
+        *self.next_failure.lock()
+    }
+
+    /// Returns the loader without fault injection.
+    #[must_use]
+    pub fn inner(&self) -> &MemoryLoader<Value> {
+        &self.inner
+    }
+
     /// Delegate `store_message` to inner loader.
     pub fn store_message(
         &self,

@@ -12,6 +12,8 @@ use crate::consumer::middleware::deduplication::{
     DeduplicationMiddleware, DeduplicationStore, MemoryDeduplicationStore,
     MemoryDeduplicationStoreProvider, dedup_uuid, dedup_uuid_for_message,
 };
+use crate::consumer::middleware::providers::LeafHandler;
+use crate::consumer::middleware::tests::test_support::settlement_name;
 use crate::consumer::middleware::tests::test_support::{
     MockEventContext, RecordingSession, create_test_message_from, recording_session,
 };
@@ -130,15 +132,9 @@ impl FallibleHandler for MockHandler {
     async fn shutdown(self) {}
 }
 
-impl SettlementHandler for MockHandler {
-    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
-        Settlement::Final
-    }
-}
-
-fn create_handler<T>(inner: T) -> DeduplicationHandler<T, MemoryDeduplicationStore> {
+fn create_handler<T>(inner: T) -> DeduplicationHandler<LeafHandler<T>, MemoryDeduplicationStore> {
     DeduplicationHandler {
-        inner,
+        inner: LeafHandler::new(inner),
         store: MemoryDeduplicationStore::new(),
     }
 }
@@ -187,7 +183,8 @@ fn session_context(dedup_id: Uuid) -> MockEventContext<serde_json::Value, Record
 /// identity the boundary records.
 #[tokio::test]
 async fn seeded_id_filters_before_handler() -> color_eyre::Result<()> {
-    let handler = create_handler(MockHandler::success());
+    let inner = MockHandler::success();
+    let handler = create_handler(inner.clone());
 
     let msg = create_test_message("key1", Some("evt1"))?;
     let id = dedup_uuid_for_message(test_identity(), &msg);
@@ -196,20 +193,21 @@ async fn seeded_id_filters_before_handler() -> color_eyre::Result<()> {
 
     let result = FallibleHandler::on_message(&handler, context, msg, DemandType::Normal).await;
     assert!(matches!(result, Ok(None)), "a seeded id is filtered");
-    assert_eq!(handler.inner.call_count(), 0, "filtered before the handler");
+    assert_eq!(inner.call_count(), 0, "filtered before the handler");
     Ok(())
 }
 
 #[tokio::test]
 async fn cache_miss_runs_handler() -> color_eyre::Result<()> {
-    let handler = create_handler(MockHandler::success());
+    let inner = MockHandler::success();
+    let handler = create_handler(inner.clone());
 
     let msg = create_test_message("key1", Some("evt1"))?;
     let context = session_context(dedup_uuid_for_message(test_identity(), &msg));
 
     let result = FallibleHandler::on_message(&handler, context, msg, DemandType::Normal).await;
     assert!(matches!(result, Ok(Some(()))));
-    assert_eq!(handler.inner.call_count(), 1);
+    assert_eq!(inner.call_count(), 1);
     Ok(())
 }
 
@@ -217,7 +215,8 @@ async fn cache_miss_runs_handler() -> color_eyre::Result<()> {
 /// *different* message's id never filters this one.
 #[tokio::test]
 async fn a_different_message_id_is_not_filtered() -> color_eyre::Result<()> {
-    let handler = create_handler(MockHandler::success());
+    let inner = MockHandler::success();
+    let handler = create_handler(inner.clone());
 
     let msg1 = create_test_message("key1", Some("evt1"))?;
     let msg2 = create_test_message("key1", Some("evt2"))?;
@@ -229,7 +228,7 @@ async fn a_different_message_id_is_not_filtered() -> color_eyre::Result<()> {
     let context = session_context(dedup_uuid_for_message(test_identity(), &msg2));
     let result = FallibleHandler::on_message(&handler, context, msg2, DemandType::Normal).await;
     assert!(matches!(result, Ok(Some(()))));
-    assert_eq!(handler.inner.call_count(), 1);
+    assert_eq!(inner.call_count(), 1);
     Ok(())
 }
 
@@ -237,19 +236,21 @@ async fn a_different_message_id_is_not_filtered() -> color_eyre::Result<()> {
 /// dispatches unfiltered — the filter cannot key without an identity.
 #[tokio::test]
 async fn no_marker_source_dispatches_unfiltered() -> color_eyre::Result<()> {
-    let handler = create_handler(MockHandler::success());
+    let inner = MockHandler::success();
+    let handler = create_handler(inner.clone());
     let context = MockEventContext::new();
 
     let msg = create_test_message("key1", Some("evt1"))?;
     let result = FallibleHandler::on_message(&handler, context, msg, DemandType::Normal).await;
     assert!(matches!(result, Ok(Some(()))));
-    assert_eq!(handler.inner.call_count(), 1);
+    assert_eq!(inner.call_count(), 1);
     Ok(())
 }
 
 #[tokio::test]
 async fn timer_passthrough() {
-    let handler = create_handler(MockHandler::success());
+    let inner = MockHandler::success();
+    let handler = create_handler(inner.clone());
     let context = MockEventContext::new();
     let trigger = Trigger::for_testing(
         "test-key".into(),
@@ -259,7 +260,7 @@ async fn timer_passthrough() {
 
     let result = FallibleHandler::on_timer(&handler, context, trigger, DemandType::Normal).await;
     assert!(result.is_ok());
-    assert_eq!(handler.inner.call_count(), 1);
+    assert_eq!(inner.call_count(), 1);
 }
 
 /// The settlement classification table: every Output and error variant. The
@@ -322,45 +323,44 @@ fn settlement_classification_table() {
         }
     }
 
-    type Subject = DeduplicationHandler<MockHandler, MemoryDeduplicationStore>;
+    type Subject = DeduplicationHandler<LeafHandler<MockHandler>, MemoryDeduplicationStore>;
     type Probe = DeduplicationHandler<BypassedProbe, MemoryDeduplicationStore>;
     type SubjectResult = Result<Option<()>, DeduplicationError<TestError>>;
-    let rows: Vec<(&str, SubjectResult, Settlement)> = vec![
+    let rows: Vec<(&str, SubjectResult, &str)> = vec![
+        ("Ok(Some) delegates (leaf Final)", Ok(Some(())), "Final"),
+        ("Ok(None) dedup hit is Bypassed", Ok(None), "Bypassed"),
         (
-            "Ok(Some) delegates (leaf Final)",
-            Ok(Some(())),
-            Settlement::Final,
-        ),
-        (
-            "Ok(None) dedup hit is Bypassed",
-            Ok(None),
-            Settlement::Bypassed,
-        ),
-        (
-            "Err(Inner) delegates (leaf Final)",
+            "Err(Inner) delegates (leaf Rejected)",
             Err(DeduplicationError::Inner(TestError::Permanent)),
-            Settlement::Final,
+            "Rejected",
         ),
         (
-            "Err(Store) filter-read failure is Bypassed",
+            "Err(Store) filter-read failure is Abandoned",
             Err(DeduplicationError::Store(Box::new(TestError::Transient))),
-            Settlement::Bypassed,
+            "Abandoned",
         ),
     ];
     for (label, result, expected) in rows {
-        assert_eq!(Subject::settlement(result.as_ref()), expected, "{label}");
+        assert_eq!(
+            settlement_name(Subject::settlement(result.as_ref())),
+            expected,
+            "{label}"
+        );
     }
 
     // Delegation proof: over a Bypassed-classifying inner, the delegating
     // rows stay Bypassed — the wrapper is not hardcoding Final.
     let ok: Result<Option<()>, DeduplicationError<TestError>> = Ok(Some(()));
-    assert_eq!(Probe::settlement(ok.as_ref()), Settlement::Bypassed);
+    assert_eq!(settlement_name(Probe::settlement(ok.as_ref())), "Bypassed");
     let err: Result<Option<()>, DeduplicationError<TestError>> =
         Err(DeduplicationError::Inner(TestError::Permanent));
-    assert_eq!(Probe::settlement(err.as_ref()), Settlement::Bypassed);
+    assert_eq!(settlement_name(Probe::settlement(err.as_ref())), "Bypassed");
 }
 
-impl FallibleEventHandler for DeduplicationHandler<MockHandler, MemoryDeduplicationStore> {}
+impl FallibleEventHandler
+    for DeduplicationHandler<LeafHandler<MockHandler>, MemoryDeduplicationStore>
+{
+}
 
 /// A dedup skip records no second marker: the store is pre-seeded with the
 /// session's dedup id, the boundary is driven end to end, and the skip

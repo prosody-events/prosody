@@ -412,7 +412,7 @@ async fn shutdown_during_sleep_does_not_double_fire_apply_hook() -> Result<()> {
         base_delay_millis: 1000,
         max_delay_millis: 10_000,
         max_retries: 10,
-        handler: handler.clone(),
+        handler: LeafHandler::new(handler.clone()),
     };
     let context = MockEventContext::new();
 

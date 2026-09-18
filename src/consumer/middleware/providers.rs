@@ -38,23 +38,18 @@ use crate::consumer::message::ConsumerMessage;
 use crate::consumer::{DemandType, EventHandler, HandlerProvider, Partition, Topic};
 use crate::timers::Trigger;
 
+use super::settle::leaf_settlement;
+
 use super::{FallibleHandler, FallibleHandlerProvider, Settlement, SettlementHandler};
 
-/// The chain terminator [`into_provider`] mints around the user's leaf
-/// handler. Its crate-internal settlement
-/// classification is final on both sides — the leaf's result is the event's
-/// own outcome, by definition. Minting it here (instead of a blanket
-/// classification over all handlers) keeps the classification an explicit,
-/// per-wrapper obligation inside the framework while leaving public leaf
-/// handlers untouched.
-///
-/// [`into_provider`]: super::HandlerMiddleware::into_provider
+/// Maps the user's handler result to a settlement action.
+/// [`into_provider`](super::HandlerMiddleware::into_provider) creates this
+/// adapter.
 #[derive(Clone, Debug)]
 pub struct LeafHandler<H>(H);
 
 impl<H> LeafHandler<H> {
-    /// Wraps the user's leaf handler; called only by
-    /// [`into_provider`](super::HandlerMiddleware::into_provider).
+    /// Wraps the user's leaf handler for settlement.
     pub(crate) fn new(handler: H) -> Self {
         Self(handler)
     }
@@ -135,9 +130,8 @@ impl<H> SettlementHandler for LeafHandler<H>
 where
     H: FallibleHandler,
 {
-    /// The handler's own result is the event's own outcome, by definition.
-    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
-        Settlement::Final
+    fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        leaf_settlement(result)
     }
 }
 

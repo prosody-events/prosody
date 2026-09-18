@@ -19,6 +19,8 @@ use thiserror::Error;
 pub mod kafka;
 
 /// Categorizes errors in message processing.
+/// The retry layer reads this classification.
+/// The settlement boundary reads only the leaf adapter's map of it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
 #[cfg_attr(test, derive(strum::VariantArray))]
 #[serde(rename_all = "camelCase")]

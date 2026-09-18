@@ -7,32 +7,23 @@
 //!
 //! 1. **Ordering**: Messages for a key are processed in offset order.
 //!
-//! 2. **Completion**: All messages are processed. Deferred keys always have an
-//!    active timer ensuring eventual processing.
+//! 2. **Completion**: Deferred keys have a retry timer for pending work. A
+//!    bookkeeping failure abandons the source. Each queue append re-arms a
+//!    missing timer.
 //!
 //! 3. **Deferral**: When enabled, all transient errors are deferred. Once
 //!    deferred, transient errors always re-defer (config/decider only gate
 //!    initial deferral).
 //!
-//! # Apply hooks
-//!
-//! The inner is invoked at most once per dispatch; retries arrive as new
-//! `on_timer` dispatches, each with their own apply-hook pairing.
-//! [`MessageDeferOutput`] encodes the routing:
-//!
-//! * `Inner` — inner ran; forward the framework's chosen hook.
-//! * `Deferred` — inner ran and returned a transient error that we captured for
-//!   retry. Both hooks route to `after_abort(Err(..))`: a retry is coming even
-//!   though the dispatch's offset itself commits.
-//! * `NoInner` — inner did not run (queue-append, orphan-timer, loader failure,
-//!   key-mismatch); suppress both hooks.
+//! The inner handler runs at most once per dispatch.
+//! [`DeferOutput`] selects its apply hook.
 
 use super::store::{MessageDeferStore, MessageDeferStoreProvider};
 use crate::JsonCodec;
 use crate::consumer::ConsumerConfiguration;
-use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::{DeferralDecider, FailureTracker};
 use crate::consumer::middleware::defer::error::{DeferError, DeferInitError};
+use crate::consumer::middleware::defer::{DeferConfiguration, DeferOutput};
 use crate::consumer::middleware::{
     FallibleHandler, FallibleHandlerProvider, HandlerMiddleware, Settlement, SettlementHandler,
 };
@@ -48,23 +39,6 @@ mod operations;
 /// Property-based tests for defer handler invariants.
 #[cfg(test)]
 pub mod tests;
-
-/// Output of [`MessageDeferHandler`] dispatches; drives apply-hook routing.
-///
-/// See the module-level apply-hooks section for how `after_commit` /
-/// `after_abort` dispatch on these variants.
-#[derive(Debug)]
-pub enum MessageDeferOutput<O, E> {
-    /// Inner ran and produced an output.
-    Inner(O),
-    /// Inner did not run (queue-append, orphan-timer, loader failure,
-    /// key-mismatch) — suppress both apply hooks.
-    NoInner,
-    /// Inner ran and returned a transient error captured for retry. Both
-    /// apply hooks fire `after_abort(Err(E))`: the retry will re-dispatch
-    /// the same logical message.
-    Deferred(E),
-}
 
 /// Middleware that defers transiently-failed messages for timer-based retry.
 ///
@@ -260,22 +234,18 @@ where
     fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
         match result {
             // Inner ran: its result is the dispatch's outcome.
-            Ok(MessageDeferOutput::Inner(output)) => T::settlement(Ok(output)),
+            Ok(DeferOutput::Inner(output)) => T::settlement(Ok(output)),
             // Inner ran and its error surfaced.
             Err(DeferError::Handler(error)) => T::settlement(Err(error)),
-            // `Deferred`/`NoInner` — parked for retry / queued behind /
-            // handled at the load layer: the outcome lives in the defer
-            // queue, so nothing here may stage or record — the reload must
-            // re-run unfiltered. The error rows are the defer layer's own
-            // rescue failing (store/timer/loader/backoff computation) — a
-            // layer failure, never the event's outcome.
-            Ok(MessageDeferOutput::Deferred(_) | MessageDeferOutput::NoInner)
-            | Err(
+            // The defer layer completed its queue and timer bookkeeping.
+            Ok(DeferOutput::Deferred(_) | DeferOutput::NoInner) => Settlement::Bypassed,
+            // Failed defer bookkeeping abandons the source.
+            Err(
                 DeferError::Store(_)
                 | DeferError::Timer(_)
                 | DeferError::Loader(_)
                 | DeferError::CompactTime(_),
-            ) => Settlement::Bypassed,
+            ) => Settlement::Abandoned,
         }
     }
 }

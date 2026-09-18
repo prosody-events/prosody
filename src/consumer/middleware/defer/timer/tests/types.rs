@@ -56,6 +56,8 @@ pub struct ApplicationTimerEvent {
     pub time: CompactDateTime,
     /// Expected handler result and deferral decision.
     pub outcome: ApplicationTimerOutcome,
+    /// Removes the retry timer before a queued dispatch.
+    pub lost_timer: bool,
 }
 
 // ============================================================================

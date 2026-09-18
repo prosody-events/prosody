@@ -1,5 +1,6 @@
 use super::*;
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::providers::LeafHandler;
 use crate::consumer::middleware::tests::test_support::{
     MockEventContext, ScriptedHandler, ScriptedHook, TestError, create_test_message,
     create_test_trigger,
@@ -18,12 +19,12 @@ use tracing::Span;
 
 use dispatch_signals::create_offset_tracker;
 
-fn create_retry_handler<T>(handler: T, max_retries: u32) -> RetryHandler<T> {
+fn create_retry_handler<T>(handler: T, max_retries: u32) -> RetryHandler<LeafHandler<T>> {
     RetryHandler {
         base_delay_millis: 1, // Very short for tests
         max_delay_millis: 10,
         max_retries,
-        handler,
+        handler: LeafHandler::new(handler),
     }
 }
 

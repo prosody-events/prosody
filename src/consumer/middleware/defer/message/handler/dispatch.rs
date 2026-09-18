@@ -1,6 +1,6 @@
 use tracing::debug;
 
-use super::{MessageDeferHandler, MessageDeferOutput};
+use super::{DeferOutput, MessageDeferHandler};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, ConsumerRecord};
 use crate::consumer::middleware::FallibleHandler;
@@ -28,29 +28,30 @@ where
         context: C,
         message: ConsumerMessage<H::MessagePayload>,
         demand_type: DemandType,
-    ) -> Result<MessageDeferOutput<T::Output, T::Error>, DeferError<M::Error, T::Error, L::Error>>
+    ) -> Result<DeferOutput<T::Output, T::Error>, DeferError<M::Error, T::Error, L::Error>>
     where
         H: HandlerMethod<T>,
         C: EventContext<Payload = T::Payload>,
     {
         // Already deferred: queue after existing messages to preserve order.
         // The inner handler does not run, so return `NoInner`.
-        if self
+        if let Some(retry_count) = self
             .store
             .is_deferred(message.key())
             .await
             .map_err(DeferError::Store)?
-            .is_some()
         {
             let offset = message.offset();
-            return self.append_to_deferred_queue(message.key(), offset).await;
+            return self
+                .append_to_deferred_queue(&context, message.key(), offset, retry_count)
+                .await;
         }
 
         let message_key = message.key().clone();
         let offset = message.offset();
         // Not deferred: call the handler. Defer a transient failure when enabled.
         let error = match H::call(&self.handler, context.clone(), message, demand_type).await {
-            Ok(output) => return Ok(MessageDeferOutput::Inner(output)),
+            Ok(output) => return Ok(DeferOutput::Inner(output)),
             Err(error) => error,
         };
 
@@ -95,9 +96,7 @@ where
     L::Payload: crate::EventIdentity,
 {
     type Error = DeferError<M::Error, T::Error, L::Error>;
-    /// Encodes the inner's outcome; drives apply-hook routing. See
-    /// [`MessageDeferOutput`] and the module-level apply-hooks section.
-    type Output = MessageDeferOutput<T::Output, T::Error>;
+    type Output = DeferOutput<T::Output, T::Error>;
     type Payload = T::Payload;
 
     async fn on_message<C>(
@@ -145,7 +144,7 @@ where
                 .handler
                 .on_timer(context, trigger, demand_type)
                 .await
-                .map(MessageDeferOutput::Inner)
+                .map(DeferOutput::Inner)
                 .map_err(DeferError::Handler);
         }
 
@@ -176,7 +175,7 @@ where
                 .delete_key(message_key)
                 .await
                 .map_err(DeferError::Store)?;
-            return Ok(MessageDeferOutput::NoInner);
+            return Ok(DeferOutput::NoInner);
         };
 
         let Some(message) = self
@@ -186,7 +185,7 @@ where
             // Loader handled the failure (retry rescheduled, queue advanced
             // past a permanent skip, or key-mismatch skip) — inner did not
             // run for this dispatch.
-            return Ok(MessageDeferOutput::NoInner);
+            return Ok(DeferOutput::NoInner);
         };
 
         // The exactly-one set site of the reload identity override:
@@ -257,23 +256,19 @@ where
         // - Deferred(e): inner ran, transient err deferred -> after_abort(Err(e))
         //   (retry coming)
         // - Handler(e):  inner ran and surfaced an error   -> after_commit(Err)
-        // - Store/Timer/Loader: defer-layer rescue failed. Suppress the inner hook
-        //   regardless of whether the inner ran on this dispatch. These errors classify
-        //   as Transient (see `DeferError::classify_error`) so the outer retry layer
-        //   will redrive the whole stack; consistency lives in the failed Result, not
-        //   in the hook. Apply hooks are best-effort — see
-        //   `FallibleHandler::after_commit` docs.
+        // - Store/Timer/Loader/CompactTime: bookkeeping failed; suppress the inner
+        //   hook. Abandoned settlement abandons the source for redelivery.
         match result {
-            Ok(MessageDeferOutput::Inner(output)) => {
+            Ok(DeferOutput::Inner(output)) => {
                 self.handler.after_commit(context, Ok(output)).await;
             }
-            Ok(MessageDeferOutput::Deferred(error)) => {
+            Ok(DeferOutput::Deferred(error)) => {
                 self.handler.after_abort(context, Err(error)).await;
             }
             Err(DeferError::Handler(error)) => {
                 self.handler.after_commit(context, Err(error)).await;
             }
-            Ok(MessageDeferOutput::NoInner) | Err(_) => {}
+            Ok(DeferOutput::NoInner) | Err(_) => {}
         }
     }
 
@@ -284,16 +279,15 @@ where
         // Symmetric to after_commit. Two notes:
         //   - Deferred(e) still routes to after_abort(Err(e)) regardless of the outer
         //     commit/abort decision (a retry is coming via the deferred timer).
-        //   - Store/Timer/Loader rescue-failure paths suppress the inner hook on
-        //     purpose; the outer retry redrives the stack. See after_commit.
+        //   - Bookkeeping failures suppress the inner hook. See after_commit.
         match result {
-            Ok(MessageDeferOutput::Inner(output)) => {
+            Ok(DeferOutput::Inner(output)) => {
                 self.handler.after_abort(context, Ok(output)).await;
             }
-            Ok(MessageDeferOutput::Deferred(error)) | Err(DeferError::Handler(error)) => {
+            Ok(DeferOutput::Deferred(error)) | Err(DeferError::Handler(error)) => {
                 self.handler.after_abort(context, Err(error)).await;
             }
-            Ok(MessageDeferOutput::NoInner) | Err(_) => {}
+            Ok(DeferOutput::NoInner) | Err(_) => {}
         }
     }
 

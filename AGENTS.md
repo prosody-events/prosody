@@ -453,18 +453,19 @@ terminates the chain with the handler as the **INNERMOST** component.
   `retry → message_defer → timer_defer → monopolization →
   dedup → (cancellation → scheduler → timeout → telemetry) → handler`.
 
-**The keyed-state durability sequence is NOT in the stack.** It runs once
-after the stack returns, owned by the `settle` boundary in
-`src/consumer/middleware/settle.rs` (called from the blanket
-`FallibleEventHandler → EventHandler` impl; `retry` routes its final outcome
-through the same `settle`/`abandon`). Whether a dispatch settles the event at
-all is a pure function of the stack's final result: the crate-internal
-`Settlement` classification (`SettlementHandler::settlement`, one explicit
-impl per framework wrapper, the leaf adapter minted at `into_provider`
-hardcoding `Final`) decides `Final` vs `Bypassed` before the error category is
-consulted; the message commit marker is read from the session's event identity
-(`message_marker()` — the message `EventRef`'s dedup id, or the
-deferred-reload's last-wins identity override), never deposited by middleware.
+**The keyed-state durability sequence runs after the stack returns.**
+The boundary in `src/consumer/middleware/settle.rs` owns this sequence.
+The blanket `FallibleEventHandler → EventHandler` implementation calls it.
+The retry layer routes its final outcome through the same `settle` or `abandon` function.
+
+`SettlementHandler::settlement` selects `Final`, `Rejected`, `Bypassed`, or `Abandoned`.
+The leaf adapter maps the handler's error category. The boundary does not read the category.
+Each wrapper forwards inner results or names an action for its own outcomes.
+`Abandoned` aborts the source so unfinished bookkeeping can run again.
+
+The session's event identity supplies the message commit marker through `message_marker()`.
+This identity comes from the message `EventRef` or the deferred reload's last-wins override.
+Middleware does not deposit the marker.
 The boundary stages cells, promotes them, records the message dedup id, and commits the source.
 Read `settle_committed`, `Staged::promote`, and `PartitionStateManager::admit` before changes to this sequence.
 
