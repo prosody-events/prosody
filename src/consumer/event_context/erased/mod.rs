@@ -32,27 +32,48 @@ pub enum ErasedCategory {
     Transient,
 }
 
-/// Erased scan constraints over edges of type `E`.
-/// The default scans forward, unbounded, and without a limit.
+/// Map and set scan constraints. The key edges follow the scan direction.
 #[derive(Clone, Debug)]
-pub struct ScanConfig<E> {
+pub struct KeyScanConfig {
+    /// The scan direction.
+    pub dir: Direction,
+    /// The maximum number of present items.
+    pub limit: Option<NonZeroUsize>,
+    /// The key prefix. Explicit bounds replace its edges.
+    pub prefix: Option<String>,
+    /// The inclusive or exclusive start. An open bound preserves the prefix
+    /// edge.
+    pub start: Bound<String>,
+    /// The inclusive or exclusive end. An open bound preserves the prefix edge.
+    pub end: Bound<String>,
+}
+
+/// Deque scan constraints. The position edges count from the front.
+#[derive(Clone, Debug)]
+pub struct DequeScanConfig {
     /// The scan direction.
     pub dir: Direction,
     /// The maximum number of present items.
     pub limit: Option<NonZeroUsize>,
     /// The inclusive, exclusive, or open range start.
-    pub start: Bound<E>,
+    pub start: Bound<u64>,
     /// The inclusive, exclusive, or open range end.
-    pub end: Bound<E>,
+    pub end: Bound<u64>,
 }
 
-/// Map and set scan constraints. The key edges follow the scan direction.
-pub type KeyScanConfig = ScanConfig<String>;
+impl Default for KeyScanConfig {
+    fn default() -> Self {
+        Self {
+            dir: Direction::Forward,
+            limit: None,
+            prefix: None,
+            start: Bound::Unbounded,
+            end: Bound::Unbounded,
+        }
+    }
+}
 
-/// Deque scan constraints. The position edges count from the front.
-pub type DequeScanConfig = ScanConfig<u64>;
-
-impl<E> Default for ScanConfig<E> {
+impl Default for DequeScanConfig {
     fn default() -> Self {
         Self {
             dir: Direction::Forward,
@@ -315,17 +336,19 @@ fn bound_usize(bound: Bound<u64>) -> Bound<usize> {
 
 /// Encodes the shared map and set query bounds.
 fn key_query(config: KeyScanConfig) -> Query {
-    let edge = |bound: Bound<String>| match bound {
+    let edge = |bound: Bound<String>, current| match bound {
         Bound::Included(key) => ScanEdge::Included(Utf8KeyCodec::encode(&key)),
         Bound::Excluded(key) => ScanEdge::Excluded(Utf8KeyCodec::encode(&key)),
-        Bound::Unbounded => ScanEdge::Unbounded,
+        Bound::Unbounded => current,
     };
-    Query {
-        dir: config.dir,
-        limit: config.limit,
-        start: edge(config.start),
-        end: edge(config.end),
+    let mut query = Query::new(config.dir);
+    query.limit = config.limit;
+    if let Some(prefix) = config.prefix {
+        query.prefix(Utf8KeyCodec::encode(&prefix));
     }
+    query.start = edge(config.start, query.start);
+    query.end = edge(config.end, query.end);
+    query
 }
 
 mod cursor;

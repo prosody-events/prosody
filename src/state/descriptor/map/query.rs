@@ -85,20 +85,9 @@ where
         self
     }
 
-    /// Keeps only keys whose encoding starts with the encoding of `prefix`.
-    /// The range is the same in both directions.
-    /// It sets both edges, so call it before a cursor edge such as `after`.
-    /// For fixed-width keys the range is one key.
-    pub fn prefix(mut self, prefix: &BorrowedKeyOf<L::Cell>) -> Self {
-        let low = <L::Cell as CellType>::Key::encode(prefix);
-        let high = low
-            .prefix_end()
-            .map_or(ScanEdge::Unbounded, ScanEdge::Excluded);
-        let low = ScanEdge::Included(low);
-        (self.query.start, self.query.end) = match self.query.dir {
-            Direction::Forward => (low, high),
-            Direction::Backward => (high, low),
-        };
+    /// Sets both edges to select keys with the encoded prefix.
+    pub fn prefix(mut self, key: &BorrowedKeyOf<L::Cell>) -> Self {
+        self.query.prefix(<L::Cell as CellType>::Key::encode(key));
         self
     }
 
@@ -170,6 +159,23 @@ impl Query {
             start: ScanEdge::Unbounded,
             end: ScanEdge::Unbounded,
         }
+    }
+
+    /// Sets both edges to select coordinates that start with `low`.
+    /// The range is the same in both directions.
+    /// For fixed-width keys the range is one key.
+    /// A cursor edge set after `prefix` must start with the prefix.
+    /// A cursor outside the prefix replaces that edge and the stream can leave
+    /// the prefix.
+    pub(crate) fn prefix(&mut self, low: Coordinate) {
+        let high = low
+            .prefix_end()
+            .map_or(ScanEdge::Unbounded, ScanEdge::Excluded);
+        let low = ScanEdge::Included(low);
+        (self.start, self.end) = match self.dir {
+            Direction::Forward => (low, high),
+            Direction::Backward => (high, low),
+        };
     }
 
     /// Keeps the ascending stored coordinates within the query bounds, in

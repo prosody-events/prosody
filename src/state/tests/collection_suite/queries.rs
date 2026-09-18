@@ -92,7 +92,13 @@ impl Arbitrary for PrefixShape {
                 .collect::<String>()
         };
         let prefix = word(g, 2);
-        let cursor = bool::arbitrary(g).then(|| format!("{prefix}{}", word(g, 3)));
+        let cursor = bool::arbitrary(g).then(|| {
+            if bool::arbitrary(g) {
+                format!("{prefix}{}", word(g, 3))
+            } else {
+                word(g, 3)
+            }
+        });
         Self {
             keys: (0..u8::arbitrary(g) % 64).map(|_| word(g, 3)).collect(),
             prefix,
@@ -102,9 +108,34 @@ impl Arbitrary for PrefixShape {
             tracked: bool::arbitrary(g),
         }
     }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let shape = self.clone();
+        let keys = self.keys.shrink().map(move |keys| Self {
+            keys,
+            ..shape.clone()
+        });
+        let cursor = self.cursor.as_ref().map(|_| Self {
+            cursor: None,
+            ..self.clone()
+        });
+        let limit = self.limit.map(|_| Self {
+            limit: None,
+            ..self.clone()
+        });
+        Box::new(keys.chain(cursor).chain(limit))
+    }
 }
 
 impl PrefixShape {
+    fn contains(&self, key: &str, dir: Direction, end: Option<&str>) -> bool {
+        match (dir, self.cursor.as_deref()) {
+            (Direction::Forward, Some(cursor)) => key > cursor && end.is_none_or(|end| key < end),
+            (Direction::Backward, Some(cursor)) => key < cursor && key >= self.prefix.as_str(),
+            (_, None) => key >= self.prefix.as_str() && end.is_none_or(|end| key < end),
+        }
+    }
+
     fn apply<'a, S, L>(&self, query: KeysetQuery<'a, S, L>) -> KeysetQuery<'a, S, L>
     where
         S: StateSession,
@@ -143,17 +174,16 @@ async fn run_prefix_query(shape: PrefixShape) -> Result<bool> {
         set.insert(key).await?;
     }
 
+    let mut end = shape.prefix.clone();
+    let end = end.pop().map(|last| {
+        end.push(char::from(last as u8 + 1));
+        end
+    });
     let distinct: BTreeSet<_> = shape.keys.iter().cloned().collect();
     for dir in [Direction::Forward, Direction::Backward] {
         let mut expected: Vec<_> = distinct
             .iter()
-            .filter(|key| key.starts_with(&shape.prefix))
-            .filter(|key| {
-                shape.cursor.as_ref().is_none_or(|cursor| match dir {
-                    Direction::Forward => *key > cursor,
-                    Direction::Backward => *key < cursor,
-                })
-            })
+            .filter(|key| shape.contains(key, dir, end.as_deref()))
             .cloned()
             .collect();
         if dir == Direction::Backward {
@@ -171,7 +201,7 @@ async fn run_prefix_query(shape: PrefixShape) -> Result<bool> {
     Ok(true)
 }
 
-/// Both plans preserve prefixes, cursor exclusion, direction, and result
+/// Both plans preserve prefix edges, cursor replacement, direction, and result
 /// limits.
 #[test]
 fn prop_prefix_query() {
