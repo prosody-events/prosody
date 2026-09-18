@@ -27,6 +27,10 @@
 //!
 //! Message and timer defer middlewares compose independently via `.layer()`.
 
+use self::message::store::MemoryMessageDeferStoreProvider;
+use self::segment::MemorySegmentStore;
+use self::timer::store::MemoryTimerDeferStoreProvider;
+use crate::otel::SpanRelation;
 use crate::timers::duration::CompactDuration;
 use rand::RngExt;
 use std::cmp::min;
@@ -47,6 +51,25 @@ pub use timer::{TimerDeferMiddleware, TimerDeferProvider};
 // ============================================================================
 // Utility Functions
 // ============================================================================
+
+/// Memory mode's defer substrates: one registry of deferred segments and the
+/// two providers that write it.
+///
+/// Both providers share the returned registry, as one `CassandraSegmentStore`
+/// serves both Cassandra providers. A registry per provider would hide every
+/// segment the other provider registered from a reader of the registry.
+pub(crate) fn memory_providers(
+    timer_spans: SpanRelation,
+) -> (
+    MemorySegmentStore,
+    MemoryMessageDeferStoreProvider,
+    MemoryTimerDeferStoreProvider,
+) {
+    let segments = MemorySegmentStore::new();
+    let messages = MemoryMessageDeferStoreProvider::new(segments.clone());
+    let timers = MemoryTimerDeferStoreProvider::new(segments.clone(), timer_spans);
+    (segments, messages, timers)
+}
 
 /// Jittered exponential backoff: `random(1, min(base * 2^retry, max))`.
 ///

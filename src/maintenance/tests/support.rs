@@ -4,6 +4,7 @@
 //! and reads that backend's catalog, so both backends answer the same trace.
 
 use super::trace::{CatalogTrace, Effect, Model, Snapshot, key_name, timer_segment, topic};
+use crate::consumer::middleware::defer::memory_providers;
 use crate::consumer::middleware::defer::message::store::cassandra::MessageQueries;
 use crate::consumer::middleware::defer::message::store::{
     CassandraMessageDeferStoreProvider, MessageDeferStore, MessageDeferStoreProvider,
@@ -13,10 +14,11 @@ use crate::consumer::middleware::defer::timer::store::cassandra::queries::Querie
 use crate::consumer::middleware::defer::timer::store::{
     CassandraTimerDeferStoreProvider, TimerDeferStore, TimerDeferStoreProvider,
 };
-use crate::maintenance::{CassandraCatalog, Catalog, GroupId};
+use crate::maintenance::{CassandraCatalog, Catalog, GroupId, MemoryCatalog};
 use crate::otel::SpanRelation;
 use crate::test_util::{TEST_KEYSPACE, shared_cassandra_store};
 use crate::timers::store::cassandra::CassandraTriggerStoreProvider;
+use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use crate::timers::store::{TriggerStore, TriggerStoreProvider};
 use crate::timers::{TimerType, Trigger};
 use crate::{Key, Partition};
@@ -89,6 +91,19 @@ impl CassandraFixture {
 /// The Cassandra fixture, prepared once for the test process.
 pub(super) async fn cassandra_fixture() -> Result<&'static CassandraFixture> {
     CASSANDRA.get_or_try_init(CassandraFixture::build).await
+}
+
+/// Drives `trace` through memory mode's production stores, then reads the
+/// memory catalog.
+///
+/// The providers come from the production wiring, so the catalog reads the one
+/// registry both providers write.
+pub(super) async fn run_memory(trace: &CatalogTrace, group: &GroupId) -> Result<Snapshot> {
+    let (segments, messages, timers) = memory_providers(SpanRelation::default());
+    let triggers = InMemoryTriggerStoreProvider::new();
+    let catalog = MemoryCatalog::new(segments, messages.clone(), timers.clone(), triggers.clone());
+
+    run_trace(trace, group, &triggers, &messages, &timers, &catalog).await
 }
 
 /// Drives `trace` through one backend's production stores, then reads that

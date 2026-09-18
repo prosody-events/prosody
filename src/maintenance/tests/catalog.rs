@@ -1,20 +1,15 @@
 //! The catalog reports exactly what the production stores hold, on either
 //! backend.
 
-use super::support::{cassandra_fixture, finish, run_trace};
+use super::support::{cassandra_fixture, finish, run_memory};
 use super::trace::{CatalogTrace, expected_snapshot, fresh_group, segment};
 use crate::cassandra::TABLE_SEGMENTS;
-use crate::consumer::middleware::defer::message::store::MemoryMessageDeferStoreProvider;
-use crate::consumer::middleware::defer::segment::MemorySegmentStore;
-use crate::consumer::middleware::defer::timer::store::MemoryTimerDeferStoreProvider;
-use crate::maintenance::{Catalog, MemoryCatalog};
-use crate::otel::SpanRelation;
+use crate::maintenance::Catalog;
 use crate::test_util::{
     TEST_KEYSPACE, TEST_RUNTIME, integration_test_count, shared_cassandra_store,
 };
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::SegmentVersion;
-use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use quickcheck::{QuickCheck, TestResult};
@@ -29,16 +24,8 @@ fn prop_memory_catalog_matches_the_trace() {
     fn property(trace: CatalogTrace) -> TestResult {
         finish(TEST_RUNTIME.block_on(async move {
             let group = fresh_group();
-            let segments = MemorySegmentStore::new();
-            let messages = MemoryMessageDeferStoreProvider::new(segments.clone());
-            let timers =
-                MemoryTimerDeferStoreProvider::new(segments.clone(), SpanRelation::default());
-            let triggers = InMemoryTriggerStoreProvider::new();
-            let catalog =
-                MemoryCatalog::new(segments, messages.clone(), timers.clone(), triggers.clone());
 
-            let observed =
-                run_trace(&trace, &group, &triggers, &messages, &timers, &catalog).await?;
+            let observed = run_memory(&trace, &group).await?;
             ensure!(
                 observed == expected_snapshot(&trace, &group),
                 "memory catalog disagreed with the model\nobserved: {observed:#?}\nexpected: {:#?}",
@@ -62,15 +49,7 @@ fn prop_catalog_parity() {
         finish(TEST_RUNTIME.block_on(async move {
             let group = fresh_group();
 
-            let segments = MemorySegmentStore::new();
-            let messages = MemoryMessageDeferStoreProvider::new(segments.clone());
-            let timers =
-                MemoryTimerDeferStoreProvider::new(segments.clone(), SpanRelation::default());
-            let triggers = InMemoryTriggerStoreProvider::new();
-            let catalog =
-                MemoryCatalog::new(segments, messages.clone(), timers.clone(), triggers.clone());
-            let memory = run_trace(&trace, &group, &triggers, &messages, &timers, &catalog).await?;
-
+            let memory = run_memory(&trace, &group).await?;
             let cassandra = cassandra_fixture().await?.run(&trace, &group).await?;
 
             let expected = expected_snapshot(&trace, &group);

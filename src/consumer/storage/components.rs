@@ -7,16 +7,15 @@ use crate::consumer::middleware::deduplication::DeduplicationStoreProvider;
 use crate::consumer::middleware::deduplication::cassandra::CassandraDeduplicationStoreProvider;
 use crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStoreProvider;
 use crate::consumer::middleware::deduplication::queries::DeduplicationQueries;
-use crate::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
+use crate::consumer::middleware::defer::memory_providers;
 use crate::consumer::middleware::defer::message::store::cassandra::MessageQueries;
 use crate::consumer::middleware::defer::message::store::{
-    CassandraMessageDeferStoreProvider, MemoryMessageDeferStoreProvider,
+    CassandraMessageDeferStoreProvider, MemoryMessageDeferStoreProvider, MessageDeferStoreProvider,
 };
-use crate::consumer::middleware::defer::segment::{CassandraSegmentStore, MemorySegmentStore};
-use crate::consumer::middleware::defer::timer::store::TimerDeferStoreProvider;
+use crate::consumer::middleware::defer::segment::CassandraSegmentStore;
 use crate::consumer::middleware::defer::timer::store::cassandra::queries::Queries as TimerQueries;
 use crate::consumer::middleware::defer::timer::store::{
-    CassandraTimerDeferStoreProvider, MemoryTimerDeferStoreProvider,
+    CassandraTimerDeferStoreProvider, MemoryTimerDeferStoreProvider, TimerDeferStoreProvider,
 };
 use crate::consumer::observer::KafkaObserver;
 use crate::consumer::wiring::state::{
@@ -112,13 +111,11 @@ where
         loader.clone(),
         publisher,
     );
-    // One registry serves both memory defer providers, as the Cassandra arm
-    // passes one `CassandraSegmentStore` to both of its providers.
-    let segments = MemorySegmentStore::new();
+    let (_, messages, timers) = memory_providers(inputs.timer_spans);
     Ok(ConsumerComponents {
         trigger: InMemoryTriggerStoreProvider::new(),
-        messages: MemoryMessageDeferStoreProvider::new(segments.clone()),
-        timers: MemoryTimerDeferStoreProvider::new(segments, inputs.timer_spans),
+        messages,
+        timers,
         dedup,
         state,
         loader,
