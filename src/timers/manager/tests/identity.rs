@@ -187,7 +187,7 @@ where
     /// The actor pops the queue entry before this dispatch, as in production.
     /// Paused time advances to a pending coordinate. A delivery for the other
     /// coordinate waits in the inbox. An older delivery for the same
-    /// coordinate is a dead attempt and is dropped.
+    /// coordinate is a dead attempt, so the inbox drops it.
     async fn deliver(&mut self, index: usize, tag: i32) -> Result<PendingTimer<MemoryStore>> {
         loop {
             if let Some(pending) = self.inbox[index].take_if(|pending| pending.trigger().tag == tag)
@@ -335,9 +335,9 @@ async fn run_identity_trace(trace: IdentityTrace) -> Result<()> {
     check_loaded_identity(&manager, &mut stream, &loaded).await?;
 
     // Index 0 starts the loaded slab and is due at insert. Index 1 sits two
-    // seconds ahead: `now()` rounds to the nearest second, so its queue entry
-    // waits until a dispatch advances paused time. The first load reaches at
-    // least sixty seconds ahead, so the actor owns both coordinates.
+    // seconds ahead, because `now()` rounds to the nearest second. Its queue
+    // entry waits until a dispatch advances paused time. The first load
+    // reaches at least sixty seconds ahead, so the actor owns both coordinates.
     let base = Slab::from_time(manager.0.store.slab_size(), loaded.time)
         .range()
         .start;
