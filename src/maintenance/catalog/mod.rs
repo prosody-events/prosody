@@ -48,9 +48,9 @@ pub trait Catalog: Clone + Send + Sync + 'static {
 
     /// Keys with deferred message rows in one segment.
     ///
-    /// A key can come back with an empty queue. No production path writes a
-    /// retry count with no queue row, so a caller reads the queue head and
-    /// drops the key when the head is absent.
+    /// A key can come back with an empty queue. A caller reads the queue head
+    /// through the production store and drops the key when the head is absent.
+    /// No production path writes a retry count with no queue row.
     fn message_keys(
         &self,
         id: DeferSegmentId,

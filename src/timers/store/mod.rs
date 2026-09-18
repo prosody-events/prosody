@@ -185,8 +185,8 @@ pub struct Segment {
 }
 
 impl Segment {
-    /// Canonical per-Kafka-partition segment: id derived from
-    /// `{group}:{topic}/{partition}`, layout V4.
+    /// Canonical per-Kafka-partition segment: name and id from
+    /// `crate::segment::timer_segment_name` and `timer_segment_id`, layout V4.
     ///
     /// The partition loop creates this segment once at acquisition.
     /// State admission receives the resulting trigger store.

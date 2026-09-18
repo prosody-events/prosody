@@ -3,8 +3,9 @@
 //! This file is the only place in the crate that uses `ALLOW FILTERING`. The
 //! deferred message and timer tables are keyed by `(segment_id, key)`, and a
 //! maintenance run knows only the segment, so Cassandra must filter the rest.
-//! Production code must never copy this: every production read names a whole
-//! partition key.
+//! The filter walks every token range of the table, so one scan costs the
+//! table and not the segment. Production code must never copy this: every
+//! production read names a whole partition key.
 //!
 //! The scans read at one replica and fetch small pages, so a maintenance run
 //! never competes with a live consumer group for a coordinator. A stale row

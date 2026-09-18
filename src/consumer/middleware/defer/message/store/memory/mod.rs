@@ -185,7 +185,12 @@ impl MessageDeferStore for MemoryMessageDeferStore {
 /// for the same segment observe each other's rows, exactly as two Cassandra
 /// stores over one partition do. A fresh map per `create_store` would make
 /// every durable row vanish with the store that wrote it. The map is keyed by
-/// segment id and key, so segments cannot collide. It drops with the provider.
+/// segment id and key, so segments cannot collide.
+///
+/// A row leaves the map when its queue drains or `delete_key` runs. A queue a
+/// revoked partition leaves behind stays until the provider drops, because
+/// memory mode has no TTL. Cassandra reclaims the same rows through the base
+/// TTL every deferred write binds.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryMessageDeferStoreProvider {
     segments: MemorySegmentStore,
@@ -202,14 +207,14 @@ impl MemoryMessageDeferStoreProvider {
         }
     }
 
-    /// Keys with a non-empty deferred queue in one segment. A snapshot; it
-    /// drops with the caller's stream.
+    /// Keys with a deferred queue in one segment. A snapshot of the whole
+    /// shared map; it drops with the caller's stream.
     pub(crate) async fn keys(&self, segment: SegmentId) -> Vec<Key> {
         let mut out = Vec::new();
         self.inner
             .deferred
-            .iter_async(|(id, key), (offsets, _)| {
-                if *id == segment && !offsets.is_empty() {
+            .iter_async(|(id, key), _| {
+                if *id == segment {
                     out.push(Arc::clone(key));
                 }
                 true

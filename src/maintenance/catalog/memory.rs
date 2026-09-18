@@ -35,8 +35,13 @@ pub struct MemoryCatalog {
 
 impl MemoryCatalog {
     /// Builds a catalog over the substrates these providers share.
+    ///
+    /// Crate-private, because no caller outside the crate can name the
+    /// parameter types. The tests are its only caller until a memory-mode
+    /// maintenance client calls it.
+    #[cfg(test)]
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         segments: MemorySegmentStore,
         messages: MemoryMessageDeferStoreProvider,
         timers: MemoryTimerDeferStoreProvider,

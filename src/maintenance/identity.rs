@@ -78,8 +78,8 @@ impl Segment {
     }
 }
 
-/// Renders the segment for a human. The timer segment name comes from
-/// `timer_segment_name`, and the two strings differ by one separator character.
+/// Renders the segment for a human. Do not use this string as the timer
+/// segment name: `crate::segment::timer_segment_name` builds that.
 impl fmt::Display for Segment {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}/{}", self.group, self.topic, self.partition)
