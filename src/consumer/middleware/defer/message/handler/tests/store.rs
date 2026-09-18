@@ -1,11 +1,14 @@
 //! Store faults for deferred-message traces.
 
-use super::super::super::store::{MessageDeferStore, MessageRetryCompletionResult};
-use crate::error::{ClassifyError, ErrorCategory};
+use super::super::super::store::MessageDeferStore;
+use super::context::TimerCapture;
 use crate::{Key, Offset};
-use parking_lot::Mutex;
-use std::sync::Arc;
-use thiserror::Error;
+use std::future::Future;
+
+use crate::consumer::middleware::tests::test_support::faults::{
+    FailableStoreError, FaultKind, FaultSlot,
+};
+use quickcheck::{Arbitrary, Gen};
 
 /// Selects the store call that receives a fault.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,60 +19,91 @@ pub enum StoreOp {
     DeferFirst,
     /// Appends an offset.
     DeferAdditional,
-    /// Completes a retry and advances the queue.
-    CompleteRetrySuccess,
     /// Increases the retry count.
     IncrementRetryCount,
     /// Reads the queue head.
     GetNext,
+    /// Removes one message.
+    Remove,
     /// Deletes the key.
     DeleteKey,
 }
 
-/// Selects an injected error category.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FaultKind {
-    /// Reports a transient error.
-    Transient,
-    /// Reports a permanent error.
-    Permanent,
+impl Arbitrary for StoreOp {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let ops = [
+            Self::IsDeferred,
+            Self::DeferFirst,
+            Self::DeferAdditional,
+            Self::IncrementRetryCount,
+            Self::GetNext,
+            Self::Remove,
+            Self::DeleteKey,
+        ];
+        ops[usize::arbitrary(g) % ops.len()]
+    }
 }
 
-/// Injects one error before the selected store call changes state.
+/// Injects one error before the selected store call changes state, and checks
+/// the timer rule after each queue write.
 #[derive(Clone)]
 pub struct FailableStore<S> {
     inner: S,
-    next_fault: Arc<Mutex<Option<(StoreOp, FaultKind)>>>,
+    capture: TimerCapture,
+    pub(super) next_fault: FaultSlot<StoreOp>,
 }
 
 impl<S> FailableStore<S> {
-    /// Wraps the store with an empty fault slot.
-    pub fn new(inner: S) -> Self {
+    /// Wraps the store with an empty fault slot. The slot shares the
+    /// capture's phase, so the store sees the trigger under dispatch.
+    pub fn new(inner: S, capture: TimerCapture) -> Self {
         Self {
+            next_fault: FaultSlot::sharing(capture.next_fault.phase()),
             inner,
-            next_fault: Arc::default(),
+            capture,
         }
     }
 
-    /// Arms one fault for the selected call.
-    pub fn set_fault(&self, fault: Option<(StoreOp, FaultKind)>) {
-        *self.next_fault.lock() = fault;
-    }
+    /// Runs one queue write, then checks the rule. A queue that stays
+    /// non-empty keeps a retry timer that fires again. The trigger under
+    /// dispatch has already fired, so it counts only when the dispatch
+    /// re-armed its time. A violation is recorded, not raised: the handler
+    /// must see the write succeed. The property reads it through
+    /// `take_uncovered`.
+    async fn write<T>(
+        &self,
+        op: StoreOp,
+        key: &Key,
+        write: impl Future<Output = Result<T, S::Error>>,
+    ) -> Result<T, FailableStoreError<S::Error>>
+    where
+        S: MessageDeferStore,
+    {
+        self.check(op)?;
+        let value = write.await.map_err(FailableStoreError::Inner)?;
 
-    /// Reports whether a fault still awaits its selected call.
-    pub fn fault_pending(&self) -> bool {
-        self.next_fault.lock().is_some()
+        let deferred = self
+            .inner
+            .is_deferred(key)
+            .await
+            .map_err(FailableStoreError::Inner)?;
+        if deferred.is_some()
+            && !self
+                .capture
+                .fires_again(key, self.next_fault.phase().fired())
+        {
+            self.next_fault.record_uncovered(op);
+        }
+
+        Ok(value)
     }
 
     fn check<E>(&self, op: StoreOp) -> Result<(), FailableStoreError<E>> {
-        let mut slot = self.next_fault.lock();
-        if let Some((target, kind)) = *slot
-            && target == op
-        {
-            *slot = None;
+        if let Some(kind) = self.next_fault.check(op) {
             return Err(match kind {
                 FaultKind::Transient => FailableStoreError::Transient,
                 FaultKind::Permanent => FailableStoreError::Permanent,
+                FaultKind::Terminal => FailableStoreError::Terminal,
             });
         }
         Ok(())
@@ -80,31 +114,21 @@ impl<S: MessageDeferStore> MessageDeferStore for FailableStore<S> {
     type Error = FailableStoreError<S::Error>;
 
     async fn defer_first_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        self.check(StoreOp::DeferFirst)?;
-        self.inner
-            .defer_first_message(key, offset)
-            .await
-            .map_err(FailableStoreError::Inner)
+        self.write(
+            StoreOp::DeferFirst,
+            key,
+            self.inner.defer_first_message(key, offset),
+        )
+        .await
     }
 
     async fn defer_additional_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        self.check(StoreOp::DeferAdditional)?;
-        self.inner
-            .defer_additional_message(key, offset)
-            .await
-            .map_err(FailableStoreError::Inner)
-    }
-
-    async fn complete_retry_success(
-        &self,
-        key: &Key,
-        offset: Offset,
-    ) -> Result<MessageRetryCompletionResult, Self::Error> {
-        self.check(StoreOp::CompleteRetrySuccess)?;
-        self.inner
-            .complete_retry_success(key, offset)
-            .await
-            .map_err(FailableStoreError::Inner)
+        self.write(
+            StoreOp::DeferAdditional,
+            key,
+            self.inner.defer_additional_message(key, offset),
+        )
+        .await
     }
 
     async fn increment_retry_count(
@@ -112,11 +136,12 @@ impl<S: MessageDeferStore> MessageDeferStore for FailableStore<S> {
         key: &Key,
         current_retry_count: u32,
     ) -> Result<u32, Self::Error> {
-        self.check(StoreOp::IncrementRetryCount)?;
-        self.inner
-            .increment_retry_count(key, current_retry_count)
-            .await
-            .map_err(FailableStoreError::Inner)
+        self.write(
+            StoreOp::IncrementRetryCount,
+            key,
+            self.inner.increment_retry_count(key, current_retry_count),
+        )
+        .await
     }
 
     async fn get_next_deferred_message(
@@ -139,27 +164,30 @@ impl<S: MessageDeferStore> MessageDeferStore for FailableStore<S> {
     }
 
     async fn append_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        self.check(StoreOp::DeferAdditional)?;
-        self.inner
-            .append_deferred_message(key, offset)
-            .await
-            .map_err(FailableStoreError::Inner)
+        self.write(
+            StoreOp::DeferAdditional,
+            key,
+            self.inner.append_deferred_message(key, offset),
+        )
+        .await
     }
 
     async fn remove_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        self.check(StoreOp::CompleteRetrySuccess)?;
-        self.inner
-            .remove_deferred_message(key, offset)
-            .await
-            .map_err(FailableStoreError::Inner)
+        self.write(
+            StoreOp::Remove,
+            key,
+            self.inner.remove_deferred_message(key, offset),
+        )
+        .await
     }
 
     async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
-        self.check(StoreOp::IncrementRetryCount)?;
-        self.inner
-            .set_retry_count(key, retry_count)
-            .await
-            .map_err(FailableStoreError::Inner)
+        self.write(
+            StoreOp::IncrementRetryCount,
+            key,
+            self.inner.set_retry_count(key, retry_count),
+        )
+        .await
     }
 
     async fn delete_key(&self, key: &Key) -> Result<(), Self::Error> {
@@ -168,29 +196,5 @@ impl<S: MessageDeferStore> MessageDeferStore for FailableStore<S> {
             .delete_key(key)
             .await
             .map_err(FailableStoreError::Inner)
-    }
-}
-
-/// Reports an injected error or the inner store's error.
-#[derive(Debug, Error)]
-pub enum FailableStoreError<E> {
-    /// Reports an injected transient store error.
-    #[error("injected transient store failure")]
-    Transient,
-    /// Reports an injected permanent store error.
-    #[error("injected permanent store failure")]
-    Permanent,
-    /// Retains the inner store error.
-    #[error("inner store error: {0}")]
-    Inner(E),
-}
-
-impl<E: ClassifyError> ClassifyError for FailableStoreError<E> {
-    fn classify_error(&self) -> ErrorCategory {
-        match self {
-            Self::Transient => ErrorCategory::Transient,
-            Self::Permanent => ErrorCategory::Permanent,
-            Self::Inner(error) => error.classify_error(),
-        }
     }
 }

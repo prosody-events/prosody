@@ -164,7 +164,7 @@ impl FallibleHandler for ProbeHandler {
 
 /// A commit guard that records whether it was committed or aborted, so a
 /// test can assert which terminal the durability sequence chose.
-struct RecordingGuard {
+pub(crate) struct RecordingGuard {
     committed: Arc<AtomicUsize>,
     aborted: Arc<AtomicUsize>,
 }
@@ -172,7 +172,7 @@ struct RecordingGuard {
 impl RecordingGuard {
     /// A fresh guard and the two counters it records into, in
     /// `(guard, committed, aborted)` order.
-    fn new() -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    pub(crate) fn new() -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let committed: Arc<AtomicUsize> = Arc::default();
         let aborted: Arc<AtomicUsize> = Arc::default();
         (

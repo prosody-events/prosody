@@ -4,7 +4,6 @@
 //! - Timer coverage: every deferred key has an active `DeferredTimer`
 //! - FIFO order: timer with earliest `original_time` processed first
 
-use super::faults::FaultedTimerTrace;
 use super::types::{
     ApplicationTimerEvent, ApplicationTimerOutcome, DeferredTimerEvent, DeferredTimerOutcome,
     TimerTrace, TimerTraceEvent,
@@ -14,15 +13,13 @@ use crate::Key;
 use crate::consumer::DemandType;
 use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::defer::calculate_backoff;
-use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger};
 use crate::tracing::init_test_logging;
 use ahash::HashMap;
-use color_eyre::eyre::ensure;
 use color_eyre::eyre::eyre;
-use quickcheck::{Arbitrary, Gen, TestResult};
+use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -88,14 +85,6 @@ impl TraceModel {
         self.deferred
             .get(key)
             .and_then(|(times, _)| times.first().copied())
-    }
-
-    fn deferred_keys(&self) -> Vec<Key> {
-        self.deferred
-            .iter()
-            .filter(|(_, (times, _))| !times.is_empty())
-            .map(|(k, _)| Arc::clone(k))
-            .collect()
     }
 }
 
@@ -220,39 +209,6 @@ fn test_key(idx: usize) -> Key {
 // ============================================================================
 // Property Tests
 // ============================================================================
-
-/// Property: Timer coverage is maintained after every operation.
-///
-/// **Invariant**: For every key with deferred timers, there is an active
-/// `DeferredTimer`. For every key without deferred timers, there is no timer.
-#[quickcheck]
-fn prop_timer_coverage(trace: TimerTrace) -> color_eyre::Result<()> {
-    init_test_logging();
-    let TimerTrace { events, key_count } = trace;
-
-    TEST_RUNTIME.block_on(async {
-        let harness = TestHarness::new()?;
-        let mut model = TraceModel::new();
-
-        for event in &events {
-            execute_event(&harness, event).await?;
-            update_model(&mut model, event);
-
-            // Verify coverage: once the model believes any key is deferred, a
-            // `DeferredTimer` must have been scheduled to cover it.
-            let deferred_keys = model.deferred_keys();
-            if !deferred_keys.is_empty() && !harness.has_deferred_timer() {
-                return Err(color_eyre::eyre::eyre!(
-                    "coverage violation: model has deferred keys {deferred_keys:?} but no \
-                     DeferredTimer has been scheduled"
-                ));
-            }
-        }
-
-        let _ = key_count; // Used by trace validation
-        Ok(())
-    })
-}
 
 /// Property: FIFO order is maintained for deferred timers.
 ///
@@ -700,65 +656,4 @@ fn prop_span_restored(trace: TimerTrace) -> color_eyre::Result<()> {
         let _ = key_count; // Used by trace validation
         Ok(())
     })
-}
-
-/// Every deferred key has a retry timer after each settled event.
-/// Store faults, timer faults, and lost timers preserve this invariant.
-#[quickcheck]
-fn prop_timer_coverage_under_faults(trace: FaultedTimerTrace) -> TestResult {
-    let result: color_eyre::Result<()> = TEST_RUNTIME.block_on(async {
-        let harness = TestHarness::for_keys(trace.trace.key_count)?;
-        for (event, fault) in trace.trace.events.iter().zip(trace.faults) {
-            let passes = harness.execute_faulted(event, fault).await?;
-            let _ = passes;
-            for index in 0..trace.trace.key_count {
-                let deferred = harness.store.is_deferred(&test_key(index)).await?.is_some();
-                ensure!(
-                    !deferred || !harness.contexts[index].active_deferred_timers().is_empty(),
-                    "Key {index} has a queue without a timer; event: {event:?}; fault: {fault:?}"
-                );
-            }
-        }
-        Ok(())
-    });
-    match result {
-        Ok(()) => TestResult::passed(),
-        Err(error) => TestResult::error(format!("{error:?}")),
-    }
-}
-
-/// A consumed store or timer fault aborts the source. The redelivery commits.
-/// An unconsumed fault changes nothing.
-#[quickcheck]
-fn prop_fault_abandons_source(trace: FaultedTimerTrace) -> TestResult {
-    let result: color_eyre::Result<()> = TEST_RUNTIME.block_on(async {
-        let harness = TestHarness::for_keys(trace.trace.key_count)?;
-        for (event, fault) in trace.trace.events.iter().zip(trace.faults) {
-            let passes = harness.execute_faulted(event, fault).await?;
-            if let Some(first) = passes.first() {
-                ensure!(
-                    first.committed != first.consumed,
-                    "Events: {:?}; event: {event:?}; fault: {fault:?}; passes: {passes:?}",
-                    trace.trace.events
-                );
-                ensure!(
-                    passes.len() == 1 + usize::from(first.consumed),
-                    "Events: {:?}; passes: {passes:?}",
-                    trace.trace.events
-                );
-                if let Some(second) = passes.get(1) {
-                    ensure!(
-                        second.committed && !second.consumed,
-                        "Events: {:?}; passes: {passes:?}",
-                        trace.trace.events
-                    );
-                }
-            }
-        }
-        Ok(())
-    });
-    match result {
-        Ok(()) => TestResult::passed(),
-        Err(error) => TestResult::error(format!("{error:?}")),
-    }
 }

@@ -17,8 +17,12 @@
 //! 5. **Success/Failure**: On success advance queue, on transient re-defer, on
 //!    permanent skip
 //!
-//! Deferred keys have a retry timer for pending work. A bookkeeping failure
-//! abandons the source. Each queue append re-arms a missing timer.
+//! # Invariants
+//!
+//! 1. **Completion**: A key with a non-empty deferred queue has a scheduled
+//!    retry timer. Every queue write follows the timer write that covers it. A
+//!    failed timer write leaves the queue unchanged, and the redelivery repeats
+//!    the step.
 //!
 //! # Apply hooks
 //!
@@ -240,18 +244,18 @@ where
             Ok(TimerDeferOutput::Inner(output)) => T::settlement(Ok(output)),
             // Inner ran and its error surfaced.
             Err(DeferError::Handler(error)) => T::settlement(Err(error)),
-            // The outcome lives in the defer queue. Nothing here stages or
-            // records.
-            Ok(TimerDeferOutput::Deferred(_) | TimerDeferOutput::NoInner) => Settlement::Bypassed,
-            // Defer bookkeeping failed. A committed source would strand the
-            // queue without a timer. Abandon so the redelivery repeats the
-            // bookkeeping.
-            Err(
+            // `Deferred`/`NoInner` — parked for retry / queued behind /
+            // orphan cleanup: the outcome lives in the defer queue, so
+            // nothing here may stage or record. The error rows are the defer
+            // layer's own rescue failing (store/timer/loader/backoff
+            // computation) — a layer failure, never the event's outcome.
+            Ok(TimerDeferOutput::Deferred(_) | TimerDeferOutput::NoInner)
+            | Err(
                 DeferError::Store(_)
                 | DeferError::Timer(_)
                 | DeferError::Loader(_)
                 | DeferError::CompactTime(_),
-            ) => Settlement::Abandoned,
+            ) => Settlement::Bypassed,
         }
     }
 }

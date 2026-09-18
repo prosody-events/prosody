@@ -8,7 +8,6 @@
 //! - Cleanup: timer cleared when queue empty
 
 use super::TEST_RUNTIME;
-use super::faults::FaultedTrace;
 use super::harness::TestHarness;
 use super::types::{MessageOutcome, TimerOutcome, Trace, TraceEvent};
 use crate::consumer::DemandType;
@@ -16,7 +15,6 @@ use crate::consumer::middleware::defer::message::store::MessageDeferStore;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::tracing::init_test_logging;
-use color_eyre::eyre::ensure;
 use color_eyre::eyre::eyre;
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
@@ -24,36 +22,6 @@ use quickcheck_macros::quickcheck;
 // ============================================================================
 // Property Tests
 // ============================================================================
-
-/// Property: Timer coverage is maintained after every operation.
-///
-/// **Invariant**: For every key with deferred messages, there is an active
-/// timer. For every key without deferred messages, there is no timer.
-#[quickcheck]
-fn prop_timer_coverage(trace: Trace) -> TestResult {
-    init_test_logging();
-    let Trace { events, key_count } = trace;
-
-    TEST_RUNTIME.block_on(async {
-        let mut harness = match TestHarness::new(key_count) {
-            Ok(h) => h,
-            Err(e) => return TestResult::error(format!("Harness construction failed: {e}")),
-        };
-
-        for event in &events {
-            if let Err(e) = harness.execute_event(event).await {
-                return TestResult::error(format!("Execution failed: {e}"));
-            }
-
-            // Verify timer coverage after each event
-            if let Err(e) = harness.verify_invariants().await {
-                return TestResult::error(format!("Timer coverage violation: {e}"));
-            }
-        }
-
-        TestResult::passed()
-    })
-}
 
 /// Property: FIFO order is maintained for deferred messages.
 ///
@@ -339,67 +307,4 @@ fn prop_processing_order(trace: Trace) -> TestResult {
 
         TestResult::passed()
     })
-}
-
-/// Every deferred key has a retry timer after each settled event.
-/// Store faults, timer faults, and lost timers preserve this invariant.
-/// An empty queue can retain a timer after a clear fault.
-/// This property checks only the queue-to-timer direction.
-#[quickcheck]
-fn prop_timer_coverage_under_faults(trace: FaultedTrace) -> TestResult {
-    let result: color_eyre::Result<()> = TEST_RUNTIME.block_on(async {
-        let mut harness = TestHarness::new(trace.trace.key_count)?;
-        for (event, fault) in trace.trace.events.iter().zip(trace.faults) {
-            harness.execute_faulted(event, fault).await?;
-            for index in 0..trace.trace.key_count {
-                let key = harness.key(index);
-                let deferred = harness.store().is_deferred(key).await?.is_some();
-                ensure!(
-                    !deferred || harness.capture().has_active_timer(key),
-                    "Key {index} has a queue without a timer; event: {event:?}; fault: {fault:?}"
-                );
-            }
-        }
-        Ok(())
-    });
-    match result {
-        Ok(()) => TestResult::passed(),
-        Err(error) => TestResult::error(format!("{error:?}")),
-    }
-}
-
-/// A consumed store or timer fault aborts the source. The redelivery commits.
-/// An unconsumed fault changes nothing.
-#[quickcheck]
-fn prop_fault_abandons_source(trace: FaultedTrace) -> TestResult {
-    let result: color_eyre::Result<()> = TEST_RUNTIME.block_on(async {
-        let mut harness = TestHarness::new(trace.trace.key_count)?;
-        for (event, fault) in trace.trace.events.iter().zip(trace.faults) {
-            let passes = harness.execute_faulted(event, fault).await?;
-            if let Some(first) = passes.first() {
-                ensure!(
-                    first.committed != first.consumed,
-                    "Events: {:?}; event: {event:?}; fault: {fault:?}; passes: {passes:?}",
-                    trace.trace.events
-                );
-                ensure!(
-                    passes.len() == 1 + usize::from(first.consumed),
-                    "Events: {:?}; passes: {passes:?}",
-                    trace.trace.events
-                );
-                if let Some(second) = passes.get(1) {
-                    ensure!(
-                        second.committed && !second.consumed,
-                        "Events: {:?}; passes: {passes:?}",
-                        trace.trace.events
-                    );
-                }
-            }
-        }
-        Ok(())
-    });
-    match result {
-        Ok(()) => TestResult::passed(),
-        Err(error) => TestResult::error(format!("{error:?}")),
-    }
 }

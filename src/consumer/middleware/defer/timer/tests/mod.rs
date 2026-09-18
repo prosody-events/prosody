@@ -34,20 +34,19 @@ use std::time::Duration;
 use tracing::span::Id;
 
 mod context;
+/// A bypassed deferred timer commits its source without state or dedup.
+mod defer_swallow;
 mod faults;
+mod integration;
+mod properties;
 mod replay;
 mod store;
-use context::KeyedMockContext;
+mod types;
+
+use context::{KeyedMockContext, TimerCapture};
 use faults::{Fault, Pass};
 use store::FailableTimerStore;
 use types::TimerTraceEvent;
-mod integration;
-mod properties;
-mod types;
-
-// ============================================================================
-// MockContext - Minimal context for tests
-// ============================================================================
 
 /// Timer operation recorded by `MockContext`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,10 +202,6 @@ impl EventContext for MockContext {
     }
 }
 
-// ============================================================================
-// OutcomeHandler - Mock handler for tests
-// ============================================================================
-
 /// `(ambient span id, event span id)` recorded inside one handler call.
 type AmbientPair = (Option<Id>, Option<Id>);
 
@@ -324,10 +319,6 @@ impl FallibleHandler for OutcomeHandler {
     async fn shutdown(self) {}
 }
 
-// ============================================================================
-// TestHarness - Test harness for timer defer handler
-// ============================================================================
-
 /// Test harness for executing timer defer tests.
 struct TestHarness {
     /// The timer defer handler under test.
@@ -358,22 +349,24 @@ impl TestHarness {
         faults::execute_faulted(self, event, fault).await
     }
 
-    /// Creates a new test harness with default (enabled) configuration.
+    /// Creates a harness with one key context.
     fn new() -> color_eyre::Result<Self> {
-        Self::with_enabled(true)
+        Self::build(true, 1)
     }
 
     /// Creates one timer context per key.
     fn for_keys(key_count: usize) -> color_eyre::Result<Self> {
-        let mut harness = Self::new()?;
-        harness.contexts = (0..key_count)
-            .map(|index| KeyedMockContext::new(&format!("timer-test-key-{index}")))
-            .collect();
-        Ok(harness)
+        Self::build(true, key_count)
     }
 
-    /// Creates a new test harness with specified enabled state.
+    /// Creates a harness with the given enabled state.
     fn with_enabled(enabled: bool) -> color_eyre::Result<Self> {
+        Self::build(enabled, 1)
+    }
+
+    /// Builds the harness and registers `key_count` contexts with the
+    /// capture, so the rule check is live in every test.
+    fn build(enabled: bool, key_count: usize) -> color_eyre::Result<Self> {
         let topic = Topic::from("test-topic");
         let partition = Partition::from(0_i32);
 
@@ -381,7 +374,8 @@ impl TestHarness {
         let decider = TraceBasedDecider::new();
         let store = MemoryTimerDeferStore::new(SpanRelation::default());
         let context = MockContext::new();
-        let failable_store = FailableTimerStore::new(store.clone());
+        let capture = TimerCapture::default();
+        let failable_store = FailableTimerStore::new(store.clone(), capture.clone());
 
         let config = DeferConfiguration::builder()
             .enabled(enabled)
@@ -405,13 +399,18 @@ impl TestHarness {
             source: Arc::from("test"),
         };
 
+        let mut contexts: Vec<KeyedMockContext> = (0..key_count)
+            .map(|index| KeyedMockContext::new(&format!("timer-test-key-{index}")))
+            .collect();
+        capture.watch(&mut contexts);
+
         Ok(Self {
             handler,
             inner_handler,
             decider,
             store,
             context,
-            contexts: Vec::new(),
+            contexts,
             failable_store,
         })
     }
@@ -450,5 +449,3 @@ impl TestHarness {
         self.context.has_scheduled_timer(TimerType::DeferredTimer)
     }
 }
-/// A bypassed deferred timer commits its source without state or dedup.
-mod defer_swallow;

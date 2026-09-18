@@ -6,8 +6,6 @@
 //! determines whether the boundary stages state. The blanket `EventHandler`
 //! implementation and `RetryHandler` use this same boundary.
 //!
-//! A wrapper bookkeeping failure abandons the source.
-//!
 //! State rejection records no dedup id. The source commits only after state
 //! resolution.
 //!
@@ -66,11 +64,6 @@ pub(crate) enum Settlement {
     /// dirty overlay. This dispatch stages no state and records no dedup
     /// id.
     Bypassed,
-
-    /// A wrapper's own bookkeeping failed after a durable write. Discard
-    /// state and abort the source without a marker. The redelivery repeats
-    /// the bookkeeping.
-    Abandoned,
 }
 
 /// Crate-internal middleware-chain surface: classifies the final result for
@@ -152,7 +145,6 @@ impl<C: EventContext> NextAttempt for C {
 /// A final success stages state, promotes it, records dedup, and commits the
 /// source. A permanent rejection records dedup without state changes. A
 /// bypassed or transient result commits the source without state or dedup.
-/// A wrapper bookkeeping failure abandons the source without state or dedup.
 /// A terminal result abandons the source before classification.
 pub(crate) async fn settle<T, C, G>(
     handler: &T,
@@ -202,10 +194,6 @@ pub(crate) async fn settle<T, C, G>(
         // yields `Finalized::Clean`, which has no provisional work.
         Settlement::Bypassed => {
             commit_and_finish(handler, context, guard, result, lifecycle.as_ref(), permit).await;
-        }
-        Settlement::Abandoned => {
-            drop(permit);
-            abandon(handler, context, guard, result).await;
         }
         Settlement::Final => match category {
             // A permanent final failure records its marker best-effort, so

@@ -265,26 +265,26 @@ fn settlement_classification_table() {
             Settlement::Final,
         ),
         (
-            "Store rescue failure is Abandoned",
+            "Store rescue failure is Bypassed",
             Err(DeferError::Store(TestError(ErrorCategory::Transient))),
-            Settlement::Abandoned,
+            Settlement::Bypassed,
         ),
         (
-            "Timer rescue failure is Abandoned",
+            "Timer rescue failure is Bypassed",
             Err(DeferError::Timer(Box::new(TestError(
                 ErrorCategory::Transient,
             )))),
-            Settlement::Abandoned,
+            Settlement::Bypassed,
         ),
         (
-            "Loader rescue failure is Abandoned",
+            "Loader rescue failure is Bypassed",
             Err(DeferError::Loader(KafkaLoaderError::LoaderShutdown)),
-            Settlement::Abandoned,
+            Settlement::Bypassed,
         ),
         (
-            "CompactTime (backoff computation, Permanent) is Abandoned",
+            "CompactTime (backoff computation, Permanent) is Bypassed",
             Err(DeferError::CompactTime(CompactDateTimeError::OutOfRange)),
-            Settlement::Abandoned,
+            Settlement::Bypassed,
         ),
     ];
     for (label, result, expected) in rows {

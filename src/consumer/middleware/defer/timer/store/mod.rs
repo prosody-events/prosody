@@ -29,8 +29,6 @@ pub enum TimerRetryCompletionResult {
     MoreTimers {
         /// Next timer's fire time (for scheduling).
         next_time: CompactDateTime,
-        /// Parent trace context for span reconstruction.
-        context: Context,
     },
 
     /// Queue empty; key deleted from storage.
@@ -90,10 +88,8 @@ pub trait TimerDeferStore: Clone + Send + Sync + 'static {
 
             if let Some((trigger, _)) = self.get_next_deferred_timer(key).await? {
                 self.set_retry_count(key, 0).await?;
-                let context = trigger.context();
                 Ok(TimerRetryCompletionResult::MoreTimers {
                     next_time: trigger.time,
-                    context,
                 })
             } else {
                 self.delete_key(key).await?;

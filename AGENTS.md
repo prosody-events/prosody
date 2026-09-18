@@ -465,7 +465,6 @@ hardcoding `Final`) decides `Final` vs `Bypassed` before the error category is
 consulted; the message commit marker is read from the session's event identity
 (`message_marker()` — the message `EventRef`'s dedup id, or the
 deferred-reload's last-wins identity override), never deposited by middleware.
-A wrapper whose own bookkeeping fails after a durable write selects `Abandoned`; the boundary aborts the source.
 The boundary stages cells, promotes them, records the message dedup id, and commits the source.
 Read `settle_committed`, `Staged::promote`, and `PartitionStateManager::admit` before changes to this sequence.
 

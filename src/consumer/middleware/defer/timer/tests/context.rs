@@ -3,16 +3,18 @@
 //! Verifies that the context wrapper correctly unifies active and deferred
 //! timer operations, delegating appropriately based on deferral state.
 
+use super::faults::record_operation;
 use super::*;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::StateAccessError;
 use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::middleware::RepinProof;
-use crate::consumer::middleware::defer::message::handler::tests::store::FaultKind;
 use crate::consumer::middleware::defer::timer::context::TimerDeferContext;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
-use crate::error::{ClassifyError, ErrorCategory};
+use crate::consumer::middleware::tests::test_support::faults::{
+    FaultSlot, Phase, TimerError, TimerOp,
+};
 use crate::otel::SpanRelation;
 use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::state::tests::support::UnavailableState;
@@ -22,33 +24,52 @@ use crate::tracing::init_test_logging;
 use std::convert::Infallible;
 use std::future::{Future, ready};
 use std::sync::Arc;
-use thiserror::Error;
 
-// ============================================================================
-// KeyedMockContext - Context that implements Keyed trait
-// ============================================================================
+/// Holds the key contexts whose retry timers the rule checks.
+#[derive(Clone, Default)]
+pub struct TimerCapture {
+    phase: Arc<Phase>,
+    contexts: Arc<Mutex<Vec<KeyedMockContext>>>,
+}
 
-/// Selects the timer call that receives a fault.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimerOp {
-    /// Adds a timer.
-    Schedule,
-    /// Replaces the key timers.
-    ClearAndSchedule,
-    /// Removes the key timers.
-    ClearScheduled,
-    /// Reads the key timers.
-    Scheduled,
+impl TimerCapture {
+    /// Registers the key contexts and shares the phase with each one.
+    pub(super) fn watch(&self, contexts: &mut [KeyedMockContext]) {
+        for context in contexts.iter_mut() {
+            context.next_fault = FaultSlot::sharing(&self.phase);
+        }
+        self.contexts.lock().extend_from_slice(contexts);
+    }
+
+    /// Returns the phase the store and the contexts share.
+    pub(super) fn phase(&self) -> &Arc<Phase> {
+        &self.phase
+    }
+
+    /// Reports whether the key keeps a retry timer other than `fired`. An
+    /// unregistered key has none.
+    pub(super) fn fires_again(&self, key: &Key, fired: Option<CompactDateTime>) -> bool {
+        self.contexts
+            .lock()
+            .iter()
+            .find(|context| context.key() == key)
+            .is_some_and(|context| {
+                context
+                    .active_deferred_timers()
+                    .iter()
+                    .any(|time| Some(*time) != fired)
+            })
+    }
 }
 
 /// Mock context with `Keyed` trait for testing `TimerDeferContext`.
 #[derive(Clone)]
 pub struct KeyedMockContext {
-    inner: MockContext,
-    next_fault: Arc<Mutex<Option<(TimerOp, FaultKind)>>>,
+    pub(super) inner: MockContext,
+    pub(super) next_fault: FaultSlot<TimerOp>,
     key: Key,
     /// Tracks timer times by type for verification.
-    active_timers: Arc<Mutex<Vec<(CompactDateTime, TimerType)>>>,
+    pub(super) active_timers: Arc<Mutex<Vec<(CompactDateTime, TimerType)>>>,
 }
 
 impl KeyedMockContext {
@@ -56,55 +77,9 @@ impl KeyedMockContext {
     pub fn new(key: &str) -> Self {
         Self {
             inner: MockContext::new(),
-            next_fault: Arc::default(),
+            next_fault: FaultSlot::default(),
             key: Arc::from(key),
             active_timers: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    /// Arms one timer fault for the next dispatch.
-    pub fn set_fault(&self, fault: Option<(TimerOp, FaultKind)>) {
-        *self.next_fault.lock() = fault;
-    }
-
-    /// Reports whether a fault still awaits its selected call.
-    pub fn fault_pending(&self) -> bool {
-        self.next_fault.lock().is_some()
-    }
-
-    fn check(&self, op: TimerOp) -> Result<(), TimerError> {
-        let mut slot = self.next_fault.lock();
-        if let Some((target, kind)) = *slot
-            && target == op
-        {
-            *slot = None;
-            return Err(TimerError(kind));
-        }
-        Ok(())
-    }
-
-    /// Removes deferred timers without a handler operation.
-    pub fn drop_deferred_timers(&self) {
-        self.active_timers
-            .lock()
-            .retain(|(_, kind)| *kind != TimerType::DeferredTimer);
-    }
-
-    /// Clears timer operations before a dispatch.
-    pub(super) fn clear_operations(&self) {
-        self.inner.clear_operations();
-    }
-
-    /// A committed fired trigger is retired; an aborted one re-fires.
-    pub(super) fn retire_fired(&self, trigger: &Trigger) {
-        let rescheduled = self.inner.operations.lock().drain(..).any(|op| {
-            matches!(op, TimerOperation::Schedule(time, kind) | TimerOperation::ClearAndSchedule(time, kind)
-                if time == trigger.time && kind == trigger.timer_type)
-        });
-        if !rescheduled {
-            self.active_timers
-                .lock()
-                .retain(|(time, kind)| *time != trigger.time || *kind != trigger.timer_type);
         }
     }
 
@@ -117,6 +92,13 @@ impl KeyedMockContext {
             .filter(|(_, t)| *t == TimerType::Application)
             .map(|(time, _)| *time)
             .collect()
+    }
+
+    /// Records that the retry timer at this time fires again.
+    fn rearm(&self, time: CompactDateTime, timer_type: TimerType) {
+        if timer_type == TimerType::DeferredTimer {
+            self.next_fault.phase().rearm(time);
+        }
     }
 
     /// Returns all active `DeferredTimer` timers for this context.
@@ -141,7 +123,7 @@ impl Keyed for KeyedMockContext {
 
 impl TerminationSignals for KeyedMockContext {
     fn is_shutdown(&self) -> bool {
-        self.inner.is_shutdown()
+        self.next_fault.phase().is_revoked()
     }
 
     fn is_message_cancelled(&self) -> bool {
@@ -173,8 +155,6 @@ impl EventContext for KeyedMockContext {
     }
 
     fn redispatch(&self, proof: RepinProof) -> Self {
-        // Forward to the inner mock (compiler-enforced, like `state`); the
-        // key/timer capture are cheap clones this wrapper owns.
         Self {
             inner: self.inner.redispatch(proof),
             next_fault: self.next_fault.clone(),
@@ -204,15 +184,12 @@ impl EventContext for KeyedMockContext {
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        if let Err(error) = self.check(TimerOp::Schedule) {
-            return ready(Err(error));
+        if let Some(error) = self.next_fault.check_timer(TimerOp::Schedule) {
+            return ready(Err(TimerError(error)));
         }
+        self.rearm(time, timer_type);
         self.active_timers.lock().push((time, timer_type));
-        self.inner
-            .operations
-            .lock()
-            .push(TimerOperation::Schedule(time, timer_type));
-        ready(Ok(()))
+        record_operation(self, TimerOperation::Schedule(time, timer_type))
     }
 
     fn clear_and_schedule(
@@ -220,17 +197,13 @@ impl EventContext for KeyedMockContext {
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        if let Err(error) = self.check(TimerOp::ClearAndSchedule) {
-            return ready(Err(error));
+        if let Some(error) = self.next_fault.check_timer(TimerOp::ClearAndSchedule) {
+            return ready(Err(TimerError(error)));
         }
-        // Clear existing timers of this type, then add new one
+        self.rearm(time, timer_type);
         self.active_timers.lock().retain(|(_, t)| *t != timer_type);
         self.active_timers.lock().push((time, timer_type));
-        self.inner
-            .operations
-            .lock()
-            .push(TimerOperation::ClearAndSchedule(time, timer_type));
-        ready(Ok(()))
+        record_operation(self, TimerOperation::ClearAndSchedule(time, timer_type))
     }
 
     fn unschedule(
@@ -238,37 +211,32 @@ impl EventContext for KeyedMockContext {
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        if let Some(error) = self.next_fault.check_timer(TimerOp::Unschedule) {
+            return ready(Err(TimerError(error)));
+        }
         self.active_timers
             .lock()
             .retain(|(t, tt)| !(*t == time && *tt == timer_type));
-        self.inner
-            .operations
-            .lock()
-            .push(TimerOperation::Unschedule(time, timer_type));
-        ready(Ok(()))
+        record_operation(self, TimerOperation::Unschedule(time, timer_type))
     }
 
     fn clear_scheduled(
         &self,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        if let Err(error) = self.check(TimerOp::ClearScheduled) {
-            return ready(Err(error));
+        if let Some(error) = self.next_fault.check_timer(TimerOp::ClearScheduled) {
+            return ready(Err(TimerError(error)));
         }
         self.active_timers.lock().retain(|(_, t)| *t != timer_type);
-        self.inner
-            .operations
-            .lock()
-            .push(TimerOperation::ClearScheduled(timer_type));
-        ready(Ok(()))
+        record_operation(self, TimerOperation::ClearScheduled(timer_type))
     }
 
     fn scheduled(
         &self,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
-        if let Err(error) = self.check(TimerOp::Scheduled) {
-            return ready(Err(error));
+        if let Some(error) = self.next_fault.check_timer(TimerOp::Scheduled) {
+            return ready(Err(TimerError(error)));
         }
         let times: Vec<CompactDateTime> = self
             .active_timers
@@ -280,10 +248,6 @@ impl EventContext for KeyedMockContext {
         ready(Ok(times))
     }
 }
-
-// ============================================================================
-// Test Helper
-// ============================================================================
 
 struct ContextTestHarness {
     store: MemoryTimerDeferStore,
@@ -343,10 +307,6 @@ impl ContextTestHarness {
         Ok(self.store.deferred_times(self.key()).await?)
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 /// `schedule()` when NOT deferred delegates to inner context.
 #[test]
@@ -776,10 +736,6 @@ fn non_application_timers_pass_through() -> color_eyre::Result<()> {
     })
 }
 
-// ============================================================================
-// Error Handling Tests
-// ============================================================================
-
 mod error_handling {
     use super::*;
     use crate::consumer::middleware::defer::timer::context::TimerDeferContextError;
@@ -1055,18 +1011,4 @@ fn context_error_classification_delegates_correctly() {
         matches!(store_permanent.classify_error(), ErrorCategory::Permanent),
         "Store(Permanent) should classify as Permanent"
     );
-}
-
-/// Reports a timer fault before the capture changes.
-#[derive(Debug, Error)]
-#[error("injected timer failure: {0:?}")]
-pub struct TimerError(FaultKind);
-
-impl ClassifyError for TimerError {
-    fn classify_error(&self) -> ErrorCategory {
-        match self.0 {
-            FaultKind::Transient => ErrorCategory::Transient,
-            FaultKind::Permanent => ErrorCategory::Permanent,
-        }
-    }
 }

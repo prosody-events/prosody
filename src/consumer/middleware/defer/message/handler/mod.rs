@@ -7,9 +7,10 @@
 //!
 //! 1. **Ordering**: Messages for a key are processed in offset order.
 //!
-//! 2. **Completion**: Deferred keys have a retry timer for pending work. A
-//!    bookkeeping failure abandons the source. Each queue append re-arms a
-//!    missing timer.
+//! 2. **Completion**: A key with a non-empty deferred queue has a scheduled
+//!    retry timer. Every queue write follows the timer write that covers it. A
+//!    failed timer write leaves the queue unchanged, and the redelivery repeats
+//!    the step.
 //!
 //! 3. **Deferral**: When enabled, all transient errors are deferred. Once
 //!    deferred, transient errors always re-defer (config/decider only gate
@@ -264,20 +265,19 @@ where
             Ok(MessageDeferOutput::Inner(output)) => T::settlement(Ok(output)),
             // Inner ran and its error surfaced.
             Err(DeferError::Handler(error)) => T::settlement(Err(error)),
-            // The outcome lives in the defer queue. Nothing here stages or
-            // records.
-            Ok(MessageDeferOutput::Deferred(_) | MessageDeferOutput::NoInner) => {
-                Settlement::Bypassed
-            }
-            // Defer bookkeeping failed. A committed source would strand the
-            // queue without a timer. Abandon so the redelivery repeats the
-            // bookkeeping.
-            Err(
+            // `Deferred`/`NoInner` — parked for retry / queued behind /
+            // handled at the load layer: the outcome lives in the defer
+            // queue, so nothing here may stage or record — the reload must
+            // re-run unfiltered. The error rows are the defer layer's own
+            // rescue failing (store/timer/loader/backoff computation) — a
+            // layer failure, never the event's outcome.
+            Ok(MessageDeferOutput::Deferred(_) | MessageDeferOutput::NoInner)
+            | Err(
                 DeferError::Store(_)
                 | DeferError::Timer(_)
                 | DeferError::Loader(_)
                 | DeferError::CompactTime(_),
-            ) => Settlement::Abandoned,
+            ) => Settlement::Bypassed,
         }
     }
 }

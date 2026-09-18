@@ -11,7 +11,7 @@ mod integration;
 mod loader;
 mod properties;
 mod replay;
-pub(crate) mod store;
+mod store;
 mod types;
 
 pub use loader::{FailableLoader, FailableLoaderError, LoaderFailureType};

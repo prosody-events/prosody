@@ -16,8 +16,6 @@ use crate::timers::UncommittedTimer;
 /// [`RetryHandler`](crate::consumer::middleware::retry::RetryHandler) uses the
 /// same boundary. The internal settlement classification decides whether a
 /// result needs settlement.
-/// A wrapper whose own bookkeeping fails after a durable write selects
-/// `Abandoned`, which also aborts the source.
 pub trait FallibleEventHandler: FallibleHandler {
     /// Called when message processing fails.
     fn on_message_error(&self, _error: &Self::Error) {}

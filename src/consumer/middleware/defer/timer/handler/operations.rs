@@ -2,6 +2,7 @@ use tracing::{Instrument, debug, info, warn};
 
 use super::super::store::{TimerDeferStore, TimerRetryCompletionResult};
 use super::{TimerDeferHandler, TimerDeferOutput};
+use crate::Key;
 use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::middleware::FallibleHandler;
@@ -197,8 +198,7 @@ where
     }
 
     /// Defers a timer for the first time after the inner handler returned a
-    /// transient error. Schedules retry timer before storing to ensure timer
-    /// still fires on partial failure.
+    /// transient error.
     ///
     /// Returns [`TimerDeferOutput::Deferred`] carrying the inner error so the
     /// apply hooks can drive `after_abort(Err(inner_err))` on the inner: the
@@ -213,7 +213,6 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        // Timer first, then store: the timer still fires on partial failure
         self.schedule_retry_timer(&context, 0).await?;
 
         self.store
@@ -232,10 +231,9 @@ where
         Ok(TimerDeferOutput::Deferred(inner_err))
     }
 
-    /// Appends to an already-deferred key's queue and re-arms a missing retry
-    /// timer. The queue is the source of truth for pending work.
-    /// No single write spans the queue and the timer, so each append re-arms an
-    /// absent timer. The inner handler does not run;
+    /// Appends to an already-deferred key's queue. A key without a retry
+    /// timer receives one before the append. A key can carry a queue with no
+    /// timer from before this rule. The inner handler does not run;
     /// [`TimerDeferOutput::NoInner`] suppresses both apply hooks.
     pub(super) async fn append_to_deferred_queue<C>(
         &self,
@@ -246,12 +244,10 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        let (appended, scheduled) = tokio::join!(
-            self.store.defer_additional_timer(trigger),
-            context.scheduled(TimerType::DeferredTimer),
-        );
-        appended.map_err(DeferError::Store)?;
-        let scheduled = scheduled.map_err(|e| DeferError::Timer(Box::new(e)))?;
+        let scheduled = context
+            .scheduled(TimerType::DeferredTimer)
+            .await
+            .map_err(|e| DeferError::Timer(Box::new(e)))?;
 
         if scheduled.is_empty() {
             self.schedule_retry_timer(context, retry_count).await?;
@@ -265,6 +261,11 @@ where
             );
         }
 
+        self.store
+            .defer_additional_timer(trigger)
+            .await
+            .map_err(DeferError::Store)?;
+
         debug!(
             key = ?trigger.key,
             time = %trigger.time,
@@ -274,6 +275,25 @@ where
         );
 
         Ok(TimerDeferOutput::NoInner)
+    }
+
+    /// Schedules the next retry, then records the attempt.
+    /// Timer first, then store: the timer still fires on a partial failure.
+    async fn re_defer<C>(
+        &self,
+        context: &C,
+        key: &Key,
+        retry_count: u32,
+    ) -> Result<u32, DeferError<S::Error, T::Error>>
+    where
+        C: EventContext<Payload = T::Payload>,
+    {
+        self.schedule_retry_timer(context, retry_count.saturating_add(1))
+            .await?;
+        self.store
+            .increment_retry_count(key, retry_count)
+            .await
+            .map_err(DeferError::Store)
     }
 
     /// Handles retry failures by error category.
@@ -306,12 +326,8 @@ where
             ErrorCategory::Transient => {
                 // Always re-defer: timer is committed to queue
                 let new_retry_count = self
-                    .store
-                    .increment_retry_count(&deferred_trigger.key, retry_count)
-                    .await
-                    .map_err(DeferError::Store)?;
-
-                self.schedule_retry_timer(context, new_retry_count).await?;
+                    .re_defer(context, &deferred_trigger.key, retry_count)
+                    .await?;
 
                 self.sender.emit_timer(
                     TimerEventType::Failed {
@@ -380,8 +396,12 @@ where
         }
     }
 
-    /// Removes timer from queue and schedules next (or clears).
-    /// Used after success, permanent failure, or skipping corrupted entries.
+    /// Removes the timer from the queue after a success, a permanent failure,
+    /// or a corrupted entry. The timer write covers the next entry before the
+    /// queue advances. An empty queue clears the timer, so a drained queue
+    /// pays one timer insert and one clear. A stray retry timer on an empty
+    /// queue reloads nothing. The fire consumes it, and the handler deletes
+    /// the key.
     pub(super) async fn complete_and_advance<C>(
         &self,
         context: &C,
@@ -390,13 +410,22 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
+        self.schedule_retry_timer(context, 0).await?;
+
         let result = self
             .store
             .complete_retry_success(&trigger.key, trigger.time)
             .await
             .map_err(DeferError::Store)?;
 
-        self.schedule_next_or_clear(context, result).await
+        if matches!(result, TimerRetryCompletionResult::Completed) {
+            context
+                .clear_scheduled(TimerType::DeferredTimer)
+                .await
+                .map_err(|e| DeferError::Timer(Box::new(e)))?;
+        }
+
+        Ok(())
     }
 
     /// Schedules a `DeferredTimer` timer with backoff based on retry count.
@@ -424,30 +453,6 @@ where
         );
 
         Ok(())
-    }
-
-    /// Schedules timer for next entry or clears if queue empty.
-    pub(super) async fn schedule_next_or_clear<C>(
-        &self,
-        context: &C,
-        result: TimerRetryCompletionResult,
-    ) -> Result<(), DeferError<S::Error, T::Error>>
-    where
-        C: EventContext<Payload = T::Payload>,
-    {
-        match result {
-            TimerRetryCompletionResult::MoreTimers { .. } => {
-                // More timers in queue - schedule retry (retry_count reset to 0)
-                self.schedule_retry_timer(context, 0).await
-            }
-            TimerRetryCompletionResult::Completed => {
-                // No more timers - clear the retry timer
-                context
-                    .clear_scheduled(TimerType::DeferredTimer)
-                    .await
-                    .map_err(|e| DeferError::Timer(Box::new(e)))
-            }
-        }
     }
 
     /// Returns `now + backoff(retry_count)`; used for scheduling retry timers.

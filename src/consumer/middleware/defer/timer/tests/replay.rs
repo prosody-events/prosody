@@ -1,6 +1,6 @@
-//! Checks source redelivery after a retry timer write fails.
+//! Replays the production failure: the retry timer write fails after the
+//! handler succeeds.
 
-use super::context::TimerOp;
 use super::faults::Fault;
 use super::types::{
     ApplicationTimerEvent, ApplicationTimerOutcome, DeferredTimerEvent, DeferredTimerOutcome,
@@ -8,55 +8,78 @@ use super::types::{
 };
 use super::{TEST_RUNTIME, TestHarness};
 use crate::consumer::Keyed;
-use crate::consumer::middleware::defer::message::handler::tests::store::FaultKind;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
+use crate::consumer::middleware::tests::test_support::faults::{FaultKind, TimerOp};
 use crate::timers::datetime::CompactDateTime;
 
-/// A transient timer fault represents `TimerSchedulerError::Shutdown`.
-/// The retry count write succeeds before the timer write fails.
-/// The source aborts. Redelivery repeats the bookkeeping and restores a timer.
+/// A key holds two queued timers. The retry timer fires, the handler
+/// succeeds, and the timer write for the next entry fails.
+///
+/// A terminal error aborts the first pass, which leaves the head in place,
+/// and the redelivery commits. A transient error reaches another attempt
+/// inside the same dispatch, so one pass commits.
 #[test]
-fn timer_write_failure_after_queue_write_aborts_source() -> color_eyre::Result<()> {
+fn timer_write_failure_keeps_the_queue_covered() -> color_eyre::Result<()> {
     TEST_RUNTIME.block_on(async {
-        let harness = TestHarness::for_keys(1)?;
-        let time = CompactDateTime::from(1000_u32);
-        harness
-            .execute_faulted(
-                &TimerTraceEvent::ApplicationTimer(ApplicationTimerEvent {
-                    key_idx: 0,
-                    time,
-                    outcome: ApplicationTimerOutcome::Transient { defer: true },
-                }),
-                None,
-            )
-            .await?;
-        let passes = harness
-            .execute_faulted(
-                &TimerTraceEvent::DeferredTimer(DeferredTimerEvent {
-                    key_idx: 0,
-                    expected_time: time,
-                    outcome: DeferredTimerOutcome::Transient,
-                }),
-                Some(Fault::Timer(
-                    TimerOp::ClearAndSchedule,
-                    FaultKind::Transient,
-                )),
-            )
-            .await?;
-        assert!(passes[0].consumed && !passes[0].committed, "{passes:?}");
-        assert_eq!(passes.len(), 2);
-        assert!(passes[1].committed && !passes[1].consumed, "{passes:?}");
-        let context = &harness.contexts[0];
-        assert!(!context.active_deferred_timers().is_empty());
-        assert_eq!(
+        for (kind, expected_passes) in [(FaultKind::Terminal, 2), (FaultKind::Transient, 1)] {
+            let harness = TestHarness::for_keys(1)?;
+            let first = CompactDateTime::from(1000_u32);
+            let second = CompactDateTime::from(2000_u32);
             harness
-                .store
-                .get_next_deferred_timer(context.key())
-                .await?
-                .map(|(trigger, _)| trigger.time),
-            Some(time)
-        );
-        assert_eq!(harness.store.is_deferred(context.key()).await?, Some(2));
+                .execute_faulted(
+                    &TimerTraceEvent::ApplicationTimer(ApplicationTimerEvent {
+                        key_idx: 0,
+                        time: first,
+                        outcome: ApplicationTimerOutcome::Transient { defer: true },
+                    }),
+                    None,
+                )
+                .await?;
+            harness
+                .execute_faulted(
+                    &TimerTraceEvent::ApplicationTimer(ApplicationTimerEvent {
+                        key_idx: 0,
+                        time: second,
+                        outcome: ApplicationTimerOutcome::Queued,
+                    }),
+                    None,
+                )
+                .await?;
+
+            let passes = harness
+                .execute_faulted(
+                    &TimerTraceEvent::DeferredTimer(DeferredTimerEvent {
+                        key_idx: 0,
+                        expected_time: first,
+                        outcome: DeferredTimerOutcome::Success,
+                    }),
+                    Some(Fault::Timer(TimerOp::ClearAndSchedule, kind)),
+                )
+                .await?;
+
+            assert_eq!(passes.len(), expected_passes, "{passes:?}");
+            assert_eq!(passes[0].consumed, Some(kind), "{passes:?}");
+            assert!(passes[expected_passes - 1].committed, "{passes:?}");
+            if kind == FaultKind::Terminal {
+                assert_eq!(
+                    passes[0].head,
+                    Some(i64::from(i32::from(first))),
+                    "{passes:?}"
+                );
+            }
+
+            let context = &harness.contexts[0];
+            assert!(!context.active_deferred_timers().is_empty());
+            assert_eq!(
+                harness
+                    .store
+                    .get_next_deferred_timer(context.key())
+                    .await?
+                    .map(|(trigger, _)| trigger.time),
+                Some(second)
+            );
+            assert_eq!(harness.store.is_deferred(context.key()).await?, Some(0));
+        }
         Ok(())
     })
 }
