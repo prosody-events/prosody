@@ -17,7 +17,6 @@ use crate::state_reader::session::ReadSession;
 use crate::state_reader::{MemoryReaderBackend, ReaderBackend};
 use async_stream::try_stream;
 use futures::{Stream, StreamExt};
-use std::borrow::Borrow;
 use std::num::NonZeroUsize;
 use tokio::task::coop::cooperative;
 
@@ -48,38 +47,26 @@ where
     L: CollectionSpec,
 {
     /// Starts at `key`.
-    pub fn from<Q>(mut self, key: &Q) -> Self
-    where
-        Q: Borrow<BorrowedKeyOf<L::Cell>> + ?Sized,
-    {
-        self.query.start = ScanEdge::Included(<L::Cell as CellType>::Key::encode(key.borrow()));
+    pub fn from(mut self, key: &BorrowedKeyOf<L::Cell>) -> Self {
+        self.query.start = ScanEdge::Included(<L::Cell as CellType>::Key::encode(key));
         self
     }
 
     /// Starts after `key`.
-    pub fn after<Q>(mut self, key: &Q) -> Self
-    where
-        Q: Borrow<BorrowedKeyOf<L::Cell>> + ?Sized,
-    {
-        self.query.start = ScanEdge::Excluded(<L::Cell as CellType>::Key::encode(key.borrow()));
+    pub fn after(mut self, key: &BorrowedKeyOf<L::Cell>) -> Self {
+        self.query.start = ScanEdge::Excluded(<L::Cell as CellType>::Key::encode(key));
         self
     }
 
     /// Stops at `key`.
-    pub fn to<Q>(mut self, key: &Q) -> Self
-    where
-        Q: Borrow<BorrowedKeyOf<L::Cell>> + ?Sized,
-    {
-        self.query.end = ScanEdge::Included(<L::Cell as CellType>::Key::encode(key.borrow()));
+    pub fn to(mut self, key: &BorrowedKeyOf<L::Cell>) -> Self {
+        self.query.end = ScanEdge::Included(<L::Cell as CellType>::Key::encode(key));
         self
     }
 
     /// Stops before `key`.
-    pub fn before<Q>(mut self, key: &Q) -> Self
-    where
-        Q: Borrow<BorrowedKeyOf<L::Cell>> + ?Sized,
-    {
-        self.query.end = ScanEdge::Excluded(<L::Cell as CellType>::Key::encode(key.borrow()));
+    pub fn before(mut self, key: &BorrowedKeyOf<L::Cell>) -> Self {
+        self.query.end = ScanEdge::Excluded(<L::Cell as CellType>::Key::encode(key));
         self
     }
 

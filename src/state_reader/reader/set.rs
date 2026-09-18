@@ -24,13 +24,12 @@ where
     /// # Errors
     ///
     /// Returns an error when session acquisition or handle binding fails.
-    pub async fn contains<K: Into<Key>, Q>(
+    pub async fn contains<K: Into<Key>>(
         &self,
         key: K,
-        member: &Q,
+        member: &KC::Borrowed,
     ) -> Result<bool, StateReaderError>
     where
-        Q: Borrow<KC::Borrowed> + ?Sized,
         KC::Borrowed: Display,
     {
         let handle = self.bound(key.into()).await?;
@@ -51,7 +50,7 @@ where
         members: I,
     ) -> Result<Vec<bool>, StateReaderError>
     where
-        Q: Borrow<KC::Borrowed> + Sync + ?Sized + 'a,
+        Q: Borrow<KC::Borrowed> + ?Sized + 'a,
         I: IntoIterator<Item = &'a Q>,
         I::IntoIter: Send,
     {

@@ -51,13 +51,12 @@ use crate::state_reader::deps::StateReaderDependencies;
 use crate::state_reader::{PartitionCount, StateReader};
 use crate::subsystem::SubsystemName;
 use crate::test_util::{
-    TEST_KEYSPACE, TEST_RUNTIME, integration_test_count, test_cassandra_config,
+    ModelProperty, TEST_KEYSPACE, TEST_RUNTIME, integration_test_count, test_cassandra_config,
 };
 use color_eyre::eyre::{Result, ensure, eyre};
 use internment::Intern;
-use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult, Testable};
+use quickcheck::QuickCheck;
 use serde_json::Value;
-use std::fmt::Debug;
 use std::sync::Arc;
 use std::thread;
 use tokio::sync::OnceCell;
@@ -88,39 +87,6 @@ struct CassandraReaderBackend {
     publications: CassandraPublicationStore,
     identities: CassandraDescriptorIdentityStore,
     registry: Arc<CollectionDefRegistry>,
-}
-
-/// Shrinks model mismatches. Store errors stop at their original trace.
-struct ReaderProperty<O>(fn(Trace<O>) -> Result<bool>);
-
-impl<O: Arbitrary + Debug> Testable for ReaderProperty<O> {
-    fn result(&self, generator: &mut Gen) -> TestResult {
-        let mut trace = Trace::arbitrary(generator);
-        match (self.0)(trace.clone()) {
-            Ok(true) => return TestResult::passed(),
-            Err(error) => return TestResult::error(format!("{error:?}; trace: {trace:?}")),
-            Ok(false) => {}
-        }
-        loop {
-            let mut smaller = None;
-            for candidate in trace.shrink() {
-                match (self.0)(candidate.clone()) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        smaller = Some(candidate);
-                        break;
-                    }
-                    Err(error) => {
-                        return TestResult::error(format!("{error:?}; trace: {candidate:?}"));
-                    }
-                }
-            }
-            let Some(candidate) = smaller else {
-                return TestResult::error(format!("reader differs from model; trace: {trace:?}"));
-            };
-            trace = candidate;
-        }
-    }
 }
 
 impl ReaderBackend for CassandraReaderBackend {
@@ -284,7 +250,7 @@ macro_rules! cassandra_reader_prop {
                     scope.spawn(move || {
                         QuickCheck::new()
                             .tests(count)
-                            .quickcheck(ReaderProperty(property));
+                            .quickcheck(ModelProperty(property));
                     });
                 }
             });
@@ -336,8 +302,8 @@ cassandra_reader_prop!(
 /// values under one fresh subsystem. Because `-00` sorts lexicographically
 /// before `-01`, the reader must observe `-00`'s value.
 ///
-/// The test fails if reverse `ValidatedPublications::new`'s sort to
-/// `b.id.cmp(&a.id)`. The higher group then tests, and the assert goes red.
+/// If `ValidatedPublications::new` sorts by `b.id.cmp(&a.id)`, the higher group
+/// answers and the assert fails.
 #[test]
 fn reader_two_group_lowest_wins() -> Result<()> {
     TEST_RUNTIME.block_on(async {
@@ -394,9 +360,8 @@ fn reader_two_group_lowest_wins() -> Result<()> {
 /// real owner in a single event. The reader then streams it forward and
 /// backward, and both directions must equal the ordered model.
 ///
-/// The test fails if drop the first yield in
-/// `CassandraCellResources::scan_committed`. The forward stream then loses
-/// its front element and the assert goes red.
+/// If `CassandraCellResources::scan_committed` drops its first yield, the
+/// forward stream loses its front element and the assert fails.
 #[test]
 fn reader_deque_scan_committed() -> Result<()> {
     TEST_RUNTIME.block_on(async {

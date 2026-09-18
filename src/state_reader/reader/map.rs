@@ -28,13 +28,12 @@ where
     /// # Errors
     ///
     /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
-    pub async fn get<K: Into<Key>, Q>(
+    pub async fn get<K: Into<Key>>(
         &self,
         key: K,
-        map_key: &Q,
+        map_key: &KC::Borrowed,
     ) -> Result<Option<ResolvedOf<V>>, StateReaderError>
     where
-        Q: Borrow<KC::Borrowed> + ?Sized,
         KC::Borrowed: Display,
     {
         let handle = self.bound(key.into()).await?;
@@ -49,13 +48,12 @@ where
     /// # Errors
     ///
     /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
-    pub async fn contains_key<K: Into<Key>, Q>(
+    pub async fn contains_key<K: Into<Key>>(
         &self,
         key: K,
-        map_key: &Q,
+        map_key: &KC::Borrowed,
     ) -> Result<bool, StateReaderError>
     where
-        Q: Borrow<KC::Borrowed> + ?Sized,
         KC::Borrowed: Display,
     {
         let handle = self.bound(key.into()).await?;
@@ -90,7 +88,7 @@ where
         map_keys: I,
     ) -> Result<Vec<Option<ResolvedOf<V>>>, StateReaderError>
     where
-        Q: Borrow<KC::Borrowed> + Sync + ?Sized + 'a,
+        Q: Borrow<KC::Borrowed> + ?Sized + 'a,
         I: IntoIterator<Item = &'a Q>,
         I::IntoIter: Send,
     {
@@ -113,7 +111,7 @@ where
         map_keys: I,
     ) -> Result<Vec<bool>, StateReaderError>
     where
-        Q: Borrow<KC::Borrowed> + Sync + ?Sized + 'a,
+        Q: Borrow<KC::Borrowed> + ?Sized + 'a,
         I: IntoIterator<Item = &'a Q>,
         I::IntoIter: Send,
     {

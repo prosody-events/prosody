@@ -76,8 +76,6 @@
 //! for kinds, this seals descriptor *authorship*.
 
 use crate::codec::Codec;
-#[cfg(test)]
-use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::StateAccessError;
 use crate::state::collection::sealed_spec::SealedSpec;
 use crate::state::collection::{Collection, StateSession};

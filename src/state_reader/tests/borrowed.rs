@@ -1,22 +1,22 @@
 //! Borrowed keys preserve owner and reader results across iterator shapes.
 
 use super::support::{
-    GROUP_A, MemoryHarness, mock_count, owner_commit, publish_source, source_state_key, state_name,
-    subsystem, topic,
+    GROUP_A, MemoryHarness, collect_query, each, mock_count, owner_commit, publish_source,
+    source_state_key, state_name, subsystem, topic,
 };
 use crate::Key;
 use crate::codec::JsonCodec;
 use crate::state::Direction;
 use crate::state::collection::WritableStateSession;
 use crate::state::descriptor::{
-    MapDescriptor, MapHandle, SetDescriptor, SetHandle, map_state, set_state,
+    MapDescriptor, MapHandle, SetDescriptor, SetHandle, StateDescriptor, map_state, set_state,
 };
 use crate::state::order_codec::Utf8KeyCodec;
-use crate::state::registry::{CollectionDef, CollectionDefRegistry};
+use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CELL_BATCH;
 use crate::state_reader::StateReader;
 use color_eyre::Result;
-use futures::{TryStreamExt, executor::block_on};
+use futures::{TryStreamExt, executor::block_on, try_join};
 use quickcheck::QuickCheck;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -56,7 +56,7 @@ fn prop_borrowed_utf8_keys_address_maps_and_sets() {
         let keys: Vec<_> = keys.iter().cycle().take(MAX_KEYS).cloned().collect();
         block_on(async {
             for limit in [0, 128] {
-                check(&operations, &keys, limit).await?;
+                Box::pin(check(&operations, &keys, limit)).await?;
             }
             Ok(())
         })
@@ -69,8 +69,8 @@ async fn check(operations: &[(String, bool)], keys: &[String], limit: usize) -> 
     let map = map_state::<Utf8KeyCodec, JsonCodec>("borrowed-map").keyset_limit(limit);
     let set = set_state::<Utf8KeyCodec>("borrowed-set").keyset_limit(limit);
     let mut registry = CollectionDefRegistry::default();
-    registry.register(&map, CollectionDef::new(None))?;
-    registry.register(&set, CollectionDef::new(None))?;
+    registry.register(&map, map.collection_def())?;
+    registry.register(&set, set.collection_def())?;
     let registry = Arc::new(registry);
     let sub = subsystem()?;
     let topic = topic("orders");
@@ -85,9 +85,14 @@ async fn check(operations: &[(String, bool)], keys: &[String], limit: usize) -> 
             model.remove(key);
         }
     }
-    owner_commit(&harness.cells, &registry, &state_key, map, 1, |handle| {
-        check_map(handle, operations, keys, &model)
-    })
+    Box::pin(owner_commit(
+        &harness.cells,
+        &registry,
+        &state_key,
+        map,
+        1,
+        |handle| check_map(handle, operations, keys, &model),
+    ))
     .await?;
     owner_commit(&harness.cells, &registry, &state_key, set, 2, |handle| {
         check_set(handle, operations, keys, &model)
@@ -134,84 +139,86 @@ async fn check_map<S: WritableStateSession>(
         .collect();
     let members: Vec<_> = model.keys().cloned().collect();
 
+    // Each write is followed by its own reads, so the writes stay sequential.
     for (position, (key, present)) in operations.iter().enumerate() {
         if *present {
             handle.set(key.as_str(), Value::from(position)).await?;
         } else {
             handle.remove(key.as_str()).await?;
         }
-        assert_eq!(handle.contains_key(key.as_str()).await?, *present);
-        assert_eq!(
-            handle.get(key.as_str()).await?,
-            present.then(|| Value::from(position))
-        );
+        let (contained, value) =
+            try_join!(handle.contains_key(key.as_str()), handle.get(key.as_str()))?;
+        assert_eq!(contained, *present);
+        assert_eq!(value, present.then(|| Value::from(position)));
     }
-    for key in keys.iter().collect::<BTreeSet<_>>() {
+
+    let (handle, values) = (&handle, values.as_slice());
+    each(keys.iter().collect::<BTreeSet<_>>(), |key| async move {
         assert_eq!(
             handle.get(&Cow::Borrowed(key.as_str())).await?,
             model.get(key).cloned()
         );
-    }
-    for len in BATCH_LENGTHS {
-        assert_eq!(handle.get_many(&keys[..len]).await?, values[..len]);
-        assert_eq!(handle.get_many(unknown(&keys[..len])).await?, values[..len]);
-    }
+        Ok(())
+    })
+    .await?;
+    each(BATCH_LENGTHS, |len| async move {
+        let (exact, lazy) = try_join!(
+            handle.get_many(&keys[..len]),
+            handle.get_many(unknown(&keys[..len]))
+        )?;
+        assert_eq!(exact, values[..len]);
+        assert_eq!(lazy, values[..len]);
+        Ok(())
+    })
+    .await?;
+
     let split = keys.len() / 2;
-    assert_eq!(
-        handle
-            .get_many(
-                keys[..split]
-                    .iter()
-                    .map(String::as_str)
-                    .chain(unknown(&keys[split..]))
-            )
-            .await?,
-        values
-    );
     let filtered = keys.iter().filter(|key| key.len().is_multiple_of(2));
     let expected: Vec<_> = filtered
         .clone()
         .map(|key| model.get(key).cloned())
         .collect();
-    assert_eq!(handle.get_many(filtered).await?, expected);
+    let (chained, filtered, mapped, lazy, streamed) = try_join!(
+        handle.get_many(
+            keys[..split]
+                .iter()
+                .map(String::as_str)
+                .chain(unknown(&keys[split..]))
+        ),
+        handle.get_many(filtered),
+        handle.contains_many(keys.iter().map(String::as_str)),
+        handle.contains_many(unknown(keys)),
+        handle.stream(Direction::Forward).try_collect::<Vec<_>>(),
+    )?;
+    assert_eq!(chained, values);
+    assert_eq!(filtered, expected);
+    assert_eq!(mapped, presence);
+    assert_eq!(lazy, presence);
+    assert_eq!(streamed, entries);
 
-    assert_eq!(
-        handle
-            .contains_many(keys.iter().map(String::as_str))
-            .await?,
-        presence
-    );
-    assert_eq!(handle.contains_many(unknown(keys)).await?, presence);
-    for edge in members.first().into_iter().chain(members.last()) {
-        assert_eq!(
-            handle
-                .query(Direction::Forward)
-                .from(edge.as_str())
-                .to(edge.as_str())
-                .entries()
-                .try_collect::<Vec<_>>()
-                .await?,
-            vec![(edge.clone(), model[edge].clone())]
-        );
-        assert!(
-            handle
-                .query(Direction::Backward)
-                .after(edge.as_str())
-                .before(edge.as_str())
-                .keys()
-                .try_collect::<Vec<_>>()
-                .await?
-                .is_empty()
-        );
-    }
-    assert_eq!(
-        handle
-            .stream(Direction::Forward)
-            .try_collect::<Vec<_>>()
-            .await?,
-        entries
-    );
-    Ok(())
+    each(
+        [members.first(), members.last()].into_iter().flatten(),
+        |edge| async move {
+            let (bounded, excluded) = try_join!(
+                handle
+                    .query(Direction::Forward)
+                    .from(edge.as_str())
+                    .to(edge.as_str())
+                    .entries()
+                    .try_collect::<Vec<_>>(),
+                handle
+                    .query(Direction::Backward)
+                    .after(edge.as_str())
+                    .before(edge.as_str())
+                    .keys()
+                    .try_collect::<Vec<_>>(),
+            )?;
+            assert_eq!(bounded, vec![(edge.clone(), model[edge].clone())]);
+            assert!(excluded.is_empty());
+            Ok(())
+        },
+    )
+    .await
 }
 
 async fn check_set<S: WritableStateSession>(
@@ -230,13 +237,18 @@ async fn check_set<S: WritableStateSession>(
         }
         assert_eq!(handle.contains(key.as_str()).await?, *present);
     }
-    for len in BATCH_LENGTHS {
-        assert_eq!(handle.contains_many(&keys[..len]).await?, presence[..len]);
-        assert_eq!(
-            handle.contains_many(unknown(&keys[..len])).await?,
-            presence[..len]
-        );
-    }
+
+    let (handle, presence) = (&handle, presence.as_slice());
+    each(BATCH_LENGTHS, |len| async move {
+        let (exact, lazy) = try_join!(
+            handle.contains_many(&keys[..len]),
+            handle.contains_many(unknown(&keys[..len]))
+        )?;
+        assert_eq!(exact, presence[..len]);
+        assert_eq!(lazy, presence[..len]);
+        Ok(())
+    })
+    .await?;
     assert_eq!(
         handle
             .keys(Direction::Forward)
@@ -257,89 +269,76 @@ async fn check_readers(
     let values: Vec<_> = keys.iter().map(|key| model.get(key).cloned()).collect();
     let presence: Vec<_> = values.iter().map(Option::is_some).collect();
     let members: Vec<_> = model.keys().cloned().collect();
-    for member in keys.iter().collect::<BTreeSet<_>>() {
-        assert_eq!(
-            map.get(key.clone(), member.as_str()).await?,
-            model.get(member).cloned()
-        );
-        assert_eq!(
-            map.contains_key(key.clone(), member.as_str()).await?,
-            model.contains_key(member)
-        );
-        assert_eq!(
-            set.contains(key.clone(), member.as_str()).await?,
-            model.contains_key(member)
-        );
-    }
-    for len in BATCH_LENGTHS {
-        assert_eq!(
-            map.get_many(key.clone(), &keys[..len]).await?,
-            values[..len]
-        );
-        assert_eq!(
-            map.get_many(key.clone(), unknown(&keys[..len])).await?,
-            values[..len]
-        );
-        assert_eq!(
-            set.contains_many(key.clone(), &keys[..len]).await?,
-            presence[..len]
-        );
-        assert_eq!(
-            set.contains_many(key.clone(), unknown(&keys[..len]))
-                .await?,
-            presence[..len]
-        );
-    }
-    assert_eq!(
-        map.contains_many(key.clone(), unknown(keys)).await?,
-        presence
-    );
-    assert_eq!(
-        set.contains_many(key.clone(), keys.iter().map(String::as_str))
-            .await?,
-        presence
-    );
-    for edge in members.first().into_iter().chain(members.last()) {
-        assert_eq!(
-            map.query(key.clone(), Direction::Forward)
-                .from(edge.as_str())
-                .to(edge.as_str())
-                .entries()
-                .await?
-                .try_collect::<Vec<_>>()
-                .await?,
-            vec![(edge.clone(), model[edge].clone())]
-        );
-        assert_eq!(
-            set.query(key.clone(), Direction::Backward)
-                .from(edge.as_str())
-                .to(edge.as_str())
-                .keys()
-                .await?
-                .try_collect::<Vec<_>>()
-                .await?,
-            vec![edge.clone()]
-        );
-        assert!(
-            map.query(key.clone(), Direction::Backward)
-                .after(edge.as_str())
-                .before(edge.as_str())
-                .keys()
-                .await?
-                .try_collect::<Vec<_>>()
-                .await?
-                .is_empty()
-        );
-        assert!(
-            set.query(key.clone(), Direction::Forward)
-                .after(edge.as_str())
-                .before(edge.as_str())
-                .keys()
-                .await?
-                .try_collect::<Vec<_>>()
-                .await?
-                .is_empty()
-        );
-    }
-    Ok(())
+    let (map, set, values, presence) = (&map, &set, values.as_slice(), presence.as_slice());
+
+    each(keys.iter().collect::<BTreeSet<_>>(), |member| async move {
+        let (value, present, contained) = try_join!(
+            map.get(key.clone(), member.as_str()),
+            map.contains_key(key.clone(), member.as_str()),
+            set.contains(key.clone(), member.as_str()),
+        )?;
+        assert_eq!(value, model.get(member).cloned());
+        assert_eq!(present, model.contains_key(member));
+        assert_eq!(contained, model.contains_key(member));
+        Ok(())
+    })
+    .await?;
+    each(BATCH_LENGTHS, |len| async move {
+        let (exact_values, lazy_values, exact_presence, lazy_presence) = try_join!(
+            map.get_many(key.clone(), &keys[..len]),
+            map.get_many(key.clone(), unknown(&keys[..len])),
+            set.contains_many(key.clone(), &keys[..len]),
+            set.contains_many(key.clone(), unknown(&keys[..len])),
+        )?;
+        assert_eq!(exact_values, values[..len]);
+        assert_eq!(lazy_values, values[..len]);
+        assert_eq!(exact_presence, presence[..len]);
+        assert_eq!(lazy_presence, presence[..len]);
+        Ok(())
+    })
+    .await?;
+    let (lazy, mapped) = try_join!(
+        map.contains_many(key.clone(), unknown(keys)),
+        set.contains_many(key.clone(), keys.iter().map(String::as_str)),
+    )?;
+    assert_eq!(lazy, presence);
+    assert_eq!(mapped, presence);
+
+    each(
+        [members.first(), members.last()].into_iter().flatten(),
+        |edge| async move {
+            let (entries, members, map_excluded, set_excluded) = try_join!(
+                collect_query(
+                    map.query(key.clone(), Direction::Forward)
+                        .from(edge.as_str())
+                        .to(edge.as_str())
+                        .entries()
+                ),
+                collect_query(
+                    set.query(key.clone(), Direction::Backward)
+                        .from(edge.as_str())
+                        .to(edge.as_str())
+                        .keys()
+                ),
+                collect_query(
+                    map.query(key.clone(), Direction::Backward)
+                        .after(edge.as_str())
+                        .before(edge.as_str())
+                        .keys()
+                ),
+                collect_query(
+                    set.query(key.clone(), Direction::Forward)
+                        .after(edge.as_str())
+                        .before(edge.as_str())
+                        .keys()
+                ),
+            )?;
+            assert_eq!(entries, vec![(edge.clone(), model[edge].clone())]);
+            assert_eq!(members, vec![edge.clone()]);
+            assert!(map_excluded.is_empty());
+            assert!(set_excluded.is_empty());
+            Ok(())
+        },
+    )
+    .await
 }

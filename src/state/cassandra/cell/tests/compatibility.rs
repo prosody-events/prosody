@@ -92,7 +92,7 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
         .await?;
 
     let id = c.id();
-    let (raw, encoding) = read_cell_blob(&fx, id).await?;
+    let (raw, encoding) = read_cell_blob(fx, id).await?;
 
     assert_ne!(
         raw.as_slice(),
@@ -129,7 +129,7 @@ async fn cassandra_data_column_is_raw_through_the_block_size() -> Result<()> {
         .await?;
 
     let id = c.id();
-    let (data, encoding) = read_cell_blob(&fx, id).await?;
+    let (data, encoding) = read_cell_blob(fx, id).await?;
 
     assert_eq!(data.as_slice(), payload.as_ref());
     assert_eq!(encoding, 1);

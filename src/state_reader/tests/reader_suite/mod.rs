@@ -31,7 +31,8 @@
 //! `stream` yields nothing and `get` returns `None`.
 
 use super::support::{
-    OwnerSession, ReaderBackend, collect_query, owner_commit_cell, source_state_key, state_name,
+    OwnerSession, ReaderBackend, all_match, collect_query, owner_commit_cell, source_state_key,
+    state_name,
 };
 use crate::Key;
 use crate::Topic;
@@ -46,10 +47,9 @@ use crate::state::order_codec::I64KeyCodec;
 use crate::state::tests::collection_suite::{DequeOp, KEY_POOL, MapOp, Trace};
 use crate::state::tests::support::reader_residue;
 use crate::state_reader::backend::ReaderBackend as CoreReaderBackend;
-use crate::state_reader::{PartitionCount, StateReader, StateReaderError};
+use crate::state_reader::{PartitionCount, StateReader};
 use crate::subsystem::SubsystemName;
-use color_eyre::eyre::{Report, Result, eyre};
-use futures::future::try_join_all;
+use color_eyre::eyre::{Result, eyre};
 use futures::{join, try_join};
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
@@ -145,19 +145,17 @@ async fn assert_map<B: ReaderBackend>(
     model: &BTreeMap<i64, Value>,
 ) -> Result<bool> {
     let deps = backend.deps();
-    let reader = StateReader::new(&deps, case.sub.clone(), descriptor)?;
-    // Reads share a committed snapshot. No owner writes occur until they finish.
-    let (empty, points, many, forward, keys, constrained_entries, constrained_keys, backward) = join!(
-        reader.is_empty(case.key.clone()),
-        try_join_all(KEY_POOL.iter().map(|k| async {
+    let reader = &StateReader::new(&deps, case.sub.clone(), descriptor)?;
+    // The first read warms the publication snapshot. The rest share it.
+    let empty = reader.is_empty(case.key.clone()).await?;
+    let (points, many, forward, keys, constrained_entries, constrained_keys, backward) = join!(
+        all_match(KEY_POOL.iter(), |k| async move {
             let (value, present) = try_join!(
                 reader.get(case.key.clone(), k),
                 reader.contains_key(case.key.clone(), k)
             )?;
-            Ok::<_, StateReaderError>(
-                value == model.get(k).cloned() && present == model.contains_key(k),
-            )
-        })),
+            Ok(value == model.get(k).cloned() && present == model.contains_key(k))
+        }),
         reader.get_many(case.key.clone(), &KEY_POOL),
         collect_query(reader.stream(case.key.clone(), Direction::Forward)),
         collect_query(reader.keys(case.key.clone(), Direction::Forward)),
@@ -178,7 +176,6 @@ async fn assert_map<B: ReaderBackend>(
         ),
         collect_query(reader.stream(case.key.clone(), Direction::Backward)),
     );
-    let empty = empty?;
     let points = points?;
     let many = many?;
     let keys = keys?;
@@ -194,7 +191,7 @@ async fn assert_map<B: ReaderBackend>(
     let forward = forward?;
     let backward = backward?;
     if empty != model.is_empty()
-        || points.iter().any(|matches| !matches)
+        || !points
         || many != expect_many
         || forward != expect_forward
         || keys != model.keys().copied().collect::<Vec<_>>()
@@ -208,29 +205,23 @@ async fn assert_map<B: ReaderBackend>(
     if backward != expect_backward {
         return Ok(false);
     }
-    let reader = &reader;
-    let limits = try_join_all(
+    all_match(
         [
             (Direction::Forward, &forward),
             (Direction::Backward, &backward),
-        ]
-        .into_iter()
-        .map(|(dir, expected)| async move {
+        ],
+        |(dir, expected)| async move {
             let limit = NonZeroUsize::new(expected.len() / 2 + 1).unwrap_or(NonZeroUsize::MIN);
-            let (entries, keys) = join!(
+            let (entries, keys) = try_join!(
                 collect_query(reader.query(case.key.clone(), dir).limit(limit).entries()),
                 collect_query(reader.query(case.key.clone(), dir).limit(limit).keys()),
-            );
-            let (entries, keys) = (entries?, keys?);
+            )?;
             let expected: Vec<_> = expected.iter().take(limit.get()).cloned().collect();
-            Ok::<_, Report>(
-                entries == expected
-                    && keys == expected.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
-            )
-        }),
+            Ok(entries == expected
+                && keys == expected.iter().map(|(key, _)| *key).collect::<Vec<_>>())
+        },
     )
-    .await?;
-    Ok(limits.into_iter().all(|matched| matched))
+    .await
 }
 
 /// Drives a Map trace: commit each event's `Set`/`Remove`/`Clear`, mirror into
@@ -333,13 +324,16 @@ async fn assert_deque<B: ReaderBackend>(
     model: &VecDeque<Value>,
 ) -> Result<bool> {
     let deps = backend.deps();
-    let reader = StateReader::new(&deps, case.sub.clone(), descriptor)?;
-    let (len, empty, front, back, points, forward, backward, constrained, constrained_backward) = join!(
-        reader.len(case.key.clone()),
+    let reader = &StateReader::new(&deps, case.sub.clone(), descriptor)?;
+    // The first read warms the publication snapshot. The rest share it.
+    let len = reader.len(case.key.clone()).await?;
+    let (empty, front, back, points, forward, backward, constrained, constrained_backward) = join!(
         reader.is_empty(case.key.clone()),
         reader.peek_front(case.key.clone()),
         reader.peek_back(case.key.clone()),
-        try_join_all((0..=model.len()).map(|i| reader.get(case.key.clone(), i))),
+        all_match(0..=model.len(), |i| async move {
+            Ok(reader.get(case.key.clone(), i).await? == model.get(i).cloned())
+        }),
         collect_query(reader.stream(case.key.clone(), Direction::Forward)),
         collect_query(reader.stream(case.key.clone(), Direction::Backward)),
         collect_query(
@@ -356,7 +350,6 @@ async fn assert_deque<B: ReaderBackend>(
                 .values()
         ),
     );
-    let len = len?;
     let empty = empty?;
     let front = front?;
     let back = back?;
@@ -370,9 +363,6 @@ async fn assert_deque<B: ReaderBackend>(
         && front == model.front().cloned()
         && back == model.back().cloned()
         && points
-            == (0..=model.len())
-                .map(|i| model.get(i).cloned())
-                .collect::<Vec<_>>()
         && forward == model.iter().cloned().collect::<Vec<_>>()
         && backward == model.iter().rev().cloned().collect::<Vec<_>>()
         && constrained == model.iter().skip(1).take(1).cloned().collect::<Vec<_>>()

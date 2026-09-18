@@ -25,16 +25,18 @@ pub(crate) use scripted::{CountingIdentityStore, ScriptedCellSource};
 pub(super) use scripted::{FaultPoint, ScriptedEnv};
 
 use crate::Topic;
+use crate::state::SHARD_FANOUT_CONCURRENCY;
 use crate::state::identity::StateName;
 use crate::state_reader::cache::ReaderCache;
 use crate::state_reader::{PartitionCount, StateReaderError};
 use crate::subsystem::SubsystemName;
 use color_eyre::eyre::{Result, eyre};
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use internment::Intern;
 use quanta::{Clock, Mock};
 use std::future::Future;
 use std::sync::Arc;
+use tokio::task::coop::cooperative;
 
 /// The subsystem every suite routes under.
 pub(super) const SUBSYSTEM: &str = "orders";
@@ -87,4 +89,40 @@ where
     S: Stream<Item = Result<T, StateReaderError>>,
 {
     Box::pin(collect_stream(query.await?)).await
+}
+
+/// Runs `check` over `items` with bounded concurrency, in input order.
+/// [`SHARD_FANOUT_CONCURRENCY`] bounds the overlapping round trips, as the
+/// production stores do.
+fn fan_out<I, F, Fut, T>(items: I, mut check: F) -> impl Stream<Item = Result<T>>
+where
+    I: IntoIterator,
+    F: FnMut(I::Item) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    stream::iter(items)
+        .map(move |item| cooperative(check(item)))
+        .buffered(SHARD_FANOUT_CONCURRENCY)
+}
+
+/// Reports whether every check matched. Stops at the first mismatch or error.
+pub(super) async fn all_match<I, F, Fut>(items: I, check: F) -> Result<bool>
+where
+    I: IntoIterator,
+    F: FnMut(I::Item) -> Fut,
+    Fut: Future<Output = Result<bool>>,
+{
+    fan_out(items, check)
+        .try_all(|matched| async move { matched })
+        .await
+}
+
+/// Runs every check. Stops at the first error.
+pub(super) async fn each<I, F, Fut>(items: I, check: F) -> Result<()>
+where
+    I: IntoIterator,
+    F: FnMut(I::Item) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    fan_out(items, check).try_collect().await
 }

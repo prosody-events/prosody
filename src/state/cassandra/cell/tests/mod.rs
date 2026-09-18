@@ -55,7 +55,7 @@ use crate::state::{
     CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateKey, StateName, StateType,
 };
 use crate::test_util::{
-    TEST_KEYSPACE, TEST_RUNTIME, integration_test_count, test_cassandra_config,
+    ModelProperty, TEST_KEYSPACE, TEST_RUNTIME, integration_test_count, test_cassandra_config,
 };
 use crate::tracing::init_test_logging;
 use bytes::Bytes;
@@ -68,10 +68,12 @@ use std::iter;
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use compatibility::mixed_binding_batch;
-use properties::finish;
+
+static FIXTURE: OnceCell<Fixture> = OnceCell::const_new();
 
 #[test]
 fn row_encoding_uses_the_larger_present_payload() -> Result<()> {
@@ -228,21 +230,27 @@ type FaultyBottom = Cached<FailingCellStore<CassandraStore>>;
 /// The shared driver session and prepared cell statements — the
 /// partition-independent half both the bottom store and the property assemblies
 /// are built from.
+/// Evaluations share one fixture. Each `bottom_store` still models a new
+/// assignment.
 struct Fixture {
     cassandra: CassandraSession,
     queries: Arc<CellQueries>,
     registry: Arc<CollectionDefRegistry>,
 }
 
-async fn fixture() -> Result<Fixture> {
-    let config = test_cassandra_config();
-    let cassandra = CassandraSession::new(&config).await?;
-    let queries = Arc::new(CellQueries::new(cassandra.session(), &config.keyspace).await?);
-    Ok(Fixture {
-        cassandra,
-        queries,
-        registry: Arc::new(CollectionDefRegistry::default()),
-    })
+async fn fixture() -> Result<&'static Fixture> {
+    FIXTURE
+        .get_or_try_init(async || {
+            let config = test_cassandra_config();
+            let cassandra = CassandraSession::new(&config).await?;
+            let queries = Arc::new(CellQueries::new(cassandra.session(), &config.keyspace).await?);
+            Ok(Fixture {
+                cassandra,
+                queries,
+                registry: Arc::new(CollectionDefRegistry::default()),
+            })
+        })
+        .await
 }
 
 impl Fixture {

@@ -49,8 +49,8 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
 /// Staged uses the collection TTL. Committed uses only the finite dedup TTL.
 #[test]
 fn marker_rows_carry_evidence_ttl() {
-    fn prop(first: u16, second: Option<u16>, clear: bool, floor: u16) -> TestResult {
-        finish(TEST_RUNTIME.block_on(async {
+    fn prop((first, second, clear, floor): (u16, Option<u16>, bool, u16)) -> Result<bool> {
+        TEST_RUNTIME.block_on(async {
             let fx = fixture().await?;
             let store = fx.bottom_store();
             let first = CompactDuration::new(u32::from(first) + 60);
@@ -142,10 +142,10 @@ fn marker_rows_carry_evidence_ttl() {
                 }
             }
             Ok(true)
-        }))
+        })
     }
     init_test_logging();
     QuickCheck::new()
         .tests(integration_test_count(25))
-        .quickcheck(prop as fn(u16, Option<u16>, bool, u16) -> TestResult);
+        .quickcheck(ModelProperty(prop));
 }

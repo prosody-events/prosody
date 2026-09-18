@@ -77,14 +77,13 @@ async fn check<B: ReaderBackend>(
     model: &BTreeSet<i64>,
 ) -> Result<bool> {
     let deps = backend.deps();
-    let reader = StateReader::new(&deps, case.sub.clone(), descriptor)?;
-    let (empty, points, presence, forward, bounded, backward) = join!(
-        reader.is_empty(case.key.clone()),
-        try_join_all(
-            KEY_POOL
-                .iter()
-                .map(|member| reader.contains(case.key.clone(), member))
-        ),
+    let reader = &StateReader::new(&deps, case.sub.clone(), descriptor)?;
+    // The first read warms the publication snapshot. The rest share it.
+    let empty = reader.is_empty(case.key.clone()).await?;
+    let (points, presence, forward, bounded, backward) = join!(
+        all_match(KEY_POOL.iter(), |member| async move {
+            Ok(reader.contains(case.key.clone(), member).await? == model.contains(member))
+        }),
         reader.contains_many(case.key.clone(), &KEY_POOL),
         collect_query(reader.keys(case.key.clone(), Direction::Forward)),
         collect_query(
@@ -97,7 +96,6 @@ async fn check<B: ReaderBackend>(
         ),
         collect_query(reader.keys(case.key.clone(), Direction::Backward)),
     );
-    let empty = empty?;
     let points = points?;
     let presence = presence?;
     let forward = forward?;
@@ -105,7 +103,7 @@ async fn check<B: ReaderBackend>(
     let backward = backward?;
     let expected = KEY_POOL.map(|member| model.contains(&member));
     Ok(empty == model.is_empty()
-        && points == expected
+        && points
         && presence == expected
         && forward == model.iter().copied().collect::<Vec<_>>()
         && bounded == model.range(-1..=1).take(1).copied().collect::<Vec<_>>()
