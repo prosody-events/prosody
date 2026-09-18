@@ -93,7 +93,8 @@ where
 
 /// Runs `check` over `items` with bounded concurrency, in input order.
 /// [`SHARD_FANOUT_CONCURRENCY`] bounds the overlapping round trips, as the
-/// production stores do.
+/// production stores do. Use this for reader operations only. Owner handle
+/// operations serialize under the session gate, so they gain nothing here.
 fn fan_out<I, F, Fut, T>(items: I, mut check: F) -> impl Stream<Item = Result<T>>
 where
     I: IntoIterator,
