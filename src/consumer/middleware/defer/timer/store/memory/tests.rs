@@ -49,12 +49,14 @@ fn to_trigger_links_reconstructed_span_to_stored_context() -> Result<()> {
 }
 
 /// Two stores minted by one provider for one segment share the durable
-/// substrate, and a store minted for another segment never sees those rows.
-/// The twin of the message store's substrate property.
+/// substrate, a store minted for another segment never sees those rows, and
+/// two standalone stores share nothing. The twin of the message store's
+/// substrate property.
 ///
 /// A fresh map per `create_store` would make every durable row vanish with the
 /// store that wrote it. A map keyed by the key alone would merge two
-/// partitions.
+/// partitions. One shared default provider would merge every standalone
+/// store.
 #[test]
 fn prop_provider_shares_one_substrate_per_segment() {
     fn property(name: String, times: Vec<u32>) -> TestResult {
@@ -89,6 +91,17 @@ fn prop_provider_shares_one_substrate_per_segment() {
             ensure!(
                 other.get_next_deferred_timer(&key).await?.is_none(),
                 "a store on another segment must not read the writer's queue"
+            );
+
+            let standalone = MemoryTimerDeferStore::new(SpanRelation::Child);
+            let other_standalone = MemoryTimerDeferStore::new(SpanRelation::Child);
+            standalone.defer_first_timer(&trigger(first)).await?;
+            ensure!(
+                other_standalone
+                    .get_next_deferred_timer(&key)
+                    .await?
+                    .is_none(),
+                "each standalone store must own its substrate"
             );
             Ok(())
         }))

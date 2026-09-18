@@ -46,10 +46,12 @@ defer_store_tests!(async { Ok::<_, color_eyre::Report>(MemoryMessageDeferStore::
 
 /// Two stores minted by one provider for one segment share the durable
 /// substrate, and a store minted for another segment never sees those rows.
+/// Two standalone stores share nothing.
 ///
 /// A fresh map per `create_store` would make every durable row vanish with the
 /// store that wrote it. A map keyed by the key alone would merge two
-/// partitions.
+/// partitions. One shared default provider would merge every standalone
+/// store.
 #[test]
 fn prop_provider_shares_one_substrate_per_segment() {
     fn property(name: String, offsets: Vec<i64>) -> TestResult {
@@ -79,6 +81,17 @@ fn prop_provider_shares_one_substrate_per_segment() {
             ensure!(
                 other.get_next_deferred_message(&key).await?.is_none(),
                 "a store on another segment must not read the writer's queue"
+            );
+
+            let standalone = MemoryMessageDeferStore::new();
+            let other_standalone = MemoryMessageDeferStore::new();
+            standalone.defer_first_message(&key, first).await?;
+            ensure!(
+                other_standalone
+                    .get_next_deferred_message(&key)
+                    .await?
+                    .is_none(),
+                "each standalone store must own its substrate"
             );
             Ok(())
         }))

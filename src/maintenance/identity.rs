@@ -78,6 +78,8 @@ impl Segment {
     }
 }
 
+/// Renders the segment for a human. The timer segment name comes from
+/// `timer_segment_name`, and the two strings differ by one separator character.
 impl fmt::Display for Segment {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}/{}", self.group, self.topic, self.partition)

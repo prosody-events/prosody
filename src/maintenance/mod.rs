@@ -14,20 +14,15 @@
 //! Facts are what the stores said at one moment. Each fact is a plain owned
 //! record. It holds no generic, no borrow, and no connection.
 //!
-//! Judgment reads facts and reports findings. It performs no input and no
-//! output.
+//! Judgment reads facts and reports findings. It does not read or write data.
 //!
-//! Action plans repairs and applies them. Every repair is idempotent, so a
-//! cancelled or interrupted run leaves a state the next run completes.
+//! Action plans repairs and applies them.
 //!
-//! Posture says whether the group that owns a segment may run. The posture
-//! decides the retry time, so a near-time write against a live group is
-//! unrepresentable.
+//! Posture says whether the group that owns a segment may run.
 //!
-//! This module holds identity, facts, and the [`Catalog`]. The catalog runs the
-//! scans production code never runs. The scans that restrict a partial
-//! partition key live only in the Cassandra catalog. No other module in the
-//! crate reads one.
+//! The [`Catalog`] runs the scans production code never runs. The scans that
+//! restrict a partial partition key live only in the Cassandra catalog. No
+//! other module in the crate runs such a scan.
 
 mod catalog;
 mod facts;

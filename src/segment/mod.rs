@@ -1,5 +1,6 @@
-//! Canonical per-Kafka-partition segment id: the type and its derivation,
-//! owned by neither the defer nor the keyed-state subsystem.
+//! The two frozen per-Kafka-partition segment id formulas, owned by no
+//! subsystem: [`partition_segment_id`] for the defer and keyed-state rows, and
+//! [`timer_segment_name`] plus [`timer_segment_id`] for the timer rows.
 
 use crate::{Partition, Topic};
 use uuid::Uuid;

@@ -35,8 +35,9 @@ pub use lazy::LazySegment;
 pub use store::SegmentStore;
 
 // `MemorySegmentStore` is memory mode's registry of deferred segments, so the
-// memory defer providers and the maintenance catalog share one.
-pub use store::MemorySegmentStore;
+// memory defer providers and the maintenance catalog share one. Nothing
+// outside the crate names it.
+pub(crate) use store::MemorySegmentStore;
 
 /// Segment metadata: ID plus source context (topic, partition, consumer group).
 ///

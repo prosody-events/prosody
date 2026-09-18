@@ -58,9 +58,8 @@ fn cassandra_directory_deregisters_idempotently() -> Result<()> {
 }
 
 /// A registration lives on a lease and nothing else. Every cell a peer writes
-/// carries a TTL inside the lease, and past the lease with no refresh the peer
-/// row is gone — so resolution finds nothing and the peer reads as unreachable
-/// rather than as a stale address to dial.
+/// carries a TTL inside the lease. Past the lease with no refresh the peer row
+/// is gone, so resolution finds nothing and the peer reads as unreachable.
 #[test]
 fn registration_cells_carry_a_ttl_and_expire() -> Result<()> {
     init_test_logging();

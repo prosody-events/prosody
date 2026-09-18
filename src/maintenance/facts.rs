@@ -15,16 +15,14 @@ pub struct SegmentFacts {
     pub segment: Segment,
     /// The slab size the live scheduler runs with.
     pub slab_size: CompactDuration,
-    /// The durable layout. A missing version column decodes as
-    /// [`SegmentVersion::V1`].
+    /// The durable layout the segment row reported.
     pub version: SegmentVersion,
 }
 
 impl SegmentFacts {
     /// Whether the layout stores a timer type.
     ///
-    /// A V1 layout cannot hold a typed retry timer. Report such a segment to
-    /// the operator, and never arm a timer in it.
+    /// A V1 layout cannot hold a typed retry timer.
     #[must_use]
     pub fn typed_layout(&self) -> bool {
         self.version != SegmentVersion::V1
@@ -34,9 +32,8 @@ impl SegmentFacts {
 /// One deferred key and its retry timer, read together.
 ///
 /// **Invariant:** a `DeferredKey` exists only for a queue that holds at least
-/// one row, and [`RetryTimer::Absent`] is the stranded case. No field says
-/// "stranded". The reader builds the value from the production queue-head read
-/// and drops a key whose head is absent.
+/// one row. [`RetryTimer::Absent`] is the stranded case, so no field says
+/// "stranded".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeferredKey {
     /// The segment the key belongs to.
@@ -54,14 +51,14 @@ pub struct DeferredKey {
 pub enum DeferredQueue {
     /// A queue of deferred message offsets.
     Messages {
-        /// Attempts already made against the head.
+        /// Attempts already made for the key.
         retry_count: u32,
         /// The offset the next attempt reloads.
         next_offset: Offset,
     },
     /// A queue of deferred timers.
     Timers {
-        /// Attempts already made against the head.
+        /// Attempts already made for the key.
         retry_count: u32,
         /// The original fire time the next attempt reloads.
         next: CompactDateTime,

@@ -1,14 +1,14 @@
 //! The catalog reports exactly what the production stores hold, on either
 //! backend.
 
-use super::support::{cassandra_fixture, finish, run_memory};
-use super::trace::{CatalogTrace, expected_snapshot, fresh_group, segment};
+use super::support::{cassandra_fixture, collect_keys, finish, run_memory};
+use super::trace::{CatalogTrace, SLAB_SIZE, expected_snapshot, fresh_group, segment};
 use crate::cassandra::TABLE_SEGMENTS;
 use crate::maintenance::Catalog;
+use crate::maintenance::catalog::cassandra::CATALOG_PAGE_SIZE;
 use crate::test_util::{
     TEST_KEYSPACE, TEST_RUNTIME, integration_test_count, shared_cassandra_store,
 };
-use crate::timers::duration::CompactDuration;
 use crate::timers::store::SegmentVersion;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
@@ -81,7 +81,6 @@ fn legacy_timer_segment_row_reads_as_v1() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let group = fresh_group();
         let id = segment(&group, 0).timer_id();
-        let slab_size = CompactDuration::new(600);
 
         shared_cassandra_store()
             .await?
@@ -91,7 +90,7 @@ fn legacy_timer_segment_row_reads_as_v1() -> Result<()> {
                     "INSERT INTO {TEST_KEYSPACE}.{TABLE_SEGMENTS} (id, name, slab_size) VALUES \
                      (?, ?, ?)"
                 ),
-                (id.as_uuid(), group.as_str(), slab_size),
+                (id.as_uuid(), group.as_str(), SLAB_SIZE),
             )
             .await?;
 
@@ -105,6 +104,34 @@ fn legacy_timer_segment_row_reads_as_v1() -> Result<()> {
             row.version == SegmentVersion::V1,
             "a missing version column must decode as V1, got {:?}",
             row.version
+        );
+        Ok(())
+    })
+}
+
+/// Both key scans report every key of a segment that holds more than one page
+/// of them.
+///
+/// A trace cannot reach this: its key pool is far smaller than one page, so
+/// every trace scan reads a single page.
+#[test]
+fn key_scans_cross_a_page_boundary() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let group = fresh_group();
+        let fixture = cassandra_fixture().await?;
+        let expected = fixture
+            .seed_keys(&group, usize::try_from(CATALOG_PAGE_SIZE)? + 1)
+            .await?;
+
+        let id = segment(&group, 0).defer_id();
+        let catalog = fixture.catalog();
+        ensure!(
+            collect_keys(catalog.message_keys(id)).await? == expected,
+            "the message key scan must report every key across the page boundary"
+        );
+        ensure!(
+            collect_keys(catalog.timer_keys(id)).await? == expected,
+            "the timer key scan must report every key across the page boundary"
         );
         Ok(())
     })

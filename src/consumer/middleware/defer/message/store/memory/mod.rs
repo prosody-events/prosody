@@ -1,6 +1,7 @@
-//! In-memory message defer store for testing.
+//! Memory mode's message defer store. All data is volatile, and the stores one
+//! provider mints share its substrate.
 //!
-//! Uses [`scc::HashMap`] for lock-free concurrent access. All data is volatile.
+//! Uses [`scc::HashMap`] for lock-free concurrent access.
 
 use super::MessageDeferStore;
 use super::provider::MessageDeferStoreProvider;
@@ -194,7 +195,7 @@ pub struct MemoryMessageDeferStoreProvider {
 impl MemoryMessageDeferStoreProvider {
     /// Creates a provider that registers its segments in `segments`.
     #[must_use]
-    pub fn new(segments: MemorySegmentStore) -> Self {
+    pub(crate) fn new(segments: MemorySegmentStore) -> Self {
         Self {
             segments,
             inner: Arc::new(Inner::default()),

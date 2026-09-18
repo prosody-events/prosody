@@ -3,7 +3,9 @@
 //! One runner drives a [`CatalogTrace`] through a backend's production stores
 //! and reads that backend's catalog, so both backends answer the same trace.
 
-use super::trace::{CatalogTrace, Effect, Model, Snapshot, key_name, timer_segment, topic};
+use super::trace::{
+    CatalogTrace, Effect, Model, Snapshot, key_name, timer_segment, timer_segment_row, topic,
+};
 use crate::consumer::middleware::defer::memory_providers;
 use crate::consumer::middleware::defer::message::store::cassandra::MessageQueries;
 use crate::consumer::middleware::defer::message::store::{
@@ -17,22 +19,28 @@ use crate::consumer::middleware::defer::timer::store::{
 use crate::maintenance::{CassandraCatalog, Catalog, GroupId, MemoryCatalog};
 use crate::otel::SpanRelation;
 use crate::test_util::{TEST_KEYSPACE, shared_cassandra_store};
+use crate::timers::datetime::CompactDateTime;
 use crate::timers::store::cassandra::CassandraTriggerStoreProvider;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use crate::timers::store::{TriggerStore, TriggerStoreProvider};
 use crate::timers::{TimerType, Trigger};
-use crate::{Key, Partition};
+use crate::{Key, Offset, Partition};
 use color_eyre::Result;
-use futures::{Stream, TryStreamExt, pin_mut};
+use futures::{Stream, StreamExt, TryStreamExt, pin_mut, stream};
 use quickcheck::TestResult;
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
+use tokio::task::coop::cooperative;
 use tracing::Span;
 
 /// Write-through cache size for the Cassandra defer stores under test.
 const CACHE: usize = 64;
+
+/// Seed writes in flight at once. The seeded keys are independent, so they are
+/// written concurrently under this bound.
+const SEED_FANOUT: usize = 16;
 
 /// The Cassandra providers and catalog, prepared once for the test process.
 static CASSANDRA: OnceCell<CassandraFixture> = OnceCell::const_new();
@@ -85,6 +93,39 @@ impl CassandraFixture {
     /// The prepared catalog, for the reads that need no trace.
     pub(super) fn catalog(&self) -> &CassandraCatalog {
         &self.catalog
+    }
+
+    /// Defers one message and one timer for each of `count` distinct keys in
+    /// partition 0 of `group`. Returns the key names.
+    pub(super) async fn seed_keys(
+        &self,
+        group: &GroupId,
+        count: usize,
+    ) -> Result<BTreeSet<String>> {
+        let messages = self
+            .messages
+            .create_store(topic(), 0, group.as_str(), CACHE);
+        let timers = self.timers.create_store(topic(), 0, group.as_str(), CACHE);
+        let (messages, timers) = (&messages, &timers);
+
+        stream::iter(0..count)
+            .map(|index| {
+                cooperative(async move {
+                    let key = Key::from(key_name(index));
+                    let offset = Offset::from(index as i64);
+                    messages.defer_first_message(&key, offset).await?;
+
+                    let time = CompactDateTime::from(index as u32);
+                    let trigger =
+                        Trigger::new(key.clone(), time, TimerType::Application, Span::none());
+                    timers.defer_first_timer(&trigger).await?;
+
+                    Ok::<_, color_eyre::Report>(key.to_string())
+                })
+            })
+            .buffer_unordered(SEED_FANOUT)
+            .try_collect()
+            .await
     }
 }
 
@@ -270,7 +311,7 @@ async fn read_snapshot<C: Catalog>(catalog: &C, group: &GroupId) -> Result<Snaps
             catalog
                 .timer_segment(segment.timer_id())
                 .await?
-                .map(|row| (row.name, row.slab_size.seconds(), i8::from(row.version))),
+                .map(timer_segment_row),
         );
     }
 
@@ -278,7 +319,7 @@ async fn read_snapshot<C: Catalog>(catalog: &C, group: &GroupId) -> Result<Snaps
 }
 
 /// Drains one key scan into a set.
-async fn collect_keys<S, E>(stream: S) -> Result<BTreeSet<String>>
+pub(super) async fn collect_keys<S, E>(stream: S) -> Result<BTreeSet<String>>
 where
     S: Stream<Item = Result<Key, E>>,
     E: Error + Send + Sync + 'static,
@@ -291,8 +332,8 @@ where
     Ok(out)
 }
 
-/// Converts a property body's result into a test outcome. A store failure is a
-/// broken environment, never a shrinkable property failure.
+/// Converts a property body's result into a test outcome. A store failure is
+/// reported as a broken environment, with the error text attached.
 pub(super) fn finish(result: Result<()>) -> TestResult {
     match result {
         Ok(()) => TestResult::passed(),

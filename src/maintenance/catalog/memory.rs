@@ -14,8 +14,13 @@ use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use async_stream::stream;
 use futures::Stream;
 use std::convert::Infallible;
+use std::future::ready;
+use tokio::task::coop::cooperative;
 
 /// Reads the shared memory substrates the memory providers write.
+///
+/// Each scan takes its snapshot on the first poll. Dropping the stream after
+/// that stops no work.
 ///
 /// Do not swap in fresh providers here. The catalog sees only what the
 /// providers it holds wrote, so four independently defaulted substrates would
@@ -49,15 +54,18 @@ impl MemoryCatalog {
 impl Catalog for MemoryCatalog {
     type Error = Infallible;
 
-    fn segments(&self) -> impl Stream<Item = Result<Segment, Self::Error>> + Send {
+    fn segments(&self) -> impl Stream<Item = Result<Segment, Self::Error>> + Send + 'static {
         let registry = self.segments.clone();
         stream! {
             for segment in registry.segments().await {
-                yield Ok(Segment::new(
+                // The snapshot holds no tokio leaf await, so `cooperative` is
+                // the only per-item budget checkpoint in these three scans.
+                yield cooperative(ready(Ok(Segment::new(
                     GroupId::new(segment.consumer_group()),
                     *segment.topic(),
                     segment.partition(),
-                ));
+                ))))
+                .await;
             }
         }
     }
@@ -66,14 +74,16 @@ impl Catalog for MemoryCatalog {
         Ok(self.triggers.segment(id.as_uuid()).await)
     }
 
+    // The two key scans are not folded: the two providers are different types,
+    // so a fold needs a trait or a macro, and plain arms read better.
     fn message_keys(
         &self,
         id: DeferSegmentId,
-    ) -> impl Stream<Item = Result<Key, Self::Error>> + Send {
+    ) -> impl Stream<Item = Result<Key, Self::Error>> + Send + 'static {
         let messages = self.messages.clone();
         stream! {
             for key in messages.keys(id.as_uuid()).await {
-                yield Ok(key);
+                yield cooperative(ready(Ok(key))).await;
             }
         }
     }
@@ -81,11 +91,11 @@ impl Catalog for MemoryCatalog {
     fn timer_keys(
         &self,
         id: DeferSegmentId,
-    ) -> impl Stream<Item = Result<Key, Self::Error>> + Send {
+    ) -> impl Stream<Item = Result<Key, Self::Error>> + Send + 'static {
         let timers = self.timers.clone();
         stream! {
             for key in timers.keys(id.as_uuid()).await {
-                yield Ok(key);
+                yield cooperative(ready(Ok(key))).await;
             }
         }
     }

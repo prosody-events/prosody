@@ -81,8 +81,9 @@ fn prop_maintenance_ids_match_production(
 }
 
 /// Every field enters the timer formula, and the two formulas never agree on
-/// one triple: swapping the group with the topic, or reusing one namespace for
-/// both families, changes the id.
+/// one triple. Perturbing the topic, the partition, or the group alone changes
+/// the timer id, and the defer formula gives a different id for the same
+/// triple.
 #[quickcheck]
 fn prop_timer_id_fields_participate(topic: String, partition: Partition, group: String) -> bool {
     let other_topic = Topic::from(format!("{topic}x").into_boxed_str());

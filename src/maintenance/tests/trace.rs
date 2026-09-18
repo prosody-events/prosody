@@ -21,7 +21,7 @@ use uuid::Uuid;
 const TOPIC: &str = "maintenance-catalog";
 
 /// The slab size every trace writes into its timer segment rows.
-const SLAB_SIZE: CompactDuration = CompactDuration::new(600);
+pub(super) const SLAB_SIZE: CompactDuration = CompactDuration::new(600);
 
 /// Partitions a trace spreads its keys over. The last one deliberately gets no
 /// timer segment row, so an absent row is covered on both backends.
@@ -134,6 +134,16 @@ pub(super) struct Model {
     registered: BTreeSet<usize>,
 }
 
+/// The timer segment row reduced to the fields a snapshot compares. The
+/// expected and the observed value share this one conversion, so neither can
+/// drift on its own.
+pub(super) type TimerSegmentRow = (String, u32, i8);
+
+/// Reduces a timer segment row to [`TimerSegmentRow`].
+pub(super) fn timer_segment_row(row: TimerSegment) -> TimerSegmentRow {
+    (row.name, row.slab_size.seconds(), i8::from(row.version))
+}
+
 /// What one catalog said, keyed by the segment's rendering so the comparison
 /// needs no ordering on a segment and reads in a failure message.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -141,7 +151,7 @@ pub(super) struct Snapshot {
     pub(super) segments: BTreeSet<String>,
     pub(super) message_keys: BTreeMap<String, BTreeSet<String>>,
     pub(super) timer_keys: BTreeMap<String, BTreeSet<String>>,
-    pub(super) timer_segments: BTreeMap<String, Option<(String, u32, i8)>>,
+    pub(super) timer_segments: BTreeMap<String, Option<TimerSegmentRow>>,
 }
 
 impl Arbitrary for CatalogTrace {
@@ -379,12 +389,11 @@ fn expected_timer_segment(
     trace: &CatalogTrace,
     group: &GroupId,
     partition: usize,
-) -> Option<(String, u32, i8)> {
+) -> Option<TimerSegmentRow> {
     if partition + 1 >= trace.partitions {
         return None;
     }
-    let row = timer_segment(group, partition);
-    Some((row.name, row.slab_size.seconds(), i8::from(row.version)))
+    Some(timer_segment_row(timer_segment(group, partition)))
 }
 
 /// The keys of one partition whose queue still holds a row.

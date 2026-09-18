@@ -20,7 +20,7 @@
 //!
 //! # Store Backends
 //!
-//! - **Memory**: Volatile, for testing
+//! - **Memory**: Volatile, for memory mode
 //! - **Cassandra**: Persistent, for production (with write-through cache)
 //!
 //! # Composability

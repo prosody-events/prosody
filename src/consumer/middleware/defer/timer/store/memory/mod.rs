@@ -1,6 +1,7 @@
-//! In-memory timer defer store for testing.
+//! Memory mode's timer defer store. All data is volatile, and the stores one
+//! provider mints share its substrate.
 //!
-//! Uses [`scc::HashMap`] for lock-free concurrent access. All data is volatile.
+//! Uses [`scc::HashMap`] for lock-free concurrent access.
 
 use super::TimerDeferStore;
 use super::provider::TimerDeferStoreProvider;
@@ -239,7 +240,7 @@ impl TimerDeferStore for MemoryTimerDeferStore {
         let _ = self
             .inner
             .deferred
-            .entry_async((segment, key.clone()))
+            .entry_async((segment, Arc::clone(key)))
             .await
             .and_modify(|(_, current)| {
                 *current = retry_count;
@@ -276,7 +277,7 @@ impl MemoryTimerDeferStoreProvider {
     /// Creates a provider that registers its segments in `segments` and links
     /// reload spans through `timer_spans`.
     #[must_use]
-    pub fn new(segments: MemorySegmentStore, timer_spans: SpanRelation) -> Self {
+    pub(crate) fn new(segments: MemorySegmentStore, timer_spans: SpanRelation) -> Self {
         Self {
             segments,
             inner: Arc::new(Inner::default()),

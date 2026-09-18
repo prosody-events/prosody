@@ -4,7 +4,9 @@
 //! wants. Maintenance must first learn which segments and which keys exist. The
 //! [`Catalog`] answers that question over either backend.
 
-mod cassandra;
+// `pub(super)` so the maintenance tests can name `CATALOG_PAGE_SIZE` and prove
+// a key scan crosses a page boundary.
+pub(super) mod cassandra;
 mod memory;
 
 pub use cassandra::CassandraCatalog;
@@ -23,9 +25,7 @@ use std::future::Future;
 /// Every method streams or returns owned values and keeps no state between
 /// calls. Dropping a stream stops the scan behind it.
 ///
-/// The catalog reads identities and one small row. It never reads a queue head
-/// or a retry timer: the production point reads answer those, one key at a
-/// time, under a bound.
+/// Each scan reports an identity at most once. The order is unspecified.
 pub trait Catalog: Clone + Send + Sync + 'static {
     /// The backend's own error. It is classified, so an operator tool can
     /// decide to retry or to stop.
@@ -33,7 +33,10 @@ pub trait Catalog: Clone + Send + Sync + 'static {
 
     /// Every segment that ever deferred, from the registry of deferred
     /// segments.
-    fn segments(&self) -> impl Stream<Item = Result<Segment, Self::Error>> + Send;
+    ///
+    /// The scan reports a segment only when the row names a group, a topic,
+    /// and a partition. It skips any other row.
+    fn segments(&self) -> impl Stream<Item = Result<Segment, Self::Error>> + Send + 'static;
 
     /// The timer segment row, or `None` when the segment never ran a scheduler.
     ///
@@ -45,15 +48,18 @@ pub trait Catalog: Clone + Send + Sync + 'static {
 
     /// Keys with deferred message rows in one segment.
     ///
-    /// A key can come back with an empty queue, because a partition can hold a
-    /// retry count and no queue row. The production point read decides.
+    /// A key can come back with an empty queue. No production path writes a
+    /// retry count with no queue row, so a caller reads the queue head and
+    /// drops the key when the head is absent.
     fn message_keys(
         &self,
         id: DeferSegmentId,
-    ) -> impl Stream<Item = Result<Key, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<Key, Self::Error>> + Send + 'static;
 
     /// Keys with deferred timer rows in one segment. The twin of
     /// [`message_keys`](Self::message_keys).
-    fn timer_keys(&self, id: DeferSegmentId)
-    -> impl Stream<Item = Result<Key, Self::Error>> + Send;
+    fn timer_keys(
+        &self,
+        id: DeferSegmentId,
+    ) -> impl Stream<Item = Result<Key, Self::Error>> + Send + 'static;
 }
