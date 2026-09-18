@@ -1,6 +1,4 @@
 use super::*;
-use crate::consumer::middleware::providers::LeafHandler;
-use crate::consumer::middleware::tests::test_support::settlement_name;
 use crate::consumer::middleware::tests::test_support::{
     MockEventContext, ScriptedHandler, TestError, create_test_message, create_test_trigger,
 };
@@ -360,74 +358,67 @@ async fn apply_hooks_suppressed_when_inner_did_not_run() {
     assert!(recorder.commit_calls.lock().is_empty());
 }
 
-/// Inner results delegate. Cancellation and shutdown abandon the source.
+/// The settlement classification table: inner-ran rows delegate (including
+/// `ShutdownAfterInner`, which carries the inner's own error); the pre-inner
+/// admission rejections are `Bypassed`. Delegation is proven against a
+/// `Bypassed`-classifying probe.
 #[test]
 fn settlement_classification_table() {
-    use crate::consumer::middleware::SettlementHandler;
     use crate::consumer::middleware::tests::test_support::BypassedHandler;
+    use crate::consumer::middleware::{Settlement, SettlementHandler};
 
-    type Subject = CancellationHandler<LeafHandler<ScriptedHandler>>;
+    type Subject = CancellationHandler<ScriptedHandler>;
     type Probe = CancellationHandler<BypassedHandler>;
     type Err_ = CancellationError<TestError>;
 
-    let rows: Vec<(&str, Result<(), Err_>, &str)> = vec![
-        ("Ok delegates to the leaf's Final", Ok(()), "Final"),
+    let rows: Vec<(&str, Result<(), Err_>, Settlement)> = vec![
         (
-            "Handler delegates to the leaf's Rejected",
+            "Ok delegates to the leaf's Final",
+            Ok(()),
+            Settlement::Final,
+        ),
+        (
+            "Handler delegates to the leaf's Final",
             Err(CancellationError::Handler(TestError(
                 ErrorCategory::Permanent,
             ))),
-            "Rejected",
+            Settlement::Final,
         ),
         (
-            "ShutdownAfterInner is Abandoned",
+            "ShutdownAfterInner delegates on the carried inner error",
             Err(CancellationError::ShutdownAfterInner(TestError(
                 ErrorCategory::Transient,
             ))),
-            "Abandoned",
+            Settlement::Final,
         ),
         (
-            "Terminal inner is Abandoned",
-            Err(CancellationError::Handler(TestError(
-                ErrorCategory::Terminal,
-            ))),
-            "Abandoned",
-        ),
-        (
-            "Shutdown (pre-inner) is Abandoned",
+            "Shutdown (pre-inner) is Bypassed",
             Err(CancellationError::Shutdown),
-            "Abandoned",
+            Settlement::Bypassed,
         ),
         (
-            "MessageCancelled (pre-inner) is Abandoned",
+            "MessageCancelled (pre-inner) is Bypassed",
             Err(CancellationError::MessageCancelled),
-            "Abandoned",
+            Settlement::Bypassed,
         ),
     ];
     for (label, result, expected) in rows {
-        assert_eq!(
-            settlement_name(Subject::settlement(result.as_ref())),
-            expected,
-            "{label}"
-        );
+        assert_eq!(Subject::settlement(result.as_ref()), expected, "{label}");
     }
 
     // Delegation proof: over a Bypassed-classifying inner the delegating
     // rows stay Bypassed.
     let ok: Result<(), Err_> = Ok(());
-    assert_eq!(settlement_name(Probe::settlement(ok.as_ref())), "Bypassed");
+    assert_eq!(Probe::settlement(ok.as_ref()), Settlement::Bypassed);
     let inner_err: Result<(), Err_> = Err(CancellationError::Handler(TestError(
         ErrorCategory::Permanent,
     )));
-    assert_eq!(
-        settlement_name(Probe::settlement(inner_err.as_ref())),
-        "Bypassed"
-    );
+    assert_eq!(Probe::settlement(inner_err.as_ref()), Settlement::Bypassed);
     let shutdown_after_inner: Result<(), Err_> = Err(CancellationError::ShutdownAfterInner(
         TestError(ErrorCategory::Permanent),
     ));
     assert_eq!(
-        settlement_name(Probe::settlement(shutdown_after_inner.as_ref())),
-        "Abandoned"
+        Probe::settlement(shutdown_after_inner.as_ref()),
+        Settlement::Bypassed
     );
 }

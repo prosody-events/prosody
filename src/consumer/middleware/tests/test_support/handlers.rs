@@ -236,6 +236,12 @@ impl FallibleHandler for ScriptedHandler {
     }
 }
 
+impl SettlementHandler for ScriptedHandler {
+    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        Settlement::Final
+    }
+}
+
 /// Probe leaf whose settlement classification is `Bypassed` for every
 /// result, so a wrapper's delegating rows are provably delegating in the
 /// classification tables — a wrapper hardcoding `Final` fails against it.
@@ -316,29 +322,13 @@ pub fn create_test_trigger_with(key: &str, time: u32, timer_type: TimerType) -> 
     Trigger::for_testing(Arc::from(key), CompactDateTime::from(time), timer_type)
 }
 
-/// Records whether the source commits or aborts.
-pub struct RecordingGuard {
+/// Guard recording whether the trigger committed or aborted.
+pub struct RecordingTimerGuard {
     committed: Arc<AtomicUsize>,
     aborted: Arc<AtomicUsize>,
 }
 
-impl RecordingGuard {
-    /// Returns the guard and its commit and abort counters.
-    pub fn new() -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
-        let committed = Arc::default();
-        let aborted = Arc::default();
-        (
-            Self {
-                committed: Arc::clone(&committed),
-                aborted: Arc::clone(&aborted),
-            },
-            committed,
-            aborted,
-        )
-    }
-}
-
-impl Uncommitted for RecordingGuard {
+impl Uncommitted for RecordingTimerGuard {
     async fn commit(self) {
         self.committed.fetch_add(1, Ordering::SeqCst);
     }
@@ -394,7 +384,7 @@ impl Uncommitted for RecordingTimer {
 }
 
 impl UncommittedTimer for RecordingTimer {
-    type CommitGuard = RecordingGuard;
+    type CommitGuard = RecordingTimerGuard;
 
     fn time(&self) -> CompactDateTime {
         self.trigger.time
@@ -409,7 +399,7 @@ impl UncommittedTimer for RecordingTimer {
     }
 
     fn into_inner(self) -> (Trigger, Self::CommitGuard) {
-        let guard = RecordingGuard {
+        let guard = RecordingTimerGuard {
             committed: self.committed.clone(),
             aborted: self.aborted.clone(),
         };

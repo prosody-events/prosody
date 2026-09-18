@@ -79,8 +79,19 @@ impl FallibleHandler for SkipReadProbe {
     async fn shutdown(self) {}
 }
 
-/// A permanent stage rejection re-pins the hook context before its state read.
-/// Without the re-pin, a stale context fails with `Terminated`.
+impl SettlementHandler for SkipReadProbe {
+    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        Settlement::Final
+    }
+}
+
+/// The permanent-finalize-`Skip` arm must fire `after_commit` through
+/// `fire_apply_hook`, not a direct call: a settle context left STALE by a
+/// nested retry's epoch bump is re-stamped current before the hook reads.
+/// Without the stamp the hook's typed read errors `Terminated` — the one
+/// hook-fire site that used to bypass the stamp. Red-proven by reverting
+/// the arm to `handler.after_commit(context, result)`: the read then
+/// reports `Terminated`.
 #[tokio::test]
 async fn permanent_skip_hook_reads_through_the_stamp() -> Result<()> {
     use crate::consumer::middleware::tests::test_support::RecordingDedup;
@@ -144,7 +155,7 @@ async fn permanent_skip_hook_reads_through_the_stamp() -> Result<()> {
     let handler = SkipReadProbe { read: read.clone() };
     let (guard, committed, _aborted) = RecordingGuard::new();
 
-    settle(&LeafHandler::new(handler.clone()), context, guard, Ok(0)).await;
+    settle(&handler, context, guard, Ok(0)).await;
 
     assert_eq!(
         committed.load(Ordering::SeqCst),

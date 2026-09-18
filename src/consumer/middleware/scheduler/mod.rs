@@ -436,8 +436,10 @@ where
             // Inner ran: delegate.
             Ok(output) => T::settlement(Ok(output)),
             Err(SchedulerError::Handler(error)) => T::settlement(Err(error)),
-            // Permit acquisition failed before the inner ran, so the source must redeliver.
-            Err(SchedulerError::PermitAcquisition(_)) => Settlement::Abandoned,
+            // Pre-inner admission rejection: the inner never ran. (Belt and
+            // braces — the variant classifies Terminal today, which settle's
+            // Terminal-first check abandons before consulting this.)
+            Err(SchedulerError::PermitAcquisition(_)) => Settlement::Bypassed,
         }
     }
 }

@@ -160,7 +160,7 @@ get real coverage.
 Exemplars: `DeferTestInput` in
 `src/consumer/middleware/defer/message/store/tests/prop_defer_store.rs`;
 the trace generator in
-`src/consumer/middleware/defer/timer/tests/properties/generator.rs`.
+`src/consumer/middleware/defer/timer/tests/properties.rs`.
 
 ### Custom `Arbitrary` with explicit shrinking
 

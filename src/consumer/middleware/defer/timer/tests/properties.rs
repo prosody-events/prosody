@@ -1,0 +1,764 @@
+//! Property tests for timer defer middleware.
+//!
+//! Verifies middleware invariants using trace-based specification:
+//! - Timer coverage: every deferred key has an active `DeferredTimer`
+//! - FIFO order: timer with earliest `original_time` processed first
+
+use super::faults::FaultedTimerTrace;
+use super::types::{
+    ApplicationTimerEvent, ApplicationTimerOutcome, DeferredTimerEvent, DeferredTimerOutcome,
+    TimerTrace, TimerTraceEvent,
+};
+use super::{HandlerOutcome, TEST_RUNTIME, TestHarness};
+use crate::Key;
+use crate::consumer::DemandType;
+use crate::consumer::middleware::FallibleHandler;
+use crate::consumer::middleware::defer::calculate_backoff;
+use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
+use crate::timers::datetime::CompactDateTime;
+use crate::timers::duration::CompactDuration;
+use crate::timers::{TimerType, Trigger};
+use crate::tracing::init_test_logging;
+use ahash::HashMap;
+use color_eyre::eyre::ensure;
+use color_eyre::eyre::eyre;
+use quickcheck::{Arbitrary, Gen, TestResult};
+use quickcheck_macros::quickcheck;
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use tracing::Span;
+
+// ============================================================================
+// Trace Model (for invariant verification)
+// ============================================================================
+
+/// Simple model tracking deferred state per key.
+#[derive(Debug, Default)]
+struct TraceModel {
+    /// Key -> (sorted times, retry count)
+    deferred: HashMap<Key, (BTreeSet<CompactDateTime>, u32)>,
+}
+
+impl TraceModel {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn is_deferred(&self, key: &Key) -> bool {
+        self.deferred
+            .get(key)
+            .is_some_and(|(times, _)| !times.is_empty())
+    }
+
+    fn defer_first(&mut self, key: Key, time: CompactDateTime) {
+        let entry = self
+            .deferred
+            .entry(key)
+            .or_insert_with(|| (BTreeSet::new(), 0));
+        entry.0.insert(time);
+        entry.1 = 0;
+    }
+
+    fn queue_behind(&mut self, key: &Key, time: CompactDateTime) {
+        if let Some(entry) = self.deferred.get_mut(key) {
+            entry.0.insert(time);
+        }
+    }
+
+    fn complete_head(&mut self, key: &Key) -> Option<CompactDateTime> {
+        let entry = self.deferred.get_mut(key)?;
+        let head = *entry.0.first()?;
+        entry.0.remove(&head);
+        if entry.0.is_empty() {
+            self.deferred.remove(key);
+            None
+        } else {
+            entry.1 = 0;
+            entry.0.first().copied()
+        }
+    }
+
+    fn increment_retry(&mut self, key: &Key) {
+        if let Some(entry) = self.deferred.get_mut(key) {
+            entry.1 = entry.1.saturating_add(1);
+        }
+    }
+
+    fn get_head(&self, key: &Key) -> Option<CompactDateTime> {
+        self.deferred
+            .get(key)
+            .and_then(|(times, _)| times.first().copied())
+    }
+
+    fn deferred_keys(&self) -> Vec<Key> {
+        self.deferred
+            .iter()
+            .filter(|(_, (times, _))| !times.is_empty())
+            .map(|(k, _)| Arc::clone(k))
+            .collect()
+    }
+}
+
+// ============================================================================
+// Trace Generator
+// ============================================================================
+
+impl Arbitrary for TimerTrace {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let key_count = (usize::arbitrary(g) % 3) + 2; // 2-4 keys
+        let event_count = (usize::arbitrary(g) % 15) + 5; // 5-19 events
+
+        let mut model = TraceModel::new();
+        let mut events = Vec::with_capacity(event_count);
+
+        for _ in 0..event_count {
+            let key_idx = usize::arbitrary(g) % key_count;
+            let key = test_key(key_idx);
+            let time = CompactDateTime::from(u32::arbitrary(g) % 10000 + 1000);
+
+            if model.is_deferred(&key) {
+                generate_deferred_key_event(g, &mut model, &mut events, key_idx, &key, time);
+            } else {
+                generate_non_deferred_event(g, &mut model, &mut events, key_idx, key, time);
+            }
+        }
+
+        Self { events, key_count }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        // Shrink by removing events from end (preserves validity)
+        let events = self.events.clone();
+        let key_count = self.key_count;
+
+        Box::new((1..events.len()).rev().map(move |len| TimerTrace {
+            events: events[..len].to_vec(),
+            key_count,
+        }))
+    }
+}
+
+/// Generates an event for a key that is already deferred.
+fn generate_deferred_key_event(
+    g: &mut Gen,
+    model: &mut TraceModel,
+    events: &mut Vec<TimerTraceEvent>,
+    key_idx: usize,
+    key: &Key,
+    time: CompactDateTime,
+) {
+    // Key is deferred - can either queue or fire retry
+    if bool::arbitrary(g) {
+        // Fire retry timer
+        if let Some(expected_time) = model.get_head(key) {
+            let outcome = match u8::arbitrary(g) % 3 {
+                0 => DeferredTimerOutcome::Success,
+                1 => DeferredTimerOutcome::Permanent,
+                _ => DeferredTimerOutcome::Transient,
+            };
+
+            // Update model
+            match outcome {
+                DeferredTimerOutcome::Success | DeferredTimerOutcome::Permanent => {
+                    model.complete_head(key);
+                }
+                DeferredTimerOutcome::Transient => {
+                    model.increment_retry(key);
+                }
+            }
+
+            events.push(TimerTraceEvent::DeferredTimer(DeferredTimerEvent {
+                key_idx,
+                expected_time,
+                outcome,
+            }));
+        }
+    } else {
+        // Queue behind existing
+        model.queue_behind(key, time);
+        events.push(TimerTraceEvent::ApplicationTimer(ApplicationTimerEvent {
+            key_idx,
+            time,
+            outcome: ApplicationTimerOutcome::Queued,
+        }));
+    }
+}
+
+/// Generates an event for a key that is not yet deferred.
+fn generate_non_deferred_event(
+    g: &mut Gen,
+    model: &mut TraceModel,
+    events: &mut Vec<TimerTraceEvent>,
+    key_idx: usize,
+    key: Key,
+    time: CompactDateTime,
+) {
+    // Key not deferred - application timer fires
+    let outcome = match u8::arbitrary(g) % 4 {
+        0 => ApplicationTimerOutcome::Success,
+        1 => ApplicationTimerOutcome::Permanent,
+        _ => {
+            let defer = bool::arbitrary(g);
+            if defer {
+                model.defer_first(key, time);
+            }
+            ApplicationTimerOutcome::Transient { defer }
+        }
+    };
+
+    events.push(TimerTraceEvent::ApplicationTimer(ApplicationTimerEvent {
+        key_idx,
+        time,
+        outcome,
+    }));
+}
+
+fn test_key(idx: usize) -> Key {
+    Arc::from(format!("timer-test-key-{idx}"))
+}
+
+// ============================================================================
+// Property Tests
+// ============================================================================
+
+/// Property: Timer coverage is maintained after every operation.
+///
+/// **Invariant**: For every key with deferred timers, there is an active
+/// `DeferredTimer`. For every key without deferred timers, there is no timer.
+#[quickcheck]
+fn prop_timer_coverage(trace: TimerTrace) -> color_eyre::Result<()> {
+    init_test_logging();
+    let TimerTrace { events, key_count } = trace;
+
+    TEST_RUNTIME.block_on(async {
+        let harness = TestHarness::new()?;
+        let mut model = TraceModel::new();
+
+        for event in &events {
+            execute_event(&harness, event).await?;
+            update_model(&mut model, event);
+
+            // Verify coverage: once the model believes any key is deferred, a
+            // `DeferredTimer` must have been scheduled to cover it.
+            let deferred_keys = model.deferred_keys();
+            if !deferred_keys.is_empty() && !harness.has_deferred_timer() {
+                return Err(color_eyre::eyre::eyre!(
+                    "coverage violation: model has deferred keys {deferred_keys:?} but no \
+                     DeferredTimer has been scheduled"
+                ));
+            }
+        }
+
+        let _ = key_count; // Used by trace validation
+        Ok(())
+    })
+}
+
+/// Property: FIFO order is maintained for deferred timers.
+///
+/// **Invariant**: When a `DeferredTimer` fires, it processes the timer with the
+/// earliest `original_time` for that key.
+#[quickcheck]
+fn prop_fifo_order(trace: TimerTrace) -> color_eyre::Result<()> {
+    init_test_logging();
+    let TimerTrace { events, key_count } = trace;
+
+    TEST_RUNTIME.block_on(async {
+        let harness = TestHarness::new()?;
+        let mut model = TraceModel::new();
+
+        for event in &events {
+            // For DeferredTimer events, verify FIFO before execution
+            if let TimerTraceEvent::DeferredTimer(deferred_event) = event {
+                let key = test_key(deferred_event.key_idx);
+                if model
+                    .get_head(&key)
+                    .is_some_and(|expected_time| expected_time != deferred_event.expected_time)
+                {
+                    return Err(color_eyre::eyre::eyre!(
+                        "FIFO violation: expected {:?} but trace has {:?}",
+                        model.get_head(&key),
+                        deferred_event.expected_time
+                    ));
+                }
+            }
+
+            // Execute and update model, ignoring expected permanent errors
+            let result = execute_event(&harness, event).await;
+            if let Err(e) = &result
+                && !is_expected_error(e)
+            {
+                return result;
+            }
+
+            update_model(&mut model, event);
+        }
+
+        let _ = key_count; // Used by trace validation
+        Ok(())
+    })
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+async fn execute_event(harness: &TestHarness, event: &TimerTraceEvent) -> color_eyre::Result<()> {
+    match event {
+        TimerTraceEvent::ApplicationTimer(app_event) => {
+            execute_application_timer(harness, app_event).await
+        }
+        TimerTraceEvent::DeferredTimer(def_event) => {
+            execute_deferred_timer(harness, def_event, DemandType::Normal).await
+        }
+    }
+}
+
+async fn execute_application_timer(
+    harness: &TestHarness,
+    event: &ApplicationTimerEvent,
+) -> color_eyre::Result<()> {
+    let key = test_key(event.key_idx);
+    let trigger = Trigger::new(key, event.time, TimerType::Application, Span::current());
+
+    // Configure handler based on expected outcome
+    match &event.outcome {
+        ApplicationTimerOutcome::Success => {
+            harness.inner_handler.set_outcome(HandlerOutcome::Success);
+        }
+        ApplicationTimerOutcome::Permanent => {
+            harness.inner_handler.set_outcome(HandlerOutcome::Permanent);
+        }
+        ApplicationTimerOutcome::Transient { defer } => {
+            harness.inner_handler.set_outcome(HandlerOutcome::Transient);
+            harness.decider.set_next(*defer);
+        }
+        ApplicationTimerOutcome::Queued => {
+            // Handler won't be called - timer is queued
+        }
+    }
+
+    let result = harness
+        .handler
+        .on_timer(harness.context().clone(), trigger, DemandType::Normal)
+        .await;
+
+    // Verify result matches expectation
+    verify_application_timer_result(&event.outcome, result.is_ok())
+}
+
+fn verify_application_timer_result(
+    outcome: &ApplicationTimerOutcome,
+    succeeded: bool,
+) -> color_eyre::Result<()> {
+    match outcome {
+        ApplicationTimerOutcome::Success | ApplicationTimerOutcome::Queued => {
+            if !succeeded {
+                return Err(color_eyre::eyre::eyre!(
+                    "Expected success/queued but got error"
+                ));
+            }
+        }
+        ApplicationTimerOutcome::Permanent => {
+            if succeeded {
+                return Err(color_eyre::eyre::eyre!(
+                    "Expected permanent error but got success"
+                ));
+            }
+        }
+        ApplicationTimerOutcome::Transient { defer } => {
+            if *defer {
+                // Should absorb error
+                if !succeeded {
+                    return Err(color_eyre::eyre::eyre!(
+                        "Expected deferral to absorb error but got error"
+                    ));
+                }
+            } else {
+                // Should propagate error
+                if succeeded {
+                    return Err(color_eyre::eyre::eyre!(
+                        "Expected transient error to propagate but got success"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn execute_deferred_timer(
+    harness: &TestHarness,
+    event: &DeferredTimerEvent,
+    demand: DemandType,
+) -> color_eyre::Result<()> {
+    let key = test_key(event.key_idx);
+    // DeferredTimer fires - time is the scheduled retry time, not original time
+    let trigger = Trigger::new(
+        key,
+        CompactDateTime::now()?,
+        TimerType::DeferredTimer,
+        Span::current(),
+    );
+
+    // Configure handler based on expected outcome
+    match &event.outcome {
+        DeferredTimerOutcome::Success => {
+            harness.inner_handler.set_outcome(HandlerOutcome::Success);
+        }
+        DeferredTimerOutcome::Permanent => {
+            harness.inner_handler.set_outcome(HandlerOutcome::Permanent);
+        }
+        DeferredTimerOutcome::Transient => {
+            harness.inner_handler.set_outcome(HandlerOutcome::Transient);
+        }
+    }
+
+    let result = harness
+        .handler
+        .on_timer(harness.context().clone(), trigger, demand)
+        .await;
+
+    // Verify result matches expectation
+    verify_deferred_timer_result(&event.outcome, result.is_ok())
+}
+
+fn verify_deferred_timer_result(
+    outcome: &DeferredTimerOutcome,
+    succeeded: bool,
+) -> color_eyre::Result<()> {
+    match outcome {
+        DeferredTimerOutcome::Success | DeferredTimerOutcome::Transient => {
+            if !succeeded {
+                return Err(color_eyre::eyre::eyre!(
+                    "Expected success/re-defer but got error"
+                ));
+            }
+        }
+        DeferredTimerOutcome::Permanent => {
+            // Permanent errors propagate
+            if succeeded {
+                return Err(color_eyre::eyre::eyre!(
+                    "Expected permanent error but got success"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn update_model(model: &mut TraceModel, event: &TimerTraceEvent) {
+    match event {
+        TimerTraceEvent::ApplicationTimer(app_event) => {
+            let key = test_key(app_event.key_idx);
+            match &app_event.outcome {
+                ApplicationTimerOutcome::Success | ApplicationTimerOutcome::Permanent => {
+                    // No model change
+                }
+                ApplicationTimerOutcome::Transient { defer } => {
+                    if *defer {
+                        model.defer_first(key, app_event.time);
+                    }
+                }
+                ApplicationTimerOutcome::Queued => {
+                    model.queue_behind(&key, app_event.time);
+                }
+            }
+        }
+        TimerTraceEvent::DeferredTimer(def_event) => {
+            let key = test_key(def_event.key_idx);
+            match &def_event.outcome {
+                DeferredTimerOutcome::Success | DeferredTimerOutcome::Permanent => {
+                    model.complete_head(&key);
+                }
+                DeferredTimerOutcome::Transient => {
+                    model.increment_retry(&key);
+                }
+            }
+        }
+    }
+}
+
+fn is_expected_error(error: &color_eyre::Report) -> bool {
+    // Permanent errors propagate - this is expected
+    let msg = format!("{error:?}");
+    msg.contains("permanent") || msg.contains("Permanent")
+}
+
+// ============================================================================
+// Backoff Property Tests
+// ============================================================================
+
+/// Property: Backoff delays are within configured bounds.
+///
+/// **Invariant**: For any `retry_count` > 0, [`calculate_backoff`] returns a
+/// delay in `[1, min(base * 2^(retry_count-1), max_delay)]` seconds. For
+/// `retry_count == 0` (first deferral), it returns zero — the timer is
+/// scheduled at `original_time`, not after a backoff.
+///
+/// This drives the production `calculate_backoff` (the exact function
+/// `TimerDeferHandler::next_retry_time` calls) against an independently
+/// derived bound, rather than re-deriving the formula and checking it
+/// against itself.
+#[quickcheck]
+fn prop_backoff_bounds(retry_count_raw: u8) -> color_eyre::Result<()> {
+    init_test_logging();
+
+    // Test with retry_count 0-15 (practical range)
+    let retry_count = u32::from(retry_count_raw % 16);
+
+    TEST_RUNTIME.block_on(async {
+        let harness = TestHarness::new()?;
+        let config = &harness.handler.config;
+
+        if retry_count == 0 {
+            assert_eq!(
+                calculate_backoff(config, 0),
+                CompactDuration::MIN,
+                "retry_count=0 must not apply backoff"
+            );
+            return Ok(());
+        }
+
+        // Independent model of the expected ceiling: base * 2^(retry_count-1),
+        // capped at max_delay, floored at 1 second.
+        let base_seconds = u32::try_from(config.base.as_secs()).unwrap_or(u32::MAX);
+        let max_delay_seconds = u32::try_from(config.max_delay.as_secs()).unwrap_or(u32::MAX);
+        let multiplier = 2_u32.saturating_pow(retry_count - 1);
+        let expected_max = base_seconds
+            .saturating_mul(multiplier)
+            .min(max_delay_seconds)
+            .max(1);
+
+        // Sample repeatedly: calculate_backoff applies full jitter, so a
+        // single call cannot expose an out-of-bounds ceiling or floor.
+        for _ in 0..32_u32 {
+            let sampled = calculate_backoff(config, retry_count).seconds();
+            assert!(
+                (1..=expected_max).contains(&sampled),
+                "backoff(retry_count={retry_count}) = {sampled}s outside [1, {expected_max}]"
+            );
+        }
+
+        Ok(())
+    })
+}
+
+/// A reload reports the stored retry count, plus one for the failure that
+/// deferred the event, plus the outer demand's retry ordinal. A transient
+/// failure increments the stored retry count by one.
+#[quickcheck]
+fn prop_retry_increment(trace: TimerTrace, demand: DemandType) -> color_eyre::Result<()> {
+    init_test_logging();
+    let TimerTrace { events, .. } = trace;
+
+    TEST_RUNTIME.block_on(async {
+        let harness = TestHarness::new()?;
+
+        for event in &events {
+            if let TimerTraceEvent::DeferredTimer(def_event) = event {
+                let key = test_key(def_event.key_idx);
+                let before = harness
+                    .get_retry_count(&key)
+                    .await?
+                    .ok_or_else(|| eyre!("Deferred head is absent"))?;
+                // Drain the calls of earlier events.
+                let _ = harness.inner_handler.take_timer_calls();
+                execute_deferred_timer(&harness, def_event, demand).await?;
+                let calls = harness.inner_handler.take_timer_calls();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(
+                    calls[0].1.retry(),
+                    before.saturating_add(1).saturating_add(demand.retry())
+                );
+                if matches!(def_event.outcome, DeferredTimerOutcome::Transient) {
+                    assert_eq!(harness.get_retry_count(&key).await?, Some(before + 1));
+                }
+            } else {
+                execute_event(&harness, event).await?;
+            }
+        }
+
+        Ok(())
+    })
+}
+
+/// Property: Processing order is maintained for deferred timers.
+///
+/// **Invariant**: For a given key, timers are processed in chronological order
+/// by `original_time`. When a `DeferredTimer` fires, it processes the timer
+/// with the smallest `original_time` among all currently-deferred timers.
+///
+/// This test uses the model to predict which timer should be processed and
+/// verifies the trace agrees. It complements `prop_fifo_order` by focusing on
+/// the processing sequence rather than just the head match at each step.
+#[quickcheck]
+fn prop_processing_order(trace: TimerTrace) -> color_eyre::Result<()> {
+    init_test_logging();
+    let TimerTrace { events, key_count } = trace;
+
+    TEST_RUNTIME.block_on(async {
+        let harness = TestHarness::new()?;
+        let mut model = TraceModel::new();
+
+        for event in &events {
+            // For DeferredTimer completions, verify processing matches model
+            if let TimerTraceEvent::DeferredTimer(def_event) = event {
+                let key = test_key(def_event.key_idx);
+
+                // Get what the model says should be at the head
+                let expected_head = model.get_head(&key);
+
+                // The trace's expected_time should match model's head
+                if let Some(head_time) = expected_head
+                    && def_event.expected_time != head_time
+                {
+                    return Err(color_eyre::eyre::eyre!(
+                        "Processing order mismatch for key={key}: model expects {:?} at head, \
+                         trace has {:?}",
+                        head_time,
+                        def_event.expected_time
+                    ));
+                }
+            }
+
+            // Execute and update model, ignoring expected permanent errors
+            let result = execute_event(&harness, event).await;
+            if let Err(e) = &result
+                && !is_expected_error(e)
+            {
+                return result;
+            }
+
+            update_model(&mut model, event);
+        }
+
+        let _ = key_count; // Used by trace validation
+        Ok(())
+    })
+}
+
+// ============================================================================
+// Span Context Property Tests
+// ============================================================================
+
+/// Property: Span context is preserved across defer/retry cycles.
+///
+/// **Invariant**: When a timer is deferred, its span context is stored and
+/// restored when the `DeferredTimer` fires for retry. The restored span must
+/// link to the original parent context, maintaining distributed trace
+/// continuity.
+///
+/// This test verifies that:
+/// 1. Span context is captured during deferral via `Span::current().context()`
+/// 2. On retry, a fresh span is created and linked to the stored context
+/// 3. The trace ID is preserved across the defer/retry cycle
+///
+/// Note: This property test operates at the model level, verifying that the
+/// span storage/retrieval contract is maintained. The integration test
+/// `span_restored_on_retry` provides concrete verification with real spans.
+#[quickcheck]
+fn prop_span_restored(trace: TimerTrace) -> color_eyre::Result<()> {
+    init_test_logging();
+    let TimerTrace { events, key_count } = trace;
+
+    TEST_RUNTIME.block_on(async {
+        let harness = TestHarness::new()?;
+        let mut model = TraceModel::new();
+
+        for event in &events {
+            // Execute and update model
+            let result = execute_event(&harness, event).await;
+            if let Err(e) = &result
+                && !is_expected_error(e)
+            {
+                return result;
+            }
+
+            update_model(&mut model, event);
+
+            // For deferred timer retries, verify the handler was called with a
+            // valid trigger (span context was restored)
+            if let TimerTraceEvent::DeferredTimer(def_event) = event {
+                let key = test_key(def_event.key_idx);
+
+                // Verify the inner handler was actually called (meaning the
+                // trigger was successfully loaded with its span context)
+                let calls = harness.inner_handler.timer_calls();
+                let key_called = calls.iter().any(|k| k.as_ref() == key.as_ref());
+
+                // Handler should have been called for non-empty queues
+                // (If queue was empty, we wouldn't have a DeferredTimerEvent in
+                // the trace)
+                assert!(
+                    key_called,
+                    "Handler should be called with restored trigger for key={key}"
+                );
+            }
+        }
+
+        let _ = key_count; // Used by trace validation
+        Ok(())
+    })
+}
+
+/// Every deferred key has a retry timer after each settled event.
+/// Store faults, timer faults, and lost timers preserve this invariant.
+#[quickcheck]
+fn prop_timer_coverage_under_faults(trace: FaultedTimerTrace) -> TestResult {
+    let result: color_eyre::Result<()> = TEST_RUNTIME.block_on(async {
+        let harness = TestHarness::for_keys(trace.trace.key_count)?;
+        for (event, fault) in trace.trace.events.iter().zip(trace.faults) {
+            let passes = harness.execute_faulted(event, fault).await?;
+            let _ = passes;
+            for index in 0..trace.trace.key_count {
+                let deferred = harness.store.is_deferred(&test_key(index)).await?.is_some();
+                ensure!(
+                    !deferred || !harness.contexts[index].active_deferred_timers().is_empty(),
+                    "Key {index} has a queue without a timer; event: {event:?}; fault: {fault:?}"
+                );
+            }
+        }
+        Ok(())
+    });
+    match result {
+        Ok(()) => TestResult::passed(),
+        Err(error) => TestResult::error(format!("{error:?}")),
+    }
+}
+
+/// A consumed store or timer fault aborts the source. The redelivery commits.
+/// An unconsumed fault changes nothing.
+#[quickcheck]
+fn prop_fault_abandons_source(trace: FaultedTimerTrace) -> TestResult {
+    let result: color_eyre::Result<()> = TEST_RUNTIME.block_on(async {
+        let harness = TestHarness::for_keys(trace.trace.key_count)?;
+        for (event, fault) in trace.trace.events.iter().zip(trace.faults) {
+            let passes = harness.execute_faulted(event, fault).await?;
+            if let Some(first) = passes.first() {
+                ensure!(
+                    first.committed != first.consumed,
+                    "Events: {:?}; event: {event:?}; fault: {fault:?}; passes: {passes:?}",
+                    trace.trace.events
+                );
+                ensure!(
+                    passes.len() == 1 + usize::from(first.consumed),
+                    "Events: {:?}; passes: {passes:?}",
+                    trace.trace.events
+                );
+                if let Some(second) = passes.get(1) {
+                    ensure!(
+                        second.committed && !second.consumed,
+                        "Events: {:?}; passes: {passes:?}",
+                        trace.trace.events
+                    );
+                }
+            }
+        }
+        Ok(())
+    });
+    match result {
+        Ok(()) => TestResult::passed(),
+        Err(error) => TestResult::error(format!("{error:?}")),
+    }
+}

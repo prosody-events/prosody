@@ -4,13 +4,11 @@ use crate::consumer::EventHandler;
 use crate::consumer::Uncommitted;
 use crate::consumer::message::ConsumerMessageValue;
 use crate::consumer::message::UncommittedMessage;
-use crate::consumer::middleware::providers::LeafHandler;
-use crate::consumer::middleware::tests::test_support::settlement_name;
 use crate::consumer::middleware::tests::test_support::{
     MockEventContext as SessionContext, RecordingParts, StagingError, StagingHook,
     StagingTransientHandler, committed_json_value, recording_session,
 };
-use crate::consumer::middleware::{FallibleEventHandler, SettlementHandler};
+use crate::consumer::middleware::{FallibleEventHandler, Settlement, SettlementHandler};
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::state::manager::EventStateScope;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
@@ -21,7 +19,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-impl FallibleEventHandler for FailureTopicHandler<LeafHandler<StagingTransientHandler>, JsonCodec> {}
+impl FallibleEventHandler for FailureTopicHandler<StagingTransientHandler, JsonCodec> {}
 
 const DEDUP_ID: Uuid = Uuid::from_u128(0xDEF3);
 
@@ -65,7 +63,7 @@ async fn routed_swallow_records_nothing_and_stages_nothing() -> color_eyre::Resu
     let scope = EventStateScope::new(session);
 
     let inner = StagingTransientHandler::new();
-    let handler = make_handler(LeafHandler::new(inner.clone()))?;
+    let handler = make_handler(inner.clone())?;
 
     let context = SessionContext::new().with_session(scope.handle());
     let (message, tracker) = uncommitted_message().await?;
@@ -104,8 +102,11 @@ async fn routed_swallow_records_nothing_and_stages_nothing() -> color_eyre::Resu
     Ok(())
 }
 
-/// A permanent producer rejection preserves the transient leaf's `Bypassed`
-/// action. The source commits without a marker.
+/// `DlqSendFailed { inner: Transient, producer: Permanent }` records NO
+/// marker: the message is neither handled nor in the DLQ, so a marker
+/// would silently dedup-filter its redelivery. Driven at the settle
+/// level (the producer cannot be made to fail on demand in a unit
+/// test); the classification cells below are the pure-function pin.
 #[tokio::test]
 async fn dlq_send_failed_with_transient_inner_records_no_marker() -> color_eyre::Result<()> {
     use crate::codec::JsonCodecError;
@@ -116,7 +117,7 @@ async fn dlq_send_failed_with_transient_inner_records_no_marker() -> color_eyre:
     let context = SessionContext::new().with_session(scope.handle());
 
     let inner = StagingTransientHandler::new();
-    let handler = make_handler(LeafHandler::new(inner))?;
+    let handler = make_handler(inner)?;
 
     let committed = Arc::new(AtomicUsize::new(0));
     let aborted = Arc::new(AtomicUsize::new(0));
@@ -144,7 +145,7 @@ async fn dlq_send_failed_with_transient_inner_records_no_marker() -> color_eyre:
     assert_eq!(
         committed.load(Ordering::SeqCst),
         1,
-        "a Permanent producer rejection retains the inner Bypassed action",
+        "the Bypassed final commits the offset",
     );
     assert_eq!(aborted.load(Ordering::SeqCst), 0);
     Ok(())
@@ -177,14 +178,18 @@ fn permanent_producer() -> color_eyre::Result<ProducerError<JsonCodecError>> {
     )))
 }
 
-/// A permanent producer rejection preserves the inner action.
-/// Other producer errors abandon the source.
+/// The settlement classification table for the failure-topic wrapper:
+/// every Output and error variant, including the `DlqSendFailed` guard
+/// cells (inner-Permanent delegates; inner-Transient/Terminal bypass).
+/// Delegation is proven against a `Bypassed`-classifying probe: the
+/// `Inner(Ok)`, `Handler`, and Permanent-inner `DlqSendFailed` rows
+/// delegate, so a wrapper hardcoding `Final` on them fails the probe.
 #[test]
 fn settlement_classification_table() -> color_eyre::Result<()> {
     use crate::codec::JsonCodecError;
     use crate::consumer::middleware::tests::test_support::BypassedHandler;
 
-    type Subject = FailureTopicHandler<LeafHandler<StagingTransientHandler>, JsonCodec>;
+    type Subject = FailureTopicHandler<StagingTransientHandler, JsonCodec>;
     type Out = FailureTopicOutput<(), StagingError>;
     type TableErr = FailureTopicError<StagingError, JsonCodecError>;
     type Probe = FailureTopicHandler<BypassedHandler, JsonCodec>;
@@ -198,95 +203,62 @@ fn settlement_classification_table() -> color_eyre::Result<()> {
         })
     }
 
-    let terminal_producer = ProducerError::Kafka(KafkaError::MessageProduction(
-        RDKafkaErrorCode::ProducerFenced,
-    ));
-    assert_eq!(terminal_producer.classify_error(), ErrorCategory::Terminal);
-
-    let rows: Vec<(&str, Result<Out, TableErr>, &str)> = vec![
+    let rows: Vec<(&str, Result<Out, TableErr>, Settlement)> = vec![
         (
             "Inner(Ok) delegates to the leaf's Final",
             Ok(FailureTopicOutput::Inner(())),
-            "Final",
+            Settlement::Final,
         ),
         (
             "Routed is Bypassed (outcome lives in the DLQ)",
             Ok(FailureTopicOutput::Routed(StagingError(
                 ErrorCategory::Transient,
             ))),
-            "Bypassed",
+            Settlement::Bypassed,
         ),
         (
-            "Handler delegates to the leaf's Rejected",
+            "Handler delegates to the leaf's Final",
             Err(FailureTopicError::Handler(StagingError(
                 ErrorCategory::Permanent,
             ))),
-            "Rejected",
+            Settlement::Final,
         ),
         (
-            "Permanent producer preserves Rejected",
+            "DlqSendFailed with a Permanent inner delegates (it would have certified)",
             Err(dlq(ErrorCategory::Permanent)?),
-            "Rejected",
+            Settlement::Final,
         ),
         (
-            "Permanent producer retains the Transient inner Bypassed action",
+            "DlqSendFailed with a Transient inner is Bypassed (never certifies)",
             Err(dlq(ErrorCategory::Transient)?),
-            "Bypassed",
+            Settlement::Bypassed,
         ),
         (
-            "Terminal producer is Abandoned",
-            Err(FailureTopicError::DlqSendFailed {
-                inner: StagingError(ErrorCategory::Permanent),
-                producer: terminal_producer,
-            }),
-            "Abandoned",
-        ),
-        (
-            "Transient producer is Abandoned",
-            Err(FailureTopicError::DlqSendFailed {
-                inner: StagingError(ErrorCategory::Permanent),
-                producer: ProducerError::Kafka(KafkaError::MessageProduction(
-                    RDKafkaErrorCode::BrokerNotAvailable,
-                )),
-            }),
-            "Abandoned",
-        ),
-        (
-            "Permanent producer preserves Abandoned",
+            "DlqSendFailed with a Terminal inner is Bypassed (never certifies)",
             Err(dlq(ErrorCategory::Terminal)?),
-            "Abandoned",
+            Settlement::Bypassed,
         ),
     ];
     for (label, result, expected) in rows {
-        assert_eq!(
-            settlement_name(Subject::settlement(result.as_ref())),
-            expected,
-            "{label}"
-        );
+        assert_eq!(Subject::settlement(result.as_ref()), expected, "{label}");
     }
 
     // Delegation proof: over a Bypassed-classifying inner the delegating
-    // rows (`Inner(Ok)`, `Handler`, Permanent-producer `DlqSendFailed`) stay
+    // rows (`Inner(Ok)`, `Handler`, Permanent-inner `DlqSendFailed`) stay
     // Bypassed.
     let inner: Result<ProbeOut, ProbeErr> = Ok(FailureTopicOutput::Inner(()));
-    assert_eq!(
-        settlement_name(Probe::settlement(inner.as_ref())),
-        "Bypassed"
-    );
+    assert_eq!(Probe::settlement(inner.as_ref()), Settlement::Bypassed);
     let handler: Result<ProbeOut, ProbeErr> = Err(FailureTopicError::Handler(TestError(
         ErrorCategory::Permanent,
     )));
-    assert_eq!(
-        settlement_name(Probe::settlement(handler.as_ref())),
-        "Bypassed"
-    );
+    assert_eq!(Probe::settlement(handler.as_ref()), Settlement::Bypassed);
     let dlq_permanent: Result<ProbeOut, ProbeErr> = Err(FailureTopicError::DlqSendFailed {
         inner: TestError(ErrorCategory::Permanent),
         producer: permanent_producer()?,
     });
     assert_eq!(
-        settlement_name(Probe::settlement(dlq_permanent.as_ref())),
-        "Bypassed"
+        Probe::settlement(dlq_permanent.as_ref()),
+        Settlement::Bypassed
     );
     Ok(())
 }

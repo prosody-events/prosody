@@ -329,8 +329,9 @@ where
             // Inner ran: delegate.
             Ok(output) => T::settlement(Ok(output)),
             Err(MonopolizationError::Handler(error)) => T::settlement(Err(error)),
-            // Monopolization rejected dispatch before the inner ran, so the source must redeliver.
-            Err(MonopolizationError::Monopolization { .. }) => Settlement::Abandoned,
+            // Pre-inner admission rejection (Transient): the inner never
+            // ran, so the result is this layer's, not the event's.
+            Err(MonopolizationError::Monopolization { .. }) => Settlement::Bypassed,
         }
     }
 }

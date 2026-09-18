@@ -7,18 +7,19 @@ use crate::consumer::middleware::deduplication::{
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::AlwaysDefer;
 use crate::consumer::middleware::defer::error::DeferError;
-use crate::consumer::middleware::defer::message::handler::{DeferOutput, MessageDeferHandler};
+use crate::consumer::middleware::defer::message::handler::{
+    MessageDeferHandler, MessageDeferOutput,
+};
 use crate::consumer::middleware::defer::message::store::MessageDeferStore;
 use crate::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStore;
 use crate::consumer::middleware::providers::FallibleCloneProvider;
-use crate::consumer::middleware::providers::LeafHandler;
 use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
 use crate::consumer::middleware::tests::test_support::{
     RecordingSession, RecordingTimer, StagingError, committed_json_value,
     recording_session_with_loader,
 };
 use crate::consumer::middleware::{
-    ErrorCategory, FallibleEventHandler, FallibleHandlerProvider, HandlerMiddleware,
+    ErrorCategory, FallibleEventHandler, FallibleHandlerProvider, HandlerMiddleware, Settlement,
     SettlementHandler,
 };
 use crate::consumer::partition::offsets::OffsetTracker;
@@ -151,8 +152,14 @@ impl FallibleHandler for StagingLeaf {
     async fn shutdown(self) {}
 }
 
+impl SettlementHandler for StagingLeaf {
+    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        Settlement::Final
+    }
+}
+
 type PinStack = MessageDeferHandler<
-    DeduplicationHandler<LeafHandler<StagingLeaf>, MemoryDeduplicationStore>,
+    DeduplicationHandler<StagingLeaf, MemoryDeduplicationStore>,
     MemoryMessageDeferStore,
     MemoryLoader<Value>,
     AlwaysDefer,
@@ -182,7 +189,7 @@ impl Fixture {
         let telemetry = Telemetry::new();
         let handler = MessageDeferHandler {
             handler: DeduplicationHandler {
-                inner: LeafHandler::new(leaf.clone()),
+                inner: leaf.clone(),
                 store: dedup_store.clone(),
             },
             loader: loader.clone(),
@@ -426,5 +433,3 @@ async fn reload_records_the_reloaded_marker_and_redelivery_filters() -> Result<(
 /// (with no stage) and advances the queue — the case a marker threaded
 /// through Ok-payloads could not express.
 mod reload_failures;
-
-mod recovery;

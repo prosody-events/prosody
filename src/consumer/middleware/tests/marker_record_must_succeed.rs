@@ -189,7 +189,7 @@ async fn err_permanent_records_the_marker_with_no_stage() -> Result<()> {
     let (guard, committed, aborted) = RecordingGuard::new();
 
     settle(
-        &LeafHandler::new(handler.clone()),
+        &handler,
         context,
         guard,
         Err(TestError(ErrorCategory::Permanent, "final")),
@@ -225,7 +225,7 @@ async fn err_transient_never_records_the_marker() -> Result<()> {
     let (guard, committed, aborted) = RecordingGuard::new();
 
     settle(
-        &LeafHandler::new(handler.clone()),
+        &handler,
         context,
         guard,
         Err(TestError(ErrorCategory::Transient, "final")),
@@ -265,7 +265,7 @@ async fn pure_timer_never_records_a_message_marker() -> Result<()> {
         let handler = ProbeHandler::ok(0);
         let (guard, committed, aborted) = RecordingGuard::new();
 
-        settle(&LeafHandler::new(handler.clone()), context, guard, result).await;
+        settle(&handler, context, guard, result).await;
 
         assert!(
             dedup.recorded().is_empty(),
@@ -314,7 +314,7 @@ fn prop_marker_record_self_heals_to_certified_commit() {
             let handler = ProbeHandler::ok(0);
             let (guard, committed, aborted) = RecordingGuard::new();
 
-            settle(&LeafHandler::new(handler.clone()), context, guard, Ok(0)).await;
+            settle(&handler, context, guard, Ok(0)).await;
 
             let committed = committed.load(Ordering::SeqCst);
             let aborted = aborted.load(Ordering::SeqCst);

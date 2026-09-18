@@ -4,6 +4,7 @@ use crate::consumer::event_context::StateAccessError;
 use crate::consumer::middleware::tests::test_support::{
     RecordingSession, committed_json_value, recording_session,
 };
+use crate::consumer::middleware::{Settlement, SettlementHandler};
 use crate::state::descriptor::{CellStateError, Registered, ValueDescriptor, value_state};
 use crate::state::memory::MemoryCellStore;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
@@ -146,6 +147,12 @@ impl FallibleHandler for AttemptAwareHandler {
     }
 
     async fn shutdown(self) {}
+}
+
+impl SettlementHandler for AttemptAwareHandler {
+    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        Settlement::Final
+    }
 }
 
 /// Retry over a real session: attempt 1 stages `cart` then fails
@@ -308,6 +315,12 @@ impl FallibleHandler for FinalHookReadHandler {
     async fn shutdown(self) {}
 }
 
+impl SettlementHandler for FinalHookReadHandler {
+    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        Settlement::Final
+    }
+}
+
 /// Builds the recording-session fixture and mock context the hook-view
 /// pins share; returns the pieces they assert on.
 fn hook_fixture(
@@ -365,8 +378,13 @@ async fn final_hook_reads_settled_state_after_retry() -> Result<()> {
     Ok(())
 }
 
-/// Nested retries leave the boundary context stale.
-/// The settlement stamp re-pins it before the final hook reads committed state.
+/// Final hook reads settled state — nested: an inner retry bumps the epoch
+/// during the outer attempt, leaving the outer's final context pinned
+/// stale; the settle
+/// stamp re-pins it current so `after_commit`'s read still sees the
+/// settled `wishlist`. Dropping the `redispatch` stamp in `fire_apply_hook`
+/// makes this read `Terminated` (the stale pin no longer matches the
+/// inner-bumped epoch).
 #[tokio::test]
 async fn final_hook_reads_settled_state_under_nested_retry() -> Result<()> {
     let read = Arc::new(Mutex::new(None));
@@ -374,12 +392,7 @@ async fn final_hook_reads_settled_state_under_nested_retry() -> Result<()> {
     // Inner retry (FallibleHandler) drives the attempts and bumps the
     // shared epoch; the outer retry (EventHandler) settles on its own
     // attempt-1 context, now stale relative to the inner's bumps.
-    let nested = RetryHandler {
-        handler: create_retry_handler(handler, 10),
-        base_delay_millis: 1,
-        max_delay_millis: 10,
-        max_retries: 10,
-    };
+    let nested = create_retry_handler(create_retry_handler(handler, 10), 10);
     let (context, cell_store, state_key) =
         hook_fixture(|r| Ok(r.register(&wishlist(), CollectionDef::new(None))?))?;
 

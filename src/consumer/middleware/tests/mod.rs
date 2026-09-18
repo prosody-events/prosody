@@ -30,7 +30,6 @@ use super::*;
 use crate::consumer::EventHandler;
 use crate::consumer::Uncommitted;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
-use crate::consumer::middleware::providers::LeafHandler;
 use crate::consumer::middleware::tests::test_support::{
     MockEventContext, create_test_message, create_test_message_from,
 };
@@ -59,7 +58,13 @@ impl ClassifyError for TestError {
     }
 }
 
-impl FallibleEventHandler for LeafHandler<ProbeHandler> {}
+impl FallibleEventHandler for ProbeHandler {}
+
+impl SettlementHandler for ProbeHandler {
+    fn settlement(_result: Result<&Self::Output, &Self::Error>) -> Settlement {
+        Settlement::Final
+    }
+}
 
 /// Records every lifecycle hook firing for later assertion.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,13 +243,7 @@ async fn after_commit_or_abort_fires_with_expected_log_per_outcome() -> color_ey
         let uncommitted_offset = tracker.take(0).await?;
         let message = create_test_message()?.into_uncommitted(uncommitted_offset);
 
-        EventHandler::on_message(
-            &LeafHandler::new(handler),
-            context,
-            message,
-            DemandType::Normal,
-        )
-        .await;
+        EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
 
         assert_eq!(log.lock().clone(), expected_log, "{description}");
     }
@@ -320,13 +319,7 @@ async fn after_commit_for_timer_path_with_ok_output() {
         aborted: aborted.clone(),
     };
 
-    EventHandler::on_timer(
-        &LeafHandler::new(handler),
-        context,
-        timer,
-        DemandType::Normal,
-    )
-    .await;
+    EventHandler::on_timer(&handler, context, timer, DemandType::Normal).await;
 
     assert_eq!(committed.load(Ordering::SeqCst), 1, "marker committed once");
     assert_eq!(aborted.load(Ordering::SeqCst), 0, "marker not aborted");
@@ -422,9 +415,7 @@ where
 async fn pass_through_middleware_forwards_output_to_inner_after_commit() -> color_eyre::Result<()> {
     let inner = ProbeHandler::ok(7);
     let log = inner.log.clone();
-    let middleware = PassThroughMiddleware {
-        inner: LeafHandler::new(inner),
-    };
+    let middleware = PassThroughMiddleware { inner };
     let context = MockEventContext::new();
     let tracker = make_offset_tracker();
     let uncommitted_offset = tracker.take(0).await?;
@@ -447,9 +438,7 @@ async fn pass_through_middleware_forwards_after_abort_on_terminal() -> color_eyr
     let err = TestError(ErrorCategory::Terminal, "terminal");
     let inner = ProbeHandler::err(0, err.clone());
     let log = inner.log.clone();
-    let middleware = PassThroughMiddleware {
-        inner: LeafHandler::new(inner),
-    };
+    let middleware = PassThroughMiddleware { inner };
     let context = MockEventContext::new();
     let tracker = make_offset_tracker();
     let uncommitted_offset = tracker.take(0).await?;
@@ -468,8 +457,15 @@ async fn pass_through_middleware_forwards_after_abort_on_terminal() -> color_eyr
 /// A permanent stage failure preserves committed state for the apply hook.
 mod staged_rollback;
 
-/// Hook reads observe committed values after marker failure or rejected
-/// promotion.
+/// Post-settle hook visibility: `finalize` drains the event's dirty overlay
+/// on success, so the apply hooks read the **lower store** — the per-cell
+/// committed projection, where an own-event provisional cell answers its
+/// committed base `prev` — never the event's pre-settle overlay. One pin per
+/// ruled-on window: the arm-shutdown rollback's `after_abort` reads the
+/// restored committed base; the ambiguous marker-record shutdown's
+/// `after_abort` reads `prev` (staged cells deliberately left provisional);
+/// the `Incomplete`-promote `after_commit` reads the mixed per-cell view
+/// (promoted cells the new values, un-promoted cells `prev`).
 mod hook_visibility;
 mod marker_record_must_succeed;
 mod settled_view;

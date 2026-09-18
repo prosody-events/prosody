@@ -1,12 +1,26 @@
-//! Dispatches trace events through the defer handler and settlement boundary.
+//! Test harness for trace-based property testing.
+//!
+//! Provides [`TestHarness`] that executes traces against the **real**
+//! `MessageDeferHandler` and verification functions for checking invariants.
+//!
+//! # Architecture
+//!
+//! The harness uses shared-state test doubles that allow external control:
+//!
+//! - [`OutcomeHandler`]: Inner handler returning trace-specified outcomes
+//! - [`TraceBasedDecider`]: Deferral decisions from trace
+//! - [`FailableLoader`]: Wraps `MemoryLoader` with failure injection
+//! - [`MemoryMessageDeferStore`]: Deferred message state
+//! - [`TimerCapture`]/[`KeyedCapturingContext`]: Timer operation capture
+//!
+//! All these components use `Arc` internally, so clones share state.
 
 use super::context::{KeyedCapturingContext, TimerCapture};
-use super::handler::{HandlerOutcome, OutcomeHandler, ProcessedMessage};
+use super::faults::{self, Fault, Pass};
+use super::handler::{HandlerOutcome, OutcomeHandler};
 use super::loader::{FailableLoader, LoaderFailureType};
-use super::types::{
-    Fault, MessageEvent, MessageOutcome, OutputEvent, Step, TimerEvent, TimerOutcome, TraceEvent,
-};
-use super::{FailableStore, FaultKind};
+use super::store::FailableStore;
+use super::types::{MessageEvent, MessageOutcome, TimerEvent, TimerOutcome, TraceEvent};
 use crate::consumer::DemandType;
 use crate::consumer::message::ConsumerRecord;
 use crate::consumer::middleware::FallibleHandler;
@@ -15,19 +29,15 @@ use crate::consumer::middleware::defer::decider::TraceBasedDecider;
 use crate::consumer::middleware::defer::message::handler::MessageDeferHandler;
 use crate::consumer::middleware::defer::message::store::MessageDeferStore;
 use crate::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStore;
-use crate::consumer::middleware::providers::LeafHandler;
-use crate::consumer::middleware::settle::settle;
-use crate::consumer::middleware::tests::test_support::RecordingGuard;
 use crate::loader::{MemoryLoader, MessageLoader};
 use crate::telemetry::Telemetry;
-use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
-use crate::{Key, Offset, Partition, Topic};
+use crate::{Key, Partition, Topic};
 use color_eyre::eyre::eyre;
 use serde_json::json;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tracing::debug;
 
 // ============================================================================
 // Verification Helpers
@@ -73,39 +83,23 @@ pub async fn verify_timer_coverage(
 
 /// Type alias for the `MessageDeferHandler` used in tests.
 type TestDeferHandler = MessageDeferHandler<
-    LeafHandler<OutcomeHandler>,
+    OutcomeHandler,
     FailableStore<MemoryMessageDeferStore>,
     FailableLoader,
     TraceBasedDecider,
 >;
 
-/// What one dispatch of a source read and decided.
-#[derive(Clone, Debug)]
-pub struct Pass {
-    /// The queue head and retry count before the dispatch.
-    pub before: Option<(Offset, u32)>,
-    /// The queue head and retry count after the dispatch.
-    pub after: Option<(Offset, u32)>,
-    /// True when the dispatch consumed a store or timer fault.
-    pub consumed: bool,
-    /// True when the boundary committed the source.
-    pub committed: bool,
-    /// The inner handler calls during the dispatch.
-    pub calls: Vec<ProcessedMessage>,
-    /// The timer times the dispatch scheduled for this key.
-    pub scheduled: Vec<CompactDateTime>,
-    /// The loader failure the dispatch consumed, if any.
-    pub loader_failure: Option<LoaderFailureType>,
-}
-
-/// Owns the stores and timer capture for one trace.
-/// Each aborted source receives at most one redelivery.
+/// Test harness for executing traces against the **real**
+/// `MessageDeferHandler`.
+///
+/// Unlike the previous simulation-based harness, this one constructs an actual
+/// `MessageDeferHandler` and calls its `on_message()` and `on_timer()` methods.
+/// Test doubles control behavior:
+///
+/// - `OutcomeHandler`: Returns outcomes specified by the trace
+/// - `TraceBasedDecider`: Returns defer decisions from the trace
+/// - `TimerCapture`: Captures timer operations for verification
 pub struct TestHarness {
-    /// Dispatch records for the last event.
-    pub passes: Vec<Pass>,
-    /// The outer demand for interpreted timer events.
-    pub demand: DemandType,
-    next_offset: i64,
     /// The real defer handler under test.
     pub(crate) handler: TestDeferHandler,
     /// Inner handler for setting outcomes (shared via Arc).
@@ -113,20 +107,30 @@ pub struct TestHarness {
     /// Decider for setting defer decisions (shared via Arc).
     pub(crate) decider: TraceBasedDecider,
     /// Loader for storing messages and injecting failures (shared via Arc).
-    loader: FailableLoader,
+    pub(super) loader: FailableLoader,
+    pub(super) failable_store: FailableStore<MemoryMessageDeferStore>,
     /// Store for verification (shared via Arc inside handler).
     store: MemoryMessageDeferStore,
     /// Timer capture for verification.
     capture: TimerCapture,
     /// Topic for messages.
-    topic: Topic,
+    pub(super) topic: Topic,
     /// Partition for messages.
-    partition: Partition,
+    pub(super) partition: Partition,
     /// Key pool (generated from `key_count`).
     keys: Vec<Key>,
 }
 
 impl TestHarness {
+    /// Runs an event with one fault and one possible redelivery.
+    pub(super) async fn execute_faulted(
+        &mut self,
+        event: &TraceEvent,
+        fault: Option<Fault>,
+    ) -> color_eyre::Result<Vec<Pass>> {
+        faults::execute_faulted(self, event, fault).await
+    }
+
     /// Creates a new test harness with the given key count.
     pub fn new(key_count: usize) -> color_eyre::Result<Self> {
         let keys: Vec<Key> = (0..key_count)
@@ -143,6 +147,7 @@ impl TestHarness {
         let loader = FailableLoader::new(memory_loader);
         let store = MemoryMessageDeferStore::new();
         let capture = TimerCapture::new();
+        let failable_store = FailableStore::new(store.clone());
 
         // Create config using shared test constants
         let config = DeferConfiguration::builder()
@@ -154,13 +159,16 @@ impl TestHarness {
             .build()
             .map_err(|e| eyre!("config error: {e}"))?;
 
+        // Create the MessageDeferHandler directly (bypassing middleware/provider
+        // pattern) This is simpler for testing since we don't need the full
+        // middleware stack
         let telemetry = Telemetry::new();
         let sender = telemetry.partition_sender(topic, partition);
 
         let handler = MessageDeferHandler {
-            handler: LeafHandler::new(inner_handler.clone()),
+            handler: inner_handler.clone(),
             loader: loader.clone(),
-            store: FailableStore::new(store.clone()),
+            store: failable_store.clone(),
             decider: decider.clone(),
             config,
             topic,
@@ -171,13 +179,11 @@ impl TestHarness {
         };
 
         Ok(Self {
-            passes: Vec::with_capacity(2),
-            demand: DemandType::Normal,
-            next_offset: 0,
             handler,
             inner_handler,
             decider,
             loader,
+            failable_store,
             store,
             capture,
             topic,
@@ -204,6 +210,14 @@ impl TestHarness {
         &self.capture
     }
 
+    /// Returns all processed messages in order (drains the queue).
+    ///
+    /// Used by `prop_processing_order` to verify per-key message ordering.
+    #[must_use]
+    pub fn processed_messages(&self) -> Vec<super::handler::ProcessedMessage> {
+        self.inner_handler.processed()
+    }
+
     /// Gets the retry count for a key from the store.
     pub async fn get_retry_count(&self, key_idx: usize) -> color_eyre::Result<Option<u32>> {
         let key = &self.keys[key_idx];
@@ -214,33 +228,34 @@ impl TestHarness {
     }
 
     /// Creates a keyed context for the given key.
-    fn context_for_key(&self, key: &Key) -> KeyedCapturingContext {
+    pub(super) fn context_for_key(&self, key: &Key) -> KeyedCapturingContext {
         KeyedCapturingContext::new(key.clone(), self.capture.clone())
     }
 
-    /// Arms the first dispatch. Uncalled faults expire at the next event.
-    fn arm(&self, key: &Key, fault: Option<Fault>) {
-        self.handler.store.set_fault(None);
-        self.capture.set_fault(None);
-        self.loader.set_next_failure(None);
-        match fault {
-            Some(Fault::Store(op, kind)) => self.handler.store.set_fault(Some((op, kind))),
-            Some(Fault::Timer(op, kind)) => self.capture.set_fault(Some((op, kind))),
-            Some(Fault::LostTimer) => self.capture.drop_timers(key),
-            Some(Fault::LoaderThenTimer(kind, op, timer_kind)) => {
-                self.loader.set_next_failure(Some(match kind {
-                    FaultKind::Transient => LoaderFailureType::Transient,
-                    FaultKind::Permanent => LoaderFailureType::Permanent,
-                }));
-                self.capture.set_fault(Some((op, timer_kind)));
+    pub(super) fn arm_message(&self, event: &MessageEvent) {
+        // Set the handler outcome based on the trace
+        let outcome = match &event.outcome {
+            MessageOutcome::Queued => {
+                // For Queued, the handler shouldn't be called (key already deferred)
+                // Set success as a safe default
+                HandlerOutcome::Success
             }
-            None => {}
-        }
+            MessageOutcome::Success => HandlerOutcome::Success,
+            MessageOutcome::Permanent => HandlerOutcome::Permanent,
+            MessageOutcome::Transient { defer, .. } => {
+                // Set the decider based on trace
+                self.decider.set_next(*defer);
+                HandlerOutcome::Transient
+            }
+        };
+        self.inner_handler.set_outcome(outcome);
     }
 
-    /// Dispatches a message and redelivers its source after an abort.
+    /// Executes a message event using the real `MessageDeferHandler`.
     pub async fn execute_message(&mut self, event: &MessageEvent) -> color_eyre::Result<()> {
-        let key = self.keys[event.key_idx].clone();
+        let key = &self.keys[event.key_idx];
+
+        // Store the message in the loader so it can be loaded on timer retry
         self.loader.store_message(
             self.topic,
             self.partition,
@@ -248,188 +263,166 @@ impl TestHarness {
             key.clone(),
             json!({"offset": event.offset, "key_idx": event.key_idx}),
         );
-        self.passes.clear();
-        self.arm(&key, event.fault);
-        for _ in 0_u8..2 {
-            let before = self.store.get_next_deferred_message(&key).await?;
-            let pending = self.fault_pending();
-            let outcome = match event.outcome {
-                MessageOutcome::Queued | MessageOutcome::Success => HandlerOutcome::Success,
-                MessageOutcome::Permanent => HandlerOutcome::Permanent,
-                MessageOutcome::Transient { defer } => {
-                    self.decider.set_next(defer);
-                    HandlerOutcome::Transient
+
+        self.arm_message(event);
+
+        // Create context for this key
+        let key_context = self.context_for_key(key);
+
+        // Load the message from the loader to get a ConsumerMessage
+        let message = self
+            .loader
+            .load_message(self.topic, self.partition, event.offset)
+            .await
+            .map_err(|e| eyre!("loader error: {e}"))?;
+        let ConsumerRecord::Message(message) = message else {
+            return Err(eyre!("the loader returned an excise record"));
+        };
+
+        // Call the real MessageDeferHandler::on_message
+        let result = self
+            .handler
+            .on_message(key_context, message, DemandType::Normal)
+            .await;
+
+        // For most outcomes, we expect Ok (defer middleware absorbs transient errors)
+        // Errors propagate only for permanent failures or when deferral is disabled
+        match &event.outcome {
+            MessageOutcome::Permanent | MessageOutcome::Transient { defer: false, .. } => {
+                // Expected to fail
+                if result.is_ok() {
+                    return Err(eyre!(
+                        "Expected error for outcome {:?} but got Ok",
+                        event.outcome
+                    ));
                 }
-            };
-            self.inner_handler.set_outcome(outcome);
-            let ConsumerRecord::Message(message) = self
-                .loader
-                .inner()
-                .load_message(self.topic, self.partition, event.offset)
-                .await?
-            else {
-                return Err(eyre!("The loader returned an excise record"));
-            };
-            let context = self.context_for_key(&key);
-            let (guard, committed, aborted) = RecordingGuard::new();
-            let result = self
-                .handler
-                .on_message(context.clone(), message, DemandType::Normal)
-                .await;
-            settle(&self.handler, context, guard, result).await;
-            let committed = committed.load(Ordering::SeqCst);
-            let aborted = aborted.load(Ordering::SeqCst);
-            assert_eq!(committed + aborted, 1);
-            self.record_pass(&key, before, pending, committed == 1, None)
-                .await?;
-            if committed == 1 {
-                return Ok(());
+            }
+            _ => {
+                // Expected to succeed (defer middleware absorbs the error)
+                if let Err(e) = result {
+                    return Err(eyre!(
+                        "Unexpected error for outcome {:?}: {e}",
+                        event.outcome
+                    ));
+                }
             }
         }
-        Err(eyre!("Message needs a third dispatch: {event:?}"))
+
+        Ok(())
     }
 
-    /// Dispatches the same trigger again after an abort.
-    /// A loader outcome overrides the loader kind in `LoaderThenTimer` on every
-    /// pass.
+    pub(super) fn arm_timer(&self, event: &TimerEvent) {
+        // Inject loader failure based on outcome (before setting handler outcome)
+        match &event.outcome {
+            TimerOutcome::LoaderPermanent => {
+                self.loader
+                    .set_next_failure(Some(LoaderFailureType::Permanent));
+            }
+            TimerOutcome::LoaderTransient { .. } => {
+                self.loader
+                    .set_next_failure(Some(LoaderFailureType::Transient));
+            }
+            _ => {
+                // No loader failure - clear any previous setting
+                self.loader.set_next_failure(None);
+            }
+        }
+
+        // Set the handler outcome based on the trace
+        // Note: For loader failures, the handler won't be called, but we set a
+        // safe default anyway
+        let outcome = match &event.outcome {
+            TimerOutcome::Success => HandlerOutcome::Success,
+            TimerOutcome::Permanent => HandlerOutcome::Permanent,
+            TimerOutcome::Transient { .. } => {
+                // Timer transient failures always defer (no decider check in retry path)
+                self.decider.set_next(true);
+                HandlerOutcome::Transient
+            }
+            TimerOutcome::LoaderPermanent | TimerOutcome::LoaderTransient { .. } => {
+                // Loader fails before handler is called - set safe default
+                HandlerOutcome::Success
+            }
+        };
+        self.inner_handler.set_outcome(outcome);
+    }
+
+    /// Executes a timer event using the real `MessageDeferHandler`.
     pub async fn execute_timer(
         &mut self,
         event: &TimerEvent,
         demand: DemandType,
     ) -> color_eyre::Result<()> {
-        let key = self.keys[event.key_idx].clone();
-        let time = self
-            .capture
-            .get_timer_time(&key)
-            .ok_or_else(|| eyre!("No timer for {key:?}"))?;
-        self.passes.clear();
-        self.arm(&key, event.fault);
-        // The fired source leaves the active set. An abort retains it for redelivery.
-        self.capture.take_timer(&key, time);
-        for _ in 0_u8..2 {
-            let before = self.store.get_next_deferred_message(&key).await?;
-            let pending = self.fault_pending();
-            match event.outcome {
-                TimerOutcome::LoaderPermanent => self
-                    .loader
-                    .set_next_failure(Some(LoaderFailureType::Permanent)),
-                TimerOutcome::LoaderTransient => self
-                    .loader
-                    .set_next_failure(Some(LoaderFailureType::Transient)),
-                _ => {}
-            }
-            let loader_failure = self.loader.pending_failure();
-            self.inner_handler.set_outcome(match event.outcome {
-                TimerOutcome::Permanent => HandlerOutcome::Permanent,
-                TimerOutcome::Transient => HandlerOutcome::Transient,
-                _ => HandlerOutcome::Success,
-            });
-            let context = self.context_for_key(&key);
-            let trigger = Trigger::for_testing(key.clone(), time, TimerType::DeferredMessage);
-            let (guard, committed, aborted) = RecordingGuard::new();
-            let result = self
-                .handler
-                .on_timer(context.clone(), trigger, demand)
-                .await;
-            settle(&self.handler, context, guard, result).await;
-            let committed = committed.load(Ordering::SeqCst);
-            let aborted = aborted.load(Ordering::SeqCst);
-            assert_eq!(committed + aborted, 1);
-            self.record_pass(&key, before, pending, committed == 1, loader_failure)
-                .await?;
-            if committed == 1 {
-                return Ok(());
-            }
-        }
-        Err(eyre!("Timer needs a third dispatch: {event:?}"))
-    }
+        let key = &self.keys[event.key_idx];
 
-    /// Turns a step into the event the real state allows.
-    pub async fn interpret(&mut self, step: &Step) -> TraceEvent {
-        let key_idx = usize::from(step.key_idx) % self.keys.len();
-        let deferred = match self.store.is_deferred(&self.keys[key_idx]).await {
-            Ok(count) => count.is_some(),
-            Err(error) => match error {},
+        // Log state before execution
+        {
+            let state = self.store.get_next_deferred_message(key).await;
+            debug!(
+                "execute_timer START: key_idx={}, trace_offset={}, store_state={:?}, has_timer={}",
+                event.key_idx,
+                event.offset,
+                state,
+                self.capture.has_active_timer(key)
+            );
         };
-        if deferred && step.roll.is_multiple_of(2) {
-            let outcome = match (step.roll / 2) % 5 {
-                0 => TimerOutcome::Success,
-                1 => TimerOutcome::Permanent,
-                2 => TimerOutcome::Transient,
-                3 => TimerOutcome::LoaderPermanent,
-                _ => TimerOutcome::LoaderTransient,
-            };
-            TraceEvent::Timer(TimerEvent {
-                key_idx,
-                outcome,
-                fault: step.fault,
-            })
-        } else {
-            self.next_offset += 1;
-            let outcome = if deferred {
-                MessageOutcome::Queued
-            } else {
-                match step.roll % 4 {
-                    0 => MessageOutcome::Success,
-                    1 => MessageOutcome::Permanent,
-                    2 => MessageOutcome::Transient { defer: true },
-                    _ => MessageOutcome::Transient { defer: false },
-                }
-            };
-            TraceEvent::Message(MessageEvent {
-                key_idx,
-                offset: Offset::from(self.next_offset),
-                outcome,
-                fault: step.fault,
-            })
-        }
-    }
 
-    /// Interprets and executes one step.
-    pub async fn execute_step(&mut self, step: &Step) -> color_eyre::Result<TraceEvent> {
-        let event = self.interpret(step).await;
-        match &event {
-            TraceEvent::Message(message) => self.execute_message(message).await?,
-            TraceEvent::Timer(timer) => self.execute_timer(timer, self.demand).await?,
-        }
-        Ok(event)
-    }
+        self.arm_timer(event);
 
-    fn fault_pending(&self) -> bool {
-        self.handler.store.fault_pending() || self.capture.fault_pending()
-    }
-
-    async fn record_pass(
-        &mut self,
-        key: &Key,
-        before: Option<(Offset, u32)>,
-        pending: bool,
-        committed: bool,
-        loader_failure: Option<LoaderFailureType>,
-    ) -> color_eyre::Result<()> {
-        let calls = self.inner_handler.processed();
-        let scheduled = self
+        // Get the actual scheduled time for this key's timer.
+        // This must match what schedule_retry_timer scheduled.
+        let trigger_time = self
             .capture
-            .drain_events()
-            .into_iter()
-            .filter_map(|event| match event {
-                OutputEvent::Scheduled {
-                    key: scheduled_key,
-                    time,
-                } if scheduled_key == *key => Some(time),
-                _ => None,
-            })
-            .collect();
-        self.passes.push(Pass {
-            before,
-            after: self.store.get_next_deferred_message(key).await?,
-            consumed: pending && !self.fault_pending(),
-            committed,
-            calls,
-            scheduled,
-            loader_failure: loader_failure.filter(|_| self.loader.pending_failure().is_none()),
-        });
+            .get_timer_time(key)
+            .ok_or_else(|| eyre!("No timer scheduled for key {:?}", key))?;
+
+        // Create context for this key
+        let key_context = self.context_for_key(key);
+
+        // Create a trigger with the actual scheduled time
+        let trigger = Trigger::for_testing(key.clone(), trigger_time, TimerType::DeferredMessage);
+
+        // Call the real MessageDeferHandler::on_timer
+        let result = self.handler.on_timer(key_context, trigger, demand).await;
+
+        // Timer event outcomes:
+        // - Success: completes, schedules next if queue not empty, returns Ok
+        // - Transient: increments retry count, reschedules same offset, returns Ok
+        // - Permanent: removes offset, schedules next if queued, PROPAGATES error
+        // - LoaderPermanent: loader fails permanently, offset removed, schedules next,
+        //   returns Ok
+        // - LoaderTransient: loader fails transiently, reschedules same offset, returns
+        //   Ok
+        match &event.outcome {
+            TimerOutcome::Success
+            | TimerOutcome::Transient { .. }
+            | TimerOutcome::LoaderPermanent
+            | TimerOutcome::LoaderTransient { .. } => {
+                // These should succeed (errors handled internally by MessageDeferHandler)
+                if let Err(e) = result {
+                    return Err(eyre!("Timer failed unexpectedly: {e}"));
+                }
+            }
+            TimerOutcome::Permanent => {
+                // Handler permanent errors are propagated - this is expected
+                if result.is_ok() {
+                    return Err(eyre!("Expected error for Permanent timer but got Ok"));
+                }
+            }
+        }
+
+        // The handler manages timers via context calls (schedule, clear_and_schedule,
+        // etc.) We don't clear timers here - that's the handler's
+        // responsibility.
         Ok(())
+    }
+
+    /// Executes a single trace event.
+    pub async fn execute_event(&mut self, event: &TraceEvent) -> color_eyre::Result<()> {
+        match event {
+            TraceEvent::Message(msg) => self.execute_message(msg).await,
+            TraceEvent::Timer(timer) => self.execute_timer(timer, DemandType::Normal).await,
+        }
     }
 
     /// Verifies all invariants after executing an event.

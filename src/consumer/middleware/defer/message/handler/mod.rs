@@ -15,15 +15,25 @@
 //!    deferred, transient errors always re-defer (config/decider only gate
 //!    initial deferral).
 //!
-//! The inner handler runs at most once per dispatch.
-//! [`DeferOutput`] selects its apply hook.
+//! # Apply hooks
+//!
+//! The inner is invoked at most once per dispatch; retries arrive as new
+//! `on_timer` dispatches, each with their own apply-hook pairing.
+//! [`MessageDeferOutput`] encodes the routing:
+//!
+//! * `Inner` — inner ran; forward the framework's chosen hook.
+//! * `Deferred` — inner ran and returned a transient error that we captured for
+//!   retry. Both hooks route to `after_abort(Err(..))`: a retry is coming even
+//!   though the dispatch's offset itself commits.
+//! * `NoInner` — inner did not run (queue-append, orphan-timer, loader failure,
+//!   key-mismatch); suppress both hooks.
 
 use super::store::{MessageDeferStore, MessageDeferStoreProvider};
 use crate::JsonCodec;
 use crate::consumer::ConsumerConfiguration;
+use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::{DeferralDecider, FailureTracker};
 use crate::consumer::middleware::defer::error::{DeferError, DeferInitError};
-use crate::consumer::middleware::defer::{DeferConfiguration, DeferOutput};
 use crate::consumer::middleware::{
     FallibleHandler, FallibleHandlerProvider, HandlerMiddleware, Settlement, SettlementHandler,
 };
@@ -39,6 +49,23 @@ mod operations;
 /// Property-based tests for defer handler invariants.
 #[cfg(test)]
 pub mod tests;
+
+/// Output of [`MessageDeferHandler`] dispatches; drives apply-hook routing.
+///
+/// See the module-level apply-hooks section for how `after_commit` /
+/// `after_abort` dispatch on these variants.
+#[derive(Debug)]
+pub enum MessageDeferOutput<O, E> {
+    /// Inner ran and produced an output.
+    Inner(O),
+    /// Inner did not run (queue-append, orphan-timer, loader failure,
+    /// key-mismatch) — suppress both apply hooks.
+    NoInner,
+    /// Inner ran and returned a transient error captured for retry. Both
+    /// apply hooks fire `after_abort(Err(E))`: the retry will re-dispatch
+    /// the same logical message.
+    Deferred(E),
+}
 
 /// Middleware that defers transiently-failed messages for timer-based retry.
 ///
@@ -234,12 +261,17 @@ where
     fn settlement(result: Result<&Self::Output, &Self::Error>) -> Settlement {
         match result {
             // Inner ran: its result is the dispatch's outcome.
-            Ok(DeferOutput::Inner(output)) => T::settlement(Ok(output)),
+            Ok(MessageDeferOutput::Inner(output)) => T::settlement(Ok(output)),
             // Inner ran and its error surfaced.
             Err(DeferError::Handler(error)) => T::settlement(Err(error)),
-            // The defer layer completed its queue and timer bookkeeping.
-            Ok(DeferOutput::Deferred(_) | DeferOutput::NoInner) => Settlement::Bypassed,
-            // Failed defer bookkeeping abandons the source.
+            // The outcome lives in the defer queue. Nothing here stages or
+            // records.
+            Ok(MessageDeferOutput::Deferred(_) | MessageDeferOutput::NoInner) => {
+                Settlement::Bypassed
+            }
+            // Defer bookkeeping failed. A committed source would strand the
+            // queue without a timer. Abandon so the redelivery repeats the
+            // bookkeeping.
             Err(
                 DeferError::Store(_)
                 | DeferError::Timer(_)

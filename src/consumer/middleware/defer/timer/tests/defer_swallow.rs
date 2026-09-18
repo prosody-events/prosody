@@ -1,15 +1,13 @@
 use super::*;
 use crate::consumer::EventHandler;
-use crate::consumer::middleware::defer::DeferOutput;
 use crate::consumer::middleware::defer::decider::AlwaysDefer;
 use crate::consumer::middleware::defer::error::DeferError;
-use crate::consumer::middleware::providers::LeafHandler;
-use crate::consumer::middleware::tests::test_support::settlement_name;
+use crate::consumer::middleware::defer::timer::handler::TimerDeferOutput;
 use crate::consumer::middleware::tests::test_support::{
     BypassedHandler, MockEventContext, RecordingTimer, ScriptedHandler, StagingHook,
     StagingTransientHandler, TestError, committed_json_value, recording_session,
 };
-use crate::consumer::middleware::{FallibleEventHandler, SettlementHandler};
+use crate::consumer::middleware::{FallibleEventHandler, Settlement, SettlementHandler};
 use crate::error::ErrorCategory;
 use crate::loader::KafkaLoaderError;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
@@ -19,12 +17,12 @@ use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
 impl FallibleEventHandler
-    for TimerDeferHandler<LeafHandler<StagingTransientHandler>, MemoryTimerDeferStore, AlwaysDefer>
+    for TimerDeferHandler<StagingTransientHandler, MemoryTimerDeferStore, AlwaysDefer>
 {
 }
 
 impl FallibleEventHandler
-    for TimerDeferHandler<LeafHandler<ScriptedHandler>, MemoryTimerDeferStore, AlwaysDefer>
+    for TimerDeferHandler<ScriptedHandler, MemoryTimerDeferStore, AlwaysDefer>
 {
 }
 
@@ -41,10 +39,10 @@ fn defer_handler<T>(
     store: MemoryTimerDeferStore,
     topic: Topic,
     partition: Partition,
-) -> color_eyre::Result<TimerDeferHandler<LeafHandler<T>, MemoryTimerDeferStore, AlwaysDefer>> {
+) -> color_eyre::Result<TimerDeferHandler<T, MemoryTimerDeferStore, AlwaysDefer>> {
     let telemetry = Telemetry::new();
     Ok(TimerDeferHandler {
-        handler: LeafHandler::new(inner),
+        handler: inner,
         store,
         decider: AlwaysDefer,
         config: DeferConfiguration::builder()
@@ -229,7 +227,7 @@ impl TimerDeferStore for TableStore {
     }
 }
 
-type TableOut = DeferOutput<(), TestError>;
+type TableOut = TimerDeferOutput<(), TestError>;
 type TableErr = DeferError<TestError, TestError>;
 
 /// The settlement classification table for the timer-defer wrapper:
@@ -240,59 +238,57 @@ type TableErr = DeferError<TestError, TestError>;
 fn settlement_classification_table() {
     use crate::timers::datetime::CompactDateTimeError;
 
-    type Subject = TimerDeferHandler<LeafHandler<ScriptedHandler>, TableStore, AlwaysDefer>;
+    type Subject = TimerDeferHandler<ScriptedHandler, TableStore, AlwaysDefer>;
     type Out = TableOut;
 
-    let rows: Vec<(&str, Result<Out, TableErr>, &str)> = vec![
+    let rows: Vec<(&str, Result<Out, TableErr>, Settlement)> = vec![
         (
             "Inner delegates to the leaf's Final",
-            Ok(DeferOutput::Inner(())),
-            "Final",
+            Ok(TimerDeferOutput::Inner(())),
+            Settlement::Final,
         ),
         (
             "Deferred is Bypassed (parked for retry)",
-            Ok(DeferOutput::Deferred(TestError(ErrorCategory::Transient))),
-            "Bypassed",
+            Ok(TimerDeferOutput::Deferred(TestError(
+                ErrorCategory::Transient,
+            ))),
+            Settlement::Bypassed,
         ),
         (
             "NoInner is Bypassed (queued behind / orphan cleanup)",
-            Ok(DeferOutput::NoInner),
-            "Bypassed",
+            Ok(TimerDeferOutput::NoInner),
+            Settlement::Bypassed,
         ),
         (
-            "Handler delegates to the leaf's Rejected",
+            "Handler delegates to the leaf's Final",
             Err(DeferError::Handler(TestError(ErrorCategory::Permanent))),
-            "Rejected",
+            Settlement::Final,
         ),
         (
-            "Store bookkeeping failure is Abandoned",
+            "Store rescue failure is Abandoned",
             Err(DeferError::Store(TestError(ErrorCategory::Transient))),
-            "Abandoned",
+            Settlement::Abandoned,
         ),
         (
-            "Timer bookkeeping failure is Abandoned",
+            "Timer rescue failure is Abandoned",
             Err(DeferError::Timer(Box::new(TestError(
                 ErrorCategory::Transient,
             )))),
-            "Abandoned",
+            Settlement::Abandoned,
         ),
         (
-            "Loader bookkeeping failure is Abandoned",
+            "Loader rescue failure is Abandoned",
             Err(DeferError::Loader(KafkaLoaderError::LoaderShutdown)),
-            "Abandoned",
+            Settlement::Abandoned,
         ),
         (
             "CompactTime (backoff computation, Permanent) is Abandoned",
             Err(DeferError::CompactTime(CompactDateTimeError::OutOfRange)),
-            "Abandoned",
+            Settlement::Abandoned,
         ),
     ];
     for (label, result, expected) in rows {
-        assert_eq!(
-            settlement_name(Subject::settlement(result.as_ref())),
-            expected,
-            "{label}"
-        );
+        assert_eq!(Subject::settlement(result.as_ref()), expected, "{label}");
     }
 }
 
@@ -304,15 +300,9 @@ fn settlement_classification_table() {
 fn settlement_table_delegates() {
     type Probe = TimerDeferHandler<BypassedHandler, TableStore, AlwaysDefer>;
 
-    let inner: Result<TableOut, TableErr> = Ok(DeferOutput::Inner(()));
+    let inner: Result<TableOut, TableErr> = Ok(TimerDeferOutput::Inner(()));
     let handler: Result<TableOut, TableErr> =
         Err(DeferError::Handler(TestError(ErrorCategory::Permanent)));
-    assert_eq!(
-        settlement_name(Probe::settlement(inner.as_ref())),
-        "Bypassed"
-    );
-    assert_eq!(
-        settlement_name(Probe::settlement(handler.as_ref())),
-        "Bypassed"
-    );
+    assert_eq!(Probe::settlement(inner.as_ref()), Settlement::Bypassed);
+    assert_eq!(Probe::settlement(handler.as_ref()), Settlement::Bypassed);
 }

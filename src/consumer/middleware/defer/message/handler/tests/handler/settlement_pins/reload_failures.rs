@@ -1,6 +1,4 @@
 use super::*;
-use crate::consumer::middleware::providers::LeafHandler;
-use crate::consumer::middleware::tests::test_support::settlement_name;
 use std::future::ready;
 
 #[tokio::test]
@@ -157,79 +155,75 @@ fn settlement_classification_table() {
     use crate::timers::datetime::CompactDateTimeError;
 
     type Subject = MessageDeferHandler<
-        DeduplicationHandler<LeafHandler<StagingLeaf>, MemoryDeduplicationStore>,
+        DeduplicationHandler<StagingLeaf, MemoryDeduplicationStore>,
         TableStore,
         MemoryLoader<Value>,
         AlwaysDefer,
     >;
-    type Out = DeferOutput<Option<()>, DeduplicationError<StagingError>>;
+    type Out = MessageDeferOutput<Option<()>, DeduplicationError<StagingError>>;
     type TableErr = DeferError<StagingError, DeduplicationError<StagingError>, MemoryLoaderError>;
 
-    let rows: Vec<(&str, Result<Out, TableErr>, &str)> = vec![
+    let rows: Vec<(&str, Result<Out, TableErr>, Settlement)> = vec![
         (
             "Inner(Some) delegates through dedup to the leaf's Final",
-            Ok(DeferOutput::Inner(Some(()))),
-            "Final",
+            Ok(MessageDeferOutput::Inner(Some(()))),
+            Settlement::Final,
         ),
         (
             "Inner(None) delegates to dedup's Bypassed (dedup hit)",
-            Ok(DeferOutput::Inner(None)),
-            "Bypassed",
+            Ok(MessageDeferOutput::Inner(None)),
+            Settlement::Bypassed,
         ),
         (
             "Deferred is Bypassed (parked for retry)",
-            Ok(DeferOutput::Deferred(DeduplicationError::Inner(
+            Ok(MessageDeferOutput::Deferred(DeduplicationError::Inner(
                 StagingError(ErrorCategory::Transient),
             ))),
-            "Bypassed",
+            Settlement::Bypassed,
         ),
         (
             "NoInner is Bypassed (queued behind / load handled)",
-            Ok(DeferOutput::NoInner),
-            "Bypassed",
+            Ok(MessageDeferOutput::NoInner),
+            Settlement::Bypassed,
         ),
         (
-            "Handler(Inner leaf error) delegates to Rejected",
+            "Handler(Inner leaf error) delegates to Final",
             Err(DeferError::Handler(DeduplicationError::Inner(
                 StagingError(ErrorCategory::Permanent),
             ))),
-            "Rejected",
+            Settlement::Final,
         ),
         (
-            "Handler(dedup Store) delegates to dedup's Abandoned",
+            "Handler(dedup Store) delegates to dedup's Bypassed",
             Err(DeferError::Handler(DeduplicationError::Store(Box::new(
                 StagingError(ErrorCategory::Transient),
             )))),
-            "Abandoned",
+            Settlement::Bypassed,
         ),
         (
-            "Store bookkeeping failure is Abandoned",
+            "Store rescue failure is Abandoned",
             Err(DeferError::Store(StagingError(ErrorCategory::Transient))),
-            "Abandoned",
+            Settlement::Abandoned,
         ),
         (
-            "Timer bookkeeping failure is Abandoned",
+            "Timer rescue failure is Abandoned",
             Err(DeferError::Timer(Box::new(StagingError(
                 ErrorCategory::Transient,
             )))),
-            "Abandoned",
+            Settlement::Abandoned,
         ),
         (
-            "Loader bookkeeping failure is Abandoned",
+            "Loader rescue failure is Abandoned",
             Err(DeferError::Loader(MemoryLoaderError::LoaderShutdown)),
-            "Abandoned",
+            Settlement::Abandoned,
         ),
         (
             "CompactTime (backoff computation, Permanent) is Abandoned",
             Err(DeferError::CompactTime(CompactDateTimeError::OutOfRange)),
-            "Abandoned",
+            Settlement::Abandoned,
         ),
     ];
     for (label, result, expected) in rows {
-        assert_eq!(
-            settlement_name(Subject::settlement(result.as_ref())),
-            expected,
-            "{label}"
-        );
+        assert_eq!(Subject::settlement(result.as_ref()), expected, "{label}");
     }
 }

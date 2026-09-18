@@ -1,6 +1,7 @@
-//! Records timer operations and injects timer faults.
+//! Records timer operations for trace properties.
+//! Tracks active timers by key and time.
 
-use super::FaultKind;
+use super::store::FaultKind;
 use super::types::OutputEvent;
 use crate::Key;
 use crate::consumer::TerminationSignals;
@@ -18,8 +19,6 @@ use std::collections::BTreeSet;
 use std::future::{self, Future, ready};
 use std::sync::Arc;
 use thiserror::Error;
-
-// Timer Capture State (shared across all contexts)
 
 /// Selects the timer call that receives a fault.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +92,18 @@ impl TimerCapture {
         let _ = self.active_timers.remove_sync(key);
     }
 
+    /// A committed fired trigger is retired; an aborted one re-fires.
+    pub(super) fn retire_fired(&self, key: &Key, time: CompactDateTime) {
+        let mut rescheduled = false;
+        while let Some(event) = self.pop_event() {
+            rescheduled |= matches!(event, OutputEvent::Scheduled { key: scheduled_key, time: scheduled_time }
+                if scheduled_key == *key && scheduled_time == time);
+        }
+        if !rescheduled {
+            self.record_clear(key, time);
+        }
+    }
+
     /// Records a timer schedule operation for a specific (key, time).
     pub fn record_schedule(&self, key: Key, time: CompactDateTime) {
         self.events.push(OutputEvent::Scheduled {
@@ -113,10 +124,7 @@ impl TimerCapture {
             });
     }
 
-    /// Records clearing a specific timer by (key, time).
-    ///
-    /// Used when `commit()` is called after a timer fires - removes only the
-    /// specific timer that was fired, not any newly scheduled timers.
+    /// Removes one timer and records the clear operation.
     pub fn record_clear(&self, key: &Key, time: CompactDateTime) {
         self.events.push(OutputEvent::Cleared { key: key.clone() });
 
@@ -140,14 +148,6 @@ impl TimerCapture {
         self.events.push(OutputEvent::Cleared { key: key.clone() });
 
         let _ = self.active_timers.remove_sync(key);
-    }
-
-    /// Detaches the fired source without a handler operation.
-    pub fn take_timer(&self, key: &Key, time: CompactDateTime) {
-        let _ = self.active_timers.remove_if_sync(key, |times| {
-            times.remove(&time);
-            times.is_empty()
-        });
     }
 
     /// Pops and returns the oldest recorded event, if any.
@@ -207,8 +207,6 @@ impl TimerCapture {
             .unwrap_or(0)
     }
 }
-
-// Keyed Capturing Context (per-key EventContext implementation)
 
 /// Context for a specific key that captures timer operations.
 ///

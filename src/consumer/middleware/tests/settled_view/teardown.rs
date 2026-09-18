@@ -9,9 +9,9 @@ async fn leaked_handle_reads_in_window_then_terminated_after_teardown() -> Resul
     let leaked: Handle = handle(&context, FLOOR)?;
     let session = context.test_lifecycle().map_err(|e| eyre!("bind: {e}"))?;
 
-    let probe = ViewProbe::new();
+    let probe = ViewProbe::<AsFinal>::new();
     // Graceful window read happens inside the probe's hook (floor == base).
-    settle(&LeafHandler::new(probe.clone()), context, g, Ok(0)).await;
+    settle(&probe, context, g, Ok(0)).await;
     assert_eq!(committed.load(Ordering::SeqCst), 1);
     let obs = probe.observation().ok_or_else(|| eyre!("hook fires"))?;
     assert_eq!(
