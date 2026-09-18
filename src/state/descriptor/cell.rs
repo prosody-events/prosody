@@ -10,22 +10,21 @@ use std::future::{Future, ready};
 use std::marker::PhantomData;
 use thiserror::Error;
 
-/// A resolver: how a decoded cell (`Stored`) maps to and from the value a
-/// handle exposes (`Resolved`/`Write`).
+/// A resolver maps a decoded cell (`Stored`) to and from the value a handle
+/// exposes (`Resolved` and `Write`).
 ///
-/// A resolver is a zero-sized *strategy*, never an instance: every method is
-/// static. It is **session-free** — it never sees the session. Instead it
-/// declares the capability [`Self::resolve`] borrows as [`Self::Context`]
-/// (`()` for none, `&'s L` for a loader); the framework extracts that context
-/// from the session through [`FromSession`]. This keeps the resolver's token
-/// ([`Self::RESOLVER_ID`]) a plain const on the one trait, symmetric with
-/// [`Codec::FORMAT_ID`].
+/// A resolver is a zero-sized strategy, never an instance. Every method is
+/// static, and no method sees the session. A resolver declares the capability
+/// that [`Self::resolve`] borrows as [`Self::Context`]: `()` for none, or
+/// `&'s L` for a loader. The framework extracts that context from the session
+/// through [`FromSession`]. The resolver token [`Self::RESOLVER_ID`] is a plain
+/// const on this trait, like [`Codec::FORMAT_ID`].
 ///
-/// A resolver is *behavior over* decoded payloads — it must never change what
-/// stored bytes mean ([`Codec::FORMAT_ID`]'s completeness law). Storage whose
-/// payload denotes something the format doesn't imply (a reference, a
-/// pointer) belongs in a dedicated codec, the way the message cell's
-/// `"message-ref"` format is its own codec and its resolver merely fetches.
+/// A resolver is behavior over decoded payloads. It must never change what the
+/// stored bytes mean, because [`Codec::FORMAT_ID`] describes them completely.
+/// A payload that denotes something the format does not imply, such as a
+/// reference, belongs in a dedicated codec. The message cell's `"message-ref"`
+/// format is its own codec, and its resolver only fetches.
 ///
 /// A resolver must never issue a session or collection operation. A point get
 /// resolves while it holds the session gate. A resolver that re-entered the
@@ -34,8 +33,8 @@ use thiserror::Error;
 /// a range page runs gate-free. The contract still binds every resolver on
 /// every path.
 pub trait CellResolver {
-    /// The decoded cell type this resolver maps from — pinned to the codec's
-    /// payload by [`CellType`].
+    /// The decoded cell type this resolver maps from. [`CellType`] fixes it to
+    /// the codec's payload.
     type Stored;
 
     /// What a handle's `get` returns. `Send` so a resolved item survives a
@@ -57,7 +56,7 @@ pub trait CellResolver {
     /// [`StructuralIdentity`](super::StructuralIdentity) for the
     /// **in-process** bind-time check (`verify_state_registration`), catching
     /// two same-named descriptors with different resolvers in one binary. It
-    /// is deliberately not part of the durable identity — resolvers are
+    /// is deliberately not part of the durable identity. Resolvers are
     /// behavior, not data (see the trait doc).
     const RESOLVER_ID: Option<&'static str>;
 
@@ -77,9 +76,9 @@ pub trait CellResolver {
     fn stored_from(write: Self::Write<'_>) -> Self::Stored;
 }
 
-/// Framework adapter: how a [`CellResolver::Context`] is borrowed from a
-/// session. Two impls, coherence-disjoint by type shape — `()` borrows
-/// nothing, `&'s S::Loader` borrows the loader. A custom context (a local type)
+/// Framework adapter that borrows a [`CellResolver::Context`] from a session.
+/// Two impls exist, and their type shapes do not overlap: `()` borrows
+/// nothing, and `&'s S::Loader` borrows the loader. A custom local context type
 /// is the public extension point.
 pub trait FromSession<'s, S>: Sized {
     /// Extracts the resolver's context from the session.
@@ -96,9 +95,8 @@ impl<'s, S: StateSession> FromSession<'s, S> for &'s S::Loader {
     }
 }
 
-/// Every [`Codec`] is its own passthrough [`CellResolver`] — the unit of
-/// composition, so a plain codec is a complete [`CellType`] with no resolver
-/// slot to fill.
+/// Every [`Codec`] is its own passthrough [`CellResolver`]. A plain codec is
+/// therefore a complete [`CellType`] with no resolver slot to fill.
 impl<C: Codec> CellResolver for C {
     type Context<'s> = ();
     type Resolved = C::Payload;
@@ -127,8 +125,8 @@ impl<C: Codec> CellResolver for C {
 /// passthrough), [`WithResolver`] pairs a codec with a resolver ad hoc, and
 /// [`Keyed`] lifts either into a key-addressed family.
 pub trait CellType {
-    /// The address codec — [`UnitKey`] for a single-cell type, a real key
-    /// codec once lifted through [`Keyed`].
+    /// The address codec. It is [`UnitKey`] for a single-cell type and a real
+    /// key codec once lifted through [`Keyed`].
     type Key: OrderedKeyCodec;
 
     /// The codec typing the stored cell.
@@ -147,9 +145,9 @@ impl<C: Codec> CellType for C {
     type Resolver = C;
 }
 
-/// Resolver-axis composer: pairs a codec with a non-trivial resolver — the way
-/// to compose a reference cell without writing a [`CellType`] impl. Single-cell
-/// (`Key = UnitKey`); lift it through [`Keyed`] to address a family.
+/// Pairs a codec with a resolver. This composes a reference cell without a
+/// hand-written [`CellType`] impl. It is single-cell (`Key = UnitKey`). Lift
+/// it through [`Keyed`] to address a family.
 pub struct WithResolver<C, R>(PhantomData<fn() -> (C, R)>);
 
 impl<C: Codec, R: CellResolver<Stored = C::Payload>> CellType for WithResolver<C, R> {
@@ -158,12 +156,12 @@ impl<C: Codec, R: CellResolver<Stored = C::Payload>> CellType for WithResolver<C
     type Resolver = R;
 }
 
-/// Key-axis composer: lifts a single-cell [`CellType`] into a family addressed
-/// by key codec `K`, keeping its payload and resolver. This plus the
-/// [`UnitKey`] blanket is the stable-Rust encoding of an optional key axis
-/// (associated-type defaults are unstable). Only single-cell types
-/// (`Key = UnitKey`) can be lifted, so a double-keyed composition — which
-/// would silently discard the inner key axis — is unrepresentable.
+/// Lifts a single-cell [`CellType`] into a family addressed by key codec `K`.
+/// The payload and resolver stay the same. Together with the [`UnitKey`]
+/// blanket impl, this encodes an optional key axis on stable Rust, where
+/// associated-type defaults are unstable. Only single-cell types
+/// (`Key = UnitKey`) can be lifted. A double-keyed composition would discard
+/// the inner key axis, so it does not compile.
 pub struct Keyed<K, T>(PhantomData<fn() -> (K, T)>);
 
 impl<K: OrderedKeyCodec, T: CellType<Key = UnitKey>> CellType for Keyed<K, T> {
@@ -172,14 +170,15 @@ impl<K: OrderedKeyCodec, T: CellType<Key = UnitKey>> CellType for Keyed<K, T> {
     type Resolver = T::Resolver;
 }
 
-/// The logical key a cell type's ops address by — `()` for a single-cell type.
+/// The logical key a cell type's ops address by. It is `()` for a single-cell
+/// type.
 pub type KeyOf<T> = <<T as CellType>::Key as OrderedKeyCodec>::Key;
 
 /// The borrowed key view accepted by a cell type.
 pub type BorrowedKeyOf<T> = <<T as CellType>::Key as OrderedKeyCodec>::Borrowed;
 
-/// The codec error a cell type's `get`/`set` surface — the codec half of
-/// [`CellStateError`].
+/// The codec error a cell type's `get` and `set` surface. It is the codec half
+/// of [`CellStateError`].
 pub type CellCodecError<T> = <<T as CellType>::Codec as Codec>::Error;
 
 /// The value a cell type's `get` returns and its scan yields.

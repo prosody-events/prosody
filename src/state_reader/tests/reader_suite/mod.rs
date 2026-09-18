@@ -233,7 +233,7 @@ async fn assert_map<B: ReaderBackend>(
 /// model on the first non-empty event. This property never reaches the wide
 /// committed-scan arm that keyset overflow falls back to, since `KEY_POOL`
 /// stays under the keyset limit. That fallback is covered separately: by
-/// [`scan_reads_only_pinned_source`](super::probe_tests) for memory, and by
+/// [`scan_reads_only_pinned_source`](super::probe) for memory, and by
 /// [`reader_deque_scan_committed`](super::cassandra_tests) for Cassandra. Do
 /// not re-add a scan case here.
 pub(super) async fn run_reader_map_trace<B: ReaderBackend>(

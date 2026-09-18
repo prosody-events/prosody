@@ -24,8 +24,8 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     /// The layout brand every family argument is checked against.
     type Layout;
 
-    /// The collection's canonical name — the operation-span field and the
-    /// subject of a collection's degrade warnings.
+    /// The collection's canonical name. It is the operation-span field and
+    /// the subject of a collection's degrade warnings.
     fn name(&self) -> &StateName;
 
     /// Whether the collection carries a durable TTL. Read from the binding's
@@ -152,11 +152,11 @@ pub(crate) trait CollectionWrite: CollectionRead {
     /// Stages a clear at its typed address.
     fn clear<T: CellType>(&mut self, address: CellAddress<Self::Layout, T>);
 
-    /// Stages an absence over the collection's **whole declared layout** — one
-    /// payload-free journal entry that expands to every active and reserved
-    /// section at merge, so a removed family's legacy rows are erased too. From
-    /// this program point the collection reads empty, and later commands in the
-    /// same invocation repopulate it.
+    /// Stages an absence over the collection's whole declared layout. One
+    /// payload-free journal entry expands to every active and reserved section
+    /// at merge, so a removed family's legacy rows are erased too. From this
+    /// program point the collection reads empty. Later commands in the same
+    /// invocation repopulate it.
     fn clear_collection(&mut self)
     where
         Self::Layout: CollectionLayout;

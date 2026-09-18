@@ -16,8 +16,8 @@ pub(super) enum Slot<P: Projection> {
 }
 
 /// Fills every pending slot from the engine and returns the answers aligned to
-/// `slots` — the journal-aware batch read a write invocation performs, where
-/// only the journal-silent positions reach the engine. It reads them through
+/// `slots`. This is the journal-aware batch read a write invocation performs.
+/// Only the journal-silent positions reach the engine, through
 /// [`read_coordinates`].
 pub(super) async fn batched<S: StateSession, P: Projection>(
     session: &S,

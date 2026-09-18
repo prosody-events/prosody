@@ -28,14 +28,14 @@ use std::num::NonZeroUsize;
 
 /// Inline capacity of one invocation's mutation journal.
 ///
-/// Four is the current maximum across the built-in collections: a Deque push
-/// stages one entry, at most `TRIM_MAX` point clears, and one bounds set; Map
-/// needs two, Value one. Each collection *declares* its own maximum beside its
-/// layout, and a compile-time assertion there pins that declaration against
-/// this budget — so widening a collection past four is a build error, not a
-/// silent steady-state allocation. A spill is still semantically correct —
-/// Rust cannot derive a sound maximum from an arbitrary async body, so the
-/// inline bound is an allocation budget, never a limit.
+/// Four is the current maximum across the built-in collections. A Deque push
+/// stages one entry, at most `TRIM_MAX` point clears, and one bounds set. Map
+/// needs two, Value one. Each collection declares its own maximum beside its
+/// layout, and a compile-time assertion there checks the declaration against
+/// this budget. Widening a collection past four is therefore a build error,
+/// not a silent steady-state allocation. A spill is still correct: Rust cannot
+/// derive a sound maximum from an arbitrary async body, so the inline bound is
+/// an allocation budget, never a limit.
 pub const JOURNAL_INLINE: usize = 4;
 
 /// One invocation's staged mutations, in authored order.
@@ -66,9 +66,9 @@ pub enum Mutation {
     },
 }
 
-/// What this invocation has already staged for one cell — the journal's answer
-/// to a read, distinct from "the journal says nothing" (which falls through to
-/// the engine).
+/// What this invocation has already staged for one cell. This is the
+/// journal's answer to a read. A cell the journal does not mention falls
+/// through to the engine.
 enum Staged {
     /// The cell was written in this invocation.
     Present(Bytes),
@@ -189,9 +189,9 @@ impl<'a, S: WritableStateSession, L> WriteOperation<'a, S, L> {
     /// then replays the journal into the event overlay in authored order with
     /// no suspension point.
     ///
-    /// Taking `self` is the invariant, not a convenience — a merged operation
-    /// is moved, so "merge, then keep writing" is a use-after-move the compiler
-    /// rejects rather than a runtime state check.
+    /// Taking `self` is the invariant, not a convenience. A merged operation
+    /// is moved, so a write after merge is a use-after-move that the compiler
+    /// rejects. No runtime state check is needed.
     ///
     /// The held write admission excludes the settle boundary's close and the
     /// attempt boundary's reset between the fence and the replay, so no
@@ -201,8 +201,8 @@ impl<'a, S: WritableStateSession, L> WriteOperation<'a, S, L> {
     ///
     /// # Errors
     ///
-    /// The final fence's refusal — a stale attempt, a closed session, or
-    /// termination — in which case nothing is replayed.
+    /// The final fence's refusal: a stale attempt, a closed session, or
+    /// termination. Nothing is replayed in that case.
     pub(super) fn merge(self) -> Result<(), StateAccessError> {
         let session = self.collection.session();
         let (state_type, name) = (self.collection.state_type(), self.collection.name());

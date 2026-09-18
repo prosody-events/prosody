@@ -58,7 +58,7 @@ pub trait ReadEngine<S: ?Sized> {
     ///
     /// # Errors
     ///
-    /// Whatever the engine's validation refuses — for the owner, an
+    /// The engine's validation refusal. For the owner, that is an
     /// unregistered name or a structural-identity mismatch.
     fn verify_registration(
         session: &S,
@@ -81,9 +81,9 @@ pub trait ReadEngine<S: ?Sized> {
     /// driver carries an unreachable arm.
     fn capture(inner: &Self::ReadInner<'_>) -> Self::Plan;
 
-    /// Re-enters an invocation under a captured plan — one coordinate
-    /// chunk's admission. The owner reacquires the gate here, which is what
-    /// keeps a coordinate stream free of a gate hold across a yield.
+    /// Re-enters an invocation under a captured plan for one coordinate
+    /// chunk's admission. The owner reacquires the gate here. A coordinate
+    /// stream therefore holds no gate across a yield.
     fn resume<'a>(
         session: &'a S,
         plan: &Self::Plan,
@@ -121,8 +121,9 @@ pub trait Reads<S: ?Sized, P: Projection>: ReadEngine<S> {
         batch: &CoordinateBatch,
     ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, StateAccessError>> + Send;
 
-    /// Pages a durable range under a captured plan, gate-free — the range
-    /// driver's only lower hop, and the one command that cannot repair.
+    /// Pages a durable range under a captured plan without the gate. This is
+    /// the range driver's only lower hop and the one command that cannot
+    /// repair.
     fn page<'a>(
         session: &'a S,
         plan: &'a Self::Plan,
@@ -137,8 +138,8 @@ pub trait Reads<S: ?Sized, P: Projection>: ReadEngine<S> {
 pub trait WriteEngine<S: ?Sized>: ReadEngine<S> {
     /// The per-invocation write state. `DerefMut` to the read state is the
     /// one-way relation from write admission to the read admission it
-    /// subsumes — which is how a write operation reuses the read driver
-    /// unchanged, with no runtime variant and no inverse conversion.
+    /// subsumes. A write operation therefore reuses the read driver unchanged,
+    /// with no runtime variant and no inverse conversion.
     type WriteInner<'a>: DerefMut<Target = Self::ReadInner<'a>> + Send
     where
         S: 'a;
@@ -147,7 +148,7 @@ pub trait WriteEngine<S: ?Sized>: ReadEngine<S> {
     ///
     /// # Errors
     ///
-    /// Whatever the engine's admission refuses — for the owner, a stale
+    /// The engine's admission refusal. For the owner, that is a stale
     /// attempt, a closed session, or termination.
     fn begin_write(
         session: &S,
