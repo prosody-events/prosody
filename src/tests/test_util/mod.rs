@@ -1,7 +1,7 @@
 mod metrics;
 
 pub(crate) use self::metrics::{GlobalMetrics, assert_distinct_labels, label, labels};
-use crate::cassandra::CassandraConfiguration;
+use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::otel::SpanRelation;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
@@ -21,6 +21,7 @@ use std::future::ready;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::OnceCell;
 use tracing::field::{Field, Visit};
 use tracing::subscriber::{DefaultGuard, set_default, set_global_default, with_default};
 use tracing::{Event, Level, Subscriber};
@@ -34,6 +35,7 @@ static SPAN_INIT: Mutex<()> = Mutex::new(());
 static GLOBAL_SPANS: LazyLock<Arc<Mutex<Option<Vec<SpanData>>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(None)));
 static GLOBAL_SPAN_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
+static CASSANDRA_STORE: OnceCell<CassandraStore> = OnceCell::const_new();
 
 /// The shared, pre-migrated keyspace every Cassandra-backed test runs against.
 ///
@@ -80,6 +82,21 @@ pub(crate) fn integration_test_count(default: u64) -> u64 {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+/// The shared store, built once for the whole test process.
+///
+/// `CassandraStore::new` runs the migrator, so a store per property iteration
+/// would spend the run on schema checks.
+///
+/// # Errors
+///
+/// Returns the driver's error when the session or the migration fails.
+pub(crate) async fn shared_cassandra_store() -> Result<&'static CassandraStore> {
+    CASSANDRA_STORE
+        .get_or_try_init(|| async { CassandraStore::new(&test_cassandra_config()).await })
+        .await
+        .map_err(Into::into)
 }
 
 /// Configuration for the local test cluster (`localhost:9042`) over the

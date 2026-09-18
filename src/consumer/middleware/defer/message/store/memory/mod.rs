@@ -4,7 +4,8 @@
 
 use super::MessageDeferStore;
 use super::provider::MessageDeferStoreProvider;
-use crate::{Key, Offset, Partition, Topic};
+use crate::consumer::middleware::defer::segment::{LazySegment, MemorySegmentStore};
+use crate::{Key, Offset, Partition, SegmentId, Topic};
 
 #[cfg(test)]
 use crate::defer_store_tests;
@@ -14,25 +15,41 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::sync::Arc;
 
+/// Topic, partition, and group a standalone [`MemoryMessageDeferStore`] is
+/// scoped to.
+const STANDALONE_SEGMENT: &str = "memory";
+
 /// In-memory message defer store.
 ///
 /// Lock-free via [`scc::HashMap`]. Each key maps to a `BTreeSet<Offset>`
 /// (sorted queue) plus a shared retry counter. Thread-safe and cheap to clone.
 ///
-/// Each store instance is scoped to a segment; partition isolation comes from
-/// creating separate instances per partition.
+/// The store reads and writes one segment of the substrate its provider owns.
+/// Partition isolation comes from the segment id in every map key.
 #[derive(Clone, Debug)]
 pub struct MemoryMessageDeferStore {
+    segment: LazySegment<MemorySegmentStore>,
     inner: Arc<Inner>,
 }
 
 impl MemoryMessageDeferStore {
-    /// Creates an empty store.
+    /// A standalone store over its own substrate and one fixed segment.
+    ///
+    /// Callers that need several segments to share rows mint their stores from
+    /// one [`MemoryMessageDeferStoreProvider`] instead.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Inner::default()),
-        }
+        MemoryMessageDeferStoreProvider::default().create_store(
+            Topic::from(STANDALONE_SEGMENT),
+            0,
+            STANDALONE_SEGMENT,
+            0,
+        )
+    }
+
+    /// The segment this store addresses, registering it on first call.
+    async fn segment_id(&self) -> Result<SegmentId, Infallible> {
+        Ok(self.segment.get().await?.id())
     }
 }
 
@@ -42,10 +59,10 @@ impl Default for MemoryMessageDeferStore {
     }
 }
 
-/// Storage: `key` → (`sorted offsets`, `retry_count`).
+/// Storage: (`segment`, `key`) → (`sorted offsets`, `retry_count`).
 #[derive(Debug)]
 struct Inner {
-    deferred: HashMap<Key, (BTreeSet<Offset>, u32), RandomState>,
+    deferred: HashMap<(SegmentId, Key), (BTreeSet<Offset>, u32), RandomState>,
 }
 
 impl Default for Inner {
@@ -60,9 +77,10 @@ impl MessageDeferStore for MemoryMessageDeferStore {
     type Error = Infallible;
 
     async fn defer_first_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
+        let segment = self.segment_id().await?;
         self.inner
             .deferred
-            .entry_async(Arc::clone(key))
+            .entry_async((segment, Arc::clone(key)))
             .await
             .and_modify(|(offsets, retry_count)| {
                 offsets.insert(offset);
@@ -81,10 +99,11 @@ impl MessageDeferStore for MemoryMessageDeferStore {
         &self,
         key: &Key,
     ) -> Result<Option<(Offset, u32)>, Self::Error> {
+        let segment = self.segment_id().await?;
         let result = self
             .inner
             .deferred
-            .get_async(key.as_ref())
+            .get_async(&(segment, Arc::clone(key)))
             .await
             .and_then(|entry| {
                 let (offsets, retry_count) = entry.get();
@@ -95,9 +114,10 @@ impl MessageDeferStore for MemoryMessageDeferStore {
     }
 
     async fn append_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
+        let segment = self.segment_id().await?;
         self.inner
             .deferred
-            .entry_async(Arc::clone(key))
+            .entry_async((segment, Arc::clone(key)))
             .await
             .and_modify(|(offsets, _)| {
                 offsets.insert(offset);
@@ -118,10 +138,11 @@ impl MessageDeferStore for MemoryMessageDeferStore {
         // messages for a key are processed, the entry is dead state
         // (retry_count = 0 ≡ retry_count absent), matching Cassandra's
         // delete_key on min-only-row removal. Atomic via remove_if_async.
+        let segment = self.segment_id().await?;
         let _ = self
             .inner
             .deferred
-            .remove_if_async(key.as_ref(), |(offsets, _)| {
+            .remove_if_async(&(segment, Arc::clone(key)), |(offsets, _)| {
                 offsets.remove(&offset);
                 offsets.is_empty()
             })
@@ -134,10 +155,11 @@ impl MessageDeferStore for MemoryMessageDeferStore {
         // No-op on a key with no offsets. Production only calls this with an
         // active deferred message present; creating an entry here would leave
         // an orphan, violating "no entry after all messages are processed."
+        let segment = self.segment_id().await?;
         let _ = self
             .inner
             .deferred
-            .entry_async(Arc::clone(key))
+            .entry_async((segment, Arc::clone(key)))
             .await
             .and_modify(|(_, current)| {
                 *current = retry_count;
@@ -147,20 +169,52 @@ impl MessageDeferStore for MemoryMessageDeferStore {
     }
 
     async fn delete_key(&self, key: &Key) -> Result<(), Self::Error> {
-        self.inner.deferred.remove_async(key.as_ref()).await;
+        let segment = self.segment_id().await?;
+        self.inner
+            .deferred
+            .remove_async(&(segment, Arc::clone(key)))
+            .await;
         Ok(())
     }
 }
 
-/// Creates isolated in-memory stores per partition.
+/// Hands out per-segment views of one shared in-memory message defer store.
+///
+/// The shared map is memory mode's **durable substrate**: two stores minted
+/// for the same segment observe each other's rows, exactly as two Cassandra
+/// stores over one partition do. A fresh map per `create_store` would make
+/// every durable row vanish with the store that wrote it. The map is keyed by
+/// segment id and key, so segments cannot collide. It drops with the provider.
 #[derive(Clone, Debug, Default)]
-pub struct MemoryMessageDeferStoreProvider;
+pub struct MemoryMessageDeferStoreProvider {
+    segments: MemorySegmentStore,
+    inner: Arc<Inner>,
+}
 
 impl MemoryMessageDeferStoreProvider {
-    /// Creates a new provider.
+    /// Creates a provider that registers its segments in `segments`.
     #[must_use]
-    pub fn new() -> Self {
-        Self
+    pub fn new(segments: MemorySegmentStore) -> Self {
+        Self {
+            segments,
+            inner: Arc::new(Inner::default()),
+        }
+    }
+
+    /// Keys with a non-empty deferred queue in one segment. A snapshot; it
+    /// drops with the caller's stream.
+    pub(crate) async fn keys(&self, segment: SegmentId) -> Vec<Key> {
+        let mut out = Vec::new();
+        self.inner
+            .deferred
+            .iter_async(|(id, key), (offsets, _)| {
+                if *id == segment && !offsets.is_empty() {
+                    out.push(Arc::clone(key));
+                }
+                true
+            })
+            .await;
+        out
     }
 }
 
@@ -169,12 +223,20 @@ impl MessageDeferStoreProvider for MemoryMessageDeferStoreProvider {
 
     fn create_store(
         &self,
-        _topic: Topic,
-        _partition: Partition,
-        _consumer_group: &str,
+        topic: Topic,
+        partition: Partition,
+        consumer_group: &str,
         _cache_size: usize,
     ) -> Self::Store {
-        MemoryMessageDeferStore::new()
+        MemoryMessageDeferStore {
+            segment: LazySegment::new(
+                self.segments.clone(),
+                topic,
+                partition,
+                Arc::from(consumer_group),
+            ),
+            inner: Arc::clone(&self.inner),
+        }
     }
 }
 

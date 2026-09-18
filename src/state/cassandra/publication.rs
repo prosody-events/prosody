@@ -157,7 +157,7 @@ cassandra_queries! {
         ),
 
         /// Reads every source of one collection — a single-partition clustering
-        /// scan, no `ALLOW FILTERING`.
+        /// scan. It names the whole partition key, so it needs no filtering.
         read_publications: (
             "SELECT group_id, topic, partition_count \
              FROM $keyspace.{} WHERE subsystem = ? AND state_type = ? AND name = ? LIMIT ?",

@@ -4,11 +4,12 @@
 
 use super::TimerDeferStore;
 use super::provider::TimerDeferStoreProvider;
+use crate::consumer::middleware::defer::segment::{LazySegment, MemorySegmentStore};
 use crate::otel::SpanRelation;
 use crate::related_span;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
-use crate::{Key, Partition, Topic};
+use crate::{Key, Partition, SegmentId, Topic};
 use ahash::RandomState;
 use opentelemetry::Context;
 use scc::HashMap;
@@ -16,6 +17,10 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
+
+/// Topic, partition, and group a standalone [`MemoryTimerDeferStore`] is
+/// scoped to.
+const STANDALONE_SEGMENT: &str = "memory";
 
 /// Timer entry with span context for reconstruction.
 #[derive(Clone, Debug)]
@@ -59,22 +64,33 @@ impl StoredTimer {
 /// `BTreeMap<CompactDateTime, StoredTimer>` (sorted queue) plus a shared retry
 /// counter. Thread-safe and cheap to clone.
 ///
-/// Each store instance is scoped to a segment; partition isolation comes from
-/// creating separate instances per partition.
+/// The store reads and writes one segment of the substrate its provider owns.
+/// Partition isolation comes from the segment id in every map key.
 #[derive(Clone, Debug)]
 pub struct MemoryTimerDeferStore {
+    segment: LazySegment<MemorySegmentStore>,
     inner: Arc<Inner>,
     timer_spans: SpanRelation,
 }
 
 impl MemoryTimerDeferStore {
-    /// Creates an empty store with the given span relation.
+    /// A standalone store over its own substrate and one fixed segment.
+    ///
+    /// Callers that need several segments to share rows mint their stores from
+    /// one [`MemoryTimerDeferStoreProvider`] instead.
     #[must_use]
     pub fn new(timer_spans: SpanRelation) -> Self {
-        Self {
-            inner: Arc::new(Inner::default()),
-            timer_spans,
-        }
+        MemoryTimerDeferStoreProvider::new(MemorySegmentStore::new(), timer_spans).create_store(
+            Topic::from(STANDALONE_SEGMENT),
+            0,
+            STANDALONE_SEGMENT,
+            0,
+        )
+    }
+
+    /// The segment this store addresses, registering it on first call.
+    async fn segment_id(&self) -> Result<SegmentId, Infallible> {
+        Ok(self.segment.get().await?.id())
     }
 }
 
@@ -84,10 +100,13 @@ impl Default for MemoryTimerDeferStore {
     }
 }
 
-/// Storage: `key` → (`sorted timers`, `retry_count`).
+/// The queue of one key in one segment, and that key's retry count.
+type DeferredTimers = (BTreeMap<CompactDateTime, StoredTimer>, u32);
+
+/// Storage: (`segment`, `key`) → (`sorted timers`, `retry_count`).
 #[derive(Debug)]
 struct Inner {
-    deferred: HashMap<Key, (BTreeMap<CompactDateTime, StoredTimer>, u32), RandomState>,
+    deferred: HashMap<(SegmentId, Key), DeferredTimers, RandomState>,
 }
 
 impl Default for Inner {
@@ -102,12 +121,13 @@ impl TimerDeferStore for MemoryTimerDeferStore {
     type Error = Infallible;
 
     async fn defer_first_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
+        let segment = self.segment_id().await?;
         let stored = StoredTimer::from_trigger(trigger);
         let time = trigger.time;
 
         self.inner
             .deferred
-            .entry_async(trigger.key.clone())
+            .entry_async((segment, trigger.key.clone()))
             .await
             .and_modify(|(timers, retry_count)| {
                 timers.insert(time, stored.clone());
@@ -126,11 +146,12 @@ impl TimerDeferStore for MemoryTimerDeferStore {
         &self,
         key: &Key,
     ) -> Result<Option<(Trigger, u32)>, Self::Error> {
+        let segment = self.segment_id().await?;
         let linking = self.timer_spans;
         let result = self
             .inner
             .deferred
-            .get_async(key.as_ref())
+            .get_async(&(segment, Arc::clone(key)))
             .await
             .and_then(|entry| {
                 let (timers, retry_count) = entry.get();
@@ -146,13 +167,15 @@ impl TimerDeferStore for MemoryTimerDeferStore {
         &self,
         key: &Key,
     ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
+        let segment = self.segment.clone();
         let inner = Arc::clone(&self.inner);
         let key = key.clone();
 
         async move {
+            let segment = segment.get().await?.id();
             Ok(inner
                 .deferred
-                .get_async(key.as_ref())
+                .get_async(&(segment, key))
                 .await
                 .map(|entry| {
                     let (timers, _) = entry.get();
@@ -163,12 +186,13 @@ impl TimerDeferStore for MemoryTimerDeferStore {
     }
 
     async fn append_deferred_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
+        let segment = self.segment_id().await?;
         let stored = StoredTimer::from_trigger(trigger);
         let time = trigger.time;
 
         self.inner
             .deferred
-            .entry_async(trigger.key.clone())
+            .entry_async((segment, trigger.key.clone()))
             .await
             .and_modify(|(timers, _)| {
                 timers.insert(time, stored.clone());
@@ -193,10 +217,11 @@ impl TimerDeferStore for MemoryTimerDeferStore {
         // deferred timers for a key are processed, the entry is dead state
         // (retry_count = 0 ≡ retry_count absent), matching Cassandra's
         // delete_key on min-only-row removal. Atomic via remove_if_async.
+        let segment = self.segment_id().await?;
         let _ = self
             .inner
             .deferred
-            .remove_if_async(key.as_ref(), |(timers, _)| {
+            .remove_if_async(&(segment, Arc::clone(key)), |(timers, _)| {
                 timers.remove(&time);
                 timers.is_empty()
             })
@@ -210,10 +235,11 @@ impl TimerDeferStore for MemoryTimerDeferStore {
         // active timer present; creating an entry here would leave an orphan
         // (entry with empty BTreeMap), violating "no entry after all timers
         // are processed."
+        let segment = self.segment_id().await?;
         let _ = self
             .inner
             .deferred
-            .entry_async(key.clone())
+            .entry_async((segment, key.clone()))
             .await
             .and_modify(|(_, current)| {
                 *current = retry_count;
@@ -223,28 +249,55 @@ impl TimerDeferStore for MemoryTimerDeferStore {
     }
 
     async fn delete_key(&self, key: &Key) -> Result<(), Self::Error> {
-        self.inner.deferred.remove_async(key.as_ref()).await;
+        let segment = self.segment_id().await?;
+        self.inner
+            .deferred
+            .remove_async(&(segment, Arc::clone(key)))
+            .await;
         Ok(())
     }
 }
 
-/// Creates isolated in-memory stores per partition.
-#[derive(Clone, Copy, Debug, Default)]
+/// Hands out per-segment views of one shared in-memory timer defer store.
+///
+/// The shared map is memory mode's **durable substrate**: two stores minted
+/// for the same segment observe each other's rows, exactly as two Cassandra
+/// stores over one partition do. A fresh map per `create_store` would make
+/// every durable row vanish with the store that wrote it. The map is keyed by
+/// segment id and key, so segments cannot collide. It drops with the provider.
+#[derive(Clone, Debug, Default)]
 pub struct MemoryTimerDeferStoreProvider {
+    segments: MemorySegmentStore,
+    inner: Arc<Inner>,
     timer_spans: SpanRelation,
 }
 
 impl MemoryTimerDeferStoreProvider {
-    /// Creates a new provider.
+    /// Creates a provider that registers its segments in `segments` and links
+    /// reload spans through `timer_spans`.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(segments: MemorySegmentStore, timer_spans: SpanRelation) -> Self {
+        Self {
+            segments,
+            inner: Arc::new(Inner::default()),
+            timer_spans,
+        }
     }
 
-    /// Creates a provider with a specific span linking strategy.
-    #[must_use]
-    pub fn with_linking(timer_spans: SpanRelation) -> Self {
-        Self { timer_spans }
+    /// Keys with a non-empty deferred queue in one segment. A snapshot; it
+    /// drops with the caller's stream.
+    pub(crate) async fn keys(&self, segment: SegmentId) -> Vec<Key> {
+        let mut out = Vec::new();
+        self.inner
+            .deferred
+            .iter_async(|(id, key), (timers, _)| {
+                if *id == segment && !timers.is_empty() {
+                    out.push(Arc::clone(key));
+                }
+                true
+            })
+            .await;
+        out
     }
 }
 
@@ -253,13 +306,19 @@ impl TimerDeferStoreProvider for MemoryTimerDeferStoreProvider {
 
     fn create_store(
         &self,
-        _topic: Topic,
-        _partition: Partition,
-        _consumer_group: &str,
+        topic: Topic,
+        partition: Partition,
+        consumer_group: &str,
         _cache_size: usize,
     ) -> Self::Store {
         MemoryTimerDeferStore {
-            inner: Arc::new(Inner::default()),
+            segment: LazySegment::new(
+                self.segments.clone(),
+                topic,
+                partition,
+                Arc::from(consumer_group),
+            ),
+            inner: Arc::clone(&self.inner),
             timer_spans: self.timer_spans,
         }
     }

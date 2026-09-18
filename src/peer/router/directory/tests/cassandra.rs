@@ -2,11 +2,13 @@ use super::suite::{
     DirectoryTrace, STABLE_LEASE, expected_answers, first_divergence, run_directory_trace,
     run_idempotent_deregister_case, run_long_label_case,
 };
-use super::support::{cassandra_directory, finish, registration, store};
+use super::support::{cassandra_directory, finish, registration};
 use crate::cassandra::{MAX_CASSANDRA_TTL_SECS, TABLE_PEER_DIRECTORY};
 use crate::peer::router::PeerId;
 use crate::peer::router::directory::{PeerDirectory, RegistrationTtl};
-use crate::test_util::{TEST_KEYSPACE, TEST_RUNTIME, integration_test_count};
+use crate::test_util::{
+    TEST_KEYSPACE, TEST_RUNTIME, integration_test_count, shared_cassandra_store,
+};
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
@@ -64,7 +66,7 @@ fn registration_cells_carry_a_ttl_and_expire() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let directory = cassandra_directory(RegistrationTtl::MIN).await?;
-        let session = store().await?.session();
+        let session = shared_cassandra_store().await?.session();
         let peer = PeerId::new();
         let written = registration(peer);
         directory.register(&written).await?;
@@ -117,7 +119,7 @@ fn unusable_row_reads_as_absent() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let directory = cassandra_directory(STABLE_LEASE).await?;
-        let store = store().await?;
+        let store = shared_cassandra_store().await?;
         let query = format!(
             "INSERT INTO {TEST_KEYSPACE}.{TABLE_PEER_DIRECTORY} (peer_id, direct_socket_address, \
              advertised_connect, hostname) VALUES (?, ?, ?, ?) USING TTL 300"

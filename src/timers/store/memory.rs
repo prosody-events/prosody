@@ -595,6 +595,20 @@ impl InMemoryTriggerStoreProvider {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// The segment row a store minted for `id` wrote, or `None` when no store
+    /// inserted one. Reads the shared substrate without minting a store.
+    pub(crate) async fn segment(&self, id: SegmentId) -> Option<Segment> {
+        self.inner.segments.get_async(&id).await.map(|entry| {
+            let (name, slab_size, version) = entry.get();
+            Segment {
+                id,
+                name: name.clone(),
+                slab_size: *slab_size,
+                version: *version,
+            }
+        })
+    }
 }
 
 impl TriggerStoreProvider for InMemoryTriggerStoreProvider {

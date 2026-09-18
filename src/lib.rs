@@ -51,6 +51,7 @@ pub mod error;
 pub mod heartbeat;
 pub mod high_level;
 pub mod loader;
+pub mod maintenance;
 pub mod otel;
 pub mod peer;
 pub mod prelude;

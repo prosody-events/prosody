@@ -3,12 +3,9 @@
 use super::Segment;
 use crate::SegmentId;
 use crate::error::ClassifyError;
+use std::convert::Infallible;
 use std::error::Error;
 use std::future::Future;
-
-#[cfg(test)]
-use std::convert::Infallible;
-#[cfg(test)]
 use std::sync::Arc;
 
 /// Storage backend for segment metadata (topic, partition, consumer group).
@@ -32,23 +29,42 @@ pub trait SegmentStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send;
 }
 
-/// In-memory segment store for testing.
-#[cfg(test)]
+/// Memory mode's registry of deferred segments, the twin of the Cassandra
+/// `deferred_segments` table.
+///
+/// One registry serves both memory defer providers, as one
+/// [`CassandraSegmentStore`](super::CassandraSegmentStore) serves both
+/// Cassandra providers. Cloning shares the map.
 #[derive(Clone, Debug, Default)]
 pub struct MemorySegmentStore {
     segments: Arc<scc::HashMap<SegmentId, Segment, ahash::RandomState>>,
 }
 
-#[cfg(test)]
 impl MemorySegmentStore {
-    /// Creates an empty store.
+    /// Creates an empty registry.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Every segment registered so far. A snapshot.
+    ///
+    /// The map has no removal path because `deferred_segments` has none
+    /// either: a segment that ever deferred stays in the registry. It is
+    /// bounded by the number of partitions the providers served, and it drops
+    /// with the registry.
+    pub(crate) async fn segments(&self) -> Vec<Segment> {
+        let mut out = Vec::new();
+        self.segments
+            .iter_async(|_, segment| {
+                out.push(segment.clone());
+                true
+            })
+            .await;
+        out
+    }
 }
 
-#[cfg(test)]
 impl SegmentStore for MemorySegmentStore {
     type Error = Infallible;
 

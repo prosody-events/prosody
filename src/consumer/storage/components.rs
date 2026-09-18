@@ -12,7 +12,7 @@ use crate::consumer::middleware::defer::message::store::cassandra::MessageQuerie
 use crate::consumer::middleware::defer::message::store::{
     CassandraMessageDeferStoreProvider, MemoryMessageDeferStoreProvider,
 };
-use crate::consumer::middleware::defer::segment::CassandraSegmentStore;
+use crate::consumer::middleware::defer::segment::{CassandraSegmentStore, MemorySegmentStore};
 use crate::consumer::middleware::defer::timer::store::TimerDeferStoreProvider;
 use crate::consumer::middleware::defer::timer::store::cassandra::queries::Queries as TimerQueries;
 use crate::consumer::middleware::defer::timer::store::{
@@ -112,10 +112,13 @@ where
         loader.clone(),
         publisher,
     );
+    // One registry serves both memory defer providers, as the Cassandra arm
+    // passes one `CassandraSegmentStore` to both of its providers.
+    let segments = MemorySegmentStore::new();
     Ok(ConsumerComponents {
         trigger: InMemoryTriggerStoreProvider::new(),
-        messages: MemoryMessageDeferStoreProvider::new(),
-        timers: MemoryTimerDeferStoreProvider::with_linking(inputs.timer_spans),
+        messages: MemoryMessageDeferStoreProvider::new(segments.clone()),
+        timers: MemoryTimerDeferStoreProvider::new(segments, inputs.timer_spans),
         dedup,
         state,
         loader,

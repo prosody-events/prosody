@@ -34,8 +34,8 @@ pub use cassandra::CassandraSegmentStore;
 pub use lazy::LazySegment;
 pub use store::SegmentStore;
 
-// Re-export MemorySegmentStore for testing only
-#[cfg(test)]
+// `MemorySegmentStore` is memory mode's registry of deferred segments, so the
+// memory defer providers and the maintenance catalog share one.
 pub use store::MemorySegmentStore;
 
 /// Segment metadata: ID plus source context (topic, partition, consumer group).

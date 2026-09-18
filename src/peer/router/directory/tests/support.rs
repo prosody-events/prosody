@@ -5,13 +5,12 @@
 //! `prosody_test` keyspace and no test creates a keyspace of its own.
 
 use super::suite::SUITE_CAPACITY;
-use crate::cassandra::CassandraStore;
 use crate::peer::router::directory::cassandra::CassandraPeerDirectory;
 use crate::peer::router::directory::{
     DirectAddress, Endpoint, NetworkId, PeerDirectory, PeerRegistration, RegistrationTtl,
 };
 use crate::peer::router::{Host, PeerId};
-use crate::test_util::test_cassandra_config;
+use crate::test_util::shared_cassandra_store;
 use color_eyre::Result;
 use parking_lot::Mutex;
 use quickcheck::{Arbitrary, Gen, TestResult};
@@ -21,17 +20,12 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::OnceCell;
 
 /// Characters a generated host, hostname or label is built from.
 const LABEL_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789.:-";
 
 /// Longest generated label. Dedicated tests cover longer values.
 const MAX_LABEL: usize = 64;
-
-/// One store per test process. `CassandraStore::new` runs the migrator, so a
-/// store per property iteration would spend the run on schema checks.
-static STORE: OnceCell<CassandraStore> = OnceCell::const_new();
 
 /// A bounded in-process directory for tests that do not need Cassandra.
 #[derive(Clone)]
@@ -120,18 +114,10 @@ impl Arbitrary for ArbRegistration {
     }
 }
 
-/// The shared store, built once for the whole test process.
-pub(crate) async fn store() -> Result<&'static CassandraStore> {
-    STORE
-        .get_or_try_init(|| async { CassandraStore::new(&test_cassandra_config()).await })
-        .await
-        .map_err(Into::into)
-}
-
 /// A directory over the shared store, publishing `lease`.
 pub(crate) async fn cassandra_directory(lease: Duration) -> Result<CassandraPeerDirectory> {
     let ttl = RegistrationTtl::try_from(lease)?;
-    Ok(CassandraPeerDirectory::new(store().await?.clone(), ttl).await?)
+    Ok(CassandraPeerDirectory::new(shared_cassandra_store().await?.clone(), ttl).await?)
 }
 
 /// An in-process directory holding [`SUITE_CAPACITY`] registrations under

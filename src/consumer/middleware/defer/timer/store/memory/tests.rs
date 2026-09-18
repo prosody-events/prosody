@@ -1,8 +1,13 @@
 use super::*;
-use crate::test_util::{assert_span_relation, captured_spans, sampled_remote_context};
+use crate::test_util::{
+    TEST_RUNTIME, assert_span_relation, captured_spans, sampled_remote_context,
+};
 use color_eyre::Result;
-use color_eyre::eyre::eyre;
+use color_eyre::eyre::{ensure, eyre};
 use opentelemetry::trace::TraceContextExt as _;
+use quickcheck::{QuickCheck, TestResult};
+use std::collections::BTreeSet;
+use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 /// [`StoredTimer::to_trigger`] reconstructs a `"timer_defer.load"` span that
@@ -41,4 +46,62 @@ fn to_trigger_links_reconstructed_span_to_stored_context() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Two stores minted by one provider for one segment share the durable
+/// substrate, and a store minted for another segment never sees those rows.
+/// The twin of the message store's substrate property.
+///
+/// A fresh map per `create_store` would make every durable row vanish with the
+/// store that wrote it. A map keyed by the key alone would merge two
+/// partitions.
+#[test]
+fn prop_provider_shares_one_substrate_per_segment() {
+    fn property(name: String, times: Vec<u32>) -> TestResult {
+        finish(TEST_RUNTIME.block_on(async move {
+            let provider =
+                MemoryTimerDeferStoreProvider::new(MemorySegmentStore::new(), SpanRelation::Child);
+            let topic = Topic::from("substrate");
+            let writer = provider.create_store(topic, 0, "group", 0);
+            let reader = provider.create_store(topic, 0, "group", 0);
+            let other = provider.create_store(topic, 1, "group", 0);
+
+            let key: Key = Arc::from(format!("substrate-{name}"));
+            // The queue always holds a head, so the read below is a real claim.
+            let mut queue: BTreeSet<CompactDateTime> =
+                times.into_iter().map(CompactDateTime::from).collect();
+            queue.insert(CompactDateTime::from(0_u32));
+
+            let mut queued = queue.iter().copied();
+            let first = queued.next().ok_or_else(|| eyre!("queue is empty"))?;
+            let trigger =
+                |time| Trigger::new(key.clone(), time, TimerType::Application, Span::none());
+            writer.defer_first_timer(&trigger(first)).await?;
+            for time in queued {
+                writer.defer_additional_timer(&trigger(time)).await?;
+            }
+
+            let head = reader.get_next_deferred_timer(&key).await?;
+            ensure!(
+                head.map(|(trigger, count)| (trigger.time, count)) == Some((first, 0)),
+                "a second store on the same segment must read the writer's queue"
+            );
+            ensure!(
+                other.get_next_deferred_timer(&key).await?.is_none(),
+                "a store on another segment must not read the writer's queue"
+            );
+            Ok(())
+        }))
+    }
+
+    QuickCheck::new().quickcheck(property as fn(String, Vec<u32>) -> TestResult);
+}
+
+/// A store or setup failure is a broken environment, never a shrinkable
+/// property failure.
+fn finish(result: Result<()>) -> TestResult {
+    match result {
+        Ok(()) => TestResult::passed(),
+        Err(error) => TestResult::error(format!("{error:?}")),
+    }
 }

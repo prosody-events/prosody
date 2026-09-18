@@ -20,6 +20,7 @@
 //! implement the same trait to provide durability.
 
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::segment::{timer_segment_id, timer_segment_name};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
@@ -196,9 +197,9 @@ impl Segment {
         partition: Partition,
         slab_size: CompactDuration,
     ) -> Self {
-        let name = format!("{group_id}:{topic}/{partition}");
+        let name = timer_segment_name(group_id, topic, partition);
         Self {
-            id: Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()),
+            id: timer_segment_id(&name),
             name,
             slab_size,
             version: SegmentVersion::V4,
