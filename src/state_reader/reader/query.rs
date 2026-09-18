@@ -70,6 +70,12 @@ where
         self
     }
 
+    /// Sets both edges to select keys with the encoded prefix.
+    pub fn prefix(mut self, key: &BorrowedKeyOf<L::Cell>) -> Self {
+        self.query.prefix(<L::Cell as CellType>::Key::encode(key));
+        self
+    }
+
     /// Sets the maximum number of present items that the stream yields.
     pub fn limit(mut self, limit: NonZeroUsize) -> Self {
         self.query.limit = Some(limit);

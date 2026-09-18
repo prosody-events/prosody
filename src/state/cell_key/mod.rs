@@ -81,6 +81,17 @@ impl Coordinate {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    /// Returns the least coordinate above all coordinates with this prefix.
+    /// Returns `None` when no upper edge exists.
+    /// Drops each trailing `0xFF` byte and increments the last remaining byte.
+    /// Prefix queries use this coordinate as their excluded upper edge.
+    pub(crate) fn prefix_end(&self) -> Option<Coordinate> {
+        let last = self.0.iter().rposition(|&byte| byte != u8::MAX)?;
+        let mut bytes = self.0[..=last].to_vec();
+        bytes[last] += 1;
+        Some(Self::from_bytes(bytes))
+    }
 }
 
 /// Full intra-collection cell address. `Ord` is `(section, coordinate)`.

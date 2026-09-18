@@ -65,6 +65,13 @@ const DEQUE_NAME: &str = "d";
 /// A small key pool for map traces, so keys collide and re-use.
 const KEYS: &[&str] = &["a", "b", "c"];
 
+/// Picks a pooled key, or the empty prefix, for a scan prefix.
+fn pooled_prefix(index: u8) -> &'static str {
+    KEYS.get(usize::from(index) % (KEYS.len() + 1))
+        .copied()
+        .unwrap_or("")
+}
+
 /// Cap on generated trace length, keeping property runs bounded.
 const MAX_OPS: usize = 30;
 

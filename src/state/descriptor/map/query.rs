@@ -43,6 +43,7 @@ pub type SetQuery<'a, S, KC> = KeysetQuery<'a, S, SetKind<KC>>;
 
 /// A directional map or set query.
 /// Edges follow the query direction. A later call replaces the same edge.
+/// [`Self::prefix`] sets both edges.
 /// A start past the end produces an empty stream.
 #[must_use]
 pub struct KeysetQuery<'a, S, L> {
@@ -81,6 +82,12 @@ where
     /// Stops before `key`.
     pub fn before(mut self, key: &BorrowedKeyOf<L::Cell>) -> Self {
         self.query.end = ScanEdge::Excluded(<L::Cell as CellType>::Key::encode(key));
+        self
+    }
+
+    /// Sets both edges to select keys with the encoded prefix.
+    pub fn prefix(mut self, key: &BorrowedKeyOf<L::Cell>) -> Self {
+        self.query.prefix(<L::Cell as CellType>::Key::encode(key));
         self
     }
 
@@ -152,6 +159,23 @@ impl Query {
             start: ScanEdge::Unbounded,
             end: ScanEdge::Unbounded,
         }
+    }
+
+    /// Sets both edges to select coordinates that start with `low`.
+    /// The range is the same in both directions.
+    /// For fixed-width keys the range is one key.
+    /// A cursor edge set after `prefix` must start with the prefix.
+    /// A cursor outside the prefix replaces that edge and the stream can leave
+    /// the prefix.
+    pub(crate) fn prefix(&mut self, low: Coordinate) {
+        let high = low
+            .prefix_end()
+            .map_or(ScanEdge::Unbounded, ScanEdge::Excluded);
+        let low = ScanEdge::Included(low);
+        (self.start, self.end) = match self.dir {
+            Direction::Forward => (low, high),
+            Direction::Backward => (high, low),
+        };
     }
 
     /// Keeps the ascending stored coordinates within the query bounds, in
