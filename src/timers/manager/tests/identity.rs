@@ -9,15 +9,19 @@ use IdentityOp::{Abort, Clear, Commit, Fire, Schedule, Unschedule};
 use TimerState::{Aborted, Firing, FiringRescheduled, Scheduled};
 use tokio::sync::Semaphore;
 
-type MemoryTimers = TimerManager<TableAdapter<InMemoryTriggerStore>>;
+type MemoryStore = TableAdapter<InMemoryTriggerStore>;
+type MemoryTimers = TimerManager<MemoryStore>;
 
-struct IdentityHarness {
+struct IdentityHarness<S> {
     manager: MemoryTimers,
+    stream: S,
     key: Key,
     times: [CompactDateTime; 2],
     models: [IdentityModel; 2],
     seen: BTreeSet<i32>,
-    delivered: Option<(usize, FiringTimer<TableAdapter<InMemoryTriggerStore>>)>,
+    /// The newest delivery for each coordinate that no dispatch has consumed.
+    inbox: [Option<PendingTimer<MemoryStore>>; 2],
+    delivered: Option<(usize, FiringTimer<MemoryStore>)>,
     permits: Arc<Semaphore>,
 }
 
@@ -71,7 +75,10 @@ impl Arbitrary for IdentityTrace {
     }
 }
 
-impl IdentityHarness {
+impl<S> IdentityHarness<S>
+where
+    S: Stream<Item = PendingTimer<MemoryStore>> + Unpin,
+{
     async fn apply(&mut self, op: IdentityOp) -> Result<()> {
         match op {
             Schedule(index) | Clear(index) => self.schedule(index, op).await?,
@@ -145,27 +152,58 @@ impl IdentityHarness {
     }
 
     async fn fire(&mut self, index: usize) -> Result<()> {
-        let model = &mut self.models[index];
-        let trigger = Trigger::with_tag(
-            self.key.clone(),
-            self.times[index],
-            TimerType::Application,
-            model.tag.unwrap_or(0_i32),
-            Span::current(),
-        );
-        let pending = PendingTimer::new(
-            trigger,
-            self.manager.clone(),
-            self.permits.clone().acquire_owned().await?,
-        );
+        let model = self.models[index];
+        let pending = if model.state == Some(Scheduled) {
+            let tag = model
+                .tag
+                .ok_or_else(|| eyre!("a queued attempt has a tag"))?;
+            self.deliver(index, tag).await?
+        } else {
+            // Nothing is queued. A stale trigger must not start an attempt.
+            let trigger = Trigger::with_tag(
+                self.key.clone(),
+                self.times[index],
+                TimerType::Application,
+                model.tag.unwrap_or(0_i32),
+                Span::current(),
+            );
+            PendingTimer::new(
+                trigger,
+                self.manager.clone(),
+                self.permits.clone().acquire_owned().await?,
+            )
+        };
         let firing = pending.fire().await;
         assert_eq!(firing.is_some(), model.state == Some(Scheduled));
         if let Some(firing) = firing {
             assert_eq!(Some(firing.trigger().tag), model.tag);
-            model.state = Some(Firing);
+            self.models[index].state = Some(Firing);
             self.delivered = Some((index, firing));
         }
         Ok(())
+    }
+
+    /// Waits for the stream to deliver attempt `tag` of coordinate `index`.
+    /// The actor pops the queue entry before this dispatch, as in production.
+    /// Paused time advances to a pending coordinate. A delivery for the other
+    /// coordinate waits in the inbox. An older delivery for the same
+    /// coordinate is a dead attempt, so the inbox drops it.
+    async fn deliver(&mut self, index: usize, tag: i32) -> Result<PendingTimer<MemoryStore>> {
+        loop {
+            if let Some(pending) = self.inbox[index].take_if(|pending| pending.trigger().tag == tag)
+            {
+                return Ok(pending);
+            }
+            let pending = timeout(Duration::from_secs(5), self.stream.next())
+                .await?
+                .ok_or_else(|| eyre!("timer stream ended"))?;
+            let slot = self
+                .times
+                .iter()
+                .position(|&time| time == pending.trigger().time)
+                .ok_or_else(|| eyre!("delivery for an unknown time"))?;
+            self.inbox[slot] = Some(pending);
+        }
     }
 
     async fn finish(&mut self, op: IdentityOp) -> Result<()> {
@@ -296,17 +334,22 @@ async fn run_identity_trace(trace: IdentityTrace) -> Result<()> {
     pin_mut!(stream);
     check_loaded_identity(&manager, &mut stream, &loaded).await?;
 
-    // Both coordinates stay in the slab whose load the first dispatch proved.
+    // Index 0 starts the loaded slab and is due at insert. Index 1 sits two
+    // seconds ahead, because `now()` rounds to the nearest second. Its queue
+    // entry waits until a dispatch advances paused time. The first load
+    // reaches at least sixty seconds ahead, so the actor owns both coordinates.
     let base = Slab::from_time(manager.0.store.slab_size(), loaded.time)
         .range()
         .start;
-    let times = [base, base.add_duration(CompactDuration::new(1))?];
+    let times = [base, loaded.time.add_duration(CompactDuration::new(2))?];
     let mut harness = IdentityHarness {
         manager,
+        stream,
         key,
         times,
         models: [IdentityModel::default(); 2],
         seen: BTreeSet::from([loaded.tag]),
+        inbox: [None, None],
         delivered: None,
         permits: Arc::new(Semaphore::new(2)),
     };
@@ -362,7 +405,7 @@ async fn check_loaded_identity<S>(
     loaded: &Trigger,
 ) -> Result<()>
 where
-    S: Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>> + Unpin,
+    S: Stream<Item = PendingTimer<MemoryStore>> + Unpin,
 {
     let key = &loaded.key;
     let timer_type = loaded.timer_type;
