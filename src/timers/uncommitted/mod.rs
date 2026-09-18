@@ -193,6 +193,12 @@ where
         self.trigger.timer_type
     }
 
+    /// The delivered trigger, for test harnesses that route deliveries.
+    #[cfg(test)]
+    pub(crate) fn trigger(&self) -> &Trigger {
+        &self.trigger
+    }
+
     /// Aborts a queued source when admission stops on shutdown.
     pub(crate) async fn abandon(mut self) {
         self.uncommitted.abort().await;
