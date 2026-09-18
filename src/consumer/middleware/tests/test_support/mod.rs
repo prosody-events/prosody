@@ -172,6 +172,8 @@ pub async fn committed_value(
 
 /// Mock context with timer, shutdown, and state controls.
 mod context;
+/// Fault slots, error categories, and settlement records.
+pub(crate) mod faults;
 pub use context::*;
 mod handlers;
 pub use handlers::*;

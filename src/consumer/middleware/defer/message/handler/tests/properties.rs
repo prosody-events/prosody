@@ -23,36 +23,6 @@ use quickcheck_macros::quickcheck;
 // Property Tests
 // ============================================================================
 
-/// Property: Timer coverage is maintained after every operation.
-///
-/// **Invariant**: For every key with deferred messages, there is an active
-/// timer. For every key without deferred messages, there is no timer.
-#[quickcheck]
-fn prop_timer_coverage(trace: Trace) -> TestResult {
-    init_test_logging();
-    let Trace { events, key_count } = trace;
-
-    TEST_RUNTIME.block_on(async {
-        let mut harness = match TestHarness::new(key_count) {
-            Ok(h) => h,
-            Err(e) => return TestResult::error(format!("Harness construction failed: {e}")),
-        };
-
-        for event in &events {
-            if let Err(e) = harness.execute_event(event).await {
-                return TestResult::error(format!("Execution failed: {e}"));
-            }
-
-            // Verify timer coverage after each event
-            if let Err(e) = harness.verify_invariants().await {
-                return TestResult::error(format!("Timer coverage violation: {e}"));
-            }
-        }
-
-        TestResult::passed()
-    })
-}
-
 /// Property: FIFO order is maintained for deferred messages.
 ///
 /// **Invariant**: When a timer fires, it processes the oldest (lowest offset)

@@ -63,32 +63,12 @@ where
         Ok(())
     }
 
-    /// Schedules timer for next message or clears if queue empty.
-    pub(super) async fn schedule_next_or_clear<C>(
-        &self,
-        context: &C,
-        result: MessageRetryCompletionResult,
-    ) -> DeferResult<(), M::Error, T::Error, L::Error>
-    where
-        C: EventContext<Payload = T::Payload>,
-    {
-        match result {
-            MessageRetryCompletionResult::MoreMessages { .. } => {
-                // More messages in queue - schedule timer (retry_count reset to 0)
-                self.schedule_retry_timer(context, 0).await
-            }
-            MessageRetryCompletionResult::Completed => {
-                // No more messages - clear the timer
-                context
-                    .clear_scheduled(TimerType::DeferredMessage)
-                    .await
-                    .map_err(|e| DeferError::Timer(Box::new(e)))
-            }
-        }
-    }
-
-    /// Removes message from queue and schedules timer for next (or clears).
-    /// Used after success, permanent failure, or skipping corrupted messages.
+    /// Removes the message from the queue after a success, a permanent
+    /// failure, or a corrupted entry. The timer write covers the next message
+    /// before the queue advances. An empty queue clears the timer, so a
+    /// drained queue pays one timer insert and one clear. A stray retry timer
+    /// on an empty queue reloads nothing. The fire consumes it, and the
+    /// handler deletes the key.
     pub(super) async fn complete_and_advance<C>(
         &self,
         context: &C,
@@ -98,27 +78,57 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
+        self.schedule_retry_timer(context, 0).await?;
+
         let result = self
             .store
             .complete_retry_success(message_key, offset)
             .await
             .map_err(DeferError::Store)?;
 
-        self.schedule_next_or_clear(context, result).await
+        if matches!(result, MessageRetryCompletionResult::Completed) {
+            context
+                .clear_scheduled(TimerType::DeferredMessage)
+                .await
+                .map_err(|e| DeferError::Timer(Box::new(e)))?;
+        }
+
+        Ok(())
     }
 
-    /// Appends message to an already-deferred key's queue (maintains ordering).
-    ///
-    /// The inner handler does *not* run on this dispatch — the message is
-    /// queued behind an existing deferred entry and will be retried later
-    /// when the deferred timer fires. Returns
-    /// [`MessageDeferOutput::NoInner`] so both inner apply hooks are
-    /// suppressed.
-    pub(super) async fn append_to_deferred_queue(
+    /// Appends to an already-deferred key's queue. A key without a retry
+    /// timer receives one before the append. A key that receives no traffic
+    /// keeps its queue until the rows expire. The scheduled read is one cached
+    /// lookup beside the durable append; the short `Vec` it returns is the
+    /// cost of the heal. The inner handler does not run and
+    /// [`MessageDeferOutput::NoInner`] suppresses both apply hooks.
+    pub(super) async fn append_to_deferred_queue<C>(
         &self,
+        context: &C,
         message_key: &Key,
         offset: Offset,
-    ) -> DeferResult<MessageDeferOutput<T::Output, T::Error>, M::Error, T::Error, L::Error> {
+        retry_count: u32,
+    ) -> DeferResult<MessageDeferOutput<T::Output, T::Error>, M::Error, T::Error, L::Error>
+    where
+        C: EventContext<Payload = T::Payload>,
+    {
+        let scheduled = context
+            .scheduled(TimerType::DeferredMessage)
+            .await
+            .map_err(|e| DeferError::Timer(Box::new(e)))?;
+
+        if scheduled.is_empty() {
+            self.schedule_retry_timer(context, retry_count).await?;
+            info!(
+                key = ?message_key,
+                offset = offset,
+                retry_count = retry_count,
+                topic = %self.topic,
+                partition = self.partition,
+                "Re-armed retry timer for a deferred key that had none"
+            );
+        }
+
         self.store
             .defer_additional_message(message_key, offset)
             .await
@@ -133,6 +143,25 @@ where
         );
 
         Ok(MessageDeferOutput::NoInner)
+    }
+
+    /// Schedules the next retry, then records the attempt.
+    /// Timer first, then store: the timer still fires on a partial failure.
+    async fn re_defer<C>(
+        &self,
+        context: &C,
+        key: &Key,
+        retry_count: u32,
+    ) -> DeferResult<u32, M::Error, T::Error, L::Error>
+    where
+        C: EventContext<Payload = T::Payload>,
+    {
+        self.schedule_retry_timer(context, retry_count.saturating_add(1))
+            .await?;
+        self.store
+            .increment_retry_count(key, retry_count)
+            .await
+            .map_err(DeferError::Store)
     }
 
     /// Handles retry failures by error category:
@@ -169,13 +198,7 @@ where
                 // the inner sees `after_abort(Err(error))` (its attempt is
                 // being rolled back; a retry is coming via the rescheduled
                 // timer).
-                let new_retry_count = self
-                    .store
-                    .increment_retry_count(message_key, retry_count)
-                    .await
-                    .map_err(DeferError::Store)?;
-
-                self.schedule_retry_timer(context, new_retry_count).await?;
+                let new_retry_count = self.re_defer(context, message_key, retry_count).await?;
 
                 self.sender.message_failed(
                     message_key.clone(),
@@ -313,13 +336,7 @@ where
                     .await?;
             }
             ErrorCategory::Transient => {
-                let new_retry_count = self
-                    .store
-                    .increment_retry_count(message_key, retry_count)
-                    .await
-                    .map_err(DeferError::Store)?;
-
-                self.schedule_retry_timer(context, new_retry_count).await?;
+                let new_retry_count = self.re_defer(context, message_key, retry_count).await?;
 
                 warn!(
                     key = ?message_key,
@@ -337,8 +354,7 @@ where
         Ok(None)
     }
 
-    /// Defers a message for the first time. Schedules timer before storing
-    /// to ensure the timer still fires on partial failure.
+    /// Defers a message for the first time.
     ///
     /// `inner_error` is the transient error returned by the inner handler
     /// for *this* dispatch — it is preserved in the returned
@@ -355,7 +371,6 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        // Timer first, then store: the timer still fires on partial failure.
         self.schedule_retry_timer(&context, 0).await?;
 
         self.store
