@@ -53,13 +53,13 @@ use crate::subsystem::SubsystemName;
 use crate::test_util::{
     TEST_KEYSPACE, TEST_RUNTIME, integration_test_count, test_cassandra_config,
 };
-use crate::tracing::init_test_logging;
 use color_eyre::eyre::{Result, ensure, eyre};
 use internment::Intern;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult, Testable};
 use serde_json::Value;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::thread;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
@@ -70,6 +70,9 @@ const VALUE_NAME: &str = "reader-value";
 const MAP_NAME: &str = "reader-map";
 const SET_NAME: &str = "reader-set";
 const DEQUE_NAME: &str = "reader-deque";
+
+/// Independent traces use distinct namespaces and share a bounded worker pool.
+const PROPERTY_WORKERS: u64 = 8;
 
 /// Cases share one connection pool. Unique group ids isolate their rows.
 static BACKEND: OnceCell<CassandraReaderBackend> = OnceCell::const_new();
@@ -274,11 +277,17 @@ macro_rules! cassandra_reader_prop {
                     Box::pin($runner(backend, $descriptor_ctor($name), &case, trace)).await
                 })
             }
-            init_test_logging();
-            QuickCheck::new()
-                // Each trace performs sequential writes and reads against live Cassandra.
-                .tests(integration_test_count(3))
-                .quickcheck(ReaderProperty(property));
+            let cases = integration_test_count(25);
+            thread::scope(|scope| {
+                for worker in 0..cases.min(PROPERTY_WORKERS) {
+                    let count = (cases - worker).div_ceil(PROPERTY_WORKERS);
+                    scope.spawn(move || {
+                        QuickCheck::new()
+                            .tests(count)
+                            .quickcheck(ReaderProperty(property));
+                    });
+                }
+            });
         }
     };
 }
@@ -331,7 +340,6 @@ cassandra_reader_prop!(
 /// `b.id.cmp(&a.id)`. The higher group then tests, and the assert goes red.
 #[test]
 fn reader_two_group_lowest_wins() -> Result<()> {
-    init_test_logging();
     TEST_RUNTIME.block_on(async {
         let backend = cassandra_backend().await?;
         let descriptor = value_state::<JsonCodec>(VALUE_NAME);
@@ -391,7 +399,6 @@ fn reader_two_group_lowest_wins() -> Result<()> {
 /// its front element and the assert goes red.
 #[test]
 fn reader_deque_scan_committed() -> Result<()> {
-    init_test_logging();
     TEST_RUNTIME.block_on(async {
         let backend = cassandra_backend().await?;
         let descriptor = deque_state::<JsonCodec>(DEQUE_NAME);

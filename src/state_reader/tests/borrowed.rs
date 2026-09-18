@@ -20,9 +20,18 @@ use futures::{TryStreamExt, executor::block_on};
 use quickcheck::QuickCheck;
 use serde_json::Value;
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::iter::from_fn;
 use std::sync::Arc;
+
+const MAX_KEYS: usize = 2 * CELL_BATCH.get() + 1;
+const BATCH_LENGTHS: [usize; 5] = [
+    0,
+    CELL_BATCH.get() - 1,
+    CELL_BATCH.get(),
+    CELL_BATCH.get() + 1,
+    MAX_KEYS,
+];
 
 /// Supplies keys without a length estimate.
 fn unknown(keys: &[String]) -> impl Iterator<Item = &str> {
@@ -32,12 +41,19 @@ fn unknown(keys: &[String]) -> impl Iterator<Item = &str> {
 
 #[test]
 fn prop_borrowed_utf8_keys_address_maps_and_sets() {
-    fn property(mut operations: Vec<(String, bool)>, queries: Vec<String>) -> Result<()> {
-        operations.truncate(2 * CELL_BATCH.get() + 1);
-        let mut keys: Vec<String> = operations.iter().map(|(key, _)| key.clone()).collect();
-        keys.extend(queries.into_iter().take(CELL_BATCH.get() + 1));
-        // Repeat positions across storage batches, including absent keys.
-        keys.extend_from_within(..);
+    fn property(mut keys: Vec<String>, steps: Vec<(u8, bool)>) -> Result<()> {
+        keys.truncate(8);
+        keys.push(String::new());
+        let operations: Vec<_> = steps
+            .into_iter()
+            .take(MAX_KEYS)
+            .map(|(index, present)| (keys[usize::from(index) % keys.len()].clone(), present))
+            .collect();
+        let mut absent = keys.iter().max().cloned().unwrap_or_default();
+        absent.push('\0');
+        keys.push(absent);
+        // Reuse keys to test overwrites, removals, and duplicate batch positions.
+        let keys: Vec<_> = keys.iter().cycle().take(MAX_KEYS).cloned().collect();
         block_on(async {
             for limit in [0, 128] {
                 check(&operations, &keys, limit).await?;
@@ -45,7 +61,7 @@ fn prop_borrowed_utf8_keys_address_maps_and_sets() {
             Ok(())
         })
     }
-    QuickCheck::new().quickcheck(property as fn(Vec<(String, bool)>, Vec<String>) -> Result<()>);
+    QuickCheck::new().quickcheck(property as fn(Vec<String>, Vec<(u8, bool)>) -> Result<()>);
 }
 
 async fn check(operations: &[(String, bool)], keys: &[String], limit: usize) -> Result<()> {
@@ -125,15 +141,33 @@ async fn check_map<S: WritableStateSession>(
             handle.remove(key.as_str()).await?;
         }
         assert_eq!(handle.contains_key(key.as_str()).await?, *present);
+        assert_eq!(
+            handle.get(key.as_str()).await?,
+            present.then(|| Value::from(position))
+        );
     }
-    for key in keys {
+    for key in keys.iter().collect::<BTreeSet<_>>() {
         assert_eq!(
             handle.get(&Cow::Borrowed(key.as_str())).await?,
             model.get(key).cloned()
         );
     }
-    assert_eq!(handle.get_many(keys).await?, values);
-    assert_eq!(handle.get_many(unknown(keys)).await?, values);
+    for len in BATCH_LENGTHS {
+        assert_eq!(handle.get_many(&keys[..len]).await?, values[..len]);
+        assert_eq!(handle.get_many(unknown(&keys[..len])).await?, values[..len]);
+    }
+    let split = keys.len() / 2;
+    assert_eq!(
+        handle
+            .get_many(
+                keys[..split]
+                    .iter()
+                    .map(String::as_str)
+                    .chain(unknown(&keys[split..]))
+            )
+            .await?,
+        values
+    );
     let filtered = keys.iter().filter(|key| key.len().is_multiple_of(2));
     let expected: Vec<_> = filtered
         .clone()
@@ -196,8 +230,13 @@ async fn check_set<S: WritableStateSession>(
         }
         assert_eq!(handle.contains(key.as_str()).await?, *present);
     }
-    assert_eq!(handle.contains_many(keys).await?, presence);
-    assert_eq!(handle.contains_many(unknown(keys)).await?, presence);
+    for len in BATCH_LENGTHS {
+        assert_eq!(handle.contains_many(&keys[..len]).await?, presence[..len]);
+        assert_eq!(
+            handle.contains_many(unknown(&keys[..len])).await?,
+            presence[..len]
+        );
+    }
     assert_eq!(
         handle
             .keys(Direction::Forward)
@@ -218,7 +257,7 @@ async fn check_readers(
     let values: Vec<_> = keys.iter().map(|key| model.get(key).cloned()).collect();
     let presence: Vec<_> = values.iter().map(Option::is_some).collect();
     let members: Vec<_> = model.keys().cloned().collect();
-    for member in keys {
+    for member in keys.iter().collect::<BTreeSet<_>>() {
         assert_eq!(
             map.get(key.clone(), member.as_str()).await?,
             model.get(member).cloned()
@@ -232,8 +271,25 @@ async fn check_readers(
             model.contains_key(member)
         );
     }
-    assert_eq!(map.get_many(key.clone(), keys).await?, values);
-    assert_eq!(map.get_many(key.clone(), unknown(keys)).await?, values);
+    for len in BATCH_LENGTHS {
+        assert_eq!(
+            map.get_many(key.clone(), &keys[..len]).await?,
+            values[..len]
+        );
+        assert_eq!(
+            map.get_many(key.clone(), unknown(&keys[..len])).await?,
+            values[..len]
+        );
+        assert_eq!(
+            set.contains_many(key.clone(), &keys[..len]).await?,
+            presence[..len]
+        );
+        assert_eq!(
+            set.contains_many(key.clone(), unknown(&keys[..len]))
+                .await?,
+            presence[..len]
+        );
+    }
     assert_eq!(
         map.contains_many(key.clone(), unknown(keys)).await?,
         presence
@@ -241,10 +297,6 @@ async fn check_readers(
     assert_eq!(
         set.contains_many(key.clone(), keys.iter().map(String::as_str))
             .await?,
-        presence
-    );
-    assert_eq!(
-        set.contains_many(key.clone(), unknown(keys)).await?,
         presence
     );
     for edge in members.first().into_iter().chain(members.last()) {

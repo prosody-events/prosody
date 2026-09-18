@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::state::descriptor::{SetDescriptor, SetHandle};
-use color_eyre::eyre::{WrapErr, ensure};
+use color_eyre::eyre::WrapErr;
 use std::collections::BTreeSet;
 
 type OwnerSetHandle<B> = SetHandle<OwnerSession<<B as ReaderBackend>::OwnerCell>, I64KeyCodec>;
@@ -60,9 +60,12 @@ pub(in crate::state_reader::tests) async fn run_reader_set_trace<B: ReaderBacken
                 MapOp::Get(_) | MapOp::IsEmpty | MapOp::Commit => {}
             }
         }
-        check(backend, descriptor, case, &model)
+        if !check(backend, descriptor, case, &model)
             .await
-            .wrap_err_with(|| format!("event {index}: {ops:?}; trace: {trace:?}"))?;
+            .wrap_err_with(|| format!("event {index}: {ops:?}; trace: {trace:?}"))?
+        {
+            return Ok(false);
+        }
     }
     Ok(true)
 }
@@ -72,52 +75,39 @@ async fn check<B: ReaderBackend>(
     descriptor: SetDescriptor<I64KeyCodec>,
     case: &ReaderCase<'_>,
     model: &BTreeSet<i64>,
-) -> Result<()> {
+) -> Result<bool> {
     let deps = backend.deps();
     let reader = StateReader::new(&deps, case.sub.clone(), descriptor)?;
-    let empty = reader.is_empty(case.key.clone()).await?;
-    ensure!(
-        empty == model.is_empty(),
-        "is_empty returned {empty}; model: {model:?}"
+    let (empty, points, presence, forward, bounded, backward) = join!(
+        reader.is_empty(case.key.clone()),
+        try_join_all(
+            KEY_POOL
+                .iter()
+                .map(|member| reader.contains(case.key.clone(), member))
+        ),
+        reader.contains_many(case.key.clone(), &KEY_POOL),
+        collect_query(reader.keys(case.key.clone(), Direction::Forward)),
+        collect_query(
+            reader
+                .query(case.key.clone(), Direction::Forward)
+                .after(&-2)
+                .to(&1)
+                .limit(NonZeroUsize::MIN)
+                .keys()
+        ),
+        collect_query(reader.keys(case.key.clone(), Direction::Backward)),
     );
-    for member in KEY_POOL {
-        let present = reader.contains(case.key.clone(), &member).await?;
-        ensure!(
-            present == model.contains(&member),
-            "contains({member}) returned {present}; model: {model:?}"
-        );
-    }
-    let expected = KEY_POOL.map(|member| model.contains(&member)).to_vec();
-    let presence = reader.contains_many(case.key.clone(), &KEY_POOL).await?;
-    ensure!(
-        presence == expected,
-        "contains_many returned {presence:?}; expected {expected:?}"
-    );
-    let forward = collect_stream(reader.keys(case.key.clone(), Direction::Forward).await?).await?;
-    ensure!(
-        forward == model.iter().copied().collect::<Vec<_>>(),
-        "forward keys returned {forward:?}; model: {model:?}"
-    );
-    let bounded = collect_stream(
-        reader
-            .query(case.key.clone(), Direction::Forward)
-            .after(&-2)
-            .to(&1)
-            .limit(NonZeroUsize::MIN)
-            .keys()
-            .await?,
-    )
-    .await?;
-    let expected: Vec<_> = model.range(-1..=1).take(1).copied().collect();
-    ensure!(
-        bounded == expected,
-        "bounded keys returned {bounded:?}; expected {expected:?}"
-    );
-    let backward =
-        collect_stream(reader.keys(case.key.clone(), Direction::Backward).await?).await?;
-    ensure!(
-        backward == model.iter().rev().copied().collect::<Vec<_>>(),
-        "backward keys returned {backward:?}; model: {model:?}"
-    );
-    Ok(())
+    let empty = empty?;
+    let points = points?;
+    let presence = presence?;
+    let forward = forward?;
+    let bounded = bounded?;
+    let backward = backward?;
+    let expected = KEY_POOL.map(|member| model.contains(&member));
+    Ok(empty == model.is_empty()
+        && points == expected
+        && presence == expected
+        && forward == model.iter().copied().collect::<Vec<_>>()
+        && bounded == model.range(-1..=1).take(1).copied().collect::<Vec<_>>()
+        && backward == model.iter().rev().copied().collect::<Vec<_>>())
 }

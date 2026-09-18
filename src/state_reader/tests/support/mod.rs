@@ -33,6 +33,7 @@ use color_eyre::eyre::{Result, eyre};
 use futures::{Stream, TryStreamExt};
 use internment::Intern;
 use quanta::{Clock, Mock};
+use std::future::Future;
 use std::sync::Arc;
 
 /// The subsystem every suite routes under.
@@ -76,4 +77,14 @@ pub(super) async fn collect_stream<T>(
     stream: impl Stream<Item = Result<T, StateReaderError>>,
 ) -> Result<Vec<T>> {
     Ok(stream.try_collect().await?)
+}
+
+/// Opens a reader query and collects its fallible stream.
+pub(super) async fn collect_query<T, S>(
+    query: impl Future<Output = Result<S, StateReaderError>>,
+) -> Result<Vec<T>>
+where
+    S: Stream<Item = Result<T, StateReaderError>>,
+{
+    Box::pin(collect_stream(query.await?)).await
 }
