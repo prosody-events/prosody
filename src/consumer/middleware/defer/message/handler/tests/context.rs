@@ -218,9 +218,6 @@ impl EventContext for KeyedCapturingContext {
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        if let Some(error) = self.capture.next_fault.check_timer(TimerOp::Unschedule) {
-            return ready(Err(TimerError(error)));
-        }
         if timer_type == TimerType::DeferredMessage {
             self.capture.record_clear(&self.key, time);
         }

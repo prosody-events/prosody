@@ -1,13 +1,13 @@
 //! Fault traces and source settlement records.
 
 use super::TimerOperation;
-use super::context::KeyedMockContext;
+use super::capture::KeyedMockContext;
 use super::store::StoreOp;
 use super::types::{ApplicationTimerOutcome, DeferredTimerOutcome, TimerTrace, TimerTraceEvent};
 use super::{HandlerOutcome, OutcomeHandler, TestHarness};
 use crate::consumer::EventHandler;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
-use crate::consumer::middleware::tests::RecordingGuard;
+use crate::consumer::middleware::tests::test_support::RecordingTimer;
 pub use crate::consumer::middleware::tests::test_support::faults::Pass;
 use crate::consumer::middleware::tests::test_support::faults::TimerError;
 use crate::consumer::middleware::tests::test_support::faults::{Fault as StoreFault, FaultKind};
@@ -133,14 +133,8 @@ pub(super) async fn execute_faulted(
             },
         };
         harness.inner_handler.set_outcome(outcome);
-        let (guard, committed, _) = RecordingGuard::new();
-        EventHandler::on_timer(
-            &handler,
-            context.clone(),
-            (trigger.clone(), guard),
-            DemandType::Normal,
-        )
-        .await;
+        let (timer, committed, _) = RecordingTimer::new(trigger.clone());
+        EventHandler::on_timer(&handler, context.clone(), timer, DemandType::Normal).await;
         let consumed = phase.take_consumed();
         let head = harness.store.get_next_deferred_timer(context.key()).await?;
         let covered_at_settle = harness.store.is_deferred(context.key()).await?.is_none()
@@ -201,12 +195,17 @@ fn prop_settlement_preserves_coverage(trace: FaultedTrace) -> TestResult {
             verify_passes(&passes)
                 .wrap_err_with(|| format!("Event: {event:?}; fault: {fault:?}"))?;
             if passes.is_empty() {
+                // A skipped event leaves the flag unchanged, because nothing
+                // ran on the key.
                 skipped += 1;
             } else {
                 let index = match event {
                     TimerTraceEvent::ApplicationTimer(e) => e.key_idx,
                     TimerTraceEvent::DeferredTimer(e) => e.key_idx,
                 };
+                // A permanent timer error exempts the key: the settle boundary
+                // commits the rejection, so the queue keeps its head with no
+                // timer.
                 stranded[index] = passes
                     .iter()
                     .any(|pass| pass.consumed == Some(FaultKind::Permanent));

@@ -1,7 +1,7 @@
 //! Store faults for deferred-timer traces.
 
 use super::super::store::TimerDeferStore;
-use super::context::TimerCapture;
+use super::capture::TimerCapture;
 use crate::Key;
 use crate::timers::{Trigger, datetime::CompactDateTime};
 use std::future::Future;

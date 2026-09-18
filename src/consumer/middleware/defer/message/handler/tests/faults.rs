@@ -8,7 +8,7 @@ use crate::consumer::DemandType;
 use crate::consumer::EventHandler;
 use crate::consumer::message::{ConsumerRecord, UncommittedMessage};
 use crate::consumer::middleware::defer::message::store::MessageDeferStore;
-use crate::consumer::middleware::tests::RecordingGuard;
+use crate::consumer::middleware::tests::test_support::RecordingTimer;
 pub use crate::consumer::middleware::tests::test_support::faults::Pass;
 use crate::consumer::middleware::tests::test_support::faults::{Fault as StoreFault, FaultKind};
 use crate::consumer::middleware::tests::test_support::faults::{retry, verify_passes};
@@ -127,8 +127,8 @@ pub(super) async fn execute_faulted(
     let mut passes = Vec::with_capacity(2);
     for _ in 0_u8..2 {
         phase.fire(trigger.as_ref().map(|source| source.time));
-        let (guard, committed, _) = RecordingGuard::new();
         let mut tracker = None;
+        let mut timer_commits = None;
         match event {
             TraceEvent::Message(e) => {
                 let (source, offsets) = message_source(harness, e).await?;
@@ -141,13 +141,9 @@ pub(super) async fn execute_faulted(
                 let trigger = trigger
                     .clone()
                     .ok_or_else(|| eyre!("The timer source is absent"))?;
-                EventHandler::on_timer(
-                    &handler,
-                    context.clone(),
-                    (trigger, guard),
-                    DemandType::Normal,
-                )
-                .await;
+                let (timer, committed, _) = RecordingTimer::new(trigger);
+                EventHandler::on_timer(&handler, context.clone(), timer, DemandType::Normal).await;
+                timer_commits = Some(committed);
             }
         }
         let consumed = phase.take_consumed();
@@ -156,7 +152,7 @@ pub(super) async fn execute_faulted(
             || harness.capture().has_active_timer(&key);
         let committed = match tracker {
             Some(offsets) => offsets.shutdown().await.is_some(),
-            None => committed.load(Ordering::SeqCst) != 0,
+            None => timer_commits.is_some_and(|count| count.load(Ordering::SeqCst) != 0),
         };
         // A committed trigger that the dispatch did not re-arm never fires
         // again.
@@ -234,12 +230,17 @@ fn prop_settlement_preserves_coverage(trace: FaultedTrace) -> TestResult {
             verify_passes(&passes)
                 .wrap_err_with(|| format!("Event: {event:?}; fault: {fault:?}"))?;
             if passes.is_empty() {
+                // A skipped event leaves the flag unchanged, because nothing
+                // ran on the key.
                 skipped += 1;
             } else {
                 let index = match event {
                     TraceEvent::Message(e) => e.key_idx,
                     TraceEvent::Timer(e) => e.key_idx,
                 };
+                // A permanent timer error exempts the key: the settle boundary
+                // commits the rejection, so the queue keeps its head with no
+                // timer.
                 stranded[index] = passes
                     .iter()
                     .any(|pass| pass.consumed == Some(FaultKind::Permanent));

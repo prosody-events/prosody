@@ -480,7 +480,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
                 self.cache.insert(Arc::clone(key), Some(entry));
 
                 debug!(key = ?key, time = %time, next_time = %next_time, "Completed FIFO timer retry");
-                Ok(TimerRetryCompletionResult::MoreTimers { next_time })
+                Ok(TimerRetryCompletionResult::MoreTimers)
             } else {
                 self.delete_key(key).await?;
                 debug!(key = ?key, time = %time, "Completed last timer retry");
@@ -516,7 +516,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
                     retry_count: 0,
                 }),
             );
-            Ok(TimerRetryCompletionResult::MoreTimers { next_time })
+            Ok(TimerRetryCompletionResult::MoreTimers)
         }
     }
 

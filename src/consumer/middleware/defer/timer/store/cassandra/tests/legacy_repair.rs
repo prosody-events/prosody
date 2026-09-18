@@ -93,11 +93,7 @@ async fn test_legacy_complete_retry_at_min() -> color_eyre::Result<()> {
         .await?;
 
     let result = store.complete_retry_success(&k, low).await?;
-    let advanced = matches!(
-        result,
-        TimerRetryCompletionResult::MoreTimers { next_time, .. } if next_time == high
-    );
-    assert!(advanced);
+    assert_eq!(result, TimerRetryCompletionResult::MoreTimers);
 
     assert_next_timer(&store, &k, Some(high)).await?;
     Ok(())
@@ -114,11 +110,7 @@ async fn test_legacy_complete_retry_above_min() -> color_eyre::Result<()> {
         .await?;
 
     let result = store.complete_retry_success(&k, high).await?;
-    let anchored = matches!(
-        result,
-        TimerRetryCompletionResult::MoreTimers { next_time, .. } if next_time == low
-    );
-    assert!(anchored);
+    assert_eq!(result, TimerRetryCompletionResult::MoreTimers);
 
     assert_next_timer(&store, &k, Some(low)).await?;
     Ok(())

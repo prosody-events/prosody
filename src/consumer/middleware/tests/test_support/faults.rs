@@ -1,15 +1,11 @@
 //! Shared fault slots and error categories for middleware tests.
 
-use super::super::RecordingGuard;
-use crate::Key;
 use crate::consumer::middleware::retry::{RetryConfiguration, RetryHandler, RetryMiddleware};
 use crate::consumer::middleware::{
     FallibleCloneProvider, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
-use crate::consumer::{Keyed, Uncommitted};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::{TimerType, Trigger, UncommittedTimer};
 use parking_lot::Mutex;
 use quickcheck::{Arbitrary, Gen};
 use std::sync::Arc;
@@ -191,8 +187,6 @@ pub enum TimerOp {
     ClearScheduled,
     /// Reads the key timers.
     Scheduled,
-    /// Removes one timer.
-    Unschedule,
 }
 
 /// A fault before one dispatch. `Op` is the twin's store operation.
@@ -281,7 +275,9 @@ pub struct Pass {
     pub head: Option<i64>,
 }
 
-/// Checks each settlement and the required redelivery.
+/// Checks each settlement and the required redelivery. A permanent timer error
+/// exempts the key: the settle boundary commits the rejection, so the queue
+/// keeps its head with no timer.
 pub fn verify_passes(passes: &[Pass]) -> color_eyre::Result<()> {
     use color_eyre::eyre::ensure;
     for (index, pass) in passes.iter().enumerate() {
@@ -317,42 +313,4 @@ where
         "test-topic".into(),
         0,
     ))
-}
-
-impl Keyed for (Trigger, RecordingGuard) {
-    type Key = Key;
-
-    fn key(&self) -> &Self::Key {
-        &self.0.key
-    }
-}
-
-impl Uncommitted for (Trigger, RecordingGuard) {
-    async fn commit(self) {
-        self.1.commit().await;
-    }
-
-    async fn abort(self) {
-        self.1.abort().await;
-    }
-}
-
-impl UncommittedTimer for (Trigger, RecordingGuard) {
-    type CommitGuard = RecordingGuard;
-
-    fn time(&self) -> CompactDateTime {
-        self.0.time
-    }
-
-    fn timer_type(&self) -> TimerType {
-        self.0.timer_type
-    }
-
-    fn span(&self) -> tracing::Span {
-        self.0.span()
-    }
-
-    fn into_inner(self) -> (Trigger, Self::CommitGuard) {
-        self
-    }
 }

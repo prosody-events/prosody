@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::span::Id;
 
+mod capture;
 mod context;
 /// A bypassed deferred timer commits its source without state or dedup.
 mod defer_swallow;
@@ -43,7 +44,7 @@ mod replay;
 mod store;
 mod types;
 
-use context::{KeyedMockContext, TimerCapture};
+use capture::{KeyedMockContext, TimerCapture};
 use faults::{Fault, Pass};
 use store::FailableTimerStore;
 use types::TimerTraceEvent;
@@ -55,8 +56,6 @@ enum TimerOperation {
     Schedule(CompactDateTime, TimerType),
     /// Timer was cleared and rescheduled.
     ClearAndSchedule(CompactDateTime, TimerType),
-    /// Timer was unscheduled.
-    Unschedule(CompactDateTime, TimerType),
     /// All timers of a type were cleared.
     ClearScheduled(TimerType),
 }
@@ -167,12 +166,9 @@ impl EventContext for MockContext {
 
     fn unschedule(
         &self,
-        time: CompactDateTime,
-        timer_type: TimerType,
+        _time: CompactDateTime,
+        _timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        self.operations
-            .lock()
-            .push(TimerOperation::Unschedule(time, timer_type));
         ready(Ok(()))
     }
 

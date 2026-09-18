@@ -97,8 +97,10 @@ where
     }
 
     /// Appends to an already-deferred key's queue. A key without a retry
-    /// timer receives one before the append. A key can carry a queue with no
-    /// timer from before this rule. The inner handler does not run;
+    /// timer receives one before the append. A key that receives no traffic
+    /// keeps its queue until the rows expire. The scheduled read is one cached
+    /// lookup beside the durable append; the short `Vec` it returns is the
+    /// cost of the heal. The inner handler does not run and
     /// [`MessageDeferOutput::NoInner`] suppresses both apply hooks.
     pub(super) async fn append_to_deferred_queue<C>(
         &self,
