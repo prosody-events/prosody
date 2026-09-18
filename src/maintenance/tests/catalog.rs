@@ -119,12 +119,21 @@ fn key_scans_cross_a_page_boundary() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let group = fresh_group();
         let fixture = cassandra_fixture().await?;
+        let catalog = fixture.catalog();
+
+        // The seed below spans a page boundary only while both scans fetch
+        // pages of this size. Prove that first, or the rest of the test reads
+        // one page and proves nothing.
+        ensure!(
+            catalog.key_scan_page_sizes() == [CATALOG_PAGE_SIZE; 2],
+            "both key scans must fetch pages of {CATALOG_PAGE_SIZE} rows, got {:?}",
+            catalog.key_scan_page_sizes()
+        );
+
         let expected = fixture
             .seed_keys(&group, usize::try_from(CATALOG_PAGE_SIZE)? + 1)
             .await?;
-
         let id = segment(&group, 0).defer_id();
-        let catalog = fixture.catalog();
         ensure!(
             collect_keys(catalog.message_keys(id)).await? == expected,
             "the message key scan must report every key across the page boundary"

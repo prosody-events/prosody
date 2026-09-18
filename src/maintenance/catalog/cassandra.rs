@@ -100,7 +100,22 @@ impl CassandraCatalog {
         })
     }
 
+    /// The page size each key scan fetches with.
+    ///
+    /// The page boundary test reads it to prove that its seed spans more than
+    /// one page.
+    #[cfg(test)]
+    pub(crate) fn key_scan_page_sizes(&self) -> [i32; 2] {
+        [
+            self.queries.message_keys.get_page_size(),
+            self.queries.timer_keys.get_page_size(),
+        ]
+    }
+
     /// Streams the keys one prepared scan reports for `id`.
+    ///
+    /// Do not swap in `execute_unpaged` here: it puts every key of the segment
+    /// in one response, and a scan has no bound on how many that is.
     fn scan_keys(
         &self,
         statement: &PreparedStatement,
