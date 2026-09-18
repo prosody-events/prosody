@@ -22,9 +22,7 @@ fn prop_cassandra_batch_read_parity() {
     init_test_logging();
     QuickCheck::new()
         .tests(integration_test_count(25))
-        .quickcheck(
-            (|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(BatchReadTrace) -> TestResult,
-        );
+        .quickcheck(ModelProperty(|trace| TEST_RUNTIME.block_on(run(trace))));
 }
 
 /// Within-batch duplicate co-observation and input-order expansion.
@@ -391,9 +389,7 @@ fn prop_cassandra_raw_batch_parity() {
     init_test_logging();
     QuickCheck::new()
         .tests(integration_test_count(25))
-        .quickcheck(
-            (|trace| finish(TEST_RUNTIME.block_on(run(trace)))) as fn(RawBatchTrace) -> TestResult,
-        );
+        .quickcheck(ModelProperty(|trace| TEST_RUNTIME.block_on(run(trace))));
 }
 
 /// Ascending-output test over the live store. The sort requirement is also

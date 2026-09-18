@@ -137,7 +137,7 @@ async fn run_msg_map(ops: Vec<MsgMapOp>) -> Result<bool> {
     }
 
     for name in MAP_KEYS {
-        let resolved = handle.get(&(*name).to_owned()).await?;
+        let resolved = handle.get(name).await?;
         if !matches_model(resolved.as_ref(), model.get(*name).copied()) {
             return Ok(false);
         }

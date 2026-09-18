@@ -46,10 +46,11 @@ use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
 use crate::state::{CollectionKindId, StateAccessError, StoreOutcome};
 use educe::Educe;
 use futures::stream::Stream;
+use std::borrow::Borrow;
 use std::error::Error;
 use std::fmt::Display;
 use thiserror::Error;
-use tracing::instrument;
+use tracing::{Span, field::Empty, instrument};
 
 /// Descriptor for a codec-backed ordered map collection. Generic over an
 /// [`OrderedKeyCodec`] `KC` (the key encoding, frozen into the identity) and a
@@ -85,16 +86,11 @@ pub struct MapHandle<S, KC, V> {
     cells: Collection<S, MapKind<KC, V>>,
 }
 
-// `KC::Key: Display` exists only so the operation spans can record the map
-// key as a joinable attribute (Debug would quote strings); every real key
-// (`String`, `i64`, `u64`) already satisfies it, and no other map machinery
-// needs it.
 #[collection_methods(field = cells, session = S)]
 impl<S, KC, V> MapHandle<S, KC, V>
 where
     S: StateSession,
     KC: OrderedKeyCodec + 'static,
-    KC::Key: Display,
     V: CellType<Key = UnitKey>,
 {
     pub(crate) fn cells(&self) -> &Collection<S, MapKind<KC, V>> {
@@ -116,8 +112,11 @@ where
     #[read(op)]
     pub async fn get(
         &self,
-        key: &KC::Key,
-    ) -> Result<Option<ResolvedOf<V>>, MapStateError<CellCodecError<V>>> {
+        key: &KC::Borrowed,
+    ) -> Result<Option<ResolvedOf<V>>, MapStateError<CellCodecError<V>>>
+    where
+        KC::Borrowed: Display,
+    {
         Ok(op.get(MapKind::<KC, V>::ENTRIES, key).await?)
     }
 
@@ -138,8 +137,11 @@ where
     #[read(op)]
     pub async fn contains_key(
         &self,
-        key: &KC::Key,
-    ) -> Result<bool, MapStateError<CellCodecError<V>>> {
+        key: &KC::Borrowed,
+    ) -> Result<bool, MapStateError<CellCodecError<V>>>
+    where
+        KC::Borrowed: Display,
+    {
         Ok(op.contains(MapKind::<KC, V>::ENTRIES, key).await?)
     }
 
@@ -147,6 +149,8 @@ where
     /// their positions. One scoped operation prevents session mutations
     /// between batch reads. Keys are addressed directly. A key outside the
     /// tracked keyset reads `None`.
+    /// Result buffers reserve the iterator's lower size estimate and grow as
+    /// needed.
     ///
     /// # Errors
     ///
@@ -155,18 +159,28 @@ where
     #[instrument(
         name = "map.get_many",
         skip_all,
-        fields(collection = self.cells.name().as_str(), keys = keys.len() as i64),
+        fields(collection = self.cells.name().as_str(), keys = Empty),
         err
     )]
     #[read(op)]
-    pub async fn get_many(
+    pub async fn get_many<'a, Q, I>(
         &self,
-        keys: &[KC::Key],
-    ) -> Result<Vec<Option<ResolvedOf<V>>>, MapStateError<CellCodecError<V>>> {
-        Ok(op
-            .get_many(MapKind::<KC, V>::ENTRIES, keys)
+        keys: I,
+    ) -> Result<Vec<Option<ResolvedOf<V>>>, MapStateError<CellCodecError<V>>>
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized + 'a,
+        I: IntoIterator<Item = &'a Q>,
+        I::IntoIter: Send,
+    {
+        let values = op
+            .get_many(
+                MapKind::<KC, V>::ENTRIES,
+                keys.into_iter().map(Borrow::borrow),
+            )
             .await?
-            .into_vec())
+            .into_vec();
+        Span::current().record("keys", values.len() as i64);
+        Ok(values)
     }
 
     /// Tests `keys` for presence as one aligned batch. `results[i]` answers
@@ -178,18 +192,28 @@ where
     #[instrument(
         name = "map.contains_many",
         skip_all,
-        fields(collection = self.cells.name().as_str(), keys = keys.len() as i64),
+        fields(collection = self.cells.name().as_str(), keys = Empty),
         err
     )]
     #[read(op)]
-    pub async fn contains_many(
+    pub async fn contains_many<'a, Q, I>(
         &self,
-        keys: &[KC::Key],
-    ) -> Result<Vec<bool>, MapStateError<CellCodecError<V>>> {
-        Ok(op
-            .contains_many(MapKind::<KC, V>::ENTRIES, keys)
+        keys: I,
+    ) -> Result<Vec<bool>, MapStateError<CellCodecError<V>>>
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized + 'a,
+        I: IntoIterator<Item = &'a Q>,
+        I::IntoIter: Send,
+    {
+        let present = op
+            .contains_many(
+                MapKind::<KC, V>::ENTRIES,
+                keys.into_iter().map(Borrow::borrow),
+            )
             .await?
-            .into_vec())
+            .into_vec();
+        Span::current().record("keys", present.len() as i64);
+        Ok(present)
     }
 
     /// Inserts or overwrites `key` and updates the tracked membership.
@@ -207,9 +231,12 @@ where
     #[write(op)]
     pub async fn set(
         &self,
-        key: &KC::Key,
+        key: &KC::Borrowed,
         value: WriteOf<'_, V>,
-    ) -> Result<(), MapStateError<CellCodecError<V>>> {
+    ) -> Result<(), MapStateError<CellCodecError<V>>>
+    where
+        KC::Borrowed: Display,
+    {
         membership::insert(op, key, value).await
     }
 
@@ -227,7 +254,10 @@ where
         err
     )]
     #[write(op)]
-    pub async fn remove(&self, key: &KC::Key) -> Result<(), MapStateError<CellCodecError<V>>> {
+    pub async fn remove(&self, key: &KC::Borrowed) -> Result<(), MapStateError<CellCodecError<V>>>
+    where
+        KC::Borrowed: Display,
+    {
         membership::remove(op, key).await
     }
 

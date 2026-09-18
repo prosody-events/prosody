@@ -101,7 +101,7 @@ async fn erased_kafka_map_set_then_get_matches_typed() -> Result<()> {
             MemoryLoader<Value>,
         >("seen_by_key")))
         .map_err(|e| eyre!("typed map bind: {e}"))?
-        .get(&"k".to_owned())
+        .get("k")
         .await
         .map_err(|e| eyre!("typed map get: {e}"))?
         .ok_or_else(|| eyre!("typed map get resolved nothing"))?;

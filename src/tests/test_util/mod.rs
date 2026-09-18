@@ -13,7 +13,7 @@ use opentelemetry::trace::{
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
 use parking_lot::Mutex;
-use quickcheck::{Arbitrary, Gen};
+use quickcheck::{Arbitrary, Gen, TestResult, Testable};
 use serde_json::{Map, Value};
 use std::env;
 use std::fmt::{Debug, Write as _};
@@ -58,6 +58,31 @@ pub static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
         .build()
         .expect("Failed to create tokio runtime")
 });
+
+/// A quickcheck property over a model comparison.
+///
+/// A model mismatch shrinks. A store error on the first evaluation is a test
+/// error. A store error on a shrink candidate skips that candidate, so the
+/// reported trace always failed the model.
+pub(crate) struct ModelProperty<A>(pub(crate) fn(A) -> Result<bool>);
+
+impl<A: Arbitrary + Debug> Testable for ModelProperty<A> {
+    fn result(&self, generator: &mut Gen) -> TestResult {
+        let mut trace = A::arbitrary(generator);
+        match (self.0)(trace.clone()) {
+            Ok(true) => return TestResult::passed(),
+            Err(error) => return TestResult::error(format!("{error:?}; trace: {trace:?}")),
+            Ok(false) => {}
+        }
+        while let Some(candidate) = trace
+            .shrink()
+            .find(|candidate| matches!((self.0)(candidate.clone()), Ok(false)))
+        {
+            trace = candidate;
+        }
+        TestResult::error(format!("result differs from model; trace: {trace:?}"))
+    }
+}
 
 /// Depth-bounded `serde_json::Value` generator shared by the state-codec
 /// and descriptor round-trip properties.

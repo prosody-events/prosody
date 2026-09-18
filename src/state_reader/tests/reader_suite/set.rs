@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::state::descriptor::{SetDescriptor, SetHandle};
+use color_eyre::eyre::WrapErr;
 use std::collections::BTreeSet;
 
 type OwnerSetHandle<B> = SetHandle<OwnerSession<<B as ReaderBackend>::OwnerCell>, I64KeyCodec>;
@@ -59,44 +60,52 @@ pub(in crate::state_reader::tests) async fn run_reader_set_trace<B: ReaderBacken
                 MapOp::Get(_) | MapOp::IsEmpty | MapOp::Commit => {}
             }
         }
-        let deps = backend.deps();
-        let reader = StateReader::new(&deps, case.sub.clone(), descriptor)?;
-        if reader.is_empty(case.key.clone()).await? != model.is_empty() {
-            return Ok(false);
-        }
-        for member in KEY_POOL {
-            assert_eq!(
-                reader.contains(case.key.clone(), &member).await?,
-                model.contains(&member)
-            );
-        }
-        let expected = KEY_POOL.map(|member| model.contains(&member)).to_vec();
-        if reader.contains_many(case.key.clone(), &KEY_POOL).await? != expected {
-            return Ok(false);
-        }
-        let forward =
-            collect_stream(reader.keys(case.key.clone(), Direction::Forward).await?).await?;
-        if forward != model.iter().copied().collect::<Vec<_>>() {
-            return Ok(false);
-        }
-        assert_eq!(
-            collect_stream(
-                reader
-                    .query(case.key.clone(), Direction::Forward)
-                    .after(&-2)
-                    .to(&1)
-                    .limit(NonZeroUsize::MIN)
-                    .keys()
-                    .await?
-            )
-            .await?,
-            model.range(-1..=1).take(1).copied().collect::<Vec<_>>()
-        );
-        let backward =
-            collect_stream(reader.keys(case.key.clone(), Direction::Backward).await?).await?;
-        if backward != model.iter().rev().copied().collect::<Vec<_>>() {
+        if !check(backend, descriptor, case, &model)
+            .await
+            .wrap_err_with(|| format!("event {index}: {ops:?}; trace: {trace:?}"))?
+        {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+async fn check<B: ReaderBackend>(
+    backend: &B,
+    descriptor: SetDescriptor<I64KeyCodec>,
+    case: &ReaderCase<'_>,
+    model: &BTreeSet<i64>,
+) -> Result<bool> {
+    let deps = backend.deps();
+    let reader = &StateReader::new(&deps, case.sub.clone(), descriptor)?;
+    // The first read warms the publication snapshot. The rest share it.
+    let empty = reader.is_empty(case.key.clone()).await?;
+    let (points, presence, forward, bounded, backward) = join!(
+        all_match(KEY_POOL.iter(), |member| async move {
+            Ok(reader.contains(case.key.clone(), member).await? == model.contains(member))
+        }),
+        reader.contains_many(case.key.clone(), &KEY_POOL),
+        collect_query(reader.keys(case.key.clone(), Direction::Forward)),
+        collect_query(
+            reader
+                .query(case.key.clone(), Direction::Forward)
+                .after(&-2)
+                .to(&1)
+                .limit(NonZeroUsize::MIN)
+                .keys()
+        ),
+        collect_query(reader.keys(case.key.clone(), Direction::Backward)),
+    );
+    let points = points?;
+    let presence = presence?;
+    let forward = forward?;
+    let bounded = bounded?;
+    let backward = backward?;
+    let expected = KEY_POOL.map(|member| model.contains(&member));
+    Ok(empty == model.is_empty()
+        && points
+        && presence == expected
+        && forward == model.iter().copied().collect::<Vec<_>>()
+        && bounded == model.range(-1..=1).take(1).copied().collect::<Vec<_>>()
+        && backward == model.iter().rev().copied().collect::<Vec<_>>())
 }

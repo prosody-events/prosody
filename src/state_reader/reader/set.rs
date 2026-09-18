@@ -9,6 +9,7 @@ use crate::state::descriptor::map::Query;
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state_reader::{ReaderBackend, StateReaderError};
 use futures::Stream;
+use std::borrow::Borrow;
 use std::fmt::Display;
 
 impl<KC, C, B> StateReader<SetDescriptor<KC>, C, B>
@@ -17,7 +18,6 @@ where
     B: ReaderBackend<C>,
     C::Payload: Clone,
     KC: OrderedKeyCodec + 'static,
-    KC::Key: Display + 'static,
 {
     /// Reports whether the committed set contains `member`.
     ///
@@ -27,8 +27,11 @@ where
     pub async fn contains<K: Into<Key>>(
         &self,
         key: K,
-        member: &KC::Key,
-    ) -> Result<bool, StateReaderError> {
+        member: &KC::Borrowed,
+    ) -> Result<bool, StateReaderError>
+    where
+        KC::Borrowed: Display,
+    {
         let handle = self.bound(key.into()).await?;
         handle
             .contains(member)
@@ -41,11 +44,16 @@ where
     /// # Errors
     ///
     /// Returns an error when session acquisition or handle binding fails.
-    pub async fn contains_many<K: Into<Key>>(
+    pub async fn contains_many<'a, K: Into<Key>, Q, I>(
         &self,
         key: K,
-        members: &[KC::Key],
-    ) -> Result<Vec<bool>, StateReaderError> {
+        members: I,
+    ) -> Result<Vec<bool>, StateReaderError>
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized + 'a,
+        I: IntoIterator<Item = &'a Q>,
+        I::IntoIter: Send,
+    {
         let handle = self.bound(key.into()).await?;
         handle
             .contains_many(members)
