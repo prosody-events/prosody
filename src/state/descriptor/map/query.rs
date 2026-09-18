@@ -43,6 +43,7 @@ pub type SetQuery<'a, S, KC> = KeysetQuery<'a, S, SetKind<KC>>;
 
 /// A directional map or set query.
 /// Edges follow the query direction. A later call replaces the same edge.
+/// [`Self::prefix`] sets both edges.
 /// A start past the end produces an empty stream.
 #[must_use]
 pub struct KeysetQuery<'a, S, L> {
@@ -81,6 +82,23 @@ where
     /// Stops before `key`.
     pub fn before(mut self, key: &BorrowedKeyOf<L::Cell>) -> Self {
         self.query.end = ScanEdge::Excluded(<L::Cell as CellType>::Key::encode(key));
+        self
+    }
+
+    /// Keeps only keys whose encoding starts with the encoding of `prefix`.
+    /// The range is the same in both directions.
+    /// It sets both edges, so call it before a cursor edge such as `after`.
+    /// For fixed-width keys the range is one key.
+    pub fn prefix(mut self, prefix: &BorrowedKeyOf<L::Cell>) -> Self {
+        let low = <L::Cell as CellType>::Key::encode(prefix);
+        let high = low
+            .prefix_end()
+            .map_or(ScanEdge::Unbounded, ScanEdge::Excluded);
+        let low = ScanEdge::Included(low);
+        (self.query.start, self.query.end) = match self.query.dir {
+            Direction::Forward => (low, high),
+            Direction::Backward => (high, low),
+        };
         self
     }
 
