@@ -17,8 +17,9 @@ use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use crate::state::{CollectionKindId, StateName, StoreOutcome};
 use educe::Educe;
 use futures::stream::Stream;
+use std::borrow::Borrow;
 use std::fmt::Display;
-use tracing::{Span, info_span, instrument};
+use tracing::{Span, field::Empty, info_span, instrument};
 
 collection_layout! {
     /// The set collection kind has one keyset cell and one cell per member.
@@ -101,7 +102,6 @@ impl<S, KC> SetHandle<S, KC>
 where
     S: StateSession,
     KC: OrderedKeyCodec + 'static,
-    KC::Key: Display,
 {
     pub(crate) fn cells(&self) -> &Collection<S, SetKind<KC>> {
         &self.cells
@@ -114,7 +114,10 @@ where
     /// Returns a codec error or a session access error.
     #[instrument(name = "set.insert", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
     #[write(op)]
-    pub async fn insert(&self, key: &KC::Key) -> Result<(), SetStateError> {
+    pub async fn insert(&self, key: &KC::Borrowed) -> Result<(), SetStateError>
+    where
+        KC::Borrowed: Display,
+    {
         membership::insert(op, key, ()).await
     }
 
@@ -125,7 +128,10 @@ where
     /// Returns a session access error.
     #[instrument(name = "set.remove", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
     #[write(op)]
-    pub async fn remove(&self, key: &KC::Key) -> Result<(), SetStateError> {
+    pub async fn remove(&self, key: &KC::Borrowed) -> Result<(), SetStateError>
+    where
+        KC::Borrowed: Display,
+    {
         membership::remove(op, key).await
     }
 
@@ -136,7 +142,10 @@ where
     /// Returns a session access error.
     #[instrument(name = "set.contains", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
     #[read(op)]
-    pub async fn contains(&self, key: &KC::Key) -> Result<bool, SetStateError> {
+    pub async fn contains(&self, key: &KC::Borrowed) -> Result<bool, SetStateError>
+    where
+        KC::Borrowed: Display,
+    {
         Ok(op.contains(SetKind::<KC>::MEMBERS, key).await?)
     }
 
@@ -145,13 +154,20 @@ where
     /// # Errors
     ///
     /// Returns a session access error.
-    #[instrument(name = "set.contains_many", skip_all, fields(collection = self.cells.name().as_str(), keys = keys.len() as i64), err)]
+    #[instrument(name = "set.contains_many", skip_all, fields(collection = self.cells.name().as_str(), keys = Empty), err)]
     #[read(op)]
-    pub async fn contains_many(&self, keys: &[KC::Key]) -> Result<Vec<bool>, SetStateError> {
-        Ok(op
-            .contains_many(SetKind::<KC>::MEMBERS, keys)
+    pub async fn contains_many<'a, Q, I>(&self, keys: I) -> Result<Vec<bool>, SetStateError>
+    where
+        Q: Borrow<KC::Borrowed> + ?Sized + 'a,
+        I: IntoIterator<Item = &'a Q>,
+        I::IntoIter: Send,
+    {
+        let present = op
+            .contains_many(SetKind::<KC>::MEMBERS, keys.into_iter().map(Borrow::borrow))
             .await?
-            .into_vec())
+            .into_vec();
+        Span::current().record("keys", present.len() as i64);
+        Ok(present)
     }
 
     /// Removes all members.

@@ -22,6 +22,7 @@
 pub(crate) mod acquisition;
 mod admission;
 mod deque;
+mod map;
 mod query;
 mod set;
 pub use deque::DequeReaderQuery;
@@ -32,12 +33,10 @@ use crate::Key;
 use crate::codec::Codec;
 use crate::state::StateName;
 use crate::state::cell_key::Direction;
-use crate::state::descriptor::map::Query;
 use crate::state::descriptor::{
-    CellType, ContextOf, DequeDescriptor, FromSession, MapDescriptor, ResolvedOf, StateDescriptor,
-    ValueDescriptor,
+    CellType, ContextOf, DequeDescriptor, FromSession, ResolvedOf, StateDescriptor, ValueDescriptor,
 };
-use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
+use crate::state::order_codec::UnitKey;
 use crate::state_reader::deps::StateReaderDependencies;
 use crate::state_reader::error::StateReaderError;
 use crate::state_reader::session::{ReadSession, ReaderCollectionDef, ReaderContext};
@@ -46,7 +45,6 @@ use crate::subsystem::SubsystemName;
 use acquisition::{DEFAULT_REFRESH_INTERVAL, PublicationSnapshot};
 use futures::stream::Stream;
 use quanta::Clock;
-use std::fmt::Display;
 use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
@@ -190,161 +188,14 @@ where
     ///
     /// # Errors
     ///
-    /// Any [`StateReaderError`]: acquisition/identity failures, an empty key,
-    /// or a store/decode failure from the bound handle.
+    /// Any [`StateReaderError`]: an acquisition or identity failure, an empty
+    /// key, or a store or decode failure from the bound handle.
     pub async fn get<K: Into<Key>>(
         &self,
         key: K,
     ) -> Result<Option<ResolvedOf<T>>, StateReaderError> {
         let handle = self.bound(key.into()).await?;
         handle.get().await.map_err(|e| StateReaderError::store(&e))
-    }
-}
-
-impl<KC, V, C, B> StateReader<MapDescriptor<KC, V>, C, B>
-where
-    C: Codec,
-    B: ReaderBackend<C>,
-    C::Payload: Clone,
-    KC: OrderedKeyCodec + 'static,
-    KC::Key: Display,
-    V: CellType<Key = UnitKey>,
-    for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
-{
-    /// Reads and resolves the committed value for map entry `map_key` under
-    /// partition `key`.
-    ///
-    /// # Errors
-    ///
-    /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
-    pub async fn get<K: Into<Key>>(
-        &self,
-        key: K,
-        map_key: &KC::Key,
-    ) -> Result<Option<ResolvedOf<V>>, StateReaderError> {
-        let handle = self.bound(key.into()).await?;
-        handle
-            .get(map_key)
-            .await
-            .map_err(|e| StateReaderError::store(&e))
-    }
-
-    /// Reports whether a committed map entry exists without decoding its value.
-    ///
-    /// # Errors
-    ///
-    /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
-    pub async fn contains_key<K: Into<Key>>(
-        &self,
-        key: K,
-        map_key: &KC::Key,
-    ) -> Result<bool, StateReaderError> {
-        let handle = self.bound(key.into()).await?;
-        handle
-            .contains_key(map_key)
-            .await
-            .map_err(|e| StateReaderError::store(&e))
-    }
-
-    /// Reports whether the committed map is empty.
-    ///
-    /// # Errors
-    ///
-    /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
-    pub async fn is_empty<K: Into<Key>>(&self, key: K) -> Result<bool, StateReaderError> {
-        let handle = self.bound(key.into()).await?;
-        handle
-            .is_empty()
-            .await
-            .map_err(|e| StateReaderError::store(&e))
-    }
-
-    /// Reads the committed values for `map_keys` as one aligned batch,
-    /// index-aligned to the input.
-    ///
-    /// # Errors
-    ///
-    /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
-    pub async fn get_many<K: Into<Key>>(
-        &self,
-        key: K,
-        map_keys: &[KC::Key],
-    ) -> Result<Vec<Option<ResolvedOf<V>>>, StateReaderError> {
-        let handle = self.bound(key.into()).await?;
-        handle
-            .get_many(map_keys)
-            .await
-            .map_err(|e| StateReaderError::store(&e))
-    }
-
-    /// Tests committed presence for `map_keys` as one aligned batch. Each
-    /// result answers the same input position.
-    ///
-    /// # Errors
-    ///
-    /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
-    pub async fn contains_many<K: Into<Key>>(
-        &self,
-        key: K,
-        map_keys: &[KC::Key],
-    ) -> Result<Vec<bool>, StateReaderError> {
-        let handle = self.bound(key.into()).await?;
-        handle
-            .contains_many(map_keys)
-            .await
-            .map_err(|e| StateReaderError::store(&e))
-    }
-
-    /// Streams the committed live entries of the map under partition `key` in
-    /// key order (ascending for [`Direction::Forward`]).
-    ///
-    /// The stream owns its session and can outlive the reader's borrow.
-    ///
-    /// # Errors
-    ///
-    /// Any [`StateReaderError`] from acquiring the session (empty key,
-    /// acquisition/identity failures); per-source read failures surface as
-    /// stream items.
-    pub async fn stream<K: Into<Key>>(
-        &self,
-        key: K,
-        dir: Direction,
-    ) -> Result<
-        impl Stream<Item = Result<(KC::Key, ResolvedOf<V>), StateReaderError>> + 'static,
-        StateReaderError,
-    >
-    where
-        V: 'static,
-        ResolvedOf<V>: 'static,
-    {
-        self.query(key, dir).entries().await
-    }
-
-    /// Streams committed live keys without decoding or resolving values.
-    ///
-    /// # Errors
-    ///
-    /// Any [`StateReaderError`] from acquiring the session. Per-source read
-    /// failures surface as stream items.
-    pub async fn keys<K: Into<Key>>(
-        &self,
-        key: K,
-        dir: Direction,
-    ) -> Result<impl Stream<Item = Result<KC::Key, StateReaderError>> + 'static, StateReaderError>
-    where
-        V: 'static,
-        KC::Key: 'static,
-    {
-        self.query(key, dir).keys().await
-    }
-
-    /// Builds a directional stream query for partition `key`.
-    pub fn query<K: Into<Key>>(&self, key: K, dir: Direction) -> MapReaderQuery<'_, KC, V, C, B> {
-        MapReaderQuery {
-            reader: self,
-            key: key.into(),
-            query: Query::new(dir),
-        }
     }
 }
 
@@ -436,9 +287,9 @@ where
     ///
     /// # Errors
     ///
-    /// Any [`StateReaderError`] from acquiring the session (empty key,
-    /// acquisition/identity failures); per-source read failures surface as
-    /// stream items.
+    /// Any [`StateReaderError`] from acquiring the session: an empty key, or
+    /// an acquisition or identity failure. Per-source read failures surface
+    /// as stream items.
     pub async fn stream<K: Into<Key>>(
         &self,
         key: K,

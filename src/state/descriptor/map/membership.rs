@@ -13,7 +13,7 @@ use crate::state::collection::{
     StateSession,
 };
 use crate::state::descriptor::{
-    CellCodecError, CellStateError, CollectionSpec, KeyOf, Keyed, WriteOf,
+    BorrowedKeyOf, CellCodecError, CellStateError, CollectionSpec, Keyed, WriteOf,
 };
 use futures::StreamExt;
 use std::error::Error;
@@ -75,7 +75,7 @@ where
 /// Read the prior keyset before the member write becomes visible.
 pub(crate) async fn insert<C>(
     op: &mut C,
-    key: &KeyOf<MemberOf<C>>,
+    key: &BorrowedKeyOf<MemberOf<C>>,
     value: WriteOf<'_, MemberOf<C>>,
 ) -> Result<(), MapStateError<CellCodecError<MemberOf<C>>>>
 where
@@ -97,7 +97,7 @@ where
 /// Removes the member and updates its keyset in one admitted operation.
 pub(crate) async fn remove<C>(
     op: &mut C,
-    key: &KeyOf<MemberOf<C>>,
+    key: &BorrowedKeyOf<MemberOf<C>>,
 ) -> Result<(), MapStateError<CellCodecError<MemberOf<C>>>>
 where
     C: CollectionWrite,

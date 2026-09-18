@@ -235,8 +235,9 @@ with `?` and convert at the boundary) with enough context to identify the
 failing operation index. Never swallow them into a `false` property
 result.
 
-Exemplar: `finish_trace` in `src/state/descriptor/tests.rs`; the `finish`
-helper + `TestResult::error` in `src/state/cassandra/cell/tests/properties.rs`.
+Exemplars: `finish_trace` in `src/state/descriptor/tests.rs` and
+`ModelProperty` in `src/tests/test_util/mod.rs`. `ModelProperty` skips a
+shrink candidate that errors, so the reported trace always failed the model.
 
 ### Deterministic time: per-iteration runtimes
 

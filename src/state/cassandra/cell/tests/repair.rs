@@ -5,7 +5,9 @@ use crate::state::store::CellRead;
 use crate::state::store::CommittedBatch;
 use crate::state::tests::support::{evidence, seed_commit_evidence};
 
-async fn corrupt_cleared_window(name: &str) -> Result<(Fixture, CassandraStore, CollectionRef)> {
+async fn corrupt_cleared_window(
+    name: &str,
+) -> Result<(&'static Fixture, CassandraStore, CollectionRef)> {
     let fx = fixture().await?;
     let dedup = MemoryDeduplicationStore::default();
     let store = fx.bottom_store();

@@ -7,7 +7,8 @@ use crate::state::cell_key::{Coordinate, Direction, ScanEdge};
 use crate::state::collection::{Collection, StateSession, StreamProjection, sealed};
 use crate::state::descriptor::set::SetKind;
 use crate::state::descriptor::{
-    CellCodecError, CellType, CollectionSpec, ContextOf, FromSession, KeyOf, ResolvedOf,
+    BorrowedKeyOf, CellCodecError, CellType, CollectionSpec, ContextOf, FromSession, KeyOf,
+    ResolvedOf,
 };
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
 use async_stream::try_stream;
@@ -60,25 +61,25 @@ where
     }
 
     /// Starts at `key`.
-    pub fn from(mut self, key: &KeyOf<L::Cell>) -> Self {
+    pub fn from(mut self, key: &BorrowedKeyOf<L::Cell>) -> Self {
         self.query.start = ScanEdge::Included(<L::Cell as CellType>::Key::encode(key));
         self
     }
 
     /// Starts after `key`.
-    pub fn after(mut self, key: &KeyOf<L::Cell>) -> Self {
+    pub fn after(mut self, key: &BorrowedKeyOf<L::Cell>) -> Self {
         self.query.start = ScanEdge::Excluded(<L::Cell as CellType>::Key::encode(key));
         self
     }
 
     /// Stops at `key`.
-    pub fn to(mut self, key: &KeyOf<L::Cell>) -> Self {
+    pub fn to(mut self, key: &BorrowedKeyOf<L::Cell>) -> Self {
         self.query.end = ScanEdge::Included(<L::Cell as CellType>::Key::encode(key));
         self
     }
 
     /// Stops before `key`.
-    pub fn before(mut self, key: &KeyOf<L::Cell>) -> Self {
+    pub fn before(mut self, key: &BorrowedKeyOf<L::Cell>) -> Self {
         self.query.end = ScanEdge::Excluded(<L::Cell as CellType>::Key::encode(key));
         self
     }

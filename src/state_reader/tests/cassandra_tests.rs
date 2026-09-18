@@ -40,7 +40,6 @@ use crate::state::descriptor::{
     DescriptorIdentity, deque_state, map_state, set_state, value_state,
 };
 use crate::state::descriptor_identity::{DescriptorIdentityStore, DurableDescriptorIdentity};
-use crate::state::fjall::test_db;
 use crate::state::order_codec::I64KeyCodec;
 use crate::state::publication::{PublicationStore, StatePublication};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
@@ -52,15 +51,29 @@ use crate::state_reader::deps::StateReaderDependencies;
 use crate::state_reader::{PartitionCount, StateReader};
 use crate::subsystem::SubsystemName;
 use crate::test_util::{
-    TEST_KEYSPACE, TEST_RUNTIME, integration_test_count, test_cassandra_config,
+    ModelProperty, TEST_KEYSPACE, TEST_RUNTIME, integration_test_count, test_cassandra_config,
 };
-use crate::tracing::init_test_logging;
 use color_eyre::eyre::{Result, ensure, eyre};
 use internment::Intern;
-use quickcheck::{QuickCheck, TestResult};
+use quickcheck::QuickCheck;
 use serde_json::Value;
 use std::sync::Arc;
+use std::thread;
+use tokio::sync::OnceCell;
 use uuid::Uuid;
+
+/// Names for the four registered kinds. Each name is distinct, so each kind
+/// registers its own `structural_identity`.
+const VALUE_NAME: &str = "reader-value";
+const MAP_NAME: &str = "reader-map";
+const SET_NAME: &str = "reader-set";
+const DEQUE_NAME: &str = "reader-deque";
+
+/// Independent traces use distinct namespaces and share a bounded worker pool.
+const PROPERTY_WORKERS: u64 = 8;
+
+/// Cases share one connection pool. Unique group ids isolate their rows.
+static BACKEND: OnceCell<CassandraReaderBackend> = OnceCell::const_new();
 
 /// The live-Cassandra [`ReaderBackend`]. It holds one
 /// `CassandraStore`, which bundles a shared session, prepared
@@ -146,14 +159,6 @@ impl ReaderBackend for CassandraReaderBackend {
     }
 }
 
-/// Names for the four registered kinds. Each name is distinct, so each
-/// kind's `structural_identity` differs instead of collapsing onto whichever
-/// kind registered first.
-const VALUE_NAME: &str = "reader-value";
-const MAP_NAME: &str = "reader-map";
-const SET_NAME: &str = "reader-set";
-const DEQUE_NAME: &str = "reader-deque";
-
 /// The reader's fixed topic. Keeping it fixed avoids growing the topic intern
 /// table. Isolation between evaluations comes from the group, subsystem, and
 /// key instead.
@@ -161,10 +166,12 @@ fn reader_topic() -> Topic {
     Intern::<str>::from("reader-topic")
 }
 
-/// Builds the heavy environment: a session, prepared queries, a process
-/// marker check, and a registry carrying the four per-kind definitions, plus
-/// the shared owner cell store and the reader's carriers.
-async fn cassandra_backend() -> Result<CassandraReaderBackend> {
+/// Reuses the connection pool, prepared queries, and collection registry.
+async fn cassandra_backend() -> Result<&'static CassandraReaderBackend> {
+    BACKEND.get_or_try_init(build_backend).await
+}
+
+async fn build_backend() -> Result<CassandraReaderBackend> {
     let conn = CassandraConn::new(&test_cassandra_config()).await?;
     let cell_queries = Arc::new(CellQueries::new(conn.session(), TEST_KEYSPACE).await?);
     let identity_queries = Arc::new(IdentityQueries::new(conn.session(), TEST_KEYSPACE).await?);
@@ -190,7 +197,6 @@ async fn cassandra_backend() -> Result<CassandraReaderBackend> {
     )?;
     let registry = Arc::new(registry);
 
-    let _presence = test_db::marker_checks("state_reader_cassandra_presence")?;
     let store = CassandraCellStore::new(conn.clone(), cell_queries.clone(), registry.clone());
     let cells = CassandraCellResources::new(conn.clone(), cell_queries);
     let publications = CassandraPublicationStore::new(conn.clone(), publication_queries);
@@ -202,17 +208,6 @@ async fn cassandra_backend() -> Result<CassandraReaderBackend> {
         identities,
         registry,
     })
-}
-
-/// Converts a runner `Result<bool>` into a `TestResult` (a store/setup error is
-/// a broken environment, never a shrinkable property failure). Mirrors
-/// `state/cassandra/cell/tests/properties.rs::finish`.
-fn finish(result: Result<bool>) -> TestResult {
-    match result {
-        Ok(true) => TestResult::passed(),
-        Ok(false) => TestResult::failed(),
-        Err(error) => TestResult::error(format!("{error:?}")),
-    }
 }
 
 /// A fresh single-group namespace `(subsystem, group, key)` per evaluation, so
@@ -227,17 +222,14 @@ fn namespace() -> Result<(SubsystemName, String, Key)> {
 }
 
 /// Instantiates a live-Cassandra `prop_cassandra_reader_<kind>` test. Each
-/// evaluation builds a fresh [`cassandra_backend`] and namespace, then runs
-/// `$runner` over an arbitrary `Trace<$op>` for `$descriptor_ctor($name)`,
-/// scaled by `INTEGRATION_TESTS`. The three instantiations below are
-/// identical except for the descriptor constructor, collection name, trace
-/// op, and runner.
+/// evaluation reuses [`cassandra_backend`] and creates an isolated namespace.
+/// `INTEGRATION_TESTS` controls the number of traces.
 macro_rules! cassandra_reader_prop {
     ($test_name:ident, $op:ty, $descriptor_ctor:expr, $name:expr, $runner:ident) => {
         #[test]
         fn $test_name() {
-            fn property(trace: Trace<$op>) -> TestResult {
-                finish(TEST_RUNTIME.block_on(async {
+            fn property(trace: Trace<$op>) -> Result<bool> {
+                TEST_RUNTIME.block_on(async {
                     let backend = cassandra_backend().await?;
                     let (sub, group, key) = namespace()?;
                     let case = ReaderCase {
@@ -247,13 +239,20 @@ macro_rules! cassandra_reader_prop {
                         key: &key,
                         count: PartitionCount::MIN,
                     };
-                    Box::pin($runner(&backend, $descriptor_ctor($name), &case, trace)).await
-                }))
+                    Box::pin($runner(backend, $descriptor_ctor($name), &case, trace)).await
+                })
             }
-            init_test_logging();
-            QuickCheck::new()
-                .tests(integration_test_count(25))
-                .quickcheck(property as fn(Trace<$op>) -> TestResult);
+            let cases = integration_test_count(25);
+            thread::scope(|scope| {
+                for worker in 0..cases.min(PROPERTY_WORKERS) {
+                    let count = (cases - worker).div_ceil(PROPERTY_WORKERS);
+                    scope.spawn(move || {
+                        QuickCheck::new()
+                            .tests(count)
+                            .quickcheck(ModelProperty(property));
+                    });
+                }
+            });
         }
     };
 }
@@ -302,11 +301,10 @@ cassandra_reader_prop!(
 /// values under one fresh subsystem. Because `-00` sorts lexicographically
 /// before `-01`, the reader must observe `-00`'s value.
 ///
-/// The test fails if reverse `ValidatedPublications::new`'s sort to
-/// `b.id.cmp(&a.id)`. The higher group then tests, and the assert goes red.
+/// If `ValidatedPublications::new` sorts by `b.id.cmp(&a.id)`, the higher group
+/// answers and the assert fails.
 #[test]
 fn reader_two_group_lowest_wins() -> Result<()> {
-    init_test_logging();
     TEST_RUNTIME.block_on(async {
         let backend = cassandra_backend().await?;
         let descriptor = value_state::<JsonCodec>(VALUE_NAME);
@@ -361,12 +359,10 @@ fn reader_two_group_lowest_wins() -> Result<()> {
 /// real owner in a single event. The reader then streams it forward and
 /// backward, and both directions must equal the ordered model.
 ///
-/// The test fails if drop the first yield in
-/// `CassandraCellResources::scan_committed`. The forward stream then loses
-/// its front element and the assert goes red.
+/// If `CassandraCellResources::scan_committed` drops its first yield, the
+/// forward stream loses its front element and the assert fails.
 #[test]
 fn reader_deque_scan_committed() -> Result<()> {
-    init_test_logging();
     TEST_RUNTIME.block_on(async {
         let backend = cassandra_backend().await?;
         let descriptor = deque_state::<JsonCodec>(DEQUE_NAME);
