@@ -310,8 +310,8 @@ async fn plan_fences_after_its_last_item() -> Result<()> {
             let cells = bind_plain(&session)?;
             cells
                 .write(async |op| {
-                    op.set(PlainLayout::CELLS, &7, 7)?;
-                    op.set(PlainLayout::CELLS, &8, 8)
+                    op.set(PlainLayout::CELLS.at(&7), 7)?;
+                    op.set(PlainLayout::CELLS.at(&8), 8)
                 })
                 .await
                 .map_err(|e| eyre!("seed: {e}"))?;
@@ -496,7 +496,7 @@ async fn seed_gated(cells: &Collection<GateSession, GatedLayout>, n: usize) -> R
     cells
         .write(async |op| {
             for key in 0..n as i64 {
-                op.set(GatedLayout::CELLS, &key, key)?;
+                op.set(GatedLayout::CELLS.at(&key), key)?;
             }
             Ok::<(), CellStateError<I64CodecError>>(())
         })

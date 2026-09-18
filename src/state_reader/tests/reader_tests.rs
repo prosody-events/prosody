@@ -12,7 +12,8 @@
 //! segment the owner wrote.
 
 use super::reader_suite::{
-    ReaderCase, ValueOp, run_reader_deque_trace, run_reader_map_trace, run_reader_value_trace,
+    ReaderCase, ValueOp, run_reader_deque_trace, run_reader_map_trace, run_reader_set_trace,
+    run_reader_value_trace,
 };
 use super::support::{
     GROUP_A, MemoryHarness, MemoryReaderBackend, ScriptedEnv, mock_count, owner_commit,
@@ -23,7 +24,7 @@ use crate::codec::JsonCodec;
 use crate::state::cell::{Presence, Values};
 use crate::state::cell_key::{Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::descriptor::{
-    DescriptorIdentity, StateDescriptor, deque_state, map_state, value_state,
+    DescriptorIdentity, StateDescriptor, deque_state, map_state, set_state, value_state,
 };
 use crate::state::descriptor_identity::DurableDescriptorIdentity;
 use crate::state::identity::CollectionId;
@@ -92,6 +93,15 @@ reader_prop!(
     map_state::<I64KeyCodec, JsonCodec>,
     "reader-map",
     run_reader_map_trace
+);
+
+// The reader set surface equals a `BTreeSet` model after each event.
+reader_prop!(
+    prop_reader_set_committed,
+    MapOp,
+    set_state::<I64KeyCodec>,
+    "reader-set",
+    run_reader_set_trace
 );
 
 // The reader's `len`, front-relative `get`, and ordered `stream` equal a
@@ -219,7 +229,7 @@ async fn reader_presence_uses_read_cache() -> Result<()> {
     let tp = topic("orders");
     let state_key = env
         .commit(GROUP_A, tp, &key, 1, |map| async move {
-            map.set(1, Value::from(7_i32)).await?;
+            map.set(&1, Value::from(7_i32)).await?;
             Ok(())
         })
         .await?;
@@ -279,7 +289,7 @@ async fn reader_range_probe_pins_second_source() -> Result<()> {
     env.publish("group-000", first_topic).await;
     let second = env
         .commit(GROUP_A, second_topic, &key, 1, |map| async move {
-            map.set(1, Value::from(7_i32)).await?;
+            map.set(&1, Value::from(7_i32)).await?;
             Ok(())
         })
         .await?

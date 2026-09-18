@@ -4,7 +4,7 @@
 //! name)`; [`CollectionId`] names it and [`CollectionRef`] pairs it with a
 //! per-write TTL (a hint, not part of identity). The collection *kind* is not
 //! representable below the descriptor layer — the cell core addresses by
-//! [`CellKey`](super::cell_key::CellKey) and never names Value/Map/Deque — so
+//! [`CellKey`](super::cell_key::CellKey) and never names a collection kind — so
 //! the runtime [`CollectionKindId`] survives only as the durable identity
 //! token the descriptor layer validates.
 
@@ -36,6 +36,9 @@ pub enum CollectionKindId {
 
     /// An index-addressed double-ended queue.
     Deque = 3,
+
+    /// A presence-only ordered set.
+    Set = 4,
 }
 
 impl From<CollectionKindId> for i8 {

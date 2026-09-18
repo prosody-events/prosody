@@ -28,10 +28,11 @@
 //!
 //! # Mid-handler durability
 //!
-//! Every collection handle exposes `commit()` and `rollback()`. Value, Map, and
-//! Deque all do, and every future collection kind must too. The contract stays
-//! here rather than on `Collection::commit` and `Collection::rollback`: those
-//! two are `pub(crate)`, so the public handle docs cannot link to them.
+//! Every collection handle exposes `commit()` and `rollback()`. Value, Map,
+//! Set, and Deque all do, and every future collection kind must too. The
+//! contract stays here rather than on `Collection::commit` and
+//! `Collection::rollback`: those two are `pub(crate)`, so the public handle
+//! docs cannot link to them.
 //!
 //! `commit()` durably commits the collection's buffered changes mid-handler, so
 //! they survive a restart after failure. A large or complex handler keeps
@@ -62,7 +63,6 @@ use crate::state::descriptor::{
     CellCodecError, CellResolver, CellStateError, CellType, CollectionSpec, ContextOf, FromSession,
     KeyOf, ResolvedOf, StructuralIdentity, WriteOf,
 };
-use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::registry::CollectionDef;
 use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::{RESOLVE_FANOUT, StateName, StateType, StoreOutcome};
@@ -74,6 +74,7 @@ use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use tokio::task::coop::cooperative;
 
+mod address;
 mod operation;
 pub(crate) mod owner;
 mod stream;
@@ -81,6 +82,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use address::{CellAddress, CellFamily};
 pub(crate) use operation::{
     JOURNAL_INLINE, Mutation, MutationJournal, ReadOperation, WriteOperation,
 };
@@ -404,45 +406,6 @@ pub(crate) const fn spec_matches<S: CollectionSpec>(entry: LayoutEntry) -> bool 
     )
 }
 
-/// A declared cell family: the layout it belongs to, the durable section it
-/// addresses, and the cell type it stores.
-///
-/// A command's family argument is checked against the operation's own layout,
-/// so a family borrowed from another collection does not compile even when its
-/// section and cell type happen to match. Tokens carry no collection or
-/// session identity, allocate nothing, and are mintable only by the layout
-/// macro — an undeclared section is unaddressable.
-pub(crate) struct CellFamily<L, T> {
-    section: Section,
-    _type: PhantomData<fn() -> (L, T)>,
-}
-
-// Manual, so a family token does not inherit `L: Copy` / `T: Copy` bounds from
-// a derive.
-impl<L, T> Copy for CellFamily<L, T> {}
-
-impl<L, T> Clone for CellFamily<L, T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<L, T> CellFamily<L, T> {
-    /// Declares the family at durable section `id`. Called only from generated
-    /// layout code.
-    pub(crate) const fn declare(id: i8) -> Self {
-        Self {
-            section: Section::new(id),
-            _type: PhantomData,
-        }
-    }
-
-    /// The durable section this family addresses.
-    pub(crate) const fn section(self) -> Section {
-        self.section
-    }
-}
-
 /// A session bound to exactly one registered collection with layout `L`.
 ///
 /// Construction is the validation: the owner path checks registration and
@@ -630,7 +593,7 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     /// captured settings; no I/O.
     fn has_ttl(&self) -> bool;
 
-    /// The Map keyset bound: how many live distinct keys a map tracks before
+    /// The keyset bound: how many live members a map or set tracks before
     /// overflowing to a range scan. Read from the binding's captured
     /// settings; no I/O.
     fn keyset_limit(&self) -> usize;
@@ -736,20 +699,19 @@ pub(crate) trait CollectionWrite: CollectionRead {
         T: CellType,
         for<'s> ContextOf<'s, T>: FromSession<'s, Self::Session>;
 
-    /// Stages a write of `value` at `key`.
+    /// Stages a write of `value` at its typed address.
     ///
     /// # Errors
     ///
     /// A codec error (Permanent) when the value fails to encode.
     fn set<T: CellType>(
         &mut self,
-        family: CellFamily<Self::Layout, T>,
-        key: &KeyOf<T>,
+        address: CellAddress<Self::Layout, T>,
         value: WriteOf<'_, T>,
     ) -> Result<(), CellStateError<CellCodecError<T>>>;
 
-    /// Stages a clear of the cell at `key`.
-    fn clear<T: CellType>(&mut self, family: CellFamily<Self::Layout, T>, key: &KeyOf<T>);
+    /// Stages a clear at its typed address.
+    fn clear<T: CellType>(&mut self, address: CellAddress<Self::Layout, T>);
 
     /// Stages an absence over the collection's **whole declared layout** — one
     /// payload-free journal entry that expands to every active and reserved
@@ -767,15 +729,6 @@ pub(crate) trait CollectionWrite: CollectionRead {
 pub(crate) mod sealed_ops {
     /// The seal marker; see the module item's doc.
     pub trait CollectionOperation {}
-}
-
-/// The full cell address for `key` in `family` — the sole place a collection's
-/// typed key is lowered to its order-preserving coordinate.
-fn cell_key<L, T: CellType>(family: CellFamily<L, T>, key: &KeyOf<T>) -> CellKey {
-    CellKey {
-        section: family.section(),
-        coordinate: <T::Key as OrderedKeyCodec>::encode(key),
-    }
 }
 
 /// Decodes and resolves raw cell bytes into the exposed application value.

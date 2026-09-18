@@ -5,27 +5,27 @@
 //! through the real owner
 //! [`KeyedStateSession`](crate::state::session::KeyedStateSession) via
 //! [`owner_commit_cell`], and the same ops advance a plain
-//! `Option`/`BTreeMap`/`VecDeque` model in lockstep. After every event, a
-//! freshly created [`StateReader`] must answer point `get`, `get_many`,
-//! `stream` (forward and backward), and `len` exactly as the model does. That
-//! is the invariant the whole suite checks: a committed read always matches
-//! the model. The runner is written once over a generic [`ReaderBackend`]. It
-//! is instantiated for the memory reader in `reader_tests` and for a
-//! live-Cassandra reader in `cassandra_tests`.
+//! `Option`/`BTreeMap`/`BTreeSet`/`VecDeque` model in lockstep. After each
+//! event, a freshly created [`StateReader`] must answer point `get`,
+//! `get_many`, `stream` (forward and backward), and `len` exactly as the model
+//! does. That is the invariant the whole suite checks: a committed read always
+//! matches the model. The runner is written once over a generic
+//! [`ReaderBackend`]. It is instantiated for the memory reader in
+//! `reader_tests` and for a live-Cassandra reader in `cassandra_tests`.
 //!
 //! The trace generators are reused wholesale from
 //! [`collection_suite`](crate::state::tests::collection_suite) (`MapOp`,
-//! `DequeOp`, `Trace`, `KEY_POOL`). Only the degenerate [`ValueOp`] is new,
-//! since a Value has no removal. The runner ignores the generators'
-//! mid-handler `Commit`/`Get` ops. A reader only observes committed state, and
-//! the runner already promotes every event, so those ops add no new outcome
-//! to check.
+//! `DequeOp`, `Trace`, `KEY_POOL`). Only the degenerate [`ValueOp`] is
+//! new, since a Value has no removal. The runner ignores the generators'
+//! mid-handler commit and read operations. A reader only observes committed
+//! state, and the runner already promotes every event, so those ops add no new
+//! outcome to check.
 //!
 //! One property needs a note. A bug that only shows up on a non-empty scan
 //! must not be able to hide by shrinking its counterexample down to an empty
 //! trace. The ordered `stream` is asserted against the ordered model after
-//! every event, empty or not. The Map and Deque generators are weighted
-//! toward `Set`/`Push`, so a non-empty, ordered, multi-entry state keeps
+//! every event, empty or not. The generators favor insert operations.
+//! Thus, a non-empty ordered state keeps
 //! recurring. A counterexample keeps its witness because `Trace` shrink
 //! preserves event structure. An empty read is still a real assertion:
 //! `stream` yields nothing and `get` returns `None`.
@@ -70,38 +70,6 @@ pub(crate) struct ReaderCase<'a> {
     pub(crate) count: PartitionCount,
 }
 
-/// A degenerate value mutation: overwrite with a JSON number. A Value has no
-/// removal, so `Set` is the only op a trace can generate. That is enough to
-/// check the committed round-trip: the reader either observes the last
-/// committed value, or `None` before the first commit.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum ValueOp {
-    /// Overwrite the committed value with `Value::from(b)`.
-    Set(u8),
-    /// Raw residue with a generated value, verdict, clear, and evidence
-    /// location.
-    Residue(u8, u8),
-}
-
-impl Arbitrary for ValueOp {
-    fn arbitrary(g: &mut Gen) -> Self {
-        if bool::arbitrary(g) {
-            Self::Set(u8::arbitrary(g))
-        } else {
-            Self::Residue(u8::arbitrary(g), u8::arbitrary(g) % 8)
-        }
-    }
-
-    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        match *self {
-            Self::Set(b) => Box::new(b.shrink().map(Self::Set)),
-            Self::Residue(b, mode) => {
-                Box::new((b, mode).shrink().map(|(b, mode)| Self::Residue(b, mode)))
-            }
-        }
-    }
-}
-
 /// Publishes `descriptor`'s routing and freezes its identity so the reader
 /// will admit this case's source. Returns the segment-qualified state key the
 /// owner writes to, the same key the reader independently recomputes.
@@ -124,73 +92,6 @@ where
     source_state_key(case.topic, case.group, case.key, case.count)
 }
 
-/// Drives a Value trace: commit each event, mirror it into an `Option<Value>`
-/// model, and after every event assert `reader.get(key)` equals the model.
-///
-/// FALSIFICATION: perturb `ReadSession::collection_id_for` (session.rs) to bind
-/// the wrong partition/state-type → the point `get` reads an empty/foreign
-/// collection → mismatch on the first committed event.
-pub(super) async fn run_reader_value_trace<B: ReaderBackend>(
-    backend: &B,
-    descriptor: ValueDescriptor<JsonCodec>,
-    case: &ReaderCase<'_>,
-    trace: Trace<ValueOp>,
-) -> Result<bool> {
-    let registry = backend.registry();
-    let state_key = seed_source(backend, descriptor, case).await?;
-
-    let mut model: Option<Value> = None;
-    for (index, ops) in trace.events_ops().enumerate() {
-        let staged: Vec<ValueOp> = ops.to_vec();
-        let for_handle = staged.clone();
-        owner_commit_cell(
-            backend.owner_cell(),
-            &registry,
-            &state_key,
-            descriptor,
-            index as u128,
-            move |handle| async move {
-                for op in for_handle {
-                    if let ValueOp::Set(b) = op {
-                        handle
-                            .set(Value::from(b))
-                            .await
-                            .map_err(|e| eyre!("set: {e}"))?;
-                    }
-                }
-                Ok(())
-            },
-        )
-        .await?;
-        for (op_index, op) in staged.into_iter().enumerate() {
-            match op {
-                ValueOp::Set(b) => model = Some(Value::from(b)),
-                ValueOp::Residue(value, mode) => {
-                    if !reader_residue(
-                        backend.owner_cell(),
-                        backend.deps().backend().cells(),
-                        &state_key,
-                        (index * 1000 + op_index) as u128,
-                        value,
-                        mode,
-                    )
-                    .await?
-                    {
-                        return Ok(false);
-                    }
-                }
-            }
-        }
-
-        let deps = backend.deps();
-        let reader = StateReader::new(&deps, case.sub.clone(), descriptor)?;
-        if reader.get(case.key.clone()).await? != model {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 /// The concrete Map handle the owner session binds.
 type OwnerMapHandle<B> =
     MapHandle<OwnerSession<<B as ReaderBackend>::OwnerCell>, I64KeyCodec, JsonCodec>;
@@ -207,7 +108,7 @@ async fn apply_map_ops<B: ReaderBackend>(
     for op in ops {
         match op {
             MapOp::Set(k, b) => handle
-                .set(k, Value::from(b))
+                .set(&k, Value::from(b))
                 .await
                 .map_err(|e| eyre!("set: {e}"))?,
             MapOp::Remove(k) => handle.remove(&k).await.map_err(|e| eyre!("remove: {e}"))?,
@@ -540,3 +441,10 @@ pub(super) async fn run_reader_deque_trace<B: ReaderBackend>(
     }
     Ok(true)
 }
+
+mod set;
+pub(super) use set::run_reader_set_trace;
+
+mod value;
+pub(crate) use value::ValueOp;
+pub(super) use value::run_reader_value_trace;

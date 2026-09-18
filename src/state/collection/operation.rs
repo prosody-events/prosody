@@ -2,8 +2,9 @@
 
 use super::stream::PlanBase;
 use super::{
-    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, Plan, StateSession,
-    WritableStateSession, cell_key, encode_cell, resolve_batch, resolve_cell, sealed, sealed_ops,
+    CellAddress, CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, Plan,
+    StateSession, WritableStateSession, encode_cell, resolve_batch, resolve_cell, sealed,
+    sealed_ops,
 };
 use crate::state::access::StateAccessError;
 use crate::state::cell::{Presence, Projection, Values};
@@ -246,7 +247,7 @@ impl<'a, S: WritableStateSession, L> WriteOperation<'a, S, L> {
     ) -> CellBuffer<Slot<P>> {
         keys.iter()
             .map(|key| {
-                let cell = cell_key(family, key);
+                let cell = family.at(key).cell;
                 match self.staged(&cell) {
                     Some(Staged::Present(bytes)) => Slot::Answered(Some(P::from_value(bytes))),
                     Some(Staged::Absent) => Slot::Answered(None),
@@ -346,7 +347,7 @@ impl<S: StateSession, L> CollectionRead for ReadOperation<'_, S, L> {
         family: CellFamily<L, T>,
         key: &KeyOf<T>,
     ) -> impl Future<Output = Result<bool, StateAccessError>> + Send {
-        let cell = cell_key(family, key);
+        let cell = family.at(key).cell;
         let Self { collection, inner } = self;
         async move {
             Ok(<S::Engine as sealed::Reads<S, Presence>>::read_point(
@@ -395,7 +396,7 @@ impl<S: StateSession, L> CollectionRead for ReadOperation<'_, S, L> {
     {
         // The key is lowered before the async block, so only the owned
         // coordinate crosses the engine await.
-        let cell = cell_key(family, key);
+        let cell = family.at(key).cell;
         let Self { collection, inner } = self;
         let session = collection.session();
         async move {
@@ -471,7 +472,7 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         family: CellFamily<L, T>,
         key: &KeyOf<T>,
     ) -> impl Future<Output = Result<bool, StateAccessError>> + Send {
-        let cell = cell_key(family, key);
+        let cell = family.at(key).cell;
         async move { Ok(self.staged_or_read::<Presence>(&cell).await?.is_some()) }
     }
 
@@ -510,7 +511,7 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         T: CellType,
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
-        let cell = cell_key(family, key);
+        let cell = family.at(key).cell;
         async move {
             match self.staged_or_read::<Values>(&cell).await? {
                 Some(bytes) => Ok(Some(
@@ -532,7 +533,7 @@ impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
         T: CellType,
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
-        let cell = cell_key(family, key);
+        let cell = family.at(key).cell;
         async move {
             let value = match self.staged_or_read::<Values>(&cell).await? {
                 Some(bytes) => Some(resolve_cell::<S, T>(self.collection.session(), bytes).await?),
@@ -546,24 +547,20 @@ impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
 
     fn set<T: CellType>(
         &mut self,
-        family: CellFamily<L, T>,
-        key: &KeyOf<T>,
+        address: CellAddress<L, T>,
         value: WriteOf<'_, T>,
     ) -> Result<(), CellStateError<CellCodecError<T>>> {
-        let cell = cell_key(family, key);
         let stored = <T::Resolver as CellResolver>::stored_from(value);
         let buffer = encode_cell::<T::Codec>(stored).map_err(CellStateError::Codec)?;
         self.journal.push(Mutation::Set {
-            cell,
+            cell: address.cell,
             bytes: Bytes::copy_from_slice(&buffer),
         });
         Ok(())
     }
 
-    fn clear<T: CellType>(&mut self, family: CellFamily<L, T>, key: &KeyOf<T>) {
-        self.journal.push(Mutation::Clear {
-            cell: cell_key(family, key),
-        });
+    fn clear<T: CellType>(&mut self, address: CellAddress<L, T>) {
+        self.journal.push(Mutation::Clear { cell: address.cell });
     }
 
     fn clear_collection(&mut self)

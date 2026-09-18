@@ -91,10 +91,12 @@ use thiserror::Error;
 
 pub mod deque;
 pub mod map;
+pub mod set;
 mod value;
 
 pub use deque::{DequeDescriptor, DequeHandle, DequeQuery, DequeStateError, deque_state};
 pub use map::{MapDescriptor, MapHandle, MapQuery, MapStateError, map_state};
+pub use set::{SetDescriptor, SetHandle, SetQuery, SetStateError, set_state};
 pub use value::{ValueDescriptor, ValueHandle, ValueKind, value_state};
 
 /// A resolver: how a decoded cell (`Stored`) maps to and from the value a
@@ -535,8 +537,8 @@ pub trait CollectionSpec: SealedSpec + Sized {
 
 /// The one descriptor skeleton every collection kind shares: an interned name,
 /// operational settings, and a zero-sized [`CollectionSpec`] `K` supplying the
-/// per-kind identity and handle. The three public names
-/// ([`ValueDescriptor`]/[`MapDescriptor`]/[`DequeDescriptor`]) are aliases over
+/// per-kind identity and handle. The public names ([`ValueDescriptor`],
+/// [`MapDescriptor`], [`SetDescriptor`], [`DequeDescriptor`]) are aliases over
 /// this type.
 ///
 /// A plain `Copy` value (the name is interned — see [`Descriptor::new`] for
@@ -575,6 +577,21 @@ impl<K> Descriptor<K> {
     }
 }
 
+impl<K: CollectionSpec> Descriptor<K> {
+    /// Binds this descriptor to the session's collection namespace.
+    pub(crate) fn bind_collection<S: StateSession>(
+        self,
+        session: &S,
+    ) -> Result<Collection<S, K>, StateAccessError> {
+        Collection::bind(
+            session,
+            self.name,
+            self.state_type(),
+            &self.structural_identity(),
+        )
+    }
+}
+
 impl<K: CollectionSpec> DescriptorIdentity for Descriptor<K> {
     fn name(&self) -> &'static str {
         self.name
@@ -589,15 +606,7 @@ impl<K: CollectionSpec> StateDescriptor for Descriptor<K> {
     type Handle<S: StateSession> = K::Handle<S>;
 
     fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
-        // The binding carries the descriptor's `state_type`, so the
-        // collection's commands address the right namespace.
-        let collection = Collection::bind(
-            session,
-            self.name,
-            self.state_type(),
-            &self.structural_identity(),
-        )?;
-        Ok(K::handle(collection))
+        Ok(K::handle(self.bind_collection(session)?))
     }
 
     fn collection_def(&self) -> CollectionDef {

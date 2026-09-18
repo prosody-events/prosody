@@ -42,6 +42,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::env;
 use std::future::ready;
+use std::io::{Write, stdout};
 use std::thread;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::time::{Duration, timeout};
@@ -93,7 +94,7 @@ impl FallibleHandler for SpanProbe {
             context.state(self.cart)?.set(json!({"key": 1_i32})).await?;
             context
                 .state(self.counts)?
-                .set(key.to_string(), json!(1_i32))
+                .set(&key.to_string(), json!(1_i32))
                 .await?;
             context.state(self.log)?.push_back(json!(2_i32)).await?;
             Ok::<_, Error>(())
@@ -308,23 +309,18 @@ async fn main() -> Result<()> {
     // batch span processor's export interval.
     shutdown_telemetry()?;
 
-    #[allow(
-        clippy::print_stdout,
-        reason = "the probe's deliverable is this JSON line"
-    )]
-    {
-        println!(
-            "{}",
-            json!({
-                "relation": format!("{relation:?}"),
-                "keys": keys,
-                "sched": sched,
-                "disp": disp,
-                "sched_threads": sched_threads.len(),
-                "disp_threads": disp_threads.len(),
-            })
-        );
-    }; // both `;` deliberate: the pair satisfies `semicolon_if_nothing_returned` AND `semicolon_outside_block`
+    writeln!(
+        stdout().lock(),
+        "{}",
+        json!({
+            "relation": format!("{relation:?}"),
+            "keys": keys,
+            "sched": sched,
+            "disp": disp,
+            "sched_threads": sched_threads.len(),
+            "disp_threads": disp_threads.len(),
+        })
+    )?;
 
     Ok(())
 }

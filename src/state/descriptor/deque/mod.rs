@@ -489,9 +489,9 @@ where
         // Append first, the sole encode, then evict the front. `evict ≤ span`
         // (see `evictions`), so `new_head ≤ tail`. The cleared half-open range
         // therefore never holds the slot this push appended.
-        op.set(DequeKind::<T>::ENTRIES, &window.tail, value)?;
+        op.set(DequeKind::<T>::ENTRIES.at(&window.tail), value)?;
         for index in window.head..new_head {
-            op.clear(DequeKind::<T>::ENTRIES, &index);
+            op.clear(DequeKind::<T>::ENTRIES.at(&index));
         }
         write_bounds(op, Window::new(new_head, next_tail)?)
     }
@@ -520,9 +520,9 @@ where
             .tail
             .checked_sub(evict)
             .ok_or(MetaDecodeError::IndexOverflow)?;
-        op.set(DequeKind::<T>::ENTRIES, &prev_head, value)?;
+        op.set(DequeKind::<T>::ENTRIES.at(&prev_head), value)?;
         for index in new_tail..window.tail {
-            op.clear(DequeKind::<T>::ENTRIES, &index);
+            op.clear(DequeKind::<T>::ENTRIES.at(&index));
         }
         write_bounds(op, Window::new(prev_head, new_tail)?)
     }
@@ -694,7 +694,7 @@ where
     C: CollectionWrite<Layout = DequeKind<T>>,
     T: CellType<Key = UnitKey>,
 {
-    op.set(DequeKind::<T>::BOUNDS, &(), (window.head, window.tail))
+    op.set(DequeKind::<T>::BOUNDS.at(&()), (window.head, window.tail))
         .map_err(meta_err)
 }
 

@@ -151,7 +151,7 @@ where
         &self,
         value: WriteOf<'_, T>,
     ) -> Result<(), CellStateError<CellCodecError<T>>> {
-        op.set(ValueKind::<T>::ENTRIES, &(), value)
+        op.set(ValueKind::<T>::ENTRIES.at(&()), value)
     }
 
     /// Stages a clear of the value.
@@ -162,7 +162,7 @@ where
     #[instrument(name = "value.clear", skip_all, fields(collection = self.cells.name().as_str()), err)]
     #[write(op)]
     pub async fn clear(&self) -> Result<(), CellStateError<CellCodecError<T>>> {
-        op.clear(ValueKind::<T>::ENTRIES, &());
+        op.clear(ValueKind::<T>::ENTRIES.at(&()));
         Ok(())
     }
 

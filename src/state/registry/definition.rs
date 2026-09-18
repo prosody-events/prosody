@@ -7,7 +7,7 @@ use crate::timers::duration::CompactDuration;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-/// Default Map keyset bound — the number of live distinct keys a map tracks
+/// Default keyset bound: the number of distinct members a map or set tracks
 /// before it overflows to the full-section scan. Applied to any collection not
 /// overriding it and to names absent from the registry.
 pub(crate) const DEFAULT_KEYSET_LIMIT: usize = 128;
@@ -108,11 +108,12 @@ pub struct CollectionDef {
     /// Per-collection commit mode.
     pub commit_mode: CommitMode,
 
-    /// Map keyset bound: the number of **live** distinct keys a map tracks in
+    /// Keyset bound: the number of live members a map or set tracks in
     /// its keyset cell before overflowing to the full-section scan (`remove`
     /// subtracts, so this is current membership, not a running total).
-    /// Meaningful for Map collections only; ignored by Value and Deque. `0`
-    /// disables tracking, so every map overflows on its first `set`.
+    /// Applies to map and set collections. Value and deque collections ignore
+    /// it. A limit of `0` makes every map or set overflow on its first
+    /// write.
     pub keyset_limit: usize,
 
     /// Deque push cap: at most this many window slots, evicted opposite-end
@@ -120,8 +121,8 @@ pub struct CollectionDef {
     /// **lazily on push only**. Reads, `len`, iteration, and `pop` never
     /// enforce it, and a persisted window need not respect the current cap —
     /// it may have changed across a redeploy. Meaningful for Deque collections
-    /// only; ignored by Value and Map. `None` is unbounded. `NonZeroUsize`
-    /// keeps `capacity = 0` unrepresentable.
+    /// only; ignored by Value, Map, and Set. `None` is unbounded.
+    /// `NonZeroUsize` keeps `capacity = 0` unrepresentable.
     pub capacity: Option<NonZeroUsize>,
 
     /// Cross-group read visibility; see [`StateVisibility`]. A `Published`

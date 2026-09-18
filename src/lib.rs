@@ -15,7 +15,7 @@
 //!   time-based slabs behind the pluggable
 //!   [`TriggerStore`](timers::store::TriggerStore) (Cassandra or in-memory) and
 //!   fired by an in-memory scheduler that preloads upcoming slabs.
-//! - **Keyed state** ([`state`]) — typed Value/Map/Deque collections over a
+//! - **Keyed state** ([`state`]) — typed Value/Map/Set/Deque collections over a
 //!   uniform cell store, registered per collection and bound by handlers
 //!   through the event context. Durability is one provisional cell per value
 //!   with no write-ahead log: after the middleware stack returns, a single

@@ -471,9 +471,8 @@ fn reregistration_is_rejected_as_duplicate() -> Result<()> {
     Ok(())
 }
 
-/// The Map-only `keyset_limit` fluent method threads into the collection def
-/// (uncompilable on a Value or Deque, which is a type-level property, not a
-/// runtime one).
+/// The map and set `keyset_limit` method changes the collection definition.
+/// Value and deque descriptors do not expose this method.
 #[test]
 fn keyset_limit_threads_into_the_collection_def() {
     let descriptor: MapDescriptor<I64KeyCodec> = map_state("m");
@@ -564,12 +563,41 @@ fn span_attr(span: &SpanData, key: &str) -> Option<String> {
         .map(|kv| kv.value.to_string())
 }
 
-/// A representative operation of every kind and shape (value read/write,
-/// keyed map ops, deque mutators, both stream twins) exports a span named
-/// for the operation, carrying the `collection` attribute (plus `map.key` /
-/// `direction` where applicable), and parented on the ambient span — so a
-/// handler's state access is visible and self-describing under its event
-/// span without any explicit parenting.
+/// Runs value, map, set, and deque operations under the current span.
+async fn run_collection_ops() -> Result<()> {
+    let value = bind_registered(cart(), MemoryLoader::new())?;
+    value.set(json!({"qty": 1_i32})).await?;
+    value.get().await?;
+
+    let map = bind_registered(
+        map_state::<Utf8KeyCodec, JsonCodec>("counts"),
+        MemoryLoader::new(),
+    )?;
+    map.set(&"k1".to_owned(), json!(1_i32)).await?;
+    map.get(&"k1".to_owned()).await?;
+    let _entries: Vec<_> = map.stream(Direction::Forward).try_collect().await?;
+    let _keys: Vec<_> = map.keys(Direction::Forward).try_collect().await?;
+    map.is_empty().await?;
+    map.remove(&"k1".to_owned()).await?;
+
+    let set = bind_registered(set_state::<Utf8KeyCodec>("tags"), MemoryLoader::new())?;
+    set.insert(&"k1".to_owned()).await?;
+    set.contains(&"k1".to_owned()).await?;
+    let _members: Vec<_> = set.keys(Direction::Forward).try_collect().await?;
+    set.is_empty().await?;
+    set.remove(&"k1".to_owned()).await?;
+
+    let deque = bind_registered(deque_state::<JsonCodec>("dq"), MemoryLoader::new())?;
+    deque.push_back(json!(7_i32)).await?;
+    let _elements: Vec<_> = deque.stream(Direction::Forward).try_collect().await?;
+    deque.pop_front().await?;
+    Ok(())
+}
+
+/// Value reads and writes, keyed map and set ops, and deque ops export spans.
+/// Each span names its operation and collection under the ambient handler span.
+/// Map and set point operations include their key. Each stream includes its
+/// direction. Map and set streams include their projection.
 #[test]
 fn collection_ops_export_operation_spans() -> Result<()> {
     let outcome: RefCell<Result<()>> = RefCell::new(Ok(()));
@@ -580,39 +608,17 @@ fn collection_ops_export_operation_spans() -> Result<()> {
         // block_ons its export on span end, which may not nest inside a
         // `LocalPool`. The root future runs on this thread, so the entered
         // `handler` span stays ambient.
-        *outcome.borrow_mut() = TEST_RUNTIME.block_on(async {
-            let value = bind_registered(cart(), MemoryLoader::new())?;
-            value.set(json!({"qty": 1_i32})).await?;
-            value.get().await?;
-
-            let map = bind_registered(
-                map_state::<Utf8KeyCodec, JsonCodec>("counts"),
-                MemoryLoader::new(),
-            )?;
-            map.set("k1".to_owned(), json!(1_i32)).await?;
-            map.get(&"k1".to_owned()).await?;
-            let _entries: Vec<_> = map.stream(Direction::Forward).try_collect().await?;
-            let _keys: Vec<_> = map.keys(Direction::Forward).try_collect().await?;
-            map.is_empty().await?;
-            map.remove(&"k1".to_owned()).await?;
-
-            let deque = bind_registered(deque_state::<JsonCodec>("dq"), MemoryLoader::new())?;
-            deque.push_back(json!(7_i32)).await?;
-            let _elements: Vec<_> = deque.stream(Direction::Forward).try_collect().await?;
-            deque.pop_front().await?;
-            Ok(())
-        });
+        *outcome.borrow_mut() = TEST_RUNTIME.block_on(run_collection_ops());
     });
     outcome.into_inner()?;
 
-    assert_eq!(
-        spans
-            .iter()
-            .filter(|span| span.name == "map.is_empty")
-            .count(),
-        1,
-        "one call exports one map.is_empty span"
-    );
+    for name in ["map.is_empty", "set.is_empty"] {
+        assert_eq!(
+            spans.iter().filter(|span| span.name == name).count(),
+            1,
+            "one call exports one {name} span"
+        );
+    }
     let mut projections: Vec<_> = spans
         .iter()
         .filter(|span| span.name == "map.stream")
@@ -625,6 +631,16 @@ fn collection_ops_export_operation_spans() -> Result<()> {
         "map streams export one span per projection under one name"
     );
 
+    assert_eq!(
+        spans
+            .iter()
+            .filter(|span| span.name == "set.stream")
+            .map(|span| span_attr(span, "projection"))
+            .collect::<Vec<_>>(),
+        [Some("presence".to_owned())],
+        "set streams export one presence span"
+    );
+
     let handler_id = named(&spans, "handler")?.span_context.span_id();
 
     for (name, collection) in [
@@ -634,6 +650,10 @@ fn collection_ops_export_operation_spans() -> Result<()> {
         ("map.get", "counts"),
         ("map.stream", "counts"),
         ("map.remove", "counts"),
+        ("set.insert", "tags"),
+        ("set.contains", "tags"),
+        ("set.stream", "tags"),
+        ("set.remove", "tags"),
         ("deque.push_back", "dq"),
         ("deque.stream", "dq"),
         ("deque.pop_front", "dq"),
@@ -651,15 +671,20 @@ fn collection_ops_export_operation_spans() -> Result<()> {
             span.parent_span_id, handler_id,
             "{name} must nest under the ambient span"
         );
-        if name.starts_with("map.") && name != "map.stream" {
+        let key_attr = match name.split_once('.') {
+            Some(("map", op)) if op != "stream" => Some("map.key"),
+            Some(("set", op)) if op != "stream" => Some("set.key"),
+            _ => None,
+        };
+        if let Some(attr) = key_attr {
             assert_eq!(
-                span_attr(span, "map.key").as_deref(),
+                span_attr(span, attr).as_deref(),
                 Some("k1"),
-                "{name} must carry the map key"
+                "{name} must carry its key"
             );
         }
     }
-    for name in ["map.stream", "deque.stream"] {
+    for name in ["map.stream", "set.stream", "deque.stream"] {
         let stream = spans
             .iter()
             .find(|s| s.name == name)
@@ -689,6 +714,10 @@ mod scope_containment {
         map_state("counts")
     }
 
+    fn tags() -> SetDescriptor<Utf8KeyCodec> {
+        set_state("tags")
+    }
+
     fn log() -> DequeDescriptor {
         deque_state("log")
     }
@@ -699,15 +728,14 @@ mod scope_containment {
         registry.register(&cart(), CollectionDef::new(None))?;
         registry.register(&wishlist(), CollectionDef::new(None))?;
         registry.register(&counts(), CollectionDef::new(None))?;
+        registry.register(&tags(), CollectionDef::new(None))?;
         registry.register(&log(), CollectionDef::new(None))?;
         Ok(registry)
     }
 
-    /// Sibling descriptors of every kind bound against one session address
-    /// disjoint cells — a write to one never leaks into another's read, even
-    /// though Value/Map/Deque reuse the same section discriminants (`0`/`1`)
-    /// and coordinate spaces. The binding pins `(state_type, name)`, so the
-    /// handles cannot collide sharing a session and a key.
+    /// Sibling descriptors address disjoint cells, though every kind reuses
+    /// sections and coordinates. The collection binding separates each name
+    /// within the same session and key.
     #[test]
     fn prop_sibling_descriptors_do_not_leak() {
         async fn check(a: Value, b: Value) -> Result<bool> {
@@ -719,12 +747,14 @@ mod scope_containment {
             let counts = counts()
                 .bind(&session)
                 .map_err(|e| eyre!("bind counts: {e}"))?;
+            let tags = tags().bind(&session).map_err(|e| eyre!("bind tags: {e}"))?;
             let log = log().bind(&session).map_err(|e| eyre!("bind log: {e}"))?;
 
             // Distinct writes to each sibling, interleaved.
             cart.set(a.clone()).await?;
             wishlist.set(b.clone()).await?;
-            counts.set("qty".to_owned(), b.clone()).await?;
+            counts.set(&"qty".to_owned(), b.clone()).await?;
+            tags.insert(&"tag".to_owned()).await?;
             log.push_back(a.clone()).await?;
 
             // Each handle reads back exactly its own collection's data — no
@@ -734,7 +764,10 @@ mod scope_containment {
                 && counts.get(&"qty".to_owned()).await? == Some(b)
                 && counts.get(&"missing".to_owned()).await?.is_none()
                 && log.get(0).await? == Some(a)
-                && log.len().await? == 1)
+                && log.len().await? == 1
+                && tags.contains(&"tag".to_owned()).await?
+                && !tags.contains(&"qty".to_owned()).await?
+                && counts.get(&"tag".to_owned()).await?.is_none())
         }
         fn prop(a: ArbJson, b: ArbJson) -> TestResult {
             let input = format!("a={:#?} b={:#?}", a.0, b.0);
@@ -756,10 +789,12 @@ mod scope_containment {
 async fn terminated_session_refuses_typed_ops_in_every_kind() -> Result<()> {
     let value = value_state::<JsonCodec>("term_value");
     let map = map_state::<Utf8KeyCodec, JsonCodec>("term_map");
+    let set = set_state::<Utf8KeyCodec>("term_set");
     let deque = deque_state::<JsonCodec>("term_deque");
     let mut registry = CollectionDefRegistry::default();
     registry.register(&value, CollectionDef::new(None))?;
     registry.register(&map, CollectionDef::new(None))?;
+    registry.register(&set, CollectionDef::new(None))?;
     registry.register(&deque, CollectionDef::new(None))?;
     let session = terminated_session(MemoryLoader::new(), registry);
 
@@ -777,6 +812,14 @@ async fn terminated_session_refuses_typed_ops_in_every_kind() -> Result<()> {
     let map_handle = map.bind(&session).map_err(|e| eyre!("bind map: {e}"))?;
     assert!(matches!(
         map_handle.get(&"k".to_owned()).await,
+        Err(MapStateError::Cell(CellStateError::Access(
+            StateAccessError::Terminated
+        )))
+    ));
+
+    let set_handle = set.bind(&session).map_err(|e| eyre!("bind set: {e}"))?;
+    assert!(matches!(
+        set_handle.contains(&"k".to_owned()).await,
         Err(MapStateError::Cell(CellStateError::Access(
             StateAccessError::Terminated
         )))

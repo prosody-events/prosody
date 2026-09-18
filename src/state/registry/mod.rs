@@ -21,10 +21,10 @@ mod tests;
 
 pub use definition::{CollectionDef, CommitMode, ReadCachePolicy, StateVisibility};
 
-/// Registration ceiling on the Map keyset bound: a larger limit is rejected at
-/// build ([`RegisterStateError::KeysetLimit`]), capping the point-get fan-out
-/// (and decode allocation) a single `stream` can issue — the byte ceiling
-/// separately bounds the frame's wire size.
+/// Registration ceiling on the map and set keyset bound: a larger limit is
+/// rejected at build ([`RegisterStateError::KeysetLimit`]), capping the
+/// point-get fan-out (and decode allocation) a single `stream` can issue — the
+/// byte ceiling separately bounds the frame's wire size.
 pub(crate) const MAX_KEYSET_LIMIT: usize = 4096;
 
 /// A registered collection: the descriptor-derived frozen identity plus
@@ -233,8 +233,8 @@ pub enum RegisterStateError {
         seconds: u32,
     },
 
-    /// The collection's Map keyset limit exceeds the maximum of `4096`, which
-    /// would let one map hold an unbounded keyset cell.
+    /// The collection's keyset limit exceeds the maximum of `4096`, which
+    /// would let one collection hold an unbounded keyset cell.
     #[error("state collection {name:?} keyset limit {limit} exceeds the maximum of 4096")]
     KeysetLimit {
         /// Collection name whose keyset limit is over the ceiling.

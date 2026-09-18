@@ -3,7 +3,7 @@
 //! This module defines the shared collection identity and cell shapes used by
 //! the keyed-state cell store. The cell layer is **uniform and
 //! untyped** — it addresses cells by [`CellKey`] and names no collection
-//! family; typed collection handles (Value, Map, Deque) are built
+//! family; typed collection handles (Value, Map, Set, Deque) are built
 //! atop it in [`descriptor`].
 //!
 //! The shapes themselves live in leaf-to-root submodules and are
@@ -56,17 +56,14 @@
 //! collection-owned `Meta` bookkeeping (as the deque window already is), never
 //! as a cell-layer feature.
 //!
-//! **TTL mass-expiry is transient and self-healing.** On a TTL'd
-//! [`descriptor::map`] the keyset cell rides the same TTL-refresh rule as every
-//! entry (each `set` rewrites it), so it outlives the newest entry. When the
-//! map's cells expire the keyset expires with them, and the next `stream` reads
-//! it absent and yields nothing with **zero scans** — no tombstone wave at all
-//! on the fast path. A degraded (`Overflowed`) map instead falls back to a
-//! full-section ([`Unbounded`](ScanEdge::Unbounded)-edged) scan that *can* meet
-//! a one-time tombstone wave, which self-heals as those rows compact — the
-//! accepted degraded cost. A [`descriptor::deque`] scan keeps concrete
-//! [`ScanEdge`] bounds pinned to its live window, so its range collapses as
-//! those bounds expire.
+//! **TTL expiry clears tracked membership.** Each member write refreshes the
+//! keyset of a map or set with a TTL. The keyset outlives the newest member.
+//! After all cells expire, the absent keyset produces an empty stream without
+//! a scan. An overflowed map or set uses a full-section scan.
+//! That scan can encounter tombstones until compaction removes them.
+//!
+//! A [`descriptor::deque`] scan uses [`ScanEdge`] bounds from its live window.
+//! Its range contracts as those bounds expire.
 //!
 //! **Cross-assignment clock skew is a standard Cassandra assumption, not a new
 //! hazard.** Last-write-wins ordering *across* assignments — a new assignee's

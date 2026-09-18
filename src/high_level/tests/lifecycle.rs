@@ -80,6 +80,9 @@ fn erased_reader_kinds_share_subsystem_validation() -> Result<()> {
         let map = client
             .map_state(String::new(), "map".to_owned(), ErasedReadCache::default())
             .await;
+        let set = client
+            .set_state(String::new(), "set".to_owned(), ErasedReadCache::default())
+            .await;
         let deque = client
             .deque_state(
                 "\t".to_owned(),
@@ -94,6 +97,10 @@ fn erased_reader_kinds_share_subsystem_validation() -> Result<()> {
         ));
         assert!(matches!(
             map,
+            Err(ErasedReaderBuildError::InvalidSubsystem(_))
+        ));
+        assert!(matches!(
+            set,
             Err(ErasedReaderBuildError::InvalidSubsystem(_))
         ));
         assert!(matches!(

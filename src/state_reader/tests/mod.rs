@@ -13,8 +13,8 @@
 //!
 //! The invariant that committed state always matches the oracle is proven
 //! once, by the backend-generic [`reader_suite`] runner
-//! (`run_reader_{value,map,deque}_trace`). It runs against the memory reader
-//! in [`reader_tests`] and against a **live Cassandra** reader in
+//! (`run_reader_{value,map,set,deque}_trace`). It runs against the memory
+//! reader in [`reader_tests`] and against a **live Cassandra** reader in
 //! [`cassandra_tests`], following the same pattern as `cell_suite`. Fault,
 //! refresh, and cache invariants stay scripted and clock-only, since
 //! production backends cannot inject faults. They live in [`probe_tests`],

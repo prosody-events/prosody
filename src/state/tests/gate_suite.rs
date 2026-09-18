@@ -284,7 +284,7 @@ fn gate_serializes_set_against_commit_drain() -> Result<()> {
             .map_err(|e| eyre!("bind: {e}"))?;
 
         handle
-            .set(1, Value::from(10_i64))
+            .set(&1, Value::from(10_i64))
             .await
             .map_err(|e| eyre!("{e}"))?;
 
@@ -301,7 +301,7 @@ fn gate_serializes_set_against_commit_drain() -> Result<()> {
         // The racing set parks on the gate the commit holds.
         let set_task = tokio::spawn({
             let handle = handle.clone();
-            async move { handle.set(2, Value::from(20_i64)).await }
+            async move { handle.set(&2, Value::from(20_i64)).await }
         });
         let_task_park().await;
         fx.holds.write_resolved().release();
@@ -401,7 +401,7 @@ fn gate_serializes_set_against_clear() -> Result<()> {
         fx.holds.read().arm(1);
         let set_task = tokio::spawn({
             let handle = handle.clone();
-            async move { handle.set(1, Value::from(99_i64)).await }
+            async move { handle.set(&1, Value::from(99_i64)).await }
         });
         timeout(HANG_GUARD, fx.holds.read().entered())
             .await
@@ -471,14 +471,14 @@ fn gate_serializes_racing_keyset_rmw() -> Result<()> {
         fx.holds.read().arm(1);
         let first = tokio::spawn({
             let handle = handle.clone();
-            async move { handle.set(1, Value::from(1_i64)).await }
+            async move { handle.set(&1, Value::from(1_i64)).await }
         });
         timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("set(1) never reached its hold"))?;
         let second = tokio::spawn({
             let handle = handle.clone();
-            async move { handle.set(9, Value::from(9_i64)).await }
+            async move { handle.set(&9, Value::from(9_i64)).await }
         });
         let_task_park().await;
         fx.holds.read().release();
@@ -599,14 +599,14 @@ fn gate_overflows_keyset_at_the_limit() -> Result<()> {
         fx.holds.read().arm(1);
         let first = tokio::spawn({
             let handle = handle.clone();
-            async move { handle.set(3, Value::from(3_i64)).await }
+            async move { handle.set(&3, Value::from(3_i64)).await }
         });
         timeout(HANG_GUARD, fx.holds.read().entered())
             .await
             .map_err(|_| eyre!("set(3) never reached its hold"))?;
         let second = tokio::spawn({
             let handle = handle.clone();
-            async move { handle.set(4, Value::from(4_i64)).await }
+            async move { handle.set(&4, Value::from(4_i64)).await }
         });
         let_task_park().await;
         fx.holds.read().release();
@@ -685,7 +685,7 @@ fn map_keyset_rotating_stays_tracked() -> Result<()> {
                 handle.remove(&(step - 3)).await.map_err(|e| eyre!("{e}"))?;
             }
             handle
-                .set(step, Value::from(step))
+                .set(&step, Value::from(step))
                 .await
                 .map_err(|e| eyre!("{e}"))?;
             finalize_and_promote(&session, &fx.dedup, event, &fx.cells, &id).await?;
@@ -719,9 +719,9 @@ fn map_keyset_rotating_stays_tracked() -> Result<()> {
 /// `Tracked` frame degrades the stream to a full-section scan, but once
 /// `remove` subtracts enough keys to bring the frame back under the limit, a
 /// fresh stream takes the point-get arm again. Red-proven by making
-/// `subtract_keyset` write `Overflowed` instead of the shrunk frame: removal
-/// never heals, so the post-remove stream still degrades (`lower_scans() ==
-/// 1`).
+/// `PriorKeyset::remove` write `Overflowed` instead of the shrunk frame:
+/// removal never heals, so the post-remove stream still degrades
+/// (`lower_scans() == 1`).
 #[test]
 fn map_keyset_removal_heals_oversized() -> Result<()> {
     runtime()?.block_on(async {
@@ -789,11 +789,9 @@ fn map_keyset_removal_heals_oversized() -> Result<()> {
     })
 }
 
-/// An absent keyset streams nothing with zero entry reads (the `Absent → Empty`
-/// fast path resting on `KeysetPresence`): a truly empty collection yields
-/// nothing and issues no scan, and the only lower read is the single keyset get
-/// itself. Red-proven by changing `stream_plan`'s `Absent` arm to `Scan`: an
-/// empty map then issues a full-section scan (`lower_scans() == 1`).
+/// An absent keyset produces no entry reads or scans.
+/// Only the keyset read reaches storage.
+/// A scan in the membership plan's absent-keyset arm fails this test.
 #[test]
 fn map_absent_keyset_streams_zero_reads() -> Result<()> {
     runtime()?.block_on(async {
@@ -897,7 +895,7 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
         // The racing set of a listed key parks on the gate.
         let set_task = tokio::spawn({
             let handle = handle.clone();
-            async move { handle.set(1, Value::from(99_i64)).await }
+            async move { handle.set(&1, Value::from(99_i64)).await }
         });
         let_task_park().await;
         fx.holds.read().release();
@@ -978,7 +976,7 @@ fn map_get_many_holds_gate_across_sub_batches() -> Result<()> {
         // A set on the sub-batch-2 target parks on the gate (get_many holds it).
         let writer = tokio::spawn({
             let map = map.clone();
-            async move { map.set(TARGET, Value::from(999_i64)).await }
+            async move { map.set(&TARGET, Value::from(999_i64)).await }
         });
         let_task_park().await;
 
@@ -1084,7 +1082,7 @@ async fn parked_set(name: &str, terminate: bool) -> Result<ParkedSet> {
     fx.holds.read().arm(1);
     let writer = tokio::spawn({
         let map = map.clone();
-        async move { map.set(9, Value::from(9_i64)).await }
+        async move { map.set(&9, Value::from(9_i64)).await }
     });
     timeout(HANG_GUARD, fx.holds.read().entered())
         .await
@@ -2044,7 +2042,7 @@ fn conforming_within_attempt_never_fenced() {
                 .bind(&session)
                 .map_err(|e| eyre!("bind m: {e}"))?;
             for k in 0..3_i64 {
-                map.set(k, Value::from(k))
+                map.set(&k, Value::from(k))
                     .await
                     .map_err(|e| eyre!("map set: {e}"))?;
             }
