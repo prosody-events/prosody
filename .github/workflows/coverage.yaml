@@ -16,20 +16,21 @@ jobs:
     name: Plan
     runs-on: ubuntu-latest
     outputs:
-      infra: ${{ steps.rail.outputs.infra }}
-      test: ${{ steps.rail.outputs.test }}
+      required-work: ${{ steps.rail.outputs.required-work }}
     steps:
       - uses: actions/checkout@v6
       - name: Plan affected work
         id: rail
-        uses: loadingalias/cargo-rail-action@ebc8ef2740efefe2cd5c42826344a8f1213113ae # v6
+        uses: loadingalias/cargo-rail-action@4a8df181e4f340a164190cf092c9f9239b20edab # v10.0.1
         with:
           since: ${{ github.event.before }}
 
   coverage:
     name: Test Coverage
     needs: plan
-    if: needs.plan.outputs.test == 'true' || needs.plan.outputs.infra == 'true'
+    if: >-
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.test') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -C target-cpu=x86-64-v3 -C link-arg=-fuse-ld=mold

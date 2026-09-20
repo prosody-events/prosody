@@ -20,21 +20,22 @@ jobs:
     name: Plan
     runs-on: ubuntu-latest
     outputs:
-      build: ${{ steps.rail.outputs.build }}
-      docs: ${{ steps.rail.outputs.docs }}
-      infra: ${{ steps.rail.outputs.infra }}
+      required-work: ${{ steps.rail.outputs.required-work }}
     steps:
       - uses: actions/checkout@v6
       - name: Plan affected work
         id: rail
-        uses: loadingalias/cargo-rail-action@ebc8ef2740efefe2cd5c42826344a8f1213113ae # v6
+        uses: loadingalias/cargo-rail-action@4a8df181e4f340a164190cf092c9f9239b20edab # v10.0.1
         with:
           since: ${{ github.event.before }}
 
   build:
     name: Build
     needs: plan
-    if: needs.plan.outputs.docs == 'true' || needs.plan.outputs.build == 'true' || needs.plan.outputs.infra == 'true'
+    if: >-
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.doc') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.build') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
