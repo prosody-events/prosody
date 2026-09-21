@@ -65,15 +65,12 @@ async fn assert_map_scans<P: ParityPayload>(
     visible: &BTreeMap<String, P>,
     prefix: &str,
 ) -> Result<bool> {
-    let config = KeyScanConfig {
-        prefix: Some(prefix.to_owned()),
-        ..KeyScanConfig::default()
-    };
+    let config = ErasedKeyQuery::default().prefix(prefix);
     let expected: Vec<_> = visible
         .iter()
         .filter(|(key, _)| key.starts_with(prefix))
         .collect();
-    let scanned = drain_cursor(&handle.scan(config.clone())).await?;
+    let scanned = drain_cursor(&handle.entries(config.clone())).await?;
     if scanned.len() != expected.len()
         || scanned.iter().zip(expected.iter().copied()).any(
             |((key, value), (expected_key, expected_value))| {
@@ -91,17 +88,15 @@ async fn assert_map_scans<P: ParityPayload>(
     {
         return Ok(false);
     }
-    let config = KeyScanConfig {
-        limit: Some(NonZeroUsize::MIN),
-        start: Bound::Included(KEYS[1].to_owned()),
-        end: Bound::Included(KEYS[2].to_owned()),
-        ..KeyScanConfig::default()
-    };
+    let config = ErasedKeyQuery::default()
+        .from(KEYS[1])
+        .to(KEYS[2])
+        .limit(NonZeroUsize::MIN);
     let expected = visible
         .range(KEYS[1].to_owned()..=KEYS[2].to_owned())
         .take(1)
         .collect::<Vec<_>>();
-    let constrained = drain_cursor(&handle.scan(config.clone())).await?;
+    let constrained = drain_cursor(&handle.entries(config.clone())).await?;
     if constrained.len() != expected.len()
         || constrained
             .iter()

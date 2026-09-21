@@ -240,6 +240,37 @@ count.set(json!(current + 1)).await?;
 
 Keyed-state cache settings are listed in [CONFIGURATION.md](CONFIGURATION.md#keyed-state).
 
+### Query collection state
+
+`KeyQuery<KC>` defines a map or set query. The key codec `KC` must match the
+collection. The query owns its bounds and has no backend or session.
+Handlers and standalone readers accept the same query:
+
+```rust,ignore
+use prosody::state::{Direction, KeyQuery};
+use std::num::NonZeroUsize;
+
+let page_size = NonZeroUsize::try_from(20_usize)?;
+let page = KeyQuery::new(Direction::Forward)
+    .prefix("order:")
+    .after("order:0042")
+    .limit(page_size);
+
+let entries = map.entries(page.clone());
+let committed_entries = reader.entries("customer-123", page).await?;
+```
+
+Use `keys` to read map keys or set members. Set the next page's cursor with
+`after`. The cursor must start with the prefix to stay within the prefix range.
+Each bound method replaces its edge. `prefix` replaces both edges.
+`range` uses ascending bounds; `from`, `after`, `to`, and `before` follow the
+query direction.
+
+Use `DequeQuery` for deque positions and read results with `values`.
+Its bound methods use positions counted from the front. Deque queries have no
+prefix operation. Erased APIs accept `ErasedKeyQuery`, the string specialization,
+and the same `DequeQuery`. Language clients can wrap these owned builders.
+
 ### Reading another group's state
 
 By default a collection is private to the consumer group that owns it. Mark a

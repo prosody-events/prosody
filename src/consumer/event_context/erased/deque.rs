@@ -1,9 +1,7 @@
 //! The erased deque adapter.
 
 use super::write::ErasedWrite;
-use super::{
-    BoxStateCursor, DequeScanConfig, DynDequeState, ErasedStateError, bound_usize, cursor,
-};
+use super::{BoxStateCursor, DequeQuery, DynDequeState, ErasedStateError, cursor};
 use crate::state::collection::WritableStateSession;
 use crate::state::descriptor::{CellType, ContextOf, DequeHandle, FromSession, ResolvedOf};
 use crate::state::order_codec::UnitKey;
@@ -99,16 +97,10 @@ where
             .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
-    fn scan(&self, config: DequeScanConfig) -> BoxStateCursor<ResolvedOf<T>> {
+    fn values(&self, query: DequeQuery) -> BoxStateCursor<ResolvedOf<T>> {
         let handle = self.handle.clone();
         Box::new(cursor(try_stream! {
-            let start = bound_usize(config.start);
-            let end = bound_usize(config.end);
-            let mut query = handle.query(config.dir).range((start, end));
-            if let Some(limit) = config.limit {
-                query = query.limit(limit);
-            }
-            for await item in query.values() {
+            for await item in handle.values(query) {
                 yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
             }
         }))

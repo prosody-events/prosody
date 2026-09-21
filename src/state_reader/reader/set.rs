@@ -1,11 +1,11 @@
 //! Standalone reads of committed set membership.
 
-use super::{SetReaderQuery, StateReader};
+use super::StateReader;
 use crate::Key;
 use crate::codec::Codec;
-use crate::state::cell_key::Direction;
+use crate::state::KeyQuery;
+use crate::state::cell::Presence;
 use crate::state::descriptor::SetDescriptor;
-use crate::state::descriptor::map::Query;
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state_reader::{ReaderBackend, StateReaderError};
 use futures::Stream;
@@ -74,7 +74,7 @@ where
             .map_err(|error| StateReaderError::store(&error))
     }
 
-    /// Streams committed set members in the direction `dir`.
+    /// Streams committed set members in query order.
     ///
     /// # Errors
     ///
@@ -82,18 +82,9 @@ where
     pub async fn keys<K: Into<Key>>(
         &self,
         key: K,
-        dir: Direction,
+        query: KeyQuery<KC>,
     ) -> Result<impl Stream<Item = Result<KC::Key, StateReaderError>> + 'static, StateReaderError>
     {
-        self.query(key, dir).keys().await
-    }
-
-    /// Builds a directional set query for partition `key`.
-    pub fn query<K: Into<Key>>(&self, key: K, dir: Direction) -> SetReaderQuery<'_, KC, C, B> {
-        SetReaderQuery {
-            reader: self,
-            key: key.into(),
-            query: Query::new(dir),
-        }
+        self.projected::<Presence>(key.into(), query.encoded).await
     }
 }

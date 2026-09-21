@@ -167,3 +167,6 @@ const _: () = assert!(
     CELLS_INLINE > 0 && CELLS_INLINE <= 8,
     "keyed-state inline buffers must stay small"
 );
+
+pub(crate) mod query;
+pub use query::{DequeQuery, ErasedKeyQuery, KeyQuery};

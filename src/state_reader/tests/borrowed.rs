@@ -7,6 +7,7 @@ use super::support::{
 use crate::Key;
 use crate::codec::JsonCodec;
 use crate::state::Direction;
+use crate::state::KeyQuery;
 use crate::state::collection::WritableStateSession;
 use crate::state::descriptor::{
     MapDescriptor, MapHandle, SetDescriptor, SetHandle, StateDescriptor, map_state, set_state,
@@ -192,20 +193,22 @@ async fn check_map<S: WritableStateSession>(
     for edge in members.first().into_iter().chain(members.last()) {
         assert_eq!(
             handle
-                .query(Direction::Forward)
-                .from(edge.as_str())
-                .to(edge.as_str())
-                .entries()
+                .entries(
+                    KeyQuery::new(Direction::Forward)
+                        .from(edge.as_str())
+                        .to(edge.as_str())
+                )
                 .try_collect::<Vec<_>>()
                 .await?,
             vec![(edge.clone(), model[edge].clone())]
         );
         assert!(
             handle
-                .query(Direction::Backward)
-                .after(edge.as_str())
-                .before(edge.as_str())
-                .keys()
+                .keys(
+                    KeyQuery::new(Direction::Backward)
+                        .after(edge.as_str())
+                        .before(edge.as_str())
+                )
                 .try_collect::<Vec<_>>()
                 .await?
                 .is_empty()
@@ -213,7 +216,7 @@ async fn check_map<S: WritableStateSession>(
     }
     assert_eq!(
         handle
-            .stream(Direction::Forward)
+            .entries(KeyQuery::new(Direction::Forward))
             .try_collect::<Vec<_>>()
             .await?,
         entries
@@ -246,7 +249,7 @@ async fn check_set<S: WritableStateSession>(
     }
     assert_eq!(
         handle
-            .keys(Direction::Forward)
+            .keys(KeyQuery::new(Direction::Forward))
             .try_collect::<Vec<_>>()
             .await?,
         members
@@ -304,28 +307,36 @@ async fn check_readers(
         |edge| async move {
             let (entries, members, map_excluded, set_excluded) = try_join!(
                 collect_query(
-                    map.query(key.clone(), Direction::Forward)
-                        .from(edge.as_str())
-                        .to(edge.as_str())
-                        .entries()
+                    map.entries(
+                        key.clone(),
+                        KeyQuery::new(Direction::Forward)
+                            .from(edge.as_str())
+                            .to(edge.as_str())
+                    )
                 ),
                 collect_query(
-                    set.query(key.clone(), Direction::Backward)
-                        .from(edge.as_str())
-                        .to(edge.as_str())
-                        .keys()
+                    set.keys(
+                        key.clone(),
+                        KeyQuery::new(Direction::Backward)
+                            .from(edge.as_str())
+                            .to(edge.as_str())
+                    )
                 ),
                 collect_query(
-                    map.query(key.clone(), Direction::Backward)
-                        .after(edge.as_str())
-                        .before(edge.as_str())
-                        .keys()
+                    map.keys(
+                        key.clone(),
+                        KeyQuery::new(Direction::Backward)
+                            .after(edge.as_str())
+                            .before(edge.as_str())
+                    )
                 ),
                 collect_query(
-                    set.query(key.clone(), Direction::Forward)
-                        .after(edge.as_str())
-                        .before(edge.as_str())
-                        .keys()
+                    set.keys(
+                        key.clone(),
+                        KeyQuery::new(Direction::Forward)
+                            .after(edge.as_str())
+                            .before(edge.as_str())
+                    )
                 ),
             )?;
             assert_eq!(entries, vec![(edge.clone(), model[edge].clone())]);

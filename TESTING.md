@@ -235,7 +235,7 @@ with `?` and convert at the boundary) with enough context to identify the
 failing operation index. Never swallow them into a `false` property
 result.
 
-Exemplars: `finish_trace` in `src/state/descriptor/tests.rs` and
+Exemplars: `finish_trace` in `src/state/descriptor/tests/mod.rs` and
 `ModelProperty` in `src/tests/test_util/mod.rs`. `ModelProperty` skips a
 shrink candidate that errors, so the reported trace always failed the model.
 

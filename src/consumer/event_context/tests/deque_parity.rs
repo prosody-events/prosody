@@ -80,7 +80,7 @@ async fn assert_deque_scans<P: ParityPayload>(
     handle: &BoxDequeState<P>,
     visible: &VecDeque<P>,
 ) -> Result<bool> {
-    let scanned = drain_cursor(&handle.scan(DequeScanConfig::default())).await?;
+    let scanned = drain_cursor(&handle.values(DequeQuery::default())).await?;
     if scanned.len() != visible.len()
         || scanned
             .iter()
@@ -89,12 +89,14 @@ async fn assert_deque_scans<P: ParityPayload>(
     {
         return Ok(false);
     }
-    let constrained = drain_cursor(&handle.scan(DequeScanConfig {
-        dir: Direction::Forward,
-        limit: Some(NonZeroUsize::MIN),
-        start: Bound::Included(1),
-        end: Bound::Excluded(3),
-    }))
+    let constrained = drain_cursor(
+        &handle.values(
+            DequeQuery::default()
+                .from(1)
+                .before(3)
+                .limit(NonZeroUsize::MIN),
+        ),
+    )
     .await?;
     Ok(constrained.len() == visible.iter().skip(1).take(1).count()
         && constrained

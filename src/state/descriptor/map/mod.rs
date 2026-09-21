@@ -22,8 +22,11 @@ pub use keyset::KeysetFrameError;
 pub(crate) use keyset::{MapKeysetCodec, MapKeysetKey};
 pub(crate) use membership::KeysetLayout;
 
-pub(crate) use query::Query;
-pub use query::{KeyItem, KeysetQuery, MapQuery, MapStreamItem, SetQuery};
+use crate::state::KeyQuery;
+use crate::state::cell::{Presence, Values};
+use crate::state::query::Query;
+pub(crate) use query::projected;
+pub use query::{KeyItem, MapStreamItem};
 
 use super::{
     CellCodecError, CellStateError, CellType, CollectionSpec, ContextOf, Descriptor, FromSession,
@@ -33,7 +36,6 @@ use super::{
 use crate::codec::Codec;
 use crate::codec::JsonCodec;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::cell_key::Direction;
 #[cfg(test)]
 use crate::state::cell_key::{CellKey, Coordinate};
 #[cfg(test)]
@@ -93,10 +95,6 @@ where
     KC: OrderedKeyCodec + 'static,
     V: CellType<Key = UnitKey>,
 {
-    pub(crate) fn cells(&self) -> &Collection<S, MapKind<KC, V>> {
-        &self.cells
-    }
-
     /// Reads and resolves the value for `key` (`None` when absent).
     ///
     /// # Errors
@@ -279,12 +277,13 @@ where
         Ok(())
     }
 
-    /// Streams live entries in key order, ascending for [`Direction::Forward`].
+    /// Streams live entries in key order, ascending for
+    /// [`crate::state::Direction::Forward`].
     ///
     /// A tracked keyset fixes membership when the stream starts. Values remain
     /// live: each chunk reads current values and skips absent cells. Later key
     /// additions do not appear. A chunk resolves all its values before
-    /// emission; a failed chunk emits only its error. [`MapQuery::limit`]
+    /// emission; a failed chunk emits only its error. [`KeyQuery::limit`]
     /// sizes each fetch.
     ///
     /// An overflowed or invalid keyset selects a range scan. This scan captures
@@ -297,24 +296,19 @@ where
     /// hold no admission; range scans run without admission after planning.
     /// The handler can mutate this map between items. Every completion checks
     /// the attempt fence, including errors and exhaustion.
-    pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapStreamItem<KC, V>> + '_
+    pub fn entries(&self, query: KeyQuery<KC>) -> impl Stream<Item = MapStreamItem<KC, V>> + '_
     where
         for<'s> ContextOf<'s, V>: FromSession<'s, S>,
     {
-        self.query(dir).entries()
+        projected::<_, _, Values>(&self.cells, query.encoded)
     }
 
     /// Streams live keys without value decoding or resolution.
     /// Message-backed maps perform no Kafka fetches. Storage presence reads
     /// still occur, and a corrupt value does not hide its key.
-    /// Source selection, consistency, and admission follow [`Self::stream`].
-    pub fn keys(&self, dir: Direction) -> impl Stream<Item = KeyItem<MapKind<KC, V>>> + '_ {
-        self.query(dir).keys()
-    }
-
-    /// Builds a directional stream query.
-    pub fn query(&self, dir: Direction) -> MapQuery<'_, S, KC, V> {
-        KeysetQuery::new(&self.cells, Query::new(dir))
+    /// Source selection, consistency, and admission follow [`Self::entries`].
+    pub fn keys(&self, query: KeyQuery<KC>) -> impl Stream<Item = KeyItem<MapKind<KC, V>>> + '_ {
+        projected::<_, _, Presence>(&self.cells, query.encoded)
     }
 
     /// Reports whether the map holds no live entries.

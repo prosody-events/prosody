@@ -1,10 +1,10 @@
 //! Standalone reads of committed map entries.
 
-use super::{MapReaderQuery, StateReader};
+use super::StateReader;
 use crate::Key;
 use crate::codec::Codec;
-use crate::state::cell_key::Direction;
-use crate::state::descriptor::map::Query;
+use crate::state::KeyQuery;
+use crate::state::cell::{Presence, Values};
 use crate::state::descriptor::{CellType, ContextOf, FromSession, MapDescriptor, ResolvedOf};
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
 use crate::state_reader::session::ReadSession;
@@ -20,7 +20,6 @@ where
     C::Payload: Clone,
     KC: OrderedKeyCodec + 'static,
     V: CellType<Key = UnitKey>,
-    for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
 {
     /// Reads and resolves the committed value for map entry `map_key` under
     /// partition `key`.
@@ -34,6 +33,7 @@ where
         map_key: &KC::Borrowed,
     ) -> Result<Option<ResolvedOf<V>>, StateReaderError>
     where
+        for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
         KC::Borrowed: Display,
     {
         let handle = self.bound(key.into()).await?;
@@ -88,6 +88,7 @@ where
         map_keys: I,
     ) -> Result<Vec<Option<ResolvedOf<V>>>, StateReaderError>
     where
+        for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
         Q: Borrow<KC::Borrowed> + ?Sized + 'a,
         I: IntoIterator<Item = &'a Q>,
         I::IntoIter: Send,
@@ -123,7 +124,7 @@ where
     }
 
     /// Streams the committed live entries of the map under partition `key` in
-    /// key order (ascending for [`Direction::Forward`]).
+    /// key order (ascending for [`crate::state::Direction::Forward`]).
     ///
     /// The stream owns its session and can outlive the reader's borrow.
     ///
@@ -132,19 +133,20 @@ where
     /// Any [`StateReaderError`] from acquiring the session: an empty key, or
     /// an acquisition or identity failure. Per-source read failures surface
     /// as stream items.
-    pub async fn stream<K: Into<Key>>(
+    pub async fn entries<K: Into<Key>>(
         &self,
         key: K,
-        dir: Direction,
+        query: KeyQuery<KC>,
     ) -> Result<
         impl Stream<Item = Result<(KC::Key, ResolvedOf<V>), StateReaderError>> + 'static,
         StateReaderError,
     >
     where
+        for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
         V: 'static,
         ResolvedOf<V>: 'static,
     {
-        self.query(key, dir).entries().await
+        self.projected::<Values>(key.into(), query.encoded).await
     }
 
     /// Streams committed live keys without decoding or resolving values.
@@ -156,21 +158,12 @@ where
     pub async fn keys<K: Into<Key>>(
         &self,
         key: K,
-        dir: Direction,
+        query: KeyQuery<KC>,
     ) -> Result<impl Stream<Item = Result<KC::Key, StateReaderError>> + 'static, StateReaderError>
     where
         V: 'static,
         KC::Key: 'static,
     {
-        self.query(key, dir).keys().await
-    }
-
-    /// Builds a directional stream query for partition `key`.
-    pub fn query<K: Into<Key>>(&self, key: K, dir: Direction) -> MapReaderQuery<'_, KC, V, C, B> {
-        MapReaderQuery {
-            reader: self,
-            key: key.into(),
-            query: Query::new(dir),
-        }
+        self.projected::<Presence>(key.into(), query.encoded).await
     }
 }

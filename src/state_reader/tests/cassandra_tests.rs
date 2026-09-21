@@ -30,6 +30,7 @@ use crate::Topic;
 use crate::cassandra::CassandraStore as CassandraConn;
 use crate::codec::JsonCodec;
 use crate::loader::MemoryLoader;
+use crate::state::DequeQuery;
 use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
     CassandraStore as CassandraCellStore, CellQueries, IdentityQueries, PublicationQueries,
@@ -403,7 +404,9 @@ fn reader_deque_scan_committed() -> Result<()> {
         let reader = StateReader::new(&deps, sub, descriptor)?;
         let model: Vec<Value> = (0..width).map(|i| Value::from(i as i64)).collect();
         let forward = Box::pin(collect_stream(
-            reader.stream(key.clone(), Direction::Forward).await?,
+            reader
+                .values(key.clone(), DequeQuery::new(Direction::Forward))
+                .await?,
         ))
         .await?;
         ensure!(
@@ -411,7 +414,9 @@ fn reader_deque_scan_committed() -> Result<()> {
             "forward scan must equal the ordered model"
         );
         let backward = Box::pin(collect_stream(
-            reader.stream(key, Direction::Backward).await?,
+            reader
+                .values(key, DequeQuery::new(Direction::Backward))
+                .await?,
         ))
         .await?;
         let mut expect_backward = model;

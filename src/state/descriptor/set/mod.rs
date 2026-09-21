@@ -3,11 +3,13 @@
 //! A set stores one zero-byte cell per member. It shares the map keyset
 //! format and keeps the same membership rules.
 
-pub use super::map::SetQuery;
 use super::map::membership::{self, KeysetLayout};
-use super::map::{KeyItem, KeysetQuery, MapKeysetCodec, MapKeysetKey, MapStateError, Query};
+use super::map::projected;
+use super::map::{KeyItem, MapKeysetCodec, MapKeysetKey, MapStateError};
 use super::{CollectionSpec, Descriptor, Keyed};
 use crate::codec::{UnitCodec, UnitCodecError};
+use crate::state::KeyQuery;
+use crate::state::cell::Presence;
 use crate::state::cell_key::Direction;
 use crate::state::collection::{
     CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, StateSession,
@@ -103,10 +105,6 @@ where
     S: StateSession,
     KC: OrderedKeyCodec + 'static,
 {
-    pub(crate) fn cells(&self) -> &Collection<S, SetKind<KC>> {
-        &self.cells
-    }
-
     /// Inserts `key` into the set.
     ///
     /// # Errors
@@ -182,14 +180,9 @@ where
         Ok(())
     }
 
-    /// Streams live members in the direction `dir`.
-    pub fn keys(&self, dir: Direction) -> impl Stream<Item = KeyItem<SetKind<KC>>> + '_ {
-        self.query(dir).keys()
-    }
-
-    /// Builds a directional set query.
-    pub fn query(&self, dir: Direction) -> SetQuery<'_, S, KC> {
-        KeysetQuery::new(&self.cells, Query::new(dir))
+    /// Streams live members in query order.
+    pub fn keys(&self, query: KeyQuery<KC>) -> impl Stream<Item = KeyItem<SetKind<KC>>> + '_ {
+        projected::<_, _, Presence>(&self.cells, query.encoded)
     }
 
     /// Reports whether the set has no live members.

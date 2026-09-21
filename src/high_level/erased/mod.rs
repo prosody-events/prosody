@@ -30,9 +30,8 @@ use implementation::ErasedClient;
 pub(super) use readers::{deque, map, set, value};
 
 pub use readers::{
-    ErasedDequeReader, ErasedDirection, ErasedMapReader, ErasedReadCache, ErasedReaderBuildError,
-    ErasedSetReader, ErasedValueReader, SharedDequeReader, SharedMapReader, SharedSetReader,
-    SharedValueReader,
+    ErasedDequeReader, ErasedMapReader, ErasedReadCache, ErasedReaderBuildError, ErasedSetReader,
+    ErasedValueReader, SharedDequeReader, SharedMapReader, SharedSetReader, SharedValueReader,
 };
 
 /// Consumer lifecycle state materialized across an FFI boundary.

@@ -7,10 +7,7 @@ fn run_set_parity(ops: &[SetOp], prefix: u8) -> Result<bool> {
         let context = parity_context::<Value>()?;
         let handle = context.set_state(SET_NAME)?;
         let prefix = pooled_prefix(prefix);
-        let listing = KeyScanConfig {
-            prefix: Some(prefix.to_owned()),
-            ..KeyScanConfig::default()
-        };
+        let listing = ErasedKeyQuery::default().prefix(prefix);
         let mut floor = BTreeSet::new();
         let mut visible = BTreeSet::new();
         for &(operation, index) in ops.iter().take(MAX_OPS) {

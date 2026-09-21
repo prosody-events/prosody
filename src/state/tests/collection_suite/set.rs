@@ -1,6 +1,7 @@
 //! Set membership follows the model through each event and query.
 
 use super::*;
+use crate::state::KeyQuery;
 use crate::state::descriptor::{SetHandle, set_state};
 use crate::test_util::TEST_RUNTIME;
 use quickcheck::QuickCheck;
@@ -147,11 +148,11 @@ async fn assert_set<S: StateSession>(
         if dir == Direction::Backward {
             expected.reverse();
         }
-        assert_eq!(drain(handle.keys(dir)).await?, expected);
+        assert_eq!(drain(handle.keys(KeyQuery::new(dir))).await?, expected);
         expected.retain(|key| constraints.contains(*key, dir));
         expected.truncate(constraints.limit.map_or(usize::MAX, NonZeroUsize::get));
         assert_eq!(
-            drain(constraints.apply(handle.query(dir)).keys()).await?,
+            drain(handle.keys(constraints.apply(KeyQuery::new(dir)))).await?,
             expected
         );
     }

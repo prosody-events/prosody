@@ -21,18 +21,14 @@
 
 pub(crate) mod acquisition;
 mod admission;
-mod deque;
 mod map;
 mod query;
 mod set;
-pub use deque::DequeReaderQuery;
-
-pub use query::{MapReaderQuery, SetReaderQuery};
 
 use crate::Key;
 use crate::codec::Codec;
+use crate::state::DequeQuery;
 use crate::state::StateName;
-use crate::state::cell_key::Direction;
 use crate::state::descriptor::{
     CellType, ContextOf, DequeDescriptor, FromSession, ResolvedOf, StateDescriptor, ValueDescriptor,
 };
@@ -43,11 +39,11 @@ use crate::state_reader::session::{ReadSession, ReaderCollectionDef, ReaderConte
 use crate::state_reader::{MemoryReaderBackend, ReaderBackend};
 use crate::subsystem::SubsystemName;
 use acquisition::{DEFAULT_REFRESH_INTERVAL, PublicationSnapshot};
-use futures::stream::Stream;
+use futures::{Stream, StreamExt};
 use quanta::Clock;
-use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::coop::cooperative;
 
 /// A cross-group, read-only view over a published keyed-state collection.
 ///
@@ -205,7 +201,6 @@ where
     B: ReaderBackend<C>,
     C::Payload: Clone,
     T: CellType<Key = UnitKey>,
-    for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
 {
     /// Reads and resolves the committed element at front-relative `index`
     /// (`None` when `index >= len`).
@@ -217,7 +212,10 @@ where
         &self,
         key: K,
         index: usize,
-    ) -> Result<Option<ResolvedOf<T>>, StateReaderError> {
+    ) -> Result<Option<ResolvedOf<T>>, StateReaderError>
+    where
+        for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
+    {
         let handle = self.bound(key.into()).await?;
         handle
             .get(index)
@@ -256,7 +254,10 @@ where
     pub async fn peek_front<K: Into<Key>>(
         &self,
         key: K,
-    ) -> Result<Option<ResolvedOf<T>>, StateReaderError> {
+    ) -> Result<Option<ResolvedOf<T>>, StateReaderError>
+    where
+        for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
+    {
         let handle = self.bound(key.into()).await?;
         handle
             .peek_front()
@@ -272,7 +273,10 @@ where
     pub async fn peek_back<K: Into<Key>>(
         &self,
         key: K,
-    ) -> Result<Option<ResolvedOf<T>>, StateReaderError> {
+    ) -> Result<Option<ResolvedOf<T>>, StateReaderError>
+    where
+        for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
+    {
         let handle = self.bound(key.into()).await?;
         handle
             .peek_back()
@@ -281,7 +285,7 @@ where
     }
 
     /// Streams the committed live elements under partition `key` in index order
-    /// (front to back for [`Direction::Forward`]).
+    /// (front to back for [`crate::state::Direction::Forward`]).
     ///
     /// The stream owns its session and can outlive the reader's borrow.
     ///
@@ -290,31 +294,27 @@ where
     /// Any [`StateReaderError`] from acquiring the session: an empty key, or
     /// an acquisition or identity failure. Per-source read failures surface
     /// as stream items.
-    pub async fn stream<K: Into<Key>>(
+    pub async fn values<K: Into<Key>>(
         &self,
         key: K,
-        dir: Direction,
+        query: DequeQuery,
     ) -> Result<
         impl Stream<Item = Result<ResolvedOf<T>, StateReaderError>> + 'static,
         StateReaderError,
     >
     where
+        for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
         T: 'static,
         ResolvedOf<T>: 'static,
     {
-        self.query(key, dir).values().await
-    }
-
-    /// Builds a directional deque query for the partition key.
-    pub fn query<K: Into<Key>>(&self, key: K, dir: Direction) -> DequeReaderQuery<'_, T, C, B> {
-        DequeReaderQuery {
-            reader: self,
-            key: key.into(),
-            dir,
-            start: Bound::Unbounded,
-            end: Bound::Unbounded,
-            limit: None,
-        }
+        let handle = self.bound(key.into()).await?;
+        Ok(async_stream::try_stream! {
+            let inner = handle.values(query);
+            futures::pin_mut!(inner);
+            while let Some(item) = cooperative(inner.next()).await {
+                yield item.map_err(|error| StateReaderError::store(&error))?;
+            }
+        })
     }
 }
 

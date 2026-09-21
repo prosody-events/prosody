@@ -6,7 +6,7 @@
 //! all-empty source set reads `None` or empty. No data plus at least one
 //! source error reads `Err`. [`prop_probe_and_pin`] proves all of this
 //! together over random fault scripts. It covers the point reads `get` and
-//! `len` and the pinned scan `stream`. [`prop_probe_and_pin_set`] proves
+//! `len` and the pinned scan `values`. [`prop_probe_and_pin_set`] proves
 //! the same selection for set reads. A failed read never reports an empty set,
 //! and the store error keeps its category.
 //!
@@ -33,6 +33,7 @@ use crate::state::descriptor::{
     DequeDescriptor, SetDescriptor, StateDescriptor, deque_state, map_state, set_state, value_state,
 };
 use crate::state::order_codec::{I64KeyCodec, Utf8KeyCodec};
+use crate::state::{DequeQuery, KeyQuery};
 use crate::state_reader::backend::ScriptedReaderBackend;
 use crate::state_reader::{StateReader, StateReaderError};
 use color_eyre::eyre::{Result, bail, eyre};
@@ -171,7 +172,7 @@ fn selection(script: &FaultScript) -> Selection {
 /// Selection skips an errored source, and data beats a skipped error. All
 /// sources empty reads `None` or empty. No data plus an earlier error reads
 /// `Err`. This holds for the point reads `get` and `len` and for the pinned
-/// scan `stream` in both directions.
+/// scan `values` in both directions.
 ///
 /// FALSIFICATION: short-circuit `Err` at the first source in
 /// `ReadSession::probe_point` instead of skipping. A `FaultOpen`-then-`Data`
@@ -222,17 +223,21 @@ async fn run_probe_and_pin(script: FaultScript) -> Result<bool> {
 type DequeReader = StateReader<DequeDescriptor<JsonCodec>, JsonCodec, ScriptedReaderBackend>;
 
 /// Asserts the reader's point reads and scan match the selection the script
-/// resolves to. The point reads are `len` and `get`. The scan is `stream`.
+/// resolves to. The point reads are `len` and `get`. The scan is `values`.
 async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> Result<bool> {
     match selection {
         Selection::Pinned { idx, len } => {
             let expected: Vec<Value> = (0..len).map(|j| element(idx, j)).collect();
             let forward = Box::pin(collect_stream(
-                reader.stream(key.clone(), Direction::Forward).await?,
+                reader
+                    .values(key.clone(), DequeQuery::new(Direction::Forward))
+                    .await?,
             ))
             .await?;
             let backward = Box::pin(collect_stream(
-                reader.stream(key.clone(), Direction::Backward).await?,
+                reader
+                    .values(key.clone(), DequeQuery::new(Direction::Backward))
+                    .await?,
             ))
             .await?;
             Ok(reader.len(key.clone()).await? == len
@@ -245,7 +250,7 @@ async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> 
             // No data through a failed source: absence is not provable, so
             // every read errors.
             let streamed: Vec<Result<Value, StateReaderError>> = reader
-                .stream(key.clone(), Direction::Forward)
+                .values(key.clone(), DequeQuery::new(Direction::Forward))
                 .await?
                 .collect::<Vec<_>>()
                 .await;
@@ -256,7 +261,9 @@ async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> 
         Selection::EmptyOnly => Ok(reader.len(key.clone()).await? == 0
             && reader.get(key.clone(), 0).await?.is_none()
             && Box::pin(collect_stream(
-                reader.stream(key.clone(), Direction::Forward).await?,
+                reader
+                    .values(key.clone(), DequeQuery::new(Direction::Forward))
+                    .await?,
             ))
             .await?
             .is_empty()),
@@ -318,7 +325,7 @@ type SetReader = StateReader<SetDescriptor<Utf8KeyCodec>, JsonCodec, ScriptedRea
 /// Asserts the set reader's `is_empty`, `contains`, and `keys` match the
 /// selection the script resolves to.
 async fn assert_set_probe(reader: &SetReader, key: &Key, selection: Selection) -> Result<bool> {
-    let keys = reader.keys(key.clone(), Direction::Forward);
+    let keys = reader.keys(key.clone(), KeyQuery::new(Direction::Forward));
     match selection {
         Selection::Pinned { idx, len } => {
             let expected: Vec<String> = (0..len).map(|j| member(idx, j)).collect();

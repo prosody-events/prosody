@@ -1,9 +1,8 @@
 //! The erased map adapter.
 
 use super::write::ErasedWrite;
-use super::{BoxStateCursor, DynMapState, ErasedStateError, KeyScanConfig, cursor, key_query};
+use super::{BoxStateCursor, DynMapState, ErasedKeyQuery, ErasedStateError, cursor};
 use crate::state::collection::WritableStateSession;
-use crate::state::descriptor::map::KeysetQuery;
 use crate::state::descriptor::{CellType, ContextOf, FromSession, MapHandle, ResolvedOf};
 use crate::state::order_codec::UnitKey;
 use crate::state::order_codec::Utf8KeyCodec;
@@ -89,19 +88,19 @@ where
             .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
-    fn scan(&self, config: KeyScanConfig) -> BoxStateCursor<(String, ResolvedOf<T>)> {
+    fn entries(&self, query: ErasedKeyQuery) -> BoxStateCursor<(String, ResolvedOf<T>)> {
         let handle = self.handle.clone();
         Box::new(cursor(try_stream! {
-            for await item in KeysetQuery::new(handle.cells(), key_query(config)).entries() {
+            for await item in handle.entries(query) {
                 yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
             }
         }))
     }
 
-    fn keys(&self, config: KeyScanConfig) -> BoxStateCursor<String> {
+    fn keys(&self, query: ErasedKeyQuery) -> BoxStateCursor<String> {
         let handle = self.handle.clone();
         Box::new(cursor(try_stream! {
-            for await item in KeysetQuery::new(handle.cells(), key_query(config)).keys() {
+            for await item in handle.keys(query) {
                 yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
             }
         }))

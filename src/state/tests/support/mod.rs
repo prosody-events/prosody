@@ -3,6 +3,7 @@
 //! runners and their trace types stay in `cell_suite`/`collection_suite`/
 //! `identity_suite`; this module holds the standalone doubles they don't own.
 
+use crate::consumer::event_context::StateCursor;
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::middleware::{MarkerWrite, RepinProof};
 use crate::error::{ClassifyError, ErrorCategory};
@@ -409,4 +410,13 @@ pub(crate) fn evidence(
         evidence_ttl: CompactDuration::new(3600),
         dedup,
     }
+}
+
+/// Collects an erased cursor and propagates each read error.
+pub(crate) async fn drain_cursor<T>(cursor: &StateCursor<T>) -> Result<Vec<T>> {
+    let mut items = Vec::new();
+    while let Some(item) = cursor.next().await? {
+        items.push(item);
+    }
+    Ok(items)
 }

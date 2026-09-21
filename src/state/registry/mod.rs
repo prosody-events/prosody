@@ -23,7 +23,7 @@ pub use definition::{CollectionDef, CommitMode, ReadCachePolicy, StateVisibility
 
 /// Registration ceiling on the map and set keyset bound: a larger limit is
 /// rejected at build ([`RegisterStateError::KeysetLimit`]), capping the
-/// point-get fan-out (and decode allocation) a single `stream` can issue — the
+/// point-get fan-out (and decode allocation) a single query can issue — the
 /// byte ceiling separately bounds the frame's wire size.
 pub(crate) const MAX_KEYSET_LIMIT: usize = 4096;
 

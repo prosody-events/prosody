@@ -3,15 +3,11 @@
 use super::{deque, drain, make_session, read_event, registry_and_ref, seed_deque_window};
 use crate::codec::JsonCodec;
 use crate::consumer::middleware::deduplication::MemoryDeduplicationStore;
-use crate::state::collection::StateSession;
-use crate::state::descriptor::map::KeysetQuery;
-use crate::state::descriptor::{
-    CellType, CollectionSpec, StateDescriptor, deque_state, map_state, set_state,
-};
+use crate::state::descriptor::{StateDescriptor, deque_state, map_state, set_state};
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::order_codec::{OrderedKeyCodec, Utf8KeyCodec};
 use crate::state::registry::CollectionDef;
-use crate::state::{Direction, StateKey};
+use crate::state::{DequeQuery, Direction, KeyQuery, StateKey};
 use crate::test_util::TEST_RUNTIME;
 use color_eyre::Result;
 use quickcheck::{Arbitrary, Gen, QuickCheck};
@@ -51,11 +47,9 @@ impl StreamConstraints {
         .contains(&key)
     }
 
-    pub(super) fn apply<S, L>(self, mut query: KeysetQuery<'_, S, L>) -> KeysetQuery<'_, S, L>
+    pub(super) fn apply<KC>(self, mut query: KeyQuery<KC>) -> KeyQuery<KC>
     where
-        S: StateSession,
-        L: CollectionSpec,
-        <L::Cell as CellType>::Key: OrderedKeyCodec<Key = i64, Borrowed = i64>,
+        KC: OrderedKeyCodec<Key = i64, Borrowed = i64>,
     {
         query = match self.start {
             Bound::Included(key) => query.from(&key),
@@ -136,12 +130,7 @@ impl PrefixShape {
         }
     }
 
-    fn apply<'a, S, L>(&self, query: KeysetQuery<'a, S, L>) -> KeysetQuery<'a, S, L>
-    where
-        S: StateSession,
-        L: CollectionSpec,
-        <L::Cell as CellType>::Key: OrderedKeyCodec<Borrowed = str>,
-    {
+    fn apply(&self, query: KeyQuery) -> KeyQuery {
         let mut query = query.prefix(&self.prefix);
         if let Some(cursor) = &self.cursor {
             query = query.after(cursor);
@@ -194,9 +183,18 @@ async fn run_prefix_query(shape: PrefixShape) -> Result<bool> {
             .iter()
             .map(|key| (key.clone(), Value::from(key.clone())))
             .collect();
-        assert_eq!(drain(shape.apply(map.query(dir)).entries()).await?, entries);
-        assert_eq!(drain(shape.apply(map.query(dir)).keys()).await?, expected);
-        assert_eq!(drain(shape.apply(set.query(dir)).keys()).await?, expected);
+        assert_eq!(
+            drain(map.entries(shape.apply(KeyQuery::new(dir)))).await?,
+            entries
+        );
+        assert_eq!(
+            drain(map.keys(shape.apply(KeyQuery::new(dir)))).await?,
+            expected
+        );
+        assert_eq!(
+            drain(set.keys(shape.apply(KeyQuery::new(dir)))).await?,
+            expected
+        );
     }
     Ok(true)
 }
@@ -285,11 +283,11 @@ pub(crate) async fn run_deque_constraint_parity(shape: DequeConstraints) -> Resu
                 expected.reverse();
             }
             expected.truncate(shape.limit.map_or(usize::MAX, NonZeroUsize::get));
-            let mut query = handle.query(dir).range(shape.range);
+            let mut query = DequeQuery::new(dir).range(shape.range);
             if let Some(limit) = shape.limit {
                 query = query.limit(limit);
             }
-            assert_eq!(drain(query.values()).await?, expected);
+            assert_eq!(drain(handle.values(query)).await?, expected);
         }
     }
     Ok(true)

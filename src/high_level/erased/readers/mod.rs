@@ -11,13 +11,13 @@ use crate::high_level::{
     MessageCodecError,
 };
 use crate::state::ReadCachePolicy;
-use crate::state::cell_key::Direction;
 use crate::state::descriptor::{
     DequeDescriptor, MapDescriptor, SetDescriptor, StateDescriptor, ValueDescriptor, deque_state,
     map_state, set_state, value_state,
 };
 use crate::state::order_codec::Utf8KeyCodec;
 use crate::state::registry::MAX_KEYSET_LIMIT;
+use crate::state::{DequeQuery, ErasedKeyQuery};
 use crate::state_reader::{ConsumerReaderBackend, ReaderBackend, StateReader, StateReaderError};
 use crate::subsystem::{SubsystemName, SubsystemNameError};
 use async_trait::async_trait;
@@ -44,25 +44,6 @@ impl From<ErasedReadCache> for ReadCachePolicy {
             ErasedReadCache::Inherit => Self::Inherit,
             ErasedReadCache::Disabled => Self::Disabled,
             ErasedReadCache::Ttl(ttl) => Self::Ttl(ttl),
-        }
-    }
-}
-
-/// Ordering for a foreign-language state scan.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ErasedDirection {
-    /// Ascending map keys, set members, or front-to-back deque elements.
-    #[default]
-    Forward,
-    /// Descending map keys, set members, or back-to-front deque elements.
-    Backward,
-}
-
-impl From<ErasedDirection> for Direction {
-    fn from(direction: ErasedDirection) -> Self {
-        match direction {
-            ErasedDirection::Forward => Self::Forward,
-            ErasedDirection::Backward => Self::Backward,
         }
     }
 }
@@ -98,17 +79,17 @@ pub trait ErasedMapReader<C: Codec>: Send + Sync {
     ) -> Result<Vec<Option<C::Payload>>, ErasedStateError>;
 
     /// Streams committed entries in key order.
-    async fn stream(
+    async fn entries(
         &self,
         key: String,
-        direction: ErasedDirection,
+        query: ErasedKeyQuery,
     ) -> Result<BoxStateCursor<(String, C::Payload)>, ErasedStateError>;
 
     /// Streams committed keys without decoding values.
     async fn keys(
         &self,
         key: String,
-        direction: ErasedDirection,
+        query: ErasedKeyQuery,
     ) -> Result<BoxStateCursor<String>, ErasedStateError>;
 }
 
@@ -135,7 +116,7 @@ pub trait ErasedSetReader: Send + Sync {
     async fn keys(
         &self,
         key: String,
-        direction: ErasedDirection,
+        query: ErasedKeyQuery,
     ) -> Result<BoxStateCursor<String>, ErasedStateError>;
 }
 
@@ -161,10 +142,10 @@ pub trait ErasedDequeReader<C: Codec>: Send + Sync {
     async fn peek_back(&self, key: String) -> Result<Option<C::Payload>, ErasedStateError>;
 
     /// Streams committed elements in index order.
-    async fn stream(
+    async fn values(
         &self,
         key: String,
-        direction: ErasedDirection,
+        query: DequeQuery,
     ) -> Result<BoxStateCursor<C::Payload>, ErasedStateError>;
 }
 
@@ -313,14 +294,14 @@ where
             .map_err(Into::into)
     }
 
-    async fn stream(
+    async fn entries(
         &self,
         key: String,
-        direction: ErasedDirection,
+        query: ErasedKeyQuery,
     ) -> Result<BoxStateCursor<(String, C::Payload)>, ErasedStateError> {
         let stream = self
             .0
-            .stream(Key::from(key), direction.into())
+            .entries(Key::from(key), query)
             .await
             .map_err(ErasedStateError::from)?;
         Ok(Box::new(state_cursor(stream)))
@@ -329,11 +310,11 @@ where
     async fn keys(
         &self,
         key: String,
-        direction: ErasedDirection,
+        query: ErasedKeyQuery,
     ) -> Result<BoxStateCursor<String>, ErasedStateError> {
         let stream = self
             .0
-            .keys(Key::from(key), direction.into())
+            .keys(Key::from(key), query)
             .await
             .map_err(ErasedStateError::from)?;
         Ok(Box::new(state_cursor(stream)))
@@ -375,11 +356,11 @@ where
     async fn keys(
         &self,
         key: String,
-        direction: ErasedDirection,
+        query: ErasedKeyQuery,
     ) -> Result<BoxStateCursor<String>, ErasedStateError> {
         let stream = self
             .0
-            .keys(Key::from(key), direction.into())
+            .keys(Key::from(key), query)
             .await
             .map_err(ErasedStateError::from)?;
         Ok(Box::new(state_cursor(stream)))
@@ -417,14 +398,14 @@ where
         self.0.peek_back(Key::from(key)).await.map_err(Into::into)
     }
 
-    async fn stream(
+    async fn values(
         &self,
         key: String,
-        direction: ErasedDirection,
+        query: DequeQuery,
     ) -> Result<BoxStateCursor<C::Payload>, ErasedStateError> {
         let stream = self
             .0
-            .stream(Key::from(key), direction.into())
+            .values(Key::from(key), query)
             .await
             .map_err(ErasedStateError::from)?;
         Ok(Box::new(state_cursor(stream)))
@@ -470,29 +451,4 @@ impl ClassifyError for ErasedReadLimitError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use color_eyre::Result;
-    use color_eyre::eyre::bail;
-
-    /// The erased boundary accepts the typed API's maximum batch and rejects
-    /// only larger batches. This prevents an FFI caller from allocating an
-    /// uncapped transfer buffer before the shared typed batching begins.
-    #[test]
-    fn get_many_limit_matches_typed_keyset_limit() -> Result<()> {
-        assert!(validate_get_many_len(MAX_KEYSET_LIMIT - 1).is_ok());
-        assert!(validate_get_many_len(MAX_KEYSET_LIMIT).is_ok());
-        let Err(error) = validate_get_many_len(MAX_KEYSET_LIMIT + 1) else {
-            bail!("one key above the limit must be rejected");
-        };
-        assert_eq!(error.classify_error(), ErrorCategory::Permanent);
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "get_many accepts at most {MAX_KEYSET_LIMIT} keys; got {}",
-                MAX_KEYSET_LIMIT + 1
-            )
-        );
-        Ok(())
-    }
-}
+mod tests;

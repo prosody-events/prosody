@@ -5,14 +5,10 @@
 //! objects.
 
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::cell_key::{Direction, ScanEdge};
-use crate::state::descriptor::map::Query;
-use crate::state::order_codec::{OrderedKeyCodec, Utf8KeyCodec};
+use crate::state::{DequeQuery, ErasedKeyQuery};
 use async_trait::async_trait;
 use futures::Stream;
 use std::fmt::Display;
-use std::num::NonZeroUsize;
-use std::ops::Bound;
 use thiserror::Error;
 
 /// Two-way error category for the FFI state seam.
@@ -30,58 +26,6 @@ pub enum ErasedCategory {
     /// Transient failure — retry may succeed (store/loader hiccup, a
     /// terminated attempt, a folded lower-layer `Terminal`).
     Transient,
-}
-
-/// Map and set scan constraints. The key edges follow the scan direction.
-#[derive(Clone, Debug)]
-pub struct KeyScanConfig {
-    /// The scan direction.
-    pub dir: Direction,
-    /// The maximum number of present items.
-    pub limit: Option<NonZeroUsize>,
-    /// The key prefix. Explicit bounds replace its edges.
-    pub prefix: Option<String>,
-    /// The inclusive or exclusive start. An open bound preserves the prefix
-    /// edge.
-    pub start: Bound<String>,
-    /// The inclusive or exclusive end. An open bound preserves the prefix edge.
-    pub end: Bound<String>,
-}
-
-/// Deque scan constraints. The position edges count from the front.
-#[derive(Clone, Debug)]
-pub struct DequeScanConfig {
-    /// The scan direction.
-    pub dir: Direction,
-    /// The maximum number of present items.
-    pub limit: Option<NonZeroUsize>,
-    /// The inclusive, exclusive, or open range start.
-    pub start: Bound<u64>,
-    /// The inclusive, exclusive, or open range end.
-    pub end: Bound<u64>,
-}
-
-impl Default for KeyScanConfig {
-    fn default() -> Self {
-        Self {
-            dir: Direction::Forward,
-            limit: None,
-            prefix: None,
-            start: Bound::Unbounded,
-            end: Bound::Unbounded,
-        }
-    }
-}
-
-impl Default for DequeScanConfig {
-    fn default() -> Self {
-        Self {
-            dir: Direction::Forward,
-            limit: None,
-            start: Bound::Unbounded,
-            end: Bound::Unbounded,
-        }
-    }
 }
 
 impl From<ErasedCategory> for ErrorCategory {
@@ -218,12 +162,12 @@ pub trait DynMapState<Item: Send + 'static>: Send + Sync {
     async fn clear(&self) -> Result<(), ErasedStateError>;
 
     /// A demand-driven cursor over the live entries in key order.
-    fn scan(&self, config: KeyScanConfig) -> BoxStateCursor<(String, Item)>;
+    fn entries(&self, query: ErasedKeyQuery) -> BoxStateCursor<(String, Item)>;
 
     /// A demand-driven cursor over the live entry **keys** in key order,
     /// without decoding or resolving any value (zero Kafka fetches for a
     /// message-backed map). A key is present even when its value is not.
-    fn keys(&self, config: KeyScanConfig) -> BoxStateCursor<String>;
+    fn keys(&self, query: ErasedKeyQuery) -> BoxStateCursor<String>;
 
     /// Durably commits buffered ops mid-handler (at-least-once).
     async fn commit(&self) -> Result<(), ErasedStateError>;
@@ -254,7 +198,7 @@ pub trait DynSetState: Send + Sync {
     async fn clear(&self) -> Result<(), ErasedStateError>;
 
     /// Returns a demand-driven cursor over live keys.
-    fn keys(&self, config: KeyScanConfig) -> BoxStateCursor<String>;
+    fn keys(&self, query: ErasedKeyQuery) -> BoxStateCursor<String>;
 
     /// Commits buffered set operations.
     async fn commit(&self) -> Result<(), ErasedStateError>;
@@ -299,7 +243,7 @@ pub trait DynDequeState<Item: Send + 'static>: Send + Sync {
     async fn clear(&self) -> Result<(), ErasedStateError>;
 
     /// A demand-driven cursor over the live elements in index order.
-    fn scan(&self, config: DequeScanConfig) -> BoxStateCursor<Item>;
+    fn values(&self, query: DequeQuery) -> BoxStateCursor<Item>;
 
     /// Durably commits buffered ops mid-handler (at-least-once).
     async fn commit(&self) -> Result<(), ErasedStateError>;
@@ -319,36 +263,14 @@ pub type BoxSetState = Box<dyn DynSetState>;
 /// Boxed erased deque handle a vend method returns.
 pub type BoxDequeState<Item> = Box<dyn DynDequeState<Item>>;
 
-/// Boxed [`StateCursor`] a `scan` returns.
+/// Boxed cursor returned by an erased query.
 pub type BoxStateCursor<Item> = Box<StateCursor<Item>>;
 
-/// Each erased stream method builds its own `try_stream!` over a cloned
-/// handle. A shared generic helper needs more bounds than it saves.
+/// Adapts an owned stream to the cursor used by language clients.
 fn cursor<T>(
     stream: impl Stream<Item = Result<T, ErasedStateError>> + Send + 'static,
 ) -> StateCursor<T> {
     StateCursor::new(Box::pin(stream))
-}
-
-fn bound_usize(bound: Bound<u64>) -> Bound<usize> {
-    bound.map(|value| usize::try_from(value).unwrap_or(usize::MAX))
-}
-
-/// Encodes the shared map and set query bounds.
-fn key_query(config: KeyScanConfig) -> Query {
-    let edge = |bound: Bound<String>, current| match bound {
-        Bound::Included(key) => ScanEdge::Included(Utf8KeyCodec::encode(&key)),
-        Bound::Excluded(key) => ScanEdge::Excluded(Utf8KeyCodec::encode(&key)),
-        Bound::Unbounded => current,
-    };
-    let mut query = Query::new(config.dir);
-    query.limit = config.limit;
-    if let Some(prefix) = config.prefix {
-        query.prefix(Utf8KeyCodec::encode(&prefix));
-    }
-    query.start = edge(config.start, query.start);
-    query.end = edge(config.end, query.end);
-    query
 }
 
 mod cursor;
@@ -362,3 +284,6 @@ pub(super) use deque::ErasedDeque;
 pub(super) use map::ErasedMap;
 pub(super) use set::ErasedSet;
 pub(super) use value::ErasedValue;
+
+mod context;
+pub use context::{BoxEventContext, BoxEventContextError, DynEventContext};

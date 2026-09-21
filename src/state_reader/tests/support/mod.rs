@@ -17,8 +17,9 @@ mod backend;
 mod owner;
 mod scripted;
 
+pub(crate) use backend::MemoryHarness;
 pub(crate) use backend::publish_source;
-pub(super) use backend::{MemoryHarness, MemoryReaderBackend, ReaderBackend};
+pub(super) use backend::{MemoryReaderBackend, ReaderBackend};
 pub(super) use owner::{OwnerSession, owner_commit_cell, owner_stage};
 pub(crate) use owner::{owner_commit, registry_of, source_state_key};
 pub(crate) use scripted::{CountingIdentityStore, ScriptedCellSource};
