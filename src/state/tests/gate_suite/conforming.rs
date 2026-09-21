@@ -1,7 +1,6 @@
 //! Valid operations within one attempt preserve access.
 
 use super::*;
-use crate::state::query::tests::query_buffer;
 
 /// A conforming within-attempt op for the conforming-handler property.
 #[derive(Clone, Debug)]
@@ -76,7 +75,7 @@ pub(super) fn conforming_within_attempt_never_fenced() {
                     .map_err(|e| eyre!("map set: {e}"))?;
             }
             {
-                let stream = map.entries(query_buffer()).stream();
+                let stream = map.entries().stream();
                 futures::pin_mut!(stream);
                 while let Some(item) = stream.next().await {
                     item.map_err(|e| eyre!("scan: {e}"))?;
@@ -84,7 +83,7 @@ pub(super) fn conforming_within_attempt_never_fenced() {
             }
             let _ = map.rollback().await;
             {
-                let stream = map.entries(query_buffer()).stream();
+                let stream = map.entries().stream();
                 futures::pin_mut!(stream);
                 while let Some(item) = stream.next().await {
                     item.map_err(|e| eyre!("rescan: {e}"))?;

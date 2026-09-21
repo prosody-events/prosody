@@ -44,29 +44,8 @@ impl Query<'_> {
 }
 
 impl<KC: OrderedKeyCodec, B: Borrow<KC::Borrowed>> KeyQuery<KC, B> {
-    /// Returns the buffer capacity needed to encode both bounds.
-    #[must_use]
-    pub fn required_capacity(&self) -> usize {
-        [&self.start, &self.end]
-            .into_iter()
-            .map(|edge| match edge {
-                Edge::Bound(Bound::Unbounded) => 0,
-                Edge::Bound(Bound::Included(key) | Bound::Excluded(key)) | Edge::PrefixEnd(key) => {
-                    KC::encoded_len(key.borrow())
-                }
-            })
-            .sum()
-    }
-
     /// Writes both bounds into reusable storage and returns a borrowed view.
     pub(crate) fn encode<'a>(&self, buf: &'a mut Vec<u8>) -> Result<Query<'a>, KeyCodecError> {
-        let required = self.required_capacity();
-        if required > buf.capacity() {
-            return Err(KeyCodecError::InsufficientCapacity {
-                required,
-                available: buf.capacity(),
-            });
-        }
         buf.clear();
         let (start, end) = KC::with_cached_local(|codec| {
             Ok::<_, KeyCodecError>((

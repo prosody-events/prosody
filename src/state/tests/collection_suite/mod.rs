@@ -46,7 +46,6 @@ use crate::state::descriptor::{
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
-use crate::state::query::tests::query_buffer;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::Promoted;
 use crate::state::session::sealed::StateLifecycle;
@@ -414,11 +413,11 @@ where
             .take(constraints.limit.map_or(usize::MAX, NonZeroUsize::get))
             .collect();
         let entries = handle
-            .entries(query_buffer())
+            .entries()
             .with_query(constraints.apply(KeyQuery::new().direction(dir)))
             .stream();
         let keys = handle
-            .keys(query_buffer())
+            .keys()
             .with_query(constraints.apply(KeyQuery::new().direction(dir)))
             .stream();
         if drain(entries).await? != expected
@@ -438,7 +437,7 @@ async fn collect_map<S>(
 where
     S: StateSession,
 {
-    drain(handle.entries(query_buffer()).direction(dir).stream()).await
+    drain(handle.entries().direction(dir).stream()).await
 }
 
 /// Collects map keys in the selected direction.
@@ -449,7 +448,7 @@ async fn collect_map_keys<S>(
 where
     S: StateSession,
 {
-    drain(handle.keys(query_buffer()).direction(dir).stream()).await
+    drain(handle.keys().direction(dir).stream()).await
 }
 
 /// `Continue` when a mid-trace return matched the model, `Mismatch` otherwise.

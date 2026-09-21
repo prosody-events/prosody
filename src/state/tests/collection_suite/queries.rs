@@ -6,7 +6,6 @@ use crate::consumer::middleware::deduplication::MemoryDeduplicationStore;
 use crate::state::descriptor::{StateDescriptor, deque_state, map_state, set_state};
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::order_codec::{OrderedKeyCodec, Utf8KeyCodec};
-use crate::state::query::tests::query_buffer;
 use crate::state::registry::CollectionDef;
 use crate::state::{BorrowedKeyQuery, DequeQuery, Direction, KeyQuery, StateKey};
 use crate::test_util::TEST_RUNTIME;
@@ -189,7 +188,7 @@ async fn run_prefix_query(shape: PrefixShape) -> Result<bool> {
             .collect();
         assert_eq!(
             drain(
-                map.entries(query_buffer())
+                map.entries()
                     .with_query(shape.apply(KeyQuery::new().direction(dir)))
                     .stream()
             )
@@ -198,7 +197,7 @@ async fn run_prefix_query(shape: PrefixShape) -> Result<bool> {
         );
         assert_eq!(
             drain(
-                map.keys(query_buffer())
+                map.keys()
                     .with_query(shape.apply(KeyQuery::new().direction(dir)))
                     .stream()
             )
@@ -207,7 +206,7 @@ async fn run_prefix_query(shape: PrefixShape) -> Result<bool> {
         );
         assert_eq!(
             drain(
-                set.keys(query_buffer())
+                set.keys()
                     .with_query(shape.apply(KeyQuery::new().direction(dir)))
                     .stream()
             )

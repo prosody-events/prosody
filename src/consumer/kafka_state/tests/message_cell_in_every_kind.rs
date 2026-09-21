@@ -1,5 +1,4 @@
 use super::*;
-use crate::state::query::tests::query_buffer;
 
 /// The topic every seeded message shares; the id doubles as the offset, so
 /// a message is fully identified by its id.
@@ -41,7 +40,7 @@ async fn collect_map(
     dir: Direction,
 ) -> Result<Vec<(String, i64)>> {
     let mut out = Vec::new();
-    let stream = handle.entries(query_buffer()).direction(dir).stream();
+    let stream = handle.entries().direction(dir).stream();
     futures::pin_mut!(stream);
     while let Some(item) = stream.next().await {
         let (key, message) = item?;

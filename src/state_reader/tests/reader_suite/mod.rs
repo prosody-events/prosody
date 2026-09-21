@@ -27,7 +27,6 @@ use crate::state::descriptor::{
 use crate::state::descriptor_identity::DurableDescriptorIdentity;
 use crate::state::identity::StateKey;
 use crate::state::order_codec::I64KeyCodec;
-use crate::state::query::tests::query_buffer;
 use crate::state::tests::collection_suite::{DequeOp, KEY_POOL, MapOp, Trace};
 use crate::state::tests::support::reader_residue;
 use crate::state_reader::backend::ReaderBackend as CoreReaderBackend;
@@ -141,29 +140,18 @@ async fn assert_map<B: ReaderBackend>(
             Ok(value == model.get(k).cloned() && present == model.contains_key(k))
         }),
         reader.get_many(case.key.clone(), &KEY_POOL),
-        collect_stream(reader.entries(case.key.clone(), query_buffer()).stream()),
-        collect_stream(reader.keys(case.key.clone(), query_buffer()).stream()),
+        collect_stream(reader.entries(case.key.clone()).stream()),
+        collect_stream(reader.keys(case.key.clone()).stream()),
         collect_stream(
             reader
-                .entries(case.key.clone(), query_buffer())
+                .entries(case.key.clone())
                 .from(&-1)
                 .before(&2)
                 .limit(NonZeroUsize::MIN)
                 .stream()
         ),
-        collect_stream(
-            reader
-                .keys(case.key.clone(), query_buffer())
-                .after(&-2)
-                .to(&1)
-                .stream()
-        ),
-        collect_stream(
-            reader
-                .entries(case.key.clone(), query_buffer())
-                .reverse()
-                .stream()
-        ),
+        collect_stream(reader.keys(case.key.clone()).after(&-2).to(&1).stream()),
+        collect_stream(reader.entries(case.key.clone()).reverse().stream()),
     );
     let points = points?;
     let many = many?;
@@ -204,14 +192,14 @@ async fn assert_map<B: ReaderBackend>(
             let (entries, keys) = try_join!(
                 collect_stream(
                     reader
-                        .entries(case.key.clone(), query_buffer())
+                        .entries(case.key.clone())
                         .direction(dir)
                         .limit(limit)
                         .stream()
                 ),
                 collect_stream(
                     reader
-                        .keys(case.key.clone(), query_buffer())
+                        .keys(case.key.clone())
                         .direction(dir)
                         .limit(limit)
                         .stream()

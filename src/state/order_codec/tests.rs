@@ -181,8 +181,7 @@ fn prop_key_codec_payload_bytes_are_coordinate_bytes() {
             codec.serialize_ref(&key, &mut borrowed)?;
             let mut input = vec![42];
             codec.serialize_key(key.borrow(), &mut input)?;
-            Ok(input.len() == KC::encoded_len(key.borrow()) + 1
-                && input[0] == 42
+            Ok(input[0] == 42
                 && input[1..] == buf
                 && borrowed == buf
                 && buf == KC::encode(key.borrow()).as_bytes()

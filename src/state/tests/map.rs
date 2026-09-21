@@ -1,7 +1,6 @@
 //! Map stream plans select bounded coordinate and range reads.
 
 use super::*;
-use crate::state::query::tests::query_buffer;
 
 /// Binds `map_state(name)` on `session` and fully drains its entries.
 /// Called with a fresh (clean-overlay) session so every read falls through to
@@ -15,7 +14,7 @@ pub(super) async fn drain_map_stream(
         .bind(session)
         .map_err(|e| eyre!("bind: {e}"))?;
     let mut out = Vec::new();
-    let stream = handle.entries(query_buffer()).direction(dir).stream();
+    let stream = handle.entries().direction(dir).stream();
     futures::pin_mut!(stream);
     while let Some(item) = stream.next().await {
         out.push(item?);

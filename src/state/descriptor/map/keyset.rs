@@ -32,10 +32,6 @@ impl OrderedKeyCodec for MapKeysetKey {
         Coordinate::from_bytes(Bytes::from_static(&[2]))
     }
 
-    fn encoded_len(_key: &Self::Borrowed) -> usize {
-        1
-    }
-
     fn serialize_key(
         &mut self,
         key: &Self::Borrowed,

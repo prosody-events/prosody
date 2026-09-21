@@ -3,7 +3,6 @@
 use crate::EventIdentity;
 use crate::Key;
 use crate::codec::{Codec, ErasedStateCodec};
-use crate::consumer::event_context::encoding_buffer;
 use crate::consumer::event_context::{BoxStateCursor, ErasedStateError, StateCursor};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::high_level::codecs::StateCodec;
@@ -290,7 +289,7 @@ where
     ) -> BoxStateCursor<(String, C::Payload)> {
         let reader = self.0.clone();
         Box::new(state_cursor(async_stream::try_stream! {
-            let stream = reader.entries(key, encoding_buffer(&query)).with_query(query.borrowed()).stream();
+            let stream = reader.entries(key).with_query(query.borrowed()).stream();
             for await item in stream { yield item?; }
         }))
     }
@@ -298,7 +297,7 @@ where
     fn read_keys(&self, key: String, query: ErasedKeyQuery) -> BoxStateCursor<String> {
         let reader = self.0.clone();
         Box::new(state_cursor(async_stream::try_stream! {
-            let stream = reader.keys(key, encoding_buffer(&query)).with_query(query.borrowed()).stream();
+            let stream = reader.keys(key).with_query(query.borrowed()).stream();
             for await item in stream { yield item?; }
         }))
     }
@@ -339,7 +338,7 @@ where
     fn read_keys(&self, key: String, query: ErasedKeyQuery) -> BoxStateCursor<String> {
         let reader = self.0.clone();
         Box::new(state_cursor(async_stream::try_stream! {
-            let stream = reader.keys(key, encoding_buffer(&query)).with_query(query.borrowed()).stream();
+            let stream = reader.keys(key).with_query(query.borrowed()).stream();
             for await item in stream { yield item?; }
         }))
     }

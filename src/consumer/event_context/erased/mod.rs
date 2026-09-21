@@ -288,4 +288,4 @@ pub(super) use value::ErasedValue;
 mod context;
 pub use context::{BoxEventContext, BoxEventContextError, DynEventContext};
 
-pub(crate) mod query;
+mod query;

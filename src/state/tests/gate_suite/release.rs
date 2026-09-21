@@ -1,7 +1,6 @@
 //! Errors and dropped futures release session admission.
 
 use super::*;
-use crate::state::query::tests::query_buffer;
 
 /// The error-yield gate-release pin (map): a `Tracked` map stream whose entry
 /// holds undecodable bytes yields `Err` — and MUST release the session gate
@@ -56,7 +55,7 @@ pub(super) fn map_stream_error_yield_releases_the_gate() -> Result<()> {
             .bind(&session)
             .map_err(|e| eyre!("bind: {e}"))?;
 
-        let stream = handle.entries(query_buffer()).stream();
+        let stream = handle.entries().stream();
         futures::pin_mut!(stream);
         // Projection fails at key 7 before the chunk emits any item.
         let first = stream

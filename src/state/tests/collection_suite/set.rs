@@ -3,7 +3,6 @@
 use super::*;
 use crate::state::KeyQuery;
 use crate::state::descriptor::{SetHandle, set_state};
-use crate::state::query::tests::query_buffer;
 use crate::test_util::TEST_RUNTIME;
 use quickcheck::QuickCheck;
 use std::collections::BTreeSet;
@@ -150,7 +149,7 @@ async fn assert_set<S: StateSession>(
             expected.reverse();
         }
         assert_eq!(
-            drain(handle.keys(query_buffer()).direction(dir).stream()).await?,
+            drain(handle.keys().direction(dir).stream()).await?,
             expected
         );
         expected.retain(|key| constraints.contains(*key, dir));
@@ -158,7 +157,7 @@ async fn assert_set<S: StateSession>(
         assert_eq!(
             drain(
                 handle
-                    .keys(query_buffer())
+                    .keys()
                     .with_query(constraints.apply(KeyQuery::new().direction(dir)))
                     .stream()
             )

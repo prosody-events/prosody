@@ -1,7 +1,6 @@
 //! Fluent queries for erased collection reads.
 
 use super::{BoxStateCursor, DynDequeState, DynMapState, DynSetState};
-use crate::codec::SerializeBufGuard;
 use crate::state::{DequeQuery, DequeRead, ErasedKeyQuery, ReadQuery, ReadSource};
 
 impl<Item: Send + 'static> dyn DynMapState<Item> + '_ {
@@ -49,11 +48,4 @@ impl<Item: Send + 'static> dyn DynDequeState<Item> + '_ {
     ) -> DequeRead<impl ReadSource<Query = DequeQuery, Output = BoxStateCursor<Item>> + '_> {
         ReadQuery::new(DequeQuery::new(), move |query| self.read_values(query))
     }
-}
-
-/// Supplies encoding storage for one erased read.
-pub(crate) fn encoding_buffer(query: &ErasedKeyQuery) -> SerializeBufGuard {
-    let mut buffer = SerializeBufGuard::acquire();
-    buffer.reserve(query.required_capacity());
-    buffer
 }

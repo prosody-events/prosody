@@ -12,7 +12,6 @@ use crate::state_reader::{ReaderBackend, StateReaderError};
 use futures::Stream;
 use std::borrow::Borrow;
 use std::fmt::Display;
-use std::ops::DerefMut;
 
 /// One committed map entry or the error that ended the stream.
 pub type MapReadItem<KC, V> =
@@ -131,11 +130,9 @@ where
     /// Builds a query over committed entries, in ascending key order.
     /// The stream owns the reader state. Its first poll acquires a session.
     /// Acquisition and read errors appear as stream items.
-    /// Supply reusable encoding storage as described by [`KeyQuery`].
-    pub fn entries<'q, K: Into<Key>, E: DerefMut<Target = Vec<u8>> + Send + 'q>(
+    pub fn entries<'q, K: Into<Key>>(
         &self,
         key: K,
-        buffer: E,
     ) -> KeyRead<
         'q,
         KC,
@@ -144,7 +141,7 @@ where
             Output: Stream<Item = MapReadItem<KC, V>> + Send + 'q,
         >
         + 'q
-        + use<'q, K, KC, V, C, B, E>,
+        + use<'q, K, KC, V, C, B>,
     >
     where
         V: 'static,
@@ -154,18 +151,16 @@ where
         let reader = self.clone();
         let key = key.into();
         ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'q, KC>| {
-            reader.projected::<Values, _>(key, query, buffer)
+            reader.projected::<Values>(key, query)
         })
     }
 
     /// Builds a query over committed keys, in ascending key order.
     /// The stream owns the reader state. Its first poll acquires a session.
     /// Acquisition and read errors appear as stream items.
-    /// Supply reusable encoding storage as described by [`KeyQuery`].
-    pub fn keys<'q, K: Into<Key>, E: DerefMut<Target = Vec<u8>> + Send + 'q>(
+    pub fn keys<'q, K: Into<Key>>(
         &self,
         key: K,
-        buffer: E,
     ) -> KeyRead<
         'q,
         KC,
@@ -174,7 +169,7 @@ where
             Output: Stream<Item = Result<KC::Key, StateReaderError>> + Send + 'q,
         >
         + 'q
-        + use<'q, K, KC, V, C, B, E>,
+        + use<'q, K, KC, V, C, B>,
     >
     where
         V: 'static,
@@ -182,7 +177,7 @@ where
         let reader = self.clone();
         let key = key.into();
         ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'q, KC>| {
-            reader.projected::<Presence, _>(key, query, buffer)
+            reader.projected::<Presence>(key, query)
         })
     }
 }

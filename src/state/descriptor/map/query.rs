@@ -2,6 +2,7 @@
 
 use super::MapStateError;
 use super::membership::{self, KeysetLayout};
+use crate::codec::SerializeBufGuard;
 use crate::state::KeyQuery;
 use crate::state::collection::{Collection, StateSession, StreamProjection, sealed};
 use crate::state::descriptor::{
@@ -10,7 +11,6 @@ use crate::state::descriptor::{
 use crate::state::order_codec::OrderedKeyCodec;
 use async_stream::try_stream;
 use futures::{Stream, StreamExt};
-use std::ops::DerefMut;
 use tracing::Instrument;
 
 /// One decoded key or the error that ended the stream.
@@ -24,20 +24,19 @@ pub type MapStreamItem<KC, V> =
     Result<(<KC as OrderedKeyCodec>::Key, ResolvedOf<V>), MapStateError<CellCodecError<V>>>;
 
 /// Executes a map or set query under one projection.
-pub(crate) fn projected<'a, S, L, P, E>(
+pub(crate) fn projected<'a, S, L, P>(
     cells: &'a Collection<S, L>,
     query: KeyQuery<<L::Cell as CellType>::Key, &'a BorrowedKeyOf<L::Cell>>,
-    mut buf: E,
 ) -> impl Stream<Item = Result<P::Item, MapStateError<CellCodecError<L::Cell>>>> + 'a
 where
     S: StateSession,
-    E: DerefMut<Target = Vec<u8>> + Send + 'a,
     L: KeysetLayout,
     P: StreamProjection<S, L::Cell>,
     S::Engine: sealed::Reads<S, P>,
 {
     let span = L::stream_span(cells.name(), query.dir, P::NAME);
     try_stream! {
+        let mut buf = SerializeBufGuard::acquire();
         let query = query.encode(&mut buf).map_err(CellStateError::Key)?;
         let plan = cells.read(async |op| membership::plan(op, &query).await).instrument(span.clone()).await?;
         let inner = plan.with_limit(query.limit).projected::<P>();

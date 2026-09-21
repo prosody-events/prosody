@@ -3,7 +3,7 @@
 use super::{BorrowedKeyQuery, DequeQuery, ErasedKeyQuery, KeyQuery, ReadQuery};
 use crate::codec::SerializeBufGuard;
 use crate::state::Direction;
-use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, Utf8KeyCodec};
+use crate::state::order_codec::{OrderedKeyCodec, Utf8KeyCodec};
 use quickcheck::QuickCheck;
 use std::num::NonZeroUsize;
 use std::ops::Bound;
@@ -128,7 +128,6 @@ fn prop_key_query_method_order() {
                 let query = key_query(dir, steps);
                 let query: ErasedKeyQuery = serde_json::from_slice(&serde_json::to_vec(&query)?)?;
                 let mut buf = SerializeBufGuard::acquire();
-                buf.reserve(query.required_capacity());
                 let query = query.encode(&mut buf)?;
                 let mut coordinates: Vec<_> =
                     keys.iter().map(|key| Utf8KeyCodec::encode(key)).collect();
@@ -240,23 +239,23 @@ fn encoded_prefix_range_matches_bytes() {
     QuickCheck::new().quickcheck(property as fn(Vec<u8>, Vec<u8>, bool, u8));
 }
 
-/// Caller-owned buffers retain their allocations across interleaved queries.
-/// Insufficient capacity produces an error without buffer growth.
+/// Sequential bound encoding reuses the pool after its largest query.
 #[test]
 fn borrowed_queries_reuse_encoding_storage() {
     fn property(mut steps: Vec<KeyStep>) -> color_eyre::Result<()> {
         steps.truncate(128);
-        let capacity = steps
+        let longest = steps
             .iter()
-            .map(|(_, a, b, _)| a.len().max(b.len()) * 2)
-            .max()
-            .unwrap_or(0);
-        let mut left = Vec::with_capacity(capacity);
-        let mut right = Vec::with_capacity(capacity);
-        let allocations = [
-            (left.as_ptr(), left.capacity()),
-            (right.as_ptr(), right.capacity()),
-        ];
+            .flat_map(|(_, a, b, _)| [a.as_str(), b.as_str()])
+            .max_by_key(|key| key.len())
+            .unwrap_or("");
+        let mut buf = SerializeBufGuard::acquire();
+        BorrowedKeyQuery::<Utf8KeyCodec>::new()
+            .prefix(longest)
+            .encode(&mut buf)?;
+        let allocation = (buf.as_ptr(), buf.capacity());
+        drop(buf);
+
         for end in 0..=steps.len() {
             let query = key_read(
                 ReadQuery::new(BorrowedKeyQuery::new(), ()),
@@ -264,24 +263,9 @@ fn borrowed_queries_reuse_encoding_storage() {
                 &steps[..end],
             )
             .into_query();
-            let required = query.required_capacity();
-            let mut empty = Vec::new();
-            if required > 0 {
-                assert!(matches!(query.encode(&mut empty),
-                    Err(KeyCodecError::InsufficientCapacity { required: size, available: 0 }) if size == required));
-                assert_eq!(empty.capacity(), 0);
-            }
-            let first = query.encode(&mut left)?;
-            let second = query.encode(&mut right)?;
-            assert_eq!(first.start, second.start);
-            assert_eq!(first.end, second.end);
-            assert_eq!(
-                [
-                    (left.as_ptr(), left.capacity()),
-                    (right.as_ptr(), right.capacity())
-                ],
-                allocations
-            );
+            let mut buf = SerializeBufGuard::acquire();
+            query.encode(&mut buf)?;
+            assert_eq!((buf.as_ptr(), buf.capacity()), allocation);
         }
         Ok(())
     }
@@ -306,11 +290,4 @@ fn query_json_is_stable() -> color_eyre::Result<()> {
         r#"{"dir":"Forward","start":{"Excluded":2},"end":{"Included":9},"limit":null}"#
     );
     Ok(())
-}
-
-/// Supplies scratch storage for collection test fixtures.
-pub(crate) fn query_buffer() -> SerializeBufGuard {
-    let mut buffer = SerializeBufGuard::acquire();
-    buffer.reserve(4096);
-    buffer
 }

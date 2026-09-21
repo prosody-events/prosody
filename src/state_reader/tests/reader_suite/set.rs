@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::state::descriptor::{SetDescriptor, SetHandle};
-use crate::state::query::tests::query_buffer;
 use color_eyre::eyre::WrapErr;
 use std::collections::BTreeSet;
 
@@ -86,21 +85,16 @@ async fn check<B: ReaderBackend>(
             Ok(reader.contains(case.key.clone(), member).await? == model.contains(member))
         }),
         reader.contains_many(case.key.clone(), &KEY_POOL),
-        collect_stream(reader.keys(case.key.clone(), query_buffer()).stream()),
+        collect_stream(reader.keys(case.key.clone()).stream()),
         collect_stream(
             reader
-                .keys(case.key.clone(), query_buffer())
+                .keys(case.key.clone())
                 .after(&-2)
                 .to(&1)
                 .limit(NonZeroUsize::MIN)
                 .stream()
         ),
-        collect_stream(
-            reader
-                .keys(case.key.clone(), query_buffer())
-                .reverse()
-                .stream()
-        ),
+        collect_stream(reader.keys(case.key.clone()).reverse().stream()),
     );
     let points = points?;
     let presence = presence?;

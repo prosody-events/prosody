@@ -1,7 +1,6 @@
 //! Read plans and batches hold the required admission.
 
 use super::*;
-use crate::state::query::tests::query_buffer;
 
 /// An absent keyset produces no entry reads or scans.
 /// Only the keyset read reaches storage.
@@ -17,7 +16,7 @@ pub(super) fn map_absent_keyset_streams_zero_reads() -> Result<()> {
         fx.counting.reset();
         let mut yielded = 0usize;
         {
-            let stream = handle.entries(query_buffer()).stream();
+            let stream = handle.entries().stream();
             futures::pin_mut!(stream);
             while let Some(item) = stream.next().await {
                 item.map_err(|e| eyre!("stream: {e}"))?;
@@ -94,7 +93,7 @@ pub(super) fn gate_excludes_set_during_keyset_stream() -> Result<()> {
             let handle = handle.clone();
             async move {
                 let mut out = Vec::new();
-                let stream = handle.entries(query_buffer()).stream();
+                let stream = handle.entries().stream();
                 futures::pin_mut!(stream);
                 while let Some(item) = stream.next().await {
                     out.push(item?);

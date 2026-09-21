@@ -33,7 +33,6 @@ where
 
 /// Query settings bound to a collection and a result projection.
 /// Construction performs no storage reads. Poll the stream to start the read.
-/// Key reads retain the encoding storage supplied at construction.
 #[must_use]
 pub struct ReadQuery<Q, S> {
     query: Q,

@@ -11,7 +11,6 @@ use crate::state_reader::{ReaderBackend, StateReaderError};
 use futures::Stream;
 use std::borrow::Borrow;
 use std::fmt::Display;
-use std::ops::DerefMut;
 
 impl<KC, C, B> StateReader<SetDescriptor<KC>, C, B>
 where
@@ -78,11 +77,9 @@ where
     /// Builds a query over committed keys, in ascending key order.
     /// The stream owns the reader state. Its first poll acquires a session.
     /// Acquisition and read errors appear as stream items.
-    /// Supply reusable encoding storage as described by [`KeyQuery`].
-    pub fn keys<'q, K: Into<Key>, E: DerefMut<Target = Vec<u8>> + Send + 'q>(
+    pub fn keys<'q, K: Into<Key>>(
         &self,
         key: K,
-        buffer: E,
     ) -> KeyRead<
         'q,
         KC,
@@ -91,12 +88,12 @@ where
             Output: Stream<Item = Result<KC::Key, StateReaderError>> + Send + 'q,
         >
         + 'q
-        + use<'q, K, KC, C, B, E>,
+        + use<'q, K, KC, C, B>,
     > {
         let reader = self.clone();
         let key = key.into();
         ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'q, KC>| {
-            reader.projected::<Presence, _>(key, query, buffer)
+            reader.projected::<Presence>(key, query)
         })
     }
 }

@@ -5,7 +5,6 @@ use crate::Key;
 use crate::codec::JsonCodec;
 use crate::state::descriptor::{StateDescriptor, deque_state, map_state, set_state};
 use crate::state::order_codec::Utf8KeyCodec;
-use crate::state::query::tests::query_buffer;
 use crate::state_reader::backend::ScriptedReaderBackend;
 use crate::state_reader::{StateReader, StateReaderError};
 use color_eyre::Result;
@@ -15,17 +14,17 @@ use futures::{Stream, StreamExt};
 async fn queries_acquire_on_first_poll() -> Result<()> {
     Box::pin(check_lazy(
         map_state::<Utf8KeyCodec, JsonCodec>("lazy-map"),
-        |reader, key| reader.entries(key, query_buffer()).stream(),
+        |reader, key| reader.entries(key).stream(),
     ))
     .await?;
     Box::pin(check_lazy(
         map_state::<Utf8KeyCodec, JsonCodec>("lazy-keys"),
-        |reader, key| reader.keys(key, query_buffer()).stream(),
+        |reader, key| reader.keys(key).stream(),
     ))
     .await?;
     Box::pin(check_lazy(
         set_state::<Utf8KeyCodec>("lazy-set"),
-        |reader, key| reader.keys(key, query_buffer()).stream(),
+        |reader, key| reader.keys(key).stream(),
     ))
     .await?;
     Box::pin(check_lazy(

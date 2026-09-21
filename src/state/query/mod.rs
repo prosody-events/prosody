@@ -25,10 +25,9 @@ use std::ops::{Bound, RangeBounds};
 /// strings. The codec must match the collection. Encoding starts when the
 /// stream is polled.
 ///
-/// Typed reads require reusable encoding storage. Allocate it before the hot
-/// loop. The stream retains that storage. Encoding rejects insufficient
-/// capacity before it writes bytes; it never grows the supplied buffer.
-/// Use [`Self::required_capacity`] to size storage for saved settings.
+/// Execution reuses a thread-local encoding buffer. Each live stream retains
+/// its buffer. Sequential reads reuse its capacity after the stream drops.
+/// A cold pool, larger bounds, or overlapping streams can require allocation.
 ///
 /// Forward order is the default. Direction changes preserve selected bounds.
 /// Edges follow the query direction. Each bound method replaces one edge.

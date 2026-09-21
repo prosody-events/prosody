@@ -1,7 +1,6 @@
 //! Collection operations export their operation spans.
 
 use super::*;
-use crate::state::query::tests::query_buffer;
 
 /// The named attribute's exported value, stringified.
 pub(super) fn span_attr(span: &SpanData, key: &str) -> Option<String> {
@@ -25,8 +24,8 @@ pub(super) async fn run_collection_ops() -> Result<()> {
     map.get("k1").await?;
     map.get_many(&["k1", "k2"]).await?;
     map.contains_many(&["k1", "k2"]).await?;
-    let _entries: Vec<_> = map.entries(query_buffer()).stream().try_collect().await?;
-    let _keys: Vec<_> = map.keys(query_buffer()).stream().try_collect().await?;
+    let _entries: Vec<_> = map.entries().stream().try_collect().await?;
+    let _keys: Vec<_> = map.keys().stream().try_collect().await?;
     map.is_empty().await?;
     map.remove("k1").await?;
 
@@ -34,7 +33,7 @@ pub(super) async fn run_collection_ops() -> Result<()> {
     set.insert("k1").await?;
     set.contains("k1").await?;
     set.contains_many(&["k1", "k2"]).await?;
-    let _members: Vec<_> = set.keys(query_buffer()).stream().try_collect().await?;
+    let _members: Vec<_> = set.keys().stream().try_collect().await?;
     set.is_empty().await?;
     set.remove("k1").await?;
 

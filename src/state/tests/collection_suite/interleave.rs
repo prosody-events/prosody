@@ -1,7 +1,6 @@
 //! Stream observations across interleaved collection operations.
 
 use super::*;
-use crate::state::query::tests::query_buffer;
 
 /// One step of a map stream-interleave trace: advance the live stream one item,
 /// or run a mutator on the same session between items.
@@ -229,7 +228,7 @@ pub(crate) async fn run_map_stream_interleave(input: MapInterleave) -> Result<bo
     // A fresh live session; the stream and its racing mutators share it.
     let session = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
-    let stream = handle.entries(query_buffer()).direction(dir).stream();
+    let stream = handle.entries().direction(dir).stream();
     futures::pin_mut!(stream);
 
     let mut yielded: BTreeSet<i64> = BTreeSet::new();

@@ -3,7 +3,6 @@
 use super::*;
 use crate::codec::JsonCodec;
 use crate::state::Direction;
-use crate::state::query::tests::query_buffer;
 use crate::state::query::tests::{KeyStep, expected_keys, key_query, key_read};
 use crate::state::tests::support::drain_cursor;
 use crate::state_reader::tests::support::{
@@ -72,7 +71,7 @@ async fn check_queries(keys: &[String], steps: &[KeyStep], tracked: bool) -> Res
             }
             for dir in [Direction::Forward, Direction::Backward] {
                 let expected = expected_keys(keys.iter().map(String::as_str), dir, steps);
-                let read = key_read(handle.keys(query_buffer()), dir, steps);
+                let read = key_read(handle.keys(), dir, steps);
                 let actual: Vec<_> = read.stream().try_collect().await?;
                 assert_eq!(actual, expected);
             }

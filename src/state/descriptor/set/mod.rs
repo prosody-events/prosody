@@ -21,7 +21,6 @@ use educe::Educe;
 use futures::stream::Stream;
 use std::borrow::Borrow;
 use std::fmt::Display;
-use std::ops::DerefMut;
 use tracing::{Span, field::Empty, info_span, instrument};
 
 collection_layout! {
@@ -182,10 +181,8 @@ where
     }
 
     /// Builds a query over live members in ascending key order.
-    /// Supply reusable encoding storage as described by [`KeyQuery`].
-    pub fn keys<'a, E: DerefMut<Target = Vec<u8>> + Send + 'a>(
+    pub fn keys<'a>(
         &'a self,
-        buffer: E,
     ) -> KeyRead<
         'a,
         KC,
@@ -195,7 +192,7 @@ where
         > + 'a,
     > {
         ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
-            projected::<_, _, Presence, _>(&self.cells, query, buffer)
+            projected::<_, _, Presence>(&self.cells, query)
         })
     }
 

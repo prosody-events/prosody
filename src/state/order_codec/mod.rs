@@ -35,12 +35,8 @@ pub trait OrderedKeyCodec: Codec<Payload = Self::Key, Error = KeyCodecError> {
     /// Encodes a key to its order-preserving bytes.
     fn encode(key: &Self::Borrowed) -> Coordinate;
 
-    /// Returns the exact byte length written by `serialize_key`.
-    fn encoded_len(key: &Self::Borrowed) -> usize;
-
     /// Appends a borrowed key to reusable encoding storage.
     /// The output must match both `encode` and `Codec::serialize_ref`.
-    /// Append exactly `encoded_len(key)` bytes. Reuse the supplied storage.
     ///
     /// # Errors
     ///
@@ -81,10 +77,6 @@ impl OrderedKeyCodec for UnitKey {
 
     fn encode((): &Self::Borrowed) -> Coordinate {
         Coordinate::empty()
-    }
-
-    fn encoded_len(_key: &Self::Borrowed) -> usize {
-        0
     }
 
     fn serialize_key(
@@ -163,10 +155,6 @@ impl OrderedKeyCodec for Utf8KeyCodec {
         Coordinate::from_bytes(key.as_bytes().to_vec())
     }
 
-    fn encoded_len(key: &Self::Borrowed) -> usize {
-        key.len()
-    }
-
     fn serialize_key(
         &mut self,
         key: &Self::Borrowed,
@@ -236,10 +224,6 @@ impl OrderedKeyCodec for I64KeyCodec {
         Coordinate::from_bytes(order_preserving_i64(*key).to_vec())
     }
 
-    fn encoded_len(_key: &Self::Borrowed) -> usize {
-        8
-    }
-
     fn serialize_key(
         &mut self,
         key: &Self::Borrowed,
@@ -290,10 +274,6 @@ impl OrderedKeyCodec for U64KeyCodec {
 
     fn encode(key: &Self::Borrowed) -> Coordinate {
         Coordinate::from_bytes(key.to_be_bytes().to_vec())
-    }
-
-    fn encoded_len(_key: &Self::Borrowed) -> usize {
-        8
     }
 
     fn serialize_key(
@@ -348,15 +328,6 @@ fn fixed_width_8(bytes: &[u8]) -> Result<[u8; 8], KeyCodecError> {
 /// Error encoding or decoding order-preserving key bytes.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum KeyCodecError {
-    /// The caller's encoding buffer cannot hold the query bounds.
-    #[error("query encoding requires {required} bytes; buffer capacity is {available}")]
-    InsufficientCapacity {
-        /// The bytes needed to encode both bounds.
-        required: usize,
-        /// The capacity supplied by the caller.
-        available: usize,
-    },
-
     /// The byte slice was not the codec's fixed key width.
     #[error("bad key length: expected {expected}, got {actual}")]
     BadLength {

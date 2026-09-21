@@ -11,7 +11,6 @@ use crate::state::descriptor::{
     MapDescriptor, MapHandle, SetDescriptor, SetHandle, StateDescriptor, map_state, set_state,
 };
 use crate::state::order_codec::Utf8KeyCodec;
-use crate::state::query::tests::query_buffer;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CELL_BATCH;
 use crate::state_reader::StateReader;
@@ -189,12 +188,10 @@ async fn check_map<S: WritableStateSession>(
         presence
     );
     assert_eq!(handle.contains_many(unknown(keys)).await?, presence);
-    let capacity = members.iter().map(String::len).max().unwrap_or(0) * 2;
-    let mut bounds = Vec::with_capacity(capacity);
     for edge in members.first().into_iter().chain(members.last()) {
         assert_eq!(
             handle
-                .entries(&mut bounds)
+                .entries()
                 .from(edge.as_str())
                 .to(edge.as_str())
                 .stream()
@@ -204,7 +201,7 @@ async fn check_map<S: WritableStateSession>(
         );
         assert!(
             handle
-                .keys(&mut bounds)
+                .keys()
                 .reverse()
                 .after(edge.as_str())
                 .before(edge.as_str())
@@ -215,11 +212,7 @@ async fn check_map<S: WritableStateSession>(
         );
     }
     assert_eq!(
-        handle
-            .entries(query_buffer())
-            .stream()
-            .try_collect::<Vec<_>>()
-            .await?,
+        handle.entries().stream().try_collect::<Vec<_>>().await?,
         entries
     );
     Ok(())
@@ -249,11 +242,7 @@ async fn check_set<S: WritableStateSession>(
         );
     }
     assert_eq!(
-        handle
-            .keys(query_buffer())
-            .stream()
-            .try_collect::<Vec<_>>()
-            .await?,
+        handle.keys().stream().try_collect::<Vec<_>>().await?,
         members
     );
     Ok(())
@@ -309,27 +298,27 @@ async fn check_readers(
         |edge| async move {
             let (entries, members, map_excluded, set_excluded) = try_join!(
                 collect_stream(
-                    map.entries(key.clone(), query_buffer())
+                    map.entries(key.clone())
                         .from(edge.as_str())
                         .to(edge.as_str())
                         .stream()
                 ),
                 collect_stream(
-                    set.keys(key.clone(), query_buffer())
+                    set.keys(key.clone())
                         .reverse()
                         .from(edge.as_str())
                         .to(edge.as_str())
                         .stream()
                 ),
                 collect_stream(
-                    map.keys(key.clone(), query_buffer())
+                    map.keys(key.clone())
                         .reverse()
                         .after(edge.as_str())
                         .before(edge.as_str())
                         .stream()
                 ),
                 collect_stream(
-                    set.keys(key.clone(), query_buffer())
+                    set.keys(key.clone())
                         .after(edge.as_str())
                         .before(edge.as_str())
                         .stream()

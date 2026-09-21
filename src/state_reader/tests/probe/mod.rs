@@ -32,7 +32,6 @@ use crate::state::descriptor::{
     DequeDescriptor, SetDescriptor, StateDescriptor, deque_state, map_state, set_state, value_state,
 };
 use crate::state::order_codec::{I64KeyCodec, Utf8KeyCodec};
-use crate::state::query::tests::query_buffer;
 use crate::state_reader::backend::ScriptedReaderBackend;
 use crate::state_reader::{StateReader, StateReaderError};
 use color_eyre::eyre::{Result, bail, eyre};
@@ -313,7 +312,7 @@ type SetReader = StateReader<SetDescriptor<Utf8KeyCodec>, JsonCodec, ScriptedRea
 /// Asserts the set reader's `is_empty`, `contains`, and `keys` match the
 /// selection the script resolves to.
 async fn assert_set_probe(reader: &SetReader, key: &Key, selection: Selection) -> Result<bool> {
-    let keys = reader.keys(key.clone(), query_buffer()).stream();
+    let keys = reader.keys(key.clone()).stream();
     match selection {
         Selection::Pinned { idx, len } => {
             let expected: Vec<String> = (0..len).map(|j| member(idx, j)).collect();

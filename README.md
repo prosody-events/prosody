@@ -253,16 +253,13 @@ Start a fluent query with `entries`, `keys`, or `values`:
 use std::num::NonZeroUsize;
 
 let page_size = NonZeroUsize::try_from(20_usize)?;
-// Allocate once before the query loop. Each live stream needs its own buffer.
-let mut bounds = Vec::with_capacity(512);
-let entries = map.entries(&mut bounds)
+let entries = map.entries()
     .prefix("order:")
     .after("order:0042")
     .limit(page_size)
     .stream();
 
-let mut committed_bounds = Vec::with_capacity(512);
-let committed_entries = reader.entries("customer-123", &mut committed_bounds)
+let committed_entries = reader.entries("customer-123")
     .prefix("order:")
     .reverse()
     .limit(page_size)
@@ -273,9 +270,9 @@ Each fluent method consumes and returns the builder. Call `into_query()` to
 extract reusable settings. Apply borrowed settings with `with_query(query)`.
 For owned settings, use `with_query(query.borrowed())`.
 
-Typed key reads borrow reusable encoding storage. Insufficient capacity returns
-an error; encoding never grows the buffer. Use `query.required_capacity()` when
-settings are known before the loop. Erased reads manage encoding storage internally.
+Key reads reuse the thread-local encoding buffer pool. Each live stream retains
+its buffer. Sequential reads reuse its capacity after the stream drops.
+A cold pool, larger bounds, or overlapping streams can require allocation.
 
 Query settings support Serde. Store owned settings when bounds must outlive their source.
 

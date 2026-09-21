@@ -1,7 +1,6 @@
 //! Session gates preserve tracked keyset updates.
 
 use super::*;
-use crate::state::query::tests::query_buffer;
 
 /// The keyset read-modify-write race pin (the pre-existing lost-update the gate
 /// closes): two racing fresh-key sets serialize under the gate, so the keyset
@@ -58,7 +57,7 @@ pub(super) fn gate_serializes_racing_keyset_rmw() -> Result<()> {
             .map_err(|e| eyre!("bind: {e}"))?;
         let mut keys = Vec::new();
         {
-            let stream = fresh.entries(query_buffer()).stream();
+            let stream = fresh.entries().stream();
             futures::pin_mut!(stream);
             while let Some(item) = stream.next().await {
                 let (key, _) = item.map_err(|e| eyre!("stream: {e}"))?;
@@ -193,7 +192,7 @@ pub(super) fn gate_overflows_keyset_at_the_limit() -> Result<()> {
             .map_err(|e| eyre!("bind: {e}"))?;
         let mut keys = Vec::new();
         {
-            let stream = fresh.entries(query_buffer()).stream();
+            let stream = fresh.entries().stream();
             futures::pin_mut!(stream);
             while let Some(item) = stream.next().await {
                 let (key, _) = item.map_err(|e| eyre!("stream: {e}"))?;
@@ -250,7 +249,7 @@ pub(super) fn map_keyset_rotating_stays_tracked() -> Result<()> {
         let fresh = descriptor.bind(&verify).map_err(|e| eyre!("bind: {e}"))?;
         let mut keys = Vec::new();
         {
-            let stream = fresh.entries(query_buffer()).stream();
+            let stream = fresh.entries().stream();
             futures::pin_mut!(stream);
             while let Some(item) = stream.next().await {
                 let (key, _) = item.map_err(|e| eyre!("stream: {e}"))?;
@@ -301,7 +300,7 @@ pub(super) fn map_keyset_removal_heals_oversized() -> Result<()> {
         {
             let verify = fx.session(1);
             let fresh = descriptor.bind(&verify).map_err(|e| eyre!("bind: {e}"))?;
-            let stream = fresh.entries(query_buffer()).stream();
+            let stream = fresh.entries().stream();
             futures::pin_mut!(stream);
             while (stream.next().await).is_some() {}
         }
@@ -325,7 +324,7 @@ pub(super) fn map_keyset_removal_heals_oversized() -> Result<()> {
         let fresh = descriptor.bind(&verify).map_err(|e| eyre!("bind: {e}"))?;
         let mut keys = Vec::new();
         {
-            let stream = fresh.entries(query_buffer()).stream();
+            let stream = fresh.entries().stream();
             futures::pin_mut!(stream);
             while let Some(item) = stream.next().await {
                 let (key, _) = item.map_err(|e| eyre!("stream: {e}"))?;

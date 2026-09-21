@@ -1,7 +1,6 @@
 //! Stream demand bounds reads and message resolution.
 
 use super::*;
-use crate::state::query::tests::query_buffer;
 
 /// A dense stream-laziness case: a collection of `n` entries drained
 /// streams limited to `k` items, with `n` on the deque's point-get arm (`≤
@@ -108,11 +107,7 @@ pub(super) async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Directio
     );
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     let taken: Vec<_> = {
-        let stream = handle
-            .entries(query_buffer())
-            .direction(dir)
-            .stream()
-            .take(k);
+        let stream = handle.entries().direction(dir).stream().take(k);
         futures::pin_mut!(stream);
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {

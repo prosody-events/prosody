@@ -43,7 +43,6 @@ use tokio::sync::watch;
 use tracing::{Instrument, Span, error, field::Empty, field::display};
 
 mod erased;
-pub(crate) use erased::query::encoding_buffer;
 
 pub use erased::{
     BoxDequeState, BoxMapState, BoxSetState, BoxStateCursor, BoxValueState, DynDequeState,

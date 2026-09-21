@@ -1,7 +1,6 @@
 //! Map membership and result limits with absent values.
 
 use super::*;
-use crate::state::query::tests::query_buffer;
 
 /// Map key-scan presence: over a directly-seeded map whose keyset frame
 /// over-reports a TTL-expired coordinate, The key stream yields exactly the
@@ -78,23 +77,8 @@ pub(crate) async fn run_map_key_scan_holes(shape: MapKeyHoles) -> Result<bool> {
             let all = collect_map(&handle, dir).await?;
             let limit = NonZeroUsize::new(all.len() / 2 + 1).unwrap_or(NonZeroUsize::MIN);
             let expected: Vec<_> = all.into_iter().take(limit.get()).collect();
-            if drain(
-                handle
-                    .entries(query_buffer())
-                    .direction(dir)
-                    .limit(limit)
-                    .stream(),
-            )
-            .await?
-                != expected
-                || drain(
-                    handle
-                        .keys(query_buffer())
-                        .direction(dir)
-                        .limit(limit)
-                        .stream(),
-                )
-                .await?
+            if drain(handle.entries().direction(dir).limit(limit).stream()).await? != expected
+                || drain(handle.keys().direction(dir).limit(limit).stream()).await?
                     != expected.iter().map(|(key, _)| *key).collect::<Vec<_>>()
             {
                 return Ok(false);

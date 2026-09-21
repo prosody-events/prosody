@@ -15,7 +15,6 @@ mod query;
 #[cfg(test)]
 use layout::FrozenLayout;
 pub use layout::MapKind;
-use std::ops::DerefMut;
 mod keyset;
 pub(super) mod membership;
 use keyset::Keyset;
@@ -297,10 +296,8 @@ where
     /// hold no admission; range scans run without admission after planning.
     /// The handler can mutate this map between items. Every completion checks
     /// the attempt fence, including errors and exhaustion.
-    /// Supply reusable encoding storage as described by [`KeyQuery`].
-    pub fn entries<'a, E: DerefMut<Target = Vec<u8>> + Send + 'a>(
+    pub fn entries<'a>(
         &'a self,
-        buffer: E,
     ) -> KeyRead<
         'a,
         KC,
@@ -313,7 +310,7 @@ where
         for<'s> ContextOf<'s, V>: FromSession<'s, S>,
     {
         ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
-            projected::<_, _, Values, _>(&self.cells, query, buffer)
+            projected::<_, _, Values>(&self.cells, query)
         })
     }
 
@@ -321,10 +318,8 @@ where
     /// Message-backed maps perform no Kafka fetches. Storage presence reads
     /// still occur, and a corrupt value does not hide its key.
     /// Source selection, consistency, and admission follow [`Self::entries`].
-    /// Supply reusable encoding storage as described by [`KeyQuery`].
-    pub fn keys<'a, E: DerefMut<Target = Vec<u8>> + Send + 'a>(
+    pub fn keys<'a>(
         &'a self,
-        buffer: E,
     ) -> KeyRead<
         'a,
         KC,
@@ -334,7 +329,7 @@ where
         > + 'a,
     > {
         ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
-            projected::<_, _, Presence, _>(&self.cells, query, buffer)
+            projected::<_, _, Presence>(&self.cells, query)
         })
     }
 
