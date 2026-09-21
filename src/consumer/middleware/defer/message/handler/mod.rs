@@ -7,8 +7,10 @@
 //!
 //! 1. **Ordering**: Messages for a key are processed in offset order.
 //!
-//! 2. **Completion**: All messages are processed. Deferred keys always have an
-//!    active timer ensuring eventual processing.
+//! 2. **Completion**: A key with a non-empty deferred queue has a scheduled
+//!    retry timer. Every queue write follows the timer write that covers it. A
+//!    failed timer write leaves the queue unchanged, and the redelivery repeats
+//!    the step.
 //!
 //! 3. **Deferral**: When enabled, all transient errors are deferred. Once
 //!    deferred, transient errors always re-defer (config/decider only gate
