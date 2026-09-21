@@ -169,4 +169,7 @@ const _: () = assert!(
 );
 
 pub(crate) mod query;
-pub use query::{DequeQuery, ErasedKeyQuery, KeyQuery};
+pub use query::{
+    BorrowedKeyQuery, DequeQuery, DequeRead, ErasedKeyQuery, KeyQuery, KeyRead, ReadQuery,
+    ReadSource,
+};

@@ -271,7 +271,7 @@ fn range_plan_terminates_at_first_error() -> Result<()> {
         let cells = bind_plain(&session)?;
         let plan = cells
             .read(async |op| {
-                op.range(
+                op.range::<_, &[u8]>(
                     PlainLayout::CELLS,
                     ScanEdge::Unbounded,
                     Direction::Forward,
@@ -319,14 +319,14 @@ async fn plan_fences_after_its_last_item() -> Result<()> {
             let plan = cells
                 .read(async |op| {
                     if use_range {
-                        op.range(
+                        op.range::<_, &[u8]>(
                             PlainLayout::CELLS,
                             ScanEdge::Unbounded,
                             Direction::Forward,
                             ScanEdge::Unbounded,
                         )
                     } else {
-                        op.coordinates(
+                        op.coordinates::<_, &[u8]>(
                             PlainLayout::CELLS,
                             vec![I64KeyCodec::encode(&7), I64KeyCodec::encode(&8)],
                         )
@@ -427,7 +427,7 @@ fn plan_streams_are_send() -> Result<()> {
         let cells = bind_gated(&session)?;
         let range = cells
             .read(async |op| {
-                op.range(
+                op.range::<_, &[u8]>(
                     GatedLayout::CELLS,
                     ScanEdge::Unbounded,
                     Direction::Forward,
@@ -437,7 +437,7 @@ fn plan_streams_are_send() -> Result<()> {
             .await;
         assert_send(range.projected::<Values>());
         let points = cells
-            .read(async |op| op.coordinates(GatedLayout::CELLS, Vec::new()))
+            .read(async |op| op.coordinates::<_, &[u8]>(GatedLayout::CELLS, Vec::new()))
             .await;
         assert_send(points.projected::<Values>());
         Ok(())
@@ -516,7 +516,7 @@ async fn ranged_keys(release: &[usize]) -> Result<Vec<i64>> {
 
     let plan = cells
         .read(async |op| {
-            op.range(
+            op.range::<_, &[u8]>(
                 GatedLayout::CELLS,
                 ScanEdge::Unbounded,
                 Direction::Forward,

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::state::Direction;
-use crate::state::query::tests::{KeyStep, expected_keys, key_query};
+use crate::state::query::tests::{KeyStep, expected_keys, key_query, key_read};
 
 #[test]
 fn prop_erased_handler_queries_match_model() {
@@ -29,26 +29,41 @@ fn prop_erased_handler_queries_match_model() {
                         .iter()
                         .map(|key| (key.clone(), Value::from(key.clone())))
                         .collect::<Vec<_>>();
-                    assert_eq!(drain_cursor(&map.entries(query.clone())).await?, entries);
-                    assert_eq!(drain_cursor(&map.keys(query.clone())).await?, expected);
-                    assert_eq!(drain_cursor(&set.keys(query)).await?, expected);
+                    assert_eq!(
+                        drain_cursor(&key_read(map.entries(), dir, steps).stream()).await?,
+                        entries
+                    );
+                    assert_eq!(
+                        drain_cursor(&map.keys().with_query(query.clone()).stream()).await?,
+                        expected
+                    );
+                    assert_eq!(
+                        drain_cursor(&set.keys().with_query(query).stream()).await?,
+                        expected
+                    );
                 }
                 let query = match dir {
-                    Direction::Forward => DequeQuery::new(dir).after(0).before(keys.len()),
-                    Direction::Backward => DequeQuery::new(dir).after(keys.len()).before(0),
+                    Direction::Forward => DequeQuery::new().after(0).before(keys.len()),
+                    Direction::Backward => DequeQuery::new().reverse().after(keys.len()).before(0),
                 };
                 let mut expected: Vec<_> = keys.iter().skip(1).cloned().map(Value::from).collect();
                 if dir == Direction::Backward {
                     expected.reverse();
                 }
-                assert_eq!(drain_cursor(&deque.values(query)).await?, expected);
+                assert_eq!(
+                    drain_cursor(&deque.values().with_query(query).stream()).await?,
+                    expected
+                );
 
                 // Successive pages must return every distinct key exactly once.
                 let expected = expected_keys(keys.iter().map(String::as_str), dir, &[]);
                 let mut actual = Vec::new();
-                let mut query = ErasedKeyQuery::new(dir).limit(NonZeroUsize::MIN);
-                while let Some(key) = map.keys(query).next().await? {
-                    query = ErasedKeyQuery::new(dir)
+                let mut query = ErasedKeyQuery::new()
+                    .direction(dir)
+                    .limit(NonZeroUsize::MIN);
+                while let Some(key) = map.keys().with_query(query).stream().next().await? {
+                    query = ErasedKeyQuery::new()
+                        .direction(dir)
                         .after(&key)
                         .limit(NonZeroUsize::MIN);
                     actual.push(key);

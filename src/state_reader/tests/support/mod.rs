@@ -82,16 +82,6 @@ pub(super) async fn collect_stream<T>(
     Ok(stream.try_collect().await?)
 }
 
-/// Opens a reader query and collects its fallible stream.
-pub(super) async fn collect_query<T, S>(
-    query: impl Future<Output = Result<S, StateReaderError>>,
-) -> Result<Vec<T>>
-where
-    S: Stream<Item = Result<T, StateReaderError>>,
-{
-    Box::pin(collect_stream(query.await?)).await
-}
-
 /// Runs `check` over `items` with bounded concurrency, in input order.
 /// [`SHARD_FANOUT_CONCURRENCY`] bounds the overlapping round trips, as the
 /// production stores do. Use this for reader operations only. Owner handle

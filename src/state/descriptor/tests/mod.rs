@@ -14,7 +14,6 @@ use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
-use crate::state::cell_key::Direction;
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::order_codec::{I64KeyCodec, Utf8KeyCodec};
@@ -22,7 +21,6 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterState
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
 use crate::state::{CommitMode, EventRef, PartitionBackend, StateKey, StateName, StateType};
-use crate::state::{DequeQuery, KeyQuery};
 use crate::test_util::{ArbJson, TEST_RUNTIME, captured_spans, named};
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, eyre};

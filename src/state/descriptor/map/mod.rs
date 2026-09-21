@@ -15,6 +15,7 @@ mod query;
 #[cfg(test)]
 use layout::FrozenLayout;
 pub use layout::MapKind;
+use std::ops::DerefMut;
 mod keyset;
 pub(super) mod membership;
 use keyset::Keyset;
@@ -22,9 +23,9 @@ pub use keyset::KeysetFrameError;
 pub(crate) use keyset::{MapKeysetCodec, MapKeysetKey};
 pub(crate) use membership::KeysetLayout;
 
-use crate::state::KeyQuery;
 use crate::state::cell::{Presence, Values};
 use crate::state::query::Query;
+use crate::state::{BorrowedKeyQuery, KeyQuery, KeyRead, ReadQuery, ReadSource};
 pub(crate) use query::projected;
 pub use query::{KeyItem, MapStreamItem};
 
@@ -277,8 +278,8 @@ where
         Ok(())
     }
 
-    /// Streams live entries in key order, ascending for
-    /// [`crate::state::Direction::Forward`].
+    /// Builds a query over live entries in ascending key order.
+    /// Call [`ReadQuery::stream`] to create the lazy stream.
     ///
     /// A tracked keyset fixes membership when the stream starts. Values remain
     /// live: each chunk reads current values and skips absent cells. Later key
@@ -296,19 +297,45 @@ where
     /// hold no admission; range scans run without admission after planning.
     /// The handler can mutate this map between items. Every completion checks
     /// the attempt fence, including errors and exhaustion.
-    pub fn entries(&self, query: KeyQuery<KC>) -> impl Stream<Item = MapStreamItem<KC, V>> + '_
+    /// Supply reusable encoding storage as described by [`KeyQuery`].
+    pub fn entries<'a, E: DerefMut<Target = Vec<u8>> + Send + 'a>(
+        &'a self,
+        buffer: E,
+    ) -> KeyRead<
+        'a,
+        KC,
+        impl ReadSource<
+            Query = BorrowedKeyQuery<'a, KC>,
+            Output: Stream<Item = MapStreamItem<KC, V>> + Send,
+        > + 'a,
+    >
     where
         for<'s> ContextOf<'s, V>: FromSession<'s, S>,
     {
-        projected::<_, _, Values>(&self.cells, query.encoded)
+        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
+            projected::<_, _, Values, _>(&self.cells, query, buffer)
+        })
     }
 
-    /// Streams live keys without value decoding or resolution.
+    /// Builds a query over live keys without value decoding or resolution.
     /// Message-backed maps perform no Kafka fetches. Storage presence reads
     /// still occur, and a corrupt value does not hide its key.
     /// Source selection, consistency, and admission follow [`Self::entries`].
-    pub fn keys(&self, query: KeyQuery<KC>) -> impl Stream<Item = KeyItem<MapKind<KC, V>>> + '_ {
-        projected::<_, _, Presence>(&self.cells, query.encoded)
+    /// Supply reusable encoding storage as described by [`KeyQuery`].
+    pub fn keys<'a, E: DerefMut<Target = Vec<u8>> + Send + 'a>(
+        &'a self,
+        buffer: E,
+    ) -> KeyRead<
+        'a,
+        KC,
+        impl ReadSource<
+            Query = BorrowedKeyQuery<'a, KC>,
+            Output: Stream<Item = KeyItem<MapKind<KC, V>>> + Send,
+        > + 'a,
+    > {
+        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
+            projected::<_, _, Presence, _>(&self.cells, query, buffer)
+        })
     }
 
     /// Reports whether the map holds no live entries.

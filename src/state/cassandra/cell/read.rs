@@ -137,12 +137,11 @@ pub(super) fn page<'a, P: CassandraProjection>(
 ) -> impl Stream<Item = Result<(CellKey, Cell<P>), CassandraCellStoreError>> + Send + 'a {
     let section = i8::from(scan.section);
     let dir = scan.dir;
-    let start = scan.start.cloned();
-    let end = scan.end.cloned();
+    let start = scan.start;
+    let end = scan.end;
     try_stream! {
         let pk = Pk::of(collection);
         let prepared = P::statements(queries).scan.select(dir, start.kind());
-        let start = start.as_ref();
         let values = (
             pk.segment_id, pk.key, pk.state_type, pk.name,
             CellKind::Cell, section, start.anchor(),
@@ -179,7 +178,7 @@ pub(super) fn page<'a, P: CassandraProjection>(
                 section: Section::new(section),
                 coordinate: Coordinate::from_bytes(coordinate),
             };
-            if past_end(dir, &key, end.as_ref()) {
+            if past_end(dir, &key, end) {
                 break;
             }
             let cell = decode_body::<P>((data, prev, encoding, version, event))?;
@@ -224,13 +223,13 @@ fn scheduled_rows<P: CassandraProjection, V: SerializeRow + Send + Sync>(
 /// direction. An `Excluded` edge also stops *on* the endpoint (the exclusive
 /// variant for exclusive scan anchors); an `Unbounded` end never stops the
 /// walk (the section-only fallback).
-pub(super) fn past_end(dir: Direction, key: &CellKey, end: ScanEdge<&Coordinate>) -> bool {
+pub(super) fn past_end(dir: Direction, key: &CellKey, end: ScanEdge<&[u8]>) -> bool {
     let coordinate = key.coordinate.as_bytes();
     match (dir, end) {
-        (Direction::Forward, ScanEdge::Included(end)) => coordinate > end.as_bytes(),
-        (Direction::Forward, ScanEdge::Excluded(end)) => coordinate >= end.as_bytes(),
-        (Direction::Backward, ScanEdge::Included(end)) => coordinate < end.as_bytes(),
-        (Direction::Backward, ScanEdge::Excluded(end)) => coordinate <= end.as_bytes(),
+        (Direction::Forward, ScanEdge::Included(end)) => coordinate > end,
+        (Direction::Forward, ScanEdge::Excluded(end)) => coordinate >= end,
+        (Direction::Backward, ScanEdge::Included(end)) => coordinate < end,
+        (Direction::Backward, ScanEdge::Excluded(end)) => coordinate <= end,
         (_, ScanEdge::Unbounded) => false,
     }
 }

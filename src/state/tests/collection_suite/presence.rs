@@ -1,14 +1,15 @@
 //! Map membership and result limits with absent values.
 
 use super::*;
+use crate::state::query::tests::query_buffer;
 
 /// Map key-scan presence: over a directly-seeded map whose keyset frame
-/// over-reports a TTL-expired coordinate, `keys()` yields exactly the present
-/// keys in order across BOTH arms. The **tracked** arm (a `Tracked` keyset
-/// within the limit) lists every key `0..n` — including the holes — yet its
-/// presence check skips a coordinate the store no longer holds; the
+/// over-reports a TTL-expired coordinate, The key stream yields exactly the
+/// present keys in order across BOTH arms. The **tracked** arm (a `Tracked`
+/// keyset within the limit) lists every key `0..n` — including the holes — yet
+/// its presence check skips a coordinate the store no longer holds; the
 /// **degrade** arm (an `Overflowed` keyset) never sees an expired row in
-/// `raw_scan`. `keys()` and `stream()` agree on the live key set in both.
+/// `raw_scan`. Key and entry streams agree on the live key set in both.
 /// Seeded directly — the only way to reach an over-reporting keyset the handle
 /// never produces.
 pub(crate) async fn run_map_key_scan_holes(shape: MapKeyHoles) -> Result<bool> {
@@ -77,8 +78,23 @@ pub(crate) async fn run_map_key_scan_holes(shape: MapKeyHoles) -> Result<bool> {
             let all = collect_map(&handle, dir).await?;
             let limit = NonZeroUsize::new(all.len() / 2 + 1).unwrap_or(NonZeroUsize::MIN);
             let expected: Vec<_> = all.into_iter().take(limit.get()).collect();
-            if drain(handle.entries(KeyQuery::new(dir).limit(limit))).await? != expected
-                || drain(handle.keys(KeyQuery::new(dir).limit(limit))).await?
+            if drain(
+                handle
+                    .entries(query_buffer())
+                    .direction(dir)
+                    .limit(limit)
+                    .stream(),
+            )
+            .await?
+                != expected
+                || drain(
+                    handle
+                        .keys(query_buffer())
+                        .direction(dir)
+                        .limit(limit)
+                        .stream(),
+                )
+                .await?
                     != expected.iter().map(|(key, _)| *key).collect::<Vec<_>>()
             {
                 return Ok(false);

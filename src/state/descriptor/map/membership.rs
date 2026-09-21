@@ -57,7 +57,7 @@ where
 {
     let plan = cells
         .read(async |op| {
-            op.range(
+            op.range::<_, &[u8]>(
                 L::MEMBERS,
                 ScanEdge::Unbounded,
                 Direction::Forward,
@@ -124,23 +124,16 @@ enum PriorKeyset {
 }
 
 /// Selects bounded point reads or a range scan from the shared keyset.
-pub(crate) async fn plan<S, L>(
+pub(crate) async fn plan<'q, S, L>(
     op: &mut ReadOperation<'_, S, L>,
-    query: &Query,
-) -> Result<Plan<S, L::Cell>, MapStateError<CellCodecError<L::Cell>>>
+    query: &Query<'q>,
+) -> Result<Plan<S, L::Cell, &'q [u8]>, MapStateError<CellCodecError<L::Cell>>>
 where
     S: StateSession,
     L: KeysetLayout,
 {
     let keyset = read_keyset_state(op).await?;
-    let range = || {
-        op.range(
-            L::MEMBERS,
-            query.start.clone(),
-            query.dir,
-            query.end.clone(),
-        )
-    };
+    let range = || op.range(L::MEMBERS, query.start, query.dir, query.end);
     let coordinates = match keyset {
         PriorKeyset::Absent => {
             return Ok(op.coordinates(L::MEMBERS, Vec::new()));

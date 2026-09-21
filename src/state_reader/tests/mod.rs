@@ -25,6 +25,7 @@ pub(crate) mod support;
 mod borrowed;
 mod cache_tests;
 mod cassandra_tests;
+mod laziness;
 mod probe;
 mod reader_suite;
 mod reader_tests;

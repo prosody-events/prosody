@@ -1,6 +1,7 @@
 //! Key projections, corrupt values, and bounded fetches.
 
 use super::*;
+use crate::state::query::tests::query_buffer as buffer;
 use crate::state::tests::counting_session;
 
 /// Corrupt-coordinate classification: a stored entry whose coordinate does not
@@ -44,7 +45,7 @@ pub(super) fn map_stream_classifies_corrupt_coordinate_permanent() -> Result<()>
     let session = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     let error = block_on(async {
-        let stream = handle.entries(KeyQuery::new(Direction::Forward));
+        let stream = handle.entries(buffer()).stream();
         futures::pin_mut!(stream);
         while let Some(item) = stream.next().await {
             if let Err(error) = item {
@@ -138,7 +139,9 @@ pub(super) fn map_presence_survives_an_undecodable_value() -> Result<()> {
             assert_presence_route_calls(&counting, tracked_route);
             counting.reset();
             let keys = handle
-                .keys(KeyQuery::new(Direction::Forward).limit(NonZeroUsize::MIN.saturating_add(1)));
+                .keys(buffer())
+                .limit(NonZeroUsize::MIN.saturating_add(1))
+                .stream();
             assert_eq!(drain(keys).await?, vec![key, key + 1]);
             assert_limited_fetch(&counting, tracked_route, &[4], CELL_BATCH.get());
             if !tracked_route {
@@ -146,8 +149,7 @@ pub(super) fn map_presence_survives_an_undecodable_value() -> Result<()> {
             }
 
             counting.reset();
-            let entries =
-                handle.entries(KeyQuery::new(Direction::Forward).limit(NonZeroUsize::MIN));
+            let entries = handle.entries(buffer()).limit(NonZeroUsize::MIN).stream();
             assert!(drain(entries).await.is_err());
             // Four keys: the second chunk `[key, key + 1]` satisfies the limit while
             // `key + 2` remains unread, so `[1, 2]` proves the schedule stops at the
@@ -156,7 +158,13 @@ pub(super) fn map_presence_survives_an_undecodable_value() -> Result<()> {
 
             for dir in [Direction::Forward, Direction::Backward] {
                 counting.reset();
-                let keys = handle.keys(KeyQuery::new(dir).from(&(key + 1)).to(&(key + 1)));
+                let next = key + 1;
+                let keys = handle
+                    .keys(buffer())
+                    .direction(dir)
+                    .from(&next)
+                    .to(&next)
+                    .stream();
                 assert_eq!(drain(keys).await?, vec![key + 1]);
                 assert_limited_fetch(&counting, tracked_route, &[1], 0);
                 if !tracked_route {
@@ -170,11 +178,7 @@ pub(super) fn map_presence_survives_an_undecodable_value() -> Result<()> {
             if let Err(error) = got {
                 assert_eq!(error.classify_error(), ErrorCategory::Permanent);
             }
-            assert!(
-                drain(handle.entries(KeyQuery::new(Direction::Forward)))
-                    .await
-                    .is_err()
-            );
+            assert!(drain(handle.entries(buffer()).stream()).await.is_err());
             Ok::<_, color_eyre::Report>(())
         })?;
     }

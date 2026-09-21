@@ -242,23 +242,45 @@ Keyed-state cache settings are listed in [CONFIGURATION.md](CONFIGURATION.md#key
 
 ### Query collection state
 
-`KeyQuery<KC>` defines a map or set query. The key codec `KC` must match the
-collection. The query owns its bounds and has no backend or session.
-Handlers and standalone readers accept the same query:
+`KeyQuery<KC, B>` defines a map or set query. The key codec `KC` must match the
+collection. `B` selects bound storage. Typed fluent builders borrow bounds,
+including `&str` for string keys. The stream retains those borrows.
+Forward order is the default. Use `reverse()` for descending order and
+`forward()` to restore ascending order. Direction changes preserve the bounds.
+Start a fluent query with `entries`, `keys`, or `values`:
 
 ```rust,ignore
-use prosody::state::{Direction, KeyQuery};
 use std::num::NonZeroUsize;
 
 let page_size = NonZeroUsize::try_from(20_usize)?;
-let page = KeyQuery::new(Direction::Forward)
+// Allocate once before the query loop. Each live stream needs its own buffer.
+let mut bounds = Vec::with_capacity(512);
+let entries = map.entries(&mut bounds)
     .prefix("order:")
     .after("order:0042")
-    .limit(page_size);
+    .limit(page_size)
+    .stream();
 
-let entries = map.entries(page.clone());
-let committed_entries = reader.entries("customer-123", page).await?;
+let mut committed_bounds = Vec::with_capacity(512);
+let committed_entries = reader.entries("customer-123", &mut committed_bounds)
+    .prefix("order:")
+    .reverse()
+    .limit(page_size)
+    .stream();
 ```
+
+Each fluent method consumes and returns the builder. Call `into_query()` to
+extract reusable settings. Apply borrowed settings with `with_query(query)`.
+For owned settings, use `with_query(query.borrowed())`.
+
+Typed key reads borrow reusable encoding storage. Insufficient capacity returns
+an error; encoding never grows the buffer. Use `query.required_capacity()` when
+settings are known before the loop. Erased reads manage encoding storage internally.
+
+Query settings support Serde. Store owned settings when bounds must outlive their source.
+
+`stream()` is synchronous and lazy. Standalone streams acquire their session
+on the first poll. Acquisition and read errors appear as stream items.
 
 Use `keys` to read map keys or set members. Set the next page's cursor with
 `after`. The cursor must start with the prefix to stay within the prefix range.

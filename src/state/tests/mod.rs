@@ -2,7 +2,6 @@ use crate::state::CommitDecision;
 use crate::state::store::CellRead;
 use crate::state::store::CommittedBatch;
 use crate::state::tests::support::{StageInspection, evidence};
-use crate::state::{DequeQuery, KeyQuery};
 use crate::test_util::TEST_RUNTIME;
 mod cached_suite;
 pub(crate) mod cell_suite;

@@ -30,12 +30,10 @@ use crate::Topic;
 use crate::cassandra::CassandraStore as CassandraConn;
 use crate::codec::JsonCodec;
 use crate::loader::MemoryLoader;
-use crate::state::DequeQuery;
 use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
     CassandraStore as CassandraCellStore, CellQueries, IdentityQueries, PublicationQueries,
 };
-use crate::state::cell_key::Direction;
 use crate::state::descriptor::deque::DEQUE_POINT_ITERATION_MAX;
 use crate::state::descriptor::{
     DescriptorIdentity, deque_state, map_state, set_state, value_state,
@@ -403,22 +401,12 @@ fn reader_deque_scan_committed() -> Result<()> {
         let deps = backend.deps();
         let reader = StateReader::new(&deps, sub, descriptor)?;
         let model: Vec<Value> = (0..width).map(|i| Value::from(i as i64)).collect();
-        let forward = Box::pin(collect_stream(
-            reader
-                .values(key.clone(), DequeQuery::new(Direction::Forward))
-                .await?,
-        ))
-        .await?;
+        let forward = Box::pin(collect_stream(reader.values(key.clone()).stream())).await?;
         ensure!(
             forward == model,
             "forward scan must equal the ordered model"
         );
-        let backward = Box::pin(collect_stream(
-            reader
-                .values(key, DequeQuery::new(Direction::Backward))
-                .await?,
-        ))
-        .await?;
+        let backward = Box::pin(collect_stream(reader.values(key).reverse().stream())).await?;
         let mut expect_backward = model;
         expect_backward.reverse();
         ensure!(

@@ -6,8 +6,9 @@ use crate::consumer::middleware::deduplication::MemoryDeduplicationStore;
 use crate::state::descriptor::{StateDescriptor, deque_state, map_state, set_state};
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::order_codec::{OrderedKeyCodec, Utf8KeyCodec};
+use crate::state::query::tests::query_buffer;
 use crate::state::registry::CollectionDef;
-use crate::state::{DequeQuery, Direction, KeyQuery, StateKey};
+use crate::state::{BorrowedKeyQuery, DequeQuery, Direction, KeyQuery, StateKey};
 use crate::test_util::TEST_RUNTIME;
 use color_eyre::Result;
 use quickcheck::{Arbitrary, Gen, QuickCheck};
@@ -47,18 +48,21 @@ impl StreamConstraints {
         .contains(&key)
     }
 
-    pub(super) fn apply<KC>(self, mut query: KeyQuery<KC>) -> KeyQuery<KC>
+    pub(super) fn apply<'a, KC>(
+        &'a self,
+        mut query: BorrowedKeyQuery<'a, KC>,
+    ) -> BorrowedKeyQuery<'a, KC>
     where
         KC: OrderedKeyCodec<Key = i64, Borrowed = i64>,
     {
-        query = match self.start {
-            Bound::Included(key) => query.from(&key),
-            Bound::Excluded(key) => query.after(&key),
+        query = match self.start.as_ref() {
+            Bound::Included(key) => query.from(key),
+            Bound::Excluded(key) => query.after(key),
             Bound::Unbounded => query,
         };
-        query = match self.end {
-            Bound::Included(key) => query.to(&key),
-            Bound::Excluded(key) => query.before(&key),
+        query = match self.end.as_ref() {
+            Bound::Included(key) => query.to(key),
+            Bound::Excluded(key) => query.before(key),
             Bound::Unbounded => query,
         };
         if let Some(limit) = self.limit {
@@ -130,9 +134,9 @@ impl PrefixShape {
         }
     }
 
-    fn apply(&self, query: KeyQuery) -> KeyQuery {
-        let mut query = query.prefix(&self.prefix);
-        if let Some(cursor) = &self.cursor {
+    fn apply<'a>(&'a self, query: BorrowedKeyQuery<'a>) -> BorrowedKeyQuery<'a> {
+        let mut query = query.prefix(self.prefix.as_str());
+        if let Some(cursor) = self.cursor.as_deref() {
             query = query.after(cursor);
         }
         if let Some(limit) = self.limit {
@@ -184,15 +188,30 @@ async fn run_prefix_query(shape: PrefixShape) -> Result<bool> {
             .map(|key| (key.clone(), Value::from(key.clone())))
             .collect();
         assert_eq!(
-            drain(map.entries(shape.apply(KeyQuery::new(dir)))).await?,
+            drain(
+                map.entries(query_buffer())
+                    .with_query(shape.apply(KeyQuery::new().direction(dir)))
+                    .stream()
+            )
+            .await?,
             entries
         );
         assert_eq!(
-            drain(map.keys(shape.apply(KeyQuery::new(dir)))).await?,
+            drain(
+                map.keys(query_buffer())
+                    .with_query(shape.apply(KeyQuery::new().direction(dir)))
+                    .stream()
+            )
+            .await?,
             expected
         );
         assert_eq!(
-            drain(set.keys(shape.apply(KeyQuery::new(dir)))).await?,
+            drain(
+                set.keys(query_buffer())
+                    .with_query(shape.apply(KeyQuery::new().direction(dir)))
+                    .stream()
+            )
+            .await?,
             expected
         );
     }
@@ -283,11 +302,14 @@ pub(crate) async fn run_deque_constraint_parity(shape: DequeConstraints) -> Resu
                 expected.reverse();
             }
             expected.truncate(shape.limit.map_or(usize::MAX, NonZeroUsize::get));
-            let mut query = DequeQuery::new(dir).range(shape.range);
+            let mut query = DequeQuery::new().direction(dir).range(shape.range);
             if let Some(limit) = shape.limit {
                 query = query.limit(limit);
             }
-            assert_eq!(drain(handle.values(query)).await?, expected);
+            assert_eq!(
+                drain(handle.values().with_query(query).stream()).await?,
+                expected
+            );
         }
     }
     Ok(true)

@@ -830,7 +830,7 @@ fn empty_coordinate_plan_fences_on_exhaustion() -> Result<()> {
 
         let plan = handle
             .cells
-            .read(async |op| op.coordinates(PairLayout::LEFT, Vec::new()))
+            .read(async |op| op.coordinates::<_, &[u8]>(PairLayout::LEFT, Vec::new()))
             .await;
         session.reset(RepinProof::for_test()).await;
 

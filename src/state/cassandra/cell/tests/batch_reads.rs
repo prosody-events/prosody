@@ -435,9 +435,9 @@ async fn scan_excludes_corrupt_endpoint() -> Result<()> {
         for fetch_hint in [None, Some(NonZeroUsize::MIN)] {
             let scan = Scan {
                 section: middle.section,
-                start: ScanEdge::Included(&middle.coordinate),
+                start: ScanEdge::Included(middle.coordinate.as_bytes()),
                 dir,
-                end: ScanEdge::Excluded(&end.coordinate),
+                end: ScanEdge::Excluded(end.coordinate.as_bytes()),
                 fetch_hint,
             };
             let values: Vec<_> = CellRead::<Values>::scan(&store, collection.id(), scan)

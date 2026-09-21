@@ -1,11 +1,12 @@
 //! Stream demand bounds reads and message resolution.
 
 use super::*;
+use crate::state::query::tests::query_buffer;
 
 /// A dense stream-laziness case: a collection of `n` entries drained
-/// `stream(..).take(k)`, with `n` on the deque's point-get arm (`≤ 128`) and
-/// far above `k`, so "fetch/resolve only the consumed prefix" is a strictly
-/// stronger claim than "fetch everything".
+/// streams limited to `k` items, with `n` on the deque's point-get arm (`≤
+/// 128`) and far above `k`, so "fetch/resolve only the consumed prefix" is a
+/// strictly stronger claim than "fetch everything".
 #[derive(Clone, Copy, Debug)]
 pub(super) struct StreamPrefix {
     n: usize,
@@ -37,13 +38,13 @@ pub(super) fn resolve_session(
     session_with_loader(counting, dedup, registry, state_key, event, loader)
 }
 
-/// The stream-laziness property (map): a `stream(dir).take(k)` over a **dense**
-/// `n`-entry `Tracked` map is genuinely incremental. It issues at most one
-/// batch read beyond `k`, because entries flow through the batch verb and only
-/// the keyset meta cell is a point read. It resolves at most `k + CELL_BATCH`
-/// values, never the whole `n`-entry collection. The counting store bounds the
-/// fetches and the counting resolver bounds the resolutions. Both counters sit
-/// at the lowest layer, so nothing masks a materialization.
+/// The stream-laziness property (map): an entry stream limited to `k` items
+/// over a **dense** `n`-entry `Tracked` map is genuinely incremental. It issues
+/// at most one batch read beyond `k`, because entries flow through the batch
+/// verb and only the keyset meta cell is a point read. It resolves at most `k +
+/// CELL_BATCH` values, never the whole `n`-entry collection. The counting store
+/// bounds the fetches and the counting resolver bounds the resolutions. Both
+/// counters sit at the lowest layer, so nothing masks a materialization.
 ///
 /// Falsification: Make the coordinate source consume all tracked keys.
 /// Then the read and resolver counts exceed their bounds, and both asserts
@@ -107,7 +108,11 @@ pub(super) async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Directio
     );
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     let taken: Vec<_> = {
-        let stream = handle.entries(KeyQuery::new(dir)).take(k);
+        let stream = handle
+            .entries(query_buffer())
+            .direction(dir)
+            .stream()
+            .take(k);
         futures::pin_mut!(stream);
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {
@@ -200,7 +205,7 @@ pub(super) async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direct
     );
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     let taken: Vec<_> = {
-        let stream = handle.values(DequeQuery::new(dir)).take(k);
+        let stream = handle.values().direction(dir).stream().take(k);
         futures::pin_mut!(stream);
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {
@@ -318,7 +323,7 @@ pub(super) fn deque_bounded_eviction_does_not_resolve() -> Result<()> {
     })
 }
 
-/// The stream-laziness property: both collections' `stream(dir).take(k)` are
+/// The stream-laziness property: both collections' limited streams are
 /// genuinely incremental — the fetch/resolve budget tracks the consumed prefix,
 /// not the collection size. A `QuickCheck` property over dense `(n, k)` in both
 /// directions.

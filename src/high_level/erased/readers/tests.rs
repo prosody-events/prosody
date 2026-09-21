@@ -3,7 +3,8 @@
 use super::*;
 use crate::codec::JsonCodec;
 use crate::state::Direction;
-use crate::state::query::tests::{KeyStep, expected_keys, key_query};
+use crate::state::query::tests::query_buffer;
+use crate::state::query::tests::{KeyStep, expected_keys, key_query, key_read};
 use crate::state::tests::support::drain_cursor;
 use crate::state_reader::tests::support::{
     MemoryHarness, mock_count, owner_commit, publish_source, registry_of, source_state_key,
@@ -59,10 +60,9 @@ async fn check_queries(keys: &[String], steps: &[KeyStep], tracked: bool) -> Res
     let map = map_state::<Utf8KeyCodec, JsonCodec>("query-map").keyset_limit(limit);
     let set = set_state::<Utf8KeyCodec>("query-set").keyset_limit(limit);
     let deque = deque_state::<JsonCodec>("query-deque");
-    let registry = registry_of(&map, map.collection_def())?;
     owner_commit(
         &harness.cells,
-        &registry,
+        &registry_of(&map, map.collection_def())?,
         &state_key,
         map,
         1,
@@ -72,7 +72,8 @@ async fn check_queries(keys: &[String], steps: &[KeyStep], tracked: bool) -> Res
             }
             for dir in [Direction::Forward, Direction::Backward] {
                 let expected = expected_keys(keys.iter().map(String::as_str), dir, steps);
-                let actual: Vec<_> = handle.keys(key_query(dir, steps)).try_collect().await?;
+                let read = key_read(handle.keys(query_buffer()), dir, steps);
+                let actual: Vec<_> = read.stream().try_collect().await?;
                 assert_eq!(actual, expected);
             }
             Ok(())
@@ -167,19 +168,20 @@ async fn assert_queries(
                 .map(|key| (key.clone(), Value::from(key.clone())))
                 .collect::<Vec<_>>();
             assert_eq!(
-                drain_cursor(&*map.entries(key.to_string(), query.clone()).await?).await?,
+                drain_cursor(&*key_read(map.entries(key.to_string()), dir, steps).stream()).await?,
                 entries
             );
             assert_eq!(
-                drain_cursor(&*map.keys(key.to_string(), query.clone()).await?).await?,
+                drain_cursor(&*map.keys(key.to_string()).with_query(query.clone()).stream())
+                    .await?,
                 expected
             );
             assert_eq!(
-                drain_cursor(&*set.keys(key.to_string(), query).await?).await?,
+                drain_cursor(&*set.keys(key.to_string()).with_query(query).stream()).await?,
                 expected
             );
         }
-        let mut query = DequeQuery::new(dir).range(1..keys.len());
+        let mut query = DequeQuery::new().direction(dir).range(1..keys.len());
         let mut expected: Vec<_> = keys.iter().skip(1).cloned().map(Value::from).collect();
         if dir == Direction::Backward {
             expected.reverse();
@@ -189,7 +191,7 @@ async fn assert_queries(
             expected.truncate(limit.get());
         }
         assert_eq!(
-            drain_cursor(&*deque.values(key.to_string(), query).await?).await?,
+            drain_cursor(&*deque.values(key.to_string()).with_query(query).stream()).await?,
             expected
         );
     }

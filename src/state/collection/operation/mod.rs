@@ -14,6 +14,7 @@ use crate::state::descriptor::{
     ResolvedOf, WriteOf,
 };
 use crate::state::order_codec::OrderedKeyCodec;
+use crate::state::order_codec::{I64KeyCodec, order_preserving_i64};
 use crate::state::store::CellBuffer;
 use crate::state::{StateName, StateType};
 
@@ -101,23 +102,23 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
     /// given order. The plan freezes this invocation's engine state. Each
     /// reader chunk then resumes on the same source, and each owner chunk
     /// reacquires the gate, without a second planning command.
-    pub(crate) fn coordinates<T: CellType>(
+    pub(crate) fn coordinates<T: CellType, B: AsRef<[u8]> + Send>(
         &self,
         family: CellFamily<L, T>,
         coordinates: Vec<Coordinate>,
-    ) -> Plan<S, T> {
+    ) -> Plan<S, T, B> {
         Plan::coordinates(self.plan_base(family.section()), coordinates)
     }
 
     /// Plans a scan over encoded edges in the declared family.
     /// The edges follow `dir` and can include, exclude, or omit an endpoint.
-    pub(crate) fn range<T: CellType>(
+    pub(crate) fn range<T: CellType, B: AsRef<[u8]> + Send>(
         &self,
         family: CellFamily<L, T>,
-        start: ScanEdge<Coordinate>,
+        start: ScanEdge<B>,
         dir: Direction,
-        end: ScanEdge<Coordinate>,
-    ) -> Plan<S, T> {
+        end: ScanEdge<B>,
+    ) -> Plan<S, T, B> {
         Plan::range(self.plan_base(family.section()), start, dir, end)
     }
 
@@ -131,19 +132,19 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
     /// [`Scan`](crate::state::cell_key::Scan) defines them. Only inclusive
     /// edges exist here. A collection that knows its window also knows both of
     /// its occupied endpoints.
-    pub(crate) fn range_within<T: CellType>(
+    pub(crate) fn range_within<T: CellType<Key = I64KeyCodec>>(
         &self,
         family: CellFamily<L, T>,
         start: &BorrowedKeyOf<T>,
         dir: Direction,
         end: &BorrowedKeyOf<T>,
         limit: NonZeroUsize,
-    ) -> Plan<S, T> {
+    ) -> Plan<S, T, [u8; 8]> {
         self.range(
             family,
-            ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode(start)),
+            ScanEdge::Included(order_preserving_i64(*start)),
             dir,
-            ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode(end)),
+            ScanEdge::Included(order_preserving_i64(*end)),
         )
         .with_limit(Some(limit))
     }

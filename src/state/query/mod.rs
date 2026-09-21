@@ -1,107 +1,189 @@
-//! Owned query values shared by handler, standalone, and erased reads.
+//! Query settings shared by handler, standalone, and erased reads.
 
 mod bounds;
 mod deque;
+mod read;
 #[cfg(test)]
 pub(crate) mod tests;
 
 pub(crate) use bounds::Query;
 pub use deque::DequeQuery;
+pub use read::{DequeRead, KeyRead, ReadQuery, ReadSource};
 
-use crate::state::cell_key::{Direction, ScanEdge};
+use crate::state::Direction;
 use crate::state::order_codec::{OrderedKeyCodec, Utf8KeyCodec};
 use educe::Educe;
+use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::marker::PhantomData;
+use std::mem::swap;
 use std::num::NonZeroUsize;
 use std::ops::{Bound, RangeBounds};
 
-/// An owned map or set query with no collection, session, or backend.
-/// The key codec prevents use with a collection that has a different encoding.
-/// Handlers and readers accept the same query through `entries` and `keys`.
+/// Map or set query settings with caller-selected bound storage.
+/// Typed collection builders borrow bounds. The erased specialization owns
+/// strings. The codec must match the collection. Encoding starts when the
+/// stream is polled.
 ///
+/// Typed reads require reusable encoding storage. Allocate it before the hot
+/// loop. The stream retains that storage. Encoding rejects insufficient
+/// capacity before it writes bytes; it never grows the supplied buffer.
+/// Use [`Self::required_capacity`] to size storage for saved settings.
+///
+/// Forward order is the default. Direction changes preserve selected bounds.
 /// Edges follow the query direction. Each bound method replaces one edge.
 /// A start past the end produces an empty stream.
-#[derive(Educe)]
-#[educe(Clone, Debug)]
+#[derive(Educe, Serialize, Deserialize)]
+#[serde(bound(serialize = "B: Serialize", deserialize = "B: Deserialize<'de>"))]
+#[educe(
+    Clone(bound = "B: Clone"),
+    Copy(bound = "B: Copy"),
+    Debug(bound = "B: std::fmt::Debug")
+)]
 #[must_use]
-pub struct KeyQuery<KC = Utf8KeyCodec> {
-    pub(crate) encoded: Query,
+pub struct KeyQuery<KC: OrderedKeyCodec = Utf8KeyCodec, B = <KC as OrderedKeyCodec>::Key> {
+    pub(crate) dir: Direction,
+    pub(crate) limit: Option<NonZeroUsize>,
+    start: Edge<B>,
+    end: Edge<B>,
+    #[serde(skip)]
     codec: PhantomData<fn() -> KC>,
 }
 
-/// The string query that foreign-language clients wrap.
-pub type ErasedKeyQuery = KeyQuery<Utf8KeyCodec>;
+/// Query settings that borrow keys through the codec's input view.
+pub type BorrowedKeyQuery<'a, KC = Utf8KeyCodec> =
+    KeyQuery<KC, &'a <KC as OrderedKeyCodec>::Borrowed>;
 
-impl<KC> KeyQuery<KC> {
-    /// Creates an unbounded query in `dir` order.
-    pub fn new(dir: Direction) -> Self {
+/// The owned string query that foreign-language clients wrap.
+pub type ErasedKeyQuery = KeyQuery<Utf8KeyCodec, String>;
+
+/// A logical edge. A prefix endpoint stays logical until the codec writes it.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+enum Edge<B> {
+    Bound(Bound<B>),
+    PrefixEnd(B),
+}
+
+impl<KC: OrderedKeyCodec, B> KeyQuery<KC, B> {
+    /// Creates an unbounded query in forward order.
+    pub fn new() -> Self {
         Self {
-            encoded: Query::new(dir),
+            dir: Direction::Forward,
+            limit: None,
+            start: Edge::Bound(Bound::Unbounded),
+            end: Edge::Bound(Bound::Unbounded),
             codec: PhantomData,
         }
     }
 
-    /// Limits present results. Absent cells do not consume the limit.
-    /// The limit also bounds the first fetch and its error boundary.
-    pub fn limit(mut self, limit: NonZeroUsize) -> Self {
-        self.encoded.limit = Some(limit);
+    /// Selects ascending key order.
+    pub fn forward(self) -> Self {
+        self.direction(Direction::Forward)
+    }
+
+    /// Selects descending key order. Repeated calls keep this order.
+    pub fn reverse(self) -> Self {
+        self.direction(Direction::Backward)
+    }
+
+    /// Selects an order supplied at runtime.
+    pub fn direction(mut self, dir: Direction) -> Self {
+        if self.dir != dir {
+            swap(&mut self.start, &mut self.end);
+            self.dir = dir;
+        }
         self
     }
-}
 
-impl<KC: OrderedKeyCodec> KeyQuery<KC> {
+    /// Limits present results. Absent cells do not consume the limit.
+    pub fn limit(mut self, limit: NonZeroUsize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
     /// Starts at `key`.
-    pub fn from(mut self, key: &KC::Borrowed) -> Self {
-        self.encoded.start = ScanEdge::Included(KC::encode(key));
+    pub fn from<K: Into<B>>(mut self, key: K) -> Self {
+        self.start = Edge::Bound(Bound::Included(key.into()));
         self
     }
 
     /// Starts after `key`.
-    pub fn after(mut self, key: &KC::Borrowed) -> Self {
-        self.encoded.start = ScanEdge::Excluded(KC::encode(key));
+    pub fn after<K: Into<B>>(mut self, key: K) -> Self {
+        self.start = Edge::Bound(Bound::Excluded(key.into()));
         self
     }
 
     /// Stops at `key`.
-    pub fn to(mut self, key: &KC::Borrowed) -> Self {
-        self.encoded.end = ScanEdge::Included(KC::encode(key));
+    pub fn to<K: Into<B>>(mut self, key: K) -> Self {
+        self.end = Edge::Bound(Bound::Included(key.into()));
         self
     }
 
     /// Stops before `key`.
-    pub fn before(mut self, key: &KC::Borrowed) -> Self {
-        self.encoded.end = ScanEdge::Excluded(KC::encode(key));
+    pub fn before<K: Into<B>>(mut self, key: K) -> Self {
+        self.end = Edge::Bound(Bound::Excluded(key.into()));
         self
     }
 
-    /// Replaces both edges with an ascending key range, in either direction.
-    pub fn range<R: RangeBounds<KC::Borrowed>>(mut self, range: R) -> Self {
-        let edge = |bound| match bound {
-            Bound::Included(key) => ScanEdge::Included(KC::encode(key)),
-            Bound::Excluded(key) => ScanEdge::Excluded(KC::encode(key)),
-            Bound::Unbounded => ScanEdge::Unbounded,
-        };
-        let low = edge(range.start_bound());
-        let high = edge(range.end_bound());
-        (self.encoded.start, self.encoded.end) = match self.encoded.dir {
+    /// Replaces both edges with ascending bounds, in either direction.
+    pub fn range<R: RangeBounds<B>>(mut self, range: R) -> Self
+    where
+        B: Clone,
+    {
+        let low = Edge::Bound(range.start_bound().cloned());
+        let high = Edge::Bound(range.end_bound().cloned());
+        (self.start, self.end) = match self.dir {
             Direction::Forward => (low, high),
             Direction::Backward => (high, low),
         };
         self
     }
 
-    /// Replaces both edges to select keys with this encoded prefix.
-    /// For fixed-width keys, the range contains only that key.
-    /// A later cursor must start with the prefix to stay within this range.
-    /// A cursor outside the prefix replaces its edge and can expand the range.
-    pub fn prefix(mut self, key: &KC::Borrowed) -> Self {
-        self.encoded.prefix(KC::encode(key));
+    /// Selects keys with this encoded prefix, replacing both edges.
+    /// Later bound methods can replace an edge and expand the prefix range.
+    pub fn prefix<K: Into<B>>(mut self, key: K) -> Self
+    where
+        B: Clone,
+    {
+        let key = key.into();
+        let low = Edge::Bound(Bound::Included(key.clone()));
+        let high = Edge::PrefixEnd(key);
+        (self.start, self.end) = match self.dir {
+            Direction::Forward => (low, high),
+            Direction::Backward => (high, low),
+        };
         self
+    }
+
+    /// Borrows the stored bounds without encoding or copying them.
+    pub fn borrowed(&self) -> KeyQuery<KC, &KC::Borrowed>
+    where
+        B: Borrow<KC::Borrowed>,
+    {
+        KeyQuery {
+            dir: self.dir,
+            limit: self.limit,
+            start: self.start.borrowed(),
+            end: self.end.borrowed(),
+            codec: PhantomData,
+        }
     }
 }
 
-impl<KC> Default for KeyQuery<KC> {
+impl<B> Edge<B> {
+    fn borrowed<Q: ?Sized>(&self) -> Edge<&Q>
+    where
+        B: Borrow<Q>,
+    {
+        match self {
+            Self::Bound(bound) => Edge::Bound(bound.as_ref().map(Borrow::borrow)),
+            Self::PrefixEnd(key) => Edge::PrefixEnd(key.borrow()),
+        }
+    }
+}
+
+impl<KC: OrderedKeyCodec, B> Default for KeyQuery<KC, B> {
     fn default() -> Self {
-        Self::new(Direction::Forward)
+        Self::new()
     }
 }

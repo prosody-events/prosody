@@ -3,14 +3,15 @@
 use super::StateReader;
 use crate::Key;
 use crate::codec::Codec;
-use crate::state::KeyQuery;
 use crate::state::cell::Presence;
 use crate::state::descriptor::SetDescriptor;
 use crate::state::order_codec::OrderedKeyCodec;
+use crate::state::{BorrowedKeyQuery, KeyQuery, KeyRead, ReadQuery, ReadSource};
 use crate::state_reader::{ReaderBackend, StateReaderError};
 use futures::Stream;
 use std::borrow::Borrow;
 use std::fmt::Display;
+use std::ops::DerefMut;
 
 impl<KC, C, B> StateReader<SetDescriptor<KC>, C, B>
 where
@@ -74,17 +75,28 @@ where
             .map_err(|error| StateReaderError::store(&error))
     }
 
-    /// Streams committed set members in query order.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when session acquisition or handle binding fails.
-    pub async fn keys<K: Into<Key>>(
+    /// Builds a query over committed keys, in ascending key order.
+    /// The stream owns the reader state. Its first poll acquires a session.
+    /// Acquisition and read errors appear as stream items.
+    /// Supply reusable encoding storage as described by [`KeyQuery`].
+    pub fn keys<'q, K: Into<Key>, E: DerefMut<Target = Vec<u8>> + Send + 'q>(
         &self,
         key: K,
-        query: KeyQuery<KC>,
-    ) -> Result<impl Stream<Item = Result<KC::Key, StateReaderError>> + 'static, StateReaderError>
-    {
-        self.projected::<Presence>(key.into(), query.encoded).await
+        buffer: E,
+    ) -> KeyRead<
+        'q,
+        KC,
+        impl ReadSource<
+            Query = BorrowedKeyQuery<'q, KC>,
+            Output: Stream<Item = Result<KC::Key, StateReaderError>> + Send + 'q,
+        >
+        + 'q
+        + use<'q, K, KC, C, B, E>,
+    > {
+        let reader = self.clone();
+        let key = key.into();
+        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'q, KC>| {
+            reader.projected::<Presence, _>(key, query, buffer)
+        })
     }
 }

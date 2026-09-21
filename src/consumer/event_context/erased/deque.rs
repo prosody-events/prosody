@@ -97,10 +97,10 @@ where
             .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
-    fn values(&self, query: DequeQuery) -> BoxStateCursor<ResolvedOf<T>> {
+    fn read_values(&self, query: DequeQuery) -> BoxStateCursor<ResolvedOf<T>> {
         let handle = self.handle.clone();
         Box::new(cursor(try_stream! {
-            for await item in handle.values(query) {
+            for await item in handle.values().with_query(query).stream() {
                 yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
             }
         }))

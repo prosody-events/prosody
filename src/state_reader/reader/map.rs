@@ -3,15 +3,20 @@
 use super::StateReader;
 use crate::Key;
 use crate::codec::Codec;
-use crate::state::KeyQuery;
 use crate::state::cell::{Presence, Values};
 use crate::state::descriptor::{CellType, ContextOf, FromSession, MapDescriptor, ResolvedOf};
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
+use crate::state::{BorrowedKeyQuery, KeyQuery, KeyRead, ReadQuery, ReadSource};
 use crate::state_reader::session::ReadSession;
 use crate::state_reader::{ReaderBackend, StateReaderError};
 use futures::Stream;
 use std::borrow::Borrow;
 use std::fmt::Display;
+use std::ops::DerefMut;
+
+/// One committed map entry or the error that ended the stream.
+pub type MapReadItem<KC, V> =
+    Result<(<KC as OrderedKeyCodec>::Key, ResolvedOf<V>), StateReaderError>;
 
 impl<KC, V, C, B> StateReader<MapDescriptor<KC, V>, C, B>
 where
@@ -123,47 +128,61 @@ where
             .map_err(|e| StateReaderError::store(&e))
     }
 
-    /// Streams the committed live entries of the map under partition `key` in
-    /// key order (ascending for [`crate::state::Direction::Forward`]).
-    ///
-    /// The stream owns its session and can outlive the reader's borrow.
-    ///
-    /// # Errors
-    ///
-    /// Any [`StateReaderError`] from acquiring the session: an empty key, or
-    /// an acquisition or identity failure. Per-source read failures surface
-    /// as stream items.
-    pub async fn entries<K: Into<Key>>(
+    /// Builds a query over committed entries, in ascending key order.
+    /// The stream owns the reader state. Its first poll acquires a session.
+    /// Acquisition and read errors appear as stream items.
+    /// Supply reusable encoding storage as described by [`KeyQuery`].
+    pub fn entries<'q, K: Into<Key>, E: DerefMut<Target = Vec<u8>> + Send + 'q>(
         &self,
         key: K,
-        query: KeyQuery<KC>,
-    ) -> Result<
-        impl Stream<Item = Result<(KC::Key, ResolvedOf<V>), StateReaderError>> + 'static,
-        StateReaderError,
+        buffer: E,
+    ) -> KeyRead<
+        'q,
+        KC,
+        impl ReadSource<
+            Query = BorrowedKeyQuery<'q, KC>,
+            Output: Stream<Item = MapReadItem<KC, V>> + Send + 'q,
+        >
+        + 'q
+        + use<'q, K, KC, V, C, B, E>,
     >
     where
-        for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
         V: 'static,
+        for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
         ResolvedOf<V>: 'static,
     {
-        self.projected::<Values>(key.into(), query.encoded).await
+        let reader = self.clone();
+        let key = key.into();
+        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'q, KC>| {
+            reader.projected::<Values, _>(key, query, buffer)
+        })
     }
 
-    /// Streams committed live keys without decoding or resolving values.
-    ///
-    /// # Errors
-    ///
-    /// Any [`StateReaderError`] from acquiring the session. Per-source read
-    /// failures surface as stream items.
-    pub async fn keys<K: Into<Key>>(
+    /// Builds a query over committed keys, in ascending key order.
+    /// The stream owns the reader state. Its first poll acquires a session.
+    /// Acquisition and read errors appear as stream items.
+    /// Supply reusable encoding storage as described by [`KeyQuery`].
+    pub fn keys<'q, K: Into<Key>, E: DerefMut<Target = Vec<u8>> + Send + 'q>(
         &self,
         key: K,
-        query: KeyQuery<KC>,
-    ) -> Result<impl Stream<Item = Result<KC::Key, StateReaderError>> + 'static, StateReaderError>
+        buffer: E,
+    ) -> KeyRead<
+        'q,
+        KC,
+        impl ReadSource<
+            Query = BorrowedKeyQuery<'q, KC>,
+            Output: Stream<Item = Result<KC::Key, StateReaderError>> + Send + 'q,
+        >
+        + 'q
+        + use<'q, K, KC, V, C, B, E>,
+    >
     where
         V: 'static,
-        KC::Key: 'static,
     {
-        self.projected::<Presence>(key.into(), query.encoded).await
+        let reader = self.clone();
+        let key = key.into();
+        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'q, KC>| {
+            reader.projected::<Presence, _>(key, query, buffer)
+        })
     }
 }

@@ -1,6 +1,7 @@
 //! Streams reject results from a stale attempt.
 
 use super::*;
+use crate::state::query::tests::query_buffer;
 
 /// Whether a fenced map outcome — a stream item or a call's error — is the
 /// `Terminated` access error.
@@ -42,7 +43,7 @@ pub(super) fn range_scan_stream_fences_after_bump() -> Result<()> {
 
         let session = fx.session(1);
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
-        let stream = handle.entries(KeyQuery::new(Direction::Forward));
+        let stream = handle.entries(query_buffer()).stream();
         futures::pin_mut!(stream);
 
         match stream.next().await {
@@ -97,7 +98,7 @@ pub(super) fn coordinate_stream_fences_buffered_entries_after_bump() -> Result<(
 
         let session = fx.session(1);
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
-        let stream = handle.entries(KeyQuery::new(Direction::Forward));
+        let stream = handle.entries(query_buffer()).stream();
         futures::pin_mut!(stream);
 
         // The chunk is fetched and the permit dropped before this first yield.

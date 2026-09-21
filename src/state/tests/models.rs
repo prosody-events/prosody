@@ -137,10 +137,10 @@ pub(super) fn prop_map_ttl_keyset_refresh() {
 }
 
 /// Map key-scan presence: over a directly-seeded map whose keyset frame
-/// over-reports a TTL-expired coordinate, `keys()` yields exactly the present
-/// keys in order across both arms (tracked point-get and degrade scan), and
-/// agrees with `stream()` on the live key set — the presence-only key scan
-/// skips a coordinate the keyset lists but the store no longer holds.
+/// over-reports a TTL-expired coordinate, the key stream yields exactly the
+/// present keys in order across both arms (tracked point-get and degrade scan),
+/// and agrees with the entry stream on the live key set — the presence-only key
+/// scan skips a coordinate the keyset lists but the store no longer holds.
 #[test]
 pub(super) fn prop_map_key_scan_holes() {
     fn property(shape: MapKeyHoles) -> Result<bool> {

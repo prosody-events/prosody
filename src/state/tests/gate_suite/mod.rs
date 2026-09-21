@@ -31,8 +31,8 @@ use super::super::session::sealed::StateLifecycle;
 use super::super::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use super::super::store::{CELL_BATCH, CellStore};
 use super::super::{
-    CollectionId, CollectionRef, Direction, PartitionBackend, StateAccessError, StateKey,
-    StateName, StateType, StoreOutcome,
+    CollectionId, CollectionRef, PartitionBackend, StateAccessError, StateKey, StateName,
+    StateType, StoreOutcome,
 };
 use super::cell_suite::{MemoryDeduplicationStore, value_cell};
 use super::collection_suite::finalize_and_promote;
@@ -43,7 +43,6 @@ use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::cell::Values;
 use crate::state::store::CellRead;
-use crate::state::{DequeQuery, KeyQuery};
 
 use super::super::fjall::test_db;
 use crate::timers::duration::CompactDuration;

@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// Binds `deque_state(name)` on `session` and fully drains its `stream(dir)`,
+/// Binds `deque_state(name)` on `session` and fully drains its values,
 /// returning the yielded values. Called with a fresh (clean-overlay) session so
 /// every read falls through to the underlying store.
 pub(super) async fn drain_deque_stream(
@@ -14,7 +14,7 @@ pub(super) async fn drain_deque_stream(
         .bind(session)
         .map_err(|e| eyre!("bind: {e}"))?;
     let mut out = Vec::new();
-    let stream = handle.values(DequeQuery::new(dir));
+    let stream = handle.values().direction(dir).stream();
     futures::pin_mut!(stream);
     while let Some(item) = stream.next().await {
         out.push(item?);

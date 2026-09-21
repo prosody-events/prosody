@@ -14,7 +14,7 @@
 //! Trace generators favor inserts. Trace shrinking preserves event structure.
 
 use super::support::{
-    OwnerSession, ReaderBackend, all_match, collect_query, owner_commit_cell, source_state_key,
+    OwnerSession, ReaderBackend, all_match, collect_stream, owner_commit_cell, source_state_key,
     state_name,
 };
 use crate::Key;
@@ -27,9 +27,9 @@ use crate::state::descriptor::{
 use crate::state::descriptor_identity::DurableDescriptorIdentity;
 use crate::state::identity::StateKey;
 use crate::state::order_codec::I64KeyCodec;
+use crate::state::query::tests::query_buffer;
 use crate::state::tests::collection_suite::{DequeOp, KEY_POOL, MapOp, Trace};
 use crate::state::tests::support::reader_residue;
-use crate::state::{DequeQuery, KeyQuery};
 use crate::state_reader::backend::ReaderBackend as CoreReaderBackend;
 use crate::state_reader::{PartitionCount, StateReader};
 use crate::subsystem::SubsystemName;
@@ -141,22 +141,29 @@ async fn assert_map<B: ReaderBackend>(
             Ok(value == model.get(k).cloned() && present == model.contains_key(k))
         }),
         reader.get_many(case.key.clone(), &KEY_POOL),
-        collect_query(reader.entries(case.key.clone(), KeyQuery::new(Direction::Forward))),
-        collect_query(reader.keys(case.key.clone(), KeyQuery::new(Direction::Forward))),
-        collect_query(
-            reader.entries(
-                case.key.clone(),
-                KeyQuery::new(Direction::Forward)
-                    .from(&-1)
-                    .before(&2)
-                    .limit(NonZeroUsize::MIN)
-            )
+        collect_stream(reader.entries(case.key.clone(), query_buffer()).stream()),
+        collect_stream(reader.keys(case.key.clone(), query_buffer()).stream()),
+        collect_stream(
+            reader
+                .entries(case.key.clone(), query_buffer())
+                .from(&-1)
+                .before(&2)
+                .limit(NonZeroUsize::MIN)
+                .stream()
         ),
-        collect_query(reader.keys(
-            case.key.clone(),
-            KeyQuery::new(Direction::Forward).after(&-2).to(&1)
-        )),
-        collect_query(reader.entries(case.key.clone(), KeyQuery::new(Direction::Backward))),
+        collect_stream(
+            reader
+                .keys(case.key.clone(), query_buffer())
+                .after(&-2)
+                .to(&1)
+                .stream()
+        ),
+        collect_stream(
+            reader
+                .entries(case.key.clone(), query_buffer())
+                .reverse()
+                .stream()
+        ),
     );
     let points = points?;
     let many = many?;
@@ -166,7 +173,7 @@ async fn assert_map<B: ReaderBackend>(
     let expect_many: Vec<_> = KEY_POOL.iter().map(|k| model.get(k).cloned()).collect();
     let expect_forward: Vec<_> = model.iter().map(|(k, v)| (*k, v.clone())).collect();
     let expected_entries: Vec<_> = model
-        .range(-1..2)
+        .range(&-1..&2)
         .take(1)
         .map(|(key, value)| (*key, value.clone()))
         .collect();
@@ -195,8 +202,20 @@ async fn assert_map<B: ReaderBackend>(
         |(dir, expected)| async move {
             let limit = NonZeroUsize::new(expected.len() / 2 + 1).unwrap_or(NonZeroUsize::MIN);
             let (entries, keys) = try_join!(
-                collect_query(reader.entries(case.key.clone(), KeyQuery::new(dir).limit(limit))),
-                collect_query(reader.keys(case.key.clone(), KeyQuery::new(dir).limit(limit))),
+                collect_stream(
+                    reader
+                        .entries(case.key.clone(), query_buffer())
+                        .direction(dir)
+                        .limit(limit)
+                        .stream()
+                ),
+                collect_stream(
+                    reader
+                        .keys(case.key.clone(), query_buffer())
+                        .direction(dir)
+                        .limit(limit)
+                        .stream()
+                ),
             )?;
             let expected: Vec<_> = expected.iter().take(limit.get()).cloned().collect();
             Ok(entries == expected
@@ -316,20 +335,22 @@ async fn assert_deque<B: ReaderBackend>(
         all_match(0..=model.len(), |i| async move {
             Ok(reader.get(case.key.clone(), i).await? == model.get(i).cloned())
         }),
-        collect_query(reader.values(case.key.clone(), DequeQuery::new(Direction::Forward))),
-        collect_query(reader.values(case.key.clone(), DequeQuery::new(Direction::Backward))),
-        collect_query(
-            reader.values(
-                case.key.clone(),
-                DequeQuery::new(Direction::Forward)
-                    .range(1..=3)
-                    .limit(NonZeroUsize::MIN)
-            )
+        collect_stream(reader.values(case.key.clone()).stream()),
+        collect_stream(reader.values(case.key.clone()).reverse().stream()),
+        collect_stream(
+            reader
+                .values(case.key.clone())
+                .range(1..=3)
+                .limit(NonZeroUsize::MIN)
+                .stream()
         ),
-        collect_query(reader.values(
-            case.key.clone(),
-            DequeQuery::new(Direction::Backward).range(1..=3)
-        )),
+        collect_stream(
+            reader
+                .values(case.key.clone())
+                .reverse()
+                .range(1..=3)
+                .stream()
+        ),
     );
     let empty = empty?;
     let front = front?;

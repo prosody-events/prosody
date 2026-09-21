@@ -1,6 +1,7 @@
 //! Collection projections preserve batched reads and presence.
 
 use super::*;
+use crate::state::query::tests::query_buffer;
 
 /// A cold, dense `CELL_BATCH`-entry `Tracked` map streamed to exhaustion issues
 /// exactly ONE lower batch read for its entries — a full-width scan chunk is
@@ -67,7 +68,7 @@ pub(super) fn map_cold_chunk_is_one_batch_read() -> Result<()> {
         );
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
         let drained: Vec<_> = {
-            let stream = handle.entries(KeyQuery::new(Direction::Forward));
+            let stream = handle.entries(query_buffer()).stream();
             futures::pin_mut!(stream);
             let mut out = Vec::new();
             while let Some(item) = stream.next().await {
@@ -286,7 +287,7 @@ pub(super) async fn map_keys_drain_resolves(
 
     for dir in [Direction::Forward, Direction::Backward] {
         let drained: Vec<i64> = {
-            let stream = handle.keys(KeyQuery::new(dir));
+            let stream = handle.keys(query_buffer()).direction(dir).stream();
             futures::pin_mut!(stream);
             let mut out = Vec::new();
             while let Some(item) = stream.next().await {

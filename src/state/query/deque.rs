@@ -1,14 +1,17 @@
 //! Queries over deque positions, counted from the front.
 
 use crate::state::cell_key::Direction;
+use serde::{Deserialize, Serialize};
+use std::mem::swap;
 use std::num::NonZeroUsize;
 use std::ops::{Bound, RangeBounds};
 
 /// An owned deque query shared by all read APIs.
-/// Positions count from the front. Edges follow the query direction.
+/// Forward order is the default. Direction changes preserve the selected
+/// bounds. Positions count from the front. Edges follow the query direction.
 /// Each bound method replaces one edge. A start past the end returns no values.
 /// Deque positions have no prefix operation.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[must_use]
 pub struct DequeQuery {
     pub(crate) dir: Direction,
@@ -18,14 +21,33 @@ pub struct DequeQuery {
 }
 
 impl DequeQuery {
-    /// Creates an unbounded query in `dir` order.
-    pub fn new(dir: Direction) -> Self {
+    /// Creates an unbounded query in forward order.
+    pub fn new() -> Self {
         Self {
-            dir,
+            dir: Direction::Forward,
             start: Bound::Unbounded,
             end: Bound::Unbounded,
             limit: None,
         }
+    }
+
+    /// Selects order from front to back.
+    pub fn forward(self) -> Self {
+        self.direction(Direction::Forward)
+    }
+
+    /// Selects order from back to front. Repeated calls keep this order.
+    pub fn reverse(self) -> Self {
+        self.direction(Direction::Backward)
+    }
+
+    /// Selects an order supplied at runtime.
+    pub fn direction(mut self, dir: Direction) -> Self {
+        if self.dir != dir {
+            swap(&mut self.start, &mut self.end);
+            self.dir = dir;
+        }
+        self
     }
 
     /// Starts at `position`.
@@ -80,6 +102,6 @@ impl DequeQuery {
 
 impl Default for DequeQuery {
     fn default() -> Self {
-        Self::new(Direction::Forward)
+        Self::new()
     }
 }

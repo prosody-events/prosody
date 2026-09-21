@@ -8,7 +8,6 @@ use super::map::projected;
 use super::map::{KeyItem, MapKeysetCodec, MapKeysetKey, MapStateError};
 use super::{CollectionSpec, Descriptor, Keyed};
 use crate::codec::{UnitCodec, UnitCodecError};
-use crate::state::KeyQuery;
 use crate::state::cell::Presence;
 use crate::state::cell_key::Direction;
 use crate::state::collection::{
@@ -16,11 +15,13 @@ use crate::state::collection::{
     WritableStateSession, collection_layout, collection_methods, same_token, spec_matches,
 };
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
-use crate::state::{CollectionKindId, StateName, StoreOutcome};
+use crate::state::{BorrowedKeyQuery, CollectionKindId, StateName, StoreOutcome};
+use crate::state::{KeyQuery, KeyRead, ReadQuery, ReadSource};
 use educe::Educe;
 use futures::stream::Stream;
 use std::borrow::Borrow;
 use std::fmt::Display;
+use std::ops::DerefMut;
 use tracing::{Span, field::Empty, info_span, instrument};
 
 collection_layout! {
@@ -180,9 +181,22 @@ where
         Ok(())
     }
 
-    /// Streams live members in query order.
-    pub fn keys(&self, query: KeyQuery<KC>) -> impl Stream<Item = KeyItem<SetKind<KC>>> + '_ {
-        projected::<_, _, Presence>(&self.cells, query.encoded)
+    /// Builds a query over live members in ascending key order.
+    /// Supply reusable encoding storage as described by [`KeyQuery`].
+    pub fn keys<'a, E: DerefMut<Target = Vec<u8>> + Send + 'a>(
+        &'a self,
+        buffer: E,
+    ) -> KeyRead<
+        'a,
+        KC,
+        impl ReadSource<
+            Query = BorrowedKeyQuery<'a, KC>,
+            Output: Stream<Item = KeyItem<SetKind<KC>>> + Send,
+        > + 'a,
+    > {
+        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
+            projected::<_, _, Presence, _>(&self.cells, query, buffer)
+        })
     }
 
     /// Reports whether the set has no live members.

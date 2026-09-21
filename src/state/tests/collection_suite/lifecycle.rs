@@ -129,7 +129,7 @@ pub(super) async fn run_map_trace_inner(
             }
         },
         async |handle, model, backing: &Backing<'_>| {
-            Ok(assert_map(handle, model, constraints).await?
+            Ok(Box::pin(assert_map(handle, model, constraints)).await?
                 && assert_keyset_present(backing.cells, backing.state_key, model)?)
         },
     )

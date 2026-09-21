@@ -1,6 +1,7 @@
 //! Errors and dropped futures release session admission.
 
 use super::*;
+use crate::state::query::tests::query_buffer;
 
 /// The error-yield gate-release pin (map): a `Tracked` map stream whose entry
 /// holds undecodable bytes yields `Err` — and MUST release the session gate
@@ -55,7 +56,7 @@ pub(super) fn map_stream_error_yield_releases_the_gate() -> Result<()> {
             .bind(&session)
             .map_err(|e| eyre!("bind: {e}"))?;
 
-        let stream = handle.entries(KeyQuery::new(Direction::Forward));
+        let stream = handle.entries(query_buffer()).stream();
         futures::pin_mut!(stream);
         // Projection fails at key 7 before the chunk emits any item.
         let first = stream
@@ -128,7 +129,7 @@ pub(super) fn deque_stream_error_yield_releases_the_gate() -> Result<()> {
             .bind(&session)
             .map_err(|e| eyre!("bind: {e}"))?;
 
-        let stream = handle.values(DequeQuery::new(Direction::Forward));
+        let stream = handle.values().stream();
         futures::pin_mut!(stream);
         // Projection fails at index 1 before the chunk emits any item.
         let first = stream
@@ -269,7 +270,7 @@ pub(super) fn dropped_stream_chunk_fetch_releases_the_gate() -> Result<()> {
         let stream_task = tokio::spawn({
             let handle = handle.clone();
             async move {
-                let stream = handle.values(DequeQuery::new(Direction::Forward));
+                let stream = handle.values().stream();
                 futures::pin_mut!(stream);
                 let _ = stream.next().await;
             }
@@ -297,7 +298,7 @@ pub(super) fn dropped_stream_chunk_fetch_releases_the_gate() -> Result<()> {
         let holding = tokio::spawn({
             let handle = handle.clone();
             async move {
-                let stream = handle.values(DequeQuery::new(Direction::Forward));
+                let stream = handle.values().stream();
                 futures::pin_mut!(stream);
                 stream.next().await.transpose()
             }

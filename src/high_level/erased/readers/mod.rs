@@ -3,6 +3,7 @@
 use crate::EventIdentity;
 use crate::Key;
 use crate::codec::{Codec, ErasedStateCodec};
+use crate::consumer::event_context::encoding_buffer;
 use crate::consumer::event_context::{BoxStateCursor, ErasedStateError, StateCursor};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::high_level::codecs::StateCodec;
@@ -79,18 +80,14 @@ pub trait ErasedMapReader<C: Codec>: Send + Sync {
     ) -> Result<Vec<Option<C::Payload>>, ErasedStateError>;
 
     /// Streams committed entries in key order.
-    async fn entries(
+    fn read_entries(
         &self,
         key: String,
         query: ErasedKeyQuery,
-    ) -> Result<BoxStateCursor<(String, C::Payload)>, ErasedStateError>;
+    ) -> BoxStateCursor<(String, C::Payload)>;
 
     /// Streams committed keys without decoding values.
-    async fn keys(
-        &self,
-        key: String,
-        query: ErasedKeyQuery,
-    ) -> Result<BoxStateCursor<String>, ErasedStateError>;
+    fn read_keys(&self, key: String, query: ErasedKeyQuery) -> BoxStateCursor<String>;
 }
 
 /// Shared map-reader representation stored by native FFI wrappers.
@@ -113,11 +110,7 @@ pub trait ErasedSetReader: Send + Sync {
     async fn is_empty(&self, key: String) -> Result<bool, ErasedStateError>;
 
     /// Streams committed members in key order.
-    async fn keys(
-        &self,
-        key: String,
-        query: ErasedKeyQuery,
-    ) -> Result<BoxStateCursor<String>, ErasedStateError>;
+    fn read_keys(&self, key: String, query: ErasedKeyQuery) -> BoxStateCursor<String>;
 }
 
 /// Shared set-reader representation stored by native FFI wrappers.
@@ -142,11 +135,7 @@ pub trait ErasedDequeReader<C: Codec>: Send + Sync {
     async fn peek_back(&self, key: String) -> Result<Option<C::Payload>, ErasedStateError>;
 
     /// Streams committed elements in index order.
-    async fn values(
-        &self,
-        key: String,
-        query: DequeQuery,
-    ) -> Result<BoxStateCursor<C::Payload>, ErasedStateError>;
+    fn read_values(&self, key: String, query: DequeQuery) -> BoxStateCursor<C::Payload>;
 }
 
 /// Shared deque-reader representation stored by native FFI wrappers.
@@ -294,30 +283,24 @@ where
             .map_err(Into::into)
     }
 
-    async fn entries(
+    fn read_entries(
         &self,
         key: String,
         query: ErasedKeyQuery,
-    ) -> Result<BoxStateCursor<(String, C::Payload)>, ErasedStateError> {
-        let stream = self
-            .0
-            .entries(Key::from(key), query)
-            .await
-            .map_err(ErasedStateError::from)?;
-        Ok(Box::new(state_cursor(stream)))
+    ) -> BoxStateCursor<(String, C::Payload)> {
+        let reader = self.0.clone();
+        Box::new(state_cursor(async_stream::try_stream! {
+            let stream = reader.entries(key, encoding_buffer(&query)).with_query(query.borrowed()).stream();
+            for await item in stream { yield item?; }
+        }))
     }
 
-    async fn keys(
-        &self,
-        key: String,
-        query: ErasedKeyQuery,
-    ) -> Result<BoxStateCursor<String>, ErasedStateError> {
-        let stream = self
-            .0
-            .keys(Key::from(key), query)
-            .await
-            .map_err(ErasedStateError::from)?;
-        Ok(Box::new(state_cursor(stream)))
+    fn read_keys(&self, key: String, query: ErasedKeyQuery) -> BoxStateCursor<String> {
+        let reader = self.0.clone();
+        Box::new(state_cursor(async_stream::try_stream! {
+            let stream = reader.keys(key, encoding_buffer(&query)).with_query(query.borrowed()).stream();
+            for await item in stream { yield item?; }
+        }))
     }
 }
 
@@ -353,17 +336,12 @@ where
         self.0.is_empty(Key::from(key)).await.map_err(Into::into)
     }
 
-    async fn keys(
-        &self,
-        key: String,
-        query: ErasedKeyQuery,
-    ) -> Result<BoxStateCursor<String>, ErasedStateError> {
-        let stream = self
-            .0
-            .keys(Key::from(key), query)
-            .await
-            .map_err(ErasedStateError::from)?;
-        Ok(Box::new(state_cursor(stream)))
+    fn read_keys(&self, key: String, query: ErasedKeyQuery) -> BoxStateCursor<String> {
+        let reader = self.0.clone();
+        Box::new(state_cursor(async_stream::try_stream! {
+            let stream = reader.keys(key, encoding_buffer(&query)).with_query(query.borrowed()).stream();
+            for await item in stream { yield item?; }
+        }))
     }
 }
 
@@ -398,17 +376,9 @@ where
         self.0.peek_back(Key::from(key)).await.map_err(Into::into)
     }
 
-    async fn values(
-        &self,
-        key: String,
-        query: DequeQuery,
-    ) -> Result<BoxStateCursor<C::Payload>, ErasedStateError> {
-        let stream = self
-            .0
-            .values(Key::from(key), query)
-            .await
-            .map_err(ErasedStateError::from)?;
-        Ok(Box::new(state_cursor(stream)))
+    fn read_values(&self, key: String, query: DequeQuery) -> BoxStateCursor<C::Payload> {
+        let stream = self.0.values(key).with_query(query).stream();
+        Box::new(state_cursor(stream))
     }
 }
 
@@ -452,3 +422,5 @@ impl ClassifyError for ErasedReadLimitError {
 
 #[cfg(test)]
 mod tests;
+
+mod query;

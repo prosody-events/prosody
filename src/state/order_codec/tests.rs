@@ -10,6 +10,7 @@ use super::{
     order_preserving_i64, order_preserving_i64_decode,
 };
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::descriptor::map::MapKeysetKey;
 use bytes::BytesMut;
 use quickcheck::{QuickCheck, TestResult};
 use std::borrow::Borrow;
@@ -168,28 +169,33 @@ fn unit_key_round_trips_only_the_empty_coordinate() {
 /// property guards against a future impl drifting the two byte forms apart.
 #[test]
 fn prop_key_codec_payload_bytes_are_coordinate_bytes() {
-    fn agrees<KC>(key: KC::Key) -> bool
+    fn agrees<KC>(key: KC::Key) -> Result<bool, KeyCodecError>
     where
         KC: OrderedKeyCodec,
         KC::Key: Clone + PartialEq,
     {
-        let mut codec = KC::default();
-        let mut buf = Vec::new();
-        if codec.serialize(key.clone(), &mut buf).is_err() {
-            return false;
-        }
-        let mut borrowed = Vec::new();
-        codec.serialize_ref(&key, &mut borrowed).is_ok()
-            && borrowed == buf
-            && buf == KC::encode(key.borrow()).as_bytes()
-            && codec.deserialize(&mut buf.clone()) == Ok(key.clone())
-            && codec.deserialize_owned(BytesMut::from(buf.as_slice())) == Ok(key)
+        KC::with_cached_local(|codec| {
+            let mut buf = Vec::new();
+            codec.serialize(key.clone(), &mut buf)?;
+            let mut borrowed = Vec::new();
+            codec.serialize_ref(&key, &mut borrowed)?;
+            let mut input = vec![42];
+            codec.serialize_key(key.borrow(), &mut input)?;
+            Ok(input.len() == KC::encoded_len(key.borrow()) + 1
+                && input[0] == 42
+                && input[1..] == buf
+                && borrowed == buf
+                && buf == KC::encode(key.borrow()).as_bytes()
+                && codec.deserialize(&mut buf.clone())? == key
+                && codec.deserialize_owned(BytesMut::from(buf.as_slice())) == Ok(key))
+        })
     }
-    fn prop(s: String, i: i64, u: u64) -> bool {
-        agrees::<Utf8KeyCodec>(s)
-            && agrees::<I64KeyCodec>(i)
-            && agrees::<U64KeyCodec>(u)
-            && agrees::<UnitKey>(())
+    fn prop(s: String, i: i64, u: u64) -> Result<bool, KeyCodecError> {
+        Ok(agrees::<Utf8KeyCodec>(s)?
+            && agrees::<I64KeyCodec>(i)?
+            && agrees::<U64KeyCodec>(u)?
+            && agrees::<UnitKey>(())?
+            && agrees::<MapKeysetKey>(())?)
     }
-    QuickCheck::new().quickcheck(prop as fn(String, i64, u64) -> bool);
+    QuickCheck::new().quickcheck(prop as fn(String, i64, u64) -> Result<bool, KeyCodecError>);
 }

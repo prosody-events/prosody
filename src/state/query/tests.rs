@@ -1,8 +1,9 @@
 //! Query method order agrees with independent key and position bounds.
 
-use super::{DequeQuery, ErasedKeyQuery};
+use super::{BorrowedKeyQuery, DequeQuery, ErasedKeyQuery, KeyQuery, ReadQuery};
+use crate::codec::SerializeBufGuard;
 use crate::state::Direction;
-use crate::state::order_codec::{OrderedKeyCodec, Utf8KeyCodec};
+use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, Utf8KeyCodec};
 use quickcheck::QuickCheck;
 use std::num::NonZeroUsize;
 use std::ops::Bound;
@@ -17,17 +18,31 @@ enum Upper<'a> {
 
 /// Applies the same ordered operations to each public read interface.
 pub(crate) fn key_query(dir: Direction, steps: &[KeyStep]) -> ErasedKeyQuery {
-    let mut query = ErasedKeyQuery::new(dir);
+    key_read(ReadQuery::new(ErasedKeyQuery::new(), ()), dir, steps).into_query()
+}
+
+/// Applies ordered settings to a bound read without changing its source.
+pub(crate) fn key_read<'a, B: From<&'a str> + Clone, S>(
+    query: ReadQuery<KeyQuery<Utf8KeyCodec, B>, S>,
+    dir: Direction,
+    steps: &'a [KeyStep],
+) -> ReadQuery<KeyQuery<Utf8KeyCodec, B>, S> {
+    let mut query = query.direction(dir);
     for (op, a, b, limit) in steps {
-        query = match op % 8 {
+        query = match op % 10 {
             0 => query.from(a),
             1 => query.after(a),
             2 => query.to(a),
             3 => query.before(a),
             4 => query.prefix(a),
             5 => query.limit(*limit),
-            6 => query.range((Bound::Included(a.as_str()), Bound::Excluded(b.as_str()))),
-            _ => query.range(..),
+            6 => query.range((
+                Bound::Included(B::from(a.as_str())),
+                Bound::Excluded(B::from(b.as_str())),
+            )),
+            7 => query.range(..),
+            8 => query.forward(),
+            _ => query.reverse(),
         };
     }
     query
@@ -36,14 +51,14 @@ pub(crate) fn key_query(dir: Direction, steps: &[KeyStep]) -> ErasedKeyQuery {
 /// Models prefix bounds with string predicates, without a byte successor.
 pub(crate) fn expected_keys<'a>(
     keys: impl IntoIterator<Item = &'a str>,
-    dir: Direction,
+    mut dir: Direction,
     steps: &[KeyStep],
 ) -> Vec<String> {
     let mut low = Bound::Unbounded;
     let mut high = Upper::Bound(Bound::Unbounded);
     let mut limit = usize::MAX;
     for (op, a, b, count) in steps {
-        let op = op % 8;
+        let op = op % 10;
         match op {
             0..=3 => {
                 let bound = if op % 2 == 0 {
@@ -66,10 +81,12 @@ pub(crate) fn expected_keys<'a>(
                 low = Bound::Included(a.as_str());
                 high = Upper::Bound(Bound::Excluded(b.as_str()));
             }
-            _ => {
+            7 => {
                 low = Bound::Unbounded;
                 high = Upper::Bound(Bound::Unbounded);
             }
+            8 => dir = Direction::Forward,
+            _ => dir = Direction::Backward,
         }
     }
     let mut keys: Vec<_> = keys
@@ -101,7 +118,7 @@ pub(crate) fn expected_keys<'a>(
 
 #[test]
 fn prop_key_query_method_order() {
-    fn property(mut keys: Vec<String>, mut steps: Vec<KeyStep>) {
+    fn property(mut keys: Vec<String>, mut steps: Vec<KeyStep>) -> color_eyre::Result<()> {
         steps.truncate(128);
         keys.extend(steps.iter().flat_map(|(_, a, b, _)| [a.clone(), b.clone()]));
         for dir in [Direction::Forward, Direction::Backward] {
@@ -109,12 +126,16 @@ fn prop_key_query_method_order() {
             for end in 0..=steps.len() {
                 let steps = &steps[..end];
                 let query = key_query(dir, steps);
+                let query: ErasedKeyQuery = serde_json::from_slice(&serde_json::to_vec(&query)?)?;
+                let mut buf = SerializeBufGuard::acquire();
+                buf.reserve(query.required_capacity());
+                let query = query.encode(&mut buf)?;
                 let mut coordinates: Vec<_> =
                     keys.iter().map(|key| Utf8KeyCodec::encode(key)).collect();
                 coordinates.sort();
                 coordinates.dedup();
-                let mut actual = query.encoded.select(coordinates);
-                actual.truncate(query.encoded.limit.map_or(usize::MAX, NonZeroUsize::get));
+                let mut actual = query.select(coordinates);
+                actual.truncate(query.limit.map_or(usize::MAX, NonZeroUsize::get));
                 let expected: Vec<_> = expected_keys(keys.iter().map(String::as_str), dir, steps)
                     .iter()
                     .map(|key| Utf8KeyCodec::encode(key))
@@ -122,20 +143,25 @@ fn prop_key_query_method_order() {
                 assert_eq!(actual, expected, "direction: {dir:?}; steps: {steps:?}");
             }
         }
+        Ok(())
     }
-    QuickCheck::new().quickcheck(property as fn(Vec<String>, Vec<KeyStep>));
+    for query in [ErasedKeyQuery::new(), ErasedKeyQuery::default()] {
+        assert_eq!(query.dir, Direction::Forward);
+    }
+    QuickCheck::new()
+        .quickcheck(property as fn(Vec<String>, Vec<KeyStep>) -> color_eyre::Result<()>);
 }
 
 #[test]
 fn prop_deque_query_method_order() {
-    fn property(mut steps: Vec<(u8, usize, usize, NonZeroUsize)>) {
+    fn property(mut steps: Vec<(u8, usize, usize, NonZeroUsize)>) -> color_eyre::Result<()> {
         steps.truncate(128);
-        for dir in [Direction::Forward, Direction::Backward] {
-            let mut query = DequeQuery::new(dir);
+        for mut dir in [Direction::Forward, Direction::Backward] {
+            let mut query = ReadQuery::new(DequeQuery::new(), ()).direction(dir);
             let (mut low, mut high) = (Bound::Unbounded, Bound::Unbounded);
             let mut expected_limit = None;
             for (op, a, b, limit) in &steps {
-                let op = op % 7;
+                let op = op % 9;
                 query = match op {
                     0 => query.from(*a),
                     1 => query.after(*a),
@@ -143,7 +169,9 @@ fn prop_deque_query_method_order() {
                     3 => query.before(*a),
                     4 => query.range(*a..=*b),
                     5 => query.limit(*limit),
-                    _ => query.range(..),
+                    6 => query.range(..),
+                    7 => query.forward(),
+                    _ => query.reverse(),
                 };
                 match op {
                     0..=3 => {
@@ -163,15 +191,126 @@ fn prop_deque_query_method_order() {
                         high = Bound::Included(*b);
                     }
                     5 => expected_limit = Some(*limit),
-                    _ => {
+                    6 => {
                         low = Bound::Unbounded;
                         high = Bound::Unbounded;
                     }
+                    7 => dir = Direction::Forward,
+                    _ => dir = Direction::Backward,
                 }
-                assert_eq!(query.bounds(), (low, high));
-                assert_eq!(query.limit, expected_limit);
+                let settings = query.into_query();
+                let settings: DequeQuery = serde_json::from_slice(&serde_json::to_vec(&settings)?)?;
+                assert_eq!(settings.dir, dir);
+                assert_eq!(settings.bounds(), (low, high));
+                assert_eq!(settings.limit, expected_limit);
+                query = ReadQuery::new(DequeQuery::new(), ()).with_query(settings);
             }
         }
+        Ok(())
     }
-    QuickCheck::new().quickcheck(property as fn(Vec<(u8, usize, usize, NonZeroUsize)>));
+    for query in [DequeQuery::new(), DequeQuery::default()] {
+        assert_eq!(query.dir, Direction::Forward);
+    }
+    QuickCheck::new().quickcheck(
+        property as fn(Vec<(u8, usize, usize, NonZeroUsize)>) -> color_eyre::Result<()>,
+    );
+}
+
+/// A prefix endpoint selects exactly the bytes that start with that prefix.
+#[test]
+fn encoded_prefix_range_matches_bytes() {
+    fn property(mut bytes: Vec<u8>, mut prefix: Vec<u8>, shared: bool, offset: u8) {
+        for byte in bytes.iter_mut().chain(&mut prefix) {
+            *byte = [0, 1, 254, 255][usize::from(*byte % 4)];
+        }
+        if shared {
+            bytes.splice(..0, prefix.iter().copied());
+        }
+        let expected = bytes.starts_with(&prefix);
+        let offset = usize::from(offset);
+        let mut buffer = vec![42; offset];
+        buffer.extend_from_slice(&prefix);
+        let bounded = super::bounds::prefix_end(&mut buffer, offset);
+        assert!(buffer[..offset].iter().all(|&byte| byte == 42));
+        assert_eq!(
+            expected,
+            bytes >= prefix && (!bounded || bytes.as_slice() < &buffer[offset..])
+        );
+    }
+    QuickCheck::new().quickcheck(property as fn(Vec<u8>, Vec<u8>, bool, u8));
+}
+
+/// Caller-owned buffers retain their allocations across interleaved queries.
+/// Insufficient capacity produces an error without buffer growth.
+#[test]
+fn borrowed_queries_reuse_encoding_storage() {
+    fn property(mut steps: Vec<KeyStep>) -> color_eyre::Result<()> {
+        steps.truncate(128);
+        let capacity = steps
+            .iter()
+            .map(|(_, a, b, _)| a.len().max(b.len()) * 2)
+            .max()
+            .unwrap_or(0);
+        let mut left = Vec::with_capacity(capacity);
+        let mut right = Vec::with_capacity(capacity);
+        let allocations = [
+            (left.as_ptr(), left.capacity()),
+            (right.as_ptr(), right.capacity()),
+        ];
+        for end in 0..=steps.len() {
+            let query = key_read(
+                ReadQuery::new(BorrowedKeyQuery::new(), ()),
+                Direction::Forward,
+                &steps[..end],
+            )
+            .into_query();
+            let required = query.required_capacity();
+            let mut empty = Vec::new();
+            if required > 0 {
+                assert!(matches!(query.encode(&mut empty),
+                    Err(KeyCodecError::InsufficientCapacity { required: size, available: 0 }) if size == required));
+                assert_eq!(empty.capacity(), 0);
+            }
+            let first = query.encode(&mut left)?;
+            let second = query.encode(&mut right)?;
+            assert_eq!(first.start, second.start);
+            assert_eq!(first.end, second.end);
+            assert_eq!(
+                [
+                    (left.as_ptr(), left.capacity()),
+                    (right.as_ptr(), right.capacity())
+                ],
+                allocations
+            );
+        }
+        Ok(())
+    }
+    QuickCheck::new().quickcheck(property as fn(Vec<KeyStep>) -> color_eyre::Result<()>);
+}
+
+/// Stored settings keep their field names, bound variants, and direction
+/// values.
+#[test]
+fn query_json_is_stable() -> color_eyre::Result<()> {
+    let key = ErasedKeyQuery::new()
+        .prefix("a")
+        .reverse()
+        .limit(NonZeroUsize::MIN);
+    assert_eq!(
+        serde_json::to_string(&key)?,
+        r#"{"dir":"Backward","limit":1,"start":{"PrefixEnd":"a"},"end":{"Bound":{"Included":"a"}}}"#
+    );
+    let deque = DequeQuery::new().after(2).to(9);
+    assert_eq!(
+        serde_json::to_string(&deque)?,
+        r#"{"dir":"Forward","start":{"Excluded":2},"end":{"Included":9},"limit":null}"#
+    );
+    Ok(())
+}
+
+/// Supplies scratch storage for collection test fixtures.
+pub(crate) fn query_buffer() -> SerializeBufGuard {
+    let mut buffer = SerializeBufGuard::acquire();
+    buffer.reserve(4096);
+    buffer
 }

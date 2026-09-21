@@ -1,18 +1,17 @@
 //! Borrowed keys preserve owner and reader results across iterator shapes.
 
 use super::support::{
-    GROUP_A, MemoryHarness, collect_query, each, mock_count, owner_commit, publish_source,
+    GROUP_A, MemoryHarness, collect_stream, each, mock_count, owner_commit, publish_source,
     source_state_key, state_name, subsystem, topic,
 };
 use crate::Key;
 use crate::codec::JsonCodec;
-use crate::state::Direction;
-use crate::state::KeyQuery;
 use crate::state::collection::WritableStateSession;
 use crate::state::descriptor::{
     MapDescriptor, MapHandle, SetDescriptor, SetHandle, StateDescriptor, map_state, set_state,
 };
 use crate::state::order_codec::Utf8KeyCodec;
+use crate::state::query::tests::query_buffer;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CELL_BATCH;
 use crate::state_reader::StateReader;
@@ -190,25 +189,26 @@ async fn check_map<S: WritableStateSession>(
         presence
     );
     assert_eq!(handle.contains_many(unknown(keys)).await?, presence);
+    let capacity = members.iter().map(String::len).max().unwrap_or(0) * 2;
+    let mut bounds = Vec::with_capacity(capacity);
     for edge in members.first().into_iter().chain(members.last()) {
         assert_eq!(
             handle
-                .entries(
-                    KeyQuery::new(Direction::Forward)
-                        .from(edge.as_str())
-                        .to(edge.as_str())
-                )
+                .entries(&mut bounds)
+                .from(edge.as_str())
+                .to(edge.as_str())
+                .stream()
                 .try_collect::<Vec<_>>()
                 .await?,
             vec![(edge.clone(), model[edge].clone())]
         );
         assert!(
             handle
-                .keys(
-                    KeyQuery::new(Direction::Backward)
-                        .after(edge.as_str())
-                        .before(edge.as_str())
-                )
+                .keys(&mut bounds)
+                .reverse()
+                .after(edge.as_str())
+                .before(edge.as_str())
+                .stream()
                 .try_collect::<Vec<_>>()
                 .await?
                 .is_empty()
@@ -216,7 +216,8 @@ async fn check_map<S: WritableStateSession>(
     }
     assert_eq!(
         handle
-            .entries(KeyQuery::new(Direction::Forward))
+            .entries(query_buffer())
+            .stream()
             .try_collect::<Vec<_>>()
             .await?,
         entries
@@ -249,7 +250,8 @@ async fn check_set<S: WritableStateSession>(
     }
     assert_eq!(
         handle
-            .keys(KeyQuery::new(Direction::Forward))
+            .keys(query_buffer())
+            .stream()
             .try_collect::<Vec<_>>()
             .await?,
         members
@@ -306,37 +308,31 @@ async fn check_readers(
         [members.first(), members.last()].into_iter().flatten(),
         |edge| async move {
             let (entries, members, map_excluded, set_excluded) = try_join!(
-                collect_query(
-                    map.entries(
-                        key.clone(),
-                        KeyQuery::new(Direction::Forward)
-                            .from(edge.as_str())
-                            .to(edge.as_str())
-                    )
+                collect_stream(
+                    map.entries(key.clone(), query_buffer())
+                        .from(edge.as_str())
+                        .to(edge.as_str())
+                        .stream()
                 ),
-                collect_query(
-                    set.keys(
-                        key.clone(),
-                        KeyQuery::new(Direction::Backward)
-                            .from(edge.as_str())
-                            .to(edge.as_str())
-                    )
+                collect_stream(
+                    set.keys(key.clone(), query_buffer())
+                        .reverse()
+                        .from(edge.as_str())
+                        .to(edge.as_str())
+                        .stream()
                 ),
-                collect_query(
-                    map.keys(
-                        key.clone(),
-                        KeyQuery::new(Direction::Backward)
-                            .after(edge.as_str())
-                            .before(edge.as_str())
-                    )
+                collect_stream(
+                    map.keys(key.clone(), query_buffer())
+                        .reverse()
+                        .after(edge.as_str())
+                        .before(edge.as_str())
+                        .stream()
                 ),
-                collect_query(
-                    set.keys(
-                        key.clone(),
-                        KeyQuery::new(Direction::Forward)
-                            .after(edge.as_str())
-                            .before(edge.as_str())
-                    )
+                collect_stream(
+                    set.keys(key.clone(), query_buffer())
+                        .after(edge.as_str())
+                        .before(edge.as_str())
+                        .stream()
                 ),
             )?;
             assert_eq!(entries, vec![(edge.clone(), model[edge].clone())]);

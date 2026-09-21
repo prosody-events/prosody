@@ -3,6 +3,7 @@
 use super::*;
 use crate::state::KeyQuery;
 use crate::state::descriptor::{SetHandle, set_state};
+use crate::state::query::tests::query_buffer;
 use crate::test_util::TEST_RUNTIME;
 use quickcheck::QuickCheck;
 use std::collections::BTreeSet;
@@ -148,11 +149,20 @@ async fn assert_set<S: StateSession>(
         if dir == Direction::Backward {
             expected.reverse();
         }
-        assert_eq!(drain(handle.keys(KeyQuery::new(dir))).await?, expected);
+        assert_eq!(
+            drain(handle.keys(query_buffer()).direction(dir).stream()).await?,
+            expected
+        );
         expected.retain(|key| constraints.contains(*key, dir));
         expected.truncate(constraints.limit.map_or(usize::MAX, NonZeroUsize::get));
         assert_eq!(
-            drain(handle.keys(constraints.apply(KeyQuery::new(dir)))).await?,
+            drain(
+                handle
+                    .keys(query_buffer())
+                    .with_query(constraints.apply(KeyQuery::new().direction(dir)))
+                    .stream()
+            )
+            .await?,
             expected
         );
     }

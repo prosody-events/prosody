@@ -70,7 +70,7 @@ async fn assert_map_scans<P: ParityPayload>(
         .iter()
         .filter(|(key, _)| key.starts_with(prefix))
         .collect();
-    let scanned = drain_cursor(&handle.entries(config.clone())).await?;
+    let scanned = drain_cursor(&handle.entries().with_query(config.clone()).stream()).await?;
     if scanned.len() != expected.len()
         || scanned.iter().zip(expected.iter().copied()).any(
             |((key, value), (expected_key, expected_value))| {
@@ -80,7 +80,7 @@ async fn assert_map_scans<P: ParityPayload>(
     {
         return Ok(false);
     }
-    if drain_cursor(&handle.keys(config)).await?
+    if drain_cursor(&handle.keys().with_query(config).stream()).await?
         != expected
             .iter()
             .map(|(key, _)| (*key).clone())
@@ -96,7 +96,7 @@ async fn assert_map_scans<P: ParityPayload>(
         .range(KEYS[1].to_owned()..=KEYS[2].to_owned())
         .take(1)
         .collect::<Vec<_>>();
-    let constrained = drain_cursor(&handle.entries(config.clone())).await?;
+    let constrained = drain_cursor(&handle.entries().with_query(config.clone()).stream()).await?;
     if constrained.len() != expected.len()
         || constrained
             .iter()
@@ -107,12 +107,14 @@ async fn assert_map_scans<P: ParityPayload>(
     {
         return Ok(false);
     }
-    Ok(drain_cursor(&handle.keys(config)).await?
-        == visible
-            .range(KEYS[1].to_owned()..=KEYS[2].to_owned())
-            .take(1)
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>())
+    Ok(
+        drain_cursor(&handle.keys().with_query(config).stream()).await?
+            == visible
+                .range(KEYS[1].to_owned()..=KEYS[2].to_owned())
+                .take(1)
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>(),
+    )
 }
 
 /// Drives a map trace through the erased handle and a `(floor, visible)`

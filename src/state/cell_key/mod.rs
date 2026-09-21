@@ -19,6 +19,7 @@
 //! [`order_codec`]: crate::state::order_codec
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
 use std::ops::Bound;
 
@@ -81,17 +82,6 @@ impl Coordinate {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
-
-    /// Returns the least coordinate above all coordinates with this prefix.
-    /// Returns `None` when no upper edge exists.
-    /// Drops each trailing `0xFF` byte and increments the last remaining byte.
-    /// Prefix queries use this coordinate as their excluded upper edge.
-    pub(crate) fn prefix_end(&self) -> Option<Coordinate> {
-        let last = self.0.iter().rposition(|&byte| byte != u8::MAX)?;
-        let mut bytes = self.0[..=last].to_vec();
-        bytes[last] += 1;
-        Some(Self::from_bytes(bytes))
-    }
 }
 
 /// Full intra-collection cell address. `Ord` is `(section, coordinate)`.
@@ -111,7 +101,7 @@ pub struct CellKey {
 }
 
 /// Direction a [`Scan`] walks the clustering range.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
     /// Ascending `coordinate` byte order.
     Forward,
@@ -123,7 +113,7 @@ pub enum Direction {
 /// One inclusive, exclusive, or unbounded coordinate edge.
 /// Edges follow the scan direction. An unbounded start opens the low side
 /// in forward order and the high side in backward order.
-/// Owned plans hold coordinates. Store requests borrow those coordinates.
+/// Plans can own or borrow bytes. Store requests borrow those bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanEdge<T> {
     /// The endpoint coordinate is part of the range.
@@ -147,13 +137,12 @@ pub(crate) enum EdgeKind {
     Unbounded,
 }
 
-impl ScanEdge<&Coordinate> {
+impl ScanEdge<&[u8]> {
     /// Returns the anchor. An unbounded start uses the minimum coordinate.
-    pub(crate) fn anchor(&self) -> &Coordinate {
-        static EMPTY: Coordinate = Coordinate::empty();
+    pub(crate) fn anchor(&self) -> &[u8] {
         match self {
             Self::Included(coordinate) | Self::Excluded(coordinate) => coordinate,
-            Self::Unbounded => &EMPTY,
+            Self::Unbounded => &[],
         }
     }
 }
@@ -227,13 +216,13 @@ pub struct Scan<'a> {
 
     /// The edge the scan starts walking from (low side forward, high side
     /// backward).
-    pub start: ScanEdge<&'a Coordinate>,
+    pub start: ScanEdge<&'a [u8]>,
 
     /// The direction the scan walks from `start`.
     pub dir: Direction,
 
     /// The edge the scan stops at (high side forward, low side backward).
-    pub end: ScanEdge<&'a Coordinate>,
+    pub end: ScanEdge<&'a [u8]>,
 
     /// The preferred size of the first fetch. A backend sizes its first page or
     /// batch from it and grows later fetches. It never limits results.
@@ -244,7 +233,7 @@ impl Scan<'_> {
     /// The scan's direction-relative edges resolved to absolute `(low, high)`:
     /// forward keeps `(start, end)`, backward swaps to `(end, start)`.
     #[must_use]
-    pub fn low_high(&self) -> (ScanEdge<&Coordinate>, ScanEdge<&Coordinate>) {
+    pub fn low_high(&self) -> (ScanEdge<&[u8]>, ScanEdge<&[u8]>) {
         match self.dir {
             Direction::Forward => (self.start, self.end),
             Direction::Backward => (self.end, self.start),
@@ -269,19 +258,19 @@ impl Scan<'_> {
 }
 
 /// Whether `coordinate` is at or above the low `edge`.
-fn above_low(coordinate: &Coordinate, edge: ScanEdge<&Coordinate>) -> bool {
+fn above_low(coordinate: &Coordinate, edge: ScanEdge<&[u8]>) -> bool {
     match edge {
-        ScanEdge::Included(lo) => coordinate >= lo,
-        ScanEdge::Excluded(lo) => coordinate > lo,
+        ScanEdge::Included(lo) => coordinate.as_bytes() >= lo,
+        ScanEdge::Excluded(lo) => coordinate.as_bytes() > lo,
         ScanEdge::Unbounded => true,
     }
 }
 
 /// Whether `coordinate` is at or below the high `edge`.
-fn below_high(coordinate: &Coordinate, edge: ScanEdge<&Coordinate>) -> bool {
+fn below_high(coordinate: &Coordinate, edge: ScanEdge<&[u8]>) -> bool {
     match edge {
-        ScanEdge::Included(hi) => coordinate <= hi,
-        ScanEdge::Excluded(hi) => coordinate < hi,
+        ScanEdge::Included(hi) => coordinate.as_bytes() <= hi,
+        ScanEdge::Excluded(hi) => coordinate.as_bytes() < hi,
         ScanEdge::Unbounded => true,
     }
 }

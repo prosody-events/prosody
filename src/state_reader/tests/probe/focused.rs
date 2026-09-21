@@ -1,7 +1,6 @@
 //! Focused probe tests for invariants the fault-script model does not express.
 
 use super::*;
-use crate::state::DequeQuery;
 
 /// A mid-stream error after the scan has pinned a source terminates with
 /// `Err`. There is no silent restart that would repeat or skip data. This test
@@ -30,11 +29,8 @@ async fn scan_midstream_error_propagates() -> Result<()> {
     env.publish(GROUP_A, tp_a).await;
 
     let reader = env.reader_eager()?;
-    let items: Vec<Result<Value, StateReaderError>> = reader
-        .values(key, DequeQuery::new(Direction::Forward))
-        .await?
-        .collect::<Vec<_>>()
-        .await;
+    let items: Vec<Result<Value, StateReaderError>> =
+        reader.values(key).stream().collect::<Vec<_>>().await;
     // Five yielded prefix elements, then an error terminates the stream.
     assert_eq!(items.len(), 6, "five-element prefix + terminating error");
     assert!(items[..5].iter().all(Result::is_ok), "prefix yielded");
@@ -193,8 +189,8 @@ async fn scan_reads_only_pinned_source() -> Result<()> {
     let reader = env.reader_eager()?;
 
     let scanned: Vec<Value> = reader
-        .values(key, DequeQuery::new(Direction::Forward))
-        .await?
+        .values(key)
+        .stream()
         .collect::<Vec<_>>()
         .await
         .into_iter()

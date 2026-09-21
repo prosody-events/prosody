@@ -8,6 +8,7 @@ use super::{
     WriteOf, bounds, collection_methods, evictions, instrument, write_bounds,
 };
 use crate::state::cell::Values;
+use crate::state::{DequeRead, ReadQuery, ReadSource};
 use async_stream::try_stream;
 use futures::StreamExt;
 use tracing::{Instrument, info_span};
@@ -159,7 +160,7 @@ where
         dir: Direction,
         start: &Bound<usize>,
         end: &Bound<usize>,
-    ) -> Result<Plan<S, Keyed<I64KeyCodec, T>>, DequeStateError<CellCodecError<T>>> {
+    ) -> Result<Plan<S, Keyed<I64KeyCodec, T>, [u8; 8]>, DequeStateError<CellCodecError<T>>> {
         let window = bounds(op).await?;
         let window_len = window.len()?;
         let start = match start {
@@ -199,7 +200,7 @@ where
         Ok(op.coordinates(DequeKind::<T>::ENTRIES, coordinates))
     }
 
-    /// Streams live values from front to back for [`Direction::Forward`].
+    /// Builds a query over live values in front-to-back order.
     ///
     /// The initial bounds read fixes positions, not values. Each fetch reads
     /// current values and skips absent positions. If a pop and push reuse a
@@ -215,29 +216,35 @@ where
     /// the attempt fence, including errors and exhaustion.
     pub fn values(
         &self,
-        query: DequeQuery,
-    ) -> impl Stream<Item = Result<ResolvedOf<T>, DequeStateError<CellCodecError<T>>>> + '_
+    ) -> DequeRead<
+        impl ReadSource<
+            Query = DequeQuery,
+            Output: Stream<Item = Result<ResolvedOf<T>, DequeStateError<CellCodecError<T>>>> + Send,
+        > + '_,
+    >
     where
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
-        let (start, end) = query.bounds();
-        let span = info_span!(
-            "deque.stream",
-            collection = self.cells.name().as_str(),
-            direction = ?query.dir,
-        );
-        try_stream! {
-            let plan = self
-                .stream_plan(query.dir, &start, &end)
-                .instrument(span.clone())
-                .await?;
-            let inner = plan.with_limit(query.limit).projected::<Values>();
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().instrument(span.clone()).await {
-                let (_, value) = item?;
-                yield value;
+        ReadQuery::new(DequeQuery::new(), move |query: DequeQuery| {
+            let (start, end) = query.bounds();
+            let span = info_span!(
+                "deque.stream",
+                collection = self.cells.name().as_str(),
+                direction = ?query.dir,
+            );
+            try_stream! {
+                let plan = self
+                    .stream_plan(query.dir, &start, &end)
+                    .instrument(span.clone())
+                    .await?;
+                let inner = plan.with_limit(query.limit).projected::<Values>();
+                futures::pin_mut!(inner);
+                while let Some(item) = inner.next().instrument(span.clone()).await {
+                    let (_, value) = item?;
+                    yield value;
+                }
             }
-        }
+        })
     }
 
     /// Appends `value` at the back, extending the window to `tail + 1`.

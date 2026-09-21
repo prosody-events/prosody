@@ -234,9 +234,9 @@ where
     let end_c = end.map(|b| Coordinate::from_bytes(vec![b]));
     let scan = Scan {
         section: SECTION,
-        start: ScanEdge::Included(&start_c),
+        start: ScanEdge::Included(start_c.as_bytes()),
         dir: Direction::Forward,
-        end: end_c.as_ref(),
+        end: end_c.as_ref().map(Coordinate::as_bytes),
         fetch_hint: None,
     };
     let stream = CellRead::<Values>::scan(store, id, scan);

@@ -53,22 +53,3 @@ fn coordinate_empty_is_least() {
     assert!(Coordinate::empty().as_bytes().is_empty());
     QuickCheck::new().quickcheck(prop as fn(Vec<u8>) -> bool);
 }
-
-/// A prefix range contains exactly the coordinates that start with its bytes.
-#[test]
-fn coordinate_prefix_range_matches_bytes() {
-    fn prop(mut c: Vec<u8>, mut p: Vec<u8>, shared: bool) -> bool {
-        for byte in c.iter_mut().chain(&mut p) {
-            *byte = [0, 1, 254, 255][usize::from(*byte % 4)];
-        }
-        if shared {
-            c.splice(..0, p.iter().copied());
-        }
-        let starts_with = c.starts_with(&p);
-        let coordinate = Coordinate::from_bytes(c);
-        let prefix = Coordinate::from_bytes(p);
-        starts_with
-            == (prefix <= coordinate && prefix.prefix_end().is_none_or(|end| coordinate < end))
-    }
-    QuickCheck::new().quickcheck(prop as fn(Vec<u8>, Vec<u8>, bool) -> bool);
-}

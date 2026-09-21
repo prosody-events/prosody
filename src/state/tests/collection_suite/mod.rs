@@ -36,7 +36,6 @@ use crate::codec::{Codec, JsonCodec};
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
-use crate::state::DequeQuery;
 use crate::state::KeyQuery;
 use crate::state::cell::Values;
 use crate::state::collection::StateSession;
@@ -47,6 +46,7 @@ use crate::state::descriptor::{
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
+use crate::state::query::tests::query_buffer;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::Promoted;
 use crate::state::session::sealed::StateLifecycle;
@@ -358,13 +358,13 @@ where
     Ok(out)
 }
 
-/// Collects a deque handle's `stream(dir)` into a vector.
+/// Collects deque values in the selected direction.
 async fn collect_deque<S, C>(handle: &DequeHandle<S, C>, dir: Direction) -> Result<Vec<Value>>
 where
     S: StateSession,
     C: Codec<Payload = Value>,
 {
-    drain(handle.values(DequeQuery::new(dir))).await
+    drain(handle.values().direction(dir).stream()).await
 }
 
 /// Asserts a map handle equals the model: `get` (with `contains_key` parity)
@@ -395,8 +395,7 @@ where
     if collect_map(handle, Direction::Backward).await? != descending {
         return Ok(false);
     }
-    // `keys()` yields the same live key set as `stream()`, value-free and in
-    // the same order, from the source that the membership plan selected.
+    // Key and entry streams return the same live keys in the same order.
     let ascending_keys: Vec<i64> = model.keys().copied().collect();
     if collect_map_keys(handle, Direction::Forward).await? != ascending_keys {
         return Ok(false);
@@ -414,9 +413,16 @@ where
             .filter(|(key, _)| constraints.contains(*key, dir))
             .take(constraints.limit.map_or(usize::MAX, NonZeroUsize::get))
             .collect();
-        if drain(handle.entries(constraints.apply(KeyQuery::new(dir)))).await? != expected
-            || drain(handle.keys(constraints.apply(KeyQuery::new(dir)))).await?
-                != expected.iter().map(|(key, _)| *key).collect::<Vec<_>>()
+        let entries = handle
+            .entries(query_buffer())
+            .with_query(constraints.apply(KeyQuery::new().direction(dir)))
+            .stream();
+        let keys = handle
+            .keys(query_buffer())
+            .with_query(constraints.apply(KeyQuery::new().direction(dir)))
+            .stream();
+        if drain(entries).await? != expected
+            || drain(keys).await? != expected.iter().map(|(key, _)| *key).collect::<Vec<_>>()
         {
             return Ok(false);
         }
@@ -424,7 +430,7 @@ where
     Ok(handle.is_empty().await? == model.is_empty())
 }
 
-/// Collects a map handle's `stream(dir)` into a `(key, value)` vector.
+/// Collects map entries in the selected direction.
 async fn collect_map<S>(
     handle: &MapHandle<S, I64KeyCodec, JsonCodec>,
     dir: Direction,
@@ -432,10 +438,10 @@ async fn collect_map<S>(
 where
     S: StateSession,
 {
-    drain(handle.entries(KeyQuery::new(dir))).await
+    drain(handle.entries(query_buffer()).direction(dir).stream()).await
 }
 
-/// Collects a map handle's `keys(dir)` into a key vector.
+/// Collects map keys in the selected direction.
 async fn collect_map_keys<S>(
     handle: &MapHandle<S, I64KeyCodec, JsonCodec>,
     dir: Direction,
@@ -443,7 +449,7 @@ async fn collect_map_keys<S>(
 where
     S: StateSession,
 {
-    drain(handle.keys(KeyQuery::new(dir))).await
+    drain(handle.keys(query_buffer()).direction(dir).stream()).await
 }
 
 /// `Continue` when a mid-trace return matched the model, `Mismatch` otherwise.

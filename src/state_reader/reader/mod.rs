@@ -25,20 +25,23 @@ mod map;
 mod query;
 mod set;
 
+pub use map::MapReadItem;
+
 use crate::Key;
 use crate::codec::Codec;
-use crate::state::DequeQuery;
 use crate::state::StateName;
 use crate::state::descriptor::{
     CellType, ContextOf, DequeDescriptor, FromSession, ResolvedOf, StateDescriptor, ValueDescriptor,
 };
 use crate::state::order_codec::UnitKey;
+use crate::state::{DequeQuery, DequeRead, ReadQuery, ReadSource};
 use crate::state_reader::deps::StateReaderDependencies;
 use crate::state_reader::error::StateReaderError;
 use crate::state_reader::session::{ReadSession, ReaderCollectionDef, ReaderContext};
 use crate::state_reader::{MemoryReaderBackend, ReaderBackend};
 use crate::subsystem::SubsystemName;
 use acquisition::{DEFAULT_REFRESH_INTERVAL, PublicationSnapshot};
+use educe::Educe;
 use futures::{Stream, StreamExt};
 use quanta::Clock;
 use std::sync::Arc;
@@ -58,6 +61,8 @@ use tokio::task::coop::cooperative;
 /// codec `C`. The read methods live in descriptor-specialized impl blocks for
 /// Value, Map, Set, and Deque. Each is a thin bind-and-delegate over the shared
 /// read machinery.
+#[derive(Educe)]
+#[educe(Clone(bound = "D: Clone"))]
 pub struct StateReader<D, C: Codec, B = MemoryReaderBackend<C>> {
     descriptor: D,
     subsystem: SubsystemName,
@@ -284,35 +289,35 @@ where
             .map_err(|e| StateReaderError::store(&e))
     }
 
-    /// Streams the committed live elements under partition `key` in index order
-    /// (front to back for [`crate::state::Direction::Forward`]).
-    ///
-    /// The stream owns its session and can outlive the reader's borrow.
-    ///
-    /// # Errors
-    ///
-    /// Any [`StateReaderError`] from acquiring the session: an empty key, or
-    /// an acquisition or identity failure. Per-source read failures surface
-    /// as stream items.
-    pub async fn values<K: Into<Key>>(
+    /// Builds a query over committed elements, in front-to-back order.
+    /// The stream owns the reader state. Its first poll acquires a session.
+    /// Acquisition and read errors appear as stream items.
+    pub fn values<K: Into<Key>>(
         &self,
         key: K,
-        query: DequeQuery,
-    ) -> Result<
-        impl Stream<Item = Result<ResolvedOf<T>, StateReaderError>> + 'static,
-        StateReaderError,
+    ) -> DequeRead<
+        impl ReadSource<
+            Query = DequeQuery,
+            Output: Stream<Item = Result<ResolvedOf<T>, StateReaderError>> + Send + 'static,
+        >
+        + 'static
+        + use<K, T, C, B>,
     >
     where
         for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
         T: 'static,
         ResolvedOf<T>: 'static,
     {
-        let handle = self.bound(key.into()).await?;
-        Ok(async_stream::try_stream! {
-            let inner = handle.values(query);
-            futures::pin_mut!(inner);
-            while let Some(item) = cooperative(inner.next()).await {
-                yield item.map_err(|error| StateReaderError::store(&error))?;
+        let reader = self.clone();
+        let key = key.into();
+        ReadQuery::new(DequeQuery::new(), move |query| {
+            async_stream::try_stream! {
+                let handle = reader.bound(key).await?;
+                let inner = handle.values().with_query(query).stream();
+                futures::pin_mut!(inner);
+                while let Some(item) = cooperative(inner.next()).await {
+                    yield item.map_err(|error| StateReaderError::store(&error))?;
+                }
             }
         })
     }

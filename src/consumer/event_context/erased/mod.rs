@@ -162,12 +162,12 @@ pub trait DynMapState<Item: Send + 'static>: Send + Sync {
     async fn clear(&self) -> Result<(), ErasedStateError>;
 
     /// A demand-driven cursor over the live entries in key order.
-    fn entries(&self, query: ErasedKeyQuery) -> BoxStateCursor<(String, Item)>;
+    fn read_entries(&self, query: ErasedKeyQuery) -> BoxStateCursor<(String, Item)>;
 
     /// A demand-driven cursor over the live entry **keys** in key order,
     /// without decoding or resolving any value (zero Kafka fetches for a
     /// message-backed map). A key is present even when its value is not.
-    fn keys(&self, query: ErasedKeyQuery) -> BoxStateCursor<String>;
+    fn read_keys(&self, query: ErasedKeyQuery) -> BoxStateCursor<String>;
 
     /// Durably commits buffered ops mid-handler (at-least-once).
     async fn commit(&self) -> Result<(), ErasedStateError>;
@@ -198,7 +198,7 @@ pub trait DynSetState: Send + Sync {
     async fn clear(&self) -> Result<(), ErasedStateError>;
 
     /// Returns a demand-driven cursor over live keys.
-    fn keys(&self, query: ErasedKeyQuery) -> BoxStateCursor<String>;
+    fn read_keys(&self, query: ErasedKeyQuery) -> BoxStateCursor<String>;
 
     /// Commits buffered set operations.
     async fn commit(&self) -> Result<(), ErasedStateError>;
@@ -243,7 +243,7 @@ pub trait DynDequeState<Item: Send + 'static>: Send + Sync {
     async fn clear(&self) -> Result<(), ErasedStateError>;
 
     /// A demand-driven cursor over the live elements in index order.
-    fn values(&self, query: DequeQuery) -> BoxStateCursor<Item>;
+    fn read_values(&self, query: DequeQuery) -> BoxStateCursor<Item>;
 
     /// Durably commits buffered ops mid-handler (at-least-once).
     async fn commit(&self) -> Result<(), ErasedStateError>;
@@ -287,3 +287,5 @@ pub(super) use value::ErasedValue;
 
 mod context;
 pub use context::{BoxEventContext, BoxEventContextError, DynEventContext};
+
+pub(crate) mod query;

@@ -28,12 +28,11 @@ use crate::Key;
 use crate::codec::JsonCodec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::ReadCachePolicy;
-use crate::state::cell_key::Direction;
 use crate::state::descriptor::{
     DequeDescriptor, SetDescriptor, StateDescriptor, deque_state, map_state, set_state, value_state,
 };
 use crate::state::order_codec::{I64KeyCodec, Utf8KeyCodec};
-use crate::state::{DequeQuery, KeyQuery};
+use crate::state::query::tests::query_buffer;
 use crate::state_reader::backend::ScriptedReaderBackend;
 use crate::state_reader::{StateReader, StateReaderError};
 use color_eyre::eyre::{Result, bail, eyre};
@@ -228,16 +227,9 @@ async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> 
     match selection {
         Selection::Pinned { idx, len } => {
             let expected: Vec<Value> = (0..len).map(|j| element(idx, j)).collect();
-            let forward = Box::pin(collect_stream(
-                reader
-                    .values(key.clone(), DequeQuery::new(Direction::Forward))
-                    .await?,
-            ))
-            .await?;
+            let forward = Box::pin(collect_stream(reader.values(key.clone()).stream())).await?;
             let backward = Box::pin(collect_stream(
-                reader
-                    .values(key.clone(), DequeQuery::new(Direction::Backward))
-                    .await?,
+                reader.values(key.clone()).reverse().stream(),
             ))
             .await?;
             Ok(reader.len(key.clone()).await? == len
@@ -250,8 +242,8 @@ async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> 
             // No data through a failed source: absence is not provable, so
             // every read errors.
             let streamed: Vec<Result<Value, StateReaderError>> = reader
-                .values(key.clone(), DequeQuery::new(Direction::Forward))
-                .await?
+                .values(key.clone())
+                .stream()
                 .collect::<Vec<_>>()
                 .await;
             Ok(reader.len(key.clone()).await.is_err()
@@ -260,13 +252,9 @@ async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> 
         }
         Selection::EmptyOnly => Ok(reader.len(key.clone()).await? == 0
             && reader.get(key.clone(), 0).await?.is_none()
-            && Box::pin(collect_stream(
-                reader
-                    .values(key.clone(), DequeQuery::new(Direction::Forward))
-                    .await?,
-            ))
-            .await?
-            .is_empty()),
+            && Box::pin(collect_stream(reader.values(key.clone()).stream()))
+                .await?
+                .is_empty()),
     }
 }
 
@@ -325,13 +313,13 @@ type SetReader = StateReader<SetDescriptor<Utf8KeyCodec>, JsonCodec, ScriptedRea
 /// Asserts the set reader's `is_empty`, `contains`, and `keys` match the
 /// selection the script resolves to.
 async fn assert_set_probe(reader: &SetReader, key: &Key, selection: Selection) -> Result<bool> {
-    let keys = reader.keys(key.clone(), KeyQuery::new(Direction::Forward));
+    let keys = reader.keys(key.clone(), query_buffer()).stream();
     match selection {
         Selection::Pinned { idx, len } => {
             let expected: Vec<String> = (0..len).map(|j| member(idx, j)).collect();
             Ok(!reader.is_empty(key.clone()).await?
                 && reader.contains(key.clone(), &member(idx, 0)).await?
-                && Box::pin(collect_stream(keys.await?)).await? == expected)
+                && Box::pin(collect_stream(keys)).await? == expected)
         }
         Selection::ErrOnly => {
             // No data through a failed source: absence is not provable, so the
@@ -349,7 +337,7 @@ async fn assert_set_probe(reader: &SetReader, key: &Key, selection: Selection) -
         }
         Selection::EmptyOnly => Ok(reader.is_empty(key.clone()).await?
             && !reader.contains(key.clone(), &member(0, 0)).await?
-            && Box::pin(collect_stream(keys.await?)).await?.is_empty()),
+            && Box::pin(collect_stream(keys)).await?.is_empty()),
     }
 }
 

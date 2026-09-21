@@ -1440,8 +1440,8 @@ fn scan_of<'a>(req: ScanReq, start: &'a Coordinate, end: &'a Coordinate) -> Scan
         EdgeKind::Excluded => ScanEdge::Excluded(coordinate),
         EdgeKind::Unbounded => ScanEdge::Unbounded,
     };
-    let start = edge(req.start_kind, start);
-    let end = edge(req.end_kind, end);
+    let start = edge(req.start_kind, start.as_bytes());
+    let end = edge(req.end_kind, end.as_bytes());
     Scan {
         section: SECTIONS[req.sect as usize % SECTIONS.len()],
         start,

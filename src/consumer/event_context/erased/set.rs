@@ -1,5 +1,6 @@
 //! The erased set adapter.
 
+use super::query::encoding_buffer;
 use super::{BoxStateCursor, DynSetState, ErasedKeyQuery, ErasedStateError, cursor};
 use crate::state::collection::WritableStateSession;
 use crate::state::descriptor::SetHandle;
@@ -65,10 +66,10 @@ where
             .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
-    fn keys(&self, query: ErasedKeyQuery) -> BoxStateCursor<String> {
+    fn read_keys(&self, query: ErasedKeyQuery) -> BoxStateCursor<String> {
         let handle = self.handle.clone();
         Box::new(cursor(try_stream! {
-            for await item in handle.keys(query) {
+            for await item in handle.keys(encoding_buffer(&query)).with_query(query.borrowed()).stream() {
                 yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
             }
         }))

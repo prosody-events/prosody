@@ -50,7 +50,7 @@ fn run_set_parity(ops: &[SetOp], prefix: u8) -> Result<bool> {
                     .contains_many(query.map(str::to_owned).to_vec())
                     .await?
                     != query.map(|member| visible.contains(member))
-                || drain_cursor(&handle.keys(listing.clone())).await?
+                || drain_cursor(&handle.keys().with_query(listing.clone()).stream()).await?
                     != visible
                         .iter()
                         .filter(|key| key.starts_with(prefix))
