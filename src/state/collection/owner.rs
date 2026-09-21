@@ -121,7 +121,8 @@ where
         state_type: StateType,
         name: &'a StateName,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + use<'a, B, L, P>
+    {
         // Unwitnessed by design: a range pages gate-free, taking the gate only
         // for the planning command that preceded it.
         session.scan::<P>(state_type, name, scan)

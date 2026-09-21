@@ -97,7 +97,7 @@ impl CassandraCellResources {
         &'a self,
         id: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), CassandraCellStoreError>> + Send + 'a
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), CassandraCellStoreError>> + Send + use<'a, P>
     {
         try_stream! {
             let pages = page::<P>(&self.session, &self.queries, id, scan);
@@ -139,7 +139,7 @@ impl<P: CassandraProjection> CommittedCellSource<P> for CassandraCellResources {
         &'a self,
         id: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + use<'a, P> {
         self.scan_committed::<P>(id, scan)
     }
 }

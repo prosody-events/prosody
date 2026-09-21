@@ -280,13 +280,13 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     fn get_slab_range(
         &self,
         range: RangeInclusive<SlabId>,
-    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send + use<'_, Self>;
 
     /// Streams all triggers in a slab across all timer types.
     fn get_slab_triggers_all_types(
         &self,
         slab_id: SlabId,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'_, Self>;
 
     // ===================================================================
     // Slab Metadata Writes (2 methods) - Used by SchedulerActor
@@ -337,20 +337,20 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ///
     /// Returns only timestamps without full trigger metadata.
     /// More efficient than `get_key_triggers` when trace context not needed.
-    fn get_key_times(
-        &self,
+    fn get_key_times<'s, 'k>(
+        &'s self,
         timer_type: TimerType,
-        key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send;
+        key: &'k Key,
+    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + use<'s, 'k, Self>;
 
     /// Streams full trigger objects for a key and timer type.
     ///
     /// Includes all metadata (key, time, `timer_type`, trace context).
-    fn get_key_triggers(
-        &self,
+    fn get_key_triggers<'s, 'k>(
+        &'s self,
         timer_type: TimerType,
-        key: &Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
+        key: &'k Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k, Self>;
 
     // ===================================================================
     // Coordinated Write Operations (3 methods) - Used by TimerManager

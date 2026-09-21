@@ -24,7 +24,7 @@ where
         self,
         key: Key,
         query: KeyQuery<<L::Cell as CellType>::Key, &BorrowedKeyOf<L::Cell>>,
-    ) -> impl Stream<Item = Result<P::Item, StateReaderError>> + Send + '_
+    ) -> impl Stream<Item = Result<P::Item, StateReaderError>> + Send + use<'_, L, C, B, P>
     where
         L: KeysetLayout + 'static,
         P: StreamProjection<ReadSession<C, B>, L::Cell>,

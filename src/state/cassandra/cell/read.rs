@@ -134,7 +134,7 @@ pub(super) fn page<'a, P: CassandraProjection>(
     queries: &'a CellQueries,
     collection: &'a CollectionId,
     scan: Scan<'a>,
-) -> impl Stream<Item = Result<(CellKey, Cell<P>), CassandraCellStoreError>> + Send + 'a {
+) -> impl Stream<Item = Result<(CellKey, Cell<P>), CassandraCellStoreError>> + Send + use<'a, P> {
     let section = i8::from(scan.section);
     let dir = scan.dir;
     let start = scan.start;
@@ -189,13 +189,13 @@ pub(super) fn page<'a, P: CassandraProjection>(
 
 /// Fetches pages one at a time. The first page holds `first` rows and each
 /// later page doubles, up to `page_size`.
-fn scheduled_rows<P: CassandraProjection, V: SerializeRow + Send + Sync>(
-    session: &CassandraSession,
-    prepared: &PreparedStatement,
+fn scheduled_rows<'s, 'p, P: CassandraProjection, V: SerializeRow + Send + Sync>(
+    session: &'s CassandraSession,
+    prepared: &'p PreparedStatement,
     values: V,
     first: NonZeroUsize,
     page_size: NonZeroUsize,
-) -> impl Stream<Item = Result<ScanRow<P>, CassandraCellStoreError>> + Send {
+) -> impl Stream<Item = Result<ScanRow<P>, CassandraCellStoreError>> + Send + use<'s, 'p, P, V> {
     try_stream! {
         let mut statement = prepared.clone();
         let mut fetch = FetchSchedule::new(Some(first), page_size);

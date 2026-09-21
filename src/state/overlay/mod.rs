@@ -173,7 +173,7 @@ impl<L> Overlay<L> {
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), L::Error>> + Send + 'a
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), L::Error>> + Send + use<'a, L, P>
     where
         L: CellRead<P>,
     {

@@ -304,7 +304,7 @@ where
         impl ReadSource<
             Query = BorrowedKeyQuery<'a, KC>,
             Output: Stream<Item = MapStreamItem<KC, V>> + Send,
-        > + 'a,
+        > + use<'a, S, KC, V>,
     >
     where
         for<'s> ContextOf<'s, V>: FromSession<'s, S>,
@@ -326,7 +326,7 @@ where
         impl ReadSource<
             Query = BorrowedKeyQuery<'a, KC>,
             Output: Stream<Item = KeyItem<MapKind<KC, V>>> + Send,
-        > + 'a,
+        > + use<'a, S, KC, V>,
     > {
         ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
             projected::<_, _, Presence>(&self.cells, query)

@@ -156,7 +156,8 @@ where
         _state_type: StateType,
         _name: &'a StateName,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + use<'a, C, B, P>
+    {
         session.scan_from::<P>(plan.as_ref(), scan)
     }
 }

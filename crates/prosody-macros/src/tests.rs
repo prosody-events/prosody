@@ -187,7 +187,7 @@ impl Handle {
 const NON_ASYNC_READ: &str = "\
 impl Handle {
     #[read(op)]
-    fn items(&self) -> impl Stream<Item = u32> + '_ {
+    fn items(&self) -> impl Stream<Item = u32> + use<'_> {
         op.coordinates(0)
     }
 }

@@ -177,7 +177,9 @@ impl<S: StateSession, T: CellType, B: AsRef<[u8]> + Send> Plan<S, T, B> {
 
     /// Selects one concrete driver, then applies the shared limit and attempt
     /// fence.
-    pub(crate) fn projected<P>(self) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
+    pub(crate) fn projected<P>(
+        self,
+    ) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send + use<S, T, B, P>
     where
         P: StreamProjection<S, T>,
         S::Engine: sealed::Reads<S, P>,
@@ -214,7 +216,7 @@ fn coordinate_source<S, T, P>(
     base: PlanBase<S>,
     coordinates: Vec<Coordinate>,
     limit: Option<NonZeroUsize>,
-) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
+) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send + use<S, T, P>
 where
     S: StateSession,
     T: CellType,
@@ -276,7 +278,7 @@ fn range_source<S, T, P, B>(
     dir: Direction,
     end: ScanEdge<B>,
     limit: Option<NonZeroUsize>,
-) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
+) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send + use<S, T, P, B>
 where
     S: StateSession,
     B: AsRef<[u8]> + Send,

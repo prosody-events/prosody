@@ -129,7 +129,7 @@ pub trait Reads<S: ?Sized, P: Projection>: ReadEngine<S> {
         state_type: StateType,
         name: &'a StateName,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a;
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + use<'a, Self, S, P>;
 }
 
 /// The write half of one engine: admission, the final fence, journal

@@ -949,7 +949,7 @@ where
         state_type: StateType,
         name: &'a StateName,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + use<'a, B, L, P>
     where
         B::Cell: CellRead<P>,
     {

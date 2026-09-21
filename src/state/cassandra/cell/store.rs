@@ -189,7 +189,7 @@ impl<P: CassandraProjection> CellRead<P> for CassandraStore {
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), CellStoreError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), CellStoreError>> + Send + use<'a, P> {
         try_stream! {
             let pages = page::<P>(&self.session, &self.queries, collection, scan);
             pin_mut!(pages);

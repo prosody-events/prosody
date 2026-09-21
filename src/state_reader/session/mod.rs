@@ -384,7 +384,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         &'a self,
         id: CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + use<'a, C, B, P>
     where
         B::Cells: CommittedCellSource<P>,
     {
@@ -406,7 +406,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         &'a self,
         selected: Option<&'a PinnedSource>,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + use<'a, C, B, P>
     where
         B::Cells: CommittedCellSource<P>,
     {

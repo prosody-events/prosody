@@ -195,7 +195,7 @@ impl<S: CellRead<P>, P: CountProjection> CellRead<P> for CountingCellStore<S> {
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + use<'a, S, P> {
         {
             P::scan(&self.counts).fetch_add(1, Ordering::Relaxed);
             self.counts.scan_hint.store(

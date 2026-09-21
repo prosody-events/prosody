@@ -203,7 +203,7 @@ impl ScriptedCellSource {
         &'a self,
         id: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + use<'a> {
         self.scan_hint.store(
             scan.fetch_hint.map_or(0, NonZeroUsize::get),
             Ordering::Relaxed,

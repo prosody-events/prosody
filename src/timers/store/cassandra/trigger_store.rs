@@ -114,7 +114,7 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn get_slabs(&self) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send {
+    fn get_slabs(&self) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send + use<'_> {
         let segment_id = self.segment.id;
         try_stream! {
             let stream = self
@@ -143,7 +143,7 @@ impl TriggerOperations for CassandraTriggerStore {
     fn get_slab_range(
         &self,
         range: RangeInclusive<SlabId>,
-    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send {
+    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send + use<'_> {
         let segment_id = self.segment.id;
         try_stream! {
             // An invalid range (start > end in u32 terms) yields nothing.
@@ -273,11 +273,11 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn get_slab_triggers(
-        &self,
-        slab: &Slab,
+    fn get_slab_triggers<'s, 'k>(
+        &'s self,
+        slab: &'k Slab,
         timer_type: TimerType,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k> {
         let segment_id = self.segment.id;
         let slab_size = slab.size().seconds() as i32;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
@@ -308,7 +308,7 @@ impl TriggerOperations for CassandraTriggerStore {
     fn get_slab_triggers_all_types(
         &self,
         slab: Slab,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'_> {
         let segment_id = self.segment.id;
         let slab_size = slab.size().seconds() as i32;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
@@ -405,11 +405,11 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty))]
-    fn get_key_times(
-        &self,
+    fn get_key_times<'s, 'k>(
+        &'s self,
         timer_type: TimerType,
-        key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send {
+        key: &'k Key,
+    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + use<'s, 'k> {
         let key_clone = key.clone();
         let segment_id = self.segment.id;
 
@@ -456,11 +456,11 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty))]
-    fn get_key_triggers(
-        &self,
+    fn get_key_triggers<'s, 'k>(
+        &'s self,
         timer_type: TimerType,
-        key: &Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
+        key: &'k Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k> {
         let key_clone = key.clone();
         let segment_id = self.segment.id;
 
@@ -510,10 +510,10 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty))]
-    fn get_key_triggers_all_types(
-        &self,
-        key: &Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
+    fn get_key_triggers_all_types<'s, 'k>(
+        &'s self,
+        key: &'k Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k> {
         let key_clone = key.clone();
         let segment_id = self.segment.id;
 

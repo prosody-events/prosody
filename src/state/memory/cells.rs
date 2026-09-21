@@ -114,7 +114,7 @@ impl MemoryCells {
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Infallible>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), Infallible>> + Send + use<'a> {
         try_stream! {
             let evidence = self.reader_evidence(collection);
             let mut raw: Vec<(CellKey, Cell)> = Vec::new();

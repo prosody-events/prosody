@@ -192,7 +192,8 @@ where
         _state_type: StateType,
         _name: &'a StateName,
         _scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Q::Payload), StateAccessError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, Q::Payload), StateAccessError>> + Send + use<'a, P, Q>
+    {
         stream::once(async { Err(StateAccessError::Unavailable) })
     }
 }

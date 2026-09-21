@@ -2018,7 +2018,7 @@ impl<S: CellRead<P>, P: Projection> CellRead<P> for FailingCellStore<S> {
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + use<'a, S, P> {
         CellRead::<P>::scan(&self.inner, collection, scan)
             .map(|item| item.map_err(FailCellError::Inner))
     }

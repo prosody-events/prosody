@@ -27,7 +27,7 @@ pub type MapStreamItem<KC, V> =
 pub(crate) fn projected<'a, S, L, P>(
     cells: &'a Collection<S, L>,
     query: KeyQuery<<L::Cell as CellType>::Key, &'a BorrowedKeyOf<L::Cell>>,
-) -> impl Stream<Item = Result<P::Item, MapStateError<CellCodecError<L::Cell>>>> + 'a
+) -> impl Stream<Item = Result<P::Item, MapStateError<CellCodecError<L::Cell>>>> + use<'a, S, L, P>
 where
     S: StateSession,
     L: KeysetLayout,

@@ -64,14 +64,14 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     // =========================================================================
 
     /// Lists all slab IDs in this store's segment.
-    fn get_slabs(&self) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send;
+    fn get_slabs(&self) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send + use<'_, Self>;
 
     /// Lists slab IDs in a specified inclusive range within this store's
     /// segment.
     fn get_slab_range(
         &self,
         range: RangeInclusive<SlabId>,
-    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send + use<'_, Self>;
 
     /// Registers (inserts) a slab ID under this store's segment.
     fn insert_slab(&self, slab: Slab) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -116,17 +116,17 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     // =========================================================================
 
     /// Streams all triggers of a specific type within a slab's time range.
-    fn get_slab_triggers(
-        &self,
-        slab: &Slab,
+    fn get_slab_triggers<'s, 'k>(
+        &'s self,
+        slab: &'k Slab,
         timer_type: TimerType,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k, Self>;
 
     /// Streams ALL triggers within a slab across all timer types.
     fn get_slab_triggers_all_types(
         &self,
         slab: Slab,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'_, Self>;
 
     /// Inserts a trigger into the slab index.
     fn insert_slab_trigger(
@@ -155,24 +155,24 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     // =========================================================================
 
     /// Streams all scheduled times for a given key and timer type.
-    fn get_key_times(
-        &self,
+    fn get_key_times<'s, 'k>(
+        &'s self,
         timer_type: TimerType,
-        key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send;
+        key: &'k Key,
+    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + use<'s, 'k, Self>;
 
     /// Streams all triggers for a given key and timer type.
-    fn get_key_triggers(
-        &self,
+    fn get_key_triggers<'s, 'k>(
+        &'s self,
         timer_type: TimerType,
-        key: &Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
+        key: &'k Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k, Self>;
 
     /// Streams ALL triggers for a given key across all timer types.
-    fn get_key_triggers_all_types(
-        &self,
-        key: &Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
+    fn get_key_triggers_all_types<'s, 'k>(
+        &'s self,
+        key: &'k Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k, Self>;
 
     /// Upserts a trigger into the key-based index.
     ///

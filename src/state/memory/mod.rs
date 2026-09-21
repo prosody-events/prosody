@@ -154,7 +154,7 @@ impl<P: Projection> CellRead<P> for MemoryCellStore {
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + use<'a, P> {
         try_stream! {
             // Snapshot the matching raw cells synchronously (scc holds no
             // borrowing iterator across an await), then resolve each lazily.

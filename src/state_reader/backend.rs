@@ -72,7 +72,7 @@ pub trait CommittedCellSource<P: Projection>: CellSource {
         &'a self,
         id: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a;
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + use<'a, Self, P>;
 }
 
 impl CellSource for MemoryCells {
@@ -101,7 +101,7 @@ impl<P: Projection> CommittedCellSource<P> for MemoryCells {
         &'a self,
         id: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + use<'a, P> {
         self.scan_committed(id, scan)
             .map_ok(|(key, value)| (key, P::from_value(value)))
     }
@@ -138,7 +138,7 @@ impl<P: Projection> CommittedCellSource<P> for ScriptedCellSource {
         &'a self,
         id: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + use<'a, P> {
         self.scan_committed(id, scan)
             .map_ok(|(key, value)| (key, P::from_value(value)))
     }

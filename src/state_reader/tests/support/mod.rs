@@ -86,7 +86,10 @@ pub(super) async fn collect_stream<T>(
 /// [`SHARD_FANOUT_CONCURRENCY`] bounds the overlapping round trips, as the
 /// production stores do. Use this for reader operations only. Owner handle
 /// operations serialize under the session gate, so they gain nothing here.
-fn fan_out<I, F, Fut, T>(items: I, mut check: F) -> impl Stream<Item = Result<T>>
+fn fan_out<I, F, Fut, T>(
+    items: I,
+    mut check: F,
+) -> impl Stream<Item = Result<T>> + use<I, F, Fut, T>
 where
     I: IntoIterator,
     F: FnMut(I::Item) -> Fut,

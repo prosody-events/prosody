@@ -124,7 +124,8 @@ where
         heartbeats: HeartbeatRegistry,
         shutdown_rx: watch::Receiver<ShutdownPhase>,
         semaphores: Arc<TimerSemaphores>,
-    ) -> Result<(impl Stream<Item = PendingTimer<T>>, Self), TimerManagerError<T::Error>> {
+    ) -> Result<(impl Stream<Item = PendingTimer<T>> + use<T>, Self), TimerManagerError<T::Error>>
+    {
         // Ensure the segment exists in persistent storage.
         let segment = get_or_create_segment(&config.store).await?;
 

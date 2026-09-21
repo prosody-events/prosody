@@ -109,14 +109,14 @@ where
     fn get_slab_range(
         &self,
         range: RangeInclusive<SlabId>,
-    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send {
+    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send + use<'_, T> {
         self.operations.get_slab_range(range)
     }
 
     fn get_slab_triggers_all_types(
         &self,
         slab_id: SlabId,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'_, T> {
         let slab = Slab::new(slab_id, self.slab_size());
         self.operations.get_slab_triggers_all_types(slab)
     }
@@ -151,19 +151,19 @@ where
             .batch_insert_slab_with_watermark(slab, watermark)
     }
 
-    fn get_key_times(
-        &self,
+    fn get_key_times<'s, 'k>(
+        &'s self,
         timer_type: TimerType,
-        key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send {
+        key: &'k Key,
+    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + use<'s, 'k, T> {
         self.operations.get_key_times(timer_type, key)
     }
 
-    fn get_key_triggers(
-        &self,
+    fn get_key_triggers<'s, 'k>(
+        &'s self,
         timer_type: TimerType,
-        key: &Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
+        key: &'k Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k, T> {
         self.operations.get_key_triggers(timer_type, key)
     }
 

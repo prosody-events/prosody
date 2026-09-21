@@ -36,7 +36,7 @@ impl<P: Projection> CellRead<P> for TtlStub {
         &'a self,
         _collection: &'a CollectionId,
         _scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + use<'a, P> {
         stream::empty()
     }
 }
