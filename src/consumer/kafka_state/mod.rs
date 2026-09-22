@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 
 mod codec;
+mod erased;
 
 pub use self::codec::{MessageRefCodec, MessageRefCodecError};
 

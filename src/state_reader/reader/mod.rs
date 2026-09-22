@@ -300,6 +300,7 @@ where
             Query = DequeQuery,
             Output: Stream<Item = Result<ResolvedOf<T>, StateReaderError>> + Send + 'static,
         >
+        + Clone
         + 'static
         + use<K, T, C, B>,
     >

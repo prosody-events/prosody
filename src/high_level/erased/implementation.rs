@@ -9,7 +9,7 @@ use super::{
     ErasedReadCache, ErasedReaderBuildError, ErasedStateCodec, EventIdentity, EventType,
     HighLevelClient, HighLevelClientError, MessageCodec, MessageCodecError, ProducerConfiguration,
     RequestError, SharedDequeReader, SharedMapReader, SharedSetReader, SharedValueReader,
-    StateCodec, SubsystemName, SubsystemOutcomes, Topic, deque, erased_config, map, set, value,
+    SubsystemName, SubsystemOutcomes, Topic, deque, erased_config, map, set, value,
 };
 use crate::high_level::{ClientBackend, ClientHandler};
 
@@ -111,7 +111,7 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedValueReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    ) -> Result<SharedValueReader<T::Payload>, ErasedReaderBuildError<MessageCodecError<T>>>
     where
         T::Payload: ErasedStateCodec,
     {
@@ -123,7 +123,7 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    ) -> Result<SharedMapReader<T::Payload>, ErasedReaderBuildError<MessageCodecError<T>>>
     where
         T::Payload: ErasedStateCodec,
     {
@@ -147,7 +147,7 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedDequeReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    ) -> Result<SharedDequeReader<T::Payload>, ErasedReaderBuildError<MessageCodecError<T>>>
     where
         T::Payload: ErasedStateCodec,
     {

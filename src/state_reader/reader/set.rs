@@ -87,6 +87,7 @@ where
             Query = BorrowedKeyQuery<'q, KC>,
             Output: Stream<Item = Result<KC::Key, StateReaderError>> + Send + 'q,
         >
+        + Clone
         + 'q
         + use<'q, K, KC, C, B>,
     > {

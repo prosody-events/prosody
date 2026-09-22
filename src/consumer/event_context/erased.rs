@@ -1,6 +1,6 @@
 //! The event context adapter used by language clients.
 
-use super::super::{
+use super::{
     BoxDequeState, BoxMapState, BoxSetState, BoxValueState, CompactDateTime, ConsumerMessage,
     DynClone, ErasedDeque, ErasedMap, ErasedSet, ErasedStateCodec, ErasedStateError, ErasedValue,
     Error, EventContext, EventContextError, Registered, StateSession, TimerType, Utf8KeyCodec,
@@ -24,8 +24,8 @@ impl Error for BoxEventContextError {}
 ///
 /// Every method resolves to an object-safe shape: the timer ops are `async fn`
 /// (boxed by `#[async_trait]`), `should_cancel` is a synchronous `bool`, and
-/// the six keyed-state vend methods are synchronous fallible `fn`s returning a
-/// boxed erased handle (`Result<Box<dyn Dyn*State>, ErasedStateError>`).
+/// the seven keyed-state vend methods are synchronous fallible `fn`s returning
+/// a boxed erased handle (`Result<Box<dyn Dyn*State>, ErasedStateError>`).
 #[async_trait]
 pub trait DynEventContext: DynClone + Send + Sync + 'static {
     /// The message payload type events on this context carry; mirrors

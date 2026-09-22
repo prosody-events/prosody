@@ -19,6 +19,7 @@ mod backend;
 mod cache;
 mod client;
 mod deps;
+pub mod erased;
 mod error;
 mod partitioner;
 mod publication_cache;

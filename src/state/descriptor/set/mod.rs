@@ -189,7 +189,8 @@ where
         impl ReadSource<
             Query = BorrowedKeyQuery<'a, KC>,
             Output: Stream<Item = KeyItem<SetKind<KC>>> + Send,
-        > + use<'a, S, KC>,
+        > + Clone
+        + use<'a, S, KC>,
     > {
         ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
             projected::<_, _, Presence>(&self.cells, query)

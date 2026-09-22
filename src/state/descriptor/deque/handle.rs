@@ -220,7 +220,8 @@ where
         impl ReadSource<
             Query = DequeQuery,
             Output: Stream<Item = Result<ResolvedOf<T>, DequeStateError<CellCodecError<T>>>> + Send,
-        > + use<'_, S, T>,
+        > + Clone
+        + use<'_, S, T>,
     >
     where
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,

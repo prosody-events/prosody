@@ -185,12 +185,12 @@ impl<Item> StateCursor<Item> {
 #[cfg(test)]
 mod tests {
     //! Pure state-machine pins for [`StateCursor`]. Seam-level cursor pins
-    //! (laziness against a counting store, parity) live in the parent module's
-    //! `tests.rs`; these drive synthetic streams to prove the three-state
-    //! transitions, so they need no session substrate.
+    //! (laziness against a counting store, parity) live in
+    //! `consumer::event_context::tests`; these drive synthetic streams to prove
+    //! the three-state transitions, so they need no session substrate.
 
     use super::{CursorInner, ErasedStateError, StateCursor};
-    use crate::consumer::event_context::ErasedCategory;
+    use crate::state::erased::ErasedCategory;
     use color_eyre::eyre::{Result, eyre};
     use futures::stream::{self, StreamExt};
     use std::collections::BTreeSet;

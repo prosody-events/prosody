@@ -1,22 +1,23 @@
 //! The erased map adapter.
 
 use super::write::ErasedWrite;
-use super::{BoxStateCursor, DynMapState, ErasedKeyQuery, ErasedStateError, cursor};
+use super::{DynMapState, ErasedKeyRead, ErasedStateError, cursor, read};
 use crate::state::collection::WritableStateSession;
 use crate::state::descriptor::{CellType, ContextOf, FromSession, MapHandle, ResolvedOf};
 use crate::state::order_codec::UnitKey;
 use crate::state::order_codec::Utf8KeyCodec;
+use crate::state::{ErasedKeyQuery, StoreOutcome};
 use async_stream::try_stream;
 use async_trait::async_trait;
 
 /// Erased map wrapper over a typed [`MapHandle`] monomorphized on
 /// [`Utf8KeyCodec`].
-pub(in crate::consumer::event_context) struct ErasedMap<S, T> {
+pub(crate) struct ErasedMap<S, T> {
     handle: MapHandle<S, Utf8KeyCodec, T>,
 }
 
 impl<S, T> ErasedMap<S, T> {
-    pub(in crate::consumer::event_context) fn new(handle: MapHandle<S, Utf8KeyCodec, T>) -> Self {
+    pub(crate) fn new(handle: MapHandle<S, Utf8KeyCodec, T>) -> Self {
         Self { handle }
     }
 }
@@ -88,33 +89,38 @@ where
             .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
-    fn read_entries(&self, query: ErasedKeyQuery) -> BoxStateCursor<(String, ResolvedOf<T>)> {
+    fn entries(&self) -> ErasedKeyRead<(String, ResolvedOf<T>)> {
         let handle = self.handle.clone();
-        Box::new(cursor(try_stream! {
-            for await item in handle.entries().with_query(query.borrowed()).stream() {
-                yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
-            }
-        }))
+        read(move |query: ErasedKeyQuery| {
+            let handle = handle.clone();
+            Box::new(cursor(try_stream! {
+                for await item in handle.entries().with_query(query.borrowed()).stream() {
+                    yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
+                }
+            }))
+        })
     }
 
-    fn read_keys(&self, query: ErasedKeyQuery) -> BoxStateCursor<String> {
+    fn keys(&self) -> ErasedKeyRead<String> {
         let handle = self.handle.clone();
-        Box::new(cursor(try_stream! {
-            for await item in handle.keys().with_query(query.borrowed()).stream() {
-                yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
-            }
-        }))
+        read(move |query: ErasedKeyQuery| {
+            let handle = handle.clone();
+            Box::new(cursor(try_stream! {
+                for await item in handle.keys().with_query(query.borrowed()).stream() {
+                    yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
+                }
+            }))
+        })
     }
 
-    async fn commit(&self) -> Result<(), ErasedStateError> {
+    async fn commit(&self) -> Result<StoreOutcome, ErasedStateError> {
         self.handle
             .commit()
             .await
-            .map(drop)
             .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
-    async fn rollback(&self) {
-        self.handle.rollback().await;
+    async fn rollback(&self) -> StoreOutcome {
+        self.handle.rollback().await
     }
 }

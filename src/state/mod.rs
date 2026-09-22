@@ -89,6 +89,7 @@ pub mod config;
 pub mod descriptor;
 pub mod descriptor_identity;
 pub(crate) mod dirty;
+pub mod erased;
 pub mod event_ref;
 pub(crate) mod fjall;
 pub mod identity;

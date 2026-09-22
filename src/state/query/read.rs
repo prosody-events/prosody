@@ -33,6 +33,8 @@ where
 
 /// Query settings bound to a collection and a result projection.
 /// Construction performs no storage reads. Poll the stream to start the read.
+/// Clone a builder to keep its settings before fluent methods consume it.
+#[derive(Clone)]
 #[must_use]
 pub struct ReadQuery<Q, S> {
     query: Q,
@@ -47,14 +49,15 @@ pub type DequeRead<S> = ReadQuery<DequeQuery, S>;
 
 impl<Q, F> ReadQuery<Q, (F, PhantomData<fn(Q)>)> {
     pub(crate) fn new(query: Q, source: F) -> Self {
-        Self {
-            query,
-            source: (source, PhantomData),
-        }
+        Self::from_source(query, (source, PhantomData))
     }
 }
 
 impl<Q, S> ReadQuery<Q, S> {
+    pub(crate) fn from_source(query: Q, source: S) -> Self {
+        Self { query, source }
+    }
+
     /// Replaces all query settings.
     pub fn with_query(mut self, query: Q) -> Self {
         self.query = query;

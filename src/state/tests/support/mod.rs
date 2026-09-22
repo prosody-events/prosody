@@ -3,7 +3,6 @@
 //! runners and their trace types stay in `cell_suite`/`collection_suite`/
 //! `identity_suite`; this module holds the standalone doubles they don't own.
 
-use crate::consumer::event_context::StateCursor;
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::middleware::{MarkerWrite, RepinProof};
 use crate::error::{ClassifyError, ErrorCategory};
@@ -13,6 +12,7 @@ use crate::state::cell::{Committed, Presence, Projection, ProvisionalCell, Provi
 use crate::state::cell_key::{CellKey, CellRef, Coordinate, Scan, Section};
 use crate::state::collection::{MutationJournal, StateSession, WritableStateSession, sealed};
 use crate::state::descriptor::{CellResolver, StructuralIdentity};
+use crate::state::erased::StateCursor;
 use crate::state::marker::{AttemptId, EventEvidence, EventMarker, SectionClear};
 use crate::state::memory::MemoryPublicationStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};

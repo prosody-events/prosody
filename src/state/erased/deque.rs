@@ -1,7 +1,8 @@
 //! The erased deque adapter.
 
 use super::write::ErasedWrite;
-use super::{BoxStateCursor, DequeQuery, DynDequeState, ErasedStateError, cursor};
+use super::{DynDequeState, ErasedDequeRead, ErasedStateError, cursor, read};
+use crate::state::StoreOutcome;
 use crate::state::collection::WritableStateSession;
 use crate::state::descriptor::{CellType, ContextOf, DequeHandle, FromSession, ResolvedOf};
 use crate::state::order_codec::UnitKey;
@@ -9,12 +10,12 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 
 /// Erased deque wrapper over a typed [`DequeHandle`].
-pub(in crate::consumer::event_context) struct ErasedDeque<S, T> {
+pub(crate) struct ErasedDeque<S, T> {
     handle: DequeHandle<S, T>,
 }
 
 impl<S, T> ErasedDeque<S, T> {
-    pub(in crate::consumer::event_context) fn new(handle: DequeHandle<S, T>) -> Self {
+    pub(crate) fn new(handle: DequeHandle<S, T>) -> Self {
         Self { handle }
     }
 }
@@ -97,24 +98,26 @@ where
             .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
-    fn read_values(&self, query: DequeQuery) -> BoxStateCursor<ResolvedOf<T>> {
+    fn values(&self) -> ErasedDequeRead<ResolvedOf<T>> {
         let handle = self.handle.clone();
-        Box::new(cursor(try_stream! {
-            for await item in handle.values().with_query(query).stream() {
-                yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
-            }
-        }))
+        read(move |query| {
+            let handle = handle.clone();
+            Box::new(cursor(try_stream! {
+                for await item in handle.values().with_query(query).stream() {
+                    yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
+                }
+            }))
+        })
     }
 
-    async fn commit(&self) -> Result<(), ErasedStateError> {
+    async fn commit(&self) -> Result<StoreOutcome, ErasedStateError> {
         self.handle
             .commit()
             .await
-            .map(drop)
             .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
-    async fn rollback(&self) {
-        self.handle.rollback().await;
+    async fn rollback(&self) -> StoreOutcome {
+        self.handle.rollback().await
     }
 }

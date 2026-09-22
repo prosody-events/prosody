@@ -3,9 +3,15 @@
 //! Each adapter delegates to a typed collection handle. Cursors preserve
 //! demand-driven reads and attempt fences. Only this FFI layer uses trait
 //! objects.
+//!
+//! Maps expose `entries()` and `keys()`. Sets expose `keys()`.
+//! Deques expose `values()`. Each builder supports the typed query methods.
+//! Call `stream()` to create an owned cursor. Its first pull starts the read.
+//! Builders own their handles and bounds, so clients can store them.
+//! Commit and rollback return the typed handle's [`StoreOutcome`].
 
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::{DequeQuery, ErasedKeyQuery};
+use crate::state::StoreOutcome;
 use async_trait::async_trait;
 use futures::Stream;
 use std::fmt::Display;
@@ -37,13 +43,8 @@ impl From<ErasedCategory> for ErrorCategory {
     }
 }
 
-/// The error every erased state op and vend method returns.
-///
-/// Carries its classification as data ([`ErasedCategory`]) so the four
-/// bindings can branch on it directly; [`ClassifyError`] also reaches it
-/// through the box, so the binding handler-error bridges reclassify with zero
-/// changes. Fields are private so no caller can mint an inconsistently
-/// classified error — the two `pub(crate)` constructors are the only mints.
+/// An erased state error with its classification and message.
+/// Private fields keep classification consistent across language clients.
 #[derive(Debug, Error)]
 #[error("{message}")]
 pub struct ErasedStateError {
@@ -123,11 +124,11 @@ pub trait DynValueState<Item: Send + 'static>: Send + Sync {
     async fn clear(&self) -> Result<(), ErasedStateError>;
 
     /// Durably commits buffered ops mid-handler (at-least-once).
-    async fn commit(&self) -> Result<(), ErasedStateError>;
+    async fn commit(&self) -> Result<StoreOutcome, ErasedStateError>;
 
     /// Discards buffered uncommitted ops. Infallible no-op on a terminated
     /// session.
-    async fn rollback(&self);
+    async fn rollback(&self) -> StoreOutcome;
 }
 
 /// Erased ordered map — the object-safe face of
@@ -161,19 +162,19 @@ pub trait DynMapState<Item: Send + 'static>: Send + Sync {
     /// Removes every entry.
     async fn clear(&self) -> Result<(), ErasedStateError>;
 
-    /// A demand-driven cursor over the live entries in key order.
-    fn read_entries(&self, query: ErasedKeyQuery) -> BoxStateCursor<(String, Item)>;
+    /// A fluent query over the live entries in key order.
+    fn entries(&self) -> ErasedKeyRead<(String, Item)>;
 
-    /// A demand-driven cursor over the live entry **keys** in key order,
+    /// A fluent query over the live entry **keys** in key order,
     /// without decoding or resolving any value (zero Kafka fetches for a
     /// message-backed map). A key is present even when its value is not.
-    fn read_keys(&self, query: ErasedKeyQuery) -> BoxStateCursor<String>;
+    fn keys(&self) -> ErasedKeyRead<String>;
 
     /// Durably commits buffered ops mid-handler (at-least-once).
-    async fn commit(&self) -> Result<(), ErasedStateError>;
+    async fn commit(&self) -> Result<StoreOutcome, ErasedStateError>;
 
     /// Discards buffered uncommitted ops.
-    async fn rollback(&self);
+    async fn rollback(&self) -> StoreOutcome;
 }
 
 /// Erased presence-only ordered set with `String` keys.
@@ -197,14 +198,14 @@ pub trait DynSetState: Send + Sync {
     /// Removes all members.
     async fn clear(&self) -> Result<(), ErasedStateError>;
 
-    /// Returns a demand-driven cursor over live keys.
-    fn read_keys(&self, query: ErasedKeyQuery) -> BoxStateCursor<String>;
+    /// Builds a fluent query over live keys.
+    fn keys(&self) -> ErasedKeyRead<String>;
 
     /// Commits buffered set operations.
-    async fn commit(&self) -> Result<(), ErasedStateError>;
+    async fn commit(&self) -> Result<StoreOutcome, ErasedStateError>;
 
     /// Discards buffered set operations.
-    async fn rollback(&self);
+    async fn rollback(&self) -> StoreOutcome;
 }
 
 /// Erased deque — the object-safe face of
@@ -242,14 +243,14 @@ pub trait DynDequeState<Item: Send + 'static>: Send + Sync {
     /// Removes every element.
     async fn clear(&self) -> Result<(), ErasedStateError>;
 
-    /// A demand-driven cursor over the live elements in index order.
-    fn read_values(&self, query: DequeQuery) -> BoxStateCursor<Item>;
+    /// A fluent query over the live elements in index order.
+    fn values(&self) -> ErasedDequeRead<Item>;
 
     /// Durably commits buffered ops mid-handler (at-least-once).
-    async fn commit(&self) -> Result<(), ErasedStateError>;
+    async fn commit(&self) -> Result<StoreOutcome, ErasedStateError>;
 
     /// Discards buffered uncommitted ops.
-    async fn rollback(&self);
+    async fn rollback(&self) -> StoreOutcome;
 }
 
 /// Boxed erased single-value handle a vend method returns.
@@ -280,12 +281,12 @@ mod set;
 mod value;
 mod write;
 pub use cursor::StateCursor;
-pub(super) use deque::ErasedDeque;
-pub(super) use map::ErasedMap;
-pub(super) use set::ErasedSet;
-pub(super) use value::ErasedValue;
-
-mod context;
-pub use context::{BoxEventContext, BoxEventContextError, DynEventContext};
+pub(crate) use deque::ErasedDeque;
+pub(crate) use map::ErasedMap;
+pub(crate) use set::ErasedSet;
+pub(crate) use value::ErasedValue;
+pub(crate) use write::ErasedWrite;
 
 mod query;
+pub(crate) use query::read;
+pub use query::{ErasedDequeRead, ErasedKeyRead, ErasedReadSource};

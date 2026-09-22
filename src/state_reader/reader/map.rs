@@ -140,6 +140,7 @@ where
             Query = BorrowedKeyQuery<'q, KC>,
             Output: Stream<Item = MapReadItem<KC, V>> + Send + 'q,
         >
+        + Clone
         + 'q
         + use<'q, K, KC, V, C, B>,
     >
@@ -168,6 +169,7 @@ where
             Query = BorrowedKeyQuery<'q, KC>,
             Output: Stream<Item = Result<KC::Key, StateReaderError>> + Send + 'q,
         >
+        + Clone
         + 'q
         + use<'q, K, KC, V, C, B>,
     >

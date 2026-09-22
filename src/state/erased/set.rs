@@ -1,19 +1,20 @@
 //! The erased set adapter.
 
-use super::{BoxStateCursor, DynSetState, ErasedKeyQuery, ErasedStateError, cursor};
+use super::{DynSetState, ErasedKeyRead, ErasedStateError, cursor, read};
 use crate::state::collection::WritableStateSession;
 use crate::state::descriptor::SetHandle;
 use crate::state::order_codec::Utf8KeyCodec;
+use crate::state::{ErasedKeyQuery, StoreOutcome};
 use async_stream::try_stream;
 use async_trait::async_trait;
 
 /// Erased set wrapper over a typed UTF-8 set.
-pub(in crate::consumer::event_context) struct ErasedSet<S> {
+pub(crate) struct ErasedSet<S> {
     handle: SetHandle<S, Utf8KeyCodec>,
 }
 
 impl<S> ErasedSet<S> {
-    pub(in crate::consumer::event_context) fn new(handle: SetHandle<S, Utf8KeyCodec>) -> Self {
+    pub(crate) fn new(handle: SetHandle<S, Utf8KeyCodec>) -> Self {
         Self { handle }
     }
 }
@@ -65,24 +66,26 @@ where
             .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
-    fn read_keys(&self, query: ErasedKeyQuery) -> BoxStateCursor<String> {
+    fn keys(&self) -> ErasedKeyRead<String> {
         let handle = self.handle.clone();
-        Box::new(cursor(try_stream! {
-            for await item in handle.keys().with_query(query.borrowed()).stream() {
-                yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
-            }
-        }))
+        read(move |query: ErasedKeyQuery| {
+            let handle = handle.clone();
+            Box::new(cursor(try_stream! {
+                for await item in handle.keys().with_query(query.borrowed()).stream() {
+                    yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
+                }
+            }))
+        })
     }
 
-    async fn commit(&self) -> Result<(), ErasedStateError> {
+    async fn commit(&self) -> Result<StoreOutcome, ErasedStateError> {
         self.handle
             .commit()
             .await
-            .map(drop)
             .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
-    async fn rollback(&self) {
-        self.handle.rollback().await;
+    async fn rollback(&self) -> StoreOutcome {
+        self.handle.rollback().await
     }
 }

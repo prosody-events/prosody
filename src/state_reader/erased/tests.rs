@@ -2,39 +2,21 @@
 
 use super::*;
 use crate::codec::JsonCodec;
-use crate::state::Direction;
+use crate::state::descriptor::{StateDescriptor, deque_state, map_state, set_state};
 use crate::state::query::tests::{KeyStep, expected_keys, key_query, key_read};
 use crate::state::tests::support::drain_cursor;
+use crate::state::{DequeQuery, Direction};
 use crate::state_reader::tests::support::{
     MemoryHarness, mock_count, owner_commit, publish_source, registry_of, source_state_key,
     state_name, topic,
 };
+use crate::subsystem::SubsystemName;
 use crate::test_util::TEST_RUNTIME;
 use color_eyre::Result;
-use color_eyre::eyre::bail;
 use quickcheck::QuickCheck;
 use serde_json::Value;
-
-/// The erased boundary accepts the typed API's maximum batch and rejects
-/// only larger batches. This prevents an FFI caller from allocating an
-/// uncapped transfer buffer before the shared typed batching begins.
-#[test]
-fn get_many_limit_matches_typed_keyset_limit() -> Result<()> {
-    assert!(validate_get_many_len(MAX_KEYSET_LIMIT - 1).is_ok());
-    assert!(validate_get_many_len(MAX_KEYSET_LIMIT).is_ok());
-    let Err(error) = validate_get_many_len(MAX_KEYSET_LIMIT + 1) else {
-        bail!("one key above the limit must be rejected");
-    };
-    assert_eq!(error.classify_error(), ErrorCategory::Permanent);
-    assert_eq!(
-        error.to_string(),
-        format!(
-            "get_many accepts at most {MAX_KEYSET_LIMIT} keys; got {}",
-            MAX_KEYSET_LIMIT + 1
-        )
-    );
-    Ok(())
-}
+use std::iter::once;
+use std::num::NonZeroUsize;
 
 #[test]
 fn prop_erased_reader_queries_match_model() {
@@ -141,22 +123,45 @@ async fn check_queries(keys: &[String], steps: &[KeyStep], tracked: bool) -> Res
     )
     .await;
     let deps = harness.deps();
-    let map: SharedMapReader<JsonCodec> =
+    let map: SharedMapReader<Value> =
         Arc::new(MapReader(StateReader::new(&deps, sub.clone(), map)?));
     let set: SharedSetReader = Arc::new(SetReader(StateReader::new(&deps, sub.clone(), set)?));
-    let deque: SharedDequeReader<JsonCodec> =
+    let deque: SharedDequeReader<Value> =
         Arc::new(DequeReader(StateReader::new(&deps, sub, deque)?));
     assert_queries(&map, &set, &deque, &key, keys, steps).await
 }
 
 async fn assert_queries(
-    map: &SharedMapReader<JsonCodec>,
+    map: &SharedMapReader<Value>,
     set: &SharedSetReader,
-    deque: &SharedDequeReader<JsonCodec>,
+    deque: &SharedDequeReader<Value>,
     key: &Key,
     keys: &[String],
     steps: &[KeyStep],
 ) -> Result<()> {
+    assert_eq!(map.is_empty(key.to_string()).await?, keys.is_empty());
+    assert_eq!(set.is_empty(key.to_string()).await?, keys.is_empty());
+    // Batch size is independent of the collection's keyset storage limit.
+    let probes: Vec<_> = keys
+        .iter()
+        .cloned()
+        .chain(once("absent\0".to_owned()))
+        .cycle()
+        .take(4097 + steps.len())
+        .collect();
+    let present: Vec<_> = probes.iter().map(|probe| keys.contains(probe)).collect();
+    let values = probes
+        .iter()
+        .zip(&present)
+        .map(|(probe, &present)| present.then(|| Value::from(probe.clone())))
+        .collect::<Vec<_>>();
+    assert_eq!(map.get_many(key.to_string(), probes.clone()).await?, values);
+    assert_eq!(
+        map.contains_many(key.to_string(), probes.clone()).await?,
+        present
+    );
+    assert_eq!(set.contains_many(key.to_string(), probes).await?, present);
+
     for dir in [Direction::Forward, Direction::Backward] {
         for end in 0..=steps.len() {
             let steps = &steps[..end];
@@ -166,10 +171,14 @@ async fn assert_queries(
                 .iter()
                 .map(|key| (key.clone(), Value::from(key.clone())))
                 .collect::<Vec<_>>();
-            assert_eq!(
-                drain_cursor(&*key_read(map.entries(key.to_string()), dir, steps).stream()).await?,
-                entries
-            );
+            let read: ErasedKeyRead<(String, Value)> = {
+                let reader = Arc::clone(map);
+                reader.entries(key.to_string())
+            };
+            let read = key_read(read, dir, steps);
+            let first = drain_cursor(&*read.clone().limit(NonZeroUsize::MIN).stream()).await?;
+            assert_eq!(first, entries.iter().take(1).cloned().collect::<Vec<_>>());
+            assert_eq!(drain_cursor(&*read.stream()).await?, entries);
             assert_eq!(
                 drain_cursor(&*map.keys(key.to_string()).with_query(query.clone()).stream())
                     .await?,
