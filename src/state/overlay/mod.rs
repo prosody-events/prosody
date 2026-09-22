@@ -232,3 +232,6 @@ fn front_cmp(dir: Direction, top: &Coordinate, bottom: &Coordinate) -> Ordering 
         Direction::Backward => bottom.cmp(top),
     }
 }
+
+#[cfg(test)]
+mod tests;

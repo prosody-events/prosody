@@ -13,7 +13,7 @@ use super::{Finalized, KeyedStateSession, SessionParts, StateBackend, Terminatio
 use crate::codec::JsonCodec;
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::partition::ShutdownPhase;
-use crate::error::ErrorCategory;
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell::Values;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::descriptor::value_state;
@@ -1312,10 +1312,12 @@ fn touched_cells(ops: &[StageOp]) -> HashSet<CellKey> {
         .collect()
 }
 
-/// A staging population: one op sequence under a chosen commit mode.
+/// A staging population: one op sequence under a chosen commit mode. `short`
+/// makes the lower store drop the last answer of each base batch.
 #[derive(Clone, Debug)]
 struct StagePop {
     ru: bool,
+    short: bool,
     ops: Vec<StageOp>,
 }
 
@@ -1323,13 +1325,14 @@ impl Arbitrary for StagePop {
     fn arbitrary(g: &mut Gen) -> Self {
         Self {
             ru: bool::arbitrary(g),
+            short: bool::arbitrary(g),
             ops: Vec::<StageOp>::arbitrary(g).into_iter().take(40).collect(),
         }
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        let ru = self.ru;
-        Box::new(self.ops.shrink().map(move |ops| Self { ru, ops }))
+        let (ru, short) = (self.ru, self.short);
+        Box::new(self.ops.shrink().map(move |ops| Self { ru, short, ops }))
     }
 }
 
@@ -1342,7 +1345,32 @@ async fn run_stage_query_counts(pop: StagePop) -> Result<()> {
     // The expected batch count, derived from the stage's dirty input.
     let expected_batches = fx.expected_batches();
     fx.counting.reset();
-    let finalized = fx.session.finalize().await?;
+    if pop.short {
+        fx.counting.short_batches();
+    }
+    let finalized = fx.session.finalize().await;
+
+    // A short base batch fails the stage as Permanent. It writes nothing and
+    // keeps the dirty input whole.
+    if pop.short && !pop.ru && expected_batches > 0 {
+        let Err(error) = finalized else {
+            bail!("a short base batch must fail the stage");
+        };
+        if error.classify_error() != ErrorCategory::Permanent {
+            bail!("a short base batch failed as {error:?}, expected Permanent");
+        }
+        if fx.counting.durable_writes() != 0 {
+            bail!(
+                "a failed stage wrote {} times",
+                fx.counting.durable_writes()
+            );
+        }
+        if fx.expected_batches() != expected_batches {
+            bail!("a failed stage changed its dirty input");
+        }
+        return Ok(());
+    }
+    let finalized = finalized?;
 
     // Query-count law: never a visible point read; RC issues exactly the
     // per-section batch count, RU reads no bases at all.
@@ -1381,7 +1409,8 @@ async fn run_stage_query_counts(pop: StagePop) -> Result<()> {
 /// The query-count law over random op sequences in both commit modes: the RC
 /// stage reads committed bases in exactly `Σ_section ceil(survivors /
 /// CELL_BATCH)` batches and zero point reads, RU reads no bases, and the
-/// committed projection tracks the model regardless.
+/// committed projection tracks the model regardless. A short base batch fails
+/// an RC stage before any durable write.
 #[test]
 fn prop_stage_query_counts() {
     fn prop(pop: StagePop) -> TestResult {

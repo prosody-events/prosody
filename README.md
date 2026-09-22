@@ -280,8 +280,9 @@ Query settings support Serde. Store owned settings when bounds must outlive thei
 on the first poll. Acquisition and read errors appear as stream items.
 
 Use `keys` to read map keys or set members. Set the next page's cursor with
-`after`. Each bound method replaces its edge. `prefix` keeps only keys with that
-prefix. Edges can narrow the prefix range but never widen it.
+`after`. Bound and prefix methods narrow the selection and never widen it, so
+their order does not change the selected keys. `prefix` keeps only keys with
+that prefix.
 `range` uses ascending bounds; `from`, `after`, `to`, and `before` follow the
 query direction.
 

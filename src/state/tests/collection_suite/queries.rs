@@ -210,8 +210,8 @@ async fn run_prefix_query(shape: PrefixShape) -> Result<bool> {
     Ok(true)
 }
 
-/// Both plans preserve prefix edges, cursor replacement, direction, and result
-/// limits.
+/// Both plans keep the cursor within the prefix, and preserve direction and
+/// result limits.
 #[test]
 fn prop_prefix_query() {
     fn property(shape: PrefixShape) -> Result<bool> {
