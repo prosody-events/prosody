@@ -151,19 +151,19 @@ where
             .batch_insert_slab_with_watermark(slab, watermark)
     }
 
-    fn get_key_times<'s, 'k>(
-        &'s self,
+    fn get_key_times<'a>(
+        &'a self,
         timer_type: TimerType,
-        key: &'k Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + use<'s, 'k, T> {
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + use<'a, T> {
         self.operations.get_key_times(timer_type, key)
     }
 
-    fn get_key_triggers<'s, 'k>(
-        &'s self,
+    fn get_key_triggers<'a>(
+        &'a self,
         timer_type: TimerType,
-        key: &'k Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k, T> {
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'a, T> {
         self.operations.get_key_triggers(timer_type, key)
     }
 

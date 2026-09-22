@@ -10,7 +10,7 @@ use crate::state::erased::{
 use crate::state::order_codec::Utf8KeyCodec;
 use crate::state_reader::{ReaderBackend, StateReader, StateReaderError};
 use async_trait::async_trait;
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use std::sync::Arc;
 
 pub use crate::state::ReadCachePolicy as ErasedReadCache;
@@ -183,7 +183,7 @@ where
         read(move |query: ErasedKeyQuery| {
             let reader = reader.clone();
             let key = key.clone();
-            state_cursor(async_stream::try_stream! {
+            StateCursor::new(async_stream::try_stream! {
                 let stream = reader.entries(key).with_query(query.borrowed()).stream();
                 for await item in stream { yield item?; }
             })
@@ -196,7 +196,7 @@ where
         read(move |query: ErasedKeyQuery| {
             let reader = reader.clone();
             let key = key.clone();
-            state_cursor(async_stream::try_stream! {
+            StateCursor::new(async_stream::try_stream! {
                 let stream = reader.keys(key).with_query(query.borrowed()).stream();
                 for await item in stream { yield item?; }
             })
@@ -239,7 +239,7 @@ where
         read(move |query: ErasedKeyQuery| {
             let reader = reader.clone();
             let key = key.clone();
-            state_cursor(async_stream::try_stream! {
+            StateCursor::new(async_stream::try_stream! {
                 let stream = reader.keys(key).with_query(query.borrowed()).stream();
                 for await item in stream { yield item?; }
             })
@@ -281,18 +281,9 @@ where
         let key = Key::from(key);
         read(move |query| {
             let stream = reader.values(key.clone()).with_query(query).stream();
-            state_cursor(stream)
+            StateCursor::new(stream.err_into())
         })
     }
-}
-
-fn state_cursor<T>(
-    stream: impl futures::Stream<Item = Result<T, StateReaderError>> + Send + 'static,
-) -> StateCursor<T> {
-    let stream = stream
-        .map_err(|error| ErasedStateError::from_classified(&error))
-        .boxed();
-    StateCursor::new(stream)
 }
 
 impl From<StateReaderError> for ErasedStateError {

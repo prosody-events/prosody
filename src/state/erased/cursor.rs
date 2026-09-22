@@ -2,7 +2,7 @@
 
 use super::ErasedStateError;
 use futures::stream::BoxStream;
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use std::num::NonZeroUsize;
 use tokio::sync::Mutex;
 
@@ -37,10 +37,13 @@ enum CursorInner<Item> {
 }
 
 impl<Item> StateCursor<Item> {
-    /// Wraps an erased typed stream as a fresh, open cursor.
-    pub(crate) fn new(stream: BoxStream<'static, Result<Item, ErasedStateError>>) -> Self {
+    /// Wraps an owned erased stream as a fresh, open cursor.
+    pub(crate) fn new<S>(stream: S) -> Self
+    where
+        S: Stream<Item = Result<Item, ErasedStateError>> + Send + 'static,
+    {
         Self {
-            inner: Mutex::new(CursorInner::Open(stream)),
+            inner: Mutex::new(CursorInner::Open(stream.boxed())),
         }
     }
 
@@ -202,7 +205,7 @@ mod tests {
 
     /// Builds a cursor over an explicit item sequence.
     fn cursor(items: Vec<Result<i32, ErasedStateError>>) -> StateCursor<i32> {
-        StateCursor::new(stream::iter(items).boxed())
+        StateCursor::new(stream::iter(items))
     }
 
     fn boom() -> ErasedStateError {
@@ -302,7 +305,7 @@ mod tests {
     #[tokio::test]
     async fn ready_chunk_does_not_wait_to_fill() -> Result<()> {
         let source = stream::once(async { Ok(7_i32) }).chain(stream::pending());
-        let cursor = StateCursor::new(source.boxed());
+        let cursor = StateCursor::new(source);
         let cap = NonZeroUsize::new(256).ok_or_else(|| eyre!("256 is nonzero"))?;
         let chunk = timeout(Duration::from_millis(100), cursor.next_ready_chunk(cap))
             .await
@@ -322,7 +325,7 @@ mod tests {
                 .await
                 .map_err(|error| ErasedStateError::terminated(&error.to_string()))
         });
-        let cursor = StateCursor::new(source.boxed());
+        let cursor = StateCursor::new(source);
         let cap = NonZeroUsize::new(256).ok_or_else(|| eyre!("256 is nonzero"))?;
         assert!(
             timeout(Duration::from_millis(10), cursor.next_ready_chunk(cap))

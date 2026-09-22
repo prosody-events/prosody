@@ -941,8 +941,7 @@ where
             .inner
             .overlay
             .get_many::<P>(&id, section, batch)
-            .await
-            .map_err(|e| StateAccessError::store(&e))?;
+            .await?;
         Ok(committed.into_iter().map(Committed::into_inner).collect())
     }
 
@@ -1507,18 +1506,14 @@ where
                             CellRead::<Values>::read_many(lower, id, section, &batch.as_ref())
                                 .await
                                 .map_err(|e| StateAccessError::store(&e))?;
-                        // `get_many`'s contract: bases.len() == batch.len()
-                        // == records.len(). Pair this chunk's bases with
-                        // EXACTLY its records BEFORE the fold flattens
-                        // across chunks. The debug_assert mirrors the store
-                        // default's / `Overlay::get_many`'s alignment
-                        // posture (a hard panic is banned); by construction
-                        // the lengths match.
-                        debug_assert_eq!(
-                            bases.len(),
-                            records.len(),
-                            "get_many must answer every batched cell"
-                        );
+                        // Pair this chunk's bases with exactly its records
+                        // before the fold flattens the chunks.
+                        if bases.len() != records.len() {
+                            return Err(StateAccessError::misaligned_batch(
+                                bases.len(),
+                                records.len(),
+                            ));
+                        }
                         let chunk_writes: CellBuffer<(CellKey, ProvisionalWrite)> = records
                             .into_iter()
                             .zip(bases.into_iter().map(|(committed, _)| committed))

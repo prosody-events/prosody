@@ -20,6 +20,8 @@
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::ops::{Bound, RangeBounds};
 
@@ -113,12 +115,15 @@ impl CellRef<'_> {
 
 /// Full intra-collection cell address. `Ord` is `(section, coordinate)`.
 ///
+/// Equality, order, and hashing delegate to [`CellRef`]. A borrowed lookup
+/// therefore finds the owned key in any map or tree.
+///
 /// It carries **only** `(section, coordinate)` — never the cell store's
 /// internal `kind` discriminant (the reserved-`kind` safety invariant). A
 /// backend that splits its partition into a data slice and an event-marker
 /// slice binds that discriminant itself as a compile-time constant; because it
 /// is unnameable here, no collection can address the marker slice.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug)]
 pub struct CellKey {
     /// The cell's sub-grouping section.
     pub section: Section,
@@ -138,6 +143,32 @@ impl CellKey {
     }
 }
 
+impl PartialEq for CellKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for CellKey {}
+
+impl PartialOrd for CellKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CellKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_ref().cmp(&other.as_ref())
+    }
+}
+
+impl Hash for CellKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_ref().hash(state);
+    }
+}
+
 /// Direction a [`Scan`] walks the clustering range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
@@ -146,6 +177,18 @@ pub enum Direction {
 
     /// Descending `coordinate` byte order.
     Backward,
+}
+
+impl Direction {
+    /// Converts ascending `(low, high)` edges into `(start, end)` edges.
+    /// Backward swaps the pair. The swap is its own inverse, so this also
+    /// converts `(start, end)` into `(low, high)`.
+    pub(crate) fn orient<T>(self, low: T, high: T) -> (T, T) {
+        match self {
+            Self::Forward => (low, high),
+            Self::Backward => (high, low),
+        }
+    }
 }
 
 /// A cell scan within one section.
@@ -176,10 +219,7 @@ impl Scan<'_> {
     /// forward keeps `(start, end)`, backward swaps to `(end, start)`.
     #[must_use]
     pub fn low_high(&self) -> (Bound<&[u8]>, Bound<&[u8]>) {
-        match self.dir {
-            Direction::Forward => (self.start, self.end),
-            Direction::Backward => (self.end, self.start),
-        }
+        self.dir.orient(self.start, self.end)
     }
 
     /// Tests whether a coordinate lies within the bounds in scan order.

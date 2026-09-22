@@ -1,6 +1,6 @@
 //! Encoded map and set bounds and ordered coordinate selection.
 
-use super::{Edge, KeyQuery};
+use super::KeyQuery;
 use crate::state::cell_key::{Coordinate, Direction};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec};
 use std::borrow::Borrow;
@@ -20,10 +20,7 @@ impl Query<'_> {
     /// Keeps the ascending stored coordinates within the query bounds, in
     /// query order. The trim reuses the stored vector.
     pub(crate) fn select(&self, mut coordinates: Vec<Coordinate>) -> Vec<Coordinate> {
-        let (low, high) = match self.dir {
-            Direction::Forward => (&self.start, &self.end),
-            Direction::Backward => (&self.end, &self.start),
-        };
+        let (low, high) = self.dir.orient(&self.start, &self.end);
         let start = match low {
             Bound::Included(edge) => coordinates.partition_point(|c| c.as_bytes() < *edge),
             Bound::Excluded(edge) => coordinates.partition_point(|c| c.as_bytes() <= *edge),
@@ -44,45 +41,87 @@ impl Query<'_> {
 }
 
 impl<KC: OrderedKeyCodec, B: Borrow<KC::Borrowed>> KeyQuery<KC, B> {
-    /// Writes both bounds into reusable storage and returns a borrowed view.
+    /// Writes the edges into reusable storage and returns a borrowed view.
+    /// The view narrows the edges to the prefix range.
     pub(crate) fn encode<'a>(&self, buf: &'a mut Vec<u8>) -> Result<Query<'a>, KeyCodecError> {
         buf.clear();
-        let (start, end) = KC::with_cached_local(|codec| {
+        let (low, high, prefix) = KC::with_cached_local(|codec| {
             Ok::<_, KeyCodecError>((
-                encode_edge(codec, &self.start, buf)?,
-                encode_edge(codec, &self.end, buf)?,
+                encode_bound(codec, self.edges.low.as_ref(), buf)?,
+                encode_bound(codec, self.edges.high.as_ref(), buf)?,
+                self.prefix
+                    .as_ref()
+                    .map(|prefix| encode_prefix(codec, prefix.borrow(), buf))
+                    .transpose()?,
             ))
         })?;
+
+        let buf: &'a [u8] = buf;
+        let mut low = low.map(|range| &buf[range]);
+        let mut high = high.map(|range| &buf[range]);
+        if let Some((prefix, prefix_end)) = prefix {
+            let prefix = &buf[prefix];
+            if edge(low).is_none_or(|edge| edge < prefix) {
+                low = Bound::Included(prefix);
+            }
+            if let Some(prefix_end) = prefix_end.map(|range| &buf[range])
+                && edge(high).is_none_or(|edge| edge >= prefix_end)
+            {
+                high = Bound::Excluded(prefix_end);
+            }
+        }
+
+        let (start, end) = self.dir.orient(low, high);
         Ok(Query {
             dir: self.dir,
             limit: self.limit,
-            start: start.map(|range| &buf[range]),
-            end: end.map(|range| &buf[range]),
+            start,
+            end,
         })
     }
 }
 
-fn encode_edge<KC: OrderedKeyCodec, B: Borrow<KC::Borrowed>>(
+/// Writes one bound key and returns its range in `buf`.
+fn encode_bound<KC: OrderedKeyCodec, B: Borrow<KC::Borrowed>>(
     codec: &mut KC,
-    edge: &Edge<B>,
+    bound: Bound<&B>,
     buf: &mut Vec<u8>,
 ) -> Result<Bound<Range<usize>>, KeyCodecError> {
     let start = buf.len();
-    let (key, included) = match edge {
-        Edge::Bound(Bound::Unbounded) => return Ok(Bound::Unbounded),
-        Edge::Bound(Bound::Included(key)) => (key, true),
-        Edge::Bound(Bound::Excluded(key)) | Edge::PrefixEnd(key) => (key, false),
+    let mut write = |key: &B| {
+        codec
+            .serialize_key(key.borrow(), buf)
+            .map(|()| start..buf.len())
     };
-    codec.serialize_key(key.borrow(), buf)?;
-    if matches!(edge, Edge::PrefixEnd(_)) && !prefix_end(buf, start) {
-        return Ok(Bound::Unbounded);
-    }
-    let range = start..buf.len();
-    Ok(if included {
-        Bound::Included(range)
-    } else {
-        Bound::Excluded(range)
+    Ok(match bound {
+        Bound::Included(key) => Bound::Included(write(key)?),
+        Bound::Excluded(key) => Bound::Excluded(write(key)?),
+        Bound::Unbounded => Bound::Unbounded,
     })
+}
+
+/// Writes a prefix and its exclusive endpoint. It returns their ranges in
+/// `buf`. A prefix without a finite endpoint returns no endpoint range.
+fn encode_prefix<KC: OrderedKeyCodec>(
+    codec: &mut KC,
+    prefix: &KC::Borrowed,
+    buf: &mut Vec<u8>,
+) -> Result<(Range<usize>, Option<Range<usize>>), KeyCodecError> {
+    let start = buf.len();
+    codec.serialize_key(prefix, buf)?;
+    let prefix = start..buf.len();
+    buf.extend_from_within(prefix.clone());
+    let bounded = prefix_end(buf, prefix.end);
+    let end = bounded.then_some(prefix.end..buf.len());
+    Ok((prefix, end))
+}
+
+/// Returns the key of a finite bound.
+fn edge(bound: Bound<&[u8]>) -> Option<&[u8]> {
+    match bound {
+        Bound::Included(key) | Bound::Excluded(key) => Some(key),
+        Bound::Unbounded => None,
+    }
 }
 
 /// Replaces the encoded suffix with its exclusive prefix endpoint.

@@ -1,22 +1,20 @@
 //! Queries over deque positions, counted from the front.
 
+use super::edges::Edges;
 use crate::state::cell_key::Direction;
 use serde::{Deserialize, Serialize};
-use std::mem::swap;
 use std::num::NonZeroUsize;
 use std::ops::{Bound, RangeBounds};
 
 /// An owned deque query shared by all read APIs.
-/// Forward order is the default. Direction changes preserve the selected
-/// bounds. Positions count from the front. Edges follow the query direction.
-/// Each bound method replaces one edge. A start past the end returns no values.
-/// Deque positions have no prefix operation.
+/// Forward order is the default. Positions count from the front. Bound
+/// methods narrow the selection and never widen it, as on
+/// [`KeyQuery`](super::KeyQuery). Deque positions have no prefix operation.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[must_use]
 pub struct DequeQuery {
     pub(crate) dir: Direction,
-    start: Bound<usize>,
-    end: Bound<usize>,
+    edges: Edges<usize>,
     pub(crate) limit: Option<NonZeroUsize>,
 }
 
@@ -25,8 +23,7 @@ impl DequeQuery {
     pub fn new() -> Self {
         Self {
             dir: Direction::Forward,
-            start: Bound::Unbounded,
-            end: Bound::Unbounded,
+            edges: Edges::unbounded(),
             limit: None,
         }
     }
@@ -36,53 +33,44 @@ impl DequeQuery {
         self.direction(Direction::Forward)
     }
 
-    /// Selects order from back to front. Repeated calls keep this order.
+    /// Selects order from back to front.
     pub fn reverse(self) -> Self {
         self.direction(Direction::Backward)
     }
 
     /// Selects an order supplied at runtime.
     pub fn direction(mut self, dir: Direction) -> Self {
-        if self.dir != dir {
-            swap(&mut self.start, &mut self.end);
-            self.dir = dir;
-        }
+        self.dir = dir;
         self
     }
 
-    /// Starts at `position`.
+    /// Starts at `position` in query order.
     pub fn from(mut self, position: usize) -> Self {
-        self.start = Bound::Included(position);
+        self.edges.start(self.dir, Bound::Included(position));
         self
     }
 
-    /// Starts after `position`.
+    /// Starts after `position` in query order.
     pub fn after(mut self, position: usize) -> Self {
-        self.start = Bound::Excluded(position);
+        self.edges.start(self.dir, Bound::Excluded(position));
         self
     }
 
-    /// Stops at `position`.
+    /// Stops at `position` in query order.
     pub fn to(mut self, position: usize) -> Self {
-        self.end = Bound::Included(position);
+        self.edges.end(self.dir, Bound::Included(position));
         self
     }
 
-    /// Stops before `position`.
+    /// Stops before `position` in query order.
     pub fn before(mut self, position: usize) -> Self {
-        self.end = Bound::Excluded(position);
+        self.edges.end(self.dir, Bound::Excluded(position));
         self
     }
 
-    /// Replaces both edges with an ascending position range, in either
-    /// direction.
+    /// Keeps positions within an ascending range, in either direction.
     pub fn range<R: RangeBounds<usize>>(mut self, range: R) -> Self {
-        let low = range.start_bound().cloned();
-        let high = range.end_bound().cloned();
-        (self.start, self.end) = match self.dir {
-            Direction::Forward => (low, high),
-            Direction::Backward => (high, low),
-        };
+        self.edges.range(&range);
         self
     }
 
@@ -92,11 +80,9 @@ impl DequeQuery {
         self
     }
 
+    /// Returns the ascending `(low, high)` bounds.
     pub(crate) fn bounds(self) -> (Bound<usize>, Bound<usize>) {
-        match self.dir {
-            Direction::Forward => (self.start, self.end),
-            Direction::Backward => (self.end, self.start),
-        }
+        (self.edges.low, self.edges.high)
     }
 }
 

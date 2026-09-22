@@ -120,8 +120,8 @@ pub use identity::{
     CollectionId, CollectionKindId, CollectionRef, StateKey, StateName, StateNameError, StateType,
 };
 pub use order_codec::{
-    I64KeyCodec, KeyCodecError, OrderedKeyCodec, U64KeyCodec, UnitKey, Utf8KeyCodec,
-    order_preserving_i64, order_preserving_i64_decode,
+    I64KeyCodec, KeyCodecError, OrderedKeyCodec, PrefixKeyCodec, U64KeyCodec, UnitKey,
+    Utf8KeyCodec, order_preserving_i64, order_preserving_i64_decode,
 };
 pub use registry::{CommitMode, ReadCachePolicy, StateVisibility};
 

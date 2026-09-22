@@ -99,8 +99,9 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a codec error (`Permanent`) when the cell does not decode, a
-    /// resolution error, or an access error from the session.
+    /// Returns a key codec error (`Permanent`) when `key` does not encode, a
+    /// codec error (`Permanent`) when the cell does not decode, a resolution
+    /// error, or an access error from the session.
     #[instrument(
         name = "map.get",
         skip_all,
@@ -125,7 +126,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a session access error.
+    /// Returns a key codec error (`Permanent`) when a key does not encode, or a
+    /// session access error.
     #[instrument(
         name = "map.contains_key",
         skip_all,
@@ -151,8 +153,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a codec, resolution, or session access error. Errors return no
-    /// partial result.
+    /// Returns a key codec, codec, resolution, or session access error. Errors
+    /// return no partial result.
     #[instrument(
         name = "map.get_many",
         skip_all,
@@ -185,7 +187,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a session access error.
+    /// Returns a key codec error (`Permanent`) when a key does not encode, or a
+    /// session access error.
     #[instrument(
         name = "map.contains_many",
         skip_all,
@@ -217,8 +220,9 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a codec error (`Permanent`) when `value` does not encode, or an
-    /// access error from the session.
+    /// Returns a key codec error (`Permanent`) when `key` does not encode, a
+    /// codec error (`Permanent`) when `value` does not encode, or an access
+    /// error from the session.
     #[instrument(
         name = "map.set",
         skip_all,
@@ -243,7 +247,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a session access error.
+    /// Returns a key codec error (`Permanent`) when a key does not encode, or a
+    /// session access error.
     #[instrument(
         name = "map.remove",
         skip_all,

@@ -2,6 +2,7 @@
 
 mod bounds;
 mod deque;
+mod edges;
 mod read;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -11,12 +12,12 @@ pub use deque::DequeQuery;
 pub use read::{DequeRead, KeyRead, ReadQuery, ReadSource};
 
 use crate::state::Direction;
-use crate::state::order_codec::{OrderedKeyCodec, Utf8KeyCodec};
+use crate::state::order_codec::{OrderedKeyCodec, PrefixKeyCodec, Utf8KeyCodec};
+use edges::Edges;
 use educe::Educe;
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
 use std::marker::PhantomData;
-use std::mem::swap;
 use std::num::NonZeroUsize;
 use std::ops::{Bound, RangeBounds};
 
@@ -29,9 +30,11 @@ use std::ops::{Bound, RangeBounds};
 /// its buffer. Sequential reads reuse its capacity after the stream drops.
 /// A cold pool, larger bounds, or overlapping streams can require allocation.
 ///
-/// Forward order is the default. Direction changes preserve selected bounds.
-/// Edges follow the query direction. Each bound method replaces one edge.
-/// A start past the end produces an empty stream.
+/// Forward order is the default. Bound and prefix methods narrow the
+/// selection and never widen it, so their order does not change the selected
+/// keys. `from`, `after`, `to`, and `before` use the direction set before the
+/// call. A later direction change keeps the selection and changes only the
+/// order. A start past the end produces an empty stream.
 #[derive(Educe, Serialize, Deserialize)]
 #[serde(bound(serialize = "B: Serialize", deserialize = "B: Deserialize<'de>"))]
 #[educe(
@@ -43,8 +46,8 @@ use std::ops::{Bound, RangeBounds};
 pub struct KeyQuery<KC: OrderedKeyCodec = Utf8KeyCodec, B = <KC as OrderedKeyCodec>::Key> {
     pub(crate) dir: Direction,
     pub(crate) limit: Option<NonZeroUsize>,
-    start: Edge<B>,
-    end: Edge<B>,
+    edges: Edges<B>,
+    prefix: Option<B>,
     #[serde(skip)]
     codec: PhantomData<fn() -> KC>,
 }
@@ -56,21 +59,14 @@ pub type BorrowedKeyQuery<'a, KC = Utf8KeyCodec> =
 /// The owned string query that foreign-language clients wrap.
 pub type ErasedKeyQuery = KeyQuery<Utf8KeyCodec, String>;
 
-/// A logical edge. A prefix endpoint stays logical until the codec writes it.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-enum Edge<B> {
-    Bound(Bound<B>),
-    PrefixEnd(B),
-}
-
 impl<KC: OrderedKeyCodec, B> KeyQuery<KC, B> {
     /// Creates an unbounded query in forward order.
     pub fn new() -> Self {
         Self {
             dir: Direction::Forward,
             limit: None,
-            start: Edge::Bound(Bound::Unbounded),
-            end: Edge::Bound(Bound::Unbounded),
+            edges: Edges::unbounded(),
+            prefix: None,
             codec: PhantomData,
         }
     }
@@ -80,17 +76,14 @@ impl<KC: OrderedKeyCodec, B> KeyQuery<KC, B> {
         self.direction(Direction::Forward)
     }
 
-    /// Selects descending key order. Repeated calls keep this order.
+    /// Selects descending key order.
     pub fn reverse(self) -> Self {
         self.direction(Direction::Backward)
     }
 
     /// Selects an order supplied at runtime.
     pub fn direction(mut self, dir: Direction) -> Self {
-        if self.dir != dir {
-            swap(&mut self.start, &mut self.end);
-            self.dir = dir;
-        }
+        self.dir = dir;
         self
     }
 
@@ -100,57 +93,72 @@ impl<KC: OrderedKeyCodec, B> KeyQuery<KC, B> {
         self
     }
 
-    /// Starts at `key`.
-    pub fn from<K: Into<B>>(mut self, key: K) -> Self {
-        self.start = Edge::Bound(Bound::Included(key.into()));
+    /// Starts at `key` in query order.
+    pub fn from<K: Into<B>>(mut self, key: K) -> Self
+    where
+        B: Ord,
+    {
+        self.edges.start(self.dir, Bound::Included(key.into()));
         self
     }
 
-    /// Starts after `key`.
-    pub fn after<K: Into<B>>(mut self, key: K) -> Self {
-        self.start = Edge::Bound(Bound::Excluded(key.into()));
+    /// Starts after `key` in query order.
+    pub fn after<K: Into<B>>(mut self, key: K) -> Self
+    where
+        B: Ord,
+    {
+        self.edges.start(self.dir, Bound::Excluded(key.into()));
         self
     }
 
-    /// Stops at `key`.
-    pub fn to<K: Into<B>>(mut self, key: K) -> Self {
-        self.end = Edge::Bound(Bound::Included(key.into()));
+    /// Stops at `key` in query order.
+    pub fn to<K: Into<B>>(mut self, key: K) -> Self
+    where
+        B: Ord,
+    {
+        self.edges.end(self.dir, Bound::Included(key.into()));
         self
     }
 
-    /// Stops before `key`.
-    pub fn before<K: Into<B>>(mut self, key: K) -> Self {
-        self.end = Edge::Bound(Bound::Excluded(key.into()));
+    /// Stops before `key` in query order.
+    pub fn before<K: Into<B>>(mut self, key: K) -> Self
+    where
+        B: Ord,
+    {
+        self.edges.end(self.dir, Bound::Excluded(key.into()));
         self
     }
 
-    /// Replaces both edges with ascending bounds, in either direction.
+    /// Keeps keys within an ascending range, in either direction.
     pub fn range<R: RangeBounds<B>>(mut self, range: R) -> Self
     where
-        B: Clone,
+        B: Ord + Clone,
     {
-        let low = Edge::Bound(range.start_bound().cloned());
-        let high = Edge::Bound(range.end_bound().cloned());
-        (self.start, self.end) = match self.dir {
-            Direction::Forward => (low, high),
-            Direction::Backward => (high, low),
-        };
+        self.edges.range(&range);
         self
     }
 
-    /// Selects keys with this encoded prefix, replacing both edges.
-    /// Later bound methods can replace an edge and expand the prefix range.
+    /// Keeps keys that start with `key`.
     pub fn prefix<K: Into<B>>(mut self, key: K) -> Self
     where
-        B: Clone,
+        KC: PrefixKeyCodec,
+        B: Borrow<KC::Borrowed> + Ord,
     {
-        let key = key.into();
-        let low = Edge::Bound(Bound::Included(key.clone()));
-        let high = Edge::PrefixEnd(key);
-        (self.start, self.end) = match self.dir {
-            Direction::Forward => (low, high),
-            Direction::Backward => (high, low),
-        };
+        let prefix = key.into();
+        match &self.prefix {
+            Some(current) if KC::starts_with(current.borrow(), prefix.borrow()) => {}
+            Some(current) if !KC::starts_with(prefix.borrow(), current.borrow()) => {
+                // Disjoint prefixes select no keys. The new prefix lies wholly
+                // below or above the current prefix range. As an edge on that
+                // side, it empties the range.
+                if &prefix < current {
+                    self.edges.narrow_high(Bound::Excluded(prefix));
+                } else {
+                    self.edges.narrow_low(Bound::Included(prefix));
+                }
+            }
+            _ => self.prefix = Some(prefix),
+        }
         self
     }
 
@@ -162,21 +170,12 @@ impl<KC: OrderedKeyCodec, B> KeyQuery<KC, B> {
         KeyQuery {
             dir: self.dir,
             limit: self.limit,
-            start: self.start.borrowed(),
-            end: self.end.borrowed(),
+            edges: Edges {
+                low: self.edges.low.as_ref().map(Borrow::borrow),
+                high: self.edges.high.as_ref().map(Borrow::borrow),
+            },
+            prefix: self.prefix.as_ref().map(Borrow::borrow),
             codec: PhantomData,
-        }
-    }
-}
-
-impl<B> Edge<B> {
-    fn borrowed<Q: ?Sized>(&self) -> Edge<&Q>
-    where
-        B: Borrow<Q>,
-    {
-        match self {
-            Self::Bound(bound) => Edge::Bound(bound.as_ref().map(Borrow::borrow)),
-            Self::PrefixEnd(key) => Edge::PrefixEnd(key.borrow()),
         }
     }
 }

@@ -82,7 +82,7 @@ fn unknown(keys: &[String]) -> impl Iterator<Item = &str> + use<'_> {
 }
 
 #[test]
-fn prop_borrowed_utf8_keys_address_maps_and_sets() {
+fn prop_borrowed_utf8_keys_address_maps_and_sets() -> Result<()> {
     fn property(mut keys: Vec<String>, steps: Vec<(u8, bool)>) -> Result<()> {
         keys.truncate(8);
         keys.push(String::new());
@@ -103,7 +103,14 @@ fn prop_borrowed_utf8_keys_address_maps_and_sets() {
             Ok(())
         })
     }
+    // A filtered batch can need more key bytes than any consecutive batch.
+    let lengths = [2368, 1612, 2650, 697, 690, 2057, 929, 50];
+    let keys = (b'a'..)
+        .zip(lengths)
+        .map(|(letter, len)| char::from(letter).to_string().repeat(len));
+    property(keys.collect(), Vec::new())?;
     QuickCheck::new().quickcheck(property as fn(Vec<String>, Vec<(u8, bool)>) -> Result<()>);
+    Ok(())
 }
 
 async fn check(operations: &[(String, bool)], keys: &[String], limit: usize) -> Result<()> {
@@ -190,10 +197,17 @@ async fn check_map<S: WritableStateSession>(
             present.then(|| Value::from(position))
         );
     }
+    let encodings = OWNED_ENCODINGS.get();
     assert_eq!(handle.contains_many(keys).await?, presence);
+    // Warm the pool with both batch groupings before the reuse check.
+    let filtered = keys.iter().filter(|key| key.len().is_multiple_of(2));
+    let expected: Vec<_> = filtered
+        .clone()
+        .map(|key| model.get(key).cloned())
+        .collect();
+    assert_eq!(handle.get_many(filtered).await?, expected);
     let storage = SerializeBufGuard::allocation();
     assert!(storage.1 > 0, "the batch must warm the encoding pool");
-    let encodings = OWNED_ENCODINGS.get();
     for key in keys.iter().collect::<BTreeSet<_>>() {
         let expected = model.get(key).cloned();
         assert_eq!(handle.contains_key(key.as_str()).await?, expected.is_some());
@@ -215,12 +229,6 @@ async fn check_map<S: WritableStateSession>(
             .await?,
         values
     );
-    let filtered = keys.iter().filter(|key| key.len().is_multiple_of(2));
-    let expected: Vec<_> = filtered
-        .clone()
-        .map(|key| model.get(key).cloned())
-        .collect();
-    assert_eq!(handle.get_many(filtered).await?, expected);
 
     assert_eq!(
         handle

@@ -40,11 +40,7 @@ impl Arbitrary for StreamConstraints {
 
 impl StreamConstraints {
     pub(super) fn contains(self, key: i64, dir: Direction) -> bool {
-        match dir {
-            Direction::Forward => (self.start, self.end),
-            Direction::Backward => (self.end, self.start),
-        }
-        .contains(&key)
+        dir.orient(self.start, self.end).contains(&key)
     }
 
     pub(super) fn apply<'a, KC>(
@@ -125,12 +121,14 @@ impl Arbitrary for PrefixShape {
 }
 
 impl PrefixShape {
-    fn contains(&self, key: &str, dir: Direction, end: Option<&str>) -> bool {
-        match (dir, self.cursor.as_deref()) {
-            (Direction::Forward, Some(cursor)) => key > cursor && end.is_none_or(|end| key < end),
-            (Direction::Backward, Some(cursor)) => key < cursor && key >= self.prefix.as_str(),
-            (_, None) => key >= self.prefix.as_str() && end.is_none_or(|end| key < end),
-        }
+    /// A key matches when it has the prefix and lies past the cursor in
+    /// walk order.
+    fn contains(&self, key: &str, dir: Direction) -> bool {
+        key.starts_with(self.prefix.as_str())
+            && self.cursor.as_deref().is_none_or(|cursor| match dir {
+                Direction::Forward => key > cursor,
+                Direction::Backward => key < cursor,
+            })
     }
 
     fn apply<'a>(&'a self, query: BorrowedKeyQuery<'a>) -> BorrowedKeyQuery<'a> {
@@ -166,16 +164,11 @@ async fn run_prefix_query(shape: PrefixShape) -> Result<bool> {
         set.insert(key).await?;
     }
 
-    let mut end = shape.prefix.clone();
-    let end = end.pop().map(|last| {
-        end.push(char::from(last as u8 + 1));
-        end
-    });
     let distinct: BTreeSet<_> = shape.keys.iter().cloned().collect();
     for dir in [Direction::Forward, Direction::Backward] {
         let mut expected: Vec<_> = distinct
             .iter()
-            .filter(|key| shape.contains(key, dir, end.as_deref()))
+            .filter(|key| shape.contains(key, dir))
             .cloned()
             .collect();
         if dir == Direction::Backward {

@@ -2,7 +2,8 @@
 
 use super::{BorrowedKeyQuery, DequeQuery, KeyQuery};
 use crate::state::Direction;
-use crate::state::order_codec::OrderedKeyCodec;
+use crate::state::order_codec::{OrderedKeyCodec, PrefixKeyCodec};
+use std::borrow::Borrow;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::ops::RangeBounds;
@@ -106,7 +107,7 @@ impl<KC: OrderedKeyCodec, B, S> ReadQuery<KeyQuery<KC, B>, S> {
     /// Applies [`KeyQuery::from`] to this read.
     pub fn from<'a>(mut self, bound: &'a KC::Borrowed) -> Self
     where
-        B: From<&'a KC::Borrowed>,
+        B: From<&'a KC::Borrowed> + Ord,
     {
         self.query = self.query.from(bound);
         self
@@ -115,7 +116,7 @@ impl<KC: OrderedKeyCodec, B, S> ReadQuery<KeyQuery<KC, B>, S> {
     /// Applies [`KeyQuery::after`] to this read.
     pub fn after<'a>(mut self, bound: &'a KC::Borrowed) -> Self
     where
-        B: From<&'a KC::Borrowed>,
+        B: From<&'a KC::Borrowed> + Ord,
     {
         self.query = self.query.after(bound);
         self
@@ -124,7 +125,7 @@ impl<KC: OrderedKeyCodec, B, S> ReadQuery<KeyQuery<KC, B>, S> {
     /// Applies [`KeyQuery::to`] to this read.
     pub fn to<'a>(mut self, bound: &'a KC::Borrowed) -> Self
     where
-        B: From<&'a KC::Borrowed>,
+        B: From<&'a KC::Borrowed> + Ord,
     {
         self.query = self.query.to(bound);
         self
@@ -133,7 +134,7 @@ impl<KC: OrderedKeyCodec, B, S> ReadQuery<KeyQuery<KC, B>, S> {
     /// Applies [`KeyQuery::before`] to this read.
     pub fn before<'a>(mut self, bound: &'a KC::Borrowed) -> Self
     where
-        B: From<&'a KC::Borrowed>,
+        B: From<&'a KC::Borrowed> + Ord,
     {
         self.query = self.query.before(bound);
         self
@@ -142,18 +143,19 @@ impl<KC: OrderedKeyCodec, B, S> ReadQuery<KeyQuery<KC, B>, S> {
     /// Applies [`KeyQuery::range`] to this read.
     pub fn range<R: RangeBounds<B>>(mut self, range: R) -> Self
     where
-        B: Clone,
+        B: Ord + Clone,
     {
         self.query = self.query.range(range);
         self
     }
 
     /// Applies [`KeyQuery::prefix`] to this read.
-    pub fn prefix<'a>(mut self, bound: &'a KC::Borrowed) -> Self
+    pub fn prefix<'a>(mut self, prefix: &'a KC::Borrowed) -> Self
     where
-        B: From<&'a KC::Borrowed> + Clone,
+        KC: PrefixKeyCodec,
+        B: From<&'a KC::Borrowed> + Borrow<KC::Borrowed> + Ord,
     {
-        self.query = self.query.prefix(bound);
+        self.query = self.query.prefix(prefix);
         self
     }
 }

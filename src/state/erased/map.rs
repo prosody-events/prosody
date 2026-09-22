@@ -1,7 +1,7 @@
 //! The erased map adapter.
 
 use super::write::ErasedWrite;
-use super::{DynMapState, Erased, ErasedKeyRead, ErasedStateError, cursor, read};
+use super::{DynMapState, Erased, ErasedKeyRead, ErasedStateError, StateCursor, read};
 use crate::state::collection::WritableStateSession;
 use crate::state::descriptor::{CellType, ContextOf, FromSession, MapHandle, ResolvedOf};
 use crate::state::order_codec::UnitKey;
@@ -81,7 +81,7 @@ where
         let handle = self.0.clone();
         read(move |query: ErasedKeyQuery| {
             let handle = handle.clone();
-            cursor(try_stream! {
+            StateCursor::new(try_stream! {
                 for await item in handle.entries().with_query(query.borrowed()).stream() {
                     yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
                 }
@@ -93,7 +93,7 @@ where
         let handle = self.0.clone();
         read(move |query: ErasedKeyQuery| {
             let handle = handle.clone();
-            cursor(try_stream! {
+            StateCursor::new(try_stream! {
                 for await item in handle.keys().with_query(query.borrowed()).stream() {
                     yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
                 }

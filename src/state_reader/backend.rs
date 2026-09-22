@@ -53,21 +53,21 @@ pub trait CellSource: Clone + Send + Sync + 'static {
 /// Reads one projection through collection evidence without a partition owner.
 pub trait CommittedCellSource<P: Projection>: CellSource {
     /// Reads one committed cell.
-    fn load<'a, 'b, 'c>(
+    fn load<'a>(
         &'a self,
-        id: &'b CollectionId,
-        cell: CellRef<'c>,
-    ) -> impl Future<Output = Result<Option<P::Payload>, Self::Error>> + Send + use<'a, 'b, 'c, Self, P>;
+        id: &'a CollectionId,
+        cell: CellRef<'a>,
+    ) -> impl Future<Output = Result<Option<P::Payload>, Self::Error>> + Send + use<'a, Self, P>;
 
     /// Returns one committed answer for each input coordinate, in input order.
-    fn load_many<'buf, 'a, 'b, 'c>(
+    fn load_many<'buf, 'a>(
         &'a self,
-        id: &'b CollectionId,
+        id: &'a CollectionId,
         section: Section,
-        batch: &'c ReadBatch<'buf>,
+        batch: &'a ReadBatch<'buf>,
     ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, Self::Error>>
     + Send
-    + use<'buf, 'a, 'b, 'c, Self, P>;
+    + use<'buf, 'a, Self, P>;
 
     /// Streams committed cells in scan order.
     fn scan<'a>(
@@ -82,23 +82,22 @@ impl CellSource for MemoryCells {
 }
 
 impl<P: Projection> CommittedCellSource<P> for MemoryCells {
-    fn load<'a, 'b, 'c>(
+    fn load<'a>(
         &'a self,
-        id: &'b CollectionId,
-        cell: CellRef<'c>,
-    ) -> impl Future<Output = Result<Option<P::Payload>, Self::Error>> + Send + use<'a, 'b, 'c, P>
-    {
+        id: &'a CollectionId,
+        cell: CellRef<'a>,
+    ) -> impl Future<Output = Result<Option<P::Payload>, Self::Error>> + Send + use<'a, P> {
         ready(Ok(self.read_committed(id, cell).map(P::from_value)))
     }
 
-    fn load_many<'buf, 'a, 'b, 'c>(
+    fn load_many<'buf, 'a>(
         &'a self,
-        id: &'b CollectionId,
+        id: &'a CollectionId,
         section: Section,
-        batch: &'c ReadBatch<'buf>,
+        batch: &'a ReadBatch<'buf>,
     ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, Self::Error>>
     + Send
-    + use<'buf, 'a, 'b, 'c, P> {
+    + use<'buf, 'a, P> {
         ready(Ok(self.read_committed_many::<P>(id, section, batch)))
     }
 
@@ -130,14 +129,14 @@ impl<P: Projection> CommittedCellSource<P> for ScriptedCellSource {
         read.map(|value| value.map(P::from_value))
     }
 
-    fn load_many<'buf, 'a, 'b, 'c>(
+    fn load_many<'buf, 'a>(
         &'a self,
-        id: &'b CollectionId,
+        id: &'a CollectionId,
         section: Section,
-        batch: &'c ReadBatch<'buf>,
+        batch: &'a ReadBatch<'buf>,
     ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, Self::Error>>
     + Send
-    + use<'buf, 'a, 'b, 'c, P> {
+    + use<'buf, 'a, P> {
         ready(self.read_committed_many::<P>(id, section, batch))
     }
 

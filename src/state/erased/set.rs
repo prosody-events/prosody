@@ -1,6 +1,6 @@
 //! The erased set adapter.
 
-use super::{DynSetState, Erased, ErasedKeyRead, ErasedStateError, cursor, read};
+use super::{DynSetState, Erased, ErasedKeyRead, ErasedStateError, StateCursor, read};
 use crate::state::collection::WritableStateSession;
 use crate::state::descriptor::SetHandle;
 use crate::state::order_codec::Utf8KeyCodec;
@@ -59,7 +59,7 @@ where
         let handle = self.0.clone();
         read(move |query: ErasedKeyQuery| {
             let handle = handle.clone();
-            cursor(try_stream! {
+            StateCursor::new(try_stream! {
                 for await item in handle.keys().with_query(query.borrowed()).stream() {
                     yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
                 }

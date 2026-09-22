@@ -23,7 +23,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error when session acquisition or handle binding fails.
+    /// Returns an error when session acquisition, handle binding, key
+    /// encoding, or the read fails.
     pub async fn contains<K: Into<Key>>(
         &self,
         key: K,
@@ -43,7 +44,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error when session acquisition or handle binding fails.
+    /// Returns an error when session acquisition, handle binding, key
+    /// encoding, or the read fails.
     pub async fn contains_many<'a, K: Into<Key>, Q, I>(
         &self,
         key: K,
@@ -65,7 +67,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error when session acquisition or handle binding fails.
+    /// Returns an error when session acquisition, handle binding, key
+    /// encoding, or the read fails.
     pub async fn is_empty<K: Into<Key>>(&self, key: K) -> Result<bool, StateReaderError> {
         let handle = self.bound(key.into()).await?;
         handle

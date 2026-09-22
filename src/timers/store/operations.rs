@@ -116,11 +116,11 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     // =========================================================================
 
     /// Streams all triggers of a specific type within a slab's time range.
-    fn get_slab_triggers<'s, 'k>(
-        &'s self,
-        slab: &'k Slab,
+    fn get_slab_triggers<'a>(
+        &'a self,
+        slab: &'a Slab,
         timer_type: TimerType,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k, Self>;
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'a, Self>;
 
     /// Streams ALL triggers within a slab across all timer types.
     fn get_slab_triggers_all_types(
@@ -155,24 +155,24 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     // =========================================================================
 
     /// Streams all scheduled times for a given key and timer type.
-    fn get_key_times<'s, 'k>(
-        &'s self,
+    fn get_key_times<'a>(
+        &'a self,
         timer_type: TimerType,
-        key: &'k Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + use<'s, 'k, Self>;
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + use<'a, Self>;
 
     /// Streams all triggers for a given key and timer type.
-    fn get_key_triggers<'s, 'k>(
-        &'s self,
+    fn get_key_triggers<'a>(
+        &'a self,
         timer_type: TimerType,
-        key: &'k Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k, Self>;
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'a, Self>;
 
     /// Streams ALL triggers for a given key across all timer types.
-    fn get_key_triggers_all_types<'s, 'k>(
-        &'s self,
-        key: &'k Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k, Self>;
+    fn get_key_triggers_all_types<'a>(
+        &'a self,
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'a, Self>;
 
     /// Upserts a trigger into the key-based index.
     ///

@@ -8,6 +8,7 @@ use super::{
     WriteOf, bounds, collection_methods, evictions, instrument, write_bounds,
 };
 use crate::state::cell::Values;
+use crate::state::order_codec::order_preserving_i64;
 use crate::state::{DequeRead, ReadQuery, ReadSource};
 use async_stream::try_stream;
 use futures::StreamExt;
@@ -158,18 +159,18 @@ where
     async fn stream_plan(
         &self,
         dir: Direction,
-        start: &Bound<usize>,
-        end: &Bound<usize>,
+        low: &Bound<usize>,
+        high: &Bound<usize>,
     ) -> Result<Plan<S, Keyed<I64KeyCodec, T>, [u8; 8]>, DequeStateError<CellCodecError<T>>> {
         let window = bounds(op).await?;
         let window_len = window.len()?;
-        let start = match start {
+        let start = match low {
             Bound::Included(position) => *position,
             Bound::Excluded(position) => position.saturating_add(1),
             Bound::Unbounded => 0,
         }
         .min(window_len);
-        let end = match end {
+        let end = match high {
             Bound::Included(position) => position.saturating_add(1),
             Bound::Excluded(position) => *position,
             Bound::Unbounded => window_len,
@@ -184,11 +185,15 @@ where
         // The scan limit cannot exceed the selected position count.
         if let Some(limit) = NonZeroUsize::new(len).filter(|n| n.get() > DEQUE_POINT_ITERATION_MAX)
         {
-            let (start, end) = match dir {
-                Direction::Forward => (first, last),
-                Direction::Backward => (last, first),
-            };
-            return Ok(op.range_within(DequeKind::<T>::ENTRIES, &start, dir, &end, limit));
+            let (start, end) = dir.orient(order_preserving_i64(first), order_preserving_i64(last));
+            return Ok(op
+                .range(
+                    DequeKind::<T>::ENTRIES,
+                    Bound::Included(start),
+                    dir,
+                    Bound::Included(end),
+                )
+                .with_limit(Some(limit)));
         }
         // Both endpoints are valid, so interior index arithmetic cannot overflow.
         // Allocate at most 128 coordinates once per stream, before item reads.
@@ -227,7 +232,7 @@ where
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         ReadQuery::new(DequeQuery::new(), move |query: DequeQuery| {
-            let (start, end) = query.bounds();
+            let (low, high) = query.bounds();
             let span = info_span!(
                 "deque.stream",
                 collection = self.cells.name().as_str(),
@@ -235,7 +240,7 @@ where
             );
             try_stream! {
                 let plan = self
-                    .stream_plan(query.dir, &start, &end)
+                    .stream_plan(query.dir, &low, &high)
                     .instrument(span.clone())
                     .await?;
                 let inner = plan.with_limit(query.limit).projected::<Values>();

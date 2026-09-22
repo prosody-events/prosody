@@ -116,11 +116,12 @@ where
             session, inner, state_type, name, section, &batch,
         )
         .await?;
-        debug_assert_eq!(
-            values.len(),
-            batch.len(),
-            "batch read answers every input position"
-        );
+        if values.len() != batch.len() {
+            return Err(StateAccessError::misaligned_batch(
+                values.len(),
+                batch.len(),
+            ));
+        }
         answers.extend(values);
     }
     Ok(answers)

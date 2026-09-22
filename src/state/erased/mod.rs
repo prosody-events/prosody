@@ -13,7 +13,6 @@
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::StoreOutcome;
 use async_trait::async_trait;
-use futures::Stream;
 use std::fmt::Display;
 use thiserror::Error;
 
@@ -266,13 +265,6 @@ pub type BoxSetState = Box<dyn DynSetState>;
 
 /// Boxed erased deque handle a vend method returns.
 pub type BoxDequeState<Item> = Box<dyn DynDequeState<Item>>;
-
-/// Adapts an owned stream to the cursor used by language clients.
-fn cursor<T>(
-    stream: impl Stream<Item = Result<T, ErasedStateError>> + Send + 'static,
-) -> StateCursor<T> {
-    StateCursor::new(Box::pin(stream))
-}
 
 mod cursor;
 mod deque;

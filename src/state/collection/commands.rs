@@ -52,8 +52,9 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     ///
     /// # Errors
     ///
-    /// An access error from the engine, a codec error (Permanent) when the
-    /// cell bytes do not decode, or a resolution error from the resolver.
+    /// An access error from the engine, a key codec error (Permanent) when
+    /// `key` does not encode, a codec error (Permanent) when the cell bytes do
+    /// not decode, or a resolution error from the resolver.
     fn get<'a, T>(
         &'a mut self,
         family: CellFamily<Self::Layout, T>,
@@ -94,7 +95,7 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     ///
     /// # Errors
     ///
-    /// Returns an engine access error.
+    /// As [`Self::contains`].
     fn contains_many<'a, 'op, T, I>(
         &'op mut self,
         family: CellFamily<Self::Layout, T>,
@@ -112,7 +113,8 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     ///
     /// # Errors
     ///
-    /// An access error from the engine.
+    /// An access error from the engine, or a key codec error (Permanent) when
+    /// `key` does not encode.
     fn contains<'a, T: CellType>(
         &'a mut self,
         family: CellFamily<Self::Layout, T>,

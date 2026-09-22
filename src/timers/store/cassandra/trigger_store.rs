@@ -273,11 +273,11 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn get_slab_triggers<'s, 'k>(
-        &'s self,
-        slab: &'k Slab,
+    fn get_slab_triggers<'a>(
+        &'a self,
+        slab: &'a Slab,
         timer_type: TimerType,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k> {
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'a> {
         let segment_id = self.segment.id;
         let slab_size = slab.size().seconds() as i32;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
@@ -405,11 +405,11 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty))]
-    fn get_key_times<'s, 'k>(
-        &'s self,
+    fn get_key_times<'a>(
+        &'a self,
         timer_type: TimerType,
-        key: &'k Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + use<'s, 'k> {
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + use<'a> {
         let key_clone = key.clone();
         let segment_id = self.segment.id;
 
@@ -456,11 +456,11 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty))]
-    fn get_key_triggers<'s, 'k>(
-        &'s self,
+    fn get_key_triggers<'a>(
+        &'a self,
         timer_type: TimerType,
-        key: &'k Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k> {
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'a> {
         let key_clone = key.clone();
         let segment_id = self.segment.id;
 
@@ -510,10 +510,10 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty))]
-    fn get_key_triggers_all_types<'s, 'k>(
-        &'s self,
-        key: &'k Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k> {
+    fn get_key_triggers_all_types<'a>(
+        &'a self,
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'a> {
         let key_clone = key.clone();
         let segment_id = self.segment.id;
 

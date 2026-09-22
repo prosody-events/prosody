@@ -142,10 +142,10 @@ impl V1Operations {
     /// only static columns. We handle this by deserializing to `Option<i32>`
     /// and filtering.
     #[instrument(level = "debug", skip(self), fields(segment_id = %segment_id))]
-    pub(crate) fn get_slabs<'s, 'k>(
-        &'s self,
-        segment_id: &'k SegmentId,
-    ) -> impl Stream<Item = Result<SlabId, CassandraTriggerStoreError>> + Send + use<'s, 'k> {
+    pub(crate) fn get_slabs<'a>(
+        &'a self,
+        segment_id: &'a SegmentId,
+    ) -> impl Stream<Item = Result<SlabId, CassandraTriggerStoreError>> + Send + use<'a> {
         let segment_id = *segment_id;
         let store = self.store.clone();
         let queries = Arc::clone(&self.queries);
@@ -177,12 +177,11 @@ impl V1Operations {
     /// Queries the v1 `timer_slabs` table with PK `((segment_id, id), key,
     /// time)`.
     #[instrument(level = "debug", skip(self), fields(segment_id = %segment_id, slab_id = %slab_id))]
-    pub(crate) fn get_slab_triggers<'s, 'k>(
-        &'s self,
-        segment_id: &'k SegmentId,
+    pub(crate) fn get_slab_triggers<'a>(
+        &'a self,
+        segment_id: &'a SegmentId,
         slab_id: SlabId,
-    ) -> impl Stream<Item = Result<TriggerV1, CassandraTriggerStoreError>> + Send + use<'s, 'k>
-    {
+    ) -> impl Stream<Item = Result<TriggerV1, CassandraTriggerStoreError>> + Send + use<'a> {
         let segment_id = *segment_id;
         let slab_id = i32::from_le_bytes(slab_id.to_le_bytes());
         let store = self.store.clone();
@@ -312,12 +311,11 @@ impl V1Operations {
     ///
     /// Queries v1 `timer_keys` table using partition key (`segment_id`, key).
     #[instrument(level = "debug", skip(self), fields(segment_id = %segment_id, key = %key))]
-    pub(crate) fn get_key_triggers<'s, 'k, 'v>(
-        &'s self,
-        segment_id: &'k SegmentId,
-        key: &'v Key,
-    ) -> impl Stream<Item = Result<TriggerV1, CassandraTriggerStoreError>> + Send + use<'s, 'k, 'v>
-    {
+    pub(crate) fn get_key_triggers<'a>(
+        &'a self,
+        segment_id: &'a SegmentId,
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<TriggerV1, CassandraTriggerStoreError>> + Send + use<'a> {
         let segment_id = *segment_id;
         let key = key.clone();
         let store = self.store.clone();

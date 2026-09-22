@@ -109,7 +109,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a codec error or a session access error.
+    /// Returns a key codec error (`Permanent`) when a key does not encode, or a
+    /// session access error.
     #[instrument(name = "set.insert", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
     #[write(op)]
     pub async fn insert(&self, key: &KC::Borrowed) -> Result<(), SetStateError>
@@ -123,7 +124,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a session access error.
+    /// Returns a key codec error (`Permanent`) when a key does not encode, or a
+    /// session access error.
     #[instrument(name = "set.remove", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
     #[write(op)]
     pub async fn remove(&self, key: &KC::Borrowed) -> Result<(), SetStateError>
@@ -137,7 +139,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a session access error.
+    /// Returns a key codec error (`Permanent`) when a key does not encode, or a
+    /// session access error.
     #[instrument(name = "set.contains", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
     #[read(op)]
     pub async fn contains(&self, key: &KC::Borrowed) -> Result<bool, SetStateError>
@@ -151,7 +154,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a session access error.
+    /// Returns a key codec error (`Permanent`) when a key does not encode, or a
+    /// session access error.
     #[instrument(name = "set.contains_many", skip_all, fields(collection = self.cells.name().as_str(), keys = Empty), err)]
     #[read(op)]
     pub async fn contains_many<'a, Q, I>(&self, keys: I) -> Result<Vec<bool>, SetStateError>

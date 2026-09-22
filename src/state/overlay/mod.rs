@@ -15,6 +15,7 @@ use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::dirty::{DirtyStore, DirtyVal};
 use super::identity::CollectionId;
 use super::store::{CELL_BATCH, CommittedBatch, ReadBatch};
+use crate::state::StateAccessError;
 use crate::state::cell_key::CellRef;
 use crate::state::store::CellRead;
 use async_stream::try_stream;
@@ -88,12 +89,14 @@ impl<L> Overlay<L> {
     /// # Errors
     ///
     /// Returns the lower store error when the dirty overlay has no answer.
+    /// Returns a permanent error when the lower batch answers a different
+    /// number of positions.
     pub async fn get_many<'a, P: Projection>(
         &'a self,
         collection: &'a CollectionId,
         section: Section,
         batch: &'a ReadBatch<'_>,
-    ) -> Result<CommittedBatch<P>, L::Error>
+    ) -> Result<CommittedBatch<P>, StateAccessError>
     where
         L: CellRead<P>,
     {
@@ -124,13 +127,15 @@ impl<L> Overlay<L> {
             (answers, ReadBatch::from_buffer(untouched), positions)
         };
         if let Some(lower_batch) = &lower_batch {
-            let lower =
-                CellRead::<P>::read_many(&self.lower, collection, section, lower_batch).await?;
-            assert_eq!(
-                lower.len(),
-                positions.len(),
-                "batch read must answer every input position"
-            );
+            let lower = CellRead::<P>::read_many(&self.lower, collection, section, lower_batch)
+                .await
+                .map_err(|e| StateAccessError::store(&e))?;
+            if lower.len() != positions.len() {
+                return Err(StateAccessError::misaligned_batch(
+                    lower.len(),
+                    positions.len(),
+                ));
+            }
             for ((committed, _), &position) in lower.into_iter().zip(&positions) {
                 answers[usize::from(position)] = committed;
             }

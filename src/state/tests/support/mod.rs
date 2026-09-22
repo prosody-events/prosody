@@ -165,26 +165,26 @@ impl<P, Q: Projection> sealed::Reads<UnavailableState<P>, Q> for UnavailableEngi
 where
     P: Clone + Send + Sync + 'static,
 {
-    fn read_point<'a, 'b, 'c, 'd, 'e>(
+    fn read_point<'a, 'c>(
         _session: &'a UnavailableState<P>,
-        _inner: &'b mut Self::ReadInner<'c>,
+        _inner: &'a mut Self::ReadInner<'c>,
         _state_type: StateType,
-        _name: &'d StateName,
-        _cell: CellRef<'e>,
-    ) -> impl Future<Output = Result<Option<Q::Payload>, StateAccessError>> + use<'a, 'b, 'c, 'd, 'e, P, Q>
+        _name: &'a StateName,
+        _cell: CellRef<'a>,
+    ) -> impl Future<Output = Result<Option<Q::Payload>, StateAccessError>> + use<'a, 'c, P, Q>
     {
         ready(Err(StateAccessError::Unavailable))
     }
 
-    fn read_batch<'buf, 'a, 'b, 'c, 'd, 'e>(
+    fn read_batch<'buf, 'a, 'c>(
         _session: &'a UnavailableState<P>,
-        _inner: &'b mut Self::ReadInner<'c>,
+        _inner: &'a mut Self::ReadInner<'c>,
         _state_type: StateType,
-        _name: &'d StateName,
+        _name: &'a StateName,
         _section: Section,
-        _batch: &'e ReadBatch<'buf>,
+        _batch: &'a ReadBatch<'buf>,
     ) -> impl Future<Output = Result<CellBuffer<Option<Q::Payload>>, StateAccessError>>
-    + use<'buf, 'a, 'b, 'c, 'd, 'e, P, Q> {
+    + use<'buf, 'a, 'c, P, Q> {
         ready(Err(StateAccessError::Unavailable))
     }
 
@@ -228,19 +228,19 @@ where
     ) {
     }
 
-    fn commit<'a, 'b>(
+    fn commit<'a>(
         _session: &'a UnavailableState<P>,
         _state_type: StateType,
-        _name: &'b StateName,
-    ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + use<'a, 'b, P> {
+        _name: &'a StateName,
+    ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + use<'a, P> {
         ready(Err(StateAccessError::Unavailable))
     }
 
-    fn rollback<'a, 'b>(
+    fn rollback<'a>(
         _session: &'a UnavailableState<P>,
         _state_type: StateType,
-        _name: &'b StateName,
-    ) -> impl Future<Output = StoreOutcome> + use<'a, 'b, P> {
+        _name: &'a StateName,
+    ) -> impl Future<Output = StoreOutcome> + use<'a, P> {
         // Stateless: nothing is ever buffered, so the discard is a NoOp.
         ready(StoreOutcome::NoOp)
     }

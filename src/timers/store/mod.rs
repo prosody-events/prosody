@@ -337,20 +337,20 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ///
     /// Returns only timestamps without full trigger metadata.
     /// More efficient than `get_key_triggers` when trace context not needed.
-    fn get_key_times<'s, 'k>(
-        &'s self,
+    fn get_key_times<'a>(
+        &'a self,
         timer_type: TimerType,
-        key: &'k Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + use<'s, 'k, Self>;
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + use<'a, Self>;
 
     /// Streams full trigger objects for a key and timer type.
     ///
     /// Includes all metadata (key, time, `timer_type`, trace context).
-    fn get_key_triggers<'s, 'k>(
-        &'s self,
+    fn get_key_triggers<'a>(
+        &'a self,
         timer_type: TimerType,
-        key: &'k Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k, Self>;
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'a, Self>;
 
     // ===================================================================
     // Coordinated Write Operations (3 methods) - Used by TimerManager

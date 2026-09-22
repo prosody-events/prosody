@@ -1,7 +1,7 @@
 //! The erased deque adapter.
 
 use super::write::ErasedWrite;
-use super::{DynDequeState, Erased, ErasedDequeRead, ErasedStateError, cursor, read};
+use super::{DynDequeState, Erased, ErasedDequeRead, ErasedStateError, StateCursor, read};
 use crate::state::StoreOutcome;
 use crate::state::collection::WritableStateSession;
 use crate::state::descriptor::{CellType, ContextOf, DequeHandle, FromSession, ResolvedOf};
@@ -91,7 +91,7 @@ where
         let handle = self.0.clone();
         read(move |query| {
             let handle = handle.clone();
-            cursor(try_stream! {
+            StateCursor::new(try_stream! {
                 for await item in handle.values().with_query(query).stream() {
                     yield item.map_err(|error| ErasedStateError::from_classified(&error))?;
                 }

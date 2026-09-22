@@ -56,6 +56,13 @@ pub trait OrderedKeyCodec: Codec<Payload = Self::Key, Error = KeyCodecError> {
     fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError>;
 }
 
+/// An ordered codec whose key prefixes are encoded byte prefixes.
+pub trait PrefixKeyCodec: OrderedKeyCodec {
+    /// Tests whether `key` starts with `prefix`.
+    /// The answer must equal the byte prefix test of the encoded keys.
+    fn starts_with(key: &Self::Borrowed, prefix: &Self::Borrowed) -> bool;
+}
+
 /// The unit address: the single cell of a one-cell collection, at the empty
 /// coordinate.
 ///
@@ -130,7 +137,7 @@ impl Codec for UnitKey {
 ///
 /// Flipping the sign bit maps `i64::MIN..=i64::MAX` onto `u64::MIN..=u64::MAX`,
 /// so the big-endian bytes compare by memcmp in signed order. Inverse:
-/// [`order_preserving_i64_decode`]. This is the Deque index encoding.
+/// [`order_preserving_i64_decode`]. [`I64KeyCodec`] writes these bytes.
 #[must_use]
 pub fn order_preserving_i64(value: i64) -> [u8; 8] {
     ((value as u64) ^ (1 << 63)).to_be_bytes()
@@ -166,6 +173,12 @@ impl OrderedKeyCodec for Utf8KeyCodec {
 
     fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError> {
         Ok(from_utf8(bytes)?.to_owned())
+    }
+}
+
+impl PrefixKeyCodec for Utf8KeyCodec {
+    fn starts_with(key: &str, prefix: &str) -> bool {
+        key.starts_with(prefix)
     }
 }
 

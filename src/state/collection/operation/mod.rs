@@ -14,7 +14,6 @@ use crate::state::descriptor::{
     ResolvedOf, WriteOf,
 };
 use crate::state::order_codec::OrderedKeyCodec;
-use crate::state::order_codec::{I64KeyCodec, order_preserving_i64};
 use crate::state::store::CellBuffer;
 use crate::state::{StateName, StateType};
 use std::ops::Bound;
@@ -26,7 +25,6 @@ pub(super) use batch::read_coordinates;
 use bytes::Bytes;
 use smallvec::SmallVec;
 use std::future::Future;
-use std::num::NonZeroUsize;
 
 /// Inline capacity of one invocation's mutation journal.
 ///
@@ -121,33 +119,6 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
         end: Bound<B>,
     ) -> Plan<S, T, B> {
         Plan::range(self.plan_base(family.section()), start, dir, end)
-    }
-
-    /// Plans a managed durable range over one inclusive typed span of
-    /// `family`'s section. The plan walks `[start, end]` in `dir` order and
-    /// yields at most `limit` cells.
-    ///
-    /// A collection with a contiguous coordinate window takes this plan. It
-    /// does not enumerate every coordinate in the window. `start` and `end`
-    /// are direction-relative, exactly as
-    /// [`Scan`](crate::state::cell_key::Scan) defines them. Only inclusive
-    /// edges exist here. A collection that knows its window also knows both of
-    /// its occupied endpoints.
-    pub(crate) fn range_within<T: CellType<Key = I64KeyCodec>>(
-        &self,
-        family: CellFamily<L, T>,
-        start: &BorrowedKeyOf<T>,
-        dir: Direction,
-        end: &BorrowedKeyOf<T>,
-        limit: NonZeroUsize,
-    ) -> Plan<S, T, [u8; 8]> {
-        self.range(
-            family,
-            Bound::Included(order_preserving_i64(*start)),
-            dir,
-            Bound::Included(order_preserving_i64(*end)),
-        )
-        .with_limit(Some(limit))
     }
 
     /// The binding and captured engine state every managed plan carries.

@@ -176,46 +176,46 @@ pub trait AdmissionChecks: Clone + Send + Sync + 'static {
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
     /// Tests whether admission completed for this key.
-    fn contains<'a, 'b>(
+    fn contains<'a>(
         &'a self,
-        key: &'b Key,
-    ) -> impl Future<Output = Result<bool, Self::Error>> + Send + use<'a, 'b, Self>;
+        key: &'a Key,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send + use<'a, Self>;
 
     /// Records complete admission.
-    fn mark<'a, 'b>(
+    fn mark<'a>(
         &'a self,
-        key: &'b Key,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, 'b, Self>;
+        key: &'a Key,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, Self>;
 
     /// Removes admission proof before another dispatch can use it.
-    fn unmark<'a, 'b>(
+    fn unmark<'a>(
         &'a self,
-        key: &'b Key,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, 'b, Self>;
+        key: &'a Key,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, Self>;
 }
 
 /// Memory stores have no assignment workspace. Each event admits again.
 impl AdmissionChecks for () {
     type Error = Infallible;
 
-    fn contains<'a, 'b>(
+    fn contains<'a>(
         &'a self,
-        _key: &'b Key,
-    ) -> impl Future<Output = Result<bool, Self::Error>> + use<'a, 'b> {
+        _key: &'a Key,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + use<'a> {
         ready(Ok(false))
     }
 
-    fn mark<'a, 'b>(
+    fn mark<'a>(
         &'a self,
-        _key: &'b Key,
-    ) -> impl Future<Output = Result<(), Self::Error>> + use<'a, 'b> {
+        _key: &'a Key,
+    ) -> impl Future<Output = Result<(), Self::Error>> + use<'a> {
         ready(Ok(()))
     }
 
-    fn unmark<'a, 'b>(
+    fn unmark<'a>(
         &'a self,
-        _key: &'b Key,
-    ) -> impl Future<Output = Result<(), Self::Error>> + use<'a, 'b> {
+        _key: &'a Key,
+    ) -> impl Future<Output = Result<(), Self::Error>> + use<'a> {
         ready(Ok(()))
     }
 }

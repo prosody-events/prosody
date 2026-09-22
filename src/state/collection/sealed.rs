@@ -104,27 +104,27 @@ pub trait ReadEngine<S: ?Sized> {
 /// Reads one projection under the engine's admission and plan.
 pub trait Reads<S: ?Sized, P: Projection>: ReadEngine<S> {
     /// Reads one projected cell and updates the invocation state.
-    fn read_point<'a, 'b, 'c, 'd, 'e>(
+    fn read_point<'a, 'c>(
         session: &'a S,
-        inner: &'b mut Self::ReadInner<'c>,
+        inner: &'a mut Self::ReadInner<'c>,
         state_type: StateType,
-        name: &'d StateName,
-        cell: CellRef<'e>,
+        name: &'a StateName,
+        cell: CellRef<'a>,
     ) -> impl Future<Output = Result<Option<P::Payload>, StateAccessError>>
     + Send
-    + use<'a, 'b, 'c, 'd, 'e, Self, S, P>;
+    + use<'a, 'c, Self, S, P>;
 
     /// Reads an aligned batch and updates the invocation state.
-    fn read_batch<'buf, 'a, 'b, 'c, 'd, 'e>(
+    fn read_batch<'buf, 'a, 'c>(
         session: &'a S,
-        inner: &'b mut Self::ReadInner<'c>,
+        inner: &'a mut Self::ReadInner<'c>,
         state_type: StateType,
-        name: &'d StateName,
+        name: &'a StateName,
         section: Section,
-        batch: &'e ReadBatch<'buf>,
+        batch: &'a ReadBatch<'buf>,
     ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, StateAccessError>>
     + Send
-    + use<'buf, 'a, 'b, 'c, 'd, 'e, Self, S, P>;
+    + use<'buf, 'a, 'c, Self, S, P>;
 
     /// Pages a durable range under a captured plan without the gate. This is
     /// the range driver's only lower hop and the one command that cannot
@@ -183,16 +183,16 @@ pub trait WriteEngine<S: ?Sized>: ReadEngine<S> {
     /// # Errors
     ///
     /// Admission refusal, or a store failure.
-    fn commit<'a, 'b>(
+    fn commit<'a>(
         session: &'a S,
         state_type: StateType,
-        name: &'b StateName,
-    ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + Send + use<'a, 'b, Self, S>;
+        name: &'a StateName,
+    ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + Send + use<'a, Self, S>;
 
     /// Discards the collection's buffered changes mid-invocation.
-    fn rollback<'a, 'b>(
+    fn rollback<'a>(
         session: &'a S,
         state_type: StateType,
-        name: &'b StateName,
-    ) -> impl Future<Output = StoreOutcome> + Send + use<'a, 'b, Self, S>;
+        name: &'a StateName,
+    ) -> impl Future<Output = StoreOutcome> + Send + use<'a, Self, S>;
 }

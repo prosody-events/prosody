@@ -264,11 +264,11 @@ impl TriggerOperations for InMemoryTriggerStore {
     // -- Slab trigger operations (time index) --
 
     /// Stream all triggers of a specific type within a given slab.
-    fn get_slab_triggers<'s, 'k>(
-        &'s self,
-        slab: &'k Slab,
+    fn get_slab_triggers<'a>(
+        &'a self,
+        slab: &'a Slab,
         timer_type: TimerType,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + use<'s, 'k> {
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + use<'a> {
         let segment_id = self.segment.id;
         let slab_size = slab.size();
         let slab_id = slab.id();
@@ -363,21 +363,21 @@ impl TriggerOperations for InMemoryTriggerStore {
     // -- Key trigger operations (entity index) --
 
     /// Stream all scheduled times for a given key and timer type.
-    fn get_key_times<'s, 'k>(
-        &'s self,
+    fn get_key_times<'a>(
+        &'a self,
         timer_type: TimerType,
-        key: &'k Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + use<'s, 'k> {
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + use<'a> {
         self.get_key_triggers(timer_type, key)
             .map_ok(|trigger| trigger.time)
     }
 
     /// Stream all triggers for a given key and timer type.
-    fn get_key_triggers<'s, 'k>(
-        &'s self,
+    fn get_key_triggers<'a>(
+        &'a self,
         timer_type: TimerType,
-        key: &'k Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k> {
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'a> {
         let segment_id = self.segment.id;
         try_stream! {
             let partition_key = (segment_id, key.clone());
@@ -395,10 +395,10 @@ impl TriggerOperations for InMemoryTriggerStore {
     }
 
     /// Stream ALL triggers for a given key across all timer types.
-    fn get_key_triggers_all_types<'s, 'k>(
-        &'s self,
-        key: &'k Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'s, 'k> {
+    fn get_key_triggers_all_types<'a>(
+        &'a self,
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'a> {
         let segment_id = self.segment.id;
         try_stream! {
             let partition_key = (segment_id, key.clone());
