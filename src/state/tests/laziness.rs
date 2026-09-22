@@ -1,6 +1,7 @@
 //! Stream demand bounds reads and message resolution.
 
 use super::*;
+use futures::TryStreamExt;
 
 /// A dense stream-laziness case: a collection of `n` entries drained
 /// streams limited to `k` items, with `n` on the deque's point-get arm (`≤
@@ -106,15 +107,13 @@ pub(super) async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Directio
         resolves.clone(),
     );
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
-    let taken: Vec<_> = {
-        let stream = handle.entries().direction(dir).stream().take(k);
-        futures::pin_mut!(stream);
-        let mut out = Vec::new();
-        while let Some(item) = stream.next().await {
-            out.push(item.map_err(|e| eyre!("stream: {e}"))?);
-        }
-        out
-    };
+    let taken: Vec<_> = handle
+        .entries()
+        .direction(dir)
+        .stream()
+        .take(k)
+        .try_collect()
+        .await?;
     assert_eq!(
         taken.len(),
         k.min(n),
@@ -199,15 +198,13 @@ pub(super) async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direct
         resolves.clone(),
     );
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
-    let taken: Vec<_> = {
-        let stream = handle.values().direction(dir).stream().take(k);
-        futures::pin_mut!(stream);
-        let mut out = Vec::new();
-        while let Some(item) = stream.next().await {
-            out.push(item.map_err(|e| eyre!("stream: {e}"))?);
-        }
-        out
-    };
+    let taken: Vec<_> = handle
+        .values()
+        .direction(dir)
+        .stream()
+        .take(k)
+        .try_collect()
+        .await?;
     assert_eq!(
         taken.len(),
         k.min(n),

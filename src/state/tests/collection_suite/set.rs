@@ -65,7 +65,7 @@ async fn run_set_trace(
                             StateName::try_new("st")?,
                         );
                         let store = MemoryCellStore::new(backing.cells.clone());
-                        let stored = CellRead::<Values>::read(&store, &id, &keyset_cell())
+                        let stored = CellRead::<Values>::read(&store, &id, keyset_cell().as_ref())
                             .await?
                             .0
                             .into_inner();

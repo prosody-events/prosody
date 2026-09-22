@@ -21,6 +21,7 @@ use super::cell_key::{CellKey, Coordinate, Scan, Section};
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::{EventMarker, MarkerState, SectionClear};
 use crate::error::ClassifyError;
+use crate::state::cell_key::CellRef;
 use bytes::Bytes;
 use futures::Stream;
 use std::error::Error;
@@ -32,7 +33,9 @@ pub(crate) use super::store_helpers::{
     sorted_unique_coordinates,
 };
 pub(crate) use super::store_types::CELL_BATCH;
-pub use super::store_types::{CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch, Durable};
+pub use super::store_types::{
+    CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch, Durable, ReadBatch,
+};
 
 /// Sizes the fetches of one read. The first fetch equals the caller's
 /// expectation, capped at the transport maximum. Each later fetch doubles,
@@ -77,7 +80,7 @@ pub trait CellRead<P: Projection>: CellBackend {
     fn read<'a>(
         &'a self,
         collection: &'a CollectionId,
-        cell: &'a CellKey,
+        cell: CellRef<'a>,
     ) -> impl Future<Output = Result<Durable<P>, Self::Error>> + Send + use<'a, Self, P>;
 
     /// Reads one section's coordinates in input order.
@@ -86,21 +89,22 @@ pub trait CellRead<P: Projection>: CellBackend {
     /// coordinates share one read. Unique coordinates resolve in
     /// first-occurrence order. The earliest affected position supplies the
     /// error. A backend can fail the whole batch before row resolution.
-    fn read_many<'a>(
+    fn read_many<'buf, 'a>(
         &'a self,
         collection: &'a CollectionId,
         section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CacheBatch<P>, Self::Error>> + Send + use<'a, Self, P> {
+        batch: &'a ReadBatch<'buf>,
+    ) -> impl Future<Output = Result<CacheBatch<P>, Self::Error>> + Send + use<'buf, 'a, Self, P>
+    {
         async move {
             let (coordinates, indices) = dedupe(batch);
             let mut answers = CacheBatch::<P>::with_capacity(coordinates.len());
-            for coordinate in coordinates {
-                let cell = CellKey {
+            for &coordinate in &coordinates {
+                let cell = CellRef {
                     section,
-                    coordinate: Coordinate::clone(coordinate),
+                    coordinate,
                 };
-                answers.push(self.read(collection, &cell).await?);
+                answers.push(self.read(collection, cell).await?);
             }
             Ok(expand_to_input_order(&indices, &answers))
         }

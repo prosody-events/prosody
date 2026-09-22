@@ -173,7 +173,7 @@ pub(super) async fn deque_no_committed_orphans(
     id: &CollectionId,
     span: usize,
 ) -> Result<bool> {
-    let Some(bounds) = CellRead::<Values>::read(store, id, &deque::meta_cell())
+    let Some(bounds) = CellRead::<Values>::read(store, id, deque::meta_cell().as_ref())
         .await?
         .0
         .into_inner()
@@ -185,11 +185,15 @@ pub(super) async fn deque_no_committed_orphans(
     for i in 0..span as i64 {
         let outside = i < head || i >= tail;
         if outside
-            && CellRead::<Values>::read(store, id, &deque::entry_cell_for(&I64KeyCodec::encode(&i)))
-                .await?
-                .0
-                .into_inner()
-                .is_some()
+            && CellRead::<Values>::read(
+                store,
+                id,
+                (deque::entry_cell_for(&I64KeyCodec::encode(&i))).as_ref(),
+            )
+            .await?
+            .0
+            .into_inner()
+            .is_some()
         {
             return Ok(false); // a committed orphan outside the converged window
         }

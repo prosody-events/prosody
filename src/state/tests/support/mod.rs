@@ -10,7 +10,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
 use crate::state::cell::{Committed, Presence, Projection, ProvisionalCell, ProvisionalWrite};
-use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
+use crate::state::cell_key::{CellKey, CellRef, Coordinate, Scan, Section};
 use crate::state::collection::{MutationJournal, StateSession, WritableStateSession, sealed};
 use crate::state::descriptor::{CellResolver, StructuralIdentity};
 use crate::state::marker::{AttemptId, EventEvidence, EventMarker, SectionClear};
@@ -21,7 +21,7 @@ use crate::state::registry::CollectionDef;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{Finalized, MessageMarker, OpPermit, SessionGate};
 use crate::state::store::{
-    CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable,
+    CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable, ReadBatch,
     provisional_point_loop,
 };
 use crate::state::{
@@ -170,21 +170,21 @@ where
         _inner: &'b mut Self::ReadInner<'c>,
         _state_type: StateType,
         _name: &'d StateName,
-        _cell: &'e CellKey,
+        _cell: CellRef<'e>,
     ) -> impl Future<Output = Result<Option<Q::Payload>, StateAccessError>> + use<'a, 'b, 'c, 'd, 'e, P, Q>
     {
         ready(Err(StateAccessError::Unavailable))
     }
 
-    fn read_batch<'a, 'b, 'c, 'd, 'e>(
+    fn read_batch<'buf, 'a, 'b, 'c, 'd, 'e>(
         _session: &'a UnavailableState<P>,
         _inner: &'b mut Self::ReadInner<'c>,
         _state_type: StateType,
         _name: &'d StateName,
         _section: Section,
-        _batch: &'e CoordinateBatch,
+        _batch: &'e ReadBatch<'buf>,
     ) -> impl Future<Output = Result<CellBuffer<Option<Q::Payload>>, StateAccessError>>
-    + use<'a, 'b, 'c, 'd, 'e, P, Q> {
+    + use<'buf, 'a, 'b, 'c, 'd, 'e, P, Q> {
         ready(Err(StateAccessError::Unavailable))
     }
 

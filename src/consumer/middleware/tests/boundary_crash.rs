@@ -19,8 +19,7 @@ use crate::state::session::MessageMarker;
 use crate::state::session::Promoted;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{EventSession, Finalized, TerminationWatch};
-use crate::state::store::CellRead;
-use crate::state::store::CellStore;
+use crate::state::store::{CellRead, CellStore};
 use crate::state::tests::support::seed_commit_evidence;
 use crate::state::{
     CollectionId, CollectionRef, EventRef, StateKey, StateName, StateType, TimerEventRef,
@@ -502,7 +501,7 @@ fn prop_boundary_permanent_rejection() {
                 "rejected state retained residue"
             );
             ensure!(
-                CellRead::<Values>::read(&raw, &collection, &value_cell())
+                CellRead::<Values>::read(&raw, &collection, value_cell().as_ref())
                     .await?
                     .0
                     .get()

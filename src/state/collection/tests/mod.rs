@@ -49,6 +49,7 @@ use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::iter::{empty, once};
+use std::pin::pin;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -704,16 +705,15 @@ fn cancelled_write_drops_the_journal_and_releases_admission() -> Result<()> {
         let before = staged_state(&dirty, &id)?;
 
         let parked = Notify::new();
-        let mut invocation = Box::pin(handle.cells.write(async |op| {
-            op.set(PairLayout::LEFT.at(&2), 77)?;
-            parked.notified().await;
-            Ok::<(), ProbeError>(())
-        }));
-        assert!(
-            futures::poll!(invocation.as_mut()).is_pending(),
-            "the invocation must park inside its scope"
-        );
-        drop(invocation);
+        let pending = {
+            let mut invocation = pin!(handle.cells.write(async |op| {
+                op.set(PairLayout::LEFT.at(&2), 77)?;
+                parked.notified().await;
+                Ok::<(), ProbeError>(())
+            }));
+            futures::poll!(invocation.as_mut()).is_pending()
+        };
+        assert!(pending, "the invocation must park inside its scope");
 
         assert_eq!(
             staged_state(&dirty, &id)?,

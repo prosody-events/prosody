@@ -25,15 +25,16 @@ use crate::codec::Codec;
 use crate::segment::partition_segment_id;
 use crate::state::access::StateAccessError;
 use crate::state::cell::Projection;
-use crate::state::cell_key::{CellKey, Scan, Section};
+use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::identity::{CollectionId, StateKey};
-use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store::{CellBuffer, ReadBatch};
 use crate::state_reader::backend::{CommittedCellSource, ReaderBackend};
-use crate::state_reader::cache::CacheKey;
+use crate::state_reader::cache::CacheLookup;
 use crate::state_reader::partition_for_key;
 use crate::state_reader::source::{Source, ValidatedPublications};
 use futures::stream::{FuturesOrdered, Stream, StreamExt};
 use smallvec::smallvec;
+use std::borrow::{Borrow, Cow};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -125,25 +126,25 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
 
     /// `selected` when the operation already routed this source, else a fresh
     /// routing through [`Self::collection_id_for`].
-    fn resolved_id(
+    fn resolved_id<'a>(
         &self,
-        selected: Option<&CollectionId>,
+        selected: Option<&'a CollectionId>,
         source: &Source,
-    ) -> Result<CollectionId, StateAccessError> {
+    ) -> Result<Cow<'a, CollectionId>, StateAccessError> {
         match selected {
-            Some(id) => Ok(id.clone()),
-            None => self.collection_id_for(source),
+            Some(id) => Ok(Cow::Borrowed(id)),
+            None => self.collection_id_for(source).map(Cow::Owned),
         }
     }
 
-    fn cache_key(&self, source: &Source, cell: &CellKey) -> CacheKey {
-        (
-            source.clone(),
+    fn cache_key<'a>(&'a self, source: &'a Source, cell: CellRef<'a>) -> CacheLookup<'a> {
+        CacheLookup((
+            source,
             self.context.state_type,
-            self.context.name.clone(),
-            self.key.clone(),
-            cell.clone(),
-        )
+            &self.context.name,
+            &self.key,
+            cell,
+        ))
     }
 
     /// One source's committed point read, cached per policy. `selected` is the
@@ -153,7 +154,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         &self,
         selected: Option<&CollectionId>,
         source: &Source,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Result<Option<P::Payload>, StateAccessError>
     where
         B::Cells: CommittedCellSource<P>,
@@ -190,7 +191,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         selected: Option<&CollectionId>,
         source: &Source,
         section: Section,
-        batch: &CoordinateBatch,
+        batch: &ReadBatch<'_>,
     ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
     where
         B::Cells: CommittedCellSource<P>,
@@ -223,7 +224,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                 // miss), never when the batch is served entirely from the cache.
                 self.context
                     .cache
-                    .get_many_cached::<P, _, _>(&keys, ttl, || async {
+                    .get_many_cached::<P, _, _>(keys, ttl, || async {
                         let id = self.resolved_id(selected, source)?;
                         CommittedCellSource::<P>::load_many(
                             self.context.backend.cells(),
@@ -239,29 +240,22 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         }
     }
 
-    /// Builds one bounded batch of cache keys.
-    ///
-    /// A stream chunk can exceed `CELLS_INLINE`, so this buffer can spill to
-    /// the heap. The allocation is sized once and bounded by the batch.
-    /// Increasing `CELLS_INLINE` would inflate every `CellBuffer` instead.
-    fn batch_cache_keys(
-        &self,
-        source: &Source,
+    /// Borrows cache keys from a bounded coordinate batch.
+    fn batch_cache_keys<'a, 'buf>(
+        &'a self,
+        source: &'a Source,
         section: Section,
-        batch: &CoordinateBatch,
-    ) -> CellBuffer<CacheKey> {
-        batch
-            .iter()
-            .map(|coordinate| {
-                self.cache_key(
-                    source,
-                    &CellKey {
-                        section,
-                        coordinate: coordinate.clone(),
-                    },
-                )
-            })
-            .collect()
+        batch: &'a ReadBatch<'buf>,
+    ) -> impl ExactSizeIterator<Item = CacheLookup<'a>> + Clone + use<'a, 'buf, C, B> {
+        batch.iter().map(move |coordinate| {
+            self.cache_key(
+                source,
+                CellRef {
+                    section,
+                    coordinate,
+                },
+            )
+        })
     }
 
     /// One operation's committed point read: address the already-selected
@@ -269,7 +263,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     async fn point_read<P: Projection>(
         &self,
         selection: &mut Option<PinnedSource>,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Result<Option<P::Payload>, StateAccessError>
     where
         B::Cells: CommittedCellSource<P>,
@@ -286,7 +280,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     async fn probe_point<P: Projection>(
         &self,
         selection: &mut Option<PinnedSource>,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Result<Option<P::Payload>, StateAccessError>
     where
         B::Cells: CommittedCellSource<P>,
@@ -306,7 +300,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         &self,
         selection: &mut Option<PinnedSource>,
         section: Section,
-        batch: &CoordinateBatch,
+        batch: &ReadBatch<'_>,
     ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
     where
         B::Cells: CommittedCellSource<P>,
@@ -324,7 +318,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         &self,
         selection: &mut Option<PinnedSource>,
         section: Section,
-        batch: &CoordinateBatch,
+        batch: &ReadBatch<'_>,
     ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
     where
         B::Cells: CommittedCellSource<P>,
@@ -380,16 +374,16 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     }
 
     /// Streams one source's committed cells under the projection.
-    fn source_scan<'a, P: Projection>(
+    fn source_scan<'a, P: Projection, I: Borrow<CollectionId> + Send>(
         &'a self,
-        id: CollectionId,
+        id: I,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + use<'a, C, B, P>
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + use<'a, C, B, P, I>
     where
         B::Cells: CommittedCellSource<P>,
     {
         async_stream::try_stream! {
-            let inner = CommittedCellSource::<P>::scan(self.context.backend.cells(), &id, scan);
+            let inner = CommittedCellSource::<P>::scan(self.context.backend.cells(), id.borrow(), scan);
             futures::pin_mut!(inner);
             while let Some(item) = cooperative(inner.next()).await {
                 yield item.map_err(|error| StateAccessError::store(&error))?;
@@ -412,7 +406,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     {
         async_stream::try_stream! {
             if let Some(pin) = selected.or_else(|| self.pin.get()) {
-                let inner = self.source_scan::<P>(pin.collection.clone(), scan);
+                let inner = self.source_scan::<P, _>(&pin.collection, scan);
                 futures::pin_mut!(inner);
                 while let Some(item) = cooperative(inner.next()).await {
                     yield item?;
@@ -426,7 +420,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                 |source| async move {
                     let id = self.collection_id_for(source)?;
                     // Like resolve_probe nodes, stream boxes are bounded by MAX_PUBLICATION_SOURCES per operation, not per cell.
-                    let mut stream = Box::pin(self.source_scan::<P>(id, scan));
+                    let mut stream = Box::pin(self.source_scan::<P, _>(id, scan));
                     let first = cooperative(stream.next()).await.transpose()?;
                     Ok(first.map(|row| (row, stream)))
                 },

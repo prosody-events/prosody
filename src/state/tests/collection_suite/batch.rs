@@ -98,15 +98,15 @@ pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Res
         };
         let session1 = make_session(&cells, &dedup, &registry, &state_key, ev1);
         let handle1 = descriptor.bind(&session1).map_err(|e| eyre!("bind: {e}"))?;
-        batch = Box::pin(handle1.get_many(&input.queries)).await?;
-        presence = Box::pin(handle1.contains_many(&input.queries)).await?;
+        batch = handle1.get_many(&input.queries).await?;
+        presence = handle1.contains_many(&input.queries).await?;
         for q in &input.queries {
             point.push(handle1.get(q).await?);
             point_presence.push(handle1.contains_key(q).await?);
         }
     } else {
-        batch = Box::pin(handle0.get_many(&input.queries)).await?;
-        presence = Box::pin(handle0.contains_many(&input.queries)).await?;
+        batch = handle0.get_many(&input.queries).await?;
+        presence = handle0.contains_many(&input.queries).await?;
         for q in &input.queries {
             point.push(handle0.get(q).await?);
             point_presence.push(handle0.contains_key(q).await?);

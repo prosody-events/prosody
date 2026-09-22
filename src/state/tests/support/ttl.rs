@@ -1,6 +1,7 @@
 //! Fixed-TTL cell store used by cache metadata tests.
 
 use super::*;
+use crate::state::cell_key::CellRef;
 use crate::state::marker::MarkerState;
 use std::future::ready;
 
@@ -24,7 +25,7 @@ impl<P: Projection> CellRead<P> for TtlStub {
     fn read<'a>(
         &'a self,
         _collection: &'a CollectionId,
-        _cell: &'a CellKey,
+        _cell: CellRef<'a>,
     ) -> impl Future<Output = Result<Durable<P>, Self::Error>> + Send + use<'a, P> {
         ready(Ok((
             Committed::new(Some(P::from_value(self.value.clone()))),

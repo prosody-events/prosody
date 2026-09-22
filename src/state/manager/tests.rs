@@ -132,7 +132,7 @@ async fn legacy_and_timer_residue(value: u8, mode: u8) -> Result<bool> {
         value.wrapping_add(1)
     });
     ensure!(
-        CellRead::<Values>::read(&store, collection.id(), &value_cell())
+        CellRead::<Values>::read(&store, collection.id(), value_cell().as_ref())
             .await?
             .0
             .get()
@@ -266,7 +266,7 @@ async fn legacy_deregistration(value: u8) -> Result<()> {
     dedup.insert(dedup_id).await?;
     ensure!(admit_registered(&store, &dedup, &collections).await? == Admission::Fresh);
     ensure!(
-        CellRead::<Values>::read(&store, collections[1].id(), &value_cell())
+        CellRead::<Values>::read(&store, collections[1].id(), value_cell().as_ref())
             .await?
             .0
             .get()

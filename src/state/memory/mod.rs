@@ -9,6 +9,8 @@ use super::store::{
     expand_to_input_order, provisional_point_loop,
 };
 use super::{CollectionId, CollectionRef};
+use crate::state::cell_key::CellRef;
+use crate::state::store::ReadBatch;
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::Stream;
@@ -42,7 +44,7 @@ impl MemoryCellStore {
 
     /// Returns the raw cell through [`MemoryCells::read_committed_cell`].
     /// A missing row represents committed absence.
-    fn read_raw(&self, collection: &CollectionId, cell: &CellKey) -> Cell {
+    fn read_raw(&self, collection: &CollectionId, cell: CellRef<'_>) -> Cell {
         self.cells.read_committed_cell(collection, cell)
     }
 
@@ -116,7 +118,7 @@ impl<P: Projection> CellRead<P> for MemoryCellStore {
     async fn read<'a>(
         &'a self,
         collection: &'a CollectionId,
-        cell: &'a CellKey,
+        cell: CellRef<'a>,
     ) -> Result<Durable<P>, Self::Error> {
         let committed = EvidenceLookup::new(self, collection)
             .resolve(self.read_raw(collection, cell))
@@ -131,17 +133,17 @@ impl<P: Projection> CellRead<P> for MemoryCellStore {
         &'a self,
         collection: &'a CollectionId,
         section: Section,
-        batch: &'a CoordinateBatch,
+        batch: &'a ReadBatch<'_>,
     ) -> Result<CacheBatch<P>, Self::Error> {
         let (coordinates, indices) = dedupe(batch);
         let mut answers = CacheBatch::<P>::with_capacity(coordinates.len());
         let mut lookup = EvidenceLookup::new(self, collection);
-        for coordinate in coordinates {
-            let cell = CellKey {
+        for &coordinate in &coordinates {
+            let cell = CellRef {
                 section,
-                coordinate: coordinate.clone(),
+                coordinate,
             };
-            let committed = cooperative(lookup.resolve(self.read_raw(collection, &cell))).await?;
+            let committed = cooperative(lookup.resolve(self.read_raw(collection, cell))).await?;
             answers.push((
                 Committed::new(committed.into_inner().map(P::from_value)),
                 None,
@@ -190,7 +192,7 @@ impl CellStore for MemoryCellStore {
         collection: &'a CollectionId,
         cell: &'a CellKey,
     ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + use<'a> {
-        ready(Ok(match self.read_raw(collection, cell) {
+        ready(Ok(match self.read_raw(collection, cell.as_ref()) {
             Cell::Provisional(provisional) => Some(provisional),
             Cell::Resolved(_) => None,
         }))

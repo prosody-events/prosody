@@ -238,7 +238,7 @@ macro_rules! cassandra_reader_prop {
                         key: &key,
                         count: PartitionCount::MIN,
                     };
-                    Box::pin($runner(backend, $descriptor_ctor($name), &case, trace)).await
+                    $runner(backend, $descriptor_ctor($name), &case, trace).await
                 })
             }
             let cases = integration_test_count(25);

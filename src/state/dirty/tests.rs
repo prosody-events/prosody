@@ -25,13 +25,13 @@ fn lookup_after_remove_returns_none_without_spinning() -> Result<()> {
         coordinate: Coordinate::empty(),
     };
     store.set(&c, &cell, b"x");
-    assert!(store.lookup(&c, &cell).is_some());
+    assert!(store.lookup(&c, cell.as_ref()).is_some());
     store.remove_collection(&c);
-    assert!(store.lookup(&c, &cell).is_none());
+    assert!(store.lookup(&c, cell.as_ref()).is_none());
     // Re-set after the drain must be visible again (no stale tombstone).
     store.set(&c, &cell, b"y");
     assert_eq!(
-        store.lookup(&c, &cell),
+        store.lookup(&c, cell.as_ref()),
         Some(DirtyVal::Set(Bytes::from_static(b"y")))
     );
     Ok(())
@@ -411,7 +411,8 @@ fn dirty_matches(
                     return Ok(false);
                 }
                 for x in 0..OP_COORDS {
-                    if store.lookup(id, &pool_cell(s, x)) != model.cells.get(&(k, c, s, x)).cloned()
+                    if store.lookup(id, pool_cell(s, x).as_ref())
+                        != model.cells.get(&(k, c, s, x)).cloned()
                     {
                         return Ok(false);
                     }

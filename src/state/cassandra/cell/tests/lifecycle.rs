@@ -34,7 +34,9 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
 
     store.mark_resolved(&c, slice::from_ref(&cell)).await?;
     assert_eq!(
-        CellRead::<Values>::read(&store, c.id(), &cell).await?.0,
+        CellRead::<Values>::read(&store, c.id(), cell.as_ref())
+            .await?
+            .0,
         Committed::new(Some(data))
     );
     assert!(provisional_cells(&store, c.id()).await?.is_empty());
@@ -43,7 +45,9 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
         .write_resolved(&c, &[(cell.clone(), None)], &[])
         .await?;
     assert_eq!(
-        CellRead::<Values>::read(&store, c.id(), &cell).await?.0,
+        CellRead::<Values>::read(&store, c.id(), cell.as_ref())
+            .await?
+            .0,
         Committed::new(None)
     );
     Ok(())
@@ -90,7 +94,9 @@ async fn committed_clear_deletes_the_row() -> Result<()> {
         .await?;
 
     assert_eq!(
-        CellRead::<Values>::read(&store, c.id(), &cell).await?.0,
+        CellRead::<Values>::read(&store, c.id(), cell.as_ref())
+            .await?
+            .0,
         Committed::new(None)
     );
 

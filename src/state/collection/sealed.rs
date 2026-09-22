@@ -15,10 +15,10 @@
 use super::MutationJournal;
 use crate::state::StateAccessError;
 use crate::state::cell::{Presence, Projection, Values};
-use crate::state::cell_key::{CellKey, Scan, Section};
+use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::registry::CollectionDef;
-use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store::{CellBuffer, ReadBatch};
 use crate::state::{StateName, StateType, StoreOutcome};
 use futures::Stream;
 use std::future::Future;
@@ -109,22 +109,22 @@ pub trait Reads<S: ?Sized, P: Projection>: ReadEngine<S> {
         inner: &'b mut Self::ReadInner<'c>,
         state_type: StateType,
         name: &'d StateName,
-        cell: &'e CellKey,
+        cell: CellRef<'e>,
     ) -> impl Future<Output = Result<Option<P::Payload>, StateAccessError>>
     + Send
     + use<'a, 'b, 'c, 'd, 'e, Self, S, P>;
 
     /// Reads an aligned batch and updates the invocation state.
-    fn read_batch<'a, 'b, 'c, 'd, 'e>(
+    fn read_batch<'buf, 'a, 'b, 'c, 'd, 'e>(
         session: &'a S,
         inner: &'b mut Self::ReadInner<'c>,
         state_type: StateType,
         name: &'d StateName,
         section: Section,
-        batch: &'e CoordinateBatch,
+        batch: &'e ReadBatch<'buf>,
     ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, StateAccessError>>
     + Send
-    + use<'a, 'b, 'c, 'd, 'e, Self, S, P>;
+    + use<'buf, 'a, 'b, 'c, 'd, 'e, Self, S, P>;
 
     /// Pages a durable range under a captured plan without the gate. This is
     /// the range driver's only lower hop and the one command that cannot

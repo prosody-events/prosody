@@ -5,6 +5,7 @@
 //! absence.
 
 use crate::state::cell::{Presence, Projection, Values};
+use crate::state::cell_key::CellRef;
 use crate::state::store::{CellBackend, CellRead, Durable};
 
 use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
@@ -583,7 +584,7 @@ where
         let mut cell_writes: Vec<(CellKey, ProvisionalWrite)> = Vec::with_capacity(cells.len());
         for &((s, c), mutation) in cells {
             let key = cell_in(s, c);
-            let prev = CellRead::<Values>::read(store, refs[*coll as usize].id(), &key)
+            let prev = CellRead::<Values>::read(store, refs[*coll as usize].id(), key.as_ref())
                 .await?
                 .0;
             if !stale_prev_ok[*coll as usize]
@@ -769,7 +770,9 @@ where
     // Stage a clears-FREE marker; the commit is deliberately NOT recorded (a
     // clears-free marker is never consulted, so the verdict is irrelevant).
     let staged = cell_in(0, 0);
-    let prev = CellRead::<Values>::read(&store, id, &staged).await?.0;
+    let prev = CellRead::<Values>::read(&store, id, staged.as_ref())
+        .await?
+        .0;
     let writes = vec![(
         staged.clone(),
         ProvisionalWrite::new(Some(bytes(1)), prev, event_a),
@@ -803,7 +806,7 @@ where
     // (clear resolution leaves clears-free markers unsettled too — parity with
     // reads).
     ensure!(
-        CellRead::<Values>::read(&store, id, &blind)
+        CellRead::<Values>::read(&store, id, blind.as_ref())
             .await?
             .0
             .into_inner()
@@ -892,7 +895,9 @@ where
         let mut cell_writes: Vec<(CellKey, ProvisionalWrite)> = Vec::with_capacity(cells.len());
         for &(coord, mutation) in &cells {
             let key = cell_at(coord);
-            let prev = CellRead::<Values>::read(&store, &ids[slot], &key).await?.0;
+            let prev = CellRead::<Values>::read(&store, &ids[slot], key.as_ref())
+                .await?
+                .0;
             if prev.get().cloned() != model[slot].get(&coord).cloned().flatten() {
                 return Ok(false);
             }
@@ -922,7 +927,7 @@ where
     for (i, id) in ids.iter().enumerate() {
         admit_collection(&store, &dedup, &refs[i]).await?;
         for (&coord, value) in &model[i] {
-            if CellRead::<Values>::read(&store, id, &cell_at(coord))
+            if CellRead::<Values>::read(&store, id, cell_at(coord).as_ref())
                 .await?
                 .0
                 .into_inner()
@@ -1137,7 +1142,7 @@ where
         for s in 0..SECTIONS.len() as u8 {
             for c in 0..CELLS {
                 if overlay
-                    .get::<Values>(&id, &cell_in(s, c))
+                    .get::<Values>(&id, cell_in(s, c).as_ref())
                     .await?
                     .into_inner()
                     != model.visible(s, c)
@@ -1156,10 +1161,10 @@ where
             // `CELLS ≥ 1` makes the iterator non-empty, so `next()` is `Some`.
             let batch = batch_of((0..CELLS).chain(iter::once(0)))?;
             let got = overlay
-                .get_many::<Values>(&id, SECTIONS[s as usize], &batch)
+                .get_many::<Values>(&id, SECTIONS[s as usize], &batch.as_ref())
                 .await?;
             let presence = overlay
-                .get_many::<Presence>(&id, SECTIONS[s as usize], &batch)
+                .get_many::<Presence>(&id, SECTIONS[s as usize], &batch.as_ref())
                 .await?;
             if presence_of(&presence) != presence_of(&got) {
                 return Ok(false);
@@ -1212,7 +1217,9 @@ pub(crate) async fn run_overlay_precedence_pin<S: CellStore>(
     overlay.dirty().clear_section(&id, SECTIONS[0]);
     overlay.dirty().set(&id, &cell_in(0, 5), &bytes(7));
     let batch = batch_of([5, 5])?;
-    let got = overlay.get_many::<Values>(&id, SECTIONS[0], &batch).await?;
+    let got = overlay
+        .get_many::<Values>(&id, SECTIONS[0], &batch.as_ref())
+        .await?;
     assert_eq!(got.len(), 2, "every input position is answered");
     assert_eq!(
         got[0].clone().into_inner(),
@@ -1848,7 +1855,9 @@ where
         return Ok(false);
     }
     for &(s, c) in keys {
-        let committed = CellRead::<Values>::read(store, id, &cell_in(s, c)).await?.0;
+        let committed = CellRead::<Values>::read(store, id, cell_in(s, c).as_ref())
+            .await?
+            .0;
         if committed.into_inner() != expected.get(&(s, c)).cloned() {
             return Ok(false);
         }
@@ -1963,9 +1972,9 @@ impl<S> FailingCellStore<S> {
         }
     }
 
-    fn injected_read(&self, cell: &CellKey) -> Option<ErrorCategory> {
+    fn injected_read(&self, cell: CellRef<'_>) -> Option<ErrorCategory> {
         match &*self.poison.lock() {
-            Some(Poison::Read(targets)) => targets.get(&coord_of(cell)).copied(),
+            Some(Poison::Read(targets)) => targets.get(&cell.coordinate[0]).copied(),
             _ => None,
         }
     }
@@ -2008,7 +2017,7 @@ impl<S: CellRead<P>, P: Projection> CellRead<P> for FailingCellStore<S> {
     async fn read<'a>(
         &'a self,
         collection: &'a CollectionId,
-        cell: &'a CellKey,
+        cell: CellRef<'a>,
     ) -> Result<Durable<P>, Self::Error> {
         {
             if let Some(category) = self.injected_read(cell) {
@@ -2247,7 +2256,7 @@ async fn seed_batch<S: CellStore>(
     if !provisional.is_empty() {
         let mut writes = Vec::with_capacity(provisional.len());
         for (cell, data) in provisional {
-            let prev = CellRead::<Values>::read(store, collection.id(), cell)
+            let prev = CellRead::<Values>::read(store, collection.id(), cell.as_ref())
                 .await?
                 .0;
             writes.push((
@@ -2305,9 +2314,13 @@ pub(crate) async fn run_batch_read_parity_trace<S: CellStore>(
     let mut expected: Vec<Committed> = Vec::with_capacity(trace.reads.len());
     for &b in &trace.reads {
         expected.push(
-            CellRead::<Values>::read(&store, expected_coll.id(), &cell_in(trace.read_section, b))
-                .await?
-                .0,
+            CellRead::<Values>::read(
+                &store,
+                expected_coll.id(),
+                cell_in(trace.read_section, b).as_ref(),
+            )
+            .await?
+            .0,
         );
     }
     let coords = trace.reads.iter().map(|&b| Coordinate::from_bytes(vec![b]));
@@ -2315,7 +2328,7 @@ pub(crate) async fn run_batch_read_parity_trace<S: CellStore>(
     let mut presence = Vec::with_capacity(trace.reads.len());
     for batch in CoordinateBatch::chunks(coords) {
         got.extend(
-            CellRead::<Values>::read_many(&store, batch_coll.id(), section, &batch)
+            CellRead::<Values>::read_many(&store, batch_coll.id(), section, &batch.as_ref())
                 .await
                 .map(|cells| {
                     cells
@@ -2325,7 +2338,7 @@ pub(crate) async fn run_batch_read_parity_trace<S: CellStore>(
                 })?,
         );
         presence.extend(
-            CellRead::<Presence>::read_many(&store, presence_coll.id(), section, &batch)
+            CellRead::<Presence>::read_many(&store, presence_coll.id(), section, &batch.as_ref())
                 .await
                 .map(|cells| {
                     cells
@@ -2363,7 +2376,7 @@ pub(crate) async fn run_batch_duplicate_co_observation<S: CellStore>(store: S) -
         )
         .await?;
     let batch = batch_of([5, 9, 5])?;
-    let got = CellRead::<Values>::read_many(&store, &id, SECTIONS[0], &batch)
+    let got = CellRead::<Values>::read_many(&store, &id, SECTIONS[0], &batch.as_ref())
         .await
         .map(|cells| {
             cells
@@ -2417,7 +2430,7 @@ pub(crate) async fn run_batch_alignment<S: CellStore>(store: S) -> Result<()> {
     let mut expected: Vec<Committed> = Vec::with_capacity(read_bytes.len());
     for &b in &read_bytes {
         expected.push(
-            CellRead::<Values>::read(&store, &id, &cell_in(0, b))
+            CellRead::<Values>::read(&store, &id, cell_in(0, b).as_ref())
                 .await?
                 .0,
         );
@@ -2426,7 +2439,7 @@ pub(crate) async fn run_batch_alignment<S: CellStore>(store: S) -> Result<()> {
     let mut got: Vec<Committed> = Vec::new();
     for batch in CoordinateBatch::chunks(coords) {
         got.extend(
-            CellRead::<Values>::read_many(&store, &id, SECTIONS[0], &batch)
+            CellRead::<Values>::read_many(&store, &id, SECTIONS[0], &batch.as_ref())
                 .await
                 .map(|cells| {
                     cells
@@ -2819,7 +2832,7 @@ async fn stage_clock_crash<S: CellStore>(
     for (slot, expiry) in cell_expiry.iter().enumerate() {
         let expected = (committed && *expiry > now).then(|| bytes(slot as u8));
         ensure!(
-            CellRead::<Values>::read(store, collection.id(), &writes[slot].0)
+            CellRead::<Values>::read(store, collection.id(), (writes[slot].0).as_ref())
                 .await?
                 .0
                 .get()
@@ -2848,7 +2861,7 @@ async fn assert_crash_state<S: CellStore, P: ShapeProbe>(
                     .get(&(section, coordinate))
                     .and_then(Option::as_ref);
                 ensure!(
-                    CellRead::<Values>::read(store, id, &cell_in(section, coordinate))
+                    CellRead::<Values>::read(store, id, cell_in(section, coordinate).as_ref())
                         .await?
                         .0
                         .get()

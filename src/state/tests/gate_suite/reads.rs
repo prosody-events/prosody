@@ -180,7 +180,7 @@ pub(super) fn map_get_many_holds_gate_across_sub_batches() -> Result<()> {
         let reader = tokio::spawn({
             let map = map.clone();
             let keys = keys.clone();
-            async move { Box::pin(map.get_many(&keys)).await }
+            async move { map.get_many(&keys).await }
         });
         timeout(HANG_GUARD, fx.holds.read().entered())
             .await

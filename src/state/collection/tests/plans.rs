@@ -376,7 +376,8 @@ async fn get_many_resolves_full_window_concurrently() -> Result<()> {
 
     let keys: Vec<i64> = (0..n as i64).collect();
     let collector = async {
-        Box::pin(cells.read(async |op| op.get_many(GatedLayout::CELLS, &keys).await))
+        cells
+            .read(async |op| op.get_many(GatedLayout::CELLS, &keys).await)
             .await
             .map_err(|e| eyre!("get_many: {e}"))
     };

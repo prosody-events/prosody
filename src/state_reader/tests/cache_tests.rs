@@ -20,7 +20,7 @@ use crate::state::cell::{Presence, Values};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::store::CellBuffer;
 use crate::state::{StateName, StateType};
-use crate::state_reader::cache::CacheKey;
+use crate::state_reader::cache::{CacheKey, CacheLookup};
 use crate::state_reader::{PartitionCount, source::SourceId};
 use bytes::Bytes;
 use color_eyre::eyre::Result;
@@ -59,6 +59,10 @@ fn key_at(
 }
 
 /// A cache key for the given collection name and one fixed cell.
+fn lookup(key: &CacheKey) -> CacheLookup<'_> {
+    CacheLookup((&key.0, key.1, &key.2, &key.3, key.4.as_ref()))
+}
+
 fn key(name: &str) -> Result<CacheKey> {
     key_at(StateType::Application, name, 1, vec![0])
 }
@@ -236,10 +240,14 @@ async fn run_cache_schedule(schedule: CacheSchedule) -> Result<bool> {
                 let expected: CellBuffer<_> =
                     indices.iter().map(|key| model[key].1.clone()).collect();
                 let served = cache
-                    .get_many_cached::<Values, _, _>(&batch, CACHE_TTL, || async {
-                        fills.fetch_add(1, Ordering::Relaxed);
-                        Ok(filled)
-                    })
+                    .get_many_cached::<Values, _, _>(
+                        batch.iter().map(lookup),
+                        CACHE_TTL,
+                        || async {
+                            fills.fetch_add(1, Ordering::Relaxed);
+                            Ok(filled)
+                        },
+                    )
                     .await?;
                 assert_eq!(served, expected);
                 assert_eq!(fills.load(Ordering::Relaxed), expected_fills);
@@ -261,7 +269,7 @@ async fn run_cache_schedule(schedule: CacheSchedule) -> Result<bool> {
 
                 let counter = fills.clone();
                 let served = cache
-                    .get_cached::<Values, _, _>(keys[key as usize].clone(), CACHE_TTL, move || {
+                    .get_cached::<Values, _, _>(lookup(&keys[key as usize]), CACHE_TTL, move || {
                         let counter = counter.clone();
                         let filled = filled.clone();
                         async move {
@@ -310,7 +318,7 @@ async fn slow_fill_cannot_launder() -> Result<()> {
 
     // Issued at t=0, completes at t=10s; the fill serves its own result.
     let got = cache
-        .get_cached::<Values, _, _>(k.clone(), ttl, fill)
+        .get_cached::<Values, _, _>(lookup(&k), ttl, fill)
         .await?;
     assert_eq!(got, Some(Bytes::from_static(b"v")));
     assert_eq!(fills.load(Ordering::Relaxed), 1);
@@ -318,7 +326,7 @@ async fn slow_fill_cannot_launder() -> Result<()> {
     // A later reader at t=10s: age 10s >= ttl → miss → refill. The refill
     // advances the clock again, which only ages it further.
     cache
-        .get_cached::<Values, _, _>(k.clone(), ttl, fill)
+        .get_cached::<Values, _, _>(lookup(&k), ttl, fill)
         .await?;
     assert_eq!(
         fills.load(Ordering::Relaxed),
@@ -328,17 +336,17 @@ async fn slow_fill_cannot_launder() -> Result<()> {
     // The value-only schedule cannot represent a failed upgrade of presence.
     let k = key("failed-upgrade")?;
     cache
-        .get_cached::<Presence, _, _>(k.clone(), ttl, || async { Ok(Some(())) })
+        .get_cached::<Presence, _, _>(lookup(&k), ttl, || async { Ok(Some(())) })
         .await?;
     let failed = cache
-        .get_cached::<Values, _, _>(k.clone(), ttl, || async {
+        .get_cached::<Values, _, _>(lookup(&k), ttl, || async {
             Err(StateAccessError::Terminated)
         })
         .await;
     assert!(matches!(failed, Err(StateAccessError::Terminated)));
     let before = fills.load(Ordering::Relaxed);
     let presence = cache
-        .get_cached::<Presence, _, _>(k, ttl, || async {
+        .get_cached::<Presence, _, _>(lookup(&k), ttl, || async {
             fills.fetch_add(1, Ordering::Relaxed);
             Ok(None)
         })
@@ -367,8 +375,8 @@ async fn cold_miss_is_single_flight() -> Result<()> {
 
     let ttl = Duration::from_secs(1);
     let (a, b) = tokio::join!(
-        cache.get_cached::<Values, _, _>(k.clone(), ttl, fill),
-        cache.get_cached::<Values, _, _>(k.clone(), ttl, fill),
+        cache.get_cached::<Values, _, _>(lookup(&k), ttl, fill),
+        cache.get_cached::<Values, _, _>(lookup(&k), ttl, fill),
     );
     assert_eq!(a?, Some(Bytes::from_static(b"v")));
     assert_eq!(b?, Some(Bytes::from_static(b"v")));
@@ -380,7 +388,7 @@ async fn cold_miss_is_single_flight() -> Result<()> {
 
     let k = key("single-flight-upgrade")?;
     cache
-        .get_cached::<Presence, _, _>(k.clone(), ttl, || async { Ok(Some(())) })
+        .get_cached::<Presence, _, _>(lookup(&k), ttl, || async { Ok(Some(())) })
         .await?;
     let before = fills.load(Ordering::Relaxed);
     let upgrade = || async {
@@ -389,8 +397,8 @@ async fn cold_miss_is_single_flight() -> Result<()> {
         Ok::<_, StateAccessError>(Some(Bytes::from_static(b"v")))
     };
     let (a, b) = tokio::join!(
-        cache.get_cached::<Values, _, _>(k.clone(), ttl, upgrade),
-        cache.get_cached::<Values, _, _>(k, ttl, upgrade),
+        cache.get_cached::<Values, _, _>(lookup(&k), ttl, upgrade),
+        cache.get_cached::<Values, _, _>(lookup(&k), ttl, upgrade),
     );
     assert_eq!(a?, Some(Bytes::from_static(b"v")));
     assert_eq!(b?, Some(Bytes::from_static(b"v")));
@@ -431,7 +439,7 @@ async fn get_many_cached_shortcuts_when_all_fresh() -> Result<()> {
     let value_done = Notify::new();
     let values = async {
         let result = cache
-            .get_many_cached::<Values, _, _>(&keys, ttl, || async {
+            .get_many_cached::<Values, _, _>(keys.iter().map(lookup), ttl, || async {
                 mock.increment(Duration::from_nanos(1));
                 presence_started.notified().await;
                 fill().await
@@ -440,11 +448,12 @@ async fn get_many_cached_shortcuts_when_all_fresh() -> Result<()> {
         value_done.notify_one();
         result
     };
-    let presence = cache.get_many_cached::<Presence, _, _>(&keys, ttl, || async {
-        presence_started.notify_one();
-        value_done.notified().await;
-        Ok(smallvec![Some(()), Some(())])
-    });
+    let presence =
+        cache.get_many_cached::<Presence, _, _>(keys.iter().map(lookup), ttl, || async {
+            presence_started.notify_one();
+            value_done.notified().await;
+            Ok(smallvec![Some(()), Some(())])
+        });
     let (values, presence) = tokio::join!(biased; values, presence);
     values?;
     assert_eq!(presence?.as_slice(), [Some(()), Some(())]);
@@ -452,7 +461,7 @@ async fn get_many_cached_shortcuts_when_all_fresh() -> Result<()> {
 
     // Both entries remain fresh. The cache answers without a fill.
     let served = cache
-        .get_many_cached::<Values, _, _>(&keys, ttl, fill)
+        .get_many_cached::<Values, _, _>(keys.iter().map(lookup), ttl, fill)
         .await?;
     let expected: CellBuffer<Option<Bytes>> = smallvec![
         Some(Bytes::from_static(b"a")),
@@ -469,7 +478,7 @@ async fn get_many_cached_shortcuts_when_all_fresh() -> Result<()> {
     // exactly one whole-batch refill fires (a single fill, not one per key).
     mock.increment(ttl);
     cache
-        .get_many_cached::<Values, _, _>(&keys, ttl, fill)
+        .get_many_cached::<Values, _, _>(keys.iter().map(lookup), ttl, fill)
         .await?;
     assert_eq!(
         fills.load(Ordering::Relaxed),
@@ -494,7 +503,7 @@ async fn declared_weight_bounded_by_budget() -> Result<()> {
         )?;
         let value = value.clone();
         cache
-            .get_cached::<Values, _, _>(k, Duration::from_secs(1000), || {
+            .get_cached::<Values, _, _>(lookup(&k), Duration::from_secs(1000), || {
                 let value = value.clone();
                 async move { Ok::<_, StateAccessError>(Some(value)) }
             })

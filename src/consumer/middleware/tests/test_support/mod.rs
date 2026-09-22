@@ -163,7 +163,7 @@ pub async fn committed_value(
     cell_store: &MemoryCellStore,
     id: &CollectionId,
 ) -> color_eyre::Result<Option<Bytes>> {
-    CellRead::<Values>::read(cell_store, id, &value_cell())
+    CellRead::<Values>::read(cell_store, id, value_cell().as_ref())
         .await
         .map(|(committed, _)| committed)
         .map(Committed::into_inner)

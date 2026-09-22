@@ -2,9 +2,9 @@
 
 use super::*;
 use crate::state::cell::Values;
+use crate::state::cell_key::CellRef;
 use crate::state::marker::MarkerState;
-use crate::state::store::CellRead;
-use crate::state::store::CommittedBatch;
+use crate::state::store::{CellRead, CommittedBatch, ReadBatch};
 use futures::StreamExt;
 use std::num::NonZeroUsize;
 
@@ -183,7 +183,7 @@ impl<S: CellRead<P>, P: CountProjection> CellRead<P> for CountingCellStore<S> {
     async fn read<'a>(
         &'a self,
         collection: &'a CollectionId,
-        cell: &'a CellKey,
+        cell: CellRef<'a>,
     ) -> Result<Durable<P>, Self::Error> {
         {
             P::point(&self.counts).fetch_add(1, Ordering::Relaxed);
@@ -212,7 +212,7 @@ impl<S: CellRead<P>, P: CountProjection> CellRead<P> for CountingCellStore<S> {
         &'a self,
         collection: &'a CollectionId,
         section: Section,
-        batch: &'a CoordinateBatch,
+        batch: &'a ReadBatch<'_>,
     ) -> Result<CacheBatch<P>, Self::Error> {
         P::batch(&self.counts).fetch_add(1, Ordering::Relaxed);
         self.counts.batch_widths.lock().push(batch.len());
@@ -364,14 +364,14 @@ mod tests {
         };
 
         store.reset();
-        CellRead::<Values>::read(&store, &id, &cell).await?;
+        CellRead::<Values>::read(&store, &id, cell.as_ref()).await?;
         assert_eq!(store.visible_point_reads(), 1);
         assert_eq!(store.batch_reads(), 0);
         assert_eq!(store.raw_point_reads(), 0);
 
         store.reset();
         let batch = batch_of([0])?;
-        CellRead::<Values>::read_many(&store, &id, Section::new(0), &batch)
+        CellRead::<Values>::read_many(&store, &id, Section::new(0), &batch.as_ref())
             .await
             .map(|cells| {
                 cells

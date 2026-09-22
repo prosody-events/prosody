@@ -40,7 +40,7 @@ pub(super) fn deque_meta_cell_bytes_are_frozen() -> Result<()> {
         StateName::try_new("dq")?,
     );
     let Some(bytes) = block_on(async {
-        CellRead::<Values>::read(&store, &id, &meta_cell())
+        CellRead::<Values>::read(&store, &id, meta_cell().as_ref())
             .await
             .map(|(committed, _)| committed)
     })?
@@ -111,7 +111,7 @@ pub(super) fn deque_clear_resets_the_index_space() -> Result<()> {
 
     let store = MemoryCellStore::new(cells.clone());
     let Some(bytes) = block_on(async {
-        CellRead::<Values>::read(&store, id, &meta_cell())
+        CellRead::<Values>::read(&store, id, meta_cell().as_ref())
             .await
             .map(|(committed, _)| committed)
     })?
@@ -130,7 +130,7 @@ pub(super) fn deque_clear_resets_the_index_space() -> Result<()> {
     let stale = entry_cell_for(&I64KeyCodec::encode(&1));
     assert_eq!(
         block_on(async {
-            CellRead::<Values>::read(&store, id, &stale)
+            CellRead::<Values>::read(&store, id, stale.as_ref())
                 .await
                 .map(|(committed, _)| committed)
         })?
@@ -141,7 +141,7 @@ pub(super) fn deque_clear_resets_the_index_space() -> Result<()> {
     let reused = entry_cell_for(&I64KeyCodec::encode(&0));
     assert_eq!(
         block_on(async {
-            CellRead::<Values>::read(&store, id, &reused)
+            CellRead::<Values>::read(&store, id, reused.as_ref())
                 .await
                 .map(|(committed, _)| committed)
         })?
@@ -265,7 +265,7 @@ pub(super) fn deque_push_on_an_over_wide_window_succeeds() -> Result<()> {
         })?;
 
         let Some(bounds) = block_on(async {
-            CellRead::<Values>::read(&store, id, &meta_cell())
+            CellRead::<Values>::read(&store, id, meta_cell().as_ref())
                 .await
                 .map(|(committed, _)| committed)
         })?

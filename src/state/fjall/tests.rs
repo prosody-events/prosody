@@ -49,9 +49,14 @@ fn prop_fjall_present_cell_is_uniquely_owned() {
         let c = fresh_collection("uniq")?;
         let cell = value_cell();
         store
-            .put::<Values>(&c, &cell, Committed::new(Some(Bytes::from(payload))), 0)
+            .put::<Values>(
+                &c,
+                cell.as_ref(),
+                Committed::new(Some(Bytes::from(payload))),
+                0,
+            )
             .await?;
-        let CacheRead::Hit((committed, _)) = store.get::<Values>(&c, &cell).await? else {
+        let CacheRead::Hit((committed, _)) = store.get::<Values>(&c, cell.as_ref()).await? else {
             return Err(eyre!("expected a cache hit"));
         };
         let Some(bytes) = committed.into_inner() else {
@@ -95,12 +100,12 @@ fn stored_cells_are_raw_tagged_payload_with_expiry() -> Result<()> {
     let cache = FjallCellCache::new(database, cache_partition.clone(), index_partition);
     TEST_RUNTIME.block_on(cache.put::<Values>(
         &c,
-        &cell,
+        cell.as_ref(),
         Committed::new(Some(Bytes::copy_from_slice(payload))),
         EXPIRY,
     ))?;
     let cache_raw = cache_partition
-        .get(cell_key(&c, &cell))?
+        .get(cell_key(&c, cell.as_ref()))?
         .ok_or_else(|| eyre!("cache cell missing"))?;
     assert_eq!(
         cache_raw.as_ref(),
@@ -126,24 +131,35 @@ fn expired_entry_reads_as_miss() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         // Stamp an entry that expires at 2_000ms.
         cache
-            .put::<Values>(&c, &cell, payload.clone(), 2_000)
+            .put::<Values>(&c, cell.as_ref(), payload.clone(), 2_000)
             .await?;
         // Before expiry: a hit.
         assert!(
-            matches!(cache.get::<Values>(&c, &cell).await?, CacheRead::Hit(_)),
+            matches!(
+                cache.get::<Values>(&c, cell.as_ref()).await?,
+                CacheRead::Hit(_)
+            ),
             "live entry must hit"
         );
         // At/after expiry: reported Expired (an entry exists, floor-expired).
         now.store(2_000, Ordering::Relaxed);
         assert!(
-            matches!(cache.get::<Values>(&c, &cell).await?, CacheRead::Expired),
+            matches!(
+                cache.get::<Values>(&c, cell.as_ref()).await?,
+                CacheRead::Expired
+            ),
             "expired entry must read as Expired"
         );
         // A `never` (0) expiry never expires, even far in the future.
-        cache.put::<Values>(&c, &cell, payload.clone(), 0).await?;
+        cache
+            .put::<Values>(&c, cell.as_ref(), payload.clone(), 0)
+            .await?;
         now.store(u64::MAX, Ordering::Relaxed);
         assert!(
-            matches!(cache.get::<Values>(&c, &cell).await?, CacheRead::Hit(_)),
+            matches!(
+                cache.get::<Values>(&c, cell.as_ref()).await?,
+                CacheRead::Hit(_)
+            ),
             "a never-expiry entry must always hit"
         );
         Ok::<_, Report>(())
@@ -169,12 +185,17 @@ fn get_batch_probes_the_whole_batch_in_one_blocking_hop() -> Result<()> {
         // identical payloads would false-pass a reorder bug.
         for b in 0..u8::try_from(CELL_BATCH.get()).unwrap_or(u8::MAX) {
             cache
-                .put::<Values>(&c, &batch_cell(b), Committed::new(Some(bytes(b))), 0)
+                .put::<Values>(
+                    &c,
+                    batch_cell(b).as_ref(),
+                    Committed::new(Some(bytes(b))),
+                    0,
+                )
                 .await?;
         }
         let batch = batch_of(0..u8::try_from(CELL_BATCH.get()).unwrap_or(u8::MAX))?;
         let hits = cache
-            .get_batch::<Values>(&c, Section::new(0), &batch)
+            .get_batch::<Values>(&c, Section::new(0), &batch.as_ref())
             .await?;
         assert_eq!(hits.len(), CELL_BATCH.get(), "every position answered");
         for (i, hit) in hits.iter().enumerate() {
@@ -209,14 +230,18 @@ fn get_batch_classifies_hits_misses_expiry_and_errors() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         // (1) Two present coordinates with DISTINCT payloads: an all-hit batch,
         // each position index-aligned to its own coordinate's value.
-        cache
-            .put::<Values>(&c, &batch_cell(0), Committed::new(Some(bytes(0))), 0)
-            .await?;
-        cache
-            .put::<Values>(&c, &batch_cell(1), Committed::new(Some(bytes(1))), 0)
-            .await?;
+        for index in [0, 1] {
+            cache
+                .put::<Values>(
+                    &c,
+                    batch_cell(index).as_ref(),
+                    Committed::new(Some(bytes(index))),
+                    0,
+                )
+                .await?;
+        }
         let hits = cache
-            .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 1])?)
+            .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 1])?.as_ref())
             .await?;
         assert_eq!(hits.len(), 2, "both positions answered");
         for (i, hit) in hits.iter().enumerate() {
@@ -227,13 +252,14 @@ fn get_batch_classifies_hits_misses_expiry_and_errors() -> Result<()> {
         }
 
         cache
-            .put::<Presence>(&c, &batch_cell(5), Committed::new(Some(())), 3_000)
+            .put::<Presence>(&c, batch_cell(5).as_ref(), Committed::new(Some(())), 3_000)
             .await?;
         assert!(matches!(
-            cache.get::<Values>(&c, &batch_cell(5)).await?,
+            cache.get::<Values>(&c, batch_cell(5).as_ref()).await?,
             CacheRead::Miss
         ));
-        let CacheRead::Hit((presence, ttl)) = cache.get::<Presence>(&c, &batch_cell(5)).await?
+        let CacheRead::Hit((presence, ttl)) =
+            cache.get::<Presence>(&c, batch_cell(5).as_ref()).await?
         else {
             return Err(eyre!("presence frame must answer presence"));
         };
@@ -241,7 +267,7 @@ fn get_batch_classifies_hits_misses_expiry_and_errors() -> Result<()> {
         assert_eq!(ttl, Some(CompactDuration::new(2)));
         assert_eq!(cache.stored_expiry(&c, &batch_cell(5)).await?, Some(3_000));
         let hits = cache
-            .get_batch::<Presence>(&c, Section::new(0), &batch_of([0, 5])?)
+            .get_batch::<Presence>(&c, Section::new(0), &batch_of([0, 5])?.as_ref())
             .await?;
         assert!(
             hits.iter().all(
@@ -252,7 +278,7 @@ fn get_batch_classifies_hits_misses_expiry_and_errors() -> Result<()> {
         // (2) A coordinate that was never put: the batch misses.
         assert!(
             cache
-                .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 2])?)
+                .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 2])?.as_ref())
                 .await?
                 .iter()
                 .any(|hit| matches!(hit, CacheRead::Miss)),
@@ -261,11 +287,11 @@ fn get_batch_classifies_hits_misses_expiry_and_errors() -> Result<()> {
 
         // (3) A floor-expired entry (stamped at 500, clock at 1_000): refetch.
         cache
-            .put::<Values>(&c, &batch_cell(3), present.clone(), 500)
+            .put::<Values>(&c, batch_cell(3).as_ref(), present.clone(), 500)
             .await?;
         assert!(
             cache
-                .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 3])?)
+                .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 3])?.as_ref())
                 .await?
                 .iter()
                 .any(|hit| matches!(hit, CacheRead::Expired)),
@@ -276,7 +302,7 @@ fn get_batch_classifies_hits_misses_expiry_and_errors() -> Result<()> {
         cache.fail_reads().store(true, Ordering::Relaxed);
         assert!(
             cache
-                .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 1])?)
+                .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 1])?.as_ref())
                 .await
                 .is_err(),
             "an engine read fault degrades the batch to Err"
@@ -287,11 +313,11 @@ fn get_batch_classifies_hits_misses_expiry_and_errors() -> Result<()> {
 
         now.store(3_000, Ordering::Relaxed);
         assert!(matches!(
-            cache.get::<Values>(&c, &batch_cell(5)).await?,
+            cache.get::<Values>(&c, batch_cell(5).as_ref()).await?,
             CacheRead::Expired
         ));
         let probes = cache
-            .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 5])?)
+            .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 5])?.as_ref())
             .await?;
         assert!(matches!(
             probes.as_slice(),
@@ -307,13 +333,13 @@ async fn check_corrupt_repair(cache: &FjallCellCache, c: &CollectionId) -> Resul
     cache
         .inner
         .handle()
-        .insert(cell_key(c, &batch_cell(4)).as_slice(), [0x05; 9])?;
+        .insert(cell_key(c, batch_cell(4).as_ref()).as_slice(), [0x05; 9])?;
     assert!(matches!(
-        cache.get::<Values>(c, &batch_cell(4)).await?,
+        cache.get::<Values>(c, batch_cell(4).as_ref()).await?,
         CacheRead::Corrupt
     ));
     let probes = cache
-        .get_batch::<Values>(c, Section::new(0), &batch_of([0, 4, 2, 3])?)
+        .get_batch::<Values>(c, Section::new(0), &batch_of([0, 4, 2, 3])?.as_ref())
         .await?;
     assert!(matches!(
         probes.as_slice(),
@@ -326,22 +352,23 @@ async fn check_corrupt_repair(cache: &FjallCellCache, c: &CollectionId) -> Resul
     ));
 
     let cached = Cached::new(cache.clone(), MemoryCellStore::new(MemoryCells::new()));
-    CellRead::<Values>::read(&cached, c, &batch_cell(4)).await?;
+    CellRead::<Values>::read(&cached, c, batch_cell(4).as_ref()).await?;
     assert!(matches!(
-        cache.get::<Values>(c, &batch_cell(4)).await?,
+        cache.get::<Values>(c, batch_cell(4).as_ref()).await?,
         CacheRead::Hit((value, _)) if value.get().is_none()
     ));
     cache
         .inner
         .handle()
-        .insert(cell_key(c, &batch_cell(4)).as_slice(), [0x05; 9])?;
-    CellRead::<Presence>::read_many(&cached, c, Section::new(0), &batch_of([0, 4])?).await?;
+        .insert(cell_key(c, batch_cell(4).as_ref()).as_slice(), [0x05; 9])?;
+    CellRead::<Presence>::read_many(&cached, c, Section::new(0), &batch_of([0, 4])?.as_ref())
+        .await?;
     assert!(matches!(
-        cache.get::<Values>(c, &batch_cell(4)).await?,
+        cache.get::<Values>(c, batch_cell(4).as_ref()).await?,
         CacheRead::Hit((value, _)) if value.get().is_none()
     ));
     assert!(matches!(
-        cache.get::<Values>(c, &batch_cell(0)).await?,
+        cache.get::<Values>(c, batch_cell(0).as_ref()).await?,
         CacheRead::Hit((value, _)) if value.get() == Some(&bytes(0))
     ));
 
@@ -372,14 +399,14 @@ fn delete_section_hops_delete_exactly_the_section() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         for i in 0..total {
             cache
-                .put::<Values>(&c, &cell_in(0, i), payload.clone(), 0)
+                .put::<Values>(&c, cell_in(0, i).as_ref(), payload.clone(), 0)
                 .await?;
         }
         cache
-            .put::<Values>(&c, &cell_in(1, 7), payload.clone(), 0)
+            .put::<Values>(&c, cell_in(1, 7).as_ref(), payload.clone(), 0)
             .await?;
         cache
-            .put::<Values>(&other, &cell_in(0, 7), payload.clone(), 0)
+            .put::<Values>(&other, cell_in(0, 7).as_ref(), payload.clone(), 0)
             .await?;
 
         // Exclude two survivors, one in each hop region.
@@ -388,7 +415,7 @@ fn delete_section_hops_delete_exactly_the_section() -> Result<()> {
 
         for i in 0..total {
             let hit = matches!(
-                cache.get::<Values>(&c, &cell_in(0, i)).await?,
+                cache.get::<Values>(&c, cell_in(0, i).as_ref()).await?,
                 CacheRead::Hit(_)
             );
             let survives = excluded.iter().any(|cell| *cell == cell_in(0, i));
@@ -399,14 +426,14 @@ fn delete_section_hops_delete_exactly_the_section() -> Result<()> {
         }
         assert!(
             matches!(
-                cache.get::<Values>(&c, &cell_in(1, 7)).await?,
+                cache.get::<Values>(&c, cell_in(1, 7).as_ref()).await?,
                 CacheRead::Hit(_)
             ),
             "the sibling section survives"
         );
         assert!(
             matches!(
-                cache.get::<Values>(&other, &cell_in(0, 7)).await?,
+                cache.get::<Values>(&other, cell_in(0, 7).as_ref()).await?,
                 CacheRead::Hit(_)
             ),
             "the sibling collection survives"

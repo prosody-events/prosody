@@ -1,6 +1,7 @@
 //! Deterministic response gates for state-store concurrency tests.
 
 use super::*;
+use crate::state::cell_key::CellRef;
 use crate::state::marker::MarkerState;
 
 #[derive(Clone)]
@@ -91,7 +92,7 @@ impl<S: CellRead<P>, P: Projection> CellRead<P> for HoldingCellStore<S> {
     async fn read<'a>(
         &'a self,
         collection: &'a CollectionId,
-        cell: &'a CellKey,
+        cell: CellRef<'a>,
     ) -> Result<Durable<P>, Self::Error> {
         self.holds
             .read

@@ -214,7 +214,7 @@ async fn run_probe_and_pin(script: FaultScript) -> Result<bool> {
     }
 
     let reader = env.reader_eager()?;
-    Box::pin(assert_probe(&reader, &key, selection(&script))).await
+    assert_probe(&reader, &key, selection(&script)).await
 }
 
 /// The concrete deque reader the probe property drives.
@@ -226,11 +226,8 @@ async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> 
     match selection {
         Selection::Pinned { idx, len } => {
             let expected: Vec<Value> = (0..len).map(|j| element(idx, j)).collect();
-            let forward = Box::pin(collect_stream(reader.values(key.clone()).stream())).await?;
-            let backward = Box::pin(collect_stream(
-                reader.values(key.clone()).reverse().stream(),
-            ))
-            .await?;
+            let forward = collect_stream(reader.values(key.clone()).stream()).await?;
+            let backward = collect_stream(reader.values(key.clone()).reverse().stream()).await?;
             Ok(reader.len(key.clone()).await? == len
                 && reader.get(key.clone(), 0).await? == Some(element(idx, 0))
                 && reader.get(key.clone(), len).await?.is_none()
@@ -251,7 +248,7 @@ async fn assert_probe(reader: &DequeReader, key: &Key, selection: Selection) -> 
         }
         Selection::EmptyOnly => Ok(reader.len(key.clone()).await? == 0
             && reader.get(key.clone(), 0).await?.is_none()
-            && Box::pin(collect_stream(reader.values(key.clone()).stream()))
+            && collect_stream(reader.values(key.clone()).stream())
                 .await?
                 .is_empty()),
     }
@@ -318,7 +315,7 @@ async fn assert_set_probe(reader: &SetReader, key: &Key, selection: Selection) -
             let expected: Vec<String> = (0..len).map(|j| member(idx, j)).collect();
             Ok(!reader.is_empty(key.clone()).await?
                 && reader.contains(key.clone(), &member(idx, 0)).await?
-                && Box::pin(collect_stream(keys)).await? == expected)
+                && collect_stream(keys).await? == expected)
         }
         Selection::ErrOnly => {
             // No data through a failed source: absence is not provable, so the
@@ -336,7 +333,7 @@ async fn assert_set_probe(reader: &SetReader, key: &Key, selection: Selection) -
         }
         Selection::EmptyOnly => Ok(reader.is_empty(key.clone()).await?
             && !reader.contains(key.clone(), &member(0, 0)).await?
-            && Box::pin(collect_stream(keys)).await?.is_empty()),
+            && collect_stream(keys).await?.is_empty()),
     }
 }
 

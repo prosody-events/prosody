@@ -39,6 +39,7 @@ use super::CELLS_INLINE;
 use super::cell_key::{CellKey, Section};
 use super::identity::{CollectionId, StateName, StateType};
 use crate::Key;
+use crate::state::cell_key::CellRef;
 use bytes::Bytes;
 use scc::Guard;
 use smallvec::SmallVec;
@@ -199,9 +200,9 @@ impl DirtyStore {
     ///
     /// [`Overlay`]: crate::state::overlay::Overlay
     #[must_use]
-    pub fn lookup(&self, collection: &CollectionId, cell: &CellKey) -> Option<DirtyVal> {
+    pub fn lookup(&self, collection: &CollectionId, cell: CellRef<'_>) -> Option<DirtyVal> {
         self.entries
-            .peek_with(&dirty_key(collection, cell), |_, value| value.clone())
+            .peek_with(&DirtyRef(collection, cell), |_, value| value.clone())
     }
 
     /// Returns owned dirty cells from one collection section in coordinate
@@ -374,6 +375,27 @@ where
     drop(guard);
     for key in &doomed {
         tree.remove_sync(key);
+    }
+}
+
+/// A borrowed tree lookup with the same ordering as `DirtyKey`.
+struct DirtyRef<'a>(&'a CollectionId, CellRef<'a>);
+
+impl scc::Equivalent<DirtyKey> for DirtyRef<'_> {
+    fn equivalent(&self, key: &DirtyKey) -> bool {
+        scc::Comparable::compare(self, key) == Ordering::Equal
+    }
+}
+
+impl scc::Comparable<DirtyKey> for DirtyRef<'_> {
+    fn compare(&self, key: &DirtyKey) -> Ordering {
+        (
+            &self.0.state_key().key,
+            self.0.state_type(),
+            self.0.name(),
+            self.1,
+        )
+            .cmp(&(&key.key, key.state_type, &key.name, key.cell.as_ref()))
     }
 }
 

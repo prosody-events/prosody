@@ -20,6 +20,7 @@ use super::event_ref::EventRef;
 use super::identity::{StateName, StateType, StateTypeError};
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::cell_key::CellRef;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use std::str::from_utf8;
@@ -121,14 +122,21 @@ impl ReaderEvidence {
         })
     }
 
-    pub(crate) fn survives(&self, cell: &CellKey) -> bool {
+    pub(crate) fn survives(&self, cell: CellRef<'_>) -> bool {
         self.state.staged.as_ref().is_none_or(|marker| {
             !self.committed(marker.event())
                 || marker
                     .clears()
                     .iter()
                     .filter(|clear| clear.section() == cell.section)
-                    .all(|clear| clear.survivors().binary_search(&cell.coordinate).is_ok())
+                    .all(|clear| {
+                        clear
+                            .survivors()
+                            .binary_search_by(|coordinate| {
+                                coordinate.as_bytes().cmp(cell.coordinate)
+                            })
+                            .is_ok()
+                    })
         })
     }
 }

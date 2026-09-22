@@ -37,6 +37,8 @@
 //! Read fills use the remaining durable TTL. All stamps round down to whole
 //! seconds.
 
+use crate::state::cell_key::CellRef;
+use crate::state::store::ReadBatch;
 pub(crate) mod metrics;
 
 use self::metrics::{CacheResult, CellMetrics, Source};
@@ -148,7 +150,7 @@ impl<L> Cached<L> {
         // instead of N.
         let projected = cells
             .iter()
-            .map(|(cell, value)| (cell.clone(), project(value), expiry));
+            .map(|(cell, value)| (cell.as_ref(), project(value), expiry));
         if let Err(error) = self
             .fjall
             .put_batch::<Values>(collection.id(), projected)
@@ -192,7 +194,7 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
     async fn read<'a>(
         &'a self,
         collection: &'a CollectionId,
-        cell: &'a CellKey,
+        cell: CellRef<'a>,
     ) -> Result<Durable<P>, Self::Error> {
         let started = Instant::now();
         if self.fjall.is_disabled() {
@@ -259,7 +261,7 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
         &'a self,
         collection: &'a CollectionId,
         section: Section,
-        batch: &'a CoordinateBatch,
+        batch: &'a ReadBatch<'_>,
     ) -> Result<CacheBatch<P>, Self::Error> {
         let started = Instant::now();
         if self.fjall.is_disabled() {
@@ -323,9 +325,9 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
                 .filter(|(i, _)| !matches!(probes.get(*i), Some(CacheRead::Hit(_))))
                 .map(|(_, (coordinate, (committed, remaining)))| {
                     (
-                        CellKey {
+                        CellRef {
                             section,
-                            coordinate: coordinate.clone(),
+                            coordinate,
                         },
                         committed.clone(),
                         expiry_at(stamped_at, *remaining),

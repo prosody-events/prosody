@@ -9,7 +9,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
 use crate::state::cell::Projection;
-use crate::state::cell_key::{CellKey, Scan, Section};
+use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::descriptor::StateDescriptor;
 use crate::state::descriptor_identity::{
     DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
@@ -20,7 +20,7 @@ use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::publication::StatePublication;
 use crate::state::registry::CollectionDef;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store::{CellBuffer, ReadBatch};
 use crate::state::tests::support::ScriptedPublicationStore;
 use crate::state::{StateName, StateType};
 use crate::state_reader::backend::{ReaderComponents, ScriptedReaderBackend};
@@ -170,7 +170,7 @@ impl ScriptedCellSource {
     pub(crate) fn read_committed(
         &self,
         id: &CollectionId,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Result<Option<Bytes>, StateAccessError> {
         let segment = id.state_key().segment_id;
         self.record_read(segment);
@@ -184,7 +184,7 @@ impl ScriptedCellSource {
         &self,
         id: &CollectionId,
         section: Section,
-        batch: &CoordinateBatch,
+        batch: &ReadBatch<'_>,
     ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError> {
         let segment = id.state_key().segment_id;
         self.record_read(segment);

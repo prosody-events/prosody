@@ -158,8 +158,8 @@ pub(super) fn dedupe_uniques_and_plan() -> Result<()> {
     let batch = CoordinateBatch::chunks(bytes_in.iter().map(|&b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    let (uniques, plan) = dedupe(&batch);
-    let unique_bytes: Vec<u8> = uniques.iter().map(|c| c.as_bytes()[0]).collect();
+    let (uniques, plan) = dedupe(&batch.as_ref());
+    let unique_bytes: Vec<u8> = uniques.iter().map(|c| c[0]).collect();
     assert_eq!(
         unique_bytes,
         vec![5, 9, 2],
@@ -334,7 +334,7 @@ pub(super) fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
 
         // Resolved cells return the committed value directly.
         assert_eq!(
-            CellRead::<Values>::read(&store, &id, &cell_in(0, 7))
+            CellRead::<Values>::read(&store, &id, cell_in(0, 7).as_ref())
                 .await
                 .map(|(committed, _)| committed)
                 .map_err(|e| eyre!("get s0: {e}"))?,
@@ -342,7 +342,7 @@ pub(super) fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
             "the section-0 survivor commits at (0, 7)"
         );
         assert_eq!(
-            CellRead::<Values>::read(&store, &id, &cell_in(1, 7))
+            CellRead::<Values>::read(&store, &id, cell_in(1, 7).as_ref())
                 .await
                 .map(|(committed, _)| committed)
                 .map_err(|e| eyre!("get s1: {e}"))?,

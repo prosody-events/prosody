@@ -1,12 +1,12 @@
 //! Typed commands available within collection admission.
 
 use super::{CellAddress, CellFamily, CollectionLayout, StateSession};
+use crate::state::StateName;
 use crate::state::descriptor::{
     BorrowedKeyOf, CellCodecError, CellStateError, CellType, ContextOf, FromSession, ResolvedOf,
     WriteOf,
 };
 use crate::state::store::CellBuffer;
-use crate::state::{StateAccessError, StateName};
 use std::future::Future;
 use std::num::NonZeroUsize;
 
@@ -99,7 +99,9 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
         &'op mut self,
         family: CellFamily<Self::Layout, T>,
         keys: I,
-    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send + use<'a, 'op, Self, T, I>
+    ) -> impl Future<Output = Result<CellBuffer<bool>, CellStateError<CellCodecError<T>>>>
+    + Send
+    + use<'a, 'op, Self, T, I>
     where
         T: CellType,
         I: IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>;
@@ -115,7 +117,7 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
         &'a mut self,
         family: CellFamily<Self::Layout, T>,
         key: &BorrowedKeyOf<T>,
-    ) -> impl Future<Output = Result<bool, StateAccessError>> + Send + use<'a, Self, T>;
+    ) -> impl Future<Output = Result<bool, CellStateError<CellCodecError<T>>>> + Send + use<'a, Self, T>;
 }
 
 /// The mutation commands, implemented only by the write operation.

@@ -30,13 +30,7 @@ fn prop_cassandra_cell_crash_equivalence() {
         let probe = CassandraShapeProbe {
             session: fx.cassandra.clone(),
         };
-        Box::pin(run_crash_equivalence_trace(
-            make,
-            dedup.clone(),
-            trace,
-            &probe,
-        ))
-        .await
+        run_crash_equivalence_trace(make, dedup.clone(), trace, &probe).await
     }
 
     init_test_logging();

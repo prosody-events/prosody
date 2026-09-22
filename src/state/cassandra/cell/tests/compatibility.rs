@@ -68,7 +68,7 @@ async fn legacy_null_null_residue_reads_committed_none() -> Result<()> {
         .await?;
 
     assert_eq!(
-        CellRead::<Values>::read(&store, id, &cell).await?.0,
+        CellRead::<Values>::read(&store, id, cell.as_ref()).await?.0,
         Committed::new(None),
         "the decoder must read the legacy residue as committed-absence"
     );
@@ -226,7 +226,7 @@ fn prop_cassandra_present_cell_is_uniquely_owned() {
         store
             .write_resolved(&c, &[(cell.clone(), Some(data))], &[])
             .await?;
-        let Some(bytes) = CellRead::<Values>::read(&store, c.id(), &cell)
+        let Some(bytes) = CellRead::<Values>::read(&store, c.id(), cell.as_ref())
             .await?
             .0
             .into_inner()

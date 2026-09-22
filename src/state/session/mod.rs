@@ -25,7 +25,7 @@ use crate::state::CommitDecision;
 use crate::state::access::StateAccessError;
 use crate::state::backend::AdmissionChecks;
 use crate::state::cell::{Committed, Projection, ProvisionalWrite, Values};
-use crate::state::cell_key::{CellKey, Scan, Section};
+use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::collection::{StateSession, WritableStateSession};
 use crate::state::descriptor::{
     DescriptorIdentity, Registered, SealedDescriptor, StateDescriptor, StructuralIdentity,
@@ -37,7 +37,9 @@ use crate::state::overlay::Overlay;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::resolve::resolve_event_marker;
 use crate::state::retry::{StepOutcome, retry_step};
-use crate::state::store::{CELL_BATCH, CellBuffer, CellRead, CellStore, CoordinateBatch};
+use crate::state::store::{
+    CELL_BATCH, CellBuffer, CellRead, CellStore, CoordinateBatch, ReadBatch,
+};
 use crate::state::{
     CollectionKindId, CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY,
     StateBackend, StateKey, StateName, StateType, StoreOutcome,
@@ -904,7 +906,7 @@ where
         &self,
         state_type: StateType,
         name: &StateName,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Result<Option<P::Payload>, StateAccessError>
     where
         B::Cell: CellRead<P>,
@@ -929,7 +931,7 @@ where
         state_type: StateType,
         name: &StateName,
         section: Section,
-        batch: &CoordinateBatch,
+        batch: &ReadBatch<'_>,
     ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
     where
         B::Cell: CellRead<P>,
@@ -1222,7 +1224,7 @@ where
         name: &StateName,
         cell: &CellKey,
     ) -> Result<Option<Bytes>, StateAccessError> {
-        self.get::<Values>(state_type, name, cell).await
+        self.get::<Values>(state_type, name, cell.as_ref()).await
     }
 }
 
@@ -1501,9 +1503,10 @@ where
                             batch,
                             records,
                         } = chunk;
-                        let bases = CellRead::<Values>::read_many(lower, id, section, &batch)
-                            .await
-                            .map_err(|e| StateAccessError::store(&e))?;
+                        let bases =
+                            CellRead::<Values>::read_many(lower, id, section, &batch.as_ref())
+                                .await
+                                .map_err(|e| StateAccessError::store(&e))?;
                         // `get_many`'s contract: bases.len() == batch.len()
                         // == records.len(). Pair this chunk's bases with
                         // EXACTLY its records BEFORE the fold flattens

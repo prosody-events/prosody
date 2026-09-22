@@ -1,14 +1,19 @@
 use super::cell::ProvisionalCell;
 use super::cell_key::{CellKey, Coordinate, Section};
 use super::identity::CollectionId;
-use super::store::{CellBuffer, CellStore, CoordinateBatch};
+use super::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, ReadBatch};
 use smallvec::SmallVec;
 
 /// Returns unique coordinates and each input coordinate's unique index.
-pub(crate) fn dedupe(batch: &CoordinateBatch) -> (CellBuffer<&Coordinate>, CellBuffer<usize>) {
-    let mut unique_coordinates: CellBuffer<&Coordinate> = SmallVec::with_capacity(batch.len());
-    let mut input_indices: CellBuffer<usize> = SmallVec::with_capacity(batch.len());
-    for coordinate in batch.iter() {
+pub(crate) fn dedupe<'a>(
+    batch: &ReadBatch<'a>,
+) -> (
+    SmallVec<[&'a [u8]; CELL_BATCH.get()]>,
+    SmallVec<[u8; CELL_BATCH.get()]>,
+) {
+    let mut unique_coordinates = SmallVec::new();
+    let mut input_indices = SmallVec::new();
+    for &coordinate in batch.iter() {
         let index = if let Some(index) = unique_coordinates
             .iter()
             .position(|unique| *unique == coordinate)
@@ -18,25 +23,25 @@ pub(crate) fn dedupe(batch: &CoordinateBatch) -> (CellBuffer<&Coordinate>, CellB
             unique_coordinates.push(coordinate);
             unique_coordinates.len() - 1
         };
-        input_indices.push(index);
+        input_indices.push(index as u8);
     }
     (unique_coordinates, input_indices)
 }
 
 /// Expands unique answers to the original input order.
 pub(crate) fn expand_to_input_order<T: Clone>(
-    input_indices: &[usize],
+    input_indices: &[u8],
     unique_answers: &[T],
 ) -> CellBuffer<T> {
     debug_assert!(
         input_indices
             .iter()
-            .all(|&index| index < unique_answers.len()),
+            .all(|&index| usize::from(index) < unique_answers.len()),
         "batch read must answer every input position"
     );
     input_indices
         .iter()
-        .map(|&index| unique_answers[index].clone())
+        .map(|&index| unique_answers[usize::from(index)].clone())
         .collect()
 }
 

@@ -72,7 +72,7 @@ pub(super) fn gate_serializes_racing_keyset_rmw() -> Result<()> {
 
         // The keyset is the UNION {1, 9}, not a last-wins singleton.
         let id = fx.id("m")?;
-        let keyset = CellRead::<Values>::read(&fx.counting, &id, &map::keyset_cell())
+        let keyset = CellRead::<Values>::read(&fx.counting, &id, map::keyset_cell().as_ref())
             .await?
             .0
             .into_inner()
@@ -174,7 +174,7 @@ pub(super) fn gate_overflows_keyset_at_the_limit() -> Result<()> {
         finalize_and_promote(&session, &fx.dedup, Uuid::from_u128(1), &fx.cells, &id).await?;
 
         // The serial second set exceeds the limit → Overflowed.
-        let keyset = CellRead::<Values>::read(&fx.counting, &id, &map::keyset_cell())
+        let keyset = CellRead::<Values>::read(&fx.counting, &id, map::keyset_cell().as_ref())
             .await?
             .0
             .into_inner()

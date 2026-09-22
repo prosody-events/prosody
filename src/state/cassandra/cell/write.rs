@@ -7,8 +7,6 @@ use super::{
 use crate::state::SHARD_FANOUT_CONCURRENCY;
 use crate::state::marker::MarkerRow;
 use futures::{StreamExt, TryStreamExt, stream};
-use smallvec::SmallVec;
-use std::ops::Range;
 
 pub(super) async fn write_provisional(
     store: &CassandraStore,
@@ -81,9 +79,8 @@ pub(super) async fn write_provisional(
         )
     }));
 
-    let chunks: SmallVec<[Range<usize>; 1]> =
-        super::batch::stage_batches(&marker, &units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS)
-            .collect();
+    let chunks =
+        super::batch::stage_batches(&marker, &units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS);
     stream::iter(chunks)
         .map(|range| {
             let rows = super::batch::stage_chunk(&marker, &units, range);

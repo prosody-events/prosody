@@ -21,11 +21,11 @@ use super::{PinnedSource, ReadSession};
 use crate::codec::Codec;
 use crate::state::access::StateAccessError;
 use crate::state::cell::Projection;
-use crate::state::cell_key::{CellKey, Scan, Section};
+use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::collection::{StateSession, sealed};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::registry::{CollectionDef, MAX_KEYSET_LIMIT};
-use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store::{CellBuffer, ReadBatch};
 use crate::state::{StateName, StateType};
 use crate::state_reader::backend::{CommittedCellSource, ReaderBackend};
 use futures::stream::Stream;
@@ -124,7 +124,7 @@ where
         inner: &mut Self::ReadInner<'_>,
         _state_type: StateType,
         _name: &StateName,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Result<Option<P::Payload>, StateAccessError> {
         let unselected = inner.is_none();
         let result = session.point_read::<P>(inner, cell).await;
@@ -140,7 +140,7 @@ where
         _state_type: StateType,
         _name: &StateName,
         section: Section,
-        batch: &CoordinateBatch,
+        batch: &ReadBatch<'_>,
     ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError> {
         let unselected = inner.is_none();
         let result = session.batch_read::<P>(inner, section, batch).await;

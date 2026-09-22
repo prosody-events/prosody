@@ -145,10 +145,9 @@ where
 
     /// Reads one value per input key, in input order. Duplicate keys retain
     /// their positions. One scoped operation prevents session mutations
-    /// between batch reads. Keys are addressed directly. A key outside the
-    /// tracked keyset reads `None`.
-    /// Result buffers reserve the iterator's lower size estimate and grow as
-    /// needed.
+    /// between batch reads. Reads address cells directly without a keyset
+    /// lookup. Result buffers reserve the iterator's lower size estimate
+    /// and grow as needed.
     ///
     /// # Errors
     ///

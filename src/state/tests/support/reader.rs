@@ -93,7 +93,7 @@ async fn check_residue<R: CommittedCellSource<Values> + CommittedCellSource<Pres
     let points = async {
         let matches = try_join_all(cells.iter().zip(expected).map(|(cell, expected)| async {
             Ok::<_, Report>(
-                CommittedCellSource::<Values>::load(source, id, cell).await? == *expected,
+                CommittedCellSource::<Values>::load(source, id, cell.as_ref()).await? == *expected,
             )
         }))
         .await?;
@@ -102,9 +102,10 @@ async fn check_residue<R: CommittedCellSource<Values> + CommittedCellSource<Pres
     let batches = async {
         let expected_presence = expected.each_ref().map(|value| value.as_ref().map(|_| ()));
         for batch in CoordinateBatch::chunks(cells.iter().map(|cell| cell.coordinate.clone())) {
+            let borrowed = batch.as_ref();
             let (values, presence) = join!(
-                CommittedCellSource::<Values>::load_many(source, id, section, &batch),
-                CommittedCellSource::<Presence>::load_many(source, id, section, &batch),
+                CommittedCellSource::<Values>::load_many(source, id, section, &borrowed),
+                CommittedCellSource::<Presence>::load_many(source, id, section, &borrowed),
             );
             let (values, presence) = (values?, presence?);
             if values.as_slice() != expected.as_slice() || presence.as_slice() != expected_presence

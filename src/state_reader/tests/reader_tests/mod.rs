@@ -173,12 +173,14 @@ async fn reader_reads_prev_in_commit_window() -> Result<()> {
         .next()
         .ok_or_else(|| eyre!("the test batch is empty"))?;
     let values =
-        CommittedCellSource::<Values>::load_many(&harness.cells, &id, section, &batch).await?;
-    let presence = CommittedCellSource::<Presence>::load_many(&harness.cells, &id, section, &batch)
-        .await?
-        .iter()
-        .map(Option::is_some)
-        .collect::<Vec<_>>();
+        CommittedCellSource::<Values>::load_many(&harness.cells, &id, section, &batch.as_ref())
+            .await?;
+    let presence =
+        CommittedCellSource::<Presence>::load_many(&harness.cells, &id, section, &batch.as_ref())
+            .await?
+            .iter()
+            .map(Option::is_some)
+            .collect::<Vec<_>>();
     let expected: Vec<bool> = values.into_iter().map(|value| value.is_some()).collect();
     assert_eq!(presence.as_slice(), expected);
     let scan = Scan {

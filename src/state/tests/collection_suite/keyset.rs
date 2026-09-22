@@ -43,7 +43,7 @@ pub(super) fn map_keyset_stays_tracked_under_ttl() -> Result<()> {
     })?;
     assert_eq!(
         block_on(async {
-            CellRead::<Values>::read(&store, id, &keyset_cell())
+            CellRead::<Values>::read(&store, id, keyset_cell().as_ref())
                 .await
                 .map(|(committed, _)| committed)
         })?
@@ -69,7 +69,7 @@ pub(super) fn map_keyset_stays_tracked_under_ttl() -> Result<()> {
     })?;
     assert_eq!(
         block_on(async {
-            CellRead::<Values>::read(&store, id, &keyset_cell())
+            CellRead::<Values>::read(&store, id, keyset_cell().as_ref())
                 .await
                 .map(|(committed, _)| committed)
         })?
@@ -140,7 +140,7 @@ pub(super) fn map_keyset_malformed_frame_degrades_and_heals() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
     let Some(bytes) = block_on(async {
-        CellRead::<Values>::read(&store, id, &keyset_cell())
+        CellRead::<Values>::read(&store, id, keyset_cell().as_ref())
             .await
             .map(|(committed, _)| committed)
     })?
@@ -221,7 +221,7 @@ pub(super) fn map_keyset_oversized_frame_collapses_before_fast_path() -> Result<
         Ok::<_, color_eyre::Report>(())
     })?;
     let Some(bytes) = block_on(async {
-        CellRead::<Values>::read(&store, id, &keyset_cell())
+        CellRead::<Values>::read(&store, id, keyset_cell().as_ref())
             .await
             .map(|(committed, _)| committed)
     })?
@@ -267,7 +267,7 @@ pub(super) fn map_keyset_byte_ceiling_overflows() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
     let Some(bytes) = block_on(async {
-        CellRead::<Values>::read(&store, id, &keyset_cell())
+        CellRead::<Values>::read(&store, id, keyset_cell().as_ref())
             .await
             .map(|(committed, _)| committed)
     })?

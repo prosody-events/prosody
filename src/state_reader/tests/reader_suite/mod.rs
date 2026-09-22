@@ -246,9 +246,9 @@ pub(super) async fn run_reader_map_trace<B: ReaderBackend>(
             index as u128,
             move |handle| async move { apply_map_ops::<B>(&handle, for_handle).await },
         );
-        Box::pin(commit).await?;
+        commit.await?;
         model_map_ops(&mut model, &staged);
-        if !Box::pin(assert_map(backend, descriptor, case, &model)).await? {
+        if !assert_map(backend, descriptor, case, &model).await? {
             return Ok(false);
         }
     }
@@ -398,9 +398,9 @@ pub(super) async fn run_reader_deque_trace<B: ReaderBackend>(
             index as u128,
             move |handle| async move { apply_deque_ops::<B>(&handle, for_handle).await },
         );
-        Box::pin(commit).await?;
+        commit.await?;
         model_deque_ops(&mut model, &staged);
-        if !Box::pin(assert_deque(backend, descriptor, case, &model)).await? {
+        if !assert_deque(backend, descriptor, case, &model).await? {
             return Ok(false);
         }
     }

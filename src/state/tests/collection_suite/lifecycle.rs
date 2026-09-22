@@ -268,7 +268,7 @@ pub(crate) async fn run_map_keyset_exact_trace(trace: MapTrace) -> Result<bool> 
         // frame must equal `tracked_frame(live)`; an absent keyset is the
         // live-empty case (a fresh or `clear`ed map).
         let live: Vec<i64> = model.keys().copied().collect();
-        let stored = CellRead::<Values>::read(&store, id, &keyset_cell())
+        let stored = CellRead::<Values>::read(&store, id, keyset_cell().as_ref())
             .await?
             .0
             .into_inner();

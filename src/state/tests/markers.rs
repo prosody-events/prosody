@@ -92,7 +92,7 @@ pub(super) fn prop_resolve_reads_each_marker_once() {
                         .await?
                         .into_inner();
                     assert_eq!(actual, expected);
-                    assert_eq!(actual, cells.read_committed(&id, &cell));
+                    assert_eq!(actual, cells.read_committed(&id, cell.as_ref()));
                 }
                 assert_eq!(store.marker_reads(), count, "one snapshot per call");
                 for collection in &collections {
@@ -122,7 +122,7 @@ pub(super) async fn check_memory_read_parity(
     let batch = CoordinateBatch::chunks(writes.iter().map(|(cell, _)| cell.coordinate.clone()))
         .next()
         .ok_or_else(|| eyre!("batch missing"))?;
-    let values = CellRead::<Values>::read_many(store, id, writes[0].0.section, &batch)
+    let values = CellRead::<Values>::read_many(store, id, writes[0].0.section, &batch.as_ref())
         .await
         .map(|cells| {
             cells
@@ -135,7 +135,8 @@ pub(super) async fn check_memory_read_parity(
         assert_eq!(value.into_inner().as_ref(), expected);
     }
 
-    let values = CellRead::<Values>::read_many(store, id, writes[0].0.section, &batch).await?;
+    let values =
+        CellRead::<Values>::read_many(store, id, writes[0].0.section, &batch.as_ref()).await?;
     assert_eq!(values.len(), batch.len());
     for (value, ttl) in values {
         assert_eq!(value.into_inner().as_ref(), expected);

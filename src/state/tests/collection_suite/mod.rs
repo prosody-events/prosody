@@ -50,8 +50,7 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::Promoted;
 use crate::state::session::sealed::StateLifecycle;
 use crate::state::session::{Finalized, KeyedStateSession, SessionParts, TerminationWatch};
-use crate::state::store::CellRead;
-use crate::state::store::{CELL_BATCH, CellStore};
+use crate::state::store::{CELL_BATCH, CellRead, CellStore};
 use crate::state::tests::support::admit_collection;
 use crate::state::tests::support::seed_commit_evidence;
 use crate::state::{
@@ -60,7 +59,7 @@ use crate::state::{
 };
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, bail, eyre};
-use futures::StreamExt;
+use futures::{Stream, StreamExt, TryStreamExt};
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -345,16 +344,12 @@ where
 }
 
 /// Drains a fallible stream into a vector.
-async fn drain<T, E>(stream: impl futures::Stream<Item = Result<T, E>>) -> Result<Vec<T>>
+fn drain<T, E, S>(stream: S) -> impl Future<Output = Result<Vec<T>>> + use<T, E, S>
 where
+    S: Stream<Item = Result<T, E>>,
     E: Error + Send + Sync + 'static,
 {
-    futures::pin_mut!(stream);
-    let mut out = Vec::new();
-    while let Some(item) = stream.next().await {
-        out.push(item?);
-    }
-    Ok(out)
+    stream.map_err(Into::into).try_collect()
 }
 
 /// Collects deque values in the selected direction.

@@ -8,7 +8,7 @@ use super::{
 };
 use crate::state::access::StateAccessError;
 use crate::state::cell::{Presence, Projection, Values};
-use crate::state::cell_key::{CellKey, Coordinate, Direction, ScanEdge, Section};
+use crate::state::cell_key::{CellKey, CellRef, Coordinate, Direction, ScanEdge, Section};
 use crate::state::descriptor::{
     BorrowedKeyOf, CellCodecError, CellResolver, CellStateError, CellType, ContextOf, FromSession,
     ResolvedOf, WriteOf,
@@ -20,7 +20,7 @@ use crate::state::{StateName, StateType};
 
 mod batch;
 mod read;
-use batch::Slot;
+use batch::encode_key;
 pub(super) use batch::read_coordinates;
 use bytes::Bytes;
 use smallvec::SmallVec;
@@ -219,59 +219,15 @@ impl<'a, S: WritableStateSession, L> WriteOperation<'a, S, L> {
         Ok(())
     }
 
-    /// This invocation's staged view of `cell`, or `None` when the journal
-    /// says nothing about it.
-    ///
-    /// The reverse walk gives staged mutations last-write-wins and
-    /// read-your-writes semantics. Forward replay at merge reproduces the same
-    /// result.
-    fn staged(&self, cell: &CellKey) -> Option<Staged> {
-        self.journal
-            .iter()
-            .rev()
-            .find_map(|mutation| match mutation {
-                Mutation::Set {
-                    cell: staged,
-                    bytes,
-                } if staged == cell => Some(Staged::Present(bytes.clone())),
-                Mutation::Clear { cell: staged } if staged == cell => Some(Staged::Absent),
-                // A staged reset hides every cell of the layout, so a read
-                // after `clear_collection` sees the same absence the merge will
-                // replay.
-                Mutation::Reset { sections } if sections.contains(&cell.section) => {
-                    Some(Staged::Absent)
-                }
-                _ => None,
-            })
-    }
-
-    /// Projects the journal answer for each key before the engine reads.
-    fn slots<'k, T: CellType, P: Projection>(
-        &self,
-        family: CellFamily<L, T>,
-        keys: impl IntoIterator<Item = &'k BorrowedKeyOf<T>, IntoIter: Send>,
-    ) -> CellBuffer<Slot<P>> {
-        keys.into_iter()
-            .map(|key| {
-                let cell = family.at(key).cell;
-                match self.staged(&cell) {
-                    Some(Staged::Present(bytes)) => Slot::Answered(Some(P::from_value(bytes))),
-                    Some(Staged::Absent) => Slot::Answered(None),
-                    None => Slot::Pending(cell.coordinate),
-                }
-            })
-            .collect()
-    }
-
     /// Reads the journal answer or one projected engine answer.
     async fn staged_or_read<P: Projection>(
         &mut self,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Result<Option<P::Payload>, StateAccessError>
     where
         S::Engine: sealed::Reads<S, P>,
     {
-        match self.staged(cell) {
+        match staged(&self.journal, cell) {
             Some(Staged::Present(bytes)) => Ok(Some(P::from_value(bytes))),
             Some(Staged::Absent) => Ok(None),
             None => {
@@ -316,14 +272,21 @@ impl<'c, S: WritableStateSession, L> CollectionWrite for WriteOperation<'c, S, L
         T: CellType,
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
-        let cell = family.at(key).cell;
+        let encoded = encode_key::<T::Key>(key);
         async move {
-            let value = match self.staged_or_read::<Values>(&cell).await? {
+            let buffer = encoded.map_err(CellStateError::Key)?;
+            let cell = CellRef {
+                section: family.section(),
+                coordinate: &buffer,
+            };
+            let value = match self.staged_or_read::<Values>(cell).await? {
                 Some(bytes) => Some(resolve_cell::<S, T>(self.collection.session(), bytes).await?),
                 None => None,
             };
             // A failed read leaves the journal unchanged.
-            self.journal.push(Mutation::Clear { cell });
+            self.journal.push(Mutation::Clear {
+                cell: cell.into_owned(),
+            });
             Ok(value)
         }
     }
@@ -354,4 +317,20 @@ impl<'c, S: WritableStateSession, L> CollectionWrite for WriteOperation<'c, S, L
             sections: L::SECTIONS,
         });
     }
+}
+
+/// Returns the last staged answer without a coordinate copy.
+fn staged(journal: &[Mutation], cell: CellRef<'_>) -> Option<Staged> {
+    journal.iter().rev().find_map(|mutation| match mutation {
+        Mutation::Set {
+            cell: staged,
+            bytes,
+        } if staged.as_ref() == cell => Some(Staged::Present(bytes.clone())),
+        Mutation::Clear { cell: staged } if staged.as_ref() == cell => Some(Staged::Absent),
+        // A staged reset hides every cell of the layout, so a read
+        // after `clear_collection` sees the same absence the merge will
+        // replay.
+        Mutation::Reset { sections } if sections.contains(&cell.section) => Some(Staged::Absent),
+        _ => None,
+    })
 }

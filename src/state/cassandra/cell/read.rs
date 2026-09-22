@@ -10,6 +10,7 @@ use super::{
     CellKind, CellQueries, CollectionId, Coordinate, Direction, Pk, Scan, ScanEdge, Section,
     Stream, cooperative, try_stream,
 };
+use crate::state::cell_key::CellRef;
 use crate::state::marker::MarkerState;
 use crate::state::store::FetchSchedule;
 use crate::timers::duration::CompactDuration;
@@ -27,7 +28,7 @@ pub(super) async fn fetch_point<P: CassandraProjection>(
     session: &CassandraSession,
     queries: &CellQueries,
     id: &CollectionId,
-    cell: &CellKey,
+    cell: CellRef<'_>,
 ) -> Result<Option<PointRow<P>>, CassandraCellStoreError> {
     let pk = Pk::of(id);
     Ok(session
@@ -58,7 +59,7 @@ pub(super) async fn fetch_batch<P: CassandraProjection>(
     queries: &CellQueries,
     id: &CollectionId,
     section: Section,
-    coordinates: &[&Coordinate],
+    coordinates: &[&[u8]],
 ) -> Result<CellBuffer<Option<PointRow<P>>>, CassandraCellStoreError> {
     let pk = Pk::of(id);
     let result = session
@@ -91,13 +92,13 @@ pub(super) async fn fetch_batch<P: CassandraProjection>(
 
 pub(super) fn match_rows_to_coordinates<Row>(
     mut rows: CellBuffer<(Bytes, Row)>,
-    coordinates: &[&Coordinate],
+    coordinates: &[&[u8]],
 ) -> CellBuffer<Option<Row>> {
     let mut out = CellBuffer::with_capacity(coordinates.len());
     for &coordinate in coordinates {
         let Some(pos) = rows
             .iter()
-            .position(|(found, _)| found.as_ref() == coordinate.as_bytes())
+            .position(|(found, _)| found.as_ref() == coordinate)
         else {
             out.push(None);
             continue;

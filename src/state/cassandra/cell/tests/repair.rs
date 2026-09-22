@@ -1,8 +1,7 @@
 use super::*;
 use crate::cassandra::TABLE_KEYED_STATE_CELL;
 use crate::state::cell::Values;
-use crate::state::store::CellRead;
-use crate::state::store::CommittedBatch;
+use crate::state::store::{CellRead, CommittedBatch};
 use crate::state::tests::support::{evidence, seed_commit_evidence};
 
 async fn corrupt_cleared_window(
@@ -72,7 +71,7 @@ async fn admit_removes_corrupt_cleared_rows_before_point_read() -> Result<()> {
     let (_fx, store, collection) = corrupt_cleared_window("point-repair-order").await?;
 
     assert_eq!(
-        CellRead::<Values>::read(&store, collection.id(), &cell_in(0, 1))
+        CellRead::<Values>::read(&store, collection.id(), cell_in(0, 1).as_ref())
             .await?
             .0,
         Committed::new(None)
@@ -89,8 +88,8 @@ async fn admit_removes_corrupt_cleared_rows_before_batch_read() -> Result<()> {
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
 
-    let got = Box::pin(async {
-        CellRead::<Values>::read_many(&store, collection.id(), SECTIONS[0], &batch)
+    let got = async {
+        CellRead::<Values>::read_many(&store, collection.id(), SECTIONS[0], &batch.as_ref())
             .await
             .map(|cells| {
                 cells
@@ -98,7 +97,7 @@ async fn admit_removes_corrupt_cleared_rows_before_batch_read() -> Result<()> {
                     .map(|(committed, _)| committed)
                     .collect::<CommittedBatch>()
             })
-    })
+    }
     .await?;
     assert_eq!(
         got.as_slice(),

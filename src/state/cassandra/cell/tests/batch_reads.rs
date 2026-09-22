@@ -1,8 +1,7 @@
 use super::*;
 use crate::state::cassandra::CassandraCellStoreError;
 use crate::state::cell::Values;
-use crate::state::store::CellRead;
-use crate::state::store::CommittedBatch;
+use crate::state::store::{CellBuffer, CellRead, CommittedBatch};
 use crate::state::tests::support::evidence;
 
 /// Batch-read parity over the live `CassandraStore`: the single-`IN`-query
@@ -16,7 +15,7 @@ fn prop_cassandra_batch_read_parity() {
     async fn run(trace: BatchReadTrace) -> Result<bool> {
         let fx = fixture().await?;
         let store = fx.bottom_store();
-        Box::pin(run_batch_read_parity_trace(store, trace)).await
+        run_batch_read_parity_trace(store, trace).await
     }
 
     init_test_logging();
@@ -30,7 +29,7 @@ fn prop_cassandra_batch_read_parity() {
 async fn cassandra_batch_duplicate_co_observation() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    Box::pin(run_batch_duplicate_co_observation(fx.bottom_store())).await
+    run_batch_duplicate_co_observation(fx.bottom_store()).await
 }
 
 /// Every input position answered over two chunks on the live store.
@@ -38,7 +37,7 @@ async fn cassandra_batch_duplicate_co_observation() -> Result<()> {
 async fn cassandra_batch_preserves_input_positions() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    Box::pin(run_batch_alignment(fx.bottom_store())).await
+    run_batch_alignment(fx.bottom_store()).await
 }
 
 /// Seeds two raw-CQL corrupt cells (unreachable through the store verbs) in
@@ -119,7 +118,7 @@ async fn first_error_is_first_input_position() -> Result<()> {
     // The two rows are distinguishable through the sequential oracle.
     assert!(
         matches!(
-            CellRead::<Values>::read(&store, id, &cell_a)
+            CellRead::<Values>::read(&store, id, cell_a.as_ref())
                 .await
                 .map(|(committed, _)| committed),
             Err(ResolveCellError::Store(
@@ -130,7 +129,7 @@ async fn first_error_is_first_input_position() -> Result<()> {
     );
     assert!(
         matches!(
-            CellRead::<Values>::read(&store, id, &cell_b)
+            CellRead::<Values>::read(&store, id, cell_b.as_ref())
                 .await
                 .map(|(committed, _)| committed),
             Err(ResolveCellError::Store(
@@ -144,8 +143,8 @@ async fn first_error_is_first_input_position() -> Result<()> {
     let batch = CoordinateBatch::chunks([0xFEu8, 0x01].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    match Box::pin(async {
-        CellRead::<Values>::read_many(&store, id, SECTIONS[0], &batch)
+    match async {
+        CellRead::<Values>::read_many(&store, id, SECTIONS[0], &batch.as_ref())
             .await
             .map(|cells| {
                 cells
@@ -153,7 +152,7 @@ async fn first_error_is_first_input_position() -> Result<()> {
                     .map(|(committed, _)| committed)
                     .collect::<CommittedBatch>()
             })
-    })
+    }
     .await
     {
         Err(ResolveCellError::Store(CassandraCellStoreError::CorruptCell(reason))) => {
@@ -177,7 +176,6 @@ fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
     use super::decode::PointRow;
     use super::encoding::{Encoding, encode_payload};
     use crate::state::cell::Values;
-    use crate::state::store::CellBuffer;
     use smallvec::SmallVec;
 
     let prev_blob = encode_payload(&bytes(0xAA), Encoding::Zstd)?;
@@ -206,14 +204,17 @@ fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
     let mut rows: CellBuffer<(Bytes, PointRow<Values>)> = SmallVec::new();
     rows.push((Bytes::copy_from_slice(high_coordinate.as_bytes()), high));
     rows.push((Bytes::copy_from_slice(low_coordinate.as_bytes()), low));
-    let decoded = match_rows_to_coordinates(rows, &[&low_coordinate, &high_coordinate])
-        .into_iter()
-        .map(|row| {
-            row.map(decode_point::<Values>)
-                .transpose()
-                .map(|cell| cell.map(|(cell, _)| cell))
-        })
-        .collect::<Result<CellBuffer<_>, CassandraCellStoreError>>();
+    let decoded = match_rows_to_coordinates(
+        rows,
+        &[low_coordinate.as_bytes(), high_coordinate.as_bytes()],
+    )
+    .into_iter()
+    .map(|row| {
+        row.map(decode_point::<Values>)
+            .transpose()
+            .map(|cell| cell.map(|(cell, _)| cell))
+    })
+    .collect::<Result<CellBuffer<_>, CassandraCellStoreError>>();
     match decoded {
         Err(CassandraCellStoreError::CorruptCell(reason)) => assert_eq!(
             reason,
@@ -230,7 +231,6 @@ fn borrowed_batch_matches_requested_coordinates() -> Result<()> {
     use super::super::read::{decode_point, match_rows_to_coordinates};
     use super::decode::PointRow;
     use crate::state::cell::Values;
-    use crate::state::store::CellBuffer;
     use smallvec::smallvec;
 
     let low_data = [0x11];
@@ -254,14 +254,15 @@ fn borrowed_batch_matches_requested_coordinates() -> Result<()> {
         (Bytes::copy_from_slice(low.as_bytes()), row(&low_data)),
     ];
 
-    let decoded = match_rows_to_coordinates(rows, &[&low, &absent, &high])
-        .into_iter()
-        .map(|row| {
-            row.map(decode_point::<Values>)
-                .transpose()
-                .map(|cell| cell.map(|(cell, _)| cell))
-        })
-        .collect::<Result<CellBuffer<_>, CassandraCellStoreError>>()?;
+    let decoded =
+        match_rows_to_coordinates(rows, &[low.as_bytes(), absent.as_bytes(), high.as_bytes()])
+            .into_iter()
+            .map(|row| {
+                row.map(decode_point::<Values>)
+                    .transpose()
+                    .map(|cell| cell.map(|(cell, _)| cell))
+            })
+            .collect::<Result<CellBuffer<_>, CassandraCellStoreError>>()?;
     assert_eq!(decoded.len(), 3);
     assert_eq!(
         decoded[0]
@@ -315,7 +316,7 @@ async fn resolved_corrupt_rows_fail_before_blob_decode() -> Result<()> {
     let batch = CoordinateBatch::chunks([0xFEu8, 0x01].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    match Box::pin(store.provisional_many(id, SECTIONS[0], &batch)).await {
+    match store.provisional_many(id, SECTIONS[0], &batch).await {
         Err(ResolveCellError::Store(CassandraCellStoreError::CorruptCell(reason))) => assert_eq!(
             reason,
             CellCorruptReason::PrevWithoutEvent,
@@ -340,7 +341,7 @@ async fn cassandra_raw_batch_is_one_query() -> Result<()> {
     let mut writes = Vec::new();
     for b in [1u8, 2] {
         let cell = cell_in(0, b);
-        let prev = CellRead::<Values>::read(&seed, id, &cell).await?.0;
+        let prev = CellRead::<Values>::read(&seed, id, cell.as_ref()).await?.0;
         writes.push((
             cell,
             ProvisionalWrite::new(Some(bytes(b * 10)), prev, staging),
@@ -355,7 +356,7 @@ async fn cassandra_raw_batch_is_one_query() -> Result<()> {
     let batch = CoordinateBatch::chunks([1u8, 2].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    let out = Box::pin(reader.provisional_many(id, SECTIONS[0], &batch)).await?;
+    let out = reader.provisional_many(id, SECTIONS[0], &batch).await?;
     assert_eq!(out.len(), 2, "both staged provisional cells survive");
     assert_eq!(
         counters.provisional_in_queries.load(Ordering::Relaxed),
@@ -383,7 +384,7 @@ fn prop_cassandra_raw_batch_parity() {
     async fn run(trace: RawBatchTrace) -> Result<bool> {
         let fx = fixture().await?;
         let store = fx.bottom_store();
-        Box::pin(run_raw_batch_parity_trace(store, trace)).await
+        run_raw_batch_parity_trace(store, trace).await
     }
 
     init_test_logging();
@@ -399,7 +400,7 @@ fn prop_cassandra_raw_batch_parity() {
 async fn cassandra_raw_batch_ascending_output() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
-    Box::pin(run_raw_batch_ascending_output(fx.bottom_store())).await
+    run_raw_batch_ascending_output(fx.bottom_store()).await
 }
 
 /// No-side-effects test over the live store:
@@ -409,7 +410,7 @@ async fn cassandra_raw_batch_no_side_effects() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
     let store = fx.bottom_store();
-    Box::pin(run_raw_batch_no_side_effects(store)).await
+    run_raw_batch_no_side_effects(store).await
 }
 
 /// A bounded scan must not decode a corrupt row beyond its end.

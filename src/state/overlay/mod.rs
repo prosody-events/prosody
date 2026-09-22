@@ -14,11 +14,12 @@ use super::cell::{Committed, Projection};
 use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::dirty::{DirtyStore, DirtyVal};
 use super::identity::CollectionId;
-use super::store::{CellBuffer, CommittedBatch, CoordinateBatch};
+use super::store::{CELL_BATCH, CommittedBatch, ReadBatch};
+use crate::state::cell_key::CellRef;
 use crate::state::store::CellRead;
 use async_stream::try_stream;
 use futures::{Stream, StreamExt};
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -60,7 +61,7 @@ impl<L> Overlay<L> {
     pub async fn get<'a, P: Projection>(
         &'a self,
         collection: &'a CollectionId,
-        cell: &'a CellKey,
+        cell: CellRef<'a>,
     ) -> Result<Committed<P>, L::Error>
     where
         L: CellRead<P>,
@@ -91,77 +92,50 @@ impl<L> Overlay<L> {
         &'a self,
         collection: &'a CollectionId,
         section: Section,
-        batch: &'a CoordinateBatch,
+        batch: &'a ReadBatch<'_>,
     ) -> Result<CommittedBatch<P>, L::Error>
     where
         L: CellRead<P>,
     {
-        let (dirty_answers, untouched, untouched_pos) =
-            self.classify_batch(collection, section, batch);
-        let mut answers: CellBuffer<Option<Committed<P>>> = dirty_answers
-            .into_iter()
-            .map(|answer| {
-                answer.map(|value| match value {
-                    DirtyVal::Set(bytes) => Committed::new(Some(P::from_value(bytes))),
-                    DirtyVal::Cleared => Committed::new(None),
-                })
-            })
-            .collect();
-        // `untouched.len() ≤ batch.len() ≤ CELL_BATCH`, so this yields zero or
-        // one lower batch; `untouched_pos` aligns 1:1 with its answers.
-        for lower_batch in CoordinateBatch::chunks(untouched) {
-            let lower =
-                CellRead::<P>::read_many(&self.lower, collection, section, &lower_batch).await?;
-            for ((committed, _), &pos) in lower.into_iter().zip(untouched_pos.iter()) {
-                answers[pos] = Some(committed);
-            }
-        }
-        // Every position is filled (dirty-answered or lower-scattered), so
-        // `flatten` drops nothing; a short lower result — a lower-store
-        // alignment violation, the same bug the store layer's own `get_many`
-        // default guards — would leave a hole the debug assert catches.
-        let out: CommittedBatch<P> = answers.into_iter().flatten().collect();
-        debug_assert_eq!(
-            out.len(),
-            batch.len(),
-            "batch read must answer every input position"
-        );
-        Ok(out)
-    }
-
-    /// A dirty `Set` answers its value. A dirty `Cleared` answers absence.
-    /// A section clear answers absence for an untouched cell because a later
-    /// `Set` matches first. The lower sub-batch keeps untouched input
-    /// positions.
-    fn classify_batch(
-        &self,
-        collection: &CollectionId,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> (
-        CellBuffer<Option<DirtyVal>>,
-        CellBuffer<Coordinate>,
-        CellBuffer<usize>,
-    ) {
         let section_cleared = self.dirty.section_cleared(collection, section);
-        let mut answers = smallvec![None; batch.len()];
-        let mut untouched = SmallVec::new();
-        let mut untouched_pos = SmallVec::new();
-        for (i, coordinate) in batch.iter().enumerate() {
-            let cell = CellKey {
-                section,
-                coordinate: Coordinate::clone(coordinate),
-            };
-            match self.dirty.lookup(collection, &cell) {
-                Some(value) => answers[i] = Some(value),
-                None if section_cleared => answers[i] = Some(DirtyVal::Cleared),
-                None => {
-                    untouched.push(Coordinate::clone(coordinate));
-                    untouched_pos.push(i);
-                }
+        let (mut answers, lower_batch, positions) = {
+            let mut answers = CommittedBatch::<P>::with_capacity(batch.len());
+            let mut untouched: SmallVec<[&[u8]; CELL_BATCH.get()]> = SmallVec::new();
+            let mut positions: SmallVec<[u8; CELL_BATCH.get()]> = SmallVec::new();
+            for &coordinate in batch.iter() {
+                let value = match self.dirty.lookup(
+                    collection,
+                    CellRef {
+                        section,
+                        coordinate,
+                    },
+                ) {
+                    Some(DirtyVal::Set(bytes)) => Some(P::from_value(bytes)),
+                    Some(DirtyVal::Cleared) => None,
+                    None if section_cleared => None,
+                    None => {
+                        untouched.push(coordinate);
+                        positions.push(answers.len() as u8);
+                        None
+                    }
+                };
+                answers.push(Committed::new(value));
+            }
+            (answers, ReadBatch::from_buffer(untouched), positions)
+        };
+        if let Some(lower_batch) = &lower_batch {
+            let lower =
+                CellRead::<P>::read_many(&self.lower, collection, section, lower_batch).await?;
+            assert_eq!(
+                lower.len(),
+                positions.len(),
+                "batch read must answer every input position"
+            );
+            for ((committed, _), &position) in lower.into_iter().zip(&positions) {
+                answers[usize::from(position)] = committed;
             }
         }
-        (answers, untouched, untouched_pos)
+        Ok(answers)
     }
 
     /// Merges the dirty snapshot with the lower scan in coordinate order.

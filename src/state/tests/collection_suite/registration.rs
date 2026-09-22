@@ -68,7 +68,7 @@ pub(super) fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
     })?;
     assert_eq!(
         block_on(async {
-            CellRead::<Values>::read(&store, id, &keyset_cell())
+            CellRead::<Values>::read(&store, id, keyset_cell().as_ref())
                 .await
                 .map(|(committed, _)| committed)
         })?
@@ -79,7 +79,7 @@ pub(super) fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
     for cell in &legacy {
         assert_eq!(
             block_on(async {
-                CellRead::<Values>::read(&store, id, cell)
+                CellRead::<Values>::read(&store, id, cell.as_ref())
                     .await
                     .map(|(committed, _)| committed)
             })?
@@ -104,7 +104,7 @@ pub(super) fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
     })?;
     assert_eq!(
         block_on(async {
-            CellRead::<Values>::read(&store, id, &keyset_cell())
+            CellRead::<Values>::read(&store, id, keyset_cell().as_ref())
                 .await
                 .map(|(committed, _)| committed)
         })?
@@ -249,7 +249,7 @@ pub(super) fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
     let Some(bytes) = block_on(async {
-        CellRead::<Values>::read(&store, id, &keyset_cell())
+        CellRead::<Values>::read(&store, id, keyset_cell().as_ref())
             .await
             .map(|(committed, _)| committed)
     })?
@@ -279,7 +279,7 @@ pub(super) fn map_keyset_cell_bytes_are_frozen() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
     let Some(bytes) = block_on(async {
-        CellRead::<Values>::read(&store, id, &keyset_cell())
+        CellRead::<Values>::read(&store, id, keyset_cell().as_ref())
             .await
             .map(|(committed, _)| committed)
     })?

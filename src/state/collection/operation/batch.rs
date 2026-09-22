@@ -1,78 +1,95 @@
-//! Aligned batch reads and typed value resolution.
+//! Bounded coordinate encoding and aligned batch reads.
 
 use super::{
-    BorrowedKeyOf, CellBuffer, CellType, Coordinate, OrderedKeyCodec, Projection, Section,
-    StateAccessError, StateName, StateSession, StateType, sealed,
+    BorrowedKeyOf, CellBuffer, CellCodecError, CellStateError, CellType, Coordinate, Mutation,
+    OrderedKeyCodec, Projection, Section, Staged, StateAccessError, StateName, StateSession,
+    StateType, sealed, staged,
 };
-use crate::state::store::CoordinateBatch;
+use crate::codec::{Codec, SerializeBufGuard};
+use crate::state::cell_key::CellRef;
+use crate::state::order_codec::KeyCodecError;
+use crate::state::store::{CELL_BATCH, CoordinateBatch, ReadBatch};
+use smallvec::SmallVec;
 
-/// One position of an aligned batch read: either already answered from the
-/// invocation's journal, or awaiting the engine at its coordinate.
-pub(super) enum Slot<P: Projection> {
-    /// The journal already answers this position.
-    Answered(Option<P::Payload>),
-    /// The engine must read this coordinate.
-    Pending(Coordinate),
+/// Encodes one key before its borrow ends. The future owns the buffer guard.
+pub(super) fn encode_key<K: OrderedKeyCodec>(
+    key: &K::Borrowed,
+) -> Result<SerializeBufGuard, KeyCodecError> {
+    let mut buffer = SerializeBufGuard::acquire();
+    K::with_cached_local(|codec| codec.serialize_key(key, &mut buffer))?;
+    Ok(buffer)
 }
 
-/// Fills every pending slot from the engine and returns the answers aligned to
-/// `slots`. This is the journal-aware batch read a write invocation performs.
-/// Only the journal-silent positions reach the engine, through
-/// [`read_coordinates`].
-pub(super) async fn batched<S: StateSession, P: Projection>(
-    session: &S,
-    inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
-    state_type: StateType,
-    name: &StateName,
-    section: Section,
-    slots: CellBuffer<Slot<P>>,
-) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
-where
-    S::Engine: sealed::Reads<S, P>,
-{
-    let pending: CellBuffer<Coordinate> = slots
-        .iter()
-        .filter_map(|slot| match slot {
-            Slot::Pending(coordinate) => Some(coordinate.clone()),
-            Slot::Answered(_) => None,
-        })
-        .collect();
-    let answers =
-        read_coordinates::<S, P>(session, inner, state_type, name, section, pending).await?;
-    let mut answers = answers.into_iter();
-    Ok(slots
-        .into_iter()
-        .map(|slot| match slot {
-            Slot::Answered(payload) => payload,
-            // The engine answers every batched position in order, so the
-            // answers line up with the pending slots.
-            Slot::Pending(_) => answers.next().flatten(),
-        })
-        .collect())
-}
-
-/// Reads one projected answer per key in input order.
-///
-/// # Errors
-///
-/// An access error from the engine.
+/// Encodes one bounded batch at a time and preserves every input position.
+/// The read completes before the next batch reuses the encoding buffer.
 pub(super) async fn read_keys<'a, S, T, P: Projection>(
     session: &S,
     inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
     state_type: StateType,
     name: &StateName,
     section: Section,
-    keys: impl Iterator<Item = &'a BorrowedKeyOf<T>> + Send,
-) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
+    journal: &[Mutation],
+    mut keys: impl Iterator<Item = &'a BorrowedKeyOf<T>> + Send,
+) -> Result<CellBuffer<Option<P::Payload>>, CellStateError<CellCodecError<T>>>
 where
     S: StateSession,
     S::Engine: sealed::Reads<S, P>,
     T: CellType,
 {
-    // Mapped as a function item, so the lowering carries no closure whose
-    // higher-ranked capture would defeat the future's `Send` proof.
-    let coordinates = keys.map(<T::Key as OrderedKeyCodec>::encode);
-    read_coordinates::<S, P>(session, inner, state_type, name, section, coordinates).await
+    let mut answers = CellBuffer::with_capacity(keys.size_hint().0);
+    let mut buffer = SerializeBufGuard::acquire();
+    loop {
+        buffer.clear();
+        let (batch, positions) = {
+            let mut ends: SmallVec<[usize; CELL_BATCH.get()]> = SmallVec::new();
+            T::Key::with_cached_local(|codec| {
+                for key in keys.by_ref().take(CELL_BATCH.get()) {
+                    codec.serialize_key(key, &mut buffer)?;
+                    ends.push(buffer.len());
+                }
+                Ok(())
+            })
+            .map_err(CellStateError::Key)?;
+            if ends.is_empty() {
+                return Ok(answers);
+            }
+            let mut pending: SmallVec<[&[u8]; CELL_BATCH.get()]> = SmallVec::new();
+            let mut positions: SmallVec<[usize; CELL_BATCH.get()]> = SmallVec::new();
+            let mut start = 0;
+            for &end in &ends {
+                let cell = CellRef {
+                    section,
+                    coordinate: &buffer[start..end],
+                };
+                start = end;
+                let value = match staged(journal, cell) {
+                    Some(Staged::Present(bytes)) => Some(P::from_value(bytes)),
+                    Some(Staged::Absent) => None,
+                    None => {
+                        pending.push(cell.coordinate);
+                        positions.push(answers.len());
+                        None
+                    }
+                };
+                answers.push(value);
+            }
+            (ReadBatch::from_buffer(pending), positions)
+        };
+        if let Some(batch) = &batch {
+            let loaded = <S::Engine as sealed::Reads<S, P>>::read_batch(
+                session, inner, state_type, name, section, batch,
+            )
+            .await?;
+            if loaded.len() != positions.len() {
+                return Err(
+                    StateAccessError::misaligned_batch(loaded.len(), positions.len()).into(),
+                );
+            }
+            for (position, value) in positions.iter().zip(loaded) {
+                answers[*position] = value;
+            }
+        }
+    }
 }
 
 /// Reads one projected answer per coordinate in input order.
@@ -94,6 +111,7 @@ where
     // bounded.
     let mut answers = CellBuffer::with_capacity(coordinates.size_hint().0);
     for batch in CoordinateBatch::chunks(coordinates) {
+        let batch = batch.as_ref();
         let values = <S::Engine as sealed::Reads<S, P>>::read_batch(
             session, inner, state_type, name, section, &batch,
         )

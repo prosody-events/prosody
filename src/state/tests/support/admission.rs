@@ -135,7 +135,7 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
     ensure!(admit_registered(&counted, &dedup, &collections).await? == Admission::Fresh);
     let expected = if committed { replay } else { newer };
     ensure!(
-        CellRead::<Values>::read(&store, collections[0].id(), &cell)
+        CellRead::<Values>::read(&store, collections[0].id(), cell.as_ref())
             .await?
             .0
             .get()
@@ -143,7 +143,7 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
         "an old certificate certified a replay"
     );
     ensure!(
-        CellRead::<Values>::read(&store, collections[1].id(), &cell)
+        CellRead::<Values>::read(&store, collections[1].id(), cell.as_ref())
             .await?
             .0
             .get()
@@ -251,7 +251,7 @@ async fn deregistration<S: CellStore>(
         .await?;
     let expected = committed.then(|| bytes(value));
     ensure!(
-        CellRead::<Values>::read(store, collections[1].id(), &value_cell())
+        CellRead::<Values>::read(store, collections[1].id(), value_cell().as_ref())
             .await?
             .0
             .into_inner()
@@ -267,7 +267,7 @@ async fn deregistration<S: CellStore>(
             .is_none()
     );
     ensure!(
-        CellRead::<Values>::read(store, collections[1].id(), &value_cell())
+        CellRead::<Values>::read(store, collections[1].id(), value_cell().as_ref())
             .await?
             .0
             .into_inner()

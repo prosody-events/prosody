@@ -28,6 +28,8 @@
 //! Fjall uses synchronous I/O. Reads and writes use
 //! [`tokio::task::spawn_blocking`].
 
+use crate::state::cell_key::{CellKey, CellRef, Section};
+use crate::state::store::{CellBuffer, ReadBatch};
 mod codec;
 mod error;
 mod workspace;
@@ -45,8 +47,6 @@ pub(crate) use workspace::{FjallClient, FjallWorkspace};
 use crate::state::CollectionId;
 use crate::state::backend::AdmissionChecks;
 use crate::state::cell::{CacheEntry, Committed, Projection, ProvisionalWrite, Read, Values};
-use crate::state::cell_key::{CellKey, Section};
-use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::store_types::Durable;
 use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
@@ -386,7 +386,7 @@ impl FjallCellCache {
     ) -> Result<(), FjallCellCacheError> {
         write_cell(
             self.inner.handle(),
-            codec::cell_key(collection, cell),
+            codec::cell_key(collection, cell.as_ref()),
             bytes,
         )
         .await
@@ -407,7 +407,7 @@ impl FjallCellCache {
     pub(crate) async fn get<P: Projection>(
         &self,
         collection: &CollectionId,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Result<CacheRead<P>, FjallCellCacheError> {
         #[cfg(test)]
         if self.fail_reads.load(Ordering::Relaxed) {
@@ -435,7 +435,7 @@ impl FjallCellCache {
         &self,
         collection: &CollectionId,
         section: Section,
-        batch: &CoordinateBatch,
+        batch: &ReadBatch<'_>,
     ) -> Result<CellBuffer<CacheRead<P>>, FjallCellCacheError> {
         let raws = self.read_batch(collection, section, batch).await?;
         let now = self.clock.now_ms();
@@ -462,7 +462,7 @@ impl FjallCellCache {
         &self,
         collection: &CollectionId,
         section: Section,
-        batch: &CoordinateBatch,
+        batch: &ReadBatch<'_>,
     ) -> Result<CellBuffer<Option<Slice>>, FjallCellCacheError> {
         // Encode every key up front (bounded, sized once): small requests stay
         // inline and the owned keys move into the blocking closure.
@@ -471,9 +471,9 @@ impl FjallCellCache {
             .map(|coordinate| {
                 codec::cell_key(
                     collection,
-                    &CellKey {
+                    CellRef {
                         section,
-                        coordinate: coordinate.clone(),
+                        coordinate,
                     },
                 )
             })
@@ -511,7 +511,11 @@ impl FjallCellCache {
         collection: &CollectionId,
         cell: &CellKey,
     ) -> Result<Option<u64>, FjallCellCacheError> {
-        let raw = read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
+        let raw = read_cell(
+            self.inner.handle(),
+            codec::cell_key(collection, cell.as_ref()),
+        )
+        .await?;
         codec::frame_expiry(raw.as_deref())
     }
 
@@ -521,7 +525,7 @@ impl FjallCellCache {
     pub(crate) async fn put<P: Projection>(
         &self,
         collection: &CollectionId,
-        cell: &CellKey,
+        cell: CellRef<'_>,
         value: Committed<P>,
         expiry: u64,
     ) -> Result<(), FjallCellCacheError> {
@@ -543,10 +547,10 @@ impl FjallCellCache {
     /// A durable write caller removes old entries after a failed cache update.
     /// A read fill caller retains old entries because durable state did not
     /// change.
-    pub(crate) async fn put_batch<P: Projection>(
+    pub(crate) async fn put_batch<'a, P: Projection>(
         &self,
         collection: &CollectionId,
-        cells: impl IntoIterator<Item = (CellKey, Committed<P>, u64)>,
+        cells: impl IntoIterator<Item = (CellRef<'a>, Committed<P>, u64)>,
     ) -> Result<(), FjallCellCacheError> {
         #[cfg(test)]
         if self.fail_puts.load(Ordering::Relaxed) {
@@ -560,7 +564,7 @@ impl FjallCellCache {
             .into_iter()
             .map(|(cell, value, expiry)| {
                 (
-                    codec::cell_key(collection, &cell),
+                    codec::cell_key(collection, cell),
                     encode_frame(&P::into_cached(value.into_inner()), expiry),
                 )
             })
@@ -601,7 +605,10 @@ impl FjallCellCache {
         let mut inputs: CellBuffer<(SmallVec<[u8; 32]>, Option<Bytes>)> =
             SmallVec::with_capacity(writes.len());
         for (cell, write) in writes {
-            inputs.push((codec::cell_key(collection, cell), write.data().cloned()));
+            inputs.push((
+                codec::cell_key(collection, cell.as_ref()),
+                write.data().cloned(),
+            ));
         }
         let database = self.inner.database().clone();
         let handle = self.inner.handle().clone();
@@ -640,7 +647,7 @@ impl FjallCellCache {
         self.injected_delete_failure()?;
         let mut keys: CellBuffer<SmallVec<[u8; 32]>> = SmallVec::with_capacity(cells.len());
         for cell in cells {
-            keys.push(codec::cell_key(collection, cell));
+            keys.push(codec::cell_key(collection, cell.as_ref()));
         }
         let handle = self.inner.handle().clone();
         let capacity = keys.len();
@@ -678,7 +685,7 @@ impl FjallCellCache {
         let excluded: Arc<HashSet<SmallVec<[u8; 32]>, RandomState>> = Arc::new(
             exclude
                 .iter()
-                .map(|cell| codec::cell_key(collection, cell))
+                .map(|cell| codec::cell_key(collection, cell.as_ref()))
                 .collect(),
         );
         let prefix = codec::section_prefix(collection, section);

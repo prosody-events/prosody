@@ -5,13 +5,14 @@ use super::read::{decode_point, fetch_batch, fetch_point, page};
 use super::{
     Arc, BatchUnit, Bytes, CacheBatch, CassandraCellStoreError, CassandraSession, CassandraStore,
     Cell, CellAddr, CellBatchRow, CellBlobs, CellKey, CellKind, CellQueries, CellStoreError,
-    CollectionDefRegistry, CollectionId, Committed, CoordinateBatch, EventMarker, EvidenceLookup,
-    KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, Pk, ResolveCellError, ResolvedRow,
-    RowShape, SHARD_FANOUT_CONCURRENCY, Scan, Section, Stream, TryStreamExt, blob_weight, dedupe,
-    encode, encode_marker_payload, expand_to_input_order, pin_mut, smallvec, try_stream,
+    CollectionDefRegistry, CollectionId, Committed, EventMarker, EvidenceLookup, KeyRow,
+    MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, Pk, ResolveCellError, ResolvedRow, RowShape,
+    SHARD_FANOUT_CONCURRENCY, Scan, Section, Stream, TryStreamExt, blob_weight, dedupe, encode,
+    encode_marker_payload, expand_to_input_order, pin_mut, smallvec, try_stream,
     ttl_seconds_to_duration,
 };
-use crate::state::store::CellRead;
+use crate::state::cell_key::CellRef;
+use crate::state::store::{CellRead, ReadBatch};
 use crate::state::store_types::Durable;
 
 impl CassandraStore {
@@ -149,7 +150,11 @@ pub(super) fn stage_marker(marker: &EventMarker) -> Result<MarkerBlob, CellStore
 
 impl<P: CassandraProjection> CellRead<P> for CassandraStore {
     /// Reads one committed projection and its remaining durable TTL.
-    async fn read(&self, id: &CollectionId, cell: &CellKey) -> Result<Durable<P>, CellStoreError> {
+    async fn read(
+        &self,
+        id: &CollectionId,
+        cell: CellRef<'_>,
+    ) -> Result<Durable<P>, CellStoreError> {
         let row = fetch_point::<P>(&self.session, &self.queries, id, cell)
             .await
             .map_err(ResolveCellError::Store)?;
@@ -166,7 +171,7 @@ impl<P: CassandraProjection> CellRead<P> for CassandraStore {
         &self,
         id: &CollectionId,
         section: Section,
-        batch: &CoordinateBatch,
+        batch: &ReadBatch<'_>,
     ) -> Result<CacheBatch<P>, CellStoreError> {
         let (coordinates, indices) = dedupe(batch);
         let rows = fetch_batch::<P>(&self.session, &self.queries, id, section, &coordinates)

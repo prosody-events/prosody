@@ -107,17 +107,23 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     // columns); C written fresh resolved to its own payload (the resolved-write
     // row bound its columns).
     assert_eq!(
-        CellRead::<Values>::read(&reader, &id, &cell_b).await?.0,
+        CellRead::<Values>::read(&reader, &id, cell_b.as_ref())
+            .await?
+            .0,
         Committed::new(Some(data_b))
     );
     assert_eq!(
-        CellRead::<Values>::read(&reader, &id, &cell_c).await?.0,
+        CellRead::<Values>::read(&reader, &id, cell_c.as_ref())
+            .await?
+            .0,
         Committed::new(Some(data_c))
     );
     // D's row was deleted (the `cell_delete` bound its own `kind=Cell` key
     // columns, not the marker slice's `kind=Marker`), so it reads absent.
     assert_eq!(
-        CellRead::<Values>::read(&reader, &id, &cell_d).await?.0,
+        CellRead::<Values>::read(&reader, &id, cell_d.as_ref())
+            .await?
+            .0,
         Committed::new(None)
     );
 

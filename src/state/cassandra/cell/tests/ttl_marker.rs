@@ -30,7 +30,7 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
     let marker = EventMarker::frozen(event(1), &writes, &[], &evidence([].into(), None));
     store.write_provisional(&c, &writes, Some(&marker)).await?;
 
-    let (committed, co_expiry) = CellRead::<Values>::read(&store, c.id(), &cell).await?;
+    let (committed, co_expiry) = CellRead::<Values>::read(&store, c.id(), cell.as_ref()).await?;
     assert_eq!(
         committed.into_inner().as_ref(),
         Some(&old),

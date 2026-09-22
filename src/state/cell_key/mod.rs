@@ -84,6 +84,33 @@ impl Coordinate {
     }
 }
 
+impl AsRef<[u8]> for Coordinate {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+/// A read address that borrows encoded coordinate bytes.
+/// Its bytes must remain valid until the read completes.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CellRef<'a> {
+    /// The cell's section.
+    pub section: Section,
+    /// The encoded coordinate within the section.
+    pub coordinate: &'a [u8],
+}
+
+impl CellRef<'_> {
+    /// Copies the address for storage beyond the read.
+    #[must_use]
+    pub fn into_owned(self) -> CellKey {
+        CellKey {
+            section: self.section,
+            coordinate: Coordinate::from_bytes(Bytes::copy_from_slice(self.coordinate)),
+        }
+    }
+}
+
 /// Full intra-collection cell address. `Ord` is `(section, coordinate)`.
 ///
 /// It carries **only** `(section, coordinate)` — never the cell store's
@@ -98,6 +125,17 @@ pub struct CellKey {
 
     /// The cell's order-preserving coordinate within the section.
     pub coordinate: Coordinate,
+}
+
+impl CellKey {
+    /// Borrows this address for a read without a coordinate copy.
+    #[must_use]
+    pub fn as_ref(&self) -> CellRef<'_> {
+        CellRef {
+            section: self.section,
+            coordinate: self.coordinate.as_bytes(),
+        }
+    }
 }
 
 /// Direction a [`Scan`] walks the clustering range.

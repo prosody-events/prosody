@@ -148,7 +148,9 @@ async fn markerless_provisional_reads_its_committed_base() -> Result<()> {
         "admission left the unlisted provisional cell untouched"
     );
     assert_eq!(
-        CellRead::<Values>::read(&store, c.id(), &cell).await?.0,
+        CellRead::<Values>::read(&store, c.id(), cell.as_ref())
+            .await?
+            .0,
         Committed::new(None),
         "a markerless legacy cell reads its committed base"
     );

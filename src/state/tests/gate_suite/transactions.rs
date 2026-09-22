@@ -256,7 +256,7 @@ pub(super) fn gate_serializes_set_against_clear() -> Result<()> {
             .bind(&verify)
             .map_err(|e| eyre!("bind: {e}"))?;
         let entry = fresh.get(&1).await.map_err(|e| eyre!("{e}"))?;
-        let keyset = CellRead::<Values>::read(&fx.counting, &id, &map::keyset_cell())
+        let keyset = CellRead::<Values>::read(&fx.counting, &id, map::keyset_cell().as_ref())
             .await?
             .0
             .into_inner();

@@ -171,7 +171,7 @@ pub(super) fn map_get_many_after_reset_is_terminated() -> Result<()> {
         // Attempt boundary: discard + bump. `map` keeps the stale pin.
         session.reset(RepinProof::for_test()).await;
 
-        match Box::pin(map.get_many(&[0, 1, 2])).await {
+        match map.get_many(&[0, 1, 2]).await {
             Err(ref e) if map_item_terminated(e) => {}
             other => bail!("get_many after reset must be Terminated, got {other:?}"),
         }

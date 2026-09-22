@@ -76,10 +76,11 @@ pub(super) fn mock_clock_cache(budget: u64) -> (ReaderCache, Arc<Mock>) {
 }
 
 /// Collects a fallible reader stream into a `Vec`, surfacing the first error.
-pub(super) async fn collect_stream<T>(
-    stream: impl Stream<Item = Result<T, StateReaderError>>,
-) -> Result<Vec<T>> {
-    Ok(stream.try_collect().await?)
+pub(super) fn collect_stream<T, S>(stream: S) -> impl Future<Output = Result<Vec<T>>> + use<T, S>
+where
+    S: Stream<Item = Result<T, StateReaderError>>,
+{
+    stream.map_err(Into::into).try_collect()
 }
 
 /// Runs `check` over `items` with bounded concurrency, in input order.
