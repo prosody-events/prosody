@@ -17,6 +17,9 @@ use futures::Stream;
 use std::fmt::Display;
 use thiserror::Error;
 
+/// Keeps typed and erased method signatures separate.
+pub(crate) struct Erased<T>(pub(crate) T);
+
 /// Two-way error category for the FFI state seam.
 ///
 /// `Terminal` is deliberately absent: the keyed-state layer never surfaces it
@@ -264,9 +267,6 @@ pub type BoxSetState = Box<dyn DynSetState>;
 /// Boxed erased deque handle a vend method returns.
 pub type BoxDequeState<Item> = Box<dyn DynDequeState<Item>>;
 
-/// Boxed cursor returned by an erased query.
-pub type BoxStateCursor<Item> = Box<StateCursor<Item>>;
-
 /// Adapts an owned stream to the cursor used by language clients.
 fn cursor<T>(
     stream: impl Stream<Item = Result<T, ErasedStateError>> + Send + 'static,
@@ -281,10 +281,6 @@ mod set;
 mod value;
 mod write;
 pub use cursor::StateCursor;
-pub(crate) use deque::ErasedDeque;
-pub(crate) use map::ErasedMap;
-pub(crate) use set::ErasedSet;
-pub(crate) use value::ErasedValue;
 pub(crate) use write::ErasedWrite;
 
 mod query;

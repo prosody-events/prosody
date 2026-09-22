@@ -45,10 +45,9 @@ use tracing::{Instrument, Span, error, field::Empty, field::display};
 mod erased;
 
 pub use crate::state::erased::{
-    BoxDequeState, BoxMapState, BoxSetState, BoxStateCursor, BoxValueState, DynDequeState,
-    DynMapState, DynSetState, DynValueState, ErasedCategory, ErasedStateError, StateCursor,
+    BoxDequeState, BoxMapState, BoxSetState, BoxValueState, DynDequeState, DynMapState,
+    DynSetState, DynValueState, ErasedCategory, ErasedStateError, StateCursor,
 };
-use crate::state::erased::{ErasedDeque, ErasedMap, ErasedSet, ErasedValue};
 
 /// Marker trait for errors that can be returned from event context operations.
 ///

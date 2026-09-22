@@ -8,7 +8,7 @@ use super::{
 };
 use crate::state::access::StateAccessError;
 use crate::state::cell::{Presence, Projection, Values};
-use crate::state::cell_key::{CellKey, CellRef, Coordinate, Direction, ScanEdge, Section};
+use crate::state::cell_key::{CellKey, CellRef, Coordinate, Direction, Section};
 use crate::state::descriptor::{
     BorrowedKeyOf, CellCodecError, CellResolver, CellStateError, CellType, ContextOf, FromSession,
     ResolvedOf, WriteOf,
@@ -17,6 +17,7 @@ use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::order_codec::{I64KeyCodec, order_preserving_i64};
 use crate::state::store::CellBuffer;
 use crate::state::{StateName, StateType};
+use std::ops::Bound;
 
 mod batch;
 mod read;
@@ -115,9 +116,9 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
     pub(crate) fn range<T: CellType, B: AsRef<[u8]> + Send>(
         &self,
         family: CellFamily<L, T>,
-        start: ScanEdge<B>,
+        start: Bound<B>,
         dir: Direction,
-        end: ScanEdge<B>,
+        end: Bound<B>,
     ) -> Plan<S, T, B> {
         Plan::range(self.plan_base(family.section()), start, dir, end)
     }
@@ -142,9 +143,9 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
     ) -> Plan<S, T, [u8; 8]> {
         self.range(
             family,
-            ScanEdge::Included(order_preserving_i64(*start)),
+            Bound::Included(order_preserving_i64(*start)),
             dir,
-            ScanEdge::Included(order_preserving_i64(*end)),
+            Bound::Included(order_preserving_i64(*end)),
         )
         .with_limit(Some(limit))
     }

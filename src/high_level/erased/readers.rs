@@ -8,13 +8,13 @@ use crate::high_level::{
     MessageCodecError,
 };
 use crate::state::descriptor::{StateDescriptor, deque_state, map_state, set_state, value_state};
+use crate::state::erased::Erased;
 use crate::state::order_codec::Utf8KeyCodec;
 use crate::state_reader::ConsumerReaderBackend;
 use crate::subsystem::{SubsystemName, SubsystemNameError};
 use std::sync::Arc;
 use thiserror::Error;
 
-use crate::state_reader::erased::{DequeReader, MapReader, SetReader, ValueReader};
 pub use crate::state_reader::erased::{
     ErasedDequeReader, ErasedMapReader, ErasedReadCache, ErasedSetReader, ErasedValueReader,
     SharedDequeReader, SharedMapReader, SharedSetReader, SharedValueReader,
@@ -34,7 +34,7 @@ where
 {
     let descriptor = value_state::<StateCodec<T>>(name).read_cache(cache);
     let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
-    Ok(Arc::new(ValueReader(reader)))
+    Ok(Arc::new(Erased(reader)))
 }
 
 pub(in crate::high_level) async fn map<T, B>(
@@ -51,7 +51,7 @@ where
 {
     let descriptor = map_state::<Utf8KeyCodec, StateCodec<T>>(name).read_cache(cache);
     let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
-    Ok(Arc::new(MapReader(reader)))
+    Ok(Arc::new(Erased(reader)))
 }
 
 pub(in crate::high_level) async fn set<T, B>(
@@ -68,7 +68,7 @@ where
 {
     let descriptor = set_state::<Utf8KeyCodec>(name).read_cache(cache);
     let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
-    Ok(Arc::new(SetReader(reader)))
+    Ok(Arc::new(Erased(reader)))
 }
 
 pub(in crate::high_level) async fn deque<T, B>(
@@ -85,7 +85,7 @@ where
 {
     let descriptor = deque_state::<StateCodec<T>>(name).read_cache(cache);
     let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
-    Ok(Arc::new(DequeReader(reader)))
+    Ok(Arc::new(Erased(reader)))
 }
 
 fn subsystem_name<E>(name: String) -> Result<SubsystemName, ErasedReaderBuildError<E>> {

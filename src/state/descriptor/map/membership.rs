@@ -7,7 +7,7 @@ use super::keyset::is_oversized;
 use super::{Keyset, KeysetFrameError, MapKeysetCodec, MapKeysetKey, MapStateError, Query};
 use crate::state::StateName;
 use crate::state::cell::Presence;
-use crate::state::cell_key::{Coordinate, Direction, ScanEdge};
+use crate::state::cell_key::{Coordinate, Direction};
 use crate::state::collection::{
     CellFamily, Collection, CollectionRead, CollectionWrite, JOURNAL_INLINE, Plan, ReadOperation,
     StateSession,
@@ -18,6 +18,7 @@ use crate::state::descriptor::{
 use futures::StreamExt;
 use std::error::Error;
 use std::num::NonZeroUsize;
+use std::ops::Bound;
 use tracing::{Span, warn};
 
 /// Insert and remove each stage one member mutation and one keyset write.
@@ -59,9 +60,9 @@ where
         .read(async |op| {
             op.range::<_, &[u8]>(
                 L::MEMBERS,
-                ScanEdge::Unbounded,
+                Bound::Unbounded,
                 Direction::Forward,
-                ScanEdge::Unbounded,
+                Bound::Unbounded,
             )
             .with_limit(Some(NonZeroUsize::MIN))
         })

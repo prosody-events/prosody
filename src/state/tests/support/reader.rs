@@ -1,5 +1,5 @@
 use crate::state::cell::{Committed, Presence, ProvisionalWrite, Values};
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::store::{CellStore, CoordinateBatch};
 use crate::state::tests::support::{evidence, evidence_only, probe};
@@ -9,6 +9,7 @@ use bytes::Bytes;
 use color_eyre::{Report, Result};
 use futures::future::try_join_all;
 use futures::{TryStreamExt, join, try_join};
+use std::ops::Bound;
 
 /// Checks value and presence projections before the owner removes residue.
 pub(crate) async fn reader_residue<
@@ -120,8 +121,8 @@ async fn check_residue<R: CommittedCellSource<Values> + CommittedCellSource<Pres
             |dir| async move {
                 let scan = Scan {
                     section,
-                    start: ScanEdge::Unbounded,
-                    end: ScanEdge::Unbounded,
+                    start: Bound::Unbounded,
+                    end: Bound::Unbounded,
                     dir,
                     fetch_hint: None,
                 };

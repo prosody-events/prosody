@@ -13,7 +13,7 @@ use crate::codec::{I64Codec, I64CodecError};
 use crate::consumer::middleware::RepinProof;
 use crate::loader::MemoryLoader;
 use crate::state::cell::Values;
-use crate::state::cell_key::{CellKey, Direction, ScanEdge};
+use crate::state::cell_key::{CellKey, Direction};
 use crate::state::collection::{
     Collection, CollectionRead, CollectionWrite, StateSession, collection_layout,
 };
@@ -36,6 +36,7 @@ use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use serde_json::Value;
 use std::future::Future;
 use std::num::NonZeroUsize;
+use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -273,9 +274,9 @@ fn range_plan_terminates_at_first_error() -> Result<()> {
             .read(async |op| {
                 op.range::<_, &[u8]>(
                     PlainLayout::CELLS,
-                    ScanEdge::Unbounded,
+                    Bound::Unbounded,
                     Direction::Forward,
-                    ScanEdge::Unbounded,
+                    Bound::Unbounded,
                 )
             })
             .await;
@@ -321,9 +322,9 @@ async fn plan_fences_after_its_last_item() -> Result<()> {
                     if use_range {
                         op.range::<_, &[u8]>(
                             PlainLayout::CELLS,
-                            ScanEdge::Unbounded,
+                            Bound::Unbounded,
                             Direction::Forward,
-                            ScanEdge::Unbounded,
+                            Bound::Unbounded,
                         )
                     } else {
                         op.coordinates::<_, &[u8]>(
@@ -430,9 +431,9 @@ fn plan_streams_are_send() -> Result<()> {
             .read(async |op| {
                 op.range::<_, &[u8]>(
                     GatedLayout::CELLS,
-                    ScanEdge::Unbounded,
+                    Bound::Unbounded,
                     Direction::Forward,
-                    ScanEdge::Unbounded,
+                    Bound::Unbounded,
                 )
             })
             .await;
@@ -519,9 +520,9 @@ async fn ranged_keys(release: &[usize]) -> Result<Vec<i64>> {
         .read(async |op| {
             op.range::<_, &[u8]>(
                 GatedLayout::CELLS,
-                ScanEdge::Unbounded,
+                Bound::Unbounded,
                 Direction::Forward,
-                ScanEdge::Unbounded,
+                Bound::Unbounded,
             )
         })
         .await;

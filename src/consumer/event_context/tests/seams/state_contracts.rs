@@ -1,5 +1,5 @@
 use super::*;
-use crate::state::erased::ErasedKeyRead;
+use crate::state::erased::{ErasedKeyRead, StateCursor};
 
 /// A synthetic error classifying `Terminal`, to pin the boundary fold.
 #[derive(Debug, Error)]
@@ -101,7 +101,7 @@ async fn map_cursor_is_lazy() -> Result<()> {
         0,
         "builder creation must not read storage"
     );
-    let cursor = read.stream();
+    let cursor: StateCursor<(String, Value)> = tokio::spawn(async move { read.stream() }).await?;
     assert_eq!(
         counting.lower_reads(),
         0,

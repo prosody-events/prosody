@@ -7,8 +7,8 @@ use super::decode::{
 use super::projection::CassandraProjection;
 use super::{
     CassandraCellStoreError, CassandraSession, CassandraStoreError, Cell, CellBuffer, CellKey,
-    CellKind, CellQueries, CollectionId, Coordinate, Direction, Pk, Scan, ScanEdge, Section,
-    Stream, cooperative, try_stream,
+    CellKind, CellQueries, CollectionId, Coordinate, Direction, Pk, Scan, Section, Stream,
+    cooperative, try_stream,
 };
 use crate::state::cell_key::CellRef;
 use crate::state::marker::MarkerState;
@@ -21,7 +21,7 @@ use scylla::response::PagingState;
 use scylla::serialize::row::SerializeRow;
 use scylla::statement::prepared::PreparedStatement;
 use std::num::NonZeroUsize;
-use std::ops::ControlFlow;
+use std::ops::{Bound, ControlFlow};
 
 /// Fetches one projected cell with its durable TTL columns.
 pub(super) async fn fetch_point<P: CassandraProjection>(
@@ -142,10 +142,14 @@ pub(super) fn page<'a, P: CassandraProjection>(
     let end = scan.end;
     try_stream! {
         let pk = Pk::of(collection);
-        let prepared = P::statements(queries).scan.select(dir, start.kind());
+        let prepared = P::statements(queries).scan.select(dir, start.map(|_| ()));
+        let anchor = match start {
+            Bound::Included(coordinate) | Bound::Excluded(coordinate) => coordinate,
+            Bound::Unbounded => &[],
+        };
         let values = (
             pk.segment_id, pk.key, pk.state_type, pk.name,
-            CellKind::Cell, section, start.anchor(),
+            CellKind::Cell, section, anchor,
         );
         // Scylla rejects a non-positive page size, so this fallback is unreachable.
         let page_size = NonZeroUsize::new(usize::try_from(prepared.get_page_size()).unwrap_or(0))
@@ -224,14 +228,14 @@ fn scheduled_rows<'s, 'p, P: CassandraProjection, V: SerializeRow + Send + Sync>
 /// direction. An `Excluded` edge also stops *on* the endpoint (the exclusive
 /// variant for exclusive scan anchors); an `Unbounded` end never stops the
 /// walk (the section-only fallback).
-pub(super) fn past_end(dir: Direction, key: &CellKey, end: ScanEdge<&[u8]>) -> bool {
+pub(super) fn past_end(dir: Direction, key: &CellKey, end: Bound<&[u8]>) -> bool {
     let coordinate = key.coordinate.as_bytes();
     match (dir, end) {
-        (Direction::Forward, ScanEdge::Included(end)) => coordinate > end,
-        (Direction::Forward, ScanEdge::Excluded(end)) => coordinate >= end,
-        (Direction::Backward, ScanEdge::Included(end)) => coordinate < end,
-        (Direction::Backward, ScanEdge::Excluded(end)) => coordinate <= end,
-        (_, ScanEdge::Unbounded) => false,
+        (Direction::Forward, Bound::Included(end)) => coordinate > end,
+        (Direction::Forward, Bound::Excluded(end)) => coordinate >= end,
+        (Direction::Backward, Bound::Included(end)) => coordinate < end,
+        (Direction::Backward, Bound::Excluded(end)) => coordinate <= end,
+        (_, Bound::Unbounded) => false,
     }
 }
 

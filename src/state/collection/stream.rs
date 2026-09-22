@@ -8,7 +8,7 @@ use super::operation::read_coordinates;
 use super::{StateSession, resolve_cell, sealed};
 use crate::state::StateAccessError;
 use crate::state::cell::{Presence, Projection, Values};
-use crate::state::cell_key::{Coordinate, Direction, Scan, ScanEdge, Section};
+use crate::state::cell_key::{Coordinate, Direction, Scan, Section};
 use crate::state::descriptor::{
     CellCodecError, CellStateError, CellType, ContextOf, FromSession, KeyOf, ResolvedOf,
 };
@@ -22,6 +22,7 @@ use pin_project::pin_project;
 use std::future::{Future, ready};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
+use std::ops::Bound;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::task::coop::cooperative;
@@ -114,9 +115,9 @@ impl<S: StateSession> PlanBase<S> {
 enum Source<B> {
     Points(Vec<Coordinate>),
     Range {
-        start: ScanEdge<B>,
+        start: Bound<B>,
         dir: Direction,
-        end: ScanEdge<B>,
+        end: Bound<B>,
     },
 }
 
@@ -157,12 +158,7 @@ impl<S: StateSession, T: CellType, B: AsRef<[u8]> + Send> Plan<S, T, B> {
     }
 
     /// Captures one range within the collection section.
-    pub(super) fn range(
-        base: PlanBase<S>,
-        start: ScanEdge<B>,
-        dir: Direction,
-        end: ScanEdge<B>,
-    ) -> Self {
+    pub(super) fn range(base: PlanBase<S>, start: Bound<B>, dir: Direction, end: Bound<B>) -> Self {
         Self {
             base,
             source: Source::Range { start, dir, end },
@@ -277,9 +273,9 @@ where
 /// Scans without admission and projects cells through an ordered window.
 fn range_source<S, T, P, B>(
     base: PlanBase<S>,
-    start: ScanEdge<B>,
+    start: Bound<B>,
     dir: Direction,
-    end: ScanEdge<B>,
+    end: Bound<B>,
     limit: Option<NonZeroUsize>,
 ) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send + use<S, T, P, B>
 where

@@ -16,7 +16,7 @@ use crate::state::store::{CacheBatch, CellBackend, CellRead, CommittedBatch, Dur
 
 use super::super::cached::{Cached, DELETE_RETRY_BUDGET};
 use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
-use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
+use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::super::fjall::test_db;
 use super::super::fjall::{Clock, FjallCellCache};
 use super::super::marker::{EventMarker, SectionClear};
@@ -43,6 +43,7 @@ use futures::{Stream, StreamExt};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
+use std::ops::Bound;
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -222,13 +223,13 @@ fn prop_memory_cached_overlay_view() {
 }
 
 /// Collects a forward scan over `start` to `end`, mapping each cell to its
-/// single coordinate byte. A whole-section scan passes a `ScanEdge::Included`
+/// single coordinate byte. A whole-section scan passes a `Bound::Included`
 /// of a dominating sentinel (`255`) rather than an unbounded edge.
 async fn scan_forward<S>(
     store: &S,
     id: &CollectionId,
     start: u8,
-    end: ScanEdge<u8>,
+    end: Bound<u8>,
 ) -> Result<Vec<(Vec<u8>, Bytes)>>
 where
     S: CellStore,
@@ -237,7 +238,7 @@ where
     let end_c = end.map(|b| Coordinate::from_bytes(vec![b]));
     let scan = Scan {
         section: SECTION,
-        start: ScanEdge::Included(start_c.as_bytes()),
+        start: Bound::Included(start_c.as_bytes()),
         dir: Direction::Forward,
         end: end_c.as_ref().map(Coordinate::as_bytes),
         fetch_hint: None,
@@ -922,7 +923,7 @@ fn scan_resolution_is_read_only() -> Result<()> {
         // Scan the section. The cell resolves to its
         // committed view — absent, since data = None — so the scan yields
         // nothing, but must leave the durable cell provisional.
-        let seen = scan_forward(&lower, &id, 0, ScanEdge::Included(255)).await?;
+        let seen = scan_forward(&lower, &id, 0, Bound::Included(255)).await?;
         assert!(
             seen.is_empty(),
             "the committed clear resolves to absent, so the scan yields nothing"
@@ -2366,8 +2367,8 @@ impl Replay {
             self.counting.presence_reads(),
             self.counting.presence_scans(),
         );
-        let subject = scan_forward(&self.subject, &self.id, 0, ScanEdge::Included(255)).await?;
-        let twin = scan_forward(&self.twin, &self.id, 0, ScanEdge::Included(255)).await?;
+        let subject = scan_forward(&self.subject, &self.id, 0, Bound::Included(255)).await?;
+        let twin = scan_forward(&self.twin, &self.id, 0, Bound::Included(255)).await?;
         if subject != twin {
             return Err(eyre!("scan diverged: subject {subject:?}, twin {twin:?}"));
         }

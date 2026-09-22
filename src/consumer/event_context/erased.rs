@@ -1,11 +1,12 @@
 //! The event context adapter used by language clients.
 
+use crate::state::erased::Erased;
+
 use super::{
     BoxDequeState, BoxMapState, BoxSetState, BoxValueState, CompactDateTime, ConsumerMessage,
-    DynClone, ErasedDeque, ErasedMap, ErasedSet, ErasedStateCodec, ErasedStateError, ErasedValue,
-    Error, EventContext, EventContextError, Registered, StateSession, TimerType, Utf8KeyCodec,
-    async_trait, deque_state, map_state, message_deque_state, message_map_state, message_state,
-    set_state, value_state,
+    DynClone, ErasedStateCodec, ErasedStateError, Error, EventContext, EventContextError,
+    Registered, StateSession, TimerType, Utf8KeyCodec, async_trait, deque_state, map_state,
+    message_deque_state, message_map_state, message_state, set_state, value_state,
 };
 
 /// Object-safe boxed event context
@@ -227,7 +228,7 @@ where
                 <C::Payload as ErasedStateCodec>::Codec,
             >(name)))
             .map_err(|error| ErasedStateError::from_classified(&error))?;
-        Ok(Box::new(ErasedValue::new(handle)))
+        Ok(Box::new(Erased(handle)))
     }
 
     fn map_state(&self, name: &str) -> Result<BoxMapState<Self::Payload>, ErasedStateError> {
@@ -237,14 +238,14 @@ where
                 <C::Payload as ErasedStateCodec>::Codec,
             >(name)))
             .map_err(|error| ErasedStateError::from_classified(&error))?;
-        Ok(Box::new(ErasedMap::new(handle)))
+        Ok(Box::new(Erased(handle)))
     }
 
     fn set_state(&self, name: &str) -> Result<BoxSetState, ErasedStateError> {
         let handle = self
             .state(Registered::new(set_state::<Utf8KeyCodec>(name)))
             .map_err(|error| ErasedStateError::from_classified(&error))?;
-        Ok(Box::new(ErasedSet::new(handle)))
+        Ok(Box::new(Erased(handle)))
     }
 
     fn deque_state(&self, name: &str) -> Result<BoxDequeState<Self::Payload>, ErasedStateError> {
@@ -253,7 +254,7 @@ where
                 <C::Payload as ErasedStateCodec>::Codec,
             >(name)))
             .map_err(|error| ErasedStateError::from_classified(&error))?;
-        Ok(Box::new(ErasedDeque::new(handle)))
+        Ok(Box::new(Erased(handle)))
     }
 
     fn message_value_state(
@@ -265,7 +266,7 @@ where
                 <C::State as StateSession>::Loader,
             >(name)))
             .map_err(|error| ErasedStateError::from_classified(&error))?;
-        Ok(Box::new(ErasedValue::new(handle)))
+        Ok(Box::new(Erased(handle)))
     }
 
     fn message_map_state(
@@ -278,7 +279,7 @@ where
                 <C::State as StateSession>::Loader,
             >(name)))
             .map_err(|error| ErasedStateError::from_classified(&error))?;
-        Ok(Box::new(ErasedMap::new(handle)))
+        Ok(Box::new(Erased(handle)))
     }
 
     fn message_deque_state(
@@ -290,6 +291,6 @@ where
                 <C::State as StateSession>::Loader,
             >(name)))
             .map_err(|error| ErasedStateError::from_classified(&error))?;
-        Ok(Box::new(ErasedDeque::new(handle)))
+        Ok(Box::new(Erased(handle)))
     }
 }

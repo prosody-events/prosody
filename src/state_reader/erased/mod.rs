@@ -2,37 +2,18 @@
 
 use crate::Key;
 use crate::codec::Codec;
+use crate::state::ErasedKeyQuery;
 use crate::state::descriptor::{DequeDescriptor, MapDescriptor, SetDescriptor, ValueDescriptor};
-use crate::state::erased::{ErasedDequeRead, ErasedKeyRead, ErasedStateError, StateCursor, read};
+use crate::state::erased::{
+    Erased, ErasedDequeRead, ErasedKeyRead, ErasedStateError, StateCursor, read,
+};
 use crate::state::order_codec::Utf8KeyCodec;
-use crate::state::{ErasedKeyQuery, ReadCachePolicy};
 use crate::state_reader::{ReaderBackend, StateReader, StateReaderError};
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
-use std::time::Duration;
 
-/// Cache policy accepted by foreign-language published-state readers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ErasedReadCache {
-    /// Use the client's configured default.
-    #[default]
-    Inherit,
-    /// Read durable storage for every operation.
-    Disabled,
-    /// Cache committed reads for this duration.
-    Ttl(Duration),
-}
-
-impl From<ErasedReadCache> for ReadCachePolicy {
-    fn from(cache: ErasedReadCache) -> Self {
-        match cache {
-            ErasedReadCache::Inherit => Self::Inherit,
-            ErasedReadCache::Disabled => Self::Disabled,
-            ErasedReadCache::Ttl(ttl) => Self::Ttl(ttl),
-        }
-    }
-}
+pub use crate::state::ReadCachePolicy as ErasedReadCache;
 
 /// Read-only access to a published value collection.
 #[async_trait]
@@ -128,12 +109,8 @@ pub trait ErasedDequeReader<Item: Send + 'static>: Send + Sync {
 /// Shared deque-reader representation stored by native FFI wrappers.
 pub type SharedDequeReader<Item> = Arc<dyn ErasedDequeReader<Item>>;
 
-pub(crate) struct ValueReader<C: Codec, W: Codec, B: ReaderBackend<W>>(
-    pub(crate) StateReader<ValueDescriptor<C>, W, B>,
-);
-
 #[async_trait]
-impl<C, W, B> ErasedValueReader<C::Payload> for ValueReader<C, W, B>
+impl<C, W, B> ErasedValueReader<C::Payload> for Erased<StateReader<ValueDescriptor<C>, W, B>>
 where
     C: Codec + Send + Sync,
     C::Payload: Clone + Send + Sync + 'static,
@@ -146,12 +123,9 @@ where
     }
 }
 
-pub(crate) struct MapReader<C: Codec, W: Codec, B: ReaderBackend<W>>(
-    pub(crate) StateReader<MapDescriptor<Utf8KeyCodec, C>, W, B>,
-);
-
 #[async_trait]
-impl<C, W, B> ErasedMapReader<C::Payload> for MapReader<C, W, B>
+impl<C, W, B> ErasedMapReader<C::Payload>
+    for Erased<StateReader<MapDescriptor<Utf8KeyCodec, C>, W, B>>
 where
     C: Codec + Send + Sync,
     C::Payload: Clone + Send + Sync + 'static,
@@ -209,10 +183,10 @@ where
         read(move |query: ErasedKeyQuery| {
             let reader = reader.clone();
             let key = key.clone();
-            Box::new(state_cursor(async_stream::try_stream! {
+            state_cursor(async_stream::try_stream! {
                 let stream = reader.entries(key).with_query(query.borrowed()).stream();
                 for await item in stream { yield item?; }
-            }))
+            })
         })
     }
 
@@ -222,20 +196,16 @@ where
         read(move |query: ErasedKeyQuery| {
             let reader = reader.clone();
             let key = key.clone();
-            Box::new(state_cursor(async_stream::try_stream! {
+            state_cursor(async_stream::try_stream! {
                 let stream = reader.keys(key).with_query(query.borrowed()).stream();
                 for await item in stream { yield item?; }
-            }))
+            })
         })
     }
 }
 
-pub(crate) struct SetReader<W: Codec, B: ReaderBackend<W>>(
-    pub(crate) StateReader<SetDescriptor<Utf8KeyCodec>, W, B>,
-);
-
 #[async_trait]
-impl<W, B> ErasedSetReader for SetReader<W, B>
+impl<W, B> ErasedSetReader for Erased<StateReader<SetDescriptor<Utf8KeyCodec>, W, B>>
 where
     W: Codec,
     W::Payload: Clone,
@@ -269,20 +239,16 @@ where
         read(move |query: ErasedKeyQuery| {
             let reader = reader.clone();
             let key = key.clone();
-            Box::new(state_cursor(async_stream::try_stream! {
+            state_cursor(async_stream::try_stream! {
                 let stream = reader.keys(key).with_query(query.borrowed()).stream();
                 for await item in stream { yield item?; }
-            }))
+            })
         })
     }
 }
 
-pub(crate) struct DequeReader<C: Codec, W: Codec, B: ReaderBackend<W>>(
-    pub(crate) StateReader<DequeDescriptor<C>, W, B>,
-);
-
 #[async_trait]
-impl<C, W, B> ErasedDequeReader<C::Payload> for DequeReader<C, W, B>
+impl<C, W, B> ErasedDequeReader<C::Payload> for Erased<StateReader<DequeDescriptor<C>, W, B>>
 where
     C: Codec + Send + Sync,
     C::Payload: Clone + Send + Sync + 'static,
@@ -315,7 +281,7 @@ where
         let key = Key::from(key);
         read(move |query| {
             let stream = reader.values(key.clone()).with_query(query).stream();
-            Box::new(state_cursor(stream))
+            state_cursor(stream)
         })
     }
 }

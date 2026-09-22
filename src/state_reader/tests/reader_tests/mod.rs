@@ -22,7 +22,7 @@ use super::support::{
 use crate::Key;
 use crate::codec::JsonCodec;
 use crate::state::cell::{Presence, Values};
-use crate::state::cell_key::{Coordinate, Direction, Scan, ScanEdge, Section};
+use crate::state::cell_key::{Coordinate, Direction, Scan, Section};
 use crate::state::descriptor::{
     DescriptorIdentity, StateDescriptor, deque_state, map_state, set_state, value_state,
 };
@@ -40,6 +40,7 @@ use color_eyre::eyre::{Result, bail, eyre};
 use futures::{TryStreamExt, executor::block_on};
 use serde_json::Value;
 use std::num::NonZeroU64;
+use std::ops::Bound;
 use std::time::Duration;
 
 /// Instantiates a memory `prop_reader_<kind>_committed` test.
@@ -185,9 +186,9 @@ async fn reader_reads_prev_in_commit_window() -> Result<()> {
     assert_eq!(presence.as_slice(), expected);
     let scan = Scan {
         section,
-        start: ScanEdge::Unbounded,
+        start: Bound::Unbounded,
         dir: Direction::Forward,
-        end: ScanEdge::Unbounded,
+        end: Bound::Unbounded,
         fetch_hint: None,
     };
     let values =

@@ -123,11 +123,9 @@ async fn check_queries(keys: &[String], steps: &[KeyStep], tracked: bool) -> Res
     )
     .await;
     let deps = harness.deps();
-    let map: SharedMapReader<Value> =
-        Arc::new(MapReader(StateReader::new(&deps, sub.clone(), map)?));
-    let set: SharedSetReader = Arc::new(SetReader(StateReader::new(&deps, sub.clone(), set)?));
-    let deque: SharedDequeReader<Value> =
-        Arc::new(DequeReader(StateReader::new(&deps, sub, deque)?));
+    let map: SharedMapReader<Value> = Arc::new(Erased(StateReader::new(&deps, sub.clone(), map)?));
+    let set: SharedSetReader = Arc::new(Erased(StateReader::new(&deps, sub.clone(), set)?));
+    let deque: SharedDequeReader<Value> = Arc::new(Erased(StateReader::new(&deps, sub, deque)?));
     assert_queries(&map, &set, &deque, &key, keys, steps).await
 }
 
@@ -176,16 +174,15 @@ async fn assert_queries(
                 reader.entries(key.to_string())
             };
             let read = key_read(read, dir, steps);
-            let first = drain_cursor(&*read.clone().limit(NonZeroUsize::MIN).stream()).await?;
+            let first = drain_cursor(&read.clone().limit(NonZeroUsize::MIN).stream()).await?;
             assert_eq!(first, entries.iter().take(1).cloned().collect::<Vec<_>>());
-            assert_eq!(drain_cursor(&*read.stream()).await?, entries);
+            assert_eq!(drain_cursor(&read.stream()).await?, entries);
             assert_eq!(
-                drain_cursor(&*map.keys(key.to_string()).with_query(query.clone()).stream())
-                    .await?,
+                drain_cursor(&map.keys(key.to_string()).with_query(query.clone()).stream()).await?,
                 expected
             );
             assert_eq!(
-                drain_cursor(&*set.keys(key.to_string()).with_query(query).stream()).await?,
+                drain_cursor(&set.keys(key.to_string()).with_query(query).stream()).await?,
                 expected
             );
         }
@@ -199,7 +196,7 @@ async fn assert_queries(
             expected.truncate(limit.get());
         }
         assert_eq!(
-            drain_cursor(&*deque.values(key.to_string()).with_query(query).stream()).await?,
+            drain_cursor(&deque.values(key.to_string()).with_query(query).stream()).await?,
             expected
         );
     }

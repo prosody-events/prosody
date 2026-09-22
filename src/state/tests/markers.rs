@@ -116,8 +116,9 @@ pub(super) async fn check_memory_read_parity(
     writes: &[(CellKey, ProvisionalWrite)],
     expected: Option<&Bytes>,
 ) -> Result<()> {
-    use crate::state::{Scan, ScanEdge};
+    use crate::state::Scan;
     use futures::TryStreamExt;
+    use std::ops::Bound;
 
     let batch = CoordinateBatch::chunks(writes.iter().map(|(cell, _)| cell.coordinate.clone()))
         .next()
@@ -146,8 +147,8 @@ pub(super) async fn check_memory_read_parity(
     for dir in [Direction::Forward, Direction::Backward] {
         let scan = Scan {
             section: writes[0].0.section,
-            start: ScanEdge::Unbounded,
-            end: ScanEdge::Unbounded,
+            start: Bound::Unbounded,
+            end: Bound::Unbounded,
             dir,
             fetch_hint: None,
         };

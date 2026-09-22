@@ -21,7 +21,7 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
-use std::ops::Bound;
+use std::ops::{Bound, RangeBounds};
 
 /// Disjoint, orderable sub-grouping of one collection's cells.
 ///
@@ -148,105 +148,9 @@ pub enum Direction {
     Backward,
 }
 
-/// One inclusive, exclusive, or unbounded coordinate edge.
-/// Edges follow the scan direction. An unbounded start opens the low side
-/// in forward order and the high side in backward order.
-/// Plans can own or borrow bytes. Store requests borrow those bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScanEdge<T> {
-    /// The endpoint coordinate is part of the range.
-    Included(T),
-
-    /// The endpoint coordinate is excluded from the range.
-    Excluded(T),
-
-    /// No endpoint on this side — the range is open (direction-relative).
-    Unbounded,
-}
-
-/// The start edge used to select a scan statement.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum EdgeKind {
-    /// Include the anchor coordinate.
-    Included,
-    /// Exclude the anchor coordinate.
-    Excluded,
-    /// Scan the whole section.
-    Unbounded,
-}
-
-impl ScanEdge<&[u8]> {
-    /// Returns the anchor. An unbounded start uses the minimum coordinate.
-    pub(crate) fn anchor(&self) -> &[u8] {
-        match self {
-            Self::Included(coordinate) | Self::Excluded(coordinate) => coordinate,
-            Self::Unbounded => &[],
-        }
-    }
-}
-
-impl<T> ScanEdge<T> {
-    /// Returns the kind of this edge.
-    pub(crate) fn kind(&self) -> EdgeKind {
-        match self {
-            Self::Included(_) => EdgeKind::Included,
-            Self::Excluded(_) => EdgeKind::Excluded,
-            Self::Unbounded => EdgeKind::Unbounded,
-        }
-    }
-
-    /// Borrows the inner value, preserving inclusivity — the borrow half of the
-    /// `as_ref().cloned()` pair, parallelling [`Bound::as_ref`].
-    #[must_use]
-    pub fn as_ref(&self) -> ScanEdge<&T> {
-        match self {
-            Self::Included(t) => ScanEdge::Included(t),
-            Self::Excluded(t) => ScanEdge::Excluded(t),
-            Self::Unbounded => ScanEdge::Unbounded,
-        }
-    }
-
-    /// Maps the inner value, preserving inclusivity.
-    #[must_use]
-    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> ScanEdge<U> {
-        match self {
-            Self::Included(t) => ScanEdge::Included(f(t)),
-            Self::Excluded(t) => ScanEdge::Excluded(f(t)),
-            Self::Unbounded => ScanEdge::Unbounded,
-        }
-    }
-}
-
-impl<T: Clone> ScanEdge<&T> {
-    /// Clones the borrowed inner, parallelling [`Bound::cloned`].
-    #[must_use]
-    pub fn cloned(self) -> ScanEdge<T> {
-        match self {
-            Self::Included(t) => ScanEdge::Included(t.clone()),
-            Self::Excluded(t) => ScanEdge::Excluded(t.clone()),
-            Self::Unbounded => ScanEdge::Unbounded,
-        }
-    }
-}
-
-impl<T> From<ScanEdge<T>> for Bound<T> {
-    fn from(edge: ScanEdge<T>) -> Self {
-        match edge {
-            ScanEdge::Included(t) => Bound::Included(t),
-            ScanEdge::Excluded(t) => Bound::Excluded(t),
-            ScanEdge::Unbounded => Bound::Unbounded,
-        }
-    }
-}
-
-/// A single-section cell scan request over a bounded coordinate range.
-///
-/// `section` is required, so a cross-section scan cannot be constructed. The
-/// `start`/`end` [`ScanEdge`]s are **direction-relative**: forward walks from
-/// `start` (the low side) toward `end` (the high side); backward walks from
-/// `start` (the high side) toward `end` (the low side). Either edge may be
-/// [`ScanEdge::Unbounded`] (open on that side), so a scan is still single-
-/// section but need not be pinned to a known coordinate range.
+/// A cell scan within one section.
+/// Bounds follow the scan direction. Forward scans start low and end high.
+/// Backward scans start high and end low. Either bound can be unbounded.
 #[derive(Clone, Copy)]
 pub struct Scan<'a> {
     /// The section whose cells the scan walks.
@@ -254,13 +158,13 @@ pub struct Scan<'a> {
 
     /// The edge the scan starts walking from (low side forward, high side
     /// backward).
-    pub start: ScanEdge<&'a [u8]>,
+    pub start: Bound<&'a [u8]>,
 
     /// The direction the scan walks from `start`.
     pub dir: Direction,
 
     /// The edge the scan stops at (high side forward, low side backward).
-    pub end: ScanEdge<&'a [u8]>,
+    pub end: Bound<&'a [u8]>,
 
     /// The preferred size of the first fetch. A backend sizes its first page or
     /// batch from it and grows later fetches. It never limits results.
@@ -271,45 +175,17 @@ impl Scan<'_> {
     /// The scan's direction-relative edges resolved to absolute `(low, high)`:
     /// forward keeps `(start, end)`, backward swaps to `(end, start)`.
     #[must_use]
-    pub fn low_high(&self) -> (ScanEdge<&[u8]>, ScanEdge<&[u8]>) {
+    pub fn low_high(&self) -> (Bound<&[u8]>, Bound<&[u8]>) {
         match self.dir {
             Direction::Forward => (self.start, self.end),
             Direction::Backward => (self.end, self.start),
         }
     }
 
-    /// Whether `coordinate` lies within the scan's coordinate range, accounting
-    /// for direction and bound exclusivity.
-    ///
-    /// One of three equivalent range predicates — this one (used by the
-    /// in-memory and overlay legs), the Cassandra hand-roll (CQL comparators
-    /// plus `past_end`), and the test oracle `in_scan_range`. Their parity is
-    /// pinned by the backend-generic property test `run_bottom_scan_trace`,
-    /// which runs one generator against both `MemoryCellStore` and a live
-    /// `CassandraStore` under the shared oracle across the full
-    /// Direction × exclusivity space, so a one-sided edit fails the suite.
+    /// Tests whether a coordinate lies within the bounds in scan order.
     #[must_use]
     pub fn contains(&self, coordinate: &Coordinate) -> bool {
-        let (low, high) = self.low_high();
-        above_low(coordinate, low) && below_high(coordinate, high)
-    }
-}
-
-/// Whether `coordinate` is at or above the low `edge`.
-fn above_low(coordinate: &Coordinate, edge: ScanEdge<&[u8]>) -> bool {
-    match edge {
-        ScanEdge::Included(lo) => coordinate.as_bytes() >= lo,
-        ScanEdge::Excluded(lo) => coordinate.as_bytes() > lo,
-        ScanEdge::Unbounded => true,
-    }
-}
-
-/// Whether `coordinate` is at or below the high `edge`.
-fn below_high(coordinate: &Coordinate, edge: ScanEdge<&[u8]>) -> bool {
-    match edge {
-        ScanEdge::Included(hi) => coordinate.as_bytes() <= hi,
-        ScanEdge::Excluded(hi) => coordinate.as_bytes() < hi,
-        ScanEdge::Unbounded => true,
+        RangeBounds::<[u8]>::contains(&self.low_high(), coordinate.as_bytes())
     }
 }
 

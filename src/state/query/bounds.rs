@@ -1,7 +1,7 @@
 //! Encoded map and set bounds and ordered coordinate selection.
 
 use super::{Edge, KeyQuery};
-use crate::state::cell_key::{Coordinate, Direction, ScanEdge};
+use crate::state::cell_key::{Coordinate, Direction};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec};
 use std::borrow::Borrow;
 use std::num::NonZeroUsize;
@@ -12,8 +12,8 @@ use std::ops::{Bound, Range};
 pub(crate) struct Query<'a> {
     pub(crate) dir: Direction,
     pub(crate) limit: Option<NonZeroUsize>,
-    pub(crate) start: ScanEdge<&'a [u8]>,
-    pub(crate) end: ScanEdge<&'a [u8]>,
+    pub(crate) start: Bound<&'a [u8]>,
+    pub(crate) end: Bound<&'a [u8]>,
 }
 
 impl Query<'_> {
@@ -25,14 +25,14 @@ impl Query<'_> {
             Direction::Backward => (&self.end, &self.start),
         };
         let start = match low {
-            ScanEdge::Included(edge) => coordinates.partition_point(|c| c.as_bytes() < *edge),
-            ScanEdge::Excluded(edge) => coordinates.partition_point(|c| c.as_bytes() <= *edge),
-            ScanEdge::Unbounded => 0,
+            Bound::Included(edge) => coordinates.partition_point(|c| c.as_bytes() < *edge),
+            Bound::Excluded(edge) => coordinates.partition_point(|c| c.as_bytes() <= *edge),
+            Bound::Unbounded => 0,
         };
         let end = match high {
-            ScanEdge::Included(edge) => coordinates.partition_point(|c| c.as_bytes() <= *edge),
-            ScanEdge::Excluded(edge) => coordinates.partition_point(|c| c.as_bytes() < *edge),
-            ScanEdge::Unbounded => coordinates.len(),
+            Bound::Included(edge) => coordinates.partition_point(|c| c.as_bytes() <= *edge),
+            Bound::Excluded(edge) => coordinates.partition_point(|c| c.as_bytes() < *edge),
+            Bound::Unbounded => coordinates.len(),
         };
         coordinates.truncate(end.max(start));
         coordinates.drain(..start);
@@ -66,22 +66,22 @@ fn encode_edge<KC: OrderedKeyCodec, B: Borrow<KC::Borrowed>>(
     codec: &mut KC,
     edge: &Edge<B>,
     buf: &mut Vec<u8>,
-) -> Result<ScanEdge<Range<usize>>, KeyCodecError> {
+) -> Result<Bound<Range<usize>>, KeyCodecError> {
     let start = buf.len();
     let (key, included) = match edge {
-        Edge::Bound(Bound::Unbounded) => return Ok(ScanEdge::Unbounded),
+        Edge::Bound(Bound::Unbounded) => return Ok(Bound::Unbounded),
         Edge::Bound(Bound::Included(key)) => (key, true),
         Edge::Bound(Bound::Excluded(key)) | Edge::PrefixEnd(key) => (key, false),
     };
     codec.serialize_key(key.borrow(), buf)?;
     if matches!(edge, Edge::PrefixEnd(_)) && !prefix_end(buf, start) {
-        return Ok(ScanEdge::Unbounded);
+        return Ok(Bound::Unbounded);
     }
     let range = start..buf.len();
     Ok(if included {
-        ScanEdge::Included(range)
+        Bound::Included(range)
     } else {
-        ScanEdge::Excluded(range)
+        Bound::Excluded(range)
     })
 }
 

@@ -12,7 +12,7 @@
 //! * [`identity`] — collection identity ([`CollectionId`], [`CollectionRef`],
 //!   [`StateKey`], [`CollectionKindId`], …).
 //! * [`cell_key`] — intra-collection cell addressing ([`CellKey`], [`Section`],
-//!   [`Coordinate`], [`Scan`], [`ScanEdge`]).
+//!   [`Coordinate`], [`Scan`], [`std::ops::Bound`]).
 //! * [`event_ref`] — event identity and verdicts ([`EventRef`],
 //!   [`CommitDecision`], [`StoreOutcome`], …).
 //! * [`cell`] — the provisional-cell durability model ([`Cell`], [`Committed`],
@@ -62,8 +62,8 @@
 //! a scan. An overflowed map or set uses a full-section scan.
 //! That scan can encounter tombstones until compaction removes them.
 //!
-//! A [`descriptor::deque`] scan uses [`ScanEdge`] bounds from its live window.
-//! Its range contracts as those bounds expire.
+//! A [`descriptor::deque`] scan uses [`std::ops::Bound`] bounds from its live
+//! window. Its range contracts as those bounds expire.
 //!
 //! **Cross-assignment clock skew is a standard Cassandra assumption, not a new
 //! hazard.** Last-write-wins ordering *across* assignments — a new assignee's
@@ -113,7 +113,7 @@ mod store_types;
 pub(crate) mod tests;
 
 pub use access::StateAccessError;
-pub use cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
+pub use cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 pub use collection::{Collection, StateSession, WritableStateSession};
 pub use event_ref::{CommitDecision, EventRef, StoreOutcome, TimerEventRef};
 pub use identity::{

@@ -9,7 +9,7 @@ use crate::state::cell_key::CellRef;
 use crate::state::store::{CellBackend, CellRead, Durable};
 
 use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
-use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
+use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::super::dirty::DirtyStore;
 use super::super::identity::{CollectionId, CollectionRef};
 use super::super::marker::{EventMarker, SectionClear};
@@ -38,6 +38,7 @@ use std::error::Error;
 use std::future::{Future, ready};
 use std::iter;
 use std::num::NonZeroUsize;
+use std::ops::Bound;
 use std::slice;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -1449,9 +1450,9 @@ fn in_scan_range(req: ScanReq, c: u8) -> bool {
 /// `req.start_kind`/`req.end_kind` choose each edge (incl/excl/unbounded).
 fn scan_of<'a>(req: ScanReq, start: &'a Coordinate, end: &'a Coordinate) -> Scan<'a> {
     let edge = |kind, coordinate| match kind {
-        EdgeKind::Included => ScanEdge::Included(coordinate),
-        EdgeKind::Excluded => ScanEdge::Excluded(coordinate),
-        EdgeKind::Unbounded => ScanEdge::Unbounded,
+        EdgeKind::Included => Bound::Included(coordinate),
+        EdgeKind::Excluded => Bound::Excluded(coordinate),
+        EdgeKind::Unbounded => Bound::Unbounded,
     };
     let start = edge(req.start_kind, start.as_bytes());
     let end = edge(req.end_kind, end.as_bytes());
