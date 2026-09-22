@@ -199,7 +199,10 @@ pub(crate) trait ShapeProbe {
 pub(crate) struct MemoryShapeProbe(pub(crate) MemoryCells);
 
 impl ShapeProbe for MemoryShapeProbe {
-    fn cell_rows(&self, id: &CollectionId) -> impl Future<Output = Result<RowKeys>> {
+    fn cell_rows<'a, 'b>(
+        &'a self,
+        id: &'b CollectionId,
+    ) -> impl Future<Output = Result<RowKeys>> + use<'a, 'b> {
         ready(Ok(self
             .0
             .stored_coordinates(id)
@@ -208,17 +211,20 @@ impl ShapeProbe for MemoryShapeProbe {
             .collect()))
     }
 
-    fn unsettled_marker(
-        &self,
-        id: &CollectionId,
-    ) -> impl Future<Output = Result<Option<ProbedMarker>>> {
+    fn unsettled_marker<'a, 'b>(
+        &'a self,
+        id: &'b CollectionId,
+    ) -> impl Future<Output = Result<Option<ProbedMarker>>> + use<'a, 'b> {
         ready(Ok(self.0.unsettled_marker_of(id).map(|marker| {
             let (staged, clears) = probed_parts(&marker);
             (marker.event(), staged, clears)
         })))
     }
 
-    fn provisional_rows(&self, id: &CollectionId) -> impl Future<Output = Result<RowKeys>> {
+    fn provisional_rows<'a, 'b>(
+        &'a self,
+        id: &'b CollectionId,
+    ) -> impl Future<Output = Result<RowKeys>> + use<'a, 'b> {
         ready(Ok(self
             .0
             .provisional_coordinates(id)

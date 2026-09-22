@@ -24,7 +24,7 @@ impl CoordinateBatch {
     /// Splits `coords` into maximal `1..=CELL_BATCH` batches in input order.
     pub fn chunks<I: IntoIterator<Item = Coordinate>>(
         coords: I,
-    ) -> impl Iterator<Item = CoordinateBatch> {
+    ) -> impl Iterator<Item = CoordinateBatch> + use<I> {
         let mut it = coords.into_iter();
         from_fn(move || {
             let batch: CellBuffer<Coordinate> = it.by_ref().take(CELL_BATCH.get()).collect();

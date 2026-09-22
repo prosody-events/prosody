@@ -166,7 +166,7 @@ impl CellResolver for GateResolver {
     fn resolve(
         ctx: Self::Context<'_>,
         stored: i64,
-    ) -> impl Future<Output = Result<i64, StateAccessError>> + Send {
+    ) -> impl Future<Output = Result<i64, StateAccessError>> + Send + use<'_> {
         let GateContext(ladder) = ctx;
         let gate = usize::try_from(stored).unwrap_or(usize::MAX);
         async move {

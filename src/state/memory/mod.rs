@@ -189,7 +189,7 @@ impl CellStore for MemoryCellStore {
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + use<'a> {
         ready(Ok(match self.read_raw(collection, cell) {
             Cell::Provisional(provisional) => Some(provisional),
             Cell::Resolved(_) => None,
@@ -201,8 +201,9 @@ impl CellStore for MemoryCellStore {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
-    {
+    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>>
+    + Send
+    + use<'a> {
         // No batch query of its own — the raw point-loop reference, reading each
         // distinct coordinate through `provisional_cell_at` in ascending order.
         provisional_point_loop(self, collection, section, batch)

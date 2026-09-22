@@ -138,7 +138,8 @@ where
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + use<'a, S>
+    {
         self.inner.provisional_cell_at(collection, cell)
     }
 
@@ -147,8 +148,9 @@ where
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
-    {
+    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>>
+    + Send
+    + use<'a, S> {
         self.inner.provisional_many(collection, section, batch)
     }
 
@@ -157,7 +159,7 @@ where
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
         marker: Option<&'a EventMarker>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, S> {
         self.inner.write_provisional(collection, writes, marker)
     }
 
@@ -166,7 +168,7 @@ where
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
         clears: &'a [SectionClear],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, S> {
         self.inner.write_resolved(collection, cells, clears)
     }
 
@@ -174,7 +176,7 @@ where
         &'a self,
         collection: &'a CollectionRef,
         cells: &'a [CellKey],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, S> {
         self.inner.mark_resolved(collection, cells)
     }
 
@@ -190,7 +192,7 @@ where
         collection: &'a CollectionRef,
         marker: &'a EventMarker,
         writes: &'a [(CellKey, ProvisionalWrite)],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, S> {
         self.inner.commit_provisional(collection, marker, writes)
     }
 
@@ -198,7 +200,7 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, S> {
         self.inner.abort_provisional(collection, writes)
     }
 }

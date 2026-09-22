@@ -165,24 +165,26 @@ impl<P, Q: Projection> sealed::Reads<UnavailableState<P>, Q> for UnavailableEngi
 where
     P: Clone + Send + Sync + 'static,
 {
-    fn read_point(
-        _session: &UnavailableState<P>,
-        _inner: &mut Self::ReadInner<'_>,
+    fn read_point<'a, 'b, 'c, 'd, 'e>(
+        _session: &'a UnavailableState<P>,
+        _inner: &'b mut Self::ReadInner<'c>,
         _state_type: StateType,
-        _name: &StateName,
-        _cell: &CellKey,
-    ) -> impl Future<Output = Result<Option<Q::Payload>, StateAccessError>> {
+        _name: &'d StateName,
+        _cell: &'e CellKey,
+    ) -> impl Future<Output = Result<Option<Q::Payload>, StateAccessError>> + use<'a, 'b, 'c, 'd, 'e, P, Q>
+    {
         ready(Err(StateAccessError::Unavailable))
     }
 
-    fn read_batch(
-        _session: &UnavailableState<P>,
-        _inner: &mut Self::ReadInner<'_>,
+    fn read_batch<'a, 'b, 'c, 'd, 'e>(
+        _session: &'a UnavailableState<P>,
+        _inner: &'b mut Self::ReadInner<'c>,
         _state_type: StateType,
-        _name: &StateName,
+        _name: &'d StateName,
         _section: Section,
-        _batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<Option<Q::Payload>>, StateAccessError>> {
+        _batch: &'e CoordinateBatch,
+    ) -> impl Future<Output = Result<CellBuffer<Option<Q::Payload>>, StateAccessError>>
+    + use<'a, 'b, 'c, 'd, 'e, P, Q> {
         ready(Err(StateAccessError::Unavailable))
     }
 
@@ -206,7 +208,7 @@ where
 
     fn begin_write(
         _session: &UnavailableState<P>,
-    ) -> impl Future<Output = Result<NoWrite, StateAccessError>> {
+    ) -> impl Future<Output = Result<NoWrite, StateAccessError>> + use<'_, P> {
         ready(Err(StateAccessError::Unavailable))
     }
 
@@ -226,19 +228,19 @@ where
     ) {
     }
 
-    fn commit(
-        _session: &UnavailableState<P>,
+    fn commit<'a, 'b>(
+        _session: &'a UnavailableState<P>,
         _state_type: StateType,
-        _name: &StateName,
-    ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> {
+        _name: &'b StateName,
+    ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + use<'a, 'b, P> {
         ready(Err(StateAccessError::Unavailable))
     }
 
-    fn rollback(
-        _session: &UnavailableState<P>,
+    fn rollback<'a, 'b>(
+        _session: &'a UnavailableState<P>,
         _state_type: StateType,
-        _name: &StateName,
-    ) -> impl Future<Output = StoreOutcome> {
+        _name: &'b StateName,
+    ) -> impl Future<Output = StoreOutcome> + use<'a, 'b, P> {
         // Stateless: nothing is ever buffered, so the discard is a NoOp.
         ready(StoreOutcome::NoOp)
     }
@@ -284,7 +286,8 @@ where
 
     fn finalize(
         &self,
-    ) -> impl Future<Output = Result<Finalized<Self::Cell, ()>, StateAccessError>> {
+    ) -> impl Future<Output = Result<Finalized<Self::Cell, ()>, StateAccessError>> + use<'_, P>
+    {
         ready(Ok(Finalized::Clean))
     }
 
@@ -292,7 +295,7 @@ where
         &self,
         _marker: MessageMarker,
         _proof: MarkerWrite,
-    ) -> impl Future<Output = Result<(), StateAccessError>> {
+    ) -> impl Future<Output = Result<(), StateAccessError>> + use<'_, P> {
         ready(Ok(()))
     }
 

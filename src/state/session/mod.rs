@@ -478,7 +478,7 @@ pub(crate) mod sealed {
         /// Closes the session's gate for settlement — one acquire, phase
         /// `Closed`, permit returned — tagging the wait warnings with this
         /// session's event and key. See [`SessionGate::close`].
-        fn close_gate(&self) -> impl Future<Output = OpPermit<'_>> + Send;
+        fn close_gate(&self) -> impl Future<Output = OpPermit<'_>> + Send + use<'_, Self>;
 
         /// Resolves every touched collection by its commit mode:
         /// `ReadCommitted` collections stage a provisional cell,
@@ -496,7 +496,9 @@ pub(crate) mod sealed {
         /// a retried `finalize` re-stages idempotently.
         fn finalize(
             &self,
-        ) -> impl Future<Output = Result<Finalized<Self::Cell, Self::Checks>, StateAccessError>> + Send;
+        ) -> impl Future<Output = Result<Finalized<Self::Cell, Self::Checks>, StateAccessError>>
+        + Send
+        + use<'_, Self>;
 
         /// Records the message dedup id with an idempotent upsert.
         /// The boundary retries failures before it commits the source.
@@ -504,7 +506,7 @@ pub(crate) mod sealed {
             &self,
             marker: MessageMarker,
             proof: MarkerWrite,
-        ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
+        ) -> impl Future<Output = Result<(), StateAccessError>> + Send + use<'_, Self>;
 
         /// Discards just this event's buffered dirty cells — the isolation step
         /// of the attempt-boundary [`Self::reset`] transition (which then bumps
@@ -540,7 +542,7 @@ pub(crate) mod sealed {
         /// bump and survive into the next attempt. This is the epoch's ONLY
         /// bump site. Gated by [`RepinProof`] so a lone bump (a partial reset
         /// with no matching re-pin) is unwritable outside the two mint sites.
-        fn reset(&self, proof: RepinProof) -> impl Future<Output = ()> + Send;
+        fn reset(&self, proof: RepinProof) -> impl Future<Output = ()> + Send + use<'_, Self>;
 
         /// A session clone re-pinned to the CURRENT epoch — the crate-internal
         /// re-pin constructor. [`RepinProof`]-gated so only the two mint sites
@@ -1418,9 +1420,9 @@ struct StageChunk {
 /// reproduces the input; each chunk's `batch` is built from its own records, so
 /// it aligns 1:1 with them. Splitting per section (not purely by count) keeps
 /// every `get_many` call single-section, as its `section` argument requires.
-fn stage_chunks(
-    survivors: impl Iterator<Item = (CellKey, Option<Bytes>)>,
-) -> impl Iterator<Item = StageChunk> {
+fn stage_chunks<I: Iterator<Item = (CellKey, Option<Bytes>)>>(
+    survivors: I,
+) -> impl Iterator<Item = StageChunk> + use<I> {
     let mut it = survivors.peekable();
     from_fn(move || {
         // `Section` is `Copy`, so the peek borrow ends here, before `next_if`.

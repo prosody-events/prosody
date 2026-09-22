@@ -199,12 +199,12 @@ pub trait PartitionStateManager: Clone + Send + Sync + 'static {
     /// Admission then retires each committed source: the message dedup id or
     /// the timer trigger. A permanent store rejection skips its step and does
     /// not block dispatch. Shutdown returns [`Admission::Abandoned`].
-    fn admit<T>(
-        &self,
+    fn admit<'a, 'b, 'c, T>(
+        &'a self,
         key: Key,
-        timers: &TimerManager<T>,
-        shutdown: &watch::Receiver<ShutdownPhase>,
-    ) -> impl Future<Output = Admission> + Send
+        timers: &'b TimerManager<T>,
+        shutdown: &'c watch::Receiver<ShutdownPhase>,
+    ) -> impl Future<Output = Admission> + Send + use<'a, 'b, 'c, Self, T>
     where
         T: TriggerStore;
 }
@@ -250,7 +250,7 @@ pub trait PartitionStateProvider<T>: Clone + Send + Sync + 'static {
         topic: Topic,
         partition: Partition,
         triggers: T,
-    ) -> impl Future<Output = Result<Self::Manager, Self::AcquireError>> + Send;
+    ) -> impl Future<Output = Result<Self::Manager, Self::AcquireError>> + Send + use<'_, Self, T>;
 }
 
 struct StateManagerInner<B, L>

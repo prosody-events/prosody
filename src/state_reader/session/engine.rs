@@ -89,7 +89,7 @@ impl<C: Codec, B: ReaderBackend<C>> sealed::ReadEngine<ReadSession<C, B>> for Re
 
     fn begin_read(
         session: &ReadSession<C, B>,
-    ) -> impl Future<Output = Option<PinnedSource>> + Send {
+    ) -> impl Future<Output = Option<PinnedSource>> + Send + use<'_, C, B> {
         // Admission is not a concept here: the invocation starts from whatever
         // the session already selected and performs no I/O until its first
         // command.
@@ -100,10 +100,10 @@ impl<C: Codec, B: ReaderBackend<C>> sealed::ReadEngine<ReadSession<C, B>> for Re
         inner.clone()
     }
 
-    fn resume<'a>(
+    fn resume<'a, 'b>(
         _session: &'a ReadSession<C, B>,
-        plan: &Self::Plan,
-    ) -> impl Future<Output = Self::ReadInner<'a>> + Send {
+        plan: &'b Self::Plan,
+    ) -> impl Future<Output = Self::ReadInner<'a>> + Send + use<'a, 'b, C, B> {
         ready(plan.clone())
     }
 

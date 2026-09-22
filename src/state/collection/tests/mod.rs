@@ -47,6 +47,7 @@ use educe::Educe;
 use futures::StreamExt;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::iter::{empty, once};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -83,17 +84,16 @@ struct PairHandle<S> {
     cells: Collection<S, PairLayout>,
 }
 
-/// A stateful helper in the author-facing form: it takes the operation, never a
-/// handle, so it cannot acquire admission of its own.
-async fn read_family<C>(
+/// Returns a read future after its local key leaves scope.
+fn read_family<C>(
     op: &mut C,
     family: CellFamily<C::Layout, ProbeCell>,
     key: i64,
-) -> Result<Option<i64>, ProbeError>
+) -> impl Future<Output = Result<Option<i64>, ProbeError>> + use<'_, C>
 where
     C: CollectionRead,
 {
-    op.get(family, &key).await
+    op.get(family, &key)
 }
 
 /// The mutating twin of [`read_family`].
@@ -392,7 +392,7 @@ where
             }
             &Command::Get(family, key) => {
                 assert_eq!(
-                    op.get(family.token(), &key).await?,
+                    read_family(op, family.token(), key).await?,
                     model.visible(family, key),
                     "an in-invocation read folds the journal last-write-wins"
                 );
@@ -409,8 +409,12 @@ where
                 );
             }
             &Command::Contains(family, key) => {
+                let read = {
+                    let bound = key;
+                    op.contains(family.token(), &bound)
+                };
                 assert_eq!(
-                    op.contains(family.token(), &key).await?,
+                    read.await?,
                     model.visible(family, key).is_some(),
                     "presence agrees with the journal fold, without resolving"
                 );
@@ -427,8 +431,12 @@ where
                 );
             }
             &Command::Take(family, key) => {
+                let read = {
+                    let bound = key;
+                    op.take(family.token(), &bound)
+                };
                 assert_eq!(
-                    op.take(family.token(), &key).await?,
+                    read.await?,
                     model.visible(family, key),
                     "take answers from the journal fold, then clears"
                 );

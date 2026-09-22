@@ -10,7 +10,7 @@ use super::{
 use std::future::Future;
 use std::num::NonZeroUsize;
 
-impl<S: StateSession, L> CollectionRead for ReadOperation<'_, S, L> {
+impl<'c, S: StateSession, L> CollectionRead for ReadOperation<'c, S, L> {
     type Layout = L;
     type Session = S;
 
@@ -30,15 +30,17 @@ impl<S: StateSession, L> CollectionRead for ReadOperation<'_, S, L> {
         self.collection.def().capacity
     }
 
-    fn get_many<'a, T>(
-        &mut self,
+    fn get_many<'a, 'op, T, I>(
+        &'op mut self,
         family: CellFamily<L, T>,
-        keys: impl IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>,
+        keys: I,
     ) -> impl Future<
         Output = Result<CellBuffer<Option<ResolvedOf<T>>>, CellStateError<CellCodecError<T>>>,
     > + Send
+    + use<'a, 'op, 'c, S, L, T, I>
     where
         T: CellType,
+        I: IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>,
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         let section = family.section();
@@ -59,11 +61,11 @@ impl<S: StateSession, L> CollectionRead for ReadOperation<'_, S, L> {
         }
     }
 
-    fn contains<T: CellType>(
-        &mut self,
+    fn contains<'a, T: CellType>(
+        &'a mut self,
         family: CellFamily<L, T>,
         key: &BorrowedKeyOf<T>,
-    ) -> impl Future<Output = Result<bool, StateAccessError>> + Send {
+    ) -> impl Future<Output = Result<bool, StateAccessError>> + Send + use<'a, 'c, S, L, T> {
         let cell = family.at(key).cell;
         let Self { collection, inner } = self;
         async move {
@@ -79,11 +81,17 @@ impl<S: StateSession, L> CollectionRead for ReadOperation<'_, S, L> {
         }
     }
 
-    fn contains_many<'a, T: CellType>(
-        &mut self,
+    fn contains_many<'a, 'op, T, I>(
+        &'op mut self,
         family: CellFamily<L, T>,
-        keys: impl IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>,
-    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send {
+        keys: I,
+    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>>
+    + Send
+    + use<'a, 'op, 'c, S, L, T, I>
+    where
+        T: CellType,
+        I: IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>,
+    {
         let section = family.section();
         let Self { collection, inner } = self;
         let keys = keys.into_iter();
@@ -103,11 +111,13 @@ impl<S: StateSession, L> CollectionRead for ReadOperation<'_, S, L> {
         }
     }
 
-    fn get<T>(
-        &mut self,
+    fn get<'a, T>(
+        &'a mut self,
         family: CellFamily<L, T>,
         key: &BorrowedKeyOf<T>,
-    ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send
+    ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>>
+    + Send
+    + use<'a, 'c, S, L, T>
     where
         T: CellType,
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
@@ -134,7 +144,7 @@ impl<S: StateSession, L> CollectionRead for ReadOperation<'_, S, L> {
     }
 }
 
-impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
+impl<'c, S: WritableStateSession, L> CollectionRead for WriteOperation<'c, S, L> {
     type Layout = L;
     type Session = S;
 
@@ -154,15 +164,17 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         self.collection.def().capacity
     }
 
-    fn get_many<'a, T>(
-        &mut self,
+    fn get_many<'a, 'op, T, I>(
+        &'op mut self,
         family: CellFamily<L, T>,
-        keys: impl IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>,
+        keys: I,
     ) -> impl Future<
         Output = Result<CellBuffer<Option<ResolvedOf<T>>>, CellStateError<CellCodecError<T>>>,
     > + Send
+    + use<'a, 'op, 'c, S, L, T, I>
     where
         T: CellType,
+        I: IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>,
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         let section = family.section();
@@ -185,20 +197,26 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         }
     }
 
-    fn contains<T: CellType>(
-        &mut self,
+    fn contains<'a, T: CellType>(
+        &'a mut self,
         family: CellFamily<L, T>,
         key: &BorrowedKeyOf<T>,
-    ) -> impl Future<Output = Result<bool, StateAccessError>> + Send {
+    ) -> impl Future<Output = Result<bool, StateAccessError>> + Send + use<'a, 'c, S, L, T> {
         let cell = family.at(key).cell;
         async move { Ok(self.staged_or_read::<Presence>(&cell).await?.is_some()) }
     }
 
-    fn contains_many<'a, T: CellType>(
-        &mut self,
+    fn contains_many<'a, 'op, T, I>(
+        &'op mut self,
         family: CellFamily<L, T>,
-        keys: impl IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>,
-    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send {
+        keys: I,
+    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>>
+    + Send
+    + use<'a, 'op, 'c, S, L, T, I>
+    where
+        T: CellType,
+        I: IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>,
+    {
         let section = family.section();
         let slots = self.slots::<T, Presence>(family, keys);
         let Self {
@@ -220,11 +238,13 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         }
     }
 
-    fn get<T>(
-        &mut self,
+    fn get<'a, T>(
+        &'a mut self,
         family: CellFamily<L, T>,
         key: &BorrowedKeyOf<T>,
-    ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send
+    ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>>
+    + Send
+    + use<'a, 'c, S, L, T>
     where
         T: CellType,
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,

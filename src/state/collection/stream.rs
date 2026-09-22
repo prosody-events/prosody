@@ -35,7 +35,9 @@ pub(crate) trait StreamProjection<S: StateSession, T: CellType>: Projection {
         session: &S,
         key: KeyOf<T>,
         payload: Self::Payload,
-    ) -> impl Future<Output = Result<Self::Item, CellStateError<CellCodecError<T>>>> + Send;
+    ) -> impl Future<Output = Result<Self::Item, CellStateError<CellCodecError<T>>>>
+    + Send
+    + use<'_, Self, S, T>;
 }
 
 impl<S, T> StreamProjection<S, T> for Values
@@ -62,7 +64,8 @@ impl<S: StateSession, T: CellType> StreamProjection<S, T> for Presence {
         _session: &S,
         key: KeyOf<T>,
         (): Self::Payload,
-    ) -> impl Future<Output = Result<Self::Item, CellStateError<CellCodecError<T>>>> + Send {
+    ) -> impl Future<Output = Result<Self::Item, CellStateError<CellCodecError<T>>>> + Send + use<'_, S, T>
+    {
         ready(Ok(key))
     }
 }

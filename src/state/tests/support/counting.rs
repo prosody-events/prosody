@@ -237,8 +237,9 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
-    {
+    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>>
+    + Send
+    + use<'a, S> {
         self.counts.provisional_many.fetch_add(1, Ordering::Relaxed);
         self.inner.provisional_many(collection, section, batch)
     }
@@ -339,7 +340,7 @@ impl CellResolver for CountingResolver {
     fn resolve(
         ctx: Self::Context<'_>,
         stored: Value,
-    ) -> impl Future<Output = Result<Value, StateAccessError>> + Send {
+    ) -> impl Future<Output = Result<Value, StateAccessError>> + Send + use<'_> {
         ctx.bump();
         ready(Ok(stored))
     }

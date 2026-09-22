@@ -61,7 +61,7 @@ pub trait AssignmentPublisher: Clone + Send + Sync + 'static {
         &self,
         topic: Topic,
         partition: Partition,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'_, Self>;
 }
 
 impl<P> AssignmentPublisher for Option<P>
@@ -93,7 +93,7 @@ impl AssignmentPublisher for NoPublisher {
         &self,
         _topic: Topic,
         _partition: Partition,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'_> {
         ready(Ok(()))
     }
 }

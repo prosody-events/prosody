@@ -138,7 +138,7 @@ impl CollectionDefRegistry {
     /// acquisition validates against the durable identity table.
     pub(crate) fn identities(
         &self,
-    ) -> impl Iterator<Item = (StateType, &StateName, &StructuralIdentity)> {
+    ) -> impl Iterator<Item = (StateType, &StateName, &StructuralIdentity)> + use<'_> {
         self.defs.iter().flat_map(|(state_type, namespace)| {
             namespace
                 .iter()
@@ -149,7 +149,7 @@ impl CollectionDefRegistry {
     /// Returns every registered `(state_type, name)` collection.
     /// Admission also follows marker payloads to discover unregistered
     /// collections.
-    pub(crate) fn collections(&self) -> impl Iterator<Item = (StateType, &StateName)> {
+    pub(crate) fn collections(&self) -> impl Iterator<Item = (StateType, &StateName)> + use<'_> {
         self.defs.iter().flat_map(|(state_type, namespace)| {
             namespace.keys().map(move |name| (*state_type, name))
         })

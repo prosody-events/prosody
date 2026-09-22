@@ -735,12 +735,15 @@ impl FjallCellCache {
     /// [`commit_batch`](Self::commit_batch) (which reads stage expiries inside
     /// its own closure) and the hopping
     /// [`delete_section`](Self::delete_section).
-    fn run_batch(
+    fn run_batch<F>(
         &self,
         handle: Keyspace,
         capacity: usize,
-        fill: impl FnOnce(&mut OwnedWriteBatch, &Keyspace) -> fjall::Result<()> + Send + 'static,
-    ) -> impl Future<Output = Result<(), FjallCellCacheError>> + Send {
+        fill: F,
+    ) -> impl Future<Output = Result<(), FjallCellCacheError>> + Send + use<F>
+    where
+        F: FnOnce(&mut OwnedWriteBatch, &Keyspace) -> fjall::Result<()> + Send + 'static,
+    {
         let database = self.inner.database().clone();
         let task = spawn_blocking(move || {
             let mut batch = OwnedWriteBatch::with_capacity(database, capacity);

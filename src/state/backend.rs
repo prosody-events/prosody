@@ -176,28 +176,46 @@ pub trait AdmissionChecks: Clone + Send + Sync + 'static {
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
     /// Tests whether admission completed for this key.
-    fn contains(&self, key: &Key) -> impl Future<Output = Result<bool, Self::Error>> + Send;
+    fn contains<'a, 'b>(
+        &'a self,
+        key: &'b Key,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send + use<'a, 'b, Self>;
 
     /// Records complete admission.
-    fn mark(&self, key: &Key) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn mark<'a, 'b>(
+        &'a self,
+        key: &'b Key,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, 'b, Self>;
 
     /// Removes admission proof before another dispatch can use it.
-    fn unmark(&self, key: &Key) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn unmark<'a, 'b>(
+        &'a self,
+        key: &'b Key,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, 'b, Self>;
 }
 
 /// Memory stores have no assignment workspace. Each event admits again.
 impl AdmissionChecks for () {
     type Error = Infallible;
 
-    fn contains(&self, _key: &Key) -> impl Future<Output = Result<bool, Self::Error>> {
+    fn contains<'a, 'b>(
+        &'a self,
+        _key: &'b Key,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + use<'a, 'b> {
         ready(Ok(false))
     }
 
-    fn mark(&self, _key: &Key) -> impl Future<Output = Result<(), Self::Error>> {
+    fn mark<'a, 'b>(
+        &'a self,
+        _key: &'b Key,
+    ) -> impl Future<Output = Result<(), Self::Error>> + use<'a, 'b> {
         ready(Ok(()))
     }
 
-    fn unmark(&self, _key: &Key) -> impl Future<Output = Result<(), Self::Error>> {
+    fn unmark<'a, 'b>(
+        &'a self,
+        _key: &'b Key,
+    ) -> impl Future<Output = Result<(), Self::Error>> + use<'a, 'b> {
         ready(Ok(()))
     }
 }

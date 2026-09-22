@@ -33,7 +33,7 @@ const BATCH_LENGTHS: [usize; 5] = [
 ];
 
 /// Supplies keys without a length estimate.
-fn unknown(keys: &[String]) -> impl Iterator<Item = &str> {
+fn unknown(keys: &[String]) -> impl Iterator<Item = &str> + use<'_> {
     let mut keys = keys.iter();
     from_fn(move || keys.next().map(String::as_str))
 }

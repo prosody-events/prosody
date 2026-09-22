@@ -21,7 +21,7 @@ pub(super) trait ErasedWrite: CellType + Sized {
     fn value_set<'a, S>(
         handle: &'a ValueHandle<S, Self>,
         item: ResolvedOf<Self>,
-    ) -> impl Future<Output = Result<(), CellStateError<CellCodecError<Self>>>> + Send + 'a
+    ) -> impl Future<Output = Result<(), CellStateError<CellCodecError<Self>>>> + Send + use<'a, Self, S>
     where
         S: WritableStateSession,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>;
@@ -30,7 +30,7 @@ pub(super) trait ErasedWrite: CellType + Sized {
         handle: &'a MapHandle<S, Utf8KeyCodec, Self>,
         key: String,
         item: ResolvedOf<Self>,
-    ) -> impl Future<Output = Result<(), MapStateError<CellCodecError<Self>>>> + Send + 'a
+    ) -> impl Future<Output = Result<(), MapStateError<CellCodecError<Self>>>> + Send + use<'a, Self, S>
     where
         S: WritableStateSession,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>;
@@ -38,7 +38,7 @@ pub(super) trait ErasedWrite: CellType + Sized {
     fn deque_push_back<'a, S>(
         handle: &'a DequeHandle<S, Self>,
         item: ResolvedOf<Self>,
-    ) -> impl Future<Output = Result<(), DequeStateError<CellCodecError<Self>>>> + Send + 'a
+    ) -> impl Future<Output = Result<(), DequeStateError<CellCodecError<Self>>>> + Send + use<'a, Self, S>
     where
         S: WritableStateSession,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>;
@@ -46,7 +46,7 @@ pub(super) trait ErasedWrite: CellType + Sized {
     fn deque_push_front<'a, S>(
         handle: &'a DequeHandle<S, Self>,
         item: ResolvedOf<Self>,
-    ) -> impl Future<Output = Result<(), DequeStateError<CellCodecError<Self>>>> + Send + 'a
+    ) -> impl Future<Output = Result<(), DequeStateError<CellCodecError<Self>>>> + Send + use<'a, Self, S>
     where
         S: WritableStateSession,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>;
@@ -69,7 +69,7 @@ where
     fn value_set<'a, S>(
         handle: &'a ValueHandle<S, Self>,
         item: C::Payload,
-    ) -> impl Future<Output = Result<(), CellStateError<CellCodecError<Self>>>> + Send + 'a
+    ) -> impl Future<Output = Result<(), CellStateError<CellCodecError<Self>>>> + Send + use<'a, C, S>
     where
         S: WritableStateSession,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>,
@@ -92,7 +92,7 @@ where
     fn deque_push_back<'a, S>(
         handle: &'a DequeHandle<S, Self>,
         item: C::Payload,
-    ) -> impl Future<Output = Result<(), DequeStateError<CellCodecError<Self>>>> + Send + 'a
+    ) -> impl Future<Output = Result<(), DequeStateError<CellCodecError<Self>>>> + Send + use<'a, C, S>
     where
         S: WritableStateSession,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>,
@@ -103,7 +103,7 @@ where
     fn deque_push_front<'a, S>(
         handle: &'a DequeHandle<S, Self>,
         item: C::Payload,
-    ) -> impl Future<Output = Result<(), DequeStateError<CellCodecError<Self>>>> + Send + 'a
+    ) -> impl Future<Output = Result<(), DequeStateError<CellCodecError<Self>>>> + Send + use<'a, C, S>
     where
         S: WritableStateSession,
         for<'s> ContextOf<'s, Self>: FromSession<'s, S>,

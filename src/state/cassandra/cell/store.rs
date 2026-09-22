@@ -81,7 +81,7 @@ impl CassandraStore {
         ttl: i32,
         blobs: &'u [CellBlobs],
         cells: &'u [(CellKey, Option<Bytes>)],
-    ) -> impl Iterator<Item = BatchUnit<CellBatchRow<'u>>> + 'u {
+    ) -> impl Iterator<Item = BatchUnit<CellBatchRow<'u>>> + use<'u> {
         blobs.iter().zip(cells).map(move |(blob, (cell, _))| {
             let addr = CellAddr::new(pk, cell);
             let row = match blob.data() {

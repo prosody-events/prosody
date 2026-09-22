@@ -373,8 +373,9 @@ impl<L: CellStore> CellStore for Cached<L> {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
-    {
+    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>>
+    + Send
+    + use<'a, L> {
         // A raw provisional read the committed-value cache cannot answer, so
         // delegate straight to the lower store — no fjall step, no cache-disabled
         // branch (like `provisional_cell_at`). Nothing is published into the

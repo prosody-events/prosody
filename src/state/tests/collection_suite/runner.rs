@@ -255,7 +255,7 @@ impl<O> Trace<O> {
     /// The `state_reader` test suite replays these ops but always promotes
     /// every event. A `StateReader` only observes committed state, so the
     /// per-event outcome does not matter there.
-    pub(crate) fn events_ops(&self) -> impl Iterator<Item = &[O]> + '_ {
+    pub(crate) fn events_ops(&self) -> impl Iterator<Item = &[O]> + use<'_, O> {
         self.events.iter().map(|event| event.ops.as_slice())
     }
 }

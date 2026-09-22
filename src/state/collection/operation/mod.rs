@@ -304,12 +304,14 @@ impl<S: StateSession, L> sealed_ops::CollectionOperation for ReadOperation<'_, S
 
 impl<S: WritableStateSession, L> sealed_ops::CollectionOperation for WriteOperation<'_, S, L> {}
 
-impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
-    fn take<T>(
-        &mut self,
+impl<'c, S: WritableStateSession, L> CollectionWrite for WriteOperation<'c, S, L> {
+    fn take<'a, T>(
+        &'a mut self,
         family: CellFamily<L, T>,
         key: &BorrowedKeyOf<T>,
-    ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send
+    ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>>
+    + Send
+    + use<'a, 'c, S, L, T>
     where
         T: CellType,
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,

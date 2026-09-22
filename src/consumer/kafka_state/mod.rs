@@ -98,7 +98,7 @@ impl<L: MessageLoader + 'static> CellResolver for MessageResolver<L> {
     fn resolve(
         loader: Self::Context<'_>,
         stored: MessageRef,
-    ) -> impl Future<Output = Result<Self::Resolved, StateAccessError>> + Send {
+    ) -> impl Future<Output = Result<Self::Resolved, StateAccessError>> + Send + use<'_, L> {
         let MessageRef {
             topic,
             partition,

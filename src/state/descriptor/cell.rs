@@ -70,7 +70,7 @@ pub trait CellResolver {
     fn resolve(
         ctx: Self::Context<'_>,
         stored: Self::Stored,
-    ) -> impl Future<Output = Result<Self::Resolved, StateAccessError>> + Send;
+    ) -> impl Future<Output = Result<Self::Resolved, StateAccessError>> + Send + use<'_, Self>;
 
     /// Lowers a written value into the cell value the codec serializes.
     fn stored_from(write: Self::Write<'_>) -> Self::Stored;
@@ -108,7 +108,7 @@ impl<C: Codec> CellResolver for C {
     fn resolve(
         _ctx: Self::Context<'_>,
         stored: C::Payload,
-    ) -> impl Future<Output = Result<C::Payload, StateAccessError>> + Send {
+    ) -> impl Future<Output = Result<C::Payload, StateAccessError>> + Send + use<'_, C> {
         ready(Ok(stored))
     }
 

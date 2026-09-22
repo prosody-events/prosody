@@ -33,16 +33,18 @@ where
     type Router: Router;
 
     /// Builds the shared reader components.
-    fn build_reader(
-        &self,
-        config: &ReaderConfiguration,
-    ) -> impl Future<Output = Result<StateReaderDependencies<C, Self::Reader>, StateReaderError>> + Send;
+    fn build_reader<'a, 'b>(
+        &'a self,
+        config: &'b ReaderConfiguration,
+    ) -> impl Future<Output = Result<StateReaderDependencies<C, Self::Reader>, StateReaderError>>
+    + Send
+    + use<'a, 'b, Self, C>;
 
     /// Builds the peer route over the shared reader backend.
-    fn build_router(
-        &self,
-        config: &PeerConfiguration,
-    ) -> impl Future<Output = Result<Self::Router, ConsumerError>> + Send;
+    fn build_router<'a, 'b>(
+        &'a self,
+        config: &'b PeerConfiguration,
+    ) -> impl Future<Output = Result<Self::Router, ConsumerError>> + Send + use<'a, 'b, Self, C>;
 }
 
 /// In-memory high-level client backend.
@@ -103,11 +105,11 @@ where
     type Reader = MemoryReaderBackend<C>;
     type Router = LocalRouter;
 
-    fn build_reader(
-        &self,
-        config: &ReaderConfiguration,
+    fn build_reader<'a, 'b>(
+        &'a self,
+        config: &'b ReaderConfiguration,
     ) -> impl Future<Output = Result<StateReaderDependencies<C, Self::Reader>, StateReaderError>>
-    {
+    + use<'a, 'b, C> {
         ready(Ok(StateReaderDependencies::memory(
             config.group_id.clone(),
             config.stall_threshold,

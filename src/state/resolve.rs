@@ -67,13 +67,14 @@ impl<'a, S: CellStore> EvidenceLookup<'a, S> {
 }
 
 /// Reads sibling certificates through the caller's marker decoder.
-pub(crate) fn sibling_committed<'a, E, Fut>(
+pub(crate) fn sibling_committed<'a, E, F, Fut>(
     collection: &'a CollectionId,
     marker: &'a EventMarker,
-    read: impl Fn(CollectionId) -> Fut + Send + 'a,
-) -> impl Future<Output = Result<bool, E>> + Send + 'a
+    read: F,
+) -> impl Future<Output = Result<bool, E>> + Send + use<'a, E, F, Fut>
 where
-    Fut: Future<Output = Result<MarkerState, E>> + Send + 'a,
+    F: Fn(CollectionId) -> Fut + Send,
+    Fut: Future<Output = Result<MarkerState, E>> + Send,
 {
     stream::iter(
         marker.touched().iter().filter(move |(kind, name)| {
