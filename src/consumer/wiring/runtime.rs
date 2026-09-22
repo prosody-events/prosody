@@ -60,10 +60,6 @@ pub(in crate::consumer) struct StartupServices<'a, P> {
 ///
 /// `requests` selects result-request reading by type.
 ///
-/// Every caller wraps this future in `Box::pin`, because
-/// `clippy::large_futures` warns otherwise. The allocation is one per consumer
-/// start.
-///
 /// Fails if the configuration is invalid, the probe server can't be started
 /// (if enabled), the consumer context can't be created, the hostname can't be
 /// retrieved for the client ID, the Kafka consumer can't be created with the

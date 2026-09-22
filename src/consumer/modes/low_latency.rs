@@ -193,13 +193,13 @@ where
             observer,
             managers: Arc::clone(&managers),
         };
-        Box::pin(initialize_consumer::<_, _, _, C, _>(
+        initialize_consumer::<_, _, _, C, _>(
             setup.consumer,
             provider,
             providers,
             services,
             requests,
-        ))
+        )
         .await
     }
 }

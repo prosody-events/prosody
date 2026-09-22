@@ -273,12 +273,12 @@ async fn main() -> Result<()> {
     };
 
     let (sender, mut receiver) = channel(keys * 2 + 4);
-    let client = CassandraHighLevelClient::<SpanProbe>::new(
+    let client = Box::pin(CassandraHighLevelClient::<SpanProbe>::new(
         cassandra_config.build()?,
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,
-    )
+    ))
     .await?;
 
     // One shared absolute fire time lands every timer in the same instant, so

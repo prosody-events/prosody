@@ -7,6 +7,7 @@
 use crate::propagator::new_propagator;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
+use futures::TryFutureExt;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use opentelemetry::propagation::TextMapCompositePropagator;
 use scylla::client::Compression;
@@ -21,6 +22,7 @@ use scylla::statement::Consistency;
 use scylla::statement::batch::{Batch, BatchStatement, BatchType};
 use scylla::statement::prepared::PreparedStatement;
 use smallvec::SmallVec;
+use std::future::Future;
 use std::iter;
 use std::ops::Range;
 use std::sync::Arc;
@@ -131,7 +133,7 @@ impl CassandraStore {
     /// - Connection to Cassandra fails
     /// - Schema migration fails
     pub async fn new(config: &CassandraConfiguration) -> Result<Self, CassandraStoreError> {
-        let session = Box::pin(create_session(config)).await?;
+        let session = create_session(config).await?;
 
         // Run all migrations
         let migrator = CassandraMigrator::new(&session, &config.keyspace).await?;
@@ -364,7 +366,9 @@ pub(crate) fn chunk_boundaries(
 }
 
 /// Creates and configures a Cassandra session with the given configuration.
-async fn create_session(config: &CassandraConfiguration) -> Result<Session, CassandraStoreError> {
+fn create_session(
+    config: &CassandraConfiguration,
+) -> impl Future<Output = Result<Session, CassandraStoreError>> + Send + use<> {
     let mut lb_policy = DefaultPolicy::builder()
         .token_aware(true)
         .permit_dc_failover(true);
@@ -397,5 +401,5 @@ async fn create_session(config: &CassandraConfiguration) -> Result<Session, Cass
         session = session.user(user.clone(), config.password.clone().unwrap_or_default());
     }
 
-    Ok(Box::pin(session.build()).await?)
+    Session::connect(session.config).map_err(CassandraStoreError::from)
 }

@@ -31,6 +31,7 @@
 //! - `timeout`: Fixed timeout duration (default: 80% of stall threshold)
 
 use std::future::Future;
+use std::pin::pin;
 use std::time::Duration;
 
 use derive_builder::Builder;
@@ -107,11 +108,8 @@ impl<T> TimeoutHandler<T> {
         F: Future<Output = Result<R, E>>,
     {
         let start = Instant::now();
-        // Box::pin moves the downstream future to the heap. Without this,
-        // the entire composed middleware chain (including large futures like
-        // TimerManager::clear_and_schedule) lives on the stack frame,
-        // overflowing tokio's worker thread stack.
-        let mut operation = Box::pin(operation);
+        // Pin the operation for the timeout race and cancellation cleanup.
+        let mut operation = pin!(operation);
 
         select! {
             result = &mut operation => {

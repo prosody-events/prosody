@@ -117,13 +117,13 @@ impl PipelineMiddlewareStack {
         };
         // Preparation is the last fallible step of this mode: no `?` after it
         // could drop a served listener.
-        Box::pin(initialize_consumer::<_, _, _, C, _>(
+        initialize_consumer::<_, _, _, C, _>(
             &self.consumer_config,
             provider,
             partition_providers,
             services,
             requests,
-        ))
+        )
         .await
     }
 }
