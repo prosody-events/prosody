@@ -3,14 +3,17 @@
 
 use super::*;
 use crate::codec::JsonCodec;
+use crate::error::ErrorCategory;
 use crate::state::backend::AdmissionChecks;
 use crate::state::cell::Values;
 use crate::state::fjall::test_db::cold_marker_checks;
 use crate::state::marker::decode_marker_payload;
+use crate::state::marker::{EventMarker, MarkerVersion};
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::session::Promoted;
 use crate::state::store::CellRead;
 use crate::state::tests::support::{MemoryDeduplicationStore, evidence, run_admit_soundness};
+use crate::state::{CollectionId, CollectionRef, StateName, StateType};
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::Trigger;
 use crate::timers::store::adapter::TableAdapter;

@@ -8,15 +8,17 @@ use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::cassandra::v1::V1Operations;
+use crate::timers::store::cassandra::v1::{V1Operations, coordinated};
 use crate::timers::store::{SegmentId, TriggerV1};
 use ahash::HashMap;
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen};
-use std::collections::BTreeSet;
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
+
+mod model;
+use model::V1HighLevelModel;
 
 /// Type alias for V1 trigger tuple (key, time) - no `timer_type` in V1.
 type TriggerV1Tuple = (Key, CompactDateTime);
@@ -216,145 +218,6 @@ impl Arbitrary for V1HighLevelTestInput {
     }
 }
 
-/// Reference model tracking V1 dual indices.
-#[derive(Clone, Debug)]
-pub struct V1HighLevelModel {
-    /// Triggers indexed by (`segment_id`, `slab_id`).
-    slab_index: HashMap<(SegmentId, SlabId), BTreeSet<TriggerV1Tuple>>,
-    /// Triggers indexed by (`segment_id`, key).
-    key_index: HashMap<(SegmentId, Key), BTreeSet<TriggerV1Tuple>>,
-}
-
-impl Default for V1HighLevelModel {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl V1HighLevelModel {
-    /// Creates a new empty model.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            slab_index: HashMap::default(),
-            key_index: HashMap::default(),
-        }
-    }
-
-    /// Applies an operation to the model.
-    pub fn apply(&mut self, op: &V1HighLevelOperation) {
-        match op {
-            V1HighLevelOperation::AddTrigger {
-                segment_id,
-                slab_id,
-                trigger,
-            } => {
-                let tuple = (trigger.key.clone(), trigger.time);
-
-                // Add to slab index
-                self.slab_index
-                    .entry((*segment_id, *slab_id))
-                    .or_default()
-                    .insert(tuple.clone());
-
-                // Add to key index
-                self.key_index
-                    .entry((*segment_id, trigger.key.clone()))
-                    .or_default()
-                    .insert(tuple);
-            }
-            V1HighLevelOperation::RemoveTrigger {
-                segment_id,
-                slab_id,
-                key,
-                time,
-            } => {
-                let tuple = (key.clone(), *time);
-
-                // Remove from slab index
-                if let Some(triggers) = self.slab_index.get_mut(&(*segment_id, *slab_id)) {
-                    triggers.remove(&tuple);
-                }
-
-                // Remove from key index
-                if let Some(triggers) = self.key_index.get_mut(&(*segment_id, key.clone())) {
-                    triggers.remove(&tuple);
-                }
-            }
-            V1HighLevelOperation::ClearTriggersForKey {
-                segment_id,
-                key,
-                slab_size,
-            } => {
-                // Get all triggers for this key from key index
-                let triggers_to_remove: Vec<TriggerV1Tuple> = self
-                    .key_index
-                    .get(&(*segment_id, key.clone()))
-                    .map(|set| set.iter().cloned().collect())
-                    .unwrap_or_default();
-
-                // Remove from slab index for each trigger
-                for (k, time) in &triggers_to_remove {
-                    let slab = Slab::from_time(*slab_size, *time);
-                    if let Some(triggers) = self.slab_index.get_mut(&(*segment_id, slab.id())) {
-                        triggers.remove(&(k.clone(), *time));
-                    }
-                }
-
-                // Clear from key index
-                self.key_index.remove(&(*segment_id, key.clone()));
-            }
-            V1HighLevelOperation::DeleteSlab {
-                segment_id,
-                slab_id,
-            } => {
-                // Get all triggers in this slab
-                let triggers_to_remove: Vec<TriggerV1Tuple> = self
-                    .slab_index
-                    .get(&(*segment_id, *slab_id))
-                    .map(|set| set.iter().cloned().collect())
-                    .unwrap_or_default();
-
-                // Remove from key index for each trigger
-                for (key, time) in &triggers_to_remove {
-                    if let Some(triggers) = self.key_index.get_mut(&(*segment_id, key.clone())) {
-                        triggers.remove(&(key.clone(), *time));
-                    }
-                }
-
-                // Clear slab index
-                self.slab_index.remove(&(*segment_id, *slab_id));
-            }
-            V1HighLevelOperation::GetSlabTriggers { .. }
-            | V1HighLevelOperation::GetKeyTriggers { .. } => {
-                // Queries don't modify state
-            }
-        }
-    }
-
-    /// Gets triggers from V1 slab index.
-    #[must_use]
-    pub fn get_slab_triggers(
-        &self,
-        segment_id: &SegmentId,
-        slab_id: SlabId,
-    ) -> Vec<TriggerV1Tuple> {
-        self.slab_index
-            .get(&(*segment_id, slab_id))
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default()
-    }
-
-    /// Gets triggers from V1 key index.
-    #[must_use]
-    pub fn get_key_triggers(&self, segment_id: &SegmentId, key: &Key) -> Vec<TriggerV1Tuple> {
-        self.key_index
-            .get(&(*segment_id, key.clone()))
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default()
-    }
-}
-
 /// Applies V1 high-level operations with inline verification.
 async fn apply_v1_high_level_operations(
     store: &V1Operations,
@@ -369,8 +232,7 @@ async fn apply_v1_high_level_operations(
                 trigger,
             } => {
                 model.apply(op);
-                store
-                    .add_trigger(segment_id, *slab_id, trigger.clone())
+                coordinated::add_trigger(store, segment_id, *slab_id, trigger.clone())
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} AddTrigger v1 failed: {e:?}")
@@ -383,8 +245,7 @@ async fn apply_v1_high_level_operations(
                 time,
             } => {
                 model.apply(op);
-                store
-                    .remove_trigger(segment_id, *slab_id, key, *time)
+                coordinated::remove_trigger(store, segment_id, *slab_id, key, *time)
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} RemoveTrigger v1 failed: {e:?}")
@@ -396,8 +257,7 @@ async fn apply_v1_high_level_operations(
                 slab_size,
             } => {
                 model.apply(op);
-                store
-                    .clear_triggers_for_key(segment_id, key, *slab_size)
+                coordinated::clear_triggers_for_key(store, segment_id, key, *slab_size)
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} ClearTriggersForKey v1 failed: {e:?}")
@@ -408,9 +268,11 @@ async fn apply_v1_high_level_operations(
                 slab_id,
             } => {
                 model.apply(op);
-                store.delete_slab(segment_id, *slab_id).await.map_err(|e| {
-                    color_eyre::eyre::eyre!("Op #{op_idx} DeleteSlab v1 failed: {e:?}")
-                })?;
+                coordinated::delete_slab(store, segment_id, *slab_id)
+                    .await
+                    .map_err(|e| {
+                        color_eyre::eyre::eyre!("Op #{op_idx} DeleteSlab v1 failed: {e:?}")
+                    })?;
             }
             V1HighLevelOperation::GetSlabTriggers {
                 segment_id,
