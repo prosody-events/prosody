@@ -19,7 +19,7 @@ use super::super::memory::MemoryCells;
 use super::super::overlay::Overlay;
 use super::super::resolve::{EvidenceLookup, resolve_event_marker};
 use super::super::store::{
-    CELL_BATCH, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, provisional_point_loop,
+    CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, provisional_point_loop,
 };
 use super::super::{CommitDecision, EventRef, StateKey, StateName, StateType};
 pub(crate) use super::support::MemoryDeduplicationStore;

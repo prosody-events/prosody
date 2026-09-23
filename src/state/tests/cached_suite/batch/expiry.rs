@@ -42,7 +42,7 @@ fn batch_get_treats_expired_probe_as_refetch() -> Result<()> {
                 cells
                     .into_iter()
                     .map(|(committed, _)| committed)
-                    .collect::<CommittedBatch>()
+                    .collect::<CellBuffer<Committed>>()
             })?;
         assert_eq!(
             out[0].get(),
@@ -121,7 +121,7 @@ fn batch_get_expiry_boundary_degrade_never_serves_stale() -> Result<()> {
                         cells
                             .into_iter()
                             .map(|(committed, _)| committed)
-                            .collect::<CommittedBatch>()
+                            .collect::<CellBuffer<Committed>>()
                     })
                     .map_err(|error| eyre!("{error:?}"))
             }
@@ -191,7 +191,7 @@ fn batch_get_publishes_absence_only_from_successful_batch() -> Result<()> {
                 cells
                     .into_iter()
                     .map(|(committed, _)| committed)
-                    .collect::<CommittedBatch>()
+                    .collect::<CellBuffer<Committed>>()
             })?;
         assert_eq!(out[0].get(), None, "the never-written cell is absent");
         assert_eq!(
@@ -231,7 +231,7 @@ fn batch_get_publishes_absence_only_from_successful_batch() -> Result<()> {
                     cells
                         .into_iter()
                         .map(|(committed, _)| committed)
-                        .collect::<CommittedBatch>()
+                        .collect::<CellBuffer<Committed>>()
                 });
         assert!(
             err.is_err(),
@@ -335,7 +335,7 @@ fn prop_batch_fill_expiry_never_overhangs() {
                             cells
                                 .into_iter()
                                 .map(|(committed, _)| committed)
-                                .collect::<CommittedBatch>()
+                                .collect::<CellBuffer<Committed>>()
                         })
                         .map_err(|error| eyre!("{error:?}"))
                 }

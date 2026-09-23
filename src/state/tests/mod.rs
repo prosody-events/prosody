@@ -1,5 +1,5 @@
 use crate::state::CommitDecision;
-use crate::state::store::{CellRead, CommittedBatch};
+use crate::state::store::CellRead;
 use crate::state::tests::support::{StageInspection, evidence};
 use crate::test_util::TEST_RUNTIME;
 mod cached_suite;
@@ -88,7 +88,7 @@ fn forwarding_default_preserves_ttl() -> Result<()> {
         CellRead::<Values>::read_many(&store, &id, SECTIONS[0], &batch.as_ref()).await
     })?;
     assert_eq!(got.len(), 2, "every position answered");
-    for (_, remaining) in &got {
+    for (_, remaining) in got.iter() {
         assert_eq!(
             *remaining,
             Some(ttl),

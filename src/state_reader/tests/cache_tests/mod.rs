@@ -18,16 +18,15 @@ use crate::Key;
 use crate::state::access::StateAccessError;
 use crate::state::cell::{Presence, Values};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
-use crate::state::store::CellBuffer;
+use crate::state::store::{CellBuffer, ReadBatch};
 use crate::state::{StateName, StateType};
 use crate::state_reader::cache::{CacheKey, CacheLookup};
 use crate::state_reader::{PartitionCount, source::SourceId};
 use bytes::Bytes;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, eyre};
 use futures::executor::block_on;
 use quanta::Instant;
 use quickcheck::{Arbitrary, Gen, QuickCheck};
-use smallvec::smallvec;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,6 +66,13 @@ fn lookup(key: &CacheKey) -> CacheLookup<'_> {
 
 fn key(name: &str) -> Result<CacheKey> {
     key_at(StateType::Application, name, 1, vec![0])
+}
+
+/// A batch whose one-byte coordinates index a key pool.
+fn pool_batch(indices: &[[u8; 1]]) -> Result<ReadBatch<'_>> {
+    ReadBatch::chunks(indices.iter().map(<[u8; 1]>::as_slice))
+        .next()
+        .ok_or_else(|| eyre!("a pool batch needs an index"))
 }
 
 // --- Staleness property -----------------------------------------------------
@@ -202,15 +208,16 @@ async fn get_many_cached_shortcuts_when_all_fresh() -> Result<()> {
     let (cache, mock) = mock_clock_cache(1 << 20);
     let ttl = Duration::from_secs(5);
     let keys = [key("batch-0")?, key("batch-1")?];
+    let indices = [[0], [1]];
+    let batch = pool_batch(&indices)?;
+    let key_of = |coordinate: &[u8]| lookup(&keys[usize::from(coordinate[0])]);
     let fills = Arc::new(AtomicUsize::new(0));
     let fill = || {
         let fills = fills.clone();
+        let values = batch.map(|coordinate| Some(Bytes::copy_from_slice(coordinate)));
         async move {
             fills.fetch_add(1, Ordering::Relaxed);
-            Ok::<_, StateAccessError>(smallvec![
-                Some(Bytes::from_static(b"a")),
-                Some(Bytes::from_static(b"b")),
-            ])
+            Ok::<_, StateAccessError>(values)
         }
     };
 
@@ -219,7 +226,7 @@ async fn get_many_cached_shortcuts_when_all_fresh() -> Result<()> {
     let value_done = Notify::new();
     let values = async {
         let result = cache
-            .get_many_cached::<Values, _, _>(keys.iter().map(lookup), ttl, || async {
+            .get_many_cached::<Values, _, _>(&batch, key_of, ttl, || async {
                 mock.increment(Duration::from_nanos(1));
                 presence_started.notified().await;
                 fill().await
@@ -228,26 +235,27 @@ async fn get_many_cached_shortcuts_when_all_fresh() -> Result<()> {
         value_done.notify_one();
         result
     };
-    let presence =
-        cache.get_many_cached::<Presence, _, _>(keys.iter().map(lookup), ttl, || async {
-            presence_started.notify_one();
-            value_done.notified().await;
-            Ok(smallvec![Some(()), Some(())])
-        });
+    let presence = cache.get_many_cached::<Presence, _, _>(&batch, key_of, ttl, || async {
+        presence_started.notify_one();
+        value_done.notified().await;
+        Ok(batch.map(|_| Some(())))
+    });
     let (values, presence) = tokio::join!(biased; values, presence);
     values?;
-    assert_eq!(presence?.as_slice(), [Some(()), Some(())]);
+    assert_eq!(*presence?, [Some(()), Some(())]);
     assert_eq!(fills.load(Ordering::Relaxed), 1, "cold batch fills once");
 
     // Both entries remain fresh. The cache answers without a fill.
     let served = cache
-        .get_many_cached::<Values, _, _>(keys.iter().map(lookup), ttl, fill)
+        .get_many_cached::<Values, _, _>(&batch, key_of, ttl, fill)
         .await?;
-    let expected: CellBuffer<Option<Bytes>> = smallvec![
-        Some(Bytes::from_static(b"a")),
-        Some(Bytes::from_static(b"b"))
-    ];
-    assert_eq!(served, expected);
+    assert_eq!(
+        *served,
+        [
+            Some(Bytes::from_static(&[0])),
+            Some(Bytes::from_static(&[1]))
+        ]
+    );
     assert_eq!(
         fills.load(Ordering::Relaxed),
         1,
@@ -258,7 +266,7 @@ async fn get_many_cached_shortcuts_when_all_fresh() -> Result<()> {
     // exactly one whole-batch refill fires (a single fill, not one per key).
     mock.increment(ttl);
     cache
-        .get_many_cached::<Values, _, _>(keys.iter().map(lookup), ttl, fill)
+        .get_many_cached::<Values, _, _>(&batch, key_of, ttl, fill)
         .await?;
     assert_eq!(
         fills.load(Ordering::Relaxed),

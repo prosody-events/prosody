@@ -160,13 +160,14 @@ async fn run_cache_schedule(schedule: CacheSchedule) -> Result<bool> {
                         .get(key)
                         .is_some_and(|(time, _)| issued.duration_since(*time) < CACHE_TTL)
                 });
-                let batch: CellBuffer<_> =
-                    indices.iter().map(|i| keys[*i as usize].clone()).collect();
-                let filled: CellBuffer<_> =
-                    indices.iter().map(|i| fill_value(*i, present)).collect();
+                let coordinates: Vec<[u8; 1]> = indices.iter().map(|&i| [i]).collect();
+                let Ok(batch) = pool_batch(&coordinates) else {
+                    continue;
+                };
+                let filled = batch.map(|coordinate| fill_value(coordinate[0], present));
                 if !all_fresh {
                     expected_fills += 1;
-                    for (key, value) in indices.iter().zip(&filled) {
+                    for (key, value) in indices.iter().zip(filled.iter()) {
                         model.insert(*key, (issued, value.clone()));
                     }
                 }
@@ -174,7 +175,8 @@ async fn run_cache_schedule(schedule: CacheSchedule) -> Result<bool> {
                     indices.iter().map(|key| model[key].1.clone()).collect();
                 let served = cache
                     .get_many_cached::<Values, _, _>(
-                        batch.iter().map(lookup),
+                        &batch,
+                        |coordinate| lookup(&keys[usize::from(coordinate[0])]),
                         CACHE_TTL,
                         || async {
                             fills.fetch_add(1, Ordering::Relaxed);
@@ -182,7 +184,7 @@ async fn run_cache_schedule(schedule: CacheSchedule) -> Result<bool> {
                         },
                     )
                     .await?;
-                assert_eq!(served, expected);
+                assert_eq!(*served, *expected);
                 assert_eq!(fills.load(Ordering::Relaxed), expected_fills);
             }
             CacheStep::Get { key, present } => {

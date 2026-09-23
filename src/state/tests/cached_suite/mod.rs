@@ -14,7 +14,7 @@
 use crate::state::cell::{CacheEntry, Presence, Projection, Read, Values};
 use crate::state::cell_key::CellRef;
 use crate::state::marker::ProvisionalStage;
-use crate::state::store::{CacheBatch, CellBackend, CellRead, CommittedBatch, Durable, ReadBatch};
+use crate::state::store::{CacheBatch, CellBackend, CellRead, Durable, ReadBatch};
 use crate::state::tests::support::listed;
 
 use super::super::cached::{Cached, DELETE_RETRY_BUDGET};
@@ -129,12 +129,9 @@ impl<S: CellRead<P>, P: CountProjection> CellRead<P> for TtlAwareCellStore<S> {
         section: Section,
         batch: &'a ReadBatch<'_>,
     ) -> Result<CacheBatch<P>, Self::Error> {
-        let mut cells = CellRead::<P>::read_many(&self.inner, collection, section, batch).await?;
+        let cells = CellRead::<P>::read_many(&self.inner, collection, section, batch).await?;
         let remaining = self.remaining();
-        for (_, ttl) in &mut cells {
-            *ttl = remaining;
-        }
-        Ok(cells)
+        Ok(cells.map(|(committed, _)| (committed, remaining)))
     }
 
     fn scan<'a>(

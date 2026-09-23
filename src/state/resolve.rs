@@ -14,6 +14,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use std::error::Error;
 use std::future::Future;
 use thiserror::Error;
+use tokio::sync::OnceCell;
 use tokio::task::coop::cooperative;
 
 /// Resolves cells with one evidence snapshot per batch or scan.
@@ -23,7 +24,7 @@ use tokio::task::coop::cooperative;
 pub(crate) struct EvidenceLookup<'a, S> {
     store: &'a S,
     collection: &'a CollectionId,
-    evidence: Option<ReaderEvidence>,
+    evidence: OnceCell<ReaderEvidence>,
 }
 
 impl<'a, S: CellStore> EvidenceLookup<'a, S> {
@@ -31,37 +32,37 @@ impl<'a, S: CellStore> EvidenceLookup<'a, S> {
         Self {
             store,
             collection,
-            evidence: None,
+            evidence: OnceCell::new(),
         }
     }
 
     pub(crate) async fn resolve<P: Projection>(
-        &mut self,
+        &self,
         raw: Cell<P>,
     ) -> Result<Committed<P>, S::Error> {
         if let Cell::Resolved(committed) = raw {
             return Ok(committed);
         }
-        let evidence = if let Some(evidence) = &self.evidence {
-            evidence
-        } else {
-            let store = self.store;
-            let collection = self.collection;
-            let state = store.marker_state(collection).await?;
-            let staged_committed = match &state.staged {
-                Some(marker) => {
-                    sibling_committed(collection, marker, |sibling| async move {
-                        store.marker_state(&sibling).await
-                    })
-                    .await?
-                }
-                None => false,
-            };
-            self.evidence.insert(ReaderEvidence {
-                state,
-                staged_committed,
+        let (store, collection) = (self.store, self.collection);
+        let evidence = self
+            .evidence
+            .get_or_try_init(|| async move {
+                let state = store.marker_state(collection).await?;
+                let staged_committed = match &state.staged {
+                    Some(marker) => {
+                        sibling_committed(collection, marker, |sibling| async move {
+                            store.marker_state(&sibling).await
+                        })
+                        .await?
+                    }
+                    None => false,
+                };
+                Ok(ReaderEvidence {
+                    state,
+                    staged_committed,
+                })
             })
-        };
+            .await?;
         Ok(Committed::new(resolve_for_reader(&raw, evidence).cloned()))
     }
 }

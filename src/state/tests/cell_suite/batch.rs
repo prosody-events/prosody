@@ -173,7 +173,7 @@ pub(crate) async fn run_batch_read_parity_trace<S: CellStore>(
                     cells
                         .into_iter()
                         .map(|(committed, _)| committed)
-                        .collect::<CommittedBatch>()
+                        .collect::<CellBuffer<Committed>>()
                 })?,
         );
         presence.extend(
@@ -221,7 +221,7 @@ pub(crate) async fn run_batch_duplicate_co_observation<S: CellStore>(store: S) -
             cells
                 .into_iter()
                 .map(|(committed, _)| committed)
-                .collect::<CommittedBatch>()
+                .collect::<CellBuffer<Committed>>()
         })?;
     assert_eq!(got.len(), 3, "every position answered");
     assert_eq!(got[0], got[2], "duplicate coordinate co-observes one value");
@@ -284,7 +284,7 @@ pub(crate) async fn run_batch_alignment<S: CellStore>(store: S) -> Result<()> {
                     cells
                         .into_iter()
                         .map(|(committed, _)| committed)
-                        .collect::<CommittedBatch>()
+                        .collect::<CellBuffer<Committed>>()
                 })?,
         );
     }

@@ -42,8 +42,7 @@ use crate::state::marker::{EventMarker, SectionClear, encode_marker_payload};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{EvidenceLookup, ResolveCellError};
 use crate::state::store::{
-    CacheBatch, CellBuffer, CellStore, CoordinateBatch, distinct, repeated,
-    sorted_unique_coordinates,
+    CacheBatch, CellBuffer, CellStore, CoordinateBatch, distinct, sorted_unique_coordinates,
 };
 use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
 use crate::timers::duration::CompactDuration;

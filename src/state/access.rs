@@ -2,7 +2,6 @@
 
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::StructuralIdentity;
-use crate::state::store::MisalignedBatch;
 use std::error::Error;
 use thiserror::Error;
 
@@ -63,10 +62,6 @@ pub enum StateAccessError {
         category: ErrorCategory,
     },
 
-    /// A store answered a batch read with the wrong number of values.
-    #[error(transparent)]
-    MisalignedBatch(#[from] MisalignedBatch),
-
     /// The message loader failed (type-erased).
     #[error("keyed-state message loader failed: {message}")]
     Load {
@@ -123,7 +118,6 @@ impl ClassifyError for StateAccessError {
             // Aligned with the cancellation middleware: a terminated
             // context is a transient condition (retry decides).
             Self::Terminated => ErrorCategory::Transient,
-            Self::MisalignedBatch(error) => error.classify_error(),
             Self::Store { category, .. } | Self::Load { category, .. } => *category,
         }
     }

@@ -232,7 +232,7 @@ where
                 return Ok(false);
             }
             for c in 0..CELLS {
-                if got[c as usize].clone().into_inner() != model.visible(s, c) {
+                if got[c as usize] != model.visible(s, c) {
                     return Ok(false);
                 }
             }
@@ -245,11 +245,8 @@ where
     Ok(true)
 }
 
-fn presence_of<P: Projection>(batch: &CommittedBatch<P>) -> CellBuffer<bool> {
-    batch
-        .iter()
-        .map(|committed| committed.get().is_some())
-        .collect()
+fn presence_of<T>(batch: &[Option<T>]) -> CellBuffer<bool> {
+    batch.iter().map(Option::is_some).collect()
 }
 
 /// Proves that a dirty value takes priority over a dirty section clear.
@@ -281,7 +278,7 @@ pub(crate) async fn run_overlay_precedence_pin<S: CellStore>(
         .await?;
     assert_eq!(got.len(), 2, "every input position is answered");
     assert_eq!(
-        got[0].clone().into_inner(),
+        got[0],
         Some(bytes(7)),
         "a dirty Set beats an unsettled section-clear"
     );

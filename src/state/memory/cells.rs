@@ -5,7 +5,7 @@ use crate::state::cell_key::{CellKey, CellRef, Direction, Scan, Section};
 #[cfg(test)]
 use crate::state::marker::EventMarker;
 use crate::state::marker::{MarkerState, ReaderEvidence};
-use crate::state::store::{CellBuffer, ReadBatch};
+use crate::state::store::{Answers, ReadBatch};
 use crate::state::{CollectionId, EventRef};
 use ahash::RandomState;
 use async_stream::try_stream;
@@ -103,23 +103,20 @@ impl MemoryCells {
         collection: &CollectionId,
         section: Section,
         batch: &ReadBatch<'_>,
-    ) -> CellBuffer<Option<P::Payload>> {
+    ) -> Answers<Option<P::Payload>> {
         let evidence = self.reader_evidence(collection);
-        batch
-            .iter()
-            .map(|coordinate| {
-                let key = CellRef {
-                    section,
-                    coordinate,
-                };
-                if !evidence.survives(key) {
-                    return None;
-                }
-                resolve_for_reader(&self.read_committed_cell(collection, key), &evidence)
-                    .cloned()
-                    .map(P::from_value)
-            })
-            .collect()
+        batch.map(|&coordinate| {
+            let key = CellRef {
+                section,
+                coordinate,
+            };
+            if !evidence.survives(key) {
+                return None;
+            }
+            resolve_for_reader(&self.read_committed_cell(collection, key), &evidence)
+                .cloned()
+                .map(P::from_value)
+        })
     }
 
     pub(crate) fn scan_committed<'a>(

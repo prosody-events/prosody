@@ -18,7 +18,7 @@ use crate::state::cell::{Presence, Projection, Values};
 use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::registry::CollectionDef;
-use crate::state::store::{CellBuffer, ReadBatch};
+use crate::state::store::{Answers, ReadBatch};
 use crate::state::{StateName, StateType, StoreOutcome};
 use futures::Stream;
 use std::future::Future;
@@ -122,7 +122,7 @@ pub trait Reads<S: ?Sized, P: Projection>: ReadEngine<S> {
         name: &'a StateName,
         section: Section,
         batch: &'a ReadBatch<'buf>,
-    ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, StateAccessError>>
+    ) -> impl Future<Output = Result<Answers<Option<P::Payload>>, StateAccessError>>
     + Send
     + use<'buf, 'a, 'c, Self, S, P>;
 

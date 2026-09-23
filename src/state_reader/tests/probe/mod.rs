@@ -13,7 +13,6 @@
 //! The [`focused`] tests cover invariants the script model does not express:
 //!
 //! * `get_many` batch error precedence;
-//! * the batch alignment check on the uncached read path;
 //! * `get_many` single-source splicing;
 //! * a mid-stream scan error after a source has pinned;
 //! * a source-call trace that proves a pinned scan never opens the decoy

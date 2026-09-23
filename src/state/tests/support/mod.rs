@@ -21,8 +21,8 @@ use crate::state::registry::CollectionDef;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{Finalized, MessageMarker, OpPermit, SessionGate};
 use crate::state::store::{
-    CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable, ReadBatch,
-    provisional_point_loop,
+    Answers, CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable,
+    ReadBatch, provisional_point_loop,
 };
 use crate::state::{
     CollectionId, CollectionRef, EventRef, StateKey, StateName, StateType, StoreOutcome,
@@ -183,7 +183,7 @@ where
         _name: &'a StateName,
         _section: Section,
         _batch: &'a ReadBatch<'buf>,
-    ) -> impl Future<Output = Result<CellBuffer<Option<Q::Payload>>, StateAccessError>>
+    ) -> impl Future<Output = Result<Answers<Option<Q::Payload>>, StateAccessError>>
     + use<'buf, 'a, 'c, P, Q> {
         ready(Err(StateAccessError::Unavailable))
     }

@@ -1,7 +1,6 @@
 //! Focused probe tests for invariants the fault-script model does not express.
 
 use super::*;
-use crate::state_reader::cache::ReaderCache;
 
 /// A mid-stream error after the scan has pinned a source terminates with
 /// `Err`. There is no silent restart that would repeat or skip data. This test
@@ -67,50 +66,6 @@ async fn get_many_error_beats_all_none() -> Result<()> {
         Err(error) if error.classify_error() == ErrorCategory::Transient => Ok(()),
         other => bail!("expected a Transient store error, got {other:?}"),
     }
-}
-
-/// A source that violates its contract answers a batch read with fewer values
-/// than requested. Both the uncached and the cached batch arms check that
-/// alignment, so the read fails instead of zipping the short buffer into a
-/// misaligned answer. The cached arm checks before it fills, so it caches
-/// nothing under the wrong key.
-///
-/// Falsify: remove the length check from either arm of `cached_batch`. That
-/// arm then answers a two-cell batch with one value.
-#[tokio::test]
-async fn short_batch_buffer_fails_the_read() -> Result<()> {
-    for ttl in [None, Some(Duration::from_mins(1))] {
-        let env = ScriptedEnv::new(map_state::<I64KeyCodec, JsonCodec>("m-short-batch"))?;
-        let key = Key::from("user-1");
-        let tp_a = topic("topic-a");
-
-        env.commit(GROUP_A, tp_a, &key, 1, |h| async move {
-            h.set(&0, Value::from("A0"))
-                .await
-                .map_err(|e| eyre!("set: {e}"))
-        })
-        .await?;
-        env.publish(GROUP_A, tp_a).await;
-        // Arm the fault after seeding: `commit` writes through the same source.
-        env.fault(GROUP_A, tp_a, &key, FaultPoint::ShortBatch)?;
-        let deps = env
-            .deps_with_cache(ReaderCache::with_budget(1 << 20))
-            .with_default_read_cache_ttl(ttl);
-        let reader = StateReader::new_eager(&deps, env.sub.clone(), env.descriptor)?;
-
-        match reader.get_many(key, &[0, 1]).await {
-            Err(error) if error.classify_error() == ErrorCategory::Transient => {
-                assert!(
-                    error.to_string().contains("batch read returned 1 answers"),
-                    "expected the alignment error with cache TTL {ttl:?}, got {error}"
-                );
-            }
-            other => {
-                bail!("expected a Transient alignment error with cache TTL {ttl:?}, got {other:?}")
-            }
-        }
-    }
-    Ok(())
 }
 
 /// The lowest-ordered source with any `Some` answers the entire `get_many`

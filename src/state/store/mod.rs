@@ -30,11 +30,10 @@ use std::num::NonZeroUsize;
 
 mod batch;
 
-pub use batch::MisalignedBatch;
-pub(crate) use batch::{CELL_BATCH, ensure_aligned};
-pub use batch::{CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch, Durable, ReadBatch};
+pub(crate) use batch::CELL_BATCH;
+pub use batch::{Answers, CacheBatch, CellBuffer, CoordinateBatch, Durable, ReadBatch};
 pub(crate) use batch::{
-    distinct, provisional_point_loop, repeated, section_batches, sorted_unique_coordinates,
+    distinct, provisional_point_loop, section_batches, sorted_unique_coordinates,
 };
 
 /// Sizes the fetches of one read. The first fetch equals the caller's
@@ -96,22 +95,13 @@ pub trait CellRead<P: Projection>: CellBackend {
         batch: &'a ReadBatch<'buf>,
     ) -> impl Future<Output = Result<CacheBatch<P>, Self::Error>> + Send + use<'buf, 'a, Self, P>
     {
-        async move {
-            let mut answers = CacheBatch::<P>::with_capacity(batch.len());
-            for &coordinate in batch.iter() {
-                let answer = if let Some(answer) = repeated(batch, &answers, coordinate) {
-                    answer
-                } else {
-                    let cell = CellRef {
-                        section,
-                        coordinate,
-                    };
-                    self.read(collection, cell).await?
-                };
-                answers.push(answer);
-            }
-            Ok(answers)
-        }
+        batch.read(move |coordinate| {
+            let cell = CellRef {
+                section,
+                coordinate,
+            };
+            self.read(collection, cell)
+        })
     }
 
     /// Scans present committed cells in coordinate order within one section.

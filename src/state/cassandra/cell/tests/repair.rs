@@ -1,7 +1,7 @@
 use super::*;
 use crate::cassandra::TABLE_KEYED_STATE_CELL;
 use crate::state::cell::Values;
-use crate::state::store::{CellRead, CommittedBatch};
+use crate::state::store::{CellBuffer, CellRead};
 use crate::state::tests::support::listed;
 use crate::state::tests::support::{evidence, seed_commit_evidence};
 
@@ -96,7 +96,7 @@ async fn admit_removes_corrupt_cleared_rows_before_batch_read() -> Result<()> {
                 cells
                     .into_iter()
                     .map(|(committed, _)| committed)
-                    .collect::<CommittedBatch>()
+                    .collect::<CellBuffer<Committed>>()
             })
     }
     .await?;

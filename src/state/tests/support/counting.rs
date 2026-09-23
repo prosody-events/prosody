@@ -1,14 +1,12 @@
-//! Store and resolver counters used by query-budget tests, and a short-batch
-//! fault used by batch alignment tests.
+//! Store and resolver counters used by query-budget tests.
 
 use super::*;
 use crate::state::cell::Values;
 use crate::state::cell_key::CellRef;
 use crate::state::marker::MarkerState;
-use crate::state::store::{CellRead, CommittedBatch, ReadBatch};
+use crate::state::store::{CellRead, ReadBatch};
 use futures::StreamExt;
 use std::num::NonZeroUsize;
-use std::sync::atomic::AtomicBool;
 
 #[derive(Clone)]
 pub(crate) struct CountingCellStore<S> {
@@ -35,9 +33,6 @@ pub(crate) struct OpCounts {
     batch_widths: Mutex<Vec<usize>>,
     scan_hint: AtomicUsize,
     scan_rows: AtomicUsize,
-    /// Drops the last answer of each batch read. [`CountingCellStore::reset`]
-    /// keeps this setting.
-    short_batches: AtomicBool,
 }
 
 pub(crate) trait CountProjection: Projection {
@@ -175,11 +170,6 @@ impl<S> CountingCellStore<S> {
         self.counts.scan_rows.load(Ordering::Relaxed)
     }
 
-    /// Breaks batch alignment: each later batch read loses its last answer.
-    pub(crate) fn short_batches(&self) {
-        self.counts.short_batches.store(true, Ordering::Relaxed);
-    }
-
     pub(crate) fn reset(&self) {
         for (_, count) in self.marker_counts.iter() {
             count.store(0, Ordering::Relaxed);
@@ -244,11 +234,7 @@ impl<S: CellRead<P>, P: CountProjection> CellRead<P> for CountingCellStore<S> {
     ) -> Result<CacheBatch<P>, Self::Error> {
         P::batch(&self.counts).fetch_add(1, Ordering::Relaxed);
         self.counts.batch_widths.lock().push(batch.len());
-        let mut answers = CellRead::<P>::read_many(&self.inner, collection, section, batch).await?;
-        if self.counts.short_batches.load(Ordering::Relaxed) {
-            answers.pop();
-        }
-        Ok(answers)
+        CellRead::<P>::read_many(&self.inner, collection, section, batch).await
     }
 }
 
@@ -406,7 +392,7 @@ mod tests {
                 cells
                     .into_iter()
                     .map(|(committed, _)| committed)
-                    .collect::<CommittedBatch>()
+                    .collect::<CellBuffer<Committed>>()
             })?;
         assert_eq!(store.batch_reads(), 1);
         assert_eq!(store.visible_point_reads(), 0);

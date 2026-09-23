@@ -6,7 +6,7 @@ use super::marker::{EventMarker, MarkerState, SectionClear};
 use super::resolve::{EvidenceLookup, ResolveCellError};
 use super::store::{
     CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable,
-    provisional_point_loop, repeated,
+    provisional_point_loop,
 };
 use super::{CollectionId, CollectionRef};
 use crate::state::cell_key::CellRef;
@@ -136,26 +136,25 @@ impl<P: Projection> CellRead<P> for MemoryCellStore {
         section: Section,
         batch: &'a ReadBatch<'_>,
     ) -> Result<CacheBatch<P>, Self::Error> {
-        let mut answers = CacheBatch::<P>::with_capacity(batch.len());
-        let mut lookup = EvidenceLookup::new(self, collection);
-        for &coordinate in batch.iter() {
-            let answer = if let Some(answer) = repeated(batch, &answers, coordinate) {
-                answer
-            } else {
-                let cell = CellRef {
-                    section,
-                    coordinate,
-                };
-                let committed =
-                    cooperative(lookup.resolve(self.read_raw(collection, cell))).await?;
-                (
-                    Committed::new(committed.into_inner().map(P::from_value)),
-                    None,
-                )
-            };
-            answers.push(answer);
-        }
-        Ok(answers)
+        let lookup = EvidenceLookup::new(self, collection);
+        batch
+            .read(|coordinate| {
+                let raw = self.read_raw(
+                    collection,
+                    CellRef {
+                        section,
+                        coordinate,
+                    },
+                );
+                cooperative(async {
+                    let committed = lookup.resolve(raw).await?;
+                    Ok((
+                        Committed::new(committed.into_inner().map(P::from_value)),
+                        None,
+                    ))
+                })
+            })
+            .await
     }
 
     fn scan<'a>(
@@ -180,7 +179,7 @@ impl<P: Projection> CellRead<P> for MemoryCellStore {
             // The resolved fast path touches no tokio leaf, so a large in-memory
             // scan would drain in one poll; a per-item `cooperative` yield point
             // fires every ~128 items.
-            let mut lookup = EvidenceLookup::new(self, collection);
+            let lookup = EvidenceLookup::new(self, collection);
             for (cell, stored) in raw {
                 let committed =
                     cooperative(lookup.resolve(stored)).await?;

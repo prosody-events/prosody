@@ -205,10 +205,7 @@ fn get_batch_classifies_hits_misses_expiry_and_errors() -> Result<()> {
         let probes = cache
             .get_batch::<Values>(&c, Section::new(0), &batch_of([0, 5])?.as_ref())
             .await?;
-        assert!(matches!(
-            probes.as_slice(),
-            [CacheRead::Hit(_), CacheRead::Expired]
-        ));
+        assert!(matches!(&*probes, [CacheRead::Hit(_), CacheRead::Expired]));
         Ok::<_, Report>(())
     })?;
     Ok(())
@@ -228,7 +225,7 @@ async fn check_corrupt_repair(cache: &FjallCellCache, c: &CollectionId) -> Resul
         .get_batch::<Values>(c, Section::new(0), &batch_of([0, 4, 2, 3])?.as_ref())
         .await?;
     assert!(matches!(
-        probes.as_slice(),
+        &*probes,
         [
             CacheRead::Hit(_),
             CacheRead::Corrupt,

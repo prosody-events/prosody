@@ -18,7 +18,7 @@ use crate::Key;
 use crate::state::access::StateAccessError;
 use crate::state::cell::{CacheEntry, Projection, Read};
 use crate::state::cell_key::{CellKey, CellRef};
-use crate::state::store::{CellBuffer, ensure_aligned};
+use crate::state::store::{Answers, ReadBatch};
 use crate::state::{StateName, StateType};
 use crate::state_reader::source::SourceId;
 use bytes::Bytes;
@@ -221,54 +221,49 @@ impl ReaderCache {
         }
     }
 
-    /// The read-through batch read, index-aligned to `keys`. Serves the batch
-    /// entirely from the cache when every key is a fresh hit. Otherwise it
-    /// issues one batch store read through `fill`, writes every position, and
-    /// returns the store answers.
+    /// The read-through batch read. Serves the batch entirely from the cache
+    /// when every key is a fresh hit. Otherwise it issues one batch store read
+    /// through `fill`, writes every position, and returns the store answers.
     ///
     /// # Errors
     ///
     /// Propagates the store error from `fill`.
-    pub(crate) async fn get_many_cached<'a, P: Projection, F, Fut>(
+    pub(crate) async fn get_many_cached<'a, 'buf, P: Projection, F, Fut>(
         &self,
-        keys: impl ExactSizeIterator<Item = CacheLookup<'a>> + Clone,
+        batch: &ReadBatch<'buf>,
+        key: impl Fn(&'buf [u8]) -> CacheLookup<'a>,
         ttl: Duration,
         fill: F,
-    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
+    ) -> Result<Answers<Option<P::Payload>>, StateAccessError>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<CellBuffer<Option<P::Payload>>, StateAccessError>>,
+        Fut: Future<Output = Result<Answers<Option<P::Payload>>, StateAccessError>>,
     {
-        let hits = keys
-            .clone()
-            .try_fold(CellBuffer::with_capacity(keys.len()), |mut hits, key| {
-                let value = match self.inner.get(&key) {
-                    Some((issued, entry)) if self.fresh(issued, ttl) => match P::from_cached(entry)
-                    {
-                        Read::Present(value) => Some(Some(value)),
-                        Read::Absent => Some(None),
-                        Read::Unknown => None,
-                    },
-                    Some((issued, _)) => {
-                        self.inner
-                            .remove_if(&key, |(observed, _)| *observed == issued);
-                        None
-                    }
-                    None => None,
-                }?;
-                hits.push(value);
-                Some(hits)
-            });
-        if let Some(hits) = hits {
+        let hits = batch.try_map(|&coordinate| {
+            let key = key(coordinate);
+            match self.inner.get(&key) {
+                Some((issued, entry)) if self.fresh(issued, ttl) => match P::from_cached(entry) {
+                    Read::Present(value) => Ok(Some(value)),
+                    Read::Absent => Ok(None),
+                    Read::Unknown => Err(()),
+                },
+                Some((issued, _)) => {
+                    self.inner
+                        .remove_if(&key, |(observed, _)| *observed == issued);
+                    Err(())
+                }
+                None => Err(()),
+            }
+        });
+        if let Ok(hits) = hits {
             return Ok(hits);
         }
         // One shared issue time for the whole batch fill.
         let issued = self.clock.now();
         let fresh = fill().await?;
-        // A misaligned fill would cache values under the wrong keys.
-        ensure_aligned(fresh.len(), keys.len())?;
-        for (key, value) in keys.zip(&fresh) {
-            cooperative(self.write_through(&key, issued, P::into_cached(value.clone()))).await;
+        for (&coordinate, value) in batch.iter().zip(fresh.iter()) {
+            let value = P::into_cached(value.clone());
+            cooperative(self.write_through(&key(coordinate), issued, value)).await;
         }
         Ok(fresh)
     }

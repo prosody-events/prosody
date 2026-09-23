@@ -8,7 +8,7 @@ use super::{
     CollectionDefRegistry, CollectionId, Committed, EventMarker, EvidenceLookup, KeyRow,
     MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, Pk, ResolveCellError, ResolvedRow, RowShape,
     SHARD_FANOUT_CONCURRENCY, Scan, Section, Stream, TryStreamExt, blob_weight, distinct, encode,
-    encode_marker_payload, pin_mut, repeated, smallvec, try_stream, ttl_seconds_to_duration,
+    encode_marker_payload, pin_mut, smallvec, try_stream, ttl_seconds_to_duration,
 };
 use crate::state::cell_key::CellRef;
 use crate::state::store::Durable;
@@ -176,21 +176,19 @@ impl<P: CassandraProjection> CellRead<P> for CassandraStore {
             fetch_batch::<P>(&self.session, &self.queries, id, section, &distinct(batch))
                 .await
                 .map_err(ResolveCellError::Store)?;
-        let mut answers = CacheBatch::<P>::with_capacity(batch.len());
-        let mut lookup = EvidenceLookup::new(self, id);
-        for &coordinate in batch.iter() {
-            let answer = if let Some(answer) = repeated(batch, &answers, coordinate) {
-                answer
-            } else {
-                let (raw, ttl) = match take_row(&mut rows, coordinate) {
-                    Some(row) => decode_point::<P>(row).map_err(ResolveCellError::Store)?,
-                    None => (Cell::Resolved(Committed::new(None)), None),
-                };
-                (lookup.resolve(raw).await?, ttl_seconds_to_duration(ttl))
-            };
-            answers.push(answer);
-        }
-        Ok(answers)
+        let lookup = &EvidenceLookup::new(self, id);
+        batch
+            .read(|coordinate| {
+                let row = take_row(&mut rows, coordinate);
+                async move {
+                    let (raw, ttl) = match row {
+                        Some(row) => decode_point::<P>(row).map_err(ResolveCellError::Store)?,
+                        None => (Cell::Resolved(Committed::new(None)), None),
+                    };
+                    Ok((lookup.resolve(raw).await?, ttl_seconds_to_duration(ttl)))
+                }
+            })
+            .await
     }
 
     /// Scans one section under the selected projection.
@@ -203,7 +201,7 @@ impl<P: CassandraProjection> CellRead<P> for CassandraStore {
             let pages = page::<P>(&self.session, &self.queries, collection, scan);
             pin_mut!(pages);
 
-            let mut lookup = EvidenceLookup::new(self, collection);
+            let lookup = EvidenceLookup::new(self, collection);
             while let Some((key, raw)) = pages.try_next().await.map_err(ResolveCellError::Store)? {
                 let committed = lookup.resolve(raw).await?;
                 if let Some(bytes) = committed.into_inner() {

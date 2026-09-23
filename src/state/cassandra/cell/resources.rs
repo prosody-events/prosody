@@ -1,17 +1,17 @@
 use super::projection::CassandraProjection;
 use super::read::{decode_point, fetch_batch, fetch_marker_state, fetch_point, page, take_row};
 use super::{
-    Arc, CassandraCellResources, CassandraCellStoreError, CassandraSession, CellBuffer, CellKey,
-    CellQueries, CollectionId, Scan, Section, Stream, TryStreamExt, distinct, pin_mut, repeated,
-    try_stream,
+    Arc, CassandraCellResources, CassandraCellStoreError, CassandraSession, CellKey, CellQueries,
+    CollectionId, Scan, Section, Stream, TryStreamExt, distinct, pin_mut, try_stream,
 };
 use crate::state::cell::resolve_for_reader;
 use crate::state::cell_key::CellRef;
 use crate::state::marker::ReaderEvidence;
 use crate::state::resolve::sibling_committed;
-use crate::state::store::ReadBatch;
+use crate::state::store::{Answers, ReadBatch};
 use crate::state_reader::{CellSource, CommittedCellSource};
 use futures::try_join;
+use std::future::ready;
 
 impl CassandraCellResources {
     /// Bundles the shared session and prepared cell statements.
@@ -67,31 +67,28 @@ impl CassandraCellResources {
         id: &CollectionId,
         section: Section,
         batch: &ReadBatch<'_>,
-    ) -> Result<CellBuffer<Option<P::Payload>>, CassandraCellStoreError> {
+    ) -> Result<Answers<Option<P::Payload>>, CassandraCellStoreError> {
         let coordinates = distinct(batch);
         let (mut rows, evidence) = try_join!(
             fetch_batch::<P>(&self.session, &self.queries, id, section, &coordinates),
             self.reader_evidence(id),
         )?;
-        let mut answers = CellBuffer::with_capacity(batch.len());
-        for &coordinate in batch.iter() {
-            let answer = if let Some(answer) = repeated(batch, &answers, coordinate) {
-                answer
-            } else {
+        batch
+            .read(|coordinate| {
                 let key = CellRef {
                     section,
                     coordinate,
                 };
-                let cell = take_row(&mut rows, coordinate)
+                let answer = take_row(&mut rows, coordinate)
                     .map(decode_point::<P>)
-                    .transpose()?
-                    .map(|(cell, _)| cell);
-                cell.filter(|_| evidence.survives(key))
-                    .and_then(|cell| resolve_for_reader(&cell, &evidence).cloned())
-            };
-            answers.push(answer);
-        }
-        Ok(answers)
+                    .transpose()
+                    .map(|cell| {
+                        cell.filter(|_| evidence.survives(key))
+                            .and_then(|(cell, _)| resolve_for_reader(&cell, &evidence).cloned())
+                    });
+                ready(answer)
+            })
+            .await
     }
 
     /// Scans committed projections in coordinate order through one evidence
@@ -134,7 +131,7 @@ impl<P: CassandraProjection> CommittedCellSource<P> for CassandraCellResources {
         id: &CollectionId,
         section: Section,
         batch: &ReadBatch<'_>,
-    ) -> Result<CellBuffer<Option<P::Payload>>, Self::Error> {
+    ) -> Result<Answers<Option<P::Payload>>, Self::Error> {
         self.read_committed_many::<P>(id, section, batch).await
     }
 

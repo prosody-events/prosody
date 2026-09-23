@@ -4,13 +4,13 @@ use super::sealed::{MutatePermit, OpPermit, SessionGate};
 use super::stage::write_direct;
 use super::{AttemptEpoch, SessionInner, SessionParts};
 use crate::state::access::StateAccessError;
-use crate::state::cell::{Committed, Projection};
+use crate::state::cell::Projection;
 use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::identity::{CollectionId, CollectionRef};
 use crate::state::overlay::Overlay;
 use crate::state::registry::CollectionDef;
-use crate::state::store::{CellBuffer, CellRead, ReadBatch};
+use crate::state::store::{Answers, CellRead, ReadBatch};
 use crate::state::{StateBackend, StateName, StateType, StoreOutcome};
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -229,17 +229,16 @@ where
         name: &StateName,
         section: Section,
         batch: &ReadBatch<'_>,
-    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
+    ) -> Result<Answers<Option<P::Payload>>, StateAccessError>
     where
         B::Cell: CellRead<P>,
     {
         let id = self.id_for(state_type, name);
-        let committed = self
-            .inner
+        self.inner
             .overlay
             .get_many::<P>(&id, section, batch)
-            .await?;
-        Ok(committed.into_iter().map(Committed::into_inner).collect())
+            .await
+            .map_err(|e| StateAccessError::store(&e))
     }
 
     /// The single-section, start-anchored, bidirectional range primitive: a

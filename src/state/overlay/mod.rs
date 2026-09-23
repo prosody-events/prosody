@@ -14,13 +14,11 @@ use super::cell::{Committed, Projection};
 use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::dirty::{DirtyStore, DirtyVal};
 use super::identity::CollectionId;
-use super::store::{CELL_BATCH, CommittedBatch, ReadBatch, ensure_aligned};
-use crate::state::StateAccessError;
+use super::store::{Answers, ReadBatch};
 use crate::state::cell_key::CellRef;
 use crate::state::store::CellRead;
 use async_stream::try_stream;
 use futures::{Stream, StreamExt};
-use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -89,51 +87,37 @@ impl<L> Overlay<L> {
     /// # Errors
     ///
     /// Returns the lower store error when the dirty overlay has no answer.
-    /// Returns [`StateAccessError::MisalignedBatch`] when the lower batch
-    /// answers a different number of positions.
     pub async fn get_many<'a, P: Projection>(
         &'a self,
         collection: &'a CollectionId,
         section: Section,
         batch: &'a ReadBatch<'_>,
-    ) -> Result<CommittedBatch<P>, StateAccessError>
+    ) -> Result<Answers<Option<P::Payload>>, L::Error>
     where
         L: CellRead<P>,
     {
         let section_cleared = self.dirty.section_cleared(collection, section);
-        let mut answers = CommittedBatch::<P>::with_capacity(batch.len());
-        let mut positions: SmallVec<[u8; CELL_BATCH.get()]> = SmallVec::new();
-        // The untouched coordinates read through to the lower store.
-        // The journal read in `operation::batch` has the same shape. A shared
-        // helper needs a new type and a placeholder closure, so each keeps its loop.
-        let lower_batch = batch.filter(|&coordinate| {
-            let cell = CellRef {
-                section,
-                coordinate,
-            };
-            let value = match self.dirty.lookup(collection, cell) {
-                Some(DirtyVal::Set(bytes)) => Some(P::from_value(bytes)),
-                Some(DirtyVal::Cleared) => None,
-                None if section_cleared => None,
-                None => {
-                    positions.push(answers.len() as u8);
-                    answers.push(Committed::new(None));
-                    return true;
-                }
-            };
-            answers.push(Committed::new(value));
-            false
-        });
-        if let Some(lower_batch) = &lower_batch {
-            let lower = CellRead::<P>::read_many(&self.lower, collection, section, lower_batch)
-                .await
-                .map_err(|e| StateAccessError::store(&e))?;
-            ensure_aligned(lower.len(), positions.len())?;
-            for ((committed, _), &position) in lower.into_iter().zip(&positions) {
-                answers[usize::from(position)] = committed;
-            }
-        }
-        Ok(answers)
+        batch
+            .merge(
+                |coordinate| {
+                    let cell = CellRef {
+                        section,
+                        coordinate,
+                    };
+                    match self.dirty.lookup(collection, cell) {
+                        Some(DirtyVal::Set(bytes)) => Some(Some(P::from_value(bytes))),
+                        Some(DirtyVal::Cleared) => Some(None),
+                        None => section_cleared.then_some(None),
+                    }
+                },
+                move |pending| async move {
+                    let answers =
+                        CellRead::<P>::read_many(&self.lower, collection, section, &pending)
+                            .await?;
+                    Ok(answers.map(|(committed, _)| committed.into_inner()))
+                },
+            )
+            .await
     }
 
     /// Merges the dirty snapshot with the lower scan in coordinate order.

@@ -98,14 +98,11 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
         }
         let probes = match self.fjall.get_batch::<P>(collection, section, batch).await {
             Ok(probes) => {
-                let hits: Option<CacheBatch<P>> = probes
-                    .iter()
-                    .map(|probe| match probe {
-                        CacheRead::Hit(hit) => Some(hit.clone()),
-                        CacheRead::Miss | CacheRead::Expired | CacheRead::Corrupt => None,
-                    })
-                    .collect();
-                if let Some(hits) = hits {
+                let hits = probes.try_map(|probe| match probe {
+                    CacheRead::Hit(hit) => Ok(hit.clone()),
+                    CacheRead::Miss | CacheRead::Expired | CacheRead::Corrupt => Err(()),
+                });
+                if let Ok(hits) = hits {
                     let loaded = Ok(hits);
                     self.metrics.batch(
                         batch.len(),
@@ -138,17 +135,12 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
         let stamped_at = self.fjall.clock().now_ms();
         let loaded = async {
             let filled = CellRead::<P>::read_many(&self.lower, collection, section, batch).await?;
-            // A misaligned answer is never cached. The caller rejects it, and a
-            // retry must read the lower store again.
-            if filled.len() != batch.len() {
-                return Ok(filled);
-            }
             let projected = batch
                 .iter()
-                .zip(&filled)
-                .enumerate()
-                .filter(|(i, _)| !matches!(probes.get(*i), Some(CacheRead::Hit(_))))
-                .map(|(_, (coordinate, (committed, remaining)))| {
+                .zip(filled.iter())
+                .zip(probes.iter())
+                .filter(|(_, probe)| !matches!(probe, CacheRead::Hit(_)))
+                .map(|((coordinate, (committed, remaining)), _)| {
                     (
                         CellRef {
                             section,

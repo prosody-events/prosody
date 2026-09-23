@@ -11,9 +11,7 @@ use crate::state::marker::{EventEvidence, FrozenStage, SectionClear};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::resolve_event_marker;
 use crate::state::retry::{StepOutcome, retry_step};
-use crate::state::store::{
-    CELL_BATCH, CellBuffer, CellRead, CellStore, CoordinateBatch, ensure_aligned,
-};
+use crate::state::store::{CELL_BATCH, CellBuffer, CellRead, CellStore, CoordinateBatch};
 use crate::state::{
     CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY, StateKey, StateName,
     StateType,
@@ -122,9 +120,8 @@ where
                             CellRead::<Values>::read_many(lower, id, section, &batch.as_ref())
                                 .await
                                 .map_err(|e| StateAccessError::store(&e))?;
-                        // Pair this chunk's bases with exactly its records
-                        // before the fold flattens the chunks.
-                        ensure_aligned(bases.len(), records.len())?;
+                        // `batch` holds the coordinates of `records`, so each
+                        // base answers the record at its position.
                         let chunk_writes: CellBuffer<(CellKey, ProvisionalWrite)> = records
                             .into_iter()
                             .zip(bases.into_iter().map(|(committed, _)| committed))

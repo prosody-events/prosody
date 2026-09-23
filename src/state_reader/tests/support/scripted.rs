@@ -20,7 +20,7 @@ use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::publication::StatePublication;
 use crate::state::registry::CollectionDef;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::store::{CellBuffer, ReadBatch};
+use crate::state::store::{Answers, ReadBatch};
 use crate::state::tests::support::ScriptedPublicationStore;
 use crate::state::{StateName, StateType};
 use crate::state_reader::backend::{ReaderComponents, ScriptedReaderBackend};
@@ -86,10 +86,6 @@ pub(in crate::state_reader::tests) enum FaultPoint {
     AtOpen,
     /// Yield `n` present cells, then error (scan only).
     AfterYields(usize),
-    /// Drop the last value from the returned buffer (batch read only). It
-    /// models a downstream `CommittedCellSource` that breaks the index
-    /// alignment its contract promises.
-    ShortBatch,
 }
 
 /// A committed cell source that can fault deterministically per source. It
@@ -185,18 +181,13 @@ impl ScriptedCellSource {
         id: &CollectionId,
         section: Section,
         batch: &ReadBatch<'_>,
-    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError> {
+    ) -> Result<Answers<Option<P::Payload>>, StateAccessError> {
         let segment = id.state_key().segment_id;
         self.record_read(segment);
-        let fault = self.fault_of(segment);
-        if matches!(fault, Some(FaultPoint::AtOpen)) {
+        if matches!(self.fault_of(segment), Some(FaultPoint::AtOpen)) {
             return Err(StateAccessError::store(&ScriptedFaultError));
         }
-        let mut buffer = self.inner.read_committed_many::<P>(id, section, batch);
-        if matches!(fault, Some(FaultPoint::ShortBatch)) {
-            buffer.pop();
-        }
-        Ok(buffer)
+        Ok(self.inner.read_committed_many::<P>(id, section, batch))
     }
 
     pub(crate) fn scan_committed<'a>(

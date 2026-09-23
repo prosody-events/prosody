@@ -127,7 +127,6 @@ pub use query::{
     ReadSource,
 };
 pub use registry::{CommitMode, ReadCachePolicy, StateVisibility};
-pub use store::MisalignedBatch;
 
 // The backend cluster is crate-internal (module-capped in [`backend`]); these
 // re-exports keep every in-crate `crate::state::X` import resolving without

@@ -1,7 +1,7 @@
 use super::*;
 use crate::state::cassandra::CassandraCellStoreError;
 use crate::state::cell::Values;
-use crate::state::store::{CellBuffer, CellRead, CommittedBatch};
+use crate::state::store::{CellBuffer, CellRead};
 use crate::state::tests::support::evidence;
 use crate::state::tests::support::listed;
 
@@ -153,7 +153,7 @@ async fn first_error_is_first_input_position() -> Result<()> {
                 cells
                     .into_iter()
                     .map(|(committed, _)| committed)
-                    .collect::<CommittedBatch>()
+                    .collect::<CellBuffer<Committed>>()
             })
     }
     .await

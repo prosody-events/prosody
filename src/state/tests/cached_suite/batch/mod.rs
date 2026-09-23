@@ -32,33 +32,6 @@ fn prop_cached_projection_scan_parity() {
     QuickCheck::new().quickcheck(property as fn(ScanTrace) -> Result<bool>);
 }
 
-/// A misaligned lower batch is never cached. The caller rejects the answer,
-/// so a retry must read the lower store again.
-#[test]
-fn misaligned_lower_batch_is_never_cached() -> Result<()> {
-    TEST_RUNTIME.block_on(async {
-        let (cached, counting, id) = counting_cached("batch-misaligned")?;
-        let cref = CollectionRef::new(id.clone(), None);
-        let cold: Vec<(CellKey, Option<Bytes>)> =
-            (0u8..4).map(|c| (cell_at(c), Some(bytes(c)))).collect();
-        counting.write_resolved(&cref, &cold, &[]).await?;
-
-        counting.short_batches();
-        let answers =
-            CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of(0u8..4)?.as_ref())
-                .await?;
-        assert_eq!(answers.len(), 3, "the lower store dropped one answer");
-        for c in 0u8..4 {
-            assert_eq!(
-                cached.stored_expiry(&id, &cell_at(c)).await?,
-                None,
-                "coordinate {c} was cached from a misaligned batch"
-            );
-        }
-        Ok(())
-    })
-}
-
 /// A warm batch returns every value without a lower read.
 #[test]
 fn batch_get_all_hits_reads_nothing() -> Result<()> {
@@ -78,7 +51,7 @@ fn batch_get_all_hits_reads_nothing() -> Result<()> {
                     cells
                         .into_iter()
                         .map(|(committed, _)| committed)
-                        .collect::<CommittedBatch>()
+                        .collect::<CellBuffer<Committed>>()
                 })?;
         assert_eq!(out.len(), 16, "every position answered");
         for c in 0u8..16 {
@@ -117,7 +90,7 @@ fn batch_get_any_miss_is_one_lower_batch_read() -> Result<()> {
                     cells
                         .into_iter()
                         .map(|(committed, _)| committed)
-                        .collect::<CommittedBatch>()
+                        .collect::<CellBuffer<Committed>>()
                 })?;
         assert_eq!(out.len(), 16, "every position answered");
         for c in 0u8..15 {
@@ -168,7 +141,7 @@ fn batch_get_completes_after_cache_disablement() -> Result<()> {
                         cells
                             .into_iter()
                             .map(|(committed, _)| committed)
-                            .collect::<CommittedBatch>()
+                            .collect::<CellBuffer<Committed>>()
                     })
                     .map_err(color_eyre::Report::from)
             })
@@ -212,7 +185,7 @@ fn batch_get_discards_sampled_hits_on_any_miss() -> Result<()> {
                 cells
                     .into_iter()
                     .map(|(committed, _)| committed)
-                    .collect::<CommittedBatch>()
+                    .collect::<CellBuffer<Committed>>()
             })?;
         assert_eq!(out.len(), 2, "every position answered");
         assert_eq!(
@@ -249,7 +222,7 @@ fn batch_get_failed_publish_keeps_hidden_live_entry_warm() -> Result<()> {
                 cells
                     .into_iter()
                     .map(|(committed, _)| committed)
-                    .collect::<CommittedBatch>()
+                    .collect::<CellBuffer<Committed>>()
             })?;
         assert_eq!(out.len(), 1, "the single position answered");
         assert_eq!(

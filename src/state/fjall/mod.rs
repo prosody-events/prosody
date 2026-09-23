@@ -29,7 +29,7 @@
 //! [`tokio::task::spawn_blocking`].
 
 use crate::state::cell_key::{CellKey, CellRef, Section};
-use crate::state::store::{CellBuffer, ReadBatch};
+use crate::state::store::{Answers, CellBuffer, ReadBatch};
 mod checks;
 mod clock;
 mod codec;
@@ -240,13 +240,10 @@ impl FjallCellCache {
         collection: &CollectionId,
         section: Section,
         batch: &ReadBatch<'_>,
-    ) -> Result<CellBuffer<CacheRead<P>>, FjallCellCacheError> {
+    ) -> Result<Answers<CacheRead<P>>, FjallCellCacheError> {
         let raws = self.read_batch(collection, section, batch).await?;
         let now = self.clock.now_ms();
-        Ok(raws
-            .iter()
-            .map(|raw| io::probe::<P>(raw.as_deref(), now))
-            .collect())
+        Ok(raws.map(|raw| io::probe::<P>(raw.as_deref(), now)))
     }
 
     async fn read_batch(
@@ -254,21 +251,18 @@ impl FjallCellCache {
         collection: &CollectionId,
         section: Section,
         batch: &ReadBatch<'_>,
-    ) -> Result<CellBuffer<Option<Slice>>, FjallCellCacheError> {
+    ) -> Result<Answers<Option<Slice>>, FjallCellCacheError> {
         // Encode every key up front (bounded, sized once): small requests stay
         // inline and the owned keys move into the blocking closure.
-        let keys: CellBuffer<SmallVec<[u8; 32]>> = batch
-            .iter()
-            .map(|coordinate| {
-                codec::cell_key(
-                    collection,
-                    CellRef {
-                        section,
-                        coordinate,
-                    },
-                )
-            })
-            .collect();
+        let keys = batch.map(|&coordinate| {
+            codec::cell_key(
+                collection,
+                CellRef {
+                    section,
+                    coordinate,
+                },
+            )
+        });
         let handle = self.inner.handle().clone();
         #[cfg(test)]
         let faults = self.faults.clone();
@@ -276,14 +270,10 @@ impl FjallCellCache {
         // (or the injected fault) fails the whole hop, mirroring how `read_cell`
         // surfaces one via `??`.
         spawn_blocking(
-            move || -> Result<CellBuffer<Option<Slice>>, FjallCellCacheError> {
+            move || -> Result<Answers<Option<Slice>>, FjallCellCacheError> {
                 #[cfg(test)]
                 faults.probe()?;
-                let mut out = SmallVec::with_capacity(keys.len());
-                for key in &keys {
-                    out.push(handle.get(key.as_slice())?);
-                }
-                Ok(out)
+                Ok(keys.try_map(|key| handle.get(key.as_slice()))?)
             },
         )
         .await?

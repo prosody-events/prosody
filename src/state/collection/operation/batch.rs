@@ -8,7 +8,7 @@ use super::{
 use crate::codec::{Codec, SerializeBufGuard};
 use crate::state::cell_key::CellRef;
 use crate::state::order_codec::KeyCodecError;
-use crate::state::store::{CELL_BATCH, ReadBatch, ensure_aligned};
+use crate::state::store::{CELL_BATCH, ReadBatch};
 use smallvec::SmallVec;
 
 /// Encodes one key before its borrow ends.
@@ -39,62 +39,56 @@ where
     S::Engine: sealed::Reads<S, P>,
     T: CellType,
 {
-    let mut answers = CellBuffer::with_capacity(keys.size_hint().0);
+    let mut answers = CellBuffer::new();
     let mut buffer = SerializeBufGuard::acquire();
     loop {
         buffer.clear();
-        let (batch, positions) = {
-            let mut ends: SmallVec<[usize; CELL_BATCH.get()]> = SmallVec::new();
-            T::Key::with_cached_local(|codec| {
-                for key in keys.by_ref().take(CELL_BATCH.get()) {
-                    codec.serialize_key(key, &mut buffer)?;
-                    ends.push(buffer.len());
-                }
-                Ok(())
-            })
-            .map_err(CellStateError::Key)?;
-            // The loop above takes at most one batch of keys, so the first
-            // chunk holds every encoded coordinate.
-            let coordinates = ends.iter().scan(0, |start, &end| {
-                let coordinate = &buffer[*start..end];
-                *start = end;
-                Some(coordinate)
-            });
-            let Some(encoded) = ReadBatch::chunks(coordinates).next() else {
-                return Ok(answers);
-            };
-            let mut positions: SmallVec<[usize; CELL_BATCH.get()]> = SmallVec::new();
-            // Coordinates that the journal does not answer read from the store.
-            let pending = encoded.filter(|&coordinate| {
-                let value = match staged(
-                    journal,
-                    CellRef {
+        let mut ends: SmallVec<[usize; CELL_BATCH.get()]> = SmallVec::new();
+        T::Key::with_cached_local(|codec| {
+            for key in keys.by_ref().take(CELL_BATCH.get()) {
+                codec.serialize_key(key, &mut buffer)?;
+                ends.push(buffer.len());
+            }
+            Ok(())
+        })
+        .map_err(CellStateError::Key)?;
+        // The loop above takes at most one batch of keys, so the first chunk
+        // holds every encoded coordinate.
+        let coordinates = ends.iter().scan(0, |start, &end| {
+            let coordinate = &buffer[*start..end];
+            *start = end;
+            Some(coordinate)
+        });
+        let Some(batch) = ReadBatch::chunks(coordinates).next() else {
+            return Ok(answers);
+        };
+        let inner = &mut *inner;
+        // Coordinates that the journal does not answer read from the store.
+        let merged = batch
+            .merge(
+                |coordinate| {
+                    let cell = CellRef {
                         section,
                         coordinate,
-                    },
-                ) {
-                    Some(Staged::Present(bytes)) => Some(P::from_value(bytes)),
-                    Some(Staged::Absent) => None,
-                    None => {
-                        positions.push(answers.len());
-                        answers.push(None);
-                        return true;
-                    }
-                };
-                answers.push(value);
-                false
-            });
-            (pending, positions)
-        };
-        if let Some(batch) = &batch {
-            let loaded = <S::Engine as sealed::Reads<S, P>>::read_batch(
-                session, inner, state_type, name, section, batch,
+                    };
+                    staged(journal, cell).map(|staged| match staged {
+                        Staged::Present(bytes) => Some(P::from_value(bytes)),
+                        Staged::Absent => None,
+                    })
+                },
+                move |pending| async move {
+                    <S::Engine as sealed::Reads<S, P>>::read_batch(
+                        session, inner, state_type, name, section, &pending,
+                    )
+                    .await
+                },
             )
             .await?;
-            ensure_aligned(loaded.len(), positions.len()).map_err(StateAccessError::from)?;
-            for (position, value) in positions.iter().zip(loaded) {
-                answers[*position] = value;
-            }
+        // The first batch moves in, so a read of one batch allocates once.
+        if answers.is_empty() {
+            answers = merged.into();
+        } else {
+            answers.extend(merged);
         }
     }
 }
@@ -119,7 +113,6 @@ where
             session, inner, state_type, name, section, &batch,
         )
         .await?;
-        ensure_aligned(values.len(), batch.len())?;
         answers.extend(values);
     }
     Ok(answers)

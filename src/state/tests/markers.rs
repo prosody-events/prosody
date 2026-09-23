@@ -64,7 +64,7 @@ pub(super) fn prop_resolve_reads_each_marker_once() {
             // Exercise a batch and both scan directions with separate lookups.
             for direction in [None, Some(Direction::Forward), Some(Direction::Backward)] {
                 store.reset();
-                let mut lookup = EvidenceLookup::new(&store, &id);
+                let lookup = EvidenceLookup::new(&store, &id);
                 assert_eq!(
                     lookup
                         .resolve(Cell::Resolved(Committed::<Values>::new(None)))
@@ -130,7 +130,7 @@ pub(super) async fn check_memory_read_parity(
             cells
                 .into_iter()
                 .map(|(committed, _)| committed)
-                .collect::<CommittedBatch>()
+                .collect::<CellBuffer<Committed>>()
         })?;
     assert_eq!(values.len(), batch.len());
     for value in values {

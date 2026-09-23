@@ -16,7 +16,7 @@ use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::registry::CollectionDef;
 use crate::state::session::{KeyedStateSession, MutatePermit, OpPermit};
-use crate::state::store::{CellBuffer, CellRead, ReadBatch};
+use crate::state::store::{Answers, CellRead, ReadBatch};
 use crate::state::{StateBackend, StateName, StateType, StoreOutcome};
 use futures::stream::Stream;
 
@@ -107,7 +107,7 @@ where
         name: &StateName,
         section: Section,
         batch: &ReadBatch<'_>,
-    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError> {
+    ) -> Result<Answers<Option<P::Payload>>, StateAccessError> {
         ensure_live(session)?;
         session
             .get_many::<P>(state_type, name, section, batch)

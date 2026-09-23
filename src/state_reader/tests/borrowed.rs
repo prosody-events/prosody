@@ -98,7 +98,7 @@ fn prop_borrowed_utf8_keys_address_maps_and_sets() -> Result<()> {
         let keys: Vec<_> = keys.iter().cycle().take(MAX_KEYS).cloned().collect();
         block_on(async {
             for limit in [0, 128] {
-                check(&operations, &keys, limit).await?;
+                Box::pin(check(&operations, &keys, limit)).await?;
             }
             Ok(())
         })
@@ -166,7 +166,7 @@ async fn check(operations: &[(String, bool)], keys: &[String], limit: usize) -> 
     let deps = harness.deps();
     let map = StateReader::new(&deps, sub.clone(), map)?;
     let set = StateReader::new(&deps, sub, set)?;
-    check_readers(map, set, &key, keys, &model).await
+    Box::pin(check_readers(map, set, &key, keys, &model)).await
 }
 
 async fn check_map<S: WritableStateSession>(

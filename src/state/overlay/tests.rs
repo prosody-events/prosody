@@ -1,14 +1,13 @@
-//! Overlay batch reads reject a misaligned lower batch.
+//! Overlay batch reads answer from the dirty store before the lower store.
 
 use super::Overlay;
-use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::cell::{Committed, Values};
+use crate::state::cell::Values;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::store::{CELL_BATCH, ReadBatch};
 use crate::state::tests::support::CountingCellStore;
-use crate::state::{CollectionId, StateAccessError, StateKey, StateName, StateType};
+use crate::state::{CollectionId, StateKey, StateName, StateType};
 use crate::test_util::TEST_RUNTIME;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, bail};
@@ -20,11 +19,11 @@ use uuid::Uuid;
 
 const SECTION: Section = Section::new(0);
 
-/// Under a lower store that drops the last answer of each batch, a batch read
-/// fails as a transient misaligned batch exactly when a position reaches the
-/// lower store. Dirty answers and a cleared section never reach it.
+/// A batch read over an empty lower store answers each position from the
+/// dirty model. It reads the lower store once exactly when a position has no
+/// dirty answer. A cleared section never reaches it.
 #[test]
-fn prop_short_lower_batch_fails_only_lower_reads() {
+fn prop_lower_batch_reads_only_untouched_positions() {
     fn property(
         cleared: bool,
         dirty: Vec<(u8, Option<u8>)>,
@@ -49,7 +48,6 @@ async fn check(
         StateName::try_new("overlay")?,
     );
     let lower = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
-    lower.short_batches();
     let overlay = Overlay::new(Arc::new(DirtyStore::new()), lower.clone());
 
     // The model applies the section clear first. Later dirty writes repopulate
@@ -83,7 +81,7 @@ async fn check(
             .iter()
             .any(|[coordinate]| !model.contains_key(coordinate));
 
-    let result = overlay.get_many::<Values>(&id, SECTION, &batch).await;
+    let answers = overlay.get_many::<Values>(&id, SECTION, &batch).await?;
     if lower.batch_reads() != usize::from(reaches_lower) {
         bail!(
             "{} lower batch reads, expected {}",
@@ -91,35 +89,18 @@ async fn check(
             usize::from(reaches_lower)
         );
     }
-    match result {
-        Err(error) if reaches_lower => {
-            if !matches!(error, StateAccessError::MisalignedBatch(_))
-                || error.classify_error() != ErrorCategory::Transient
-            {
-                bail!(
-                    "a short lower batch failed as {error:?}, expected a transient misaligned \
-                     batch"
-                );
-            }
-        }
-        Err(error) => bail!("a read without lower positions failed: {error:?}"),
-        Ok(_) if reaches_lower => bail!("a short lower batch must fail the read"),
-        Ok(answers) => {
-            let answers: Vec<_> = answers.into_iter().map(Committed::into_inner).collect();
-            let expected: Vec<_> = coordinates
-                .iter()
-                .map(|[coordinate]| {
-                    model
-                        .get(coordinate)
-                        .copied()
-                        .flatten()
-                        .map(|byte| Bytes::copy_from_slice(&[byte]))
-                })
-                .collect();
-            if answers != expected {
-                bail!("answers {answers:?}, expected {expected:?}");
-            }
-        }
+    let expected: Vec<_> = coordinates
+        .iter()
+        .map(|[coordinate]| {
+            model
+                .get(coordinate)
+                .copied()
+                .flatten()
+                .map(|byte| Bytes::copy_from_slice(&[byte]))
+        })
+        .collect();
+    if *answers != *expected {
+        bail!("answers {answers:?}, expected {expected:?}");
     }
     Ok(())
 }

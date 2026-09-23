@@ -115,8 +115,7 @@ async fn check_residue<R: CommittedCellSource<Values> + CommittedCellSource<Pres
                 CommittedCellSource::<Presence>::load_many(source, id, section, &borrowed),
             );
             let (values, presence) = (values?, presence?);
-            if values.as_slice() != expected.as_slice() || presence.as_slice() != expected_presence
-            {
+            if *values != *expected.as_slice() || *presence != expected_presence {
                 return Ok(false);
             }
         }

@@ -26,7 +26,7 @@ use crate::state::descriptor_identity::DescriptorIdentityStore;
 use crate::state::identity::CollectionId;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state::publication::PublicationStore;
-use crate::state::store::{CellBuffer, ReadBatch};
+use crate::state::store::{Answers, ReadBatch};
 use crate::timers::store::cassandra::CassandraTriggerStoreProvider;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use futures::{Stream, TryStreamExt};
@@ -65,7 +65,7 @@ pub trait CommittedCellSource<P: Projection>: CellSource {
         id: &'a CollectionId,
         section: Section,
         batch: &'a ReadBatch<'buf>,
-    ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, Self::Error>>
+    ) -> impl Future<Output = Result<Answers<Option<P::Payload>>, Self::Error>>
     + Send
     + use<'buf, 'a, Self, P>;
 
@@ -95,9 +95,8 @@ impl<P: Projection> CommittedCellSource<P> for MemoryCells {
         id: &'a CollectionId,
         section: Section,
         batch: &'a ReadBatch<'buf>,
-    ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, Self::Error>>
-    + Send
-    + use<'buf, 'a, P> {
+    ) -> impl Future<Output = Result<Answers<Option<P::Payload>>, Self::Error>> + Send + use<'buf, 'a, P>
+    {
         ready(Ok(self.read_committed_many::<P>(id, section, batch)))
     }
 
@@ -134,9 +133,8 @@ impl<P: Projection> CommittedCellSource<P> for ScriptedCellSource {
         id: &'a CollectionId,
         section: Section,
         batch: &'a ReadBatch<'buf>,
-    ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, Self::Error>>
-    + Send
-    + use<'buf, 'a, P> {
+    ) -> impl Future<Output = Result<Answers<Option<P::Payload>>, Self::Error>> + Send + use<'buf, 'a, P>
+    {
         ready(self.read_committed_many::<P>(id, section, batch))
     }
 
