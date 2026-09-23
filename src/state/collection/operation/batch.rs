@@ -84,9 +84,11 @@ where
                 },
             )
             .await?;
-        // The first batch moves in, so a read of one batch allocates once.
+        // The first batch moves in, so a one-batch read allocates once. It then
+        // reserves the remaining size hint for later batches.
         if answers.is_empty() {
             answers = merged.into();
+            answers.reserve(keys.size_hint().0);
         } else {
             answers.extend(merged);
         }
