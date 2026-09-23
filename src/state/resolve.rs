@@ -21,6 +21,8 @@ use tokio::task::coop::cooperative;
 /// Each marker is read at most once, on the first provisional cell.
 /// Per-key serialization protects owner reads. Standalone reads accept this
 /// snapshot.
+/// The snapshot lives in a `OnceCell` so that each per-cell future of one
+/// batch read can share the lookup through `&self`.
 pub(crate) struct EvidenceLookup<'a, S> {
     store: &'a S,
     collection: &'a CollectionId,

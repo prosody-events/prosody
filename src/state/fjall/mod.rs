@@ -59,7 +59,6 @@ use crate::state::cell::{Committed, Projection, ProvisionalWrite, Values};
 use crate::state::store::Durable;
 use bytes::Bytes;
 use educe::Educe;
-use fjall::Slice;
 #[cfg(test)]
 use fjall::{Database, Keyspace};
 use smallvec::SmallVec;
@@ -241,17 +240,6 @@ impl FjallCellCache {
         section: Section,
         batch: &ReadBatch<'_>,
     ) -> Result<Answers<CacheRead<P>>, FjallCellCacheError> {
-        let raws = self.read_batch(collection, section, batch).await?;
-        let now = self.clock.now_ms();
-        Ok(raws.map(|raw| io::probe::<P>(raw.as_deref(), now)))
-    }
-
-    async fn read_batch(
-        &self,
-        collection: &CollectionId,
-        section: Section,
-        batch: &ReadBatch<'_>,
-    ) -> Result<Answers<Option<Slice>>, FjallCellCacheError> {
         // Encode every key up front (bounded, sized once): small requests stay
         // inline and the owned keys move into the blocking closure.
         let keys = batch.map(|&coordinate| {
@@ -264,18 +252,20 @@ impl FjallCellCache {
             )
         });
         let handle = self.inner.handle().clone();
+        let now = self.clock.now_ms();
         #[cfg(test)]
         let faults = self.faults.clone();
         // ONE blocking hop reads every key exhaustively; a per-key engine error
         // (or the injected fault) fails the whole hop, mirroring how `read_cell`
         // surfaces one via `??`.
-        spawn_blocking(
-            move || -> Result<Answers<Option<Slice>>, FjallCellCacheError> {
-                #[cfg(test)]
-                faults.probe()?;
-                Ok(keys.try_map(|key| handle.get(key.as_slice()))?)
-            },
-        )
+        spawn_blocking(move || {
+            #[cfg(test)]
+            faults.probe()?;
+            keys.try_map(|key| {
+                let raw = handle.get(key.as_slice())?;
+                Ok(io::probe::<P>(raw.as_deref(), now))
+            })
+        })
         .await?
     }
 

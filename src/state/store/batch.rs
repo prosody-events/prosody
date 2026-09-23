@@ -7,7 +7,6 @@ use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::identity::CollectionId;
 use crate::timers::duration::CompactDuration;
 use smallvec::SmallVec;
-use std::convert::Infallible;
 use std::future::Future;
 use std::iter::from_fn;
 use std::num::NonZeroUsize;
@@ -79,11 +78,8 @@ impl<C, const N: usize> Batch<C, N> {
     }
 
     /// Answers each position with `answer`.
-    pub(crate) fn map<T>(&self, mut answer: impl FnMut(&C) -> T) -> Answers<T> {
-        match self.try_map(|coordinate| Ok::<_, Infallible>(answer(coordinate))) {
-            Ok(answers) => answers,
-            Err(never) => match never {},
-        }
+    pub(crate) fn map<T>(&self, answer: impl FnMut(&C) -> T) -> Answers<T> {
+        Answers(self.iter().map(answer).collect())
     }
 
     /// Answers each position with `answer`, or returns its first error.
@@ -154,7 +150,7 @@ impl<'a> ReadBatch<'a> {
 /// Only a batch builds answers, and mapping keeps each position. So every
 /// answer list has the length of the batch it answers, and callers pair
 /// answers with coordinates by position.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Answers<T>(CellBuffer<T>);
 
 impl<T> Answers<T> {
