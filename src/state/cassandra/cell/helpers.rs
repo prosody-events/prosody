@@ -51,7 +51,7 @@ pub(super) fn ttl_seconds_to_duration(ttl: Option<i32>) -> Option<CompactDuratio
 }
 
 /// Keeps provisional cells from a recovery batch and discards their TTLs.
-/// The input already follows ascending coordinate order.
+/// `coordinates` is ascending, so the output is ascending.
 pub(super) fn decode_provisional_batch(
     mut rows: CellBuffer<(Bytes, PointRow<Values>)>,
     coordinates: &[&Coordinate],

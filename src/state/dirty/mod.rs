@@ -44,6 +44,17 @@ use bytes::Bytes;
 use scc::Guard;
 use smallvec::SmallVec;
 
+mod keys;
+#[cfg(test)]
+mod tests;
+
+pub(crate) use keys::Edge;
+pub(in crate::state) use keys::remove_span;
+use keys::{
+    CollectionScope, DirtyKey, DirtyRef, KeyScope, MarkerCollectionScope, MarkerKey,
+    MarkerKeyScope, SectionScope, dirty_key, marker_key,
+};
+
 /// Inline capacity of one event's touched-collection work-list; an event
 /// touches a handful of collections.
 const COLLECTIONS_INLINE: usize = 4;
@@ -322,14 +333,3 @@ impl DirtyStore {
         remove_span(&self.markers, MarkerKeyScope::range(key.clone()));
     }
 }
-
-mod keys;
-#[cfg(test)]
-mod tests;
-
-pub(crate) use keys::Edge;
-pub(in crate::state) use keys::remove_span;
-use keys::{
-    CollectionScope, DirtyKey, DirtyRef, KeyScope, MarkerCollectionScope, MarkerKey,
-    MarkerKeyScope, SectionScope, dirty_key, marker_key,
-};

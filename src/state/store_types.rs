@@ -47,8 +47,9 @@ impl<C, const N: usize> Batch<C, N> {
         })
     }
 
-    /// Keeps the coordinates that `keep` accepts, in input order. An empty
-    /// result returns `None`. A subset stays within the batch bound.
+    /// Keeps the coordinates that `keep` accepts, in input order. `keep` runs
+    /// once per coordinate, in input order. An empty result returns `None`.
+    /// A subset stays within the batch bound.
     pub(crate) fn filter(&self, mut keep: impl FnMut(&C) -> bool) -> Option<Self>
     where
         C: Clone,

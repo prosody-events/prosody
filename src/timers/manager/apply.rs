@@ -1,4 +1,5 @@
-//! Applies resolved timer transitions to the store and the scheduler.
+//! Applies resolved timer transitions to the store and the scheduler, and
+//! reports them to telemetry.
 
 use super::{TimerManagerError, TimerManagerInner};
 use crate::error::ClassifyError;

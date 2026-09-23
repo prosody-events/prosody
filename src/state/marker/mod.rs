@@ -24,6 +24,18 @@ use bytes::Bytes;
 use std::sync::Arc;
 use uuid::Uuid;
 
+mod payload;
+mod stage;
+#[cfg(test)]
+mod tests;
+
+pub use payload::MarkerPayloadError;
+pub(in crate::state) use payload::{
+    decode_marker_payload, encode_committed_payload, encode_marker_payload,
+};
+pub(crate) use stage::FrozenStage;
+pub use stage::ProvisionalStage;
+
 /// Identifies one stage across all collections of one settle.
 /// A Committed row certifies a Staged row exactly when their attempt ids match.
 /// The event and touched list do not select this decision.
@@ -362,15 +374,3 @@ pub(crate) struct EventEvidence {
     pub(crate) evidence_ttl: CompactDuration,
     pub(crate) dedup: Option<Uuid>,
 }
-
-mod payload;
-mod stage;
-#[cfg(test)]
-mod tests;
-
-pub use payload::MarkerPayloadError;
-pub(in crate::state) use payload::{
-    decode_marker_payload, encode_committed_payload, encode_marker_payload,
-};
-pub(crate) use stage::FrozenStage;
-pub use stage::ProvisionalStage;
