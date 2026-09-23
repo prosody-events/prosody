@@ -10,6 +10,7 @@ use crate::state::cell_key::CellRef;
 use crate::state::order_codec::KeyCodecError;
 use crate::state::store::{CELL_BATCH, ReadBatch};
 use smallvec::SmallVec;
+use std::convert::identity;
 
 /// Encodes one key before its borrow ends.
 /// The pooled buffer returns at once, so concurrent point reads share it.
@@ -39,7 +40,7 @@ where
     S::Engine: sealed::Reads<S, P>,
     T: CellType,
 {
-    let mut answers = CellBuffer::new();
+    let mut answers = CellBuffer::with_capacity(keys.size_hint().0);
     let mut buffer = SerializeBufGuard::acquire();
     loop {
         buffer.clear();
@@ -64,8 +65,9 @@ where
         };
         let inner = &mut *inner;
         // Coordinates that the journal does not answer read from the store.
-        let merged = batch
-            .merge(
+        batch
+            .merge_into(
+                &mut answers,
                 |coordinate| {
                     let cell = CellRef {
                         section,
@@ -82,16 +84,9 @@ where
                     )
                     .await
                 },
+                identity,
             )
             .await?;
-        // The first batch moves in, so a one-batch read allocates once. It then
-        // reserves the remaining size hint for later batches.
-        if answers.is_empty() {
-            answers = merged.into();
-            answers.reserve(keys.size_hint().0);
-        } else {
-            answers.extend(merged);
-        }
     }
 }
 

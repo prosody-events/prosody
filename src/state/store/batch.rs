@@ -10,7 +10,7 @@ use smallvec::SmallVec;
 use std::future::Future;
 use std::iter::from_fn;
 use std::num::NonZeroUsize;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::slice;
 
 /// The maximum number of coordinates a batch read carries in one hop.
@@ -116,49 +116,65 @@ impl<'a> ReadBatch<'a> {
 
     /// Answers each position from `local`, which returns `None` for a position
     /// it cannot answer. One `lower` read of the pending subset answers the
-    /// rest, and it runs only when a position remains.
-    pub(crate) async fn merge<T: Default, E, F>(
+    /// rest, and it runs only when a position remains. `answer` converts each
+    /// lower answer.
+    pub(crate) async fn merge<T: Default, U, E, F>(
         &self,
-        mut local: impl FnMut(&'a [u8]) -> Option<T>,
+        local: impl FnMut(&'a [u8]) -> Option<T>,
         lower: impl FnOnce(ReadBatch<'a>) -> F,
+        answer: impl FnMut(U) -> T,
     ) -> Result<Answers<T>, E>
     where
-        F: Future<Output = Result<Answers<T>, E>>,
+        F: Future<Output = Result<Answers<U>, E>>,
     {
-        let mut answers = CellBuffer::with_capacity(self.len());
+        let mut answers = CellBuffer::new();
+        self.merge_into(&mut answers, local, lower, answer).await?;
+        Ok(Answers(answers))
+    }
+
+    /// Appends the [`Self::merge`] answers to `answers`, so a read of many
+    /// batches fills one buffer. After an error, `answers` holds placeholders.
+    pub(crate) async fn merge_into<T: Default, U, E, F>(
+        &self,
+        answers: &mut CellBuffer<T>,
+        mut local: impl FnMut(&'a [u8]) -> Option<T>,
+        lower: impl FnOnce(ReadBatch<'a>) -> F,
+        mut answer: impl FnMut(U) -> T,
+    ) -> Result<(), E>
+    where
+        F: Future<Output = Result<Answers<U>, E>>,
+    {
+        let start = answers.len();
         let mut positions: SmallVec<[u8; CELL_BATCH.get()]> = SmallVec::new();
         let mut pending = SmallVec::new();
-        for &coordinate in self.iter() {
+        answers.reserve(self.len());
+        for (position, &coordinate) in self.iter().enumerate() {
             answers.push(local(coordinate).unwrap_or_else(|| {
-                positions.push(answers.len() as u8);
+                positions.push(position as u8);
                 pending.push(coordinate);
                 T::default()
             }));
         }
         if !pending.is_empty() {
             // `pending` is a non-empty subset of this batch.
-            for (position, answer) in positions.into_iter().zip(lower(Batch(pending)).await?) {
-                answers[usize::from(position)] = answer;
+            for (position, value) in positions.into_iter().zip(lower(Batch(pending)).await?) {
+                answers[start + usize::from(position)] = answer(value);
             }
         }
-        Ok(Answers(answers))
+        Ok(())
     }
 }
 
 /// One answer for each position of a batch, in input order.
 ///
-/// Only a batch builds answers, and mapping keeps each position. So every
+/// Only a batch builds answers, and no method changes their length. So every
 /// answer list has the length of the batch it answers, and callers pair
-/// answers with coordinates by position.
+/// answers with coordinates by position. A reader must answer the batch it
+/// receives. The type cannot stop crate code that answers a different batch.
 #[derive(Debug)]
 pub struct Answers<T>(CellBuffer<T>);
 
 impl<T> Answers<T> {
-    /// Maps each answer in place of its position.
-    pub(crate) fn map<U>(self, answer: impl FnMut(T) -> U) -> Answers<U> {
-        Answers(self.0.into_iter().map(answer).collect())
-    }
-
     /// Maps each borrowed answer, or returns the first error.
     pub(crate) fn try_map<U, E>(
         &self,
@@ -173,6 +189,12 @@ impl<T> Deref for Answers<T> {
 
     fn deref(&self) -> &[T] {
         &self.0
+    }
+}
+
+impl<T> DerefMut for Answers<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.0
     }
 }
 

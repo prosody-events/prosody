@@ -129,9 +129,12 @@ impl<S: CellRead<P>, P: CountProjection> CellRead<P> for TtlAwareCellStore<S> {
         section: Section,
         batch: &'a ReadBatch<'_>,
     ) -> Result<CacheBatch<P>, Self::Error> {
-        let cells = CellRead::<P>::read_many(&self.inner, collection, section, batch).await?;
+        let mut cells = CellRead::<P>::read_many(&self.inner, collection, section, batch).await?;
         let remaining = self.remaining();
-        Ok(cells.map(|(committed, _)| (committed, remaining)))
+        for (_, ttl) in cells.iter_mut() {
+            *ttl = remaining;
+        }
+        Ok(cells)
     }
 
     fn scan<'a>(

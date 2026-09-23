@@ -252,18 +252,19 @@ impl FjallCellCache {
             )
         });
         let handle = self.inner.handle().clone();
-        let now = self.clock.now_ms();
+        let clock = self.clock.clone();
         #[cfg(test)]
         let faults = self.faults.clone();
         // ONE blocking hop reads every key exhaustively; a per-key engine error
         // (or the injected fault) fails the whole hop, mirroring how `read_cell`
-        // surfaces one via `??`.
+        // surfaces one via `??`. As in `get`, each expiry check reads the clock
+        // after its read.
         spawn_blocking(move || {
             #[cfg(test)]
             faults.probe()?;
             keys.try_map(|key| {
                 let raw = handle.get(key.as_slice())?;
-                Ok(io::probe::<P>(raw.as_deref(), now))
+                Ok(io::probe::<P>(raw.as_deref(), clock.now_ms()))
             })
         })
         .await?

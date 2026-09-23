@@ -111,11 +111,9 @@ impl<L> Overlay<L> {
                     }
                 },
                 move |pending| async move {
-                    let answers =
-                        CellRead::<P>::read_many(&self.lower, collection, section, &pending)
-                            .await?;
-                    Ok(answers.map(|(committed, _)| committed.into_inner()))
+                    CellRead::<P>::read_many(&self.lower, collection, section, &pending).await
                 },
+                |(committed, _)| committed.into_inner(),
             )
             .await
     }
