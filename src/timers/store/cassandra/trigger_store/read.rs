@@ -24,11 +24,10 @@ pub(super) fn times<'a>(
     timer_type: TimerType,
     key: &'a Key,
 ) -> impl Stream<Item = Result<CompactDateTime, CassandraTriggerStoreError>> + Send + use<'a> {
-    let key_clone = key.clone();
     let segment_id = store.segment.id;
 
     try_stream! {
-        let (handle, cached) = store.resolve_state(&segment_id, &key_clone, timer_type).await?;
+        let (handle, cached) = store.resolve_state(&segment_id, key, timer_type).await?;
         Span::current().record("state_cached", cached);
 
         // Snapshot the state and release the lock before any DB I/O — a
@@ -46,7 +45,7 @@ pub(super) fn times<'a>(
                     .session()
                     .execute_iter(
                         store.queries().get_key_times.clone(),
-                        (segment_id, key_clone.as_ref(), timer_type),
+                        (segment_id, key.as_ref(), timer_type),
                     )
                     .await
                     .map_err(CassandraStoreError::from)?
@@ -75,11 +74,10 @@ pub(super) fn triggers<'a>(
     timer_type: TimerType,
     key: &'a Key,
 ) -> impl Stream<Item = Result<Trigger, CassandraTriggerStoreError>> + Send + use<'a> {
-    let key_clone = key.clone();
     let segment_id = store.segment.id;
 
     try_stream! {
-        let (handle, cached) = store.resolve_state(&segment_id, &key_clone, timer_type).await?;
+        let (handle, cached) = store.resolve_state(&segment_id, key, timer_type).await?;
         Span::current().record("state_cached", cached);
 
         // Snapshot the state and release the lock before any DB I/O — a
@@ -90,7 +88,7 @@ pub(super) fn triggers<'a>(
             TimerState::Inline(timer) => {
                 // Inline: yield trigger from cache (0 clustering query).
                 let context = store.propagator().extract(&timer.span);
-                yield Trigger::restored(key_clone.clone(), timer.time, timer_type, timer.tag, context);
+                yield Trigger::restored(key.clone(), timer.time, timer_type, timer.tag, context);
             }
             TimerState::Overflow => {
                 // Overflow: scan clustering rows.
@@ -98,7 +96,7 @@ pub(super) fn triggers<'a>(
                     .session()
                     .execute_iter(
                         store.queries().get_key_triggers.clone(),
-                        (segment_id, key_clone.as_ref(), timer_type),
+                        (segment_id, key.as_ref(), timer_type),
                     )
                     .await
                     .map_err(CassandraStoreError::from)?
@@ -113,7 +111,7 @@ pub(super) fn triggers<'a>(
                 {
                     let context = store.propagator().extract(&span_map);
                     let tag = tag_opt.unwrap_or(0_i32);
-                    yield Trigger::restored(key_clone.clone(), time, timer_type, tag, context);
+                    yield Trigger::restored(key.clone(), time, timer_type, tag, context);
                 }
             }
             TimerState::Absent => {
@@ -128,12 +126,11 @@ pub(super) fn triggers_all_types<'a>(
     store: &'a CassandraTriggerStore,
     key: &'a Key,
 ) -> impl Stream<Item = Result<Trigger, CassandraTriggerStoreError>> + Send + use<'a> {
-    let key_clone = key.clone();
     let segment_id = store.segment.id;
 
     try_stream! {
         // Read all types in a single query, then build the state_map.
-        let raw_map = store.fetch_state_map(&segment_id, &key_clone).await?;
+        let raw_map = store.fetch_state_map(&segment_id, key).await?;
         let raw_map = raw_map.unwrap_or_default();
 
         let mut state_map: HashMap<TimerType, TimerState> =
@@ -153,7 +150,7 @@ pub(super) fn triggers_all_types<'a>(
         // Use get_value_or_guard_async to avoid overwriting an existing
         // Arc<AsyncMutex> handle held by a concurrent mutator.
         for (&tt, state) in &state_map {
-            let cache_key = (key_clone.clone(), tt);
+            let cache_key = (key.clone(), tt);
             if let Err(guard) = store.state_cache.get_value_or_guard_async(&cache_key).await {
                 let _ = guard.insert(Arc::new(AsyncMutex::new(state.clone())));
             }
@@ -171,7 +168,7 @@ pub(super) fn triggers_all_types<'a>(
             let clustering_stream = store.session()
                 .execute_iter(
                     store.queries().get_key_triggers_all_types.clone(),
-                    (segment_id, key_clone.as_ref()),
+                    (segment_id, key.as_ref()),
                 )
                 .await
                 .map_err(CassandraStoreError::from)?
@@ -190,7 +187,7 @@ pub(super) fn triggers_all_types<'a>(
 
             let mut variants_iter = TimerType::VARIANTS.iter();
             let mut inline_next = advance_inline(
-                &key_clone,
+                key,
                 &state_map,
                 &mut variants_iter,
                 store.propagator(),
@@ -199,7 +196,7 @@ pub(super) fn triggers_all_types<'a>(
             // For each clustering row, flush any inline entries that
             // sort before it.
             while let Some(clustering) = advance_clustering(
-                &key_clone,
+                key,
                 &mut clustering_stream,
                 store.propagator(),
             ).await? {
@@ -207,7 +204,7 @@ pub(super) fn triggers_all_types<'a>(
                     if (s.timer_type, s.time) <= (clustering.timer_type, clustering.time) {
                         yield s;
                         inline_next = advance_inline(
-                            &key_clone,
+                            key,
                             &state_map,
                             &mut variants_iter,
                             store.propagator(),
@@ -224,7 +221,7 @@ pub(super) fn triggers_all_types<'a>(
             while let Some(trigger) = inline_next {
                 yield trigger;
                 inline_next = advance_inline(
-                    &key_clone,
+                    key,
                     &state_map,
                     &mut variants_iter,
                     store.propagator(),
@@ -236,7 +233,7 @@ pub(super) fn triggers_all_types<'a>(
             for &tt in TimerType::VARIANTS {
                 if let Some(TimerState::Inline(timer)) = state_map.get(&tt) {
                     let context = store.propagator().extract(&timer.span);
-                    yield Trigger::restored(key_clone.clone(), timer.time, tt, timer.tag, context);
+                    yield Trigger::restored(key.clone(), timer.time, tt, timer.tag, context);
                 }
             }
         }

@@ -293,6 +293,9 @@ pub trait CellStore: CellRead<Values> + CellRead<Presence> {
     ///
     /// The frozen positions protect survivors without timestamp comparisons.
     /// Admission can retry this operation.
+    /// Unlike [`Self::write_provisional`], it takes no [`ProvisionalStage`].
+    /// A promote leaves no provisional cell, so an unlisted write cannot
+    /// strand.
     ///
     /// # Errors
     ///

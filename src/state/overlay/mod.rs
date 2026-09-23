@@ -104,6 +104,8 @@ impl<L> Overlay<L> {
         let mut answers = CommittedBatch::<P>::with_capacity(batch.len());
         let mut positions: SmallVec<[u8; CELL_BATCH.get()]> = SmallVec::new();
         // The untouched coordinates read through to the lower store.
+        // The journal read in `operation::batch` has the same shape. A shared
+        // helper needs a new type and a placeholder closure, so each keeps its loop.
         let lower_batch = batch.filter(|&coordinate| {
             let cell = CellRef {
                 section,

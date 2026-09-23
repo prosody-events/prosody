@@ -11,13 +11,15 @@ use crate::state::order_codec::KeyCodecError;
 use crate::state::store::{CELL_BATCH, ReadBatch, ensure_aligned};
 use smallvec::SmallVec;
 
-/// Encodes one key before its borrow ends. The future owns the buffer guard.
+/// Encodes one key before its borrow ends.
+/// The pooled buffer returns at once, so concurrent point reads share it.
+/// The copy stays inline for coordinates of 32 bytes or fewer.
 pub(super) fn encode_key<K: OrderedKeyCodec>(
     key: &K::Borrowed,
-) -> Result<SerializeBufGuard, KeyCodecError> {
+) -> Result<SmallVec<[u8; 32]>, KeyCodecError> {
     let mut buffer = SerializeBufGuard::acquire();
     K::with_cached_local(|codec| codec.serialize_key(key, &mut buffer))?;
-    Ok(buffer)
+    Ok(SmallVec::from_slice(&buffer))
 }
 
 /// Encodes one bounded batch at a time and preserves every input position.

@@ -1,6 +1,7 @@
 //! Metric instruments for committed keyed-state cell loads.
 
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::store::{CellBuffer, ensure_aligned};
 use opentelemetry::KeyValue;
 use opentelemetry::global::meter;
 use opentelemetry::metrics::{Counter, Histogram, Meter};
@@ -53,6 +54,7 @@ impl CellMetrics {
         cache_result: CacheResult,
         outcome: &Result<T, E>,
     ) {
+        let outcome = outcome.as_ref().map(drop).map_err(E::classify_error);
         self.record(
             1,
             ("get", projection),
@@ -64,6 +66,7 @@ impl CellMetrics {
     }
 
     /// Records all cells in one batch load.
+    /// A misaligned answer records as a failed load.
     pub(super) fn batch<T, E: ClassifyError>(
         &self,
         cells: usize,
@@ -71,8 +74,12 @@ impl CellMetrics {
         started: Instant,
         source: Source,
         cache_result: CacheResult,
-        outcome: &Result<T, E>,
+        outcome: &Result<CellBuffer<T>, E>,
     ) {
+        let outcome = match outcome {
+            Ok(answers) => ensure_aligned(answers.len(), cells).map_err(|e| e.classify_error()),
+            Err(error) => Err(error.classify_error()),
+        };
         self.record(
             cells,
             ("get_many", projection),
@@ -83,14 +90,14 @@ impl CellMetrics {
         );
     }
 
-    fn record<T, E: ClassifyError>(
+    fn record(
         &self,
         cells: usize,
         (operation, projection): (&'static str, &'static str),
         started: Instant,
         source: Source,
         result: CacheResult,
-        outcome: &Result<T, E>,
+        outcome: Result<(), ErrorCategory>,
     ) {
         let cells = cells as u64;
         let attributes = [
@@ -101,18 +108,18 @@ impl CellMetrics {
         ];
         let duration = started.elapsed().as_secs_f64();
         match outcome {
-            Ok(_) => {
+            Ok(()) => {
                 self.loads.add(cells, &attributes);
                 self.load_duration.record(duration, &attributes);
             }
-            Err(error) => self.load_duration.record(
+            Err(category) => self.load_duration.record(
                 duration,
                 &[
                     attributes[0].clone(),
                     attributes[1].clone(),
                     attributes[2].clone(),
                     attributes[3].clone(),
-                    KeyValue::new(ERROR_CATEGORY, error_category(error.classify_error())),
+                    KeyValue::new(ERROR_CATEGORY, error_category(category)),
                 ],
             ),
         }

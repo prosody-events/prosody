@@ -275,8 +275,9 @@ struct EventMarkerData {
 
 impl EventMarker {
     /// Freezes the marker for `event` from its staged cells and cleared
-    /// sections. The staged list is sorted by `(section, coordinate)` and
-    /// distinct, as the decoder makes it, so a payload round trip is exact.
+    /// sections. The staged coordinate list is sorted by `(section,
+    /// coordinate)` for a deterministic payload. An event stages each cell at
+    /// most once, so the list is distinct without a dedup.
     #[must_use]
     pub(in crate::state) fn frozen(
         event: EventRef,
@@ -285,7 +286,7 @@ impl EventMarker {
         evidence: &EventEvidence,
     ) -> Self {
         let mut coordinates: Vec<CellKey> = staged.iter().map(|(cell, _)| cell.clone()).collect();
-        sort_distinct(&mut coordinates);
+        coordinates.sort_unstable();
         Self::from_parts(EventMarkerData {
             version: MarkerVersion::V2,
             stage: evidence.stage,

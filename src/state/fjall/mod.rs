@@ -442,7 +442,7 @@ impl FjallCellCache {
     ///
     /// `exclude` names the staged coordinates that survive
     /// [`Cached::commit_provisional`](crate::state::cached::Cached).
-    /// Other callers pass `&[]` to delete the whole section.
+    /// Other callers pass an empty set to delete the whole section.
     /// The exclusion set encodes each coordinate once with `codec::cell_key`,
     /// the same form that the scan returns.
     /// A hash set gives expected O(1) work per scanned key and O(|exclude| +

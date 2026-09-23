@@ -149,7 +149,6 @@ impl<'c, S: StateSession, L> CollectionRead for ReadOperation<'c, S, L> {
                 cell,
             )
             .await?;
-            drop(buffer);
             match bytes {
                 Some(bytes) => Ok(Some(resolve_cell::<S, T>(session, bytes).await?)),
                 None => Ok(None),
@@ -286,7 +285,6 @@ impl<'c, S: WritableStateSession, L> CollectionRead for WriteOperation<'c, S, L>
                 coordinate: &buffer,
             };
             let value = self.staged_or_read::<Values>(cell).await?;
-            drop(buffer);
             match value {
                 Some(bytes) => Ok(Some(
                     resolve_cell::<S, T>(self.collection.session(), bytes).await?,

@@ -64,10 +64,6 @@ pub enum StateAccessError {
     },
 
     /// A store answered a batch read with the wrong number of values.
-    ///
-    /// The category is transient. A permanent error would restore the
-    /// event's state and then commit its source, so a store defect would drop
-    /// state writes. A transient error keeps the event in retry instead.
     #[error(transparent)]
     MisalignedBatch(#[from] MisalignedBatch),
 
@@ -126,7 +122,8 @@ impl ClassifyError for StateAccessError {
             | Self::SessionClosed => ErrorCategory::Permanent,
             // Aligned with the cancellation middleware: a terminated
             // context is a transient condition (retry decides).
-            Self::Terminated | Self::MisalignedBatch(_) => ErrorCategory::Transient,
+            Self::Terminated => ErrorCategory::Transient,
+            Self::MisalignedBatch(error) => error.classify_error(),
             Self::Store { category, .. } | Self::Load { category, .. } => *category,
         }
     }

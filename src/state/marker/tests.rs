@@ -30,19 +30,23 @@ fn arb_cell(g: &mut Gen) -> CellKey {
     }
 }
 
-/// A staged write whose data is present or absent (the survivor derivation
-/// keeps only the present ones).
+/// Unsorted staged writes whose data is present or absent (the survivor
+/// derivation keeps only the present ones). An event stages each cell at most
+/// once, so a repeated cell keeps its first write.
 fn arb_staged(g: &mut Gen) -> Vec<(CellKey, ProvisionalWrite)> {
     let len = usize::arbitrary(g) % 5;
-    (0..len)
-        .map(|_| {
-            let data = bool::arbitrary(g).then(|| bytes(u8::arbitrary(g)));
-            (
-                arb_cell(g),
+    let mut staged: Vec<(CellKey, ProvisionalWrite)> = Vec::with_capacity(len);
+    for _ in 0..len {
+        let cell = arb_cell(g);
+        let data = bool::arbitrary(g).then(|| bytes(u8::arbitrary(g)));
+        if staged.iter().all(|(staged, _)| *staged != cell) {
+            staged.push((
+                cell,
                 ProvisionalWrite::new(data, Committed::new(None), event()),
-            )
-        })
-        .collect()
+            ));
+        }
+    }
+    staged
 }
 
 fn bytes(value: u8) -> bytes::Bytes {
@@ -149,39 +153,6 @@ fn prop_marker_payload_round_trips() {
     QuickCheck::new().quickcheck(
         prop as fn(ArbMarker, Vec<(bool, String)>, Option<u32>, Option<u128>) -> TestResult,
     );
-}
-
-/// A repeated staged cell freezes once, so the payload round trip is exact.
-/// This is the shrunk input of a `prop_marker_payload_round_trips` failure.
-#[test]
-fn repeated_staged_cell_round_trips() -> color_eyre::Result<()> {
-    let write = |coordinate: &[u8]| {
-        (
-            CellKey {
-                section: Section::new(0),
-                coordinate: Coordinate::from_bytes(coordinate.to_vec()),
-            },
-            ProvisionalWrite::new(None, Committed::new(None), event()),
-        )
-    };
-    let staged = [write(b""), write(b"\0"), write(b"\0")];
-    let marker = EventMarker::frozen(
-        event(),
-        &staged,
-        Vec::new(),
-        &EventEvidence {
-            touched: [].into(),
-            evidence_ttl: CompactDuration::new(3600),
-            dedup: None,
-            stage: StageId(Uuid::from_u128(0xA77E)),
-        },
-    );
-
-    let bytes = encode_marker_payload(&marker)?;
-    let decoded = decode_marker_payload(event(), &bytes, MarkerVersion::V2, None)?;
-    assert_eq!(marker.staged().len(), 2);
-    assert_eq!(decoded, marker);
-    Ok(())
 }
 
 /// The survivor definition pinned directly at its source: for any mix of

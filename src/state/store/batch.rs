@@ -1,6 +1,7 @@
 //! Bounded batch reads: the batch type, its helpers, and its alignment check.
 
 use super::CellStore;
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::CELLS_INLINE;
 use crate::state::cell::{Committed, ProvisionalCell, Values};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
@@ -198,4 +199,12 @@ pub struct MisalignedBatch {
 
     /// The number of coordinates the batch requested.
     pub requested: usize,
+}
+
+/// A misaligned batch is transient. The stored data is intact, so a permanent
+/// error would restore the event's state and drop its writes.
+impl ClassifyError for MisalignedBatch {
+    fn classify_error(&self) -> ErrorCategory {
+        ErrorCategory::Transient
+    }
 }
