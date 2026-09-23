@@ -2,6 +2,7 @@ use super::*;
 use crate::state::cell::Values;
 use crate::state::store::CellRead;
 use crate::state::tests::support::evidence;
+use crate::state::tests::support::listed;
 
 /// Positional binding-order proof (the one silent-failure surface):
 /// `scylla::Batch` binds its statement list 1:1 with the value list, and on a
@@ -49,7 +50,7 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     )];
     let marker_b = EventMarker::frozen(event(1), &writes_b, &[], &evidence([].into(), None));
     store
-        .write_provisional(&c, &writes_b, Some(&marker_b))
+        .write_provisional(&c, listed(&marker_b, &writes_b)?)
         .await?;
     // Pre-seed D resolved so the batch's `cell_delete` has a row to remove.
     store

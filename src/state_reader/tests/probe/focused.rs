@@ -94,14 +94,14 @@ async fn short_batch_buffer_fails_the_uncached_read() -> Result<()> {
     let reader = env.reader_eager()?;
 
     match reader.get_many(key, &[0, 1]).await {
-        Err(error) if error.classify_error() == ErrorCategory::Permanent => {
+        Err(error) if error.classify_error() == ErrorCategory::Transient => {
             assert!(
-                error.to_string().contains("batch read returned 1 values"),
+                error.to_string().contains("batch read returned 1 answers"),
                 "expected the alignment error, got {error}"
             );
             Ok(())
         }
-        other => bail!("expected a Permanent alignment error, got {other:?}"),
+        other => bail!("expected a Transient alignment error, got {other:?}"),
     }
 }
 

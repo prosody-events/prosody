@@ -1,15 +1,14 @@
 #[cfg(test)]
 use super::CellReadCounts;
 use super::projection::CassandraProjection;
-use super::read::{decode_point, fetch_batch, fetch_point, page};
+use super::read::{decode_point, fetch_batch, fetch_point, page, take_row};
 use super::{
     Arc, BatchUnit, Bytes, CacheBatch, CassandraCellStoreError, CassandraSession, CassandraStore,
     Cell, CellAddr, CellBatchRow, CellBlobs, CellKey, CellKind, CellQueries, CellStoreError,
     CollectionDefRegistry, CollectionId, Committed, EventMarker, EvidenceLookup, KeyRow,
     MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, Pk, ResolveCellError, ResolvedRow, RowShape,
-    SHARD_FANOUT_CONCURRENCY, Scan, Section, Stream, TryStreamExt, blob_weight, dedupe, encode,
-    encode_marker_payload, expand_to_input_order, pin_mut, smallvec, try_stream,
-    ttl_seconds_to_duration,
+    SHARD_FANOUT_CONCURRENCY, Scan, Section, Stream, TryStreamExt, blob_weight, distinct, encode,
+    encode_marker_payload, pin_mut, repeated, smallvec, try_stream, ttl_seconds_to_duration,
 };
 use crate::state::cell_key::CellRef;
 use crate::state::store::{CellRead, ReadBatch};
@@ -166,27 +165,32 @@ impl<P: CassandraProjection> CellRead<P> for CassandraStore {
         Ok((committed, ttl_seconds_to_duration(ttl)))
     }
 
-    /// Resolves each unique coordinate once and expands answers to input order.
+    /// Fetches each distinct coordinate once and answers in input order.
     async fn read_many(
         &self,
         id: &CollectionId,
         section: Section,
         batch: &ReadBatch<'_>,
     ) -> Result<CacheBatch<P>, CellStoreError> {
-        let (coordinates, indices) = dedupe(batch);
-        let rows = fetch_batch::<P>(&self.session, &self.queries, id, section, &coordinates)
-            .await
-            .map_err(ResolveCellError::Store)?;
-        let mut answers = CacheBatch::<P>::with_capacity(coordinates.len());
+        let mut rows =
+            fetch_batch::<P>(&self.session, &self.queries, id, section, &distinct(batch))
+                .await
+                .map_err(ResolveCellError::Store)?;
+        let mut answers = CacheBatch::<P>::with_capacity(batch.len());
         let mut lookup = EvidenceLookup::new(self, id);
-        for row in rows {
-            let (raw, ttl) = match row {
-                Some(row) => decode_point::<P>(row).map_err(ResolveCellError::Store)?,
-                None => (Cell::Resolved(Committed::new(None)), None),
+        for &coordinate in batch.iter() {
+            let answer = if let Some(answer) = repeated(batch, &answers, coordinate) {
+                answer
+            } else {
+                let (raw, ttl) = match take_row(&mut rows, coordinate) {
+                    Some(row) => decode_point::<P>(row).map_err(ResolveCellError::Store)?,
+                    None => (Cell::Resolved(Committed::new(None)), None),
+                };
+                (lookup.resolve(raw).await?, ttl_seconds_to_duration(ttl))
             };
-            answers.push((lookup.resolve(raw).await?, ttl_seconds_to_duration(ttl)));
+            answers.push(answer);
         }
-        Ok(expand_to_input_order(&indices, &answers))
+        Ok(answers)
     }
 
     /// Scans one section under the selected projection.

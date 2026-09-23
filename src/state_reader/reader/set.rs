@@ -78,26 +78,23 @@ where
     }
 
     /// Builds a query over committed keys, in ascending key order.
-    /// The stream owns the reader state. Its first poll acquires a session.
+    /// The stream borrows the reader. Its first poll acquires a session.
     /// Acquisition and read errors appear as stream items.
-    pub fn keys<'q, K: Into<Key>>(
-        &self,
+    pub fn keys<'a, K: Into<Key>>(
+        &'a self,
         key: K,
     ) -> KeyRead<
-        'q,
+        'a,
         KC,
         impl ReadSource<
-            Query = BorrowedKeyQuery<'q, KC>,
-            Output: Stream<Item = Result<KC::Key, StateReaderError>> + Send + 'q,
-        >
-        + Clone
-        + 'q
-        + use<'q, K, KC, C, B>,
+            Query = BorrowedKeyQuery<'a, KC>,
+            Output: Stream<Item = Result<KC::Key, StateReaderError>> + Send,
+        > + Clone
+        + use<'a, K, KC, C, B>,
     > {
-        let reader = self.clone();
         let key = key.into();
-        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'q, KC>| {
-            reader.projected::<Presence>(key, query)
+        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
+            self.projected::<Presence>(key, query)
         })
     }
 }

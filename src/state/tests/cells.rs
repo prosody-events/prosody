@@ -1,6 +1,7 @@
 //! Memory cell operations preserve the shared store invariants.
 
 use super::*;
+use crate::state::tests::support::listed;
 
 /// `CollectionRef` equality and hashing key on the inner `CollectionId` only —
 /// the TTL is a per-write hint, not part of identity. Two refs to the same
@@ -148,28 +149,17 @@ pub(super) fn cell_buffers_spill_before_full_batch() {
     );
 }
 
-/// `dedupe` keeps unique coordinates in first-occurrence order and maps every
-/// input position to its unique's index — the dedup + first-occurrence leg the
-/// batch verbs and the Cassandra `IN` override share (a value-only test cannot
-/// observe client-side dedup, so it is verified directly here).
+/// `distinct` keeps the first occurrence of each coordinate in input order.
+/// The Cassandra `IN` read binds this list. Batch-read parity covers the
+/// answer for each repeated position.
 #[test]
-pub(super) fn dedupe_uniques_and_plan() -> Result<()> {
+pub(super) fn distinct_keeps_first_occurrence_order() -> Result<()> {
     let bytes_in = [5u8, 9, 5, 2, 9, 5];
     let batch = CoordinateBatch::chunks(bytes_in.iter().map(|&b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    let (uniques, plan) = dedupe(&batch.as_ref());
-    let unique_bytes: Vec<u8> = uniques.iter().map(|c| c[0]).collect();
-    assert_eq!(
-        unique_bytes,
-        vec![5, 9, 2],
-        "first-occurrence order, deduped"
-    );
-    assert_eq!(
-        plan.as_slice(),
-        &[0, 1, 0, 2, 1, 0],
-        "each position maps to its unique"
-    );
+    let unique_bytes: Vec<u8> = distinct(&batch.as_ref()).iter().map(|c| c[0]).collect();
+    assert_eq!(unique_bytes, vec![5, 9, 2], "first-occurrence order");
     Ok(())
 }
 
@@ -260,7 +250,7 @@ pub(super) fn memory_resolve_event_marker_batches_reads() -> Result<()> {
         }));
         let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
         counting
-            .write_provisional(&cref, &writes, Some(&marker))
+            .write_provisional(&cref, listed(&marker, &writes)?)
             .await
             .map_err(|e| eyre!("stage: {e}"))?;
 
@@ -314,7 +304,7 @@ pub(super) fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
         ];
         let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
         store
-            .write_provisional(&cref, &writes, Some(&marker))
+            .write_provisional(&cref, listed(&marker, &writes)?)
             .await
             .map_err(|e| eyre!("stage: {e}"))?;
 

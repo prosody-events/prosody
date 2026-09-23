@@ -207,14 +207,15 @@ async fn run_stage_query_counts(pop: StagePop) -> Result<()> {
     }
     let finalized = fx.session.finalize().await;
 
-    // A short base batch fails the stage as Permanent. It writes nothing and
-    // keeps the dirty input whole.
+    // A short base batch fails the stage as Transient, so the source never
+    // commits without its state. It writes nothing and keeps the dirty input
+    // whole.
     if pop.short && !pop.ru && expected_batches > 0 {
         let Err(error) = finalized else {
             bail!("a short base batch must fail the stage");
         };
-        if error.classify_error() != ErrorCategory::Permanent {
-            bail!("a short base batch failed as {error:?}, expected Permanent");
+        if error.classify_error() != ErrorCategory::Transient {
+            bail!("a short base batch failed as {error:?}, expected Transient");
         }
         if fx.counting.durable_writes() != 0 {
             bail!(

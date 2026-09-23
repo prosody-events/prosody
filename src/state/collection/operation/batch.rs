@@ -8,7 +8,7 @@ use super::{
 use crate::codec::{Codec, SerializeBufGuard};
 use crate::state::cell_key::CellRef;
 use crate::state::order_codec::KeyCodecError;
-use crate::state::store::{CELL_BATCH, CoordinateBatch, ReadBatch};
+use crate::state::store::{CELL_BATCH, CoordinateBatch, ReadBatch, ensure_aligned};
 use smallvec::SmallVec;
 
 /// Encodes one key before its borrow ends. The future owns the buffer guard.
@@ -50,41 +50,45 @@ where
                 Ok(())
             })
             .map_err(CellStateError::Key)?;
-            if ends.is_empty() {
+            // The loop above takes at most one batch of keys, so the first
+            // chunk holds every encoded coordinate.
+            let coordinates = ends.iter().scan(0, |start, &end| {
+                let coordinate = &buffer[*start..end];
+                *start = end;
+                Some(coordinate)
+            });
+            let Some(encoded) = ReadBatch::chunks(coordinates).next() else {
                 return Ok(answers);
-            }
-            let mut pending: SmallVec<[&[u8]; CELL_BATCH.get()]> = SmallVec::new();
+            };
             let mut positions: SmallVec<[usize; CELL_BATCH.get()]> = SmallVec::new();
-            let mut start = 0;
-            for &end in &ends {
-                let cell = CellRef {
-                    section,
-                    coordinate: &buffer[start..end],
-                };
-                start = end;
-                let value = match staged(journal, cell) {
+            // Coordinates that the journal does not answer read from the store.
+            let pending = encoded.filter(|&coordinate| {
+                let value = match staged(
+                    journal,
+                    CellRef {
+                        section,
+                        coordinate,
+                    },
+                ) {
                     Some(Staged::Present(bytes)) => Some(P::from_value(bytes)),
                     Some(Staged::Absent) => None,
                     None => {
-                        pending.push(cell.coordinate);
                         positions.push(answers.len());
-                        None
+                        answers.push(None);
+                        return true;
                     }
                 };
                 answers.push(value);
-            }
-            (ReadBatch::from_buffer(pending), positions)
+                false
+            });
+            (pending, positions)
         };
         if let Some(batch) = &batch {
             let loaded = <S::Engine as sealed::Reads<S, P>>::read_batch(
                 session, inner, state_type, name, section, batch,
             )
             .await?;
-            if loaded.len() != positions.len() {
-                return Err(
-                    StateAccessError::misaligned_batch(loaded.len(), positions.len()).into(),
-                );
-            }
+            ensure_aligned(loaded.len(), positions.len()).map_err(StateAccessError::from)?;
             for (position, value) in positions.iter().zip(loaded) {
                 answers[*position] = value;
             }
@@ -116,12 +120,7 @@ where
             session, inner, state_type, name, section, &batch,
         )
         .await?;
-        if values.len() != batch.len() {
-            return Err(StateAccessError::misaligned_batch(
-                values.len(),
-                batch.len(),
-            ));
-        }
+        ensure_aligned(values.len(), batch.len())?;
         answers.extend(values);
     }
     Ok(answers)

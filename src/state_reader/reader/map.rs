@@ -128,58 +128,47 @@ where
     }
 
     /// Builds a query over committed entries, in ascending key order.
-    /// The stream owns the reader state. Its first poll acquires a session.
+    /// The stream borrows the reader. Its first poll acquires a session.
     /// Acquisition and read errors appear as stream items.
-    pub fn entries<'q, K: Into<Key>>(
-        &self,
+    pub fn entries<'a, K: Into<Key>>(
+        &'a self,
         key: K,
     ) -> KeyRead<
-        'q,
+        'a,
         KC,
         impl ReadSource<
-            Query = BorrowedKeyQuery<'q, KC>,
-            Output: Stream<Item = MapReadItem<KC, V>> + Send + 'q,
-        >
-        + Clone
-        + 'q
-        + use<'q, K, KC, V, C, B>,
+            Query = BorrowedKeyQuery<'a, KC>,
+            Output: Stream<Item = MapReadItem<KC, V>> + Send,
+        > + Clone
+        + use<'a, K, KC, V, C, B>,
     >
     where
-        V: 'static,
         for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
-        ResolvedOf<V>: 'static,
     {
-        let reader = self.clone();
         let key = key.into();
-        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'q, KC>| {
-            reader.projected::<Values>(key, query)
+        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
+            self.projected::<Values>(key, query)
         })
     }
 
     /// Builds a query over committed keys, in ascending key order.
-    /// The stream owns the reader state. Its first poll acquires a session.
+    /// The stream borrows the reader. Its first poll acquires a session.
     /// Acquisition and read errors appear as stream items.
-    pub fn keys<'q, K: Into<Key>>(
-        &self,
+    pub fn keys<'a, K: Into<Key>>(
+        &'a self,
         key: K,
     ) -> KeyRead<
-        'q,
+        'a,
         KC,
         impl ReadSource<
-            Query = BorrowedKeyQuery<'q, KC>,
-            Output: Stream<Item = Result<KC::Key, StateReaderError>> + Send + 'q,
-        >
-        + Clone
-        + 'q
-        + use<'q, K, KC, V, C, B>,
-    >
-    where
-        V: 'static,
-    {
-        let reader = self.clone();
+            Query = BorrowedKeyQuery<'a, KC>,
+            Output: Stream<Item = Result<KC::Key, StateReaderError>> + Send,
+        > + Clone
+        + use<'a, K, KC, V, C, B>,
+    > {
         let key = key.into();
-        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'q, KC>| {
-            reader.projected::<Presence>(key, query)
+        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
+            self.projected::<Presence>(key, query)
         })
     }
 }

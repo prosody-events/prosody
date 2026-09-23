@@ -7,6 +7,8 @@ use crate::state::descriptor::{StateDescriptor, deque_state, map_state, set_stat
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::order_codec::{OrderedKeyCodec, Utf8KeyCodec};
 use crate::state::registry::CollectionDef;
+use crate::state::tests::counting_session;
+use crate::state::tests::support::CountingCellStore;
 use crate::state::{BorrowedKeyQuery, DequeQuery, Direction, KeyQuery, StateKey};
 use crate::test_util::TEST_RUNTIME;
 use color_eyre::Result;
@@ -218,6 +220,72 @@ fn prop_prefix_query() {
         TEST_RUNTIME.block_on(run_prefix_query(shape))
     }
     QuickCheck::new().quickcheck(property as fn(PrefixShape) -> Result<bool>);
+}
+
+/// A query that selects nothing reads nothing: no keyset, window, or entry
+/// read. Disjoint prefixes and an inverted position range select nothing for
+/// every population, so each stream ends before any store read.
+#[test]
+fn empty_queries_read_nothing() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let dedup = MemoryDeduplicationStore::default();
+        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
+        let state_key = StateKey::new(Uuid::new_v4(), Arc::from("empty"));
+        let def = CollectionDef::new(None);
+        let map = map_state::<Utf8KeyCodec, JsonCodec>("empty-map");
+        let set = set_state::<Utf8KeyCodec>("empty-set");
+        let deque = deque_state::<JsonCodec>("empty-deque");
+        let (map_registry, _) = registry_and_ref(&map, "empty-map", &state_key, def)?;
+        let (set_registry, _) = registry_and_ref(&set, "empty-set", &state_key, def)?;
+        let (deque_registry, _) = registry_and_ref(&deque, "empty-deque", &state_key, def)?;
+        let session =
+            |registry| counting_session(&counting, &dedup, registry, &state_key, read_event(0));
+        let (map_session, set_session, deque_session) = (
+            session(&map_registry),
+            session(&set_registry),
+            session(&deque_registry),
+        );
+        let map = map.bind(&map_session)?;
+        let set = set.bind(&set_session)?;
+        let deque = deque.bind(&deque_session)?;
+        let reads = || {
+            counting.lower_reads()
+                + counting.batch_reads()
+                + counting.lower_scans()
+                + counting.presence_reads()
+                + counting.presence_scans()
+                + counting.marker_reads()
+        };
+
+        let disjoint = || KeyQuery::new().prefix("ab").prefix("b");
+        assert!(
+            drain(map.entries().with_query(disjoint()).stream())
+                .await?
+                .is_empty()
+        );
+        assert!(
+            drain(map.keys().with_query(disjoint()).stream())
+                .await?
+                .is_empty()
+        );
+        assert!(
+            drain(set.keys().with_query(disjoint()).stream())
+                .await?
+                .is_empty()
+        );
+        let inverted = DequeQuery::new().from(5).to(3);
+        assert!(
+            drain(deque.values().with_query(inverted).stream())
+                .await?
+                .is_empty()
+        );
+        assert_eq!(reads(), 0, "a query that selects nothing reads nothing");
+
+        drain(map.keys().stream()).await?;
+        drain(deque.values().stream()).await?;
+        assert!(reads() > 0, "the counters observe queries that can select");
+        Ok(())
+    })
 }
 
 /// Position bounds include empty, reversed, and saturated intervals.

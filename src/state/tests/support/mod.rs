@@ -13,7 +13,7 @@ use crate::state::cell_key::{CellKey, CellRef, Coordinate, Scan, Section};
 use crate::state::collection::{MutationJournal, StateSession, WritableStateSession, sealed};
 use crate::state::descriptor::{CellResolver, StructuralIdentity};
 use crate::state::erased::StateCursor;
-use crate::state::marker::{AttemptId, EventEvidence, EventMarker, SectionClear};
+use crate::state::marker::{AttemptId, EventEvidence, EventMarker, ProvisionalStage, SectionClear};
 use crate::state::memory::MemoryPublicationStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::publication::{PublicationRows, PublicationStore, StatePublication};
@@ -387,6 +387,15 @@ pub(crate) use admission::{
 
 mod inspection;
 pub(crate) use inspection::StageInspection;
+
+/// Pairs test writes with a marker that must list every write.
+pub(crate) fn listed<'a>(
+    marker: &'a EventMarker,
+    writes: &'a [(CellKey, ProvisionalWrite)],
+) -> Result<ProvisionalStage<'a>> {
+    ProvisionalStage::listed(marker, writes)
+        .ok_or_else(|| eyre!("the marker must list every staged write"))
+}
 
 /// The marker's evidence with no staged cells and no clears.
 pub(crate) fn evidence_only(marker: &EventMarker) -> EventMarker {

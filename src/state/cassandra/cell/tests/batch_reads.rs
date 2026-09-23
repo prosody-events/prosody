@@ -3,6 +3,7 @@ use crate::state::cassandra::CassandraCellStoreError;
 use crate::state::cell::Values;
 use crate::state::store::{CellBuffer, CellRead, CommittedBatch};
 use crate::state::tests::support::evidence;
+use crate::state::tests::support::listed;
 
 /// Batch-read parity over the live `CassandraStore`: the single-`IN`-query
 /// override answers each position exactly as the sequential point-`get` oracle
@@ -171,7 +172,7 @@ async fn first_error_is_first_input_position() -> Result<()> {
 /// A live query returns clustering order and cannot prove this rule.
 #[test]
 fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
-    use super::super::read::{decode_point, match_rows_to_coordinates};
+    use super::super::read::{decode_point, take_row};
     use super::CellCorruptReason;
     use super::decode::PointRow;
     use super::encoding::{Encoding, encode_payload};
@@ -204,17 +205,15 @@ fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
     let mut rows: CellBuffer<(Bytes, PointRow<Values>)> = SmallVec::new();
     rows.push((Bytes::copy_from_slice(high_coordinate.as_bytes()), high));
     rows.push((Bytes::copy_from_slice(low_coordinate.as_bytes()), low));
-    let decoded = match_rows_to_coordinates(
-        rows,
-        &[low_coordinate.as_bytes(), high_coordinate.as_bytes()],
-    )
-    .into_iter()
-    .map(|row| {
-        row.map(decode_point::<Values>)
-            .transpose()
-            .map(|cell| cell.map(|(cell, _)| cell))
-    })
-    .collect::<Result<CellBuffer<_>, CassandraCellStoreError>>();
+    let decoded = [low_coordinate.as_bytes(), high_coordinate.as_bytes()]
+        .into_iter()
+        .map(|coordinate| {
+            take_row(&mut rows, coordinate)
+                .map(decode_point::<Values>)
+                .transpose()
+                .map(|cell| cell.map(|(cell, _)| cell))
+        })
+        .collect::<Result<CellBuffer<_>, CassandraCellStoreError>>();
     match decoded {
         Err(CassandraCellStoreError::CorruptCell(reason)) => assert_eq!(
             reason,
@@ -228,7 +227,7 @@ fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
 
 #[test]
 fn borrowed_batch_matches_requested_coordinates() -> Result<()> {
-    use super::super::read::{decode_point, match_rows_to_coordinates};
+    use super::super::read::{decode_point, take_row};
     use super::decode::PointRow;
     use crate::state::cell::Values;
     use smallvec::smallvec;
@@ -249,20 +248,20 @@ fn borrowed_batch_matches_requested_coordinates() -> Result<()> {
     let low = Coordinate::from_bytes(vec![1]);
     let absent = Coordinate::from_bytes(vec![2]);
     let high = Coordinate::from_bytes(vec![3]);
-    let rows: CellBuffer<_> = smallvec![
+    let mut rows: CellBuffer<_> = smallvec![
         (Bytes::copy_from_slice(high.as_bytes()), row(&high_data)),
         (Bytes::copy_from_slice(low.as_bytes()), row(&low_data)),
     ];
 
-    let decoded =
-        match_rows_to_coordinates(rows, &[low.as_bytes(), absent.as_bytes(), high.as_bytes()])
-            .into_iter()
-            .map(|row| {
-                row.map(decode_point::<Values>)
-                    .transpose()
-                    .map(|cell| cell.map(|(cell, _)| cell))
-            })
-            .collect::<Result<CellBuffer<_>, CassandraCellStoreError>>()?;
+    let decoded = [low.as_bytes(), absent.as_bytes(), high.as_bytes()]
+        .into_iter()
+        .map(|coordinate| {
+            take_row(&mut rows, coordinate)
+                .map(decode_point::<Values>)
+                .transpose()
+                .map(|cell| cell.map(|(cell, _)| cell))
+        })
+        .collect::<Result<CellBuffer<_>, CassandraCellStoreError>>()?;
     assert_eq!(decoded.len(), 3);
     assert_eq!(
         decoded[0]
@@ -348,7 +347,8 @@ async fn cassandra_raw_batch_is_one_query() -> Result<()> {
         ));
     }
     let marker = EventMarker::frozen(staging, &writes, &[], &evidence([].into(), None));
-    seed.write_provisional(&c, &writes, Some(&marker)).await?;
+    seed.write_provisional(&c, listed(&marker, &writes)?)
+        .await?;
 
     // A fresh store: cold counters shared across its clones.
     let reader = fx.bottom_store();

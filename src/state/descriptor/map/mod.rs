@@ -25,8 +25,8 @@ pub(crate) use membership::KeysetLayout;
 use crate::state::cell::{Presence, Values};
 use crate::state::query::Query;
 use crate::state::{BorrowedKeyQuery, KeyQuery, KeyRead, ReadQuery, ReadSource};
-pub(crate) use query::projected;
 pub use query::{KeyItem, MapStreamItem};
+pub(crate) use query::{projected, selected};
 
 use super::{
     CellCodecError, CellStateError, CellType, CollectionSpec, ContextOf, Descriptor, FromSession,

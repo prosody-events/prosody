@@ -9,6 +9,7 @@ use crate::state::descriptor::{
     BorrowedKeyOf, CellCodecError, CellStateError, CellType, CollectionSpec, KeyOf, ResolvedOf,
 };
 use crate::state::order_codec::OrderedKeyCodec;
+use crate::state::query::Query;
 use async_stream::try_stream;
 use futures::{Stream, StreamExt};
 use tracing::Instrument;
@@ -24,6 +25,7 @@ pub type MapStreamItem<KC, V> =
     Result<(<KC as OrderedKeyCodec>::Key, ResolvedOf<V>), MapStateError<CellCodecError<V>>>;
 
 /// Executes a map or set query under one projection.
+/// A query that selects no key reads nothing.
 pub(crate) fn projected<'a, S, L, P>(
     cells: &'a Collection<S, L>,
     query: KeyQuery<<L::Cell as CellType>::Key, &'a BorrowedKeyOf<L::Cell>>,
@@ -34,11 +36,32 @@ where
     P: StreamProjection<S, L::Cell>,
     S::Engine: sealed::Reads<S, P>,
 {
-    let span = L::stream_span(cells.name(), query.dir, P::NAME);
     try_stream! {
         let mut buf = SerializeBufGuard::acquire();
-        let query = query.encode(&mut buf).map_err(CellStateError::Key)?;
-        let plan = cells.read(async |op| membership::plan(op, &query).await).instrument(span.clone()).await?;
+        if let Some(query) = query.encode(&mut buf).map_err(CellStateError::Key)? {
+            let inner = selected::<S, L, P>(cells, &query);
+            futures::pin_mut!(inner);
+            while let Some(item) = inner.next().await {
+                yield item?;
+            }
+        }
+    }
+}
+
+/// Executes an encoded query that can select a key.
+pub(crate) fn selected<'a, S, L, P>(
+    cells: &'a Collection<S, L>,
+    query: &'a Query<'_>,
+) -> impl Stream<Item = Result<P::Item, MapStateError<CellCodecError<L::Cell>>>> + use<'a, S, L, P>
+where
+    S: StateSession,
+    L: KeysetLayout,
+    P: StreamProjection<S, L::Cell>,
+    S::Engine: sealed::Reads<S, P>,
+{
+    let span = L::stream_span(cells.name(), query.dir, P::NAME);
+    try_stream! {
+        let plan = cells.read(async |op| membership::plan(op, query).await).instrument(span.clone()).await?;
         let inner = plan.with_limit(query.limit).projected::<P>();
         futures::pin_mut!(inner);
         while let Some(item) = inner.next().instrument(span.clone()).await {

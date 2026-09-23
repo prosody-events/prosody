@@ -8,7 +8,7 @@ use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::store::{CELL_BATCH, ReadBatch};
 use crate::state::tests::support::CountingCellStore;
-use crate::state::{CollectionId, StateKey, StateName, StateType};
+use crate::state::{CollectionId, StateAccessError, StateKey, StateName, StateType};
 use crate::test_util::TEST_RUNTIME;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, bail};
@@ -21,8 +21,8 @@ use uuid::Uuid;
 const SECTION: Section = Section::new(0);
 
 /// Under a lower store that drops the last answer of each batch, a batch read
-/// fails as Permanent exactly when a position reaches the lower store. Dirty
-/// answers and a cleared section never reach it.
+/// fails as a transient misaligned batch exactly when a position reaches the
+/// lower store. Dirty answers and a cleared section never reach it.
 #[test]
 fn prop_short_lower_batch_fails_only_lower_reads() {
     fn property(
@@ -75,8 +75,7 @@ async fn check(
         .take(CELL_BATCH.get())
         .map(|coordinate| [coordinate])
         .collect();
-    let Some(batch) = ReadBatch::from_buffer(coordinates.iter().map(<[u8; 1]>::as_slice).collect())
-    else {
+    let Some(batch) = ReadBatch::chunks(coordinates.iter().map(<[u8; 1]>::as_slice)).next() else {
         bail!("a read batch with a first coordinate is never empty");
     };
     let reaches_lower = !cleared
@@ -94,8 +93,13 @@ async fn check(
     }
     match result {
         Err(error) if reaches_lower => {
-            if error.classify_error() != ErrorCategory::Permanent {
-                bail!("a short lower batch failed as {error:?}, expected Permanent");
+            if !matches!(error, StateAccessError::MisalignedBatch(_))
+                || error.classify_error() != ErrorCategory::Transient
+            {
+                bail!(
+                    "a short lower batch failed as {error:?}, expected a transient misaligned \
+                     batch"
+                );
             }
         }
         Err(error) => bail!("a read without lower positions failed: {error:?}"),

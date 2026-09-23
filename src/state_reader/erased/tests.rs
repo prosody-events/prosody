@@ -13,6 +13,7 @@ use crate::state_reader::tests::support::{
 use crate::subsystem::SubsystemName;
 use crate::test_util::TEST_RUNTIME;
 use color_eyre::Result;
+use futures::TryStreamExt;
 use quickcheck::QuickCheck;
 use serde_json::Value;
 use std::iter::once;

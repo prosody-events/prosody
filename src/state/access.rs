@@ -2,6 +2,7 @@
 
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::StructuralIdentity;
+use crate::state::store::MisalignedBatch;
 use std::error::Error;
 use thiserror::Error;
 
@@ -62,6 +63,14 @@ pub enum StateAccessError {
         category: ErrorCategory,
     },
 
+    /// A store answered a batch read with the wrong number of values.
+    ///
+    /// The category is transient. A permanent error would restore the
+    /// event's state and then commit its source, so a store defect would drop
+    /// state writes. A transient error keeps the event in retry instead.
+    #[error(transparent)]
+    MisalignedBatch(#[from] MisalignedBatch),
+
     /// The message loader failed (type-erased).
     #[error("keyed-state message loader failed: {message}")]
     Load {
@@ -83,17 +92,6 @@ impl StateAccessError {
         Self::Store {
             message: error.to_string(),
             category: error.classify_error(),
-        }
-    }
-
-    /// Reports a batch read whose buffer is not index-aligned to the requested
-    /// coordinates. Callers zip the two together, so a short buffer truncates
-    /// and misaligns the result, and a long one carries values nobody
-    /// requested. Both break the store contract, so the category is permanent.
-    pub(crate) fn misaligned_batch(returned: usize, requested: usize) -> Self {
-        Self::Store {
-            message: format!("batch read returned {returned} values for {requested} coordinates"),
-            category: ErrorCategory::Permanent,
         }
     }
 
@@ -128,7 +126,7 @@ impl ClassifyError for StateAccessError {
             | Self::SessionClosed => ErrorCategory::Permanent,
             // Aligned with the cancellation middleware: a terminated
             // context is a transient condition (retry decides).
-            Self::Terminated => ErrorCategory::Transient,
+            Self::Terminated | Self::MisalignedBatch(_) => ErrorCategory::Transient,
             Self::Store { category, .. } | Self::Load { category, .. } => *category,
         }
     }

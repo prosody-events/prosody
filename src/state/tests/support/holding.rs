@@ -136,10 +136,9 @@ where
     fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
-        writes: &'a [(CellKey, ProvisionalWrite)],
-        marker: Option<&'a EventMarker>,
+        stage: ProvisionalStage<'a>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, S> {
-        self.inner.write_provisional(collection, writes, marker)
+        self.inner.write_provisional(collection, stage)
     }
 
     async fn write_resolved<'a>(

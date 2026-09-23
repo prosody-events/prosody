@@ -124,6 +124,7 @@ pub use order_codec::{
     Utf8KeyCodec, order_preserving_i64, order_preserving_i64_decode,
 };
 pub use registry::{CommitMode, ReadCachePolicy, StateVisibility};
+pub use store_types::MisalignedBatch;
 
 // The backend cluster is crate-internal (module-capped in [`backend`]); these
 // re-exports keep every in-crate `crate::state::X` import resolving without

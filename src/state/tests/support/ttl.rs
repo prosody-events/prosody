@@ -65,8 +65,7 @@ impl CellStore for TtlStub {
     fn write_provisional<'a>(
         &'a self,
         _collection: &'a CollectionRef,
-        _writes: &'a [(CellKey, ProvisionalWrite)],
-        _marker: Option<&'a EventMarker>,
+        _stage: ProvisionalStage<'a>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a> {
         ready(Ok(()))
     }

@@ -178,12 +178,8 @@ where
     B: StateBackend,
 {
     fn set_reload_marker(&self, marker: MessageMarker) {
-        // Override implies timer session: only the deferred-message reload
-        // sets it, and that reload always dispatches under a timer EventRef.
-        debug_assert!(
-            matches!(self.inner.event, EventRef::Timer(_)),
-            "the reload override is set only on timer sessions"
-        );
+        // Only the deferred-message reload sets the override, under a timer
+        // event. `message_marker` never reads it on a message session.
         *self.inner.reload_marker.lock() = Some(marker);
     }
 

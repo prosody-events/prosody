@@ -2,6 +2,7 @@ use crate::state::cell::{Committed, Presence, ProvisionalWrite, Values};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::store::{CellStore, CoordinateBatch};
+use crate::state::tests::support::listed;
 use crate::state::tests::support::{evidence, evidence_only, probe};
 use crate::state::{CollectionId, CollectionRef, StateKey, StateName, StateType};
 use crate::state_reader::CommittedCellSource;
@@ -70,7 +71,7 @@ pub(crate) async fn reader_residue<
         store.commit_provisional(&anchor, &evidence, &[]).await?;
     }
     store
-        .write_provisional(&collection, &writes, Some(&marker))
+        .write_provisional(&collection, listed(&marker, &writes)?)
         .await?;
     let expected = if committed {
         [Some(next), None, (!clear).then_some(base.clone())]

@@ -1,9 +1,9 @@
 use super::projection::CassandraProjection;
-use super::read::{decode_point, fetch_batch, fetch_marker_state, fetch_point, page};
+use super::read::{decode_point, fetch_batch, fetch_marker_state, fetch_point, page, take_row};
 use super::{
     Arc, CassandraCellResources, CassandraCellStoreError, CassandraSession, CellBuffer, CellKey,
-    CellQueries, CollectionId, Scan, Section, Stream, TryStreamExt, dedupe, expand_to_input_order,
-    pin_mut, try_stream,
+    CellQueries, CollectionId, Scan, Section, Stream, TryStreamExt, distinct, pin_mut, repeated,
+    try_stream,
 };
 use crate::state::cell::resolve_for_reader;
 use crate::state::cell_key::CellRef;
@@ -68,29 +68,30 @@ impl CassandraCellResources {
         section: Section,
         batch: &ReadBatch<'_>,
     ) -> Result<CellBuffer<Option<P::Payload>>, CassandraCellStoreError> {
-        let (coordinates, indices) = dedupe(batch);
-        let (rows, evidence) = try_join!(
+        let coordinates = distinct(batch);
+        let (mut rows, evidence) = try_join!(
             fetch_batch::<P>(&self.session, &self.queries, id, section, &coordinates),
             self.reader_evidence(id),
         )?;
-        let answers: CellBuffer<Option<P::Payload>> = rows
-            .into_iter()
-            .zip(coordinates)
-            .map(|(row, coordinate)| {
+        let mut answers = CellBuffer::with_capacity(batch.len());
+        for &coordinate in batch.iter() {
+            let answer = if let Some(answer) = repeated(batch, &answers, coordinate) {
+                answer
+            } else {
                 let key = CellRef {
                     section,
                     coordinate,
                 };
-                let cell = row
+                let cell = take_row(&mut rows, coordinate)
                     .map(decode_point::<P>)
                     .transpose()?
                     .map(|(cell, _)| cell);
-                Ok(cell
-                    .filter(|_| evidence.survives(key))
-                    .and_then(|cell| resolve_for_reader(&cell, &evidence).cloned()))
-            })
-            .collect::<Result<_, CassandraCellStoreError>>()?;
-        Ok(expand_to_input_order(&indices, &answers))
+                cell.filter(|_| evidence.survives(key))
+                    .and_then(|cell| resolve_for_reader(&cell, &evidence).cloned())
+            };
+            answers.push(answer);
+        }
+        Ok(answers)
     }
 
     /// Scans committed projections in coordinate order through one evidence

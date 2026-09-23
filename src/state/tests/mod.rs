@@ -41,7 +41,7 @@ use super::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use super::registry::{CollectionDef, CollectionDefRegistry};
 use super::resolve::{EvidenceLookup, resolve_event_marker};
 use super::session::{KeyedStateSession, SessionParts, TerminationWatch};
-use super::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, dedupe};
+use super::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, distinct};
 use super::{
     CELLS_INLINE, CollectionId, CollectionRef, CommitMode, Coordinate, Direction, EventRef,
     PartitionBackend, StateKey, StateName, StateType,

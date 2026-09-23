@@ -49,10 +49,10 @@ shapes and where to see them proven:
 | Invariant shape | Property | Exemplar |
 | --- | --- | --- |
 | Round-trip | `decode(encode(x)) == x` | `present_round_trip` in `src/state/fjall/codec/tests.rs` |
-| Oracle correctness | Real impl tracks a simple model op-for-op | `CellModel` + the `run_*_trace` runners in `src/state/tests/cell_suite.rs` |
+| Oracle correctness | Real impl tracks a simple model op-for-op | `CellModel` in `src/state/tests/cell_suite/overlay.rs` + the `run_*_trace` runners in `src/state/tests/cell_suite/` |
 | Parity | Two implementations answer identically | `src/consumer/middleware/deduplication/tests/prop_dedup_store.rs` |
 | Idempotence | A second admission preserves state | `prop_admit_soundness` in `src/state/manager/tests.rs` |
-| Crash-recovery equivalence | Recovery converges to committed-or-rolled-back, never half-applied | `run_crash_equivalence_trace` in `src/state/tests/cell_suite.rs` |
+| Crash-recovery equivalence | Recovery converges to committed-or-rolled-back, never half-applied | `run_crash_equivalence_trace` in `src/state/tests/cell_suite/crash.rs` |
 | Monotonicity | Watermarks never move backwards | `src/consumer/partition/offsets/test.rs` |
 
 A property over toy inputs is just a slow example test. Generators must
@@ -143,8 +143,8 @@ together, and assert equivalence **after every operation**, not just at
 the end. The model uses plain `HashMap`/`BTreeSet`/`Option` — it must be
 obviously correct, never a re-implementation of the production code.
 
-Exemplars: `Trace`/`Outcome` and the `CellModel` in
-`src/state/tests/cell_suite.rs`; `DeferModel` in
+Exemplars: `Trace`/`Outcome` in `src/state/tests/cell_suite/events.rs` and
+`CellModel` in `src/state/tests/cell_suite/overlay.rs`; `DeferModel` in
 `src/consumer/middleware/defer/message/store/tests/prop_defer_store.rs`;
 `HighLevelOperation` in `src/timers/store/tests/prop_high_level.rs`.
 
@@ -177,7 +177,7 @@ because trait resolution is global, a use-case-specific impl parked in an
 unrelated test module silently becomes the generator every other property in
 the crate inherits.
 
-Exemplars: `src/state/tests/cell_suite.rs` (`Trace`/`OverlayTrace`/`ScanTrace`
+Exemplars: `src/state/tests/cell_suite/` (`Trace`/`OverlayTrace`/`ScanTrace`
 and their `Arbitrary` impls) and `src/state/fjall/codec/tests.rs` (`PrefixFields`
 generator over a null-prone alphabet).
 
@@ -185,7 +185,7 @@ generator over a null-prone alphabet).
 
 Write the property once as a generic runner, then instantiate it from each
 backend's test module. `run_crash_equivalence_trace` / `run_overwrite_trace`
-/ `run_overlay_trace` / `run_bottom_scan_trace` in `src/state/tests/cell_suite.rs`
+/ `run_overlay_trace` / `run_bottom_scan_trace` in `src/state/tests/cell_suite/`
 are generic over the `CellStore` backend and run unchanged against memory
 (`Overlay<MemoryCellStore>`) and Cassandra (`Overlay<Cached<CassandraStore>>`)
 — every backend must satisfy the same invariants. New backends get the
@@ -212,7 +212,7 @@ The trace covers both committed and uncommitted stages. **Never simulate a crash
 reproduce the on-disk / on-wire state directly (see the Memory rule in
 CLAUDE.md).
 
-Exemplar: `run_crash_equivalence_trace` in `src/state/tests/cell_suite.rs`.
+Exemplar: `run_crash_equivalence_trace` in `src/state/tests/cell_suite/crash.rs`.
 
 ### Seeding stale state directly
 

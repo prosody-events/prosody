@@ -10,7 +10,6 @@ use crate::state::erased::{
 use crate::state::order_codec::Utf8KeyCodec;
 use crate::state_reader::{ReaderBackend, StateReader, StateReaderError};
 use async_trait::async_trait;
-use futures::TryStreamExt;
 use std::sync::Arc;
 
 pub use crate::state::ReadCachePolicy as ErasedReadCache;
@@ -280,8 +279,12 @@ where
         let reader = self.0.clone();
         let key = Key::from(key);
         read(move |query| {
-            let stream = reader.values(key.clone()).with_query(query).stream();
-            StateCursor::new(stream.err_into())
+            let reader = reader.clone();
+            let key = key.clone();
+            StateCursor::new(async_stream::try_stream! {
+                let stream = reader.values(key).with_query(query).stream();
+                for await item in stream { yield item?; }
+            })
         })
     }
 }

@@ -12,6 +12,7 @@ use crate::state::order_codec::order_preserving_i64;
 use crate::state::{DequeRead, ReadQuery, ReadSource};
 use async_stream::try_stream;
 use futures::StreamExt;
+use std::ops::Range;
 use tracing::{Instrument, info_span};
 
 /// Typed, owned handle over a codec-backed deque.
@@ -152,30 +153,22 @@ where
         Ok(op.get(DequeKind::<T>::ENTRIES, &last).await?)
     }
 
-    /// Clamps the query to the stored window and captures its read plan.
-    /// At most [`DEQUE_POINT_ITERATION_MAX`] positions use point reads.
-    /// Wider selections use a bounded scan. Empty selections read no entries.
+    /// Clamps the selected positions to the stored window and captures its
+    /// read plan. At most [`DEQUE_POINT_ITERATION_MAX`] positions use point
+    /// reads. Wider selections use a bounded scan. Empty selections read no
+    /// entries.
     #[read(op)]
     async fn stream_plan(
         &self,
         dir: Direction,
-        low: &Bound<usize>,
-        high: &Bound<usize>,
+        positions: Range<usize>,
     ) -> Result<Plan<S, Keyed<I64KeyCodec, T>, [u8; 8]>, DequeStateError<CellCodecError<T>>> {
         let window = bounds(op).await?;
         let window_len = window.len()?;
-        let start = match low {
-            Bound::Included(position) => *position,
-            Bound::Excluded(position) => position.saturating_add(1),
-            Bound::Unbounded => 0,
-        }
-        .min(window_len);
-        let end = match high {
-            Bound::Included(position) => position.saturating_add(1),
-            Bound::Excluded(position) => *position,
-            Bound::Unbounded => window_len,
-        }
-        .min(window_len);
+        let (start, end) = (
+            positions.start.min(window_len),
+            positions.end.min(window_len),
+        );
         if start >= end {
             return Ok(op.coordinates(DequeKind::<T>::ENTRIES, Vec::new()));
         }
@@ -232,22 +225,25 @@ where
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         ReadQuery::new(DequeQuery::new(), move |query: DequeQuery| {
-            let (low, high) = query.bounds();
+            let positions = query.positions();
             let span = info_span!(
                 "deque.stream",
                 collection = self.cells.name().as_str(),
                 direction = ?query.dir,
             );
             try_stream! {
-                let plan = self
-                    .stream_plan(query.dir, &low, &high)
-                    .instrument(span.clone())
-                    .await?;
-                let inner = plan.with_limit(query.limit).projected::<Values>();
-                futures::pin_mut!(inner);
-                while let Some(item) = inner.next().instrument(span.clone()).await {
-                    let (_, value) = item?;
-                    yield value;
+                // A query that selects no position reads nothing.
+                if !positions.is_empty() {
+                    let plan = self
+                        .stream_plan(query.dir, positions)
+                        .instrument(span.clone())
+                        .await?;
+                    let inner = plan.with_limit(query.limit).projected::<Values>();
+                    futures::pin_mut!(inner);
+                    while let Some(item) = inner.next().instrument(span.clone()).await {
+                        let (_, value) = item?;
+                        yield value;
+                    }
                 }
             }
         })

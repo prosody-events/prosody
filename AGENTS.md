@@ -113,6 +113,13 @@ Tiger style and data-oriented design agree: minimize allocation, and never
   ever seen") on the hot path. If a reusable scratch buffer is truly
   unavoidable, allocate it once at construction with a fixed bound and reuse it
   — never amortize-grow it per call.
+- **The caller controls boxing.** Never box a future inside the library to
+  make it smaller. A caller can compose other futures first and then box the
+  whole composition once. Tokio keeps every spawned task on the heap, so a
+  large future does not overflow a worker stack. When `clippy::large_futures`
+  fires at a call site, box at that call site: a test, an example, or a client
+  binding. Production library code uses `Box::pin` only to move a polled
+  future or stream, never to make a future smaller.
 - **Simplicity is not sacrificed for this.** The design principles above still
   win: prefer the reading that's clearest. Zero-alloc and simple are usually
   *not* in conflict — the fn-item fix above removed an allocation *and* a line.

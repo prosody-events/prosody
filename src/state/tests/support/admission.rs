@@ -6,6 +6,7 @@ use crate::state::descriptor::{DescriptorIdentity, value_state};
 use crate::state::manager::{Admission, PartitionStateManager, test_manager};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellRead;
+use crate::state::tests::support::listed;
 use crate::timers::test_support::setup_timer_manager;
 use std::slice::from_ref;
 
@@ -86,7 +87,7 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
         )];
         let marker = EventMarker::frozen(e, &writes, &[], &initial_evidence);
         store
-            .write_provisional(collection, &writes, Some(&marker))
+            .write_provisional(collection, listed(&marker, &writes)?)
             .await?;
         store
             .commit_provisional(collection, &marker, &writes)
@@ -106,7 +107,7 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
         &evidence(touched.clone(), Some(Uuid::from_u128(2))),
     );
     store
-        .write_provisional(&collections[0], &writes, Some(&marker))
+        .write_provisional(&collections[0], listed(&marker, &writes)?)
         .await?;
     store
         .commit_provisional(&collections[0], &marker, &writes)
@@ -124,7 +125,7 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
         &evidence(touched.clone(), Some(Uuid::from_u128(1))),
     );
     store
-        .write_provisional(&collections[0], &writes, Some(&marker))
+        .write_provisional(&collections[0], listed(&marker, &writes)?)
         .await?;
     if committed {
         store
@@ -178,7 +179,7 @@ pub(crate) async fn seed_commit_evidence<S: CellStore>(
         .commit_provisional(collection, &evidence_only(&marker), &[])
         .await?;
     store
-        .write_provisional(collection, &[], Some(&marker))
+        .write_provisional(collection, listed(&marker, &[])?)
         .await?;
     Ok(())
 }
@@ -211,7 +212,7 @@ async fn deregistration<S: CellStore>(
     let marker = EventMarker::frozen(event, &writes, &[], &evidence(touched, Some(dedup_id)));
     for collection in &collections {
         store
-            .write_provisional(collection, &writes, Some(&marker))
+            .write_provisional(collection, listed(&marker, &writes)?)
             .await?;
     }
     if committed {
@@ -244,7 +245,7 @@ async fn deregistration<S: CellStore>(
         ),
     );
     store
-        .write_provisional(&collections[0], &next, Some(&marker))
+        .write_provisional(&collections[0], listed(&marker, &next)?)
         .await?;
     store
         .commit_provisional(&collections[0], &marker, &next)

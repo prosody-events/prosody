@@ -290,34 +290,32 @@ where
     }
 
     /// Builds a query over committed elements, in front-to-back order.
-    /// The stream owns the reader state. Its first poll acquires a session.
-    /// Acquisition and read errors appear as stream items.
+    /// The stream borrows the reader. Its first poll acquires a session.
+    /// A query that selects no position acquires no session. Acquisition and
+    /// read errors appear as stream items.
     pub fn values<K: Into<Key>>(
         &self,
         key: K,
     ) -> DequeRead<
         impl ReadSource<
             Query = DequeQuery,
-            Output: Stream<Item = Result<ResolvedOf<T>, StateReaderError>> + Send + 'static,
-        >
-        + Clone
-        + 'static
-        + use<K, T, C, B>,
+            Output: Stream<Item = Result<ResolvedOf<T>, StateReaderError>> + Send,
+        > + Clone
+        + use<'_, K, T, C, B>,
     >
     where
         for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
-        T: 'static,
-        ResolvedOf<T>: 'static,
     {
-        let reader = self.clone();
         let key = key.into();
-        ReadQuery::new(DequeQuery::new(), move |query| {
+        ReadQuery::new(DequeQuery::new(), move |query: DequeQuery| {
             async_stream::try_stream! {
-                let handle = reader.bound(key).await?;
-                let inner = handle.values().with_query(query).stream();
-                futures::pin_mut!(inner);
-                while let Some(item) = cooperative(inner.next()).await {
-                    yield item.map_err(|error| StateReaderError::store(&error))?;
+                if !query.positions().is_empty() {
+                    let handle = self.bound(key).await?;
+                    let inner = handle.values().with_query(query).stream();
+                    futures::pin_mut!(inner);
+                    while let Some(item) = cooperative(inner.next()).await {
+                        yield item.map_err(|error| StateReaderError::store(&error))?;
+                    }
                 }
             }
         })

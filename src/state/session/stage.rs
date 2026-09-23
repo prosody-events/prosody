@@ -7,11 +7,13 @@ use crate::state::cell::{ProvisionalWrite, Values};
 use crate::state::cell_key::{CellKey, Section};
 use crate::state::dirty::{CellSnapshot, ClearedSections, DirtyVal, ResolvedCells};
 use crate::state::identity::{CollectionId, CollectionRef};
-use crate::state::marker::{EventEvidence, EventMarker, SectionClear};
+use crate::state::marker::{EventEvidence, FrozenStage, SectionClear};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::resolve_event_marker;
 use crate::state::retry::{StepOutcome, retry_step};
-use crate::state::store::{CELL_BATCH, CellBuffer, CellRead, CellStore, CoordinateBatch};
+use crate::state::store::{
+    CELL_BATCH, CellBuffer, CellRead, CellStore, CoordinateBatch, ensure_aligned,
+};
 use crate::state::{
     CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY, StateKey, StateName,
     StateType,
@@ -124,12 +126,7 @@ where
                                 .map_err(|e| StateAccessError::store(&e))?;
                         // Pair this chunk's bases with exactly its records
                         // before the fold flattens the chunks.
-                        if bases.len() != records.len() {
-                            return Err(StateAccessError::misaligned_batch(
-                                bases.len(),
-                                records.len(),
-                            ));
-                        }
+                        ensure_aligned(bases.len(), records.len())?;
                         let chunk_writes: CellBuffer<(CellKey, ProvisionalWrite)> = records
                             .into_iter()
                             .zip(bases.into_iter().map(|(committed, _)| committed))
@@ -165,15 +162,14 @@ where
                 .iter()
                 .map(|&section| SectionClear::frozen(section, &writes))
                 .collect();
-            let marker = EventMarker::frozen(event, &writes, &clears, evidence);
+            let stage = FrozenStage::new(event, writes, &clears, evidence);
             lower
-                .write_provisional(&collection_ref, &writes, Some(&marker))
+                .write_provisional(&collection_ref, stage.request())
                 .await
                 .map_err(|e| StateAccessError::store(&e))?;
             Ok(Some(StagedCollection {
                 collection: collection_ref,
-                writes,
-                marker,
+                stage,
             }))
         }
         CommitMode::ReadUncommitted => {
@@ -248,7 +244,11 @@ pub(super) async fn resolve_collections<S: CellStore>(
         .map(|staged| {
             cooperative(async move {
                 let outcome = retry_step(shutdown, "keyed-state promote", || {
-                    store.commit_provisional(&staged.collection, &staged.marker, &staged.writes)
+                    store.commit_provisional(
+                        &staged.collection,
+                        staged.stage.marker(),
+                        staged.stage.writes(),
+                    )
                 })
                 .await;
                 match outcome {

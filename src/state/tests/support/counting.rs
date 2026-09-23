@@ -261,15 +261,12 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
     async fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
-        writes: &'a [(CellKey, ProvisionalWrite)],
-        marker: Option<&'a EventMarker>,
+        stage: ProvisionalStage<'a>,
     ) -> Result<(), Self::Error> {
         self.counts
             .write_provisional
             .fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .write_provisional(collection, writes, marker)
-            .await
+        self.inner.write_provisional(collection, stage).await
     }
 
     async fn write_resolved<'a>(

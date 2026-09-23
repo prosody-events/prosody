@@ -42,8 +42,12 @@ impl Query<'_> {
 
 impl<KC: OrderedKeyCodec, B: Borrow<KC::Borrowed>> KeyQuery<KC, B> {
     /// Writes the edges into reusable storage and returns a borrowed view.
-    /// The view narrows the edges to the prefix range.
-    pub(crate) fn encode<'a>(&self, buf: &'a mut Vec<u8>) -> Result<Query<'a>, KeyCodecError> {
+    /// The view narrows the edges to the prefix range. Edges that cannot hold
+    /// a key return `None`, so the query reads nothing.
+    pub(crate) fn encode<'a>(
+        &self,
+        buf: &'a mut Vec<u8>,
+    ) -> Result<Option<Query<'a>>, KeyCodecError> {
         buf.clear();
         let (low, high, prefix) = KC::with_cached_local(|codec| {
             Ok::<_, KeyCodecError>((
@@ -71,13 +75,30 @@ impl<KC: OrderedKeyCodec, B: Borrow<KC::Borrowed>> KeyQuery<KC, B> {
             }
         }
 
+        if !can_hold_key(low, high) {
+            return Ok(None);
+        }
         let (start, end) = self.dir.orient(low, high);
-        Ok(Query {
+        Ok(Some(Query {
             dir: self.dir,
             limit: self.limit,
             start,
             end,
-        })
+        }))
+    }
+}
+
+/// Reports whether ascending edges can hold a key. The test is exact when both
+/// edges are equal or ordered. Excluded edges that no byte string separates
+/// still pass.
+fn can_hold_key(low: Bound<&[u8]>, high: Bound<&[u8]>) -> bool {
+    match (low, high) {
+        (Bound::Included(low), Bound::Included(high)) => low <= high,
+        (
+            Bound::Included(low) | Bound::Excluded(low),
+            Bound::Included(high) | Bound::Excluded(high),
+        ) => low < high,
+        _ => true,
     }
 }
 

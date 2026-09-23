@@ -27,7 +27,7 @@ use crate::state::access::StateAccessError;
 use crate::state::cell::Projection;
 use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::identity::{CollectionId, StateKey};
-use crate::state::store::{CellBuffer, ReadBatch};
+use crate::state::store::{CellBuffer, ReadBatch, ensure_aligned};
 use crate::state_reader::backend::{CommittedCellSource, ReaderBackend};
 use crate::state_reader::cache::CacheLookup;
 use crate::state_reader::partition_for_key;
@@ -210,12 +210,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                 // `CommittedCellSource` is a downstream trait, so check the
                 // alignment its contract promises in every build. The cached
                 // arm gets the same check inside `get_many_cached`.
-                if buffer.len() != batch.len() {
-                    return Err(StateAccessError::misaligned_batch(
-                        buffer.len(),
-                        batch.len(),
-                    ));
-                }
+                ensure_aligned(buffer.len(), batch.len())?;
                 Ok(buffer)
             }
             Some(ttl) => {

@@ -12,6 +12,7 @@ use super::{
 };
 use super::{CassandraCellStoreError, MarkerWriteRow, encode};
 use crate::state::cell::Values;
+use crate::state::marker::ProvisionalStage;
 use crate::state::marker::{MarkerRow, MarkerState, encode_committed_payload};
 use crate::state::store::{CELL_BATCH, CellBackend};
 use smallvec::SmallVec;
@@ -80,10 +81,9 @@ impl CellStore for CassandraStore {
     async fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
-        writes: &'a [(CellKey, ProvisionalWrite)],
-        marker: Option<&'a EventMarker>,
+        stage: ProvisionalStage<'a>,
     ) -> Result<(), Self::Error> {
-        write_provisional(self, collection, writes, marker).await
+        write_provisional(self, collection, stage).await
     }
 
     async fn write_resolved<'a>(

@@ -1,6 +1,7 @@
 //! Committed evidence reads preserve marker identity and batching.
 
 use super::*;
+use crate::state::tests::support::listed;
 
 /// Batches and scans share one marker snapshot and preserve reader parity.
 #[test]
@@ -49,7 +50,7 @@ pub(super) fn prop_resolve_reads_each_marker_once() {
             let marker = EventMarker::frozen(event, &writes, &[], &evidence);
             for collection in &collections {
                 store
-                    .write_provisional(collection, &writes, Some(&marker))
+                    .write_provisional(collection, listed(&marker, &writes)?)
                     .await?;
             }
             let certificate = usize::from(certificate) % (count + 1);

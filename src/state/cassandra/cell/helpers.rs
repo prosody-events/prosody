@@ -1,4 +1,5 @@
 use super::decode::PointRow;
+use super::read::take_row;
 use super::{
     Bytes, CassandraCellStoreError, CellBlobs, CellBuffer, CompactDuration, Coordinate,
     PER_STATEMENT_OVERHEAD, ProvisionalCell, SmallVec, encode_payload, select_encoding,
@@ -52,12 +53,13 @@ pub(super) fn ttl_seconds_to_duration(ttl: Option<i32>) -> Option<CompactDuratio
 /// Keeps provisional cells from a recovery batch and discards their TTLs.
 /// The input already follows ascending coordinate order.
 pub(super) fn decode_provisional_batch(
-    rows: CellBuffer<Option<PointRow<Values>>>,
+    mut rows: CellBuffer<(Bytes, PointRow<Values>)>,
     coordinates: &[&Coordinate],
 ) -> Result<CellBuffer<(Coordinate, ProvisionalCell)>, CassandraCellStoreError> {
-    let mut out: CellBuffer<(Coordinate, ProvisionalCell)> = SmallVec::with_capacity(rows.len());
-    for (&coordinate, row) in coordinates.iter().zip(rows) {
-        if let Some(row) = row
+    let mut out: CellBuffer<(Coordinate, ProvisionalCell)> =
+        SmallVec::with_capacity(coordinates.len());
+    for &coordinate in coordinates {
+        if let Some(row) = take_row(&mut rows, coordinate.as_bytes())
             && let Some(provisional) = super::decode::try_decode_provisional_cell_ttl(row)?
         {
             out.push((Coordinate::clone(coordinate), provisional));

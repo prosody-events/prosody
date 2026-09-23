@@ -4,7 +4,7 @@ use super::edges::Edges;
 use crate::state::cell_key::Direction;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
-use std::ops::{Bound, RangeBounds};
+use std::ops::{Bound, Range, RangeBounds};
 
 /// An owned deque query shared by all read APIs.
 /// Forward order is the default. Positions count from the front. Bound
@@ -80,9 +80,20 @@ impl DequeQuery {
         self
     }
 
-    /// Returns the ascending `(low, high)` bounds.
-    pub(crate) fn bounds(self) -> (Bound<usize>, Bound<usize>) {
-        (self.edges.low, self.edges.high)
+    /// Returns the selected positions as an ascending half-open range. An
+    /// empty range selects nothing.
+    pub(crate) fn positions(self) -> Range<usize> {
+        let start = match self.edges.low {
+            Bound::Included(position) => position,
+            Bound::Excluded(position) => position.saturating_add(1),
+            Bound::Unbounded => 0,
+        };
+        let end = match self.edges.high {
+            Bound::Included(position) => position.saturating_add(1),
+            Bound::Excluded(position) => position,
+            Bound::Unbounded => usize::MAX,
+        };
+        start..end
     }
 }
 

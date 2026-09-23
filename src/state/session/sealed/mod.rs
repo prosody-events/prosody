@@ -1,8 +1,8 @@
 use super::{
-    AdmissionChecks, CellKey, CellStore, CollectionRef, Duration, EventMarker, Future, MarkerWrite,
-    ProvisionalWrite, RepinProof, STATE_FANOUT_CONCURRENCY, StateAccessError, StepOutcome, Uuid,
-    resolve_collections, retry_step,
+    AdmissionChecks, CellStore, CollectionRef, Duration, Future, MarkerWrite, RepinProof,
+    STATE_FANOUT_CONCURRENCY, StateAccessError, StepOutcome, Uuid, resolve_collections, retry_step,
 };
+use crate::state::marker::FrozenStage;
 use futures::{StreamExt, stream};
 use tokio::task::coop::cooperative;
 use tracing::{error, warn};
@@ -42,8 +42,7 @@ impl MessageMarker {
 // sites already bound the allocation.
 pub struct StagedCollection {
     pub(super) collection: CollectionRef,
-    pub(super) writes: Vec<(CellKey, ProvisionalWrite)>,
-    pub(super) marker: EventMarker,
+    pub(super) stage: FrozenStage,
 }
 
 /// The provisional work that a successful stage produced.
@@ -109,7 +108,7 @@ impl<S: CellStore, K: AdmissionChecks> Staged<S, K> {
                     !matches!(
                         retry_step(&shutdown, "keyed-state rollback", || {
                             self.store
-                                .abort_provisional(&staged.collection, &staged.writes)
+                                .abort_provisional(&staged.collection, staged.stage.writes())
                         })
                         .await,
                         StepOutcome::Abandon

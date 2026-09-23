@@ -146,13 +146,19 @@ fn prop_key_query_method_order() {
                 let query = key_query(dir, steps);
                 let query: ErasedKeyQuery = serde_json::from_slice(&serde_json::to_vec(&query)?)?;
                 let mut buf = SerializeBufGuard::acquire();
-                let query = query.encode(&mut buf)?;
                 let mut coordinates: Vec<_> =
                     keys.iter().map(|key| Utf8KeyCodec::encode(key)).collect();
                 coordinates.sort();
                 coordinates.dedup();
-                let mut actual = query.select(coordinates);
-                actual.truncate(query.limit.map_or(usize::MAX, NonZeroUsize::get));
+                // An empty encoding must select no key.
+                let actual = match query.encode(&mut buf)? {
+                    Some(query) => {
+                        let mut actual = query.select(coordinates);
+                        actual.truncate(query.limit.map_or(usize::MAX, NonZeroUsize::get));
+                        actual
+                    }
+                    None => Vec::new(),
+                };
                 let expected: Vec<_> = expected_keys(keys.iter().map(String::as_str), dir, steps)
                     .iter()
                     .map(|key| Utf8KeyCodec::encode(key))
@@ -205,10 +211,10 @@ fn prop_deque_query_method_order() {
                 let settings: DequeQuery = serde_json::from_slice(&serde_json::to_vec(&settings)?)?;
                 assert_eq!(settings.dir, dir);
                 assert_eq!(settings.limit, expected_limit);
-                let bounds = settings.bounds();
+                let positions = settings.positions();
                 for position in 0..=256 {
                     assert_eq!(
-                        bounds.contains(&position),
+                        positions.contains(&position),
                         rules.iter().all(|rule| rule.admits(position)),
                         "position: {position}; steps: {steps:?}"
                     );

@@ -19,7 +19,7 @@
 use super::cell::{Presence, Projection, ProvisionalCell, ProvisionalWrite, Values};
 use super::cell_key::{CellKey, Coordinate, Scan, Section};
 use super::identity::{CollectionId, CollectionRef};
-use super::marker::{EventMarker, MarkerState, SectionClear};
+use super::marker::{EventMarker, MarkerState, ProvisionalStage, SectionClear};
 use crate::error::ClassifyError;
 use crate::state::cell_key::CellRef;
 use bytes::Bytes;
@@ -29,10 +29,10 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 
 pub(crate) use super::store_helpers::{
-    dedupe, expand_to_input_order, provisional_point_loop, section_batches,
-    sorted_unique_coordinates,
+    distinct, provisional_point_loop, repeated, section_batches, sorted_unique_coordinates,
 };
-pub(crate) use super::store_types::CELL_BATCH;
+pub use super::store_types::MisalignedBatch;
+pub(crate) use super::store_types::{CELL_BATCH, ensure_aligned};
 pub use super::store_types::{
     CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch, Durable, ReadBatch,
 };
@@ -86,7 +86,7 @@ pub trait CellRead<P: Projection>: CellBackend {
     /// Reads one section's coordinates in input order.
     ///
     /// Each result answers the input at the same position. Duplicate
-    /// coordinates share one read. Unique coordinates resolve in
+    /// coordinates share one read. Distinct coordinates resolve in
     /// first-occurrence order. The earliest affected position supplies the
     /// error. A backend can fail the whole batch before row resolution.
     fn read_many<'buf, 'a>(
@@ -97,16 +97,20 @@ pub trait CellRead<P: Projection>: CellBackend {
     ) -> impl Future<Output = Result<CacheBatch<P>, Self::Error>> + Send + use<'buf, 'a, Self, P>
     {
         async move {
-            let (coordinates, indices) = dedupe(batch);
-            let mut answers = CacheBatch::<P>::with_capacity(coordinates.len());
-            for &coordinate in &coordinates {
-                let cell = CellRef {
-                    section,
-                    coordinate,
+            let mut answers = CacheBatch::<P>::with_capacity(batch.len());
+            for &coordinate in batch.iter() {
+                let answer = if let Some(answer) = repeated(batch, &answers, coordinate) {
+                    answer
+                } else {
+                    let cell = CellRef {
+                        section,
+                        coordinate,
+                    };
+                    self.read(collection, cell).await?
                 };
-                answers.push(self.read(collection, cell).await?);
+                answers.push(answer);
             }
-            Ok(expand_to_input_order(&indices, &answers))
+            Ok(answers)
         }
     }
 
@@ -173,7 +177,7 @@ pub trait CellStore: CellRead<Values> + CellRead<Presence> {
     + use<'a, Self>;
 
     /// Stages provisional cells and writes the collection's Staged row from
-    /// the frozen `marker`. Cells and Staged bind the collection TTL.
+    /// the stage's frozen marker. Cells and Staged bind the collection TTL.
     /// The Staged row names the event, coordinates, and clears.
     ///
     /// # Staged row lifecycle
@@ -182,17 +186,16 @@ pub trait CellStore: CellRead<Values> + CellRead<Presence> {
     /// through [`Self::commit_provisional`] or [`Self::abort_provisional`].
     /// [`Self::write_resolved`] and [`Self::mark_resolved`] never write Staged.
     ///
-    /// Every write must occur in the frozen staged list
-    /// (`writes ⊆ marker.staged()`). Split stages use that full list for every
-    /// chunk, so admission can find every provisional coordinate.
+    /// [`ProvisionalStage`] guarantees that the marker lists every write.
+    /// Split stages send the full marker with every chunk, so admission can
+    /// find every provisional coordinate.
     /// The session freezes the payload once per collection at `finalize`.
     /// A retry can replace the same event's Staged row; handlers must produce
     /// the same result across retries.
     ///
-    /// `None` requires empty `writes`: it writes no Staged row and skips the
-    /// boundary check. A clears-only stage supplies a payload with empty
-    /// `staged()` and non-empty `clears()`. It writes Staged and checks the
-    /// boundary. Admission resolves prior residue before dispatch.
+    /// A clears-only stage supplies a payload with empty `staged()` and
+    /// non-empty `clears()`. It writes Staged and checks the boundary.
+    /// Admission resolves prior residue before dispatch.
     ///
     /// Staged carries frozen clear survivors that [`Self::commit_provisional`]
     /// applies at settle. Admission uses only that durable payload.
@@ -206,8 +209,7 @@ pub trait CellStore: CellRead<Values> + CellRead<Presence> {
     fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
-        writes: &'a [(CellKey, ProvisionalWrite)],
-        marker: Option<&'a EventMarker>,
+        stage: ProvisionalStage<'a>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, Self>;
 
     /// Writes resolved cells in a same-partition batch with the collection TTL.

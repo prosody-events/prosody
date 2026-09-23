@@ -3,6 +3,7 @@ use crate::cassandra::TABLE_KEYED_STATE_CELL;
 use crate::state::cell::Values;
 use crate::state::marker::MarkerRow;
 use crate::state::store::CellRead;
+use crate::state::tests::support::listed;
 use crate::state::tests::support::{StageInspection, evidence};
 
 async fn read_cell_blob(fx: &Fixture, id: &CollectionId) -> Result<(Vec<u8>, i16)> {
@@ -173,7 +174,9 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
         ),
     )];
     let marker = EventMarker::frozen(event(1), &writes, &[], &evidence([].into(), None));
-    store.write_provisional(&c, &writes, Some(&marker)).await?;
+    store
+        .write_provisional(&c, listed(&marker, &writes)?)
+        .await?;
     let corrupt_cell = format!(
         "UPDATE {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} SET event = {{kind: 1, msg_dedup_id: \
          null, timer_type: 99, time: 0, tag: 0}} WHERE segment_id = ? AND key = ? AND state_type \

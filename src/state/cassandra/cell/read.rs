@@ -53,14 +53,15 @@ pub(super) async fn fetch_point<P: CassandraProjection>(
         .map_err(CassandraStoreError::from)?)
 }
 
-/// Fetches one batch and preserves input order before semantic decode.
+/// Fetches the stored rows of one batch with their coordinates.
+/// Rows arrive in clustering order. [`take_row`] finds each coordinate's row.
 pub(super) async fn fetch_batch<P: CassandraProjection>(
     session: &CassandraSession,
     queries: &CellQueries,
     id: &CollectionId,
     section: Section,
     coordinates: &[&[u8]],
-) -> Result<CellBuffer<Option<PointRow<P>>>, CassandraCellStoreError> {
+) -> Result<CellBuffer<(Bytes, PointRow<P>)>, CassandraCellStoreError> {
     let pk = Pk::of(id);
     let result = session
         .session()
@@ -87,26 +88,16 @@ pub(super) async fn fetch_batch<P: CassandraProjection>(
     {
         rows.push(split_batch::<P>(row.map_err(CassandraStoreError::from)?));
     }
-    Ok(match_rows_to_coordinates(rows, coordinates))
+    Ok(rows)
 }
 
-pub(super) fn match_rows_to_coordinates<Row>(
-    mut rows: CellBuffer<(Bytes, Row)>,
-    coordinates: &[&[u8]],
-) -> CellBuffer<Option<Row>> {
-    let mut out = CellBuffer::with_capacity(coordinates.len());
-    for &coordinate in coordinates {
-        let Some(pos) = rows
-            .iter()
-            .position(|(found, _)| found.as_ref() == coordinate)
-        else {
-            out.push(None);
-            continue;
-        };
-        let (_, row) = rows.swap_remove(pos);
-        out.push(Some(row));
-    }
-    out
+/// Removes and returns the fetched row for `coordinate`. A coordinate with no
+/// stored row returns `None`.
+pub(super) fn take_row<Row>(rows: &mut CellBuffer<(Bytes, Row)>, coordinate: &[u8]) -> Option<Row> {
+    let position = rows
+        .iter()
+        .position(|(found, _)| found.as_ref() == coordinate)?;
+    Some(rows.swap_remove(position).1)
 }
 
 /// Decodes a point row into its cell and the remaining durable TTL.

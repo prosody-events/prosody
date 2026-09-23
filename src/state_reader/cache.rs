@@ -18,7 +18,7 @@ use crate::Key;
 use crate::state::access::StateAccessError;
 use crate::state::cell::{CacheEntry, Projection, Read};
 use crate::state::cell_key::{CellKey, CellRef};
-use crate::state::store::CellBuffer;
+use crate::state::store::{CellBuffer, ensure_aligned};
 use crate::state::{StateName, StateType};
 use crate::state_reader::source::SourceId;
 use bytes::Bytes;
@@ -265,11 +265,8 @@ impl ReaderCache {
         // One shared issue time for the whole batch fill.
         let issued = self.clock.now();
         let fresh = fill().await?;
-        // Check the fill alignment in every build, not just a debug assert:
-        // a misaligned fill would cache values under the wrong keys.
-        if fresh.len() != keys.len() {
-            return Err(StateAccessError::misaligned_batch(fresh.len(), keys.len()));
-        }
+        // A misaligned fill would cache values under the wrong keys.
+        ensure_aligned(fresh.len(), keys.len())?;
         for (key, value) in keys.zip(&fresh) {
             cooperative(self.write_through(&key, issued, P::into_cached(value.clone()))).await;
         }

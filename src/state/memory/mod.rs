@@ -5,11 +5,12 @@ use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::marker::{EventMarker, MarkerState, SectionClear};
 use super::resolve::{EvidenceLookup, ResolveCellError};
 use super::store::{
-    CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable, dedupe,
-    expand_to_input_order, provisional_point_loop,
+    CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable,
+    provisional_point_loop, repeated,
 };
 use super::{CollectionId, CollectionRef};
 use crate::state::cell_key::CellRef;
+use crate::state::marker::ProvisionalStage;
 use crate::state::store::ReadBatch;
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -135,21 +136,26 @@ impl<P: Projection> CellRead<P> for MemoryCellStore {
         section: Section,
         batch: &'a ReadBatch<'_>,
     ) -> Result<CacheBatch<P>, Self::Error> {
-        let (coordinates, indices) = dedupe(batch);
-        let mut answers = CacheBatch::<P>::with_capacity(coordinates.len());
+        let mut answers = CacheBatch::<P>::with_capacity(batch.len());
         let mut lookup = EvidenceLookup::new(self, collection);
-        for &coordinate in &coordinates {
-            let cell = CellRef {
-                section,
-                coordinate,
+        for &coordinate in batch.iter() {
+            let answer = if let Some(answer) = repeated(batch, &answers, coordinate) {
+                answer
+            } else {
+                let cell = CellRef {
+                    section,
+                    coordinate,
+                };
+                let committed =
+                    cooperative(lookup.resolve(self.read_raw(collection, cell))).await?;
+                (
+                    Committed::new(committed.into_inner().map(P::from_value)),
+                    None,
+                )
             };
-            let committed = cooperative(lookup.resolve(self.read_raw(collection, cell))).await?;
-            answers.push((
-                Committed::new(committed.into_inner().map(P::from_value)),
-                None,
-            ));
+            answers.push(answer);
         }
-        Ok(expand_to_input_order(&indices, &answers))
+        Ok(answers)
     }
 
     fn scan<'a>(
@@ -214,33 +220,18 @@ impl CellStore for MemoryCellStore {
     async fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
-        writes: &'a [(CellKey, ProvisionalWrite)],
-        marker: Option<&'a EventMarker>,
+        stage: ProvisionalStage<'a>,
     ) -> Result<(), Self::Error> {
-        // `None` ⇒ the explicit empty-stage no-op: no marker and no boundary
-        // check (nothing to strand). A clears-only stage passes a marker with
-        // empty `staged()` and runs the boundary like any stage.
-        debug_assert!(
-            marker.is_some() || writes.is_empty(),
-            "a markerless stage must write nothing"
-        );
-        if let Some(marker) = marker {
-            debug_assert!(
-                writes
-                    .iter()
-                    .all(|(cell, _)| marker.staged().binary_search(cell).is_ok()),
-                "every staged write must be listed by the event marker"
-            );
-            // Marker-first: order-irrelevant in memory (no mid-call crash), but
-            // mirrors the documented stage ordering.
-            self.cells
-                .markers
-                .entry_async(collection.id().clone())
-                .await
-                .or_default()
-                .get_mut()
-                .staged = Some(marker.clone());
-        }
+        let (marker, writes) = (stage.marker(), stage.writes());
+        // Marker-first: order-irrelevant in memory (no mid-call crash), but
+        // mirrors the documented stage ordering.
+        self.cells
+            .markers
+            .entry_async(collection.id().clone())
+            .await
+            .or_default()
+            .get_mut()
+            .staged = Some(marker.clone());
         for (cell, write) in writes {
             self.map()
                 .upsert_async(

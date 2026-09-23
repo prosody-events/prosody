@@ -279,13 +279,13 @@ fn finalize_matches_model(
             };
             let expected = EventMarker::frozen(
                 event,
-                &collection.writes,
-                collection.marker.clears(),
+                collection.stage.writes(),
+                collection.stage.marker().clears(),
                 &EventEvidence {
                     touched: vec![(StateType::Application, fx.value_id().name().clone())].into(),
                     evidence_ttl: CompactDuration::new(30),
-                    dedup: collection.marker.dedup(),
-                    attempt: collection.marker.attempt(),
+                    dedup: collection.stage.marker().dedup(),
+                    attempt: collection.stage.marker().attempt(),
                 },
             );
             (fx.cells.unsettled_marker_of(&fx.value_id()) != Some(expected))

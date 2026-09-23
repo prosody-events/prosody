@@ -2,6 +2,7 @@ use super::*;
 use crate::cassandra::TABLE_KEYED_STATE_CELL;
 use crate::state::cell::Values;
 use crate::state::store::{CellRead, CommittedBatch};
+use crate::state::tests::support::listed;
 use crate::state::tests::support::{evidence, seed_commit_evidence};
 
 async fn corrupt_cleared_window(
@@ -35,7 +36,7 @@ async fn corrupt_cleared_window(
         &evidence([].into(), None),
     );
     store
-        .write_provisional(&collection, &[], Some(&marker))
+        .write_provisional(&collection, listed(&marker, &[])?)
         .await?;
     seed_commit_evidence(&store, &collection).await?;
 

@@ -4,45 +4,31 @@ use super::identity::CollectionId;
 use super::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, ReadBatch};
 use smallvec::SmallVec;
 
-/// Returns unique coordinates and each input coordinate's unique index.
-pub(crate) fn dedupe<'a>(
-    batch: &ReadBatch<'a>,
-) -> (
-    SmallVec<[&'a [u8]; CELL_BATCH.get()]>,
-    SmallVec<[u8; CELL_BATCH.get()]>,
-) {
-    let mut unique_coordinates = SmallVec::new();
-    let mut input_indices = SmallVec::new();
+/// Returns the distinct coordinates of `batch` in first-occurrence order.
+pub(crate) fn distinct<'a>(batch: &ReadBatch<'a>) -> SmallVec<[&'a [u8]; CELL_BATCH.get()]> {
+    let mut coordinates: SmallVec<[&[u8]; CELL_BATCH.get()]> = SmallVec::new();
     for &coordinate in batch.iter() {
-        let index = if let Some(index) = unique_coordinates
-            .iter()
-            .position(|unique| *unique == coordinate)
-        {
-            index
-        } else {
-            unique_coordinates.push(coordinate);
-            unique_coordinates.len() - 1
-        };
-        input_indices.push(index as u8);
+        if !coordinates.contains(&coordinate) {
+            coordinates.push(coordinate);
+        }
     }
-    (unique_coordinates, input_indices)
+    coordinates
 }
 
-/// Expands unique answers to the original input order.
-pub(crate) fn expand_to_input_order<T: Clone>(
-    input_indices: &[u8],
-    unique_answers: &[T],
-) -> CellBuffer<T> {
-    debug_assert!(
-        input_indices
-            .iter()
-            .all(|&index| usize::from(index) < unique_answers.len()),
-        "batch read must answer every input position"
-    );
-    input_indices
+/// Returns the answer of the first earlier position that holds `coordinate`.
+///
+/// A batch read answers positions in input order and calls this before it
+/// reads each one. `answers` then holds exactly the earlier positions, so a
+/// repeated coordinate reuses its first answer and shares one read.
+pub(crate) fn repeated<T: Clone>(
+    batch: &ReadBatch<'_>,
+    answers: &[T],
+    coordinate: &[u8],
+) -> Option<T> {
+    batch
         .iter()
-        .map(|&index| unique_answers[usize::from(index)].clone())
-        .collect()
+        .zip(answers)
+        .find_map(|(&earlier, answer)| (earlier == coordinate).then(|| answer.clone()))
 }
 
 /// Returns the sorted, distinct coordinates for one bounded batch.

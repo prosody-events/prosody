@@ -12,6 +12,7 @@ use crate::state::marker::{EventMarker, MarkerVersion};
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::session::Promoted;
 use crate::state::store::CellRead;
+use crate::state::tests::support::listed;
 use crate::state::tests::support::{MemoryDeduplicationStore, evidence, run_admit_soundness};
 use crate::state::{CollectionId, CollectionRef, StateName, StateType};
 use crate::test_util::TEST_RUNTIME;
@@ -119,7 +120,7 @@ async fn legacy_and_timer_residue(value: u8, mode: u8) -> Result<bool> {
         None,
     )?;
     store
-        .write_provisional(&collection, &writes, Some(&legacy))
+        .write_provisional(&collection, listed(&legacy, &writes)?)
         .await?;
     ensure!(
         manager
@@ -247,7 +248,7 @@ async fn legacy_deregistration(value: u8) -> Result<()> {
     )?;
     for collection in &collections {
         store
-            .write_provisional(collection, &writes, Some(&marker))
+            .write_provisional(collection, listed(&marker, &writes)?)
             .await?;
     }
     ensure!(admit_registered(&store, &dedup, &collections[..1]).await? == Admission::Fresh);
