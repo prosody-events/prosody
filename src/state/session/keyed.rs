@@ -1,16 +1,16 @@
 //! The per-event keyed-state session and its operations.
 
 use super::sealed::{MutatePermit, OpPermit, SessionGate};
+use super::stage::write_direct;
 use super::{AttemptEpoch, SessionInner, SessionParts};
 use crate::state::access::StateAccessError;
 use crate::state::cell::{Committed, Projection};
 use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::identity::{CollectionId, CollectionRef};
-use crate::state::marker::SectionClear;
 use crate::state::overlay::Overlay;
 use crate::state::registry::CollectionDef;
-use crate::state::store::{CellBuffer, CellRead, CellStore, ReadBatch};
+use crate::state::store::{CellBuffer, CellRead, ReadBatch};
 use crate::state::{StateBackend, StateName, StateType, StoreOutcome};
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -85,7 +85,7 @@ where
         } = parts;
         Self {
             inner: Arc::new(SessionInner {
-                stage_attempt: OnceLock::new(),
+                stage_id: OnceLock::new(),
                 overlay: Overlay::new(dirty, cell),
                 dedup,
                 loader,
@@ -387,28 +387,18 @@ where
     ) -> Result<StoreOutcome, StateAccessError> {
         let id = self.id_for(state_type, name);
         let dirty = self.inner.overlay.dirty();
-        let cleared = dirty.cleared_sections(&id);
-        let mut resolved = dirty.collection_snapshot(&id);
-        if resolved.is_empty() && cleared.is_empty() {
-            return Ok(StoreOutcome::NoOp);
-        }
-        // A `Cleared` cell in a cleared section is subsumed by the clear's gap
-        // erase — dropping it keeps the batch row-disjoint (no written row
-        // overlaps a gap range); the remaining present cells of a cleared
-        // section are exactly its survivors.
-        resolved.retain(|(cell, data)| data.is_some() || !cleared.contains(&cell.section));
-        let clears: Vec<SectionClear> = cleared
-            .iter()
-            .map(|&section| SectionClear::frozen_resolved(section, &resolved))
-            .collect();
         let ttl = self.inner.registry.ttl_for(state_type, name);
         let collection_ref = CollectionRef::new(id.clone(), ttl);
-        self.inner
-            .overlay
-            .lower()
-            .write_resolved(&collection_ref, &resolved, &clears)
-            .await
-            .map_err(|e| StateAccessError::store(&e))?;
+        let written = write_direct(
+            self.inner.overlay.lower(),
+            &collection_ref,
+            &dirty.cleared_sections(&id),
+            dirty.collection_snapshot(&id),
+        )
+        .await?;
+        if !written {
+            return Ok(StoreOutcome::NoOp);
+        }
         // Drain only after the write landed: a store failure leaves the
         // buffer intact, so the ops still ride the normal commit path. The
         // drain also drops the collection's dirty clear markers — sound
@@ -437,17 +427,9 @@ where
         // infallible contract needs the gate's phase — a CLOSED session (the
         // settle boundary already snapshotted it) discards nothing, expressed
         // as a NoOp because the signature cannot surface `SessionClosed`.
-        let permit = self.inner.gate.read().await;
-        // Self-admission INSIDE the held gate: rollback expresses every other
-        // cell op's admission checks as a `NoOp` (its infallible signature
-        // cannot surface an error). A stale pin (this clone outlived its
-        // attempt — the epoch was bumped) drains nothing, so it cannot touch
-        // the next attempt's live buffer; a closed session (the settle boundary
-        // already snapshotted it) and a terminated one (shutdown/cancel) do the
-        // same. Without the pin check a stale clone of a retried event moved
-        // into a spawned task could drain the next attempt's buffer: a silent
-        // lost write.
-        if !self.attempt_current() || permit.is_closed() || self.is_terminated() {
+        let permit = self.permit().await;
+        // The infallible signature reports every admission refusal as `NoOp`.
+        if self.check_write_admission(&permit).is_err() {
             return StoreOutcome::NoOp;
         }
         let id = self.id_for(state_type, name);

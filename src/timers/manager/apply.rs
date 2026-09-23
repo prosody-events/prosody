@@ -5,23 +5,77 @@ use super::{TimerManagerError, TimerManagerInner};
 use crate::error::ClassifyError;
 use crate::timers::Trigger;
 use crate::timers::active::{
-    Announce, MemoryEffects, QueueEffect, StoreEffect, TimerOp, Transition, transition,
+    Announce, MemoryEffects, QueueEffect, StoreEffect, TimerOp, TimerState, Transition, transition,
 };
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::store::TriggerStore;
+use futures::TryStreamExt;
 use std::error::Error;
 use std::fmt::Debug;
 use tracing::{Span, debug};
 
 impl<T: TriggerStore> TimerManagerInner<T> {
+    /// Clears the key's timers of one type and schedules `trigger` in one
+    /// atomic store write.
+    pub(super) async fn clear_and_schedule(
+        &self,
+        mut trigger: Trigger,
+    ) -> Result<(), TimerManagerError<T::Error>> {
+        let existing_times: Vec<CompactDateTime> = self
+            .store
+            .get_key_times(trigger.timer_type, &trigger.key)
+            .map_err(TimerManagerError::Store)
+            .try_collect()
+            .await?;
+
+        let queued = self
+            .scheduler
+            .active_triggers()
+            .get(&trigger.key, trigger.time, trigger.timer_type)
+            .await;
+        let prior = queued.map(|entry| entry.state);
+        if let Some(entry) = queued.filter(|entry| {
+            matches!(
+                entry.state,
+                TimerState::Scheduled | TimerState::FiringRescheduled
+            )
+        }) {
+            trigger.tag = entry.tag;
+        }
+        let (pre, post) = transition(prior, TimerOp::ClearSchedule).phases();
+
+        debug!(
+            key = %trigger.key,
+            timer_type = ?trigger.timer_type,
+            new_time = ?trigger.time,
+            existing_count = existing_times.len(),
+            prior_state = ?prior,
+            "clear_and_schedule: resolved transition, applying"
+        );
+
+        // In-memory effects that must precede the atomic write: the new
+        // timer's pre-persist half, then the removal of every replaced time.
+        apply_memory(&self.scheduler, &trigger, pre).await?;
+        unschedule_replaced_timers(&self.scheduler, &trigger, &existing_times).await?;
+
+        // The single durable write: atomically inserts the new row and
+        // clears the replaced ones (`ClearSchedule` transitions carry no
+        // store effect of their own).
+        self.store
+            .clear_and_schedule(trigger.clone())
+            .await
+            .map_err(TimerManagerError::Store)?;
+
+        apply_memory(&self.scheduler, &trigger, post).await?;
+        self.emit_clear_telemetry(&trigger, &existing_times);
+
+        Ok(())
+    }
+
     /// Emits one `timer_cancelled` event per replaced time (excluding the
     /// new time) and one `timer_scheduled` event for the new trigger.
-    pub(super) fn emit_clear_telemetry(
-        &self,
-        trigger: &Trigger,
-        existing_times: &[CompactDateTime],
-    ) {
+    fn emit_clear_telemetry(&self, trigger: &Trigger, existing_times: &[CompactDateTime]) {
         for &old_time in existing_times {
             if old_time != trigger.time {
                 self.telemetry.timer_cancelled(
@@ -100,7 +154,7 @@ impl<T: TriggerStore> TimerManagerInner<T> {
 }
 
 /// Applies the queue effect, then sets the resulting registry state.
-pub(super) async fn apply_memory<E>(
+async fn apply_memory<E>(
     scheduler: &TriggerScheduler<E>,
     trigger: &Trigger,
     effects: MemoryEffects,
@@ -134,7 +188,7 @@ where
 /// All effects are in-memory: the caller's atomic store write subsumes the
 /// per-row deletes. The scheduler removal is idempotent — the actor finds
 /// nothing when the slab isn't loaded.
-pub(super) async fn unschedule_replaced_timers<E>(
+async fn unschedule_replaced_timers<E>(
     scheduler: &TriggerScheduler<E>,
     new_trigger: &Trigger,
     existing_times: &[CompactDateTime],

@@ -155,7 +155,9 @@ fn delete_section_hops_delete_exactly_the_section() -> Result<()> {
 
         // Exclude two survivors, one in each hop region.
         let excluded = [cell_in(0, 3), cell_in(0, super::io::SCAN_HOP_ROWS + 9)];
-        cache.delete_section(&c, Section::new(0), &excluded).await?;
+        cache
+            .delete_section(&c, Section::new(0), excluded.iter().map(CellKey::as_ref))
+            .await?;
 
         for i in 0..total {
             let hit = matches!(

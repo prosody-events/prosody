@@ -11,8 +11,8 @@ use super::{
     encode_marker_payload, pin_mut, repeated, smallvec, try_stream, ttl_seconds_to_duration,
 };
 use crate::state::cell_key::CellRef;
+use crate::state::store::Durable;
 use crate::state::store::{CellRead, ReadBatch};
-use crate::state::store_types::Durable;
 
 impl CassandraStore {
     /// Creates a Cassandra cell store for one partition assignment.

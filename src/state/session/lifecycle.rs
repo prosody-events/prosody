@@ -11,7 +11,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::access::StateAccessError;
 use crate::state::backend::AdmissionChecks;
 use crate::state::identity::CollectionId;
-use crate::state::marker::{AttemptId, EventEvidence};
+use crate::state::marker::{EventEvidence, StageId};
 use crate::state::{CommitMode, EventRef, STATE_FANOUT_CONCURRENCY, StateBackend};
 use futures::stream::{self, StreamExt};
 use std::sync::atomic::Ordering;
@@ -65,11 +65,8 @@ where
         }
         marker_touched.sort_unstable();
         marker_touched.dedup();
-        // Sized once to the touched-collection cardinality — the fold in
-        // place of an unconstrained `try_collect` keeps the receipt's vector
-        // from re-growing on the per-event hot path (bounded-allocation rule).
         let evidence = EventEvidence {
-            attempt: *self.inner.stage_attempt.get_or_init(AttemptId::new),
+            stage: *self.inner.stage_id.get_or_init(StageId::new),
             touched: marker_touched.into(),
             evidence_ttl: self.inner.dedup_ttl,
             dedup: self.message_marker().map(MessageMarker::into_uuid),
@@ -83,6 +80,9 @@ where
                 ))
             })
             .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+            // Fold without a short circuit: every stage call must return
+            // before `abort_stages` reads the markers. A `try_fold` would drop
+            // stage writes in flight, and they could land after the rollback.
             .fold(Ok(Vec::with_capacity(capacity)), |acc, staged| async move {
                 match (acc, staged) {
                     (Ok(mut acc), Ok(staged)) => {

@@ -2,26 +2,33 @@
 
 use super::{EventEvidence, EventMarker, SectionClear};
 use crate::state::cell::ProvisionalWrite;
-use crate::state::cell_key::CellKey;
+use crate::state::cell_key::{CellKey, Section};
 use crate::state::event_ref::EventRef;
 
 /// One collection's provisional writes and the event marker frozen from them.
 ///
-/// The marker's staged list holds exactly the write coordinates. Admission
-/// finds provisional cells only through that list.
+/// The marker's staged list holds exactly the write coordinates, and each
+/// clear's survivors are exactly the present-data writes in its section.
+/// Admission finds provisional cells only through the staged list.
 pub(crate) struct FrozenStage {
     writes: Vec<(CellKey, ProvisionalWrite)>,
     marker: EventMarker,
 }
 
 impl FrozenStage {
-    /// Freezes the marker for `event` from `writes` and `clears`.
+    /// Freezes the marker for `event` from `writes` and the `cleared`
+    /// sections. Each clear's survivors are the present-data writes in its
+    /// section.
     pub(crate) fn new(
         event: EventRef,
         writes: Vec<(CellKey, ProvisionalWrite)>,
-        clears: &[SectionClear],
+        cleared: &[Section],
         evidence: &EventEvidence,
     ) -> Self {
+        let clears = cleared
+            .iter()
+            .map(|&section| SectionClear::frozen(section, &writes))
+            .collect();
         let marker = EventMarker::frozen(event, &writes, clears, evidence);
         Self { writes, marker }
     }

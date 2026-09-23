@@ -228,7 +228,7 @@ async fn legacy_deregistration(value: u8) -> Result<()> {
     let older = EventRef::Message {
         dedup_id: Uuid::new_v4(),
     };
-    let evidence = EventMarker::frozen(older, &[], &[], &evidence(touched, None));
+    let evidence = EventMarker::frozen(older, &[], Vec::new(), &evidence(touched, None));
     store
         .commit_provisional(&collections[0], &evidence, &[])
         .await?;
@@ -427,7 +427,8 @@ async fn retire_timer_residue(
                     trigger.time,
                     trigger.tag + i32::try_from(index)?,
                 ));
-                let marker = EventMarker::frozen(event, &[], &[], &evidence([].into(), None));
+                let marker =
+                    EventMarker::frozen(event, &[], Vec::new(), &evidence([].into(), None));
                 store.commit_provisional(&collection, &marker, &[]).await?;
             }
             let manager = test_manager(store, dedup, Arc::new(registry), key.segment_id, (), ());

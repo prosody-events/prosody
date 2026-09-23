@@ -29,7 +29,7 @@ where
             ProvisionalWrite::new(Some(bytes(100 + c)), prev, event),
         ));
     }
-    let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
+    let marker = EventMarker::frozen(event, &writes, Vec::new(), &evidence([].into(), None));
     cached
         .write_provisional(cref, listed(&marker, &writes)?)
         .await?;
@@ -326,7 +326,8 @@ fn d5_clear_and_repopulate_keeps_staged_cells_warm() -> Result<()> {
             SectionClear::frozen(Section::new(0), &writes),
             SectionClear::frozen(Section::new(1), &writes),
         ];
-        let marker = EventMarker::frozen(event, &writes, &clears, &evidence([].into(), None));
+        let marker =
+            EventMarker::frozen(event, &writes, clears.to_vec(), &evidence([].into(), None));
         cached
             .write_provisional(&cref, listed(&marker, &writes)?)
             .await?;

@@ -25,7 +25,9 @@ pub type MapStreamItem<KC, V> =
     Result<(<KC as OrderedKeyCodec>::Key, ResolvedOf<V>), MapStateError<CellCodecError<V>>>;
 
 /// Executes a map or set query under one projection.
-/// A query that selects no key reads nothing.
+/// A query that selects no key reads nothing. The standalone reader encodes
+/// before it acquires a session, so it calls [`selected`] itself; the extra
+/// stream layer here costs one poll per item.
 pub(crate) fn projected<'a, S, L, P>(
     cells: &'a Collection<S, L>,
     query: KeyQuery<<L::Cell as CellType>::Key, &'a BorrowedKeyOf<L::Cell>>,
@@ -59,10 +61,10 @@ where
     P: StreamProjection<S, L::Cell>,
     S::Engine: sealed::Reads<S, P>,
 {
-    let span = L::stream_span(cells.name(), query.dir, P::NAME);
+    let span = L::stream_span(cells.name(), query.dir(), P::NAME);
     try_stream! {
         let plan = cells.read(async |op| membership::plan(op, query).await).instrument(span.clone()).await?;
-        let inner = plan.with_limit(query.limit).projected::<P>();
+        let inner = plan.with_limit(query.limit()).projected::<P>();
         futures::pin_mut!(inner);
         while let Some(item) = inner.next().instrument(span.clone()).await {
             yield item?;

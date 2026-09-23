@@ -85,7 +85,7 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
             cell.clone(),
             ProvisionalWrite::new(Some(bytes(value)), Committed::new(None), e),
         )];
-        let marker = EventMarker::frozen(e, &writes, &[], &initial_evidence);
+        let marker = EventMarker::frozen(e, &writes, Vec::new(), &initial_evidence);
         store
             .write_provisional(collection, listed(&marker, &writes)?)
             .await?;
@@ -103,7 +103,7 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
     let marker = EventMarker::frozen(
         c,
         &writes,
-        &[],
+        Vec::new(),
         &evidence(touched.clone(), Some(Uuid::from_u128(2))),
     );
     store
@@ -121,7 +121,7 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
     let marker = EventMarker::frozen(
         e,
         &writes,
-        &[],
+        Vec::new(),
         &evidence(touched.clone(), Some(Uuid::from_u128(1))),
     );
     store
@@ -209,7 +209,12 @@ async fn deregistration<S: CellStore>(
         value_cell(),
         ProvisionalWrite::new(Some(bytes(value)), Committed::new(None), event),
     )];
-    let marker = EventMarker::frozen(event, &writes, &[], &evidence(touched, Some(dedup_id)));
+    let marker = EventMarker::frozen(
+        event,
+        &writes,
+        Vec::new(),
+        &evidence(touched, Some(dedup_id)),
+    );
     for collection in &collections {
         store
             .write_provisional(collection, listed(&marker, &writes)?)
@@ -238,7 +243,7 @@ async fn deregistration<S: CellStore>(
     let marker = EventMarker::frozen(
         event,
         &next,
-        &[],
+        Vec::new(),
         &evidence(
             [(StateType::Application, collections[0].id().name().clone())].into(),
             marker.dedup(),

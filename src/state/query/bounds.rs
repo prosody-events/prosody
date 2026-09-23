@@ -8,15 +8,31 @@ use std::num::NonZeroUsize;
 use std::ops::{Bound, Range};
 
 /// The encoded bounds, direction, and result limit of a map or set query.
+/// Only [`KeyQuery::encode`] builds one, so its edges can always hold a key.
 #[derive(Clone, Debug)]
 pub(crate) struct Query<'a> {
-    pub(crate) dir: Direction,
-    pub(crate) limit: Option<NonZeroUsize>,
-    pub(crate) start: Bound<&'a [u8]>,
-    pub(crate) end: Bound<&'a [u8]>,
+    dir: Direction,
+    limit: Option<NonZeroUsize>,
+    start: Bound<&'a [u8]>,
+    end: Bound<&'a [u8]>,
 }
 
-impl Query<'_> {
+impl<'a> Query<'a> {
+    /// The walk direction.
+    pub(crate) fn dir(&self) -> Direction {
+        self.dir
+    }
+
+    /// The limit on present results.
+    pub(crate) fn limit(&self) -> Option<NonZeroUsize> {
+        self.limit
+    }
+
+    /// The start and end edges, in walk order.
+    pub(crate) fn edges(&self) -> (Bound<&'a [u8]>, Bound<&'a [u8]>) {
+        (self.start, self.end)
+    }
+
     /// Keeps the ascending stored coordinates within the query bounds, in
     /// query order. The trim reuses the stored vector.
     pub(crate) fn select(&self, mut coordinates: Vec<Coordinate>) -> Vec<Coordinate> {
@@ -88,9 +104,9 @@ impl<KC: OrderedKeyCodec, B: Borrow<KC::Borrowed>> KeyQuery<KC, B> {
     }
 }
 
-/// Reports whether ascending edges can hold a key. The test is exact when both
-/// edges are equal or ordered. Excluded edges that no byte string separates
-/// still pass.
+/// Reports whether ascending edges can hold a key. Crossed edges hold none,
+/// and equal edges hold none unless both include the edge. Excluded edges with
+/// no byte string between them still pass.
 fn can_hold_key(low: Bound<&[u8]>, high: Bound<&[u8]>) -> bool {
     match (low, high) {
         (Bound::Included(low), Bound::Included(high)) => low <= high,

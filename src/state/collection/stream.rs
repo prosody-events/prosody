@@ -238,7 +238,7 @@ where
                     base.state_type,
                     &base.name,
                     base.section,
-                    chunk.iter().cloned(),
+                    &chunk,
                 ).await.map_err(CellStateError::Access)?
             };
 

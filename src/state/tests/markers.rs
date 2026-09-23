@@ -47,7 +47,7 @@ pub(super) fn prop_resolve_reads_each_marker_once() {
                     )
                 })
                 .collect();
-            let marker = EventMarker::frozen(event, &writes, &[], &evidence);
+            let marker = EventMarker::frozen(event, &writes, Vec::new(), &evidence);
             for collection in &collections {
                 store
                     .write_provisional(collection, listed(&marker, &writes)?)

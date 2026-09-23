@@ -12,6 +12,7 @@ use crate::codec::JsonCodec;
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::StateAccessError;
 use crate::state::cell::Values;
 use crate::state::cell_key::{CellKey, Section};
 use crate::state::descriptor::value_state;
@@ -214,8 +215,10 @@ async fn run_stage_query_counts(pop: StagePop) -> Result<()> {
         let Err(error) = finalized else {
             bail!("a short base batch must fail the stage");
         };
-        if error.classify_error() != ErrorCategory::Transient {
-            bail!("a short base batch failed as {error:?}, expected Transient");
+        if !matches!(error, StateAccessError::MisalignedBatch(_))
+            || error.classify_error() != ErrorCategory::Transient
+        {
+            bail!("a short base batch failed as {error:?}, expected a transient misaligned batch");
         }
         if fx.counting.durable_writes() != 0 {
             bail!(

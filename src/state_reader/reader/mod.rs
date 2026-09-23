@@ -8,7 +8,8 @@
 //! [`ReadSession`](super::session::ReadSession)).
 //!
 //! Point reads acquire a session and bind a collection handle.
-//! Queries bind the collection directly and use the shared query executor.
+//! Map and set queries bind the collection and use the shared query executor.
+//! Deque queries bind a handle and use its query.
 //! Owner and reader sessions use the same collection methods.
 //! Message reference cells use the loader from the session's backend.
 //!
@@ -155,12 +156,19 @@ where
     /// fresh source pin. Rejects an empty key first: an empty or NULL key has
     /// no deterministic partition to route to.
     pub(crate) async fn session(&self, key: Key) -> Result<ReadSession<C, B>, StateReaderError> {
-        if key.is_empty() {
-            return Err(StateReaderError::EmptyKey);
-        }
+        require_key(&key)?;
         let snapshot = self.snapshot().await?;
         Ok(ReadSession::new(self.context.clone(), snapshot, key))
     }
+}
+
+/// Rejects an empty key. Every read checks the key first, even a query that
+/// selects nothing.
+fn require_key(key: &Key) -> Result<(), StateReaderError> {
+    if key.is_empty() {
+        return Err(StateReaderError::EmptyKey);
+    }
+    Ok(())
 }
 
 /// Rejects a degenerate read-cache TTL. A zero TTL would make every entry born
@@ -309,6 +317,7 @@ where
         let key = key.into();
         ReadQuery::new(DequeQuery::new(), move |query: DequeQuery| {
             async_stream::try_stream! {
+                require_key(&key)?;
                 if !query.positions().is_empty() {
                     let handle = self.bound(key).await?;
                     let inner = handle.values().with_query(query).stream();

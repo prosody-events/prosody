@@ -89,8 +89,8 @@ impl<L> Overlay<L> {
     /// # Errors
     ///
     /// Returns the lower store error when the dirty overlay has no answer.
-    /// Returns a permanent error when the lower batch answers a different
-    /// number of positions.
+    /// Returns [`StateAccessError::MisalignedBatch`] when the lower batch
+    /// answers a different number of positions.
     pub async fn get_many<'a, P: Projection>(
         &'a self,
         collection: &'a CollectionId,

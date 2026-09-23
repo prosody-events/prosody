@@ -23,7 +23,7 @@ fn cached_provisional_many_does_not_publish() -> Result<()> {
             cell_at(2),
             ProvisionalWrite::new(Some(bytes(20)), prev, event),
         )];
-        let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
+        let marker = EventMarker::frozen(event, &writes, Vec::new(), &evidence([].into(), None));
         counting
             .write_provisional(&cref, listed(&marker, &writes)?)
             .await?;
@@ -195,7 +195,7 @@ fn promote_delete_retries_before_cache_disablement() -> Result<()> {
             cell_at(0),
             ProvisionalWrite::new(Some(bytes(5)), prev, event),
         )];
-        let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
+        let marker = EventMarker::frozen(event, &writes, Vec::new(), &evidence([].into(), None));
         cached
             .write_provisional(&cref, listed(&marker, &writes)?)
             .await?;

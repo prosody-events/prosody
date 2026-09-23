@@ -23,7 +23,7 @@ use crate::state::TimerEventRef;
 #[cfg(test)]
 use crate::telemetry::Telemetry;
 use crate::telemetry::partition::TelemetryPartitionSender;
-use crate::timers::active::{TimerOp, TimerSnapshot, TimerState, transition};
+use crate::timers::active::{TimerOp, TimerSnapshot, TimerState};
 use crate::timers::datetime::CompactDateTime;
 
 pub use crate::timers::error::TimerManagerError;
@@ -39,11 +39,9 @@ use futures::{Stream, StreamExt, TryStreamExt, stream};
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{Instrument, Span, debug};
+use tracing::{Instrument, Span};
 
 mod apply;
-
-use apply::{apply_memory, unschedule_replaced_timers};
 
 /// Configuration for a [`TimerManager`] instance.
 ///
@@ -310,67 +308,7 @@ where
         &self,
         request: TimerRequest,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        self.clear_and_schedule_trigger(request.into_trigger())
-            .await
-    }
-
-    /// Clears and schedules an already-tagged internal trigger.
-    async fn clear_and_schedule_trigger(
-        &self,
-        mut trigger: Trigger,
-    ) -> Result<(), TimerManagerError<T::Error>> {
-        let existing_times: Vec<CompactDateTime> = self
-            .0
-            .store
-            .get_key_times(trigger.timer_type, &trigger.key)
-            .map_err(TimerManagerError::Store)
-            .try_collect()
-            .await?;
-
-        let queued = self
-            .0
-            .scheduler
-            .active_triggers()
-            .get(&trigger.key, trigger.time, trigger.timer_type)
-            .await;
-        let prior = queued.map(|entry| entry.state);
-        if let Some(entry) = queued.filter(|entry| {
-            matches!(
-                entry.state,
-                TimerState::Scheduled | TimerState::FiringRescheduled
-            )
-        }) {
-            trigger.tag = entry.tag;
-        }
-        let (pre, post) = transition(prior, TimerOp::ClearSchedule).phases();
-
-        debug!(
-            key = %trigger.key,
-            timer_type = ?trigger.timer_type,
-            new_time = ?trigger.time,
-            existing_count = existing_times.len(),
-            prior_state = ?prior,
-            "clear_and_schedule: resolved transition, applying"
-        );
-
-        // In-memory effects that must precede the atomic write: the new
-        // timer's pre-persist half, then the removal of every replaced time.
-        apply_memory(&self.0.scheduler, &trigger, pre).await?;
-        unschedule_replaced_timers(&self.0.scheduler, &trigger, &existing_times).await?;
-
-        // The single durable write: atomically inserts the new row and
-        // clears the replaced ones (`ClearSchedule` transitions carry no
-        // store effect of their own).
-        self.0
-            .store
-            .clear_and_schedule(trigger.clone())
-            .await
-            .map_err(TimerManagerError::Store)?;
-
-        apply_memory(&self.0.scheduler, &trigger, post).await?;
-        self.0.emit_clear_telemetry(&trigger, &existing_times);
-
-        Ok(())
+        self.0.clear_and_schedule(request.into_trigger()).await
     }
 
     /// Starts the pending trigger only if its queued attempt is still

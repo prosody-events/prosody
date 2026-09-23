@@ -134,7 +134,8 @@ where
     L: KeysetLayout,
 {
     let keyset = read_keyset_state(op).await?;
-    let range = || op.range(L::MEMBERS, query.start, query.dir, query.end);
+    let (start, end) = query.edges();
+    let range = || op.range(L::MEMBERS, start, query.dir(), end);
     let coordinates = match keyset {
         PriorKeyset::Absent => {
             return Ok(op.coordinates(L::MEMBERS, Vec::new()));

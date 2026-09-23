@@ -32,7 +32,7 @@ async fn corrupt_cleared_window(
     let marker = EventMarker::frozen(
         foreign,
         &[],
-        slice::from_ref(&clear),
+        vec![clear.clone()],
         &evidence([].into(), None),
     );
     store

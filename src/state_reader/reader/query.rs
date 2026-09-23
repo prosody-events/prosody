@@ -1,6 +1,6 @@
 //! Streams over committed entries with borrowed query bounds.
 
-use super::StateReader;
+use super::{StateReader, require_key};
 use crate::Key;
 use crate::codec::Codec;
 use crate::codec::SerializeBufGuard;
@@ -34,6 +34,7 @@ where
         <ReadSession<C, B> as sealed::Session>::Engine: sealed::Reads<ReadSession<C, B>, P>,
     {
         try_stream! {
+            require_key(&key)?;
             let mut buf = SerializeBufGuard::acquire();
             let query = query.encode(&mut buf).map_err(|error| StateReaderError::store(&error))?;
             if let Some(query) = query {

@@ -280,12 +280,12 @@ fn finalize_matches_model(
             let expected = EventMarker::frozen(
                 event,
                 collection.stage.writes(),
-                collection.stage.marker().clears(),
+                collection.stage.marker().clears().to_vec(),
                 &EventEvidence {
                     touched: vec![(StateType::Application, fx.value_id().name().clone())].into(),
                     evidence_ttl: CompactDuration::new(30),
                     dedup: collection.stage.marker().dedup(),
-                    attempt: collection.stage.marker().attempt(),
+                    stage: collection.stage.marker().stage(),
                 },
             );
             (fx.cells.unsettled_marker_of(&fx.value_id()) != Some(expected))

@@ -1,7 +1,9 @@
 //! Memory cell operations preserve the shared store invariants.
 
 use super::*;
+use crate::state::store::sorted_unique_coordinates;
 use crate::state::tests::support::listed;
+use std::collections::BTreeSet;
 
 /// `CollectionRef` equality and hashing key on the inner `CollectionId` only —
 /// the TTL is a per-write hint, not part of identity. Two refs to the same
@@ -149,18 +151,45 @@ pub(super) fn cell_buffers_spill_before_full_batch() {
     );
 }
 
-/// `distinct` keeps the first occurrence of each coordinate in input order.
-/// The Cassandra `IN` read binds this list. Batch-read parity covers the
-/// answer for each repeated position.
+/// The two batch coordinate sets name each input coordinate exactly once.
+/// `distinct` keeps first-occurrence order for the Cassandra `IN` read.
+/// `sorted_unique_coordinates` sorts for the ascending provisional batch.
+/// `prop_cassandra_batch_read_parity` covers the answers built from them.
 #[test]
-pub(super) fn distinct_keeps_first_occurrence_order() -> Result<()> {
-    let bytes_in = [5u8, 9, 5, 2, 9, 5];
-    let batch = CoordinateBatch::chunks(bytes_in.iter().map(|&b| Coordinate::from_bytes(vec![b])))
-        .next()
-        .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    let unique_bytes: Vec<u8> = distinct(&batch.as_ref()).iter().map(|c| c[0]).collect();
-    assert_eq!(unique_bytes, vec![5, 9, 2], "first-occurrence order");
-    Ok(())
+pub(super) fn prop_batch_coordinate_sets() {
+    fn property(input: Vec<u8>) -> bool {
+        // A small alphabet makes duplicates common.
+        let input: Vec<u8> = input
+            .into_iter()
+            .take(CELL_BATCH.get())
+            .map(|byte| byte % 8)
+            .collect();
+        let Some(batch) =
+            CoordinateBatch::chunks(input.iter().map(|&byte| Coordinate::from_bytes(vec![byte])))
+                .next()
+        else {
+            return input.is_empty();
+        };
+        let mut first_seen = Vec::new();
+        for &byte in &input {
+            if !first_seen.contains(&byte) {
+                first_seen.push(byte);
+            }
+        }
+        let ascending: Vec<u8> = input
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let distinct_bytes: Vec<u8> = distinct(&batch.as_ref()).iter().map(|c| c[0]).collect();
+        let sorted_bytes: Vec<u8> = sorted_unique_coordinates(&batch)
+            .iter()
+            .map(|coordinate| coordinate.as_bytes()[0])
+            .collect();
+        distinct_bytes == first_seen && sorted_bytes == ascending
+    }
+    QuickCheck::new().quickcheck(property as fn(Vec<u8>) -> bool);
 }
 
 /// Batch-read parity over the memory cell store: `get_many` answers each
@@ -248,7 +277,7 @@ pub(super) fn memory_resolve_event_marker_batches_reads() -> Result<()> {
                 ProvisionalWrite::new(Some(bytes(2)), Committed::new(None), event),
             )
         }));
-        let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
+        let marker = EventMarker::frozen(event, &writes, Vec::new(), &evidence([].into(), None));
         counting
             .write_provisional(&cref, listed(&marker, &writes)?)
             .await
@@ -302,7 +331,7 @@ pub(super) fn resolve_event_marker_rekeys_survivors_by_section() -> Result<()> {
                 ProvisionalWrite::new(Some(bytes(90)), Committed::new(None), event),
             ),
         ];
-        let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
+        let marker = EventMarker::frozen(event, &writes, Vec::new(), &evidence([].into(), None));
         store
             .write_provisional(&cref, listed(&marker, &writes)?)
             .await

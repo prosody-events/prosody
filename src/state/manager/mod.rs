@@ -154,7 +154,7 @@ pub trait PartitionStateManager: Clone + Send + Sync + 'static {
     /// An interrupted settle leaves a Staged row and provisional cells in each
     /// collection it touched. Admission reads the marker rows of every
     /// discovered collection and decides each Staged row. A Committed row with
-    /// the same attempt id certifies a version 2 row. The old commit point
+    /// the same stage id certifies a version 2 row. The old commit point
     /// certifies a version 1 row.
     ///
     /// - A certified row promotes, registered or not.
@@ -298,7 +298,7 @@ where
         T: TriggerStore,
     {
         let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
-        match admission_step(cancelled, &key, "checks.contains", || {
+        match admission_step(cancelled, &key, "checks.contains", None, || {
             self.inner.checks.contains(&key)
         })
         .await
@@ -310,7 +310,7 @@ where
         if let Err(admission) = self.admit_unchecked(&key, timers, shutdown).await {
             return admission;
         }
-        match admission_step(cancelled, &key, "checks.mark", || {
+        match admission_step(cancelled, &key, "checks.mark", None, || {
             self.inner.checks.mark(&key)
         })
         .await

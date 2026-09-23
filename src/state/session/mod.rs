@@ -16,30 +16,21 @@
 //! the overlay and advances the attempt epoch. A deferred reload retains its
 //! last message identity across that reset.
 
-use crate::consumer::middleware::{MarkerWrite, RepinProof};
 use crate::consumer::partition::ShutdownPhase;
-use crate::state::access::StateAccessError;
-use crate::state::backend::AdmissionChecks;
 use crate::state::collection::WritableStateSession;
 use crate::state::dirty::DirtyStore;
-use crate::state::identity::CollectionRef;
-use crate::state::marker::AttemptId;
+use crate::state::marker::StageId;
 use crate::state::overlay::Overlay;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::retry::{StepOutcome, retry_step};
-use crate::state::store::CellStore;
-use crate::state::{EventRef, STATE_FANOUT_CONCURRENCY, StateBackend, StateKey};
+use crate::state::{EventRef, StateBackend, StateKey};
 use crate::timers::duration::CompactDuration;
 use parking_lot::{Mutex as SyncMutex, RwLock};
 pub(in crate::state) use sealed::MutatePermit;
 pub(crate) use sealed::{Finalized, MessageMarker, OpPermit, Promoted, SessionGate};
 use sealed::{MarkerIdentity, StateLifecycle};
-use std::future::Future;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 use tokio::sync::watch;
-use uuid::Uuid;
 
 mod access;
 mod keyed;
@@ -50,7 +41,6 @@ mod tests;
 
 pub(crate) use access::{LifecycleAccess, MarkerAccessExt};
 pub use keyed::KeyedStateSession;
-use stage::resolve_collections;
 
 /// The per-event session bound: a writable collection session that also
 /// carries the settle boundary's sealed lifecycle and message-marker identity.
@@ -173,7 +163,10 @@ where
     registry: Arc<CollectionDefRegistry>,
     state_key: StateKey,
     event: EventRef,
-    stage_attempt: OnceLock<AttemptId>,
+    /// One id for the whole session. It stays the same across `finalize`
+    /// retries, so each re-stage overwrites Staged under the same id and a
+    /// Committed row from an earlier promote still certifies it.
+    stage_id: OnceLock<StageId>,
     dedup_ttl: CompactDuration,
     checks: B::Checks,
     termination: TerminationWatch,

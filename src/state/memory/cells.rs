@@ -16,6 +16,11 @@ use std::sync::Arc;
 use tokio::task::coop::cooperative;
 
 pub(super) type CellMap = scc::HashMap<(CollectionId, CellKey), StoredCell, RandomState>;
+/// A borrowed key for [`CellMap`] lookups.
+///
+/// Its derived `Hash` must equal the hash of the owned
+/// `(CollectionId, CellKey)` key. It does, because `CellKey` hashes through
+/// its `CellRef`.
 #[derive(Hash)]
 struct CellLookup<'a>(&'a CollectionId, CellRef<'a>);
 

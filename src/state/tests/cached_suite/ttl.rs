@@ -212,5 +212,5 @@ fn prop_cached_ttl_expiry_matches_durable_death() {
 }
 
 fn ttl_marker(event: EventRef, writes: &[(CellKey, ProvisionalWrite)]) -> EventMarker {
-    EventMarker::frozen(event, writes, &[], &evidence([].into(), None))
+    EventMarker::frozen(event, writes, Vec::new(), &evidence([].into(), None))
 }

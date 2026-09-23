@@ -73,10 +73,11 @@ where
                     let ttl = registry.ttl_for(kind, &name);
                     let id = CollectionId::new(state_key.clone(), kind, name);
                     cooperative(async move {
-                        let state = admission_step(cancelled, key, id.name().as_str(), || {
-                            self.inner.cell.marker_state(&id)
-                        })
-                        .await?;
+                        let state =
+                            admission_step(cancelled, key, "marker state", Some(id.name()), || {
+                                self.inner.cell.marker_state(&id)
+                            })
+                            .await?;
                         // A corrupt marker cannot name cells for repair. Keep those cells
                         // unchanged.
                         let state = state.unwrap_or_else(|| {
@@ -223,22 +224,27 @@ where
             })
         {
             if marker.version() == MarkerVersion::V1 {
-                admission_step(cancelled, key, collection.id().name().as_str(), || {
-                    self.inner.cell.abort_provisional(collection, &[])
-                })
+                admission_step(
+                    cancelled,
+                    key,
+                    "legacy marker abort",
+                    Some(collection.id().name()),
+                    || self.inner.cell.abort_provisional(collection, &[]),
+                )
                 .await?;
             }
             return Ok(());
         }
 
         let marker = marker.for_admission(self.inner.dedup_ttl);
-        let resolved = admission_step(cancelled, key, collection.id().name().as_str(), || {
+        let name = Some(collection.id().name());
+        let resolved = admission_step(cancelled, key, "marker resolve", name, || {
             resolve_event_marker(&self.inner.cell, collection, &marker, decision)
         })
         .await?;
         if resolved.is_none() && decision == CommitDecision::Committed {
             ADMISSION_TORN.add(1, &[]);
-            admission_step(cancelled, key, collection.id().name().as_str(), || {
+            admission_step(cancelled, key, "torn marker rollback", name, || {
                 resolve_event_marker(
                     &self.inner.cell,
                     collection,
@@ -271,6 +277,7 @@ where
                             cancelled,
                             key,
                             "dedup read rejected; redelivery can reach the handler",
+                            None,
                             || self.inner.dedup.exists(dedup_id),
                         )
                         .await?
@@ -281,6 +288,7 @@ where
                         cancelled,
                         key,
                         "dedup write rejected; redelivery can reach the handler",
+                        None,
                         || self.inner.dedup.insert(dedup_id),
                     )
                     .await?;
@@ -292,7 +300,7 @@ where
                     if let EventRef::Timer(timer) = other
                         && same_timer_coordinate(source, other)
                     {
-                        admission_step(cancelled, key, "timer retirement", || {
+                        admission_step(cancelled, key, "timer retirement", None, || {
                             timers.retire_committed(key, timer)
                         })
                         .await?;
@@ -320,12 +328,13 @@ where
                     cancelled,
                     key,
                     "legacy dedup read; redelivery can reach the handler",
+                    None,
                     || self.inner.dedup.exists(dedup_id),
                 )
                 .await
             }
             EventRef::Timer(timer) => {
-                let tag = admission_step(cancelled, key, "legacy timer read", || {
+                let tag = admission_step(cancelled, key, "legacy timer read", None, || {
                     timers.current_timer_tag(key, timer.time, timer.timer_type)
                 })
                 .await?;
@@ -361,28 +370,37 @@ fn retain_sources(sources: &mut SmallVec<[EventRef; 32]>, event: EventRef, dedup
     }
 }
 
+/// Retries one admission store operation. A permanent rejection logs the
+/// `step` label and, for a collection operation, the collection name.
 pub(super) async fn admission_step<R, E, Fut>(
     cancelled: impl Fn() -> bool,
     key: &Key,
-    collection: &str,
-    mut step: impl FnMut() -> Fut,
+    step: &'static str,
+    collection: Option<&StateName>,
+    mut operation: impl FnMut() -> Fut,
 ) -> Result<Option<R>, Admission>
 where
     Fut: Future<Output = Result<R, E>>,
     E: ClassifyError + Error,
 {
-    match retry_step(cancelled, "keyed-state admission", || {
-        let result = step();
+    let collection = collection.map(StateName::as_str);
+    let outcome = retry_step(cancelled, "keyed-state admission", || {
+        let result = operation();
         async move {
             let result = result.await;
             if let Err(error) = &result
                 && error.classify_error() == ErrorCategory::Permanent
             {
-                error!(%error, %key, collection, "admission rejected store operation; continue with local repair");
+                error!(
+                    %error, %key, step, collection,
+                    "admission rejected store operation; continue with local repair"
+                );
             }
             result
         }
-    }).await {
+    })
+    .await;
+    match outcome {
         StepOutcome::Done(value) => Ok(Some(value)),
         StepOutcome::Skip => Ok(None),
         StepOutcome::Abandon => Err(Admission::Abandoned),

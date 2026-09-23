@@ -21,7 +21,7 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
         cell.clone(),
         ProvisionalWrite::new(Some(data.clone()), Committed::new(None), event(1)),
     )];
-    let marker = EventMarker::frozen(event(1), &writes, &[], &evidence([].into(), None));
+    let marker = EventMarker::frozen(event(1), &writes, Vec::new(), &evidence([].into(), None));
     store
         .write_provisional(&c, listed(&marker, &writes)?)
         .await?;
@@ -81,7 +81,7 @@ async fn committed_clear_deletes_the_row() -> Result<()> {
         .await?;
     let write = ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(2));
     let writes = [(cell.clone(), write.clone())];
-    let marker = EventMarker::frozen(event(2), &writes, &[], &evidence([].into(), None));
+    let marker = EventMarker::frozen(event(2), &writes, Vec::new(), &evidence([].into(), None));
     store
         .write_provisional(&c, listed(&marker, &writes)?)
         .await?;

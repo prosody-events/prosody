@@ -89,12 +89,12 @@ pub(super) async fn stage_clock_crash<S: CellStore>(
     let marker = EventMarker::frozen(
         event,
         &writes,
-        &[],
+        Vec::new(),
         &EventEvidence {
             touched,
             evidence_ttl: CompactDuration::new(3600),
             dedup: None,
-            attempt: AttemptId::new(),
+            stage: StageId::new(),
         },
     );
     let marker_unit = BatchUnit::<()>::new(0, smallvec::SmallVec::new());

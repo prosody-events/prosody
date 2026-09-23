@@ -32,6 +32,33 @@ fn prop_cached_projection_scan_parity() {
     QuickCheck::new().quickcheck(property as fn(ScanTrace) -> Result<bool>);
 }
 
+/// A misaligned lower batch is never cached. The caller rejects the answer,
+/// so a retry must read the lower store again.
+#[test]
+fn misaligned_lower_batch_is_never_cached() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let (cached, counting, id) = counting_cached("batch-misaligned")?;
+        let cref = CollectionRef::new(id.clone(), None);
+        let cold: Vec<(CellKey, Option<Bytes>)> =
+            (0u8..4).map(|c| (cell_at(c), Some(bytes(c)))).collect();
+        counting.write_resolved(&cref, &cold, &[]).await?;
+
+        counting.short_batches();
+        let answers =
+            CellRead::<Values>::read_many(&cached, &id, SECTION, &batch_of(0u8..4)?.as_ref())
+                .await?;
+        assert_eq!(answers.len(), 3, "the lower store dropped one answer");
+        for c in 0u8..4 {
+            assert_eq!(
+                cached.stored_expiry(&id, &cell_at(c)).await?,
+                None,
+                "coordinate {c} was cached from a misaligned batch"
+            );
+        }
+        Ok(())
+    })
+}
+
 /// A warm batch returns every value without a lower read.
 #[test]
 fn batch_get_all_hits_reads_nothing() -> Result<()> {

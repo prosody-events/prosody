@@ -8,7 +8,7 @@ use super::{
 use crate::codec::{Codec, SerializeBufGuard};
 use crate::state::cell_key::CellRef;
 use crate::state::order_codec::KeyCodecError;
-use crate::state::store::{CELL_BATCH, CoordinateBatch, ReadBatch, ensure_aligned};
+use crate::state::store::{CELL_BATCH, ReadBatch, ensure_aligned};
 use smallvec::SmallVec;
 
 /// Encodes one key before its borrow ends. The future owns the buffer guard.
@@ -22,6 +22,7 @@ pub(super) fn encode_key<K: OrderedKeyCodec>(
 
 /// Encodes one bounded batch at a time and preserves every input position.
 /// The read completes before the next batch reuses the encoding buffer.
+/// Reads pass an empty journal, so one path serves reads and writes.
 pub(super) async fn read_keys<'a, S, T, P: Projection>(
     session: &S,
     inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
@@ -104,18 +105,14 @@ pub(in crate::state::collection) async fn read_coordinates<S, P: Projection>(
     state_type: StateType,
     name: &StateName,
     section: Section,
-    coordinates: impl IntoIterator<Item = Coordinate>,
+    coordinates: &[Coordinate],
 ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
 where
     S: StateSession,
     S::Engine: sealed::Reads<S, P>,
 {
-    let coordinates = coordinates.into_iter();
-    // Unknown input lengths can grow the result buffer. Storage batches stay
-    // bounded.
-    let mut answers = CellBuffer::with_capacity(coordinates.size_hint().0);
-    for batch in CoordinateBatch::chunks(coordinates) {
-        let batch = batch.as_ref();
+    let mut answers = CellBuffer::with_capacity(coordinates.len());
+    for batch in ReadBatch::chunks(coordinates.iter().map(Coordinate::as_bytes)) {
         let values = <S::Engine as sealed::Reads<S, P>>::read_batch(
             session, inner, state_type, name, section, &batch,
         )

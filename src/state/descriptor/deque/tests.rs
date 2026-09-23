@@ -7,6 +7,7 @@
 //! durable cell addresses and the collection-owned `head ≤ tail` window check.
 
 use super::*;
+use crate::state::order_codec::OrderedKeyCodec;
 use quickcheck::{QuickCheck, TestResult};
 
 /// The frozen cell addresses and the reset domain that a `clear` covers. The

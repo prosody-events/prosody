@@ -26,7 +26,7 @@
 //! monotonic and never reused **within a window's lifetime** — a pop advances
 //! `head`/`tail` past the freed index, never back into it. So `len` is
 //! `tail − head` (O(1) from the bounds cell), `get(i)` reads the single cell at
-//! `head + i`, and iteration point-reads each index in `[head, tail)`, never a
+//! `head + i`, and a stream reads only indices in `[head, tail)`, never a
 //! popped tombstone (which sits below `head` or at/above `tail`).
 //! [`DequeHandle::clear`] ends the window's lifetime and
 //! **resets the index space**: the erased bounds cell reads `[0, 0)`, so the
@@ -88,7 +88,7 @@ use crate::state::collection::{
     StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
     spec_matches,
 };
-use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec, UnitKey};
+use crate::state::order_codec::{I64KeyCodec, UnitKey};
 use crate::state::{CollectionKindId, StateAccessError, StoreOutcome};
 use educe::Educe;
 use futures::Stream;

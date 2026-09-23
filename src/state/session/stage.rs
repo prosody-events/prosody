@@ -20,7 +20,6 @@ use crate::state::{
 };
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
-use smallvec::SmallVec;
 use std::iter::from_fn;
 use tokio::task::coop::cooperative;
 
@@ -65,14 +64,13 @@ fn stage_chunks<I: Iterator<Item = (CellKey, Option<Bytes>)>>(
     })
 }
 
-/// Stages one collection's touched cells in a single batch, returning the
-/// frozen [`StagedCollection`] record the receipt promotes / rolls back (or
-/// `None` for a `ReadUncommitted` collection, which resolves at stage time).
-/// A `Cleared` cell in a cleared section is dropped on both arms: the clear's
-/// gap erase subsumes it, and dropping it keeps the batch row-disjoint (no
-/// written row overlaps a gap range) — the section's remaining present cells
-/// are exactly its frozen survivors. Free function so no `self` borrow
-/// crosses the concurrent fan-out.
+/// Stages one collection's touched cells and returns the frozen
+/// [`StagedCollection`] record that the receipt promotes or rolls back.
+/// Returns `None` when there is nothing to stage, and for a `ReadUncommitted`
+/// collection, which writes resolved values at stage time.
+/// A `Cleared` cell in a cleared section is dropped on both arms. The clear's
+/// gap erase covers it, so the write stays row-disjoint. This is a free
+/// function so no `self` borrow crosses the concurrent fan-out.
 pub(super) async fn stage_collection<S>(
     lower: &S,
     registry: &CollectionDefRegistry,
@@ -149,20 +147,10 @@ where
             if writes.is_empty() && cleared.is_empty() {
                 return Ok(None);
             }
-            // `finalize` builds the staged record exactly once per collection
-            // from the post-`commit()` dirty buffer, so the marker lists
-            // exactly this stage's writes and frozen clears; only a retry
-            // attempt re-running `finalize` re-stages (an idempotent
-            // same-event marker overwrite). A clears-only collection stages
-            // `writes = []` under a marker whose `clears()` is non-empty: the
-            // durable marker still lands and the stage-boundary
-            // foreign-marker resolve still runs, and the returned entry makes
-            // `finalize` returns a staged receipt so the boundary promotes the clear.
-            let clears: Vec<SectionClear> = cleared
-                .iter()
-                .map(|&section| SectionClear::frozen(section, &writes))
-                .collect();
-            let stage = FrozenStage::new(event, writes, &clears, evidence);
+            // The marker lists exactly this stage's writes and frozen clears. A
+            // clears-only collection stages no writes, but its Staged row still
+            // lands so that promote applies the clear.
+            let stage = FrozenStage::new(event, writes, cleared, evidence);
             lower
                 .write_provisional(&collection_ref, stage.request())
                 .await
@@ -175,26 +163,37 @@ where
         CommitMode::ReadUncommitted => {
             let resolved: ResolvedCells = cells
                 .into_iter()
-                .filter(|(cell, value)| !subsumed(cell, value))
                 .map(|(cell, value)| (cell, value.into_data()))
                 .collect();
-            if resolved.is_empty() && cleared.is_empty() {
-                return Ok(None);
-            }
-            // The direct apply: cells plus the frozen gap erase in one write.
-            // RU writes resolved values directly.
-            // return `None` even for a clears-only collection.
-            let clears: Vec<SectionClear> = cleared
-                .iter()
-                .map(|&section| SectionClear::frozen_resolved(section, &resolved))
-                .collect();
-            lower
-                .write_resolved(&collection_ref, &resolved, &clears)
-                .await
-                .map_err(|e| StateAccessError::store(&e))?;
+            write_direct(lower, &collection_ref, cleared, resolved).await?;
             Ok(None)
         }
     }
+}
+
+/// Writes resolved cells and their frozen section clears in one direct write.
+/// A `Cleared` cell in a cleared section is dropped, because the clear's gap
+/// erase covers it and the write must stay row-disjoint. Returns `false` when
+/// there is nothing to write.
+pub(super) async fn write_direct<S: CellStore>(
+    lower: &S,
+    collection: &CollectionRef,
+    cleared: &ClearedSections,
+    mut cells: ResolvedCells,
+) -> Result<bool, StateAccessError> {
+    cells.retain(|(cell, data)| data.is_some() || !cleared.contains(&cell.section));
+    if cells.is_empty() && cleared.is_empty() {
+        return Ok(false);
+    }
+    let clears: Vec<SectionClear> = cleared
+        .iter()
+        .map(|&section| SectionClear::frozen_resolved(section, &cells))
+        .collect();
+    lower
+        .write_resolved(collection, &cells, &clears)
+        .await
+        .map_err(|e| StateAccessError::store(&e))?;
+    Ok(true)
 }
 
 /// Restores stage residue after every concurrent stage call has returned.
@@ -258,13 +257,35 @@ pub(super) async fn resolve_collections<S: CellStore>(
             })
         })
         .buffer_unordered(STATE_FANOUT_CONCURRENCY)
-        .fold(
-            SmallVec::<[StagedCollection; 1]>::new(),
-            |mut rejected, staged| async move {
-                rejected.extend(staged);
-                rejected
-            },
-        )
+        .fold(Vec::new(), |mut rejected, staged| async move {
+            rejected.extend(staged);
+            rejected
+        })
         .await
-        .into_vec()
+}
+
+/// Rolls back every staged collection concurrently. Returns `false` when
+/// shutdown abandoned a rollback.
+pub(super) async fn abort_collections<S: CellStore>(
+    store: &S,
+    collections: &[StagedCollection],
+    shutdown: &(impl Fn() -> bool + Sync),
+) -> bool {
+    // Indices keep the closure free of a higher-ranked borrow.
+    stream::iter(0..collections.len())
+        .map(|index| {
+            let staged = &collections[index];
+            cooperative(async move {
+                !matches!(
+                    retry_step(shutdown, "keyed-state rollback", || {
+                        store.abort_provisional(&staged.collection, staged.stage.writes())
+                    })
+                    .await,
+                    StepOutcome::Abandon
+                )
+            })
+        })
+        .buffer_unordered(STATE_FANOUT_CONCURRENCY)
+        .fold(true, |all, done| async move { all && done })
+        .await
 }

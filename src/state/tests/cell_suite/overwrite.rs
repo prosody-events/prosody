@@ -83,7 +83,8 @@ where
             }
             cell_writes.push((key, ProvisionalWrite::new(mutation.value(), prev, event)));
         }
-        let marker = EventMarker::frozen(event, &cell_writes, &[], &evidence([].into(), None));
+        let marker =
+            EventMarker::frozen(event, &cell_writes, Vec::new(), &evidence([].into(), None));
         if !cell_writes.is_empty() {
             store
                 .write_provisional(&refs[slot], listed(&marker, &cell_writes)?)

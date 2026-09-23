@@ -153,7 +153,7 @@ where
         let keys: BTreeSet<(u8, u8)> = base.keys().copied().collect();
         return assert_apply_settled(&store, probe, &id, &base, &keys).await;
     }
-    let marker = EventMarker::frozen(event, &writes, &clears, &evidence([].into(), None));
+    let marker = EventMarker::frozen(event, &writes, clears.clone(), &evidence([].into(), None));
     store
         .write_provisional(&collection, listed(&marker, &writes)?)
         .await?;

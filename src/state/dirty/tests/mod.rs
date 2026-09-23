@@ -1,3 +1,5 @@
+//! Regression tests for dirty-store tree ranges and section clears.
+
 use super::*;
 use crate::state::StateKey;
 use crate::state::cell_key::Coordinate;

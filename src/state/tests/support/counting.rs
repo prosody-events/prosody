@@ -105,6 +105,24 @@ impl<S> CountingCellStore<S> {
             + self.counts.abort_provisional.load(Ordering::Relaxed)
     }
 
+    /// Every durable read of any kind: point, batch, scan, marker, and raw
+    /// provisional reads.
+    pub(crate) fn durable_reads(&self) -> usize {
+        [
+            &self.counts.marker_state,
+            &self.counts.value_reads,
+            &self.counts.value_batches,
+            &self.counts.presence_reads,
+            &self.counts.value_scans,
+            &self.counts.presence_scans,
+            &self.counts.provisional_cell_at,
+            &self.counts.provisional_many,
+        ]
+        .iter()
+        .map(|count| count.load(Ordering::Relaxed))
+        .sum()
+    }
+
     pub(crate) fn marker_reads(&self) -> usize {
         self.counts.marker_state.load(Ordering::Relaxed)
     }

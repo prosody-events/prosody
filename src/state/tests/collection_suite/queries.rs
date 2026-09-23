@@ -1,6 +1,6 @@
 //! Query bounds match independent key and position models.
 
-use super::{deque, drain, make_session, read_event, registry_and_ref, seed_deque_window};
+use super::{deque, drain, read_event, registry_and_ref, seed_deque_window};
 use crate::codec::JsonCodec;
 use crate::consumer::middleware::deduplication::MemoryDeduplicationStore;
 use crate::state::descriptor::{StateDescriptor, deque_state, map_state, set_state};
@@ -133,6 +133,18 @@ impl PrefixShape {
             })
     }
 
+    /// A cursor past the whole prefix range selects no key in any population.
+    fn selects_nothing(&self, dir: Direction) -> bool {
+        let prefix = self.prefix.as_str();
+        self.cursor.as_deref().is_some_and(|cursor| {
+            !prefix.is_empty()
+                && match dir {
+                    Direction::Forward => cursor > prefix && !cursor.starts_with(prefix),
+                    Direction::Backward => cursor <= prefix,
+                }
+        })
+    }
+
     fn apply<'a>(&'a self, query: BorrowedKeyQuery<'a>) -> BorrowedKeyQuery<'a> {
         let mut query = query.prefix(self.prefix.as_str());
         if let Some(cursor) = self.cursor.as_deref() {
@@ -157,8 +169,9 @@ async fn run_prefix_query(shape: PrefixShape) -> Result<bool> {
     let set = set_state::<Utf8KeyCodec>("prefix-set");
     let (map_registry, _) = registry_and_ref(&map, "prefix-map", &state_key, definition)?;
     let (set_registry, _) = registry_and_ref(&set, "prefix-set", &state_key, definition)?;
-    let map_session = make_session(&cells, &dedup, &map_registry, &state_key, read_event(0));
-    let set_session = make_session(&cells, &dedup, &set_registry, &state_key, read_event(1));
+    let counting = CountingCellStore::new(MemoryCellStore::new(cells));
+    let map_session = counting_session(&counting, &dedup, &map_registry, &state_key, read_event(0));
+    let set_session = counting_session(&counting, &dedup, &set_registry, &state_key, read_event(1));
     let map = map.bind(&map_session)?;
     let set = set.bind(&set_session)?;
     for key in &shape.keys {
@@ -177,6 +190,7 @@ async fn run_prefix_query(shape: PrefixShape) -> Result<bool> {
             expected.reverse();
         }
         expected.truncate(shape.limit.map_or(usize::MAX, NonZeroUsize::get));
+        counting.reset();
         let entries: Vec<_> = expected
             .iter()
             .map(|key| (key.clone(), Value::from(key.clone())))
@@ -208,84 +222,22 @@ async fn run_prefix_query(shape: PrefixShape) -> Result<bool> {
             .await?,
             expected
         );
+        // A query that selects nothing for every population reads nothing.
+        if shape.selects_nothing(dir) {
+            assert_eq!(counting.durable_reads(), 0, "an empty query read the store");
+        }
     }
     Ok(true)
 }
 
 /// Both plans keep the cursor within the prefix, and preserve direction and
-/// result limits.
+/// result limits. A query that selects no key reads nothing.
 #[test]
 fn prop_prefix_query() {
     fn property(shape: PrefixShape) -> Result<bool> {
         TEST_RUNTIME.block_on(run_prefix_query(shape))
     }
     QuickCheck::new().quickcheck(property as fn(PrefixShape) -> Result<bool>);
-}
-
-/// A query that selects nothing reads nothing: no keyset, window, or entry
-/// read. Disjoint prefixes and an inverted position range select nothing for
-/// every population, so each stream ends before any store read.
-#[test]
-fn empty_queries_read_nothing() -> Result<()> {
-    TEST_RUNTIME.block_on(async {
-        let dedup = MemoryDeduplicationStore::default();
-        let counting = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
-        let state_key = StateKey::new(Uuid::new_v4(), Arc::from("empty"));
-        let def = CollectionDef::new(None);
-        let map = map_state::<Utf8KeyCodec, JsonCodec>("empty-map");
-        let set = set_state::<Utf8KeyCodec>("empty-set");
-        let deque = deque_state::<JsonCodec>("empty-deque");
-        let (map_registry, _) = registry_and_ref(&map, "empty-map", &state_key, def)?;
-        let (set_registry, _) = registry_and_ref(&set, "empty-set", &state_key, def)?;
-        let (deque_registry, _) = registry_and_ref(&deque, "empty-deque", &state_key, def)?;
-        let session =
-            |registry| counting_session(&counting, &dedup, registry, &state_key, read_event(0));
-        let (map_session, set_session, deque_session) = (
-            session(&map_registry),
-            session(&set_registry),
-            session(&deque_registry),
-        );
-        let map = map.bind(&map_session)?;
-        let set = set.bind(&set_session)?;
-        let deque = deque.bind(&deque_session)?;
-        let reads = || {
-            counting.lower_reads()
-                + counting.batch_reads()
-                + counting.lower_scans()
-                + counting.presence_reads()
-                + counting.presence_scans()
-                + counting.marker_reads()
-        };
-
-        let disjoint = || KeyQuery::new().prefix("ab").prefix("b");
-        assert!(
-            drain(map.entries().with_query(disjoint()).stream())
-                .await?
-                .is_empty()
-        );
-        assert!(
-            drain(map.keys().with_query(disjoint()).stream())
-                .await?
-                .is_empty()
-        );
-        assert!(
-            drain(set.keys().with_query(disjoint()).stream())
-                .await?
-                .is_empty()
-        );
-        let inverted = DequeQuery::new().from(5).to(3);
-        assert!(
-            drain(deque.values().with_query(inverted).stream())
-                .await?
-                .is_empty()
-        );
-        assert_eq!(reads(), 0, "a query that selects nothing reads nothing");
-
-        drain(map.keys().stream()).await?;
-        drain(deque.values().stream()).await?;
-        assert!(reads() > 0, "the counters observe queries that can select");
-        Ok(())
-    })
 }
 
 /// Position bounds include empty, reversed, and saturated intervals.
@@ -325,7 +277,29 @@ impl Arbitrary for DequeConstraints {
     }
 }
 
+impl DequeConstraints {
+    /// Crossed position bounds select nothing in any window.
+    fn selects_nothing(&self) -> bool {
+        let start = match self.range.0 {
+            Bound::Included(position) => Some(position),
+            Bound::Excluded(position) => position.checked_add(1),
+            Bound::Unbounded => Some(0),
+        };
+        let end = match self.range.1 {
+            Bound::Included(position) => position.checked_add(1),
+            Bound::Excluded(position) => Some(position),
+            Bound::Unbounded => None,
+        };
+        match (start, end) {
+            (None, _) => true,
+            (Some(start), Some(end)) => start >= end,
+            (Some(_), None) => false,
+        }
+    }
+}
+
 /// Both plans preserve position bounds, direction, and the live-result limit.
+/// A query that selects no position reads nothing.
 pub(crate) async fn run_deque_constraint_parity(shape: DequeConstraints) -> Result<bool> {
     let cells = MemoryCells::new();
     let store = MemoryCellStore::new(cells.clone());
@@ -349,7 +323,8 @@ pub(crate) async fn run_deque_constraint_parity(shape: DequeConstraints) -> Resu
             .map(|i| (!shape.holes.get(i).copied().unwrap_or(false)).then_some((i % 256) as u8))
             .collect();
         seed_deque_window(&store, &collection, i64::from(shape.head), &values).await?;
-        let session = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
+        let counting = CountingCellStore::new(store.clone());
+        let session = counting_session(&counting, &dedup, &registry, &state_key, read_event(0));
         let handle = descriptor.bind(&session)?;
         for dir in [Direction::Forward, Direction::Backward] {
             let mut expected: Vec<_> = values
@@ -366,10 +341,14 @@ pub(crate) async fn run_deque_constraint_parity(shape: DequeConstraints) -> Resu
             if let Some(limit) = shape.limit {
                 query = query.limit(limit);
             }
+            counting.reset();
             assert_eq!(
                 drain(handle.values().with_query(query).stream()).await?,
                 expected
             );
+            if shape.selects_nothing() {
+                assert_eq!(counting.durable_reads(), 0, "an empty query read the store");
+            }
         }
     }
     Ok(true)

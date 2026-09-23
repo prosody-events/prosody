@@ -146,13 +146,22 @@ fn expired(expiry: u64, now: u64) -> bool {
     expiry != codec::NEVER_EXPIRES && now >= expiry
 }
 
+/// Decodes one stored frame and classifies it at `now`. A frame that does not
+/// decode returns `Corrupt`. Point and batch reads share this probe.
+pub(super) fn probe<P: Projection>(raw: Option<&[u8]>, now: u64) -> CacheRead<P> {
+    match codec::decode_frame(raw) {
+        Ok((expiry, entry)) => {
+            classify::<P>(expiry, entry.map_or(Read::Unknown, P::from_cached), now)
+        }
+        Err(error) => {
+            warn!(%error, "cell cache frame does not decode");
+            CacheRead::Corrupt
+        }
+    }
+}
+
 /// Classifies a projected frame at `now` and gives each hit its remaining TTL.
-/// Point and batch reads share this classifier.
-pub(super) fn classify<P: Projection>(
-    expiry: u64,
-    read: Read<P::Payload>,
-    now: u64,
-) -> CacheRead<P> {
+fn classify<P: Projection>(expiry: u64, read: Read<P::Payload>, now: u64) -> CacheRead<P> {
     let remaining = || {
         (expiry != codec::NEVER_EXPIRES).then(|| {
             CompactDuration::new(

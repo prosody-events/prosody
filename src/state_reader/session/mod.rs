@@ -34,7 +34,7 @@ use crate::state_reader::partition_for_key;
 use crate::state_reader::source::{Source, ValidatedPublications};
 use futures::stream::{FuturesOrdered, Stream, StreamExt};
 use smallvec::smallvec;
-use std::borrow::{Borrow, Cow};
+use std::borrow::Cow;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -369,16 +369,16 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     }
 
     /// Streams one source's committed cells under the projection.
-    fn source_scan<'a, P: Projection, I: Borrow<CollectionId> + Send>(
+    fn source_scan<'a, P: Projection>(
         &'a self,
-        id: I,
+        id: CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + use<'a, C, B, P, I>
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + use<'a, C, B, P>
     where
         B::Cells: CommittedCellSource<P>,
     {
         async_stream::try_stream! {
-            let inner = CommittedCellSource::<P>::scan(self.context.backend.cells(), id.borrow(), scan);
+            let inner = CommittedCellSource::<P>::scan(self.context.backend.cells(), &id, scan);
             futures::pin_mut!(inner);
             while let Some(item) = cooperative(inner.next()).await {
                 yield item.map_err(|error| StateAccessError::store(&error))?;
@@ -401,7 +401,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     {
         async_stream::try_stream! {
             if let Some(pin) = selected.or_else(|| self.pin.get()) {
-                let inner = self.source_scan::<P, _>(&pin.collection, scan);
+                let inner = self.source_scan::<P>(pin.collection.clone(), scan);
                 futures::pin_mut!(inner);
                 while let Some(item) = cooperative(inner.next()).await {
                     yield item?;
@@ -415,7 +415,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                 |source| async move {
                     let id = self.collection_id_for(source)?;
                     // Like resolve_probe nodes, stream boxes are bounded by MAX_PUBLICATION_SOURCES per operation, not per cell.
-                    let mut stream = Box::pin(self.source_scan::<P, _>(id, scan));
+                    let mut stream = Box::pin(self.source_scan::<P>(id, scan));
                     let first = cooperative(stream.next()).await.transpose()?;
                     Ok(first.map(|row| (row, stream)))
                 },

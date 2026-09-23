@@ -22,7 +22,7 @@ fn absent_fill_over_committed_foreign_provisional_publishes_present() -> Result<
             cell_at(4),
             ProvisionalWrite::new(Some(bytes(44)), Committed::new(None), a),
         )];
-        let marker = EventMarker::frozen(a, &writes, &[], &evidence([].into(), None));
+        let marker = EventMarker::frozen(a, &writes, Vec::new(), &evidence([].into(), None));
         counting
             .write_provisional(&cref, listed(&marker, &writes)?)
             .await?;
@@ -69,7 +69,7 @@ fn absent_fill_over_aborted_foreign_provisional_publishes_absent() -> Result<()>
             cell_at(4),
             ProvisionalWrite::new(Some(bytes(44)), Committed::new(None), a),
         )];
-        let marker = EventMarker::frozen(a, &writes, &[], &evidence([].into(), None));
+        let marker = EventMarker::frozen(a, &writes, Vec::new(), &evidence([].into(), None));
         counting
             .write_provisional(&cref, listed(&marker, &writes)?)
             .await?;
@@ -271,7 +271,7 @@ fn cache_disablement_applies_to_all_workspace_clones() -> Result<()> {
             cell_at(1),
             ProvisionalWrite::new(Some(bytes(2)), prev1, event),
         )];
-        let marker2 = EventMarker::frozen(event, &stage, &[], &evidence([].into(), None));
+        let marker2 = EventMarker::frozen(event, &stage, Vec::new(), &evidence([].into(), None));
         cached_a
             .write_provisional(&cref, listed(&marker2, &stage)?)
             .await?;
@@ -328,7 +328,7 @@ fn cache_disablement_applies_to_all_workspace_clones() -> Result<()> {
             cell_at(3),
             ProvisionalWrite::new(Some(bytes(5)), prev3, event),
         )];
-        let marker3 = EventMarker::frozen(event, &post, &[], &evidence([].into(), None));
+        let marker3 = EventMarker::frozen(event, &post, Vec::new(), &evidence([].into(), None));
         cached_b
             .write_provisional(&cref, listed(&marker3, &post)?)
             .await?;

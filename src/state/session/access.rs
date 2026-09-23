@@ -18,12 +18,11 @@ use crate::state::registry::CollectionDef;
 /// This is the **settlement surface**: the sealed [`StateLifecycle`] verbs.
 /// It stays `pub(crate)` because the settle-module-private
 /// [`SettlementAccess`](crate::consumer::middleware::settle) extension must
-/// name it. Residual: no convenient crate-wide accessor exists (the old
-/// `LifecycleAccessExt` is gone), so reaching this surface outside settle
-/// requires writing `context.state(Registered::new(LifecycleAccess))` plus a
-/// `use sealed::StateLifecycle` by hand — a deliberate, greppable act rather
-/// than a one-call convenience. Dedup / defer-reload reach only the marker
-/// identity, through the narrow [`MarkerHandle`].
+/// name it. No crate-wide accessor exists. Code outside settle must write
+/// `context.state(Registered::new(LifecycleAccess))` and
+/// `use sealed::StateLifecycle` by hand, so each use stays easy to find. Dedup
+/// / defer-reload reach only the marker identity, through the narrow
+/// [`MarkerHandle`].
 ///
 /// [`EventContext::state`]: crate::consumer::event_context::EventContext::state
 #[derive(Clone, Copy, Debug)]
@@ -143,8 +142,7 @@ impl StateDescriptor for MarkerAccess {
 
 /// Crate-private extension giving the marker-identity audiences (defer-reload,
 /// dedup, and settle) one-call access to their event's [`MarkerHandle`]
-/// through the public [`EventContext::state`] method — the narrow replacement
-/// for the deleted crate-wide `lifecycle()` accessor.
+/// through the public [`EventContext::state`] method.
 pub(crate) trait MarkerAccessExt: EventContext {
     /// Binds the event's marker-identity handle. Fails with
     /// [`StateAccessError`] only when the context is terminated;

@@ -1,12 +1,12 @@
 //! Invariants of the read-through TTL cache.
 //!
-//! [`prop_cache_staleness`] proves the staleness rules together over random
-//! clock and get schedules, checked against a plain `HashMap` model: the
-//! issue-time age, expiry, batch refresh, negative caching, and cache-key
-//! isolation. The focused tests below pin invariants that schedule cannot
-//! express: concurrent single-flight, failed presence upgrades, slow fills, and
-//! the byte-budget bound. Its key pool includes two namespaces with the same
-//! collection name, proving `StateType` participates in cache identity.
+//! [`staleness::prop_cache_staleness`] proves the staleness rules together
+//! over random clock and get schedules, checked against a plain `HashMap`
+//! model: the issue-time age, expiry, batch refresh, negative caching, and
+//! cache-key isolation. Its key pool includes two namespaces with the same
+//! collection name, so `StateType` takes part in cache identity. The focused
+//! tests in this module check what a schedule cannot express: concurrent
+//! single-flight, failed presence upgrades, slow fills, and the byte budget.
 //!
 //! Every test drives a mocked monotonic clock instead of sleeping, so timing
 //! stays deterministic. The cache is exercised directly, with no

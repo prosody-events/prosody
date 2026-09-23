@@ -154,7 +154,7 @@ fn prop_key_query_method_order() {
                 let actual = match query.encode(&mut buf)? {
                     Some(query) => {
                         let mut actual = query.select(coordinates);
-                        actual.truncate(query.limit.map_or(usize::MAX, NonZeroUsize::get));
+                        actual.truncate(query.limit().map_or(usize::MAX, NonZeroUsize::get));
                         actual
                     }
                     None => Vec::new(),
@@ -164,6 +164,18 @@ fn prop_key_query_method_order() {
                     .map(|key| Utf8KeyCodec::encode(key))
                     .collect();
                 assert_eq!(actual, expected, "direction: {dir:?}; steps: {steps:?}");
+
+                // `from(k)` then `before(k)` leaves no key after any history,
+                // so the encoding must report the query as empty.
+                let k = keys.first().cloned().unwrap_or_default();
+                let mut emptied = steps.to_vec();
+                emptied.push((0, k.clone(), k.clone(), NonZeroUsize::MIN));
+                emptied.push((3, k.clone(), k, NonZeroUsize::MIN));
+                let mut buf = SerializeBufGuard::acquire();
+                assert!(
+                    key_query(dir, &emptied).encode(&mut buf)?.is_none(),
+                    "direction: {dir:?}; steps: {emptied:?}"
+                );
             }
         }
         Ok(())

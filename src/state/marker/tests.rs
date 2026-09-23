@@ -1,5 +1,5 @@
 use super::{
-    AttemptId, EventMarker, EventMarkerData, MarkerPayloadError, MarkerVersion, SectionClear,
+    EventMarker, EventMarkerData, MarkerPayloadError, MarkerVersion, SectionClear, StageId,
     decode_marker_payload, encode_committed_payload, encode_marker_payload,
 };
 use crate::state::cell::{Committed, ProvisionalWrite};
@@ -10,7 +10,6 @@ use crate::state::tests::support::arb_coordinate;
 use crate::state::{StateName, StateType};
 use crate::timers::duration::CompactDuration;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
-use std::slice::from_ref;
 use uuid::Uuid;
 
 /// A fixed message event to bind every generated marker; the event is not part
@@ -69,12 +68,12 @@ impl Arbitrary for ArbMarker {
         Self(EventMarker::frozen(
             event(),
             &staged,
-            &clears,
+            clears.clone(),
             &EventEvidence {
                 touched: [].into(),
                 evidence_ttl: CompactDuration::new(3600),
                 dedup: None,
-                attempt: AttemptId(Uuid::from_u128(0xA77E)),
+                stage: StageId(Uuid::from_u128(0xA77E)),
             },
         ))
     }
@@ -115,7 +114,7 @@ fn prop_marker_payload_round_trips() {
         touched.dedup();
         let marker = EventMarker::from_parts(EventMarkerData {
             version: MarkerVersion::V2,
-            attempt: marker.attempt(),
+            stage: marker.stage(),
             event: marker.event(),
             staged: marker.staged().to_vec(),
             clears: marker.clears().to_vec(),
@@ -247,23 +246,23 @@ fn frozen_marker_payload_bytes() -> color_eyre::Result<()> {
     let legacy = EventMarker::frozen(
         event(),
         &staged,
-        from_ref(&clear),
+        vec![clear.clone()],
         &EventEvidence {
             touched: [].into(),
             evidence_ttl: CompactDuration::new(3600),
             dedup: None,
-            attempt: AttemptId(Uuid::from_u128(0xA77E)),
+            stage: StageId(Uuid::from_u128(0xA77E)),
         },
     );
     let marker = EventMarker::frozen(
         event(),
         &staged,
-        &[clear],
+        vec![clear],
         &EventEvidence {
             touched: vec![(StateType::Application, StateName::try_new("x")?)].into(),
             evidence_ttl: CompactDuration::new(3600),
             dedup: Some(Uuid::from_u128(0xD3D0)),
-            attempt: AttemptId(Uuid::from_u128(0xA77E)),
+            stage: StageId(Uuid::from_u128(0xA77E)),
         },
     );
 
@@ -339,12 +338,12 @@ fn trailing_garbage_is_rejected() -> color_eyre::Result<()> {
     let marker = EventMarker::frozen(
         event(),
         &[],
-        &[],
+        Vec::new(),
         &EventEvidence {
             touched: [].into(),
             evidence_ttl: CompactDuration::new(3600),
             dedup: None,
-            attempt: AttemptId(Uuid::from_u128(0xA77E)),
+            stage: StageId(Uuid::from_u128(0xA77E)),
         },
     );
     let mut bytes = encode_marker_payload(&marker)?.to_vec();

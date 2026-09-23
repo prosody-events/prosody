@@ -142,7 +142,7 @@ where
             .iter()
             .map(|&s| SectionClear::frozen(SECTIONS[s as usize], &cell_writes))
             .collect();
-        let marker = EventMarker::frozen(event, &cell_writes, &clears, &evidence);
+        let marker = EventMarker::frozen(event, &cell_writes, clears.clone(), &evidence);
         let collection = &refs[*coll as usize];
         if split && cell_writes.len() >= 2 {
             let mid = cell_writes.len() / 2;
@@ -319,7 +319,7 @@ where
         staged.clone(),
         ProvisionalWrite::new(Some(bytes(1)), prev, event_a),
     )];
-    let marker = EventMarker::frozen(event_a, &writes, &[], &evidence([].into(), None));
+    let marker = EventMarker::frozen(event_a, &writes, Vec::new(), &evidence([].into(), None));
     store
         .write_provisional(&refs[0], listed(&marker, &writes)?)
         .await?;

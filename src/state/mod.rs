@@ -12,7 +12,7 @@
 //! * [`identity`] — collection identity ([`CollectionId`], [`CollectionRef`],
 //!   [`StateKey`], [`CollectionKindId`], …).
 //! * [`cell_key`] — intra-collection cell addressing ([`CellKey`], [`Section`],
-//!   [`Coordinate`], [`Scan`], [`std::ops::Bound`]).
+//!   [`Coordinate`], [`Scan`]).
 //! * [`event_ref`] — event identity and verdicts ([`EventRef`],
 //!   [`CommitDecision`], [`StoreOutcome`], …).
 //! * [`cell`] — the provisional-cell durability model ([`Cell`], [`Committed`],
@@ -101,13 +101,12 @@ pub(crate) mod overlay;
 pub(crate) mod production;
 pub mod publication;
 pub(crate) mod publisher;
+pub(crate) mod query;
 pub mod registry;
 pub mod resolve;
 pub(crate) mod retry;
 pub mod session;
 pub(crate) mod store;
-mod store_helpers;
-mod store_types;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -123,8 +122,12 @@ pub use order_codec::{
     I64KeyCodec, KeyCodecError, OrderedKeyCodec, PrefixKeyCodec, U64KeyCodec, UnitKey,
     Utf8KeyCodec, order_preserving_i64, order_preserving_i64_decode,
 };
+pub use query::{
+    BorrowedKeyQuery, DequeQuery, DequeRead, ErasedKeyQuery, KeyQuery, KeyRead, ReadQuery,
+    ReadSource,
+};
 pub use registry::{CommitMode, ReadCachePolicy, StateVisibility};
-pub use store_types::MisalignedBatch;
+pub use store::MisalignedBatch;
 
 // The backend cluster is crate-internal (module-capped in [`backend`]); these
 // re-exports keep every in-crate `crate::state::X` import resolving without
@@ -169,9 +172,3 @@ const _: () = assert!(
     CELLS_INLINE > 0 && CELLS_INLINE <= 8,
     "keyed-state inline buffers must stay small"
 );
-
-pub(crate) mod query;
-pub use query::{
-    BorrowedKeyQuery, DequeQuery, DequeRead, ErasedKeyQuery, KeyQuery, KeyRead, ReadQuery,
-    ReadSource,
-};

@@ -64,7 +64,12 @@ pub(crate) async fn reader_residue<
         .map(|id| (id.state_type(), id.name().clone()))
         .to_vec();
     touched.sort_unstable();
-    let marker = EventMarker::frozen(event, &writes, &clears, &evidence(touched.into(), None));
+    let marker = EventMarker::frozen(
+        event,
+        &writes,
+        clears.clone(),
+        &evidence(touched.into(), None),
+    );
     if committed {
         let anchor = CollectionRef::new(if other { remote } else { id.clone() }, None);
         let evidence = evidence_only(&marker);

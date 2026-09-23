@@ -138,6 +138,11 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
         let stamped_at = self.fjall.clock().now_ms();
         let loaded = async {
             let filled = CellRead::<P>::read_many(&self.lower, collection, section, batch).await?;
+            // A misaligned answer is never cached. The caller rejects it, and a
+            // retry must read the lower store again.
+            if filled.len() != batch.len() {
+                return Ok(filled);
+            }
             let projected = batch
                 .iter()
                 .zip(&filled)

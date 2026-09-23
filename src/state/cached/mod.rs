@@ -47,7 +47,7 @@ use super::cell_key::CellKey;
 use super::fjall::{FjallCellCache, FjallCellCacheError};
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::EventMarker;
-use super::store::{CellBackend, CellBuffer};
+use super::store::CellBackend;
 use crate::timers::duration::CompactDuration;
 use std::future::Future;
 use std::time::Duration;
@@ -108,12 +108,13 @@ impl<L> Cached<L> {
     /// A failed removal disables the cache.
     async fn evict_marker_cache_entries(&self, collection: &CollectionId, marker: &EventMarker) {
         retry_delete(&self.fjall, "marker staged", || {
-            self.fjall.delete_batch(collection, marker.staged())
+            self.fjall
+                .delete_batch(collection, marker.staged().iter().map(CellKey::as_ref))
         })
         .await;
         for clear in marker.clears() {
             retry_delete(&self.fjall, "marker section", || {
-                self.fjall.delete_section(collection, clear.section(), &[])
+                self.fjall.delete_section(collection, clear.section(), [])
             })
             .await;
         }
@@ -123,7 +124,7 @@ impl<L> Cached<L> {
     /// `lower.write` (establish-then-publish) in **one** atomic fjall batch
     /// ([`FjallCellCache::put_batch`]). `stamped_at` is a clock reading taken
     /// **before** the lower write; [`expiry_at`] floors it to match
-    /// Cassandra's TTL resolution (see the module's TTL co-expiry doc). The
+    /// Cassandra's TTL resolution. The
     /// collection's write TTL is the full TTL (the value was just written).
     /// `project` computes each cell's committed projection from its batch
     /// entry.
@@ -152,11 +153,9 @@ impl<L> Cached<L> {
             .await
         {
             warn_skip("publish", &error);
-            // failed-publish cache guard repair: rebuild the delete keys from the `cells`
-            // param.
-            let keys: CellBuffer<CellKey> = cells.iter().map(|(cell, _)| cell.clone()).collect();
             retry_delete(&self.fjall, "publish repair", || {
-                self.fjall.delete_batch(collection.id(), &keys)
+                self.fjall
+                    .delete_batch(collection.id(), cells.iter().map(|(cell, _)| cell.as_ref()))
             })
             .await;
         }
@@ -218,10 +217,9 @@ fn expiry_at(stamped_at: u64, remaining: Option<CompactDuration>) -> u64 {
 
 /// Runs a must-succeed repair delete: up to [`DELETE_RETRY_BUDGET`] attempts
 /// with [`DELETE_RETRY_DELAY`] between them, warning per failure; on
-/// exhaustion it **disables the cache** and returns. Completes-or-disables: it
-/// never fails upward and never stalls settlement — see the module's cache
-/// disablement section for why every failure class (there is no Permanent
-/// escape hatch) lands in the same bounded place.
+/// exhaustion it **disables the cache** and returns. It never fails upward
+/// and never stalls settlement. Every failure class ends here, because a
+/// disabled cache sends all reads to durable storage.
 ///
 /// A dropped **boundary-owned** settle/admission future abandons the retry
 /// harmlessly: the drop coincides with assignment revocation (the workspace —

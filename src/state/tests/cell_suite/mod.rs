@@ -1,8 +1,8 @@
 //! Shared property suites for memory, cached memory, and Cassandra cells.
-//! Crash traces preserve durable rows and rebuild the store with a cold cache.
-//! Admission resolves residue through collection evidence before the next
-//! event. Physical probes check marker rows, provisional cells, and committed
-//! absence.
+//!
+//! Each child module holds one backend-generic runner family. This root holds
+//! the shared cell addresses, value helpers, and the [`ShapeProbe`] that
+//! checks marker rows, provisional cells, and committed absence.
 
 use crate::state::cell::{Presence, Projection, Values};
 use crate::state::cell_key::CellRef;
@@ -27,7 +27,7 @@ use super::support::{CountingCellStore, batch_of};
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell::Cell::Provisional;
-use crate::state::marker::{AttemptId, EventEvidence, MarkerState};
+use crate::state::marker::{EventEvidence, MarkerState, StageId};
 use crate::state::tests::support::{admit_collection, evidence, seed_commit_evidence};
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;

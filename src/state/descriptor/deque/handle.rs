@@ -3,14 +3,16 @@
 use super::{
     Bound, CellCodecError, CellType, Collection, CollectionRead, CollectionWrite, ContextOf,
     DEQUE_POINT_ITERATION_MAX, DequeKind, DequeQuery, DequeStateError, Direction, Educe, Empty,
-    FromSession, I64KeyCodec, Keyed, MetaDecodeError, NonZeroUsize, OrderedKeyCodec, Plan,
-    ResolvedOf, Span, StateSession, StoreOutcome, Stream, UnitKey, Window, WritableStateSession,
-    WriteOf, bounds, collection_methods, evictions, instrument, write_bounds,
+    FromSession, I64KeyCodec, Keyed, MetaDecodeError, NonZeroUsize, Plan, ResolvedOf, Span,
+    StateSession, StoreOutcome, Stream, UnitKey, Window, WritableStateSession, WriteOf, bounds,
+    collection_methods, evictions, instrument, write_bounds,
 };
 use crate::state::cell::Values;
+use crate::state::cell_key::Coordinate;
 use crate::state::order_codec::order_preserving_i64;
 use crate::state::{DequeRead, ReadQuery, ReadSource};
 use async_stream::try_stream;
+use bytes::BytesMut;
 use futures::StreamExt;
 use std::ops::Range;
 use tracing::{Instrument, info_span};
@@ -189,9 +191,17 @@ where
                 .with_limit(Some(limit)));
         }
         // Both endpoints are valid, so interior index arithmetic cannot overflow.
-        // Allocate at most 128 coordinates once per stream, before item reads.
-        let mut coordinates = Vec::with_capacity(len);
-        coordinates.extend((0..len).map(|offset| I64KeyCodec::encode(&(first + offset as i64))));
+        // One buffer holds the at most 128 selected coordinates, and each
+        // coordinate shares it.
+        let mut bytes = BytesMut::with_capacity(len * size_of::<i64>());
+        for offset in 0..len {
+            bytes.extend_from_slice(&order_preserving_i64(first + offset as i64));
+        }
+        let bytes = bytes.freeze();
+        let mut coordinates: Vec<Coordinate> = bytes
+            .chunks(size_of::<i64>())
+            .map(|chunk| Coordinate::from_bytes(bytes.slice_ref(chunk)))
+            .collect();
         if dir == Direction::Backward {
             coordinates.reverse();
         }
@@ -204,7 +214,8 @@ where
     /// current values and skips absent positions. If a pop and push reuse a
     /// position before its fetch, the stream yields its new value.
     ///
-    /// Small windows use point reads; wider windows use range scans.
+    /// A selection of at most `DEQUE_POINT_ITERATION_MAX` positions uses
+    /// point reads. A wider selection uses a range scan.
     /// Both sources preserve order and skip absent cells. Earlier chunks can
     /// emit before a later fetch fails. A failed point chunk emits no values.
     ///
@@ -226,14 +237,14 @@ where
     {
         ReadQuery::new(DequeQuery::new(), move |query: DequeQuery| {
             let positions = query.positions();
-            let span = info_span!(
-                "deque.stream",
-                collection = self.cells.name().as_str(),
-                direction = ?query.dir,
-            );
             try_stream! {
                 // A query that selects no position reads nothing.
                 if !positions.is_empty() {
+                    let span = info_span!(
+                        "deque.stream",
+                        collection = self.cells.name().as_str(),
+                        direction = ?query.dir,
+                    );
                     let plan = self
                         .stream_plan(query.dir, positions)
                         .instrument(span.clone())

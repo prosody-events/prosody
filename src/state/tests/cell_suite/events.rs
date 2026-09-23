@@ -90,12 +90,12 @@ impl Arbitrary for Outcome {
 /// One event: a flat list of `(collection, section idx, coord, mutation)`
 /// writes, the sections it durably clears, an outcome, and the recovery path
 /// to use when the outcome is a crash. The flat list is grouped by collection
-/// ([`event_plan`]) so each touched collection stages **all** its cells (and
-/// clears) in one `write_provisional` call — unless `split` is set, which
-/// stages a ≥2-cell collection in two sequential same-event calls carrying the
-/// same union marker, exercising the same-event marker overwrite at the stage
-/// boundary (the second stage's unsettled marker is the event's OWN and must
-/// not be resolved).
+/// ([`crash::event_plan`](super::crash::event_plan)) so each touched collection
+/// stages **all** its cells (and clears) in one `write_provisional` call —
+/// unless `split` is set, which stages a ≥2-cell collection in two sequential
+/// same-event calls carrying the same union marker, exercising the same-event
+/// marker overwrite at the stage boundary (the second stage's unsettled marker
+/// is the event's OWN and must not be resolved).
 #[derive(Clone, Debug)]
 pub(super) struct TraceEvent {
     pub(super) writes: Vec<(u8, u8, u8, Mutation)>,

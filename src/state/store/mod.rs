@@ -28,13 +28,13 @@ use std::error::Error;
 use std::future::Future;
 use std::num::NonZeroUsize;
 
-pub(crate) use super::store_helpers::{
+mod batch;
+
+pub use batch::MisalignedBatch;
+pub(crate) use batch::{CELL_BATCH, ensure_aligned};
+pub use batch::{CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch, Durable, ReadBatch};
+pub(crate) use batch::{
     distinct, provisional_point_loop, repeated, section_batches, sorted_unique_coordinates,
-};
-pub use super::store_types::MisalignedBatch;
-pub(crate) use super::store_types::{CELL_BATCH, ensure_aligned};
-pub use super::store_types::{
-    CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch, Durable, ReadBatch,
 };
 
 /// Sizes the fetches of one read. The first fetch equals the caller's
@@ -127,13 +127,13 @@ pub trait CellRead<P: Projection>: CellBackend {
 /// A committed-absent cell has no row. Each operation that resolves a cell to
 /// absence deletes its row.
 pub trait CellStore: CellRead<Values> + CellRead<Presence> {
-    /// Point-reads one coordinate's provisional cell, or `None` when it is
-    /// absent or resolved (over-report-safe). The single-coordinate primitive
-    /// that [`provisional_point_loop`] fans out over to
-    /// supply [`provisional_many`](Self::provisional_many) for backends with no
-    /// native batch read (the memory store, test doubles); a backend with a
-    /// native `IN` read implements [`provisional_many`](Self::provisional_many)
-    /// directly and never routes through this.
+    /// Reads one coordinate's provisional cell. Returns `None` when the cell
+    /// is absent or resolved. A false `Some` is safe because admission resolves
+    /// the cell again.
+    ///
+    /// [`provisional_point_loop`] calls this once per distinct coordinate for
+    /// backends with no native batch read. A backend with a native `IN` read
+    /// implements [`provisional_many`](Self::provisional_many) directly.
     ///
     /// # Errors
     ///
@@ -193,9 +193,9 @@ pub trait CellStore: CellRead<Values> + CellRead<Presence> {
     /// A retry can replace the same event's Staged row; handlers must produce
     /// the same result across retries.
     ///
-    /// A clears-only stage supplies a payload with empty `staged()` and
-    /// non-empty `clears()`. It writes Staged and checks the boundary.
-    /// Admission resolves prior residue before dispatch.
+    /// This verb overwrites any Staged row. Admission resolves prior residue
+    /// before dispatch. A clears-only stage supplies a payload with empty
+    /// `staged()` and non-empty `clears()`, and it still writes Staged.
     ///
     /// Staged carries frozen clear survivors that [`Self::commit_provisional`]
     /// applies at settle. Admission uses only that durable payload.

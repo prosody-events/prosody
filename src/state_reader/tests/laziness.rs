@@ -9,10 +9,14 @@ use crate::state_reader::StateReaderError;
 use color_eyre::Result;
 use futures::StreamExt;
 
-/// Builds one stream from a borrowed reader and checks that it reads nothing
-/// before its first poll.
+/// Checks the laziness of one query shape over a borrowed reader.
+///
+/// `$stream` must be able to select a value and `$empty` must select nothing.
+/// Neither stream reads before its first poll. An empty key fails both. A
+/// polled empty query reads nothing. The valid query's reads that follow in
+/// the same environment prove that the counters observe reads.
 macro_rules! check_lazy {
-    ($descriptor:expr, |$reader:ident, $key:ident| $stream:expr) => {{
+    ($descriptor:expr, |$reader:ident, $key:ident| $stream:expr, $empty:expr) => {{
         let env = ScriptedEnv::new($descriptor)?;
         let key = Key::from("user-1");
         let tp = topic("lazy-source");
@@ -24,33 +28,52 @@ macro_rules! check_lazy {
             let $key = key.clone();
             $stream
         });
-        let exhausted = {
+        // An empty key fails both queries before any read.
+        {
             let invalid = {
                 let $key = Key::from("");
                 $stream
             };
-            assert_eq!(env.publications.reads(), 0);
-            assert_eq!(env.identities.reads(), 0);
-            assert_eq!(env.cells.reads(segment), 0);
-
             futures::pin_mut!(invalid);
             assert!(matches!(
                 invalid.next().await,
                 Some(Err(StateReaderError::EmptyKey))
             ));
-            invalid.next().await.is_none()
-        };
-        assert!(exhausted);
+            assert!(invalid.next().await.is_none());
+        }
+        {
+            let invalid = {
+                let $key = Key::from("");
+                $empty
+            };
+            futures::pin_mut!(invalid);
+            assert!(matches!(
+                invalid.next().await,
+                Some(Err(StateReaderError::EmptyKey))
+            ));
+            assert!(invalid.next().await.is_none());
+        }
+        assert_eq!(env.publications.reads(), 0);
 
         let valid = {
-            let $key = key;
+            let $key = key.clone();
             $stream
         };
         assert_eq!(env.publications.reads(), 0);
 
         // A publication created after the stream must be visible on its first
-        // poll.
+        // poll. An empty query over the same publication still reads nothing.
         env.publish(GROUP_A, tp).await;
+        let empty = {
+            let $key = key;
+            $empty
+        };
+        futures::pin_mut!(empty);
+        assert!(empty.next().await.is_none());
+        assert_eq!(env.publications.reads(), 0);
+        assert_eq!(env.identities.reads(), 0);
+        assert_eq!(env.cells.reads(segment), 0);
+
         futures::pin_mut!(valid);
         assert!(valid.next().await.is_none());
         assert_eq!(env.publications.reads(), 1);
@@ -63,57 +86,23 @@ macro_rules! check_lazy {
 async fn queries_acquire_on_first_poll() -> Result<()> {
     check_lazy!(
         map_state::<Utf8KeyCodec, JsonCodec>("lazy-map"),
-        |reader, key| reader.entries(key).stream()
+        |reader, key| reader.entries(key).stream(),
+        reader.entries(key).prefix("ab").prefix("b").stream()
     );
     check_lazy!(
         map_state::<Utf8KeyCodec, JsonCodec>("lazy-keys"),
-        |reader, key| reader.keys(key).stream()
+        |reader, key| reader.keys(key).stream(),
+        reader.keys(key).from("b").to("a").stream()
     );
-    check_lazy!(set_state::<Utf8KeyCodec>("lazy-set"), |reader, key| reader
-        .keys(key)
-        .stream());
-    check_lazy!(deque_state::<JsonCodec>("lazy-deque"), |reader, key| reader
-        .values(key)
-        .stream());
-    Ok(())
-}
-
-/// Builds a query that selects nothing and checks that it ends without a
-/// session, even over a published source.
-macro_rules! check_empty {
-    ($descriptor:expr, |$reader:ident, $key:ident| $stream:expr) => {{
-        let env = ScriptedEnv::new($descriptor)?;
-        let key = Key::from("user-1");
-        let tp = topic("empty-source");
-        let segment = source_state_key(tp, GROUP_A, &key, env.count)?.segment_id;
-        env.publish(GROUP_A, tp).await;
-        let reader = env.reader_eager()?;
-        let $reader = &reader;
-        let empty = {
-            let $key = key;
-            $stream
-        };
-        futures::pin_mut!(empty);
-        assert!(empty.next().await.is_none());
-        assert_eq!(env.publications.reads(), 0);
-        assert_eq!(env.identities.reads(), 0);
-        assert_eq!(env.cells.reads(segment), 0);
-    }};
-}
-
-#[tokio::test]
-async fn empty_queries_acquire_nothing() -> Result<()> {
-    check_empty!(
-        map_state::<Utf8KeyCodec, JsonCodec>("empty-map"),
-        |reader, key| reader.entries(key).prefix("ab").prefix("b").stream()
+    check_lazy!(
+        set_state::<Utf8KeyCodec>("lazy-set"),
+        |reader, key| reader.keys(key).stream(),
+        reader.keys(key).prefix("ab").prefix("b").stream()
     );
-    check_empty!(set_state::<Utf8KeyCodec>("empty-set"), |reader, key| reader
-        .keys(key)
-        .from("b")
-        .to("a")
-        .stream());
-    check_empty!(deque_state::<JsonCodec>("empty-deque"), |reader, key| {
+    check_lazy!(
+        deque_state::<JsonCodec>("lazy-deque"),
+        |reader, key| reader.values(key).stream(),
         reader.values(key).from(5).to(3).stream()
-    });
+    );
     Ok(())
 }

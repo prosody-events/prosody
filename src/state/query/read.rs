@@ -3,6 +3,7 @@
 use super::{BorrowedKeyQuery, DequeQuery, KeyQuery};
 use crate::state::Direction;
 use crate::state::order_codec::{OrderedKeyCodec, PrefixKeyCodec};
+use educe::Educe;
 use std::borrow::Borrow;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
@@ -20,7 +21,12 @@ pub trait ReadSource {
     fn stream(self, query: Self::Query) -> Self::Output;
 }
 
-impl<Q, F, O> ReadSource for (F, PhantomData<fn(Q)>)
+/// A read source that calls `F` with the query settings.
+#[derive(Educe)]
+#[educe(Clone(bound = "F: Clone"))]
+pub(crate) struct FnSource<Q, F>(F, PhantomData<fn(Q)>);
+
+impl<Q, F, O> ReadSource for FnSource<Q, F>
 where
     F: FnOnce(Q) -> O,
 {
@@ -48,9 +54,9 @@ pub type KeyRead<'a, KC, S> = ReadQuery<BorrowedKeyQuery<'a, KC>, S>;
 /// A fluent deque read with bounds counted from the front.
 pub type DequeRead<S> = ReadQuery<DequeQuery, S>;
 
-impl<Q, F> ReadQuery<Q, (F, PhantomData<fn(Q)>)> {
+impl<Q, F> ReadQuery<Q, FnSource<Q, F>> {
     pub(crate) fn new(query: Q, source: F) -> Self {
-        Self::from_source(query, (source, PhantomData))
+        Self::from_source(query, FnSource(source, PhantomData))
     }
 }
 

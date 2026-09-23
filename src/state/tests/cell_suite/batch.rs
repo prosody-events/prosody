@@ -103,7 +103,7 @@ pub(super) async fn seed_batch<S: CellStore>(
                 ProvisionalWrite::new(Some(bytes(*data)), prev, event),
             ));
         }
-        let marker = EventMarker::frozen(event, &writes, &[], &evidence([].into(), None));
+        let marker = EventMarker::frozen(event, &writes, Vec::new(), &evidence([].into(), None));
         store
             .write_provisional(collection, listed(&marker, &writes)?)
             .await?;

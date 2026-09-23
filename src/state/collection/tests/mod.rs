@@ -5,11 +5,11 @@
 //! directly, so the invariants hold for every collection that runs through the
 //! same scope.
 //!
-//! The flagship is [`prop_write_invocations_are_atomic`], a trace/model
-//! property over generated invocations. Its model is a plain map: the journal's
-//! reverse-order fold must answer every in-invocation read, a successful merge
-//! must leave the event overlay exactly at the model, and every other exit must
-//! leave the overlay exactly as the invocation found it.
+//! The flagship is [`invocation::prop_write_invocations_are_atomic`], a
+//! trace/model property over generated invocations. Its model is a plain map:
+//! the journal's reverse-order fold must answer every in-invocation read, a
+//! successful merge must leave the event overlay exactly at the model, and
+//! every other exit must leave the overlay exactly as the invocation found it.
 //!
 //! The sibling [`plans`] module pins the managed stream drivers that a plan
 //! feeds. It covers order, error termination, the per-emission fence, and the

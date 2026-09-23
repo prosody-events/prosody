@@ -173,7 +173,7 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
             event(1),
         ),
     )];
-    let marker = EventMarker::frozen(event(1), &writes, &[], &evidence([].into(), None));
+    let marker = EventMarker::frozen(event(1), &writes, Vec::new(), &evidence([].into(), None));
     store
         .write_provisional(&c, listed(&marker, &writes)?)
         .await?;

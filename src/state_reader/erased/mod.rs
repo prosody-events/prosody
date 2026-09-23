@@ -50,10 +50,10 @@ pub trait ErasedMapReader<Item: Send + 'static>: Send + Sync {
     /// Reports whether the committed map is empty.
     async fn is_empty(&self, key: String) -> Result<bool, ErasedStateError>;
 
-    /// Streams committed entries in key order.
+    /// A fluent query over committed entries in key order.
     fn entries(&self, key: String) -> ErasedKeyRead<(String, Item)>;
 
-    /// Streams committed keys without decoding values.
+    /// A fluent query over committed keys, without decoding values.
     fn keys(&self, key: String) -> ErasedKeyRead<String>;
 }
 
@@ -76,7 +76,7 @@ pub trait ErasedSetReader: Send + Sync {
     /// Reports whether the committed set has no members.
     async fn is_empty(&self, key: String) -> Result<bool, ErasedStateError>;
 
-    /// Streams committed members in key order.
+    /// A fluent query over committed members in key order.
     fn keys(&self, key: String) -> ErasedKeyRead<String>;
 }
 
@@ -101,7 +101,7 @@ pub trait ErasedDequeReader<Item: Send + 'static>: Send + Sync {
     /// Reads the committed back endpoint.
     async fn peek_back(&self, key: String) -> Result<Option<Item>, ErasedStateError>;
 
-    /// Streams committed elements in index order.
+    /// A fluent query over committed elements in index order.
     fn values(&self, key: String) -> ErasedDequeRead<Item>;
 }
 

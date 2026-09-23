@@ -257,8 +257,8 @@ Never hardcode an iteration count in a test body.
 
 - In-memory property tests: quickcheck reads `QUICKCHECK_TESTS` itself;
   `QuickCheck::new().quickcheck(...)` needs no extra configuration.
-- Property tests against live backends: read `INTEGRATION_TESTS` via the
-  local `get_test_count()` helper (default 25) and pass it to
+- Property tests against live backends: read `INTEGRATION_TESTS` through
+  `integration_test_count(25)` in `src/tests/test_util/mod.rs` and pass it to
   `.tests(...)` — see `src/state/cassandra/tests.rs`.
 - A property whose per-iteration cost is intrinsically heavy (multiple
   seconds of live-broker protocol, e.g. multi-consumer rebalance coverage)

@@ -1,10 +1,10 @@
 //! The session gate and the permits that serialize session operations.
 
-use super::Duration;
 use opentelemetry::global::meter;
 use opentelemetry::metrics::Counter;
 use std::ops::{Deref, DerefMut};
 use std::sync::LazyLock;
+use std::time::Duration;
 use tokio::sync::{Mutex as TokioMutex, MutexGuard};
 use tokio::time::timeout;
 
@@ -31,10 +31,9 @@ static SETTLE_GATE_WAITS: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// check through the fill's publish; `commit()` across snapshot →
 /// durable write → drain; `set`/`remove`/`clear` across their
 /// entry-and-meta updates. `join!`-ed ops therefore execute in *some*
-/// serial order — which also closes two lost-update races the dirty
-/// store's old "no handler op is in flight" comment papered
-/// over: `commit()`'s snapshot→drain window dropping a concurrent `set`,
-/// and the map or set keyset updates under concurrent member writes.
+/// serial order. That order prevents two lost updates: a concurrent `set`
+/// inside `commit()`'s snapshot-to-drain window, and concurrent member
+/// writes that update the same map or set keyset.
 ///
 /// **A stream acquires the gate at init and once per chunk**, each permit
 /// dropped before the next; every other public op acquires it once for its
@@ -91,8 +90,8 @@ static SETTLE_GATE_WAITS: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// op**, not a convention. Session handles are `Clone + 'static`, but the
 /// gate only serializes ops *within* one event's dispatch. Between retry
 /// attempts the gate is Open (closure happens only at settle), so a leaked
-/// clone's `set` landing after an attempt boundary would once have joined
-/// the NEXT attempt's transaction. The attempt boundary
+/// clone's `set` after an attempt boundary could otherwise join the next
+/// attempt's transaction. The attempt boundary
 /// ([`StateLifecycle::reset`]) bumps the session epoch under this gate. A
 /// detached clone keeps its stale pin. The leak therefore errors at the
 /// point its op takes effect. This holds uniformly across the whole

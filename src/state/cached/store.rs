@@ -69,16 +69,16 @@ impl<L: CellStore> CellStore for Cached<L> {
         for clear in clears {
             retry_delete(&self.fjall, "clear section", || {
                 self.fjall
-                    .delete_section(collection.id(), clear.section(), &[])
+                    .delete_section(collection.id(), clear.section(), [])
             })
             .await;
         }
         // Remove old entries before the durable write.
         // Cancellation can then leave entries absent, but never stale.
         // Publish the new values only after the durable write succeeds.
-        let cell_keys: CellBuffer<CellKey> = cells.iter().map(|(cell, _)| cell.clone()).collect();
         retry_delete(&self.fjall, "resolved cells", || {
-            self.fjall.delete_batch(collection.id(), &cell_keys)
+            self.fjall
+                .delete_batch(collection.id(), cells.iter().map(|(cell, _)| cell.as_ref()))
         })
         .await;
         // Pre-write anchor, establish-first — see `write_provisional`.
@@ -102,7 +102,8 @@ impl<L: CellStore> CellStore for Cached<L> {
         // The keys do not contain the new committed values.
         // Remove their old entries before the durable promotion.
         retry_delete(&self.fjall, "promote", || {
-            self.fjall.delete_batch(collection.id(), cells)
+            self.fjall
+                .delete_batch(collection.id(), cells.iter().map(CellKey::as_ref))
         })
         .await;
         self.lower.mark_resolved(collection, cells).await?;
@@ -141,20 +142,24 @@ impl<L: CellStore> CellStore for Cached<L> {
         // cell per event.
         if let Err(error) = self.fjall.commit_batch(collection.id(), writes).await {
             warn_skip("commit transform", &error);
-            let cells: CellBuffer<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
             retry_delete(&self.fjall, "commit transform fallback", || {
-                self.fjall.delete_batch(collection.id(), &cells)
+                self.fjall.delete_batch(
+                    collection.id(),
+                    writes.iter().map(|(cell, _)| cell.as_ref()),
+                )
             })
             .await;
         }
         // Remove other entries from each cleared section.
         // Keep the staged entries that this settlement just published.
         if !clears.is_empty() {
-            let staged: CellBuffer<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
             for clear in clears {
                 retry_delete(&self.fjall, "commit clear section", || {
-                    self.fjall
-                        .delete_section(collection.id(), clear.section(), &staged)
+                    self.fjall.delete_section(
+                        collection.id(),
+                        clear.section(),
+                        writes.iter().map(|(cell, _)| cell.as_ref()),
+                    )
                 })
                 .await;
             }
@@ -171,10 +176,6 @@ impl<L: CellStore> CellStore for Cached<L> {
         if self.fjall.is_disabled() {
             return self.lower.abort_provisional(collection, writes).await;
         }
-        let cells: CellBuffer<(CellKey, Option<Bytes>)> = writes
-            .iter()
-            .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
-            .collect();
         // No pre-call action exists for the abort: the cached `prev` IS the
         // committed projection while an aborted marker stands, so on a lower
         // Err the result returns verbatim with the cache already correct. And
@@ -190,8 +191,8 @@ impl<L: CellStore> CellStore for Cached<L> {
         let stamped_at = self.fjall.clock().now_ms();
         let result = self.lower.abort_provisional(collection, writes).await;
         if result.is_ok() {
-            self.publish_written(collection, &cells, stamped_at, |data| {
-                Committed::new(data.clone())
+            self.publish_written(collection, writes, stamped_at, |write| {
+                Committed::new(write.prev().cloned())
             })
             .await;
         }

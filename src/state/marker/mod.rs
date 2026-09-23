@@ -3,7 +3,8 @@
 //! carries positive commit evidence. Only a promote writes evidence.
 //!
 //! The frozen payload lists staged coordinates, clear survivors, and touched
-//! collections. Version 2 adds touched collections and the shared evidence TTL.
+//! collections. Version 2 adds touched collections, the shared evidence TTL,
+//! the dedup id, and the stage id.
 //! The row's version column selects the format; the payload has no version
 //! byte.
 //!
@@ -37,12 +38,12 @@ pub(crate) use stage::FrozenStage;
 pub use stage::ProvisionalStage;
 
 /// Identifies one stage across all collections of one settle.
-/// A Committed row certifies a Staged row exactly when their attempt ids match.
+/// A Committed row certifies a Staged row exactly when their stage ids match.
 /// The event and touched list do not select this decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct AttemptId(Uuid);
+pub(crate) struct StageId(Uuid);
 
-impl AttemptId {
+impl StageId {
     pub(crate) fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -50,7 +51,7 @@ impl AttemptId {
 
 /// The two addresses in a collection's marker slice.
 ///
-/// A Committed row certifies residue through its [`AttemptId`].
+/// A Committed row certifies residue through its [`StageId`].
 /// Only a promote writes this row, before any destructive promote chunk.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MarkerRow {
@@ -80,7 +81,7 @@ pub struct MarkerState {
 /// This value cannot carry staged cells or section clears.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CommittedMarker {
-    pub(crate) attempt: AttemptId,
+    pub(crate) stage: StageId,
     pub(crate) event: EventRef,
     pub(crate) dedup: Option<Uuid>,
     pub(crate) touched: Arc<[(StateType, StateName)]>,
@@ -88,14 +89,14 @@ pub(crate) struct CommittedMarker {
 
 impl CommittedMarker {
     pub(crate) fn certifies(&self, marker: &EventMarker) -> bool {
-        self.attempt == marker.attempt()
+        self.stage == marker.stage()
     }
 }
 
 impl From<&EventMarker> for CommittedMarker {
     fn from(marker: &EventMarker) -> Self {
         Self {
-            attempt: marker.attempt(),
+            stage: marker.stage(),
             event: marker.event(),
             dedup: marker.dedup(),
             touched: marker.inner.touched.clone(),
@@ -110,7 +111,7 @@ impl From<&EventMarker> for CommittedMarker {
 pub(crate) struct ReaderEvidence {
     /// The collection's own Staged and Committed rows.
     pub(crate) state: MarkerState,
-    /// A sibling collection holds Committed for the staged attempt.
+    /// A sibling collection holds Committed for the same stage.
     pub(crate) staged_committed: bool,
 }
 
@@ -180,8 +181,8 @@ impl TryFrom<i32> for MarkerVersion {
 ///
 /// The survivor list is derived once, at stage time, by
 /// [`SectionClear::frozen`] and thereafter replayed verbatim — never recomputed
-/// from whatever cells are still provisional at resolve time. That is the
-/// single survivor definition the design relies on for re-apply purity.
+/// from whatever cells are still provisional at resolve time. A repeated
+/// promote therefore applies the same clear.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SectionClear {
     section: Section,
@@ -250,10 +251,9 @@ impl SectionClear {
 /// The unsettled event marker for one collection: the owning event, its full
 /// staged coordinate set, and each cleared section's frozen survivors.
 ///
-/// See the module docs for the invariants it carries. Constructed only inside
-/// the state module (mirroring
-/// [`ProvisionalCell`](super::cell::ProvisionalCell)): only the stage path
-/// mints a marker. Clones share one immutable payload.
+/// See the module docs for the invariants it carries. Only the state module
+/// constructs one: the stage path freezes it, and admission decodes it from
+/// its Staged row. Clones share one immutable payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventMarker {
     inner: Arc<EventMarkerData>,
@@ -262,7 +262,7 @@ pub struct EventMarker {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EventMarkerData {
     version: MarkerVersion,
-    attempt: AttemptId,
+    stage: StageId,
     event: EventRef,
     staged: Vec<CellKey>,
     clears: Vec<SectionClear>,
@@ -283,17 +283,17 @@ impl EventMarker {
     pub(in crate::state) fn frozen(
         event: EventRef,
         staged: &[(CellKey, ProvisionalWrite)],
-        clears: &[SectionClear],
+        clears: Vec<SectionClear>,
         evidence: &EventEvidence,
     ) -> Self {
         let mut coordinates: Vec<CellKey> = staged.iter().map(|(cell, _)| cell.clone()).collect();
         coordinates.sort_unstable();
         Self::from_parts(EventMarkerData {
             version: MarkerVersion::V2,
-            attempt: evidence.attempt,
+            stage: evidence.stage,
             event,
             staged: coordinates,
-            clears: clears.to_vec(),
+            clears,
             touched: Arc::clone(&evidence.touched),
             evidence_ttl: evidence.evidence_ttl,
             dedup: evidence.dedup,
@@ -306,8 +306,8 @@ impl EventMarker {
         }
     }
 
-    pub(crate) fn attempt(&self) -> AttemptId {
-        self.inner.attempt
+    pub(crate) fn stage(&self) -> StageId {
+        self.inner.stage
     }
 
     /// The durable format selects the commit rule for old residue.
@@ -369,7 +369,7 @@ impl EventMarker {
 /// Thus retained evidence without a dedup row requires recovery of the dedup
 /// record.
 pub(crate) struct EventEvidence {
-    pub(crate) attempt: AttemptId,
+    pub(crate) stage: StageId,
     pub(crate) touched: Arc<[(StateType, StateName)]>,
     pub(crate) evidence_ttl: CompactDuration,
     pub(crate) dedup: Option<Uuid>,

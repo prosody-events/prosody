@@ -1,6 +1,10 @@
-use super::CELLS_INLINE;
-use super::cell::{Committed, Values};
-use super::cell_key::Coordinate;
+//! Bounded batch reads: the batch type, its helpers, and its alignment check.
+
+use super::CellStore;
+use crate::state::CELLS_INLINE;
+use crate::state::cell::{Committed, ProvisionalCell, Values};
+use crate::state::cell_key::{CellKey, Coordinate, Section};
+use crate::state::identity::CollectionId;
 use crate::timers::duration::CompactDuration;
 use smallvec::SmallVec;
 use std::iter::from_fn;
@@ -20,10 +24,10 @@ const _: () = assert!(
 /// A non-empty, bounded (`1..=CELL_BATCH`) run of coordinates for one batch
 /// read.
 ///
-/// Only [`Self::chunks`] and subsets of a batch create one, so no batch can
-/// exceed the bound. `N` selects inline storage capacity.
-/// Owned coordinates use the small buffer capacity. Borrowed coordinates
-/// keep a full batch inline.
+/// Only [`Self::chunks`], [`Self::filter`], and [`Self::as_ref`] create one.
+/// Each keeps or shrinks a bounded length, so no batch can exceed the bound.
+/// `N` selects inline storage capacity. Owned coordinates use the small buffer
+/// capacity. Borrowed coordinates keep a full batch inline.
 ///
 /// Duplicates and unknown coordinates are valid. The read contract on
 /// [`super::store::CellRead::read_many`] defines each result position.
@@ -72,12 +76,13 @@ impl<C, const N: usize> Batch<C, N> {
     pub fn iter(&self) -> slice::Iter<'_, C> {
         self.0.iter()
     }
-}
 
-impl<C: AsRef<[u8]>, const N: usize> Batch<C, N> {
     /// Borrows every coordinate. The bounded address buffer stays on the stack.
     #[must_use]
-    pub fn as_ref(&self) -> ReadBatch<'_> {
+    pub fn as_ref(&self) -> ReadBatch<'_>
+    where
+        C: AsRef<[u8]>,
+    {
         Batch(self.iter().map(AsRef::as_ref).collect())
     }
 }
@@ -93,6 +98,75 @@ pub type CacheBatch<P = Values> = CellBuffer<Durable<P>>;
 
 /// One committed cell with the remaining TTL of its durable row.
 pub type Durable<P = Values> = (Committed<P>, Option<CompactDuration>);
+
+/// Returns the distinct coordinates of `batch` in first-occurrence order.
+pub(crate) fn distinct<'a>(batch: &ReadBatch<'a>) -> SmallVec<[&'a [u8]; CELL_BATCH.get()]> {
+    let mut coordinates: SmallVec<[&[u8]; CELL_BATCH.get()]> = SmallVec::new();
+    for &coordinate in batch.iter() {
+        if !coordinates.contains(&coordinate) {
+            coordinates.push(coordinate);
+        }
+    }
+    coordinates
+}
+
+/// Returns the answer of the first earlier position that holds `coordinate`.
+///
+/// A batch read answers positions in input order and calls this before it
+/// reads each one. `answers` then holds exactly the earlier positions, so a
+/// repeated coordinate reuses its first answer and shares one read.
+pub(crate) fn repeated<T: Clone>(
+    batch: &ReadBatch<'_>,
+    answers: &[T],
+    coordinate: &[u8],
+) -> Option<T> {
+    batch
+        .iter()
+        .zip(answers)
+        .find_map(|(&earlier, answer)| (earlier == coordinate).then(|| answer.clone()))
+}
+
+/// Returns the sorted, distinct coordinates for one bounded batch.
+pub(crate) fn sorted_unique_coordinates(batch: &CoordinateBatch) -> CellBuffer<&Coordinate> {
+    let mut coordinates: CellBuffer<&Coordinate> = SmallVec::with_capacity(batch.len());
+    coordinates.extend(batch.iter());
+    coordinates.sort_unstable();
+    coordinates.dedup();
+    coordinates
+}
+
+/// Groups sorted cell keys into bounded batches for each section.
+pub(crate) fn section_batches(keys: &[CellKey]) -> Vec<(Section, CoordinateBatch)> {
+    keys.chunk_by(|a, b| a.section == b.section)
+        .flat_map(|run| {
+            let section = run[0].section;
+            CoordinateBatch::chunks(run.iter().map(|key| key.coordinate.clone()))
+                .map(move |batch| (section, batch))
+        })
+        .collect()
+}
+
+/// Reads distinct provisional cells in ascending coordinate order.
+pub(crate) async fn provisional_point_loop<S: CellStore>(
+    store: &S,
+    collection: &CollectionId,
+    section: Section,
+    batch: &CoordinateBatch,
+) -> Result<CellBuffer<(Coordinate, ProvisionalCell)>, S::Error> {
+    let unique_coordinates = sorted_unique_coordinates(batch);
+    let mut out: CellBuffer<(Coordinate, ProvisionalCell)> =
+        SmallVec::with_capacity(unique_coordinates.len());
+    for coordinate in unique_coordinates {
+        let cell = CellKey {
+            section,
+            coordinate: coordinate.clone(),
+        };
+        if let Some(provisional) = store.provisional_cell_at(collection, &cell).await? {
+            out.push((coordinate.clone(), provisional));
+        }
+    }
+    Ok(out)
+}
 
 /// Checks that a batch read returned one answer per requested coordinate.
 /// Callers pair answers with coordinates by position.

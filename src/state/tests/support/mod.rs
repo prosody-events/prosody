@@ -13,7 +13,7 @@ use crate::state::cell_key::{CellKey, CellRef, Coordinate, Scan, Section};
 use crate::state::collection::{MutationJournal, StateSession, WritableStateSession, sealed};
 use crate::state::descriptor::{CellResolver, StructuralIdentity};
 use crate::state::erased::StateCursor;
-use crate::state::marker::{AttemptId, EventEvidence, EventMarker, ProvisionalStage, SectionClear};
+use crate::state::marker::{EventEvidence, EventMarker, ProvisionalStage, SectionClear, StageId};
 use crate::state::memory::MemoryPublicationStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::publication::{PublicationRows, PublicationStore, StatePublication};
@@ -402,9 +402,9 @@ pub(crate) fn evidence_only(marker: &EventMarker) -> EventMarker {
     EventMarker::frozen(
         marker.event(),
         &[],
-        &[],
+        Vec::new(),
         &EventEvidence {
-            attempt: marker.attempt(),
+            stage: marker.stage(),
             touched: marker.touched().into(),
             evidence_ttl: marker.evidence_ttl(),
             dedup: marker.dedup(),
@@ -418,7 +418,7 @@ pub(crate) fn evidence(
     dedup: Option<Uuid>,
 ) -> EventEvidence {
     EventEvidence {
-        attempt: AttemptId::new(),
+        stage: StageId::new(),
         touched,
         evidence_ttl: CompactDuration::new(3600),
         dedup,

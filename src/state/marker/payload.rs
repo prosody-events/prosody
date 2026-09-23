@@ -1,6 +1,6 @@
 //! The frozen wire payload of the Staged and Committed marker rows.
 
-use super::{AttemptId, EventMarker, EventMarkerData, MarkerVersion, SectionClear};
+use super::{EventMarker, EventMarkerData, MarkerVersion, SectionClear, StageId};
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
@@ -31,7 +31,7 @@ const LEN_PREFIX: usize = 4;
 /// [evidence_ttl_secs_minus_one: u32 BE] // finite retention only
 /// [dedup_present: u8] // 0 means absent; nonzero means present
 /// [dedup: 16 bytes] // only when present
-/// [attempt: 16 bytes]
+/// [stage: 16 bytes]
 /// ```
 ///
 /// Cassandra stores this frozen payload through the Staged row's `data`,
@@ -110,7 +110,7 @@ fn encode_payload(
     if let Some(dedup) = marker.dedup() {
         buf.extend_from_slice(dedup.as_bytes());
     }
-    buf.extend_from_slice(marker.attempt().0.as_bytes());
+    buf.extend_from_slice(marker.stage().0.as_bytes());
     Ok(Bytes::from(buf))
 }
 
@@ -153,10 +153,11 @@ pub(in crate::state) fn decode_marker_payload(
         for _ in 0..survivor_count {
             survivors.push(cursor.take_coordinate()?);
         }
+        sort_distinct(&mut survivors);
         clears.push(SectionClear { section, survivors });
     }
 
-    let (mut touched, ttl, dedup, attempt) = match version {
+    let (mut touched, ttl, dedup, stage) = match version {
         MarkerVersion::V1 => (
             Vec::new(),
             legacy_ttl.unwrap_or(CompactDuration::new(0)),
@@ -164,7 +165,7 @@ pub(in crate::state) fn decode_marker_payload(
                 EventRef::Message { dedup_id } => Some(dedup_id),
                 EventRef::Timer(_) => None,
             },
-            AttemptId::new(),
+            StageId::new(),
         ),
         MarkerVersion::V2 => {
             let count = cursor.take_u32()? as usize;
@@ -192,23 +193,25 @@ pub(in crate::state) fn decode_marker_payload(
                         .map_err(|_| MarkerPayloadError::Truncated)?,
                 )),
             };
-            let attempt = AttemptId(Uuid::from_bytes(
+            let stage = StageId(Uuid::from_bytes(
                 cursor
                     .take(16)?
                     .try_into()
                     .map_err(|_| MarkerPayloadError::Truncated)?,
             ));
-            (touched, CompactDuration::new(seconds), dedup, attempt)
+            (touched, CompactDuration::new(seconds), dedup, stage)
         }
     };
     if !cursor.is_empty() {
         return Err(MarkerPayloadError::TrailingGarbage);
     }
-    touched.sort_unstable();
-    touched.dedup();
+    // Lookups binary-search these lists. The encoder writes them sorted, and
+    // sorting again makes a lookup correct for any row.
+    sort_distinct(&mut staged);
+    sort_distinct(&mut touched);
     Ok(EventMarker::from_parts(EventMarkerData {
         version,
-        attempt,
+        stage,
         event,
         staged,
         clears,
@@ -216,6 +219,13 @@ pub(in crate::state) fn decode_marker_payload(
         evidence_ttl: ttl,
         dedup,
     }))
+}
+
+/// Sorts `items` ascending and removes duplicates. A sorted input costs one
+/// linear pass.
+fn sort_distinct<T: Ord>(items: &mut Vec<T>) {
+    items.sort_unstable();
+    items.dedup();
 }
 
 /// A `usize` length as the `u32` wire prefix, or

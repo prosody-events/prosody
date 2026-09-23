@@ -1,6 +1,6 @@
 use super::*;
 use crate::state::cell::Values;
-use crate::state::marker::{AttemptId, EventEvidence};
+use crate::state::marker::{EventEvidence, StageId};
 use crate::state::store::CellRead;
 use crate::state::tests::support::evidence;
 use crate::state::tests::support::listed;
@@ -28,7 +28,7 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
         cell.clone(),
         ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(1)),
     )];
-    let marker = EventMarker::frozen(event(1), &writes, &[], &evidence([].into(), None));
+    let marker = EventMarker::frozen(event(1), &writes, Vec::new(), &evidence([].into(), None));
     store
         .write_provisional(&c, listed(&marker, &writes)?)
         .await?;
@@ -84,7 +84,7 @@ fn marker_rows_carry_evidence_ttl() {
             let marker = EventMarker::frozen(
                 event(1),
                 &writes,
-                &clears,
+                clears.clone(),
                 &EventEvidence {
                     touched: [
                         (c.id().state_type(), c.id().name().clone()),
@@ -93,7 +93,7 @@ fn marker_rows_carry_evidence_ttl() {
                     .into(),
                     evidence_ttl: floor,
                     dedup: None,
-                    attempt: AttemptId::new(),
+                    stage: StageId::new(),
                 },
             );
             for collection in [&c, &sibling] {

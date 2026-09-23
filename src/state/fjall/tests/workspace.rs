@@ -11,11 +11,10 @@ use super::*;
 /// — and silently deletes the cache partition the moment the dropped
 /// workspace's `Drop` runs. The cache is a hint over the durable lower store,
 /// so that degrades every op to a backing read with no other test failing. We
-/// move the
-/// workspace in with no other binding to it and confirm — through the keyspace,
-/// the only channel a `Drop` side-effect is observable on — that the partition
-/// is still live after construction. A discarding `for_workspace` would show
-/// zero.
+/// move the workspace in with no other binding to it and confirm — through the
+/// keyspace, the only channel a `Drop` side-effect is observable on — that the
+/// partition is still live after construction. A discarding `for_workspace`
+/// would show zero.
 #[test]
 fn for_workspace_retains_the_workspace() -> Result<()> {
     let dir = tempfile::tempdir()?;

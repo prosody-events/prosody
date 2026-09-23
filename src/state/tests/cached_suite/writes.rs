@@ -217,7 +217,8 @@ fn scan_resolution_is_read_only() -> Result<()> {
             cell_at(4),
             ProvisionalWrite::new(None, Committed::new(Some(bytes(1))), prior_event),
         )];
-        let marker = EventMarker::frozen(prior_event, &writes, &[], &evidence([].into(), None));
+        let marker =
+            EventMarker::frozen(prior_event, &writes, Vec::new(), &evidence([].into(), None));
         lower
             .write_provisional(&cref, listed(&marker, &writes)?)
             .await?;

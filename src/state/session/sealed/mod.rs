@@ -1,11 +1,15 @@
-use super::{
-    AdmissionChecks, CellStore, CollectionRef, Duration, Future, MarkerWrite, RepinProof,
-    STATE_FANOUT_CONCURRENCY, StateAccessError, StepOutcome, Uuid, resolve_collections, retry_step,
-};
+use super::stage::{abort_collections, resolve_collections};
+use crate::Key;
+use crate::consumer::middleware::{MarkerWrite, RepinProof};
+use crate::state::access::StateAccessError;
+use crate::state::backend::AdmissionChecks;
+use crate::state::identity::CollectionRef;
 use crate::state::marker::FrozenStage;
-use futures::{StreamExt, stream};
-use tokio::task::coop::cooperative;
+use crate::state::store::CellStore;
+use smallvec::SmallVec;
+use std::future::Future;
 use tracing::{error, warn};
+use uuid::Uuid;
 
 mod gate;
 
@@ -60,7 +64,7 @@ pub struct Staged<S: CellStore, K: AdmissionChecks> {
     pub(super) store: S,
     pub(super) collections: Vec<StagedCollection>,
     pub(super) checks: K,
-    pub(super) key: crate::Key,
+    pub(super) key: Key,
 }
 
 /// The promote result retains rejected collections for rollback.
@@ -94,30 +98,14 @@ impl<S: CellStore, K: AdmissionChecks> Staged<S, K> {
     /// Restores the rejected collections before the boundary commits the
     /// source.
     pub(crate) async fn abort(self, shutdown: impl Fn() -> bool + Sync) -> bool {
-        let names: smallvec::SmallVec<[&str; 8]> = self
+        let names: SmallVec<[&str; 8]> = self
             .collections
             .iter()
             .map(|staged| staged.collection.id().name().as_str())
             .collect();
         error!(key = %self.key, collections = ?names,
             "promote rejected collections; restore committed state");
-        let complete = stream::iter(0..self.collections.len())
-            .map(|index| {
-                let staged = &self.collections[index];
-                cooperative(async {
-                    !matches!(
-                        retry_step(&shutdown, "keyed-state rollback", || {
-                            self.store
-                                .abort_provisional(&staged.collection, staged.stage.writes())
-                        })
-                        .await,
-                        StepOutcome::Abandon
-                    )
-                })
-            })
-            .buffer_unordered(STATE_FANOUT_CONCURRENCY)
-            .fold(true, |all, done| async move { all && done })
-            .await;
+        let complete = abort_collections(&self.store, &self.collections, &shutdown).await;
         if let Err(error) = self.checks.unmark(&self.key).await {
             warn!(%error, key = %self.key, "cannot remove admission proof");
         }

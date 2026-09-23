@@ -9,7 +9,7 @@ use crate::state::tests::support::listed;
 /// override answers each position exactly as the sequential point-`get` oracle
 /// over an identically-seeded sibling collection — across duplicates, unknowns,
 /// absence, and provisional resolution. Runs directly on the bare store so the
-/// override (deduplication, input-order expansion, and resolution) is
+/// override (distinct fetch, per-position answers, and resolution) is
 /// exercised, not the `Cached` default.
 #[test]
 fn prop_cassandra_batch_read_parity() {
@@ -25,7 +25,8 @@ fn prop_cassandra_batch_read_parity() {
         .quickcheck(ModelProperty(|trace| TEST_RUNTIME.block_on(run(trace))));
 }
 
-/// Within-batch duplicate co-observation and input-order expansion.
+/// Within-batch duplicate co-observation: a repeated coordinate reuses its
+/// first answer.
 #[tokio::test]
 async fn cassandra_batch_duplicate_co_observation() -> Result<()> {
     init_test_logging();
@@ -102,7 +103,8 @@ async fn seed_prev_without_event_and_blob_without_encoding(
 /// must surface B's `BlobWithoutEncoding`, not A's `PrevWithoutEvent`,
 /// which the `IN` query returns first in clustering order. The corruptions are
 /// seeded by raw CQL (unreachable through the store verbs), and the sequential
-/// point `get`s confirm the two rows are distinguishable.
+/// point `get`s confirm the two rows are distinguishable. The standalone
+/// reader's batch read must surface the same error.
 #[tokio::test]
 async fn first_error_is_first_input_position() -> Result<()> {
     use super::CellCorruptReason;
@@ -165,138 +167,46 @@ async fn first_error_is_first_input_position() -> Result<()> {
         }
         other => return Err(eyre!("expected B's BlobWithoutEncoding, got {other:?}")),
     }
-    Ok(())
-}
 
-/// Shuffled rows decode in input order and report the first coordinate's error.
-/// A live query returns clustering order and cannot prove this rule.
-#[test]
-fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
-    use super::super::read::{decode_point, take_row};
-    use super::CellCorruptReason;
-    use super::decode::PointRow;
-    use super::encoding::{Encoding, encode_payload};
-    use crate::state::cell::Values;
-    use smallvec::SmallVec;
-
-    let prev_blob = encode_payload(&bytes(0xAA), Encoding::Zstd)?;
-    // event = None throughout, so no RawEventRef construction is needed.
-    let high_bytes = [0xBB];
-    let high: PointRow<Values> = (
-        Some(Bytes::copy_from_slice(&high_bytes)),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-    let low: PointRow<Values> = (
-        None,
-        Some(prev_blob),
-        Some(4_i16),
-        Some(1_i32),
-        None,
-        None,
-        None,
-    );
-    let high_coordinate = Coordinate::from_bytes(vec![0xFE]);
-    let low_coordinate = Coordinate::from_bytes(vec![0x01]);
-    let mut rows: CellBuffer<(Bytes, PointRow<Values>)> = SmallVec::new();
-    rows.push((Bytes::copy_from_slice(high_coordinate.as_bytes()), high));
-    rows.push((Bytes::copy_from_slice(low_coordinate.as_bytes()), low));
-    let decoded = [low_coordinate.as_bytes(), high_coordinate.as_bytes()]
-        .into_iter()
-        .map(|coordinate| {
-            take_row(&mut rows, coordinate)
-                .map(decode_point::<Values>)
-                .transpose()
-                .map(|cell| cell.map(|(cell, _)| cell))
-        })
-        .collect::<Result<CellBuffer<_>, CassandraCellStoreError>>();
-    match decoded {
-        Err(CassandraCellStoreError::CorruptCell(reason)) => assert_eq!(
-            reason,
-            CellCorruptReason::PrevWithoutEvent,
-            "the first coordinate's error must surface first"
-        ),
-        other => return Err(eyre!("expected PrevWithoutEvent, got {other:?}")),
+    // The standalone reader's batch read follows the same input order.
+    let resources = CassandraCellResources::new(fx.cassandra.clone(), fx.queries.clone());
+    match resources
+        .read_committed_many::<Values>(id, SECTIONS[0], &batch.as_ref())
+        .await
+    {
+        Err(CassandraCellStoreError::CorruptCell(reason)) => {
+            assert_eq!(
+                reason,
+                CellCorruptReason::BlobWithoutEncoding,
+                "the reader path surfaces the earliest input position's error"
+            );
+        }
+        other => return Err(eyre!("expected B's BlobWithoutEncoding, got {other:?}")),
     }
     Ok(())
 }
 
+/// `take_row` answers each coordinate with its own fetched row, or `None` when
+/// no row was fetched. Fetched rows arrive in any order, and each row answers
+/// once.
 #[test]
-fn borrowed_batch_matches_requested_coordinates() -> Result<()> {
-    use super::super::read::{decode_point, take_row};
-    use super::decode::PointRow;
-    use crate::state::cell::Values;
-    use smallvec::smallvec;
+fn prop_take_row_matches_coordinates() {
+    use super::super::read::take_row;
+    use std::collections::BTreeSet;
 
-    let low_data = [0x11];
-    let high_data = [0x33];
-    let row = |data: &[u8]| -> PointRow<Values> {
-        (
-            Some(Bytes::copy_from_slice(data)),
-            None,
-            Some(1_i16),
-            Some(1_i32),
-            None,
-            None,
-            None,
-        )
-    };
-    let low = Coordinate::from_bytes(vec![1]);
-    let absent = Coordinate::from_bytes(vec![2]);
-    let high = Coordinate::from_bytes(vec![3]);
-    let mut rows: CellBuffer<_> = smallvec![
-        (Bytes::copy_from_slice(high.as_bytes()), row(&high_data)),
-        (Bytes::copy_from_slice(low.as_bytes()), row(&low_data)),
-    ];
-
-    let decoded = [low.as_bytes(), absent.as_bytes(), high.as_bytes()]
-        .into_iter()
-        .map(|coordinate| {
-            take_row(&mut rows, coordinate)
-                .map(decode_point::<Values>)
-                .transpose()
-                .map(|cell| cell.map(|(cell, _)| cell))
-        })
-        .collect::<Result<CellBuffer<_>, CassandraCellStoreError>>()?;
-    assert_eq!(decoded.len(), 3);
-    assert_eq!(
-        decoded[0]
-            .as_ref()
-            .and_then(|cell| cell.project_committed())
-            .map(Bytes::as_ref),
-        Some(&low_data[..])
-    );
-    assert!(decoded[1].is_none());
-    assert_eq!(
-        decoded[2]
-            .as_ref()
-            .and_then(|cell| cell.project_committed())
-            .map(Bytes::as_ref),
-        Some(&high_data[..])
-    );
-    Ok(())
-}
-
-#[test]
-fn provisional_batch_coordinates_are_sorted_and_distinct() -> Result<()> {
-    let batch = CoordinateBatch::chunks(
-        [0xFE_u8, 0x01, 0x80, 0x01].map(|byte| Coordinate::from_bytes(vec![byte])),
-    )
-    .next()
-    .ok_or_else(|| eyre!("non-empty input must yield one batch"))?;
-    let coordinates = sorted_unique_coordinates(&batch);
-    assert_eq!(
-        coordinates
+    fn property(mut present: BTreeSet<u8>, shuffle: u8, requests: Vec<u8>) -> bool {
+        // Multiplying by an odd factor permutes the byte values.
+        let mut rows: CellBuffer<(Bytes, u8)> = present
             .iter()
-            .map(|coordinate| coordinate.as_bytes())
-            .collect::<Vec<_>>(),
-        vec![&[0x01_u8][..], &[0x80_u8][..], &[0xFE_u8][..]]
-    );
-    Ok(())
+            .map(|&coordinate| (Bytes::copy_from_slice(&[coordinate]), coordinate))
+            .collect();
+        rows.sort_by_key(|&(_, coordinate)| coordinate.wrapping_mul(shuffle | 1));
+        requests.into_iter().all(|coordinate| {
+            let expected = present.remove(&coordinate).then_some(coordinate);
+            take_row(&mut rows, &[coordinate]) == expected
+        })
+    }
+    QuickCheck::new().quickcheck(property as fn(BTreeSet<u8>, u8, Vec<u8>) -> bool);
 }
 
 /// Recovery validates resolved row metadata before it skips unused blobs.
@@ -346,7 +256,7 @@ async fn cassandra_raw_batch_is_one_query() -> Result<()> {
             ProvisionalWrite::new(Some(bytes(b * 10)), prev, staging),
         ));
     }
-    let marker = EventMarker::frozen(staging, &writes, &[], &evidence([].into(), None));
+    let marker = EventMarker::frozen(staging, &writes, Vec::new(), &evidence([].into(), None));
     seed.write_provisional(&c, listed(&marker, &writes)?)
         .await?;
 
@@ -393,9 +303,8 @@ fn prop_cassandra_raw_batch_parity() {
         .quickcheck(ModelProperty(|trace| TEST_RUNTIME.block_on(run(trace))));
 }
 
-/// Ascending-output test over the live store. The sort requirement is also
-/// verified by `borrowed_batch_decodes_in_resolution_order` and
-/// `provisional_batch_coordinates_are_sorted_and_distinct`.
+/// Ascending-output test over the live store. `prop_batch_coordinate_sets`
+/// covers the sorted coordinate list that the read binds.
 #[tokio::test]
 async fn cassandra_raw_batch_ascending_output() -> Result<()> {
     init_test_logging();

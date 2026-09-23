@@ -117,7 +117,8 @@ impl Replay {
             .then(|| SectionClear::frozen(SECTION, &staged))
             .into_iter()
             .collect();
-        let marker = EventMarker::frozen(event, &staged, &clears, &evidence([].into(), None));
+        let marker =
+            EventMarker::frozen(event, &staged, clears.clone(), &evidence([].into(), None));
         self.subject
             .write_provisional(&self.cref, listed(&marker, &staged)?)
             .await

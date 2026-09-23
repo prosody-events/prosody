@@ -55,8 +55,8 @@ use workspace::Inner;
 pub(crate) use workspace::{FjallClient, FjallWorkspace};
 
 use crate::state::CollectionId;
-use crate::state::cell::{Committed, Projection, ProvisionalWrite, Read, Values};
-use crate::state::store_types::Durable;
+use crate::state::cell::{Committed, Projection, ProvisionalWrite, Values};
+use crate::state::store::Durable;
 use bytes::Bytes;
 use educe::Educe;
 use fjall::Slice;
@@ -66,7 +66,6 @@ use smallvec::SmallVec;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::spawn_blocking;
-use tracing::warn;
 
 /// The four-state result of a [`FjallCellCache::get`].
 #[derive(Clone, Debug)]
@@ -230,18 +229,7 @@ impl FjallCellCache {
         #[cfg(test)]
         self.faults.read()?;
         let raw = io::read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
-        let (expiry, entry) = match codec::decode_frame(raw.as_deref()) {
-            Ok(frame) => frame,
-            Err(error) => {
-                warn!(%error, "cell cache frame does not decode");
-                return Ok(CacheRead::Corrupt);
-            }
-        };
-        Ok(io::classify::<P>(
-            expiry,
-            entry.map_or(Read::Unknown, P::from_cached),
-            self.clock.now_ms(),
-        ))
+        Ok(io::probe::<P>(raw.as_deref(), self.clock.now_ms()))
     }
 
     /// Probes every coordinate in one blocking call and returns one result per
@@ -255,23 +243,10 @@ impl FjallCellCache {
     ) -> Result<CellBuffer<CacheRead<P>>, FjallCellCacheError> {
         let raws = self.read_batch(collection, section, batch).await?;
         let now = self.clock.now_ms();
-        let mut reads = CellBuffer::with_capacity(raws.len());
-        for raw in raws {
-            let (expiry, entry) = match codec::decode_frame(raw.as_deref()) {
-                Ok(frame) => frame,
-                Err(error) => {
-                    warn!(%error, "cell cache frame does not decode");
-                    reads.push(CacheRead::Corrupt);
-                    continue;
-                }
-            };
-            reads.push(io::classify::<P>(
-                expiry,
-                entry.map_or(Read::Unknown, P::from_cached),
-                now,
-            ));
-        }
-        Ok(reads)
+        Ok(raws
+            .iter()
+            .map(|raw| io::probe::<P>(raw.as_deref(), now))
+            .collect())
     }
 
     async fn read_batch(
@@ -428,21 +403,20 @@ impl FjallCellCache {
         Ok(())
     }
 
-    /// Deletes a batch of committed cell entries in one atomic
-    /// [`OwnedWriteBatch`](fjall::OwnedWriteBatch) — the must-succeed repair
-    /// primitive (keys built at exact size). Idempotent: removing an absent
-    /// key is a no-op.
-    pub(crate) async fn delete_batch(
+    /// Deletes the committed entries of `cells` in one atomic
+    /// [`OwnedWriteBatch`](fjall::OwnedWriteBatch). Repairs depend on this
+    /// delete. Deleting an absent entry does nothing, so a retry is safe.
+    pub(crate) async fn delete_batch<'a>(
         &self,
         collection: &CollectionId,
-        cells: &[CellKey],
+        cells: impl IntoIterator<Item = CellRef<'a>>,
     ) -> Result<(), FjallCellCacheError> {
         #[cfg(test)]
         self.faults.delete()?;
-        let mut keys: CellBuffer<SmallVec<[u8; 32]>> = SmallVec::with_capacity(cells.len());
-        for cell in cells {
-            keys.push(codec::cell_key(collection, cell.as_ref()));
-        }
+        let keys: CellBuffer<SmallVec<[u8; 32]>> = cells
+            .into_iter()
+            .map(|cell| codec::cell_key(collection, cell))
+            .collect();
         let handle = self.inner.handle().clone();
         let capacity = keys.len();
         io::run_batch(
@@ -473,17 +447,17 @@ impl FjallCellCache {
     /// the same form that the scan returns.
     /// A hash set gives expected O(1) work per scanned key and O(|exclude| +
     /// one hop) memory.
-    pub(crate) async fn delete_section(
+    pub(crate) async fn delete_section<'a>(
         &self,
         collection: &CollectionId,
         section: Section,
-        exclude: &[CellKey],
+        exclude: impl IntoIterator<Item = CellRef<'a>>,
     ) -> Result<(), FjallCellCacheError> {
         #[cfg(test)]
         self.faults.delete()?;
         let excluded = exclude
-            .iter()
-            .map(|cell| codec::cell_key(collection, cell.as_ref()))
+            .into_iter()
+            .map(|cell| codec::cell_key(collection, cell))
             .collect();
         io::delete_section(
             self.inner.database().clone(),
