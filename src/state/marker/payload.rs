@@ -1,6 +1,6 @@
 //! The frozen wire payload of the Staged and Committed marker rows.
 
-use super::{EventMarker, EventMarkerData, MarkerVersion, SectionClear, StageId};
+use super::{EventMarker, EventMarkerData, MarkerVersion, SectionClear, StageId, sort_distinct};
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
@@ -219,13 +219,6 @@ pub(in crate::state) fn decode_marker_payload(
         evidence_ttl: ttl,
         dedup,
     }))
-}
-
-/// Sorts `items` ascending and removes duplicates. A sorted input costs one
-/// linear pass.
-fn sort_distinct<T: Ord>(items: &mut Vec<T>) {
-    items.sort_unstable();
-    items.dedup();
 }
 
 /// A `usize` length as the `u32` wire prefix, or

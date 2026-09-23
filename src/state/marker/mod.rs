@@ -230,8 +230,7 @@ impl SectionClear {
 
     /// The shared survivor-definition tail: ascending, deduped.
     fn from_survivors(section: Section, mut survivors: Vec<Coordinate>) -> Self {
-        survivors.sort_unstable();
-        survivors.dedup();
+        sort_distinct(&mut survivors);
         Self { section, survivors }
     }
 
@@ -276,9 +275,8 @@ struct EventMarkerData {
 
 impl EventMarker {
     /// Freezes the marker for `event` from its staged cells and cleared
-    /// sections. The staged coordinate list is sorted by `(section,
-    /// coordinate)` for a deterministic payload; an event stages each cell at
-    /// most once, so no dedup is required.
+    /// sections. The staged list is sorted by `(section, coordinate)` and
+    /// distinct, as the decoder makes it, so a payload round trip is exact.
     #[must_use]
     pub(in crate::state) fn frozen(
         event: EventRef,
@@ -287,7 +285,7 @@ impl EventMarker {
         evidence: &EventEvidence,
     ) -> Self {
         let mut coordinates: Vec<CellKey> = staged.iter().map(|(cell, _)| cell.clone()).collect();
-        coordinates.sort_unstable();
+        sort_distinct(&mut coordinates);
         Self::from_parts(EventMarkerData {
             version: MarkerVersion::V2,
             stage: evidence.stage,
@@ -373,4 +371,11 @@ pub(crate) struct EventEvidence {
     pub(crate) touched: Arc<[(StateType, StateName)]>,
     pub(crate) evidence_ttl: CompactDuration,
     pub(crate) dedup: Option<Uuid>,
+}
+
+/// Sorts `items` ascending and removes duplicates. A sorted input costs one
+/// linear pass.
+fn sort_distinct<T: Ord>(items: &mut Vec<T>) {
+    items.sort_unstable();
+    items.dedup();
 }
