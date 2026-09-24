@@ -1,8 +1,9 @@
 use super::*;
 use crate::state::cell::Values;
-use crate::state::marker::{AttemptId, EventEvidence};
+use crate::state::marker::{EventEvidence, StageId};
 use crate::state::store::CellRead;
 use crate::state::tests::support::evidence;
+use crate::state::tests::support::listed;
 use crate::timers::duration::CompactDuration;
 
 /// An uncommitted clear reads prev with the provisional row's finite expiry.
@@ -27,10 +28,12 @@ async fn rolled_back_staged_clear_reports_finite_co_expiry() -> Result<()> {
         cell.clone(),
         ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(1)),
     )];
-    let marker = EventMarker::frozen(event(1), &writes, &[], &evidence([].into(), None));
-    store.write_provisional(&c, &writes, Some(&marker)).await?;
+    let marker = EventMarker::frozen(event(1), &writes, Vec::new(), &evidence([].into(), None));
+    store
+        .write_provisional(&c, listed(&marker, &writes)?)
+        .await?;
 
-    let (committed, co_expiry) = CellRead::<Values>::read(&store, c.id(), &cell).await?;
+    let (committed, co_expiry) = CellRead::<Values>::read(&store, c.id(), cell.as_ref()).await?;
     assert_eq!(
         committed.into_inner().as_ref(),
         Some(&old),
@@ -81,7 +84,7 @@ fn marker_rows_carry_evidence_ttl() {
             let marker = EventMarker::frozen(
                 event(1),
                 &writes,
-                &clears,
+                clears.clone(),
                 &EventEvidence {
                     touched: [
                         (c.id().state_type(), c.id().name().clone()),
@@ -90,12 +93,12 @@ fn marker_rows_carry_evidence_ttl() {
                     .into(),
                     evidence_ttl: floor,
                     dedup: None,
-                    attempt: AttemptId::new(),
+                    stage: StageId::new(),
                 },
             );
             for collection in [&c, &sibling] {
                 store
-                    .write_provisional(collection, &writes, Some(&marker))
+                    .write_provisional(collection, listed(&marker, &writes)?)
                     .await?;
                 for (coordinate, column, expected) in [
                     (&[][..], "data", collection.ttl()),

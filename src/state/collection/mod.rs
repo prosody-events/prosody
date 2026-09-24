@@ -395,7 +395,7 @@ pub(crate) use commands::{CollectionRead, CollectionWrite, sealed_ops};
 pub(in crate::state) fn resolve_cell<'a, S, T>(
     session: &'a S,
     bytes: Bytes,
-) -> impl Future<Output = Result<ResolvedOf<T>, CellStateError<CellCodecError<T>>>> + Send + 'a
+) -> impl Future<Output = Result<ResolvedOf<T>, CellStateError<CellCodecError<T>>>> + Send + use<'a, S, T>
 where
     S: StateSession,
     T: CellType,

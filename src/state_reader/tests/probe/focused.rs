@@ -29,11 +29,8 @@ async fn scan_midstream_error_propagates() -> Result<()> {
     env.publish(GROUP_A, tp_a).await;
 
     let reader = env.reader_eager()?;
-    let items: Vec<Result<Value, StateReaderError>> = reader
-        .stream(key, Direction::Forward)
-        .await?
-        .collect::<Vec<_>>()
-        .await;
+    let items: Vec<Result<Value, StateReaderError>> =
+        reader.values(key).stream().collect::<Vec<_>>().await;
     // Five yielded prefix elements, then an error terminates the stream.
     assert_eq!(items.len(), 6, "five-element prefix + terminating error");
     assert!(items[..5].iter().all(Result::is_ok), "prefix yielded");
@@ -68,43 +65,6 @@ async fn get_many_error_beats_all_none() -> Result<()> {
     match reader.get_many(key, &[0, 1]).await {
         Err(error) if error.classify_error() == ErrorCategory::Transient => Ok(()),
         other => bail!("expected a Transient store error, got {other:?}"),
-    }
-}
-
-/// A source that violates its contract answers a batch read with fewer values
-/// than requested. The uncached batch path checks that alignment in every
-/// build. The read fails instead of zipping the short buffer into a misaligned
-/// answer. `CommittedCellSource` is a downstream trait, so a debug assertion
-/// cannot hold this line in a release build.
-///
-/// Falsify: remove the length check from the uncached arm of `cached_batch`.
-/// `get_many` then answers a two-cell batch with one value.
-#[tokio::test]
-async fn short_batch_buffer_fails_the_uncached_read() -> Result<()> {
-    let env = ScriptedEnv::new(map_state::<I64KeyCodec, JsonCodec>("m-short-batch"))?;
-    let key = Key::from("user-1");
-    let tp_a = topic("topic-a");
-
-    env.commit(GROUP_A, tp_a, &key, 1, |h| async move {
-        h.set(&0, Value::from("A0"))
-            .await
-            .map_err(|e| eyre!("set: {e}"))
-    })
-    .await?;
-    env.publish(GROUP_A, tp_a).await;
-    // Arm the fault after seeding: `commit` writes through the same source.
-    env.fault(GROUP_A, tp_a, &key, FaultPoint::ShortBatch)?;
-    let reader = env.reader_eager()?;
-
-    match reader.get_many(key, &[0, 1]).await {
-        Err(error) if error.classify_error() == ErrorCategory::Permanent => {
-            assert!(
-                error.to_string().contains("batch read returned 1 values"),
-                "expected the alignment error, got {error}"
-            );
-            Ok(())
-        }
-        other => bail!("expected a Permanent alignment error, got {other:?}"),
     }
 }
 
@@ -192,8 +152,8 @@ async fn scan_reads_only_pinned_source() -> Result<()> {
     let reader = env.reader_eager()?;
 
     let scanned: Vec<Value> = reader
-        .stream(key, Direction::Forward)
-        .await?
+        .values(key)
+        .stream()
         .collect::<Vec<_>>()
         .await
         .into_iter()

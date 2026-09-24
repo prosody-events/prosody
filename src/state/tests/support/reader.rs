@@ -1,7 +1,8 @@
 use crate::state::cell::{Committed, Presence, ProvisionalWrite, Values};
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::store::{CellStore, CoordinateBatch};
+use crate::state::tests::support::listed;
 use crate::state::tests::support::{evidence, evidence_only, probe};
 use crate::state::{CollectionId, CollectionRef, StateKey, StateName, StateType};
 use crate::state_reader::CommittedCellSource;
@@ -9,6 +10,7 @@ use bytes::Bytes;
 use color_eyre::{Report, Result};
 use futures::future::try_join_all;
 use futures::{TryStreamExt, join, try_join};
+use std::ops::Bound;
 
 /// Checks value and presence projections before the owner removes residue.
 pub(crate) async fn reader_residue<
@@ -62,14 +64,19 @@ pub(crate) async fn reader_residue<
         .map(|id| (id.state_type(), id.name().clone()))
         .to_vec();
     touched.sort_unstable();
-    let marker = EventMarker::frozen(event, &writes, &clears, &evidence(touched.into(), None));
+    let marker = EventMarker::frozen(
+        event,
+        &writes,
+        clears.clone(),
+        &evidence(touched.into(), None),
+    );
     if committed {
         let anchor = CollectionRef::new(if other { remote } else { id.clone() }, None);
         let evidence = evidence_only(&marker);
         store.commit_provisional(&anchor, &evidence, &[]).await?;
     }
     store
-        .write_provisional(&collection, &writes, Some(&marker))
+        .write_provisional(&collection, listed(&marker, &writes)?)
         .await?;
     let expected = if committed {
         [Some(next), None, (!clear).then_some(base.clone())]
@@ -93,7 +100,7 @@ async fn check_residue<R: CommittedCellSource<Values> + CommittedCellSource<Pres
     let points = async {
         let matches = try_join_all(cells.iter().zip(expected).map(|(cell, expected)| async {
             Ok::<_, Report>(
-                CommittedCellSource::<Values>::load(source, id, cell).await? == *expected,
+                CommittedCellSource::<Values>::load(source, id, cell.as_ref()).await? == *expected,
             )
         }))
         .await?;
@@ -102,13 +109,13 @@ async fn check_residue<R: CommittedCellSource<Values> + CommittedCellSource<Pres
     let batches = async {
         let expected_presence = expected.each_ref().map(|value| value.as_ref().map(|_| ()));
         for batch in CoordinateBatch::chunks(cells.iter().map(|cell| cell.coordinate.clone())) {
+            let borrowed = batch.as_ref();
             let (values, presence) = join!(
-                CommittedCellSource::<Values>::load_many(source, id, section, &batch),
-                CommittedCellSource::<Presence>::load_many(source, id, section, &batch),
+                CommittedCellSource::<Values>::load_many(source, id, section, &borrowed),
+                CommittedCellSource::<Presence>::load_many(source, id, section, &borrowed),
             );
             let (values, presence) = (values?, presence?);
-            if values.as_slice() != expected.as_slice() || presence.as_slice() != expected_presence
-            {
+            if *values != *expected.as_slice() || *presence != expected_presence {
                 return Ok(false);
             }
         }
@@ -119,8 +126,8 @@ async fn check_residue<R: CommittedCellSource<Values> + CommittedCellSource<Pres
             |dir| async move {
                 let scan = Scan {
                     section,
-                    start: ScanEdge::Unbounded,
-                    end: ScanEdge::Unbounded,
+                    start: Bound::Unbounded,
+                    end: Bound::Unbounded,
                     dir,
                     fetch_hint: None,
                 };

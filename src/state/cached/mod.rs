@@ -38,20 +38,17 @@
 //! seconds.
 
 pub(crate) mod metrics;
+mod read;
+mod store;
 
-use self::metrics::{CacheResult, CellMetrics, Source};
-use super::cell::{Committed, Projection, ProvisionalCell, ProvisionalWrite, Values};
-use super::cell_key::{CellKey, Coordinate, Scan, Section};
-use super::fjall::{CacheRead, FjallCellCache, FjallCellCacheError};
+use self::metrics::CellMetrics;
+use super::cell::{Committed, Values};
+use super::cell_key::CellKey;
+use super::fjall::{FjallCellCache, FjallCellCacheError};
 use super::identity::{CollectionId, CollectionRef};
-use super::marker::{EventMarker, MarkerState, SectionClear};
-use super::store::{
-    CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable,
-};
+use super::marker::EventMarker;
+use super::store::CellBackend;
 use crate::timers::duration::CompactDuration;
-use bytes::Bytes;
-use futures::Stream;
-use quanta::Instant;
 use std::future::Future;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -111,12 +108,13 @@ impl<L> Cached<L> {
     /// A failed removal disables the cache.
     async fn evict_marker_cache_entries(&self, collection: &CollectionId, marker: &EventMarker) {
         retry_delete(&self.fjall, "marker staged", || {
-            self.fjall.delete_batch(collection, marker.staged())
+            self.fjall
+                .delete_batch(collection, marker.staged().iter().map(CellKey::as_ref))
         })
         .await;
         for clear in marker.clears() {
             retry_delete(&self.fjall, "marker section", || {
-                self.fjall.delete_section(collection, clear.section(), &[])
+                self.fjall.delete_section(collection, clear.section(), [])
             })
             .await;
         }
@@ -126,7 +124,7 @@ impl<L> Cached<L> {
     /// `lower.write` (establish-then-publish) in **one** atomic fjall batch
     /// ([`FjallCellCache::put_batch`]). `stamped_at` is a clock reading taken
     /// **before** the lower write; [`expiry_at`] floors it to match
-    /// Cassandra's TTL resolution (see the module's TTL co-expiry doc). The
+    /// Cassandra's TTL resolution. The
     /// collection's write TTL is the full TTL (the value was just written).
     /// `project` computes each cell's committed projection from its batch
     /// entry.
@@ -148,18 +146,16 @@ impl<L> Cached<L> {
         // instead of N.
         let projected = cells
             .iter()
-            .map(|(cell, value)| (cell.clone(), project(value), expiry));
+            .map(|(cell, value)| (cell.as_ref(), project(value), expiry));
         if let Err(error) = self
             .fjall
             .put_batch::<Values>(collection.id(), projected)
             .await
         {
             warn_skip("publish", &error);
-            // failed-publish cache guard repair: rebuild the delete keys from the `cells`
-            // param.
-            let keys: CellBuffer<CellKey> = cells.iter().map(|(cell, _)| cell.clone()).collect();
             retry_delete(&self.fjall, "publish repair", || {
-                self.fjall.delete_batch(collection.id(), &keys)
+                self.fjall
+                    .delete_batch(collection.id(), cells.iter().map(|(cell, _)| cell.as_ref()))
             })
             .await;
         }
@@ -186,378 +182,6 @@ impl Drop for PromoteCacheGuard<'_> {
 
 impl<L: CellBackend> CellBackend for Cached<L> {
     type Error = L::Error;
-}
-
-impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
-    async fn read<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        cell: &'a CellKey,
-    ) -> Result<Durable<P>, Self::Error> {
-        let started = Instant::now();
-        if self.fjall.is_disabled() {
-            let loaded = CellRead::<P>::read(&self.lower, collection, cell).await;
-            self.metrics.point(
-                P::NAME,
-                started,
-                Source::Store,
-                CacheResult::Disabled,
-                &loaded,
-            );
-            return loaded;
-        }
-        let cache_result = match self.fjall.get::<P>(collection, cell).await {
-            Ok(CacheRead::Hit(hit)) => {
-                let loaded = Ok(hit);
-                self.metrics
-                    .point(P::NAME, started, Source::Cache, CacheResult::Hit, &loaded);
-                return loaded;
-            }
-            Ok(CacheRead::Miss) => CacheResult::Miss,
-            Ok(CacheRead::Expired) => CacheResult::Expired,
-            Ok(CacheRead::Corrupt) => {
-                self.metrics.cache_error("get", "lookup");
-                CacheResult::Error
-            }
-            Err(error) => {
-                warn_skip("read", &error);
-                self.metrics.cache_error("get", "lookup");
-                let loaded = CellRead::<P>::read(&self.lower, collection, cell).await;
-                self.metrics
-                    .point(P::NAME, started, Source::Store, CacheResult::Error, &loaded);
-                return loaded;
-            }
-        };
-        let stamped_at = self.fjall.clock().now_ms();
-        let loaded = async {
-            let (committed, remaining) = CellRead::<P>::read(&self.lower, collection, cell).await?;
-            if let Err(error) = self
-                .fjall
-                .put::<P>(
-                    collection,
-                    cell,
-                    committed.clone(),
-                    expiry_at(stamped_at, remaining),
-                )
-                .await
-            {
-                warn_skip("populate", &error);
-                self.metrics.cache_error("get", "fill");
-            }
-            Ok((committed, remaining))
-        }
-        .await;
-        self.metrics
-            .point(P::NAME, started, Source::Store, cache_result, &loaded);
-        loaded
-    }
-
-    /// Reads the whole lower batch after any miss and publishes only probe
-    /// misses. Partial refetch requires a benchmark before it can replace
-    /// this rule.
-    async fn read_many<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> Result<CacheBatch<P>, Self::Error> {
-        let started = Instant::now();
-        if self.fjall.is_disabled() {
-            let loaded = CellRead::<P>::read_many(&self.lower, collection, section, batch).await;
-            self.metrics.batch(
-                batch.len(),
-                P::NAME,
-                started,
-                Source::Store,
-                CacheResult::Disabled,
-                &loaded,
-            );
-            return loaded;
-        }
-        let probes = match self.fjall.get_batch::<P>(collection, section, batch).await {
-            Ok(probes) => {
-                let hits: Option<CacheBatch<P>> = probes
-                    .iter()
-                    .map(|probe| match probe {
-                        CacheRead::Hit(hit) => Some(hit.clone()),
-                        CacheRead::Miss | CacheRead::Expired | CacheRead::Corrupt => None,
-                    })
-                    .collect();
-                if let Some(hits) = hits {
-                    let loaded = Ok(hits);
-                    self.metrics.batch(
-                        batch.len(),
-                        P::NAME,
-                        started,
-                        Source::Cache,
-                        CacheResult::Hit,
-                        &loaded,
-                    );
-                    return loaded;
-                }
-                probes
-            }
-            Err(error) => {
-                warn_skip("read batch", &error);
-                self.metrics.cache_error("get_many", "lookup");
-                let loaded =
-                    CellRead::<P>::read_many(&self.lower, collection, section, batch).await;
-                self.metrics.batch(
-                    batch.len(),
-                    P::NAME,
-                    started,
-                    Source::Store,
-                    CacheResult::Error,
-                    &loaded,
-                );
-                return loaded;
-            }
-        };
-        let stamped_at = self.fjall.clock().now_ms();
-        let loaded = async {
-            let filled = CellRead::<P>::read_many(&self.lower, collection, section, batch).await?;
-            let projected = batch
-                .iter()
-                .zip(&filled)
-                .enumerate()
-                .filter(|(i, _)| !matches!(probes.get(*i), Some(CacheRead::Hit(_))))
-                .map(|(_, (coordinate, (committed, remaining)))| {
-                    (
-                        CellKey {
-                            section,
-                            coordinate: coordinate.clone(),
-                        },
-                        committed.clone(),
-                        expiry_at(stamped_at, *remaining),
-                    )
-                });
-            if let Err(error) = self.fjall.put_batch::<P>(collection, projected).await {
-                warn_skip("populate batch", &error);
-                self.metrics.cache_error("get_many", "fill");
-            }
-            Ok(filled)
-        }
-        .await;
-        self.metrics.batch(
-            batch.len(),
-            P::NAME,
-            started,
-            Source::Store,
-            CacheResult::NotAllHit,
-            &loaded,
-        );
-        loaded
-    }
-
-    fn scan<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
-        CellRead::<P>::scan(&self.lower, collection, scan)
-    }
-}
-
-impl<L: CellStore> CellStore for Cached<L> {
-    async fn provisional_cell_at<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        cell: &'a CellKey,
-    ) -> Result<Option<ProvisionalCell>, Self::Error> {
-        // A pure lower read — no fjall step, so no cache-disabled branch is needed.
-        self.lower.provisional_cell_at(collection, cell).await
-    }
-
-    fn provisional_many<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-        section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
-    {
-        // A raw provisional read the committed-value cache cannot answer, so
-        // delegate straight to the lower store — no fjall step, no cache-disabled
-        // branch (like `provisional_cell_at`). Nothing is published into the
-        // cache.
-        self.lower.provisional_many(collection, section, batch)
-    }
-
-    async fn write_provisional<'a>(
-        &'a self,
-        collection: &'a CollectionRef,
-        writes: &'a [(CellKey, ProvisionalWrite)],
-        marker: Option<&'a EventMarker>,
-    ) -> Result<(), Self::Error> {
-        // A disabled cache delegates the write to the lower store.
-        if self.fjall.is_disabled() {
-            return self
-                .lower
-                .write_provisional(collection, writes, marker)
-                .await;
-        }
-        let stamped_at = self.fjall.clock().now_ms();
-        self.lower
-            .write_provisional(collection, writes, marker)
-            .await?;
-        // The committed value stays `prev` while the cell is provisional
-        // (commit/abort republishes), so publish `prev` — never the in-flight
-        // `data`.
-        self.publish_written(collection, writes, stamped_at, |write| {
-            Committed::new(write.prev().cloned())
-        })
-        .await;
-        Ok(())
-    }
-
-    async fn write_resolved<'a>(
-        &'a self,
-        collection: &'a CollectionRef,
-        cells: &'a [(CellKey, Option<Bytes>)],
-        clears: &'a [SectionClear],
-    ) -> Result<(), Self::Error> {
-        if self.fjall.is_disabled() {
-            return self.lower.write_resolved(collection, cells, clears).await;
-        }
-        // Remove each cleared section before the lower write.
-        // A failed lower write leaves the section uncached.
-        for clear in clears {
-            retry_delete(&self.fjall, "clear section", || {
-                self.fjall
-                    .delete_section(collection.id(), clear.section(), &[])
-            })
-            .await;
-        }
-        // Remove old entries before the durable write.
-        // Cancellation can then leave entries absent, but never stale.
-        // Publish the new values only after the durable write succeeds.
-        let cell_keys: CellBuffer<CellKey> = cells.iter().map(|(cell, _)| cell.clone()).collect();
-        retry_delete(&self.fjall, "resolved cells", || {
-            self.fjall.delete_batch(collection.id(), &cell_keys)
-        })
-        .await;
-        // Pre-write anchor, establish-first — see `write_provisional`.
-        let stamped_at = self.fjall.clock().now_ms();
-        self.lower.write_resolved(collection, cells, clears).await?;
-        self.publish_written(collection, cells, stamped_at, |data| {
-            Committed::new(data.clone())
-        })
-        .await;
-        Ok(())
-    }
-
-    async fn mark_resolved<'a>(
-        &'a self,
-        collection: &'a CollectionRef,
-        cells: &'a [CellKey],
-    ) -> Result<(), Self::Error> {
-        if self.fjall.is_disabled() {
-            return self.lower.mark_resolved(collection, cells).await;
-        }
-        // The keys do not contain the new committed values.
-        // Remove their old entries before the durable promotion.
-        retry_delete(&self.fjall, "promote", || {
-            self.fjall.delete_batch(collection.id(), cells)
-        })
-        .await;
-        self.lower.mark_resolved(collection, cells).await?;
-        Ok(())
-    }
-
-    async fn commit_provisional<'a>(
-        &'a self,
-        collection: &'a CollectionRef,
-        marker: &'a EventMarker,
-        writes: &'a [(CellKey, ProvisionalWrite)],
-    ) -> Result<(), Self::Error> {
-        let clears = marker.clears();
-        if self.fjall.is_disabled() {
-            return self
-                .lower
-                .commit_provisional(collection, marker, writes)
-                .await;
-        }
-        let cache_guard = PromoteCacheGuard(Some(&self.fjall));
-        if let Err(error) = self
-            .lower
-            .commit_provisional(collection, marker, writes)
-            .await
-        {
-            self.evict_marker_cache_entries(collection.id(), marker)
-                .await;
-            cache_guard.complete();
-            return Err(error);
-        }
-        // Publish only after the lower promote succeeds.
-        // The event result is final before this function starts.
-        // Remove the entries if this cache update fails.
-        // Ruling: keep this transform. Delete-and-refill would leave staged
-        // cells cold after each commit and cost one durable point read per hot
-        // cell per event.
-        if let Err(error) = self.fjall.commit_batch(collection.id(), writes).await {
-            warn_skip("commit transform", &error);
-            let cells: CellBuffer<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
-            retry_delete(&self.fjall, "commit transform fallback", || {
-                self.fjall.delete_batch(collection.id(), &cells)
-            })
-            .await;
-        }
-        // Remove other entries from each cleared section.
-        // Keep the staged entries that this settlement just published.
-        if !clears.is_empty() {
-            let staged: CellBuffer<CellKey> = writes.iter().map(|(cell, _)| cell.clone()).collect();
-            for clear in clears {
-                retry_delete(&self.fjall, "commit clear section", || {
-                    self.fjall
-                        .delete_section(collection.id(), clear.section(), &staged)
-                })
-                .await;
-            }
-        }
-        cache_guard.complete();
-        Ok(())
-    }
-
-    async fn abort_provisional<'a>(
-        &'a self,
-        collection: &'a CollectionRef,
-        writes: &'a [(CellKey, ProvisionalWrite)],
-    ) -> Result<(), Self::Error> {
-        if self.fjall.is_disabled() {
-            return self.lower.abort_provisional(collection, writes).await;
-        }
-        let cells: CellBuffer<(CellKey, Option<Bytes>)> = writes
-            .iter()
-            .map(|(cell, write)| (cell.clone(), write.prev().cloned()))
-            .collect();
-        // No pre-call action exists for the abort: the cached `prev` IS the
-        // committed projection while an aborted marker stands, so on a lower
-        // Err the result returns verbatim with the cache already correct. And
-        // no section delete — an uncommitted clear never invalidates anything
-        // (the cached pre-clear values are still the committed truth the
-        // rollback restores).
-        //
-        // Pre-write anchor: the rollback re-writes `prev` with a fresh
-        // `USING TTL`, so it co-expires from this instant. Forward to the
-        // lower `abort_provisional` (not a bare `write_resolved`) so the lower
-        // store's marker delete runs — the cache owns only the fjall
-        // re-publish of the rolled-back `prev`, layered over the lower settle.
-        let stamped_at = self.fjall.clock().now_ms();
-        let result = self.lower.abort_provisional(collection, writes).await;
-        if result.is_ok() {
-            self.publish_written(collection, &cells, stamped_at, |data| {
-                Committed::new(data.clone())
-            })
-            .await;
-        }
-        result
-    }
-
-    async fn marker_state<'a>(
-        &'a self,
-        collection: &'a CollectionId,
-    ) -> Result<MarkerState, Self::Error> {
-        self.lower.marker_state(collection).await
-    }
 }
 
 /// The absolute fjall expiry (millis; `0` = never) for a cell whose durable row
@@ -593,10 +217,9 @@ fn expiry_at(stamped_at: u64, remaining: Option<CompactDuration>) -> u64 {
 
 /// Runs a must-succeed repair delete: up to [`DELETE_RETRY_BUDGET`] attempts
 /// with [`DELETE_RETRY_DELAY`] between them, warning per failure; on
-/// exhaustion it **disables the cache** and returns. Completes-or-disables: it
-/// never fails upward and never stalls settlement — see the module's cache
-/// disablement section for why every failure class (there is no Permanent
-/// escape hatch) lands in the same bounded place.
+/// exhaustion it **disables the cache** and returns. It never fails upward
+/// and never stalls settlement. Every failure class ends here, because a
+/// disabled cache sends all reads to durable storage.
 ///
 /// A dropped **boundary-owned** settle/admission future abandons the retry
 /// harmlessly: the drop coincides with assignment revocation (the workspace —

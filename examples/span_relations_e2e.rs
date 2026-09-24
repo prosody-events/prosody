@@ -94,7 +94,7 @@ impl FallibleHandler for SpanProbe {
             context.state(self.cart)?.set(json!({"key": 1_i32})).await?;
             context
                 .state(self.counts)?
-                .set(&key.to_string(), json!(1_i32))
+                .set(key.as_ref(), json!(1_i32))
                 .await?;
             context.state(self.log)?.push_back(json!(2_i32)).await?;
             Ok::<_, Error>(())
@@ -273,12 +273,12 @@ async fn main() -> Result<()> {
     };
 
     let (sender, mut receiver) = channel(keys * 2 + 4);
-    let client = CassandraHighLevelClient::<SpanProbe>::new(
+    let client = Box::pin(CassandraHighLevelClient::<SpanProbe>::new(
         cassandra_config.build()?,
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,
-    )
+    ))
     .await?;
 
     // One shared absolute fire time lands every timer in the same instant, so

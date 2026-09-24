@@ -12,12 +12,11 @@
 use super::{Mutation, MutationJournal, StateSession, WritableStateSession, sealed};
 use crate::state::access::StateAccessError;
 use crate::state::cell::Projection;
-use crate::state::cell_key::{CellKey, Scan, Section};
+use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::registry::CollectionDef;
 use crate::state::session::{KeyedStateSession, MutatePermit, OpPermit};
-use crate::state::store::CellRead;
-use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store::{Answers, CellRead, ReadBatch};
 use crate::state::{StateBackend, StateName, StateType, StoreOutcome};
 use futures::stream::Stream;
 
@@ -94,7 +93,7 @@ where
         _inner: &mut Self::ReadInner<'_>,
         state_type: StateType,
         name: &StateName,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Result<Option<P::Payload>, StateAccessError> {
         ensure_live(session)?;
         session.get::<P>(state_type, name, cell).await
@@ -107,8 +106,8 @@ where
         state_type: StateType,
         name: &StateName,
         section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError> {
+        batch: &ReadBatch<'_>,
+    ) -> Result<Answers<Option<P::Payload>>, StateAccessError> {
         ensure_live(session)?;
         session
             .get_many::<P>(state_type, name, section, batch)
@@ -121,7 +120,8 @@ where
         state_type: StateType,
         name: &'a StateName,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + use<'a, B, L, P>
+    {
         // Unwitnessed by design: a range pages gate-free, taking the gate only
         // for the planning command that preceded it.
         session.scan::<P>(state_type, name, scan)

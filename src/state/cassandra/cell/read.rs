@@ -7,9 +7,10 @@ use super::decode::{
 use super::projection::CassandraProjection;
 use super::{
     CassandraCellStoreError, CassandraSession, CassandraStoreError, Cell, CellBuffer, CellKey,
-    CellKind, CellQueries, CollectionId, Coordinate, Direction, Pk, Scan, ScanEdge, Section,
-    Stream, cooperative, try_stream,
+    CellKind, CellQueries, CollectionId, Coordinate, Direction, Pk, Scan, Section, Stream,
+    cooperative, try_stream,
 };
+use crate::state::cell_key::CellRef;
 use crate::state::marker::MarkerState;
 use crate::state::store::FetchSchedule;
 use crate::timers::duration::CompactDuration;
@@ -20,14 +21,14 @@ use scylla::response::PagingState;
 use scylla::serialize::row::SerializeRow;
 use scylla::statement::prepared::PreparedStatement;
 use std::num::NonZeroUsize;
-use std::ops::ControlFlow;
+use std::ops::{Bound, ControlFlow};
 
 /// Fetches one projected cell with its durable TTL columns.
 pub(super) async fn fetch_point<P: CassandraProjection>(
     session: &CassandraSession,
     queries: &CellQueries,
     id: &CollectionId,
-    cell: &CellKey,
+    cell: CellRef<'_>,
 ) -> Result<Option<PointRow<P>>, CassandraCellStoreError> {
     let pk = Pk::of(id);
     Ok(session
@@ -52,14 +53,15 @@ pub(super) async fn fetch_point<P: CassandraProjection>(
         .map_err(CassandraStoreError::from)?)
 }
 
-/// Fetches one batch and preserves input order before semantic decode.
+/// Fetches the stored rows of one batch with their coordinates.
+/// Rows arrive in clustering order. [`take_row`] finds each coordinate's row.
 pub(super) async fn fetch_batch<P: CassandraProjection>(
     session: &CassandraSession,
     queries: &CellQueries,
     id: &CollectionId,
     section: Section,
-    coordinates: &[&Coordinate],
-) -> Result<CellBuffer<Option<PointRow<P>>>, CassandraCellStoreError> {
+    coordinates: &[&[u8]],
+) -> Result<CellBuffer<(Bytes, PointRow<P>)>, CassandraCellStoreError> {
     let pk = Pk::of(id);
     let result = session
         .session()
@@ -86,26 +88,16 @@ pub(super) async fn fetch_batch<P: CassandraProjection>(
     {
         rows.push(split_batch::<P>(row.map_err(CassandraStoreError::from)?));
     }
-    Ok(match_rows_to_coordinates(rows, coordinates))
+    Ok(rows)
 }
 
-pub(super) fn match_rows_to_coordinates<Row>(
-    mut rows: CellBuffer<(Bytes, Row)>,
-    coordinates: &[&Coordinate],
-) -> CellBuffer<Option<Row>> {
-    let mut out = CellBuffer::with_capacity(coordinates.len());
-    for &coordinate in coordinates {
-        let Some(pos) = rows
-            .iter()
-            .position(|(found, _)| found.as_ref() == coordinate.as_bytes())
-        else {
-            out.push(None);
-            continue;
-        };
-        let (_, row) = rows.swap_remove(pos);
-        out.push(Some(row));
-    }
-    out
+/// Removes and returns the fetched row for `coordinate`. A coordinate with no
+/// stored row returns `None`.
+pub(super) fn take_row<Row>(rows: &mut CellBuffer<(Bytes, Row)>, coordinate: &[u8]) -> Option<Row> {
+    let position = rows
+        .iter()
+        .position(|(found, _)| found.as_ref() == coordinate)?;
+    Some(rows.swap_remove(position).1)
 }
 
 /// Decodes a point row into its cell and the remaining durable TTL.
@@ -134,18 +126,21 @@ pub(super) fn page<'a, P: CassandraProjection>(
     queries: &'a CellQueries,
     collection: &'a CollectionId,
     scan: Scan<'a>,
-) -> impl Stream<Item = Result<(CellKey, Cell<P>), CassandraCellStoreError>> + Send + 'a {
+) -> impl Stream<Item = Result<(CellKey, Cell<P>), CassandraCellStoreError>> + Send + use<'a, P> {
     let section = i8::from(scan.section);
     let dir = scan.dir;
-    let start = scan.start.cloned();
-    let end = scan.end.cloned();
+    let start = scan.start;
+    let end = scan.end;
     try_stream! {
         let pk = Pk::of(collection);
-        let prepared = P::statements(queries).scan.select(dir, start.kind());
-        let start = start.as_ref();
+        let prepared = P::statements(queries).scan.select(dir, start.map(|_| ()));
+        let anchor = match start {
+            Bound::Included(coordinate) | Bound::Excluded(coordinate) => coordinate,
+            Bound::Unbounded => &[],
+        };
         let values = (
             pk.segment_id, pk.key, pk.state_type, pk.name,
-            CellKind::Cell, section, start.anchor(),
+            CellKind::Cell, section, anchor,
         );
         // Scylla rejects a non-positive page size, so this fallback is unreachable.
         let page_size = NonZeroUsize::new(usize::try_from(prepared.get_page_size()).unwrap_or(0))
@@ -179,7 +174,7 @@ pub(super) fn page<'a, P: CassandraProjection>(
                 section: Section::new(section),
                 coordinate: Coordinate::from_bytes(coordinate),
             };
-            if past_end(dir, &key, end.as_ref()) {
+            if past_end(dir, &key, end) {
                 break;
             }
             let cell = decode_body::<P>((data, prev, encoding, version, event))?;
@@ -190,13 +185,13 @@ pub(super) fn page<'a, P: CassandraProjection>(
 
 /// Fetches pages one at a time. The first page holds `first` rows and each
 /// later page doubles, up to `page_size`.
-fn scheduled_rows<P: CassandraProjection, V: SerializeRow + Send + Sync>(
-    session: &CassandraSession,
-    prepared: &PreparedStatement,
+fn scheduled_rows<'a, P: CassandraProjection, V: SerializeRow + Send + Sync>(
+    session: &'a CassandraSession,
+    prepared: &'a PreparedStatement,
     values: V,
     first: NonZeroUsize,
     page_size: NonZeroUsize,
-) -> impl Stream<Item = Result<ScanRow<P>, CassandraCellStoreError>> + Send {
+) -> impl Stream<Item = Result<ScanRow<P>, CassandraCellStoreError>> + Send + use<'a, P, V> {
     try_stream! {
         let mut statement = prepared.clone();
         let mut fetch = FetchSchedule::new(Some(first), page_size);
@@ -224,14 +219,14 @@ fn scheduled_rows<P: CassandraProjection, V: SerializeRow + Send + Sync>(
 /// direction. An `Excluded` edge also stops *on* the endpoint (the exclusive
 /// variant for exclusive scan anchors); an `Unbounded` end never stops the
 /// walk (the section-only fallback).
-pub(super) fn past_end(dir: Direction, key: &CellKey, end: ScanEdge<&Coordinate>) -> bool {
+pub(super) fn past_end(dir: Direction, key: &CellKey, end: Bound<&[u8]>) -> bool {
     let coordinate = key.coordinate.as_bytes();
     match (dir, end) {
-        (Direction::Forward, ScanEdge::Included(end)) => coordinate > end.as_bytes(),
-        (Direction::Forward, ScanEdge::Excluded(end)) => coordinate >= end.as_bytes(),
-        (Direction::Backward, ScanEdge::Included(end)) => coordinate < end.as_bytes(),
-        (Direction::Backward, ScanEdge::Excluded(end)) => coordinate <= end.as_bytes(),
-        (_, ScanEdge::Unbounded) => false,
+        (Direction::Forward, Bound::Included(end)) => coordinate > end,
+        (Direction::Forward, Bound::Excluded(end)) => coordinate >= end,
+        (Direction::Backward, Bound::Included(end)) => coordinate < end,
+        (Direction::Backward, Bound::Excluded(end)) => coordinate <= end,
+        (_, Bound::Unbounded) => false,
     }
 }
 

@@ -10,15 +10,15 @@
 //! source result without another age check or read.
 //!
 //! Point reads share one fill for each missing key.
-//! Batch reads probe every key and write every filled position through the
-//! lattice. Cache admission does not change a successful source result into an
-//! error.
+//! Batch reads stop the cache probe at the first miss and write each filled
+//! position through the lattice. Cache admission does not change a successful
+//! source result into an error.
 
 use crate::Key;
 use crate::state::access::StateAccessError;
 use crate::state::cell::{CacheEntry, Projection, Read};
-use crate::state::cell_key::CellKey;
-use crate::state::store::CellBuffer;
+use crate::state::cell_key::{CellKey, CellRef};
+use crate::state::store::{Answers, ReadBatch};
 use crate::state::{StateName, StateType};
 use crate::state_reader::source::SourceId;
 use bytes::Bytes;
@@ -40,6 +40,31 @@ const READER_CACHE_ENTRY_INLINE_BYTES: u64 = (size_of::<CacheKey>() + size_of::<
 /// partition key, and cell. The [`SourceId`] is stable, never an ordinal, so
 /// an entry never aliases another source across a snapshot reorder.
 pub(crate) type CacheKey = (SourceId, StateType, StateName, Key, CellKey);
+
+/// A cache lookup that borrows its address. Fresh hits do not copy coordinates.
+#[derive(Clone, Copy, Hash)]
+pub(crate) struct CacheLookup<'a>(
+    pub(crate) (&'a SourceId, StateType, &'a StateName, &'a Key, CellRef<'a>),
+);
+
+impl CacheLookup<'_> {
+    fn into_owned(self) -> CacheKey {
+        let (source, state_type, name, key, cell) = self.0;
+        (
+            source.clone(),
+            state_type,
+            name.clone(),
+            key.clone(),
+            cell.into_owned(),
+        )
+    }
+}
+
+impl quick_cache::Equivalent<CacheKey> for CacheLookup<'_> {
+    fn equivalent(&self, key: &CacheKey) -> bool {
+        self.0 == (&key.0, key.1, &key.2, &key.3, key.4.as_ref())
+    }
+}
 
 /// The issue time and the committed cache knowledge.
 type CacheVal = (Instant, CacheEntry<Bytes>);
@@ -141,7 +166,7 @@ impl ReaderCache {
     /// Propagates the store error from `fill`.
     pub(crate) async fn get_cached<P: Projection, F, Fut>(
         &self,
-        key: CacheKey,
+        key: CacheLookup<'_>,
         ttl: Duration,
         fill: F,
     ) -> Result<Option<P::Payload>, StateAccessError>
@@ -149,6 +174,16 @@ impl ReaderCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Option<P::Payload>, StateAccessError>>,
     {
+        if let Some((issued, entry)) = self.inner.get(&key)
+            && self.fresh(issued, ttl)
+        {
+            match P::from_cached(entry) {
+                Read::Present(value) => return Ok(Some(value)),
+                Read::Absent => return Ok(None),
+                Read::Unknown => {}
+            }
+        }
+        let key = key.into_owned();
         let outcome = self
             .inner
             .entry_async(&key, |_, (issued, entry): &mut CacheVal| {
@@ -186,66 +221,65 @@ impl ReaderCache {
         }
     }
 
-    /// The read-through batch read, index-aligned to `keys`. Serves the batch
-    /// entirely from the cache when every key is a fresh hit. Otherwise it
-    /// issues one batch store read through `fill`, writes every position, and
-    /// returns the store answers.
+    /// The read-through batch read. Serves the batch entirely from the cache
+    /// when every key is a fresh hit. Otherwise it issues one batch store read
+    /// through `fill`, writes every position, and returns the store answers.
     ///
     /// # Errors
     ///
     /// Propagates the store error from `fill`.
-    pub(crate) async fn get_many_cached<P: Projection, F, Fut>(
+    pub(crate) async fn get_many_cached<'a, 'buf, P: Projection, F, Fut>(
         &self,
-        keys: &[CacheKey],
+        batch: &ReadBatch<'buf>,
+        key: impl Fn(&'buf [u8]) -> CacheLookup<'a>,
         ttl: Duration,
         fill: F,
-    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
+    ) -> Result<Answers<Option<P::Payload>>, StateAccessError>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<CellBuffer<Option<P::Payload>>, StateAccessError>>,
+        Fut: Future<Output = Result<Answers<Option<P::Payload>>, StateAccessError>>,
     {
-        let mut hits = CellBuffer::with_capacity(keys.len());
-        for key in keys {
-            let hit = match self.inner.get(key) {
-                Some((issued, entry)) if self.fresh(issued, ttl) => P::from_cached(entry),
+        let hits = batch.try_map(|&coordinate| {
+            let key = key(coordinate);
+            match self.inner.get(&key) {
+                Some((issued, entry)) if self.fresh(issued, ttl) => match P::from_cached(entry) {
+                    Read::Present(value) => Ok(Some(value)),
+                    Read::Absent => Ok(None),
+                    Read::Unknown => Err(()),
+                },
                 Some((issued, _)) => {
                     self.inner
-                        .remove_if(key, |(observed, _)| *observed == issued);
-                    Read::Unknown
+                        .remove_if(&key, |(observed, _)| *observed == issued);
+                    Err(())
                 }
-                None => Read::Unknown,
-            };
-            hits.push(hit);
-        }
-        if hits.iter().all(|hit| !matches!(hit, Read::Unknown)) {
-            return Ok(hits
-                .into_iter()
-                .map(|hit| match hit {
-                    Read::Present(value) => Some(value),
-                    Read::Absent | Read::Unknown => None,
-                })
-                .collect());
+                None => Err(()),
+            }
+        });
+        if let Ok(hits) = hits {
+            return Ok(hits);
         }
         // One shared issue time for the whole batch fill.
         let issued = self.clock.now();
         let fresh = fill().await?;
-        // Check the fill alignment in every build, not just a debug assert:
-        // a misaligned fill would cache values under the wrong keys.
-        if fresh.len() != keys.len() {
-            return Err(StateAccessError::misaligned_batch(fresh.len(), keys.len()));
-        }
-        for (key, value) in keys.iter().zip(&fresh) {
-            cooperative(self.write_through(key, issued, P::into_cached(value.clone()))).await;
+        for (&coordinate, value) in batch.iter().zip(fresh.iter()) {
+            let value = P::into_cached(value.clone());
+            cooperative(self.write_through(&key(coordinate), issued, value)).await;
         }
         Ok(fresh)
     }
 
     /// Writes `value` for `key`. A fill replaces an observation issued earlier.
     /// Replacements follow the lattice contract in [`crate::state::cell`].
-    async fn write_through(&self, key: &CacheKey, issued: Instant, value: CacheEntry<Bytes>) {
+    async fn write_through(
+        &self,
+        key: &CacheLookup<'_>,
+        issued: Instant,
+        value: CacheEntry<Bytes>,
+    ) {
+        let key = (*key).into_owned();
         let outcome = self
             .inner
-            .entry_async(key, |_, existing: &mut CacheVal| {
+            .entry_async(&key, |_, existing: &mut CacheVal| {
                 // Equal issue times permit a value to refine presence.
                 let refines_presence = issued == existing.0 && existing.1.downgrades(&value);
                 if !value.downgrades(&existing.1) && (issued > existing.0 || refines_presence) {

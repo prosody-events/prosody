@@ -1,17 +1,21 @@
 //! Standalone reads of committed map entries.
 
-use super::{MapReaderQuery, StateReader};
+use super::StateReader;
 use crate::Key;
 use crate::codec::Codec;
-use crate::state::cell_key::Direction;
-use crate::state::descriptor::map::Query;
+use crate::state::cell::{Presence, Values};
 use crate::state::descriptor::{CellType, ContextOf, FromSession, MapDescriptor, ResolvedOf};
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
+use crate::state::{BorrowedKeyQuery, KeyQuery, KeyRead, ReadQuery, ReadSource};
 use crate::state_reader::session::ReadSession;
 use crate::state_reader::{ReaderBackend, StateReaderError};
 use futures::Stream;
 use std::borrow::Borrow;
 use std::fmt::Display;
+
+/// One committed map entry or the error that ended the stream.
+pub type MapReadItem<KC, V> =
+    Result<(<KC as OrderedKeyCodec>::Key, ResolvedOf<V>), StateReaderError>;
 
 impl<KC, V, C, B> StateReader<MapDescriptor<KC, V>, C, B>
 where
@@ -20,7 +24,6 @@ where
     C::Payload: Clone,
     KC: OrderedKeyCodec + 'static,
     V: CellType<Key = UnitKey>,
-    for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
 {
     /// Reads and resolves the committed value for map entry `map_key` under
     /// partition `key`.
@@ -34,6 +37,7 @@ where
         map_key: &KC::Borrowed,
     ) -> Result<Option<ResolvedOf<V>>, StateReaderError>
     where
+        for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
         KC::Borrowed: Display,
     {
         let handle = self.bound(key.into()).await?;
@@ -88,6 +92,7 @@ where
         map_keys: I,
     ) -> Result<Vec<Option<ResolvedOf<V>>>, StateReaderError>
     where
+        for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
         Q: Borrow<KC::Borrowed> + ?Sized + 'a,
         I: IntoIterator<Item = &'a Q>,
         I::IntoIter: Send,
@@ -122,55 +127,48 @@ where
             .map_err(|e| StateReaderError::store(&e))
     }
 
-    /// Streams the committed live entries of the map under partition `key` in
-    /// key order (ascending for [`Direction::Forward`]).
-    ///
-    /// The stream owns its session and can outlive the reader's borrow.
-    ///
-    /// # Errors
-    ///
-    /// Any [`StateReaderError`] from acquiring the session: an empty key, or
-    /// an acquisition or identity failure. Per-source read failures surface
-    /// as stream items.
-    pub async fn stream<K: Into<Key>>(
-        &self,
+    /// Builds a query over committed entries, in ascending key order.
+    /// The stream borrows the reader. Its first poll acquires a session.
+    /// Acquisition and read errors appear as stream items.
+    pub fn entries<'a, K: Into<Key>>(
+        &'a self,
         key: K,
-        dir: Direction,
-    ) -> Result<
-        impl Stream<Item = Result<(KC::Key, ResolvedOf<V>), StateReaderError>> + 'static,
-        StateReaderError,
+    ) -> KeyRead<
+        'a,
+        KC,
+        impl ReadSource<
+            Query = BorrowedKeyQuery<'a, KC>,
+            Output: Stream<Item = MapReadItem<KC, V>> + Send,
+        > + Clone
+        + use<'a, K, KC, V, C, B>,
     >
     where
-        V: 'static,
-        ResolvedOf<V>: 'static,
+        for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
     {
-        self.query(key, dir).entries().await
+        let key = key.into();
+        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
+            self.projected::<Values>(key, query)
+        })
     }
 
-    /// Streams committed live keys without decoding or resolving values.
-    ///
-    /// # Errors
-    ///
-    /// Any [`StateReaderError`] from acquiring the session. Per-source read
-    /// failures surface as stream items.
-    pub async fn keys<K: Into<Key>>(
-        &self,
+    /// Builds a query over committed keys, in ascending key order.
+    /// The stream borrows the reader. Its first poll acquires a session.
+    /// Acquisition and read errors appear as stream items.
+    pub fn keys<'a, K: Into<Key>>(
+        &'a self,
         key: K,
-        dir: Direction,
-    ) -> Result<impl Stream<Item = Result<KC::Key, StateReaderError>> + 'static, StateReaderError>
-    where
-        V: 'static,
-        KC::Key: 'static,
-    {
-        self.query(key, dir).keys().await
-    }
-
-    /// Builds a directional stream query for partition `key`.
-    pub fn query<K: Into<Key>>(&self, key: K, dir: Direction) -> MapReaderQuery<'_, KC, V, C, B> {
-        MapReaderQuery {
-            reader: self,
-            key: key.into(),
-            query: Query::new(dir),
-        }
+    ) -> KeyRead<
+        'a,
+        KC,
+        impl ReadSource<
+            Query = BorrowedKeyQuery<'a, KC>,
+            Output: Stream<Item = Result<KC::Key, StateReaderError>> + Send,
+        > + Clone
+        + use<'a, K, KC, V, C, B>,
+    > {
+        let key = key.into();
+        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
+            self.projected::<Presence>(key, query)
+        })
     }
 }

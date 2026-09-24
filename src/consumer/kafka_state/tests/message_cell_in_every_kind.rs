@@ -40,7 +40,7 @@ async fn collect_map(
     dir: Direction,
 ) -> Result<Vec<(String, i64)>> {
     let mut out = Vec::new();
-    let stream = handle.stream(dir);
+    let stream = handle.entries().direction(dir).stream();
     futures::pin_mut!(stream);
     while let Some(item) = stream.next().await {
         let (key, message) = item?;
@@ -55,7 +55,7 @@ async fn collect_deque(
     dir: Direction,
 ) -> Result<Vec<i64>> {
     let mut out = Vec::new();
-    let stream = handle.stream(dir);
+    let stream = handle.values().direction(dir).stream();
     futures::pin_mut!(stream);
     while let Some(item) = stream.next().await {
         out.push(item?.offset());

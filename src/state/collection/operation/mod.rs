@@ -8,7 +8,7 @@ use super::{
 };
 use crate::state::access::StateAccessError;
 use crate::state::cell::{Presence, Projection, Values};
-use crate::state::cell_key::{CellKey, Coordinate, Direction, ScanEdge, Section};
+use crate::state::cell_key::{CellKey, CellRef, Coordinate, Direction, Section};
 use crate::state::descriptor::{
     BorrowedKeyOf, CellCodecError, CellResolver, CellStateError, CellType, ContextOf, FromSession,
     ResolvedOf, WriteOf,
@@ -16,15 +16,15 @@ use crate::state::descriptor::{
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::store::CellBuffer;
 use crate::state::{StateName, StateType};
+use std::ops::Bound;
 
 mod batch;
 mod read;
-use batch::Slot;
+use batch::encode_key;
 pub(super) use batch::read_coordinates;
 use bytes::Bytes;
 use smallvec::SmallVec;
 use std::future::Future;
-use std::num::NonZeroUsize;
 
 /// Inline capacity of one invocation's mutation journal.
 ///
@@ -101,51 +101,24 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
     /// given order. The plan freezes this invocation's engine state. Each
     /// reader chunk then resumes on the same source, and each owner chunk
     /// reacquires the gate, without a second planning command.
-    pub(crate) fn coordinates<T: CellType>(
+    pub(crate) fn coordinates<T: CellType, B: AsRef<[u8]> + Send>(
         &self,
         family: CellFamily<L, T>,
         coordinates: Vec<Coordinate>,
-    ) -> Plan<S, T> {
+    ) -> Plan<S, T, B> {
         Plan::coordinates(self.plan_base(family.section()), coordinates)
     }
 
     /// Plans a scan over encoded edges in the declared family.
     /// The edges follow `dir` and can include, exclude, or omit an endpoint.
-    pub(crate) fn range<T: CellType>(
+    pub(crate) fn range<T: CellType, B: AsRef<[u8]> + Send>(
         &self,
         family: CellFamily<L, T>,
-        start: ScanEdge<Coordinate>,
+        start: Bound<B>,
         dir: Direction,
-        end: ScanEdge<Coordinate>,
-    ) -> Plan<S, T> {
+        end: Bound<B>,
+    ) -> Plan<S, T, B> {
         Plan::range(self.plan_base(family.section()), start, dir, end)
-    }
-
-    /// Plans a managed durable range over one inclusive typed span of
-    /// `family`'s section. The plan walks `[start, end]` in `dir` order and
-    /// yields at most `limit` cells.
-    ///
-    /// A collection with a contiguous coordinate window takes this plan. It
-    /// does not enumerate every coordinate in the window. `start` and `end`
-    /// are direction-relative, exactly as
-    /// [`Scan`](crate::state::cell_key::Scan) defines them. Only inclusive
-    /// edges exist here. A collection that knows its window also knows both of
-    /// its occupied endpoints.
-    pub(crate) fn range_within<T: CellType>(
-        &self,
-        family: CellFamily<L, T>,
-        start: &BorrowedKeyOf<T>,
-        dir: Direction,
-        end: &BorrowedKeyOf<T>,
-        limit: NonZeroUsize,
-    ) -> Plan<S, T> {
-        self.range(
-            family,
-            ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode(start)),
-            dir,
-            ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode(end)),
-        )
-        .with_limit(Some(limit))
     }
 
     /// The binding and captured engine state every managed plan carries.
@@ -218,59 +191,15 @@ impl<'a, S: WritableStateSession, L> WriteOperation<'a, S, L> {
         Ok(())
     }
 
-    /// This invocation's staged view of `cell`, or `None` when the journal
-    /// says nothing about it.
-    ///
-    /// The reverse walk gives staged mutations last-write-wins and
-    /// read-your-writes semantics. Forward replay at merge reproduces the same
-    /// result.
-    fn staged(&self, cell: &CellKey) -> Option<Staged> {
-        self.journal
-            .iter()
-            .rev()
-            .find_map(|mutation| match mutation {
-                Mutation::Set {
-                    cell: staged,
-                    bytes,
-                } if staged == cell => Some(Staged::Present(bytes.clone())),
-                Mutation::Clear { cell: staged } if staged == cell => Some(Staged::Absent),
-                // A staged reset hides every cell of the layout, so a read
-                // after `clear_collection` sees the same absence the merge will
-                // replay.
-                Mutation::Reset { sections } if sections.contains(&cell.section) => {
-                    Some(Staged::Absent)
-                }
-                _ => None,
-            })
-    }
-
-    /// Projects the journal answer for each key before the engine reads.
-    fn slots<'k, T: CellType, P: Projection>(
-        &self,
-        family: CellFamily<L, T>,
-        keys: impl IntoIterator<Item = &'k BorrowedKeyOf<T>, IntoIter: Send>,
-    ) -> CellBuffer<Slot<P>> {
-        keys.into_iter()
-            .map(|key| {
-                let cell = family.at(key).cell;
-                match self.staged(&cell) {
-                    Some(Staged::Present(bytes)) => Slot::Answered(Some(P::from_value(bytes))),
-                    Some(Staged::Absent) => Slot::Answered(None),
-                    None => Slot::Pending(cell.coordinate),
-                }
-            })
-            .collect()
-    }
-
     /// Reads the journal answer or one projected engine answer.
     async fn staged_or_read<P: Projection>(
         &mut self,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Result<Option<P::Payload>, StateAccessError>
     where
         S::Engine: sealed::Reads<S, P>,
     {
-        match self.staged(cell) {
+        match staged(&self.journal, cell) {
             Some(Staged::Present(bytes)) => Ok(Some(P::from_value(bytes))),
             Some(Staged::Absent) => Ok(None),
             None => {
@@ -303,24 +232,33 @@ impl<S: StateSession, L> sealed_ops::CollectionOperation for ReadOperation<'_, S
 
 impl<S: WritableStateSession, L> sealed_ops::CollectionOperation for WriteOperation<'_, S, L> {}
 
-impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
-    fn take<T>(
-        &mut self,
+impl<'c, S: WritableStateSession, L> CollectionWrite for WriteOperation<'c, S, L> {
+    fn take<'a, T>(
+        &'a mut self,
         family: CellFamily<L, T>,
         key: &BorrowedKeyOf<T>,
-    ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send
+    ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>>
+    + Send
+    + use<'a, 'c, S, L, T>
     where
         T: CellType,
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
-        let cell = family.at(key).cell;
+        let encoded = encode_key::<T::Key>(key);
         async move {
-            let value = match self.staged_or_read::<Values>(&cell).await? {
+            let buffer = encoded.map_err(CellStateError::Key)?;
+            let cell = CellRef {
+                section: family.section(),
+                coordinate: &buffer,
+            };
+            let value = match self.staged_or_read::<Values>(cell).await? {
                 Some(bytes) => Some(resolve_cell::<S, T>(self.collection.session(), bytes).await?),
                 None => None,
             };
             // A failed read leaves the journal unchanged.
-            self.journal.push(Mutation::Clear { cell });
+            self.journal.push(Mutation::Clear {
+                cell: cell.into_owned(),
+            });
             Ok(value)
         }
     }
@@ -351,4 +289,20 @@ impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
             sections: L::SECTIONS,
         });
     }
+}
+
+/// Returns the last staged answer without a coordinate copy.
+fn staged(journal: &[Mutation], cell: CellRef<'_>) -> Option<Staged> {
+    journal.iter().rev().find_map(|mutation| match mutation {
+        Mutation::Set {
+            cell: staged,
+            bytes,
+        } if staged.as_ref() == cell => Some(Staged::Present(bytes.clone())),
+        Mutation::Clear { cell: staged } if staged.as_ref() == cell => Some(Staged::Absent),
+        // A staged reset hides every cell of the layout, so a read
+        // after `clear_collection` sees the same absence the merge will
+        // replay.
+        Mutation::Reset { sections } if sections.contains(&cell.section) => Some(Staged::Absent),
+        _ => None,
+    })
 }

@@ -19,6 +19,7 @@ mod backend;
 mod cache;
 mod client;
 mod deps;
+pub mod erased;
 mod error;
 mod partitioner;
 mod publication_cache;
@@ -46,5 +47,5 @@ pub(crate) use source::PUBLICATION_READ_LIMIT;
 // same reason: they appear in that public signature and in the public
 // `PartitionCount::try_from`.
 pub use partitioner::{EmptyKeyError, PartitionCount, PartitionCountError, partition_for_key};
-pub use reader::{DequeReaderQuery, MapReaderQuery, SetReaderQuery, StateReader};
+pub use reader::{MapReadItem, StateReader};
 pub use session::ReadSession;

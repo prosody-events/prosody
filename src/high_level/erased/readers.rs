@@ -1,193 +1,31 @@
-//! Read-only keyed-state types materialized across FFI boundaries.
+//! Constructs erased readers from the high-level client.
 
 use crate::EventIdentity;
-use crate::Key;
-use crate::codec::{Codec, ErasedStateCodec};
-use crate::consumer::event_context::{BoxStateCursor, ErasedStateError, StateCursor};
-use crate::error::{ClassifyError, ErrorCategory};
+use crate::codec::ErasedStateCodec;
 use crate::high_level::codecs::StateCodec;
 use crate::high_level::{
     ClientBackend, ClientHandler, HighLevelClient, HighLevelClientError, MessageCodec,
     MessageCodecError,
 };
-use crate::state::ReadCachePolicy;
-use crate::state::cell_key::Direction;
-use crate::state::descriptor::{
-    DequeDescriptor, MapDescriptor, SetDescriptor, StateDescriptor, ValueDescriptor, deque_state,
-    map_state, set_state, value_state,
-};
+use crate::state::descriptor::{StateDescriptor, deque_state, map_state, set_state, value_state};
+use crate::state::erased::Erased;
 use crate::state::order_codec::Utf8KeyCodec;
-use crate::state::registry::MAX_KEYSET_LIMIT;
-use crate::state_reader::{ConsumerReaderBackend, ReaderBackend, StateReader, StateReaderError};
+use crate::state_reader::ConsumerReaderBackend;
 use crate::subsystem::{SubsystemName, SubsystemNameError};
-use async_trait::async_trait;
-use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
-use std::time::Duration;
 use thiserror::Error;
 
-/// Cache policy accepted by foreign-language published-state readers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ErasedReadCache {
-    /// Use the client's configured default.
-    #[default]
-    Inherit,
-    /// Read durable storage for every operation.
-    Disabled,
-    /// Cache committed reads for this duration.
-    Ttl(Duration),
-}
-
-impl From<ErasedReadCache> for ReadCachePolicy {
-    fn from(cache: ErasedReadCache) -> Self {
-        match cache {
-            ErasedReadCache::Inherit => Self::Inherit,
-            ErasedReadCache::Disabled => Self::Disabled,
-            ErasedReadCache::Ttl(ttl) => Self::Ttl(ttl),
-        }
-    }
-}
-
-/// Ordering for a foreign-language state scan.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ErasedDirection {
-    /// Ascending map keys, set members, or front-to-back deque elements.
-    #[default]
-    Forward,
-    /// Descending map keys, set members, or back-to-front deque elements.
-    Backward,
-}
-
-impl From<ErasedDirection> for Direction {
-    fn from(direction: ErasedDirection) -> Self {
-        match direction {
-            ErasedDirection::Forward => Self::Forward,
-            ErasedDirection::Backward => Self::Backward,
-        }
-    }
-}
-
-/// Read-only access to a published value collection.
-#[async_trait]
-pub trait ErasedValueReader<C: Codec>: Send + Sync {
-    /// Reads the committed value for `key`.
-    async fn get(&self, key: String) -> Result<Option<C::Payload>, ErasedStateError>;
-}
-
-/// Shared value-reader representation stored by native FFI wrappers.
-pub type SharedValueReader<C> = Arc<dyn ErasedValueReader<C>>;
-
-/// Read-only access to a published string-keyed map collection.
-#[async_trait]
-pub trait ErasedMapReader<C: Codec>: Send + Sync {
-    /// Reads one committed map entry.
-    async fn get(
-        &self,
-        key: String,
-        map_key: String,
-    ) -> Result<Option<C::Payload>, ErasedStateError>;
-
-    /// Reports whether one committed map entry exists without decoding it.
-    async fn contains_key(&self, key: String, map_key: String) -> Result<bool, ErasedStateError>;
-
-    /// Reads committed map entries aligned with `map_keys`.
-    async fn get_many(
-        &self,
-        key: String,
-        map_keys: Vec<String>,
-    ) -> Result<Vec<Option<C::Payload>>, ErasedStateError>;
-
-    /// Streams committed entries in key order.
-    async fn stream(
-        &self,
-        key: String,
-        direction: ErasedDirection,
-    ) -> Result<BoxStateCursor<(String, C::Payload)>, ErasedStateError>;
-
-    /// Streams committed keys without decoding values.
-    async fn keys(
-        &self,
-        key: String,
-        direction: ErasedDirection,
-    ) -> Result<BoxStateCursor<String>, ErasedStateError>;
-}
-
-/// Shared map-reader representation stored by native FFI wrappers.
-pub type SharedMapReader<C> = Arc<dyn ErasedMapReader<C>>;
-
-/// Read-only access to a published string-keyed set collection.
-#[async_trait]
-pub trait ErasedSetReader: Send + Sync {
-    /// Reports whether the committed set contains `member`.
-    async fn contains(&self, key: String, member: String) -> Result<bool, ErasedStateError>;
-
-    /// Tests committed membership aligned with `members`.
-    async fn contains_many(
-        &self,
-        key: String,
-        members: Vec<String>,
-    ) -> Result<Vec<bool>, ErasedStateError>;
-
-    /// Reports whether the committed set has no members.
-    async fn is_empty(&self, key: String) -> Result<bool, ErasedStateError>;
-
-    /// Streams committed members in key order.
-    async fn keys(
-        &self,
-        key: String,
-        direction: ErasedDirection,
-    ) -> Result<BoxStateCursor<String>, ErasedStateError>;
-}
-
-/// Shared set-reader representation stored by native FFI wrappers.
-pub type SharedSetReader = Arc<dyn ErasedSetReader>;
-
-/// Read-only access to a published deque collection.
-#[async_trait]
-pub trait ErasedDequeReader<C: Codec>: Send + Sync {
-    /// Reads one front-relative committed element.
-    async fn get(&self, key: String, index: usize) -> Result<Option<C::Payload>, ErasedStateError>;
-
-    /// Returns the committed deque length.
-    async fn len(&self, key: String) -> Result<usize, ErasedStateError>;
-
-    /// Reports whether the committed deque is empty.
-    async fn is_empty(&self, key: String) -> Result<bool, ErasedStateError>;
-
-    /// Reads the committed front endpoint.
-    async fn peek_front(&self, key: String) -> Result<Option<C::Payload>, ErasedStateError>;
-
-    /// Reads the committed back endpoint.
-    async fn peek_back(&self, key: String) -> Result<Option<C::Payload>, ErasedStateError>;
-
-    /// Streams committed elements in index order.
-    async fn stream(
-        &self,
-        key: String,
-        direction: ErasedDirection,
-    ) -> Result<BoxStateCursor<C::Payload>, ErasedStateError>;
-}
-
-/// Shared deque-reader representation stored by native FFI wrappers.
-pub type SharedDequeReader<C> = Arc<dyn ErasedDequeReader<C>>;
-
-/// Failure to construct a foreign-language published-state reader.
-#[derive(Debug, Error)]
-pub enum ErasedReaderBuildError<E> {
-    /// The subsystem name is empty.
-    #[error(transparent)]
-    InvalidSubsystem(#[from] SubsystemNameError),
-    /// The high-level client could not compose the reader.
-    #[error(transparent)]
-    Client(#[from] HighLevelClientError<E>),
-}
+pub use crate::state_reader::erased::{
+    ErasedDequeReader, ErasedMapReader, ErasedReadCache, ErasedSetReader, ErasedValueReader,
+    SharedDequeReader, SharedMapReader, SharedSetReader, SharedValueReader,
+};
 
 pub(in crate::high_level) async fn value<T, B>(
     client: &HighLevelClient<T, B>,
     subsystem: String,
     name: &str,
     cache: ErasedReadCache,
-) -> Result<SharedValueReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+) -> Result<SharedValueReader<T::Payload>, ErasedReaderBuildError<MessageCodecError<T>>>
 where
     T: ClientHandler,
     T::Payload: Clone + ErasedStateCodec + EventIdentity + Send + Sync + 'static,
@@ -196,7 +34,7 @@ where
 {
     let descriptor = value_state::<StateCodec<T>>(name).read_cache(cache);
     let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
-    Ok(Arc::new(ValueReader(reader)))
+    Ok(Arc::new(Erased(reader)))
 }
 
 pub(in crate::high_level) async fn map<T, B>(
@@ -204,7 +42,7 @@ pub(in crate::high_level) async fn map<T, B>(
     subsystem: String,
     name: &str,
     cache: ErasedReadCache,
-) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+) -> Result<SharedMapReader<T::Payload>, ErasedReaderBuildError<MessageCodecError<T>>>
 where
     T: ClientHandler,
     T::Payload: Clone + ErasedStateCodec + EventIdentity + Send + Sync + 'static,
@@ -213,7 +51,7 @@ where
 {
     let descriptor = map_state::<Utf8KeyCodec, StateCodec<T>>(name).read_cache(cache);
     let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
-    Ok(Arc::new(MapReader(reader)))
+    Ok(Arc::new(Erased(reader)))
 }
 
 pub(in crate::high_level) async fn set<T, B>(
@@ -230,7 +68,7 @@ where
 {
     let descriptor = set_state::<Utf8KeyCodec>(name).read_cache(cache);
     let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
-    Ok(Arc::new(SetReader(reader)))
+    Ok(Arc::new(Erased(reader)))
 }
 
 pub(in crate::high_level) async fn deque<T, B>(
@@ -238,7 +76,7 @@ pub(in crate::high_level) async fn deque<T, B>(
     subsystem: String,
     name: &str,
     cache: ErasedReadCache,
-) -> Result<SharedDequeReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+) -> Result<SharedDequeReader<T::Payload>, ErasedReaderBuildError<MessageCodecError<T>>>
 where
     T: ClientHandler,
     T::Payload: Clone + ErasedStateCodec + EventIdentity + Send + Sync + 'static,
@@ -247,252 +85,20 @@ where
 {
     let descriptor = deque_state::<StateCodec<T>>(name).read_cache(cache);
     let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
-    Ok(Arc::new(DequeReader(reader)))
+    Ok(Arc::new(Erased(reader)))
 }
 
 fn subsystem_name<E>(name: String) -> Result<SubsystemName, ErasedReaderBuildError<E>> {
     Ok(SubsystemName::try_new(name)?)
 }
 
-struct ValueReader<C: Codec, W: Codec, B: ReaderBackend<W>>(StateReader<ValueDescriptor<C>, W, B>);
-
-#[async_trait]
-impl<C, W, B> ErasedValueReader<C> for ValueReader<C, W, B>
-where
-    C: Codec + Send + Sync,
-    C::Payload: Clone + Send + Sync + 'static,
-    W: Codec,
-    W::Payload: Clone,
-    B: ReaderBackend<W>,
-{
-    async fn get(&self, key: String) -> Result<Option<C::Payload>, ErasedStateError> {
-        self.0.get(Key::from(key)).await.map_err(Into::into)
-    }
-}
-
-struct MapReader<C: Codec, W: Codec, B: ReaderBackend<W>>(
-    StateReader<MapDescriptor<Utf8KeyCodec, C>, W, B>,
-);
-
-#[async_trait]
-impl<C, W, B> ErasedMapReader<C> for MapReader<C, W, B>
-where
-    C: Codec + Send + Sync,
-    C::Payload: Clone + Send + Sync + 'static,
-    W: Codec,
-    W::Payload: Clone,
-    B: ReaderBackend<W>,
-{
-    async fn get(
-        &self,
-        key: String,
-        map_key: String,
-    ) -> Result<Option<C::Payload>, ErasedStateError> {
-        self.0
-            .get(Key::from(key), &map_key)
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn contains_key(&self, key: String, map_key: String) -> Result<bool, ErasedStateError> {
-        self.0
-            .contains_key(Key::from(key), &map_key)
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn get_many(
-        &self,
-        key: String,
-        map_keys: Vec<String>,
-    ) -> Result<Vec<Option<C::Payload>>, ErasedStateError> {
-        validate_get_many_len(map_keys.len())?;
-        self.0
-            .get_many(Key::from(key), &map_keys)
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn stream(
-        &self,
-        key: String,
-        direction: ErasedDirection,
-    ) -> Result<BoxStateCursor<(String, C::Payload)>, ErasedStateError> {
-        let stream = self
-            .0
-            .stream(Key::from(key), direction.into())
-            .await
-            .map_err(ErasedStateError::from)?;
-        Ok(Box::new(state_cursor(stream)))
-    }
-
-    async fn keys(
-        &self,
-        key: String,
-        direction: ErasedDirection,
-    ) -> Result<BoxStateCursor<String>, ErasedStateError> {
-        let stream = self
-            .0
-            .keys(Key::from(key), direction.into())
-            .await
-            .map_err(ErasedStateError::from)?;
-        Ok(Box::new(state_cursor(stream)))
-    }
-}
-
-struct SetReader<W: Codec, B: ReaderBackend<W>>(StateReader<SetDescriptor<Utf8KeyCodec>, W, B>);
-
-#[async_trait]
-impl<W, B> ErasedSetReader for SetReader<W, B>
-where
-    W: Codec,
-    W::Payload: Clone,
-    B: ReaderBackend<W>,
-{
-    async fn contains(&self, key: String, member: String) -> Result<bool, ErasedStateError> {
-        self.0
-            .contains(Key::from(key), &member)
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn contains_many(
-        &self,
-        key: String,
-        members: Vec<String>,
-    ) -> Result<Vec<bool>, ErasedStateError> {
-        validate_get_many_len(members.len())?;
-        self.0
-            .contains_many(Key::from(key), &members)
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn is_empty(&self, key: String) -> Result<bool, ErasedStateError> {
-        self.0.is_empty(Key::from(key)).await.map_err(Into::into)
-    }
-
-    async fn keys(
-        &self,
-        key: String,
-        direction: ErasedDirection,
-    ) -> Result<BoxStateCursor<String>, ErasedStateError> {
-        let stream = self
-            .0
-            .keys(Key::from(key), direction.into())
-            .await
-            .map_err(ErasedStateError::from)?;
-        Ok(Box::new(state_cursor(stream)))
-    }
-}
-
-struct DequeReader<C: Codec, W: Codec, B: ReaderBackend<W>>(StateReader<DequeDescriptor<C>, W, B>);
-
-#[async_trait]
-impl<C, W, B> ErasedDequeReader<C> for DequeReader<C, W, B>
-where
-    C: Codec + Send + Sync,
-    C::Payload: Clone + Send + Sync + 'static,
-    W: Codec,
-    W::Payload: Clone,
-    B: ReaderBackend<W>,
-{
-    async fn get(&self, key: String, index: usize) -> Result<Option<C::Payload>, ErasedStateError> {
-        self.0.get(Key::from(key), index).await.map_err(Into::into)
-    }
-
-    async fn len(&self, key: String) -> Result<usize, ErasedStateError> {
-        self.0.len(Key::from(key)).await.map_err(Into::into)
-    }
-
-    async fn is_empty(&self, key: String) -> Result<bool, ErasedStateError> {
-        self.0.is_empty(Key::from(key)).await.map_err(Into::into)
-    }
-
-    async fn peek_front(&self, key: String) -> Result<Option<C::Payload>, ErasedStateError> {
-        self.0.peek_front(Key::from(key)).await.map_err(Into::into)
-    }
-
-    async fn peek_back(&self, key: String) -> Result<Option<C::Payload>, ErasedStateError> {
-        self.0.peek_back(Key::from(key)).await.map_err(Into::into)
-    }
-
-    async fn stream(
-        &self,
-        key: String,
-        direction: ErasedDirection,
-    ) -> Result<BoxStateCursor<C::Payload>, ErasedStateError> {
-        let stream = self
-            .0
-            .stream(Key::from(key), direction.into())
-            .await
-            .map_err(ErasedStateError::from)?;
-        Ok(Box::new(state_cursor(stream)))
-    }
-}
-
-fn state_cursor<T>(
-    stream: impl futures::Stream<Item = Result<T, StateReaderError>> + Send + 'static,
-) -> StateCursor<T> {
-    let stream = stream
-        .map_err(|error| ErasedStateError::from_classified(&error))
-        .boxed();
-    StateCursor::new(stream)
-}
-
-fn validate_get_many_len(found: usize) -> Result<(), ErasedStateError> {
-    if found > MAX_KEYSET_LIMIT {
-        return Err(ErasedStateError::from_classified(&ErasedReadLimitError {
-            found,
-            max: MAX_KEYSET_LIMIT,
-        }));
-    }
-    Ok(())
-}
-
-impl From<StateReaderError> for ErasedStateError {
-    fn from(error: StateReaderError) -> Self {
-        Self::from_classified(&error)
-    }
-}
-
+/// Failure to construct a foreign-language published-state reader.
 #[derive(Debug, Error)]
-#[error("get_many accepts at most {max} keys; got {found}")]
-struct ErasedReadLimitError {
-    found: usize,
-    max: usize,
-}
-
-impl ClassifyError for ErasedReadLimitError {
-    fn classify_error(&self) -> ErrorCategory {
-        ErrorCategory::Permanent
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use color_eyre::Result;
-    use color_eyre::eyre::bail;
-
-    /// The erased boundary accepts the typed API's maximum batch and rejects
-    /// only larger batches. This prevents an FFI caller from allocating an
-    /// uncapped transfer buffer before the shared typed batching begins.
-    #[test]
-    fn get_many_limit_matches_typed_keyset_limit() -> Result<()> {
-        assert!(validate_get_many_len(MAX_KEYSET_LIMIT - 1).is_ok());
-        assert!(validate_get_many_len(MAX_KEYSET_LIMIT).is_ok());
-        let Err(error) = validate_get_many_len(MAX_KEYSET_LIMIT + 1) else {
-            bail!("one key above the limit must be rejected");
-        };
-        assert_eq!(error.classify_error(), ErrorCategory::Permanent);
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "get_many accepts at most {MAX_KEYSET_LIMIT} keys; got {}",
-                MAX_KEYSET_LIMIT + 1
-            )
-        );
-        Ok(())
-    }
+pub enum ErasedReaderBuildError<E> {
+    /// The subsystem name is empty.
+    #[error(transparent)]
+    InvalidSubsystem(#[from] SubsystemNameError),
+    /// The high-level client could not compose the reader.
+    #[error(transparent)]
+    Client(#[from] HighLevelClientError<E>),
 }

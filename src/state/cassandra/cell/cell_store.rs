@@ -12,8 +12,10 @@ use super::{
 };
 use super::{CassandraCellStoreError, MarkerWriteRow, encode};
 use crate::state::cell::Values;
+use crate::state::marker::ProvisionalStage;
 use crate::state::marker::{MarkerRow, MarkerState, encode_committed_payload};
-use crate::state::store::CellBackend;
+use crate::state::store::{CELL_BATCH, CellBackend};
+use smallvec::SmallVec;
 
 impl CellBackend for CassandraStore {
     type Error = CellStoreError;
@@ -31,9 +33,10 @@ impl CellStore for CassandraStore {
         self.counters
             .cell_point_reads
             .fetch_add(1, Ordering::Relaxed);
-        let Some(row) = fetch_point::<Values>(&self.session, &self.queries, collection, cell)
-            .await
-            .map_err(ResolveCellError::Store)?
+        let Some(row) =
+            fetch_point::<Values>(&self.session, &self.queries, collection, cell.as_ref())
+                .await
+                .map_err(ResolveCellError::Store)?
         else {
             return Ok(None);
         };
@@ -59,12 +62,16 @@ impl CellStore for CassandraStore {
         // One IN query, reusing the TTL-bearing batch read; TTL is discarded in
         // the decoder. This read neither resolves cells nor writes state.
         // It leaves marker state unchanged, as `provisional_cell_at` does.
+        let coordinates: SmallVec<[&[u8]; CELL_BATCH.get()]> = unique_coordinates
+            .iter()
+            .map(|coordinate| coordinate.as_bytes())
+            .collect();
         let rows = fetch_batch::<Values>(
             &self.session,
             &self.queries,
             collection,
             section,
-            &unique_coordinates,
+            &coordinates,
         )
         .await
         .map_err(ResolveCellError::Store)?;
@@ -74,10 +81,9 @@ impl CellStore for CassandraStore {
     async fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
-        writes: &'a [(CellKey, ProvisionalWrite)],
-        marker: Option<&'a EventMarker>,
+        stage: ProvisionalStage<'a>,
     ) -> Result<(), Self::Error> {
-        write_provisional(self, collection, writes, marker).await
+        write_provisional(self, collection, stage).await
     }
 
     async fn write_resolved<'a>(

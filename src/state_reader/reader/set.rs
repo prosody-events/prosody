@@ -1,12 +1,12 @@
 //! Standalone reads of committed set membership.
 
-use super::{SetReaderQuery, StateReader};
+use super::StateReader;
 use crate::Key;
 use crate::codec::Codec;
-use crate::state::cell_key::Direction;
+use crate::state::cell::Presence;
 use crate::state::descriptor::SetDescriptor;
-use crate::state::descriptor::map::Query;
 use crate::state::order_codec::OrderedKeyCodec;
+use crate::state::{BorrowedKeyQuery, KeyQuery, KeyRead, ReadQuery, ReadSource};
 use crate::state_reader::{ReaderBackend, StateReaderError};
 use futures::Stream;
 use std::borrow::Borrow;
@@ -23,7 +23,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error when session acquisition or handle binding fails.
+    /// Returns an error when session acquisition, handle binding, key
+    /// encoding, or the read fails.
     pub async fn contains<K: Into<Key>>(
         &self,
         key: K,
@@ -43,7 +44,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error when session acquisition or handle binding fails.
+    /// Returns an error when session acquisition, handle binding, key
+    /// encoding, or the read fails.
     pub async fn contains_many<'a, K: Into<Key>, Q, I>(
         &self,
         key: K,
@@ -65,7 +67,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error when session acquisition or handle binding fails.
+    /// Returns an error when session acquisition, handle binding, key
+    /// encoding, or the read fails.
     pub async fn is_empty<K: Into<Key>>(&self, key: K) -> Result<bool, StateReaderError> {
         let handle = self.bound(key.into()).await?;
         handle
@@ -74,26 +77,24 @@ where
             .map_err(|error| StateReaderError::store(&error))
     }
 
-    /// Streams committed set members in the direction `dir`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when session acquisition or handle binding fails.
-    pub async fn keys<K: Into<Key>>(
-        &self,
+    /// Builds a query over committed keys, in ascending key order.
+    /// The stream borrows the reader. Its first poll acquires a session.
+    /// Acquisition and read errors appear as stream items.
+    pub fn keys<'a, K: Into<Key>>(
+        &'a self,
         key: K,
-        dir: Direction,
-    ) -> Result<impl Stream<Item = Result<KC::Key, StateReaderError>> + 'static, StateReaderError>
-    {
-        self.query(key, dir).keys().await
-    }
-
-    /// Builds a directional set query for partition `key`.
-    pub fn query<K: Into<Key>>(&self, key: K, dir: Direction) -> SetReaderQuery<'_, KC, C, B> {
-        SetReaderQuery {
-            reader: self,
-            key: key.into(),
-            query: Query::new(dir),
-        }
+    ) -> KeyRead<
+        'a,
+        KC,
+        impl ReadSource<
+            Query = BorrowedKeyQuery<'a, KC>,
+            Output: Stream<Item = Result<KC::Key, StateReaderError>> + Send,
+        > + Clone
+        + use<'a, K, KC, C, B>,
+    > {
+        let key = key.into();
+        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
+            self.projected::<Presence>(key, query)
+        })
     }
 }

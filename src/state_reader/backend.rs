@@ -21,12 +21,12 @@ use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
 };
 use crate::state::cell::{Presence, Projection, Values};
-use crate::state::cell_key::{CellKey, Scan, Section};
+use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::descriptor_identity::DescriptorIdentityStore;
 use crate::state::identity::CollectionId;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state::publication::PublicationStore;
-use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store::{Answers, ReadBatch};
 use crate::timers::store::cassandra::CassandraTriggerStoreProvider;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use futures::{Stream, TryStreamExt};
@@ -53,26 +53,28 @@ pub trait CellSource: Clone + Send + Sync + 'static {
 /// Reads one projection through collection evidence without a partition owner.
 pub trait CommittedCellSource<P: Projection>: CellSource {
     /// Reads one committed cell.
-    fn load(
-        &self,
-        id: &CollectionId,
-        cell: &CellKey,
-    ) -> impl Future<Output = Result<Option<P::Payload>, Self::Error>> + Send;
+    fn load<'a>(
+        &'a self,
+        id: &'a CollectionId,
+        cell: CellRef<'a>,
+    ) -> impl Future<Output = Result<Option<P::Payload>, Self::Error>> + Send + use<'a, Self, P>;
 
     /// Returns one committed answer for each input coordinate, in input order.
-    fn load_many(
-        &self,
-        id: &CollectionId,
+    fn load_many<'buf, 'a>(
+        &'a self,
+        id: &'a CollectionId,
         section: Section,
-        batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, Self::Error>> + Send;
+        batch: &'a ReadBatch<'buf>,
+    ) -> impl Future<Output = Result<Answers<Option<P::Payload>>, Self::Error>>
+    + Send
+    + use<'buf, 'a, Self, P>;
 
     /// Streams committed cells in scan order.
     fn scan<'a>(
         &'a self,
         id: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a;
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + use<'a, Self, P>;
 }
 
 impl CellSource for MemoryCells {
@@ -80,20 +82,21 @@ impl CellSource for MemoryCells {
 }
 
 impl<P: Projection> CommittedCellSource<P> for MemoryCells {
-    fn load(
-        &self,
-        id: &CollectionId,
-        cell: &CellKey,
-    ) -> impl Future<Output = Result<Option<P::Payload>, Self::Error>> + Send {
+    fn load<'a>(
+        &'a self,
+        id: &'a CollectionId,
+        cell: CellRef<'a>,
+    ) -> impl Future<Output = Result<Option<P::Payload>, Self::Error>> + Send + use<'a, P> {
         ready(Ok(self.read_committed(id, cell).map(P::from_value)))
     }
 
-    fn load_many(
-        &self,
-        id: &CollectionId,
+    fn load_many<'buf, 'a>(
+        &'a self,
+        id: &'a CollectionId,
         section: Section,
-        batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, Self::Error>> + Send {
+        batch: &'a ReadBatch<'buf>,
+    ) -> impl Future<Output = Result<Answers<Option<P::Payload>>, Self::Error>> + Send + use<'buf, 'a, P>
+    {
         ready(Ok(self.read_committed_many::<P>(id, section, batch)))
     }
 
@@ -101,7 +104,7 @@ impl<P: Projection> CommittedCellSource<P> for MemoryCells {
         &'a self,
         id: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + use<'a, P> {
         self.scan_committed(id, scan)
             .map_ok(|(key, value)| (key, P::from_value(value)))
     }
@@ -117,7 +120,7 @@ impl<P: Projection> CommittedCellSource<P> for ScriptedCellSource {
     async fn load(
         &self,
         id: &CollectionId,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Result<Option<P::Payload>, Self::Error> {
         let read = self.read_committed(id, cell);
         // The test barrier holds each reader after its read and before its answer.
@@ -125,12 +128,13 @@ impl<P: Projection> CommittedCellSource<P> for ScriptedCellSource {
         read.map(|value| value.map(P::from_value))
     }
 
-    fn load_many(
-        &self,
-        id: &CollectionId,
+    fn load_many<'buf, 'a>(
+        &'a self,
+        id: &'a CollectionId,
         section: Section,
-        batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, Self::Error>> + Send {
+        batch: &'a ReadBatch<'buf>,
+    ) -> impl Future<Output = Result<Answers<Option<P::Payload>>, Self::Error>> + Send + use<'buf, 'a, P>
+    {
         ready(self.read_committed_many::<P>(id, section, batch))
     }
 
@@ -138,7 +142,7 @@ impl<P: Projection> CommittedCellSource<P> for ScriptedCellSource {
         &'a self,
         id: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + use<'a, P> {
         self.scan_committed(id, scan)
             .map_ok(|(key, value)| (key, P::from_value(value)))
     }

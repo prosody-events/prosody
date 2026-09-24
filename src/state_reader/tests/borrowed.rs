@@ -1,17 +1,17 @@
 //! Borrowed keys preserve owner and reader results across iterator shapes.
 
 use super::support::{
-    GROUP_A, MemoryHarness, collect_query, each, mock_count, owner_commit, publish_source,
+    GROUP_A, MemoryHarness, collect_stream, each, mock_count, owner_commit, publish_source,
     source_state_key, state_name, subsystem, topic,
 };
 use crate::Key;
-use crate::codec::JsonCodec;
-use crate::state::Direction;
+use crate::codec::{Codec, JsonCodec, SerializeBufGuard};
+use crate::state::cell_key::Coordinate;
 use crate::state::collection::WritableStateSession;
 use crate::state::descriptor::{
     MapDescriptor, MapHandle, SetDescriptor, SetHandle, StateDescriptor, map_state, set_state,
 };
-use crate::state::order_codec::Utf8KeyCodec;
+use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, Utf8KeyCodec};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::CELL_BATCH;
 use crate::state_reader::StateReader;
@@ -20,6 +20,7 @@ use futures::{TryStreamExt, executor::block_on, try_join};
 use quickcheck::QuickCheck;
 use serde_json::Value;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::iter::from_fn;
 use std::sync::Arc;
@@ -33,14 +34,55 @@ const BATCH_LENGTHS: [usize; 5] = [
     MAX_KEYS,
 ];
 
+thread_local! {
+    static OWNED_ENCODINGS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Counts owned key encodings without changing the UTF-8 wire format.
+#[derive(Default)]
+struct CountedUtf8;
+
+impl Codec for CountedUtf8 {
+    type Error = KeyCodecError;
+    type Payload = String;
+
+    const FORMAT_ID: &'static str = Utf8KeyCodec::FORMAT_ID;
+
+    fn deserialize(&mut self, buf: &mut [u8]) -> Result<String, KeyCodecError> {
+        Utf8KeyCodec.deserialize(buf)
+    }
+
+    fn serialize_ref(&mut self, key: &String, buf: &mut Vec<u8>) -> Result<(), KeyCodecError> {
+        Utf8KeyCodec.serialize_ref(key, buf)
+    }
+}
+
+impl OrderedKeyCodec for CountedUtf8 {
+    type Borrowed = str;
+    type Key = String;
+
+    fn encode(key: &str) -> Coordinate {
+        OWNED_ENCODINGS.set(OWNED_ENCODINGS.get() + 1);
+        Utf8KeyCodec::encode(key)
+    }
+
+    fn serialize_key(&mut self, key: &str, buf: &mut Vec<u8>) -> Result<(), KeyCodecError> {
+        Utf8KeyCodec.serialize_key(key, buf)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<String, KeyCodecError> {
+        Utf8KeyCodec::decode(bytes)
+    }
+}
+
 /// Supplies keys without a length estimate.
-fn unknown(keys: &[String]) -> impl Iterator<Item = &str> {
+fn unknown(keys: &[String]) -> impl Iterator<Item = &str> + use<'_> {
     let mut keys = keys.iter();
     from_fn(move || keys.next().map(String::as_str))
 }
 
 #[test]
-fn prop_borrowed_utf8_keys_address_maps_and_sets() {
+fn prop_borrowed_utf8_keys_address_maps_and_sets() -> Result<()> {
     fn property(mut keys: Vec<String>, steps: Vec<(u8, bool)>) -> Result<()> {
         keys.truncate(8);
         keys.push(String::new());
@@ -61,13 +103,20 @@ fn prop_borrowed_utf8_keys_address_maps_and_sets() {
             Ok(())
         })
     }
+    // A filtered batch can need more key bytes than any consecutive batch.
+    let lengths = [2368, 1612, 2650, 697, 690, 2057, 929, 50];
+    let keys = (b'a'..)
+        .zip(lengths)
+        .map(|(letter, len)| char::from(letter).to_string().repeat(len));
+    property(keys.collect(), Vec::new())?;
     QuickCheck::new().quickcheck(property as fn(Vec<String>, Vec<(u8, bool)>) -> Result<()>);
+    Ok(())
 }
 
 async fn check(operations: &[(String, bool)], keys: &[String], limit: usize) -> Result<()> {
     let harness = MemoryHarness::new();
-    let map = map_state::<Utf8KeyCodec, JsonCodec>("borrowed-map").keyset_limit(limit);
-    let set = set_state::<Utf8KeyCodec>("borrowed-set").keyset_limit(limit);
+    let map = map_state::<CountedUtf8, JsonCodec>("borrowed-map").keyset_limit(limit);
+    let set = set_state::<CountedUtf8>("borrowed-set").keyset_limit(limit);
     let mut registry = CollectionDefRegistry::default();
     registry.register(&map, map.collection_def())?;
     registry.register(&set, set.collection_def())?;
@@ -85,14 +134,9 @@ async fn check(operations: &[(String, bool)], keys: &[String], limit: usize) -> 
             model.remove(key);
         }
     }
-    Box::pin(owner_commit(
-        &harness.cells,
-        &registry,
-        &state_key,
-        map,
-        1,
-        |handle| check_map(handle, operations, keys, &model),
-    ))
+    owner_commit(&harness.cells, &registry, &state_key, map, 1, |handle| {
+        check_map(handle, operations, keys, &model)
+    })
     .await?;
     owner_commit(&harness.cells, &registry, &state_key, set, 2, |handle| {
         check_set(handle, operations, keys, &model)
@@ -122,11 +166,11 @@ async fn check(operations: &[(String, bool)], keys: &[String], limit: usize) -> 
     let deps = harness.deps();
     let map = StateReader::new(&deps, sub.clone(), map)?;
     let set = StateReader::new(&deps, sub, set)?;
-    check_readers(map, set, &key, keys, &model).await
+    Box::pin(check_readers(map, set, &key, keys, &model)).await
 }
 
 async fn check_map<S: WritableStateSession>(
-    handle: MapHandle<S, Utf8KeyCodec, JsonCodec>,
+    handle: MapHandle<S, CountedUtf8, JsonCodec>,
     operations: &[(String, bool)],
     keys: &[String],
     model: &BTreeMap<String, Value>,
@@ -153,11 +197,21 @@ async fn check_map<S: WritableStateSession>(
             present.then(|| Value::from(position))
         );
     }
+    let encodings = OWNED_ENCODINGS.get();
+    assert_eq!(handle.contains_many(keys).await?, presence);
+    // Warm the pool with both batch groupings before the reuse check.
+    let filtered = keys.iter().filter(|key| key.len().is_multiple_of(2));
+    let expected: Vec<_> = filtered
+        .clone()
+        .map(|key| model.get(key).cloned())
+        .collect();
+    assert_eq!(handle.get_many(filtered).await?, expected);
+    let storage = SerializeBufGuard::allocation();
+    assert!(storage.1 > 0, "the batch must warm the encoding pool");
     for key in keys.iter().collect::<BTreeSet<_>>() {
-        assert_eq!(
-            handle.get(&Cow::Borrowed(key.as_str())).await?,
-            model.get(key).cloned()
-        );
+        let expected = model.get(key).cloned();
+        assert_eq!(handle.contains_key(key.as_str()).await?, expected.is_some());
+        assert_eq!(handle.get(&Cow::Borrowed(key.as_str())).await?, expected);
     }
     for len in BATCH_LENGTHS {
         assert_eq!(handle.get_many(&keys[..len]).await?, values[..len]);
@@ -175,12 +229,6 @@ async fn check_map<S: WritableStateSession>(
             .await?,
         values
     );
-    let filtered = keys.iter().filter(|key| key.len().is_multiple_of(2));
-    let expected: Vec<_> = filtered
-        .clone()
-        .map(|key| model.get(key).cloned())
-        .collect();
-    assert_eq!(handle.get_many(filtered).await?, expected);
 
     assert_eq!(
         handle
@@ -189,40 +237,48 @@ async fn check_map<S: WritableStateSession>(
         presence
     );
     assert_eq!(handle.contains_many(unknown(keys)).await?, presence);
+    assert_eq!(
+        OWNED_ENCODINGS.get(),
+        encodings,
+        "reads must not encode owned keys"
+    );
+    assert_eq!(
+        SerializeBufGuard::allocation(),
+        storage,
+        "sequential reads must reuse encoding storage"
+    );
     for edge in members.first().into_iter().chain(members.last()) {
         assert_eq!(
             handle
-                .query(Direction::Forward)
+                .entries()
                 .from(edge.as_str())
                 .to(edge.as_str())
-                .entries()
+                .stream()
                 .try_collect::<Vec<_>>()
                 .await?,
             vec![(edge.clone(), model[edge].clone())]
         );
         assert!(
             handle
-                .query(Direction::Backward)
+                .keys()
+                .reverse()
                 .after(edge.as_str())
                 .before(edge.as_str())
-                .keys()
+                .stream()
                 .try_collect::<Vec<_>>()
                 .await?
                 .is_empty()
         );
     }
     assert_eq!(
-        handle
-            .stream(Direction::Forward)
-            .try_collect::<Vec<_>>()
-            .await?,
+        handle.entries().stream().try_collect::<Vec<_>>().await?,
         entries
     );
     Ok(())
 }
 
 async fn check_set<S: WritableStateSession>(
-    handle: SetHandle<S, Utf8KeyCodec>,
+    handle: SetHandle<S, CountedUtf8>,
     operations: &[(String, bool)],
     keys: &[String],
     model: &BTreeMap<String, Value>,
@@ -237,6 +293,7 @@ async fn check_set<S: WritableStateSession>(
         }
         assert_eq!(handle.contains(key.as_str()).await?, *present);
     }
+    let encodings = OWNED_ENCODINGS.get();
     for len in BATCH_LENGTHS {
         assert_eq!(handle.contains_many(&keys[..len]).await?, presence[..len]);
         assert_eq!(
@@ -245,18 +302,20 @@ async fn check_set<S: WritableStateSession>(
         );
     }
     assert_eq!(
-        handle
-            .keys(Direction::Forward)
-            .try_collect::<Vec<_>>()
-            .await?,
+        OWNED_ENCODINGS.get(),
+        encodings,
+        "reads must not encode owned keys"
+    );
+    assert_eq!(
+        handle.keys().stream().try_collect::<Vec<_>>().await?,
         members
     );
     Ok(())
 }
 
 async fn check_readers(
-    map: StateReader<MapDescriptor<Utf8KeyCodec>, JsonCodec>,
-    set: StateReader<SetDescriptor<Utf8KeyCodec>, JsonCodec>,
+    map: StateReader<MapDescriptor<CountedUtf8>, JsonCodec>,
+    set: StateReader<SetDescriptor<CountedUtf8>, JsonCodec>,
     key: &Key,
     keys: &[String],
     model: &BTreeMap<String, Value>,
@@ -266,6 +325,7 @@ async fn check_readers(
     let members: Vec<_> = model.keys().cloned().collect();
     let (map, set, values, presence) = (&map, &set, values.as_slice(), presence.as_slice());
 
+    let encodings = OWNED_ENCODINGS.get();
     each(keys.iter().collect::<BTreeSet<_>>(), |member| async move {
         let (value, present, contained) = try_join!(
             map.get(key.clone(), member.as_str()),
@@ -299,33 +359,40 @@ async fn check_readers(
     assert_eq!(lazy, presence);
     assert_eq!(mapped, presence);
 
+    assert_eq!(
+        OWNED_ENCODINGS.get(),
+        encodings,
+        "reads must not encode owned keys"
+    );
     each(
         [members.first(), members.last()].into_iter().flatten(),
         |edge| async move {
             let (entries, members, map_excluded, set_excluded) = try_join!(
-                collect_query(
-                    map.query(key.clone(), Direction::Forward)
+                collect_stream(
+                    map.entries(key.clone())
                         .from(edge.as_str())
                         .to(edge.as_str())
-                        .entries()
+                        .stream()
                 ),
-                collect_query(
-                    set.query(key.clone(), Direction::Backward)
+                collect_stream(
+                    set.keys(key.clone())
+                        .reverse()
                         .from(edge.as_str())
                         .to(edge.as_str())
-                        .keys()
+                        .stream()
                 ),
-                collect_query(
-                    map.query(key.clone(), Direction::Backward)
+                collect_stream(
+                    map.keys(key.clone())
+                        .reverse()
                         .after(edge.as_str())
                         .before(edge.as_str())
-                        .keys()
+                        .stream()
                 ),
-                collect_query(
-                    set.query(key.clone(), Direction::Forward)
+                collect_stream(
+                    set.keys(key.clone())
                         .after(edge.as_str())
                         .before(edge.as_str())
-                        .keys()
+                        .stream()
                 ),
             )?;
             assert_eq!(entries, vec![(edge.clone(), model[edge].clone())]);

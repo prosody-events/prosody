@@ -2,6 +2,7 @@ use super::*;
 use crate::state::cell::Values;
 use crate::state::store::CellRead;
 use crate::state::tests::support::evidence;
+use crate::state::tests::support::listed;
 
 /// Positional binding-order proof (the one silent-failure surface):
 /// `scylla::Batch` binds its statement list 1:1 with the value list, and on a
@@ -47,9 +48,9 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
         cell_b.clone(),
         ProvisionalWrite::new(Some(data_b.clone()), Committed::new(None), event(1)),
     )];
-    let marker_b = EventMarker::frozen(event(1), &writes_b, &[], &evidence([].into(), None));
+    let marker_b = EventMarker::frozen(event(1), &writes_b, Vec::new(), &evidence([].into(), None));
     store
-        .write_provisional(&c, &writes_b, Some(&marker_b))
+        .write_provisional(&c, listed(&marker_b, &writes_b)?)
         .await?;
     // Pre-seed D resolved so the batch's `cell_delete` has a row to remove.
     store
@@ -68,7 +69,7 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     let marker_payload = encode_marker_payload(&EventMarker::frozen(
         event(2),
         &staged_a,
-        &[],
+        Vec::new(),
         &evidence([].into(), None),
     ))?;
     let payload = encode(&marker_payload)?;
@@ -107,17 +108,23 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     // columns); C written fresh resolved to its own payload (the resolved-write
     // row bound its columns).
     assert_eq!(
-        CellRead::<Values>::read(&reader, &id, &cell_b).await?.0,
+        CellRead::<Values>::read(&reader, &id, cell_b.as_ref())
+            .await?
+            .0,
         Committed::new(Some(data_b))
     );
     assert_eq!(
-        CellRead::<Values>::read(&reader, &id, &cell_c).await?.0,
+        CellRead::<Values>::read(&reader, &id, cell_c.as_ref())
+            .await?
+            .0,
         Committed::new(Some(data_c))
     );
     // D's row was deleted (the `cell_delete` bound its own `kind=Cell` key
     // columns, not the marker slice's `kind=Marker`), so it reads absent.
     assert_eq!(
-        CellRead::<Values>::read(&reader, &id, &cell_d).await?.0,
+        CellRead::<Values>::read(&reader, &id, cell_d.as_ref())
+            .await?
+            .0,
         Committed::new(None)
     );
 

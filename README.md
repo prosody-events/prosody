@@ -240,6 +240,57 @@ count.set(json!(current + 1)).await?;
 
 Keyed-state cache settings are listed in [CONFIGURATION.md](CONFIGURATION.md#keyed-state).
 
+### Query collection state
+
+`KeyQuery<KC, B>` defines a map or set query. The key codec `KC` must match the
+collection. `B` selects bound storage. Typed fluent builders borrow bounds,
+including `&str` for string keys. The stream retains those borrows.
+Forward order is the default. Use `reverse()` for descending order and
+`forward()` to restore ascending order. Direction changes preserve the bounds.
+Start a fluent query with `entries`, `keys`, or `values`:
+
+```rust,ignore
+use std::num::NonZeroUsize;
+
+let page_size = NonZeroUsize::try_from(20_usize)?;
+let entries = map.entries()
+    .prefix("order:")
+    .after("order:0042")
+    .limit(page_size)
+    .stream();
+
+let committed_entries = reader.entries("customer-123")
+    .prefix("order:")
+    .reverse()
+    .limit(page_size)
+    .stream();
+```
+
+Each fluent method consumes and returns the builder. Call `into_query()` to
+extract reusable settings. Apply borrowed settings with `with_query(query)`.
+For owned settings, use `with_query(query.borrowed())`.
+
+Key reads reuse the thread-local encoding buffer pool. Each live stream retains
+its buffer. Sequential reads reuse its capacity after the stream drops.
+A cold pool, larger bounds, or overlapping streams can require allocation.
+
+Query settings support Serde. Store owned settings when bounds must outlive their source.
+
+`stream()` is synchronous and lazy. Standalone streams acquire their session
+on the first poll. Acquisition and read errors appear as stream items.
+
+Use `keys` to read map keys or set members. Set the next page's cursor with
+`after`. Bound and prefix methods narrow the selection and never widen it, so
+their order does not change the selected keys. `prefix` keeps only keys with
+that prefix.
+`range` uses ascending bounds; `from`, `after`, `to`, and `before` follow the
+query direction.
+
+Use `DequeQuery` for deque positions and read results with `values`.
+Its bound methods use positions counted from the front. Deque queries have no
+prefix operation. Erased APIs accept `ErasedKeyQuery`, the string specialization,
+and the same `DequeQuery`. Language clients can wrap these owned builders.
+
 ### Reading another group's state
 
 By default a collection is private to the consumer group that owns it. Mark a

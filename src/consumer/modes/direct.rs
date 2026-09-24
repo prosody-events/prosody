@@ -153,7 +153,7 @@ where
         MemoryLoader::new(),
         None,
     );
-    Box::pin(initialize_consumer::<_, _, _, C, _>(
+    initialize_consumer::<_, _, _, C, _>(
         consumer,
         handler,
         PartitionProviders {
@@ -162,6 +162,6 @@ where
         },
         services,
         IgnoreRequests,
-    ))
+    )
     .await
 }

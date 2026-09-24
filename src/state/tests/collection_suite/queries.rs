@@ -1,18 +1,20 @@
 //! Query bounds match independent key and position models.
 
-use super::{deque, drain, make_session, read_event, registry_and_ref, seed_deque_window};
+use super::{deque, drain, read_event, registry_and_ref, seed_deque_window};
 use crate::codec::JsonCodec;
 use crate::consumer::middleware::deduplication::MemoryDeduplicationStore;
-use crate::state::collection::StateSession;
-use crate::state::descriptor::map::KeysetQuery;
-use crate::state::descriptor::{CellType, CollectionSpec, StateDescriptor, deque_state};
+use crate::state::descriptor::{StateDescriptor, deque_state, map_state, set_state};
 use crate::state::memory::{MemoryCellStore, MemoryCells};
-use crate::state::order_codec::OrderedKeyCodec;
+use crate::state::order_codec::{OrderedKeyCodec, Utf8KeyCodec};
 use crate::state::registry::CollectionDef;
-use crate::state::{Direction, StateKey};
+use crate::state::tests::counting_session;
+use crate::state::tests::support::CountingCellStore;
+use crate::state::{BorrowedKeyQuery, DequeQuery, Direction, KeyQuery, StateKey};
+use crate::test_util::TEST_RUNTIME;
 use color_eyre::Result;
-use quickcheck::{Arbitrary, Gen};
+use quickcheck::{Arbitrary, Gen, QuickCheck};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
@@ -40,27 +42,24 @@ impl Arbitrary for StreamConstraints {
 
 impl StreamConstraints {
     pub(super) fn contains(self, key: i64, dir: Direction) -> bool {
-        match dir {
-            Direction::Forward => (self.start, self.end),
-            Direction::Backward => (self.end, self.start),
-        }
-        .contains(&key)
+        dir.orient(self.start, self.end).contains(&key)
     }
 
-    pub(super) fn apply<S, L>(self, mut query: KeysetQuery<'_, S, L>) -> KeysetQuery<'_, S, L>
+    pub(super) fn apply<'a, KC>(
+        &'a self,
+        mut query: BorrowedKeyQuery<'a, KC>,
+    ) -> BorrowedKeyQuery<'a, KC>
     where
-        S: StateSession,
-        L: CollectionSpec,
-        <L::Cell as CellType>::Key: OrderedKeyCodec<Key = i64, Borrowed = i64>,
+        KC: OrderedKeyCodec<Key = i64, Borrowed = i64>,
     {
-        query = match self.start {
-            Bound::Included(key) => query.from(&key),
-            Bound::Excluded(key) => query.after(&key),
+        query = match self.start.as_ref() {
+            Bound::Included(key) => query.from(key),
+            Bound::Excluded(key) => query.after(key),
             Bound::Unbounded => query,
         };
-        query = match self.end {
-            Bound::Included(key) => query.to(&key),
-            Bound::Excluded(key) => query.before(&key),
+        query = match self.end.as_ref() {
+            Bound::Included(key) => query.to(key),
+            Bound::Excluded(key) => query.before(key),
             Bound::Unbounded => query,
         };
         if let Some(limit) = self.limit {
@@ -68,6 +67,177 @@ impl StreamConstraints {
         }
         query
     }
+}
+
+/// Prefix queries share their population, cursor, and limit across projections.
+#[derive(Clone, Debug)]
+struct PrefixShape {
+    keys: Vec<String>,
+    prefix: String,
+    cursor: Option<String>,
+    limit: Option<NonZeroUsize>,
+    tracked: bool,
+}
+
+impl Arbitrary for PrefixShape {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let word = |g: &mut Gen, max: u8| {
+            (0..u8::arbitrary(g) % (max + 1))
+                .map(|_| char::from(b'a' + u8::arbitrary(g) % 3))
+                .collect::<String>()
+        };
+        let prefix = word(g, 2);
+        let cursor = bool::arbitrary(g).then(|| {
+            if bool::arbitrary(g) {
+                format!("{prefix}{}", word(g, 3))
+            } else {
+                word(g, 3)
+            }
+        });
+        Self {
+            keys: (0..u8::arbitrary(g) % 64).map(|_| word(g, 3)).collect(),
+            prefix,
+            cursor,
+            limit: Option::<NonZeroUsize>::arbitrary(g)
+                .map(|n| NonZeroUsize::MIN.saturating_add(n.get() % 7)),
+            tracked: bool::arbitrary(g),
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let shape = self.clone();
+        let keys = self.keys.shrink().map(move |keys| Self {
+            keys,
+            ..shape.clone()
+        });
+        let cursor = self.cursor.as_ref().map(|_| Self {
+            cursor: None,
+            ..self.clone()
+        });
+        let limit = self.limit.map(|_| Self {
+            limit: None,
+            ..self.clone()
+        });
+        Box::new(keys.chain(cursor).chain(limit))
+    }
+}
+
+impl PrefixShape {
+    /// A key matches when it has the prefix and lies past the cursor in
+    /// walk order.
+    fn contains(&self, key: &str, dir: Direction) -> bool {
+        key.starts_with(self.prefix.as_str())
+            && self.cursor.as_deref().is_none_or(|cursor| match dir {
+                Direction::Forward => key > cursor,
+                Direction::Backward => key < cursor,
+            })
+    }
+
+    /// A cursor past the whole prefix range selects no key in any population.
+    fn selects_nothing(&self, dir: Direction) -> bool {
+        let prefix = self.prefix.as_str();
+        self.cursor.as_deref().is_some_and(|cursor| {
+            !prefix.is_empty()
+                && match dir {
+                    Direction::Forward => cursor > prefix && !cursor.starts_with(prefix),
+                    Direction::Backward => cursor <= prefix,
+                }
+        })
+    }
+
+    fn apply<'a>(&'a self, query: BorrowedKeyQuery<'a>) -> BorrowedKeyQuery<'a> {
+        let mut query = query.prefix(self.prefix.as_str());
+        if let Some(cursor) = self.cursor.as_deref() {
+            query = query.after(cursor);
+        }
+        if let Some(limit) = self.limit {
+            query = query.limit(limit);
+        }
+        query
+    }
+}
+
+async fn run_prefix_query(shape: PrefixShape) -> Result<bool> {
+    let cells = MemoryCells::new();
+    let dedup = MemoryDeduplicationStore::default();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("prefix"));
+    let definition = CollectionDef {
+        keyset_limit: if shape.tracked { 4096 } else { 0 },
+        ..CollectionDef::new(None)
+    };
+    let map = map_state::<Utf8KeyCodec, JsonCodec>("prefix-map");
+    let set = set_state::<Utf8KeyCodec>("prefix-set");
+    let (map_registry, _) = registry_and_ref(&map, "prefix-map", &state_key, definition)?;
+    let (set_registry, _) = registry_and_ref(&set, "prefix-set", &state_key, definition)?;
+    let counting = CountingCellStore::new(MemoryCellStore::new(cells));
+    let map_session = counting_session(&counting, &dedup, &map_registry, &state_key, read_event(0));
+    let set_session = counting_session(&counting, &dedup, &set_registry, &state_key, read_event(1));
+    let map = map.bind(&map_session)?;
+    let set = set.bind(&set_session)?;
+    for key in &shape.keys {
+        map.set(key, Value::from(key.clone())).await?;
+        set.insert(key).await?;
+    }
+
+    let distinct: BTreeSet<_> = shape.keys.iter().cloned().collect();
+    for dir in [Direction::Forward, Direction::Backward] {
+        let mut expected: Vec<_> = distinct
+            .iter()
+            .filter(|key| shape.contains(key, dir))
+            .cloned()
+            .collect();
+        if dir == Direction::Backward {
+            expected.reverse();
+        }
+        expected.truncate(shape.limit.map_or(usize::MAX, NonZeroUsize::get));
+        counting.reset();
+        let entries: Vec<_> = expected
+            .iter()
+            .map(|key| (key.clone(), Value::from(key.clone())))
+            .collect();
+        assert_eq!(
+            drain(
+                map.entries()
+                    .with_query(shape.apply(KeyQuery::new().direction(dir)))
+                    .stream()
+            )
+            .await?,
+            entries
+        );
+        assert_eq!(
+            drain(
+                map.keys()
+                    .with_query(shape.apply(KeyQuery::new().direction(dir)))
+                    .stream()
+            )
+            .await?,
+            expected
+        );
+        assert_eq!(
+            drain(
+                set.keys()
+                    .with_query(shape.apply(KeyQuery::new().direction(dir)))
+                    .stream()
+            )
+            .await?,
+            expected
+        );
+        // A query that selects nothing for every population reads nothing.
+        if shape.selects_nothing(dir) {
+            assert_eq!(counting.durable_reads(), 0, "an empty query read the store");
+        }
+    }
+    Ok(true)
+}
+
+/// Both plans keep the cursor within the prefix, and preserve direction and
+/// result limits. A query that selects no key reads nothing.
+#[test]
+fn prop_prefix_query() {
+    fn property(shape: PrefixShape) -> Result<bool> {
+        TEST_RUNTIME.block_on(run_prefix_query(shape))
+    }
+    QuickCheck::new().quickcheck(property as fn(PrefixShape) -> Result<bool>);
 }
 
 /// Position bounds include empty, reversed, and saturated intervals.
@@ -107,7 +277,29 @@ impl Arbitrary for DequeConstraints {
     }
 }
 
+impl DequeConstraints {
+    /// Crossed position bounds select nothing in any window.
+    fn selects_nothing(&self) -> bool {
+        let start = match self.range.0 {
+            Bound::Included(position) => Some(position),
+            Bound::Excluded(position) => position.checked_add(1),
+            Bound::Unbounded => Some(0),
+        };
+        let end = match self.range.1 {
+            Bound::Included(position) => position.checked_add(1),
+            Bound::Excluded(position) => Some(position),
+            Bound::Unbounded => None,
+        };
+        match (start, end) {
+            (None, _) => true,
+            (Some(start), Some(end)) => start >= end,
+            (Some(_), None) => false,
+        }
+    }
+}
+
 /// Both plans preserve position bounds, direction, and the live-result limit.
+/// A query that selects no position reads nothing.
 pub(crate) async fn run_deque_constraint_parity(shape: DequeConstraints) -> Result<bool> {
     let cells = MemoryCells::new();
     let store = MemoryCellStore::new(cells.clone());
@@ -131,7 +323,8 @@ pub(crate) async fn run_deque_constraint_parity(shape: DequeConstraints) -> Resu
             .map(|i| (!shape.holes.get(i).copied().unwrap_or(false)).then_some((i % 256) as u8))
             .collect();
         seed_deque_window(&store, &collection, i64::from(shape.head), &values).await?;
-        let session = make_session(&cells, &dedup, &registry, &state_key, read_event(0));
+        let counting = CountingCellStore::new(store.clone());
+        let session = counting_session(&counting, &dedup, &registry, &state_key, read_event(0));
         let handle = descriptor.bind(&session)?;
         for dir in [Direction::Forward, Direction::Backward] {
             let mut expected: Vec<_> = values
@@ -144,11 +337,18 @@ pub(crate) async fn run_deque_constraint_parity(shape: DequeConstraints) -> Resu
                 expected.reverse();
             }
             expected.truncate(shape.limit.map_or(usize::MAX, NonZeroUsize::get));
-            let mut query = handle.query(dir).range(shape.range);
+            let mut query = DequeQuery::new().direction(dir).range(shape.range);
             if let Some(limit) = shape.limit {
                 query = query.limit(limit);
             }
-            assert_eq!(drain(query.values()).await?, expected);
+            counting.reset();
+            assert_eq!(
+                drain(handle.values().with_query(query).stream()).await?,
+                expected
+            );
+            if shape.selects_nothing() {
+                assert_eq!(counting.durable_reads(), 0, "an empty query read the store");
+            }
         }
     }
     Ok(true)

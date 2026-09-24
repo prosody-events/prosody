@@ -9,7 +9,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
 use crate::state::cell::Projection;
-use crate::state::cell_key::{CellKey, Scan, Section};
+use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::descriptor::StateDescriptor;
 use crate::state::descriptor_identity::{
     DescriptorIdentityStore, DurableDescriptorIdentity, RegisterOutcome,
@@ -20,7 +20,7 @@ use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::publication::StatePublication;
 use crate::state::registry::CollectionDef;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store::{Answers, ReadBatch};
 use crate::state::tests::support::ScriptedPublicationStore;
 use crate::state::{StateName, StateType};
 use crate::state_reader::backend::{ReaderComponents, ScriptedReaderBackend};
@@ -86,10 +86,6 @@ pub(in crate::state_reader::tests) enum FaultPoint {
     AtOpen,
     /// Yield `n` present cells, then error (scan only).
     AfterYields(usize),
-    /// Drop the last value from the returned buffer (batch read only). It
-    /// models a downstream `CommittedCellSource` that breaks the index
-    /// alignment its contract promises.
-    ShortBatch,
 }
 
 /// A committed cell source that can fault deterministically per source. It
@@ -170,7 +166,7 @@ impl ScriptedCellSource {
     pub(crate) fn read_committed(
         &self,
         id: &CollectionId,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Result<Option<Bytes>, StateAccessError> {
         let segment = id.state_key().segment_id;
         self.record_read(segment);
@@ -184,26 +180,21 @@ impl ScriptedCellSource {
         &self,
         id: &CollectionId,
         section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError> {
+        batch: &ReadBatch<'_>,
+    ) -> Result<Answers<Option<P::Payload>>, StateAccessError> {
         let segment = id.state_key().segment_id;
         self.record_read(segment);
-        let fault = self.fault_of(segment);
-        if matches!(fault, Some(FaultPoint::AtOpen)) {
+        if matches!(self.fault_of(segment), Some(FaultPoint::AtOpen)) {
             return Err(StateAccessError::store(&ScriptedFaultError));
         }
-        let mut buffer = self.inner.read_committed_many::<P>(id, section, batch);
-        if matches!(fault, Some(FaultPoint::ShortBatch)) {
-            buffer.pop();
-        }
-        Ok(buffer)
+        Ok(self.inner.read_committed_many::<P>(id, section, batch))
     }
 
     pub(crate) fn scan_committed<'a>(
         &'a self,
         id: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + use<'a> {
         self.scan_hint.store(
             scan.fetch_hint.map_or(0, NonZeroUsize::get),
             Ordering::Relaxed,

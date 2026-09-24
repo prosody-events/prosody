@@ -22,8 +22,11 @@ pub use keyset::KeysetFrameError;
 pub(crate) use keyset::{MapKeysetCodec, MapKeysetKey};
 pub(crate) use membership::KeysetLayout;
 
-pub(crate) use query::Query;
-pub use query::{KeyItem, KeysetQuery, MapQuery, MapStreamItem, SetQuery};
+use crate::state::cell::{Presence, Values};
+use crate::state::query::Query;
+use crate::state::{BorrowedKeyQuery, KeyQuery, KeyRead, ReadQuery, ReadSource};
+pub use query::{KeyItem, MapStreamItem};
+pub(crate) use query::{projected, selected};
 
 use super::{
     CellCodecError, CellStateError, CellType, CollectionSpec, ContextOf, Descriptor, FromSession,
@@ -33,7 +36,6 @@ use super::{
 use crate::codec::Codec;
 use crate::codec::JsonCodec;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::cell_key::Direction;
 #[cfg(test)]
 use crate::state::cell_key::{CellKey, Coordinate};
 #[cfg(test)]
@@ -93,16 +95,13 @@ where
     KC: OrderedKeyCodec + 'static,
     V: CellType<Key = UnitKey>,
 {
-    pub(crate) fn cells(&self) -> &Collection<S, MapKind<KC, V>> {
-        &self.cells
-    }
-
     /// Reads and resolves the value for `key` (`None` when absent).
     ///
     /// # Errors
     ///
-    /// Returns a codec error (`Permanent`) when the cell does not decode, a
-    /// resolution error, or an access error from the session.
+    /// Returns a key codec error (`Permanent`) when `key` does not encode, a
+    /// codec error (`Permanent`) when the cell does not decode, a resolution
+    /// error, or an access error from the session.
     #[instrument(
         name = "map.get",
         skip_all,
@@ -127,7 +126,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a session access error.
+    /// Returns a key codec error (`Permanent`) when a key does not encode, or a
+    /// session access error.
     #[instrument(
         name = "map.contains_key",
         skip_all,
@@ -147,15 +147,14 @@ where
 
     /// Reads one value per input key, in input order. Duplicate keys retain
     /// their positions. One scoped operation prevents session mutations
-    /// between batch reads. Keys are addressed directly. A key outside the
-    /// tracked keyset reads `None`.
-    /// Result buffers reserve the iterator's lower size estimate and grow as
-    /// needed.
+    /// between batch reads. Reads address cells directly without a keyset
+    /// lookup. Result buffers reserve the iterator's lower size estimate
+    /// and grow as needed.
     ///
     /// # Errors
     ///
-    /// Returns a codec, resolution, or session access error. Errors return no
-    /// partial result.
+    /// Returns a key codec, codec, resolution, or session access error. Errors
+    /// return no partial result.
     #[instrument(
         name = "map.get_many",
         skip_all,
@@ -188,7 +187,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a session access error.
+    /// Returns a key codec error (`Permanent`) when a key does not encode, or a
+    /// session access error.
     #[instrument(
         name = "map.contains_many",
         skip_all,
@@ -220,8 +220,9 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a codec error (`Permanent`) when `value` does not encode, or an
-    /// access error from the session.
+    /// Returns a key codec error (`Permanent`) when `key` does not encode, a
+    /// codec error (`Permanent`) when `value` does not encode, or an access
+    /// error from the session.
     #[instrument(
         name = "map.set",
         skip_all,
@@ -246,7 +247,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a session access error.
+    /// Returns a key codec error (`Permanent`) when a key does not encode, or a
+    /// session access error.
     #[instrument(
         name = "map.remove",
         skip_all,
@@ -279,12 +281,13 @@ where
         Ok(())
     }
 
-    /// Streams live entries in key order, ascending for [`Direction::Forward`].
+    /// Builds a query over live entries in ascending key order.
+    /// Call [`ReadQuery::stream`] to create the lazy stream.
     ///
     /// A tracked keyset fixes membership when the stream starts. Values remain
     /// live: each chunk reads current values and skips absent cells. Later key
     /// additions do not appear. A chunk resolves all its values before
-    /// emission; a failed chunk emits only its error. [`MapQuery::limit`]
+    /// emission; a failed chunk emits only its error. [`KeyQuery::limit`]
     /// sizes each fetch.
     ///
     /// An overflowed or invalid keyset selects a range scan. This scan captures
@@ -297,24 +300,43 @@ where
     /// hold no admission; range scans run without admission after planning.
     /// The handler can mutate this map between items. Every completion checks
     /// the attempt fence, including errors and exhaustion.
-    pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapStreamItem<KC, V>> + '_
+    pub fn entries<'a>(
+        &'a self,
+    ) -> KeyRead<
+        'a,
+        KC,
+        impl ReadSource<
+            Query = BorrowedKeyQuery<'a, KC>,
+            Output: Stream<Item = MapStreamItem<KC, V>> + Send,
+        > + Clone
+        + use<'a, S, KC, V>,
+    >
     where
         for<'s> ContextOf<'s, V>: FromSession<'s, S>,
     {
-        self.query(dir).entries()
+        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
+            projected::<_, _, Values>(&self.cells, query)
+        })
     }
 
-    /// Streams live keys without value decoding or resolution.
+    /// Builds a query over live keys without value decoding or resolution.
     /// Message-backed maps perform no Kafka fetches. Storage presence reads
     /// still occur, and a corrupt value does not hide its key.
-    /// Source selection, consistency, and admission follow [`Self::stream`].
-    pub fn keys(&self, dir: Direction) -> impl Stream<Item = KeyItem<MapKind<KC, V>>> + '_ {
-        self.query(dir).keys()
-    }
-
-    /// Builds a directional stream query.
-    pub fn query(&self, dir: Direction) -> MapQuery<'_, S, KC, V> {
-        KeysetQuery::new(&self.cells, Query::new(dir))
+    /// Source selection, consistency, and admission follow [`Self::entries`].
+    pub fn keys<'a>(
+        &'a self,
+    ) -> KeyRead<
+        'a,
+        KC,
+        impl ReadSource<
+            Query = BorrowedKeyQuery<'a, KC>,
+            Output: Stream<Item = KeyItem<MapKind<KC, V>>> + Send,
+        > + Clone
+        + use<'a, S, KC, V>,
+    > {
+        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
+            projected::<_, _, Presence>(&self.cells, query)
+        })
     }
 
     /// Reports whether the map holds no live entries.

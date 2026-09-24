@@ -5,11 +5,11 @@
 //! directly, so the invariants hold for every collection that runs through the
 //! same scope.
 //!
-//! The flagship is [`prop_write_invocations_are_atomic`], a trace/model
-//! property over generated invocations. Its model is a plain map: the journal's
-//! reverse-order fold must answer every in-invocation read, a successful merge
-//! must leave the event overlay exactly at the model, and every other exit must
-//! leave the overlay exactly as the invocation found it.
+//! The flagship is [`invocation::prop_write_invocations_are_atomic`], a
+//! trace/model property over generated invocations. Its model is a plain map:
+//! the journal's reverse-order fold must answer every in-invocation read, a
+//! successful merge must leave the event overlay exactly at the model, and
+//! every other exit must leave the overlay exactly as the invocation found it.
 //!
 //! The sibling [`plans`] module pins the managed stream drivers that a plan
 //! feeds. It covers order, error termination, the per-emission fence, and the
@@ -47,10 +47,15 @@ use educe::Educe;
 use futures::StreamExt;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::iter::{empty, once};
+use std::pin::pin;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use uuid::Uuid;
+
+mod invocation;
+mod reads;
 
 /// The probe collection's registered name.
 const PROBE: &str = "pair-probe";
@@ -83,17 +88,16 @@ struct PairHandle<S> {
     cells: Collection<S, PairLayout>,
 }
 
-/// A stateful helper in the author-facing form: it takes the operation, never a
-/// handle, so it cannot acquire admission of its own.
-async fn read_family<C>(
+/// Returns a read future after its local key leaves scope.
+fn read_family<C>(
     op: &mut C,
     family: CellFamily<C::Layout, ProbeCell>,
     key: i64,
-) -> Result<Option<i64>, ProbeError>
+) -> impl Future<Output = Result<Option<i64>, ProbeError>> + use<'_, C>
 where
     C: CollectionRead,
 {
-    op.get(family, &key).await
+    op.get(family, &key)
 }
 
 /// The mutating twin of [`read_family`].
@@ -187,381 +191,6 @@ fn staged_state(dirty: &DirtyStore, id: &CollectionId) -> Result<BTreeMap<(i8, i
         state.insert((i8::from(cell.section), key), value);
     }
     Ok(state)
-}
-
-/// Which probe family a generated command addresses.
-#[derive(Clone, Copy, Debug)]
-enum Family {
-    Left,
-    Right,
-}
-
-impl Family {
-    fn token(self) -> CellFamily<PairLayout, ProbeCell> {
-        match self {
-            Self::Left => PairLayout::LEFT,
-            Self::Right => PairLayout::RIGHT,
-        }
-    }
-
-    fn section(self) -> i8 {
-        i8::from(self.token().section())
-    }
-}
-
-impl Arbitrary for Family {
-    fn arbitrary(g: &mut Gen) -> Self {
-        if bool::arbitrary(g) {
-            Self::Left
-        } else {
-            Self::Right
-        }
-    }
-}
-
-/// One command inside a generated invocation.
-#[derive(Clone, Debug)]
-enum Command {
-    Set(Family, i64, i64),
-    Clear(Family, i64),
-    Get(Family, i64),
-    GetMany(Family, Vec<i64>),
-    Contains(Family, i64),
-    ContainsMany(Family, Vec<i64>),
-    Take(Family, i64),
-    ClearCollection,
-}
-
-impl Arbitrary for Command {
-    fn arbitrary(g: &mut Gen) -> Self {
-        // A tiny key pool, so overwrites, clear-then-read, and read-your-writes
-        // actually occur inside one invocation.
-        let key = i64::from(u8::arbitrary(g) % 3);
-        let family = Family::arbitrary(g);
-        match u8::arbitrary(g) % 8 {
-            0 => Self::Set(family, key, i64::from(u8::arbitrary(g))),
-            1 => Self::Clear(family, key),
-            2 => Self::Get(family, key),
-            3 => Self::GetMany(
-                family,
-                (0..u8::arbitrary(g) % 4)
-                    .map(|_| i64::from(u8::arbitrary(g) % 3))
-                    .collect(),
-            ),
-            4 => Self::Contains(family, key),
-            5 => Self::ContainsMany(
-                family,
-                (0..u8::arbitrary(g) % 4)
-                    .map(|_| i64::from(u8::arbitrary(g) % 3))
-                    .collect(),
-            ),
-            6 => Self::Take(family, key),
-            _ => Self::ClearCollection,
-        }
-    }
-
-    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        match *self {
-            Self::Set(family, key, value) => Box::new(
-                value
-                    .shrink()
-                    .map(move |value| Self::Set(family, key, value)),
-            ),
-            _ => Box::new(empty()),
-        }
-    }
-}
-
-/// How a generated invocation ends.
-#[derive(Clone, Copy, Debug)]
-enum Exit {
-    /// The authored body returns `Ok`: the journal merges.
-    Ok,
-    /// The authored body returns `Err`: the journal is dropped.
-    Err,
-    /// The session is terminated before the body returns: the final fence
-    /// refuses and the journal is dropped.
-    Terminated,
-}
-
-impl Arbitrary for Exit {
-    fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 3 {
-            0 => Self::Err,
-            1 => Self::Terminated,
-            _ => Self::Ok,
-        }
-    }
-}
-
-/// One generated case: some already-staged state, one invocation's commands,
-/// and how that invocation ends.
-#[derive(Clone, Debug)]
-struct Invocation {
-    seeded: Vec<(Family, i64, i64)>,
-    commands: Vec<Command>,
-    exit: Exit,
-}
-
-impl Arbitrary for Invocation {
-    fn arbitrary(g: &mut Gen) -> Self {
-        let seeded = (0..u8::arbitrary(g) % 3)
-            .map(|_| {
-                (
-                    Family::arbitrary(g),
-                    i64::from(u8::arbitrary(g) % 3),
-                    i64::from(u8::arbitrary(g)),
-                )
-            })
-            .collect();
-        // Zero to six commands: zero exercises the empty-journal invocation
-        // (admission plus a no-op merge), six is past `JOURNAL_INLINE`, so the
-        // spill path is generated as well as the inline one.
-        let count = u8::arbitrary(g) % 7;
-        let commands = (0..count).map(|_| Command::arbitrary(g)).collect();
-        Self {
-            seeded,
-            commands,
-            exit: Exit::arbitrary(g),
-        }
-    }
-
-    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        let seeded = self.seeded.clone();
-        let exit = self.exit;
-        Box::new(self.commands.shrink().map(move |commands| Self {
-            seeded: seeded.clone(),
-            commands,
-            exit,
-        }))
-    }
-}
-
-/// What the invocation's journal fold should answer, and whether a whole-layout
-/// reset merged with it.
-#[derive(Clone, Default)]
-struct Model {
-    cells: BTreeMap<(i8, i64), Option<i64>>,
-    reset: bool,
-}
-
-impl Model {
-    /// The model's answer for one cell: the fold's last write, or absent when
-    /// the model says nothing (the probe collection starts empty, so every
-    /// value it can hold went through the model).
-    fn visible(&self, family: Family, key: i64) -> Option<i64> {
-        self.cells
-            .get(&(family.section(), key))
-            .copied()
-            .unwrap_or_default()
-    }
-
-    /// The sections a merge of this model marks cleared.
-    fn cleared(&self) -> Vec<i8> {
-        if self.reset {
-            <PairLayout as CollectionLayout>::SECTIONS
-                .iter()
-                .map(|section| i8::from(*section))
-                .collect()
-        } else {
-            Vec::new()
-        }
-    }
-}
-
-/// Runs one invocation's commands against `op`, asserting every in-invocation
-/// read against the model as it happens — so no later command can heal an
-/// earlier divergence.
-async fn run_commands<C>(
-    op: &mut C,
-    commands: &[Command],
-    model: &mut Model,
-) -> Result<(), ProbeError>
-where
-    C: CollectionWrite<Layout = PairLayout>,
-{
-    for command in commands {
-        match command {
-            &Command::Set(family, key, value) => {
-                op.set(family.token().at(&key), value)?;
-                model.cells.insert((family.section(), key), Some(value));
-            }
-            &Command::Clear(family, key) => {
-                op.clear(family.token().at(&key));
-                model.cells.insert((family.section(), key), None);
-            }
-            &Command::Get(family, key) => {
-                assert_eq!(
-                    op.get(family.token(), &key).await?,
-                    model.visible(family, key),
-                    "an in-invocation read folds the journal last-write-wins"
-                );
-            }
-            Command::GetMany(family, keys) => {
-                let expected: Vec<Option<i64>> = keys
-                    .iter()
-                    .map(|key| model.visible(*family, *key))
-                    .collect();
-                assert_eq!(
-                    op.get_many(family.token(), keys).await?.into_vec(),
-                    expected,
-                    "a batch read answers every position from the same journal fold"
-                );
-            }
-            &Command::Contains(family, key) => {
-                assert_eq!(
-                    op.contains(family.token(), &key).await?,
-                    model.visible(family, key).is_some(),
-                    "presence agrees with the journal fold, without resolving"
-                );
-            }
-            Command::ContainsMany(family, keys) => {
-                let expected: Vec<bool> = keys
-                    .iter()
-                    .map(|key| model.visible(*family, *key).is_some())
-                    .collect();
-                assert_eq!(
-                    op.contains_many(family.token(), keys).await?.into_vec(),
-                    expected,
-                    "batch presence agrees with each journal-fold position"
-                );
-            }
-            &Command::Take(family, key) => {
-                assert_eq!(
-                    op.take(family.token(), &key).await?,
-                    model.visible(family, key),
-                    "take answers from the journal fold, then clears"
-                );
-                model.cells.insert((family.section(), key), None);
-            }
-            Command::ClearCollection => {
-                op.clear_collection();
-                // A reset hides every section of the layout — including the
-                // probe's reserved id gap — and the merge discards the
-                // sections' already-staged cells.
-                model.cells.clear();
-                model.reset = true;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Drives one generated invocation against the real scope and a plain-map
-/// model, asserting the in-invocation reads after every command and the
-/// overlay's exact contents at exit.
-async fn run_invocation(case: Invocation) -> Result<()> {
-    let registry = value_registry(&probe_descriptor())?;
-    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("probe-key"));
-    let (session, dirty) = session_with_dirty(MemoryLoader::new(), registry, state_key.clone());
-    let handle = bind_probe(&session)?;
-    // The session's own key and the collection's own canonical name — never a
-    // value the test invented for its bookkeeping.
-    let id = CollectionId::new(
-        state_key,
-        StateType::Application,
-        handle.cells.name().clone(),
-    );
-
-    // Seed through real invocations, so the pre-state is exactly what the
-    // production path leaves behind.
-    let mut seeded = Model::default();
-    for &(family, key, value) in &case.seeded {
-        handle
-            .cells
-            .write(async move |op| op.set(family.token().at(&key), value))
-            .await?;
-        seeded.cells.insert((family.section(), key), Some(value));
-    }
-    let before = staged_state(&dirty, &id)?;
-
-    let commands = case.commands.clone();
-    let exit = case.exit;
-    let terminator = session.clone();
-    let outcome: Result<Model, ProbeError> = handle
-        .cells
-        .write(async move |op| {
-            let mut model = seeded;
-            op.set(PairLayout::LEFT.at(&2), 1)?;
-            model.cells.insert((Family::Left.section(), 2), Some(1));
-            op.clear(PairLayout::LEFT.at(&2));
-            model.cells.insert((Family::Left.section(), 2), None);
-            assert_eq!(
-                op.contains_many(PairLayout::LEFT, &[2, 3, 2])
-                    .await?
-                    .into_vec(),
-                vec![false, false, false],
-                "batch presence sees staged clears, absent keys, and duplicates"
-            );
-            run_commands(op, &commands, &mut model).await?;
-            assert_eq!(
-                op.journal_spilled(),
-                op.journal_len() > JOURNAL_INLINE,
-                "the journal leaves its inline capacity only when it must"
-            );
-            match exit {
-                Exit::Ok => Ok(model),
-                Exit::Err => Err(CellStateError::Access(StateAccessError::Unavailable)),
-                Exit::Terminated => {
-                    terminator.terminate();
-                    Ok(model)
-                }
-            }
-        })
-        .await;
-
-    let after = staged_state(&dirty, &id)?;
-    let cleared: Vec<i8> = dirty
-        .cleared_sections(&id)
-        .into_iter()
-        .map(i8::from)
-        .collect();
-    match (case.exit, outcome) {
-        (Exit::Ok, Ok(model)) => {
-            assert_eq!(
-                after, model.cells,
-                "a successful merge replays the journal onto the overlay exactly"
-            );
-            assert_eq!(
-                cleared,
-                model.cleared(),
-                "a merged reset marks every declared section, and nothing else marks any"
-            );
-        }
-        (Exit::Err | Exit::Terminated, Err(_)) => {
-            assert_eq!(
-                after, before,
-                "a failed or fenced invocation leaves the overlay untouched"
-            );
-            assert!(
-                cleared.is_empty(),
-                "a failed or fenced invocation stages no section clear"
-            );
-        }
-        (exit, outcome) => {
-            return Err(eyre!(
-                "invocation ended as {exit:?} but returned ok={}",
-                outcome.is_ok()
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Invariant: a write invocation is atomic. Every in-invocation read folds the
-/// journal in reverse order; a successful merge replays it forward onto the
-/// event overlay exactly; and an authored error or a fenced final validation
-/// leaves the overlay exactly as the invocation found it.
-#[test]
-fn prop_write_invocations_are_atomic() {
-    fn property(case: Invocation) -> TestResult {
-        let described = format!("{case:?}");
-        match TEST_RUNTIME.block_on(run_invocation(case)) {
-            Ok(()) => TestResult::passed(),
-            Err(error) => TestResult::error(format!("{described}: {error}")),
-        }
-    }
-    QuickCheck::new().quickcheck(property as fn(Invocation) -> TestResult);
 }
 
 /// The generated read and write expansions run, not merely typecheck: a
@@ -696,16 +325,15 @@ fn cancelled_write_drops_the_journal_and_releases_admission() -> Result<()> {
         let before = staged_state(&dirty, &id)?;
 
         let parked = Notify::new();
-        let mut invocation = Box::pin(handle.cells.write(async |op| {
-            op.set(PairLayout::LEFT.at(&2), 77)?;
-            parked.notified().await;
-            Ok::<(), ProbeError>(())
-        }));
-        assert!(
-            futures::poll!(invocation.as_mut()).is_pending(),
-            "the invocation must park inside its scope"
-        );
-        drop(invocation);
+        let pending = {
+            let mut invocation = pin!(handle.cells.write(async |op| {
+                op.set(PairLayout::LEFT.at(&2), 77)?;
+                parked.notified().await;
+                Ok::<(), ProbeError>(())
+            }));
+            futures::poll!(invocation.as_mut()).is_pending()
+        };
+        assert!(pending, "the invocation must park inside its scope");
 
         assert_eq!(
             staged_state(&dirty, &id)?,
@@ -720,129 +348,6 @@ fn cancelled_write_drops_the_journal_and_releases_admission() -> Result<()> {
             "the pre-cancel value stands"
         );
         Ok(())
-    })
-}
-
-/// Steady-state I/O budget: a warm value read performs zero lower-store reads,
-/// and opening a fresh operation does not change that — admission is not a
-/// cache boundary.
-#[test]
-fn warm_reads_perform_no_additional_lower_reads() -> Result<()> {
-    TEST_RUNTIME.block_on(async {
-        let descriptor: ValueDescriptor<I64Codec> = value_state("warm-value");
-        let registry = value_registry(&descriptor)?;
-        let lower = CountingCellStore::new(MemoryCellStore::new(MemoryCells::new()));
-        let cached = Cached::new(test_db::cache("collection-warm")?, lower.clone());
-        let state_key = StateKey::new(Uuid::new_v4(), Arc::from("warm-key"));
-        let session = session_over(MemoryLoader::new(), registry, state_key, cached);
-
-        let handle = descriptor
-            .bind(&session)
-            .map_err(|e| eyre!("bind failed: {e}"))?;
-        handle.set(7).await?;
-        handle.commit().await?;
-
-        assert_eq!(
-            handle.get().await?,
-            Some(7),
-            "the committed value reads back"
-        );
-        let warm = lower.lower_reads();
-        assert_eq!(handle.get().await?, Some(7), "the warm re-read");
-        assert_eq!(
-            lower.lower_reads(),
-            warm,
-            "a warm re-read performs no lower-store read"
-        );
-
-        let fresh = descriptor
-            .bind(&session)
-            .map_err(|e| eyre!("re-bind failed: {e}"))?;
-        assert_eq!(fresh.get().await?, Some(7), "the fresh operation's read");
-        assert_eq!(
-            lower.lower_reads(),
-            warm,
-            "opening a new operation is not a cache boundary"
-        );
-        Ok(())
-    })
-}
-
-/// A batch read stays index-aligned **across** the lower store's batch
-/// boundary: a `CELL_BATCH`-crossing query answers every position, in input
-/// order, with duplicates answered per position.
-///
-/// Deterministic because the generated property's key pool is tiny and its
-/// queries never reach `CELL_BATCH`, so no random trace can cross the split
-/// the sub-batching performs.
-#[test]
-fn batch_reads_stay_aligned_across_the_store_batch_boundary() -> Result<()> {
-    // One past a full batch, so the query spans exactly two sub-batches and
-    // lands on the 127/128/129 boundary.
-    let populated = CELL_BATCH.get() as i64 + 1;
-    TEST_RUNTIME.block_on(async {
-        let registry = value_registry(&probe_descriptor())?;
-        let state_key = StateKey::new(Uuid::new_v4(), Arc::from("probe-key"));
-        let (session, _dirty) = session_with_dirty(MemoryLoader::new(), registry, state_key);
-        let handle = bind_probe(&session)?;
-        handle
-            .cells
-            .write(async |op| {
-                for key in 0..populated {
-                    op.set(PairLayout::LEFT.at(&key), key * 10)?;
-                }
-                Ok::<(), ProbeError>(())
-            })
-            .await?;
-
-        // The boundary key at both ends, so a dropped or reordered sub-batch
-        // cannot be masked by a palindromic query.
-        let queries: Vec<i64> = once(CELL_BATCH.get() as i64)
-            .chain(0..populated)
-            .chain(once(CELL_BATCH.get() as i64))
-            .collect();
-        let answers = handle
-            .cells
-            .read(async |op| op.get_many(PairLayout::LEFT, &queries).await)
-            .await?;
-
-        let expected: Vec<Option<i64>> = queries.iter().map(|key| Some(key * 10)).collect();
-        assert_eq!(
-            answers.into_vec(),
-            expected,
-            "every position of a batch-crossing read answers its own key"
-        );
-        Ok(())
-    })
-}
-
-/// A managed stream leaked past its attempt fences on **exhaustion**: an empty
-/// coordinate plan errors `Terminated` at its first pull rather than reporting
-/// a clean end. The plan is captured before the bump, so the error can only
-/// come from the driver's per-emission fence.
-#[test]
-fn empty_coordinate_plan_fences_on_exhaustion() -> Result<()> {
-    TEST_RUNTIME.block_on(async {
-        let registry = value_registry(&probe_descriptor())?;
-        let state_key = StateKey::new(Uuid::new_v4(), Arc::from("probe-key"));
-        let (session, _dirty) = session_with_dirty(MemoryLoader::new(), registry, state_key);
-        let handle = bind_probe(&session)?;
-
-        let plan = handle
-            .cells
-            .read(async |op| op.coordinates(PairLayout::LEFT, Vec::new()))
-            .await;
-        session.reset(RepinProof::for_test()).await;
-
-        let stream = plan.projected::<Values>();
-        futures::pin_mut!(stream);
-        match stream.next().await {
-            Some(Err(CellStateError::Access(StateAccessError::Terminated))) => Ok(()),
-            other => Err(eyre!(
-                "a leaked empty plan must fence Terminated on exhaustion, got ok={}",
-                other.is_some()
-            )),
-        }
     })
 }
 

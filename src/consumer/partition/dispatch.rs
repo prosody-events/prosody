@@ -240,13 +240,13 @@ where
 ///
 /// Yields [`UncommittedEvent`] items (each wrapping an [`UncommittedMessage`]
 /// or a timer) ready for processing.
-pub(super) fn build_message_stream<T, P>(
-    offsets: &OffsetTracker,
+pub(super) fn build_message_stream<'a, T, P>(
+    offsets: &'a OffsetTracker,
     mut message_rx: Receiver<ConsumerRecord<P>>,
-    group_id: &str,
-    highest_offset_seen: &mut i64,
-    allowed_events: Option<&AhoCorasick>,
-) -> impl Stream<Item = UncommittedEvent<T, P>>
+    group_id: &'a str,
+    highest_offset_seen: &'a mut i64,
+    allowed_events: Option<&'a AhoCorasick>,
+) -> impl Stream<Item = UncommittedEvent<T, P>> + use<'a, T, P>
 where
     T: TriggerStore,
     P: Send + Sync + 'static + EventType,

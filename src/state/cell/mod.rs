@@ -22,7 +22,7 @@
 
 use super::event_ref::EventRef;
 use super::marker::ReaderEvidence;
-use super::store_types::CELL_BATCH;
+use super::store::CELL_BATCH;
 use bytes::Bytes;
 use std::fmt::Debug;
 use std::num::NonZeroUsize;

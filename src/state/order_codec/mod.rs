@@ -35,6 +35,18 @@ pub trait OrderedKeyCodec: Codec<Payload = Self::Key, Error = KeyCodecError> {
     /// Encodes a key to its order-preserving bytes.
     fn encode(key: &Self::Borrowed) -> Coordinate;
 
+    /// Appends a borrowed key to reusable encoding storage.
+    /// The output must match both `encode` and `Codec::serialize_ref`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the key cannot be encoded.
+    fn serialize_key(
+        &mut self,
+        key: &Self::Borrowed,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), KeyCodecError>;
+
     /// Decodes order-preserving bytes back to the logical key.
     ///
     /// # Errors
@@ -42,6 +54,13 @@ pub trait OrderedKeyCodec: Codec<Payload = Self::Key, Error = KeyCodecError> {
     /// Returns [`KeyCodecError`] when the bytes are not a valid encoding (wrong
     /// length, invalid UTF-8).
     fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError>;
+}
+
+/// An ordered codec whose key prefixes are encoded byte prefixes.
+pub trait PrefixKeyCodec: OrderedKeyCodec {
+    /// Tests whether `key` starts with `prefix`.
+    /// The answer must equal the byte prefix test of the encoded keys.
+    fn starts_with(key: &Self::Borrowed, prefix: &Self::Borrowed) -> bool;
 }
 
 /// The unit address: the single cell of a one-cell collection, at the empty
@@ -65,6 +84,14 @@ impl OrderedKeyCodec for UnitKey {
 
     fn encode((): &Self::Borrowed) -> Coordinate {
         Coordinate::empty()
+    }
+
+    fn serialize_key(
+        &mut self,
+        key: &Self::Borrowed,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), KeyCodecError> {
+        self.serialize_ref(key, buf)
     }
 
     fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError> {
@@ -110,7 +137,7 @@ impl Codec for UnitKey {
 ///
 /// Flipping the sign bit maps `i64::MIN..=i64::MAX` onto `u64::MIN..=u64::MAX`,
 /// so the big-endian bytes compare by memcmp in signed order. Inverse:
-/// [`order_preserving_i64_decode`]. This is the Deque index encoding.
+/// [`order_preserving_i64_decode`]. [`I64KeyCodec`] writes these bytes.
 #[must_use]
 pub fn order_preserving_i64(value: i64) -> [u8; 8] {
     ((value as u64) ^ (1 << 63)).to_be_bytes()
@@ -135,8 +162,23 @@ impl OrderedKeyCodec for Utf8KeyCodec {
         Coordinate::from_bytes(key.as_bytes().to_vec())
     }
 
+    fn serialize_key(
+        &mut self,
+        key: &Self::Borrowed,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), KeyCodecError> {
+        buf.extend_from_slice(key.as_bytes());
+        Ok(())
+    }
+
     fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError> {
         Ok(from_utf8(bytes)?.to_owned())
+    }
+}
+
+impl PrefixKeyCodec for Utf8KeyCodec {
+    fn starts_with(key: &str, prefix: &str) -> bool {
+        key.starts_with(prefix)
     }
 }
 
@@ -195,6 +237,14 @@ impl OrderedKeyCodec for I64KeyCodec {
         Coordinate::from_bytes(order_preserving_i64(*key).to_vec())
     }
 
+    fn serialize_key(
+        &mut self,
+        key: &Self::Borrowed,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), KeyCodecError> {
+        self.serialize_ref(key, buf)
+    }
+
     fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError> {
         Ok(order_preserving_i64_decode(fixed_width_8(bytes)?))
     }
@@ -239,6 +289,14 @@ impl OrderedKeyCodec for U64KeyCodec {
         Coordinate::from_bytes(key.to_be_bytes().to_vec())
     }
 
+    fn serialize_key(
+        &mut self,
+        key: &Self::Borrowed,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), KeyCodecError> {
+        self.serialize_ref(key, buf)
+    }
+
     fn decode(bytes: &[u8]) -> Result<Self::Key, KeyCodecError> {
         Ok(u64::from_be_bytes(fixed_width_8(bytes)?))
     }
@@ -280,7 +338,7 @@ fn fixed_width_8(bytes: &[u8]) -> Result<[u8; 8], KeyCodecError> {
     })
 }
 
-/// Error decoding order-preserving key bytes.
+/// Error encoding or decoding order-preserving key bytes.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum KeyCodecError {
     /// The byte slice was not the codec's fixed key width.

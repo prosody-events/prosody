@@ -70,7 +70,7 @@ pub trait CellResolver {
     fn resolve(
         ctx: Self::Context<'_>,
         stored: Self::Stored,
-    ) -> impl Future<Output = Result<Self::Resolved, StateAccessError>> + Send;
+    ) -> impl Future<Output = Result<Self::Resolved, StateAccessError>> + Send + use<'_, Self>;
 
     /// Lowers a written value into the cell value the codec serializes.
     fn stored_from(write: Self::Write<'_>) -> Self::Stored;
@@ -108,7 +108,7 @@ impl<C: Codec> CellResolver for C {
     fn resolve(
         _ctx: Self::Context<'_>,
         stored: C::Payload,
-    ) -> impl Future<Output = Result<C::Payload, StateAccessError>> + Send {
+    ) -> impl Future<Output = Result<C::Payload, StateAccessError>> + Send + use<'_, C> {
         ready(Ok(stored))
     }
 
@@ -207,9 +207,8 @@ where
     #[error("state codec failed")]
     Codec(#[source] E),
 
-    /// A stored key coordinate did not decode back to a logical key. Only a
-    /// coordinate decode produces this error, so only a stream can raise it.
-    /// Every point command encodes the caller's key and decodes no stored one.
+    /// A caller's key did not encode, or a stored key coordinate did not
+    /// decode back to a logical key.
     #[error(transparent)]
     Key(#[from] KeyCodecError),
 }
@@ -225,7 +224,7 @@ where
             // classification, and a cell that does not round-trip will not
             // start doing so on retry.
             Self::Codec(_) => ErrorCategory::Permanent,
-            // A malformed stored coordinate will not decode on retry either.
+            // A key that fails its codec fails the same way on retry.
             Self::Key(e) => e.classify_error(),
         }
     }

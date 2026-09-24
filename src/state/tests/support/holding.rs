@@ -1,6 +1,7 @@
 //! Deterministic response gates for state-store concurrency tests.
 
 use super::*;
+use crate::state::cell_key::CellRef;
 use crate::state::marker::MarkerState;
 
 #[derive(Clone)]
@@ -91,7 +92,7 @@ impl<S: CellRead<P>, P: Projection> CellRead<P> for HoldingCellStore<S> {
     async fn read<'a>(
         &'a self,
         collection: &'a CollectionId,
-        cell: &'a CellKey,
+        cell: CellRef<'a>,
     ) -> Result<Durable<P>, Self::Error> {
         self.holds
             .read
@@ -103,7 +104,7 @@ impl<S: CellRead<P>, P: Projection> CellRead<P> for HoldingCellStore<S> {
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + use<'a, S, P> {
         CellRead::<P>::scan(&self.inner, collection, scan)
     }
 }
@@ -116,7 +117,8 @@ where
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + use<'a, S>
+    {
         self.inner.provisional_cell_at(collection, cell)
     }
 
@@ -125,18 +127,18 @@ where
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
-    {
+    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>>
+    + Send
+    + use<'a, S> {
         provisional_point_loop(self, collection, section, batch)
     }
 
     fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
-        writes: &'a [(CellKey, ProvisionalWrite)],
-        marker: Option<&'a EventMarker>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
-        self.inner.write_provisional(collection, writes, marker)
+        stage: ProvisionalStage<'a>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, S> {
+        self.inner.write_provisional(collection, stage)
     }
 
     async fn write_resolved<'a>(
@@ -155,7 +157,7 @@ where
         &'a self,
         collection: &'a CollectionRef,
         cells: &'a [CellKey],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, S> {
         self.inner.mark_resolved(collection, cells)
     }
 
@@ -182,7 +184,7 @@ where
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, S> {
         self.inner.abort_provisional(collection, writes)
     }
 }

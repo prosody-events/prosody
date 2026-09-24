@@ -7,6 +7,7 @@
 //! durable cell addresses and the collection-owned `head ≤ tail` window check.
 
 use super::*;
+use crate::state::order_codec::OrderedKeyCodec;
 use quickcheck::{QuickCheck, TestResult};
 
 /// The frozen cell addresses and the reset domain that a `clear` covers. The
@@ -58,4 +59,33 @@ fn prop_deque_window_orders_head_and_tail() {
         TestResult::from_bool(ordered && disordered)
     }
     QuickCheck::new().quickcheck(prop as fn(i32, u16) -> TestResult);
+}
+
+/// Test-only: the single bounds cell at its frozen address, which is section 0
+/// at the empty coordinate. A test reads the stored bounds frame directly
+/// through it, and pins the deque's binding to the [`MetaCodec`] frame.
+pub(crate) fn meta_cell() -> CellKey {
+    CellKey {
+        section: FrozenLayout::BOUNDS.section(),
+        coordinate: <UnitKey as OrderedKeyCodec>::encode(&()),
+    }
+}
+
+/// Test-only: the entry cell at index `coordinate`, which [`I64KeyCodec`] has
+/// already encoded. A test seeds a sparse window directly through it. A live
+/// deque never produces such holes, so this is how a test proves the
+/// TTL'd-hole tolerance against the real store.
+pub(crate) fn entry_cell_for(coordinate: &Coordinate) -> CellKey {
+    CellKey {
+        section: FrozenLayout::ENTRIES.section(),
+        coordinate: coordinate.clone(),
+    }
+}
+
+/// Test-only: the frozen `head ‖ tail` bounds frame as raw bytes. The frame is
+/// two plain big-endian `i64`s, the [`MetaCodec`] layout that
+/// `deque_meta_cell_bytes_are_frozen` pins. A test seeds the bounds cell
+/// directly through it.
+pub(crate) fn seed_frame(head: i64, tail: i64) -> Vec<u8> {
+    [head.to_be_bytes(), tail.to_be_bytes()].concat()
 }

@@ -85,16 +85,16 @@ async fn check<B: ReaderBackend>(
             Ok(reader.contains(case.key.clone(), member).await? == model.contains(member))
         }),
         reader.contains_many(case.key.clone(), &KEY_POOL),
-        collect_query(reader.keys(case.key.clone(), Direction::Forward)),
-        collect_query(
+        collect_stream(reader.keys(case.key.clone()).stream()),
+        collect_stream(
             reader
-                .query(case.key.clone(), Direction::Forward)
+                .keys(case.key.clone())
                 .after(&-2)
                 .to(&1)
                 .limit(NonZeroUsize::MIN)
-                .keys()
+                .stream()
         ),
-        collect_query(reader.keys(case.key.clone(), Direction::Backward)),
+        collect_stream(reader.keys(case.key.clone()).reverse().stream()),
     );
     let points = points?;
     let presence = presence?;

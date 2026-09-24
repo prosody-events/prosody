@@ -1,5 +1,5 @@
 use super::{
-    AttemptId, EventMarker, EventMarkerData, MarkerPayloadError, MarkerVersion, SectionClear,
+    EventMarker, EventMarkerData, MarkerPayloadError, MarkerVersion, SectionClear, StageId,
     decode_marker_payload, encode_committed_payload, encode_marker_payload,
 };
 use crate::state::cell::{Committed, ProvisionalWrite};
@@ -10,7 +10,6 @@ use crate::state::tests::support::arb_coordinate;
 use crate::state::{StateName, StateType};
 use crate::timers::duration::CompactDuration;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
-use std::slice::from_ref;
 use uuid::Uuid;
 
 /// A fixed message event to bind every generated marker; the event is not part
@@ -31,19 +30,23 @@ fn arb_cell(g: &mut Gen) -> CellKey {
     }
 }
 
-/// A staged write whose data is present or absent (the survivor derivation
-/// keeps only the present ones).
+/// Unsorted staged writes whose data is present or absent (the survivor
+/// derivation keeps only the present ones). An event stages each cell at most
+/// once, so a repeated cell keeps its first write.
 fn arb_staged(g: &mut Gen) -> Vec<(CellKey, ProvisionalWrite)> {
     let len = usize::arbitrary(g) % 5;
-    (0..len)
-        .map(|_| {
-            let data = bool::arbitrary(g).then(|| bytes(u8::arbitrary(g)));
-            (
-                arb_cell(g),
+    let mut staged: Vec<(CellKey, ProvisionalWrite)> = Vec::with_capacity(len);
+    for _ in 0..len {
+        let cell = arb_cell(g);
+        let data = bool::arbitrary(g).then(|| bytes(u8::arbitrary(g)));
+        if staged.iter().all(|(staged, _)| *staged != cell) {
+            staged.push((
+                cell,
                 ProvisionalWrite::new(data, Committed::new(None), event()),
-            )
-        })
-        .collect()
+            ));
+        }
+    }
+    staged
 }
 
 fn bytes(value: u8) -> bytes::Bytes {
@@ -69,12 +72,12 @@ impl Arbitrary for ArbMarker {
         Self(EventMarker::frozen(
             event(),
             &staged,
-            &clears,
+            clears.clone(),
             &EventEvidence {
                 touched: [].into(),
                 evidence_ttl: CompactDuration::new(3600),
                 dedup: None,
-                attempt: AttemptId(Uuid::from_u128(0xA77E)),
+                stage: StageId(Uuid::from_u128(0xA77E)),
             },
         ))
     }
@@ -115,7 +118,7 @@ fn prop_marker_payload_round_trips() {
         touched.dedup();
         let marker = EventMarker::from_parts(EventMarkerData {
             version: MarkerVersion::V2,
-            attempt: marker.attempt(),
+            stage: marker.stage(),
             event: marker.event(),
             staged: marker.staged().to_vec(),
             clears: marker.clears().to_vec(),
@@ -247,23 +250,23 @@ fn frozen_marker_payload_bytes() -> color_eyre::Result<()> {
     let legacy = EventMarker::frozen(
         event(),
         &staged,
-        from_ref(&clear),
+        vec![clear.clone()],
         &EventEvidence {
             touched: [].into(),
             evidence_ttl: CompactDuration::new(3600),
             dedup: None,
-            attempt: AttemptId(Uuid::from_u128(0xA77E)),
+            stage: StageId(Uuid::from_u128(0xA77E)),
         },
     );
     let marker = EventMarker::frozen(
         event(),
         &staged,
-        &[clear],
+        vec![clear],
         &EventEvidence {
             touched: vec![(StateType::Application, StateName::try_new("x")?)].into(),
             evidence_ttl: CompactDuration::new(3600),
             dedup: Some(Uuid::from_u128(0xD3D0)),
-            attempt: AttemptId(Uuid::from_u128(0xA77E)),
+            stage: StageId(Uuid::from_u128(0xA77E)),
         },
     );
 
@@ -339,12 +342,12 @@ fn trailing_garbage_is_rejected() -> color_eyre::Result<()> {
     let marker = EventMarker::frozen(
         event(),
         &[],
-        &[],
+        Vec::new(),
         &EventEvidence {
             touched: [].into(),
             evidence_ttl: CompactDuration::new(3600),
             dedup: None,
-            attempt: AttemptId(Uuid::from_u128(0xA77E)),
+            stage: StageId(Uuid::from_u128(0xA77E)),
         },
     );
     let mut bytes = encode_marker_payload(&marker)?.to_vec();

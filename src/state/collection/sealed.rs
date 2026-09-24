@@ -15,10 +15,10 @@
 use super::MutationJournal;
 use crate::state::StateAccessError;
 use crate::state::cell::{Presence, Projection, Values};
-use crate::state::cell_key::{CellKey, Scan, Section};
+use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::registry::CollectionDef;
-use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store::{Answers, ReadBatch};
 use crate::state::{StateName, StateType, StoreOutcome};
 use futures::Stream;
 use std::future::Future;
@@ -73,7 +73,9 @@ pub trait ReadEngine<S: ?Sized> {
     fn collection_def(session: &S, state_type: StateType, name: &StateName) -> CollectionDef;
 
     /// Acquires this invocation's read state.
-    fn begin_read(session: &S) -> impl Future<Output = Self::ReadInner<'_>> + Send;
+    fn begin_read(
+        session: &S,
+    ) -> impl Future<Output = Self::ReadInner<'_>> + Send + use<'_, Self, S>;
 
     /// Freezes this invocation's state into the plan a managed stream
     /// driver runs on. Total: there is no unplannable invocation, so no
@@ -83,10 +85,10 @@ pub trait ReadEngine<S: ?Sized> {
     /// Re-enters an invocation under a captured plan for one coordinate
     /// chunk's admission. The owner reacquires the gate here. A coordinate
     /// stream therefore holds no gate across a yield.
-    fn resume<'a>(
+    fn resume<'a, 'b>(
         session: &'a S,
-        plan: &Self::Plan,
-    ) -> impl Future<Output = Self::ReadInner<'a>> + Send;
+        plan: &'b Self::Plan,
+    ) -> impl Future<Output = Self::ReadInner<'a>> + Send + use<'a, 'b, Self, S>;
 
     /// The per-emission fence a managed stream runs after every source
     /// completion, before the item or error escapes. Vacuous on the
@@ -102,23 +104,27 @@ pub trait ReadEngine<S: ?Sized> {
 /// Reads one projection under the engine's admission and plan.
 pub trait Reads<S: ?Sized, P: Projection>: ReadEngine<S> {
     /// Reads one projected cell and updates the invocation state.
-    fn read_point(
-        session: &S,
-        inner: &mut Self::ReadInner<'_>,
+    fn read_point<'a, 'c>(
+        session: &'a S,
+        inner: &'a mut Self::ReadInner<'c>,
         state_type: StateType,
-        name: &StateName,
-        cell: &CellKey,
-    ) -> impl Future<Output = Result<Option<P::Payload>, StateAccessError>> + Send;
+        name: &'a StateName,
+        cell: CellRef<'a>,
+    ) -> impl Future<Output = Result<Option<P::Payload>, StateAccessError>>
+    + Send
+    + use<'a, 'c, Self, S, P>;
 
     /// Reads an aligned batch and updates the invocation state.
-    fn read_batch(
-        session: &S,
-        inner: &mut Self::ReadInner<'_>,
+    fn read_batch<'buf, 'a, 'c>(
+        session: &'a S,
+        inner: &'a mut Self::ReadInner<'c>,
         state_type: StateType,
-        name: &StateName,
+        name: &'a StateName,
         section: Section,
-        batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<Option<P::Payload>>, StateAccessError>> + Send;
+        batch: &'a ReadBatch<'buf>,
+    ) -> impl Future<Output = Result<Answers<Option<P::Payload>>, StateAccessError>>
+    + Send
+    + use<'buf, 'a, 'c, Self, S, P>;
 
     /// Pages a durable range under a captured plan without the gate. This is
     /// the range driver's only lower hop and the one command that cannot
@@ -129,7 +135,7 @@ pub trait Reads<S: ?Sized, P: Projection>: ReadEngine<S> {
         state_type: StateType,
         name: &'a StateName,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a;
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + use<'a, Self, S, P>;
 }
 
 /// The write half of one engine: admission, the final fence, journal
@@ -151,7 +157,7 @@ pub trait WriteEngine<S: ?Sized>: ReadEngine<S> {
     /// attempt, a closed session, or termination.
     fn begin_write(
         session: &S,
-    ) -> impl Future<Output = Result<Self::WriteInner<'_>, StateAccessError>> + Send;
+    ) -> impl Future<Output = Result<Self::WriteInner<'_>, StateAccessError>> + Send + use<'_, Self, S>;
 
     /// Rechecks admission at the end of the invocation, immediately before
     /// replay.
@@ -177,16 +183,16 @@ pub trait WriteEngine<S: ?Sized>: ReadEngine<S> {
     /// # Errors
     ///
     /// Admission refusal, or a store failure.
-    fn commit(
-        session: &S,
+    fn commit<'a>(
+        session: &'a S,
         state_type: StateType,
-        name: &StateName,
-    ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + Send;
+        name: &'a StateName,
+    ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + Send + use<'a, Self, S>;
 
     /// Discards the collection's buffered changes mid-invocation.
-    fn rollback(
-        session: &S,
+    fn rollback<'a>(
+        session: &'a S,
         state_type: StateType,
-        name: &StateName,
-    ) -> impl Future<Output = StoreOutcome> + Send;
+        name: &'a StateName,
+    ) -> impl Future<Output = StoreOutcome> + Send + use<'a, Self, S>;
 }

@@ -25,7 +25,7 @@
 use super::error::FjallCellCacheError;
 use crate::state::CollectionId;
 use crate::state::cell::CacheEntry;
-use crate::state::cell_key::{CellKey, Section};
+use crate::state::cell_key::{CellRef, Section};
 use bytes::Bytes;
 use smallvec::SmallVec;
 use xxhash_rust::xxh3::Xxh3;
@@ -70,9 +70,9 @@ type DecodedFrame<'a> = (u64, Option<CacheEntry<&'a [u8]>>);
 /// and short-key Map entries stay on the stack; only a long Map key spills to
 /// the heap (its coordinate is genuinely unbounded).
 #[must_use]
-pub(super) fn cell_key(id: &CollectionId, cell: &CellKey) -> SmallVec<[u8; 32]> {
+pub(super) fn cell_key(id: &CollectionId, cell: CellRef<'_>) -> SmallVec<[u8; 32]> {
     let prefix = collection_prefix(id);
-    let coordinate = cell.coordinate.as_bytes();
+    let coordinate = cell.coordinate;
     let mut key = SmallVec::with_capacity(prefix.len() + 1 + coordinate.len());
     key.extend_from_slice(&prefix);
     key.push(i8::from(cell.section).cast_unsigned());

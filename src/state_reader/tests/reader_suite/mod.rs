@@ -1,37 +1,20 @@
-//! The backend-generic committed-read trace runner, the reader analogue of
-//! [`cell_suite`](crate::state::tests::cell_suite)'s `run_*_trace` family.
+//! Committed reads must match the model after each event.
 //!
-//! Each runner drives a generated multi-event trace. Every event is committed
-//! through the real owner
-//! [`KeyedStateSession`](crate::state::session::KeyedStateSession) via
-//! [`owner_commit_cell`], and the same ops advance a plain
-//! `Option`/`BTreeMap`/`BTreeSet`/`VecDeque` model in lockstep. After each
-//! event, a freshly created [`StateReader`] must answer point `get`,
-//! `get_many`, `stream` (forward and backward), and `len` exactly as the model
-//! does. That is the invariant the whole suite checks: a committed read always
-//! matches the model. The runner is written once over a generic
-//! [`ReaderBackend`]. It is instantiated for the memory reader in
-//! `reader_tests` and for a live-Cassandra reader in `cassandra_tests`.
+//! Each runner commits a generated trace through the real owner session.
+//! The same operations update an independent model for each collection kind.
+//! Readers check point reads and queries in both directions after every event.
+//! The memory and Cassandra suites share these generic runners.
 //!
-//! The trace generators are reused wholesale from
-//! [`collection_suite`](crate::state::tests::collection_suite) (`MapOp`,
-//! `DequeOp`, `Trace`, `KEY_POOL`). Only the degenerate [`ValueOp`] is
-//! new, since a Value has no removal. The runner ignores the generators'
-//! mid-handler commit and read operations. A reader only observes committed
-//! state, and the runner already promotes every event, so those ops add no new
-//! outcome to check.
+//! [`collection_suite`](crate::state::tests::collection_suite) owns the
+//! collection traces. [`ValueOp`] supplies operations for value cells.
+//! The runner ignores mid-handler commits and reads because it commits every
+//! event.
 //!
-//! One property needs a note. A bug that only shows up on a non-empty scan
-//! must not be able to hide by shrinking its counterexample down to an empty
-//! trace. The ordered `stream` is asserted against the ordered model after
-//! every event, empty or not. The generators favor insert operations.
-//! Thus, a non-empty ordered state keeps
-//! recurring. A counterexample keeps its witness because `Trace` shrink
-//! preserves event structure. An empty read is still a real assertion:
-//! `stream` yields nothing and `get` returns `None`.
+//! Every query compares its results with the model, including empty results.
+//! Trace generators favor inserts. Trace shrinking preserves event structure.
 
 use super::support::{
-    OwnerSession, ReaderBackend, all_match, collect_query, owner_commit_cell, source_state_key,
+    OwnerSession, ReaderBackend, all_match, collect_stream, owner_commit_cell, source_state_key,
     state_name,
 };
 use crate::Key;
@@ -157,24 +140,18 @@ async fn assert_map<B: ReaderBackend>(
             Ok(value == model.get(k).cloned() && present == model.contains_key(k))
         }),
         reader.get_many(case.key.clone(), &KEY_POOL),
-        collect_query(reader.stream(case.key.clone(), Direction::Forward)),
-        collect_query(reader.keys(case.key.clone(), Direction::Forward)),
-        collect_query(
+        collect_stream(reader.entries(case.key.clone()).stream()),
+        collect_stream(reader.keys(case.key.clone()).stream()),
+        collect_stream(
             reader
-                .query(case.key.clone(), Direction::Forward)
+                .entries(case.key.clone())
                 .from(&-1)
                 .before(&2)
                 .limit(NonZeroUsize::MIN)
-                .entries()
+                .stream()
         ),
-        collect_query(
-            reader
-                .query(case.key.clone(), Direction::Forward)
-                .after(&-2)
-                .to(&1)
-                .keys()
-        ),
-        collect_query(reader.stream(case.key.clone(), Direction::Backward)),
+        collect_stream(reader.keys(case.key.clone()).after(&-2).to(&1).stream()),
+        collect_stream(reader.entries(case.key.clone()).reverse().stream()),
     );
     let points = points?;
     let many = many?;
@@ -184,7 +161,7 @@ async fn assert_map<B: ReaderBackend>(
     let expect_many: Vec<_> = KEY_POOL.iter().map(|k| model.get(k).cloned()).collect();
     let expect_forward: Vec<_> = model.iter().map(|(k, v)| (*k, v.clone())).collect();
     let expected_entries: Vec<_> = model
-        .range(-1..2)
+        .range(&-1..&2)
         .take(1)
         .map(|(key, value)| (*key, value.clone()))
         .collect();
@@ -213,8 +190,20 @@ async fn assert_map<B: ReaderBackend>(
         |(dir, expected)| async move {
             let limit = NonZeroUsize::new(expected.len() / 2 + 1).unwrap_or(NonZeroUsize::MIN);
             let (entries, keys) = try_join!(
-                collect_query(reader.query(case.key.clone(), dir).limit(limit).entries()),
-                collect_query(reader.query(case.key.clone(), dir).limit(limit).keys()),
+                collect_stream(
+                    reader
+                        .entries(case.key.clone())
+                        .direction(dir)
+                        .limit(limit)
+                        .stream()
+                ),
+                collect_stream(
+                    reader
+                        .keys(case.key.clone())
+                        .direction(dir)
+                        .limit(limit)
+                        .stream()
+                ),
             )?;
             let expected: Vec<_> = expected.iter().take(limit.get()).cloned().collect();
             Ok(entries == expected
@@ -229,7 +218,7 @@ async fn assert_map<B: ReaderBackend>(
 ///
 /// FALSIFICATION: perturb the reader's committed point read
 /// (`CommittedCellSource::read_committed`/`read_committed_many`) to drop or
-/// misorder an entry → the keyset-backed `stream`/`get_many` diverges from the
+/// misorder an entry → the keyset-backed `entries`/`get_many` diverges from the
 /// model on the first non-empty event. This property never reaches the wide
 /// committed-scan arm that keyset overflow falls back to, since `KEY_POOL`
 /// stays under the keyset limit. That fallback is covered separately: by
@@ -257,9 +246,9 @@ pub(super) async fn run_reader_map_trace<B: ReaderBackend>(
             index as u128,
             move |handle| async move { apply_map_ops::<B>(&handle, for_handle).await },
         );
-        Box::pin(commit).await?;
+        commit.await?;
         model_map_ops(&mut model, &staged);
-        if !Box::pin(assert_map(backend, descriptor, case, &model)).await? {
+        if !assert_map(backend, descriptor, case, &model).await? {
             return Ok(false);
         }
     }
@@ -334,20 +323,21 @@ async fn assert_deque<B: ReaderBackend>(
         all_match(0..=model.len(), |i| async move {
             Ok(reader.get(case.key.clone(), i).await? == model.get(i).cloned())
         }),
-        collect_query(reader.stream(case.key.clone(), Direction::Forward)),
-        collect_query(reader.stream(case.key.clone(), Direction::Backward)),
-        collect_query(
+        collect_stream(reader.values(case.key.clone()).stream()),
+        collect_stream(reader.values(case.key.clone()).reverse().stream()),
+        collect_stream(
             reader
-                .query(case.key.clone(), Direction::Forward)
+                .values(case.key.clone())
                 .range(1..=3)
                 .limit(NonZeroUsize::MIN)
-                .values()
+                .stream()
         ),
-        collect_query(
+        collect_stream(
             reader
-                .query(case.key.clone(), Direction::Backward)
+                .values(case.key.clone())
+                .reverse()
                 .range(1..=3)
-                .values()
+                .stream()
         ),
     );
     let empty = empty?;
@@ -408,9 +398,9 @@ pub(super) async fn run_reader_deque_trace<B: ReaderBackend>(
             index as u128,
             move |handle| async move { apply_deque_ops::<B>(&handle, for_handle).await },
         );
-        Box::pin(commit).await?;
+        commit.await?;
         model_deque_ops(&mut model, &staged);
-        if !Box::pin(assert_deque(backend, descriptor, case, &model)).await? {
+        if !assert_deque(backend, descriptor, case, &model).await? {
             return Ok(false);
         }
     }

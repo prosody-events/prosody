@@ -1,18 +1,18 @@
 #[cfg(test)]
 use super::CellReadCounts;
 use super::projection::CassandraProjection;
-use super::read::{decode_point, fetch_batch, fetch_point, page};
+use super::read::{decode_point, fetch_batch, fetch_point, page, take_row};
 use super::{
     Arc, BatchUnit, Bytes, CacheBatch, CassandraCellStoreError, CassandraSession, CassandraStore,
     Cell, CellAddr, CellBatchRow, CellBlobs, CellKey, CellKind, CellQueries, CellStoreError,
-    CollectionDefRegistry, CollectionId, Committed, CoordinateBatch, EventMarker, EvidenceLookup,
-    KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, Pk, ResolveCellError, ResolvedRow,
-    RowShape, SHARD_FANOUT_CONCURRENCY, Scan, Section, Stream, TryStreamExt, blob_weight, dedupe,
-    encode, encode_marker_payload, expand_to_input_order, pin_mut, smallvec, try_stream,
-    ttl_seconds_to_duration,
+    CollectionDefRegistry, CollectionId, Committed, EventMarker, EvidenceLookup, KeyRow,
+    MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, Pk, ResolveCellError, ResolvedRow, RowShape,
+    SHARD_FANOUT_CONCURRENCY, Scan, Section, Stream, TryStreamExt, blob_weight, distinct, encode,
+    encode_marker_payload, pin_mut, smallvec, try_stream, ttl_seconds_to_duration,
 };
-use crate::state::store::CellRead;
-use crate::state::store_types::Durable;
+use crate::state::cell_key::CellRef;
+use crate::state::store::Durable;
+use crate::state::store::{CellRead, ReadBatch};
 
 impl CassandraStore {
     /// Creates a Cassandra cell store for one partition assignment.
@@ -81,7 +81,7 @@ impl CassandraStore {
         ttl: i32,
         blobs: &'u [CellBlobs],
         cells: &'u [(CellKey, Option<Bytes>)],
-    ) -> impl Iterator<Item = BatchUnit<CellBatchRow<'u>>> + 'u {
+    ) -> impl Iterator<Item = BatchUnit<CellBatchRow<'u>>> + use<'u> {
         blobs.iter().zip(cells).map(move |(blob, (cell, _))| {
             let addr = CellAddr::new(pk, cell);
             let row = match blob.data() {
@@ -149,7 +149,11 @@ pub(super) fn stage_marker(marker: &EventMarker) -> Result<MarkerBlob, CellStore
 
 impl<P: CassandraProjection> CellRead<P> for CassandraStore {
     /// Reads one committed projection and its remaining durable TTL.
-    async fn read(&self, id: &CollectionId, cell: &CellKey) -> Result<Durable<P>, CellStoreError> {
+    async fn read(
+        &self,
+        id: &CollectionId,
+        cell: CellRef<'_>,
+    ) -> Result<Durable<P>, CellStoreError> {
         let row = fetch_point::<P>(&self.session, &self.queries, id, cell)
             .await
             .map_err(ResolveCellError::Store)?;
@@ -161,27 +165,30 @@ impl<P: CassandraProjection> CellRead<P> for CassandraStore {
         Ok((committed, ttl_seconds_to_duration(ttl)))
     }
 
-    /// Resolves each unique coordinate once and expands answers to input order.
+    /// Fetches each distinct coordinate once and answers in input order.
     async fn read_many(
         &self,
         id: &CollectionId,
         section: Section,
-        batch: &CoordinateBatch,
+        batch: &ReadBatch<'_>,
     ) -> Result<CacheBatch<P>, CellStoreError> {
-        let (coordinates, indices) = dedupe(batch);
-        let rows = fetch_batch::<P>(&self.session, &self.queries, id, section, &coordinates)
+        let mut rows =
+            fetch_batch::<P>(&self.session, &self.queries, id, section, &distinct(batch))
+                .await
+                .map_err(ResolveCellError::Store)?;
+        let lookup = &EvidenceLookup::new(self, id);
+        batch
+            .read(|coordinate| {
+                let row = take_row(&mut rows, coordinate);
+                async move {
+                    let (raw, ttl) = match row {
+                        Some(row) => decode_point::<P>(row).map_err(ResolveCellError::Store)?,
+                        None => (Cell::Resolved(Committed::new(None)), None),
+                    };
+                    Ok((lookup.resolve(raw).await?, ttl_seconds_to_duration(ttl)))
+                }
+            })
             .await
-            .map_err(ResolveCellError::Store)?;
-        let mut answers = CacheBatch::<P>::with_capacity(coordinates.len());
-        let mut lookup = EvidenceLookup::new(self, id);
-        for row in rows {
-            let (raw, ttl) = match row {
-                Some(row) => decode_point::<P>(row).map_err(ResolveCellError::Store)?,
-                None => (Cell::Resolved(Committed::new(None)), None),
-            };
-            answers.push((lookup.resolve(raw).await?, ttl_seconds_to_duration(ttl)));
-        }
-        Ok(expand_to_input_order(&indices, &answers))
     }
 
     /// Scans one section under the selected projection.
@@ -189,12 +196,12 @@ impl<P: CassandraProjection> CellRead<P> for CassandraStore {
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), CellStoreError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), CellStoreError>> + Send + use<'a, P> {
         try_stream! {
             let pages = page::<P>(&self.session, &self.queries, collection, scan);
             pin_mut!(pages);
 
-            let mut lookup = EvidenceLookup::new(self, collection);
+            let lookup = EvidenceLookup::new(self, collection);
             while let Some((key, raw)) = pages.try_next().await.map_err(ResolveCellError::Store)? {
                 let committed = lookup.resolve(raw).await?;
                 if let Some(bytes) = committed.into_inner() {

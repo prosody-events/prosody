@@ -45,6 +45,64 @@ use thiserror::Error;
 use tracing::warn;
 use uuid::Uuid;
 
+/// Backing for a [`FjallCellCache`](super::FjallCellCache): either a bare cache
+/// handle plus its owning database (tests) or an owned per-partition workspace
+/// whose cache handle the cache operates and whose `Drop` deletes the keyspace
+/// at revocation (production).
+///
+/// The [`Database`] is held in both arms because batch writes are issued
+/// through [`Database::batch`], not the keyspace handle. The `index` keyspace
+/// (warm provisional coordinates and the cold-seed and marker-check
+/// latches)
+/// rides alongside `cache` in
+/// both arms purely for lifecycle co-location — it shares the workspace's
+/// lifecycle (cold at a fresh assignment, dropped at revocation). Index and
+/// cell-cache writes are **not** issued as one cross-keyspace batch; the warm
+/// index is a rebuildable hint (a fresh assignment re-seeds from the durable
+/// event marker), so they need no atomicity with the committed-value write.
+pub(super) enum Inner {
+    #[cfg(test)]
+    Bare {
+        database: Database,
+        cache: Keyspace,
+        index: Keyspace,
+    },
+    Owned(FjallWorkspace),
+}
+
+impl Inner {
+    /// The cache keyspace handle this cache operates.
+    pub(super) fn handle(&self) -> &Keyspace {
+        match self {
+            #[cfg(test)]
+            Self::Bare { cache, .. } => cache,
+            Self::Owned(workspace) => workspace.cache_handle(),
+        }
+    }
+
+    /// The warm-index keyspace handle (provisional coordinates and the
+    /// cold-seed rows and marker-check rows).
+    pub(super) fn index_handle(&self) -> &Keyspace {
+        match self {
+            #[cfg(test)]
+            Self::Bare { index, .. } => index,
+            Self::Owned(workspace) => workspace.index_handle(),
+        }
+    }
+
+    /// The database the cache keyspace belongs to — the owner of [`batch`]
+    /// writes.
+    ///
+    /// [`batch`]: Database::batch
+    pub(super) fn database(&self) -> &Database {
+        match self {
+            #[cfg(test)]
+            Self::Bare { database, .. } => database,
+            Self::Owned(workspace) => workspace.database(),
+        }
+    }
+}
+
 const PARTITION_NAME_PREFIX: &str = "value_";
 const CACHE_ROLE: &str = "cache";
 const INDEX_ROLE: &str = "index";

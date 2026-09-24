@@ -3,18 +3,20 @@
 //! A set stores one zero-byte cell per member. It shares the map keyset
 //! format and keeps the same membership rules.
 
-pub use super::map::SetQuery;
 use super::map::membership::{self, KeysetLayout};
-use super::map::{KeyItem, KeysetQuery, MapKeysetCodec, MapKeysetKey, MapStateError, Query};
+use super::map::projected;
+use super::map::{KeyItem, MapKeysetCodec, MapKeysetKey, MapStateError};
 use super::{CollectionSpec, Descriptor, Keyed};
 use crate::codec::{UnitCodec, UnitCodecError};
+use crate::state::cell::Presence;
 use crate::state::cell_key::Direction;
 use crate::state::collection::{
     CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, StateSession,
     WritableStateSession, collection_layout, collection_methods, same_token, spec_matches,
 };
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
-use crate::state::{CollectionKindId, StateName, StoreOutcome};
+use crate::state::{BorrowedKeyQuery, CollectionKindId, StateName, StoreOutcome};
+use crate::state::{KeyQuery, KeyRead, ReadQuery, ReadSource};
 use educe::Educe;
 use futures::stream::Stream;
 use std::borrow::Borrow;
@@ -103,15 +105,12 @@ where
     S: StateSession,
     KC: OrderedKeyCodec + 'static,
 {
-    pub(crate) fn cells(&self) -> &Collection<S, SetKind<KC>> {
-        &self.cells
-    }
-
     /// Inserts `key` into the set.
     ///
     /// # Errors
     ///
-    /// Returns a codec error or a session access error.
+    /// Returns a key codec error (`Permanent`) when a key does not encode, or a
+    /// session access error.
     #[instrument(name = "set.insert", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
     #[write(op)]
     pub async fn insert(&self, key: &KC::Borrowed) -> Result<(), SetStateError>
@@ -125,7 +124,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a session access error.
+    /// Returns a key codec error (`Permanent`) when a key does not encode, or a
+    /// session access error.
     #[instrument(name = "set.remove", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
     #[write(op)]
     pub async fn remove(&self, key: &KC::Borrowed) -> Result<(), SetStateError>
@@ -139,7 +139,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a session access error.
+    /// Returns a key codec error (`Permanent`) when a key does not encode, or a
+    /// session access error.
     #[instrument(name = "set.contains", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
     #[read(op)]
     pub async fn contains(&self, key: &KC::Borrowed) -> Result<bool, SetStateError>
@@ -153,7 +154,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a session access error.
+    /// Returns a key codec error (`Permanent`) when a key does not encode, or a
+    /// session access error.
     #[instrument(name = "set.contains_many", skip_all, fields(collection = self.cells.name().as_str(), keys = Empty), err)]
     #[read(op)]
     pub async fn contains_many<'a, Q, I>(&self, keys: I) -> Result<Vec<bool>, SetStateError>
@@ -182,14 +184,21 @@ where
         Ok(())
     }
 
-    /// Streams live members in the direction `dir`.
-    pub fn keys(&self, dir: Direction) -> impl Stream<Item = KeyItem<SetKind<KC>>> + '_ {
-        self.query(dir).keys()
-    }
-
-    /// Builds a directional set query.
-    pub fn query(&self, dir: Direction) -> SetQuery<'_, S, KC> {
-        KeysetQuery::new(&self.cells, Query::new(dir))
+    /// Builds a query over live members in ascending key order.
+    pub fn keys<'a>(
+        &'a self,
+    ) -> KeyRead<
+        'a,
+        KC,
+        impl ReadSource<
+            Query = BorrowedKeyQuery<'a, KC>,
+            Output: Stream<Item = KeyItem<SetKind<KC>>> + Send,
+        > + Clone
+        + use<'a, S, KC>,
+    > {
+        ReadQuery::new(KeyQuery::new(), move |query: BorrowedKeyQuery<'a, KC>| {
+            projected::<_, _, Presence>(&self.cells, query)
+        })
     }
 
     /// Reports whether the set has no live members.
