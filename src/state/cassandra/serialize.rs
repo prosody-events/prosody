@@ -17,6 +17,12 @@
 //! `DeserializationError`, which would tear the partition down over one bad
 //! row.
 //!
+//! [`PartitionCount`] is not a discriminator either. It binds here for the same
+//! reason: the impl delegates to `i32`, so a publication row binds the count
+//! directly instead of converting it at the call site. Reads keep validating
+//! the raw `i32` through `PartitionCount::try_from`, which rejects a
+//! non-positive count as `Permanent`.
+//!
 //! [`Coordinate`] is not a discriminator but a `blob` — it shares this module
 //! only for the same **serialize-only** posture: its impl delegates to its byte
 //! blob so a `CellKey`'s coordinate binds directly (as a single bind and inside
@@ -28,6 +34,7 @@ use crate::state::StateType;
 use crate::state::cassandra::cell::CellKind;
 use crate::state::cassandra::cell::Encoding;
 use crate::state::cell_key::Coordinate;
+use crate::state_reader::PartitionCount;
 use scylla::_macro_internal::{CellWriter, ColumnType, WrittenCellProof};
 use scylla::serialize::SerializationError;
 use scylla::serialize::value::SerializeValue;
@@ -69,5 +76,15 @@ impl SerializeValue for Coordinate {
         writer: CellWriter<'b>,
     ) -> Result<WrittenCellProof<'b>, SerializationError> {
         self.as_bytes().serialize(typ, writer)
+    }
+}
+
+impl SerializeValue for PartitionCount {
+    fn serialize<'b>(
+        &self,
+        typ: &ColumnType,
+        writer: CellWriter<'b>,
+    ) -> Result<WrittenCellProof<'b>, SerializationError> {
+        i32::from(*self).serialize(typ, writer)
     }
 }
