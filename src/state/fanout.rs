@@ -1,9 +1,5 @@
-//! How a keyed-state read runs its per-cell futures.
-//!
-//! A cell type selects its [`Fanout`] at compile time. A resolver that can
-//! wait on a loader overlaps its futures in a bounded window. A cell that
-//! finishes on its first poll runs its futures in order, with no task per
-//! cell.
+//! How a keyed-state read runs its per-cell futures. Each cell type selects
+//! its [`Fanout`] at compile time.
 
 use futures::stream::{Stream, StreamExt};
 use std::convert::identity;
@@ -12,14 +8,10 @@ use std::future::Future;
 /// Runs a stream of per-cell futures and yields their outputs in input order.
 pub trait Fanout {
     /// Drives `futures` in input order. `window` bounds the futures in flight.
-    fn drive<St>(
-        futures: St,
+    fn drive<F: Future<Output: Send> + Send>(
+        futures: impl Stream<Item = F> + Send,
         window: usize,
-    ) -> impl Stream<Item = <St::Item as Future>::Output> + Send
-    where
-        St: Stream + Send,
-        St::Item: Future + Send,
-        <St::Item as Future>::Output: Send;
+    ) -> impl Stream<Item = F::Output> + Send;
 }
 
 /// Polls one future at a time. The stream holds the future inline, so the
@@ -32,29 +24,19 @@ pub enum Sequential {}
 pub enum Concurrent {}
 
 impl Fanout for Sequential {
-    fn drive<St>(
-        futures: St,
+    fn drive<F: Future<Output: Send> + Send>(
+        futures: impl Stream<Item = F> + Send,
         _window: usize,
-    ) -> impl Stream<Item = <St::Item as Future>::Output> + Send
-    where
-        St: Stream + Send,
-        St::Item: Future + Send,
-        <St::Item as Future>::Output: Send,
-    {
+    ) -> impl Stream<Item = F::Output> + Send {
         futures.then(identity)
     }
 }
 
 impl Fanout for Concurrent {
-    fn drive<St>(
-        futures: St,
+    fn drive<F: Future<Output: Send> + Send>(
+        futures: impl Stream<Item = F> + Send,
         window: usize,
-    ) -> impl Stream<Item = <St::Item as Future>::Output> + Send
-    where
-        St: Stream + Send,
-        St::Item: Future + Send,
-        <St::Item as Future>::Output: Send,
-    {
+    ) -> impl Stream<Item = F::Output> + Send {
         futures.buffered(window)
     }
 }

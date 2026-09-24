@@ -208,5 +208,12 @@ impl ErasedStateCodec for BinaryPayload {
     }
 }
 
+/// Converts an owned encoding into `Bytes`. The allocation shrinks to its
+/// length first, so the bytes keep no spare capacity. A vector with no spare
+/// capacity converts without a copy.
+pub(crate) fn owned_bytes(encoding: Vec<u8>) -> Bytes {
+    Bytes::from(encoding.into_boxed_slice())
+}
+
 #[cfg(test)]
 mod tests;

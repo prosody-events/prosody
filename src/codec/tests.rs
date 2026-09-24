@@ -1,7 +1,9 @@
-use super::{BinaryPayload, Codec, JsonBinaryCodec, JsonBinaryMessageCodec, JsonCodec};
+use super::{
+    BinaryPayload, Codec, JsonBinaryCodec, JsonBinaryMessageCodec, JsonCodec, owned_bytes,
+};
 use crate::test_util::ArbJson;
 use crate::{EventIdentity, EventType};
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use quickcheck::{QuickCheck, TestResult};
 use serde_json::Value;
 
@@ -107,10 +109,7 @@ fn binary_json_codec_is_byte_compatible_with_json() {
         let origin = owned.as_ptr();
         match binary.serialize_bytes(BinaryPayload::new(owned, None::<String>, None::<String>)) {
             Ok(encoded) if encoded == bytes && encoded.as_ptr() == origin => {}
-            Ok(encoded) if encoded == bytes => {
-                return TestResult::error("binary serialize_bytes copied the payload");
-            }
-            Ok(_) => return TestResult::error("binary serialize_bytes altered bytes"),
+            Ok(_) => return TestResult::error("binary serialize_bytes copied or altered bytes"),
             Err(_) => return TestResult::error("binary serialize_bytes failed"),
         }
 
@@ -133,4 +132,34 @@ fn binary_json_codec_is_byte_compatible_with_json() {
         }
     }
     QuickCheck::new().quickcheck(prop as fn(ArbJson) -> TestResult);
+}
+
+/// [`owned_bytes`] keeps the input bytes and drops all spare capacity. A
+/// vector with no spare capacity keeps its allocation.
+///
+/// Falsify: convert through `Bytes::from(Vec)` and the spare capacity stays.
+#[test]
+fn owned_bytes_keeps_no_spare_capacity() {
+    fn prop(input: Vec<u8>, spare: u8) -> TestResult {
+        let input = Bytes::from(input);
+        let mut encoding = Vec::with_capacity(input.len() + usize::from(spare));
+        encoding.extend_from_slice(&input);
+        let origin = encoding.as_ptr();
+        let bytes = owned_bytes(encoding);
+        if bytes != input {
+            return TestResult::error("owned_bytes altered bytes");
+        }
+        if input.is_empty() {
+            return TestResult::passed();
+        }
+        if spare == 0 && bytes.as_ptr() != origin {
+            return TestResult::error("owned_bytes copied a vector with no spare capacity");
+        }
+        match bytes.try_into_mut() {
+            Ok(unique) if unique.capacity() == input.len() => TestResult::passed(),
+            Ok(_) => TestResult::error("owned_bytes kept spare capacity"),
+            Err(_) => TestResult::error("owned_bytes shared its allocation"),
+        }
+    }
+    QuickCheck::new().quickcheck(prop as fn(Vec<u8>, u8) -> TestResult);
 }

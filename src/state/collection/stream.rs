@@ -293,7 +293,6 @@ where
 {
     try_stream! {
         <S::Engine as sealed::ReadEngine<S>>::fence(&base.session)?;
-        let window = limit.map_or(RESOLVE_FANOUT, |n| n.get().min(RESOLVE_FANOUT));
         let scan = Scan {
             section: base.section,
             start: start.as_ref().map(AsRef::as_ref),
@@ -312,9 +311,10 @@ where
             let (cell, payload) = item?;
             project::<S, T, P>(session, &cell.coordinate, payload).await
         }));
-        // Resolvers read the loader, so use RESOLVE_FANOUT, not shard fanout.
-        // The limit bounds concurrent resolutions. Without a limit, early
-        // cancellation can leave one window of resolutions already started.
+        // A concurrent fanout overlaps at most RESOLVE_FANOUT resolutions, fewer
+        // under a limit. Without a limit, early cancellation can leave one
+        // window of resolutions already started.
+        let window = limit.map_or(RESOLVE_FANOUT, |n| n.get().min(RESOLVE_FANOUT));
         let inner = <P::Fanout as Fanout>::drive(futures, window);
         futures::pin_mut!(inner);
         while let Some(item) = inner.next().await {

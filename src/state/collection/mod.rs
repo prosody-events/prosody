@@ -412,10 +412,8 @@ where
 
 /// Decodes and resolves an aligned batch of raw cell slots into the exposed
 /// application values, preserving input order. The cell type's
-/// [`FanoutOf`] runs the resolves. A resolver that reads a loader overlaps
-/// them across the whole batch in a window of [`RESOLVE_FANOUT`]. A plain
-/// codec decodes in order with no task per cell. The answer buffer is sized
-/// once to the batch length.
+/// [`FanoutOf`] runs the resolves across the whole batch. The answer buffer
+/// is sized once to the batch length.
 ///
 /// # Errors
 ///

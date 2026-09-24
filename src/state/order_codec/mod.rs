@@ -3,7 +3,7 @@
 //! Encoded byte order must match logical key order. Collection scans rely on
 //! this contract to return ordered keys without a separate sort.
 
-use crate::codec::Codec;
+use crate::codec::{Codec, owned_bytes};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::Coordinate;
 use bytes::{Bytes, BytesMut};
@@ -206,7 +206,8 @@ impl Codec for Utf8KeyCodec {
         payload: Self::Payload,
         buf: &mut Vec<u8>,
     ) -> Result<(), KeyCodecError> {
-        // Ownership moves the string allocation into the output when it is empty.
+        // Ownership moves the string allocation into the output when it is
+        // empty.
         if buf.is_empty() {
             *buf = payload.into_bytes();
         } else {
@@ -222,6 +223,10 @@ impl Codec for Utf8KeyCodec {
     ) -> Result<(), KeyCodecError> {
         buf.extend_from_slice(payload.as_bytes());
         Ok(())
+    }
+
+    fn serialize_bytes(&mut self, payload: Self::Payload) -> Result<Bytes, KeyCodecError> {
+        Ok(owned_bytes(payload.into_bytes()))
     }
 }
 

@@ -38,8 +38,8 @@ pub trait CellResolver {
     /// the codec's payload.
     type Stored;
 
-    /// What a handle's `get` returns. `Send` so a resolved item survives a
-    /// `buffered` scan window in a `Send` stream.
+    /// What a handle's `get` returns. `Send` so a resolved item can cross an
+    /// await in a `Send` stream.
     type Resolved: Send;
 
     /// What a handle's `set` takes. The lifetime lets a borrowing resolver

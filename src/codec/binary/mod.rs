@@ -1,6 +1,7 @@
 //! Binary codec that copies bytes verbatim and uses a caller-supplied
 //! function to extract event metadata (id and type).
 
+use super::owned_bytes;
 use bytes::Bytes;
 use serde::de::value::MapAccessDeserializer;
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -189,7 +190,7 @@ impl<E: BinaryExtractor, F: BinaryFormat> Codec for BinaryCodec<E, F> {
     }
 
     fn serialize_bytes(&mut self, payload: Self::Payload) -> Result<Bytes, Self::Error> {
-        Ok(Bytes::from(payload.bytes))
+        Ok(owned_bytes(payload.bytes))
     }
 
     fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R {
