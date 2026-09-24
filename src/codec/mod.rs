@@ -127,6 +127,21 @@ pub trait Codec: Default + Send + Sync + 'static {
         buf: &mut Vec<u8>,
     ) -> Result<(), Self::Error>;
 
+    /// Serializes a payload into immutable owned bytes, consuming the payload.
+    ///
+    /// Implement this method when the codec already owns the encoded bytes and
+    /// can return them without a copy. The default serializes into a pooled
+    /// buffer through [`Self::serialize`] and copies the result once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `payload` cannot be encoded.
+    fn serialize_bytes(&mut self, payload: Self::Payload) -> Result<Bytes, Self::Error> {
+        let mut buf = SerializeBufGuard::acquire();
+        self.serialize(payload, &mut buf)?;
+        Ok(Bytes::copy_from_slice(&buf))
+    }
+
     /// Runs `f` with an instance of this codec.
     ///
     /// The default constructs a fresh codec via `Default` per call — all a

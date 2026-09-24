@@ -55,7 +55,7 @@
 //! floor.** The settle boundary also rolls back staged provisional cells, but
 //! that is a different, framework-only step after the handler returns.
 
-use crate::codec::{Codec, SerializeBufGuard};
+use crate::codec::Codec;
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::Section;
 use crate::state::descriptor::{
@@ -457,14 +457,9 @@ pub(in crate::state) fn decode_cell<C: Codec>(cell: Bytes) -> Result<C::Payload,
     C::with_cached_local(|codec| codec.deserialize_bytes(cell))
 }
 
-/// Encodes `payload` into the pooled, reusable serialize buffer, returning the
-/// guard so the caller hands its bytes on before the guard drops (returning the
-/// buffer to the pool). The guard owns its buffer, so it is `Send` and rides a
-/// write across an await. The single encode path every typed cell write shares.
-pub(in crate::state) fn encode_cell<C: Codec>(
-    payload: C::Payload,
-) -> Result<SerializeBufGuard, C::Error> {
-    let mut buf = SerializeBufGuard::acquire();
-    C::with_cached_local(|codec| codec.serialize(payload, &mut buf))?;
-    Ok(buf)
+/// Encodes `payload` into owned cell bytes through
+/// [`Codec::serialize_bytes`]. A codec that owns its encoded bytes returns
+/// them without a copy. The single encode path every typed cell write shares.
+pub(in crate::state) fn encode_cell<C: Codec>(payload: C::Payload) -> Result<Bytes, C::Error> {
+    C::with_cached_local(|codec| codec.serialize_bytes(payload))
 }

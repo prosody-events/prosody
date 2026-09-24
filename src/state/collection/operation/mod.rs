@@ -269,10 +269,10 @@ impl<'c, S: WritableStateSession, L> CollectionWrite for WriteOperation<'c, S, L
         value: WriteOf<'_, T>,
     ) -> Result<(), CellStateError<CellCodecError<T>>> {
         let stored = <T::Resolver as CellResolver>::stored_from(value);
-        let buffer = encode_cell::<T::Codec>(stored).map_err(CellStateError::Codec)?;
+        let bytes = encode_cell::<T::Codec>(stored).map_err(CellStateError::Codec)?;
         self.journal.push(Mutation::Set {
             cell: address.cell,
-            bytes: Bytes::copy_from_slice(&buffer),
+            bytes,
         });
         Ok(())
     }

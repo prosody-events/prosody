@@ -36,6 +36,9 @@ fn json_bytes(value: &Value) -> Vec<u8> {
 /// including `null`, scalars, arrays, and objects. This pins the cross-client
 /// byte-compatibility law the shared format-id asserts.
 ///
+/// Every serializer writes the same bytes, and owned binary serialization
+/// returns the payload's own allocation.
+///
 /// Falsify: make [`NoopExtractor`](super::NoopExtractor) / the binary
 /// codec drop or mutate a byte and the recovered bytes / re-decoded value
 /// diverge.
@@ -47,6 +50,11 @@ fn binary_json_codec_is_byte_compatible_with_json() {
         let mut json = JsonCodec::default();
         if json.serialize_ref(&value, &mut borrowed_bytes).is_err() || borrowed_bytes != bytes {
             return TestResult::error("JSON serializers wrote different bytes");
+        }
+        match json.serialize_bytes(value.clone()) {
+            Ok(owned) if owned == bytes => {}
+            Ok(_) => return TestResult::error("JSON serialize_bytes wrote different bytes"),
+            Err(_) => return TestResult::error("JSON serialize_bytes failed"),
         }
         let mut mutable_bytes = bytes.clone();
         let borrowed_decode = json.deserialize(&mut mutable_bytes);
@@ -93,9 +101,21 @@ fn binary_json_codec_is_byte_compatible_with_json() {
             Err(_) => return TestResult::error(format!("message codec rejected tagged {value}")),
         }
 
+        // Owned binary serialization returns the payload's own allocation.
+        let mut binary = JsonBinaryCodec::default();
+        let owned = bytes.clone();
+        let origin = owned.as_ptr();
+        match binary.serialize_bytes(BinaryPayload::new(owned, None::<String>, None::<String>)) {
+            Ok(encoded) if encoded == bytes && encoded.as_ptr() == origin => {}
+            Ok(encoded) if encoded == bytes => {
+                return TestResult::error("binary serialize_bytes copied the payload");
+            }
+            Ok(_) => return TestResult::error("binary serialize_bytes altered bytes"),
+            Err(_) => return TestResult::error("binary serialize_bytes failed"),
+        }
+
         // Binary serialize -> JsonCodec deserialize -> original value.
         let mut out = Vec::new();
-        let mut binary = JsonBinaryCodec::default();
         if binary
             .serialize(
                 BinaryPayload::new(bytes, None::<String>, None::<String>),
