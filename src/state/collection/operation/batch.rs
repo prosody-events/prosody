@@ -1,9 +1,10 @@
 //! Bounded coordinate encoding and aligned batch reads.
 
 use super::{
-    BorrowedKeyOf, CellBuffer, CellCodecError, CellStateError, CellType, Coordinate, Mutation,
-    OrderedKeyCodec, Projection, Section, Staged, StateAccessError, StateName, StateSession,
-    StateType, sealed, staged,
+    BorrowedKeyOf, CellBuffer, CellCodecError, CellStateError, CellType, Collection, ContextOf,
+    Coordinate, FromSession, Mutation, OrderedKeyCodec, Presence, Projection, ResolvedOf, Section,
+    Staged, StateAccessError, StateName, StateSession, StateType, Values, resolve_batch, sealed,
+    staged,
 };
 use crate::codec::{Codec, SerializeBufGuard};
 use crate::state::cell_key::CellRef;
@@ -23,18 +24,61 @@ pub(super) fn encode_key<K: OrderedKeyCodec>(
     Ok(SmallVec::from_slice(&buffer))
 }
 
+/// Reads and resolves one value per key in input order.
+/// A read passes an empty journal. A write passes its own journal.
+pub(super) async fn get_keys<'a, S, L, T>(
+    collection: &Collection<S, L>,
+    inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
+    section: Section,
+    journal: &[Mutation],
+    keys: impl Iterator<Item = &'a BorrowedKeyOf<T>> + Send,
+) -> Result<CellBuffer<Option<ResolvedOf<T>>>, CellStateError<CellCodecError<T>>>
+where
+    S: StateSession,
+    T: CellType,
+    for<'s> ContextOf<'s, T>: FromSession<'s, S>,
+{
+    let bytes =
+        read_keys::<S, L, T, Values, _>(collection, inner, section, journal, keys, identity)
+            .await?;
+    resolve_batch::<S, T>(collection.session(), bytes).await
+}
+
+/// Tests each key for presence in input order.
+/// The journal follows [`get_keys`].
+pub(super) async fn contains_keys<'a, S, L, T>(
+    collection: &Collection<S, L>,
+    inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
+    section: Section,
+    journal: &[Mutation],
+    keys: impl Iterator<Item = &'a BorrowedKeyOf<T>> + Send,
+) -> Result<CellBuffer<bool>, CellStateError<CellCodecError<T>>>
+where
+    S: StateSession,
+    T: CellType,
+{
+    read_keys::<S, L, T, Presence, _>(
+        collection,
+        inner,
+        section,
+        journal,
+        keys,
+        |present: Option<()>| present.is_some(),
+    )
+    .await
+}
+
 /// Encodes one bounded batch at a time and preserves every input position.
 /// The read completes before the next batch reuses the encoding buffer.
-/// Reads pass an empty journal, so one path serves reads and writes.
-pub(super) async fn read_keys<'a, S, T, P: Projection>(
-    session: &S,
+/// `answer` maps each projected cell into the one answer buffer.
+async fn read_keys<'a, S, L, T, P: Projection, A: Default>(
+    collection: &Collection<S, L>,
     inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
-    state_type: StateType,
-    name: &StateName,
     section: Section,
     journal: &[Mutation],
     mut keys: impl Iterator<Item = &'a BorrowedKeyOf<T>> + Send,
-) -> Result<CellBuffer<Option<P::Payload>>, CellStateError<CellCodecError<T>>>
+    answer: impl Fn(Option<P::Payload>) -> A + Copy + Send,
+) -> Result<CellBuffer<A>, CellStateError<CellCodecError<T>>>
 where
     S: StateSession,
     S::Engine: sealed::Reads<S, P>,
@@ -73,18 +117,25 @@ where
                         section,
                         coordinate,
                     };
-                    staged(journal, cell).map(|staged| match staged {
-                        Staged::Present(bytes) => Some(P::from_value(bytes)),
-                        Staged::Absent => None,
+                    staged(journal, cell).map(|staged| {
+                        answer(match staged {
+                            Staged::Present(bytes) => Some(P::from_value(bytes)),
+                            Staged::Absent => None,
+                        })
                     })
                 },
                 move |pending| async move {
                     <S::Engine as sealed::Reads<S, P>>::read_batch(
-                        session, inner, state_type, name, section, &pending,
+                        collection.session(),
+                        inner,
+                        collection.state_type(),
+                        collection.name(),
+                        section,
+                        &pending,
                     )
                     .await
                 },
-                identity,
+                answer,
             )
             .await?;
     }

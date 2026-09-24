@@ -102,8 +102,8 @@ async fn get_many_answers_from_one_source() -> Result<()> {
 
     let got = reader.get_many(key, &[0, 1]).await?;
     assert_eq!(
-        got,
-        vec![Some(Value::from("A0")), None],
+        *got,
+        [Some(Value::from("A0")), None],
         "the whole batch resolves from the lowest source A; B's key 1 is never spliced in"
     );
     Ok(())

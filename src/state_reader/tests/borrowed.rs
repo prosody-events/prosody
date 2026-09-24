@@ -94,7 +94,8 @@ fn prop_borrowed_utf8_keys_address_maps_and_sets() -> Result<()> {
         let mut absent = keys.iter().max().cloned().unwrap_or_default();
         absent.push('\0');
         keys.push(absent);
-        // Reuse keys to test overwrites, removals, and duplicate batch positions.
+        // Reuse keys to test overwrites, removals, and duplicate batch
+        // positions.
         let keys: Vec<_> = keys.iter().cycle().take(MAX_KEYS).cloned().collect();
         block_on(async {
             for limit in [0, 128] {
@@ -198,14 +199,14 @@ async fn check_map<S: WritableStateSession>(
         );
     }
     let encodings = OWNED_ENCODINGS.get();
-    assert_eq!(handle.contains_many(keys).await?, presence);
+    assert_eq!(*handle.contains_many(keys).await?, presence);
     // Warm the pool with both batch groupings before the reuse check.
     let filtered = keys.iter().filter(|key| key.len().is_multiple_of(2));
     let expected: Vec<_> = filtered
         .clone()
         .map(|key| model.get(key).cloned())
         .collect();
-    assert_eq!(handle.get_many(filtered).await?, expected);
+    assert_eq!(*handle.get_many(filtered).await?, expected);
     let storage = SerializeBufGuard::allocation();
     assert!(storage.1 > 0, "the batch must warm the encoding pool");
     for key in keys.iter().collect::<BTreeSet<_>>() {
@@ -214,12 +215,15 @@ async fn check_map<S: WritableStateSession>(
         assert_eq!(handle.get(&Cow::Borrowed(key.as_str())).await?, expected);
     }
     for len in BATCH_LENGTHS {
-        assert_eq!(handle.get_many(&keys[..len]).await?, values[..len]);
-        assert_eq!(handle.get_many(unknown(&keys[..len])).await?, values[..len]);
+        assert_eq!(*handle.get_many(&keys[..len]).await?, values[..len]);
+        assert_eq!(
+            *handle.get_many(unknown(&keys[..len])).await?,
+            values[..len]
+        );
     }
     let split = keys.len() / 2;
     assert_eq!(
-        handle
+        *handle
             .get_many(
                 keys[..split]
                     .iter()
@@ -231,12 +235,12 @@ async fn check_map<S: WritableStateSession>(
     );
 
     assert_eq!(
-        handle
+        *handle
             .contains_many(keys.iter().map(String::as_str))
             .await?,
         presence
     );
-    assert_eq!(handle.contains_many(unknown(keys)).await?, presence);
+    assert_eq!(*handle.contains_many(unknown(keys)).await?, presence);
     assert_eq!(
         OWNED_ENCODINGS.get(),
         encodings,
@@ -295,9 +299,9 @@ async fn check_set<S: WritableStateSession>(
     }
     let encodings = OWNED_ENCODINGS.get();
     for len in BATCH_LENGTHS {
-        assert_eq!(handle.contains_many(&keys[..len]).await?, presence[..len]);
+        assert_eq!(*handle.contains_many(&keys[..len]).await?, presence[..len]);
         assert_eq!(
-            handle.contains_many(unknown(&keys[..len])).await?,
+            *handle.contains_many(unknown(&keys[..len])).await?,
             presence[..len]
         );
     }
@@ -345,10 +349,10 @@ async fn check_readers(
             set.contains_many(key.clone(), &keys[..len]),
             set.contains_many(key.clone(), unknown(&keys[..len])),
         )?;
-        assert_eq!(exact_values, values[..len]);
-        assert_eq!(lazy_values, values[..len]);
-        assert_eq!(exact_presence, presence[..len]);
-        assert_eq!(lazy_presence, presence[..len]);
+        assert_eq!(*exact_values, values[..len]);
+        assert_eq!(*lazy_values, values[..len]);
+        assert_eq!(*exact_presence, presence[..len]);
+        assert_eq!(*lazy_presence, presence[..len]);
         Ok(())
     })
     .await?;
@@ -356,8 +360,8 @@ async fn check_readers(
         map.contains_many(key.clone(), unknown(keys)),
         set.contains_many(key.clone(), keys.iter().map(String::as_str)),
     )?;
-    assert_eq!(lazy, presence);
-    assert_eq!(mapped, presence);
+    assert_eq!(*lazy, *presence);
+    assert_eq!(*mapped, *presence);
 
     assert_eq!(
         OWNED_ENCODINGS.get(),

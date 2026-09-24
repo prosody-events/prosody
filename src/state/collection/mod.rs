@@ -65,10 +65,10 @@ use crate::state::descriptor::{
 use crate::state::registry::CollectionDef;
 use crate::state::store::CellBuffer;
 use crate::state::{RESOLVE_FANOUT, StateName, StateType, StoreOutcome};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use educe::Educe;
 use futures::stream::{StreamExt, TryStreamExt, iter};
-use std::future::Future;
+use std::future::{Future, ready};
 use std::marker::PhantomData;
 use tokio::task::coop::cooperative;
 
@@ -414,7 +414,7 @@ where
 /// half, potentially a loader read per cell — fan out across the WHOLE batch
 /// through an ordered [`buffered`](StreamExt::buffered) window of
 /// [`RESOLVE_FANOUT`], so a batch's resolves overlap instead of serializing per
-/// sub-batch.
+/// sub-batch. The answer buffer is sized once to the batch length.
 ///
 /// # Errors
 ///
@@ -429,6 +429,7 @@ where
     T: CellType,
     for<'s> ContextOf<'s, T>: FromSession<'s, S>,
 {
+    let len = bytes.len();
     iter(bytes)
         .map(|slot| {
             cooperative(async move {
@@ -441,22 +442,19 @@ where
             })
         })
         .buffered(RESOLVE_FANOUT)
-        .try_collect()
+        .try_fold(CellBuffer::with_capacity(len), |mut values, value| {
+            values.push(value);
+            ready(Ok(values))
+        })
         .await
 }
 
-/// Decodes a cell's bytes as `C::Payload`. Parses in place when the `Bytes` is
-/// uniquely owned (zero-copy, the production path — every backend decode mints
-/// a fresh `Bytes`); falls back to a copy for a shared clone (the in-memory
-/// test backend). The single decode path every typed cell read shares.
+/// Decodes a cell's bytes as `C::Payload` through
+/// [`Codec::deserialize_bytes`]. A codec that reads shared bytes avoids a
+/// copy, and the default copies only shared bytes. The single decode path
+/// every typed cell read shares.
 pub(in crate::state) fn decode_cell<C: Codec>(cell: Bytes) -> Result<C::Payload, C::Error> {
-    match cell.try_into_mut() {
-        Ok(buf) => C::with_cached_local(|codec| codec.deserialize_owned(buf)),
-        Err(cell) => {
-            let buf = BytesMut::from(cell.as_ref());
-            C::with_cached_local(|codec| codec.deserialize_owned(buf))
-        }
-    }
+    C::with_cached_local(|codec| codec.deserialize_bytes(cell))
 }
 
 /// Encodes `payload` into the pooled, reusable serialize buffer, returning the

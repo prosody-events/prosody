@@ -117,5 +117,5 @@ pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Res
     if batch.len() != input.queries.len() {
         return Ok(false);
     }
-    Ok(batch == point && presence == point_presence)
+    Ok(*batch == point && *presence == point_presence)
 }

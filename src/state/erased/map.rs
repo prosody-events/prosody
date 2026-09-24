@@ -6,7 +6,7 @@ use crate::state::collection::WritableStateSession;
 use crate::state::descriptor::{CellType, ContextOf, FromSession, MapHandle, ResolvedOf};
 use crate::state::order_codec::UnitKey;
 use crate::state::order_codec::Utf8KeyCodec;
-use crate::state::{ErasedKeyQuery, StoreOutcome};
+use crate::state::{CellBuffer, ErasedKeyQuery, StoreOutcome};
 use async_stream::try_stream;
 use async_trait::async_trait;
 
@@ -46,6 +46,7 @@ where
         self.0
             .get_many(&keys)
             .await
+            .map(CellBuffer::into_vec)
             .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
@@ -53,6 +54,7 @@ where
         self.0
             .contains_many(&keys)
             .await
+            .map(CellBuffer::into_vec)
             .map_err(|error| ErasedStateError::from_classified(&error))
     }
 

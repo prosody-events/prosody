@@ -45,7 +45,7 @@ use crate::state::collection::{
     collection_methods,
 };
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
-use crate::state::{CollectionKindId, StateAccessError, StoreOutcome};
+use crate::state::{CellBuffer, CollectionKindId, StateAccessError, StoreOutcome};
 use educe::Educe;
 use futures::stream::Stream;
 use std::borrow::Borrow;
@@ -165,7 +165,7 @@ where
     pub async fn get_many<'a, Q, I>(
         &self,
         keys: I,
-    ) -> Result<Vec<Option<ResolvedOf<V>>>, MapStateError<CellCodecError<V>>>
+    ) -> Result<CellBuffer<Option<ResolvedOf<V>>>, MapStateError<CellCodecError<V>>>
     where
         Q: Borrow<KC::Borrowed> + ?Sized + 'a,
         I: IntoIterator<Item = &'a Q>,
@@ -176,8 +176,7 @@ where
                 MapKind::<KC, V>::ENTRIES,
                 keys.into_iter().map(Borrow::borrow),
             )
-            .await?
-            .into_vec();
+            .await?;
         Span::current().record("keys", values.len() as i64);
         Ok(values)
     }
@@ -199,7 +198,7 @@ where
     pub async fn contains_many<'a, Q, I>(
         &self,
         keys: I,
-    ) -> Result<Vec<bool>, MapStateError<CellCodecError<V>>>
+    ) -> Result<CellBuffer<bool>, MapStateError<CellCodecError<V>>>
     where
         Q: Borrow<KC::Borrowed> + ?Sized + 'a,
         I: IntoIterator<Item = &'a Q>,
@@ -210,8 +209,7 @@ where
                 MapKind::<KC, V>::ENTRIES,
                 keys.into_iter().map(Borrow::borrow),
             )
-            .await?
-            .into_vec();
+            .await?;
         Span::current().record("keys", present.len() as i64);
         Ok(present)
     }

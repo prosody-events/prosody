@@ -15,7 +15,7 @@ use crate::state::collection::{
     WritableStateSession, collection_layout, collection_methods, same_token, spec_matches,
 };
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
-use crate::state::{BorrowedKeyQuery, CollectionKindId, StateName, StoreOutcome};
+use crate::state::{BorrowedKeyQuery, CellBuffer, CollectionKindId, StateName, StoreOutcome};
 use crate::state::{KeyQuery, KeyRead, ReadQuery, ReadSource};
 use educe::Educe;
 use futures::stream::Stream;
@@ -158,7 +158,7 @@ where
     /// session access error.
     #[instrument(name = "set.contains_many", skip_all, fields(collection = self.cells.name().as_str(), keys = Empty), err)]
     #[read(op)]
-    pub async fn contains_many<'a, Q, I>(&self, keys: I) -> Result<Vec<bool>, SetStateError>
+    pub async fn contains_many<'a, Q, I>(&self, keys: I) -> Result<CellBuffer<bool>, SetStateError>
     where
         Q: Borrow<KC::Borrowed> + ?Sized + 'a,
         I: IntoIterator<Item = &'a Q>,
@@ -166,8 +166,7 @@ where
     {
         let present = op
             .contains_many(SetKind::<KC>::MEMBERS, keys.into_iter().map(Borrow::borrow))
-            .await?
-            .into_vec();
+            .await?;
         Span::current().record("keys", present.len() as i64);
         Ok(present)
     }
