@@ -10,8 +10,9 @@ use crate::state::StateAccessError;
 use crate::state::cell::{Presence, Projection, Values};
 use crate::state::cell_key::{Coordinate, Direction, Scan, Section};
 use crate::state::descriptor::{
-    CellCodecError, CellStateError, CellType, ContextOf, FromSession, KeyOf, ResolvedOf,
+    CellCodecError, CellStateError, CellType, ContextOf, FanoutOf, FromSession, KeyOf, ResolvedOf,
 };
+use crate::state::fanout::{Fanout, Sequential};
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::store::{CELL_BATCH, CellBuffer, FetchSchedule};
 use crate::state::{RESOLVE_FANOUT, StateName, StateType};
@@ -32,6 +33,9 @@ use tokio::task::coop::cooperative;
 pub(crate) trait StreamProjection<S: StateSession, T: CellType>: Projection {
     type Item: Send;
 
+    /// How the stream runs [`Self::finish`] for each cell.
+    type Fanout: Fanout;
+
     fn finish(
         session: &S,
         key: KeyOf<T>,
@@ -47,6 +51,7 @@ where
     T: CellType,
     for<'s> ContextOf<'s, T>: FromSession<'s, S>,
 {
+    type Fanout = FanoutOf<T>;
     type Item = (KeyOf<T>, ResolvedOf<T>);
 
     async fn finish(
@@ -59,6 +64,7 @@ where
 }
 
 impl<S: StateSession, T: CellType> StreamProjection<S, T> for Presence {
+    type Fanout = Sequential;
     type Item = KeyOf<T>;
 
     fn finish(
@@ -245,9 +251,9 @@ where
             let session = &base.session;
             let buffer = CellBuffer::with_capacity(chunk.len());
             // `cooperative` is the only per-item budget checkpoint here. Tokio's `rt`
-            // feature is off, so `consume_budget` is uncallable. For `Presence` the
-            // wrapped future is a no-op; keep the wrapper. Do not re-litigate the window.
-            let items = stream::iter(chunk.into_iter().zip(slots))
+            // feature is off, so `consume_budget` is uncallable. Keep the wrapper
+            // when the projection finishes on its first poll.
+            let futures = stream::iter(chunk.into_iter().zip(slots))
                 .map(|(coordinate, slot)| cooperative(async move {
                     match slot {
                         Some(payload) => project::<S, T, P>(session, &coordinate, payload)
@@ -255,8 +261,8 @@ where
                             .map(Some),
                         None => Ok(None),
                     }
-                }))
-                .buffered(RESOLVE_FANOUT)
+                }));
+            let items = <P::Fanout as Fanout>::drive(futures, RESOLVE_FANOUT)
                 .try_fold(buffer, |mut items, item| {
                     if let Some(item) = item {
                         items.push(item);
@@ -302,15 +308,14 @@ where
         )
         .take(limit.map_or(usize::MAX, NonZeroUsize::get));
         let session = &base.session;
-        let inner = page
-            .map(|item| cooperative(async move {
-                let (cell, payload) = item?;
-                project::<S, T, P>(session, &cell.coordinate, payload).await
-            }))
-            // Resolvers read the loader, so use RESOLVE_FANOUT, not shard fanout.
-            // The limit bounds concurrent resolutions. Without a limit, early
-            // cancellation can leave one window of resolutions already started.
-            .buffered(window);
+        let futures = page.map(|item| cooperative(async move {
+            let (cell, payload) = item?;
+            project::<S, T, P>(session, &cell.coordinate, payload).await
+        }));
+        // Resolvers read the loader, so use RESOLVE_FANOUT, not shard fanout.
+        // The limit bounds concurrent resolutions. Without a limit, early
+        // cancellation can leave one window of resolutions already started.
+        let inner = <P::Fanout as Fanout>::drive(futures, window);
         futures::pin_mut!(inner);
         while let Some(item) = inner.next().await {
             yield item?;

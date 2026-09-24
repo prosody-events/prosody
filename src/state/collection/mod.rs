@@ -59,9 +59,10 @@ use crate::codec::{Codec, SerializeBufGuard};
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::Section;
 use crate::state::descriptor::{
-    CellCodecError, CellResolver, CellStateError, CellType, CollectionSpec, ContextOf, FromSession,
-    ResolvedOf, StructuralIdentity,
+    CellCodecError, CellResolver, CellStateError, CellType, CollectionSpec, ContextOf, FanoutOf,
+    FromSession, ResolvedOf, StructuralIdentity,
 };
+use crate::state::fanout::Fanout;
 use crate::state::registry::CollectionDef;
 use crate::state::store::CellBuffer;
 use crate::state::{RESOLVE_FANOUT, StateName, StateType, StoreOutcome};
@@ -410,11 +411,11 @@ where
 }
 
 /// Decodes and resolves an aligned batch of raw cell slots into the exposed
-/// application values, preserving input order. The resolves — the expensive
-/// half, potentially a loader read per cell — fan out across the WHOLE batch
-/// through an ordered [`buffered`](StreamExt::buffered) window of
-/// [`RESOLVE_FANOUT`], so a batch's resolves overlap instead of serializing per
-/// sub-batch. The answer buffer is sized once to the batch length.
+/// application values, preserving input order. The cell type's
+/// [`FanoutOf`] runs the resolves. A resolver that reads a loader overlaps
+/// them across the whole batch in a window of [`RESOLVE_FANOUT`]. A plain
+/// codec decodes in order with no task per cell. The answer buffer is sized
+/// once to the batch length.
 ///
 /// # Errors
 ///
@@ -430,18 +431,17 @@ where
     for<'s> ContextOf<'s, T>: FromSession<'s, S>,
 {
     let len = bytes.len();
-    iter(bytes)
-        .map(|slot| {
-            cooperative(async move {
-                match slot {
-                    Some(raw) => Ok::<_, CellStateError<CellCodecError<T>>>(Some(
-                        resolve_cell::<S, T>(session, raw).await?,
-                    )),
-                    None => Ok(None),
-                }
-            })
+    let futures = iter(bytes).map(|slot| {
+        cooperative(async move {
+            match slot {
+                Some(raw) => Ok::<_, CellStateError<CellCodecError<T>>>(Some(
+                    resolve_cell::<S, T>(session, raw).await?,
+                )),
+                None => Ok(None),
+            }
         })
-        .buffered(RESOLVE_FANOUT)
+    });
+    <FanoutOf<T> as Fanout>::drive(futures, RESOLVE_FANOUT)
         .try_fold(CellBuffer::with_capacity(len), |mut values, value| {
             values.push(value);
             ready(Ok(values))
