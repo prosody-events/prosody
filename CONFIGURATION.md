@@ -14,7 +14,11 @@ environment variables for unset fields, so you can mix both approaches.
 | `PROSODY_SOURCE_SYSTEM`     | Tag for outgoing messages (prevents reprocessing)  | `<group id>` |          | ✓        |
 | `PROSODY_SUBSYSTEM`         | This consumer's request and published-state subsystem | - | ✓ |          |
 | `PROSODY_MOCK`              | Use in-memory Kafka for testing                    | false        | ✓        | ✓        |
-| `PROSODY_LOG`               | Log filter (e.g., `debug`, `prosody=debug`). Each directive replaces the default for its target. A bare level below `warn` also applies to scylla and OpenTelemetry. | `info,scylla=warn,opentelemetry=warn` | ✓ | ✓ |
+| `PROSODY_LOG`               | Log filter (e.g., `debug`, `prosody=debug`)        | `info`       | ✓        | ✓        |
+
+`scylla` and `opentelemetry` log at `warn` by default. Each `PROSODY_LOG` directive replaces
+the default for its target. A bare level below `warn` also applies to `scylla` and
+`opentelemetry`.
 
 ## Consumer
 
