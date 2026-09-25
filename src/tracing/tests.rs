@@ -1,4 +1,4 @@
-use super::{DEFAULT_LOG_DIRECTIVES, flush_telemetry, log_filter, shutdown_telemetry};
+use super::{QUIET_TARGETS, flush_telemetry, log_filter, shutdown_telemetry};
 use color_eyre::Result;
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
@@ -19,16 +19,19 @@ const OVERRIDE_TARGETS: [Option<&str>; 5] = [
     Some("prosody"),
 ];
 
-/// Levels that a generated directive can set. `None` is an invalid level.
-const OVERRIDE_LEVELS: [Option<LevelFilter>; 7] = [
-    Some(LevelFilter::OFF),
-    Some(LevelFilter::ERROR),
-    Some(LevelFilter::WARN),
-    Some(LevelFilter::INFO),
-    Some(LevelFilter::DEBUG),
-    Some(LevelFilter::TRACE),
-    None,
+/// Levels that a generated directive can set.
+const OVERRIDE_LEVELS: [LevelFilter; 6] = [
+    LevelFilter::OFF,
+    LevelFilter::ERROR,
+    LevelFilter::WARN,
+    LevelFilter::INFO,
+    LevelFilter::DEBUG,
+    LevelFilter::TRACE,
 ];
+
+/// Segments that `EnvFilter` ignores. An unset `PROSODY_LOG` is one empty
+/// segment.
+const BLANK_SEGMENTS: [&str; 2] = ["", " "];
 
 /// Targets that the property checks, in the order of [`probe_all`].
 /// `rdkafka` has no default and no generated directive.
@@ -50,30 +53,42 @@ const LEVELS: [Level; 5] = [
     Level::TRACE,
 ];
 
-/// One generated `PROSODY_LOG` directive.
+/// One generated segment of a `PROSODY_LOG` value.
 #[derive(Clone, Debug)]
-struct Override {
-    target: Option<&'static str>,
-    level: Option<LevelFilter>,
+enum Override {
+    /// A valid directive for a target, or a bare level.
+    Valid(Option<&'static str>, LevelFilter),
+
+    /// A directive with the level `!loud`. It is also invalid as a bare
+    /// target.
+    Invalid(Option<&'static str>),
+
+    /// A segment that holds no directive.
+    Blank(&'static str),
 }
 
 impl Override {
     fn render(&self) -> String {
-        let level = self
-            .level
-            .map_or_else(|| "loud".to_owned(), |level| level.to_string());
-        match self.target {
-            None => level,
-            Some(target) => format!("{target}={level}"),
+        match self {
+            Self::Valid(None, level) => level.to_string(),
+            Self::Valid(Some(target), level) => format!("{target}={level}"),
+            Self::Invalid(None) => "!loud".to_owned(),
+            Self::Invalid(Some(target)) => format!("{target}=!loud"),
+            Self::Blank(segment) => (*segment).to_owned(),
         }
     }
 }
 
 impl Arbitrary for Override {
     fn arbitrary(g: &mut Gen) -> Self {
-        Self {
-            target: *g.choose(&OVERRIDE_TARGETS).unwrap_or(&None),
-            level: *g.choose(&OVERRIDE_LEVELS).unwrap_or(&None),
+        let target = *g.choose(&OVERRIDE_TARGETS).unwrap_or(&None);
+        match g.choose(&[0_u8, 1, 2]).unwrap_or(&0) {
+            0 => Self::Valid(
+                target,
+                *g.choose(&OVERRIDE_LEVELS).unwrap_or(&LevelFilter::OFF),
+            ),
+            1 => Self::Invalid(target),
+            _ => Self::Blank(g.choose(&BLANK_SEGMENTS).unwrap_or(&"")),
         }
     }
 }
@@ -95,24 +110,34 @@ macro_rules! probe {
     };
 }
 
-/// A `PROSODY_LOG` directive replaces the default for its own target, and a
-/// bare level replaces the `info` default. Defaults for other targets stay,
-/// and invalid directives change nothing.
+/// A `PROSODY_LOG` directive replaces the default for its own target. The
+/// last bare level replaces the `info` default and caps the quiet targets at
+/// that level. Invalid and blank segments change nothing.
 ///
 /// The model keeps one level for each target. The defaults go in first. Then
-/// each valid override replaces the entry for its target. A probe target
-/// gets the level of the longest entry that is a prefix of it.
+/// each valid targeted override replaces the entry for its target. A probe
+/// target gets the level of the longest entry that is a prefix of it.
 #[quickcheck]
 fn prop_prosody_log_replaces_defaults_per_target(overrides: Vec<Override>) -> bool {
-    let mut model: BTreeMap<Option<&str>, LevelFilter> = DEFAULT_LOG_DIRECTIVES
-        .split(',')
-        .map(default_directive)
-        .collect();
+    let base = overrides
+        .iter()
+        .filter_map(|directive| match directive {
+            Override::Valid(None, level) => Some(*level),
+            _ => None,
+        })
+        .next_back()
+        .unwrap_or(LevelFilter::INFO);
+
+    let mut model = BTreeMap::from([(None, base)]);
+    for target in QUIET_TARGETS {
+        model.insert(Some(target), base.min(LevelFilter::WARN));
+    }
+
     let mut rendered = Vec::with_capacity(overrides.len());
     for directive in overrides {
         rendered.push(directive.render());
-        if let Some(level) = directive.level {
-            model.insert(directive.target, level);
+        if let Override::Valid(Some(target), level) = directive {
+            model.insert(Some(target), level);
         }
     }
 
@@ -146,7 +171,7 @@ fn flush_and_shutdown_are_noops_when_uninitialized() -> Result<()> {
 }
 
 /// Probes every target in [`PROBE_TARGETS`] under the current subscriber.
-fn probe_all() -> [[bool; 5]; 6] {
+fn probe_all() -> [[bool; LEVELS.len()]; PROBE_TARGETS.len()] {
     [
         probe!("scylla"),
         probe!("opentelemetry"),
@@ -155,16 +180,4 @@ fn probe_all() -> [[bool; 5]; 6] {
         probe!("prosody"),
         probe!("rdkafka"),
     ]
-}
-
-/// Splits one default directive into its target and level.
-fn default_directive(directive: &str) -> (Option<&str>, LevelFilter) {
-    match directive.split_once('=') {
-        None => (None, level_filter(directive)),
-        Some((target, level)) => (Some(target), level_filter(level)),
-    }
-}
-
-fn level_filter(level: &str) -> LevelFilter {
-    level.parse().unwrap_or(LevelFilter::OFF)
 }

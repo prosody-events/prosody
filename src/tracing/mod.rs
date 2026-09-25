@@ -19,23 +19,19 @@ use std::env;
 use std::sync::OnceLock;
 use thiserror::Error;
 use tracing::error;
-#[cfg(not(test))]
 use tracing::level_filters::LevelFilter;
 use tracing::subscriber::{SetGlobalDefaultError, set_global_default};
 use tracing_opentelemetry::OpenTelemetryLayer;
-#[cfg(not(test))]
-use tracing_subscriber::fmt;
 use tracing_subscriber::layer::Identity as TracingIdentity;
 use tracing_subscriber::layer::{Layered, SubscriberExt};
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
-/// Log filter directives that apply unless `PROSODY_LOG` names the same
-/// target.
+/// Targets that log at warn unless `PROSODY_LOG` names them.
 ///
 /// The OpenTelemetry crates log routine setup and shutdown steps at info. A
 /// target matches by prefix, so `opentelemetry` also covers
 /// `opentelemetry_sdk` and `opentelemetry-otlp`.
-const DEFAULT_LOG_DIRECTIVES: &str = "info,scylla=warn,opentelemetry=warn";
+const QUIET_TARGETS: [&str; 2] = ["scylla", "opentelemetry"];
 
 /// A layer that does nothing
 pub type Identity = TracingIdentity;
@@ -85,7 +81,11 @@ pub fn initialize_tracing<T>(layer: Option<T>) -> Result<(), TracingError>
 where
     T: Layer<Layered<OpenTelemetryLayer<Registry, Tracer>, Registry>> + Send + Sync,
 {
-    let env_filter = log_filter(&env::var("PROSODY_LOG").unwrap_or_default());
+    let env_filter = log_filter(
+        &env::var_os("PROSODY_LOG")
+            .unwrap_or_default()
+            .to_string_lossy(),
+    );
 
     // Create a tracing subscriber with OpenTelemetry layer
     #[allow(clippy::print_stderr, reason = "tracing is not initialized yet")]
@@ -141,11 +141,23 @@ where
 
 /// Builds the log filter from the `PROSODY_LOG` directives.
 ///
-/// Each directive replaces the [`DEFAULT_LOG_DIRECTIVES`] entry for the same
-/// target, and a bare level replaces the `info` default. The defaults for all
-/// other targets stay. Invalid directives are reported to stderr and ignored.
+/// The default level is info, and the [`QUIET_TARGETS`] log at warn. A bare
+/// level replaces info. It also lowers the quiet targets when it is below
+/// warn, so `off` silences every target. A directive for a target replaces
+/// the default for that target. Invalid directives are reported to stderr and
+/// ignored.
 fn log_filter(overrides: &str) -> EnvFilter {
-    EnvFilter::builder().parse_lossy(format!("{DEFAULT_LOG_DIRECTIVES},{overrides}"))
+    let base = overrides
+        .rsplit(',')
+        // `LevelFilter` parses an empty string as error. `EnvFilter` ignores
+        // an empty segment.
+        .filter(|directive| !directive.is_empty())
+        .find_map(|directive| directive.parse::<LevelFilter>().ok())
+        .unwrap_or(LevelFilter::INFO);
+    let quiet = base.min(LevelFilter::WARN);
+    let defaults = QUIET_TARGETS.map(|target| format!("{target}={quiet}"));
+
+    EnvFilter::builder().parse_lossy(format!("{base},{},{overrides}", defaults.join(",")))
 }
 
 /// Selects base-2 exponential aggregation for all Prosody histograms.
@@ -349,6 +361,7 @@ pub fn init_test_logging() {
 /// Initializes test tracing infrastructure.
 pub fn init_test_logging() {
     use std::sync::Once;
+    use tracing_subscriber::fmt;
 
     static INIT: Once = Once::new();
 
