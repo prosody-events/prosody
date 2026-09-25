@@ -225,7 +225,8 @@ fn try_answers<X, T, E>(
     Ok(Answers(answers))
 }
 
-/// A keyed-state work buffer. Small operations stay inline.
+/// A keyed-state work buffer, such as batch answers or a coordinate chunk.
+/// Eight or fewer items stay inline without a heap allocation.
 pub type CellBuffer<T> = SmallVec<[T; CELLS_INLINE]>;
 
 /// The answers of a cache-fill batch read.

@@ -4,6 +4,7 @@ use crate::codec::Codec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::StateAccessError;
 use crate::state::collection::StateSession;
+use crate::state::fanout::{Concurrent, Sequential};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
 use std::error::Error;
 use std::future::{Future, ready};
@@ -37,8 +38,8 @@ pub trait CellResolver {
     /// the codec's payload.
     type Stored;
 
-    /// What a handle's `get` returns. `Send` so a resolved item survives a
-    /// `buffered` scan window in a `Send` stream.
+    /// What a handle's `get` returns. `Send` so a resolved item can cross an
+    /// await in a `Send` stream.
     type Resolved: Send;
 
     /// What a handle's `set` takes. The lifetime lets a borrowing resolver
@@ -123,10 +124,11 @@ impl<C: Codec> CellResolver for C {
 /// value. The `Resolver::Stored = Codec::Payload` bound enforces their
 /// compatibility here, once.
 ///
-/// Users never write a `CellType` impl. A plain codec satisfies it as a
-/// unit-addressed passthrough. [`WithResolver`] pairs a codec with a resolver,
-/// and [`Keyed`] lifts either into a key-addressed family.
-pub trait CellType {
+/// The crate seals this trait, so users cannot write a `CellType` impl. A
+/// plain codec satisfies it as a unit-addressed passthrough. [`WithResolver`]
+/// pairs a codec with a resolver, and [`Keyed`] lifts either into a
+/// key-addressed family.
+pub trait CellType: sealed::Resolution {
     /// The address codec. It is [`UnitKey`] for a single-cell type and a real
     /// key codec once lifted through [`Keyed`].
     type Key: OrderedKeyCodec;
@@ -147,6 +149,10 @@ impl<C: Codec> CellType for C {
     type Resolver = C;
 }
 
+impl<C: Codec> sealed::Resolution for C {
+    type Fanout = Sequential;
+}
+
 /// Pairs a codec with a resolver. This composes a reference cell without a
 /// hand-written [`CellType`] impl. It is single-cell (`Key = UnitKey`). Lift
 /// it through [`Keyed`] to address a family.
@@ -156,6 +162,10 @@ impl<C: Codec, R: CellResolver<Stored = C::Payload>> CellType for WithResolver<C
     type Codec = C;
     type Key = UnitKey;
     type Resolver = R;
+}
+
+impl<C: Codec, R: CellResolver<Stored = C::Payload>> sealed::Resolution for WithResolver<C, R> {
+    type Fanout = Concurrent;
 }
 
 /// Lifts a single-cell [`CellType`] into a family addressed by key codec `K`.
@@ -170,6 +180,10 @@ impl<K: OrderedKeyCodec, T: CellType<Key = UnitKey>> CellType for Keyed<K, T> {
     type Codec = T::Codec;
     type Key = K;
     type Resolver = T::Resolver;
+}
+
+impl<K: OrderedKeyCodec, T: CellType<Key = UnitKey>> sealed::Resolution for Keyed<K, T> {
+    type Fanout = FanoutOf<T>;
 }
 
 /// The logical key a cell type's ops address by. It is `()` for a single-cell
@@ -191,6 +205,27 @@ pub type WriteOf<'a, T> = <<T as CellType>::Resolver as CellResolver>::Write<'a>
 
 /// The session capability a cell type's resolver borrows at resolve time.
 pub type ContextOf<'s, T> = <<T as CellType>::Resolver as CellResolver>::Context<'s>;
+
+/// How a cell type's reads run their resolves.
+pub(crate) type FanoutOf<T> = <T as sealed::Resolution>::Fanout;
+
+/// Seals [`CellType`]. A `pub` trait inside a `pub(crate)` module caps at
+/// crate visibility, so no impl can exist outside this crate.
+pub(crate) mod sealed {
+    use crate::state::fanout::Fanout;
+
+    /// Selects how a cell type's reads run their resolves.
+    ///
+    /// Invariant: a cell type with a [`CellResolver`](super::CellResolver)
+    /// that can wait uses [`Concurrent`](crate::state::fanout::Concurrent).
+    /// Only a plain codec, whose resolve finishes on its first poll, uses
+    /// [`Sequential`](crate::state::fanout::Sequential). The seal enforces
+    /// this, because the crate writes every impl.
+    pub trait Resolution {
+        /// The driver for this cell type's resolves.
+        type Fanout: Fanout;
+    }
+}
 
 /// Error returned by a typed cell operation, which is one scoped collection
 /// command.

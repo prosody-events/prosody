@@ -55,20 +55,21 @@
 //! floor.** The settle boundary also rolls back staged provisional cells, but
 //! that is a different, framework-only step after the handler returns.
 
-use crate::codec::{Codec, SerializeBufGuard};
+use crate::codec::Codec;
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::Section;
 use crate::state::descriptor::{
-    CellCodecError, CellResolver, CellStateError, CellType, CollectionSpec, ContextOf, FromSession,
-    ResolvedOf, StructuralIdentity,
+    CellCodecError, CellResolver, CellStateError, CellType, CollectionSpec, ContextOf, FanoutOf,
+    FromSession, ResolvedOf, StructuralIdentity,
 };
+use crate::state::fanout::Fanout;
 use crate::state::registry::CollectionDef;
 use crate::state::store::CellBuffer;
 use crate::state::{RESOLVE_FANOUT, StateName, StateType, StoreOutcome};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use educe::Educe;
 use futures::stream::{StreamExt, TryStreamExt, iter};
-use std::future::Future;
+use std::future::{Future, ready};
 use std::marker::PhantomData;
 use tokio::task::coop::cooperative;
 
@@ -410,11 +411,9 @@ where
 }
 
 /// Decodes and resolves an aligned batch of raw cell slots into the exposed
-/// application values, preserving input order. The resolves — the expensive
-/// half, potentially a loader read per cell — fan out across the WHOLE batch
-/// through an ordered [`buffered`](StreamExt::buffered) window of
-/// [`RESOLVE_FANOUT`], so a batch's resolves overlap instead of serializing per
-/// sub-batch.
+/// application values, preserving input order. The cell type's
+/// [`FanoutOf`] runs the resolves across the whole batch. The answer buffer
+/// is sized once to the batch length.
 ///
 /// # Errors
 ///
@@ -429,44 +428,36 @@ where
     T: CellType,
     for<'s> ContextOf<'s, T>: FromSession<'s, S>,
 {
-    iter(bytes)
-        .map(|slot| {
-            cooperative(async move {
-                match slot {
-                    Some(raw) => Ok::<_, CellStateError<CellCodecError<T>>>(Some(
-                        resolve_cell::<S, T>(session, raw).await?,
-                    )),
-                    None => Ok(None),
-                }
-            })
+    let len = bytes.len();
+    let futures = iter(bytes).map(|slot| {
+        cooperative(async move {
+            match slot {
+                Some(raw) => Ok::<_, CellStateError<CellCodecError<T>>>(Some(
+                    resolve_cell::<S, T>(session, raw).await?,
+                )),
+                None => Ok(None),
+            }
         })
-        .buffered(RESOLVE_FANOUT)
-        .try_collect()
+    });
+    <FanoutOf<T> as Fanout>::drive(futures, RESOLVE_FANOUT)
+        .try_fold(CellBuffer::with_capacity(len), |mut values, value| {
+            values.push(value);
+            ready(Ok(values))
+        })
         .await
 }
 
-/// Decodes a cell's bytes as `C::Payload`. Parses in place when the `Bytes` is
-/// uniquely owned (zero-copy, the production path — every backend decode mints
-/// a fresh `Bytes`); falls back to a copy for a shared clone (the in-memory
-/// test backend). The single decode path every typed cell read shares.
+/// Decodes a cell's bytes as `C::Payload` through
+/// [`Codec::deserialize_bytes`]. A codec that reads shared bytes avoids a
+/// copy, and the default copies only shared bytes. The single decode path
+/// every typed cell read shares.
 pub(in crate::state) fn decode_cell<C: Codec>(cell: Bytes) -> Result<C::Payload, C::Error> {
-    match cell.try_into_mut() {
-        Ok(buf) => C::with_cached_local(|codec| codec.deserialize_owned(buf)),
-        Err(cell) => {
-            let buf = BytesMut::from(cell.as_ref());
-            C::with_cached_local(|codec| codec.deserialize_owned(buf))
-        }
-    }
+    C::with_cached_local(|codec| codec.deserialize_bytes(cell))
 }
 
-/// Encodes `payload` into the pooled, reusable serialize buffer, returning the
-/// guard so the caller hands its bytes on before the guard drops (returning the
-/// buffer to the pool). The guard owns its buffer, so it is `Send` and rides a
-/// write across an await. The single encode path every typed cell write shares.
-pub(in crate::state) fn encode_cell<C: Codec>(
-    payload: C::Payload,
-) -> Result<SerializeBufGuard, C::Error> {
-    let mut buf = SerializeBufGuard::acquire();
-    C::with_cached_local(|codec| codec.serialize(payload, &mut buf))?;
-    Ok(buf)
+/// Encodes `payload` into owned cell bytes through
+/// [`Codec::serialize_bytes`]. A codec that owns its encoded bytes returns
+/// them without a copy. The single encode path every typed cell write shares.
+pub(in crate::state) fn encode_cell<C: Codec>(payload: C::Payload) -> Result<Bytes, C::Error> {
+    C::with_cached_local(|codec| codec.serialize_bytes(payload))
 }

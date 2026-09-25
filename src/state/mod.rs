@@ -91,6 +91,7 @@ pub mod descriptor_identity;
 pub(crate) mod dirty;
 pub mod erased;
 pub mod event_ref;
+pub(crate) mod fanout;
 pub(crate) mod fjall;
 pub mod identity;
 pub mod manager;
@@ -127,6 +128,7 @@ pub use query::{
     ReadSource,
 };
 pub use registry::{CommitMode, ReadCachePolicy, StateVisibility};
+pub use store::CellBuffer;
 
 // The backend cluster is crate-internal (module-capped in [`backend`]); these
 // re-exports keep every in-crate `crate::state::X` import resolving without
@@ -150,16 +152,11 @@ pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
 /// pressure. Add configuration only if deployments require different bounds.
 pub(crate) const SHARD_FANOUT_CONCURRENCY: usize = 8;
 
-/// Maximum concurrent typed resolves within an aligned batch read or a range
-/// scan's resolution window. This bounds the loader fan-out for each read.
-/// A resolve reads the collection's source, such as a Kafka message.
-/// It does not contend on the collection's Scylla shard.
-/// [`SHARD_FANOUT_CONCURRENCY`] bounds overlapping round trips to that shard.
-/// A batch's resolves fan out across the WHOLE call under this window, so the
-/// resolves overlap rather than serialize per store sub-batch.
-///
-/// Currently matches [`store::CELL_BATCH`] so a full store batch resolves in
-/// one wave; the two bounds remain independently tunable.
+/// Maximum concurrent resolves within one batch read or range scan, for a
+/// cell type that drives them through [`fanout::Concurrent`]. A resolve reads
+/// the collection's source, such as a Kafka message, not its Scylla shard.
+/// [`SHARD_FANOUT_CONCURRENCY`] bounds round trips to that shard. It matches
+/// [`store::CELL_BATCH`], so a full store batch resolves in one wave.
 pub(crate) const RESOLVE_FANOUT: usize = 128;
 
 /// Inline capacity for keyed-state buffers whose cardinality is commonly small.

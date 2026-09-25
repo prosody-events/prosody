@@ -6,7 +6,7 @@ use crate::codec::Codec;
 use crate::state::cell::Presence;
 use crate::state::descriptor::SetDescriptor;
 use crate::state::order_codec::OrderedKeyCodec;
-use crate::state::{BorrowedKeyQuery, KeyQuery, KeyRead, ReadQuery, ReadSource};
+use crate::state::{BorrowedKeyQuery, CellBuffer, KeyQuery, KeyRead, ReadQuery, ReadSource};
 use crate::state_reader::{ReaderBackend, StateReaderError};
 use futures::Stream;
 use std::borrow::Borrow;
@@ -50,7 +50,7 @@ where
         &self,
         key: K,
         members: I,
-    ) -> Result<Vec<bool>, StateReaderError>
+    ) -> Result<CellBuffer<bool>, StateReaderError>
     where
         Q: Borrow<KC::Borrowed> + ?Sized + 'a,
         I: IntoIterator<Item = &'a Q>,

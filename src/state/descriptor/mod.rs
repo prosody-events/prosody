@@ -100,6 +100,7 @@ pub use set::{SetDescriptor, SetHandle, SetStateError, set_state};
 pub use value::{ValueDescriptor, ValueHandle, ValueKind, value_state};
 
 mod cell;
+pub(crate) use cell::FanoutOf;
 pub use cell::{
     BorrowedKeyOf, CellCodecError, CellResolver, CellStateError, CellType, ContextOf, FromSession,
     KeyOf, Keyed, ResolvedOf, WithResolver, WriteOf,

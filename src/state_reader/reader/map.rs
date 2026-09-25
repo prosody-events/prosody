@@ -6,7 +6,7 @@ use crate::codec::Codec;
 use crate::state::cell::{Presence, Values};
 use crate::state::descriptor::{CellType, ContextOf, FromSession, MapDescriptor, ResolvedOf};
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
-use crate::state::{BorrowedKeyQuery, KeyQuery, KeyRead, ReadQuery, ReadSource};
+use crate::state::{BorrowedKeyQuery, CellBuffer, KeyQuery, KeyRead, ReadQuery, ReadSource};
 use crate::state_reader::session::ReadSession;
 use crate::state_reader::{ReaderBackend, StateReaderError};
 use futures::Stream;
@@ -90,7 +90,7 @@ where
         &self,
         key: K,
         map_keys: I,
-    ) -> Result<Vec<Option<ResolvedOf<V>>>, StateReaderError>
+    ) -> Result<CellBuffer<Option<ResolvedOf<V>>>, StateReaderError>
     where
         for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
         Q: Borrow<KC::Borrowed> + ?Sized + 'a,
@@ -114,7 +114,7 @@ where
         &self,
         key: K,
         map_keys: I,
-    ) -> Result<Vec<bool>, StateReaderError>
+    ) -> Result<CellBuffer<bool>, StateReaderError>
     where
         Q: Borrow<KC::Borrowed> + ?Sized + 'a,
         I: IntoIterator<Item = &'a Q>,

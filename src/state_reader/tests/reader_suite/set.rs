@@ -104,7 +104,7 @@ async fn check<B: ReaderBackend>(
     let expected = KEY_POOL.map(|member| model.contains(&member));
     Ok(empty == model.is_empty()
         && points
-        && presence == expected
+        && *presence == expected
         && forward == model.iter().copied().collect::<Vec<_>>()
         && bounded == model.range(-1..=1).take(1).copied().collect::<Vec<_>>()
         && backward == model.iter().rev().copied().collect::<Vec<_>>())

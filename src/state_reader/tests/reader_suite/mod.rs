@@ -169,7 +169,7 @@ async fn assert_map<B: ReaderBackend>(
     let backward = backward?;
     if empty != model.is_empty()
         || !points
-        || many != expect_many
+        || *many != expect_many
         || forward != expect_forward
         || keys != model.keys().copied().collect::<Vec<_>>()
         || constrained_entries != expected_entries

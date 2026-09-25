@@ -137,7 +137,7 @@ async fn assert_set<S: StateSession>(
     }
     assert_eq!(handle.is_empty().await?, model.is_empty());
     assert_eq!(
-        handle.contains_many(queries).await?,
+        *handle.contains_many(queries).await?,
         queries
             .iter()
             .map(|key| model.contains(key))

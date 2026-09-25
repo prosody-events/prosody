@@ -261,7 +261,7 @@ async fn reader_presence_uses_read_cache() -> Result<()> {
         "absence answers both projections"
     );
     assert_eq!(
-        reader.contains_many(key.clone(), &[1, 3]).await?,
+        *reader.contains_many(key.clone(), &[1, 3]).await?,
         [true, false]
     );
     assert_eq!(

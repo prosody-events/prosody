@@ -2,12 +2,12 @@
 
 use crate::Key;
 use crate::codec::Codec;
-use crate::state::ErasedKeyQuery;
 use crate::state::descriptor::{DequeDescriptor, MapDescriptor, SetDescriptor, ValueDescriptor};
 use crate::state::erased::{
     Erased, ErasedDequeRead, ErasedKeyRead, ErasedStateError, StateCursor, read,
 };
 use crate::state::order_codec::Utf8KeyCodec;
+use crate::state::{CellBuffer, ErasedKeyQuery};
 use crate::state_reader::{ReaderBackend, StateReader, StateReaderError};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -158,6 +158,7 @@ where
         self.0
             .get_many(Key::from(key), &map_keys)
             .await
+            .map(CellBuffer::into_vec)
             .map_err(Into::into)
     }
 
@@ -169,6 +170,7 @@ where
         self.0
             .contains_many(Key::from(key), &map_keys)
             .await
+            .map(CellBuffer::into_vec)
             .map_err(Into::into)
     }
 
@@ -225,6 +227,7 @@ where
         self.0
             .contains_many(Key::from(key), &members)
             .await
+            .map(CellBuffer::into_vec)
             .map_err(Into::into)
     }
 

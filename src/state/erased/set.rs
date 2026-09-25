@@ -4,7 +4,7 @@ use super::{DynSetState, Erased, ErasedKeyRead, ErasedStateError, StateCursor, r
 use crate::state::collection::WritableStateSession;
 use crate::state::descriptor::SetHandle;
 use crate::state::order_codec::Utf8KeyCodec;
-use crate::state::{ErasedKeyQuery, StoreOutcome};
+use crate::state::{CellBuffer, ErasedKeyQuery, StoreOutcome};
 use async_stream::try_stream;
 use async_trait::async_trait;
 
@@ -24,6 +24,7 @@ where
         self.0
             .contains_many(&keys)
             .await
+            .map(CellBuffer::into_vec)
             .map_err(|error| ErasedStateError::from_classified(&error))
     }
 

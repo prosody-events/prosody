@@ -1,11 +1,10 @@
 //! Scoped reads through owner or reader admission.
 
-use super::batch::{encode_key, read_keys};
+use super::batch::{contains_keys, encode_key, get_keys};
 use super::{
     BorrowedKeyOf, CellBuffer, CellCodecError, CellFamily, CellStateError, CellType,
     CollectionRead, ContextOf, FromSession, Presence, ReadOperation, ResolvedOf, StateName,
-    StateSession, Values, WritableStateSession, WriteOperation, resolve_batch, resolve_cell,
-    sealed,
+    StateSession, Values, WritableStateSession, WriteOperation, resolve_cell, sealed,
 };
 use crate::state::cell_key::CellRef;
 use std::future::Future;
@@ -44,23 +43,8 @@ impl<'c, S: StateSession, L> CollectionRead for ReadOperation<'c, S, L> {
         I: IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>,
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
-        let section = family.section();
         let Self { collection, inner } = self;
-        let session = collection.session();
-        let keys = keys.into_iter();
-        async move {
-            let bytes = read_keys::<S, T, Values>(
-                session,
-                inner,
-                collection.state_type(),
-                collection.name(),
-                section,
-                &[],
-                keys,
-            )
-            .await?;
-            resolve_batch::<S, T>(session, bytes).await
-        }
+        get_keys::<S, L, T>(collection, inner, family.section(), &[], keys.into_iter())
     }
 
     fn contains<'a, T: CellType>(
@@ -101,24 +85,8 @@ impl<'c, S: StateSession, L> CollectionRead for ReadOperation<'c, S, L> {
         T: CellType,
         I: IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>,
     {
-        let section = family.section();
         let Self { collection, inner } = self;
-        let keys = keys.into_iter();
-        async move {
-            Ok(read_keys::<S, T, Presence>(
-                collection.session(),
-                inner,
-                collection.state_type(),
-                collection.name(),
-                section,
-                &[],
-                keys,
-            )
-            .await?
-            .into_iter()
-            .map(|value| value.is_some())
-            .collect())
-        }
+        contains_keys::<S, L, T>(collection, inner, family.section(), &[], keys.into_iter())
     }
 
     fn get<'a, T>(
@@ -190,27 +158,18 @@ impl<'c, S: WritableStateSession, L> CollectionRead for WriteOperation<'c, S, L>
         I: IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>,
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
-        let section = family.section();
-        let keys = keys.into_iter();
         let Self {
             collection,
             inner,
             journal,
         } = self;
-        let session = collection.session();
-        async move {
-            let bytes = read_keys::<S, T, Values>(
-                session,
-                &mut **inner,
-                collection.state_type(),
-                collection.name(),
-                section,
-                journal,
-                keys,
-            )
-            .await?;
-            resolve_batch::<S, T>(session, bytes).await
-        }
+        get_keys::<S, L, T>(
+            collection,
+            inner,
+            family.section(),
+            journal,
+            keys.into_iter(),
+        )
     }
 
     fn contains<'a, T: CellType>(
@@ -242,28 +201,18 @@ impl<'c, S: WritableStateSession, L> CollectionRead for WriteOperation<'c, S, L>
         T: CellType,
         I: IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>,
     {
-        let section = family.section();
-        let keys = keys.into_iter();
         let Self {
             collection,
             inner,
             journal,
         } = self;
-        async move {
-            Ok(read_keys::<S, T, Presence>(
-                collection.session(),
-                &mut **inner,
-                collection.state_type(),
-                collection.name(),
-                section,
-                journal,
-                keys,
-            )
-            .await?
-            .into_iter()
-            .map(|value| value.is_some())
-            .collect())
-        }
+        contains_keys::<S, L, T>(
+            collection,
+            inner,
+            family.section(),
+            journal,
+            keys.into_iter(),
+        )
     }
 
     fn get<'a, T>(
