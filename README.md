@@ -68,7 +68,7 @@ prosody = "0.1"
 
 ### Worker stack size (debug builds)
 
-A debug build of Prosody polls deep async stack frames, from the handler down through the timer store and the Cassandra driver. This depth can overflow Tokio's default 2 MiB worker stack. If you build your own Tokio runtime, set the worker stack size to at least 8 MiB:
+A debug build of Prosody polls deep async frames, from the handler through the timer store to the Cassandra driver. This depth can overflow the Tokio default worker stack of 2 MiB. `#[tokio::main]` uses that default. In a debug build, build the Tokio runtime yourself and set the worker stack size to at least 8 MiB:
 
 ```rust,ignore
 tokio::runtime::Builder::new_multi_thread()
