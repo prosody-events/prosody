@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.7.0](https://github.com/prosody-events/prosody/compare/prosody-v0.6.0...prosody-v0.7.0) (2026-09-25)
+
+
+### Features
+
+* accept borrowed collection keys ([#79](https://github.com/prosody-events/prosody/issues/79)) ([420fa26](https://github.com/prosody-events/prosody/commit/420fa26502f4d6dc84e21c1a88593f0c44c45a36))
+* add a presence-only set collection ([#75](https://github.com/prosody-events/prosody/issues/75)) ([3bfdc3e](https://github.com/prosody-events/prosody/commit/3bfdc3e6e07a8cab07af7d8b9fa1384837b64aee))
+* add bounded map and deque queries ([#74](https://github.com/prosody-events/prosody/issues/74)) ([82fe206](https://github.com/prosody-events/prosody/commit/82fe2066c2bd9c35898b719f11e61a2f0263abf8))
+* add fluent map queries with limit push-down ([#72](https://github.com/prosody-events/prosody/issues/72)) ([38f9b4d](https://github.com/prosody-events/prosody/commit/38f9b4d6eeaf70686daf18bb6a0e25f7e2fa25a6))
+* add keyed-state cell metrics ([#82](https://github.com/prosody-events/prosody/issues/82)) ([9a499b9](https://github.com/prosody-events/prosody/commit/9a499b95d5e675dd05db4e18e936d9e7c341cf3b))
+* add presence-only key reads and map is_empty ([#71](https://github.com/prosody-events/prosody/issues/71)) ([a93ae12](https://github.com/prosody-events/prosody/commit/a93ae1274794a4d1d49948a8a8995f08b874501d))
+* carry the retry ordinal on DemandType ([#91](https://github.com/prosody-events/prosody/issues/91)) ([3da0adf](https://github.com/prosody-events/prosody/commit/3da0adfd4e707b1184384a2f3f41463ba3653ac0))
+* **state:** anchor the commit point on collection evidence ([#90](https://github.com/prosody-events/prosody/issues/90)) ([ea69964](https://github.com/prosody-events/prosody/commit/ea699645641da40a2851b31595887456264db9c3))
+* **state:** share fluent collection queries across read APIs ([#95](https://github.com/prosody-events/prosody/issues/95)) ([80887f8](https://github.com/prosody-events/prosody/commit/80887f8d69ff4f6862a3ba23241a60da618a8734))
+
+
+### Bug Fixes
+
+* allow published reads without topic subscriptions ([#81](https://github.com/prosody-events/prosody/issues/81)) ([87ea311](https://github.com/prosody-events/prosody/commit/87ea311049cd9c18b581e4db75509ecfb578f7db))
+* **deps:** upgrade dependencies ([#99](https://github.com/prosody-events/prosody/issues/99)) ([8a91e60](https://github.com/prosody-events/prosody/commit/8a91e600bd9e59b5eeda9dc45a7814562e730d0f))
+* resolve all Rust 1.98 quality issues ([#83](https://github.com/prosody-events/prosody/issues/83)) ([fc48b63](https://github.com/prosody-events/prosody/commit/fc48b633cf76466c136ab12f5ab9db978abecfbc))
+* serialize keyed-state publication ([#77](https://github.com/prosody-events/prosody/issues/77)) ([c759797](https://github.com/prosody-events/prosody/commit/c7597978ed050d13c4f2085e9db15d6e2bc8e0b2))
+* **tracing:** quiet OpenTelemetry info logs by default ([#100](https://github.com/prosody-events/prosody/issues/100)) ([0c800a5](https://github.com/prosody-events/prosody/commit/0c800a521ad2efe8a9de3aaefdad68d7230c3aa2))
+* write the retry timer before every deferred queue write ([#93](https://github.com/prosody-events/prosody/issues/93)) ([5b0aecf](https://github.com/prosody-events/prosody/commit/5b0aecf6ad18e90c0cc8fb981873cac43b7fc6ca))
+
+
+### Performance Improvements
+
+* **state:** cut allocations in keyed-state batch reads ([#98](https://github.com/prosody-events/prosody/issues/98)) ([7bb6f78](https://github.com/prosody-events/prosody/commit/7bb6f780208ab95bb294fb1bb5e11ad637336aa1))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * prosody-macros bumped from 0.6.0 to 0.7.0
+
 ## [0.6.0](https://github.com/prosody-events/prosody/compare/prosody-v0.5.0...prosody-v0.6.0) (2026-08-19)
 
 
