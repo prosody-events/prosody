@@ -66,6 +66,19 @@ Add Prosody to your `Cargo.toml`:
 prosody = "0.1"
 ```
 
+### Worker stack size (debug builds)
+
+A debug build of Prosody polls deep async frames, from the handler through the timer store to the Cassandra driver. This depth can overflow the Tokio default worker stack of 2 MiB. `#[tokio::main]` uses that default. In a debug build, build the Tokio runtime yourself and set the worker stack size to at least 8 MiB:
+
+```rust,ignore
+tokio::runtime::Builder::new_multi_thread()
+    .enable_all()
+    .thread_stack_size(8 * 1024 * 1024)
+    .build()?;
+```
+
+A release build stays well below the default stack size, so it needs no change.
+
 ### High-Level Client Example
 
 ```rust,no_run
