@@ -4,8 +4,11 @@ CMAKE_POLICY_VERSION_MINIMUM = { value = "3.5", force = true }
 # chain's poll descent (handler -> context chain -> TimerManager -> scylla)
 # overflows tokio's default 2 MiB worker stacks in integration tests.
 # This `[env]` applies to every cargo-launched process (`run`, `test`, ...),
-# not just test binaries; binaries invoked directly (e.g. a release deploy)
-# are unaffected and sit far below the limit regardless.
+# not just test binaries. A debug binary launched outside cargo (an embedding
+# host process, a language binding's test runner) does not inherit this
+# variable and must set the same worker stack size on its own Tokio runtime;
+# see "Worker stack size (debug builds)" in README.md. A release build stays
+# far below the limit regardless.
 RUST_MIN_STACK = "8388608"
 
 [target.x86_64-unknown-linux-gnu]
