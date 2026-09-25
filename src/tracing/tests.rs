@@ -29,21 +29,6 @@ const OVERRIDE_LEVELS: [LevelFilter; 6] = [
     LevelFilter::TRACE,
 ];
 
-/// Segments that `EnvFilter` ignores. An unset `PROSODY_LOG` is one empty
-/// segment.
-const BLANK_SEGMENTS: [&str; 2] = ["", " "];
-
-/// Targets that the property checks, in the order of [`probe_all`].
-/// `rdkafka` has no default and no generated directive.
-const PROBE_TARGETS: [&str; 6] = [
-    "scylla",
-    "opentelemetry",
-    "opentelemetry_sdk",
-    "opentelemetry-otlp",
-    "prosody",
-    "rdkafka",
-];
-
 /// Event levels that the property checks, in the order of [`probe`].
 const LEVELS: [Level; 5] = [
     Level::ERROR,
@@ -63,7 +48,8 @@ enum Override {
     /// target.
     Invalid(Option<&'static str>),
 
-    /// A segment that holds no directive.
+    /// A segment that holds no directive. An unset `PROSODY_LOG` is one empty
+    /// segment.
     Blank(&'static str),
 }
 
@@ -88,31 +74,34 @@ impl Arbitrary for Override {
                 *g.choose(&OVERRIDE_LEVELS).unwrap_or(&LevelFilter::OFF),
             ),
             1 => Self::Invalid(target),
-            _ => Self::Blank(g.choose(&BLANK_SEGMENTS).unwrap_or(&"")),
+            _ => Self::Blank(if bool::arbitrary(g) { "" } else { " " }),
         }
     }
 }
 
-/// Reports, for each level in [`LEVELS`], whether the current subscriber
-/// enables an event for `$target`.
+/// Returns `$target` and, for each level in [`LEVELS`], whether the current
+/// subscriber enables an event for it.
 ///
 /// A callsite fixes its target and level at compile time. So each pair needs
 /// its own `enabled!` call.
 macro_rules! probe {
     ($target:literal) => {
-        [
-            enabled!(target: $target, Level::ERROR),
-            enabled!(target: $target, Level::WARN),
-            enabled!(target: $target, Level::INFO),
-            enabled!(target: $target, Level::DEBUG),
-            enabled!(target: $target, Level::TRACE),
-        ]
+        (
+            $target,
+            [
+                enabled!(target: $target, Level::ERROR),
+                enabled!(target: $target, Level::WARN),
+                enabled!(target: $target, Level::INFO),
+                enabled!(target: $target, Level::DEBUG),
+                enabled!(target: $target, Level::TRACE),
+            ],
+        )
     };
 }
 
 /// A `PROSODY_LOG` directive replaces the default for its own target. The
-/// last bare level replaces the `info` default and caps the quiet targets at
-/// that level. Invalid and blank segments change nothing.
+/// last bare level replaces the `info` default and caps the
+/// [`QUIET_TARGETS`] at that level. Invalid and blank segments change nothing.
 ///
 /// The model keeps one level for each target. The defaults go in first. Then
 /// each valid targeted override replaces the entry for its target. A probe
@@ -141,19 +130,17 @@ fn prop_prosody_log_replaces_defaults_per_target(overrides: Vec<Override>) -> bo
         }
     }
 
-    let expected = PROBE_TARGETS.map(|probe| {
+    let filter = log_filter(&rendered.join(","));
+    let probes = with_default(Registry::default().with(filter), probe_all);
+
+    probes.into_iter().all(|(probe, enabled)| {
         let level = model
             .iter()
             .filter(|(target, _)| target.is_none_or(|target| probe.starts_with(target)))
             .max_by_key(|(target, _)| target.map_or(0, str::len))
             .map_or(LevelFilter::OFF, |(_, level)| *level);
-        LEVELS.map(|event| event <= level)
-    });
-
-    let filter = log_filter(&rendered.join(","));
-    let actual = with_default(Registry::default().with(filter), probe_all);
-
-    actual == expected
+        enabled == LEVELS.map(|event| event <= level)
+    })
 }
 
 /// FFI clients call flush and shutdown unconditionally on dispose or process
@@ -170,8 +157,9 @@ fn flush_and_shutdown_are_noops_when_uninitialized() -> Result<()> {
     Ok(())
 }
 
-/// Probes every target in [`PROBE_TARGETS`] under the current subscriber.
-fn probe_all() -> [[bool; LEVELS.len()]; PROBE_TARGETS.len()] {
+/// Probes each checked target under the current subscriber. `rdkafka` has no
+/// default and no generated directive.
+fn probe_all() -> [(&'static str, [bool; LEVELS.len()]); 6] {
     [
         probe!("scylla"),
         probe!("opentelemetry"),

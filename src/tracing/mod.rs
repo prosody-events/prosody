@@ -26,7 +26,7 @@ use tracing_subscriber::layer::Identity as TracingIdentity;
 use tracing_subscriber::layer::{Layered, SubscriberExt};
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
-/// Targets that log at warn unless `PROSODY_LOG` names them.
+/// Targets that log at warn by default.
 ///
 /// The OpenTelemetry crates log routine setup and shutdown steps at info. A
 /// target matches by prefix, so `opentelemetry` also covers
@@ -81,11 +81,8 @@ pub fn initialize_tracing<T>(layer: Option<T>) -> Result<(), TracingError>
 where
     T: Layer<Layered<OpenTelemetryLayer<Registry, Tracer>, Registry>> + Send + Sync,
 {
-    let env_filter = log_filter(
-        &env::var_os("PROSODY_LOG")
-            .unwrap_or_default()
-            .to_string_lossy(),
-    );
+    let overrides = env::var_os("PROSODY_LOG").unwrap_or_default();
+    let env_filter = log_filter(&overrides.to_string_lossy());
 
     // Create a tracing subscriber with OpenTelemetry layer
     #[allow(clippy::print_stderr, reason = "tracing is not initialized yet")]
@@ -144,8 +141,8 @@ where
 /// The default level is info, and the [`QUIET_TARGETS`] log at warn. A bare
 /// level replaces info. It also lowers the quiet targets when it is below
 /// warn, so `off` silences every target. A directive for a target replaces
-/// the default for that target. Invalid directives are reported to stderr and
-/// ignored.
+/// the default for that target. `EnvFilter` reports invalid directives to
+/// stderr and ignores them.
 fn log_filter(overrides: &str) -> EnvFilter {
     let base = overrides
         .rsplit(',')
@@ -155,9 +152,11 @@ fn log_filter(overrides: &str) -> EnvFilter {
         .find_map(|directive| directive.parse::<LevelFilter>().ok())
         .unwrap_or(LevelFilter::INFO);
     let quiet = base.min(LevelFilter::WARN);
-    let defaults = QUIET_TARGETS.map(|target| format!("{target}={quiet}"));
+    let defaults = QUIET_TARGETS
+        .map(|target| format!("{target}={quiet}"))
+        .join(",");
 
-    EnvFilter::builder().parse_lossy(format!("{base},{},{overrides}", defaults.join(",")))
+    EnvFilter::builder().parse_lossy(format!("{base},{defaults},{overrides}"))
 }
 
 /// Selects base-2 exponential aggregation for all Prosody histograms.
