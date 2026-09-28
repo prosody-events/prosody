@@ -83,9 +83,7 @@ where
     C::Payload: EventType + Clone + EventIdentity,
     R: ResultRequestReader + 'static,
 {
-    if let Err(error) = consumer_config.validate() {
-        return Err(error.into());
-    }
+    consumer_config.validate()?;
     let StartupServices {
         version,
         telemetry,
@@ -103,17 +101,11 @@ where
     // an unreachable thread that holds the Kafka client forever. The probe
     // server binds first: a misconfigured port fails in microseconds, ahead of
     // the client's network round trips, and no consumer exists yet to release.
-    let probe_server = match consumer_config
+    let probe_server = consumer_config
         .probe_port
         .filter(|_| !consumer_config.mock)
         .map(|port| ProbeServer::new(port, managers.clone(), heartbeats.clone()))
-        .transpose()
-    {
-        Ok(probe_server) => probe_server,
-        Err(error) => {
-            return Err(error.into());
-        }
-    };
+        .transpose()?;
 
     let started = start_client::<T, P, SP, C>(
         consumer_config,

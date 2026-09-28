@@ -89,8 +89,8 @@ pub struct KeyedStateConfiguration {
     ///
     /// `None` (the default) leaves the storage engine to choose its own
     /// default. `Some(bytes)` sets the capacity of the one cache this consumer
-    /// opens at `cache_dir`; it is shared by every partition, never multiplied
-    /// per partition.
+    /// opens under `cache_dir`; it is shared by every partition, never
+    /// multiplied per partition.
     ///
     /// Environment variable: `PROSODY_STATE_OWNED_CACHE_SIZE`. Accepts a
     /// positive human-readable byte size such as `64 MiB` or `500 MB`. A bare

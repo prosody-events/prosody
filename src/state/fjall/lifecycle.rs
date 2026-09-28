@@ -1,6 +1,6 @@
 //! Background creation and deletion of assignment keyspaces.
 //!
-//! fjall creates and deletes a keyspace under one process-wide lock, with many
+//! fjall creates and deletes a keyspace under one database-wide lock, with many
 //! `fsync` calls. One task runs these operations one at a time, each on a
 //! blocking thread. Assignment, revocation, and the Tokio workers never wait
 //! for them. Creates run before deletes: a create lets an assignment start
