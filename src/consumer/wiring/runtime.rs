@@ -83,6 +83,9 @@ where
     C::Payload: EventType + Clone + EventIdentity,
     R: ResultRequestReader + 'static,
 {
+    if let Err(error) = consumer_config.validate() {
+        return Err(error.into());
+    }
     let StartupServices {
         version,
         telemetry,
@@ -100,26 +103,15 @@ where
     // an unreachable thread that holds the Kafka client forever. The probe
     // server binds first: a misconfigured port fails in microseconds, ahead of
     // the client's network round trips, and no consumer exists yet to release.
-    // The providers hold the keyed-state cache open, so an early failure drops
-    // them before it waits for the cache.
-    let cache = providers.state.stopped();
-    let bound = consumer_config
-        .validate()
-        .map_err(ConsumerError::from)
-        .and_then(|()| {
-            consumer_config
-                .probe_port
-                .filter(|_| !consumer_config.mock)
-                .map(|port| ProbeServer::new(port, managers.clone(), heartbeats.clone()))
-                .transpose()
-                .map_err(ConsumerError::from)
-        });
-    let probe_server = match bound {
+    let probe_server = match consumer_config
+        .probe_port
+        .filter(|_| !consumer_config.mock)
+        .map(|port| ProbeServer::new(port, managers.clone(), heartbeats.clone()))
+        .transpose()
+    {
         Ok(probe_server) => probe_server,
         Err(error) => {
-            drop(providers);
-            cache.wait().await;
-            return Err(error);
+            return Err(error.into());
         }
     };
 
@@ -151,7 +143,6 @@ where
         Err(error) => {
             observer.clear();
             drain_managers(&managers).await;
-            cache.wait().await;
             return Err(release_probe(probe_server, error).await);
         }
     };
@@ -182,7 +173,6 @@ where
         poll_handle,
         probe_server,
         observer,
-        cache,
     })));
 
     Ok(ProsodyConsumer {

@@ -1,17 +1,15 @@
-//! Keyspace lifecycle, startup deletion, and cache sizing.
+//! Keyspace lifecycle, client directories, and cache sizing.
 
 use super::*;
 use crate::ByteSize;
 use crate::state::config::KeyedStateConfiguration;
-use futures::FutureExt;
 use quickcheck::{Arbitrary, Gen};
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
-use std::time::Duration;
 use tempfile::TempDir;
 use tokio::runtime::Builder;
 use tokio::sync::OnceCell;
-use tokio::time::timeout;
 
 /// Most operations in one lifecycle trace. Each assignment creates a keyspace,
 /// which costs one directory `fsync`.
@@ -118,72 +116,34 @@ fn prop_keyspaces_track_live_slots() {
     QuickCheck::new().quickcheck(prop as fn(Trace) -> TestResult);
 }
 
-/// Two clients on one `cache_dir` fail fast with [`CacheDirInUse`]: fjall's
-/// exclusive directory lock is what makes the startup deletion safe, so
-/// contention must surface as a clear, permanent configuration error.
-///
-/// [`CacheDirInUse`]: FjallClientError::CacheDirInUse
+/// Clients share a `cache_dir` without contention: each opens its database in
+/// its own fresh subdirectory. fjall removes each subdirectory when the last
+/// handle to that database drops. Dropping the runtime drops the lifecycle
+/// tasks, and with them the last handles.
 #[test]
-fn open_fails_clearly_when_cache_dir_is_in_use() -> Result<()> {
+fn clients_own_fresh_directories_that_fjall_removes() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let config = config(dir.path(), None)?;
-    TEST_RUNTIME.block_on(async {
-        let _first = FjallClient::open(&config).await?;
-        let second = FjallClient::open(&config).await;
-        assert!(
-            matches!(second, Err(FjallClientError::CacheDirInUse { .. })),
-            "a second client on a live cache_dir must fail with CacheDirInUse"
-        );
-        Ok(())
-    })
-}
+    let entries = || -> Result<usize> { Ok(fs::read_dir(dir.path())?.count()) };
 
-/// The next startup deletes every keyspace left in `cache_dir`, whatever its
-/// name. The stop signal stays pending while a client lives. It resolves when
-/// the lifecycle task holds no fjall handle, so a restart opens the same
-/// `cache_dir` at once. A raw [`Database`] seeds what a crashed process left.
-#[test]
-fn restart_deletes_every_leftover_keyspace() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    {
-        let database = Database::builder(dir.path()).open()?;
-        for name in ["deadbeef", "unrelated"] {
-            database
-                .keyspace(name, KeyspaceCreateOptions::default)?
-                .insert(b"stale", b"row")?;
-        }
-    }
-    let config = config(dir.path(), None)?;
-    // One thread, so the lifecycle task runs only when the test awaits.
     let runtime = Builder::new_current_thread().enable_all().build()?;
     runtime.block_on(async {
-        let client = FjallClient::open(&config).await?;
-        let slot = client.slot();
-        client.settled().await?;
-        let live = slot
-            .attached()
-            .map(|cache| cache.keyspace().name().to_string());
+        let first = FjallClient::open(&config).await?;
+        let second = FjallClient::open(&config).await?;
+        let slot = first.slot();
+        first.settled().await?;
         assert!(
-            keyspace_names(client.database()).into_iter().eq(live),
-            "open must delete every leftover keyspace"
+            slot.attached().is_some(),
+            "the settled slot holds a keyspace"
         );
-        let stopped = client.stopped();
-        assert!(
-            stopped.clone().wait().now_or_never().is_none(),
-            "the stop signal must stay pending while the client lives"
-        );
-        drop((slot, client));
+        assert_eq!(entries()?, 2, "each client opens its own subdirectory");
+        drop((slot, first, second));
+        Ok::<_, Report>(())
+    })?;
+    drop(runtime);
 
-        timeout(Duration::from_secs(30), stopped.wait()).await?;
-        // Nothing awaits between the signal and this open. So a fjall handle
-        // that outlives the signal keeps the directory locked.
-        drop(Database::builder(dir.path()).open()?);
-        let reopened = FjallClient::open(&config).await?;
-        reopened.settled().await?;
-        let names = keyspace_names(reopened.database());
-        assert!(names.is_empty(), "restart must delete {names:?}");
-        Ok(())
-    })
+    assert_eq!(entries()?, 0, "fjall must remove every client directory");
+    Ok(())
 }
 
 /// `owned_cache_size` sets fjall's block-cache capacity. `None` leaves the

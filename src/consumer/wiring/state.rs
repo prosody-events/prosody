@@ -25,7 +25,6 @@ use crate::state::registry::CollectionDefRegistry;
 use crate::state_reader::PartitionCount;
 use crate::timers::duration::CompactDuration;
 use crate::{Codec, ConsumerGroup, EventIdentity, EventType, Topic};
-use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -202,9 +201,6 @@ pub(in crate::consumer) async fn cassandra_state_provider<C: Codec>(
 where
     C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
 {
-    // The process owns this directory and Cassandra is authoritative, so
-    // creating the default directory here is safe.
-    fs::create_dir_all(&keyed_state.config.cache_dir)?;
     let fjall_client = FjallClient::open(&keyed_state.config)
         .await
         .map_err(|error| KeyedStateInitError::Cache {

@@ -1,6 +1,6 @@
-//! The process-wide fjall database and its assignment keyspaces.
+//! The client's fjall database and its assignment keyspaces.
 //!
-//! One [`FjallClient`] owns the `fjall::Database` at the configured
+//! One [`FjallClient`] owns a `fjall::Database` in a fresh directory under
 //! `cache_dir`. Each partition assignment gets a [`CacheSlot`] from
 //! [`FjallClient::slot`]. The lifecycle task creates the assignment's
 //! keyspace in the background and fills the slot. When the assignment ends,
@@ -12,9 +12,7 @@
 //! committed-value cache and the admission markers.
 //!
 //! The cache has no durability guarantee. Cassandra provisional cells and
-//! collection evidence are the recovery source. The process owns everything
-//! in `cache_dir`, so [`FjallClient::open`] queues every existing keyspace for
-//! deletion. A failed delete costs only disk until a later startup.
+//! collection evidence are the recovery source.
 
 use super::CacheSlot;
 #[cfg(test)]
@@ -23,24 +21,22 @@ use super::lifecycle::{self, Pending};
 use crate::ByteSize;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::config::KeyedStateConfiguration;
-use crate::state::manager::Stopped;
 use fjall::config::CompressionPolicy;
 use fjall::{CompressionType, Database, KeyspaceCreateOptions};
-use std::path::PathBuf;
 use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
 #[cfg(test)]
 use tokio::sync::oneshot::{self, error::RecvError};
 use tokio::task::{JoinError, spawn_blocking};
+use uuid::Uuid;
 
-/// Process-wide Fjall instance and the create queue of its lifecycle task.
+/// A fjall database and the create queue of its lifecycle task.
 ///
-/// One `FjallClient` per consumer process. Clones share the task, and the task
-/// stops when the last clone drops.
+/// Clones share the database and the task. The task stops when the last clone
+/// drops.
 #[derive(Clone)]
 pub(crate) struct FjallClient {
     creates: UnboundedSender<Pending>,
-    stopped: Stopped,
     #[cfg(test)]
     retires: UnboundedSender<Retirement>,
     #[cfg(test)]
@@ -48,45 +44,29 @@ pub(crate) struct FjallClient {
 }
 
 impl FjallClient {
-    /// Opens the shared database at the configured `cache_dir`, starts the
-    /// lifecycle task, and queues every existing keyspace for deletion. Startup
-    /// does not wait for the deletes.
+    /// Opens an empty database in a fresh directory under `cache_dir` and
+    /// starts the lifecycle task.
     ///
-    /// fjall locks `cache_dir` before it opens the database. So no other live
-    /// client's keyspaces can be under this directory.
+    /// The directory name is a new v4 UUID, so no other client can use it.
+    /// fjall removes the directory when the last database handle drops.
     ///
     /// # Errors
     ///
-    /// Returns [`FjallClientError`] when another live client holds
-    /// `cache_dir` or the database cannot be opened.
+    /// Returns [`FjallClientError`] when the database cannot be opened.
     pub async fn open(config: &KeyedStateConfiguration) -> Result<Self, FjallClientError> {
-        let mut builder = Database::builder(&config.cache_dir);
+        let path = config.cache_dir.join(Uuid::new_v4().simple().to_string());
+        let mut builder = Database::builder(path).temporary(true);
         if let Some(bytes) = config.owned_cache_size {
             builder = builder.cache_size(bytes.get());
         }
-        let options = keyspace_options(config.memtable_size);
-        let path = config.cache_dir.clone();
-        let opened = options.clone();
-        let (database, stale) = spawn_blocking(move || {
-            let database = builder.open().map_err(|error| match error {
-                fjall::Error::Locked => FjallClientError::CacheDirInUse { path },
-                other => FjallClientError::Engine(other),
-            })?;
-            let stale = database
-                .list_keyspace_names()
-                .iter()
-                .map(|name| database.keyspace(name, || opened.clone()))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, FjallClientError>((database, stale))
-        })
-        .await??;
+        let database = spawn_blocking(move || builder.open()).await??;
 
-        let (creates, retires, stopped) = lifecycle::spawn(database.clone(), options, stale);
+        let (creates, retires) =
+            lifecycle::spawn(database.clone(), keyspace_options(config.memtable_size));
         #[cfg(not(test))]
         drop(retires);
         Ok(Self {
             creates,
-            stopped,
             #[cfg(test)]
             retires,
             #[cfg(test)]
@@ -102,12 +82,6 @@ impl FjallClient {
         let slot = CacheSlot::default();
         drop(self.creates.send(slot.pending()));
         slot
-    }
-
-    /// Returns the signal that resolves when the lifecycle task has stopped.
-    #[must_use]
-    pub(crate) fn stopped(&self) -> Stopped {
-        self.stopped.clone()
     }
 
     /// Returns the shared database.
@@ -154,21 +128,12 @@ pub(crate) enum FjallClientError {
 
     #[error("the blocking task that opened the cache failed: {0}")]
     BlockingTaskJoin(#[from] JoinError),
-
-    #[error(
-        "cache_dir {path:?} is already in use by another live prosody client; each consumer needs \
-         its own cache_dir"
-    )]
-    CacheDirInUse { path: PathBuf },
 }
 
 impl ClassifyError for FjallClientError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
             Self::Engine(_) | Self::BlockingTaskJoin(_) => ErrorCategory::Transient,
-            // The same configuration will keep colliding with the other
-            // client's lock; retrying cannot succeed.
-            Self::CacheDirInUse { .. } => ErrorCategory::Permanent,
         }
     }
 }

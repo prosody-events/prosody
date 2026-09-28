@@ -156,7 +156,6 @@ pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationB
 // `descriptor::Keyed` (the key-axis lifter) is deliberately not re-exported
 // here: it would shadow the message-routing `Keyed` trait re-exported here.
 pub use crate::state::descriptor::{CellResolver, CellType, FromSession, WithResolver};
-use crate::state::manager::Stopped;
 use crate::{Codec, JsonCodec, Partition, Topic};
 use ahash::HashMap;
 use crossbeam_utils::CachePadded;
@@ -214,8 +213,6 @@ struct RuntimeState {
     /// The consumer's Kafka observation handle. Shutdown retires its gauge
     /// series so a stopped consumer stops contributing to `sum` aggregations.
     observer: KafkaObserver,
-    /// Resolves when the keyed-state background work has stopped.
-    cache: Stopped,
 }
 
 /// What one teardown still holds after the Kafka poll loop stops.
@@ -227,7 +224,6 @@ struct RuntimeState {
 struct Teardown {
     probe_server: Option<ProbeServer>,
     observer: KafkaObserver,
-    cache: Stopped,
 }
 
 /// High-level Kafka consumer implementation.
@@ -331,8 +327,7 @@ impl<C: Codec> ProsodyConsumer<C> {
 
     /// Stops this consumer after all handlers finish.
     ///
-    /// It stops the poll loop, sweeps each partition, retires observations,
-    /// and waits for the keyed-state cache to release its directory.
+    /// It stops the poll loop, sweeps each partition, and retires observations.
     ///
     /// A second call finds no runtime state and does no work.
     /// A call on a clone behaves the same after another clone stops the
@@ -361,7 +356,6 @@ impl<C: Codec> ProsodyConsumer<C> {
             poll_handle,
             probe_server,
             observer,
-            cache,
         } = self.runtime_state.lock().take()?;
 
         self.shutdown.store(true, Ordering::Relaxed);
@@ -376,7 +370,6 @@ impl<C: Codec> ProsodyConsumer<C> {
             Teardown {
                 probe_server,
                 observer,
-                cache,
             },
             poll_failure,
         ))
@@ -384,8 +377,7 @@ impl<C: Codec> ProsodyConsumer<C> {
 }
 
 impl Teardown {
-    /// Retires observation resources after all partition handlers stop, then
-    /// waits for the keyed-state background work to stop.
+    /// Retires observation resources after all partition handlers stop.
     ///
     /// The [`Swept`](sweep::Swept) proof is the parameter, and only the sweep
     /// mints one, so this step cannot run before the sweep.
@@ -393,21 +385,19 @@ impl Teardown {
         let Self {
             probe_server,
             observer,
-            cache,
         } = self;
         observer.retire_gauges();
         if let Some(probe_server) = probe_server {
             probe_server.shutdown().await;
         }
-        cache.wait().await;
     }
 }
 
 /// Stops the consumer when it drops without an explicit shutdown.
 ///
-/// This path does await the probe server and keyed-state tasks. A
-/// current-thread runtime cannot drive them while this blocks its only thread,
-/// so call `shutdown` from such a runtime.
+/// This path does await the probe server task. A current-thread runtime cannot
+/// drive that task while this blocks its only thread, so call `shutdown` from
+/// such a runtime.
 ///
 /// `Drop` cannot return, so it logs the poll loop's join failure that
 /// [`shutdown`](ProsodyConsumer::shutdown) reports.

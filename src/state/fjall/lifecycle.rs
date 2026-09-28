@@ -6,13 +6,11 @@
 //! for them. Creates run before deletes: a create lets an assignment start
 //! caching, and a delete only reclaims disk.
 //!
-//! The task stops when the last client clone drops, and then [`Stopped`]
-//! resolves. Consumer shutdown waits for it after the assignment caches are
-//! gone, so the directory lock is free and a new client can open the same
-//! directory. Deletes still in the queue stay on disk until that startup.
+//! The task stops when the last client clone drops and leaves any queued
+//! deletes undone. fjall removes the whole database directory when the last
+//! handle to the database drops.
 
 use super::{FjallCellCache, io};
-use crate::state::manager::Stopped;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use std::sync::{Arc, OnceLock, Weak};
 use tokio::select;
@@ -87,41 +85,30 @@ impl Drop for Retire {
     fn drop(&mut self) {
         // Moving the handle leaves the last one to the lifecycle task, so fjall
         // removes the keyspace directory on a blocking thread. A failed send
-        // means the task has stopped. The next startup deletes the keyspace.
+        // means the task has stopped. The database drop removes the keyspace.
         if let Some(keyspace) = self.keyspace.take() {
             drop(self.queue.send(Retirement::Keyspace(keyspace)));
         }
     }
 }
 
-/// Starts the lifecycle task for `database`, queues the deletion of `stale`,
-/// and returns the create queue, the delete queue, and the task's stop signal.
-/// The task creates each keyspace with `options`. The caller runs inside a
-/// Tokio runtime.
-///
-/// The task stops when the returned create sender drops. The signal resolves
-/// after the task has dropped every fjall handle it held.
+/// Starts the lifecycle task for `database` and returns its create and delete
+/// queues. The task creates each keyspace with `options` and stops when the
+/// returned create sender drops. The caller runs inside a Tokio runtime.
 pub(super) fn spawn(
     database: Database,
     options: KeyspaceCreateOptions,
-    stale: Vec<Keyspace>,
-) -> (
-    UnboundedSender<Pending>,
-    UnboundedSender<Retirement>,
-    Stopped,
-) {
+) -> (UnboundedSender<Pending>, UnboundedSender<Retirement>) {
     let (creates, create_rx) = unbounded_channel();
     let (retires, retire_rx) = unbounded_channel();
-    for keyspace in stale {
-        drop(retires.send(Retirement::Keyspace(keyspace)));
-    }
-    let (running, stopped) = Stopped::channel();
-    let task = run(database, options, create_rx, retire_rx, retires.clone());
-    tokio::spawn(async move {
-        task.await;
-        drop(running);
-    });
-    (creates, retires, stopped)
+    tokio::spawn(run(
+        database,
+        options,
+        create_rx,
+        retire_rx,
+        retires.clone(),
+    ));
+    (creates, retires)
 }
 
 /// Runs queued creates and deletes, one at a time and creates first. Returns
@@ -193,10 +180,10 @@ async fn create(
     }
 }
 
-/// Deletes `keyspace`. A failure leaves it for the next startup to delete.
+/// Deletes `keyspace`. A failure leaves it for the database drop to remove.
 async fn delete(database: &Database, keyspace: Keyspace) {
     let database = database.clone();
     if let Err(error) = io::blocking(move || database.delete_keyspace(keyspace)).await {
-        warn!(%error, "keyed-state cache keyspace deletion failed; startup deletes it");
+        warn!(%error, "keyed-state cache keyspace deletion failed; the database drop removes it");
     }
 }

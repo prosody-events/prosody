@@ -46,8 +46,6 @@ mod tests;
 
 pub(crate) use checks::MarkerCheckSet;
 pub(crate) use client::FjallClient;
-#[cfg(test)]
-pub(crate) use client::FjallClientError;
 pub(crate) use clock::Clock;
 pub(crate) use error::FjallCellCacheError;
 #[cfg(test)]

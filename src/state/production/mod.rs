@@ -7,7 +7,6 @@ use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraStore,
 };
 use crate::state::fjall::{FjallClient, MarkerCheckSet};
-use crate::state::manager::Stopped;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::{PartitionBackend, StateBackendFactory};
@@ -74,10 +73,6 @@ where
         let cell = Cached::new(slot.clone(), cassandra);
         PartitionBackend::new(dedup, self.identity.clone(), cell, slot.into())
     }
-
-    fn stopped(&self) -> Stopped {
-        self.client.stopped()
-    }
 }
 
 /// Shares memory cells and identities across partitions.
@@ -123,9 +118,5 @@ where
             .create_store(topic, partition, &self.consumer_group);
         let cell = MemoryCellStore::new(self.cells.clone());
         PartitionBackend::new(dedup, self.identity.clone(), cell, ())
-    }
-
-    fn stopped(&self) -> Stopped {
-        Stopped::now()
     }
 }

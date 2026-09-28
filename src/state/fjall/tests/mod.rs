@@ -10,9 +10,7 @@
 
 use super::codec::cell_key;
 use super::test_db;
-use super::{
-    CacheRead, CacheSlot, Clock, FjallCellCache, FjallClient, FjallClientError, MarkerCheckSet,
-};
+use super::{CacheRead, CacheSlot, Clock, FjallCellCache, FjallClient, MarkerCheckSet};
 use crate::Key;
 use crate::state::CollectionId;
 use crate::state::backend::AdmissionChecks;
@@ -27,7 +25,7 @@ use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Report, Result, eyre};
-use fjall::{Database, KeyspaceCreateOptions};
+use fjall::Database;
 use quickcheck::{QuickCheck, TestResult};
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;

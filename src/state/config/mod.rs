@@ -13,7 +13,6 @@ use std::env;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use uuid::Uuid;
 use validator::{Validate, ValidationError};
 
 /// Environment variable for the local keyed-state cache directory.
@@ -73,14 +72,13 @@ const DEFAULT_READER_CACHE_SIZE: ByteSize = match NonZeroU64::new(1_048_576) {
 /// returns the parse error. Do not add a `Default` impl.
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct KeyedStateConfiguration {
-    /// Directory of the local keyed-state cache.
+    /// Directory that holds the local keyed-state caches.
     ///
-    /// Production deployments mount this (e.g. a Kubernetes `emptyDir`) and
-    /// **must** set it — the cache is wiped on process restart, so the mount
-    /// needs no persistence. Each live client needs its own directory because
-    /// it is locked exclusively. Defaults to a per-client temporary directory
-    /// so unconfigured consumers (and consumers that never register state)
-    /// work out of the box, even several in one process.
+    /// Each client opens its cache in a fresh subdirectory, and the cache
+    /// removes that subdirectory when the client drops. So clients can share
+    /// the directory, and the mount needs no persistence. Production
+    /// deployments **must** set it to a mounted path, for example a
+    /// Kubernetes `emptyDir`. Defaults to `<temp>/prosody/keyed-state`.
     ///
     /// Environment variable: `PROSODY_STATE_CACHE_DIR`
     #[builder(default = "from_env_with_fallback(STATE_CACHE_DIR_ENV, default_cache_dir())?")]
@@ -260,16 +258,10 @@ fn validate_publication(
     Ok(())
 }
 
-/// Per-client fallback keyed-state cache directory, used when
-/// [`STATE_CACHE_DIR_ENV`] is unset: `<temp>/prosody/keyed-state/<uuid>`. Wiped
-/// on restart, so it needs no persistence. The UUID leaf gives every client its
-/// own database. The directory is locked exclusively per live client, so two
-/// default-config clients in one process never contend.
+/// Fallback keyed-state cache directory, used when [`STATE_CACHE_DIR_ENV`] is
+/// unset.
 fn default_cache_dir() -> PathBuf {
-    env::temp_dir()
-        .join("prosody")
-        .join("keyed-state")
-        .join(Uuid::new_v4().simple().to_string())
+    env::temp_dir().join("prosody").join("keyed-state")
 }
 
 fn validate_cache_dir(cache_dir: &Path) -> Result<(), ValidationError> {

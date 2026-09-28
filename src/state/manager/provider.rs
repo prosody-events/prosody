@@ -1,6 +1,6 @@
 //! The process-wide provider that acquires a partition's state manager.
 
-use super::{IdentityErr, PartitionStateProvider, StateManager, StateManagerInner, Stopped};
+use super::{IdentityErr, PartitionStateProvider, StateManager, StateManagerInner};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::segment::partition_segment_id;
 use crate::state::descriptor_identity::{DescriptorIdentityError, acquire_descriptor_identities};
@@ -125,10 +125,6 @@ where
                 checks: backend.checks(),
             }),
         })
-    }
-
-    fn stopped(&self) -> Stopped {
-        self.backend.stopped()
     }
 }
 
