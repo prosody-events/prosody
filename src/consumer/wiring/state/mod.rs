@@ -21,7 +21,7 @@ use crate::state::registry::CollectionDefRegistry;
 use crate::state_reader::PartitionCount;
 use crate::subsystem::SubsystemName;
 use crate::timers::duration::CompactDuration;
-use crate::{ByteSize, Codec, ConsumerGroup, EventIdentity, EventType, Topic};
+use crate::{ByteSize, Codec, ConsumerGroup, EventIdentity, EventType, METADATA_TIMEOUT, Topic};
 use rdkafka::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::RDKafkaErrorCode;
@@ -32,9 +32,6 @@ use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::spawn_blocking;
-
-/// How long the routing metadata fetch may run before construction fails.
-const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) type MemoryStateProvider<P> = StateManagerProvider<
     MemoryStateBackendFactory<MemoryDeduplicationStoreProvider>,
