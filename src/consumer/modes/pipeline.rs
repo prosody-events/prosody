@@ -17,7 +17,6 @@ use crate::consumer::middleware::defer::{
 use crate::consumer::middleware::monopolization::MonopolizationMiddleware;
 use crate::consumer::middleware::retry::RetryMiddleware;
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
-use crate::consumer::observer::KafkaObserver;
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::{
     build_common_middleware, build_typed_state, cassandra_deps, memory_deps,
@@ -46,7 +45,6 @@ struct PipelineMiddlewareStack {
     retry_middleware: RetryMiddleware,
     heartbeats: HeartbeatRegistry,
     telemetry: Telemetry,
-    observer: KafkaObserver,
 }
 
 impl PipelineMiddlewareStack {
@@ -112,7 +110,6 @@ impl PipelineMiddlewareStack {
             version,
             telemetry: &self.telemetry,
             heartbeats: self.heartbeats,
-            observer: self.observer,
             managers: Arc::clone(&managers),
         };
         // Preparation is the last fallible step of this mode: no `?` after it
@@ -257,7 +254,7 @@ where
             monopolization,
             defer,
         } = pipeline_config;
-        let (components, _keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
+        let (components, _keyed_state, heartbeats) = build_typed_state(&setup).await?;
         let failure_tracker = FailureTracker::new(
             defer.failure_window,
             defer.failure_threshold,
@@ -273,7 +270,6 @@ where
             retry_middleware: RetryMiddleware::new(retry)?,
             heartbeats,
             telemetry,
-            observer,
         };
         let message_defer = MessageDeferMiddleware::new(
             defer,

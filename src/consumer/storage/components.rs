@@ -18,7 +18,6 @@ use crate::consumer::middleware::defer::timer::store::cassandra::queries::Querie
 use crate::consumer::middleware::defer::timer::store::{
     CassandraTimerDeferStoreProvider, MemoryTimerDeferStoreProvider,
 };
-use crate::consumer::observer::KafkaObserver;
 use crate::consumer::wiring::state::{
     CassandraStateProvider, KeyedStateInputs, MemoryStateProvider, cassandra_state_provider,
     memory_state_provider,
@@ -75,7 +74,6 @@ where
         &self,
         inputs: ConsumerStorageInputs,
         keyed_state: &KeyedStateInputs,
-        observer: KafkaObserver,
     ) -> impl Future<Output = Result<ComponentsOf<C, Self>, ConsumerError>> + Send;
 }
 
@@ -129,7 +127,6 @@ pub(crate) async fn cassandra<C>(
     identities: CassandraDescriptorIdentityStore,
     publications: CassandraPublicationStore,
     loader: KafkaLoader<C>,
-    observer: KafkaObserver,
 ) -> Result<
     ConsumerComponents<
         CassandraTriggerStoreProvider,
@@ -182,7 +179,9 @@ where
         ttl,
         inputs.dedup_cache_capacity,
     );
-    let publisher = keyed_state.cassandra_publication_setup(publications, observer);
+    let publisher = keyed_state
+        .cassandra_publication_setup(publications)
+        .await?;
     let state = cassandra_state_provider::<C>(
         keyed_state,
         dedup.clone(),

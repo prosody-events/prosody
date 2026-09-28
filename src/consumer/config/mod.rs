@@ -169,11 +169,9 @@ pub struct ConsumerConfiguration {
     /// it grows with the client's brokers, topics, and partitions. A shorter
     /// interval spends more poll-thread time on that parse.
     ///
-    /// Reporting cannot be turned off. Reports are the only thing that
-    /// refreshes the observed partition counts published keyed state routes
-    /// on, and they drive the fetch-queue and metadata-age gauges. Raise
-    /// the interval to make them cheaper. The accepted range is 1
-    /// millisecond to 24 hours.
+    /// Reporting cannot be turned off. Reports drive the fetch-queue and
+    /// metadata-age gauges. Raise the interval to make them cheaper. The
+    /// accepted range is 1 millisecond to 24 hours.
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_STATISTICS_INTERVAL\", \
                    DEFAULT_STATISTICS_INTERVAL)?",

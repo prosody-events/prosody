@@ -1,14 +1,13 @@
 //! Statistics fixtures: a partition-topology generator, the trees librdkafka
-//! would report for it, the identity attributes every generated series carries,
-//! and the observers the publication tests read counts from.
+//! would report for it, and the identity attributes every generated series
+//! carries.
 
-use super::super::{KafkaObserver, KafkaSnapshot, KafkaSnapshotGuard};
+use super::super::assigned_partitions;
 use quickcheck::{Arbitrary, Gen};
 use rdkafka::Statistics;
 use rdkafka::statistics::Partition as StatsPartition;
 use rdkafka::statistics::Topic as StatsTopic;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// The topic every fixture that needs only one uses.
 pub(super) const TOPIC: &str = "observed";
@@ -18,8 +17,8 @@ const TOPIC_POOL: [&str; 2] = [TOPIC, "observed-other"];
 /// Fixture identity attributes. They are constant for a client's lifetime, so
 /// one pair keeps every generated series comparable.
 const CLIENT_NAME: &str = "rdkafka#consumer-1";
-const CLIENT_ID: &str = "observer-tests";
-pub(super) const GROUP: &str = "observer-tests-group";
+const CLIENT_ID: &str = "statistics-tests";
+pub(super) const GROUP: &str = "statistics-tests-group";
 /// The metadata ages a generated report draws from, in milliseconds.
 const METADATA_AGES: [i64; 4] = [0, 1, 37, 4_000];
 
@@ -99,7 +98,7 @@ impl Entry {
     }
 
     /// Whether this entry is a real partition this instance holds. The oracle
-    /// half of the observer's assignment filter.
+    /// half of the gauges' assignment filter.
     fn is_assigned(self) -> bool {
         self.id != INTERNAL && self.desired
     }
@@ -272,13 +271,6 @@ pub(super) fn statistics_of_partitions(partitions: HashMap<i32, StatsPartition>)
     statistics_of([(TOPIC.to_owned(), stats_topic(0, partitions))])
 }
 
-/// Wraps a statistics tree in the guard readers hold.
-pub(super) fn guard_of(statistics: Statistics) -> KafkaSnapshotGuard {
-    KafkaSnapshotGuard {
-        snapshot: Arc::new(KafkaSnapshot::ConsumerStatistics(Box::new(statistics))),
-    }
-}
-
 /// The identity attributes every gauge carries, in the form the gauge readback
 /// matches on.
 pub(super) fn identity() -> [(&'static str, String); 4] {
@@ -290,51 +282,13 @@ pub(super) fn identity() -> [(&'static str, String); 4] {
     ]
 }
 
-/// A contiguous assigned topology of `count` partitions.
-pub(super) fn contiguous(count: i32) -> Vec<Entry> {
-    (0..count).map(Entry::generated).collect()
-}
-
-/// The assigned partition ids a guard yields, sorted.
-pub(super) fn assigned_ids(guard: &KafkaSnapshotGuard) -> Vec<i32> {
-    let mut ids: Vec<i32> = guard.assigned_partitions().map(|(_, id, _)| id).collect();
-    ids.sort_unstable();
-    ids
-}
-
-/// The assigned `(topic, id, fetch-queue depth)` triples a guard yields,
+/// The assigned `(topic, id, fetch-queue depth)` triples `statistics` yields,
 /// sorted. Pairing each id with its own depth is what proves the iterator does
 /// not mix entries.
-pub(super) fn assigned_depths(guard: &KafkaSnapshotGuard) -> Vec<(&str, i32, i64)> {
-    let mut yielded: Vec<(&str, i32, i64)> = guard
-        .assigned_partitions()
+pub(super) fn assigned_depths(statistics: &Statistics) -> Vec<(&str, i32, i64)> {
+    let mut yielded: Vec<(&str, i32, i64)> = assigned_partitions(statistics)
         .map(|(topic, id, partition)| (topic, id, partition.fetchq_cnt))
         .collect();
     yielded.sort_unstable();
     yielded
-}
-
-/// An observer with no observation installed — the pre-startup state.
-pub(crate) fn unobserved(group: &str) -> KafkaObserver {
-    KafkaObserver::new(group)
-}
-
-/// An observer reporting each `(topic, partition count)` as a contiguous
-/// assigned topology. Counts must be positive: `contiguous(0)` yields a topic
-/// with no partitions, which the count lookup rejects as an incomplete
-/// topology rather than reporting zero.
-pub(crate) fn observing(group: &str, topics: &[(&str, i32)]) -> KafkaObserver {
-    let observer = unobserved(group);
-    observe(&observer, topics);
-    observer
-}
-
-/// Replaces `observer`'s observation, as the next statistics report would.
-pub(crate) fn observe(observer: &KafkaObserver, topics: &[(&str, i32)]) {
-    observer.observe_statistics(statistics_of(topics.iter().map(|&(name, count)| {
-        (
-            name.to_owned(),
-            stats_topic(0, partition_map(&contiguous(count))),
-        )
-    })));
 }

@@ -2,11 +2,10 @@
 //! state providers built from them.
 
 use crate::consumer::config::ConsumerConfiguration;
-use crate::consumer::error::{ConsumerError, KeyedStateInitError};
+use crate::consumer::error::{ConsumerError, KeyedStateInitError, RoutingError};
 use crate::consumer::middleware::deduplication::{
     CassandraDeduplicationStoreProvider, MemoryDeduplicationStoreProvider,
 };
-use crate::consumer::observer::KafkaObserver;
 use crate::error::ClassifyError;
 use crate::loader::{KafkaLoader, MemoryLoader};
 use crate::state::cassandra::{
@@ -17,28 +16,34 @@ use crate::state::fjall::FjallClient;
 use crate::state::manager::StateManagerProvider;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
-use crate::state::publication::PublicationStore;
-use crate::state::publisher::{
-    FixedPartitionCount, PartitionCountSource, PublicationOwner, PublicationTopics,
-};
+use crate::state::publisher::{PublicationOwner, PublicationTopics, RoutingSet};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state_reader::PartitionCount;
+use crate::subsystem::SubsystemName;
 use crate::timers::duration::CompactDuration;
 use crate::{ByteSize, Codec, ConsumerGroup, EventIdentity, EventType, Topic};
+use rdkafka::ClientConfig;
+use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::metadata::{Metadata, MetadataPartition};
+use smallvec::SmallVec;
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::spawn_blocking;
+
+/// How long the routing metadata fetch may run before construction fails.
+const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) type MemoryStateProvider<P> = StateManagerProvider<
     MemoryStateBackendFactory<MemoryDeduplicationStoreProvider>,
     MemoryLoader<P>,
-    Option<PublicationOwner<MemoryPublicationStore, FixedPartitionCount>>,
+    Option<PublicationOwner<MemoryPublicationStore>>,
 >;
 
 pub(crate) type CassandraStateProvider<C> = StateManagerProvider<
     CassandraStateBackendFactory<CassandraDeduplicationStoreProvider>,
     KafkaLoader<C>,
-    Option<PublicationOwner<CassandraPublicationStore, KafkaObserver>>,
+    Option<PublicationOwner<CassandraPublicationStore>>,
 >;
 
 /// Keyed-state wiring inputs shared by every mode.
@@ -48,6 +53,7 @@ pub(crate) struct KeyedStateInputs {
     pub(in crate::consumer) version: Arc<str>,
     registry: Arc<CollectionDefRegistry>,
     topics: Option<PublicationTopics>,
+    bootstrap_servers: String,
     mock: bool,
     dedup_ttl: CompactDuration,
 }
@@ -77,6 +83,7 @@ impl KeyedStateInputs {
             version: Arc::from(dedup_version),
             registry,
             topics: PublicationTopics::new(topics),
+            bootstrap_servers: consumer_config.bootstrap_servers.join(","),
             mock: consumer_config.mock,
             dedup_ttl: CompactDuration::new(u32::try_from(dedup_ttl.as_secs()).unwrap_or(u32::MAX)),
         })
@@ -102,59 +109,64 @@ impl KeyedStateInputs {
         )
     }
 
-    /// Publication setup for a Cassandra arm. The count source is the primary
-    /// consumer's own observation, so the routing row advertises the topology
-    /// that consumer sees. The observer is the one carried by
-    /// [`StartupServices`](super::runtime::StartupServices).
-    pub(in crate::consumer) fn cassandra_publication_setup(
+    /// Publication setup for a Cassandra arm. The routing set comes from
+    /// broker metadata, which this call fetches once.
+    ///
+    /// # Errors
+    ///
+    /// [`ConsumerError`] when the fetch fails, or when the metadata cannot
+    /// supply a partition count for every subscribed topic.
+    pub(in crate::consumer) async fn cassandra_publication_setup(
         &self,
         store: CassandraPublicationStore,
-        observer: KafkaObserver,
-    ) -> Option<PublicationOwner<CassandraPublicationStore, KafkaObserver>> {
-        self.publication_setup(store, observer)
+    ) -> Result<Option<PublicationOwner<CassandraPublicationStore>>, ConsumerError> {
+        let Some((subsystem, topics)) = self.publication() else {
+            return Ok(None);
+        };
+        let routes = fetch_routes(
+            self.bootstrap_servers.clone(),
+            self.group.clone(),
+            topics.clone(),
+        )
+        .await?;
+        Ok(Some(PublicationOwner::new(
+            subsystem,
+            store,
+            self.registry.clone(),
+            routes,
+        )))
     }
 
-    /// Publication setup for mock-mode memory storage. The fixed partition
-    /// count is the mock cluster's topology. A live Kafka consumer using
-    /// in-memory storage cannot publish because this backend has no real topic
-    /// partition-count source.
+    /// Publication setup for mock-mode memory storage. Every topic gets the
+    /// mock cluster's partition count. A live Kafka consumer using in-memory
+    /// storage cannot publish, because that count is not the real one.
     pub(in crate::consumer) fn memory_publication_setup(
         &self,
         store: MemoryPublicationStore,
-    ) -> Result<Option<PublicationOwner<MemoryPublicationStore, FixedPartitionCount>>, ConsumerError>
-    {
+    ) -> Result<Option<PublicationOwner<MemoryPublicationStore>>, ConsumerError> {
         if self.registry.has_published() && !self.mock {
             return Err(KeyedStateInitError::PublishedMemoryStorage.into());
         }
-        Ok(self.publication_setup(store, FixedPartitionCount(PartitionCount::MOCK)))
+        Ok(self.publication().map(|(subsystem, topics)| {
+            PublicationOwner::new(
+                subsystem,
+                store,
+                self.registry.clone(),
+                topics.route_uniform(&self.group, PartitionCount::MOCK),
+            )
+        }))
     }
 
-    /// Builds the assignment owner for one backend's publication store.
-    /// The two typed wrappers above choose the count source, so a mock topology
-    /// can never reach a Cassandra routing row.
+    /// The subsystem and topic set a publishing consumer writes routing rows
+    /// for, or `None` when this consumer does not publish.
     ///
     /// The owner runs only on partition zero of the first topic in lexical
     /// order. It replaces the group's full routing set during assignment
     /// acquisition. The low-level
     /// [`ProsodyConsumer::new`](crate::consumer::ProsodyConsumer::new)
     /// constructor never calls this: it rejects registrations.
-    fn publication_setup<S, N>(&self, store: S, counts: N) -> Option<PublicationOwner<S, N>>
-    where
-        S: PublicationStore,
-        N: PartitionCountSource,
-    {
-        let (Some(subsystem), Some(topics)) = (self.config.subsystem.clone(), self.topics.clone())
-        else {
-            return None;
-        };
-        Some(PublicationOwner::new(
-            subsystem,
-            self.group.clone(),
-            store,
-            counts,
-            self.registry.clone(),
-            topics,
-        ))
+    fn publication(&self) -> Option<(SubsystemName, &PublicationTopics)> {
+        Some((self.config.subsystem.clone()?, self.topics.as_ref()?))
     }
 }
 
@@ -170,7 +182,7 @@ pub(in crate::consumer) fn memory_state_provider<C: Codec>(
     cells: MemoryCells,
     identities: MemoryDescriptorIdentityStore,
     loader: MemoryLoader<C::Payload>,
-    publisher: Option<PublicationOwner<MemoryPublicationStore, FixedPartitionCount>>,
+    publisher: Option<PublicationOwner<MemoryPublicationStore>>,
 ) -> MemoryStateProvider<C::Payload>
 where
     C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
@@ -197,7 +209,7 @@ pub(in crate::consumer) fn cassandra_state_provider<C: Codec>(
     cell_store: CassandraCellResources,
     identity_store: CassandraDescriptorIdentityStore,
     loader: KafkaLoader<C>,
-    publisher: Option<PublicationOwner<CassandraPublicationStore, KafkaObserver>>,
+    publisher: Option<PublicationOwner<CassandraPublicationStore>>,
 ) -> Result<CassandraStateProvider<C>, ConsumerError>
 where
     C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
@@ -224,39 +236,62 @@ where
     Ok(keyed_state.provider(backend, loader, publisher))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::JsonCodec;
-    use crate::state::descriptor::{StateDescriptor, value_state};
-    use crate::subsystem::SubsystemName;
-    use color_eyre::Result;
-
-    /// Published routing from memory is valid only when the Kafka topology is
-    /// also mocked. A live consumer has no typed partition-count source for
-    /// the in-memory publication store.
-    #[tokio::test]
-    async fn published_memory_state_requires_mock_mode() -> Result<()> {
-        let mut state = KeyedStateConfiguration::builder()
-            .subsystem(Some(SubsystemName::try_new("orders")?))
-            .build()?;
-        let _ = state.register(value_state::<JsonCodec>("cart").published(true));
-        let consumer = ConsumerConfiguration::builder()
-            .bootstrap_servers(vec!["unused:9092".to_owned()])
-            .group_id("orders")
-            .subscribed_topics(&["orders".to_owned()])
-            .mock(false)
-            .build()?;
-        let inputs = KeyedStateInputs::new(state, &consumer, "v1", Duration::from_secs(30))?;
-
-        let result = inputs.memory_publication_setup(MemoryPublicationStore::new());
-
-        assert!(matches!(
-            result,
-            Err(ConsumerError::KeyedState(
-                KeyedStateInitError::PublishedMemoryStorage
-            ))
-        ));
-        Ok(())
-    }
+/// Reads every topic's partition count from broker metadata.
+///
+/// A short-lived client fetches the metadata. It has no group id, so it never
+/// joins the consumer group, and its drop does not wait for a group leave.
+async fn fetch_routes(
+    bootstrap_servers: String,
+    group: ConsumerGroup,
+    topics: PublicationTopics,
+) -> Result<RoutingSet, ConsumerError> {
+    spawn_blocking(move || {
+        let client: BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap_servers)
+            .create()?;
+        let metadata = client.fetch_metadata(None, METADATA_TIMEOUT)?;
+        let routes = topics
+            .route(&group, |topic| partition_count(&metadata, topic))
+            .map_err(KeyedStateInitError::from)?;
+        Ok(routes)
+    })
+    .await
+    .map_err(ConsumerError::StartupTask)?
 }
+
+/// The partition count that broker metadata reports for `topic`.
+///
+/// The count is the number of partition ids. A partition without a leader
+/// still counts, because the broker lists its id.
+fn partition_count(metadata: &Metadata, topic: &str) -> Result<PartitionCount, RoutingError> {
+    if topic.starts_with('^') {
+        return Err(RoutingError::Pattern(topic.to_owned()));
+    }
+    let entry = metadata
+        .topics()
+        .iter()
+        .find(|entry| entry.name() == topic)
+        .ok_or_else(|| RoutingError::Unknown(topic.to_owned()))?;
+    if entry.error().is_some() {
+        return Err(RoutingError::Invalid(topic.to_owned()));
+    }
+    contiguous_count(entry.partitions().iter().map(MetadataPartition::id), topic)
+}
+
+/// The count of `ids`, which must be exactly `0..count` for a positive count.
+fn contiguous_count(
+    ids: impl Iterator<Item = i32>,
+    topic: &str,
+) -> Result<PartitionCount, RoutingError> {
+    let invalid = || RoutingError::Invalid(topic.to_owned());
+    let mut ids: SmallVec<[i32; 64]> = ids.collect();
+    ids.sort_unstable();
+    let count = i32::try_from(ids.len()).map_err(|_| invalid())?;
+    if !ids.iter().copied().eq(0_i32..count) {
+        return Err(invalid());
+    }
+    PartitionCount::try_from(count).map_err(|_| invalid())
+}
+
+#[cfg(test)]
+mod tests;

@@ -5,7 +5,7 @@ use crate::cassandra::config::CassandraConfiguration;
 use crate::codec::Codec;
 use crate::consumer::storage::{ComponentsOf, ConsumerStorageBackend, ConsumerStorageInputs};
 use crate::consumer::{ConsumerConfiguration, KeyedStateConfiguration};
-use crate::consumer::{ConsumerError, KafkaObserver, KeyedStateInputs};
+use crate::consumer::{ConsumerError, KeyedStateInputs};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::LoaderConfiguration;
 use crate::loader::{KafkaLoader, MemoryLoader};
@@ -225,13 +225,12 @@ where
         &self,
         inputs: ConsumerStorageInputs,
         keyed_state: &KeyedStateInputs,
-        observer: KafkaObserver,
     ) -> Result<ComponentsOf<C, B>, ConsumerError>
     where
         B: ConsumerReaderBackend<C> + ConsumerStorageBackend<C>,
     {
         self.backend
-            .build_consumer_components(inputs, keyed_state, observer)
+            .build_consumer_components(inputs, keyed_state)
             .await
     }
 

@@ -1,16 +1,15 @@
-//! In-memory metric capture: a meter provider the tests own, an observer that
-//! records into it, and readback of the exported gauge series.
+//! In-memory metric capture: a meter provider the tests own, gauges that
+//! record into it, and readback of the exported gauge series.
 
-use super::super::KafkaObserver;
+use super::super::KafkaMetrics;
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
-use std::time::Duration;
 
 /// The meter scope every test provider registers its instruments under.
-const SCOPE: &str = "observer-tests";
+const SCOPE: &str = "statistics-tests";
 
 pub(super) const FETCH_MESSAGES: &str = "prosody.kafka.consumer.fetch_queue.messages";
 pub(super) const FETCH_BYTES: &str = "prosody.kafka.consumer.fetch_queue.size";
@@ -26,15 +25,10 @@ pub(super) fn test_meter() -> (SdkMeterProvider, InMemoryMetricExporter) {
     (provider, exporter)
 }
 
-/// An observer recording into `provider`'s meter, so its exported series are
-/// readable back. Tests pass a short `startup_timeout` where a failing metadata
-/// fetch is the subject.
-pub(super) fn observer_with(
-    group_id: &str,
-    startup_timeout: Duration,
-    provider: &SdkMeterProvider,
-) -> KafkaObserver {
-    KafkaObserver::with_instrumentation(group_id, startup_timeout, &provider.meter(SCOPE))
+/// Gauges recording into `provider`'s meter, so their exported series are
+/// readable back.
+pub(super) fn metrics_with(group_id: &str, provider: &SdkMeterProvider) -> KafkaMetrics {
+    KafkaMetrics::new(&provider.meter(SCOPE), group_id)
 }
 
 /// The last exported value of `name` on the data point carrying every attribute

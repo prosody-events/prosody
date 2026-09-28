@@ -234,6 +234,11 @@ pub enum KeyedStateInitError {
     #[error("published keyed state with in-memory storage requires mock mode")]
     PublishedMemoryStorage,
 
+    /// Broker metadata cannot supply a partition count for a subscribed topic,
+    /// so the consumer has no complete routing set to publish.
+    #[error("cannot build the keyed-state routing set: {0}")]
+    Routing(#[from] RoutingError),
+
     /// Keyed-state collections were registered on the low-level
     /// [`ProsodyConsumer::new`](crate::consumer::ProsodyConsumer::new)
     /// constructor, which runs no state middleware to stage or recover them.
@@ -245,6 +250,25 @@ pub enum KeyedStateInitError {
          runs no state middleware"
     )]
     StateUnsupported,
+}
+
+/// Why broker metadata cannot supply a subscribed topic's partition count.
+#[derive(Debug, Error)]
+pub enum RoutingError {
+    /// The subscribed name is a `^` pattern. A pattern has no fixed topic set,
+    /// so a consumer that publishes keyed state must subscribe to literal
+    /// topics.
+    #[error("topic {0:?} is a pattern; publication requires literal topics")]
+    Pattern(String),
+
+    /// The topic is not in the broker metadata.
+    #[error("topic {0:?} is not in the broker metadata")]
+    Unknown(String),
+
+    /// The broker reports an error for the topic, or its partition ids are
+    /// not exactly `0..count`.
+    #[error("topic {0:?} has an invalid partition layout in the broker metadata")]
+    Invalid(String),
 }
 
 /// Collapses the two hops from a keyed-state configuration failure, so

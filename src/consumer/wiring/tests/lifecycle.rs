@@ -4,14 +4,14 @@ use super::{
     Event, EventLog, RecordingBackend, RecordingDirectory, consumer_config, peer_config,
     retain_manager, start,
 };
-use crate::consumer::Managers;
 use crate::consumer::decode::IgnoreRequests;
 use crate::consumer::error::{ConsumerError, PeerInitError};
+use crate::consumer::{ConsumerConfiguration, Managers};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::peer::Router;
 use crate::peer::runtime::prepare_router;
 use color_eyre::Result;
-use color_eyre::eyre::{ensure, eyre};
+use color_eyre::eyre::{bail, ensure, eyre};
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
@@ -187,5 +187,47 @@ async fn failed_activation_rolls_back_and_releases_the_listener() -> Result<()> 
     assert_eq!(directory.inner.len(), 0);
     let rebound = TcpListener::bind(address)?;
     drop(rebound);
+    Ok(())
+}
+
+/// A construction that fails after the probe server binds releases the probe
+/// port before it returns. Dropping the server only signals graceful shutdown,
+/// so a caller that retried construction on the same port would find the
+/// listener still bound.
+///
+/// An empty subscription makes `subscribe` fail after the bind.
+#[tokio::test]
+async fn failed_startup_releases_the_probe_port() -> Result<()> {
+    let port = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))?
+        .local_addr()?
+        .port();
+    let config = ConsumerConfiguration::builder()
+        .bootstrap_servers(vec!["127.0.0.1:1".to_owned()])
+        .group_id("failed-startup-probe")
+        .subscribed_topics(Vec::<String>::new())
+        .probe_port(Some(port))
+        .build()?;
+    let managers: Arc<Managers<Value>> = Arc::default();
+    let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
+    let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+
+    match start(&config, managers, heartbeats, log, IgnoreRequests).await {
+        Ok(consumer) => {
+            consumer.shutdown().await;
+            bail!("construction succeeded with an empty subscription");
+        }
+        Err(error) => ensure!(
+            matches!(error, ConsumerError::Kafka(_)),
+            "expected the subscription to fail, got {error:#}"
+        ),
+    }
+
+    // Binding synchronously: nothing between the failed construction and this
+    // call yields, so the probe task cannot close its listener behind the
+    // assertion's back.
+    ensure!(
+        TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok(),
+        "the probe port was still bound after construction failed"
+    );
     Ok(())
 }
