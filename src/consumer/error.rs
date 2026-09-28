@@ -13,7 +13,7 @@ use crate::state::registry::RegisterStateError;
 use crate::state_reader::StateReaderError;
 use crate::timers::duration::CompactDurationError;
 use crate::timers::store::cassandra::CassandraTriggerStoreError;
-use rdkafka::error::KafkaError;
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use std::io;
 use thiserror::Error;
 use tokio::task::JoinError;
@@ -216,20 +216,6 @@ pub enum KeyedStateInitError {
         category: ErrorCategory,
     },
 
-    /// Startup reconciliation of keyed-state publication routing rows failed,
-    /// typically because the publication store was unreachable.
-    ///
-    /// This variant carries a rendered message plus the error's classification
-    /// instead of the source type. Reconciliation propagates every failure so
-    /// startup cannot continue with routing rows of unknown freshness.
-    #[error("keyed-state publication reconciliation failed: {message}")]
-    Publication {
-        /// Rendered reconciliation error, full source chain.
-        message: String,
-        /// The reconciliation error's captured classification.
-        category: ErrorCategory,
-    },
-
     /// Published state needs a real topic partition count outside mock mode.
     #[error("published keyed state with in-memory storage requires mock mode")]
     PublishedMemoryStorage,
@@ -261,12 +247,11 @@ pub enum RoutingError {
     #[error("topic {0:?} is a pattern; publication requires literal topics")]
     Pattern(String),
 
-    /// The topic is not in the broker metadata.
-    #[error("topic {0:?} is not in the broker metadata")]
-    Unknown(String),
+    /// The broker metadata omits the topic or reports an error for it.
+    #[error("topic {0:?} has a broker metadata error: {1}")]
+    Broker(String, RDKafkaErrorCode),
 
-    /// The broker reports an error for the topic, or its partition ids are
-    /// not exactly `0..count`.
+    /// The topic's partition ids are not exactly `0..count`.
     #[error("topic {0:?} has an invalid partition layout in the broker metadata")]
     Invalid(String),
 }

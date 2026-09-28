@@ -8,6 +8,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{bail, ensure};
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
+use rdkafka::error::RDKafkaErrorCode::UnknownTopicOrPartition;
 use rdkafka::mocking::MockCluster;
 use rdkafka::producer::DefaultProducerContext;
 use std::collections::BTreeSet;
@@ -113,7 +114,7 @@ fn broker_metadata_counts_every_topic() -> Result<()> {
     ensure!(
         matches!(
             partition_count(&metadata, "routes-absent"),
-            Err(RoutingError::Unknown(_))
+            Err(RoutingError::Broker(_, UnknownTopicOrPartition))
         ),
         "an absent topic must be unknown"
     );
@@ -154,7 +155,7 @@ async fn fetch_routes_requires_every_topic() -> Result<()> {
         matches!(
             failure,
             Err(ConsumerError::KeyedState(KeyedStateInitError::Routing(
-                RoutingError::Unknown(_)
+                RoutingError::Broker(_, UnknownTopicOrPartition)
             )))
         ),
         "a missing topic must fail the fetch, got {:?}",

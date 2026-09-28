@@ -115,19 +115,24 @@ impl PublicationTopics {
         })
     }
 
-    /// Gives every topic the same partition count.
-    pub(crate) fn route_uniform(&self, group: &ConsumerGroup, count: PartitionCount) -> RoutingSet {
-        let Ok(routes) = self.route(group, |_| Ok::<_, Infallible>(count));
-        routes
+    /// The empty routing set, for a consumer that publishes no collection.
+    pub(crate) fn withdrawal(&self, group: &ConsumerGroup) -> RoutingSet {
+        RoutingSet {
+            group: group.clone(),
+            rows: Arc::new([]),
+            leader: self.leader,
+        }
     }
 }
 
 /// One consumer group's complete routing set: one row for each subscribed
 /// topic, with the topic's partition count.
 ///
-/// Partition counts never change. Increasing a topic's partition count is
-/// invalid for a Prosody deployment. So the set is a constant value, built
-/// once at construction, and every row in it is final.
+/// The rows are empty only when no collection is published. The owner then
+/// fetches no counts and only withdraws the group's old rows.
+///
+/// Partition counts never change, because a Prosody deployment never increases
+/// them. So the set is built once, at construction, and every row is final.
 ///
 /// Do not take counts from librdkafka statistics. A statistics report lists
 /// only the topics that this client held, and the owner must count every

@@ -24,8 +24,10 @@ use crate::timers::duration::CompactDuration;
 use crate::{ByteSize, Codec, ConsumerGroup, EventIdentity, EventType, Topic};
 use rdkafka::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::error::RDKafkaErrorCode;
 use rdkafka::metadata::{Metadata, MetadataPartition};
 use smallvec::SmallVec;
+use std::convert::Infallible;
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,12 +125,17 @@ impl KeyedStateInputs {
         let Some((subsystem, topics)) = self.publication() else {
             return Ok(None);
         };
-        let routes = fetch_routes(
-            self.bootstrap_servers.clone(),
-            self.group.clone(),
-            topics.clone(),
-        )
-        .await?;
+        // Only published collections need counts; see `RoutingSet`.
+        let routes = if self.registry.has_published() {
+            fetch_routes(
+                self.bootstrap_servers.clone(),
+                self.group.clone(),
+                topics.clone(),
+            )
+            .await?
+        } else {
+            topics.withdrawal(&self.group)
+        };
         Ok(Some(PublicationOwner::new(
             subsystem,
             store,
@@ -148,17 +155,14 @@ impl KeyedStateInputs {
             return Err(KeyedStateInitError::PublishedMemoryStorage.into());
         }
         Ok(self.publication().map(|(subsystem, topics)| {
-            PublicationOwner::new(
-                subsystem,
-                store,
-                self.registry.clone(),
-                topics.route_uniform(&self.group, PartitionCount::MOCK),
-            )
+            let Ok(routes) =
+                topics.route(&self.group, |_| Ok::<_, Infallible>(PartitionCount::MOCK));
+            PublicationOwner::new(subsystem, store, self.registry.clone(), routes)
         }))
     }
 
-    /// The subsystem and topic set a publishing consumer writes routing rows
-    /// for, or `None` when this consumer does not publish.
+    /// The subsystem and topic set the publication owner serves, or `None`
+    /// without a subsystem or topics.
     ///
     /// The owner runs only on partition zero of the first topic in lexical
     /// order. It replaces the group's full routing set during assignment
@@ -267,13 +271,14 @@ fn partition_count(metadata: &Metadata, topic: &str) -> Result<PartitionCount, R
     if topic.starts_with('^') {
         return Err(RoutingError::Pattern(topic.to_owned()));
     }
+    let broker = |code| RoutingError::Broker(topic.to_owned(), code);
     let entry = metadata
         .topics()
         .iter()
         .find(|entry| entry.name() == topic)
-        .ok_or_else(|| RoutingError::Unknown(topic.to_owned()))?;
-    if entry.error().is_some() {
-        return Err(RoutingError::Invalid(topic.to_owned()));
+        .ok_or_else(|| broker(RDKafkaErrorCode::UnknownTopicOrPartition))?;
+    if let Some(code) = entry.error() {
+        return Err(broker(code.into()));
     }
     contiguous_count(entry.partitions().iter().map(MetadataPartition::id), topic)
 }
