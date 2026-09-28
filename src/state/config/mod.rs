@@ -22,6 +22,9 @@ const STATE_CACHE_DIR_ENV: &str = "PROSODY_STATE_CACHE_DIR";
 /// Environment variable for the owning keyed-state cache capacity.
 const STATE_OWNED_CACHE_SIZE_ENV: &str = "PROSODY_STATE_OWNED_CACHE_SIZE";
 
+/// Environment variable for the per-partition memtable size.
+const STATE_MEMTABLE_SIZE_ENV: &str = "PROSODY_STATE_MEMTABLE_SIZE";
+
 /// Environment variable for the reader-side read-through cache capacity, in
 /// bytes.
 const STATE_READ_CACHE_SIZE_ENV: &str = "PROSODY_STATE_READ_CACHE_SIZE";
@@ -96,6 +99,21 @@ pub struct KeyedStateConfiguration {
     /// number is interpreted as bytes.
     #[builder(default = "from_option_env(STATE_OWNED_CACHE_SIZE_ENV)?")]
     pub owned_cache_size: Option<ByteSize>,
+
+    /// Size at which the local keyed-state cache flushes a partition's
+    /// in-memory writes to disk.
+    ///
+    /// Each assigned partition holds up to this many bytes in memory, so
+    /// memory use scales with the number of assigned partitions. Flushes
+    /// also start when the storage engine's write-ahead log grows too large.
+    /// A smaller size uses less memory but writes and compacts more files.
+    /// `None` (the default) uses the storage engine's default of 64 MiB.
+    ///
+    /// Environment variable: `PROSODY_STATE_MEMTABLE_SIZE`. Accepts a
+    /// positive human-readable byte size such as `16 MiB`. A bare number is
+    /// interpreted as bytes.
+    #[builder(default = "from_option_env(STATE_MEMTABLE_SIZE_ENV)?")]
+    pub memtable_size: Option<ByteSize>,
 
     /// Byte budget for the reader-side read-through cache. The high-level
     /// client sizes this cache when it composes standalone readers.

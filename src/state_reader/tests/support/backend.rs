@@ -135,9 +135,7 @@ pub(in crate::state_reader::tests) trait ReaderBackend {
     fn registry(&self) -> Arc<CollectionDefRegistry>;
 
     /// A cell store to seed one event through. Cloning shares the committed
-    /// backing, memory cells or Cassandra rows, across a trace's events. On
-    /// Cassandra, cloning also shares the one assignment workspace
-    /// lifecycle the store owns.
+    /// backing, memory cells or Cassandra rows, across a trace's events.
     fn owner_cell(&self) -> Self::OwnerCell;
 
     /// Advertises `(group, topic)` as a source of `name` and freezes `identity`

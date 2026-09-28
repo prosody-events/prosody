@@ -44,6 +44,10 @@ pub(super) enum CacheOp {
 #[derive(Clone, Debug)]
 pub(super) struct CacheTrace {
     pub(super) ttl: Option<u32>,
+    /// The index of the op before which the cache attaches. Earlier ops pass
+    /// through to the lower store. An index past the last op attaches after
+    /// the trace.
+    pub(super) attach: usize,
     pub(super) ops: Vec<CacheOp>,
 }
 
@@ -55,6 +59,11 @@ impl Arbitrary for CacheTrace {
             Some(1 + u32::from(u8::arbitrary(g) % 8))
         };
         let len = usize::arbitrary(g) % 20;
+        let attach = if bool::arbitrary(g) {
+            0
+        } else {
+            usize::arbitrary(g) % (len + 1)
+        };
         let mut staged = false;
         let mut ops = Vec::with_capacity(len);
         for _ in 0..len {
@@ -62,8 +71,9 @@ impl Arbitrary for CacheTrace {
             // While a stage stands, only reads, clock movement, faults, and
             // the stage's own settle are legal — per-key serialization means
             // no handler write can interleave a stage and its settle, and the
-            // settlement cache update argument (the staged rows still hold the verdict's
-            // data when commit_provisional runs) rests on exactly that.
+            // settlement cache update argument (the staged rows still hold the
+            // verdict's data when commit_provisional runs) rests on
+            // exactly that.
             let op = match roll {
                 0..=3 if !staged => {
                     let n = 1 + usize::arbitrary(g) % 3;
@@ -115,25 +125,28 @@ impl Arbitrary for CacheTrace {
             };
             ops.push(op);
         }
-        Self { ttl, ops }
+        Self { ttl, attach, ops }
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        let ttl = self.ttl;
-        let ops = self.ops.clone();
+        let Self { ttl, attach, ops } = self.clone();
         // A prefix of a clean-lifecycle trace is itself clean, so truncation
-        // is a safe shrink; also try dropping the TTL entirely.
+        // is a safe shrink; also try dropping the TTL and attaching first.
+        let simpler = [
+            ttl.map(|_| Self {
+                ttl: None,
+                ..self.clone()
+            }),
+            (attach != 0).then(|| Self {
+                attach: 0,
+                ..self.clone()
+            }),
+        ];
         let prefixes = (0..ops.len()).map(move |n| Self {
             ttl,
+            attach,
             ops: ops[..n].to_vec(),
         });
-        let drop_ttl = self
-            .ttl
-            .map(|_| Self {
-                ttl: None,
-                ops: self.ops.clone(),
-            })
-            .into_iter();
-        Box::new(drop_ttl.chain(prefixes))
+        Box::new(simpler.into_iter().flatten().chain(prefixes))
     }
 }

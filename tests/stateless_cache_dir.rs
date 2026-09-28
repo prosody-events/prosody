@@ -1,7 +1,7 @@
 //! A stateless consumer (`ProsodyConsumer::new`, no middleware, no keyed-state
 //! registrations) over a Cassandra trigger store must not spin up the
 //! keyed-state machinery: the `settle` boundary never runs and the registry is
-//! provably empty, so the per-consumer Kafka loader and the fjall workspace
+//! provably empty, so the per-consumer Kafka loader and the fjall database
 //! would be pure overhead. This pins the observable proxy — the fjall cache
 //! directory is never created.
 

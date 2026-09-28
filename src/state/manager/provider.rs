@@ -82,7 +82,7 @@ where
     P: AssignmentPublisher,
     T: Send,
 {
-    type AcquireError = StateAcquireError<F::Error, IdentityErr<F::Backend>, P::Error>;
+    type AcquireError = StateAcquireError<IdentityErr<F::Backend>, P::Error>;
     type Manager = StateManager<F::Backend, L>;
 
     async fn acquire(
@@ -92,18 +92,16 @@ where
         triggers: T,
     ) -> Result<Self::Manager, Self::AcquireError> {
         let segment_id = partition_segment_id(topic, partition, &self.consumer_group);
-        let backend = self
-            .backend
-            .for_partition(topic, partition, triggers)
-            .map_err(StateAcquireError::Factory)?;
+        let backend = self.backend.for_partition(topic, partition, triggers);
         let dedup = backend.dedup();
         // Invariant: no state op executes under an unvalidated identity —
         // the manager does not exist until the registered descriptors match
         // the group's frozen identity rows. The identity table is group-global,
-        // so validation is a once-per-process latch (`get_or_try_init` coalesces
-        // concurrent first-acquires and re-runs on a transient `Err`); any
-        // partition's identity handle is equivalent. Identity lives on the
-        // shared control-plane store, decoupled from any kind's data store.
+        // so validation is a once-per-process latch (`get_or_try_init`
+        // coalesces concurrent first-acquires and re-runs on a
+        // transient `Err`); any partition's identity handle is
+        // equivalent. Identity lives on the shared control-plane store,
+        // decoupled from any kind's data store.
         let identity = backend.identity();
         self.validated
             .get_or_try_init(|| {
@@ -133,19 +131,14 @@ where
 /// Error raised when a [`StateManagerProvider`] cannot acquire a
 /// partition's manager.
 #[derive(Debug, Error)]
-pub enum StateAcquireError<FactoryErr, StoreErr, PublicationErr>
+pub enum StateAcquireError<StoreErr, PublicationErr>
 where
-    FactoryErr: ClassifyError + Error + Send + Sync + 'static,
     StoreErr: ClassifyError + Error + Send + Sync + 'static,
     PublicationErr: ClassifyError + Error + Send + Sync + 'static,
 {
     /// Routing-set publication failed on its owning assignment.
     #[error("keyed-state publication failed at partition acquisition")]
     Publication(#[source] PublicationErr),
-
-    /// The backend factory failed to mint the partition's backend.
-    #[error("keyed-state backend factory failed at partition acquisition")]
-    Factory(#[source] FactoryErr),
 
     /// Durable descriptor-identity validation failed. A mismatch is
     /// Permanent and recurs until the deployed descriptors match the
@@ -155,17 +148,14 @@ where
     Identity(#[source] DescriptorIdentityError<StoreErr>),
 }
 
-impl<FactoryErr, StoreErr, PublicationErr> ClassifyError
-    for StateAcquireError<FactoryErr, StoreErr, PublicationErr>
+impl<StoreErr, PublicationErr> ClassifyError for StateAcquireError<StoreErr, PublicationErr>
 where
-    FactoryErr: ClassifyError + Error + Send + Sync + 'static,
     StoreErr: ClassifyError + Error + Send + Sync + 'static,
     PublicationErr: ClassifyError + Error + Send + Sync + 'static,
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {
             Self::Publication(e) => e.classify_error(),
-            Self::Factory(e) => e.classify_error(),
             Self::Identity(e) => e.classify_error(),
         }
     }

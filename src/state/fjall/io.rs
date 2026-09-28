@@ -117,6 +117,13 @@ pub(super) fn encode_frame(entry: &CacheEntry<Bytes>, expiry: u64) -> Bytes {
     codec::encode_frame(borrowed, expiry)
 }
 
+/// Runs `op` on a blocking thread.
+pub(super) async fn blocking<T: Send + 'static>(
+    op: impl FnOnce() -> fjall::Result<T> + Send + 'static,
+) -> Result<T, FjallCellCacheError> {
+    Ok(spawn_blocking(op).await??)
+}
+
 /// Reads the raw cell at `key`, or `None` when the key is absent — one
 /// blocking hop. Generic over the key so a variable-length `SmallVec` cell key
 /// and a fixed-size `[u8; N]` index key both read without a bridging copy.
@@ -125,7 +132,7 @@ pub(super) async fn read_cell(
     key: impl AsRef<[u8]> + Send + 'static,
 ) -> Result<Option<Slice>, FjallCellCacheError> {
     let cache = cache.clone();
-    Ok(spawn_blocking(move || cache.get(key)).await??)
+    blocking(move || cache.get(key)).await
 }
 
 /// Writes `cell` at `key`, overwriting any existing cell — one blocking hop.
@@ -137,8 +144,7 @@ pub(super) async fn write_cell(
     cell: Bytes,
 ) -> Result<(), FjallCellCacheError> {
     let cache = cache.clone();
-    spawn_blocking(move || cache.insert(key.as_ref(), cell.as_ref())).await??;
-    Ok(())
+    blocking(move || cache.insert(key.as_ref(), cell.as_ref())).await
 }
 
 /// Whether an absolute `expiry` (millis; `0` = never) has passed at `now`.

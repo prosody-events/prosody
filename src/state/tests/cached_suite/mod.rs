@@ -21,7 +21,7 @@ use super::super::cached::{Cached, DELETE_RETRY_BUDGET};
 use super::super::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use super::super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::super::fjall::test_db;
-use super::super::fjall::{Clock, FjallCellCache};
+use super::super::fjall::{CacheSlot, Clock, FjallCellCache};
 use super::super::marker::{EventMarker, SectionClear};
 use super::super::memory::{MemoryCellStore, MemoryCells};
 use super::super::store::{CellBuffer, CellStore, CoordinateBatch};
@@ -63,7 +63,7 @@ use batch::counting_cached;
 use promote::stage_committed_marker;
 
 /// Builds a production-shaped `Cached` over the shared fjall database (the
-/// `name` warm-reuse keyspace pair) and the shared memory cells.
+/// `name` warm-reuse keyspace) and the shared memory cells.
 fn cached_over(cells: &MemoryCells, name: &str) -> Result<Cached<MemoryCellStore>> {
     let lower = MemoryCellStore::new(cells.clone());
     Ok(Cached::new(test_db::cache(name)?, lower))
@@ -269,8 +269,8 @@ where
 /// Crash-recovery equivalence over the **real** `Cached<MemoryCellStore>` at
 /// the full alphabet of markers with clears: each resolution arm drives
 /// `commit_provisional`/`abort_provisional` (the publish-on-settle path), and
-/// a "crash" rebuilds the cache cold over the same warm memory cells (a fresh
-/// fjall workspace — the assignment-scoped lifecycle). The committed
+/// a "crash" rebuilds the cache cold over the same warm memory cells, as a new
+/// assignment's keyspace does. The committed
 /// projection must converge to the model on every path — write-through
 /// publish, cold restart, AND the delete legs: every committed durable clear
 /// applied beneath the cache must delete its sections' entries before the gap
@@ -284,7 +284,7 @@ fn prop_memory_cached_crash_equivalence() {
         // Each `make` yields a cold cache over the same warm memory cells +
         // dedup store, so a crash drops the cache but not durable state; the
         // runner's lower fault seam sits between the cache and the bottom
-        // store. `test_db::cold_cache` reuses the `crash` keyspace pair on
+        // store. `test_db::cold_cache` reuses the `crash` keyspace on
         // the shared database and CLEARS it (a cheap journal marker, no
         // fsync) — modeling a fresh assignment without a keyspace creation
         // per make. Distinct v4 segments per iteration keep the shared
