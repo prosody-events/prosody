@@ -188,6 +188,34 @@ pub enum Admission {
     Abandoned,
 }
 
+/// Resolves when a provider's background work has stopped.
+///
+/// Consumer shutdown waits on it after the partitions stop. The keyed-state
+/// cache then holds no lock on its directory, so a new consumer can open it.
+#[derive(Clone)]
+pub struct Stopped(watch::Receiver<()>);
+
+impl Stopped {
+    /// Returns the sender that the background work holds, and the signal. The
+    /// signal resolves when the sender drops.
+    pub(crate) fn channel() -> (watch::Sender<()>, Self) {
+        let (running, stopped) = watch::channel(());
+        (running, Self(stopped))
+    }
+
+    /// Returns the signal of a provider with no background work. It resolves
+    /// at once.
+    pub(crate) fn now() -> Self {
+        Self::channel().1
+    }
+
+    /// Waits until the background work has stopped.
+    pub(crate) async fn wait(mut self) {
+        // The sender never sends, so `changed` returns only when it drops.
+        let _ = self.0.changed().await;
+    }
+}
+
 /// Process-wide factory for per-partition [`PartitionStateManager`]s,
 /// the keyed-state analog of
 /// [`TriggerStoreProvider`](crate::timers::store::TriggerStoreProvider).
@@ -220,6 +248,10 @@ pub trait PartitionStateProvider<T>: Clone + Send + Sync + 'static {
         partition: Partition,
         triggers: T,
     ) -> impl Future<Output = Result<Self::Manager, Self::AcquireError>> + Send + use<'_, Self, T>;
+
+    /// Returns the signal that resolves when the provider's background work
+    /// has stopped. The work stops after the last provider clone drops.
+    fn stopped(&self) -> Stopped;
 }
 
 struct StateManagerInner<B, L>

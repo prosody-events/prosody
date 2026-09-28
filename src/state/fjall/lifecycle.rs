@@ -6,25 +6,21 @@
 //! for them. Creates run before deletes: a create lets an assignment start
 //! caching, and a delete only reclaims disk.
 //!
-//! The task holds only weak senders. It stops when the client and every
-//! assignment cache are gone, and the database then releases its directory.
+//! The task stops when the client drops, and then [`Stopped`] resolves.
+//! Consumer shutdown waits for it after the assignment caches are gone, so the
+//! directory lock is free and a new client can open the same directory.
+//! Deletes still in the queue stay on disk until that startup.
 
 use super::{FjallCellCache, io};
+use crate::state::manager::Stopped;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::Duration;
 use tokio::select;
-use tokio::sync::mpsc::{
-    UnboundedReceiver, UnboundedSender, WeakUnboundedSender, unbounded_channel,
-};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 #[cfg(test)]
 use tokio::sync::oneshot;
-use tokio::time::sleep;
 use tracing::warn;
 use uuid::Uuid;
-
-/// Delay before a failed keyspace creation runs again.
-const CREATE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// A request to create the keyspace for one slot. It holds the slot weakly, so
 /// an assignment that ends first cancels its create.
@@ -98,41 +94,53 @@ impl Drop for Retire {
     }
 }
 
-/// Starts the lifecycle task for `database` and returns its create and delete
-/// queues. The task creates each keyspace with `options`. The caller runs
-/// inside a Tokio runtime.
+/// Starts the lifecycle task for `database`, queues the deletion of `stale`,
+/// and returns the create queue, the delete queue, and the task's stop signal.
+/// The task creates each keyspace with `options`. The caller runs inside a
+/// Tokio runtime.
+///
+/// The task stops when the returned create sender drops. The signal resolves
+/// after the task has dropped every fjall handle it held.
 pub(super) fn spawn(
     database: Database,
     options: KeyspaceCreateOptions,
-) -> (UnboundedSender<Pending>, UnboundedSender<Retirement>) {
+    stale: Vec<Keyspace>,
+) -> (
+    UnboundedSender<Pending>,
+    UnboundedSender<Retirement>,
+    Stopped,
+) {
     let (creates, create_rx) = unbounded_channel();
     let (retires, retire_rx) = unbounded_channel();
-    tokio::spawn(run(
-        database,
-        options,
-        create_rx,
-        retire_rx,
-        creates.downgrade(),
-        retires.downgrade(),
-    ));
-    (creates, retires)
+    for keyspace in stale {
+        drop(retires.send(Retirement::Keyspace(keyspace)));
+    }
+    let (running, stopped) = Stopped::channel();
+    let task = run(database, options, create_rx, retire_rx, retires.clone());
+    tokio::spawn(async move {
+        task.await;
+        drop(running);
+    });
+    (creates, retires, stopped)
 }
 
-/// Runs queued creates and deletes, one at a time and creates first.
+/// Runs queued creates and deletes, one at a time and creates first. Returns
+/// when the create queue closes. The task holds a delete sender, so the delete
+/// queue never closes first.
 async fn run(
     database: Database,
     options: KeyspaceCreateOptions,
     mut creates: UnboundedReceiver<Pending>,
     mut retires: UnboundedReceiver<Retirement>,
-    create_queue: WeakUnboundedSender<Pending>,
-    retire_queue: WeakUnboundedSender<Retirement>,
+    retire_queue: UnboundedSender<Retirement>,
 ) {
     loop {
         select! {
             biased;
-            Some(slot) = creates.recv() => {
-                create(&database, &options, slot, &create_queue, &retire_queue).await;
-            }
+            slot = creates.recv() => match slot {
+                Some(slot) => create(&database, &options, slot, &retire_queue).await,
+                None => return,
+            },
             Some(work) = retires.recv() => match work {
                 Retirement::Keyspace(keyspace) => delete(&database, keyspace).await,
                 #[cfg(test)]
@@ -140,31 +148,25 @@ async fn run(
                     let _ = done.send(());
                 }
                 #[cfg(test)]
-                barrier @ Retirement::Barrier(_) => {
-                    if let Some(queue) = retire_queue.upgrade() {
-                        drop(queue.send(barrier));
-                    }
-                }
+                barrier @ Retirement::Barrier(_) => drop(retire_queue.send(barrier)),
             },
-            else => return,
         }
     }
 }
 
 /// Creates the keyspace for `slot` and fills the slot. A slot whose assignment
-/// ended drops the new cache, which queues the keyspace's deletion. A failure
-/// queues the same request again after [`CREATE_RETRY_DELAY`], so deletes keep
-/// running meanwhile.
+/// ended drops the new cache, which queues the keyspace's deletion. After a
+/// failure the slot stays empty, so the assignment uses durable storage, as it
+/// does after the cache is disabled.
 async fn create(
     database: &Database,
     options: &KeyspaceCreateOptions,
     slot: Pending,
-    create_queue: &WeakUnboundedSender<Pending>,
-    retire_queue: &WeakUnboundedSender<Retirement>,
+    retire_queue: &UnboundedSender<Retirement>,
 ) {
-    let Some(queue) = retire_queue.upgrade().filter(|_| slot.strong_count() > 0) else {
+    if slot.strong_count() == 0 {
         return;
-    };
+    }
     let opened = database.clone();
     let options = options.clone();
     let created = io::blocking(move || {
@@ -178,7 +180,7 @@ async fn create(
         Ok(keyspace) => {
             let retire = Retire {
                 keyspace: Some(keyspace.clone()),
-                queue,
+                queue: retire_queue.clone(),
             };
             let cache = FjallCellCache::for_keyspace(database.clone(), keyspace, retire);
             if let Some(slot) = slot.upgrade() {
@@ -186,14 +188,7 @@ async fn create(
             }
         }
         Err(error) => {
-            warn!(%error, "keyed-state cache keyspace creation failed; retrying");
-            let create_queue = create_queue.clone();
-            tokio::spawn(async move {
-                sleep(CREATE_RETRY_DELAY).await;
-                if let Some(queue) = create_queue.upgrade() {
-                    drop(queue.send(slot));
-                }
-            });
+            warn!(%error, "keyed-state cache keyspace creation failed; the assignment uses durable storage");
         }
     }
 }

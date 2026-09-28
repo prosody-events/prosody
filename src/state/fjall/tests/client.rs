@@ -3,11 +3,15 @@
 use super::*;
 use crate::ByteSize;
 use crate::state::config::KeyedStateConfiguration;
+use futures::FutureExt;
 use quickcheck::{Arbitrary, Gen};
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 use tempfile::TempDir;
+use tokio::runtime::Builder;
 use tokio::sync::OnceCell;
+use tokio::time::timeout;
 
 /// Most operations in one lifecycle trace. Each assignment creates a keyspace,
 /// which costs one directory `fsync`.
@@ -114,33 +118,6 @@ fn prop_keyspaces_track_live_slots() {
     QuickCheck::new().quickcheck(prop as fn(Trace) -> TestResult);
 }
 
-/// `open` deletes every keyspace a prior process left in `cache_dir`,
-/// whatever its name. The keyspaces are seeded through a raw [`Database`],
-/// modeling a crashed prior process.
-#[test]
-fn open_deletes_every_existing_keyspace() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    {
-        let database = Database::builder(dir.path()).open()?;
-        for name in ["deadbeef", "unrelated"] {
-            database
-                .keyspace(name, KeyspaceCreateOptions::default)?
-                .insert(b"stale", b"row")?;
-        }
-    }
-
-    TEST_RUNTIME.block_on(async {
-        let client = FjallClient::open(&config(dir.path(), None)?).await?;
-        client.settled().await?;
-        let names = keyspace_names(client.database());
-        assert!(
-            names.is_empty(),
-            "open must delete every existing keyspace, found {names:?}"
-        );
-        Ok(())
-    })
-}
-
 /// Two clients on one `cache_dir` fail fast with [`CacheDirInUse`]: fjall's
 /// exclusive directory lock is what makes the startup deletion safe, so
 /// contention must surface as a clear, permanent configuration error.
@@ -157,6 +134,51 @@ fn open_fails_clearly_when_cache_dir_is_in_use() -> Result<()> {
             matches!(second, Err(FjallClientError::CacheDirInUse { .. })),
             "a second client on a live cache_dir must fail with CacheDirInUse"
         );
+        Ok(())
+    })
+}
+
+/// The next startup deletes every keyspace left in `cache_dir`, whatever its
+/// name. The stop signal stays pending while a client lives. It resolves when
+/// the lifecycle task holds no fjall handle, so a restart opens the same
+/// `cache_dir` at once. A raw [`Database`] seeds what a crashed process left.
+#[test]
+fn restart_deletes_every_leftover_keyspace() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let database = Database::builder(dir.path()).open()?;
+        for name in ["deadbeef", "unrelated"] {
+            database
+                .keyspace(name, KeyspaceCreateOptions::default)?
+                .insert(b"stale", b"row")?;
+        }
+    }
+    let config = config(dir.path(), None)?;
+    // One thread, so the lifecycle task runs only when the test awaits.
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    runtime.block_on(async {
+        let client = FjallClient::open(&config).await?;
+        let slot = client.slot();
+        client.settled().await?;
+        let live = slot
+            .attached()
+            .map(|cache| cache.keyspace().name().to_string());
+        assert!(
+            keyspace_names(client.database()).into_iter().eq(live),
+            "open must delete every leftover keyspace"
+        );
+        let stopped = client.stopped();
+        assert!(
+            stopped.clone().wait().now_or_never().is_none(),
+            "the stop signal must stay pending while the client lives"
+        );
+        drop((slot, client));
+
+        timeout(Duration::from_secs(30), stopped.wait()).await?;
+        let reopened = FjallClient::open(&config).await?;
+        reopened.settled().await?;
+        let names = keyspace_names(reopened.database());
+        assert!(names.is_empty(), "restart must delete {names:?}");
         Ok(())
     })
 }

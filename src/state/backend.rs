@@ -6,6 +6,7 @@ use crate::Key;
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::error::ClassifyError;
 use crate::state::descriptor_identity::DescriptorIdentityStore;
+use crate::state::manager::Stopped;
 use crate::{Partition, Topic};
 use std::convert::Infallible;
 use std::error::Error;
@@ -103,6 +104,10 @@ pub trait StateBackendFactory<T>: Clone + Send + Sync + 'static {
 
     /// Creates the backend for the partition without waiting for any I/O.
     fn for_partition(&self, topic: Topic, partition: Partition, triggers: T) -> Self::Backend;
+
+    /// Returns the signal that resolves when the factory's background work has
+    /// stopped.
+    fn stopped(&self) -> Stopped;
 }
 
 /// Clones shared test stores for each partition.
@@ -144,6 +149,10 @@ where
             self.cell.clone(),
             (),
         )
+    }
+
+    fn stopped(&self) -> Stopped {
+        Stopped::now()
     }
 }
 

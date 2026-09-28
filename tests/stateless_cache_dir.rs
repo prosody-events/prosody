@@ -26,7 +26,7 @@ async fn stateless_cassandra_consumer_does_not_create_the_fjall_cache_dir() -> R
     // A cache-dir path under a fresh tempdir root — the subdir does not exist
     // yet, so its presence afterwards is exactly "did the consumer create it?".
     let tmp = tempfile::tempdir()?;
-    let cache_dir = tmp.path().join("fjall-workspace");
+    let cache_dir = tmp.path().join("fjall-cache");
     assert!(!cache_dir.exists(), "precondition: cache dir absent");
 
     let consumer_config = ConsumerConfiguration::builder()

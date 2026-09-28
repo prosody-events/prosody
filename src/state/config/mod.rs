@@ -73,7 +73,7 @@ const DEFAULT_READER_CACHE_SIZE: ByteSize = match NonZeroU64::new(1_048_576) {
 /// returns the parse error. Do not add a `Default` impl.
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct KeyedStateConfiguration {
-    /// Disk workspace for the local keyed-state cache.
+    /// Directory of the local keyed-state cache.
     ///
     /// Production deployments mount this (e.g. a Kubernetes `emptyDir`) and
     /// **must** set it — the cache is wiped on process restart, so the mount
@@ -260,7 +260,7 @@ fn validate_publication(
     Ok(())
 }
 
-/// Per-client fallback keyed-state cache workspace, used when
+/// Per-client fallback keyed-state cache directory, used when
 /// [`STATE_CACHE_DIR_ENV`] is unset: `<temp>/prosody/keyed-state/<uuid>`. Wiped
 /// on restart, so it needs no persistence. The UUID leaf gives every client its
 /// own database. The directory is locked exclusively per live client, so two

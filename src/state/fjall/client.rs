@@ -4,7 +4,8 @@
 //! `cache_dir`. Each partition assignment gets a [`CacheSlot`] from
 //! [`FjallClient::slot`]. The lifecycle task creates the assignment's
 //! keyspace in the background and fills the slot. When the assignment ends,
-//! the last cache handle queues the keyspace for deletion.
+//! the last cache handle queues the keyspace for deletion. The task stops when
+//! the last client clone drops.
 //!
 //! Each keyspace takes a fresh v4 UUID name, so a new keyspace starts empty and
 //! no assignment can open another's data. The keyspace holds the
@@ -16,10 +17,13 @@
 //! deletion. A failed delete costs only disk until a later startup.
 
 use super::CacheSlot;
-use super::lifecycle::{self, Pending, Retirement};
+#[cfg(test)]
+use super::lifecycle::Retirement;
+use super::lifecycle::{self, Pending};
 use crate::ByteSize;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::config::KeyedStateConfiguration;
+use crate::state::manager::Stopped;
 use fjall::config::CompressionPolicy;
 use fjall::{CompressionType, Database, KeyspaceCreateOptions};
 use std::path::PathBuf;
@@ -29,14 +33,15 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot::{self, error::RecvError};
 use tokio::task::{JoinError, spawn_blocking};
 
-/// Process-wide Fjall instance and the queues of its lifecycle task.
+/// Process-wide Fjall instance and the create queue of its lifecycle task.
 ///
-/// One `FjallClient` per consumer process. Clones share the task.
+/// One `FjallClient` per consumer process. Clones share the task, and the task
+/// stops when the last clone drops.
 #[derive(Clone)]
 pub(crate) struct FjallClient {
     creates: UnboundedSender<Pending>,
-    /// Keeps the delete queue open while the client lives. The lifecycle task
-    /// gives each new keyspace a sender from it.
+    stopped: Stopped,
+    #[cfg(test)]
     retires: UnboundedSender<Retirement>,
     #[cfg(test)]
     database: Database,
@@ -76,17 +81,17 @@ impl FjallClient {
         })
         .await??;
 
-        let (creates, retires) = lifecycle::spawn(database.clone(), options);
-        let client = Self {
+        let (creates, retires, stopped) = lifecycle::spawn(database.clone(), options, stale);
+        #[cfg(not(test))]
+        drop(retires);
+        Ok(Self {
             creates,
+            stopped,
+            #[cfg(test)]
             retires,
             #[cfg(test)]
             database,
-        };
-        for keyspace in stale {
-            drop(client.retires.send(Retirement::Keyspace(keyspace)));
-        }
-        Ok(client)
+        })
     }
 
     /// Returns an empty slot for a new assignment and queues the creation of
@@ -97,6 +102,12 @@ impl FjallClient {
         let slot = CacheSlot::default();
         drop(self.creates.send(slot.pending()));
         slot
+    }
+
+    /// Returns the signal that resolves when the lifecycle task has stopped.
+    #[must_use]
+    pub(crate) fn stopped(&self) -> Stopped {
+        self.stopped.clone()
     }
 
     /// Returns the shared database.
@@ -120,11 +131,9 @@ impl FjallClient {
 
 /// Creation options shared by every keyed-state fjall keyspace.
 ///
-/// Cells are stored raw; fjall compresses data blocks at flush/compaction.
-/// fjall 3.x configures compression with a per-level [`CompressionPolicy`]
-/// rather than a single type; pinning every level to LZ4 preserves the prior
-/// behavior, documents the intent, and guards against a future change to
-/// fjall's default policy.
+/// Cells are stored raw. fjall compresses data blocks at flush and
+/// compaction, with LZ4 at every level. The explicit [`CompressionPolicy`]
+/// keeps LZ4 if fjall changes its default.
 ///
 /// `memtable_size` is the size at which fjall flushes the keyspace's memtable.
 /// `None` keeps fjall's default.

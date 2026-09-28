@@ -115,6 +115,7 @@ where
         }
     };
 
+    let cache = providers.state.stopped();
     let started = start_client::<T, P, SP, C>(
         consumer_config,
         handler_provider,
@@ -143,6 +144,7 @@ where
         Err(error) => {
             observer.clear();
             drain_managers(&managers).await;
+            cache.wait().await;
             return Err(release_probe(probe_server, error).await);
         }
     };
@@ -173,6 +175,7 @@ where
         poll_handle,
         probe_server,
         observer,
+        cache,
     })));
 
     Ok(ProsodyConsumer {
