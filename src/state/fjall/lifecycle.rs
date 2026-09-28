@@ -6,10 +6,10 @@
 //! for them. Creates run before deletes: a create lets an assignment start
 //! caching, and a delete only reclaims disk.
 //!
-//! The task stops when the client drops, and then [`Stopped`] resolves.
-//! Consumer shutdown waits for it after the assignment caches are gone, so the
-//! directory lock is free and a new client can open the same directory.
-//! Deletes still in the queue stay on disk until that startup.
+//! The task stops when the last client clone drops, and then [`Stopped`]
+//! resolves. Consumer shutdown waits for it after the assignment caches are
+//! gone, so the directory lock is free and a new client can open the same
+//! directory. Deletes still in the queue stay on disk until that startup.
 
 use super::{FjallCellCache, io};
 use crate::state::manager::Stopped;

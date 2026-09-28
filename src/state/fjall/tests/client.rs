@@ -175,6 +175,9 @@ fn restart_deletes_every_leftover_keyspace() -> Result<()> {
         drop((slot, client));
 
         timeout(Duration::from_secs(30), stopped.wait()).await?;
+        // Nothing awaits between the signal and this open. So a fjall handle
+        // that outlives the signal keeps the directory locked.
+        drop(Database::builder(dir.path()).open()?);
         let reopened = FjallClient::open(&config).await?;
         reopened.settled().await?;
         let names = keyspace_names(reopened.database());

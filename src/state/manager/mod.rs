@@ -192,6 +192,8 @@ pub enum Admission {
 ///
 /// Consumer shutdown waits on it after the partitions stop. The keyed-state
 /// cache then holds no lock on its directory, so a new consumer can open it.
+/// The work stops only after the last provider clone drops. A wait that holds
+/// a clone never resolves.
 #[derive(Clone)]
 pub struct Stopped(watch::Receiver<()>);
 
@@ -250,7 +252,7 @@ pub trait PartitionStateProvider<T>: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Self::Manager, Self::AcquireError>> + Send + use<'_, Self, T>;
 
     /// Returns the signal that resolves when the provider's background work
-    /// has stopped. The work stops after the last provider clone drops.
+    /// has stopped.
     fn stopped(&self) -> Stopped;
 }
 
