@@ -15,30 +15,26 @@
 //! collection evidence are the recovery source.
 
 use super::CacheSlot;
-use super::lifecycle::{self, Pending, Retirement};
+use super::lifecycle::{self, Pending};
 use crate::ByteSize;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::config::KeyedStateConfiguration;
 use fjall::config::CompressionPolicy;
-use fjall::{CompressionType, Database, KeyspaceCreateOptions};
+use fjall::{CompressionType, Database, DatabaseBuilder, Keyspace, KeyspaceCreateOptions};
 use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
-#[cfg(test)]
-use tokio::sync::oneshot::{self, error::RecvError};
 use tokio::task::{JoinError, spawn_blocking};
 use uuid::Uuid;
 
-/// A fjall database and the queues of its lifecycle task.
+/// The queues of the lifecycle task that owns a fjall database.
 ///
-/// Clones share the database and the task.
+/// Clones share the task.
 #[derive(Clone)]
 pub(crate) struct FjallClient {
     creates: UnboundedSender<Pending>,
     /// Keeps the delete queue open while the client lives. The lifecycle task
     /// gives each new keyspace a sender from it.
-    _retires: UnboundedSender<Retirement>,
-    #[cfg(test)]
-    database: Database,
+    _retires: UnboundedSender<Keyspace>,
 }
 
 impl FjallClient {
@@ -52,20 +48,12 @@ impl FjallClient {
     ///
     /// Returns [`FjallClientError`] when the database cannot be opened.
     pub async fn open(config: &KeyedStateConfiguration) -> Result<Self, FjallClientError> {
-        let path = config.cache_dir.join(Uuid::new_v4().simple().to_string());
-        let mut builder = Database::builder(path).temporary(true);
-        if let Some(bytes) = config.owned_cache_size {
-            builder = builder.cache_size(bytes.get());
-        }
+        let builder = database_builder(config);
         let database = spawn_blocking(move || builder.open()).await??;
-
-        let (creates, retires) =
-            lifecycle::spawn(database.clone(), keyspace_options(config.memtable_size));
+        let (creates, retires) = lifecycle::spawn(database, keyspace_options(config.memtable_size));
         Ok(Self {
             creates,
             _retires: retires,
-            #[cfg(test)]
-            database,
         })
     }
 
@@ -78,26 +66,16 @@ impl FjallClient {
         drop(self.creates.send(slot.pending()));
         slot
     }
+}
 
-    /// Returns the shared database.
-    #[cfg(test)]
-    pub(crate) fn database(&self) -> &Database {
-        &self.database
-    }
-
-    /// Waits until the lifecycle task has no queued work.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RecvError`] when the lifecycle task has stopped.
-    #[cfg(test)]
-    pub(crate) async fn settled(&self) -> Result<(), RecvError> {
-        let Self {
-            _retires: retires, ..
-        } = self;
-        let (done, settled) = oneshot::channel();
-        drop(retires.send(Retirement::Barrier(done)));
-        settled.await
+/// Configures a temporary database in a fresh directory under `cache_dir`,
+/// with the configured block-cache capacity.
+pub(super) fn database_builder(config: &KeyedStateConfiguration) -> DatabaseBuilder<Database> {
+    let path = config.cache_dir.join(Uuid::new_v4().simple().to_string());
+    let builder = Database::builder(path).temporary(true);
+    match config.owned_cache_size {
+        Some(bytes) => builder.cache_size(bytes.get()),
+        None => builder,
     }
 }
 

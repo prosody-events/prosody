@@ -3,6 +3,9 @@
 use super::*;
 use crate::ByteSize;
 use crate::state::config::KeyedStateConfiguration;
+use crate::state::fjall::client::{database_builder, keyspace_options};
+use crate::state::fjall::lifecycle::{create, delete};
+use fjall::Keyspace;
 use quickcheck::{Arbitrary, Gen};
 use std::collections::HashMap;
 use std::fs;
@@ -10,14 +13,15 @@ use std::path::Path;
 use tempfile::TempDir;
 use tokio::runtime::Builder;
 use tokio::sync::OnceCell;
+use tokio::sync::mpsc::unbounded_channel;
 
 /// Most operations in one lifecycle trace. Each assignment creates a keyspace,
 /// which costs one directory `fsync`.
 const MAX_TRACE_OPS: usize = 8;
 
-/// One client shared by every lifecycle iteration. Each iteration ends with no
-/// live slot and an empty database, so iterations do not interact.
-static CLIENT: OnceCell<(FjallClient, TempDir)> = OnceCell::const_new();
+/// One database shared by every lifecycle iteration. Each iteration ends with
+/// no live slot and an empty database, so iterations do not interact.
+static DATABASE: OnceCell<(Database, TempDir)> = OnceCell::const_new();
 
 /// One step of a lifecycle trace.
 #[derive(Clone, Debug)]
@@ -26,7 +30,8 @@ enum Op {
     Assign,
     /// Revokes the live slot at this index, modulo the live count.
     Revoke(usize),
-    /// Waits for the lifecycle task, then checks the model.
+    /// Runs every queued create, then every queued delete, and checks the
+    /// model.
     Settle,
 }
 
@@ -55,33 +60,46 @@ impl Arbitrary for Trace {
     }
 }
 
-/// Lifecycle model: after the lifecycle task settles, every live slot holds a
-/// keyspace, the database holds exactly those keyspaces, and no keyspace name
-/// serves two assignments. Revokes often land before the create runs, so the
-/// trace covers creates for assignments that already ended.
+/// Lifecycle model: after the queued creates and deletes run, every live slot
+/// holds a keyspace, the database holds exactly those keyspaces, and no
+/// keyspace name serves two assignments. Revokes often land before the create
+/// runs, so the trace covers creates for assignments that already ended. The
+/// lifecycle task runs creates first, and this model does the same.
 #[test]
 fn prop_keyspaces_track_live_slots() {
     async fn check(trace: Trace) -> Result<bool> {
-        let (client, _) = CLIENT
+        let (database, _) = DATABASE
             .get_or_try_init(|| async {
                 let dir = tempfile::tempdir()?;
-                let client = FjallClient::open(&config(dir.path(), None)?).await?;
-                Ok::<_, Report>((client, dir))
+                let database = database_builder(&config(dir.path(), None)?).open()?;
+                Ok::<_, Report>((database, dir))
             })
             .await?;
+        let options = keyspace_options(None);
+        let (queue, mut retired) = unbounded_channel::<Keyspace>();
+        let mut creates = Vec::new();
         let mut live: Vec<(usize, CacheSlot)> = Vec::new();
         let mut owners: HashMap<String, usize> = HashMap::new();
 
         for (step, op) in trace.0.iter().chain([&Op::Settle]).enumerate() {
             match op {
-                Op::Assign => live.push((step, client.slot())),
+                Op::Assign => {
+                    let slot = CacheSlot::default();
+                    creates.push(slot.pending());
+                    live.push((step, slot));
+                }
                 Op::Revoke(index) => {
                     if !live.is_empty() {
                         live.swap_remove(index % live.len());
                     }
                 }
                 Op::Settle => {
-                    client.settled().await?;
+                    for slot in creates.drain(..) {
+                        create(database, &options, slot, &queue.downgrade()).await;
+                    }
+                    while let Ok(keyspace) = retired.try_recv() {
+                        delete(database, keyspace).await;
+                    }
                     let mut held = BTreeSet::new();
                     for (id, slot) in &live {
                         let Some(cache) = slot.attached() else {
@@ -93,7 +111,7 @@ fn prop_keyspaces_track_live_slots() {
                         }
                         held.insert(name);
                     }
-                    if held != keyspace_names(client.database()) {
+                    if held != keyspace_names(database) {
                         return Ok(false);
                     }
                 }
@@ -101,8 +119,10 @@ fn prop_keyspaces_track_live_slots() {
         }
 
         live.clear();
-        client.settled().await?;
-        Ok(keyspace_names(client.database()).is_empty())
+        while let Ok(keyspace) = retired.try_recv() {
+            delete(database, keyspace).await;
+        }
+        Ok(keyspace_names(database).is_empty())
     }
 
     fn prop(trace: Trace) -> TestResult {
@@ -127,19 +147,13 @@ fn clients_own_fresh_directories_that_fjall_removes() -> Result<()> {
     let entries = || -> Result<usize> { Ok(fs::read_dir(dir.path())?.count()) };
 
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(async {
-        let first = FjallClient::open(&config).await?;
-        let second = FjallClient::open(&config).await?;
-        let slot = first.slot();
-        first.settled().await?;
-        assert!(
-            slot.attached().is_some(),
-            "the settled slot holds a keyspace"
-        );
-        assert_eq!(entries()?, 2, "each client opens its own subdirectory");
-        drop((slot, first, second));
-        Ok::<_, Report>(())
+    let _clients = runtime.block_on(async {
+        Ok::<_, Report>((
+            FjallClient::open(&config).await?,
+            FjallClient::open(&config).await?,
+        ))
     })?;
+    assert_eq!(entries()?, 2, "each client opens its own subdirectory");
     drop(runtime);
 
     assert_eq!(entries()?, 0, "fjall must remove every client directory");
@@ -159,12 +173,8 @@ fn cache_size_reaches_the_block_cache() -> Result<()> {
         (Some(ByteSize::new(seven_mib)), seven_mib.get()),
     ] {
         let dir = tempfile::tempdir()?;
-        let client = TEST_RUNTIME.block_on(FjallClient::open(&config(dir.path(), size)?))?;
-        assert_eq!(
-            client.database().cache_capacity(),
-            expected,
-            "cache size {size:?}"
-        );
+        let database = database_builder(&config(dir.path(), size)?).open()?;
+        assert_eq!(database.cache_capacity(), expected, "cache size {size:?}");
     }
     Ok(())
 }

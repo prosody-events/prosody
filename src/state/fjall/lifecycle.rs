@@ -17,8 +17,6 @@ use tokio::select;
 use tokio::sync::mpsc::{
     UnboundedReceiver, UnboundedSender, WeakUnboundedSender, unbounded_channel,
 };
-#[cfg(test)]
-use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 use tracing::warn;
 use uuid::Uuid;
@@ -36,20 +34,11 @@ pub(super) type Pending = Weak<OnceLock<FjallCellCache>>;
 #[derive(Clone, Default)]
 pub(crate) struct CacheSlot(Arc<OnceLock<FjallCellCache>>);
 
-/// Work for the delete queue.
-pub(super) enum Retirement {
-    /// Deletes the keyspace.
-    Keyspace(Keyspace),
-    /// Replies when both queues are empty.
-    #[cfg(test)]
-    Barrier(oneshot::Sender<()>),
-}
-
 /// Queues its keyspace for deletion when dropped.
 pub(super) struct Retire {
     /// `Some` until `drop` moves it into the queue.
     keyspace: Option<Keyspace>,
-    queue: UnboundedSender<Retirement>,
+    queue: UnboundedSender<Keyspace>,
 }
 
 impl CacheSlot {
@@ -90,7 +79,7 @@ impl Drop for Retire {
         // removes the keyspace directory on a blocking thread. A failed send
         // means the task has stopped. The database drop removes the keyspace.
         if let Some(keyspace) = self.keyspace.take() {
-            drop(self.queue.send(Retirement::Keyspace(keyspace)));
+            drop(self.queue.send(keyspace));
         }
     }
 }
@@ -101,7 +90,7 @@ impl Drop for Retire {
 pub(super) fn spawn(
     database: Database,
     options: KeyspaceCreateOptions,
-) -> (UnboundedSender<Pending>, UnboundedSender<Retirement>) {
+) -> (UnboundedSender<Pending>, UnboundedSender<Keyspace>) {
     let (creates, create_rx) = unbounded_channel();
     let (retires, retire_rx) = unbounded_channel();
     tokio::spawn(run(
@@ -121,8 +110,8 @@ async fn run(
     database: Database,
     options: KeyspaceCreateOptions,
     mut creates: UnboundedReceiver<Pending>,
-    mut retires: UnboundedReceiver<Retirement>,
-    retire_queue: WeakUnboundedSender<Retirement>,
+    mut retires: UnboundedReceiver<Keyspace>,
+    retire_queue: WeakUnboundedSender<Keyspace>,
 ) {
     loop {
         select! {
@@ -130,19 +119,7 @@ async fn run(
             Some(slot) = creates.recv() => {
                 create(&database, &options, slot, &retire_queue).await;
             }
-            Some(work) = retires.recv() => match work {
-                Retirement::Keyspace(keyspace) => delete(&database, keyspace).await,
-                #[cfg(test)]
-                Retirement::Barrier(done) if creates.is_empty() && retires.is_empty() => {
-                    let _ = done.send(());
-                }
-                #[cfg(test)]
-                barrier @ Retirement::Barrier(_) => {
-                    if let Some(queue) = retire_queue.upgrade() {
-                        drop(queue.send(barrier));
-                    }
-                }
-            },
+            Some(keyspace) = retires.recv() => delete(&database, keyspace).await,
             else => break,
         }
     }
@@ -154,11 +131,11 @@ async fn run(
 /// ended drops the new cache, which queues the keyspace's deletion. After a
 /// failure the slot stays empty, so the assignment uses durable storage, as it
 /// does after the cache is disabled.
-async fn create(
+pub(super) async fn create(
     database: &Database,
     options: &KeyspaceCreateOptions,
     slot: Pending,
-    retire_queue: &WeakUnboundedSender<Retirement>,
+    retire_queue: &WeakUnboundedSender<Keyspace>,
 ) {
     let Some(queue) = retire_queue.upgrade().filter(|_| slot.strong_count() > 0) else {
         return;
@@ -190,7 +167,7 @@ async fn create(
 }
 
 /// Deletes `keyspace`. A failure leaves it for the database drop to remove.
-async fn delete(database: &Database, keyspace: Keyspace) {
+pub(super) async fn delete(database: &Database, keyspace: Keyspace) {
     let database = database.clone();
     if let Err(error) = io::blocking(move || database.delete_keyspace(keyspace)).await {
         warn!(%error, "keyed-state cache keyspace deletion failed; the database drop removes it");
