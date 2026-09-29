@@ -83,12 +83,12 @@ struct CartFacts {
 impl CartEnv {
     /// An environment whose collections are all private.
     async fn private() -> Result<Self> {
-        Self::start(Registration::Private).await
+        Box::pin(Self::start(Registration::Private)).await
     }
 
     /// An environment publishing `cart` and `receipt` under `subsystem`.
     async fn published(subsystem: SubsystemName) -> Result<Self> {
-        Self::start(Registration::Published { subsystem }).await
+        Box::pin(Self::start(Registration::Published { subsystem })).await
     }
 
     async fn start(registration: Registration) -> Result<Self> {
@@ -114,9 +114,10 @@ impl CartEnv {
                 true
             }
         };
-        // `cart`'s token is the only way the handler can bind it. `last_seen` and
-        // `receipt` are reached through the erased seam by name, so their tokens
-        // exist only to register the collections' identities.
+        // `cart`'s token is the only way the handler can bind it. `last_seen`
+        // and `receipt` are reached through the erased seam by name, so
+        // their tokens exist only to register the collections'
+        // identities.
         let cart = keyed_state.register(cart().published(published));
         let _last_seen = keyed_state.register(last_seen());
         let _receipt = keyed_state
@@ -140,7 +141,7 @@ impl CartEnv {
         )?;
 
         let router = LocalRouter::new().await?;
-        let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
+        let consumer = Box::pin(ProsodyConsumer::<JsonCodec>::pipeline_consumer(
             ConsumerSetup {
                 consumer: &consumer_config,
                 trigger_store: &trigger_store,
@@ -156,7 +157,7 @@ impl CartEnv {
                 observations_tx,
                 cart,
             },
-        )
+        ))
         .await?;
 
         Ok(Self {
@@ -223,7 +224,7 @@ impl CartEnv {
 /// that message re-fetched from Kafka by offset.
 #[tokio::test]
 async fn test_keyed_state_round_trip_through_pipeline() -> Result<()> {
-    CartEnv::private().await?.run().await
+    Box::pin(CartEnv::private()).await?.run().await
 }
 
 /// A published collection's first durable write publishes a routing row into
@@ -236,7 +237,7 @@ async fn test_keyed_state_round_trip_through_pipeline() -> Result<()> {
 #[tokio::test]
 async fn test_published_collection_writes_routing_row() -> Result<()> {
     let subsystem = fresh_subsystem()?;
-    CartEnv::published(subsystem.clone())
+    Box::pin(CartEnv::published(subsystem.clone()))
         .await?
         .run_then(|facts| async move {
             assert_routing_row(&subsystem, &facts.group_id, facts.topic).await?;

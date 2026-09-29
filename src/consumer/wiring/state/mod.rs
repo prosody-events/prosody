@@ -107,6 +107,22 @@ impl KeyedStateInputs {
         )
     }
 
+    /// Opens the local keyed-state cache that a Cassandra backend reads
+    /// through.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyedStateInitError::Cache`] when the cache cannot be opened.
+    pub(in crate::consumer) async fn open_cache(&self) -> Result<FjallClient, ConsumerError> {
+        FjallClient::open(&self.config).await.map_err(|error| {
+            KeyedStateInitError::Cache {
+                message: format!("{error:#}"),
+                category: error.classify_error(),
+            }
+            .into()
+        })
+    }
+
     /// Publication setup for a Cassandra arm. The routing set comes from
     /// broker metadata, which this call fetches once.
     ///
@@ -198,37 +214,32 @@ where
     keyed_state.provider(backend, loader, publisher)
 }
 
-/// Builds the keyed-state provider for a Cassandra backend. It opens the fjall
-/// cache, mints the backend factory over the caller's
-/// Kafka loader, and wraps it in the partition state provider. Shared by every
-/// constructor's Cassandra arm; the caller owns the loader so the pipeline can
+/// Builds the keyed-state provider for a Cassandra backend: the backend
+/// factory over the opened cache and the caller's Kafka loader, wrapped in the
+/// partition state provider. The caller opens every resource, so it can open
+/// them concurrently. The caller also owns the loader, so the pipeline can
 /// hand the same one to its message-defer middleware.
-pub(in crate::consumer) async fn cassandra_state_provider<C: Codec>(
+pub(in crate::consumer) fn cassandra_state_provider<C: Codec>(
     keyed_state: &KeyedStateInputs,
     dedup_provider: CassandraDeduplicationStoreProvider,
     cell_store: CassandraCellResources,
     identity_store: CassandraDescriptorIdentityStore,
+    cache: FjallClient,
     loader: KafkaLoader<C>,
     publisher: Option<PublicationOwner<CassandraPublicationStore>>,
-) -> Result<CassandraStateProvider<C>, ConsumerError>
+) -> CassandraStateProvider<C>
 where
     C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
 {
-    let fjall_client = FjallClient::open(&keyed_state.config)
-        .await
-        .map_err(|error| KeyedStateInitError::Cache {
-            message: format!("{error:#}"),
-            category: error.classify_error(),
-        })?;
     let backend = CassandraStateBackendFactory::new(
-        fjall_client,
+        cache,
         cell_store,
         identity_store,
         keyed_state.registry.clone(),
         dedup_provider,
         keyed_state.group.clone(),
     );
-    Ok(keyed_state.provider(backend, loader, publisher))
+    keyed_state.provider(backend, loader, publisher)
 }
 
 /// Reads every topic's partition count from broker metadata.

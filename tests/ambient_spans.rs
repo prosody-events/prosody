@@ -151,7 +151,7 @@ async fn handlers_run_inside_their_event_spans() -> Result<()> {
     .await?;
 
     let fire_at = CompactDateTime::now()?.add_duration(CompactDuration::new(2))?;
-    client.subscribe(AmbientProbe { sender, fire_at }).await?;
+    Box::pin(client.subscribe(AmbientProbe { sender, fire_at })).await?;
     client.send(topic, "ambient-key", json!({})).await?;
 
     // Collect all reports before asserting: the consumer must be shut down

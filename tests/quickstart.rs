@@ -129,7 +129,7 @@ async fn quickstart() -> Result<()> {
     ))
     .await?;
 
-    client.subscribe(MyHandler { sender }).await?;
+    Box::pin(client.subscribe(MyHandler { sender })).await?;
 
     client
         .send(topic, "message-key", json!({"value": "Hello, Kafka!"}))
