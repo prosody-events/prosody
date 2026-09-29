@@ -150,9 +150,9 @@ macro_rules! cassandra_queries {
                 session: &::scylla::client::session::Session,
                 keyspace: &str,
             ) -> ::std::result::Result<Self, $crate::cassandra::errors::CassandraStoreError> {
-                // The fixed statement count bounds the join. The box keeps
-                // every constructor's future small. AGENTS.md authorizes it,
-                // because stores prepare only at construction.
+                // The fixed statement count bounds the join. Stores prepare
+                // only at construction, so the one allocation is off every
+                // hot path. The box keeps every constructor's future small.
                 let ($($field,)*) = ::std::boxed::Box::pin(async {
                     ::paste::paste! {
                         ::tokio::try_join!($([<prepare_ $field>](session, keyspace)),*)
