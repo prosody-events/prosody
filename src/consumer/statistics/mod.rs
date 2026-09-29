@@ -1,5 +1,6 @@
-//! The client-local gauges an observation reports: fetch-queue depth and size
-//! per assigned partition, and the age of the client's topic metadata.
+//! The client-local gauges that librdkafka statistics reports feed:
+//! fetch-queue depth and size per assigned partition, and the age of the
+//! client's topic metadata.
 //!
 //! Assignment and lag are left to broker-side exporters, which already report
 //! them. A second series would compete with theirs for no gain.
@@ -12,18 +13,32 @@
 //! cloned once per partition per statistics report. There is no attribute cache
 //! keyed by topic or partition.
 
-use super::{assigned_partitions, is_assigned};
+#[cfg(test)]
+mod tests;
+
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Gauge, Meter};
+use parking_lot::Mutex;
 use rdkafka::Statistics;
+use rdkafka::statistics::Partition as StatsPartition;
 use std::sync::Arc;
 
-/// The gauges one [`KafkaObserver`](super::KafkaObserver) records.
+/// librdkafka's internal partition entry, which belongs to no real partition.
+const INTERNAL_PARTITION: i32 = -1;
+
+/// The gauges of one Kafka client.
+///
+/// The client's context owns it, so it lives exactly as long as the client.
+/// Dropping it zeroes the last report's series: a stopped consumer stops
+/// contributing to `sum` aggregations. librdkafka delivers no statistics after
+/// the client is destroyed, and the context drops only after that.
 pub(super) struct KafkaMetrics {
     group: Arc<str>,
     fetch_queue_messages: Gauge<u64>,
     fetch_queue_size: Gauge<u64>,
     metadata_age: Gauge<u64>,
+    /// The newest report. The next report or the drop retires its series.
+    last: Mutex<Option<Statistics>>,
 }
 
 impl KafkaMetrics {
@@ -50,7 +65,18 @@ impl KafkaMetrics {
                 .with_description("Age of the client's metadata for its assigned topics")
                 .with_unit("ms")
                 .build(),
+            last: Mutex::new(None),
         }
+    }
+
+    /// Records `incoming` and keeps it as the newest report.
+    ///
+    /// The statistics callback runs on the poll thread, so the lock is never
+    /// contended.
+    pub(super) fn observe(&self, incoming: Statistics) {
+        let mut last = self.last.lock();
+        self.record(last.as_ref(), &incoming);
+        *last = Some(incoming);
     }
 
     /// Retires the series `previous` reported and no longer holds, then records
@@ -64,7 +90,7 @@ impl KafkaMetrics {
     /// Retired series are addressed with `incoming`'s identity attributes:
     /// librdkafka's handle name and the configured `client.id` are fixed for a
     /// client's lifetime, so they name the same series either way.
-    pub(super) fn record(&self, previous: Option<&Statistics>, incoming: &Statistics) {
+    fn record(&self, previous: Option<&Statistics>, incoming: &Statistics) {
         if let Some(previous) = previous {
             for (topic, id, _) in assigned_partitions(previous) {
                 if retained(incoming, topic, id) {
@@ -92,9 +118,8 @@ impl KafkaMetrics {
         );
     }
 
-    /// Zeroes every series of `last`'s assignment, so a stopped consumer stops
-    /// reporting.
-    pub(super) fn zero_assigned(&self, last: &Statistics) {
+    /// Zeroes every series of `last`'s assignment.
+    fn zero_assigned(&self, last: &Statistics) {
         for (topic, id, _) in assigned_partitions(last) {
             self.zero_partition(last, topic, id);
         }
@@ -131,6 +156,36 @@ impl KafkaMetrics {
             KeyValue::new("messaging.destination.partition.id", i64::from(id)),
         ]
     }
+}
+
+impl Drop for KafkaMetrics {
+    fn drop(&mut self) {
+        if let Some(last) = self.last.get_mut().take() {
+            self.zero_assigned(&last);
+        }
+    }
+}
+
+/// The topic, id, and statistics of every partition `statistics` reports as
+/// assigned to this instance. The map key is the canonical partition id; the
+/// duplicated `partition` field inside each entry is never trusted.
+fn assigned_partitions(
+    statistics: &Statistics,
+) -> impl Iterator<Item = (&str, i32, &StatsPartition)> {
+    statistics.topics.iter().flat_map(|(name, topic)| {
+        topic.partitions.iter().filter_map(move |(&id, partition)| {
+            is_assigned(id, partition).then_some((name.as_str(), id, partition))
+        })
+    })
+}
+
+/// Whether librdkafka reports this entry as a real partition assigned to this
+/// instance. `desired` is what the rebalance sets.
+///
+/// `unknown` is deliberately not consulted: a partition missing from broker
+/// metadata still has client-side queues worth reporting.
+fn is_assigned(id: i32, partition: &StatsPartition) -> bool {
+    id != INTERNAL_PARTITION && partition.desired
 }
 
 /// Whether `incoming` still reports `(topic, id)` as assigned to this instance.

@@ -361,10 +361,19 @@ never opens a second Cassandra session, Kafka loader, or cache.
 
 **Retiring a published collection.** Change the collection to
 `.published(false)`. Keep its registration and the consumer's `subsystem` for
-one complete stop-then-start deployment. Startup reconciliation then removes
-the routing row. Deleting the registration or subsystem first strands the
-routing row. Routing rows and committed state have no automatic expiry, so
-other groups can continue to discover and read the collection.
+one complete stop-then-start deployment. The consumer that owns partition 0
+of the first subscribed topic in lexical order then removes the routing row
+when it next acquires that partition. Deleting the registration or subsystem
+first strands the routing row. Routing rows and committed state have no
+automatic expiry, so other groups can continue to discover and read the
+collection.
+
+**Topics of a publishing consumer.** A publishing consumer reads the partition
+count of each subscribed topic from the brokers when it starts. Construction
+fails if a subscribed topic does not exist. Subscribe to literal topic names,
+because a `^` pattern has no fixed topic set. Never increase the partition
+count of a subscribed topic. The routing rows would then send readers to the
+wrong partition.
 
 ## Quality of Service
 

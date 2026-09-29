@@ -2,15 +2,11 @@
 //! cluster actually has.
 
 use crate::producer::{ProducerError, ProsodyProducer};
-use crate::{Codec, Topic};
+use crate::{Codec, METADATA_TIMEOUT, Topic};
 use rdkafka::metadata::MetadataTopic;
-use std::time::Duration;
 
 #[cfg(test)]
 mod tests;
-
-/// How long to wait for the cluster's metadata.
-const METADATA_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Which of `topics` the cluster does not have.
 ///

@@ -22,8 +22,6 @@
 //! - `PartitionManager`: Manages message processing for a single Kafka
 //!   partition
 //! - `EventHandler`: User-implemented trait for message processing logic
-//! - `KafkaObserver`: What the primary Kafka client knows about itself, shared
-//!   with the consumer context
 //! - Failure strategies: Composable error handling mechanisms
 //!
 //! # Usage
@@ -134,7 +132,7 @@ pub use crate::consumer::config::{
     MockConfigurationError, PipelineMiddlewareConfiguration,
 };
 pub use crate::consumer::error::{
-    ConsumerError, KeyedStateInitError, PeerInitError, ShutdownError,
+    ConsumerError, KeyedStateInitError, PeerInitError, RoutingError, ShutdownError,
 };
 pub use crate::consumer::event_context::{EventContext, TerminationSignals};
 pub use crate::consumer::handler::{DemandType, EventHandler, HandlerProvider, Keyed, Uncommitted};
@@ -144,7 +142,6 @@ pub use crate::consumer::kafka_state::{
 };
 pub use crate::consumer::message::ConsumerMessage;
 pub use crate::consumer::middleware::{FallibleHandler, RepinProof};
-pub(crate) use crate::consumer::observer::KafkaObserver;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::probes::ProbeServer;
 pub(crate) use crate::consumer::wiring::state::{
@@ -180,12 +177,10 @@ pub mod message;
 pub mod middleware;
 mod modes;
 pub(crate) use modes::{NoResponses, Responding, ResponsePolicy};
-// Crate-wide, not `pub(in crate::consumer)`: keyed-state publication reads the
-// observed partition count from outside this module.
-pub(crate) mod observer;
 pub(crate) mod partition;
 mod poll;
 mod probes;
+mod statistics;
 pub mod storage;
 mod sweep;
 mod wiring;
@@ -210,9 +205,6 @@ pub(crate) type Managers<P> = RwLock<HashMap<(Topic, Partition), PartitionManage
 struct RuntimeState {
     poll_handle: JoinHandle<()>,
     probe_server: Option<ProbeServer>,
-    /// The consumer's Kafka observation handle. Shutdown retires its gauge
-    /// series so a stopped consumer stops contributing to `sum` aggregations.
-    observer: KafkaObserver,
 }
 
 /// What one teardown still holds after the Kafka poll loop stops.
@@ -223,7 +215,6 @@ struct RuntimeState {
 /// nothing shared.
 struct Teardown {
     probe_server: Option<ProbeServer>,
-    observer: KafkaObserver,
 }
 
 /// High-level Kafka consumer implementation.
@@ -327,7 +318,8 @@ impl<C: Codec> ProsodyConsumer<C> {
 
     /// Stops this consumer after all handlers finish.
     ///
-    /// It stops the poll loop, sweeps each partition, and retires observations.
+    /// It stops the poll loop, sweeps each partition, and stops the probe
+    /// server.
     ///
     /// A second call finds no runtime state and does no work.
     /// A call on a clone behaves the same after another clone stops the
@@ -338,7 +330,7 @@ impl<C: Codec> ProsodyConsumer<C> {
         }
     }
 
-    /// Stops polling, drains every manager, and releases observations.
+    /// Stops polling, drains every manager, and releases the probe server.
     async fn finish_shutdown(&mut self) -> Option<ShutdownError> {
         let (teardown, poll_failure) = self.stop_polling().await?;
         let swept = sweep::drain_managers(&self.managers).await;
@@ -355,7 +347,6 @@ impl<C: Codec> ProsodyConsumer<C> {
         let RuntimeState {
             poll_handle,
             probe_server,
-            observer,
         } = self.runtime_state.lock().take()?;
 
         self.shutdown.store(true, Ordering::Relaxed);
@@ -366,28 +357,17 @@ impl<C: Codec> ProsodyConsumer<C> {
                 message: format!("{error:#}"),
             }),
         };
-        Some((
-            Teardown {
-                probe_server,
-                observer,
-            },
-            poll_failure,
-        ))
+        Some((Teardown { probe_server }, poll_failure))
     }
 }
 
 impl Teardown {
-    /// Retires observation resources after all partition handlers stop.
+    /// Stops the probe server after all partition handlers stop.
     ///
     /// The [`Swept`](sweep::Swept) proof is the parameter, and only the sweep
     /// mints one, so this step cannot run before the sweep.
     async fn release(self, _swept: sweep::Swept) {
-        let Self {
-            probe_server,
-            observer,
-        } = self;
-        observer.retire_gauges();
-        if let Some(probe_server) = probe_server {
+        if let Some(probe_server) = self.probe_server {
             probe_server.shutdown().await;
         }
     }

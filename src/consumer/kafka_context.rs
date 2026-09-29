@@ -11,12 +11,13 @@
 //! - librdkafka's periodic statistics callback
 //!
 //! The core component is the `Context` struct which implements Kafka's
-//! rebalance callbacks to manage partition lifecycle events, and holds the
-//! observation handle the statistics callback updates.
+//! rebalance callbacks to manage partition lifecycle events, and owns the
+//! gauges the statistics callback records.
 
 use aho_corasick::{AhoCorasick, BuildError, StartKind};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+use opentelemetry::global::meter;
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext, Rebalance};
 use rdkafka::{ClientContext, Statistics};
 use std::array::from_fn;
@@ -29,8 +30,8 @@ use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, watch};
 use tracing::{debug, error, info, warn};
 
-use crate::consumer::observer::KafkaObserver;
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
+use crate::consumer::statistics::KafkaMetrics;
 use crate::consumer::{
     ConsumerConfiguration, ConsumerError, EventHandler, HandlerProvider, Managers,
     WatermarkVersion, get_assigned_partition_count,
@@ -53,9 +54,6 @@ pub(super) struct ContextHandles<PL> {
     pub(super) assignment_tx: watch::Sender<u32>,
     /// Telemetry the context and the partitions it creates publish through.
     pub(super) telemetry: TelemetrySender,
-    /// The one consumer observation this client updates from its statistics
-    /// callback. Readers elsewhere hold clones of the same handle.
-    pub(super) observer: KafkaObserver,
 }
 
 /// The per-partition factories the context threads into each
@@ -116,8 +114,9 @@ pub(super) struct Context<F, PL> {
     /// Publishes the rebalance events this context observes.
     telemetry: TelemetrySender,
 
-    /// Receives librdkafka's statistics and holds the shared observation.
-    observer: KafkaObserver,
+    /// The gauges librdkafka's statistics feed. They retire when the client
+    /// drops this context.
+    metrics: KafkaMetrics,
 }
 
 /// Creates a new consumer context with the given configuration.
@@ -199,7 +198,7 @@ where
         managers: shared.managers,
         assignment_tx: shared.assignment_tx,
         telemetry: shared.telemetry,
-        observer: shared.observer,
+        metrics: KafkaMetrics::new(&meter("prosody"), &config.group_id),
     })
 }
 
@@ -209,14 +208,12 @@ where
     PL: Send + Sync + 'static,
 {
     /// Receives librdkafka's periodic statistics on the poll thread, so the
-    /// body must never block, spawn, or call a Kafka API. See
-    /// [`KafkaObserver::observe_statistics`] for the record-then-replace
-    /// sequence it delegates to.
+    /// body must never block, spawn, or call a Kafka API.
     ///
     /// Do not delete this override: rdkafka's default `stats` logs the entire
-    /// statistics tree at `info` and the observation stream stops.
+    /// statistics tree at `info` and the gauges stop.
     fn stats(&self, statistics: Statistics) {
-        self.observer.observe_statistics(statistics);
+        self.metrics.observe(statistics);
     }
 }
 

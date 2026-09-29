@@ -13,7 +13,7 @@ use crate::consumer::middleware::defer::timer::store::{
 use crate::consumer::storage::components::{cassandra, memory};
 use crate::consumer::storage::{ComponentsOf, ConsumerStorageBackend, ConsumerStorageInputs};
 use crate::consumer::{
-    CassandraStateProvider, ConsumerError, KafkaObserver, KeyedStateInputs, MemoryStateProvider,
+    CassandraStateProvider, ConsumerError, KeyedStateInputs, MemoryStateProvider,
 };
 use crate::error::ClassifyError;
 use crate::loader::{KafkaLoader, MemoryLoader, MessageLoader};
@@ -123,7 +123,8 @@ impl<P: Projection> CommittedCellSource<P> for ScriptedCellSource {
         cell: CellRef<'_>,
     ) -> Result<Option<P::Payload>, Self::Error> {
         let read = self.read_committed(id, cell);
-        // The test barrier holds each reader after its read and before its answer.
+        // The test barrier holds each reader after its read and before its
+        // answer.
         self.meet().await;
         read.map(|value| value.map(P::from_value))
     }
@@ -279,7 +280,6 @@ where
         &self,
         inputs: ConsumerStorageInputs,
         keyed_state: &KeyedStateInputs,
-        observer: KafkaObserver,
     ) -> Result<ComponentsOf<C, Self>, ConsumerError> {
         cassandra::<C>(
             inputs,
@@ -288,7 +288,6 @@ where
             self.identities().clone(),
             self.publications().clone(),
             self.loader().clone(),
-            observer,
         )
         .await
     }
@@ -310,7 +309,6 @@ where
         &self,
         inputs: ConsumerStorageInputs,
         keyed_state: &KeyedStateInputs,
-        _observer: KafkaObserver,
     ) -> Result<ComponentsOf<C, Self>, ConsumerError> {
         memory::<C>(
             inputs,

@@ -163,7 +163,7 @@ where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         RP: ResponsePolicy<T>,
     {
-        let (components, keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
+        let (components, keyed_state, heartbeats) = build_typed_state(&setup).await?;
         let retry = RetryMiddleware::new(low_latency_config.retry)?;
         let topic = FailureTopicMiddleware::new(
             low_latency_config.failure_topic,
@@ -190,7 +190,6 @@ where
             version: keyed_state.version.clone(),
             telemetry: &telemetry,
             heartbeats,
-            observer,
             managers: Arc::clone(&managers),
         };
         initialize_consumer::<_, _, _, C, _>(

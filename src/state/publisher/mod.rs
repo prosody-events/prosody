@@ -4,53 +4,23 @@
 //! routing set. Kafka assigns that partition to at most one group member.
 //! All group members must use the same topic set so they select one leader.
 
-use crate::consumer::observer::{KafkaObserver, PartitionCountObservationError};
-use crate::error::{ClassifyError, ErrorCategory};
+use crate::error::ClassifyError;
 use crate::state::STATE_FANOUT_CONCURRENCY;
 use crate::state::publication::{PublicationStore, StatePublication};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state_reader::PartitionCount;
 use crate::subsystem::SubsystemName;
-use crate::{Partition, Topic};
+use crate::{ConsumerGroup, Partition, Topic};
 use futures::stream::{self, StreamExt, TryStreamExt};
-use smallvec::SmallVec;
 use std::convert::Infallible;
 use std::error::Error;
 use std::future::ready;
 use std::sync::Arc;
-use thiserror::Error;
 
 #[cfg(test)]
 mod tests;
 
 const PUBLICATION_PARTITION: Partition = 0;
-
-/// Supplies the current partition count for a published topic.
-pub(crate) trait PartitionCountSource: Clone + Send + Sync + 'static {
-    type Error: ClassifyError + Error + Send + Sync + 'static;
-
-    fn count_for(&self, topic: &str) -> Result<PartitionCount, Self::Error>;
-}
-
-impl PartitionCountSource for KafkaObserver {
-    type Error = PartitionCountObservationError;
-
-    fn count_for(&self, topic: &str) -> Result<PartitionCount, Self::Error> {
-        KafkaObserver::partition_count(self, topic)
-    }
-}
-
-/// A partition count used by the in-memory backend.
-#[derive(Clone, Copy)]
-pub(crate) struct FixedPartitionCount(pub(crate) PartitionCount);
-
-impl PartitionCountSource for FixedPartitionCount {
-    type Error = Infallible;
-
-    fn count_for(&self, _topic: &str) -> Result<PartitionCount, Self::Error> {
-        Ok(self.0)
-    }
-}
 
 /// Publishes routing rows during the owning partition's state acquisition.
 pub trait AssignmentPublisher: Clone + Send + Sync + 'static {
@@ -116,121 +86,122 @@ impl PublicationTopics {
             leader,
         })
     }
+
+    /// Pairs every topic with the partition count `count_for` reports.
+    ///
+    /// # Errors
+    ///
+    /// The first error `count_for` returns.
+    pub(crate) fn route<E>(
+        &self,
+        group: &ConsumerGroup,
+        mut count_for: impl FnMut(&str) -> Result<PartitionCount, E>,
+    ) -> Result<RoutingSet, E> {
+        let rows = self
+            .all
+            .iter()
+            .map(|&topic| {
+                Ok(StatePublication {
+                    group_id: group.clone(),
+                    topic,
+                    partition_count: count_for(topic.as_ref())?,
+                })
+            })
+            .collect::<Result<_, E>>()?;
+        Ok(RoutingSet {
+            group: group.clone(),
+            rows,
+            leader: self.leader,
+        })
+    }
+
+    /// The empty routing set, for a consumer that publishes no collection.
+    pub(crate) fn withdrawal(&self, group: &ConsumerGroup) -> RoutingSet {
+        RoutingSet {
+            group: group.clone(),
+            rows: Arc::new([]),
+            leader: self.leader,
+        }
+    }
+}
+
+/// One consumer group's complete routing set: one row for each subscribed
+/// topic, with the topic's partition count.
+///
+/// The rows are empty only when no collection is published. The owner then
+/// fetches no counts and only withdraws the group's old rows.
+///
+/// Partition counts never change, because a Prosody deployment never increases
+/// them. So the set is built once, at construction, and every row is final.
+///
+/// Do not take counts from librdkafka statistics. A statistics report lists
+/// only the topics that this client held, and the owner must count every
+/// topic.
+#[derive(Clone)]
+pub(crate) struct RoutingSet {
+    group: ConsumerGroup,
+    rows: Arc<[StatePublication]>,
+    leader: Topic,
 }
 
 /// The sole writer for one consumer group's complete routing set.
 #[derive(Clone)]
-pub(crate) struct PublicationOwner<S, N> {
+pub(crate) struct PublicationOwner<S> {
     subsystem: SubsystemName,
-    group: Arc<str>,
     store: S,
-    counts: N,
     registry: Arc<CollectionDefRegistry>,
-    topics: PublicationTopics,
+    routes: RoutingSet,
 }
 
-impl<S, N> PublicationOwner<S, N>
-where
-    S: PublicationStore,
-    N: PartitionCountSource,
-{
-    /// Creates an owner for the supplied non-empty topic set.
+impl<S: PublicationStore> PublicationOwner<S> {
+    /// Creates the owner that writes `routes`.
     pub(crate) fn new(
         subsystem: SubsystemName,
-        group: Arc<str>,
         store: S,
-        counts: N,
         registry: Arc<CollectionDefRegistry>,
-        topics: PublicationTopics,
+        routes: RoutingSet,
     ) -> Self {
         Self {
             subsystem,
-            group,
             store,
-            counts,
             registry,
-            topics,
+            routes,
         }
     }
 
-    async fn publish(&self) -> Result<(), PublicationError<S::Error, N::Error>> {
-        let rows: SmallVec<[StatePublication; 2]> = self
-            .topics
-            .all
-            .iter()
-            .copied()
-            .map(|topic| {
-                self.counts
-                    .count_for(topic.as_ref())
-                    .map(|partition_count| StatePublication {
-                        group_id: self.group.clone(),
-                        topic,
-                        partition_count,
-                    })
-                    .map_err(PublicationError::Count)
-            })
-            .collect::<Result<_, _>>()?;
-
+    async fn publish(&self) -> Result<(), S::Error> {
+        let group = &self.routes.group;
         stream::iter(self.registry.collections())
             .map(Ok)
-            .try_for_each_concurrent(STATE_FANOUT_CONCURRENCY, |(state_type, name)| {
-                let rows = &rows;
-                async move {
-                    self.store
-                        .remove_group(&self.subsystem, state_type, name, &self.group)
-                        .await
-                        .map_err(PublicationError::Store)?;
-                    if self.registry.is_published(state_type, name) {
-                        stream::iter(rows)
-                            .map(Ok)
-                            .try_for_each_concurrent(STATE_FANOUT_CONCURRENCY, |row| async move {
-                                self.store
-                                    .upsert(&self.subsystem, state_type, name, row)
-                                    .await
-                                    .map_err(PublicationError::Store)
-                            })
-                            .await?;
-                    }
-                    Ok(())
+            .try_for_each_concurrent(STATE_FANOUT_CONCURRENCY, |(state_type, name)| async move {
+                self.store
+                    .remove_group(&self.subsystem, state_type, name, group)
+                    .await?;
+                if self.registry.is_published(state_type, name) {
+                    stream::iter(self.routes.rows.iter())
+                        .map(Ok)
+                        .try_for_each_concurrent(STATE_FANOUT_CONCURRENCY, |row| {
+                            self.store.upsert(&self.subsystem, state_type, name, row)
+                        })
+                        .await?;
                 }
+                Ok(())
             })
             .await
     }
 }
 
-impl<S, N> AssignmentPublisher for PublicationOwner<S, N>
-where
-    S: PublicationStore,
-    N: PartitionCountSource,
-{
-    type Error = PublicationError<S::Error, N::Error>;
+impl<S: PublicationStore> AssignmentPublisher for PublicationOwner<S> {
+    type Error = S::Error;
 
     async fn publish_if_owner(
         &self,
         topic: Topic,
         partition: Partition,
     ) -> Result<(), Self::Error> {
-        if topic != self.topics.leader || partition != PUBLICATION_PARTITION {
+        if topic != self.routes.leader || partition != PUBLICATION_PARTITION {
             return Ok(());
         }
         self.publish().await
-    }
-}
-
-/// A routing-set publication failure.
-#[derive(Debug, Error)]
-pub(crate) enum PublicationError<S, N> {
-    #[error(transparent)]
-    Store(S),
-    #[error(transparent)]
-    Count(N),
-}
-
-impl<S: ClassifyError, N: ClassifyError> ClassifyError for PublicationError<S, N> {
-    fn classify_error(&self) -> ErrorCategory {
-        match self {
-            Self::Store(error) => error.classify_error(),
-            Self::Count(error) => error.classify_error(),
-        }
     }
 }

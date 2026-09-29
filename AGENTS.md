@@ -119,7 +119,9 @@ Tiger style and data-oriented design agree: minimize allocation, and never
   large future does not overflow a worker stack. When `clippy::large_futures`
   fires at a call site, box at that call site: a test, an example, or a client
   binding. Production library code uses `Box::pin` only to move a polled
-  future or stream, never to make a future smaller.
+  future or stream, never to make a future smaller. Sole authorized
+  exception: `cassandra_queries!` boxes its concurrent statement preparation,
+  which runs only at store construction. Do not cite it to justify another.
 - **Simplicity is not sacrificed for this.** The design principles above still
   win: prefer the reading that's clearest. Zero-alloc and simple are usually
   *not* in conflict — the fn-item fix above removed an allocation *and* a line.
