@@ -11,10 +11,11 @@ async fn message_lifecycle_events_on_kafka() -> Result<()> {
         let client = build_client(&source_topic, &telemetry_topic, true).await?;
 
         let (msg_tx, mut msg_rx) = channel(16);
-        Box::pin(client.subscribe(FallibleTestHandler {
-            messages_tx: msg_tx,
-        }))
-        .await?;
+        client
+            .subscribe(FallibleTestHandler {
+                messages_tx: msg_tx,
+            })
+            .await?;
 
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
@@ -118,10 +119,11 @@ async fn emitter_disabled_no_events() -> Result<()> {
         let client = build_client(&source_topic, &telemetry_topic, false).await?;
 
         let (msg_tx, mut msg_rx) = channel(16);
-        Box::pin(client.subscribe(FallibleTestHandler {
-            messages_tx: msg_tx,
-        }))
-        .await?;
+        client
+            .subscribe(FallibleTestHandler {
+                messages_tx: msg_tx,
+            })
+            .await?;
 
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
@@ -152,10 +154,11 @@ async fn json_payload_contract_validation() -> Result<()> {
         let client = build_client(&source_topic, &telemetry_topic, true).await?;
 
         let (msg_tx, mut msg_rx) = channel(16);
-        Box::pin(client.subscribe(FallibleTestHandler {
-            messages_tx: msg_tx,
-        }))
-        .await?;
+        client
+            .subscribe(FallibleTestHandler {
+                messages_tx: msg_tx,
+            })
+            .await?;
 
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 

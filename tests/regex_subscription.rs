@@ -159,8 +159,7 @@ fn verify_messages(messages: &[(String, Value)], topics: &[TestTopic]) -> Result
         );
     }
 
-    // Verify we got messages from all matching topics and none from
-    // non-matching
+    // Verify we got messages from all matching topics and none from non-matching
     let received_sources: HashSet<String> = messages
         .iter()
         .filter_map(|(_, payload)| {
@@ -235,7 +234,9 @@ async fn test_regex_topic_subscription() -> Result<()> {
 
     // Create and configure high-level client
     let client = create_high_level_client(regex_pattern, consumer_group).await?;
-    Box::pin(client.subscribe(FallibleTestHandler { messages_tx })).await?;
+    client
+        .subscribe(FallibleTestHandler { messages_tx })
+        .await?;
 
     // Send test messages and get expected count
     let expected_message_count = send_test_messages(&client, &topics).await?;

@@ -139,7 +139,8 @@ macro_rules! cassandra_queries {
 
         // Generate the impl block with new() function
         impl $name {
-            /// Creates a new instance with all prepared statements.
+            /// Creates a new instance with all prepared statements. It
+            /// prepares every statement concurrently.
             ///
             /// # Errors
             ///
@@ -148,11 +149,14 @@ macro_rules! cassandra_queries {
                 session: &::scylla::client::session::Session,
                 keyspace: &str,
             ) -> ::std::result::Result<Self, $crate::cassandra::errors::CassandraStoreError> {
-                $(
-                    let $field = ::paste::paste! {
-                        [<prepare_ $field>](session, keyspace).await?
-                    };
-                )*
+                // Preparation runs once per client. The heap holds the joined
+                // futures, so every caller's future stays small.
+                let ($($field,)*) = ::std::boxed::Box::pin(async {
+                    ::paste::paste! {
+                        ::tokio::try_join!($([<prepare_ $field>](session, keyspace)),*)
+                    }
+                })
+                .await?;
 
                 ::std::result::Result::Ok(Self {
                     $(

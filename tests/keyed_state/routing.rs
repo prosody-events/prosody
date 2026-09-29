@@ -168,7 +168,7 @@ async fn start_member(
         keyed_state,
     };
 
-    Ok(Box::pin(ProsodyConsumer::<JsonCodec>::pipeline_consumer(
+    Ok(ProsodyConsumer::<JsonCodec>::pipeline_consumer(
         ConsumerSetup {
             consumer: consumer_config,
             trigger_store: &create_cassandra_trigger_store_config(),
@@ -181,7 +181,7 @@ async fn start_member(
         },
         Telemetry::new(),
         FallibleTestHandler { messages_tx },
-    ))
+    )
     .await?)
 }
 

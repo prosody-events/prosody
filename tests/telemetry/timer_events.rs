@@ -12,7 +12,7 @@ async fn message_failed_event_on_kafka() -> Result<()> {
             build_typed_client(&source_topic, &telemetry_topic).await?;
 
         let (fail_tx, mut fail_rx) = channel(16);
-        Box::pin(client.subscribe(FailingHandler { tx: fail_tx })).await?;
+        client.subscribe(FailingHandler { tx: fail_tx }).await?;
 
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
@@ -51,7 +51,9 @@ async fn timer_lifecycle_events_on_kafka() -> Result<()> {
 
         let (msg_tx, mut msg_rx) = channel(16);
         let (timer_tx, mut timer_rx) = channel(16);
-        Box::pin(client.subscribe(TimerSchedulingHandler { msg_tx, timer_tx })).await?;
+        client
+            .subscribe(TimerSchedulingHandler { msg_tx, timer_tx })
+            .await?;
 
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
@@ -101,7 +103,9 @@ async fn timer_failed_event_on_kafka() -> Result<()> {
 
         let (msg_tx, mut msg_rx) = channel(16);
         let (timer_tx, mut timer_rx) = channel(16);
-        Box::pin(client.subscribe(TimerFailingHandler { msg_tx, timer_tx })).await?;
+        client
+            .subscribe(TimerFailingHandler { msg_tx, timer_tx })
+            .await?;
 
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
@@ -152,7 +156,9 @@ async fn deferred_message_timer_three_event_invariant() -> Result<()> {
             build_typed_client_with_defer(&source_topic, &telemetry_topic, defer).await?;
 
         let (done_tx, mut done_rx) = channel(16);
-        Box::pin(client.subscribe(TransientMessageHandler { done_tx })).await?;
+        client
+            .subscribe(TransientMessageHandler { done_tx })
+            .await?;
 
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
@@ -172,9 +178,8 @@ async fn deferred_message_timer_three_event_invariant() -> Result<()> {
         // Wait for the retry to succeed
         let _ = timeout(RECEIVE_TIMEOUT, done_rx.recv()).await?;
 
-        // Collect all timer events — there must be a full scheduled →
-        // dispatched → succeeded lifecycle for the deferredMessage
-        // timer.
+        // Collect all timer events — there must be a full scheduled → dispatched
+        // → succeeded lifecycle for the deferredMessage timer.
         let events = collect_events_for_key(
             &telemetry_consumer,
             "defer-msg-key",
@@ -213,7 +218,9 @@ async fn deferred_timer_timer_three_event_invariant() -> Result<()> {
 
         let (msg_tx, mut msg_rx) = channel(16);
         let (done_tx, mut done_rx) = channel(16);
-        Box::pin(client.subscribe(TransientTimerHandler { msg_tx, done_tx })).await?;
+        client
+            .subscribe(TransientTimerHandler { msg_tx, done_tx })
+            .await?;
 
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
@@ -276,7 +283,7 @@ async fn timer_cancelled_event_on_kafka() -> Result<()> {
             build_typed_client(&source_topic, &telemetry_topic).await?;
 
         let (msg_tx, mut msg_rx) = channel(16);
-        Box::pin(client.subscribe(TimerCancellingHandler { msg_tx })).await?;
+        client.subscribe(TimerCancellingHandler { msg_tx }).await?;
 
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
@@ -345,7 +352,7 @@ async fn clear_and_schedule_emits_cancelled_and_scheduled() -> Result<()> {
             build_typed_client(&source_topic, &telemetry_topic).await?;
 
         let (msg_tx, mut msg_rx) = channel(16);
-        Box::pin(client.subscribe(ClearAndScheduleHandler { msg_tx })).await?;
+        client.subscribe(ClearAndScheduleHandler { msg_tx }).await?;
 
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
@@ -378,8 +385,7 @@ async fn clear_and_schedule_emits_cancelled_and_scheduled() -> Result<()> {
             .filter_map(|e| e.get("type").and_then(Value::as_str))
             .collect();
 
-        // Should have: scheduled (first), cancelled (from clear), scheduled
-        // (new)
+        // Should have: scheduled (first), cancelled (from clear), scheduled (new)
         let scheduled_count = types
             .iter()
             .filter(|&&t| t == "prosody.timer.scheduled")

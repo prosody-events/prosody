@@ -92,7 +92,7 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
     };
     let router = LocalRouter::new().await?;
 
-    let consumer = Box::pin(ProsodyConsumer::<JsonCodec>::pipeline_consumer(
+    let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
         ConsumerSetup {
             consumer: &consumer_config,
             trigger_store: &common::create_cassandra_trigger_store_config(),
@@ -101,7 +101,7 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         pipeline_config,
         telemetry,
         handler,
-    ))
+    )
     .await?;
 
     // Send two messages with the same event ID

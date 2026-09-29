@@ -284,14 +284,15 @@ async fn main() -> Result<()> {
     // One shared absolute fire time lands every timer in the same instant, so
     // the fires dispatch concurrently across the runtime's worker threads.
     let fire_at = CompactDateTime::now()?.add_duration(CompactDuration::new(8))?;
-    Box::pin(client.subscribe(SpanProbe {
-        sender,
-        fire_at,
-        cart,
-        counts,
-        log,
-    }))
-    .await?;
+    client
+        .subscribe(SpanProbe {
+            sender,
+            fire_at,
+            cart,
+            counts,
+            log,
+        })
+        .await?;
 
     for i in 0..keys {
         let key = format!("k{i:03}");

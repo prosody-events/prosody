@@ -199,8 +199,8 @@ async fn test_timer_scheduled_time_accuracy() -> Result<()> {
             timer_event.time
         );
 
-        // Additional verification: timer should have triggered at the right
-        // wall-clock time
+        // Additional verification: timer should have triggered at the right wall-clock
+        // time
         let actual_trigger_time = CompactDateTime::now()?;
         let time_diff = actual_trigger_time
             .epoch_seconds()
@@ -365,12 +365,13 @@ async fn inline_replacement_fires_once_at_replacement_time() -> Result<()> {
         let (messages, mut msg_rx) = channel(16);
         let (replacement_time, mut replacement_time_rx) = channel(16);
         let (timer_fired, mut timer_rx) = channel(16);
-        Box::pin(client.subscribe(InlineReplacementHandler {
-            messages,
-            replacement_time,
-            timer_fired,
-        }))
-        .await?;
+        client
+            .subscribe(InlineReplacementHandler {
+                messages,
+                replacement_time,
+                timer_fired,
+            })
+            .await?;
 
         // Step 1: schedule at t+3s
         client
