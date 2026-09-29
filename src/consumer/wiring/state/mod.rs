@@ -216,9 +216,8 @@ where
 
 /// Builds the keyed-state provider for a Cassandra backend: the backend
 /// factory over the opened cache and the caller's Kafka loader, wrapped in the
-/// partition state provider. The caller opens every resource, so it can open
-/// them concurrently. The caller also owns the loader, so the pipeline can
-/// hand the same one to its message-defer middleware.
+/// partition state provider. The pipeline hands the same loader to its
+/// message-defer middleware.
 pub(in crate::consumer) fn cassandra_state_provider<C: Codec>(
     keyed_state: &KeyedStateInputs,
     dedup_provider: CassandraDeduplicationStoreProvider,

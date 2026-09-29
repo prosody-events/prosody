@@ -113,7 +113,8 @@ pub(crate) fn format_sql(template: &str, keyspace: &str, args: &[&str]) -> Strin
 ///
 /// # Requirements
 ///
-/// None - the macro is fully self-contained and handles all necessary imports.
+/// The invoking crate must depend on `educe`, `paste`, `scylla`, and `tokio`
+/// with the `macros` feature.
 #[macro_export]
 macro_rules! cassandra_queries {
     (
@@ -149,8 +150,9 @@ macro_rules! cassandra_queries {
                 session: &::scylla::client::session::Session,
                 keyspace: &str,
             ) -> ::std::result::Result<Self, $crate::cassandra::errors::CassandraStoreError> {
-                // Preparation runs once per client. The heap holds the joined
-                // futures, so every caller's future stays small.
+                // The fixed statement count bounds the join. The box keeps
+                // every constructor's future small. AGENTS.md authorizes it,
+                // because stores prepare only at construction.
                 let ($($field,)*) = ::std::boxed::Box::pin(async {
                     ::paste::paste! {
                         ::tokio::try_join!($([<prepare_ $field>](session, keyspace)),*)
