@@ -6,17 +6,20 @@
 //! for them. Creates run before deletes: a create lets an assignment start
 //! caching, and a delete only reclaims disk.
 //!
-//! The task stops when the last client clone drops and leaves any queued
-//! deletes undone. fjall removes the whole database directory when the last
-//! handle to the database drops.
+//! The task holds only weak senders. It stops after the client and every
+//! assignment cache are gone, then drops the database on a blocking thread.
+//! fjall removes the whole database directory when that last handle drops.
 
 use super::{FjallCellCache, io};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use std::sync::{Arc, OnceLock, Weak};
 use tokio::select;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{
+    UnboundedReceiver, UnboundedSender, WeakUnboundedSender, unbounded_channel,
+};
 #[cfg(test)]
 use tokio::sync::oneshot;
+use tokio::task::spawn_blocking;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -93,8 +96,8 @@ impl Drop for Retire {
 }
 
 /// Starts the lifecycle task for `database` and returns its create and delete
-/// queues. The task creates each keyspace with `options` and stops when the
-/// returned create sender drops. The caller runs inside a Tokio runtime.
+/// queues. The task creates each keyspace with `options`. The caller runs
+/// inside a Tokio runtime.
 pub(super) fn spawn(
     database: Database,
     options: KeyspaceCreateOptions,
@@ -106,28 +109,27 @@ pub(super) fn spawn(
         options,
         create_rx,
         retire_rx,
-        retires.clone(),
+        retires.downgrade(),
     ));
     (creates, retires)
 }
 
 /// Runs queued creates and deletes, one at a time and creates first. Returns
-/// when the create queue closes. The task holds a delete sender, so the delete
-/// queue never closes first.
+/// after the client and every assignment cache are gone and both queues are
+/// empty. It then drops the last database handle on a blocking thread.
 async fn run(
     database: Database,
     options: KeyspaceCreateOptions,
     mut creates: UnboundedReceiver<Pending>,
     mut retires: UnboundedReceiver<Retirement>,
-    retire_queue: UnboundedSender<Retirement>,
+    retire_queue: WeakUnboundedSender<Retirement>,
 ) {
     loop {
         select! {
             biased;
-            slot = creates.recv() => match slot {
-                Some(slot) => create(&database, &options, slot, &retire_queue).await,
-                None => return,
-            },
+            Some(slot) = creates.recv() => {
+                create(&database, &options, slot, &retire_queue).await;
+            }
             Some(work) = retires.recv() => match work {
                 Retirement::Keyspace(keyspace) => delete(&database, keyspace).await,
                 #[cfg(test)]
@@ -135,10 +137,17 @@ async fn run(
                     let _ = done.send(());
                 }
                 #[cfg(test)]
-                barrier @ Retirement::Barrier(_) => drop(retire_queue.send(barrier)),
+                barrier @ Retirement::Barrier(_) => {
+                    if let Some(queue) = retire_queue.upgrade() {
+                        drop(queue.send(barrier));
+                    }
+                }
             },
+            else => break,
         }
     }
+    // The last database handle removes the whole directory when it drops.
+    spawn_blocking(move || drop(database));
 }
 
 /// Creates the keyspace for `slot` and fills the slot. A slot whose assignment
@@ -149,11 +158,11 @@ async fn create(
     database: &Database,
     options: &KeyspaceCreateOptions,
     slot: Pending,
-    retire_queue: &UnboundedSender<Retirement>,
+    retire_queue: &WeakUnboundedSender<Retirement>,
 ) {
-    if slot.strong_count() == 0 {
+    let Some(queue) = retire_queue.upgrade().filter(|_| slot.strong_count() > 0) else {
         return;
-    }
+    };
     let opened = database.clone();
     let options = options.clone();
     let created = io::blocking(move || {
@@ -167,7 +176,7 @@ async fn create(
         Ok(keyspace) => {
             let retire = Retire {
                 keyspace: Some(keyspace.clone()),
-                queue: retire_queue.clone(),
+                queue,
             };
             let cache = FjallCellCache::for_keyspace(database.clone(), keyspace, retire);
             if let Some(slot) = slot.upgrade() {

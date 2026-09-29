@@ -4,8 +4,8 @@
 //! `cache_dir`. Each partition assignment gets a [`CacheSlot`] from
 //! [`FjallClient::slot`]. The lifecycle task creates the assignment's
 //! keyspace in the background and fills the slot. When the assignment ends,
-//! the last cache handle queues the keyspace for deletion. The task stops when
-//! the last client clone drops.
+//! the last cache handle queues the keyspace for deletion. The task stops after
+//! the client and every assignment cache are gone.
 //!
 //! Each keyspace takes a fresh v4 UUID name, so a new keyspace starts empty and
 //! no assignment can open another's data. The keyspace holds the
@@ -15,9 +15,7 @@
 //! collection evidence are the recovery source.
 
 use super::CacheSlot;
-#[cfg(test)]
-use super::lifecycle::Retirement;
-use super::lifecycle::{self, Pending};
+use super::lifecycle::{self, Pending, Retirement};
 use crate::ByteSize;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::config::KeyedStateConfiguration;
@@ -30,15 +28,15 @@ use tokio::sync::oneshot::{self, error::RecvError};
 use tokio::task::{JoinError, spawn_blocking};
 use uuid::Uuid;
 
-/// A fjall database and the create queue of its lifecycle task.
+/// A fjall database and the queues of its lifecycle task.
 ///
-/// Clones share the database and the task. The task stops when the last clone
-/// drops.
+/// Clones share the database and the task.
 #[derive(Clone)]
 pub(crate) struct FjallClient {
     creates: UnboundedSender<Pending>,
-    #[cfg(test)]
-    retires: UnboundedSender<Retirement>,
+    /// Keeps the delete queue open while the client lives. The lifecycle task
+    /// gives each new keyspace a sender from it.
+    _retires: UnboundedSender<Retirement>,
     #[cfg(test)]
     database: Database,
 }
@@ -63,12 +61,9 @@ impl FjallClient {
 
         let (creates, retires) =
             lifecycle::spawn(database.clone(), keyspace_options(config.memtable_size));
-        #[cfg(not(test))]
-        drop(retires);
         Ok(Self {
             creates,
-            #[cfg(test)]
-            retires,
+            _retires: retires,
             #[cfg(test)]
             database,
         })
@@ -97,8 +92,11 @@ impl FjallClient {
     /// Returns [`RecvError`] when the lifecycle task has stopped.
     #[cfg(test)]
     pub(crate) async fn settled(&self) -> Result<(), RecvError> {
+        let Self {
+            _retires: retires, ..
+        } = self;
         let (done, settled) = oneshot::channel();
-        drop(self.retires.send(Retirement::Barrier(done)));
+        drop(retires.send(Retirement::Barrier(done)));
         settled.await
     }
 }
