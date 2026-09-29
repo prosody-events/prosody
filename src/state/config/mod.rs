@@ -74,9 +74,9 @@ const DEFAULT_READER_CACHE_SIZE: ByteSize = match NonZeroU64::new(1_048_576) {
 pub struct KeyedStateConfiguration {
     /// Directory that holds the local keyed-state caches.
     ///
-    /// Each client opens its cache in a fresh subdirectory, and the cache
-    /// removes that subdirectory when the client drops. So clients can share
-    /// the directory, and the mount needs no persistence. Production
+    /// Each consumer opens its cache in a fresh subdirectory, and the cache
+    /// removes that subdirectory when the consumer drops. So consumers can
+    /// share the directory, and the mount needs no persistence. Production
     /// deployments **must** set it to a mounted path, for example a
     /// Kubernetes `emptyDir`. Defaults to `<temp>/prosody/keyed-state`.
     ///

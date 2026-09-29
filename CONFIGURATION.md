@@ -104,7 +104,7 @@ reloads and keyed-state message resolution.
 
 | Environment Variable                 | Description                                        | Default                  |
 |--------------------------------------|----------------------------------------------------|--------------------------|
-| `PROSODY_STATE_CACHE_DIR`            | Directory that holds the local keyed-state caches. Each client uses a fresh subdirectory and removes it when the client drops, so the mount needs no persistence. Production deployments **must** set it to a mounted path (e.g. a Kubernetes `emptyDir`). | `<temp>/prosody/keyed-state` |
+| `PROSODY_STATE_CACHE_DIR`            | Directory that holds the local keyed-state caches. Each consumer uses a fresh subdirectory and removes it when the consumer drops, so the mount needs no persistence. Production deployments **must** set it to a mounted path (e.g. a Kubernetes `emptyDir`). | `<temp>/prosody/keyed-state` |
 | `PROSODY_STATE_OWNED_CACHE_SIZE`     | Capacity of the owning keyed-state cache. Accepts sizes such as `64 MiB` or `500 MB`. | storage-engine default |
 | `PROSODY_STATE_MEMTABLE_SIZE`        | In-memory write size at which the local keyed-state cache flushes a partition to disk. Each assigned partition can hold this much, so memory use scales with the number of partitions. Accepts sizes such as `16 MiB`. | storage-engine default (64 MiB) |
 | `PROSODY_STATE_READ_CACHE_SIZE` | Capacity of the read-only client's shared read-through cache. Accepts sizes such as `1 MiB`. | `PROSODY_STATE_OWNED_CACHE_SIZE` when set; otherwise 1 MiB |
