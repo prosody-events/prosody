@@ -64,7 +64,9 @@ impl Arbitrary for Trace {
 /// holds a keyspace, the database holds exactly those keyspaces, and no
 /// keyspace name serves two assignments. Revokes often land before the create
 /// runs, so the trace covers creates for assignments that already ended. The
-/// lifecycle task runs creates first, and this model does the same.
+/// lifecycle task runs creates first, and this model does the same. Each
+/// iteration first deletes the keyspaces that a failed iteration left, so a
+/// shrunk trace starts from an empty database.
 #[test]
 fn prop_keyspaces_track_live_slots() {
     async fn check(trace: Trace) -> Result<bool> {
@@ -76,6 +78,9 @@ fn prop_keyspaces_track_live_slots() {
             })
             .await?;
         let options = keyspace_options(None);
+        for name in keyspace_names(database) {
+            database.delete_keyspace(database.keyspace(&name, || options.clone())?)?;
+        }
         let (queue, mut retired) = unbounded_channel::<Keyspace>();
         let mut creates = Vec::new();
         let mut live: Vec<(usize, CacheSlot)> = Vec::new();
