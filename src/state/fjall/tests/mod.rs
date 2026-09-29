@@ -10,9 +10,10 @@
 
 use super::codec::cell_key;
 use super::test_db;
-use super::{CacheRead, Clock, FjallCellCache, FjallClient, FjallClientError};
-use crate::Topic;
+use super::{CacheRead, CacheSlot, Clock, FjallCellCache, FjallClient, MarkerCheckSet};
+use crate::Key;
 use crate::state::CollectionId;
+use crate::state::backend::AdmissionChecks;
 use crate::state::cached::Cached;
 use crate::state::cell::{Committed, Presence, Values};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
@@ -24,15 +25,16 @@ use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Report, Result, eyre};
-use fjall::{Database, KeyspaceCreateOptions};
+use fjall::Database;
 use quickcheck::{QuickCheck, TestResult};
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use uuid::Uuid;
 
+mod client;
 mod reads;
-mod workspace;
 
 /// The section-0 cell at coordinate byte `b`.
 fn batch_cell(b: u8) -> CellKey {
@@ -96,11 +98,11 @@ fn stored_cells_are_raw_tagged_payload_with_expiry() -> Result<()> {
     expected.extend_from_slice(&EXPIRY.to_be_bytes());
     expected.extend_from_slice(payload);
 
-    let (database, cache_partition, index_partition) = test_db::keyspace_pair("value_cache")?;
+    let (database, cache_partition) = test_db::keyspace("value_cache")?;
     let c = fresh_collection("raw")?;
     let cell = value_cell();
 
-    let cache = FjallCellCache::new(database, cache_partition.clone(), index_partition);
+    let cache = FjallCellCache::new(database, cache_partition.clone(), Clock::Wall);
     TEST_RUNTIME.block_on(cache.put::<Values>(
         &c,
         cell.as_ref(),
@@ -123,8 +125,8 @@ fn stored_cells_are_raw_tagged_payload_with_expiry() -> Result<()> {
 /// section: seeded past two hop budgets so the walk re-seeks repeatedly, with
 /// a sibling section and a second collection sharing the keyspace, a delete of
 /// section 0 with a non-empty exclusion set removes every non-excluded
-/// section-0 entry and leaves the excluded keys, the sibling section, and the
-/// other collection untouched.
+/// section-0 entry and leaves the excluded keys, the sibling section, the
+/// other collection, and the admission markers in the same keyspace untouched.
 #[test]
 fn delete_section_hops_delete_exactly_the_section() -> Result<()> {
     // > 2 hops of rows so the re-seek arithmetic is exercised.
@@ -139,8 +141,15 @@ fn delete_section_hops_delete_exactly_the_section() -> Result<()> {
         ),
     };
     let payload = Committed::<Values>::new(Some(Bytes::from_static(b"v")));
+    let checks = MarkerCheckSet::from(CacheSlot::from(cache.clone()));
+    let keys: Vec<Key> = (0_u8..8)
+        .map(|i| Key::from(format!("hop-del-key-{i}")))
+        .collect();
 
     TEST_RUNTIME.block_on(async {
+        for key in &keys {
+            checks.mark(key).await?;
+        }
         for i in 0..total {
             cache
                 .put::<Values>(&c, cell_in(0, i).as_ref(), payload.clone(), 0)
@@ -184,7 +193,62 @@ fn delete_section_hops_delete_exactly_the_section() -> Result<()> {
             ),
             "the sibling collection survives"
         );
+        for key in &keys {
+            assert!(
+                checks.contains(key).await?,
+                "the section delete keeps the marker for {key}"
+            );
+        }
         Ok::<_, Report>(())
     })?;
     Ok(())
+}
+
+/// Admission proofs follow the slot. An empty slot holds no proof, and marks
+/// made before the slot attaches are lost. After it attaches, the check set
+/// holds exactly the keys marked and not since unmarked.
+#[test]
+fn prop_marker_checks_follow_the_slot() {
+    const KEYS: u8 = 4;
+
+    async fn check(ops: Vec<(bool, u8)>, attach: usize) -> Result<bool> {
+        let cache = test_db::cache("marker_checks")?;
+        let slot = CacheSlot::default();
+        let checks = MarkerCheckSet::from(slot.clone());
+        let run = Uuid::new_v4();
+        let keys: Vec<Key> = (0..KEYS).map(|i| Key::from(format!("{run}-{i}"))).collect();
+        let mut marked = BTreeSet::new();
+
+        for (index, (mark, key)) in ops.into_iter().enumerate() {
+            if index == attach {
+                slot.attach(cache.clone());
+            }
+            let key = key % KEYS;
+            if mark {
+                checks.mark(&keys[usize::from(key)]).await?;
+                if slot.attached().is_some() {
+                    marked.insert(key);
+                }
+            } else {
+                checks.unmark(&keys[usize::from(key)]).await?;
+                marked.remove(&key);
+            }
+            for (index, key) in (0..KEYS).zip(&keys) {
+                if checks.contains(key).await? != marked.contains(&index) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn prop(ops: Vec<(bool, u8)>, attach: usize) -> TestResult {
+        let attach = attach % (ops.len() + 1);
+        match TEST_RUNTIME.block_on(check(ops, attach)) {
+            Ok(passed) => TestResult::from_bool(passed),
+            Err(error) => TestResult::error(format!("{error:?}")),
+        }
+    }
+
+    QuickCheck::new().quickcheck(prop as fn(Vec<(bool, u8)>, usize) -> TestResult);
 }

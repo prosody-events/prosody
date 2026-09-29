@@ -9,7 +9,6 @@ use bytes::Bytes;
 use fjall::{Database, Keyspace, OwnedWriteBatch, Slice};
 use smallvec::SmallVec;
 use std::collections::HashSet;
-use std::future::Future;
 use std::ops::Bound;
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
@@ -17,7 +16,7 @@ use tracing::warn;
 
 /// Rows examined per blocking hop of a chunked
 /// [`delete_section`] walk: each hop collects
-/// at most this many keys in one [`spawn_blocking`], deletes them in one
+/// at most this many keys in one [`blocking`] hop, deletes them in one
 /// bounded write batch, then re-seeks from the last key it saw. A section
 /// delete therefore holds O(hop) keys in RAM — never the whole section (the
 /// bounded-RAM invariant) — while the synchronous fjall range guard still
@@ -27,7 +26,7 @@ pub(super) const SCAN_HOP_ROWS: usize = 256;
 /// Deletes the rows under `prefix` except `excluded`, in hops of at most
 /// [`SCAN_HOP_ROWS`] keys.
 ///
-/// Each hop runs in [`spawn_blocking`], deletes its keys in one bounded batch,
+/// Each hop runs in [`blocking`], deletes its keys in one bounded batch,
 /// and resumes after the last examined key. The walk never holds the whole
 /// section in RAM. Deleted keys disappear, so a retry can repeat the walk.
 pub(super) async fn delete_section(
@@ -42,7 +41,7 @@ pub(super) async fn delete_section(
         let hop_database = database.clone();
         let hop_excluded = excluded.clone();
         let hop_lo = lo;
-        let resume = spawn_blocking(move || -> fjall::Result<Option<Vec<u8>>> {
+        let resume = blocking(move || -> fjall::Result<Option<Vec<u8>>> {
             // A `Vec`: bounded by `SCAN_HOP_ROWS` and always spilling past
             // any small inline on this recovery/must-succeed-delete path.
             let mut doomed: Vec<Vec<u8>> = Vec::new();
@@ -71,7 +70,7 @@ pub(super) async fn delete_section(
             batch.commit()?;
             Ok(resume)
         })
-        .await??;
+        .await?;
         match resume {
             // The hop stopped on its budget; re-seek just past the last
             // examined key.
@@ -87,24 +86,21 @@ pub(super) async fn delete_section(
 /// [`FjallCellCache::commit_batch`](super::FjallCellCache::commit_batch), which
 /// reads stage expiries inside its own closure, and the hopping
 /// [`delete_section`].
-pub(super) fn run_batch<F>(
+pub(super) async fn run_batch<F>(
     database: Database,
     handle: Keyspace,
     capacity: usize,
     fill: F,
-) -> impl Future<Output = Result<(), FjallCellCacheError>> + Send + use<F>
+) -> Result<(), FjallCellCacheError>
 where
     F: FnOnce(&mut OwnedWriteBatch, &Keyspace) -> fjall::Result<()> + Send + 'static,
 {
-    let task = spawn_blocking(move || {
+    blocking(move || {
         let mut batch = OwnedWriteBatch::with_capacity(database, capacity);
         fill(&mut batch, &handle)?;
         batch.commit()
-    });
-    async move {
-        task.await??;
-        Ok(())
-    }
+    })
+    .await
 }
 
 /// Borrows the owned payload for frame encoding.
@@ -117,6 +113,13 @@ pub(super) fn encode_frame(entry: &CacheEntry<Bytes>, expiry: u64) -> Bytes {
     codec::encode_frame(borrowed, expiry)
 }
 
+/// Runs `op` on a blocking thread.
+pub(super) async fn blocking<T: Send + 'static>(
+    op: impl FnOnce() -> fjall::Result<T> + Send + 'static,
+) -> Result<T, FjallCellCacheError> {
+    Ok(spawn_blocking(op).await??)
+}
+
 /// Reads the raw cell at `key`, or `None` when the key is absent — one
 /// blocking hop. Generic over the key so a variable-length `SmallVec` cell key
 /// and a fixed-size `[u8; N]` index key both read without a bridging copy.
@@ -125,7 +128,7 @@ pub(super) async fn read_cell(
     key: impl AsRef<[u8]> + Send + 'static,
 ) -> Result<Option<Slice>, FjallCellCacheError> {
     let cache = cache.clone();
-    Ok(spawn_blocking(move || cache.get(key)).await??)
+    blocking(move || cache.get(key)).await
 }
 
 /// Writes `cell` at `key`, overwriting any existing cell — one blocking hop.
@@ -137,8 +140,7 @@ pub(super) async fn write_cell(
     cell: Bytes,
 ) -> Result<(), FjallCellCacheError> {
     let cache = cache.clone();
-    spawn_blocking(move || cache.insert(key.as_ref(), cell.as_ref())).await??;
-    Ok(())
+    blocking(move || cache.insert(key.as_ref(), cell.as_ref())).await
 }
 
 /// Whether an absolute `expiry` (millis; `0` = never) has passed at `now`.

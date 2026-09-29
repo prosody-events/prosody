@@ -1,8 +1,9 @@
 //! Keys and frames for the fjall cell cache.
 //!
-//! A key contains a 16-byte collection hash, one section byte, and the
+//! A cell key contains a 16-byte collection hash, one section byte, and the
 //! coordinate bytes. The section and coordinate preserve order within a
-//! collection.
+//! collection. An admission marker key is a 16-byte key hash; see
+//! [`marker_key`].
 //!
 //! The collection hash uses `xxh3_128` over the collection identity.
 //! The input starts with `segment_id` and the one-byte `state_type`.
@@ -20,18 +21,20 @@
 //! applies its projection and checks the expiry. [`frame_expiry`] reads the
 //! expiry without a projection.
 //!
-//! The assignment owns these frames. Its workspace removes them at revocation.
+//! The assignment's keyspace holds these frames. Revocation deletes the
+//! keyspace.
 
 use super::error::FjallCellCacheError;
+use crate::Key;
 use crate::state::CollectionId;
 use crate::state::cell::CacheEntry;
 use crate::state::cell_key::{CellRef, Section};
 use bytes::Bytes;
 use smallvec::SmallVec;
-use xxhash_rust::xxh3::Xxh3;
+use xxhash_rust::xxh3::{Xxh3, xxh3_128};
 
-/// Length of the collection hash prefix that leads every fjall key (cell and
-/// index alike).
+/// Length of the collection hash that leads every cell key, and of every
+/// marker key.
 const COLLECTION_PREFIX_LEN: usize = 16;
 
 /// Tag byte for "known absent" entries.
@@ -108,10 +111,11 @@ pub(super) fn collection_prefix(id: &CollectionId) -> [u8; COLLECTION_PREFIX_LEN
     // arbitrary bytes) — so two distinct collections could share a buffer.
     //
     // Streamed through `Xxh3` (seed 0, identical to `xxh3_128`) so no transient
-    // buffer is allocated. The byte sequence fed here is load-bearing: it is the
-    // durable cache key, so the field order and the big-endian `u64` length
-    // prefixes must stay byte-for-byte what the buffer build produced. Never
-    // substitute `write_u64`/`write_u32` — those are native-endian.
+    // buffer is allocated. The byte sequence fed here is load-bearing: it is
+    // the durable cache key, so the field order and the big-endian `u64`
+    // length prefixes must stay byte-for-byte what the buffer build
+    // produced. Never substitute `write_u64`/`write_u32` — those are
+    // native-endian.
     let mut hasher = Xxh3::new();
     hasher.update(segment_bytes);
     hasher.update(&[state_type_byte]);
@@ -121,6 +125,17 @@ pub(super) fn collection_prefix(id: &CollectionId) -> [u8; COLLECTION_PREFIX_LEN
     hasher.update(name_bytes);
 
     hasher.digest128().to_be_bytes()
+}
+
+/// Returns the admission marker key for `key`: its xxh3-128 hash.
+///
+/// A marker key is 16 bytes and every cell key is at least
+/// [`SECTION_PREFIX_LEN`] bytes. So a marker key never equals a cell key, and
+/// no section scan reaches one. Length separates the two kinds because every
+/// section byte belongs to some collection.
+#[must_use]
+pub(super) fn marker_key(key: &Key) -> [u8; COLLECTION_PREFIX_LEN] {
+    xxh3_128(key.as_bytes()).to_be_bytes()
 }
 
 /// Encodes a cache entry with its absolute expiry. Zero means no expiry.

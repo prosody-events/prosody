@@ -214,8 +214,7 @@ fn get_batch_classifies_hits_misses_expiry_and_errors() -> Result<()> {
 /// A corrupt position does not change its neighbors. A fill repairs it.
 async fn check_corrupt_repair(cache: &FjallCellCache, c: &CollectionId) -> Result<()> {
     cache
-        .inner
-        .handle()
+        .keyspace()
         .insert(cell_key(c, batch_cell(4).as_ref()).as_slice(), [0x05; 9])?;
     assert!(matches!(
         cache.get::<Values>(c, batch_cell(4).as_ref()).await?,
@@ -241,8 +240,7 @@ async fn check_corrupt_repair(cache: &FjallCellCache, c: &CollectionId) -> Resul
         CacheRead::Hit((value, _)) if value.get().is_none()
     ));
     cache
-        .inner
-        .handle()
+        .keyspace()
         .insert(cell_key(c, batch_cell(4).as_ref()).as_slice(), [0x05; 9])?;
     CellRead::<Presence>::read_many(&cached, c, Section::new(0), &batch_of([0, 4])?.as_ref())
         .await?;

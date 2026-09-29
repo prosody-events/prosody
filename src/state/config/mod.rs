@@ -13,7 +13,6 @@ use std::env;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use uuid::Uuid;
 use validator::{Validate, ValidationError};
 
 /// Environment variable for the local keyed-state cache directory.
@@ -21,6 +20,9 @@ const STATE_CACHE_DIR_ENV: &str = "PROSODY_STATE_CACHE_DIR";
 
 /// Environment variable for the owning keyed-state cache capacity.
 const STATE_OWNED_CACHE_SIZE_ENV: &str = "PROSODY_STATE_OWNED_CACHE_SIZE";
+
+/// Environment variable for the per-partition memtable size.
+const STATE_MEMTABLE_SIZE_ENV: &str = "PROSODY_STATE_MEMTABLE_SIZE";
 
 /// Environment variable for the reader-side read-through cache capacity, in
 /// bytes.
@@ -70,14 +72,13 @@ const DEFAULT_READER_CACHE_SIZE: ByteSize = match NonZeroU64::new(1_048_576) {
 /// returns the parse error. Do not add a `Default` impl.
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct KeyedStateConfiguration {
-    /// Disk workspace for the local keyed-state cache.
+    /// Directory that holds the local keyed-state caches.
     ///
-    /// Production deployments mount this (e.g. a Kubernetes `emptyDir`) and
-    /// **must** set it — the cache is wiped on process restart, so the mount
-    /// needs no persistence. Each live client needs its own directory because
-    /// it is locked exclusively. Defaults to a per-client temporary directory
-    /// so unconfigured consumers (and consumers that never register state)
-    /// work out of the box, even several in one process.
+    /// Each consumer opens its cache in a fresh subdirectory, and the cache
+    /// removes that subdirectory when the consumer drops. So consumers can
+    /// share the directory, and the mount needs no persistence. Production
+    /// deployments **must** set it to a mounted path, for example a
+    /// Kubernetes `emptyDir`. Defaults to `<temp>/prosody/keyed-state`.
     ///
     /// Environment variable: `PROSODY_STATE_CACHE_DIR`
     #[builder(default = "from_env_with_fallback(STATE_CACHE_DIR_ENV, default_cache_dir())?")]
@@ -88,14 +89,29 @@ pub struct KeyedStateConfiguration {
     ///
     /// `None` (the default) leaves the storage engine to choose its own
     /// default. `Some(bytes)` sets the capacity of the one cache this consumer
-    /// opens at `cache_dir`; it is shared by every partition, never multiplied
-    /// per partition.
+    /// opens under `cache_dir`; it is shared by every partition, never
+    /// multiplied per partition.
     ///
     /// Environment variable: `PROSODY_STATE_OWNED_CACHE_SIZE`. Accepts a
     /// positive human-readable byte size such as `64 MiB` or `500 MB`. A bare
     /// number is interpreted as bytes.
     #[builder(default = "from_option_env(STATE_OWNED_CACHE_SIZE_ENV)?")]
     pub owned_cache_size: Option<ByteSize>,
+
+    /// Size at which the local keyed-state cache flushes a partition's
+    /// in-memory writes to disk.
+    ///
+    /// Each assigned partition holds up to this many bytes in memory, so
+    /// memory use scales with the number of assigned partitions. Flushes
+    /// also start when the storage engine's write-ahead log grows too large.
+    /// A smaller size uses less memory but writes and compacts more files.
+    /// `None` (the default) uses the storage engine's default of 64 MiB.
+    ///
+    /// Environment variable: `PROSODY_STATE_MEMTABLE_SIZE`. Accepts a
+    /// positive human-readable byte size such as `16 MiB`. A bare number is
+    /// interpreted as bytes.
+    #[builder(default = "from_option_env(STATE_MEMTABLE_SIZE_ENV)?")]
+    pub memtable_size: Option<ByteSize>,
 
     /// Byte budget for the reader-side read-through cache. The high-level
     /// client sizes this cache when it composes standalone readers.
@@ -242,16 +258,10 @@ fn validate_publication(
     Ok(())
 }
 
-/// Per-client fallback keyed-state cache workspace, used when
-/// [`STATE_CACHE_DIR_ENV`] is unset: `<temp>/prosody/keyed-state/<uuid>`. Wiped
-/// on restart, so it needs no persistence. The UUID leaf gives every client its
-/// own database. The directory is locked exclusively per live client, so two
-/// default-config clients in one process never contend.
+/// Fallback keyed-state cache directory, used when [`STATE_CACHE_DIR_ENV`] is
+/// unset.
 fn default_cache_dir() -> PathBuf {
-    env::temp_dir()
-        .join("prosody")
-        .join("keyed-state")
-        .join(Uuid::new_v4().simple().to_string())
+    env::temp_dir().join("prosody").join("keyed-state")
 }
 
 fn validate_cache_dir(cache_dir: &Path) -> Result<(), ValidationError> {

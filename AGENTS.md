@@ -74,7 +74,7 @@ aspirations — perform each one; do not merely agree with it:
   by user key or collection must have a fixed capacity bound — at that scale
   even ~100 bytes per key×collection is 10–60 GiB. Acceptable homes for keyed
   state: fjall (RAM = block cache + memtables; data spills to the
-  assignment-scoped disk workspace) and a capacity-bounded `quick_cache`. An
+  assignment's keyspace on disk) and a capacity-bounded `quick_cache`. An
   insert-only `scc` map/set keyed by key or collection is a defect regardless
   of entry size. The former in-RAM `MarkerMemo` checked set was this bug;
   `MarkerCheckSet` is its disk-backed fix. Every in-memory map

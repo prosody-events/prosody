@@ -17,7 +17,7 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
         cell: CellRef<'a>,
     ) -> Result<Durable<P>, Self::Error> {
         let started = Instant::now();
-        if self.fjall.is_disabled() {
+        let Some(fjall) = self.slot.active() else {
             let loaded = CellRead::<P>::read(&self.lower, collection, cell).await;
             self.metrics.point(
                 P::NAME,
@@ -27,8 +27,8 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
                 &loaded,
             );
             return loaded;
-        }
-        let cache_result = match self.fjall.get::<P>(collection, cell).await {
+        };
+        let cache_result = match fjall.get::<P>(collection, cell).await {
             Ok(CacheRead::Hit(hit)) => {
                 let loaded = Ok(hit);
                 self.metrics
@@ -50,11 +50,10 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
                 return loaded;
             }
         };
-        let stamped_at = self.fjall.clock().now_ms();
+        let stamped_at = fjall.clock().now_ms();
         let loaded = async {
             let (committed, remaining) = CellRead::<P>::read(&self.lower, collection, cell).await?;
-            if let Err(error) = self
-                .fjall
+            if let Err(error) = fjall
                 .put::<P>(
                     collection,
                     cell,
@@ -84,7 +83,7 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
         batch: &'a ReadBatch<'_>,
     ) -> Result<CacheBatch<P>, Self::Error> {
         let started = Instant::now();
-        if self.fjall.is_disabled() {
+        let Some(fjall) = self.slot.active() else {
             let loaded = CellRead::<P>::read_many(&self.lower, collection, section, batch).await;
             self.metrics.batch(
                 batch.len(),
@@ -95,8 +94,8 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
                 &loaded,
             );
             return loaded;
-        }
-        let probes = match self.fjall.get_batch::<P>(collection, section, batch).await {
+        };
+        let probes = match fjall.get_batch::<P>(collection, section, batch).await {
             Ok(probes) => {
                 let hits = probes.try_map(|probe| match probe {
                     CacheRead::Hit(hit) => Ok(hit.clone()),
@@ -132,7 +131,7 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
                 return loaded;
             }
         };
-        let stamped_at = self.fjall.clock().now_ms();
+        let stamped_at = fjall.clock().now_ms();
         let loaded = async {
             let filled = CellRead::<P>::read_many(&self.lower, collection, section, batch).await?;
             let projected = batch
@@ -150,7 +149,7 @@ impl<L: CellRead<P>, P: Projection> CellRead<P> for Cached<L> {
                         expiry_at(stamped_at, *remaining),
                     )
                 });
-            if let Err(error) = self.fjall.put_batch::<P>(collection, projected).await {
+            if let Err(error) = fjall.put_batch::<P>(collection, projected).await {
                 warn_skip("populate batch", &error);
                 self.metrics.cache_error("get_many", "fill");
             }

@@ -8,15 +8,14 @@
 //! answers, and corrupt frames. [`Cached`](crate::state::cached::Cached)
 //! supplies durable reads when this cache cannot answer.
 //!
-//! The workspace also stores provisional cells and completed admission checks.
-//! All components share one cache-disabled state.
+//! The keyspace also stores the assignment's admission markers. The cache and
+//! its markers share one cache-disabled state.
 //!
-//! # Workspace ownership
+//! # Keyspace ownership
 //!
-//! [`FjallCellCache::for_workspace`] retains its [`FjallWorkspace`] for the
-//! partition assignment. The workspace removes its keyspace when the assignment
-//! ends. Test caches from [`FjallCellCache::new`] use a shared database without
-//! an owned workspace.
+//! A production cache owns its assignment's keyspace. When the last clone
+//! drops, the keyspace is queued for deletion; see [`CacheSlot`]. Test caches
+//! from [`FjallCellCache::new`] use a shared keyspace and delete nothing.
 //!
 //! # Expiry and storage
 //!
@@ -31,13 +30,14 @@
 use crate::state::cell_key::{CellKey, CellRef, Section};
 use crate::state::store::{Answers, CellBuffer, ReadBatch};
 mod checks;
+mod client;
 mod clock;
 mod codec;
 mod error;
 #[cfg(test)]
 mod faults;
 mod io;
-mod workspace;
+mod lifecycle;
 
 #[cfg(test)]
 pub(crate) mod test_db;
@@ -45,26 +45,38 @@ pub(crate) mod test_db;
 mod tests;
 
 pub(crate) use checks::MarkerCheckSet;
+pub(crate) use client::FjallClient;
 pub(crate) use clock::Clock;
 pub(crate) use error::FjallCellCacheError;
 #[cfg(test)]
 pub(crate) use faults::Faults;
-#[cfg(test)]
-pub(crate) use workspace::FjallClientError;
-use workspace::Inner;
-pub(crate) use workspace::{FjallClient, FjallWorkspace};
+pub(crate) use lifecycle::CacheSlot;
+use lifecycle::Retire;
 
 use crate::state::CollectionId;
 use crate::state::cell::{Committed, Projection, ProvisionalWrite, Values};
 use crate::state::store::Durable;
 use bytes::Bytes;
 use educe::Educe;
-#[cfg(test)]
 use fjall::{Database, Keyspace};
+use opentelemetry::global::meter;
+use opentelemetry::metrics::Counter;
 use smallvec::SmallVec;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use tokio::task::spawn_blocking;
+use tracing::warn;
+
+/// Assignments that disabled their cell cache after a repair failure.
+///
+/// [`FjallCellCache::disable`] increments this counter once per assignment.
+static CACHE_DISABLED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    meter("prosody")
+        .u64_counter("prosody.state.cell.cache.disabled_assignments")
+        .with_description("Keyed-state assignments that disabled their cell cache")
+        .with_unit("{assignment}")
+        .build()
+});
 
 /// The four-state result of a [`FjallCellCache::get`].
 #[derive(Clone, Debug)]
@@ -85,79 +97,43 @@ pub(crate) enum CacheRead<P: Projection = Values> {
 #[educe(Debug)]
 pub(crate) struct FjallCellCache {
     #[educe(Debug(ignore))]
-    inner: Arc<Inner>,
+    database: Database,
+    #[educe(Debug(ignore))]
+    keyspace: Keyspace,
     clock: Clock,
-    /// The cache-disabled state for all workspace handles.
+    /// The cache-disabled state shared by every clone.
     #[educe(Debug(ignore))]
     disabled: Arc<AtomicBool>,
     /// Test-only fault seams shared by every clone.
     #[cfg(test)]
     #[educe(Debug(ignore))]
     faults: Faults,
+    /// Queues the keyspace for deletion when the last clone drops. `None` only
+    /// for test caches. Declared after `keyspace`, so that handle drops first.
+    #[educe(Debug(ignore))]
+    _retire: Option<Arc<Retire>>,
 }
 
 impl FjallCellCache {
-    /// Builds a cache over opened `cache` + `index` `Keyspace`s and their
-    /// owning `Database`, owning no workspace.
-    ///
-    /// The caller owns the database the handles belong to and is responsible
-    /// for keeping them alive for the cache's lifetime. Used by tests;
-    /// production uses [`Self::for_workspace`], which owns the workspace.
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) fn new(database: Database, cache: Keyspace, index: Keyspace) -> Self {
-        Self::from_parts(
-            Inner::Bare {
-                database,
-                cache,
-                index,
-            },
-            Clock::Wall,
-        )
-    }
-
-    /// Builds a bare cache over `cache` + `index` driven by a test-controlled
-    /// [`Clock`], so a TTL-expiry property can advance time past a stamped
-    /// expiry deterministically.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn with_clock(
-        database: Database,
-        cache: Keyspace,
-        index: Keyspace,
-        clock: Clock,
-    ) -> Self {
-        Self::from_parts(
-            Inner::Bare {
-                database,
-                cache,
-                index,
-            },
-            clock,
-        )
-    }
-
-    /// Builds the production cache, taking ownership of the per-partition
-    /// [`FjallWorkspace`].
-    ///
-    /// The cache operates the workspace's cache handle and holds the workspace
-    /// alive, so the workspace's `Drop` — which deletes the fjall keyspace —
-    /// fires only when the cache (and thus the partition's state manager) is
-    /// dropped at revocation.
-    #[must_use]
-    pub fn for_workspace(workspace: FjallWorkspace) -> Self {
-        Self::from_parts(Inner::Owned(workspace), Clock::Wall)
-    }
-
-    /// The single struct-literal site, so the cfg-gated test fields stay in one
-    /// place.
-    fn from_parts(inner: Inner, clock: Clock) -> Self {
+    /// Builds a cache over a `keyspace` that it never deletes. Tests pass a
+    /// shared keyspace and may drive `clock` to expire entries.
+    fn new(database: Database, keyspace: Keyspace, clock: Clock) -> Self {
         Self {
-            inner: Arc::new(inner),
+            database,
+            keyspace,
             clock,
             disabled: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             faults: Faults::default(),
+            _retire: None,
+        }
+    }
+
+    /// Builds the production cache, which owns `keyspace` until `retire` drops.
+    fn for_keyspace(database: Database, keyspace: Keyspace, retire: Retire) -> Self {
+        Self {
+            _retire: Some(Arc::new(retire)),
+            ..Self::new(database, keyspace, Clock::Wall)
         }
     }
 
@@ -170,11 +146,19 @@ impl FjallCellCache {
         self.disabled.load(Ordering::Relaxed)
     }
 
-    /// Disables the cache for this assignment.
+    /// Disables the cache for this assignment, with one log and one count.
     ///
     /// A disabled cache sends all operations to durable storage.
     pub(crate) fn disable(&self) {
-        self.marker_checks().disable();
+        if !self.disabled.swap(true, Ordering::Relaxed) {
+            warn!("keyed-state cell cache disabled for this assignment; using durable reads");
+            CACHE_DISABLED.add(1, &[]);
+        }
+    }
+
+    /// The assignment's keyspace.
+    pub(super) fn keyspace(&self) -> &Keyspace {
+        &self.keyspace
     }
 
     /// The test-only fault seams of this cache.
@@ -201,20 +185,11 @@ impl FjallCellCache {
         bytes: Bytes,
     ) -> Result<(), FjallCellCacheError> {
         io::write_cell(
-            self.inner.handle(),
+            &self.keyspace,
             codec::cell_key(collection, cell.as_ref()),
             bytes,
         )
         .await
-    }
-
-    /// Returns a marker-check handle for this workspace.
-    #[must_use]
-    pub(crate) fn marker_checks(&self) -> MarkerCheckSet {
-        MarkerCheckSet {
-            index: self.inner.index_handle().clone(),
-            disabled: self.disabled.clone(),
-        }
     }
 
     /// Reads one projection and its remaining TTL from an unexpired frame.
@@ -227,7 +202,7 @@ impl FjallCellCache {
     ) -> Result<CacheRead<P>, FjallCellCacheError> {
         #[cfg(test)]
         self.faults.read()?;
-        let raw = io::read_cell(self.inner.handle(), codec::cell_key(collection, cell)).await?;
+        let raw = io::read_cell(&self.keyspace, codec::cell_key(collection, cell)).await?;
         Ok(io::probe::<P>(raw.as_deref(), self.clock.now_ms()))
     }
 
@@ -251,14 +226,14 @@ impl FjallCellCache {
                 },
             )
         });
-        let handle = self.inner.handle().clone();
+        let handle = self.keyspace.clone();
         let clock = self.clock.clone();
         #[cfg(test)]
         let faults = self.faults.clone();
         // ONE blocking hop reads every key exhaustively; a per-key engine error
-        // (or the injected fault) fails the whole hop, mirroring how `read_cell`
-        // surfaces one via `??`. As in `get`, each expiry check reads the clock
-        // after its read.
+        // (or the injected fault) fails the whole hop, mirroring how
+        // `read_cell` surfaces one via `??`. As in `get`, each expiry
+        // check reads the clock after its read.
         spawn_blocking(move || {
             #[cfg(test)]
             faults.probe()?;
@@ -279,11 +254,7 @@ impl FjallCellCache {
         collection: &CollectionId,
         cell: &CellKey,
     ) -> Result<Option<u64>, FjallCellCacheError> {
-        let raw = io::read_cell(
-            self.inner.handle(),
-            codec::cell_key(collection, cell.as_ref()),
-        )
-        .await?;
+        let raw = io::read_cell(&self.keyspace, codec::cell_key(collection, cell.as_ref())).await?;
         codec::frame_expiry(raw.as_deref())
     }
 
@@ -300,12 +271,7 @@ impl FjallCellCache {
         #[cfg(test)]
         self.faults.put()?;
         let frame = io::encode_frame(&P::into_cached(value.into_inner()), expiry);
-        io::write_cell(
-            self.inner.handle(),
-            codec::cell_key(collection, cell),
-            frame,
-        )
-        .await
+        io::write_cell(&self.keyspace, codec::cell_key(collection, cell), frame).await
     }
 
     /// Publishes committed projections in one atomic
@@ -322,8 +288,9 @@ impl FjallCellCache {
         self.faults.put()?;
         // Encode every key + frame up front (bounded, sized once from the
         // caller's iterator) so the blocking closure only touches fjall; the
-        // owned key/frame pairs move into it. Building `framed` directly from the
-        // projected iterator avoids an intermediate collect on the settle path.
+        // owned key/frame pairs move into it. Building `framed` directly from
+        // the projected iterator avoids an intermediate collect on the
+        // settle path.
         let framed: CellBuffer<(SmallVec<[u8; 32]>, Bytes)> = cells
             .into_iter()
             .map(|(cell, value, expiry)| {
@@ -333,10 +300,10 @@ impl FjallCellCache {
                 )
             })
             .collect();
-        let handle = self.inner.handle().clone();
+        let handle = self.keyspace.clone();
         let capacity = framed.len();
         io::run_batch(
-            self.inner.database().clone(),
+            self.database.clone(),
             handle,
             capacity,
             move |batch, handle| {
@@ -378,10 +345,9 @@ impl FjallCellCache {
                 write.data().cloned(),
             ));
         }
-        let database = self.inner.database().clone();
-        let handle = self.inner.handle().clone();
-        spawn_blocking(move || io::commit_stage(database, &handle, &inputs)).await??;
-        Ok(())
+        let database = self.database.clone();
+        let handle = self.keyspace.clone();
+        io::blocking(move || io::commit_stage(database, &handle, &inputs)).await
     }
 
     /// Deletes the committed entries of `cells` in one atomic
@@ -398,10 +364,10 @@ impl FjallCellCache {
             .into_iter()
             .map(|cell| codec::cell_key(collection, cell))
             .collect();
-        let handle = self.inner.handle().clone();
+        let handle = self.keyspace.clone();
         let capacity = keys.len();
         io::run_batch(
-            self.inner.database().clone(),
+            self.database.clone(),
             handle,
             capacity,
             move |batch, handle| {
@@ -441,8 +407,8 @@ impl FjallCellCache {
             .map(|cell| codec::cell_key(collection, cell))
             .collect();
         io::delete_section(
-            self.inner.database().clone(),
-            self.inner.handle().clone(),
+            self.database.clone(),
+            self.keyspace.clone(),
             codec::section_prefix(collection, section),
             Arc::new(excluded),
         )

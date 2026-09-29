@@ -28,9 +28,11 @@
 //! ends. A cache failure does not change the durable operation's result.
 //! Required removals retry within a fixed budget.
 //!
-//! All clones share the disabled state. Each operation checks that state once
-//! and completes work already accepted. A disabled cache sends reads to durable
-//! storage. The admission check set also stops its disk operations.
+//! Each operation reads the [`CacheSlot`] once and completes work already
+//! accepted. An empty slot or a disabled cache sends the operation to durable
+//! storage, and the admission check set then holds no proofs. The slot fills
+//! at most once, with an empty keyspace. So a slot that fills partway through
+//! an assignment is a fresh assignment for every key, and KV4 still holds.
 //!
 //! An entry must not outlive its durable cell. Direct writes use the time
 //! before the write plus the collection TTL. Promotion preserves that expiry.
@@ -44,7 +46,7 @@ mod store;
 use self::metrics::CellMetrics;
 use super::cell::{Committed, Values};
 use super::cell_key::CellKey;
-use super::fjall::{FjallCellCache, FjallCellCacheError};
+use super::fjall::{CacheSlot, FjallCellCache, FjallCellCacheError};
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::EventMarker;
 use super::store::CellBackend;
@@ -68,7 +70,7 @@ pub(crate) const DELETE_RETRY_BUDGET: usize = 5;
 /// A shared cache over a durable store for one partition assignment.
 #[derive(Clone)]
 pub struct Cached<L> {
-    fjall: FjallCellCache,
+    slot: CacheSlot,
     lower: L,
     metrics: CellMetrics,
 }
@@ -76,9 +78,9 @@ pub struct Cached<L> {
 impl<L> Cached<L> {
     /// Constructs a cache for committed projections over `lower`.
     #[must_use]
-    pub fn new(fjall: FjallCellCache, lower: L) -> Self {
+    pub fn new<S: Into<CacheSlot>>(slot: S, lower: L) -> Self {
         Self {
-            fjall,
+            slot: slot.into(),
             lower,
             metrics: CellMetrics::default(),
         }
@@ -100,64 +102,9 @@ impl<L> Cached<L> {
         collection: &CollectionId,
         cell: &CellKey,
     ) -> Result<Option<u64>, FjallCellCacheError> {
-        self.fjall.stored_expiry(collection, cell).await
-    }
-
-    /// Removes cache entries that a Staged payload can change.
-    ///
-    /// A failed removal disables the cache.
-    async fn evict_marker_cache_entries(&self, collection: &CollectionId, marker: &EventMarker) {
-        retry_delete(&self.fjall, "marker staged", || {
-            self.fjall
-                .delete_batch(collection, marker.staged().iter().map(CellKey::as_ref))
-        })
-        .await;
-        for clear in marker.clears() {
-            retry_delete(&self.fjall, "marker section", || {
-                self.fjall.delete_section(collection, clear.section(), [])
-            })
-            .await;
-        }
-    }
-
-    /// Publishes each touched cell's `projection` after a successful
-    /// `lower.write` (establish-then-publish) in **one** atomic fjall batch
-    /// ([`FjallCellCache::put_batch`]). `stamped_at` is a clock reading taken
-    /// **before** the lower write; [`expiry_at`] floors it to match
-    /// Cassandra's TTL resolution. The
-    /// collection's write TTL is the full TTL (the value was just written).
-    /// `project` computes each cell's committed projection from its batch
-    /// entry.
-    ///
-    /// A failed cache update removes all old entries for these cells. The
-    /// durable value has moved, so an old entry would serve the pre-write
-    /// value.
-    async fn publish_written<T>(
-        &self,
-        collection: &CollectionRef,
-        cells: &[(CellKey, T)],
-        stamped_at: u64,
-        project: impl Fn(&T) -> Committed,
-    ) {
-        let expiry = expiry_at(stamped_at, collection.ttl());
-        // Project each touched cell and publish atomically, streaming the batch
-        // input straight into `put_batch` (no intermediate collect): a multi-cell
-        // update is never torn, and the whole settle is one blocking thread-hop
-        // instead of N.
-        let projected = cells
-            .iter()
-            .map(|(cell, value)| (cell.as_ref(), project(value), expiry));
-        if let Err(error) = self
-            .fjall
-            .put_batch::<Values>(collection.id(), projected)
-            .await
-        {
-            warn_skip("publish", &error);
-            retry_delete(&self.fjall, "publish repair", || {
-                self.fjall
-                    .delete_batch(collection.id(), cells.iter().map(|(cell, _)| cell.as_ref()))
-            })
-            .await;
+        match self.slot.attached() {
+            Some(fjall) => fjall.stored_expiry(collection, cell).await,
+            None => Ok(None),
         }
     }
 }
@@ -215,6 +162,62 @@ fn expiry_at(stamped_at: u64, remaining: Option<CompactDuration>) -> u64 {
     }
 }
 
+/// Removes cache entries that a Staged payload can change.
+///
+/// A failed removal disables the cache.
+async fn evict_marker_cache_entries(
+    fjall: &FjallCellCache,
+    collection: &CollectionId,
+    marker: &EventMarker,
+) {
+    retry_delete(fjall, "marker staged", || {
+        fjall.delete_batch(collection, marker.staged().iter().map(CellKey::as_ref))
+    })
+    .await;
+    for clear in marker.clears() {
+        retry_delete(fjall, "marker section", || {
+            fjall.delete_section(collection, clear.section(), [])
+        })
+        .await;
+    }
+}
+
+/// Publishes each touched cell's `projection` after a successful
+/// `lower.write` (establish-then-publish) in **one** atomic fjall batch
+/// ([`FjallCellCache::put_batch`]). `stamped_at` is a clock reading taken
+/// **before** the lower write; [`expiry_at`] floors it to match
+/// Cassandra's TTL resolution. The
+/// collection's write TTL is the full TTL (the value was just written).
+/// `project` computes each cell's committed projection from its batch
+/// entry.
+///
+/// A failed cache update removes all old entries for these cells. The
+/// durable value has moved, so an old entry would serve the pre-write
+/// value.
+async fn publish_written<T>(
+    fjall: &FjallCellCache,
+    collection: &CollectionRef,
+    cells: &[(CellKey, T)],
+    stamped_at: u64,
+    project: impl Fn(&T) -> Committed,
+) {
+    let expiry = expiry_at(stamped_at, collection.ttl());
+    // Project each touched cell and publish atomically, streaming the batch
+    // input straight into `put_batch` (no intermediate collect): a multi-cell
+    // update is never torn, and the whole settle is one blocking thread-hop
+    // instead of N.
+    let projected = cells
+        .iter()
+        .map(|(cell, value)| (cell.as_ref(), project(value), expiry));
+    if let Err(error) = fjall.put_batch::<Values>(collection.id(), projected).await {
+        warn_skip("publish", &error);
+        retry_delete(fjall, "publish repair", || {
+            fjall.delete_batch(collection.id(), cells.iter().map(|(cell, _)| cell.as_ref()))
+        })
+        .await;
+    }
+}
+
 /// Runs a must-succeed repair delete: up to [`DELETE_RETRY_BUDGET`] attempts
 /// with [`DELETE_RETRY_DELAY`] between them, warning per failure; on
 /// exhaustion it **disables the cache** and returns. It never fails upward
@@ -222,8 +225,8 @@ fn expiry_at(stamped_at: u64, remaining: Option<CompactDuration>) -> u64 {
 /// disabled cache sends all reads to durable storage.
 ///
 /// A dropped **boundary-owned** settle/admission future abandons the retry
-/// harmlessly: the drop coincides with assignment revocation (the workspace —
-/// and any stale entry — dies with it) or with an idempotent admission that
+/// harmlessly: the drop coincides with assignment revocation (the keyspace and
+/// any stale entry die with it) or with an idempotent admission that
 /// re-attempts the repair. The one **user-droppable** caller — mid-handler
 /// `commit()` / `ReadUncommitted` finalize via [`Cached::write_resolved`] — is
 /// not covered by that argument (nothing re-runs a marker-free direct write);

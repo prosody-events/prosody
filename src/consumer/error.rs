@@ -201,7 +201,7 @@ pub enum KeyedStateInitError {
     #[error(transparent)]
     Register(#[from] RegisterStateError),
 
-    /// The local keyed-state cache's disk workspace could not be opened.
+    /// The local keyed-state cache could not be opened.
     ///
     /// The inner `FjallClientError` is crate-internal, so this variant carries
     /// a rendered message plus the error's classification instead of the source

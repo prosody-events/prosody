@@ -189,7 +189,8 @@ where
         identities,
         loader.clone(),
         publisher,
-    )?;
+    )
+    .await?;
     Ok(ConsumerComponents {
         trigger,
         messages,

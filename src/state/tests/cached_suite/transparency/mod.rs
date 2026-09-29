@@ -86,6 +86,9 @@ async fn check_failed_probes(replay: &Replay, fjall: &FjallCellCache) -> Result<
 /// issues zero lower reads for every cell the warm-set model holds — the
 /// exceptions (expired, cleared, fault-path, marker-resolution evictions) are
 /// excluded by construction as the model's removals.
+///
+/// The cache attaches before a generated op. Earlier ops pass through to the
+/// lower store, as they do before an assignment's keyspace exists.
 #[test]
 pub(super) fn prop_cached_is_transparent() {
     fn property(trace: CacheTrace) -> Result<bool> {
@@ -101,12 +104,14 @@ pub(super) fn prop_cached_is_transparent() {
             let fjall = test_db::cache_with_clock("transparent", Clock::Fixed(now.clone()))?;
             let fail_puts = fjall.faults().fail_puts();
             let fail_deletes = fjall.faults().fail_deletes();
-            let subject = Cached::new(fjall.clone(), ttl_lower.clone());
+            let slot = CacheSlot::default();
+            let subject = Cached::new(slot.clone(), ttl_lower.clone());
             let twin = MemoryCellStore::new(MemoryCells::new());
             let id = collection("transparent")?;
             let ttl = trace.ttl.map(CompactDuration::new);
             let mut replay = Replay {
                 subject,
+                slot,
                 twin,
                 counting,
                 cref: CollectionRef::new(id.clone(), ttl),
@@ -124,6 +129,9 @@ pub(super) fn prop_cached_is_transparent() {
             };
 
             for (index, op) in trace.ops.iter().enumerate() {
+                if index == trace.attach {
+                    replay.slot.attach(fjall.clone());
+                }
                 replay
                     .step(op)
                     .await
@@ -134,9 +142,10 @@ pub(super) fn prop_cached_is_transparent() {
                     .map_err(|e| eyre!("after op {index} ({op:?}): {e}"))?;
             }
 
-            // The KV5 budget arm: heal the seams, run one model-updating
-            // verification pass to refill cold entries, then assert every warm-model cell
-            // re-gets with zero lower reads.
+            // The KV5 budget arm: attach, heal the seams, run one
+            // model-updating verification pass to refill cold entries, then
+            // assert every warm-model cell re-gets with zero lower reads.
+            replay.slot.attach(fjall.clone());
             replay.fail_puts.store(false, Ordering::Relaxed);
             replay.fail_deletes.store(0, Ordering::Relaxed);
             replay.fault_puts = false;

@@ -238,13 +238,13 @@ fn fjall_read_failure_degrades_that_get() -> Result<()> {
     })
 }
 
-/// Proves that cache disablement applies to all workspace clones.
+/// Proves that cache disablement applies to every clone of one cache.
 ///
 /// A removal failure disables clone A.
 /// Clone B must then use durable storage.
 /// Admission must use durable marker state.
 #[test]
-fn cache_disablement_applies_to_all_workspace_clones() -> Result<()> {
+fn cache_disablement_applies_to_all_cache_clones() -> Result<()> {
     let metrics = GlobalMetrics::install_global();
     TEST_RUNTIME.block_on(async {
         let dedup = MemoryDeduplicationStore::default();
