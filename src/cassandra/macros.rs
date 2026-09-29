@@ -59,7 +59,7 @@ pub(crate) fn format_sql(template: &str, keyspace: &str, args: &[&str]) -> Strin
 /// This macro eliminates boilerplate for managing prepared CQL statements by
 /// generating:
 /// - The struct definition with `PreparedStatement` fields
-/// - An async `new()` constructor that prepares all statements
+/// - An async `new()` constructor that prepares all statements concurrently
 /// - Individual prepare functions for each query
 ///
 /// All generated fields are public and marked with `#[educe(Debug(ignore))]`
