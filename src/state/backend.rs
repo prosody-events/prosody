@@ -96,25 +96,13 @@ where
 }
 
 /// Creates the keyed-state dependencies for each partition assignment.
-/// The workspace lives until partition revocation.
+/// Its stores live until partition revocation.
 pub trait StateBackendFactory<T>: Clone + Send + Sync + 'static {
     /// The per-partition backend bundle this factory mints.
     type Backend: StateBackend;
 
-    /// Error returned when a partition's backend cannot be materialized.
-    type Error: ClassifyError + Error + Send + Sync + 'static;
-
-    /// Creates the backend for the partition.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the assignment workspace cannot open.
-    fn for_partition(
-        &self,
-        topic: Topic,
-        partition: Partition,
-        triggers: T,
-    ) -> Result<Self::Backend, Self::Error>;
+    /// Creates the backend for the partition without waiting for any I/O.
+    fn for_partition(&self, topic: Topic, partition: Partition, triggers: T) -> Self::Backend;
 }
 
 /// Clones shared test stores for each partition.
@@ -148,20 +136,14 @@ where
     D: DeduplicationStore,
 {
     type Backend = PartitionBackend<D, I, S, ()>;
-    type Error = Infallible;
 
-    fn for_partition(
-        &self,
-        _topic: Topic,
-        _partition: Partition,
-        _triggers: T,
-    ) -> Result<Self::Backend, Self::Error> {
-        Ok(PartitionBackend::new(
+    fn for_partition(&self, _topic: Topic, _partition: Partition, _triggers: T) -> Self::Backend {
+        PartitionBackend::new(
             self.dedup.clone(),
             self.identity.clone(),
             self.cell.clone(),
             (),
-        ))
+        )
     }
 }
 
@@ -194,7 +176,7 @@ pub trait AdmissionChecks: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, Self>;
 }
 
-/// Memory stores have no assignment workspace. Each event admits again.
+/// Memory stores have no assignment keyspace. Each event admits again.
 impl AdmissionChecks for () {
     type Error = Infallible;
 

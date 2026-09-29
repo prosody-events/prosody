@@ -15,6 +15,7 @@ pub(super) type WarmModel = HashMap<u8, (u64, CacheEntry<Bytes>)>;
 /// through every op and the per-op verification passes.
 pub(super) struct Replay {
     pub(super) subject: Cached<TtlAwareCellStore<MemoryCellStore>>,
+    pub(super) slot: CacheSlot,
     pub(super) twin: MemoryCellStore,
     pub(super) counting: CountingCellStore<MemoryCellStore>,
     pub(super) id: CollectionId,
@@ -38,6 +39,11 @@ impl Replay {
             .map_or(u64::MAX, |ttl| (self.clock - self.clock % 1_000) + ttl)
     }
 
+    /// Whether a cache write lands: the cache is attached and puts succeed.
+    fn fills(&self) -> bool {
+        self.slot.attached().is_some() && !self.fault_puts
+    }
+
     /// Whether the warm model says `key` is a live hit at the current clock.
     pub(super) fn is_warm<P: Projection>(&self, key: u8) -> bool {
         self.warm.get(&key).is_some_and(|(expiry, entry)| {
@@ -47,15 +53,15 @@ impl Replay {
     }
 
     /// Publish-through model update: the batch either warms every cell (a
-    /// clean atomic publish) or — under the puts fault — lands nothing and
-    /// failed-publish cache guard deletes every cell.
+    /// clean atomic publish) or lands nothing. A failed publish deletes every
+    /// cell, and a detached cache holds none.
     fn model_publish(&mut self, cells: impl IntoIterator<Item = (u8, Option<Bytes>)>) {
         let expiry = self.write_expiry();
         for (key, value) in cells {
-            if self.fault_puts {
-                self.warm.remove(&key);
-            } else {
+            if self.fills() {
                 self.warm.insert(key, (expiry, Values::into_cached(value)));
+            } else {
+                self.warm.remove(&key);
             }
         }
     }
@@ -84,7 +90,8 @@ impl Replay {
             .await
             .map_err(|e| eyre!("twin write: {e:?}"))?;
         if !clears.is_empty() {
-            // section-clear cache guard whole-section delete ran before the lower write.
+            // section-clear cache guard whole-section delete ran before the
+            // lower write.
             self.warm.clear();
         }
         self.model_publish(
@@ -168,10 +175,11 @@ impl Replay {
                     .map(|(cell, _)| cell.coordinate.as_bytes()[0])
                     .collect();
                 if !staged.clears.is_empty() {
-                    // Scoped section-clear cache guard: everything but the staged coordinates goes.
+                    // Scoped section-clear cache guard: everything but the
+                    // staged coordinates goes.
                     self.warm.retain(|key, _| staged_keys.contains(key));
                 }
-                if self.fault_puts {
+                if !self.fills() {
                     // The transform failed; the fallback delete landed.
                     for key in &staged_keys {
                         self.warm.remove(key);
@@ -215,7 +223,8 @@ impl Replay {
                     .mark_resolved(&self.twin_ref, &cells)
                     .await
                     .map_err(|e| eyre!("twin promote: {e:?}"))?;
-                // Raw promotion removes cached entries and leaves the marker unchanged.
+                // Raw promotion removes cached entries and leaves the marker
+                // unchanged.
                 for cell in &cells {
                     self.warm.remove(&cell.coordinate.as_bytes()[0]);
                 }
@@ -274,7 +283,7 @@ impl Replay {
             other_reads,
             "a value point does not fetch another projection or batch"
         );
-        if falls_through && !self.fault_puts {
+        if falls_through && self.fills() {
             self.warm
                 .insert(key, (u64::MAX, Values::into_cached(twin.into_inner())));
         }
@@ -351,7 +360,7 @@ impl Replay {
                 value.get().is_some(),
                 "presence differs at {key}"
             );
-            if missed.contains(key) && !self.fault_puts {
+            if missed.contains(key) && self.fills() {
                 self.warm.insert(
                     *key,
                     (u64::MAX, Presence::into_cached(present.into_inner())),

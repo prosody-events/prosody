@@ -75,10 +75,10 @@ const PROPERTY_WORKERS: u64 = 8;
 static BACKEND: OnceCell<CassandraReaderBackend> = OnceCell::const_new();
 
 /// The live-Cassandra [`ReaderBackend`]. It holds one
-/// `CassandraStore`, which bundles a shared session, prepared
-/// queries, and one assignment workspace. That store is
-/// cloned into a fresh owner session for each event. The reader reads through
-/// [`CassandraCellResources`] over the same session and the same queries.
+/// `CassandraStore`, which bundles a shared session and prepared queries.
+/// That store is cloned into a fresh owner session for each event. The reader
+/// reads through [`CassandraCellResources`] over the same session and the same
+/// queries.
 struct CassandraReaderBackend {
     store: CassandraCellStore,
     cells: CassandraCellResources,

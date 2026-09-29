@@ -16,8 +16,6 @@ use crate::state::store::{CellRead, ReadBatch};
 
 impl CassandraStore {
     /// Creates a Cassandra cell store for one partition assignment.
-    ///
-    /// The marker-check set must use the assignment cache workspace.
     #[must_use]
     pub(crate) fn new(
         session: CassandraSession,

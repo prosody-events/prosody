@@ -24,8 +24,7 @@ use crate::state::publisher::{
 use crate::state::registry::CollectionDefRegistry;
 use crate::state_reader::PartitionCount;
 use crate::timers::duration::CompactDuration;
-use crate::{ByteSize, Codec, ConsumerGroup, EventIdentity, EventType, Topic};
-use std::fs;
+use crate::{Codec, ConsumerGroup, EventIdentity, EventType, Topic};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -187,11 +186,11 @@ where
 }
 
 /// Builds the keyed-state provider for a Cassandra backend. It opens the fjall
-/// workspace, mints the backend factory over the caller's
+/// cache, mints the backend factory over the caller's
 /// Kafka loader, and wraps it in the partition state provider. Shared by every
 /// constructor's Cassandra arm; the caller owns the loader so the pipeline can
 /// hand the same one to its message-defer middleware.
-pub(in crate::consumer) fn cassandra_state_provider<C: Codec>(
+pub(in crate::consumer) async fn cassandra_state_provider<C: Codec>(
     keyed_state: &KeyedStateInputs,
     dedup_provider: CassandraDeduplicationStoreProvider,
     cell_store: CassandraCellResources,
@@ -202,17 +201,12 @@ pub(in crate::consumer) fn cassandra_state_provider<C: Codec>(
 where
     C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
 {
-    // The fjall workspace root is wiped on restart (Cassandra is
-    // authoritative), so creating the default directory here is safe.
-    fs::create_dir_all(&keyed_state.config.cache_dir)?;
-    let fjall_client = FjallClient::open(
-        &keyed_state.config.cache_dir,
-        keyed_state.config.owned_cache_size.map(ByteSize::nonzero),
-    )
-    .map_err(|error| KeyedStateInitError::Cache {
-        message: format!("{error:#}"),
-        category: error.classify_error(),
-    })?;
+    let fjall_client = FjallClient::open(&keyed_state.config)
+        .await
+        .map_err(|error| KeyedStateInitError::Cache {
+            message: format!("{error:#}"),
+            category: error.classify_error(),
+        })?;
     let backend = CassandraStateBackendFactory::new(
         fjall_client,
         cell_store,

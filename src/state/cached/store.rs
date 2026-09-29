@@ -1,6 +1,8 @@
 //! Durability operations that keep the cell cache coherent.
 
-use super::{Cached, PromoteCacheGuard, retry_delete, warn_skip};
+use super::{
+    Cached, PromoteCacheGuard, evict_marker_cache_entries, publish_written, retry_delete, warn_skip,
+};
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::identity::{CollectionId, CollectionRef};
@@ -15,7 +17,8 @@ impl<L: CellStore> CellStore for Cached<L> {
         collection: &'a CollectionId,
         cell: &'a CellKey,
     ) -> Result<Option<ProvisionalCell>, Self::Error> {
-        // A pure lower read — no fjall step, so no cache-disabled branch is needed.
+        // A pure lower read — no fjall step, so no cache-disabled branch is
+        // needed.
         self.lower.provisional_cell_at(collection, cell).await
     }
 
@@ -28,9 +31,9 @@ impl<L: CellStore> CellStore for Cached<L> {
     + Send
     + use<'a, L> {
         // A raw provisional read the committed-value cache cannot answer, so
-        // delegate straight to the lower store — no fjall step, no cache-disabled
-        // branch (like `provisional_cell_at`). Nothing is published into the
-        // cache.
+        // delegate straight to the lower store — no fjall step, no
+        // cache-disabled branch (like `provisional_cell_at`). Nothing
+        // is published into the cache.
         self.lower.provisional_many(collection, section, batch)
     }
 
@@ -39,16 +42,15 @@ impl<L: CellStore> CellStore for Cached<L> {
         collection: &'a CollectionRef,
         stage: ProvisionalStage<'a>,
     ) -> Result<(), Self::Error> {
-        // A disabled cache delegates the write to the lower store.
-        if self.fjall.is_disabled() {
+        let Some(fjall) = self.slot.active() else {
             return self.lower.write_provisional(collection, stage).await;
-        }
-        let stamped_at = self.fjall.clock().now_ms();
+        };
+        let stamped_at = fjall.clock().now_ms();
         self.lower.write_provisional(collection, stage).await?;
         // The committed value stays `prev` while the cell is provisional
         // (commit/abort republishes), so publish `prev` — never the in-flight
         // `data`.
-        self.publish_written(collection, stage.writes(), stamped_at, |write| {
+        publish_written(fjall, collection, stage.writes(), stamped_at, |write| {
             Committed::new(write.prev().cloned())
         })
         .await;
@@ -61,30 +63,28 @@ impl<L: CellStore> CellStore for Cached<L> {
         cells: &'a [(CellKey, Option<Bytes>)],
         clears: &'a [SectionClear],
     ) -> Result<(), Self::Error> {
-        if self.fjall.is_disabled() {
+        let Some(fjall) = self.slot.active() else {
             return self.lower.write_resolved(collection, cells, clears).await;
-        }
+        };
         // Remove each cleared section before the lower write.
         // A failed lower write leaves the section uncached.
         for clear in clears {
-            retry_delete(&self.fjall, "clear section", || {
-                self.fjall
-                    .delete_section(collection.id(), clear.section(), [])
+            retry_delete(fjall, "clear section", || {
+                fjall.delete_section(collection.id(), clear.section(), [])
             })
             .await;
         }
         // Remove old entries before the durable write.
         // Cancellation can then leave entries absent, but never stale.
         // Publish the new values only after the durable write succeeds.
-        retry_delete(&self.fjall, "resolved cells", || {
-            self.fjall
-                .delete_batch(collection.id(), cells.iter().map(|(cell, _)| cell.as_ref()))
+        retry_delete(fjall, "resolved cells", || {
+            fjall.delete_batch(collection.id(), cells.iter().map(|(cell, _)| cell.as_ref()))
         })
         .await;
         // Pre-write anchor, establish-first — see `write_provisional`.
-        let stamped_at = self.fjall.clock().now_ms();
+        let stamped_at = fjall.clock().now_ms();
         self.lower.write_resolved(collection, cells, clears).await?;
-        self.publish_written(collection, cells, stamped_at, |data| {
+        publish_written(fjall, collection, cells, stamped_at, |data| {
             Committed::new(data.clone())
         })
         .await;
@@ -96,14 +96,13 @@ impl<L: CellStore> CellStore for Cached<L> {
         collection: &'a CollectionRef,
         cells: &'a [CellKey],
     ) -> Result<(), Self::Error> {
-        if self.fjall.is_disabled() {
+        let Some(fjall) = self.slot.active() else {
             return self.lower.mark_resolved(collection, cells).await;
-        }
+        };
         // The keys do not contain the new committed values.
         // Remove their old entries before the durable promotion.
-        retry_delete(&self.fjall, "promote", || {
-            self.fjall
-                .delete_batch(collection.id(), cells.iter().map(CellKey::as_ref))
+        retry_delete(fjall, "promote", || {
+            fjall.delete_batch(collection.id(), cells.iter().map(CellKey::as_ref))
         })
         .await;
         self.lower.mark_resolved(collection, cells).await?;
@@ -117,20 +116,19 @@ impl<L: CellStore> CellStore for Cached<L> {
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
         let clears = marker.clears();
-        if self.fjall.is_disabled() {
+        let Some(fjall) = self.slot.active() else {
             return self
                 .lower
                 .commit_provisional(collection, marker, writes)
                 .await;
-        }
-        let cache_guard = PromoteCacheGuard(Some(&self.fjall));
+        };
+        let cache_guard = PromoteCacheGuard(Some(fjall));
         if let Err(error) = self
             .lower
             .commit_provisional(collection, marker, writes)
             .await
         {
-            self.evict_marker_cache_entries(collection.id(), marker)
-                .await;
+            evict_marker_cache_entries(fjall, collection.id(), marker).await;
             cache_guard.complete();
             return Err(error);
         }
@@ -140,10 +138,10 @@ impl<L: CellStore> CellStore for Cached<L> {
         // Ruling: keep this transform. Delete-and-refill would leave staged
         // cells cold after each commit and cost one durable point read per hot
         // cell per event.
-        if let Err(error) = self.fjall.commit_batch(collection.id(), writes).await {
+        if let Err(error) = fjall.commit_batch(collection.id(), writes).await {
             warn_skip("commit transform", &error);
-            retry_delete(&self.fjall, "commit transform fallback", || {
-                self.fjall.delete_batch(
+            retry_delete(fjall, "commit transform fallback", || {
+                fjall.delete_batch(
                     collection.id(),
                     writes.iter().map(|(cell, _)| cell.as_ref()),
                 )
@@ -154,8 +152,8 @@ impl<L: CellStore> CellStore for Cached<L> {
         // Keep the staged entries that this settlement just published.
         if !clears.is_empty() {
             for clear in clears {
-                retry_delete(&self.fjall, "commit clear section", || {
-                    self.fjall.delete_section(
+                retry_delete(fjall, "commit clear section", || {
+                    fjall.delete_section(
                         collection.id(),
                         clear.section(),
                         writes.iter().map(|(cell, _)| cell.as_ref()),
@@ -173,9 +171,9 @@ impl<L: CellStore> CellStore for Cached<L> {
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
     ) -> Result<(), Self::Error> {
-        if self.fjall.is_disabled() {
+        let Some(fjall) = self.slot.active() else {
             return self.lower.abort_provisional(collection, writes).await;
-        }
+        };
         // No pre-call action exists for the abort: the cached `prev` IS the
         // committed projection while an aborted marker stands, so on a lower
         // Err the result returns verbatim with the cache already correct. And
@@ -188,10 +186,10 @@ impl<L: CellStore> CellStore for Cached<L> {
         // lower `abort_provisional` (not a bare `write_resolved`) so the lower
         // store's marker delete runs — the cache owns only the fjall
         // re-publish of the rolled-back `prev`, layered over the lower settle.
-        let stamped_at = self.fjall.clock().now_ms();
+        let stamped_at = fjall.clock().now_ms();
         let result = self.lower.abort_provisional(collection, writes).await;
         if result.is_ok() {
-            self.publish_written(collection, writes, stamped_at, |write| {
+            publish_written(fjall, collection, writes, stamped_at, |write| {
                 Committed::new(write.prev().cloned())
             })
             .await;
