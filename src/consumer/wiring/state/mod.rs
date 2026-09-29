@@ -25,8 +25,7 @@ use crate::{Codec, ConsumerGroup, EventIdentity, EventType, METADATA_TIMEOUT, To
 use rdkafka::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::RDKafkaErrorCode;
-use rdkafka::metadata::{Metadata, MetadataPartition};
-use smallvec::SmallVec;
+use rdkafka::metadata::Metadata;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -264,10 +263,9 @@ async fn fetch_routes(
     .map_err(ConsumerError::StartupTask)?
 }
 
-/// The partition count that broker metadata reports for `topic`.
-///
-/// The count is the number of partition ids. A partition without a leader
-/// still counts, because the broker lists its id.
+/// The partition count that broker metadata reports for `topic`: the number
+/// of partitions it lists. A partition without a leader still counts, because
+/// the broker lists it.
 fn partition_count(metadata: &Metadata, topic: &str) -> Result<PartitionCount, RoutingError> {
     if topic.starts_with('^') {
         return Err(RoutingError::Pattern(topic.to_owned()));
@@ -281,21 +279,8 @@ fn partition_count(metadata: &Metadata, topic: &str) -> Result<PartitionCount, R
     if let Some(code) = entry.error() {
         return Err(broker(code.into()));
     }
-    contiguous_count(entry.partitions().iter().map(MetadataPartition::id), topic)
-}
-
-/// The count of `ids`, which must be exactly `0..count` for a positive count.
-fn contiguous_count(
-    ids: impl Iterator<Item = i32>,
-    topic: &str,
-) -> Result<PartitionCount, RoutingError> {
     let invalid = || RoutingError::Invalid(topic.to_owned());
-    let mut ids: SmallVec<[i32; 64]> = ids.collect();
-    ids.sort_unstable();
-    let count = i32::try_from(ids.len()).map_err(|_| invalid())?;
-    if !ids.iter().copied().eq(0_i32..count) {
-        return Err(invalid());
-    }
+    let count = i32::try_from(entry.partitions().len()).map_err(|_| invalid())?;
     PartitionCount::try_from(count).map_err(|_| invalid())
 }
 

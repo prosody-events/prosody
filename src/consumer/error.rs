@@ -251,8 +251,9 @@ pub enum RoutingError {
     #[error("topic {0:?} has a broker metadata error: {1}")]
     Broker(String, RDKafkaErrorCode),
 
-    /// The topic's partition ids are not exactly `0..count`.
-    #[error("topic {0:?} has an invalid partition layout in the broker metadata")]
+    /// The broker metadata lists no partitions for the topic, or more than a
+    /// partition count can hold.
+    #[error("topic {0:?} has no valid partition count in the broker metadata")]
     Invalid(String),
 }
 
