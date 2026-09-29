@@ -2346,7 +2346,7 @@ dependencies = [
 
 [[package]]
 name = "prosody"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -2426,7 +2426,7 @@ dependencies = [
 
 [[package]]
 name = "prosody-macros"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proc-macro2",
  "quote",
