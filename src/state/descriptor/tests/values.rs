@@ -1,47 +1,105 @@
 //! Value descriptors preserve typed payloads and absence.
 
 use super::*;
+use color_eyre::eyre::WrapErr;
+use std::iter::{empty, once};
 
 pub(super) fn cart() -> ValueDescriptor {
     value_state("cart")
 }
 
-/// Round-trip invariant: for every JSON-representable value, `set(v)` then
-/// `get()` returns `Some(v)` — the value survives the full
+/// One step of a Value trace.
+#[derive(Clone, Debug)]
+pub(super) enum ValueStep {
+    Set(Value),
+    Clear,
+    Commit,
+    Rollback,
+}
+
+impl Arbitrary for ValueStep {
+    fn arbitrary(g: &mut Gen) -> Self {
+        match u8::arbitrary(g) % 5 {
+            0 | 1 => Self::Set(ArbJson::arbitrary(g).0),
+            2 => Self::Clear,
+            3 => Self::Commit,
+            _ => Self::Rollback,
+        }
+    }
+
+    /// Shrinks a set payload to JSON null, the smallest payload.
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        match self {
+            Self::Set(value) if !value.is_null() => Box::new(once(Self::Set(Value::Null))),
+            _ => Box::new(empty()),
+        }
+    }
+}
+
+/// Oracle invariant: before the first step and after each step, `get`
+/// returns the model value and `contains` reports whether the model holds
+/// one. The model is the visible value and the last committed value.
+/// `rollback` restores the committed value. A JSON null is a stored payload,
+/// so `contains` reports it present. The value survives the full
 /// `T → codec → cell bytes → store → cell bytes → codec → T` path through
 /// the real session substrate.
-pub(super) async fn roundtrip(value: Value) -> Result<bool> {
+pub(super) async fn value_trace(steps: Vec<ValueStep>) -> Result<bool> {
     let handle = bind_registered(cart(), MemoryLoader::new())?;
-    handle.set(value.clone()).await?;
-    Ok(handle.get().await? == Some(value))
+    let mut visible = None;
+    let mut committed = None;
+    if !matches_model(&handle, visible.as_ref()).await? {
+        return Ok(false);
+    }
+
+    for (index, step) in steps.into_iter().enumerate() {
+        apply(&handle, &step)
+            .await
+            .wrap_err_with(|| format!("step {index}: {step:?}"))?;
+        match step {
+            ValueStep::Set(value) => visible = Some(value),
+            ValueStep::Clear => visible = None,
+            ValueStep::Commit => committed.clone_from(&visible),
+            ValueStep::Rollback => visible.clone_from(&committed),
+        }
+        let matches = matches_model(&handle, visible.as_ref()).await;
+        if !matches.wrap_err_with(|| format!("read after step {index}"))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Applies `step` to the real handle.
+async fn apply(handle: &ValueHandle<TestSession, JsonCodec>, step: &ValueStep) -> Result<()> {
+    match step {
+        ValueStep::Set(value) => handle.set(value.clone()).await?,
+        ValueStep::Clear => handle.clear().await?,
+        ValueStep::Commit => {
+            handle.commit().await?;
+        }
+        ValueStep::Rollback => {
+            handle.rollback().await;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `get` and `contains` both agree with `model`.
+async fn matches_model(
+    handle: &ValueHandle<TestSession, JsonCodec>,
+    model: Option<&Value>,
+) -> Result<bool> {
+    Ok(handle.get().await?.as_ref() == model && handle.contains().await? == model.is_some())
 }
 
 #[test]
-pub(super) fn prop_descriptor_set_get_roundtrip() {
-    fn prop(value: ArbJson) -> TestResult {
-        let input_dbg = format!("{value:#?}");
-        let result = TEST_RUNTIME.block_on(roundtrip(value.0));
-        finish_trace(result, "typed roundtrip lost", &input_dbg)
+pub(super) fn prop_value_trace_matches_model() {
+    fn prop(steps: Vec<ValueStep>) -> TestResult {
+        let input_dbg = format!("{steps:#?}");
+        let result = TEST_RUNTIME.block_on(value_trace(steps));
+        finish_trace(result, "value trace diverged from the model", &input_dbg)
     }
-    QuickCheck::new().quickcheck(prop as fn(ArbJson) -> TestResult);
-}
-
-/// A never-written collection reads as `None`.
-#[tokio::test]
-pub(super) async fn descriptor_get_absent_returns_none() -> Result<()> {
-    let handle = bind_registered(cart(), MemoryLoader::new())?;
-    assert_eq!(handle.get().await?, None);
-    Ok(())
-}
-
-/// `set` then `clear` reads as `None`.
-#[tokio::test]
-pub(super) async fn descriptor_clear_then_get_none() -> Result<()> {
-    let handle = bind_registered(cart(), MemoryLoader::new())?;
-    handle.set(json!({"items": [1_i32, 2_i32]})).await?;
-    handle.clear().await?;
-    assert_eq!(handle.get().await?, None);
-    Ok(())
+    QuickCheck::new().quickcheck(prop as fn(Vec<ValueStep>) -> TestResult);
 }
 
 /// A user-written typed cell: the codec **is** the typing, so a `Cart`
