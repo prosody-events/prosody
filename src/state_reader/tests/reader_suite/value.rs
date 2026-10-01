@@ -1,6 +1,8 @@
 //! Committed value reads and recovery evidence.
 
 use super::*;
+use crate::state::erased::Erased;
+use crate::state_reader::erased::ErasedValueReader;
 use std::iter::empty;
 
 /// A value trace operation. The reader observes the last committed `Set`, or
@@ -38,7 +40,8 @@ impl Arbitrary for ValueOp {
 
 /// Drives a Value trace: commit each event, mirror it into an `Option<Value>`
 /// model, and after every event assert `reader.get(key)` equals the model and
-/// `reader.contains(key)` reports whether the model holds a value.
+/// `reader.contains(key)` reports whether the model holds a value. The reads
+/// go through the erased adapter, so the trace also covers the client path.
 ///
 /// FALSIFICATION: perturb `ReadSession::collection_id_for` (session.rs) to bind
 /// the wrong partition/state-type → the point `get` reads an empty/foreign
@@ -99,9 +102,9 @@ pub(in crate::state_reader::tests) async fn run_reader_value_trace<B: ReaderBack
         }
 
         let deps = backend.deps();
-        let reader = StateReader::new(&deps, case.sub.clone(), descriptor)?;
-        if reader.get(case.key.clone()).await? != model
-            || reader.contains(case.key.clone()).await? != model.is_some()
+        let reader = Erased(StateReader::new(&deps, case.sub.clone(), descriptor)?);
+        if reader.get(case.key.to_string()).await? != model
+            || reader.contains(case.key.to_string()).await? != model.is_some()
         {
             return Ok(false);
         }

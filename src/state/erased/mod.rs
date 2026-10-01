@@ -119,8 +119,8 @@ pub trait DynValueState<Item: Send + 'static>: Send + Sync {
     /// Reads the current value (`None` when absent/cleared).
     async fn get(&self) -> Result<Option<Item>, ErasedStateError>;
 
-    /// Whether a value is present, without decoding it or running the
-    /// resolver (a presence read through the dirty overlay).
+    /// Tests whether a value is present, without decoding it or running the
+    /// resolver. The read includes buffered changes.
     async fn contains(&self) -> Result<bool, ErasedStateError>;
 
     /// Buffers a write of `item`. Rejects the JSON-null sentinel (`Permanent`).
@@ -144,8 +144,8 @@ pub trait DynMapState<Item: Send + 'static>: Send + Sync {
     /// Reads `key`'s value (`None` when absent).
     async fn get(&self, key: String) -> Result<Option<Item>, ErasedStateError>;
 
-    /// Whether a stored cell exists for `key`, without decoding its value or
-    /// running the resolver (a presence read through the dirty overlay).
+    /// Tests whether a stored cell exists for `key`, without decoding its
+    /// value or running the resolver. The read includes buffered changes.
     async fn contains_key(&self, key: String) -> Result<bool, ErasedStateError>;
 
     /// Whether the map holds no live entries.

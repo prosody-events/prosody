@@ -10,7 +10,7 @@ pub(super) fn cart() -> ValueDescriptor {
 
 /// One step of a Value trace.
 #[derive(Clone, Debug)]
-pub(super) enum ValueStep {
+enum ValueStep {
     Set(Value),
     Clear,
     Commit,
@@ -43,45 +43,36 @@ impl Arbitrary for ValueStep {
 /// so `contains` reports it present. The value survives the full
 /// `T → codec → cell bytes → store → cell bytes → codec → T` path through
 /// the real session substrate.
-pub(super) async fn value_trace(steps: Vec<ValueStep>) -> Result<bool> {
+async fn value_trace(steps: Vec<ValueStep>) -> Result<bool> {
     let handle = bind_registered(cart(), MemoryLoader::new())?;
     let mut visible = None;
     let mut committed = None;
-    if !matches_model(&handle, visible.as_ref()).await? {
-        return Ok(false);
-    }
-
     for (index, step) in steps.into_iter().enumerate() {
-        apply(&handle, &step)
-            .await
-            .wrap_err_with(|| format!("step {index}: {step:?}"))?;
-        match step {
-            ValueStep::Set(value) => visible = Some(value),
-            ValueStep::Clear => visible = None,
-            ValueStep::Commit => committed.clone_from(&visible),
-            ValueStep::Rollback => visible.clone_from(&committed),
-        }
-        let matches = matches_model(&handle, visible.as_ref()).await;
-        if !matches.wrap_err_with(|| format!("read after step {index}"))? {
+        if !matches_model(&handle, visible.as_ref()).await? {
             return Ok(false);
         }
-    }
-    Ok(true)
-}
 
-/// Applies `step` to the real handle.
-async fn apply(handle: &ValueHandle<TestSession, JsonCodec>, step: &ValueStep) -> Result<()> {
-    match step {
-        ValueStep::Set(value) => handle.set(value.clone()).await?,
-        ValueStep::Clear => handle.clear().await?,
-        ValueStep::Commit => {
-            handle.commit().await?;
-        }
-        ValueStep::Rollback => {
-            handle.rollback().await;
+        let context = || format!("step {index}");
+        match step {
+            ValueStep::Set(value) => {
+                handle.set(value.clone()).await.wrap_err_with(context)?;
+                visible = Some(value);
+            }
+            ValueStep::Clear => {
+                handle.clear().await.wrap_err_with(context)?;
+                visible = None;
+            }
+            ValueStep::Commit => {
+                handle.commit().await.wrap_err_with(context)?;
+                committed.clone_from(&visible);
+            }
+            ValueStep::Rollback => {
+                handle.rollback().await;
+                visible.clone_from(&committed);
+            }
         }
     }
-    Ok(())
+    matches_model(&handle, visible.as_ref()).await
 }
 
 /// Whether `get` and `contains` both agree with `model`.
