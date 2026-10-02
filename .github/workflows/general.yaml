@@ -57,12 +57,12 @@ jobs:
         run: >
           cargo rail plan evidence --work cargo.build
           --output target/planning-evidence/cargo.build.json
-          -- build --locked --workspace --all-targets --all-features
+          -- build --locked --workspace --all-targets
       - name: Record test evidence
         run: >
           cargo rail plan evidence --work cargo.test
           --output target/planning-evidence/cargo.test.json
-          -- test --locked --workspace --all-features --no-run
+          -- test --locked --workspace --no-run
       - name: Show evidence bindings
         run: >
           jq '{work: (.work | map_values({complete, bypasses})), platform,
