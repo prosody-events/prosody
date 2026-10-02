@@ -60,7 +60,6 @@ jobs:
       # Their jobs route on cargo.build and cargo.test instead, because that evidence covers the same compiler inputs.
       - name: Record build evidence
         run: >
-          rm -rf target/planning-evidence &&
           cargo rail plan evidence --work cargo.build
           --output target/planning-evidence/cargo.build.json
           -- build --locked --workspace
