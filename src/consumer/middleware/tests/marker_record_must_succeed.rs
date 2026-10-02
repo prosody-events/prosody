@@ -158,7 +158,7 @@ async fn assert_no_durable_cart(
     };
     assert_eq!(
         Committed::into_inner(
-            CellRead::<Values>::read(cell_store, cart_id, &cell)
+            CellRead::<Values>::read(cell_store, cart_id, cell.as_ref())
                 .await?
                 .0
         ),
@@ -325,10 +325,11 @@ fn prop_marker_record_self_heals_to_certified_commit() {
             let value = match CellRead::<Values>::read(
                 &cell_store,
                 &cart_id,
-                &CellKey {
+                (CellKey {
                     section: Section::new(0),
                     coordinate: Coordinate::empty(),
-                },
+                })
+                .as_ref(),
             )
             .await
             .map(|(committed, _)| committed)

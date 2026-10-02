@@ -359,11 +359,15 @@ async fn state_type_namespaces_cells() -> Result<()> {
         .await?;
 
     assert_eq!(
-        CellRead::<Values>::read(&store, app.id(), &cell).await?.0,
+        CellRead::<Values>::read(&store, app.id(), cell.as_ref())
+            .await?
+            .0,
         Committed::new(Some(Bytes::from_static(b"app"))),
     );
     assert_eq!(
-        CellRead::<Values>::read(&store, fw.id(), &cell).await?.0,
+        CellRead::<Values>::read(&store, fw.id(), cell.as_ref())
+            .await?
+            .0,
         Committed::new(Some(Bytes::from_static(b"fw"))),
         "the framework-namespaced cell holds its own value",
     );

@@ -23,7 +23,7 @@ pub use definition::{CollectionDef, CommitMode, ReadCachePolicy, StateVisibility
 
 /// Registration ceiling on the map and set keyset bound: a larger limit is
 /// rejected at build ([`RegisterStateError::KeysetLimit`]), capping the
-/// point-get fan-out (and decode allocation) a single `stream` can issue — the
+/// point-get fan-out (and decode allocation) a single query can issue — the
 /// byte ceiling separately bounds the frame's wire size.
 pub(crate) const MAX_KEYSET_LIMIT: usize = 4096;
 
@@ -138,7 +138,7 @@ impl CollectionDefRegistry {
     /// acquisition validates against the durable identity table.
     pub(crate) fn identities(
         &self,
-    ) -> impl Iterator<Item = (StateType, &StateName, &StructuralIdentity)> {
+    ) -> impl Iterator<Item = (StateType, &StateName, &StructuralIdentity)> + use<'_> {
         self.defs.iter().flat_map(|(state_type, namespace)| {
             namespace
                 .iter()
@@ -149,7 +149,7 @@ impl CollectionDefRegistry {
     /// Returns every registered `(state_type, name)` collection.
     /// Admission also follows marker payloads to discover unregistered
     /// collections.
-    pub(crate) fn collections(&self) -> impl Iterator<Item = (StateType, &StateName)> {
+    pub(crate) fn collections(&self) -> impl Iterator<Item = (StateType, &StateName)> + use<'_> {
         self.defs.iter().flat_map(|(state_type, namespace)| {
             namespace.keys().map(move |name| (*state_type, name))
         })

@@ -6,7 +6,6 @@ use crate::consumer::decode::ResultRequestReader;
 use crate::consumer::error::ConsumerError;
 use crate::consumer::handler::{EventHandler, HandlerProvider};
 use crate::consumer::kafka_context::{ContextHandles, PartitionProviders, new_context};
-use crate::consumer::observer::KafkaObserver;
 use crate::consumer::poll::{PollConfig, poll};
 use crate::consumer::probes::ProbeServer;
 use crate::consumer::sweep::drain_managers;
@@ -31,10 +30,6 @@ use whoami::hostname;
 
 /// Everything startup needs beyond the consumer configuration and the two
 /// per-partition providers.
-///
-/// Deliberately not `Clone`: one value can serve only one consumer, so a mode
-/// cannot hand two consumers two different observers without a second,
-/// grep-visible [`KafkaObserver::new`] call.
 pub(in crate::consumer) struct StartupServices<'a, P> {
     /// Idempotence version stamped into the partition configuration.
     pub(in crate::consumer) version: Arc<str>,
@@ -42,10 +37,6 @@ pub(in crate::consumer) struct StartupServices<'a, P> {
     pub(in crate::consumer) telemetry: &'a Telemetry,
     /// Stall-detection registry, shared with the probe server.
     pub(in crate::consumer) heartbeats: HeartbeatRegistry,
-    /// The consumer's one Kafka observation handle. The same instance its
-    /// primary consumer's context holds, which updates it from the statistics
-    /// callback.
-    pub(in crate::consumer) observer: KafkaObserver,
     /// The partition managers shared by startup, health, and shutdown.
     pub(in crate::consumer) managers: Arc<Managers<P>>,
 }
@@ -54,21 +45,12 @@ pub(in crate::consumer) struct StartupServices<'a, P> {
 /// partition machinery to a Kafka consumer and starting its background poll
 /// loop. The provider creates per-partition stores with independent caches.
 ///
-/// The primary consumer is the sole source of Kafka observations: it is the
-/// client configured to report statistics, and its first observation is seeded
-/// by [`KafkaObserver::install_startup_metadata`], which owns that contract.
-///
 /// `requests` selects result-request reading by type.
-///
-/// Every caller wraps this future in `Box::pin`, because
-/// `clippy::large_futures` warns otherwise. The allocation is one per consumer
-/// start.
 ///
 /// Fails if the configuration is invalid, the probe server can't be started
 /// (if enabled), the consumer context can't be created, the hostname can't be
 /// retrieved for the client ID, the Kafka consumer can't be created with the
-/// provided configuration, topic subscription fails, the startup metadata
-/// fetch fails.
+/// provided configuration, or topic subscription fails.
 pub(in crate::consumer) async fn initialize_consumer<T, P, SP, C, R>(
     consumer_config: &ConsumerConfiguration,
     handler_provider: T,
@@ -87,14 +69,11 @@ where
     C::Payload: EventType + Clone + EventIdentity,
     R: ResultRequestReader + 'static,
 {
-    if let Err(error) = consumer_config.validate() {
-        return Err(error.into());
-    }
+    consumer_config.validate()?;
     let StartupServices {
         version,
         telemetry,
         heartbeats,
-        observer,
         managers,
     } = services;
 
@@ -107,17 +86,11 @@ where
     // an unreachable thread that holds the Kafka client forever. The probe
     // server binds first: a misconfigured port fails in microseconds, ahead of
     // the client's network round trips, and no consumer exists yet to release.
-    let probe_server = match consumer_config
+    let probe_server = consumer_config
         .probe_port
         .filter(|_| !consumer_config.mock)
         .map(|port| ProbeServer::new(port, managers.clone(), heartbeats.clone()))
-        .transpose()
-    {
-        Ok(probe_server) => probe_server,
-        Err(error) => {
-            return Err(error.into());
-        }
-    };
+        .transpose()?;
 
     let started = start_client::<T, P, SP, C>(
         consumer_config,
@@ -128,24 +101,19 @@ where
             managers: managers.clone(),
             assignment_tx,
             telemetry: telemetry.sender(),
-            observer: observer.clone(),
         },
         version,
-        observer.clone(),
     )
     .await;
 
-    // The failure arm for every step after the probe bound: the observation is
-    // discarded, the partition managers swept, and the probe port freed.
-    // Clearing after the task, rather than inside it,
-    // also covers a fetch that panicked — see `KafkaObserver::clear`.
+    // The failure arm for every step after the probe bound: the partition
+    // managers are swept and the probe port freed.
     //
     // Both arms below sweep retained managers. After a normal revoke, the map
     // is empty and the sweep does nothing.
     let consumer = match started {
         Ok(consumer) => consumer,
         Err(error) => {
-            observer.clear();
             drain_managers(&managers).await;
             return Err(release_probe(probe_server, error).await);
         }
@@ -176,7 +144,6 @@ where
     let runtime_state = Arc::new(Mutex::new(Some(RuntimeState {
         poll_handle,
         probe_server,
-        observer,
     })));
 
     Ok(ProsodyConsumer {
@@ -188,10 +155,9 @@ where
     })
 }
 
-/// Builds the client, subscribes it, seeds the observer, and reads the cluster
-/// id.
+/// Builds the client and subscribes it.
 ///
-/// All four run inside one blocking task. Subscribing and fetching block, and
+/// Both run inside one blocking task. Subscribing blocks, and
 /// dropping a `BaseConsumer` poll-loops until its queue closes, so the client
 /// lives and dies inside that task. The returned context type captures no
 /// borrow, which is what lets a failure arm surrender the client to a blocking
@@ -199,8 +165,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`ConsumerError`] when the context, the client, the subscription or
-/// the metadata fetch fails, or when the blocking task does not join.
+/// Returns [`ConsumerError`] when the context, the client, or the subscription
+/// fails, or when the blocking task does not join.
 async fn start_client<T, P, SP, C>(
     consumer_config: &ConsumerConfiguration,
     handler_provider: T,
@@ -208,7 +174,6 @@ async fn start_client<T, P, SP, C>(
     watermark_version: Arc<WatermarkVersion>,
     handles: ContextHandles<C::Payload>,
     version: Arc<str>,
-    observer: KafkaObserver,
 ) -> Result<BaseConsumer<impl ConsumerContext + use<T, P, SP, C>>, ConsumerError>
 where
     T: HandlerProvider,
@@ -235,7 +200,6 @@ where
         let topics = &consumer_config.subscribed_topics;
         let topics: Vec<&str> = topics.iter().map(String::as_str).collect();
         consumer.subscribe(&topics)?;
-        observer.install_startup_metadata(&consumer)?;
         Ok::<_, ConsumerError>(consumer)
     })
     .await

@@ -306,7 +306,7 @@ impl MessageDeferStore for CassandraMessageDeferStore {
                     .map_err(CassandraStoreError::from)?;
 
                 self.cache.insert(Arc::clone(key), Some((next_offset, 0)));
-                Ok(MessageRetryCompletionResult::MoreMessages { next_offset })
+                Ok(MessageRetryCompletionResult::MoreMessages)
             } else {
                 self.delete_key(key).await?;
                 Ok(MessageRetryCompletionResult::Completed)
@@ -329,9 +329,7 @@ impl MessageDeferStore for CassandraMessageDeferStore {
                 .map_err(CassandraStoreError::from)?;
 
             self.cache.insert(Arc::clone(key), Some((cur_next, 0)));
-            Ok(MessageRetryCompletionResult::MoreMessages {
-                next_offset: cur_next,
-            })
+            Ok(MessageRetryCompletionResult::MoreMessages)
         }
     }
 

@@ -34,7 +34,6 @@ use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
     CassandraStore as CassandraCellStore, CellQueries, IdentityQueries, PublicationQueries,
 };
-use crate::state::cell_key::Direction;
 use crate::state::descriptor::deque::DEQUE_POINT_ITERATION_MAX;
 use crate::state::descriptor::{
     DescriptorIdentity, deque_state, map_state, set_state, value_state,
@@ -76,10 +75,10 @@ const PROPERTY_WORKERS: u64 = 8;
 static BACKEND: OnceCell<CassandraReaderBackend> = OnceCell::const_new();
 
 /// The live-Cassandra [`ReaderBackend`]. It holds one
-/// `CassandraStore`, which bundles a shared session, prepared
-/// queries, and one assignment workspace. That store is
-/// cloned into a fresh owner session for each event. The reader reads through
-/// [`CassandraCellResources`] over the same session and the same queries.
+/// `CassandraStore`, which bundles a shared session and prepared queries.
+/// That store is cloned into a fresh owner session for each event. The reader
+/// reads through [`CassandraCellResources`] over the same session and the same
+/// queries.
 struct CassandraReaderBackend {
     store: CassandraCellStore,
     cells: CassandraCellResources,
@@ -239,7 +238,7 @@ macro_rules! cassandra_reader_prop {
                         key: &key,
                         count: PartitionCount::MIN,
                     };
-                    Box::pin($runner(backend, $descriptor_ctor($name), &case, trace)).await
+                    $runner(backend, $descriptor_ctor($name), &case, trace).await
                 })
             }
             let cases = integration_test_count(25);
@@ -402,18 +401,12 @@ fn reader_deque_scan_committed() -> Result<()> {
         let deps = backend.deps();
         let reader = StateReader::new(&deps, sub, descriptor)?;
         let model: Vec<Value> = (0..width).map(|i| Value::from(i as i64)).collect();
-        let forward = Box::pin(collect_stream(
-            reader.stream(key.clone(), Direction::Forward).await?,
-        ))
-        .await?;
+        let forward = Box::pin(collect_stream(reader.values(key.clone()).stream())).await?;
         ensure!(
             forward == model,
             "forward scan must equal the ordered model"
         );
-        let backward = Box::pin(collect_stream(
-            reader.stream(key, Direction::Backward).await?,
-        ))
-        .await?;
+        let backward = Box::pin(collect_stream(reader.values(key).reverse().stream())).await?;
         let mut expect_backward = model;
         expect_backward.reverse();
         ensure!(

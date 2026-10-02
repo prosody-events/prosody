@@ -85,16 +85,16 @@ async fn check<B: ReaderBackend>(
             Ok(reader.contains(case.key.clone(), member).await? == model.contains(member))
         }),
         reader.contains_many(case.key.clone(), &KEY_POOL),
-        collect_query(reader.keys(case.key.clone(), Direction::Forward)),
-        collect_query(
+        collect_stream(reader.keys(case.key.clone()).stream()),
+        collect_stream(
             reader
-                .query(case.key.clone(), Direction::Forward)
+                .keys(case.key.clone())
                 .after(&-2)
                 .to(&1)
                 .limit(NonZeroUsize::MIN)
-                .keys()
+                .stream()
         ),
-        collect_query(reader.keys(case.key.clone(), Direction::Backward)),
+        collect_stream(reader.keys(case.key.clone()).reverse().stream()),
     );
     let points = points?;
     let presence = presence?;
@@ -104,7 +104,7 @@ async fn check<B: ReaderBackend>(
     let expected = KEY_POOL.map(|member| model.contains(&member));
     Ok(empty == model.is_empty()
         && points
-        && presence == expected
+        && *presence == expected
         && forward == model.iter().copied().collect::<Vec<_>>()
         && bounded == model.range(-1..=1).take(1).copied().collect::<Vec<_>>()
         && backward == model.iter().rev().copied().collect::<Vec<_>>())

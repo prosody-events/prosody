@@ -10,6 +10,7 @@ use super::{
     order_preserving_i64, order_preserving_i64_decode,
 };
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::descriptor::map::MapKeysetKey;
 use bytes::BytesMut;
 use quickcheck::{QuickCheck, TestResult};
 use std::borrow::Borrow;
@@ -87,7 +88,8 @@ fn fixed_width_codecs_reject_bad_length() {
 /// codecs cannot produce.
 #[test]
 fn utf8_codec_rejects_invalid_utf8() {
-    // 0xFF is never a valid UTF-8 byte (continuation/leading-byte rules forbid it).
+    // 0xFF is never a valid UTF-8 byte (continuation/leading-byte rules forbid
+    // it).
     let result = Utf8KeyCodec::decode(&[0xFF]);
     assert!(matches!(result, Err(KeyCodecError::InvalidUtf8(_))));
     if let Err(error) = result {
@@ -161,35 +163,41 @@ fn unit_key_round_trips_only_the_empty_coordinate() {
     ));
 }
 
-/// Byte-identity law: every key codec is its own payload codec — `serialize`
-/// writes exactly `encode`'s bytes and `deserialize` agrees with `decode` —
-/// which is what lets a key ride as a cell payload with no
+/// Byte-identity law: every key codec is its own payload codec — each
+/// serializer writes exactly `encode`'s bytes and `deserialize` agrees with
+/// `decode` — which is what lets a key ride as a cell payload with no
 /// adapter. Held by construction today (the `Codec` impls delegate); this
 /// property guards against a future impl drifting the two byte forms apart.
 #[test]
 fn prop_key_codec_payload_bytes_are_coordinate_bytes() {
-    fn agrees<KC>(key: KC::Key) -> bool
+    fn agrees<KC>(key: KC::Key) -> Result<bool, KeyCodecError>
     where
         KC: OrderedKeyCodec,
         KC::Key: Clone + PartialEq,
     {
-        let mut codec = KC::default();
-        let mut buf = Vec::new();
-        if codec.serialize(key.clone(), &mut buf).is_err() {
-            return false;
-        }
-        let mut borrowed = Vec::new();
-        codec.serialize_ref(&key, &mut borrowed).is_ok()
-            && borrowed == buf
-            && buf == KC::encode(key.borrow()).as_bytes()
-            && codec.deserialize(&mut buf.clone()) == Ok(key.clone())
-            && codec.deserialize_owned(BytesMut::from(buf.as_slice())) == Ok(key)
+        KC::with_cached_local(|codec| {
+            let mut buf = Vec::new();
+            codec.serialize(key.clone(), &mut buf)?;
+            let mut borrowed = Vec::new();
+            codec.serialize_ref(&key, &mut borrowed)?;
+            let mut input = vec![42];
+            codec.serialize_key(key.borrow(), &mut input)?;
+            let owned = codec.serialize_bytes(key.clone())?;
+            Ok(input[0] == 42
+                && input[1..] == buf
+                && borrowed == buf
+                && owned == buf
+                && buf == KC::encode(key.borrow()).as_bytes()
+                && codec.deserialize(&mut buf.clone())? == key
+                && codec.deserialize_owned(BytesMut::from(buf.as_slice())) == Ok(key))
+        })
     }
-    fn prop(s: String, i: i64, u: u64) -> bool {
-        agrees::<Utf8KeyCodec>(s)
-            && agrees::<I64KeyCodec>(i)
-            && agrees::<U64KeyCodec>(u)
-            && agrees::<UnitKey>(())
+    fn prop(s: String, i: i64, u: u64) -> Result<bool, KeyCodecError> {
+        Ok(agrees::<Utf8KeyCodec>(s)?
+            && agrees::<I64KeyCodec>(i)?
+            && agrees::<U64KeyCodec>(u)?
+            && agrees::<UnitKey>(())?
+            && agrees::<MapKeysetKey>(())?)
     }
-    QuickCheck::new().quickcheck(prop as fn(String, i64, u64) -> bool);
+    QuickCheck::new().quickcheck(prop as fn(String, i64, u64) -> Result<bool, KeyCodecError>);
 }

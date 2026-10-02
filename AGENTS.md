@@ -6,7 +6,7 @@ Distributed Kafka consumer framework with a timer system and pluggable storage b
 
 These come before everything else. Every change is judged against them.
 
-**Write code that is simple, clear, well-factored, elegant, beautiful, easy to understand, correct, and idiomatic.** A reader should grasp the intent without effort. If a change makes the code harder to read, the change is wrong, even if it's faster or shorter. If two designs are correct, pick the one that's easier to delete.
+**Write code that is simple, clear, well-factored, DRY, performant, elegant, beautiful, easy to understand, correct, and idiomatic.** A reader should grasp the intent without effort. If a change makes the code harder to read, the change is wrong, even if it's faster or shorter. If two designs are correct, pick the one that's easier to delete.
 
 **Make invalid states unrepresentable in the type system.** When the compiler can prove a contract, no test, comment, or convention has to. Prefer:
 - Distinct types for distinct concepts (`TimerRequest` vs `Trigger`) over flag fields and "set this when X" rules.
@@ -16,7 +16,7 @@ These come before everything else. Every change is judged against them.
 
 If a bug class can be made uncompilable, do that instead of writing a runtime check.
 
-**Delete more than you add.** Every change should leave the codebase smaller, simpler, or both — measured by lines, types, indirections, or cognitive load. If you must add code, look first for duplication you can fold, abstractions that no longer pay rent, dead branches, and stale comments. The end-state diff should net negative whenever the task allows. Bloat compounds; aggressively prune. The bar applies per change, and line count is not the only axis: a fold that buys line savings with generic machinery (GATs, trait plumbing, flag parameters) is not a simplification — plain duplicated arms are often the better reading.
+**Delete more than you add.** Every change should leave the codebase smaller, simpler, or both — measured by lines, types, indirections, or cognitive load. If you must add code, look first for duplication you can fold, abstractions that no longer pay rent, dead branches, and stale comments. The end-state diff should net negative whenever the task allows. Each added line must be inherent to the problem, not incidental to the solution. Bloat compounds; aggressively prune. The bar applies per change, and line count is not the only axis: a fold that buys line savings with generic machinery (GATs, trait plumbing, flag parameters) is not a simplification — plain duplicated arms are often the better reading.
 
 **Identify, document, and enforce invariants.** For every load-bearing piece of state:
 1. Name the invariant.
@@ -50,7 +50,8 @@ aspirations — perform each one; do not merely agree with it:
    exemplar path, metric motivating the change — was verified to resolve, not
    recalled from memory. Re-measure headline numbers before acting on them;
    measurement artifacts (file moves, reclassified lines) masquerade as signal.
-8. The diff is net-negative, or each addition is individually justified.
+8. The diff is net-negative, or each addition is individually justified as
+   inherent to the problem.
 
 ## Critical Rules
 
@@ -74,7 +75,7 @@ aspirations — perform each one; do not merely agree with it:
   by user key or collection must have a fixed capacity bound — at that scale
   even ~100 bytes per key×collection is 10–60 GiB. Acceptable homes for keyed
   state: fjall (RAM = block cache + memtables; data spills to the
-  assignment-scoped disk workspace) and a capacity-bounded `quick_cache`. An
+  assignment's keyspace on disk) and a capacity-bounded `quick_cache`. An
   insert-only `scc` map/set keyed by key or collection is a defect regardless
   of entry size. The former in-RAM `MarkerMemo` checked set was this bug;
   `MarkerCheckSet` is its disk-backed fix. Every in-memory map
@@ -113,6 +114,15 @@ Tiger style and data-oriented design agree: minimize allocation, and never
   ever seen") on the hot path. If a reusable scratch buffer is truly
   unavoidable, allocate it once at construction with a fixed bound and reuse it
   — never amortize-grow it per call.
+- **The caller controls boxing.** Never box a future inside the library to
+  make it smaller. A caller can compose other futures first and then box the
+  whole composition once. Tokio keeps every spawned task on the heap, so a
+  large future does not overflow a worker stack. When `clippy::large_futures`
+  fires at a call site, box at that call site: a test, an example, or a client
+  binding. Production library code uses `Box::pin` only to move a polled
+  future or stream, never to make a future smaller. Sole authorized
+  exception: `cassandra_queries!` boxes its concurrent statement preparation,
+  which runs only at store construction. Do not cite it to justify another.
 - **Simplicity is not sacrificed for this.** The design principles above still
   win: prefer the reading that's clearest. Zero-alloc and simple are usually
   *not* in conflict — the fn-item fix above removed an allocation *and* a line.

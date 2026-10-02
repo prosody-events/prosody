@@ -59,7 +59,7 @@ pub(crate) fn format_sql(template: &str, keyspace: &str, args: &[&str]) -> Strin
 /// This macro eliminates boilerplate for managing prepared CQL statements by
 /// generating:
 /// - The struct definition with `PreparedStatement` fields
-/// - An async `new()` constructor that prepares all statements
+/// - An async `new()` constructor that prepares all statements concurrently
 /// - Individual prepare functions for each query
 ///
 /// All generated fields are public and marked with `#[educe(Debug(ignore))]`
@@ -113,7 +113,8 @@ pub(crate) fn format_sql(template: &str, keyspace: &str, args: &[&str]) -> Strin
 ///
 /// # Requirements
 ///
-/// None - the macro is fully self-contained and handles all necessary imports.
+/// The invoking crate must depend on `educe`, `paste`, `scylla`, and `tokio`
+/// with the `macros` feature.
 #[macro_export]
 macro_rules! cassandra_queries {
     (
@@ -139,7 +140,8 @@ macro_rules! cassandra_queries {
 
         // Generate the impl block with new() function
         impl $name {
-            /// Creates a new instance with all prepared statements.
+            /// Creates a new instance with all prepared statements. It
+            /// prepares every statement concurrently.
             ///
             /// # Errors
             ///
@@ -148,11 +150,15 @@ macro_rules! cassandra_queries {
                 session: &::scylla::client::session::Session,
                 keyspace: &str,
             ) -> ::std::result::Result<Self, $crate::cassandra::errors::CassandraStoreError> {
-                $(
-                    let $field = ::paste::paste! {
-                        [<prepare_ $field>](session, keyspace).await?
-                    };
-                )*
+                // The fixed statement count bounds the join. Stores prepare
+                // only at construction, so the one allocation is off every
+                // hot path. The box keeps every constructor's future small.
+                let ($($field,)*) = ::std::boxed::Box::pin(async {
+                    ::paste::paste! {
+                        ::tokio::try_join!($([<prepare_ $field>](session, keyspace)),*)
+                    }
+                })
+                .await?;
 
                 ::std::result::Result::Ok(Self {
                     $(

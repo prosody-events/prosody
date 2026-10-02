@@ -78,7 +78,7 @@ impl HookProbe {
                             &mut inner,
                             StateType::Application,
                             name,
-                            &value_cell(),
+                            value_cell().as_ref(),
                         )
                         .await
                         .map_err(|e| e.to_string()),

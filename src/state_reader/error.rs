@@ -150,7 +150,7 @@ impl From<StateAccessError> for StateReaderError {
 /// `Terminal`. Shutting the client down is meaningless for an ownerless
 /// cross-group reader, and a faulted loader or driver may recover on a retry.
 /// Mirrors the owner-side fold in
-/// [`ErasedStateError::from_classified`](crate::consumer::event_context::ErasedStateError).
+/// [`ErasedStateError::from_classified`](crate::state::erased::ErasedStateError).
 fn client_category(category: ErrorCategory) -> ErrorCategory {
     match category {
         ErrorCategory::Terminal => ErrorCategory::Transient,

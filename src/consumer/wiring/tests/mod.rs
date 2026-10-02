@@ -18,8 +18,8 @@ use crate::consumer::middleware::timeout::TimeoutConfiguration;
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::storage::{ComponentsOf, ConsumerStorageBackend, ConsumerStorageInputs};
 use crate::consumer::{
-    CommonConfiguration, ConsumerConfiguration, ConsumerError, KafkaObserver, Managers,
-    PeerInitError, ProsodyConsumer,
+    CommonConfiguration, ConsumerConfiguration, ConsumerError, Managers, PeerInitError,
+    ProsodyConsumer,
 };
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MemoryLoader;
@@ -227,10 +227,8 @@ impl ConsumerStorageBackend<JsonCodec> for RecordingMemoryBackend {
         &self,
         inputs: ConsumerStorageInputs,
         keyed_state: &KeyedStateInputs,
-        observer: KafkaObserver,
     ) -> impl Future<Output = Result<ComponentsOf<JsonCodec, Self>, ConsumerError>> + Send {
-        self.inner
-            .build_consumer_components(inputs, keyed_state, observer)
+        self.inner.build_consumer_components(inputs, keyed_state)
     }
 }
 
@@ -430,7 +428,6 @@ async fn start<R: ResultRequestReader + 'static>(
             version: keyed_state.version.clone(),
             telemetry: &telemetry,
             heartbeats,
-            observer: KafkaObserver::new(&config.group_id),
             managers,
         },
         requests,

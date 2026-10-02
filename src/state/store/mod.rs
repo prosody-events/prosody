@@ -19,20 +19,22 @@
 use super::cell::{Presence, Projection, ProvisionalCell, ProvisionalWrite, Values};
 use super::cell_key::{CellKey, Coordinate, Scan, Section};
 use super::identity::{CollectionId, CollectionRef};
-use super::marker::{EventMarker, MarkerState, SectionClear};
+use super::marker::{EventMarker, MarkerState, ProvisionalStage, SectionClear};
 use crate::error::ClassifyError;
+use crate::state::cell_key::CellRef;
 use bytes::Bytes;
 use futures::Stream;
 use std::error::Error;
 use std::future::Future;
 use std::num::NonZeroUsize;
 
-pub(crate) use super::store_helpers::{
-    dedupe, expand_to_input_order, provisional_point_loop, section_batches,
-    sorted_unique_coordinates,
+mod batch;
+
+pub(crate) use batch::CELL_BATCH;
+pub use batch::{Answers, CacheBatch, CellBuffer, CoordinateBatch, Durable, ReadBatch};
+pub(crate) use batch::{
+    distinct, provisional_point_loop, section_batches, sorted_unique_coordinates,
 };
-pub(crate) use super::store_types::CELL_BATCH;
-pub use super::store_types::{CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch, Durable};
 
 /// Sizes the fetches of one read. The first fetch equals the caller's
 /// expectation, capped at the transport maximum. Each later fetch doubles,
@@ -77,33 +79,29 @@ pub trait CellRead<P: Projection>: CellBackend {
     fn read<'a>(
         &'a self,
         collection: &'a CollectionId,
-        cell: &'a CellKey,
-    ) -> impl Future<Output = Result<Durable<P>, Self::Error>> + Send + 'a;
+        cell: CellRef<'a>,
+    ) -> impl Future<Output = Result<Durable<P>, Self::Error>> + Send + use<'a, Self, P>;
 
     /// Reads one section's coordinates in input order.
     ///
     /// Each result answers the input at the same position. Duplicate
-    /// coordinates share one read. Unique coordinates resolve in
+    /// coordinates share one read. Distinct coordinates resolve in
     /// first-occurrence order. The earliest affected position supplies the
     /// error. A backend can fail the whole batch before row resolution.
-    fn read_many<'a>(
+    fn read_many<'buf, 'a>(
         &'a self,
         collection: &'a CollectionId,
         section: Section,
-        batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CacheBatch<P>, Self::Error>> + Send + 'a {
-        async move {
-            let (coordinates, indices) = dedupe(batch);
-            let mut answers = CacheBatch::<P>::with_capacity(coordinates.len());
-            for coordinate in coordinates {
-                let cell = CellKey {
-                    section,
-                    coordinate: Coordinate::clone(coordinate),
-                };
-                answers.push(self.read(collection, &cell).await?);
-            }
-            Ok(expand_to_input_order(&indices, &answers))
-        }
+        batch: &'a ReadBatch<'buf>,
+    ) -> impl Future<Output = Result<CacheBatch<P>, Self::Error>> + Send + use<'buf, 'a, Self, P>
+    {
+        batch.read(move |coordinate| {
+            let cell = CellRef {
+                section,
+                coordinate,
+            };
+            self.read(collection, cell)
+        })
     }
 
     /// Scans present committed cells in coordinate order within one section.
@@ -111,7 +109,7 @@ pub trait CellRead<P: Projection>: CellBackend {
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a;
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + use<'a, Self, P>;
 }
 
 /// Stores durable cells and collection commit evidence.
@@ -119,13 +117,13 @@ pub trait CellRead<P: Projection>: CellBackend {
 /// A committed-absent cell has no row. Each operation that resolves a cell to
 /// absence deletes its row.
 pub trait CellStore: CellRead<Values> + CellRead<Presence> {
-    /// Point-reads one coordinate's provisional cell, or `None` when it is
-    /// absent or resolved (over-report-safe). The single-coordinate primitive
-    /// that [`provisional_point_loop`] fans out over to
-    /// supply [`provisional_many`](Self::provisional_many) for backends with no
-    /// native batch read (the memory store, test doubles); a backend with a
-    /// native `IN` read implements [`provisional_many`](Self::provisional_many)
-    /// directly and never routes through this.
+    /// Reads one coordinate's provisional cell. Returns `None` when the cell
+    /// is absent or resolved. A false `Some` is safe because admission resolves
+    /// the cell again.
+    ///
+    /// [`provisional_point_loop`] calls this once per distinct coordinate for
+    /// backends with no native batch read. A backend with a native `IN` read
+    /// implements [`provisional_many`](Self::provisional_many) directly.
     ///
     /// # Errors
     ///
@@ -134,7 +132,7 @@ pub trait CellStore: CellRead<Values> + CellRead<Presence> {
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + use<'a, Self>;
 
     /// Reads distinct provisional cells from one collection section in
     /// ascending coordinate order.
@@ -164,10 +162,12 @@ pub trait CellStore: CellRead<Values> + CellRead<Presence> {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>>
+    + Send
+    + use<'a, Self>;
 
     /// Stages provisional cells and writes the collection's Staged row from
-    /// the frozen `marker`. Cells and Staged bind the collection TTL.
+    /// the stage's frozen marker. Cells and Staged bind the collection TTL.
     /// The Staged row names the event, coordinates, and clears.
     ///
     /// # Staged row lifecycle
@@ -176,17 +176,16 @@ pub trait CellStore: CellRead<Values> + CellRead<Presence> {
     /// through [`Self::commit_provisional`] or [`Self::abort_provisional`].
     /// [`Self::write_resolved`] and [`Self::mark_resolved`] never write Staged.
     ///
-    /// Every write must occur in the frozen staged list
-    /// (`writes ⊆ marker.staged()`). Split stages use that full list for every
-    /// chunk, so admission can find every provisional coordinate.
+    /// [`ProvisionalStage`] guarantees that the marker lists every write.
+    /// Split stages send the full marker with every chunk, so admission can
+    /// find every provisional coordinate.
     /// The session freezes the payload once per collection at `finalize`.
     /// A retry can replace the same event's Staged row; handlers must produce
     /// the same result across retries.
     ///
-    /// `None` requires empty `writes`: it writes no Staged row and skips the
-    /// boundary check. A clears-only stage supplies a payload with empty
-    /// `staged()` and non-empty `clears()`. It writes Staged and checks the
-    /// boundary. Admission resolves prior residue before dispatch.
+    /// This verb overwrites any Staged row. Admission resolves prior residue
+    /// before dispatch. A clears-only stage supplies a payload with empty
+    /// `staged()` and non-empty `clears()`, and it still writes Staged.
     ///
     /// Staged carries frozen clear survivors that [`Self::commit_provisional`]
     /// applies at settle. Admission uses only that durable payload.
@@ -200,9 +199,8 @@ pub trait CellStore: CellRead<Values> + CellRead<Presence> {
     fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
-        writes: &'a [(CellKey, ProvisionalWrite)],
-        marker: Option<&'a EventMarker>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+        stage: ProvisionalStage<'a>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, Self>;
 
     /// Writes resolved cells in a same-partition batch with the collection TTL.
     /// `Some(data)` writes a committed value with null `event` and `prev`.
@@ -229,7 +227,7 @@ pub trait CellStore: CellRead<Values> + CellRead<Presence> {
         collection: &'a CollectionRef,
         cells: &'a [(CellKey, Option<Bytes>)],
         clears: &'a [SectionClear],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, Self>;
 
     /// Reads both marker rows from the store, without a memo.
     ///
@@ -239,7 +237,7 @@ pub trait CellStore: CellRead<Values> + CellRead<Presence> {
     fn marker_state<'a>(
         &'a self,
         collection: &'a CollectionId,
-    ) -> impl Future<Output = Result<MarkerState, Self::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<MarkerState, Self::Error>> + Send + use<'a, Self>;
 
     /// Promotes each `cell`'s provisional cell to resolved: nulls `event` and
     /// `prev`, keeping `data`. O(1) bytes per cell. Idempotent — promoting a
@@ -259,7 +257,7 @@ pub trait CellStore: CellRead<Values> + CellRead<Presence> {
         &'a self,
         collection: &'a CollectionRef,
         cells: &'a [CellKey],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, Self>;
 
     /// Writes Committed evidence, promotes staged values and frozen clears,
     /// then deletes Staged.
@@ -285,6 +283,9 @@ pub trait CellStore: CellRead<Values> + CellRead<Presence> {
     ///
     /// The frozen positions protect survivors without timestamp comparisons.
     /// Admission can retry this operation.
+    /// Unlike [`Self::write_provisional`], it takes no [`ProvisionalStage`].
+    /// A promote leaves no provisional cell, so an unlisted write cannot
+    /// strand.
     ///
     /// # Errors
     ///
@@ -294,7 +295,7 @@ pub trait CellStore: CellRead<Values> + CellRead<Presence> {
         collection: &'a CollectionRef,
         marker: &'a EventMarker,
         writes: &'a [(CellKey, ProvisionalWrite)],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, Self>;
 
     /// Restores each staged cell's committed base `prev` as its resolved value,
     /// then deletes Staged.
@@ -310,7 +311,7 @@ pub trait CellStore: CellRead<Values> + CellRead<Presence> {
         &'a self,
         collection: &'a CollectionRef,
         writes: &'a [(CellKey, ProvisionalWrite)],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, Self>;
 }
 
 #[cfg(test)]

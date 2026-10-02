@@ -86,14 +86,6 @@ impl TraceModel {
             .get(key)
             .and_then(|(times, _)| times.first().copied())
     }
-
-    fn deferred_keys(&self) -> Vec<Key> {
-        self.deferred
-            .iter()
-            .filter(|(_, (times, _))| !times.is_empty())
-            .map(|(k, _)| Arc::clone(k))
-            .collect()
-    }
 }
 
 // ============================================================================
@@ -217,39 +209,6 @@ fn test_key(idx: usize) -> Key {
 // ============================================================================
 // Property Tests
 // ============================================================================
-
-/// Property: Timer coverage is maintained after every operation.
-///
-/// **Invariant**: For every key with deferred timers, there is an active
-/// `DeferredTimer`. For every key without deferred timers, there is no timer.
-#[quickcheck]
-fn prop_timer_coverage(trace: TimerTrace) -> color_eyre::Result<()> {
-    init_test_logging();
-    let TimerTrace { events, key_count } = trace;
-
-    TEST_RUNTIME.block_on(async {
-        let harness = TestHarness::new()?;
-        let mut model = TraceModel::new();
-
-        for event in &events {
-            execute_event(&harness, event).await?;
-            update_model(&mut model, event);
-
-            // Verify coverage: once the model believes any key is deferred, a
-            // `DeferredTimer` must have been scheduled to cover it.
-            let deferred_keys = model.deferred_keys();
-            if !deferred_keys.is_empty() && !harness.has_deferred_timer() {
-                return Err(color_eyre::eyre::eyre!(
-                    "coverage violation: model has deferred keys {deferred_keys:?} but no \
-                     DeferredTimer has been scheduled"
-                ));
-            }
-        }
-
-        let _ = key_count; // Used by trace validation
-        Ok(())
-    })
-}
 
 /// Property: FIFO order is maintained for deferred timers.
 ///

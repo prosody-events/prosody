@@ -94,12 +94,13 @@ pub mod map;
 pub mod set;
 mod value;
 
-pub use deque::{DequeDescriptor, DequeHandle, DequeQuery, DequeStateError, deque_state};
-pub use map::{MapDescriptor, MapHandle, MapQuery, MapStateError, map_state};
-pub use set::{SetDescriptor, SetHandle, SetQuery, SetStateError, set_state};
+pub use deque::{DequeDescriptor, DequeHandle, DequeStateError, deque_state};
+pub use map::{MapDescriptor, MapHandle, MapStateError, map_state};
+pub use set::{SetDescriptor, SetHandle, SetStateError, set_state};
 pub use value::{ValueDescriptor, ValueHandle, ValueKind, value_state};
 
 mod cell;
+pub(crate) use cell::FanoutOf;
 pub use cell::{
     BorrowedKeyOf, CellCodecError, CellResolver, CellStateError, CellType, ContextOf, FromSession,
     KeyOf, Keyed, ResolvedOf, WithResolver, WriteOf,

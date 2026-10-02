@@ -397,12 +397,12 @@ pub(super) async fn build_client_with<T: ClientHandler<Payload = Value>>(
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
     cassandra_builder.nodes(vec![CASSANDRA_HOST.to_owned()]);
 
-    let client = CassandraHighLevelClient::new(
+    let client = Box::pin(CassandraHighLevelClient::new(
         cassandra_builder.build()?,
         mode,
         &mut producer_builder,
         &consumer_builders,
-    )
+    ))
     .await?;
     Ok(client)
 }

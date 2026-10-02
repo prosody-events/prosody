@@ -2,35 +2,10 @@
 //!
 //! Traces describe expected behavior - test inputs become sequences of
 //! [`MessageEvent`] and [`TimerEvent`] with explicit outcomes. Verification
-//! happens against real store state and [`OutputEvent`] records.
+//! happens against real store state and the recorded timers.
 
-use crate::timers::datetime::CompactDateTime;
+use crate::Offset;
 use crate::timers::duration::CompactDuration;
-use crate::{Key, Offset};
-
-// ============================================================================
-// Output Events (recorded by CapturingContext)
-// ============================================================================
-
-/// Timer operation recorded by [`CapturingContext`] for verification.
-///
-/// The middleware schedules and clears timers through [`EventContext`].
-/// We capture these operations to verify timer coverage and cleanup invariants.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum OutputEvent {
-    /// Timer scheduled for key at specified time.
-    Scheduled {
-        /// Message key that was deferred.
-        key: Key,
-        /// Scheduled retry time.
-        time: CompactDateTime,
-    },
-    /// Timer cleared for key (queue empty).
-    Cleared {
-        /// Message key whose timer was cleared.
-        key: Key,
-    },
-}
 
 // ============================================================================
 // Message Event Types

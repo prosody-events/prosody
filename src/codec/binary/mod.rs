@@ -1,6 +1,8 @@
 //! Binary codec that copies bytes verbatim and uses a caller-supplied
 //! function to extract event metadata (id and type).
 
+use super::owned_bytes;
+use bytes::Bytes;
 use serde::de::value::MapAccessDeserializer;
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -130,8 +132,9 @@ impl BinaryFormat for JsonFormat {
 /// on the (now scratch) input to pull out the event id and type. The codec
 /// owns one extractor instance for its lifetime, so any state the extractor
 /// keeps (parser buffers, lookup tables) is reused across calls. On
-/// Owned serialization moves the byte vector into an empty output buffer.
-/// Borrowed serialization copies bytes because the payload must retain them.
+/// Owned serialization moves the byte vector into an empty output buffer, and
+/// [`Codec::serialize_bytes`] returns the vector as `Bytes`. Borrowed
+/// serialization copies bytes because the payload must retain them.
 /// Both decode forms preserve wire bytes before a mutable extractor runs.
 pub struct BinaryCodec<E: BinaryExtractor, F: BinaryFormat> {
     extractor: E,
@@ -184,6 +187,10 @@ impl<E: BinaryExtractor, F: BinaryFormat> Codec for BinaryCodec<E, F> {
         // A borrow requires one copy because the payload must retain its bytes.
         buf.extend_from_slice(&payload.bytes);
         Ok(())
+    }
+
+    fn serialize_bytes(&mut self, payload: Self::Payload) -> Result<Bytes, Self::Error> {
+        Ok(owned_bytes(payload.bytes))
     }
 
     fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R {

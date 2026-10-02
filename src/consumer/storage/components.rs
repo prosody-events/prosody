@@ -18,7 +18,6 @@ use crate::consumer::middleware::defer::timer::store::cassandra::queries::Querie
 use crate::consumer::middleware::defer::timer::store::{
     CassandraTimerDeferStoreProvider, MemoryTimerDeferStoreProvider,
 };
-use crate::consumer::observer::KafkaObserver;
 use crate::consumer::wiring::state::{
     CassandraStateProvider, KeyedStateInputs, MemoryStateProvider, cassandra_state_provider,
     memory_state_provider,
@@ -34,7 +33,9 @@ use crate::state::session::EventSession;
 use crate::timers::store::TriggerStoreProvider;
 use crate::timers::store::cassandra::CassandraTriggerStoreProvider;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
+use futures::TryFutureExt;
 use std::sync::Arc;
+use tokio::try_join;
 use tracing::debug;
 
 /// Providers and state wiring selected by one concrete backend.
@@ -75,7 +76,6 @@ where
         &self,
         inputs: ConsumerStorageInputs,
         keyed_state: &KeyedStateInputs,
-        observer: KafkaObserver,
     ) -> impl Future<Output = Result<ComponentsOf<C, Self>, ConsumerError>> + Send;
 }
 
@@ -129,7 +129,6 @@ pub(crate) async fn cassandra<C>(
     identities: CassandraDescriptorIdentityStore,
     publications: CassandraPublicationStore,
     loader: KafkaLoader<C>,
-    observer: KafkaObserver,
 ) -> Result<
     ConsumerComponents<
         CassandraTriggerStoreProvider,
@@ -145,52 +144,48 @@ where
     C: Codec,
     C::Payload: crate::EventIdentity + crate::EventType + Clone + Send + Sync + 'static,
 {
+    let ttl = dedup_ttl_seconds(inputs.dedup_ttl)?;
+    debug!(ttl_secs = ttl, "deduplication store TTL");
+
     let store = cells.session.clone();
     let keyspace = store.keyspace();
-    let trigger = CassandraTriggerStoreProvider::with_store(store.clone(), keyspace).await?;
-    let segment = CassandraSegmentStore::new(store.clone(), keyspace)
-        .await
-        .map_err(StoreCreationError::from)?;
+    let session = store.session();
+    let (trigger, segment, message_queries, timer_queries, dedup_queries, publisher, cache) = try_join!(
+        CassandraTriggerStoreProvider::with_store(store.clone(), keyspace).err_into(),
+        CassandraSegmentStore::new(store.clone(), keyspace).map_err(creation_error),
+        MessageQueries::new(session, keyspace).map_err(creation_error),
+        TimerQueries::new(session, keyspace).map_err(creation_error),
+        DeduplicationQueries::new(session, keyspace).map_err(creation_error),
+        keyed_state.cassandra_publication_setup(publications),
+        keyed_state.open_cache(),
+    )?;
+
     let messages = CassandraMessageDeferStoreProvider::new(
         store.clone(),
-        Arc::new(
-            MessageQueries::new(store.session(), keyspace)
-                .await
-                .map_err(StoreCreationError::from)?,
-        ),
+        Arc::new(message_queries),
         segment.clone(),
     );
     let timers = CassandraTimerDeferStoreProvider::new(
         store.clone(),
-        Arc::new(
-            TimerQueries::new(store.session(), keyspace)
-                .await
-                .map_err(StoreCreationError::from)?,
-        ),
+        Arc::new(timer_queries),
         segment,
         inputs.timer_spans,
     );
-    let ttl = dedup_ttl_seconds(inputs.dedup_ttl)?;
-    debug!(ttl_secs = ttl, "deduplication store TTL");
     let dedup = CassandraDeduplicationStoreProvider::new(
-        store.clone(),
-        Arc::new(
-            DeduplicationQueries::new(store.session(), keyspace)
-                .await
-                .map_err(StoreCreationError::from)?,
-        ),
+        store,
+        Arc::new(dedup_queries),
         ttl,
         inputs.dedup_cache_capacity,
     );
-    let publisher = keyed_state.cassandra_publication_setup(publications, observer);
     let state = cassandra_state_provider::<C>(
         keyed_state,
         dedup.clone(),
         cells,
         identities,
+        cache,
         loader.clone(),
         publisher,
-    )?;
+    );
     Ok(ConsumerComponents {
         trigger,
         messages,
@@ -199,4 +194,9 @@ where
         state,
         loader,
     })
+}
+
+/// Converts a store preparation failure into a consumer construction error.
+fn creation_error(error: impl Into<StoreCreationError>) -> ConsumerError {
+    error.into().into()
 }

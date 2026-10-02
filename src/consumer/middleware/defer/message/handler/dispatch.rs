@@ -35,15 +35,16 @@ where
     {
         // Already deferred: queue after existing messages to preserve order.
         // The inner handler does not run, so return `NoInner`.
-        if self
+        if let Some(retry_count) = self
             .store
             .is_deferred(message.key())
             .await
             .map_err(DeferError::Store)?
-            .is_some()
         {
             let offset = message.offset();
-            return self.append_to_deferred_queue(message.key(), offset).await;
+            return self
+                .append_to_deferred_queue(&context, message.key(), offset, retry_count)
+                .await;
         }
 
         let message_key = message.key().clone();

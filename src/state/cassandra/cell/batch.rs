@@ -120,12 +120,12 @@ pub(in crate::state) fn settle_batches<R>(
 /// Splits cells into ranges with space for the marker in every batch.
 /// The caller must include the marker when it executes each range.
 /// No cells produces one marker-only batch.
-pub(in crate::state) fn stage_batches<R>(
+pub(in crate::state) fn stage_batches<'c, R>(
     marker: &BatchUnit<R>,
-    cells: &[BatchUnit<R>],
+    cells: &'c [BatchUnit<R>],
     max_bytes: u64,
     max_count: usize,
-) -> impl Iterator<Item = Range<usize>> {
+) -> impl Iterator<Item = Range<usize>> + use<'c, R> {
     let cell_bytes = max_bytes.saturating_sub(marker.weight());
     let cell_limit = if marker.weight() > max_bytes {
         // An oversized marker permits only one cell, even when cells weigh zero.
@@ -145,7 +145,7 @@ pub(in crate::state) fn stage_chunk<'u, R>(
     marker: &'u BatchUnit<R>,
     cells: &'u [BatchUnit<R>],
     range: Range<usize>,
-) -> impl Iterator<Item = &'u BatchUnit<R>> {
+) -> impl Iterator<Item = &'u BatchUnit<R>> + use<'u, R> {
     iter::once(marker).chain(cells[range].iter())
 }
 

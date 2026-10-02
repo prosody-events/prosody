@@ -2,6 +2,7 @@ use super::*;
 use crate::state::cell::Values;
 use crate::state::store::CellRead;
 use crate::state::tests::support::evidence;
+use crate::state::tests::support::listed;
 
 /// Stage a set, observe it provisional, promote, read back resolved — the
 /// hot-path round-trip — then a direct resolved clear reads back absent. A fast
@@ -20,8 +21,10 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
         cell.clone(),
         ProvisionalWrite::new(Some(data.clone()), Committed::new(None), event(1)),
     )];
-    let marker = EventMarker::frozen(event(1), &writes, &[], &evidence([].into(), None));
-    store.write_provisional(&c, &writes, Some(&marker)).await?;
+    let marker = EventMarker::frozen(event(1), &writes, Vec::new(), &evidence([].into(), None));
+    store
+        .write_provisional(&c, listed(&marker, &writes)?)
+        .await?;
     let staged = provisional_cells(&store, c.id()).await?;
     let (key, prov) = staged
         .into_iter()
@@ -34,7 +37,9 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
 
     store.mark_resolved(&c, slice::from_ref(&cell)).await?;
     assert_eq!(
-        CellRead::<Values>::read(&store, c.id(), &cell).await?.0,
+        CellRead::<Values>::read(&store, c.id(), cell.as_ref())
+            .await?
+            .0,
         Committed::new(Some(data))
     );
     assert!(provisional_cells(&store, c.id()).await?.is_empty());
@@ -43,7 +48,9 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
         .write_resolved(&c, &[(cell.clone(), None)], &[])
         .await?;
     assert_eq!(
-        CellRead::<Values>::read(&store, c.id(), &cell).await?.0,
+        CellRead::<Values>::read(&store, c.id(), cell.as_ref())
+            .await?
+            .0,
         Committed::new(None)
     );
     Ok(())
@@ -74,8 +81,10 @@ async fn committed_clear_deletes_the_row() -> Result<()> {
         .await?;
     let write = ProvisionalWrite::new(None, Committed::new(Some(old.clone())), event(2));
     let writes = [(cell.clone(), write.clone())];
-    let marker = EventMarker::frozen(event(2), &writes, &[], &evidence([].into(), None));
-    store.write_provisional(&c, &writes, Some(&marker)).await?;
+    let marker = EventMarker::frozen(event(2), &writes, Vec::new(), &evidence([].into(), None));
+    store
+        .write_provisional(&c, listed(&marker, &writes)?)
+        .await?;
     let staged = provisional_cells(&store, c.id()).await?;
     let (_, prov) = staged
         .into_iter()
@@ -90,7 +99,9 @@ async fn committed_clear_deletes_the_row() -> Result<()> {
         .await?;
 
     assert_eq!(
-        CellRead::<Values>::read(&store, c.id(), &cell).await?.0,
+        CellRead::<Values>::read(&store, c.id(), cell.as_ref())
+            .await?
+            .0,
         Committed::new(None)
     );
 

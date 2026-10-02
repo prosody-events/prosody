@@ -18,6 +18,7 @@ fn cart() -> ValueDescriptor {
 
 const _: fn(&KeyedStateConfiguration) -> &Option<ByteSize> = |c| &c.owned_cache_size;
 const _: fn(&KeyedStateConfiguration) -> &Option<ByteSize> = |c| &c.read_cache_size;
+const _: fn(&KeyedStateConfiguration) -> &Option<ByteSize> = |c| &c.memtable_size;
 
 #[test]
 fn cache_sizes_parse_human_units_and_reject_degenerate_values() -> Result<()> {

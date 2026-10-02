@@ -25,15 +25,15 @@ use crate::codec::Codec;
 use crate::segment::partition_segment_id;
 use crate::state::access::StateAccessError;
 use crate::state::cell::Projection;
-use crate::state::cell_key::{CellKey, Scan, Section};
+use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::identity::{CollectionId, StateKey};
-use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store::{Answers, ReadBatch};
 use crate::state_reader::backend::{CommittedCellSource, ReaderBackend};
-use crate::state_reader::cache::CacheKey;
+use crate::state_reader::cache::CacheLookup;
 use crate::state_reader::partition_for_key;
 use crate::state_reader::source::{Source, ValidatedPublications};
 use futures::stream::{FuturesOrdered, Stream, StreamExt};
-use smallvec::smallvec;
+use std::borrow::Cow;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -125,25 +125,25 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
 
     /// `selected` when the operation already routed this source, else a fresh
     /// routing through [`Self::collection_id_for`].
-    fn resolved_id(
+    fn resolved_id<'a>(
         &self,
-        selected: Option<&CollectionId>,
+        selected: Option<&'a CollectionId>,
         source: &Source,
-    ) -> Result<CollectionId, StateAccessError> {
+    ) -> Result<Cow<'a, CollectionId>, StateAccessError> {
         match selected {
-            Some(id) => Ok(id.clone()),
-            None => self.collection_id_for(source),
+            Some(id) => Ok(Cow::Borrowed(id)),
+            None => self.collection_id_for(source).map(Cow::Owned),
         }
     }
 
-    fn cache_key(&self, source: &Source, cell: &CellKey) -> CacheKey {
-        (
-            source.clone(),
+    fn cache_key<'a>(&'a self, source: &'a Source, cell: CellRef<'a>) -> CacheLookup<'a> {
+        CacheLookup((
+            source,
             self.context.state_type,
-            self.context.name.clone(),
-            self.key.clone(),
-            cell.clone(),
-        )
+            &self.context.name,
+            &self.key,
+            cell,
+        ))
     }
 
     /// One source's committed point read, cached per policy. `selected` is the
@@ -153,7 +153,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         &self,
         selected: Option<&CollectionId>,
         source: &Source,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Result<Option<P::Payload>, StateAccessError>
     where
         B::Cells: CommittedCellSource<P>,
@@ -190,40 +190,38 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         selected: Option<&CollectionId>,
         source: &Source,
         section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
+        batch: &ReadBatch<'_>,
+    ) -> Result<Answers<Option<P::Payload>>, StateAccessError>
     where
         B::Cells: CommittedCellSource<P>,
     {
         match self.context.def.read_cache_ttl {
             None => {
                 let id = self.resolved_id(selected, source)?;
-                let buffer = CommittedCellSource::<P>::load_many(
+                CommittedCellSource::<P>::load_many(
                     self.context.backend.cells(),
                     &id,
                     section,
                     batch,
                 )
                 .await
-                .map_err(|error| StateAccessError::store(&error))?;
-                // `CommittedCellSource` is a downstream trait, so check the
-                // alignment its contract promises in every build. The cached
-                // arm gets the same check inside `get_many_cached`.
-                if buffer.len() != batch.len() {
-                    return Err(StateAccessError::misaligned_batch(
-                        buffer.len(),
-                        batch.len(),
-                    ));
-                }
-                Ok(buffer)
+                .map_err(|error| StateAccessError::store(&error))
             }
             Some(ttl) => {
-                let keys = self.batch_cache_keys(source, section, batch);
+                let key = |coordinate| {
+                    self.cache_key(
+                        source,
+                        CellRef {
+                            section,
+                            coordinate,
+                        },
+                    )
+                };
                 // `collection_id_for` runs only when the batch fill fires (a
                 // miss), never when the batch is served entirely from the cache.
                 self.context
                     .cache
-                    .get_many_cached::<P, _, _>(&keys, ttl, || async {
+                    .get_many_cached::<P, _, _>(batch, key, ttl, || async {
                         let id = self.resolved_id(selected, source)?;
                         CommittedCellSource::<P>::load_many(
                             self.context.backend.cells(),
@@ -239,37 +237,12 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         }
     }
 
-    /// Builds one bounded batch of cache keys.
-    ///
-    /// A stream chunk can exceed `CELLS_INLINE`, so this buffer can spill to
-    /// the heap. The allocation is sized once and bounded by the batch.
-    /// Increasing `CELLS_INLINE` would inflate every `CellBuffer` instead.
-    fn batch_cache_keys(
-        &self,
-        source: &Source,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> CellBuffer<CacheKey> {
-        batch
-            .iter()
-            .map(|coordinate| {
-                self.cache_key(
-                    source,
-                    &CellKey {
-                        section,
-                        coordinate: coordinate.clone(),
-                    },
-                )
-            })
-            .collect()
-    }
-
     /// One operation's committed point read: address the already-selected
     /// source, or probe for one.
     async fn point_read<P: Projection>(
         &self,
         selection: &mut Option<PinnedSource>,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Result<Option<P::Payload>, StateAccessError>
     where
         B::Cells: CommittedCellSource<P>,
@@ -286,7 +259,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     async fn probe_point<P: Projection>(
         &self,
         selection: &mut Option<PinnedSource>,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Result<Option<P::Payload>, StateAccessError>
     where
         B::Cells: CommittedCellSource<P>,
@@ -306,8 +279,8 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         &self,
         selection: &mut Option<PinnedSource>,
         section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
+        batch: &ReadBatch<'_>,
+    ) -> Result<Answers<Option<P::Payload>>, StateAccessError>
     where
         B::Cells: CommittedCellSource<P>,
     {
@@ -324,8 +297,8 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         &self,
         selection: &mut Option<PinnedSource>,
         section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError>
+        batch: &ReadBatch<'_>,
+    ) -> Result<Answers<Option<P::Payload>>, StateAccessError>
     where
         B::Cells: CommittedCellSource<P>,
     {
@@ -333,7 +306,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
             selection,
             |source| self.cached_batch::<P>(None, source, section, batch),
             |buffer| buffer.iter().any(Option::is_some),
-            || smallvec![None; batch.len()],
+            || batch.map(|_| None),
         )
         .await
     }
@@ -384,7 +357,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         &'a self,
         id: CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + use<'a, C, B, P>
     where
         B::Cells: CommittedCellSource<P>,
     {
@@ -406,7 +379,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         &'a self,
         selected: Option<&'a PinnedSource>,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + use<'a, C, B, P>
     where
         B::Cells: CommittedCellSource<P>,
     {

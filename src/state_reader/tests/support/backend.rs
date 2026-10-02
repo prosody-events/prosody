@@ -87,14 +87,14 @@ pub(crate) async fn publish_source<D: StateDescriptor>(
 /// and the reader reads from, plus the publication and identity control-plane
 /// stores.
 #[derive(Clone)]
-pub(in crate::state_reader::tests) struct MemoryHarness {
-    pub(in crate::state_reader::tests) cells: MemoryCells,
-    pub(in crate::state_reader::tests) publications: MemoryPublicationStore,
-    pub(in crate::state_reader::tests) identities: MemoryDescriptorIdentityStore,
+pub(crate) struct MemoryHarness {
+    pub(crate) cells: MemoryCells,
+    pub(crate) publications: MemoryPublicationStore,
+    pub(crate) identities: MemoryDescriptorIdentityStore,
 }
 
 impl MemoryHarness {
-    pub(in crate::state_reader::tests) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             cells: MemoryCells::new(),
             publications: MemoryPublicationStore::new(),
@@ -103,7 +103,7 @@ impl MemoryHarness {
     }
 
     /// A shared-deps bundle over these handles with a wall-clock cache.
-    pub(in crate::state_reader::tests) fn deps(&self) -> StateReaderDependencies<JsonCodec> {
+    pub(crate) fn deps(&self) -> StateReaderDependencies<JsonCodec> {
         StateReaderDependencies::memory(
             "reader-test".to_owned(),
             Duration::from_secs(30),
@@ -135,9 +135,7 @@ pub(in crate::state_reader::tests) trait ReaderBackend {
     fn registry(&self) -> Arc<CollectionDefRegistry>;
 
     /// A cell store to seed one event through. Cloning shares the committed
-    /// backing, memory cells or Cassandra rows, across a trace's events. On
-    /// Cassandra, cloning also shares the one assignment workspace
-    /// lifecycle the store owns.
+    /// backing, memory cells or Cassandra rows, across a trace's events.
     fn owner_cell(&self) -> Self::OwnerCell;
 
     /// Advertises `(group, topic)` as a source of `name` and freezes `identity`

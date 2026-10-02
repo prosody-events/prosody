@@ -1,6 +1,7 @@
 //! Fixed-TTL cell store used by cache metadata tests.
 
 use super::*;
+use crate::state::cell_key::CellRef;
 use crate::state::marker::MarkerState;
 use std::future::ready;
 
@@ -24,8 +25,8 @@ impl<P: Projection> CellRead<P> for TtlStub {
     fn read<'a>(
         &'a self,
         _collection: &'a CollectionId,
-        _cell: &'a CellKey,
-    ) -> impl Future<Output = Result<Durable<P>, Self::Error>> + Send + 'a {
+        _cell: CellRef<'a>,
+    ) -> impl Future<Output = Result<Durable<P>, Self::Error>> + Send + use<'a, P> {
         ready(Ok((
             Committed::new(Some(P::from_value(self.value.clone()))),
             self.ttl,
@@ -36,7 +37,7 @@ impl<P: Projection> CellRead<P> for TtlStub {
         &'a self,
         _collection: &'a CollectionId,
         _scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + use<'a, P> {
         stream::empty()
     }
 }
@@ -46,7 +47,7 @@ impl CellStore for TtlStub {
         &'a self,
         _collection: &'a CollectionId,
         _cell: &'a CellKey,
-    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + use<'a> {
         ready(Ok(None))
     }
 
@@ -55,17 +56,17 @@ impl CellStore for TtlStub {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
-    {
+    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>>
+    + Send
+    + use<'a> {
         provisional_point_loop(self, collection, section, batch)
     }
 
     fn write_provisional<'a>(
         &'a self,
         _collection: &'a CollectionRef,
-        _writes: &'a [(CellKey, ProvisionalWrite)],
-        _marker: Option<&'a EventMarker>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        _stage: ProvisionalStage<'a>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a> {
         ready(Ok(()))
     }
 
@@ -74,7 +75,7 @@ impl CellStore for TtlStub {
         _collection: &'a CollectionRef,
         _cells: &'a [(CellKey, Option<Bytes>)],
         _clears: &'a [SectionClear],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a> {
         ready(Ok(()))
     }
 
@@ -82,14 +83,14 @@ impl CellStore for TtlStub {
         &'a self,
         _collection: &'a CollectionRef,
         _cells: &'a [CellKey],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a> {
         ready(Ok(()))
     }
 
     fn marker_state<'a>(
         &'a self,
         _collection: &'a CollectionId,
-    ) -> impl Future<Output = Result<MarkerState, Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<MarkerState, Self::Error>> + Send + use<'a> {
         ready(Ok(MarkerState::default()))
     }
 
@@ -98,7 +99,7 @@ impl CellStore for TtlStub {
         _collection: &'a CollectionRef,
         _marker: &'a EventMarker,
         _writes: &'a [(CellKey, ProvisionalWrite)],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a> {
         ready(Ok(()))
     }
 
@@ -106,7 +107,7 @@ impl CellStore for TtlStub {
         &'a self,
         _collection: &'a CollectionRef,
         _writes: &'a [(CellKey, ProvisionalWrite)],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a> {
         ready(Ok(()))
     }
 }

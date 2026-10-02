@@ -3,6 +3,7 @@ use crate::cassandra::TABLE_KEYED_STATE_CELL;
 use crate::state::cell::Values;
 use crate::state::marker::MarkerRow;
 use crate::state::store::CellRead;
+use crate::state::tests::support::listed;
 use crate::state::tests::support::{StageInspection, evidence};
 
 async fn read_cell_blob(fx: &Fixture, id: &CollectionId) -> Result<(Vec<u8>, i16)> {
@@ -68,7 +69,7 @@ async fn legacy_null_null_residue_reads_committed_none() -> Result<()> {
         .await?;
 
     assert_eq!(
-        CellRead::<Values>::read(&store, id, &cell).await?.0,
+        CellRead::<Values>::read(&store, id, cell.as_ref()).await?.0,
         Committed::new(None),
         "the decoder must read the legacy residue as committed-absence"
     );
@@ -172,8 +173,10 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
             event(1),
         ),
     )];
-    let marker = EventMarker::frozen(event(1), &writes, &[], &evidence([].into(), None));
-    store.write_provisional(&c, &writes, Some(&marker)).await?;
+    let marker = EventMarker::frozen(event(1), &writes, Vec::new(), &evidence([].into(), None));
+    store
+        .write_provisional(&c, listed(&marker, &writes)?)
+        .await?;
     let corrupt_cell = format!(
         "UPDATE {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} SET event = {{kind: 1, msg_dedup_id: \
          null, timer_type: 99, time: 0, tag: 0}} WHERE segment_id = ? AND key = ? AND state_type \
@@ -226,7 +229,7 @@ fn prop_cassandra_present_cell_is_uniquely_owned() {
         store
             .write_resolved(&c, &[(cell.clone(), Some(data))], &[])
             .await?;
-        let Some(bytes) = CellRead::<Values>::read(&store, c.id(), &cell)
+        let Some(bytes) = CellRead::<Values>::read(&store, c.id(), cell.as_ref())
             .await?
             .0
             .into_inner()

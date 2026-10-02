@@ -2,10 +2,12 @@ use super::*;
 
 type SetOp = (u8, usize);
 
-fn run_set_parity(ops: &[SetOp]) -> Result<bool> {
+fn run_set_parity(ops: &[SetOp], prefix: u8) -> Result<bool> {
     TEST_RUNTIME.block_on(async {
         let context = parity_context::<Value>()?;
         let handle = context.set_state(SET_NAME)?;
+        let prefix = pooled_prefix(prefix);
+        let listing = ErasedKeyQuery::default().prefix(prefix);
         let mut floor = BTreeSet::new();
         let mut visible = BTreeSet::new();
         for &(operation, index) in ops.iter().take(MAX_OPS) {
@@ -48,8 +50,12 @@ fn run_set_parity(ops: &[SetOp]) -> Result<bool> {
                     .contains_many(query.map(str::to_owned).to_vec())
                     .await?
                     != query.map(|member| visible.contains(member))
-                || drain_cursor(&handle.keys(KeyScanConfig::default())).await?
-                    != visible.iter().cloned().collect::<Vec<_>>()
+                || drain_cursor(&handle.keys().with_query(listing.clone()).stream()).await?
+                    != visible
+                        .iter()
+                        .filter(|key| key.starts_with(prefix))
+                        .cloned()
+                        .collect::<Vec<_>>()
             {
                 return Ok(false);
             }
@@ -62,13 +68,13 @@ fn run_set_parity(ops: &[SetOp]) -> Result<bool> {
 /// FALSIFICATION: make operation 1 skip the erased insert call.
 #[test]
 fn prop_erased_set_parity() {
-    fn prop(mut ops: Vec<SetOp>) -> TestResult {
+    fn prop(mut ops: Vec<SetOp>, prefix: u8) -> TestResult {
         ops.truncate(MAX_OPS);
-        match run_set_parity(&ops) {
+        match run_set_parity(&ops, prefix) {
             Ok(true) => TestResult::passed(),
             Ok(false) => TestResult::error(format!("set parity diverged: {ops:?}")),
             Err(error) => TestResult::error(format!("set trace failed: {error:#}")),
         }
     }
-    QuickCheck::new().quickcheck(prop as fn(Vec<SetOp>) -> TestResult);
+    QuickCheck::new().quickcheck(prop as fn(Vec<SetOp>, u8) -> TestResult);
 }

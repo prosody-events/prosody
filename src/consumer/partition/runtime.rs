@@ -41,7 +41,10 @@ struct TimerInitContext<'a> {
 async fn init_timer_manager<S>(
     trigger_store: S,
     ctx: TimerInitContext<'_>,
-) -> Option<(impl Stream<Item = PendingTimer<S>>, TimerManager<S>)>
+) -> Option<(
+    impl Stream<Item = PendingTimer<S>> + use<S>,
+    TimerManager<S>,
+)>
 where
     S: TriggerStore,
 {

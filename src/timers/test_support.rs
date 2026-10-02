@@ -65,7 +65,7 @@ pub(crate) fn create_test_trigger(
 /// `shutdown_tx` and can send `ShutdownPhase::Cancelling` to stop the
 /// background scheduler actor.
 pub(crate) async fn setup_timer_manager() -> Result<(
-    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
+    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>> + use<>,
     TimerManager<TableAdapter<InMemoryTriggerStore>>,
     watch::Sender<ShutdownPhase>,
 )> {
@@ -81,7 +81,7 @@ pub(crate) async fn setup_timer_manager() -> Result<(
 pub(crate) async fn setup_timer_manager_at(
     initial: ShutdownPhase,
 ) -> Result<(
-    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
+    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>> + use<>,
     TimerManager<TableAdapter<InMemoryTriggerStore>>,
     watch::Sender<ShutdownPhase>,
 )> {
@@ -95,7 +95,7 @@ pub(crate) async fn setup_timer_manager_with_store(
     store: TableAdapter<InMemoryTriggerStore>,
     initial: ShutdownPhase,
 ) -> Result<(
-    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
+    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>> + use<>,
     TimerManager<TableAdapter<InMemoryTriggerStore>>,
     watch::Sender<ShutdownPhase>,
 )> {

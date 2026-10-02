@@ -285,70 +285,63 @@ where
         B::Reader: ConsumerReaderBackend<MessageCodec<T>>,
         RP: ResponsePolicy<T>,
     {
-        let built =
-            match &config {
-                ModeConfiguration::Pipeline {
-                    consumer,
-                    retry,
-                    monopolization,
-                    defer,
-                    common,
-                } => Box::pin(
-                    ProsodyConsumer::<MessageCodec<T>>::pipeline_consumer_with_policy::<
-                        T,
-                        B::Reader,
-                        RP,
-                    >(
-                        deps::consumer_setup::<MessageCodec<T>, B>(consumer, common, &shared),
-                        PipelineMiddlewareConfiguration {
-                            retry: retry.clone(),
-                            monopolization: monopolization.clone(),
-                            defer: defer.clone(),
-                        },
-                        telemetry,
-                        handler,
-                        response,
-                    ),
-                )
-                .await
-                .map_err(Into::into),
-                ModeConfiguration::LowLatency {
-                    consumer,
-                    retry,
-                    failure_topic,
-                    common,
-                } => Box::pin(ProsodyConsumer::low_latency_consumer_with_policy::<
+        let built = match &config {
+            ModeConfiguration::Pipeline {
+                consumer,
+                retry,
+                monopolization,
+                defer,
+                common,
+            } => ProsodyConsumer::<MessageCodec<T>>::pipeline_consumer_with_policy::<
+                T,
+                B::Reader,
+                RP,
+            >(
+                deps::consumer_setup::<MessageCodec<T>, B>(consumer, common, &shared),
+                PipelineMiddlewareConfiguration {
+                    retry: retry.clone(),
+                    monopolization: monopolization.clone(),
+                    defer: defer.clone(),
+                },
+                telemetry,
+                handler,
+                response,
+            )
+            .await
+            .map_err(Into::into),
+            ModeConfiguration::LowLatency {
+                consumer,
+                retry,
+                failure_topic,
+                common,
+            } => ProsodyConsumer::low_latency_consumer_with_policy::<T, B::Reader, RP>(
+                deps::consumer_setup::<MessageCodec<T>, B>(consumer, common, &shared),
+                LowLatencyMiddlewareConfiguration {
+                    retry: retry.clone(),
+                    failure_topic: failure_topic.clone(),
+                },
+                producer,
+                telemetry,
+                handler,
+                response,
+            )
+            .await
+            .map_err(Into::into),
+            ModeConfiguration::BestEffort { consumer, common } => {
+                ProsodyConsumer::<MessageCodec<T>>::best_effort_consumer_with_policy::<
                     T,
                     B::Reader,
                     RP,
                 >(
                     deps::consumer_setup::<MessageCodec<T>, B>(consumer, common, &shared),
-                    LowLatencyMiddlewareConfiguration {
-                        retry: retry.clone(),
-                        failure_topic: failure_topic.clone(),
-                    },
-                    producer,
                     telemetry,
                     handler,
                     response,
-                ))
-                .await
-                .map_err(Into::into),
-                ModeConfiguration::BestEffort { consumer, common } => Box::pin(
-                    ProsodyConsumer::<MessageCodec<T>>::best_effort_consumer_with_policy::<
-                        T,
-                        B::Reader,
-                        RP,
-                    >(
-                        deps::consumer_setup::<MessageCodec<T>, B>(consumer, common, &shared),
-                        telemetry,
-                        handler,
-                        response,
-                    ),
                 )
                 .await
-                .map_err(Into::into),
-            };
+                .map_err(Into::into)
+            }
+        };
         (built, config)
     }
 

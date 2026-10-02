@@ -7,7 +7,8 @@ pub(crate) trait StageInspection: CellStore {
     fn staged_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
-    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, ProvisionalCell), Self::Error>> + Send + use<'a, Self>
+    {
         async_stream::try_stream! {
             if let Some(marker) = self.marker_state(collection).await?.staged {
                 for key in marker.staged() {

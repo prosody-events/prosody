@@ -13,7 +13,7 @@ use crate::state::registry::RegisterStateError;
 use crate::state_reader::StateReaderError;
 use crate::timers::duration::CompactDurationError;
 use crate::timers::store::cassandra::CassandraTriggerStoreError;
-use rdkafka::error::KafkaError;
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use std::io;
 use thiserror::Error;
 use tokio::task::JoinError;
@@ -201,7 +201,7 @@ pub enum KeyedStateInitError {
     #[error(transparent)]
     Register(#[from] RegisterStateError),
 
-    /// The local keyed-state cache's disk workspace could not be opened.
+    /// The local keyed-state cache could not be opened.
     ///
     /// The inner `FjallClientError` is crate-internal, so this variant carries
     /// a rendered message plus the error's classification instead of the source
@@ -216,23 +216,14 @@ pub enum KeyedStateInitError {
         category: ErrorCategory,
     },
 
-    /// Startup reconciliation of keyed-state publication routing rows failed,
-    /// typically because the publication store was unreachable.
-    ///
-    /// This variant carries a rendered message plus the error's classification
-    /// instead of the source type. Reconciliation propagates every failure so
-    /// startup cannot continue with routing rows of unknown freshness.
-    #[error("keyed-state publication reconciliation failed: {message}")]
-    Publication {
-        /// Rendered reconciliation error, full source chain.
-        message: String,
-        /// The reconciliation error's captured classification.
-        category: ErrorCategory,
-    },
-
     /// Published state needs a real topic partition count outside mock mode.
     #[error("published keyed state with in-memory storage requires mock mode")]
     PublishedMemoryStorage,
+
+    /// Broker metadata cannot supply a partition count for a subscribed topic,
+    /// so the consumer has no complete routing set to publish.
+    #[error("cannot build the keyed-state routing set: {0}")]
+    Routing(#[from] RoutingError),
 
     /// Keyed-state collections were registered on the low-level
     /// [`ProsodyConsumer::new`](crate::consumer::ProsodyConsumer::new)
@@ -245,6 +236,25 @@ pub enum KeyedStateInitError {
          runs no state middleware"
     )]
     StateUnsupported,
+}
+
+/// Why broker metadata cannot supply a subscribed topic's partition count.
+#[derive(Debug, Error)]
+pub enum RoutingError {
+    /// The subscribed name is a `^` pattern. A pattern has no fixed topic set,
+    /// so a consumer that publishes keyed state must subscribe to literal
+    /// topics.
+    #[error("topic {0:?} is a pattern; publication requires literal topics")]
+    Pattern(String),
+
+    /// The broker metadata omits the topic or reports an error for it.
+    #[error("topic {0:?} has a broker metadata error: {1}")]
+    Broker(String, RDKafkaErrorCode),
+
+    /// The broker metadata lists no partitions for the topic, or more than a
+    /// partition count can hold.
+    #[error("topic {0:?} has no valid partition count in the broker metadata")]
+    Invalid(String),
 }
 
 /// Collapses the two hops from a keyed-state configuration failure, so

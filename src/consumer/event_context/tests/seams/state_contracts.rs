@@ -1,4 +1,5 @@
 use super::*;
+use crate::state::erased::{ErasedKeyRead, StateCursor};
 
 /// A synthetic error classifying `Terminal`, to pin the boundary fold.
 #[derive(Debug, Error)]
@@ -91,10 +92,21 @@ async fn map_cursor_is_lazy() -> Result<()> {
     map.commit().await.map_err(|e| eyre!("commit: {e}"))?;
 
     counting.reset();
-    let cursor = ctx
+    let read: ErasedKeyRead<(String, Value)> = ctx
         .map_state(MAP_NAME)
         .map_err(|e| eyre!("vend map: {e}"))?
-        .scan(KeyScanConfig::default());
+        .entries();
+    assert_eq!(
+        counting.lower_reads(),
+        0,
+        "builder creation must not read storage"
+    );
+    let cursor: StateCursor<(String, Value)> = tokio::spawn(async move { read.stream() }).await?;
+    assert_eq!(
+        counting.lower_reads(),
+        0,
+        "cursor creation must not read storage"
+    );
     let first = cursor.next().await.map_err(|e| eyre!("first next: {e}"))?;
     assert!(first.is_some(), "the seeded map must yield a first entry");
 

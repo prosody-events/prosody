@@ -18,7 +18,6 @@ use crate::consumer::middleware::scheduler::SchedulerMiddleware;
 use crate::consumer::middleware::telemetry::TelemetryMiddleware;
 use crate::consumer::middleware::timeout::TimeoutMiddleware;
 use crate::consumer::middleware::{ComposedMiddleware, HandlerMiddleware};
-use crate::consumer::observer::KafkaObserver;
 use crate::consumer::storage::{ComponentsOf, ConsumerStorageBackend, ConsumerStorageInputs};
 use crate::consumer::wiring::state::KeyedStateInputs;
 use crate::heartbeat::HeartbeatRegistry;
@@ -61,15 +60,7 @@ pub(in crate::consumer) type CommonMiddleware<DP, P> = ComposedMiddleware<
 /// Validates shared configuration and builds one already-selected backend.
 pub(in crate::consumer) async fn build_typed_state<C, B>(
     setup: &TypedConsumerSetup<'_, C, B>,
-) -> Result<
-    (
-        ComponentsOf<C, B>,
-        KeyedStateInputs,
-        HeartbeatRegistry,
-        KafkaObserver,
-    ),
-    ConsumerError,
->
+) -> Result<(ComponentsOf<C, B>, KeyedStateInputs, HeartbeatRegistry), ConsumerError>
 where
     C: Codec,
     C::Payload: Clone + EventIdentity + crate::EventType + Send + Sync + 'static,
@@ -86,7 +77,6 @@ where
         &dedup.version,
         dedup.ttl,
     )?;
-    let observer = KafkaObserver::new(&setup.consumer.group_id);
     let components = setup
         .deps
         .build_consumer_components(
@@ -96,10 +86,9 @@ where
                 timer_spans: setup.consumer.timer_spans,
             },
             &keyed_state,
-            observer.clone(),
         )
         .await?;
-    Ok((components, keyed_state, heartbeats, observer))
+    Ok((components, keyed_state, heartbeats))
 }
 
 /// Builds the in-memory reader dependencies.

@@ -32,7 +32,7 @@ where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         RP: ResponsePolicy<T>,
     {
-        let (components, keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
+        let (components, keyed_state, heartbeats) = build_typed_state(&setup).await?;
         let middleware = build_common_middleware::<_, C::Payload>(
             setup.common,
             setup.consumer,
@@ -51,16 +51,15 @@ where
             version: keyed_state.version.clone(),
             telemetry: &telemetry,
             heartbeats,
-            observer,
             managers: Arc::clone(&managers),
         };
-        Box::pin(initialize_consumer::<_, _, _, C, _>(
+        initialize_consumer::<_, _, _, C, _>(
             setup.consumer,
             provider,
             providers,
             services,
             requests,
-        ))
+        )
         .await
     }
 }

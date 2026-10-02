@@ -13,13 +13,9 @@ fn prop_cassandra_cell_crash_equivalence() {
         let dedup = MemoryDeduplicationStore::default();
         // Each `make` is a crash: a cold fjall cache over the same durable
         // Cassandra rows, with the runner's lower fault seam between them.
-        // `cold_cache` clears the shared `cassandra_crash` keyspace pair (a
-        // cheap journal marker, no keyspace-creation fsync) instead of
-        // minting a fresh workspace per make; distinct v4 segments per
-        // iteration keep the shared keyspace disjoint. The cleared index
-        // keyspace also resets the bottom store's marker check — per-
-        // assignment state dies with the assignment, so the marker-check handle is
-        // minted from that same cold cache.
+        // `cold_cache` clears the shared `cassandra_crash` keyspace, which
+        // costs no keyspace-creation fsync. Distinct v4 segments per iteration
+        // keep the shared keyspace disjoint.
         let make = |handle: &PoisonHandle| -> Result<FaultyBottom> {
             let cache = test_db::cold_cache("cassandra_crash")?;
             Ok(Cached::new(
@@ -30,13 +26,7 @@ fn prop_cassandra_cell_crash_equivalence() {
         let probe = CassandraShapeProbe {
             session: fx.cassandra.clone(),
         };
-        Box::pin(run_crash_equivalence_trace(
-            make,
-            dedup.clone(),
-            trace,
-            &probe,
-        ))
-        .await
+        run_crash_equivalence_trace(make, dedup.clone(), trace, &probe).await
     }
 
     init_test_logging();
@@ -88,11 +78,9 @@ fn prop_cassandra_cell_implicit_overwrite() {
         let fx = fixture().await?;
         let dedup = MemoryDeduplicationStore::default();
         // Each op reads its committed base through a fresh COLD store, so
-        // `make` clears the shared `cassandra_overwrite` keyspace pair (no
+        // `make` clears the shared `cassandra_overwrite` keyspace (no
         // keyspace-creation fsync); distinct v4 segments per iteration keep it
-        // disjoint. The cleared index keyspace resets the bottom store's
-        // marker check too — a fresh cold assignment — so its marker-check handle
-        // is minted from that same cold cache.
+        // disjoint.
         let make = || -> Result<Bottom> {
             let cache = test_db::cold_cache("cassandra_overwrite")?;
             Ok(Cached::new(cache, fx.bottom_store()))
@@ -107,7 +95,7 @@ fn prop_cassandra_cell_implicit_overwrite() {
 }
 
 /// A single `Cached<CassandraStore>` over the shared `cassandra_overlay`
-/// fjall keyspace pair (warm-reuse; distinct v4 segments keep iterations
+/// fjall keyspace (warm-reuse; distinct v4 segments keep iterations
 /// disjoint).
 fn assembly(fx: &Fixture) -> Result<Bottom> {
     Ok(Cached::new(

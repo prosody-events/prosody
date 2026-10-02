@@ -1,4 +1,6 @@
 use super::*;
+use crate::consumer::middleware::defer::message::handler::tests::store::StoreOp;
+use crate::consumer::middleware::tests::test_support::faults::{FaultKind, retry};
 use std::future::ready;
 
 #[tokio::test]
@@ -38,10 +40,60 @@ async fn reload_permanent_failure_records_the_reloaded_id() -> Result<()> {
     Ok(())
 }
 
-/// Last-wins override: a retry re-dispatch of the same defer timer after
-/// a durable queue advance loads a DIFFERENT queue head and records
-/// under the NEW head's id — a set-once override would record message
-/// B's dispatch under message A's identity.
+/// A failed retry timer write leaves the queue head in place. The retry
+/// re-dispatch reloads that head again. The settle boundary records the head
+/// the final attempt loaded.
+#[tokio::test(start_paused = true)]
+async fn retry_redispatch_reloads_the_unchanged_head() -> Result<()> {
+    let fx = Fixture::new()?;
+    let expected = fx.seed_message(0);
+    fx.seed_message(1);
+    fx.defer_store
+        .defer_first_message(&Key::from(KEY), 0)
+        .await?;
+    fx.defer_store
+        .defer_additional_message(&Key::from(KEY), 1)
+        .await?;
+
+    let (session, _cell_store, _dirty, recorded) = fx.session(timer_event())?;
+    let scope = EventStateScope::new(session);
+    // Poison the FIRST timer op: attempt 1 reloads M1 and the leaf
+    // succeeds, then the reschedule fails Transient before the queue can
+    // advance. The outer retry re-dispatches and attempt 2 reloads M1.
+    let context = MockEventContext::new()
+        .with_session(scope.handle())
+        .with_timer_tracking()
+        .with_timer_failures(1, ErrorCategory::Transient);
+    let (timer, committed, _aborted) = RecordingTimer::new(defer_trigger());
+
+    let retry_handler = retry(fx.handler.clone())?;
+    EventHandler::on_timer(&retry_handler, context, timer, DemandType::Normal).await;
+
+    assert_eq!(
+        fx.leaf.processed(),
+        vec![0, 0],
+        "the failed timer write kept the head, so attempt 2 reloaded M1",
+    );
+    assert_eq!(
+        recorded.lock().clone(),
+        vec![expected],
+        "the marker records under the head the final attempt loaded",
+    );
+    assert_eq!(
+        fx.defer_store
+            .get_next_deferred_message(&Key::from(KEY))
+            .await?,
+        Some((1, 0)),
+        "only the committed attempt advances the queue",
+    );
+    assert_eq!(committed.load(Ordering::SeqCst), 1, "the trigger commits");
+    Ok(())
+}
+
+/// The reload override is last-wins. A durable queue advance followed by a
+/// transient failure makes attempt 2 load the NEW head. The settle boundary
+/// then records the new head's id. A set-once override would record attempt
+/// 2's work under M1's identity.
 #[tokio::test(start_paused = true)]
 async fn retry_redispatch_records_under_the_new_head_id() -> Result<()> {
     let fx = Fixture::new()?;
@@ -56,24 +108,18 @@ async fn retry_redispatch_records_under_the_new_head_id() -> Result<()> {
 
     let (session, _cell_store, _dirty, recorded) = fx.session(timer_event())?;
     let scope = EventStateScope::new(session);
-    // Poison the FIRST timer op: attempt 1 reloads M1, the leaf
-    // succeeds, the queue durably advances to M2, then the
-    // reschedule fails Transient — the outer retry re-dispatches and
-    // attempt 2 reloads M2.
     let context = MockEventContext::new()
         .with_session(scope.handle())
-        .with_timer_tracking()
-        .with_timer_failures(1, ErrorCategory::Transient);
+        .with_timer_tracking();
     let (timer, committed, _aborted) = RecordingTimer::new(defer_trigger());
 
-    let retry_provider = RetryMiddleware::new(RetryConfiguration::builder().build()?)?
-        .with_provider(FallibleCloneProvider::new(fx.handler.clone()));
-    let retry_handler = FallibleHandlerProvider::handler_for_partition(
-        &retry_provider,
-        Topic::from(TOPIC),
-        Partition::from(PARTITION),
-    );
+    // Poison the retry-count reset, which runs after the schedule and after
+    // the pop. Attempt 1 advances the queue durably, then fails Transient.
+    fx.defer_store
+        .next_fault
+        .set(Some((StoreOp::IncrementRetryCount, FaultKind::Transient)));
 
+    let retry_handler = retry(fx.handler.clone())?;
     EventHandler::on_timer(&retry_handler, context, timer, DemandType::Normal).await;
 
     assert_eq!(
@@ -84,7 +130,7 @@ async fn retry_redispatch_records_under_the_new_head_id() -> Result<()> {
     assert_eq!(
         recorded.lock().clone(),
         vec![id_m2],
-        "the marker records under the NEW head's id — last-wins, never M1's",
+        "the marker records under the new head's id, never M1's",
     );
     assert_ne!(id_m1, id_m2, "distinct offsets hash to distinct ids");
     assert_eq!(committed.load(Ordering::SeqCst), 1, "the trigger commits");

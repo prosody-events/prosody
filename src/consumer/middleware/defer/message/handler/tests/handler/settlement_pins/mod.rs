@@ -7,20 +7,19 @@ use crate::consumer::middleware::deduplication::{
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::AlwaysDefer;
 use crate::consumer::middleware::defer::error::DeferError;
+use crate::consumer::middleware::defer::message::handler::tests::context::TimerCapture;
+use crate::consumer::middleware::defer::message::handler::tests::store::FailableStore;
 use crate::consumer::middleware::defer::message::handler::{
     MessageDeferHandler, MessageDeferOutput,
 };
 use crate::consumer::middleware::defer::message::store::MessageDeferStore;
 use crate::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStore;
-use crate::consumer::middleware::providers::FallibleCloneProvider;
-use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
 use crate::consumer::middleware::tests::test_support::{
     RecordingSession, RecordingTimer, StagingError, committed_json_value,
     recording_session_with_loader,
 };
 use crate::consumer::middleware::{
-    ErrorCategory, FallibleEventHandler, FallibleHandlerProvider, HandlerMiddleware, Settlement,
-    SettlementHandler,
+    ErrorCategory, FallibleEventHandler, Settlement, SettlementHandler,
 };
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::loader::{MemoryLoader, MemoryLoaderError};
@@ -160,7 +159,7 @@ impl SettlementHandler for StagingLeaf {
 
 type PinStack = MessageDeferHandler<
     DeduplicationHandler<StagingLeaf, MemoryDeduplicationStore>,
-    MemoryMessageDeferStore,
+    FailableStore<MemoryMessageDeferStore>,
     MemoryLoader<Value>,
     AlwaysDefer,
 >;
@@ -174,7 +173,8 @@ struct Fixture {
     leaf: StagingLeaf,
     dedup_store: MemoryDeduplicationStore,
     loader: MemoryLoader<Value>,
-    defer_store: MemoryMessageDeferStore,
+    /// The defer store, wrapped so one store call can fail on demand.
+    defer_store: FailableStore<MemoryMessageDeferStore>,
     registry_key: StateKey,
 }
 
@@ -185,7 +185,7 @@ impl Fixture {
         let leaf = StagingLeaf::default();
         let dedup_store = MemoryDeduplicationStore::new();
         let loader = MemoryLoader::new();
-        let defer_store = MemoryMessageDeferStore::new();
+        let defer_store = FailableStore::new(MemoryMessageDeferStore::new(), TimerCapture::new());
         let telemetry = Telemetry::new();
         let handler = MessageDeferHandler {
             handler: DeduplicationHandler {

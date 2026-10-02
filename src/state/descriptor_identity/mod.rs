@@ -122,22 +122,24 @@ pub trait DescriptorIdentityStore: Send + Sync + 'static {
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
     /// Point-reads the identity row for `(group_id, state_type, name)`.
-    fn read_identity(
-        &self,
-        group_id: &str,
+    fn read_identity<'a>(
+        &'a self,
+        group_id: &'a str,
         state_type: StateType,
-        name: &str,
-    ) -> impl Future<Output = Result<Option<DurableDescriptorIdentity>, Self::Error>> + Send;
+        name: &'a str,
+    ) -> impl Future<Output = Result<Option<DurableDescriptorIdentity>, Self::Error>>
+    + Send
+    + use<'a, Self>;
 
     /// Registers `row` if its `(group_id, state_type, name)` key is unused,
     /// atomically. Returns [`RegisterOutcome::Applied`] when this caller
     /// registered it, or [`RegisterOutcome::Conflict`] carrying the existing
     /// row when a concurrent registrant won.
-    fn register_identity(
-        &self,
-        group_id: &str,
-        row: &DurableDescriptorIdentity,
-    ) -> impl Future<Output = Result<RegisterOutcome, Self::Error>> + Send;
+    fn register_identity<'a>(
+        &'a self,
+        group_id: &'a str,
+        row: &'a DurableDescriptorIdentity,
+    ) -> impl Future<Output = Result<RegisterOutcome, Self::Error>> + Send + use<'a, Self>;
 }
 
 /// Validates every registered descriptor against the group's durable identity

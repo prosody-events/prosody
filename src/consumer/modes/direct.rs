@@ -12,7 +12,6 @@ use crate::consumer::kafka_context::PartitionProviders;
 use crate::consumer::middleware::deduplication::{
     DEFAULT_IDEMPOTENCE_VERSION, MemoryDeduplicationStoreProvider,
 };
-use crate::consumer::observer::KafkaObserver;
 use crate::consumer::storage::StoreCreationError;
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::state::{KeyedStateInputs, memory_state_provider};
@@ -97,7 +96,6 @@ where
             version: keyed_state.version.clone(),
             telemetry: &telemetry,
             heartbeats,
-            observer: KafkaObserver::new(&consumer_config.group_id),
             managers,
         };
 
@@ -153,7 +151,7 @@ where
         MemoryLoader::new(),
         None,
     );
-    Box::pin(initialize_consumer::<_, _, _, C, _>(
+    initialize_consumer::<_, _, _, C, _>(
         consumer,
         handler,
         PartitionProviders {
@@ -162,6 +160,6 @@ where
         },
         services,
         IgnoreRequests,
-    ))
+    )
     .await
 }

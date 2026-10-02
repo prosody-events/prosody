@@ -112,12 +112,12 @@ async fn create_high_level_client(
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
     cassandra_builder.nodes(vec![CASSANDRA_HOST.to_owned()]);
 
-    Ok(CassandraHighLevelClient::new(
+    Ok(Box::pin(CassandraHighLevelClient::new(
         cassandra_builder.build()?,
         Mode::BestEffort,
         &mut producer_builder,
         &consumer_builders,
-    )
+    ))
     .await?)
 }
 

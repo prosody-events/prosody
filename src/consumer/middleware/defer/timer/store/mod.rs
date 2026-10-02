@@ -23,17 +23,13 @@ pub use memory::{MemoryTimerDeferStore, MemoryTimerDeferStoreProvider};
 pub use provider::TimerDeferStoreProvider;
 
 /// Outcome of completing a successful timer retry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimerRetryCompletionResult {
-    /// Queue has more timers; retry count reset to 0.
-    MoreTimers {
-        /// Next timer's fire time (for scheduling).
-        next_time: CompactDateTime,
-        /// Parent trace context for span reconstruction.
-        context: Context,
-    },
+    /// The queue keeps more timers and the retry count is 0. Read the new head
+    /// with [`get_next_deferred_timer`](TimerDeferStore::get_next_deferred_timer).
+    MoreTimers,
 
-    /// Queue empty; key deleted from storage.
+    /// The queue is empty and the store deleted the key.
     Completed,
 }
 
@@ -88,13 +84,9 @@ pub trait TimerDeferStore: Clone + Send + Sync + 'static {
         async move {
             self.remove_deferred_timer(key, time).await?;
 
-            if let Some((trigger, _)) = self.get_next_deferred_timer(key).await? {
+            if self.get_next_deferred_timer(key).await?.is_some() {
                 self.set_retry_count(key, 0).await?;
-                let context = trigger.context();
-                Ok(TimerRetryCompletionResult::MoreTimers {
-                    next_time: trigger.time,
-                    context,
-                })
+                Ok(TimerRetryCompletionResult::MoreTimers)
             } else {
                 self.delete_key(key).await?;
                 Ok(TimerRetryCompletionResult::Completed)

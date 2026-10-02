@@ -5,10 +5,13 @@ use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::marker::{EventMarker, MarkerState, SectionClear};
 use super::resolve::{EvidenceLookup, ResolveCellError};
 use super::store::{
-    CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable, dedupe,
-    expand_to_input_order, provisional_point_loop,
+    CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable,
+    provisional_point_loop,
 };
 use super::{CollectionId, CollectionRef};
+use crate::state::cell_key::CellRef;
+use crate::state::marker::ProvisionalStage;
+use crate::state::store::ReadBatch;
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::Stream;
@@ -42,7 +45,7 @@ impl MemoryCellStore {
 
     /// Returns the raw cell through [`MemoryCells::read_committed_cell`].
     /// A missing row represents committed absence.
-    fn read_raw(&self, collection: &CollectionId, cell: &CellKey) -> Cell {
+    fn read_raw(&self, collection: &CollectionId, cell: CellRef<'_>) -> Cell {
         self.cells.read_committed_cell(collection, cell)
     }
 
@@ -116,7 +119,7 @@ impl<P: Projection> CellRead<P> for MemoryCellStore {
     async fn read<'a>(
         &'a self,
         collection: &'a CollectionId,
-        cell: &'a CellKey,
+        cell: CellRef<'a>,
     ) -> Result<Durable<P>, Self::Error> {
         let committed = EvidenceLookup::new(self, collection)
             .resolve(self.read_raw(collection, cell))
@@ -131,30 +134,34 @@ impl<P: Projection> CellRead<P> for MemoryCellStore {
         &'a self,
         collection: &'a CollectionId,
         section: Section,
-        batch: &'a CoordinateBatch,
+        batch: &'a ReadBatch<'_>,
     ) -> Result<CacheBatch<P>, Self::Error> {
-        let (coordinates, indices) = dedupe(batch);
-        let mut answers = CacheBatch::<P>::with_capacity(coordinates.len());
-        let mut lookup = EvidenceLookup::new(self, collection);
-        for coordinate in coordinates {
-            let cell = CellKey {
-                section,
-                coordinate: coordinate.clone(),
-            };
-            let committed = cooperative(lookup.resolve(self.read_raw(collection, &cell))).await?;
-            answers.push((
-                Committed::new(committed.into_inner().map(P::from_value)),
-                None,
-            ));
-        }
-        Ok(expand_to_input_order(&indices, &answers))
+        let lookup = EvidenceLookup::new(self, collection);
+        batch
+            .read(|coordinate| {
+                let raw = self.read_raw(
+                    collection,
+                    CellRef {
+                        section,
+                        coordinate,
+                    },
+                );
+                cooperative(async {
+                    let committed = lookup.resolve(raw).await?;
+                    Ok((
+                        Committed::new(committed.into_inner().map(P::from_value)),
+                        None,
+                    ))
+                })
+            })
+            .await
     }
 
     fn scan<'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + use<'a, P> {
         try_stream! {
             // Snapshot the matching raw cells synchronously (scc holds no
             // borrowing iterator across an await), then resolve each lazily.
@@ -172,7 +179,7 @@ impl<P: Projection> CellRead<P> for MemoryCellStore {
             // The resolved fast path touches no tokio leaf, so a large in-memory
             // scan would drain in one poll; a per-item `cooperative` yield point
             // fires every ~128 items.
-            let mut lookup = EvidenceLookup::new(self, collection);
+            let lookup = EvidenceLookup::new(self, collection);
             for (cell, stored) in raw {
                 let committed =
                     cooperative(lookup.resolve(stored)).await?;
@@ -189,8 +196,8 @@ impl CellStore for MemoryCellStore {
         &'a self,
         collection: &'a CollectionId,
         cell: &'a CellKey,
-    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + 'a {
-        ready(Ok(match self.read_raw(collection, cell) {
+    ) -> impl Future<Output = Result<Option<ProvisionalCell>, Self::Error>> + Send + use<'a> {
+        ready(Ok(match self.read_raw(collection, cell.as_ref()) {
             Cell::Provisional(provisional) => Some(provisional),
             Cell::Resolved(_) => None,
         }))
@@ -201,8 +208,9 @@ impl CellStore for MemoryCellStore {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
-    {
+    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>>
+    + Send
+    + use<'a> {
         // No batch query of its own — the raw point-loop reference, reading each
         // distinct coordinate through `provisional_cell_at` in ascending order.
         provisional_point_loop(self, collection, section, batch)
@@ -211,33 +219,18 @@ impl CellStore for MemoryCellStore {
     async fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
-        writes: &'a [(CellKey, ProvisionalWrite)],
-        marker: Option<&'a EventMarker>,
+        stage: ProvisionalStage<'a>,
     ) -> Result<(), Self::Error> {
-        // `None` ⇒ the explicit empty-stage no-op: no marker and no boundary
-        // check (nothing to strand). A clears-only stage passes a marker with
-        // empty `staged()` and runs the boundary like any stage.
-        debug_assert!(
-            marker.is_some() || writes.is_empty(),
-            "a markerless stage must write nothing"
-        );
-        if let Some(marker) = marker {
-            debug_assert!(
-                writes
-                    .iter()
-                    .all(|(cell, _)| marker.staged().binary_search(cell).is_ok()),
-                "every staged write must be listed by the event marker"
-            );
-            // Marker-first: order-irrelevant in memory (no mid-call crash), but
-            // mirrors the documented stage ordering.
-            self.cells
-                .markers
-                .entry_async(collection.id().clone())
-                .await
-                .or_default()
-                .get_mut()
-                .staged = Some(marker.clone());
-        }
+        let (marker, writes) = (stage.marker(), stage.writes());
+        // Marker-first: order-irrelevant in memory (no mid-call crash), but
+        // mirrors the documented stage ordering.
+        self.cells
+            .markers
+            .entry_async(collection.id().clone())
+            .await
+            .or_default()
+            .get_mut()
+            .staged = Some(marker.clone());
         for (cell, write) in writes {
             self.map()
                 .upsert_async(

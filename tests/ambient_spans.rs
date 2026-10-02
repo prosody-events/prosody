@@ -142,12 +142,12 @@ async fn handlers_run_inside_their_event_spans() -> Result<()> {
     };
 
     let (sender, mut receiver) = channel(4);
-    let client = CassandraHighLevelClient::<AmbientProbe>::new(
+    let client = Box::pin(CassandraHighLevelClient::<AmbientProbe>::new(
         cassandra_config.build()?,
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,
-    )
+    ))
     .await?;
 
     let fire_at = CompactDateTime::now()?.add_duration(CompactDuration::new(2))?;

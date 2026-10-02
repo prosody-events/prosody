@@ -30,13 +30,13 @@ impl MemoryPublicationStore {
 impl PublicationStore for MemoryPublicationStore {
     type Error = Infallible;
 
-    fn upsert(
-        &self,
-        subsystem: &SubsystemName,
+    fn upsert<'a>(
+        &'a self,
+        subsystem: &'a SubsystemName,
         state_type: StateType,
-        name: &StateName,
-        row: &StatePublication,
-    ) -> impl Future<Output = Result<(), Self::Error>> {
+        name: &'a StateName,
+        row: &'a StatePublication,
+    ) -> impl Future<Output = Result<(), Self::Error>> + use<'a> {
         self.rows.upsert_sync(
             publication_key(subsystem, state_type, name, row),
             row.clone(),
@@ -44,13 +44,13 @@ impl PublicationStore for MemoryPublicationStore {
         ready(Ok(()))
     }
 
-    fn remove_group(
-        &self,
-        subsystem: &SubsystemName,
+    fn remove_group<'a>(
+        &'a self,
+        subsystem: &'a SubsystemName,
         state_type: StateType,
-        name: &StateName,
-        group_id: &str,
-    ) -> impl Future<Output = Result<(), Self::Error>> {
+        name: &'a StateName,
+        group_id: &'a str,
+    ) -> impl Future<Output = Result<(), Self::Error>> + use<'a> {
         remove_span(
             &self.rows,
             PublicationScope::group_range(subsystem, state_type, name, group_id),
@@ -58,12 +58,12 @@ impl PublicationStore for MemoryPublicationStore {
         ready(Ok(()))
     }
 
-    fn read_publications(
-        &self,
-        subsystem: &SubsystemName,
+    fn read_publications<'a>(
+        &'a self,
+        subsystem: &'a SubsystemName,
         state_type: StateType,
-        name: &StateName,
-    ) -> impl Future<Output = Result<PublicationRows, Self::Error>> {
+        name: &'a StateName,
+    ) -> impl Future<Output = Result<PublicationRows, Self::Error>> + use<'a> {
         let guard = Guard::new();
         let rows = self
             .rows

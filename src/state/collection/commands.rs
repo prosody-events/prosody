@@ -1,12 +1,12 @@
 //! Typed commands available within collection admission.
 
 use super::{CellAddress, CellFamily, CollectionLayout, StateSession};
+use crate::state::StateName;
 use crate::state::descriptor::{
     BorrowedKeyOf, CellCodecError, CellStateError, CellType, ContextOf, FromSession, ResolvedOf,
     WriteOf,
 };
 use crate::state::store::CellBuffer;
-use crate::state::{StateAccessError, StateName};
 use std::future::Future;
 use std::num::NonZeroUsize;
 
@@ -47,16 +47,21 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     fn capacity(&self) -> Option<NonZeroUsize>;
 
     /// Reads, decodes, and resolves the visible value at `key`.
+    /// Point commands encode the key before return. Their futures borrow only
+    /// the operation.
     ///
     /// # Errors
     ///
-    /// An access error from the engine, a codec error (Permanent) when the
-    /// cell bytes do not decode, or a resolution error from the resolver.
-    fn get<T>(
-        &mut self,
+    /// An access error from the engine, a key codec error (Permanent) when
+    /// `key` does not encode, a codec error (Permanent) when the cell bytes do
+    /// not decode, or a resolution error from the resolver.
+    fn get<'a, T>(
+        &'a mut self,
         family: CellFamily<Self::Layout, T>,
         key: &BorrowedKeyOf<T>,
-    ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send
+    ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>>
+    + Send
+    + use<'a, Self, T>
     where
         T: CellType,
         for<'s> ContextOf<'s, T>: FromSession<'s, Self::Session>;
@@ -72,15 +77,17 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     /// # Errors
     ///
     /// As [`Self::get`].
-    fn get_many<'a, T>(
-        &mut self,
+    fn get_many<'a, 'op, T, I>(
+        &'op mut self,
         family: CellFamily<Self::Layout, T>,
-        keys: impl IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>,
+        keys: I,
     ) -> impl Future<
         Output = Result<CellBuffer<Option<ResolvedOf<T>>>, CellStateError<CellCodecError<T>>>,
     > + Send
+    + use<'a, 'op, Self, T, I>
     where
         T: CellType,
+        I: IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>,
         for<'s> ContextOf<'s, T>: FromSession<'s, Self::Session>;
 
     /// Tests `keys` for presence as one aligned batch. Each result answers the
@@ -88,12 +95,17 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     ///
     /// # Errors
     ///
-    /// Returns an engine access error.
-    fn contains_many<'a, T: CellType>(
-        &mut self,
+    /// As [`Self::contains`].
+    fn contains_many<'a, 'op, T, I>(
+        &'op mut self,
         family: CellFamily<Self::Layout, T>,
-        keys: impl IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>,
-    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send;
+        keys: I,
+    ) -> impl Future<Output = Result<CellBuffer<bool>, CellStateError<CellCodecError<T>>>>
+    + Send
+    + use<'a, 'op, Self, T, I>
+    where
+        T: CellType,
+        I: IntoIterator<Item = &'a BorrowedKeyOf<T>, IntoIter: Send>;
 
     /// Whether a stored cell exists at `key`, **without decoding its value or
     /// running the resolver**. The guarantee is "no decode, no resolve", not
@@ -101,12 +113,13 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     ///
     /// # Errors
     ///
-    /// An access error from the engine.
-    fn contains<T: CellType>(
-        &mut self,
+    /// An access error from the engine, or a key codec error (Permanent) when
+    /// `key` does not encode.
+    fn contains<'a, T: CellType>(
+        &'a mut self,
         family: CellFamily<Self::Layout, T>,
         key: &BorrowedKeyOf<T>,
-    ) -> impl Future<Output = Result<bool, StateAccessError>> + Send;
+    ) -> impl Future<Output = Result<bool, CellStateError<CellCodecError<T>>>> + Send + use<'a, Self, T>;
 }
 
 /// The mutation commands, implemented only by the write operation.
@@ -129,11 +142,13 @@ pub(crate) trait CollectionWrite: CollectionRead {
     /// # Errors
     ///
     /// As [`CollectionRead::get`].
-    fn take<T>(
-        &mut self,
+    fn take<'a, T>(
+        &'a mut self,
         family: CellFamily<Self::Layout, T>,
         key: &BorrowedKeyOf<T>,
-    ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send
+    ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>>
+    + Send
+    + use<'a, Self, T>
     where
         T: CellType,
         for<'s> ContextOf<'s, T>: FromSession<'s, Self::Session>;
