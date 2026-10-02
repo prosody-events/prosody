@@ -219,9 +219,6 @@ impl Arbitrary for TriggerSequence {
 ///
 /// # Usage
 ///
-/// Rustdoc cannot compile this example, because the macro exists only in test
-/// builds.
-///
 /// ```rust,ignore
 /// trigger_store_tests!(
 ///     LowLevelStore, low_level_constructor,

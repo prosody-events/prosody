@@ -16,9 +16,6 @@ pub mod prop_dedup_store;
 ///
 /// # Usage
 ///
-/// Rustdoc cannot compile this example, because the macro exists only in test
-/// builds.
-///
 /// ```rust,ignore
 /// dedup_store_tests!(async { Ok::<_, Report>(MyStore::new()) });
 /// ```
