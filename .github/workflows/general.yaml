@@ -6,7 +6,6 @@ on:
   pull_request:
     branches:
       - main
-  workflow_dispatch:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -16,6 +15,8 @@ jobs:
   plan:
     name: Plan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       required-work: ${{ steps.rail.outputs.required-work }}
     steps:
@@ -24,6 +25,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Restore planning evidence
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/planning-evidence
@@ -34,14 +36,15 @@ jobs:
         id: rail
         uses: loadingalias/cargo-rail-action@409962f05d90a78aae995ef6b1c8466010c0a460 # v10.1.1
         with:
-          all: ${{ github.event_name == 'workflow_dispatch' }}
           evidence: target/planning-evidence
 
   # A separate job records evidence on every push. The routed jobs can skip, and their RUSTFLAGS would not match the plan jobs.
   evidence:
     name: Planning evidence
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
         with:
@@ -51,24 +54,21 @@ jobs:
         with:
           packages: cmake libcurl4-openssl-dev protobuf-compiler
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: loadingalias/cargo-rail-action/setup@409962f05d90a78aae995ef6b1c8466010c0a460 # v10.1.1
-      # Clippy evidence is not recorded: Cargo-Rail 0.30.1 marks it incomplete when the clippy::cargo lints run cargo metadata.
+      # Do not record cargo.clippy, cargo.doc, or cargo.doctest: Cargo-Rail 0.30.1 has no complete evidence for them.
+      # Their jobs route on cargo.build and cargo.test instead, because that evidence covers the same compiler inputs.
       - name: Record build evidence
         run: >
+          rm -rf target/planning-evidence &&
           cargo rail plan evidence --work cargo.build
           --output target/planning-evidence/cargo.build.json
-          -- build --locked --workspace --all-targets
+          -- build --locked --workspace
       - name: Record test evidence
         run: >
           cargo rail plan evidence --work cargo.test
           --output target/planning-evidence/cargo.test.json
           -- test --locked --workspace --no-run
-      - name: Show evidence bindings
-        run: >
-          jq '{work: (.work | map_values({complete, bypasses})), platform,
-          cargo: .cargo_identity, configuration: .cargo_configuration_identity,
-          toolchain: .toolchain_identity, target: .target_identity}'
-          target/planning-evidence/*.json
       - name: Save planning evidence
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -80,7 +80,6 @@ jobs:
     needs: plan
     if: >-
       contains(fromJSON(needs.plan.outputs.required-work), 'cargo.test') ||
-      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.doctest') ||
       contains(fromJSON(needs.plan.outputs.required-work), 'nextest') ||
       contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
@@ -138,6 +137,22 @@ jobs:
         run: cargo nextest run
         env:
           PROSODY_BOOTSTRAP_SERVERS: localhost:9094
+
+  doctests:
+    name: Doctests
+    needs: plan
+    if: >-
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.build') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'ci')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@v1.6.0
+        with:
+          packages: cmake libcurl4-openssl-dev protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Run doctests
         run: cargo test --doc --workspace
 
@@ -149,6 +164,7 @@ jobs:
       contains(fromJSON(needs.plan.outputs.required-work), 'cargo.build') ||
       contains(fromJSON(needs.plan.outputs.required-work), 'cargo.test') ||
       contains(fromJSON(needs.plan.outputs.required-work), 'taplo') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'nextest') ||
       contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
     steps:
@@ -200,7 +216,6 @@ jobs:
     name: Documentation
     needs: plan
     if: >-
-      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.doc') ||
       contains(fromJSON(needs.plan.outputs.required-work), 'cargo.build') ||
       contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest

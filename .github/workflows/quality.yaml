@@ -20,6 +20,8 @@ jobs:
   plan:
     name: Plan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       required-work: ${{ steps.rail.outputs.required-work }}
     steps:
@@ -28,6 +30,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Restore planning evidence
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/planning-evidence
@@ -38,16 +41,15 @@ jobs:
         id: rail
         uses: loadingalias/cargo-rail-action@409962f05d90a78aae995ef6b1c8466010c0a460 # v10.1.1
         with:
-          all: ${{ github.event_name == 'workflow_dispatch' }}
+          all: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
           evidence: target/planning-evidence
 
   clippy:
     name: Clippy
     needs: plan
     if: >-
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch' ||
-      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.clippy') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.build') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.test') ||
       contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
     steps:

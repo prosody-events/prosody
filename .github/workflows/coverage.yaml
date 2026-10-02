@@ -15,6 +15,8 @@ jobs:
   plan:
     name: Plan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       required-work: ${{ steps.rail.outputs.required-work }}
     steps:
@@ -23,6 +25,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Restore planning evidence
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/planning-evidence
