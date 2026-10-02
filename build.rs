@@ -23,6 +23,10 @@ const GENERATED_LINTS: &str = concat!(
 );
 
 fn main() -> Result<()> {
+    // prost-build emits no rerun directive. Without one, Cargo reruns this
+    // script when any file in the package changes.
+    println!("cargo::rerun-if-changed=proto");
+
     let out_dir = PathBuf::from(var("OUT_DIR").map_err(Error::other)?);
     tonic_prost_build::configure()
         .file_descriptor_set_path(out_dir.join("peer_descriptor.bin"))
