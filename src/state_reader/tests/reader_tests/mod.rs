@@ -73,9 +73,9 @@ macro_rules! reader_prop {
     };
 }
 
-// The reader observes exactly the committed Value the owner wrote, over an
-// arbitrary overwrite trace — the memory instantiation of
-// `run_reader_value_trace`.
+// The reader's point `get` and `contains` equal an `Option` model of the
+// committed value after every event, over an arbitrary set/clear trace — the
+// memory instantiation of `run_reader_value_trace`.
 reader_prop!(
     prop_reader_value_committed,
     ValueOp,
