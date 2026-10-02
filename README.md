@@ -72,14 +72,12 @@ A debug build of Prosody polls deep async frames, from the handler through the t
 
 ```rust,no_run
 # async fn run() {}
-# fn main() -> std::io::Result<()> {
 let runtime = tokio::runtime::Builder::new_multi_thread()
     .enable_all()
     .thread_stack_size(8 * 1024 * 1024)
     .build()?;
 runtime.block_on(run());
-# Ok(())
-# }
+# Ok::<(), std::io::Error>(())
 ```
 
 A release build stays well below the default stack size, so it needs no change.
@@ -208,13 +206,8 @@ client. It routes other responses between live peers. See
 [Requests](CONFIGURATION.md#requests) for network and cache settings.
 
 ```rust,no_run
-# use prosody::prelude::*;
-# use serde_json::{Value, json};
-# use std::time::Duration;
-# async fn example<H>(client: &CassandraHighLevelClient<H>) -> Result<(), Box<dyn std::error::Error>>
-# where
-#     H: ClientHandler<Payload = Value, Output = Value, Codecs = JsonCodecs>,
-# {
+# use prosody::prelude::*; use serde_json::{Value, json}; use std::time::Duration;
+# async fn example<H: ClientHandler<Payload = Value, Output = Value, Codecs = JsonCodecs>>(client: &CassandraHighLevelClient<H>) -> Result<(), Box<dyn std::error::Error>> {
 let subsystems = [SubsystemName::try_new("inventory")?];
 let results = client
     .request(
@@ -233,8 +226,7 @@ for (subsystem, result) in results {
         Err(error) => eprintln!("{subsystem} failed: {error}"),
     }
 }
-# Ok(())
-# }
+# Ok(()) }
 ```
 
 ## Keyed State
@@ -249,72 +241,27 @@ the handler. Most collections should have a TTL comfortably beyond the longest t
 ```rust,no_run
 use prosody::state::descriptor::{Registered, StateDescriptor, ValueDescriptor, value_state};
 use prosody::timers::duration::CompactDuration;
-# use prosody::codec::JsonCodecError;
-# use prosody::prelude::*;
-# use prosody::state::descriptor::CellStateError;
-# use serde_json::{Value, json};
+# use prosody::{codec::JsonCodecError, prelude::*, state::descriptor::CellStateError}; use serde_json::{Value, json};
 
 #[derive(Clone)]
 struct CountHandler {
     count: Registered<ValueDescriptor>,
 }
 
-# async fn example(
-#     client: &CassandraHighLevelClient<CountHandler>,
-# ) -> Result<(), Box<dyn std::error::Error>> {
+# async fn example(client: &CassandraHighLevelClient<CountHandler>) -> Result<(), Box<dyn std::error::Error>> {
 let count = value_state("count").ttl(CompactDuration::new(30 * 24 * 60 * 60));
 let count = client.register(count).await?;
 client.subscribe(CountHandler { count }).await?;
-# Ok(())
-# }
-#
-# impl FallibleHandler for CountHandler {
-#     type Payload = Value;
-#     type Error = CellStateError<JsonCodecError>;
-#     type Output = ();
-#
-#     async fn on_message<C>(
-#         &self,
-#         context: C,
-#         _message: ConsumerMessage<Value>,
-#         _demand_type: DemandType,
-#     ) -> Result<(), Self::Error>
-#     where
-#         C: EventContext<Payload = Value>,
-#     {
+# Ok(()) } impl ClientHandler for CountHandler { type Codecs = Codecs<JsonCodec, UnitCodec>; }
+# impl FallibleHandler for CountHandler { type Payload = Value; type Error = CellStateError<JsonCodecError>; type Output = (); async fn shutdown(self) {}
+# async fn on_timer<C: EventContext>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) } async fn on_excise<C: EventContext>(&self, _: C, _: ConsumerMessage<()>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+# async fn on_message<C: EventContext<Payload = Value>>(&self, context: C, _: ConsumerMessage<Value>, _: DemandType) -> Result<(), Self::Error> {
 
 // Inside CountHandler::on_message:
 let count = context.state(self.count)?;
 let current = count.get().await?.and_then(|value| value.as_u64()).unwrap_or(0);
 count.set(json!(current + 1)).await?;
-#         Ok(())
-#     }
-#
-#     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error>
-#     where
-#         C: EventContext<Payload = Value>,
-#     {
-#         Ok(())
-#     }
-#
-#     async fn on_excise<C>(
-#         &self,
-#         _: C,
-#         _: ConsumerMessage<()>,
-#         _: DemandType,
-#     ) -> Result<(), Self::Error>
-#     where
-#         C: EventContext<Payload = Value>,
-#     {
-#         Ok(())
-#     }
-#
-#     async fn shutdown(self) {}
-# }
-#
-# impl ClientHandler for CountHandler {
-#     type Codecs = Codecs<JsonCodec, UnitCodec>;
-# }
+# Ok(()) } }
 ```
 
 Keyed-state cache settings are listed in [CONFIGURATION.md](CONFIGURATION.md#keyed-state).
@@ -329,22 +276,10 @@ Forward order is the default. Use `reverse()` for descending order and
 Start a fluent query with `entries`, `keys`, or `values`:
 
 ```rust,no_run
-# use prosody::prelude::*;
-# use prosody::state::Utf8KeyCodec;
-# use prosody::state::descriptor::{MapDescriptor, Registered, map_state};
-# use serde_json::Value;
-# async fn example<H, C>(
-#     client: &CassandraHighLevelClient<H>,
-#     context: C,
-#     orders: Registered<MapDescriptor<Utf8KeyCodec>>,
-# ) -> Result<(), Box<dyn std::error::Error>>
-# where
-#     H: ClientHandler<Payload = Value, Output = Value, Codecs = JsonCodecs>,
-#     C: EventContext<Payload = Value>,
-# {
+# use prosody::{prelude::*, state::{Utf8KeyCodec, descriptor::{MapDescriptor, Registered, map_state}}}; use serde_json::Value;
+# async fn example<H: ClientHandler<Payload = Value, Output = Value, Codecs = JsonCodecs>>(client: &CassandraHighLevelClient<H>, context: impl EventContext<Payload = Value>, orders: Registered<MapDescriptor<Utf8KeyCodec>>) -> Result<(), Box<dyn std::error::Error>> {
 # let map = context.state(orders)?;
-# let descriptor: MapDescriptor<Utf8KeyCodec> = map_state("orders");
-# let reader = client.state(SubsystemName::try_new("checkout")?, descriptor).await?;
+# let reader = client.state(SubsystemName::try_new("checkout")?, map_state::<Utf8KeyCodec, JsonCodec>("orders")).await?;
 use std::num::NonZeroUsize;
 
 let page_size = NonZeroUsize::try_from(20_usize)?;
@@ -359,9 +294,7 @@ let committed_entries = reader.entries("customer-123")
     .reverse()
     .limit(page_size)
     .stream();
-# drop((entries, committed_entries));
-# Ok(())
-# }
+# Ok(()) }
 ```
 
 Each fluent method consumes and returns the builder. Call `into_query()` to
@@ -398,19 +331,8 @@ the write machinery. A published collection with no subsystem is rejected at
 registration. The builder field falls back to `PROSODY_SUBSYSTEM` when unset.
 
 ```rust,no_run
-# use prosody::prelude::*;
-# use prosody::state::config::KeyedStateConfiguration;
-# use prosody::state::descriptor::{StateDescriptor, ValueDescriptor, value_state};
-# use serde_json::Value;
-# async fn example<H, C>(
-#     owner: &CassandraHighLevelClient<H>,
-#     context: C,
-#     updated: Value,
-# ) -> Result<(), Box<dyn std::error::Error>>
-# where
-#     H: ClientHandler<Payload = Value, Output = Value, Codecs = JsonCodecs>,
-#     C: EventContext<Payload = Value>,
-# {
+# use prosody::{prelude::*, state::{config::KeyedStateConfiguration, descriptor::{StateDescriptor, ValueDescriptor, value_state}}}; use serde_json::Value;
+# async fn example<H: ClientHandler<Payload = Value, Output = Value, Codecs = JsonCodecs>>(owner: &CassandraHighLevelClient<H>, context: impl EventContext<Payload = Value>, updated: Value) -> Result<(), Box<dyn std::error::Error>> {
 // One descriptor configures both the owning handle and the published reader.
 let current_order: ValueDescriptor = value_state("current-order").published(true);
 let config = KeyedStateConfiguration::builder()
@@ -423,31 +345,22 @@ let registered_order = owner.register(current_order).await?;
 let state = context.state(registered_order)?;
 let value = state.get().await?;
 state.set(updated).await?;
-# drop((config, value));
-# Ok(())
-# }
+# Ok(()) }
 ```
 
 Any other service reads it through the same high-level client, naming the
 subsystem and the same collection shape:
 
 ```rust,no_run
-# use prosody::prelude::*;
-# use prosody::state::descriptor::{StateDescriptor, ValueDescriptor, value_state};
-# use serde_json::Value;
-# async fn example<H>(client: &CassandraHighLevelClient<H>) -> Result<(), Box<dyn std::error::Error>>
-# where
-#     H: ClientHandler<Payload = Value, Output = Value, Codecs = JsonCodecs>,
-# {
+# use prosody::{prelude::*, state::descriptor::{StateDescriptor, ValueDescriptor, value_state}}; use serde_json::Value;
+# async fn example<H: ClientHandler<Payload = Value, Output = Value, Codecs = JsonCodecs>>(client: &CassandraHighLevelClient<H>) -> Result<(), Box<dyn std::error::Error>> {
 # let current_order: ValueDescriptor = value_state("current-order").published(true);
 // Outside a handler, each read supplies the state key explicitly.
 let reader = client
     .state(SubsystemName::try_new("checkout")?, current_order)
     .await?;
 let value = reader.get("customer-123").await?; // committed value from the owning group
-# drop(value);
-# Ok(())
-# }
+# Ok(()) }
 ```
 
 A reader observes only **committed** state — never an in-flight value and never
@@ -607,13 +520,10 @@ export PROSODY_ALLOWED_EVENTS=user.,account.
 
 ```rust,no_run
 # use prosody::prelude::*;
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
 let config = ConsumerConfiguration::builder()
     .allowed_events(vec!["user.".to_owned()])
     .build()?;
-# drop(config);
-# Ok(())
-# }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ### Matching Behavior
