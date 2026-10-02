@@ -97,7 +97,7 @@ fn prop_retry_increment(trace: Trace, demand: DemandType) -> color_eyre::Result<
                 let calls = harness.processed_messages();
                 match timer.outcome {
                     TimerOutcome::LoaderPermanent | TimerOutcome::LoaderTransient { .. } => {
-                        assert!(calls.is_empty());
+                        assert_eq!(calls, []);
                     }
                     _ => {
                         assert_eq!(calls.len(), 1);

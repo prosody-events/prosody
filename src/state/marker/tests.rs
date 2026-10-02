@@ -292,7 +292,7 @@ fn frozen_marker_payload_bytes() -> color_eyre::Result<()> {
     assert_eq!(decoded.clears(), legacy.clears());
     assert_eq!(decoded.evidence_ttl(), legacy.evidence_ttl());
     assert_eq!(decoded.dedup(), Some(Uuid::from_u128(0xFEED)));
-    assert!(decoded.touched().is_empty());
+    assert_eq!(decoded.touched(), []);
     let mut expected_v2 = expected;
     expected_v2.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 1, b'x', 0, 0, 14, 15, 1]);
     expected_v2.extend_from_slice(Uuid::from_u128(0xD3D0).as_bytes());
