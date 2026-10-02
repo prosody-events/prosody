@@ -24,11 +24,19 @@ jobs:
       required-work: ${{ steps.rail.outputs.required-work }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Restore planning evidence
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/planning-evidence
+          key: cargo-rail-evidence-${{ runner.os }}-${{ runner.arch }}-${{ github.event.pull_request.base.sha || github.event.before }}
       - name: Plan affected work
         id: rail
         uses: loadingalias/cargo-rail-action@409962f05d90a78aae995ef6b1c8466010c0a460 # v10.1.1
         with:
-          since: ${{ github.event_name == 'push' && github.event.before || '' }}
+          evidence: target/planning-evidence
 
   clippy:
     name: Clippy
