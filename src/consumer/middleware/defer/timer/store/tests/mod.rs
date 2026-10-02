@@ -16,6 +16,9 @@ pub type TestStoreResult = Result<(), String>;
 ///
 /// # Usage
 ///
+/// Rustdoc cannot compile this example, because the macro exists only in test
+/// builds.
+///
 /// ```rust,ignore
 /// timer_defer_store_tests!(async { MyStore::new().await });
 /// ```

@@ -33,14 +33,6 @@ use std::sync::Arc;
 /// - Connection to Cassandra fails
 /// - Schema migration fails
 /// - Query preparation fails
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let config = CassandraConfiguration { ... };
-/// let store = cassandra_store(&config, segment).await?;
-/// let manager = TimerManager::new(..., store);
-/// ```
 pub async fn cassandra_store(
     config: &CassandraConfiguration,
     segment: Segment,

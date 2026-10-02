@@ -74,7 +74,7 @@ pub(crate) fn format_sql(template: &str, keyspace: &str, args: &[&str]) -> Strin
 ///
 /// # Syntax
 ///
-/// ```rust,ignore
+/// ```text
 /// cassandra_queries! {
 ///     /// Documentation for the struct
 ///     pub struct Queries {
@@ -89,6 +89,9 @@ pub(crate) fn format_sql(template: &str, keyspace: &str, args: &[&str]) -> Strin
 /// ```
 ///
 /// # Example
+///
+/// Rustdoc cannot compile this example, because the expansion calls
+/// crate-private helpers that exist only inside `prosody`.
 ///
 /// ```rust,ignore
 /// use crate::cassandra::TABLE_SEGMENTS;
