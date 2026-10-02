@@ -37,14 +37,21 @@ type MessageStorage<P> =
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use prosody::consumer::message::ConsumerRecord;
+/// use prosody::loader::{MemoryLoader, MessageLoader};
 /// use serde_json::json;
 ///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let topic = "orders".into();
 /// let loader = MemoryLoader::new();
-/// loader.store_message(topic, 0, 100, key, json!({"value": 42}));
+/// loader.store_message(topic, 0, 100, "order-123".into(), json!({"value": 42}));
 ///
-/// let message = loader.load_message(topic, 0, 100).await?;
-/// assert_eq!(message.offset(), 100);
+/// let record = loader.load_message(topic, 0, 100).await?;
+/// assert!(matches!(record, ConsumerRecord::Message(message) if message.offset() == 100));
+/// # Ok(())
+/// # }
 /// ```
 pub struct MemoryLoader<P> {
     messages: Arc<RwLock<MessageStorage<P>>>,

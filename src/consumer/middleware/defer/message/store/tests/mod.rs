@@ -18,7 +18,7 @@ pub type TestStoreResult = Result<(), String>;
 /// # Usage
 ///
 /// ```rust,ignore
-/// defer_store_tests!(MyStore, async { MyStore::new().await });
+/// defer_store_tests!(async { MyStore::new().await });
 /// ```
 #[macro_export]
 macro_rules! defer_store_tests {

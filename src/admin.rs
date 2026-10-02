@@ -313,11 +313,19 @@ impl ProsodyAdminClient {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// admin.delete_records([
-    ///     (topic.clone(), 0, 100),
-    ///     (topic2.clone(), 1, 200),
-    /// ]).await?;
+    /// ```no_run
+    /// # use prosody::Topic;
+    /// # use prosody::admin::{ProsodyAdminClient, ProsodyAdminClientError};
+    /// # async fn example(
+    /// #     admin: &ProsodyAdminClient,
+    /// #     topic: Topic,
+    /// #     topic2: Topic,
+    /// # ) -> Result<(), ProsodyAdminClientError> {
+    /// admin
+    ///     .delete_records([(topic, 0, 100), (topic2, 1, 200)])
+    ///     .await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn delete_records<I>(&self, records: I) -> Result<(), ProsodyAdminClientError>
     where

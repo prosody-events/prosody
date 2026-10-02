@@ -66,20 +66,6 @@ impl DeferralDecider for AlwaysDefer {
 ///
 /// Test harness sets `next_decision` before each `MessageEvent`,
 /// based on the trace's `Transient { defer: bool }` field.
-///
-/// # Example
-///
-/// ```ignore
-/// let decider = TraceBasedDecider::new();
-///
-/// // Before processing a message that should be deferred
-/// decider.set_next(true);
-/// harness.process_message(event);
-///
-/// // Before processing a message that should NOT be deferred
-/// decider.set_next(false);
-/// harness.process_message(event);
-/// ```
 #[cfg(test)]
 #[derive(Clone, Debug, Default)]
 pub struct TraceBasedDecider {

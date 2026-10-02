@@ -32,20 +32,6 @@ use tracing::{debug, instrument};
 /// **Visibility**: `pub` but not re-exported from `store/mod.rs`.
 /// Used by factory functions in implementation modules (cassandra/mod.rs,
 /// memory.rs) which return concrete `TableAdapter<T>` types.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// // Factory functions return concrete TableAdapter:
-/// pub fn cassandra_store(...) -> TableAdapter<CassandraTriggerStore> {
-///     let cassandra = CassandraTriggerStore::new(...);
-///     TableAdapter::new(cassandra)
-/// }
-///
-/// // Consumer usage:
-/// let store = cassandra_store(...);  // TableAdapter<CassandraTriggerStore>: TriggerStore
-/// let manager = TimerManager::new(..., store);
-/// ```
 #[derive(Clone)]
 pub struct TableAdapter<T> {
     operations: Arc<T>,
