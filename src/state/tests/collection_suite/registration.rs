@@ -180,10 +180,9 @@ pub(super) fn map_missing_keyset_hides_a_live_entry() -> Result<()> {
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
     block_on(async {
         assert!(!handle.is_empty().await?);
-        assert!(
-            collect_map_keys(&handle, Direction::Forward)
-                .await?
-                .is_empty()
+        assert_eq!(
+            collect_map_keys(&handle, Direction::Forward).await?,
+            Vec::<i64>::new()
         );
         Ok::<_, color_eyre::Report>(())
     })

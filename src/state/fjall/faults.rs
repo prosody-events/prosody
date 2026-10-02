@@ -61,7 +61,7 @@ impl Faults {
     pub(super) fn delete(&self) -> Result<(), FjallCellCacheError> {
         injected(
             self.deletes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                 .is_ok(),
         )
     }

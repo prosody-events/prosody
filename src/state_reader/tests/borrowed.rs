@@ -262,7 +262,7 @@ async fn check_map<S: WritableStateSession>(
                 .await?,
             vec![(edge.clone(), model[edge].clone())]
         );
-        assert!(
+        assert_eq!(
             handle
                 .keys()
                 .reverse()
@@ -270,8 +270,8 @@ async fn check_map<S: WritableStateSession>(
                 .before(edge.as_str())
                 .stream()
                 .try_collect::<Vec<_>>()
-                .await?
-                .is_empty()
+                .await?,
+            Vec::<String>::new()
         );
     }
     assert_eq!(
@@ -401,8 +401,8 @@ async fn check_readers(
             )?;
             assert_eq!(entries, vec![(edge.clone(), model[edge].clone())]);
             assert_eq!(members, vec![edge.clone()]);
-            assert!(map_excluded.is_empty());
-            assert!(set_excluded.is_empty());
+            assert_eq!(map_excluded, Vec::<String>::new());
+            assert_eq!(set_excluded, Vec::<String>::new());
             Ok(())
         },
     )

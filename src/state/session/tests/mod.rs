@@ -329,7 +329,7 @@ async fn rollback_restores_the_commit_floor_without_durable_writes() -> Result<(
             .into_inner(),
         Some(Bytes::from_static(b"V")),
     );
-    assert!(fx.cells.provisional_coordinates(&cart_id).is_empty());
+    assert_eq!(fx.cells.provisional_coordinates(&cart_id), []);
     assert!(fx.cells.unsettled_marker_of(&cart_id).is_none());
 
     // Sibling isolation: the rollback drained only cart; wishlist stands.
