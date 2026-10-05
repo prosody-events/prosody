@@ -89,18 +89,17 @@ fn prop_segment_layout_fence() {
         use crate::error::{ClassifyError, ErrorCategory};
         let (store, id) = setup_test_store_with_version("layout-fence", SegmentVersion::V3).await?;
         let slab_size = CompactDuration::new(u32::from(slab_size).max(1));
-        store.update_segment_version(SegmentVersion::V3).await?;
         store.update_segment_slab_size(slab_size).await?;
         let acquired = store
             .get_segment()
             .await?
             .ok_or_else(|| color_eyre::eyre::eyre!("segment missing"))?;
-        assert_eq!(acquired.version, SegmentVersion::V4);
+        assert_eq!(acquired.into_parts().0.version, SegmentVersion::V4);
         let durable = store
             .get_segment_unchecked(&id)
             .await?
             .ok_or_else(|| color_eyre::eyre::eyre!("segment missing"))?;
-        assert_eq!(durable.version, SegmentVersion::V4);
+        assert_eq!(durable.into_parts().0.version, SegmentVersion::V4);
         store
             .session()
             .execute_unpaged(&store.queries().update_segment_version, (5_i8, id))
@@ -708,8 +707,8 @@ async fn test_pre_migration_reads_and_migration() -> Result<()> {
         .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_a.clone(), t1, tt))
         .await?;
     // Pre-backfill: state is Absent (no MAP entry).
-    // Uses fetch_state (DB-direct): add_key_trigger_clustering does not update
-    // the cache.
+    // Uses fetch_state (DB-direct): add_key_trigger_clustering does not update the
+    // cache.
     let state = store.fetch_state(&segment_id, &key_a, tt).await?;
     assert_eq!(
         state,
@@ -719,8 +718,7 @@ async fn test_pre_migration_reads_and_migration() -> Result<()> {
 
     // Backfill: 1 row → Inline.
     store.backfill_key_state(&segment_id, &key_a, tt).await?;
-    // Uses fetch_state (DB-direct): backfill_key_state does not update the
-    // cache.
+    // Uses fetch_state (DB-direct): backfill_key_state does not update the cache.
     let state = store.fetch_state(&segment_id, &key_a, tt).await?;
     assert!(
         matches!(&state, TimerState::Inline(t) if t.time == t1),
@@ -736,8 +734,8 @@ async fn test_pre_migration_reads_and_migration() -> Result<()> {
     store
         .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_b.clone(), t2, tt))
         .await?;
-    // Uses fetch_state (DB-direct): add_key_trigger_clustering does not update
-    // the cache.
+    // Uses fetch_state (DB-direct): add_key_trigger_clustering does not update the
+    // cache.
     let state = store.fetch_state(&segment_id, &key_b, tt).await?;
     assert_eq!(
         state,
@@ -747,8 +745,7 @@ async fn test_pre_migration_reads_and_migration() -> Result<()> {
 
     // Backfill: 2 rows → Overflow.
     store.backfill_key_state(&segment_id, &key_b, tt).await?;
-    // Uses fetch_state (DB-direct): backfill_key_state does not update the
-    // cache.
+    // Uses fetch_state (DB-direct): backfill_key_state does not update the cache.
     let state = store.fetch_state(&segment_id, &key_b, tt).await?;
     assert_eq!(
         state,
@@ -845,8 +842,7 @@ async fn test_clear_all_types_clears_inline_and_overflow() -> Result<()> {
     let t1 = CompactDateTime::from(1_000_000u32);
     let t2 = CompactDateTime::from(2_000_000u32);
 
-    // Set up: Application inline (1 timer), DeferredMessage overflow (2
-    // timers).
+    // Set up: Application inline (1 timer), DeferredMessage overflow (2 timers).
     store
         .clear_and_schedule_key(Trigger::for_testing(
             key.clone(),
@@ -1304,8 +1300,7 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
     let times: Vec<CompactDateTime> = ops_b.get_key_times(tt, &key).try_collect().await?;
     assert_eq!(times, vec![t1], "store B should read t1 via shared session");
 
-    // After the read, store B's cache should now be warm (Inline cached from
-    // DB).
+    // After the read, store B's cache should now be warm (Inline cached from DB).
     let warm_b = ops_b.state_cache.get(&cache_key);
     assert!(warm_b.is_some(), "store B cache should be warm after read");
     let warm_b_state = warm_b.as_ref().map(|h| h.try_lock().map(|g| g.clone()));

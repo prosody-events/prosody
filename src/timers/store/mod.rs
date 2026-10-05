@@ -32,7 +32,7 @@ use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::ops::{Deref, RangeInclusive};
+use std::ops::RangeInclusive;
 use uuid::Uuid;
 
 /// Cassandra-based persistent storage implementation.
@@ -211,9 +211,7 @@ impl Segment {
 /// The watermark is a slab id, so the segment slab size measures it. When it
 /// is set, every slab row of the segment has a higher slab id. Only the store
 /// sets the watermark, and a slab-size change clears it. Thus a watermark never
-/// pairs with a different slab size. `Deref` gives read access to the segment
-/// fields. There is no `DerefMut`, so the slab size changes only through
-/// `resize`.
+/// pairs with a different slab size.
 #[derive(Clone, Debug)]
 pub struct StoredSegment {
     segment: Segment,
@@ -229,20 +227,10 @@ impl StoredSegment {
         }
     }
 
-    /// Splits into the segment and its slab watermark.
+    /// Splits into the segment and its slab watermark. It stays crate-visible
+    /// because no client binding reads a segment.
     pub(crate) fn into_parts(self) -> (Segment, Option<SlabId>) {
         (self.segment, self.slab_watermark)
-    }
-
-    /// Sets the schema version. The watermark does not depend on it.
-    pub(in crate::timers::store) fn set_version(&mut self, version: SegmentVersion) {
-        self.segment.version = version;
-    }
-
-    /// Sets the slab size and clears the watermark of the old slab size.
-    pub(in crate::timers::store) fn resize(&mut self, slab_size: CompactDuration) {
-        self.segment.slab_size = slab_size;
-        self.slab_watermark = None;
     }
 }
 
@@ -250,14 +238,6 @@ impl StoredSegment {
 impl From<Segment> for StoredSegment {
     fn from(segment: Segment) -> Self {
         Self::new(segment, None)
-    }
-}
-
-impl Deref for StoredSegment {
-    type Target = Segment;
-
-    fn deref(&self) -> &Segment {
-        &self.segment
     }
 }
 

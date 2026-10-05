@@ -88,10 +88,14 @@ impl Arbitrary for MigrationTestInput {
         };
 
         // Slab sizes run from 1 second to 7 days, which avoids TTL overflow.
-        // Do not clamp: a clamp maps most draws to 7 days, so sizes rarely
-        // change.
+        // Do not clamp: a clamp maps most draws to 7 days. Half of the inputs
+        // keep the slab size, so a version-only migration keeps the watermark.
         let initial_slab_size = CompactDuration::new(u32::arbitrary(g) % 604_800 + 1);
-        let target_slab_size = CompactDuration::new(u32::arbitrary(g) % 604_800 + 1);
+        let target_slab_size = if bool::arbitrary(g) {
+            initial_slab_size
+        } else {
+            CompactDuration::new(u32::arbitrary(g) % 604_800 + 1)
+        };
 
         // Generate 0-50 triggers (empty segments are valid test cases)
         let trigger_count = usize::arbitrary(g) % 51;
@@ -370,8 +374,7 @@ pub async fn prop_migration_invariants(
         }
         SegmentVersion::V2 => {
             // Write true V2 layout: clustering rows + slab entries, no state
-            // MAP entries.  backfill_key_state must populate state from
-            // scratch.
+            // MAP entries.  backfill_key_state must populate state from scratch.
             let config = test_cassandra_config(TEST_KEYSPACE);
             let cassandra_base = CassandraStore::new(&config).await?;
             let segment = Segment {
@@ -413,8 +416,8 @@ pub async fn prop_migration_invariants(
         version: SegmentVersion::V3,
     };
 
-    // Seed the watermark through a store in the initial slab size, which
-    // anchors its TTL.
+    // Anchor the seed TTL in the initial slab size, because a target-size
+    // anchor can expire after 2038 and Cassandra rejects that TTL.
     if let Some(watermark) = input.initial_watermark() {
         let segment = Segment {
             slab_size: input.initial_slab_size,
@@ -450,8 +453,15 @@ pub async fn prop_migration_invariants(
         return Ok(());
     }
 
-    // Verification phase: Check all invariants
-    verify_segment_metadata(&store, &model, input.initial_version).await?;
+    // Verification phase: Check the migrated segment, a fresh read of it, and
+    // all other invariants.
+    let durable = store
+        .get_segment()
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to get segment: {e:?}"))?;
+    for segment in [segment_opt, durable] {
+        verify_segment_metadata(segment, &model, input.initial_version)?;
+    }
     verify_data_preservation(&store, &model).await?;
     verify_correct_indexing(&store, &model).await?;
     verify_dual_index_consistency(&store, &model).await?;

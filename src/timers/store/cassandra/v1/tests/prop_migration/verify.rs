@@ -8,7 +8,7 @@ use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::cassandra::v1::V1Operations;
 use crate::timers::store::cassandra::{CassandraTriggerStore, TimerState};
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{SegmentVersion, TriggerStore};
+use crate::timers::store::{SegmentVersion, StoredSegment, TriggerStore};
 use crate::timers::{TimerType, Trigger};
 use ahash::{HashMap, HashSet};
 use futures::TryStreamExt;
@@ -18,16 +18,14 @@ use strum::VariantArray;
 ///
 /// Expected: version V4, the target slab size, the model slab watermark, and
 /// the initial name (not for V1).
-pub(super) async fn verify_segment_metadata(
-    store: &TableAdapter<CassandraTriggerStore>,
+pub(super) fn verify_segment_metadata(
+    segment: Option<StoredSegment>,
     model: &MigrationModel,
     initial_version: SegmentVersion,
 ) -> color_eyre::Result<()> {
-    let segment = store
-        .get_segment()
-        .await
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to get segment: {e:?}"))?
-        .ok_or_else(|| color_eyre::eyre::eyre!("Segment {} not found", model.segment.id))?;
+    let (segment, watermark) = segment
+        .ok_or_else(|| color_eyre::eyre::eyre!("Segment {} not found", model.segment.id))?
+        .into_parts();
 
     if segment.version != model.segment.version {
         return Err(color_eyre::eyre::eyre!(
@@ -46,7 +44,6 @@ pub(super) async fn verify_segment_metadata(
     }
 
     // Invariant I1: every slab row lies above the watermark.
-    let (segment, watermark) = segment.into_parts();
     if watermark != model.slab_watermark
         || watermark.is_some_and(|w| model.expected_slab_ids().iter().any(|&slab| slab <= w))
     {
@@ -364,9 +361,8 @@ pub(super) async fn verify_key_state_invariant(
                     ));
                 }
 
-                // For singleton normalization: the clustering row must have
-                // been deleted — the trigger lives exclusively
-                // in the state MAP now.
+                // For singleton normalization: the clustering row must have been
+                // deleted — the trigger lives exclusively in the state MAP now.
                 let clustering_rows = store
                     .operations()
                     .peek_trigger_times(&model.segment.id, key, *timer_type)

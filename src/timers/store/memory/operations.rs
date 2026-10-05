@@ -394,8 +394,7 @@ impl TriggerOperations for InMemoryTriggerStore {
             .await
             .or_default();
 
-        // Collect old times before clearing (exclude the new trigger's own
-        // time).
+        // Collect old times before clearing (exclude the new trigger's own time).
         let old_times: SmallVec<[CompactDateTime; 1]> = entry
             .get()
             .keys()
@@ -403,8 +402,7 @@ impl TriggerOperations for InMemoryTriggerStore {
             .map(|(_, time)| *time)
             .collect();
 
-        // Clear all existing triggers for this timer_type, then insert the new
-        // one.
+        // Clear all existing triggers for this timer_type, then insert the new one.
         entry
             .get_mut()
             .retain(|(t_type, _time), _| *t_type != trigger.timer_type);

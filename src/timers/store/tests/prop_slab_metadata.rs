@@ -53,8 +53,9 @@ pub struct SlabMetadataTestInput {
 
 impl Arbitrary for SlabMetadataTestInput {
     fn arbitrary(g: &mut Gen) -> Self {
-        // Generate a slab size for this test (1 second to 7 days to avoid TTL overflow)
-        let slab_size = CompactDuration::new(u32::arbitrary(g).clamp(1, 604_800));
+        // Draw a slab size from 1 second to 7 days, which avoids TTL overflow.
+        // Do not clamp: a clamp maps most draws to 7 days.
+        let slab_size = CompactDuration::new(u32::arbitrary(g) % 604_800 + 1);
 
         // Generate 10-50 operations using these segments
         let op_count = (usize::arbitrary(g) % 40) + 10;

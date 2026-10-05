@@ -46,8 +46,8 @@ cassandra_queries! {
         /// skips them when a live slab row exists. An idle segment has no live
         /// slab row. Its read walks every tombstone: at most one for each slab
         /// interval during `gc_grace_seconds`, or 240 at the default 1-hour slab
-        /// size. Moving the static columns to their own table needs a segment
-        /// version fence, and older versions treat an unknown version as
+        /// size. A separate table for the static columns needs a segment
+        /// version fence. Older versions treat an unknown version as
         /// `Terminal`.
         get_segment: (
             "SELECT name, slab_size, version, slab_watermark FROM $keyspace.{} WHERE id = ? ORDER BY slab_id DESC LIMIT 1",
@@ -163,8 +163,7 @@ cassandra_queries! {
         ),
 
         /// Updates segment slab size and clears the watermark measured in the
-        /// old slab size. Null is correct: a rewrite without a TTL makes the
-        /// watermark permanent.
+        /// old slab size.
         update_segment_slab_size: (
             "UPDATE $keyspace.{} SET slab_size = ?, slab_watermark = null WHERE id = ?",
             TABLE_SEGMENTS
