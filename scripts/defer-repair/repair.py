@@ -19,20 +19,26 @@ Classes:
   NO_SEGMENT  the defer segment metadata or the timer segment is missing
   OLD_LAYOUT  the timer segment layout is older than V3
 
-A key is also UNREADABLE when its queue has rows but both summary columns
-(`next_offset` or `next_timer`, and `retry_count`) are NULL. The store reads
-such a queue as empty, and the next retry fire deletes it. Versions before
-v0.2.1 can write this state.
+The summary column shows how the defer store reads the queue:
+  readable    the store starts at the first row
+  UNREADABLE  the queue has rows, but both summary columns (`next_offset` or
+              `next_timer`, and `retry_count`) are NULL
+  HIDDEN      the next-entry summary is after the first row
 
-Entries of GHOST, NO_TIMER and UNREADABLE keys never run: the report counts
-them under `never_fire`. HEALTHY and STALE keys keep a loadable retry timer.
+The store reads an UNREADABLE queue as empty. It starts a HIDDEN queue at the
+summary and never reads the rows before it. In both cases a retry fire that
+finds no later row deletes the whole queue. Versions before v0.2.1 can write
+both states: a later deferral to an UNREADABLE queue makes it HIDDEN.
+
+The report counts the entries that never run under `never_fire`: all entries
+of GHOST, NO_TIMER and UNREADABLE keys, and the hidden entries of HIDDEN keys.
 
 Commands:
   audit full | audit sample      read only; write a report
   arm                            show the plan; add --apply to write
 
-The arm command first repairs each UNREADABLE key with the store's own
-legacy repair write. It then adds one retry timer to each GHOST, NO_TIMER
+The arm command first repairs each UNREADABLE and HIDDEN key with the
+store's own legacy repair write. It then adds one retry timer to each GHOST, NO_TIMER
 and STALE key. It never removes a timer. A second run finds each key readable and
 HEALTHY, and skips it. A slab row that the key row does not show is not
 found. Such a key gets one more timer, which is safe.
@@ -409,19 +415,21 @@ class Repair:
                       (segment.id, key, timer_type, fire, {}, tag, store.ttl(fire)))
 
     def repair_summary(self, table, defer_segment_id, key):
-        """Writes the missing next-entry summary of an UNREADABLE queue.
+        """Points the next-entry summary of a queue at its first row.
 
         Copies `repair_legacy_partition` in each defer store. The statics
-        are read again first. Returns "repaired", "readable" when a consumer
-        wrote them during the scan, or "empty" when no queue row is left.
+        and the first row are read again first. Returns "repaired",
+        "readable" when the store already starts at the first row, or
+        "empty" when no queue row is left.
         """
         store = self.store
-        rows = store.run(store.q_next_static[table], (defer_segment_id, key))
-        if rows and (rows[0][0] is not None or rows[0].retry_count is not None):
-            return "readable"
         first = store.run(store.q_probe_min[table], (defer_segment_id, key))
         if not first or first[0][0] is None:
             return "empty"
+        rows = store.run(store.q_next_static[table], (defer_segment_id, key))
+        next_value, retry_count = (rows[0][0], rows[0].retry_count) if rows else (None, None)
+        if summary_state(table, next_value, retry_count, first[0][0]) == "readable":
+            return "readable"
 
         if table == "deferred_offsets":
             # The message store binds the retention, not an anchored TTL.
@@ -452,13 +460,28 @@ def partitions(rows, clustering):
         yield current
 
 
-def unreadable(part):
-    """True when the store reads this non-empty queue as empty.
+def summary_state(table, next_value, retry_count, first):
+    """Returns how the defer store reads a queue whose first row is `first`.
 
     `read_next_static` returns no entry when both summary columns are NULL,
-    and does not probe the queue rows.
+    and does not probe the queue rows. When only `next_*` is NULL, the store
+    probes the first row and repairs the summary itself. Otherwise the store
+    starts at the summary, and a FIFO completion reads only later rows.
     """
-    return bool(part["entries"]) and part["next"] is None and part["retry_count"] is None
+    if next_value is None:
+        return "UNREADABLE" if retry_count is None else "readable"
+    start = next_value if table == "deferred_offsets" else next_value.time
+    return "HIDDEN" if start > first else "readable"
+
+
+def never_run(table, part, summary):
+    """Counts the queue entries that the defer store never reads."""
+    if summary == "UNREADABLE":
+        return len(part["entries"])
+    if summary == "HIDDEN":
+        start = part["next"] if table == "deferred_offsets" else part["next"].time
+        return sum(1 for entry in part["entries"] if entry < start)
+    return 0
 
 
 def batches(repair, args, table, clustering, next_column):
@@ -518,14 +541,17 @@ def process_table(repair, args, table, clustering, timer_type, next_column, writ
             meta, segment, klass, detail = repair.classify(segment_id, key, timer_type)
             group, topic, partition = meta or ("?", "?", "?")
             queued = len(part["entries"])
-            summary = "UNREADABLE" if unreadable(part) else "readable"
+            summary = summary_state(table, part["next"], part["retry_count"],
+                                    min(part["entries"]))
             classes.add(klass, queued)
             summaries.add(summary, queued)
-            if klass in STRANDED or summary == "UNREADABLE":
+            if klass in STRANDED:
                 never_fire.add(group, queued)
+            elif summary != "readable":
+                never_fire.add(group, never_run(table, part, summary))
             by_group[group].add(klass, queued)
-            if summary == "UNREADABLE":
-                by_group[group].add("UNREADABLE", queued)
+            if summary != "readable":
+                by_group[group].add(summary, queued)
             writer.writerow([table, klass, summary, group, topic, partition,
                              segment.version if segment else "",
                              segment.watermark_age_days(repair.now) if segment else "",
@@ -578,7 +604,7 @@ def act(repair, args, table, defer_segment_id, segment, key, timer_type, klass, 
     The summary repair runs first. A key whose repair does not succeed is
     never armed, because a retry fire would delete its queue.
     """
-    needs_repair = summary == "UNREADABLE"
+    needs_repair = summary != "readable"
     needs_timer = klass in ARMABLE
     if not needs_repair and not needs_timer:
         return None

@@ -42,17 +42,27 @@ segment. Never assume one slab size for all segments.
 
 `GHOST` and `NO_TIMER` keys have no retry timer that will ever fire.
 
-The `summary` column is separate from the class. A queue is `UNREADABLE`
-when it has rows but both summary columns are NULL: `next_offset` or
-`next_timer`, and `retry_count`. The defer store reads only those columns,
-so it reads such a queue as empty. The next retry fire then deletes the
-queue and its entries never run. Versions before v0.2.1 can write this
-state. The report counts these keys under `summary`.
+The `summary` column is separate from the class. It shows where the defer
+store starts to read the queue:
+
+| Summary | Meaning |
+|---------|---------|
+| `readable` | The store starts at the first row. |
+| `UNREADABLE` | The queue has rows, but both summary columns are NULL: `next_offset` or `next_timer`, and `retry_count`. |
+| `HIDDEN` | The next-entry summary is after the first row. |
+
+The store reads an `UNREADABLE` queue as empty. It starts a `HIDDEN` queue
+at the summary and never reads the rows before it. In both cases, a retry
+fire that finds no later row deletes the whole queue, so those rows never
+run. Versions before v0.2.1 can write both states. A later deferral to an
+`UNREADABLE` queue writes a new summary above the old rows, which makes the
+queue `HIDDEN`.
 
 The report counts the entries that will never run under `never_fire`: all
-`GHOST`, `NO_TIMER` and `UNREADABLE` keys. `HEALTHY` and `STALE` keys keep a
-loadable retry timer. A `STALE` key is not an error: its group is off, or
-its handler keeps failing for that key.
+entries of `GHOST`, `NO_TIMER` and `UNREADABLE` keys, and the hidden entries
+of `HIDDEN` keys. `HEALTHY` and `STALE` keys keep a loadable retry timer. A
+`STALE` key is not an error: its group is off, or its handler keeps failing
+for that key.
 
 `STALE` is not a stranded key. A loadable timer in the past means that the
 segment has no running owner, or that the owner retries the fired timer in
@@ -61,22 +71,24 @@ owner advances the segment.
 
 ## The summary repair
 
-The `arm` command repairs each `UNREADABLE` queue before it adds a timer.
-It repairs these queues even when they already have a loadable timer. The write
-copies `repair_legacy_partition` in each defer store:
+The `arm` command repairs each `UNREADABLE` and `HIDDEN` queue before it
+adds a timer. It repairs these queues even when they already have a loadable
+timer. The write points the next-entry summary at the first row, as
+`repair_legacy_partition` does in each defer store:
 
 - Messages: set `next_offset` to the first offset, with the retention as TTL.
 - Timers: set `next_timer` to the first row's time and span, with
   `calculate_ttl(time)` as TTL.
 
-The script reads the summary columns again just before the write. It skips
-a queue that a consumer made readable during the scan. It never arms a key
-whose repair did not succeed.
+The script reads the first row and the summary columns again just before
+the write. It skips a queue that a consumer made readable during the scan.
+It never arms a key whose repair did not succeed.
 
 A running consumer keeps a cache of each key's next entry, and the cache
-can hold "no queue". The script cannot clear that cache. If a consumer read
-an `UNREADABLE` key since its partition assignment, a retry fire can still
-delete the queue until the cache entry goes or the partition moves.
+can hold "no queue" or the old summary. The script cannot clear that cache.
+If a consumer read an `UNREADABLE` or `HIDDEN` key since its partition
+assignment, a retry fire can still delete the queue until the cache entry
+goes or the partition moves.
 
 ## The arm write
 
