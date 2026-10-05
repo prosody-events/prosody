@@ -576,10 +576,10 @@ Every consumer mode includes a deduplication middleware that filters duplicate m
 When a message arrives, the middleware computes a deterministic UUID by hashing the version, consumer group, topic,
 partition, key, and either the message's `id` field or its Kafka offset. It checks the local cache first, then
 Cassandra. If found in either, the message is skipped. Otherwise, the message is processed and the UUID is recorded in
-both tiers.
+both tiers. Other messages can arrive between duplicates.
 
-- **Best-effort persistence**: Cassandra read failures are treated as cache misses; write failures are logged but do not
-  fail the message. The global cache still provides deduplication within a single process lifetime.
+- **Store errors**: A failed Cassandra deduplication read returns a transient error before the handler runs.
+  Successful settlement retries deduplication writes before it commits the source offset. Shutdown can stop these retries.
 - **Cache-busting**: Changing `PROSODY_IDEMPOTENCE_VERSION` invalidates all previously recorded entries, causing
   messages to be reprocessed.
 - **TTL expiry**: Dedup records in Cassandra expire after `PROSODY_IDEMPOTENCE_TTL` (default: 7 days).
