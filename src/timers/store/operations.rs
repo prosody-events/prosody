@@ -9,9 +9,8 @@
 use crate::Key;
 use crate::error::ClassifyError;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::{Segment, SegmentVersion, StoredSegment};
+use crate::timers::store::{Segment, StoredSegment};
 use crate::timers::{TimerType, Trigger};
 use futures::Stream;
 use smallvec::SmallVec;
@@ -47,7 +46,7 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     fn segment(&self) -> &Segment;
 
     // =========================================================================
-    // Segment Operations (3 methods)
+    // Segment Operations
     // =========================================================================
 
     /// Persists this store's segment configuration.
@@ -62,7 +61,7 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     fn delete_segment(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // =========================================================================
-    // Slab Metadata Operations (4 methods)
+    // Slab Metadata Operations
     // =========================================================================
 
     /// Lists all slab IDs in this store's segment.
@@ -105,7 +104,7 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // =========================================================================
-    // Slab Trigger Operations (4 methods)
+    // Slab Trigger Operations
     // =========================================================================
 
     /// Streams all triggers of a specific type within a slab's time range.
@@ -144,7 +143,7 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // =========================================================================
-    // Key Trigger Operations (7 methods)
+    // Key Trigger Operations
     // =========================================================================
 
     /// Streams all scheduled times for a given key and timer type.
@@ -224,21 +223,4 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<Option<Trigger>, Self::Error>> + Send;
-
-    // =========================================================================
-    // Segment Migration Markers (2 methods)
-    // =========================================================================
-
-    /// Updates the schema version for this store's segment.
-    fn update_segment_version(
-        &self,
-        new_version: SegmentVersion,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Updates the slab size for this store's segment and clears its slab
-    /// watermark in one write. The watermark is a slab id in the old slab size.
-    fn update_segment_slab_size(
-        &self,
-        new_slab_size: CompactDuration,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

@@ -14,7 +14,8 @@ use ahash::{HashMap, HashSet};
 use futures::TryStreamExt;
 use strum::VariantArray;
 
-/// Verifies that segment metadata is correct after migration.
+/// Verifies that segment metadata is correct after migration, and returns the
+/// slab watermark.
 ///
 /// Expected: version V4, the target slab size, the model slab watermark, and
 /// the initial name (not for V1).
@@ -22,7 +23,7 @@ pub(super) fn verify_segment_metadata(
     segment: Option<StoredSegment>,
     model: &MigrationModel,
     initial_version: SegmentVersion,
-) -> color_eyre::Result<()> {
+) -> color_eyre::Result<Option<SlabId>> {
     let (segment, watermark) = segment
         .ok_or_else(|| color_eyre::eyre::eyre!("Segment {} not found", model.segment.id))?
         .into_parts();
@@ -43,14 +44,10 @@ pub(super) fn verify_segment_metadata(
         ));
     }
 
-    // Invariant I1: every slab row lies above the watermark.
-    if watermark != model.slab_watermark
-        || watermark.is_some_and(|w| model.expected_slab_ids().iter().any(|&slab| slab <= w))
-    {
+    if watermark != model.slab_watermark {
         return Err(color_eyre::eyre::eyre!(
-            "Slab watermark {watermark:?} differs from {:?} or is not below slabs {:?}",
-            model.slab_watermark,
-            model.expected_slab_ids()
+            "Slab watermark mismatch: expected {:?}, got {watermark:?}",
+            model.slab_watermark
         ));
     }
 
@@ -64,7 +61,7 @@ pub(super) fn verify_segment_metadata(
         ));
     }
 
-    Ok(())
+    Ok(watermark)
 }
 
 /// Collects every trigger the key index holds for each distinct key in the
@@ -212,10 +209,12 @@ pub(super) async fn verify_dual_index_consistency(
     Ok(())
 }
 
-/// Verifies that ONLY expected slabs exist (no extra slabs).
-pub(super) async fn verify_no_extra_slabs(
+/// Verifies that ONLY expected slabs exist (no extra slabs), and that every
+/// slab lies above the persisted `watermark`.
+pub(super) async fn verify_slabs(
     operations: &CassandraTriggerStore,
     model: &MigrationModel,
+    watermark: Option<SlabId>,
 ) -> color_eyre::Result<()> {
     // Get ALL slabs for this segment
     let all_slabs: Vec<SlabId> = operations
@@ -223,6 +222,17 @@ pub(super) async fn verify_no_extra_slabs(
         .try_collect()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to get all slabs: {e:?}"))?;
+
+    // Invariant I1 of `StoredSegment`: every stored slab lies above the
+    // watermark.
+    if let Some(slab) = all_slabs
+        .iter()
+        .find(|&&slab| watermark.is_some_and(|w| slab <= w))
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "Slab {slab} is not above watermark {watermark:?}"
+        ));
+    }
 
     let expected_slabs: HashSet<SlabId> = model.expected_slab_ids().into_iter().collect();
 

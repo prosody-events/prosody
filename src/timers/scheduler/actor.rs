@@ -57,12 +57,9 @@ pub(super) struct ActorState<T> {
     /// truth for which persisted slab rows still need cleanup. The load loop
     /// is the only code path that discovers preexisting rows from storage.
     pub(super) known_slab_ids: BTreeSet<SlabId>,
-    /// Last persisted value of `slab_watermark` for this segment.
-    ///
-    /// Invariant I1: when `Some(w)`, every clustering row in `timer_segments`
-    /// for this segment has `slab_id > w`. `None` means the column is null;
-    /// the scheduler then scans from slab 0. The actor seeds it from the
-    /// [`StoredSegment`] it receives.
+    /// Last persisted value of `slab_watermark` for this segment. It keeps
+    /// invariant I1 of [`StoredSegment`]. `None` makes the scheduler scan
+    /// from slab 0.
     pub(super) last_persisted_watermark: Option<SlabId>,
     /// Highest slab ID `load_step` has scanned to. Tracks loading progress
     /// so we know where to resume next tick.
@@ -86,7 +83,13 @@ pub(super) async fn run_actor<T>(
 ) where
     T: TriggerStore,
 {
-    let (segment, last_persisted_watermark) = segment.into_parts();
+    let (segment, watermark) = segment.into_parts();
+    // A valid watermark is below the current slab. An older version did not
+    // convert the watermark on a slab-size change, so discard a higher one.
+    let last_persisted_watermark = watermark.filter(|&watermark| {
+        CompactDateTime::now()
+            .is_ok_and(|now| watermark < Slab::from_time(segment.slab_size, now).id())
+    });
     let preload_window = calculate_preload(segment.slab_size);
     let now = Instant::now();
     let mut state: ActorState<T> = ActorState {

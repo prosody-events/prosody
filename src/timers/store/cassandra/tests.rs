@@ -23,7 +23,7 @@ use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::tests::common::KEY_POOL;
 use crate::timers::store::tests::prop_key_triggers::{KeyTriggerOperation, KeyTriggerTestInput};
-use crate::timers::store::{Segment, SegmentId, SegmentVersion};
+use crate::timers::store::{Segment, SegmentId, SegmentVersion, StoredSegment};
 use crate::timers::test_support::test_segment;
 use crate::tracing::init_test_logging;
 use crate::trigger_store_tests;
@@ -89,7 +89,13 @@ fn prop_segment_layout_fence() {
         use crate::error::{ClassifyError, ErrorCategory};
         let (store, id) = setup_test_store_with_version("layout-fence", SegmentVersion::V3).await?;
         let slab_size = CompactDuration::new(u32::from(slab_size).max(1));
-        store.update_segment_slab_size(slab_size).await?;
+        let segment = Segment {
+            slab_size,
+            ..store.segment.clone()
+        };
+        store
+            .update_segment_slab_size(&StoredSegment::from(segment))
+            .await?;
         let acquired = store
             .get_segment()
             .await?

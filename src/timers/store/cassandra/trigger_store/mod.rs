@@ -43,7 +43,7 @@ use crate::timers::store::cassandra::CassandraTriggerStore;
 use crate::timers::store::cassandra::error::CassandraTriggerStoreError;
 use crate::timers::store::cassandra::migration;
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentVersion, StoredSegment};
+use crate::timers::store::{Segment, StoredSegment};
 use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
 use futures::{Stream, TryStreamExt, pin_mut};
@@ -358,29 +358,6 @@ impl TriggerOperations for CassandraTriggerStore {
         timer_type: TimerType,
     ) -> impl Future<Output = Result<Option<Trigger>, Self::Error>> + Send {
         read::current(self, key, time, timer_type)
-    }
-
-    // -- Segment migration markers --
-
-    #[instrument(level = "debug", skip(self), err)]
-    async fn update_segment_version(&self, new_version: SegmentVersion) -> Result<(), Self::Error> {
-        self.execute_unpaged_discard(
-            &self.queries().update_segment_version,
-            (new_version, self.segment.id),
-        )
-        .await
-    }
-
-    #[instrument(level = "debug", skip(self), err)]
-    async fn update_segment_slab_size(
-        &self,
-        new_slab_size: CompactDuration,
-    ) -> Result<(), Self::Error> {
-        self.execute_unpaged_discard(
-            &self.queries().update_segment_slab_size,
-            (new_slab_size, self.segment.id),
-        )
-        .await
     }
 }
 

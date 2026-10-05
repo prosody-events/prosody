@@ -88,34 +88,30 @@ use tracing::{debug, info, instrument, warn};
 #[instrument(level = "debug", skip(store), err)]
 pub(crate) async fn migrate_segment_if_needed(
     store: &CassandraTriggerStore,
-    segment: StoredSegment,
+    mut stored: StoredSegment,
     desired_slab_size: CompactDuration,
 ) -> Result<StoredSegment, CassandraTriggerStoreError> {
-    let (mut segment, mut slab_watermark) = segment.into_parts();
-
     // Phase 1: V1→V2 schema migration
-    if needs_migration(&segment) {
-        segment = migrate_segment_version(store, segment).await?;
+    if needs_migration(&stored.segment) {
+        stored.segment = migrate_segment_version(store, stored.segment).await?;
     }
 
     // Phase 2: Slab size migration
-    if needs_slab_size_migration(&segment, desired_slab_size) {
-        segment = migrate_slab_size(store, segment, desired_slab_size).await?;
-        // The store cleared the watermark: it was a slab id in the old size.
-        slab_watermark = None;
+    if needs_slab_size_migration(&stored.segment, desired_slab_size) {
+        stored = migrate_slab_size(store, stored, desired_slab_size).await?;
     }
 
     // Phase 3: V2→V3 key state backfill
-    if needs_key_state_migration(&segment) {
-        segment = migrate_key_states(store, segment).await?;
+    if needs_key_state_migration(&stored.segment) {
+        stored.segment = migrate_key_states(store, stored.segment).await?;
     }
 
-    if segment.version == SegmentVersion::V3 {
+    if stored.segment.version == SegmentVersion::V3 {
         store.update_segment_version(SegmentVersion::V4).await?;
-        segment.version = SegmentVersion::V4;
+        stored.segment.version = SegmentVersion::V4;
     }
 
-    Ok(StoredSegment::new(segment, slab_watermark))
+    Ok(stored)
 }
 
 /// Checks if a segment needs migration from v1 to v2.
@@ -453,11 +449,11 @@ async fn migrate_triggers_to_new_slabs(
 /// - Metadata row: `(segment_id, slab_id=2)` ← Shared, don't delete
 async fn cleanup_old_slabs_with_overlap_protection(
     store: &CassandraTriggerStore,
-    segment: &Segment,
+    segment_id: SegmentId,
+    old_slab_size: CompactDuration,
     old_slab_ids: Vec<SlabId>,
     new_slab_ids: &HashSet<SlabId>,
 ) {
-    let old_slab_size = segment.slab_size;
     let old_slab_count = old_slab_ids.len();
     let reused_count = old_slab_ids
         .iter()
@@ -471,10 +467,7 @@ async fn cleanup_old_slabs_with_overlap_protection(
         );
     }
 
-    debug!(
-        "Cleaning up {} old slabs for segment {}",
-        old_slab_count, segment.id
-    );
+    debug!("Cleaning up {old_slab_count} old slabs for segment {segment_id}");
 
     // Process ALL old slab IDs: conditionally delete metadata, always clear
     // triggers
@@ -484,9 +477,8 @@ async fn cleanup_old_slabs_with_overlap_protection(
             let is_reused = new_slab_ids.contains(&slab_id);
 
             async move {
-                let segment_id = segment.id;
-
-                // Delete metadata ONLY if slab_id is not reused (shared row in timer_segments)
+                // Delete metadata ONLY if slab_id is not reused (shared row in
+                // timer_segments)
                 if !is_reused && let Err(error) = store.delete_slab(slab_id).await {
                     warn!(
                         "Failed to delete metadata for old slab {slab_id} (segment {segment_id}): \
@@ -511,8 +503,8 @@ async fn cleanup_old_slabs_with_overlap_protection(
         .await;
 
     debug!(
-        "Cleaned up {} old slabs for segment {} ({} metadata deletions skipped for reused IDs)",
-        old_slab_count, segment.id, reused_count
+        "Cleaned up {old_slab_count} old slabs for segment {segment_id} ({reused_count} metadata \
+         deletions skipped for reused IDs)"
     );
 }
 
@@ -520,8 +512,8 @@ async fn cleanup_old_slabs_with_overlap_protection(
 ///
 /// Reads all triggers from slabs with the old slab size, recalculates their
 /// slab IDs based on the new slab size, writes them to new slabs using
-/// coordinated high-level operations, updates the segment `slab_size`, and
-/// cleans up old slabs.
+/// coordinated high-level operations, updates the segment `slab_size` and the
+/// converted slab watermark, and cleans up old slabs.
 ///
 /// **IMPORTANT:** This function requires the segment to be v2. Phase 1 version
 /// migration must be completed before calling this function.
@@ -529,12 +521,13 @@ async fn cleanup_old_slabs_with_overlap_protection(
 /// **Note**: This function is Cassandra-specific. If the segment is not v2
 /// or v3, migration is skipped and the segment is returned unchanged rather
 /// than erroring — see the version check below.
-#[instrument(level = "debug", skip(store, segment), fields(segment_id = %segment.id), err)]
+#[instrument(level = "debug", skip(store, stored), fields(segment_id = %stored.segment.id), err)]
 pub(crate) async fn migrate_slab_size(
     store: &CassandraTriggerStore,
-    mut segment: Segment,
+    stored: StoredSegment,
     desired_slab_size: CompactDuration,
-) -> Result<Segment, CassandraTriggerStoreError> {
+) -> Result<StoredSegment, CassandraTriggerStoreError> {
+    let segment = &stored.segment;
     let segment_id = segment.id;
     let old_slab_size = segment.slab_size;
 
@@ -548,7 +541,7 @@ pub(crate) async fn migrate_slab_size(
              {:?}). Run version migration first.",
             segment.version
         );
-        return Ok(segment);
+        return Ok(stored);
     }
 
     info!(
@@ -566,12 +559,12 @@ pub(crate) async fn migrate_slab_size(
 
     // Phase 2: Migrate triggers to new slabs with recalculated slab IDs
     let new_slab_ids =
-        migrate_triggers_to_new_slabs(store, &segment, &old_slab_ids, desired_slab_size).await?;
+        migrate_triggers_to_new_slabs(store, segment, &old_slab_ids, desired_slab_size).await?;
 
-    // Phase 3: Update segment slab_size (atomic marker indicating migration
-    // complete). The same write clears the watermark, which is a slab id in
-    // the old slab size.
-    store.update_segment_slab_size(desired_slab_size).await?;
+    // Phase 3: Update segment slab_size and the converted watermark (atomic
+    // marker indicating migration complete)
+    let resized = stored.resize(desired_slab_size);
+    store.update_segment_slab_size(&resized).await?;
 
     info!(
         "Successfully migrated segment {segment_id}, slab_size updated from {old_slab_size} to \
@@ -579,9 +572,14 @@ pub(crate) async fn migrate_slab_size(
     );
 
     // Phase 4: Clean up old slabs with overlap protection (best-effort)
-    cleanup_old_slabs_with_overlap_protection(store, &segment, old_slab_ids, &new_slab_ids).await;
+    cleanup_old_slabs_with_overlap_protection(
+        store,
+        segment_id,
+        old_slab_size,
+        old_slab_ids,
+        &new_slab_ids,
+    )
+    .await;
 
-    // Update segment slab_size and return
-    segment.slab_size = desired_slab_size;
-    Ok(segment)
+    Ok(resized)
 }

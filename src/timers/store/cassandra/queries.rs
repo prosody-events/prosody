@@ -44,8 +44,8 @@ cassandra_queries! {
         /// it finds a live slab row. Deleted slabs leave row tombstones at low
         /// `slab_id`. `ORDER BY slab_id DESC` starts at the high end, so it
         /// skips them when a live slab row exists. An idle segment has no live
-        /// slab row. Its read walks every tombstone: at most one for each slab
-        /// interval during `gc_grace_seconds`, or 240 at the default 1-hour slab
+        /// slab row. Its read walks every tombstone: about `gc_grace_seconds`
+        /// divided by the slab size, for example 14,400 at a 1-minute slab
         /// size. A separate table for the static columns needs a segment
         /// version fence. Older versions treat an unknown version as
         /// `Terminal`.
@@ -162,10 +162,9 @@ cassandra_queries! {
             TABLE_SEGMENTS
         ),
 
-        /// Updates segment slab size and clears the watermark measured in the
-        /// old slab size.
+        /// Updates segment slab size and slab watermark. See `StoredSegment`.
         update_segment_slab_size: (
-            "UPDATE $keyspace.{} SET slab_size = ?, slab_watermark = null WHERE id = ?",
+            "UPDATE $keyspace.{} SET slab_size = ?, slab_watermark = ? WHERE id = ?",
             TABLE_SEGMENTS
         ),
 

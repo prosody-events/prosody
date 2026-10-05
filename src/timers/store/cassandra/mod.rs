@@ -34,6 +34,7 @@ use scylla::serialize::row::SerializeRow;
 use scylla::statement::prepared::PreparedStatement;
 use state::{CachedState, StateCacheKey};
 use std::sync::Arc;
+use tracing::instrument;
 
 mod error;
 mod mutators;
@@ -163,6 +164,36 @@ impl CassandraTriggerStore {
     /// Only used during V1→V2 migration.
     pub(crate) fn v1(&self) -> v1::V1Operations {
         v1::V1Operations::new(self.store.clone(), Arc::clone(&self.queries))
+    }
+
+    /// Writes the segment version: the commit point of a version migration.
+    #[instrument(level = "debug", skip(self), err)]
+    async fn update_segment_version(
+        &self,
+        version: SegmentVersion,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        self.execute_unpaged_discard(
+            &self.queries().update_segment_version,
+            (version, self.segment.id),
+        )
+        .await
+    }
+
+    /// Writes the slab size and slab watermark of `segment` in one update:
+    /// the commit point of a slab-size migration.
+    #[instrument(level = "debug", skip(self), err)]
+    async fn update_segment_slab_size(
+        &self,
+        segment: &StoredSegment,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        let watermark = segment
+            .slab_watermark
+            .map(|w| i32::from_le_bytes(w.to_le_bytes()));
+        self.execute_unpaged_discard(
+            &self.queries().update_segment_slab_size,
+            (segment.segment.slab_size, watermark, self.segment.id),
+        )
+        .await
     }
 
     /// Reads a segment from the database without applying any migrations.

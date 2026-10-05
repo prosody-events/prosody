@@ -3,10 +3,9 @@
 use super::InMemoryTriggerStore;
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentVersion, StoredSegment};
+use crate::timers::store::{Segment, StoredSegment};
 use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
 use futures::TryStreamExt;
@@ -432,32 +431,5 @@ impl TriggerOperations for InMemoryTriggerStore {
         };
         // entry.get() returns &BTreeMap<...>; then look up by clustering key.
         Ok(entry.get().get(&clustering_key).cloned())
-    }
-
-    // -- Segment migration markers --
-
-    async fn update_segment_version(&self, new_version: SegmentVersion) -> Result<(), Self::Error> {
-        self.inner
-            .segments
-            .update_async(&self.segment.id, |_, (_, _, version)| {
-                *version = new_version;
-            })
-            .await;
-        Ok(())
-    }
-
-    async fn update_segment_slab_size(
-        &self,
-        new_slab_size: CompactDuration,
-    ) -> Result<(), Self::Error> {
-        let segment_id = self.segment.id;
-        self.inner
-            .segments
-            .update_async(&segment_id, |_, (_, slab_size, _)| {
-                *slab_size = new_slab_size;
-            })
-            .await;
-        self.inner.slab_watermarks.remove_async(&segment_id).await;
-        Ok(())
     }
 }

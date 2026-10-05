@@ -21,6 +21,7 @@
 //!       the watermark lowers the watermark, preserves compact ownership, and
 //!       activates the trigger.
 
+mod seed;
 pub(crate) mod support;
 
 use super::actor::{
