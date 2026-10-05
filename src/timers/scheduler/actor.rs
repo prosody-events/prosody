@@ -14,7 +14,7 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::queue::TriggerQueue;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::{Segment, TriggerStore};
+use crate::timers::store::{Segment, StoredSegment, TriggerStore};
 use crate::timers::{DELETE_CONCURRENCY, Trigger};
 use futures::{StreamExt, TryStreamExt, stream};
 use rand::RngExt;
@@ -60,8 +60,9 @@ pub(super) struct ActorState<T> {
     /// Last persisted value of `slab_watermark` for this segment.
     ///
     /// Invariant I1: when `Some(w)`, every clustering row in `timer_segments`
-    /// for this segment has `slab_id > w`. `None` means the column was never
-    /// written; treated as "scan from slab 0" by the scheduler.
+    /// for this segment has `slab_id > w`. `None` means the column is null;
+    /// the scheduler then scans from slab 0. The actor seeds it from the
+    /// [`StoredSegment`] it receives.
     pub(super) last_persisted_watermark: Option<SlabId>,
     /// Highest slab ID `load_step` has scanned to. Tracks loading progress
     /// so we know where to resume next tick.
@@ -76,7 +77,7 @@ pub(super) struct ActorState<T> {
 /// emission, slab loading, and slab cleanup.
 pub(super) async fn run_actor<T>(
     store: T,
-    segment: Segment,
+    segment: StoredSegment,
     mut triggers: TriggerQueue,
     mut commands: mpsc::Receiver<Command<T::Error>>,
     trigger_tx: mpsc::Sender<Trigger>,
@@ -85,24 +86,18 @@ pub(super) async fn run_actor<T>(
 ) where
     T: TriggerStore,
 {
+    let (segment, last_persisted_watermark) = segment.into_parts();
     let preload_window = calculate_preload(segment.slab_size);
     let now = Instant::now();
     let mut state: ActorState<T> = ActorState {
         store,
         segment,
         known_slab_ids: BTreeSet::new(),
-        last_persisted_watermark: None,
+        last_persisted_watermark,
         highest_loaded_slab_id: None,
         preload_window,
         next_load_at: now,
     };
-
-    // Seed `last_persisted_watermark` from the store. A read failure
-    // degrades to "scan from 0", matching the NULL-watermark case.
-    match state.store.get_slab_watermark().await {
-        Ok(w) => state.last_persisted_watermark = w,
-        Err(e) => warn!("Failed to read slab_watermark on startup: {e:#}"),
-    }
 
     let mut trigger_to_send: Option<Trigger> = None;
 

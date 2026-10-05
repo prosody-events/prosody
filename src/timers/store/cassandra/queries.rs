@@ -38,15 +38,19 @@ cassandra_queries! {
             TABLE_SEGMENTS
         ),
 
-        /// Gets segment metadata by ID.
+        /// Gets segment metadata and the slab watermark by ID.
         ///
-        /// Selects only static columns. `ORDER BY slab_id DESC` resolves the
-        /// row on the live tail of the partition — the sweeper (PR #34) leaves
-        /// a tombstone graveyard at low `slab_id`, and a forward `LIMIT 1`
-        /// walks straight through it on every startup. Reverse scan is the
-        /// same I/O cost when paired with `LIMIT 1` and skips the graveyard.
+        /// Selects only static columns, so Cassandra reads the partition until
+        /// it finds a live slab row. Deleted slabs leave row tombstones at low
+        /// `slab_id`. `ORDER BY slab_id DESC` starts at the high end, so it
+        /// skips them when a live slab row exists. An idle segment has no live
+        /// slab row. Its read walks every tombstone: at most one for each slab
+        /// interval during `gc_grace_seconds`, or 240 at the default 1-hour slab
+        /// size. Moving the static columns to their own table needs a segment
+        /// version fence, and older versions treat an unknown version as
+        /// `Terminal`.
         get_segment: (
-            "SELECT name, slab_size, version FROM $keyspace.{} WHERE id = ? ORDER BY slab_id DESC LIMIT 1",
+            "SELECT name, slab_size, version, slab_watermark FROM $keyspace.{} WHERE id = ? ORDER BY slab_id DESC LIMIT 1",
             TABLE_SEGMENTS
         ),
 
@@ -401,20 +405,6 @@ cassandra_queries! {
         // =========================================================================
         // Slab Watermark Operations
         // =========================================================================
-
-        /// Reads the static `slab_watermark` column for a segment.
-        ///
-        /// Returns `Option<i32>` (Cassandra static columns are NULL until set).
-        /// `None` = pre-migration / fresh segment → scheduler scans from `slab_id = 0`.
-        ///
-        /// `ORDER BY slab_id DESC` resolves on the live tail of the partition
-        /// — see `get_segment` for the full rationale; this query is read
-        /// once per scheduler-actor spawn and was a primary source of
-        /// `tombstone_warn_threshold` warnings on Kafka rebalance.
-        get_slab_watermark: (
-            "SELECT slab_watermark FROM $keyspace.{} WHERE id = ? ORDER BY slab_id DESC LIMIT 1",
-            TABLE_SEGMENTS
-        ),
 
         /// Updates `slab_watermark` (static column) with TTL.
         set_slab_watermark: (

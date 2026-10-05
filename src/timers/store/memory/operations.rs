@@ -6,7 +6,7 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentVersion};
+use crate::timers::store::{Segment, SegmentVersion, StoredSegment};
 use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
 use futures::TryStreamExt;
@@ -38,25 +38,34 @@ impl TriggerOperations for InMemoryTriggerStore {
         Ok(())
     }
 
-    async fn get_segment(&self) -> Result<Option<Segment>, Self::Error> {
-        let segment_id = self.segment.id;
-        Ok(self.inner.segments.get_async(&segment_id).await.map(|e| {
-            let (name, slab_size, version) = e.get();
-            Segment {
-                id: segment_id,
+    async fn get_segment(&self) -> Result<Option<StoredSegment>, Self::Error> {
+        let id = self.segment.id;
+        let Some(segment) = self
+            .inner
+            .segments
+            .read_async(&id, |_, (name, slab_size, version)| Segment {
+                id,
                 name: name.clone(),
                 slab_size: *slab_size,
                 version: *version,
-            }
-        }))
+            })
+            .await
+        else {
+            return Ok(None);
+        };
+
+        let watermark = self.inner.slab_watermarks.read_async(&id, |_, w| *w).await;
+        Ok(Some(StoredSegment::new(segment, watermark)))
     }
 
     async fn delete_segment(&self) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
-        // Remove from both the segments map and the segment_slabs map.
+        // Remove the segment, its slabs, and its watermark, like the Cassandra
+        // partition delete.
         join!(
             self.inner.segments.remove_async(&segment_id),
-            self.inner.segment_slabs.remove_async(&segment_id)
+            self.inner.segment_slabs.remove_async(&segment_id),
+            self.inner.slab_watermarks.remove_async(&segment_id)
         );
 
         Ok(())
@@ -118,16 +127,6 @@ impl TriggerOperations for InMemoryTriggerStore {
         }
 
         Ok(())
-    }
-
-    async fn get_slab_watermark(&self) -> Result<Option<SlabId>, Self::Error> {
-        let segment_id = self.segment.id;
-        Ok(self
-            .inner
-            .slab_watermarks
-            .get_async(&segment_id)
-            .await
-            .map(|entry| *entry.get()))
     }
 
     async fn set_slab_watermark(&self, watermark: Option<SlabId>) -> Result<(), Self::Error> {

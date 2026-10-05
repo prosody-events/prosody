@@ -52,7 +52,7 @@ use crate::Key;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::Slab;
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentId, SegmentVersion, SlabId};
+use crate::timers::store::{Segment, SegmentId, SegmentVersion, SlabId, StoredSegment};
 use crate::timers::{DELETE_CONCURRENCY, TimerType, Trigger};
 
 /// Maximum concurrent slab migrations.
@@ -88,9 +88,9 @@ use tracing::{debug, info, instrument, warn};
 #[instrument(level = "debug", skip(store), err)]
 pub(crate) async fn migrate_segment_if_needed(
     store: &CassandraTriggerStore,
-    mut segment: Segment,
+    mut segment: StoredSegment,
     desired_slab_size: CompactDuration,
-) -> Result<Segment, CassandraTriggerStoreError> {
+) -> Result<StoredSegment, CassandraTriggerStoreError> {
     // Phase 1: V1→V2 schema migration
     if needs_migration(&segment) {
         segment = migrate_segment_version(store, segment).await?;
@@ -108,7 +108,7 @@ pub(crate) async fn migrate_segment_if_needed(
 
     if segment.version == SegmentVersion::V3 {
         store.update_segment_version(SegmentVersion::V4).await?;
-        segment.version = SegmentVersion::V4;
+        segment.set_version(SegmentVersion::V4);
     }
 
     Ok(segment)
@@ -140,8 +140,8 @@ pub(crate) fn needs_key_state_migration(segment: &Segment) -> bool {
 #[instrument(level = "debug", skip(store, segment), fields(segment_id = %segment.id), err)]
 pub(crate) async fn migrate_segment_version(
     store: &CassandraTriggerStore,
-    mut segment: Segment,
-) -> Result<Segment, CassandraTriggerStoreError> {
+    mut segment: StoredSegment,
+) -> Result<StoredSegment, CassandraTriggerStoreError> {
     let segment_id = segment.id;
     info!("Starting v1 to v2 migration for segment {segment_id}");
 
@@ -236,7 +236,7 @@ pub(crate) async fn migrate_segment_version(
     }
 
     // Update segment version and return
-    segment.version = SegmentVersion::V2;
+    segment.set_version(SegmentVersion::V2);
     Ok(segment)
 }
 
@@ -304,8 +304,8 @@ async fn cleanup_v1_data(
 #[instrument(level = "debug", skip(store, segment), fields(segment_id = %segment.id), err)]
 pub(crate) async fn migrate_key_states(
     store: &CassandraTriggerStore,
-    mut segment: Segment,
-) -> Result<Segment, CassandraTriggerStoreError> {
+    mut segment: StoredSegment,
+) -> Result<StoredSegment, CassandraTriggerStoreError> {
     let segment_id = segment.id;
     info!("Starting V2→V3 key state migration for segment {segment_id}");
 
@@ -365,7 +365,7 @@ pub(crate) async fn migrate_key_states(
 
     info!("Successfully migrated segment {segment_id} from V2 to V3");
 
-    segment.version = SegmentVersion::V3;
+    segment.set_version(SegmentVersion::V3);
     Ok(segment)
 }
 
@@ -536,9 +536,9 @@ async fn cleanup_old_slabs_with_overlap_protection(
 #[instrument(level = "debug", skip(store, segment), fields(segment_id = %segment.id), err)]
 pub(crate) async fn migrate_slab_size(
     store: &CassandraTriggerStore,
-    mut segment: Segment,
+    mut segment: StoredSegment,
     desired_slab_size: CompactDuration,
-) -> Result<Segment, CassandraTriggerStoreError> {
+) -> Result<StoredSegment, CassandraTriggerStoreError> {
     let segment_id = segment.id;
     let old_slab_size = segment.slab_size;
 
@@ -585,7 +585,6 @@ pub(crate) async fn migrate_slab_size(
     // Phase 4: Clean up old slabs with overlap protection (best-effort)
     cleanup_old_slabs_with_overlap_protection(store, &segment, old_slab_ids, &new_slab_ids).await;
 
-    // Update segment slab_size and return
-    segment.slab_size = desired_slab_size;
+    segment.resize(desired_slab_size);
     Ok(segment)
 }

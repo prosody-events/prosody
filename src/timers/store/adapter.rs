@@ -13,7 +13,7 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentId, TriggerStore};
+use crate::timers::store::{Segment, SegmentId, StoredSegment, TriggerStore};
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use std::future::Future;
 use std::ops::RangeInclusive;
@@ -84,7 +84,9 @@ where
     // Pass-through methods: Delegate directly to operations
     // ===================================================================
 
-    fn get_segment(&self) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send {
+    fn get_segment(
+        &self,
+    ) -> impl Future<Output = Result<Option<StoredSegment>, Self::Error>> + Send {
         self.operations.get_segment()
     }
 
@@ -113,12 +115,6 @@ where
 
     fn delete_slab(&self, slab_id: SlabId) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.operations.delete_slab(slab_id)
-    }
-
-    fn get_slab_watermark(
-        &self,
-    ) -> impl Future<Output = Result<Option<SlabId>, Self::Error>> + Send {
-        self.operations.get_slab_watermark()
     }
 
     fn set_slab_watermark(

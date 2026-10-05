@@ -11,7 +11,7 @@ use crate::error::ClassifyError;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::{Segment, SegmentVersion};
+use crate::timers::store::{Segment, SegmentVersion, StoredSegment};
 use crate::timers::{TimerType, Trigger};
 use futures::Stream;
 use smallvec::SmallVec;
@@ -53,8 +53,10 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     /// Persists this store's segment configuration.
     fn insert_segment(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Retrieves this store's segment from persistent storage.
-    fn get_segment(&self) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send;
+    /// Retrieves this store's segment and slab watermark in one read.
+    fn get_segment(
+        &self,
+    ) -> impl Future<Output = Result<Option<StoredSegment>, Self::Error>> + Send;
 
     /// Deletes this store's segment and all associated metadata.
     fn delete_segment(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -78,15 +80,6 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
 
     /// Unregisters (deletes) a slab ID from this store's segment.
     fn delete_slab(&self, slab_id: SlabId) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Reads the persisted `slab_watermark` for this segment.
-    ///
-    /// `None` = pre-migration / fresh segment → callers should treat as
-    /// "scan from slab 0". When `Some(w)`, every slab clustering row in this
-    /// segment has `slab_id > w` (invariant I1).
-    fn get_slab_watermark(
-        &self,
-    ) -> impl Future<Output = Result<Option<SlabId>, Self::Error>> + Send;
 
     /// Persists `slab_watermark` for this segment as a single UPDATE.
     ///

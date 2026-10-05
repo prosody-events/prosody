@@ -23,8 +23,9 @@ use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
+use crate::timers::slab::SlabId;
 use crate::timers::store::cassandra::queries::Queries;
-use crate::timers::store::{Segment, SegmentId, SegmentVersion};
+use crate::timers::store::{Segment, SegmentId, SegmentVersion, StoredSegment};
 use educe::Educe;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use quick_cache::sync::Cache;
@@ -171,7 +172,7 @@ impl CassandraTriggerStore {
     pub(super) async fn get_segment_unchecked(
         &self,
         segment_id: &SegmentId,
-    ) -> Result<Option<Segment>, CassandraTriggerStoreError> {
+    ) -> Result<Option<StoredSegment>, CassandraTriggerStoreError> {
         let row = self
             .session()
             .execute_unpaged(&self.queries().get_segment, (segment_id,))
@@ -179,20 +180,20 @@ impl CassandraTriggerStore {
             .map_err(CassandraStoreError::from)?
             .into_rows_result()
             .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<(String, CompactDuration, Option<SegmentVersion>)>()
+            .maybe_first_row::<(String, CompactDuration, Option<SegmentVersion>, Option<i32>)>()
             .map_err(CassandraStoreError::from)?;
 
-        let Some((name, slab_size, version)) = row else {
+        let Some((name, slab_size, version, slab_watermark)) = row else {
             return Ok(None);
         };
 
-        let version = version.unwrap_or(SegmentVersion::V1);
-
-        Ok(Some(Segment {
+        let segment = Segment {
             id: *segment_id,
             name,
             slab_size,
-            version,
-        }))
+            version: version.unwrap_or(SegmentVersion::V1),
+        };
+        let slab_watermark = slab_watermark.map(|w| SlabId::from_le_bytes(w.to_le_bytes()));
+        Ok(Some(StoredSegment::new(segment, slab_watermark)))
     }
 }

@@ -46,10 +46,7 @@ pub(super) async fn verify_segment_metadata(
     }
 
     // Invariant I1: every slab row lies above the watermark.
-    let watermark = store
-        .get_slab_watermark()
-        .await
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to get slab watermark: {e:?}"))?;
+    let (segment, watermark) = segment.into_parts();
     if watermark != model.slab_watermark
         || watermark.is_some_and(|w| model.expected_slab_ids().iter().any(|&slab| slab <= w))
     {

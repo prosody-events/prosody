@@ -72,6 +72,12 @@ fn fresh_state(store: TestStore, segment: Segment) -> ActorState<TestStore> {
     }
 }
 
+/// Reads the persisted slab watermark through the segment read.
+async fn persisted_watermark(store: &TestStore) -> Option<SlabId> {
+    let Ok(segment) = store.get_segment().await;
+    segment.and_then(|segment| segment.into_parts().1)
+}
+
 // ===================================================================
 // Pure helper tests
 // ===================================================================
@@ -426,11 +432,7 @@ impl Fixture {
 
     async fn apply_restart(&mut self) -> StdResult<(), String> {
         self.state = fresh_state(self.store.clone(), self.segment.clone());
-        self.state.last_persisted_watermark = self
-            .store
-            .get_slab_watermark()
-            .await
-            .map_err(|e| format!("get_slab_watermark on restart: {e:?}"))?;
+        self.state.last_persisted_watermark = persisted_watermark(&self.store).await;
         self.triggers = TriggerQueue::new();
         for model in self.expected.values_mut() {
             model.active_state = None;
@@ -617,11 +619,7 @@ impl Fixture {
                 "P3 violated: watermark={w} but slab {min_slab} present"
             ));
         }
-        let persisted_watermark = self
-            .store
-            .get_slab_watermark()
-            .await
-            .map_err(|e| format!("get_slab_watermark: {e:?}"))?;
+        let persisted_watermark = persisted_watermark(&self.store).await;
         if persisted_watermark != watermark {
             return Err(format!(
                 "watermark drift: actor={watermark:?} store={persisted_watermark:?}"
@@ -801,7 +799,7 @@ async fn test_cleanup_preserves_aborted_timer_slab_and_reload_schedules_it() -> 
     );
 
     let mut reloaded_state = fresh_state(store.clone(), segment.clone());
-    reloaded_state.last_persisted_watermark = store.get_slab_watermark().await?;
+    reloaded_state.last_persisted_watermark = persisted_watermark(&store).await;
     let mut reloaded_triggers = TriggerQueue::new();
     load_step(&mut reloaded_state, &mut reloaded_triggers).await;
 

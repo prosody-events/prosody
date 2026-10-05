@@ -1566,26 +1566,15 @@ async fn prop_timer_state_invariant(
     Ok(())
 }
 
-/// Regression test for `tombstone_warn_threshold` warnings emitted by
-/// `get_segment` and `get_slab_watermark` on actor startup.
+/// The segment read skips the deleted slabs below a live slab row.
 ///
-/// Both queries select only static columns from `timer_segments` with
-/// `LIMIT 1`. With no clustering predicate, Cassandra walks the iterator
-/// from the bottom up to materialise the static row — straight through
-/// the tombstone graveyard the load-driven sweeper (PR #34) leaves at
-/// low `slab_id`. Appending `ORDER BY slab_id DESC` resolves on the
-/// live tail and skips the graveyard entirely.
-///
-/// This test seeds that exact partition shape — a dense band of
-/// tombstones at low `slab_id`, a small set of live rows above the
-/// watermark, and `slab_watermark` raised to the boundary — and asserts
-/// the two reads return the correct values. The assertion is purely
-/// behavioural; the explicit `ORDER BY slab_id DESC` in
-/// `queries.rs` is itself the durable statement about scan direction.
+/// The test seeds more tombstones at low `slab_id` than the default
+/// `tombstone_warn_threshold` of 1,000. Live slab rows sit above them, and
+/// the watermark sits between. The read must return no Cassandra warning and
+/// the correct static values.
 #[tokio::test]
 async fn test_segment_reads_skip_low_slab_tombstones() -> Result<()> {
-    /// Density of the tombstone band — chosen to mimic the post-sweeper
-    /// graveyard observed in production (~5k cells per segment partition).
+    /// About the tombstone count of one production segment partition.
     const TOMBSTONE_COUNT: u32 = 5_000;
 
     init_test_logging();
@@ -1606,27 +1595,25 @@ async fn test_segment_reads_skip_low_slab_tombstones() -> Result<()> {
         store.insert_slab(Slab::new(slab_id, slab_size)).await?;
     }
 
-    // Raise the watermark to the boundary — same as the sweeper would.
     let watermark = TOMBSTONE_COUNT;
     store.set_slab_watermark(Some(watermark)).await?;
 
-    // `get_segment`: forward scan walked the graveyard; reverse scan
-    // resolves on a live row at the top of the partition.
-    let segment = store
+    let result = store
+        .session()
+        .execute_unpaged(&store.queries().get_segment, (segment_id,))
+        .await?;
+    let warnings: Vec<&str> = result.warnings().collect();
+    assert!(warnings.is_empty(), "segment read warned: {warnings:?}");
+
+    let (segment, observed_watermark) = store
         .get_segment()
         .await?
-        .ok_or_else(|| color_eyre::eyre::eyre!("segment missing after insert"))?;
-    assert_eq!(segment.id, segment_id);
-    assert_eq!(segment.name, segment_name);
-    assert_eq!(segment.slab_size, slab_size);
-
-    // `get_slab_watermark`: same partition, same problem, same fix.
-    let observed_watermark = store.get_slab_watermark().await?;
-    assert_eq!(
-        observed_watermark,
-        Some(watermark),
-        "watermark roundtrip should ignore low-slab tombstones",
-    );
+        .ok_or_else(|| color_eyre::eyre::eyre!("segment missing after insert"))?
+        .into_parts();
+    assert_eq!(segment.id, segment_id, "segment id");
+    assert_eq!(segment.name, segment_name, "segment name");
+    assert_eq!(segment.slab_size, slab_size, "segment slab size");
+    assert_eq!(observed_watermark, Some(watermark), "slab watermark");
 
     store.delete_segment().await?;
     Ok(())

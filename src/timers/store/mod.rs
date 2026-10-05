@@ -32,7 +32,7 @@ use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::ops::RangeInclusive;
+use std::ops::{Deref, RangeInclusive};
 use uuid::Uuid;
 
 /// Cassandra-based persistent storage implementation.
@@ -206,6 +206,61 @@ impl Segment {
     }
 }
 
+/// A [`Segment`] as persisted, with its slab watermark.
+///
+/// The watermark is a slab id, so the segment slab size measures it. When it
+/// is set, every slab row of the segment has a higher slab id. Only the store
+/// sets the watermark, and a slab-size change clears it. Thus a watermark never
+/// pairs with a different slab size. `Deref` gives read access to the segment
+/// fields. There is no `DerefMut`, so the slab size changes only through
+/// `resize`.
+#[derive(Clone, Debug)]
+pub struct StoredSegment {
+    segment: Segment,
+    slab_watermark: Option<SlabId>,
+}
+
+impl StoredSegment {
+    /// Pairs a segment with the watermark read from the same row.
+    pub(in crate::timers::store) fn new(segment: Segment, slab_watermark: Option<SlabId>) -> Self {
+        Self {
+            segment,
+            slab_watermark,
+        }
+    }
+
+    /// Splits into the segment and its slab watermark.
+    pub(crate) fn into_parts(self) -> (Segment, Option<SlabId>) {
+        (self.segment, self.slab_watermark)
+    }
+
+    /// Sets the schema version. The watermark does not depend on it.
+    pub(in crate::timers::store) fn set_version(&mut self, version: SegmentVersion) {
+        self.segment.version = version;
+    }
+
+    /// Sets the slab size and clears the watermark of the old slab size.
+    pub(in crate::timers::store) fn resize(&mut self, slab_size: CompactDuration) {
+        self.segment.slab_size = slab_size;
+        self.slab_watermark = None;
+    }
+}
+
+/// A new segment has no slab watermark.
+impl From<Segment> for StoredSegment {
+    fn from(segment: Segment) -> Self {
+        Self::new(segment, None)
+    }
+}
+
+impl Deref for StoredSegment {
+    type Target = Segment;
+
+    fn deref(&self) -> &Segment {
+        &self.segment
+    }
+}
+
 /// Factory for segment-scoped [`TriggerStore`] instances.
 ///
 /// Holds shared resources and creates per-segment stores; store creation is
@@ -266,8 +321,11 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     // Segment Operations (2 methods) - Used by Loader
     // ===================================================================
 
-    /// Retrieves this store's segment metadata from persistent storage.
-    fn get_segment(&self) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send;
+    /// Retrieves this store's segment metadata and slab watermark from
+    /// persistent storage in one read.
+    fn get_segment(
+        &self,
+    ) -> impl Future<Output = Result<Option<StoredSegment>, Self::Error>> + Send;
 
     /// Persists this store's segment metadata.
     fn insert_segment(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -303,17 +361,8 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     fn delete_slab(&self, slab_id: SlabId) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // ===================================================================
-    // Slab Watermark Operations (3 methods) - Used by SchedulerActor
+    // Slab Watermark Operations (2 methods) - Used by SchedulerActor
     // ===================================================================
-
-    /// Reads the persisted `slab_watermark` for this segment.
-    ///
-    /// `None` = pre-migration / fresh segment → callers should treat as
-    /// "scan from slab 0". When `Some(w)`, every slab clustering row in this
-    /// segment has `slab_id > w`.
-    fn get_slab_watermark(
-        &self,
-    ) -> impl Future<Output = Result<Option<SlabId>, Self::Error>> + Send;
 
     /// Persists `slab_watermark` for this segment.
     fn set_slab_watermark(

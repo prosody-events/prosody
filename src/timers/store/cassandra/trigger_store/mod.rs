@@ -43,7 +43,7 @@ use crate::timers::store::cassandra::CassandraTriggerStore;
 use crate::timers::store::cassandra::error::CassandraTriggerStoreError;
 use crate::timers::store::cassandra::migration;
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentVersion};
+use crate::timers::store::{Segment, SegmentVersion, StoredSegment};
 use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
 use futures::{Stream, TryStreamExt, pin_mut};
@@ -86,7 +86,7 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self), err)]
-    async fn get_segment(&self) -> Result<Option<Segment>, Self::Error> {
+    async fn get_segment(&self) -> Result<Option<StoredSegment>, Self::Error> {
         let segment_id = &self.segment.id;
         let Some(segment) = self.get_segment_unchecked(segment_id).await? else {
             return Ok(None);
@@ -205,24 +205,6 @@ impl TriggerOperations for CassandraTriggerStore {
             .map_err(CassandraStoreError::from)?;
 
         Ok(())
-    }
-
-    #[instrument(level = "debug", skip(self), err)]
-    async fn get_slab_watermark(&self) -> Result<Option<SlabId>, Self::Error> {
-        let segment_id = self.segment.id;
-        let row = self
-            .session()
-            .execute_unpaged(&self.queries().get_slab_watermark, (segment_id,))
-            .await
-            .map_err(CassandraStoreError::from)?
-            .into_rows_result()
-            .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<(Option<i32>,)>()
-            .map_err(CassandraStoreError::from)?;
-
-        Ok(row
-            .and_then(|(w,)| w)
-            .map(|w| SlabId::from_le_bytes(w.to_le_bytes())))
     }
 
     #[instrument(level = "debug", skip(self), err)]
