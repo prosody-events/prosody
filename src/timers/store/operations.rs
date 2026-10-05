@@ -233,13 +233,19 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Option<Trigger>, Self::Error>> + Send;
 
     // =========================================================================
-    // Version Management (1 method)
+    // Segment Migration Markers (2 methods)
     // =========================================================================
 
-    /// Updates the schema version and slab size for this store's segment.
+    /// Updates the schema version for this store's segment.
     fn update_segment_version(
         &self,
         new_version: SegmentVersion,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Updates the slab size for this store's segment and clears its slab
+    /// watermark in one write. The watermark is a slab id in the old slab size.
+    fn update_segment_slab_size(
+        &self,
         new_slab_size: CompactDuration,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

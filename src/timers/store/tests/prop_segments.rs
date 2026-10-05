@@ -48,7 +48,8 @@ pub struct SegmentTestInput {
 
 impl Arbitrary for SegmentTestInput {
     fn arbitrary(g: &mut Gen) -> Self {
-        // Generate a slab size for this test (1 second to 7 days to avoid TTL overflow)
+        // Generate a slab size for this test (1 second to 7 days to avoid TTL
+        // overflow)
         let slab_size = CompactDuration::new(u32::arbitrary(g).clamp(1, 604_800));
 
         // Generate 10-50 operations
@@ -126,7 +127,8 @@ impl SegmentModel {
         match op {
             SegmentOperation::Insert => {
                 self.present = true;
-                // insert_segment writes the base segment; reset version/slab_size
+                // insert_segment writes the base segment; reset
+                // version/slab_size
                 self.version = self.base.version;
                 self.slab_size = self.base.slab_size;
             }
@@ -283,10 +285,16 @@ where
             }
             SegmentOperation::UpdateVersion { version, slab_size } => {
                 operations
-                    .update_segment_version(*version, *slab_size)
+                    .update_segment_version(*version)
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} UpdateVersion failed: {e:?}")
+                    })?;
+                operations
+                    .update_segment_slab_size(*slab_size)
+                    .await
+                    .map_err(|e| {
+                        color_eyre::eyre::eyre!("Op #{op_idx} UpdateSlabSize failed: {e:?}")
                     })?;
             }
         }

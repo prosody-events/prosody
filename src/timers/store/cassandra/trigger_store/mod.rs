@@ -378,25 +378,27 @@ impl TriggerOperations for CassandraTriggerStore {
         read::current(self, key, time, timer_type)
     }
 
-    // -- V1 migration methods --
+    // -- Segment migration markers --
 
-    /// Updates the segment's version field after v1 to v2 migration.
     #[instrument(level = "debug", skip(self), err)]
-    async fn update_segment_version(
+    async fn update_segment_version(&self, new_version: SegmentVersion) -> Result<(), Self::Error> {
+        self.execute_unpaged_discard(
+            &self.queries().update_segment_version,
+            (new_version, self.segment.id),
+        )
+        .await
+    }
+
+    #[instrument(level = "debug", skip(self), err)]
+    async fn update_segment_slab_size(
         &self,
-        new_version: SegmentVersion,
         new_slab_size: CompactDuration,
     ) -> Result<(), Self::Error> {
-        let segment_id = self.segment.id;
-        self.session()
-            .execute_unpaged(
-                &self.queries().update_segment_version,
-                (new_version, new_slab_size.seconds() as i32, segment_id),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?;
-
-        Ok(())
+        self.execute_unpaged_discard(
+            &self.queries().update_segment_slab_size,
+            (new_slab_size, self.segment.id),
+        )
+        .await
     }
 }
 

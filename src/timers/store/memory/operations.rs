@@ -395,7 +395,8 @@ impl TriggerOperations for InMemoryTriggerStore {
             .await
             .or_default();
 
-        // Collect old times before clearing (exclude the new trigger's own time).
+        // Collect old times before clearing (exclude the new trigger's own
+        // time).
         let old_times: SmallVec<[CompactDateTime; 1]> = entry
             .get()
             .keys()
@@ -403,7 +404,8 @@ impl TriggerOperations for InMemoryTriggerStore {
             .map(|(_, time)| *time)
             .collect();
 
-        // Clear all existing triggers for this timer_type, then insert the new one.
+        // Clear all existing triggers for this timer_type, then insert the new
+        // one.
         entry
             .get_mut()
             .retain(|(t_type, _time), _| *t_type != trigger.timer_type);
@@ -435,24 +437,30 @@ impl TriggerOperations for InMemoryTriggerStore {
         Ok(entry.get().get(&clustering_key).cloned())
     }
 
-    // -- V1 migration methods --
+    // -- Segment migration markers --
 
-    /// Update segment metadata including version and slab size.
-    async fn update_segment_version(
+    async fn update_segment_version(&self, new_version: SegmentVersion) -> Result<(), Self::Error> {
+        self.inner
+            .segments
+            .update_async(&self.segment.id, |_, (_, _, version)| {
+                *version = new_version;
+            })
+            .await;
+        Ok(())
+    }
+
+    async fn update_segment_slab_size(
         &self,
-        new_version: SegmentVersion,
         new_slab_size: CompactDuration,
     ) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
-        if let Some(entry) = self.inner.segments.get_async(&segment_id).await {
-            let (name, ..) = entry.get();
-            let name = name.clone();
-            drop(entry);
-            self.inner
-                .segments
-                .upsert_async(segment_id, (name, new_slab_size, new_version))
-                .await;
-        }
+        self.inner
+            .segments
+            .update_async(&segment_id, |_, (_, slab_size, _)| {
+                *slab_size = new_slab_size;
+            })
+            .await;
+        self.inner.slab_watermarks.remove_async(&segment_id).await;
         Ok(())
     }
 }

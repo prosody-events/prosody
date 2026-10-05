@@ -49,6 +49,18 @@ pub struct MigrationTestInput {
     pub triggers: Vec<MigrationTriggerData>,
 }
 
+impl MigrationTestInput {
+    /// The slab watermark the scheduler leaves before migration: one below
+    /// the lowest slab, in the initial slab size.
+    fn initial_watermark(&self) -> Option<SlabId> {
+        self.triggers
+            .iter()
+            .map(|trigger| Slab::from_time(self.initial_slab_size, trigger.time).id())
+            .min()?
+            .checked_sub(1)
+    }
+}
+
 /// Trigger data for migration tests.
 #[derive(Clone, Debug)]
 pub struct MigrationTriggerData {
@@ -75,10 +87,11 @@ impl Arbitrary for MigrationTestInput {
             _ => SegmentVersion::V3,
         };
 
-        // Generate slab sizes (1 second to 7 days to avoid TTL overflow)
-        // Clamp to 604_800 seconds (7 days)
-        let initial_slab_size = CompactDuration::new(u32::arbitrary(g).clamp(1, 604_800));
-        let target_slab_size = CompactDuration::new(u32::arbitrary(g).clamp(1, 604_800));
+        // Slab sizes run from 1 second to 7 days, which avoids TTL overflow.
+        // Do not clamp: a clamp maps most draws to 7 days, so sizes rarely
+        // change.
+        let initial_slab_size = CompactDuration::new(u32::arbitrary(g) % 604_800 + 1);
+        let target_slab_size = CompactDuration::new(u32::arbitrary(g) % 604_800 + 1);
 
         // Generate 0-50 triggers (empty segments are valid test cases)
         let trigger_count = usize::arbitrary(g) % 51;
@@ -126,6 +139,9 @@ pub struct MigrationModel {
     /// V1→V2: All triggers become Application type.
     /// V2→V2/V3: Timer types preserved.
     pub triggers: HashSet<(Key, CompactDateTime, TimerType)>,
+    /// Expected slab watermark after migration. A slab-size change clears it,
+    /// because a slab id in the old size does not measure the new slabs.
+    pub slab_watermark: Option<SlabId>,
 }
 
 impl MigrationModel {
@@ -161,7 +177,15 @@ impl MigrationModel {
             triggers.insert((trigger_data.key.clone(), trigger_data.time, timer_type));
         }
 
-        Self { segment, triggers }
+        let slab_watermark = input
+            .initial_watermark()
+            .filter(|_| input.initial_slab_size == input.target_slab_size);
+
+        Self {
+            segment,
+            triggers,
+            slab_watermark,
+        }
     }
 
     /// Gets all unique slab IDs that triggers should be in.
@@ -346,7 +370,8 @@ pub async fn prop_migration_invariants(
         }
         SegmentVersion::V2 => {
             // Write true V2 layout: clustering rows + slab entries, no state
-            // MAP entries.  backfill_key_state must populate state from scratch.
+            // MAP entries.  backfill_key_state must populate state from
+            // scratch.
             let config = test_cassandra_config(TEST_KEYSPACE);
             let cassandra_base = CassandraStore::new(&config).await?;
             let segment = Segment {
@@ -387,6 +412,20 @@ pub async fn prop_migration_invariants(
         slab_size: input.target_slab_size,
         version: SegmentVersion::V3,
     };
+
+    // Seed the watermark through a store in the initial slab size, which
+    // anchors its TTL.
+    if let Some(watermark) = input.initial_watermark() {
+        let segment = Segment {
+            slab_size: input.initial_slab_size,
+            ..segment.clone()
+        };
+        CassandraTriggerStore::with_store(cassandra_base.clone(), &config.keyspace, segment)
+            .await?
+            .set_slab_watermark(Some(watermark))
+            .await?;
+    }
+
     let cassandra_store =
         CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment).await?;
     let store = TableAdapter::new(cassandra_store);

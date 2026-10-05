@@ -154,7 +154,15 @@ cassandra_queries! {
 
         /// Updates segment version
         update_segment_version: (
-            "UPDATE $keyspace.{} SET version = ?, slab_size = ? WHERE id = ?",
+            "UPDATE $keyspace.{} SET version = ? WHERE id = ?",
+            TABLE_SEGMENTS
+        ),
+
+        /// Updates segment slab size and clears the watermark measured in the
+        /// old slab size. Null is correct: a rewrite without a TTL makes the
+        /// watermark permanent.
+        update_segment_slab_size: (
+            "UPDATE $keyspace.{} SET slab_size = ?, slab_watermark = null WHERE id = ?",
             TABLE_SEGMENTS
         ),
 

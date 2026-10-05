@@ -16,8 +16,8 @@ use strum::VariantArray;
 
 /// Verifies that segment metadata is correct after migration.
 ///
-/// Expected: version=V2, `slab_size=target_slab_size`, name preserved (for V2
-/// only).
+/// Expected: version V4, the target slab size, the model slab watermark, and
+/// the initial name (not for V1).
 pub(super) async fn verify_segment_metadata(
     store: &TableAdapter<CassandraTriggerStore>,
     model: &MigrationModel,
@@ -42,6 +42,21 @@ pub(super) async fn verify_segment_metadata(
             "Segment slab_size mismatch: expected {:?}, got {:?}",
             model.segment.slab_size,
             segment.slab_size
+        ));
+    }
+
+    // Invariant I1: every slab row lies above the watermark.
+    let watermark = store
+        .get_slab_watermark()
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to get slab watermark: {e:?}"))?;
+    if watermark != model.slab_watermark
+        || watermark.is_some_and(|w| model.expected_slab_ids().iter().any(|&slab| slab <= w))
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "Slab watermark {watermark:?} differs from {:?} or is not below slabs {:?}",
+            model.slab_watermark,
+            model.expected_slab_ids()
         ));
     }
 
@@ -352,8 +367,9 @@ pub(super) async fn verify_key_state_invariant(
                     ));
                 }
 
-                // For singleton normalization: the clustering row must have been
-                // deleted — the trigger lives exclusively in the state MAP now.
+                // For singleton normalization: the clustering row must have
+                // been deleted — the trigger lives exclusively
+                // in the state MAP now.
                 let clustering_rows = store
                     .operations()
                     .peek_trigger_times(&model.segment.id, key, *timer_type)
