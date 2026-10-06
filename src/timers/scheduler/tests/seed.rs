@@ -6,12 +6,14 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::scheduler::TriggerScheduler;
+use crate::timers::scheduler::actor::seed_watermark;
 use crate::timers::slab::Slab;
 use crate::timers::store::TriggerStore;
 use crate::timers::store::memory::memory_store;
 use crate::timers::test_support::test_segment;
 use crate::timers::{TimerType, Trigger};
 use color_eyre::eyre::{Result, eyre};
+use quickcheck_macros::quickcheck;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::timeout;
@@ -52,4 +54,26 @@ async fn test_stale_watermark_does_not_hide_timers() -> Result<()> {
         .ok_or_else(|| eyre!("scheduler stopped"))?;
     assert_eq!(observed, trigger, "the actor must fire the hidden timer");
     Ok(())
+}
+
+/// The actor keeps exactly the watermarks below the current slab. Cleanup
+/// writes at most `current - 1`, so a valid watermark is never dropped.
+#[quickcheck]
+fn seed_watermark_keeps_only_watermarks_below_current_slab(
+    slab_seconds: u32,
+    now_seconds: u32,
+    other: u32,
+) -> bool {
+    let slab_size = CompactDuration::new(slab_seconds % 604_800 + 1);
+    let now = CompactDateTime::from(now_seconds);
+    let current = Slab::from_time(slab_size, now).id();
+    let other = other % current.saturating_mul(2).max(1);
+    let seed = |watermark| seed_watermark(watermark, slab_size, now);
+
+    seed(None).is_none()
+        && seed(Some(current)).is_none()
+        && current
+            .checked_sub(1)
+            .is_none_or(|top| seed(Some(top)) == Some(top))
+        && seed(Some(other)).is_some() == (other < current)
 }

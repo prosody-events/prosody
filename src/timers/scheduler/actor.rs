@@ -84,12 +84,10 @@ pub(super) async fn run_actor<T>(
     T: TriggerStore,
 {
     let (segment, watermark) = segment.into_parts();
-    // A valid watermark is below the current slab. An older version did not
-    // convert the watermark on a slab-size change, so discard a higher one.
-    let last_persisted_watermark = watermark.filter(|&watermark| {
-        CompactDateTime::now()
-            .is_ok_and(|now| watermark < Slab::from_time(segment.slab_size, now).id())
-    });
+    let last_persisted_watermark = match CompactDateTime::now() {
+        Ok(now) => seed_watermark(watermark, segment.slab_size, now),
+        Err(_) => None,
+    };
     let preload_window = calculate_preload(segment.slab_size);
     let now = Instant::now();
     let mut state: ActorState<T> = ActorState {
@@ -338,6 +336,17 @@ where
     if let Err(e) = maybe_advance_watermark(state, now_slab_id, &active_slab_ids).await {
         warn!("cleanup_step: failed to advance watermark: {e:#}");
     }
+}
+
+/// Keeps a stored watermark only if it is below the slab of `now`.
+/// An older version did not convert the watermark on a slab-size change,
+/// so a higher one is stale.
+pub(super) fn seed_watermark(
+    watermark: Option<SlabId>,
+    slab_size: CompactDuration,
+    now: CompactDateTime,
+) -> Option<SlabId> {
+    watermark.filter(|&watermark| watermark < Slab::from_time(slab_size, now).id())
 }
 
 fn cleanable_slab_end<T>(state: &ActorState<T>, now_slab_id: SlabId) -> Option<SlabId> {
