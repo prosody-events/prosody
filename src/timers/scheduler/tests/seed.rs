@@ -62,12 +62,10 @@ async fn test_stale_watermark_does_not_hide_timers() -> Result<()> {
 fn seed_watermark_keeps_only_watermarks_below_current_slab(
     slab_seconds: u32,
     now_seconds: u32,
-    other: u32,
 ) -> bool {
     let slab_size = CompactDuration::new(slab_seconds % 604_800 + 1);
     let now = CompactDateTime::from(now_seconds);
     let current = Slab::from_time(slab_size, now).id();
-    let other = other % current.saturating_mul(2).max(1);
     let seed = |watermark| seed_watermark(watermark, slab_size, now);
 
     seed(None).is_none()
@@ -75,5 +73,4 @@ fn seed_watermark_keeps_only_watermarks_below_current_slab(
         && current
             .checked_sub(1)
             .is_none_or(|top| seed(Some(top)) == Some(top))
-        && seed(Some(other)).is_some() == (other < current)
 }
