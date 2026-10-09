@@ -38,7 +38,8 @@ services:
       timeout: 10s
       retries: 15
   cassandra:
-    image: cassandra:latest
+    # The Docker official image, from ECR Public: no Docker Hub pull limit.
+    image: public.ecr.aws/docker/library/cassandra:latest
     ports:
       - "9042:9042"
     volumes:
@@ -49,7 +50,9 @@ services:
       timeout: 10s
       retries: 15
   console:
-    image: docker.redpanda.com/redpandadata/console:latest
+    # Pull from Docker Hub directly. The docker.redpanda.com proxy shares one
+    # pull limit across all of its users.
+    image: redpandadata/console:latest
     entrypoint: /bin/sh
     command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
     environment:
