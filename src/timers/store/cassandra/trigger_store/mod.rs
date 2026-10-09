@@ -368,7 +368,7 @@ impl TriggerOperations for CassandraTriggerStore {
 /// configured grace period (default 1 year) — slabs and the watermark hint
 /// deliberately outlive their natural end so a lagging consumer can still
 /// process past-time slabs.
-fn anchor_after_watermark(
+pub(super) fn anchor_after_watermark(
     watermark: Option<SlabId>,
     slab_size: CompactDuration,
 ) -> CompactDateTime {

@@ -25,6 +25,7 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::SlabId;
 use crate::timers::store::cassandra::queries::Queries;
+use crate::timers::store::cassandra::trigger_store::anchor_after_watermark;
 use crate::timers::store::{Segment, SegmentId, SegmentVersion, StoredSegment};
 use educe::Educe;
 use opentelemetry::propagation::TextMapCompositePropagator;
@@ -179,19 +180,22 @@ impl CassandraTriggerStore {
         .await
     }
 
-    /// Writes the slab size and slab watermark of `segment` in one update:
-    /// the commit point of a slab-size migration.
+    /// Writes the slab size and slab watermark of `segment` in one batch:
+    /// the commit point of a slab-size migration. The watermark gets the same
+    /// TTL as the other watermark writes.
     #[instrument(level = "debug", skip(self), err)]
     async fn update_segment_slab_size(
         &self,
         segment: &StoredSegment,
     ) -> Result<(), CassandraTriggerStoreError> {
+        let slab_size = segment.segment.slab_size;
+        let ttl = self.calculate_ttl(anchor_after_watermark(segment.slab_watermark, slab_size));
         let watermark = segment
             .slab_watermark
             .map(|w| i32::from_le_bytes(w.to_le_bytes()));
         self.execute_unpaged_discard(
             &self.queries().update_segment_slab_size,
-            (segment.segment.slab_size, watermark, self.segment.id),
+            (slab_size, self.segment.id, ttl, watermark, self.segment.id),
         )
         .await
     }

@@ -162,10 +162,14 @@ cassandra_queries! {
             TABLE_SEGMENTS
         ),
 
-        /// Updates segment slab size and slab watermark. See `StoredSegment`.
+        /// BATCH: atomically updates the segment slab size and its
+        /// `slab_watermark` (with TTL). See `StoredSegment`.
         update_segment_slab_size: (
-            "UPDATE $keyspace.{} SET slab_size = ?, slab_watermark = ? WHERE id = ?",
-            TABLE_SEGMENTS
+            "BEGIN UNLOGGED BATCH \
+             UPDATE $keyspace.{} SET slab_size = ? WHERE id = ?; \
+             UPDATE $keyspace.{} USING TTL ? SET slab_watermark = ? WHERE id = ?; \
+             APPLY BATCH",
+            TABLE_SEGMENTS, TABLE_SEGMENTS
         ),
 
         /// Enumerates active v1 slabs for a segment

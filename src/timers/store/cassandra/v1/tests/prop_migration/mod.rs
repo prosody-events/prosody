@@ -114,19 +114,19 @@ impl Arbitrary for MigrationTestInput {
         }
 
         // Draw a watermark below the lowest slab, as `StoredSegment` requires:
-        // none, the highest valid value, or a lower value.
-        let lowest_slab = triggers
+        // none, the highest valid value, or a lower value. A segment without
+        // triggers gets a bound at a random time.
+        let lowest_time = triggers
             .iter()
-            .map(|trigger| Slab::from_time(initial_slab_size, trigger.time).id())
-            .min();
-        let initial_watermark = lowest_slab.and_then(|slab| {
-            let highest = slab.checked_sub(1)?;
-            match u8::arbitrary(g) % 3 {
-                0 => None,
-                1 => Some(highest),
-                _ => Some(u32::arbitrary(g) % slab),
-            }
-        });
+            .map(|trigger| trigger.time)
+            .min()
+            .unwrap_or_else(|| CompactDateTime::arbitrary(g));
+        let lowest_slab = Slab::from_time(initial_slab_size, lowest_time).id();
+        let initial_watermark = match (lowest_slab.checked_sub(1), u8::arbitrary(g) % 3) {
+            (Some(highest), 1) => Some(highest),
+            (Some(_), 2) => Some(u32::arbitrary(g) % lowest_slab),
+            _ => None,
+        };
 
         Self {
             segment_id,

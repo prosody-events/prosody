@@ -8,8 +8,8 @@ use crate::timers::test_support::test_segment;
 use quickcheck_macros::quickcheck;
 
 /// The actor keeps a stored watermark exactly when the watermark slab has
-/// ended. Cleanup writes only the watermark of an ended slab, so a valid
-/// watermark is never dropped.
+/// ended. Cleanup writes only the watermark of an ended slab, so on one clock
+/// a valid watermark is never dropped.
 #[quickcheck]
 fn start_keeps_only_watermarks_of_ended_slabs(
     slab_seconds: u32,

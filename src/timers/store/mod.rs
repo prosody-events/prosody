@@ -222,6 +222,8 @@ pub struct StoredSegment {
 
 impl StoredSegment {
     /// Pairs a segment with the slab watermark read from the same row.
+    ///
+    /// It is public so that a [`TriggerStore`] outside the crate can build one.
     #[must_use]
     pub fn new(segment: Segment, slab_watermark: Option<SlabId>) -> Self {
         Self {
