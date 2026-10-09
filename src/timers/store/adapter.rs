@@ -1,9 +1,8 @@
 //! Adapts `TriggerOperations` to implement `TriggerStore`.
 //!
 //! This module provides the `TableAdapter` struct that wraps a type
-//! implementing `TriggerOperations` (22 primitive methods) and provides the
-//! public `TriggerStore` interface (13 methods) with coordinated dual-table
-//! operations.
+//! implementing `TriggerOperations` and provides the public `TriggerStore`
+//! interface with coordinated dual-table operations.
 
 use crate::Key;
 use crate::timers::DELETE_CONCURRENCY;
@@ -13,7 +12,7 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentId, TriggerStore};
+use crate::timers::store::{Segment, SegmentId, StoredSegment, TriggerStore};
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use std::future::Future;
 use std::ops::RangeInclusive;
@@ -23,9 +22,8 @@ use tracing::{debug, instrument};
 
 /// Adapts `TriggerOperations` to implement `TriggerStore`.
 ///
-/// This struct wraps a type implementing `TriggerOperations` (22 primitive
-/// methods) and provides the public `TriggerStore` interface (13 methods)
-/// with coordinated dual-table operations.
+/// This struct wraps a type implementing `TriggerOperations` and provides the
+/// public `TriggerStore` interface with coordinated dual-table operations.
 ///
 /// Uses `Arc` for cheap cloning and best-effort consistency via `try_join!`.
 ///
@@ -84,7 +82,9 @@ where
     // Pass-through methods: Delegate directly to operations
     // ===================================================================
 
-    fn get_segment(&self) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send {
+    fn get_segment(
+        &self,
+    ) -> impl Future<Output = Result<Option<StoredSegment>, Self::Error>> + Send {
         self.operations.get_segment()
     }
 
@@ -113,12 +113,6 @@ where
 
     fn delete_slab(&self, slab_id: SlabId) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.operations.delete_slab(slab_id)
-    }
-
-    fn get_slab_watermark(
-        &self,
-    ) -> impl Future<Output = Result<Option<SlabId>, Self::Error>> + Send {
-        self.operations.get_slab_watermark()
     }
 
     fn set_slab_watermark(

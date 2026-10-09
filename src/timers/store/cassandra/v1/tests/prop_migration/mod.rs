@@ -26,8 +26,8 @@ use uuid::Uuid;
 mod verify;
 use verify::{
     verify_cleanup, verify_correct_indexing, verify_data_preservation,
-    verify_dual_index_consistency, verify_key_state_invariant, verify_no_extra_slabs,
-    verify_segment_metadata,
+    verify_dual_index_consistency, verify_key_state_invariant, verify_segment_metadata,
+    verify_slabs,
 };
 
 /// Test input containing a migration scenario.
@@ -47,6 +47,8 @@ pub struct MigrationTestInput {
     pub target_slab_size: CompactDuration,
     /// Triggers to insert before migration.
     pub triggers: Vec<MigrationTriggerData>,
+    /// Slab watermark before migration, in the initial slab size.
+    pub initial_watermark: Option<SlabId>,
 }
 
 /// Trigger data for migration tests.
@@ -75,10 +77,15 @@ impl Arbitrary for MigrationTestInput {
             _ => SegmentVersion::V3,
         };
 
-        // Generate slab sizes (1 second to 7 days to avoid TTL overflow)
-        // Clamp to 604_800 seconds (7 days)
-        let initial_slab_size = CompactDuration::new(u32::arbitrary(g).clamp(1, 604_800));
-        let target_slab_size = CompactDuration::new(u32::arbitrary(g).clamp(1, 604_800));
+        // Slab sizes run from 1 second to 7 days, which avoids TTL overflow.
+        // Do not clamp: a clamp maps most draws to 7 days. Half of the inputs
+        // keep the slab size.
+        let initial_slab_size = CompactDuration::new(u32::arbitrary(g) % 604_800 + 1);
+        let target_slab_size = if bool::arbitrary(g) {
+            initial_slab_size
+        } else {
+            CompactDuration::new(u32::arbitrary(g) % 604_800 + 1)
+        };
 
         // Generate 0-50 triggers (empty segments are valid test cases)
         let trigger_count = usize::arbitrary(g) % 51;
@@ -106,6 +113,21 @@ impl Arbitrary for MigrationTestInput {
             });
         }
 
+        // Draw a watermark below the lowest slab, as `StoredSegment` requires:
+        // none, the highest valid value, or a lower value. A segment without
+        // triggers gets a bound at a random time.
+        let lowest_time = triggers
+            .iter()
+            .map(|trigger| trigger.time)
+            .min()
+            .unwrap_or_else(|| CompactDateTime::arbitrary(g));
+        let lowest_slab = Slab::from_time(initial_slab_size, lowest_time).id();
+        let initial_watermark = match (lowest_slab.checked_sub(1), u8::arbitrary(g) % 3) {
+            (Some(highest), 1) => Some(highest),
+            (Some(_), 2) => Some(u32::arbitrary(g) % lowest_slab),
+            _ => None,
+        };
+
         Self {
             segment_id,
             segment_name,
@@ -113,6 +135,7 @@ impl Arbitrary for MigrationTestInput {
             initial_slab_size,
             target_slab_size,
             triggers,
+            initial_watermark,
         }
     }
 }
@@ -126,6 +149,8 @@ pub struct MigrationModel {
     /// V1→V2: All triggers become Application type.
     /// V2→V2/V3: Timer types preserved.
     pub triggers: HashSet<(Key, CompactDateTime, TimerType)>,
+    /// Expected slab watermark after migration, in the target slab size.
+    pub slab_watermark: Option<SlabId>,
 }
 
 impl MigrationModel {
@@ -161,7 +186,18 @@ impl MigrationModel {
             triggers.insert((trigger_data.key.clone(), trigger_data.time, timer_type));
         }
 
-        Self { segment, triggers }
+        // The old slab rows start at or after the end of the watermark slab.
+        // The new watermark is one below the target slab that holds that time.
+        let slab_watermark = input.initial_watermark.and_then(|watermark| {
+            let start = (watermark + 1) * input.initial_slab_size.seconds();
+            (start / input.target_slab_size.seconds()).checked_sub(1)
+        });
+
+        Self {
+            segment,
+            triggers,
+            slab_watermark,
+        }
     }
 
     /// Gets all unique slab IDs that triggers should be in.
@@ -387,6 +423,20 @@ pub async fn prop_migration_invariants(
         slab_size: input.target_slab_size,
         version: SegmentVersion::V3,
     };
+
+    // Anchor the seed TTL in the initial slab size, because a target-size
+    // anchor can expire after 2038 and Cassandra rejects that TTL.
+    if let Some(watermark) = input.initial_watermark {
+        let segment = Segment {
+            slab_size: input.initial_slab_size,
+            ..segment.clone()
+        };
+        CassandraTriggerStore::with_store(cassandra_base.clone(), &config.keyspace, segment)
+            .await?
+            .set_slab_watermark(Some(watermark))
+            .await?;
+    }
+
     let cassandra_store =
         CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment).await?;
     let store = TableAdapter::new(cassandra_store);
@@ -411,12 +461,19 @@ pub async fn prop_migration_invariants(
         return Ok(());
     }
 
-    // Verification phase: Check all invariants
-    verify_segment_metadata(&store, &model, input.initial_version).await?;
+    // Verification phase: Check the migrated segment, the row that migration
+    // wrote, and all other invariants.
+    let persisted = store
+        .operations()
+        .get_segment_unchecked(&input.segment_id)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to read segment: {e:?}"))?;
+    verify_segment_metadata(segment_opt, &model, input.initial_version)?;
+    let watermark = verify_segment_metadata(persisted, &model, input.initial_version)?;
     verify_data_preservation(&store, &model).await?;
     verify_correct_indexing(&store, &model).await?;
     verify_dual_index_consistency(&store, &model).await?;
-    verify_no_extra_slabs(store.operations(), &model).await?;
+    verify_slabs(store.operations(), &model, watermark).await?;
     verify_cleanup(v1_operations, store.operations(), &input, &model).await?;
     verify_key_state_invariant(&store, &model, input.initial_version).await?;
 

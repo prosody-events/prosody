@@ -24,7 +24,7 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::timers::active::ActiveTriggers;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::queue::TriggerQueue;
-use crate::timers::store::{Segment, TriggerStore};
+use crate::timers::store::{StoredSegment, TriggerStore};
 use crate::timers::{TimerType, Trigger};
 use futures::TryFutureExt;
 use std::error::Error as StdError;
@@ -99,7 +99,7 @@ where
     /// expired-trigger channel along with the scheduler handle.
     pub fn new<T>(
         store: T,
-        segment: Segment,
+        segment: StoredSegment,
         heartbeats: &HeartbeatRegistry,
         shutdown_rx: watch::Receiver<ShutdownPhase>,
     ) -> (mpsc::Receiver<Trigger>, Self)

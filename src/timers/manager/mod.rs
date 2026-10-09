@@ -128,12 +128,8 @@ where
         // Initialize the unified scheduler actor — it owns slab metadata,
         // loading, cleanup, and the trigger queue. The manager keeps its
         // own `store` clone for trigger-row writes that race in parallel.
-        let (trigger_rx, scheduler) = TriggerScheduler::new(
-            config.store.clone(),
-            segment.clone(),
-            &heartbeats,
-            shutdown_rx,
-        );
+        let (trigger_rx, scheduler) =
+            TriggerScheduler::new(config.store.clone(), segment, &heartbeats, shutdown_rx);
 
         // Build the manager wrapper. The segment is consumed when the
         // scheduler actor spawns; no copy is retained here.

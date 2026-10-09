@@ -8,26 +8,25 @@ use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::cassandra::v1::V1Operations;
 use crate::timers::store::cassandra::{CassandraTriggerStore, TimerState};
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{SegmentVersion, TriggerStore};
+use crate::timers::store::{SegmentVersion, StoredSegment, TriggerStore};
 use crate::timers::{TimerType, Trigger};
 use ahash::{HashMap, HashSet};
 use futures::TryStreamExt;
 use strum::VariantArray;
 
-/// Verifies that segment metadata is correct after migration.
+/// Verifies that segment metadata is correct after migration, and returns the
+/// slab watermark.
 ///
-/// Expected: version=V2, `slab_size=target_slab_size`, name preserved (for V2
-/// only).
-pub(super) async fn verify_segment_metadata(
-    store: &TableAdapter<CassandraTriggerStore>,
+/// Expected: version V4, the target slab size, the model slab watermark, and
+/// the initial name (not for V1).
+pub(super) fn verify_segment_metadata(
+    segment: Option<StoredSegment>,
     model: &MigrationModel,
     initial_version: SegmentVersion,
-) -> color_eyre::Result<()> {
-    let segment = store
-        .get_segment()
-        .await
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to get segment: {e:?}"))?
-        .ok_or_else(|| color_eyre::eyre::eyre!("Segment {} not found", model.segment.id))?;
+) -> color_eyre::Result<Option<SlabId>> {
+    let (segment, watermark) = segment
+        .ok_or_else(|| color_eyre::eyre::eyre!("Segment {} not found", model.segment.id))?
+        .into_parts();
 
     if segment.version != model.segment.version {
         return Err(color_eyre::eyre::eyre!(
@@ -45,6 +44,13 @@ pub(super) async fn verify_segment_metadata(
         ));
     }
 
+    if watermark != model.slab_watermark {
+        return Err(color_eyre::eyre::eyre!(
+            "Slab watermark mismatch: expected {:?}, got {watermark:?}",
+            model.slab_watermark
+        ));
+    }
+
     // Only check name preservation for V2→V3 migrations (and V2→V2 slab-size).
     // V1→V2 migrations don't preserve name (V1 segments have NULL name).
     if initial_version != SegmentVersion::V1 && segment.name != model.segment.name {
@@ -55,7 +61,7 @@ pub(super) async fn verify_segment_metadata(
         ));
     }
 
-    Ok(())
+    Ok(watermark)
 }
 
 /// Collects every trigger the key index holds for each distinct key in the
@@ -203,10 +209,12 @@ pub(super) async fn verify_dual_index_consistency(
     Ok(())
 }
 
-/// Verifies that ONLY expected slabs exist (no extra slabs).
-pub(super) async fn verify_no_extra_slabs(
+/// Verifies that ONLY expected slabs exist (no extra slabs), and that every
+/// slab lies above the persisted `watermark`.
+pub(super) async fn verify_slabs(
     operations: &CassandraTriggerStore,
     model: &MigrationModel,
+    watermark: Option<SlabId>,
 ) -> color_eyre::Result<()> {
     // Get ALL slabs for this segment
     let all_slabs: Vec<SlabId> = operations
@@ -214,6 +222,17 @@ pub(super) async fn verify_no_extra_slabs(
         .try_collect()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to get all slabs: {e:?}"))?;
+
+    // Invariant I1 of `StoredSegment`: every stored slab lies above the
+    // watermark.
+    if let Some(slab) = all_slabs
+        .iter()
+        .find(|&&slab| watermark.is_some_and(|w| slab <= w))
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "Slab {slab} is not above watermark {watermark:?}"
+        ));
+    }
 
     let expected_slabs: HashSet<SlabId> = model.expected_slab_ids().into_iter().collect();
 
