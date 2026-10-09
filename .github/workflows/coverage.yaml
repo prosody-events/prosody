@@ -50,7 +50,13 @@ jobs:
       RUSTFLAGS: -C target-cpu=x86-64-v3 -C link-arg=-fuse-ld=mold
     services:
       kafka:
+        # Docker Hub is the only registry for this image. A sign-in gives CI
+        # its own pull limit. The runner pulls anonymously when a secret is
+        # empty, for example in a pull request from a fork.
         image: apache/kafka:latest
+        credentials:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
         ports:
           - "9094:9094"
         env:
@@ -71,7 +77,8 @@ jobs:
           --health-timeout 10s
           --health-retries 15
       cassandra:
-        image: cassandra:latest
+        # The Docker official image, from ECR Public: no Docker Hub pull limit.
+        image: public.ecr.aws/docker/library/cassandra:latest
         ports:
           - "9042:9042"
         options: >-
