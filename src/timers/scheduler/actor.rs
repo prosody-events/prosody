@@ -70,6 +70,28 @@ pub(super) struct ActorState<T> {
     pub(super) next_load_at: Instant,
 }
 
+impl<T> ActorState<T> {
+    /// Builds the state of an actor that starts at `now`.
+    ///
+    /// It keeps the stored watermark only if it is below the slab of `now`.
+    /// An older version did not convert the watermark on a slab-size change,
+    /// so a higher one is stale.
+    pub(super) fn start(store: T, segment: StoredSegment, now: CompactDateTime) -> Self {
+        let (segment, watermark) = segment.into_parts();
+        let current_slab_id = Slab::from_time(segment.slab_size, now).id();
+
+        Self {
+            store,
+            known_slab_ids: BTreeSet::new(),
+            last_persisted_watermark: watermark.filter(|&watermark| watermark < current_slab_id),
+            highest_loaded_slab_id: None,
+            preload_window: calculate_preload(segment.slab_size),
+            next_load_at: Instant::now(),
+            segment,
+        }
+    }
+}
+
 /// Background task: drives the scheduler's command loop, expired trigger
 /// emission, slab loading, and slab cleanup.
 pub(super) async fn run_actor<T>(
@@ -83,22 +105,9 @@ pub(super) async fn run_actor<T>(
 ) where
     T: TriggerStore,
 {
-    let (segment, watermark) = segment.into_parts();
-    let last_persisted_watermark = match CompactDateTime::now() {
-        Ok(now) => seed_watermark(watermark, segment.slab_size, now),
-        Err(_) => None,
-    };
-    let preload_window = calculate_preload(segment.slab_size);
-    let now = Instant::now();
-    let mut state: ActorState<T> = ActorState {
-        store,
-        segment,
-        known_slab_ids: BTreeSet::new(),
-        last_persisted_watermark,
-        highest_loaded_slab_id: None,
-        preload_window,
-        next_load_at: now,
-    };
+    // A clock error discards the watermark: no slab is below slab 0.
+    let now = CompactDateTime::now().unwrap_or(CompactDateTime::MIN);
+    let mut state = ActorState::start(store, segment, now);
 
     let mut trigger_to_send: Option<Trigger> = None;
 
@@ -336,17 +345,6 @@ where
     if let Err(e) = maybe_advance_watermark(state, now_slab_id, &active_slab_ids).await {
         warn!("cleanup_step: failed to advance watermark: {e:#}");
     }
-}
-
-/// Keeps a stored watermark only if it is below the slab of `now`.
-/// An older version did not convert the watermark on a slab-size change,
-/// so a higher one is stale.
-pub(super) fn seed_watermark(
-    watermark: Option<SlabId>,
-    slab_size: CompactDuration,
-    now: CompactDateTime,
-) -> Option<SlabId> {
-    watermark.filter(|&watermark| watermark < Slab::from_time(slab_size, now).id())
 }
 
 fn cleanable_slab_end<T>(state: &ActorState<T>, now_slab_id: SlabId) -> Option<SlabId> {
