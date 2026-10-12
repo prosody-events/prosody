@@ -10,6 +10,7 @@
 use std::time::Duration;
 
 use crate::common::handler::ChannelHandler;
+use crate::common::kafka::BOOTSTRAP;
 use color_eyre::eyre::{Result, bail, eyre};
 use prosody::high_level::config::TriggerStoreConfiguration;
 use prosody::tracing::init_test_logging;
@@ -33,9 +34,6 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 mod common;
-
-/// The broker the stall test connects to.
-const BOOTSTRAP: &str = "localhost:9094";
 
 /// The log segment size of the stall test topic. Kafka accepts no smaller
 /// `segment.bytes`.
@@ -62,7 +60,7 @@ async fn test_backpressure() -> Result<()> {
 
     // Create a unique four-partition topic for the test
     let (topic, admin_client) = common::kafka::create_topic_with_partitions(4).await?;
-    let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
+    let bootstrap: Vec<String> = vec![BOOTSTRAP.to_owned()];
 
     // Use a channel with a buffer capacity to accommodate slow processing
     let (messages_tx, mut messages_rx) = channel(64);
@@ -262,7 +260,7 @@ async fn receive_until_after(messages: &mut Receiver<(String, Value)>) -> Result
     }
 }
 
-/// A client configuration for the stall test broker.
+/// A client configuration for the test broker.
 fn client_config() -> ClientConfig {
     let mut config = ClientConfig::new();
     config.set("bootstrap.servers", BOOTSTRAP);

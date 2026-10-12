@@ -90,7 +90,8 @@ where
 /// This function implements the core consumption loop that:
 /// 1. Monitors and updates heartbeats to detect stalls
 /// 2. Stores committed offsets when watermarks advance
-/// 3. Dispatches the messages that wait for room, in arrival order
+/// 3. Dispatches the messages that wait for room, in arrival order, and waits
+///    for room while they wait
 /// 4. Polls for new messages from Kafka
 /// 5. Processes valid messages through validation and filtering
 /// 6. Dispatches messages to their respective partition managers, or holds them
@@ -132,12 +133,18 @@ where
         store_watermarks(&consumer, watermark_version, managers, &mut last_version);
 
         // Dispatch the messages that wait for room before new ones arrive
-        if let Err(error) = backpressure.drain(&consumer) {
-            error!("error resuming partitions: {error:#}");
+        if let Err(error) = backpressure.drain(&consumer, poll_interval) {
+            error!("error resuming partition: {error:#}");
         }
 
-        // Poll for next message with timeout
-        let Some(result) = consumer.poll(Timeout::After(poll_interval)) else {
+        // Poll for next message with timeout. While messages wait, the drain
+        // above has already waited for room.
+        let timeout = if backpressure.is_blocked() {
+            Duration::ZERO
+        } else {
+            poll_interval
+        };
+        let Some(result) = consumer.poll(Timeout::After(timeout)) else {
             continue;
         };
 
@@ -170,9 +177,7 @@ where
             continue;
         };
 
-        if let Err(error) =
-            backpressure.submit(&consumer, decoded, manager.sender(), topic, partition)
-        {
+        if let Err(error) = backpressure.submit(&consumer, decoded, manager.sender()) {
             error!("error pausing partition: {error:#}");
         }
 

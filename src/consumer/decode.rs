@@ -97,18 +97,25 @@ impl<P> DecodedMessage<P> {
 }
 
 impl<P> DecodedRecord<P> {
+    /// Borrows the metadata a record span is built from.
+    pub(crate) fn meta(&self) -> RecordMeta<'_> {
+        match self {
+            Self::Message(decoded) => decoded.meta(),
+            Self::Excise(decoded) => decoded.meta(),
+        }
+    }
+
     pub(crate) fn into_record(
         self,
         permit: OwnedSemaphorePermit,
         span: impl FnOnce(RecordMeta<'_>) -> Span,
     ) -> ConsumerRecord<P> {
+        let span = span(self.meta());
         match self {
             Self::Message(decoded) => {
-                let span = span(decoded.meta());
                 ConsumerRecord::Message(ConsumerMessage::from_decoded(decoded.value, span, permit))
             }
             Self::Excise(decoded) => {
-                let span = span(decoded.meta());
                 ConsumerRecord::Excise(ConsumerMessage::from_decoded(decoded.value, span, permit))
             }
         }
