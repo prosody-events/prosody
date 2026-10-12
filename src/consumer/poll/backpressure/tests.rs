@@ -20,8 +20,8 @@ use tokio::sync::mpsc::{Receiver, channel};
 /// The number of partitions in each trace.
 const PARTITIONS: usize = 3;
 
-/// The in-flight limit. It exceeds the channel capacity, so a full channel
-/// and a free permit can occur together.
+/// The in-flight limit. It exceeds the channel capacity, so the traces also
+/// cover a full channel while a permit is free.
 const MAX_IN_FLIGHT: usize = 3;
 
 /// The capacity of each partition channel.
@@ -41,10 +41,11 @@ enum Op {
     Drain,
     /// The partition task takes its next record and starts its handler.
     Take(usize),
-    /// A running handler finishes and frees its permit. The index is reduced
-    /// modulo the number of running handlers.
+    /// A running handler finishes and frees its permit. The step reduces the
+    /// index modulo the number of running handlers.
     Finish(usize),
-    /// The partition is revoked and assigned again with a new channel.
+    /// A rebalance revokes the partition and assigns it again with a new
+    /// channel.
     Reassign(usize),
     /// The partition task stops while the partition stays assigned.
     Stop(usize),
@@ -137,8 +138,8 @@ struct Harness<'a> {
 ///
 /// FALSIFICATION: in `drain`, push a record that cannot dispatch to the back
 /// instead of the front → a later record overtakes it and a take reds. Let
-/// `submit` dispatch while records wait → the waiting count reds. Skip the
-/// closed-channel discard in `drain` → a stopped partition blocks every later
+/// `submit` dispatch while records wait → the waiting count reds. In `drain`,
+/// keep a record whose channel closed → a stopped partition blocks every later
 /// record and the waiting count reds.
 #[test]
 fn prop_backpressure_matches_model() {

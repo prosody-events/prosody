@@ -269,8 +269,8 @@ impl<P: Send + 'static> PartitionManager<P> {
 
     /// The channel that feeds this partition's processing task.
     ///
-    /// [`Self::shutdown`] closes it, so a weak handle to it tells whether this
-    /// partition assignment is still live.
+    /// [`Self::shutdown`] drops this sender. So a weak handle to the channel
+    /// shows whether this partition assignment is still live.
     pub(crate) fn sender(&self) -> &Sender<ConsumerRecord<P>> {
         &self.message_tx
     }

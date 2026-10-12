@@ -97,7 +97,7 @@ impl<P> DecodedMessage<P> {
 }
 
 impl<P> DecodedRecord<P> {
-    /// Borrows the metadata a record span is built from.
+    /// Borrows the metadata that a record span uses, for either variant.
     pub(crate) fn meta(&self) -> RecordMeta<'_> {
         match self {
             Self::Message(decoded) => decoded.meta(),

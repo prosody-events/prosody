@@ -2,8 +2,8 @@
 //!
 //! It simulates a scenario where a producer sends a large number of messages
 //! while the consumer processes them slowly, demonstrating the backpressure
-//! handling capabilities of the system. It also checks that backpressure never
-//! strands a partition at a log segment that ends without a deliverable record.
+//! handling capabilities of the system. It also checks that backpressure moves
+//! a partition past a log segment that ends without a deliverable record.
 
 #![recursion_limit = "512"]
 
@@ -132,8 +132,8 @@ async fn test_backpressure() -> Result<()> {
     Ok(())
 }
 
-/// Proves that backpressure never strands a partition at a log segment that
-/// ends without a deliverable record.
+/// Proves that backpressure moves a partition past a log segment that ends
+/// without a deliverable record.
 ///
 /// Partition 0 holds a committed transaction whose commit marker ends a
 /// segment, and one more record after it. A fetch at the marker returns no
@@ -143,7 +143,7 @@ async fn test_backpressure() -> Result<()> {
 /// and partition 0 then waits there for many seconds. A partition that gets
 /// past the marker delivers its next record after a few backlog records.
 #[tokio::test]
-async fn backpressure_never_strands_a_partition_at_an_empty_segment_tail() -> Result<()> {
+async fn backpressure_moves_a_partition_past_an_empty_segment_tail() -> Result<()> {
     init_test_logging();
 
     let topic = Uuid::new_v4().to_string();

@@ -42,8 +42,8 @@ graph TD
       consumption from that specific partition. Other partitions continue to make progress, ensuring that a slowdown in
       one partition doesn't affect the entire consumer
     - **Per-key queuing**: Each key has its own queue to preserve message order; the global semaphore prevents unbounded
-      growth. When the in-flight count reaches `PROSODY_MAX_UNCOMMITTED`, the poll loop holds the next message from
-      each partition and pauses only that partition until the message gets a slot
+      growth. When the in-flight count reaches `PROSODY_MAX_UNCOMMITTED`, the poll loop holds each new message and
+      pauses only the partition of that message. The partition resumes when its message gets a slot
 
 ## Message Flow
 

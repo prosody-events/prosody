@@ -21,8 +21,8 @@ use crate::otel::SpanRelation;
 #[cfg(test)]
 mod tests;
 
-/// Limits the records in flight across all partitions, and never strands a
-/// partition.
+/// Limits the records in flight across all partitions, and never holds a
+/// partition at a batch that it cannot deliver.
 ///
 /// A record dispatches when an in-flight permit is free and its partition
 /// channel has room. Otherwise the record waits here, and its partition pauses
@@ -32,7 +32,7 @@ mod tests;
 /// # Invariant
 ///
 /// The poll loop pauses a partition only while a record that the partition
-/// delivered waits here. librdkafka resumes the partition after that record.
+/// delivered waits here. librdkafka resumes the partition at the next offset.
 /// A fetch can return only a batch with no deliverable record, such as a batch
 /// at the end of a compacted or transactional log segment. librdkafka then
 /// moves its fetch position past the batch, but a pause moves it back.
@@ -42,8 +42,9 @@ pub(super) struct Backpressure<P> {
     /// Limits the records in flight across all partitions.
     permits: Arc<Semaphore>,
 
-    /// Records in arrival order. A partition pauses when its record joins, so
-    /// it adds no other record while the pause holds.
+    /// Records in arrival order. A partition pauses when its record enters the
+    /// queue. So the queue holds one record for each paused partition, unless a
+    /// pause fails.
     waiting: VecDeque<Waiting<P>>,
 
     /// How a receive span relates to the producer's trace context.
@@ -58,7 +59,12 @@ struct Waiting<P> {
     span: Span,
 
     /// The channel of the partition assignment that delivered the record.
-    /// Revoking the assignment drops its last strong sender.
+    ///
+    /// A revoke drops the only strong sender. So a failed upgrade means that
+    /// the assignment ended, and its next owner reads the record again.
+    /// Do not hold a strong clone: it keeps a revoked channel open.
+    /// Do not look up the channel by partition: a later assignment reads the
+    /// record again from its committed offset, so it gets the record twice.
     channel: WeakSender<ConsumerRecord<P>>,
 }
 
@@ -72,9 +78,9 @@ impl<P> Backpressure<P> {
         }
     }
 
-    /// Whether a record waits. [`Self::drain`] then waits for room, so the
-    /// poll loop must not block in its poll as well.
-    pub(super) fn is_blocked(&self) -> bool {
+    /// Returns whether a record waits. [`Self::drain`] then waits for room, so
+    /// the poll loop must not block in its poll as well.
+    pub(super) fn has_waiting(&self) -> bool {
         !self.waiting.is_empty()
     }
 
@@ -115,6 +121,11 @@ impl<P> Backpressure<P> {
     ///
     /// Waits up to `timeout` for room when a record waits, so the poll loop
     /// sees each permit as soon as a handler frees it.
+    ///
+    /// The drain stops at the first record that cannot dispatch. This costs no
+    /// throughput. Each record in a channel holds a permit, and a channel has
+    /// room for as many records as there are permits. So a full channel leaves
+    /// no permit for any other record.
     ///
     /// # Errors
     ///

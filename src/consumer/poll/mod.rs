@@ -6,8 +6,8 @@
 //! - Applies event type filtering
 //! - Maintains distributed tracing contexts
 //! - Manages offset tracking and committing
-//! - Dispatches messages to the appropriate partition managers, holding back
-//!   the ones they cannot accept yet (see [`Backpressure`])
+//! - Dispatches messages to the partition managers, and holds back the ones
+//!   they cannot accept yet (see [`Backpressure`])
 //!
 //! The main entry point is the [`poll`] function, which orchestrates all these
 //! operations within a continuous loop.
@@ -139,7 +139,7 @@ where
 
         // Poll for next message with timeout. While messages wait, the drain
         // above has already waited for room.
-        let timeout = if backpressure.is_blocked() {
+        let timeout = if backpressure.has_waiting() {
             Duration::ZERO
         } else {
             poll_interval
@@ -169,8 +169,8 @@ where
             continue;
         };
 
-        // A partition is missing while it is revoked. Its next owner reads
-        // the message again.
+        // A revoke removes the partition manager. The next owner of the
+        // partition reads the message again.
         let assigned = managers.read();
         let Some(manager) = assigned.get(&(topic, partition)) else {
             warn!("failed to dispatch message: partition not found; discarding");
