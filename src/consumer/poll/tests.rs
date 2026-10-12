@@ -9,6 +9,7 @@ use crate::test_util::{assert_span_relation, captured_spans, sampled_remote_cont
 use color_eyre::Result;
 use opentelemetry::Context;
 use opentelemetry::trace::TraceContextExt as _;
+use std::sync::Arc;
 
 /// A `DecodedMessage` carrying `context` as its `parent_context`, the same
 /// shape `decode_message` produces after extracting headers via the

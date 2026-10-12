@@ -93,9 +93,9 @@ pub struct ConsumerConfiguration {
     /// Default: 64
     ///
     /// Controls the global limit of messages being processed concurrently
-    /// across all partitions. This provides backpressure when the system is
-    /// under high load by pausing message consumption when the limit is
-    /// reached. Also determines the buffer size for message queues.
+    /// across all partitions. At the limit, each partition that delivers a
+    /// message pauses until a slot frees for that message. Also determines the
+    /// buffer size for message queues.
     #[builder(
         default = "from_env_with_fallback(\"PROSODY_MAX_UNCOMMITTED\", 64)?",
         setter(into)
