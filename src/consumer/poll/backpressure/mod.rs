@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::FutureExt;
 use rdkafka::TopicPartitionList;
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
 use rdkafka::error::KafkaResult;
@@ -60,11 +61,10 @@ struct Waiting<P> {
 
     /// The channel of the partition assignment that delivered the record.
     ///
-    /// A revoke drops the only strong sender. So a failed upgrade means that
-    /// the assignment ended, and its next owner reads the record again.
-    /// Do not hold a strong clone: it keeps a revoked channel open.
-    /// Do not look up the channel by partition: a later assignment reads the
-    /// record again from its committed offset, so it gets the record twice.
+    /// A revoke drops the only strong sender, so a failed upgrade means that
+    /// the assignment ended. Do not hold a strong clone: it keeps a revoked
+    /// channel open. Do not look up the channel by partition: a later
+    /// assignment of the partition would get the record twice.
     channel: WeakSender<ConsumerRecord<P>>,
 }
 
@@ -101,7 +101,7 @@ impl<P> Backpressure<P> {
     ) -> KafkaResult<()> {
         let span = create_receive_span(record.meta(), self.spans);
         if self.waiting.is_empty()
-            && let Some((permit, slot)) = self.try_reserve(channel)
+            && let Some((permit, slot)) = self.reserve(channel).now_or_never().flatten()
         {
             slot.send(record.into_record(permit, |_| span));
             return Ok(());
@@ -122,10 +122,9 @@ impl<P> Backpressure<P> {
     /// Waits up to `timeout` for room when a record waits, so the poll loop
     /// sees each permit as soon as a handler frees it.
     ///
-    /// The drain stops at the first record that cannot dispatch. This costs no
-    /// throughput. Each record in a channel holds a permit, and a channel has
-    /// room for as many records as there are permits. So a full channel leaves
-    /// no permit for any other record.
+    /// The drain stops at the first record that cannot dispatch. This costs
+    /// nothing: a channel holds at most one record for each permit, so a full
+    /// channel leaves no free permit.
     ///
     /// # Errors
     ///
@@ -143,7 +142,9 @@ impl<P> Backpressure<P> {
                 continue;
             };
 
-            let Some((permit, slot)) = self.reserve(&channel, deadline) else {
+            let reserved = timeout_at(deadline, self.reserve(&channel));
+            let Some((permit, slot)) = Handle::current().block_on(reserved).unwrap_or_default()
+            else {
                 if channel.is_closed() {
                     let meta = waiting.record.meta();
                     error!(
@@ -167,39 +168,19 @@ impl<P> Backpressure<P> {
         Ok(())
     }
 
-    /// Takes an in-flight permit and a slot in `channel` if both are free now.
-    fn try_reserve<'a>(
+    /// Waits for an in-flight permit and a slot in `channel`. Returns `None`
+    /// if the channel closes.
+    async fn reserve<'a>(
         &self,
         channel: &'a Sender<ConsumerRecord<P>>,
     ) -> Option<(OwnedSemaphorePermit, Permit<'a, ConsumerRecord<P>>)> {
-        let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
+        let Ok(permit) = Arc::clone(&self.permits).acquire_owned().await else {
             return None;
         };
-        let Ok(slot) = channel.try_reserve() else {
+        let Ok(slot) = channel.reserve().await else {
             return None;
         };
         Some((permit, slot))
-    }
-
-    /// Waits until `deadline` for an in-flight permit and a slot in `channel`.
-    fn reserve<'a>(
-        &self,
-        channel: &'a Sender<ConsumerRecord<P>>,
-        deadline: Instant,
-    ) -> Option<(OwnedSemaphorePermit, Permit<'a, ConsumerRecord<P>>)> {
-        let reserved = async {
-            let Ok(permit) = Arc::clone(&self.permits).acquire_owned().await else {
-                return None;
-            };
-            let Ok(slot) = channel.reserve().await else {
-                return None;
-            };
-            Some((permit, slot))
-        };
-
-        Handle::current()
-            .block_on(timeout_at(deadline, reserved))
-            .unwrap_or_default()
     }
 }
 
