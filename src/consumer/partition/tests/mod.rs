@@ -102,7 +102,8 @@ async fn test_partition_manager_capacity() -> color_eyre::Result<()> {
         let message = create_test_message(Offset::from(i), "key")?;
         assert!(
             partition_manager
-                .try_send_record(ConsumerRecord::Message(message))
+                .sender()
+                .try_send(ConsumerRecord::Message(message))
                 .is_ok(),
             "Message send should succeed"
         );
@@ -112,7 +113,8 @@ async fn test_partition_manager_capacity() -> color_eyre::Result<()> {
     let message = create_test_message(5, "key")?;
     assert!(
         partition_manager
-            .try_send_record(ConsumerRecord::Message(message))
+            .sender()
+            .try_send(ConsumerRecord::Message(message))
             .is_err(),
         "Message send should fail when buffer is full"
     );
@@ -138,7 +140,8 @@ async fn test_partition_manager_ordering() -> color_eyre::Result<()> {
         let message = create_test_message(offset, "key")?;
         assert!(
             partition_manager
-                .try_send_record(ConsumerRecord::Message(message))
+                .sender()
+                .try_send(ConsumerRecord::Message(message))
                 .is_ok(),
             "Message send should succeed"
         );
@@ -178,7 +181,8 @@ async fn test_partition_manager_watermark() -> color_eyre::Result<()> {
         let message = create_test_message(i, "key")?;
         assert!(
             partition_manager
-                .try_send_record(ConsumerRecord::Message(message))
+                .sender()
+                .try_send(ConsumerRecord::Message(message))
                 .is_ok(),
             "Message send should succeed"
         );
@@ -210,13 +214,15 @@ async fn test_partition_manager_max_uncommitted() -> color_eyre::Result<()> {
         let message = create_test_message(i as Offset, "key")?;
         assert!(
             partition_manager
-                .try_send_record(ConsumerRecord::Message(message))
+                .sender()
+                .try_send(ConsumerRecord::Message(message))
                 .is_ok(),
             "Message send should succeed"
         );
     }
 
-    // Verify that only max_uncommitted messages are processed before backpressure
+    // Verify that only max_uncommitted messages are processed before
+    // backpressure
     wait_for_processed_offsets(&handler, max_uncommitted, Duration::from_secs(1)).await?;
 
     partition_manager.shutdown().await;
@@ -311,7 +317,8 @@ async fn test_partition_manager_is_stalled() -> color_eyre::Result<()> {
     let message = create_test_message(0, "key")?;
     assert!(
         partition_manager
-            .try_send_record(ConsumerRecord::Message(message))
+            .sender()
+            .try_send(ConsumerRecord::Message(message))
             .is_ok(),
         "Message send should succeed"
     );

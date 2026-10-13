@@ -34,7 +34,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tokio::spawn;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -268,28 +267,12 @@ impl<P: Send + 'static> PartitionManager<P> {
         }
     }
 
-    /// Checks if the partition can accept more messages.
+    /// The channel that feeds this partition's processing task.
     ///
-    /// This method indicates whether the internal message queue has capacity
-    /// for more messages, which is used to implement backpressure.
-    pub fn has_capacity(&self) -> bool {
-        self.message_tx.capacity() > 0
-    }
-
-    /// Attempts to enqueue a message for processing.
-    ///
-    /// This non-blocking method tries to send a message to the internal
-    /// processing queue without waiting. If the queue is full or closed, the
-    /// original message is returned to the caller in the `Err` variant.
-    pub(crate) fn try_send_record(
-        &self,
-        message: ConsumerRecord<P>,
-    ) -> Result<(), ConsumerRecord<P>> {
-        self.message_tx
-            .try_send(message)
-            .map_err(|error| match error {
-                TrySendError::Closed(message) | TrySendError::Full(message) => message,
-            })
+    /// [`Self::shutdown`] drops this sender. So a weak handle to the channel
+    /// shows whether this partition assignment is still live.
+    pub(crate) fn sender(&self) -> &Sender<ConsumerRecord<P>> {
+        &self.message_tx
     }
 
     /// Gets the current committed offset watermark.

@@ -378,7 +378,8 @@ async fn process_event_wires_the_catch_for_a_panicking_handler() -> Result<()> {
     let partition_manager = PartitionManager::new(config, handler, "test-topic".into(), 0);
 
     partition_manager
-        .try_send_record(ConsumerRecord::Message(create_test_message(0, "key")?))
+        .sender()
+        .try_send(ConsumerRecord::Message(create_test_message(0, "key")?))
         .map_err(|_| eyre!("message send rejected"))?;
 
     // The handler ran and buffered a set on the live attempt and is about

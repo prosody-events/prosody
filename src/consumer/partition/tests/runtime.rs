@@ -29,7 +29,8 @@ async fn test_partition_manager_event_type_filtering() -> color_eyre::Result<()>
     );
     assert!(
         partition_manager
-            .try_send_record(ConsumerRecord::Message(disallowed))
+            .sender()
+            .try_send(ConsumerRecord::Message(disallowed))
             .is_ok()
     );
 
@@ -46,7 +47,8 @@ async fn test_partition_manager_event_type_filtering() -> color_eyre::Result<()>
     );
     assert!(
         partition_manager
-            .try_send_record(ConsumerRecord::Message(allowed))
+            .sender()
+            .try_send(ConsumerRecord::Message(allowed))
             .is_ok()
     );
 
@@ -62,7 +64,8 @@ async fn test_partition_manager_event_type_filtering() -> color_eyre::Result<()>
     );
     assert!(
         partition_manager
-            .try_send_record(ConsumerRecord::Excise(excise))
+            .sender()
+            .try_send(ConsumerRecord::Excise(excise))
             .is_ok()
     );
 
@@ -294,7 +297,8 @@ async fn test_partition_manager_timer_heartbeat_integration() -> color_eyre::Res
     let message = create_test_message(1, "test-key")?;
     assert!(
         partition_manager
-            .try_send_record(ConsumerRecord::Message(message))
+            .sender()
+            .try_send(ConsumerRecord::Message(message))
             .is_ok(),
         "Message send should succeed"
     );
