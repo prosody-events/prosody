@@ -19,6 +19,9 @@ pub use crate::state::ReadCachePolicy as ErasedReadCache;
 pub trait ErasedValueReader<Item: Send + 'static>: Send + Sync {
     /// Reads the committed value for `key`.
     async fn get(&self, key: String) -> Result<Option<Item>, ErasedStateError>;
+
+    /// Reports whether a committed value exists for `key` without decoding it.
+    async fn contains(&self, key: String) -> Result<bool, ErasedStateError>;
 }
 
 /// Shared value-reader representation stored by native FFI wrappers.
@@ -119,6 +122,10 @@ where
 {
     async fn get(&self, key: String) -> Result<Option<C::Payload>, ErasedStateError> {
         self.0.get(Key::from(key)).await.map_err(Into::into)
+    }
+
+    async fn contains(&self, key: String) -> Result<bool, ErasedStateError> {
+        self.0.contains(Key::from(key)).await.map_err(Into::into)
     }
 }
 
