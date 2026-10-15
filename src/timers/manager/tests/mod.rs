@@ -86,12 +86,13 @@ async fn test_new_timer_manager_creation() -> Result<()> {
     let (_stream, manager) = result?;
     // Manager construction succeeded; the segment was bootstrapped into
     // the store and is now owned by the scheduler actor.
-    let stored = manager
+    let (stored, _) = manager
         .0
         .store
         .get_segment()
         .await?
-        .ok_or_else(|| eyre!("segment should be persisted after manager init"))?;
+        .ok_or_else(|| eyre!("segment should be persisted after manager init"))?
+        .into_parts();
     assert_eq!(stored.id, segment.id);
     assert_eq!(stored.name, segment.name);
     assert_eq!(stored.slab_size, segment.slab_size);
