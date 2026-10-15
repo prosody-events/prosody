@@ -63,7 +63,7 @@ impl PublicationStore for CassandraPublicationStore {
                     name.as_str(),
                     row.group_id.as_ref(),
                     row.topic.as_ref(),
-                    i32::from(row.partition_count),
+                    row.partition_count,
                 ),
             )
             .await
