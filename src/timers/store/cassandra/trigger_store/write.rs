@@ -55,11 +55,13 @@ pub(super) async fn upsert(
 /// - **Inline(timer), time matches**: Remove state entry → `Absent`
 /// - **Inline(timer), time mismatch**: No-op (Inline guarantees zero clustering
 ///   rows) → stays `Inline`
-/// - **Overflow**: One pre-delete read (LIMIT 3) drives a single atomic batch:
-///   - 0 surviving rows → batch DELETE target + DELETE `state[type]` → `Absent`
-///   - 1 surviving row → batch DELETE target + DELETE survivor + UPDATE state
-///     Inline → `Inline(survivor)`
-///   - 2+ surviving rows → single DELETE target → stays `Overflow`
+/// - **Overflow**: One pre-delete read (LIMIT 3) drives a single write:
+///   - 0 surviving rows → clear the type → `Absent`
+///   - 1 surviving row → clear the type and write the survivor inline →
+///     `Inline(survivor)`
+///   - 2+ surviving rows → stays `Overflow`. A target at or before the earliest
+///     row gets a range tombstone through it, which covers every earlier
+///     delete. Any other target gets a row tombstone.
 /// - **Absent**: No-op (post-V3 Absent is unambiguous: 0 timers, no rows)
 #[instrument(name = "delete_key_trigger", level = "debug", skip(store), fields(state_cached = Empty), err)]
 pub(super) async fn delete(
@@ -84,59 +86,43 @@ pub(super) async fn delete(
             *guard = TimerState::Absent;
         }
         TimerState::Overflow => {
-            // Read pre-delete clustering rows (LIMIT 3) in one round-trip.
-            // After filtering the target out, the survivor count drives
-            // the post-delete state — and any survivor's data is already
-            // in hand to feed straight into the atomic write batch below.
             let triggers = store
                 .peek_three_key_triggers(&segment_id, key, timer_type)
                 .await?;
+            // A target at or before the earliest row makes a prefix delete exact.
+            let is_prefix = triggers.first().is_some_and(|(first, ..)| time <= *first);
             let mut survivors = triggers.into_iter().filter(|(t, ..)| *t != time);
 
-            match (survivors.next(), survivors.next()) {
+            *guard = match (survivors.next(), survivors.next()) {
                 (None, _) => {
-                    // No survivor → atomic DELETE target + DELETE state[type].
                     store
-                        .batch_delete_to_absent(&segment_id, key, timer_type, time)
+                        .batch_clear_key_triggers(&segment_id, key, timer_type)
                         .await?;
-                    *guard = TimerState::Absent;
+                    TimerState::Absent
                 }
-                (Some((survivor_time, span_map, tag_opt)), None) => {
-                    // Exactly one survivor → atomic DELETE target +
-                    // DELETE survivor's clustering row + UPDATE state
-                    // Inline(survivor). Heals any cross-process drift
-                    // (e.g. cache says Overflow but DB has only the
-                    // survivor) by promoting the survivor to Inline.
-                    let new_state = TimerState::Inline(InlineTimer {
-                        time: survivor_time,
-                        span: span_map,
-                        tag: tag_opt.unwrap_or(0_i32),
-                    });
+                (Some(survivor), None) => {
+                    let state = TimerState::Inline(survivor.into());
                     store
-                        .batch_delete_to_inline(
-                            &segment_id,
-                            key,
-                            timer_type,
-                            time,
-                            survivor_time,
-                            &new_state,
-                        )
+                        .batch_clear_and_set_inline(&segment_id, key, timer_type, &state)
                         .await?;
-                    *guard = new_state;
+                    state
                 }
                 (Some(_), Some(_)) => {
-                    // 2+ survivors → state stays Overflow, just delete
-                    // the target row. Some target rows past clustering
-                    // position 3 won't appear in the LIMIT 3 read — the
-                    // DELETE is correct regardless (idempotent if absent).
+                    let queries = store.queries();
+                    let delete = if is_prefix {
+                        &queries.delete_key_triggers_through
+                    } else {
+                        &queries.delete_key_trigger
+                    };
                     store
                         .execute_unpaged_discard(
-                            &store.queries().delete_key_trigger,
+                            delete,
                             (&segment_id, key.as_ref(), timer_type, time),
                         )
                         .await?;
+                    TimerState::Overflow
                 }
-            }
+            };
         }
         TimerState::Inline(_) | TimerState::Absent => {
             // Inline state guarantees zero clustering rows — nothing to
@@ -166,19 +152,8 @@ pub(super) async fn clear(
         return Ok(());
     }
 
-    // Atomic BATCH: clear clustering rows + remove state entry.
     store
-        .execute_unpaged_discard(
-            &store.queries().batch_clear_key_triggers,
-            (
-                &segment_id,
-                key.as_ref(),
-                timer_type,
-                timer_type,
-                &segment_id,
-                key.as_ref(),
-            ),
-        )
+        .batch_clear_key_triggers(&segment_id, key, timer_type)
         .await?;
 
     *guard = TimerState::Absent;
@@ -275,11 +250,10 @@ pub(super) async fn clear_all_types(
         return Ok(());
     }
 
-    // Atomic BATCH: clear all clustering rows + clear entire state column.
     store
         .execute_unpaged_discard(
-            &store.queries().batch_clear_key_triggers_all_types,
-            (&segment_id, key.as_ref(), &segment_id, key.as_ref()),
+            &store.queries().clear_key_triggers_all_types,
+            (&segment_id, key.as_ref()),
         )
         .await?;
 

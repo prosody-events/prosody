@@ -39,8 +39,8 @@ pub(super) struct ClusteringEntry<'a> {
     pub(super) tag: i32,
 }
 
-/// A single row returned by `peek_first_key_trigger`: trigger time, span, and
-/// tag.
+/// A single row returned by `peek_three_key_triggers`: trigger time, span,
+/// and tag.
 pub(super) type PeekedTrigger = (CompactDateTime, HashMap<String, String>, Option<i32>);
 
 /// Capacity for the per-partition state cache.
@@ -111,6 +111,16 @@ struct RawTimerState {
     /// Queued attempt identity (added by the `20260506_add_tag` migration).
     /// `None` for rows written before migration; normalised to `0`.
     tag: Option<i32>,
+}
+
+impl From<PeekedTrigger> for InlineTimer {
+    fn from((time, span, tag): PeekedTrigger) -> Self {
+        Self {
+            time,
+            span,
+            tag: tag.unwrap_or(0_i32),
+        }
+    }
 }
 
 impl SerializeValue for TimerState {
