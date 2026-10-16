@@ -22,52 +22,19 @@ use crate::consumer::sweep::drain_managers;
 use crate::consumer::{Managers, WatermarkVersion};
 use crate::heartbeat::Heartbeat;
 
-/// Configuration for the Kafka poll loop.
+/// Runs the Kafka poll loop until `shutdown` is set, then closes the client.
 ///
-/// # Type Parameters
-///
-/// * `Ctx` - The Kafka [`ConsumerContext`] the [`BaseConsumer`] runs under. The
-///   poller only calls `Consumer`-trait methods on it, so it stays agnostic to
-///   the provider generics baked into the context.
-pub struct PollConfig<'a, Ctx>
-where
-    Ctx: ConsumerContext,
-{
-    /// The longest time one poll waits for an event.
-    pub poll_interval: Duration,
-
-    /// The Kafka client. The loop holds the only strong reference that no
-    /// partition queue holds, and it drops the client when it stops.
-    pub consumer: Arc<BaseConsumer<Ctx>>,
-
-    /// Reference to counter tracking watermark version changes
-    pub watermark_version: &'a WatermarkVersion,
-
-    /// Reference to the collection of partition managers
-    pub managers: &'a Managers,
-
-    /// Reference to heartbeat for tracking liveness
-    pub heartbeat: &'a Heartbeat,
-
-    /// Flag for signaling polling loop shutdown
-    pub shutdown: &'a AtomicBool,
-}
-
-/// Runs the Kafka poll loop until the shutdown flag is set, then closes the
-/// client.
-///
-/// Each pass beats the heartbeat, stores the watermarks that advanced, and
-/// serves the events that arrive within one poll interval.
-pub fn poll<Ctx: ConsumerContext>(config: PollConfig<Ctx>) {
-    let PollConfig {
-        poll_interval,
-        consumer,
-        watermark_version,
-        managers,
-        heartbeat,
-        shutdown,
-    } = config;
-
+/// Each pass beats `heartbeat`, stores the watermarks that advanced, and
+/// serves the events that arrive within `poll_interval`. The loop holds the
+/// only reference to `consumer` that no partition queue holds.
+pub(super) fn poll<Ctx: ConsumerContext>(
+    poll_interval: Duration,
+    consumer: Arc<BaseConsumer<Ctx>>,
+    watermark_version: &WatermarkVersion,
+    managers: &Managers,
+    heartbeat: &Heartbeat,
+    shutdown: &AtomicBool,
+) {
     let mut last_version = watermark_version.load(Ordering::Acquire);
     while !shutdown.load(Ordering::Relaxed) {
         heartbeat.beat();
@@ -100,11 +67,11 @@ pub fn poll<Ctx: ConsumerContext>(config: PollConfig<Ctx>) {
 fn close<Ctx: ConsumerContext>(consumer: Arc<BaseConsumer<Ctx>>, managers: &Managers) {
     Handle::current().block_on(drain_managers(managers));
 
-    let Some(consumer) = Arc::into_inner(consumer) else {
-        error!("a partition queue outlived its partition; the client closes on another thread");
-        return;
-    };
-    drop(consumer);
+    if let Some(consumer) = Arc::into_inner(consumer) {
+        drop(consumer);
+    } else {
+        error!("a partition queue outlived its partition; the client closes elsewhere");
+    }
 }
 
 /// Stores the watermark of every partition when a watermark advanced since the

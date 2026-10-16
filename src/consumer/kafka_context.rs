@@ -133,16 +133,6 @@ where
 /// partition via its factory. During revocations, it ensures proper cleanup
 /// and graceful shutdown of partition processing.
 ///
-/// The context is generic only over what it actually uses at rebalance time:
-/// a partition-manager factory. The provider types
-/// (`HandlerProvider`/`TriggerStoreProvider`/`PartitionStateProvider`) are
-/// discharged once inside [`new_context`] and captured by the factory, so
-/// they never surface on the context itself.
-///
-/// # Type Parameters
-///
-/// * `F` - The partition-manager factory
-///
 /// # Invariant
 ///
 /// Every record of an assigned partition goes to that partition's queue, and
@@ -177,10 +167,8 @@ pub(super) struct Context<F: MakeManager> {
 /// Creates a new consumer context with the given configuration.
 ///
 /// Converts the consumer-level configuration into partition-level
-/// configuration and captures the handler provider and per-partition factories
-/// into a partition-manager factory. This discharges the provider trait bounds
-/// in one place; the returned [`Context`] carries only the payload-erased
-/// factory and the shared handles. `reader` reads the queue of each partition.
+/// configuration and captures it, the handler provider, and `reader` in the
+/// [`MakeManager`] of the context.
 ///
 /// # Errors
 ///

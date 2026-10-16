@@ -6,7 +6,7 @@ use crate::consumer::decode::ResultRequestReader;
 use crate::consumer::error::ConsumerError;
 use crate::consumer::handler::{EventHandler, HandlerProvider};
 use crate::consumer::kafka_context::{ContextHandles, PartitionProviders, new_context};
-use crate::consumer::poll::{PollConfig, poll};
+use crate::consumer::poll::poll;
 use crate::consumer::probes::ProbeServer;
 use crate::consumer::source::Reader;
 use crate::consumer::sweep::drain_managers;
@@ -139,14 +139,14 @@ where
     let cloned_shutdown = shutdown.clone();
 
     let poll_handle = spawn_blocking(move || {
-        poll(PollConfig {
+        poll(
             poll_interval,
             consumer,
-            watermark_version: &watermark_version,
-            managers: &cloned_managers,
-            heartbeat: &heartbeat,
-            shutdown: &cloned_shutdown,
-        });
+            &watermark_version,
+            &cloned_managers,
+            &heartbeat,
+            &cloned_shutdown,
+        );
     });
 
     let runtime_state = Arc::new(Mutex::new(Some(RuntimeState {
