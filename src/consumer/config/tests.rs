@@ -2,7 +2,7 @@
 
 use super::{
     ConsumerConfiguration, ConsumerConfigurationBuilder, DEFAULT_STATISTICS_INTERVAL,
-    MAX_STATISTICS_INTERVAL, validate_fetch_queue_backoff, validate_statistics_interval,
+    MAX_STATISTICS_INTERVAL, validate_statistics_interval,
 };
 use crate::ByteSize;
 use color_eyre::Result;
@@ -99,21 +99,6 @@ fn prop_fetch_max_bytes_accepts_only_what_librdkafka_carries(
     let config = required().fetch_max_bytes(limit).build()?;
     let carried = (1_000_000..=u64::from(i32::MAX.unsigned_abs()) - 512).contains(&limit.get());
     Ok(config.validate().is_ok() == carried)
-}
-
-/// A fetch queue backoff is accepted exactly when librdkafka can carry it: at
-/// most 5 minutes.
-///
-/// Falsify: remove the bound in [`validate_fetch_queue_backoff`].
-#[quickcheck]
-fn prop_fetch_queue_backoff_accepts_only_what_librdkafka_carries(
-    exponent: u8,
-    offset: u32,
-) -> bool {
-    // Up to about 35 years, so the 5 minute bound stays reachable.
-    let millis = (1_u64 << (exponent % 40)).saturating_add(u64::from(offset));
-    let backoff = Duration::from_millis(millis);
-    validate_fetch_queue_backoff(&backoff).is_ok() == (backoff <= Duration::from_mins(5))
 }
 
 /// The prefetch defaults survive their own validation, so a consumer that

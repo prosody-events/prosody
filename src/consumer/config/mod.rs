@@ -63,13 +63,6 @@ const MIN_FETCH_MAX_BYTES: u64 = 1_000_000;
 /// 512 bytes of framing inside a 32-bit size.
 const MAX_FETCH_MAX_BYTES: u64 = (1 << 31_u32) - 1 - 512;
 
-/// Default wait before a full partition fetches again. See
-/// [`ConsumerConfiguration::fetch_queue_backoff`].
-const DEFAULT_FETCH_QUEUE_BACKOFF: Duration = Duration::from_millis(10);
-
-/// Longest fetch queue backoff librdkafka accepts.
-const MAX_FETCH_QUEUE_BACKOFF: Duration = Duration::from_mins(5);
-
 /// Configuration for the Kafka consumer.
 ///
 /// This struct holds all the necessary configuration options for creating a
@@ -182,23 +175,6 @@ pub struct ConsumerConfiguration {
     )]
     #[validate(range(min = MIN_FETCH_MAX_BYTES, max = MAX_FETCH_MAX_BYTES))]
     pub fetch_max_bytes: ByteSize,
-
-    /// How long a full partition waits before it fetches again.
-    ///
-    /// Environment variable: `PROSODY_FETCH_QUEUE_BACKOFF`
-    /// Default: 10 milliseconds
-    ///
-    /// librdkafka checks a full partition again only after this wait. A read
-    /// of the partition does not end the wait early. A shorter wait refills a
-    /// fast partition sooner and checks more often. The accepted range is 0
-    /// to 5 minutes, in whole milliseconds.
-    #[builder(
-        default = "from_duration_env_with_fallback(\"PROSODY_FETCH_QUEUE_BACKOFF\", \
-                   DEFAULT_FETCH_QUEUE_BACKOFF)?",
-        setter(into)
-    )]
-    #[validate(custom(function = "validate_fetch_queue_backoff"))]
-    pub fetch_queue_backoff: Duration,
 
     /// Duration of inactivity allowed before considering a partition stalled.
     ///
@@ -477,14 +453,6 @@ fn validate_statistics_interval(interval: &Duration) -> Result<(), ValidationErr
     }
     if *interval > MAX_STATISTICS_INTERVAL {
         return Err(ValidationError::new("statistics_interval_above_24_hours"));
-    }
-    Ok(())
-}
-
-/// Accepts a fetch queue backoff that librdkafka can carry.
-fn validate_fetch_queue_backoff(backoff: &Duration) -> Result<(), ValidationError> {
-    if *backoff > MAX_FETCH_QUEUE_BACKOFF {
-        return Err(ValidationError::new("fetch_queue_backoff_above_5_minutes"));
     }
     Ok(())
 }

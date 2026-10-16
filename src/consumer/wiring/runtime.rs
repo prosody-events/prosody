@@ -25,10 +25,16 @@ use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::spawn_blocking;
 use validator::Validate;
 use whoami::hostname;
+
+/// How long librdkafka waits to fetch a full partition again. A read of the
+/// partition does not end the wait early, so the librdkafka default of one
+/// second stalls a fast partition after each fill.
+const FETCH_QUEUE_BACKOFF: Duration = Duration::from_millis(10);
 
 /// Everything startup needs beyond the consumer configuration and the two
 /// per-partition providers.
@@ -274,7 +280,7 @@ fn client_config(consumer_config: &ConsumerConfiguration) -> Result<ClientConfig
         )
         .set(
             "fetch.queue.backoff.ms",
-            consumer_config.fetch_queue_backoff.as_millis().to_string(),
+            FETCH_QUEUE_BACKOFF.as_millis().to_string(),
         )
         .set_log_level(RDKafkaLogLevel::Error);
     Ok(config)
