@@ -100,6 +100,9 @@ where
     ///
     /// `shutdown_rx` signals [`ShutdownPhase`] transitions: the main loop
     /// exits at `Draining` and the drain loop exits at `Terminating`.
+    ///
+    /// The drain drops the input stream and the queued messages, which never
+    /// start. So a drain holds only the resources of its in-flight tasks.
     pub async fn process_messages<S>(
         mut self,
         messages: S,
@@ -112,35 +115,39 @@ where
         F: FnMut(M) -> Fut,
         Fut: Future,
     {
-        pin_mut!(messages);
         let shutdown_rx = &mut shutdown_rx;
 
         // Main processing loop. Biased so the drain check always wins when
         // ready; other arms only fire while drain has not yet been signaled.
-        loop {
-            heartbeat.beat();
+        // The input stream drops at the end of this block.
+        {
+            pin_mut!(messages);
+            loop {
+                heartbeat.beat();
 
-            select! {
-                biased;
+                select! {
+                    biased;
 
-                // Exit as soon as draining begins
-                _ = shutdown_rx.wait_for(|v| *v >= ShutdownPhase::Draining) => break,
+                    // Exit as soon as draining begins
+                    _ = shutdown_rx.wait_for(|v| *v >= ShutdownPhase::Draining) => break,
 
-                // Process the next available message from the executing queue
-                Some(hash_value) = self.executing.next() => {
-                    self.handle_completion(hash_value);
+                    // Process the next available message from the executing queue
+                    Some(hash_value) = self.executing.next() => {
+                        self.handle_completion(hash_value);
+                    }
+
+                    // Fetch and process the next message from the input stream
+                    maybe_message = messages.next() => match maybe_message {
+                        None => break, // Stream ended
+                        Some(message) => self.dispatch_message(message),
+                    },
+
+                    // Ensure heartbeat is recorded even if nothing happens
+                    () = heartbeat.next() => {}
                 }
-
-                // Fetch and process the next message from the input stream
-                maybe_message = messages.next() => match maybe_message {
-                    None => break, // Stream ended
-                    Some(message) => self.dispatch_message(message),
-                },
-
-                // Ensure heartbeat is recorded even if nothing happens
-                () = heartbeat.next() => {}
             }
         }
+        self.enqueued.clear();
 
         // Drain in-flight tasks. The Terminating phase (sent after the full
         // shutdown_timeout) acts as the hard deadline; completing all tasks
@@ -155,8 +162,7 @@ where
                     break;
                 }
 
-                // Exit when all in-flight tasks complete; remaining enqueued
-                // messages are dropped with self
+                // Exit when all in-flight tasks complete
                 option = self.executing.next() => {
                     if option.is_none() {
                         break;
