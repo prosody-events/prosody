@@ -224,9 +224,8 @@ where
         let client_id = hostname().map_err(|error| KafkaLoaderError::Hostname(Arc::new(error)))?;
 
         // Point lookups don't benefit from prefetching. Start with small fetch
-        // sizes for ~1KB messages; rdkafka auto-adjusts if larger messages
-        // appear. fetch.max.bytes >= message.max.bytes is required by
-        // rdkafka.
+        // sizes for ~1KB messages; rdkafka auto-adjusts if larger messages appear.
+        // fetch.max.bytes >= message.max.bytes is required by rdkafka.
         let consumer: BaseConsumer = ClientConfig::new()
             .set("bootstrap.servers", config.bootstrap_servers.join(","))
             .set("client.id", &client_id)
@@ -318,8 +317,7 @@ where
         let instrument_span = Span::current();
         let cache_key = (topic, partition, offset);
 
-        // Get decoded message from cache or load from Kafka, tracking cache
-        // status
+        // Get decoded message from cache or load from Kafka, tracking cache status
         let (decoded_message, cached) = if let Some(cached) = self.cache.get(&cache_key) {
             instrument_span.record("cached", true);
             debug!(
@@ -335,7 +333,7 @@ where
             (decoded, false)
         };
 
-        Ok(decoded_message.into_record(Some(load_permit), |meta| {
+        Ok(decoded_message.into_record(load_permit, |meta| {
             create_load_span(meta, cached, self.message_spans)
         }))
     }
@@ -383,8 +381,7 @@ where
         // Wait for decoded message (decode permit was dropped in poll loop)
         let decoded = rx.await.map_err(|_| KafkaLoaderError::LoaderShutdown)??;
 
-        // Cache the decoded message (no permit needed, quick_cache manages
-        // capacity)
+        // Cache the decoded message (no permit needed, quick_cache manages capacity)
         let cache_key = (topic, partition, offset);
         self.cache.insert(cache_key, decoded.clone());
 

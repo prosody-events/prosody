@@ -199,7 +199,7 @@ impl<P: Send + Sync + 'static> MemoryLoader<P> {
         Ok(ConsumerRecord::Message(ConsumerMessage::from_decoded(
             message_value,
             span,
-            Some(permit),
+            permit,
         )))
     }
 }

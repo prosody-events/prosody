@@ -323,7 +323,6 @@ fn retain_manager(
     let partition_config = PartitionConfiguration {
         group_id: Arc::from(config.group_id.as_str()),
         max_uncommitted: 1,
-        handler_permits: Arc::new(Semaphore::new(1)),
         allowed_events: None,
         shutdown_timeout: Duration::from_secs(1),
         stall_threshold: config.stall_threshold,

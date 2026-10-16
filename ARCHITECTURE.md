@@ -39,16 +39,14 @@ graph TD
    it stores committed offsets.
 
 6. **Backpressure Management**: Prosody never pauses a partition. It bounds memory at three levels:
-    - **Decoded messages**: Each partition holds at most `PROSODY_MAX_UNCOMMITTED` uncommitted messages. A partition
-      at the limit stops reading.
+    - **Decoded messages**: A record is decoded only when it gets one of `PROSODY_MAX_UNCOMMITTED` in-flight permits,
+      shared by all partitions. It holds the permit until its offset commits. A partition without a permit stops
+      reading.
     - **Fetched records**: librdkafka stops fetching a partition when its queue holds `PROSODY_PARTITION_PREFETCH`
       bytes. The fetched records stay in librdkafka until the partition reads them. Other partitions continue to make
       progress.
-    - **Per-key queuing**: Each key has its own queue to preserve message order. The uncommitted limit of the
-      partition bounds these queues.
-
-   Handlers that run at once number at most `PROSODY_MAX_UNCOMMITTED` across all partitions. An event takes a handler
-   permit only when its key is free, so an event that waits behind a busy key holds none.
+    - **Per-key queuing**: Each key has its own queue to preserve message order. The in-flight permits bound these
+      queues.
 
 ## Message Flow
 
@@ -72,7 +70,7 @@ sequenceDiagram
 ```
 
 1. librdkafka fetches the records of each assigned partition into that partition's queue.
-2. The `PartitionManager` of the partition reads its queue and decodes the record.
+2. The `PartitionManager` of the partition reads its queue. It waits for an in-flight permit, then decodes the record.
 3. The `PartitionManager` enqueues the message in the correct key-based queue within `KeyManager`, according to the
    message key (e.g., User ID, Product ID).
 4. `KeyManager` dispatches messages for each key sequentially through the middleware stack, which applies retry,
@@ -81,7 +79,7 @@ sequenceDiagram
 6. The `PartitionManager`'s `OffsetTracker` tracks the partition's high watermark committed offset.
 7. The `Poll Loop` reads watermarks from each `PartitionManager` and stores them with librdkafka, which commits them
    back to Kafka asynchronously, ensuring at-least-once message processing semantics.
-8. If the partition holds `PROSODY_MAX_UNCOMMITTED` uncommitted messages, it stops reading. librdkafka keeps its fetched records and stops fetching
+8. If no in-flight permit is free, the partition stops reading. librdkafka keeps its fetched records and stops fetching
    the partition at `PROSODY_PARTITION_PREFETCH`.
 
 Throughout this flow, OpenTelemetry is used to create and propagate distributed traces, allowing for end-to-end

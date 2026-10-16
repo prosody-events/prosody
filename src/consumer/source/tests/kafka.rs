@@ -61,7 +61,7 @@ fn split_before_assign_survives_reassignment() -> Result<()> {
 /// Falsify: remove the callback in [`Reader::read`]. The reader then misses
 /// the first record that reaches its empty queue, and the read stops at its
 /// deadline. The race between the empty poll and the wait is too short to
-/// reach here; `prop_arrivals_reads_each_record_once_in_order` covers it.
+/// reach here; `prop_admit_reads_each_record_once_in_order` covers it.
 #[test]
 fn reader_wakes_for_each_arrival() -> Result<()> {
     TEST_RUNTIME.block_on(with_topic(&topic_name("wake"), 1, async |topic| {
@@ -71,7 +71,7 @@ fn reader_wakes_for_each_arrival() -> Result<()> {
             .ok_or_eyre("no partition queue")?;
         consumer.incremental_assign(&assignment(topic)?)?;
 
-        let reader = Reader::<JsonCodec, _>::new(IgnoreRequests, SpanRelation::default());
+        let reader = Reader::<JsonCodec, _>::new(1, IgnoreRequests, SpanRelation::default());
         let offsets = reader
             .read(queue)
             .map(|record| record.offset())

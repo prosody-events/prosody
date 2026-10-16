@@ -5,9 +5,8 @@ use aho_corasick::AhoCorasick;
 use async_stream::stream;
 use futures::stream::select;
 use futures::{Stream, StreamExt, pin_mut};
-use tokio::select;
 use tokio::spawn;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::watch;
 use tokio::task::coop::cooperative;
 use tokio::time::sleep;
 use tracing::{debug, error};
@@ -121,7 +120,6 @@ struct PartitionParams {
     group_id: Arc<str>,
     version: Arc<str>,
     allowed_events: Option<AhoCorasick>,
-    handler_permits: Arc<Semaphore>,
     timer_semaphores: Arc<TimerSemaphores>,
     telemetry_sender: TelemetrySender,
     timer_spans: SpanRelation,
@@ -150,7 +148,6 @@ pub(super) async fn handle_messages<T, S, SP, P, Q>(
         group_id,
         version,
         allowed_events,
-        handler_permits,
         trigger_provider,
         state_provider,
         timer_slab_size,
@@ -184,7 +181,6 @@ pub(super) async fn handle_messages<T, S, SP, P, Q>(
         group_id,
         version,
         allowed_events,
-        handler_permits,
         timer_semaphores,
         telemetry_sender,
         timer_spans,
@@ -221,7 +217,6 @@ async fn run_partition<T, S, M, P, Q>(
         group_id,
         version,
         allowed_events,
-        handler_permits,
         timer_semaphores,
         telemetry_sender,
         timer_spans,
@@ -271,16 +266,7 @@ async fn run_partition<T, S, M, P, Q>(
         }
     };
 
-    // An event takes a handler permit only when its key is free. An event that
-    // still waits for a permit when the partition drains never starts.
     let process = |event: UncommittedEvent<S, P>| async {
-        let mut draining = shutdown_rx.clone();
-        let _permit = select! {
-            biased;
-            _ = draining.wait_for(|phase| *phase >= ShutdownPhase::Draining) => return,
-            Ok(permit) = handler_permits.acquire() => permit,
-        };
-
         debug!(?event, "calling handler");
         process_event(
             event,

@@ -114,13 +114,11 @@ pub struct ConsumerConfiguration {
     /// Environment variable: `PROSODY_MAX_UNCOMMITTED`
     /// Default: 64
     ///
-    /// Limits the uncommitted messages of each partition. A message holds its
-    /// slot from decode until its offset commits. A partition at the limit
-    /// stops reading, and its fetched records wait in librdkafka. See
+    /// Controls the global limit of decoded messages in flight across all
+    /// partitions. A message holds its slot from decode until its offset
+    /// commits. At the limit, partitions stop reading, and their fetched
+    /// records wait in librdkafka. See
     /// [`partition_prefetch`](Self::partition_prefetch).
-    ///
-    /// Also limits the handlers that run at once, across all partitions. An
-    /// event that waits behind a busy key does not count.
     #[builder(
         default = "from_env_with_fallback(\"PROSODY_MAX_UNCOMMITTED\", 64)?",
         setter(into)

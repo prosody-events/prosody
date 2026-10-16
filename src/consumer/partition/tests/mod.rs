@@ -78,7 +78,6 @@ fn default_config()
         group_id: Arc::from("test-group"),
         version: Arc::from("1"),
         max_uncommitted: 10,
-        handler_permits: Arc::new(Semaphore::new(10)),
         allowed_events: None,
         shutdown_timeout: Duration::from_secs(1),
         stall_threshold: Duration::from_secs(1),
@@ -315,6 +314,5 @@ async fn test_partition_manager_is_stalled() -> color_eyre::Result<()> {
     Ok(())
 }
 
-mod permits;
 mod runtime;
 mod unwind;
