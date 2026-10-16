@@ -17,15 +17,14 @@ use futures::stream::FuturesUnordered;
 /// site, and nothing else in the crate mints or spends a `Swept`.
 pub(in crate::consumer) struct Swept(());
 
-/// Shuts down every partition manager the final revoke left behind.
+/// Shuts down every partition manager in `managers`.
 ///
-/// rdkafka skips its close-poll loop when the queue cannot be closed, and the
-/// final revoke never dispatches then. Each retained manager holds a handler
-/// clone, so this drain bounds consumer shutdown. After a
-/// normal revoke the map is already empty.
-pub(in crate::consumer) async fn drain_managers<P: Send + 'static>(
-    managers: &Managers<P>,
-) -> Swept {
+/// The poll loop runs this sweep before it drops the client, because each
+/// partition queue holds the client. The consumer runs it again after the
+/// poll loop joins. That second sweep finds the map empty unless the poll loop
+/// failed. Each retained manager holds a handler clone, so this drain bounds
+/// consumer shutdown.
+pub(in crate::consumer) async fn drain_managers(managers: &Managers) -> Swept {
     let draining: FuturesUnordered<_> = managers
         .write()
         .drain()

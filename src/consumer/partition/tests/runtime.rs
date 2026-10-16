@@ -12,7 +12,7 @@ async fn test_partition_manager_event_type_filtering() -> color_eyre::Result<()>
             .start_kind(StartKind::Anchored)
             .build(["allowed"])?,
     );
-    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
+    let (partition_manager, records) = start(config, handler.clone());
 
     let test_semaphore = Arc::new(Semaphore::new(10));
 
@@ -28,8 +28,7 @@ async fn test_partition_manager_event_type_filtering() -> color_eyre::Result<()>
         test_semaphore.clone().try_acquire_owned()?,
     );
     assert!(
-        partition_manager
-            .sender()
+        records
             .try_send(ConsumerRecord::Message(disallowed))
             .is_ok()
     );
@@ -45,12 +44,7 @@ async fn test_partition_manager_event_type_filtering() -> color_eyre::Result<()>
         Span::current(),
         test_semaphore.clone().try_acquire_owned()?,
     );
-    assert!(
-        partition_manager
-            .sender()
-            .try_send(ConsumerRecord::Message(allowed))
-            .is_ok()
-    );
+    assert!(records.try_send(ConsumerRecord::Message(allowed)).is_ok());
 
     let excise = ConsumerMessage::new(
         ConsumerMessageValue {
@@ -62,12 +56,7 @@ async fn test_partition_manager_event_type_filtering() -> color_eyre::Result<()>
         Span::current(),
         test_semaphore.try_acquire_owned()?,
     );
-    assert!(
-        partition_manager
-            .sender()
-            .try_send(ConsumerRecord::Excise(excise))
-            .is_ok()
-    );
+    assert!(records.try_send(ConsumerRecord::Excise(excise)).is_ok());
 
     wait_for_processed_offsets(&handler, 2, Duration::from_secs(1)).await?;
 
@@ -123,14 +112,11 @@ where
 /// `stall_threshold / HEARTBEAT_MARGIN`, so under normal dispatch only the
 /// offset half ever transitions — this asserts the composite once the edge
 /// fires to confirm it matches.
-pub(super) async fn wait_for_partition_stalled<P>(
-    partition_manager: &PartitionManager<P>,
+pub(super) async fn wait_for_partition_stalled(
+    partition_manager: &PartitionManager,
     expected: bool,
     timeout: Duration,
-) -> color_eyre::Result<()>
-where
-    P: Send + 'static,
-{
+) -> color_eyre::Result<()> {
     let deadline = Instant::now() + timeout;
     tokio::select! {
         result = partition_manager.offsets.wait_for_stall_state(expected) => result?,
@@ -284,7 +270,7 @@ async fn test_partition_manager_timer_heartbeat_integration() -> color_eyre::Res
     let handler = TestHandler::new();
     let mut config = default_config();
     config.stall_threshold = Duration::from_millis(200);
-    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
+    let (partition_manager, records) = start(config, handler.clone());
 
     // Initially, the partition should not be stalled
     assert!(
@@ -296,10 +282,7 @@ async fn test_partition_manager_timer_heartbeat_integration() -> color_eyre::Res
     // registering their heartbeats
     let message = create_test_message(1, "test-key")?;
     assert!(
-        partition_manager
-            .sender()
-            .try_send(ConsumerRecord::Message(message))
-            .is_ok(),
+        records.try_send(ConsumerRecord::Message(message)).is_ok(),
         "Message send should succeed"
     );
     wait_for_processed_offsets(&handler, 1, Duration::from_secs(1)).await?;

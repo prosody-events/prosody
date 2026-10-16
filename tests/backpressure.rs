@@ -139,9 +139,10 @@ async fn test_backpressure() -> Result<()> {
 /// segment, and one more record after it. A fetch at the marker returns no
 /// record, so librdkafka needs a second fetch to reach the next record.
 /// Partition 1 holds a backlog, and a slow handler keeps every in-flight permit
-/// busy. A pause between the two fetches resets partition 0 to the marker,
-/// and partition 0 then waits there for many seconds. A partition that gets
-/// past the marker delivers its next record after a few backlog records.
+/// busy. A pause between the two fetches would reset partition 0 to the
+/// marker, and partition 0 would then wait there for many seconds. The
+/// consumer never pauses, so partition 0 gets past the marker and delivers its
+/// next record after a few backlog records.
 #[tokio::test]
 async fn backpressure_moves_a_partition_past_an_empty_segment_tail() -> Result<()> {
     init_test_logging();

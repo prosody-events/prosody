@@ -1,11 +1,16 @@
 //! Human-readable byte budgets used at configuration boundaries.
 
+use serde::Serialize;
 use std::num::NonZeroU64;
 use std::str::FromStr;
 use thiserror::Error;
+use validator::ValidateRange;
 
 /// A positive byte count parsed from a human-readable size.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// It serializes as the byte count, so a validation error can report it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct ByteSize(NonZeroU64);
 
 impl ByteSize {
@@ -32,6 +37,18 @@ impl FromStr for ByteSize {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let bytes = parse_size::parse_size(value).map_err(ByteSizeError::Parse)?;
         NonZeroU64::new(bytes).map(Self).ok_or(ByteSizeError::Zero)
+    }
+}
+
+/// Lets a configuration field bound a byte size with `#[validate(range)]`, in
+/// bytes.
+impl ValidateRange<u64> for ByteSize {
+    fn greater_than(&self, max: u64) -> Option<bool> {
+        Some(self.get() > max)
+    }
+
+    fn less_than(&self, min: u64) -> Option<bool> {
+        Some(self.get() < min)
     }
 }
 

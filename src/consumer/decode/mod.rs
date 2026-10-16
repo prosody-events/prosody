@@ -25,12 +25,17 @@ use std::sync::Arc;
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::{Span, error};
 
-use crate::Codec;
 use crate::consumer::extractor::MessageExtractor;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, ConsumerRecord};
+use crate::otel::SpanRelation;
 use crate::peer::response::headers::{ResultRequest, parse_result_request};
 use crate::subsystem::SubsystemName;
-use crate::{Key, Offset, Partition, SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
+use crate::{
+    Codec, Key, Offset, Partition, SOURCE_SYSTEM_HEADER, SourceSystem, Topic, related_span,
+};
+
+#[cfg(test)]
+mod tests;
 
 /// A decoded Kafka message without live span references.
 ///
@@ -83,6 +88,23 @@ pub enum DecodedRecord<P> {
     Excise(DecodedMessage<()>),
 }
 
+impl RecordMeta<'_> {
+    /// Starts the "receive" span of a record and relates it to the producer's
+    /// trace context.
+    pub(crate) fn receive_span(self, relation: SpanRelation) -> Span {
+        related_span!(
+            relation,
+            self.parent_context.clone(),
+            "receive",
+            messaging.system = "kafka",
+            partition = self.partition,
+            offset = self.offset,
+            topic = %self.topic,
+            key = %self.key,
+        )
+    }
+}
+
 impl<P> DecodedMessage<P> {
     /// Borrows the metadata a record span is built from.
     pub(crate) fn meta(&self) -> RecordMeta<'_> {
@@ -128,6 +150,7 @@ pub(crate) trait ResultRequestReader: Send {
 }
 
 /// Ignores all result-request headers.
+#[derive(Clone, Copy)]
 pub(crate) struct IgnoreRequests;
 
 /// Decodes and validates a Kafka message into a `DecodedMessage`.
@@ -149,14 +172,14 @@ pub fn decode_message<C: Codec, R: ResultRequestReader>(
 ) -> Option<DecodedMessage<C::Payload>> {
     // SAFETY: librdkafka does not formally promise the payload is mutable,
     // but on the consumer poll path:
-    //   - `on_consume` interceptors run inside `rd_kafka_message_setup` before the
-    //     message is returned to the application, so no librdkafka-internal code
-    //     reads these bytes after delivery.
+    //   - `on_consume` interceptors run inside `rd_kafka_message_setup` before
+    //     the message is returned to the application, so no librdkafka-internal
+    //     code reads these bytes after delivery.
     //   - The payload occupies a disjoint slice of the refcounted fetch buffer;
     //     mutating it cannot corrupt sibling messages.
-    //   - `decode_message` is the only site in the crate that reads the borrowed
-    //     payload bytes, so the codec's destructive parse cannot affect downstream
-    //     code.
+    //   - `decode_message` is the only site in the crate that reads the
+    //     borrowed payload bytes, so the codec's destructive parse cannot
+    //     affect downstream code.
     // The audit boundary is the rdkafka version resolved in `Cargo.lock`, not
     // `Cargo.toml` (which uses caret semver and accepts any 0.39.x via
     // `cargo update`). Re-audit on any rdkafka bump, including patch updates.
