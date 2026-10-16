@@ -219,6 +219,7 @@ where
     let partition_config = PartitionConfiguration {
         group_id: Arc::from(config.group_id.as_str()),
         max_uncommitted: config.max_uncommitted,
+        handler_permits: Arc::new(Semaphore::new(config.max_uncommitted)),
         allowed_events,
         shutdown_timeout: config.shutdown_timeout,
         stall_threshold: config.stall_threshold,

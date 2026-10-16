@@ -100,11 +100,7 @@ where
         .map(|port| ProbeServer::new(port, managers.clone(), heartbeats.clone()))
         .transpose()?;
 
-    let reader = Reader::<C, _>::new(
-        consumer_config.max_uncommitted,
-        requests,
-        consumer_config.message_spans,
-    );
+    let reader = Reader::<C, _>::new(requests, consumer_config.message_spans);
     let started = start_client(
         consumer_config,
         handler_provider,

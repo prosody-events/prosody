@@ -265,8 +265,10 @@ struct ProcessingState {
     #[educe(Debug(ignore))]
     span: Span,
 
-    /// Permit used to bound buffering.
-    _permit: OwnedSemaphorePermit,
+    /// The permit of the loader that read this message, which bounds its
+    /// buffered loads. A consumed message has none: the offset tracker of its
+    /// partition bounds it.
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 /// The full data and metadata for a consumer message.
@@ -337,28 +339,18 @@ impl<P> ConsumerMessage<P> {
     /// components.
     #[must_use]
     pub fn new(value: ConsumerMessageValue<P>, span: Span, permit: OwnedSemaphorePermit) -> Self {
-        let value = Arc::new(value);
-        let processing_state = ArcSwapOption::from_pointee(ProcessingState {
-            span,
-            _permit: permit,
-        })
-        .into();
-
-        Self {
-            value,
-            processing_state,
-        }
+        Self::from_decoded(Arc::new(value), span, Some(permit))
     }
 
     /// Create a `ConsumerMessage` from a decoded message with processing state.
     ///
     /// This is used after `decode_message` returns a `DecodedMessage` to
-    /// attach the semaphore permit and span for the processing phase.
+    /// attach the span and any loader permit for the processing phase.
     #[must_use]
     pub fn from_decoded(
         value: Arc<ConsumerMessageValue<P>>,
         span: Span,
-        permit: OwnedSemaphorePermit,
+        permit: Option<OwnedSemaphorePermit>,
     ) -> Self {
         let processing_state = ArcSwapOption::from_pointee(ProcessingState {
             span,

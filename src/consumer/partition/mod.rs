@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tokio::spawn;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 use tracing::{debug, error, instrument};
@@ -121,8 +121,14 @@ pub struct PartitionConfiguration<S, SP, P> {
     /// Consumer group identifier
     pub group_id: Arc<str>,
 
-    /// Maximum number of uncommitted messages allowed
+    /// Maximum number of uncommitted messages of this partition. A partition
+    /// at the limit stops reading, so this bounds its decoded messages.
     pub max_uncommitted: usize,
+
+    /// Bounds the events whose handlers run at once, across all partitions.
+    /// An event takes a permit only when its key is free, so an event that
+    /// waits behind a busy key holds none.
+    pub handler_permits: Arc<Semaphore>,
 
     /// Optional automaton for filtering messages by event type
     pub allowed_events: Option<AhoCorasick>,

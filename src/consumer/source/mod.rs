@@ -5,9 +5,10 @@
 //! and only the partition task reads it. [`Reader::read`] turns the queue into
 //! the record stream of the partition task.
 //!
-//! Prosody never pauses a partition. A partition without an in-flight permit
-//! stops reading, and its fetched records stay in librdkafka. librdkafka stops
-//! fetching a partition when its queue holds the
+//! Prosody never pauses a partition. A partition that holds
+//! [`max_uncommitted`](crate::consumer::ConsumerConfiguration::max_uncommitted)
+//! uncommitted messages stops reading, and its fetched records stay in
+//! librdkafka. librdkafka stops fetching a partition when its queue holds the
 //! [`partition_prefetch`](crate::consumer::ConsumerConfiguration::partition_prefetch).
 //! A pause would discard those records and fetch them again.
 
@@ -20,7 +21,7 @@ use educe::Educe;
 use futures::{Stream, StreamExt, pin_mut};
 use rdkafka::consumer::ConsumerContext;
 use rdkafka::consumer::base_consumer::PartitionQueue;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Notify;
 use tracing::error;
 
 use crate::Codec;
@@ -37,15 +38,11 @@ mod tests;
 ///
 /// # Invariant
 ///
-/// A record is decoded only while it holds one of `permits`. The record keeps
-/// the permit until it completes. So the consumer holds at most
-/// `max_uncommitted` decoded records, across all partitions.
+/// A record is decoded only when the partition task asks for the next record.
+/// So the reader adds no buffer of its own.
 #[derive(Educe)]
 #[educe(Clone(bound(R: Clone)))]
 pub(crate) struct Reader<C, R> {
-    /// Limits the records in flight across all partitions.
-    permits: Arc<Semaphore>,
-
     /// Reads the result-request headers that this consumer answers.
     requests: R,
 
@@ -60,10 +57,10 @@ where
     C: Codec,
     R: ResultRequestReader + 'static,
 {
-    /// Creates a reader that allows `max_in_flight` records in flight.
-    pub(crate) fn new(max_in_flight: usize, requests: R, spans: SpanRelation) -> Self {
+    /// Creates a reader that answers `requests` and relates each receive span
+    /// to its producer by `spans`.
+    pub(crate) fn new(requests: R, spans: SpanRelation) -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(max_in_flight)),
             requests,
             spans,
             _codec: PhantomData,
@@ -84,18 +81,15 @@ where
         queue.set_nonempty_callback(move || notify.notify_one());
 
         let Self {
-            permits,
-            requests,
-            spans,
-            ..
+            requests, spans, ..
         } = self.clone();
 
         stream! {
             let propagator = new_propagator();
-            let admitted = admit(|| queue.poll(Duration::ZERO), &ready, &permits);
-            pin_mut!(admitted);
+            let arrived = arrivals(|| queue.poll(Duration::ZERO), &ready);
+            pin_mut!(arrived);
 
-            while let Some((polled, permit)) = admitted.next().await {
+            while let Some(polled) = arrived.next().await {
                 let mut message = match polled {
                     Ok(message) => message,
                     Err(error) => {
@@ -108,46 +102,35 @@ where
                     decode_record(&mut message, &propagator, codec, &requests)
                 });
                 if let Some(decoded) = decoded {
-                    yield decoded.into_record(permit, |meta| meta.receive_span(spans));
+                    yield decoded.into_record(None, |meta| meta.receive_span(spans));
                 }
             }
         }
     }
 }
 
-/// Pairs each item that `poll` returns with an in-flight permit, in order.
+/// Yields each item that `poll` returns, in order, and waits on `ready` when
+/// `poll` finds nothing.
 ///
 /// `poll` must not block. It returns `None` when the queue is empty. `ready`
 /// must get a `notify_one` each time the queue changes from empty to not
 /// empty.
 ///
-/// # Invariants
+/// # Invariant
 ///
-/// - **At most one item waits.** The stream polls an item only after it yields
-///   the previous one. While it waits for a permit, it holds that one item, and
-///   the rest stay in the queue.
-/// - **No lost wakeup.** The stream waits on `ready` only after `poll` returns
-///   `None`. An item that arrives after that check calls `notify_one`, which
-///   stores a permit when nothing waits yet. So the wait ends at once. The
-///   stream polls again after each permit, so a queue that filled while the
-///   stream waited for a permit gets read without a new notification.
-fn admit<'a, M: 'a>(
+/// **No lost wakeup.** The stream waits on `ready` only after `poll` returns
+/// `None`. An item that arrives after that check calls `notify_one`, which
+/// [`Notify`] keeps when nothing waits yet. So the wait ends at once.
+fn arrivals<'a, M: 'a>(
     mut poll: impl FnMut() -> Option<M> + 'a,
     ready: &'a Notify,
-    permits: &'a Arc<Semaphore>,
-) -> impl Stream<Item = (M, OwnedSemaphorePermit)> + 'a {
+) -> impl Stream<Item = M> + 'a {
     stream! {
         loop {
-            let Some(item) = poll() else {
-                ready.notified().await;
-                continue;
-            };
-
-            // Nothing closes the semaphore.
-            let Ok(permit) = Arc::clone(permits).acquire_owned().await else {
-                break;
-            };
-            yield (item, permit);
+            match poll() {
+                Some(item) => yield item,
+                None => ready.notified().await,
+            }
         }
     }
 }

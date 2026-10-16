@@ -129,7 +129,7 @@ impl<P> DecodedRecord<P> {
 
     pub(crate) fn into_record(
         self,
-        permit: OwnedSemaphorePermit,
+        permit: Option<OwnedSemaphorePermit>,
         span: impl FnOnce(RecordMeta<'_>) -> Span,
     ) -> ConsumerRecord<P> {
         let span = span(self.meta());
