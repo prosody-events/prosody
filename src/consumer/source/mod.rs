@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::stream;
+use educe::Educe;
 use futures::{Stream, StreamExt, pin_mut};
 use rdkafka::consumer::ConsumerContext;
 use rdkafka::consumer::base_consumer::PartitionQueue;
@@ -39,6 +40,8 @@ mod tests;
 /// A record is decoded only while it holds one of `permits`. The record keeps
 /// the permit until it completes. So the consumer holds at most
 /// `max_uncommitted` decoded records, across all partitions.
+#[derive(Educe)]
+#[educe(Clone(bound(R: Clone)))]
 pub(crate) struct Reader<C, R> {
     /// Limits the records in flight across all partitions.
     permits: Arc<Semaphore>,
@@ -50,17 +53,6 @@ pub(crate) struct Reader<C, R> {
     spans: SpanRelation,
 
     _codec: PhantomData<fn() -> C>,
-}
-
-impl<C, R: Clone> Clone for Reader<C, R> {
-    fn clone(&self) -> Self {
-        Self {
-            permits: Arc::clone(&self.permits),
-            requests: self.requests.clone(),
-            spans: self.spans,
-            _codec: PhantomData,
-        }
-    }
 }
 
 impl<C, R> Reader<C, R>

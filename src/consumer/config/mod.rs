@@ -37,7 +37,7 @@ const MAX_STATISTICS_INTERVAL: Duration = Duration::from_hours(24);
 
 /// Default prefetch of each partition. See
 /// [`ConsumerConfiguration::partition_prefetch`].
-const DEFAULT_PARTITION_PREFETCH: ByteSize = match NonZeroU64::new(256 << 10_u32) {
+const DEFAULT_PARTITION_PREFETCH: ByteSize = match NonZeroU64::new(1 << 20_u32) {
     Some(bytes) => ByteSize::new(bytes),
     None => ByteSize::new(NonZeroU64::MIN),
 };
@@ -143,7 +143,7 @@ pub struct ConsumerConfiguration {
     /// The bytes that each assigned partition fetches ahead of its handlers.
     ///
     /// Environment variable: `PROSODY_PARTITION_PREFETCH`
-    /// Default: 256 KiB
+    /// Default: 1 MiB
     ///
     /// librdkafka stops fetching a partition when its queue holds this many
     /// bytes. One fetch adds at most this many bytes for a partition, but it
