@@ -26,7 +26,7 @@ the default for its target. A bare level below `warn` also applies to `scylla` a
 |----------------------------------|------------------------------------------------------|------------------------|
 | `PROSODY_MAX_CONCURRENCY`        | Max messages being processed simultaneously          | 32                     |
 | `PROSODY_MAX_UNCOMMITTED`        | Max decoded messages in flight across all partitions | 64                     |
-| `PROSODY_PARTITION_PREFETCH`     | Bytes each partition fetches ahead of its handlers; also the fetch size of one partition (1 KiB to 1 GB) | 1 MiB |
+| `PROSODY_PARTITION_PREFETCH`     | Bytes each partition fetches ahead of its handlers; also the fetch size of one partition (1 KiB to 1 GB) | 128 KiB |
 | `PROSODY_FETCH_MAX_BYTES`        | Size limit of one fetch response from one broker (1 MB to 2 GiB less 512 bytes) | 50 MiB |
 | `PROSODY_TIMEOUT`                | Cancel handler if it runs longer than this           | 80% of stall threshold |
 | `PROSODY_COMMIT_INTERVAL`        | How often to save progress to Kafka                  | 1s                     |

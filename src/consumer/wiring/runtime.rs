@@ -32,9 +32,9 @@ use validator::Validate;
 use whoami::hostname;
 
 /// How long librdkafka waits to fetch a full partition again. A read of the
-/// partition does not end the wait early, so the librdkafka default of one
-/// second stalls a fast partition after each fill.
-const FETCH_QUEUE_BACKOFF: Duration = Duration::from_millis(10);
+/// partition does not end the wait early, so a partition refills at most once
+/// per wait. A short wait lets a small prefetch keep a fast partition busy.
+const FETCH_QUEUE_BACKOFF: Duration = Duration::from_millis(1);
 
 /// Everything startup needs beyond the consumer configuration and the two
 /// per-partition providers.

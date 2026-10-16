@@ -36,7 +36,7 @@ const MAX_STATISTICS_INTERVAL: Duration = Duration::from_hours(24);
 
 /// Default prefetch of each partition. See
 /// [`ConsumerConfiguration::partition_prefetch`].
-const DEFAULT_PARTITION_PREFETCH: ByteSize = ByteSize::mebibytes(1);
+const DEFAULT_PARTITION_PREFETCH: ByteSize = ByteSize::bytes(128 << 10_u32);
 
 /// Smallest prefetch librdkafka accepts: its queue limit counts whole KiB.
 const MIN_PARTITION_PREFETCH: u64 = 1 << 10_u32;
@@ -46,7 +46,7 @@ const MAX_PARTITION_PREFETCH: u64 = 1_000_000_000;
 
 /// Default size limit of one fetch response. See
 /// [`ConsumerConfiguration::fetch_max_bytes`].
-const DEFAULT_FETCH_MAX_BYTES: ByteSize = ByteSize::mebibytes(50);
+const DEFAULT_FETCH_MAX_BYTES: ByteSize = ByteSize::bytes(50 << 20_u32);
 
 /// Smallest fetch response limit librdkafka accepts: the largest record it
 /// accepts (`message.max.bytes`, 1 MB by default).
@@ -129,13 +129,14 @@ pub struct ConsumerConfiguration {
     /// The bytes that each assigned partition fetches ahead of its handlers.
     ///
     /// Environment variable: `PROSODY_PARTITION_PREFETCH`
-    /// Default: 1 MiB
+    /// Default: 128 KiB
     ///
     /// librdkafka stops fetching a partition when its queue holds this many
     /// bytes. One fetch adds at most this many bytes for a partition, but it
     /// always returns at least one record batch. So the fetched records of a
-    /// partition take at most two times this value, plus one batch. A larger
-    /// value lets a fast partition run longer between fetches.
+    /// partition take at most two times this value, plus one batch. This
+    /// memory grows with the assigned partitions. A larger value lets a fast
+    /// partition run longer between fetches.
     ///
     /// Accepts a human-readable byte size such as `1 MiB`. A bare number is
     /// interpreted as bytes. The accepted range is 1 KiB to 1 GB.
