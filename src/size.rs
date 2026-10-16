@@ -20,6 +20,15 @@ impl ByteSize {
         Self(bytes)
     }
 
+    /// Creates a byte size of `count` mebibytes, for a constant default. A
+    /// zero count gives one byte.
+    pub(crate) const fn mebibytes(count: u64) -> Self {
+        match NonZeroU64::new(count.saturating_mul(1 << 20_u32)) {
+            Some(bytes) => Self(bytes),
+            None => Self(NonZeroU64::MIN),
+        }
+    }
+
     /// Returns the byte count.
     #[must_use]
     pub const fn get(self) -> u64 {

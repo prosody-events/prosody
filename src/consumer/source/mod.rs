@@ -58,7 +58,7 @@ pub(crate) struct Reader<C, R> {
 impl<C, R> Reader<C, R>
 where
     C: Codec,
-    R: ResultRequestReader + Clone + 'static,
+    R: ResultRequestReader + 'static,
 {
     /// Creates a reader that allows `max_in_flight` records in flight.
     pub(crate) fn new(max_in_flight: usize, requests: R, spans: SpanRelation) -> Self {

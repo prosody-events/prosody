@@ -7,9 +7,7 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
 use crate::telemetry::Telemetry;
 use crate::test_util::TEST_RUNTIME;
-use crate::test_util::kafka::{
-    self, admin, create_topic as create_topic_with_partitions, delete_topic,
-};
+use crate::test_util::kafka::{self, BOOTSTRAP, admin, create_topic, delete_topic};
 use crate::tracing::init_test_logging;
 use crate::{Offset, Partition, Topic};
 use ahash::AHashMap;
@@ -35,7 +33,7 @@ fn test_topic(name: &str) -> String {
 
 fn loader_config() -> LoaderConfiguration {
     LoaderConfiguration {
-        bootstrap_servers: vec!["localhost:9094".to_owned()],
+        bootstrap_servers: vec![BOOTSTRAP.to_owned()],
         group_id: "prosody-test".to_owned(),
         max_permits: 10,
         cache_size: 1, // Minimal size to stress test deadlock prevention and eviction
@@ -77,7 +75,7 @@ async fn try_load_reports_transient_capacity_exhaustion() -> color_eyre::Result<
 
 fn producer() -> color_eyre::Result<FutureProducer> {
     let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9094")
+        .set("bootstrap.servers", BOOTSTRAP)
         .create()?;
     Ok(producer)
 }
@@ -158,7 +156,7 @@ async fn delete_records_multi(
 fn watermark_consumer() -> color_eyre::Result<Arc<BaseConsumer>> {
     Ok(Arc::new(
         ClientConfig::new()
-            .set("bootstrap.servers", "localhost:9094")
+            .set("bootstrap.servers", BOOTSTRAP)
             .set("group.id", "prosody-test-setup")
             .create()?,
     ))

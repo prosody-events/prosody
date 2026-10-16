@@ -75,7 +75,7 @@ where
         EventSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
     C::Payload: EventType + Clone + EventIdentity,
-    R: ResultRequestReader + Clone + Sync + 'static,
+    R: ResultRequestReader + 'static,
 {
     consumer_config.validate()?;
     let StartupServices {
@@ -195,7 +195,7 @@ where
         EventSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
     C::Payload: EventType + Clone + EventIdentity,
-    R: ResultRequestReader + Clone + Sync + 'static,
+    R: ResultRequestReader + 'static,
 {
     let consumer_config = consumer_config.clone();
     spawn_blocking(move || {

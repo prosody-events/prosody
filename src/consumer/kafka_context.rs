@@ -109,7 +109,7 @@ where
         EventSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
     C::Payload: Clone + EventType + EventIdentity,
-    R: ResultRequestReader + Clone + Sync + 'static,
+    R: ResultRequestReader + 'static,
 {
     fn make<Ctx: ConsumerContext + 'static>(
         &self,
@@ -205,7 +205,7 @@ where
         EventSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
     C::Payload: Clone + EventType + EventIdentity,
-    R: ResultRequestReader + Clone + Sync + 'static,
+    R: ResultRequestReader + 'static,
 {
     // Compile the event-type filter automaton from the configured
     // prefixes; payloads supply their event type via [`EventType`].

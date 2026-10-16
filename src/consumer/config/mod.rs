@@ -20,7 +20,6 @@ use crate::util::{
 use crate::{ByteSize, Codec};
 use derive_builder::Builder;
 use std::env::var;
-use std::num::NonZeroU64;
 use std::time::Duration;
 use thiserror::Error;
 use validator::{Validate, ValidationError};
@@ -37,10 +36,7 @@ const MAX_STATISTICS_INTERVAL: Duration = Duration::from_hours(24);
 
 /// Default prefetch of each partition. See
 /// [`ConsumerConfiguration::partition_prefetch`].
-const DEFAULT_PARTITION_PREFETCH: ByteSize = match NonZeroU64::new(1 << 20_u32) {
-    Some(bytes) => ByteSize::new(bytes),
-    None => ByteSize::new(NonZeroU64::MIN),
-};
+const DEFAULT_PARTITION_PREFETCH: ByteSize = ByteSize::mebibytes(1);
 
 /// Smallest prefetch librdkafka accepts: its queue limit counts whole KiB.
 const MIN_PARTITION_PREFETCH: u64 = 1 << 10_u32;
@@ -50,10 +46,7 @@ const MAX_PARTITION_PREFETCH: u64 = 1_000_000_000;
 
 /// Default size limit of one fetch response. See
 /// [`ConsumerConfiguration::fetch_max_bytes`].
-const DEFAULT_FETCH_MAX_BYTES: ByteSize = match NonZeroU64::new(50 << 20_u32) {
-    Some(bytes) => ByteSize::new(bytes),
-    None => ByteSize::new(NonZeroU64::MIN),
-};
+const DEFAULT_FETCH_MAX_BYTES: ByteSize = ByteSize::mebibytes(50);
 
 /// Smallest fetch response limit librdkafka accepts: the largest record it
 /// accepts (`message.max.bytes`, 1 MB by default).

@@ -145,7 +145,9 @@ impl<P> DecodedRecord<P> {
 }
 
 /// Reads result-request headers that this consumer can answer.
-pub(crate) trait ResultRequestReader: Send {
+///
+/// Every partition reads through its own clone of one reader.
+pub(crate) trait ResultRequestReader: Clone + Send + Sync {
     fn request(&self, message: &BorrowedMessage) -> Option<ResultRequest>;
 }
 

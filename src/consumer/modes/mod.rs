@@ -49,7 +49,7 @@ where
     type Provider: FallibleHandlerProvider<
         Handler: FallibleHandler<Payload = H::Payload> + SettlementHandler,
     >;
-    type Requests: ResultRequestReader + Clone + Sync + 'static;
+    type Requests: ResultRequestReader + 'static;
 
     fn request_subsystem(&self) -> Option<&SubsystemName>;
     fn into_parts(self, handler: H) -> (Self::Provider, Self::Requests);

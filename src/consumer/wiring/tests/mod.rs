@@ -394,7 +394,7 @@ fn recording_memory_deps(
     StateReaderDependencies::from_parts(backend, deps.cache().clone())
 }
 
-async fn start<R: ResultRequestReader + Clone + Sync + 'static>(
+async fn start<R: ResultRequestReader + 'static>(
     config: &ConsumerConfiguration,
     managers: Arc<Managers>,
     heartbeats: HeartbeatRegistry,

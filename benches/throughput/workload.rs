@@ -29,8 +29,9 @@ const ENVELOPE_BYTES: usize = 80;
 pub(crate) struct Workload {
     pub(crate) topic: Topic,
     pub(crate) messages: u32,
-    /// The mean serialized payload size in bytes.
-    pub(crate) mean_bytes: f64,
+    /// The serialized size of each payload in bytes. All payloads of a
+    /// workload have the same size.
+    pub(crate) payload_bytes: f64,
     admin: &'static ProsodyAdminClient,
 }
 
@@ -44,6 +45,8 @@ impl Workload {
     ///
     /// Returns an error if the topic cannot be created or a send fails.
     pub(crate) async fn load(settings: &Settings, size: usize) -> Result<(Self, Duration)> {
+        let fields = size.saturating_sub(ENVELOPE_BYTES) / FIELD_BYTES;
+        let payload_bytes = payload_bytes(fields)?;
         let topic: Topic = format!("prosody-bench-{}", Uuid::new_v4()).as_str().into();
         let admin =
             ProsodyAdminClient::cached(&AdminConfiguration::new(settings.bootstrap.clone())?)?;
@@ -60,22 +63,13 @@ impl Workload {
         let workload = Self {
             topic,
             messages: settings.messages_for(size),
-            mean_bytes: 0.0,
+            payload_bytes,
             admin,
         };
 
         let started = Instant::now();
-        match workload.produce(settings, size).await {
-            Ok(bytes) => {
-                let mean_bytes = bytes / f64::from(workload.messages);
-                Ok((
-                    Self {
-                        mean_bytes,
-                        ..workload
-                    },
-                    started.elapsed(),
-                ))
-            }
+        match workload.produce(settings, fields).await {
+            Ok(()) => Ok((workload, started.elapsed())),
             Err(error) => {
                 workload.delete().await;
                 Err(error)
@@ -91,7 +85,7 @@ impl Workload {
         }
     }
 
-    async fn produce(&self, settings: &Settings, size: usize) -> Result<f64> {
+    async fn produce(&self, settings: &Settings, fields: usize) -> Result<()> {
         let producer = ProsodyProducer::<JsonCodec>::new(
             &ProducerConfiguration::builder()
                 .bootstrap_servers(settings.bootstrap.clone())
@@ -100,7 +94,6 @@ impl Workload {
             Telemetry::new().sender(),
         )?;
 
-        let fields = size.saturating_sub(ENVELOPE_BYTES) / FIELD_BYTES;
         let keys = settings.keys.max(1);
 
         stream::iter(0..self.messages)
@@ -108,14 +101,13 @@ impl Workload {
                 let producer = &producer;
                 let payload = payload(fields);
                 async move {
-                    let bytes = payload_len(&payload);
                     let key = format!("key-{}", index % keys);
                     producer.send([], self.topic, &key, payload).await?;
-                    Ok::<_, color_eyre::Report>(bytes)
+                    Ok::<_, color_eyre::Report>(())
                 }
             })
             .buffer_unordered(LOAD_CONCURRENCY)
-            .try_fold(0.0_f64, |total, bytes| async move { Ok(total + bytes) })
+            .try_collect()
             .await
     }
 }
@@ -141,9 +133,9 @@ fn payload(fields: usize) -> Value {
     })
 }
 
-fn payload_len(payload: &Value) -> f64 {
-    serde_json::to_vec(payload)
-        .ok()
-        .and_then(|bytes| u32::try_from(bytes.len()).ok())
-        .map_or(0.0, f64::from)
+/// The serialized size of a payload with `fields` fields. The size does not
+/// depend on the random values, so one sample gives the size of every payload.
+fn payload_bytes(fields: usize) -> Result<f64> {
+    let bytes = serde_json::to_vec(&payload(fields))?.len();
+    Ok(f64::from(u32::try_from(bytes)?))
 }

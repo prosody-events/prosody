@@ -94,7 +94,7 @@ async fn run_layers(
             "{size:>7} {layer:>11} {:>8} {:>8.1}s {rate:>10.0} {:>9.1}",
             measurement.messages,
             measurement.startup.as_secs_f64(),
-            rate * workload.mean_bytes / f64::from(1_u32 << 20_u32),
+            rate * workload.payload_bytes / f64::from(1_u32 << 20_u32),
         )?;
         out.flush()?;
     }

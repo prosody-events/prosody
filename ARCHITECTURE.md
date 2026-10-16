@@ -38,7 +38,7 @@ graph TD
    its records, so decoding runs on all runtime threads. One poll loop serves rebalances, statistics, and errors, and
    it stores committed offsets.
 
-6. **Backpressure Management**: Prosody never pauses a partition. It bounds memory at two levels:
+6. **Backpressure Management**: Prosody never pauses a partition. It bounds memory at three levels:
     - **Decoded messages**: A record is decoded only when it gets one of `PROSODY_MAX_UNCOMMITTED` in-flight permits,
       shared by all partitions. It holds the permit until its offset commits. A partition without a permit stops
       reading.
