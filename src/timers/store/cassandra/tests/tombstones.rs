@@ -15,27 +15,19 @@ use crate::timers::store::cassandra::state::{PeekedTrigger, TimerState};
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::{TimerType, Trigger};
 use crate::tracing::init_test_logging;
-use color_eyre::eyre::{Report, Result, eyre};
+use color_eyre::eyre::{Result, eyre};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use scylla::response::query_result::QueryRowsResult;
 use scylla::serialize::row::SerializeRow;
 use scylla::statement::prepared::PreparedStatement;
 use std::collections::{BTreeSet, HashMap};
-use std::time::Duration;
 use strum::VariantArray;
-use tokio::time::{interval, timeout};
 use uuid::Uuid;
 
 /// Tombstone cells that one type-scoped read may count with no strays: the
 /// two markers of a type-wide range tombstone and the boundary that a newer
 /// prefix delete adds.
 const RANGE_MARKERS: u64 = 3;
-
-/// Interval between polls for a trace's read summary.
-const TRACE_POLL: Duration = Duration::from_millis(5);
-
-/// Hang guard for a trace's read summary.
-const TRACE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// One step of a key's timer history. Times are seconds in a narrow window,
 /// so deletes often hit live timers.
@@ -181,10 +173,9 @@ async fn run(trace: Vec<Step>) -> Result<bool> {
                 ty.delete(time);
             }
             Action::Unschedule(at) => {
-                store
-                    .delete_key_trigger(timer_type, &key, at.into())
-                    .await?;
-                ty.delete(at.into());
+                let time = at.into();
+                store.delete_key_trigger(timer_type, &key, time).await?;
+                ty.delete(time);
             }
             Action::Reschedule(at) => {
                 store.clear_and_schedule_key(trigger(at)).await?;
@@ -287,34 +278,24 @@ async fn traced(
         .tracing_id()
         .ok_or_else(|| eyre!("traced read returned no tracing id"))?;
 
-    // Cassandra writes trace events asynchronously and gives no signal when
-    // they land, so the read summary can trail the finished session. Poll for
-    // it, as the driver's own `get_tracing_info` does.
-    let summary = async {
-        let mut ticks = interval(TRACE_POLL);
-        loop {
-            ticks.tick().await;
-            let info = store.session().get_tracing_info(&id).await?;
-            let cells = info
-                .events
-                .iter()
-                .find_map(|event| tombstone_cells(event.activity.as_deref()?));
-            if let Some(cells) = cells {
-                return Ok::<_, Report>(cells);
-            }
-        }
-    };
-    let tombstones = timeout(TRACE_DEADLINE, summary)
-        .await
-        .map_err(|_| eyre!("trace {id} has no read summary"))??;
+    // The test cluster sets `cassandra.wait_for_tracing_events_timeout_secs`,
+    // so a finished session already holds every event.
+    let info = store.session().get_tracing_info(&id).await?;
+    let tombstones = info
+        .events
+        .iter()
+        .find_map(|event| tombstone_cells(event.activity.as_deref()?))
+        .ok_or_else(|| eyre!("trace {id} has no read summary"))?
+        .parse()?;
 
     Ok((result.into_rows_result()?, tombstones))
 }
 
-/// Parses Cassandra's `Read N live rows and M tombstone cells` trace event.
-fn tombstone_cells(activity: &str) -> Option<u64> {
+/// Extracts `M` from Cassandra's `Read N live rows and M tombstone cells`
+/// trace event.
+fn tombstone_cells(activity: &str) -> Option<&str> {
     let (_, rest) = activity
         .strip_prefix("Read ")?
         .split_once(" live rows and ")?;
-    rest.split_once(" tombstone cells")?.0.parse().ok()
+    Some(rest.split_once(" tombstone cells")?.0)
 }
