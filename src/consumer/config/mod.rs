@@ -1,7 +1,6 @@
 //! Consumer and mode configuration, including shared keyed-state and dedup
 //! settings.
 
-use crate::Codec;
 use crate::consumer::middleware::deduplication::DeduplicationConfiguration;
 use crate::consumer::middleware::defer::DeferConfiguration;
 use crate::consumer::middleware::monopolization::MonopolizationConfiguration;
@@ -18,6 +17,7 @@ use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
     from_option_env_with_fallback, from_optional_vec_env, from_vec_env,
 };
+use crate::{ByteSize, Codec};
 use derive_builder::Builder;
 use std::env::var;
 use std::time::Duration;
@@ -33,6 +33,28 @@ const DEFAULT_STATISTICS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Longest statistics interval librdkafka accepts.
 const MAX_STATISTICS_INTERVAL: Duration = Duration::from_hours(24);
+
+/// Default prefetch of each partition. See
+/// [`ConsumerConfiguration::partition_prefetch`].
+const DEFAULT_PARTITION_PREFETCH: ByteSize = ByteSize::bytes(128 << 10_u32);
+
+/// Smallest prefetch librdkafka accepts: its queue limit counts whole KiB.
+const MIN_PARTITION_PREFETCH: u64 = 1 << 10_u32;
+
+/// Largest prefetch librdkafka accepts as a partition fetch size.
+const MAX_PARTITION_PREFETCH: u64 = 1_000_000_000;
+
+/// Default size limit of one fetch response. See
+/// [`ConsumerConfiguration::fetch_max_bytes`].
+const DEFAULT_FETCH_MAX_BYTES: ByteSize = ByteSize::bytes(50 << 20_u32);
+
+/// Smallest fetch response limit librdkafka accepts: the largest record it
+/// accepts (`message.max.bytes`, 1 MB by default).
+const MIN_FETCH_MAX_BYTES: u64 = 1_000_000;
+
+/// Largest fetch response limit librdkafka accepts: the response also needs
+/// 512 bytes of framing inside a 32-bit size.
+const MAX_FETCH_MAX_BYTES: u64 = (1 << 31_u32) - 1 - 512;
 
 /// Configuration for the Kafka consumer.
 ///
@@ -92,16 +114,61 @@ pub struct ConsumerConfiguration {
     /// Environment variable: `PROSODY_MAX_UNCOMMITTED`
     /// Default: 64
     ///
-    /// Controls the global limit of messages being processed concurrently
-    /// across all partitions. At the limit, each partition that delivers a
-    /// message pauses until a slot frees for that message. Also determines the
-    /// buffer size for message queues.
+    /// Controls the global limit of decoded messages in flight across all
+    /// partitions. A message holds its slot from decode until its offset
+    /// commits. At the limit, partitions stop reading, and their fetched
+    /// records wait in librdkafka. See
+    /// [`partition_prefetch`](Self::partition_prefetch).
     #[builder(
         default = "from_env_with_fallback(\"PROSODY_MAX_UNCOMMITTED\", 64)?",
         setter(into)
     )]
     #[validate(range(min = 1_usize))]
     pub max_uncommitted: usize,
+
+    /// The bytes that each assigned partition fetches ahead of its handlers.
+    ///
+    /// Environment variable: `PROSODY_PARTITION_PREFETCH`
+    /// Default: 128 KiB
+    ///
+    /// librdkafka stops fetching a partition when its queue holds this many
+    /// bytes. One fetch adds at most this many bytes for a partition, but it
+    /// always returns at least one record batch. So the fetched records of a
+    /// partition take at most two times this value, plus one batch. This
+    /// memory grows with the assigned partitions. A larger value lets a fast
+    /// partition run longer between fetches.
+    ///
+    /// Accepts a human-readable byte size such as `1 MiB`. A bare number is
+    /// interpreted as bytes. The accepted range is 1 KiB to 1 GB.
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_PARTITION_PREFETCH\", \
+                   DEFAULT_PARTITION_PREFETCH)?",
+        setter(into)
+    )]
+    #[validate(range(min = MIN_PARTITION_PREFETCH, max = MAX_PARTITION_PREFETCH))]
+    pub partition_prefetch: ByteSize,
+
+    /// The size limit of one fetch response from one broker, across all of
+    /// its partitions.
+    ///
+    /// Environment variable: `PROSODY_FETCH_MAX_BYTES`
+    /// Default: 50 MiB
+    ///
+    /// A fetch response holds the fetched records of many partitions until the
+    /// partitions read them, so this limit also bounds the memory of each
+    /// response. A response still returns one record batch that is larger.
+    /// Each partition gets at most
+    /// [`partition_prefetch`](Self::partition_prefetch) of a response.
+    ///
+    /// Accepts a human-readable byte size such as `16 MiB`. A bare number is
+    /// interpreted as bytes. The accepted range is 1 MB to 2 GiB less 512
+    /// bytes.
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_FETCH_MAX_BYTES\", DEFAULT_FETCH_MAX_BYTES)?",
+        setter(into)
+    )]
+    #[validate(range(min = MIN_FETCH_MAX_BYTES, max = MAX_FETCH_MAX_BYTES))]
+    pub fetch_max_bytes: ByteSize,
 
     /// Duration of inactivity allowed before considering a partition stalled.
     ///
@@ -139,7 +206,9 @@ pub struct ConsumerConfiguration {
     /// Environment variable: `PROSODY_POLL_INTERVAL`
     /// Default: 100 milliseconds
     ///
-    /// Controls how frequently the consumer polls Kafka for new messages.
+    /// Controls how often the consumer serves Kafka events, such as
+    /// rebalances, and stores the offsets of finished messages. Each partition
+    /// reads its records as soon as they arrive.
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_POLL_INTERVAL\", \
                    Duration::from_millis(100))?",
