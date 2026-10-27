@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.1](https://github.com/prosody-events/prosody/compare/prosody-v0.7.0...prosody-v0.7.1) (2026-10-13)
+
+
+### Bug Fixes
+
+* resolve Rust 1.99 Clippy failures in tests ([#106](https://github.com/prosody-events/prosody/issues/106)) ([aee0a32](https://github.com/prosody-events/prosody/commit/aee0a328be50b934a6c4302ba96fa0b50991bd13))
+* stop stalling partitions at empty segment tails ([#113](https://github.com/prosody-events/prosody/issues/113)) ([6fb0141](https://github.com/prosody-events/prosody/commit/6fb014111e7e864a57559fa47b1aad146d54d025))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * prosody-macros bumped from 0.7.0 to 0.7.1
+
 ## [0.7.0](https://github.com/prosody-events/prosody/compare/prosody-v0.6.0...prosody-v0.7.0) (2026-09-29)
 
 

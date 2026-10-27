@@ -19,7 +19,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 /// The broker the fixtures in this module connect to.
-const BOOTSTRAP: &str = "localhost:9094";
+pub(crate) const BOOTSTRAP: &str = "localhost:9094";
 
 /// Creates a uuid-named test topic with the given number of partitions.
 ///
