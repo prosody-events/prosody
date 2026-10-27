@@ -4,7 +4,7 @@ use super::{
     Arc, ArcSwapOption, AsyncFnOnce, CompactDateTime, Educe, Empty, EventContext, EventSession,
     Future, FutureExt, Instrument, Key, MessageLoader, Registered, RepinProof, ShutdownPhase, Span,
     StateAccessError, StateDescriptor, TerminationSignals, TimerManager, TimerManagerError,
-    TimerRequest, TimerType, TriggerStore, display, error, ready, select, timer_span, watch,
+    TimerRequest, TimerType, TriggerStore, display, ready, select, timer_span, warn, watch,
 };
 
 /// Concrete leaf [`EventContext`] constructed once per event by the
@@ -128,7 +128,7 @@ where
 
     /// Runs a cancellable operation inside `span`, recording the guard's key
     /// on it once the closure runs and any failure as an error event in its
-    /// scope — the hand-built equivalent of `#[instrument(err)]`, needed
+    /// scope — the hand-built equivalent of `#[instrument(err(level = "warn"))]`, needed
     /// because timer-op span levels follow the runtime [`TimerType`]
     /// (`timer_span!`).
     ///
@@ -152,7 +152,7 @@ where
             .instrument(span.clone())
             .await;
         if let Err(error) = &result {
-            span.in_scope(|| error!(error = %error));
+            span.in_scope(|| warn!(error = %error));
         }
         result
     }

@@ -133,7 +133,7 @@ where
     /// Returns an access error from the session, a codec error (Permanent)
     /// when the cell bytes do not decode, or a resolution error from the
     /// resolver.
-    #[instrument(name = "value.get", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "value.get", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     #[read(op)]
     pub async fn get(&self) -> Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>> {
         op.get(ValueKind::<T>::ENTRIES, &()).await
@@ -145,7 +145,7 @@ where
     ///
     /// Returns a codec error (Permanent) when the cell fails to encode, or
     /// an access error from the session.
-    #[instrument(name = "value.set", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "value.set", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     #[write(op)]
     pub async fn set(
         &self,
@@ -159,7 +159,7 @@ where
     /// # Errors
     ///
     /// Returns an access error from the session.
-    #[instrument(name = "value.clear", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "value.clear", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     #[write(op)]
     pub async fn clear(&self) -> Result<(), CellStateError<CellCodecError<T>>> {
         op.clear(ValueKind::<T>::ENTRIES.at(&()));
@@ -173,7 +173,7 @@ where
     /// # Errors
     ///
     /// Returns an access error from the session.
-    #[instrument(name = "value.commit", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "value.commit", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     pub async fn commit(&self) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>>
     where
         S: WritableStateSession,

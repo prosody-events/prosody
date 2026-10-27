@@ -368,7 +368,7 @@ impl fmt::Debug for CassandraTimerDeferStore {
 impl TimerDeferStore for CassandraTimerDeferStore {
     type Error = CassandraDeferStoreError;
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn defer_first_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
         // Consult current state so we don't violate I1 when the caller's
         // "fresh key" precondition is violated: the new row must not raise
@@ -381,7 +381,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn get_next_deferred_timer(
         &self,
         key: &Key,
@@ -435,7 +435,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         }
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn complete_retry_success(
         &self,
         key: &Key,
@@ -520,7 +520,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         }
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn append_deferred_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
         let (segment_id, cached) = self.resolve_cache_or_read(&trigger.key).await?;
         let ttl = self.store.calculate_ttl(trigger.time);
@@ -591,7 +591,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn remove_deferred_timer(
         &self,
         key: &Key,
@@ -655,7 +655,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
         // No-op on a partition with no live timers. Cassandra's blind UPDATE
         // upserts a static-only row and leaves an orphan retry_count after
@@ -692,7 +692,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn delete_key(&self, key: &Key) -> Result<(), Self::Error> {
         let segment_id = self.segment_id().await?;
 

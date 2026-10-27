@@ -28,7 +28,7 @@ use tracing::{Span, instrument};
 /// - **Overflow**: Write clustering only (1 query) → stays `Overflow`
 /// - **Absent**: Set inline state with new timer directly → `Inline(new)`
 ///   (post-V3 Absent is unambiguous: 0 timers, no clustering rows)
-#[instrument(name = "upsert_key_trigger", level = "debug", skip(store), fields(state_cached = Empty), err)]
+#[instrument(name = "upsert_key_trigger", level = "debug", skip(store), fields(state_cached = Empty), err(level = "warn"))]
 pub(super) async fn upsert(
     store: &CassandraTriggerStore,
     trigger: Trigger,
@@ -61,7 +61,7 @@ pub(super) async fn upsert(
 ///     Inline → `Inline(survivor)`
 ///   - 2+ surviving rows → single DELETE target → stays `Overflow`
 /// - **Absent**: No-op (post-V3 Absent is unambiguous: 0 timers, no rows)
-#[instrument(name = "delete_key_trigger", level = "debug", skip(store), fields(state_cached = Empty), err)]
+#[instrument(name = "delete_key_trigger", level = "debug", skip(store), fields(state_cached = Empty), err(level = "warn"))]
 pub(super) async fn delete(
     store: &CassandraTriggerStore,
     timer_type: TimerType,
@@ -152,7 +152,12 @@ pub(super) async fn delete(
 ///
 /// Uses `resolve_state` to read the real DB state on cache miss, avoiding
 /// stale `Absent` entries if the DB operation later fails.
-#[instrument(name = "clear_key_triggers", level = "debug", skip(store), err)]
+#[instrument(
+    name = "clear_key_triggers",
+    level = "debug",
+    skip(store),
+    err(level = "warn")
+)]
 pub(super) async fn clear(
     store: &CassandraTriggerStore,
     timer_type: TimerType,
@@ -196,7 +201,7 @@ pub(super) async fn clear(
 /// `resolve_state` returns the per-`(key, timer_type)` mutex; holding
 /// `handle.lock().await` for the entire match serialises the
 /// read-decide-write sequence against concurrent same-key writers.
-#[instrument(name = "clear_and_schedule_key", level = "debug", skip(store), fields(state_cached = Empty), err)]
+#[instrument(name = "clear_and_schedule_key", level = "debug", skip(store), fields(state_cached = Empty), err(level = "warn"))]
 pub(super) async fn clear_and_schedule(
     store: &CassandraTriggerStore,
     trigger: Trigger,
@@ -251,7 +256,7 @@ pub(super) async fn clear_and_schedule(
     name = "clear_key_triggers_all_types",
     level = "debug",
     skip(store),
-    err
+    err(level = "warn")
 )]
 pub(super) async fn clear_all_types(
     store: &CassandraTriggerStore,

@@ -286,7 +286,7 @@ where
     /// Fails with [`KafkaLoaderError::LoaderShutdown`] if the semaphore or
     /// either channel has closed, or with a decode/Kafka error if the message
     /// can't be found or decoded.
-    #[instrument(level = "debug", skip(self, mode), fields(cached = Empty), err)]
+    #[instrument(level = "debug", skip(self, mode), fields(cached = Empty), err(level = "warn"))]
     async fn load_message_impl(
         &self,
         topic: Topic,
@@ -343,7 +343,7 @@ where
     /// Sends a load request to the background poll loop, which handles Kafka
     /// polling and message decoding. The decoded message is cached using
     /// `quick_cache`'s S3-FIFO eviction policy for efficient repeated access.
-    #[instrument(skip(self), level = "debug", err)]
+    #[instrument(skip(self), level = "debug", err(level = "warn"))]
     async fn load_from_kafka(
         &self,
         topic: Topic,

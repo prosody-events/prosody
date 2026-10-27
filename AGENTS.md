@@ -592,10 +592,19 @@ arithmetic.
 
 **Instrument with `#[instrument]`, never a hand-built `info_span!` +
 `.instrument(...)`.** The repo pattern: `#[instrument(name = "map.set",
-skip_all, fields(collection = ..., map.key = ?key), err)]` for user-facing
-operations (span name = the operation, low-cardinality; `skip_all` plus
-explicit `fields` control the attributes; `err` records failures on the span),
-and `#[instrument(level = "debug", skip(self), err)]` for internal plumbing.
+skip_all, fields(collection = ..., map.key = ?key), err(level = "warn"))]` for
+user-facing operations (span name = the operation, low-cardinality; `skip_all`
+plus explicit `fields` control the attributes; `err(level = "warn")` records
+failures on the span), and `#[instrument(level = "debug", skip(self),
+err(level = "warn"))]` for internal plumbing.
+
+**Log level is the owner's decision.** An instrumented function returns its
+error to a caller that decides what it means, so its `err` event and any manual
+span error annotation log at warn; the OTel layer still marks the span failed
+(`warn_err_event_marks_span_failed`). A failure that Prosody retries also logs
+at warn. Log at error only where work is lost or a retry ends: a discarded
+message or timer, exhausted attempts, a skipped durability step, or a broken
+invariant.
 Hand-built spans are reserved for the cases the attribute cannot express: a
 function returning `impl Stream` (instrument each inner await with a clone of
 one span), a relation against a carried context (`related_span!`), a value

@@ -40,7 +40,7 @@ use std::ops::AsyncFnOnce;
 use std::sync::Arc;
 use tokio::select;
 use tokio::sync::watch;
-use tracing::{Instrument, Span, error, field::Empty, field::display};
+use tracing::{Instrument, Span, field::Empty, field::display, warn};
 
 mod erased;
 

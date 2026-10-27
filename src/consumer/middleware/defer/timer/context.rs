@@ -28,7 +28,7 @@ use crate::timers::datetime::CompactDateTime;
 use futures::TryFutureExt;
 use std::future::Future;
 use thiserror::Error;
-use tracing::{Instrument, error, info_span};
+use tracing::{Instrument, info_span, warn};
 
 /// Context wrapper that unifies active and deferred timer operations.
 ///
@@ -200,7 +200,7 @@ where
                     // Parity with the instrumented branch's `err`: mark the
                     // span before the error propagates, so a failed append is
                     // visible on the trace.
-                    span.in_scope(|| error!(error = %error, "deferred timer append failed"));
+                    span.in_scope(|| warn!(error = %error, "deferred timer append failed"));
                     TimerDeferContextError::Store(error)
                 })
         } else {

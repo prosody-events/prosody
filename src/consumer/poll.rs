@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::runtime::Handle;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::Topic;
 use crate::consumer::sweep::drain_managers;
@@ -50,7 +50,7 @@ pub(super) fn poll<Ctx: ConsumerContext>(
                 offset = message.offset(),
                 "record reached the consumer queue; discarding"
             ),
-            Some(Err(error)) => error!("error polling for events: {error:#}"),
+            Some(Err(error)) => warn!("error polling for events: {error:#}"),
         }
     }
 

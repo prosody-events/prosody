@@ -168,7 +168,7 @@ impl CassandraTriggerStore {
     }
 
     /// Writes the segment version: the commit point of a version migration.
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn update_segment_version(
         &self,
         version: SegmentVersion,
@@ -183,7 +183,7 @@ impl CassandraTriggerStore {
     /// Writes the slab size and slab watermark of `segment` in one batch:
     /// the commit point of a slab-size migration. The watermark gets the same
     /// TTL as the other watermark writes.
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn update_segment_slab_size(
         &self,
         segment: &StoredSegment,

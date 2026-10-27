@@ -114,7 +114,7 @@ fn process_poll_result<C: Codec>(
     let mut message = match result {
         Ok(message) => message,
         Err(error) => {
-            error!(error = %format_args!("{error:#}"), "Error polling for message");
+            warn!(error = %format_args!("{error:#}"), "Error polling for message");
             return;
         }
     };

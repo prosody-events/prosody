@@ -306,7 +306,7 @@ impl<C: Codec> ProsodyProducer<C> {
         name = "send",
         skip(self, topic, headers, payload),
         fields(otel.kind = "producer", messaging.system = "kafka", topic = topic.as_ref(), key = %key, payload_size, partition, offset, timestamp),
-        err
+        err(level = "warn")
     )]
     pub(crate) async fn send_owned(
         &self,
@@ -371,7 +371,7 @@ impl<C: Codec> ProsodyProducer<C> {
     #[instrument(
         skip(self, topic, headers),
         fields(otel.kind = "producer", messaging.system = "kafka", topic = topic.as_ref(), key = %key, partition, offset, timestamp),
-        err
+        err(level = "warn")
     )]
     pub async fn excise<'a, H>(
         &'a self,
