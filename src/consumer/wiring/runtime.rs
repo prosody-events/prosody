@@ -164,14 +164,12 @@ where
     })
 }
 
-/// Builds the client, attaches it to its context, and subscribes it.
+/// Builds the client and subscribes it.
 ///
-/// All three run inside one blocking task. Subscribing blocks, and
-/// dropping a `BaseConsumer` poll-loops until its queue closes, so the client
-/// lives and dies inside that task. The returned context type captures no
-/// borrow, which is what lets a failure arm surrender the client to a blocking
-/// drop. The context needs the client before the first rebalance, so the
-/// attach comes before the subscription.
+/// Both run inside one blocking task. Subscribing blocks, and dropping a
+/// `BaseConsumer` poll-loops until its queue closes, so the client lives and
+/// dies inside that task. The returned context type captures no borrow, which
+/// is what lets a failure arm surrender the client to a blocking drop.
 ///
 /// # Errors
 ///
@@ -199,7 +197,7 @@ where
 {
     let consumer_config = consumer_config.clone();
     spawn_blocking(move || {
-        let context = new_context(
+        let consumer = new_context(
             &consumer_config,
             handler_provider,
             providers,
@@ -207,10 +205,8 @@ where
             watermark_version,
             handles,
             version,
-        )?;
-        let consumer: Arc<BaseConsumer<_>> =
-            Arc::new(client_config(&consumer_config)?.create_with_context(context)?);
-        consumer.context().attach(&consumer);
+        )?
+        .into_client(&client_config(&consumer_config)?)?;
         let topics = &consumer_config.subscribed_topics;
         let topics: Vec<&str> = topics.iter().map(String::as_str).collect();
         consumer.subscribe(&topics)?;

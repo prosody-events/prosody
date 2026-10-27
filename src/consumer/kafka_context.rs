@@ -21,8 +21,9 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use opentelemetry::global::meter;
 use rdkafka::consumer::base_consumer::PartitionQueue;
-use rdkafka::consumer::{BaseConsumer, ConsumerContext, Rebalance};
-use rdkafka::{ClientContext, Statistics};
+use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext, Rebalance};
+use rdkafka::error::KafkaResult;
+use rdkafka::{ClientConfig, ClientContext, Statistics};
 use std::array::from_fn;
 use std::collections::hash_map::Entry;
 use std::future::ready;
@@ -140,13 +141,23 @@ where
 /// assigns the partition. A split queue stays split for every later assignment
 /// of the partition, so librdkafka never forwards its records to the consumer
 /// queue.
+///
+/// # Ownership
+///
+/// The client owns this context, and the context holds the partition managers.
+/// Each partition task holds the client through its queue. This cycle keeps the
+/// client alive until the poll loop sweeps the managers in its close. Do not
+/// drop the client before that sweep. A design that defers rebalances to the
+/// poll loop has no cycle. It was rejected because it adds a deferred-assign
+/// protocol, and its close still needs the same order.
 pub(super) struct Context<F: MakeManager> {
     /// Builds a fresh partition manager for a newly assigned partition.
     factory: F,
 
-    /// The client that runs this context, for the queue split. Set once,
-    /// before the client subscribes. It is weak because the client owns this
-    /// context.
+    /// The client that runs this context, for the queue split. It is weak
+    /// because the client owns this context. Only [`Context::into_client`] sets
+    /// it. It is a `OnceLock` because `create_with_context` can fail and
+    /// `Arc::new_cyclic` cannot.
     consumer: OnceLock<Weak<BaseConsumer<Self>>>,
 
     /// Thread-safe storage for partition managers
@@ -248,12 +259,15 @@ where
 }
 
 impl<F: MakeManager> Context<F> {
-    /// Gives this context its client, which it needs to split partition
-    /// queues. Call it once, before the client subscribes.
-    pub(super) fn attach(&self, consumer: &Arc<BaseConsumer<Self>>) {
-        if self.consumer.set(Arc::downgrade(consumer)).is_err() {
-            error!("consumer context attached twice; keeping the first client");
-        }
+    /// Creates the client that runs this context. The context keeps a weak
+    /// reference to the client, which it needs to split partition queues.
+    pub(super) fn into_client(self, config: &ClientConfig) -> KafkaResult<Arc<BaseConsumer<Self>>> {
+        let consumer: Arc<BaseConsumer<Self>> = Arc::new(config.create_with_context(self)?);
+        consumer
+            .context()
+            .consumer
+            .get_or_init(|| Arc::downgrade(&consumer));
+        Ok(consumer)
     }
 }
 
