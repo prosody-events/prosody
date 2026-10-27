@@ -599,14 +599,16 @@ failures on the span), and `#[instrument(level = "debug", skip(self),
 err(level = "warn"))]` for internal plumbing.
 
 **Log level is the owner's decision.** An instrumented function returns its
-error to a caller that decides what it means, so its `err` event and any manual
-span error annotation log at warn; the OTel layer still marks the span failed
-(`warn_err_event_marks_span_failed`). A failure that Prosody retries also logs
-at warn. Log at error only where work is lost or a retry ends: a discarded
-message or timer, exhausted attempts, a skipped durability step, or a broken
-invariant. Create every Kafka client with `kafka_log::LogContext` (the
-consumer context delegates to it), so librdkafka connection failures log at
-warn.
+error to a caller that decides what it means, so its `err` event logs at warn.
+Mark a hand-built span failed with `otel::mark_failed`. The OTel layer marks a
+span failed from a warn event only when the event has an `error` field and no
+message (`warn_failures_mark_their_span_failed`). A failure that Prosody
+retries also logs at warn. Log at error only where work is lost or a retry
+ends: a discarded message or timer, exhausted attempts, a skipped durability
+step, or a broken invariant. Create every Kafka client with
+`kafka_log::LogContext`; the consumer context calls the same log functions. Log
+Kafka poll errors with `kafka_log::log_error`. Then librdkafka connection
+failures log at warn, and other Kafka errors log at error.
 Hand-built spans are reserved for the cases the attribute cannot express: a
 function returning `impl Stream` (instrument each inner await with a clone of
 one span), a relation against a carried context (`related_span!`), a value

@@ -1,6 +1,6 @@
 use super::{
     ActiveRequests, BaseConsumer, Consumer, Duration, KafkaLoaderError, KafkaResult, LogContext,
-    Offset, Partition, Request, SmallVec, Timeout, Topic, TopicPartitionList, debug, error, warn,
+    Offset, Partition, Request, SmallVec, Timeout, Topic, TopicPartitionList, debug, warn,
 };
 
 pub(super) fn handle_request<P>(
@@ -25,13 +25,7 @@ pub(super) fn handle_request<P>(
     );
 
     if let Err(error) = assign_if_needed(active, consumer, topic, partition, offset) {
-        error!(
-            topic = %topic,
-            partition = partition,
-            offset = offset,
-            error = %format_args!("{error:#}"),
-            "Failed to assign partition for message load"
-        );
+        // The caller logs the error it receives.
         let _ = tx.send(Err(KafkaLoaderError::Kafka(error)));
         return;
     }

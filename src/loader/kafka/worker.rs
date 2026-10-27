@@ -5,6 +5,7 @@ use super::{
     RecordMeta, Request, Responses, Span, SpanRelation, TextMapCompositePropagator, Timeout, Topic,
     TryRecvError, debug, decode_record, error, mpsc, new_propagator, related_span, select, warn,
 };
+use crate::kafka_log::log_error;
 use crate::subsystem::SubsystemName;
 
 pub(super) fn poll_loop<C: Codec>(
@@ -114,7 +115,7 @@ fn process_poll_result<C: Codec>(
     let mut message = match result {
         Ok(message) => message,
         Err(error) => {
-            warn!(error = %format_args!("{error:#}"), "Error polling for message");
+            log_error(&error, "message loader poll failed");
             return;
         }
     };

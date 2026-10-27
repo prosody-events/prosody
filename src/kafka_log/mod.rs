@@ -20,7 +20,7 @@ mod tests;
 const CONNECTION_FAILURE: &str = "FAIL";
 
 /// A client context that applies Prosody's librdkafka log levels.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct LogContext;
 
 impl ClientContext for LogContext {
@@ -46,8 +46,7 @@ pub(crate) fn log_line(level: RDKafkaLogLevel, fac: &str, message: &str) {
     }
 }
 
-/// Logs one librdkafka client error at the level that [`error_level`]
-/// selects.
+/// Logs one librdkafka error at the level that [`error_level`] selects.
 pub(crate) fn log_error(error: &KafkaError, reason: &str) {
     if error_level(error) == Level::WARN {
         warn!(target: "rdkafka::client", "librdkafka: {error}: {reason}");
@@ -59,22 +58,20 @@ pub(crate) fn log_error(error: &KafkaError, reason: &str) {
 /// Maps a librdkafka log line to a tracing level. An error-level line about a
 /// failed broker connection logs at warn.
 fn line_level(level: RDKafkaLogLevel, fac: &str) -> Level {
-    match level {
+    let level = match level {
         RDKafkaLogLevel::Emerg
         | RDKafkaLogLevel::Alert
         | RDKafkaLogLevel::Critical
-        | RDKafkaLogLevel::Error
-            if fac != CONNECTION_FAILURE =>
-        {
-            Level::ERROR
-        }
-        RDKafkaLogLevel::Emerg
-        | RDKafkaLogLevel::Alert
-        | RDKafkaLogLevel::Critical
-        | RDKafkaLogLevel::Error
-        | RDKafkaLogLevel::Warning => Level::WARN,
+        | RDKafkaLogLevel::Error => Level::ERROR,
+        RDKafkaLogLevel::Warning => Level::WARN,
         RDKafkaLogLevel::Notice | RDKafkaLogLevel::Info => Level::INFO,
         RDKafkaLogLevel::Debug => Level::DEBUG,
+    };
+    // A more verbose tracing level compares greater.
+    if fac == CONNECTION_FAILURE {
+        level.max(Level::WARN)
+    } else {
+        level
     }
 }
 

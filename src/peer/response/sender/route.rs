@@ -3,7 +3,7 @@
 use super::metrics::{DropReason, Stage};
 use crate::codec::Codec;
 use crate::error::ClassifyError;
-use crate::otel::context_with_parent;
+use crate::otel::{context_with_parent, mark_failed};
 use crate::peer::metrics::PeerMetrics;
 use crate::peer::response::ResponseDisposition;
 use crate::peer::response::frame::FrameHeader;
@@ -100,7 +100,7 @@ pub(crate) async fn deliver_response<R: ResponseRoute + PeerMetricSource>(
             if reason != DropReason::SendFailed {
                 span.record(ERROR_TYPE, reason.label());
             }
-            span.in_scope(|| warn!(error = %reason.label()));
+            mark_failed(&span, reason.label());
             reason.record(router.peer_metrics());
         }
     }

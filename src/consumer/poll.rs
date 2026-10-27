@@ -21,6 +21,7 @@ use crate::Topic;
 use crate::consumer::sweep::drain_managers;
 use crate::consumer::{Managers, WatermarkVersion};
 use crate::heartbeat::Heartbeat;
+use crate::kafka_log::log_error;
 
 /// Runs the Kafka poll loop until `shutdown` is set, then closes the client.
 ///
@@ -50,7 +51,7 @@ pub(super) fn poll<Ctx: ConsumerContext>(
                 offset = message.offset(),
                 "record reached the consumer queue; discarding"
             ),
-            Some(Err(error)) => warn!("error polling for events: {error:#}"),
+            Some(Err(error)) => log_error(&error, "consumer poll failed"),
         }
     }
 
@@ -124,7 +125,7 @@ fn store_watermarks<Ctx: ConsumerContext>(
     // Store offsets in librdkafka for auto-commit
     debug!("storing watermarks for commit: {list:?}");
     if let Err(error) = consumer.store_offsets(&list) {
-        error!("failed to store offsets: {error:#}");
+        warn!("failed to store offsets: {error:#}");
         success = false;
     }
 

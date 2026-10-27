@@ -1,14 +1,11 @@
 use super::{QUIET_TARGETS, flush_telemetry, log_filter, shutdown_telemetry};
 use color_eyre::Result;
-use color_eyre::eyre::ensure;
-use opentelemetry::trace::{Status, TracerProvider};
-use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use std::collections::BTreeMap;
 use tracing::level_filters::LevelFilter;
 use tracing::subscriber::with_default;
-use tracing::{Level, enabled, instrument};
+use tracing::{Level, enabled};
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -157,33 +154,6 @@ fn prop_prosody_log_replaces_defaults_per_target(overrides: Vec<Override>) -> bo
 fn flush_and_shutdown_are_noops_when_uninitialized() -> Result<()> {
     flush_telemetry()?;
     shutdown_telemetry()?;
-    Ok(())
-}
-
-/// A failed instrumented function marks its span as an error when its `err`
-/// event logs at warn. Prosody relies on this to keep failed spans visible.
-#[test]
-fn warn_err_event_marks_span_failed() -> Result<()> {
-    #[instrument(err(level = "warn"))]
-    fn fail() -> Result<(), &'static str> {
-        Err("failed")
-    }
-
-    let exporter = InMemorySpanExporter::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exporter.clone())
-        .build();
-    let subscriber = Registry::default()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
-
-    ensure!(with_default(subscriber, fail).is_err(), "fail must fail");
-    provider.force_flush()?;
-
-    let spans = exporter.get_finished_spans()?;
-    ensure!(
-        matches!(spans.as_slice(), [span] if matches!(span.status, Status::Error { .. })),
-        "expected one failed span, got {spans:?}"
-    );
     Ok(())
 }
 

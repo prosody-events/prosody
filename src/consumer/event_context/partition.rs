@@ -4,8 +4,9 @@ use super::{
     Arc, ArcSwapOption, AsyncFnOnce, CompactDateTime, Educe, Empty, EventContext, EventSession,
     Future, FutureExt, Instrument, Key, MessageLoader, Registered, RepinProof, ShutdownPhase, Span,
     StateAccessError, StateDescriptor, TerminationSignals, TimerManager, TimerManagerError,
-    TimerRequest, TimerType, TriggerStore, display, ready, select, timer_span, warn, watch,
+    TimerRequest, TimerType, TriggerStore, display, ready, select, timer_span, watch,
 };
+use crate::otel::mark_failed;
 
 /// Concrete leaf [`EventContext`] constructed once per event by the
 /// partition loop.
@@ -126,11 +127,10 @@ where
         }
     }
 
-    /// Runs a cancellable operation inside `span`, recording the guard's key
-    /// on it once the closure runs and any failure as an error event in its
-    /// scope — the hand-built equivalent of `#[instrument(err(level = "warn"))]`, needed
-    /// because timer-op span levels follow the runtime [`TimerType`]
-    /// (`timer_span!`).
+    /// Runs a cancellable operation inside `span`, records the guard's key on
+    /// it, and marks it failed on error. This is the hand-built equivalent of
+    /// `#[instrument(err)]`, because timer-op span levels follow the runtime
+    /// [`TimerType`] (`timer_span!`).
     ///
     /// The key is recorded through the owned `span` handle, never
     /// `Span::current()`: a level-disabled span (an internal timer op under
@@ -152,7 +152,7 @@ where
             .instrument(span.clone())
             .await;
         if let Err(error) = &result {
-            span.in_scope(|| warn!(error = %error));
+            mark_failed(&span, error);
         }
         result
     }
