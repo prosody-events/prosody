@@ -48,6 +48,7 @@ use crate::consumer::ConsumerConfiguration;
 use crate::consumer::decode::{DecodedRecord, RecordMeta, decode_record};
 use crate::consumer::message::ConsumerRecord;
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
+use crate::kafka_log::LogContext;
 use crate::propagator::new_propagator;
 use crate::{JsonCodec, Offset, Partition, Topic};
 use ahash::HashMap;
@@ -226,7 +227,7 @@ where
         // Point lookups don't benefit from prefetching. Start with small fetch
         // sizes for ~1KB messages; rdkafka auto-adjusts if larger messages appear.
         // fetch.max.bytes >= message.max.bytes is required by rdkafka.
-        let consumer: BaseConsumer = ClientConfig::new()
+        let consumer: BaseConsumer<LogContext> = ClientConfig::new()
             .set("bootstrap.servers", config.bootstrap_servers.join(","))
             .set("client.id", &client_id)
             .set("group.id", &group_id)
@@ -240,7 +241,7 @@ where
             .set("fetch.max.bytes", "1048576")
             .set("fetch.wait.max.ms", "100")
             .set_log_level(RDKafkaLogLevel::Error)
-            .create()
+            .create_with_context(LogContext)
             .map_err(KafkaLoaderError::ConsumerCreation)?;
 
         let (tx, rx) = mpsc::channel(config.max_permits);

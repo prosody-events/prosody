@@ -604,7 +604,9 @@ span error annotation log at warn; the OTel layer still marks the span failed
 (`warn_err_event_marks_span_failed`). A failure that Prosody retries also logs
 at warn. Log at error only where work is lost or a retry ends: a discarded
 message or timer, exhausted attempts, a skipped durability step, or a broken
-invariant.
+invariant. Create every Kafka client with `kafka_log::LogContext` (the
+consumer context delegates to it), so librdkafka connection failures log at
+warn.
 Hand-built spans are reserved for the cases the attribute cannot express: a
 function returning `impl Stream` (instrument each inner await with a clone of
 one span), a relation against a carried context (`related_span!`), a value

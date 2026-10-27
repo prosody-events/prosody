@@ -20,9 +20,10 @@ use aho_corasick::{AhoCorasick, BuildError, StartKind};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use opentelemetry::global::meter;
+use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::base_consumer::PartitionQueue;
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext, Rebalance};
-use rdkafka::error::KafkaResult;
+use rdkafka::error::{KafkaError, KafkaResult};
 use rdkafka::{ClientConfig, ClientContext, Statistics};
 use std::array::from_fn;
 use std::collections::hash_map::Entry;
@@ -42,6 +43,7 @@ use crate::consumer::{
     ConsumerConfiguration, ConsumerError, EventHandler, HandlerProvider, Managers,
     WatermarkVersion, get_assigned_partition_count,
 };
+use crate::kafka_log::{log_error, log_line};
 use crate::loader::MessageLoader;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::EventSession;
@@ -279,6 +281,14 @@ impl<F: MakeManager> ClientContext for Context<F> {
     /// statistics tree at `info` and the gauges stop.
     fn stats(&self, statistics: Statistics) {
         self.metrics.observe(statistics);
+    }
+
+    fn log(&self, level: RDKafkaLogLevel, fac: &str, log_message: &str) {
+        log_line(level, fac, log_message);
+    }
+
+    fn error(&self, error: KafkaError, reason: &str) {
+        log_error(&error, reason);
     }
 }
 

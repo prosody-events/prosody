@@ -20,7 +20,7 @@ use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use tokio::time::Instant;
 use tonic::{Code, Request, Response, Status};
 use tracing::field::{Empty, display};
-use tracing::{Instrument, Span, debug_span, error};
+use tracing::{Instrument, Span, debug_span, warn};
 
 /// Serves [`DeliverResult`](PeerServiceApi::deliver_result) for one peer.
 ///
@@ -91,7 +91,7 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
         // remaining duration so a second hop does not restart the timeout.
         let deadline = inbound_deadline(request.metadata()).ok_or_else(|| {
             record_status(&span, Code::InvalidArgument);
-            span.in_scope(|| error!(error = "grpc-timeout is missing or invalid"));
+            span.in_scope(|| warn!(error = "grpc-timeout is missing or invalid"));
             Status::invalid_argument("grpc-timeout is missing or invalid")
         })?;
         let remaining_ms = deadline
@@ -103,7 +103,7 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
         );
         let frame: ResponseFrame = request.into_inner().try_into().map_err(|error| {
             record_status(&span, Code::InvalidArgument);
-            span.in_scope(|| error!(%error, "peer frame is invalid"));
+            span.in_scope(|| warn!(%error, "peer frame is invalid"));
             refusal(&error)
         })?;
         async {
@@ -152,12 +152,12 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
                         }
                         Err(RelayFailure::DeadlineExceeded) => {
                             record_status(&forward, Code::DeadlineExceeded);
-                            forward.in_scope(|| error!(error = "the relay deadline elapsed"));
+                            forward.in_scope(|| warn!(error = "the relay deadline elapsed"));
                             self.answer(&span, ResponseDisposition::RelayDeadlineExceeded)
                         }
                         Err(RelayFailure::Unreachable) => {
                             record_status(&forward, Code::Unavailable);
-                            forward.in_scope(|| error!(error = "the relay target was unavailable"));
+                            forward.in_scope(|| warn!(error = "the relay target was unavailable"));
                             self.answer(&span, ResponseDisposition::Unreachable)
                         }
                         // The hop came to a status. It is passed through
@@ -165,10 +165,10 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
                         // the responder's own retry decision.
                         Err(RelayFailure::Target(code)) => {
                             record_status(&forward, code);
-                            forward.in_scope(|| error!(error = %code.description()));
+                            forward.in_scope(|| warn!(error = %code.description()));
                             record_status(&span, code);
                             span.record("request.disposition", "target_error");
-                            span.in_scope(|| error!(error = %code.description()));
+                            span.in_scope(|| warn!(error = %code.description()));
                             Err(service_status(code, code.description()))
                         }
                     }
@@ -200,7 +200,7 @@ fn answer(
         | ResponseDisposition::AlreadyRelayed
         | ResponseDisposition::RelayDeadlineExceeded
         | ResponseDisposition::Unreachable => {
-            span.in_scope(|| error!(error = %disposition.label()));
+            span.in_scope(|| warn!(error = %disposition.label()));
             Err(service_status(disposition.status(), disposition.message()))
         }
     }

@@ -16,7 +16,7 @@ use std::fmt::Display;
 use std::future::{Future, ready};
 use tokio::time::{Instant, timeout_at};
 use tracing::field::Empty;
-use tracing::{Instrument, Span, debug_span, error, warn};
+use tracing::{Instrument, Span, debug_span, warn};
 
 use crate::peer::router::LocalTarget;
 
@@ -100,7 +100,7 @@ pub(crate) async fn deliver_response<R: ResponseRoute + PeerMetricSource>(
             if reason != DropReason::SendFailed {
                 span.record(ERROR_TYPE, reason.label());
             }
-            span.in_scope(|| error!(error = %reason.label()));
+            span.in_scope(|| warn!(error = %reason.label()));
             reason.record(router.peer_metrics());
         }
     }
