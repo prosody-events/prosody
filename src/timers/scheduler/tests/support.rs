@@ -99,7 +99,14 @@ where
     let actor = async {
         let mut handled = 0_u8;
         let mut repaired = true;
+        let mut held = None;
         while let Some(command) = commands.recv().await {
+            // A hold precedes the repair it guards.
+            if matches!(command.operation, CommandOperation::Hold) {
+                held = Some(command.trigger.tag);
+                process_command(&mut state, &mut queue, command).await;
+                continue;
+            }
             let rows: Vec<_> = store
                 .get_slab_triggers_all_types(slab.id())
                 .try_collect()
@@ -110,11 +117,12 @@ where
                 command.operation,
                 CommandOperation::Add | CommandOperation::RetireCommitted
             ) && rows.iter().map(|t| t.tag).collect::<Vec<_>>()
-                == expected.into_iter().collect::<Vec<_>>();
+                == expected.into_iter().collect::<Vec<_>>()
+                && expected.is_none_or(|tag| held.take() == Some(tag));
             process_command(&mut state, &mut queue, command).await;
             handled += 1;
         }
-        ensure!(repaired, "command preceded repair");
+        ensure!(repaired, "command preceded repair or its hold");
         ensure!(
             handled == 3 + u8::from(retire_replacement),
             "retirement did not acknowledge every command"

@@ -202,7 +202,11 @@ pub(super) async fn process_command<T>(
     T: TriggerStore,
 {
     let result: Result<(), T::Error> = match operation {
-        CommandOperation::Add => handle_add(state, triggers, trigger).await,
+        CommandOperation::Hold => handle_hold(state, triggers, trigger).await,
+        CommandOperation::Add => {
+            handle_add(state, triggers, trigger).await;
+            Ok(())
+        }
         CommandOperation::Remove => {
             triggers.remove(&trigger).await;
             Ok(())
@@ -229,24 +233,19 @@ pub(super) async fn process_command<T>(
     let _ = result_tx.send(result);
 }
 
-/// Handler for [`CommandOperation::Add`].
+/// Handler for [`CommandOperation::Hold`].
 ///
-/// Classifies the trigger's slab as **owned** or **pending**:
+/// Registers the trigger's slab and holds the trigger before the manager
+/// writes its row. This keeps the durable row invariant of
+/// [`crate::timers::active`] if the write is dropped or fails.
 ///
-/// - A slab is **owned** when it sits at or below the persisted watermark
-///   (past-time) or is at/below `highest_loaded_slab_id`. Owned-slab triggers
-///   go into the in-memory queue; their slab metadata is persisted on first
-///   sighting. Past-time slabs route through an atomic UNLOGGED BATCH that also
-///   lowers the watermark (invariant I6) — the only way the actor can pull a
-///   slab back below its own high-water without violating I1.
-/// - A **pending** slab sits above the load high-water and has never been
-///   touched by the actor. The trigger row (written first by the manager via
-///   [`TriggerStore::add_trigger`]) waits in storage; the actor just persists
-///   slab metadata so `load_step` can find it later. Keeps the in-memory queue
-///   bounded to the preload window.
-pub(super) async fn handle_add<T>(
+/// A slab at or below the persisted watermark routes through an atomic
+/// UNLOGGED BATCH that also lowers the watermark (invariant I6). This is the
+/// only way the actor can pull a slab back below its own high-water without
+/// violating I1.
+pub(super) async fn handle_hold<T>(
     state: &mut ActorState<T>,
-    triggers: &mut TriggerQueue,
+    triggers: &TriggerQueue,
     trigger: Trigger,
 ) -> Result<(), T::Error>
 where
@@ -255,13 +254,7 @@ where
     let slab = Slab::from_time(state.segment.slab_size, trigger.time);
     let slab_id = slab.id();
 
-    let is_registered = state.known_slab_ids.contains(&slab_id);
-    // Once the actor commits to owning a slab's triggers in memory, it must
-    // keep accepting new triggers for that slab in memory. Otherwise the
-    // slab's active set drifts below its DB content and P1 breaks.
-    let is_owned = owns_slab(state, slab_id);
-
-    if !is_registered {
+    if !state.known_slab_ids.contains(&slab_id) {
         if let Some(old_watermark) = state.last_persisted_watermark
             && slab_id <= old_watermark
         {
@@ -282,14 +275,34 @@ where
                     .highest_loaded_slab_id
                     .map_or(old_watermark, |h| h.max(old_watermark)),
             );
-            state.known_slab_ids.insert(slab_id);
         } else {
             // Plain INSERT for in-window or pending. Pending writes are
             // what let `load_step` discover the slab when it enters the
             // preload window.
             state.store.insert_slab(slab).await?;
-            state.known_slab_ids.insert(slab_id);
         }
+        state.known_slab_ids.insert(slab_id);
+    }
+
+    triggers.active_triggers().hold(trigger).await;
+    Ok(())
+}
+
+/// Handler for [`CommandOperation::Add`].
+///
+/// Queues the written trigger if the actor owns its slab, so the slab's active
+/// set never drifts below its DB content (P1). For a pending slab, the actor
+/// drops the hold and `load_step` reads the row later. This keeps the
+/// in-memory queue bounded to the preload window.
+pub(super) async fn handle_add<T>(
+    state: &ActorState<T>,
+    triggers: &mut TriggerQueue,
+    trigger: Trigger,
+) {
+    let slab_id = Slab::from_time(state.segment.slab_size, trigger.time).id();
+    if !owns_slab(state, slab_id) {
+        triggers.remove(&trigger).await;
+        return;
     }
 
     // The key row supplies the tag, even when a partial drain has not advanced
@@ -302,11 +315,7 @@ where
     if tag.is_some_and(|tag| tag != trigger.tag) {
         triggers.remove(&trigger).await;
     }
-    if is_owned {
-        triggers.insert(trigger).await;
-    }
-
-    Ok(())
+    triggers.insert(trigger).await;
 }
 
 /// Deletes completed persisted slabs below the current slab and then advances

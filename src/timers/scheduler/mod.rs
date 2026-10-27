@@ -2,11 +2,11 @@
 //!
 //! Provides [`TriggerScheduler`] backed by a single actor task that owns:
 //!
-//! - **Slab metadata** writes: when a command schedules a trigger for a slab
-//!   the actor hasn't seen, it writes the slab clustering row to persistent
-//!   storage. Past-time slabs (`slab.id <= last_persisted_watermark`) route
-//!   through an atomic UNLOGGED BATCH that also lowers the watermark, so
-//!   invariant I1 holds across crashes.
+//! - **Slab metadata** writes: when a hold names a slab the actor hasn't seen,
+//!   it writes the slab clustering row before the trigger row exists. Past-time
+//!   slabs (`slab.id <= last_persisted_watermark`) route through an atomic
+//!   UNLOGGED BATCH that also lowers the watermark, so invariant I1 holds
+//!   across crashes.
 //! - **Slab preloading**: future slabs are loaded from the store and their
 //!   triggers inserted into the in-memory queue.
 //! - **Slab cleanup**: completed slabs are deleted from the store; the
@@ -22,7 +22,7 @@ use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::timers::active::ActiveTriggers;
-use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
+use crate::timers::datetime::CompactDateTime;
 use crate::timers::queue::TriggerQueue;
 use crate::timers::store::{StoredSegment, TriggerStore};
 use crate::timers::{TimerType, Trigger};
@@ -38,7 +38,7 @@ mod actor;
 pub(crate) mod tests;
 
 /// Size of the internal command and trigger channels.
-const BUFFER_SIZE: usize = 64;
+pub(crate) const BUFFER_SIZE: usize = 64;
 
 /// Asynchronous scheduler for timer [`Trigger`]s.
 ///
@@ -62,8 +62,8 @@ impl<E> Clone for TriggerScheduler<E> {
 /// Command sent from `TriggerScheduler` handles to the actor task.
 ///
 /// Carries an `oneshot` reply so the caller can observe success, a store
-/// error (currently only the Schedule operation can produce one), or a
-/// shutdown signal via the channel being closed.
+/// error (only the Hold operation can produce one), or a shutdown signal via
+/// the channel being closed.
 #[derive(Debug)]
 pub(super) struct Command<E> {
     pub(super) operation: CommandOperation,
@@ -74,8 +74,9 @@ pub(super) struct Command<E> {
 /// Operation variants for [`Command`].
 #[derive(Copy, Clone, Debug)]
 pub(super) enum CommandOperation {
-    /// Insert a trigger: persist slab metadata + add to `TriggerQueue`/
-    /// `ActiveTriggers`.
+    /// Persist slab metadata and hold the trigger in `ActiveTriggers`.
+    Hold,
+    /// Add a written trigger to `TriggerQueue`/`ActiveTriggers`.
     Add,
     /// Remove a trigger from both `DelayQueue` and `ActiveTriggers`.
     Remove,
@@ -136,12 +137,17 @@ where
         &self.active_triggers
     }
 
-    /// Schedule a new [`Trigger`] for future emission.
+    /// Prepares a [`Trigger`] for its row write: the actor persists slab
+    /// metadata and holds the trigger as `Aborted`. Call this before the row
+    /// write and [`schedule`](Self::schedule) after it.
+    pub(crate) async fn hold(&self, trigger: Trigger) -> Result<(), TimerSchedulerError<E>> {
+        self.send_command(CommandOperation::Hold, trigger).await
+    }
+
+    /// Schedules a held [`Trigger`] whose row is written.
     ///
-    /// The actor persists slab metadata (if not already known) and inserts
-    /// the trigger into the in-memory queue. If the slab is at or below the
-    /// current watermark, the slab insert and watermark update are written
-    /// in one UNLOGGED BATCH.
+    /// The actor queues the trigger if it owns the slab. Otherwise it drops
+    /// the hold, and the load loop reads the row later.
     pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerSchedulerError<E>> {
         self.send_command(CommandOperation::Add, trigger).await
     }
@@ -209,10 +215,6 @@ pub enum TimerSchedulerError<E>
 where
     E: ClassifyError + StdError + Send + Sync + 'static,
 {
-    /// A datetime conversion error occurred when scheduling a trigger.
-    #[error(transparent)]
-    DateTime(#[from] CompactDateTimeError),
-
     /// The scheduler has been shut down and cannot accept commands.
     #[error("Timer has been shutdown")]
     Shutdown,
@@ -228,7 +230,6 @@ where
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            Self::DateTime(e) => e.classify_error(),
             // Scheduler is shutting down — partition rebalance / draining.
             Self::Shutdown => ErrorCategory::Transient,
             Self::Store(e) => e.classify_error(),

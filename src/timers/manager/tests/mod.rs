@@ -1068,6 +1068,7 @@ async fn test_abort_firing_preserves_db() -> Result<()> {
     Ok(())
 }
 
+mod cancel;
 mod identity;
 
 // =========================================================================

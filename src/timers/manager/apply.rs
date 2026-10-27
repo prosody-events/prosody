@@ -55,7 +55,7 @@ impl<T: TriggerStore> TimerManagerInner<T> {
         );
 
         // In-memory effects that must precede the atomic write: the new
-        // timer's pre-persist half, then the removal of every replaced time.
+        // timer's hold, then the removal of every replaced time.
         apply_memory(&self.scheduler, &trigger, pre).await?;
         unschedule_replaced_timers(&self.scheduler, &trigger, &existing_times).await?;
 
@@ -165,6 +165,7 @@ where
     match effects.queue {
         QueueEffect::None => {}
         QueueEffect::Dequeue => scheduler.remove_from_queue(trigger.clone()).await?,
+        QueueEffect::Hold => scheduler.hold(trigger.clone()).await?,
         QueueEffect::Insert => scheduler.schedule(trigger.clone()).await?,
         QueueEffect::Remove => scheduler.unschedule(trigger.clone()).await?,
         QueueEffect::Deactivate => {
@@ -211,7 +212,7 @@ where
             .active_triggers()
             .get_state(&old.key, old.time, old.timer_type)
             .await;
-        let (pre, post) = transition(prior, TimerOp::ClearReplaced).phases();
+        let (pre, _) = transition(prior, TimerOp::ClearReplaced).phases();
         debug!(
             key = %old.key,
             timer_type = ?old.timer_type,
@@ -220,7 +221,6 @@ where
             "clear_and_schedule: unscheduling replaced timer"
         );
         apply_memory(scheduler, &old, pre).await?;
-        apply_memory(scheduler, &old, post).await?;
     }
     Ok(())
 }

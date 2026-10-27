@@ -59,6 +59,12 @@ enum Op {
         ty: TimerType,
         tag: i32,
     },
+    Hold {
+        key: Key,
+        time: CompactDateTime,
+        ty: TimerType,
+        tag: i32,
+    },
     Remove {
         key: Key,
         time: CompactDateTime,
@@ -78,6 +84,7 @@ impl Op {
     fn triple(&self) -> Triple {
         match self {
             Op::Insert { key, time, ty, .. }
+            | Op::Hold { key, time, ty, .. }
             | Op::Remove { key, time, ty }
             | Op::SetState { key, time, ty, .. } => (key.clone(), *time, *ty),
         }
@@ -90,14 +97,20 @@ impl Arbitrary for Op {
         let time =
             CompactDateTime::from(TIME_POOL[usize::from(u8::arbitrary(g)) % TIME_POOL.len()]);
         let ty = TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
-        match u8::arbitrary(g) % 3 {
+        match u8::arbitrary(g) % 4 {
             0 => Op::Insert {
                 key,
                 time,
                 ty,
                 tag: i32::arbitrary(g),
             },
-            1 => Op::Remove { key, time, ty },
+            1 => Op::Hold {
+                key,
+                time,
+                ty,
+                tag: i32::arbitrary(g),
+            },
+            2 => Op::Remove { key, time, ty },
             _ => Op::SetState {
                 key,
                 time,
@@ -189,6 +202,16 @@ async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
     );
 }
 
+/// Records a new entry. It replaces only an absent or `Aborted` entry.
+fn insert_model(model: &mut Model, triple: Triple, state: TimerState, tag: i32) {
+    if model
+        .get(&triple)
+        .is_none_or(|entry| entry.state == TimerState::Aborted)
+    {
+        model.insert(triple, ActiveTriggerEntry { state, tag });
+    }
+}
+
 /// Applies each op to the registry and the model in lockstep, asserting
 /// equivalence on the empty state and after every op. `set_state`
 /// return values are compared inline, where the model's pre-op membership is
@@ -218,10 +241,19 @@ async fn run_trace(trace: Trace) {
                         Span::current(),
                     ))
                     .await;
-                model.entry((key, time, ty)).or_insert(ActiveTriggerEntry {
-                    state: TimerState::Scheduled,
-                    tag,
-                });
+                insert_model(&mut model, (key, time, ty), TimerState::Scheduled, tag);
+            }
+            Op::Hold { key, time, ty, tag } => {
+                active
+                    .hold(Trigger::with_tag(
+                        key.clone(),
+                        time,
+                        ty,
+                        tag,
+                        Span::current(),
+                    ))
+                    .await;
+                insert_model(&mut model, (key, time, ty), TimerState::Aborted, tag);
             }
             Op::Remove { key, time, ty } => {
                 active.remove(&key, time, ty).await;
@@ -250,7 +282,7 @@ async fn run_trace(trace: Trace) {
 }
 
 /// The registry tracks a plain `HashMap` model op-for-op across
-/// Insert/Remove/SetState, and every reader (`get_state`, `get`,
+/// Insert/Hold/Remove/SetState, and every reader (`get_state`, `get`,
 /// `contains`, `is_scheduled`, `scan_active_times`, `snapshot`) agrees after
 /// every op.
 #[test]
