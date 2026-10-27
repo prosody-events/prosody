@@ -23,8 +23,10 @@ use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
+use crate::timers::slab::SlabId;
 use crate::timers::store::cassandra::queries::Queries;
-use crate::timers::store::{Segment, SegmentId, SegmentVersion};
+use crate::timers::store::cassandra::trigger_store::anchor_after_watermark;
+use crate::timers::store::{Segment, SegmentId, SegmentVersion, StoredSegment};
 use educe::Educe;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use quick_cache::sync::Cache;
@@ -33,6 +35,7 @@ use scylla::serialize::row::SerializeRow;
 use scylla::statement::prepared::PreparedStatement;
 use state::{CachedState, StateCacheKey};
 use std::sync::Arc;
+use tracing::instrument;
 
 mod error;
 mod mutators;
@@ -164,6 +167,39 @@ impl CassandraTriggerStore {
         v1::V1Operations::new(self.store.clone(), Arc::clone(&self.queries))
     }
 
+    /// Writes the segment version: the commit point of a version migration.
+    #[instrument(level = "debug", skip(self), err)]
+    async fn update_segment_version(
+        &self,
+        version: SegmentVersion,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        self.execute_unpaged_discard(
+            &self.queries().update_segment_version,
+            (version, self.segment.id),
+        )
+        .await
+    }
+
+    /// Writes the slab size and slab watermark of `segment` in one batch:
+    /// the commit point of a slab-size migration. The watermark gets the same
+    /// TTL as the other watermark writes.
+    #[instrument(level = "debug", skip(self), err)]
+    async fn update_segment_slab_size(
+        &self,
+        segment: &StoredSegment,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        let slab_size = segment.segment.slab_size;
+        let ttl = self.calculate_ttl(anchor_after_watermark(segment.slab_watermark, slab_size));
+        let watermark = segment
+            .slab_watermark
+            .map(|w| i32::from_le_bytes(w.to_le_bytes()));
+        self.execute_unpaged_discard(
+            &self.queries().update_segment_slab_size,
+            (slab_size, self.segment.id, ttl, watermark, self.segment.id),
+        )
+        .await
+    }
+
     /// Reads a segment from the database without applying any migrations.
     ///
     /// This is an internal helper used during migration to reload segments
@@ -171,7 +207,7 @@ impl CassandraTriggerStore {
     pub(super) async fn get_segment_unchecked(
         &self,
         segment_id: &SegmentId,
-    ) -> Result<Option<Segment>, CassandraTriggerStoreError> {
+    ) -> Result<Option<StoredSegment>, CassandraTriggerStoreError> {
         let row = self
             .session()
             .execute_unpaged(&self.queries().get_segment, (segment_id,))
@@ -179,20 +215,20 @@ impl CassandraTriggerStore {
             .map_err(CassandraStoreError::from)?
             .into_rows_result()
             .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<(String, CompactDuration, Option<SegmentVersion>)>()
+            .maybe_first_row::<(String, CompactDuration, Option<SegmentVersion>, Option<i32>)>()
             .map_err(CassandraStoreError::from)?;
 
-        let Some((name, slab_size, version)) = row else {
+        let Some((name, slab_size, version, slab_watermark)) = row else {
             return Ok(None);
         };
 
-        let version = version.unwrap_or(SegmentVersion::V1);
-
-        Ok(Some(Segment {
+        let segment = Segment {
             id: *segment_id,
             name,
             slab_size,
-            version,
-        }))
+            version: version.unwrap_or(SegmentVersion::V1),
+        };
+        let slab_watermark = slab_watermark.map(|w| SlabId::from_le_bytes(w.to_le_bytes()));
+        Ok(Some(StoredSegment::new(segment, slab_watermark)))
     }
 }
