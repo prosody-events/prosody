@@ -23,7 +23,7 @@ use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::tests::common::KEY_POOL;
 use crate::timers::store::tests::prop_key_triggers::{KeyTriggerOperation, KeyTriggerTestInput};
-use crate::timers::store::{Segment, SegmentId, SegmentVersion};
+use crate::timers::store::{Segment, SegmentId, SegmentVersion, StoredSegment};
 use crate::timers::test_support::test_segment;
 use crate::tracing::init_test_logging;
 use crate::trigger_store_tests;
@@ -89,25 +89,26 @@ fn prop_segment_layout_fence() {
         use crate::error::{ClassifyError, ErrorCategory};
         let (store, id) = setup_test_store_with_version("layout-fence", SegmentVersion::V3).await?;
         let slab_size = CompactDuration::new(u32::from(slab_size).max(1));
+        let segment = Segment {
+            slab_size,
+            ..store.segment.clone()
+        };
         store
-            .update_segment_version(SegmentVersion::V3, slab_size)
+            .update_segment_slab_size(&StoredSegment::from(segment))
             .await?;
         let acquired = store
             .get_segment()
             .await?
             .ok_or_else(|| color_eyre::eyre::eyre!("segment missing"))?;
-        assert_eq!(acquired.version, SegmentVersion::V4);
+        assert_eq!(acquired.into_parts().0.version, SegmentVersion::V4);
         let durable = store
             .get_segment_unchecked(&id)
             .await?
             .ok_or_else(|| color_eyre::eyre::eyre!("segment missing"))?;
-        assert_eq!(durable.version, SegmentVersion::V4);
+        assert_eq!(durable.into_parts().0.version, SegmentVersion::V4);
         store
             .session()
-            .execute_unpaged(
-                &store.queries().update_segment_version,
-                (5_i8, store.segment.slab_size, id),
-            )
+            .execute_unpaged(&store.queries().update_segment_version, (5_i8, id))
             .await?;
         let error = store
             .get_segment()
@@ -1566,26 +1567,15 @@ async fn prop_timer_state_invariant(
     Ok(())
 }
 
-/// Regression test for `tombstone_warn_threshold` warnings emitted by
-/// `get_segment` and `get_slab_watermark` on actor startup.
+/// The segment read skips the deleted slabs below a live slab row.
 ///
-/// Both queries select only static columns from `timer_segments` with
-/// `LIMIT 1`. With no clustering predicate, Cassandra walks the iterator
-/// from the bottom up to materialise the static row — straight through
-/// the tombstone graveyard the load-driven sweeper (PR #34) leaves at
-/// low `slab_id`. Appending `ORDER BY slab_id DESC` resolves on the
-/// live tail and skips the graveyard entirely.
-///
-/// This test seeds that exact partition shape — a dense band of
-/// tombstones at low `slab_id`, a small set of live rows above the
-/// watermark, and `slab_watermark` raised to the boundary — and asserts
-/// the two reads return the correct values. The assertion is purely
-/// behavioural; the explicit `ORDER BY slab_id DESC` in
-/// `queries.rs` is itself the durable statement about scan direction.
+/// The test seeds more tombstones at low `slab_id` than the default
+/// `tombstone_warn_threshold` of 1,000. Live slab rows sit above them, and
+/// the watermark sits between. The read must return no Cassandra warning and
+/// the correct static values.
 #[tokio::test]
 async fn test_segment_reads_skip_low_slab_tombstones() -> Result<()> {
-    /// Density of the tombstone band — chosen to mimic the post-sweeper
-    /// graveyard observed in production (~5k cells per segment partition).
+    /// About the tombstone count of one production segment partition.
     const TOMBSTONE_COUNT: u32 = 5_000;
 
     init_test_logging();
@@ -1606,27 +1596,25 @@ async fn test_segment_reads_skip_low_slab_tombstones() -> Result<()> {
         store.insert_slab(Slab::new(slab_id, slab_size)).await?;
     }
 
-    // Raise the watermark to the boundary — same as the sweeper would.
     let watermark = TOMBSTONE_COUNT;
     store.set_slab_watermark(Some(watermark)).await?;
 
-    // `get_segment`: forward scan walked the graveyard; reverse scan
-    // resolves on a live row at the top of the partition.
-    let segment = store
+    let result = store
+        .session()
+        .execute_unpaged(&store.queries().get_segment, (segment_id,))
+        .await?;
+    let warnings: Vec<&str> = result.warnings().collect();
+    assert!(warnings.is_empty(), "segment read warned: {warnings:?}");
+
+    let (segment, observed_watermark) = store
         .get_segment()
         .await?
-        .ok_or_else(|| color_eyre::eyre::eyre!("segment missing after insert"))?;
-    assert_eq!(segment.id, segment_id);
-    assert_eq!(segment.name, segment_name);
-    assert_eq!(segment.slab_size, slab_size);
-
-    // `get_slab_watermark`: same partition, same problem, same fix.
-    let observed_watermark = store.get_slab_watermark().await?;
-    assert_eq!(
-        observed_watermark,
-        Some(watermark),
-        "watermark roundtrip should ignore low-slab tombstones",
-    );
+        .ok_or_else(|| color_eyre::eyre::eyre!("segment missing after insert"))?
+        .into_parts();
+    assert_eq!(segment.id, segment_id, "segment id");
+    assert_eq!(segment.name, segment_name, "segment name");
+    assert_eq!(segment.slab_size, slab_size, "segment slab size");
+    assert_eq!(observed_watermark, Some(watermark), "slab watermark");
 
     store.delete_segment().await?;
     Ok(())

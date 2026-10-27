@@ -39,7 +39,7 @@ use uuid::Uuid;
 pub mod cassandra;
 pub mod memory;
 
-/// Internal primitive operations trait (22 methods).
+/// Internal primitive operations trait.
 ///
 /// The trait itself is `pub` to satisfy Rust's visibility rules (used in public
 /// `TableAdapter`), but is not re-exported, keeping it effectively internal.
@@ -206,6 +206,63 @@ impl Segment {
     }
 }
 
+/// A [`Segment`] as persisted, with its slab watermark.
+///
+/// The watermark is a slab id in the segment slab size. Invariant I1: when the
+/// watermark is set, every slab row of the segment has a higher slab id. A
+/// caller of [`StoredSegment::new`] must keep I1. A slab-size
+/// change converts the watermark to the new slab size. The old slab rows start
+/// at or after the end of the watermark slab. The new watermark is one below
+/// the new slab that holds that time.
+#[derive(Clone, Debug)]
+pub struct StoredSegment {
+    segment: Segment,
+    slab_watermark: Option<SlabId>,
+}
+
+impl StoredSegment {
+    /// Pairs a segment with the slab watermark read from the same row.
+    ///
+    /// It is public so that a [`TriggerStore`] outside the crate can build one.
+    #[must_use]
+    pub fn new(segment: Segment, slab_watermark: Option<SlabId>) -> Self {
+        Self {
+            segment,
+            slab_watermark,
+        }
+    }
+
+    /// Splits into the segment and its slab watermark.
+    #[must_use]
+    pub fn into_parts(self) -> (Segment, Option<SlabId>) {
+        (self.segment, self.slab_watermark)
+    }
+
+    /// Changes the slab size and converts the watermark to the new size.
+    fn resize(self, slab_size: CompactDuration) -> Self {
+        let old_slab_size = self.segment.slab_size;
+        let slab_watermark = self.slab_watermark.and_then(|watermark| {
+            let start = Slab::new(watermark, old_slab_size).next()?.range().start;
+            Slab::from_time(slab_size, start).id().checked_sub(1)
+        });
+
+        Self {
+            segment: Segment {
+                slab_size,
+                ..self.segment
+            },
+            slab_watermark,
+        }
+    }
+}
+
+/// A new segment has no slab watermark.
+impl From<Segment> for StoredSegment {
+    fn from(segment: Segment) -> Self {
+        Self::new(segment, None)
+    }
+}
+
 /// Factory for segment-scoped [`TriggerStore`] instances.
 ///
 /// Holds shared resources and creates per-segment stores; store creation is
@@ -232,12 +289,12 @@ pub trait TriggerStoreProvider: Clone + Send + Sync + 'static {
 /// Storage backends can implement this trait in two ways:
 ///
 /// 1. **Via `TableAdapter`** (recommended for most backends):
-///    - Implement internal `TriggerOperations` trait (22 primitive methods)
+///    - Implement internal `TriggerOperations` trait
 ///    - Wrap in `TableAdapter<T>` which implements `TriggerStore`
 ///    - Best-effort consistency using parallel execution
 ///
 /// 2. **Direct implementation** (for transactional backends):
-///    - Implement `TriggerStore` directly (13 methods)
+///    - Implement `TriggerStore` directly
 ///    - Use database transactions for atomic dual-table operations
 ///    - Provides ACID guarantees
 ///
@@ -263,17 +320,20 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     fn slab_size(&self) -> CompactDuration;
 
     // ===================================================================
-    // Segment Operations (2 methods) - Used by Loader
+    // Segment Operations - Used by Loader
     // ===================================================================
 
-    /// Retrieves this store's segment metadata from persistent storage.
-    fn get_segment(&self) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send;
+    /// Retrieves this store's segment metadata and slab watermark from
+    /// persistent storage in one read.
+    fn get_segment(
+        &self,
+    ) -> impl Future<Output = Result<Option<StoredSegment>, Self::Error>> + Send;
 
     /// Persists this store's segment metadata.
     fn insert_segment(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // ===================================================================
-    // Slab Query Operations (2 methods) - Used by Loader
+    // Slab Query Operations - Used by Loader
     // ===================================================================
 
     /// Streams slab IDs within a time range for this store's segment.
@@ -289,7 +349,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'_, Self>;
 
     // ===================================================================
-    // Slab Metadata Writes (2 methods) - Used by SchedulerActor
+    // Slab Metadata Writes - Used by SchedulerActor
     // ===================================================================
 
     /// Inserts slab metadata (the `(id, slab_id)` clustering row). Used by
@@ -303,17 +363,8 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     fn delete_slab(&self, slab_id: SlabId) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // ===================================================================
-    // Slab Watermark Operations (3 methods) - Used by SchedulerActor
+    // Slab Watermark Operations - Used by SchedulerActor
     // ===================================================================
-
-    /// Reads the persisted `slab_watermark` for this segment.
-    ///
-    /// `None` = pre-migration / fresh segment → callers should treat as
-    /// "scan from slab 0". When `Some(w)`, every slab clustering row in this
-    /// segment has `slab_id > w`.
-    fn get_slab_watermark(
-        &self,
-    ) -> impl Future<Output = Result<Option<SlabId>, Self::Error>> + Send;
 
     /// Persists `slab_watermark` for this segment.
     fn set_slab_watermark(
@@ -330,7 +381,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // ===================================================================
-    // Key Query Operations (2 methods) - Used by TimerManager
+    // Key Query Operations - Used by TimerManager
     // ===================================================================
 
     /// Streams scheduled times for a key and timer type.
@@ -353,7 +404,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'a, Self>;
 
     // ===================================================================
-    // Coordinated Write Operations (3 methods) - Used by TimerManager
+    // Coordinated Write Operations - Used by TimerManager
     // ===================================================================
 
     /// Adds a trigger to both slab and key tables.

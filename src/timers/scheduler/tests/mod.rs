@@ -13,7 +13,8 @@
 //!       a slab that has active triggers or that contains `now`.
 //!   P5 (restart preserves): the property holds across actor restart, so no
 //!       timer rows can be lost when the in-memory state is discarded and
-//!       rebuilt against the same store.
+//!       rebuilt against the same store. This includes a restart over a stale
+//!       watermark that an older version left.
 //!   P6 (cleanup progress): a persisted slab at or below the load high-water
 //!       that is neither active nor current-time is deleted by cleanup, even
 //!       when it has no trigger rows.
@@ -21,6 +22,7 @@
 //!       the watermark lowers the watermark, preserves compact ownership, and
 //!       activates the trigger.
 
+mod seed;
 pub(crate) mod support;
 
 use super::actor::{
@@ -37,7 +39,7 @@ use crate::timers::queue::TriggerQueue;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
-use crate::timers::store::{Segment, TriggerStore};
+use crate::timers::store::{Segment, StoredSegment, TriggerStore};
 use crate::timers::test_support::test_segment;
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
@@ -49,7 +51,7 @@ use std::result::Result as StdResult;
 use std::time::Duration as StdDuration;
 use strum::VariantArray;
 use tokio::runtime::Builder as RuntimeBuilder;
-use tokio::time::{Instant, advance};
+use tokio::time::advance;
 use tracing::Span;
 
 /// Tests use a 300s slab and a deterministic preload window so slab
@@ -59,17 +61,26 @@ const PRELOAD_SECS: u32 = 120;
 
 type TestStore = TableAdapter<InMemoryTriggerStore>;
 
+/// Starts the actor state as `run_actor` does, with a fixed preload window.
+fn start_state(
+    store: TestStore,
+    segment: StoredSegment,
+    now: CompactDateTime,
+) -> ActorState<TestStore> {
+    let mut state = ActorState::start(store, segment, now);
+    state.preload_window = CompactDuration::new(PRELOAD_SECS);
+    state
+}
+
+/// Starts the actor state for a new segment, which has no watermark.
 fn fresh_state(store: TestStore, segment: Segment) -> ActorState<TestStore> {
-    let now = Instant::now();
-    ActorState {
-        store,
-        segment,
-        known_slab_ids: BTreeSet::new(),
-        last_persisted_watermark: None,
-        highest_loaded_slab_id: None,
-        preload_window: CompactDuration::new(PRELOAD_SECS),
-        next_load_at: now,
-    }
+    start_state(store, segment.into(), CompactDateTime::MIN)
+}
+
+/// Reads the persisted slab watermark through the segment read.
+async fn persisted_watermark(store: &TestStore) -> Option<SlabId> {
+    let Ok(segment) = store.get_segment().await;
+    segment.and_then(|segment| segment.into_parts().1)
 }
 
 // ===================================================================
@@ -152,7 +163,11 @@ enum Op {
     Abort(TriggerSpec),
     LoadStep,
     CleanupStep,
-    Restart,
+    /// Restarts the actor. A stale restart first writes the watermark that
+    /// an older version left after a change from 1-minute slabs.
+    Restart {
+        stale_watermark: bool,
+    },
 }
 
 /// Compact, hashable trigger identity used by the generator and the
@@ -207,7 +222,9 @@ impl Arbitrary for Op {
             7 => Self::Abort(TriggerSpec::arbitrary(g)),
             8..=9 => Self::LoadStep,
             10 => Self::CleanupStep,
-            _ => Self::Restart,
+            _ => Self::Restart {
+                stale_watermark: bool::arbitrary(g),
+            },
         }
     }
 }
@@ -310,7 +327,7 @@ impl Fixture {
                 Ok(())
             }
             Op::CleanupStep => self.check_cleanup_effects().await,
-            Op::Restart => self.apply_restart().await,
+            Op::Restart { stale_watermark } => self.apply_restart(stale_watermark).await,
         }
     }
 
@@ -424,13 +441,18 @@ impl Fixture {
         Ok(())
     }
 
-    async fn apply_restart(&mut self) -> StdResult<(), String> {
-        self.state = fresh_state(self.store.clone(), self.segment.clone());
-        self.state.last_persisted_watermark = self
-            .store
-            .get_slab_watermark()
-            .await
-            .map_err(|e| format!("get_slab_watermark on restart: {e:?}"))?;
+    async fn apply_restart(&mut self, stale_watermark: bool) -> StdResult<(), String> {
+        let now = CompactDateTime::now().map_err(|e| format!("wall-clock now: {e:?}"))?;
+        if stale_watermark {
+            let old_slab = Slab::from_time(CompactDuration::new(60), now);
+            let Ok(()) = self
+                .store
+                .set_slab_watermark(old_slab.id().checked_sub(1))
+                .await;
+        }
+        let Ok(segment) = self.store.get_segment().await;
+        let segment = segment.ok_or("restart: segment missing")?;
+        self.state = start_state(self.store.clone(), segment, now);
         self.triggers = TriggerQueue::new();
         for model in self.expected.values_mut() {
             model.active_state = None;
@@ -481,6 +503,14 @@ impl Fixture {
         Ok(())
     }
 
+    /// The slab of the wall clock, as cleanup and actor start compute it.
+    fn current_slab(&self) -> SlabId {
+        match CompactDateTime::now() {
+            Ok(t) => Slab::from_time(self.segment.slab_size, t).id(),
+            Err(_) => self.now_slab,
+        }
+    }
+
     fn model_for(&self, key: &Key, time: CompactDateTime, ty: TimerType) -> TriggerModel {
         self.expected
             .get(&(key.clone(), time, ty))
@@ -526,10 +556,7 @@ impl Fixture {
             .map_err(|e| format!("get_slab_range before cleanup: {e:?}"))?;
         let before_watermark = self.state.last_persisted_watermark;
 
-        let now_slab = match CompactDateTime::now() {
-            Ok(t) => Slab::from_time(self.segment.slab_size, t).id(),
-            Err(_) => self.now_slab,
-        };
+        let now_slab = self.current_slab();
 
         let expected_deletes = cleanup_candidates_for_test(
             self.state.highest_loaded_slab_id,
@@ -617,12 +644,12 @@ impl Fixture {
                 "P3 violated: watermark={w} but slab {min_slab} present"
             ));
         }
-        let persisted_watermark = self
-            .store
-            .get_slab_watermark()
-            .await
-            .map_err(|e| format!("get_slab_watermark: {e:?}"))?;
-        if persisted_watermark != watermark {
+        // A start discards a stale watermark, which stays in the store until
+        // cleanup writes a new one.
+        let persisted_watermark = persisted_watermark(&self.store).await;
+        let discarded =
+            watermark.is_none() && persisted_watermark.is_some_and(|w| w >= self.current_slab());
+        if persisted_watermark != watermark && !discarded {
             return Err(format!(
                 "watermark drift: actor={watermark:?} store={persisted_watermark:?}"
             ));
@@ -800,8 +827,11 @@ async fn test_cleanup_preserves_aborted_timer_slab_and_reload_schedules_it() -> 
         "cleanup must not delete the persisted timer row"
     );
 
-    let mut reloaded_state = fresh_state(store.clone(), segment.clone());
-    reloaded_state.last_persisted_watermark = store.get_slab_watermark().await?;
+    let stored = store
+        .get_segment()
+        .await?
+        .ok_or_else(|| eyre!("segment missing"))?;
+    let mut reloaded_state = start_state(store.clone(), stored, now);
     let mut reloaded_triggers = TriggerQueue::new();
     load_step(&mut reloaded_state, &mut reloaded_triggers).await;
 
