@@ -142,8 +142,8 @@ impl Arbitrary for InterleavedScenario {
 
         for _ in 0..op_count {
             let has_pending = !pending.is_empty();
-            // 60% Request, 40% Await when both are possible; always Request when nothing is
-            // pending.
+            // 60% Request, 40% Await when both are possible; always Request
+            // when nothing is pending.
             let do_request = !has_pending || (usize::arbitrary(g) % 5) < 3;
 
             if do_request {
@@ -419,7 +419,7 @@ async fn prepare_interleaved_topics() -> color_eyre::Result<Vec<String>> {
     let mut topics = Vec::with_capacity(INTERLEAVED_TOPIC_COUNT);
     for _ in 0..INTERLEAVED_TOPIC_COUNT {
         let name = test_topic("prop_interleaved");
-        if let Err(error) = create_topic_with_partitions(&name, INTERLEAVED_PARTITION_COUNT).await {
+        if let Err(error) = create_topic(&name, INTERLEAVED_PARTITION_COUNT).await {
             return match cleanup_topics(&topics).await {
                 Ok(()) => Err(error),
                 Err(cleanup) => Err(color_eyre::eyre::eyre!(
