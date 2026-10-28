@@ -5,6 +5,7 @@ use crate::consumer::middleware::tests::test_support::{
     create_test_trigger,
 };
 use crate::error::ErrorCategory;
+use crate::test_util::capture_events;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use color_eyre::eyre::{Result, bail};
@@ -14,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::runtime::Builder;
 use tokio::time::{sleep as tokio_sleep, timeout};
-use tracing::Span;
+use tracing::{Level, Span};
 
 use dispatch_signals::create_offset_tracker;
 
@@ -177,6 +178,45 @@ async fn shutdown_during_retry_sleep_returns_error() -> Result<()> {
     let result = join_result?;
 
     assert!(result.is_err(), "Should return error on shutdown");
+    Ok(())
+}
+
+// === Terminal Abort Alerts ===
+
+const TERMINAL_ABORT: &str = "terminal condition encountered while handling message";
+
+/// Runs one message that fails `Terminal` through the outermost retry layer
+/// and returns how many error events reported the abort.
+async fn terminal_abort_alerts(shutdown: bool) -> Result<usize> {
+    let (errors, _guard) = capture_events(Level::ERROR);
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Terminal);
+    let retry_handler = create_retry_handler(handler.clone(), 10);
+    let context = MockEventContext::new();
+    if shutdown {
+        context.request_shutdown();
+    }
+
+    let tracker = create_offset_tracker();
+    let uncommitted_offset = tracker.take(0).await?;
+    let message = create_test_message()?.into_uncommitted(uncommitted_offset);
+    EventHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
+
+    assert_eq!(handler.call_count(), 1);
+    assert_eq!(tracker.shutdown().await, None, "offset should be aborted");
+    Ok(errors.count(TERMINAL_ABORT))
+}
+
+/// A `Terminal` abort outside shutdown holds the partition, so it alerts once.
+#[tokio::test]
+async fn terminal_abort_logs_error() -> Result<()> {
+    assert_eq!(terminal_abort_alerts(false).await?, 1);
+    Ok(())
+}
+
+/// A shutdown abort is expected and does not alert.
+#[tokio::test]
+async fn shutdown_abort_logs_no_error() -> Result<()> {
+    assert_eq!(terminal_abort_alerts(true).await?, 0);
     Ok(())
 }
 

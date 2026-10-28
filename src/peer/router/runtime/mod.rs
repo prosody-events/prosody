@@ -367,7 +367,10 @@ async fn refresh_registration<D: PeerDirectory>(
     mut stopped: watch::Receiver<bool>,
 ) {
     heartbeat.beat();
-    let mut refresh_at = Instant::now() + refresh_delay(ttl);
+    // `activate` registers before it starts this task.
+    let mut registered_at = Instant::now();
+    let mut lapsed = false;
+    let mut refresh_at = registered_at + refresh_delay(ttl);
     loop {
         select! {
             () = sleep_until(refresh_at) => {}
@@ -388,8 +391,23 @@ async fn refresh_registration<D: PeerDirectory>(
         }
         // A store failure must never end this task: a dead refresher makes the
         // peer vanish one lease later.
-        if let Err(error) = directory.register(&registration).await {
-            warn!(%error, peer = %registration.peer, "peer registration refresh failed");
+        // The store starts the lease when it applies the write, which is no
+        // earlier than this instant.
+        let attempted_at = Instant::now();
+        match directory.register(&registration).await {
+            Ok(()) => {
+                registered_at = attempted_at;
+                lapsed = false;
+            }
+            // A lapsed lease makes other peers drop responses to this peer.
+            // Alert once for each lapse.
+            Err(error) if !lapsed && registered_at.elapsed() >= ttl.duration() => {
+                error!(%error, peer = %registration.peer, "peer registration lapsed");
+                lapsed = true;
+            }
+            Err(error) => {
+                warn!(%error, peer = %registration.peer, "peer registration refresh failed");
+            }
         }
         heartbeat.beat();
         refresh_at = Instant::now() + refresh_delay(ttl);

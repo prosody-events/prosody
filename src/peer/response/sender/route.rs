@@ -16,7 +16,7 @@ use std::fmt::Display;
 use std::future::{Future, ready};
 use tokio::time::{Instant, timeout_at};
 use tracing::field::Empty;
-use tracing::{Instrument, Span, debug_span, warn};
+use tracing::{Instrument, Span, debug_span, error, warn};
 
 use crate::peer::router::LocalTarget;
 
@@ -276,8 +276,9 @@ where
             Stage::Framed.record(router.peer_metrics());
             PreparedResponse::Ready(staged)
         }
+        // A codec fault never clears by retry, and the response is lost.
         Err(error) => {
-            warn!(%error, peer = %header.target, "response could not be framed");
+            error!(%error, peer = %header.target, "response could not be framed");
             PreparedResponse::Rejected(header, DropReason::EncodeFailed)
         }
     }

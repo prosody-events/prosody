@@ -602,10 +602,13 @@ err(level = "warn"))]` for internal plumbing.
 error to a caller that decides what it means, so its `err` event logs at warn.
 Mark a hand-built span failed with `otel::mark_failed`. The OTel layer marks a
 span failed from a warn event only when the event has an `error` field and no
-message (`warn_failures_mark_their_span_failed`). A failure that Prosody
-retries also logs at warn. Log at error only where work is lost or a retry
-ends: a discarded message or timer, exhausted attempts, a skipped durability
-step, or a broken invariant. Create every Kafka client with
+message (`warn_failures_mark_their_span_failed`). A `Transient` failure that
+Prosody retries also logs at warn. Log at error where work is lost, a retry
+ends, or a retry cannot succeed: a discarded message or timer, exhausted
+attempts, a skipped durability step, a `Terminal` abort outside shutdown, a
+non-`Transient` error in a retry loop, a partition stall, or a broken
+invariant. Before you lower a log to warn, trace its error to the owner that
+logs it at error. Create every Kafka client with
 `kafka_log::LogContext`; the consumer context calls the same log functions. Log
 Kafka poll errors with `kafka_log::log_error`. Then librdkafka connection
 failures log at warn, and other Kafka errors log at error.

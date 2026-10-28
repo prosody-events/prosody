@@ -53,6 +53,17 @@ pub(super) enum LogReason<'a, E> {
     },
 }
 
+/// Which retry layer logs a failure. It sets who owns the failure's outcome.
+#[derive(Clone, Copy)]
+pub(super) enum Layer {
+    /// A `FallibleHandler` layer. The error propagates to an outer layer.
+    Inner,
+
+    /// The `EventHandler` layer. It discards a failed event. A `Terminal`
+    /// abort here holds the partition until a restart, so it alerts.
+    Outermost,
+}
+
 impl<T> RetryHandler<T> {
     /// Calculates the sleep time for a given retry attempt.
     pub(super) fn sleep_time(&self, attempt: u32) -> Duration {
@@ -192,18 +203,21 @@ impl<T> RetryHandler<T> {
     }
 }
 
-/// Emits a structured log for a message-path retry event. `discard_suffix` is
-/// `""` in `FallibleHandler` context (the error propagates upward) and
-/// `"; discarding message"` in `EventHandler` context (the marker commits and
-/// the message is dropped from this consumer's perspective).
+/// Emits a structured log for a message-path retry event. At the
+/// [`Layer::Outermost`] layer the marker commits and the message is dropped
+/// from this consumer's perspective.
 pub(super) fn log_message_failure<E: Display>(
     topic: &str,
     partition: Partition,
     key: &str,
     offset: Offset,
     reason: &LogReason<'_, E>,
-    discard_suffix: &str,
+    layer: Layer,
 ) {
+    let discard_suffix = match layer {
+        Layer::Inner => "",
+        Layer::Outermost => "; discarding message",
+    };
     match *reason {
         LogReason::Retrying {
             attempt,
@@ -234,20 +248,34 @@ pub(super) fn log_message_failure<E: Display>(
             topic,
             "permanently failed to handle message: {error:#}{discard_suffix}",
         ),
-        LogReason::Terminal { attempt, error } => info!(
-            partition,
-            key,
-            offset,
-            attempt,
-            topic,
-            "terminal condition encountered while handling message: {error:#}; aborting",
-        ),
+        LogReason::Terminal { attempt, error } => match layer {
+            Layer::Inner => info!(
+                partition,
+                key,
+                offset,
+                attempt,
+                topic,
+                "terminal condition encountered while handling message: {error:#}; aborting",
+            ),
+            Layer::Outermost => error!(
+                partition,
+                key,
+                offset,
+                attempt,
+                topic,
+                "terminal condition encountered while handling message: {error:#}; aborting",
+            ),
+        },
     }
 }
 
 /// Emits a structured log for a timer-path retry event. See
-/// [`log_message_failure`] for the meaning of `discard_suffix`.
-pub(super) fn log_timer_failure<E: Display>(reason: &LogReason<'_, E>, discard_suffix: &str) {
+/// [`log_message_failure`] for the meaning of `layer`.
+pub(super) fn log_timer_failure<E: Display>(reason: &LogReason<'_, E>, layer: Layer) {
+    let discard_suffix = match layer {
+        Layer::Inner => "",
+        Layer::Outermost => "; discarding timer",
+    };
     match *reason {
         LogReason::Retrying { error, sleep, .. } => warn!(
             "failed to handle timer: {error:#}; retrying after {}",
@@ -259,8 +287,13 @@ pub(super) fn log_timer_failure<E: Display>(reason: &LogReason<'_, E>, discard_s
         LogReason::Permanent { error, .. } => {
             error!("permanently failed to handle timer: {error:#}{discard_suffix}");
         }
-        LogReason::Terminal { error, .. } => {
-            info!("terminal condition encountered while handling timer: {error:#}; aborting");
-        }
+        LogReason::Terminal { error, .. } => match layer {
+            Layer::Inner => {
+                info!("terminal condition encountered while handling timer: {error:#}; aborting");
+            }
+            Layer::Outermost => {
+                error!("terminal condition encountered while handling timer: {error:#}; aborting");
+            }
+        },
     }
 }

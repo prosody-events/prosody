@@ -78,7 +78,7 @@ use crate::{Partition, Topic};
 
 mod engine;
 
-use engine::{Resolution, log_message_failure, log_timer_failure};
+use engine::{Layer, Resolution, log_message_failure, log_timer_failure};
 
 // Configuration
 // ============================================================================
@@ -209,7 +209,7 @@ where
                         key.as_ref(),
                         offset,
                         &reason,
-                        "",
+                        Layer::Inner,
                     );
                 },
             )
@@ -363,7 +363,7 @@ where
                 Some(self.max_retries),
                 |ctx, dt| self.handler.on_timer(ctx, timer.clone(), dt),
                 |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |reason| log_timer_failure(&reason, ""),
+                |reason| log_timer_failure(&reason, Layer::Inner),
             )
             .await;
         match resolution {

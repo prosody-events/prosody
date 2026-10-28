@@ -230,8 +230,8 @@ where
     },
 
     /// The identity store failed.
-    #[error("descriptor identity store failed")]
-    Store(#[source] StoreErr),
+    #[error("descriptor identity store failed: {0:#}")]
+    Store(StoreErr),
 }
 
 impl<StoreErr> ClassifyError for DescriptorIdentityError<StoreErr>

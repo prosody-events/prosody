@@ -1,9 +1,9 @@
 use std::future::Future;
 
 use super::{
-    ConsumerMessage, DemandType, EventContext, EventHandler, Keyed, Resolution, RetryHandler,
-    SettlementHandler, UncommittedMessage, UncommittedTimer, abandon, debug, log_message_failure,
-    log_timer_failure, settle,
+    ConsumerMessage, DemandType, EventContext, EventHandler, Keyed, Layer, Resolution,
+    RetryHandler, SettlementHandler, UncommittedMessage, UncommittedTimer, abandon, debug,
+    log_message_failure, log_timer_failure, settle,
 };
 use crate::consumer::Uncommitted;
 
@@ -38,7 +38,7 @@ async fn process_record<T, C, Q, F, Fut>(
                     key.as_ref(),
                     offset,
                     &reason,
-                    "; discarding message",
+                    Layer::Outermost,
                 );
             },
         )
@@ -118,7 +118,7 @@ where
                 None,
                 |ctx, dt| self.handler.on_timer(ctx, trigger.clone(), dt),
                 |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |reason| log_timer_failure(&reason, "; discarding timer"),
+                |reason| log_timer_failure(&reason, Layer::Outermost),
             )
             .await;
 

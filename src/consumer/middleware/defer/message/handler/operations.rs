@@ -1,4 +1,4 @@
-use tracing::{Instrument, debug, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use super::{MessageDeferHandler, MessageDeferOutput};
 use crate::consumer::event_context::EventContext;
@@ -288,8 +288,9 @@ where
             }
         };
 
+        // This skip loses the deferred message, and no other layer logs it.
         if message.key() != message_key {
-            warn!(
+            error!(
                 expected_key = ?message_key,
                 actual_key = ?message.key(),
                 offset = offset,
@@ -324,8 +325,9 @@ where
         C: EventContext<Payload = T::Payload>,
     {
         match error.classify_error() {
+            // This skip loses the deferred message, and no other layer logs it.
             ErrorCategory::Permanent => {
-                warn!(
+                error!(
                     key = ?message_key,
                     offset = offset,
                     topic = %self.topic,
