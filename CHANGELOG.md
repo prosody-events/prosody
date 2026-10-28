@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.7.2](https://github.com/prosody-events/prosody/compare/prosody-v0.7.1...prosody-v0.7.2) (2026-10-28)
+
+
+### Bug Fixes
+
+* log expected, retried failures at warn ([#118](https://github.com/prosody-events/prosody/issues/118)) ([1e1813a](https://github.com/prosody-events/prosody/commit/1e1813ae98bfdc2ab96565d3b1eb1ed8a457d774))
+* stop timer key-index reads from scanning fired-timer tombstones ([#115](https://github.com/prosody-events/prosody/issues/115)) ([2e7d3ca](https://github.com/prosody-events/prosody/commit/2e7d3cad9689a9286105baf83a75516aa187f06a))
+* **timers:** convert slab watermark on slab-size migration and read segment statics once ([#111](https://github.com/prosody-events/prosody/issues/111)) ([9353b48](https://github.com/prosody-events/prosody/commit/9353b4859ab72fc3e24e4b6780933fefc292bebf))
+
+
+### Performance Improvements
+
+* read each partition from its own librdkafka queue ([#114](https://github.com/prosody-events/prosody/issues/114)) ([98e39f0](https://github.com/prosody-events/prosody/commit/98e39f07144f87f4d642acfb70254edb4b4255af))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * prosody-macros bumped from 0.7.1 to 0.7.2
+
 ## [0.7.1](https://github.com/prosody-events/prosody/compare/prosody-v0.7.0...prosody-v0.7.1) (2026-10-13)
 
 

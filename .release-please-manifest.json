@@ -1,4 +1,4 @@
 {
-  ".": "0.7.1",
-  "crates/prosody-macros": "0.7.1"
+  ".": "0.7.2",
+  "crates/prosody-macros": "0.7.2"
 }
