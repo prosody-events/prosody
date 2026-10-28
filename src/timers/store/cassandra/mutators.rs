@@ -13,12 +13,15 @@
 //! - `Overflow → Inline` and `Overflow → Absent`: a BATCH that range-deletes
 //!   the type's clustering rows and writes the new state atomically.
 //!
-//! Tombstone invariant: a clustering-row tombstone only sits above the
-//! earliest live row of an `Overflow` type. Every other clustering delete is a
-//! range or partition tombstone. It covers all earlier deletes in its range, so
-//! reads do not count them and compaction drops them. Neither the reverse
-//! static read nor the forward peek therefore scans a graveyard of fired
-//! timers.
+//! Tombstone invariant: every clustering delete is a range or partition
+//! tombstone. A delete of one timer covers the whole gap between its live
+//! neighbors, so it also covers every earlier tombstone in that gap. A read
+//! therefore counts a few range markers for each gap it crosses, and no read
+//! scans a graveyard of fired timers.
+//!
+//! A range tombstone also hides an older write in its gap. The owner's session
+//! stamps writes in order, so its later schedules survive. After a rebalance,
+//! a new owner whose clock lags can lose a schedule in a recent gap.
 //!
 //! `resolve_state` shares cached state across clones of the partition's store.
 //! Callers hold the returned lock through each read or write for that key and
@@ -37,7 +40,11 @@ use crate::timers::store::cassandra::trigger_store::extract_span_map;
 use crate::timers::{TimerType, Trigger};
 use scylla::SerializeRow;
 use scylla::errors::MaybeFirstRowError;
+use scylla::serialize::row::SerializeRow;
+use scylla::statement::prepared::PreparedStatement;
+use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::instrument;
@@ -129,7 +136,8 @@ impl CassandraTriggerStore {
             .maybe_first_row::<(Option<TimerState>,)>()
             .map_err(CassandraStoreError::from)?;
 
-        // No row → partition absent. Some(None) → map entry absent. Both → Absent.
+        // No row → partition absent. Some(None) → map entry absent. Both →
+        // Absent.
         Ok(row.and_then(|(entry,)| entry).unwrap_or(TimerState::Absent))
     }
 
@@ -297,39 +305,32 @@ impl CassandraTriggerStore {
         Ok(())
     }
 
-    /// Reads the first 3 clustering rows (time, span, tag) of a key/type.
-    ///
-    /// Rows ascend by time, so the first row is the type's earliest live
-    /// trigger. A delete and the V2→V3 backfill each read it once to choose
-    /// the next state. A third row signals two or more survivors.
-    #[instrument(level = "debug", skip(self), err(level = "warn"))]
-    pub(super) async fn peek_three_key_triggers(
+    /// Reads at most 2 clustering rows of one type with a `peek_*_key_triggers`
+    /// statement.
+    #[instrument(level = "debug", skip(self, statement), err(level = "warn"))]
+    pub(super) async fn peek_key_triggers(
         &self,
-        segment_id: &SegmentId,
-        key: &Key,
-        timer_type: TimerType,
-    ) -> Result<Vec<PeekedTrigger>, CassandraTriggerStoreError> {
+        statement: &PreparedStatement,
+        values: impl SerializeRow + Debug,
+    ) -> Result<SmallVec<[InlineTimer; 2]>, CassandraTriggerStoreError> {
         let rows_result = self
             .session()
-            .execute_unpaged(
-                &self.queries().peek_three_key_triggers,
-                (segment_id, key.as_ref(), timer_type),
-            )
+            .execute_unpaged(statement, values)
             .await
             .map_err(CassandraStoreError::from)?
             .into_rows_result()
             .map_err(CassandraStoreError::from)?;
 
-        let mut out = Vec::with_capacity(3);
-        for row in rows_result
+        let rows = rows_result
             .rows::<PeekedTrigger>()
-            .map_err(CassandraStoreError::from)?
-        {
-            out.push(row.map_err(|e| {
-                CassandraStoreError::from(MaybeFirstRowError::DeserializationFailed(e))
-            })?);
-        }
-        Ok(out)
+            .map_err(CassandraStoreError::from)?;
+        Ok(rows
+            .map(|row| {
+                row.map(InlineTimer::from).map_err(|e| {
+                    CassandraStoreError::from(MaybeFirstRowError::DeserializationFailed(e))
+                })
+            })
+            .collect::<Result<_, _>>()?)
     }
 
     /// Backfills the key state MAP entry for a single `(key, timer_type)` pair.
@@ -356,7 +357,10 @@ impl CassandraTriggerStore {
         }
 
         let mut rows = self
-            .peek_three_key_triggers(segment_id, key, timer_type)
+            .peek_key_triggers(
+                &self.queries().peek_last_key_triggers,
+                (segment_id, key.as_ref(), timer_type),
+            )
             .await?
             .into_iter();
 
@@ -364,14 +368,13 @@ impl CassandraTriggerStore {
             // Stale slab entry: no clustering rows exist.
             (None, _) => {}
             (Some(row), None) => {
-                let state = TimerState::Inline(row.into());
+                let state = TimerState::Inline(row);
                 self.batch_clear_and_set_inline(segment_id, key, timer_type, &state)
                     .await?;
             }
-            (Some(_), Some((second, ..))) => {
-                // Rows ascend by time: anchor the marker TTL to the latest peeked row.
-                let ttl_time = rows.last().map_or(second, |(time, ..)| time);
-                self.set_state_overflow(segment_id, key, timer_type, ttl_time)
+            // The marker expires with the latest row.
+            (Some(latest), Some(_)) => {
+                self.set_state_overflow(segment_id, key, timer_type, latest.time)
                     .await?;
             }
         }

@@ -39,8 +39,7 @@ pub(super) struct ClusteringEntry<'a> {
     pub(super) tag: i32,
 }
 
-/// A single row returned by `peek_three_key_triggers`: trigger time, span,
-/// and tag.
+/// A clustering row read by `peek_key_triggers`: trigger time, span, and tag.
 pub(super) type PeekedTrigger = (CompactDateTime, HashMap<String, String>, Option<i32>);
 
 /// Capacity for the per-partition state cache.

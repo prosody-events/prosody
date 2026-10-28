@@ -132,15 +132,9 @@ cassandra_queries! {
             TABLE_TYPED_KEYS
         ),
 
-        /// Deletes a specific trigger from the key index
-        delete_key_trigger: (
-            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?",
-            TABLE_TYPED_KEYS
-        ),
-
-        /// Deletes every trigger of a type at or before a time with one range tombstone.
-        delete_key_triggers_through: (
-            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time <= ?",
+        /// Deletes every trigger of a type in an inclusive time range with one range tombstone.
+        delete_key_triggers_within: (
+            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time >= ? AND time <= ?",
             TABLE_TYPED_KEYS
         ),
 
@@ -280,9 +274,21 @@ cassandra_queries! {
             TABLE_TYPED_KEYS
         ),
 
-        /// Reads the first 3 clustering rows (time, span, tag) of a key/type in time order.
-        peek_three_key_triggers: (
-            "SELECT time, span, tag FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? LIMIT 3",
+        /// Reads the 2 latest triggers of a type before a time, latest first.
+        peek_key_triggers_before: (
+            "SELECT time, span, tag FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time < ? ORDER BY timer_type DESC, time DESC LIMIT 2",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Reads the 2 earliest triggers of a type after a time, earliest first.
+        peek_key_triggers_after: (
+            "SELECT time, span, tag FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time > ? LIMIT 2",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Reads the 2 latest triggers of a type, latest first.
+        peek_last_key_triggers: (
+            "SELECT time, span, tag FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? ORDER BY timer_type DESC, time DESC LIMIT 2",
             TABLE_TYPED_KEYS
         ),
 
