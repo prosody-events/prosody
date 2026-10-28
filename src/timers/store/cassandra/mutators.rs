@@ -10,8 +10,18 @@
 //! - `Inline → Overflow`: an unlogged BATCH that promotes the old inline timer
 //!   into a new clustering row at the same time as the new one is inserted,
 //!   keeping the transition atomic at the partition level.
-//! - `Overflow → Inline`: a BATCH that deletes all clustering rows and sets the
-//!   new inline state atomically — one round-trip, zero residual tombstones.
+//! - `Overflow → Inline` and `Overflow → Absent`: a BATCH that range-deletes
+//!   the type's clustering rows and writes the new state atomically.
+//!
+//! Tombstone invariant: every clustering delete is a range or partition
+//! tombstone. A delete of one timer covers the whole gap between its live
+//! neighbors, so it also covers every earlier tombstone in that gap. A read
+//! therefore counts a few range markers for each gap it crosses, and no read
+//! scans a graveyard of fired timers.
+//!
+//! A range tombstone also hides an older write in its gap. The owner's session
+//! stamps writes in order, so its later schedules survive. After a rebalance,
+//! a new owner whose clock lags can lose a schedule in a recent gap.
 //!
 //! `resolve_state` shares cached state across clones of the partition's store.
 //! Callers hold the returned lock through each read or write for that key and
@@ -30,7 +40,11 @@ use crate::timers::store::cassandra::trigger_store::extract_span_map;
 use crate::timers::{TimerType, Trigger};
 use scylla::SerializeRow;
 use scylla::errors::MaybeFirstRowError;
+use scylla::serialize::row::SerializeRow;
+use scylla::statement::prepared::PreparedStatement;
+use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::instrument;
@@ -122,7 +136,8 @@ impl CassandraTriggerStore {
             .maybe_first_row::<(Option<TimerState>,)>()
             .map_err(CassandraStoreError::from)?;
 
-        // No row → partition absent. Some(None) → map entry absent. Both → Absent.
+        // No row → partition absent. Some(None) → map entry absent. Both →
+        // Absent.
         Ok(row.and_then(|(entry,)| entry).unwrap_or(TimerState::Absent))
     }
 
@@ -200,40 +215,22 @@ impl CassandraTriggerStore {
         .await
     }
 
-    /// Atomically deletes a single clustering row and sets inline state.
+    /// Atomically clears clustering rows and removes the state entry.
     ///
-    /// Uses a Cassandra BATCH to:
-    /// 1. DELETE the specific clustering row identified by `time_to_delete`
-    /// 2. UPDATE the `state[type]` with the new inline timer data
-    ///
-    /// Both statements target the same `(segment_id, key)` partition, so an
-    /// unlogged batch is correct and carries no cross-partition overhead.
-    /// This is the Overflow→Inline demotion path when exactly 1 clustering
-    /// row remains after a delete.
+    /// One BATCH range-deletes the type's clustering rows and deletes
+    /// `state[type]`. Every transition to `Absent` that can leave clustering
+    /// rows goes through here.
     #[instrument(level = "debug", skip(self), err(level = "warn"))]
-    pub(super) async fn batch_demote_to_inline(
+    pub(super) async fn batch_clear_key_triggers(
         &self,
         segment_id: &SegmentId,
         key: &Key,
         timer_type: TimerType,
-        time_to_delete: CompactDateTime,
-        state: &TimerState,
     ) -> Result<(), CassandraTriggerStoreError> {
-        let timer = require_inline(state)?;
-        let ttl = self.calculate_ttl(timer.time);
+        let key = key.as_ref();
         self.execute_unpaged_discard(
-            &self.queries().batch_demote_to_inline,
-            (
-                segment_id,
-                key.as_ref(),
-                timer_type,
-                time_to_delete,
-                ttl,
-                timer_type,
-                state,
-                segment_id,
-                key.as_ref(),
-            ),
+            &self.queries().batch_clear_key_triggers,
+            (segment_id, key, timer_type, timer_type, segment_id, key),
         )
         .await
     }
@@ -308,180 +305,32 @@ impl CassandraTriggerStore {
         Ok(())
     }
 
-    /// Reads up to 2 remaining clustering trigger times for a key/type.
-    ///
-    /// Used for the demotion check after deleting a clustering row:
-    /// - 0 remaining → state becomes `Absent`
-    /// - 1 remaining → demote to `Inline`
-    /// - 2 remaining → state stays `Overflow`
-    ///
-    /// Also used by migration tests to verify singleton normalization deleted
-    /// the clustering row.
-    ///
-    /// Fetches only `time` — no span — to keep the result small.
-    #[instrument(level = "debug", skip(self), err(level = "warn"))]
-    pub(super) async fn peek_trigger_times(
+    /// Reads at most 2 clustering rows of one type with a `peek_*_key_triggers`
+    /// statement.
+    #[instrument(level = "debug", skip(self, statement), err(level = "warn"))]
+    pub(super) async fn peek_key_triggers(
         &self,
-        segment_id: &SegmentId,
-        key: &Key,
-        timer_type: TimerType,
-    ) -> Result<Vec<CompactDateTime>, CassandraTriggerStoreError> {
+        statement: &PreparedStatement,
+        values: impl SerializeRow + Debug,
+    ) -> Result<SmallVec<[InlineTimer; 2]>, CassandraTriggerStoreError> {
         let rows_result = self
             .session()
-            .execute_unpaged(
-                &self.queries().count_key_triggers,
-                (segment_id, key.as_ref(), timer_type),
-            )
+            .execute_unpaged(statement, values)
             .await
             .map_err(CassandraStoreError::from)?
             .into_rows_result()
             .map_err(CassandraStoreError::from)?;
 
-        let mut out = Vec::with_capacity(2);
-        for row in rows_result
-            .rows::<(CompactDateTime,)>()
-            .map_err(CassandraStoreError::from)?
-        {
-            let (time,) = row.map_err(|e| {
-                CassandraStoreError::from(MaybeFirstRowError::DeserializationFailed(e))
-            })?;
-            out.push(time);
-        }
-        Ok(out)
-    }
-
-    /// Reads the first remaining clustering trigger (time + span) for a
-    /// key/type.
-    ///
-    /// Used in the `1`-remaining demotion branch of `delete_key_trigger` and
-    /// `backfill_key_state` to retrieve the span needed to build inline state.
-    #[instrument(level = "debug", skip(self), err(level = "warn"))]
-    pub(super) async fn peek_first_key_trigger(
-        &self,
-        segment_id: &SegmentId,
-        key: &Key,
-        timer_type: TimerType,
-    ) -> Result<Option<PeekedTrigger>, CassandraTriggerStoreError> {
-        Ok(self
-            .session()
-            .execute_unpaged(
-                &self.queries().peek_first_key_trigger,
-                (segment_id, key.as_ref(), timer_type),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?
-            .into_rows_result()
-            .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<PeekedTrigger>()
-            .map_err(CassandraStoreError::from)?)
-    }
-
-    /// Reads up to 3 clustering rows (time, span, tag) for a key/type.
-    ///
-    /// Used by `delete_key_trigger`'s Overflow branch as a single pre-delete
-    /// read: the caller filters the target time out and inspects what remains
-    /// to choose between three post-delete states (Absent / Inline / Overflow).
-    /// Returning a third row signals "≥2 survivors" without needing its data.
-    #[instrument(level = "debug", skip(self), err(level = "warn"))]
-    pub(super) async fn peek_three_key_triggers(
-        &self,
-        segment_id: &SegmentId,
-        key: &Key,
-        timer_type: TimerType,
-    ) -> Result<Vec<PeekedTrigger>, CassandraTriggerStoreError> {
-        let rows_result = self
-            .session()
-            .execute_unpaged(
-                &self.queries().peek_three_key_triggers,
-                (segment_id, key.as_ref(), timer_type),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?
-            .into_rows_result()
-            .map_err(CassandraStoreError::from)?;
-
-        let mut out = Vec::with_capacity(3);
-        for row in rows_result
+        let rows = rows_result
             .rows::<PeekedTrigger>()
-            .map_err(CassandraStoreError::from)?
-        {
-            out.push(row.map_err(|e| {
-                CassandraStoreError::from(MaybeFirstRowError::DeserializationFailed(e))
-            })?);
-        }
-        Ok(out)
-    }
-
-    /// Atomic batch: DELETE target clustering row + DELETE `state[type]`.
-    ///
-    /// Used by `delete_key_trigger`'s Overflow branch when the pre-delete
-    /// read shows zero non-target rows. Both statements target the same
-    /// `(segment_id, key)` partition so the unlogged batch carries no
-    /// cross-partition coordination overhead and is atomic on the replica.
-    #[instrument(level = "debug", skip(self), err(level = "warn"))]
-    pub(super) async fn batch_delete_to_absent(
-        &self,
-        segment_id: &SegmentId,
-        key: &Key,
-        timer_type: TimerType,
-        target_time: CompactDateTime,
-    ) -> Result<(), CassandraTriggerStoreError> {
-        let key_ref = key.as_ref();
-        self.execute_unpaged_discard(
-            &self.queries().batch_delete_to_absent,
-            (
-                segment_id,
-                key_ref,
-                timer_type,
-                target_time,
-                timer_type,
-                segment_id,
-                key_ref,
-            ),
-        )
-        .await
-    }
-
-    /// Atomic batch: DELETE target clustering + DELETE surviving clustering +
-    /// UPDATE state Inline.
-    ///
-    /// Used by `delete_key_trigger`'s Overflow branch when the pre-delete
-    /// read shows exactly one non-target row will survive. The survivor's
-    /// time/span/tag has already been captured into `state` so the UPDATE
-    /// writes Inline state in the same round-trip, avoiding a separate
-    /// target DELETE and a separate demote BATCH.
-    #[instrument(level = "debug", skip(self), err(level = "warn"))]
-    pub(super) async fn batch_delete_to_inline(
-        &self,
-        segment_id: &SegmentId,
-        key: &Key,
-        timer_type: TimerType,
-        target_time: CompactDateTime,
-        surviving_time: CompactDateTime,
-        state: &TimerState,
-    ) -> Result<(), CassandraTriggerStoreError> {
-        let timer = require_inline(state)?;
-        let key_ref = key.as_ref();
-        let ttl = self.calculate_ttl(timer.time);
-        self.execute_unpaged_discard(
-            &self.queries().batch_delete_to_inline,
-            (
-                segment_id,
-                key_ref,
-                timer_type,
-                target_time,
-                segment_id,
-                key_ref,
-                timer_type,
-                surviving_time,
-                ttl,
-                timer_type,
-                state,
-                segment_id,
-                key_ref,
-            ),
-        )
-        .await
+            .map_err(CassandraStoreError::from)?;
+        Ok(rows
+            .map(|row| {
+                row.map(InlineTimer::from).map_err(|e| {
+                    CassandraStoreError::from(MaybeFirstRowError::DeserializationFailed(e))
+                })
+            })
+            .collect::<Result<_, _>>()?)
     }
 
     /// Backfills the key state MAP entry for a single `(key, timer_type)` pair.
@@ -490,8 +339,7 @@ impl CassandraTriggerStore {
     /// state MAP entry, this method writes the appropriate state:
     /// - If state already non-Absent: skip (idempotent).
     /// - 0 clustering rows: skip (stale slab entry, truly absent).
-    /// - 1 clustering row: normalize to inline state (concurrent
-    ///   `set_state_inline` + delete clustering row).
+    /// - 1 clustering row: move it into inline state.
     /// - ≥2 clustering rows: set overflow marker.
     #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(super) async fn backfill_key_state(
@@ -501,45 +349,32 @@ impl CassandraTriggerStore {
         timer_type: TimerType,
     ) -> Result<(), CassandraTriggerStoreError> {
         // Skip if already has state (idempotency guard).
-        // Uses fetch_state (DB-direct) because backfill writes via set_state_inline /
-        // set_state_overflow without updating the in-memory cache.
+        // Uses fetch_state (DB-direct) because backfill writes without updating
+        // the in-memory cache.
         let state = self.fetch_state(segment_id, key, timer_type).await?;
         if !matches!(state, TimerState::Absent) {
             return Ok(());
         }
 
-        // Count clustering rows (LIMIT 2, time only — no span allocation).
-        let times = self.peek_trigger_times(segment_id, key, timer_type).await?;
+        let mut rows = self
+            .peek_key_triggers(
+                &self.queries().peek_last_key_triggers,
+                (segment_id, key.as_ref(), timer_type),
+            )
+            .await?
+            .into_iter();
 
-        match times.as_slice() {
-            [] => {
-                // Stale slab entry — no clustering rows exist, nothing to do.
-            }
-            [remaining_time] => {
-                // Exactly 1 row: fetch span + tag and normalize to inline state.
-                let Some((confirmed_time, span_map, tag_opt)) = self
-                    .peek_first_key_trigger(segment_id, key, timer_type)
-                    .await?
-                else {
-                    // Row vanished between count and read — skip.
-                    return Ok(());
-                };
-
-                let state = TimerState::Inline(InlineTimer {
-                    time: *remaining_time,
-                    span: span_map,
-                    tag: tag_opt.unwrap_or(0_i32),
-                });
-
-                // Atomic batch: write inline state + delete clustering row.
-                self.batch_demote_to_inline(segment_id, key, timer_type, confirmed_time, &state)
+        match (rows.next(), rows.next()) {
+            // Stale slab entry: no clustering rows exist.
+            (None, _) => {}
+            (Some(row), None) => {
+                let state = TimerState::Inline(row);
+                self.batch_clear_and_set_inline(segment_id, key, timer_type, &state)
                     .await?;
             }
-            _ => {
-                // ≥2 rows: mark as overflow, anchoring TTL to the latest
-                // clustering row so the marker expires with the data it describes.
-                let ttl_time = times.iter().copied().max().unwrap_or(times[0]);
-                self.set_state_overflow(segment_id, key, timer_type, ttl_time)
+            // The marker expires with the latest row.
+            (Some(latest), Some(_)) => {
+                self.set_state_overflow(segment_id, key, timer_type, latest.time)
                     .await?;
             }
         }
