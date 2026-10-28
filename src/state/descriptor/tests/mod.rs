@@ -26,7 +26,7 @@ use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{Result, eyre};
 use futures::TryStreamExt;
 use opentelemetry_sdk::trace::SpanData;
-use quickcheck::{QuickCheck, TestResult};
+use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;

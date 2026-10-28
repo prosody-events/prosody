@@ -1,15 +1,18 @@
 //! Committed value reads and recovery evidence.
 
 use super::*;
+use crate::state::erased::Erased;
+use crate::state_reader::erased::ErasedValueReader;
+use std::iter::empty;
 
-/// A degenerate value mutation: overwrite with a JSON number. A Value has no
-/// removal, so `Set` is the only op a trace can generate. That is enough to
-/// check the committed round-trip: the reader either observes the last
-/// committed value, or `None` before the first commit.
+/// A value trace operation. The reader observes the last committed `Set`, or
+/// `None` before the first `Set` and after a `Clear`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ValueOp {
     /// Overwrite the committed value with `Value::from(b)`.
     Set(u8),
+    /// Clear the committed value.
+    Clear,
     /// Raw residue with a generated value, verdict, clear, and evidence
     /// location.
     Residue(u8, u8),
@@ -17,16 +20,17 @@ pub(crate) enum ValueOp {
 
 impl Arbitrary for ValueOp {
     fn arbitrary(g: &mut Gen) -> Self {
-        if bool::arbitrary(g) {
-            Self::Set(u8::arbitrary(g))
-        } else {
-            Self::Residue(u8::arbitrary(g), u8::arbitrary(g) % 8)
+        match u8::arbitrary(g) % 3 {
+            0 => Self::Set(u8::arbitrary(g)),
+            1 => Self::Clear,
+            _ => Self::Residue(u8::arbitrary(g), u8::arbitrary(g) % 8),
         }
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         match *self {
             Self::Set(b) => Box::new(b.shrink().map(Self::Set)),
+            Self::Clear => Box::new(empty()),
             Self::Residue(b, mode) => {
                 Box::new((b, mode).shrink().map(|(b, mode)| Self::Residue(b, mode)))
             }
@@ -35,7 +39,9 @@ impl Arbitrary for ValueOp {
 }
 
 /// Drives a Value trace: commit each event, mirror it into an `Option<Value>`
-/// model, and after every event assert `reader.get(key)` equals the model.
+/// model, and after every event assert `reader.get(key)` equals the model and
+/// `reader.contains(key)` reports whether the model holds a value. The reads
+/// go through the erased adapter, so the trace also covers the client path.
 ///
 /// FALSIFICATION: perturb `ReadSession::collection_id_for` (session.rs) to bind
 /// the wrong partition/state-type → the point `get` reads an empty/foreign
@@ -61,11 +67,13 @@ pub(in crate::state_reader::tests) async fn run_reader_value_trace<B: ReaderBack
             index as u128,
             move |handle| async move {
                 for op in for_handle {
-                    if let ValueOp::Set(b) = op {
-                        handle
+                    match op {
+                        ValueOp::Set(b) => handle
                             .set(Value::from(b))
                             .await
-                            .map_err(|e| eyre!("set: {e}"))?;
+                            .map_err(|e| eyre!("set: {e}"))?,
+                        ValueOp::Clear => handle.clear().await.map_err(|e| eyre!("clear: {e}"))?,
+                        ValueOp::Residue(..) => {}
                     }
                 }
                 Ok(())
@@ -75,6 +83,7 @@ pub(in crate::state_reader::tests) async fn run_reader_value_trace<B: ReaderBack
         for (op_index, op) in staged.into_iter().enumerate() {
             match op {
                 ValueOp::Set(b) => model = Some(Value::from(b)),
+                ValueOp::Clear => model = None,
                 ValueOp::Residue(value, mode) => {
                     if !reader_residue(
                         backend.owner_cell(),
@@ -93,8 +102,10 @@ pub(in crate::state_reader::tests) async fn run_reader_value_trace<B: ReaderBack
         }
 
         let deps = backend.deps();
-        let reader = StateReader::new(&deps, case.sub.clone(), descriptor)?;
-        if reader.get(case.key.clone()).await? != model {
+        let reader = Erased(StateReader::new(&deps, case.sub.clone(), descriptor)?);
+        if reader.get(case.key.to_string()).await? != model
+            || reader.contains(case.key.to_string()).await? != model.is_some()
+        {
             return Ok(false);
         }
     }

@@ -191,7 +191,6 @@ where
     B: ReaderBackend<C>,
     C::Payload: Clone,
     T: CellType<Key = UnitKey>,
-    for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
 {
     /// Reads and resolves the committed value for `key` (`None` when absent).
     ///
@@ -199,12 +198,25 @@ where
     ///
     /// Any [`StateReaderError`]: an acquisition or identity failure, an empty
     /// key, or a store or decode failure from the bound handle.
-    pub async fn get<K: Into<Key>>(
-        &self,
-        key: K,
-    ) -> Result<Option<ResolvedOf<T>>, StateReaderError> {
+    pub async fn get<K: Into<Key>>(&self, key: K) -> Result<Option<ResolvedOf<T>>, StateReaderError>
+    where
+        for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
+    {
         let handle = self.bound(key.into()).await?;
         handle.get().await.map_err(|e| StateReaderError::store(&e))
+    }
+
+    /// Reports whether a committed value exists for `key` without decoding it.
+    ///
+    /// # Errors
+    ///
+    /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
+    pub async fn contains<K: Into<Key>>(&self, key: K) -> Result<bool, StateReaderError> {
+        let handle = self.bound(key.into()).await?;
+        handle
+            .contains()
+            .await
+            .map_err(|e| StateReaderError::store(&e))
     }
 }
 
