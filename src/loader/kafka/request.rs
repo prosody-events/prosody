@@ -1,12 +1,12 @@
 use super::{
-    ActiveRequests, BaseConsumer, Consumer, Duration, KafkaLoaderError, KafkaResult, Offset,
-    Partition, Request, SmallVec, Timeout, Topic, TopicPartitionList, debug, error, warn,
+    ActiveRequests, BaseConsumer, Consumer, Duration, KafkaLoaderError, KafkaResult, LogContext,
+    Offset, Partition, Request, SmallVec, Timeout, Topic, TopicPartitionList, debug, warn,
 };
 
 pub(super) fn handle_request<P>(
     request: Request<P>,
     active: &mut ActiveRequests<P>,
-    consumer: &BaseConsumer,
+    consumer: &BaseConsumer<LogContext>,
 ) {
     use std::collections::btree_map::Entry;
 
@@ -25,13 +25,7 @@ pub(super) fn handle_request<P>(
     );
 
     if let Err(error) = assign_if_needed(active, consumer, topic, partition, offset) {
-        error!(
-            topic = %topic,
-            partition = partition,
-            offset = offset,
-            error = %format_args!("{error:#}"),
-            "Failed to assign partition for message load"
-        );
+        // The caller logs the error it receives.
         let _ = tx.send(Err(KafkaLoaderError::Kafka(error)));
         return;
     }
@@ -88,7 +82,7 @@ pub(super) fn handle_request<P>(
 /// The caller should retry the seek on the next iteration.
 pub(super) fn seek_to_first_active_offset<P>(
     active: &mut ActiveRequests<P>,
-    consumer: &BaseConsumer,
+    consumer: &BaseConsumer<LogContext>,
     discard_threshold: i64,
     seek_timeout: Duration,
 ) -> KafkaResult<()> {
@@ -211,7 +205,7 @@ pub(super) fn seek_to_first_active_offset<P>(
 /// requested vs received offsets.
 fn assign_if_needed<P>(
     active: &ActiveRequests<P>,
-    consumer: &BaseConsumer,
+    consumer: &BaseConsumer<LogContext>,
     topic: Topic,
     partition: Partition,
     offset: Offset,
@@ -253,7 +247,7 @@ fn assign_if_needed<P>(
 /// fulfilled. This keeps resource usage minimal by only holding assignments
 /// for partitions with active requests.
 pub(super) fn unassign_partition(
-    consumer: &BaseConsumer,
+    consumer: &BaseConsumer<LogContext>,
     topic: Topic,
     partition: Partition,
 ) -> KafkaResult<()> {

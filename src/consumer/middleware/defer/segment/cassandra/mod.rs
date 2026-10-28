@@ -57,7 +57,7 @@ impl CassandraSegmentStore {
 impl SegmentStore for CassandraSegmentStore {
     type Error = CassandraDeferStoreError;
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn get_or_create_segment(&self, segment: Segment) -> Result<Segment, Self::Error> {
         let topic: &str = segment.topic().as_ref();
         let consumer_group: &str = segment.consumer_group().as_ref();
@@ -73,7 +73,7 @@ impl SegmentStore for CassandraSegmentStore {
         Ok(segment)
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn get_segment(&self, segment_id: &SegmentId) -> Result<Option<Segment>, Self::Error> {
         let result = self
             .session()

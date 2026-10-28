@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use humantime::format_duration;
 use rand::RngExt;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::{RetryHandler, RetryWaitResult, wait_with_cancellation};
 use crate::consumer::DemandType;
@@ -209,7 +209,7 @@ pub(super) fn log_message_failure<E: Display>(
             attempt,
             error,
             sleep,
-        } => error!(
+        } => warn!(
             partition,
             key,
             offset,
@@ -249,7 +249,7 @@ pub(super) fn log_message_failure<E: Display>(
 /// [`log_message_failure`] for the meaning of `discard_suffix`.
 pub(super) fn log_timer_failure<E: Display>(reason: &LogReason<'_, E>, discard_suffix: &str) {
     match *reason {
-        LogReason::Retrying { error, sleep, .. } => error!(
+        LogReason::Retrying { error, sleep, .. } => warn!(
             "failed to handle timer: {error:#}; retrying after {}",
             format_duration(sleep),
         ),

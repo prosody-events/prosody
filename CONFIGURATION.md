@@ -25,10 +25,12 @@ the default for its target. A bare level below `warn` also applies to `scylla` a
 | Environment Variable             | Description                                          | Default                |
 |----------------------------------|------------------------------------------------------|------------------------|
 | `PROSODY_MAX_CONCURRENCY`        | Max messages being processed simultaneously          | 32                     |
-| `PROSODY_MAX_UNCOMMITTED`        | Max queued messages before pausing consumption       | 64                     |
+| `PROSODY_MAX_UNCOMMITTED`        | Max decoded messages in flight across all partitions | 64                     |
+| `PROSODY_PARTITION_PREFETCH`     | Bytes each partition fetches ahead of its handlers; also the fetch size of one partition (1 KiB to 1 GB) | 128 KiB |
+| `PROSODY_FETCH_MAX_BYTES`        | Size limit of one fetch response from one broker (1 MB to 2 GiB less 512 bytes) | 50 MiB |
 | `PROSODY_TIMEOUT`                | Cancel handler if it runs longer than this           | 80% of stall threshold |
 | `PROSODY_COMMIT_INTERVAL`        | How often to save progress to Kafka                  | 1s                     |
-| `PROSODY_POLL_INTERVAL`          | How often to fetch new messages from Kafka           | 100ms                  |
+| `PROSODY_POLL_INTERVAL`          | How often to serve Kafka events and store offsets    | 100ms                  |
 | `PROSODY_SHUTDOWN_TIMEOUT`       | Shutdown budget; handlers complete freely before cancellation fires near the deadline | 30s |
 | `PROSODY_STALL_THRESHOLD`        | Report unhealthy if no progress for this long        | 5m                     |
 | `PROSODY_STATISTICS_INTERVAL`    | How often librdkafka reports client statistics; must be between 1ms and 24h | 5s |
@@ -37,6 +39,14 @@ the default for its target. A bare level below `warn` also applies to `scylla` a
 | `PROSODY_SLAB_SIZE`              | Timer storage granularity (rarely needs changing)    | 1h                     |
 | `PROSODY_MESSAGE_SPANS`          | Span linking for message execution: `child` (child-of) or `follows_from`         | `child`       |
 | `PROSODY_TIMER_SPANS`            | Span linking for timer execution: `child` (child-of) or `follows_from`           | `follows_from` |
+
+Three settings bound the memory of records that wait for handlers:
+
+- Fetched records take at most two times `PROSODY_PARTITION_PREFETCH` for each assigned partition. A partition can
+  also hold one record batch that is larger.
+- One fetch response takes at most `PROSODY_FETCH_MAX_BYTES`. It stays in memory until its partitions read their
+  records.
+- Decoded messages number at most `PROSODY_MAX_UNCOMMITTED`.
 
 ## Producer
 

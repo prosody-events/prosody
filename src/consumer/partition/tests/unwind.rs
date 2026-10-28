@@ -375,10 +375,9 @@ async fn process_event_wires_the_catch_for_a_panicking_handler() -> Result<()> {
         .map_err(|e| eyre!("register: {e}"))?;
     let mut config = default_config();
     config.state_provider = memory_state_provider(registry);
-    let partition_manager = PartitionManager::new(config, handler, "test-topic".into(), 0);
+    let (partition_manager, records) = start(config, handler);
 
-    partition_manager
-        .sender()
+    records
         .try_send(ConsumerRecord::Message(create_test_message(0, "key")?))
         .map_err(|_| eyre!("message send rejected"))?;
 

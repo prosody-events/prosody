@@ -5,7 +5,7 @@ use std::error::Error;
 use std::future::Future;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::error;
+use tracing::{error, warn};
 
 /// Delay between failed durability steps.
 pub(crate) const DURABILITY_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -35,12 +35,11 @@ where
         match step().await {
             Ok(value) => return StepOutcome::Done(value),
             Err(error) => {
-                let permanent = error.classify_error() == ErrorCategory::Permanent;
-                let action = if permanent { "skip" } else { "retry" };
-                error!(label, %error, action, "durability step failed");
-                if permanent {
+                if error.classify_error() == ErrorCategory::Permanent {
+                    error!(label, %error, action = "skip", "durability step failed");
                     return StepOutcome::Skip;
                 }
+                warn!(label, %error, action = "retry", "durability step failed");
                 sleep(DURABILITY_RETRY_DELAY).await;
             }
         }

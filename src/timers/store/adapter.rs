@@ -152,7 +152,7 @@ where
     // consistency
     // ===================================================================
 
-    #[instrument(level = "debug", skip(self, trigger), err)]
+    #[instrument(level = "debug", skip(self, trigger), err(level = "warn"))]
     async fn add_trigger(&self, trigger: Trigger) -> Result<(), Self::Error> {
         let slab = Slab::from_time(self.slab_size(), trigger.time);
         // Coordinate the two trigger-row writes; slab metadata is owned by
@@ -171,7 +171,7 @@ where
             .await
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn remove_trigger(
         &self,
         key: &Key,
@@ -197,7 +197,7 @@ where
         self.operations.current_trigger(key, time, timer_type).await
     }
 
-    #[instrument(level = "debug", skip(self, trigger), err)]
+    #[instrument(level = "debug", skip(self, trigger), err(level = "warn"))]
     async fn clear_and_schedule(&self, trigger: Trigger) -> Result<(), Self::Error> {
         // INVARIANT (at-least-once delivery): Write new timer FIRST, then
         // delete old entries. If crash occurs after writing new but before

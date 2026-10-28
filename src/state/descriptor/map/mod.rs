@@ -106,7 +106,7 @@ where
         name = "map.get",
         skip_all,
         fields(collection = self.cells.name().as_str(), map.key = %key),
-        err
+        err(level = "warn")
     )]
     #[read(op)]
     pub async fn get(
@@ -132,7 +132,7 @@ where
         name = "map.contains_key",
         skip_all,
         fields(collection = self.cells.name().as_str(), map.key = %key),
-        err
+        err(level = "warn")
     )]
     #[read(op)]
     pub async fn contains_key(
@@ -159,7 +159,7 @@ where
         name = "map.get_many",
         skip_all,
         fields(collection = self.cells.name().as_str(), keys = Empty),
-        err
+        err(level = "warn")
     )]
     #[read(op)]
     pub async fn get_many<'a, Q, I>(
@@ -192,7 +192,7 @@ where
         name = "map.contains_many",
         skip_all,
         fields(collection = self.cells.name().as_str(), keys = Empty),
-        err
+        err(level = "warn")
     )]
     #[read(op)]
     pub async fn contains_many<'a, Q, I>(
@@ -225,7 +225,7 @@ where
         name = "map.set",
         skip_all,
         fields(collection = self.cells.name().as_str(), map.key = %key),
-        err
+        err(level = "warn")
     )]
     #[write(op)]
     pub async fn set(
@@ -251,7 +251,7 @@ where
         name = "map.remove",
         skip_all,
         fields(collection = self.cells.name().as_str(), map.key = %key),
-        err
+        err(level = "warn")
     )]
     #[write(op)]
     pub async fn remove(&self, key: &KC::Borrowed) -> Result<(), MapStateError<CellCodecError<V>>>
@@ -271,7 +271,7 @@ where
         name = "map.clear",
         skip_all,
         fields(collection = self.cells.name().as_str()),
-        err
+        err(level = "warn")
     )]
     #[write(op)]
     pub async fn clear(&self) -> Result<(), MapStateError<CellCodecError<V>>> {
@@ -346,7 +346,7 @@ where
     /// # Errors
     ///
     /// Returns a key codec error or an access error from the session.
-    #[instrument(name = "map.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "map.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     pub async fn is_empty(&self) -> Result<bool, MapStateError<CellCodecError<V>>> {
         membership::is_empty(&self.cells).await
     }
@@ -363,7 +363,7 @@ where
         name = "map.commit",
         skip_all,
         fields(collection = self.cells.name().as_str()),
-        err
+        err(level = "warn")
     )]
     pub async fn commit(&self) -> Result<StoreOutcome, MapStateError<CellCodecError<V>>>
     where

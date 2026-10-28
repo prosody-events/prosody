@@ -34,16 +34,19 @@ graph TD
 4. **Ordered Processing**: Messages with the same key are processed sequentially from their respective queue, ensuring
    ordered processing for each key.
 
-5. **Polling Mechanism**: The `KafkaConsumer` uses a polling mechanism to efficiently fetch messages from Kafka brokers.
+5. **Partition Queues**: Each assigned partition has its own librdkafka queue. The partition's task reads and decodes
+   its records, so decoding runs on all runtime threads. One poll loop serves rebalances, statistics, and errors, and
+   it stores committed offsets.
 
-6. **Backpressure Management**: Prosody provides multiple levels of backpressure control:
-    - **Global buffering**: A global semaphore limits the total number of messages being processed across all partitions
-    - **Partition pausing**: If a partition becomes backed up (i.e., its queues are full), Prosody will pause
-      consumption from that specific partition. Other partitions continue to make progress, ensuring that a slowdown in
-      one partition doesn't affect the entire consumer
-    - **Per-key queuing**: Each key has its own queue to preserve message order; the global semaphore prevents unbounded
-      growth. When the in-flight count reaches `PROSODY_MAX_UNCOMMITTED`, the poll loop holds each new message and
-      pauses only the partition of that message. The partition resumes when its message gets a slot
+6. **Backpressure Management**: Prosody never pauses a partition. It bounds memory at three levels:
+    - **Decoded messages**: A record is decoded only when it gets one of `PROSODY_MAX_UNCOMMITTED` in-flight permits,
+      shared by all partitions. It holds the permit until its offset commits. A partition without a permit stops
+      reading.
+    - **Fetched records**: librdkafka stops fetching a partition when its queue holds `PROSODY_PARTITION_PREFETCH`
+      bytes. The fetched records stay in librdkafka until the partition reads them. Other partitions continue to make
+      progress.
+    - **Per-key queuing**: Each key has its own queue to preserve message order. The in-flight permits bound these
+      queues.
 
 ## Message Flow
 
@@ -55,8 +58,7 @@ sequenceDiagram
     participant Key Manager
     participant Middleware Stack
     participant User Message Handler
-    Kafka Broker ->> Poll Loop: Deliver message
-    Poll Loop ->> Partition Manager: Dispatch message to correct partition
+    Kafka Broker ->> Partition Manager: Fetch records into the partition queue
     Partition Manager ->> Key Manager: Enqueue message for specific key
     Key Manager ->> Middleware Stack: Dispatch message in key order
     Middleware Stack ->> User Message Handler: Process message
@@ -67,8 +69,8 @@ sequenceDiagram
     Poll Loop -->> Kafka Broker: Store committed offsets
 ```
 
-1. The `Poll Loop` polls messages from Kafka Brokers on behalf of `ProsodyConsumer`.
-2. Messages are dispatched to the appropriate `PartitionManager` based on their topic and partition.
+1. librdkafka fetches the records of each assigned partition into that partition's queue.
+2. The `PartitionManager` of the partition reads its queue. It waits for an in-flight permit, then decodes the record.
 3. The `PartitionManager` enqueues the message in the correct key-based queue within `KeyManager`, according to the
    message key (e.g., User ID, Product ID).
 4. `KeyManager` dispatches messages for each key sequentially through the middleware stack, which applies retry,
@@ -77,7 +79,8 @@ sequenceDiagram
 6. The `PartitionManager`'s `OffsetTracker` tracks the partition's high watermark committed offset.
 7. The `Poll Loop` reads watermarks from each `PartitionManager` and stores them with librdkafka, which commits them
    back to Kafka asynchronously, ensuring at-least-once message processing semantics.
-8. If a partition's queues become full, that specific partition is paused until the backlog is processed.
+8. If no in-flight permit is free, the partition stops reading. librdkafka keeps its fetched records and stops fetching
+   the partition at `PROSODY_PARTITION_PREFETCH`.
 
 Throughout this flow, OpenTelemetry is used to create and propagate distributed traces, allowing for end-to-end
 visibility of message processing across different services.
@@ -94,8 +97,8 @@ Both strategies are configurable via `PROSODY_MESSAGE_SPANS` and `PROSODY_TIMER_
 
 This architecture allows Prosody to achieve high throughput by processing different partitions and keys concurrently,
 while still maintaining strict ordering for messages with the same key. It also provides backpressure management by
-limiting the total number of in-flight messages across all keys within a partition through a global semaphore and
-selective partition pausing.
+limiting the total number of in-flight messages through a global semaphore, and the fetched bytes of each partition
+through librdkafka.
 
 ## Component Organization
 
