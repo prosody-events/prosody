@@ -1,26 +1,28 @@
 //! A timer call dropped at any await point leaves no hold behind, and its
-//! written row stays loadable.
+//! stored row stays loadable.
 
 use crate::Key;
+use crate::consumer::Uncommitted;
 use crate::consumer::partition::ShutdownPhase;
-use crate::timers::active::TimerState;
+use crate::timers::active::{Queued, TimerState};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::manager::TimerManagerError;
-use crate::timers::scheduler::BUFFER_SIZE;
 use crate::timers::scheduler::TimerSchedulerError;
-use crate::timers::slab::Slab;
+use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::TriggerStore;
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
 use crate::timers::test_support::{setup_timer_manager_with_store, test_segment};
-use crate::timers::{TimerManager, TimerRequest, TimerType};
+use crate::timers::{TimerManager, TimerRequest, TimerType, Trigger, UncommittedTimer};
 use color_eyre::eyre::{OptionExt, Result, ensure};
 use futures::future::try_join_all;
 use futures::{StreamExt, TryStreamExt, pin_mut, poll};
-use quickcheck::QuickCheck;
+use quickcheck::{Arbitrary, Gen, QuickCheck};
+use std::cell::Cell;
 use std::task::Poll;
 use std::time::Duration;
+use strum::VariantArray;
 use tokio::runtime::Builder;
 use tokio::task::coop::unconstrained;
 use tokio::task::yield_now;
@@ -29,71 +31,70 @@ use tracing::Span;
 
 const SLAB_SECONDS: u32 = 60;
 
-type Manager = TimerManager<TableAdapter<InMemoryTriggerStore>>;
+/// Commands queued ahead of the victim, so its polls stop at different points.
+const BACKLOGS: [usize; 3] = [0, 1, 64];
 
-/// Drops a schedule after `polls` polls, with `pressure` choosing how many
-/// earlier schedules fill the command channel. A full channel parks a command
-/// send, which is where a dropped call once left a row in an unregistered
-/// slab. A `due` victim lands in a slab below the seeded watermark, which the
-/// actor owns from the start, and a stored one must fire. `op` picks the
-/// victim's call; see [`victim`].
+type Store = TableAdapter<InMemoryTriggerStore>;
+type Manager = TimerManager<Store>;
+
+/// Drops a [`Victim`] call after `polls` polls, with `backlog` choosing how
+/// many earlier schedules wait in the command channel. A `due` victim lands in
+/// a slab that the actor owns from the start, and a stored one must fire.
 #[test]
-fn prop_dropped_schedule_keeps_rows_loadable() {
-    fn property(op: u8, pressure: u8, polls: u8, due: bool) -> Result<()> {
+fn prop_dropped_call_keeps_rows_loadable() {
+    fn property(victim: Victim, backlog: u8, polls: u8, due: bool) -> Result<()> {
         Builder::new_current_thread()
             .enable_all()
             .build()?
-            .block_on(run(op, pressure, polls, due))
+            .block_on(run(victim, backlog, polls, due))
     }
-    QuickCheck::new().quickcheck(property as fn(u8, u8, u8, bool) -> Result<()>);
+    QuickCheck::new().quickcheck(property as fn(Victim, u8, u8, bool) -> Result<()>);
 }
 
-async fn run(op: u8, pressure: u8, polls: u8, due: bool) -> Result<()> {
-    let clear = op % 2 == 1;
-    let segment = test_segment("dropped", SLAB_SECONDS);
-    let store = memory_store(segment.clone());
-    let now = CompactDateTime::now()?;
-    store.insert_segment().await?;
-    if due {
-        let current = Slab::from_time(segment.slab_size, now).id();
-        store.set_slab_watermark(current.checked_sub(1)).await?;
-    }
+async fn run(victim: Victim, backlog: u8, polls: u8, due: bool) -> Result<()> {
+    let (store, now) = seeded_store(due).await?;
     let (stream, manager, _shutdown) =
         setup_timer_manager_with_store(store.clone(), ShutdownPhase::default()).await?;
     pin_mut!(stream);
     let time = now.add_duration(CompactDuration::new(3_600))?;
     // The victim has its own slab, so no other schedule registers it.
     let victim_time = if due {
-        CompactDateTime::from(now.epoch_seconds().saturating_sub(2 * SLAB_SECONDS))
+        past(now)
     } else {
         time.add_duration(CompactDuration::new(SLAB_SECONDS))?
     };
+    if victim.removes() {
+        schedule(&manager, "victim", victim_time, false).await?;
+    }
 
     // Start every filler without yielding to the actor.
-    let count = [0, BUFFER_SIZE - 1, BUFFER_SIZE][usize::from(pressure) % 3];
-    let mut fillers: Vec<_> = (0..count)
-        .map(|i| Box::pin(schedule(&manager, format!("filler-{i}"), time, clear)))
+    let clear = victim.clears();
+    let count = BACKLOGS[usize::from(backlog) % BACKLOGS.len()];
+    let fillers: Vec<_> = (0..count).map(|i| format!("filler-{i}")).collect();
+    let mut fillers: Vec<_> = fillers
+        .iter()
+        .map(|key| Box::pin(schedule(&manager, key, time, clear)))
         .collect();
     for filler in &mut fillers {
         let pending = unconstrained(async { poll!(filler.as_mut()).is_pending() }).await;
         ensure!(pending, "a filler finished before the actor ran");
     }
 
-    let mut victim = Box::pin(victim(&manager, victim_time, op));
+    let mut call = Box::pin(victim.call(&manager, victim_time, time));
     for _ in 0..polls % 4 {
-        if let Poll::Ready(result) = unconstrained(async { poll!(victim.as_mut()) }).await {
+        if let Poll::Ready(result) = unconstrained(async { poll!(call.as_mut()) }).await {
             result?;
             break;
         }
         yield_now().await;
     }
-    drop(victim);
+    drop(call);
 
     // Commands are FIFO, so the barrier returns after every earlier command.
     try_join_all(fillers).await?;
-    schedule(&manager, "barrier".to_owned(), time, clear).await?;
+    schedule(&manager, "barrier", time, clear).await?;
 
-    let slab_id = Slab::from_time(segment.slab_size, victim_time).id();
+    let slab_id = slab_id(victim_time);
     let rows: Vec<_> = store
         .get_slab_triggers_all_types(slab_id)
         .try_collect()
@@ -104,7 +105,7 @@ async fn run(op: u8, pressure: u8, polls: u8, due: bool) -> Result<()> {
         .await?;
     ensure!(
         rows.is_empty() || !registered.is_empty(),
-        "a dropped schedule left its row in unregistered slab {slab_id}"
+        "a dropped call left its row in unregistered slab {slab_id}"
     );
     let entry = manager
         .0
@@ -114,10 +115,14 @@ async fn run(op: u8, pressure: u8, polls: u8, due: bool) -> Result<()> {
         .await;
     ensure!(
         entry.is_none_or(|entry| entry.state != TimerState::Aborted),
-        "a dropped schedule left its hold"
+        "a dropped call left its hold"
     );
 
     if due && !rows.is_empty() {
+        ensure!(
+            entry.is_some(),
+            "a stored victim in an owned slab left memory"
+        );
         let pending = timeout(Duration::from_secs(10), stream.next())
             .await?
             .ok_or_eyre("timer stream ended")?;
@@ -133,49 +138,187 @@ async fn run(op: u8, pressure: u8, polls: u8, due: bool) -> Result<()> {
     Ok(())
 }
 
-/// Schedules the victim through the manager, or through a scheduler insert
-/// whose write stores the row and then stays pending or fails. A Cassandra
-/// write can do either.
-async fn victim(manager: &Manager, time: CompactDateTime, op: u8) -> Result<()> {
-    if op % 4 < 2 {
-        return schedule(manager, "victim".to_owned(), time, op % 2 == 1).await;
-    }
-    let fails = op % 4 == 3;
-    let request = TimerRequest::new(
-        Key::from("victim"),
-        time,
-        TimerType::Application,
-        Span::current(),
-    );
-    let trigger = request.into_trigger();
-    let write = async {
-        manager
-            .0
-            .store
-            .add_trigger(trigger.clone())
-            .await
-            .map_err(TimerManagerError::Store)?;
-        if fails {
-            return Err(TimerManagerError::Scheduler(TimerSchedulerError::Shutdown));
-        }
+/// A handler reschedules its own firing timer, and the call is dropped after
+/// the row write lands. The delivery's commit must keep the replacement, so
+/// the timer fires again.
+#[tokio::test]
+async fn dropped_reschedule_of_a_firing_timer_fires_after_commit() -> Result<()> {
+    let (store, now) = seeded_store(true).await?;
+    let (stream, manager, _shutdown) =
+        setup_timer_manager_with_store(store, ShutdownPhase::default()).await?;
+    pin_mut!(stream);
+
+    let time = past(now);
+    schedule(&manager, "victim", time, false).await?;
+    let firing = timeout(Duration::from_secs(10), stream.next())
+        .await?
+        .ok_or_eyre("timer stream ended")?
+        .fire()
+        .await
+        .ok_or_eyre("the timer did not fire")?;
+
+    let replacement = trigger("victim", time);
+    let written = Cell::new(false);
+    let mut call = Box::pin(manager.0.scheduler.insert(
+        replacement.clone(),
+        Queued::FiringRescheduled,
+        write_row(&manager, &replacement, false, &written),
+    ));
+    while !written.get() {
+        let polled = unconstrained(async { poll!(call.as_mut()) }).await;
+        ensure!(
+            polled.is_pending(),
+            "the reschedule finished before the drop"
+        );
         yield_now().await;
-        Ok(())
-    };
-    let result = manager
-        .0
-        .scheduler
-        .insert(trigger.clone(), TimerState::Scheduled, write)
-        .await;
-    ensure!(result.is_err() == fails, "the write outcome was lost");
+    }
+    drop(call);
+
+    // Commands are FIFO, so the barrier returns after the dropped call's last
+    // command.
+    let later = now.add_duration(CompactDuration::new(3_600))?;
+    schedule(&manager, "barrier", later, false).await?;
+    let (_, guard) = firing.into_inner();
+    guard.commit().await;
+
+    let times = manager
+        .scheduled_times(&replacement.key, TimerType::Application)
+        .await?;
+    ensure!(times == [time], "the commit deleted the replacement row");
+    let refired = timeout(Duration::from_secs(10), stream.next())
+        .await?
+        .ok_or_eyre("timer stream ended")?;
+    ensure!(refired.trigger().time == time, "another timer fired");
+    ensure!(
+        refired.fire().await.is_some(),
+        "the replacement did not fire"
+    );
     Ok(())
 }
 
-async fn schedule(
+/// The call that the property drops.
+#[derive(Clone, Copy, Debug, VariantArray)]
+enum Victim {
+    Schedule,
+    ClearAndSchedule,
+    /// A scheduler insert whose write stores the row and then stays pending.
+    PendingWrite,
+    /// A scheduler insert whose write stores the row and then fails.
+    FailedWrite,
+    /// Unschedules a stored victim.
+    Unschedule,
+    /// Replaces a stored victim with a timer in another slab.
+    Replace,
+}
+
+impl Arbitrary for Victim {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self::VARIANTS[usize::from(u8::arbitrary(g)) % Self::VARIANTS.len()]
+    }
+}
+
+impl Victim {
+    /// Whether the call removes a stored victim.
+    fn removes(self) -> bool {
+        matches!(self, Self::Unschedule | Self::Replace)
+    }
+
+    /// Whether the fillers use `clear_and_schedule`.
+    fn clears(self) -> bool {
+        matches!(self, Self::ClearAndSchedule | Self::Replace)
+    }
+
+    /// Runs the call on the victim at `time`. A replacement moves it to
+    /// `elsewhere`.
+    async fn call(
+        self,
+        manager: &Manager,
+        time: CompactDateTime,
+        elsewhere: CompactDateTime,
+    ) -> Result<()> {
+        let fails = match self {
+            Self::Schedule | Self::ClearAndSchedule => {
+                return schedule(manager, "victim", time, self.clears()).await;
+            }
+            Self::Unschedule => {
+                let key = Key::from("victim");
+                return Ok(manager
+                    .unschedule(&key, time, TimerType::Application)
+                    .await?);
+            }
+            Self::Replace => return schedule(manager, "victim", elsewhere, true).await,
+            Self::PendingWrite => false,
+            Self::FailedWrite => true,
+        };
+        let trigger = trigger("victim", time);
+        let written = Cell::new(false);
+        let write = write_row(manager, &trigger, fails, &written);
+        let result = manager
+            .0
+            .scheduler
+            .insert(trigger.clone(), Queued::Scheduled, write)
+            .await;
+        ensure!(result.is_err() == fails, "the write outcome was lost");
+        Ok(())
+    }
+}
+
+/// A memory store for a new segment. If `due`, the watermark sits below the
+/// current slab, so the actor owns [`past`] slabs from the start.
+async fn seeded_store(due: bool) -> Result<(Store, CompactDateTime)> {
+    let store = memory_store(test_segment("dropped", SLAB_SECONDS));
+    let now = CompactDateTime::now()?;
+    store.insert_segment().await?;
+    if due {
+        store
+            .set_slab_watermark(slab_id(now).checked_sub(1))
+            .await?;
+    }
+    Ok((store, now))
+}
+
+/// A time two slabs before `now`.
+fn past(now: CompactDateTime) -> CompactDateTime {
+    CompactDateTime::from(now.epoch_seconds().saturating_sub(2 * SLAB_SECONDS))
+}
+
+fn slab_id(time: CompactDateTime) -> SlabId {
+    Slab::from_time(CompactDuration::new(SLAB_SECONDS), time).id()
+}
+
+fn trigger(key: &str, time: CompactDateTime) -> Trigger {
+    TimerRequest::new(
+        Key::from(key),
+        time,
+        TimerType::Application,
+        Span::current(),
+    )
+    .into_trigger()
+}
+
+/// Stores the row of `trigger`, sets `written`, and then fails or stays
+/// pending for one poll. A Cassandra write can do either.
+async fn write_row(
     manager: &Manager,
-    key: String,
-    time: CompactDateTime,
-    clear: bool,
-) -> Result<()> {
+    trigger: &Trigger,
+    fails: bool,
+    written: &Cell<bool>,
+) -> Result<(), TimerManagerError<<Store as TriggerStore>::Error>> {
+    manager
+        .0
+        .store
+        .add_trigger(trigger.clone())
+        .await
+        .map_err(TimerManagerError::Store)?;
+    written.set(true);
+    if fails {
+        return Err(TimerManagerError::Scheduler(TimerSchedulerError::Shutdown));
+    }
+    yield_now().await;
+    Ok(())
+}
+
+async fn schedule(manager: &Manager, key: &str, time: CompactDateTime, clear: bool) -> Result<()> {
     let request = TimerRequest::new(
         Key::from(key),
         time,

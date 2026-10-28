@@ -30,13 +30,12 @@ impl<T: TriggerStore> TimerManagerInner<T> {
             .try_collect()
             .await?;
 
-        let queued = self
+        let prior = self
             .scheduler
             .active_triggers()
             .get(&trigger.key, trigger.time, trigger.timer_type)
             .await;
-        let prior = queued.map(|entry| entry.state);
-        if let Some(entry) = queued.filter(|entry| {
+        if let Some(entry) = prior.filter(|entry| {
             matches!(
                 entry.state,
                 TimerState::Scheduled | TimerState::FiringRescheduled
@@ -51,11 +50,9 @@ impl<T: TriggerStore> TimerManagerInner<T> {
             timer_type = ?trigger.timer_type,
             new_time = ?trigger.time,
             existing_count = existing_times.len(),
-            prior_state = ?prior,
+            prior = ?prior,
             "clear_and_schedule: resolved transition, applying"
         );
-
-        unschedule_replaced_timers(&self.scheduler, &trigger, &existing_times).await?;
 
         // The single durable write: atomically inserts the new row and
         // clears the replaced ones (`ClearSchedule` transitions carry no
@@ -67,6 +64,7 @@ impl<T: TriggerStore> TimerManagerInner<T> {
                 .map_err(TimerManagerError::Store)
         };
         persist(&self.scheduler, &trigger, memory, write).await?;
+        unschedule_replaced_timers(&self.scheduler, &trigger, &existing_times).await?;
         self.emit_clear_telemetry(&trigger, &existing_times);
 
         Ok(())
@@ -102,7 +100,7 @@ impl<T: TriggerStore> TimerManagerInner<T> {
         let prior = self
             .scheduler
             .active_triggers()
-            .get_state(&trigger.key, trigger.time, trigger.timer_type)
+            .get(&trigger.key, trigger.time, trigger.timer_type)
             .await;
         self.apply(trigger, transition(prior, op)).await
     }
@@ -147,9 +145,9 @@ impl<T: TriggerStore> TimerManagerInner<T> {
     }
 }
 
-/// Applies `memory` around the durable `write`. An insert goes through the
-/// scheduler, which holds the trigger across the write. An update runs before
-/// it.
+/// Applies `memory` around the durable `write`, so the registry covers every
+/// stored row. An insert goes through the scheduler, which holds the trigger
+/// across the write. An update runs after the write.
 async fn persist<E>(
     scheduler: &TriggerScheduler<E>,
     trigger: &Trigger,
@@ -165,6 +163,7 @@ where
         }
         MemoryEffect::Update { next_state, queue } => (next_state, queue),
     };
+    write.await?;
     match queue {
         QueueEffect::None => {}
         QueueEffect::Dequeue => scheduler.remove_from_queue(trigger.clone()).await?,
@@ -181,11 +180,11 @@ where
             .set_state(&trigger.key, trigger.time, trigger.timer_type, state)
             .await;
     }
-    write.await
+    Ok(())
 }
 
-/// Unschedules every replaced (old-time) timer during a `clear_and_schedule`
-/// operation, resolving each through the state machine's `ClearReplaced` op.
+/// Unschedules every replaced (old-time) timer after a `clear_and_schedule`
+/// write, resolving each through the state machine's `ClearReplaced` op.
 ///
 /// All effects are in-memory: the caller's atomic store write subsumes the
 /// per-row deletes. The scheduler removal is idempotent — the actor finds
@@ -211,14 +210,14 @@ where
         );
         let prior = scheduler
             .active_triggers()
-            .get_state(&old.key, old.time, old.timer_type)
+            .get(&old.key, old.time, old.timer_type)
             .await;
         let memory = transition(prior, TimerOp::ClearReplaced).memory();
         debug!(
             key = %old.key,
             timer_type = ?old.timer_type,
             old_time = ?old.time,
-            prior_state = ?prior,
+            prior = ?prior,
             "clear_and_schedule: unscheduling replaced timer"
         );
         persist(scheduler, &old, memory, ready(Ok(()))).await?;

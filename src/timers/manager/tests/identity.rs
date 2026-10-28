@@ -312,7 +312,8 @@ fn prop_queued_attempt_identity_inner(trace: IdentityTrace) -> TestResult {
 }
 
 async fn run_identity_trace(trace: IdentityTrace) -> Result<()> {
-    // Seed the old layout directly. The loader must preserve its stored identity.
+    // Seed the old layout directly. The loader must preserve its stored
+    // identity.
     let mut segment = test_segment("identity", 300_u32);
     segment.version = SegmentVersion::V3;
     let store = memory_store(segment);

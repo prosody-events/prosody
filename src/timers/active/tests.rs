@@ -34,9 +34,8 @@ const NOW: u32 = 1200;
 
 /// The lifecycle states `set_state` can store. `TimerState` has no
 /// `Arbitrary` of its own, so ops index this pool directly.
-const STATES: [TimerState; 5] = [
+const STATES: [TimerState; 4] = [
     TimerState::Scheduled,
-    TimerState::Unconfirmed,
     TimerState::Firing,
     TimerState::FiringRescheduled,
     TimerState::Aborted,
@@ -77,6 +76,13 @@ enum Op {
         ty: TimerType,
         state: TimerState,
     },
+    Queue {
+        key: Key,
+        time: CompactDateTime,
+        ty: TimerType,
+        queued: Queued,
+        row: Row,
+    },
 }
 
 impl Op {
@@ -87,7 +93,8 @@ impl Op {
             Op::Insert { key, time, ty, .. }
             | Op::Hold { key, time, ty, .. }
             | Op::Remove { key, time, ty }
-            | Op::SetState { key, time, ty, .. } => (key.clone(), *time, *ty),
+            | Op::SetState { key, time, ty, .. }
+            | Op::Queue { key, time, ty, .. } => (key.clone(), *time, *ty),
         }
     }
 }
@@ -98,7 +105,7 @@ impl Arbitrary for Op {
         let time =
             CompactDateTime::from(TIME_POOL[usize::from(u8::arbitrary(g)) % TIME_POOL.len()]);
         let ty = TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
-        match u8::arbitrary(g) % 4 {
+        match u8::arbitrary(g) % 5 {
             0 => Op::Insert {
                 key,
                 time,
@@ -112,6 +119,21 @@ impl Arbitrary for Op {
                 tag: i32::arbitrary(g),
             },
             2 => Op::Remove { key, time, ty },
+            3 => Op::Queue {
+                key,
+                time,
+                ty,
+                queued: if bool::arbitrary(g) {
+                    Queued::Scheduled
+                } else {
+                    Queued::FiringRescheduled
+                },
+                row: if bool::arbitrary(g) {
+                    Row::Written
+                } else {
+                    Row::Unconfirmed
+                },
+            },
             _ => Op::SetState {
                 key,
                 time,
@@ -142,7 +164,7 @@ impl Arbitrary for Trace {
 }
 
 /// Asserts every reader of the registry agrees with the model: per-triple
-/// `get_state`/`get`/`contains`/`is_scheduled`, the `scan_active_times`
+/// `get_state`/`get`/`contains`, the `scan_active_times`
 /// multiset, and the `snapshot` fold — the last recomputed independently, not
 /// by calling `snapshot` again.
 async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
@@ -152,18 +174,8 @@ async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
             active.get_state(key, *time, *ty).await,
             entry.map(|e| e.state)
         );
-        assert_eq!(
-            active.get(key, *time, *ty).await.map(|entry| entry.tag),
-            entry.map(|e| e.tag)
-        );
+        assert_eq!(active.get(key, *time, *ty).await, entry.copied());
         assert_eq!(active.contains(key, *time, *ty).await, entry.is_some());
-        assert_eq!(
-            active.is_scheduled(key, *time, *ty).await,
-            entry.is_some_and(|e| matches!(
-                e.state,
-                TimerState::Scheduled | TimerState::Unconfirmed | TimerState::FiringRescheduled
-            ))
-        );
     }
 
     // scan is per-key: a (time, type) shared by two keys appears twice, so the
@@ -209,7 +221,14 @@ fn insert_model(model: &mut Model, triple: Triple, state: TimerState, tag: i32) 
         .get(&triple)
         .is_none_or(|entry| entry.state == TimerState::Aborted && state != TimerState::Aborted)
     {
-        model.insert(triple, ActiveTriggerEntry { state, tag });
+        model.insert(
+            triple,
+            ActiveTriggerEntry {
+                state,
+                tag,
+                row: Row::Written,
+            },
+        );
     }
 }
 
@@ -276,6 +295,19 @@ async fn run_trace(trace: Trace) {
                 };
                 assert_eq!(got, want, "set_state return");
             }
+            Op::Queue {
+                key,
+                time,
+                ty,
+                queued,
+                row,
+            } => {
+                active.queue(&key, time, ty, queued, row).await;
+                if let Some(entry) = model.get_mut(&(key, time, ty)) {
+                    entry.state = queued.into();
+                    entry.row = row;
+                }
+            }
         }
 
         assert_equiv(&active, &model, &seen).await;
@@ -283,8 +315,8 @@ async fn run_trace(trace: Trace) {
 }
 
 /// The registry tracks a plain `HashMap` model op-for-op across
-/// Insert/Hold/Remove/SetState, and every reader (`get_state`, `get`,
-/// `contains`, `is_scheduled`, `scan_active_times`, `snapshot`) agrees after
+/// Insert/Hold/Remove/SetState/Queue, and every reader (`get_state`, `get`,
+/// `contains`, `scan_active_times`, `snapshot`) agrees after
 /// every op.
 #[test]
 fn prop_active_triggers_track_model() {

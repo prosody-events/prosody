@@ -23,7 +23,7 @@ use crate::state::TimerEventRef;
 #[cfg(test)]
 use crate::telemetry::Telemetry;
 use crate::telemetry::partition::TelemetryPartitionSender;
-use crate::timers::active::{TimerOp, TimerSnapshot, TimerState};
+use crate::timers::active::{Queued, TimerOp, TimerSnapshot, TimerState};
 use crate::timers::datetime::CompactDateTime;
 
 pub use crate::timers::error::TimerManagerError;
@@ -191,7 +191,6 @@ where
                         Some(TimerState::Firing) => false,
                         Some(
                             TimerState::Scheduled
-                            | TimerState::Unconfirmed
                             | TimerState::FiringRescheduled
                             | TimerState::Aborted,
                         )
@@ -407,7 +406,7 @@ where
             };
             self.0
                 .scheduler
-                .insert(replacement.clone(), TimerState::Scheduled, write)
+                .insert(replacement.clone(), Queued::Scheduled, write)
                 .await?;
         } else {
             self.0

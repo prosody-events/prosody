@@ -902,8 +902,8 @@ async fn test_fire_scheduled_timer() -> Result<()> {
 
 #[tokio::test]
 async fn test_fire_cancelled_timer() -> Result<()> {
-    // Verify fire() returns None if timer was unscheduled after delivery but before
-    // fire()
+    // Verify fire() returns None if timer was unscheduled after delivery but
+    // before fire()
     time::pause();
 
     let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
@@ -1008,7 +1008,8 @@ async fn test_reschedule_abort_fires_again() -> Result<()> {
 
 #[tokio::test]
 async fn test_abort_firing_preserves_db() -> Result<()> {
-    // Verify abort from Firing state keeps DB row and protects active slab state.
+    // Verify abort from Firing state keeps DB row and protects active slab
+    // state.
     time::pause();
 
     let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
@@ -1028,7 +1029,8 @@ async fn test_abort_firing_preserves_db() -> Result<()> {
         .ok_or_else(|| eyre!("Expected a pending timer"))?;
     let firing = pending.fire().await.ok_or_else(|| eyre!("Not active"))?;
 
-    // Verify timer is in Firing state - scheduled_times() excludes Firing timers
+    // Verify timer is in Firing state - scheduled_times() excludes Firing
+    // timers
     let times_while_firing = manager
         .scheduled_times(&trigger.key, TimerType::Application)
         .await?;

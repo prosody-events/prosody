@@ -4,8 +4,8 @@
 //! and asserts the four load-bearing invariants after every op:
 //!
 //!   P1 (owned↔DB parity): every `(key, time, type)` in the loaded numeric
-//!       range is in `ActiveTriggers` iff it's currently in the DB, except an
-//!       unconfirmed timer whose write failed.
+//!       range is in `ActiveTriggers` iff it's currently in the DB, except a
+//!       timer with an unconfirmed row whose write failed.
 //!   P2 (pending = store-only): triggers for slabs outside the owned range
 //!       never land in `ActiveTriggers`.
 //!   P3 (watermark I1): every slab clustering row sits strictly above
@@ -35,7 +35,7 @@ use super::actor::{
 };
 use crate::Key;
 use crate::state::TimerEventRef;
-use crate::timers::active::TimerState;
+use crate::timers::active::{ActiveTriggerEntry, Queued, Row, TimerState};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::queue::TriggerQueue;
@@ -85,11 +85,11 @@ async fn schedule(
     state: &mut ActorState<TestStore>,
     queue: &mut TriggerQueue,
     trigger: Trigger,
-    queued: TimerState,
+    queued: Queued,
 ) -> Result<()> {
     handle_hold(state, queue, trigger.clone()).await?;
     state.store.add_trigger(trigger.clone()).await?;
-    handle_add(state, queue, trigger, queued).await;
+    handle_add(state, queue, trigger, queued, Row::Written).await;
     Ok(())
 }
 
@@ -187,8 +187,8 @@ enum Op {
 }
 
 /// How a schedule ends. A manager call dropped before its row write releases
-/// its hold. One dropped during the write, or whose write fails, queues an
-/// unconfirmed timer.
+/// its hold. One dropped during the write, or whose write fails, queues a
+/// timer with an unconfirmed row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stop {
     Never,
@@ -281,17 +281,15 @@ impl Arbitrary for OpSequence {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModelActiveState {
-    Scheduled,
-    Unconfirmed,
+    Scheduled(Row),
     Firing,
     Aborted,
 }
 
 impl ModelActiveState {
-    fn from_timer_state(state: TimerState) -> StdResult<Self, String> {
-        match state {
-            TimerState::Scheduled => Ok(Self::Scheduled),
-            TimerState::Unconfirmed => Ok(Self::Unconfirmed),
+    fn from_entry(entry: ActiveTriggerEntry) -> StdResult<Self, String> {
+        match entry.state {
+            TimerState::Scheduled => Ok(Self::Scheduled(entry.row)),
             TimerState::Firing => Ok(Self::Firing),
             TimerState::Aborted => Ok(Self::Aborted),
             TimerState::FiringRescheduled => {
@@ -404,13 +402,21 @@ impl Fixture {
                 .map_err(|e| format!("add_trigger: {e:?}"))?;
             model.in_store = true;
         }
-        let (queued, model_state) = match stop {
-            Stop::Never => (TimerState::Scheduled, ModelActiveState::Scheduled),
-            _ => (TimerState::Unconfirmed, ModelActiveState::Unconfirmed),
+        let row = if stop == Stop::Never {
+            Row::Written
+        } else {
+            Row::Unconfirmed
         };
         let in_memory = owns_slab(&self.state, slab_id) || model.active_state.is_some();
-        handle_add(&self.state, &mut self.triggers, trigger, queued).await;
-        model.active_state = in_memory.then_some(model_state);
+        handle_add(
+            &self.state,
+            &mut self.triggers,
+            trigger,
+            Queued::Scheduled,
+            row,
+        )
+        .await;
+        model.active_state = in_memory.then_some(ModelActiveState::Scheduled(row));
 
         self.set_model(key, time, ty, model);
         Ok(())
@@ -443,7 +449,7 @@ impl Fixture {
                 .active_triggers()
                 .get_state(&key, time, ty)
                 .await,
-            Some(TimerState::Scheduled | TimerState::Unconfirmed)
+            Some(TimerState::Scheduled)
         ) {
             return Ok(());
         }
@@ -470,7 +476,7 @@ impl Fixture {
             .get_state(&key, time, ty)
             .await
         {
-            Some(TimerState::Scheduled | TimerState::Unconfirmed) => true,
+            Some(TimerState::Scheduled) => true,
             Some(TimerState::Firing) => false,
             Some(TimerState::Aborted | TimerState::FiringRescheduled) | None => return Ok(()),
         };
@@ -587,7 +593,7 @@ impl Fixture {
                 && model.in_store
                 && model.active_state.is_none()
             {
-                model.active_state = Some(ModelActiveState::Scheduled);
+                model.active_state = Some(ModelActiveState::Scheduled(Row::Written));
             }
         }
     }
@@ -736,15 +742,9 @@ impl Fixture {
 
             // ActiveTriggers state: owned stored timers are active unless they
             // have not yet been loaded after a restart.
-            let actual_state = self
-                .triggers
-                .active_triggers()
-                .get_state(key, *time, *ty)
-                .await;
+            let actual_entry = self.triggers.active_triggers().get(key, *time, *ty).await;
             let owned = owns_slab(&self.state, slab_id);
-            let actual_model_state = actual_state
-                .map(ModelActiveState::from_timer_state)
-                .transpose()?;
+            let actual_model_state = actual_entry.map(ModelActiveState::from_entry).transpose()?;
             if actual_model_state != expected.active_state {
                 return Err(format!(
                     "Active mismatch for ({key}, {time:?}, {ty:?}): active={actual_model_state:?} \
@@ -931,7 +931,7 @@ fn prop_failed_load_reschedule() {
                 );
                 let mut state = fresh_state(store.clone(), segment);
                 let mut queue = TriggerQueue::new();
-                schedule(&mut state, &mut queue, old.clone(), TimerState::Scheduled).await?;
+                schedule(&mut state, &mut queue, old.clone(), Queued::Scheduled).await?;
 
                 // Seed the successful drain before a later slab read fails.
                 // The failed tick does not advance ownership.
@@ -943,12 +943,12 @@ fn prop_failed_load_reschedule() {
                 )
                 .await?;
                 ensure!(!owns_slab(&state, slab.id()));
-                let mut queued = TimerState::Scheduled;
+                let mut queued = Queued::Scheduled;
                 if delivered {
                     let delivery = queue.next().await.ok_or_eyre("old timer not queued")?;
                     if firing {
                         ensure!(queue.active_triggers().fire(&delivery).await);
-                        queued = TimerState::FiringRescheduled;
+                        queued = Queued::FiringRescheduled;
                     }
                 }
                 let mut replacement = old;
@@ -956,7 +956,8 @@ fn prop_failed_load_reschedule() {
                 schedule(&mut state, &mut queue, replacement.clone(), queued).await?;
                 let active = queue.active_triggers();
                 ensure!(
-                    active.get_state(&replacement.key, time, timer_type).await == Some(queued),
+                    active.get_state(&replacement.key, time, timer_type).await
+                        == Some(queued.into()),
                     "the reschedule left memory"
                 );
                 // The delivery commits, so the re-fire is due.

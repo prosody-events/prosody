@@ -58,7 +58,9 @@ impl FallibleHandler for AmbientProbe {
         C: EventContext<Payload = Self::Payload>,
     {
         let ok = ambient_is(&message.span());
-        let scheduled = context.schedule(self.fire_at, TimerType::Application).await;
+        // The schedule future is large in debug builds, and this test polls the
+        // consumer on its own thread's stack.
+        let scheduled = Box::pin(context.schedule(self.fire_at, TimerType::Application)).await;
         let _ = self.sender.send(("message".to_owned(), ok)).await;
         let _ = self
             .sender

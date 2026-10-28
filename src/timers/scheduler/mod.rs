@@ -21,7 +21,7 @@ use crate::Key;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::heartbeat::HeartbeatRegistry;
-use crate::timers::active::{ActiveTriggers, TimerState};
+use crate::timers::active::{ActiveTriggers, Queued, Row};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::queue::TriggerQueue;
 use crate::timers::store::{StoredSegment, TriggerStore};
@@ -29,7 +29,8 @@ use crate::timers::{TimerType, Trigger};
 use std::error::Error as StdError;
 use thiserror::Error;
 use tokio::spawn;
-use tokio::sync::mpsc::Permit;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::error::SendError;
 use tokio::sync::{mpsc, oneshot, watch};
 
 mod actor;
@@ -37,16 +38,19 @@ mod actor;
 #[cfg(test)]
 pub(crate) mod tests;
 
-/// Size of the internal command and trigger channels.
-pub(crate) const BUFFER_SIZE: usize = 64;
+/// Size of the channel of expired triggers.
+const BUFFER_SIZE: usize = 64;
 
 /// Asynchronous scheduler for timer [`Trigger`]s.
 ///
 /// Cloning shares the same underlying actor task and active-triggers
-/// registry.
+/// registry. A command send never waits, so a dropped call cannot leave a
+/// command half sent. The command channel needs no bound: each caller waits
+/// for the reply to its command, so the queue holds at most one command for
+/// each caller.
 #[derive(Debug)]
 pub struct TriggerScheduler<E> {
-    command_tx: mpsc::Sender<Command<E>>,
+    command_tx: UnboundedSender<Command<E>>,
     active_triggers: ActiveTriggers,
 }
 
@@ -78,8 +82,8 @@ pub(super) enum CommandOperation {
     Hold,
     /// Release the trigger's hold; its row write never started.
     Release,
-    /// Queue a trigger whose row write ended, in the given state.
-    Add(TimerState),
+    /// Queue a trigger whose row write ended.
+    Add(Queued, Row),
     /// Remove a trigger from both `DelayQueue` and `ActiveTriggers`.
     Remove,
     /// Remove the coordinate only if no replacement tag stands.
@@ -109,7 +113,7 @@ where
     where
         T: TriggerStore<Error = E>,
     {
-        let (command_tx, commands_rx) = mpsc::channel(BUFFER_SIZE);
+        let (command_tx, commands_rx) = mpsc::unbounded_channel();
         let (trigger_tx, triggers_rx) = mpsc::channel(BUFFER_SIZE);
         let triggers = TriggerQueue::new();
         let active_triggers = triggers.active_triggers().clone();
@@ -144,36 +148,32 @@ where
     ///
     /// Before the write, the actor registers the slab and holds the trigger.
     /// After it, the actor queues the trigger if it owns the slab. Otherwise
-    /// it drops the hold, and the load loop reads the row later. Commands for
-    /// a dropped or failed call are sent on drop through a reserved permit.
+    /// it drops the hold, and the load loop reads the row later. A dropped or
+    /// failed call still sends its last command, through [`Settle`].
     pub(crate) async fn insert<X>(
         &self,
         trigger: Trigger,
-        queued: TimerState,
+        queued: Queued,
         write: impl Future<Output = Result<(), X>>,
     ) -> Result<(), X>
     where
         X: From<TimerSchedulerError<E>>,
     {
-        let mut permits = self
-            .command_tx
-            .reserve_many(2)
-            .await
-            .map_err(|_| TimerSchedulerError::Shutdown)?;
         let mut settle = Settle {
-            permit: permits.next(),
+            commands: &self.command_tx,
             trigger: trigger.clone(),
-            on_drop: CommandOperation::Release,
+            on_drop: Some(CommandOperation::Release),
         };
-        let hold = permits
-            .next()
-            .map(|permit| command(permit, CommandOperation::Hold, trigger));
-        reply(hold).await?;
+        self.send_command(CommandOperation::Hold, trigger.clone())
+            .await?;
 
         // The row may exist once the write starts.
-        settle.on_drop = CommandOperation::Add(TimerState::Unconfirmed);
+        settle.on_drop = Some(CommandOperation::Add(queued, Row::Unconfirmed));
         write.await?;
-        Ok(reply(settle.send(CommandOperation::Add(queued))).await?)
+        settle.on_drop = None;
+        Ok(self
+            .send_command(CommandOperation::Add(queued, Row::Written), trigger)
+            .await?)
     }
 
     /// Unschedule a previously scheduled [`Trigger`].
@@ -212,67 +212,51 @@ where
         self.active_triggers.remove(key, time, timer_type).await;
     }
 
+    /// Sends a command and waits for its reply. A closed channel means
+    /// shutdown.
     async fn send_command(
         &self,
         operation: CommandOperation,
         trigger: Trigger,
     ) -> Result<(), TimerSchedulerError<E>> {
-        let permit = self
-            .command_tx
-            .reserve()
+        send(&self.command_tx, operation, trigger)
+            .map_err(|_| TimerSchedulerError::Shutdown)?
             .await
-            .map_err(|_| TimerSchedulerError::Shutdown)?;
-        reply(Some(command(permit, operation, trigger))).await
+            .map_err(|_| TimerSchedulerError::Shutdown)?
+            .map_err(TimerSchedulerError::Store)
     }
 }
 
-/// Sends the final command of an insert. Dropping it sends `on_drop`.
+/// Sends `on_drop` when an insert ends before its last command.
 struct Settle<'a, E> {
-    permit: Option<Permit<'a, Command<E>>>,
+    commands: &'a UnboundedSender<Command<E>>,
     trigger: Trigger,
-    on_drop: CommandOperation,
-}
-
-impl<E> Settle<'_, E> {
-    fn send(&mut self, operation: CommandOperation) -> Option<oneshot::Receiver<Result<(), E>>> {
-        let permit = self.permit.take()?;
-        Some(command(permit, operation, self.trigger.clone()))
-    }
+    on_drop: Option<CommandOperation>,
 }
 
 impl<E> Drop for Settle<'_, E> {
     fn drop(&mut self) {
-        self.send(self.on_drop);
+        if let Some(operation) = self.on_drop {
+            // A closed channel means the actor stopped, and its state is gone.
+            let _ = send(self.commands, operation, self.trigger.clone());
+        }
     }
 }
 
-/// Sends a command through a reserved permit and returns its reply channel.
-fn command<E>(
-    permit: Permit<'_, Command<E>>,
+/// Queues a command for the actor and returns its reply channel. An error
+/// means the actor stopped.
+fn send<E>(
+    commands: &UnboundedSender<Command<E>>,
     operation: CommandOperation,
     trigger: Trigger,
-) -> oneshot::Receiver<Result<(), E>> {
+) -> Result<oneshot::Receiver<Result<(), E>>, SendError<Command<E>>> {
     let (result_tx, result_rx) = oneshot::channel();
-    permit.send(Command {
+    commands.send(Command {
         operation,
         trigger,
         result_tx,
-    });
-    result_rx
-}
-
-/// Awaits a command reply. A missing permit or reply means shutdown.
-async fn reply<E>(
-    result_rx: Option<oneshot::Receiver<Result<(), E>>>,
-) -> Result<(), TimerSchedulerError<E>>
-where
-    E: ClassifyError + StdError + Send + Sync + 'static,
-{
-    result_rx
-        .ok_or(TimerSchedulerError::Shutdown)?
-        .await
-        .map_err(|_| TimerSchedulerError::Shutdown)?
-        .map_err(TimerSchedulerError::Store)
+    })?;
+    Ok(result_rx)
 }
 
 /// Errors returned by [`TriggerScheduler`] methods.

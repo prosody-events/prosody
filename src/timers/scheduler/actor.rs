@@ -10,7 +10,7 @@
 use super::{Command, CommandOperation};
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::Heartbeat;
-use crate::timers::active::TimerState;
+use crate::timers::active::{Queued, Row};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::queue::TriggerQueue;
@@ -99,7 +99,7 @@ pub(super) async fn run_actor<T>(
     store: T,
     segment: StoredSegment,
     mut triggers: TriggerQueue,
-    mut commands: mpsc::Receiver<Command<T::Error>>,
+    mut commands: mpsc::UnboundedReceiver<Command<T::Error>>,
     trigger_tx: mpsc::Sender<Trigger>,
     heartbeat: Heartbeat,
     mut shutdown_rx: watch::Receiver<ShutdownPhase>,
@@ -208,8 +208,8 @@ pub(super) async fn process_command<T>(
             release(triggers, &trigger).await;
             Ok(())
         }
-        CommandOperation::Add(queued) => {
-            handle_add(state, triggers, trigger, queued).await;
+        CommandOperation::Add(queued, row) => {
+            handle_add(state, triggers, trigger, queued, row).await;
             Ok(())
         }
         CommandOperation::Remove => {
@@ -295,16 +295,18 @@ where
 
 /// Handler for [`CommandOperation::Add`].
 ///
-/// Queues the trigger in the `queued` state if the actor keeps the
-/// coordinate in memory: it owns the slab, or a partial drain or a delivery
-/// holds the coordinate. The slab's active set then never drifts below its DB
-/// content (P1). Otherwise the actor releases the hold, and `load_step` reads
-/// the row later. This keeps the in-memory queue bounded to the preload window.
+/// Queues the trigger in the `queued` state with its `row` certainty if the
+/// actor keeps the coordinate in memory: it owns the slab, or a partial drain
+/// or a delivery holds the coordinate. The slab's active set then never drifts
+/// below its DB content (P1). Otherwise the actor releases the hold, and
+/// `load_step` reads the row later. This keeps the in-memory queue bounded to
+/// the preload window.
 pub(super) async fn handle_add<T>(
     state: &ActorState<T>,
     triggers: &mut TriggerQueue,
     trigger: Trigger,
-    queued: TimerState,
+    queued: Queued,
+    row: Row,
 ) {
     let entry = triggers
         .active_triggers()
@@ -325,7 +327,7 @@ pub(super) async fn handle_add<T>(
     triggers.insert(trigger).await;
     triggers
         .active_triggers()
-        .set_state(&key, time, timer_type, queued)
+        .queue(&key, time, timer_type, queued, row)
         .await;
 }
 
