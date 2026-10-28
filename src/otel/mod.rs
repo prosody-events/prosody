@@ -5,9 +5,10 @@
 
 use opentelemetry::Context;
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 use std::str::FromStr;
 use thiserror::Error;
-use tracing::{Span, debug};
+use tracing::{Span, debug, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Controls how a new span relates to a propagated OpenTelemetry context.
@@ -138,6 +139,15 @@ pub(crate) fn context_with_parent(span: &Span, context: Context) -> Context {
         return context;
     }
     span.context()
+}
+
+/// Marks `span` failed and logs `error` at warn.
+///
+/// Use it for a span that `#[instrument(err)]` cannot cover. The `OTel` layer
+/// sets the error status from an `error` field only when the event has no
+/// message, so this event has no message. A disabled span gets no status.
+pub(crate) fn mark_failed(span: &Span, error: impl Display) {
+    warn!(parent: span, error = %error);
 }
 
 /// Error returned when parsing a [`SpanRelation`] from a string fails.

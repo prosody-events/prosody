@@ -15,15 +15,17 @@ use crate::consumer::partition::keyed::KeyManager;
 use crate::heartbeat::Heartbeat;
 use crate::test_util::TEST_RUNTIME;
 use ahash::HashMapExt;
+use async_stream::stream;
 use futures::StreamExt;
 use futures::stream::iter;
 use futures::stream::pending;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use scc::{HashMap, HashSet};
-use tokio::sync::Notify;
+use tokio::spawn;
 use tokio::sync::watch;
-use tokio::time::sleep;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::time::{sleep, timeout};
 
 /// A sequence of messages with keys and values for testing.
 #[derive(Clone, Debug)]
@@ -32,6 +34,13 @@ struct Messages(Vec<(u8, u16)>);
 /// A wrapper for a vector of u8 values used in `QuickCheck` tests.
 #[derive(Clone, Debug)]
 struct SimpleMessages(Vec<u8>);
+
+/// A keyed message that holds an in-flight permit.
+#[derive(Debug)]
+struct Held {
+    key: u8,
+    _permit: OwnedSemaphorePermit,
+}
 
 /// Verifies that `KeyManager` prevents concurrent execution of messages with
 /// the same key.
@@ -67,7 +76,8 @@ async fn prevents_concurrent_key_execution_impl(
                 sleep(Duration::from_micros(key.saturating_mul(100).into())).await;
                 active_keys.remove_async(&key).await;
             } else {
-                // If insertion fails, it means the key is already being processed
+                // If insertion fails, it means the key is already being
+                // processed
                 failed.store(true, Ordering::Release);
             }
         }
@@ -157,7 +167,7 @@ async fn grace_period_allows_inflight_to_complete() {
     let messages = iter([1u8]).chain(pending::<u8>());
 
     let started_wait = started.clone();
-    tokio::spawn(async move {
+    spawn(async move {
         started_wait.notified().await;
         let _ = shutdown_tx.send(ShutdownPhase::Draining);
         sleep(Duration::from_millis(200)).await;
@@ -203,7 +213,7 @@ async fn drain_prevents_queued_work_from_starting() {
     let messages = iter([1u8, 1u8]).chain(pending::<u8>());
 
     let started_wait = started.clone();
-    tokio::spawn(async move {
+    spawn(async move {
         started_wait.notified().await;
         let _ = shutdown_tx.send(ShutdownPhase::Draining);
         sleep(Duration::from_millis(200)).await;
@@ -223,6 +233,57 @@ async fn drain_prevents_queued_work_from_starting() {
         1,
         "queued message should not start after draining begins"
     );
+}
+
+/// A drain releases the permits that the input stream and the queued
+/// messages hold, while a task is still in flight. Another waiter then gets a
+/// freed permit before the drain ends.
+///
+/// Falsify: keep the input stream alive, or keep the queued messages. The
+/// stream then takes the freed permit, or no permit is freed.
+#[tokio::test]
+async fn drain_releases_unstarted_permits() {
+    let permits = Arc::new(Semaphore::new(2));
+    let waiting = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+
+    // Every message has key 1. The first runs, the second is queued, and the
+    // stream then waits for a permit for the third.
+    let (source, arrived) = (Arc::clone(&permits), Arc::clone(&waiting));
+    let messages = stream! {
+        for index in 0_u8.. {
+            if index == 2 {
+                arrived.notify_one();
+            }
+            let Ok(permit) = Arc::clone(&source).acquire_owned().await else {
+                break;
+            };
+            yield Held { key: 1, _permit: permit };
+        }
+    };
+
+    let finish = Arc::clone(&release);
+    let manager = KeyManager::new(move |held: Held| {
+        let release = Arc::clone(&finish);
+        async move {
+            release.notified().await;
+            drop(held);
+        }
+    });
+    let processed = spawn(manager.process_messages(
+        messages,
+        Heartbeat::new("test", Duration::from_secs(30)),
+        shutdown_rx,
+    ));
+
+    waiting.notified().await;
+    assert!(shutdown_tx.send(ShutdownPhase::Draining).is_ok());
+    let freed = timeout(Duration::from_secs(5), permits.acquire()).await;
+    assert!(freed.is_ok(), "the drain kept every unstarted permit");
+
+    release.notify_one();
+    assert!(processed.await.is_ok());
 }
 
 impl Arbitrary for Messages {
@@ -252,6 +313,14 @@ impl Keyed for (u8, u16) {
 
     fn key(&self) -> &Self::Key {
         &self.0
+    }
+}
+
+impl Keyed for Held {
+    type Key = u8;
+
+    fn key(&self) -> &Self::Key {
+        &self.key
     }
 }
 

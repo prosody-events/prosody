@@ -114,7 +114,7 @@ impl PeerDirectory for CassandraPeerDirectory {
     /// # Errors
     ///
     /// Returns the driver's error when the write fails.
-    #[instrument(level = "debug", skip_all, fields(peer = %registration.peer), err)]
+    #[instrument(level = "debug", skip_all, fields(peer = %registration.peer), err(level = "warn"))]
     async fn register(&self, registration: &PeerRegistration) -> Result<(), CassandraStoreError> {
         let direct_socket_address = registration.direct.socket().to_string();
         let advertised_connect = registration
@@ -151,7 +151,7 @@ impl PeerDirectory for CassandraPeerDirectory {
     ///
     /// Returns the driver's error when the read fails. An unusable row is a
     /// data outcome, not an error.
-    #[instrument(level = "debug", skip_all, fields(%peer), err)]
+    #[instrument(level = "debug", skip_all, fields(%peer), err(level = "warn"))]
     async fn read(&self, peer: PeerId) -> Result<Option<PeerRegistration>, CassandraStoreError> {
         let row = self
             .store
@@ -213,7 +213,7 @@ impl PeerDirectory for CassandraPeerDirectory {
     /// # Errors
     ///
     /// Returns the driver's error when the delete fails.
-    #[instrument(level = "debug", skip_all, fields(peer = %registration.peer), err)]
+    #[instrument(level = "debug", skip_all, fields(peer = %registration.peer), err(level = "warn"))]
     async fn deregister(&self, registration: &PeerRegistration) -> Result<(), CassandraStoreError> {
         self.store
             .execute_unpaged_discard(&self.queries.remove, (Uuid::from(registration.peer),))

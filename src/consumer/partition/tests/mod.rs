@@ -31,9 +31,14 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
+use tokio::sync::mpsc::{Sender, channel};
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::time::{Instant, sleep, sleep_until};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::Span;
+
+/// The record capacity of the test channel that feeds a partition manager.
+const RECORD_CAPACITY: usize = 10;
 
 /// Helper trait for waiting on processed offsets.
 trait HasProcessedOffsets {
@@ -72,7 +77,6 @@ fn default_config()
     PartitionConfiguration {
         group_id: Arc::from("test-group"),
         version: Arc::from("1"),
-        buffer_size: 10,
         max_uncommitted: 10,
         allowed_events: None,
         shutdown_timeout: Duration::from_secs(1),
@@ -88,39 +92,28 @@ fn default_config()
     }
 }
 
-#[tokio::test]
-async fn test_partition_manager_capacity() -> color_eyre::Result<()> {
-    init_test_logging();
-
-    let handler = TestHandler::new();
-    let mut config = default_config();
-    config.buffer_size = 5;
-    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
-
-    // Send messages up to buffer capacity
-    for i in 0..5u8 {
-        let message = create_test_message(Offset::from(i), "key")?;
-        assert!(
-            partition_manager
-                .sender()
-                .try_send(ConsumerRecord::Message(message))
-                .is_ok(),
-            "Message send should succeed"
-        );
-    }
-
-    // Send one more message; it should be rejected because the buffer is full
-    let message = create_test_message(5, "key")?;
-    assert!(
-        partition_manager
-            .sender()
-            .try_send(ConsumerRecord::Message(message))
-            .is_err(),
-        "Message send should fail when buffer is full"
+/// Starts a partition manager over a test channel. Each record sent on the
+/// returned sender reaches the manager in send order.
+fn start<T>(
+    config: PartitionConfiguration<
+        InMemoryTriggerStoreProvider,
+        MemoryStateProvider,
+        serde_json::Value,
+    >,
+    handler: T,
+) -> (PartitionManager, Sender<ConsumerRecord<serde_json::Value>>)
+where
+    T: EventHandler<Payload = serde_json::Value> + Send + Sync + 'static,
+{
+    let (records, receiver) = channel(RECORD_CAPACITY);
+    let manager = PartitionManager::new(
+        config,
+        handler,
+        "test-topic".into(),
+        0,
+        ReceiverStream::new(receiver),
     );
-
-    partition_manager.shutdown().await;
-    Ok(())
+    (manager, records)
 }
 
 /// Same-key events are strictly serialized, in order: each handler holds its
@@ -132,17 +125,14 @@ async fn test_partition_manager_ordering() -> color_eyre::Result<()> {
 
     let handler = TestHandler::with_delay(Duration::from_millis(20));
     let config = default_config();
-    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
+    let (partition_manager, records) = start(config, handler.clone());
 
     // Send messages with the same key and increasing offsets
     let offsets = vec![0, 1, 2, 3];
     for &offset in &offsets {
         let message = create_test_message(offset, "key")?;
         assert!(
-            partition_manager
-                .sender()
-                .try_send(ConsumerRecord::Message(message))
-                .is_ok(),
+            records.try_send(ConsumerRecord::Message(message)).is_ok(),
             "Message send should succeed"
         );
     }
@@ -174,16 +164,13 @@ async fn test_partition_manager_watermark() -> color_eyre::Result<()> {
 
     let handler = TestHandler::new();
     let config = default_config();
-    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
+    let (partition_manager, records) = start(config, handler.clone());
 
     // Send sequential messages
     for i in 0..5 {
         let message = create_test_message(i, "key")?;
         assert!(
-            partition_manager
-                .sender()
-                .try_send(ConsumerRecord::Message(message))
-                .is_ok(),
+            records.try_send(ConsumerRecord::Message(message)).is_ok(),
             "Message send should succeed"
         );
     }
@@ -207,16 +194,13 @@ async fn test_partition_manager_max_uncommitted() -> color_eyre::Result<()> {
     let max_uncommitted = 5;
     let mut config = default_config();
     config.max_uncommitted = max_uncommitted;
-    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
+    let (partition_manager, records) = start(config, handler.clone());
 
     // Send more messages than max_uncommitted
     for i in 0..(max_uncommitted + 5) {
         let message = create_test_message(i as Offset, "key")?;
         assert!(
-            partition_manager
-                .sender()
-                .try_send(ConsumerRecord::Message(message))
-                .is_ok(),
+            records.try_send(ConsumerRecord::Message(message)).is_ok(),
             "Message send should succeed"
         );
     }
@@ -311,15 +295,12 @@ async fn test_partition_manager_is_stalled() -> color_eyre::Result<()> {
     let mut config = default_config();
     let stall_threshold = Duration::from_millis(100);
     config.stall_threshold = stall_threshold;
-    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
+    let (partition_manager, records) = start(config, handler.clone());
 
     // Send a message that is delayed in processing
     let message = create_test_message(0, "key")?;
     assert!(
-        partition_manager
-            .sender()
-            .try_send(ConsumerRecord::Message(message))
-            .is_ok(),
+        records.try_send(ConsumerRecord::Message(message)).is_ok(),
         "Message send should succeed"
     );
 

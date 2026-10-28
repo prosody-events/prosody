@@ -86,7 +86,7 @@ fn require_inline(state: &TimerState) -> Result<&InlineTimer, CassandraTriggerSt
 
 impl CassandraTriggerStore {
     /// Fetches the `state` map from the database.
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(super) async fn fetch_state_map(
         &self,
         segment_id: &SegmentId,
@@ -109,7 +109,7 @@ impl CassandraTriggerStore {
     ///
     /// Uses `SELECT state[?]` to read only the requested type. Both a missing
     /// partition (no row) and a `NULL` map entry resolve to `Absent`.
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(super) async fn fetch_state(
         &self,
         segment_id: &SegmentId,
@@ -181,7 +181,7 @@ impl CassandraTriggerStore {
     ///
     /// This is the safe path for Overflow→Inline and DB-Absent→Inline
     /// transitions.
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(super) async fn batch_clear_and_set_inline(
         &self,
         segment_id: &SegmentId,
@@ -212,7 +212,7 @@ impl CassandraTriggerStore {
     /// One BATCH range-deletes the type's clustering rows and deletes
     /// `state[type]`. Every transition to `Absent` that can leave clustering
     /// rows goes through here.
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(super) async fn batch_clear_key_triggers(
         &self,
         segment_id: &SegmentId,
@@ -233,7 +233,7 @@ impl CassandraTriggerStore {
     /// This is the fast path for Inline→Inline replacement: no BATCH,
     /// no DELETE, no range tombstone. Safe because the caller knows the state
     /// is `Inline` (no clustering rows for this key/type).
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(super) async fn set_state_inline(
         &self,
         segment_id: &SegmentId,
@@ -256,7 +256,7 @@ impl CassandraTriggerStore {
     /// A TTL is applied (derived from `ttl_time`) so the marker expires no
     /// later than the clustering rows it describes, preventing zombie Overflow
     /// entries if those rows expire via TTL without an explicit deletion.
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(super) async fn set_state_overflow(
         &self,
         segment_id: &SegmentId,
@@ -279,7 +279,7 @@ impl CassandraTriggerStore {
     }
 
     /// Removes a state entry for a single timer type (returns to Absent).
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(super) async fn remove_state_entry(
         &self,
         segment_id: &SegmentId,
@@ -302,7 +302,7 @@ impl CassandraTriggerStore {
     /// Rows ascend by time, so the first row is the type's earliest live
     /// trigger. A delete and the V2→V3 backfill each read it once to choose
     /// the next state. A third row signals two or more survivors.
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(super) async fn peek_three_key_triggers(
         &self,
         segment_id: &SegmentId,
@@ -340,7 +340,7 @@ impl CassandraTriggerStore {
     /// - 0 clustering rows: skip (stale slab entry, truly absent).
     /// - 1 clustering row: move it into inline state.
     /// - ≥2 clustering rows: set overflow marker.
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(super) async fn backfill_key_state(
         &self,
         segment_id: &SegmentId,
@@ -396,7 +396,7 @@ impl CassandraTriggerStore {
     /// expires together with the last clustering row it describes — preventing
     /// zombie markers if those rows later expire via TTL without explicit
     /// deletion.
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(super) async fn batch_promote_and_set_overflow(
         &self,
         segment_id: &SegmentId,
@@ -443,7 +443,7 @@ impl CassandraTriggerStore {
     ///
     /// Used when multiple timers exist for a key/type. Does not touch the
     /// state column.
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(super) async fn add_key_trigger_clustering(
         &self,
         segment_id: &SegmentId,

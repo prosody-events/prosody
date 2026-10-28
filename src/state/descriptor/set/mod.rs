@@ -111,7 +111,7 @@ where
     ///
     /// Returns a key codec error (`Permanent`) when a key does not encode, or a
     /// session access error.
-    #[instrument(name = "set.insert", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
+    #[instrument(name = "set.insert", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err(level = "warn"))]
     #[write(op)]
     pub async fn insert(&self, key: &KC::Borrowed) -> Result<(), SetStateError>
     where
@@ -126,7 +126,7 @@ where
     ///
     /// Returns a key codec error (`Permanent`) when a key does not encode, or a
     /// session access error.
-    #[instrument(name = "set.remove", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
+    #[instrument(name = "set.remove", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err(level = "warn"))]
     #[write(op)]
     pub async fn remove(&self, key: &KC::Borrowed) -> Result<(), SetStateError>
     where
@@ -141,7 +141,7 @@ where
     ///
     /// Returns a key codec error (`Permanent`) when a key does not encode, or a
     /// session access error.
-    #[instrument(name = "set.contains", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err)]
+    #[instrument(name = "set.contains", skip_all, fields(collection = self.cells.name().as_str(), set.key = %key), err(level = "warn"))]
     #[read(op)]
     pub async fn contains(&self, key: &KC::Borrowed) -> Result<bool, SetStateError>
     where
@@ -156,7 +156,7 @@ where
     ///
     /// Returns a key codec error (`Permanent`) when a key does not encode, or a
     /// session access error.
-    #[instrument(name = "set.contains_many", skip_all, fields(collection = self.cells.name().as_str(), keys = Empty), err)]
+    #[instrument(name = "set.contains_many", skip_all, fields(collection = self.cells.name().as_str(), keys = Empty), err(level = "warn"))]
     #[read(op)]
     pub async fn contains_many<'a, Q, I>(&self, keys: I) -> Result<CellBuffer<bool>, SetStateError>
     where
@@ -176,7 +176,7 @@ where
     /// # Errors
     ///
     /// Returns a session access error.
-    #[instrument(name = "set.clear", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "set.clear", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     #[write(op)]
     pub async fn clear(&self) -> Result<(), SetStateError> {
         op.clear_collection();
@@ -209,7 +209,7 @@ where
     /// # Errors
     ///
     /// Returns a key codec error or a session access error.
-    #[instrument(name = "set.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "set.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     pub async fn is_empty(&self) -> Result<bool, SetStateError> {
         membership::is_empty(&self.cells).await
     }
@@ -219,7 +219,7 @@ where
     /// # Errors
     ///
     /// Returns a session access error.
-    #[instrument(name = "set.commit", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "set.commit", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     pub async fn commit(&self) -> Result<StoreOutcome, SetStateError>
     where
         S: WritableStateSession,
