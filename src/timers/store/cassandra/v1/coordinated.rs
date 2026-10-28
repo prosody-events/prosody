@@ -20,7 +20,7 @@ use tracing::instrument;
 /// Both operations execute in parallel using `try_join!` for efficiency,
 /// so if one insertion fails the other may still have succeeded, leaving
 /// the indices inconsistent until the caller retries.
-#[instrument(level = "debug", skip(ops, trigger), err)]
+#[instrument(level = "debug", skip(ops, trigger), err(level = "warn"))]
 pub(super) async fn add_trigger(
     ops: &V1Operations,
     segment_id: &SegmentId,
@@ -48,7 +48,7 @@ pub(super) async fn add_trigger(
 /// Both operations execute in parallel using `try_join!` for efficiency,
 /// so if one deletion fails the other may still have succeeded, leaving
 /// the indices inconsistent until the caller retries.
-#[instrument(level = "debug", skip(ops), err)]
+#[instrument(level = "debug", skip(ops), err(level = "warn"))]
 pub(super) async fn remove_trigger(
     ops: &V1Operations,
     segment_id: &SegmentId,
@@ -78,7 +78,7 @@ pub(super) async fn remove_trigger(
 ///
 /// If an error interrupts processing partway through, some triggers may
 /// already be deleted from one index but not the other.
-#[instrument(level = "debug", skip(ops), err)]
+#[instrument(level = "debug", skip(ops), err(level = "warn"))]
 pub(super) async fn clear_triggers_for_key(
     ops: &V1Operations,
     segment_id: &SegmentId,
@@ -123,7 +123,7 @@ pub(super) async fn clear_triggers_for_key(
 ///
 /// If an error interrupts processing partway through, some steps may
 /// already be complete while others are not.
-#[instrument(level = "debug", skip(ops), err)]
+#[instrument(level = "debug", skip(ops), err(level = "warn"))]
 pub(super) async fn delete_slab(
     ops: &V1Operations,
     segment_id: &SegmentId,

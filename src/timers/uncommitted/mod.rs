@@ -381,7 +381,7 @@ where
             {
                 Ok(()) => break,
                 Err(error) => {
-                    tracing::error!("failed to commit timer: {error:#}; retrying");
+                    warn!("failed to commit timer: {error:#}; retrying");
                     sleep(RETRY_DURATION).await;
                 }
             }

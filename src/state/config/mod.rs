@@ -39,10 +39,7 @@ const SUBSYSTEM_ENV: &str = "PROSODY_SUBSYSTEM";
 /// fewer repeated store reads on hot keys.
 const DEFAULT_READ_CACHE_TTL: Duration = Duration::from_secs(5);
 
-const DEFAULT_READER_CACHE_SIZE: ByteSize = match NonZeroU64::new(1_048_576) {
-    Some(budget) => ByteSize::new(budget),
-    None => ByteSize::new(NonZeroU64::MIN),
-};
+const DEFAULT_READER_CACHE_SIZE: ByteSize = ByteSize::bytes(1 << 20_u32);
 
 /// Configuration for the pipeline consumer's keyed-state layer.
 ///

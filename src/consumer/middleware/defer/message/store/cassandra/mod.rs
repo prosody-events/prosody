@@ -239,7 +239,7 @@ impl fmt::Debug for CassandraMessageDeferStore {
 impl MessageDeferStore for CassandraMessageDeferStore {
     type Error = CassandraDeferStoreError;
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn defer_first_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
         // Consult current state so we don't violate I1 when the caller's
         // "fresh key" precondition is violated: the new row must not raise
@@ -249,7 +249,7 @@ impl MessageDeferStore for CassandraMessageDeferStore {
             .await
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn get_next_deferred_message(
         &self,
         key: &Key,
@@ -267,7 +267,7 @@ impl MessageDeferStore for CassandraMessageDeferStore {
         Ok(result)
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn complete_retry_success(
         &self,
         key: &Key,
@@ -333,7 +333,7 @@ impl MessageDeferStore for CassandraMessageDeferStore {
         }
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn append_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
         let (segment_id, cached) = self.resolve_cache_or_read(key).await?;
         let ttl = self.store.base_ttl();
@@ -384,7 +384,7 @@ impl MessageDeferStore for CassandraMessageDeferStore {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn remove_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
         let (segment_id, cached) = self.resolve_cache_or_read(key).await?;
         let ttl = self.store.base_ttl();
@@ -433,7 +433,7 @@ impl MessageDeferStore for CassandraMessageDeferStore {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
         // No-op on a partition with no live messages. Cassandra's blind UPDATE
         // upserts a static-only row and leaves an orphan retry_count after
@@ -463,7 +463,7 @@ impl MessageDeferStore for CassandraMessageDeferStore {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn delete_key(&self, key: &Key) -> Result<(), Self::Error> {
         let segment_id = self.segment_id().await?;
 

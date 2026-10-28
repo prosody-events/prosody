@@ -9,12 +9,12 @@ use tokio::spawn;
 use tokio::sync::watch;
 use tokio::task::coop::cooperative;
 use tokio::time::sleep;
-use tracing::{debug, error};
+use tracing::{debug, warn};
 
 use super::dispatch::{build_message_stream, process_event};
 use super::{PartitionConfiguration, PartitionContext, PartitionInfo, ShutdownPhase, metrics};
 use crate::consumer::EventHandler;
-use crate::consumer::message::UncommittedEvent;
+use crate::consumer::message::{ConsumerRecord, UncommittedEvent};
 use crate::consumer::middleware::deduplication::DedupIdentity;
 use crate::consumer::partition::keyed::KeyManager;
 use crate::heartbeat::HeartbeatRegistry;
@@ -71,7 +71,7 @@ where
         {
             Ok(result) => return Some(result),
             Err(error) => {
-                error!("failed to initialize timer manager: {error:#}; retrying");
+                warn!("failed to initialize timer manager: {error:#}; retrying");
                 sleep(Duration::from_secs(1)).await;
             }
         }
@@ -107,7 +107,7 @@ where
         {
             Ok(manager) => return Some(manager),
             Err(error) => {
-                error!("failed to acquire keyed-state manager: {error:#}; retrying");
+                warn!("failed to acquire keyed-state manager: {error:#}; retrying");
                 sleep(Duration::from_secs(1)).await;
             }
         }
@@ -130,12 +130,13 @@ struct PartitionParams {
 /// only over `S::Store` and `SP::Manager`. This keeps the provider types
 /// out of the long-lived coroutine state machine, preventing future-size
 /// explosion with the deeply nested middleware handler type `T`.
-pub(super) async fn handle_messages<T, S, SP, P>(
+pub(super) async fn handle_messages<T, S, SP, P, Q>(
     config: PartitionConfiguration<S, SP, P>,
     partition_info: PartitionInfo,
     handler: T,
-    context: PartitionContext<P>,
+    context: PartitionContext<Q>,
 ) where
+    Q: Stream<Item = ConsumerRecord<P>>,
     T: EventHandler<Payload = P> + Send + Sync + 'static,
     S: TriggerStoreProvider,
     SP: PartitionStateProvider<S::Store>,
@@ -198,14 +199,15 @@ pub(super) async fn handle_messages<T, S, SP, P>(
 
 /// Core partition loop, generic over `S: TriggerStore`, the keyed-state
 /// manager `M`, and `P` (payload type).
-async fn run_partition<T, S, M, P>(
+async fn run_partition<T, S, M, P, Q>(
     trigger_store: S,
     state_manager: M,
     partition_info: PartitionInfo,
     handler: T,
-    context: PartitionContext<P>,
+    context: PartitionContext<Q>,
     params: PartitionParams,
 ) where
+    Q: Stream<Item = ConsumerRecord<P>>,
     T: EventHandler<Payload = P> + Send + Sync + 'static,
     S: TriggerStore,
     M: PartitionStateManager<Session: EventSession<Loader: MessageLoader<Payload = P>>>,
@@ -221,16 +223,16 @@ async fn run_partition<T, S, M, P>(
     } = params;
     let PartitionContext {
         offsets,
-        message_rx,
+        records,
         heartbeats,
         shutdown_rx,
     } = context;
 
     let mut highest_offset_seen = -1;
 
-    let message_events = build_message_stream::<S, P>(
+    let message_events = build_message_stream::<S, P, _>(
         &offsets,
-        message_rx,
+        records,
         &group_id,
         &mut highest_offset_seen,
         allowed_events.as_ref(),

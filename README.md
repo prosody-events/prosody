@@ -41,7 +41,7 @@ chain. Handler timeouts cancel handlers that exceed their deadline, preventing a
 - **Event Filtering**: Filters messages by event type prefix; unmatched events are committed without processing.
 - **Health Probes**: Built-in `/readyz` and `/livez` HTTP endpoints for Kubernetes liveness and readiness checks.
 - **Distributed Tracing**: OpenTelemetry integration for tracing message flow across services.
-- **Backpressure**: Pauses partitions when handlers fall behind.
+- **Backpressure**: Stops reading a partition when handlers fall behind, and bounds fetched and decoded records.
 - **Mocking**: In-memory Kafka broker for tests (`PROSODY_MOCK=true`).
 - **High-Level Client**: Combines producer and consumer with timer support.
 - **Requests**: Collects one typed response from each requested subsystem.

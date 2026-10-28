@@ -242,7 +242,7 @@ pub(super) fn triggers_all_types<'a>(
 
 /// Reads the current trigger through the partition writer's shared cache.
 /// Per-key serialization orders admission after every prior store mutation.
-#[instrument(name = "current_trigger", level = "debug", skip(store), fields(state_cached = Empty), err)]
+#[instrument(name = "current_trigger", level = "debug", skip(store), fields(state_cached = Empty), err(level = "warn"))]
 pub(super) async fn current(
     store: &CassandraTriggerStore,
     key: &Key,
