@@ -1,6 +1,7 @@
 //! Explicit actor steps for admission after partial timer writes.
 
-use super::super::actor::{ActorState, load_step, process_command};
+use super::super::actor::load::load_step;
+use super::super::actor::{ActorState, process_command};
 use super::super::{CommandOperation, TriggerScheduler};
 use crate::state::TimerEventRef;
 use crate::timers::duration::CompactDuration;
