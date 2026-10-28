@@ -3,9 +3,10 @@
 //! librdkafka reconnects to a broker by itself after a connection fails, but
 //! the default rdkafka client context logs each failure at error. A failed
 //! connection needs action only when it persists, and stall detection reports
-//! a client that stops. So Prosody logs connection failures at warn. Every
-//! other librdkafka error, including authentication and SSL failures, stays at
-//! error.
+//! a client that stops. So Prosody logs connection failures at warn. A `FAIL`
+//! log line can also carry an authentication or SSL failure. The error
+//! callback reports that failure with its own code, which stays at error with
+//! every other librdkafka error.
 
 use rdkafka::ClientContext;
 use rdkafka::config::RDKafkaLogLevel;

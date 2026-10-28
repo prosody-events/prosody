@@ -23,6 +23,7 @@
 //! persistent state for potential reloading.
 
 use crate::consumer::{Keyed, Uncommitted};
+use crate::error::{ClassifyError, RetryAlert};
 use crate::otel::SpanRelation;
 use crate::related_span;
 use crate::timers::TimerType;
@@ -38,7 +39,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::sleep;
-use tracing::{Level, Span, warn};
+use tracing::{Level, Span, error, warn};
 
 /// Delay between retry attempts when commits fail.
 const RETRY_DURATION: Duration = Duration::from_secs(1);
@@ -373,6 +374,7 @@ where
         }
 
         // Retry loop: ensure TimerManager::complete eventually succeeds.
+        let mut alert = RetryAlert::default();
         loop {
             match self
                 .manager
@@ -381,7 +383,13 @@ where
             {
                 Ok(()) => break,
                 Err(error) => {
-                    warn!("failed to commit timer: {error:#}; retrying");
+                    // A schema fault or a corrupt trigger does not clear by
+                    // retry, and this key runs no events until it clears.
+                    if alert.alerts(error.classify_error()) {
+                        error!("failed to commit timer: {error:#}; retrying");
+                    } else {
+                        warn!("failed to commit timer: {error:#}; retrying");
+                    }
                     sleep(RETRY_DURATION).await;
                 }
             }

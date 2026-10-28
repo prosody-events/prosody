@@ -42,6 +42,15 @@ pub trait ClassifyError {
     }
 }
 
+/// Raises one alert for each retry loop that cannot succeed.
+///
+/// A loop that retries every error logs a
+/// [`Transient`](ErrorCategory::Transient) failure at warn, because it heals by
+/// itself. The first failure of another category does not clear by retry, so
+/// the loop logs it at error. Later failures log at warn.
+#[derive(Debug, Default)]
+pub(crate) struct RetryAlert(bool);
+
 /// The wire discriminants, for formats that carry a category between processes.
 ///
 /// **Zero is reserved and no category claims it.** Protobuf decodes a missing
@@ -72,6 +81,15 @@ impl TryFrom<i32> for ErrorCategory {
             3 => Ok(Self::Terminal),
             other => Err(UnknownErrorCategory(other)),
         }
+    }
+}
+
+impl RetryAlert {
+    /// Returns `true` when a failure in `category` must log at error.
+    pub(crate) fn alerts(&mut self, category: ErrorCategory) -> bool {
+        let alerts = !self.0 && category != ErrorCategory::Transient;
+        self.0 |= alerts;
+        alerts
     }
 }
 

@@ -239,8 +239,8 @@ where
     Access(#[from] StateAccessError),
 
     /// The codec failed to encode or decode the cell.
-    #[error("state codec failed")]
-    Codec(#[source] E),
+    #[error("state codec failed: {0:#}")]
+    Codec(E),
 
     /// A caller's key did not encode, or a stored key coordinate did not
     /// decode back to a logical key.

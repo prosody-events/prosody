@@ -1,4 +1,5 @@
-use super::{ErrorCategory, UnknownErrorCategory};
+use super::{ErrorCategory, RetryAlert, UnknownErrorCategory};
+use strum::VariantArray;
 
 /// The numbers a peer of another release reads off the wire. A round trip
 /// cannot pin them — both conversions sit beside each other and move together —
@@ -30,5 +31,26 @@ fn each_category_keeps_its_wire_discriminant() {
             Err(UnknownErrorCategory(value)),
             "{value} names no category"
         );
+    }
+}
+
+/// A retry loop alerts at its first failure that is not `Transient`, and never
+/// again. Every three-failure sequence is checked.
+#[test]
+fn retry_alert_fires_once_at_the_first_failure_retry_cannot_clear() {
+    for &first in ErrorCategory::VARIANTS {
+        for &second in ErrorCategory::VARIANTS {
+            for &third in ErrorCategory::VARIANTS {
+                let sequence = [first, second, third];
+                let mut alert = RetryAlert::default();
+                let alerts = sequence.map(|category| alert.alerts(category));
+
+                let alerting = sequence
+                    .iter()
+                    .position(|&category| category != ErrorCategory::Transient);
+                let expected = [0, 1, 2].map(|index| Some(index) == alerting);
+                assert_eq!(alerts, expected, "{sequence:?}");
+            }
+        }
     }
 }

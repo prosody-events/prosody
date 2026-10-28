@@ -9,7 +9,7 @@ use tokio::spawn;
 use tokio::sync::watch;
 use tokio::task::coop::cooperative;
 use tokio::time::sleep;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use super::dispatch::{build_message_stream, process_event};
 use super::{PartitionConfiguration, PartitionContext, PartitionInfo, ShutdownPhase, metrics};
@@ -17,6 +17,7 @@ use crate::consumer::EventHandler;
 use crate::consumer::message::{ConsumerRecord, UncommittedEvent};
 use crate::consumer::middleware::deduplication::DedupIdentity;
 use crate::consumer::partition::keyed::KeyManager;
+use crate::error::{ClassifyError, RetryAlert};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MessageLoader;
 use crate::otel::SpanRelation;
@@ -48,6 +49,7 @@ async fn init_timer_manager<S>(
 where
     S: TriggerStore,
 {
+    let mut alert = RetryAlert::default();
     loop {
         if *ctx.shutdown_rx.borrow() >= ShutdownPhase::Draining {
             return None;
@@ -70,8 +72,16 @@ where
         .await
         {
             Ok(result) => return Some(result),
+            // A failure from a revoke is expected, so it does not alert.
+            Err(_) if *ctx.shutdown_rx.borrow() >= ShutdownPhase::Draining => return None,
             Err(error) => {
-                warn!("failed to initialize timer manager: {error:#}; retrying");
+                // A schema or segment fault does not clear by retry, and the
+                // partition processes no events until init succeeds.
+                if alert.alerts(error.classify_error()) {
+                    error!("failed to initialize timer manager: {error:#}; retrying");
+                } else {
+                    warn!("failed to initialize timer manager: {error:#}; retrying");
+                }
                 sleep(Duration::from_secs(1)).await;
             }
         }
@@ -96,6 +106,7 @@ where
     SP: PartitionStateProvider<S>,
     S: Clone,
 {
+    let mut alert = RetryAlert::default();
     loop {
         if *shutdown_rx.borrow() >= ShutdownPhase::Draining {
             return None;
@@ -106,8 +117,16 @@ where
             .await
         {
             Ok(manager) => return Some(manager),
+            // A failure from a revoke is expected, so it does not alert.
+            Err(_) if *shutdown_rx.borrow() >= ShutdownPhase::Draining => return None,
             Err(error) => {
-                warn!("failed to acquire keyed-state manager: {error:#}; retrying");
+                // A descriptor identity or routing fault does not clear by
+                // retry, and the partition processes no events until it clears.
+                if alert.alerts(error.classify_error()) {
+                    error!("failed to acquire keyed-state manager: {error:#}; retrying");
+                } else {
+                    warn!("failed to acquire keyed-state manager: {error:#}; retrying");
+                }
                 sleep(Duration::from_secs(1)).await;
             }
         }

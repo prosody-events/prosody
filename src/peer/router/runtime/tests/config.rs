@@ -10,16 +10,19 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::peer::router::PeerId;
 use crate::peer::router::cache_config::PeerCacheConfiguration;
 use crate::peer::router::directory::tests::support::{registration, test_directory};
-use crate::peer::router::directory::{PeerDirectory, RegistrationTtl};
-use crate::test_util::TEST_RUNTIME;
+use crate::peer::router::directory::{PeerDirectory, PeerRegistration, RegistrationTtl};
+use crate::test_util::{TEST_RUNTIME, capture_events};
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
+use std::future::{Future, ready};
+use std::io::Error as IoError;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::yield_now;
 use tokio::time::advance;
+use tracing::Level;
 use validator::Validate;
 
 /// The lease the refused runtimes below publish under. Neither reaches a write,
@@ -102,6 +105,80 @@ async fn heartbeat_checks_preserve_the_refresh_deadline() -> Result<()> {
         directory.read(registered.peer).await?.is_some(),
         "heartbeat checks postponed the registration refresh"
     );
+
+    stop.send_replace(true);
+    refresh.await?;
+    Ok(())
+}
+
+/// A directory whose every write fails, as during a long store outage.
+#[derive(Clone)]
+struct FailingDirectory(RegistrationTtl);
+
+impl PeerDirectory for FailingDirectory {
+    type Error = IoError;
+
+    fn ttl(&self) -> RegistrationTtl {
+        self.0
+    }
+
+    fn register(
+        &self,
+        _registration: &PeerRegistration,
+    ) -> impl Future<Output = Result<(), IoError>> {
+        ready(Err(IoError::other("store unavailable")))
+    }
+
+    fn read(
+        &self,
+        _peer: PeerId,
+    ) -> impl Future<Output = Result<Option<PeerRegistration>, IoError>> {
+        ready(Err(IoError::other("store unavailable")))
+    }
+
+    fn deregister(
+        &self,
+        _registration: &PeerRegistration,
+    ) -> impl Future<Output = Result<(), IoError>> {
+        ready(Err(IoError::other("store unavailable")))
+    }
+}
+
+/// A failed refresh inside the lease heals on a later refresh, so it does not
+/// alert. Once the lease lapses, other peers drop responses, so it alerts once.
+#[tokio::test(start_paused = true)]
+async fn refresh_failure_alerts_once_after_the_lease_lapses() -> Result<()> {
+    const LAPSED: &str = "peer registration lapsed";
+    let lease = Duration::from_mins(1);
+    let (errors, _guard) = capture_events(Level::ERROR);
+    let (stop, stopped) = watch::channel(false);
+    let refresh = tokio::spawn(refresh_registration(
+        FailingDirectory(RegistrationTtl::try_from(lease)?),
+        registration(PeerId::new()),
+        HeartbeatRegistry::test().register("directory refresh"),
+        RegistrationTtl::try_from(lease)?,
+        stopped,
+    ));
+
+    // Each step is shorter than the smallest refresh delay, so every refresh
+    // runs before the clock passes the next one.
+    let tick = lease / 10;
+    for _ in 0..9_u32 {
+        advance(tick).await;
+        yield_now().await;
+    }
+    assert_eq!(
+        errors.count(LAPSED),
+        0,
+        "a refresh inside the lease alerted"
+    );
+
+    // Several more refreshes fail after the lapse. They repeat no alert.
+    for _ in 0..12_u32 {
+        advance(tick).await;
+        yield_now().await;
+    }
+    assert_eq!(errors.count(LAPSED), 1, "a lapse must alert exactly once");
 
     stop.send_replace(true);
     refresh.await?;
