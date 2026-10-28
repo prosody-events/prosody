@@ -170,7 +170,8 @@ where
         QueueEffect::Remove => scheduler.unschedule(trigger.clone()).await?,
         QueueEffect::Deactivate => {
             scheduler
-                .deactivate(&trigger.key, trigger.time, trigger.timer_type)
+                .active_triggers()
+                .remove(&trigger.key, trigger.time, trigger.timer_type)
                 .await;
         }
     }

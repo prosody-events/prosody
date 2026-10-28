@@ -164,18 +164,12 @@ impl Arbitrary for Trace {
 }
 
 /// Asserts every reader of the registry agrees with the model: per-triple
-/// `get_state`/`get`/`contains`, the `scan_active_times`
-/// multiset, and the `snapshot` fold — the last recomputed independently, not
-/// by calling `snapshot` again.
+/// `get`, the `scan_active_times` multiset, and the `snapshot` fold — the last
+/// recomputed independently, not by calling `snapshot` again.
 async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
     for (key, time, ty) in seen {
         let entry = model.get(&(key.clone(), *time, *ty));
-        assert_eq!(
-            active.get_state(key, *time, *ty).await,
-            entry.map(|e| e.state)
-        );
         assert_eq!(active.get(key, *time, *ty).await, entry.copied());
-        assert_eq!(active.contains(key, *time, *ty).await, entry.is_some());
     }
 
     // scan is per-key: a (time, type) shared by two keys appears twice, so the
@@ -315,9 +309,8 @@ async fn run_trace(trace: Trace) {
 }
 
 /// The registry tracks a plain `HashMap` model op-for-op across
-/// Insert/Hold/Remove/SetState/Queue, and every reader (`get_state`, `get`,
-/// `contains`, `scan_active_times`, `snapshot`) agrees after
-/// every op.
+/// Insert/Hold/Remove/SetState/Queue, and every reader (`get`,
+/// `scan_active_times`, `snapshot`) agrees after every op.
 #[test]
 fn prop_active_triggers_track_model() {
     fn property(trace: Trace) {

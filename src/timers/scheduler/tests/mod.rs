@@ -447,8 +447,9 @@ impl Fixture {
         if !matches!(
             self.triggers
                 .active_triggers()
-                .get_state(&key, time, ty)
-                .await,
+                .get(&key, time, ty)
+                .await
+                .map(|entry| entry.state),
             Some(TimerState::Scheduled)
         ) {
             return Ok(());
@@ -473,8 +474,9 @@ impl Fixture {
         let needs_dequeue = match self
             .triggers
             .active_triggers()
-            .get_state(&key, time, ty)
+            .get(&key, time, ty)
             .await
+            .map(|entry| entry.state)
         {
             Some(TimerState::Scheduled) => true,
             Some(TimerState::Firing) => false,
@@ -545,11 +547,12 @@ impl Fixture {
                 self.state.highest_loaded_slab_id
             ));
         }
-        if !self
+        if self
             .triggers
             .active_triggers()
-            .contains(key, time, ty)
+            .get(key, time, ty)
             .await
+            .is_none()
         {
             return Err(format!(
                 "past-watermark schedule: trigger ({key}, {time:?}, {ty:?}) was not active"
@@ -956,7 +959,10 @@ fn prop_failed_load_reschedule() {
                 schedule(&mut state, &mut queue, replacement.clone(), queued).await?;
                 let active = queue.active_triggers();
                 ensure!(
-                    active.get_state(&replacement.key, time, timer_type).await
+                    active
+                        .get(&replacement.key, time, timer_type)
+                        .await
+                        .map(|entry| entry.state)
                         == Some(queued.into()),
                     "the reschedule left memory"
                 );

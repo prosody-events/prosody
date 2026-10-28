@@ -185,9 +185,9 @@ where
 
         stream
             .try_filter(|&time| {
-                let state = active_triggers.get_state(key, time, timer_type);
+                let entry = active_triggers.get(key, time, timer_type);
                 async move {
-                    match state.await {
+                    match entry.await.map(|entry| entry.state) {
                         Some(TimerState::Firing) => false,
                         Some(
                             TimerState::Scheduled
@@ -310,7 +310,7 @@ where
     /// Starts the pending trigger only if its queued attempt is still
     /// scheduled.
     pub(crate) async fn fire(&self, trigger: &Trigger) -> bool {
-        self.0.scheduler.fire(trigger).await
+        self.0.scheduler.active_triggers().fire(trigger).await
     }
 
     /// Marks a timer as completed.

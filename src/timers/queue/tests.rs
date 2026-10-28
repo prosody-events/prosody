@@ -47,17 +47,19 @@ async fn test_remove_clears_active_registry() -> Result<()> {
     assert!(
         triggers
             .active_triggers()
-            .contains(&key, time, TimerType::Application)
+            .get(&key, time, TimerType::Application)
             .await
+            .is_some()
     );
 
     // Case 1: remove while still queued.
     triggers.remove(&trigger).await;
     assert!(
-        !triggers
+        triggers
             .active_triggers()
-            .contains(&key, time, TimerType::Application)
+            .get(&key, time, TimerType::Application)
             .await
+            .is_none()
     );
 
     // Advance past the original expiration time; nothing fires.
@@ -79,27 +81,30 @@ async fn test_remove_clears_active_registry() -> Result<()> {
     assert!(
         triggers
             .active_triggers()
-            .contains(&key, time, TimerType::Application)
+            .get(&key, time, TimerType::Application)
             .await
+            .is_some()
     );
 
     // Case 2: remove after delivery — clears ActiveTriggers without
     // panicking on the already-absent queue key.
     triggers.remove(&trigger).await;
     assert!(
-        !triggers
+        triggers
             .active_triggers()
-            .contains(&key, time, TimerType::Application)
+            .get(&key, time, TimerType::Application)
             .await
+            .is_none()
     );
 
     // Idempotent: removing an already-removed trigger is a no-op.
     triggers.remove(&trigger).await;
     assert!(
-        !triggers
+        triggers
             .active_triggers()
-            .contains(&key, time, TimerType::Application)
+            .get(&key, time, TimerType::Application)
             .await
+            .is_none()
     );
 
     Ok(())

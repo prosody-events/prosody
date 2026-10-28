@@ -85,8 +85,9 @@ async fn run(steps: Vec<Step>) -> Result<()> {
             .0
             .scheduler
             .active_triggers()
-            .get_state(&key, time, timer_type)
-            .await;
+            .get(&key, time, timer_type)
+            .await
+            .map(|entry| entry.state);
         ensure!(state == model, "{step:?} left {state:?}, not {model:?}");
         let listed = manager.scheduled_times(&key, timer_type).await?;
         let stored = matches!(model, Some(Scheduled | FiringRescheduled | Aborted));

@@ -17,15 +17,13 @@
 //! Cassandra round-trips yield back to command processing and trigger
 //! emission between slabs.
 
-use crate::Key;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::timers::Trigger;
 use crate::timers::active::{ActiveTriggers, Queued, Row};
-use crate::timers::datetime::CompactDateTime;
 use crate::timers::queue::TriggerQueue;
 use crate::timers::store::{StoredSegment, TriggerStore};
-use crate::timers::{TimerType, Trigger};
 use std::error::Error as StdError;
 use thiserror::Error;
 use tokio::spawn;
@@ -198,18 +196,6 @@ where
     ) -> Result<(), TimerSchedulerError<E>> {
         self.send_command(CommandOperation::RemoveFromQueue, trigger)
             .await
-    }
-
-    /// Transitions a timer from `Scheduled` to `Firing` state.
-    ///
-    /// Returns `true` if the transition succeeded.
-    pub(crate) async fn fire(&self, trigger: &Trigger) -> bool {
-        self.active_triggers.fire(trigger).await
-    }
-
-    /// Deactivate a trigger without removing it from the persistent queue.
-    pub async fn deactivate(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
-        self.active_triggers.remove(key, time, timer_type).await;
     }
 
     /// Sends a command and waits for its reply. A closed channel means

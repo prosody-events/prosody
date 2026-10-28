@@ -302,22 +302,6 @@ impl ActiveTriggers {
         }
     }
 
-    /// Returns the state of a given trigger time and type for a key, or
-    /// `None` if the registry contains no such entry.
-    pub async fn get_state(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> Option<TimerState> {
-        self.0
-            .read_async(key, |_, states| {
-                states.get(&(time, timer_type)).map(|e| e.state)
-            })
-            .await
-            .flatten()
-    }
-
     /// Returns the queued attempt, or `None` if absent.
     pub(crate) async fn get(
         &self,
@@ -344,12 +328,6 @@ impl ActiveTriggers {
             return true;
         }
         false
-    }
-
-    /// Checks whether a given trigger time and type is active for a key.
-    #[cfg(test)]
-    pub async fn contains(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) -> bool {
-        self.get_state(key, time, timer_type).await.is_some()
     }
 
     /// Atomically sets the state of a timer (preserves tag). Returns `true`

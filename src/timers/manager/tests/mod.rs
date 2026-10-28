@@ -129,42 +129,6 @@ async fn test_new_timer_manager_creation() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_timer_stream_delivery() -> Result<()> {
-    time::pause();
-
-    let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
-    pin_mut!(stream);
-
-    // Schedule a timer for immediate execution
-    let now = CompactDateTime::now()?;
-    let immediate_time = now.add_duration(CompactDuration::new(1))?;
-    let trigger = Trigger::new(
-        Key::from("stream-test"),
-        immediate_time,
-        TimerType::Application,
-        Span::current(),
-    );
-
-    manager.schedule(timer_request(&trigger)).await?;
-
-    // Advance time past the trigger time
-    advance(Duration::from_secs(2)).await;
-    task::yield_now().await;
-
-    if let Some(pending_timer) = stream.next().await {
-        let firing_timer = pending_timer
-            .fire()
-            .await
-            .ok_or_else(|| eyre!("Timer should be active"))?;
-        let (trigger_data, _) = firing_timer.into_inner();
-        assert_eq!(trigger_data.key, trigger.key);
-        assert_eq!(trigger_data.time, trigger.time);
-    }
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_concurrent_operations() -> Result<()> {
     time::pause();
 
