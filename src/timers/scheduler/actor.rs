@@ -10,6 +10,7 @@
 use super::{Command, CommandOperation};
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::Heartbeat;
+use crate::timers::active::TimerState;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::queue::TriggerQueue;
@@ -203,8 +204,12 @@ pub(super) async fn process_command<T>(
 {
     let result: Result<(), T::Error> = match operation {
         CommandOperation::Hold => handle_hold(state, triggers, trigger).await,
-        CommandOperation::Add => {
-            handle_add(state, triggers, trigger).await;
+        CommandOperation::Release => {
+            release(triggers, &trigger).await;
+            Ok(())
+        }
+        CommandOperation::Add(queued) => {
+            handle_add(state, triggers, trigger, queued).await;
             Ok(())
         }
         CommandOperation::Remove => {
@@ -290,32 +295,51 @@ where
 
 /// Handler for [`CommandOperation::Add`].
 ///
-/// Queues the written trigger if the actor owns its slab, so the slab's active
-/// set never drifts below its DB content (P1). For a pending slab, the actor
-/// drops the hold and `load_step` reads the row later. This keeps the
-/// in-memory queue bounded to the preload window.
+/// Queues the trigger in the `queued` state if the actor keeps the
+/// coordinate in memory: it owns the slab, or a partial drain or a delivery
+/// holds the coordinate. The slab's active set then never drifts below its DB
+/// content (P1). Otherwise the actor releases the hold, and `load_step` reads
+/// the row later. This keeps the in-memory queue bounded to the preload window.
 pub(super) async fn handle_add<T>(
     state: &ActorState<T>,
     triggers: &mut TriggerQueue,
     trigger: Trigger,
+    queued: TimerState,
 ) {
+    let entry = triggers
+        .active_triggers()
+        .get(&trigger.key, trigger.time, trigger.timer_type)
+        .await;
     let slab_id = Slab::from_time(state.segment.slab_size, trigger.time).id();
-    if !owns_slab(state, slab_id) {
+    if !owns_slab(state, slab_id) && entry.is_none_or(|entry| entry.holds(&trigger)) {
         triggers.remove(&trigger).await;
         return;
     }
 
     // The key row supplies the tag, even when a partial drain has not advanced
     // ownership.
-    let tag = triggers
-        .active_triggers()
-        .get(&trigger.key, trigger.time, trigger.timer_type)
-        .await
-        .map(|entry| entry.tag);
-    if tag.is_some_and(|tag| tag != trigger.tag) {
+    if entry.is_some_and(|entry| entry.tag != trigger.tag) {
         triggers.remove(&trigger).await;
     }
+    let (key, time, timer_type) = (trigger.key.clone(), trigger.time, trigger.timer_type);
     triggers.insert(trigger).await;
+    triggers
+        .active_triggers()
+        .set_state(&key, time, timer_type, queued)
+        .await;
+}
+
+/// Handler for [`CommandOperation::Release`]: removes the trigger's own hold.
+pub(super) async fn release(triggers: &TriggerQueue, trigger: &Trigger) {
+    let active = triggers.active_triggers();
+    let (key, time, timer_type) = (&trigger.key, trigger.time, trigger.timer_type);
+    if active
+        .get(key, time, timer_type)
+        .await
+        .is_some_and(|entry| entry.holds(trigger))
+    {
+        active.remove(key, time, timer_type).await;
+    }
 }
 
 /// Deletes completed persisted slabs below the current slab and then advances

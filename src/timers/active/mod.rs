@@ -17,16 +17,18 @@
 //! |----------------------|---------------------|--------------|------------|
 //! | `UNSCHEDULED`        | absent              | -            | -          |
 //! | `SCHEDULED`          | `Scheduled`         | ✓            | ✓          |
+//! | `UNCONFIRMED`        | `Unconfirmed`       | ✓            | maybe      |
 //! | `FIRING`             | `Firing`            | -            | ✓          |
 //! | `FIRING_RESCHEDULED` | `FiringRescheduled` | ✓            | ✓          |
 //! | `ABORTED`            | `Aborted`           | -            | maybe      |
 //!
 //! # Durable Row Invariant
 //!
-//! Every durable row is in a registered slab, and every durable row in an
-//! owned slab has a registry entry. Cleanup keeps such a slab, so a restart
-//! loads the row as `Scheduled`. A schedule holds its timer as `Aborted`
-//! before the row write, so a dropped or failed schedule keeps the invariant.
+//! A written row is in a registered slab. In an owned slab, it also has a
+//! registry entry, so cleanup keeps the slab and a restart loads the row.
+//! [`MemoryEffect::Insert`] keeps this invariant when a schedule is dropped
+//! or its write fails. Removals run before the row delete, so a dropped
+//! removal can leave a cancelled row that never loads.
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
@@ -43,6 +45,13 @@ pub(crate) struct ActiveTriggerEntry {
     /// Random 32-bit identity; `0` for legacy/inline timers without a stored
     /// tag.
     pub(crate) tag: i32,
+}
+
+impl ActiveTriggerEntry {
+    /// Whether this entry is the hold of `trigger`'s schedule.
+    pub(crate) fn holds(self, trigger: &Trigger) -> bool {
+        self.state == TimerState::Aborted && self.tag == trigger.tag
+    }
 }
 
 /// Point-in-time counts of active timers for metrics reporting.
@@ -80,10 +89,14 @@ pub enum TimerState {
     /// re-scheduled during dispatch and will fire again after commit.
     FiringRescheduled,
 
-    /// The timer is not in the `DelayQueue`, and its row may be durable: an
-    /// aborted delivery keeps its row, and a schedule holds its timer here
-    /// until the row is written.
+    /// Delivery was aborted. The row stays for recovery, but the timer is not
+    /// in the `DelayQueue`. A schedule also holds its timer in this state
+    /// while it writes the row.
     Aborted,
+
+    /// The timer is in the `DelayQueue`, but its row write did not confirm.
+    /// It fires once, and the next schedule writes the row again.
+    Unconfirmed,
 }
 
 /// A lifecycle operation submitted to the timer state machine.
@@ -113,23 +126,16 @@ pub(crate) enum TimerOp {
     ClearReplaced,
 }
 
-/// The scheduler effect of a [`Transition`].
+/// The scheduler effect of a [`MemoryEffect::Update`].
 ///
-/// `Dequeue` changes only the `DelayQueue`. `Hold`, `Insert` and `Remove`
-/// also create or delete the [`ActiveTriggers`] entry. Only these commands and
-/// `Deactivate` create or delete registry entries.
-#[derive(Clone, Copy, Debug, Default)]
+/// `Dequeue` changes only the `DelayQueue`. `Remove` and `Deactivate` also
+/// delete the [`ActiveTriggers`] entry.
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum QueueEffect {
     /// No queue change.
-    #[default]
     None,
     /// Queue-only removal; the registry entry stays.
     Dequeue,
-    /// Scheduler `Hold`: persist slab metadata and hold the registry entry.
-    /// Only [`Transition::phases`] produces it, before an `Insert`.
-    Hold,
-    /// Scheduler `Add`: queue and registry insert in an owned slab.
-    Insert,
     /// Full scheduler `Remove`: queue removal plus registry removal.
     Remove,
     /// Registry-only removal; the queue entry was already popped by firing.
@@ -156,38 +162,30 @@ pub(crate) enum Announce {
     Cancelled,
 }
 
-/// The in-memory effects on one side of a [`Transition`]'s durable write.
-///
-/// Apply the queue effect before the state change.
+/// The in-memory effect of a [`Transition`].
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct MemoryEffects {
-    /// New registry state for the timer; `None` leaves the entry untouched.
-    pub(crate) next_state: Option<TimerState>,
-    /// Scheduler effect to run before the state change.
-    pub(crate) queue: QueueEffect,
-}
-
-impl MemoryEffects {
-    /// No in-memory effects.
-    const NONE: Self = Self {
-        next_state: None,
-        queue: QueueEffect::None,
-    };
+pub(crate) enum MemoryEffect {
+    /// Runs before the durable write: the queue effect, then the new state.
+    Update {
+        /// New registry state; `None` leaves the entry untouched.
+        next_state: Option<TimerState>,
+        /// Scheduler effect to run before the state change.
+        queue: QueueEffect,
+    },
+    /// Queues the timer in this state around the durable write, through
+    /// `TriggerScheduler::insert`.
+    Insert(TimerState),
 }
 
 /// One resolved step of the timer state machine.
 ///
 /// Only [`transition`] constructs values of this type, so the table's
 /// exhaustive `(op, prior state)` match is the only place a transition can
-/// be defined — an illegal transition is unwritable outside it. Consumers
-/// read the in-memory effects through [`phases`](Self::phases), which
-/// splits them around the durable write.
+/// be defined — an illegal transition is unwritable outside it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Transition {
-    /// New registry state for the timer; `None` leaves the entry untouched.
-    next_state: Option<TimerState>,
-    /// Scheduler queue effect.
-    queue: QueueEffect,
+    /// In-memory effect.
+    memory: MemoryEffect,
     /// Durable-store effect.
     store: StoreEffect,
     /// Telemetry event emitted once the transition is fully applied.
@@ -195,6 +193,11 @@ pub(crate) struct Transition {
 }
 
 impl Transition {
+    /// The in-memory effect.
+    pub(crate) fn memory(self) -> MemoryEffect {
+        self.memory
+    }
+
     /// The durable-store effect, if any.
     pub(crate) fn store(self) -> StoreEffect {
         self.store
@@ -203,24 +206,6 @@ impl Transition {
     /// The telemetry event to emit once the transition has been applied.
     pub(crate) fn announce(self) -> Option<Announce> {
         self.announce
-    }
-
-    /// Splits the in-memory effects into their (pre-persist, post-persist)
-    /// halves. An insert holds the timer before the write and queues it
-    /// after. All other effects run before the write.
-    pub(crate) fn phases(self) -> (MemoryEffects, MemoryEffects) {
-        let all = MemoryEffects {
-            next_state: self.next_state,
-            queue: self.queue,
-        };
-        if !matches!(self.queue, QueueEffect::Insert) {
-            return (all, MemoryEffects::NONE);
-        }
-        let hold = MemoryEffects {
-            queue: QueueEffect::Hold,
-            ..MemoryEffects::NONE
-        };
-        (hold, all)
     }
 }
 
@@ -243,12 +228,14 @@ impl ActiveTriggers {
         self.insert_as(trigger, TimerState::Scheduled).await;
     }
 
-    /// Holds a trigger as [`TimerState::Aborted`] while its row is written,
-    /// with the replacement rule of [`insert`](Self::insert).
+    /// Holds a trigger as [`TimerState::Aborted`] while its row is written.
+    /// The hold never replaces an entry.
     pub(crate) async fn hold(&self, trigger: Trigger) {
         self.insert_as(trigger, TimerState::Aborted).await;
     }
 
+    /// Inserts an entry in `state`. Only a live state replaces an `Aborted`
+    /// entry.
     async fn insert_as(&self, trigger: Trigger, state: TimerState) {
         let entry = ActiveTriggerEntry {
             state,
@@ -261,7 +248,7 @@ impl ActiveTriggers {
             .get_mut()
             .entry((trigger.time, trigger.timer_type))
             .and_modify(|current| {
-                if current.state == TimerState::Aborted {
+                if current.state == TimerState::Aborted && state != TimerState::Aborted {
                     *current = entry;
                 }
             })
@@ -320,7 +307,7 @@ impl ActiveTriggers {
             && let Some(entry) = occupied
                 .get_mut()
                 .get_mut(&(trigger.time, trigger.timer_type))
-            && entry.state == TimerState::Scheduled
+            && matches!(entry.state, TimerState::Scheduled | TimerState::Unconfirmed)
             && entry.tag == trigger.tag
         {
             entry.state = TimerState::Firing;
@@ -346,7 +333,10 @@ impl ActiveTriggers {
         self.get_state(key, time, timer_type)
             .await
             .is_some_and(|state| {
-                matches!(state, TimerState::Scheduled | TimerState::FiringRescheduled)
+                matches!(
+                    state,
+                    TimerState::Scheduled | TimerState::Unconfirmed | TimerState::FiringRescheduled
+                )
             })
     }
 
@@ -431,90 +421,89 @@ impl ActiveTriggers {
 /// scheduled, already removed, or its slab not yet loaded (absent timers
 /// still accept `Schedule`/`Unschedule` so durable rows stay authoritative).
 pub(crate) fn transition(prior: Option<TimerState>, op: TimerOp) -> Transition {
-    use TimerState::{Aborted, Firing, FiringRescheduled, Scheduled};
+    use TimerState::{Aborted, Firing, FiringRescheduled, Scheduled, Unconfirmed};
 
     /// A row with every effect at its no-op value.
     const NOOP: Transition = Transition {
-        next_state: None,
-        queue: QueueEffect::None,
+        memory: update(None, QueueEffect::None),
         store: StoreEffect::None,
         announce: None,
     };
 
+    const fn update(next_state: Option<TimerState>, queue: QueueEffect) -> MemoryEffect {
+        MemoryEffect::Update { next_state, queue }
+    }
+
     match (op, prior) {
         // Each new queued attempt has one tag, held before its row is written.
         (TimerOp::Schedule, Some(Firing)) => Transition {
-            next_state: Some(FiringRescheduled),
-            queue: QueueEffect::Insert,
+            memory: MemoryEffect::Insert(FiringRescheduled),
             store: StoreEffect::Insert,
             ..NOOP
         },
         (TimerOp::ClearSchedule, Some(Firing)) => Transition {
-            next_state: Some(FiringRescheduled),
-            queue: QueueEffect::Insert,
+            memory: MemoryEffect::Insert(FiringRescheduled),
             ..NOOP
         },
-        (TimerOp::Schedule, Some(Aborted) | None) => Transition {
-            queue: QueueEffect::Insert,
+        (TimerOp::Schedule, Some(Aborted | Unconfirmed) | None) => Transition {
+            memory: MemoryEffect::Insert(Scheduled),
             store: StoreEffect::Insert,
             announce: Some(Announce::Scheduled),
-            ..NOOP
         },
 
         // Cancel a reschedule: back to `Firing`, drop the queued re-fire.
         // The in-flight delivery completes normally without firing again.
         (TimerOp::Unschedule | TimerOp::ClearReplaced, Some(FiringRescheduled)) => Transition {
-            next_state: Some(Firing),
-            queue: QueueEffect::Dequeue,
+            memory: update(Some(Firing), QueueEffect::Dequeue),
             ..NOOP
         },
 
         // Plain cancel: remove from memory first, then delete the row.
-        (TimerOp::Unschedule, Some(Scheduled | Aborted) | None) => Transition {
-            queue: QueueEffect::Remove,
+        (TimerOp::Unschedule, Some(Scheduled | Unconfirmed | Aborted) | None) => Transition {
+            memory: update(None, QueueEffect::Remove),
             store: StoreEffect::Delete,
             announce: Some(Announce::Cancelled),
-            ..NOOP
         },
 
         // A timer replaced by `clear_and_schedule`: as `Unschedule`, minus
         // the row delete and telemetry the caller owns.
-        (TimerOp::ClearReplaced, Some(Scheduled | Aborted) | None) => Transition {
-            queue: QueueEffect::Remove,
+        (TimerOp::ClearReplaced, Some(Scheduled | Unconfirmed | Aborted) | None) => Transition {
+            memory: update(None, QueueEffect::Remove),
             ..NOOP
         },
 
         // The replacement already has durable rows and a queue entry.
         (TimerOp::Complete | TimerOp::Abort, Some(FiringRescheduled)) => Transition {
-            next_state: Some(Scheduled),
+            memory: update(Some(Scheduled), QueueEffect::None),
             ..NOOP
         },
 
         // Commit anything else: drop the registry entry (firing already
         // popped the queue entry), then delete the row.
-        (TimerOp::Complete, Some(Firing | Scheduled | Aborted) | None) => Transition {
-            queue: QueueEffect::Deactivate,
-            store: StoreEffect::Delete,
-            ..NOOP
-        },
+        (TimerOp::Complete, Some(Firing | Scheduled | Unconfirmed | Aborted) | None) => {
+            Transition {
+                memory: update(None, QueueEffect::Deactivate),
+                store: StoreEffect::Delete,
+                ..NOOP
+            }
+        }
 
         // Abort a queued timer: keep the row for recovery, drop the queue
         // entry.
-        (TimerOp::Abort, Some(Scheduled)) => Transition {
-            next_state: Some(Aborted),
-            queue: QueueEffect::Dequeue,
+        (TimerOp::Abort, Some(Scheduled | Unconfirmed)) => Transition {
+            memory: update(Some(Aborted), QueueEffect::Dequeue),
             ..NOOP
         },
 
         // Abort a firing timer: keep the row; firing already dequeued it.
         (TimerOp::Abort, Some(Firing)) => Transition {
-            next_state: Some(Aborted),
+            memory: update(Some(Aborted), QueueEffect::None),
             ..NOOP
         },
 
-        // The caller holds the replacement before its atomic write.
-        (TimerOp::ClearSchedule, Some(Aborted) | None) => Transition {
-            queue: QueueEffect::Insert,
+        // The caller owns the atomic write of the replacement.
+        (TimerOp::ClearSchedule, Some(Aborted | Unconfirmed) | None) => Transition {
+            memory: MemoryEffect::Insert(Scheduled),
             ..NOOP
         },
 

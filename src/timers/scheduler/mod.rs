@@ -21,15 +21,15 @@ use crate::Key;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::heartbeat::HeartbeatRegistry;
-use crate::timers::active::ActiveTriggers;
+use crate::timers::active::{ActiveTriggers, TimerState};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::queue::TriggerQueue;
 use crate::timers::store::{StoredSegment, TriggerStore};
 use crate::timers::{TimerType, Trigger};
-use futures::TryFutureExt;
 use std::error::Error as StdError;
 use thiserror::Error;
 use tokio::spawn;
+use tokio::sync::mpsc::Permit;
 use tokio::sync::{mpsc, oneshot, watch};
 
 mod actor;
@@ -76,8 +76,10 @@ pub(super) struct Command<E> {
 pub(super) enum CommandOperation {
     /// Persist slab metadata and hold the trigger in `ActiveTriggers`.
     Hold,
-    /// Add a written trigger to `TriggerQueue`/`ActiveTriggers`.
-    Add,
+    /// Release the trigger's hold; its row write never started.
+    Release,
+    /// Queue a trigger whose row write ended, in the given state.
+    Add(TimerState),
     /// Remove a trigger from both `DelayQueue` and `ActiveTriggers`.
     Remove,
     /// Remove the coordinate only if no replacement tag stands.
@@ -137,19 +139,41 @@ where
         &self.active_triggers
     }
 
-    /// Prepares a [`Trigger`] for its row write: the actor persists slab
-    /// metadata and holds the trigger as `Aborted`. Call this before the row
-    /// write and [`schedule`](Self::schedule) after it.
-    pub(crate) async fn hold(&self, trigger: Trigger) -> Result<(), TimerSchedulerError<E>> {
-        self.send_command(CommandOperation::Hold, trigger).await
-    }
-
-    /// Schedules a held [`Trigger`] whose row is written.
+    /// Runs `write`, which stores the row of `trigger`, and then queues the
+    /// trigger in the `queued` state.
     ///
-    /// The actor queues the trigger if it owns the slab. Otherwise it drops
-    /// the hold, and the load loop reads the row later.
-    pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerSchedulerError<E>> {
-        self.send_command(CommandOperation::Add, trigger).await
+    /// Before the write, the actor registers the slab and holds the trigger.
+    /// After it, the actor queues the trigger if it owns the slab. Otherwise
+    /// it drops the hold, and the load loop reads the row later. Commands for
+    /// a dropped or failed call are sent on drop through a reserved permit.
+    pub(crate) async fn insert<X>(
+        &self,
+        trigger: Trigger,
+        queued: TimerState,
+        write: impl Future<Output = Result<(), X>>,
+    ) -> Result<(), X>
+    where
+        X: From<TimerSchedulerError<E>>,
+    {
+        let mut permits = self
+            .command_tx
+            .reserve_many(2)
+            .await
+            .map_err(|_| TimerSchedulerError::Shutdown)?;
+        let mut settle = Settle {
+            permit: permits.next(),
+            trigger: trigger.clone(),
+            on_drop: CommandOperation::Release,
+        };
+        let hold = permits
+            .next()
+            .map(|permit| command(permit, CommandOperation::Hold, trigger));
+        reply(hold).await?;
+
+        // The row may exist once the write starts.
+        settle.on_drop = CommandOperation::Add(TimerState::Unconfirmed);
+        write.await?;
+        Ok(reply(settle.send(CommandOperation::Add(queued))).await?)
     }
 
     /// Unschedule a previously scheduled [`Trigger`].
@@ -193,20 +217,62 @@ where
         operation: CommandOperation,
         trigger: Trigger,
     ) -> Result<(), TimerSchedulerError<E>> {
-        let (result_tx, result_rx) = oneshot::channel();
-        self.command_tx
-            .send(Command {
-                operation,
-                trigger,
-                result_tx,
-            })
-            .map_err(|_| TimerSchedulerError::Shutdown)
-            .await?;
-        result_rx
+        let permit = self
+            .command_tx
+            .reserve()
             .await
-            .map_err(|_| TimerSchedulerError::Shutdown)?
-            .map_err(TimerSchedulerError::Store)
+            .map_err(|_| TimerSchedulerError::Shutdown)?;
+        reply(Some(command(permit, operation, trigger))).await
     }
+}
+
+/// Sends the final command of an insert. Dropping it sends `on_drop`.
+struct Settle<'a, E> {
+    permit: Option<Permit<'a, Command<E>>>,
+    trigger: Trigger,
+    on_drop: CommandOperation,
+}
+
+impl<E> Settle<'_, E> {
+    fn send(&mut self, operation: CommandOperation) -> Option<oneshot::Receiver<Result<(), E>>> {
+        let permit = self.permit.take()?;
+        Some(command(permit, operation, self.trigger.clone()))
+    }
+}
+
+impl<E> Drop for Settle<'_, E> {
+    fn drop(&mut self) {
+        self.send(self.on_drop);
+    }
+}
+
+/// Sends a command through a reserved permit and returns its reply channel.
+fn command<E>(
+    permit: Permit<'_, Command<E>>,
+    operation: CommandOperation,
+    trigger: Trigger,
+) -> oneshot::Receiver<Result<(), E>> {
+    let (result_tx, result_rx) = oneshot::channel();
+    permit.send(Command {
+        operation,
+        trigger,
+        result_tx,
+    });
+    result_rx
+}
+
+/// Awaits a command reply. A missing permit or reply means shutdown.
+async fn reply<E>(
+    result_rx: Option<oneshot::Receiver<Result<(), E>>>,
+) -> Result<(), TimerSchedulerError<E>>
+where
+    E: ClassifyError + StdError + Send + Sync + 'static,
+{
+    result_rx
+        .ok_or(TimerSchedulerError::Shutdown)?
+        .await
+        .map_err(|_| TimerSchedulerError::Shutdown)?
+        .map_err(TimerSchedulerError::Store)
 }
 
 /// Errors returned by [`TriggerScheduler`] methods.

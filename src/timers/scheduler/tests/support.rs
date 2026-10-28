@@ -63,7 +63,8 @@ where
     }
     let mut queue = TriggerQueue::new();
     let active = queue.active_triggers().clone();
-    let (command_tx, mut commands) = mpsc::channel(1);
+    // An insert reserves two command slots.
+    let (command_tx, mut commands) = mpsc::channel(2);
     let manager = TimerManager::with_test_scheduler(
         store.clone(),
         TriggerScheduler {
@@ -111,11 +112,11 @@ where
                 .get_slab_triggers_all_types(slab.id())
                 .try_collect()
                 .await?;
-            let expected =
-                matches!(command.operation, CommandOperation::Add).then_some(command.trigger.tag);
+            let expected = matches!(command.operation, CommandOperation::Add(_))
+                .then_some(command.trigger.tag);
             repaired &= matches!(
                 command.operation,
-                CommandOperation::Add | CommandOperation::RetireCommitted
+                CommandOperation::Add(_) | CommandOperation::RetireCommitted
             ) && rows.iter().map(|t| t.tag).collect::<Vec<_>>()
                 == expected.into_iter().collect::<Vec<_>>()
                 && expected.is_none_or(|tag| held.take() == Some(tag));

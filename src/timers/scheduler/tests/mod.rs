@@ -4,11 +4,10 @@
 //! and asserts the four load-bearing invariants after every op:
 //!
 //!   P1 (owned↔DB parity): every `(key, time, type)` in the loaded numeric
-//!       range is in `ActiveTriggers` iff it's currently in the DB, except the
-//!       hold of a schedule that stopped before its row write.
+//!       range is in `ActiveTriggers` iff it's currently in the DB, except an
+//!       unconfirmed timer whose write failed.
 //!   P2 (pending = store-only): triggers for slabs outside the owned range
-//!       never land in `ActiveTriggers`, except the hold of an interrupted
-//!       schedule.
+//!       never land in `ActiveTriggers`.
 //!   P3 (watermark I1): every slab clustering row sits strictly above
 //!       `last_persisted_watermark`.
 //!   P4 (cleanup safety): cleanup never deletes
@@ -23,8 +22,8 @@
 //!   P7 (past-watermark schedule): scheduling an unregistered slab at or below
 //!       the watermark lowers the watermark, preserves compact ownership, and
 //!       activates the trigger.
-//!   P8 (registered rows): every stored trigger sits in a registered slab,
-//!       even when its schedule stops before or after the row write.
+//!   P8 (settled schedules): every stored trigger sits in a registered slab,
+//!       and a schedule that stops early leaves no hold behind.
 
 mod seed;
 pub(crate) mod support;
@@ -32,7 +31,7 @@ pub(crate) mod support;
 use super::actor::{
     ActorState, MIN_PRELOAD, calculate_preload, calculate_wait_time, cleanup_step,
     collect_active_slab_ids, drain_slab_range, handle_add, handle_hold, load_step,
-    next_unloaded_slab_id, owns_slab,
+    next_unloaded_slab_id, owns_slab, release,
 };
 use crate::Key;
 use crate::state::TimerEventRef;
@@ -47,7 +46,7 @@ use crate::timers::store::{Segment, StoredSegment, TriggerStore};
 use crate::timers::test_support::test_segment;
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
-use color_eyre::eyre::{Result, ensure, eyre};
+use color_eyre::eyre::{OptionExt, Result, ensure, eyre};
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::collections::BTreeSet;
@@ -86,10 +85,11 @@ async fn schedule(
     state: &mut ActorState<TestStore>,
     queue: &mut TriggerQueue,
     trigger: Trigger,
+    queued: TimerState,
 ) -> Result<()> {
     handle_hold(state, queue, trigger.clone()).await?;
     state.store.add_trigger(trigger.clone()).await?;
-    handle_add(state, queue, trigger).await;
+    handle_add(state, queue, trigger, queued).await;
     Ok(())
 }
 
@@ -186,20 +186,23 @@ enum Op {
     },
 }
 
-/// Where a schedule stops. A dropped or failed manager call stops after its
-/// hold or after its row write.
+/// How a schedule ends. A manager call dropped before its row write releases
+/// its hold. One dropped during the write, or whose write fails, queues an
+/// unconfirmed timer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stop {
     Never,
     BeforeWrite,
-    BeforeAdd,
+    AfterWrite,
+    FailedWrite,
 }
 
 impl Arbitrary for Stop {
     fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 4 {
+        match u8::arbitrary(g) % 6 {
             0 => Self::BeforeWrite,
-            1 => Self::BeforeAdd,
+            1 => Self::AfterWrite,
+            2 => Self::FailedWrite,
             _ => Self::Never,
         }
     }
@@ -279,6 +282,7 @@ impl Arbitrary for OpSequence {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModelActiveState {
     Scheduled,
+    Unconfirmed,
     Firing,
     Aborted,
 }
@@ -287,6 +291,7 @@ impl ModelActiveState {
     fn from_timer_state(state: TimerState) -> StdResult<Self, String> {
         match state {
             TimerState::Scheduled => Ok(Self::Scheduled),
+            TimerState::Unconfirmed => Ok(Self::Unconfirmed),
             TimerState::Firing => Ok(Self::Firing),
             TimerState::Aborted => Ok(Self::Aborted),
             TimerState::FiringRescheduled => {
@@ -357,14 +362,8 @@ impl Fixture {
             Op::Fire(spec) => self.apply_fire(spec).await,
             Op::Abort(spec) => self.apply_abort(spec).await,
             Op::LoadStep => {
-                let unowned: BTreeSet<SlabId> = self
-                    .universe
-                    .iter()
-                    .map(|(_, time, _)| Slab::from_time(self.segment.slab_size, *time).id())
-                    .filter(|&slab_id| !owns_slab(&self.state, slab_id))
-                    .collect();
                 load_step(&mut self.state, &mut self.triggers).await;
-                self.reconcile_loaded_models(&unowned);
+                self.reconcile_loaded_models();
                 Ok(())
             }
             Op::CleanupStep => self.check_cleanup_effects().await,
@@ -393,22 +392,25 @@ impl Fixture {
             self.assert_past_watermark_pull(&key, time, ty, slab_id, old_watermark)
                 .await?;
         }
-        if matches!(model.active_state, None | Some(ModelActiveState::Aborted)) {
-            model.active_state = Some(ModelActiveState::Aborted);
+        if stop == Stop::BeforeWrite {
+            release(&self.triggers, &trigger).await;
+            return Ok(());
         }
 
-        if stop != Stop::BeforeWrite {
+        if stop != Stop::FailedWrite {
             self.store
                 .add_trigger(trigger.clone())
                 .await
                 .map_err(|e| format!("add_trigger: {e:?}"))?;
             model.in_store = true;
         }
-        if stop == Stop::Never {
-            handle_add(&self.state, &mut self.triggers, trigger).await;
-            model.active_state =
-                owns_slab(&self.state, slab_id).then_some(ModelActiveState::Scheduled);
-        }
+        let (queued, model_state) = match stop {
+            Stop::Never => (TimerState::Scheduled, ModelActiveState::Scheduled),
+            _ => (TimerState::Unconfirmed, ModelActiveState::Unconfirmed),
+        };
+        let in_memory = owns_slab(&self.state, slab_id) || model.active_state.is_some();
+        handle_add(&self.state, &mut self.triggers, trigger, queued).await;
+        model.active_state = in_memory.then_some(model_state);
 
         self.set_model(key, time, ty, model);
         Ok(())
@@ -441,7 +443,7 @@ impl Fixture {
                 .active_triggers()
                 .get_state(&key, time, ty)
                 .await,
-            Some(TimerState::Scheduled)
+            Some(TimerState::Scheduled | TimerState::Unconfirmed)
         ) {
             return Ok(());
         }
@@ -460,15 +462,15 @@ impl Fixture {
 
     async fn apply_abort(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
         let (key, time, ty) = spec.resolve(self.now_slab);
-        // Only `Scheduled` and `Firing` are abortable; `Scheduled` also has
-        // a `DelayQueue` entry that needs explicit removal.
+        // Only queued and firing timers are abortable; a queued timer also
+        // has a `DelayQueue` entry that needs explicit removal.
         let needs_dequeue = match self
             .triggers
             .active_triggers()
             .get_state(&key, time, ty)
             .await
         {
-            Some(TimerState::Scheduled) => true,
+            Some(TimerState::Scheduled | TimerState::Unconfirmed) => true,
             Some(TimerState::Firing) => false,
             Some(TimerState::Aborted | TimerState::FiringRescheduled) | None => return Ok(()),
         };
@@ -574,17 +576,16 @@ impl Fixture {
         }
     }
 
-    /// A load queues every stored trigger of a slab it newly owns. The
-    /// loaded trigger replaces the hold of an interrupted schedule.
-    fn reconcile_loaded_models(&mut self, unowned: &BTreeSet<SlabId>) {
+    fn reconcile_loaded_models(&mut self) {
         for (key, time, ty) in &self.universe {
             let slab_id = Slab::from_time(self.segment.slab_size, *time).id();
-            if !unowned.contains(&slab_id) || !owns_slab(&self.state, slab_id) {
+            if !owns_slab(&self.state, slab_id) {
                 continue;
             }
             let triple = (key.clone(), *time, *ty);
             if let Some(model) = self.expected.get_mut(&triple)
                 && model.in_store
+                && model.active_state.is_none()
             {
                 model.active_state = Some(ModelActiveState::Scheduled);
             }
@@ -842,6 +843,8 @@ async fn run_property(ops: Vec<Op>) -> StdResult<(), String> {
         Op::LoadStep,
         Op::Fire(same),
         Op::Schedule(same, Stop::Never),
+        Op::Abort(same),
+        Op::Schedule(same, Stop::BeforeWrite),
     ];
     let history: Vec<_> = prefix.into_iter().chain(ops).collect();
     for (i, op) in history.iter().cloned().enumerate() {
@@ -902,10 +905,10 @@ fn prop_retirement_idempotence() {
 }
 
 /// A partial load cannot preserve an old tag after the durable schedule
-/// changes.
+/// changes, and a reschedule during delivery stays in memory.
 #[test]
 fn prop_failed_load_reschedule() {
-    fn property(tag: i16, kind: u8, delivered: bool) -> Result<()> {
+    fn property(tag: i16, kind: u8, delivered: bool, firing: bool) -> Result<()> {
         RuntimeBuilder::new_current_thread()
             .enable_time()
             .start_paused(true)
@@ -928,7 +931,7 @@ fn prop_failed_load_reschedule() {
                 );
                 let mut state = fresh_state(store.clone(), segment);
                 let mut queue = TriggerQueue::new();
-                schedule(&mut state, &mut queue, old.clone()).await?;
+                schedule(&mut state, &mut queue, old.clone(), TimerState::Scheduled).await?;
 
                 // Seed the successful drain before a later slab read fails.
                 // The failed tick does not advance ownership.
@@ -940,12 +943,26 @@ fn prop_failed_load_reschedule() {
                 )
                 .await?;
                 ensure!(!owns_slab(&state, slab.id()));
+                let mut queued = TimerState::Scheduled;
                 if delivered {
-                    ensure!(queue.next().await.is_some());
+                    let delivery = queue.next().await.ok_or_eyre("old timer not queued")?;
+                    if firing {
+                        ensure!(queue.active_triggers().fire(&delivery).await);
+                        queued = TimerState::FiringRescheduled;
+                    }
                 }
                 let mut replacement = old;
                 replacement.tag += 1_i32;
-                schedule(&mut state, &mut queue, replacement.clone()).await?;
+                schedule(&mut state, &mut queue, replacement.clone(), queued).await?;
+                let active = queue.active_triggers();
+                ensure!(
+                    active.get_state(&replacement.key, time, timer_type).await == Some(queued),
+                    "the reschedule left memory"
+                );
+                // The delivery commits, so the re-fire is due.
+                active
+                    .set_state(&replacement.key, time, timer_type, TimerState::Scheduled)
+                    .await;
 
                 load_step(&mut state, &mut queue).await;
                 let expired = queue
@@ -961,5 +978,5 @@ fn prop_failed_load_reschedule() {
                 Ok(())
             })
     }
-    QuickCheck::new().quickcheck(property as fn(i16, u8, bool) -> Result<()>);
+    QuickCheck::new().quickcheck(property as fn(i16, u8, bool, bool) -> Result<()>);
 }

@@ -32,10 +32,11 @@ const TIME_POOL: [u32; 5] = [1000, 1100, 1200, 1300, 1400];
 /// [`TIME_POOL`].
 const NOW: u32 = 1200;
 
-/// The four lifecycle states `set_state` can store. `TimerState` has no
+/// The lifecycle states `set_state` can store. `TimerState` has no
 /// `Arbitrary` of its own, so ops index this pool directly.
-const STATES: [TimerState; 4] = [
+const STATES: [TimerState; 5] = [
     TimerState::Scheduled,
+    TimerState::Unconfirmed,
     TimerState::Firing,
     TimerState::FiringRescheduled,
     TimerState::Aborted,
@@ -160,7 +161,7 @@ async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
             active.is_scheduled(key, *time, *ty).await,
             entry.is_some_and(|e| matches!(
                 e.state,
-                TimerState::Scheduled | TimerState::FiringRescheduled
+                TimerState::Scheduled | TimerState::Unconfirmed | TimerState::FiringRescheduled
             ))
         );
     }
@@ -202,11 +203,11 @@ async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
     );
 }
 
-/// Records a new entry. It replaces only an absent or `Aborted` entry.
+/// Records a new entry. Only a live state replaces an `Aborted` entry.
 fn insert_model(model: &mut Model, triple: Triple, state: TimerState, tag: i32) {
     if model
         .get(&triple)
-        .is_none_or(|entry| entry.state == TimerState::Aborted)
+        .is_none_or(|entry| entry.state == TimerState::Aborted && state != TimerState::Aborted)
     {
         model.insert(triple, ActiveTriggerEntry { state, tag });
     }

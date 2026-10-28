@@ -191,6 +191,7 @@ where
                         Some(TimerState::Firing) => false,
                         Some(
                             TimerState::Scheduled
+                            | TimerState::Unconfirmed
                             | TimerState::FiringRescheduled
                             | TimerState::Aborted,
                         )
@@ -382,10 +383,9 @@ where
     }
 
     /// Retires a committed attempt and preserves the key row's replacement.
-    /// Hold the replacement before its slab repair. Write both deletes or the
-    /// slab repair before the scheduler acknowledges the command. The actor's
-    /// serial loop corrects earlier loads; later loads read the repaired
-    /// state.
+    /// Write both deletes or the slab repair before the scheduler
+    /// acknowledges the command. The actor's serial loop corrects earlier
+    /// loads; later loads read the repaired state.
     pub(crate) async fn retire_committed(
         &self,
         key: &Key,
@@ -398,13 +398,17 @@ where
             .await
             .map_err(TimerManagerError::Store)?;
         if let Some(replacement) = current.filter(|trigger| trigger.tag != timer.tag) {
-            self.0.scheduler.hold(replacement.clone()).await?;
+            let write = async {
+                self.0
+                    .store
+                    .insert_slab_trigger(replacement.clone())
+                    .await
+                    .map_err(TimerManagerError::Store)
+            };
             self.0
-                .store
-                .insert_slab_trigger(replacement.clone())
-                .await
-                .map_err(TimerManagerError::Store)?;
-            self.0.scheduler.schedule(replacement).await?;
+                .scheduler
+                .insert(replacement.clone(), TimerState::Scheduled, write)
+                .await?;
         } else {
             self.0
                 .store

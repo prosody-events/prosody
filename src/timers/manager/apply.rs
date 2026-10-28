@@ -5,12 +5,13 @@ use super::{TimerManagerError, TimerManagerInner};
 use crate::error::ClassifyError;
 use crate::timers::Trigger;
 use crate::timers::active::{
-    Announce, MemoryEffects, QueueEffect, StoreEffect, TimerOp, TimerState, Transition, transition,
+    Announce, MemoryEffect, QueueEffect, StoreEffect, TimerOp, TimerState, Transition, transition,
 };
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::store::TriggerStore;
 use futures::TryStreamExt;
+use futures::future::ready;
 use std::error::Error;
 use std::fmt::Debug;
 use tracing::{Span, debug};
@@ -43,7 +44,7 @@ impl<T: TriggerStore> TimerManagerInner<T> {
         }) {
             trigger.tag = entry.tag;
         }
-        let (pre, post) = transition(prior, TimerOp::ClearSchedule).phases();
+        let memory = transition(prior, TimerOp::ClearSchedule).memory();
 
         debug!(
             key = %trigger.key,
@@ -54,20 +55,18 @@ impl<T: TriggerStore> TimerManagerInner<T> {
             "clear_and_schedule: resolved transition, applying"
         );
 
-        // In-memory effects that must precede the atomic write: the new
-        // timer's hold, then the removal of every replaced time.
-        apply_memory(&self.scheduler, &trigger, pre).await?;
         unschedule_replaced_timers(&self.scheduler, &trigger, &existing_times).await?;
 
         // The single durable write: atomically inserts the new row and
         // clears the replaced ones (`ClearSchedule` transitions carry no
         // store effect of their own).
-        self.store
-            .clear_and_schedule(trigger.clone())
-            .await
-            .map_err(TimerManagerError::Store)?;
-
-        apply_memory(&self.scheduler, &trigger, post).await?;
+        let write = async {
+            self.store
+                .clear_and_schedule(trigger.clone())
+                .await
+                .map_err(TimerManagerError::Store)
+        };
+        persist(&self.scheduler, &trigger, memory, write).await?;
         self.emit_clear_telemetry(&trigger, &existing_times);
 
         Ok(())
@@ -108,31 +107,26 @@ impl<T: TriggerStore> TimerManagerInner<T> {
         self.apply(trigger, transition(prior, op)).await
     }
 
-    /// Applies a resolved [`Transition`]: pre-persist in-memory effects, the
-    /// durable write, post-persist in-memory effects, then telemetry.
+    /// Applies a resolved [`Transition`]: the in-memory effect around the
+    /// durable write, then telemetry.
     async fn apply(
         &self,
         trigger: &Trigger,
         t: Transition,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        let (pre, post) = t.phases();
-        apply_memory(&self.scheduler, trigger, pre).await?;
-
-        match t.store() {
-            StoreEffect::None => {}
-            StoreEffect::Insert => self
-                .store
-                .add_trigger(trigger.clone())
-                .await
-                .map_err(TimerManagerError::Store)?,
-            StoreEffect::Delete => self
-                .store
-                .remove_trigger(&trigger.key, trigger.time, trigger.timer_type)
-                .await
-                .map_err(TimerManagerError::Store)?,
-        }
-
-        apply_memory(&self.scheduler, trigger, post).await?;
+        let write = async {
+            match t.store() {
+                StoreEffect::None => Ok(()),
+                StoreEffect::Insert => self.store.add_trigger(trigger.clone()).await,
+                StoreEffect::Delete => {
+                    self.store
+                        .remove_trigger(&trigger.key, trigger.time, trigger.timer_type)
+                        .await
+                }
+            }
+            .map_err(TimerManagerError::Store)
+        };
+        persist(&self.scheduler, trigger, t.memory(), write).await?;
 
         match t.announce() {
             Some(Announce::Scheduled) => self.telemetry.timer_scheduled(
@@ -153,20 +147,27 @@ impl<T: TriggerStore> TimerManagerInner<T> {
     }
 }
 
-/// Applies the queue effect, then sets the resulting registry state.
-async fn apply_memory<E>(
+/// Applies `memory` around the durable `write`. An insert goes through the
+/// scheduler, which holds the trigger across the write. An update runs before
+/// it.
+async fn persist<E>(
     scheduler: &TriggerScheduler<E>,
     trigger: &Trigger,
-    effects: MemoryEffects,
+    memory: MemoryEffect,
+    write: impl Future<Output = Result<(), TimerManagerError<E>>>,
 ) -> Result<(), TimerManagerError<E>>
 where
     E: ClassifyError + Error + Debug + Send + Sync + 'static,
 {
-    match effects.queue {
+    let (next_state, queue) = match memory {
+        MemoryEffect::Insert(queued) => {
+            return scheduler.insert(trigger.clone(), queued, write).await;
+        }
+        MemoryEffect::Update { next_state, queue } => (next_state, queue),
+    };
+    match queue {
         QueueEffect::None => {}
         QueueEffect::Dequeue => scheduler.remove_from_queue(trigger.clone()).await?,
-        QueueEffect::Hold => scheduler.hold(trigger.clone()).await?,
-        QueueEffect::Insert => scheduler.schedule(trigger.clone()).await?,
         QueueEffect::Remove => scheduler.unschedule(trigger.clone()).await?,
         QueueEffect::Deactivate => {
             scheduler
@@ -174,13 +175,13 @@ where
                 .await;
         }
     }
-    if let Some(state) = effects.next_state {
+    if let Some(state) = next_state {
         scheduler
             .active_triggers()
             .set_state(&trigger.key, trigger.time, trigger.timer_type, state)
             .await;
     }
-    Ok(())
+    write.await
 }
 
 /// Unschedules every replaced (old-time) timer during a `clear_and_schedule`
@@ -212,7 +213,7 @@ where
             .active_triggers()
             .get_state(&old.key, old.time, old.timer_type)
             .await;
-        let (pre, _) = transition(prior, TimerOp::ClearReplaced).phases();
+        let memory = transition(prior, TimerOp::ClearReplaced).memory();
         debug!(
             key = %old.key,
             timer_type = ?old.timer_type,
@@ -220,7 +221,7 @@ where
             prior_state = ?prior,
             "clear_and_schedule: unscheduling replaced timer"
         );
-        apply_memory(scheduler, &old, pre).await?;
+        persist(scheduler, &old, memory, ready(Ok(()))).await?;
     }
     Ok(())
 }
