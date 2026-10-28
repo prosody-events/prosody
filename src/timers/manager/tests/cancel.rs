@@ -1,6 +1,7 @@
 //! A timer call dropped at any await point leaves no hold behind, and its
 //! stored row stays loadable.
 
+use super::{SLAB_SECONDS, Store, past, seeded_store, slab_id};
 use crate::Key;
 use crate::consumer::Uncommitted;
 use crate::consumer::partition::ShutdownPhase;
@@ -9,11 +10,8 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::manager::TimerManagerError;
 use crate::timers::scheduler::TimerSchedulerError;
-use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::TriggerStore;
-use crate::timers::store::adapter::TableAdapter;
-use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
-use crate::timers::test_support::{setup_timer_manager_with_store, test_segment};
+use crate::timers::test_support::setup_timer_manager_with_store;
 use crate::timers::{TimerManager, TimerRequest, TimerType, Trigger, UncommittedTimer};
 use color_eyre::eyre::{OptionExt, Result, ensure};
 use futures::future::try_join_all;
@@ -29,12 +27,9 @@ use tokio::task::yield_now;
 use tokio::time::timeout;
 use tracing::Span;
 
-const SLAB_SECONDS: u32 = 60;
-
 /// Commands queued ahead of the victim, so its polls stop at different points.
 const BACKLOGS: [usize; 3] = [0, 1, 64];
 
-type Store = TableAdapter<InMemoryTriggerStore>;
 type Manager = TimerManager<Store>;
 
 /// Drops a [`Victim`] call after `polls` polls, with `backlog` choosing how
@@ -261,29 +256,6 @@ impl Victim {
         ensure!(result.is_err() == fails, "the write outcome was lost");
         Ok(())
     }
-}
-
-/// A memory store for a new segment. If `due`, the watermark sits below the
-/// current slab, so the actor owns [`past`] slabs from the start.
-async fn seeded_store(due: bool) -> Result<(Store, CompactDateTime)> {
-    let store = memory_store(test_segment("dropped", SLAB_SECONDS));
-    let now = CompactDateTime::now()?;
-    store.insert_segment().await?;
-    if due {
-        store
-            .set_slab_watermark(slab_id(now).checked_sub(1))
-            .await?;
-    }
-    Ok((store, now))
-}
-
-/// A time two slabs before `now`.
-fn past(now: CompactDateTime) -> CompactDateTime {
-    CompactDateTime::from(now.epoch_seconds().saturating_sub(2 * SLAB_SECONDS))
-}
-
-fn slab_id(time: CompactDateTime) -> SlabId {
-    Slab::from_time(CompactDuration::new(SLAB_SECONDS), time).id()
 }
 
 fn trigger(key: &str, time: CompactDateTime) -> Trigger {
