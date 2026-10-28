@@ -4,12 +4,13 @@
 //! Kafka topics. It handles configuration, message serialization, and injection
 //! of OpenTelemetry context for distributed tracing.
 
+use crate::kafka_log::LogContext;
 use derive_builder::Builder;
 use educe::Educe;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use quick_cache::sync::Cache;
 use rdkafka::ClientConfig;
-use rdkafka::client::{Client, DefaultClientContext};
+use rdkafka::client::Client;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::future_producer::FutureProducerContext;
@@ -146,7 +147,7 @@ pub struct ProsodyProducer<C: Codec = JsonCodec> {
 
     /// Underlying Kafka producer.
     #[educe(Debug(ignore))]
-    producer: FutureProducer,
+    producer: FutureProducer<LogContext>,
 
     /// Idempotence cache for deduplicating messages.
     idempotence_cache: Option<Arc<Cache<u128, ()>>>,
@@ -221,7 +222,7 @@ impl<C: Codec> ProsodyProducer<C> {
         Ok(Self {
             send_timeout,
             source_system: config.source_system.clone().into_boxed_str(),
-            producer: client_config.create()?,
+            producer: client_config.create_with_context(LogContext)?,
             idempotence_cache,
             propagator: new_propagator(),
             telemetry,
@@ -306,7 +307,7 @@ impl<C: Codec> ProsodyProducer<C> {
         name = "send",
         skip(self, topic, headers, payload),
         fields(otel.kind = "producer", messaging.system = "kafka", topic = topic.as_ref(), key = %key, payload_size, partition, offset, timestamp),
-        err
+        err(level = "warn")
     )]
     pub(crate) async fn send_owned(
         &self,
@@ -371,7 +372,7 @@ impl<C: Codec> ProsodyProducer<C> {
     #[instrument(
         skip(self, topic, headers),
         fields(otel.kind = "producer", messaging.system = "kafka", topic = topic.as_ref(), key = %key, partition, offset, timestamp),
-        err
+        err(level = "warn")
     )]
     pub async fn excise<'a, H>(
         &'a self,
@@ -460,7 +461,7 @@ impl<C: Codec> ProsodyProducer<C> {
     ///
     /// This method is primarily used for internal purposes like checking topic
     /// existence.
-    pub(crate) fn kafka_client(&self) -> &Client<FutureProducerContext<DefaultClientContext>> {
+    pub(crate) fn kafka_client(&self) -> &Client<FutureProducerContext<LogContext>> {
         self.producer.client()
     }
 }

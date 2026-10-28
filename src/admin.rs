@@ -3,11 +3,11 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::kafka_log::LogContext;
 use derive_builder::Builder;
 use rdkafka::ClientConfig;
 use rdkafka::TopicPartitionList;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
-use rdkafka::client::DefaultClientContext;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::metadata::{Metadata, MetadataPartition};
@@ -157,7 +157,7 @@ const TOPIC_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A client for performing administrative operations on Kafka topics.
 pub struct ProsodyAdminClient {
-    client: AdminClient<DefaultClientContext>,
+    client: AdminClient<LogContext>,
     options: AdminOptions,
     bootstrap_servers: Vec<String>,
 }
@@ -179,7 +179,7 @@ impl ProsodyAdminClient {
         let options = AdminOptions::new().operation_timeout(Some(Duration::from_secs(30)));
 
         Ok(Self {
-            client: client_config.create()?,
+            client: client_config.create_with_context(LogContext)?,
             options,
             bootstrap_servers: config.bootstrap_servers.clone(),
         })
@@ -265,10 +265,10 @@ impl ProsodyAdminClient {
         name: &str,
         expected_partitions: Option<u16>,
     ) -> Result<(), ProsodyAdminClientError> {
-        let consumer: Arc<BaseConsumer> = Arc::new(
+        let consumer: Arc<BaseConsumer<LogContext>> = Arc::new(
             ClientConfig::new()
                 .set("bootstrap.servers", self.bootstrap_servers.join(","))
-                .create()?,
+                .create_with_context(LogContext)?,
         );
         let deadline = Instant::now() + TOPIC_READY_TIMEOUT;
         loop {

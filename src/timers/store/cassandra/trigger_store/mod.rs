@@ -66,7 +66,7 @@ impl TriggerOperations for CassandraTriggerStore {
         &self.segment
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn insert_segment(&self) -> Result<(), Self::Error> {
         let segment = &self.segment;
         self.session()
@@ -85,7 +85,7 @@ impl TriggerOperations for CassandraTriggerStore {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn get_segment(&self) -> Result<Option<StoredSegment>, Self::Error> {
         let segment_id = &self.segment.id;
         let Some(segment) = self.get_segment_unchecked(segment_id).await? else {
@@ -98,7 +98,7 @@ impl TriggerOperations for CassandraTriggerStore {
         Ok(Some(segment))
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn delete_segment(&self) -> Result<(), Self::Error> {
         let segment_id = &self.segment.id;
         self.session()
@@ -183,7 +183,7 @@ impl TriggerOperations for CassandraTriggerStore {
         }
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn insert_slab(&self, slab: Slab) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
@@ -193,7 +193,7 @@ impl TriggerOperations for CassandraTriggerStore {
             .await
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn delete_slab(&self, slab_id: SlabId) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
         self.session()
@@ -207,7 +207,7 @@ impl TriggerOperations for CassandraTriggerStore {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn set_slab_watermark(&self, watermark: Option<SlabId>) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
         let watermark_i32 = watermark.map(|w| i32::from_le_bytes(w.to_le_bytes()));
@@ -225,7 +225,7 @@ impl TriggerOperations for CassandraTriggerStore {
         .await
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn batch_insert_slab_with_watermark(
         &self,
         slab: Slab,

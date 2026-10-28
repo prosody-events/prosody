@@ -9,7 +9,7 @@ use tokio::spawn;
 use tokio::sync::watch;
 use tokio::task::coop::cooperative;
 use tokio::time::sleep;
-use tracing::{debug, error};
+use tracing::{debug, warn};
 
 use super::dispatch::{build_message_stream, process_event};
 use super::{PartitionConfiguration, PartitionContext, PartitionInfo, ShutdownPhase, metrics};
@@ -71,7 +71,7 @@ where
         {
             Ok(result) => return Some(result),
             Err(error) => {
-                error!("failed to initialize timer manager: {error:#}; retrying");
+                warn!("failed to initialize timer manager: {error:#}; retrying");
                 sleep(Duration::from_secs(1)).await;
             }
         }
@@ -107,7 +107,7 @@ where
         {
             Ok(manager) => return Some(manager),
             Err(error) => {
-                error!("failed to acquire keyed-state manager: {error:#}; retrying");
+                warn!("failed to acquire keyed-state manager: {error:#}; retrying");
                 sleep(Duration::from_secs(1)).await;
             }
         }

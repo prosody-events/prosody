@@ -223,7 +223,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             error.type = Empty,
             subsystems = subsystems.len() as i64,
         ),
-        err
+        err(level = "warn")
     )]
     async fn request_prepared<V, F, Fut>(
         &self,

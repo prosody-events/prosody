@@ -21,11 +21,11 @@ use futures::{Stream, StreamExt, pin_mut};
 use rdkafka::consumer::ConsumerContext;
 use rdkafka::consumer::base_consumer::PartitionQueue;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
-use tracing::error;
 
 use crate::Codec;
 use crate::consumer::decode::{ResultRequestReader, decode_record};
 use crate::consumer::message::ConsumerRecord;
+use crate::kafka_log::log_error;
 use crate::otel::SpanRelation;
 use crate::propagator::new_propagator;
 
@@ -99,7 +99,7 @@ where
                 let mut message = match polled {
                     Ok(message) => message,
                     Err(error) => {
-                        error!("partition queue error: {error:#}");
+                        log_error(&error, "partition queue poll failed");
                         continue;
                     }
                 };
