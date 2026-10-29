@@ -83,7 +83,6 @@ pub mod datetime;
 pub mod duration;
 pub mod error;
 mod manager;
-mod queue;
 mod scheduler;
 mod segment;
 mod slab;
@@ -256,8 +255,7 @@ pub(crate) enum TriggerTrace {
 /// are excluded from equality and ordering comparisons.
 ///
 /// Equality and ordering identify the coordinate: key, time, and timer type.
-/// The tag identifies an attempt at that coordinate. See
-/// `timers::active::transition`.
+/// The tag identifies an attempt at that coordinate.
 #[derive(Clone, Debug, Educe)]
 #[educe(Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Trigger {

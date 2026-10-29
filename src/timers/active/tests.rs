@@ -1,320 +1,290 @@
-//! Trace + model property for [`ActiveTriggers`].
+//! Trace + model property for [`Timers`].
 //!
-//! `ActiveTriggers` is a concurrent registry whose only invariants are pure
-//! map/aggregation facts: a read returns the last write, `remove` deletes,
-//! `scan_active_times` visits exactly the live `(time, type)` tuples, and
-//! `snapshot` counts match a fold over the contents. The timer *state machine*
-//! (schedule/fire/commit/abort) is not implemented here — it lives in the
-//! scheduler and is proven by `prop_scheduler_invariants`. So this suite drives
-//! the registry and a plain `HashMap` model through a random op sequence and
-//! asserts equivalence after every op.
+//! The model is the set of stored rows that operations leave: absent, present
+//! with a tag, or unknown after a row change with an unknown result. After
+//! every operation, memory must cover each row that may exist in an owned slab,
+//! hold nothing for a row that cannot exist, and keep the delay queue and the
+//! entries in step.
 
 use super::*;
-use crate::Key;
-use crate::test_util::TEST_RUNTIME;
-use crate::timers::datetime::CompactDateTime;
-use crate::timers::{TimerType, Trigger};
-use ahash::HashMap;
+use color_eyre::eyre::{Result, ensure};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
-use std::collections::HashSet;
-use strum::VariantArray;
+use std::array::from_fn;
+use std::sync::Arc;
+use tokio::runtime::Builder;
 use tracing::Span;
 
-/// Cap on ops per trace — long enough for collisions and re-use, short enough
-/// to shrink quickly.
-const MAX_OPS: usize = 40;
+/// Times of the trace. The slab of the last one is not owned.
+const TIMES: [u32; 3] = [100, 200, 300];
+const TYPES: [TimerType; 2] = [TimerType::Application, TimerType::DeferredMessage];
 
-/// Fire-time pool, chosen to straddle [`NOW`]: past (`1000`, `1100`), equal
-/// (`1200`), and future (`1300`, `1400`) so every snapshot branch is reached.
-const TIME_POOL: [u32; 5] = [1000, 1100, 1200, 1300, 1400];
+/// One coordinate of the trace, as indexes into [`TIMES`] and [`TYPES`].
+#[derive(Clone, Copy, Debug)]
+struct At(usize, usize);
 
-/// The fixed `now` handed to every `snapshot` assertion; the midpoint of
-/// [`TIME_POOL`].
-const NOW: u32 = 1200;
-
-/// The lifecycle states `set_state` can store. `TimerState` has no
-/// `Arbitrary` of its own, so ops index this pool directly.
-const STATES: [TimerState; 4] = [
-    TimerState::Scheduled,
-    TimerState::Firing,
-    TimerState::FiringRescheduled,
-    TimerState::Aborted,
-];
-
-/// Identifies one registry entry across the real registry and the model.
-type Triple = (Key, CompactDateTime, TimerType);
-
-/// Deliberately-simple model: a flat map keyed by the full triple. Whole-entry
-/// removal is implicit here, an equivalent flattening of the registry's
-/// two-level `key → (time, type)` map.
-type Model = HashMap<Triple, ActiveTriggerEntry>;
-
-/// One registry operation, drawn from small fixed pools so collisions
-/// (same key/time/type) and cross-key isolation happen naturally.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum Op {
-    Insert {
-        key: Key,
-        time: CompactDateTime,
-        ty: TimerType,
-        tag: i32,
-    },
-    Hold {
-        key: Key,
-        time: CompactDateTime,
-        ty: TimerType,
-        tag: i32,
-    },
-    Remove {
-        key: Key,
-        time: CompactDateTime,
-        ty: TimerType,
-    },
-    SetState {
-        key: Key,
-        time: CompactDateTime,
-        ty: TimerType,
-        state: TimerState,
-    },
-    Queue {
-        key: Key,
-        time: CompactDateTime,
-        ty: TimerType,
-        queued: Queued,
-        row: Row,
-    },
+    Insert(At, Insert, i32, Outcome),
+    Unschedule(At, Outcome),
+    UnscheduleAll(usize, Outcome),
+    Complete(At, Outcome),
+    Abort(At),
+    /// The delay queue releases the waiting attempt.
+    Pop(At),
+    /// Fires the attempt with this tag.
+    Fire(At, i32),
+    /// A slab load reads the stored row.
+    Load(At),
 }
 
-impl Op {
-    /// The registry entry this op targets — recorded so equivalence is checked
-    /// for absent triples too, catching a spurious presence.
-    fn triple(&self) -> Triple {
-        match self {
-            Op::Insert { key, time, ty, .. }
-            | Op::Hold { key, time, ty, .. }
-            | Op::Remove { key, time, ty }
-            | Op::SetState { key, time, ty, .. }
-            | Op::Queue { key, time, ty, .. } => (key.clone(), *time, *ty),
+/// What the store holds at one coordinate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Stored {
+    #[default]
+    Absent,
+    Present(i32),
+    /// A row change with an unknown result touched the row.
+    Unknown,
+}
+
+/// The rows of the trace, by coordinate.
+type Rows = [[Stored; TYPES.len()]; TIMES.len()];
+
+#[test]
+fn prop_timers_cover_every_row() {
+    fn property(ops: Vec<Op>) -> Result<()> {
+        // The delay queue needs the timer of a runtime.
+        let runtime = Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()?;
+        let _runtime = runtime.enter();
+        run(ops)
+    }
+    QuickCheck::new().quickcheck(property as fn(Vec<Op>) -> Result<()>);
+}
+
+fn run(ops: Vec<Op>) -> Result<()> {
+    let mut timers = Timers::default();
+    let mut rows = Rows::default();
+    for (step, op) in ops.into_iter().enumerate() {
+        apply(&mut timers, &mut rows, op)
+            .and_then(|()| check(&timers, &rows))
+            .map_err(|error| error.wrap_err(format!("step {step}: {op:?}")))?;
+    }
+    Ok(())
+}
+
+/// Applies `op`, and checks the rules of the operation itself: a removal that
+/// is not done keeps the waiting attempt, and a schedule of the waiting
+/// attempt moves it onto the newest trace.
+fn apply(timers: &mut Timers, rows: &mut Rows, op: Op) -> Result<()> {
+    let key = key();
+    match op {
+        Op::Insert(at, insert, tag, outcome) => {
+            let (trigger, change) = timers.start_insert(trigger(at, tag), insert);
+            let cleared = matches!(insert, Insert::Clear).then_some(at.1);
+            for (time, row) in rows.iter_mut().enumerate() {
+                if let Some(ty) = cleared
+                    && time != at.0
+                {
+                    delete(&mut row[ty], outcome);
+                }
+            }
+            write(&mut rows[at.0][at.1], trigger.tag, outcome);
+            timers.end(change, outcome, owned);
+            if let Some(next) = entry(timers, at).and_then(|entry| entry.next.as_ref())
+                && outcome != Outcome::Unchanged
+                && next.trigger.tag == trigger.tag
+            {
+                let trace = next.trigger.trace.load_full();
+                ensure!(
+                    Arc::ptr_eq(&trace, &trigger.trace.load_full()),
+                    "the waiting attempt kept an old trace"
+                );
+            }
         }
+        Op::Unschedule(at @ At(time, ty), outcome) => {
+            let before = waiting(timers, at);
+            if let Some(change) = timers.start_unschedule(key, time_of(time), TYPES[ty]) {
+                delete(&mut rows[time][ty], outcome);
+                timers.end(change, outcome, owned);
+                kept(timers, at, before, outcome)?;
+            }
+        }
+        Op::UnscheduleAll(ty, outcome) => {
+            let before: [_; TIMES.len()] = from_fn(|time| waiting(timers, At(time, ty)));
+            let (change, firing) = timers.start_unschedule_all(key, TYPES[ty]);
+            for (time, row) in rows.iter_mut().enumerate() {
+                if !firing.contains(&time_of(time)) {
+                    delete(&mut row[ty], outcome);
+                }
+            }
+            timers.end(change, outcome, owned);
+            for (time, before) in before.into_iter().enumerate() {
+                if !firing.contains(&time_of(time)) {
+                    kept(timers, At(time, ty), before, outcome)?;
+                }
+            }
+        }
+        Op::Complete(at @ At(time, ty), outcome) => {
+            let before = waiting(timers, at);
+            if let Some(change) = timers.start_complete(key, time_of(time), TYPES[ty]) {
+                delete(&mut rows[time][ty], outcome);
+                timers.end(change, outcome, owned);
+                kept(timers, at, before, outcome)?;
+            }
+        }
+        Op::Abort(At(time, ty)) => timers.abort(&key, time_of(time), TYPES[ty]),
+        Op::Pop(At(time, ty)) => {
+            let Timers { entries, queue } = timers;
+            if let Some(next) = get_mut(entries, &key, time_of(time), TYPES[ty])
+                .and_then(|entry| entry.next.as_mut())
+                && let Some(item) = next.queued.take()
+            {
+                queue.try_remove(&item);
+            }
+        }
+        Op::Fire(at, tag) => {
+            timers.fire(&trigger(at, tag));
+        }
+        Op::Load(at) => {
+            if let Stored::Present(tag) = rows[at.0][at.1]
+                && owned(time_of(at.0))
+            {
+                timers.load(trigger(at, tag));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks the invariants of memory against the stored rows.
+fn check(timers: &Timers, rows: &Rows) -> Result<()> {
+    let mut queued = 0_usize;
+    for (time, row) in rows.iter().enumerate() {
+        for (ty, &row) in row.iter().enumerate() {
+            let entry = entry(timers, At(time, ty));
+            let covered = row == Stored::Absent || !owned(time_of(time)) || entry.is_some();
+            ensure!(covered, "an owned row that may exist has no entry");
+            let Some(entry) = entry else {
+                continue;
+            };
+            ensure!(
+                row != Stored::Absent || entry.firing,
+                "an entry stands for no row and no delivery"
+            );
+            if let (Some(next), Stored::Present(tag)) = (&entry.next, row) {
+                ensure!(
+                    next.trigger.tag == tag,
+                    "the waiting attempt is not the stored one"
+                );
+            }
+            queued += usize::from(
+                entry
+                    .next
+                    .as_ref()
+                    .is_some_and(|next| next.queued.is_some()),
+            );
+        }
+    }
+    ensure!(
+        queued == timers.queue.len(),
+        "the queue and the entries disagree"
+    );
+    Ok(())
+}
+
+/// Checks that a removal that is not done leaves the attempt that waited.
+fn kept(timers: &Timers, at: At, before: Option<i32>, outcome: Outcome) -> Result<()> {
+    ensure!(
+        outcome == Outcome::Done || waiting(timers, at) == before,
+        "a removal that is not done lost the waiting attempt"
+    );
+    Ok(())
+}
+
+/// The tag of the attempt that waits at `at`.
+fn waiting(timers: &Timers, at: At) -> Option<i32> {
+    entry(timers, at)?
+        .next
+        .as_ref()
+        .map(|next| next.trigger.tag)
+}
+
+fn entry(timers: &Timers, At(time, ty): At) -> Option<&Entry> {
+    timers.entries.get(&key())?.get(&(time_of(time), TYPES[ty]))
+}
+
+/// Records a row write with `outcome`.
+fn write(row: &mut Stored, tag: i32, outcome: Outcome) {
+    *row = match (outcome, *row) {
+        (Outcome::Unchanged, row) => row,
+        (Outcome::Done, _) => Stored::Present(tag),
+        (Outcome::Unknown, Stored::Present(stored)) if stored == tag => Stored::Present(tag),
+        (Outcome::Unknown, _) => Stored::Unknown,
+    };
+}
+
+/// Records a row delete with `outcome`.
+fn delete(row: &mut Stored, outcome: Outcome) {
+    *row = match (outcome, *row) {
+        (Outcome::Unchanged, row) | (Outcome::Unknown, row @ Stored::Absent) => row,
+        (Outcome::Done, _) => Stored::Absent,
+        (Outcome::Unknown, _) => Stored::Unknown,
+    };
+}
+
+fn owned(time: CompactDateTime) -> bool {
+    time != time_of(TIMES.len() - 1)
+}
+
+fn key() -> Key {
+    Arc::from("key")
+}
+
+fn time_of(index: usize) -> CompactDateTime {
+    CompactDateTime::from(TIMES[index])
+}
+
+fn trigger(At(time, ty): At, tag: i32) -> Trigger {
+    Trigger::with_tag(key(), time_of(time), TYPES[ty], tag, Span::none())
+}
+
+impl Arbitrary for At {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self(
+            usize::from(u8::arbitrary(g)) % TIMES.len(),
+            usize::from(u8::arbitrary(g)) % TYPES.len(),
+        )
     }
 }
 
 impl Arbitrary for Op {
     fn arbitrary(g: &mut Gen) -> Self {
-        let key = format!("key-{}", u8::arbitrary(g) % 3).into();
-        let time =
-            CompactDateTime::from(TIME_POOL[usize::from(u8::arbitrary(g)) % TIME_POOL.len()]);
-        let ty = TimerType::VARIANTS[usize::from(u8::arbitrary(g)) % TimerType::VARIANTS.len()];
-        match u8::arbitrary(g) % 5 {
-            0 => Op::Insert {
-                key,
-                time,
-                ty,
-                tag: i32::arbitrary(g),
-            },
-            1 => Op::Hold {
-                key,
-                time,
-                ty,
-                tag: i32::arbitrary(g),
-            },
-            2 => Op::Remove { key, time, ty },
-            3 => Op::Queue {
-                key,
-                time,
-                ty,
-                queued: if bool::arbitrary(g) {
-                    Queued::Scheduled
-                } else {
-                    Queued::FiringRescheduled
-                },
-                row: if bool::arbitrary(g) {
-                    Row::Written
-                } else {
-                    Row::Unconfirmed
-                },
-            },
-            _ => Op::SetState {
-                key,
-                time,
-                ty,
-                state: STATES[usize::from(u8::arbitrary(g)) % STATES.len()],
-            },
+        let at = At::arbitrary(g);
+        // A small tag pool makes stale and current tags collide.
+        let tag = i32::from(u8::arbitrary(g) % 3);
+        let outcome = *g
+            .choose(&[
+                Outcome::Unchanged,
+                Outcome::Unknown,
+                Outcome::Done,
+                Outcome::Done,
+            ])
+            .unwrap_or(&Outcome::Done);
+        let insert = *g
+            .choose(&[Insert::Schedule, Insert::Clear, Insert::Repair])
+            .unwrap_or(&Insert::Schedule);
+        match u8::arbitrary(g) % 10 {
+            0..=2 => Op::Insert(at, insert, tag, outcome),
+            3 => Op::Unschedule(at, outcome),
+            4 => Op::UnscheduleAll(at.1, outcome),
+            5 => Op::Complete(at, outcome),
+            6 => Op::Abort(at),
+            7 => Op::Pop(at),
+            8 => Op::Fire(at, tag),
+            _ => Op::Load(at),
         }
     }
-}
-
-/// A shrinkable op sequence. Dropping ops is the high-value reduction, so
-/// shrink delegates to the `Vec`.
-#[derive(Clone, Debug)]
-struct Trace {
-    ops: Vec<Op>,
-}
-
-impl Arbitrary for Trace {
-    fn arbitrary(g: &mut Gen) -> Self {
-        Self {
-            ops: Vec::<Op>::arbitrary(g).into_iter().take(MAX_OPS).collect(),
-        }
-    }
-
-    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        Box::new(self.ops.shrink().map(|ops| Self { ops }))
-    }
-}
-
-/// Asserts every reader of the registry agrees with the model: per-triple
-/// `get`, the `scan_active_times` multiset, and the `snapshot` fold — the last
-/// recomputed independently, not by calling `snapshot` again.
-async fn assert_equiv(active: &ActiveTriggers, model: &Model, seen: &[Triple]) {
-    for (key, time, ty) in seen {
-        let entry = model.get(&(key.clone(), *time, *ty));
-        assert_eq!(active.get(key, *time, *ty).await, entry.copied());
-    }
-
-    // scan is per-key: a (time, type) shared by two keys appears twice, so the
-    // oracle is a sorted multiset — one entry per model key — not a set.
-    let mut scanned: Vec<(CompactDateTime, TimerType)> = Vec::new();
-    active
-        .scan_active_times(|time, ty| scanned.push((time, ty)))
-        .await;
-    scanned.sort();
-    let mut expected: Vec<(CompactDateTime, TimerType)> =
-        model.keys().map(|(_, time, ty)| (*time, *ty)).collect();
-    expected.sort();
-    assert_eq!(scanned, expected, "scan_active_times multiset");
-
-    let now = CompactDateTime::from(NOW);
-    let snap = active.snapshot(now).await;
-    let (mut count, mut in_flight, mut overdue, mut oldest) = (0_u32, 0_u32, 0_u32, 0_u32);
-    for ((_, time, _), entry) in model {
-        count = count.saturating_add(1);
-        if matches!(
-            entry.state,
-            TimerState::Firing | TimerState::FiringRescheduled
-        ) {
-            in_flight = in_flight.saturating_add(1);
-        }
-        if *time <= now {
-            overdue = overdue.saturating_add(1);
-            oldest = oldest.max(now.epoch_seconds().saturating_sub(time.epoch_seconds()));
-        }
-    }
-    assert_eq!(snap.active, count, "snapshot.active");
-    assert_eq!(snap.in_flight, in_flight, "snapshot.in_flight");
-    assert_eq!(snap.overdue, overdue, "snapshot.overdue");
-    assert_eq!(
-        snap.oldest_overdue_secs, oldest,
-        "snapshot.oldest_overdue_secs"
-    );
-}
-
-/// Records a new entry. Only a live state replaces an `Aborted` entry.
-fn insert_model(model: &mut Model, triple: Triple, state: TimerState, tag: i32) {
-    if model
-        .get(&triple)
-        .is_none_or(|entry| entry.state == TimerState::Aborted && state != TimerState::Aborted)
-    {
-        model.insert(
-            triple,
-            ActiveTriggerEntry {
-                state,
-                tag,
-                row: Row::Written,
-            },
-        );
-    }
-}
-
-/// Applies each op to the registry and the model in lockstep, asserting
-/// equivalence on the empty state and after every op. `set_state`
-/// return values are compared inline, where the model's pre-op membership is
-/// known.
-async fn run_trace(trace: Trace) {
-    let active = ActiveTriggers::default();
-    let mut model = Model::default();
-    let mut seen: Vec<Triple> = Vec::new();
-    let mut seen_set: HashSet<Triple> = HashSet::new();
-
-    assert_equiv(&active, &model, &seen).await;
-
-    for op in trace.ops {
-        let triple = op.triple();
-        if seen_set.insert(triple.clone()) {
-            seen.push(triple.clone());
-        }
-
-        match op {
-            Op::Insert { key, time, ty, tag } => {
-                active
-                    .insert(Trigger::with_tag(
-                        key.clone(),
-                        time,
-                        ty,
-                        tag,
-                        Span::current(),
-                    ))
-                    .await;
-                insert_model(&mut model, (key, time, ty), TimerState::Scheduled, tag);
-            }
-            Op::Hold { key, time, ty, tag } => {
-                active
-                    .hold(Trigger::with_tag(
-                        key.clone(),
-                        time,
-                        ty,
-                        tag,
-                        Span::current(),
-                    ))
-                    .await;
-                insert_model(&mut model, (key, time, ty), TimerState::Aborted, tag);
-            }
-            Op::Remove { key, time, ty } => {
-                active.remove(&key, time, ty).await;
-                model.remove(&(key, time, ty));
-            }
-            Op::SetState {
-                key,
-                time,
-                ty,
-                state,
-            } => {
-                let got = active.set_state(&key, time, ty, state).await;
-                let want = match model.get_mut(&(key, time, ty)) {
-                    Some(entry) => {
-                        entry.state = state;
-                        true
-                    }
-                    None => false,
-                };
-                assert_eq!(got, want, "set_state return");
-            }
-            Op::Queue {
-                key,
-                time,
-                ty,
-                queued,
-                row,
-            } => {
-                active.queue(&key, time, ty, queued, row).await;
-                if let Some(entry) = model.get_mut(&(key, time, ty)) {
-                    entry.state = queued.into();
-                    entry.row = row;
-                }
-            }
-        }
-
-        assert_equiv(&active, &model, &seen).await;
-    }
-}
-
-/// The registry tracks a plain `HashMap` model op-for-op across
-/// Insert/Hold/Remove/SetState/Queue, and every reader (`get`,
-/// `scan_active_times`, `snapshot`) agrees after every op.
-#[test]
-fn prop_active_triggers_track_model() {
-    fn property(trace: Trace) {
-        TEST_RUNTIME.block_on(run_trace(trace));
-    }
-    QuickCheck::new().quickcheck(property as fn(Trace));
 }

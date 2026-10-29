@@ -1,25 +1,23 @@
 //! Scheduler actor: state, run loop, and command handlers.
 //!
-//! The actor owns slab metadata writes, slab preloading, slab cleanup, and
-//! the trigger queue. The public [`TriggerScheduler`] handle in the parent
-//! module communicates with it through a command channel; [`run_actor`] is
-//! spawned by `TriggerScheduler::new`. The [`load`] module holds the preload
-//! and cleanup steps.
+//! The public [`TriggerScheduler`] handle in the parent module sends commands
+//! to the actor; [`run_actor`] is spawned by `TriggerScheduler::new`. The
+//! [`load`] module holds the preload and cleanup steps.
 //!
 //! [`TriggerScheduler`]: super::TriggerScheduler
 
-use super::{Command, CommandOperation};
+use super::{Command, Ticket};
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::Heartbeat;
 use crate::timers::Trigger;
-use crate::timers::active::{Queued, Row};
+use crate::timers::active::{Change, Outcome, Timers};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::queue::TriggerQueue;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, StoredSegment, TriggerStore};
 use std::collections::BTreeSet;
 use tokio::select;
+use tokio::sync::mpsc::WeakUnboundedSender;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep_until};
@@ -29,10 +27,8 @@ use load::{calculate_preload, load_step};
 
 pub(super) mod load;
 
-/// Mutable actor state — everything except the trigger queue and the
-/// transient `trigger_to_send` slot. The queue is held as a local in
-/// [`run_actor`] so handlers can borrow it independently of the rest of
-/// the state.
+/// Slab state of the actor. [`run_actor`] holds the [`Timers`] apart, so
+/// handlers can borrow both.
 pub(super) struct ActorState<T> {
     pub(super) store: T,
     pub(super) segment: Segment,
@@ -83,7 +79,7 @@ impl<T> ActorState<T> {
 pub(super) async fn run_actor<T>(
     store: T,
     segment: StoredSegment,
-    mut triggers: TriggerQueue,
+    tickets: WeakUnboundedSender<Command<T::Error>>,
     mut commands: mpsc::UnboundedReceiver<Command<T::Error>>,
     trigger_tx: mpsc::Sender<Trigger>,
     heartbeat: Heartbeat,
@@ -94,6 +90,7 @@ pub(super) async fn run_actor<T>(
     // A clock error discards the watermark: no slab is below slab 0.
     let now = CompactDateTime::now().unwrap_or(CompactDateTime::MIN);
     let mut state = ActorState::start(store, segment, now);
+    let mut timers = Timers::default();
 
     let mut trigger_to_send: Option<Trigger> = None;
 
@@ -118,7 +115,7 @@ pub(super) async fn run_actor<T>(
             select! {
                 result = commands.recv() => {
                     let Some(command) = result else { break; };
-                    process_command(&mut state, &mut triggers, command).await;
+                    process_command(&mut state, &mut timers, &tickets, command).await;
                 }
                 result = trigger_tx.reserve() => {
                     let Ok(permit) = result else { break; };
@@ -128,7 +125,7 @@ pub(super) async fn run_actor<T>(
                     permit.send(trigger);
                 }
                 () = sleep_until(load_deadline) => {
-                    load_step(&mut state, &mut triggers).await;
+                    load_step(&mut state, &mut timers).await;
                 }
                 () = heartbeat.next() => {},
                 // Wake a parked actor on any phase change: an `Ok` falls
@@ -149,9 +146,9 @@ pub(super) async fn run_actor<T>(
             select! {
                 result = commands.recv() => {
                     let Some(command) = result else { break; };
-                    process_command(&mut state, &mut triggers, command).await;
+                    process_command(&mut state, &mut timers, &tickets, command).await;
                 }
-                Some(trigger) = triggers.next() => {
+                Some(trigger) = timers.next() => {
                     if let Err(err) = trigger_tx.try_send(trigger) {
                         match err {
                             TrySendError::Full(t) => trigger_to_send = Some(t),
@@ -160,7 +157,7 @@ pub(super) async fn run_actor<T>(
                     }
                 }
                 () = sleep_until(load_deadline) => {
-                    load_step(&mut state, &mut triggers).await;
+                    load_step(&mut state, &mut timers).await;
                 }
                 () = heartbeat.next() => {},
                 // Wake-and-route-to-the-gate; see the trigger_to_send branch.
@@ -178,155 +175,130 @@ pub(super) async fn run_actor<T>(
 /// Processes a single command from the command channel.
 pub(super) async fn process_command<T>(
     state: &mut ActorState<T>,
-    triggers: &mut TriggerQueue,
-    Command {
-        operation,
-        trigger,
-        result_tx,
-    }: Command<T::Error>,
+    timers: &mut Timers,
+    tickets: &WeakUnboundedSender<Command<T::Error>>,
+    command: Command<T::Error>,
 ) where
     T: TriggerStore,
 {
-    let result: Result<(), T::Error> = match operation {
-        CommandOperation::Hold => handle_hold(state, triggers, trigger).await,
-        CommandOperation::Release => {
-            release(triggers, &trigger).await;
-            Ok(())
-        }
-        CommandOperation::Add(queued, row) => {
-            handle_add(state, triggers, trigger, queued, row).await;
-            Ok(())
-        }
-        CommandOperation::Remove => {
-            triggers.remove(&trigger).await;
-            Ok(())
-        }
-        CommandOperation::RetireCommitted => {
-            let tag = triggers
-                .active_triggers()
-                .get(&trigger.key, trigger.time, trigger.timer_type)
+    let ticket = |change| Ticket::new(change, tickets.clone());
+    // A caller that left before its reply never ran the row change.
+    let returned = match command {
+        Command::Insert {
+            trigger,
+            insert,
+            reply,
+        } => {
+            let started = register_slab(state, trigger.time)
                 .await
-                .map(|entry| entry.tag);
-            if tag.is_none_or(|tag| tag == trigger.tag) {
-                triggers.remove(&trigger).await;
-            }
-            Ok(())
+                .map(|()| timers.start_insert(trigger, insert))
+                .map(|(trigger, change)| (trigger, ticket(change)));
+            reply
+                .send(started)
+                .err()
+                .and_then(Result::ok)
+                .map(|(_, t)| t)
         }
-        CommandOperation::RemoveFromQueue => {
-            triggers.remove_queue_only(&trigger);
-            Ok(())
+        Command::Unschedule { id, reply } => {
+            let change = timers.start_unschedule(id.key, id.time, id.timer_type);
+            reply.send(change.map(ticket)).err().flatten()
+        }
+        Command::UnscheduleAll {
+            key,
+            timer_type,
+            reply,
+        } => {
+            let (change, firing) = timers.start_unschedule_all(key, timer_type);
+            reply.send((ticket(change), firing)).err().map(|(t, _)| t)
+        }
+        Command::Complete { id, reply } => {
+            let change = timers.start_complete(id.key, id.time, id.timer_type);
+            reply.send(change.map(ticket)).err().flatten()
+        }
+        Command::Abort(id) => {
+            timers.abort(&id.key, id.time, id.timer_type);
+            None
+        }
+        Command::End(change, outcome) => {
+            end(state, timers, change, outcome);
+            None
+        }
+        Command::Fire { trigger, reply } => {
+            let _ = reply.send(timers.fire(&trigger));
+            None
+        }
+        Command::List {
+            key,
+            timer_type,
+            reply,
+        } => {
+            let _ = reply.send(timers.list(&key, timer_type));
+            None
+        }
+        Command::Snapshot { now, reply } => {
+            let _ = reply.send(timers.snapshot(now));
+            None
         }
     };
-
-    // Ignore send errors: the caller will observe a closed reply channel as
-    // a shutdown signal.
-    let _ = result_tx.send(result);
+    if let Some(change) = returned.and_then(Ticket::into_change) {
+        end(state, timers, change, Outcome::Unchanged);
+    }
 }
 
-/// Handler for [`CommandOperation::Hold`].
-///
-/// Registers the trigger's slab and holds the trigger before the manager
-/// writes its row. This keeps the durable row invariant of
-/// [`crate::timers::active`] if the write is dropped or fails.
+/// Ends an operation in `timers`.
+fn end<T>(state: &ActorState<T>, timers: &mut Timers, change: Change, outcome: Outcome) {
+    let slab_size = state.segment.slab_size;
+    timers.end(change, outcome, |time| {
+        owns_slab(state, Slab::from_time(slab_size, time).id())
+    });
+}
+
+/// Registers the slab that holds `time` before an insert writes its row.
 ///
 /// A slab at or below the persisted watermark routes through an atomic
 /// UNLOGGED BATCH that also lowers the watermark (invariant I6). This is the
 /// only way the actor can pull a slab back below its own high-water without
 /// violating I1.
-pub(super) async fn handle_hold<T>(
+pub(super) async fn register_slab<T>(
     state: &mut ActorState<T>,
-    triggers: &TriggerQueue,
-    trigger: Trigger,
+    time: CompactDateTime,
 ) -> Result<(), T::Error>
 where
     T: TriggerStore,
 {
-    let slab = Slab::from_time(state.segment.slab_size, trigger.time);
+    let slab = Slab::from_time(state.segment.slab_size, time);
     let slab_id = slab.id();
-
-    if !state.known_slab_ids.contains(&slab_id) {
-        if let Some(old_watermark) = state.last_persisted_watermark
-            && slab_id <= old_watermark
-        {
-            // I6: atomically write the slab row and lower the watermark.
-            let new_watermark = slab_id.checked_sub(1);
-            state
-                .store
-                .batch_insert_slab_with_watermark(slab, new_watermark)
-                .await?;
-            state.last_persisted_watermark = new_watermark;
-            // Before lowering, the old watermark proved there were no
-            // persisted slab rows <= old_watermark. After atomically inserting
-            // this slab and lowering to slab_id - 1, the actor owns exactly the
-            // compact range slab_id..=old_watermark; no per-slab scan or
-            // materialized loaded set is needed.
-            state.highest_loaded_slab_id = Some(
-                state
-                    .highest_loaded_slab_id
-                    .map_or(old_watermark, |h| h.max(old_watermark)),
-            );
-        } else {
-            // Plain INSERT for in-window or pending. Pending writes are
-            // what let `load_step` discover the slab when it enters the
-            // preload window.
-            state.store.insert_slab(slab).await?;
-        }
-        state.known_slab_ids.insert(slab_id);
+    if state.known_slab_ids.contains(&slab_id) {
+        return Ok(());
     }
 
-    triggers.active_triggers().hold(trigger).await;
-    Ok(())
-}
-
-/// Handler for [`CommandOperation::Add`].
-///
-/// Queues the trigger in the `queued` state with its `row` certainty if the
-/// actor keeps the coordinate in memory: it owns the slab, or a partial drain
-/// or a delivery holds the coordinate. The slab's active set then never drifts
-/// below its DB content (P1). Otherwise the actor releases the hold, and
-/// `load_step` reads the row later. This keeps the in-memory queue bounded to
-/// the preload window.
-pub(super) async fn handle_add<T>(
-    state: &ActorState<T>,
-    triggers: &mut TriggerQueue,
-    trigger: Trigger,
-    queued: Queued,
-    row: Row,
-) {
-    let entry = triggers
-        .active_triggers()
-        .get(&trigger.key, trigger.time, trigger.timer_type)
-        .await;
-    let slab_id = Slab::from_time(state.segment.slab_size, trigger.time).id();
-    if !owns_slab(state, slab_id) && entry.is_none_or(|entry| entry.holds(&trigger)) {
-        triggers.remove(&trigger).await;
-        return;
-    }
-
-    // The key row supplies the tag, even when a partial drain has not advanced
-    // ownership.
-    if entry.is_some_and(|entry| entry.tag != trigger.tag) {
-        triggers.remove(&trigger).await;
-    }
-    let (key, time, timer_type) = (trigger.key.clone(), trigger.time, trigger.timer_type);
-    triggers.insert(trigger).await;
-    triggers
-        .active_triggers()
-        .queue(&key, time, timer_type, queued, row)
-        .await;
-}
-
-/// Handler for [`CommandOperation::Release`]: removes the trigger's own hold.
-pub(super) async fn release(triggers: &TriggerQueue, trigger: &Trigger) {
-    let active = triggers.active_triggers();
-    let (key, time, timer_type) = (&trigger.key, trigger.time, trigger.timer_type);
-    if active
-        .get(key, time, timer_type)
-        .await
-        .is_some_and(|entry| entry.holds(trigger))
+    if let Some(old_watermark) = state.last_persisted_watermark
+        && slab_id <= old_watermark
     {
-        active.remove(key, time, timer_type).await;
+        // I6: atomically write the slab row and lower the watermark.
+        let new_watermark = slab_id.checked_sub(1);
+        state
+            .store
+            .batch_insert_slab_with_watermark(slab, new_watermark)
+            .await?;
+        state.last_persisted_watermark = new_watermark;
+        // Before lowering, the old watermark proved there were no persisted
+        // slab rows <= old_watermark. After atomically inserting this slab and
+        // lowering to slab_id - 1, the actor owns exactly the compact range
+        // slab_id..=old_watermark; no per-slab scan or materialized loaded set
+        // is needed.
+        state.highest_loaded_slab_id = Some(
+            state
+                .highest_loaded_slab_id
+                .map_or(old_watermark, |h| h.max(old_watermark)),
+        );
+    } else {
+        // Plain INSERT for in-window or pending. Pending writes are what let
+        // `load_step` discover the slab when it enters the preload window.
+        state.store.insert_slab(slab).await?;
     }
+    state.known_slab_ids.insert(slab_id);
+    Ok(())
 }
 
 pub(super) fn owns_slab<T>(state: &ActorState<T>, slab_id: SlabId) -> bool {

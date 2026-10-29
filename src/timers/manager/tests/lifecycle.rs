@@ -1,12 +1,11 @@
-//! The lifecycle of one timer follows the state table in `timers::active`.
+//! The lifecycle of one timer, as its owner sees it.
 
-use super::{Store, past, seeded_store};
+use super::{Store, listed, past, seeded_store};
 use crate::Key;
 use crate::consumer::Uncommitted;
 use crate::consumer::partition::ShutdownPhase;
-use crate::timers::active::TimerState;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::test_support::setup_timer_manager_with_store;
+use crate::timers::test_support::{Memory, setup_timer_manager_with_store};
 use crate::timers::uncommitted::UncommittedTriggerGuard;
 use crate::timers::{PendingTimer, TimerRequest, TimerType, UncommittedTimer};
 use color_eyre::eyre::{OptionExt, Result, ensure};
@@ -35,11 +34,11 @@ impl Arbitrary for Step {
     }
 }
 
-/// Every step leaves the timer's registry state and its `scheduled_times` as
-/// the state table predicts. A fire happens only from `Scheduled`, and a
+/// After every step, memory lists the timer and `scheduled_times` reports it
+/// as the model predicts. A fire happens only while an attempt waits, and a
 /// commit or abort only during a delivery.
 #[test]
-fn prop_lifecycle_follows_the_state_table() {
+fn prop_lifecycle_follows_the_model() {
     fn property(steps: Vec<Step>) -> Result<()> {
         Builder::new_current_thread()
             .enable_all()
@@ -50,8 +49,6 @@ fn prop_lifecycle_follows_the_state_table() {
 }
 
 async fn run(steps: Vec<Step>) -> Result<()> {
-    use TimerState::{Aborted, Firing, FiringRescheduled, Scheduled};
-
     let (store, now) = seeded_store(true).await?;
     let (stream, manager, _shutdown) =
         setup_timer_manager_with_store(store, ShutdownPhase::default()).await?;
@@ -68,8 +65,10 @@ async fn run(steps: Vec<Step>) -> Result<()> {
                 manager.schedule(request).await?;
             }
             (Step::Unschedule, _) => manager.unschedule(&key, time, timer_type).await?,
-            (Step::Fire, Some(Scheduled)) => delivery = Some(fire(&mut stream, &key, time).await?),
-            (Step::Commit | Step::Abort, Some(Firing | FiringRescheduled)) => {
+            (Step::Fire, Some(Memory::Waits)) => {
+                delivery = Some(fire(&mut stream, &key, time).await?);
+            }
+            (Step::Commit | Step::Abort, Some(Memory::Firing { .. })) => {
                 let guard = delivery.take().ok_or_eyre("no delivery to settle")?;
                 if matches!(step, Step::Commit) {
                     guard.commit().await;
@@ -81,19 +80,22 @@ async fn run(steps: Vec<Step>) -> Result<()> {
         }
         model = next(model, step);
 
-        let state = manager
-            .0
-            .scheduler
-            .active_triggers()
-            .get(&key, time, timer_type)
-            .await
-            .map(|entry| entry.state);
-        ensure!(state == model, "{step:?} left {state:?}, not {model:?}");
-        let listed = manager.scheduled_times(&key, timer_type).await?;
-        let stored = matches!(model, Some(Scheduled | FiringRescheduled | Aborted));
+        let listed = listed(&manager, &key, time, timer_type).await?;
         ensure!(
-            listed == Vec::from_iter(stored.then_some(time)),
-            "{step:?} in {model:?} listed {listed:?}"
+            listed == model.and_then(Memory::listed),
+            "{step:?} listed {listed:?}, not {model:?}"
+        );
+        let entries = manager.snapshot().await?.active;
+        ensure!(
+            entries == u32::from(model.is_some()),
+            "{step:?} left {entries} entries"
+        );
+
+        let scheduled = manager.scheduled_times(&key, timer_type).await?;
+        let reported = !matches!(model, None | Some(Memory::Firing { again: false }));
+        ensure!(
+            scheduled == Vec::from_iter(reported.then_some(time)),
+            "{step:?} in {model:?} reported {scheduled:?}"
         );
     }
 
@@ -103,18 +105,20 @@ async fn run(steps: Vec<Step>) -> Result<()> {
     Ok(())
 }
 
-/// The state table, as its owner sees one timer.
-fn next(state: Option<TimerState>, step: Step) -> Option<TimerState> {
-    use TimerState::{Aborted, Firing, FiringRescheduled, Scheduled};
+/// The model of one timer's memory, as its owner sees it.
+fn next(memory: Option<Memory>, step: Step) -> Option<Memory> {
+    use Memory::{Firing, Kept, Waits};
 
-    match (step, state) {
-        (Step::Schedule, None | Some(Aborted))
-        | (Step::Commit | Step::Abort, Some(FiringRescheduled)) => Some(Scheduled),
-        (Step::Schedule, Some(Firing)) => Some(FiringRescheduled),
-        (Step::Schedule, queued) => queued,
-        (Step::Unschedule, Some(Firing | FiringRescheduled)) | (Step::Fire, _) => Some(Firing),
+    match (step, memory) {
+        // A delivery keeps its row. A schedule during it queues an attempt.
+        (Step::Schedule, Some(Firing { .. })) => Some(Firing { again: true }),
+        (Step::Unschedule, Some(Firing { .. })) | (Step::Fire, _) => Some(Firing { again: false }),
+        // The end of a delivery leaves the attempt that waits.
+        (Step::Schedule, _) | (Step::Commit | Step::Abort, Some(Firing { again: true })) => {
+            Some(Waits)
+        }
         (Step::Unschedule | Step::Commit, _) => None,
-        (Step::Abort, _) => Some(Aborted),
+        (Step::Abort, _) => Some(Kept),
     }
 }
 

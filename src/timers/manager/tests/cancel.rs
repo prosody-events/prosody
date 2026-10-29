@@ -1,11 +1,11 @@
-//! A timer call dropped at any await point leaves no hold behind, and its
-//! stored row stays loadable.
+//! A timer call dropped at any await point leaves memory that covers its rows
+//! and nothing more, and its stored row stays loadable.
 
-use super::{SLAB_SECONDS, Store, past, seeded_store, slab_id};
+use super::{SLAB_SECONDS, Store, listed, past, seeded_store, slab_id};
 use crate::Key;
 use crate::consumer::Uncommitted;
 use crate::consumer::partition::ShutdownPhase;
-use crate::timers::active::{Queued, TimerState};
+use crate::timers::active::{Insert, Listed};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::manager::TimerManagerError;
@@ -33,20 +33,28 @@ const BACKLOGS: [usize; 3] = [0, 1, 64];
 type Manager = TimerManager<Store>;
 
 /// Drops a [`Victim`] call after `polls` polls, with `backlog` choosing how
-/// many earlier schedules wait in the command channel. A `due` victim lands in
-/// a slab that the actor owns from the start, and a stored one must fire.
+/// many earlier schedules wait in the command channel. A [`Followup`] then
+/// runs before the actor reads the dropped call's last command. A `due` victim
+/// lands in a slab that the actor owns from the start, and a stored one must
+/// fire.
 #[test]
 fn prop_dropped_call_keeps_rows_loadable() {
-    fn property(victim: Victim, backlog: u8, polls: u8, due: bool) -> Result<()> {
+    fn property(
+        victim: Victim,
+        followup: Followup,
+        backlog: u8,
+        polls: u8,
+        due: bool,
+    ) -> Result<()> {
         Builder::new_current_thread()
             .enable_all()
             .build()?
-            .block_on(run(victim, backlog, polls, due))
+            .block_on(run(victim, followup, backlog, polls, due))
     }
-    QuickCheck::new().quickcheck(property as fn(Victim, u8, u8, bool) -> Result<()>);
+    QuickCheck::new().quickcheck(property as fn(Victim, Followup, u8, u8, bool) -> Result<()>);
 }
 
-async fn run(victim: Victim, backlog: u8, polls: u8, due: bool) -> Result<()> {
+async fn run(victim: Victim, followup: Followup, backlog: u8, polls: u8, due: bool) -> Result<()> {
     let (store, now) = seeded_store(due).await?;
     let (stream, manager, _shutdown) =
         setup_timer_manager_with_store(store.clone(), ShutdownPhase::default()).await?;
@@ -75,15 +83,23 @@ async fn run(victim: Victim, backlog: u8, polls: u8, due: bool) -> Result<()> {
         ensure!(pending, "a filler finished before the actor ran");
     }
 
+    // The actor runs between polls. An even `polls` drops the call before the
+    // actor reads its last command.
     let mut call = Box::pin(victim.call(&manager, victim_time, time));
-    for _ in 0..polls % 4 {
+    for poll in 0..polls / 2 % 4 {
+        if poll > 0 {
+            yield_now().await;
+        }
         if let Poll::Ready(result) = unconstrained(async { poll!(call.as_mut()) }).await {
             result?;
             break;
         }
+    }
+    if polls % 2 == 1 {
         yield_now().await;
     }
     drop(call);
+    followup.call(&manager, victim_time).await?;
 
     // Commands are FIFO, so the barrier returns after every earlier command.
     try_join_all(fillers).await?;
@@ -102,21 +118,34 @@ async fn run(victim: Victim, backlog: u8, polls: u8, due: bool) -> Result<()> {
         rows.is_empty() || !registered.is_empty(),
         "a dropped call left its row in unregistered slab {slab_id}"
     );
-    let entry = manager
-        .0
-        .scheduler
-        .active_triggers()
-        .get(&Key::from("victim"), victim_time, TimerType::Application)
-        .await;
+    // Only a stored victim in an owned slab has an entry: the fillers and the
+    // barrier sit in an unowned slab, and a load reads them later.
+    let key = Key::from("victim");
+    let entries = manager.snapshot().await?.active;
     ensure!(
-        entry.is_none_or(|entry| entry.state != TimerState::Aborted),
-        "a dropped call left its hold"
+        entries == u32::from(due && !rows.is_empty()),
+        "memory holds {entries} entries for {} victim rows",
+        rows.len()
     );
+    match followup {
+        Followup::None => {}
+        Followup::Schedule => ensure!(!rows.is_empty(), "the later schedule left no row"),
+        Followup::UnscheduleAll => {
+            for at in [victim_time, time] {
+                let listed = listed(&manager, &key, at, TimerType::Application).await?;
+                ensure!(
+                    !matches!(listed, Some(Listed::Waits | Listed::Firing { again: true })),
+                    "unschedule_all left a waiting victim"
+                );
+            }
+        }
+    }
 
     if due && !rows.is_empty() {
+        let listed = listed(&manager, &key, victim_time, TimerType::Application).await?;
         ensure!(
-            entry.is_some(),
-            "a stored victim in an owned slab left memory"
+            listed == Some(Listed::Waits),
+            "a stored victim in an owned slab does not wait"
         );
         let pending = timeout(Duration::from_secs(10), stream.next())
             .await?
@@ -154,11 +183,7 @@ async fn dropped_reschedule_of_a_firing_timer_fires_after_commit() -> Result<()>
 
     let replacement = trigger("victim", time);
     let written = Cell::new(false);
-    let mut call = Box::pin(manager.0.scheduler.insert(
-        replacement.clone(),
-        Queued::FiringRescheduled,
-        write_row(&manager, &replacement, false, &written),
-    ));
+    let mut call = Box::pin(insert(&manager, replacement.clone(), false, &written));
     while !written.get() {
         let polled = unconstrained(async { poll!(call.as_mut()) }).await;
         ensure!(
@@ -189,6 +214,35 @@ async fn dropped_reschedule_of_a_firing_timer_fires_after_commit() -> Result<()>
         "the replacement did not fire"
     );
     Ok(())
+}
+
+/// A call on the victim's key that runs right after the drop.
+#[derive(Clone, Copy, Debug, VariantArray)]
+enum Followup {
+    None,
+    /// Schedules the victim again, which must store its row.
+    Schedule,
+    /// Must leave no queued victim.
+    UnscheduleAll,
+}
+
+impl Arbitrary for Followup {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self::VARIANTS[usize::from(u8::arbitrary(g)) % Self::VARIANTS.len()]
+    }
+}
+
+impl Followup {
+    async fn call(self, manager: &Manager, time: CompactDateTime) -> Result<()> {
+        match self {
+            Self::None => Ok(()),
+            Self::Schedule => schedule(manager, "victim", time, false).await,
+            Self::UnscheduleAll => {
+                let key = Key::from("victim");
+                Ok(manager.unschedule_all(&key, TimerType::Application).await?)
+            }
+        }
+    }
 }
 
 /// The call that the property drops.
@@ -245,14 +299,8 @@ impl Victim {
             Self::PendingWrite => false,
             Self::FailedWrite => true,
         };
-        let trigger = trigger("victim", time);
         let written = Cell::new(false);
-        let write = write_row(manager, &trigger, fails, &written);
-        let result = manager
-            .0
-            .scheduler
-            .insert(trigger.clone(), Queued::Scheduled, write)
-            .await;
+        let result = insert(manager, trigger("victim", time), fails, &written).await;
         ensure!(result.is_err() == fails, "the write outcome was lost");
         Ok(())
     }
@@ -266,6 +314,24 @@ fn trigger(key: &str, time: CompactDateTime) -> Trigger {
         Span::current(),
     )
     .into_trigger()
+}
+
+/// Schedules `trigger` through the scheduler, with [`write_row`] as its row
+/// write.
+async fn insert(
+    manager: &Manager,
+    trigger: Trigger,
+    fails: bool,
+    written: &Cell<bool>,
+) -> Result<(), TimerManagerError<<Store as TriggerStore>::Error>> {
+    let (trigger, ticket) = manager
+        .0
+        .scheduler
+        .insert(trigger, Insert::Schedule)
+        .await?;
+    ticket
+        .run(write_row(manager, &trigger, fails, written))
+        .await
 }
 
 /// Stores the row of `trigger`, sets `written`, and then fails or stays
@@ -303,4 +369,13 @@ async fn schedule(manager: &Manager, key: &str, time: CompactDateTime, clear: bo
         manager.schedule(request).await?;
     }
     Ok(())
+}
+
+/// Inputs that `prop_dropped_call_keeps_rows_loadable` found.
+#[tokio::test]
+async fn dropped_call_regressions() -> Result<()> {
+    // A replacement dropped after its write left the replaced timer queued.
+    run(Victim::Replace, Followup::UnscheduleAll, 0, 5, true).await?;
+    // A schedule trusted an entry that a dropped unschedule then removed.
+    run(Victim::Unschedule, Followup::Schedule, 0, 2, true).await
 }

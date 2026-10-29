@@ -3,6 +3,7 @@ use crate::Topic;
 use crate::consumer::Uncommitted;
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
+use crate::timers::active::Listed;
 use crate::timers::duration::CompactDuration;
 use crate::timers::scheduler::TimerSchedulerError;
 use crate::timers::slab::{Slab, SlabId};
@@ -61,6 +62,19 @@ fn slab_id(time: CompactDateTime) -> SlabId {
     Slab::from_time(CompactDuration::new(SLAB_SECONDS), time).id()
 }
 
+/// How the scheduler of `manager` lists the timer at `time`.
+async fn listed(
+    manager: &TimerManager<Store>,
+    key: &Key,
+    time: CompactDateTime,
+    timer_type: TimerType,
+) -> Result<Option<Listed>> {
+    let listed = manager.0.scheduler.list(key.clone(), timer_type).await?;
+    Ok(listed
+        .into_iter()
+        .find_map(|(at, listed)| (at == time).then_some(listed)))
+}
+
 /// Helper: count scheduled times for a key and timer type
 async fn count_scheduled<T: TriggerStore>(
     manager: &TimerManager<T>,
@@ -79,7 +93,9 @@ where
     S: Stream<Item = PendingTimer<T>> + Unpin,
     T: TriggerStore,
 {
-    let pending = stream.next().await.ok_or_else(|| eyre!("{msg}"))?;
+    let pending = timeout(Duration::from_secs(10), stream.next())
+        .await?
+        .ok_or_else(|| eyre!("{msg}"))?;
     let firing = pending
         .fire()
         .await
@@ -416,9 +432,8 @@ async fn test_fire_cancelled_timer() -> Result<()> {
     task::yield_now().await;
 
     // Get the pending timer from stream (timer has been delivered)
-    let pending = stream
-        .next()
-        .await
+    let pending = timeout(Duration::from_secs(10), stream.next())
+        .await?
         .ok_or_else(|| eyre!("Expected a pending timer"))?;
 
     // Unschedule the timer AFTER delivery but BEFORE calling fire()

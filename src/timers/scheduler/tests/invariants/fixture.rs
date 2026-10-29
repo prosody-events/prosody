@@ -1,20 +1,21 @@
 //! The fixture that applies each [`Op`] to the actor and to the model.
 
-use super::super::{SLAB_SIZE_SECS, TestStore, fresh_state, start_state};
+use super::super::support::{Actor, TestStore};
+use super::super::{SLAB_SIZE_SECS, fresh_state, start_state};
 use super::checks::{assert_past_watermark_pull, check_cleanup_effects};
-use super::{ModelActiveState, Op, Stop, TriggerModel, TriggerModels, TriggerSpec, build_universe};
+use super::{Op, Stop, TriggerModel, TriggerModels, TriggerSpec, build_universe};
 use crate::Key;
-use crate::timers::active::{Queued, Row, TimerState};
+use crate::timers::active::Insert;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::queue::TriggerQueue;
 use crate::timers::scheduler::actor::load::load_step;
-use crate::timers::scheduler::actor::{ActorState, handle_add, handle_hold, owns_slab, release};
+use crate::timers::scheduler::actor::owns_slab;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::memory::memory_store;
 use crate::timers::store::{Segment, TriggerStore};
+use crate::timers::test_support::Memory;
 use crate::timers::test_support::test_segment;
-use crate::timers::{TimerType, Trigger};
+use crate::timers::{TimerType, Trigger, TriggerId};
 use std::result::Result as StdResult;
 use tracing::Span;
 
@@ -22,12 +23,9 @@ use tracing::Span;
 pub(super) struct Fixture {
     pub(super) store: TestStore,
     pub(super) segment: Segment,
-    pub(super) state: ActorState<TestStore>,
-    pub(super) triggers: TriggerQueue,
+    pub(super) actor: Actor,
     /// Authoritative per-trigger model.
     pub(super) expected: TriggerModels,
-    /// Gives each add command a distinct input tag.
-    next_tag: i32,
     /// Anchored at construction so all ops within one iteration use a
     /// stable `now_slab_id` regardless of wall-clock drift.
     now_slab: SlabId,
@@ -47,20 +45,14 @@ impl Fixture {
 
         let now = CompactDateTime::now().map_err(|e| format!("wall-clock now: {e:?}"))?;
         let now_slab = Slab::from_time(segment.slab_size, now).id();
-
-        let universe = build_universe(now_slab);
-
-        let state = fresh_state(store.clone(), segment.clone());
-        let triggers = TriggerQueue::new();
+        let actor = Actor::new(fresh_state(store.clone(), segment.clone()));
         Ok(Self {
             store,
             segment,
-            state,
-            triggers,
+            actor,
             expected: TriggerModels::default(),
-            next_tag: 0,
             now_slab,
-            universe,
+            universe: build_universe(now_slab),
         })
     }
 
@@ -68,10 +60,10 @@ impl Fixture {
         match op {
             Op::Schedule(spec, stop) => self.apply_schedule(spec, stop).await,
             Op::Unschedule(spec) => self.apply_unschedule(spec).await,
-            Op::Fire(spec) => self.apply_fire(spec).await,
+            Op::Fire => self.apply_fire().await,
             Op::Abort(spec) => self.apply_abort(spec).await,
             Op::LoadStep => {
-                load_step(&mut self.state, &mut self.triggers).await;
+                load_step(&mut self.actor.state, &mut self.actor.timers).await;
                 self.reconcile_loaded_models();
                 Ok(())
             }
@@ -82,51 +74,48 @@ impl Fixture {
 
     async fn apply_schedule(&mut self, spec: TriggerSpec, stop: Stop) -> StdResult<(), String> {
         let (key, time, ty) = spec.resolve(self.now_slab);
-        self.next_tag += 1_i32;
-        let trigger = Trigger::with_tag(key.clone(), time, ty, self.next_tag, Span::current());
         let mut model = self.model_for(&key, time, ty);
-
         let slab_id = Slab::from_time(self.segment.slab_size, time).id();
-        let past_unregistered = self
-            .state
-            .last_persisted_watermark
-            .is_some_and(|w| slab_id <= w)
-            && !self.state.known_slab_ids.contains(&slab_id);
-        let old_watermark = self.state.last_persisted_watermark;
+        let state = &self.actor.state;
+        let past_unregistered = state.last_persisted_watermark.is_some_and(|w| slab_id <= w)
+            && !state.known_slab_ids.contains(&slab_id);
+        let old_watermark = state.last_persisted_watermark;
 
-        handle_hold(&mut self.state, &self.triggers, trigger.clone())
+        let trigger = Trigger::new(key.clone(), time, ty, Span::current());
+        let scheduler = self.actor.scheduler();
+        let (trigger, ticket) = self
+            .actor
+            .serve(scheduler.insert(trigger, Insert::Schedule))
             .await
-            .map_err(|e| format!("handle_hold: {e:?}"))?;
+            .map_err(|e| format!("insert: {e:?}"))?;
         if past_unregistered {
-            assert_past_watermark_pull(self, &key, time, ty, slab_id, old_watermark).await?;
+            assert_past_watermark_pull(self, slab_id, old_watermark)?;
         }
-        if stop == Stop::BeforeWrite {
-            release(&self.triggers, &trigger).await;
-            return Ok(());
+        match stop {
+            Stop::BeforeWrite => drop(ticket),
+            Stop::Never | Stop::AfterWrite | Stop::FailedWrite => {
+                let write = async {
+                    if stop != Stop::FailedWrite {
+                        let Ok(()) = self.store.add_trigger(trigger).await;
+                    }
+                    if stop == Stop::Never {
+                        Ok(())
+                    } else {
+                        Err(format!("the write of a {stop:?} schedule stops"))
+                    }
+                };
+                // The error of a stopped write is the point of the op.
+                let _ = ticket.run(write).await;
+                model.in_store |= stop != Stop::FailedWrite;
+                let owned = owns_slab(&self.actor.state, slab_id);
+                model.memory = match model.memory {
+                    Some(Memory::Firing { .. }) => Some(Memory::Firing { again: true }),
+                    None if !owned => None,
+                    Some(Memory::Waits | Memory::Kept) | None => Some(Memory::Waits),
+                };
+            }
         }
-
-        if stop != Stop::FailedWrite {
-            self.store
-                .add_trigger(trigger.clone())
-                .await
-                .map_err(|e| format!("add_trigger: {e:?}"))?;
-            model.in_store = true;
-        }
-        let row = if stop == Stop::Never {
-            Row::Written
-        } else {
-            Row::Unconfirmed
-        };
-        let in_memory = owns_slab(&self.state, slab_id) || model.active_state.is_some();
-        handle_add(
-            &self.state,
-            &mut self.triggers,
-            trigger,
-            Queued::Scheduled,
-            row,
-        )
-        .await;
-        model.active_state = in_memory.then_some(ModelActiveState::Scheduled(row));
+        self.actor.drain().await;
 
         self.set_model(key, time, ty, model);
         Ok(())
@@ -134,76 +123,53 @@ impl Fixture {
 
     async fn apply_unschedule(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
         let (key, time, ty) = spec.resolve(self.now_slab);
-        self.store
-            .remove_trigger(&key, time, ty)
+        let mut model = self.model_for(&key, time, ty);
+        let scheduler = self.actor.scheduler();
+        let started = self
+            .actor
+            .serve(scheduler.unschedule(id(&key, time, ty)))
             .await
-            .map_err(|e| format!("remove_trigger: {e:?}"))?;
-        let trigger = Trigger::new(key.clone(), time, ty, Span::current());
-        self.triggers.remove(&trigger).await;
-        self.set_model(
-            key,
-            time,
-            ty,
-            TriggerModel {
-                in_store: false,
-                active_state: None,
-            },
-        );
+            .map_err(|e| format!("unschedule: {e:?}"))?;
+        if let Some(ticket) = started {
+            ticket
+                .run(self.store.remove_trigger(&key, time, ty))
+                .await
+                .map_err(|e| format!("remove_trigger: {e:?}"))?;
+            model = TriggerModel::default();
+        } else {
+            model.memory = Some(Memory::Firing { again: false });
+        }
+        self.actor.drain().await;
+        self.set_model(key, time, ty, model);
         Ok(())
     }
 
-    async fn apply_fire(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
-        let (key, time, ty) = spec.resolve(self.now_slab);
-        if !matches!(
-            self.triggers
-                .active_triggers()
-                .get(&key, time, ty)
-                .await
-                .map(|entry| entry.state),
-            Some(TimerState::Scheduled)
-        ) {
+    async fn apply_fire(&mut self) -> StdResult<(), String> {
+        let Some(trigger) = self.actor.timers.next().await else {
             return Ok(());
+        };
+        if !self.actor.timers.fire(&trigger) {
+            return Err(format!(
+                "the attempt that left the queue did not fire: {trigger:?}"
+            ));
         }
-
-        let trigger = Trigger::new(key.clone(), time, ty, Span::current());
-        self.triggers.remove_queue_only(&trigger);
-        self.triggers
-            .active_triggers()
-            .set_state(&key, time, ty, TimerState::Firing)
-            .await;
+        let (key, time, ty) = (trigger.key, trigger.time, trigger.timer_type);
         let mut model = self.model_for(&key, time, ty);
-        model.active_state = Some(ModelActiveState::Firing);
+        model.memory = Some(Memory::Firing { again: false });
         self.set_model(key, time, ty, model);
         Ok(())
     }
 
     async fn apply_abort(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
         let (key, time, ty) = spec.resolve(self.now_slab);
-        // Only queued and firing timers are abortable; a queued timer also
-        // has a `DelayQueue` entry that needs explicit removal.
-        let needs_dequeue = match self
-            .triggers
-            .active_triggers()
-            .get(&key, time, ty)
-            .await
-            .map(|entry| entry.state)
-        {
-            Some(TimerState::Scheduled) => true,
-            Some(TimerState::Firing) => false,
-            Some(TimerState::Aborted | TimerState::FiringRescheduled) | None => return Ok(()),
-        };
-
-        self.triggers
-            .active_triggers()
-            .set_state(&key, time, ty, TimerState::Aborted)
-            .await;
-        if needs_dequeue {
-            let trigger = Trigger::new(key.clone(), time, ty, Span::current());
-            self.triggers.remove_queue_only(&trigger);
-        }
-
+        self.actor.scheduler().abort(id(&key, time, ty));
+        self.actor.drain().await;
         let mut model = self.model_for(&key, time, ty);
-        model.active_state = Some(ModelActiveState::Aborted);
+        model.memory = match model.memory {
+            Some(Memory::Firing { again: true }) => Some(Memory::Waits),
+            Some(_) => Some(Memory::Kept),
+            None => None,
+        };
         self.set_model(key, time, ty, model);
         Ok(())
     }
@@ -219,10 +185,9 @@ impl Fixture {
         }
         let Ok(segment) = self.store.get_segment().await;
         let segment = segment.ok_or("restart: segment missing")?;
-        self.state = start_state(self.store.clone(), segment, now);
-        self.triggers = TriggerQueue::new();
+        self.actor = Actor::new(start_state(self.store.clone(), segment, now));
         for model in self.expected.values_mut() {
-            model.active_state = None;
+            model.memory = None;
         }
         Ok(())
     }
@@ -249,7 +214,7 @@ impl Fixture {
 
     fn set_model(&mut self, key: Key, time: CompactDateTime, ty: TimerType, model: TriggerModel) {
         let triple = (key, time, ty);
-        if model.in_store || model.active_state.is_some() {
+        if model.in_store || model.memory.is_some() {
             self.expected.insert(triple, model);
         } else {
             self.expected.remove(&triple);
@@ -259,16 +224,23 @@ impl Fixture {
     fn reconcile_loaded_models(&mut self) {
         for (key, time, ty) in &self.universe {
             let slab_id = Slab::from_time(self.segment.slab_size, *time).id();
-            if !owns_slab(&self.state, slab_id) {
+            if !owns_slab(&self.actor.state, slab_id) {
                 continue;
             }
-            let triple = (key.clone(), *time, *ty);
-            if let Some(model) = self.expected.get_mut(&triple)
+            if let Some(model) = self.expected.get_mut(&(key.clone(), *time, *ty))
                 && model.in_store
-                && model.active_state.is_none()
+                && model.memory.is_none()
             {
-                model.active_state = Some(ModelActiveState::Scheduled(Row::Written));
+                model.memory = Some(Memory::Waits);
             }
         }
+    }
+}
+
+fn id(key: &Key, time: CompactDateTime, timer_type: TimerType) -> TriggerId {
+    TriggerId {
+        key: key.clone(),
+        time,
+        timer_type,
     }
 }

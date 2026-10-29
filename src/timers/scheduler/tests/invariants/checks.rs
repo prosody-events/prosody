@@ -1,58 +1,52 @@
 //! The invariant checks that run after each op.
 
 use super::super::persisted_watermark;
-use super::ModelActiveState;
 use super::fixture::Fixture;
-use crate::Key;
-use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::scheduler::actor::load::{cleanup_step, collect_active_slab_ids};
+use crate::timers::scheduler::actor::load::cleanup_step;
 use crate::timers::scheduler::actor::owns_slab;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::TriggerStore;
+use crate::timers::test_support::Memory;
 use futures::TryStreamExt;
 use std::collections::BTreeSet;
 use std::result::Result as StdResult;
 
 /// Verifies that the BATCH-driven past-watermark insert lowered the
 /// watermark to `slab_id - 1`, preserved ownership through the prior
-/// watermark, and landed the trigger in `ActiveTriggers`.
-pub(super) async fn assert_past_watermark_pull(
+/// watermark, and kept an entry in the slab during the write.
+pub(super) fn assert_past_watermark_pull(
     fixture: &Fixture,
-    key: &Key,
-    time: CompactDateTime,
-    ty: TimerType,
     slab_id: SlabId,
     old_watermark: Option<SlabId>,
 ) -> StdResult<(), String> {
+    let state = &fixture.actor.state;
     let expected_watermark = slab_id.checked_sub(1);
-    if fixture.state.last_persisted_watermark != expected_watermark {
+    if state.last_persisted_watermark != expected_watermark {
         return Err(format!(
             "past-watermark schedule: expected watermark {expected_watermark:?}, got {:?}",
-            fixture.state.last_persisted_watermark
+            state.last_persisted_watermark
         ));
     }
     if let Some(old_watermark) = old_watermark
-        && fixture
-            .state
+        && state
             .highest_loaded_slab_id
             .is_none_or(|h| h < old_watermark)
     {
         return Err(format!(
             "past-watermark schedule: highest_loaded_slab_id {:?} did not preserve ownership \
              through old watermark {old_watermark}",
-            fixture.state.highest_loaded_slab_id
+            state.highest_loaded_slab_id
         ));
     }
-    if fixture
-        .triggers
-        .active_triggers()
-        .get(key, time, ty)
-        .await
-        .is_none()
+    if !fixture
+        .actor
+        .timers
+        .slabs(fixture.segment.slab_size)
+        .contains(&slab_id)
     {
         return Err(format!(
-            "past-watermark schedule: trigger ({key}, {time:?}, {ty:?}) was not active"
+            "past-watermark schedule: slab {slab_id} has no entry"
         ));
     }
     Ok(())
@@ -62,25 +56,26 @@ pub(super) async fn assert_past_watermark_pull(
 /// properties that keep slab metadata and the watermark from getting
 /// pinned behind empty rows.
 pub(super) async fn check_cleanup_effects(fixture: &mut Fixture) -> StdResult<(), String> {
-    let before_active = collect_active_slab_ids(fixture.segment.slab_size, &fixture.triggers).await;
+    let before_active = fixture.actor.timers.slabs(fixture.segment.slab_size);
     let before_store_slabs: BTreeSet<SlabId> = fixture
         .store
         .get_slab_range(0..=SlabId::MAX)
         .try_collect()
         .await
         .map_err(|e| format!("get_slab_range before cleanup: {e:?}"))?;
-    let before_watermark = fixture.state.last_persisted_watermark;
+    let before_watermark = fixture.actor.state.last_persisted_watermark;
 
     let now_slab = fixture.current_slab();
 
     let expected_deletes = cleanup_candidates_for_test(
-        fixture.state.highest_loaded_slab_id,
+        fixture.actor.state.highest_loaded_slab_id,
         now_slab,
         &before_active,
         &before_store_slabs,
     );
 
-    cleanup_step(&mut fixture.state, &fixture.triggers).await;
+    let actor = &mut fixture.actor;
+    cleanup_step(&mut actor.state, &actor.timers).await;
 
     let after_store_slabs: BTreeSet<SlabId> = fixture
         .store
@@ -115,7 +110,7 @@ pub(super) async fn check_cleanup_effects(fixture: &mut Fixture) -> StdResult<()
     }
 
     for ((key, time, ty), model) in &fixture.expected {
-        if model.in_store && model.active_state.is_some() {
+        if model.in_store && model.memory.is_some() {
             let slab_id = Slab::from_time(fixture.segment.slab_size, *time).id();
             if !after_store_slabs.contains(&slab_id) {
                 return Err(format!(
@@ -128,14 +123,14 @@ pub(super) async fn check_cleanup_effects(fixture: &mut Fixture) -> StdResult<()
 
     let expected_watermark = expected_watermark_after_cleanup_for_test(
         before_watermark,
-        fixture.state.highest_loaded_slab_id,
+        fixture.actor.state.highest_loaded_slab_id,
         now_slab,
         &before_active,
     );
-    if fixture.state.last_persisted_watermark != expected_watermark {
+    if fixture.actor.state.last_persisted_watermark != expected_watermark {
         return Err(format!(
             "watermark progress: expected {expected_watermark:?}, got {:?}",
-            fixture.state.last_persisted_watermark
+            fixture.actor.state.last_persisted_watermark
         ));
     }
 
@@ -144,7 +139,7 @@ pub(super) async fn check_cleanup_effects(fixture: &mut Fixture) -> StdResult<()
 
 pub(super) async fn check_invariants(fixture: &Fixture) -> StdResult<(), String> {
     // P3: every slab clustering row sits above the persisted watermark.
-    let watermark = fixture.state.last_persisted_watermark;
+    let watermark = fixture.actor.state.last_persisted_watermark;
     let store_slabs: BTreeSet<SlabId> = fixture
         .store
         .get_slab_range(0..=SlabId::MAX)
@@ -170,10 +165,9 @@ pub(super) async fn check_invariants(fixture: &Fixture) -> StdResult<(), String>
         ));
     }
 
-    // P1 + P2: walk the entire generator universe so we verify both
-    // directions (every triple's actual state matches the expected
-    // state derived from `expected` + loaded numeric range).
-
+    // P1 + P2: walk the whole generator universe, so both directions of
+    // the parity hold.
+    let timers = &fixture.actor.timers;
     for (key, time, ty) in &fixture.universe {
         let expected = fixture.model_for(key, *time, *ty);
         let slab_id = Slab::from_time(fixture.segment.slab_size, *time).id();
@@ -199,25 +193,39 @@ pub(super) async fn check_invariants(fixture: &Fixture) -> StdResult<(), String>
             ));
         }
 
-        // ActiveTriggers state: owned stored timers are active unless they
-        // have not yet been loaded after a restart.
-        let actual_entry = fixture
-            .triggers
-            .active_triggers()
-            .get(key, *time, *ty)
-            .await;
-        let owned = owns_slab(&fixture.state, slab_id);
-        let actual_model_state = actual_entry.map(ModelActiveState::from_entry).transpose()?;
-        if actual_model_state != expected.active_state {
+        let listed = timers
+            .list(key, *ty)
+            .into_iter()
+            .find_map(|(at, listed)| (at == *time).then_some(listed));
+        let owned = owns_slab(&fixture.actor.state, slab_id);
+        if listed != expected.memory.and_then(Memory::listed) {
             return Err(format!(
-                "Active mismatch for ({key}, {time:?}, {ty:?}): active={actual_model_state:?} \
-                 expected={:?} (in_store={}, owned={owned})",
-                expected.active_state, expected.in_store
+                "memory mismatch for ({key}, {time:?}, {ty:?}): listed={listed:?} expected={:?} \
+                 (in_store={}, owned={owned})",
+                expected.memory, expected.in_store
             ));
         }
-        if expected.in_store && owned && expected.active_state.is_none() {
+        if expected.in_store && owned && expected.memory.is_none() {
             return Err(format!(
-                "Model mismatch for ({key}, {time:?}, {ty:?}): owned stored timer is not active"
+                "model mismatch for ({key}, {time:?}, {ty:?}): owned stored timer has no entry"
+            ));
+        }
+    }
+
+    // Kept entries list nothing, so the count of entries checks them.
+    let held = fixture
+        .expected
+        .values()
+        .filter(|model| model.memory.is_some());
+    let entries = usize::try_from(timers.snapshot(CompactDateTime::MIN).active)
+        .map_err(|e| format!("entry count: {e}"))?;
+    if entries != held.count() {
+        return Err(format!("memory holds {entries} entries, not the model's"));
+    }
+    for slab_id in timers.slabs(fixture.segment.slab_size) {
+        if !owns_slab(&fixture.actor.state, slab_id) {
+            return Err(format!(
+                "P2: memory holds a timer in unowned slab {slab_id}"
             ));
         }
     }

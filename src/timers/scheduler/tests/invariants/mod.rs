@@ -1,13 +1,13 @@
 //! Property test (`prop_scheduler_invariants`) for the scheduler actor.
 //!
-//! Drives random sequences of scheduler ops against the actor's handlers
-//! and checks these invariants after every op:
+//! Drives random sequences of scheduler ops through the actor's commands and
+//! checks these invariants after every op:
 //!
-//!   P1 (owned↔DB parity): every `(key, time, type)` in the loaded numeric
-//!       range is in `ActiveTriggers` iff it's currently in the DB, except a
-//!       timer with an unconfirmed row whose write failed.
-//!   P2 (pending = store-only): triggers for slabs outside the owned range
-//!       never land in `ActiveTriggers`.
+//!   P1 (owned↔DB parity): memory holds every `(key, time, type)` in the
+//!       loaded numeric range that is in the DB, except a timer whose row
+//!       write failed, which memory still holds.
+//!   P2 (pending = store-only): memory holds no timer in a slab outside the
+//!       owned range.
 //!   P3 (watermark I1): every slab clustering row sits strictly above
 //!       `last_persisted_watermark`.
 //!   P4 (cleanup safety): cleanup never deletes
@@ -23,7 +23,8 @@
 //!       the watermark lowers the watermark, preserves compact ownership, and
 //!       activates the trigger.
 //!   P8 (settled schedules): every stored trigger sits in a registered slab,
-//!       and a schedule that stops early leaves no hold behind.
+//!       and a schedule that stops early leaves no entry for a row that does
+//!       not exist.
 
 mod checks;
 mod fixture;
@@ -31,9 +32,9 @@ mod fixture;
 use super::SLAB_SIZE_SECS;
 use crate::Key;
 use crate::timers::TimerType;
-use crate::timers::active::{ActiveTriggerEntry, Row, TimerState};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::slab::SlabId;
+use crate::timers::test_support::Memory;
 use ahash::HashMap;
 use checks::check_invariants;
 use fixture::Fixture;
@@ -56,7 +57,8 @@ const PROP_FUTURE_SLABS: i32 = 5;
 enum Op {
     Schedule(TriggerSpec, Stop),
     Unschedule(TriggerSpec),
-    Fire(TriggerSpec),
+    /// Fires the attempt that leaves the queue next.
+    Fire,
     Abort(TriggerSpec),
     LoadStep,
     CleanupStep,
@@ -67,9 +69,9 @@ enum Op {
     },
 }
 
-/// How a schedule ends. A manager call dropped before its row write releases
-/// its hold. One dropped during the write, or whose write fails, queues a
-/// timer with an unconfirmed row.
+/// How a schedule ends. A call dropped before its row write leaves memory as
+/// it was. One dropped during the write, or whose write fails, queues the
+/// timer whether the row exists or not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stop {
     Never,
@@ -137,7 +139,7 @@ impl Arbitrary for Op {
         match u8::arbitrary(g) % 12 {
             0..=3 => Self::Schedule(TriggerSpec::arbitrary(g), Stop::arbitrary(g)),
             4..=5 => Self::Unschedule(TriggerSpec::arbitrary(g)),
-            6 => Self::Fire(TriggerSpec::arbitrary(g)),
+            6 => Self::Fire,
             7 => Self::Abort(TriggerSpec::arbitrary(g)),
             8..=9 => Self::LoadStep,
             10 => Self::CleanupStep,
@@ -160,38 +162,18 @@ impl Arbitrary for OpSequence {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ModelActiveState {
-    Scheduled(Row),
-    Firing,
-    Aborted,
-}
-
-impl ModelActiveState {
-    fn from_entry(entry: ActiveTriggerEntry) -> StdResult<Self, String> {
-        match entry.state {
-            TimerState::Scheduled => Ok(Self::Scheduled(entry.row)),
-            TimerState::Firing => Ok(Self::Firing),
-            TimerState::Aborted => Ok(Self::Aborted),
-            TimerState::FiringRescheduled => {
-                Err("property model does not create FiringRescheduled timers".to_owned())
-            }
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct TriggerModel {
     in_store: bool,
-    active_state: Option<ModelActiveState>,
+    memory: Option<Memory>,
 }
 
-/// Per-trigger model for persistent membership plus in-memory lifecycle state.
+/// Per-trigger model of the stored row and of memory.
 type TriggerModels = HashMap<(Key, CompactDateTime, TimerType), TriggerModel>;
 
 /// Enumerates every `(key, time, type)` that the generator can produce
 /// given `now_slab`. Used to drive an exhaustive per-triple check after
-/// every op without needing to iterate `ActiveTriggers`' internal map.
+/// every op.
 fn build_universe(now_slab: SlabId) -> Vec<(Key, CompactDateTime, TimerType)> {
     let mut out = Vec::with_capacity(usize::from(PROP_KEYS) * 11 * TimerType::VARIANTS.len());
     for key_idx in 0..PROP_KEYS {
@@ -217,7 +199,7 @@ async fn run_property(ops: Vec<Op>) -> StdResult<(), String> {
     let prefix = [
         Op::Schedule(same, Stop::Never),
         Op::LoadStep,
-        Op::Fire(same),
+        Op::Fire,
         Op::Schedule(same, Stop::Never),
         Op::Abort(same),
         Op::Schedule(same, Stop::BeforeWrite),

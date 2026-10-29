@@ -6,9 +6,9 @@
 
 use super::ActorState;
 use crate::timers::DELETE_CONCURRENCY;
+use crate::timers::active::Timers;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::queue::TriggerQueue;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::TriggerStore;
 use futures::{StreamExt, TryStreamExt, stream};
@@ -40,7 +40,7 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// Cleanup is load-driven: a successful `load_step` calls this after moving
 /// the load high-water. If a delete fails, in-memory bookkeeping is left
 /// untouched and a later load will retry.
-pub(crate) async fn cleanup_step<T>(state: &mut ActorState<T>, triggers: &TriggerQueue)
+pub(crate) async fn cleanup_step<T>(state: &mut ActorState<T>, timers: &Timers)
 where
     T: TriggerStore,
 {
@@ -52,7 +52,7 @@ where
         }
     };
 
-    let active_slab_ids = collect_active_slab_ids(state.segment.slab_size, triggers).await;
+    let active_slab_ids = timers.slabs(state.segment.slab_size);
     let completed_slabs = completed_slab_ids(state, now_slab_id, &active_slab_ids);
 
     match delete_completed_slabs(&state.store, &completed_slabs).await {
@@ -156,7 +156,7 @@ where
 /// This is the actor's only slab-table read path after startup. Cleanup and
 /// watermark advancement consume the slab IDs learned here rather than
 /// re-scanning metadata.
-pub(crate) async fn load_step<T>(state: &mut ActorState<T>, triggers: &mut TriggerQueue)
+pub(crate) async fn load_step<T>(state: &mut ActorState<T>, timers: &mut Timers)
 where
     T: TriggerStore,
 {
@@ -195,7 +195,7 @@ where
     let load_result = drain_slab_range(
         &state.store,
         start_slab_id..=target_slab_id,
-        triggers,
+        timers,
         &mut state.known_slab_ids,
     )
     .await;
@@ -210,7 +210,7 @@ where
                 "load_step: loaded range"
             );
             schedule_next_load(state, &target_slab);
-            cleanup_step(state, triggers).await;
+            cleanup_step(state, timers).await;
         }
         Err(e) => {
             warn!(
@@ -230,7 +230,7 @@ where
 pub(crate) async fn drain_slab_range<T>(
     store: &T,
     range: RangeInclusive<SlabId>,
-    triggers: &mut TriggerQueue,
+    timers: &mut Timers,
     known_slab_ids: &mut BTreeSet<SlabId>,
 ) -> Result<usize, T::Error>
 where
@@ -255,7 +255,7 @@ where
     while let Some((slab_id, slab_triggers)) = cooperative(stream.try_next()).await? {
         known_slab_ids.insert(slab_id);
         for trigger in slab_triggers {
-            triggers.insert(trigger).await;
+            timers.load(trigger);
             count = count.saturating_add(1);
         }
     }
@@ -285,22 +285,6 @@ fn schedule_next_load<T>(state: &mut ActorState<T>, target_slab: &Slab) {
     let wait = calculate_wait_time(next_slab.range().start, state.preload_window);
     state.next_load_at = Instant::now() + wait.into();
     state.preload_window = calculate_preload(state.segment.slab_size);
-}
-
-/// Builds the set of slab IDs currently holding active triggers — i.e. the
-/// slabs cleanup must NOT delete.
-pub(crate) async fn collect_active_slab_ids(
-    slab_size: CompactDuration,
-    triggers: &TriggerQueue,
-) -> BTreeSet<SlabId> {
-    let mut active = BTreeSet::new();
-    triggers
-        .active_triggers()
-        .scan_active_times(|time, _timer_type| {
-            active.insert(Slab::from_time(slab_size, time).id());
-        })
-        .await;
-    active
 }
 
 /// Computes the wait time until a slab beginning at `load_time` should be

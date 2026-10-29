@@ -6,6 +6,7 @@ use crate::Topic;
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::telemetry::Telemetry;
+use crate::timers::active::Listed;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 pub(crate) use crate::timers::scheduler::tests::support::retirement_trace;
@@ -24,6 +25,28 @@ use tracing::Span;
 use uuid::Uuid;
 
 const TEST_TIMER_SEMAPHORE_SIZE: usize = 64;
+
+/// What memory holds for one timer, as timer tests model it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Memory {
+    /// An attempt waits to fire, and no delivery runs.
+    Waits,
+    /// A delivery runs. `again` tells whether an attempt also waits.
+    Firing { again: bool },
+    /// An entry that fires nothing, such as an aborted delivery.
+    Kept,
+}
+
+impl Memory {
+    /// How the scheduler lists the timer.
+    pub(crate) fn listed(self) -> Option<Listed> {
+        match self {
+            Self::Waits => Some(Listed::Waits),
+            Self::Firing { again } => Some(Listed::Firing { again }),
+            Self::Kept => None,
+        }
+    }
+}
 
 /// Per-type timer semaphores sized generously for tests.
 pub(crate) fn test_semaphores() -> Arc<TimerSemaphores> {

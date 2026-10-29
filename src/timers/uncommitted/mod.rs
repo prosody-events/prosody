@@ -34,6 +34,7 @@ use crate::timers::store::TriggerStore;
 use crate::{Key, ProcessScope};
 use arc_swap::ArcSwap;
 use educe::Educe;
+use std::future::ready;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
@@ -200,8 +201,8 @@ where
     }
 
     /// Aborts a queued source when admission stops on shutdown.
-    pub(crate) async fn abandon(mut self) {
-        self.uncommitted.abort().await;
+    pub(crate) fn abandon(mut self) {
+        self.uncommitted.abort();
     }
 
     /// Transition this timer to the firing state.
@@ -298,8 +299,9 @@ where
     /// Abort this timer without deleting persistent data.
     ///
     /// The timer is deactivated in-memory; it may be reloaded later.
-    async fn abort(mut self) {
-        self.uncommitted.abort().await;
+    fn abort(mut self) -> impl Future<Output = ()> + Send {
+        self.uncommitted.abort();
+        ready(())
     }
 }
 
@@ -351,10 +353,11 @@ where
     }
 
     /// Abort this timer without deleting persistent data.
-    async fn abort(mut self) {
+    fn abort(mut self) -> impl Future<Output = ()> + Send {
         if let Some(mut trigger) = self.inner.take() {
-            trigger.abort().await;
+            trigger.abort();
         }
+        ready(())
     }
 }
 
@@ -394,15 +397,13 @@ where
     ///
     /// The timer can fire again if reloaded. Multiple aborts or commits
     /// are ignored.
-    async fn abort(&mut self) {
+    fn abort(&mut self) {
         if self.completed {
             warn!("timer already marked as completed; ignoring abort");
             return;
         }
 
-        self.manager
-            .abort(&self.key, self.time, self.timer_type)
-            .await;
+        self.manager.abort(&self.key, self.time, self.timer_type);
         self.completed = true;
     }
 }

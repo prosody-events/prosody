@@ -71,7 +71,7 @@ pub async fn run<T: TriggerStore>(
             _ = tick.tick() => {},
             _ = shutdown_rx.wait_for(|v| *v >= ShutdownPhase::Terminating) => break,
         }
-        if let Some(s) = timer_manager.snapshot().await {
+        if let Ok(s) = timer_manager.snapshot().await {
             record(s);
         }
     }
