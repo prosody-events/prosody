@@ -181,15 +181,8 @@ where
         let listed = self.0.scheduler.list(key.clone(), timer_type).err_into();
         let (mut times, listed) = try_join!(stored, listed)?;
 
-        let done =
-            |time: &CompactDateTime| listed.contains(&(*time, Listed::Firing { again: false }));
-        times.retain(|time| !done(time));
-        times.extend(
-            listed
-                .iter()
-                .map(|&(time, _)| time)
-                .filter(|time| !done(time)),
-        );
+        times.extend(listed.iter().map(|&(time, _)| time));
+        times.retain(|&time| !listed.contains(&(time, Listed::Firing { again: false })));
         times.sort_unstable();
         times.dedup();
         Ok(times)
@@ -247,16 +240,7 @@ where
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        let id = TriggerId {
-            key: key.clone(),
-            time,
-            timer_type,
-        };
-        if let Some(ticket) = self.0.scheduler.unschedule(id).await? {
-            ticket
-                .run(self.0.store.remove_trigger(key, time, timer_type))
-                .await
-                .map_err(TimerManagerError::Store)?;
+        if self.0.remove(key, time, timer_type).await? {
             self.0.cancelled(key, time, timer_type);
         }
         Ok(())
@@ -390,16 +374,18 @@ where
         Ok(self.0.scheduler.snapshot(CompactDateTime::now()?).await?)
     }
 
-    /// Aborts a timer delivery.
+    /// Aborts a timer delivery, or its delivered attempt with `tag` that
+    /// never fired.
     ///
     /// Never deletes the timer from persistent storage: an aborted timer
     /// fires again after a restart.
-    pub fn abort(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
-        self.0.scheduler.abort(TriggerId {
+    pub fn abort(&self, key: &Key, time: CompactDateTime, timer_type: TimerType, tag: i32) {
+        let id = TriggerId {
             key: key.clone(),
             time,
             timer_type,
-        });
+        };
+        self.0.scheduler.abort(id, tag);
     }
 
     /// Reads the durable tag for legacy residue and source retirement.
@@ -440,11 +426,37 @@ where
                 .map_err(TimerManagerError::Store)?;
             return Ok(());
         }
-        self.unschedule(key, timer.time, timer.timer_type).await
+        inner
+            .remove(key, timer.time, timer.timer_type)
+            .await
+            .map(drop)
     }
 }
 
 impl<T: TriggerStore> TimerManagerInner<T> {
+    /// Deletes the row of a timer and removes it from memory. Returns whether
+    /// it deleted the row: a delivery in progress keeps its row.
+    async fn remove(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<bool, TimerManagerError<T::Error>> {
+        let id = TriggerId {
+            key: key.clone(),
+            time,
+            timer_type,
+        };
+        let Some(ticket) = self.scheduler.unschedule(id).await? else {
+            return Ok(false);
+        };
+        ticket
+            .run(self.store.remove_trigger(key, time, timer_type))
+            .await
+            .map_err(TimerManagerError::Store)?;
+        Ok(true)
+    }
+
     /// Reports a scheduled timer to telemetry.
     fn scheduled(&self, trigger: &Trigger) {
         self.telemetry.timer_scheduled(

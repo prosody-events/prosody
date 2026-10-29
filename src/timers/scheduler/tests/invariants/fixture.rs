@@ -162,13 +162,14 @@ impl Fixture {
 
     async fn apply_abort(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
         let (key, time, ty) = spec.resolve(self.now_slab);
-        self.actor.scheduler().abort(id(&key, time, ty));
+        // No attempt here waits outside the queue, so only a delivery aborts.
+        self.actor.scheduler().abort(id(&key, time, ty), 0);
         self.actor.drain().await;
         let mut model = self.model_for(&key, time, ty);
         model.memory = match model.memory {
             Some(Memory::Firing { again: true }) => Some(Memory::Waits),
-            Some(_) => Some(Memory::Kept),
-            None => None,
+            Some(Memory::Firing { again: false }) => Some(Memory::Kept),
+            memory => memory,
         };
         self.set_model(key, time, ty, model);
         Ok(())

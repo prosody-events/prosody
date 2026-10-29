@@ -32,7 +32,7 @@ use tokio_util::time::DelayQueue;
 
 mod entry;
 
-use entry::{Coordinates, Delivery, Entry, Next, get_mut, get_or_insert};
+use entry::{Coordinates, Delivery, Next, get_mut, get_or_insert};
 
 /// The in-memory timers of one partition.
 #[derive(Debug, Default)]
@@ -74,6 +74,10 @@ pub(crate) struct Change {
     insert: Option<Inserted>,
     /// The timers whose rows the operation deletes.
     removed: SmallVec<[Removed; 1]>,
+    /// For a change that deletes every row of the key and type, the times
+    /// whose rows stay. A slab load during the change can add entries that
+    /// `removed` does not name, and the end of a done change drops them too.
+    all_but: Option<SmallVec<[CompactDateTime; 1]>>,
 }
 
 #[derive(Debug)]
@@ -112,6 +116,19 @@ pub struct TimerSnapshot {
     pub oldest_overdue_secs: u32,
 }
 
+impl Change {
+    /// A change that deletes the rows of `removed`.
+    fn removal(key: Key, timer_type: TimerType, removed: SmallVec<[Removed; 1]>) -> Self {
+        Self {
+            key,
+            timer_type,
+            insert: None,
+            removed,
+            all_but: None,
+        }
+    }
+}
+
 impl Timers {
     /// Starts an insert of `trigger`, and returns the attempt to write. The
     /// entry stays from now to the end, so cleanup keeps the slab.
@@ -120,9 +137,12 @@ impl Timers {
         mut trigger: Trigger,
         insert: Insert,
     ) -> (Trigger, Change) {
-        let removed = match insert {
-            Insert::Clear => self.take_all(&trigger.key, trigger.timer_type, Some(trigger.time)),
-            Insert::Schedule | Insert::Repair => SmallVec::new(),
+        let (removed, all_but) = match insert {
+            Insert::Clear => (
+                self.take_all(&trigger.key, trigger.timer_type, trigger.time),
+                Some(SmallVec::from_buf([trigger.time])),
+            ),
+            Insert::Schedule | Insert::Repair => (SmallVec::new(), None),
         };
         let (created, entry) = get_or_insert(
             &mut self.entries,
@@ -143,6 +163,7 @@ impl Timers {
                 created,
             }),
             removed,
+            all_but,
         };
         (trigger, change)
     }
@@ -160,18 +181,12 @@ impl Timers {
         if let Some(entry) = get_mut(entries, &key, time, timer_type)
             && entry.firing.is_some()
         {
-            if let Some(next) = entry.next.take() {
-                next.dequeue(queue);
-            }
+            entry.take_next(queue);
             return None;
         }
         let restore = self.take(&key, time, timer_type);
-        Some(Change {
-            key,
-            timer_type,
-            insert: None,
-            removed: SmallVec::from_buf([Removed { time, restore }]),
-        })
+        let removed = SmallVec::from_buf([Removed { time, restore }]);
+        Some(Change::removal(key, timer_type, removed))
     }
 
     /// Starts the removal of every timer of a key and type. Returns the change
@@ -191,7 +206,7 @@ impl Timers {
             .flatten()
             .filter(|&&mut (_, ty, _)| ty == timer_type)
         {
-            let restore = entry.next.take().map(|next| next.dequeue(queue));
+            let restore = entry.take_next(queue);
             if entry.firing.is_some() {
                 firing.push(time);
             } else {
@@ -199,10 +214,8 @@ impl Timers {
             }
         }
         let change = Change {
-            key,
-            timer_type,
-            insert: None,
-            removed,
+            all_but: Some(firing.clone()),
+            ..Change::removal(key, timer_type, removed)
         };
         (change, firing)
     }
@@ -216,7 +229,7 @@ impl Timers {
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Option<Change> {
-        if let Some(entry) = self.get_mut(&key, time, timer_type)
+        if let Some(entry) = get_mut(&mut self.entries, &key, time, timer_type)
             && let Some(delivery) = entry.firing.take()
         {
             if entry.next.is_some() {
@@ -228,18 +241,20 @@ impl Timers {
             }
         }
         let restore = self.take(&key, time, timer_type);
-        Some(Change {
-            key,
-            timer_type,
-            insert: None,
-            removed: SmallVec::from_buf([Removed { time, restore }]),
-        })
+        let removed = SmallVec::from_buf([Removed { time, restore }]);
+        Some(Change::removal(key, timer_type, removed))
     }
 
-    /// Aborts a delivery, or a delivered attempt that never fired. The row
-    /// stays, and a restart loads it. A delivery whose row a clear deleted
-    /// leaves nothing.
-    pub(crate) fn abort(&mut self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
+    /// Aborts a delivery, or the delivered attempt with `tag` that never
+    /// fired. The row stays, and a restart loads it. A delivery whose row a
+    /// clear deleted leaves nothing.
+    pub(crate) fn abort(
+        &mut self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+        tag: i32,
+    ) {
         let Self { entries, queue } = self;
         let Some(entry) = get_mut(entries, key, time, timer_type) else {
             return;
@@ -248,8 +263,8 @@ impl Timers {
             Some(Delivery::Stored) => {}
             Some(Delivery::Deleted) => self.forget(key, time, timer_type),
             None => {
-                if let Some(next) = entry.next.take() {
-                    next.dequeue(queue);
+                if entry.next.as_ref().is_some_and(|next| next.delivered(tag)) {
+                    entry.take_next(queue);
                 }
             }
         }
@@ -268,11 +283,17 @@ impl Timers {
             timer_type,
             insert,
             removed,
+            all_but,
         } = change;
-        for Removed { time, restore } in removed {
-            if outcome == Outcome::Done {
-                self.drop_row(&key, time, timer_type);
-            } else if let Some(trigger) = restore {
+        if outcome == Outcome::Done {
+            match all_but {
+                Some(kept) => self.drop_rows(&key, timer_type, |time| !kept.contains(&time)),
+                None => self.drop_rows(&key, timer_type, |time| {
+                    removed.iter().any(|removed| removed.time == time)
+                }),
+            }
+        } else {
+            for trigger in removed.into_iter().filter_map(|removed| removed.restore) {
                 self.restore(trigger);
             }
         }
@@ -291,13 +312,18 @@ impl Timers {
     /// Starts the delivery of an attempt that left the queue, if it is still
     /// the attempt that fires next.
     pub(crate) fn fire(&mut self, trigger: &Trigger) -> bool {
-        let Some(entry) = self.get_mut(&trigger.key, trigger.time, trigger.timer_type) else {
+        let Some(entry) = get_mut(
+            &mut self.entries,
+            &trigger.key,
+            trigger.time,
+            trigger.timer_type,
+        ) else {
             return false;
         };
         let due = entry
             .next
             .as_ref()
-            .is_some_and(|next| next.queued.is_none() && next.trigger.tag == trigger.tag);
+            .is_some_and(|next| next.delivered(trigger.tag));
         if due {
             entry.next = None;
             entry.firing = Some(Delivery::Stored);
@@ -305,13 +331,14 @@ impl Timers {
         due
     }
 
-    /// Adds a trigger that a slab load read. An existing entry stays as it
-    /// is, because the operations that made it know more than the load.
+    /// Adds a trigger that a slab load read. An entry with an attempt or a
+    /// delivery stays as it is, because the operations that made it know more
+    /// than the load. An empty entry stands for a row change in progress, so
+    /// the load fills it.
     pub(crate) fn load(&mut self, trigger: Trigger) {
         let Self { entries, queue } = self;
-        let (created, entry) =
-            get_or_insert(entries, &trigger.key, trigger.time, trigger.timer_type);
-        if created {
+        let (_, entry) = get_or_insert(entries, &trigger.key, trigger.time, trigger.timer_type);
+        if entry.next.is_none() && entry.firing.is_none() {
             entry.next = Some(Next::queue(queue, trigger));
         }
     }
@@ -327,9 +354,13 @@ impl Timers {
             return Poll::Ready(None);
         };
         let trigger = expired.into_inner();
-        if let Some(next) = self
-            .get_mut(&trigger.key, trigger.time, trigger.timer_type)
-            .and_then(|entry| entry.next.as_mut())
+        if let Some(next) = get_mut(
+            &mut self.entries,
+            &trigger.key,
+            trigger.time,
+            trigger.timer_type,
+        )
+        .and_then(|entry| entry.next.as_mut())
         {
             next.queued = None;
         }
@@ -401,9 +432,8 @@ impl Timers {
                 next.trigger.adopt_trace_from(&trigger);
             }
             _ => {
-                if let Some(old) = entry.next.replace(Next::queue(queue, trigger)) {
-                    old.dequeue(queue);
-                }
+                entry.take_next(queue);
+                entry.next = Some(Next::queue(queue, trigger));
             }
         }
     }
@@ -417,19 +447,24 @@ impl Timers {
         }
     }
 
-    /// Forgets a deleted row: no attempt waits, and the entry goes unless a
-    /// delivery runs.
-    fn drop_row(&mut self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
+    /// Forgets the deleted rows of a key and type at the times that
+    /// `deleted` picks. A running delivery keeps its entry.
+    fn drop_rows(
+        &mut self,
+        key: &Key,
+        timer_type: TimerType,
+        deleted: impl Fn(CompactDateTime) -> bool,
+    ) {
         let Self { entries, queue } = self;
-        if let Some(entry) = get_mut(entries, key, time, timer_type) {
-            if let Some(next) = entry.next.take() {
-                next.dequeue(queue);
-            }
-            if let Some(delivery) = &mut entry.firing {
-                *delivery = Delivery::Deleted;
-            }
+        let Some(coordinates) = entries.get_mut(key) else {
+            return;
+        };
+        coordinates.retain(|(time, ty, entry)| {
+            *ty != timer_type || !deleted(*time) || entry.drop_row(queue)
+        });
+        if coordinates.is_empty() {
+            entries.remove(key);
         }
-        self.forget(key, time, timer_type);
     }
 
     /// Removes an entry that holds no attempt and no delivery.
@@ -448,8 +483,7 @@ impl Timers {
     /// Takes the waiting attempt of a coordinate out of the queue.
     fn take(&mut self, key: &Key, time: CompactDateTime, timer_type: TimerType) -> Option<Trigger> {
         let Self { entries, queue } = self;
-        let next = get_mut(entries, key, time, timer_type)?.next.take()?;
-        Some(next.dequeue(queue))
+        get_mut(entries, key, time, timer_type)?.take_next(queue)
     }
 
     /// Takes the waiting attempts of a key and type, except at `except`.
@@ -457,28 +491,19 @@ impl Timers {
         &mut self,
         key: &Key,
         timer_type: TimerType,
-        except: Option<CompactDateTime>,
+        except: CompactDateTime,
     ) -> SmallVec<[Removed; 1]> {
         let Self { entries, queue } = self;
         entries
             .get_mut(key)
             .into_iter()
             .flatten()
-            .filter(|&&mut (time, ty, _)| ty == timer_type && Some(time) != except)
+            .filter(|&&mut (time, ty, _)| ty == timer_type && time != except)
             .map(|&mut (time, _, ref mut entry)| Removed {
                 time,
-                restore: entry.next.take().map(|next| next.dequeue(queue)),
+                restore: entry.take_next(queue),
             })
             .collect()
-    }
-
-    fn get_mut(
-        &mut self,
-        key: &Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> Option<&mut Entry> {
-        get_mut(&mut self.entries, key, time, timer_type)
     }
 }
 

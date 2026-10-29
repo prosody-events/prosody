@@ -452,6 +452,32 @@ async fn test_fire_cancelled_timer() -> Result<()> {
     Ok(())
 }
 
+/// A delivered timer that drops without a commit or an abort ends its
+/// delivery, so memory keeps no delivery that nothing ends.
+#[tokio::test]
+async fn dropped_timer_ends_its_delivery() -> Result<()> {
+    time::pause();
+
+    let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+    pin_mut!(stream);
+    let trigger = create_test_trigger("dropped-key", 1, TimerType::Application)?;
+    manager.schedule(timer_request(&trigger)).await?;
+    advance(Duration::from_secs(2)).await;
+
+    let pending = timeout(Duration::from_secs(10), stream.next())
+        .await?
+        .ok_or_else(|| eyre!("Expected a pending timer"))?;
+    let firing = pending
+        .fire()
+        .await
+        .ok_or_else(|| eyre!("the timer did not fire"))?;
+    drop(firing);
+
+    let snapshot = manager.snapshot().await?;
+    assert_eq!(snapshot.in_flight, 0, "a dropped delivery still runs");
+    Ok(())
+}
+
 mod cancel;
 mod crud;
 mod identity;

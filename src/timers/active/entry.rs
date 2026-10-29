@@ -46,6 +46,23 @@ pub(super) struct Next {
     pub(super) queued: Option<delay_queue::Key>,
 }
 
+impl Entry {
+    /// Takes the waiting attempt out of the queue.
+    pub(super) fn take_next(&mut self, queue: &mut DelayQueue<Trigger>) -> Option<Trigger> {
+        self.next.take().map(|next| next.dequeue(queue))
+    }
+
+    /// Forgets the row of this coordinate. Returns whether the entry stays: a
+    /// running delivery stays, with its row marked deleted.
+    pub(super) fn drop_row(&mut self, queue: &mut DelayQueue<Trigger>) -> bool {
+        self.take_next(queue);
+        let delivery = self.firing.as_mut();
+        delivery
+            .map(|delivery| *delivery = Delivery::Deleted)
+            .is_some()
+    }
+}
+
 impl Next {
     /// Puts `trigger` in the queue until its time.
     pub(super) fn queue(queue: &mut DelayQueue<Trigger>, trigger: Trigger) -> Self {
@@ -55,11 +72,16 @@ impl Next {
     }
 
     /// Takes the attempt out of the queue.
-    pub(super) fn dequeue(self, queue: &mut DelayQueue<Trigger>) -> Trigger {
+    fn dequeue(self, queue: &mut DelayQueue<Trigger>) -> Trigger {
         if let Some(key) = self.queued {
             queue.try_remove(&key);
         }
         self.trigger
+    }
+
+    /// Whether this attempt left the queue with `tag`.
+    pub(super) fn delivered(&self, tag: i32) -> bool {
+        self.queued.is_none() && self.trigger.tag == tag
     }
 }
 
@@ -76,7 +98,9 @@ pub(super) fn get_mut<'a>(
         .map(|(_, _, entry)| entry)
 }
 
-/// Returns the entry of a coordinate, and whether this call made it.
+/// Returns the entry of a coordinate, and whether this call made it. It clones
+/// the key on every call: a refcount bump costs less than the second hash of a
+/// lookup first.
 pub(super) fn get_or_insert<'a>(
     entries: &'a mut HashMap<Key, Coordinates>,
     key: &Key,

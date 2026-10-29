@@ -89,7 +89,7 @@ async fn run_crud_trace(trace: CrudTrace) -> Result<()> {
             }
             // Abort never removes the durable row (it is preserved for
             // recovery), so `scheduled_times` visibility is unchanged.
-            CrudOp::Abort => manager.abort(key, time, timer_type),
+            CrudOp::Abort => manager.abort(key, time, timer_type, 0),
         }
 
         for (idx, key) in keys.iter().enumerate() {

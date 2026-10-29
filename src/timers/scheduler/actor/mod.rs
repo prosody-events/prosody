@@ -111,61 +111,43 @@ pub(super) async fn run_actor<T>(
 
         let load_deadline = state.next_load_at;
 
-        if trigger_to_send.is_some() {
-            select! {
-                result = commands.recv() => {
-                    let Some(command) = result else { break; };
-                    process_command(&mut state, &mut timers, &tickets, command).await;
-                }
-                result = trigger_tx.reserve() => {
-                    let Ok(permit) = result else { break; };
-                    let Some(trigger) = trigger_to_send.take() else {
-                        continue;
-                    };
+        // A trigger that the full channel refused waits for space before the
+        // queue releases the next one.
+        let waiting = trigger_to_send.is_some();
+        select! {
+            result = commands.recv() => {
+                let Some(command) = result else { break; };
+                process_command(&mut state, &mut timers, &tickets, command).await;
+            }
+            result = trigger_tx.reserve(), if waiting => {
+                let Ok(permit) = result else { break; };
+                if let Some(trigger) = trigger_to_send.take() {
                     permit.send(trigger);
                 }
-                () = sleep_until(load_deadline) => {
-                    load_step(&mut state, &mut timers).await;
-                }
-                () = heartbeat.next() => {},
-                // Wake a parked actor on any phase change: an `Ok` falls
-                // through to the loop-top gate, which exits iff the phase is
-                // now `>= Cancelling` (and re-parks otherwise, without
-                // spinning — `changed()` consumes the notification). An `Err`
-                // means every sender dropped below `Cancelling`, so exit.
-                // (`changed()` yields `Result<(), _>`, not a `!Send` `Ref`
-                // like `wait_for`, keeping this spawned future `Send`.)
-                result = shutdown_rx.changed() => {
-                    if result.is_err() {
-                        debug!("Scheduler actor shutting down");
-                        return;
+            }
+            Some(trigger) = timers.next(), if !waiting => {
+                if let Err(err) = trigger_tx.try_send(trigger) {
+                    match err {
+                        TrySendError::Full(t) => trigger_to_send = Some(t),
+                        TrySendError::Closed(_) => break,
                     }
                 }
             }
-        } else {
-            select! {
-                result = commands.recv() => {
-                    let Some(command) = result else { break; };
-                    process_command(&mut state, &mut timers, &tickets, command).await;
-                }
-                Some(trigger) = timers.next() => {
-                    if let Err(err) = trigger_tx.try_send(trigger) {
-                        match err {
-                            TrySendError::Full(t) => trigger_to_send = Some(t),
-                            TrySendError::Closed(_) => break,
-                        }
-                    }
-                }
-                () = sleep_until(load_deadline) => {
-                    load_step(&mut state, &mut timers).await;
-                }
-                () = heartbeat.next() => {},
-                // Wake-and-route-to-the-gate; see the trigger_to_send branch.
-                result = shutdown_rx.changed() => {
-                    if result.is_err() {
-                        debug!("Scheduler actor shutting down");
-                        return;
-                    }
+            () = sleep_until(load_deadline) => {
+                load_step(&mut state, &mut timers).await;
+            }
+            () = heartbeat.next() => {},
+            // Wake a parked actor on any phase change: an `Ok` falls
+            // through to the loop-top gate, which exits iff the phase is
+            // now `>= Cancelling` (and re-parks otherwise, without
+            // spinning — `changed()` consumes the notification). An `Err`
+            // means every sender dropped below `Cancelling`, so exit.
+            // (`changed()` yields `Result<(), _>`, not a `!Send` `Ref`
+            // like `wait_for`, keeping this spawned future `Send`.)
+            result = shutdown_rx.changed() => {
+                if result.is_err() {
+                    debug!("Scheduler actor shutting down");
+                    return;
                 }
             }
         }
@@ -193,11 +175,10 @@ pub(super) async fn process_command<T>(
                 .await
                 .map(|()| timers.start_insert(trigger, insert))
                 .map(|(trigger, change)| (trigger, ticket(change)));
-            reply
-                .send(started)
-                .err()
-                .and_then(Result::ok)
-                .map(|(_, t)| t)
+            match reply.send(started) {
+                Err(Ok((_, ticket))) => Some(ticket),
+                _ => None,
+            }
         }
         Command::Unschedule { id, reply } => {
             let change = timers.start_unschedule(id.key, id.time, id.timer_type);
@@ -215,8 +196,8 @@ pub(super) async fn process_command<T>(
             let change = timers.start_complete(id.key, id.time, id.timer_type);
             reply.send(change.map(ticket)).err().flatten()
         }
-        Command::Abort(id) => {
-            timers.abort(&id.key, id.time, id.timer_type);
+        Command::Abort { id, tag } => {
+            timers.abort(&id.key, id.time, id.timer_type, tag);
             None
         }
         Command::End(change, outcome) => {

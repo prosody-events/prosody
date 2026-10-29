@@ -147,6 +147,9 @@ where
     /// Timer type classification.
     timer_type: TimerType,
 
+    /// Tag of the delivered attempt.
+    tag: i32,
+
     /// Manager coordinating persistent and in-memory state.
     manager: TimerManager<T>,
 
@@ -173,19 +176,17 @@ where
     /// timer is dropped.
     #[must_use]
     pub fn new(trigger: Trigger, manager: TimerManager<T>, permit: OwnedSemaphorePermit) -> Self {
-        let key = trigger.key.clone();
-        let time = trigger.time;
-        let timer_type = trigger.timer_type;
         Self {
-            trigger,
             uncommitted: UncommittedTrigger {
-                key,
-                time,
-                timer_type,
+                key: trigger.key.clone(),
+                time: trigger.time,
+                timer_type: trigger.timer_type,
+                tag: trigger.tag,
                 manager,
                 completed: false,
                 _permit: permit,
             },
+            trigger,
         }
     }
 
@@ -403,7 +404,8 @@ where
             return;
         }
 
-        self.manager.abort(&self.key, self.time, self.timer_type);
+        self.manager
+            .abort(&self.key, self.time, self.timer_type, self.tag);
         self.completed = true;
     }
 }
@@ -441,12 +443,12 @@ impl<T> Drop for UncommittedTrigger<T>
 where
     T: TriggerStore,
 {
-    /// Warn if a timer is dropped without being committed or aborted.
-    ///
-    /// Helps detect resource leaks from unacknowledged timers.
+    /// Aborts a timer that is dropped without a commit or an abort, so memory
+    /// keeps no delivery that nothing ends.
     fn drop(&mut self) {
         if !self.completed {
-            warn!("timer was dropped without committing or aborting");
+            warn!("timer was dropped without committing or aborting; aborting it");
+            self.abort();
         }
     }
 }

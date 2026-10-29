@@ -86,8 +86,8 @@ pub(super) enum Command<E> {
         id: TriggerId,
         reply: oneshot::Sender<Option<Ticket<E>>>,
     },
-    /// Aborts a delivery.
-    Abort(TriggerId),
+    /// Aborts a delivery, or the delivered attempt with `tag`.
+    Abort { id: TriggerId, tag: i32 },
     /// Ends an operation.
     End(Change, Outcome),
     /// Starts the delivery of an attempt that left the queue.
@@ -211,10 +211,11 @@ where
         self.request(|reply| Command::Complete { id, reply }).await
     }
 
-    /// Aborts a delivery. The row stays for recovery.
-    pub(crate) fn abort(&self, id: TriggerId) {
+    /// Aborts a delivery, or the delivered attempt with `tag` that never
+    /// fired. The row stays for recovery.
+    pub(crate) fn abort(&self, id: TriggerId, tag: i32) {
         // A closed channel means the actor stopped, and its state is gone.
-        let _ = self.command_tx.send(Command::Abort(id));
+        let _ = self.command_tx.send(Command::Abort { id, tag });
     }
 
     /// Starts the delivery of `trigger` if it is still the attempt that

@@ -7,6 +7,7 @@ use super::super::{Command, TriggerScheduler};
 use crate::Topic;
 use crate::state::TimerEventRef;
 use crate::telemetry::Telemetry;
+use crate::telemetry::event::{Data, TelemetryEvent, TimerEventType, TimerTelemetryEvent};
 use crate::timers::active::Timers;
 use crate::timers::duration::CompactDuration;
 use crate::timers::manager::{TimerManager, TimerManagerConfig};
@@ -22,6 +23,7 @@ use futures::TryStreamExt;
 use std::pin::pin;
 use std::sync::Arc;
 use tokio::select;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::Span;
 
@@ -82,7 +84,7 @@ impl Actor {
 
 /// Retires an old attempt through `admit` and then twice more. Checks that
 /// the key row's replacement, and nothing else, stays in both indexes and in
-/// memory.
+/// memory, and that retirement reports no cancel.
 ///
 /// `mode` picks which old rows exist: the slab row of the old attempt, the
 /// key row of a replacement with the next tag, or both.
@@ -136,9 +138,11 @@ where
             .is_some_and(|end| end >= slab.id())
     );
 
+    let telemetry = Telemetry::new();
+    let mut events = telemetry.subscribe();
     let config = TimerManagerConfig {
         store: store.clone(),
-        telemetry: Telemetry::new().partition_sender(Topic::from("admission"), 0),
+        telemetry: telemetry.partition_sender(Topic::from("admission"), 0),
         source: Arc::from("admission"),
     };
     let manager = TimerManager::assemble(config, actor.scheduler());
@@ -151,6 +155,7 @@ where
         })
         .await?;
 
+    ensure!(!cancelled(&mut events), "retirement reported a cancel");
     let expected = (replaced && !retire_replacement).then_some(replacement.tag);
     let current = store
         .current_trigger(&old.key, old.time, old.timer_type)
@@ -194,4 +199,18 @@ where
         "memory keeps an entry for a deleted row"
     );
     Ok(())
+}
+
+/// Whether `events` holds a timer cancel.
+fn cancelled(events: &mut broadcast::Receiver<TelemetryEvent>) -> bool {
+    while let Ok(event) = events.try_recv() {
+        if let Data::Timer(TimerTelemetryEvent {
+            event_type: TimerEventType::Cancelled,
+            ..
+        }) = &*event.data
+        {
+            return true;
+        }
+    }
+    false
 }
