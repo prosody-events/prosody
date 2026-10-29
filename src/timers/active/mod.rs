@@ -30,8 +30,11 @@ use std::future::poll_fn;
 use std::task::{Context, Poll, ready};
 use tokio_util::time::DelayQueue;
 
+mod change;
 mod entry;
 
+pub(crate) use change::{Change, Insert, Outcome};
+use change::{Inserted, Removed};
 use entry::{Coordinates, Delivery, Next, get_mut, get_or_insert};
 
 /// The in-memory timers of one partition.
@@ -39,59 +42,6 @@ use entry::{Coordinates, Delivery, Next, get_mut, get_or_insert};
 pub(crate) struct Timers {
     entries: HashMap<Key, Coordinates>,
     queue: DelayQueue<Trigger>,
-}
-
-/// How an insert changes memory.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Insert {
-    /// Queues the timer. A waiting attempt keeps its tag.
-    Schedule,
-    /// As `Schedule`, and removes the other timers of the key and type.
-    Clear,
-    /// Queues the attempt of the key row with the tag of that row.
-    Repair,
-}
-
-/// How the row change of an operation ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Outcome {
-    /// The row change never started.
-    Unchanged,
-    /// The row change failed or stopped, so the row may or may not have
-    /// changed.
-    Unknown,
-    /// The row change succeeded.
-    Done,
-}
-
-/// What an operation changes in memory around its row change. Only [`Timers`]
-/// makes one, and [`Timers::end`] uses it.
-#[derive(Debug)]
-pub(crate) struct Change {
-    key: Key,
-    timer_type: TimerType,
-    /// The attempt that the operation writes.
-    insert: Option<Inserted>,
-    /// The timers whose rows the operation deletes.
-    removed: SmallVec<[Removed; 1]>,
-    /// For a change that deletes every row of the key and type, the times
-    /// whose rows stay. A slab load during the change can add entries that
-    /// `removed` does not name, and the end of a done change drops them too.
-    all_but: Option<SmallVec<[CompactDateTime; 1]>>,
-}
-
-#[derive(Debug)]
-struct Inserted {
-    trigger: Trigger,
-    /// Whether the start made the entry.
-    created: bool,
-}
-
-#[derive(Debug)]
-struct Removed {
-    time: CompactDateTime,
-    /// The attempt that the start took, to restore if the row stays.
-    restore: Option<Trigger>,
 }
 
 /// How memory lists the time of a timer.
@@ -114,19 +64,6 @@ pub struct TimerSnapshot {
     pub overdue: u32,
     /// Age in seconds of the oldest overdue timer; 0 when none.
     pub oldest_overdue_secs: u32,
-}
-
-impl Change {
-    /// A change that deletes the rows of `removed`.
-    fn removal(key: Key, timer_type: TimerType, removed: SmallVec<[Removed; 1]>) -> Self {
-        Self {
-            key,
-            timer_type,
-            insert: None,
-            removed,
-            all_but: None,
-        }
-    }
 }
 
 impl Timers {

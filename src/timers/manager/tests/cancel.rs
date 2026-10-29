@@ -1,5 +1,6 @@
 //! A timer call dropped at any await point leaves memory that covers its rows
-//! and nothing more, and its stored row stays loadable.
+//! and nothing more, and its stored row stays loadable. A dropped delivery
+//! leaves no delivery running.
 
 use super::{SLAB_SECONDS, Store, listed, past, seeded_store, slab_id};
 use crate::Key;
@@ -12,12 +13,15 @@ use crate::timers::manager::TimerManagerError;
 use crate::timers::scheduler::TimerSchedulerError;
 use crate::timers::store::TriggerStore;
 use crate::timers::test_support::setup_timer_manager_with_store;
-use crate::timers::{TimerManager, TimerRequest, TimerType, Trigger, UncommittedTimer};
+use crate::timers::{
+    PendingTimer, TimerManager, TimerRequest, TimerType, Trigger, UncommittedTimer,
+};
 use color_eyre::eyre::{OptionExt, Result, ensure};
 use futures::future::try_join_all;
-use futures::{StreamExt, TryStreamExt, pin_mut, poll};
+use futures::{Stream, StreamExt, TryStreamExt, pin_mut, poll};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::cell::Cell;
+use std::future::pending;
 use std::task::Poll;
 use std::time::Duration;
 use strum::VariantArray;
@@ -36,7 +40,7 @@ type Manager = TimerManager<Store>;
 /// many earlier schedules wait in the command channel. A [`Followup`] then
 /// runs before the actor reads the dropped call's last command. A `due` victim
 /// lands in a slab that the actor owns from the start, and a stored one must
-/// fire.
+/// fire. A delivery victim is always due.
 #[test]
 fn prop_dropped_call_keeps_rows_loadable() {
     fn property(
@@ -55,6 +59,7 @@ fn prop_dropped_call_keeps_rows_loadable() {
 }
 
 async fn run(victim: Victim, followup: Followup, backlog: u8, polls: u8, due: bool) -> Result<()> {
+    let due = due || victim.delivers();
     let (store, now) = seeded_store(due).await?;
     let (stream, manager, _shutdown) =
         setup_timer_manager_with_store(store.clone(), ShutdownPhase::default()).await?;
@@ -66,9 +71,17 @@ async fn run(victim: Victim, followup: Followup, backlog: u8, polls: u8, due: bo
     } else {
         time.add_duration(CompactDuration::new(SLAB_SECONDS))?
     };
-    if victim.removes() {
+    if victim.removes() || victim.delivers() {
         schedule(&manager, "victim", victim_time, false).await?;
     }
+    let delivered = if victim.delivers() {
+        let pending = timeout(Duration::from_secs(10), stream.next())
+            .await?
+            .ok_or_eyre("timer stream ended")?;
+        Some(pending)
+    } else {
+        None
+    };
 
     // Start every filler without yielding to the actor.
     let clear = victim.clears();
@@ -85,7 +98,7 @@ async fn run(victim: Victim, followup: Followup, backlog: u8, polls: u8, due: bo
 
     // The actor runs between polls. An even `polls` drops the call before the
     // actor reads its last command.
-    let mut call = Box::pin(victim.call(&manager, victim_time, time));
+    let mut call = Box::pin(victim.call(&manager, victim_time, time, delivered));
     for poll in 0..polls / 2 % 4 {
         if poll > 0 {
             yield_now().await;
@@ -121,7 +134,9 @@ async fn run(victim: Victim, followup: Followup, backlog: u8, polls: u8, due: bo
     // Only a stored victim in an owned slab has an entry: the fillers and the
     // barrier sit in an unowned slab, and a load reads them later.
     let key = Key::from("victim");
-    let entries = manager.snapshot().await?.active;
+    let snapshot = manager.snapshot().await?;
+    ensure!(snapshot.in_flight == 0, "a dropped delivery still runs");
+    let entries = snapshot.active;
     ensure!(
         entries == u32::from(due && !rows.is_empty()),
         "memory holds {entries} entries for {} victim rows",
@@ -141,24 +156,38 @@ async fn run(victim: Victim, followup: Followup, backlog: u8, polls: u8, due: bo
         }
     }
 
-    if due && !rows.is_empty() {
+    // A dropped delivery keeps its row for a reload, and only a later schedule
+    // makes it wait again.
+    let rescheduled = matches!(followup, Followup::Schedule);
+    if victim.delivers() && !rescheduled && !rows.is_empty() {
         let listed = listed(&manager, &key, victim_time, TimerType::Application).await?;
-        ensure!(
-            listed == Some(Listed::Waits),
-            "a stored victim in an owned slab does not wait"
-        );
-        let pending = timeout(Duration::from_secs(10), stream.next())
-            .await?
-            .ok_or_eyre("timer stream ended")?;
-        ensure!(
-            pending.trigger().time == victim_time,
-            "a filler fired first"
-        );
-        ensure!(
-            pending.fire().await.is_some(),
-            "the stored victim did not fire"
-        );
+        ensure!(listed.is_none(), "a dropped delivery is still listed");
+    } else if due && !rows.is_empty() {
+        waits_and_fires(&manager, stream.as_mut(), victim_time).await?;
     }
+    Ok(())
+}
+
+/// Checks that the stored victim at `time` waits, leaves the queue first,
+/// and fires.
+async fn waits_and_fires<S>(manager: &Manager, mut stream: S, time: CompactDateTime) -> Result<()>
+where
+    S: Stream<Item = PendingTimer<Store>> + Unpin,
+{
+    let key = Key::from("victim");
+    let listed = listed(manager, &key, time, TimerType::Application).await?;
+    ensure!(
+        listed == Some(Listed::Waits),
+        "a stored victim in an owned slab does not wait"
+    );
+    let pending = timeout(Duration::from_secs(10), stream.next())
+        .await?
+        .ok_or_eyre("timer stream ended")?;
+    ensure!(pending.trigger().time == time, "a filler fired first");
+    ensure!(
+        pending.fire().await.is_some(),
+        "the stored victim did not fire"
+    );
     Ok(())
 }
 
@@ -258,6 +287,9 @@ enum Victim {
     Unschedule,
     /// Replaces a stored victim with a timer in another slab.
     Replace,
+    /// Fires a stored victim that left the queue, and holds its delivery
+    /// until the drop.
+    Deliver,
 }
 
 impl Arbitrary for Victim {
@@ -272,20 +304,32 @@ impl Victim {
         matches!(self, Self::Unschedule | Self::Replace)
     }
 
+    /// Whether the call delivers a stored victim.
+    fn delivers(self) -> bool {
+        matches!(self, Self::Deliver)
+    }
+
     /// Whether the fillers use `clear_and_schedule`.
     fn clears(self) -> bool {
         matches!(self, Self::ClearAndSchedule | Self::Replace)
     }
 
     /// Runs the call on the victim at `time`. A replacement moves it to
-    /// `elsewhere`.
+    /// `elsewhere`, and a delivery fires `delivered`.
     async fn call(
         self,
         manager: &Manager,
         time: CompactDateTime,
         elsewhere: CompactDateTime,
+        delivered: Option<PendingTimer<Store>>,
     ) -> Result<()> {
         let fails = match self {
+            Self::Deliver => {
+                let delivered = delivered.ok_or_eyre("no victim left the queue")?;
+                ensure!(delivered.trigger().time == time, "a filler left the queue");
+                let _firing = delivered.fire().await;
+                return pending().await;
+            }
             Self::Schedule | Self::ClearAndSchedule => {
                 return schedule(manager, "victim", time, self.clears()).await;
             }

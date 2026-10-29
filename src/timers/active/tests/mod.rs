@@ -70,15 +70,6 @@ enum Stored {
 /// A value for each coordinate.
 type Grid<T> = [[T; TYPES.len()]; TIMES.len()];
 
-/// What a trace holds: whether a load read the unowned slab, and for each
-/// coordinate its row, whether a delivery kept it, and its entry. The entry
-/// is the tag of the waiting attempt, whether that attempt is queued, and
-/// whether a delivery runs with its row deleted.
-type State = (
-    bool,
-    Vec<(Stored, bool, Option<(Option<(i32, bool)>, Option<bool>)>)>,
-);
-
 /// Memory and the model of a trace.
 #[derive(Default)]
 struct Trace {
@@ -94,7 +85,7 @@ struct Trace {
 #[test]
 fn prop_timers_cover_every_row() {
     fn property(ops: Vec<Op>) -> Result<()> {
-        replay(ops).map(drop)
+        replay(ops)
     }
     QuickCheck::new().quickcheck(property as fn(Vec<Op>) -> Result<()>);
 }
@@ -111,7 +102,6 @@ fn aborted_delivery_of_a_cleared_row_leaves_no_entry() -> Result<()> {
         Op::Insert(other, Insert::Clear, 0, Outcome::Done, During::Nothing),
         Op::Abort(cleared, 0),
     ])
-    .map(drop)
 }
 
 /// A slab load runs while a row change is in progress. A clear then deletes
@@ -135,12 +125,10 @@ fn slab_load_during_a_row_change_keeps_memory_exact() -> Result<()> {
             During::Load,
         ),
     ])
-    .map(drop)
 }
 
-/// Applies `ops` to empty memory, checks after each one, and returns the
-/// state at the end.
-fn replay(ops: impl IntoIterator<Item = Op>) -> Result<State> {
+/// Applies `ops` to empty memory, and checks after each one.
+fn replay(ops: impl IntoIterator<Item = Op>) -> Result<()> {
     let runtime = runtime()?;
     let _runtime = runtime.enter();
     let mut trace = Trace::default();
@@ -149,7 +137,7 @@ fn replay(ops: impl IntoIterator<Item = Op>) -> Result<State> {
             .step(op)
             .map_err(|error| error.wrap_err(format!("step {step}: {op:?}")))?;
     }
-    Ok(trace.state())
+    Ok(())
 }
 
 /// A runtime for the delay queue, whose timer needs one.
@@ -377,54 +365,6 @@ impl Trace {
             .iter()
             .find(|&&(t, ty, _)| (t, ty) == coordinate)
             .map(|(_, _, entry)| entry)
-    }
-
-    /// What the trace holds, for the search to compare states.
-    fn state(&self) -> State {
-        let held = coordinates().map(|(time, ty)| {
-            let entry = self.entry(At(time, ty)).map(|entry| {
-                let next = entry.next.as_ref();
-                let firing = entry.firing.map(|delivery| delivery == Delivery::Deleted);
-                (
-                    next.map(|next| (next.trigger.tag, next.queued.is_some())),
-                    firing,
-                )
-            });
-            (self.rows[time][ty], self.kept[time][ty], entry)
-        });
-        (self.loaded, held.collect())
-    }
-
-    /// Builds the trace that `state` describes.
-    fn rebuild((loaded, held): &State) -> Self {
-        let mut trace = Self {
-            loaded: *loaded,
-            ..Self::default()
-        };
-        let Timers { entries, queue } = &mut trace.timers;
-        for ((time, ty), &(row, kept, entry)) in coordinates().zip(held) {
-            trace.rows[time][ty] = row;
-            trace.kept[time][ty] = kept;
-            let Some((next, firing)) = entry else {
-                continue;
-            };
-            let (_, slot) = get_or_insert(entries, &key(), time_of(time), TYPES[ty]);
-            slot.next = next.map(|(tag, queued)| {
-                let mut next = Next::queue(queue, trigger(At(time, ty), tag));
-                if !queued && let Some(item) = next.queued.take() {
-                    queue.try_remove(&item);
-                }
-                next
-            });
-            slot.firing = firing.map(|deleted| {
-                if deleted {
-                    Delivery::Deleted
-                } else {
-                    Delivery::Stored
-                }
-            });
-        }
-        trace
     }
 }
 
