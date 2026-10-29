@@ -26,14 +26,13 @@ use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
 use smallvec::SmallVec;
 use std::collections::BTreeSet;
-use std::collections::hash_map::Entry as MapEntry;
 use std::future::poll_fn;
 use std::task::{Context, Poll, ready};
 use tokio_util::time::DelayQueue;
 
 mod entry;
 
-use entry::{Coordinates, Delivery, Entry, Next, get_mut};
+use entry::{Coordinates, Delivery, Entry, Next, get_mut, get_or_insert};
 
 /// The in-memory timers of one partition.
 #[derive(Debug, Default)]
@@ -125,11 +124,12 @@ impl Timers {
             Insert::Clear => self.take_all(&trigger.key, trigger.timer_type, Some(trigger.time)),
             Insert::Schedule | Insert::Repair => SmallVec::new(),
         };
-        let coordinates = self.entries.entry(trigger.key.clone()).or_default();
-        let (created, entry) = match coordinates.entry((trigger.time, trigger.timer_type)) {
-            MapEntry::Occupied(entry) => (false, entry.into_mut()),
-            MapEntry::Vacant(entry) => (true, entry.insert(Entry::default())),
-        };
+        let (created, entry) = get_or_insert(
+            &mut self.entries,
+            &trigger.key,
+            trigger.time,
+            trigger.timer_type,
+        );
         if let Some(next) = &entry.next
             && !matches!(insert, Insert::Repair)
         {
@@ -185,11 +185,11 @@ impl Timers {
         let Self { entries, queue } = self;
         let mut removed = SmallVec::new();
         let mut firing = SmallVec::new();
-        for (&(time, _), entry) in entries
+        for &mut (time, _, ref mut entry) in entries
             .get_mut(&key)
             .into_iter()
             .flatten()
-            .filter(|&(&(_, ty), _)| ty == timer_type)
+            .filter(|&&mut (_, ty, _)| ty == timer_type)
         {
             let restore = entry.next.take().map(|next| next.dequeue(queue));
             if entry.firing.is_some() {
@@ -309,12 +309,10 @@ impl Timers {
     /// is, because the operations that made it know more than the load.
     pub(crate) fn load(&mut self, trigger: Trigger) {
         let Self { entries, queue } = self;
-        let coordinates = entries.entry(trigger.key.clone()).or_default();
-        if let MapEntry::Vacant(entry) = coordinates.entry((trigger.time, trigger.timer_type)) {
-            entry.insert(Entry {
-                next: Some(Next::queue(queue, trigger)),
-                firing: None,
-            });
+        let (created, entry) =
+            get_or_insert(entries, &trigger.key, trigger.time, trigger.timer_type);
+        if created {
+            entry.next = Some(Next::queue(queue, trigger));
         }
     }
 
@@ -349,8 +347,8 @@ impl Timers {
             .get(key)
             .into_iter()
             .flatten()
-            .filter(|&(&(_, ty), _)| ty == timer_type)
-            .filter_map(|(&(time, _), entry)| {
+            .filter(|&&(_, ty, _)| ty == timer_type)
+            .filter_map(|&(time, _, ref entry)| {
                 match (entry.next.is_some(), entry.firing.is_some()) {
                     (true, false) => Some((time, Listed::Waits)),
                     (again, true) => Some((time, Listed::Firing { again })),
@@ -364,8 +362,8 @@ impl Timers {
     pub(crate) fn slabs(&self, slab_size: CompactDuration) -> BTreeSet<SlabId> {
         self.entries
             .values()
-            .flat_map(HashMap::keys)
-            .map(|&(time, _)| Slab::from_time(slab_size, time).id())
+            .flatten()
+            .map(|&(time, ..)| Slab::from_time(slab_size, time).id())
             .collect()
     }
 
@@ -373,7 +371,7 @@ impl Timers {
     /// prevents wrapping under pathological loads.
     pub(crate) fn snapshot(&self, now: CompactDateTime) -> TimerSnapshot {
         let mut s = TimerSnapshot::default();
-        for (&(time, _), entry) in self.entries.values().flatten() {
+        for &(time, _, ref entry) in self.entries.values().flatten() {
             s.active = s.active.saturating_add(1);
             if entry.firing.is_some() {
                 s.in_flight = s.in_flight.saturating_add(1);
@@ -391,10 +389,7 @@ impl Timers {
     /// that holds nothing else goes instead, and a load reads the row later.
     fn queue(&mut self, trigger: Trigger, owned: bool) {
         let Self { entries, queue } = self;
-        let coordinates = entries.entry(trigger.key.clone()).or_default();
-        let entry = coordinates
-            .entry((trigger.time, trigger.timer_type))
-            .or_default();
+        let (_, entry) = get_or_insert(entries, &trigger.key, trigger.time, trigger.timer_type);
         if let Some(delivery) = &mut entry.firing {
             *delivery = Delivery::Stored;
         }
@@ -416,10 +411,7 @@ impl Timers {
     /// Puts back an attempt that a removal took, unless another one waits.
     fn restore(&mut self, trigger: Trigger) {
         let Self { entries, queue } = self;
-        let coordinates = entries.entry(trigger.key.clone()).or_default();
-        let entry = coordinates
-            .entry((trigger.time, trigger.timer_type))
-            .or_default();
+        let (_, entry) = get_or_insert(entries, &trigger.key, trigger.time, trigger.timer_type);
         if entry.next.is_none() {
             entry.next = Some(Next::queue(queue, trigger));
         }
@@ -445,14 +437,11 @@ impl Timers {
         let Some(coordinates) = self.entries.get_mut(key) else {
             return;
         };
-        if let MapEntry::Occupied(entry) = coordinates.entry((time, timer_type))
-            && entry.get().next.is_none()
-            && entry.get().firing.is_none()
-        {
-            entry.remove();
-            if coordinates.is_empty() {
-                self.entries.remove(key);
-            }
+        coordinates.retain(|(t, ty, entry)| {
+            (*t, *ty) != (time, timer_type) || entry.next.is_some() || entry.firing.is_some()
+        });
+        if coordinates.is_empty() {
+            self.entries.remove(key);
         }
     }
 
@@ -475,8 +464,8 @@ impl Timers {
             .get_mut(key)
             .into_iter()
             .flatten()
-            .filter(|&(&(time, ty), _)| ty == timer_type && Some(time) != except)
-            .map(|(&(time, _), entry)| Removed {
+            .filter(|&&mut (time, ty, _)| ty == timer_type && Some(time) != except)
+            .map(|&mut (time, _, ref mut entry)| Removed {
                 time,
                 restore: entry.next.take().map(|next| next.dequeue(queue)),
             })

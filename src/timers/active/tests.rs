@@ -307,7 +307,13 @@ fn waiting(timers: &Timers, at: At) -> Option<i32> {
 }
 
 fn entry(timers: &Timers, At(time, ty): At) -> Option<&Entry> {
-    timers.entries.get(&key())?.get(&(time_of(time), TYPES[ty]))
+    let coordinate = (time_of(time), TYPES[ty]);
+    timers
+        .entries
+        .get(&key())?
+        .iter()
+        .find(|&&(t, ty, _)| (t, ty) == coordinate)
+        .map(|(_, _, entry)| entry)
 }
 
 /// Records a row write with `outcome`.

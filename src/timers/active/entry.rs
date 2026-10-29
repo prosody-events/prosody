@@ -5,11 +5,13 @@ use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
+use smallvec::SmallVec;
 use std::time::Duration;
 use tokio_util::time::{DelayQueue, delay_queue};
 
-/// The entries of one key, by time and timer type.
-pub(super) type Coordinates = HashMap<(CompactDateTime, TimerType), Entry>;
+/// The entries of one key, by time and timer type. A key almost always has
+/// one entry, so it stays inline.
+pub(super) type Coordinates = SmallVec<[(CompactDateTime, TimerType, Entry); 1]>;
 
 /// What memory holds for one coordinate.
 ///
@@ -67,5 +69,27 @@ pub(super) fn get_mut<'a>(
     time: CompactDateTime,
     timer_type: TimerType,
 ) -> Option<&'a mut Entry> {
-    entries.get_mut(key)?.get_mut(&(time, timer_type))
+    entries
+        .get_mut(key)?
+        .iter_mut()
+        .find(|(t, ty, _)| (*t, *ty) == (time, timer_type))
+        .map(|(_, _, entry)| entry)
+}
+
+/// Returns the entry of a coordinate, and whether this call made it.
+pub(super) fn get_or_insert<'a>(
+    entries: &'a mut HashMap<Key, Coordinates>,
+    key: &Key,
+    time: CompactDateTime,
+    timer_type: TimerType,
+) -> (bool, &'a mut Entry) {
+    let coordinates = entries.entry(key.clone()).or_default();
+    let found = coordinates
+        .iter()
+        .position(|&(t, ty, _)| (t, ty) == (time, timer_type));
+    let index = found.unwrap_or_else(|| {
+        coordinates.push((time, timer_type, Entry::default()));
+        coordinates.len() - 1
+    });
+    (found.is_none(), &mut coordinates[index].2)
 }
