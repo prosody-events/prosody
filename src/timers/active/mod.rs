@@ -33,7 +33,7 @@ use tokio_util::time::DelayQueue;
 
 mod entry;
 
-use entry::{Coordinates, Entry, Next, get_mut};
+use entry::{Coordinates, Delivery, Entry, Next, get_mut};
 
 /// The in-memory timers of one partition.
 #[derive(Debug, Default)]
@@ -158,7 +158,7 @@ impl Timers {
     ) -> Option<Change> {
         let Self { entries, queue } = self;
         if let Some(entry) = get_mut(entries, &key, time, timer_type)
-            && entry.firing
+            && entry.firing.is_some()
         {
             if let Some(next) = entry.next.take() {
                 next.dequeue(queue);
@@ -192,7 +192,7 @@ impl Timers {
             .filter(|&(&(_, ty), _)| ty == timer_type)
         {
             let restore = entry.next.take().map(|next| next.dequeue(queue));
-            if entry.firing {
+            if entry.firing.is_some() {
                 firing.push(time);
             } else {
                 removed.push(Removed { time, restore });
@@ -208,18 +208,22 @@ impl Timers {
     }
 
     /// Ends the delivery of a coordinate. Returns the change that deletes its
-    /// row, or `None` when the timer was scheduled again during the delivery:
-    /// then its waiting attempt keeps the row.
+    /// row, or `None` when no row needs a delete: the timer was scheduled
+    /// again during the delivery, or a clear deleted the row.
     pub(crate) fn start_complete(
         &mut self,
         key: Key,
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Option<Change> {
-        if let Some(entry) = self.get_mut(&key, time, timer_type) {
-            let rescheduled = entry.firing && entry.next.is_some();
-            entry.firing = false;
-            if rescheduled {
+        if let Some(entry) = self.get_mut(&key, time, timer_type)
+            && let Some(delivery) = entry.firing.take()
+        {
+            if entry.next.is_some() {
+                return None;
+            }
+            if delivery == Delivery::Deleted {
+                self.forget(&key, time, timer_type);
                 return None;
             }
         }
@@ -233,16 +237,21 @@ impl Timers {
     }
 
     /// Aborts a delivery, or a delivered attempt that never fired. The row
-    /// stays, and a restart loads it.
+    /// stays, and a restart loads it. A delivery whose row a clear deleted
+    /// leaves nothing.
     pub(crate) fn abort(&mut self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
         let Self { entries, queue } = self;
         let Some(entry) = get_mut(entries, key, time, timer_type) else {
             return;
         };
-        if entry.firing {
-            entry.firing = false;
-        } else if let Some(next) = entry.next.take() {
-            next.dequeue(queue);
+        match entry.firing.take() {
+            Some(Delivery::Stored) => {}
+            Some(Delivery::Deleted) => self.forget(key, time, timer_type),
+            None => {
+                if let Some(next) = entry.next.take() {
+                    next.dequeue(queue);
+                }
+            }
         }
     }
 
@@ -291,7 +300,7 @@ impl Timers {
             .is_some_and(|next| next.queued.is_none() && next.trigger.tag == trigger.tag);
         if due {
             entry.next = None;
-            entry.firing = true;
+            entry.firing = Some(Delivery::Stored);
         }
         due
     }
@@ -304,7 +313,7 @@ impl Timers {
         if let MapEntry::Vacant(entry) = coordinates.entry((trigger.time, trigger.timer_type)) {
             entry.insert(Entry {
                 next: Some(Next::queue(queue, trigger)),
-                firing: false,
+                firing: None,
             });
         }
     }
@@ -341,13 +350,13 @@ impl Timers {
             .into_iter()
             .flatten()
             .filter(|&(&(_, ty), _)| ty == timer_type)
-            .filter_map(
-                |(&(time, _), entry)| match (entry.next.is_some(), entry.firing) {
+            .filter_map(|(&(time, _), entry)| {
+                match (entry.next.is_some(), entry.firing.is_some()) {
                     (true, false) => Some((time, Listed::Waits)),
                     (again, true) => Some((time, Listed::Firing { again })),
                     (false, false) => None,
-                },
-            )
+                }
+            })
             .collect()
     }
 
@@ -366,7 +375,7 @@ impl Timers {
         let mut s = TimerSnapshot::default();
         for (&(time, _), entry) in self.entries.values().flatten() {
             s.active = s.active.saturating_add(1);
-            if entry.firing {
+            if entry.firing.is_some() {
                 s.in_flight = s.in_flight.saturating_add(1);
             }
             if time <= now {
@@ -386,8 +395,11 @@ impl Timers {
         let entry = coordinates
             .entry((trigger.time, trigger.timer_type))
             .or_default();
+        if let Some(delivery) = &mut entry.firing {
+            *delivery = Delivery::Stored;
+        }
         match &entry.next {
-            None if !owned && !entry.firing => {
+            None if !owned && entry.firing.is_none() => {
                 self.forget(&trigger.key, trigger.time, trigger.timer_type);
             }
             Some(next) if next.trigger.tag == trigger.tag => {
@@ -417,8 +429,13 @@ impl Timers {
     /// delivery runs.
     fn drop_row(&mut self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
         let Self { entries, queue } = self;
-        if let Some(next) = get_mut(entries, key, time, timer_type).and_then(|e| e.next.take()) {
-            next.dequeue(queue);
+        if let Some(entry) = get_mut(entries, key, time, timer_type) {
+            if let Some(next) = entry.next.take() {
+                next.dequeue(queue);
+            }
+            if let Some(delivery) = &mut entry.firing {
+                *delivery = Delivery::Deleted;
+            }
         }
         self.forget(key, time, timer_type);
     }
@@ -430,7 +447,7 @@ impl Timers {
         };
         if let MapEntry::Occupied(entry) = coordinates.entry((time, timer_type))
             && entry.get().next.is_none()
-            && !entry.get().firing
+            && entry.get().firing.is_none()
         {
             entry.remove();
             if coordinates.is_empty() {

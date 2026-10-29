@@ -19,8 +19,18 @@ pub(super) type Coordinates = HashMap<(CompactDateTime, TimerType), Entry>;
 pub(super) struct Entry {
     /// The attempt that fires next.
     pub(super) next: Option<Next>,
-    /// Whether a handler runs a delivery of this coordinate.
-    pub(super) firing: bool,
+    /// The delivery of this coordinate that a handler runs.
+    pub(super) firing: Option<Delivery>,
+}
+
+/// The row of a coordinate while its delivery runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Delivery {
+    /// The row may exist.
+    Stored,
+    /// A clear deleted the row, and no write followed. The delivery has no
+    /// row to keep or to delete.
+    Deleted,
 }
 
 /// An attempt that fires next.

@@ -223,7 +223,8 @@ where
                     self.permits.clone().acquire_owned().await?,
                 );
                 assert!(pending.fire().await.is_none());
-            } else if matches!(op, Commit) {
+            } else if matches!(op, Commit) || model.row.is_none() {
+                // A clear that deleted the row leaves an abort nothing to keep.
                 *model = IdentityModel::default();
             } else {
                 model.memory = Some(Kept);

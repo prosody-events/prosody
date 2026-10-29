@@ -1,15 +1,17 @@
-//! Trace + model property for [`Timers`].
+//! Trace + model checks for [`Timers`].
 //!
 //! The model is the set of stored rows that operations leave: absent, present
 //! with a tag, or unknown after a row change with an unknown result. After
 //! every operation, memory must cover each row that may exist in an owned slab,
 //! hold nothing for a row that cannot exist, and keep the delay queue and the
-//! entries in step.
+//! entries in step. A random property checks long traces, and a search checks
+//! every state that a small universe can reach.
 
 use super::*;
 use color_eyre::eyre::{Result, ensure};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::array::from_fn;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::runtime::Builder;
 use tracing::Span;
@@ -38,7 +40,7 @@ enum Op {
 }
 
 /// What the store holds at one coordinate.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 enum Stored {
     #[default]
     Absent,
@@ -50,21 +52,95 @@ enum Stored {
 /// The rows of the trace, by coordinate.
 type Rows = [[Stored; TYPES.len()]; TIMES.len()];
 
+/// What one coordinate holds: its row, and its entry as the tag of the waiting
+/// attempt, whether that attempt is queued, and whether a delivery runs with
+/// its row deleted.
+type Held = (Stored, Option<(Option<(i32, bool)>, Option<bool>)>);
+
 #[test]
 fn prop_timers_cover_every_row() {
     fn property(ops: Vec<Op>) -> Result<()> {
-        // The delay queue needs the timer of a runtime.
-        let runtime = Builder::new_current_thread()
-            .enable_time()
-            .start_paused(true)
-            .build()?;
-        let _runtime = runtime.enter();
-        run(ops)
+        replay(ops).map(drop)
     }
     QuickCheck::new().quickcheck(property as fn(Vec<Op>) -> Result<()>);
 }
 
-fn run(ops: Vec<Op>) -> Result<()> {
+/// A clear deletes the row of a timer during its delivery, and then the
+/// delivery aborts. Memory must keep nothing for the deleted row.
+#[test]
+fn aborted_delivery_of_a_cleared_row_leaves_no_entry() -> Result<()> {
+    let (cleared, other) = (At(0, 0), At(2, 0));
+    replay([
+        Op::Insert(cleared, Insert::Clear, 0, Outcome::Done),
+        Op::Pop(cleared),
+        Op::Fire(cleared, 0),
+        Op::Insert(other, Insert::Clear, 0, Outcome::Done),
+        Op::Abort(cleared),
+    ])
+    .map(drop)
+}
+
+/// Checks every operation from every state that operations on two times of
+/// one type reach from empty memory. The first pair interacts in owned slabs;
+/// the second pair adds a slab that the actor does not own.
+#[test]
+fn every_reachable_state_keeps_the_invariants() -> Result<()> {
+    explore(&[At(0, 0), At(1, 0), At(2, 0)])?;
+    explore(&[At(0, 0), At(2, 0), At(0, 1)])
+}
+
+/// Searches the states breadth first. Memory holds a delay queue that cannot
+/// be cloned, so each state is rebuilt from its shortest path.
+fn explore(coordinates: &[At]) -> Result<()> {
+    let ops = alphabet(coordinates);
+    let mut seen = HashSet::new();
+    let mut paths = VecDeque::from([Vec::new()]);
+    while let Some(path) = paths.pop_front() {
+        for &op in &ops {
+            let mut next = path.clone();
+            next.push(op);
+            let held = replay(next.iter().copied())
+                .map_err(|error| error.wrap_err(format!("path {next:?}")))?;
+            if seen.insert(held) {
+                paths.push_back(next);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every operation on `coordinates` with two tags.
+fn alphabet(coordinates: &[At]) -> Vec<Op> {
+    const OUTCOMES: [Outcome; 3] = [Outcome::Unchanged, Outcome::Unknown, Outcome::Done];
+    let types: BTreeSet<_> = coordinates.iter().map(|at| at.1).collect();
+    let mut ops: Vec<_> = types
+        .into_iter()
+        .flat_map(|ty| OUTCOMES.map(|outcome| Op::UnscheduleAll(ty, outcome)))
+        .collect();
+    for &at in coordinates {
+        ops.extend([Op::Abort(at), Op::Pop(at), Op::Load(at)]);
+        for outcome in OUTCOMES {
+            ops.extend([Op::Unschedule(at, outcome), Op::Complete(at, outcome)]);
+            for tag in [0_i32, 1_i32] {
+                for insert in [Insert::Schedule, Insert::Clear, Insert::Repair] {
+                    ops.push(Op::Insert(at, insert, tag, outcome));
+                }
+            }
+        }
+        ops.extend([Op::Fire(at, 0), Op::Fire(at, 1)]);
+    }
+    ops
+}
+
+/// Applies `ops` to empty memory, checks after each one, and returns what
+/// every coordinate holds at the end.
+fn replay(ops: impl IntoIterator<Item = Op>) -> Result<Vec<Held>> {
+    // The delay queue needs the timer of a runtime.
+    let runtime = Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()?;
+    let _runtime = runtime.enter();
     let mut timers = Timers::default();
     let mut rows = Rows::default();
     for (step, op) in ops.into_iter().enumerate() {
@@ -72,7 +148,21 @@ fn run(ops: Vec<Op>) -> Result<()> {
             .and_then(|()| check(&timers, &rows))
             .map_err(|error| error.wrap_err(format!("step {step}: {op:?}")))?;
     }
-    Ok(())
+    let held = |(time, ty)| {
+        let entry = entry(&timers, At(time, ty)).map(|entry| {
+            let next = entry.next.as_ref();
+            let firing = entry.firing.map(|delivery| delivery == Delivery::Deleted);
+            (
+                next.map(|next| (next.trigger.tag, next.queued.is_some())),
+                firing,
+            )
+        });
+        (rows[time][ty], entry)
+    };
+    Ok((0..TIMES.len())
+        .flat_map(|time| (0..TYPES.len()).map(move |ty| (time, ty)))
+        .map(held)
+        .collect())
 }
 
 /// Applies `op`, and checks the rules of the operation itself: a removal that
@@ -171,8 +261,12 @@ fn check(timers: &Timers, rows: &Rows) -> Result<()> {
                 continue;
             };
             ensure!(
-                row != Stored::Absent || entry.firing,
+                row != Stored::Absent || entry.firing.is_some(),
                 "an entry stands for no row and no delivery"
+            );
+            ensure!(
+                row == Stored::Absent || entry.firing != Some(Delivery::Deleted),
+                "a delivery marks its row deleted, but the row may exist"
             );
             if let (Some(next), Stored::Present(tag)) = (&entry.next, row) {
                 ensure!(
