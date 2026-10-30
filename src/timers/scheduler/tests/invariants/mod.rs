@@ -37,9 +37,9 @@ use crate::timers::slab::SlabId;
 use crate::timers::test_support::Memory;
 use ahash::HashMap;
 use checks::check_invariants;
+use color_eyre::eyre::{Result, WrapErr};
 use fixture::Fixture;
-use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
-use std::result::Result as StdResult;
+use quickcheck::{Arbitrary, Gen, QuickCheck};
 use strum::VariantArray;
 use tokio::runtime::Builder as RuntimeBuilder;
 
@@ -189,7 +189,7 @@ fn build_universe(now_slab: SlabId) -> Vec<(Key, CompactDateTime, TimerType)> {
     out
 }
 
-async fn run_property(ops: Vec<Op>) -> StdResult<(), String> {
+async fn run_property(ops: Vec<Op>) -> Result<()> {
     let mut fixture = Fixture::new().await?;
     let same = TriggerSpec {
         key_idx: 0,
@@ -209,32 +209,22 @@ async fn run_property(ops: Vec<Op>) -> StdResult<(), String> {
         fixture
             .apply(op.clone())
             .await
-            .map_err(|e| format!("op #{i} {op:?}: {e}\nhistory: {history:#?}"))?;
+            .wrap_err_with(|| format!("op #{i} {op:?}\nhistory: {history:#?}"))?;
         check_invariants(&fixture)
             .await
-            .map_err(|e| format!("after op #{i} {op:?}: {e}\nhistory: {history:#?}"))?;
+            .wrap_err_with(|| format!("after op #{i} {op:?}\nhistory: {history:#?}"))?;
     }
     Ok(())
 }
 
 #[test]
 fn prop_scheduler_invariants() {
-    fn property(seq: OpSequence) -> TestResult {
-        let runtime = match RuntimeBuilder::new_current_thread()
+    fn property(seq: OpSequence) -> Result<()> {
+        RuntimeBuilder::new_current_thread()
             .enable_all()
             .start_paused(true)
-            .build()
-        {
-            Ok(r) => r,
-            Err(e) => return TestResult::error(format!("runtime build: {e:?}")),
-        };
-        match runtime.block_on(run_property(seq.0)) {
-            Ok(()) => TestResult::passed(),
-            Err(e) => TestResult::error(e),
-        }
+            .build()?
+            .block_on(run_property(seq.0))
     }
-
-    // Iteration count is read from the `QUICKCHECK_TESTS` env var, with
-    // quickcheck's built-in default applying when unset. Never hardcoded.
-    QuickCheck::new().quickcheck(property as fn(OpSequence) -> TestResult);
+    QuickCheck::new().quickcheck(property as fn(OpSequence) -> Result<()>);
 }

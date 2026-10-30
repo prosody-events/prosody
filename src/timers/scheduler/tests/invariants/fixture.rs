@@ -16,7 +16,7 @@ use crate::timers::store::{Segment, TriggerStore};
 use crate::timers::test_support::Memory;
 use crate::timers::test_support::test_segment;
 use crate::timers::{TimerType, Trigger, TriggerId};
-use std::result::Result as StdResult;
+use color_eyre::eyre::{OptionExt, Result, WrapErr, bail};
 use tracing::Span;
 
 /// The actor under test and the model that it must match.
@@ -35,15 +35,12 @@ pub(super) struct Fixture {
 }
 
 impl Fixture {
-    pub(super) async fn new() -> StdResult<Self, String> {
+    pub(super) async fn new() -> Result<Self> {
         let segment = test_segment("scheduler-test", SLAB_SIZE_SECS);
         let store = memory_store(segment.clone());
-        store
-            .insert_segment()
-            .await
-            .map_err(|e| format!("insert_segment: {e:?}"))?;
+        store.insert_segment().await.wrap_err("insert_segment")?;
 
-        let now = CompactDateTime::now().map_err(|e| format!("wall-clock now: {e:?}"))?;
+        let now = CompactDateTime::now().wrap_err("wall-clock now")?;
         let now_slab = Slab::from_time(segment.slab_size, now).id();
         let actor = Actor::new(fresh_state(store.clone(), segment.clone()));
         Ok(Self {
@@ -56,7 +53,7 @@ impl Fixture {
         })
     }
 
-    pub(super) async fn apply(&mut self, op: Op) -> StdResult<(), String> {
+    pub(super) async fn apply(&mut self, op: Op) -> Result<()> {
         match op {
             Op::Schedule(spec, stop) => self.apply_schedule(spec, stop).await,
             Op::Unschedule(spec) => self.apply_unschedule(spec).await,
@@ -72,7 +69,7 @@ impl Fixture {
         }
     }
 
-    async fn apply_schedule(&mut self, spec: TriggerSpec, stop: Stop) -> StdResult<(), String> {
+    async fn apply_schedule(&mut self, spec: TriggerSpec, stop: Stop) -> Result<()> {
         let (key, time, ty) = spec.resolve(self.now_slab);
         let mut model = self.model_for(&key, time, ty);
         let slab_id = Slab::from_time(self.segment.slab_size, time).id();
@@ -87,7 +84,7 @@ impl Fixture {
             .actor
             .serve(scheduler.insert(trigger, Insert::Schedule))
             .await
-            .map_err(|e| format!("insert: {e:?}"))?;
+            .wrap_err("insert")?;
         if past_unregistered {
             assert_past_watermark_pull(self, slab_id, old_watermark)?;
         }
@@ -101,7 +98,7 @@ impl Fixture {
                     if stop == Stop::Never {
                         Ok(())
                     } else {
-                        Err(format!("the write of a {stop:?} schedule stops"))
+                        bail!("the write of a {stop:?} schedule stops")
                     }
                 };
                 // The error of a stopped write is the point of the op.
@@ -121,7 +118,7 @@ impl Fixture {
         Ok(())
     }
 
-    async fn apply_unschedule(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
+    async fn apply_unschedule(&mut self, spec: TriggerSpec) -> Result<()> {
         let (key, time, ty) = spec.resolve(self.now_slab);
         let mut model = self.model_for(&key, time, ty);
         let scheduler = self.actor.scheduler();
@@ -129,12 +126,12 @@ impl Fixture {
             .actor
             .serve(scheduler.unschedule(TriggerId::new(&key, time, ty)))
             .await
-            .map_err(|e| format!("unschedule: {e:?}"))?;
+            .wrap_err("unschedule")?;
         if let Some(ticket) = started {
             ticket
                 .run(self.store.remove_trigger(&key, time, ty))
                 .await
-                .map_err(|e| format!("remove_trigger: {e:?}"))?;
+                .wrap_err("remove_trigger")?;
             model = TriggerModel::default();
         } else {
             model.memory = Some(Memory::Firing { again: false });
@@ -144,14 +141,12 @@ impl Fixture {
         Ok(())
     }
 
-    async fn apply_fire(&mut self) -> StdResult<(), String> {
+    async fn apply_fire(&mut self) -> Result<()> {
         let Some(trigger) = self.actor.timers.next().await else {
             return Ok(());
         };
         if !self.actor.timers.fire(&trigger.id(), trigger.tag) {
-            return Err(format!(
-                "the attempt that left the queue did not fire: {trigger:?}"
-            ));
+            bail!("the attempt that left the queue did not fire: {trigger:?}");
         }
         let (key, time, ty) = (trigger.key, trigger.time, trigger.timer_type);
         let mut model = self.model_for(&key, time, ty);
@@ -160,7 +155,7 @@ impl Fixture {
         Ok(())
     }
 
-    async fn apply_abort(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
+    async fn apply_abort(&mut self, spec: TriggerSpec) -> Result<()> {
         let (key, time, ty) = spec.resolve(self.now_slab);
         // No attempt here waits outside the queue, so only a delivery aborts.
         self.actor
@@ -177,8 +172,8 @@ impl Fixture {
         Ok(())
     }
 
-    async fn apply_restart(&mut self, stale_watermark: bool) -> StdResult<(), String> {
-        let now = CompactDateTime::now().map_err(|e| format!("wall-clock now: {e:?}"))?;
+    async fn apply_restart(&mut self, stale_watermark: bool) -> Result<()> {
+        let now = CompactDateTime::now().wrap_err("wall-clock now")?;
         if stale_watermark {
             let old_slab = Slab::from_time(CompactDuration::new(60), now);
             let Ok(()) = self
@@ -187,7 +182,7 @@ impl Fixture {
                 .await;
         }
         let Ok(segment) = self.store.get_segment().await;
-        let segment = segment.ok_or("restart: segment missing")?;
+        let segment = segment.ok_or_eyre("restart: segment missing")?;
         self.actor = Actor::new(start_state(self.store.clone(), segment, now));
         for model in self.expected.values_mut() {
             model.memory = None;

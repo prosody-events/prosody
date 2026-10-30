@@ -15,7 +15,7 @@ use crate::timers::test_support::{
 use crate::timers::uncommitted::UncommittedTriggerGuard;
 use color_eyre::eyre::{OptionExt, Result, eyre};
 use futures::{StreamExt, pin_mut};
-use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;

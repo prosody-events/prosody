@@ -290,25 +290,14 @@ where
 /// New schedules use a different identity in memory and both indexes.
 #[test]
 fn prop_queued_attempt_identity() {
-    QuickCheck::new()
-        .quickcheck(prop_queued_attempt_identity_inner as fn(IdentityTrace) -> TestResult);
-}
-
-fn prop_queued_attempt_identity_inner(trace: IdentityTrace) -> TestResult {
-    let runtime = match Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => return TestResult::error(format!("runtime build failed: {error}")),
-    };
-    runtime.block_on(async {
-        match run_identity_trace(trace).await {
-            Ok(()) => TestResult::passed(),
-            Err(error) => TestResult::error(format!("{error:?}")),
-        }
-    })
+    fn property(trace: IdentityTrace) -> Result<()> {
+        Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()?
+            .block_on(run_identity_trace(trace))
+    }
+    QuickCheck::new().quickcheck(property as fn(IdentityTrace) -> Result<()>);
 }
 
 async fn run_identity_trace(trace: IdentityTrace) -> Result<()> {

@@ -36,30 +36,27 @@ pub(crate) enum Outcome {
 pub(crate) struct Change {
     pub(super) key: Key,
     pub(super) timer_type: TimerType,
-    /// The attempt that the operation writes.
-    pub(super) insert: Option<Inserted>,
-    /// The rows that the operation deletes.
-    pub(super) deleted: Deleted,
+    pub(super) rows: Rows,
     /// The attempts that the start took, to put back if the rows stay.
     pub(super) restore: SmallVec<[Trigger; 1]>,
 }
 
+/// The rows of the key and type that an operation changes.
 #[derive(Debug)]
-pub(super) struct Inserted {
-    pub(super) trigger: Trigger,
-    /// Whether the start made the entry.
-    pub(super) created: bool,
-}
-
-/// The rows of the key and type that an operation deletes.
-#[derive(Debug)]
-pub(super) enum Deleted {
-    Nothing,
-    At(CompactDateTime),
-    /// Every row except the rows at these times. A slab load during the
-    /// change can add entries for the deleted rows, so the end of a done
+pub(super) enum Rows {
+    /// Writes the row of `trigger`. A clear also deletes every other row.
+    Write {
+        trigger: Trigger,
+        insert: Insert,
+        /// Whether the start made the entry.
+        created: bool,
+    },
+    /// Deletes the row at this time.
+    Remove(CompactDateTime),
+    /// Deletes every row except the rows at these times. A slab load during
+    /// the change can add entries for the deleted rows, so the end of a done
     /// change drops every entry at another time.
-    AllBut(SmallVec<[CompactDateTime; 1]>),
+    RemoveAll(SmallVec<[CompactDateTime; 1]>),
 }
 
 impl Change {

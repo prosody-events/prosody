@@ -103,7 +103,7 @@ where
     T: TriggerStore,
 {
     stream::iter(slab_ids.iter().copied())
-        .map(|slab_id| store.delete_slab(slab_id))
+        .map(|slab_id| cooperative(store.delete_slab(slab_id)))
         .buffer_unordered(DELETE_CONCURRENCY)
         .try_collect::<()>()
         .await

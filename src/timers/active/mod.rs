@@ -9,8 +9,8 @@
 //! An operation that changes a row starts in the actor, changes the row
 //! outside it, and then ends in the actor. Its [`Change`] carries what the end
 //! needs. The actor runs one operation at a time on each key and timer type.
-//! Between a start and its end, only slab loads, the delay queue, fires and
-//! aborts change the entries of that key and type.
+//! Between a start and its end, only slab loads and the delay queue change the
+//! entries of that key and type.
 //!
 //! # Durable row invariant
 //!
@@ -34,8 +34,8 @@ use tokio_util::time::DelayQueue;
 mod change;
 mod entry;
 
+use change::Rows;
 pub(crate) use change::{Change, Insert, Outcome};
-use change::{Deleted, Inserted};
 use entry::{Coordinates, Delivery, Next, get_mut, get_or_insert, retain};
 
 /// The in-memory timers of one partition.
@@ -75,14 +75,11 @@ impl Timers {
         mut trigger: Trigger,
         insert: Insert,
     ) -> (Trigger, Change) {
-        let (deleted, restore) = match insert {
-            Insert::Clear => (
-                Deleted::AllBut(SmallVec::from_buf([trigger.time])),
-                self.take_all(&trigger.key, trigger.timer_type, |time| {
-                    time != trigger.time
-                }),
-            ),
-            Insert::Schedule | Insert::Repair => (Deleted::Nothing, SmallVec::new()),
+        let restore = match insert {
+            Insert::Clear => self.take_all(&trigger.key, trigger.timer_type, |time| {
+                time != trigger.time
+            }),
+            Insert::Schedule | Insert::Repair => SmallVec::new(),
         };
         let (created, entry) = get_or_insert(
             &mut self.entries,
@@ -98,11 +95,11 @@ impl Timers {
         let change = Change {
             key: trigger.key.clone(),
             timer_type: trigger.timer_type,
-            insert: Some(Inserted {
+            rows: Rows::Write {
                 trigger: trigger.clone(),
+                insert,
                 created,
-            }),
-            deleted,
+            },
             restore,
         };
         (trigger, change)
@@ -147,8 +144,7 @@ impl Timers {
             restore: self.take_all(&key, timer_type, |_| true),
             key,
             timer_type,
-            insert: None,
-            deleted: Deleted::AllBut(firing.clone()),
+            rows: Rows::RemoveAll(firing.clone()),
         };
         (change, firing)
     }
@@ -206,23 +202,31 @@ impl Timers {
         let Change {
             key,
             timer_type,
-            insert,
-            deleted,
+            rows,
             restore,
         } = change;
-        match (outcome, deleted) {
-            (Outcome::Done, Deleted::Nothing) => {}
-            (Outcome::Done, Deleted::At(at)) => self.drop_rows(&key, timer_type, |time| time == at),
-            (Outcome::Done, Deleted::AllBut(kept)) => {
-                self.drop_rows(&key, timer_type, |time| !kept.contains(&time));
-            }
-            (Outcome::Unchanged | Outcome::Unknown, _) => {
-                for trigger in restore {
-                    self.restore(trigger);
+        if outcome == Outcome::Done {
+            match &rows {
+                Rows::Write {
+                    trigger,
+                    insert: Insert::Clear,
+                    ..
+                } => self.drop_rows(&key, timer_type, |time| time != trigger.time),
+                Rows::Write { .. } => {}
+                Rows::Remove(at) => self.drop_rows(&key, timer_type, |time| time == *at),
+                Rows::RemoveAll(kept) => {
+                    self.drop_rows(&key, timer_type, |time| !kept.contains(&time));
                 }
             }
+        } else {
+            for trigger in restore {
+                self.restore(trigger);
+            }
         }
-        if let Some(Inserted { trigger, created }) = insert {
+        if let Rows::Write {
+            trigger, created, ..
+        } = rows
+        {
             if outcome == Outcome::Unchanged {
                 if created {
                     self.forget(&key, trigger.time, timer_type);
@@ -398,8 +402,7 @@ impl Timers {
         Change {
             key,
             timer_type,
-            insert: None,
-            deleted: Deleted::At(time),
+            rows: Rows::Remove(time),
             restore,
         }
     }

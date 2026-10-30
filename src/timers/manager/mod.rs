@@ -36,8 +36,8 @@ use educe::Educe;
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, stream, try_join};
 use std::sync::Arc;
 use tokio::sync::watch;
+use tokio::task::coop::cooperative;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{Instrument, Span};
 
 /// Configuration for a [`TimerManager`] instance.
 ///
@@ -266,7 +266,6 @@ where
 
         // The read runs in the operation, so it sees the rows of the
         // operations before it on the key and type.
-        let span = Span::current();
         let deletes = async {
             let mut times: Vec<_> = inner
                 .store
@@ -275,12 +274,7 @@ where
                 .await?;
             times.retain(|time| !firing.contains(time));
             stream::iter(times.iter().copied())
-                .map(|time| {
-                    inner
-                        .store
-                        .remove_trigger(key, time, timer_type)
-                        .instrument(span.clone())
-                })
+                .map(|time| cooperative(inner.store.remove_trigger(key, time, timer_type)))
                 .buffer_unordered(DELETE_CONCURRENCY)
                 .try_collect::<()>()
                 .await?;

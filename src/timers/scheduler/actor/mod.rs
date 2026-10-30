@@ -195,10 +195,6 @@ pub(super) async fn process_command<T>(
             }
             waiting.remove();
         }
-        Command::Abort { id, tag } => timers.abort(&id, tag),
-        Command::Fire { id, tag, reply } => {
-            let _ = reply.send(timers.fire(&id, tag));
-        }
         Command::List {
             key,
             timer_type,
@@ -212,7 +208,8 @@ pub(super) async fn process_command<T>(
     }
 }
 
-/// Starts an operation. Returns whether it runs: its caller holds its ticket.
+/// Runs a command on a free lane. Returns whether it starts an operation that
+/// runs: its caller holds its ticket.
 async fn begin<T>(
     state: &mut ActorState<T>,
     timers: &mut Timers,
@@ -229,6 +226,8 @@ where
     };
     // A caller that left before its reply never ran the row change.
     let returned = match start {
+        // An insert whose caller left skips its slab write.
+        Start::Insert { reply, .. } if reply.is_closed() => None,
         Start::Insert {
             trigger,
             insert,
@@ -259,6 +258,14 @@ where
             let change = timers.start_complete(id.key, id.time, id.timer_type);
             reply.send(change.map(ticket)).err().flatten()
         }
+        Start::Fire { id, tag, reply } => {
+            let _ = reply.send(timers.fire(&id, tag));
+            None
+        }
+        Start::Abort { id, tag } => {
+            timers.abort(&id, tag);
+            None
+        }
     };
     if let Some(change) = returned.and_then(Ticket::into_change) {
         end(state, timers, change, Outcome::Unchanged);
@@ -278,9 +285,9 @@ fn end<T>(state: &ActorState<T>, timers: &mut Timers, change: Change, outcome: O
 /// Registers the slab that holds `time` before an insert writes its row.
 ///
 /// A slab at or below the persisted watermark routes through an atomic
-/// UNLOGGED BATCH that also lowers the watermark (invariant I6). This is the
-/// only way the actor can pull a slab back below its own high-water without
-/// violating I1.
+/// UNLOGGED BATCH that also lowers the watermark below it. This is the only
+/// way the actor can pull a slab back below its own high-water and keep
+/// invariant I1 of [`StoredSegment`].
 pub(super) async fn register_slab<T>(
     state: &mut ActorState<T>,
     time: CompactDateTime,
@@ -297,7 +304,6 @@ where
     if let Some(old_watermark) = state.last_persisted_watermark
         && slab_id <= old_watermark
     {
-        // I6: atomically write the slab row and lower the watermark.
         let new_watermark = slab_id.checked_sub(1);
         state
             .store

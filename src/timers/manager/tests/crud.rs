@@ -8,7 +8,7 @@ use crate::timers::duration::CompactDuration;
 use crate::timers::store::tests::common::KEY_POOL;
 use crate::timers::test_support::setup_timer_manager;
 use color_eyre::eyre::Result;
-use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::collections::BTreeSet;
 use tokio::runtime::Builder;
 use tokio::time;
@@ -32,22 +32,13 @@ const TYPES: [TimerType; 2] = [TimerType::Application, TimerType::DeferredMessag
 /// and time pool.
 #[test]
 fn prop_crud_scheduled_times_oracle() {
-    QuickCheck::new()
-        .quickcheck(prop_crud_scheduled_times_oracle_inner as fn(CrudTrace) -> TestResult);
-}
-
-fn prop_crud_scheduled_times_oracle_inner(trace: CrudTrace) -> TestResult {
-    let runtime = match Builder::new_current_thread().enable_all().build() {
-        Ok(runtime) => runtime,
-        Err(error) => return TestResult::error(format!("runtime build failed: {error}")),
-    };
-
-    runtime.block_on(async {
-        match run_crud_trace(trace).await {
-            Ok(()) => TestResult::passed(),
-            Err(error) => TestResult::error(format!("{error:?}")),
-        }
-    })
+    fn property(trace: CrudTrace) -> Result<()> {
+        Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_crud_trace(trace))
+    }
+    QuickCheck::new().quickcheck(property as fn(CrudTrace) -> Result<()>);
 }
 
 async fn run_crud_trace(trace: CrudTrace) -> Result<()> {

@@ -60,16 +60,8 @@ pub struct TriggerScheduler<E> {
 pub(super) enum Command<E> {
     /// Starts an operation that changes a row.
     Start(Start<E>),
-    /// Aborts a delivery, or the delivered attempt with `tag`.
-    Abort { id: TriggerId, tag: i32 },
     /// Ends an operation.
     End(Change, Outcome),
-    /// Starts the delivery of the attempt with `tag` that left the queue.
-    Fire {
-        id: TriggerId,
-        tag: i32,
-        reply: oneshot::Sender<bool>,
-    },
     /// Lists the times of a key that memory decides.
     List {
         key: Key,
@@ -83,9 +75,10 @@ pub(super) enum Command<E> {
     },
 }
 
-/// The start of an operation that changes a row. The actor runs one
-/// operation at a time on each key and timer type, so a start waits for the
-/// end of the operation before it.
+/// A command on the timers of one key and timer type. The actor runs one
+/// operation at a time on each key and type, and each of these commands waits
+/// for the end of the operation before it. Thus no fire or abort comes between
+/// the start and the end of an operation.
 #[derive(Debug)]
 pub(super) enum Start<E> {
     /// Registers the slab of `trigger`, and starts its insert.
@@ -110,6 +103,14 @@ pub(super) enum Start<E> {
         id: TriggerId,
         reply: oneshot::Sender<Option<Ticket<E>>>,
     },
+    /// Starts the delivery of the attempt with `tag` that left the queue.
+    Fire {
+        id: TriggerId,
+        tag: i32,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Aborts a delivery, or the delivered attempt with `tag`.
+    Abort { id: TriggerId, tag: i32 },
 }
 
 /// An operation that the actor started.
@@ -224,7 +225,9 @@ where
     /// fired. The row stays for recovery.
     pub(crate) fn abort(&self, id: TriggerId, tag: i32) {
         // A closed channel means the actor stopped, and its state is gone.
-        let _ = self.command_tx.send(Command::Abort { id, tag });
+        let _ = self
+            .command_tx
+            .send(Command::Start(Start::Abort { id, tag }));
     }
 
     /// Starts the delivery of the attempt with `tag` if it is still the
@@ -234,7 +237,8 @@ where
         id: TriggerId,
         tag: i32,
     ) -> Result<bool, TimerSchedulerError<E>> {
-        self.request(|reply| Command::Fire { id, tag, reply }).await
+        self.request(|reply| Command::Start(Start::Fire { id, tag, reply }))
+            .await
     }
 
     /// Lists the times of a key that memory decides.
@@ -274,13 +278,14 @@ where
 }
 
 impl<E> Start<E> {
-    /// The key and timer type of the operation.
+    /// The key and timer type of the command.
     fn lane(&self) -> (Key, TimerType) {
         match self {
             Self::Insert { trigger, .. } => (trigger.key.clone(), trigger.timer_type),
-            Self::Unschedule { id, .. } | Self::Complete { id, .. } => {
-                (id.key.clone(), id.timer_type)
-            }
+            Self::Unschedule { id, .. }
+            | Self::Complete { id, .. }
+            | Self::Fire { id, .. }
+            | Self::Abort { id, .. } => (id.key.clone(), id.timer_type),
             Self::UnscheduleAll {
                 key, timer_type, ..
             } => (key.clone(), *timer_type),
