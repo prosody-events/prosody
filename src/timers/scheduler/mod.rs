@@ -1,102 +1,139 @@
-//! Asynchronous in-memory scheduler for timer triggers.
+//! The timer scheduler: one actor task that owns all in-memory timer state.
 //!
-//! Provides [`TriggerScheduler`] backed by a single actor task that owns:
+//! [`TriggerScheduler`] is the handle. Every read and change of timer memory is
+//! a command to the actor, so the actor applies them in the order of sending.
+//! The actor owns:
 //!
-//! - **Slab metadata** writes: when a command schedules a trigger for a slab
-//!   the actor hasn't seen, it writes the slab clustering row to persistent
-//!   storage. Past-time slabs (`slab.id <= last_persisted_watermark`) route
-//!   through an atomic UNLOGGED BATCH that also lowers the watermark, so
+//! - **Timer memory**: the [`Timers`](crate::timers::active::Timers) of the
+//!   partition.
+//! - **Slab metadata** writes: before an insert, the actor registers the slab
+//!   of the timer. Past-time slabs (`slab.id <= last_persisted_watermark`)
+//!   route through an atomic UNLOGGED BATCH that also lowers the watermark, so
 //!   invariant I1 holds across crashes.
 //! - **Slab preloading**: future slabs are loaded from the store and their
-//!   triggers inserted into the in-memory queue.
+//!   triggers queued.
 //! - **Slab cleanup**: completed slabs are deleted from the store; the
-//!   watermark is raised opportunistically so the next restart skips the
-//!   tombstones.
+//!   watermark is raised so the next restart skips the tombstones.
 //!
-//! Load and cleanup process one slab per `select!` arm invocation, so
-//! Cassandra round-trips yield back to command processing and trigger
-//! emission between slabs.
+//! An operation that changes a row is a start command, a row change that the
+//! caller runs, and an end command. The start returns a [`Ticket`], which sends
+//! the end when it drops. A caller that stops early thus ends its operation at
+//! once, before it or anyone else on the key can start another operation.
 
 use crate::Key;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::heartbeat::HeartbeatRegistry;
-use crate::timers::active::ActiveTriggers;
-use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
-use crate::timers::queue::TriggerQueue;
+use crate::timers::active::{Change, Insert, Listed, Outcome, TimerSnapshot};
+use crate::timers::datetime::CompactDateTime;
 use crate::timers::store::{StoredSegment, TriggerStore};
-use crate::timers::{TimerType, Trigger};
-use futures::TryFutureExt;
+use crate::timers::{TimerType, Trigger, TriggerId};
+use educe::Educe;
+use smallvec::SmallVec;
 use std::error::Error as StdError;
 use thiserror::Error;
 use tokio::spawn;
+use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
 use tokio::sync::{mpsc, oneshot, watch};
 
 mod actor;
-
 #[cfg(test)]
 pub(crate) mod tests;
 
-/// Size of the internal command and trigger channels.
+/// Size of the channel of expired triggers.
 const BUFFER_SIZE: usize = 64;
 
 /// Asynchronous scheduler for timer [`Trigger`]s.
 ///
-/// Cloning shares the same underlying actor task and active-triggers
-/// registry.
-#[derive(Debug)]
+/// Cloning shares the same actor task. A command send never waits, so a
+/// dropped call cannot leave a command half sent. The command channel has no
+/// bound: a live call waits for the reply to each command, and a dropped call
+/// sends at most one more command.
+#[derive(Debug, Educe)]
+#[educe(Clone(bound()))]
 pub struct TriggerScheduler<E> {
-    command_tx: mpsc::Sender<Command<E>>,
-    active_triggers: ActiveTriggers,
+    command_tx: UnboundedSender<Command<E>>,
 }
 
-impl<E> Clone for TriggerScheduler<E> {
-    fn clone(&self) -> Self {
-        Self {
-            command_tx: self.command_tx.clone(),
-            active_triggers: self.active_triggers.clone(),
-        }
-    }
-}
-
-/// Command sent from `TriggerScheduler` handles to the actor task.
-///
-/// Carries an `oneshot` reply so the caller can observe success, a store
-/// error (currently only the Schedule operation can produce one), or a
-/// shutdown signal via the channel being closed.
+/// A command to the actor. A command that replies carries the reply sender.
 #[derive(Debug)]
-pub(super) struct Command<E> {
-    pub(super) operation: CommandOperation,
-    pub(super) trigger: Trigger,
-    pub(super) result_tx: oneshot::Sender<Result<(), E>>,
+pub(super) enum Command<E> {
+    /// Starts an operation that changes a row.
+    Start(Start<E>),
+    /// Ends an operation.
+    End(Change, Outcome),
+    /// Lists the times of a key that memory decides.
+    List {
+        key: Key,
+        timer_type: TimerType,
+        reply: oneshot::Sender<SmallVec<[(CompactDateTime, Listed); 2]>>,
+    },
+    /// Counts the timers in memory.
+    Snapshot {
+        now: CompactDateTime,
+        reply: oneshot::Sender<TimerSnapshot>,
+    },
 }
 
-/// Operation variants for [`Command`].
-#[derive(Copy, Clone, Debug)]
-pub(super) enum CommandOperation {
-    /// Insert a trigger: persist slab metadata + add to `TriggerQueue`/
-    /// `ActiveTriggers`.
-    Add,
-    /// Remove a trigger from both `DelayQueue` and `ActiveTriggers`.
-    Remove,
-    /// Remove the coordinate only if no replacement tag stands.
-    RetireCommitted,
-    /// Remove the queue entry and preserve its registry state.
-    RemoveFromQueue,
+/// A command on the timers of one key and timer type. The actor runs one
+/// operation at a time on each key and type, and each of these commands waits
+/// for the end of the operation before it. Thus no fire or abort comes between
+/// the start and the end of an operation.
+#[derive(Debug)]
+pub(super) enum Start<E> {
+    /// Registers the slab of `trigger`, and starts its insert.
+    Insert {
+        trigger: Trigger,
+        insert: Insert,
+        reply: oneshot::Sender<Result<(Trigger, Ticket<E>), E>>,
+    },
+    /// Starts the removal of one timer.
+    Unschedule {
+        id: TriggerId,
+        reply: oneshot::Sender<Option<Ticket<E>>>,
+    },
+    /// Starts the removal of every timer of a key and type.
+    UnscheduleAll {
+        key: Key,
+        timer_type: TimerType,
+        reply: oneshot::Sender<(Ticket<E>, SmallVec<[CompactDateTime; 1]>)>,
+    },
+    /// Ends a delivery.
+    Complete {
+        id: TriggerId,
+        reply: oneshot::Sender<Option<Ticket<E>>>,
+    },
+    /// Starts the delivery of the attempt with `tag` that left the queue.
+    Fire {
+        id: TriggerId,
+        tag: i32,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Aborts a delivery, or the delivered attempt with `tag`.
+    Abort { id: TriggerId, tag: i32 },
+}
+
+/// An operation that the actor started.
+///
+/// It ends when it drops. Before [`Ticket::run`], the row is unchanged. During
+/// it, the row change has an unknown result. After it succeeds, the row change
+/// is done.
+#[derive(Debug)]
+pub(crate) struct Ticket<E> {
+    change: Option<Change>,
+    outcome: Outcome,
+    commands: WeakUnboundedSender<Command<E>>,
 }
 
 impl<E> TriggerScheduler<E>
 where
     E: ClassifyError + StdError + Send + Sync + 'static,
 {
-    /// Creates a new scheduler, spawning the unified actor task.
+    /// Creates a new scheduler, spawning the actor task.
     ///
-    /// The actor owns the trigger queue, slab metadata writes, slab loads,
-    /// and slab cleanup. `store` must be `Clone` so the manager can keep its
-    /// own handle for trigger-row writes; the actor serves commands through
-    /// `Draining` (so settling handlers can still schedule) and exits at
-    /// `shutdown_rx >= Cancelling`. Returns the receiver end of the
-    /// expired-trigger channel along with the scheduler handle.
+    /// The actor serves commands through `Draining` (so settling handlers can
+    /// still schedule) and exits at `shutdown_rx >= Cancelling`. Returns the
+    /// receiver end of the expired-trigger channel along with the handle.
     pub fn new<T>(
         store: T,
         segment: StoredSegment,
@@ -106,100 +143,191 @@ where
     where
         T: TriggerStore<Error = E>,
     {
-        let (command_tx, commands_rx) = mpsc::channel(BUFFER_SIZE);
+        let (scheduler, commands_rx) = Self::channel();
         let (trigger_tx, triggers_rx) = mpsc::channel(BUFFER_SIZE);
-        let triggers = TriggerQueue::new();
-        let active_triggers = triggers.active_triggers().clone();
         let heartbeat = heartbeats.register("timer scheduler");
 
         spawn(actor::run_actor(
             store,
             segment,
-            triggers,
+            scheduler.command_tx.downgrade(),
             commands_rx,
             trigger_tx,
             heartbeat,
             shutdown_rx,
         ));
 
-        (
-            triggers_rx,
-            Self {
-                command_tx,
-                active_triggers,
-            },
-        )
+        (triggers_rx, scheduler)
     }
 
-    /// Returns a reference to the set of active triggers.
-    pub fn active_triggers(&self) -> &ActiveTriggers {
-        &self.active_triggers
+    /// Creates a handle and the receiver of its commands.
+    fn channel() -> (Self, mpsc::UnboundedReceiver<Command<E>>) {
+        let (command_tx, commands_rx) = mpsc::unbounded_channel();
+        (Self { command_tx }, commands_rx)
     }
 
-    /// Schedule a new [`Trigger`] for future emission.
-    ///
-    /// The actor persists slab metadata (if not already known) and inserts
-    /// the trigger into the in-memory queue. If the slab is at or below the
-    /// current watermark, the slab insert and watermark update are written
-    /// in one UNLOGGED BATCH.
-    pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerSchedulerError<E>> {
-        self.send_command(CommandOperation::Add, trigger).await
-    }
-
-    /// Unschedule a previously scheduled [`Trigger`].
-    pub async fn unschedule(&self, trigger: Trigger) -> Result<(), TimerSchedulerError<E>> {
-        self.send_command(CommandOperation::Remove, trigger).await
-    }
-
-    /// Removes a committed attempt and preserves a replacement tag.
-    pub(crate) async fn retire_committed(
+    /// Starts an insert of `trigger`. Returns the attempt to write, which
+    /// keeps the tag of an attempt that waits, and the ticket of the insert.
+    pub(crate) async fn insert(
         &self,
         trigger: Trigger,
-    ) -> Result<(), TimerSchedulerError<E>> {
-        self.send_command(CommandOperation::RetireCommitted, trigger)
-            .await
-    }
-
-    /// Remove a trigger from the `DelayQueue` without modifying
-    /// `ActiveTriggers`.
-    pub(crate) async fn remove_from_queue(
-        &self,
-        trigger: Trigger,
-    ) -> Result<(), TimerSchedulerError<E>> {
-        self.send_command(CommandOperation::RemoveFromQueue, trigger)
-            .await
-    }
-
-    /// Transitions a timer from `Scheduled` to `Firing` state.
-    ///
-    /// Returns `true` if the transition succeeded.
-    pub(crate) async fn fire(&self, trigger: &Trigger) -> bool {
-        self.active_triggers.fire(trigger).await
-    }
-
-    /// Deactivate a trigger without removing it from the persistent queue.
-    pub async fn deactivate(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
-        self.active_triggers.remove(key, time, timer_type).await;
-    }
-
-    async fn send_command(
-        &self,
-        operation: CommandOperation,
-        trigger: Trigger,
-    ) -> Result<(), TimerSchedulerError<E>> {
-        let (result_tx, result_rx) = oneshot::channel();
-        self.command_tx
-            .send(Command {
-                operation,
+        insert: Insert,
+    ) -> Result<(Trigger, Ticket<E>), TimerSchedulerError<E>> {
+        self.request(|reply| {
+            Command::Start(Start::Insert {
                 trigger,
-                result_tx,
+                insert,
+                reply,
             })
-            .map_err(|_| TimerSchedulerError::Shutdown)
-            .await?;
-        result_rx
+        })
+        .await?
+        .map_err(TimerSchedulerError::Store)
+    }
+
+    /// Starts the removal of one timer. Returns `None` when a delivery of the
+    /// timer runs: it keeps its row, and only its waiting attempt goes.
+    pub(crate) async fn unschedule(
+        &self,
+        id: TriggerId,
+    ) -> Result<Option<Ticket<E>>, TimerSchedulerError<E>> {
+        self.request(|reply| Command::Start(Start::Unschedule { id, reply }))
             .await
-            .map_err(|_| TimerSchedulerError::Shutdown)?
-            .map_err(TimerSchedulerError::Store)
+    }
+
+    /// Starts the removal of every timer of a key and type. Also returns the
+    /// times whose delivery runs: they keep their rows.
+    pub(crate) async fn unschedule_all(
+        &self,
+        key: Key,
+        timer_type: TimerType,
+    ) -> Result<(Ticket<E>, SmallVec<[CompactDateTime; 1]>), TimerSchedulerError<E>> {
+        self.request(|reply| {
+            Command::Start(Start::UnscheduleAll {
+                key,
+                timer_type,
+                reply,
+            })
+        })
+        .await
+    }
+
+    /// Ends a delivery. Returns the ticket of the row delete, or `None` when
+    /// an attempt waits and keeps the row.
+    pub(crate) async fn complete(
+        &self,
+        id: TriggerId,
+    ) -> Result<Option<Ticket<E>>, TimerSchedulerError<E>> {
+        self.request(|reply| Command::Start(Start::Complete { id, reply }))
+            .await
+    }
+
+    /// Aborts a delivery, or the delivered attempt with `tag` that never
+    /// fired. The row stays for recovery.
+    pub(crate) fn abort(&self, id: TriggerId, tag: i32) {
+        // A closed channel means the actor stopped, and its state is gone.
+        let _ = self
+            .command_tx
+            .send(Command::Start(Start::Abort { id, tag }));
+    }
+
+    /// Starts the delivery of the attempt with `tag` if it is still the
+    /// attempt that fires next.
+    pub(crate) async fn fire(
+        &self,
+        id: TriggerId,
+        tag: i32,
+    ) -> Result<bool, TimerSchedulerError<E>> {
+        self.request(|reply| Command::Start(Start::Fire { id, tag, reply }))
+            .await
+    }
+
+    /// Lists the times of a key that memory decides.
+    pub(crate) async fn list(
+        &self,
+        key: Key,
+        timer_type: TimerType,
+    ) -> Result<SmallVec<[(CompactDateTime, Listed); 2]>, TimerSchedulerError<E>> {
+        self.request(|reply| Command::List {
+            key,
+            timer_type,
+            reply,
+        })
+        .await
+    }
+
+    /// Counts the timers in memory.
+    pub(crate) async fn snapshot(
+        &self,
+        now: CompactDateTime,
+    ) -> Result<TimerSnapshot, TimerSchedulerError<E>> {
+        self.request(|reply| Command::Snapshot { now, reply }).await
+    }
+
+    /// Sends a command and waits for its reply. A closed channel means
+    /// shutdown.
+    async fn request<R>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<R>) -> Command<E>,
+    ) -> Result<R, TimerSchedulerError<E>> {
+        let (reply, response) = oneshot::channel();
+        self.command_tx
+            .send(command(reply))
+            .map_err(|_| TimerSchedulerError::Shutdown)?;
+        response.await.map_err(|_| TimerSchedulerError::Shutdown)
+    }
+}
+
+impl<E> Start<E> {
+    /// The key and timer type of the command.
+    fn lane(&self) -> (Key, TimerType) {
+        match self {
+            Self::Insert { trigger, .. } => (trigger.key.clone(), trigger.timer_type),
+            Self::Unschedule { id, .. }
+            | Self::Complete { id, .. }
+            | Self::Fire { id, .. }
+            | Self::Abort { id, .. } => (id.key.clone(), id.timer_type),
+            Self::UnscheduleAll {
+                key, timer_type, ..
+            } => (key.clone(), *timer_type),
+        }
+    }
+}
+
+impl<E> Ticket<E> {
+    fn new(change: Change, commands: WeakUnboundedSender<Command<E>>) -> Self {
+        Self {
+            change: Some(change),
+            outcome: Outcome::Unchanged,
+            commands,
+        }
+    }
+
+    /// Runs `change`, the row change of the operation, and then ends the
+    /// operation.
+    pub(crate) async fn run<R, X>(
+        mut self,
+        change: impl Future<Output = Result<R, X>>,
+    ) -> Result<R, X> {
+        self.outcome = Outcome::Unknown;
+        let result = change.await?;
+        self.outcome = Outcome::Done;
+        Ok(result)
+    }
+
+    /// Takes the change back, so that the ticket sends no end.
+    fn into_change(mut self) -> Option<Change> {
+        self.change.take()
+    }
+}
+
+impl<E> Drop for Ticket<E> {
+    fn drop(&mut self) {
+        if let Some(change) = self.change.take()
+            && let Some(commands) = self.commands.upgrade()
+        {
+            // A closed channel means the actor stopped, and its state is gone.
+            let _ = commands.send(Command::End(change, self.outcome));
+        }
     }
 }
 
@@ -209,10 +337,6 @@ pub enum TimerSchedulerError<E>
 where
     E: ClassifyError + StdError + Send + Sync + 'static,
 {
-    /// A datetime conversion error occurred when scheduling a trigger.
-    #[error(transparent)]
-    DateTime(#[from] CompactDateTimeError),
-
     /// The scheduler has been shut down and cannot accept commands.
     #[error("Timer has been shutdown")]
     Shutdown,
@@ -228,7 +352,6 @@ where
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            Self::DateTime(e) => e.classify_error(),
             // Scheduler is shutting down — partition rebalance / draining.
             Self::Shutdown => ErrorCategory::Transient,
             Self::Store(e) => e.classify_error(),

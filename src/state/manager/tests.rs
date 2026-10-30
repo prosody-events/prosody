@@ -403,7 +403,7 @@ async fn retire_timer_residue(
     use color_eyre::eyre::ensure;
     use uuid::Uuid;
     let retire_replacement = value & 1 != 0;
-    retirement_trace(
+    Box::pin(retirement_trace(
         mode,
         i32::from(value),
         retire_replacement,
@@ -436,7 +436,7 @@ async fn retire_timer_residue(
             ensure!(manager.admit(key.key, &timers, &shutdown).await == Admission::Fresh);
             Ok(())
         },
-    )
+    ))
     .await?;
     Ok(())
 }
