@@ -6,16 +6,19 @@
 //!
 //! [`TriggerScheduler`]: super::TriggerScheduler
 
-use super::{Command, Ticket};
+use super::{Command, Start, Ticket};
+use crate::Key;
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::Heartbeat;
-use crate::timers::Trigger;
 use crate::timers::active::{Change, Outcome, Timers};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, StoredSegment, TriggerStore};
-use std::collections::BTreeSet;
+use crate::timers::{TimerType, Trigger};
+use ahash::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, VecDeque};
 use tokio::select;
 use tokio::sync::mpsc::WeakUnboundedSender;
 use tokio::sync::mpsc::error::TrySendError;
@@ -26,6 +29,11 @@ use tracing::debug;
 use load::{calculate_preload, load_step};
 
 pub(super) mod load;
+
+/// The starts that wait for the operation that runs on their key and timer
+/// type. A lane exists while an operation on it runs. The end of its last
+/// operation removes it.
+pub(super) type Lanes<E> = HashMap<(Key, TimerType), VecDeque<Start<E>>>;
 
 /// Slab state of the actor. [`run_actor`] holds the [`Timers`] apart, so
 /// handlers can borrow both.
@@ -91,6 +99,7 @@ pub(super) async fn run_actor<T>(
     let now = CompactDateTime::now().unwrap_or(CompactDateTime::MIN);
     let mut state = ActorState::start(store, segment, now);
     let mut timers = Timers::default();
+    let mut lanes = Lanes::default();
 
     let mut trigger_to_send: Option<Trigger> = None;
 
@@ -117,7 +126,7 @@ pub(super) async fn run_actor<T>(
         select! {
             result = commands.recv() => {
                 let Some(command) = result else { break; };
-                process_command(&mut state, &mut timers, &tickets, command).await;
+                process_command(&mut state, &mut timers, &mut lanes, &tickets, command).await;
             }
             result = trigger_tx.reserve(), if waiting => {
                 let Ok(permit) = result else { break; };
@@ -158,15 +167,69 @@ pub(super) async fn run_actor<T>(
 pub(super) async fn process_command<T>(
     state: &mut ActorState<T>,
     timers: &mut Timers,
+    lanes: &mut Lanes<T::Error>,
     tickets: &WeakUnboundedSender<Command<T::Error>>,
     command: Command<T::Error>,
 ) where
     T: TriggerStore,
 {
-    let ticket = |change| Ticket::new(change, tickets.clone());
+    match command {
+        Command::Start(start) => match lanes.entry(start.lane()) {
+            Entry::Occupied(mut waiting) => waiting.get_mut().push_back(start),
+            Entry::Vacant(lane) => {
+                if begin(state, timers, tickets, start).await {
+                    lane.insert(VecDeque::new());
+                }
+            }
+        },
+        Command::End(change, outcome) => {
+            let lane = change.lane();
+            end(state, timers, change, outcome);
+            let Entry::Occupied(mut waiting) = lanes.entry(lane) else {
+                return;
+            };
+            while let Some(start) = waiting.get_mut().pop_front() {
+                if begin(state, timers, tickets, start).await {
+                    return;
+                }
+            }
+            waiting.remove();
+        }
+        Command::Abort { id, tag } => timers.abort(&id, tag),
+        Command::Fire { id, tag, reply } => {
+            let _ = reply.send(timers.fire(&id, tag));
+        }
+        Command::List {
+            key,
+            timer_type,
+            reply,
+        } => {
+            let _ = reply.send(timers.list(&key, timer_type));
+        }
+        Command::Snapshot { now, reply } => {
+            let _ = reply.send(timers.snapshot(now));
+        }
+    }
+}
+
+/// Starts an operation. Returns whether it runs: its caller holds its ticket.
+async fn begin<T>(
+    state: &mut ActorState<T>,
+    timers: &mut Timers,
+    tickets: &WeakUnboundedSender<Command<T::Error>>,
+    start: Start<T::Error>,
+) -> bool
+where
+    T: TriggerStore,
+{
+    let mut runs = false;
+    let mut ticket = |change| {
+        runs = true;
+        Ticket::new(change, tickets.clone())
+    };
     // A caller that left before its reply never ran the row change.
-    let returned = match command {
-        Command::Insert {
+    let returned = match start {
+        Start::Insert {
             trigger,
             insert,
             reply,
@@ -180,11 +243,11 @@ pub(super) async fn process_command<T>(
                 _ => None,
             }
         }
-        Command::Unschedule { id, reply } => {
+        Start::Unschedule { id, reply } => {
             let change = timers.start_unschedule(id.key, id.time, id.timer_type);
             reply.send(change.map(ticket)).err().flatten()
         }
-        Command::UnscheduleAll {
+        Start::UnscheduleAll {
             key,
             timer_type,
             reply,
@@ -192,38 +255,16 @@ pub(super) async fn process_command<T>(
             let (change, firing) = timers.start_unschedule_all(key, timer_type);
             reply.send((ticket(change), firing)).err().map(|(t, _)| t)
         }
-        Command::Complete { id, reply } => {
+        Start::Complete { id, reply } => {
             let change = timers.start_complete(id.key, id.time, id.timer_type);
             reply.send(change.map(ticket)).err().flatten()
-        }
-        Command::Abort { id, tag } => {
-            timers.abort(&id.key, id.time, id.timer_type, tag);
-            None
-        }
-        Command::End(change, outcome) => {
-            end(state, timers, change, outcome);
-            None
-        }
-        Command::Fire { trigger, reply } => {
-            let _ = reply.send(timers.fire(&trigger));
-            None
-        }
-        Command::List {
-            key,
-            timer_type,
-            reply,
-        } => {
-            let _ = reply.send(timers.list(&key, timer_type));
-            None
-        }
-        Command::Snapshot { now, reply } => {
-            let _ = reply.send(timers.snapshot(now));
-            None
         }
     };
     if let Some(change) = returned.and_then(Ticket::into_change) {
         end(state, timers, change, Outcome::Unchanged);
+        return false;
     }
+    runs
 }
 
 /// Ends an operation in `timers`.

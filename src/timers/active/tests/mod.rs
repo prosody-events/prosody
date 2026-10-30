@@ -207,9 +207,7 @@ impl Trace {
                 }
                 self.end(change, outcome);
                 for (time, before) in before.into_iter().enumerate() {
-                    if !firing.contains(&time_of(time)) {
-                        self.kept_attempt(At(time, ty), before, outcome)?;
-                    }
+                    self.kept_attempt(At(time, ty), before, outcome)?;
                 }
             }
             Op::Complete(at @ At(time, ty), outcome) => {
@@ -226,7 +224,8 @@ impl Trace {
                 let undelivered = next
                     .filter(|next| !next.delivered(tag))
                     .map(|next| next.trigger.tag);
-                self.timers.abort(&key, time_of(time), TYPES[ty], tag);
+                self.timers
+                    .abort(&TriggerId::new(&key, time_of(time), TYPES[ty]), tag);
                 ensure!(
                     undelivered.is_none() || self.waiting(at) == undelivered,
                     "an abort took an attempt that it did not deliver"
@@ -235,7 +234,7 @@ impl Trace {
             }
             Op::Pop(at) => self.pop(at),
             Op::Fire(at, tag) => {
-                self.timers.fire(&trigger(at, tag));
+                self.timers.fire(&trigger(at, tag).id(), tag);
             }
             Op::Load(at) => {
                 if at.0 == UNOWNED {

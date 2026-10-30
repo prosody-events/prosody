@@ -2,7 +2,7 @@
 //! and nothing more, and its stored row stays loadable. A dropped delivery
 //! leaves no delivery running.
 
-use super::{SLAB_SECONDS, Store, listed, past, seeded_store, slab_id};
+use super::{SLAB_SECONDS, Store, listed, next_pending, past, seeded_store, slab_id};
 use crate::Key;
 use crate::consumer::Uncommitted;
 use crate::consumer::partition::ShutdownPhase;
@@ -18,17 +18,15 @@ use crate::timers::{
 };
 use color_eyre::eyre::{OptionExt, Result, ensure};
 use futures::future::try_join_all;
-use futures::{Stream, StreamExt, TryStreamExt, pin_mut, poll};
+use futures::{Stream, TryStreamExt, pin_mut, poll};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::cell::Cell;
 use std::future::pending;
 use std::task::Poll;
-use std::time::Duration;
 use strum::VariantArray;
 use tokio::runtime::Builder;
 use tokio::task::coop::unconstrained;
 use tokio::task::yield_now;
-use tokio::time::timeout;
 use tracing::Span;
 
 /// Commands queued ahead of the victim, so its polls stop at different points.
@@ -75,9 +73,7 @@ async fn run(victim: Victim, followup: Followup, backlog: u8, polls: u8, due: bo
         schedule(&manager, "victim", victim_time, false).await?;
     }
     let delivered = if victim.delivers() {
-        let pending = timeout(Duration::from_secs(10), stream.next())
-            .await?
-            .ok_or_eyre("timer stream ended")?;
+        let pending = next_pending(&mut stream).await?;
         Some(pending)
     } else {
         None
@@ -180,9 +176,7 @@ where
         listed == Some(Listed::Waits),
         "a stored victim in an owned slab does not wait"
     );
-    let pending = timeout(Duration::from_secs(10), stream.next())
-        .await?
-        .ok_or_eyre("timer stream ended")?;
+    let pending = next_pending(&mut stream).await?;
     ensure!(pending.trigger().time == time, "a filler fired first");
     ensure!(
         pending.fire().await.is_some(),
@@ -203,9 +197,8 @@ async fn dropped_reschedule_of_a_firing_timer_fires_after_commit() -> Result<()>
 
     let time = past(now);
     schedule(&manager, "victim", time, false).await?;
-    let firing = timeout(Duration::from_secs(10), stream.next())
+    let firing = next_pending(&mut stream)
         .await?
-        .ok_or_eyre("timer stream ended")?
         .fire()
         .await
         .ok_or_eyre("the timer did not fire")?;
@@ -234,9 +227,7 @@ async fn dropped_reschedule_of_a_firing_timer_fires_after_commit() -> Result<()>
         .scheduled_times(&replacement.key, TimerType::Application)
         .await?;
     ensure!(times == [time], "the commit deleted the replacement row");
-    let refired = timeout(Duration::from_secs(10), stream.next())
-        .await?
-        .ok_or_eyre("timer stream ended")?;
+    let refired = next_pending(&mut stream).await?;
     ensure!(refired.trigger().time == time, "another timer fired");
     ensure!(
         refired.fire().await.is_some(),

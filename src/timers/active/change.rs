@@ -38,12 +38,10 @@ pub(crate) struct Change {
     pub(super) timer_type: TimerType,
     /// The attempt that the operation writes.
     pub(super) insert: Option<Inserted>,
-    /// The timers whose rows the operation deletes.
-    pub(super) removed: SmallVec<[Removed; 1]>,
-    /// For a change that deletes every row of the key and type, the times
-    /// whose rows stay. A slab load during the change can add entries that
-    /// `removed` does not name, and the end of a done change drops them too.
-    pub(super) all_but: Option<SmallVec<[CompactDateTime; 1]>>,
+    /// The rows that the operation deletes.
+    pub(super) deleted: Deleted,
+    /// The attempts that the start took, to put back if the rows stay.
+    pub(super) restore: SmallVec<[Trigger; 1]>,
 }
 
 #[derive(Debug)]
@@ -53,26 +51,21 @@ pub(super) struct Inserted {
     pub(super) created: bool,
 }
 
+/// The rows of the key and type that an operation deletes.
 #[derive(Debug)]
-pub(super) struct Removed {
-    pub(super) time: CompactDateTime,
-    /// The attempt that the start took, to restore if the row stays.
-    pub(super) restore: Option<Trigger>,
+pub(super) enum Deleted {
+    Nothing,
+    At(CompactDateTime),
+    /// Every row except the rows at these times. A slab load during the
+    /// change can add entries for the deleted rows, so the end of a done
+    /// change drops every entry at another time.
+    AllBut(SmallVec<[CompactDateTime; 1]>),
 }
 
 impl Change {
-    /// A change that deletes the rows of `removed`.
-    pub(super) fn removal(
-        key: Key,
-        timer_type: TimerType,
-        removed: SmallVec<[Removed; 1]>,
-    ) -> Self {
-        Self {
-            key,
-            timer_type,
-            insert: None,
-            removed,
-            all_but: None,
-        }
+    /// The key and timer type of the operation. The actor runs one operation
+    /// at a time on them.
+    pub(crate) fn lane(&self) -> (Key, TimerType) {
+        (self.key.clone(), self.timer_type)
     }
 }

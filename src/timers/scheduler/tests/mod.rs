@@ -11,6 +11,7 @@ use super::actor::load::{
 };
 use crate::Key;
 use crate::state::TimerEventRef;
+use crate::telemetry::Telemetry;
 use crate::timers::active::Insert;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -19,8 +20,9 @@ use crate::timers::store::memory::memory_store;
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, StoredSegment, TriggerStore};
 use crate::timers::test_support::test_segment;
-use crate::timers::{TimerType, Trigger};
+use crate::timers::{TimerRequest, TimerType, Trigger};
 use color_eyre::eyre::{OptionExt, Result, ensure};
+use futures::future::try_join_all;
 use quickcheck::QuickCheck;
 use std::time::Duration as StdDuration;
 use strum::VariantArray;
@@ -204,7 +206,10 @@ async fn partial_load(tag: i32, kind: u8, delivery: Delivery, repair: bool) -> R
             .await
             .ok_or_eyre("the old attempt is not queued")?;
         if matches!(delivery, Delivery::Firing) {
-            ensure!(actor.timers.fire(&trigger), "the old attempt did not fire");
+            ensure!(
+                actor.timers.fire(&trigger.id(), trigger.tag),
+                "the old attempt did not fire"
+            );
         } else {
             popped = Some(trigger);
         }
@@ -238,7 +243,7 @@ async fn partial_load(tag: i32, kind: u8, delivery: Delivery, repair: bool) -> R
         .ok_or_eyre("the key row is gone")?;
     let mut fired = Vec::new();
     for trigger in popped.into_iter().chain(actor.timers.next().await) {
-        if actor.timers.fire(&trigger) {
+        if actor.timers.fire(&trigger.id(), trigger.tag) {
             fired.push(trigger.tag);
         }
     }
@@ -250,6 +255,94 @@ async fn partial_load(tag: i32, kind: u8, delivery: Delivery, repair: bool) -> R
     ensure!(
         actor.timers.next().await.is_none(),
         "an attempt fired twice"
+    );
+    Ok(())
+}
+
+/// An operation that a handler runs on one key and timer type. The flag picks
+/// the later of two times.
+#[derive(Clone, Copy, Debug)]
+enum Call {
+    Schedule(bool),
+    Unschedule(bool),
+    Clear(bool),
+    UnscheduleAll,
+}
+
+impl quickcheck::Arbitrary for Call {
+    fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+        let later = bool::arbitrary(g);
+        match u8::arbitrary(g) % 4 {
+            0 => Self::Schedule(later),
+            1 => Self::Unschedule(later),
+            2 => Self::Clear(later),
+            _ => Self::UnscheduleAll,
+        }
+    }
+}
+
+/// Operations that run at the same time on one key and type leave memory
+/// exact, in any order of their commands: it fires one attempt for each
+/// stored row, with the tag of the row.
+#[test]
+fn prop_concurrent_operations_keep_memory_exact() {
+    fn property(calls: Vec<Call>, order: Vec<u8>) -> Result<()> {
+        RuntimeBuilder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()?
+            .block_on(concurrent(calls, order))
+    }
+    QuickCheck::new().quickcheck(property as fn(Vec<Call>, Vec<u8>) -> Result<()>);
+}
+
+/// Runs `calls` at the same time. The actor takes the waiting commands in an
+/// order from `order`.
+async fn concurrent(calls: Vec<Call>, order: Vec<u8>) -> Result<()> {
+    let segment = test_segment("concurrent", SLAB_SIZE_SECS);
+    let store = memory_store(segment.clone());
+    store.insert_segment().await?;
+    let now = CompactDateTime::now()?.epoch_seconds();
+    let times = [601, 600].map(|ago| CompactDateTime::from(now.saturating_sub(ago)));
+    let mut actor = Actor::new(fresh_state(store.clone(), segment));
+    load_step(&mut actor.state, &mut actor.timers).await;
+
+    let manager = actor.manager(&store, &Telemetry::new());
+    let key = Key::from("concurrent");
+    let ty = TimerType::Application;
+    let request = |later: bool| {
+        TimerRequest::new(key.clone(), times[usize::from(later)], ty, Span::current())
+    };
+    let runs = calls.into_iter().map(|call| {
+        let (manager, key, request) = (&manager, &key, &request);
+        async move {
+            match call {
+                Call::Schedule(later) => manager.schedule(request(later)).await,
+                Call::Unschedule(later) => {
+                    manager.unschedule(key, times[usize::from(later)], ty).await
+                }
+                Call::Clear(later) => manager.clear_and_schedule(request(later)).await,
+                Call::UnscheduleAll => manager.unschedule_all(key, ty).await,
+            }
+        }
+    });
+    let mut order = order.into_iter().cycle();
+    let pick = |_| order.next().map_or(0, usize::from);
+    actor.serve_in(try_join_all(runs), pick).await?;
+
+    let mut stored = Vec::new();
+    for time in times {
+        let row = store.current_trigger(&key, time, ty).await?;
+        stored.extend(row.map(|trigger| (time, trigger.tag)));
+    }
+    let mut fired = Vec::new();
+    while let Some(trigger) = actor.timers.next().await {
+        fired.push((trigger.time, trigger.tag));
+    }
+    fired.sort_unstable();
+    ensure!(
+        fired == stored,
+        "memory fires {fired:?}, but the store holds {stored:?}"
     );
     Ok(())
 }

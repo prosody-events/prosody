@@ -33,6 +33,7 @@ homes — per-file scaffolding clones are how this test tree once doubled:
 | Keyed state (cells, collections, `UnavailableState`) | `src/state/tests/support/mod.rs` |
 | Timers (segment/trigger factories, in-memory `TimerManager` harness) | `src/timers/test_support.rs` |
 | Timer stores (store helpers, `KEY_POOL`, suite macros) | `src/timers/store/tests/` |
+| Timer scheduler actor (hand-stepped `Actor`; `serve_in` takes concurrent commands in a chosen order) | `src/timers/scheduler/tests/support.rs` |
 | Integration (keyspace/runtime in `mod.rs`; handlers, Kafka fixtures, channel helpers in children) | `tests/common/` |
 
 If the helper you need exists in a sibling test file but not a shared home,

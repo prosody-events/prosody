@@ -34,6 +34,7 @@ const LOAD_CONCURRENCY: usize = 16;
 /// Backoff after a Cassandra-side failure inside the actor's load/cleanup
 /// arms — these errors are typically transient.
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+
 /// Deletes completed persisted slabs below the current slab and then advances
 /// the watermark.
 ///
@@ -102,10 +103,7 @@ where
     T: TriggerStore,
 {
     stream::iter(slab_ids.iter().copied())
-        .map(|slab_id| async move {
-            store.delete_slab(slab_id).await?;
-            Ok(())
-        })
+        .map(|slab_id| store.delete_slab(slab_id))
         .buffer_unordered(DELETE_CONCURRENCY)
         .try_collect::<()>()
         .await
@@ -160,15 +158,8 @@ pub(crate) async fn load_step<T>(state: &mut ActorState<T>, timers: &mut Timers)
 where
     T: TriggerStore,
 {
-    let now = match CompactDateTime::now() {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("load_step: failed to compute now: {e:#}");
-            state.next_load_at = Instant::now() + RETRY_DELAY;
-            return;
-        }
-    };
-    let target_time = match now.add_duration(state.preload_window) {
+    let target = CompactDateTime::now().and_then(|now| now.add_duration(state.preload_window));
+    let target_time = match target {
         Ok(t) => t,
         Err(e) => {
             warn!("load_step: failed to compute target_time: {e:#}");

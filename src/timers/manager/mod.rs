@@ -4,8 +4,8 @@
 //! querying, and canceling timers within a specific segment. It coordinates
 //! between:
 //! - **Persistent Storage**: Durable [`TriggerStore`] for timer metadata.
-//! - **Background Slab Loader**: Preloads upcoming timer slabs.
-//! - **In-Memory Scheduler**: Precise, delay-queue based timer dispatch.
+//! - **Scheduler actor**: Owns timer memory, preloads upcoming timer slabs, and
+//!   dispatches each timer from a delay queue.
 //! - **Application**: Delivers timers as an async stream of [`PendingTimer`].
 //! - **Per-Type Backpressure**: A [`TimerSemaphores`] array provides one
 //!   [`tokio::sync::Semaphore`] per [`TimerType`] variant, bounding in-flight
@@ -76,9 +76,8 @@ pub struct TimerManager<T: TriggerStore>(#[educe(Debug(ignore))] Arc<TimerManage
 /// The bound `T: TriggerStore` is required because `scheduler` is typed on
 /// the store's error variant.
 pub struct TimerManagerInner<T: TriggerStore> {
-    /// Persistent trigger store. Cloned across the manager and the scheduler
-    /// actor so trigger-row writes can race in parallel with slab metadata
-    /// writes inside the actor.
+    /// Persistent trigger store. The manager writes trigger rows, and the
+    /// scheduler actor writes slab metadata with its own clone.
     store: T,
     /// In-memory scheduler actor handle. Owns slab metadata writes, slab
     /// loading, slab cleanup, and the trigger queue.
@@ -95,10 +94,8 @@ where
 {
     /// Creates a new timer manager for the specified segment.
     ///
-    /// Initializes:
-    /// 1. A persistent segment record (creating or retrieving it).
-    /// 2. An in-memory scheduler and its command processing task.
-    /// 3. A background scheduler actor for preloading upcoming timers.
+    /// Initializes a persistent segment record, creating or retrieving it,
+    /// and the scheduler actor that owns timer memory and preloads slabs.
     ///
     /// `shutdown_rx` signals partition shutdown; the scheduler actor serves
     /// commands through `Draining` and exits at `>= ShutdownPhase::Cancelling`.
@@ -262,29 +259,34 @@ where
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
         let inner = &self.0;
-        let stored = inner
-            .store
-            .get_key_times(timer_type, key)
-            .map_err(TimerManagerError::Store)
-            .try_collect::<Vec<_>>();
-        let started = inner
+        let (ticket, firing) = inner
             .scheduler
             .unschedule_all(key.clone(), timer_type)
-            .err_into();
-        let (mut times, (ticket, firing)) = try_join!(stored, started)?;
-        times.retain(|time| !firing.contains(time));
+            .await?;
 
+        // The read runs in the operation, so it sees the rows of the
+        // operations before it on the key and type.
         let span = Span::current();
-        let deletes = stream::iter(times.iter().copied())
-            .map(|time| {
-                inner
-                    .store
-                    .remove_trigger(key, time, timer_type)
-                    .instrument(span.clone())
-            })
-            .buffer_unordered(DELETE_CONCURRENCY)
-            .try_collect::<()>();
-        ticket
+        let deletes = async {
+            let mut times: Vec<_> = inner
+                .store
+                .get_key_times(timer_type, key)
+                .try_collect()
+                .await?;
+            times.retain(|time| !firing.contains(time));
+            stream::iter(times.iter().copied())
+                .map(|time| {
+                    inner
+                        .store
+                        .remove_trigger(key, time, timer_type)
+                        .instrument(span.clone())
+                })
+                .buffer_unordered(DELETE_CONCURRENCY)
+                .try_collect::<()>()
+                .await?;
+            Ok(times)
+        };
+        let times = ticket
             .run(deletes)
             .await
             .map_err(TimerManagerError::Store)?;
@@ -328,7 +330,10 @@ where
     /// fires next.
     pub(crate) async fn fire(&self, trigger: &Trigger) -> bool {
         // A scheduler that shut down fires nothing.
-        matches!(self.0.scheduler.fire(trigger.clone()).await, Ok(true))
+        matches!(
+            self.0.scheduler.fire(trigger.id(), trigger.tag).await,
+            Ok(true)
+        )
     }
 
     /// Marks a timer as completed.
@@ -349,11 +354,7 @@ where
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        let id = TriggerId {
-            key: key.clone(),
-            time,
-            timer_type,
-        };
+        let id = TriggerId::new(key, time, timer_type);
         if let Some(ticket) = self.0.scheduler.complete(id).await? {
             ticket
                 .run(self.0.store.remove_trigger(key, time, timer_type))
@@ -380,11 +381,7 @@ where
     /// Never deletes the timer from persistent storage: an aborted timer
     /// fires again after a restart.
     pub fn abort(&self, key: &Key, time: CompactDateTime, timer_type: TimerType, tag: i32) {
-        let id = TriggerId {
-            key: key.clone(),
-            time,
-            timer_type,
-        };
+        let id = TriggerId::new(key, time, timer_type);
         self.0.scheduler.abort(id, tag);
     }
 
@@ -442,11 +439,7 @@ impl<T: TriggerStore> TimerManagerInner<T> {
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Result<bool, TimerManagerError<T::Error>> {
-        let id = TriggerId {
-            key: key.clone(),
-            time,
-            timer_type,
-        };
+        let id = TriggerId::new(key, time, timer_type);
         let Some(ticket) = self.scheduler.unschedule(id).await? else {
             return Ok(false);
         };

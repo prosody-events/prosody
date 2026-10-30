@@ -382,10 +382,16 @@ impl Trigger {
     /// Returns the immutable logical identity for this trigger.
     #[must_use]
     pub(crate) fn id(&self) -> TriggerId {
-        TriggerId {
-            key: self.key.clone(),
-            time: self.time,
-            timer_type: self.timer_type,
+        TriggerId::new(&self.key, self.time, self.timer_type)
+    }
+}
+
+impl TriggerId {
+    pub(crate) fn new(key: &Key, time: CompactDateTime, timer_type: TimerType) -> Self {
+        Self {
+            key: key.clone(),
+            time,
+            timer_type,
         }
     }
 }

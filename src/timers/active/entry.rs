@@ -56,8 +56,8 @@ impl Entry {
     /// running delivery stays, with its row marked deleted.
     pub(super) fn drop_row(&mut self, queue: &mut DelayQueue<Trigger>) -> bool {
         self.take_next(queue);
-        let delivery = self.firing.as_mut();
-        delivery
+        self.firing
+            .as_mut()
             .map(|delivery| *delivery = Delivery::Deleted)
             .is_some()
     }
@@ -96,6 +96,21 @@ pub(super) fn get_mut<'a>(
         .iter_mut()
         .find(|(t, ty, _)| (*t, *ty) == (time, timer_type))
         .map(|(_, _, entry)| entry)
+}
+
+/// Keeps the entries of `key` that `keep` picks. A key with no entry left
+/// goes.
+pub(super) fn retain(
+    entries: &mut HashMap<Key, Coordinates>,
+    key: &Key,
+    keep: impl FnMut(&mut (CompactDateTime, TimerType, Entry)) -> bool,
+) {
+    if let Some(coordinates) = entries.get_mut(key) {
+        coordinates.retain(keep);
+        if coordinates.is_empty() {
+            entries.remove(key);
+        }
+    }
 }
 
 /// Returns the entry of a coordinate, and whether this call made it. It clones

@@ -13,7 +13,7 @@ use crate::timers::test_support::{
     create_test_trigger, setup_timer_manager, setup_timer_manager_at, test_segment, test_semaphores,
 };
 use crate::timers::uncommitted::UncommittedTriggerGuard;
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{OptionExt, Result, eyre};
 use futures::{StreamExt, pin_mut};
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::collections::BTreeSet;
@@ -84,6 +84,13 @@ async fn count_scheduled<T: TriggerStore>(
     Ok(manager.scheduled_times(key, timer_type).await?.len())
 }
 
+/// Waits for the next timer of `stream`.
+async fn next_pending<S: Stream + Unpin>(stream: &mut S) -> Result<S::Item> {
+    timeout(Duration::from_secs(10), stream.next())
+        .await?
+        .ok_or_eyre("timer stream ended")
+}
+
 /// Helper: wait for timer and fire it
 async fn wait_and_fire<S, T>(
     stream: &mut S,
@@ -93,9 +100,7 @@ where
     S: Stream<Item = PendingTimer<T>> + Unpin,
     T: TriggerStore,
 {
-    let pending = timeout(Duration::from_secs(10), stream.next())
-        .await?
-        .ok_or_else(|| eyre!("{msg}"))?;
+    let pending = next_pending(stream).await?;
     let firing = pending
         .fire()
         .await
@@ -268,9 +273,7 @@ async fn test_fire_cancelled_timer() -> Result<()> {
     task::yield_now().await;
 
     // Get the pending timer from stream (timer has been delivered)
-    let pending = timeout(Duration::from_secs(10), stream.next())
-        .await?
-        .ok_or_else(|| eyre!("Expected a pending timer"))?;
+    let pending = next_pending(&mut stream).await?;
 
     // Unschedule the timer AFTER delivery but BEFORE calling fire()
     // This is the race window where cancellation should still work
@@ -300,9 +303,7 @@ async fn dropped_timer_ends_its_delivery() -> Result<()> {
     manager.schedule(timer_request(&trigger)).await?;
     advance(Duration::from_secs(2)).await;
 
-    let pending = timeout(Duration::from_secs(10), stream.next())
-        .await?
-        .ok_or_else(|| eyre!("Expected a pending timer"))?;
+    let pending = next_pending(&mut stream).await?;
     let firing = pending
         .fire()
         .await

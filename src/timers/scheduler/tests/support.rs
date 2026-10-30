@@ -2,7 +2,7 @@
 //! admission tests share.
 
 use super::super::actor::load::load_step;
-use super::super::actor::{ActorState, process_command};
+use super::super::actor::{ActorState, Lanes, process_command};
 use super::super::{Command, TriggerScheduler};
 use crate::Topic;
 use crate::state::TimerEventRef;
@@ -20,6 +20,7 @@ use crate::timers::test_support::test_segment;
 use crate::timers::{CompactDateTime, TimerType, Trigger};
 use color_eyre::eyre::{Result, ensure};
 use futures::TryStreamExt;
+use std::collections::VecDeque;
 use std::pin::pin;
 use std::sync::Arc;
 use tokio::select;
@@ -34,6 +35,7 @@ type Error = <TestStore as TriggerStore>::Error;
 pub(super) struct Actor {
     pub(super) state: ActorState<TestStore>,
     pub(super) timers: Timers,
+    lanes: Lanes<Error>,
     scheduler: TriggerScheduler<Error>,
     commands: UnboundedReceiver<Command<Error>>,
 }
@@ -44,6 +46,7 @@ impl Actor {
         Self {
             state,
             timers: Timers::default(),
+            lanes: Lanes::default(),
             scheduler,
             commands,
         }
@@ -54,31 +57,83 @@ impl Actor {
         self.scheduler.clone()
     }
 
+    /// A manager whose scheduler is this actor.
+    pub(super) fn manager(
+        &self,
+        store: &TestStore,
+        telemetry: &Telemetry,
+    ) -> TimerManager<TestStore> {
+        let config = TimerManagerConfig {
+            store: store.clone(),
+            telemetry: telemetry.partition_sender(Topic::from("actor"), 0),
+            source: Arc::from("actor"),
+        };
+        TimerManager::assemble(config, self.scheduler())
+    }
+
     /// Serves commands until `call` ends, and then the commands that remain.
     pub(super) async fn serve<R>(&mut self, call: impl Future<Output = R>) -> R {
+        self.serve_in(call, |_| 0).await
+    }
+
+    /// As [`serve`](Self::serve), but takes each waiting command at the index
+    /// that `pick` returns for the count of waiting commands. The commands of
+    /// different calls can reach the actor in any order.
+    pub(super) async fn serve_in<R>(
+        &mut self,
+        call: impl Future<Output = R>,
+        mut pick: impl FnMut(usize) -> usize,
+    ) -> R {
         let mut call = pin!(call);
         loop {
             select! {
                 biased;
                 result = &mut call => {
-                    self.drain().await;
+                    self.drain_in(VecDeque::new(), &mut pick).await;
                     return result;
                 }
-                Some(command) = self.commands.recv() => self.process(command).await,
+                Some(command) = self.commands.recv() => {
+                    self.drain_in(VecDeque::from([command]), &mut pick).await;
+                }
             }
         }
     }
 
     /// Serves the commands that wait, such as the ends that tickets sent.
     pub(super) async fn drain(&mut self) {
-        while let Ok(command) = self.commands.try_recv() {
-            self.process(command).await;
+        self.drain_in(VecDeque::new(), &mut |_| 0).await;
+    }
+
+    /// Serves `waiting` and the commands that arrive, in the order of `pick`,
+    /// until no command waits.
+    async fn drain_in(
+        &mut self,
+        mut waiting: VecDeque<Command<Error>>,
+        pick: &mut impl FnMut(usize) -> usize,
+    ) {
+        loop {
+            while let Ok(command) = self.commands.try_recv() {
+                waiting.push_back(command);
+            }
+            let Some(index) = pick(waiting.len()).checked_rem(waiting.len()) else {
+                return;
+            };
+            if let Some(command) = waiting.remove(index) {
+                self.process(command).await;
+            }
         }
     }
 
     async fn process(&mut self, command: Command<Error>) {
         let tickets = self.scheduler.command_tx.downgrade();
-        process_command(&mut self.state, &mut self.timers, &tickets, command).await;
+        process_command(
+            &mut self.state,
+            &mut self.timers,
+            &mut self.lanes,
+            &tickets,
+            command,
+        )
+        .await;
     }
 }
 
@@ -140,12 +195,7 @@ where
 
     let telemetry = Telemetry::new();
     let mut events = telemetry.subscribe();
-    let config = TimerManagerConfig {
-        store: store.clone(),
-        telemetry: telemetry.partition_sender(Topic::from("admission"), 0),
-        source: Arc::from("admission"),
-    };
-    let manager = TimerManager::assemble(config, actor.scheduler());
+    let manager = actor.manager(&store, &telemetry);
     let event = TimerEventRef::new(old.timer_type, old.time, old.tag);
     actor
         .serve(async {
@@ -186,7 +236,7 @@ where
     );
     if let Some(trigger) = fired {
         ensure!(
-            actor.timers.fire(&trigger),
+            actor.timers.fire(&trigger.id(), trigger.tag),
             "the stored attempt did not fire"
         );
     }

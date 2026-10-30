@@ -193,9 +193,7 @@ where
             {
                 return Ok(pending);
             }
-            let pending = timeout(Duration::from_secs(5), self.stream.next())
-                .await?
-                .ok_or_else(|| eyre!("timer stream ended"))?;
+            let pending = next_pending(&mut self.stream).await?;
             let slot = self
                 .times
                 .iter()

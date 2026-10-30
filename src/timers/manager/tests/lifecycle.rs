@@ -1,6 +1,6 @@
 //! The lifecycle of one timer, as its owner sees it.
 
-use super::{Store, listed, past, seeded_store};
+use super::{Store, listed, next_pending, past, seeded_store};
 use crate::Key;
 use crate::consumer::Uncommitted;
 use crate::consumer::partition::ShutdownPhase;
@@ -9,12 +9,10 @@ use crate::timers::test_support::{Memory, setup_timer_manager_with_store};
 use crate::timers::uncommitted::UncommittedTriggerGuard;
 use crate::timers::{PendingTimer, TimerRequest, TimerType, UncommittedTimer};
 use color_eyre::eyre::{OptionExt, Result, ensure};
-use futures::{Stream, StreamExt, pin_mut};
+use futures::{Stream, pin_mut};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
-use std::time::Duration;
 use strum::VariantArray;
 use tokio::runtime::Builder;
-use tokio::time::timeout;
 use tracing::Span;
 
 /// One step that a timer's owner can take.
@@ -130,9 +128,7 @@ async fn fire(
     time: CompactDateTime,
 ) -> Result<UncommittedTriggerGuard<Store>> {
     loop {
-        let pending = timeout(Duration::from_secs(10), stream.next())
-            .await?
-            .ok_or_eyre("timer stream ended")?;
+        let pending = next_pending(stream).await?;
         ensure!(
             pending.trigger().key == *key && pending.trigger().time == time,
             "another timer fired"

@@ -28,6 +28,7 @@ use crate::timers::active::{Change, Insert, Listed, Outcome, TimerSnapshot};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::store::{StoredSegment, TriggerStore};
 use crate::timers::{TimerType, Trigger, TriggerId};
+use educe::Educe;
 use smallvec::SmallVec;
 use std::error::Error as StdError;
 use thiserror::Error;
@@ -48,22 +49,45 @@ const BUFFER_SIZE: usize = 64;
 /// dropped call cannot leave a command half sent. The command channel has no
 /// bound: a live call waits for the reply to each command, and a dropped call
 /// sends at most one more command.
-#[derive(Debug)]
+#[derive(Debug, Educe)]
+#[educe(Clone(bound()))]
 pub struct TriggerScheduler<E> {
     command_tx: UnboundedSender<Command<E>>,
-}
-
-impl<E> Clone for TriggerScheduler<E> {
-    fn clone(&self) -> Self {
-        Self {
-            command_tx: self.command_tx.clone(),
-        }
-    }
 }
 
 /// A command to the actor. A command that replies carries the reply sender.
 #[derive(Debug)]
 pub(super) enum Command<E> {
+    /// Starts an operation that changes a row.
+    Start(Start<E>),
+    /// Aborts a delivery, or the delivered attempt with `tag`.
+    Abort { id: TriggerId, tag: i32 },
+    /// Ends an operation.
+    End(Change, Outcome),
+    /// Starts the delivery of the attempt with `tag` that left the queue.
+    Fire {
+        id: TriggerId,
+        tag: i32,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Lists the times of a key that memory decides.
+    List {
+        key: Key,
+        timer_type: TimerType,
+        reply: oneshot::Sender<SmallVec<[(CompactDateTime, Listed); 2]>>,
+    },
+    /// Counts the timers in memory.
+    Snapshot {
+        now: CompactDateTime,
+        reply: oneshot::Sender<TimerSnapshot>,
+    },
+}
+
+/// The start of an operation that changes a row. The actor runs one
+/// operation at a time on each key and timer type, so a start waits for the
+/// end of the operation before it.
+#[derive(Debug)]
+pub(super) enum Start<E> {
     /// Registers the slab of `trigger`, and starts its insert.
     Insert {
         trigger: Trigger,
@@ -85,26 +109,6 @@ pub(super) enum Command<E> {
     Complete {
         id: TriggerId,
         reply: oneshot::Sender<Option<Ticket<E>>>,
-    },
-    /// Aborts a delivery, or the delivered attempt with `tag`.
-    Abort { id: TriggerId, tag: i32 },
-    /// Ends an operation.
-    End(Change, Outcome),
-    /// Starts the delivery of an attempt that left the queue.
-    Fire {
-        trigger: Trigger,
-        reply: oneshot::Sender<bool>,
-    },
-    /// Lists the times of a key that memory decides.
-    List {
-        key: Key,
-        timer_type: TimerType,
-        reply: oneshot::Sender<SmallVec<[(CompactDateTime, Listed); 2]>>,
-    },
-    /// Counts the timers in memory.
-    Snapshot {
-        now: CompactDateTime,
-        reply: oneshot::Sender<TimerSnapshot>,
     },
 }
 
@@ -168,10 +172,12 @@ where
         trigger: Trigger,
         insert: Insert,
     ) -> Result<(Trigger, Ticket<E>), TimerSchedulerError<E>> {
-        self.request(|reply| Command::Insert {
-            trigger,
-            insert,
-            reply,
+        self.request(|reply| {
+            Command::Start(Start::Insert {
+                trigger,
+                insert,
+                reply,
+            })
         })
         .await?
         .map_err(TimerSchedulerError::Store)
@@ -183,7 +189,7 @@ where
         &self,
         id: TriggerId,
     ) -> Result<Option<Ticket<E>>, TimerSchedulerError<E>> {
-        self.request(|reply| Command::Unschedule { id, reply })
+        self.request(|reply| Command::Start(Start::Unschedule { id, reply }))
             .await
     }
 
@@ -194,10 +200,12 @@ where
         key: Key,
         timer_type: TimerType,
     ) -> Result<(Ticket<E>, SmallVec<[CompactDateTime; 1]>), TimerSchedulerError<E>> {
-        self.request(|reply| Command::UnscheduleAll {
-            key,
-            timer_type,
-            reply,
+        self.request(|reply| {
+            Command::Start(Start::UnscheduleAll {
+                key,
+                timer_type,
+                reply,
+            })
         })
         .await
     }
@@ -208,7 +216,8 @@ where
         &self,
         id: TriggerId,
     ) -> Result<Option<Ticket<E>>, TimerSchedulerError<E>> {
-        self.request(|reply| Command::Complete { id, reply }).await
+        self.request(|reply| Command::Start(Start::Complete { id, reply }))
+            .await
     }
 
     /// Aborts a delivery, or the delivered attempt with `tag` that never
@@ -218,10 +227,14 @@ where
         let _ = self.command_tx.send(Command::Abort { id, tag });
     }
 
-    /// Starts the delivery of `trigger` if it is still the attempt that
-    /// fires next.
-    pub(crate) async fn fire(&self, trigger: Trigger) -> Result<bool, TimerSchedulerError<E>> {
-        self.request(|reply| Command::Fire { trigger, reply }).await
+    /// Starts the delivery of the attempt with `tag` if it is still the
+    /// attempt that fires next.
+    pub(crate) async fn fire(
+        &self,
+        id: TriggerId,
+        tag: i32,
+    ) -> Result<bool, TimerSchedulerError<E>> {
+        self.request(|reply| Command::Fire { id, tag, reply }).await
     }
 
     /// Lists the times of a key that memory decides.
@@ -257,6 +270,21 @@ where
             .send(command(reply))
             .map_err(|_| TimerSchedulerError::Shutdown)?;
         response.await.map_err(|_| TimerSchedulerError::Shutdown)
+    }
+}
+
+impl<E> Start<E> {
+    /// The key and timer type of the operation.
+    fn lane(&self) -> (Key, TimerType) {
+        match self {
+            Self::Insert { trigger, .. } => (trigger.key.clone(), trigger.timer_type),
+            Self::Unschedule { id, .. } | Self::Complete { id, .. } => {
+                (id.key.clone(), id.timer_type)
+            }
+            Self::UnscheduleAll {
+                key, timer_type, ..
+            } => (key.clone(), *timer_type),
+        }
     }
 }
 

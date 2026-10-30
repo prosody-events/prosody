@@ -127,7 +127,7 @@ impl Fixture {
         let scheduler = self.actor.scheduler();
         let started = self
             .actor
-            .serve(scheduler.unschedule(id(&key, time, ty)))
+            .serve(scheduler.unschedule(TriggerId::new(&key, time, ty)))
             .await
             .map_err(|e| format!("unschedule: {e:?}"))?;
         if let Some(ticket) = started {
@@ -148,7 +148,7 @@ impl Fixture {
         let Some(trigger) = self.actor.timers.next().await else {
             return Ok(());
         };
-        if !self.actor.timers.fire(&trigger) {
+        if !self.actor.timers.fire(&trigger.id(), trigger.tag) {
             return Err(format!(
                 "the attempt that left the queue did not fire: {trigger:?}"
             ));
@@ -163,7 +163,9 @@ impl Fixture {
     async fn apply_abort(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
         let (key, time, ty) = spec.resolve(self.now_slab);
         // No attempt here waits outside the queue, so only a delivery aborts.
-        self.actor.scheduler().abort(id(&key, time, ty), 0);
+        self.actor
+            .scheduler()
+            .abort(TriggerId::new(&key, time, ty), 0);
         self.actor.drain().await;
         let mut model = self.model_for(&key, time, ty);
         model.memory = match model.memory {
@@ -235,13 +237,5 @@ impl Fixture {
                 model.memory = Some(Memory::Waits);
             }
         }
-    }
-}
-
-fn id(key: &Key, time: CompactDateTime, timer_type: TimerType) -> TriggerId {
-    TriggerId {
-        key: key.clone(),
-        time,
-        timer_type,
     }
 }
