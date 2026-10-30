@@ -16,7 +16,7 @@ use crate::timers::store::{Segment, TriggerStore};
 use crate::timers::test_support::Memory;
 use crate::timers::test_support::test_segment;
 use crate::timers::{TimerType, Trigger, TriggerId};
-use color_eyre::eyre::{OptionExt, Result, WrapErr, bail};
+use color_eyre::eyre::{OptionExt, Result, WrapErr, bail, ensure};
 use tracing::Span;
 
 /// The actor under test and the model that it must match.
@@ -145,24 +145,34 @@ impl Fixture {
         let Some(trigger) = self.actor.timers.next().await else {
             return Ok(());
         };
-        if !self.actor.timers.fire(&trigger.id(), trigger.tag) {
-            bail!("the attempt that left the queue did not fire: {trigger:?}");
-        }
+        let fired = self.actor.timers.fire(&trigger.id(), trigger.tag);
         let (key, time, ty) = (trigger.key, trigger.time, trigger.timer_type);
         let mut model = self.model_for(&key, time, ty);
+        // A second delivery of a timer never starts while the first runs.
+        if model.delivery.is_some() {
+            ensure!(!fired, "a second delivery of {key} at {time} started");
+            return Ok(());
+        }
+        ensure!(
+            fired,
+            "the attempt at {time} that left the queue did not fire"
+        );
         model.memory = Some(Memory::Firing { again: false });
+        model.delivery = Some(trigger.tag);
         self.set_model(key, time, ty, model);
         Ok(())
     }
 
     async fn apply_abort(&mut self, spec: TriggerSpec) -> Result<()> {
         let (key, time, ty) = spec.resolve(self.now_slab);
+        let mut model = self.model_for(&key, time, ty);
         // No attempt here waits outside the queue, so only a delivery aborts.
+        // With no delivery, the abort changes nothing.
+        let tag = model.delivery.take().unwrap_or_default();
         self.actor
             .scheduler()
-            .abort(TriggerId::new(&key, time, ty), 0);
+            .abort(TriggerId::new(&key, time, ty), tag);
         self.actor.drain().await;
-        let mut model = self.model_for(&key, time, ty);
         model.memory = match model.memory {
             Some(Memory::Firing { again: true }) => Some(Memory::Waits),
             Some(Memory::Firing { again: false }) => Some(Memory::Kept),
@@ -186,6 +196,7 @@ impl Fixture {
         self.actor = Actor::new(start_state(self.store.clone(), segment, now));
         for model in self.expected.values_mut() {
             model.memory = None;
+            model.delivery = None;
         }
         Ok(())
     }

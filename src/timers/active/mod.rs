@@ -36,7 +36,7 @@ mod entry;
 
 use change::Rows;
 pub(crate) use change::{Change, Insert, Outcome};
-use entry::{Coordinates, Delivery, Next, get_mut, get_or_insert, retain};
+use entry::{Coordinates, Delivery, Next, Row, get_mut, get_or_insert, retain};
 
 /// The in-memory timers of one partition.
 #[derive(Debug, Default)]
@@ -164,7 +164,7 @@ impl Timers {
             if entry.next.is_some() {
                 return None;
             }
-            if delivery == Delivery::Deleted {
+            if delivery.row == Row::Deleted {
                 self.forget(&key, time, timer_type);
                 return None;
             }
@@ -172,17 +172,24 @@ impl Timers {
         Some(self.removal(key, time, timer_type))
     }
 
-    /// Aborts a delivery, or the delivered attempt with `tag` that never
-    /// fired. The row stays, and a restart loads it. A delivery whose row a
-    /// clear deleted leaves nothing.
+    /// Aborts the delivery of the attempt with `tag`, or that attempt if it
+    /// left the queue and never fired. The row stays, and a restart loads it.
+    /// A delivery whose row a clear deleted leaves nothing. While a delivery
+    /// of another attempt runs, the abort leaves memory as it is, so the
+    /// commit of that delivery keeps the row.
     pub(crate) fn abort(&mut self, id: &TriggerId, tag: i32) {
         let Self { entries, queue } = self;
         let Some(entry) = get_mut(entries, &id.key, id.time, id.timer_type) else {
             return;
         };
-        match entry.firing.take() {
-            Some(Delivery::Stored) => {}
-            Some(Delivery::Deleted) => self.forget(&id.key, id.time, id.timer_type),
+        match entry.firing {
+            Some(delivery) if delivery.tag == tag => {
+                entry.firing = None;
+                if delivery.row == Row::Deleted {
+                    self.forget(&id.key, id.time, id.timer_type);
+                }
+            }
+            Some(_) => {}
             None => {
                 if entry.next.as_ref().is_some_and(|next| next.delivered(tag)) {
                     entry.take_next(queue);
@@ -239,15 +246,19 @@ impl Timers {
     }
 
     /// Starts the delivery of an attempt that left the queue, if it is still
-    /// the attempt that fires next.
+    /// the attempt that fires next and no delivery of the timer runs.
     pub(crate) fn fire(&mut self, id: &TriggerId, tag: i32) -> bool {
         let Some(entry) = get_mut(&mut self.entries, &id.key, id.time, id.timer_type) else {
             return false;
         };
-        let due = entry.next.as_ref().is_some_and(|next| next.delivered(tag));
+        let due =
+            entry.firing.is_none() && entry.next.as_ref().is_some_and(|next| next.delivered(tag));
         if due {
             entry.next = None;
-            entry.firing = Some(Delivery::Stored);
+            entry.firing = Some(Delivery {
+                tag,
+                row: Row::Stored,
+            });
         }
         due
     }
@@ -345,7 +356,7 @@ impl Timers {
         let Self { entries, queue } = self;
         let (_, entry) = get_or_insert(entries, &trigger.key, trigger.time, trigger.timer_type);
         if let Some(delivery) = &mut entry.firing {
-            *delivery = Delivery::Stored;
+            delivery.row = Row::Stored;
         }
         match &entry.next {
             None if !owned && entry.firing.is_none() => {

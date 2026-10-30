@@ -80,6 +80,8 @@ struct Trace {
     /// The rows that stay without an attempt because a delivery ended without
     /// deleting them.
     kept: Grid<bool>,
+    /// The tag of the attempt whose delivery runs.
+    delivering: Grid<Option<i32>>,
 }
 
 #[test]
@@ -101,6 +103,23 @@ fn aborted_delivery_of_a_cleared_row_leaves_no_entry() -> Result<()> {
         Op::Fire(cleared, 0),
         Op::Insert(other, Insert::Clear, 0, Outcome::Done, During::Nothing),
         Op::Abort(cleared, 0),
+    ])
+}
+
+/// A handler schedules its own timer again during its delivery, and the new
+/// attempt leaves the queue. The abort of that attempt must not end the
+/// delivery that runs, so the commit of the delivery keeps the new row.
+#[test]
+fn abort_of_a_rescheduled_attempt_keeps_the_delivery() -> Result<()> {
+    let at = At(0, 0);
+    replay([
+        Op::Insert(at, Insert::Schedule, 0, Outcome::Done, During::Nothing),
+        Op::Pop(at),
+        Op::Fire(at, 0),
+        Op::Insert(at, Insert::Schedule, 1, Outcome::Done, During::Nothing),
+        Op::Pop(at),
+        Op::Abort(at, 1),
+        Op::Complete(at, Outcome::Done),
     ])
 }
 
@@ -211,6 +230,7 @@ impl Trace {
                 }
             }
             Op::Complete(at @ At(time, ty), outcome) => {
+                self.delivering[time][ty] = None;
                 let before = self.waiting(at);
                 if let Some(change) = self.timers.start_complete(key, time_of(time), TYPES[ty]) {
                     delete(&mut self.rows[time][ty], outcome);
@@ -231,11 +251,11 @@ impl Trace {
                     "an abort took an attempt that it did not deliver"
                 );
                 ended = Some(at);
+                let delivering = &mut self.delivering[time][ty];
+                *delivering = delivering.filter(|&delivered| delivered != tag);
             }
             Op::Pop(at) => self.pop(at),
-            Op::Fire(at, tag) => {
-                self.timers.fire(&trigger(at, tag).id(), tag);
-            }
+            Op::Fire(at, tag) => self.fire(at, tag)?,
             Op::Load(at) => {
                 if at.0 == UNOWNED {
                     self.load_slab();
@@ -261,6 +281,13 @@ impl Trace {
             let owned = owned(self.loaded, time_of(time));
             let covered = row == Stored::Absent || !owned || entry.is_some();
             ensure!(covered, "an owned row that may exist has no entry");
+            ensure!(
+                entry
+                    .and_then(|entry| entry.firing)
+                    .map(|delivery| delivery.tag)
+                    == self.delivering[time][ty],
+                "memory runs another delivery than the model"
+            );
             let Some(entry) = entry else {
                 continue;
             };
@@ -269,7 +296,10 @@ impl Trace {
                 "an entry stands for no row and no delivery"
             );
             ensure!(
-                row == Stored::Absent || entry.firing != Some(Delivery::Deleted),
+                row == Stored::Absent
+                    || entry
+                        .firing
+                        .is_none_or(|delivery| delivery.row != Row::Deleted),
                 "a delivery marks its row deleted, but the row may exist"
             );
             if let Stored::Present(tag) = row {
@@ -306,6 +336,21 @@ impl Trace {
             During::Load => self.load_slab(),
             During::Pop => coordinates().for_each(|(time, ty)| self.pop(At(time, ty))),
         }
+    }
+
+    /// Fires the attempt with `tag` at `at`, which starts a delivery only if
+    /// no other delivery of the timer runs.
+    fn fire(&mut self, at: At, tag: i32) -> Result<()> {
+        let fired = self.timers.fire(&trigger(at, tag).id(), tag);
+        let delivering = &mut self.delivering[at.0][at.1];
+        ensure!(
+            !fired || delivering.is_none(),
+            "a second delivery of a timer started"
+        );
+        if fired {
+            *delivering = Some(tag);
+        }
+        Ok(())
     }
 
     /// The delay queue releases the attempt that waits at `at`.

@@ -5,11 +5,15 @@ use std::collections::{HashSet, VecDeque};
 
 /// What a trace holds: whether a load read the unowned slab, and for each
 /// coordinate its row, whether a delivery kept it, and its entry. The entry
-/// is the tag of the waiting attempt, whether that attempt is queued, and
-/// whether a delivery runs with its row deleted.
+/// is the tag of the waiting attempt and whether that attempt is queued, and
+/// the tag of a running delivery and whether its row is deleted.
 type State = (
     bool,
-    Vec<(Stored, bool, Option<(Option<(i32, bool)>, Option<bool>)>)>,
+    Vec<(
+        Stored,
+        bool,
+        Option<(Option<(i32, bool)>, Option<(i32, bool)>)>,
+    )>,
 );
 
 /// Checks every operation from every state that operations on three
@@ -84,7 +88,9 @@ fn state(trace: &Trace) -> State {
     let held = coordinates().map(|(time, ty)| {
         let entry = trace.entry(At(time, ty)).map(|entry| {
             let next = entry.next.as_ref();
-            let firing = entry.firing.map(|delivery| delivery == Delivery::Deleted);
+            let firing = entry
+                .firing
+                .map(|delivery| (delivery.tag, delivery.row == Row::Deleted));
             (
                 next.map(|next| (next.trigger.tag, next.queued.is_some())),
                 firing,
@@ -116,12 +122,10 @@ fn rebuild((loaded, held): &State) -> Trace {
             }
             next
         });
-        slot.firing = firing.map(|deleted| {
-            if deleted {
-                Delivery::Deleted
-            } else {
-                Delivery::Stored
-            }
+        trace.delivering[time][ty] = firing.map(|(tag, _)| tag);
+        slot.firing = firing.map(|(tag, deleted)| Delivery {
+            tag,
+            row: if deleted { Row::Deleted } else { Row::Stored },
         });
     }
     trace

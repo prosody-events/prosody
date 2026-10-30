@@ -25,9 +25,18 @@ pub(super) struct Entry {
     pub(super) firing: Option<Delivery>,
 }
 
+/// A delivery that a handler runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Delivery {
+    /// The tag of the attempt that the delivery runs. Only an abort with this
+    /// tag ends it.
+    pub(super) tag: i32,
+    pub(super) row: Row,
+}
+
 /// The row of a coordinate while its delivery runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Delivery {
+pub(super) enum Row {
     /// The row may exist.
     Stored,
     /// A clear deleted the row, and no write followed. The delivery has no
@@ -58,7 +67,7 @@ impl Entry {
         self.take_next(queue);
         self.firing
             .as_mut()
-            .map(|delivery| *delivery = Delivery::Deleted)
+            .map(|delivery| delivery.row = Row::Deleted)
             .is_some()
     }
 }

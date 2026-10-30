@@ -166,6 +166,8 @@ impl Arbitrary for OpSequence {
 struct TriggerModel {
     in_store: bool,
     memory: Option<Memory>,
+    /// The tag of the attempt whose delivery runs.
+    delivery: Option<i32>,
 }
 
 /// Per-trigger model of the stored row and of memory.
