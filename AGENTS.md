@@ -530,6 +530,27 @@ These invariants are why LWTs, distributed locks, and optimistic concurrency are
 
 **Batching:** When multiple statements target the **same partition (same row key)**, group them into an `UNLOGGED BATCH` whenever possible. Same-partition unlogged batches are atomic on the replica and execute as a single mutation, eliminating extra coordinator round-trips. Never use `LOGGED BATCH` for performance reasons, and never batch across partitions to "reduce round-trips" — that's an anti-pattern that overloads the coordinator.
 
+**Tombstones:** each row tombstone and each range marker that a read crosses
+counts toward `tombstone_warn_threshold` and `tombstone_failure_threshold`.
+Past the failure threshold, Cassandra aborts the read. Delete the widest range
+that you can prove is dead. Use this order of preference:
+
+1. Write no tombstone. Overwrite in place, as the timer `state` column does.
+2. Delete the partition. Only a partition delete lets a read skip older
+   SSTables.
+3. Delete a clustering range in which every row is dead now. Prefer an open
+   prefix (`< watermark`). A newer, wider prefix shadows the older ones, so a
+   read counts only two markers. The gap deletes in
+   `src/state/cassandra/cell/queries.rs` follow this rule.
+4. Delete one row only when you know of no wider dead range. A range around
+   one row costs two markers, which is more than one row tombstone.
+
+Choose a clustering order that keeps dead rows next to each other. No range
+can cover dead rows that sit between live rows. A range removes the covered
+tombstones from the read count at once. The read cost falls only after
+compaction. Later inserts into the range survive, because a range tombstone
+removes only writes with an older timestamp.
+
 **Bind persisted types directly via their scylla serdes.** Pass persisted types to the driver through their `SerializeValue`/`DeserializeValue` impls; never hand-convert to a driver primitive (`i8`/`i16`/etc.) at the call site. When you persist a type, give it idiomatic `From<Self> for iN` / `TryFrom<iN> for Self` discriminator conversions (a dedicated error for the fallible direction) and let the scylla serde delegate through them — e.g. `i8::from(*self).serialize(...)`; see `TimerType`, `SegmentVersion`, `StateType`, `CollectionKindId`, `Encoding`, `CellKind`. Do not add bespoke `as_iN`/`from_iN` inherent methods; the trait impls are the single conversion surface. Reads may keep deserializing the raw primitive and validating it through `TryFrom` in a fallible post-step **only** when a bad value must classify `Permanent` (or be skipped for forward-compat) rather than become scylla's `Terminal` `DeserializationError` — as the `EventRef` UDT and the discriminators above do. In that case the serde is serialize-only by design (a `SerializeValue` impl with no `DeserializeValue`, since the latter cannot express "skip this row"); document the read-side validator it pairs with.
 
 **Static columns:** a static column returns NULL for every clustering row
