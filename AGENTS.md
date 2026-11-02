@@ -556,6 +556,17 @@ removes only writes with an older timestamp.
 **Static columns:** a static column returns NULL for every clustering row
 except the first in the partition. Read it as `Option<T>` and filter in code.
 
+A read that selects only static columns still scans the clustering rows. It
+stops at the first live row. If the partition has no live row, the read
+crosses every tombstone in it. No CQL form reads the static row alone. Read a
+static column together with a row read that needs it. Alternatively, read it
+where a live row always sits at the start of the read.
+
+A static column is not necessary for atomic updates, because a same-partition
+`UNLOGGED BATCH` is atomic for any rows. For header data that partitions
+without live rows must keep, use a row at a reserved clustering prefix. Read
+it by that prefix, as the keyed-state `Marker` kind does.
+
 **TTL overflow protection:** Cassandra's maximum TTL is 630,720,000 seconds
 (20 years). Check every computed TTL against that maximum before binding.
 Reuse `calculate_ttl` (`src/cassandra/mod.rs`); do not hand-roll TTL
