@@ -6,11 +6,12 @@ use super::{SLAB_SECONDS, Store, listed, next_pending, past, seeded_store, slab_
 use crate::Key;
 use crate::consumer::Uncommitted;
 use crate::consumer::partition::ShutdownPhase;
+use crate::telemetry::Telemetry;
 use crate::timers::active::{Insert, Listed};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::manager::TimerManagerError;
-use crate::timers::scheduler::TimerSchedulerError;
+use crate::timers::scheduler::{Inserted, TimerSchedulerError};
 use crate::timers::store::TriggerStore;
 use crate::timers::test_support::setup_timer_manager_with_store;
 use crate::timers::{
@@ -60,7 +61,8 @@ async fn run(victim: Victim, followup: Followup, backlog: u8, polls: u8, due: bo
     let due = due || victim.delivers();
     let (store, now) = seeded_store(due).await?;
     let (stream, manager, _shutdown) =
-        setup_timer_manager_with_store(store.clone(), ShutdownPhase::default()).await?;
+        setup_timer_manager_with_store(store.clone(), ShutdownPhase::default(), &Telemetry::new())
+            .await?;
     pin_mut!(stream);
     let time = now.add_duration(CompactDuration::new(3_600))?;
     // The victim has its own slab, so no other schedule registers it.
@@ -192,7 +194,7 @@ where
 async fn dropped_reschedule_of_a_firing_timer_fires_after_commit() -> Result<()> {
     let (store, now) = seeded_store(true).await?;
     let (stream, manager, _shutdown) =
-        setup_timer_manager_with_store(store, ShutdownPhase::default()).await?;
+        setup_timer_manager_with_store(store, ShutdownPhase::default(), &Telemetry::new()).await?;
     pin_mut!(stream);
 
     let time = past(now);
@@ -359,7 +361,9 @@ async fn insert(
     fails: bool,
     written: &Cell<bool>,
 ) -> Result<(), TimerManagerError<<Store as TriggerStore>::Error>> {
-    let (trigger, ticket) = manager
+    let Inserted {
+        trigger, ticket, ..
+    } = manager
         .0
         .scheduler
         .insert(trigger, Insert::Schedule)

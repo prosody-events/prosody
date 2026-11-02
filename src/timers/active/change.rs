@@ -51,12 +51,13 @@ pub(super) enum Rows {
         /// Whether the start made the entry.
         created: bool,
     },
-    /// Deletes the row at this time.
+    /// Deletes the row at this time. Only a commit deletes the row of a
+    /// delivery that runs, so a done delete also ends that delivery.
     Remove(CompactDateTime),
-    /// Deletes every row except the rows at these times. A slab load during
-    /// the change can add entries for the deleted rows, so the end of a done
-    /// change drops every entry at another time.
-    RemoveAll(SmallVec<[CompactDateTime; 1]>),
+    /// Deletes every row whose delivery does not run. A slab load during the
+    /// change can add entries for the deleted rows, so the end of a done
+    /// change drops each of them.
+    RemoveAll,
 }
 
 impl Change {

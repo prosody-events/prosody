@@ -36,7 +36,7 @@ mod entry;
 
 use change::Rows;
 pub(crate) use change::{Change, Insert, Outcome};
-use entry::{Coordinates, Delivery, Next, Row, get_mut, get_or_insert, retain};
+use entry::{Coordinates, Delivery, Entry, Next, Row, get_mut, get_or_insert, retain};
 
 /// The in-memory timers of one partition.
 #[derive(Debug, Default)]
@@ -50,7 +50,8 @@ pub(crate) struct Timers {
 pub(crate) enum Listed {
     /// An attempt waits to fire, and no delivery runs.
     Waits,
-    /// A delivery runs. `again` tells whether an attempt also waits.
+    /// A delivery runs. `again` tells whether an attempt also waits. Only
+    /// tests read `again`: they compare it with their models.
     Firing { again: bool },
 }
 
@@ -68,13 +69,14 @@ pub struct TimerSnapshot {
 }
 
 impl Timers {
-    /// Starts an insert of `trigger`, and returns the attempt to write. The
-    /// entry stays from now to the end, so cleanup keeps the slab.
+    /// Starts an insert of `trigger`. Returns the attempt to write, and
+    /// whether the timer held no attempt and no delivery. The entry stays from
+    /// now to the end, so cleanup keeps the slab.
     pub(crate) fn start_insert(
         &mut self,
         mut trigger: Trigger,
         insert: Insert,
-    ) -> (Trigger, Change) {
+    ) -> (Trigger, Change, bool) {
         let restore = match insert {
             Insert::Clear => self.take_all(&trigger.key, trigger.timer_type, |time| {
                 time != trigger.time
@@ -87,6 +89,7 @@ impl Timers {
             trigger.time,
             trigger.timer_type,
         );
+        let idle = entry.next.is_none() && entry.firing.is_none();
         if let Some(next) = &entry.next
             && !matches!(insert, Insert::Repair)
         {
@@ -102,7 +105,7 @@ impl Timers {
             },
             restore,
         };
-        (trigger, change)
+        (trigger, change, idle)
     }
 
     /// Starts the removal of the timer at `time`, and returns the change that
@@ -144,32 +147,27 @@ impl Timers {
             restore: self.take_all(&key, timer_type, |_| true),
             key,
             timer_type,
-            rows: Rows::RemoveAll(firing.clone()),
+            rows: Rows::RemoveAll,
         };
         (change, firing)
     }
 
-    /// Ends the delivery of a coordinate. Returns the change that deletes its
-    /// row, or `None` when no row needs a delete: the timer was scheduled
-    /// again during the delivery, or a clear deleted the row.
-    pub(crate) fn start_complete(
-        &mut self,
-        key: Key,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> Option<Change> {
-        if let Some(entry) = get_mut(&mut self.entries, &key, time, timer_type)
-            && let Some(delivery) = entry.firing.take()
-        {
-            if entry.next.is_some() {
-                return None;
-            }
-            if delivery.row == Row::Deleted {
-                self.forget(&key, time, timer_type);
-                return None;
-            }
+    /// Starts the commit of the delivery of the attempt with `tag`. Returns
+    /// the change that deletes its row, whose done end also ends the
+    /// delivery. Returns `None` and ends the delivery at once when no row
+    /// needs a delete: the timer was scheduled again during the delivery, or a
+    /// clear deleted the row. A commit of an attempt whose delivery does not
+    /// run changes nothing, so it never deletes a timer that it did not
+    /// deliver.
+    pub(crate) fn start_complete(&mut self, id: TriggerId, tag: i32) -> Option<Change> {
+        let entry = get_mut(&mut self.entries, &id.key, id.time, id.timer_type)?;
+        let delivery = entry.firing.filter(|delivery| delivery.tag == tag)?;
+        if entry.next.is_none() && delivery.row == Row::Stored {
+            return Some(self.removal(id.key, id.time, id.timer_type));
         }
-        Some(self.removal(key, time, timer_type))
+        entry.firing = None;
+        self.forget(&id.key, id.time, id.timer_type);
+        None
     }
 
     /// Aborts the delivery of the attempt with `tag`, or that attempt if it
@@ -218,11 +216,16 @@ impl Timers {
                     trigger,
                     insert: Insert::Clear,
                     ..
-                } => self.drop_rows(&key, timer_type, |time| time != trigger.time),
+                } => self.drop_rows(&key, timer_type, |time, _| time != trigger.time),
                 Rows::Write { .. } => {}
-                Rows::Remove(at) => self.drop_rows(&key, timer_type, |time| time == *at),
-                Rows::RemoveAll(kept) => {
-                    self.drop_rows(&key, timer_type, |time| !kept.contains(&time));
+                Rows::Remove(at) => {
+                    if let Some(entry) = get_mut(&mut self.entries, &key, *at, timer_type) {
+                        entry.firing = None;
+                    }
+                    self.drop_rows(&key, timer_type, |time, _| time == *at);
+                }
+                Rows::RemoveAll => {
+                    self.drop_rows(&key, timer_type, |_, entry| entry.firing.is_none());
                 }
             }
         } else {
@@ -381,17 +384,17 @@ impl Timers {
         }
     }
 
-    /// Forgets the deleted rows of a key and type at the times that
-    /// `deleted` picks. A running delivery keeps its entry.
+    /// Forgets the deleted rows of a key and type that `deleted` picks. A
+    /// running delivery keeps its entry.
     fn drop_rows(
         &mut self,
         key: &Key,
         timer_type: TimerType,
-        deleted: impl Fn(CompactDateTime) -> bool,
+        deleted: impl Fn(CompactDateTime, &Entry) -> bool,
     ) {
         let Self { entries, queue } = self;
         retain(entries, key, |(time, ty, entry)| {
-            *ty != timer_type || !deleted(*time) || entry.drop_row(queue)
+            *ty != timer_type || !deleted(*time, entry) || entry.drop_row(queue)
         });
     }
 

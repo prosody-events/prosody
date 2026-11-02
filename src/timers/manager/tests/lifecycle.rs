@@ -4,8 +4,10 @@ use super::{Store, listed, next_pending, past, seeded_store};
 use crate::Key;
 use crate::consumer::Uncommitted;
 use crate::consumer::partition::ShutdownPhase;
+use crate::telemetry::Telemetry;
+use crate::telemetry::event::{Data, TelemetryEvent, TimerEventType};
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::test_support::{Memory, setup_timer_manager_with_store};
+use crate::timers::test_support::{Memory, Step, after, setup_timer_manager_with_store};
 use crate::timers::uncommitted::UncommittedTriggerGuard;
 use crate::timers::{PendingTimer, TimerRequest, TimerType, UncommittedTimer};
 use color_eyre::eyre::{OptionExt, Result, ensure};
@@ -13,18 +15,8 @@ use futures::{Stream, pin_mut};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use strum::VariantArray;
 use tokio::runtime::Builder;
+use tokio::sync::broadcast;
 use tracing::Span;
-
-/// One step that a timer's owner can take.
-#[derive(Clone, Copy, Debug, VariantArray)]
-enum Step {
-    Schedule,
-    Unschedule,
-    /// Takes the due timer from the stream and starts its delivery.
-    Fire,
-    Commit,
-    Abort,
-}
 
 impl Arbitrary for Step {
     fn arbitrary(g: &mut Gen) -> Self {
@@ -33,8 +25,10 @@ impl Arbitrary for Step {
 }
 
 /// After every step, memory lists the timer and `scheduled_times` reports it
-/// as the model predicts. A fire happens only while an attempt waits, and a
-/// commit or abort only during a delivery.
+/// as the model predicts. A schedule reports a timer that was not scheduled,
+/// and an unschedule reports a timer whose delivery does not run. A fire
+/// happens only while an attempt waits, and a commit or abort only during a
+/// delivery.
 #[test]
 fn prop_lifecycle_follows_the_model() {
     fn property(steps: Vec<Step>) -> Result<()> {
@@ -48,8 +42,10 @@ fn prop_lifecycle_follows_the_model() {
 
 async fn run(steps: Vec<Step>) -> Result<()> {
     let (store, now) = seeded_store(true).await?;
+    let telemetry = Telemetry::new();
+    let mut events = telemetry.subscribe();
     let (stream, manager, _shutdown) =
-        setup_timer_manager_with_store(store, ShutdownPhase::default()).await?;
+        setup_timer_manager_with_store(store, ShutdownPhase::default(), &telemetry).await?;
     pin_mut!(stream);
     let key = Key::from("lifecycle");
     let (time, timer_type) = (past(now), TimerType::Application);
@@ -76,7 +72,19 @@ async fn run(steps: Vec<Step>) -> Result<()> {
             }
             _ => continue,
         }
-        model = next(model, step);
+        let reports = match step {
+            Step::Schedule => (usize::from(matches!(model, None | Some(Memory::Kept))), 0),
+            Step::Unschedule => (
+                0,
+                usize::from(!matches!(model, Some(Memory::Firing { .. }))),
+            ),
+            Step::Fire | Step::Commit | Step::Abort => (0, 0),
+        };
+        ensure!(
+            reported(&mut events) == reports,
+            "{step:?} in {model:?} did not report {reports:?}"
+        );
+        model = after(model, step);
 
         let listed = listed(&manager, &key, time, timer_type).await?;
         ensure!(
@@ -103,21 +111,19 @@ async fn run(steps: Vec<Step>) -> Result<()> {
     Ok(())
 }
 
-/// The model of one timer's memory, as its owner sees it.
-fn next(memory: Option<Memory>, step: Step) -> Option<Memory> {
-    use Memory::{Firing, Kept, Waits};
-
-    match (step, memory) {
-        // A delivery keeps its row. A schedule during it queues an attempt.
-        (Step::Schedule, Some(Firing { .. })) => Some(Firing { again: true }),
-        (Step::Unschedule, Some(Firing { .. })) | (Step::Fire, _) => Some(Firing { again: false }),
-        // The end of a delivery leaves the attempt that waits.
-        (Step::Schedule, _) | (Step::Commit | Step::Abort, Some(Firing { again: true })) => {
-            Some(Waits)
+/// Counts the scheduled and the cancelled events in `events`.
+fn reported(events: &mut broadcast::Receiver<TelemetryEvent>) -> (usize, usize) {
+    let mut counts = (0, 0);
+    while let Ok(event) = events.try_recv() {
+        if let Data::Timer(timer) = &*event.data {
+            match timer.event_type {
+                TimerEventType::Scheduled => counts.0 += 1,
+                TimerEventType::Cancelled => counts.1 += 1,
+                _ => {}
+            }
         }
-        (Step::Unschedule | Step::Commit, _) => None,
-        (Step::Abort, _) => Some(Kept),
     }
+    counts
 }
 
 /// Takes timers from the stream until one starts, and checks that it is the

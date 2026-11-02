@@ -80,10 +80,8 @@ async fn run_crud_trace(trace: CrudTrace) -> Result<()> {
                 manager.unschedule_all(key, timer_type).await?;
                 model_set.clear();
             }
-            CrudOp::Complete => {
-                manager.complete(key, time, timer_type).await?;
-                model_set.remove(&time);
-            }
+            // No delivery runs, so a commit changes nothing.
+            CrudOp::Complete => manager.complete(key, time, timer_type, 0).await?,
             // Abort never removes the durable row (it is preserved for
             // recovery), so `scheduled_times` visibility is unchanged.
             CrudOp::Abort => manager.abort(key, time, timer_type, 0),

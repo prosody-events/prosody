@@ -6,7 +6,7 @@
 //!
 //! [`TriggerScheduler`]: super::TriggerScheduler
 
-use super::{Command, Start, Ticket};
+use super::{Command, Inserted, Start, Ticket};
 use crate::Key;
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::Heartbeat;
@@ -236,9 +236,13 @@ where
             let started = register_slab(state, trigger.time)
                 .await
                 .map(|()| timers.start_insert(trigger, insert))
-                .map(|(trigger, change)| (trigger, ticket(change)));
+                .map(|(trigger, change, idle)| Inserted {
+                    trigger,
+                    ticket: ticket(change),
+                    idle,
+                });
             match reply.send(started) {
-                Err(Ok((_, ticket))) => Some(ticket),
+                Err(Ok(Inserted { ticket, .. })) => Some(ticket),
                 _ => None,
             }
         }
@@ -254,8 +258,8 @@ where
             let (change, firing) = timers.start_unschedule_all(key, timer_type);
             reply.send((ticket(change), firing)).err().map(|(t, _)| t)
         }
-        Start::Complete { id, reply } => {
-            let change = timers.start_complete(id.key, id.time, id.timer_type);
+        Start::Complete { id, tag, reply } => {
+            let change = timers.start_complete(id, tag);
             reply.send(change.map(ticket)).err().flatten()
         }
         Start::Fire { id, tag, reply } => {

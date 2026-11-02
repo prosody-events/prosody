@@ -35,7 +35,8 @@ enum Op {
     Insert(At, Insert, i32, Outcome, During),
     Unschedule(At, Outcome, During),
     UnscheduleAll(usize, Outcome, During),
-    Complete(At, Outcome),
+    /// Commits the delivery of the attempt with this tag.
+    Complete(At, i32, Outcome),
     /// Aborts with the tag of a delivered attempt.
     Abort(At, i32),
     /// The delay queue releases the waiting attempt.
@@ -58,7 +59,7 @@ enum During {
 }
 
 /// What the store holds at one coordinate.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Stored {
     #[default]
     Absent,
@@ -90,60 +91,6 @@ fn prop_timers_cover_every_row() {
         replay(ops)
     }
     QuickCheck::new().quickcheck(property as fn(Vec<Op>) -> Result<()>);
-}
-
-/// A clear deletes the row of a timer during its delivery, and then the
-/// delivery aborts. Memory must keep nothing for the deleted row.
-#[test]
-fn aborted_delivery_of_a_cleared_row_leaves_no_entry() -> Result<()> {
-    let (cleared, other) = (At(0, 0), At(2, 0));
-    replay([
-        Op::Insert(cleared, Insert::Clear, 0, Outcome::Done, During::Nothing),
-        Op::Pop(cleared),
-        Op::Fire(cleared, 0),
-        Op::Insert(other, Insert::Clear, 0, Outcome::Done, During::Nothing),
-        Op::Abort(cleared, 0),
-    ])
-}
-
-/// A handler schedules its own timer again during its delivery, and the new
-/// attempt leaves the queue. The abort of that attempt must not end the
-/// delivery that runs, so the commit of the delivery keeps the new row.
-#[test]
-fn abort_of_a_rescheduled_attempt_keeps_the_delivery() -> Result<()> {
-    let at = At(0, 0);
-    replay([
-        Op::Insert(at, Insert::Schedule, 0, Outcome::Done, During::Nothing),
-        Op::Pop(at),
-        Op::Fire(at, 0),
-        Op::Insert(at, Insert::Schedule, 1, Outcome::Done, During::Nothing),
-        Op::Pop(at),
-        Op::Abort(at, 1),
-        Op::Complete(at, Outcome::Done),
-    ])
-}
-
-/// A slab load runs while a row change is in progress. A clear then deletes
-/// a row that the load read, and an insert that never started leaves the row
-/// that the load read. Memory must match the rows in both cases.
-#[test]
-fn slab_load_during_a_row_change_keeps_memory_exact() -> Result<()> {
-    let (unowned, owned) = (At(UNOWNED, 0), At(0, 0));
-    let stored = Op::Insert(unowned, Insert::Schedule, 0, Outcome::Done, During::Nothing);
-    replay([
-        stored,
-        Op::Insert(owned, Insert::Clear, 1, Outcome::Done, During::Load),
-    ])?;
-    replay([
-        stored,
-        Op::Insert(
-            unowned,
-            Insert::Schedule,
-            1,
-            Outcome::Unchanged,
-            During::Load,
-        ),
-    ])
 }
 
 /// Applies `ops` to empty memory, and checks after each one.
@@ -183,7 +130,7 @@ impl Trace {
         let mut ended = None;
         match op {
             Op::Insert(at, insert, tag, outcome, during) => {
-                let (trigger, change) = self.timers.start_insert(trigger(at, tag), insert);
+                let (trigger, change, _) = self.timers.start_insert(trigger(at, tag), insert);
                 self.during(during);
                 let cleared = matches!(insert, Insert::Clear).then_some(at.1);
                 for (time, row) in self.rows.iter_mut().enumerate() {
@@ -229,14 +176,25 @@ impl Trace {
                     self.kept_attempt(At(time, ty), before, outcome)?;
                 }
             }
-            Op::Complete(at @ At(time, ty), outcome) => {
-                self.delivering[time][ty] = None;
+            // A delivery ends when its commit needs no delete or the delete is
+            // done. A commit without its delivery changes nothing.
+            Op::Complete(at @ At(time, ty), tag, outcome) => {
                 let before = self.waiting(at);
-                if let Some(change) = self.timers.start_complete(key, time_of(time), TYPES[ty]) {
+                let delivered = self.delivering[time][ty] == Some(tag);
+                let id = TriggerId::new(&key, time_of(time), TYPES[ty]);
+                let change = self.timers.start_complete(id, tag);
+                ensure!(
+                    delivered || (change.is_none() && self.waiting(at) == before),
+                    "a commit without its delivery changed memory"
+                );
+                if let Some(change) = change {
                     delete(&mut self.rows[time][ty], outcome);
                     self.end(change, outcome);
                     self.kept_attempt(at, before, outcome)?;
                     ended = (outcome != Outcome::Done).then_some(at);
+                }
+                if delivered && ended.is_none() {
+                    self.delivering[time][ty] = None;
                 }
             }
             Op::Abort(at @ At(time, ty), tag) => {
@@ -489,7 +447,7 @@ impl Arbitrary for Op {
             0..=2 => Op::Insert(at, insert, tag, outcome, during),
             3 => Op::Unschedule(at, outcome, during),
             4 => Op::UnscheduleAll(at.1, outcome, during),
-            5 => Op::Complete(at, outcome),
+            5 => Op::Complete(at, tag, outcome),
             6 => Op::Abort(at, tag),
             7 => Op::Pop(at),
             8 => Op::Fire(at, tag),

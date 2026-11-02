@@ -8,13 +8,13 @@ use crate::Key;
 use crate::timers::active::Insert;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
+use crate::timers::scheduler::Inserted;
 use crate::timers::scheduler::actor::load::load_step;
 use crate::timers::scheduler::actor::owns_slab;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::memory::memory_store;
 use crate::timers::store::{Segment, TriggerStore};
-use crate::timers::test_support::Memory;
-use crate::timers::test_support::test_segment;
+use crate::timers::test_support::{Memory, Step, after, test_segment};
 use crate::timers::{TimerType, Trigger, TriggerId};
 use color_eyre::eyre::{OptionExt, Result, WrapErr, bail, ensure};
 use tracing::Span;
@@ -80,7 +80,9 @@ impl Fixture {
 
         let trigger = Trigger::new(key.clone(), time, ty, Span::current());
         let scheduler = self.actor.scheduler();
-        let (trigger, ticket) = self
+        let Inserted {
+            trigger, ticket, ..
+        } = self
             .actor
             .serve(scheduler.insert(trigger, Insert::Schedule))
             .await
@@ -104,12 +106,10 @@ impl Fixture {
                 // The error of a stopped write is the point of the op.
                 let _ = ticket.run(write).await;
                 model.in_store |= stop != Stop::FailedWrite;
-                let owned = owns_slab(&self.actor.state, slab_id);
-                model.memory = match model.memory {
-                    Some(Memory::Firing { .. }) => Some(Memory::Firing { again: true }),
-                    None if !owned => None,
-                    Some(Memory::Waits | Memory::Kept) | None => Some(Memory::Waits),
-                };
+                // In an unowned slab, a load reads the row later.
+                if model.memory.is_some() || owns_slab(&self.actor.state, slab_id) {
+                    model.memory = after(model.memory, Step::Schedule);
+                }
             }
         }
         self.actor.drain().await;
@@ -132,10 +132,9 @@ impl Fixture {
                 .run(self.store.remove_trigger(&key, time, ty))
                 .await
                 .wrap_err("remove_trigger")?;
-            model = TriggerModel::default();
-        } else {
-            model.memory = Some(Memory::Firing { again: false });
+            model.in_store = false;
         }
+        model.memory = after(model.memory, Step::Unschedule);
         self.actor.drain().await;
         self.set_model(key, time, ty, model);
         Ok(())
@@ -157,7 +156,7 @@ impl Fixture {
             fired,
             "the attempt at {time} that left the queue did not fire"
         );
-        model.memory = Some(Memory::Firing { again: false });
+        model.memory = after(model.memory, Step::Fire);
         model.delivery = Some(trigger.tag);
         self.set_model(key, time, ty, model);
         Ok(())
@@ -173,11 +172,7 @@ impl Fixture {
             .scheduler()
             .abort(TriggerId::new(&key, time, ty), tag);
         self.actor.drain().await;
-        model.memory = match model.memory {
-            Some(Memory::Firing { again: true }) => Some(Memory::Waits),
-            Some(Memory::Firing { again: false }) => Some(Memory::Kept),
-            memory => memory,
-        };
+        model.memory = after(model.memory, Step::Abort);
         self.set_model(key, time, ty, model);
         Ok(())
     }

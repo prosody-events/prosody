@@ -3,10 +3,10 @@ use crate::timers::slab::Slab;
 use crate::timers::store::SegmentVersion;
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::InMemoryTriggerStore;
-use crate::timers::test_support::{Memory, setup_timer_manager_with_store};
+use crate::timers::test_support::{Memory, Step, after, setup_timer_manager_with_store};
 use crate::timers::uncommitted::FiringTimer;
 use IdentityOp::{Abort, Clear, Commit, Fire, Schedule, Unschedule};
-use Memory::{Firing, Kept, Waits};
+use Memory::{Firing, Waits};
 use tokio::sync::Semaphore;
 
 type MemoryStore = TableAdapter<InMemoryTriggerStore>;
@@ -43,6 +43,16 @@ enum IdentityOp {
     Unschedule(usize),
     Commit,
     Abort,
+}
+
+impl IdentityModel {
+    /// Removes the timer. A delivery that runs keeps its row and identity.
+    fn unschedule(&mut self) {
+        self.memory = after(self.memory, Step::Unschedule);
+        if self.memory.is_none() {
+            *self = Self::default();
+        }
+    }
 }
 
 impl Arbitrary for IdentityTrace {
@@ -88,11 +98,7 @@ where
                 self.manager
                     .unschedule(&self.key, self.times[index], TimerType::Application)
                     .await?;
-                let model = &mut self.models[index];
-                match model.memory {
-                    Some(Firing { .. }) => model.memory = Some(Firing { again: false }),
-                    _ => *model = IdentityModel::default(),
-                }
+                self.models[index].unschedule();
             }
             Fire(_) => {}
         }
@@ -110,11 +116,7 @@ where
             self.manager.clear_and_schedule(request).await?;
             let other = &mut self.models[1 - index];
             if other.row.take().is_some() {
-                if matches!(other.memory, Some(Firing { .. })) {
-                    other.memory = Some(Firing { again: false });
-                } else {
-                    *other = IdentityModel::default();
-                }
+                other.unschedule();
             }
         } else {
             self.manager.schedule(request).await?;
@@ -140,11 +142,7 @@ where
                 written.tag
             );
             model.tag = Some(written.tag);
-            model.memory = Some(if matches!(model.memory, Some(Firing { .. })) {
-                Firing { again: true }
-            } else {
-                Waits
-            });
+            model.memory = after(model.memory, Step::Schedule);
         }
         model.row = Some(written.tag);
         Ok(())
@@ -176,7 +174,7 @@ where
         assert_eq!(firing.is_some(), model.memory == Some(Waits));
         if let Some(firing) = firing {
             assert_eq!(Some(firing.trigger().tag), model.tag);
-            self.models[index].memory = Some(Firing { again: false });
+            self.models[index].memory = after(model.memory, Step::Fire);
             self.delivered = Some((index, firing));
         }
         Ok(())
@@ -207,13 +205,15 @@ where
         if let Some((index, firing)) = self.delivered.take() {
             let model = &mut self.models[index];
             let old = firing.trigger().clone();
-            if matches!(op, Commit) {
+            let step = if matches!(op, Commit) {
                 firing.commit().await;
+                Step::Commit
             } else {
                 firing.abort().await;
-            }
-            if model.memory == Some(Firing { again: true }) {
-                model.memory = Some(Waits);
+                Step::Abort
+            };
+            model.memory = after(model.memory, step);
+            if model.memory == Some(Waits) {
                 // A stale delivery must not dispatch the queued replacement.
                 let pending = PendingTimer::new(
                     old,
@@ -221,11 +221,9 @@ where
                     self.permits.clone().acquire_owned().await?,
                 );
                 assert!(pending.fire().await.is_none());
-            } else if matches!(op, Commit) || model.row.is_none() {
+            } else if model.memory.is_none() || model.row.is_none() {
                 // A clear that deleted the row leaves an abort nothing to keep.
                 *model = IdentityModel::default();
-            } else {
-                model.memory = Some(Kept);
             }
         }
         Ok(())
@@ -320,7 +318,7 @@ async fn run_identity_trace(trace: IdentityTrace) -> Result<()> {
         .insert_slab(Slab::from_time(store.slab_size(), loaded.time))
         .await?;
     let (stream, manager, _shutdown_tx) =
-        setup_timer_manager_with_store(store, ShutdownPhase::default()).await?;
+        setup_timer_manager_with_store(store, ShutdownPhase::default(), &Telemetry::new()).await?;
     pin_mut!(stream);
     check_loaded_identity(&manager, &mut stream, &loaded).await?;
 

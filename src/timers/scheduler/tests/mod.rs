@@ -5,6 +5,7 @@ mod invariants;
 mod seed;
 pub(crate) mod support;
 
+use super::Inserted;
 use super::actor::ActorState;
 use super::actor::load::{
     MIN_PRELOAD, calculate_preload, calculate_wait_time, drain_slab_range, load_step,
@@ -178,7 +179,11 @@ async fn partial_load(tag: i32, kind: u8, delivery: Delivery, repair: bool) -> R
     let scheduler = actor.scheduler();
 
     // The slab is not owned, so the schedule leaves the row to a load.
-    let (old, ticket) = actor.serve(scheduler.insert(old, Insert::Schedule)).await?;
+    let Inserted {
+        trigger: old,
+        ticket,
+        ..
+    } = actor.serve(scheduler.insert(old, Insert::Schedule)).await?;
     ticket.run(store.add_trigger(old.clone())).await?;
     actor.drain().await;
 
@@ -222,7 +227,11 @@ async fn partial_load(tag: i32, kind: u8, delivery: Delivery, repair: bool) -> R
     } else {
         Insert::Schedule
     };
-    let (new, ticket) = actor.serve(scheduler.insert(new, insert)).await?;
+    let Inserted {
+        trigger: new,
+        ticket,
+        ..
+    } = actor.serve(scheduler.insert(new, insert)).await?;
     if repair {
         store.operations().upsert_key_trigger(new.clone()).await?;
         ticket.run(store.insert_slab_trigger(new.clone())).await?;
@@ -231,7 +240,7 @@ async fn partial_load(tag: i32, kind: u8, delivery: Delivery, repair: bool) -> R
     }
     actor.drain().await;
     if matches!(delivery, Delivery::Firing) {
-        let commit = actor.serve(scheduler.complete(old.id())).await?;
+        let commit = actor.serve(scheduler.complete(old.id(), old.tag)).await?;
         ensure!(commit.is_none(), "the commit deleted the new row");
     }
 

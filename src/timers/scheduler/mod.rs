@@ -85,7 +85,7 @@ pub(super) enum Start<E> {
     Insert {
         trigger: Trigger,
         insert: Insert,
-        reply: oneshot::Sender<Result<(Trigger, Ticket<E>), E>>,
+        reply: oneshot::Sender<Result<Inserted<E>, E>>,
     },
     /// Starts the removal of one timer.
     Unschedule {
@@ -98,9 +98,10 @@ pub(super) enum Start<E> {
         timer_type: TimerType,
         reply: oneshot::Sender<(Ticket<E>, SmallVec<[CompactDateTime; 1]>)>,
     },
-    /// Ends a delivery.
+    /// Starts the commit of the delivery of the attempt with `tag`.
     Complete {
         id: TriggerId,
+        tag: i32,
         reply: oneshot::Sender<Option<Ticket<E>>>,
     },
     /// Starts the delivery of the attempt with `tag` that left the queue.
@@ -111,6 +112,16 @@ pub(super) enum Start<E> {
     },
     /// Aborts a delivery, or the delivered attempt with `tag`.
     Abort { id: TriggerId, tag: i32 },
+}
+
+/// An insert that the actor started.
+#[derive(Debug)]
+pub(crate) struct Inserted<E> {
+    /// The attempt to write. It keeps the tag of an attempt that waits.
+    pub(crate) trigger: Trigger,
+    pub(crate) ticket: Ticket<E>,
+    /// Whether the timer held no attempt and no delivery.
+    pub(crate) idle: bool,
 }
 
 /// An operation that the actor started.
@@ -166,13 +177,12 @@ where
         (Self { command_tx }, commands_rx)
     }
 
-    /// Starts an insert of `trigger`. Returns the attempt to write, which
-    /// keeps the tag of an attempt that waits, and the ticket of the insert.
+    /// Starts an insert of `trigger`.
     pub(crate) async fn insert(
         &self,
         trigger: Trigger,
         insert: Insert,
-    ) -> Result<(Trigger, Ticket<E>), TimerSchedulerError<E>> {
+    ) -> Result<Inserted<E>, TimerSchedulerError<E>> {
         self.request(|reply| {
             Command::Start(Start::Insert {
                 trigger,
@@ -211,13 +221,14 @@ where
         .await
     }
 
-    /// Ends a delivery. Returns the ticket of the row delete, or `None` when
-    /// an attempt waits and keeps the row.
+    /// Starts the commit of the delivery of the attempt with `tag`. Returns
+    /// the ticket of the row delete, or `None` when no row needs a delete.
     pub(crate) async fn complete(
         &self,
         id: TriggerId,
+        tag: i32,
     ) -> Result<Option<Ticket<E>>, TimerSchedulerError<E>> {
-        self.request(|reply| Command::Start(Start::Complete { id, reply }))
+        self.request(|reply| Command::Start(Start::Complete { id, tag, reply }))
             .await
     }
 

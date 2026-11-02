@@ -25,7 +25,7 @@ use crate::timers::active::{Insert, Listed, TimerSnapshot};
 use crate::timers::datetime::CompactDateTime;
 
 pub use crate::timers::error::TimerManagerError;
-use crate::timers::scheduler::TriggerScheduler;
+use crate::timers::scheduler::{Inserted, TriggerScheduler};
 use crate::timers::segment::get_or_create_segment;
 use crate::timers::store::TriggerStore;
 use crate::timers::{
@@ -212,12 +212,19 @@ where
         trigger: Trigger,
     ) -> Result<(), TimerManagerError<T::Error>> {
         let inner = &self.0;
-        let (trigger, ticket) = inner.scheduler.insert(trigger, Insert::Schedule).await?;
+        let Inserted {
+            trigger,
+            ticket,
+            idle,
+        } = inner.scheduler.insert(trigger, Insert::Schedule).await?;
         ticket
             .run(inner.store.add_trigger(trigger.clone()))
             .await
             .map_err(TimerManagerError::Store)?;
-        inner.scheduled(&trigger);
+        // A timer that waits or runs was already scheduled.
+        if idle {
+            inner.scheduled(&trigger);
+        }
         Ok(())
     }
 
@@ -305,7 +312,9 @@ where
         request: TimerRequest,
     ) -> Result<(), TimerManagerError<T::Error>> {
         let inner = &self.0;
-        let (trigger, ticket) = inner
+        let Inserted {
+            trigger, ticket, ..
+        } = inner
             .scheduler
             .insert(request.into_trigger(), Insert::Clear)
             .await?;
@@ -330,26 +339,25 @@ where
         )
     }
 
-    /// Marks a timer as completed.
+    /// Commits the delivery of the attempt with `tag`.
     ///
     /// The row goes unless the timer was scheduled again during its delivery:
-    /// then the waiting attempt keeps the row.
-    ///
-    /// Typically invoked by [`crate::timers::uncommitted::FiringTimer`]'s
-    /// [`crate::consumer::Uncommitted::commit()`] impl.
+    /// then the waiting attempt keeps the row. A commit of an attempt whose
+    /// delivery does not run changes nothing.
     ///
     /// # Errors
     ///
     /// Returns [`TimerManagerError`] if the storage write fails or the
     /// scheduler has shut down.
-    pub async fn complete(
+    pub(crate) async fn complete(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
+        tag: i32,
     ) -> Result<(), TimerManagerError<T::Error>> {
         let id = TriggerId::new(key, time, timer_type);
-        if let Some(ticket) = self.0.scheduler.complete(id).await? {
+        if let Some(ticket) = self.0.scheduler.complete(id, tag).await? {
             ticket
                 .run(self.0.store.remove_trigger(key, time, timer_type))
                 .await
@@ -365,7 +373,7 @@ where
     /// Returns [`TimerManagerError`] if the system clock is outside the
     /// 1970–2106 range or the scheduler has shut down; callers should skip
     /// that tick.
-    pub async fn snapshot(&self) -> Result<TimerSnapshot, TimerManagerError<T::Error>> {
+    pub(crate) async fn snapshot(&self) -> Result<TimerSnapshot, TimerManagerError<T::Error>> {
         Ok(self.0.scheduler.snapshot(CompactDateTime::now()?).await?)
     }
 
@@ -374,7 +382,7 @@ where
     ///
     /// Never deletes the timer from persistent storage: an aborted timer
     /// fires again after a restart.
-    pub fn abort(&self, key: &Key, time: CompactDateTime, timer_type: TimerType, tag: i32) {
+    pub(crate) fn abort(&self, key: &Key, time: CompactDateTime, timer_type: TimerType, tag: i32) {
         let id = TriggerId::new(key, time, timer_type);
         self.0.scheduler.abort(id, tag);
     }
@@ -410,7 +418,9 @@ where
             .await
             .map_err(TimerManagerError::Store)?;
         if let Some(replacement) = current.filter(|trigger| trigger.tag != timer.tag) {
-            let (trigger, ticket) = inner.scheduler.insert(replacement, Insert::Repair).await?;
+            let Inserted {
+                trigger, ticket, ..
+            } = inner.scheduler.insert(replacement, Insert::Repair).await?;
             ticket
                 .run(inner.store.insert_slab_trigger(trigger))
                 .await

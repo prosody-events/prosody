@@ -380,7 +380,7 @@ where
         loop {
             match self
                 .manager
-                .complete(&self.key, self.time, self.timer_type)
+                .complete(&self.key, self.time, self.timer_type, self.tag)
                 .await
             {
                 Ok(()) => break,
