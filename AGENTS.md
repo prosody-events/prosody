@@ -598,13 +598,22 @@ plus explicit `fields` control the attributes; `err(level = "warn")` records
 failures on the span), and `#[instrument(level = "debug", skip(self),
 err(level = "warn"))]` for internal plumbing.
 
+**Choose the log level from what the reader must do:**
+
+- `error`: an operator must act.
+- `warn`: something is wrong, but it can recover by itself.
+- `info`: most users want to know the information.
+- `debug`: the information helps to debug a problem.
+
+A `Terminal` abort during shutdown is routine. Do not log it above debug.
+
 **Log level is the owner's decision.** An instrumented function returns its
 error to a caller that decides what it means, so its `err` event logs at warn.
 Mark a hand-built span failed with `otel::mark_failed`. The OTel layer marks a
 span failed from a warn event only when the event has an `error` field and no
 message (`warn_failures_mark_their_span_failed`). A `Transient` failure that
-Prosody retries also logs at warn. Log at error where work is lost, a retry
-ends, or a retry cannot succeed: a discarded message or timer, exhausted
+Prosody retries also logs at warn. An operator must act where work is lost, a
+retry ends, or a retry cannot succeed. Log these cases at error: a discarded message or timer, exhausted
 attempts, a skipped durability step, the first `Terminal` abort of a
 partition outside shutdown, a non-`Transient` error in a retry loop, an init
 that fails past the stall threshold, a partition stall, or a broken invariant.
