@@ -11,6 +11,8 @@ use super::{RetryHandler, RetryWaitResult, wait_with_cancellation};
 use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory, NextAttempt};
+use crate::error::RetryAlert;
+use crate::timers::Trigger;
 use crate::{Offset, Partition};
 
 /// How [`RetryHandler::run`] resolved the final retry attempt.
@@ -31,8 +33,8 @@ pub(super) enum Resolution<O, E> {
 
 /// Reason a retry attempt is being logged. Each variant carries the data a
 /// call-site closure needs to emit a structured log with the relevant
-/// per-event fields (topic / partition / key / offset for messages, none for
-/// timers).
+/// per-event fields (topic / partition / key / offset for messages, key /
+/// fire time / timer type for timers).
 pub(super) enum LogReason<'a, E> {
     Retrying {
         attempt: u32,
@@ -55,13 +57,27 @@ pub(super) enum LogReason<'a, E> {
 
 /// Which retry layer logs a failure. It sets who owns the failure's outcome.
 #[derive(Clone, Copy)]
-pub(super) enum Layer {
+pub(super) enum Layer<'a> {
     /// A `FallibleHandler` layer. The error propagates to an outer layer.
     Inner,
 
     /// The `EventHandler` layer. It discards a failed event. A `Terminal`
-    /// abort here holds the partition until a restart, so it alerts.
-    Outermost,
+    /// abort here holds the partition until a restart, so the partition's
+    /// first abort raises this alert.
+    Outermost(&'a RetryAlert),
+}
+
+impl Layer<'_> {
+    fn discard_suffix(self, event: &'static str) -> &'static str {
+        match self {
+            Self::Inner => "",
+            Self::Outermost(_) => event,
+        }
+    }
+
+    fn alerts_terminal(self) -> bool {
+        matches!(self, Self::Outermost(alert) if alert.alerts(ErrorCategory::Terminal))
+    }
 }
 
 impl<T> RetryHandler<T> {
@@ -133,10 +149,10 @@ impl<T> RetryHandler<T> {
                 Err(error) => error,
             };
 
-            // Only abort on shutdown. Message cancellation is treated as transient.
-            // Shutdown returns Abort *without* firing apply_abort here — the
-            // outer layer will fire the inner's after_abort exactly once for
-            // this final attempt.
+            // Only abort on shutdown. Message cancellation is treated as
+            // transient. Shutdown returns Abort *without* firing apply_abort
+            // here — the outer layer will fire the inner's after_abort exactly
+            // once for this final attempt.
             if current.is_shutdown() {
                 return (Resolution::Abort(error), current);
             }
@@ -167,10 +183,10 @@ impl<T> RetryHandler<T> {
                     {
                         return (Resolution::Abort(error), current);
                     }
-                    // Attempt boundary, verb-then-hook ordering: clone the stale
-                    // view, run `next_attempt` (which discards this attempt's
-                    // dirty overlay + bumps the epoch under the gate, then
-                    // returns the re-pinned N+1 view), THEN fire the
+                    // Attempt boundary, verb-then-hook ordering: clone the
+                    // stale view, run `next_attempt` (which discards this
+                    // attempt's dirty overlay + bumps the epoch under the gate,
+                    // then returns the re-pinned N+1 view), THEN fire the
                     // intermediate `after_abort` with the now-EXPIRED clone.
                     // The expired clone is pinned at attempt N while the epoch
                     // is now N+1, so it is state-dead by construction: a
@@ -214,10 +230,7 @@ pub(super) fn log_message_failure<E: Display>(
     reason: &LogReason<'_, E>,
     layer: Layer,
 ) {
-    let discard_suffix = match layer {
-        Layer::Inner => "",
-        Layer::Outermost => "; discarding message",
-    };
+    let discard_suffix = layer.discard_suffix("; discarding message");
     match *reason {
         LogReason::Retrying {
             attempt,
@@ -248,52 +261,64 @@ pub(super) fn log_message_failure<E: Display>(
             topic,
             "permanently failed to handle message: {error:#}{discard_suffix}",
         ),
-        LogReason::Terminal { attempt, error } => match layer {
-            Layer::Inner => info!(
-                partition,
-                key,
-                offset,
-                attempt,
-                topic,
-                "terminal condition encountered while handling message: {error:#}; aborting",
-            ),
-            Layer::Outermost => error!(
-                partition,
-                key,
-                offset,
-                attempt,
-                topic,
-                "terminal condition encountered while handling message: {error:#}; aborting",
-            ),
-        },
+        LogReason::Terminal { attempt, error } if layer.alerts_terminal() => error!(
+            partition,
+            key,
+            offset,
+            attempt,
+            topic,
+            "terminal condition encountered while handling message: {error:#}; aborting",
+        ),
+        LogReason::Terminal { attempt, error } => info!(
+            partition,
+            key,
+            offset,
+            attempt,
+            topic,
+            "terminal condition encountered while handling message: {error:#}; aborting",
+        ),
     }
 }
 
 /// Emits a structured log for a timer-path retry event. See
 /// [`log_message_failure`] for the meaning of `layer`.
-pub(super) fn log_timer_failure<E: Display>(reason: &LogReason<'_, E>, layer: Layer) {
-    let discard_suffix = match layer {
-        Layer::Inner => "",
-        Layer::Outermost => "; discarding timer",
-    };
+pub(super) fn log_timer_failure<E: Display>(
+    trigger: &Trigger,
+    reason: &LogReason<'_, E>,
+    layer: Layer,
+) {
+    let discard_suffix = layer.discard_suffix("; discarding timer");
     match *reason {
         LogReason::Retrying { error, sleep, .. } => warn!(
+            key = %trigger.key,
+            fire_time = %trigger.time,
+            timer_type = ?trigger.timer_type,
             "failed to handle timer: {error:#}; retrying after {}",
             format_duration(sleep),
         ),
-        LogReason::MaxRetriesExceeded { error, .. } => {
-            error!("failed to handle timer: {error:#}; maximum attempts reached");
-        }
-        LogReason::Permanent { error, .. } => {
-            error!("permanently failed to handle timer: {error:#}{discard_suffix}");
-        }
-        LogReason::Terminal { error, .. } => match layer {
-            Layer::Inner => {
-                info!("terminal condition encountered while handling timer: {error:#}; aborting");
-            }
-            Layer::Outermost => {
-                error!("terminal condition encountered while handling timer: {error:#}; aborting");
-            }
-        },
+        LogReason::MaxRetriesExceeded { error, .. } => error!(
+            key = %trigger.key,
+            fire_time = %trigger.time,
+            timer_type = ?trigger.timer_type,
+            "failed to handle timer: {error:#}; maximum attempts reached",
+        ),
+        LogReason::Permanent { error, .. } => error!(
+            key = %trigger.key,
+            fire_time = %trigger.time,
+            timer_type = ?trigger.timer_type,
+            "permanently failed to handle timer: {error:#}{discard_suffix}",
+        ),
+        LogReason::Terminal { error, .. } if layer.alerts_terminal() => error!(
+            key = %trigger.key,
+            fire_time = %trigger.time,
+            timer_type = ?trigger.timer_type,
+            "terminal condition encountered while handling timer: {error:#}; aborting",
+        ),
+        LogReason::Terminal { error, .. } => info!(
+            key = %trigger.key,
+            fire_time = %trigger.time,
+            timer_type = ?trigger.timer_type,
+            "terminal condition encountered while handling timer: {error:#}; aborting",
+        ),
     }
 }

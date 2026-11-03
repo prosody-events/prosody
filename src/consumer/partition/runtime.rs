@@ -1,3 +1,5 @@
+use std::fmt::Display;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,119 +20,44 @@ use crate::consumer::message::{ConsumerRecord, UncommittedEvent};
 use crate::consumer::middleware::deduplication::DedupIdentity;
 use crate::consumer::partition::keyed::KeyManager;
 use crate::error::{ClassifyError, RetryAlert};
-use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MessageLoader;
 use crate::otel::SpanRelation;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::EventSession;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::store::{Segment, TriggerStore, TriggerStoreProvider};
-use crate::timers::{PendingTimer, TimerManager, TimerManagerConfig, TimerSemaphores};
-use crate::{EventIdentity, EventType, Partition, Topic};
+use crate::timers::{TimerManager, TimerManagerConfig, TimerSemaphores};
+use crate::{EventIdentity, EventType};
 
-/// Arguments for [`init_timer_manager`] that don't depend on the store type.
-struct TimerInitContext<'a> {
-    telemetry_sender: &'a TelemetrySender,
-    group_id: &'a Arc<str>,
-    timer_semaphores: &'a Arc<TimerSemaphores>,
-    partition_info: &'a PartitionInfo,
-    heartbeats: &'a HeartbeatRegistry,
-    shutdown_rx: &'a watch::Receiver<ShutdownPhase>,
-}
-
-/// Initializes a timer manager until it succeeds or shutdown starts.
-async fn init_timer_manager<S>(
-    trigger_store: S,
-    ctx: TimerInitContext<'_>,
-) -> Option<(
-    impl Stream<Item = PendingTimer<S>> + use<S>,
-    TimerManager<S>,
-)>
-where
-    S: TriggerStore,
-{
-    let mut alert = RetryAlert::default();
-    loop {
-        if *ctx.shutdown_rx.borrow() >= ShutdownPhase::Draining {
-            return None;
-        }
-
-        let timer_config = TimerManagerConfig {
-            store: trigger_store.clone(),
-            telemetry: ctx
-                .telemetry_sender
-                .partition_sender(ctx.partition_info.topic, ctx.partition_info.partition),
-            source: ctx.group_id.clone(),
-        };
-
-        match TimerManager::new(
-            timer_config,
-            ctx.heartbeats.clone(),
-            ctx.shutdown_rx.clone(),
-            ctx.timer_semaphores.clone(),
-        )
-        .await
-        {
-            Ok(result) => return Some(result),
-            // A failure from a revoke is expected, so it does not alert.
-            Err(_) if *ctx.shutdown_rx.borrow() >= ShutdownPhase::Draining => return None,
-            Err(error) => {
-                // A schema or segment fault does not clear by retry, and the
-                // partition processes no events until init succeeds.
-                if alert.alerts(error.classify_error()) {
-                    error!("failed to initialize timer manager: {error:#}; retrying");
-                } else {
-                    warn!("failed to initialize timer manager: {error:#}; retrying");
-                }
-                sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
-}
-
-/// Acquires the partition's keyed-state manager, retrying on failure until
-/// the shutdown signal is received — the same pattern as
-/// [`init_timer_manager`]. Acquisition publishes routing for the owner. It
-/// then validates descriptor identities before event dispatch. `trigger_store`
-/// is the partition's own store handle. Each attempt clones this handle.
-///
-/// Returns `None` if shutdown is signaled before acquisition succeeds.
-async fn init_state_manager<SP, S>(
-    state_provider: &SP,
-    trigger_store: &S,
-    topic: Topic,
-    partition: Partition,
+/// Runs `init` until it succeeds or the partition drains, and returns `None`
+/// at a drain. The partition processes no events until `init` succeeds, so a
+/// failure alerts once when it does not heal or when it outlasts
+/// `stall_threshold`.
+async fn retry_init<R, E, Fut>(
     shutdown_rx: &watch::Receiver<ShutdownPhase>,
-) -> Option<SP::Manager>
+    stall_threshold: Duration,
+    what: &str,
+    mut init: impl FnMut() -> Fut,
+) -> Option<R>
 where
-    SP: PartitionStateProvider<S>,
-    S: Clone,
+    Fut: Future<Output = Result<R, E>>,
+    E: ClassifyError + Display,
 {
-    let mut alert = RetryAlert::default();
-    loop {
-        if *shutdown_rx.borrow() >= ShutdownPhase::Draining {
-            return None;
-        }
-
-        match state_provider
-            .acquire(topic, partition, trigger_store.clone())
-            .await
-        {
-            Ok(manager) => return Some(manager),
+    let alert = RetryAlert::stalls_after(stall_threshold);
+    let draining = || *shutdown_rx.borrow() >= ShutdownPhase::Draining;
+    while !draining() {
+        match init().await {
+            Ok(value) => return Some(value),
             // A failure from a revoke is expected, so it does not alert.
-            Err(_) if *shutdown_rx.borrow() >= ShutdownPhase::Draining => return None,
-            Err(error) => {
-                // A descriptor identity or routing fault does not clear by
-                // retry, and the partition processes no events until it clears.
-                if alert.alerts(error.classify_error()) {
-                    error!("failed to acquire keyed-state manager: {error:#}; retrying");
-                } else {
-                    warn!("failed to acquire keyed-state manager: {error:#}; retrying");
-                }
-                sleep(Duration::from_secs(1)).await;
+            Err(_) if draining() => break,
+            Err(error) if alert.alerts(error.classify_error()) => {
+                error!("failed to {what}: {error:#}; retrying");
             }
+            Err(error) => warn!("failed to {what}: {error:#}; retrying"),
         }
+        sleep(Duration::from_secs(1)).await;
     }
+    None
 }
 
 /// Store-agnostic fields extracted from [`PartitionConfiguration`] for
@@ -142,6 +69,7 @@ struct PartitionParams {
     timer_semaphores: Arc<TimerSemaphores>,
     telemetry_sender: TelemetrySender,
     timer_spans: SpanRelation,
+    stall_threshold: Duration,
 }
 
 /// Extracts the store from the provider `S` and the state manager from the
@@ -173,6 +101,7 @@ pub(super) async fn handle_messages<T, S, SP, P, Q>(
         timer_semaphores,
         telemetry_sender,
         timer_spans,
+        stall_threshold,
         ..
     } = config;
 
@@ -184,12 +113,19 @@ pub(super) async fn handle_messages<T, S, SP, P, Q>(
     );
     let trigger_store = trigger_provider.create_store(segment);
 
-    let Some(state_manager) = init_state_manager(
-        &state_provider,
-        &trigger_store,
-        partition_info.topic,
-        partition_info.partition,
+    // Acquisition publishes routing for the owner. It then validates
+    // descriptor identities before event dispatch.
+    let Some(state_manager) = retry_init(
         &context.shutdown_rx,
+        stall_threshold,
+        "acquire keyed-state manager",
+        || {
+            state_provider.acquire(
+                partition_info.topic,
+                partition_info.partition,
+                trigger_store.clone(),
+            )
+        },
     )
     .await
     else {
@@ -203,6 +139,7 @@ pub(super) async fn handle_messages<T, S, SP, P, Q>(
         timer_semaphores,
         telemetry_sender,
         timer_spans,
+        stall_threshold,
     };
 
     run_partition(
@@ -239,6 +176,7 @@ async fn run_partition<T, S, M, P, Q>(
         timer_semaphores,
         telemetry_sender,
         timer_spans,
+        stall_threshold,
     } = params;
     let PartitionContext {
         offsets,
@@ -257,15 +195,26 @@ async fn run_partition<T, S, M, P, Q>(
         allowed_events.as_ref(),
     );
 
-    let timer_ctx = TimerInitContext {
-        telemetry_sender: &telemetry_sender,
-        group_id: &group_id,
-        timer_semaphores: &timer_semaphores,
-        partition_info: &partition_info,
-        heartbeats: &heartbeats,
-        shutdown_rx: &shutdown_rx,
-    };
-    let Some((timer_stream, timer_manager)) = init_timer_manager(trigger_store, timer_ctx).await
+    let Some((timer_stream, timer_manager)) = retry_init(
+        &shutdown_rx,
+        stall_threshold,
+        "initialize timer manager",
+        || {
+            let config = TimerManagerConfig {
+                store: trigger_store.clone(),
+                telemetry: telemetry_sender
+                    .partition_sender(partition_info.topic, partition_info.partition),
+                source: group_id.clone(),
+            };
+            TimerManager::new(
+                config,
+                heartbeats.clone(),
+                shutdown_rx.clone(),
+                timer_semaphores.clone(),
+            )
+        },
+    )
+    .await
     else {
         return;
     };

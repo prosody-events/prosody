@@ -14,7 +14,10 @@
 //!   waiting, configuration changes, or code changes.
 
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use thiserror::Error;
+use tokio::time::Instant;
 
 pub mod kafka;
 
@@ -42,14 +45,17 @@ pub trait ClassifyError {
     }
 }
 
-/// Raises one alert for each retry loop that cannot succeed.
+/// Raises one alert for a failure that does not heal by itself.
 ///
-/// A loop that retries every error logs a
-/// [`Transient`](ErrorCategory::Transient) failure at warn, because it heals by
-/// itself. The first failure of another category does not clear by retry, so
-/// the loop logs it at error. Later failures log at warn.
+/// A [`Transient`](ErrorCategory::Transient) failure heals by itself, so it
+/// logs below error. The first failure of another category alerts, and so does
+/// the first failure after the stall deadline. Later failures do not alert.
 #[derive(Debug, Default)]
-pub(crate) struct RetryAlert(bool);
+pub(crate) struct RetryAlert {
+    alerted: AtomicBool,
+    /// After this instant, a `Transient` failure alerts too.
+    stalls_at: Option<Instant>,
+}
 
 /// The wire discriminants, for formats that carry a category between processes.
 ///
@@ -85,11 +91,19 @@ impl TryFrom<i32> for ErrorCategory {
 }
 
 impl RetryAlert {
+    /// An alert for a retry loop that stalls its partition after `threshold`.
+    pub(crate) fn stalls_after(threshold: Duration) -> Self {
+        Self {
+            alerted: AtomicBool::default(),
+            stalls_at: Instant::now().checked_add(threshold),
+        }
+    }
+
     /// Returns `true` when a failure in `category` must log at error.
-    pub(crate) fn alerts(&mut self, category: ErrorCategory) -> bool {
-        let alerts = !self.0 && category != ErrorCategory::Transient;
-        self.0 |= alerts;
-        alerts
+    pub(crate) fn alerts(&self, category: ErrorCategory) -> bool {
+        let heals = category == ErrorCategory::Transient
+            && self.stalls_at.is_none_or(|at| Instant::now() < at);
+        !heals && !self.alerted.swap(true, Ordering::Relaxed)
     }
 }
 

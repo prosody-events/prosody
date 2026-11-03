@@ -38,7 +38,7 @@ async fn process_record<T, C, Q, F, Fut>(
                     key.as_ref(),
                     offset,
                     &reason,
-                    Layer::Outermost,
+                    Layer::Outermost(&handler.aborts),
                 );
             },
         )
@@ -118,7 +118,7 @@ where
                 None,
                 |ctx, dt| self.handler.on_timer(ctx, trigger.clone(), dt),
                 |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |reason| log_timer_failure(&reason, Layer::Outermost),
+                |reason| log_timer_failure(&trigger, &reason, Layer::Outermost(&self.aborts)),
             )
             .await;
 

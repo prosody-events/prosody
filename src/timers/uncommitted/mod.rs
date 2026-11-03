@@ -374,7 +374,7 @@ where
         }
 
         // Retry loop: ensure TimerManager::complete eventually succeeds.
-        let mut alert = RetryAlert::default();
+        let alert = RetryAlert::default();
         loop {
             match self
                 .manager

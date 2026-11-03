@@ -287,8 +287,8 @@ async fn track_watermark(
                 // `wait_for_stall` yields only from the not-stalled state, so
                 // this is always a false→true transition.
                 stalled.send_replace(true);
-                // A stall fails the liveness probe. It also catches a failure
-                // that retries forever at warn.
+                // A stall fails the liveness probe. It also catches a message
+                // whose handling retries forever at warn.
                 error!(
                     "{topic}:{partition} has stalled at offset {offset} \
                     for {}, which exceeded the stall threshold of {}",

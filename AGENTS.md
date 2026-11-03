@@ -605,11 +605,13 @@ span failed from a warn event only when the event has an `error` field and no
 message (`warn_failures_mark_their_span_failed`). A `Transient` failure that
 Prosody retries also logs at warn. Log at error where work is lost, a retry
 ends, or a retry cannot succeed: a discarded message or timer, exhausted
-attempts, a skipped durability step, a `Terminal` abort outside shutdown, a
-non-`Transient` error in a retry loop, a partition stall, or a broken
-invariant. Before you lower a log to warn, trace its error to the owner that
-logs it at error. Create every Kafka client with
-`kafka_log::LogContext`; the consumer context calls the same log functions. Log
+attempts, a skipped durability step, the first `Terminal` abort of a
+partition outside shutdown, a non-`Transient` error in a retry loop, an init
+that fails past the stall threshold, a partition stall, or a broken invariant.
+`error::RetryAlert` makes the abort, retry loop, and init alerts fire once.
+Before you lower a log to warn, trace its error to the owner that logs it at
+error. Create every Kafka client with `kafka_log::LogContext`; the consumer
+context calls the same log functions. Log
 Kafka poll errors with `kafka_log::log_error`. Then librdkafka connection
 failures log at warn, and other Kafka errors log at error.
 Hand-built spans are reserved for the cases the attribute cannot express: a

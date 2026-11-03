@@ -56,6 +56,7 @@
 //!
 //! [`ErrorCategory::Transient`]: crate::consumer::middleware::ErrorCategory::Transient
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use derive_builder::Builder;
@@ -72,6 +73,7 @@ use crate::consumer::middleware::{
     abandon, settle,
 };
 use crate::consumer::{DemandType, EventHandler, HandlerProvider, Keyed};
+use crate::error::RetryAlert;
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use crate::{Partition, Topic};
@@ -162,6 +164,8 @@ pub struct RetryHandler<T> {
     base_delay_millis: u64,
     max_delay_millis: u64,
     max_retries: u32,
+    /// The partition's `Terminal` abort alert. Every clone shares it.
+    aborts: Arc<RetryAlert>,
     handler: T,
 }
 
@@ -172,6 +176,7 @@ impl<T> RetryProvider<T> {
             base_delay_millis: self.config.base.as_millis() as u64,
             max_delay_millis: self.config.max_delay.as_millis() as u64,
             max_retries: self.config.max_retries,
+            aborts: Arc::default(),
             handler,
         }
     }
@@ -363,7 +368,7 @@ where
                 Some(self.max_retries),
                 |ctx, dt| self.handler.on_timer(ctx, timer.clone(), dt),
                 |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |reason| log_timer_failure(&reason, Layer::Inner),
+                |reason| log_timer_failure(&timer, &reason, Layer::Inner),
             )
             .await;
         match resolution {

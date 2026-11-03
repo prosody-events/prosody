@@ -1,6 +1,7 @@
 //! Staging, abort, and resolution of a session's collections.
 
 use super::sealed::StagedCollection;
+use crate::error::RetryAlert;
 use crate::state::CommitDecision;
 use crate::state::access::StateAccessError;
 use crate::state::cell::{ProvisionalWrite, Values};
@@ -92,17 +93,17 @@ where
             let id = &id;
             // Read each surviving cell's committed base in per-section batches.
             // `lower` is the pre-overlay store.
-            // The committed projection of a cell this event staged is its `prev`.
-            // Thus, a retry re-stages over the same base (idempotent).
-            // A `Set` cell in a cleared section keeps its committed pre-clear `prev` this
-            // way.
+            // The committed projection of a cell this event staged is its
+            // `prev`. Thus, a retry re-stages over the same base (idempotent).
+            // A `Set` cell in a cleared section keeps its committed pre-clear
+            // `prev` this way.
 
-            // `cooperative` adds a yield point per batch. `buffered` preserves order and
-            // bounds concurrency; order is inert here because marker and clear
-            // freezing sort internally and settle is row-disjoint. Drop cells that a
-            // section clear subsumes first, so the batch stays row-disjoint.
-            // Size the buffer once from the pre-filter snapshot; the filter can only
-            // shrink it.
+            // `cooperative` adds a yield point per batch. `buffered` preserves
+            // order and bounds concurrency; order is inert here because marker
+            // and clear freezing sort internally and settle is row-disjoint.
+            // Drop cells that a section clear subsumes first, so the batch
+            // stays row-disjoint. Size the buffer once from the pre-filter
+            // snapshot; the filter can only shrink it.
             let capacity = cells.len();
             let survivors = cells
                 .into_iter()
@@ -210,18 +211,23 @@ pub(super) async fn abort_stages<S: CellStore>(
                     CollectionId::new(key.clone(), *kind, name.clone()),
                     registry.ttl_for(*kind, name),
                 );
-                let _ = retry_step(shutdown, "rejected stage rollback", || async {
-                    if let Some(marker) = store.marker_state(collection.id()).await?.staged {
-                        resolve_event_marker(
-                            store,
-                            &collection,
-                            &marker,
-                            CommitDecision::NotCommitted,
-                        )
-                        .await?;
-                    }
-                    Ok::<_, S::Error>(())
-                })
+                let _ = retry_step(
+                    &RetryAlert::default(),
+                    shutdown,
+                    "rejected stage rollback",
+                    || async {
+                        if let Some(marker) = store.marker_state(collection.id()).await?.staged {
+                            resolve_event_marker(
+                                store,
+                                &collection,
+                                &marker,
+                                CommitDecision::NotCommitted,
+                            )
+                            .await?;
+                        }
+                        Ok::<_, S::Error>(())
+                    },
+                )
                 .await;
             })
         })
@@ -239,13 +245,18 @@ pub(super) async fn resolve_collections<S: CellStore>(
     stream::iter(collections)
         .map(|staged| {
             cooperative(async move {
-                let outcome = retry_step(shutdown, "keyed-state promote", || {
-                    store.commit_provisional(
-                        &staged.collection,
-                        staged.stage.marker(),
-                        staged.stage.writes(),
-                    )
-                })
+                let outcome = retry_step(
+                    &RetryAlert::default(),
+                    shutdown,
+                    "keyed-state promote",
+                    || {
+                        store.commit_provisional(
+                            &staged.collection,
+                            staged.stage.marker(),
+                            staged.stage.writes(),
+                        )
+                    },
+                )
                 .await;
                 match outcome {
                     StepOutcome::Done(()) => None,
@@ -274,9 +285,12 @@ pub(super) async fn abort_collections<S: CellStore>(
             let staged = &collections[index];
             cooperative(async move {
                 !matches!(
-                    retry_step(shutdown, "keyed-state rollback", || {
-                        store.abort_provisional(&staged.collection, staged.stage.writes())
-                    })
+                    retry_step(
+                        &RetryAlert::default(),
+                        shutdown,
+                        "keyed-state rollback",
+                        || { store.abort_provisional(&staged.collection, staged.stage.writes()) }
+                    )
                     .await,
                     StepOutcome::Abandon
                 )

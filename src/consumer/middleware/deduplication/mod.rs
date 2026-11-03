@@ -182,7 +182,8 @@ where
     {
         // The filter reads the identity that the settle boundary records.
         // It reads the session dedup ID or the deferred-load override. Thus,
-        // the filter and record cannot disagree. A missing source skips filtering.
+        // the filter and record cannot disagree. A missing source skips
+        // filtering.
         let marker = context
             .marker_identity()
             .ok()
@@ -420,8 +421,8 @@ pub enum DeduplicationError<E> {
     ///
     /// Classified as transient so the retry layer prevents the Kafka offset
     /// from committing until the store is healthy.
-    #[error("deduplication store error")]
-    Store(#[source] Box<dyn StdError + Send + Sync + 'static>),
+    #[error("deduplication store error: {0:#}")]
+    Store(Box<dyn StdError + Send + Sync + 'static>),
 }
 
 impl<E: ClassifyError> ClassifyError for DeduplicationError<E> {

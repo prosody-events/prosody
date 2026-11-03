@@ -113,13 +113,13 @@ async fn heartbeat_checks_preserve_the_refresh_deadline() -> Result<()> {
 
 /// A directory whose every write fails, as during a long store outage.
 #[derive(Clone)]
-struct FailingDirectory(RegistrationTtl);
+struct FailingDirectory;
 
 impl PeerDirectory for FailingDirectory {
     type Error = IoError;
 
     fn ttl(&self) -> RegistrationTtl {
-        self.0
+        RegistrationTtl::DEFAULT
     }
 
     fn register(
@@ -153,7 +153,7 @@ async fn refresh_failure_alerts_once_after_the_lease_lapses() -> Result<()> {
     let (errors, _guard) = capture_events(Level::ERROR);
     let (stop, stopped) = watch::channel(false);
     let refresh = tokio::spawn(refresh_registration(
-        FailingDirectory(RegistrationTtl::try_from(lease)?),
+        FailingDirectory,
         registration(PeerId::new()),
         HeartbeatRegistry::test().register("directory refresh"),
         RegistrationTtl::try_from(lease)?,

@@ -23,7 +23,7 @@ use tokio::time::sleep;
 use super::FallibleHandler;
 use crate::consumer::Uncommitted;
 use crate::consumer::event_context::EventContext;
-use crate::error::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory, RetryAlert};
 use crate::state::access::StateAccessError;
 use crate::state::descriptor::Registered;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
@@ -198,8 +198,8 @@ pub(crate) async fn settle<T, C, G>(
         Settlement::Final => match category {
             // A permanent final failure records its marker best-effort, so
             // dedup filters redelivery. Finalize runs only on success.
-            // A transient final failure has no marker. Commit and call the hook.
-            // Terminal failures already returned above.
+            // A transient final failure has no marker. Commit and call the
+            // hook. Terminal failures already returned above.
             Some(category) => {
                 if category == ErrorCategory::Permanent
                     && let Some(lifecycle) = &lifecycle
@@ -276,6 +276,7 @@ async fn settle_committed<'a, T, C, G>(
 
     // Stage provisional cells and write resolved cells.
     let finalized = match retry_step(
+        &RetryAlert::default(),
         || context.is_shutdown(),
         "keyed-state finalize",
         || lifecycle.finalize(),
@@ -331,9 +332,12 @@ async fn settle_committed<'a, T, C, G>(
 
     // Record the message identity after all promote attempts finish.
     if let Some(marker) = lifecycle.message_marker() {
-        // The record must succeed, so the outer loop retries permanent errors too.
+        // The record must succeed, so the outer loop retries permanent errors
+        // too. One alert covers every repeat.
+        let alert = RetryAlert::default();
         loop {
             match retry_step(
+                &alert,
                 || context.is_shutdown(),
                 "keyed-state marker record",
                 || lifecycle.record_marker(marker, MarkerWrite(())),
@@ -422,6 +426,7 @@ where
     C: EventContext,
 {
     let _ = retry_step(
+        &RetryAlert::default(),
         || context.is_shutdown(),
         "keyed-state marker record",
         || lifecycle.record_marker(marker, MarkerWrite(())),

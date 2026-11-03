@@ -1,4 +1,5 @@
 use super::{ErrorCategory, RetryAlert, UnknownErrorCategory};
+use std::time::Duration;
 use strum::VariantArray;
 
 /// The numbers a peer of another release reads off the wire. A round trip
@@ -34,22 +35,29 @@ fn each_category_keeps_its_wire_discriminant() {
     }
 }
 
-/// A retry loop alerts at its first failure that is not `Transient`, and never
-/// again. Every three-failure sequence is checked.
+/// An alert fires at the first failure that does not heal, and never again.
+/// A failure past the stall deadline does not heal. Every three-failure
+/// sequence is checked, with and without a passed deadline.
 #[test]
-fn retry_alert_fires_once_at_the_first_failure_retry_cannot_clear() {
-    for &first in ErrorCategory::VARIANTS {
-        for &second in ErrorCategory::VARIANTS {
-            for &third in ErrorCategory::VARIANTS {
-                let sequence = [first, second, third];
-                let mut alert = RetryAlert::default();
-                let alerts = sequence.map(|category| alert.alerts(category));
+fn retry_alert_fires_once_at_the_first_failure_that_does_not_heal() {
+    for stalled in [false, true] {
+        for &first in ErrorCategory::VARIANTS {
+            for &second in ErrorCategory::VARIANTS {
+                for &third in ErrorCategory::VARIANTS {
+                    let sequence = [first, second, third];
+                    let alert = if stalled {
+                        RetryAlert::stalls_after(Duration::ZERO)
+                    } else {
+                        RetryAlert::default()
+                    };
+                    let alerts = sequence.map(|category| alert.alerts(category));
 
-                let alerting = sequence
-                    .iter()
-                    .position(|&category| category != ErrorCategory::Transient);
-                let expected = [0, 1, 2].map(|index| Some(index) == alerting);
-                assert_eq!(alerts, expected, "{sequence:?}");
+                    let alerting = sequence
+                        .iter()
+                        .position(|&category| stalled || category != ErrorCategory::Transient);
+                    let expected = [0, 1, 2].map(|index| Some(index) == alerting);
+                    assert_eq!(alerts, expected, "{sequence:?}, stalled: {stalled}");
+                }
             }
         }
     }

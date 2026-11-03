@@ -24,6 +24,7 @@ fn create_retry_handler<T>(handler: T, max_retries: u32) -> RetryHandler<T> {
         base_delay_millis: 1, // Very short for tests
         max_delay_millis: 10,
         max_retries,
+        aborts: Arc::default(),
         handler,
     }
 }
@@ -153,6 +154,7 @@ async fn shutdown_during_retry_sleep_returns_error() -> Result<()> {
         base_delay_millis: 1000, // 1 second base delay
         max_delay_millis: 10000,
         max_retries: 10,
+        aborts: Arc::default(),
         handler: handler.clone(),
     };
     let context = MockEventContext::new();
@@ -185,38 +187,42 @@ async fn shutdown_during_retry_sleep_returns_error() -> Result<()> {
 
 const TERMINAL_ABORT: &str = "terminal condition encountered while handling message";
 
-/// Runs one message that fails `Terminal` through the outermost retry layer
-/// and returns how many error events reported the abort.
-async fn terminal_abort_alerts(shutdown: bool) -> Result<usize> {
+/// Runs two messages that fail `Terminal` through `retry_handler` and returns
+/// how many error events reported an abort.
+async fn terminal_abort_alerts<H>(retry_handler: &H, shutdown: bool) -> Result<usize>
+where
+    H: EventHandler<Payload = serde_json::Value>,
+{
     let (errors, _guard) = capture_events(Level::ERROR);
-    let handler = ScriptedHandler::always_failing(ErrorCategory::Terminal);
-    let retry_handler = create_retry_handler(handler.clone(), 10);
-    let context = MockEventContext::new();
-    if shutdown {
-        context.request_shutdown();
-    }
-
     let tracker = create_offset_tracker();
-    let uncommitted_offset = tracker.take(0).await?;
-    let message = create_test_message()?.into_uncommitted(uncommitted_offset);
-    EventHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
-
-    assert_eq!(handler.call_count(), 1);
-    assert_eq!(tracker.shutdown().await, None, "offset should be aborted");
+    for offset in 0..2 {
+        let context = MockEventContext::new();
+        if shutdown {
+            context.request_shutdown();
+        }
+        let uncommitted_offset = tracker.take(offset).await?;
+        let message = create_test_message()?.into_uncommitted(uncommitted_offset);
+        EventHandler::on_message(retry_handler, context, message, DemandType::Normal).await;
+    }
+    assert_eq!(tracker.shutdown().await, None, "offsets should be aborted");
     Ok(errors.count(TERMINAL_ABORT))
 }
 
-/// A `Terminal` abort outside shutdown holds the partition, so it alerts once.
+/// A `Terminal` abort outside shutdown holds the partition, so the partition's
+/// first abort alerts. A later abort and an inner layer do not repeat it. A
+/// shutdown abort is expected and does not alert.
 #[tokio::test]
-async fn terminal_abort_logs_error() -> Result<()> {
-    assert_eq!(terminal_abort_alerts(false).await?, 1);
-    Ok(())
-}
+async fn terminal_abort_alerts_once_per_partition() -> Result<()> {
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Terminal);
+    let outer = create_retry_handler(handler.clone(), 10);
+    assert_eq!(terminal_abort_alerts(&outer, false).await?, 1);
 
-/// A shutdown abort is expected and does not alert.
-#[tokio::test]
-async fn shutdown_abort_logs_no_error() -> Result<()> {
-    assert_eq!(terminal_abort_alerts(true).await?, 0);
+    let nested = create_retry_handler(create_retry_handler(handler.clone(), 10), 10);
+    assert_eq!(terminal_abort_alerts(&nested, false).await?, 1);
+
+    let shutdown = create_retry_handler(handler.clone(), 10);
+    assert_eq!(terminal_abort_alerts(&shutdown, true).await?, 0);
+    assert_eq!(handler.call_count(), 6);
     Ok(())
 }
 
@@ -250,6 +256,7 @@ fn sleep_time_has_exponential_growth_with_jitter() {
         base_delay_millis: 100,
         max_delay_millis: 10000,
         max_retries: 10,
+        aborts: Arc::default(),
         handler,
     };
 
@@ -286,6 +293,7 @@ fn sleep_time_survives_zero_backoff() {
         base_delay_millis: 0,
         max_delay_millis: 0,
         max_retries: 10,
+        aborts: Arc::default(),
         handler: ScriptedHandler::success(),
     };
 
@@ -299,6 +307,7 @@ fn sleep_time_capped_at_max_delay() {
         base_delay_millis: 100,
         max_delay_millis: 500,
         max_retries: 10,
+        aborts: Arc::default(),
         handler,
     };
 

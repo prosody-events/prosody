@@ -17,10 +17,12 @@ pub(crate) enum StepOutcome<R> {
     Abandon,
 }
 
-/// Retries transient and terminal errors until success or shutdown. The
-/// first terminal error alerts. A permanent rejection skips the step. Only
-/// shutdown abandons it.
+/// Retries transient and terminal errors until success or shutdown. A
+/// permanent rejection skips the step. Only shutdown abandons it. The first
+/// failure that does not heal raises `alert`, so a caller that repeats a
+/// skipped step shares one alert across the repeats.
 pub(crate) async fn retry_step<R, E, Fut>(
+    alert: &RetryAlert,
     shutdown: impl Fn() -> bool,
     label: &str,
     mut step: impl FnMut() -> Fut,
@@ -29,29 +31,28 @@ where
     Fut: Future<Output = Result<R, E>>,
     E: ClassifyError + Error,
 {
-    let mut alert = RetryAlert::default();
     loop {
         if shutdown() {
             return StepOutcome::Abandon;
         }
-        match step().await {
+        let error = match step().await {
             Ok(value) => return StepOutcome::Done(value),
-            Err(error) => {
-                let category = error.classify_error();
-                if category == ErrorCategory::Permanent {
-                    error!(label, %error, action = "skip", "durability step failed");
-                    return StepOutcome::Skip;
-                }
-                // A Terminal store error, such as a schema mismatch, does not
-                // clear by retry and blocks the key.
-                if alert.alerts(category) {
-                    error!(label, %error, action = "retry", "durability step failed");
-                } else {
-                    warn!(label, %error, action = "retry", "durability step failed");
-                }
-                sleep(DURABILITY_RETRY_DELAY).await;
-            }
+            Err(error) => error,
+        };
+        // A Terminal store error, such as a schema mismatch, does not clear by
+        // retry and blocks the key.
+        let category = error.classify_error();
+        let skip = category == ErrorCategory::Permanent;
+        let action = if skip { "skip" } else { "retry" };
+        if alert.alerts(category) {
+            error!(label, %error, action, "durability step failed");
+        } else {
+            warn!(label, %error, action, "durability step failed");
         }
+        if skip {
+            return StepOutcome::Skip;
+        }
+        sleep(DURABILITY_RETRY_DELAY).await;
     }
 }
 

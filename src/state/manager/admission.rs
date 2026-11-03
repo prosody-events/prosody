@@ -5,7 +5,7 @@ use super::{Admission, StateManager};
 use crate::Key;
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::partition::ShutdownPhase;
-use crate::error::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory, RetryAlert};
 use crate::state::CommitDecision;
 use crate::state::marker::{EventMarker, MarkerState, MarkerVersion};
 use crate::state::resolve::resolve_event_marker;
@@ -78,8 +78,8 @@ where
                                 self.inner.cell.marker_state(&id)
                             })
                             .await?;
-                        // A corrupt marker cannot name cells for repair. Keep those cells
-                        // unchanged.
+                        // A corrupt marker cannot name cells for repair. Keep
+                        // those cells unchanged.
                         let state = state.unwrap_or_else(|| {
                             CORRUPT_MARKER.add(1, &[]);
                             MarkerState::default()
@@ -177,7 +177,8 @@ where
             resolutions.push((collection.clone(), marker.clone(), decision));
         }
 
-        // Owned shared handles avoid higher-ranked closures and large future buffers.
+        // Owned shared handles avoid higher-ranked closures and large future
+        // buffers.
         stream::iter(resolutions)
             .map(|(collection, marker, decision)| {
                 cooperative(async move {
@@ -295,7 +296,8 @@ where
                 }
             }
             EventRef::Timer(_) => {
-                // Attempts at one coordinate share durable rows. Retire them in order.
+                // Attempts at one coordinate share durable rows. Retire them in
+                // order.
                 for &other in sources {
                     if let EventRef::Timer(timer) = other
                         && same_timer_coordinate(source, other)
@@ -384,21 +386,26 @@ where
     E: ClassifyError + Error,
 {
     let collection = collection.map(StateName::as_str);
-    let outcome = retry_step(cancelled, "keyed-state admission", || {
-        let result = operation();
-        async move {
-            let result = result.await;
-            if let Err(error) = &result
-                && error.classify_error() == ErrorCategory::Permanent
-            {
-                error!(
-                    %error, %key, step, collection,
-                    "admission rejected store operation; continue with local repair"
-                );
+    let outcome = retry_step(
+        &RetryAlert::default(),
+        cancelled,
+        "keyed-state admission",
+        || {
+            let result = operation();
+            async move {
+                let result = result.await;
+                if let Err(error) = &result
+                    && error.classify_error() == ErrorCategory::Permanent
+                {
+                    error!(
+                        %error, %key, step, collection,
+                        "admission rejected store operation; continue with local repair"
+                    );
+                }
+                result
             }
-            result
-        }
-    })
+        },
+    )
     .await;
     match outcome {
         StepOutcome::Done(value) => Ok(Some(value)),
