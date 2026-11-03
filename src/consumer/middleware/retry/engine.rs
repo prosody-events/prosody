@@ -70,13 +70,6 @@ pub(super) enum Layer<'a> {
     Outermost(&'a RetryAlert),
 }
 
-/// The log message for a failure: the error, then what happens next.
-struct Outcome<'a, E> {
-    failure: &'a Failure<'a, E>,
-    event: Event,
-    layer: Layer<'a>,
-}
-
 impl<E> Failure<'_, E> {
     /// Returns the level for this failure at `layer`.
     fn level(&self, layer: Layer) -> Level {
@@ -99,43 +92,45 @@ impl Display for Event {
     }
 }
 
-impl<E: Display> Display for Outcome<'_, E> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let Failure {
-            attempt,
-            error,
-            next,
-        } = self.failure;
-        let event = self.event;
-        write!(f, "The handler failed for this {event}: {error:#}. ")?;
-        match (next, self.layer, event) {
-            (Next::Retry(delay), ..) => {
-                write!(f, "Prosody retries in {}.", format_duration(*delay))
-            }
-            (_, Layer::Inner, _) => write!(
-                f,
-                "Prosody stops after {attempt} attempts and returns the error to the outer \
-                 middleware."
-            ),
-            (Next::GiveUp, ..) => {
-                write!(
+impl<E: Display> Failure<'_, E> {
+    /// Writes the error, then what Prosody does next.
+    fn describe(&self, event: Event, layer: Layer) -> impl Display {
+        fmt::from_fn(move |f| {
+            let Self {
+                attempt,
+                error,
+                next,
+            } = self;
+            write!(f, "The handler failed for this {event}: {error:#}. ")?;
+            match (next, layer, event) {
+                (Next::Retry(delay), ..) => {
+                    write!(f, "Prosody retries in {}.", format_duration(*delay))
+                }
+                (_, Layer::Inner, _) => write!(
                     f,
-                    "Prosody stops after {attempt} attempts and skips the {event}."
-                )
+                    "Prosody stops after {attempt} attempts and returns the error to the outer \
+                     middleware."
+                ),
+                (Next::GiveUp, ..) => {
+                    write!(
+                        f,
+                        "Prosody stops after {attempt} attempts and skips the {event}."
+                    )
+                }
+                (Next::Skip, ..) => write!(
+                    f,
+                    "The error is permanent, so Prosody skips the {event} and does not retry it."
+                ),
+                (Next::Abort, _, Event::Message) => f.write_str(
+                    "A retry cannot fix this error, so Prosody commits no later offsets for this \
+                     partition. Fix the cause, then restart the consumer.",
+                ),
+                (Next::Abort, _, Event::Timer) => f.write_str(
+                    "A retry cannot fix this error, so the timer fires again only after a \
+                     restart. Fix the cause, then restart the consumer.",
+                ),
             }
-            (Next::Skip, ..) => write!(
-                f,
-                "The error is permanent, so Prosody skips the {event} and does not retry it."
-            ),
-            (Next::Abort, _, Event::Message) => f.write_str(
-                "A retry cannot fix this error, so Prosody commits no later offsets for this \
-                 partition. Fix the cause, then restart the consumer.",
-            ),
-            (Next::Abort, _, Event::Timer) => f.write_str(
-                "A retry cannot fix this error, so the timer fires again only after a restart. \
-                 Fix the cause, then restart the consumer.",
-            ),
-        }
+        })
     }
 }
 
@@ -288,11 +283,6 @@ impl<T> RetryHandler<T> {
         failure: &Failure<'_, E>,
         layer: Layer,
     ) {
-        let outcome = Outcome {
-            failure,
-            event: Event::Message,
-            layer,
-        };
         log_at!(
             failure.level(layer),
             topic = %self.topic,
@@ -300,7 +290,8 @@ impl<T> RetryHandler<T> {
             key,
             offset,
             attempt = failure.attempt,
-            "{outcome}"
+            "{}",
+            failure.describe(Event::Message, layer)
         );
     }
 
@@ -311,11 +302,6 @@ impl<T> RetryHandler<T> {
         failure: &Failure<'_, E>,
         layer: Layer,
     ) {
-        let outcome = Outcome {
-            failure,
-            event: Event::Timer,
-            layer,
-        };
         log_at!(
             failure.level(layer),
             topic = %self.topic,
@@ -324,7 +310,8 @@ impl<T> RetryHandler<T> {
             fire_time = %trigger.time,
             timer_type = ?trigger.timer_type,
             attempt = failure.attempt,
-            "{outcome}"
+            "{}",
+            failure.describe(Event::Timer, layer)
         );
     }
 }

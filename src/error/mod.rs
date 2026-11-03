@@ -15,9 +15,7 @@
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use thiserror::Error;
-use tokio::time::Instant;
 use tracing::Level;
 
 pub mod kafka;
@@ -64,14 +62,10 @@ pub trait ClassifyError {
 /// Raises one alert for a failure that does not heal by itself.
 ///
 /// A [`Transient`](ErrorCategory::Transient) failure heals by itself, so it
-/// logs at warn. The first failure of another category logs at error, and so
-/// does the first failure after the stall deadline. Later failures log at warn.
+/// logs at warn. The first failure of another category logs at error. Later
+/// failures log at warn.
 #[derive(Debug, Default)]
-pub(crate) struct RetryAlert {
-    alerted: AtomicBool,
-    /// After this instant, a `Transient` failure alerts too.
-    stalls_at: Option<Instant>,
-}
+pub(crate) struct RetryAlert(AtomicBool);
 
 /// The wire discriminants, for formats that carry a category between processes.
 ///
@@ -107,19 +101,9 @@ impl TryFrom<i32> for ErrorCategory {
 }
 
 impl RetryAlert {
-    /// An alert for a retry loop that stalls its partition after `threshold`.
-    pub(crate) fn stalls_after(threshold: Duration) -> Self {
-        Self {
-            alerted: AtomicBool::default(),
-            stalls_at: Instant::now().checked_add(threshold),
-        }
-    }
-
     /// Returns the level for a failure in `category`.
     pub(crate) fn level(&self, category: ErrorCategory) -> Level {
-        let heals = category == ErrorCategory::Transient
-            && self.stalls_at.is_none_or(|at| Instant::now() < at);
-        if !heals && !self.alerted.swap(true, Ordering::Relaxed) {
+        if category != ErrorCategory::Transient && !self.0.swap(true, Ordering::Relaxed) {
             Level::ERROR
         } else {
             Level::WARN

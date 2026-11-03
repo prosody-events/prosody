@@ -649,13 +649,14 @@ error to a caller that decides what it means, so its `err` event logs at warn.
 Mark a hand-built span failed with `otel::mark_failed`. The OTel layer marks a
 span failed from a warn event only when the event has an `error` field and no
 message (`warn_failures_mark_their_span_failed`). A `Transient` failure that
-Prosody retries also logs at warn. An operator must act where work is lost, a
-retry ends, or a retry cannot succeed. Log these cases at error: a discarded message or timer, exhausted
-attempts, a skipped durability step, the first `Terminal` abort of a
-partition outside shutdown, a non-`Transient` error in a retry loop, an init
-that fails past the stall threshold, a partition stall, or a broken invariant.
-`error::RetryAlert` makes the abort, retry loop, and init alerts fire once,
-and a repeat of the alert logs at warn. An inner retry layer logs a failure
+Prosody retries also logs at warn, however long it lasts. The stall detector
+alerts on a partition that stops. An operator must act where work is lost, a
+retry ends, or a retry cannot succeed. Log these cases at error: a discarded
+message or timer, exhausted attempts, a skipped durability step, the first
+`Terminal` abort of a partition outside shutdown, a non-`Transient` error in a
+retry loop, a partition stall, or a broken invariant. `error::RetryAlert`
+makes the abort and retry loop alerts fire once, and a repeat of the alert
+logs at warn. An inner retry layer logs a failure
 that it returns at debug, because the outer layer owns the outcome.
 Before you lower a log to warn, trace its error to the owner that logs it at
 error. Create every Kafka client with `kafka_log::LogContext`; the consumer

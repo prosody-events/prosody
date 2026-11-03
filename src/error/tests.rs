@@ -1,5 +1,4 @@
 use super::{ErrorCategory, RetryAlert, UnknownErrorCategory};
-use std::time::Duration;
 use strum::VariantArray;
 use tracing::Level;
 
@@ -37,28 +36,21 @@ fn each_category_keeps_its_wire_discriminant() {
 }
 
 /// An alert fires at the first failure that does not heal, and never again.
-/// A failure past the stall deadline does not heal. Every three-failure
-/// sequence is checked, with and without a passed deadline.
+/// Every three-failure sequence is checked.
 #[test]
 fn retry_alert_fires_once_at_the_first_failure_that_does_not_heal() {
-    for stalled in [false, true] {
-        for &first in ErrorCategory::VARIANTS {
-            for &second in ErrorCategory::VARIANTS {
-                for &third in ErrorCategory::VARIANTS {
-                    let sequence = [first, second, third];
-                    let alert = if stalled {
-                        RetryAlert::stalls_after(Duration::ZERO)
-                    } else {
-                        RetryAlert::default()
-                    };
-                    let alerts = sequence.map(|category| alert.level(category) == Level::ERROR);
+    for &first in ErrorCategory::VARIANTS {
+        for &second in ErrorCategory::VARIANTS {
+            for &third in ErrorCategory::VARIANTS {
+                let sequence = [first, second, third];
+                let alert = RetryAlert::default();
+                let alerts = sequence.map(|category| alert.level(category) == Level::ERROR);
 
-                    let alerting = sequence
-                        .iter()
-                        .position(|&category| stalled || category != ErrorCategory::Transient);
-                    let expected = [0, 1, 2].map(|index| Some(index) == alerting);
-                    assert_eq!(alerts, expected, "{sequence:?}, stalled: {stalled}");
-                }
+                let alerting = sequence
+                    .iter()
+                    .position(|&category| category != ErrorCategory::Transient);
+                let expected = [0, 1, 2].map(|index| Some(index) == alerting);
+                assert_eq!(alerts, expected, "{sequence:?}");
             }
         }
     }

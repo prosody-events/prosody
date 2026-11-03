@@ -19,7 +19,7 @@ use tokio::select;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 use validator::Validate;
 
 mod config;
@@ -367,9 +367,6 @@ async fn refresh_registration<D: PeerDirectory>(
     mut stopped: watch::Receiver<bool>,
 ) {
     heartbeat.beat();
-    // The latest instant at which the lease can start, or `None` after its
-    // lapse alerts. `activate` registers before it starts this task.
-    let mut leased_at = Some(Instant::now());
     let mut refresh_at = Instant::now() + refresh_delay(ttl);
     loop {
         select! {
@@ -391,30 +388,12 @@ async fn refresh_registration<D: PeerDirectory>(
         }
         // A store failure must never end this task: a dead refresher makes the
         // peer vanish one lease later.
-        let peer = registration.peer;
-        match directory.register(&registration).await {
-            Ok(()) => {
-                if leased_at.is_none() {
-                    info!(%peer, "The peer registration of this process is active again");
-                }
-                leased_at = Some(Instant::now());
-            }
-            // A lapsed lease makes other peers drop responses to this peer.
-            // Alert once for each lapse.
-            Err(error) if leased_at.is_some_and(|at| at.elapsed() >= ttl.duration()) => {
-                error!(
-                    %peer,
-                    "The peer registration of this process expired: {error:#}. Other \
-                     processes drop their responses to this process until a refresh \
-                     succeeds. Check the connection to the peer directory."
-                );
-                leased_at = None;
-            }
-            Err(error) => warn!(
-                %peer,
+        if let Err(error) = directory.register(&registration).await {
+            warn!(
+                peer = %registration.peer,
                 "Prosody cannot refresh the peer registration: {error:#}. Prosody retries at \
                  the next refresh."
-            ),
+            );
         }
         heartbeat.beat();
         refresh_at = Instant::now() + refresh_delay(ttl);

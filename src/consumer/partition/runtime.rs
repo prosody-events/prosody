@@ -7,11 +7,10 @@ use aho_corasick::AhoCorasick;
 use async_stream::stream;
 use futures::stream::select;
 use futures::{Stream, StreamExt, pin_mut};
-use humantime::format_duration;
 use tokio::spawn;
 use tokio::sync::watch;
 use tokio::task::coop::cooperative;
-use tokio::time::{Instant, sleep};
+use tokio::time::sleep;
 use tracing::debug;
 
 use super::dispatch::{build_message_stream, process_event};
@@ -32,12 +31,10 @@ use crate::{EventIdentity, EventType};
 
 /// Runs `init` until it succeeds or the partition drains, and returns `None`
 /// at a drain. The partition processes no events until `init` succeeds, so a
-/// failure alerts once when it does not heal or when it outlasts
-/// `stall_threshold`.
+/// failure that does not heal alerts once.
 async fn retry_init<R, E, Fut>(
     shutdown_rx: &watch::Receiver<ShutdownPhase>,
     partition: &PartitionInfo,
-    stall_threshold: Duration,
     what: &str,
     mut init: impl FnMut() -> Fut,
 ) -> Option<R>
@@ -45,8 +42,7 @@ where
     Fut: Future<Output = Result<R, E>>,
     E: ClassifyError + Display,
 {
-    let started = Instant::now();
-    let alert = RetryAlert::stalls_after(stall_threshold);
+    let alert = RetryAlert::default();
     let draining = || *shutdown_rx.borrow() >= ShutdownPhase::Draining;
     while !draining() {
         let error = match init().await {
@@ -57,14 +53,12 @@ where
         if draining() {
             break;
         }
-        let elapsed = Duration::from_secs(started.elapsed().as_secs());
         log_at!(
             alert.level(error.classify_error()),
             topic = %partition.topic,
             partition = partition.partition,
             "Prosody cannot {what}: {error:#}. The partition processes no events while \
-             Prosody retries every second. The first failure occurred {} ago.",
-            format_duration(elapsed),
+             Prosody retries every second."
         );
         sleep(Duration::from_secs(1)).await;
     }
@@ -80,7 +74,6 @@ struct PartitionParams {
     timer_semaphores: Arc<TimerSemaphores>,
     telemetry_sender: TelemetrySender,
     timer_spans: SpanRelation,
-    stall_threshold: Duration,
 }
 
 /// Extracts the store from the provider `S` and the state manager from the
@@ -112,7 +105,6 @@ pub(super) async fn handle_messages<T, S, SP, P, Q>(
         timer_semaphores,
         telemetry_sender,
         timer_spans,
-        stall_threshold,
         ..
     } = config;
 
@@ -129,7 +121,6 @@ pub(super) async fn handle_messages<T, S, SP, P, Q>(
     let Some(state_manager) = retry_init(
         &context.shutdown_rx,
         &partition_info,
-        stall_threshold,
         "get the keyed-state manager",
         || {
             state_provider.acquire(
@@ -151,7 +142,6 @@ pub(super) async fn handle_messages<T, S, SP, P, Q>(
         timer_semaphores,
         telemetry_sender,
         timer_spans,
-        stall_threshold,
     };
 
     run_partition(
@@ -188,7 +178,6 @@ async fn run_partition<T, S, M, P, Q>(
         timer_semaphores,
         telemetry_sender,
         timer_spans,
-        stall_threshold,
     } = params;
     let PartitionContext {
         offsets,
@@ -210,7 +199,6 @@ async fn run_partition<T, S, M, P, Q>(
     let Some((timer_stream, timer_manager)) = retry_init(
         &shutdown_rx,
         &partition_info,
-        stall_threshold,
         "start the timer manager",
         || {
             let config = TimerManagerConfig {
