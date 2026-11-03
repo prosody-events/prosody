@@ -1,11 +1,16 @@
-//! Explicit actor steps for admission after partial timer writes.
+//! A scheduler actor that tests step by hand, and the retirement trace that
+//! admission tests share.
 
-use super::super::actor::{ActorState, load_step, process_command};
-use super::super::{CommandOperation, TriggerScheduler};
+use super::super::actor::load::load_step;
+use super::super::actor::{ActorState, Lanes, process_command};
+use super::super::{Command, TriggerScheduler};
+use crate::Topic;
 use crate::state::TimerEventRef;
+use crate::telemetry::Telemetry;
+use crate::telemetry::event::{Data, TelemetryEvent, TimerEventType, TimerTelemetryEvent};
+use crate::timers::active::Timers;
 use crate::timers::duration::CompactDuration;
-use crate::timers::manager::TimerManager;
-use crate::timers::queue::TriggerQueue;
+use crate::timers::manager::{TimerManager, TimerManagerConfig};
 use crate::timers::slab::Slab;
 use crate::timers::store::TriggerStore;
 use crate::timers::store::adapter::TableAdapter;
@@ -15,15 +20,129 @@ use crate::timers::test_support::test_segment;
 use crate::timers::{CompactDateTime, TimerType, Trigger};
 use color_eyre::eyre::{Result, ensure};
 use futures::TryStreamExt;
-use std::collections::BTreeSet;
-use std::future::Future;
+use std::collections::VecDeque;
+use std::pin::pin;
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio::time::Instant;
+use tokio::select;
+use tokio::sync::broadcast;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::Span;
 
-/// Loads before and after admission to check both durable indexes and the
-/// queue.
+pub(crate) type TestStore = TableAdapter<InMemoryTriggerStore>;
+type Error = <TestStore as TriggerStore>::Error;
+
+/// A scheduler actor that a test steps by hand.
+pub(super) struct Actor {
+    pub(super) state: ActorState<TestStore>,
+    pub(super) timers: Timers,
+    lanes: Lanes<Error>,
+    scheduler: TriggerScheduler<Error>,
+    commands: UnboundedReceiver<Command<Error>>,
+}
+
+impl Actor {
+    pub(super) fn new(state: ActorState<TestStore>) -> Self {
+        let (scheduler, commands) = TriggerScheduler::channel();
+        Self {
+            state,
+            timers: Timers::default(),
+            lanes: Lanes::default(),
+            scheduler,
+            commands,
+        }
+    }
+
+    /// A handle that sends commands to this actor.
+    pub(super) fn scheduler(&self) -> TriggerScheduler<Error> {
+        self.scheduler.clone()
+    }
+
+    /// A manager whose scheduler is this actor.
+    pub(super) fn manager(
+        &self,
+        store: &TestStore,
+        telemetry: &Telemetry,
+    ) -> TimerManager<TestStore> {
+        let config = TimerManagerConfig {
+            store: store.clone(),
+            telemetry: telemetry.partition_sender(Topic::from("actor"), 0),
+            source: Arc::from("actor"),
+        };
+        TimerManager::assemble(config, self.scheduler())
+    }
+
+    /// Serves commands until `call` ends, and then the commands that remain.
+    pub(super) async fn serve<R>(&mut self, call: impl Future<Output = R>) -> R {
+        self.serve_in(call, |_| 0).await
+    }
+
+    /// As [`serve`](Self::serve), but takes each waiting command at the index
+    /// that `pick` returns for the count of waiting commands. The commands of
+    /// different calls can reach the actor in any order.
+    pub(super) async fn serve_in<R>(
+        &mut self,
+        call: impl Future<Output = R>,
+        mut pick: impl FnMut(usize) -> usize,
+    ) -> R {
+        let mut call = pin!(call);
+        loop {
+            select! {
+                biased;
+                result = &mut call => {
+                    self.drain_in(VecDeque::new(), &mut pick).await;
+                    return result;
+                }
+                Some(command) = self.commands.recv() => {
+                    self.drain_in(VecDeque::from([command]), &mut pick).await;
+                }
+            }
+        }
+    }
+
+    /// Serves the commands that wait, such as the ends that tickets sent.
+    pub(super) async fn drain(&mut self) {
+        self.drain_in(VecDeque::new(), &mut |_| 0).await;
+    }
+
+    /// Serves `waiting` and the commands that arrive, in the order of `pick`,
+    /// until no command waits.
+    async fn drain_in(
+        &mut self,
+        mut waiting: VecDeque<Command<Error>>,
+        pick: &mut impl FnMut(usize) -> usize,
+    ) {
+        loop {
+            while let Ok(command) = self.commands.try_recv() {
+                waiting.push_back(command);
+            }
+            let Some(index) = pick(waiting.len()).checked_rem(waiting.len()) else {
+                return;
+            };
+            if let Some(command) = waiting.remove(index) {
+                self.process(command).await;
+            }
+        }
+    }
+
+    async fn process(&mut self, command: Command<Error>) {
+        let tickets = self.scheduler.command_tx.downgrade();
+        process_command(
+            &mut self.state,
+            &mut self.timers,
+            &mut self.lanes,
+            &tickets,
+            command,
+        )
+        .await;
+    }
+}
+
+/// Retires an old attempt through `admit` and then twice more. Checks that
+/// the key row's replacement, and nothing else, stays in both indexes and in
+/// memory, and that retirement reports no cancel.
+///
+/// `mode` picks which old rows exist: the slab row of the old attempt, the
+/// key row of a replacement with the next tag, or both.
 pub(crate) async fn retirement_trace<F, Fut>(
     mode: u8,
     tag: i32,
@@ -31,7 +150,7 @@ pub(crate) async fn retirement_trace<F, Fut>(
     admit: F,
 ) -> Result<()>
 where
-    F: FnOnce(TimerManager<TableAdapter<InMemoryTriggerStore>>, Trigger) -> Fut,
+    F: FnOnce(TimerManager<TestStore>, Trigger) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
     let segment = test_segment("admission", 300_u32);
@@ -55,120 +174,93 @@ where
             .insert_slab_trigger(slab.clone(), old.clone())
             .await?;
     }
-    if !mode.is_multiple_of(3) {
+    let replaced = !mode.is_multiple_of(3);
+    if replaced {
         store
             .operations()
             .upsert_key_trigger(replacement.clone())
             .await?;
     }
-    let mut queue = TriggerQueue::new();
-    let active = queue.active_triggers().clone();
-    let (command_tx, mut commands) = mpsc::channel(1);
-    let manager = TimerManager::with_test_scheduler(
-        store.clone(),
-        TriggerScheduler {
-            command_tx,
-            active_triggers: active.clone(),
-        },
-    );
-    let mut state = ActorState {
-        store: store.clone(),
-        segment,
-        known_slab_ids: BTreeSet::new(),
-        last_persisted_watermark: None,
-        highest_loaded_slab_id: None,
-        preload_window: CompactDuration::new(60),
-        next_load_at: Instant::now(),
-    };
-    // The empty arm removes slab metadata before admission repairs the key-only
-    // schedule.
-    load_step(&mut state, &mut queue).await;
+
+    let mut state = ActorState::start(store.clone(), segment.into(), CompactDateTime::MIN);
+    state.preload_window = CompactDuration::new(60);
+    let mut actor = Actor::new(state);
+    load_step(&mut actor.state, &mut actor.timers).await;
     ensure!(
-        state
+        actor
+            .state
             .highest_loaded_slab_id
             .is_some_and(|end| end >= slab.id())
     );
-    let admission = async {
-        admit(manager.clone(), old.clone()).await?;
-        let event = TimerEventRef::new(old.timer_type, old.time, old.tag);
-        manager.retire_committed(&old.key, event).await?;
-        manager.retire_committed(&old.key, event).await?;
-        drop(manager);
-        Result::<()>::Ok(())
-    };
-    let actor = async {
-        let mut handled = 0_u8;
-        let mut repaired = true;
-        while let Some(command) = commands.recv().await {
-            let rows: Vec<_> = store
-                .get_slab_triggers_all_types(slab.id())
-                .try_collect()
-                .await?;
-            let expected =
-                matches!(command.operation, CommandOperation::Add).then_some(command.trigger.tag);
-            repaired &= matches!(
-                command.operation,
-                CommandOperation::Add | CommandOperation::RetireCommitted
-            ) && rows.iter().map(|t| t.tag).collect::<Vec<_>>()
-                == expected.into_iter().collect::<Vec<_>>();
-            process_command(&mut state, &mut queue, command).await;
-            handled += 1;
-        }
-        ensure!(repaired, "command preceded repair");
-        ensure!(
-            handled == 3 + u8::from(retire_replacement),
-            "retirement did not acknowledge every command"
-        );
-        Result::<()>::Ok(())
-    };
-    let (admitted, handled) = tokio::join!(admission, actor);
-    admitted?;
-    handled?;
-    load_step(&mut state, &mut queue).await;
-    let expected = (!retire_replacement && !mode.is_multiple_of(3)).then_some(tag + 1_i32);
-    assert_retired(&store, &mut queue, &old, &slab, expected).await
-}
 
-async fn assert_retired(
-    store: &TableAdapter<InMemoryTriggerStore>,
-    queue: &mut TriggerQueue,
-    old: &Trigger,
-    slab: &Slab,
-    expected: Option<i32>,
-) -> Result<()> {
-    let entry = queue
-        .active_triggers()
-        .get(&old.key, old.time, old.timer_type)
-        .await;
-    ensure!(
-        entry.map(|entry| entry.tag) == expected,
-        "retirement left the wrong queued attempt"
-    );
+    let telemetry = Telemetry::new();
+    let mut events = telemetry.subscribe();
+    let manager = actor.manager(&store, &telemetry);
+    let event = TimerEventRef::new(old.timer_type, old.time, old.tag);
+    actor
+        .serve(async {
+            admit(manager.clone(), old.clone()).await?;
+            manager.retire_committed(&old.key, event).await?;
+            Ok::<_, color_eyre::Report>(manager.retire_committed(&old.key, event).await?)
+        })
+        .await?;
+
+    ensure!(!cancelled(&mut events), "retirement reported a cancel");
+    let expected = (replaced && !retire_replacement).then_some(replacement.tag);
     let current = store
         .current_trigger(&old.key, old.time, old.timer_type)
         .await?;
-    ensure!(current.map(|trigger| trigger.tag) == expected);
+    ensure!(
+        current.map(|trigger| trigger.tag) == expected,
+        "wrong key row"
+    );
     let rows: Vec<_> = store
         .get_slab_triggers_all_types(slab.id())
-        .map_ok(|t| t.tag)
+        .map_ok(|trigger| trigger.tag)
         .try_collect()
         .await?;
-    ensure!(rows == expected.into_iter().collect::<Vec<_>>());
+    ensure!(rows == Vec::from_iter(expected), "wrong slab rows");
     if expected.is_some() {
-        let metadata: Vec<_> = store
+        let slabs: Vec<_> = store
             .get_slab_range(slab.id()..=slab.id())
             .try_collect()
             .await?;
-        ensure!(metadata.len() == 1, "replacement lost slab metadata");
+        ensure!(slabs.len() == 1, "replacement lost slab metadata");
     }
-    let queued = queue.next().await;
+
+    // The attempt that stays fires once, and memory holds nothing else.
+    let fired = actor.timers.next().await;
     ensure!(
-        queued.map(|trigger| trigger.tag) == expected,
-        "retirement lost the queued attempt"
+        fired.as_ref().map(|trigger| trigger.tag) == expected,
+        "memory holds the wrong attempt"
+    );
+    if let Some(trigger) = fired {
+        ensure!(
+            actor.timers.fire(&trigger.id(), trigger.tag),
+            "the stored attempt did not fire"
+        );
+    }
+    ensure!(
+        actor.timers.next().await.is_none(),
+        "an attempt fired twice"
     );
     ensure!(
-        queue.next().await.is_none(),
-        "retirement queued the same attempt twice"
+        actor.timers.snapshot(time).active == u32::from(expected.is_some()),
+        "memory keeps an entry for a deleted row"
     );
     Ok(())
+}
+
+/// Whether `events` holds a timer cancel.
+fn cancelled(events: &mut broadcast::Receiver<TelemetryEvent>) -> bool {
+    while let Ok(event) = events.try_recv() {
+        if let Data::Timer(TimerTelemetryEvent {
+            event_type: TimerEventType::Cancelled,
+            ..
+        }) = &*event.data
+        {
+            return true;
+        }
+    }
+    false
 }

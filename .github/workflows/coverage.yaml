@@ -74,6 +74,9 @@ jobs:
         image: cassandra:latest
         ports:
           - "9042:9042"
+        env:
+          # Tests read complete query traces: a session ends after its events land.
+          JVM_EXTRA_OPTS: -Dcassandra.wait_for_tracing_events_timeout_secs=10
         options: >-
           --health-cmd "cqlsh -e 'SELECT cluster_name FROM system.local;'"
           --health-interval 15s

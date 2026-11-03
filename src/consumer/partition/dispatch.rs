@@ -148,7 +148,7 @@ async fn process_timer<T, S, M, P>(
     P: Send + Sync + 'static,
 {
     if admission == Admission::Abandoned && timer.timer_type() != TimerType::StateRecovery {
-        timer.abandon().await;
+        timer.abandon();
         return;
     }
     let Some(firing) = timer.fire().await else {

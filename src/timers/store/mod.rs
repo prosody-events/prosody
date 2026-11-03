@@ -28,6 +28,7 @@ use crate::{Key, Partition, Topic};
 use educe::Educe;
 use futures::Stream;
 use opentelemetry::Context;
+use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
@@ -441,10 +442,12 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// New timer is written FIRST, then old entries are deleted. This ensures
     /// at-least-once delivery: if a crash occurs, both timers may exist
     /// temporarily, but the timer will never be lost.
+    ///
+    /// Returns the times of the deleted timers, without the new time.
     fn clear_and_schedule(
         &self,
         trigger: Trigger,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<SmallVec<[CompactDateTime; 1]>, Self::Error>> + Send;
 
     // ===================================================================
     // Timer identity read
