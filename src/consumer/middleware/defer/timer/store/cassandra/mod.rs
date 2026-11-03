@@ -488,9 +488,8 @@ impl TimerDeferStore for CassandraTimerDeferStore {
             }
         } else {
             // Non-FIFO path: offset is not the minimum; leave next_timer alone.
-            // Only retry_count is rewritten — base_ttl is safe
-            // (read_next_static defaults retry_opt = None to 0, matching the
-            // value being written).
+            // Only retry_count is rewritten — base_ttl is safe (read_next_static
+            // defaults retry_opt = None to 0, matching the value being written).
             let ttl = self.store.base_ttl();
             self.session()
                 .execute_unpaged(
@@ -571,8 +570,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
                 );
             }
             Some(_) => {
-                // Monotonic append: current next_timer remains the minimum,
-                // just INSERT
+                // Monotonic append: current next_timer remains the minimum, just INSERT
                 self.session()
                     .execute_unpaged(
                         &self.queries.insert_deferred_timer_without_retry_count,
@@ -609,8 +607,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
             match found {
                 Some(next_udt) => {
                     // Match next_timer's TTL to the referenced successor row so
-                    // the static hint cannot expire before the row it points
-                    // to.
+                    // the static hint cannot expire before the row it points to.
                     let ttl = self.store.calculate_ttl(next_udt.time);
                     self.session()
                         .execute_unpaged(
@@ -756,8 +753,7 @@ impl TimerDeferStoreProvider for CassandraTimerDeferStoreProvider {
         cache_size: usize,
     ) -> Self::Store {
         // Each call creates a new store with its own fresh cache.
-        // The cache must never outlive or be shared across partition
-        // assignments.
+        // The cache must never outlive or be shared across partition assignments.
         let segment = LazySegment::new(
             self.segment_store.clone(),
             topic,

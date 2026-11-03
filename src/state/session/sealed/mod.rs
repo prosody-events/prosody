@@ -1,6 +1,7 @@
 use super::stage::{abort_collections, resolve_collections};
 use crate::Key;
 use crate::consumer::middleware::{MarkerWrite, RepinProof};
+use crate::error::RetryAlert;
 use crate::state::access::StateAccessError;
 use crate::state::backend::AdmissionChecks;
 use crate::state::identity::CollectionRef;
@@ -77,9 +78,14 @@ pub(crate) enum Promoted<S: CellStore, K: AdmissionChecks> {
 impl<S: CellStore, K: AdmissionChecks> Staged<S, K> {
     /// Returns rejected collections for rollback.
     /// Shutdown removes the admission proof.
-    pub(crate) async fn promote(mut self, shutdown: impl Fn() -> bool + Sync) -> Promoted<S, K> {
+    pub(crate) async fn promote(
+        mut self,
+        alert: &RetryAlert,
+        shutdown: impl Fn() -> bool + Sync,
+    ) -> Promoted<S, K> {
         let total = self.collections.len();
-        self.collections = resolve_collections(&self.store, self.collections, &shutdown).await;
+        self.collections =
+            resolve_collections(&self.store, self.collections, alert, &shutdown).await;
         if shutdown() {
             if let Err(error) = self.checks.unmark(&self.key).await {
                 warn!(%error, key = %self.key, "cannot remove admission proof");
@@ -96,8 +102,12 @@ impl<S: CellStore, K: AdmissionChecks> Staged<S, K> {
 
     /// Restores the rejected collections before the boundary commits the
     /// source.
-    pub(crate) async fn abort(self, shutdown: impl Fn() -> bool + Sync) -> bool {
-        let complete = abort_collections(&self.store, &self.collections, &shutdown).await;
+    pub(crate) async fn abort(
+        self,
+        alert: &RetryAlert,
+        shutdown: impl Fn() -> bool + Sync,
+    ) -> bool {
+        let complete = abort_collections(&self.store, &self.collections, alert, &shutdown).await;
         if let Err(error) = self.checks.unmark(&self.key).await {
             warn!(%error, key = %self.key, "cannot remove admission proof");
         }

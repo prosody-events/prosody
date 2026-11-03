@@ -192,10 +192,10 @@ where
 
         match error_category {
             ErrorCategory::Transient => {
-                // Always re-defer: message is committed to queue, dropping
-                // would violate ordering for messages queued behind it. The
-                // inner ran and returned `error`; we capture it in `Deferred`
-                // so the inner sees `after_abort(Err(error))` (its attempt is
+                // Always re-defer: message is committed to queue, dropping would
+                // violate ordering for messages queued behind it. The inner
+                // ran and returned `error`; we capture it in `Deferred` so
+                // the inner sees `after_abort(Err(error))` (its attempt is
                 // being rolled back; a retry is coming via the rescheduled
                 // timer).
                 let new_retry_count = self.re_defer(context, message_key, retry_count).await?;
@@ -221,15 +221,15 @@ where
                 Ok(MessageDeferOutput::Deferred(error))
             }
             ErrorCategory::Permanent => {
-                // The outer retry layer logs this error at error.
-                debug!(
+                // Only this layer knows the lost message and its offset.
+                error!(
                     key = %message_key,
                     offset = offset,
                     retry_count = retry_count,
                     topic = %self.topic,
                     partition = self.partition,
-                    "A deferred message failed with a permanent error: {error:#}. Prosody removes \
-                     it from the deferral queue."
+                    "Prosody lost a deferred message: {error:#}. The error is permanent, so \
+                     Prosody removes the message from the deferral queue."
                 );
 
                 self.complete_and_advance(context, message_key, offset)

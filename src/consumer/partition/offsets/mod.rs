@@ -290,6 +290,9 @@ async fn track_watermark(
                 // A stall fails the liveness probe. It also catches a message
                 // whose handling retries forever at warn.
                 error!(
+                    %topic,
+                    partition,
+                    offset,
                     "Partition {topic}:{partition} made no progress past offset {offset} for \
                      {}. This is more than the stall threshold of {}, so the liveness probe \
                      fails. Look for failure logs about offset {offset}.",

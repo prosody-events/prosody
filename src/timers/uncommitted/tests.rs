@@ -121,10 +121,12 @@ async fn test_firing_timer_commit() -> Result<()> {
     Ok(())
 }
 
-/// A commit after the partition stops returns. It does not retry forever.
+/// A commit after the partition stops returns. It does not retry forever, and
+/// the dropped timer does not warn.
 #[tokio::test]
 async fn firing_timer_commit_returns_after_shutdown() -> Result<()> {
     time::pause();
+    let (warnings, _guard) = capture_events(Level::WARN);
 
     let (stream, manager, shutdown_tx) = setup_timer_manager().await?;
     pin_mut!(stream);
@@ -144,6 +146,7 @@ async fn firing_timer_commit_returns_after_shutdown() -> Result<()> {
     // The deadline is a hang guard. A commit loop without a shutdown exit
     // retries forever.
     time::timeout(Duration::from_mins(1), firing_timer.commit()).await?;
+    assert_eq!(warnings.count("dropped without committing"), 0);
     Ok(())
 }
 

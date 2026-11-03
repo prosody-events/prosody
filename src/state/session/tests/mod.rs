@@ -12,6 +12,7 @@ use super::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::ErrorCategory;
+use crate::error::RetryAlert;
 use crate::state::StateAccessError;
 use crate::state::StateBackend;
 use crate::state::cell::Values;
@@ -412,11 +413,11 @@ async fn promote_receipt(
             ErrorCategory::Permanent,
         )));
     }
-    match staged.promote(|| false).await {
+    match staged.promote(&RetryAlert::default(), || false).await {
         Promoted::Complete => assert!(!fail_promote),
         Promoted::Rejected(rejected) => {
             assert!(fail_promote);
-            assert!(rejected.abort(|| false).await);
+            assert!(rejected.abort(&RetryAlert::default(), || false).await);
         }
         _ => bail!("unexpected promote result"),
     }

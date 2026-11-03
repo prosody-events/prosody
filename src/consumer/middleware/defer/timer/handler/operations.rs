@@ -1,4 +1,4 @@
-use tracing::{Instrument, debug, info};
+use tracing::{Instrument, debug, error, info};
 
 use super::super::store::{TimerDeferStore, TimerRetryCompletionResult};
 use super::{TimerDeferHandler, TimerDeferOutput};
@@ -355,15 +355,15 @@ where
                 Ok(TimerDeferOutput::Deferred(error))
             }
             ErrorCategory::Permanent => {
-                // The outer retry layer logs this error at error.
-                debug!(
+                // Only this layer knows the lost timer and its original time.
+                error!(
                     key = %deferred_trigger.key,
                     time = %deferred_trigger.time,
                     retry_count = retry_count,
                     topic = %self.topic,
                     partition = self.partition,
-                    "A deferred timer failed with a permanent error: {error:#}. Prosody removes \
-                     it from the deferral queue."
+                    "Prosody lost a deferred timer: {error:#}. The error is permanent, so \
+                     Prosody removes the timer from the deferral queue."
                 );
 
                 self.complete_and_advance(context, stored_trigger).await?;

@@ -198,8 +198,8 @@ pub(crate) async fn settle<T, C, G>(
         Settlement::Final => match category {
             // A permanent final failure records its marker best-effort, so
             // dedup filters redelivery. Finalize runs only on success.
-            // A transient final failure has no marker. Commit and call the
-            // hook. Terminal failures already returned above.
+            // A transient final failure has no marker. Commit and call the hook.
+            // Terminal failures already returned above.
             Some(category) => {
                 if category == ErrorCategory::Permanent
                     && let Some(lifecycle) = &lifecycle
@@ -274,8 +274,9 @@ async fn settle_committed<'a, T, C, G>(
         return;
     };
 
-    // One alert covers the event's durability steps. A partition stays
-    // assigned for weeks, so a partition-wide alert would hide a later fault.
+    // One alert covers the event's durability steps. The rollback inside
+    // finalize has its own alert. A partition stays assigned for weeks, so a
+    // partition-wide alert would hide a later fault.
     let alert = RetryAlert::default();
 
     // Stage provisional cells and write resolved cells.
@@ -316,12 +317,12 @@ async fn settle_committed<'a, T, C, G>(
 
     // The first successful promote is the commit point.
     if let Finalized::Staged(staged) = finalized {
-        let outcome = staged.promote(|| context.is_shutdown()).await;
+        let outcome = staged.promote(&alert, || context.is_shutdown()).await;
         let complete = match outcome {
             Promoted::Complete => true,
             Promoted::Abandoned => false,
             Promoted::Rejected(rejected) => {
-                if rejected.abort(|| context.is_shutdown()).await {
+                if rejected.abort(&alert, || context.is_shutdown()).await {
                     commit_and_finish(handler, context, guard, result, Some(lifecycle), permit)
                         .await;
                     return;
@@ -330,7 +331,7 @@ async fn settle_committed<'a, T, C, G>(
             }
             Promoted::Torn(rejected) => {
                 PROMOTE_TORN.add(1, &[]);
-                rejected.abort(|| context.is_shutdown()).await
+                rejected.abort(&alert, || context.is_shutdown()).await
             }
         };
         if !complete {

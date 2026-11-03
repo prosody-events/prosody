@@ -2,6 +2,7 @@
 //! that runs through the real keyed-state lifecycle.
 
 use crate::consumer::partition::ShutdownPhase;
+use crate::error::RetryAlert;
 use crate::loader::MemoryLoader;
 use crate::segment::partition_segment_id;
 use crate::state::descriptor::StateDescriptor;
@@ -98,7 +99,10 @@ async fn promote<C: CellStore>(session: OwnerSession<C>) -> Result<()> {
         .finalize()
         .await
         .map_err(|e| eyre!("finalize: {e}"))?
-        && !matches!(staged.promote(|| false).await, Promoted::Complete)
+        && !matches!(
+            staged.promote(&RetryAlert::default(), || false).await,
+            Promoted::Complete
+        )
     {
         bail!("promote incomplete on a healthy store");
     }

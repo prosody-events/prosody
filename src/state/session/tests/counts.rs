@@ -11,6 +11,7 @@ use super::{Fixture, message};
 use crate::codec::JsonCodec;
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::partition::ShutdownPhase;
+use crate::error::RetryAlert;
 use crate::state::cell::Values;
 use crate::state::cell_key::{CellKey, Section};
 use crate::state::descriptor::value_state;
@@ -152,7 +153,10 @@ impl CountingFixture {
     async fn settle(&self, finalized: Finalized<CountingCell, ()>) -> Result<()> {
         if let Finalized::Staged(staged) = finalized {
             self.dedup.insert(self.dedup_id).await?;
-            assert!(matches!(staged.promote(|| false).await, Promoted::Complete));
+            assert!(matches!(
+                staged.promote(&RetryAlert::default(), || false).await,
+                Promoted::Complete
+            ));
         }
         Ok(())
     }
@@ -364,7 +368,10 @@ async fn stage_restores_distinct_bases_on_abort() -> Result<()> {
         bail!("the seeding event must stage");
     };
     fx.dedup.insert(dedup).await?;
-    assert!(matches!(staged.promote(|| false).await, Promoted::Complete));
+    assert!(matches!(
+        staged.promote(&RetryAlert::default(), || false).await,
+        Promoted::Complete
+    ));
 
     // Overwrite both, then abort: each cell rolls back to its own base.
     let (event, _dedup) = message(2);

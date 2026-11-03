@@ -47,6 +47,26 @@ static ADMISSION_TORN: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// The shutdown signal and the alert of one key's admission. The steps of one
+/// admission share the alert.
+pub(super) struct AdmissionScope<'a> {
+    shutdown: &'a watch::Receiver<ShutdownPhase>,
+    alert: RetryAlert,
+}
+
+impl<'a> AdmissionScope<'a> {
+    pub(super) fn new(shutdown: &'a watch::Receiver<ShutdownPhase>) -> Self {
+        Self {
+            shutdown,
+            alert: RetryAlert::default(),
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        *self.shutdown.borrow() >= ShutdownPhase::Cancelling
+    }
+}
+
 impl<B, L> StateManager<B, L>
 where
     B: StateBackend,
@@ -54,9 +74,8 @@ where
     async fn load_markers(
         &self,
         key: &Key,
-        shutdown: &watch::Receiver<ShutdownPhase>,
+        scope: &AdmissionScope<'_>,
     ) -> Result<SmallVec<[(CollectionRef, MarkerState); 8]>, Admission> {
-        let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
         let registry = &self.inner.registry;
         let state_key = StateKey::new(self.inner.segment_id, key.clone());
         let mut pending: SmallVec<[(StateType, StateName); 8]> = registry
@@ -73,7 +92,7 @@ where
                     let id = CollectionId::new(state_key.clone(), kind, name);
                     cooperative(async move {
                         let state = admission_step(
-                            cancelled,
+                            scope,
                             key,
                             "read a collection marker during admission",
                             Some(id.name()),
@@ -123,9 +142,9 @@ where
         &self,
         key: &Key,
         timers: &TimerManager<T>,
-        shutdown: &watch::Receiver<ShutdownPhase>,
+        scope: &AdmissionScope<'_>,
     ) -> Result<(), Admission> {
-        let states = self.load_markers(key, shutdown).await?;
+        let states = self.load_markers(key, scope).await?;
         let mut legacy_events: SmallVec<[EventRef; 8]> = SmallVec::with_capacity(states.len());
         for marker in states.iter().filter_map(|(_, state)| state.staged.as_ref()) {
             if marker.version() == MarkerVersion::V1 && !legacy_events.contains(&marker.event()) {
@@ -138,7 +157,7 @@ where
                 cooperative(async move {
                     Ok::<_, Admission>((
                         event,
-                        self.legacy_committed(key, event, timers, shutdown).await?,
+                        self.legacy_committed(key, event, timers, scope).await?,
                     ))
                 })
             })
@@ -179,12 +198,11 @@ where
             resolutions.push((collection.clone(), marker.clone(), decision));
         }
 
-        // Owned shared handles avoid higher-ranked closures and large future
-        // buffers.
+        // Owned shared handles avoid higher-ranked closures and large future buffers.
         stream::iter(resolutions)
             .map(|(collection, marker, decision)| {
                 cooperative(async move {
-                    self.resolve_admission(key, &collection, &marker, decision, shutdown)
+                    self.resolve_admission(key, &collection, &marker, decision, scope)
                         .await
                 })
             })
@@ -204,7 +222,7 @@ where
                     &sources,
                     &legacy,
                     timers,
-                    shutdown,
+                    scope,
                 ))
             })
             .buffer_unordered(STATE_FANOUT_CONCURRENCY)
@@ -218,9 +236,8 @@ where
         collection: &CollectionRef,
         marker: &EventMarker,
         decision: CommitDecision,
-        shutdown: &watch::Receiver<ShutdownPhase>,
+        scope: &AdmissionScope<'_>,
     ) -> Result<(), Admission> {
-        let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
         if decision == CommitDecision::NotCommitted
             && !self.inner.registry.collections().any(|(kind, name)| {
                 kind == collection.id().state_type() && name == collection.id().name()
@@ -228,7 +245,7 @@ where
         {
             if marker.version() == MarkerVersion::V1 {
                 admission_step(
-                    cancelled,
+                    scope,
                     key,
                     "legacy marker abort",
                     Some(collection.id().name()),
@@ -242,7 +259,7 @@ where
         let marker = marker.for_admission(self.inner.dedup_ttl);
         let name = Some(collection.id().name());
         let resolved = admission_step(
-            cancelled,
+            scope,
             key,
             "resolve a collection marker during admission",
             name,
@@ -252,7 +269,7 @@ where
         if resolved.is_none() && decision == CommitDecision::Committed {
             ADMISSION_TORN.add(1, &[]);
             admission_step(
-                cancelled,
+                scope,
                 key,
                 "roll back a partial commit during admission",
                 name,
@@ -277,9 +294,8 @@ where
         sources: &[EventRef],
         legacy: &[(EventRef, Option<bool>)],
         timers: &TimerManager<T>,
-        shutdown: &watch::Receiver<ShutdownPhase>,
+        scope: &AdmissionScope<'_>,
     ) -> Result<(), Admission> {
-        let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
         match source {
             EventRef::Message { dedup_id } => {
                 // Reuse legacy reads, including Permanent rejections.
@@ -287,7 +303,7 @@ where
                     Some((_, exists)) => *exists,
                     None => {
                         admission_step(
-                            cancelled,
+                            scope,
                             key,
                             "dedup read rejected; redelivery can reach the handler",
                             None,
@@ -298,7 +314,7 @@ where
                 };
                 if exists == Some(false) {
                     admission_step(
-                        cancelled,
+                        scope,
                         key,
                         "dedup write rejected; redelivery can reach the handler",
                         None,
@@ -308,14 +324,13 @@ where
                 }
             }
             EventRef::Timer(_) => {
-                // Attempts at one coordinate share durable rows. Retire them in
-                // order.
+                // Attempts at one coordinate share durable rows. Retire them in order.
                 for &other in sources {
                     if let EventRef::Timer(timer) = other
                         && same_timer_coordinate(source, other)
                     {
                         admission_step(
-                            cancelled,
+                            scope,
                             key,
                             "retire a finished timer during admission",
                             None,
@@ -337,13 +352,12 @@ where
         key: &Key,
         event: EventRef,
         timers: &TimerManager<T>,
-        shutdown: &watch::Receiver<ShutdownPhase>,
+        scope: &AdmissionScope<'_>,
     ) -> Result<Option<bool>, Admission> {
-        let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
         match event {
             EventRef::Message { dedup_id } => {
                 admission_step(
-                    cancelled,
+                    scope,
                     key,
                     "legacy dedup read; redelivery can reach the handler",
                     None,
@@ -353,7 +367,7 @@ where
             }
             EventRef::Timer(timer) => {
                 let tag = admission_step(
-                    cancelled,
+                    scope,
                     key,
                     "read a timer in the legacy format during admission",
                     None,
@@ -395,7 +409,7 @@ fn retain_sources(sources: &mut SmallVec<[EventRef; 32]>, event: EventRef, dedup
 /// Retries one admission store operation. Its log events name the `step`
 /// action, the key, and, for a collection operation, the collection.
 pub(super) async fn admission_step<R, E, Fut>(
-    cancelled: impl Fn() -> bool,
+    scope: &AdmissionScope<'_>,
     key: &Key,
     step: &'static str,
     collection: Option<&StateName>,
@@ -411,7 +425,7 @@ where
         collection: collection.map(StateName::as_str),
         on_rejection: "The store rejected the data, so admission continues without it.",
     };
-    let outcome = retry_step(&RetryAlert::default(), cancelled, step, operation).await;
+    let outcome = retry_step(&scope.alert, || scope.cancelled(), step, operation).await;
     match outcome {
         StepOutcome::Done(value) => Ok(Some(value)),
         StepOutcome::Skip => Ok(None),

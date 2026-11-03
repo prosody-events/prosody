@@ -23,6 +23,7 @@ use crate::state::TimerEventRef;
 use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::timers::active::{Insert, Listed, TimerSnapshot};
 use crate::timers::datetime::CompactDateTime;
+use crate::{Partition, Topic};
 
 pub use crate::timers::error::TimerManagerError;
 use crate::timers::scheduler::{Inserted, TriggerScheduler};
@@ -375,6 +376,11 @@ where
     /// that tick.
     pub(crate) async fn snapshot(&self) -> Result<TimerSnapshot, TimerManagerError<T::Error>> {
         Ok(self.0.scheduler.snapshot(CompactDateTime::now()?).await?)
+    }
+
+    /// Returns the topic and partition that own these timers.
+    pub(crate) fn partition(&self) -> (Topic, Partition) {
+        self.0.telemetry.source()
     }
 
     /// Aborts a timer delivery, or its delivered attempt with `tag` that

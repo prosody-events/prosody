@@ -12,7 +12,7 @@
 mod admission;
 mod provider;
 
-use admission::admission_step;
+use admission::{AdmissionScope, admission_step};
 pub use provider::{StateAcquireError, StateManagerProvider};
 #[cfg(test)]
 mod tests;
@@ -297,8 +297,8 @@ where
     where
         T: TriggerStore,
     {
-        let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
-        match admission_step(cancelled, &key, "read the admission check", None, || {
+        let scope = AdmissionScope::new(shutdown);
+        match admission_step(&scope, &key, "read the admission check", None, || {
             self.inner.checks.contains(&key)
         })
         .await
@@ -307,10 +307,10 @@ where
             Ok(Some(false) | None) => {}
             Err(admission) => return admission,
         }
-        if let Err(admission) = self.admit_unchecked(&key, timers, shutdown).await {
+        if let Err(admission) = self.admit_unchecked(&key, timers, &scope).await {
             return admission;
         }
-        match admission_step(cancelled, &key, "record the admission check", None, || {
+        match admission_step(&scope, &key, "record the admission check", None, || {
             self.inner.checks.mark(&key)
         })
         .await

@@ -1,8 +1,8 @@
 use super::*;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::tests::test_support::{
-    MockEventContext, ScriptedHandler, ScriptedHook, TestError, create_test_message,
-    create_test_trigger,
+    MockEventContext, RecordingTimer, ScriptedHandler, ScriptedHook, TestError,
+    create_test_message, create_test_trigger,
 };
 use crate::error::ErrorCategory;
 use crate::test_util::{CapturedEvents, capture_events};
@@ -155,11 +155,7 @@ async fn shutdown_during_retry_sleep_returns_error() -> Result<()> {
     let retry_handler = RetryHandler {
         base_delay_millis: 1000, // 1 second base delay
         max_delay_millis: 10000,
-        max_retries: 10,
-        topic: "test-topic".into(),
-        partition: 0,
-        aborts: Arc::default(),
-        handler: handler.clone(),
+        ..create_retry_handler(handler.clone(), 10)
     };
     let context = MockEventContext::new();
     let message = create_test_message()?;
@@ -218,7 +214,8 @@ where
 }
 
 /// A `Terminal` abort outside shutdown holds the partition, so the partition's
-/// first abort alerts and a later abort logs at warn. An inner layer leaves
+/// first abort alerts and a later abort logs at warn. A timer abort does not
+/// hold the partition, so it does not use up that alert. An inner layer leaves
 /// the outcome to the outer layer, so it logs below warn. A shutdown abort is
 /// expected and does not log.
 #[tokio::test]
@@ -226,6 +223,8 @@ async fn terminal_abort_alerts_once_per_partition() -> Result<()> {
     let handler = ScriptedHandler::always_failing(ErrorCategory::Terminal);
     for (level, aborts) in [(Level::ERROR, 1), (Level::WARN, 2)] {
         let outer = create_retry_handler(handler.clone(), 10);
+        let (timer, ..) = RecordingTimer::new(create_test_trigger());
+        EventHandler::on_timer(&outer, MockEventContext::new(), timer, DemandType::Normal).await;
         let events = terminal_abort_events(&outer, false, level).await?;
         assert_eq!(events.count(TERMINAL_ABORT), aborts, "{level}");
 
@@ -238,7 +237,7 @@ async fn terminal_abort_alerts_once_per_partition() -> Result<()> {
         let events = terminal_abort_events(&shutdown, true, level).await?;
         assert_eq!(events.count(TERMINAL_ABORT), 0, "{level}");
     }
-    assert_eq!(handler.call_count(), 12);
+    assert_eq!(handler.call_count(), 14);
     Ok(())
 }
 
@@ -271,11 +270,7 @@ fn sleep_time_has_exponential_growth_with_jitter() {
     let retry_handler = RetryHandler {
         base_delay_millis: 100,
         max_delay_millis: 10000,
-        max_retries: 10,
-        topic: "test-topic".into(),
-        partition: 0,
-        aborts: Arc::default(),
-        handler,
+        ..create_retry_handler(handler, 10)
     };
 
     // Collect multiple samples to verify jitter randomness
@@ -310,11 +305,7 @@ fn sleep_time_survives_zero_backoff() {
     let retry_handler = RetryHandler {
         base_delay_millis: 0,
         max_delay_millis: 0,
-        max_retries: 10,
-        topic: "test-topic".into(),
-        partition: 0,
-        aborts: Arc::default(),
-        handler: ScriptedHandler::success(),
+        ..create_retry_handler(ScriptedHandler::success(), 10)
     };
 
     assert_eq!(retry_handler.sleep_time(1), Duration::ZERO);
@@ -326,11 +317,7 @@ fn sleep_time_capped_at_max_delay() {
     let retry_handler = RetryHandler {
         base_delay_millis: 100,
         max_delay_millis: 500,
-        max_retries: 10,
-        topic: "test-topic".into(),
-        partition: 0,
-        aborts: Arc::default(),
-        handler,
+        ..create_retry_handler(handler, 10)
     };
 
     // Attempt 10: exp_backoff = 2^10 * 100 = 102400ms, but capped at 500ms

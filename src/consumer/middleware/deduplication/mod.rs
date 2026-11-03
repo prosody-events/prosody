@@ -182,8 +182,7 @@ where
     {
         // The filter reads the identity that the settle boundary records.
         // It reads the session dedup ID or the deferred-load override. Thus,
-        // the filter and record cannot disagree. A missing source skips
-        // filtering.
+        // the filter and record cannot disagree. A missing source skips filtering.
         let marker = context
             .marker_identity()
             .ok()

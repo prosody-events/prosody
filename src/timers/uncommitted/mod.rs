@@ -387,19 +387,23 @@ where
                 .complete(&self.key, self.time, self.timer_type, self.tag)
                 .await
             {
-                Ok(()) => break,
-                // The partition stopped. The stored timer fires again after
-                // the next assignment.
-                Err(TimerManagerError::Scheduler(TimerSchedulerError::Shutdown)) => return,
+                // A stopped scheduler means that the partition stopped. The
+                // stored timer fires again after the next assignment.
+                Ok(()) | Err(TimerManagerError::Scheduler(TimerSchedulerError::Shutdown)) => break,
                 // A schema fault or a corrupt trigger does not clear by retry.
-                Err(error) => log_at!(
-                    alert.level(error.classify_error()),
-                    key = %self.key,
-                    fire_time = %self.time,
-                    timer_type = ?self.timer_type,
-                    "Prosody cannot delete a fired timer: {error:#}. Later events for this key \
-                     wait while Prosody retries every second."
-                ),
+                Err(error) => {
+                    let (topic, partition) = self.manager.partition();
+                    log_at!(
+                        alert.level(error.classify_error()),
+                        %topic,
+                        partition,
+                        key = %self.key,
+                        fire_time = %self.time,
+                        timer_type = ?self.timer_type,
+                        "Prosody cannot delete a fired timer: {error:#}. Later events for this \
+                         key wait while Prosody retries every second."
+                    );
+                }
             }
             sleep(RETRY_DURATION).await;
         }

@@ -36,6 +36,7 @@ pub(super) struct Failure<'a, E> {
     attempt: u32,
     error: &'a E,
     next: Next,
+    layer: Layer<'a>,
 }
 
 /// What a retry layer does after a failed attempt.
@@ -58,25 +59,27 @@ enum Event {
     Timer,
 }
 
-/// Which retry layer logs a failure. It sets who owns the failure's outcome.
+/// Which retry layer runs an event. It sets the retry limit and who owns the
+/// failure's outcome.
 #[derive(Clone, Copy)]
 pub(super) enum Layer<'a> {
-    /// A `FallibleHandler` layer. The error propagates to an outer layer.
-    Inner,
+    /// A `FallibleHandler` layer. It retries a `Transient` error up to
+    /// `max_retries` times, then returns the error to an outer layer.
+    Inner { max_retries: u32 },
 
-    /// The `EventHandler` layer. It discards a failed event. A `Terminal`
-    /// abort here holds the partition until a restart, so the partition's
-    /// first abort raises this alert.
+    /// The `EventHandler` layer. It retries a `Transient` error without a
+    /// limit and discards a failed event. The first `Terminal` abort of this
+    /// kind of event in the partition raises this alert.
     Outermost(&'a RetryAlert),
 }
 
 impl<E> Failure<'_, E> {
-    /// Returns the level for this failure at `layer`.
-    fn level(&self, layer: Layer) -> Level {
-        match (self.next, layer) {
+    /// Returns the level for this failure.
+    fn level(&self) -> Level {
+        match (self.next, self.layer) {
             (Next::Retry(_), _) => Level::WARN,
             // The outer layer owns the outcome and logs it.
-            (_, Layer::Inner) => Level::DEBUG,
+            (_, Layer::Inner { .. }) => Level::DEBUG,
             (Next::Abort, Layer::Outermost(aborts)) => aborts.level(ErrorCategory::Terminal),
             (Next::GiveUp | Next::Skip, Layer::Outermost(_)) => Level::ERROR,
         }
@@ -94,19 +97,20 @@ impl Display for Event {
 
 impl<E: Display> Failure<'_, E> {
     /// Writes the error, then what Prosody does next.
-    fn describe(&self, event: Event, layer: Layer) -> impl Display {
+    fn describe(&self, event: Event) -> impl Display {
         fmt::from_fn(move |f| {
             let Self {
                 attempt,
                 error,
                 next,
+                layer,
             } = self;
-            write!(f, "The handler failed for this {event}: {error:#}. ")?;
+            write!(f, "Prosody cannot process this {event}: {error:#}. ")?;
             match (next, layer, event) {
                 (Next::Retry(delay), ..) => {
                     write!(f, "Prosody retries in {}.", format_duration(*delay))
                 }
-                (_, Layer::Inner, _) => write!(
+                (_, Layer::Inner { .. }, _) => write!(
                     f,
                     "Prosody stops after {attempt} attempts and returns the error to the outer \
                      middleware."
@@ -153,10 +157,9 @@ impl<T> RetryHandler<T> {
     /// returns a [`Resolution`] describing how the **final attempt** should
     /// be handled by the outer layer.
     ///
-    /// `max_retries = None` means retry transient errors forever; used at the
-    /// outermost layer where there is no fallback. `max_retries = Some(n)`
-    /// caps transient retries at `n`, after which the call resolves to
-    /// `Commit(Err)` so an outer DLQ middleware can take over.
+    /// The [`Layer`] sets the retry limit. An inner layer resolves to
+    /// `Commit(Err)` after its last retry, so an outer DLQ middleware can take
+    /// over.
     ///
     /// **Apply-hook responsibility split:**
     ///
@@ -175,7 +178,7 @@ impl<T> RetryHandler<T> {
         &self,
         context: C,
         demand_type: DemandType,
-        max_retries: Option<u32>,
+        layer: Layer<'_>,
         mut invoke: F,
         mut apply_abort: A,
         log: impl Fn(&Failure<'_, E>),
@@ -203,21 +206,22 @@ impl<T> RetryHandler<T> {
                 Err(error) => error,
             };
 
-            // Only abort on shutdown. Message cancellation is treated as
-            // transient. Shutdown returns Abort *without* firing apply_abort
-            // here — the outer layer will fire the inner's after_abort exactly
-            // once for this final attempt.
+            // Only abort on shutdown. Message cancellation is treated as transient.
+            // Shutdown returns Abort *without* firing apply_abort here — the
+            // outer layer will fire the inner's after_abort exactly once for
+            // this final attempt.
             if current.is_shutdown() {
                 return (Resolution::Abort(error), current);
             }
 
             match error.classify_error() {
                 ErrorCategory::Transient => {
-                    if matches!(max_retries, Some(max) if attempt > max) {
+                    if matches!(layer, Layer::Inner { max_retries } if attempt > max_retries) {
                         log(&Failure {
                             attempt,
                             error: &error,
                             next: Next::GiveUp,
+                            layer,
                         });
                         // Final attempt: outer layer fires the apply hook.
                         return (Resolution::Commit(Err(error)), current);
@@ -227,6 +231,7 @@ impl<T> RetryHandler<T> {
                         attempt,
                         error: &error,
                         next: Next::Retry(sleep_time),
+                        layer,
                     });
                     // Sleep BEFORE firing the per-attempt apply hook. If
                     // shutdown intervenes during the sleep, this attempt
@@ -238,10 +243,10 @@ impl<T> RetryHandler<T> {
                     {
                         return (Resolution::Abort(error), current);
                     }
-                    // Attempt boundary, verb-then-hook ordering: clone the
-                    // stale view, run `next_attempt` (which discards this
-                    // attempt's dirty overlay + bumps the epoch under the gate,
-                    // then returns the re-pinned N+1 view), THEN fire the
+                    // Attempt boundary, verb-then-hook ordering: clone the stale
+                    // view, run `next_attempt` (which discards this attempt's
+                    // dirty overlay + bumps the epoch under the gate, then
+                    // returns the re-pinned N+1 view), THEN fire the
                     // intermediate `after_abort` with the now-EXPIRED clone.
                     // The expired clone is pinned at attempt N while the epoch
                     // is now N+1, so it is state-dead by construction: a
@@ -260,6 +265,7 @@ impl<T> RetryHandler<T> {
                         attempt,
                         error: &error,
                         next: Next::Skip,
+                        layer,
                     });
                     return (Resolution::Commit(Err(error)), current);
                 }
@@ -268,6 +274,7 @@ impl<T> RetryHandler<T> {
                         attempt,
                         error: &error,
                         next: Next::Abort,
+                        layer,
                     });
                     return (Resolution::Abort(error), current);
                 }
@@ -281,29 +288,23 @@ impl<T> RetryHandler<T> {
         key: &str,
         offset: Offset,
         failure: &Failure<'_, E>,
-        layer: Layer,
     ) {
         log_at!(
-            failure.level(layer),
+            failure.level(),
             topic = %self.topic,
             partition = self.partition,
             key,
             offset,
             attempt = failure.attempt,
             "{}",
-            failure.describe(Event::Message, layer)
+            failure.describe(Event::Message)
         );
     }
 
     /// Logs a failed timer attempt.
-    pub(super) fn log_timer<E: Display>(
-        &self,
-        trigger: &Trigger,
-        failure: &Failure<'_, E>,
-        layer: Layer,
-    ) {
+    pub(super) fn log_timer<E: Display>(&self, trigger: &Trigger, failure: &Failure<'_, E>) {
         log_at!(
-            failure.level(layer),
+            failure.level(),
             topic = %self.topic,
             partition = self.partition,
             key = %trigger.key,
@@ -311,7 +312,7 @@ impl<T> RetryHandler<T> {
             timer_type = ?trigger.timer_type,
             attempt = failure.attempt,
             "{}",
-            failure.describe(Event::Timer, layer)
+            failure.describe(Event::Timer)
         );
     }
 }

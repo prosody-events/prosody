@@ -24,13 +24,10 @@ async fn process_record<T, C, Q, F, Fut>(
         .run(
             context,
             demand_type,
-            None,
+            Layer::Outermost(&handler.aborts.message),
             |ctx, dt| dispatch(ctx, message.clone(), dt),
             |ctx, error| handler.handler.after_abort(ctx, Err(error)),
-            |failure| {
-                let layer = Layer::Outermost(&handler.aborts);
-                handler.log_message(message.key(), offset, failure, layer);
-            },
+            |failure| handler.log_message(message.key(), offset, failure),
         )
         .await;
     finish(handler, final_ctx, uncommitted, resolution).await;
@@ -105,10 +102,10 @@ where
             .run(
                 context,
                 demand_type,
-                None,
+                Layer::Outermost(&self.aborts.timer),
                 |ctx, dt| self.handler.on_timer(ctx, trigger.clone(), dt),
                 |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |failure| self.log_timer(&trigger, failure, Layer::Outermost(&self.aborts)),
+                |failure| self.log_timer(&trigger, failure),
             )
             .await;
 

@@ -97,17 +97,17 @@ where
             let id = &id;
             // Read each surviving cell's committed base in per-section batches.
             // `lower` is the pre-overlay store.
-            // The committed projection of a cell this event staged is its
-            // `prev`. Thus, a retry re-stages over the same base (idempotent).
-            // A `Set` cell in a cleared section keeps its committed pre-clear
-            // `prev` this way.
+            // The committed projection of a cell this event staged is its `prev`.
+            // Thus, a retry re-stages over the same base (idempotent).
+            // A `Set` cell in a cleared section keeps its committed pre-clear `prev` this
+            // way.
 
-            // `cooperative` adds a yield point per batch. `buffered` preserves
-            // order and bounds concurrency; order is inert here because marker
-            // and clear freezing sort internally and settle is row-disjoint.
-            // Drop cells that a section clear subsumes first, so the batch
-            // stays row-disjoint. Size the buffer once from the pre-filter
-            // snapshot; the filter can only shrink it.
+            // `cooperative` adds a yield point per batch. `buffered` preserves order and
+            // bounds concurrency; order is inert here because marker and clear
+            // freezing sort internally and settle is row-disjoint. Drop cells that a
+            // section clear subsumes first, so the batch stays row-disjoint.
+            // Size the buffer once from the pre-filter snapshot; the filter can only
+            // shrink it.
             let capacity = cells.len();
             let survivors = cells
                 .into_iter()
@@ -246,9 +246,9 @@ pub(super) async fn abort_stages<S: CellStore>(
 pub(super) async fn resolve_collections<S: CellStore>(
     store: &S,
     collections: Vec<StagedCollection>,
+    alert: &RetryAlert,
     shutdown: &(impl Fn() -> bool + Sync),
 ) -> Vec<StagedCollection> {
-    let alert = &RetryAlert::default();
     stream::iter(collections)
         .map(|staged| {
             cooperative(async move {
@@ -286,9 +286,9 @@ pub(super) async fn resolve_collections<S: CellStore>(
 pub(super) async fn abort_collections<S: CellStore>(
     store: &S,
     collections: &[StagedCollection],
+    alert: &RetryAlert,
     shutdown: &(impl Fn() -> bool + Sync),
 ) -> bool {
-    let alert = &RetryAlert::default();
     // Indices keep the closure free of a higher-ranked borrow.
     stream::iter(0..collections.len())
         .map(|index| {

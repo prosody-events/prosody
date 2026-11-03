@@ -35,6 +35,7 @@ use super::support::assert_no_settlement_residue;
 use crate::codec::{Codec, JsonCodec};
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::partition::ShutdownPhase;
+use crate::error::RetryAlert;
 use crate::loader::MemoryLoader;
 use crate::state::KeyQuery;
 use crate::state::cell::Values;
@@ -200,7 +201,10 @@ async fn resolve_event(
     match outcome {
         Outcome::Commit => {
             if let Finalized::Staged(staged) = finalized
-                && !matches!(staged.promote(|| false).await, Promoted::Complete)
+                && !matches!(
+                    staged.promote(&RetryAlert::default(), || false).await,
+                    Promoted::Complete
+                )
             {
                 return Err(eyre!("promote incomplete on a healthy store"));
             }
@@ -261,7 +265,10 @@ where
         .await
         .map_err(|e| eyre!("marker: {e}"))?;
     if let Finalized::Staged(staged) = finalized {
-        if !matches!(staged.promote(|| false).await, Promoted::Complete) {
+        if !matches!(
+            staged.promote(&RetryAlert::default(), || false).await,
+            Promoted::Complete
+        ) {
             bail!("promote incomplete on a healthy store");
         }
         assert_no_settlement_residue(cells, collection)?;

@@ -135,8 +135,7 @@ impl<'a> CassandraMigrator<'a> {
 
         ensure_migration_tables_exist(session, keyspace).await?;
 
-        // Tables may not immediately be available after creation, so retry with
-        // a limit
+        // Tables may not immediately be available after creation, so retry with a limit
         for attempt in 0..MAX_TABLE_PREPARATION_RETRIES {
             if let Ok(lock_manager) = LockManager::new(session, keyspace).await {
                 let executor = MigrationExecutor::new(session);
@@ -214,8 +213,7 @@ impl<'a> CassandraMigrator<'a> {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     if attempt >= MAX_MIGRATION_RETRIES {
-                        // Final attempt failed - do one last check before
-                        // giving up
+                        // Final attempt failed - do one last check before giving up
                         if !self.has_pending_migrations().await? {
                             return Ok(());
                         }
@@ -267,8 +265,7 @@ impl<'a> CassandraMigrator<'a> {
 
     /// Applies pending migrations.
     async fn apply_pending_migrations(&self) -> Result<(), CassandraStoreError> {
-        // Re-check for pending migrations (another process might have completed
-        // them)
+        // Re-check for pending migrations (another process might have completed them)
         debug!("Re-checking for pending migrations while holding lock");
         let pending_migrations = self.get_pending_migrations(self.keyspace).await?;
 
@@ -493,24 +490,21 @@ impl From<TypeCheckError> for MigrationError {
 impl ClassifyError for MigrationError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            // Metadata refresh failed, lock acquisition failed, statement
-            // execution failed, database query execution failed, or lock result
-            // row extraction failed. All represent transient network/cluster
-            // state that may resolve on retry.
+            // Metadata refresh failed, lock acquisition failed, statement execution failed,
+            // database query execution failed, or lock result row extraction failed. All
+            // represent transient network/cluster state that may resolve on retry.
             Self::MetadataRefreshFailed(_)
             | Self::LockAcquisitionFailed
             | Self::StatementExecutionFailed { .. }
             | Self::ExecutionError(_)
             | Self::LockResultFirstRowFailed(_) => ErrorCategory::Transient,
 
-            // Keyspace not found, migration file load failed, invalid UTF-8,
-            // invalid filename format, invalid timestamp, checksum mismatch,
-            // lock preparation failed, lock statement preparation failed,
-            // migration tracking preparation failed, applied migrations
-            // preparation failed, lock result parsing failed, or applied
-            // migrations parsing failed. All represent configuration,
-            // build/packaging, or setup issues that are not recoverable at
-            // runtime.
+            // Keyspace not found, migration file load failed, invalid UTF-8, invalid filename
+            // format, invalid timestamp, checksum mismatch, lock preparation failed, lock
+            // statement preparation failed, migration tracking preparation failed, applied
+            // migrations preparation failed, lock result parsing failed, or applied migrations
+            // parsing failed. All represent configuration, build/packaging, or setup issues
+            // that are not recoverable at runtime.
             Self::KeyspaceNotFound
             | Self::MigrationFileLoadFailed(_)
             | Self::InvalidUtf8 { .. }

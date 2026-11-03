@@ -158,6 +158,15 @@ pub struct RetryProvider<T> {
     config: RetryConfiguration,
 }
 
+/// The `Terminal` abort alerts of one partition. A message abort holds the
+/// partition's offsets and a timer abort does not, so each kind has its own
+/// alert.
+#[derive(Debug, Default)]
+struct Aborts {
+    message: RetryAlert,
+    timer: RetryAlert,
+}
+
 /// A handler wrapped with retry functionality.
 #[derive(Clone, Debug)]
 pub struct RetryHandler<T> {
@@ -166,8 +175,8 @@ pub struct RetryHandler<T> {
     max_retries: u32,
     topic: Topic,
     partition: Partition,
-    /// The partition's `Terminal` abort alert. Every clone shares it.
-    aborts: Arc<RetryAlert>,
+    /// The partition's `Terminal` abort alerts. Every clone shares them.
+    aborts: Arc<Aborts>,
     handler: T,
 }
 
@@ -206,10 +215,12 @@ where
             .run(
                 context,
                 demand_type,
-                Some(self.max_retries),
+                Layer::Inner {
+                    max_retries: self.max_retries,
+                },
                 |ctx, dt| H::call(&self.handler, ctx, message.clone(), dt),
                 |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |failure| self.log_message(key, offset, failure, Layer::Inner),
+                |failure| self.log_message(key, offset, failure),
             )
             .await;
         match resolution {
@@ -366,10 +377,12 @@ where
             .run(
                 context,
                 demand_type,
-                Some(self.max_retries),
+                Layer::Inner {
+                    max_retries: self.max_retries,
+                },
                 |ctx, dt| self.handler.on_timer(ctx, timer.clone(), dt),
                 |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |failure| self.log_timer(&timer, failure, Layer::Inner),
+                |failure| self.log_timer(&timer, failure),
             )
             .await;
         match resolution {
