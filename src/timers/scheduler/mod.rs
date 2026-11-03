@@ -133,6 +133,9 @@ pub(crate) struct Inserted<E> {
 pub(crate) struct Ticket<E> {
     change: Option<Change>,
     outcome: Outcome,
+    /// The actor makes each ticket, so the reply holds an end even if the
+    /// caller drops it unread. The sender is weak, so that tickets do not keep
+    /// the actor's command channel open after every handle drops.
     commands: WeakUnboundedSender<Command<E>>,
 }
 

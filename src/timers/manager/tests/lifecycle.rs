@@ -11,7 +11,7 @@ use crate::timers::test_support::{Memory, Step, after, setup_timer_manager_with_
 use crate::timers::uncommitted::UncommittedTriggerGuard;
 use crate::timers::{PendingTimer, TimerRequest, TimerType, UncommittedTimer};
 use color_eyre::eyre::{OptionExt, Result, ensure};
-use futures::{Stream, pin_mut};
+use futures::Stream;
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use strum::VariantArray;
 use tokio::runtime::Builder;
@@ -28,25 +28,26 @@ impl Arbitrary for Step {
 /// as the model predicts. A schedule reports a timer that was not scheduled,
 /// and an unschedule reports a timer whose delivery does not run. A fire
 /// happens only while an attempt waits, and a commit or abort only during a
-/// delivery.
+/// delivery. At the end, a waiting attempt fires. After a restart, every timer
+/// with a row fires.
 #[test]
 fn prop_lifecycle_follows_the_model() {
-    fn property(steps: Vec<Step>) -> Result<()> {
+    fn property(steps: Vec<Step>, restart: bool) -> Result<()> {
         Builder::new_current_thread()
             .enable_all()
             .build()?
-            .block_on(run(steps))
+            .block_on(run(steps, restart))
     }
-    QuickCheck::new().quickcheck(property as fn(Vec<Step>) -> Result<()>);
+    QuickCheck::new().quickcheck(property as fn(Vec<Step>, bool) -> Result<()>);
 }
 
-async fn run(steps: Vec<Step>) -> Result<()> {
+async fn run(steps: Vec<Step>, restart: bool) -> Result<()> {
     let (store, now) = seeded_store(true).await?;
     let telemetry = Telemetry::new();
     let mut events = telemetry.subscribe();
-    let (stream, manager, _shutdown) =
-        setup_timer_manager_with_store(store, ShutdownPhase::default(), &telemetry).await?;
-    pin_mut!(stream);
+    let (stream, manager, shutdown) =
+        setup_timer_manager_with_store(store.clone(), ShutdownPhase::default(), &telemetry).await?;
+    let mut stream = Box::pin(stream);
     let key = Key::from("lifecycle");
     let (time, timer_type) = (past(now), TimerType::Application);
     let mut model = None;
@@ -105,8 +106,28 @@ async fn run(steps: Vec<Step>) -> Result<()> {
         );
     }
 
+    // A delivery that the partition loses aborts. A restart loads every row
+    // that stays, but without one only a waiting attempt fires.
     if let Some(guard) = delivery {
         guard.abort().await;
+        model = after(model, Step::Abort);
+    }
+    let _restarted = if restart {
+        drop((stream, manager, shutdown));
+        let (restarted, manager, shutdown) =
+            setup_timer_manager_with_store(store, ShutdownPhase::default(), &telemetry).await?;
+        stream = Box::pin(restarted);
+        Some((manager, shutdown))
+    } else {
+        None
+    };
+    let fires = if restart {
+        model.is_some()
+    } else {
+        model == Some(Memory::Waits)
+    };
+    if fires {
+        fire(&mut stream, &key, time).await?.commit().await;
     }
     Ok(())
 }
