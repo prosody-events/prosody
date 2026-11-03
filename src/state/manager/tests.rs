@@ -15,6 +15,7 @@ use crate::state::store::CellRead;
 use crate::state::tests::support::listed;
 use crate::state::tests::support::{MemoryDeduplicationStore, evidence, run_admit_soundness};
 use crate::state::{CollectionId, CollectionRef, StateName, StateType};
+use crate::telemetry::Telemetry;
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::Trigger;
 use crate::timers::store::adapter::TableAdapter;
@@ -76,9 +77,12 @@ async fn legacy_and_timer_residue(value: u8, mode: u8) -> Result<bool> {
         (),
     );
     let timer_store = memory_store(test_segment("admit", 300_u32));
-    let (stream, timers, shutdown) =
-        setup_timer_manager_with_store(timer_store.clone(), ShutdownPhase::default()).await?;
-    let _stream = stream;
+    let (_stream, timers, shutdown) = setup_timer_manager_with_store(
+        timer_store.clone(),
+        ShutdownPhase::default(),
+        &Telemetry::new(),
+    )
+    .await?;
     let time = CompactDateTime::now()?.add_duration(CompactDuration::new(30))?;
     let trigger = Trigger::with_tag(
         key.key.clone(),
@@ -130,11 +134,7 @@ async fn legacy_and_timer_residue(value: u8, mode: u8) -> Result<bool> {
     );
     ensure!(checks.contains(&key.key).await?);
     ensure!(store.marker_state(collection.id()).await?.staged.is_none());
-    let expected = bytes(if committed {
-        value
-    } else {
-        value.wrapping_add(1)
-    });
+    let expected = bytes(value.wrapping_add(u8::from(!committed)));
     ensure!(
         CellRead::<Values>::read(&store, collection.id(), value_cell().as_ref())
             .await?
@@ -403,7 +403,7 @@ async fn retire_timer_residue(
     use color_eyre::eyre::ensure;
     use uuid::Uuid;
     let retire_replacement = value & 1 != 0;
-    retirement_trace(
+    Box::pin(retirement_trace(
         mode,
         i32::from(value),
         retire_replacement,
@@ -436,7 +436,7 @@ async fn retire_timer_residue(
             ensure!(manager.admit(key.key, &timers, &shutdown).await == Admission::Fresh);
             Ok(())
         },
-    )
+    ))
     .await?;
     Ok(())
 }

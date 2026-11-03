@@ -3,10 +3,10 @@ use crate::timers::slab::Slab;
 use crate::timers::store::SegmentVersion;
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::InMemoryTriggerStore;
-use crate::timers::test_support::setup_timer_manager_with_store;
+use crate::timers::test_support::{Memory, Step, after, setup_timer_manager_with_store};
 use crate::timers::uncommitted::FiringTimer;
 use IdentityOp::{Abort, Clear, Commit, Fire, Schedule, Unschedule};
-use TimerState::{Aborted, Firing, FiringRescheduled, Scheduled};
+use Memory::{Firing, Waits};
 use tokio::sync::Semaphore;
 
 type MemoryStore = TableAdapter<InMemoryTriggerStore>;
@@ -27,7 +27,7 @@ struct IdentityHarness<S> {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct IdentityModel {
-    state: Option<TimerState>,
+    memory: Option<Memory>,
     tag: Option<i32>,
     row: Option<i32>,
 }
@@ -43,6 +43,16 @@ enum IdentityOp {
     Unschedule(usize),
     Commit,
     Abort,
+}
+
+impl IdentityModel {
+    /// Removes the timer. A delivery that runs keeps its row and identity.
+    fn unschedule(&mut self) {
+        self.memory = after(self.memory, Step::Unschedule);
+        if self.memory.is_none() {
+            *self = Self::default();
+        }
+    }
 }
 
 impl Arbitrary for IdentityTrace {
@@ -88,12 +98,7 @@ where
                 self.manager
                     .unschedule(&self.key, self.times[index], TimerType::Application)
                     .await?;
-                let model = &mut self.models[index];
-                match model.state {
-                    Some(FiringRescheduled) => model.state = Some(Firing),
-                    Some(Firing) => {}
-                    _ => *model = IdentityModel::default(),
-                }
+                self.models[index].unschedule();
             }
             Fire(_) => {}
         }
@@ -111,11 +116,7 @@ where
             self.manager.clear_and_schedule(request).await?;
             let other = &mut self.models[1 - index];
             if other.row.take().is_some() {
-                if matches!(other.state, Some(Firing | FiringRescheduled)) {
-                    other.state = Some(Firing);
-                } else {
-                    *other = IdentityModel::default();
-                }
+                other.unschedule();
             }
         } else {
             self.manager.schedule(request).await?;
@@ -128,7 +129,7 @@ where
             .current_trigger(&self.key, self.times[index], TimerType::Application)
             .await?
             .ok_or_else(|| eyre!("schedule has no durable row"))?;
-        if matches!(model.state, Some(Scheduled | FiringRescheduled)) {
+        if matches!(model.memory, Some(Waits | Firing { again: true })) {
             assert_eq!(
                 Some(written.tag),
                 model.tag,
@@ -141,11 +142,7 @@ where
                 written.tag
             );
             model.tag = Some(written.tag);
-            model.state = Some(if model.state == Some(Firing) {
-                FiringRescheduled
-            } else {
-                Scheduled
-            });
+            model.memory = after(model.memory, Step::Schedule);
         }
         model.row = Some(written.tag);
         Ok(())
@@ -153,7 +150,7 @@ where
 
     async fn fire(&mut self, index: usize) -> Result<()> {
         let model = self.models[index];
-        let pending = if model.state == Some(Scheduled) {
+        let pending = if model.memory == Some(Waits) {
             let tag = model
                 .tag
                 .ok_or_else(|| eyre!("a queued attempt has a tag"))?;
@@ -174,10 +171,10 @@ where
             )
         };
         let firing = pending.fire().await;
-        assert_eq!(firing.is_some(), model.state == Some(Scheduled));
+        assert_eq!(firing.is_some(), model.memory == Some(Waits));
         if let Some(firing) = firing {
             assert_eq!(Some(firing.trigger().tag), model.tag);
-            self.models[index].state = Some(Firing);
+            self.models[index].memory = after(model.memory, Step::Fire);
             self.delivered = Some((index, firing));
         }
         Ok(())
@@ -194,9 +191,7 @@ where
             {
                 return Ok(pending);
             }
-            let pending = timeout(Duration::from_secs(5), self.stream.next())
-                .await?
-                .ok_or_else(|| eyre!("timer stream ended"))?;
+            let pending = next_pending(&mut self.stream).await?;
             let slot = self
                 .times
                 .iter()
@@ -210,13 +205,15 @@ where
         if let Some((index, firing)) = self.delivered.take() {
             let model = &mut self.models[index];
             let old = firing.trigger().clone();
-            if matches!(op, Commit) {
+            let step = if matches!(op, Commit) {
                 firing.commit().await;
+                Step::Commit
             } else {
                 firing.abort().await;
-            }
-            if model.state == Some(FiringRescheduled) {
-                model.state = Some(Scheduled);
+                Step::Abort
+            };
+            model.memory = after(model.memory, step);
+            if model.memory == Some(Waits) {
                 // A stale delivery must not dispatch the queued replacement.
                 let pending = PendingTimer::new(
                     old,
@@ -224,33 +221,34 @@ where
                     self.permits.clone().acquire_owned().await?,
                 );
                 assert!(pending.fire().await.is_none());
-            } else if matches!(op, Commit) {
+            } else if model.memory.is_none() || model.row.is_none() {
+                // A clear that deleted the row leaves an abort nothing to keep.
                 *model = IdentityModel::default();
-            } else {
-                model.state = Some(Aborted);
             }
         }
         Ok(())
     }
 
     async fn check(&self, op: IdentityOp) -> Result<()> {
+        let held = self.models.iter().filter(|model| model.memory.is_some());
+        let entries = self.manager.snapshot().await?.active;
+        assert_eq!(
+            usize::try_from(entries)?,
+            held.count(),
+            "entries after {op:?}"
+        );
         for (index, model) in self.models.iter().enumerate() {
-            let active = self
-                .manager
-                .0
-                .scheduler
-                .active_triggers()
-                .get(&self.key, self.times[index], TimerType::Application)
-                .await;
+            let listed = listed(
+                &self.manager,
+                &self.key,
+                self.times[index],
+                TimerType::Application,
+            )
+            .await?;
             assert_eq!(
-                active.map(|entry| entry.state),
-                model.state,
-                "registry state after {op:?}"
-            );
-            assert_eq!(
-                active.map(|entry| entry.tag),
-                model.tag,
-                "registry identity after {op:?}"
+                listed,
+                model.memory.and_then(Memory::listed),
+                "memory after {op:?}"
             );
             let row = self
                 .manager
@@ -287,32 +285,22 @@ where
 }
 
 /// A queued attempt keeps one identity through dispatch and completion.
-/// New schedules use a different identity in the registry and both indexes.
+/// New schedules use a different identity in memory and both indexes.
 #[test]
 fn prop_queued_attempt_identity() {
-    QuickCheck::new()
-        .quickcheck(prop_queued_attempt_identity_inner as fn(IdentityTrace) -> TestResult);
-}
-
-fn prop_queued_attempt_identity_inner(trace: IdentityTrace) -> TestResult {
-    let runtime = match Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => return TestResult::error(format!("runtime build failed: {error}")),
-    };
-    runtime.block_on(async {
-        match run_identity_trace(trace).await {
-            Ok(()) => TestResult::passed(),
-            Err(error) => TestResult::error(format!("{error:?}")),
-        }
-    })
+    fn property(trace: IdentityTrace) -> Result<()> {
+        Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()?
+            .block_on(run_identity_trace(trace))
+    }
+    QuickCheck::new().quickcheck(property as fn(IdentityTrace) -> Result<()>);
 }
 
 async fn run_identity_trace(trace: IdentityTrace) -> Result<()> {
-    // Seed the old layout directly. The loader must preserve its stored identity.
+    // Seed the old layout directly. The loader must preserve its stored
+    // identity.
     let mut segment = test_segment("identity", 300_u32);
     segment.version = SegmentVersion::V3;
     let store = memory_store(segment);
@@ -330,7 +318,7 @@ async fn run_identity_trace(trace: IdentityTrace) -> Result<()> {
         .insert_slab(Slab::from_time(store.slab_size(), loaded.time))
         .await?;
     let (stream, manager, _shutdown_tx) =
-        setup_timer_manager_with_store(store, ShutdownPhase::default()).await?;
+        setup_timer_manager_with_store(store, ShutdownPhase::default(), &Telemetry::new()).await?;
     pin_mut!(stream);
     check_loaded_identity(&manager, &mut stream, &loaded).await?;
 

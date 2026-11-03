@@ -40,7 +40,7 @@ async fn repaired_dispatch(poisoned: bool) -> Result<()> {
     let id = dedup_uuid_for_message(identity, &message);
     let message = message.into_uncommitted(tracker.take(0).await?);
     let handler = ProbeHandler::ok(0);
-    process_event(
+    Box::pin(process_event(
         UncommittedEvent::Message(message),
         &handler,
         &shutdown.subscribe(),
@@ -48,7 +48,7 @@ async fn repaired_dispatch(poisoned: bool) -> Result<()> {
         &manager,
         identity,
         SpanRelation::default(),
-    )
+    ))
     .await;
     ensure!(
         handler.log.lock().len() == 2,
@@ -79,7 +79,7 @@ fn prop_admit_dispatch_soundness() {
                     .sum())
             };
             let before = count()?;
-            repaired_dispatch(poisoned).await?;
+            Box::pin(repaired_dispatch(poisoned)).await?;
             ensure!(
                 count()? - before == i64::from(poisoned),
                 "corrupt marker repair did not increment its counter"

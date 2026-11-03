@@ -14,6 +14,7 @@ use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, StoredSegment, TriggerStore};
 use futures::{Stream, StreamExt, TryStreamExt, stream};
+use smallvec::SmallVec;
 use std::future::Future;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -198,7 +199,10 @@ where
     }
 
     #[instrument(level = "debug", skip(self, trigger), err(level = "warn"))]
-    async fn clear_and_schedule(&self, trigger: Trigger) -> Result<(), Self::Error> {
+    async fn clear_and_schedule(
+        &self,
+        trigger: Trigger,
+    ) -> Result<SmallVec<[CompactDateTime; 1]>, Self::Error> {
         // INVARIANT (at-least-once delivery): Write new timer FIRST, then
         // delete old entries. If crash occurs after writing new but before
         // deleting old, both timers exist (may fire twice). If we deleted
@@ -265,6 +269,6 @@ where
             "clear_and_schedule: complete"
         );
 
-        Ok(())
+        Ok(old_times)
     }
 }
