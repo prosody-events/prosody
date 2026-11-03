@@ -371,11 +371,15 @@ pub(super) async fn verify_key_state_invariant(
                     ));
                 }
 
-                // For singleton normalization: the clustering row must have been
-                // deleted — the trigger lives exclusively in the state MAP now.
-                let clustering_rows = store
-                    .operations()
-                    .peek_trigger_times(&model.segment.id, key, *timer_type)
+                // For singleton normalization: the clustering row must have
+                // been deleted — the trigger lives exclusively
+                // in the state MAP now.
+                let operations = store.operations();
+                let clustering_rows = operations
+                    .peek_key_triggers(
+                        &operations.queries().peek_last_key_triggers,
+                        (&model.segment.id, key.as_ref(), *timer_type),
+                    )
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Failed to count clustering rows: {e:?}")

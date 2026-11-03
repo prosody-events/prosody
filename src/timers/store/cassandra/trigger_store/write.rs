@@ -11,7 +11,7 @@ use crate::timers::store::cassandra::state::{ClusteringEntry, InlineTimer, Timer
 use crate::timers::{TimerType, Trigger, TriggerId};
 use futures::{
     TryStreamExt,
-    future::{join_all, ready},
+    future::{join_all, ready, try_join},
 };
 use opentelemetry::propagation::TextMapCompositePropagator;
 use smallvec::SmallVec;
@@ -22,7 +22,7 @@ use tracing::{Span, instrument};
 
 /// Upserts a trigger into the key index with state-aware transitions.
 ///
-/// Uses `resolve_state` (cache-first, warms all types on miss):
+/// Uses `resolve_state` (cache-first):
 /// - **Inline(old)**: Promote old timer to clustering + write new to clustering
 ///   + set overflow state → `Overflow`
 /// - **Overflow**: Write clustering only (1 query) → stays `Overflow`
@@ -51,15 +51,17 @@ pub(super) async fn upsert(
 /// Deletes a specific trigger from the key index with state-aware
 /// demotion.
 ///
-/// Uses `resolve_state` (cache-first, warms all types on miss):
+/// Uses `resolve_state` (cache-first):
 /// - **Inline(timer), time matches**: Remove state entry → `Absent`
 /// - **Inline(timer), time mismatch**: No-op (Inline guarantees zero clustering
 ///   rows) → stays `Inline`
-/// - **Overflow**: One pre-delete read (LIMIT 3) drives a single atomic batch:
-///   - 0 surviving rows → batch DELETE target + DELETE `state[type]` → `Absent`
-///   - 1 surviving row → batch DELETE target + DELETE survivor + UPDATE state
-///     Inline → `Inline(survivor)`
-///   - 2+ surviving rows → single DELETE target → stays `Overflow`
+/// - **Overflow**: Two concurrent reads find the nearest live rows on each side
+///   of the target. They drive a single write:
+///   - 0 surviving rows → clear the type → `Absent`
+///   - 1 surviving row → clear the type and write the survivor inline →
+///     `Inline(survivor)`
+///   - 2+ surviving rows → range-delete the [`gap`] that holds the target →
+///     stays `Overflow`
 /// - **Absent**: No-op (post-V3 Absent is unambiguous: 0 timers, no rows)
 #[instrument(name = "delete_key_trigger", level = "debug", skip(store), fields(state_cached = Empty), err(level = "warn"))]
 pub(super) async fn delete(
@@ -76,67 +78,49 @@ pub(super) async fn delete(
     let mut guard = handle.lock().await;
     match &*guard {
         TimerState::Inline(timer) if timer.time == time => {
-            // Inline timer matches the delete target → remove state, become Absent.
-            // No clustering row exists for inline timers, so only remove state.
+            // Inline timer matches the delete target → remove state, become
+            // Absent. No clustering row exists for inline timers,
+            // so only remove state.
             store
                 .remove_state_entry(&segment_id, key, timer_type)
                 .await?;
             *guard = TimerState::Absent;
         }
         TimerState::Overflow => {
-            // Read pre-delete clustering rows (LIMIT 3) in one round-trip.
-            // After filtering the target out, the survivor count drives
-            // the post-delete state — and any survivor's data is already
-            // in hand to feed straight into the atomic write batch below.
-            let triggers = store
-                .peek_three_key_triggers(&segment_id, key, timer_type)
-                .await?;
-            let mut survivors = triggers.into_iter().filter(|(t, ..)| *t != time);
+            let queries = store.queries();
+            let values = (&segment_id, key.as_ref(), timer_type, time);
+            let (below, above) = try_join(
+                store.peek_key_triggers(&queries.peek_key_triggers_before, values),
+                store.peek_key_triggers(&queries.peek_key_triggers_after, values),
+            )
+            .await?;
+            let (start, end) = gap(&below, &above);
+            let mut survivors = below.into_iter().chain(above);
 
-            match (survivors.next(), survivors.next()) {
+            *guard = match (survivors.next(), survivors.next()) {
                 (None, _) => {
-                    // No survivor → atomic DELETE target + DELETE state[type].
                     store
-                        .batch_delete_to_absent(&segment_id, key, timer_type, time)
+                        .batch_clear_key_triggers(&segment_id, key, timer_type)
                         .await?;
-                    *guard = TimerState::Absent;
+                    TimerState::Absent
                 }
-                (Some((survivor_time, span_map, tag_opt)), None) => {
-                    // Exactly one survivor → atomic DELETE target +
-                    // DELETE survivor's clustering row + UPDATE state
-                    // Inline(survivor). Heals any cross-process drift
-                    // (e.g. cache says Overflow but DB has only the
-                    // survivor) by promoting the survivor to Inline.
-                    let new_state = TimerState::Inline(InlineTimer {
-                        time: survivor_time,
-                        span: span_map,
-                        tag: tag_opt.unwrap_or(0_i32),
-                    });
+                (Some(survivor), None) => {
+                    let state = TimerState::Inline(survivor);
                     store
-                        .batch_delete_to_inline(
-                            &segment_id,
-                            key,
-                            timer_type,
-                            time,
-                            survivor_time,
-                            &new_state,
-                        )
+                        .batch_clear_and_set_inline(&segment_id, key, timer_type, &state)
                         .await?;
-                    *guard = new_state;
+                    state
                 }
                 (Some(_), Some(_)) => {
-                    // 2+ survivors → state stays Overflow, just delete
-                    // the target row. Some target rows past clustering
-                    // position 3 won't appear in the LIMIT 3 read — the
-                    // DELETE is correct regardless (idempotent if absent).
                     store
                         .execute_unpaged_discard(
-                            &store.queries().delete_key_trigger,
-                            (&segment_id, key.as_ref(), timer_type, time),
+                            &queries.delete_key_triggers_within,
+                            (&segment_id, key.as_ref(), timer_type, start, end),
                         )
                         .await?;
+                    TimerState::Overflow
                 }
-            }
+            };
         }
         TimerState::Inline(_) | TimerState::Absent => {
             // Inline state guarantees zero clustering rows — nothing to
@@ -171,19 +155,8 @@ pub(super) async fn clear(
         return Ok(());
     }
 
-    // Atomic BATCH: clear clustering rows + remove state entry.
     store
-        .execute_unpaged_discard(
-            &store.queries().batch_clear_key_triggers,
-            (
-                &segment_id,
-                key.as_ref(),
-                timer_type,
-                timer_type,
-                &segment_id,
-                key.as_ref(),
-            ),
-        )
+        .batch_clear_key_triggers(&segment_id, key, timer_type)
         .await?;
 
     *guard = TimerState::Absent;
@@ -224,7 +197,8 @@ pub(super) async fn clear_and_schedule(
     let mut guard = handle.lock().await;
     let old_times: SmallVec<[CompactDateTime; 1]> = match &*guard {
         TimerState::Absent => {
-            // Fast path: no prior timer — plain UPDATE, no tombstone, no old times.
+            // Fast path: no prior timer — plain UPDATE, no tombstone, no old
+            // times.
             store
                 .set_state_inline(&segment_id, &trigger.key, trigger.timer_type, &new_state)
                 .await?;
@@ -232,7 +206,8 @@ pub(super) async fn clear_and_schedule(
         }
         TimerState::Inline(t) => {
             // Fast path: one prior timer already in the state column.
-            // Return its time (if distinct) so the adapter can clean the slab index.
+            // Return its time (if distinct) so the adapter can clean the slab
+            // index.
             let old_time = t.time;
             store
                 .set_state_inline(&segment_id, &trigger.key, trigger.timer_type, &new_state)
@@ -280,11 +255,10 @@ pub(super) async fn clear_all_types(
         return Ok(());
     }
 
-    // Atomic BATCH: clear all clustering rows + clear entire state column.
     store
         .execute_unpaged_discard(
-            &store.queries().batch_clear_key_triggers_all_types,
-            (&segment_id, key.as_ref(), &segment_id, key.as_ref()),
+            &store.queries().clear_key_triggers_all_types,
+            (&segment_id, key.as_ref()),
         )
         .await?;
 
@@ -444,4 +418,22 @@ impl KeyUpsertTransition {
             }
         }
     }
+}
+
+/// Returns the times strictly between a delete target's nearest live rows, as
+/// an inclusive range. `below` and `above` start with the nearest row on each
+/// side. The range holds the target and no live row, so one range tombstone
+/// deletes the target exactly. A side with no live row leaves the range open.
+///
+/// Cassandra orders times by their signed `int` encoding, so the range steps
+/// in that order. The nearest rows lie strictly across the target, so no bound
+/// saturates.
+fn gap(below: &[InlineTimer], above: &[InlineTimer]) -> (CompactDateTime, CompactDateTime) {
+    let start = below
+        .first()
+        .map_or(i32::MIN, |row| i32::from(row.time).saturating_add(1));
+    let end = above
+        .first()
+        .map_or(i32::MAX, |row| i32::from(row.time).saturating_sub(1));
+    (start.into(), end.into())
 }

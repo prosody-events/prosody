@@ -42,7 +42,7 @@ pub async fn run<T: TriggerStore>(
         .build();
     let g_in_flight: Gauge<u64> = meter
         .u64_gauge("prosody.timers.in_flight")
-        .with_description("Timers with handlers currently running (Firing | FiringRescheduled)")
+        .with_description("Timers whose delivery runs")
         .with_unit("{timer}")
         .build();
     let g_overdue: Gauge<u64> = meter
@@ -71,7 +71,7 @@ pub async fn run<T: TriggerStore>(
             _ = tick.tick() => {},
             _ = shutdown_rx.wait_for(|v| *v >= ShutdownPhase::Terminating) => break,
         }
-        if let Some(s) = timer_manager.snapshot().await {
+        if let Ok(s) = timer_manager.snapshot().await {
             record(s);
         }
     }
