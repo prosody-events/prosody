@@ -23,14 +23,16 @@
 //! persistent state for potential reloading.
 
 use crate::consumer::{Keyed, Uncommitted};
-use crate::error::{ClassifyError, RetryAlert};
+use crate::error::{ClassifyError, RetryAlert, log_at};
 use crate::otel::SpanRelation;
 use crate::related_span;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::TriggerTrace;
 use crate::timers::datetime::CompactDateTime;
+use crate::timers::error::TimerManagerError;
 use crate::timers::manager::TimerManager;
+use crate::timers::scheduler::TimerSchedulerError;
 use crate::timers::store::TriggerStore;
 use crate::{Key, ProcessScope};
 use arc_swap::ArcSwap;
@@ -40,7 +42,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::sleep;
-use tracing::{Level, Span, error, warn};
+use tracing::{Level, Span, warn};
 
 /// Delay between retry attempts when commits fail.
 const RETRY_DURATION: Duration = Duration::from_secs(1);
@@ -386,17 +388,20 @@ where
                 .await
             {
                 Ok(()) => break,
-                Err(error) => {
-                    // A schema fault or a corrupt trigger does not clear by
-                    // retry, and this key runs no events until it clears.
-                    if alert.alerts(error.classify_error()) {
-                        error!("failed to commit timer: {error:#}; retrying");
-                    } else {
-                        warn!("failed to commit timer: {error:#}; retrying");
-                    }
-                    sleep(RETRY_DURATION).await;
-                }
+                // The partition stopped. The stored timer fires again after
+                // the next assignment.
+                Err(TimerManagerError::Scheduler(TimerSchedulerError::Shutdown)) => return,
+                // A schema fault or a corrupt trigger does not clear by retry.
+                Err(error) => log_at!(
+                    alert.level(error.classify_error()),
+                    key = %self.key,
+                    fire_time = %self.time,
+                    timer_type = ?self.timer_type,
+                    "Prosody cannot delete a fired timer: {error:#}. Later events for this key \
+                     wait while Prosody retries every second."
+                ),
             }
+            sleep(RETRY_DURATION).await;
         }
 
         self.completed = true;

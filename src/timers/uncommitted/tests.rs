@@ -1,5 +1,6 @@
 use super::*;
 use crate::consumer::Uncommitted;
+use crate::consumer::partition::ShutdownPhase;
 use crate::related_span;
 use crate::test_util::{
     assert_span_relation, capture_events, captured_spans, captured_spans_filtered,
@@ -117,6 +118,32 @@ async fn test_firing_timer_commit() -> Result<()> {
         .await?;
     assert!(times.is_empty(), "Timer should be removed after commit");
 
+    Ok(())
+}
+
+/// A commit after the partition stops returns. It does not retry forever.
+#[tokio::test]
+async fn firing_timer_commit_returns_after_shutdown() -> Result<()> {
+    time::pause();
+
+    let (stream, manager, shutdown_tx) = setup_timer_manager().await?;
+    pin_mut!(stream);
+    let (_trigger, pending_timer) =
+        schedule_and_pop(&manager, &mut stream, "shutdown-commit").await?;
+    let firing_timer = pending_timer
+        .fire()
+        .await
+        .ok_or_else(|| eyre!("Expected fire() to return Some"))?;
+
+    // Let the scheduler actor see the phase and stop.
+    shutdown_tx.send_replace(ShutdownPhase::Cancelling);
+    for _ in 0_u32..8 {
+        task::yield_now().await;
+    }
+
+    // The deadline is a hang guard. A commit loop without a shutdown exit
+    // retries forever.
+    time::timeout(Duration::from_mins(1), firing_timer.commit()).await?;
     Ok(())
 }
 

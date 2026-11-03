@@ -5,11 +5,11 @@ use super::{Admission, StateManager};
 use crate::Key;
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::consumer::partition::ShutdownPhase;
-use crate::error::{ClassifyError, ErrorCategory, RetryAlert};
+use crate::error::{ClassifyError, RetryAlert};
 use crate::state::CommitDecision;
 use crate::state::marker::{EventMarker, MarkerState, MarkerVersion};
 use crate::state::resolve::resolve_event_marker;
-use crate::state::retry::{StepOutcome, retry_step};
+use crate::state::retry::{Step, StepOutcome, retry_step};
 use crate::state::store::CellStore;
 use crate::state::{
     CollectionId, CollectionRef, EventRef, STATE_FANOUT_CONCURRENCY, StateBackend, StateKey,
@@ -26,7 +26,6 @@ use std::future::Future;
 use std::sync::LazyLock;
 use tokio::sync::watch;
 use tokio::task::coop::cooperative;
-use tracing::error;
 use uuid::Uuid;
 
 /// Counts each marker read that admission skips after a permanent rejection.
@@ -73,11 +72,14 @@ where
                     let ttl = registry.ttl_for(kind, &name);
                     let id = CollectionId::new(state_key.clone(), kind, name);
                     cooperative(async move {
-                        let state =
-                            admission_step(cancelled, key, "marker state", Some(id.name()), || {
-                                self.inner.cell.marker_state(&id)
-                            })
-                            .await?;
+                        let state = admission_step(
+                            cancelled,
+                            key,
+                            "read a collection marker during admission",
+                            Some(id.name()),
+                            || self.inner.cell.marker_state(&id),
+                        )
+                        .await?;
                         // A corrupt marker cannot name cells for repair. Keep
                         // those cells unchanged.
                         let state = state.unwrap_or_else(|| {
@@ -239,20 +241,30 @@ where
 
         let marker = marker.for_admission(self.inner.dedup_ttl);
         let name = Some(collection.id().name());
-        let resolved = admission_step(cancelled, key, "marker resolve", name, || {
-            resolve_event_marker(&self.inner.cell, collection, &marker, decision)
-        })
+        let resolved = admission_step(
+            cancelled,
+            key,
+            "resolve a collection marker during admission",
+            name,
+            || resolve_event_marker(&self.inner.cell, collection, &marker, decision),
+        )
         .await?;
         if resolved.is_none() && decision == CommitDecision::Committed {
             ADMISSION_TORN.add(1, &[]);
-            admission_step(cancelled, key, "torn marker rollback", name, || {
-                resolve_event_marker(
-                    &self.inner.cell,
-                    collection,
-                    &marker,
-                    CommitDecision::NotCommitted,
-                )
-            })
+            admission_step(
+                cancelled,
+                key,
+                "roll back a partial commit during admission",
+                name,
+                || {
+                    resolve_event_marker(
+                        &self.inner.cell,
+                        collection,
+                        &marker,
+                        CommitDecision::NotCommitted,
+                    )
+                },
+            )
             .await?;
         }
         Ok(())
@@ -302,9 +314,13 @@ where
                     if let EventRef::Timer(timer) = other
                         && same_timer_coordinate(source, other)
                     {
-                        admission_step(cancelled, key, "timer retirement", None, || {
-                            timers.retire_committed(key, timer)
-                        })
+                        admission_step(
+                            cancelled,
+                            key,
+                            "retire a finished timer during admission",
+                            None,
+                            || timers.retire_committed(key, timer),
+                        )
                         .await?;
                     }
                 }
@@ -336,9 +352,13 @@ where
                 .await
             }
             EventRef::Timer(timer) => {
-                let tag = admission_step(cancelled, key, "legacy timer read", None, || {
-                    timers.current_timer_tag(key, timer.time, timer.timer_type)
-                })
+                let tag = admission_step(
+                    cancelled,
+                    key,
+                    "read a timer in the legacy format during admission",
+                    None,
+                    || timers.current_timer_tag(key, timer.time, timer.timer_type),
+                )
                 .await?;
                 Ok(tag.map(|tag| tag != Some(timer.tag)))
             }
@@ -372,41 +392,26 @@ fn retain_sources(sources: &mut SmallVec<[EventRef; 32]>, event: EventRef, dedup
     }
 }
 
-/// Retries one admission store operation. A permanent rejection logs the
-/// `step` label and, for a collection operation, the collection name.
+/// Retries one admission store operation. Its log events name the `step`
+/// action, the key, and, for a collection operation, the collection.
 pub(super) async fn admission_step<R, E, Fut>(
     cancelled: impl Fn() -> bool,
     key: &Key,
     step: &'static str,
     collection: Option<&StateName>,
-    mut operation: impl FnMut() -> Fut,
+    operation: impl FnMut() -> Fut,
 ) -> Result<Option<R>, Admission>
 where
     Fut: Future<Output = Result<R, E>>,
     E: ClassifyError + Error,
 {
-    let collection = collection.map(StateName::as_str);
-    let outcome = retry_step(
-        &RetryAlert::default(),
-        cancelled,
-        "keyed-state admission",
-        || {
-            let result = operation();
-            async move {
-                let result = result.await;
-                if let Err(error) = &result
-                    && error.classify_error() == ErrorCategory::Permanent
-                {
-                    error!(
-                        %error, %key, step, collection,
-                        "admission rejected store operation; continue with local repair"
-                    );
-                }
-                result
-            }
-        },
-    )
-    .await;
+    let step = Step {
+        action: step,
+        key: Some(key),
+        collection: collection.map(StateName::as_str),
+        on_rejection: "The store rejected the data, so admission continues without it.",
+    };
+    let outcome = retry_step(&RetryAlert::default(), cancelled, step, operation).await;
     match outcome {
         StepOutcome::Done(value) => Ok(Some(value)),
         StepOutcome::Skip => Ok(None),

@@ -12,7 +12,9 @@ use rdkafka::ClientContext;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::ConsumerContext;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
-use tracing::{Level, debug, error, info, warn};
+use tracing::Level;
+
+use crate::error::log_at;
 
 #[cfg(test)]
 mod tests;
@@ -38,22 +40,12 @@ impl ConsumerContext for LogContext {}
 
 /// Logs one librdkafka log line at the level that [`line_level`] selects.
 pub(crate) fn log_line(level: RDKafkaLogLevel, fac: &str, message: &str) {
-    // A tracing callsite has a static level, so each level needs its own call.
-    match line_level(level, fac) {
-        Level::ERROR => error!(target: "librdkafka", "librdkafka: {fac} {message}"),
-        Level::WARN => warn!(target: "librdkafka", "librdkafka: {fac} {message}"),
-        Level::INFO => info!(target: "librdkafka", "librdkafka: {fac} {message}"),
-        _ => debug!(target: "librdkafka", "librdkafka: {fac} {message}"),
-    }
+    log_at!(line_level(level, fac), target: "librdkafka", "librdkafka: {fac} {message}");
 }
 
 /// Logs one librdkafka error at the level that [`error_level`] selects.
 pub(crate) fn log_error(error: &KafkaError, reason: &str) {
-    if error_level(error) == Level::WARN {
-        warn!(target: "rdkafka::client", "librdkafka: {error}: {reason}");
-    } else {
-        error!(target: "rdkafka::client", "librdkafka: {error}: {reason}");
-    }
+    log_at!(error_level(error), target: "rdkafka::client", "librdkafka: {error}: {reason}");
 }
 
 /// Maps a librdkafka log line to a tracing level. An error-level line about a

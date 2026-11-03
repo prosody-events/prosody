@@ -6,7 +6,7 @@ use strum::VariantArray;
 use tracing::Level;
 
 /// Each step fails twice with one category, then succeeds. The step runs twice
-/// with one alert, as a caller that repeats a skipped step does. A failure
+/// with one alert, as the steps of one event do. A failure
 /// that heals never alerts. Any other failure alerts once, and only a
 /// `Permanent` one skips the step.
 #[tokio::test(start_paused = true)]
@@ -16,10 +16,16 @@ async fn retry_step_alerts_once_for_a_failure_that_does_not_heal() {
         let alert = RetryAlert::default();
         for _ in 0..2_u32 {
             let failures = Cell::new(2_u32);
+            let step = Step {
+                action: "run the test step",
+                key: None,
+                collection: None,
+                on_rejection: "Prosody skips the step.",
+            };
             let outcome = retry_step(
                 &alert,
                 || false,
-                "test",
+                step,
                 || {
                     let failed = failures.get() > 0;
                     failures.set(failures.get().saturating_sub(1));
@@ -40,7 +46,7 @@ async fn retry_step_alerts_once_for_a_failure_that_does_not_heal() {
                 "{category:?}"
             );
         }
-        let alerts = errors.count("durability step failed");
+        let alerts = errors.count("Prosody cannot run the test step");
         let expected = usize::from(category != ErrorCategory::Transient);
         assert_eq!(alerts, expected, "{category:?}");
     }

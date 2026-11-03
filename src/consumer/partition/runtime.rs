@@ -7,11 +7,12 @@ use aho_corasick::AhoCorasick;
 use async_stream::stream;
 use futures::stream::select;
 use futures::{Stream, StreamExt, pin_mut};
+use humantime::format_duration;
 use tokio::spawn;
 use tokio::sync::watch;
 use tokio::task::coop::cooperative;
-use tokio::time::sleep;
-use tracing::{debug, error, warn};
+use tokio::time::{Instant, sleep};
+use tracing::debug;
 
 use super::dispatch::{build_message_stream, process_event};
 use super::{PartitionConfiguration, PartitionContext, PartitionInfo, ShutdownPhase, metrics};
@@ -19,7 +20,7 @@ use crate::consumer::EventHandler;
 use crate::consumer::message::{ConsumerRecord, UncommittedEvent};
 use crate::consumer::middleware::deduplication::DedupIdentity;
 use crate::consumer::partition::keyed::KeyManager;
-use crate::error::{ClassifyError, RetryAlert};
+use crate::error::{ClassifyError, RetryAlert, log_at};
 use crate::loader::MessageLoader;
 use crate::otel::SpanRelation;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
@@ -35,6 +36,7 @@ use crate::{EventIdentity, EventType};
 /// `stall_threshold`.
 async fn retry_init<R, E, Fut>(
     shutdown_rx: &watch::Receiver<ShutdownPhase>,
+    partition: &PartitionInfo,
     stall_threshold: Duration,
     what: &str,
     mut init: impl FnMut() -> Fut,
@@ -43,18 +45,27 @@ where
     Fut: Future<Output = Result<R, E>>,
     E: ClassifyError + Display,
 {
+    let started = Instant::now();
     let alert = RetryAlert::stalls_after(stall_threshold);
     let draining = || *shutdown_rx.borrow() >= ShutdownPhase::Draining;
     while !draining() {
-        match init().await {
+        let error = match init().await {
             Ok(value) => return Some(value),
-            // A failure from a revoke is expected, so it does not alert.
-            Err(_) if draining() => break,
-            Err(error) if alert.alerts(error.classify_error()) => {
-                error!("failed to {what}: {error:#}; retrying");
-            }
-            Err(error) => warn!("failed to {what}: {error:#}; retrying"),
+            Err(error) => error,
+        };
+        // A failure from a revoke is expected, so it does not alert.
+        if draining() {
+            break;
         }
+        let elapsed = Duration::from_secs(started.elapsed().as_secs());
+        log_at!(
+            alert.level(error.classify_error()),
+            topic = %partition.topic,
+            partition = partition.partition,
+            "Prosody cannot {what}: {error:#}. The partition processes no events while \
+             Prosody retries every second. The first failure occurred {} ago.",
+            format_duration(elapsed),
+        );
         sleep(Duration::from_secs(1)).await;
     }
     None
@@ -117,8 +128,9 @@ pub(super) async fn handle_messages<T, S, SP, P, Q>(
     // descriptor identities before event dispatch.
     let Some(state_manager) = retry_init(
         &context.shutdown_rx,
+        &partition_info,
         stall_threshold,
-        "acquire keyed-state manager",
+        "get the keyed-state manager",
         || {
             state_provider.acquire(
                 partition_info.topic,
@@ -197,8 +209,9 @@ async fn run_partition<T, S, M, P, Q>(
 
     let Some((timer_stream, timer_manager)) = retry_init(
         &shutdown_rx,
+        &partition_info,
         stall_threshold,
-        "initialize timer manager",
+        "start the timer manager",
         || {
             let config = TimerManagerConfig {
                 store: trigger_store.clone(),

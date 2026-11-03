@@ -298,7 +298,7 @@ where
         T: TriggerStore,
     {
         let cancelled = || *shutdown.borrow() >= ShutdownPhase::Cancelling;
-        match admission_step(cancelled, &key, "checks.contains", None, || {
+        match admission_step(cancelled, &key, "read the admission check", None, || {
             self.inner.checks.contains(&key)
         })
         .await
@@ -310,7 +310,7 @@ where
         if let Err(admission) = self.admit_unchecked(&key, timers, shutdown).await {
             return admission;
         }
-        match admission_step(cancelled, &key, "checks.mark", None, || {
+        match admission_step(cancelled, &key, "record the admission check", None, || {
             self.inner.checks.mark(&key)
         })
         .await

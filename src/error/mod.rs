@@ -18,8 +18,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::Instant;
+use tracing::Level;
 
 pub mod kafka;
+
+/// Logs one event at a level chosen at runtime. A tracing callsite has a
+/// static level, so the macro expands to one call for each level.
+macro_rules! log_at {
+    ($level:expr, $($arg:tt)+) => {
+        match $level {
+            ::tracing::Level::ERROR => ::tracing::error!($($arg)+),
+            ::tracing::Level::WARN => ::tracing::warn!($($arg)+),
+            ::tracing::Level::INFO => ::tracing::info!($($arg)+),
+            ::tracing::Level::DEBUG => ::tracing::debug!($($arg)+),
+            _ => ::tracing::trace!($($arg)+),
+        }
+    };
+}
+pub(crate) use log_at;
 
 /// Categorizes errors in message processing.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
@@ -48,8 +64,8 @@ pub trait ClassifyError {
 /// Raises one alert for a failure that does not heal by itself.
 ///
 /// A [`Transient`](ErrorCategory::Transient) failure heals by itself, so it
-/// logs below error. The first failure of another category alerts, and so does
-/// the first failure after the stall deadline. Later failures do not alert.
+/// logs at warn. The first failure of another category logs at error, and so
+/// does the first failure after the stall deadline. Later failures log at warn.
 #[derive(Debug, Default)]
 pub(crate) struct RetryAlert {
     alerted: AtomicBool,
@@ -99,11 +115,15 @@ impl RetryAlert {
         }
     }
 
-    /// Returns `true` when a failure in `category` must log at error.
-    pub(crate) fn alerts(&self, category: ErrorCategory) -> bool {
+    /// Returns the level for a failure in `category`.
+    pub(crate) fn level(&self, category: ErrorCategory) -> Level {
         let heals = category == ErrorCategory::Transient
             && self.stalls_at.is_none_or(|at| Instant::now() < at);
-        !heals && !self.alerted.swap(true, Ordering::Relaxed)
+        if !heals && !self.alerted.swap(true, Ordering::Relaxed) {
+            Level::ERROR
+        } else {
+            Level::WARN
+        }
     }
 }
 

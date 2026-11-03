@@ -278,7 +278,11 @@ where
         }
         // A codec fault never clears by retry, and the response is lost.
         Err(error) => {
-            error!(%error, peer = %header.target, "response could not be framed");
+            error!(
+                peer = %header.target,
+                "Prosody cannot encode a response for another process: {error:#}. Prosody \
+                 drops the response."
+            );
             PreparedResponse::Rejected(header, DropReason::EncodeFailed)
         }
     }

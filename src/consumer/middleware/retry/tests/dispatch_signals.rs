@@ -412,6 +412,8 @@ async fn shutdown_during_sleep_does_not_double_fire_apply_hook() -> Result<()> {
         base_delay_millis: 1000,
         max_delay_millis: 10_000,
         max_retries: 10,
+        topic: "test-topic".into(),
+        partition: 0,
         aborts: Arc::default(),
         handler: handler.clone(),
     };

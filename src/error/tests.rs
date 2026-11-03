@@ -1,6 +1,7 @@
 use super::{ErrorCategory, RetryAlert, UnknownErrorCategory};
 use std::time::Duration;
 use strum::VariantArray;
+use tracing::Level;
 
 /// The numbers a peer of another release reads off the wire. A round trip
 /// cannot pin them — both conversions sit beside each other and move together —
@@ -50,7 +51,7 @@ fn retry_alert_fires_once_at_the_first_failure_that_does_not_heal() {
                     } else {
                         RetryAlert::default()
                     };
-                    let alerts = sequence.map(|category| alert.alerts(category));
+                    let alerts = sequence.map(|category| alert.level(category) == Level::ERROR);
 
                     let alerting = sequence
                         .iter()

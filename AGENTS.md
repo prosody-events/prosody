@@ -639,6 +639,11 @@ err(level = "warn"))]` for internal plumbing.
 
 A `Terminal` abort during shutdown is routine. Do not log it above debug.
 
+**Write each log message for an operator who does not know Prosody's
+internals.** Use STE sentences. Say what failed, what Prosody does next, and
+what the operator must do. Put the key, collection, topic, and partition in
+fields. Choose a level at runtime with `error::log_at!`.
+
 **Log level is the owner's decision.** An instrumented function returns its
 error to a caller that decides what it means, so its `err` event logs at warn.
 Mark a hand-built span failed with `otel::mark_failed`. The OTel layer marks a
@@ -649,7 +654,9 @@ retry ends, or a retry cannot succeed. Log these cases at error: a discarded mes
 attempts, a skipped durability step, the first `Terminal` abort of a
 partition outside shutdown, a non-`Transient` error in a retry loop, an init
 that fails past the stall threshold, a partition stall, or a broken invariant.
-`error::RetryAlert` makes the abort, retry loop, and init alerts fire once.
+`error::RetryAlert` makes the abort, retry loop, and init alerts fire once,
+and a repeat of the alert logs at warn. An inner retry layer logs a failure
+that it returns at debug, because the outer layer owns the outcome.
 Before you lower a log to warn, trace its error to the owner that logs it at
 error. Create every Kafka client with `kafka_log::LogContext`; the consumer
 context calls the same log functions. Log
@@ -659,7 +666,7 @@ Hand-built spans are reserved for the cases the attribute cannot express: a
 function returning `impl Stream` (instrument each inner await with a clone of
 one span), a relation against a carried context (`related_span!`), a value
 known only mid-body (declare the field `Empty`, then
-`Span::current().record(...)`), and a level known only at runtime (a tracing
+`Span::current().record(...)`), and a span level known only at runtime (a tracing
 callsite's level is static — branch between two invocations). Record unsigned
 integers as `i64` — the OTel layer exports signed ints as typed Int attributes
 but stringifies `u64`/`usize` through their Debug form. Timer instants on span

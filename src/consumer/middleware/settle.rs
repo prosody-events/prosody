@@ -17,7 +17,7 @@ use opentelemetry::metrics::Counter;
 use std::future::Future;
 use std::sync::LazyLock;
 
-use crate::state::retry::{DURABILITY_RETRY_DELAY, StepOutcome, retry_step};
+use crate::state::retry::{DURABILITY_RETRY_DELAY, Step, StepOutcome, retry_step};
 use tokio::time::sleep;
 
 use super::FallibleHandler;
@@ -274,11 +274,21 @@ async fn settle_committed<'a, T, C, G>(
         return;
     };
 
+    // One alert covers the event's durability steps. A partition stays
+    // assigned for weeks, so a partition-wide alert would hide a later fault.
+    let alert = RetryAlert::default();
+
     // Stage provisional cells and write resolved cells.
+    let finalize = Step {
+        action: "stage the changes of the event",
+        key: None,
+        collection: None,
+        on_rejection: "The store rejected the changes, so the event commits without them.",
+    };
     let finalized = match retry_step(
-        &RetryAlert::default(),
+        &alert,
         || context.is_shutdown(),
-        "keyed-state finalize",
+        finalize,
         || lifecycle.finalize(),
     )
     .await
@@ -333,13 +343,19 @@ async fn settle_committed<'a, T, C, G>(
     // Record the message identity after all promote attempts finish.
     if let Some(marker) = lifecycle.message_marker() {
         // The record must succeed, so the outer loop retries permanent errors
-        // too. One alert covers every repeat.
-        let alert = RetryAlert::default();
+        // too.
+        let record = Step {
+            action: "record the message ID for deduplication",
+            key: None,
+            collection: None,
+            on_rejection: "The store rejected the record. The event cannot finish until the store \
+                           accepts it, so Prosody retries every second.",
+        };
         loop {
             match retry_step(
                 &alert,
                 || context.is_shutdown(),
-                "keyed-state marker record",
+                record,
                 || lifecycle.record_marker(marker, MarkerWrite(())),
             )
             .await
@@ -425,10 +441,17 @@ async fn record_marker_best_effort<C>(context: &C, lifecycle: &C::State, marker:
 where
     C: EventContext,
 {
+    let record = Step {
+        action: "record the message ID for deduplication",
+        key: None,
+        collection: None,
+        on_rejection: "The store rejected the record, so a redelivery of this message can reach \
+                       the handler again.",
+    };
     let _ = retry_step(
         &RetryAlert::default(),
         || context.is_shutdown(),
-        "keyed-state marker record",
+        record,
         || lifecycle.record_marker(marker, MarkerWrite(())),
     )
     .await;

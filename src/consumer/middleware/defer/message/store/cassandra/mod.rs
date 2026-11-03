@@ -349,7 +349,8 @@ impl MessageDeferStore for CassandraMessageDeferStore {
                     .await?;
             }
             Some((cur_next, cur_rc)) if offset < cur_next => {
-                // Out-of-order: lower next_offset in the same BATCH as the INSERT
+                // Out-of-order: lower next_offset in the same BATCH as the
+                // INSERT
                 self.session()
                     .execute_unpaged(
                         &self.queries.batch_append_with_next,
@@ -442,7 +443,7 @@ impl MessageDeferStore for CassandraMessageDeferStore {
         // next_offset still resolves as Some(_) here.
         let (segment_id, cached) = self.resolve_cache_or_read(key).await?;
         let Some((cur_next, _)) = cached else {
-            debug!(key = ?key, "set_retry_count on empty partition: no-op");
+            debug!(key = %key, "The key has no deferred messages, so Prosody does not change the retry count");
             return Ok(());
         };
 
@@ -616,7 +617,8 @@ impl MessageDeferStoreProvider for CassandraMessageDeferStoreProvider {
         cache_size: usize,
     ) -> Self::Store {
         // Each call creates a new store with its own fresh cache.
-        // The cache must never outlive or be shared across partition assignments.
+        // The cache must never outlive or be shared across partition
+        // assignments.
         let segment = LazySegment::new(
             self.segment_store.clone(),
             topic,

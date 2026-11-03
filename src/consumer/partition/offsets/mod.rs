@@ -290,9 +290,10 @@ async fn track_watermark(
                 // A stall fails the liveness probe. It also catches a message
                 // whose handling retries forever at warn.
                 error!(
-                    "{topic}:{partition} has stalled at offset {offset} \
-                    for {}, which exceeded the stall threshold of {}",
-                    format_duration(take_time.elapsed()),
+                    "Partition {topic}:{partition} made no progress past offset {offset} for \
+                     {}. This is more than the stall threshold of {}, so the liveness probe \
+                     fails. Look for failure logs about offset {offset}.",
+                    format_duration(Duration::from_secs(take_time.elapsed().as_secs())),
                     format_duration(stall_threshold),
                 );
             }

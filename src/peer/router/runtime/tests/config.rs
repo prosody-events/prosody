@@ -16,8 +16,10 @@ use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
-use std::future::{Future, ready};
+use std::future::{Future, Ready, ready};
 use std::io::Error as IoError;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::yield_now;
@@ -111,11 +113,24 @@ async fn heartbeat_checks_preserve_the_refresh_deadline() -> Result<()> {
     Ok(())
 }
 
-/// A directory whose every write fails, as during a long store outage.
-#[derive(Clone)]
-struct FailingDirectory;
+/// A directory whose writes fail while `failing` holds, as during a store
+/// outage.
+#[derive(Clone, Default)]
+struct OutageDirectory {
+    failing: Arc<AtomicBool>,
+}
 
-impl PeerDirectory for FailingDirectory {
+impl OutageDirectory {
+    fn outcome<T>(&self, value: T) -> Ready<Result<T, IoError>> {
+        ready(if self.failing.load(Ordering::Relaxed) {
+            Err(IoError::other("store unavailable"))
+        } else {
+            Ok(value)
+        })
+    }
+}
+
+impl PeerDirectory for OutageDirectory {
     type Error = IoError;
 
     fn ttl(&self) -> RegistrationTtl {
@@ -126,34 +141,48 @@ impl PeerDirectory for FailingDirectory {
         &self,
         _registration: &PeerRegistration,
     ) -> impl Future<Output = Result<(), IoError>> {
-        ready(Err(IoError::other("store unavailable")))
+        self.outcome(())
     }
 
     fn read(
         &self,
         _peer: PeerId,
     ) -> impl Future<Output = Result<Option<PeerRegistration>, IoError>> {
-        ready(Err(IoError::other("store unavailable")))
+        self.outcome(None)
     }
 
     fn deregister(
         &self,
         _registration: &PeerRegistration,
     ) -> impl Future<Output = Result<(), IoError>> {
-        ready(Err(IoError::other("store unavailable")))
+        self.outcome(())
+    }
+}
+
+/// Advances the paused clock by `ticks` steps of `tick` and lets the refresh
+/// task run after each step.
+async fn run_for(ticks: u32, tick: Duration) {
+    for _ in 0..ticks {
+        advance(tick).await;
+        yield_now().await;
     }
 }
 
 /// A failed refresh inside the lease heals on a later refresh, so it does not
 /// alert. Once the lease lapses, other peers drop responses, so it alerts once.
+/// A later success reports the recovery and re-arms the alert for the next
+/// lapse.
 #[tokio::test(start_paused = true)]
-async fn refresh_failure_alerts_once_after_the_lease_lapses() -> Result<()> {
-    const LAPSED: &str = "peer registration lapsed";
+async fn refresh_failure_alerts_once_for_each_lapse() -> Result<()> {
+    const LAPSED: &str = "peer registration of this process expired";
+    const RESTORED: &str = "peer registration of this process is active again";
     let lease = Duration::from_mins(1);
-    let (errors, _guard) = capture_events(Level::ERROR);
+    let (events, _guard) = capture_events(Level::INFO);
+    let directory = OutageDirectory::default();
+    directory.failing.store(true, Ordering::Relaxed);
     let (stop, stopped) = watch::channel(false);
     let refresh = tokio::spawn(refresh_registration(
-        FailingDirectory,
+        directory.clone(),
         registration(PeerId::new()),
         HeartbeatRegistry::test().register("directory refresh"),
         RegistrationTtl::try_from(lease)?,
@@ -163,22 +192,28 @@ async fn refresh_failure_alerts_once_after_the_lease_lapses() -> Result<()> {
     // Each step is shorter than the smallest refresh delay, so every refresh
     // runs before the clock passes the next one.
     let tick = lease / 10;
-    for _ in 0..9_u32 {
-        advance(tick).await;
-        yield_now().await;
-    }
+    run_for(9, tick).await;
     assert_eq!(
-        errors.count(LAPSED),
+        events.count(LAPSED),
         0,
         "a refresh inside the lease alerted"
     );
 
     // Several more refreshes fail after the lapse. They repeat no alert.
-    for _ in 0..12_u32 {
-        advance(tick).await;
-        yield_now().await;
-    }
-    assert_eq!(errors.count(LAPSED), 1, "a lapse must alert exactly once");
+    run_for(12, tick).await;
+    assert_eq!(events.count(LAPSED), 1, "a lapse must alert exactly once");
+
+    directory.failing.store(false, Ordering::Relaxed);
+    run_for(12, tick).await;
+    assert_eq!(
+        events.count(RESTORED),
+        1,
+        "a recovery must log exactly once"
+    );
+
+    directory.failing.store(true, Ordering::Relaxed);
+    run_for(21, tick).await;
+    assert_eq!(events.count(LAPSED), 2, "a second lapse must alert again");
 
     stop.send_replace(true);
     refresh.await?;

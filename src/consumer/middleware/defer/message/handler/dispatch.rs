@@ -49,7 +49,8 @@ where
 
         let message_key = message.key().clone();
         let offset = message.offset();
-        // Not deferred: call the handler. Defer a transient failure when enabled.
+        // Not deferred: call the handler. Defer a transient failure when
+        // enabled.
         let error = match H::call(&self.handler, context.clone(), message, demand_type).await {
             Ok(output) => return Ok(MessageDeferOutput::Inner(output)),
             Err(error) => error,
@@ -59,25 +60,26 @@ where
             return Err(DeferError::Handler(error));
         }
 
-        // Gate only the initial deferral. Always defer later transient failures again.
+        // Gate only the initial deferral. Always defer later transient failures
+        // again.
         if !self.config.enabled {
             debug!(
-                key = ?message_key,
+                key = %message_key,
                 offset,
                 topic = %self.topic,
                 partition = self.partition,
-                "Deferral skipped: middleware disabled"
+                "Prosody does not defer the message, because deferral is off"
             );
             return Err(DeferError::Handler(error));
         }
 
         if !self.decider.should_defer() {
             debug!(
-                key = ?message_key,
+                key = %message_key,
                 offset,
                 topic = %self.topic,
                 partition = self.partition,
-                "Deferral skipped: decider threshold not met"
+                "Prosody does not defer the message, because the deferral policy did not select it"
             );
             return Err(DeferError::Handler(error));
         }
@@ -153,11 +155,11 @@ where
         let message_key = &trigger.key;
 
         debug!(
-            key = ?message_key,
+            key = %message_key,
             scheduled_time = %trigger.time,
             topic = %self.topic,
             partition = self.partition,
-            "Defer retry timer fired"
+            "The retry timer of a deferred message fired"
         );
 
         let Some((offset, retry_count)) = self
@@ -168,10 +170,10 @@ where
         else {
             // Orphan timer for an empty queue — inner did not run.
             debug!(
-                key = ?message_key,
+                key = %message_key,
                 topic = %self.topic,
                 partition = self.partition,
-                "Clearing orphaned defer timer: queue empty"
+                "Prosody deletes a retry timer that has no deferred message"
             );
             self.store
                 .delete_key(message_key)
@@ -212,12 +214,12 @@ where
         }
 
         debug!(
-            key = ?message_key,
+            key = %message_key,
             offset = offset,
             retry_count = retry_count,
             topic = %self.topic,
             partition = self.partition,
-            "Loaded deferred message - attempting retry"
+            "Prosody loaded a deferred message and retries it"
         );
 
         let demand = demand_type.retried(retry_count.saturating_add(1));
@@ -255,15 +257,15 @@ where
         // Apply-hook routing (see module docs):
         // - Inner(o):    inner ran and succeeded           -> after_commit(Ok)
         // - NoInner:     no inner dispatch happened        -> suppress
-        // - Deferred(e): inner ran, transient err deferred -> after_abort(Err(e))
-        //   (retry coming)
+        // - Deferred(e): inner ran, transient err deferred ->
+        //   after_abort(Err(e)) (retry coming)
         // - Handler(e):  inner ran and surfaced an error   -> after_commit(Err)
-        // - Store/Timer/Loader: defer-layer rescue failed. Suppress the inner hook
-        //   regardless of whether the inner ran on this dispatch. These errors classify
-        //   as Transient (see `DeferError::classify_error`) so the outer retry layer
-        //   will redrive the whole stack; consistency lives in the failed Result, not
-        //   in the hook. Apply hooks are best-effort — see
-        //   `FallibleHandler::after_commit` docs.
+        // - Store/Timer/Loader: defer-layer rescue failed. Suppress the inner
+        //   hook regardless of whether the inner ran on this dispatch. These
+        //   errors classify as Transient (see `DeferError::classify_error`) so
+        //   the outer retry layer will redrive the whole stack; consistency
+        //   lives in the failed Result, not in the hook. Apply hooks are
+        //   best-effort — see `FallibleHandler::after_commit` docs.
         match result {
             Ok(MessageDeferOutput::Inner(output)) => {
                 self.handler.after_commit(context, Ok(output)).await;
@@ -283,10 +285,11 @@ where
         C: EventContext<Payload = T::Payload>,
     {
         // Symmetric to after_commit. Two notes:
-        //   - Deferred(e) still routes to after_abort(Err(e)) regardless of the outer
-        //     commit/abort decision (a retry is coming via the deferred timer).
-        //   - Store/Timer/Loader rescue-failure paths suppress the inner hook on
-        //     purpose; the outer retry redrives the stack. See after_commit.
+        //   - Deferred(e) still routes to after_abort(Err(e)) regardless of the
+        //     outer commit/abort decision (a retry is coming via the deferred
+        //     timer).
+        //   - Store/Timer/Loader rescue-failure paths suppress the inner hook
+        //     on purpose; the outer retry redrives the stack. See after_commit.
         match result {
             Ok(MessageDeferOutput::Inner(output)) => {
                 self.handler.after_abort(context, Ok(output)).await;

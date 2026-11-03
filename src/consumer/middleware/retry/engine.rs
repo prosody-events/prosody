@@ -1,19 +1,19 @@
 use std::cmp::min;
-use std::fmt::Display;
+use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::time::Duration;
 
 use humantime::format_duration;
 use rand::RngExt;
-use tracing::{error, info, warn};
+use tracing::Level;
 
 use super::{RetryHandler, RetryWaitResult, wait_with_cancellation};
+use crate::Offset;
 use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory, NextAttempt};
-use crate::error::RetryAlert;
+use crate::error::{RetryAlert, log_at};
 use crate::timers::Trigger;
-use crate::{Offset, Partition};
 
 /// How [`RetryHandler::run`] resolved the final retry attempt.
 /// The run method owns apply hooks for non-final attempts.
@@ -31,28 +31,31 @@ pub(super) enum Resolution<O, E> {
     Abort(E),
 }
 
-/// Reason a retry attempt is being logged. Each variant carries the data a
-/// call-site closure needs to emit a structured log with the relevant
-/// per-event fields (topic / partition / key / offset for messages, key /
-/// fire time / timer type for timers).
-pub(super) enum LogReason<'a, E> {
-    Retrying {
-        attempt: u32,
-        error: &'a E,
-        sleep: Duration,
-    },
-    MaxRetriesExceeded {
-        attempt: u32,
-        error: &'a E,
-    },
-    Permanent {
-        attempt: u32,
-        error: &'a E,
-    },
-    Terminal {
-        attempt: u32,
-        error: &'a E,
-    },
+/// A failed attempt that a retry layer logs.
+pub(super) struct Failure<'a, E> {
+    attempt: u32,
+    error: &'a E,
+    next: Next,
+}
+
+/// What a retry layer does after a failed attempt.
+#[derive(Clone, Copy)]
+enum Next {
+    /// Retry after this delay.
+    Retry(Duration),
+    /// Stop, because the attempt was the last one allowed.
+    GiveUp,
+    /// Stop, because the error is `Permanent`.
+    Skip,
+    /// Stop, because the error is `Terminal`.
+    Abort,
+}
+
+/// The kind of event that failed.
+#[derive(Clone, Copy)]
+enum Event {
+    Message,
+    Timer,
 }
 
 /// Which retry layer logs a failure. It sets who owns the failure's outcome.
@@ -67,16 +70,72 @@ pub(super) enum Layer<'a> {
     Outermost(&'a RetryAlert),
 }
 
-impl Layer<'_> {
-    fn discard_suffix(self, event: &'static str) -> &'static str {
-        match self {
-            Self::Inner => "",
-            Self::Outermost(_) => event,
+/// The log message for a failure: the error, then what happens next.
+struct Outcome<'a, E> {
+    failure: &'a Failure<'a, E>,
+    event: Event,
+    layer: Layer<'a>,
+}
+
+impl<E> Failure<'_, E> {
+    /// Returns the level for this failure at `layer`.
+    fn level(&self, layer: Layer) -> Level {
+        match (self.next, layer) {
+            (Next::Retry(_), _) => Level::WARN,
+            // The outer layer owns the outcome and logs it.
+            (_, Layer::Inner) => Level::DEBUG,
+            (Next::Abort, Layer::Outermost(aborts)) => aborts.level(ErrorCategory::Terminal),
+            (Next::GiveUp | Next::Skip, Layer::Outermost(_)) => Level::ERROR,
         }
     }
+}
 
-    fn alerts_terminal(self) -> bool {
-        matches!(self, Self::Outermost(alert) if alert.alerts(ErrorCategory::Terminal))
+impl Display for Event {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Message => "message",
+            Self::Timer => "timer",
+        })
+    }
+}
+
+impl<E: Display> Display for Outcome<'_, E> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Failure {
+            attempt,
+            error,
+            next,
+        } = self.failure;
+        let event = self.event;
+        write!(f, "The handler failed for this {event}: {error:#}. ")?;
+        match (next, self.layer, event) {
+            (Next::Retry(delay), ..) => {
+                write!(f, "Prosody retries in {}.", format_duration(*delay))
+            }
+            (_, Layer::Inner, _) => write!(
+                f,
+                "Prosody stops after {attempt} attempts and returns the error to the outer \
+                 middleware."
+            ),
+            (Next::GiveUp, ..) => {
+                write!(
+                    f,
+                    "Prosody stops after {attempt} attempts and skips the {event}."
+                )
+            }
+            (Next::Skip, ..) => write!(
+                f,
+                "The error is permanent, so Prosody skips the {event} and does not retry it."
+            ),
+            (Next::Abort, _, Event::Message) => f.write_str(
+                "A retry cannot fix this error, so Prosody commits no later offsets for this \
+                 partition. Fix the cause, then restart the consumer.",
+            ),
+            (Next::Abort, _, Event::Timer) => f.write_str(
+                "A retry cannot fix this error, so the timer fires again only after a restart. \
+                 Fix the cause, then restart the consumer.",
+            ),
+        }
     }
 }
 
@@ -124,7 +183,7 @@ impl<T> RetryHandler<T> {
         max_retries: Option<u32>,
         mut invoke: F,
         mut apply_abort: A,
-        log: impl Fn(LogReason<'_, E>),
+        log: impl Fn(&Failure<'_, E>),
     ) -> (Resolution<O, E>, C)
     where
         C: EventContext,
@@ -160,18 +219,19 @@ impl<T> RetryHandler<T> {
             match error.classify_error() {
                 ErrorCategory::Transient => {
                     if matches!(max_retries, Some(max) if attempt > max) {
-                        log(LogReason::MaxRetriesExceeded {
+                        log(&Failure {
                             attempt,
                             error: &error,
+                            next: Next::GiveUp,
                         });
                         // Final attempt: outer layer fires the apply hook.
                         return (Resolution::Commit(Err(error)), current);
                     }
                     let sleep_time = self.sleep_time(attempt);
-                    log(LogReason::Retrying {
+                    log(&Failure {
                         attempt,
                         error: &error,
-                        sleep: sleep_time,
+                        next: Next::Retry(sleep_time),
                     });
                     // Sleep BEFORE firing the per-attempt apply hook. If
                     // shutdown intervenes during the sleep, this attempt
@@ -201,124 +261,70 @@ impl<T> RetryHandler<T> {
                     apply_abort(expired, error).await;
                 }
                 ErrorCategory::Permanent => {
-                    log(LogReason::Permanent {
+                    log(&Failure {
                         attempt,
                         error: &error,
+                        next: Next::Skip,
                     });
                     return (Resolution::Commit(Err(error)), current);
                 }
                 ErrorCategory::Terminal => {
-                    log(LogReason::Terminal {
+                    log(&Failure {
                         attempt,
                         error: &error,
+                        next: Next::Abort,
                     });
                     return (Resolution::Abort(error), current);
                 }
             }
         }
     }
-}
 
-/// Emits a structured log for a message-path retry event. At the
-/// [`Layer::Outermost`] layer the marker commits and the message is dropped
-/// from this consumer's perspective.
-pub(super) fn log_message_failure<E: Display>(
-    topic: &str,
-    partition: Partition,
-    key: &str,
-    offset: Offset,
-    reason: &LogReason<'_, E>,
-    layer: Layer,
-) {
-    let discard_suffix = layer.discard_suffix("; discarding message");
-    match *reason {
-        LogReason::Retrying {
-            attempt,
-            error,
-            sleep,
-        } => warn!(
-            partition,
+    /// Logs a failed message attempt.
+    pub(super) fn log_message<E: Display>(
+        &self,
+        key: &str,
+        offset: Offset,
+        failure: &Failure<'_, E>,
+        layer: Layer,
+    ) {
+        let outcome = Outcome {
+            failure,
+            event: Event::Message,
+            layer,
+        };
+        log_at!(
+            failure.level(layer),
+            topic = %self.topic,
+            partition = self.partition,
             key,
             offset,
-            attempt,
-            topic,
-            "failed to handle message: {error:#}; retrying after {}",
-            format_duration(sleep),
-        ),
-        LogReason::MaxRetriesExceeded { attempt, error } => error!(
-            partition,
-            key,
-            offset,
-            attempt,
-            topic,
-            "failed to handle message: {error:#}; maximum attempts reached",
-        ),
-        LogReason::Permanent { attempt, error } => error!(
-            partition,
-            key,
-            offset,
-            attempt,
-            topic,
-            "permanently failed to handle message: {error:#}{discard_suffix}",
-        ),
-        LogReason::Terminal { attempt, error } if layer.alerts_terminal() => error!(
-            partition,
-            key,
-            offset,
-            attempt,
-            topic,
-            "terminal condition encountered while handling message: {error:#}; aborting",
-        ),
-        LogReason::Terminal { attempt, error } => info!(
-            partition,
-            key,
-            offset,
-            attempt,
-            topic,
-            "terminal condition encountered while handling message: {error:#}; aborting",
-        ),
+            attempt = failure.attempt,
+            "{outcome}"
+        );
     }
-}
 
-/// Emits a structured log for a timer-path retry event. See
-/// [`log_message_failure`] for the meaning of `layer`.
-pub(super) fn log_timer_failure<E: Display>(
-    trigger: &Trigger,
-    reason: &LogReason<'_, E>,
-    layer: Layer,
-) {
-    let discard_suffix = layer.discard_suffix("; discarding timer");
-    match *reason {
-        LogReason::Retrying { error, sleep, .. } => warn!(
+    /// Logs a failed timer attempt.
+    pub(super) fn log_timer<E: Display>(
+        &self,
+        trigger: &Trigger,
+        failure: &Failure<'_, E>,
+        layer: Layer,
+    ) {
+        let outcome = Outcome {
+            failure,
+            event: Event::Timer,
+            layer,
+        };
+        log_at!(
+            failure.level(layer),
+            topic = %self.topic,
+            partition = self.partition,
             key = %trigger.key,
             fire_time = %trigger.time,
             timer_type = ?trigger.timer_type,
-            "failed to handle timer: {error:#}; retrying after {}",
-            format_duration(sleep),
-        ),
-        LogReason::MaxRetriesExceeded { error, .. } => error!(
-            key = %trigger.key,
-            fire_time = %trigger.time,
-            timer_type = ?trigger.timer_type,
-            "failed to handle timer: {error:#}; maximum attempts reached",
-        ),
-        LogReason::Permanent { error, .. } => error!(
-            key = %trigger.key,
-            fire_time = %trigger.time,
-            timer_type = ?trigger.timer_type,
-            "permanently failed to handle timer: {error:#}{discard_suffix}",
-        ),
-        LogReason::Terminal { error, .. } if layer.alerts_terminal() => error!(
-            key = %trigger.key,
-            fire_time = %trigger.time,
-            timer_type = ?trigger.timer_type,
-            "terminal condition encountered while handling timer: {error:#}; aborting",
-        ),
-        LogReason::Terminal { error, .. } => info!(
-            key = %trigger.key,
-            fire_time = %trigger.time,
-            timer_type = ?trigger.timer_type,
-            "terminal condition encountered while handling timer: {error:#}; aborting",
-        ),
+            attempt = failure.attempt,
+            "{outcome}"
+        );
     }
 }

@@ -6,9 +6,8 @@ use crate::state::backend::AdmissionChecks;
 use crate::state::identity::CollectionRef;
 use crate::state::marker::FrozenStage;
 use crate::state::store::CellStore;
-use smallvec::SmallVec;
 use std::future::Future;
-use tracing::{error, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 mod gate;
@@ -98,13 +97,6 @@ impl<S: CellStore, K: AdmissionChecks> Staged<S, K> {
     /// Restores the rejected collections before the boundary commits the
     /// source.
     pub(crate) async fn abort(self, shutdown: impl Fn() -> bool + Sync) -> bool {
-        let names: SmallVec<[&str; 8]> = self
-            .collections
-            .iter()
-            .map(|staged| staged.collection.id().name().as_str())
-            .collect();
-        error!(key = %self.key, collections = ?names,
-            "promote rejected collections; restore committed state");
         let complete = abort_collections(&self.store, &self.collections, &shutdown).await;
         if let Err(error) = self.checks.unmark(&self.key).await {
             warn!(%error, key = %self.key, "cannot remove admission proof");

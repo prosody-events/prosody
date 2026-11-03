@@ -11,7 +11,7 @@ use crate::state::identity::{CollectionId, CollectionRef};
 use crate::state::marker::{EventEvidence, FrozenStage, SectionClear};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::resolve_event_marker;
-use crate::state::retry::{StepOutcome, retry_step};
+use crate::state::retry::{Step, StepOutcome, retry_step};
 use crate::state::store::{CELL_BATCH, CellBuffer, CellRead, CellStore, CoordinateBatch};
 use crate::state::{
     CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY, StateKey, StateName,
@@ -21,6 +21,10 @@ use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::iter::from_fn;
 use tokio::task::coop::cooperative;
+
+/// What a rejected rollback costs.
+const STAGED_CELLS_STAY: &str = "The store rejected the rollback. The staged changes stay until \
+                                 admission resolves them before the next event for the key.";
 
 /// One batch-read unit of a `ReadCommitted` stage: a section's contiguous
 /// `≤CELL_BATCH` survivor run, its coordinate batch, and the dirty records —
@@ -202,6 +206,7 @@ pub(super) async fn abort_stages<S: CellStore>(
     touched: &[(StateType, StateName)],
     shutdown: impl Fn() -> bool + Sync,
 ) {
+    let alert = &RetryAlert::default();
     stream::iter(0..touched.len())
         .map(|index| {
             let (kind, name) = &touched[index];
@@ -211,23 +216,24 @@ pub(super) async fn abort_stages<S: CellStore>(
                     CollectionId::new(key.clone(), *kind, name.clone()),
                     registry.ttl_for(*kind, name),
                 );
-                let _ = retry_step(
-                    &RetryAlert::default(),
-                    shutdown,
-                    "rejected stage rollback",
-                    || async {
-                        if let Some(marker) = store.marker_state(collection.id()).await?.staged {
-                            resolve_event_marker(
-                                store,
-                                &collection,
-                                &marker,
-                                CommitDecision::NotCommitted,
-                            )
-                            .await?;
-                        }
-                        Ok::<_, S::Error>(())
-                    },
-                )
+                let step = Step {
+                    action: "roll back the changes of a rejected stage",
+                    key: None,
+                    collection: Some(name.as_str()),
+                    on_rejection: STAGED_CELLS_STAY,
+                };
+                let _ = retry_step(alert, shutdown, step, || async {
+                    if let Some(marker) = store.marker_state(collection.id()).await?.staged {
+                        resolve_event_marker(
+                            store,
+                            &collection,
+                            &marker,
+                            CommitDecision::NotCommitted,
+                        )
+                        .await?;
+                    }
+                    Ok::<_, S::Error>(())
+                })
                 .await;
             })
         })
@@ -242,21 +248,24 @@ pub(super) async fn resolve_collections<S: CellStore>(
     collections: Vec<StagedCollection>,
     shutdown: &(impl Fn() -> bool + Sync),
 ) -> Vec<StagedCollection> {
+    let alert = &RetryAlert::default();
     stream::iter(collections)
         .map(|staged| {
             cooperative(async move {
-                let outcome = retry_step(
-                    &RetryAlert::default(),
-                    shutdown,
-                    "keyed-state promote",
-                    || {
-                        store.commit_provisional(
-                            &staged.collection,
-                            staged.stage.marker(),
-                            staged.stage.writes(),
-                        )
-                    },
-                )
+                let step = Step {
+                    action: "commit the staged changes",
+                    key: None,
+                    collection: Some(staged.collection.id().name().as_str()),
+                    on_rejection: "The store rejected the changes, so Prosody restores the \
+                                   committed state of the collection.",
+                };
+                let outcome = retry_step(alert, shutdown, step, || {
+                    store.commit_provisional(
+                        &staged.collection,
+                        staged.stage.marker(),
+                        staged.stage.writes(),
+                    )
+                })
                 .await;
                 match outcome {
                     StepOutcome::Done(()) => None,
@@ -279,21 +288,23 @@ pub(super) async fn abort_collections<S: CellStore>(
     collections: &[StagedCollection],
     shutdown: &(impl Fn() -> bool + Sync),
 ) -> bool {
+    let alert = &RetryAlert::default();
     // Indices keep the closure free of a higher-ranked borrow.
     stream::iter(0..collections.len())
         .map(|index| {
             let staged = &collections[index];
             cooperative(async move {
-                !matches!(
-                    retry_step(
-                        &RetryAlert::default(),
-                        shutdown,
-                        "keyed-state rollback",
-                        || { store.abort_provisional(&staged.collection, staged.stage.writes()) }
-                    )
-                    .await,
-                    StepOutcome::Abandon
-                )
+                let step = Step {
+                    action: "roll back the staged changes",
+                    key: None,
+                    collection: Some(staged.collection.id().name().as_str()),
+                    on_rejection: STAGED_CELLS_STAY,
+                };
+                let outcome = retry_step(alert, shutdown, step, || {
+                    store.abort_provisional(&staged.collection, staged.stage.writes())
+                })
+                .await;
+                !matches!(outcome, StepOutcome::Abandon)
             })
         })
         .buffer_unordered(STATE_FANOUT_CONCURRENCY)

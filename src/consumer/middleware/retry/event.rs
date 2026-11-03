@@ -2,8 +2,7 @@ use std::future::Future;
 
 use super::{
     ConsumerMessage, DemandType, EventContext, EventHandler, Keyed, Layer, Resolution,
-    RetryHandler, SettlementHandler, UncommittedMessage, UncommittedTimer, abandon, debug,
-    log_message_failure, log_timer_failure, settle,
+    RetryHandler, SettlementHandler, UncommittedMessage, UncommittedTimer, abandon, debug, settle,
 };
 use crate::consumer::Uncommitted;
 
@@ -19,9 +18,6 @@ async fn process_record<T, C, Q, F, Fut>(
     Fut: Future<Output = Result<T::Output, T::Error>>,
     T: SettlementHandler,
 {
-    let topic = message.topic();
-    let partition = message.partition();
-    let key = message.key().to_owned();
     let offset = message.offset();
     let (message, uncommitted) = message.into_inner();
     let (resolution, final_ctx) = handler
@@ -31,15 +27,9 @@ async fn process_record<T, C, Q, F, Fut>(
             None,
             |ctx, dt| dispatch(ctx, message.clone(), dt),
             |ctx, error| handler.handler.after_abort(ctx, Err(error)),
-            |reason| {
-                log_message_failure(
-                    topic.as_ref(),
-                    partition,
-                    key.as_ref(),
-                    offset,
-                    &reason,
-                    Layer::Outermost(&handler.aborts),
-                );
+            |failure| {
+                let layer = Layer::Outermost(&handler.aborts);
+                handler.log_message(message.key(), offset, failure, layer);
             },
         )
         .await;
@@ -118,7 +108,7 @@ where
                 None,
                 |ctx, dt| self.handler.on_timer(ctx, trigger.clone(), dt),
                 |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |reason| log_timer_failure(&trigger, &reason, Layer::Outermost(&self.aborts)),
+                |failure| self.log_timer(&trigger, failure, Layer::Outermost(&self.aborts)),
             )
             .await;
 
