@@ -17,13 +17,13 @@ use opentelemetry::metrics::Counter;
 use std::future::Future;
 use std::sync::LazyLock;
 
-use crate::state::retry::{DURABILITY_RETRY_DELAY, StepOutcome, retry_step};
+use crate::state::retry::{DURABILITY_RETRY_DELAY, Step, StepOutcome, retry_step};
 use tokio::time::sleep;
 
 use super::FallibleHandler;
 use crate::consumer::Uncommitted;
 use crate::consumer::event_context::EventContext;
-use crate::error::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory, RetryAlert};
 use crate::state::access::StateAccessError;
 use crate::state::descriptor::Registered;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
@@ -274,10 +274,22 @@ async fn settle_committed<'a, T, C, G>(
         return;
     };
 
+    // One alert covers the event's durability steps. The rollback inside
+    // finalize has its own alert. A partition stays assigned for weeks, so a
+    // partition-wide alert would hide a later fault.
+    let alert = RetryAlert::default();
+
     // Stage provisional cells and write resolved cells.
+    let finalize = Step {
+        action: "stage the changes of the event",
+        key: None,
+        collection: None,
+        on_rejection: "The store rejected the changes, so the event commits without them.",
+    };
     let finalized = match retry_step(
+        &alert,
         || context.is_shutdown(),
-        "keyed-state finalize",
+        finalize,
         || lifecycle.finalize(),
     )
     .await
@@ -305,12 +317,12 @@ async fn settle_committed<'a, T, C, G>(
 
     // The first successful promote is the commit point.
     if let Finalized::Staged(staged) = finalized {
-        let outcome = staged.promote(|| context.is_shutdown()).await;
+        let outcome = staged.promote(&alert, || context.is_shutdown()).await;
         let complete = match outcome {
             Promoted::Complete => true,
             Promoted::Abandoned => false,
             Promoted::Rejected(rejected) => {
-                if rejected.abort(|| context.is_shutdown()).await {
+                if rejected.abort(&alert, || context.is_shutdown()).await {
                     commit_and_finish(handler, context, guard, result, Some(lifecycle), permit)
                         .await;
                     return;
@@ -319,7 +331,7 @@ async fn settle_committed<'a, T, C, G>(
             }
             Promoted::Torn(rejected) => {
                 PROMOTE_TORN.add(1, &[]);
-                rejected.abort(|| context.is_shutdown()).await
+                rejected.abort(&alert, || context.is_shutdown()).await
             }
         };
         if !complete {
@@ -331,11 +343,20 @@ async fn settle_committed<'a, T, C, G>(
 
     // Record the message identity after all promote attempts finish.
     if let Some(marker) = lifecycle.message_marker() {
-        // The record must succeed, so the outer loop retries permanent errors too.
+        // The record must succeed, so the outer loop retries permanent errors
+        // too.
+        let record = Step {
+            action: "record the message ID for deduplication",
+            key: None,
+            collection: None,
+            on_rejection: "The store rejected the record. The event cannot finish until the store \
+                           accepts it, so Prosody retries every second.",
+        };
         loop {
             match retry_step(
+                &alert,
                 || context.is_shutdown(),
-                "keyed-state marker record",
+                record,
                 || lifecycle.record_marker(marker, MarkerWrite(())),
             )
             .await
@@ -421,9 +442,17 @@ async fn record_marker_best_effort<C>(context: &C, lifecycle: &C::State, marker:
 where
     C: EventContext,
 {
+    let record = Step {
+        action: "record the message ID for deduplication",
+        key: None,
+        collection: None,
+        on_rejection: "The store rejected the record, so a redelivery of this message can reach \
+                       the handler again.",
+    };
     let _ = retry_step(
+        &RetryAlert::default(),
         || context.is_shutdown(),
-        "keyed-state marker record",
+        record,
         || lifecycle.record_marker(marker, MarkerWrite(())),
     )
     .await;

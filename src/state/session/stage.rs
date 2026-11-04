@@ -1,6 +1,7 @@
 //! Staging, abort, and resolution of a session's collections.
 
 use super::sealed::StagedCollection;
+use crate::error::RetryAlert;
 use crate::state::CommitDecision;
 use crate::state::access::StateAccessError;
 use crate::state::cell::{ProvisionalWrite, Values};
@@ -10,7 +11,7 @@ use crate::state::identity::{CollectionId, CollectionRef};
 use crate::state::marker::{EventEvidence, FrozenStage, SectionClear};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::resolve_event_marker;
-use crate::state::retry::{StepOutcome, retry_step};
+use crate::state::retry::{Step, StepOutcome, retry_step};
 use crate::state::store::{CELL_BATCH, CellBuffer, CellRead, CellStore, CoordinateBatch};
 use crate::state::{
     CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY, StateKey, StateName,
@@ -20,6 +21,10 @@ use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::iter::from_fn;
 use tokio::task::coop::cooperative;
+
+/// What a rejected rollback costs.
+const STAGED_CELLS_STAY: &str = "The store rejected the rollback. The staged changes stay until \
+                                 admission resolves them before the next event for the key.";
 
 /// One batch-read unit of a `ReadCommitted` stage: a section's contiguous
 /// `≤CELL_BATCH` survivor run, its coordinate batch, and the dirty records —
@@ -201,6 +206,7 @@ pub(super) async fn abort_stages<S: CellStore>(
     touched: &[(StateType, StateName)],
     shutdown: impl Fn() -> bool + Sync,
 ) {
+    let alert = &RetryAlert::default();
     stream::iter(0..touched.len())
         .map(|index| {
             let (kind, name) = &touched[index];
@@ -210,7 +216,13 @@ pub(super) async fn abort_stages<S: CellStore>(
                     CollectionId::new(key.clone(), *kind, name.clone()),
                     registry.ttl_for(*kind, name),
                 );
-                let _ = retry_step(shutdown, "rejected stage rollback", || async {
+                let step = Step {
+                    action: "roll back the changes of a rejected stage",
+                    key: None,
+                    collection: Some(name.as_str()),
+                    on_rejection: STAGED_CELLS_STAY,
+                };
+                let _ = retry_step(alert, shutdown, step, || async {
                     if let Some(marker) = store.marker_state(collection.id()).await?.staged {
                         resolve_event_marker(
                             store,
@@ -234,12 +246,20 @@ pub(super) async fn abort_stages<S: CellStore>(
 pub(super) async fn resolve_collections<S: CellStore>(
     store: &S,
     collections: Vec<StagedCollection>,
+    alert: &RetryAlert,
     shutdown: &(impl Fn() -> bool + Sync),
 ) -> Vec<StagedCollection> {
     stream::iter(collections)
         .map(|staged| {
             cooperative(async move {
-                let outcome = retry_step(shutdown, "keyed-state promote", || {
+                let step = Step {
+                    action: "commit the staged changes",
+                    key: None,
+                    collection: Some(staged.collection.id().name().as_str()),
+                    on_rejection: "The store rejected the changes, so Prosody restores the \
+                                   committed state of the collection.",
+                };
+                let outcome = retry_step(alert, shutdown, step, || {
                     store.commit_provisional(
                         &staged.collection,
                         staged.stage.marker(),
@@ -266,6 +286,7 @@ pub(super) async fn resolve_collections<S: CellStore>(
 pub(super) async fn abort_collections<S: CellStore>(
     store: &S,
     collections: &[StagedCollection],
+    alert: &RetryAlert,
     shutdown: &(impl Fn() -> bool + Sync),
 ) -> bool {
     // Indices keep the closure free of a higher-ranked borrow.
@@ -273,13 +294,17 @@ pub(super) async fn abort_collections<S: CellStore>(
         .map(|index| {
             let staged = &collections[index];
             cooperative(async move {
-                !matches!(
-                    retry_step(shutdown, "keyed-state rollback", || {
-                        store.abort_provisional(&staged.collection, staged.stage.writes())
-                    })
-                    .await,
-                    StepOutcome::Abandon
-                )
+                let step = Step {
+                    action: "roll back the staged changes",
+                    key: None,
+                    collection: Some(staged.collection.id().name().as_str()),
+                    on_rejection: STAGED_CELLS_STAY,
+                };
+                let outcome = retry_step(alert, shutdown, step, || {
+                    store.abort_provisional(&staged.collection, staged.stage.writes())
+                })
+                .await;
+                !matches!(outcome, StepOutcome::Abandon)
             })
         })
         .buffer_unordered(STATE_FANOUT_CONCURRENCY)

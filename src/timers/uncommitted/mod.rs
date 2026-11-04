@@ -23,13 +23,16 @@
 //! persistent state for potential reloading.
 
 use crate::consumer::{Keyed, Uncommitted};
+use crate::error::{ClassifyError, RetryAlert, log_at};
 use crate::otel::SpanRelation;
 use crate::related_span;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::TriggerTrace;
 use crate::timers::datetime::CompactDateTime;
+use crate::timers::error::TimerManagerError;
 use crate::timers::manager::TimerManager;
+use crate::timers::scheduler::TimerSchedulerError;
 use crate::timers::store::TriggerStore;
 use crate::{Key, ProcessScope};
 use arc_swap::ArcSwap;
@@ -377,18 +380,32 @@ where
         }
 
         // Retry loop: ensure TimerManager::complete eventually succeeds.
+        let alert = RetryAlert::default();
         loop {
             match self
                 .manager
                 .complete(&self.key, self.time, self.timer_type, self.tag)
                 .await
             {
-                Ok(()) => break,
+                // A stopped scheduler means that the partition stopped. The
+                // stored timer fires again after the next assignment.
+                Ok(()) | Err(TimerManagerError::Scheduler(TimerSchedulerError::Shutdown)) => break,
+                // A schema fault or a corrupt trigger does not clear by retry.
                 Err(error) => {
-                    warn!("failed to commit timer: {error:#}; retrying");
-                    sleep(RETRY_DURATION).await;
+                    let (topic, partition) = self.manager.partition();
+                    log_at!(
+                        alert.level(error.classify_error()),
+                        %topic,
+                        partition,
+                        key = %self.key,
+                        fire_time = %self.time,
+                        timer_type = ?self.timer_type,
+                        "Prosody cannot delete a fired timer: {error:#}. Later events for this \
+                         key wait while Prosody retries every second."
+                    );
                 }
             }
+            sleep(RETRY_DURATION).await;
         }
 
         self.completed = true;

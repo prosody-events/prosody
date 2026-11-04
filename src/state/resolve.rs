@@ -164,8 +164,8 @@ where
     StoreErr: Error + 'static,
 {
     /// The cell store operation failed.
-    #[error("keyed-state cell store failed")]
-    Store(#[source] StoreErr),
+    #[error("keyed-state cell store failed: {0:#}")]
+    Store(StoreErr),
 }
 
 impl<StoreErr> ClassifyError for ResolveCellError<StoreErr>

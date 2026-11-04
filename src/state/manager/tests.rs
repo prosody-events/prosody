@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::codec::JsonCodec;
-use crate::error::ErrorCategory;
+use crate::error::{ErrorCategory, RetryAlert};
 use crate::state::backend::AdmissionChecks;
 use crate::state::cell::Values;
 use crate::state::fjall::test_db::cold_marker_checks;
@@ -282,8 +282,6 @@ async fn legacy_deregistration(value: u8) -> Result<()> {
 
 /// Failed stages and repaired promotes remove the admission proof.
 async fn run_settle_proof(mode: u8, value: u8) -> Result<bool> {
-    use crate::codec::JsonCodec;
-    use crate::state::descriptor::value_state;
     use crate::state::registry::CollectionDef;
     use crate::state::session::{Finalized, sealed::StateLifecycle};
     use crate::state::tests::cell_suite::{FailingCellStore, Poison, value_cell};
@@ -353,11 +351,12 @@ async fn run_settle_proof(mode: u8, value: u8) -> Result<bool> {
                     ErrorCategory::Permanent,
                 )));
             }
-            match staged.promote(|| mode % 4 == 2).await {
+            let alert = RetryAlert::default();
+            match staged.promote(&alert, || mode % 4 == 2).await {
                 Promoted::Complete => ensure!(mode % 4 == 3),
                 Promoted::Torn(rejected) => {
                     ensure!(mode % 4 == 1);
-                    ensure!(rejected.abort(|| false).await);
+                    ensure!(rejected.abort(&alert, || false).await);
                 }
                 Promoted::Abandoned => ensure!(mode % 4 == 2),
                 Promoted::Rejected(_) => return Ok(false),

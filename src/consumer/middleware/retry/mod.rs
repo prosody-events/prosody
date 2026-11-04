@@ -56,6 +56,7 @@
 //!
 //! [`ErrorCategory::Transient`]: crate::consumer::middleware::ErrorCategory::Transient
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use derive_builder::Builder;
@@ -72,13 +73,14 @@ use crate::consumer::middleware::{
     abandon, settle,
 };
 use crate::consumer::{DemandType, EventHandler, HandlerProvider, Keyed};
+use crate::error::RetryAlert;
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use crate::{Partition, Topic};
 
 mod engine;
 
-use engine::{Resolution, log_message_failure, log_timer_failure};
+use engine::{Layer, Resolution};
 
 // Configuration
 // ============================================================================
@@ -156,22 +158,38 @@ pub struct RetryProvider<T> {
     config: RetryConfiguration,
 }
 
+/// The `Terminal` abort alerts of one partition. A message abort holds the
+/// partition's offsets and a timer abort does not, so each kind has its own
+/// alert.
+#[derive(Debug, Default)]
+struct Aborts {
+    message: RetryAlert,
+    timer: RetryAlert,
+}
+
 /// A handler wrapped with retry functionality.
 #[derive(Clone, Debug)]
 pub struct RetryHandler<T> {
     base_delay_millis: u64,
     max_delay_millis: u64,
     max_retries: u32,
+    topic: Topic,
+    partition: Partition,
+    /// The partition's `Terminal` abort alerts. Every clone shares them.
+    aborts: Arc<Aborts>,
     handler: T,
 }
 
 impl<T> RetryProvider<T> {
     /// Creates a retry handler for the given topic and partition.
-    fn create_handler<H>(&self, handler: H) -> RetryHandler<H> {
+    fn create_handler<H>(&self, topic: Topic, partition: Partition, handler: H) -> RetryHandler<H> {
         RetryHandler {
             base_delay_millis: self.config.base.as_millis() as u64,
             max_delay_millis: self.config.max_delay.as_millis() as u64,
             max_retries: self.config.max_retries,
+            topic,
+            partition,
+            aborts: Arc::default(),
             handler,
         }
     }
@@ -191,27 +209,18 @@ where
         H: HandlerMethod<T>,
         C: EventContext<Payload = T::Payload>,
     {
-        let topic = message.topic();
-        let partition = message.partition();
         let key = message.key();
         let offset = message.offset();
         let (resolution, _final) = self
             .run(
                 context,
                 demand_type,
-                Some(self.max_retries),
+                Layer::Inner {
+                    max_retries: self.max_retries,
+                },
                 |ctx, dt| H::call(&self.handler, ctx, message.clone(), dt),
                 |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |reason| {
-                    log_message_failure(
-                        topic.as_ref(),
-                        partition,
-                        key.as_ref(),
-                        offset,
-                        &reason,
-                        "",
-                    );
-                },
+                |failure| self.log_message(key, offset, failure),
             )
             .await;
         match resolution {
@@ -272,7 +281,11 @@ where
     type Handler = RetryHandler<T::Handler>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        self.create_handler(self.provider.handler_for_partition(topic, partition))
+        self.create_handler(
+            topic,
+            partition,
+            self.provider.handler_for_partition(topic, partition),
+        )
     }
 }
 
@@ -284,7 +297,11 @@ where
     type Handler = RetryHandler<T::Handler>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        self.create_handler(self.provider.handler_for_partition(topic, partition))
+        self.create_handler(
+            topic,
+            partition,
+            self.provider.handler_for_partition(topic, partition),
+        )
     }
 }
 
@@ -360,10 +377,12 @@ where
             .run(
                 context,
                 demand_type,
-                Some(self.max_retries),
+                Layer::Inner {
+                    max_retries: self.max_retries,
+                },
                 |ctx, dt| self.handler.on_timer(ctx, timer.clone(), dt),
                 |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |reason| log_timer_failure(&reason, ""),
+                |failure| self.log_timer(&timer, failure),
             )
             .await;
         match resolution {

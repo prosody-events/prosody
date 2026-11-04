@@ -377,7 +377,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         self.defer_first_timer_resolved(&segment_id, trigger, cached)
             .await?;
 
-        debug!(key = ?trigger.key, time = %trigger.time, "Stored first deferred timer");
+        debug!(key = %trigger.key, time = %trigger.time, "Prosody stored the first deferred timer for the key");
         Ok(())
     }
 
@@ -479,11 +479,11 @@ impl TimerDeferStore for CassandraTimerDeferStore {
                 let next_time = entry.time;
                 self.cache.insert(Arc::clone(key), Some(entry));
 
-                debug!(key = ?key, time = %time, next_time = %next_time, "Completed FIFO timer retry");
+                debug!(key = %key, time = %time, next_time = %next_time, "A deferred timer finished, so Prosody moves to the next deferred timer of the key");
                 Ok(TimerRetryCompletionResult::MoreTimers)
             } else {
                 self.delete_key(key).await?;
-                debug!(key = ?key, time = %time, "Completed last timer retry");
+                debug!(key = %key, time = %time, "The last deferred timer for the key finished");
                 Ok(TimerRetryCompletionResult::Completed)
             }
         } else {
@@ -587,7 +587,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
             }
         }
 
-        debug!(key = ?trigger.key, time = %trigger.time, "Appended additional deferred timer");
+        debug!(key = %trigger.key, time = %trigger.time, "Prosody added a deferred timer to the key's queue");
         Ok(())
     }
 
@@ -651,7 +651,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
                 .map_err(CassandraStoreError::from)?;
         }
 
-        debug!(key = ?key, time = %time, "Removed deferred timer");
+        debug!(key = %key, time = %time, "Prosody removed a deferred timer");
         Ok(())
     }
 
@@ -664,7 +664,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         // next_timer still resolves as Some(_) here.
         let (segment_id, cached) = self.resolve_cache_or_read(key).await?;
         let Some(entry) = cached else {
-            debug!(key = ?key, "set_retry_count on empty partition: no-op");
+            debug!(key = %key, "The key has no deferred timers, so Prosody does not change the retry count");
             return Ok(());
         };
 
@@ -688,7 +688,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
             }),
         );
 
-        debug!(key = ?key, retry_count, "Updated retry count");
+        debug!(key = %key, retry_count, "Prosody updated the retry count");
         Ok(())
     }
 
@@ -703,7 +703,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
 
         self.cache.insert(Arc::clone(key), None);
 
-        debug!(key = ?key, "Deleted key from timer defer store");
+        debug!(key = %key, "Prosody deleted the deferred timers of the key");
         Ok(())
     }
 }

@@ -45,10 +45,10 @@ impl<'a> MigrationExecutor<'a> {
                 self.session
                     .query_unpaged(statement_text.as_str(), &[])
                     .await
-                    .map_err(|source| super::MigrationError::StatementExecutionFailed {
+                    .map_err(|error| super::MigrationError::StatementExecutionFailed {
                         migration: migration.filename.clone(),
                         statement_index: index + 1,
-                        source: Box::new(source),
+                        error: Box::new(error),
                     })?;
             }
         }

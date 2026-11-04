@@ -442,7 +442,7 @@ impl MessageDeferStore for CassandraMessageDeferStore {
         // next_offset still resolves as Some(_) here.
         let (segment_id, cached) = self.resolve_cache_or_read(key).await?;
         let Some((cur_next, _)) = cached else {
-            debug!(key = ?key, "set_retry_count on empty partition: no-op");
+            debug!(key = %key, "The key has no deferred messages, so Prosody does not change the retry count");
             return Ok(());
         };
 
