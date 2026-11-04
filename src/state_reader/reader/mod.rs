@@ -210,7 +210,8 @@ where
     ///
     /// # Errors
     ///
-    /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
+    /// Any [`StateReaderError`]: an acquisition or identity failure, an empty
+    /// key, or a store failure from the bound handle.
     pub async fn contains<K: Into<Key>>(&self, key: K) -> Result<bool, StateReaderError> {
         let handle = self.bound(key.into()).await?;
         handle

@@ -1,96 +1,31 @@
 //! Value descriptors preserve typed payloads and absence.
 
 use super::*;
-use color_eyre::eyre::WrapErr;
-use std::iter::{empty, once};
 
 pub(super) fn cart() -> ValueDescriptor {
     value_state("cart")
 }
 
-/// One step of a Value trace.
-#[derive(Clone, Debug)]
-enum ValueStep {
-    Set(Value),
-    Clear,
-    Commit,
-    Rollback,
-}
-
-impl Arbitrary for ValueStep {
-    fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 5 {
-            0 | 1 => Self::Set(ArbJson::arbitrary(g).0),
-            2 => Self::Clear,
-            3 => Self::Commit,
-            _ => Self::Rollback,
-        }
-    }
-
-    /// Shrinks a set payload to JSON null, the smallest payload.
-    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        match self {
-            Self::Set(value) if !value.is_null() => Box::new(once(Self::Set(Value::Null))),
-            _ => Box::new(empty()),
-        }
-    }
-}
-
-/// Oracle invariant: before the first step and after each step, `get`
-/// returns the model value and `contains` reports whether the model holds
-/// one. The model is the visible value and the last committed value.
-/// `rollback` restores the committed value. A JSON null is a stored payload,
-/// so `contains` reports it present. The value survives the full
+/// Round-trip invariant: for every JSON-representable value, `set(v)` then
+/// `get()` returns `Some(v)` and `contains()` reports it present. A JSON null
+/// is a stored payload, so it is present too. The value survives the full
 /// `T → codec → cell bytes → store → cell bytes → codec → T` path through
-/// the real session substrate.
-async fn value_trace(steps: Vec<ValueStep>) -> Result<bool> {
+/// the real session substrate. The erased value parity properties in
+/// `consumer::event_context` cover absence, clear, commit, and rollback.
+async fn roundtrip(value: Value) -> Result<bool> {
     let handle = bind_registered(cart(), MemoryLoader::new())?;
-    let mut visible = None;
-    let mut committed = None;
-    for (index, step) in steps.into_iter().enumerate() {
-        if !matches_model(&handle, visible.as_ref()).await? {
-            return Ok(false);
-        }
-
-        let context = || format!("step {index}");
-        match step {
-            ValueStep::Set(value) => {
-                handle.set(value.clone()).await.wrap_err_with(context)?;
-                visible = Some(value);
-            }
-            ValueStep::Clear => {
-                handle.clear().await.wrap_err_with(context)?;
-                visible = None;
-            }
-            ValueStep::Commit => {
-                handle.commit().await.wrap_err_with(context)?;
-                committed.clone_from(&visible);
-            }
-            ValueStep::Rollback => {
-                handle.rollback().await;
-                visible.clone_from(&committed);
-            }
-        }
-    }
-    matches_model(&handle, visible.as_ref()).await
-}
-
-/// Whether `get` and `contains` both agree with `model`.
-async fn matches_model(
-    handle: &ValueHandle<TestSession, JsonCodec>,
-    model: Option<&Value>,
-) -> Result<bool> {
-    Ok(handle.get().await?.as_ref() == model && handle.contains().await? == model.is_some())
+    handle.set(value.clone()).await?;
+    Ok(handle.get().await? == Some(value) && handle.contains().await?)
 }
 
 #[test]
-pub(super) fn prop_value_trace_matches_model() {
-    fn prop(steps: Vec<ValueStep>) -> TestResult {
-        let input_dbg = format!("{steps:#?}");
-        let result = TEST_RUNTIME.block_on(value_trace(steps));
-        finish_trace(result, "value trace diverged from the model", &input_dbg)
+pub(super) fn prop_descriptor_set_get_roundtrip() {
+    fn prop(value: ArbJson) -> TestResult {
+        let input_dbg = format!("{value:#?}");
+        let result = TEST_RUNTIME.block_on(roundtrip(value.0));
+        finish_trace(result, "typed roundtrip lost", &input_dbg)
     }
-    QuickCheck::new().quickcheck(prop as fn(Vec<ValueStep>) -> TestResult);
+    QuickCheck::new().quickcheck(prop as fn(ArbJson) -> TestResult);
 }
 
 /// A user-written typed cell: the codec **is** the typing, so a `Cart`
