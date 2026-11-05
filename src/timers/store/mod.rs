@@ -20,7 +20,6 @@
 //! implement the same trait to provide durability.
 
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::segment::{timer_segment_id, timer_segment_name};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
@@ -186,10 +185,9 @@ pub struct Segment {
 }
 
 impl Segment {
-    /// Canonical per-Kafka-partition segment, layout V4.
-    ///
-    /// The name and the id both come from the crate segment module, which owns
-    /// the frozen format for each.
+    /// Canonical per-Kafka-partition segment, layout V4. The name is
+    /// `{group}:{topic}/{partition}`, and the id is `UUIDv5(NAMESPACE_URL,
+    /// name)`. Both are frozen on-disk contracts, checked by `segment_ids_frozen`.
     ///
     /// The partition loop creates this segment once at acquisition.
     /// State admission receives the resulting trigger store.
@@ -200,9 +198,9 @@ impl Segment {
         partition: Partition,
         slab_size: CompactDuration,
     ) -> Self {
-        let name = timer_segment_name(group_id, topic, partition);
+        let name = format!("{group_id}:{topic}/{partition}");
         Self {
-            id: timer_segment_id(&name),
+            id: Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()),
             name,
             slab_size,
             version: SegmentVersion::V4,

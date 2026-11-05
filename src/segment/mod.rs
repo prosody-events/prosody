@@ -1,6 +1,5 @@
-//! The two frozen per-Kafka-partition segment id formulas, owned by no
-//! subsystem: [`partition_segment_id`] for the defer and keyed-state rows,
-//! and [`timer_segment_name`] with [`timer_segment_id`] for the timer rows.
+//! Canonical per-Kafka-partition segment id: the type and its derivation,
+//! owned by neither the defer nor the keyed-state subsystem.
 
 use crate::{Partition, Topic};
 use uuid::Uuid;
@@ -15,40 +14,17 @@ pub type SegmentId = Uuid;
 /// ([`crate::consumer::middleware::defer::segment::Segment`]) and the
 /// keyed-state segment so both name a partition with the same id.
 ///
-/// **Invariant (frozen on-disk contract):** released defer data — and
-/// keyed-state data once released — is keyed by this output. The namespace
-/// (`NAMESPACE_OID`) and format MUST NOT change, or all persisted rows are
-/// orphaned. Pinned by `defer_segment_id_frozen`.
+/// **Invariant (frozen on-disk contract):** persisted defer and keyed-state
+/// rows are keyed by this output. A change to the namespace (`NAMESPACE_OID`)
+/// or the format orphans every row. `segment_ids_frozen` checks this output.
 ///
-/// Timers keep a second, older derivation ([`timer_segment_id`]) and their own
-/// `SegmentId` alias. A later change migrates timer data onto this id and folds
-/// that alias into this one.
+/// TODO: timers use an older formula (`timers::store::Segment::for_partition`).
+/// Move timer data to this id with `migrate_segment_if_needed`, then remove
+/// the timer `SegmentId` alias.
 #[must_use]
 pub(crate) fn partition_segment_id(topic: Topic, partition: Partition, group: &str) -> SegmentId {
     let name = format!("{topic}/{partition}:{group}");
     Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes())
-}
-
-/// The name one timer segment is known by: `"{group}:{topic}/{partition}"`.
-///
-/// **Invariant (frozen on-disk contract):** this string is both the
-/// `timer_segments.name` column and the input to [`timer_segment_id`]. Both
-/// must come from here. A second copy of the format lets the stored name and
-/// the id drift apart. Pinned by `timer_segment_id_frozen`.
-#[must_use]
-pub(crate) fn timer_segment_name(group: &str, topic: Topic, partition: Partition) -> String {
-    format!("{group}:{topic}/{partition}")
-}
-
-/// Timer segment id: `UUIDv5(NAMESPACE_URL, name)` over a name that
-/// [`timer_segment_name`] built.
-///
-/// **Invariant (frozen on-disk contract):** released timer data is keyed by
-/// this output. The namespace and the name format MUST NOT change, or every
-/// persisted trigger is orphaned. Pinned by `timer_segment_id_frozen`.
-#[must_use]
-pub(crate) fn timer_segment_id(name: &str) -> SegmentId {
-    Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes())
 }
 
 #[cfg(test)]
