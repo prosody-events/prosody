@@ -1,9 +1,8 @@
 //! Adapts `TriggerOperations` to implement `TriggerStore`.
 //!
 //! This module provides the `TableAdapter` struct that wraps a type
-//! implementing `TriggerOperations` (22 primitive methods) and provides the
-//! public `TriggerStore` interface (13 methods) with coordinated dual-table
-//! operations.
+//! implementing `TriggerOperations` and provides the public `TriggerStore`
+//! interface with coordinated dual-table operations.
 
 use crate::Key;
 use crate::timers::DELETE_CONCURRENCY;
@@ -13,8 +12,9 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentId, TriggerStore};
+use crate::timers::store::{Segment, SegmentId, StoredSegment, TriggerStore};
 use futures::{Stream, StreamExt, TryStreamExt, stream};
+use smallvec::SmallVec;
 use std::future::Future;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -23,29 +23,14 @@ use tracing::{debug, instrument};
 
 /// Adapts `TriggerOperations` to implement `TriggerStore`.
 ///
-/// This struct wraps a type implementing `TriggerOperations` (22 primitive
-/// methods) and provides the public `TriggerStore` interface (13 methods)
-/// with coordinated dual-table operations.
+/// This struct wraps a type implementing `TriggerOperations` and provides the
+/// public `TriggerStore` interface with coordinated dual-table operations.
 ///
 /// Uses `Arc` for cheap cloning and best-effort consistency via `try_join!`.
 ///
 /// **Visibility**: `pub` but not re-exported from `store/mod.rs`.
 /// Used by factory functions in implementation modules (cassandra/mod.rs,
 /// memory.rs) which return concrete `TableAdapter<T>` types.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// // Factory functions return concrete TableAdapter:
-/// pub fn cassandra_store(...) -> TableAdapter<CassandraTriggerStore> {
-///     let cassandra = CassandraTriggerStore::new(...);
-///     TableAdapter::new(cassandra)
-/// }
-///
-/// // Consumer usage:
-/// let store = cassandra_store(...);  // TableAdapter<CassandraTriggerStore>: TriggerStore
-/// let manager = TimerManager::new(..., store);
-/// ```
 #[derive(Clone)]
 pub struct TableAdapter<T> {
     operations: Arc<T>,
@@ -98,7 +83,9 @@ where
     // Pass-through methods: Delegate directly to operations
     // ===================================================================
 
-    fn get_segment(&self) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send {
+    fn get_segment(
+        &self,
+    ) -> impl Future<Output = Result<Option<StoredSegment>, Self::Error>> + Send {
         self.operations.get_segment()
     }
 
@@ -127,12 +114,6 @@ where
 
     fn delete_slab(&self, slab_id: SlabId) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.operations.delete_slab(slab_id)
-    }
-
-    fn get_slab_watermark(
-        &self,
-    ) -> impl Future<Output = Result<Option<SlabId>, Self::Error>> + Send {
-        self.operations.get_slab_watermark()
     }
 
     fn set_slab_watermark(
@@ -172,7 +153,7 @@ where
     // consistency
     // ===================================================================
 
-    #[instrument(level = "debug", skip(self, trigger), err)]
+    #[instrument(level = "debug", skip(self, trigger), err(level = "warn"))]
     async fn add_trigger(&self, trigger: Trigger) -> Result<(), Self::Error> {
         let slab = Slab::from_time(self.slab_size(), trigger.time);
         // Coordinate the two trigger-row writes; slab metadata is owned by
@@ -191,7 +172,7 @@ where
             .await
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn remove_trigger(
         &self,
         key: &Key,
@@ -217,8 +198,11 @@ where
         self.operations.current_trigger(key, time, timer_type).await
     }
 
-    #[instrument(level = "debug", skip(self, trigger), err)]
-    async fn clear_and_schedule(&self, trigger: Trigger) -> Result<(), Self::Error> {
+    #[instrument(level = "debug", skip(self, trigger), err(level = "warn"))]
+    async fn clear_and_schedule(
+        &self,
+        trigger: Trigger,
+    ) -> Result<SmallVec<[CompactDateTime; 1]>, Self::Error> {
         // INVARIANT (at-least-once delivery): Write new timer FIRST, then
         // delete old entries. If crash occurs after writing new but before
         // deleting old, both timers exist (may fire twice). If we deleted
@@ -285,6 +269,6 @@ where
             "clear_and_schedule: complete"
         );
 
-        Ok(())
+        Ok(old_times)
     }
 }

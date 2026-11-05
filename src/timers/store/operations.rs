@@ -9,9 +9,8 @@
 use crate::Key;
 use crate::error::ClassifyError;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::{Segment, SegmentVersion};
+use crate::timers::store::{Segment, StoredSegment};
 use crate::timers::{TimerType, Trigger};
 use futures::Stream;
 use smallvec::SmallVec;
@@ -47,20 +46,22 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     fn segment(&self) -> &Segment;
 
     // =========================================================================
-    // Segment Operations (3 methods)
+    // Segment Operations
     // =========================================================================
 
     /// Persists this store's segment configuration.
     fn insert_segment(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Retrieves this store's segment from persistent storage.
-    fn get_segment(&self) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send;
+    /// Retrieves this store's segment and slab watermark in one read.
+    fn get_segment(
+        &self,
+    ) -> impl Future<Output = Result<Option<StoredSegment>, Self::Error>> + Send;
 
     /// Deletes this store's segment and all associated metadata.
     fn delete_segment(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // =========================================================================
-    // Slab Metadata Operations (4 methods)
+    // Slab Metadata Operations
     // =========================================================================
 
     /// Lists all slab IDs in this store's segment.
@@ -78,15 +79,6 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
 
     /// Unregisters (deletes) a slab ID from this store's segment.
     fn delete_slab(&self, slab_id: SlabId) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Reads the persisted `slab_watermark` for this segment.
-    ///
-    /// `None` = pre-migration / fresh segment → callers should treat as
-    /// "scan from slab 0". When `Some(w)`, every slab clustering row in this
-    /// segment has `slab_id > w` (invariant I1).
-    fn get_slab_watermark(
-        &self,
-    ) -> impl Future<Output = Result<Option<SlabId>, Self::Error>> + Send;
 
     /// Persists `slab_watermark` for this segment as a single UPDATE.
     ///
@@ -112,7 +104,7 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // =========================================================================
-    // Slab Trigger Operations (4 methods)
+    // Slab Trigger Operations
     // =========================================================================
 
     /// Streams all triggers of a specific type within a slab's time range.
@@ -151,7 +143,7 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // =========================================================================
-    // Key Trigger Operations (7 methods)
+    // Key Trigger Operations
     // =========================================================================
 
     /// Streams all scheduled times for a given key and timer type.
@@ -231,15 +223,4 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<Option<Trigger>, Self::Error>> + Send;
-
-    // =========================================================================
-    // Version Management (1 method)
-    // =========================================================================
-
-    /// Updates the schema version and slab size for this store's segment.
-    fn update_segment_version(
-        &self,
-        new_version: SegmentVersion,
-        new_slab_size: CompactDuration,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

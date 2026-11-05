@@ -4,6 +4,7 @@
 use super::stage::{StageOp, cell_in};
 use super::{Fixture, Session, message, promote_receipt};
 use crate::consumer::middleware::deduplication::DeduplicationStore;
+use crate::error::RetryAlert;
 use crate::state::cell::Values;
 use crate::state::cell_key::{CellKey, Section};
 use crate::state::session::Finalized;
@@ -255,7 +256,10 @@ async fn run_multi_section(trace: MultiTrace) -> Result<()> {
                     let finalized = session.finalize().await?;
                     fx.dedup.insert(dedup).await?;
                     if let Finalized::Staged(staged) = finalized {
-                        assert!(matches!(staged.promote(|| false).await, Promoted::Complete));
+                        assert!(matches!(
+                            staged.promote(&RetryAlert::default(), || false).await,
+                            Promoted::Complete
+                        ));
                     }
                     commit_into_model(&mut model, &cells, &cleared, &surviving_clears);
                 }

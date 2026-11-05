@@ -1,0 +1,11 @@
+[plan.work.ci]
+paths = [".config/rail.toml", ".github/**"]
+scope = "repository"
+
+[plan.work.nextest]
+paths = [".config/nextest.toml"]
+scope = "repository"
+
+[plan.work.taplo]
+paths = [".taplo.toml"]
+scope = "repository"

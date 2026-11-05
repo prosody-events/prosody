@@ -42,7 +42,7 @@ where
     /// Returns a `Permanent` [`DequeStateError`] when the bounds cell is
     /// corrupt or the count exceeds `usize`, or an access error from the
     /// session.
-    #[instrument(name = "deque.len", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "deque.len", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     #[read(op)]
     pub async fn len(&self) -> Result<usize, DequeStateError<CellCodecError<T>>> {
         Ok(bounds(op).await?.len()?)
@@ -54,7 +54,7 @@ where
     ///
     /// Returns a `Permanent` [`DequeStateError`] when the bounds cell is
     /// corrupt, or an access error from the session.
-    #[instrument(name = "deque.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "deque.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     #[read(op)]
     pub async fn is_empty(&self) -> Result<bool, DequeStateError<CellCodecError<T>>> {
         let window = bounds(op).await?;
@@ -74,7 +74,7 @@ where
         name = "deque.get",
         skip_all,
         fields(collection = self.cells.name().as_str(), deque.index = Empty),
-        err
+        err(level = "warn")
     )]
     #[read(op)]
     pub async fn get(
@@ -117,7 +117,7 @@ where
     /// Returns a codec error (`Permanent`) when the entry does not decode, a
     /// `Permanent` meta error when the bounds cell is corrupt, or an access
     /// error from the session.
-    #[instrument(name = "deque.peek_front", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "deque.peek_front", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     #[read(op)]
     pub async fn peek_front(
         &self,
@@ -139,7 +139,7 @@ where
     /// # Errors
     ///
     /// See [`peek_front`](Self::peek_front).
-    #[instrument(name = "deque.peek_back", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "deque.peek_back", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     #[read(op)]
     pub async fn peek_back(
         &self,
@@ -275,7 +275,7 @@ where
     ///
     /// Returns a codec error (`Permanent`) when `value` does not encode, a
     /// `Permanent` meta error on index-space exhaustion, or an access error.
-    #[instrument(name = "deque.push_back", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "deque.push_back", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     #[write(op)]
     pub async fn push_back(
         &self,
@@ -309,7 +309,7 @@ where
     /// # Errors
     ///
     /// See [`Self::push_back`].
-    #[instrument(name = "deque.push_front", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "deque.push_front", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     #[write(op)]
     pub async fn push_front(
         &self,
@@ -350,7 +350,7 @@ where
     ///
     /// Returns a codec error (`Permanent`) when the entry does not decode, a
     /// `Permanent` meta error on corruption, or an access error.
-    #[instrument(name = "deque.pop_front", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "deque.pop_front", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     #[write(op)]
     pub async fn pop_front(
         &self,
@@ -377,7 +377,7 @@ where
     /// # Errors
     ///
     /// See [`Self::pop_front`].
-    #[instrument(name = "deque.pop_back", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "deque.pop_back", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     #[write(op)]
     pub async fn pop_back(
         &self,
@@ -407,7 +407,7 @@ where
     /// # Errors
     ///
     /// Returns an access error from the session.
-    #[instrument(name = "deque.clear", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "deque.clear", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     #[write(op)]
     pub async fn clear(&self) -> Result<(), DequeStateError<CellCodecError<T>>> {
         op.clear_collection();
@@ -422,7 +422,7 @@ where
     /// # Errors
     ///
     /// Returns an access error from the session.
-    #[instrument(name = "deque.commit", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[instrument(name = "deque.commit", skip_all, fields(collection = self.cells.name().as_str()), err(level = "warn"))]
     pub async fn commit(&self) -> Result<StoreOutcome, DequeStateError<CellCodecError<T>>>
     where
         S: WritableStateSession,

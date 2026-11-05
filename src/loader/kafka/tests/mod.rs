@@ -1,5 +1,4 @@
 use super::*;
-use crate::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use crate::codec::JsonCodec;
 use crate::consumer::Keyed;
 use crate::consumer::message::ConsumerRecord;
@@ -8,6 +7,7 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
 use crate::telemetry::Telemetry;
 use crate::test_util::TEST_RUNTIME;
+use crate::test_util::kafka::{self, BOOTSTRAP, admin, create_topic, delete_topic};
 use crate::tracing::init_test_logging;
 use crate::{Offset, Partition, Topic};
 use ahash::AHashMap;
@@ -33,7 +33,7 @@ fn test_topic(name: &str) -> String {
 
 fn loader_config() -> LoaderConfiguration {
     LoaderConfiguration {
-        bootstrap_servers: vec!["localhost:9094".to_owned()],
+        bootstrap_servers: vec![BOOTSTRAP.to_owned()],
         group_id: "prosody-test".to_owned(),
         max_permits: 10,
         cache_size: 1, // Minimal size to stress test deadlock prevention and eviction
@@ -75,45 +75,16 @@ async fn try_load_reports_transient_capacity_exhaustion() -> color_eyre::Result<
 
 fn producer() -> color_eyre::Result<FutureProducer> {
     let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9094")
+        .set("bootstrap.servers", BOOTSTRAP)
         .create()?;
     Ok(producer)
-}
-
-fn admin() -> color_eyre::Result<&'static ProsodyAdminClient> {
-    let config = AdminConfiguration::new(vec!["localhost:9094".to_owned()])?;
-    Ok(ProsodyAdminClient::cached(&config)?)
-}
-
-async fn create_topic(name: &str) -> color_eyre::Result<()> {
-    create_topic_with_partitions(name, 1).await
-}
-
-async fn create_topic_with_partitions(name: &str, partitions: u16) -> color_eyre::Result<()> {
-    let admin = admin()?;
-    let topic_config = TopicConfiguration::builder()
-        .name(name)
-        .partition_count(partitions)
-        .build()?;
-    admin.create_topic(&topic_config).await?;
-    Ok(())
-}
-
-async fn delete_topic(name: &str) -> color_eyre::Result<()> {
-    let admin = admin()?;
-    admin.delete_topic(name).await?;
-    Ok(())
 }
 
 async fn with_topic(
     name: &str,
     body: impl AsyncFn(&str) -> color_eyre::Result<()>,
 ) -> color_eyre::Result<()> {
-    let topic_name = test_topic(name);
-    create_topic(&topic_name).await?;
-    let result = body(&topic_name).await;
-    delete_topic(&topic_name).await?;
-    result
+    with_partitioned_topic(name, 1, body).await
 }
 
 async fn with_partitioned_topic(
@@ -121,11 +92,7 @@ async fn with_partitioned_topic(
     partitions: u16,
     body: impl AsyncFn(&str) -> color_eyre::Result<()>,
 ) -> color_eyre::Result<()> {
-    let topic_name = test_topic(name);
-    create_topic_with_partitions(&topic_name, partitions).await?;
-    let result = body(&topic_name).await;
-    delete_topic(&topic_name).await?;
-    result
+    kafka::with_topic(&test_topic(name), partitions, body).await
 }
 
 async fn produce_messages_to_partition(
@@ -189,7 +156,7 @@ async fn delete_records_multi(
 fn watermark_consumer() -> color_eyre::Result<Arc<BaseConsumer>> {
     Ok(Arc::new(
         ClientConfig::new()
-            .set("bootstrap.servers", "localhost:9094")
+            .set("bootstrap.servers", BOOTSTRAP)
             .set("group.id", "prosody-test-setup")
             .create()?,
     ))

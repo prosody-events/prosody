@@ -3,6 +3,7 @@
 use super::{Fixture, message};
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::error::ErrorCategory;
+use crate::error::RetryAlert;
 use crate::state::cell::Values;
 use crate::state::session::Finalized;
 use crate::state::session::Promoted;
@@ -72,7 +73,10 @@ async fn failed_finalize_keeps_the_buffer_whole_for_retry() -> Result<()> {
         bail!("the healed retry must re-stage from the intact buffer");
     };
     fx.dedup.insert(dedup_id).await?;
-    assert!(matches!(staged.promote(|| false).await, Promoted::Complete));
+    assert!(matches!(
+        staged.promote(&RetryAlert::default(), || false).await,
+        Promoted::Complete
+    ));
     for (name, expected) in [(&cart, b"c1"), (&wishlist, b"w1")] {
         let id = CollectionId::new(fx.state_key.clone(), StateType::Application, name.clone());
         assert_eq!(
@@ -152,7 +156,10 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
     );
 
     fx.dedup.insert(dedup_id).await?;
-    assert!(matches!(staged.promote(|| false).await, Promoted::Complete));
+    assert!(matches!(
+        staged.promote(&RetryAlert::default(), || false).await,
+        Promoted::Complete
+    ));
 
     assert_eq!(
         fx.committed_value().await?,

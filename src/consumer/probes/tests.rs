@@ -17,7 +17,7 @@ const REQUEST_GUARD: Duration = Duration::from_secs(5);
 /// what makes the one pair of functions both surfaces call checkable here.
 #[tokio::test]
 async fn test_probe_server_endpoints_respond() -> Result<()> {
-    let managers: Arc<Managers<serde_json::Value>> = Arc::default();
+    let managers: Arc<Managers> = Arc::default();
     let heartbeats = HeartbeatRegistry::test();
     let server = ProbeServer::new(0, managers, heartbeats)?;
     let address = server.local_addr();

@@ -6,7 +6,7 @@ Distributed Kafka consumer framework with a timer system and pluggable storage b
 
 These come before everything else. Every change is judged against them.
 
-**Write code that is simple, clear, well-factored, elegant, beautiful, easy to understand, correct, and idiomatic.** A reader should grasp the intent without effort. If a change makes the code harder to read, the change is wrong, even if it's faster or shorter. If two designs are correct, pick the one that's easier to delete.
+**Write code that is simple, clear, well-factored, DRY, performant, elegant, beautiful, easy to understand, correct, and idiomatic.** A reader should grasp the intent without effort. If a change makes the code harder to read, the change is wrong, even if it's faster or shorter. If two designs are correct, pick the one that's easier to delete.
 
 **Make invalid states unrepresentable in the type system.** When the compiler can prove a contract, no test, comment, or convention has to. Prefer:
 - Distinct types for distinct concepts (`TimerRequest` vs `Trigger`) over flag fields and "set this when X" rules.
@@ -16,7 +16,7 @@ These come before everything else. Every change is judged against them.
 
 If a bug class can be made uncompilable, do that instead of writing a runtime check.
 
-**Delete more than you add.** Every change should leave the codebase smaller, simpler, or both — measured by lines, types, indirections, or cognitive load. If you must add code, look first for duplication you can fold, abstractions that no longer pay rent, dead branches, and stale comments. The end-state diff should net negative whenever the task allows. Bloat compounds; aggressively prune. The bar applies per change, and line count is not the only axis: a fold that buys line savings with generic machinery (GATs, trait plumbing, flag parameters) is not a simplification — plain duplicated arms are often the better reading.
+**Delete more than you add.** Every change should leave the codebase smaller, simpler, or both — measured by lines, types, indirections, or cognitive load. If you must add code, look first for duplication you can fold, abstractions that no longer pay rent, dead branches, and stale comments. The end-state diff should net negative whenever the task allows. Each added line must be inherent to the problem, not incidental to the solution. Bloat compounds; aggressively prune. The bar applies per change, and line count is not the only axis: a fold that buys line savings with generic machinery (GATs, trait plumbing, flag parameters) is not a simplification — plain duplicated arms are often the better reading.
 
 **Identify, document, and enforce invariants.** For every load-bearing piece of state:
 1. Name the invariant.
@@ -50,7 +50,8 @@ aspirations — perform each one; do not merely agree with it:
    exemplar path, metric motivating the change — was verified to resolve, not
    recalled from memory. Re-measure headline numbers before acting on them;
    measurement artifacts (file moves, reclassified lines) masquerade as signal.
-8. The diff is net-negative, or each addition is individually justified.
+8. The diff is net-negative, or each addition is individually justified as
+   inherent to the problem.
 
 ## Critical Rules
 
@@ -529,10 +530,42 @@ These invariants are why LWTs, distributed locks, and optimistic concurrency are
 
 **Batching:** When multiple statements target the **same partition (same row key)**, group them into an `UNLOGGED BATCH` whenever possible. Same-partition unlogged batches are atomic on the replica and execute as a single mutation, eliminating extra coordinator round-trips. Never use `LOGGED BATCH` for performance reasons, and never batch across partitions to "reduce round-trips" — that's an anti-pattern that overloads the coordinator.
 
+**Tombstones:** each row tombstone and each range marker that a read crosses
+counts toward `tombstone_warn_threshold` and `tombstone_failure_threshold`.
+Past the failure threshold, Cassandra aborts the read. Delete the widest range
+that you can prove is dead. Use this order of preference:
+
+1. Write no tombstone. Overwrite in place, as the timer `state` column does.
+2. Delete the partition. Only a partition delete lets a read skip older
+   SSTables.
+3. Delete a clustering range in which every row is dead now. Prefer an open
+   prefix (`< watermark`). A newer, wider prefix shadows the older ones, so a
+   read counts only two markers. The gap deletes in
+   `src/state/cassandra/cell/queries.rs` follow this rule.
+4. Delete one row only when you know of no wider dead range. A range around
+   one row costs two markers, which is more than one row tombstone.
+
+Choose a clustering order that keeps dead rows next to each other. No range
+can cover dead rows that sit between live rows. A range removes the covered
+tombstones from the read count at once. The read cost falls only after
+compaction. Later inserts into the range survive, because a range tombstone
+removes only writes with an older timestamp.
+
 **Bind persisted types directly via their scylla serdes.** Pass persisted types to the driver through their `SerializeValue`/`DeserializeValue` impls; never hand-convert to a driver primitive (`i8`/`i16`/etc.) at the call site. When you persist a type, give it idiomatic `From<Self> for iN` / `TryFrom<iN> for Self` discriminator conversions (a dedicated error for the fallible direction) and let the scylla serde delegate through them — e.g. `i8::from(*self).serialize(...)`; see `TimerType`, `SegmentVersion`, `StateType`, `CollectionKindId`, `Encoding`, `CellKind`. Do not add bespoke `as_iN`/`from_iN` inherent methods; the trait impls are the single conversion surface. Reads may keep deserializing the raw primitive and validating it through `TryFrom` in a fallible post-step **only** when a bad value must classify `Permanent` (or be skipped for forward-compat) rather than become scylla's `Terminal` `DeserializationError` — as the `EventRef` UDT and the discriminators above do. In that case the serde is serialize-only by design (a `SerializeValue` impl with no `DeserializeValue`, since the latter cannot express "skip this row"); document the read-side validator it pairs with.
 
 **Static columns:** a static column returns NULL for every clustering row
 except the first in the partition. Read it as `Option<T>` and filter in code.
+
+A read that selects only static columns still scans the clustering rows. It
+stops at the first live row. If the partition has no live row, the read
+crosses every tombstone in it. No CQL form reads the static row alone. Read a
+static column together with a row read that needs it. Alternatively, read it
+where a live row always sits at the start of the read.
+
+A static column is not necessary for atomic updates, because a same-partition
+`UNLOGGED BATCH` is atomic for any rows. For header data that partitions
+without live rows must keep, use a row at a reserved clustering prefix. Read
+it by that prefix, as the keyed-state `Marker` kind does.
 
 **TTL overflow protection:** Cassandra's maximum TTL is 630,720,000 seconds
 (20 years). Check every computed TTL against that maximum before binding.
@@ -591,15 +624,50 @@ arithmetic.
 
 **Instrument with `#[instrument]`, never a hand-built `info_span!` +
 `.instrument(...)`.** The repo pattern: `#[instrument(name = "map.set",
-skip_all, fields(collection = ..., map.key = ?key), err)]` for user-facing
-operations (span name = the operation, low-cardinality; `skip_all` plus
-explicit `fields` control the attributes; `err` records failures on the span),
-and `#[instrument(level = "debug", skip(self), err)]` for internal plumbing.
+skip_all, fields(collection = ..., map.key = ?key), err(level = "warn"))]` for
+user-facing operations (span name = the operation, low-cardinality; `skip_all`
+plus explicit `fields` control the attributes; `err(level = "warn")` records
+failures on the span), and `#[instrument(level = "debug", skip(self),
+err(level = "warn"))]` for internal plumbing.
+
+**Choose the log level from what the reader must do:**
+
+- `error`: an operator must act.
+- `warn`: something is wrong, but it can recover by itself.
+- `info`: most users want to know the information.
+- `debug`: the information helps to debug a problem.
+
+A `Terminal` abort during shutdown is routine. Do not log it above debug.
+
+**Write each log message for an operator who does not know Prosody's
+internals.** Use STE sentences. Say what failed, what Prosody does next, and
+what the operator must do. Put the key, collection, topic, and partition in
+fields. Choose a level at runtime with `error::log_at!`.
+
+**Log level is the owner's decision.** An instrumented function returns its
+error to a caller that decides what it means, so its `err` event logs at warn.
+Mark a hand-built span failed with `otel::mark_failed`. The OTel layer marks a
+span failed from a warn event only when the event has an `error` field and no
+message (`warn_failures_mark_their_span_failed`). A `Transient` failure that
+Prosody retries also logs at warn, however long it lasts. The stall detector
+alerts on a partition that stops. An operator must act where work is lost, a
+retry ends, or a retry cannot succeed. Log these cases at error: a discarded
+message or timer, exhausted attempts, a skipped durability step, the first
+`Terminal` abort of a partition outside shutdown, a non-`Transient` error in a
+retry loop, a partition stall, or a broken invariant. `error::RetryAlert`
+makes the abort and retry loop alerts fire once, and a repeat of the alert
+logs at warn. An inner retry layer logs a failure
+that it returns at debug, because the outer layer owns the outcome.
+Before you lower a log to warn, trace its error to the owner that logs it at
+error. Create every Kafka client with `kafka_log::LogContext`; the consumer
+context calls the same log functions. Log
+Kafka poll errors with `kafka_log::log_error`. Then librdkafka connection
+failures log at warn, and other Kafka errors log at error.
 Hand-built spans are reserved for the cases the attribute cannot express: a
 function returning `impl Stream` (instrument each inner await with a clone of
 one span), a relation against a carried context (`related_span!`), a value
 known only mid-body (declare the field `Empty`, then
-`Span::current().record(...)`), and a level known only at runtime (a tracing
+`Span::current().record(...)`), and a span level known only at runtime (a tracing
 callsite's level is static — branch between two invocations). Record unsigned
 integers as `i64` — the OTel layer exports signed ints as typed Int attributes
 but stringifies `u64`/`usize` through their Debug form. Timer instants on span

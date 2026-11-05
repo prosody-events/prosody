@@ -88,13 +88,6 @@ impl<P> Keyed for ConsumerRecord<P> {
 }
 
 impl<P> ConsumerRecord<P> {
-    pub(crate) fn topic(&self) -> Topic {
-        match self {
-            Self::Message(message) => message.topic(),
-            Self::Excise(message) => message.topic(),
-        }
-    }
-
     pub(crate) fn partition(&self) -> Partition {
         match self {
             Self::Message(message) => message.partition(),

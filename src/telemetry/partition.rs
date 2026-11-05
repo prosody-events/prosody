@@ -54,6 +54,11 @@ impl TelemetryPartitionSender {
         }
     }
 
+    /// Returns the topic and partition that this sender reports.
+    pub(crate) fn source(&self) -> (Topic, Partition) {
+        (self.topic, self.partition)
+    }
+
     /// Emits a handler invoked event for the given key.
     pub fn handler_invoked(&self, key: Key, demand_type: DemandType) {
         let timestamp = self.clock.now();

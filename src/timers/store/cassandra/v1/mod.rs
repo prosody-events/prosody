@@ -216,7 +216,7 @@ impl V1Operations {
     ///
     /// Low-level method that removes a single slab entry from the segments
     /// table. Part of the v1 migration API.
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(crate) async fn delete_slab_metadata(
         &self,
         segment_id: &SegmentId,
@@ -238,7 +238,7 @@ impl V1Operations {
     ///
     /// Low-level method that removes a specific trigger identified by
     /// `(segment_id, slab_id, key, time)` from the `timer_slabs` table.
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(crate) async fn delete_slab_trigger(
         &self,
         segment_id: &SegmentId,
@@ -262,7 +262,7 @@ impl V1Operations {
     ///
     /// Low-level method that removes all triggers for a slab from the
     /// `timer_slabs` table. Uses v1 PK `((segment_id, id), key, time)`.
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(crate) async fn clear_slab_triggers(
         &self,
         segment_id: &SegmentId,
@@ -284,7 +284,7 @@ impl V1Operations {
     ///
     /// Low-level method that inserts into the v1 `timer_keys` table without
     /// `timer_type`. Part of the v1 migration API.
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(crate) async fn insert_key_trigger(
         &self,
         segment_id: &SegmentId,
@@ -354,7 +354,7 @@ impl V1Operations {
     ///
     /// Low-level method that removes a specific trigger identified by
     /// `(segment_id, key, time)` from the `timer_keys` table.
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(crate) async fn delete_key_trigger(
         &self,
         segment_id: &SegmentId,
@@ -376,7 +376,7 @@ impl V1Operations {
     /// Clears v1 triggers for a key from the `timer_keys` table.
     ///
     /// Uses v1 partition key (`segment_id`, key).
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     pub(crate) async fn clear_key_triggers(
         &self,
         segment_id: &SegmentId,

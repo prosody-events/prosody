@@ -159,6 +159,7 @@ use crossbeam_utils::CachePadded;
 use educe::Educe;
 use futures::executor::block_on;
 use parking_lot::{Mutex, RwLock};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::watch;
@@ -180,6 +181,7 @@ pub(crate) use modes::{NoResponses, Responding, ResponsePolicy};
 pub(crate) mod partition;
 mod poll;
 mod probes;
+mod source;
 mod statistics;
 pub mod storage;
 mod sweep;
@@ -196,7 +198,7 @@ type WatermarkVersion = CachePadded<AtomicUsize>;
 /// Maps (Topic, Partition) pairs to their corresponding `PartitionManager`
 /// instances. Protected by a `RwLock` to allow concurrent reads with exclusive
 /// writes.
-pub(crate) type Managers<P> = RwLock<HashMap<(Topic, Partition), PartitionManager<P>>>;
+pub(crate) type Managers = RwLock<HashMap<(Topic, Partition), PartitionManager>>;
 
 /// Holds the runtime state of the consumer.
 ///
@@ -239,7 +241,7 @@ pub struct ProsodyConsumer<C: Codec = JsonCodec> {
 
     /// Thread-safe storage for partition managers.
     #[educe(Debug(ignore))]
-    managers: Arc<Managers<C::Payload>>,
+    managers: Arc<Managers>,
 
     /// Current assigned-partition count, republished by the rebalance callback
     /// after every assign/revoke. Awaited by
@@ -254,6 +256,11 @@ pub struct ProsodyConsumer<C: Codec = JsonCodec> {
     /// Heartbeat registry for consumer-level actors.
     #[educe(Debug(ignore))]
     heartbeats: HeartbeatRegistry,
+
+    /// Names the codec of the consumer's payloads. The codec itself runs on
+    /// the partition tasks.
+    #[educe(Debug(ignore))]
+    _codec: PhantomData<fn() -> C>,
 }
 
 /// Every clone reaches the same consumer, so a clone is a second owner and
@@ -271,6 +278,7 @@ impl<C: Codec> Clone for ProsodyConsumer<C> {
             assignment: self.assignment.clone(),
             runtime_state: Arc::clone(&self.runtime_state),
             heartbeats: self.heartbeats.clone(),
+            _codec: PhantomData,
         }
     }
 }
@@ -391,13 +399,11 @@ impl<C: Codec> Drop for ProsodyConsumer<C> {
     }
 }
 
-pub(crate) fn get_assigned_partition_count<P: Send + Sync + 'static>(
-    managers: &Managers<P>,
-) -> u32 {
+pub(crate) fn get_assigned_partition_count(managers: &Managers) -> u32 {
     u32::try_from(managers.read().len()).unwrap_or(u32::MAX)
 }
 
 /// Checks if any partition is stalled.
-pub(crate) fn get_is_stalled<P: Send + Sync + 'static>(managers: &Managers<P>) -> bool {
+pub(crate) fn get_is_stalled(managers: &Managers) -> bool {
     managers.read().values().any(PartitionManager::is_stalled)
 }

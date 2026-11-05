@@ -9,8 +9,8 @@
 //!
 //! [`CassandraTriggerStore`]: super::CassandraTriggerStore
 
+use super::TimerState;
 use super::{CassandraTriggerStore, cassandra_store};
-use super::{InlineTimer, TimerState};
 use crate::Key;
 use crate::cassandra::CassandraStore;
 use crate::test_util::TEST_RUNTIME;
@@ -23,7 +23,7 @@ use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::tests::common::KEY_POOL;
 use crate::timers::store::tests::prop_key_triggers::{KeyTriggerOperation, KeyTriggerTestInput};
-use crate::timers::store::{Segment, SegmentId, SegmentVersion};
+use crate::timers::store::{Segment, SegmentId, SegmentVersion, StoredSegment};
 use crate::timers::test_support::test_segment;
 use crate::tracing::init_test_logging;
 use crate::trigger_store_tests;
@@ -36,6 +36,8 @@ use std::collections::HashSet;
 use std::ops::RangeInclusive;
 use strum::VariantArray;
 use uuid::Uuid;
+
+mod tombstones;
 
 /// Creates a test store and segment, returning `(store, segment_id)`.
 async fn setup_test_store(name: &str) -> Result<(CassandraTriggerStore, SegmentId)> {
@@ -89,25 +91,26 @@ fn prop_segment_layout_fence() {
         use crate::error::{ClassifyError, ErrorCategory};
         let (store, id) = setup_test_store_with_version("layout-fence", SegmentVersion::V3).await?;
         let slab_size = CompactDuration::new(u32::from(slab_size).max(1));
+        let segment = Segment {
+            slab_size,
+            ..store.segment.clone()
+        };
         store
-            .update_segment_version(SegmentVersion::V3, slab_size)
+            .update_segment_slab_size(&StoredSegment::from(segment))
             .await?;
         let acquired = store
             .get_segment()
             .await?
             .ok_or_else(|| color_eyre::eyre::eyre!("segment missing"))?;
-        assert_eq!(acquired.version, SegmentVersion::V4);
+        assert_eq!(acquired.into_parts().0.version, SegmentVersion::V4);
         let durable = store
             .get_segment_unchecked(&id)
             .await?
             .ok_or_else(|| color_eyre::eyre::eyre!("segment missing"))?;
-        assert_eq!(durable.version, SegmentVersion::V4);
+        assert_eq!(durable.into_parts().0.version, SegmentVersion::V4);
         store
             .session()
-            .execute_unpaged(
-                &store.queries().update_segment_version,
-                (5_i8, store.segment.slab_size, id),
-            )
+            .execute_unpaged(&store.queries().update_segment_version, (5_i8, id))
             .await?;
         let error = store
             .get_segment()
@@ -321,137 +324,6 @@ async fn assert_key_reads(
     Ok(())
 }
 
-/// Asserts the timer state matches the expected variant, with reads
-/// verification.
-///
-/// Uses `resolve_state` (which populates the cache) so that the cache
-/// assertion below is always valid. Post-V3 all states are cached.
-async fn assert_state_and_reads(
-    store: &CassandraTriggerStore,
-    segment_id: &SegmentId,
-    timer_type: TimerType,
-    key: &Key,
-    expected_state: &TimerState,
-    expected_times: &[CompactDateTime],
-    phase: &str,
-) -> Result<()> {
-    let (handle, _) = store.resolve_state(segment_id, key, timer_type).await?;
-    let state = handle.lock().await.clone();
-    match expected_state {
-        TimerState::Absent => {
-            assert_eq!(state, TimerState::Absent, "{phase}: expected Absent");
-        }
-        TimerState::Inline(expected) => {
-            assert!(
-                matches!(&state, TimerState::Inline(t) if t.time == expected.time),
-                "{phase}: expected Inline({}), got {state:?}",
-                expected.time
-            );
-        }
-        TimerState::Overflow => {
-            assert_eq!(state, TimerState::Overflow, "{phase}: expected Overflow");
-        }
-    }
-
-    // Verify the cache entry for this specific type matches the expected state.
-    // resolve_state above populated the cache for this type.
-    let cache_key = (key.clone(), timer_type);
-    let cached = store
-        .state_cache
-        .get(&cache_key)
-        .map(|h| h.try_lock().map(|g| g.clone()));
-    match expected_state {
-        TimerState::Inline(expected) => {
-            assert!(cached.is_some(), "{phase}: cache should have Inline entry");
-            assert!(
-                matches!(&cached, Some(Ok(TimerState::Inline(t))) if t.time == expected.time),
-                "{phase}: cached state should be Inline({}), got {cached:?}",
-                expected.time,
-            );
-        }
-        TimerState::Overflow => {
-            assert!(
-                cached.is_some(),
-                "{phase}: cache should have Overflow entry"
-            );
-            assert!(
-                matches!(cached, Some(Ok(TimerState::Overflow))),
-                "{phase}: cached state should be Overflow, got {cached:?}"
-            );
-        }
-        TimerState::Absent => {
-            assert!(cached.is_some(), "{phase}: cache should have Absent entry");
-            assert!(
-                matches!(cached, Some(Ok(TimerState::Absent))),
-                "{phase}: cached state should be Absent, got {cached:?}"
-            );
-        }
-    }
-
-    assert_key_reads(store, timer_type, key, expected_times, phase).await
-}
-
-/// Absent → Inline → Overflow → demotion via delete → Absent.
-///
-/// Exercises: Absent→Inline (schedule), Inline→Overflow (insert/promote),
-/// Overflow→Inline (delete demotion 2→1), Inline→Absent (delete 1→0).
-#[tokio::test]
-async fn test_state_transitions_schedule_promote_demote() -> Result<()> {
-    init_test_logging();
-    let (store, segment_id) = setup_test_store("promote_demote").await?;
-
-    let key: Key = format!("state-test-{}", Uuid::new_v4()).into();
-    let tt = TimerType::Application;
-    let t1 = CompactDateTime::from(1_000_000u32);
-    let t2 = CompactDateTime::from(2_000_000u32);
-    let absent = TimerState::Absent;
-    let inline_t1 = TimerState::Inline(InlineTimer {
-        time: t1,
-        span: HashMap::new(),
-        tag: 0,
-    });
-    let inline_t2 = TimerState::Inline(InlineTimer {
-        time: t2,
-        span: HashMap::new(),
-        tag: 0,
-    });
-
-    // Absent (0 timers)
-    assert_state_and_reads(&store, &segment_id, tt, &key, &absent, &[], "absent").await?;
-
-    // Absent → Inline via clear_and_schedule_key
-    store
-        .clear_and_schedule_key(Trigger::for_testing(key.clone(), t1, tt))
-        .await?;
-    assert_state_and_reads(&store, &segment_id, tt, &key, &inline_t1, &[t1], "schedule").await?;
-
-    // Inline → Overflow via upsert_key_trigger (promotion)
-    store
-        .upsert_key_trigger(Trigger::for_testing(key.clone(), t2, tt))
-        .await?;
-    assert_state_and_reads(
-        &store,
-        &segment_id,
-        tt,
-        &key,
-        &TimerState::Overflow,
-        &[t1, t2],
-        "promote",
-    )
-    .await?;
-
-    // Overflow → Inline(t2) via delete_key_trigger (2→1 demotion)
-    store.delete_key_trigger(tt, &key, t1).await?;
-    assert_state_and_reads(&store, &segment_id, tt, &key, &inline_t2, &[t2], "demote").await?;
-
-    // Inline → Absent via delete_key_trigger (1→0)
-    store.delete_key_trigger(tt, &key, t2).await?;
-    assert_state_and_reads(&store, &segment_id, tt, &key, &absent, &[], "delete last").await?;
-
-    store.delete_segment().await?;
-    Ok(())
-}
-
 /// Regression: `Inline→Overflow` promotion must preserve the old timer's
 /// tag, and the tag must survive a subsequent `Overflow→Inline` demotion.
 ///
@@ -520,175 +392,6 @@ async fn test_promote_preserves_tag() -> Result<()> {
     );
 
     store.remove_trigger(&key, t1, tt).await?;
-    Ok(())
-}
-
-/// Overflow→Inline via `clear_and_schedule_key`, `clear_key_triggers`
-/// paths, Inline→Inline reschedule.
-///
-/// Exercises: Overflow→Inline (`clear_and_schedule`), Inline→Absent (clear),
-/// Overflow→Absent (clear), Inline→Inline (reschedule, 0 tombstones).
-#[tokio::test]
-async fn test_state_transitions_clear_and_reschedule() -> Result<()> {
-    init_test_logging();
-    let (store, segment_id) = setup_test_store("clear_reschedule").await?;
-
-    let key: Key = format!("state-test-{}", Uuid::new_v4()).into();
-    let tt = TimerType::Application;
-    let t1 = CompactDateTime::from(1_000_000u32);
-    let t2 = CompactDateTime::from(2_000_000u32);
-    let t3 = CompactDateTime::from(3_000_000u32);
-    let absent = TimerState::Absent;
-    let inline_t2 = TimerState::Inline(InlineTimer {
-        time: t2,
-        span: HashMap::new(),
-        tag: 0,
-    });
-    let inline_t3 = TimerState::Inline(InlineTimer {
-        time: t3,
-        span: HashMap::new(),
-        tag: 0,
-    });
-
-    // Overflow → Inline via clear_and_schedule_key
-    store
-        .clear_and_schedule_key(Trigger::for_testing(key.clone(), t1, tt))
-        .await?;
-    store
-        .upsert_key_trigger(Trigger::for_testing(key.clone(), t2, tt))
-        .await?;
-    assert_key_reads(&store, tt, &key, &[t1, t2], "overflow setup").await?;
-
-    store
-        .clear_and_schedule_key(Trigger::for_testing(key.clone(), t3, tt))
-        .await?;
-    assert_state_and_reads(
-        &store,
-        &segment_id,
-        tt,
-        &key,
-        &inline_t3,
-        &[t3],
-        "overflow→inline",
-    )
-    .await?;
-
-    // Inline → Absent via clear_key_triggers
-    store.clear_key_triggers(tt, &key).await?;
-    assert_state_and_reads(&store, &segment_id, tt, &key, &absent, &[], "clear inline").await?;
-
-    // Overflow → Absent via clear_key_triggers
-    store
-        .clear_and_schedule_key(Trigger::for_testing(key.clone(), t1, tt))
-        .await?;
-    store
-        .upsert_key_trigger(Trigger::for_testing(key.clone(), t2, tt))
-        .await?;
-    store.clear_key_triggers(tt, &key).await?;
-    assert_state_and_reads(
-        &store,
-        &segment_id,
-        tt,
-        &key,
-        &absent,
-        &[],
-        "clear overflow",
-    )
-    .await?;
-
-    // Inline → Inline via clear_and_schedule_key (no tombstone)
-    store
-        .clear_and_schedule_key(Trigger::for_testing(key.clone(), t1, tt))
-        .await?;
-    store
-        .clear_and_schedule_key(Trigger::for_testing(key.clone(), t2, tt))
-        .await?;
-    assert_state_and_reads(
-        &store,
-        &segment_id,
-        tt,
-        &key,
-        &inline_t2,
-        &[t2],
-        "inline→inline",
-    )
-    .await?;
-
-    store.delete_segment().await?;
-    Ok(())
-}
-
-/// Absent → Inline via insert, Inline → Absent via delete.
-///
-/// Post-V3: inserting on any cold or warm cache with Absent state always
-/// goes to `set_state_inline` (no more clustering-only path).
-///
-/// Exercises: Absent→Inline (insert on cold cache), Inline→Absent (delete
-/// match), Absent→Inline (insert on warm/cached Absent).
-#[tokio::test]
-async fn test_state_transitions_insert_and_delete() -> Result<()> {
-    init_test_logging();
-    let (store, segment_id) = setup_test_store("insert_delete").await?;
-
-    let key: Key = format!("state-test-{}", Uuid::new_v4()).into();
-    let tt = TimerType::Application;
-    let t1 = CompactDateTime::from(1_000_000u32);
-    let absent = TimerState::Absent;
-    let inline_t1 = TimerState::Inline(InlineTimer {
-        time: t1,
-        span: HashMap::new(),
-        tag: 0,
-    });
-
-    // Post-V3: cold insert with Absent state → set_state_inline directly.
-    // State becomes Inline (not clustering-only).
-    store
-        .upsert_key_trigger(Trigger::for_testing(key.clone(), t1, tt))
-        .await?;
-    assert_state_and_reads(
-        &store,
-        &segment_id,
-        tt,
-        &key,
-        &inline_t1,
-        &[t1],
-        "cold insert",
-    )
-    .await?;
-
-    // Inline → Absent via delete_key_trigger (time match)
-    store.delete_key_trigger(tt, &key, t1).await?;
-    assert_state_and_reads(&store, &segment_id, tt, &key, &absent, &[], "delete inline").await?;
-
-    // Absent (cached) → Inline via upsert_key_trigger
-    store
-        .upsert_key_trigger(Trigger::for_testing(key.clone(), t1, tt))
-        .await?;
-    assert_state_and_reads(
-        &store,
-        &segment_id,
-        tt,
-        &key,
-        &inline_t1,
-        &[t1],
-        "cached absent→inline",
-    )
-    .await?;
-
-    // Inline → Absent via delete_key_trigger (time match)
-    store.delete_key_trigger(tt, &key, t1).await?;
-    assert_state_and_reads(
-        &store,
-        &segment_id,
-        tt,
-        &key,
-        &absent,
-        &[],
-        "delete inline 2",
-    )
-    .await?;
-
-    store.delete_segment().await?;
     Ok(())
 }
 
@@ -1566,26 +1269,15 @@ async fn prop_timer_state_invariant(
     Ok(())
 }
 
-/// Regression test for `tombstone_warn_threshold` warnings emitted by
-/// `get_segment` and `get_slab_watermark` on actor startup.
+/// The segment read skips the deleted slabs below a live slab row.
 ///
-/// Both queries select only static columns from `timer_segments` with
-/// `LIMIT 1`. With no clustering predicate, Cassandra walks the iterator
-/// from the bottom up to materialise the static row — straight through
-/// the tombstone graveyard the load-driven sweeper (PR #34) leaves at
-/// low `slab_id`. Appending `ORDER BY slab_id DESC` resolves on the
-/// live tail and skips the graveyard entirely.
-///
-/// This test seeds that exact partition shape — a dense band of
-/// tombstones at low `slab_id`, a small set of live rows above the
-/// watermark, and `slab_watermark` raised to the boundary — and asserts
-/// the two reads return the correct values. The assertion is purely
-/// behavioural; the explicit `ORDER BY slab_id DESC` in
-/// `queries.rs` is itself the durable statement about scan direction.
+/// The test seeds more tombstones at low `slab_id` than the default
+/// `tombstone_warn_threshold` of 1,000. Live slab rows sit above them, and
+/// the watermark sits between. The read must return no Cassandra warning and
+/// the correct static values.
 #[tokio::test]
 async fn test_segment_reads_skip_low_slab_tombstones() -> Result<()> {
-    /// Density of the tombstone band — chosen to mimic the post-sweeper
-    /// graveyard observed in production (~5k cells per segment partition).
+    /// About the tombstone count of one production segment partition.
     const TOMBSTONE_COUNT: u32 = 5_000;
 
     init_test_logging();
@@ -1606,27 +1298,25 @@ async fn test_segment_reads_skip_low_slab_tombstones() -> Result<()> {
         store.insert_slab(Slab::new(slab_id, slab_size)).await?;
     }
 
-    // Raise the watermark to the boundary — same as the sweeper would.
     let watermark = TOMBSTONE_COUNT;
     store.set_slab_watermark(Some(watermark)).await?;
 
-    // `get_segment`: forward scan walked the graveyard; reverse scan
-    // resolves on a live row at the top of the partition.
-    let segment = store
+    let result = store
+        .session()
+        .execute_unpaged(&store.queries().get_segment, (segment_id,))
+        .await?;
+    let warnings: Vec<&str> = result.warnings().collect();
+    assert!(warnings.is_empty(), "segment read warned: {warnings:?}");
+
+    let (segment, observed_watermark) = store
         .get_segment()
         .await?
-        .ok_or_else(|| color_eyre::eyre::eyre!("segment missing after insert"))?;
-    assert_eq!(segment.id, segment_id);
-    assert_eq!(segment.name, segment_name);
-    assert_eq!(segment.slab_size, slab_size);
-
-    // `get_slab_watermark`: same partition, same problem, same fix.
-    let observed_watermark = store.get_slab_watermark().await?;
-    assert_eq!(
-        observed_watermark,
-        Some(watermark),
-        "watermark roundtrip should ignore low-slab tombstones",
-    );
+        .ok_or_else(|| color_eyre::eyre::eyre!("segment missing after insert"))?
+        .into_parts();
+    assert_eq!(segment.id, segment_id, "segment id");
+    assert_eq!(segment.name, segment_name, "segment name");
+    assert_eq!(segment.slab_size, slab_size, "segment slab size");
+    assert_eq!(observed_watermark, Some(watermark), "slab watermark");
 
     store.delete_segment().await?;
     Ok(())

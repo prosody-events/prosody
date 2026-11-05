@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::codec::JsonCodec;
-use crate::error::ErrorCategory;
+use crate::error::{ErrorCategory, RetryAlert};
 use crate::state::backend::AdmissionChecks;
 use crate::state::cell::Values;
 use crate::state::fjall::test_db::cold_marker_checks;
@@ -15,6 +15,7 @@ use crate::state::store::CellRead;
 use crate::state::tests::support::listed;
 use crate::state::tests::support::{MemoryDeduplicationStore, evidence, run_admit_soundness};
 use crate::state::{CollectionId, CollectionRef, StateName, StateType};
+use crate::telemetry::Telemetry;
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::Trigger;
 use crate::timers::store::adapter::TableAdapter;
@@ -76,9 +77,12 @@ async fn legacy_and_timer_residue(value: u8, mode: u8) -> Result<bool> {
         (),
     );
     let timer_store = memory_store(test_segment("admit", 300_u32));
-    let (stream, timers, shutdown) =
-        setup_timer_manager_with_store(timer_store.clone(), ShutdownPhase::default()).await?;
-    let _stream = stream;
+    let (_stream, timers, shutdown) = setup_timer_manager_with_store(
+        timer_store.clone(),
+        ShutdownPhase::default(),
+        &Telemetry::new(),
+    )
+    .await?;
     let time = CompactDateTime::now()?.add_duration(CompactDuration::new(30))?;
     let trigger = Trigger::with_tag(
         key.key.clone(),
@@ -130,11 +134,7 @@ async fn legacy_and_timer_residue(value: u8, mode: u8) -> Result<bool> {
     );
     ensure!(checks.contains(&key.key).await?);
     ensure!(store.marker_state(collection.id()).await?.staged.is_none());
-    let expected = bytes(if committed {
-        value
-    } else {
-        value.wrapping_add(1)
-    });
+    let expected = bytes(value.wrapping_add(u8::from(!committed)));
     ensure!(
         CellRead::<Values>::read(&store, collection.id(), value_cell().as_ref())
             .await?
@@ -282,8 +282,6 @@ async fn legacy_deregistration(value: u8) -> Result<()> {
 
 /// Failed stages and repaired promotes remove the admission proof.
 async fn run_settle_proof(mode: u8, value: u8) -> Result<bool> {
-    use crate::codec::JsonCodec;
-    use crate::state::descriptor::value_state;
     use crate::state::registry::CollectionDef;
     use crate::state::session::{Finalized, sealed::StateLifecycle};
     use crate::state::tests::cell_suite::{FailingCellStore, Poison, value_cell};
@@ -353,11 +351,12 @@ async fn run_settle_proof(mode: u8, value: u8) -> Result<bool> {
                     ErrorCategory::Permanent,
                 )));
             }
-            match staged.promote(|| mode % 4 == 2).await {
+            let alert = RetryAlert::default();
+            match staged.promote(&alert, || mode % 4 == 2).await {
                 Promoted::Complete => ensure!(mode % 4 == 3),
                 Promoted::Torn(rejected) => {
                     ensure!(mode % 4 == 1);
-                    ensure!(rejected.abort(|| false).await);
+                    ensure!(rejected.abort(&alert, || false).await);
                 }
                 Promoted::Abandoned => ensure!(mode % 4 == 2),
                 Promoted::Rejected(_) => return Ok(false),
@@ -403,7 +402,7 @@ async fn retire_timer_residue(
     use color_eyre::eyre::ensure;
     use uuid::Uuid;
     let retire_replacement = value & 1 != 0;
-    retirement_trace(
+    Box::pin(retirement_trace(
         mode,
         i32::from(value),
         retire_replacement,
@@ -436,7 +435,7 @@ async fn retire_timer_residue(
             ensure!(manager.admit(key.key, &timers, &shutdown).await == Admission::Fresh);
             Ok(())
         },
-    )
+    ))
     .await?;
     Ok(())
 }

@@ -134,7 +134,7 @@ async fn initialize_direct<T, P, C>(
     handler: T,
     trigger: P,
     keyed_state: &KeyedStateInputs,
-    services: StartupServices<'_, C::Payload>,
+    services: StartupServices<'_>,
 ) -> Result<ProsodyConsumer<C>, ConsumerError>
 where
     T: HandlerProvider,

@@ -82,7 +82,12 @@ pub(super) fn triggers_all_types<'a>(
     }
 }
 
-#[instrument(name = "insert_slab_trigger", level = "debug", skip(store), err)]
+#[instrument(
+    name = "insert_slab_trigger",
+    level = "debug",
+    skip(store),
+    err(level = "warn")
+)]
 pub(super) async fn insert(
     store: &CassandraTriggerStore,
     slab: Slab,
@@ -109,7 +114,12 @@ pub(super) async fn insert(
         .await
 }
 
-#[instrument(name = "delete_slab_trigger", level = "debug", skip(store), err)]
+#[instrument(
+    name = "delete_slab_trigger",
+    level = "debug",
+    skip(store),
+    err(level = "warn")
+)]
 pub(super) async fn delete(
     store: &CassandraTriggerStore,
     slab: &Slab,
@@ -136,7 +146,12 @@ pub(super) async fn delete(
     Ok(())
 }
 
-#[instrument(name = "clear_slab_triggers", level = "debug", skip(store), err)]
+#[instrument(
+    name = "clear_slab_triggers",
+    level = "debug",
+    skip(store),
+    err(level = "warn")
+)]
 pub(super) async fn clear(
     store: &CassandraTriggerStore,
     slab: &Slab,

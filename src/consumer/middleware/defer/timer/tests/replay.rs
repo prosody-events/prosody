@@ -69,7 +69,7 @@ fn timer_write_failure_keeps_the_queue_covered() -> color_eyre::Result<()> {
             }
 
             let context = &harness.contexts[0];
-            assert!(!context.active_deferred_timers().is_empty());
+            assert_ne!(context.active_deferred_timers(), []);
             assert_eq!(
                 harness
                     .store

@@ -137,15 +137,15 @@ where
     PublicationErr: ClassifyError + Error + Send + Sync + 'static,
 {
     /// Routing-set publication failed on its owning assignment.
-    #[error("keyed-state publication failed at partition acquisition")]
-    Publication(#[source] PublicationErr),
+    #[error("keyed-state publication failed at partition acquisition: {0:#}")]
+    Publication(PublicationErr),
 
     /// Durable descriptor-identity validation failed. A mismatch is
     /// Permanent and recurs until the deployed descriptors match the
     /// segment's frozen identity; a store failure retries on the next
     /// acquisition attempt.
-    #[error("keyed-state descriptor identity acquisition failed")]
-    Identity(#[source] DescriptorIdentityError<StoreErr>),
+    #[error("keyed-state descriptor identity acquisition failed: {0:#}")]
+    Identity(DescriptorIdentityError<StoreErr>),
 }
 
 impl<StoreErr, PublicationErr> ClassifyError for StateAcquireError<StoreErr, PublicationErr>

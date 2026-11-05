@@ -47,7 +47,7 @@ impl Hold {
         self.landed.fetch_add(1, Ordering::Relaxed);
         let parked = self
             .armed
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
             .is_ok();
         if parked {
             self.entered.notify_one();

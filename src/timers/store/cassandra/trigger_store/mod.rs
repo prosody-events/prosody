@@ -43,7 +43,7 @@ use crate::timers::store::cassandra::CassandraTriggerStore;
 use crate::timers::store::cassandra::error::CassandraTriggerStoreError;
 use crate::timers::store::cassandra::migration;
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentVersion};
+use crate::timers::store::{Segment, StoredSegment};
 use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
 use futures::{Stream, TryStreamExt, pin_mut};
@@ -66,7 +66,7 @@ impl TriggerOperations for CassandraTriggerStore {
         &self.segment
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn insert_segment(&self) -> Result<(), Self::Error> {
         let segment = &self.segment;
         self.session()
@@ -85,8 +85,8 @@ impl TriggerOperations for CassandraTriggerStore {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
-    async fn get_segment(&self) -> Result<Option<Segment>, Self::Error> {
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
+    async fn get_segment(&self) -> Result<Option<StoredSegment>, Self::Error> {
         let segment_id = &self.segment.id;
         let Some(segment) = self.get_segment_unchecked(segment_id).await? else {
             return Ok(None);
@@ -98,7 +98,7 @@ impl TriggerOperations for CassandraTriggerStore {
         Ok(Some(segment))
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn delete_segment(&self) -> Result<(), Self::Error> {
         let segment_id = &self.segment.id;
         self.session()
@@ -183,7 +183,7 @@ impl TriggerOperations for CassandraTriggerStore {
         }
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn insert_slab(&self, slab: Slab) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
@@ -193,7 +193,7 @@ impl TriggerOperations for CassandraTriggerStore {
             .await
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn delete_slab(&self, slab_id: SlabId) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
         self.session()
@@ -207,25 +207,7 @@ impl TriggerOperations for CassandraTriggerStore {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
-    async fn get_slab_watermark(&self) -> Result<Option<SlabId>, Self::Error> {
-        let segment_id = self.segment.id;
-        let row = self
-            .session()
-            .execute_unpaged(&self.queries().get_slab_watermark, (segment_id,))
-            .await
-            .map_err(CassandraStoreError::from)?
-            .into_rows_result()
-            .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<(Option<i32>,)>()
-            .map_err(CassandraStoreError::from)?;
-
-        Ok(row
-            .and_then(|(w,)| w)
-            .map(|w| SlabId::from_le_bytes(w.to_le_bytes())))
-    }
-
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn set_slab_watermark(&self, watermark: Option<SlabId>) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
         let watermark_i32 = watermark.map(|w| i32::from_le_bytes(w.to_le_bytes()));
@@ -243,7 +225,7 @@ impl TriggerOperations for CassandraTriggerStore {
         .await
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn batch_insert_slab_with_watermark(
         &self,
         slab: Slab,
@@ -377,27 +359,6 @@ impl TriggerOperations for CassandraTriggerStore {
     ) -> impl Future<Output = Result<Option<Trigger>, Self::Error>> + Send {
         read::current(self, key, time, timer_type)
     }
-
-    // -- V1 migration methods --
-
-    /// Updates the segment's version field after v1 to v2 migration.
-    #[instrument(level = "debug", skip(self), err)]
-    async fn update_segment_version(
-        &self,
-        new_version: SegmentVersion,
-        new_slab_size: CompactDuration,
-    ) -> Result<(), Self::Error> {
-        let segment_id = self.segment.id;
-        self.session()
-            .execute_unpaged(
-                &self.queries().update_segment_version,
-                (new_version, new_slab_size.seconds() as i32, segment_id),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?;
-
-        Ok(())
-    }
 }
 
 /// Returns the TTL anchor time for a watermark update.
@@ -407,7 +368,7 @@ impl TriggerOperations for CassandraTriggerStore {
 /// configured grace period (default 1 year) — slabs and the watermark hint
 /// deliberately outlive their natural end so a lagging consumer can still
 /// process past-time slabs.
-fn anchor_after_watermark(
+pub(super) fn anchor_after_watermark(
     watermark: Option<SlabId>,
     slab_size: CompactDuration,
 ) -> CompactDateTime {

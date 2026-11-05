@@ -211,11 +211,11 @@ impl<P, S> MockEventContext<P, S> {
     /// configured category) while the countdown is still positive (decrementing
     /// it), otherwise success.
     fn timer_result(&self) -> Result<(), MockTimerError> {
-        // fetch_update fails (leaving 0) once the countdown is exhausted; while
+        // try_update fails (leaving 0) once the countdown is exhausted; while
         // positive it decrements and we inject one more failure.
         match self
             .timer_fail_count
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
         {
             Ok(_) => Err(MockTimerError(self.timer_fail_category)),
             Err(_) => Ok(()),

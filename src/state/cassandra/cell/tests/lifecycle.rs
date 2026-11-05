@@ -42,7 +42,7 @@ async fn provisional_set_promote_and_resolved_clear_round_trip() -> Result<()> {
             .0,
         Committed::new(Some(data))
     );
-    assert!(provisional_cells(&store, c.id()).await?.is_empty());
+    assert_eq!(provisional_cells(&store, c.id()).await?, []);
 
     store
         .write_resolved(&c, &[(cell.clone(), None)], &[])

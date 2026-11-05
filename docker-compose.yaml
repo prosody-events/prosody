@@ -41,6 +41,9 @@ services:
     image: cassandra:latest
     ports:
       - "9042:9042"
+    environment:
+      # Tests read complete query traces: a session ends after its events land.
+      JVM_EXTRA_OPTS: -Dcassandra.wait_for_tracing_events_timeout_secs=10
     volumes:
       - cassandra_data:/var/lib/cassandra
     healthcheck:

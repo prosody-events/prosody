@@ -179,7 +179,7 @@ where
         .layer(retry.clone())
         .layer(topic)
         .layer(retry);
-        let managers: Arc<Managers<C::Payload>> = Arc::default();
+        let managers: Arc<Managers> = Arc::default();
         let (inner_provider, requests) = response.into_parts(handler);
         let provider = middleware.with_provider(inner_provider);
         let providers = PartitionProviders {

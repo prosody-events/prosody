@@ -82,7 +82,7 @@ impl Phase {
     fn call(&self) {
         if self
             .calls_until_revoke
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |calls| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |calls| {
                 calls.checked_sub(1)
             })
             == Ok(1)

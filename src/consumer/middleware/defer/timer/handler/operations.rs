@@ -1,4 +1,4 @@
-use tracing::{Instrument, debug, info, warn};
+use tracing::{Instrument, debug, error, info};
 
 use super::super::store::{TimerDeferStore, TimerRetryCompletionResult};
 use super::{TimerDeferHandler, TimerDeferOutput};
@@ -77,13 +77,13 @@ where
         }
 
         debug!(
-            key = ?trigger.key,
+            key = %trigger.key,
             time = %trigger.time,
             topic = %self.topic,
             partition = self.partition,
             enabled,
             should_defer,
-            "Deferral skipped"
+            "Prosody does not defer the timer"
         );
         Err(DeferError::Handler(error))
     }
@@ -101,11 +101,11 @@ where
         let key = &trigger.key;
 
         debug!(
-            key = ?key,
+            key = %key,
             scheduled_time = %trigger.time,
             topic = %self.topic,
             partition = self.partition,
-            "Defer retry timer fired"
+            "The retry timer of a deferred timer fired"
         );
 
         // Get next deferred timer
@@ -118,10 +118,10 @@ where
             // Queue empty - clear orphaned timer. Inner did not run, so the
             // inner has no apply work for this dispatch.
             debug!(
-                key = ?key,
+                key = %key,
                 topic = %self.topic,
                 partition = self.partition,
-                "Clearing orphaned defer timer: queue empty"
+                "Prosody deletes a retry timer that has no deferred timer"
             );
 
             self.store
@@ -133,12 +133,12 @@ where
         };
 
         debug!(
-            key = ?key,
+            key = %key,
             original_time = %stored_trigger.time,
             retry_count = retry_count,
             topic = %self.topic,
             partition = self.partition,
-            "Loaded deferred timer - attempting retry"
+            "Prosody loaded a deferred timer and retries it"
         );
 
         let demand = demand.retried(retry_count.saturating_add(1));
@@ -186,12 +186,12 @@ where
         self.complete_and_advance(&context, &stored_trigger).await?;
 
         info!(
-            key = ?key,
+            key = %key,
             original_time = %stored_trigger.time,
             retry_count = retry_count,
             topic = %self.topic,
             partition = self.partition,
-            "Deferred timer retry succeeded"
+            "A deferred timer succeeded on retry"
         );
 
         Ok(TimerDeferOutput::Inner(output))
@@ -221,11 +221,11 @@ where
             .map_err(DeferError::Store)?;
 
         info!(
-            key = ?trigger.key,
+            key = %trigger.key,
             time = %trigger.time,
             topic = %self.topic,
             partition = self.partition,
-            "Deferred timer for timer-based retry"
+            "Prosody deferred the timer and retries it later"
         );
 
         Ok(TimerDeferOutput::Deferred(inner_err))
@@ -254,12 +254,12 @@ where
         if scheduled.is_empty() {
             self.schedule_retry_timer(context, retry_count).await?;
             info!(
-                key = ?trigger.key,
+                key = %trigger.key,
                 time = %trigger.time,
                 retry_count = retry_count,
                 topic = %self.topic,
                 partition = self.partition,
-                "Re-armed retry timer for a deferred key that had none"
+                "Prosody scheduled a missing retry timer for a deferred key"
             );
         }
 
@@ -269,11 +269,11 @@ where
             .map_err(DeferError::Store)?;
 
         debug!(
-            key = ?trigger.key,
+            key = %trigger.key,
             time = %trigger.time,
             topic = %self.topic,
             partition = self.partition,
-            "Queued timer behind already-deferred key"
+            "Prosody deferred the timer, because its key already has deferred timers"
         );
 
         Ok(TimerDeferOutput::NoInner)
@@ -344,24 +344,26 @@ where
                 );
 
                 info!(
-                    key = ?deferred_trigger.key,
+                    key = %deferred_trigger.key,
                     time = %deferred_trigger.time,
                     retry_count = new_retry_count,
                     topic = %self.topic,
                     partition = self.partition,
-                    "Re-deferred timer after transient failure"
+                    "A deferred timer failed again with a transient error, so Prosody defers it again"
                 );
 
                 Ok(TimerDeferOutput::Deferred(error))
             }
             ErrorCategory::Permanent => {
-                warn!(
-                    key = ?deferred_trigger.key,
+                // Only this layer knows the lost timer and its original time.
+                error!(
+                    key = %deferred_trigger.key,
                     time = %deferred_trigger.time,
                     retry_count = retry_count,
                     topic = %self.topic,
                     partition = self.partition,
-                    "Permanent handler error during retry - removing from queue: {error:#}"
+                    "Prosody lost a deferred timer: {error:#}. The error is permanent, so \
+                     Prosody removes the timer from the deferral queue."
                 );
 
                 self.complete_and_advance(context, stored_trigger).await?;

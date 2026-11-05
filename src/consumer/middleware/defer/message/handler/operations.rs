@@ -1,4 +1,4 @@
-use tracing::{Instrument, debug, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use super::{MessageDeferHandler, MessageDeferOutput};
 use crate::consumer::event_context::EventContext;
@@ -120,12 +120,12 @@ where
         if scheduled.is_empty() {
             self.schedule_retry_timer(context, retry_count).await?;
             info!(
-                key = ?message_key,
+                key = %message_key,
                 offset = offset,
                 retry_count = retry_count,
                 topic = %self.topic,
                 partition = self.partition,
-                "Re-armed retry timer for a deferred key that had none"
+                "Prosody scheduled a missing retry timer for a deferred key"
             );
         }
 
@@ -135,11 +135,11 @@ where
             .map_err(DeferError::Store)?;
 
         debug!(
-            key = ?message_key,
+            key = %message_key,
             offset = offset,
             topic = %self.topic,
             partition = self.partition,
-            "Queued message behind already-deferred key"
+            "Prosody deferred the message, because its key already has deferred messages"
         );
 
         Ok(MessageDeferOutput::NoInner)
@@ -210,24 +210,26 @@ where
                 );
 
                 info!(
-                    key = ?message_key,
+                    key = %message_key,
                     offset = offset,
                     retry_count = new_retry_count,
                     topic = %self.topic,
                     partition = self.partition,
-                    "Re-deferred message after transient failure"
+                    "A deferred message failed again with a transient error, so Prosody defers it again"
                 );
 
                 Ok(MessageDeferOutput::Deferred(error))
             }
             ErrorCategory::Permanent => {
-                warn!(
-                    key = ?message_key,
+                // Only this layer knows the lost message and its offset.
+                error!(
+                    key = %message_key,
                     offset = offset,
                     retry_count = retry_count,
                     topic = %self.topic,
                     partition = self.partition,
-                    "Permanent handler error during retry - removing from queue: {error:#}"
+                    "Prosody lost a deferred message: {error:#}. The error is permanent, so \
+                     Prosody removes the message from the deferral queue."
                 );
 
                 self.complete_and_advance(context, message_key, offset)
@@ -288,14 +290,17 @@ where
             }
         };
 
+        // This skip loses the deferred message, and no other layer logs it.
         if message.key() != message_key {
-            warn!(
-                expected_key = ?message_key,
-                actual_key = ?message.key(),
+            error!(
+                expected_key = %message_key,
+                actual_key = %message.key(),
                 offset = offset,
                 topic = %self.topic,
                 partition = self.partition,
-                "Key mismatch at offset - skipping corrupted entry"
+                "Prosody lost a deferred message. Offset {offset} holds a message with a \
+                 different key, so Prosody skips it. Check whether someone recreated or \
+                 compacted the topic."
             );
 
             self.complete_and_advance(context, message_key, offset)
@@ -324,13 +329,16 @@ where
         C: EventContext<Payload = T::Payload>,
     {
         match error.classify_error() {
+            // This skip loses the deferred message, and no other layer logs it.
             ErrorCategory::Permanent => {
-                warn!(
-                    key = ?message_key,
+                error!(
+                    key = %message_key,
                     offset = offset,
                     topic = %self.topic,
                     partition = self.partition,
-                    "Permanent loader error - skipping message: {error:#}"
+                    "Prosody lost a deferred message. Prosody cannot load offset {offset}: {error:#}. \
+                     Check the topic retention, because a deferred message must stay in the \
+                     topic until its retry."
                 );
                 self.complete_and_advance(context, message_key, offset)
                     .await?;
@@ -339,12 +347,12 @@ where
                 let new_retry_count = self.re_defer(context, message_key, retry_count).await?;
 
                 warn!(
-                    key = ?message_key,
+                    key = %message_key,
                     offset = offset,
                     retry_count = new_retry_count,
                     topic = %self.topic,
                     partition = self.partition,
-                    "Transient loader error - scheduling retry: {error:#}"
+                    "Prosody cannot load a deferred message: {error:#}. Prosody retries it later."
                 );
             }
             ErrorCategory::Terminal => {
@@ -379,11 +387,11 @@ where
             .map_err(DeferError::Store)?;
 
         info!(
-            key = ?message_key,
+            key = %message_key,
             offset = offset,
             topic = %self.topic,
             partition = self.partition,
-            "Deferred message for timer-based retry"
+            "Prosody deferred the message and retries it later"
         );
 
         Ok(MessageDeferOutput::Deferred(inner_error))
@@ -448,12 +456,12 @@ where
                 self.complete_and_advance(&context, message_key, offset)
                     .await?;
                 info!(
-                    key = ?message_key,
+                    key = %message_key,
                     offset = offset,
                     retry_count = retry_count,
                     topic = %self.topic,
                     partition = self.partition,
-                    "Deferred message retry succeeded"
+                    "A deferred message succeeded on retry"
                 );
                 Ok(MessageDeferOutput::Inner(output))
             }

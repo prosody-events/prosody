@@ -6,6 +6,7 @@ use crate::consumer::middleware::deduplication::{
 };
 use crate::consumer::middleware::tests::test_support::{GatedGuard, cart};
 use crate::consumer::partition::ShutdownPhase;
+use crate::error::RetryAlert;
 use crate::loader::{MemoryLoader, MessageLoader};
 use crate::otel::SpanRelation;
 use crate::state::backend::AdmissionChecks;
@@ -170,7 +171,10 @@ async fn crash<S: EventSession<Loader: MessageLoader<Payload = Value>>>(
                 let Finalized::Staged(staged) = finalized else {
                     return Err(eyre!("the handler did not stage"));
                 };
-                ensure!(matches!(staged.promote(|| false).await, Promoted::Complete));
+                ensure!(matches!(
+                    staged.promote(&RetryAlert::default(), || false).await,
+                    Promoted::Complete
+                ));
             }
         }
         4 => {

@@ -11,9 +11,8 @@ use uuid::Uuid;
 
 /// Storage backend for deduplication identifiers.
 ///
-/// Each implementation stores UUIDs representing processed messages and
-/// provides existence checks. Reads/writes are best-effort — callers handle
-/// failures gracefully.
+/// Each implementation stores identifiers for processed messages.
+/// Store operations return errors to the caller.
 pub trait DeduplicationStore: Clone + Send + Sync + 'static {
     /// Error type for store operations.
     ///

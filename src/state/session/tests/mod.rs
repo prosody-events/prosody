@@ -12,6 +12,7 @@ use super::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::ErrorCategory;
+use crate::error::RetryAlert;
 use crate::state::StateAccessError;
 use crate::state::StateBackend;
 use crate::state::cell::Values;
@@ -329,7 +330,7 @@ async fn rollback_restores_the_commit_floor_without_durable_writes() -> Result<(
             .into_inner(),
         Some(Bytes::from_static(b"V")),
     );
-    assert!(fx.cells.provisional_coordinates(&cart_id).is_empty());
+    assert_eq!(fx.cells.provisional_coordinates(&cart_id), []);
     assert!(fx.cells.unsettled_marker_of(&cart_id).is_none());
 
     // Sibling isolation: the rollback drained only cart; wishlist stands.
@@ -412,11 +413,11 @@ async fn promote_receipt(
             ErrorCategory::Permanent,
         )));
     }
-    match staged.promote(|| false).await {
+    match staged.promote(&RetryAlert::default(), || false).await {
         Promoted::Complete => assert!(!fail_promote),
         Promoted::Rejected(rejected) => {
             assert!(fail_promote);
-            assert!(rejected.abort(|| false).await);
+            assert!(rejected.abort(&RetryAlert::default(), || false).await);
         }
         _ => bail!("unexpected promote result"),
     }

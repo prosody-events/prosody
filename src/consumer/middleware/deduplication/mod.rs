@@ -420,8 +420,8 @@ pub enum DeduplicationError<E> {
     ///
     /// Classified as transient so the retry layer prevents the Kafka offset
     /// from committing until the store is healthy.
-    #[error("deduplication store error")]
-    Store(#[source] Box<dyn StdError + Send + Sync + 'static>),
+    #[error("deduplication store error: {0:#}")]
+    Store(Box<dyn StdError + Send + Sync + 'static>),
 }
 
 impl<E: ClassifyError> ClassifyError for DeduplicationError<E> {
