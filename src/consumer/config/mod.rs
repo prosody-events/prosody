@@ -27,12 +27,8 @@ use validator::{Validate, ValidationError};
 /// Environment variable name for the Kafka consumer group ID.
 const PROSODY_GROUP_ID: &str = "PROSODY_GROUP_ID";
 
-/// Default statistics reporting interval. See
-/// [`ConsumerConfiguration::statistics_interval`].
-const DEFAULT_STATISTICS_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Longest statistics interval librdkafka accepts.
-const MAX_STATISTICS_INTERVAL: Duration = Duration::from_hours(24);
+/// Longest commit or statistics interval librdkafka accepts.
+const MAX_INTERVAL: Duration = Duration::from_hours(24);
 
 /// Default prefetch of each partition. See
 /// [`ConsumerConfiguration::partition_prefetch`].
@@ -55,10 +51,6 @@ const MIN_FETCH_MAX_BYTES: u64 = 1_000_000;
 /// Largest fetch response limit librdkafka accepts: the response also needs
 /// 512 bytes of framing inside a 32-bit size.
 const MAX_FETCH_MAX_BYTES: u64 = (1 << 31_u32) - 1 - 512;
-
-/// Default fetch wait: the librdkafka default. See
-/// [`ConsumerConfiguration::fetch_wait`].
-const DEFAULT_FETCH_WAIT: Duration = Duration::from_millis(500);
 
 /// Longest fetch wait. librdkafka warns unless the wait is at least one second
 /// below its socket timeout, which keeps the 60-second default.
@@ -196,7 +188,8 @@ pub struct ConsumerConfiguration {
     ///
     /// The accepted range is 1 millisecond to 59 seconds.
     #[builder(
-        default = "from_duration_env_with_fallback(\"PROSODY_FETCH_WAIT\", DEFAULT_FETCH_WAIT)?",
+        default = "from_duration_env_with_fallback(\"PROSODY_FETCH_WAIT\", \
+                   Duration::from_millis(500))?",
         setter(into)
     )]
     #[validate(custom(function = "validate_fetch_wait"))]
@@ -253,12 +246,14 @@ pub struct ConsumerConfiguration {
     /// Environment variable: `PROSODY_COMMIT_INTERVAL`
     /// Default: 1 second
     ///
-    /// Controls how frequently offsets are auto-committed to Kafka.
+    /// Controls how frequently offsets are auto-committed to Kafka. The
+    /// accepted range is 1 millisecond to 24 hours.
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_COMMIT_INTERVAL\", \
                    Duration::from_secs(1))?",
         setter(into)
     )]
+    #[validate(custom(function = "validate_interval"))]
     pub commit_interval: Duration,
 
     /// How often the consumer's Kafka client reports librdkafka statistics.
@@ -275,10 +270,10 @@ pub struct ConsumerConfiguration {
     /// accepted range is 1 millisecond to 24 hours.
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_STATISTICS_INTERVAL\", \
-                   DEFAULT_STATISTICS_INTERVAL)?",
+                   Duration::from_secs(5))?",
         setter(into)
     )]
-    #[validate(custom(function = "validate_statistics_interval"))]
+    #[validate(custom(function = "validate_interval"))]
     pub statistics_interval: Duration,
 
     /// Use a mock consumer for testing purposes.
@@ -466,9 +461,10 @@ impl ConsumerConfigurationBuilder {
     }
 }
 
-/// Validates the statistics interval. A zero interval stops reporting.
-fn validate_statistics_interval(interval: &Duration) -> Result<(), ValidationError> {
-    validate_millis(*interval, MAX_STATISTICS_INTERVAL)
+/// Validates a commit or statistics interval. A zero interval stops commits or
+/// reports.
+fn validate_interval(interval: &Duration) -> Result<(), ValidationError> {
+    validate_millis(*interval, MAX_INTERVAL)
 }
 
 /// Validates the fetch wait. With a zero wait, an idle consumer sends fetch
@@ -477,12 +473,9 @@ fn validate_fetch_wait(wait: &Duration) -> Result<(), ValidationError> {
     validate_millis(*wait, MAX_FETCH_WAIT)
 }
 
-/// Validates a duration that reaches librdkafka in whole milliseconds, where
-/// zero has a special meaning.
-///
-/// The check rejects a sub-millisecond duration, because it would truncate to
-/// zero and change its meaning silently. It also rejects a duration above
-/// `max`.
+/// Validates a duration that reaches librdkafka in whole milliseconds. A
+/// sub-millisecond duration truncates to zero, which has a special meaning, so
+/// the check rejects it. The check also rejects a duration above `max`.
 fn validate_millis(duration: Duration, max: Duration) -> Result<(), ValidationError> {
     if duration.as_millis() == 0 {
         return Err(ValidationError::new("below_a_millisecond"));

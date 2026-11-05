@@ -30,7 +30,7 @@ the default for its target. A bare level below `warn` also applies to `scylla` a
 | `PROSODY_FETCH_MAX_BYTES`        | Size limit of one fetch response from one broker (1 MB to 2 GiB less 512 bytes) | 50 MiB |
 | `PROSODY_FETCH_WAIT`             | Longest time a broker holds a fetch request that finds no new records (1ms to 59s) | 500ms |
 | `PROSODY_TIMEOUT`                | Cancel handler if it runs longer than this           | 80% of stall threshold |
-| `PROSODY_COMMIT_INTERVAL`        | How often to save progress to Kafka                  | 1s                     |
+| `PROSODY_COMMIT_INTERVAL`        | How often to save progress to Kafka; must be between 1ms and 24h | 1s |
 | `PROSODY_POLL_INTERVAL`          | How often to serve Kafka events and store offsets    | 100ms                  |
 | `PROSODY_SHUTDOWN_TIMEOUT`       | Shutdown budget; handlers complete freely before cancellation fires near the deadline | 30s |
 | `PROSODY_STALL_THRESHOLD`        | Report unhealthy if no progress for this long        | 5m                     |

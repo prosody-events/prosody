@@ -49,10 +49,9 @@ const IN_FLIGHT: usize = 4;
 /// The hang-guard for each broker call and each received message.
 const DEADLINE: Duration = Duration::from_secs(60);
 
-/// The fetch wait of the stall test consumer. The `gap` record fills the queue
-/// of partition 0, so librdkafka leaves partition 0 out of one fetch request.
-/// With a short wait, that request returns quickly. So the count measures only
-/// the segment tail.
+/// The fetch wait of the stall test consumer. The `gap` record leaves partition
+/// 0 out of one fetch request. A short wait ends that request quickly, so the
+/// count measures only the segment tail.
 const FETCH_WAIT: Duration = Duration::from_millis(10);
 
 /// Demonstrates backpressure in the message processing system by
