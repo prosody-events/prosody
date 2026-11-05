@@ -81,6 +81,10 @@ struct PartitionParams {
 /// only over `S::Store` and `SP::Manager`. This keeps the provider types
 /// out of the long-lived coroutine state machine, preventing future-size
 /// explosion with the deeply nested middleware handler type `T`.
+///
+/// Every exit shuts the handler down exactly once. A revoke during startup
+/// ends the partition before [`run_partition`] runs, and still shuts the
+/// handler down.
 pub(super) async fn handle_messages<T, S, SP, P, Q>(
     config: PartitionConfiguration<S, SP, P>,
     partition_info: PartitionInfo,
@@ -118,7 +122,7 @@ pub(super) async fn handle_messages<T, S, SP, P, Q>(
 
     // Acquisition publishes routing for the owner. It then validates
     // descriptor identities before event dispatch.
-    let Some(state_manager) = retry_init(
+    let state_manager = retry_init(
         &context.shutdown_rx,
         &partition_info,
         "get the keyed-state manager",
@@ -130,29 +134,29 @@ pub(super) async fn handle_messages<T, S, SP, P, Q>(
             )
         },
     )
-    .await
-    else {
-        return;
-    };
-
-    let params = PartitionParams {
-        group_id,
-        version,
-        allowed_events,
-        timer_semaphores,
-        telemetry_sender,
-        timer_spans,
-    };
-
-    run_partition(
-        trigger_store,
-        state_manager,
-        partition_info,
-        handler,
-        context,
-        params,
-    )
     .await;
+
+    if let Some(state_manager) = state_manager {
+        let params = PartitionParams {
+            group_id,
+            version,
+            allowed_events,
+            timer_semaphores,
+            telemetry_sender,
+            timer_spans,
+        };
+        run_partition(
+            trigger_store,
+            state_manager,
+            partition_info,
+            &handler,
+            context,
+            params,
+        )
+        .await;
+    }
+
+    handler.shutdown().await;
 }
 
 /// Core partition loop, generic over `S: TriggerStore`, the keyed-state
@@ -161,7 +165,7 @@ async fn run_partition<T, S, M, P, Q>(
     trigger_store: S,
     state_manager: M,
     partition_info: PartitionInfo,
-    handler: T,
+    handler: &T,
     context: PartitionContext<Q>,
     params: PartitionParams,
 ) where
@@ -239,7 +243,7 @@ async fn run_partition<T, S, M, P, Q>(
         debug!(?event, "calling handler");
         process_event(
             event,
-            &handler,
+            handler,
             &shutdown_rx,
             &timer_manager,
             &state_manager,
@@ -261,6 +265,4 @@ async fn run_partition<T, S, M, P, Q>(
             shutdown_rx.clone(),
         )
         .await;
-
-    handler.shutdown().await;
 }
