@@ -56,6 +56,14 @@ const MIN_FETCH_MAX_BYTES: u64 = 1_000_000;
 /// 512 bytes of framing inside a 32-bit size.
 const MAX_FETCH_MAX_BYTES: u64 = (1 << 31_u32) - 1 - 512;
 
+/// Default fetch wait: the librdkafka default. See
+/// [`ConsumerConfiguration::fetch_wait`].
+const DEFAULT_FETCH_WAIT: Duration = Duration::from_millis(500);
+
+/// Longest fetch wait. librdkafka warns unless the wait is at least one second
+/// below its socket timeout, which keeps the 60-second default.
+const MAX_FETCH_WAIT: Duration = Duration::from_secs(59);
+
 /// Configuration for the Kafka consumer.
 ///
 /// This struct holds all the necessary configuration options for creating a
@@ -136,7 +144,9 @@ pub struct ConsumerConfiguration {
     /// always returns at least one record batch. So the fetched records of a
     /// partition take at most two times this value, plus one batch. This
     /// memory grows with the assigned partitions. A larger value lets a fast
-    /// partition run longer between fetches.
+    /// partition run longer between fetches. See
+    /// [`fetch_wait`](Self::fetch_wait) for how often a full partition fetches
+    /// again.
     ///
     /// Accepts a human-readable byte size such as `1 MiB`. A bare number is
     /// interpreted as bytes. The accepted range is 1 KiB to 1 GB.
@@ -169,6 +179,28 @@ pub struct ConsumerConfiguration {
     )]
     #[validate(range(min = MIN_FETCH_MAX_BYTES, max = MAX_FETCH_MAX_BYTES))]
     pub fetch_max_bytes: ByteSize,
+
+    /// The longest time a broker holds a fetch request that finds no new
+    /// records.
+    ///
+    /// Environment variable: `PROSODY_FETCH_WAIT`
+    /// Default: 500 milliseconds
+    ///
+    /// librdkafka sends one fetch request at a time to each broker. It leaves a
+    /// partition out of the next request when the partition's queue holds its
+    /// [`partition_prefetch`](Self::partition_prefetch). If no other partition
+    /// in that request gets new records, the broker holds the request for this
+    /// wait. Only then can the full partition fetch again. So a partition that
+    /// is behind fetches at least once per wait. A shorter wait shortens this
+    /// delay, but an idle consumer then sends more requests to each broker.
+    ///
+    /// The accepted range is 1 millisecond to 59 seconds.
+    #[builder(
+        default = "from_duration_env_with_fallback(\"PROSODY_FETCH_WAIT\", DEFAULT_FETCH_WAIT)?",
+        setter(into)
+    )]
+    #[validate(custom(function = "validate_fetch_wait"))]
+    pub fetch_wait: Duration,
 
     /// Duration of inactivity allowed before considering a partition stalled.
     ///
@@ -434,19 +466,29 @@ impl ConsumerConfigurationBuilder {
     }
 }
 
-/// Validates the statistics interval against what librdkafka accepts.
-///
-/// The interval reaches librdkafka in whole milliseconds, where zero means "do
-/// not report". A sub-millisecond duration would truncate to zero and disable
-/// reporting silently, so it is rejected instead.
+/// Validates the statistics interval. A zero interval stops reporting.
 fn validate_statistics_interval(interval: &Duration) -> Result<(), ValidationError> {
-    if interval.as_millis() == 0 {
-        return Err(ValidationError::new(
-            "statistics_interval_below_a_millisecond",
-        ));
+    validate_millis(*interval, MAX_STATISTICS_INTERVAL)
+}
+
+/// Validates the fetch wait. With a zero wait, an idle consumer sends fetch
+/// requests without a pause.
+fn validate_fetch_wait(wait: &Duration) -> Result<(), ValidationError> {
+    validate_millis(*wait, MAX_FETCH_WAIT)
+}
+
+/// Validates a duration that reaches librdkafka in whole milliseconds, where
+/// zero has a special meaning.
+///
+/// The check rejects a sub-millisecond duration, because it would truncate to
+/// zero and change its meaning silently. It also rejects a duration above
+/// `max`.
+fn validate_millis(duration: Duration, max: Duration) -> Result<(), ValidationError> {
+    if duration.as_millis() == 0 {
+        return Err(ValidationError::new("below_a_millisecond"));
     }
-    if *interval > MAX_STATISTICS_INTERVAL {
-        return Err(ValidationError::new("statistics_interval_above_24_hours"));
+    if duration > max {
+        return Err(ValidationError::new("above_the_maximum"));
     }
     Ok(())
 }

@@ -28,6 +28,7 @@ the default for its target. A bare level below `warn` also applies to `scylla` a
 | `PROSODY_MAX_UNCOMMITTED`        | Max decoded messages in flight across all partitions | 64                     |
 | `PROSODY_PARTITION_PREFETCH`     | Bytes each partition fetches ahead of its handlers; also the fetch size of one partition (1 KiB to 1 GB) | 128 KiB |
 | `PROSODY_FETCH_MAX_BYTES`        | Size limit of one fetch response from one broker (1 MB to 2 GiB less 512 bytes) | 50 MiB |
+| `PROSODY_FETCH_WAIT`             | Longest time a broker holds a fetch request that finds no new records (1ms to 59s) | 500ms |
 | `PROSODY_TIMEOUT`                | Cancel handler if it runs longer than this           | 80% of stall threshold |
 | `PROSODY_COMMIT_INTERVAL`        | How often to save progress to Kafka                  | 1s                     |
 | `PROSODY_POLL_INTERVAL`          | How often to serve Kafka events and store offsets    | 100ms                  |
@@ -47,6 +48,10 @@ Three settings bound the memory of records that wait for handlers:
 - One fetch response takes at most `PROSODY_FETCH_MAX_BYTES`. It stays in memory until its partitions read their
   records.
 - Decoded messages number at most `PROSODY_MAX_UNCOMMITTED`.
+
+A partition that is behind can wait up to `PROSODY_FETCH_WAIT` for its next fetch. So it fetches
+`PROSODY_PARTITION_PREFETCH` at least once per wait. A shorter wait shortens this delay, but an idle consumer sends
+more fetch requests.
 
 ## Producer
 
