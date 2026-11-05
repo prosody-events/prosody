@@ -1,0 +1,68 @@
+# One run of repair.py as a Kubernetes Job. Start it with run.sh, which
+# fills in the __NAME__ values for the target cluster.
+#
+# The Job restarts the script after a failure. Each command is safe to run
+# again: the audit only reads, and arm skips keys that an earlier run fixed.
+# The pod runs apart from the Cassandra pods and has a fixed memory limit, so
+# the script cannot take memory from a database node.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: defer-repair-
+  namespace: __NAMESPACE__
+  labels:
+    app: defer-repair
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 43200
+  # Keep the finished Job and its log for one week.
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: defer-repair
+    spec:
+      restartPolicy: OnFailure
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: cassandra
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: repair
+          # This image holds Python 3 and the driver that cqlsh uses.
+          image: docker.io/k8ssandra/cass-management-api:5.0.8-ubi
+          command: ["python3", "/scripts/repair.py"]
+          args: __ARGS__
+          env:
+            - name: CASS_HOST
+              value: __HOST__
+            - name: CASS_DC
+              value: __DATACENTER__
+            - name: CASS_USER
+              valueFrom:
+                secretKeyRef:
+                  name: __SECRET__
+                  key: username
+            - name: CASS_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: __SECRET__
+                  key: password
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: script
+          configMap:
+            name: __CONFIGMAP__
