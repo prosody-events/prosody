@@ -23,6 +23,13 @@ where
             .map_err(|error| ErasedStateError::from_classified(&error))
     }
 
+    async fn contains(&self) -> Result<bool, ErasedStateError> {
+        self.0
+            .contains()
+            .await
+            .map_err(|error| ErasedStateError::from_classified(&error))
+    }
+
     async fn set(&self, item: ResolvedOf<T>) -> Result<(), ErasedStateError> {
         T::reject_null(&item)?;
         T::value_set(&self.0, item)

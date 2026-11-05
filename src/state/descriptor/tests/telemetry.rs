@@ -15,6 +15,7 @@ pub(super) async fn run_collection_ops() -> Result<()> {
     let value = bind_registered(cart(), MemoryLoader::new())?;
     value.set(json!({"qty": 1_i32})).await?;
     value.get().await?;
+    value.contains().await?;
 
     let map = bind_registered(
         map_state::<Utf8KeyCodec, JsonCodec>("counts"),
@@ -103,6 +104,7 @@ pub(super) fn collection_ops_export_operation_spans() -> Result<()> {
     for (name, collection) in [
         ("value.set", "cart"),
         ("value.get", "cart"),
+        ("value.contains", "cart"),
         ("map.set", "counts"),
         ("map.get", "counts"),
         ("map.stream", "counts"),

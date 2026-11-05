@@ -7,13 +7,15 @@ pub(super) fn cart() -> ValueDescriptor {
 }
 
 /// Round-trip invariant: for every JSON-representable value, `set(v)` then
-/// `get()` returns `Some(v)` — the value survives the full
+/// `get()` returns `Some(v)` and `contains()` reports it present. A JSON null
+/// is a stored payload, so it is present too. The value survives the full
 /// `T → codec → cell bytes → store → cell bytes → codec → T` path through
-/// the real session substrate.
-pub(super) async fn roundtrip(value: Value) -> Result<bool> {
+/// the real session substrate. The erased value parity properties in
+/// `consumer::event_context` cover absence, clear, commit, and rollback.
+async fn roundtrip(value: Value) -> Result<bool> {
     let handle = bind_registered(cart(), MemoryLoader::new())?;
     handle.set(value.clone()).await?;
-    Ok(handle.get().await? == Some(value))
+    Ok(handle.get().await? == Some(value) && handle.contains().await?)
 }
 
 #[test]
@@ -24,24 +26,6 @@ pub(super) fn prop_descriptor_set_get_roundtrip() {
         finish_trace(result, "typed roundtrip lost", &input_dbg)
     }
     QuickCheck::new().quickcheck(prop as fn(ArbJson) -> TestResult);
-}
-
-/// A never-written collection reads as `None`.
-#[tokio::test]
-pub(super) async fn descriptor_get_absent_returns_none() -> Result<()> {
-    let handle = bind_registered(cart(), MemoryLoader::new())?;
-    assert_eq!(handle.get().await?, None);
-    Ok(())
-}
-
-/// `set` then `clear` reads as `None`.
-#[tokio::test]
-pub(super) async fn descriptor_clear_then_get_none() -> Result<()> {
-    let handle = bind_registered(cart(), MemoryLoader::new())?;
-    handle.set(json!({"items": [1_i32, 2_i32]})).await?;
-    handle.clear().await?;
-    assert_eq!(handle.get().await?, None);
-    Ok(())
 }
 
 /// A user-written typed cell: the codec **is** the typing, so a `Cart`
