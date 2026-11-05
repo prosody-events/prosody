@@ -185,8 +185,9 @@ pub struct Segment {
 }
 
 impl Segment {
-    /// Canonical per-Kafka-partition segment: id derived from
-    /// `{group}:{topic}/{partition}`, layout V4.
+    /// Canonical per-Kafka-partition segment, layout V4. The name is
+    /// `{group}:{topic}/{partition}`, and the id is `UUIDv5(NAMESPACE_URL,
+    /// name)`. Both are frozen on-disk contracts, checked by `segment_ids_frozen`.
     ///
     /// The partition loop creates this segment once at acquisition.
     /// State admission receives the resulting trigger store.

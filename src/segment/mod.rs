@@ -14,17 +14,13 @@ pub type SegmentId = Uuid;
 /// ([`crate::consumer::middleware::defer::segment::Segment`]) and the
 /// keyed-state segment so both name a partition with the same id.
 ///
-/// **Invariant (frozen on-disk contract):** released defer data — and
-/// keyed-state data once released — is keyed by this output. The namespace
-/// (`NAMESPACE_OID`) and format MUST NOT change, or all persisted rows are
-/// orphaned. Pinned by `defer_segment_id_frozen`.
+/// **Invariant (frozen on-disk contract):** persisted defer and keyed-state
+/// rows are keyed by this output. A change to the namespace (`NAMESPACE_OID`)
+/// or the format orphans every row. `segment_ids_frozen` checks this output.
 ///
-/// TODO(follow-up PR): timers still derive their segment id with a separate
-/// legacy formula (`timers::store::Segment::for_partition`, `NAMESPACE_URL`)
-/// and keep their own `timers::store::SegmentId` alias. A later PR migrates
-/// timer data onto this id — reusing
-/// `timers::store::cassandra::migration::migrate_segment_if_needed` — and folds
-/// that alias into this one.
+/// TODO: timers use an older formula (`timers::store::Segment::for_partition`).
+/// Move timer data to this id with `migrate_segment_if_needed`, then remove
+/// the timer `SegmentId` alias.
 #[must_use]
 pub(crate) fn partition_segment_id(topic: Topic, partition: Partition, group: &str) -> SegmentId {
     let name = format!("{topic}/{partition}:{group}");
