@@ -38,15 +38,19 @@ cassandra_queries! {
             TABLE_SEGMENTS
         ),
 
-        /// Gets segment metadata by ID.
+        /// Gets segment metadata and the slab watermark by ID.
         ///
-        /// Selects only static columns. `ORDER BY slab_id DESC` resolves the
-        /// row on the live tail of the partition — the sweeper (PR #34) leaves
-        /// a tombstone graveyard at low `slab_id`, and a forward `LIMIT 1`
-        /// walks straight through it on every startup. Reverse scan is the
-        /// same I/O cost when paired with `LIMIT 1` and skips the graveyard.
+        /// Selects only static columns, so Cassandra reads the partition until
+        /// it finds a live slab row. Deleted slabs leave row tombstones at low
+        /// `slab_id`. `ORDER BY slab_id DESC` starts at the high end, so it
+        /// skips them when a live slab row exists. An idle segment has no live
+        /// slab row. Its read walks every tombstone: about `gc_grace_seconds`
+        /// divided by the slab size, for example 14,400 at a 1-minute slab
+        /// size. A separate table for the static columns needs a segment
+        /// version fence. Older versions treat an unknown version as
+        /// `Terminal`.
         get_segment: (
-            "SELECT name, slab_size, version FROM $keyspace.{} WHERE id = ? ORDER BY slab_id DESC LIMIT 1",
+            "SELECT name, slab_size, version, slab_watermark FROM $keyspace.{} WHERE id = ? ORDER BY slab_id DESC LIMIT 1",
             TABLE_SEGMENTS
         ),
 
@@ -128,34 +132,26 @@ cassandra_queries! {
             TABLE_TYPED_KEYS
         ),
 
-        /// Inserts a trigger into the key index with TTL
-        insert_key_trigger: (
-            "INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span, tag) VALUES (?, ?, ?, ?, ?, ?) USING TTL ?",
-            TABLE_TYPED_KEYS
-        ),
-
-        /// Deletes a specific trigger from the key index
-        delete_key_trigger: (
-            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?",
-            TABLE_TYPED_KEYS
-        ),
-
-        /// Clears all triggers for a key and timer type
-        clear_key_triggers: (
-            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ?",
-            TABLE_TYPED_KEYS
-        ),
-
-        /// Clears all triggers for a key across ALL timer types
-        clear_key_triggers_all_types: (
-            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
+        /// Deletes every trigger of a type in an inclusive time range with one range tombstone.
+        delete_key_triggers_within: (
+            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time >= ? AND time <= ?",
             TABLE_TYPED_KEYS
         ),
 
         /// Updates segment version
         update_segment_version: (
-            "UPDATE $keyspace.{} SET version = ?, slab_size = ? WHERE id = ?",
+            "UPDATE $keyspace.{} SET version = ? WHERE id = ?",
             TABLE_SEGMENTS
+        ),
+
+        /// BATCH: atomically updates the segment slab size and its
+        /// `slab_watermark` (with TTL). See `StoredSegment`.
+        update_segment_slab_size: (
+            "BEGIN UNLOGGED BATCH \
+             UPDATE $keyspace.{} SET slab_size = ? WHERE id = ?; \
+             UPDATE $keyspace.{} USING TTL ? SET slab_watermark = ? WHERE id = ?; \
+             APPLY BATCH",
+            TABLE_SEGMENTS, TABLE_SEGMENTS
         ),
 
         /// Enumerates active v1 slabs for a segment
@@ -266,12 +262,6 @@ cassandra_queries! {
             TABLE_TYPED_KEYS
         ),
 
-        /// Clears the entire `state` static column (all timer types at once)
-        clear_state: (
-            "DELETE state FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
-            TABLE_TYPED_KEYS
-        ),
-
         /// Sets inline timer state (static column only) with TTL — no DELETE, no BATCH
         set_state_inline: (
             "UPDATE $keyspace.{} USING TTL ? SET state[?] = ? WHERE segment_id = ? AND key = ?",
@@ -284,25 +274,21 @@ cassandra_queries! {
             TABLE_TYPED_KEYS
         ),
 
-        /// Reads up to 2 remaining trigger times for a key/type (demotion check)
-        count_key_triggers: (
-            "SELECT time FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? LIMIT 2",
+        /// Reads the 2 latest triggers of a type before a time, latest first.
+        peek_key_triggers_before: (
+            "SELECT time, span, tag FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time < ? ORDER BY timer_type DESC, time DESC LIMIT 2",
             TABLE_TYPED_KEYS
         ),
 
-        /// Reads the first remaining trigger (time, span, tag) for a key/type (inline demotion)
-        peek_first_key_trigger: (
-            "SELECT time, span, tag FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? LIMIT 1",
+        /// Reads the 2 earliest triggers of a type after a time, earliest first.
+        peek_key_triggers_after: (
+            "SELECT time, span, tag FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time > ? LIMIT 2",
             TABLE_TYPED_KEYS
         ),
 
-        /// Reads up to 3 clustering rows (time, span, tag) for a key/type.
-        /// Used by `delete_key_trigger`'s Overflow branch: a single
-        /// pre-delete read drives the post-delete state decision (0 / 1 /
-        /// 2+ surviving rows after filtering the target out) and supplies
-        /// the surviving row's data when the post-delete state is Inline.
-        peek_three_key_triggers: (
-            "SELECT time, span, tag FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? LIMIT 3",
+        /// Reads the 2 latest triggers of a type, latest first.
+        peek_last_key_triggers: (
+            "SELECT time, span, tag FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? ORDER BY timer_type DESC, time DESC LIMIT 2",
             TABLE_TYPED_KEYS
         ),
 
@@ -310,16 +296,6 @@ cassandra_queries! {
         batch_clear_and_set_inline: (
             "BEGIN UNLOGGED BATCH \
              DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ?; \
-             UPDATE $keyspace.{} USING TTL ? SET state[?] = ? WHERE segment_id = ? AND key = ?; \
-             APPLY BATCH",
-            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
-        ),
-
-        /// BATCH: Delete a single clustering row and set inline state with TTL.
-        /// Used for Overflow→Inline demotion when exactly 1 clustering row remains.
-        batch_demote_to_inline: (
-            "BEGIN UNLOGGED BATCH \
-             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
              UPDATE $keyspace.{} USING TTL ? SET state[?] = ? WHERE segment_id = ? AND key = ?; \
              APPLY BATCH",
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
@@ -348,40 +324,10 @@ cassandra_queries! {
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
         ),
 
-        /// BATCH: Clear all clustering rows + clear entire state column.
-        /// Same partition — no cross-partition overhead.
-        batch_clear_key_triggers_all_types: (
-            "BEGIN UNLOGGED BATCH \
-             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ?; \
-             DELETE state FROM $keyspace.{} WHERE segment_id = ? AND key = ?; \
-             APPLY BATCH",
-            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
-        ),
-
-        /// BATCH: DELETE target clustering row + DELETE `state[type]`.
-        /// Used by `delete_key_trigger`'s Overflow branch when the
-        /// pre-delete read shows the target is the only row → Absent.
-        /// Both statements target the same `(segment_id, key)` partition.
-        batch_delete_to_absent: (
-            "BEGIN UNLOGGED BATCH \
-             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
-             DELETE state[?] FROM $keyspace.{} WHERE segment_id = ? AND key = ?; \
-             APPLY BATCH",
-            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
-        ),
-
-        /// BATCH: DELETE target clustering + DELETE surviving clustering +
-        /// UPDATE state Inline (with TTL).
-        /// Used by `delete_key_trigger`'s Overflow branch when exactly one
-        /// non-target row survives — that row's data is captured into the
-        /// static state column in a single round-trip → Inline.
-        batch_delete_to_inline: (
-            "BEGIN UNLOGGED BATCH \
-             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
-             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
-             UPDATE $keyspace.{} USING TTL ? SET state[?] = ? WHERE segment_id = ? AND key = ?; \
-             APPLY BATCH",
-            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        /// Deletes the key's partition: every clustering row and the static `state` map.
+        clear_key_triggers_all_types: (
+            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
+            TABLE_TYPED_KEYS
         ),
 
         /// Reads the tag from a single clustering row.
@@ -393,20 +339,6 @@ cassandra_queries! {
         // =========================================================================
         // Slab Watermark Operations
         // =========================================================================
-
-        /// Reads the static `slab_watermark` column for a segment.
-        ///
-        /// Returns `Option<i32>` (Cassandra static columns are NULL until set).
-        /// `None` = pre-migration / fresh segment → scheduler scans from `slab_id = 0`.
-        ///
-        /// `ORDER BY slab_id DESC` resolves on the live tail of the partition
-        /// — see `get_segment` for the full rationale; this query is read
-        /// once per scheduler-actor spawn and was a primary source of
-        /// `tombstone_warn_threshold` warnings on Kafka rebalance.
-        get_slab_watermark: (
-            "SELECT slab_watermark FROM $keyspace.{} WHERE id = ? ORDER BY slab_id DESC LIMIT 1",
-            TABLE_SEGMENTS
-        ),
 
         /// Updates `slab_watermark` (static column) with TTL.
         set_slab_watermark: (

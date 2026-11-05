@@ -17,6 +17,13 @@
 //! 5. **Success/Failure**: On success advance queue, on transient re-defer, on
 //!    permanent skip
 //!
+//! # Invariants
+//!
+//! 1. **Completion**: A key with a non-empty deferred queue has a scheduled
+//!    retry timer. Every queue write follows the timer write that covers it. A
+//!    failed timer write leaves the queue unchanged, and the redelivery repeats
+//!    the step.
+//!
 //! # Apply hooks
 //!
 //! The inner is invoked at most once per dispatch. [`TimerDeferOutput`]

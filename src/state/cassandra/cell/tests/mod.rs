@@ -23,12 +23,12 @@ mod ttl_marker;
 
 use super::batch::{fits_one_batch, marker_delete_unit, settle_batches, stage_batches};
 use super::decode::try_decode_marker;
+use super::encoding;
 use super::{
-    CassandraStore, CellAddr, CellBatchRow, CellBlobs, CellCorruptReason, CellKind, CellQueries,
-    KeyRow, MarkerBlob, MarkerWriteRow, Pk, ResolvedRow, RowShape, StageRow, blob_weight,
-    encode_cell_blobs, sorted_unique_coordinates, ttl_seconds_to_duration,
+    CassandraCellResources, CassandraStore, CellAddr, CellBatchRow, CellBlobs, CellCorruptReason,
+    CellKind, CellQueries, KeyRow, MarkerBlob, MarkerWriteRow, Pk, ResolvedRow, RowShape, StageRow,
+    blob_weight, encode_cell_blobs, ttl_seconds_to_duration,
 };
-use super::{decode, encoding};
 use crate::cassandra::{BatchUnit, CassandraStore as CassandraSession};
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::state::cached::Cached;

@@ -50,6 +50,6 @@ fn coordinate_empty_is_least() {
         let other = Coordinate::from_bytes(bytes);
         empty <= other && (was_empty || empty < other)
     }
-    assert!(Coordinate::empty().as_bytes().is_empty());
+    assert_eq!(Coordinate::empty().as_bytes(), b"");
     QuickCheck::new().quickcheck(prop as fn(Vec<u8>) -> bool);
 }

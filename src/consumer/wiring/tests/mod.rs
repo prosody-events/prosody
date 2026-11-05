@@ -7,7 +7,7 @@ use crate::consumer::decode::ResultRequestReader;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::handler::{DemandType, EventHandler, HandlerProvider, Uncommitted};
 use crate::consumer::kafka_context::PartitionProviders;
-use crate::consumer::message::UncommittedMessage;
+use crate::consumer::message::{ConsumerRecord, UncommittedMessage};
 use crate::consumer::middleware::CloneProvider;
 use crate::consumer::middleware::deduplication::{
     DEFAULT_IDEMPOTENCE_VERSION, DeduplicationConfiguration, MemoryDeduplicationStoreProvider,
@@ -18,8 +18,8 @@ use crate::consumer::middleware::timeout::TimeoutConfiguration;
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::storage::{ComponentsOf, ConsumerStorageBackend, ConsumerStorageInputs};
 use crate::consumer::{
-    CommonConfiguration, ConsumerConfiguration, ConsumerError, KafkaObserver, Managers,
-    PeerInitError, ProsodyConsumer,
+    CommonConfiguration, ConsumerConfiguration, ConsumerError, Managers, PeerInitError,
+    ProsodyConsumer,
 };
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MemoryLoader;
@@ -41,6 +41,7 @@ use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use crate::{JsonCodec, Partition, PeerConfiguration, Topic};
 use color_eyre::Result;
 use crossbeam_utils::CachePadded;
+use futures::stream::pending;
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::array::from_fn;
@@ -227,10 +228,8 @@ impl ConsumerStorageBackend<JsonCodec> for RecordingMemoryBackend {
         &self,
         inputs: ConsumerStorageInputs,
         keyed_state: &KeyedStateInputs,
-        observer: KafkaObserver,
     ) -> impl Future<Output = Result<ComponentsOf<JsonCodec, Self>, ConsumerError>> + Send {
-        self.inner
-            .build_consumer_components(inputs, keyed_state, observer)
+        self.inner.build_consumer_components(inputs, keyed_state)
     }
 }
 
@@ -308,13 +307,11 @@ impl EventHandler for SweptHandler {
 /// Leaves one partition manager in the shared map that no rebalance will
 /// remove, so the shutdown sweep has something to shut down.
 ///
-/// This is the state a failed `close_queue` leaves behind: rdkafka skips its
-/// close-poll loop, the final revoke never dispatches, and the manager stays.
 /// Its handler records the end of its task, which is what makes the sweep's
 /// position in the shutdown order observable.
 fn retain_manager(
     config: &ConsumerConfiguration,
-    managers: &Managers<Value>,
+    managers: &Managers,
     log: EventLog,
 ) -> Result<()> {
     let keyed_state = KeyedStateInputs::new(
@@ -325,7 +322,6 @@ fn retain_manager(
     )?;
     let partition_config = PartitionConfiguration {
         group_id: Arc::from(config.group_id.as_str()),
-        buffer_size: 1,
         max_uncommitted: 1,
         allowed_events: None,
         shutdown_timeout: Duration::from_secs(1),
@@ -353,6 +349,7 @@ fn retain_manager(
         SweptHandler { log },
         topic,
         RETAINED_PARTITION,
+        pending::<ConsumerRecord<Value>>(),
     );
     managers
         .write()
@@ -399,7 +396,7 @@ fn recording_memory_deps(
 
 async fn start<R: ResultRequestReader + 'static>(
     config: &ConsumerConfiguration,
-    managers: Arc<Managers<Value>>,
+    managers: Arc<Managers>,
     heartbeats: HeartbeatRegistry,
     log: EventLog,
     requests: R,
@@ -430,7 +427,6 @@ async fn start<R: ResultRequestReader + 'static>(
             version: keyed_state.version.clone(),
             telemetry: &telemetry,
             heartbeats,
-            observer: KafkaObserver::new(&config.group_id),
             managers,
         },
         requests,

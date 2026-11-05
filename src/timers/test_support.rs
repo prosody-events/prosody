@@ -6,6 +6,7 @@ use crate::Topic;
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::telemetry::Telemetry;
+use crate::timers::active::Listed;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 pub(crate) use crate::timers::scheduler::tests::support::retirement_trace;
@@ -19,11 +20,65 @@ use color_eyre::eyre::{Result, eyre};
 use futures::Stream;
 use std::array::from_fn;
 use std::sync::Arc;
+use strum::VariantArray;
 use tokio::sync::{Semaphore, watch};
 use tracing::Span;
 use uuid::Uuid;
 
 const TEST_TIMER_SEMAPHORE_SIZE: usize = 64;
+
+/// What memory holds for one timer, as timer tests model it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Memory {
+    /// An attempt waits to fire, and no delivery runs.
+    Waits,
+    /// A delivery runs. `again` tells whether an attempt also waits.
+    Firing { again: bool },
+    /// An entry that fires nothing, such as an aborted delivery.
+    Kept,
+}
+
+/// A step that the owner of one timer takes, as timer tests model it.
+#[derive(Clone, Copy, Debug, VariantArray)]
+pub(crate) enum Step {
+    Schedule,
+    Unschedule,
+    /// Starts the delivery of the attempt that waits.
+    Fire,
+    Commit,
+    Abort,
+}
+
+impl Memory {
+    /// How the scheduler lists the timer.
+    pub(crate) fn listed(self) -> Option<Listed> {
+        match self {
+            Self::Waits => Some(Listed::Waits),
+            Self::Firing { again } => Some(Listed::Firing { again }),
+            Self::Kept => None,
+        }
+    }
+}
+
+/// What memory holds for a timer after `step`. A fire needs a waiting
+/// attempt, and a commit needs a delivery.
+pub(crate) fn after(memory: Option<Memory>, step: Step) -> Option<Memory> {
+    use Memory::{Firing, Kept, Waits};
+
+    match (step, memory) {
+        // A delivery keeps its row. A schedule during it queues an attempt.
+        (Step::Schedule, Some(Firing { .. })) => Some(Firing { again: true }),
+        (Step::Unschedule, Some(Firing { .. })) | (Step::Fire, _) => Some(Firing { again: false }),
+        // The end of a delivery leaves the attempt that waits.
+        (Step::Schedule, _) | (Step::Commit | Step::Abort, Some(Firing { again: true })) => {
+            Some(Waits)
+        }
+        (Step::Unschedule | Step::Commit, _) => None,
+        (Step::Abort, Some(Firing { again: false })) => Some(Kept),
+        // Only a delivery aborts.
+        (Step::Abort, memory) => memory,
+    }
+}
 
 /// Per-type timer semaphores sized generously for tests.
 pub(crate) fn test_semaphores() -> Arc<TimerSemaphores> {
@@ -65,7 +120,7 @@ pub(crate) fn create_test_trigger(
 /// `shutdown_tx` and can send `ShutdownPhase::Cancelling` to stop the
 /// background scheduler actor.
 pub(crate) async fn setup_timer_manager() -> Result<(
-    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
+    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>> + use<>,
     TimerManager<TableAdapter<InMemoryTriggerStore>>,
     watch::Sender<ShutdownPhase>,
 )> {
@@ -81,26 +136,26 @@ pub(crate) async fn setup_timer_manager() -> Result<(
 pub(crate) async fn setup_timer_manager_at(
     initial: ShutdownPhase,
 ) -> Result<(
-    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
+    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>> + use<>,
     TimerManager<TableAdapter<InMemoryTriggerStore>>,
     watch::Sender<ShutdownPhase>,
 )> {
-    setup_timer_manager_with_store(memory_store(test_segment("test-segment", 300_u32)), initial)
-        .await
+    let store = memory_store(test_segment("test-segment", 300_u32));
+    setup_timer_manager_with_store(store, initial, &Telemetry::new()).await
 }
 
 /// Creates a manager over a store that the test can seed through table
-/// operations.
+/// operations. The manager reports its events to `telemetry`.
 pub(crate) async fn setup_timer_manager_with_store(
     store: TableAdapter<InMemoryTriggerStore>,
     initial: ShutdownPhase,
+    telemetry: &Telemetry,
 ) -> Result<(
-    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
+    impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>> + use<>,
     TimerManager<TableAdapter<InMemoryTriggerStore>>,
     watch::Sender<ShutdownPhase>,
 )> {
     let (shutdown_tx, shutdown_rx) = watch::channel(initial);
-    let telemetry = Telemetry::new();
 
     let config = TimerManagerConfig {
         store,

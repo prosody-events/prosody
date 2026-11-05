@@ -6,6 +6,7 @@ use crate::state::descriptor::{DescriptorIdentity, value_state};
 use crate::state::manager::{Admission, PartitionStateManager, test_manager};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellRead;
+use crate::state::tests::support::listed;
 use crate::timers::test_support::setup_timer_manager;
 use std::slice::from_ref;
 
@@ -84,9 +85,9 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
             cell.clone(),
             ProvisionalWrite::new(Some(bytes(value)), Committed::new(None), e),
         )];
-        let marker = EventMarker::frozen(e, &writes, &[], &initial_evidence);
+        let marker = EventMarker::frozen(e, &writes, Vec::new(), &initial_evidence);
         store
-            .write_provisional(collection, &writes, Some(&marker))
+            .write_provisional(collection, listed(&marker, &writes)?)
             .await?;
         store
             .commit_provisional(collection, &marker, &writes)
@@ -102,11 +103,11 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
     let marker = EventMarker::frozen(
         c,
         &writes,
-        &[],
+        Vec::new(),
         &evidence(touched.clone(), Some(Uuid::from_u128(2))),
     );
     store
-        .write_provisional(&collections[0], &writes, Some(&marker))
+        .write_provisional(&collections[0], listed(&marker, &writes)?)
         .await?;
     store
         .commit_provisional(&collections[0], &marker, &writes)
@@ -120,11 +121,11 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
     let marker = EventMarker::frozen(
         e,
         &writes,
-        &[],
+        Vec::new(),
         &evidence(touched.clone(), Some(Uuid::from_u128(1))),
     );
     store
-        .write_provisional(&collections[0], &writes, Some(&marker))
+        .write_provisional(&collections[0], listed(&marker, &writes)?)
         .await?;
     if committed {
         store
@@ -135,7 +136,7 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
     ensure!(admit_registered(&counted, &dedup, &collections).await? == Admission::Fresh);
     let expected = if committed { replay } else { newer };
     ensure!(
-        CellRead::<Values>::read(&store, collections[0].id(), &cell)
+        CellRead::<Values>::read(&store, collections[0].id(), cell.as_ref())
             .await?
             .0
             .get()
@@ -143,7 +144,7 @@ pub(crate) async fn run_admit_soundness<S: CellStore>(
         "an old certificate certified a replay"
     );
     ensure!(
-        CellRead::<Values>::read(&store, collections[1].id(), &cell)
+        CellRead::<Values>::read(&store, collections[1].id(), cell.as_ref())
             .await?
             .0
             .get()
@@ -178,7 +179,7 @@ pub(crate) async fn seed_commit_evidence<S: CellStore>(
         .commit_provisional(collection, &evidence_only(&marker), &[])
         .await?;
     store
-        .write_provisional(collection, &[], Some(&marker))
+        .write_provisional(collection, listed(&marker, &[])?)
         .await?;
     Ok(())
 }
@@ -208,10 +209,15 @@ async fn deregistration<S: CellStore>(
         value_cell(),
         ProvisionalWrite::new(Some(bytes(value)), Committed::new(None), event),
     )];
-    let marker = EventMarker::frozen(event, &writes, &[], &evidence(touched, Some(dedup_id)));
+    let marker = EventMarker::frozen(
+        event,
+        &writes,
+        Vec::new(),
+        &evidence(touched, Some(dedup_id)),
+    );
     for collection in &collections {
         store
-            .write_provisional(collection, &writes, Some(&marker))
+            .write_provisional(collection, listed(&marker, &writes)?)
             .await?;
     }
     if committed {
@@ -237,21 +243,21 @@ async fn deregistration<S: CellStore>(
     let marker = EventMarker::frozen(
         event,
         &next,
-        &[],
+        Vec::new(),
         &evidence(
             [(StateType::Application, collections[0].id().name().clone())].into(),
             marker.dedup(),
         ),
     );
     store
-        .write_provisional(&collections[0], &next, Some(&marker))
+        .write_provisional(&collections[0], listed(&marker, &next)?)
         .await?;
     store
         .commit_provisional(&collections[0], &marker, &next)
         .await?;
     let expected = committed.then(|| bytes(value));
     ensure!(
-        CellRead::<Values>::read(store, collections[1].id(), &value_cell())
+        CellRead::<Values>::read(store, collections[1].id(), value_cell().as_ref())
             .await?
             .0
             .into_inner()
@@ -267,7 +273,7 @@ async fn deregistration<S: CellStore>(
             .is_none()
     );
     ensure!(
-        CellRead::<Values>::read(store, collections[1].id(), &value_cell())
+        CellRead::<Values>::read(store, collections[1].id(), value_cell().as_ref())
             .await?
             .0
             .into_inner()

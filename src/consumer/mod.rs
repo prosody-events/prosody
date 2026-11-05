@@ -22,8 +22,6 @@
 //! - `PartitionManager`: Manages message processing for a single Kafka
 //!   partition
 //! - `EventHandler`: User-implemented trait for message processing logic
-//! - `KafkaObserver`: What the primary Kafka client knows about itself, shared
-//!   with the consumer context
 //! - Failure strategies: Composable error handling mechanisms
 //!
 //! # Usage
@@ -134,7 +132,7 @@ pub use crate::consumer::config::{
     MockConfigurationError, PipelineMiddlewareConfiguration,
 };
 pub use crate::consumer::error::{
-    ConsumerError, KeyedStateInitError, PeerInitError, ShutdownError,
+    ConsumerError, KeyedStateInitError, PeerInitError, RoutingError, ShutdownError,
 };
 pub use crate::consumer::event_context::{EventContext, TerminationSignals};
 pub use crate::consumer::handler::{DemandType, EventHandler, HandlerProvider, Keyed, Uncommitted};
@@ -144,7 +142,6 @@ pub use crate::consumer::kafka_state::{
 };
 pub use crate::consumer::message::ConsumerMessage;
 pub use crate::consumer::middleware::{FallibleHandler, RepinProof};
-pub(crate) use crate::consumer::observer::KafkaObserver;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::probes::ProbeServer;
 pub(crate) use crate::consumer::wiring::state::{
@@ -162,6 +159,7 @@ use crossbeam_utils::CachePadded;
 use educe::Educe;
 use futures::executor::block_on;
 use parking_lot::{Mutex, RwLock};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::watch;
@@ -180,12 +178,11 @@ pub mod message;
 pub mod middleware;
 mod modes;
 pub(crate) use modes::{NoResponses, Responding, ResponsePolicy};
-// Crate-wide, not `pub(in crate::consumer)`: keyed-state publication reads the
-// observed partition count from outside this module.
-pub(crate) mod observer;
 pub(crate) mod partition;
 mod poll;
 mod probes;
+mod source;
+mod statistics;
 pub mod storage;
 mod sweep;
 mod wiring;
@@ -201,7 +198,7 @@ type WatermarkVersion = CachePadded<AtomicUsize>;
 /// Maps (Topic, Partition) pairs to their corresponding `PartitionManager`
 /// instances. Protected by a `RwLock` to allow concurrent reads with exclusive
 /// writes.
-pub(crate) type Managers<P> = RwLock<HashMap<(Topic, Partition), PartitionManager<P>>>;
+pub(crate) type Managers = RwLock<HashMap<(Topic, Partition), PartitionManager>>;
 
 /// Holds the runtime state of the consumer.
 ///
@@ -210,9 +207,6 @@ pub(crate) type Managers<P> = RwLock<HashMap<(Topic, Partition), PartitionManage
 struct RuntimeState {
     poll_handle: JoinHandle<()>,
     probe_server: Option<ProbeServer>,
-    /// The consumer's Kafka observation handle. Shutdown retires its gauge
-    /// series so a stopped consumer stops contributing to `sum` aggregations.
-    observer: KafkaObserver,
 }
 
 /// What one teardown still holds after the Kafka poll loop stops.
@@ -223,7 +217,6 @@ struct RuntimeState {
 /// nothing shared.
 struct Teardown {
     probe_server: Option<ProbeServer>,
-    observer: KafkaObserver,
 }
 
 /// High-level Kafka consumer implementation.
@@ -248,7 +241,7 @@ pub struct ProsodyConsumer<C: Codec = JsonCodec> {
 
     /// Thread-safe storage for partition managers.
     #[educe(Debug(ignore))]
-    managers: Arc<Managers<C::Payload>>,
+    managers: Arc<Managers>,
 
     /// Current assigned-partition count, republished by the rebalance callback
     /// after every assign/revoke. Awaited by
@@ -263,6 +256,11 @@ pub struct ProsodyConsumer<C: Codec = JsonCodec> {
     /// Heartbeat registry for consumer-level actors.
     #[educe(Debug(ignore))]
     heartbeats: HeartbeatRegistry,
+
+    /// Names the codec of the consumer's payloads. The codec itself runs on
+    /// the partition tasks.
+    #[educe(Debug(ignore))]
+    _codec: PhantomData<fn() -> C>,
 }
 
 /// Every clone reaches the same consumer, so a clone is a second owner and
@@ -280,6 +278,7 @@ impl<C: Codec> Clone for ProsodyConsumer<C> {
             assignment: self.assignment.clone(),
             runtime_state: Arc::clone(&self.runtime_state),
             heartbeats: self.heartbeats.clone(),
+            _codec: PhantomData,
         }
     }
 }
@@ -327,7 +326,8 @@ impl<C: Codec> ProsodyConsumer<C> {
 
     /// Stops this consumer after all handlers finish.
     ///
-    /// It stops the poll loop, sweeps each partition, and retires observations.
+    /// It stops the poll loop, sweeps each partition, and stops the probe
+    /// server.
     ///
     /// A second call finds no runtime state and does no work.
     /// A call on a clone behaves the same after another clone stops the
@@ -338,7 +338,7 @@ impl<C: Codec> ProsodyConsumer<C> {
         }
     }
 
-    /// Stops polling, drains every manager, and releases observations.
+    /// Stops polling, drains every manager, and releases the probe server.
     async fn finish_shutdown(&mut self) -> Option<ShutdownError> {
         let (teardown, poll_failure) = self.stop_polling().await?;
         let swept = sweep::drain_managers(&self.managers).await;
@@ -355,7 +355,6 @@ impl<C: Codec> ProsodyConsumer<C> {
         let RuntimeState {
             poll_handle,
             probe_server,
-            observer,
         } = self.runtime_state.lock().take()?;
 
         self.shutdown.store(true, Ordering::Relaxed);
@@ -366,28 +365,17 @@ impl<C: Codec> ProsodyConsumer<C> {
                 message: format!("{error:#}"),
             }),
         };
-        Some((
-            Teardown {
-                probe_server,
-                observer,
-            },
-            poll_failure,
-        ))
+        Some((Teardown { probe_server }, poll_failure))
     }
 }
 
 impl Teardown {
-    /// Retires observation resources after all partition handlers stop.
+    /// Stops the probe server after all partition handlers stop.
     ///
     /// The [`Swept`](sweep::Swept) proof is the parameter, and only the sweep
     /// mints one, so this step cannot run before the sweep.
     async fn release(self, _swept: sweep::Swept) {
-        let Self {
-            probe_server,
-            observer,
-        } = self;
-        observer.retire_gauges();
-        if let Some(probe_server) = probe_server {
+        if let Some(probe_server) = self.probe_server {
             probe_server.shutdown().await;
         }
     }
@@ -411,13 +399,11 @@ impl<C: Codec> Drop for ProsodyConsumer<C> {
     }
 }
 
-pub(crate) fn get_assigned_partition_count<P: Send + Sync + 'static>(
-    managers: &Managers<P>,
-) -> u32 {
+pub(crate) fn get_assigned_partition_count(managers: &Managers) -> u32 {
     u32::try_from(managers.read().len()).unwrap_or(u32::MAX)
 }
 
 /// Checks if any partition is stalled.
-pub(crate) fn get_is_stalled<P: Send + Sync + 'static>(managers: &Managers<P>) -> bool {
+pub(crate) fn get_is_stalled(managers: &Managers) -> bool {
     managers.read().values().any(PartitionManager::is_stalled)
 }

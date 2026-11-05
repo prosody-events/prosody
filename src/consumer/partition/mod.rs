@@ -8,7 +8,6 @@
 //! - Preserves strict ordering for messages with the same key
 //! - Tracks and commits message offsets for at-least-once processing
 //! - Manages graceful shutdown of partition processing
-//! - Implements backpressure through the bounded message channel
 //!
 //! The core component is `PartitionManager`, which coordinates all aspects
 //! of partition-level message processing.
@@ -29,13 +28,12 @@ use crate::{EventIdentity, EventType, Offset, Partition, Topic};
 use aho_corasick::AhoCorasick;
 use crossbeam_utils::CachePadded;
 use educe::Educe;
+use futures::Stream;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tokio::spawn;
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
@@ -94,15 +92,15 @@ struct PartitionInfo {
 
 /// Runtime context for partition message processing.
 ///
-/// Groups the channels and trackers needed for partition processing,
+/// Groups the record stream and trackers needed for partition processing,
 /// separating runtime state from static configuration.
 ///
-/// `P` is the payload type carried by incoming [`ConsumerMessage`]s.
-struct PartitionContext<P> {
+/// `Q` is the stream of the partition's records, in offset order.
+struct PartitionContext<Q> {
     /// Tracks offset commits and processing progress.
     offsets: OffsetTracker,
-    /// Channel receiving messages to process.
-    message_rx: Receiver<ConsumerRecord<P>>,
+    /// The partition's records, in offset order.
+    records: Q,
     /// Registry for monitoring processing and timer heartbeats.
     heartbeats: HeartbeatRegistry,
     /// Channel receiving shutdown phase transitions.
@@ -112,8 +110,7 @@ struct PartitionContext<P> {
 /// Configuration settings for a partition manager.
 ///
 /// Contains all the parameters needed to configure message processing
-/// for a Kafka partition, including buffer sizes, timer concurrency,
-/// and filtering options.
+/// for a Kafka partition, including timer concurrency and filtering options.
 ///
 /// `S` is a [`TriggerStoreProvider`] that creates per-partition stores.
 /// `SP` is a [`PartitionStateProvider`] that acquires per-partition
@@ -123,9 +120,6 @@ struct PartitionContext<P> {
 pub struct PartitionConfiguration<S, SP, P> {
     /// Consumer group identifier
     pub group_id: Arc<str>,
-
-    /// Maximum size of message buffers
-    pub buffer_size: usize,
 
     /// Maximum number of uncommitted messages allowed
     pub max_uncommitted: usize,
@@ -178,13 +172,10 @@ pub struct PartitionConfiguration<S, SP, P> {
 /// - Queuing messages by key to maintain ordering for each key
 /// - Tracking and committing message offsets to ensure at-least-once processing
 /// - Managing graceful partition shutdown during rebalancing
-/// - Enforcing backpressure through the bounded message channel
 /// - Monitoring for processing stalls
-///
-/// `P` is the payload type carried by consumed messages.
 #[derive(Educe)]
 #[educe(Debug)]
-pub struct PartitionManager<P> {
+pub struct PartitionManager {
     /// The Kafka topic this partition belongs to
     topic: Topic,
     /// The partition number this manager handles
@@ -193,10 +184,6 @@ pub struct PartitionManager<P> {
     /// Tracks offset commits and processing progress
     #[educe(Debug(ignore))]
     offsets: OffsetTracker,
-
-    /// Channel for sending messages to be processed
-    #[educe(Debug(ignore))]
-    message_tx: Sender<ConsumerRecord<P>>,
 
     /// Heartbeat registry
     #[educe(Debug(ignore))]
@@ -214,21 +201,26 @@ pub struct PartitionManager<P> {
     handle: JoinHandle<()>,
 }
 
-impl<P: Send + 'static> PartitionManager<P> {
-    /// Creates a new partition manager.
-    pub fn new<T, S, SP>(
+impl PartitionManager {
+    /// Creates a new partition manager that processes `records`.
+    ///
+    /// `records` must yield the partition's records in offset order. The
+    /// manager reads it until shutdown, and its task drops it then.
+    pub fn new<T, S, SP, P, Q>(
         config: PartitionConfiguration<S, SP, P>,
         handler: T,
         topic: Topic,
         partition: Partition,
+        records: Q,
     ) -> Self
     where
+        Q: Stream<Item = ConsumerRecord<P>> + Send + 'static,
         T: EventHandler<Payload = P> + Send + Sync + 'static,
         S: TriggerStoreProvider,
         SP: PartitionStateProvider<S::Store>,
         <SP::Manager as PartitionStateManager>::Session:
             EventSession<Loader: MessageLoader<Payload = P>>,
-        P: Sync + EventType + EventIdentity,
+        P: Send + Sync + 'static + EventType + EventIdentity,
     {
         // Initialize offset tracker to manage offset state
         let offsets = OffsetTracker::new(
@@ -239,10 +231,9 @@ impl<P: Send + 'static> PartitionManager<P> {
             config.watermark_version.clone(),
         );
 
-        // Initialize heartbeats, channels, and shutdown signals
+        // Initialize heartbeats and shutdown signals
         let heartbeats =
             HeartbeatRegistry::new(format!("{topic}:{partition}"), config.stall_threshold);
-        let (message_tx, message_rx) = channel(config.buffer_size);
         let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
         let shutdown_timeout = config.shutdown_timeout;
 
@@ -250,7 +241,7 @@ impl<P: Send + 'static> PartitionManager<P> {
         let partition_info = PartitionInfo { topic, partition };
         let context = PartitionContext {
             offsets: offsets.clone(),
-            message_rx,
+            records,
             heartbeats: heartbeats.clone(),
             shutdown_rx,
         };
@@ -260,36 +251,11 @@ impl<P: Send + 'static> PartitionManager<P> {
             topic,
             partition,
             offsets,
-            message_tx,
             heartbeats,
             shutdown_tx,
             shutdown_timeout,
             handle,
         }
-    }
-
-    /// Checks if the partition can accept more messages.
-    ///
-    /// This method indicates whether the internal message queue has capacity
-    /// for more messages, which is used to implement backpressure.
-    pub fn has_capacity(&self) -> bool {
-        self.message_tx.capacity() > 0
-    }
-
-    /// Attempts to enqueue a message for processing.
-    ///
-    /// This non-blocking method tries to send a message to the internal
-    /// processing queue without waiting. If the queue is full or closed, the
-    /// original message is returned to the caller in the `Err` variant.
-    pub(crate) fn try_send_record(
-        &self,
-        message: ConsumerRecord<P>,
-    ) -> Result<(), ConsumerRecord<P>> {
-        self.message_tx
-            .try_send(message)
-            .map_err(|error| match error {
-                TrySendError::Closed(message) | TrySendError::Full(message) => message,
-            })
     }
 
     /// Gets the current committed offset watermark.
@@ -321,19 +287,16 @@ impl<P: Send + 'static> PartitionManager<P> {
     /// Initiates an orderly partition shutdown.
     ///
     /// This method performs a graceful shutdown sequence:
-    /// 1. Closes the message channel to prevent new messages
-    /// 2. Signals handlers to shut down gracefully
-    /// 3. Waits for in-flight messages to complete processing
-    /// 4. Performs final offset commits
+    /// 1. Stops reading new records and signals handlers to shut down
+    ///    gracefully
+    /// 2. Waits for in-flight messages to complete processing
+    /// 3. Stops offset tracking
     ///
     /// Used during consumer rebalancing or application shutdown. Returns the
     /// final committed offset watermark, or `None` if an error occurs during
     /// shutdown.
     #[instrument(level = "debug")]
     pub async fn shutdown(self) -> Option<Offset> {
-        // Close the message channel to stop accepting new messages
-        drop(self.message_tx);
-
         // Advance to Draining immediately, then schedule Cancelling and
         // Terminating at 80% and 100% of shutdown_timeout respectively.
         // If send returns Err, all receivers have dropped (partition already

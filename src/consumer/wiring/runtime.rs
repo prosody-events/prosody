@@ -6,9 +6,9 @@ use crate::consumer::decode::ResultRequestReader;
 use crate::consumer::error::ConsumerError;
 use crate::consumer::handler::{EventHandler, HandlerProvider};
 use crate::consumer::kafka_context::{ContextHandles, PartitionProviders, new_context};
-use crate::consumer::observer::KafkaObserver;
-use crate::consumer::poll::{PollConfig, poll};
+use crate::consumer::poll::poll;
 use crate::consumer::probes::ProbeServer;
+use crate::consumer::source::Reader;
 use crate::consumer::sweep::drain_managers;
 use crate::consumer::{Managers, ProsodyConsumer, RuntimeState, WatermarkVersion};
 use crate::heartbeat::HeartbeatRegistry;
@@ -22,58 +22,48 @@ use parking_lot::Mutex;
 use rdkafka::ClientConfig;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::spawn_blocking;
 use validator::Validate;
 use whoami::hostname;
 
+/// How long librdkafka waits to fetch a full partition again. A read of the
+/// partition does not end the wait early, so a partition refills at most once
+/// per wait. A short wait lets a small prefetch keep a fast partition busy.
+const FETCH_QUEUE_BACKOFF: Duration = Duration::from_millis(1);
+
 /// Everything startup needs beyond the consumer configuration and the two
 /// per-partition providers.
-///
-/// Deliberately not `Clone`: one value can serve only one consumer, so a mode
-/// cannot hand two consumers two different observers without a second,
-/// grep-visible [`KafkaObserver::new`] call.
-pub(in crate::consumer) struct StartupServices<'a, P> {
+pub(in crate::consumer) struct StartupServices<'a> {
     /// Idempotence version stamped into the partition configuration.
     pub(in crate::consumer) version: Arc<str>,
     /// Telemetry the partitions and middleware publish through.
     pub(in crate::consumer) telemetry: &'a Telemetry,
     /// Stall-detection registry, shared with the probe server.
     pub(in crate::consumer) heartbeats: HeartbeatRegistry,
-    /// The consumer's one Kafka observation handle. The same instance its
-    /// primary consumer's context holds, which updates it from the statistics
-    /// callback.
-    pub(in crate::consumer) observer: KafkaObserver,
     /// The partition managers shared by startup, health, and shutdown.
-    pub(in crate::consumer) managers: Arc<Managers<P>>,
+    pub(in crate::consumer) managers: Arc<Managers>,
 }
 
 /// Initializes a Prosody consumer with a trigger store provider, wiring the
 /// partition machinery to a Kafka consumer and starting its background poll
 /// loop. The provider creates per-partition stores with independent caches.
 ///
-/// The primary consumer is the sole source of Kafka observations: it is the
-/// client configured to report statistics, and its first observation is seeded
-/// by [`KafkaObserver::install_startup_metadata`], which owns that contract.
-///
 /// `requests` selects result-request reading by type.
-///
-/// Every caller wraps this future in `Box::pin`, because
-/// `clippy::large_futures` warns otherwise. The allocation is one per consumer
-/// start.
 ///
 /// Fails if the configuration is invalid, the probe server can't be started
 /// (if enabled), the consumer context can't be created, the hostname can't be
 /// retrieved for the client ID, the Kafka consumer can't be created with the
-/// provided configuration, topic subscription fails, the startup metadata
-/// fetch fails.
+/// provided configuration, or topic subscription fails.
 pub(in crate::consumer) async fn initialize_consumer<T, P, SP, C, R>(
     consumer_config: &ConsumerConfiguration,
     handler_provider: T,
     providers: PartitionProviders<P, SP>,
-    services: StartupServices<'_, C::Payload>,
+    services: StartupServices<'_>,
     requests: R,
 ) -> Result<ProsodyConsumer<C>, ConsumerError>
 where
@@ -87,14 +77,11 @@ where
     C::Payload: EventType + Clone + EventIdentity,
     R: ResultRequestReader + 'static,
 {
-    if let Err(error) = consumer_config.validate() {
-        return Err(error.into());
-    }
+    consumer_config.validate()?;
     let StartupServices {
         version,
         telemetry,
         heartbeats,
-        observer,
         managers,
     } = services;
 
@@ -107,45 +94,40 @@ where
     // an unreachable thread that holds the Kafka client forever. The probe
     // server binds first: a misconfigured port fails in microseconds, ahead of
     // the client's network round trips, and no consumer exists yet to release.
-    let probe_server = match consumer_config
+    let probe_server = consumer_config
         .probe_port
         .filter(|_| !consumer_config.mock)
         .map(|port| ProbeServer::new(port, managers.clone(), heartbeats.clone()))
-        .transpose()
-    {
-        Ok(probe_server) => probe_server,
-        Err(error) => {
-            return Err(error.into());
-        }
-    };
+        .transpose()?;
 
-    let started = start_client::<T, P, SP, C>(
+    let reader = Reader::<C, _>::new(
+        consumer_config.max_uncommitted,
+        requests,
+        consumer_config.message_spans,
+    );
+    let started = start_client(
         consumer_config,
         handler_provider,
         providers,
+        reader,
         watermark_version.clone(),
         ContextHandles {
             managers: managers.clone(),
             assignment_tx,
             telemetry: telemetry.sender(),
-            observer: observer.clone(),
         },
         version,
-        observer.clone(),
     )
     .await;
 
-    // The failure arm for every step after the probe bound: the observation is
-    // discarded, the partition managers swept, and the probe port freed.
-    // Clearing after the task, rather than inside it,
-    // also covers a fetch that panicked — see `KafkaObserver::clear`.
+    // The failure arm for every step after the probe bound: the partition
+    // managers are swept and the probe port freed.
     //
     // Both arms below sweep retained managers. After a normal revoke, the map
     // is empty and the sweep does nothing.
     let consumer = match started {
         Ok(consumer) => consumer,
         Err(error) => {
-            observer.clear();
             drain_managers(&managers).await;
             return Err(release_probe(probe_server, error).await);
         }
@@ -155,28 +137,21 @@ where
     let heartbeat = heartbeats.register("Kafka poll loop");
     let cloned_managers = managers.clone();
     let cloned_shutdown = shutdown.clone();
-    let max_message_count = consumer_config.max_uncommitted;
-    let message_spans = consumer_config.message_spans;
 
     let poll_handle = spawn_blocking(move || {
-        poll(PollConfig {
+        poll(
             poll_interval,
-            max_message_count,
             consumer,
-            codec: C::default(),
-            watermark_version: &watermark_version,
-            managers: &cloned_managers,
-            heartbeat: &heartbeat,
-            shutdown: &cloned_shutdown,
-            message_spans,
-            requests,
-        });
+            &watermark_version,
+            &cloned_managers,
+            &heartbeat,
+            &cloned_shutdown,
+        );
     });
 
     let runtime_state = Arc::new(Mutex::new(Some(RuntimeState {
         poll_handle,
         probe_server,
-        observer,
     })));
 
     Ok(ProsodyConsumer {
@@ -185,31 +160,30 @@ where
         assignment,
         runtime_state,
         heartbeats,
+        _codec: PhantomData,
     })
 }
 
-/// Builds the client, subscribes it, seeds the observer, and reads the cluster
-/// id.
+/// Builds the client and subscribes it.
 ///
-/// All four run inside one blocking task. Subscribing and fetching block, and
-/// dropping a `BaseConsumer` poll-loops until its queue closes, so the client
-/// lives and dies inside that task. The returned context type captures no
-/// borrow, which is what lets a failure arm surrender the client to a blocking
-/// drop.
+/// Both run inside one blocking task. Subscribing blocks, and dropping a
+/// `BaseConsumer` poll-loops until its queue closes, so the client lives and
+/// dies inside that task. The returned context type captures no borrow, which
+/// is what lets a failure arm surrender the client to a blocking drop.
 ///
 /// # Errors
 ///
-/// Returns [`ConsumerError`] when the context, the client, the subscription or
-/// the metadata fetch fails, or when the blocking task does not join.
-async fn start_client<T, P, SP, C>(
+/// Returns [`ConsumerError`] when the context, the client, or the subscription
+/// fails, or when the blocking task does not join.
+async fn start_client<T, P, SP, C, R>(
     consumer_config: &ConsumerConfiguration,
     handler_provider: T,
     providers: PartitionProviders<P, SP>,
+    reader: Reader<C, R>,
     watermark_version: Arc<WatermarkVersion>,
-    handles: ContextHandles<C::Payload>,
+    handles: ContextHandles,
     version: Arc<str>,
-    observer: KafkaObserver,
-) -> Result<BaseConsumer<impl ConsumerContext + use<T, P, SP, C>>, ConsumerError>
+) -> Result<Arc<BaseConsumer<impl ConsumerContext + use<T, P, SP, C, R>>>, ConsumerError>
 where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = C::Payload>,
@@ -219,23 +193,23 @@ where
         EventSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
     C::Payload: EventType + Clone + EventIdentity,
+    R: ResultRequestReader + 'static,
 {
     let consumer_config = consumer_config.clone();
     spawn_blocking(move || {
-        let context = new_context(
+        let consumer = new_context(
             &consumer_config,
             handler_provider,
             providers,
+            reader,
             watermark_version,
             handles,
             version,
-        )?;
-        let consumer: BaseConsumer<_> =
-            client_config(&consumer_config)?.create_with_context(context)?;
+        )?
+        .into_client(&client_config(&consumer_config)?)?;
         let topics = &consumer_config.subscribed_topics;
         let topics: Vec<&str> = topics.iter().map(String::as_str).collect();
         consumer.subscribe(&topics)?;
-        observer.install_startup_metadata(&consumer)?;
         Ok::<_, ConsumerError>(consumer)
     })
     .await
@@ -255,8 +229,9 @@ async fn release_probe(probe_server: Option<ProbeServer>, error: ConsumerError) 
 }
 
 /// The primary consumer's librdkafka configuration: offsets are committed
-/// automatically but stored by prosody, and the client reports statistics on
-/// the configured interval.
+/// automatically but stored by prosody, the client reports statistics on the
+/// configured interval, and each partition fetches ahead at most
+/// [`partition_prefetch`](ConsumerConfiguration::partition_prefetch).
 ///
 /// # Errors
 ///
@@ -272,6 +247,7 @@ fn client_config(consumer_config: &ConsumerConfiguration) -> Result<ClientConfig
         consumer_config.bootstrap_servers.join(",")
     };
 
+    let prefetch = consumer_config.partition_prefetch.get();
     let mut config = ClientConfig::new();
     config
         .set("bootstrap.servers", bootstrap)
@@ -289,6 +265,19 @@ fn client_config(consumer_config: &ConsumerConfiguration) -> Result<ClientConfig
         .set("enable.auto.offset.store", "false")
         .set("auto.offset.reset", "earliest")
         .set("partition.assignment.strategy", "cooperative-sticky")
+        .set(
+            "queued.max.messages.kbytes",
+            prefetch.div_ceil(1 << 10).to_string(),
+        )
+        .set("fetch.message.max.bytes", prefetch.to_string())
+        .set(
+            "fetch.max.bytes",
+            consumer_config.fetch_max_bytes.get().to_string(),
+        )
+        .set(
+            "fetch.queue.backoff.ms",
+            FETCH_QUEUE_BACKOFF.as_millis().to_string(),
+        )
         .set_log_level(RDKafkaLogLevel::Error);
     Ok(config)
 }

@@ -1,11 +1,13 @@
 [env]
 CMAKE_POLICY_VERSION_MINIMUM = { value = "3.5", force = true }
-# Debug builds inflate async poll frames heavily; the composed middleware
-# chain's poll descent (handler -> context chain -> TimerManager -> scylla)
-# overflows tokio's default 2 MiB worker stacks in integration tests.
-# This `[env]` applies to every cargo-launched process (`run`, `test`, ...),
-# not just test binaries; binaries invoked directly (e.g. a release deploy)
-# are unaffected and sit far below the limit regardless.
+# Debug builds poll deep async frames. The path from the handler through the
+# timer store to scylla overflows the Tokio default worker stack of 2 MiB.
+# This `[env]` applies to every process that cargo starts (`run`, `test`, ...).
+# A debug binary that cargo does not start does not get this variable. Examples
+# are a host process that embeds prosody and the test runner of a language
+# binding. Such a process must set the worker stack size on its own Tokio
+# runtime. See "Worker stack size (debug builds)" in README.md. Release builds
+# stay far below the limit.
 RUST_MIN_STACK = "8388608"
 
 [target.x86_64-unknown-linux-gnu]

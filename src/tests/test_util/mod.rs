@@ -1,3 +1,4 @@
+pub(crate) mod kafka;
 mod metrics;
 
 pub(crate) use self::metrics::{GlobalMetrics, assert_distinct_labels, label, labels};

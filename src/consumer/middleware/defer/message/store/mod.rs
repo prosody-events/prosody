@@ -30,13 +30,12 @@ pub use provider::MessageDeferStoreProvider;
 /// Outcome of completing a successful retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRetryCompletionResult {
-    /// Queue has more messages; retry count reset to 0.
-    MoreMessages {
-        /// Next offset to retry (oldest in queue).
-        next_offset: Offset,
-    },
+    /// The queue keeps more messages and the retry count is 0. Read the new
+    /// head with
+    /// [`get_next_deferred_message`](MessageDeferStore::get_next_deferred_message).
+    MoreMessages,
 
-    /// Queue empty; key deleted from storage.
+    /// The queue is empty and the store deleted the key.
     Completed,
 }
 
@@ -92,9 +91,9 @@ pub trait MessageDeferStore: Clone + Send + Sync + 'static {
         async move {
             self.remove_deferred_message(key, offset).await?;
 
-            if let Some((next_offset, _)) = self.get_next_deferred_message(key).await? {
+            if self.get_next_deferred_message(key).await?.is_some() {
                 self.set_retry_count(key, 0).await?;
-                Ok(MessageRetryCompletionResult::MoreMessages { next_offset })
+                Ok(MessageRetryCompletionResult::MoreMessages)
             } else {
                 self.delete_key(key).await?;
                 Ok(MessageRetryCompletionResult::Completed)

@@ -1,10 +1,11 @@
 use super::*;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::tests::test_support::{
-    MockEventContext, ScriptedHandler, ScriptedHook, TestError, create_test_message,
-    create_test_trigger,
+    MockEventContext, RecordingTimer, ScriptedHandler, ScriptedHook, TestError,
+    create_test_message, create_test_trigger,
 };
 use crate::error::ErrorCategory;
+use crate::test_util::{CapturedEvents, capture_events};
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use color_eyre::eyre::{Result, bail};
@@ -14,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::runtime::Builder;
 use tokio::time::{sleep as tokio_sleep, timeout};
-use tracing::Span;
+use tracing::{Level, Span};
 
 use dispatch_signals::create_offset_tracker;
 
@@ -23,6 +24,9 @@ fn create_retry_handler<T>(handler: T, max_retries: u32) -> RetryHandler<T> {
         base_delay_millis: 1, // Very short for tests
         max_delay_millis: 10,
         max_retries,
+        topic: "test-topic".into(),
+        partition: 0,
+        aborts: Arc::default(),
         handler,
     }
 }
@@ -151,8 +155,7 @@ async fn shutdown_during_retry_sleep_returns_error() -> Result<()> {
     let retry_handler = RetryHandler {
         base_delay_millis: 1000, // 1 second base delay
         max_delay_millis: 10000,
-        max_retries: 10,
-        handler: handler.clone(),
+        ..create_retry_handler(handler.clone(), 10)
     };
     let context = MockEventContext::new();
     let message = create_test_message()?;
@@ -177,6 +180,64 @@ async fn shutdown_during_retry_sleep_returns_error() -> Result<()> {
     let result = join_result?;
 
     assert!(result.is_err(), "Should return error on shutdown");
+    Ok(())
+}
+
+// === Terminal Abort Alerts ===
+
+const TERMINAL_ABORT: &str = "A retry cannot fix this error, so Prosody commits no later offsets";
+const INNER_RETURN: &str = "returns the error to the outer middleware";
+
+/// Runs two messages that fail `Terminal` through `retry_handler` and returns
+/// the events at `level` or more severe.
+async fn terminal_abort_events<H>(
+    retry_handler: &H,
+    shutdown: bool,
+    level: Level,
+) -> Result<CapturedEvents>
+where
+    H: EventHandler<Payload = serde_json::Value>,
+{
+    let (events, _guard) = capture_events(level);
+    let tracker = create_offset_tracker();
+    for offset in 0..2 {
+        let context = MockEventContext::new();
+        if shutdown {
+            context.request_shutdown();
+        }
+        let uncommitted_offset = tracker.take(offset).await?;
+        let message = create_test_message()?.into_uncommitted(uncommitted_offset);
+        EventHandler::on_message(retry_handler, context, message, DemandType::Normal).await;
+    }
+    assert_eq!(tracker.shutdown().await, None, "offsets should be aborted");
+    Ok(events)
+}
+
+/// A `Terminal` abort outside shutdown holds the partition, so the partition's
+/// first abort alerts and a later abort logs at warn. A timer abort does not
+/// hold the partition, so it does not use up that alert. An inner layer leaves
+/// the outcome to the outer layer, so it logs below warn. A shutdown abort is
+/// expected and does not log.
+#[tokio::test]
+async fn terminal_abort_alerts_once_per_partition() -> Result<()> {
+    let handler = ScriptedHandler::always_failing(ErrorCategory::Terminal);
+    for (level, aborts) in [(Level::ERROR, 1), (Level::WARN, 2)] {
+        let outer = create_retry_handler(handler.clone(), 10);
+        let (timer, ..) = RecordingTimer::new(create_test_trigger());
+        EventHandler::on_timer(&outer, MockEventContext::new(), timer, DemandType::Normal).await;
+        let events = terminal_abort_events(&outer, false, level).await?;
+        assert_eq!(events.count(TERMINAL_ABORT), aborts, "{level}");
+
+        let nested = create_retry_handler(create_retry_handler(handler.clone(), 10), 10);
+        let events = terminal_abort_events(&nested, false, level).await?;
+        assert_eq!(events.count(TERMINAL_ABORT), aborts, "{level}");
+        assert_eq!(events.count(INNER_RETURN), 0, "{level}");
+
+        let shutdown = create_retry_handler(handler.clone(), 10);
+        let events = terminal_abort_events(&shutdown, true, level).await?;
+        assert_eq!(events.count(TERMINAL_ABORT), 0, "{level}");
+    }
+    assert_eq!(handler.call_count(), 14);
     Ok(())
 }
 
@@ -209,8 +270,7 @@ fn sleep_time_has_exponential_growth_with_jitter() {
     let retry_handler = RetryHandler {
         base_delay_millis: 100,
         max_delay_millis: 10000,
-        max_retries: 10,
-        handler,
+        ..create_retry_handler(handler, 10)
     };
 
     // Collect multiple samples to verify jitter randomness
@@ -245,8 +305,7 @@ fn sleep_time_survives_zero_backoff() {
     let retry_handler = RetryHandler {
         base_delay_millis: 0,
         max_delay_millis: 0,
-        max_retries: 10,
-        handler: ScriptedHandler::success(),
+        ..create_retry_handler(ScriptedHandler::success(), 10)
     };
 
     assert_eq!(retry_handler.sleep_time(1), Duration::ZERO);
@@ -258,8 +317,7 @@ fn sleep_time_capped_at_max_delay() {
     let retry_handler = RetryHandler {
         base_delay_millis: 100,
         max_delay_millis: 500,
-        max_retries: 10,
-        handler,
+        ..create_retry_handler(handler, 10)
     };
 
     // Attempt 10: exp_backoff = 2^10 * 100 = 102400ms, but capped at 500ms

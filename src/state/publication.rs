@@ -58,13 +58,13 @@ pub trait PublicationStore: Clone + Send + Sync + 'static {
     ///
     /// # Errors
     /// Backend failure (e.g. Cassandra unavailable).
-    fn upsert(
-        &self,
-        subsystem: &SubsystemName,
+    fn upsert<'a>(
+        &'a self,
+        subsystem: &'a SubsystemName,
         state_type: StateType,
-        name: &StateName,
-        row: &StatePublication,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+        name: &'a StateName,
+        row: &'a StatePublication,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, Self>;
 
     /// Removes every source of `(subsystem, state_type, name)` published by
     /// `group_id`, whatever topics it published under. `group_id` is the first
@@ -74,13 +74,13 @@ pub trait PublicationStore: Clone + Send + Sync + 'static {
     ///
     /// # Errors
     /// Backend failure.
-    fn remove_group(
-        &self,
-        subsystem: &SubsystemName,
+    fn remove_group<'a>(
+        &'a self,
+        subsystem: &'a SubsystemName,
         state_type: StateType,
-        name: &StateName,
-        group_id: &str,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+        name: &'a StateName,
+        group_id: &'a str,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + use<'a, Self>;
 
     /// Published sources of `(subsystem, state_type, name)` — one bounded
     /// partition read. The bound includes one overflow row so callers can
@@ -89,10 +89,10 @@ pub trait PublicationStore: Clone + Send + Sync + 'static {
     /// # Errors
     /// Backend failure, or (Cassandra backend) a decoded partition count
     /// outside `[1, i32::MAX]`.
-    fn read_publications(
-        &self,
-        subsystem: &SubsystemName,
+    fn read_publications<'a>(
+        &'a self,
+        subsystem: &'a SubsystemName,
         state_type: StateType,
-        name: &StateName,
-    ) -> impl Future<Output = Result<PublicationRows, Self::Error>> + Send;
+        name: &'a StateName,
+    ) -> impl Future<Output = Result<PublicationRows, Self::Error>> + Send + use<'a, Self>;
 }

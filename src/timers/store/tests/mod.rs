@@ -222,7 +222,7 @@ impl Arbitrary for TriggerSequence {
 /// ```rust,ignore
 /// trigger_store_tests!(
 ///     LowLevelStore, low_level_constructor,
-///     HighLevelStore, high_level_constructor,
+///     HighLevelStore, high_level_constructor
 /// );
 /// ```
 ///

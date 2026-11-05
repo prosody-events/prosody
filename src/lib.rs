@@ -41,6 +41,7 @@ use std::env;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, LazyLock};
 use std::thread::{self, park};
+use std::time::Duration;
 
 pub mod admin;
 pub mod cassandra;
@@ -50,6 +51,7 @@ pub mod consumer;
 pub mod error;
 pub mod heartbeat;
 pub mod high_level;
+mod kafka_log;
 pub mod loader;
 pub mod otel;
 pub mod peer;
@@ -237,6 +239,9 @@ impl TopicPartitionKey {
 
 /// Source system header used to prevent processing loops.
 const SOURCE_SYSTEM_HEADER: &str = "source-system";
+
+/// How long a construction-time fetch of the cluster's metadata may wait.
+const METADATA_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Defines event identity behavior for messages that contain unique
 /// identifiers.

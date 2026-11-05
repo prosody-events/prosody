@@ -1,9 +1,8 @@
 use std::future::Future;
 
 use super::{
-    ConsumerMessage, DemandType, EventContext, EventHandler, Keyed, Resolution, RetryHandler,
-    SettlementHandler, UncommittedMessage, UncommittedTimer, abandon, debug, log_message_failure,
-    log_timer_failure, settle,
+    ConsumerMessage, DemandType, EventContext, EventHandler, Keyed, Layer, Resolution,
+    RetryHandler, SettlementHandler, UncommittedMessage, UncommittedTimer, abandon, debug, settle,
 };
 use crate::consumer::Uncommitted;
 
@@ -19,28 +18,16 @@ async fn process_record<T, C, Q, F, Fut>(
     Fut: Future<Output = Result<T::Output, T::Error>>,
     T: SettlementHandler,
 {
-    let topic = message.topic();
-    let partition = message.partition();
-    let key = message.key().to_owned();
     let offset = message.offset();
     let (message, uncommitted) = message.into_inner();
     let (resolution, final_ctx) = handler
         .run(
             context,
             demand_type,
-            None,
+            Layer::Outermost(&handler.aborts.message),
             |ctx, dt| dispatch(ctx, message.clone(), dt),
             |ctx, error| handler.handler.after_abort(ctx, Err(error)),
-            |reason| {
-                log_message_failure(
-                    topic.as_ref(),
-                    partition,
-                    key.as_ref(),
-                    offset,
-                    &reason,
-                    "; discarding message",
-                );
-            },
+            |failure| handler.log_message(message.key(), offset, failure),
         )
         .await;
     finish(handler, final_ctx, uncommitted, resolution).await;
@@ -115,10 +102,10 @@ where
             .run(
                 context,
                 demand_type,
-                None,
+                Layer::Outermost(&self.aborts.timer),
                 |ctx, dt| self.handler.on_timer(ctx, trigger.clone(), dt),
                 |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |reason| log_timer_failure(&reason, "; discarding timer"),
+                |failure| self.log_timer(&trigger, failure),
             )
             .await;
 

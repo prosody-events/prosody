@@ -9,10 +9,11 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
 use crate::state::cell::{Committed, Presence, Projection, ProvisionalCell, ProvisionalWrite};
-use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
+use crate::state::cell_key::{CellKey, CellRef, Coordinate, Scan, Section};
 use crate::state::collection::{MutationJournal, StateSession, WritableStateSession, sealed};
 use crate::state::descriptor::{CellResolver, StructuralIdentity};
-use crate::state::marker::{AttemptId, EventEvidence, EventMarker, SectionClear};
+use crate::state::erased::StateCursor;
+use crate::state::marker::{EventEvidence, EventMarker, ProvisionalStage, SectionClear, StageId};
 use crate::state::memory::MemoryPublicationStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::publication::{PublicationRows, PublicationStore, StatePublication};
@@ -20,8 +21,8 @@ use crate::state::registry::CollectionDef;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{Finalized, MessageMarker, OpPermit, SessionGate};
 use crate::state::store::{
-    CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable,
-    provisional_point_loop,
+    Answers, CacheBatch, CellBackend, CellBuffer, CellRead, CellStore, CoordinateBatch, Durable,
+    ReadBatch, provisional_point_loop,
 };
 use crate::state::{
     CollectionId, CollectionRef, EventRef, StateKey, StateName, StateType, StoreOutcome,
@@ -164,24 +165,26 @@ impl<P, Q: Projection> sealed::Reads<UnavailableState<P>, Q> for UnavailableEngi
 where
     P: Clone + Send + Sync + 'static,
 {
-    fn read_point(
-        _session: &UnavailableState<P>,
-        _inner: &mut Self::ReadInner<'_>,
+    fn read_point<'a, 'c>(
+        _session: &'a UnavailableState<P>,
+        _inner: &'a mut Self::ReadInner<'c>,
         _state_type: StateType,
-        _name: &StateName,
-        _cell: &CellKey,
-    ) -> impl Future<Output = Result<Option<Q::Payload>, StateAccessError>> {
+        _name: &'a StateName,
+        _cell: CellRef<'a>,
+    ) -> impl Future<Output = Result<Option<Q::Payload>, StateAccessError>> + use<'a, 'c, P, Q>
+    {
         ready(Err(StateAccessError::Unavailable))
     }
 
-    fn read_batch(
-        _session: &UnavailableState<P>,
-        _inner: &mut Self::ReadInner<'_>,
+    fn read_batch<'buf, 'a, 'c>(
+        _session: &'a UnavailableState<P>,
+        _inner: &'a mut Self::ReadInner<'c>,
         _state_type: StateType,
-        _name: &StateName,
+        _name: &'a StateName,
         _section: Section,
-        _batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<Option<Q::Payload>>, StateAccessError>> {
+        _batch: &'a ReadBatch<'buf>,
+    ) -> impl Future<Output = Result<Answers<Option<Q::Payload>>, StateAccessError>>
+    + use<'buf, 'a, 'c, P, Q> {
         ready(Err(StateAccessError::Unavailable))
     }
 
@@ -191,7 +194,8 @@ where
         _state_type: StateType,
         _name: &'a StateName,
         _scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Q::Payload), StateAccessError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, Q::Payload), StateAccessError>> + Send + use<'a, P, Q>
+    {
         stream::once(async { Err(StateAccessError::Unavailable) })
     }
 }
@@ -204,7 +208,7 @@ where
 
     fn begin_write(
         _session: &UnavailableState<P>,
-    ) -> impl Future<Output = Result<NoWrite, StateAccessError>> {
+    ) -> impl Future<Output = Result<NoWrite, StateAccessError>> + use<'_, P> {
         ready(Err(StateAccessError::Unavailable))
     }
 
@@ -224,19 +228,19 @@ where
     ) {
     }
 
-    fn commit(
-        _session: &UnavailableState<P>,
+    fn commit<'a>(
+        _session: &'a UnavailableState<P>,
         _state_type: StateType,
-        _name: &StateName,
-    ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> {
+        _name: &'a StateName,
+    ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + use<'a, P> {
         ready(Err(StateAccessError::Unavailable))
     }
 
-    fn rollback(
-        _session: &UnavailableState<P>,
+    fn rollback<'a>(
+        _session: &'a UnavailableState<P>,
         _state_type: StateType,
-        _name: &StateName,
-    ) -> impl Future<Output = StoreOutcome> {
+        _name: &'a StateName,
+    ) -> impl Future<Output = StoreOutcome> + use<'a, P> {
         // Stateless: nothing is ever buffered, so the discard is a NoOp.
         ready(StoreOutcome::NoOp)
     }
@@ -282,7 +286,8 @@ where
 
     fn finalize(
         &self,
-    ) -> impl Future<Output = Result<Finalized<Self::Cell, ()>, StateAccessError>> {
+    ) -> impl Future<Output = Result<Finalized<Self::Cell, ()>, StateAccessError>> + use<'_, P>
+    {
         ready(Ok(Finalized::Clean))
     }
 
@@ -290,7 +295,7 @@ where
         &self,
         _marker: MessageMarker,
         _proof: MarkerWrite,
-    ) -> impl Future<Output = Result<(), StateAccessError>> {
+    ) -> impl Future<Output = Result<(), StateAccessError>> + use<'_, P> {
         ready(Ok(()))
     }
 
@@ -383,14 +388,23 @@ pub(crate) use admission::{
 mod inspection;
 pub(crate) use inspection::StageInspection;
 
+/// Pairs test writes with a marker that must list every write.
+pub(crate) fn listed<'a>(
+    marker: &'a EventMarker,
+    writes: &'a [(CellKey, ProvisionalWrite)],
+) -> Result<ProvisionalStage<'a>> {
+    ProvisionalStage::listed(marker, writes)
+        .ok_or_else(|| eyre!("the marker must list every staged write"))
+}
+
 /// The marker's evidence with no staged cells and no clears.
 pub(crate) fn evidence_only(marker: &EventMarker) -> EventMarker {
     EventMarker::frozen(
         marker.event(),
         &[],
-        &[],
+        Vec::new(),
         &EventEvidence {
-            attempt: marker.attempt(),
+            stage: marker.stage(),
             touched: marker.touched().into(),
             evidence_ttl: marker.evidence_ttl(),
             dedup: marker.dedup(),
@@ -404,9 +418,18 @@ pub(crate) fn evidence(
     dedup: Option<Uuid>,
 ) -> EventEvidence {
     EventEvidence {
-        attempt: AttemptId::new(),
+        stage: StageId::new(),
         touched,
         evidence_ttl: CompactDuration::new(3600),
         dedup,
     }
+}
+
+/// Collects an erased cursor and propagates each read error.
+pub(crate) async fn drain_cursor<T>(cursor: &StateCursor<T>) -> Result<Vec<T>> {
+    let mut items = Vec::new();
+    while let Some(item) = cursor.next().await? {
+        items.push(item);
+    }
+    Ok(items)
 }

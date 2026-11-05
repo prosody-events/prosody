@@ -1,7 +1,7 @@
 # Install Rust and necessary tools
 bootstrap:
 	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-	brew install buf protobuf
+	brew install buf jq protobuf
 	cargo install cargo-udeps cargo-llvm-cov taplo-cli bacon cargo-nextest
 
 # Start Kafka and related services using Docker Compose

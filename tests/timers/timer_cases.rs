@@ -49,12 +49,12 @@ async fn build_inline_replacement_client(
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
     cassandra_builder.nodes(vec!["localhost:9042".to_owned()]);
 
-    let client = CassandraHighLevelClient::new(
+    let client = Box::pin(CassandraHighLevelClient::new(
         cassandra_builder.build()?,
         Mode::Pipeline,
         &mut producer_builder,
         &consumer_builders,
-    )
+    ))
     .await?;
     Ok(client)
 }

@@ -63,34 +63,40 @@ impl Arbitrary for MapTrace {
 async fn assert_map_scans<P: ParityPayload>(
     handle: &BoxMapState<P>,
     visible: &BTreeMap<String, P>,
+    prefix: &str,
 ) -> Result<bool> {
-    let scanned = drain_cursor(&handle.scan(KeyScanConfig::default())).await?;
-    if scanned.len() != visible.len()
-        || scanned
-            .iter()
-            .zip(visible)
-            .any(|((key, value), (expected_key, expected_value))| {
+    let config = ErasedKeyQuery::default().prefix(prefix);
+    let expected: Vec<_> = visible
+        .iter()
+        .filter(|(key, _)| key.starts_with(prefix))
+        .collect();
+    let scanned = drain_cursor(&handle.entries().with_query(config.clone()).stream()).await?;
+    if scanned.len() != expected.len()
+        || scanned.iter().zip(expected.iter().copied()).any(
+            |((key, value), (expected_key, expected_value))| {
                 key != expected_key || !P::same(value, expected_value)
-            })
+            },
+        )
     {
         return Ok(false);
     }
-    if drain_cursor(&handle.keys(KeyScanConfig::default())).await?
-        != visible.keys().cloned().collect::<Vec<_>>()
+    if drain_cursor(&handle.keys().with_query(config).stream()).await?
+        != expected
+            .iter()
+            .map(|(key, _)| (*key).clone())
+            .collect::<Vec<_>>()
     {
         return Ok(false);
     }
-    let config = KeyScanConfig {
-        dir: Direction::Forward,
-        limit: Some(NonZeroUsize::MIN),
-        start: Bound::Included(KEYS[1].to_owned()),
-        end: Bound::Included(KEYS[2].to_owned()),
-    };
+    let config = ErasedKeyQuery::default()
+        .from(KEYS[1])
+        .to(KEYS[2])
+        .limit(NonZeroUsize::MIN);
     let expected = visible
         .range(KEYS[1].to_owned()..=KEYS[2].to_owned())
         .take(1)
         .collect::<Vec<_>>();
-    let constrained = drain_cursor(&handle.scan(config.clone())).await?;
+    let constrained = drain_cursor(&handle.entries().with_query(config.clone()).stream()).await?;
     if constrained.len() != expected.len()
         || constrained
             .iter()
@@ -101,23 +107,26 @@ async fn assert_map_scans<P: ParityPayload>(
     {
         return Ok(false);
     }
-    Ok(drain_cursor(&handle.keys(config)).await?
-        == visible
-            .range(KEYS[1].to_owned()..=KEYS[2].to_owned())
-            .take(1)
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>())
+    Ok(
+        drain_cursor(&handle.keys().with_query(config).stream()).await?
+            == visible
+                .range(KEYS[1].to_owned()..=KEYS[2].to_owned())
+                .take(1)
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>(),
+    )
 }
 
 /// Drives a map trace through the erased handle and a `(floor, visible)`
 /// `BTreeMap` model, asserting after every op that each pooled key reads equal
-/// (`get` and `contains_key` both) and a full forward scan yields exactly
-/// `visible`'s key-ordered entries. `visible` is the read-your-writes map;
+/// (`get` and `contains_key` both) and a forward scan under a pooled prefix
+/// yields exactly `visible`'s matching key-ordered entries. `visible` is the
+/// read-your-writes map;
 /// `floor` is the last committed snapshot. `commit` promotes `visible` to
 /// `floor`; `rollback` reverts `visible` to `floor`. Both are issued through
 /// the **erased** handle only — the typed handle shares the overlay, so
 /// calling its commit would mask a no-op erased commit.
-fn run_map_parity<P>(ops: &[MapOp]) -> Result<bool>
+fn run_map_parity<P>(ops: &[MapOp], prefix: u8) -> Result<bool>
 where
     P: ParityPayload + Send + Sync + 'static,
 {
@@ -126,6 +135,7 @@ where
         let handle = ctx
             .map_state(MAP_NAME)
             .map_err(|e| eyre!("vend map: {e}"))?;
+        let prefix = pooled_prefix(prefix);
         let mut floor: BTreeMap<String, P> = BTreeMap::new();
         let mut visible: BTreeMap<String, P> = BTreeMap::new();
         let mut sampler = Gen::new(8);
@@ -199,7 +209,7 @@ where
             {
                 return Ok(false);
             }
-            if !assert_map_scans(&handle, &visible).await? {
+            if !assert_map_scans(&handle, &visible, prefix).await? {
                 return Ok(false);
             }
         }
@@ -210,25 +220,25 @@ where
 /// Erased map parity for `serde_json::Value`.
 #[test]
 fn prop_erased_map_parity_json() {
-    fn prop(MapTrace(ops): MapTrace) -> TestResult {
-        match run_map_parity::<Value>(&ops) {
+    fn prop(MapTrace(ops): MapTrace, prefix: u8) -> TestResult {
+        match run_map_parity::<Value>(&ops, prefix) {
             Ok(true) => TestResult::passed(),
             Ok(false) => TestResult::error(format!("map parity diverged: {ops:?}")),
             Err(error) => TestResult::error(format!("map trace errored: {error:#}")),
         }
     }
-    QuickCheck::new().quickcheck(prop as fn(MapTrace) -> TestResult);
+    QuickCheck::new().quickcheck(prop as fn(MapTrace, u8) -> TestResult);
 }
 
 /// Erased map parity for `BinaryPayload`.
 #[test]
 fn prop_erased_map_parity_binary() {
-    fn prop(MapTrace(ops): MapTrace) -> TestResult {
-        match run_map_parity::<BinaryPayload>(&ops) {
+    fn prop(MapTrace(ops): MapTrace, prefix: u8) -> TestResult {
+        match run_map_parity::<BinaryPayload>(&ops, prefix) {
             Ok(true) => TestResult::passed(),
             Ok(false) => TestResult::error(format!("binary map parity diverged: {ops:?}")),
             Err(error) => TestResult::error(format!("binary map trace errored: {error:#}")),
         }
     }
-    QuickCheck::new().quickcheck(prop as fn(MapTrace) -> TestResult);
+    QuickCheck::new().quickcheck(prop as fn(MapTrace, u8) -> TestResult);
 }

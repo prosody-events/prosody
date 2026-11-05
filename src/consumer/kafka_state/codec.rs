@@ -70,10 +70,10 @@ impl Codec for MessageRefCodec {
 #[derive(Debug, Error)]
 pub enum MessageRefCodecError {
     /// The cell bytes did not decode as a [`MessageRef`].
-    #[error("kafka message reference cell is corrupt")]
-    Decode(#[source] MsgPackDecodeError),
+    #[error("kafka message reference cell is corrupt: {0:#}")]
+    Decode(MsgPackDecodeError),
 
     /// The reference failed to encode.
-    #[error("kafka message reference failed to encode")]
-    Encode(#[source] MsgPackEncodeError),
+    #[error("kafka message reference failed to encode: {0:#}")]
+    Encode(MsgPackEncodeError),
 }

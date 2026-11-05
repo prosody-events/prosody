@@ -7,7 +7,7 @@ use super::keyset::is_oversized;
 use super::{Keyset, KeysetFrameError, MapKeysetCodec, MapKeysetKey, MapStateError, Query};
 use crate::state::StateName;
 use crate::state::cell::Presence;
-use crate::state::cell_key::{Coordinate, Direction, ScanEdge};
+use crate::state::cell_key::{Coordinate, Direction};
 use crate::state::collection::{
     CellFamily, Collection, CollectionRead, CollectionWrite, JOURNAL_INLINE, Plan, ReadOperation,
     StateSession,
@@ -18,6 +18,7 @@ use crate::state::descriptor::{
 use futures::StreamExt;
 use std::error::Error;
 use std::num::NonZeroUsize;
+use std::ops::Bound;
 use tracing::{Span, warn};
 
 /// Insert and remove each stage one member mutation and one keyset write.
@@ -57,11 +58,11 @@ where
 {
     let plan = cells
         .read(async |op| {
-            op.range(
+            op.range::<_, &[u8]>(
                 L::MEMBERS,
-                ScanEdge::Unbounded,
+                Bound::Unbounded,
                 Direction::Forward,
-                ScanEdge::Unbounded,
+                Bound::Unbounded,
             )
             .with_limit(Some(NonZeroUsize::MIN))
         })
@@ -124,23 +125,17 @@ enum PriorKeyset {
 }
 
 /// Selects bounded point reads or a range scan from the shared keyset.
-pub(crate) async fn plan<S, L>(
+pub(crate) async fn plan<'q, S, L>(
     op: &mut ReadOperation<'_, S, L>,
-    query: &Query,
-) -> Result<Plan<S, L::Cell>, MapStateError<CellCodecError<L::Cell>>>
+    query: &Query<'q>,
+) -> Result<Plan<S, L::Cell, &'q [u8]>, MapStateError<CellCodecError<L::Cell>>>
 where
     S: StateSession,
     L: KeysetLayout,
 {
     let keyset = read_keyset_state(op).await?;
-    let range = || {
-        op.range(
-            L::MEMBERS,
-            query.start.clone(),
-            query.dir,
-            query.end.clone(),
-        )
-    };
+    let (start, end) = query.edges();
+    let range = || op.range(L::MEMBERS, start, query.dir(), end);
     let coordinates = match keyset {
         PriorKeyset::Absent => {
             return Ok(op.coordinates(L::MEMBERS, Vec::new()));

@@ -1,37 +1,18 @@
 use super::{
-    BatchUnit, CassandraCellStoreError, CassandraStore, CellAddr, CellBatchRow, CellKey,
-    CellStoreError, CollectionRef, EventMarker, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS,
-    MarkerWriteRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalWrite, ResolveCellError, RowShape,
-    StageRow, bind_ttl, blob_weight, encode_cell_blobs, smallvec,
+    BatchUnit, CassandraCellStoreError, CassandraStore, CellAddr, CellBatchRow, CellStoreError,
+    CollectionRef, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerWriteRow, PER_STATEMENT_OVERHEAD,
+    Pk, ResolveCellError, RowShape, StageRow, bind_ttl, blob_weight, encode_cell_blobs, smallvec,
 };
 use crate::state::SHARD_FANOUT_CONCURRENCY;
-use crate::state::marker::MarkerRow;
+use crate::state::marker::{MarkerRow, ProvisionalStage};
 use futures::{StreamExt, TryStreamExt, stream};
-use smallvec::SmallVec;
-use std::ops::Range;
 
 pub(super) async fn write_provisional(
     store: &CassandraStore,
     collection: &CollectionRef,
-    writes: &[(CellKey, ProvisionalWrite)],
-    marker: Option<&EventMarker>,
+    stage: ProvisionalStage<'_>,
 ) -> Result<(), CellStoreError> {
-    // `None` ⇒ the explicit empty-stage no-op: no marker, no boundary
-    // check (nothing to strand). A clears-only stage passes a marker with
-    // empty `staged()` and runs the boundary like any stage.
-    debug_assert!(
-        marker.is_some() || writes.is_empty(),
-        "a markerless stage must write nothing"
-    );
-    let Some(marker) = marker else {
-        return Ok(());
-    };
-    debug_assert!(
-        writes
-            .iter()
-            .all(|(cell, _)| marker.staged().binary_search(cell).is_ok()),
-        "every staged write must be listed by the event marker"
-    );
+    let (marker, writes) = (stage.marker(), stage.writes());
     let pk = Pk::of(collection.id());
     let marker_blob = super::store::stage_marker(marker)?;
 
@@ -81,9 +62,8 @@ pub(super) async fn write_provisional(
         )
     }));
 
-    let chunks: SmallVec<[Range<usize>; 1]> =
-        super::batch::stage_batches(&marker, &units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS)
-            .collect();
+    let chunks =
+        super::batch::stage_batches(&marker, &units, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS);
     stream::iter(chunks)
         .map(|range| {
             let rows = super::batch::stage_chunk(&marker, &units, range);

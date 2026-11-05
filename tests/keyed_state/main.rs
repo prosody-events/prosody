@@ -10,7 +10,8 @@
 //! The two tests differ only in registration. One configures no subsystem, so
 //! every collection is private and the publication machinery is off entirely.
 //! The other publishes under a subsystem and additionally checks what that made
-//! discoverable; see [`publication`].
+//! discoverable; see [`publication`]. The [`routing`] test checks publication
+//! when two group members split the subscribed topics.
 
 #![recursion_limit = "512"]
 
@@ -44,6 +45,7 @@ mod cart;
 #[path = "../common/mod.rs"]
 mod common;
 mod publication;
+mod routing;
 
 /// The single message key both tests produce under, so every event serializes
 /// per-key and the timer fires only after both messages settle.

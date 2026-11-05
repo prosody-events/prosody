@@ -481,40 +481,39 @@ where
     Ok(())
 }
 
-/// Verifies result of `complete_retry_success` matches model expectations.
-fn verify_completion_result(
+/// Verifies `complete_retry_success` against the model. The result reports
+/// whether the queue keeps work, and the store reports the successor itself.
+async fn verify_completion_result<S>(
+    store: &S,
     expected_next: Option<(Offset, u32)>,
     result: MessageRetryCompletionResult,
     key: &Key,
     op_idx: usize,
-) -> color_eyre::Result<()> {
-    match (expected_next, result) {
-        (
-            Some((expected_offset, _)),
-            MessageRetryCompletionResult::MoreMessages { next_offset },
-        ) => {
-            if expected_offset != next_offset {
-                return Err(color_eyre::eyre::eyre!(
-                    "Op #{op_idx} CompleteRetrySuccess offset mismatch for key={key}: expected \
-                     next_offset={expected_offset}, got {next_offset}"
-                ));
-            }
-        }
-        (None, MessageRetryCompletionResult::Completed) => {
-            // Both agree no more messages - correct
-        }
-        (Some((expected_offset, _)), MessageRetryCompletionResult::Completed) => {
-            return Err(color_eyre::eyre::eyre!(
-                "Op #{op_idx} CompleteRetrySuccess mismatch for key={key}: expected MoreMessages \
-                 with offset={expected_offset}, got Completed"
-            ));
-        }
-        (None, MessageRetryCompletionResult::MoreMessages { next_offset }) => {
-            return Err(color_eyre::eyre::eyre!(
-                "Op #{op_idx} CompleteRetrySuccess mismatch for key={key}: expected Completed, \
-                 got MoreMessages with offset={next_offset}"
-            ));
-        }
+) -> color_eyre::Result<()>
+where
+    S: MessageDeferStore,
+    S::Error: Error + Send + Sync + 'static,
+{
+    let expected = if expected_next.is_some() {
+        MessageRetryCompletionResult::MoreMessages
+    } else {
+        MessageRetryCompletionResult::Completed
+    };
+    if expected != result {
+        return Err(color_eyre::eyre::eyre!(
+            "Op #{op_idx} CompleteRetrySuccess mismatch for key={key}: expected {expected:?}, got \
+             {result:?}"
+        ));
+    }
+
+    let actual_next = store.get_next_deferred_message(key).await.map_err(|e| {
+        color_eyre::eyre::eyre!("Op #{op_idx} CompleteRetrySuccess successor read failed: {e:?}")
+    })?;
+    if expected_next.map(|(offset, _)| offset) != actual_next.map(|(offset, _)| offset) {
+        return Err(color_eyre::eyre::eyre!(
+            "Op #{op_idx} CompleteRetrySuccess successor mismatch for key={key}: expected \
+             {expected_next:?}, got {actual_next:?}"
+        ));
     }
     Ok(())
 }
@@ -597,7 +596,7 @@ where
         .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} CompleteRetrySuccess failed: {e:?}"))?;
 
     let expected_next = model.get_next(key);
-    verify_completion_result(expected_next, result, key, op_idx)
+    verify_completion_result(store, expected_next, result, key, op_idx).await
 }
 
 /// Applies `increment_retry_count` with return value verification.

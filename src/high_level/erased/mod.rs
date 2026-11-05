@@ -3,7 +3,6 @@
 use crate::cassandra::config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError};
 use crate::codec::ErasedStateCodec;
 use crate::consumer::MockConfigurationError;
-use crate::high_level::codecs::StateCodec;
 use crate::high_level::config::ModeConfiguration;
 use crate::high_level::state::ConsumerState;
 use crate::high_level::{
@@ -30,9 +29,8 @@ use implementation::ErasedClient;
 pub(super) use readers::{deque, map, set, value};
 
 pub use readers::{
-    ErasedDequeReader, ErasedDirection, ErasedMapReader, ErasedReadCache, ErasedReaderBuildError,
-    ErasedSetReader, ErasedValueReader, SharedDequeReader, SharedMapReader, SharedSetReader,
-    SharedValueReader,
+    ErasedDequeReader, ErasedMapReader, ErasedReadCache, ErasedReaderBuildError, ErasedSetReader,
+    ErasedValueReader, SharedDequeReader, SharedMapReader, SharedSetReader, SharedValueReader,
 };
 
 /// Consumer lifecycle state materialized across an FFI boundary.
@@ -110,7 +108,7 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedValueReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    ) -> Result<SharedValueReader<T::Payload>, ErasedReaderBuildError<MessageCodecError<T>>>
     where
         T::Payload: ErasedStateCodec;
     async fn map_state(
@@ -118,7 +116,7 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    ) -> Result<SharedMapReader<T::Payload>, ErasedReaderBuildError<MessageCodecError<T>>>
     where
         T::Payload: ErasedStateCodec;
     async fn set_state(
@@ -134,7 +132,7 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedDequeReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    ) -> Result<SharedDequeReader<T::Payload>, ErasedReaderBuildError<MessageCodecError<T>>>
     where
         T::Payload: ErasedStateCodec;
     async fn assigned_partition_count(&self) -> u32;
@@ -319,7 +317,7 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedValueReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    ) -> Result<SharedValueReader<T::Payload>, ErasedReaderBuildError<MessageCodecError<T>>>
     where
         T::Payload: ErasedStateCodec,
     {
@@ -338,7 +336,7 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    ) -> Result<SharedMapReader<T::Payload>, ErasedReaderBuildError<MessageCodecError<T>>>
     where
         T::Payload: ErasedStateCodec,
     {
@@ -376,7 +374,7 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedDequeReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    ) -> Result<SharedDequeReader<T::Payload>, ErasedReaderBuildError<MessageCodecError<T>>>
     where
         T::Payload: ErasedStateCodec,
     {

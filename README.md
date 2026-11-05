@@ -41,7 +41,7 @@ chain. Handler timeouts cancel handlers that exceed their deadline, preventing a
 - **Event Filtering**: Filters messages by event type prefix; unmatched events are committed without processing.
 - **Health Probes**: Built-in `/readyz` and `/livez` HTTP endpoints for Kubernetes liveness and readiness checks.
 - **Distributed Tracing**: OpenTelemetry integration for tracing message flow across services.
-- **Backpressure**: Pauses partitions when handlers fall behind.
+- **Backpressure**: Stops reading a partition when handlers fall behind, and bounds fetched and decoded records.
 - **Mocking**: In-memory Kafka broker for tests (`PROSODY_MOCK=true`).
 - **High-Level Client**: Combines producer and consumer with timer support.
 - **Requests**: Collects one typed response from each requested subsystem.
@@ -65,6 +65,22 @@ Add Prosody to your `Cargo.toml`:
 [dependencies]
 prosody = "0.1"
 ```
+
+### Worker stack size (debug builds)
+
+A debug build of Prosody polls deep async frames, from the handler through the timer store to the Cassandra driver. This depth can overflow the Tokio default worker stack of 2 MiB. `#[tokio::main]` uses that default. In a debug build, build the Tokio runtime yourself and set the worker stack size to at least 8 MiB:
+
+```rust,no_run
+# async fn run() {}
+let runtime = tokio::runtime::Builder::new_multi_thread()
+    .enable_all()
+    .thread_stack_size(8 * 1024 * 1024)
+    .build()?;
+runtime.block_on(run());
+# Ok::<(), std::io::Error>(())
+```
+
+A release build stays well below the default stack size, so it needs no change.
 
 ### High-Level Client Example
 
@@ -189,7 +205,9 @@ Prosody delivers responses locally when the requester and responder share one
 client. It routes other responses between live peers. See
 [Requests](CONFIGURATION.md#requests) for network and cache settings.
 
-```rust,ignore
+```rust,no_run
+# use prosody::prelude::*; use serde_json::{Value, json}; use std::time::Duration;
+# async fn example<H: ClientHandler<Payload = Value, Output = Value, Codecs = JsonCodecs>>(client: &CassandraHighLevelClient<H>) -> Result<(), Box<dyn std::error::Error>> {
 let subsystems = [SubsystemName::try_new("inventory")?];
 let results = client
     .request(
@@ -208,6 +226,7 @@ for (subsystem, result) in results {
         Err(error) => eprintln!("{subsystem} failed: {error}"),
     }
 }
+# Ok(()) }
 ```
 
 ## Keyed State
@@ -219,26 +238,89 @@ rebalances, and changes become visible only when the event succeeds by default.
 Declare each Value, Map, or Deque collection once, register it before subscribing, and give the returned capability to
 the handler. Most collections should have a TTL comfortably beyond the longest timer or workflow that uses them.
 
-```rust,ignore
+```rust,no_run
 use prosody::state::descriptor::{Registered, StateDescriptor, ValueDescriptor, value_state};
 use prosody::timers::duration::CompactDuration;
+# use prosody::{codec::JsonCodecError, prelude::*, state::descriptor::CellStateError}; use serde_json::{Value, json};
 
 #[derive(Clone)]
 struct CountHandler {
     count: Registered<ValueDescriptor>,
 }
 
+# async fn example(client: &CassandraHighLevelClient<CountHandler>) -> Result<(), Box<dyn std::error::Error>> {
 let count = value_state("count").ttl(CompactDuration::new(30 * 24 * 60 * 60));
 let count = client.register(count).await?;
 client.subscribe(CountHandler { count }).await?;
+# Ok(()) } impl ClientHandler for CountHandler { type Codecs = Codecs<JsonCodec, UnitCodec>; }
+# impl FallibleHandler for CountHandler { type Payload = Value; type Error = CellStateError<JsonCodecError>; type Output = (); async fn shutdown(self) {}
+# async fn on_timer<C: EventContext>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) } async fn on_excise<C: EventContext>(&self, _: C, _: ConsumerMessage<()>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+# async fn on_message<C: EventContext<Payload = Value>>(&self, context: C, _: ConsumerMessage<Value>, _: DemandType) -> Result<(), Self::Error> {
 
 // Inside CountHandler::on_message:
 let count = context.state(self.count)?;
 let current = count.get().await?.and_then(|value| value.as_u64()).unwrap_or(0);
 count.set(json!(current + 1)).await?;
+# Ok(()) } }
 ```
 
 Keyed-state cache settings are listed in [CONFIGURATION.md](CONFIGURATION.md#keyed-state).
+
+### Query collection state
+
+`KeyQuery<KC, B>` defines a map or set query. The key codec `KC` must match the
+collection. `B` selects bound storage. Typed fluent builders borrow bounds,
+including `&str` for string keys. The stream retains those borrows.
+Forward order is the default. Use `reverse()` for descending order and
+`forward()` to restore ascending order. Direction changes preserve the bounds.
+Start a fluent query with `entries`, `keys`, or `values`:
+
+```rust,no_run
+# use prosody::{prelude::*, state::{Utf8KeyCodec, descriptor::{MapDescriptor, Registered, map_state}}}; use serde_json::Value;
+# async fn example<H: ClientHandler<Payload = Value, Output = Value, Codecs = JsonCodecs>>(client: &CassandraHighLevelClient<H>, context: impl EventContext<Payload = Value>, orders: Registered<MapDescriptor<Utf8KeyCodec>>) -> Result<(), Box<dyn std::error::Error>> {
+# let map = context.state(orders)?;
+# let reader = client.state(SubsystemName::try_new("checkout")?, map_state::<Utf8KeyCodec, JsonCodec>("orders")).await?;
+use std::num::NonZeroUsize;
+
+let page_size = NonZeroUsize::try_from(20_usize)?;
+let entries = map.entries()
+    .prefix("order:")
+    .after("order:0042")
+    .limit(page_size)
+    .stream();
+
+let committed_entries = reader.entries("customer-123")
+    .prefix("order:")
+    .reverse()
+    .limit(page_size)
+    .stream();
+# Ok(()) }
+```
+
+Each fluent method consumes and returns the builder. Call `into_query()` to
+extract reusable settings. Apply borrowed settings with `with_query(query)`.
+For owned settings, use `with_query(query.borrowed())`.
+
+Key reads reuse the thread-local encoding buffer pool. Each live stream retains
+its buffer. Sequential reads reuse its capacity after the stream drops.
+A cold pool, larger bounds, or overlapping streams can require allocation.
+
+Query settings support Serde. Store owned settings when bounds must outlive their source.
+
+`stream()` is synchronous and lazy. Standalone streams acquire their session
+on the first poll. Acquisition and read errors appear as stream items.
+
+Use `keys` to read map keys or set members. Set the next page's cursor with
+`after`. Bound and prefix methods narrow the selection and never widen it, so
+their order does not change the selected keys. `prefix` keeps only keys with
+that prefix.
+`range` uses ascending bounds; `from`, `after`, `to`, and `before` follow the
+query direction.
+
+Use `DequeQuery` for deque positions and read results with `values`.
+Its bound methods use positions counted from the front. Deque queries have no
+prefix operation. Erased APIs accept `ErasedKeyQuery`, the string specialization,
+and the same `DequeQuery`. Language clients can wrap these owned builders.
 
 ### Reading another group's state
 
@@ -248,9 +330,11 @@ and other services can read that state without owning the partition or running
 the write machinery. A published collection with no subsystem is rejected at
 registration. The builder field falls back to `PROSODY_SUBSYSTEM` when unset.
 
-```rust,ignore
+```rust,no_run
+# use prosody::{prelude::*, state::{config::KeyedStateConfiguration, descriptor::{StateDescriptor, ValueDescriptor, value_state}}}; use serde_json::Value;
+# async fn example<H: ClientHandler<Payload = Value, Output = Value, Codecs = JsonCodecs>>(owner: &CassandraHighLevelClient<H>, context: impl EventContext<Payload = Value>, updated: Value) -> Result<(), Box<dyn std::error::Error>> {
 // One descriptor configures both the owning handle and the published reader.
-let current_order = value_state("current-order").published(true);
+let current_order: ValueDescriptor = value_state("current-order").published(true);
 let config = KeyedStateConfiguration::builder()
     .subsystem(Some(SubsystemName::try_new("checkout")?))
     .build()?;
@@ -261,17 +345,22 @@ let registered_order = owner.register(current_order).await?;
 let state = context.state(registered_order)?;
 let value = state.get().await?;
 state.set(updated).await?;
+# Ok(()) }
 ```
 
 Any other service reads it through the same high-level client, naming the
 subsystem and the same collection shape:
 
-```rust,ignore
+```rust,no_run
+# use prosody::{prelude::*, state::descriptor::{StateDescriptor, ValueDescriptor, value_state}}; use serde_json::Value;
+# async fn example<H: ClientHandler<Payload = Value, Output = Value, Codecs = JsonCodecs>>(client: &CassandraHighLevelClient<H>) -> Result<(), Box<dyn std::error::Error>> {
+# let current_order: ValueDescriptor = value_state("current-order").published(true);
 // Outside a handler, each read supplies the state key explicitly.
 let reader = client
     .state(SubsystemName::try_new("checkout")?, current_order)
     .await?;
 let value = reader.get("customer-123").await?; // committed value from the owning group
+# Ok(()) }
 ```
 
 A reader observes only **committed** state — never an in-flight value and never
@@ -297,10 +386,19 @@ never opens a second Cassandra session, Kafka loader, or cache.
 
 **Retiring a published collection.** Change the collection to
 `.published(false)`. Keep its registration and the consumer's `subsystem` for
-one complete stop-then-start deployment. Startup reconciliation then removes
-the routing row. Deleting the registration or subsystem first strands the
-routing row. Routing rows and committed state have no automatic expiry, so
-other groups can continue to discover and read the collection.
+one complete stop-then-start deployment. The consumer that owns partition 0
+of the first subscribed topic in lexical order then removes the routing row
+when it next acquires that partition. Deleting the registration or subsystem
+first strands the routing row. Routing rows and committed state have no
+automatic expiry, so other groups can continue to discover and read the
+collection.
+
+**Topics of a publishing consumer.** A publishing consumer reads the partition
+count of each subscribed topic from the brokers when it starts. Construction
+fails if a subscribed topic does not exist. Subscribe to literal topic names,
+because a `^` pattern has no fixed topic set. Never increase the partition
+count of a subscribed topic. The routing rows would then send readers to the
+wrong partition.
 
 ## Quality of Service
 
@@ -420,10 +518,12 @@ Prosody supports filtering messages based on exact event type prefixes, configur
 export PROSODY_ALLOWED_EVENTS=user.,account.
 ```
 
-```rust,ignore
+```rust,no_run
+# use prosody::prelude::*;
 let config = ConsumerConfiguration::builder()
     .allowed_events(vec!["user.".to_owned()])
     .build()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ### Matching Behavior
@@ -476,10 +576,10 @@ Every consumer mode includes a deduplication middleware that filters duplicate m
 When a message arrives, the middleware computes a deterministic UUID by hashing the version, consumer group, topic,
 partition, key, and either the message's `id` field or its Kafka offset. It checks the local cache first, then
 Cassandra. If found in either, the message is skipped. Otherwise, the message is processed and the UUID is recorded in
-both tiers.
+both tiers. Other messages can arrive between duplicates.
 
-- **Best-effort persistence**: Cassandra read failures are treated as cache misses; write failures are logged but do not
-  fail the message. The global cache still provides deduplication within a single process lifetime.
+- **Store errors**: A failed Cassandra deduplication read returns a transient error before the handler runs.
+  Successful settlement retries deduplication writes before it commits the source offset. Shutdown can stop these retries.
 - **Cache-busting**: Changing `PROSODY_IDEMPOTENCE_VERSION` invalidates all previously recorded entries, causing
   messages to be reprocessed.
 - **TTL expiry**: Dedup records in Cassandra expire after `PROSODY_IDEMPOTENCE_TTL` (default: 7 days).
@@ -578,6 +678,15 @@ Prosody uses a Makefile to simplify common development tasks. Here are some usef
 ### Utilities
 
 - `make console`: Open the Kafka console in a web browser.
+
+### Releases
+
+Release Please opens a release PR from the Conventional Commits on `main`. Merge that PR to publish both crates.
+
+- To publish an existing release again, for example after a fix to the release workflow, run the Release workflow
+  from the GitHub Actions tab. Set `retry_version` to the version, such as `0.7.1`. The run builds the
+  `prosody-v<version>` tag with the workflow on `main`, and skips crates that are already on crates.io.
+- To force the next version, put a `Release-As: x.y.z` line in the body of a squash-merge commit.
 
 ## Architecture
 

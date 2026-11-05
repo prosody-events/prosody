@@ -163,7 +163,7 @@ where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         RP: ResponsePolicy<T>,
     {
-        let (components, keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
+        let (components, keyed_state, heartbeats) = build_typed_state(&setup).await?;
         let retry = RetryMiddleware::new(low_latency_config.retry)?;
         let topic = FailureTopicMiddleware::new(
             low_latency_config.failure_topic,
@@ -179,7 +179,7 @@ where
         .layer(retry.clone())
         .layer(topic)
         .layer(retry);
-        let managers: Arc<Managers<C::Payload>> = Arc::default();
+        let managers: Arc<Managers> = Arc::default();
         let (inner_provider, requests) = response.into_parts(handler);
         let provider = middleware.with_provider(inner_provider);
         let providers = PartitionProviders {
@@ -190,16 +190,15 @@ where
             version: keyed_state.version.clone(),
             telemetry: &telemetry,
             heartbeats,
-            observer,
             managers: Arc::clone(&managers),
         };
-        Box::pin(initialize_consumer::<_, _, _, C, _>(
+        initialize_consumer::<_, _, _, C, _>(
             setup.consumer,
             provider,
             providers,
             services,
             requests,
-        ))
+        )
         .await
     }
 }

@@ -121,12 +121,12 @@ async fn quickstart() -> Result<()> {
 
     let (sender, mut receiver) = channel(1);
 
-    let client = CassandraHighLevelClient::<MyHandler>::new(
+    let client = Box::pin(CassandraHighLevelClient::<MyHandler>::new(
         cassandra_config.build()?,
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,
-    )
+    ))
     .await?;
 
     client.subscribe(MyHandler { sender }).await?;

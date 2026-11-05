@@ -22,12 +22,16 @@ use tracing::error;
 use tracing::level_filters::LevelFilter;
 use tracing::subscriber::{SetGlobalDefaultError, set_global_default};
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::filter::ParseError;
-#[cfg(not(test))]
-use tracing_subscriber::fmt;
 use tracing_subscriber::layer::Identity as TracingIdentity;
 use tracing_subscriber::layer::{Layered, SubscriberExt};
 use tracing_subscriber::{EnvFilter, Layer, Registry};
+
+/// Targets that log at warn by default.
+///
+/// The OpenTelemetry crates log routine setup and shutdown steps at info. A
+/// target matches by prefix, so `opentelemetry` also covers
+/// `opentelemetry_sdk` and `opentelemetry-otlp`.
+const QUIET_TARGETS: [&str; 2] = ["scylla", "opentelemetry"];
 
 /// A layer that does nothing
 pub type Identity = TracingIdentity;
@@ -68,9 +72,8 @@ static PROVIDERS: OnceLock<OtelProviders> = OnceLock::new();
 ///
 /// # Errors
 ///
-/// This function returns an error if:
-/// - Setting the global default subscriber fails
-/// - Filter directive parsing fails
+/// This function returns an error if setting the global default subscriber
+/// fails.
 ///
 /// Note: OTLP exporter errors (missing endpoint, unknown protocol, exporter
 /// build failures) are logged to stderr but do not cause the function to fail.
@@ -78,12 +81,8 @@ pub fn initialize_tracing<T>(layer: Option<T>) -> Result<(), TracingError>
 where
     T: Layer<Layered<OpenTelemetryLayer<Registry, Tracer>, Registry>> + Send + Sync,
 {
-    // Filter traces using an environment variable directive
-    let env_filter = EnvFilter::builder()
-        .with_env_var("PROSODY_LOG")
-        .with_default_directive(LevelFilter::INFO.into())
-        .from_env_lossy()
-        .add_directive("scylla=warn".parse()?);
+    let overrides = env::var_os("PROSODY_LOG").unwrap_or_default();
+    let env_filter = log_filter(&overrides.to_string_lossy());
 
     // Create a tracing subscriber with OpenTelemetry layer
     #[allow(clippy::print_stderr, reason = "tracing is not initialized yet")]
@@ -125,7 +124,8 @@ where
     set_meter_provider(meter_provider.clone());
 
     // `set_global_default` succeeds at most once per process, so the slot is
-    // necessarily empty here. The guard covers a future reordering of these steps.
+    // necessarily empty here. The guard covers a future reordering of these
+    // steps.
     PROVIDERS
         .set(OtelProviders {
             tracer: trace_provider,
@@ -134,6 +134,29 @@ where
         .map_err(|_| TracingError::AlreadyInitialized)?;
 
     Ok(())
+}
+
+/// Builds the log filter from the `PROSODY_LOG` directives.
+///
+/// The default level is info, and the [`QUIET_TARGETS`] log at warn. A bare
+/// level replaces info. It also lowers the quiet targets when it is below
+/// warn, so `off` silences every target. A directive for a target replaces
+/// the default for that target. `EnvFilter` reports invalid directives to
+/// stderr and ignores them.
+fn log_filter(overrides: &str) -> EnvFilter {
+    let base = overrides
+        .rsplit(',')
+        // `LevelFilter` parses an empty string as error. `EnvFilter` ignores
+        // an empty segment.
+        .filter(|directive| !directive.is_empty())
+        .find_map(|directive| directive.parse::<LevelFilter>().ok())
+        .unwrap_or(LevelFilter::INFO);
+    let quiet = base.min(LevelFilter::WARN);
+    let defaults = QUIET_TARGETS
+        .map(|target| format!("{target}={quiet}"))
+        .join(",");
+
+    EnvFilter::builder().parse_lossy(format!("{base},{defaults},{overrides}"))
 }
 
 /// Selects base-2 exponential aggregation for all Prosody histograms.
@@ -316,10 +339,6 @@ pub enum TracingError {
     /// Indicates a failure to flush or shut down the telemetry pipeline.
     #[error("failed to flush telemetry: {0:#}")]
     Flush(#[from] OTelSdkError),
-
-    /// Indicates a failure to parse filter directive.
-    #[error("failed to parse filter directive: {0:#}")]
-    FilterParse(#[from] ParseError),
 }
 
 /// Initializes test tracing infrastructure.
@@ -341,6 +360,7 @@ pub fn init_test_logging() {
 /// Initializes test tracing infrastructure.
 pub fn init_test_logging() {
     use std::sync::Once;
+    use tracing_subscriber::fmt;
 
     static INIT: Once = Once::new();
 

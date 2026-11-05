@@ -8,7 +8,8 @@
 //! [`ReadSession`](super::session::ReadSession)).
 //!
 //! Point reads acquire a session and bind a collection handle.
-//! Queries bind the collection directly and use the shared query executor.
+//! Map and set queries bind the collection and use the shared query executor.
+//! Deque queries bind a handle and use its query.
 //! Owner and reader sessions use the same collection methods.
 //! Message reference cells use the loader from the session's backend.
 //!
@@ -21,33 +22,32 @@
 
 pub(crate) mod acquisition;
 mod admission;
-mod deque;
 mod map;
 mod query;
 mod set;
-pub use deque::DequeReaderQuery;
 
-pub use query::{MapReaderQuery, SetReaderQuery};
+pub use map::MapReadItem;
 
 use crate::Key;
 use crate::codec::Codec;
 use crate::state::StateName;
-use crate::state::cell_key::Direction;
 use crate::state::descriptor::{
     CellType, ContextOf, DequeDescriptor, FromSession, ResolvedOf, StateDescriptor, ValueDescriptor,
 };
 use crate::state::order_codec::UnitKey;
+use crate::state::{DequeQuery, DequeRead, ReadQuery, ReadSource};
 use crate::state_reader::deps::StateReaderDependencies;
 use crate::state_reader::error::StateReaderError;
 use crate::state_reader::session::{ReadSession, ReaderCollectionDef, ReaderContext};
 use crate::state_reader::{MemoryReaderBackend, ReaderBackend};
 use crate::subsystem::SubsystemName;
 use acquisition::{DEFAULT_REFRESH_INTERVAL, PublicationSnapshot};
-use futures::stream::Stream;
+use educe::Educe;
+use futures::{Stream, StreamExt};
 use quanta::Clock;
-use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::coop::cooperative;
 
 /// A cross-group, read-only view over a published keyed-state collection.
 ///
@@ -62,6 +62,8 @@ use std::time::Duration;
 /// codec `C`. The read methods live in descriptor-specialized impl blocks for
 /// Value, Map, Set, and Deque. Each is a thin bind-and-delegate over the shared
 /// read machinery.
+#[derive(Educe)]
+#[educe(Clone(bound = "D: Clone"))]
 pub struct StateReader<D, C: Codec, B = MemoryReaderBackend<C>> {
     descriptor: D,
     subsystem: SubsystemName,
@@ -154,12 +156,19 @@ where
     /// fresh source pin. Rejects an empty key first: an empty or NULL key has
     /// no deterministic partition to route to.
     pub(crate) async fn session(&self, key: Key) -> Result<ReadSession<C, B>, StateReaderError> {
-        if key.is_empty() {
-            return Err(StateReaderError::EmptyKey);
-        }
+        require_key(&key)?;
         let snapshot = self.snapshot().await?;
         Ok(ReadSession::new(self.context.clone(), snapshot, key))
     }
+}
+
+/// Rejects an empty key. Every read checks the key first, even a query that
+/// selects nothing.
+fn require_key(key: &Key) -> Result<(), StateReaderError> {
+    if key.is_empty() {
+        return Err(StateReaderError::EmptyKey);
+    }
+    Ok(())
 }
 
 /// Rejects a degenerate read-cache TTL. A zero TTL would make every entry born
@@ -205,7 +214,6 @@ where
     B: ReaderBackend<C>,
     C::Payload: Clone,
     T: CellType<Key = UnitKey>,
-    for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
 {
     /// Reads and resolves the committed element at front-relative `index`
     /// (`None` when `index >= len`).
@@ -217,7 +225,10 @@ where
         &self,
         key: K,
         index: usize,
-    ) -> Result<Option<ResolvedOf<T>>, StateReaderError> {
+    ) -> Result<Option<ResolvedOf<T>>, StateReaderError>
+    where
+        for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
+    {
         let handle = self.bound(key.into()).await?;
         handle
             .get(index)
@@ -256,7 +267,10 @@ where
     pub async fn peek_front<K: Into<Key>>(
         &self,
         key: K,
-    ) -> Result<Option<ResolvedOf<T>>, StateReaderError> {
+    ) -> Result<Option<ResolvedOf<T>>, StateReaderError>
+    where
+        for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
+    {
         let handle = self.bound(key.into()).await?;
         handle
             .peek_front()
@@ -272,7 +286,10 @@ where
     pub async fn peek_back<K: Into<Key>>(
         &self,
         key: K,
-    ) -> Result<Option<ResolvedOf<T>>, StateReaderError> {
+    ) -> Result<Option<ResolvedOf<T>>, StateReaderError>
+    where
+        for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
+    {
         let handle = self.bound(key.into()).await?;
         handle
             .peek_back()
@@ -280,41 +297,37 @@ where
             .map_err(|e| StateReaderError::store(&e))
     }
 
-    /// Streams the committed live elements under partition `key` in index order
-    /// (front to back for [`Direction::Forward`]).
-    ///
-    /// The stream owns its session and can outlive the reader's borrow.
-    ///
-    /// # Errors
-    ///
-    /// Any [`StateReaderError`] from acquiring the session: an empty key, or
-    /// an acquisition or identity failure. Per-source read failures surface
-    /// as stream items.
-    pub async fn stream<K: Into<Key>>(
+    /// Builds a query over committed elements, in front-to-back order.
+    /// The stream borrows the reader. Its first poll acquires a session.
+    /// A query that selects no position acquires no session. Acquisition and
+    /// read errors appear as stream items.
+    pub fn values<K: Into<Key>>(
         &self,
         key: K,
-        dir: Direction,
-    ) -> Result<
-        impl Stream<Item = Result<ResolvedOf<T>, StateReaderError>> + 'static,
-        StateReaderError,
+    ) -> DequeRead<
+        impl ReadSource<
+            Query = DequeQuery,
+            Output: Stream<Item = Result<ResolvedOf<T>, StateReaderError>> + Send,
+        > + Clone
+        + use<'_, K, T, C, B>,
     >
     where
-        T: 'static,
-        ResolvedOf<T>: 'static,
+        for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
     {
-        self.query(key, dir).values().await
-    }
-
-    /// Builds a directional deque query for the partition key.
-    pub fn query<K: Into<Key>>(&self, key: K, dir: Direction) -> DequeReaderQuery<'_, T, C, B> {
-        DequeReaderQuery {
-            reader: self,
-            key: key.into(),
-            dir,
-            start: Bound::Unbounded,
-            end: Bound::Unbounded,
-            limit: None,
-        }
+        let key = key.into();
+        ReadQuery::new(DequeQuery::new(), move |query: DequeQuery| {
+            async_stream::try_stream! {
+                require_key(&key)?;
+                if !query.positions().is_empty() {
+                    let handle = self.bound(key).await?;
+                    let inner = handle.values().with_query(query).stream();
+                    futures::pin_mut!(inner);
+                    while let Some(item) = cooperative(inner.next()).await {
+                        yield item.map_err(|error| StateReaderError::store(&error))?;
+                    }
+                }
+            }
+        })
     }
 }
 

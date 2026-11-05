@@ -1,7 +1,8 @@
-use tracing::{Instrument, debug, info, warn};
+use tracing::{Instrument, debug, error, info};
 
 use super::super::store::{TimerDeferStore, TimerRetryCompletionResult};
 use super::{TimerDeferHandler, TimerDeferOutput};
+use crate::Key;
 use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::middleware::FallibleHandler;
@@ -42,14 +43,15 @@ where
         C: EventContext<Payload = T::Payload>,
     {
         // Check if key is already deferred - queue behind existing entry
-        if self
+        if let Some(retry_count) = self
             .store
             .is_deferred(&trigger.key)
             .await
             .map_err(DeferError::Store)?
-            .is_some()
         {
-            return self.append_to_deferred_queue(&trigger).await;
+            return self
+                .append_to_deferred_queue(&context, &trigger, retry_count)
+                .await;
         }
 
         // Try handler, defer on transient failure if enabled
@@ -75,13 +77,13 @@ where
         }
 
         debug!(
-            key = ?trigger.key,
+            key = %trigger.key,
             time = %trigger.time,
             topic = %self.topic,
             partition = self.partition,
             enabled,
             should_defer,
-            "Deferral skipped"
+            "Prosody does not defer the timer"
         );
         Err(DeferError::Handler(error))
     }
@@ -99,11 +101,11 @@ where
         let key = &trigger.key;
 
         debug!(
-            key = ?key,
+            key = %key,
             scheduled_time = %trigger.time,
             topic = %self.topic,
             partition = self.partition,
-            "Defer retry timer fired"
+            "The retry timer of a deferred timer fired"
         );
 
         // Get next deferred timer
@@ -116,10 +118,10 @@ where
             // Queue empty - clear orphaned timer. Inner did not run, so the
             // inner has no apply work for this dispatch.
             debug!(
-                key = ?key,
+                key = %key,
                 topic = %self.topic,
                 partition = self.partition,
-                "Clearing orphaned defer timer: queue empty"
+                "Prosody deletes a retry timer that has no deferred timer"
             );
 
             self.store
@@ -131,12 +133,12 @@ where
         };
 
         debug!(
-            key = ?key,
+            key = %key,
             original_time = %stored_trigger.time,
             retry_count = retry_count,
             topic = %self.topic,
             partition = self.partition,
-            "Loaded deferred timer - attempting retry"
+            "Prosody loaded a deferred timer and retries it"
         );
 
         let demand = demand.retried(retry_count.saturating_add(1));
@@ -184,20 +186,19 @@ where
         self.complete_and_advance(&context, &stored_trigger).await?;
 
         info!(
-            key = ?key,
+            key = %key,
             original_time = %stored_trigger.time,
             retry_count = retry_count,
             topic = %self.topic,
             partition = self.partition,
-            "Deferred timer retry succeeded"
+            "A deferred timer succeeded on retry"
         );
 
         Ok(TimerDeferOutput::Inner(output))
     }
 
     /// Defers a timer for the first time after the inner handler returned a
-    /// transient error. Schedules retry timer before storing to ensure timer
-    /// still fires on partial failure.
+    /// transient error.
     ///
     /// Returns [`TimerDeferOutput::Deferred`] carrying the inner error so the
     /// apply hooks can drive `after_abort(Err(inner_err))` on the inner: the
@@ -212,7 +213,6 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        // Timer first, then store: the timer still fires on partial failure
         self.schedule_retry_timer(&context, 0).await?;
 
         self.store
@@ -221,37 +221,81 @@ where
             .map_err(DeferError::Store)?;
 
         info!(
-            key = ?trigger.key,
+            key = %trigger.key,
             time = %trigger.time,
             topic = %self.topic,
             partition = self.partition,
-            "Deferred timer for timer-based retry"
+            "Prosody deferred the timer and retries it later"
         );
 
         Ok(TimerDeferOutput::Deferred(inner_err))
     }
 
-    /// Appends timer to an already-deferred key's queue (maintains ordering).
-    /// The inner handler is not invoked for this dispatch — the trigger is a
-    /// pure side-effect on the defer queue.
-    pub(super) async fn append_to_deferred_queue(
+    /// Appends to an already-deferred key's queue. A key without a retry
+    /// timer receives one before the append. A key that receives no traffic
+    /// keeps its queue until the rows expire. The scheduled read is one cached
+    /// lookup beside the durable append; the short `Vec` it returns is the
+    /// cost of the heal. The inner handler does not run and
+    /// [`TimerDeferOutput::NoInner`] suppresses both apply hooks.
+    pub(super) async fn append_to_deferred_queue<C>(
         &self,
+        context: &C,
         trigger: &Trigger,
-    ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>> {
+        retry_count: u32,
+    ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
+    where
+        C: EventContext<Payload = T::Payload>,
+    {
+        let scheduled = context
+            .scheduled(TimerType::DeferredTimer)
+            .await
+            .map_err(|e| DeferError::Timer(Box::new(e)))?;
+
+        if scheduled.is_empty() {
+            self.schedule_retry_timer(context, retry_count).await?;
+            info!(
+                key = %trigger.key,
+                time = %trigger.time,
+                retry_count = retry_count,
+                topic = %self.topic,
+                partition = self.partition,
+                "Prosody scheduled a missing retry timer for a deferred key"
+            );
+        }
+
         self.store
             .defer_additional_timer(trigger)
             .await
             .map_err(DeferError::Store)?;
 
         debug!(
-            key = ?trigger.key,
+            key = %trigger.key,
             time = %trigger.time,
             topic = %self.topic,
             partition = self.partition,
-            "Queued timer behind already-deferred key"
+            "Prosody deferred the timer, because its key already has deferred timers"
         );
 
         Ok(TimerDeferOutput::NoInner)
+    }
+
+    /// Schedules the next retry, then records the attempt.
+    /// Timer first, then store: the timer still fires on a partial failure.
+    async fn re_defer<C>(
+        &self,
+        context: &C,
+        key: &Key,
+        retry_count: u32,
+    ) -> Result<u32, DeferError<S::Error, T::Error>>
+    where
+        C: EventContext<Payload = T::Payload>,
+    {
+        self.schedule_retry_timer(context, retry_count.saturating_add(1))
+            .await?;
+        self.store
+            .increment_retry_count(key, retry_count)
+            .await
+            .map_err(DeferError::Store)
     }
 
     /// Handles retry failures by error category.
@@ -284,12 +328,8 @@ where
             ErrorCategory::Transient => {
                 // Always re-defer: timer is committed to queue
                 let new_retry_count = self
-                    .store
-                    .increment_retry_count(&deferred_trigger.key, retry_count)
-                    .await
-                    .map_err(DeferError::Store)?;
-
-                self.schedule_retry_timer(context, new_retry_count).await?;
+                    .re_defer(context, &deferred_trigger.key, retry_count)
+                    .await?;
 
                 self.sender.emit_timer(
                     TimerEventType::Failed {
@@ -304,24 +344,26 @@ where
                 );
 
                 info!(
-                    key = ?deferred_trigger.key,
+                    key = %deferred_trigger.key,
                     time = %deferred_trigger.time,
                     retry_count = new_retry_count,
                     topic = %self.topic,
                     partition = self.partition,
-                    "Re-deferred timer after transient failure"
+                    "A deferred timer failed again with a transient error, so Prosody defers it again"
                 );
 
                 Ok(TimerDeferOutput::Deferred(error))
             }
             ErrorCategory::Permanent => {
-                warn!(
-                    key = ?deferred_trigger.key,
+                // Only this layer knows the lost timer and its original time.
+                error!(
+                    key = %deferred_trigger.key,
                     time = %deferred_trigger.time,
                     retry_count = retry_count,
                     topic = %self.topic,
                     partition = self.partition,
-                    "Permanent handler error during retry - removing from queue: {error:#}"
+                    "Prosody lost a deferred timer: {error:#}. The error is permanent, so \
+                     Prosody removes the timer from the deferral queue."
                 );
 
                 self.complete_and_advance(context, stored_trigger).await?;
@@ -358,8 +400,12 @@ where
         }
     }
 
-    /// Removes timer from queue and schedules next (or clears).
-    /// Used after success, permanent failure, or skipping corrupted entries.
+    /// Removes the timer from the queue after a success, a permanent failure,
+    /// or a corrupted entry. The timer write covers the next entry before the
+    /// queue advances. An empty queue clears the timer, so a drained queue
+    /// pays one timer insert and one clear. A stray retry timer on an empty
+    /// queue reloads nothing. The fire consumes it, and the handler deletes
+    /// the key.
     pub(super) async fn complete_and_advance<C>(
         &self,
         context: &C,
@@ -368,13 +414,22 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
+        self.schedule_retry_timer(context, 0).await?;
+
         let result = self
             .store
             .complete_retry_success(&trigger.key, trigger.time)
             .await
             .map_err(DeferError::Store)?;
 
-        self.schedule_next_or_clear(context, result).await
+        if matches!(result, TimerRetryCompletionResult::Completed) {
+            context
+                .clear_scheduled(TimerType::DeferredTimer)
+                .await
+                .map_err(|e| DeferError::Timer(Box::new(e)))?;
+        }
+
+        Ok(())
     }
 
     /// Schedules a `DeferredTimer` timer with backoff based on retry count.
@@ -402,30 +457,6 @@ where
         );
 
         Ok(())
-    }
-
-    /// Schedules timer for next entry or clears if queue empty.
-    pub(super) async fn schedule_next_or_clear<C>(
-        &self,
-        context: &C,
-        result: TimerRetryCompletionResult,
-    ) -> Result<(), DeferError<S::Error, T::Error>>
-    where
-        C: EventContext<Payload = T::Payload>,
-    {
-        match result {
-            TimerRetryCompletionResult::MoreTimers { .. } => {
-                // More timers in queue - schedule retry (retry_count reset to 0)
-                self.schedule_retry_timer(context, 0).await
-            }
-            TimerRetryCompletionResult::Completed => {
-                // No more timers - clear the retry timer
-                context
-                    .clear_scheduled(TimerType::DeferredTimer)
-                    .await
-                    .map_err(|e| DeferError::Timer(Box::new(e)))
-            }
-        }
     }
 
     /// Returns `now + backoff(retry_count)`; used for scheduling retry timers.

@@ -80,10 +80,7 @@ async fn test_legacy_complete_retry_at_min() -> color_eyre::Result<()> {
     let result = store
         .complete_retry_success(&k, Offset::from(5_i64))
         .await?;
-    assert!(matches!(
-        result,
-        MessageRetryCompletionResult::MoreMessages { next_offset } if next_offset == Offset::from(10_i64)
-    ));
+    assert_eq!(result, MessageRetryCompletionResult::MoreMessages);
 
     assert_next_offset(&store, &k, Some(10)).await?;
     Ok(())
@@ -96,10 +93,7 @@ async fn test_legacy_complete_retry_above_min() -> color_eyre::Result<()> {
     let result = store
         .complete_retry_success(&k, Offset::from(10_i64))
         .await?;
-    assert!(matches!(
-        result,
-        MessageRetryCompletionResult::MoreMessages { next_offset } if next_offset == Offset::from(5_i64)
-    ));
+    assert_eq!(result, MessageRetryCompletionResult::MoreMessages);
 
     // Repair advanced next_offset to 5 on the initial read; completing a
     // non-min offset leaves next_offset anchored at the true minimum.

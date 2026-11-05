@@ -6,21 +6,20 @@ use crate::state::cached::Cached;
 use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraStore,
 };
-use crate::state::fjall::{FjallCellCache, FjallCellCacheError, FjallClient, MarkerCheckSet};
+use crate::state::fjall::{FjallClient, MarkerCheckSet};
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::{PartitionBackend, StateBackendFactory};
 use crate::timers::store::TriggerStore;
 use crate::{Partition, Topic};
-use std::convert::Infallible;
 use std::sync::Arc;
 
-/// Creates Cassandra stores and a disk workspace for each partition assignment.
-/// The workspace holds the committed cache and admission checks until
-/// revocation.
+/// Creates Cassandra stores and a cache slot for each partition assignment.
+/// The slot's keyspace holds the committed cache and admission checks until
+/// revocation. Stores use Cassandra alone until the keyspace exists.
 #[derive(Clone)]
 pub(crate) struct CassandraStateBackendFactory<DP> {
-    client: Arc<FjallClient>,
+    client: FjallClient,
     cell: CassandraCellResources,
     identity: CassandraDescriptorIdentityStore,
     registry: Arc<CollectionDefRegistry>,
@@ -33,7 +32,7 @@ impl<DP> CassandraStateBackendFactory<DP> {
     /// stores.
     #[must_use]
     pub(crate) fn new(
-        client: Arc<FjallClient>,
+        client: FjallClient,
         cell: CassandraCellResources,
         identity: CassandraDescriptorIdentityStore,
         registry: Arc<CollectionDefRegistry>,
@@ -62,38 +61,22 @@ where
         Cached<CassandraStore>,
         MarkerCheckSet,
     >;
-    type Error = FjallCellCacheError;
 
-    fn for_partition(
-        &self,
-        topic: Topic,
-        partition: Partition,
-        _triggers: S,
-    ) -> Result<Self::Backend, Self::Error> {
-        let workspace = self.client.workspace(topic, partition)?;
-        // The cache owns the workspace, holding it (and so its on-disk
-        // partition) alive until the partition's state manager is dropped at
-        // revocation.
-        let fjall = FjallCellCache::for_workspace(workspace);
+    fn for_partition(&self, topic: Topic, partition: Partition, _triggers: S) -> Self::Backend {
+        let slot = self.client.slot();
         let dedup = self
             .dedup
             .create_store(topic, partition, &self.consumer_group);
         let CassandraCellResources { session, queries } = &self.cell;
         let cassandra =
             CassandraStore::new(session.clone(), queries.clone(), self.registry.clone());
-        let checks = fjall.marker_checks();
-        let cell = Cached::new(fjall, cassandra);
-        Ok(PartitionBackend::new(
-            dedup,
-            self.identity.clone(),
-            cell,
-            checks,
-        ))
+        let cell = Cached::new(slot.clone(), cassandra);
+        PartitionBackend::new(dedup, self.identity.clone(), cell, slot.into())
     }
 }
 
 /// Shares memory cells and identities across partitions.
-/// Memory assignments have no disk workspace and admit each event.
+/// Memory assignments have no keyspace and admit each event.
 #[derive(Clone)]
 pub(crate) struct MemoryStateBackendFactory<DP> {
     cells: MemoryCells,
@@ -128,23 +111,12 @@ where
     S: TriggerStore,
 {
     type Backend = PartitionBackend<DP::Store, MemoryDescriptorIdentityStore, MemoryCellStore, ()>;
-    type Error = Infallible;
 
-    fn for_partition(
-        &self,
-        topic: Topic,
-        partition: Partition,
-        _triggers: S,
-    ) -> Result<Self::Backend, Self::Error> {
+    fn for_partition(&self, topic: Topic, partition: Partition, _triggers: S) -> Self::Backend {
         let dedup = self
             .dedup
             .create_store(topic, partition, &self.consumer_group);
         let cell = MemoryCellStore::new(self.cells.clone());
-        Ok(PartitionBackend::new(
-            dedup,
-            self.identity.clone(),
-            cell,
-            (),
-        ))
+        PartitionBackend::new(dedup, self.identity.clone(), cell, ())
     }
 }

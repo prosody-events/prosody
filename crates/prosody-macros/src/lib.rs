@@ -36,6 +36,9 @@ pub(crate) fn combine(slot: &mut Option<Error>, error: Error) {
 
 /// Declares one collection kind's durable layout.
 ///
+/// Rustdoc cannot compile this example, because the expansion names
+/// `crate::state` paths that exist only inside `prosody`.
+///
 /// ```ignore
 /// collection_layout! {
 ///     /// A two-family collection.
@@ -69,6 +72,9 @@ pub fn collection_layout(input: TokenStream) -> TokenStream {
 
 /// Rewrites one collection handle `impl` block so each marked method runs as
 /// exactly one scoped operation.
+///
+/// Rustdoc cannot compile this example, because the expansion names
+/// `crate::state` paths that exist only inside `prosody`.
 ///
 /// ```ignore
 /// #[collection_methods(field = cells, session = S)]

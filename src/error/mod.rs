@@ -14,9 +14,26 @@
 //!   waiting, configuration changes, or code changes.
 
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
+use tracing::Level;
 
 pub mod kafka;
+
+/// Logs one event at a level chosen at runtime. A tracing callsite has a
+/// static level, so the macro expands to one call for each level.
+macro_rules! log_at {
+    ($level:expr, $($arg:tt)+) => {
+        match $level {
+            ::tracing::Level::ERROR => ::tracing::error!($($arg)+),
+            ::tracing::Level::WARN => ::tracing::warn!($($arg)+),
+            ::tracing::Level::INFO => ::tracing::info!($($arg)+),
+            ::tracing::Level::DEBUG => ::tracing::debug!($($arg)+),
+            _ => ::tracing::trace!($($arg)+),
+        }
+    };
+}
+pub(crate) use log_at;
 
 /// Categorizes errors in message processing.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
@@ -41,6 +58,14 @@ pub trait ClassifyError {
         matches!(self.classify_error(), ErrorCategory::Transient)
     }
 }
+
+/// Raises one alert for a failure that does not heal by itself.
+///
+/// A [`Transient`](ErrorCategory::Transient) failure heals by itself, so it
+/// logs at warn. The first failure of another category logs at error. Later
+/// failures log at warn.
+#[derive(Debug, Default)]
+pub(crate) struct RetryAlert(AtomicBool);
 
 /// The wire discriminants, for formats that carry a category between processes.
 ///
@@ -71,6 +96,17 @@ impl TryFrom<i32> for ErrorCategory {
             2 => Ok(Self::Permanent),
             3 => Ok(Self::Terminal),
             other => Err(UnknownErrorCategory(other)),
+        }
+    }
+}
+
+impl RetryAlert {
+    /// Returns the level for a failure in `category`.
+    pub(crate) fn level(&self, category: ErrorCategory) -> Level {
+        if category != ErrorCategory::Transient && !self.0.swap(true, Ordering::Relaxed) {
+            Level::ERROR
+        } else {
+            Level::WARN
         }
     }
 }

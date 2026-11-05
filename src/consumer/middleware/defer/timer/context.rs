@@ -21,6 +21,7 @@ use crate::consumer::event_context::{EventContext, StateAccessError, Termination
 use crate::consumer::middleware::RepinProof;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::otel::mark_failed;
 use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::timers::TimerType;
 use crate::timers::Trigger;
@@ -28,7 +29,7 @@ use crate::timers::datetime::CompactDateTime;
 use futures::TryFutureExt;
 use std::future::Future;
 use thiserror::Error;
-use tracing::{Instrument, error, info_span};
+use tracing::{Instrument, info_span};
 
 /// Context wrapper that unifies active and deferred timer operations.
 ///
@@ -197,10 +198,9 @@ where
                 .instrument(span.clone())
                 .await
                 .map_err(|error| {
-                    // Parity with the instrumented branch's `err`: mark the
-                    // span before the error propagates, so a failed append is
-                    // visible on the trace.
-                    span.in_scope(|| error!(error = %error, "deferred timer append failed"));
+                    // Match the instrumented branch's `err`, so a failed
+                    // append is visible on the trace.
+                    mark_failed(&span, &error);
                     TimerDeferContextError::Store(error)
                 })
         } else {

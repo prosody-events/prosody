@@ -1,11 +1,11 @@
 //! Process-shared in-memory cells and committed reader projections.
 
 use crate::state::cell::{Cell, Committed, Projection, ProvisionalCell, resolve_for_reader};
-use crate::state::cell_key::{CellKey, Direction, Scan, Section};
+use crate::state::cell_key::{CellKey, CellRef, Direction, Scan, Section};
 #[cfg(test)]
 use crate::state::marker::EventMarker;
 use crate::state::marker::{MarkerState, ReaderEvidence};
-use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store::{Answers, ReadBatch};
 use crate::state::{CollectionId, EventRef};
 use ahash::RandomState;
 use async_stream::try_stream;
@@ -16,6 +16,20 @@ use std::sync::Arc;
 use tokio::task::coop::cooperative;
 
 pub(super) type CellMap = scc::HashMap<(CollectionId, CellKey), StoredCell, RandomState>;
+/// A borrowed key for [`CellMap`] lookups.
+///
+/// Its derived `Hash` must equal the hash of the owned
+/// `(CollectionId, CellKey)` key. It does, because `CellKey` hashes through
+/// its `CellRef`.
+#[derive(Hash)]
+struct CellLookup<'a>(&'a CollectionId, CellRef<'a>);
+
+impl scc::Equivalent<(CollectionId, CellKey)> for CellLookup<'_> {
+    fn equivalent(&self, key: &(CollectionId, CellKey)) -> bool {
+        self.0 == &key.0 && self.1 == key.1.as_ref()
+    }
+}
+
 /// This map is the memory store itself.
 /// The test and mock store has no clock. It retains Committed evidence for its
 /// lifetime. This is the only retention that a clockless store can express.
@@ -39,11 +53,9 @@ impl MemoryCells {
         Self::default()
     }
 
-    pub(super) fn read_committed_cell(&self, collection: &CollectionId, cell: &CellKey) -> Cell {
+    pub(super) fn read_committed_cell(&self, collection: &CollectionId, cell: CellRef<'_>) -> Cell {
         self.inner
-            .read_sync(&(collection.clone(), cell.clone()), |_, stored| {
-                stored.to_cell()
-            })
+            .read_sync(&CellLookup(collection, cell), |_, stored| stored.to_cell())
             .unwrap_or_else(|| Cell::Resolved(Committed::new(None)))
     }
 
@@ -77,7 +89,7 @@ impl MemoryCells {
     pub(crate) fn read_committed(
         &self,
         collection: &CollectionId,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Option<Bytes> {
         let evidence = self.reader_evidence(collection);
         if !evidence.survives(cell) {
@@ -90,31 +102,28 @@ impl MemoryCells {
         &self,
         collection: &CollectionId,
         section: Section,
-        batch: &CoordinateBatch,
-    ) -> CellBuffer<Option<P::Payload>> {
+        batch: &ReadBatch<'_>,
+    ) -> Answers<Option<P::Payload>> {
         let evidence = self.reader_evidence(collection);
-        batch
-            .iter()
-            .map(|coordinate| {
-                let key = CellKey {
-                    section,
-                    coordinate: coordinate.clone(),
-                };
-                if !evidence.survives(&key) {
-                    return None;
-                }
-                resolve_for_reader(&self.read_committed_cell(collection, &key), &evidence)
-                    .cloned()
-                    .map(P::from_value)
-            })
-            .collect()
+        batch.map(|&coordinate| {
+            let key = CellRef {
+                section,
+                coordinate,
+            };
+            if !evidence.survives(key) {
+                return None;
+            }
+            resolve_for_reader(&self.read_committed_cell(collection, key), &evidence)
+                .cloned()
+                .map(P::from_value)
+        })
     }
 
     pub(crate) fn scan_committed<'a>(
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), Infallible>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), Infallible>> + Send + use<'a> {
         try_stream! {
             let evidence = self.reader_evidence(collection);
             let mut raw: Vec<(CellKey, Cell)> = Vec::new();
@@ -132,7 +141,7 @@ impl MemoryCells {
                 raw.reverse();
             }
             for (cell, stored) in raw {
-                if !evidence.survives(&cell) { continue; }
+                if !evidence.survives(cell.as_ref()) { continue; }
                 if let Some(bytes) =
                     cooperative(async { resolve_for_reader(&stored, &evidence).cloned() }).await
                 {
