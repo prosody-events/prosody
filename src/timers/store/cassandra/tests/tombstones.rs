@@ -20,8 +20,8 @@ use quickcheck::{Arbitrary, Gen, QuickCheck};
 use scylla::client::session::Session;
 use scylla::response::query_result::QueryRowsResult;
 use scylla::serialize::row::SerializeRow;
+use scylla::statement::Consistency;
 use scylla::statement::prepared::PreparedStatement;
-use scylla::statement::{Consistency, Statement};
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 use strum::VariantArray;
@@ -293,8 +293,9 @@ async fn traced(
 /// It sends no signal when an event arrives, so this function reads the events
 /// again until the summary appears.
 async fn read_summary(session: &Session, id: Uuid) -> Result<u64> {
-    let mut events =
-        Statement::new("SELECT activity FROM system_traces.events WHERE session_id = ?");
+    let mut events = session
+        .prepare("SELECT activity FROM system_traces.events WHERE session_id = ?")
+        .await?;
     // `system_traces` keeps two replicas, and the test cluster has one node.
     // The session's LOCAL_QUORUM needs both replicas, so read at ONE.
     events.set_consistency(Consistency::One);
@@ -302,7 +303,7 @@ async fn read_summary(session: &Session, id: Uuid) -> Result<u64> {
 
     loop {
         let rows = session
-            .query_unpaged(events.clone(), (id,))
+            .execute_unpaged(&events, (id,))
             .await?
             .into_rows_result()?;
         for row in rows.rows::<(Option<&str>,)>()? {
