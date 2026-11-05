@@ -37,25 +37,20 @@ fn required() -> ConsumerConfigurationBuilder {
 }
 
 /// A duration near one bound of a millisecond setting: zero, one millisecond,
-/// or `max`. It lies a power of two nanoseconds, up to about one second, below
-/// or above that bound.
+/// or `max`. It lies zero to about one second below or above that bound, so the
+/// bound itself and its nearest neighbors stay reachable.
 fn near_bound(max: Duration, anchor: u8, below: bool, exponent: u8) -> Duration {
     let bound = match anchor % 3 {
         0 => Duration::ZERO,
         1 => Duration::from_millis(1),
         _ => max,
     };
-    let offset = Duration::from_nanos(1 << (exponent % 31));
+    let offset = Duration::from_nanos((1 << (exponent % 31)) - 1);
     if below {
         bound.saturating_sub(offset)
     } else {
         bound + offset
     }
-}
-
-/// Whether librdkafka can carry `value` for a setting whose maximum is `max`.
-fn carried_millis(value: Duration, max: Duration) -> bool {
-    value.as_millis() >= 1 && value <= max
 }
 
 /// A partition prefetch is accepted exactly when librdkafka can carry it as a
@@ -111,7 +106,8 @@ fn prop_millisecond_settings_accept_only_what_librdkafka_carries(
     for (set, max) in settings {
         let value = near_bound(max, anchor, below, exponent);
         let config = set(&mut required(), value).build()?;
-        if config.validate().is_ok() != carried_millis(value, max) {
+        let carried = value.as_millis() >= 1 && value <= max;
+        if config.validate().is_ok() != carried {
             return Ok(false);
         }
     }
