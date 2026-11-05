@@ -1,33 +1,29 @@
-//! Write-only scylla `SerializeValue` impls for keyed-state discriminators and
-//! the coordinate blob.
+//! Write-only scylla `SerializeValue` impls for keyed-state discriminators,
+//! the partition count, and the coordinate blob.
 //!
-//! Each persisted discriminator binds directly into a `SerializeRow` tuple
-//! through its own `SerializeValue` impl, rather than being hand-converted to
-//! a driver primitive (`i8`/`i16`) at the call site. The impls mirror the
-//! [`TimerType`](crate::timers::TimerType) bridge in
-//! [`crate::cassandra`]: delegate through the discriminator's `From<_> for iN`
-//! impl and let the integer's own `serialize` write the cell.
+//! Each persisted discriminator binds into a `SerializeRow` tuple through its
+//! own `SerializeValue` impl, never as a driver primitive converted at the call
+//! site. Each impl delegates through the discriminator's `From<_> for iN` impl,
+//! like the [`TimerType`](crate::timers::TimerType) bridge in [`crate::cassandra`].
 //!
-//! These impls are **serialize-only by design**, the same rationale as the
-//! [`EventRef`](crate::state::EventRef) UDT bridge in
-//! [`super::udt`]. Reads do *not* go through a matching `DeserializeValue`:
-//! the cell decoder (`cell::decode`) deserializes the raw integer and
-//! validates it in a fallible post-step. A bad discriminator then classifies
-//! `Permanent` rather than becoming scylla's opaque `Terminal`
-//! `DeserializationError`, which would tear the partition down over one bad
-//! row.
+//! These impls are serialize-only by design, like the
+//! [`EventRef`](crate::state::EventRef) UDT bridge in [`super::udt`]. The cell
+//! decoder (`cell::decode`) reads the raw integer and validates it in a
+//! fallible step, so a bad discriminator classifies as `Permanent`. A
+//! `DeserializeValue` impl would raise a `Terminal` driver error instead, and
+//! that error stops the partition.
 //!
-//! [`Coordinate`] is not a discriminator but a `blob` — it shares this module
-//! only for the same **serialize-only** posture: its impl delegates to its byte
-//! blob so a `CellKey`'s coordinate binds directly (as a single bind and inside
-//! an `IN` list of blobs), while reads keep deserializing the raw `Vec<u8>` and
-//! rebuilding the coordinate infallibly. It is the single conversion surface —
-//! no `as_iN`/`from_iN` inherent methods exist on [`Coordinate`].
+//! [`PartitionCount`] and [`Coordinate`] are not discriminators, but they bind
+//! the same way. A partition count binds as an `int`, and reads validate the
+//! raw `i32` through `PartitionCount::try_from`. A coordinate binds as its
+//! `blob`, alone or inside an `IN` list, and reads rebuild it from the raw
+//! `Vec<u8>`.
 
 use crate::state::StateType;
 use crate::state::cassandra::cell::CellKind;
 use crate::state::cassandra::cell::Encoding;
 use crate::state::cell_key::Coordinate;
+use crate::state_reader::PartitionCount;
 use scylla::_macro_internal::{CellWriter, ColumnType, WrittenCellProof};
 use scylla::serialize::SerializationError;
 use scylla::serialize::value::SerializeValue;
@@ -69,5 +65,15 @@ impl SerializeValue for Coordinate {
         writer: CellWriter<'b>,
     ) -> Result<WrittenCellProof<'b>, SerializationError> {
         self.as_bytes().serialize(typ, writer)
+    }
+}
+
+impl SerializeValue for PartitionCount {
+    fn serialize<'b>(
+        &self,
+        typ: &ColumnType,
+        writer: CellWriter<'b>,
+    ) -> Result<WrittenCellProof<'b>, SerializationError> {
+        i32::from(*self).serialize(typ, writer)
     }
 }

@@ -27,12 +27,8 @@ use validator::{Validate, ValidationError};
 /// Environment variable name for the Kafka consumer group ID.
 const PROSODY_GROUP_ID: &str = "PROSODY_GROUP_ID";
 
-/// Default statistics reporting interval. See
-/// [`ConsumerConfiguration::statistics_interval`].
-const DEFAULT_STATISTICS_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Longest statistics interval librdkafka accepts.
-const MAX_STATISTICS_INTERVAL: Duration = Duration::from_hours(24);
+/// Longest commit or statistics interval librdkafka accepts.
+const MAX_INTERVAL: Duration = Duration::from_hours(24);
 
 /// Default prefetch of each partition. See
 /// [`ConsumerConfiguration::partition_prefetch`].
@@ -55,6 +51,10 @@ const MIN_FETCH_MAX_BYTES: u64 = 1_000_000;
 /// Largest fetch response limit librdkafka accepts: the response also needs
 /// 512 bytes of framing inside a 32-bit size.
 const MAX_FETCH_MAX_BYTES: u64 = (1 << 31_u32) - 1 - 512;
+
+/// Longest fetch wait. librdkafka warns unless the wait is at least one second
+/// below its socket timeout, which keeps the 60-second default.
+const MAX_FETCH_WAIT: Duration = Duration::from_secs(59);
 
 /// Configuration for the Kafka consumer.
 ///
@@ -136,7 +136,9 @@ pub struct ConsumerConfiguration {
     /// always returns at least one record batch. So the fetched records of a
     /// partition take at most two times this value, plus one batch. This
     /// memory grows with the assigned partitions. A larger value lets a fast
-    /// partition run longer between fetches.
+    /// partition run longer between fetches. See
+    /// [`fetch_wait`](Self::fetch_wait) for how often a full partition fetches
+    /// again.
     ///
     /// Accepts a human-readable byte size such as `1 MiB`. A bare number is
     /// interpreted as bytes. The accepted range is 1 KiB to 1 GB.
@@ -169,6 +171,29 @@ pub struct ConsumerConfiguration {
     )]
     #[validate(range(min = MIN_FETCH_MAX_BYTES, max = MAX_FETCH_MAX_BYTES))]
     pub fetch_max_bytes: ByteSize,
+
+    /// The longest time a broker holds a fetch request that finds no new
+    /// records.
+    ///
+    /// Environment variable: `PROSODY_FETCH_WAIT`
+    /// Default: 500 milliseconds
+    ///
+    /// librdkafka sends one fetch request at a time to each broker. It leaves a
+    /// partition out of the next request when the partition's queue holds its
+    /// [`partition_prefetch`](Self::partition_prefetch). If no other partition
+    /// in that request gets new records, the broker holds the request for this
+    /// wait. Only then can the full partition fetch again. So a partition that
+    /// is behind fetches at least once per wait. A shorter wait shortens this
+    /// delay, but an idle consumer then sends more requests to each broker.
+    ///
+    /// The accepted range is 1 millisecond to 59 seconds.
+    #[builder(
+        default = "from_duration_env_with_fallback(\"PROSODY_FETCH_WAIT\", \
+                   Duration::from_millis(500))?",
+        setter(into)
+    )]
+    #[validate(custom(function = "validate_fetch_wait"))]
+    pub fetch_wait: Duration,
 
     /// Duration of inactivity allowed before considering a partition stalled.
     ///
@@ -221,12 +246,14 @@ pub struct ConsumerConfiguration {
     /// Environment variable: `PROSODY_COMMIT_INTERVAL`
     /// Default: 1 second
     ///
-    /// Controls how frequently offsets are auto-committed to Kafka.
+    /// Controls how frequently offsets are auto-committed to Kafka. The
+    /// accepted range is 1 millisecond to 24 hours.
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_COMMIT_INTERVAL\", \
                    Duration::from_secs(1))?",
         setter(into)
     )]
+    #[validate(custom(function = "validate_interval"))]
     pub commit_interval: Duration,
 
     /// How often the consumer's Kafka client reports librdkafka statistics.
@@ -243,10 +270,10 @@ pub struct ConsumerConfiguration {
     /// accepted range is 1 millisecond to 24 hours.
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_STATISTICS_INTERVAL\", \
-                   DEFAULT_STATISTICS_INTERVAL)?",
+                   Duration::from_secs(5))?",
         setter(into)
     )]
-    #[validate(custom(function = "validate_statistics_interval"))]
+    #[validate(custom(function = "validate_interval"))]
     pub statistics_interval: Duration,
 
     /// Use a mock consumer for testing purposes.
@@ -434,19 +461,27 @@ impl ConsumerConfigurationBuilder {
     }
 }
 
-/// Validates the statistics interval against what librdkafka accepts.
-///
-/// The interval reaches librdkafka in whole milliseconds, where zero means "do
-/// not report". A sub-millisecond duration would truncate to zero and disable
-/// reporting silently, so it is rejected instead.
-fn validate_statistics_interval(interval: &Duration) -> Result<(), ValidationError> {
-    if interval.as_millis() == 0 {
-        return Err(ValidationError::new(
-            "statistics_interval_below_a_millisecond",
-        ));
+/// Validates a commit or statistics interval. A zero interval stops commits or
+/// reports.
+fn validate_interval(interval: &Duration) -> Result<(), ValidationError> {
+    validate_millis(*interval, MAX_INTERVAL)
+}
+
+/// Validates the fetch wait. With a zero wait, an idle consumer sends fetch
+/// requests without a pause.
+fn validate_fetch_wait(wait: &Duration) -> Result<(), ValidationError> {
+    validate_millis(*wait, MAX_FETCH_WAIT)
+}
+
+/// Validates a duration that reaches librdkafka in whole milliseconds. A
+/// sub-millisecond duration truncates to zero, which has a special meaning, so
+/// the check rejects it. The check also rejects a duration above `max`.
+fn validate_millis(duration: Duration, max: Duration) -> Result<(), ValidationError> {
+    if duration.as_millis() == 0 {
+        return Err(ValidationError::new("below_a_millisecond"));
     }
-    if *interval > MAX_STATISTICS_INTERVAL {
-        return Err(ValidationError::new("statistics_interval_above_24_hours"));
+    if duration > max {
+        return Err(ValidationError::new("above_the_maximum"));
     }
     Ok(())
 }
