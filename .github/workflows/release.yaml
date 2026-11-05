@@ -6,8 +6,8 @@ on:
       - main
   workflow_dispatch:
     inputs:
-      release_as:
-        description: 'Force release version (e.g. 1.0.0)'
+      retry_version:
+        description: Publish an existing release tag with this workflow, without running Release Please
         required: false
         type: string
 
@@ -26,18 +26,39 @@ jobs:
     name: Release Please
     runs-on: ubuntu-latest
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
+      release_created: ${{ steps.release_context.outputs.release_created }}
+      ref: ${{ steps.release_context.outputs.ref }}
     steps:
       - uses: actions/checkout@v6
       - name: Release Please Action
+        if: inputs.retry_version == ''
         id: release
         uses: googleapis/release-please-action@v4
         with:
           token: ${{ secrets.GH_PAT }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-          release-as: ${{ github.event.inputs.release_as }}
+
+      - name: Resolve release context
+        id: release_context
+        env:
+          RETRY_VERSION: ${{ inputs.retry_version }}
+          RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
+        run: |
+          if [[ -n "$RETRY_VERSION" ]]; then
+            ref="refs/tags/prosody-v$RETRY_VERSION"
+            if ! git ls-remote --exit-code --tags origin "$ref" >/dev/null; then
+              echo "::error::Release tag $ref does not exist"
+              exit 1
+            fi
+            release_created=true
+          else
+            ref=
+            release_created=${RELEASE_CREATED:-false}
+          fi
+
+          echo "release_created=$release_created" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
   publish:
     name: Publish to crates.io
@@ -45,13 +66,15 @@ jobs:
     env:
       RUSTFLAGS: -C target-cpu=x86-64-v3 -C link-arg=-fuse-ld=mold
     needs: release-please
-    if: ${{ needs.release-please.outputs.release_created }}
+    if: needs.release-please.outputs.release_created == 'true'
     environment: release
     permissions:
       id-token: write
       contents: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-please.outputs.ref }}
       - name: Install mold
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
         with:
