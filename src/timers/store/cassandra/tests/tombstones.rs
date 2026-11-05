@@ -15,19 +15,30 @@ use crate::timers::store::cassandra::state::{PeekedTrigger, TimerState};
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::{TimerType, Trigger};
 use crate::tracing::init_test_logging;
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, bail, eyre};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
+use scylla::client::session::Session;
 use scylla::response::query_result::QueryRowsResult;
 use scylla::serialize::row::SerializeRow;
+use scylla::statement::Consistency;
 use scylla::statement::prepared::PreparedStatement;
 use std::collections::{BTreeSet, HashMap};
+use std::time::Duration;
 use strum::VariantArray;
+use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 /// Tombstone cells that a read may count for each gap between live rows that
 /// it crosses: the markers of the gap's range tombstone, and its boundaries
 /// with the type's last clear.
 const GAP_CELLS: u64 = 4;
+
+/// Hang-guard for Cassandra to write the read summary of a trace. Never the
+/// assertion.
+const SUMMARY_GUARD: Duration = Duration::from_secs(10);
+
+/// The pause between two reads of a trace that has no read summary yet.
+const SUMMARY_POLL: Duration = Duration::from_millis(5);
 
 /// One step of a key's timer history. Times are seconds in a narrow window,
 /// so deletes often hit live timers.
@@ -272,17 +283,40 @@ async fn traced(
         .tracing_id()
         .ok_or_else(|| eyre!("traced read returned no tracing id"))?;
 
-    // The test cluster sets `cassandra.wait_for_tracing_events_timeout_secs`,
-    // so a finished session already holds every event.
-    let info = store.session().get_tracing_info(&id).await?;
-    let tombstones = info
-        .events
-        .iter()
-        .find_map(|event| tombstone_cells(event.activity.as_deref()?))
-        .ok_or_else(|| eyre!("trace {id} has no read summary"))?
-        .parse()?;
-
+    let tombstones = read_summary(store.session(), id).await?;
     Ok((result.into_rows_result()?, tombstones))
+}
+
+/// Returns the tombstone cells of the read summary in trace `id`.
+///
+/// Cassandra replies to a traced request before it writes the trace events.
+/// It sends no signal when an event arrives, so this function reads the events
+/// again until the summary appears.
+async fn read_summary(session: &Session, id: Uuid) -> Result<u64> {
+    let mut events = session
+        .prepare("SELECT activity FROM system_traces.events WHERE session_id = ?")
+        .await?;
+    // `system_traces` keeps two replicas, and the test cluster has one node.
+    // The session's LOCAL_QUORUM needs both replicas, so read at ONE.
+    events.set_consistency(Consistency::One);
+    let deadline = Instant::now() + SUMMARY_GUARD;
+
+    loop {
+        let rows = session
+            .execute_unpaged(&events, (id,))
+            .await?
+            .into_rows_result()?;
+        for row in rows.rows::<(Option<&str>,)>()? {
+            if let Some(cells) = row?.0.and_then(tombstone_cells) {
+                return Ok(cells.parse()?);
+            }
+        }
+
+        if Instant::now() >= deadline {
+            bail!("trace {id} has no read summary after {SUMMARY_GUARD:?}");
+        }
+        sleep(SUMMARY_POLL).await;
+    }
 }
 
 /// Extracts `M` from Cassandra's `Read N live rows and M tombstone cells`
