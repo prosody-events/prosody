@@ -679,6 +679,15 @@ Prosody uses a Makefile to simplify common development tasks. Here are some usef
 
 - `make console`: Open the Kafka console in a web browser.
 
+### Releases
+
+Release Please opens a release PR from the Conventional Commits on `main`. Merge that PR to publish both crates.
+
+- To publish an existing release again, for example after a fix to the release workflow, run the Release workflow
+  from the GitHub Actions tab. Set `retry_version` to the version, such as `0.7.1`. The run builds the
+  `prosody-v<version>` tag with the workflow on `main`, and skips crates that are already on crates.io.
+- To force the next version, put a `Release-As: x.y.z` line in the body of a squash-merge commit.
+
 ## Architecture
 
 Prosody processes Kafka messages with partition-level parallelism while guaranteeing ordered delivery for messages with
