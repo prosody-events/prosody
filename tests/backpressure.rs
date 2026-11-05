@@ -42,8 +42,17 @@ const SEGMENT_BYTES: usize = 1 << 20;
 /// The number of records in partition 1's backlog.
 const BACKLOG: usize = 400;
 
+/// The in-flight permits of the stall test consumer. The test lets two rounds
+/// of permit holders arrive before the `after` record.
+const IN_FLIGHT: usize = 4;
+
 /// The hang-guard for each broker call and each received message.
 const DEADLINE: Duration = Duration::from_secs(60);
+
+/// The fetch wait of the stall test consumer. The `gap` record leaves partition
+/// 0 out of one fetch request. A short wait ends that request quickly, so the
+/// count measures only the segment tail.
+const FETCH_WAIT: Duration = Duration::from_millis(10);
 
 /// Demonstrates backpressure in the message processing system by
 /// simulating a setup where messages are produced at a high rate while the
@@ -142,7 +151,7 @@ async fn test_backpressure() -> Result<()> {
 /// busy. A pause between the two fetches would reset partition 0 to the
 /// marker, and partition 0 would then wait there for many seconds. The
 /// consumer never pauses, so partition 0 gets past the marker and delivers its
-/// next record after a few backlog records.
+/// next record after a few backlog records. See [`IN_FLIGHT`] for the limit.
 #[tokio::test]
 async fn backpressure_moves_a_partition_past_an_empty_segment_tail() -> Result<()> {
     init_test_logging();
@@ -169,7 +178,7 @@ async fn backpressure_moves_a_partition_past_an_empty_segment_tail() -> Result<(
     let backlog = outcome?;
     info!("{backlog} of {BACKLOG} backlog records arrived before the segment tail");
     assert!(
-        backlog < BACKLOG / 8,
+        backlog <= 2 * IN_FLIGHT,
         "partition 0 waited at its empty segment tail ({backlog} of {BACKLOG} backlog records \
          arrived first)"
     );
@@ -189,7 +198,8 @@ async fn backlog_before_segment_tail(topic: &str) -> Result<usize> {
             .group_id(Uuid::new_v4().to_string().as_str())
             .probe_port(None)
             .subscribed_topics(&[topic.to_owned()])
-            .max_uncommitted(4_usize)
+            .max_uncommitted(IN_FLIGHT)
+            .fetch_wait(FETCH_WAIT)
             .build()?,
         &TriggerStoreConfiguration::InMemory,
         KeyedStateConfiguration::builder().build()?,

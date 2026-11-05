@@ -1,57 +1,23 @@
 //! Unit tests for consumer-build configuration cross-checks.
 
-use super::{
-    ConsumerConfiguration, ConsumerConfigurationBuilder, DEFAULT_STATISTICS_INTERVAL,
-    MAX_STATISTICS_INTERVAL, validate_statistics_interval,
-};
+use super::{ConsumerConfiguration, ConsumerConfigurationBuilder};
 use crate::ByteSize;
 use color_eyre::Result;
-use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
 use std::num::NonZeroU64;
 use std::time::Duration;
 use validator::Validate;
+
+/// A builder setter of a millisecond setting.
+type Setter = fn(&mut ConsumerConfigurationBuilder, Duration) -> &mut ConsumerConfigurationBuilder;
 
 /// A reader needs Kafka coordinates, but it does not need a topic subscription.
 ///
 /// Falsify: require one subscribed topic in [`ConsumerConfiguration`].
 #[test]
 fn consumer_configuration_allows_no_topic_subscription() {
-    let mut builder = ConsumerConfiguration::builder();
-    builder
-        .bootstrap_servers(vec!["kafka:9092".to_owned()])
-        .group_id("state-reader");
-
-    let config = builder.build();
+    let config = required().build();
     assert!(matches!(config, Ok(config) if config.subscribed_topics.is_empty()));
-}
-
-/// A statistics interval is accepted exactly when librdkafka can carry it: at
-/// least one whole millisecond, at most 24 hours. Anything shorter truncates to
-/// zero milliseconds, which would silently stop reporting.
-///
-/// Falsify: relax either bound in [`validate_statistics_interval`]. The
-/// sub-millisecond and over-24-hour intervals then pass.
-#[quickcheck]
-fn prop_statistics_interval_accepts_only_what_librdkafka_carries(
-    exponent: u8,
-    offset: u32,
-) -> TestResult {
-    // One nanosecond to roughly 292 years, so both bounds stay reachable from
-    // quickcheck's small integer generator.
-    let nanos = (1_u64 << (exponent % 63)).saturating_add(u64::from(offset));
-    let interval = Duration::from_nanos(nanos);
-    let accepted = validate_statistics_interval(&interval).is_ok();
-    TestResult::from_bool(
-        accepted == (interval.as_millis() >= 1 && interval <= MAX_STATISTICS_INTERVAL),
-    )
-}
-
-/// The default interval survives its own validation, so a consumer that
-/// configures nothing builds.
-#[test]
-fn the_default_statistics_interval_validates() {
-    assert!(validate_statistics_interval(&DEFAULT_STATISTICS_INTERVAL).is_ok());
 }
 
 /// A byte count from one byte to about 2^63, so the boundaries of every
@@ -66,8 +32,25 @@ fn required() -> ConsumerConfigurationBuilder {
     let mut builder = ConsumerConfiguration::builder();
     builder
         .bootstrap_servers(vec!["kafka:9092".to_owned()])
-        .group_id("prefetch");
+        .group_id("configuration");
     builder
+}
+
+/// A duration near one bound of a millisecond setting: zero, one millisecond,
+/// or `max`. It lies zero to about one second below or above that bound, so the
+/// bound itself and its nearest neighbors stay reachable.
+fn near_bound(max: Duration, anchor: u8, below: bool, exponent: u8) -> Duration {
+    let bound = match anchor % 3 {
+        0 => Duration::ZERO,
+        1 => Duration::from_millis(1),
+        _ => max,
+    };
+    let offset = Duration::from_nanos((1 << (exponent % 31)) - 1);
+    if below {
+        bound.saturating_sub(offset)
+    } else {
+        bound + offset
+    }
 }
 
 /// A partition prefetch is accepted exactly when librdkafka can carry it as a
@@ -101,10 +84,40 @@ fn prop_fetch_max_bytes_accepts_only_what_librdkafka_carries(
     Ok(config.validate().is_ok() == carried)
 }
 
-/// The prefetch defaults survive their own validation, so a consumer that
-/// configures nothing builds.
+/// The validator accepts a millisecond setting exactly when librdkafka can
+/// carry it: at least one whole millisecond, and at most the setting's maximum.
+/// A shorter duration truncates to zero milliseconds, which has a special
+/// meaning.
+///
+/// Falsify: move either bound in `validate_millis`, raise a maximum, or drop
+/// the validator of any setting.
+#[quickcheck]
+fn prop_millisecond_settings_accept_only_what_librdkafka_carries(
+    anchor: u8,
+    below: bool,
+    exponent: u8,
+) -> Result<bool> {
+    let (day, wait_max) = (Duration::from_hours(24), Duration::from_secs(59));
+    let settings: [(Setter, Duration); 3] = [
+        (ConsumerConfigurationBuilder::commit_interval, day),
+        (ConsumerConfigurationBuilder::statistics_interval, day),
+        (ConsumerConfigurationBuilder::fetch_wait, wait_max),
+    ];
+    for (set, max) in settings {
+        let value = near_bound(max, anchor, below, exponent);
+        let config = set(&mut required(), value).build()?;
+        let carried = value.as_millis() >= 1 && value <= max;
+        if config.validate().is_ok() != carried {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The defaults survive their own validation, so a consumer that configures
+/// nothing builds.
 #[test]
-fn the_prefetch_defaults_validate() -> Result<()> {
+fn the_defaults_validate() -> Result<()> {
     required().build()?.validate()?;
     Ok(())
 }

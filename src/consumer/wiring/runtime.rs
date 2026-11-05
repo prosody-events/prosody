@@ -31,9 +31,10 @@ use tokio::task::spawn_blocking;
 use validator::Validate;
 use whoami::hostname;
 
-/// How long librdkafka waits to fetch a full partition again. A read of the
-/// partition does not end the wait early, so a partition refills at most once
-/// per wait. A short wait lets a small prefetch keep a fast partition busy.
+/// How long librdkafka postpones the next fetch of a partition whose queue is
+/// full. A read of the partition does not end this delay early, so the value is
+/// short. A fetch request in flight can delay the partition longer. See
+/// [`fetch_wait`](ConsumerConfiguration::fetch_wait).
 const FETCH_QUEUE_BACKOFF: Duration = Duration::from_millis(1);
 
 /// Everything startup needs beyond the consumer configuration and the two
@@ -283,6 +284,10 @@ fn client_config(consumer_config: &ConsumerConfiguration) -> Result<ClientConfig
         .set(
             "fetch.queue.backoff.ms",
             FETCH_QUEUE_BACKOFF.as_millis().to_string(),
+        )
+        .set(
+            "fetch.wait.max.ms",
+            consumer_config.fetch_wait.as_millis().to_string(),
         )
         .set_log_level(RDKafkaLogLevel::Error);
     Ok(config)
