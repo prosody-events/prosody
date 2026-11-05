@@ -4,14 +4,16 @@
 //! reference model to verify correctness.
 //!
 //! Each store instance is scoped to exactly one segment. The operations
-//! (`insert_segment`, `get_segment`, `delete_segment`,
-//! `update_segment_version`) all operate on the store's own segment. This test
-//! verifies that the store correctly persists, retrieves, updates, and deletes
-//! its own segment.
+//! (`insert_segment`, `get_segment`, `delete_segment`, and
+//! `set_slab_watermark`) all operate on the store's own segment. This test
+//! verifies that the store correctly persists, retrieves, and deletes its own
+//! segment and slab watermark.
 
+use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
+use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentVersion};
+use crate::timers::store::{Segment, StoredSegment};
 use quickcheck::{Arbitrary, Gen};
 use std::error::Error;
 use std::fmt::Debug;
@@ -25,13 +27,8 @@ pub enum SegmentOperation {
     Get,
     /// Delete the store's own segment.
     Delete,
-    /// Update the store's own segment version and slab size.
-    UpdateVersion {
-        /// The new version.
-        version: SegmentVersion,
-        /// The new slab size.
-        slab_size: CompactDuration,
-    },
+    /// Set the store's own slab watermark.
+    SetWatermark(SlabId),
 }
 
 /// Test input containing a sequence of single-segment operations.
@@ -48,14 +45,15 @@ pub struct SegmentTestInput {
 
 impl Arbitrary for SegmentTestInput {
     fn arbitrary(g: &mut Gen) -> Self {
-        // Generate a slab size for this test (1 second to 7 days to avoid TTL overflow)
-        let slab_size = CompactDuration::new(u32::arbitrary(g).clamp(1, 604_800));
+        // Draw a slab size from 1 second to 7 days, which avoids TTL overflow.
+        // Do not clamp: a clamp maps most draws to 7 days.
+        let slab_size = CompactDuration::new(u32::arbitrary(g) % 604_800 + 1);
 
         // Generate 10-50 operations
         let op_count = (usize::arbitrary(g) % 40) + 10;
         let mut operations = Vec::with_capacity(op_count);
 
-        // Track whether segment has been inserted for valid UpdateVersion ops
+        // Track whether segment has been inserted for valid SetWatermark ops
         let mut inserted = false;
 
         for _ in 0..op_count {
@@ -69,17 +67,11 @@ impl Arbitrary for SegmentTestInput {
                     inserted = false;
                     SegmentOperation::Delete
                 }
-                _ => {
-                    if inserted {
-                        SegmentOperation::UpdateVersion {
-                            version: SegmentVersion::V4,
-                            slab_size,
-                        }
-                    } else {
-                        // No segment to update — emit a Get instead
-                        SegmentOperation::Get
-                    }
-                }
+                // No segment to hold a watermark: emit a Get instead.
+                _ if !inserted => SegmentOperation::Get,
+                _ => SegmentOperation::SetWatermark(
+                    Slab::from_time(slab_size, CompactDateTime::arbitrary(g)).id(),
+                ),
             };
             operations.push(op);
         }
@@ -93,71 +85,63 @@ impl Arbitrary for SegmentTestInput {
 
 /// Reference model for segment table behavior.
 ///
-/// Tracks whether the store's own segment is currently present and what its
-/// current `version` and `slab_size` are after `update_segment_version` calls.
+/// Tracks whether the store's own segment is present and its slab watermark.
 #[derive(Clone, Debug)]
 pub struct SegmentModel {
     /// The base segment from the store (set once at test start).
     base: Segment,
     /// Whether the segment is currently present in the store.
     present: bool,
-    /// Current version (may be updated by `UpdateVersion`).
-    version: SegmentVersion,
-    /// Current slab size (may be updated by `UpdateVersion`).
-    slab_size: CompactDuration,
+    /// Current slab watermark. An insert keeps it, like a Cassandra insert
+    /// that does not name the column.
+    watermark: Option<SlabId>,
 }
 
 impl SegmentModel {
     /// Creates a new model tracking the given base segment.
     #[must_use]
     pub fn new(base: Segment) -> Self {
-        let version = base.version;
-        let slab_size = base.slab_size;
         Self {
             base,
             present: false,
-            version,
-            slab_size,
+            watermark: None,
         }
     }
 
     /// Applies an operation to the model.
     pub fn apply(&mut self, op: &SegmentOperation) {
         match op {
-            SegmentOperation::Insert => {
-                self.present = true;
-                // insert_segment writes the base segment; reset version/slab_size
-                self.version = self.base.version;
-                self.slab_size = self.base.slab_size;
-            }
+            SegmentOperation::Insert => self.present = true,
             SegmentOperation::Get => {}
             SegmentOperation::Delete => {
                 self.present = false;
+                self.watermark = None;
             }
-            SegmentOperation::UpdateVersion { version, slab_size } => {
-                if self.present {
-                    self.version = *version;
-                    self.slab_size = *slab_size;
-                }
-            }
+            SegmentOperation::SetWatermark(watermark) => self.watermark = Some(*watermark),
         }
     }
 
     /// Returns the expected segment state, if present.
     #[must_use]
     pub fn expected_segment(&self) -> Option<Segment> {
-        self.present.then(|| Segment {
-            id: self.base.id,
-            name: self.base.name.clone(),
-            version: self.version,
-            slab_size: self.slab_size,
-        })
+        self.present.then(|| self.base.clone())
     }
 }
 
-/// Verifies that two segments have identical id, name, `slab_size`, and
-/// version fields.
-fn verify_segment_fields(expected: &Segment, actual: &Segment) -> color_eyre::Result<()> {
+/// Verifies that two segments have identical id, name, `slab_size`, version,
+/// and slab watermark.
+fn verify_segment_fields(
+    expected: &Segment,
+    expected_watermark: Option<SlabId>,
+    actual: StoredSegment,
+) -> color_eyre::Result<()> {
+    let (actual, watermark) = actual.into_parts();
+    if expected_watermark != watermark {
+        return Err(color_eyre::eyre::eyre!(
+            "Watermark mismatch for {}: expected {expected_watermark:?}, got {watermark:?}",
+            expected.id
+        ));
+    }
     if expected.id != actual.id {
         return Err(color_eyre::eyre::eyre!(
             "ID mismatch: expected {:?}, got {:?}",
@@ -199,7 +183,7 @@ fn verify_segment_fields(expected: &Segment, actual: &Segment) -> color_eyre::Re
 /// 1. Start with an empty store (no segment persisted yet)
 /// 2. Apply a sequence of random operations to both the store and the model
 /// 3. After each `Get` operation, verify the store's response matches the model
-/// 4. After all operations, verify final state matches
+/// 4. End with a `Get`, which verifies the final state
 ///
 /// The store is scoped to exactly one segment (`operations.segment()`). All
 /// operations target that segment — there is no multi-segment routing.
@@ -227,16 +211,10 @@ where
     let mut model = SegmentModel::new(operations.segment().clone());
 
     // Apply all operations to both store and model, verifying queries inline
-    let prefix = [
-        SegmentOperation::Insert,
-        SegmentOperation::Get,
-        SegmentOperation::UpdateVersion {
-            version: SegmentVersion::V4,
-            slab_size: input.slab_size,
-        },
-        SegmentOperation::Get,
-    ];
-    for (op_idx, op) in prefix.iter().chain(&input.operations).enumerate() {
+    let prefix = [SegmentOperation::Insert, SegmentOperation::Get];
+    // The trailing `Get` checks the final state.
+    let ops = prefix.iter().chain(&input.operations);
+    for (op_idx, op) in ops.chain([&SegmentOperation::Get]).enumerate() {
         model.apply(op);
         match op {
             SegmentOperation::Insert => {
@@ -254,7 +232,7 @@ where
                 let expected = model.expected_segment();
                 match (expected, actual) {
                     (Some(exp), Some(act)) => {
-                        verify_segment_fields(&exp, &act).map_err(|e| {
+                        verify_segment_fields(&exp, model.watermark, act).map_err(|e| {
                             color_eyre::eyre::eyre!("Op #{op_idx} Get mismatch: {e}")
                         })?;
                     }
@@ -281,36 +259,14 @@ where
                     .await
                     .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} Delete failed: {e:?}"))?;
             }
-            SegmentOperation::UpdateVersion { version, slab_size } => {
+            SegmentOperation::SetWatermark(watermark) => {
                 operations
-                    .update_segment_version(*version, *slab_size)
+                    .set_slab_watermark(Some(*watermark))
                     .await
                     .map_err(|e| {
-                        color_eyre::eyre::eyre!("Op #{op_idx} UpdateVersion failed: {e:?}")
+                        color_eyre::eyre::eyre!("Op #{op_idx} SetWatermark failed: {e:?}")
                     })?;
             }
-        }
-    }
-
-    // Final sanity check: verify model-store equivalence
-    let actual = operations
-        .get_segment()
-        .await
-        .map_err(|e| color_eyre::eyre::eyre!("Final get_segment failed: {e:?}"))?;
-    let expected = model.expected_segment();
-    match (expected, actual) {
-        (Some(exp), Some(act)) => verify_segment_fields(&exp, &act)
-            .map_err(|e| color_eyre::eyre::eyre!("Final state mismatch: {e}"))?,
-        (None, None) => {}
-        (Some(exp), None) => {
-            return Err(color_eyre::eyre::eyre!(
-                "Final state: segment in model but not store (expected: {exp:?})"
-            ));
-        }
-        (None, Some(act)) => {
-            return Err(color_eyre::eyre::eyre!(
-                "Final state: segment in store but not model (actual: {act:?})"
-            ));
         }
     }
 

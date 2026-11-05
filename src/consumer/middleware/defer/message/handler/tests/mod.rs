@@ -3,12 +3,15 @@ pub use crate::consumer::middleware::tests::test_support::{MockEventContext, Tim
 pub use crate::test_util::TEST_RUNTIME;
 
 mod context;
+mod faults;
 mod generator;
 mod handler;
 mod harness;
 mod integration;
 mod loader;
 mod properties;
+mod replay;
+mod store;
 mod types;
 
 pub use loader::{FailableLoader, FailableLoaderError, LoaderFailureType};

@@ -14,17 +14,23 @@ environment variables for unset fields, so you can mix both approaches.
 | `PROSODY_SOURCE_SYSTEM`     | Tag for outgoing messages (prevents reprocessing)  | `<group id>` |          | ✓        |
 | `PROSODY_SUBSYSTEM`         | This consumer's request and published-state subsystem | - | ✓ |          |
 | `PROSODY_MOCK`              | Use in-memory Kafka for testing                    | false        | ✓        | ✓        |
-| `PROSODY_LOG`               | Log level (e.g., `info`, `prosody=debug`)          | info         | ✓        | ✓        |
+| `PROSODY_LOG`               | Log filter (e.g., `debug`, `prosody=debug`)        | `info`       | ✓        | ✓        |
+
+`scylla` and `opentelemetry` log at `warn` by default. Each `PROSODY_LOG` directive replaces
+the default for its target. A bare level below `warn` also applies to `scylla` and
+`opentelemetry`.
 
 ## Consumer
 
 | Environment Variable             | Description                                          | Default                |
 |----------------------------------|------------------------------------------------------|------------------------|
 | `PROSODY_MAX_CONCURRENCY`        | Max messages being processed simultaneously          | 32                     |
-| `PROSODY_MAX_UNCOMMITTED`        | Max queued messages before pausing consumption       | 64                     |
+| `PROSODY_MAX_UNCOMMITTED`        | Max decoded messages in flight across all partitions | 64                     |
+| `PROSODY_PARTITION_PREFETCH`     | Bytes each partition fetches ahead of its handlers; also the fetch size of one partition (1 KiB to 1 GB) | 128 KiB |
+| `PROSODY_FETCH_MAX_BYTES`        | Size limit of one fetch response from one broker (1 MB to 2 GiB less 512 bytes) | 50 MiB |
 | `PROSODY_TIMEOUT`                | Cancel handler if it runs longer than this           | 80% of stall threshold |
 | `PROSODY_COMMIT_INTERVAL`        | How often to save progress to Kafka                  | 1s                     |
-| `PROSODY_POLL_INTERVAL`          | How often to fetch new messages from Kafka           | 100ms                  |
+| `PROSODY_POLL_INTERVAL`          | How often to serve Kafka events and store offsets    | 100ms                  |
 | `PROSODY_SHUTDOWN_TIMEOUT`       | Shutdown budget; handlers complete freely before cancellation fires near the deadline | 30s |
 | `PROSODY_STALL_THRESHOLD`        | Report unhealthy if no progress for this long        | 5m                     |
 | `PROSODY_STATISTICS_INTERVAL`    | How often librdkafka reports client statistics; must be between 1ms and 24h | 5s |
@@ -33,6 +39,14 @@ environment variables for unset fields, so you can mix both approaches.
 | `PROSODY_SLAB_SIZE`              | Timer storage granularity (rarely needs changing)    | 1h                     |
 | `PROSODY_MESSAGE_SPANS`          | Span linking for message execution: `child` (child-of) or `follows_from`         | `child`       |
 | `PROSODY_TIMER_SPANS`            | Span linking for timer execution: `child` (child-of) or `follows_from`           | `follows_from` |
+
+Three settings bound the memory of records that wait for handlers:
+
+- Fetched records take at most two times `PROSODY_PARTITION_PREFETCH` for each assigned partition. A partition can
+  also hold one record batch that is larger.
+- One fetch response takes at most `PROSODY_FETCH_MAX_BYTES`. It stays in memory until its partitions read their
+  records.
+- Decoded messages number at most `PROSODY_MAX_UNCOMMITTED`.
 
 ## Producer
 
@@ -100,8 +114,9 @@ reloads and keyed-state message resolution.
 
 | Environment Variable                 | Description                                        | Default                  |
 |--------------------------------------|----------------------------------------------------|--------------------------|
-| `PROSODY_STATE_CACHE_DIR`            | Disk workspace for the local keyed-state cache. Wiped on restart, so it needs no persistence — but production deployments **must** set it to a mounted path (e.g. a Kubernetes `emptyDir`). | per-process temp dir |
+| `PROSODY_STATE_CACHE_DIR`            | Directory that holds the local keyed-state caches. Each consumer uses a fresh subdirectory and removes it when the consumer drops, so the mount needs no persistence. Production deployments **must** set it to a mounted path (e.g. a Kubernetes `emptyDir`). | `<temp>/prosody/keyed-state` |
 | `PROSODY_STATE_OWNED_CACHE_SIZE`     | Capacity of the owning keyed-state cache. Accepts sizes such as `64 MiB` or `500 MB`. | storage-engine default |
+| `PROSODY_STATE_MEMTABLE_SIZE`        | In-memory write size at which the local keyed-state cache flushes a partition to disk. Each assigned partition can hold this much, so memory use scales with the number of partitions. Accepts sizes such as `16 MiB`. | storage-engine default (64 MiB) |
 | `PROSODY_STATE_READ_CACHE_SIZE` | Capacity of the read-only client's shared read-through cache. Accepts sizes such as `1 MiB`. | `PROSODY_STATE_OWNED_CACHE_SIZE` when set; otherwise 1 MiB |
 | `PROSODY_STATE_READ_CACHE_TTL` | Default read-cache TTL for composed readers: how long a `StateReader` may serve a collection's reads from its cache before re-reading the store. A humantime duration (`5s`, `750ms`); `none` disables the inherited default. A descriptor can replace it with `.read_cache(duration)` or bypass it with `.read_cache(ReadCachePolicy::Disabled)`. Reader-only — never affects the owning consumer's writes or a collection's durable TTL. | 5s |
 

@@ -399,15 +399,14 @@ pub enum MigrationError {
     LockAcquisitionFailed,
 
     /// Failed to execute a statement in a migration.
-    #[error("Failed to execute statement {statement_index} in migration {migration}")]
+    #[error("Failed to execute statement {statement_index} in migration {migration}: {error:#}")]
     StatementExecutionFailed {
         /// The name of the migration file that failed.
         migration: String,
         /// The index of the statement within the migration that failed.
         statement_index: usize,
         /// The underlying database execution error.
-        #[source]
-        source: Box<ExecutionError>,
+        error: Box<ExecutionError>,
     },
 
     /// Migration checksum mismatch - file has been modified after being
@@ -434,16 +433,16 @@ pub enum MigrationError {
     ExecutionError(Box<ExecutionError>),
 
     /// Failed to prepare lock-related database statements.
-    #[error("Failed to prepare lock statements")]
-    LockStatementPreparationFailed(#[source] Box<PrepareError>),
+    #[error("Failed to prepare lock statements: {0:#}")]
+    LockStatementPreparationFailed(Box<PrepareError>),
 
     /// Failed to prepare migration tracking statement.
-    #[error("Failed to prepare migration tracking statement")]
-    MigrationTrackingPreparationFailed(#[source] Box<PrepareError>),
+    #[error("Failed to prepare migration tracking statement: {0:#}")]
+    MigrationTrackingPreparationFailed(Box<PrepareError>),
 
     /// Failed to prepare query for applied migrations.
-    #[error("Failed to prepare applied migrations query")]
-    AppliedMigrationsPreparationFailed(#[source] Box<PrepareError>),
+    #[error("Failed to prepare applied migrations query: {0:#}")]
+    AppliedMigrationsPreparationFailed(Box<PrepareError>),
 
     /// Failed to parse lock acquisition result into rows.
     #[error("Failed to parse lock acquisition result into rows")]

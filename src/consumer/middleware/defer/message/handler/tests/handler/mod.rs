@@ -292,14 +292,14 @@ mod tests {
 
 /// The settlement pins for the message-defer seams, each driven end to end
 /// through the real settle boundary (the blanket `EventHandler` impl, or
-/// retry's for the last-wins pin):
+/// retry's for the re-dispatch pin):
 ///
 /// - a defer swallow (`Ok(Deferred)`) records **no** marker and stages
 ///   **nothing**, so the deferred reload re-runs unfiltered;
 /// - a deferred reload records the **reloaded message's** marker while staging
 ///   under the timer's `EventRef`, and a redelivery of that message filters;
 /// - a reload that fails permanently records the reloaded id;
-/// - a retry re-dispatch that loads a **different** queue head records under
-///   the new head's id (the last-wins override).
+/// - a failed retry timer write keeps the queue head, so the retry re-dispatch
+///   reloads that head and records under its id.
 #[cfg(test)]
 mod settlement_pins;

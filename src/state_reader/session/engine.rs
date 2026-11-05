@@ -21,11 +21,11 @@ use super::{PinnedSource, ReadSession};
 use crate::codec::Codec;
 use crate::state::access::StateAccessError;
 use crate::state::cell::Projection;
-use crate::state::cell_key::{CellKey, Scan, Section};
+use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::collection::{StateSession, sealed};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::registry::{CollectionDef, MAX_KEYSET_LIMIT};
-use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::store::{Answers, ReadBatch};
 use crate::state::{StateName, StateType};
 use crate::state_reader::backend::{CommittedCellSource, ReaderBackend};
 use futures::stream::Stream;
@@ -89,7 +89,7 @@ impl<C: Codec, B: ReaderBackend<C>> sealed::ReadEngine<ReadSession<C, B>> for Re
 
     fn begin_read(
         session: &ReadSession<C, B>,
-    ) -> impl Future<Output = Option<PinnedSource>> + Send {
+    ) -> impl Future<Output = Option<PinnedSource>> + Send + use<'_, C, B> {
         // Admission is not a concept here: the invocation starts from whatever
         // the session already selected and performs no I/O until its first
         // command.
@@ -100,10 +100,10 @@ impl<C: Codec, B: ReaderBackend<C>> sealed::ReadEngine<ReadSession<C, B>> for Re
         inner.clone()
     }
 
-    fn resume<'a>(
+    fn resume<'a, 'b>(
         _session: &'a ReadSession<C, B>,
-        plan: &Self::Plan,
-    ) -> impl Future<Output = Self::ReadInner<'a>> + Send {
+        plan: &'b Self::Plan,
+    ) -> impl Future<Output = Self::ReadInner<'a>> + Send + use<'a, 'b, C, B> {
         ready(plan.clone())
     }
 
@@ -124,7 +124,7 @@ where
         inner: &mut Self::ReadInner<'_>,
         _state_type: StateType,
         _name: &StateName,
-        cell: &CellKey,
+        cell: CellRef<'_>,
     ) -> Result<Option<P::Payload>, StateAccessError> {
         let unselected = inner.is_none();
         let result = session.point_read::<P>(inner, cell).await;
@@ -140,8 +140,8 @@ where
         _state_type: StateType,
         _name: &StateName,
         section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<P::Payload>>, StateAccessError> {
+        batch: &ReadBatch<'_>,
+    ) -> Result<Answers<Option<P::Payload>>, StateAccessError> {
         let unselected = inner.is_none();
         let result = session.batch_read::<P>(inner, section, batch).await;
         if unselected {
@@ -156,7 +156,8 @@ where
         _state_type: StateType,
         _name: &'a StateName,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), StateAccessError>> + Send + use<'a, C, B, P>
+    {
         session.scan_from::<P>(plan.as_ref(), scan)
     }
 }

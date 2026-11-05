@@ -1,15 +1,16 @@
 use super::request::{handle_request, seek_to_first_active_offset, unassign_partition};
 use super::{
     ActiveRequests, BTreeMap, BaseConsumer, BorrowedMessage, Codec, Handle, HashMap, Heartbeat,
-    KafkaError, KafkaLoaderError, LoaderConfiguration, Message, Offset, Partition, RecordMeta,
-    Request, Responses, Span, SpanRelation, TextMapCompositePropagator, Timeout, Topic,
+    KafkaError, KafkaLoaderError, LoaderConfiguration, LogContext, Message, Offset, Partition,
+    RecordMeta, Request, Responses, Span, SpanRelation, TextMapCompositePropagator, Timeout, Topic,
     TryRecvError, debug, decode_record, error, mpsc, new_propagator, related_span, select, warn,
 };
+use crate::kafka_log::log_error;
 use crate::subsystem::SubsystemName;
 
 pub(super) fn poll_loop<C: Codec>(
     mut rx: mpsc::Receiver<Request<C::Payload>>,
-    consumer: &BaseConsumer,
+    consumer: &BaseConsumer<LogContext>,
     config: &LoaderConfiguration,
     heartbeat: &Heartbeat,
 ) where
@@ -106,7 +107,7 @@ fn process_poll_result<C: Codec>(
     propagator: &TextMapCompositePropagator,
     codec: &mut C,
     active: &mut ActiveRequests<C::Payload>,
-    consumer: &BaseConsumer,
+    consumer: &BaseConsumer<LogContext>,
     responder: Option<&SubsystemName>,
 ) where
     C::Payload: Clone,
@@ -114,7 +115,7 @@ fn process_poll_result<C: Codec>(
     let mut message = match result {
         Ok(message) => message,
         Err(error) => {
-            error!(error = %format_args!("{error:#}"), "Error polling for message");
+            log_error(&error, "message loader poll failed");
             return;
         }
     };
@@ -251,7 +252,7 @@ fn fulfill_requests<C: Codec>(
 /// Cleans up partition entry and unassigns if no more requests remain.
 fn cleanup_if_empty<P>(
     active: &mut ActiveRequests<P>,
-    consumer: &BaseConsumer,
+    consumer: &BaseConsumer<LogContext>,
     topic: Topic,
     partition: Partition,
 ) {

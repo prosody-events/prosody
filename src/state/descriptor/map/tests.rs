@@ -1,9 +1,7 @@
-//! Map section-freeze and frozen-byte goldens.
+//! Frozen map section identifiers and cell addresses.
 //!
-//! The behavioral invariants (key ordering, current-membership keyset, clear,
-//! crash atomicity) are proven by the memory-backed `run_map_trace` property
-//! in [`crate::state::tests`]. These pin the durable wire contracts: the
-//! section discriminants and the `Meta` cell addresses.
+//! [`crate::state::tests::models::prop_map_query_matches_model`] checks map
+//! behavior. These tests check the durable byte format.
 
 use super::*;
 use bytes::BytesMut;

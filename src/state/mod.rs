@@ -12,7 +12,7 @@
 //! * [`identity`] — collection identity ([`CollectionId`], [`CollectionRef`],
 //!   [`StateKey`], [`CollectionKindId`], …).
 //! * [`cell_key`] — intra-collection cell addressing ([`CellKey`], [`Section`],
-//!   [`Coordinate`], [`Scan`], [`ScanEdge`]).
+//!   [`Coordinate`], [`Scan`]).
 //! * [`event_ref`] — event identity and verdicts ([`EventRef`],
 //!   [`CommitDecision`], [`StoreOutcome`], …).
 //! * [`cell`] — the provisional-cell durability model ([`Cell`], [`Committed`],
@@ -62,8 +62,8 @@
 //! a scan. An overflowed map or set uses a full-section scan.
 //! That scan can encounter tombstones until compaction removes them.
 //!
-//! A [`descriptor::deque`] scan uses [`ScanEdge`] bounds from its live window.
-//! Its range contracts as those bounds expire.
+//! A [`descriptor::deque`] scan uses [`std::ops::Bound`] bounds from its live
+//! window. Its range contracts as those bounds expire.
 //!
 //! **Cross-assignment clock skew is a standard Cassandra assumption, not a new
 //! hazard.** Last-write-wins ordering *across* assignments — a new assignee's
@@ -89,7 +89,9 @@ pub mod config;
 pub mod descriptor;
 pub mod descriptor_identity;
 pub(crate) mod dirty;
+pub mod erased;
 pub mod event_ref;
+pub(crate) mod fanout;
 pub(crate) mod fjall;
 pub mod identity;
 pub mod manager;
@@ -100,29 +102,33 @@ pub(crate) mod overlay;
 pub(crate) mod production;
 pub mod publication;
 pub(crate) mod publisher;
+pub(crate) mod query;
 pub mod registry;
 pub mod resolve;
 pub(crate) mod retry;
 pub mod session;
 pub(crate) mod store;
-mod store_helpers;
-mod store_types;
 
 #[cfg(test)]
 pub(crate) mod tests;
 
 pub use access::StateAccessError;
-pub use cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
+pub use cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 pub use collection::{Collection, StateSession, WritableStateSession};
 pub use event_ref::{CommitDecision, EventRef, StoreOutcome, TimerEventRef};
 pub use identity::{
     CollectionId, CollectionKindId, CollectionRef, StateKey, StateName, StateNameError, StateType,
 };
 pub use order_codec::{
-    I64KeyCodec, KeyCodecError, OrderedKeyCodec, U64KeyCodec, UnitKey, Utf8KeyCodec,
-    order_preserving_i64, order_preserving_i64_decode,
+    I64KeyCodec, KeyCodecError, OrderedKeyCodec, PrefixKeyCodec, U64KeyCodec, UnitKey,
+    Utf8KeyCodec, order_preserving_i64, order_preserving_i64_decode,
+};
+pub use query::{
+    BorrowedKeyQuery, DequeQuery, DequeRead, ErasedKeyQuery, KeyQuery, KeyRead, ReadQuery,
+    ReadSource,
 };
 pub use registry::{CommitMode, ReadCachePolicy, StateVisibility};
+pub use store::CellBuffer;
 
 // The backend cluster is crate-internal (module-capped in [`backend`]); these
 // re-exports keep every in-crate `crate::state::X` import resolving without
@@ -146,16 +152,11 @@ pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
 /// pressure. Add configuration only if deployments require different bounds.
 pub(crate) const SHARD_FANOUT_CONCURRENCY: usize = 8;
 
-/// Maximum concurrent typed resolves within an aligned batch read or a range
-/// scan's resolution window. This bounds the loader fan-out for each read.
-/// A resolve reads the collection's source, such as a Kafka message.
-/// It does not contend on the collection's Scylla shard.
-/// [`SHARD_FANOUT_CONCURRENCY`] bounds overlapping round trips to that shard.
-/// A batch's resolves fan out across the WHOLE call under this window, so the
-/// resolves overlap rather than serialize per store sub-batch.
-///
-/// Currently matches [`store::CELL_BATCH`] so a full store batch resolves in
-/// one wave; the two bounds remain independently tunable.
+/// Maximum concurrent resolves within one batch read or range scan, for a
+/// cell type that drives them through [`fanout::Concurrent`]. A resolve reads
+/// the collection's source, such as a Kafka message, not its Scylla shard.
+/// [`SHARD_FANOUT_CONCURRENCY`] bounds round trips to that shard. It matches
+/// [`store::CELL_BATCH`], so a full store batch resolves in one wave.
 pub(crate) const RESOLVE_FANOUT: usize = 128;
 
 /// Inline capacity for keyed-state buffers whose cardinality is commonly small.

@@ -48,7 +48,7 @@ pub enum StateVisibility {
     ///
     /// To retire a published collection, set `.published(false)` but keep both
     /// its registration and the consumer's `subsystem` for one stop-then-start
-    /// deploy. Startup reconciliation only sweeps the routing rows of names
+    /// deploy. The publication owner only withdraws the routing rows of names
     /// that are still registered, now `Private`, and have a configured
     /// subsystem. Deleting the registration or dropping the `subsystem` config
     /// strands the `(subsystem, name)` routing row. With `TTL = None` that

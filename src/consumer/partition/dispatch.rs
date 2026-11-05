@@ -3,8 +3,7 @@ use std::panic::{AssertUnwindSafe, resume_unwind};
 
 use aho_corasick::{AhoCorasick, Anchored, Input};
 use async_stream::stream;
-use futures::{FutureExt, Stream};
-use tokio::sync::mpsc::Receiver;
+use futures::{FutureExt, Stream, StreamExt, pin_mut};
 use tokio::sync::watch;
 use tracing::{Instrument, debug, debug_span, error, info_span};
 
@@ -149,7 +148,7 @@ async fn process_timer<T, S, M, P>(
     P: Send + Sync + 'static,
 {
     if admission == Admission::Abandoned && timer.timer_type() != TimerType::StateRecovery {
-        timer.abandon().await;
+        timer.abandon();
         return;
     }
     let Some(firing) = timer.fire().await else {
@@ -230,7 +229,8 @@ where
     }
 }
 
-/// Builds a message processing stream with filtering.
+/// Builds a message processing stream with filtering over `records`, which
+/// yields the partition's records in offset order.
 ///
 /// Creates a stream that:
 /// - Filters out duplicate messages based on offsets
@@ -240,19 +240,21 @@ where
 ///
 /// Yields [`UncommittedEvent`] items (each wrapping an [`UncommittedMessage`]
 /// or a timer) ready for processing.
-pub(super) fn build_message_stream<T, P>(
-    offsets: &OffsetTracker,
-    mut message_rx: Receiver<ConsumerRecord<P>>,
-    group_id: &str,
-    highest_offset_seen: &mut i64,
-    allowed_events: Option<&AhoCorasick>,
-) -> impl Stream<Item = UncommittedEvent<T, P>>
+pub(super) fn build_message_stream<'a, T, P, Q>(
+    offsets: &'a OffsetTracker,
+    records: Q,
+    group_id: &'a str,
+    highest_offset_seen: &'a mut i64,
+    allowed_events: Option<&'a AhoCorasick>,
+) -> impl Stream<Item = UncommittedEvent<T, P>> + use<'a, T, P, Q>
 where
     T: TriggerStore,
     P: Send + Sync + 'static + EventType,
+    Q: Stream<Item = ConsumerRecord<P>> + 'a,
 {
     stream! {
-        while let Some(record) = message_rx.recv().await {
+        pin_mut!(records);
+        while let Some(record) = records.next().await {
             // Apply filter_rewind - skip messages with offsets we've already processed
             if !filter_rewind(highest_offset_seen, &record).await {
                 continue;
@@ -334,8 +336,8 @@ async fn filter_loops<P: Send + Sync + 'static>(
     group_id: &str,
     message: UncommittedMessage<P>,
 ) -> Option<UncommittedMessage<P>> {
-    // Check if the message comes from the same source system as our own consumer
-    // group
+    // Check if the message comes from the same source system as our own
+    // consumer group
     if message
         .source_system()
         .is_some_and(|source_system| source_system.as_str() == group_id)

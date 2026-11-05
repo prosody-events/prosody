@@ -6,20 +6,26 @@
 
 use super::operation::read_coordinates;
 use super::{StateSession, resolve_cell, sealed};
+use crate::state::StateAccessError;
 use crate::state::cell::{Presence, Projection, Values};
-use crate::state::cell_key::{Coordinate, Direction, Scan, ScanEdge, Section};
+use crate::state::cell_key::{Coordinate, Direction, Scan, Section};
 use crate::state::descriptor::{
-    CellCodecError, CellStateError, CellType, ContextOf, FromSession, KeyOf, ResolvedOf,
+    CellCodecError, CellStateError, CellType, ContextOf, FanoutOf, FromSession, KeyOf, ResolvedOf,
 };
+use crate::state::fanout::{Fanout, Sequential};
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::store::{CELL_BATCH, CellBuffer, FetchSchedule};
 use crate::state::{RESOLVE_FANOUT, StateName, StateType};
 use async_stream::try_stream;
 use futures::future::Either;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use pin_project::pin_project;
 use std::future::{Future, ready};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
+use std::ops::Bound;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::task::coop::cooperative;
 
 /// The typed output of a projected collection stream.
@@ -27,11 +33,16 @@ use tokio::task::coop::cooperative;
 pub(crate) trait StreamProjection<S: StateSession, T: CellType>: Projection {
     type Item: Send;
 
+    /// How the stream runs [`Self::finish`] for each cell.
+    type Fanout: Fanout;
+
     fn finish(
         session: &S,
         key: KeyOf<T>,
         payload: Self::Payload,
-    ) -> impl Future<Output = Result<Self::Item, CellStateError<CellCodecError<T>>>> + Send;
+    ) -> impl Future<Output = Result<Self::Item, CellStateError<CellCodecError<T>>>>
+    + Send
+    + use<'_, Self, S, T>;
 }
 
 impl<S, T> StreamProjection<S, T> for Values
@@ -40,6 +51,7 @@ where
     T: CellType,
     for<'s> ContextOf<'s, T>: FromSession<'s, S>,
 {
+    type Fanout = FanoutOf<T>;
     type Item = (KeyOf<T>, ResolvedOf<T>);
 
     async fn finish(
@@ -52,13 +64,15 @@ where
 }
 
 impl<S: StateSession, T: CellType> StreamProjection<S, T> for Presence {
+    type Fanout = Sequential;
     type Item = KeyOf<T>;
 
     fn finish(
         _session: &S,
         key: KeyOf<T>,
         (): Self::Payload,
-    ) -> impl Future<Output = Result<Self::Item, CellStateError<CellCodecError<T>>>> + Send {
+    ) -> impl Future<Output = Result<Self::Item, CellStateError<CellCodecError<T>>>> + Send + use<'_, S, T>
+    {
         ready(Ok(key))
     }
 }
@@ -104,12 +118,12 @@ impl<S: StateSession> PlanBase<S> {
 /// A stream source contains either ordered coordinates or direction-relative
 /// range bounds. The collection selects it from stored metadata before
 /// execution starts.
-enum Source {
+enum Source<B> {
     Points(Vec<Coordinate>),
     Range {
-        start: ScanEdge<Coordinate>,
+        start: Bound<B>,
         dir: Direction,
-        end: ScanEdge<Coordinate>,
+        end: Bound<B>,
     },
 }
 
@@ -118,15 +132,26 @@ enum Source {
 /// Each terminal applies the limit after absent cells have been removed.
 /// The final attempt fence covers every completion, including exhaustion.
 /// Source drivers cannot emit directly to the caller.
-pub(crate) struct Plan<S: StateSession, T: CellType> {
+pub(crate) struct Plan<S: StateSession, T: CellType, B> {
     base: PlanBase<S>,
-    source: Source,
+    source: Source<B>,
     limit: Option<NonZeroUsize>,
     /// The cell type the plan projects. The source holds only coordinates.
     cell: PhantomData<fn() -> T>,
 }
 
-impl<S: StateSession, T: CellType> Plan<S, T> {
+/// Checks the attempt fence before each result, including errors and
+/// exhaustion. A failure or exhaustion ends the stream. No work follows the
+/// fence before emission.
+#[pin_project]
+struct Fenced<S, I> {
+    session: S,
+    #[pin]
+    inner: I,
+    ended: bool,
+}
+
+impl<S: StateSession, T: CellType, B: AsRef<[u8]> + Send> Plan<S, T, B> {
     /// Captures coordinates in their required output order. An empty list
     /// performs no read.
     pub(super) fn coordinates(base: PlanBase<S>, coordinates: Vec<Coordinate>) -> Self {
@@ -139,12 +164,7 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
     }
 
     /// Captures one range within the collection section.
-    pub(super) fn range(
-        base: PlanBase<S>,
-        start: ScanEdge<Coordinate>,
-        dir: Direction,
-        end: ScanEdge<Coordinate>,
-    ) -> Self {
+    pub(super) fn range(base: PlanBase<S>, start: Bound<B>, dir: Direction, end: Bound<B>) -> Self {
         Self {
             base,
             source: Source::Range { start, dir, end },
@@ -162,7 +182,9 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
 
     /// Selects one concrete driver, then applies the shared limit and attempt
     /// fence.
-    pub(crate) fn projected<P>(self) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
+    pub(crate) fn projected<P>(
+        self,
+    ) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send + use<S, T, B, P>
     where
         P: StreamProjection<S, T>,
         S::Engine: sealed::Reads<S, P>,
@@ -179,13 +201,14 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
                 Either::Left(coordinate_source::<S, T, P>(base, coordinates, limit))
             }
             Source::Range { start, dir, end } => {
-                Either::Right(range_source::<S, T, P>(base, start, dir, end, limit))
+                Either::Right(range_source::<S, T, P, B>(base, start, dir, end, limit))
             }
         };
-        fenced::<S, _, T>(
+        Fenced {
             session,
-            inner.take(limit.map_or(usize::MAX, NonZeroUsize::get)),
-        )
+            inner: inner.take(limit.map_or(usize::MAX, NonZeroUsize::get)),
+            ended: false,
+        }
     }
 }
 
@@ -198,7 +221,7 @@ fn coordinate_source<S, T, P>(
     base: PlanBase<S>,
     coordinates: Vec<Coordinate>,
     limit: Option<NonZeroUsize>,
-) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
+) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send + use<S, T, P>
 where
     S: StateSession,
     T: CellType,
@@ -221,16 +244,16 @@ where
                     base.state_type,
                     &base.name,
                     base.section,
-                    chunk.iter().cloned(),
+                    &chunk,
                 ).await.map_err(CellStateError::Access)?
             };
 
             let session = &base.session;
             let buffer = CellBuffer::with_capacity(chunk.len());
             // `cooperative` is the only per-item budget checkpoint here. Tokio's `rt`
-            // feature is off, so `consume_budget` is uncallable. For `Presence` the
-            // wrapped future is a no-op; keep the wrapper. Do not re-litigate the window.
-            let items = stream::iter(chunk.into_iter().zip(slots))
+            // feature is off, so `consume_budget` is uncallable. Keep the wrapper
+            // when the projection finishes on its first poll.
+            let futures = stream::iter(chunk.into_iter().zip(slots))
                 .map(|(coordinate, slot)| cooperative(async move {
                     match slot {
                         Some(payload) => project::<S, T, P>(session, &coordinate, payload)
@@ -238,8 +261,8 @@ where
                             .map(Some),
                         None => Ok(None),
                     }
-                }))
-                .buffered(RESOLVE_FANOUT)
+                }));
+            let items = <P::Fanout as Fanout>::drive(futures, RESOLVE_FANOUT)
                 .try_fold(buffer, |mut items, item| {
                     if let Some(item) = item {
                         items.push(item);
@@ -254,27 +277,27 @@ where
 }
 
 /// Scans without admission and projects cells through an ordered window.
-fn range_source<S, T, P>(
+fn range_source<S, T, P, B>(
     base: PlanBase<S>,
-    start: ScanEdge<Coordinate>,
+    start: Bound<B>,
     dir: Direction,
-    end: ScanEdge<Coordinate>,
+    end: Bound<B>,
     limit: Option<NonZeroUsize>,
-) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send
+) -> impl Stream<Item = ProjectedItem<S, T, P>> + Send + use<S, T, P, B>
 where
     S: StateSession,
+    B: AsRef<[u8]> + Send,
     T: CellType,
     P: StreamProjection<S, T>,
     S::Engine: sealed::Reads<S, P>,
 {
     try_stream! {
         <S::Engine as sealed::ReadEngine<S>>::fence(&base.session)?;
-        let window = limit.map_or(RESOLVE_FANOUT, |n| n.get().min(RESOLVE_FANOUT));
         let scan = Scan {
             section: base.section,
-            start: start.as_ref(),
+            start: start.as_ref().map(AsRef::as_ref),
             dir,
-            end: end.as_ref(),
+            end: end.as_ref().map(AsRef::as_ref),
             fetch_hint: P::demand(limit),
         };
         // Every backend page yields present cells only, so the limit ends paging
@@ -284,15 +307,15 @@ where
         )
         .take(limit.map_or(usize::MAX, NonZeroUsize::get));
         let session = &base.session;
-        let inner = page
-            .map(|item| cooperative(async move {
-                let (cell, payload) = item?;
-                project::<S, T, P>(session, &cell.coordinate, payload).await
-            }))
-            // Resolvers read the loader, so use RESOLVE_FANOUT, not shard fanout.
-            // The limit bounds concurrent resolutions. Without a limit, early
-            // cancellation can leave one window of resolutions already started.
-            .buffered(window);
+        let futures = page.map(|item| cooperative(async move {
+            let (cell, payload) = item?;
+            project::<S, T, P>(session, &cell.coordinate, payload).await
+        }));
+        // A concurrent fanout overlaps at most RESOLVE_FANOUT resolutions, fewer
+        // under a limit. Without a limit, early cancellation can leave one
+        // window of resolutions already started.
+        let window = limit.map_or(RESOLVE_FANOUT, |n| n.get().min(RESOLVE_FANOUT));
+        let inner = <P::Fanout as Fanout>::drive(futures, window);
         futures::pin_mut!(inner);
         while let Some(item) = inner.next().await {
             yield item?;
@@ -316,32 +339,27 @@ where
     P::finish(session, key, payload).await
 }
 
-/// Checks the attempt fence after every source completion, before emission.
-/// This includes errors and exhaustion, so stale empty streams also fail.
-///
-/// No await or buffer can follow the check before emission. The check orders
-/// each completion against a concurrent attempt reset. Source buffers stay
-/// below this adapter, and collection adapters perform only synchronous work.
-fn fenced<S, X, T>(
-    session: S,
-    inner: impl Stream<Item = Result<X, CellStateError<CellCodecError<T>>>> + Send,
-) -> impl Stream<Item = Result<X, CellStateError<CellCodecError<T>>>> + Send
+impl<S, I, X, E> Stream for Fenced<S, I>
 where
     S: StateSession,
-    X: Send,
-    T: CellType,
+    I: Stream<Item = Result<X, E>>,
+    E: From<StateAccessError>,
 {
-    // Box the concrete source once to bound the enclosing future's stack size.
-    // This allocation occurs at construction, never per item.
-    let mut inner = Box::pin(inner);
-    try_stream! {
-        loop {
-            let item = inner.next().await;
-            <S::Engine as sealed::ReadEngine<S>>::fence(&session)?;
-            match item {
-                Some(item) => yield item?,
-                None => break,
-            }
+    type Item = Result<X, E>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        if *this.ended {
+            return Poll::Ready(None);
         }
+        let Poll::Ready(item) = this.inner.poll_next(cx) else {
+            return Poll::Pending;
+        };
+        if let Err(error) = <S::Engine as sealed::ReadEngine<S>>::fence(this.session) {
+            *this.ended = true;
+            return Poll::Ready(Some(Err(error.into())));
+        }
+        *this.ended = !matches!(item, Some(Ok(_)));
+        Poll::Ready(item)
     }
 }

@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::JsonCodec;
-use crate::consumer::observer::tests::support::{observing, unobserved};
 use crate::error::ErrorCategory;
 use crate::state::descriptor::value_state;
 use crate::state::registry::{CollectionDef, StateVisibility};
@@ -48,17 +47,22 @@ fn topics() -> Result<PublicationTopics> {
         .ok_or_else(|| eyre!("publication topics must not be empty"))
 }
 
-fn owner<N: PartitionCountSource>(
-    store: ScriptedPublicationStore,
-    counts: N,
-) -> Result<PublicationOwner<ScriptedPublicationStore, N>> {
+/// The broker's partition count for each fixture topic.
+fn count_for(topic: &str) -> Result<PartitionCount> {
+    let count = match topic {
+        LEADER => 3_i32,
+        SECOND => 7_i32,
+        _ => return Err(eyre!("no partition count for {topic}")),
+    };
+    Ok(PartitionCount::try_from(count)?)
+}
+
+fn owner(store: ScriptedPublicationStore) -> Result<PublicationOwner<ScriptedPublicationStore>> {
     Ok(PublicationOwner::new(
         subsystem()?,
-        Arc::from(GROUP),
         store,
-        counts,
         registry()?,
-        topics()?,
+        topics()?.route(&Arc::from(GROUP), count_for)?,
     ))
 }
 
@@ -74,10 +78,7 @@ fn row(group: &str, topic: &str, count: i32) -> Result<StatePublication> {
 #[tokio::test]
 async fn only_leader_partition_zero_publishes() -> Result<()> {
     let store = ScriptedPublicationStore::new();
-    let owner = owner(
-        store.clone(),
-        observing(GROUP, &[(LEADER, 3_i32), (SECOND, 7_i32)]),
-    )?;
+    let owner = owner(store.clone())?;
 
     for (topic, partition) in [(LEADER, 1_i32), (SECOND, 0_i32), (SECOND, 4_i32)] {
         owner
@@ -117,12 +118,9 @@ async fn owner_replaces_the_complete_routing_set() -> Result<()> {
             .await;
     }
 
-    owner(
-        store.clone(),
-        observing(GROUP, &[(LEADER, 3_i32), (SECOND, 7_i32)]),
-    )?
-    .publish_if_owner(Topic::from(LEADER), 0)
-    .await?;
+    owner(store.clone())?
+        .publish_if_owner(Topic::from(LEADER), 0)
+        .await?;
 
     let mut cart = store
         .rows(&subsystem, StateType::Application, &name("cart")?)
@@ -145,33 +143,13 @@ async fn owner_replaces_the_complete_routing_set() -> Result<()> {
     Ok(())
 }
 
-/// A missing topic count prevents any routing-store mutation.
-#[tokio::test]
-async fn missing_metadata_blocks_replacement() -> Result<()> {
-    for counts in [unobserved(GROUP), observing(GROUP, &[(LEADER, 3_i32)])] {
-        let store = ScriptedPublicationStore::new();
-        let failure = owner(store.clone(), counts)?
-            .publish_if_owner(Topic::from(LEADER), 0)
-            .await
-            .err()
-            .ok_or_else(|| eyre!("missing metadata must fail publication"))?;
-
-        assert_eq!(failure.classify_error(), ErrorCategory::Transient);
-        assert!(
-            store.calls().is_empty(),
-            "the owner must resolve every topic count before it mutates rows"
-        );
-    }
-    Ok(())
-}
-
 /// A routing-store failure keeps its category for the acquisition retry loop.
 #[tokio::test]
 async fn store_failure_preserves_its_category() -> Result<()> {
     let store = ScriptedPublicationStore::new();
     store.fail_removes_with(ErrorCategory::Terminal);
 
-    let failure = owner(store, observing(GROUP, &[(LEADER, 3_i32), (SECOND, 7_i32)]))?
+    let failure = owner(store)?
         .publish_if_owner(Topic::from(LEADER), 0)
         .await
         .err()

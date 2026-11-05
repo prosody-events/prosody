@@ -3,7 +3,7 @@
 use super::metrics::{DropReason, Stage};
 use crate::codec::Codec;
 use crate::error::ClassifyError;
-use crate::otel::context_with_parent;
+use crate::otel::{context_with_parent, mark_failed};
 use crate::peer::metrics::PeerMetrics;
 use crate::peer::response::ResponseDisposition;
 use crate::peer::response::frame::FrameHeader;
@@ -100,7 +100,7 @@ pub(crate) async fn deliver_response<R: ResponseRoute + PeerMetricSource>(
             if reason != DropReason::SendFailed {
                 span.record(ERROR_TYPE, reason.label());
             }
-            span.in_scope(|| error!(error = %reason.label()));
+            mark_failed(&span, reason.label());
             reason.record(router.peer_metrics());
         }
     }
@@ -276,8 +276,13 @@ where
             Stage::Framed.record(router.peer_metrics());
             PreparedResponse::Ready(staged)
         }
+        // A codec fault never clears by retry, and the response is lost.
         Err(error) => {
-            warn!(%error, peer = %header.target, "response could not be framed");
+            error!(
+                peer = %header.target,
+                "Prosody cannot encode a response for another process: {error:#}. Prosody \
+                 drops the response."
+            );
             PreparedResponse::Rejected(header, DropReason::EncodeFailed)
         }
     }

@@ -12,11 +12,10 @@
 //! corruption or name-resolution bug. Cursor laziness, the null-write
 //! rejection, the never-`Terminal` fold, and the unregistered-name
 //! classification are pinned alongside; duplicate-name is a registry-level pin
-//! in `state/descriptor/tests.rs`.
+//! in `state/descriptor/tests/mod.rs`.
 
 use super::{
-    BoxDequeState, BoxMapState, DequeScanConfig, DynEventContext, ErasedCategory, ErasedStateError,
-    EventContext, KeyScanConfig, StateCursor,
+    BoxDequeState, BoxMapState, DynEventContext, ErasedCategory, ErasedStateError, EventContext,
 };
 use crate::codec::{BinaryPayload, ErasedStateCodec, JsonCodec};
 use crate::consumer::kafka_state::{message_deque_state, message_map_state, message_state};
@@ -25,7 +24,6 @@ use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
-use crate::state::cell_key::Direction;
 use crate::state::descriptor::tests::{TestBackend, test_session, test_session_for};
 use crate::state::descriptor::{
     Registered, StateDescriptor, deque_state, map_state, set_state, value_state,
@@ -48,7 +46,6 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::iter::once;
 use std::num::NonZeroUsize;
-use std::ops::Bound;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::watch;
@@ -64,6 +61,13 @@ const DEQUE_NAME: &str = "d";
 
 /// A small key pool for map traces, so keys collide and re-use.
 const KEYS: &[&str] = &["a", "b", "c"];
+
+/// Picks a pooled key, or the empty prefix, for a scan prefix.
+fn pooled_prefix(index: u8) -> &'static str {
+    KEYS.get(usize::from(index) % (KEYS.len() + 1))
+        .copied()
+        .unwrap_or("")
+}
 
 /// Cap on generated trace length, keeping property runs bounded.
 const MAX_OPS: usize = 30;
@@ -151,17 +155,6 @@ where
     )?;
     let session = test_session_for(MemoryLoader::<P>::new(), registry);
     Ok(MockEventContext::<P>::new().with_session(session))
-}
-
-/// Drains a scan cursor fully into a `Vec`, surfacing any scan error. Shared by
-/// the map and deque parity runners, whose scan checks differ only in how they
-/// compare the drained entries against the model.
-async fn drain_cursor<T>(cursor: &StateCursor<T>) -> Result<Vec<T>> {
-    let mut items = Vec::new();
-    while let Some(item) = cursor.next().await.map_err(|e| eyre!("scan: {e}"))? {
-        items.push(item);
-    }
-    Ok(items)
 }
 
 /// Compares two optional payloads observationally.
@@ -351,3 +344,9 @@ mod deque_parity;
 mod map_parity;
 mod seams;
 mod set_parity;
+
+use crate::state::{DequeQuery, ErasedKeyQuery};
+
+use crate::state::tests::support::drain_cursor;
+
+mod queries;

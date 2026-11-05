@@ -4,16 +4,15 @@ use super::{
     Event, EventLog, RecordingBackend, RecordingDirectory, consumer_config, peer_config,
     retain_manager, start,
 };
-use crate::consumer::Managers;
 use crate::consumer::decode::IgnoreRequests;
 use crate::consumer::error::{ConsumerError, PeerInitError};
+use crate::consumer::{ConsumerConfiguration, Managers};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::peer::Router;
 use crate::peer::runtime::prepare_router;
 use color_eyre::Result;
-use color_eyre::eyre::{ensure, eyre};
+use color_eyre::eyre::{bail, ensure, eyre};
 use parking_lot::Mutex;
-use serde_json::Value;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
 
@@ -23,7 +22,7 @@ use std::sync::Arc;
 async fn a_consumer_without_responses_starts_and_stops() -> Result<()> {
     let log: EventLog = Arc::new(Mutex::new(Vec::new()));
     let config = consumer_config("peer-lifecycle-none")?;
-    let managers: Arc<Managers<Value>> = Arc::default();
+    let managers: Arc<Managers> = Arc::default();
     let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
     let consumer = start(
         &config,
@@ -43,11 +42,13 @@ async fn a_consumer_without_responses_starts_and_stops() -> Result<()> {
     Ok(())
 }
 
-/// The router outlives the handlers. Consumer drop joins the poll loop and
-/// sweeps the partition manager before router shutdown deregisters the peer.
+/// The router outlives the handlers. Consumer drop joins the poll loop, which
+/// sweeps the partition manager and then drops the client with its provider.
+/// Router shutdown deregisters the peer after that.
 ///
-/// The sweep is what bounds the peer teardown, so its position between the two
-/// is asserted rather than its occurrence.
+/// Partition queues hold the client, so the sweep must come before the client
+/// drop. The sweep also bounds the peer teardown. So the test asserts the
+/// position of each event, not only its occurrence.
 #[tokio::test(flavor = "multi_thread")]
 async fn peer_teardown_follows_drop_and_the_sweep() -> Result<()> {
     let log: EventLog = Arc::new(Mutex::new(Vec::new()));
@@ -56,7 +57,7 @@ async fn peer_teardown_follows_drop_and_the_sweep() -> Result<()> {
         directory: directory.clone(),
     };
     let config = consumer_config("peer-lifecycle-order")?;
-    let managers: Arc<Managers<Value>> = Arc::default();
+    let managers: Arc<Managers> = Arc::default();
     let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
     let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     let router = prepare_router(&peer, &backend).await?;
@@ -87,8 +88,11 @@ async fn peer_teardown_follows_drop_and_the_sweep() -> Result<()> {
         .ok_or_else(|| eyre!("shutdown did not sweep the retained partition manager"))?;
     let deregistered = position(&Event::Deregistered)
         .ok_or_else(|| eyre!("peer teardown did not deregister the peer"))?;
-    ensure!(provider < swept, "the sweep preceded the poll loop");
-    ensure!(swept < deregistered, "peer teardown preceded the sweep");
+    ensure!(swept < provider, "the client dropped before the sweep");
+    ensure!(
+        provider < deregistered,
+        "peer teardown preceded the client drop"
+    );
     ensure!(
         events
             .iter()
@@ -112,7 +116,7 @@ async fn peer_teardown_follows_drop_and_the_sweep() -> Result<()> {
 async fn a_second_shutdown_sweeps_nothing() -> Result<()> {
     let log: EventLog = Arc::new(Mutex::new(Vec::new()));
     let config = consumer_config("peer-lifecycle-second")?;
-    let managers: Arc<Managers<Value>> = Arc::default();
+    let managers: Arc<Managers> = Arc::default();
     let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
     let consumer = start(
         &config,
@@ -187,5 +191,47 @@ async fn failed_activation_rolls_back_and_releases_the_listener() -> Result<()> 
     assert_eq!(directory.inner.len(), 0);
     let rebound = TcpListener::bind(address)?;
     drop(rebound);
+    Ok(())
+}
+
+/// A construction that fails after the probe server binds releases the probe
+/// port before it returns. Dropping the server only signals graceful shutdown,
+/// so a caller that retried construction on the same port would find the
+/// listener still bound.
+///
+/// An empty subscription makes `subscribe` fail after the bind.
+#[tokio::test]
+async fn failed_startup_releases_the_probe_port() -> Result<()> {
+    let port = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))?
+        .local_addr()?
+        .port();
+    let config = ConsumerConfiguration::builder()
+        .bootstrap_servers(vec!["127.0.0.1:1".to_owned()])
+        .group_id("failed-startup-probe")
+        .subscribed_topics(Vec::<String>::new())
+        .probe_port(Some(port))
+        .build()?;
+    let managers: Arc<Managers> = Arc::default();
+    let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
+    let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+
+    match start(&config, managers, heartbeats, log, IgnoreRequests).await {
+        Ok(consumer) => {
+            consumer.shutdown().await;
+            bail!("construction succeeded with an empty subscription");
+        }
+        Err(error) => ensure!(
+            matches!(error, ConsumerError::Kafka(_)),
+            "expected the subscription to fail, got {error:#}"
+        ),
+    }
+
+    // Binding synchronously: nothing between the failed construction and this
+    // call yields, so the probe task cannot close its listener behind the
+    // assertion's back.
+    ensure!(
+        TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok(),
+        "the probe port was still bound after construction failed"
+    );
     Ok(())
 }

@@ -368,7 +368,7 @@ impl fmt::Debug for CassandraTimerDeferStore {
 impl TimerDeferStore for CassandraTimerDeferStore {
     type Error = CassandraDeferStoreError;
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn defer_first_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
         // Consult current state so we don't violate I1 when the caller's
         // "fresh key" precondition is violated: the new row must not raise
@@ -377,11 +377,11 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         self.defer_first_timer_resolved(&segment_id, trigger, cached)
             .await?;
 
-        debug!(key = ?trigger.key, time = %trigger.time, "Stored first deferred timer");
+        debug!(key = %trigger.key, time = %trigger.time, "Prosody stored the first deferred timer for the key");
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn get_next_deferred_timer(
         &self,
         key: &Key,
@@ -435,7 +435,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         }
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn complete_retry_success(
         &self,
         key: &Key,
@@ -477,14 +477,13 @@ impl TimerDeferStore for CassandraTimerDeferStore {
 
                 let entry = self.udt_to_cache_entry(&next_udt);
                 let next_time = entry.time;
-                let context = entry.context.clone();
                 self.cache.insert(Arc::clone(key), Some(entry));
 
-                debug!(key = ?key, time = %time, next_time = %next_time, "Completed FIFO timer retry");
-                Ok(TimerRetryCompletionResult::MoreTimers { next_time, context })
+                debug!(key = %key, time = %time, next_time = %next_time, "A deferred timer finished, so Prosody moves to the next deferred timer of the key");
+                Ok(TimerRetryCompletionResult::MoreTimers)
             } else {
                 self.delete_key(key).await?;
-                debug!(key = ?key, time = %time, "Completed last timer retry");
+                debug!(key = %key, time = %time, "The last deferred timer for the key finished");
                 Ok(TimerRetryCompletionResult::Completed)
             }
         } else {
@@ -508,21 +507,20 @@ impl TimerDeferStore for CassandraTimerDeferStore {
                 .map_err(CassandraStoreError::from)?;
 
             // cur_next is unchanged; retry_count reset to 0
-            let context = entry.context.clone();
             let next_time = entry.time;
             self.cache.insert(
                 Arc::clone(key),
                 Some(CachedTimerEntry {
                     time: next_time,
-                    context: context.clone(),
+                    context: entry.context.clone(),
                     retry_count: 0,
                 }),
             );
-            Ok(TimerRetryCompletionResult::MoreTimers { next_time, context })
+            Ok(TimerRetryCompletionResult::MoreTimers)
         }
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn append_deferred_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
         let (segment_id, cached) = self.resolve_cache_or_read(&trigger.key).await?;
         let ttl = self.store.calculate_ttl(trigger.time);
@@ -589,11 +587,11 @@ impl TimerDeferStore for CassandraTimerDeferStore {
             }
         }
 
-        debug!(key = ?trigger.key, time = %trigger.time, "Appended additional deferred timer");
+        debug!(key = %trigger.key, time = %trigger.time, "Prosody added a deferred timer to the key's queue");
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn remove_deferred_timer(
         &self,
         key: &Key,
@@ -653,11 +651,11 @@ impl TimerDeferStore for CassandraTimerDeferStore {
                 .map_err(CassandraStoreError::from)?;
         }
 
-        debug!(key = ?key, time = %time, "Removed deferred timer");
+        debug!(key = %key, time = %time, "Prosody removed a deferred timer");
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
         // No-op on a partition with no live timers. Cassandra's blind UPDATE
         // upserts a static-only row and leaves an orphan retry_count after
@@ -666,7 +664,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         // next_timer still resolves as Some(_) here.
         let (segment_id, cached) = self.resolve_cache_or_read(key).await?;
         let Some(entry) = cached else {
-            debug!(key = ?key, "set_retry_count on empty partition: no-op");
+            debug!(key = %key, "The key has no deferred timers, so Prosody does not change the retry count");
             return Ok(());
         };
 
@@ -690,11 +688,11 @@ impl TimerDeferStore for CassandraTimerDeferStore {
             }),
         );
 
-        debug!(key = ?key, retry_count, "Updated retry count");
+        debug!(key = %key, retry_count, "Prosody updated the retry count");
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    #[instrument(level = "debug", skip(self), err(level = "warn"))]
     async fn delete_key(&self, key: &Key) -> Result<(), Self::Error> {
         let segment_id = self.segment_id().await?;
 
@@ -705,7 +703,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
 
         self.cache.insert(Arc::clone(key), None);
 
-        debug!(key = ?key, "Deleted key from timer defer store");
+        debug!(key = %key, "Prosody deleted the deferred timers of the key");
         Ok(())
     }
 }

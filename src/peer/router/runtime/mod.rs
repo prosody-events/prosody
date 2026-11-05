@@ -389,7 +389,11 @@ async fn refresh_registration<D: PeerDirectory>(
         // A store failure must never end this task: a dead refresher makes the
         // peer vanish one lease later.
         if let Err(error) = directory.register(&registration).await {
-            warn!(%error, peer = %registration.peer, "peer registration refresh failed");
+            warn!(
+                peer = %registration.peer,
+                "Prosody cannot refresh the peer registration: {error:#}. Prosody retries at \
+                 the next refresh."
+            );
         }
         heartbeat.beat();
         refresh_at = Instant::now() + refresh_delay(ttl);

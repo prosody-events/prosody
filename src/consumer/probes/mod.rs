@@ -65,10 +65,10 @@ pub struct ProbeServer {
 /// consumer health status.
 #[derive(Educe)]
 #[educe(Clone, Debug)]
-struct ProbeState<P: Send + Sync + 'static> {
+struct ProbeState {
     /// Reference to partition managers for checking assignment status
     #[educe(Debug(ignore))]
-    managers: Arc<Managers<P>>,
+    managers: Arc<Managers>,
 
     /// Registry for checking if consumer-level actors are stalled
     heartbeats: HeartbeatRegistry,
@@ -80,9 +80,9 @@ impl ProbeServer {
     /// # Errors
     ///
     /// Returns an `io::Error` if the server fails to bind to the specified port
-    pub fn new<P: Send + Sync + 'static>(
+    pub fn new(
         port: u16,
-        managers: Arc<Managers<P>>,
+        managers: Arc<Managers>,
         heartbeats: HeartbeatRegistry,
     ) -> Result<Self, io::Error> {
         // Create application state with references to components
@@ -167,8 +167,8 @@ impl ProbeServer {
 /// messages. Responds `StatusCode::OK` if partitions are assigned, or
 /// `StatusCode::SERVICE_UNAVAILABLE` otherwise, paired with a message
 /// describing the current assignment status.
-async fn readiness_probe<P: Send + Sync + 'static>(
-    State(ProbeState { managers, .. }): State<ProbeState<P>>,
+async fn readiness_probe(
+    State(ProbeState { managers, .. }): State<ProbeState>,
 ) -> (StatusCode, Cow<'static, str>) {
     let assigned_count = get_assigned_partition_count(&managers);
     if assigned_count > 0 {
@@ -193,11 +193,11 @@ async fn readiness_probe<P: Send + Sync + 'static>(
 /// making progress and may need to be restarted. Responds `StatusCode::OK`
 /// if no stalls are detected, or `StatusCode::SERVICE_UNAVAILABLE` otherwise,
 /// paired with a message describing the current stall status.
-async fn liveness_probe<P: Send + Sync + 'static>(
+async fn liveness_probe(
     State(ProbeState {
         managers,
         heartbeats,
-    }): State<ProbeState<P>>,
+    }): State<ProbeState>,
 ) -> (StatusCode, &'static str) {
     if is_live(&managers, &heartbeats) {
         // Consumer is actively processing messages
@@ -214,10 +214,7 @@ async fn liveness_probe<P: Send + Sync + 'static>(
 
 /// Whether this consumer is live: no consumer-level actor and no partition has
 /// stalled.
-pub(crate) fn is_live<P: Send + Sync + 'static>(
-    managers: &Managers<P>,
-    heartbeats: &HeartbeatRegistry,
-) -> bool {
+pub(crate) fn is_live(managers: &Managers, heartbeats: &HeartbeatRegistry) -> bool {
     !heartbeats.any_stalled() && !get_is_stalled(managers)
 }
 

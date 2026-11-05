@@ -36,14 +36,13 @@ use crate::cassandra::errors::CassandraStoreError;
 use crate::cassandra::{BatchRow, BatchUnit, bind_ttl};
 use crate::cassandra_queries;
 use crate::state::cell::{Cell, Committed, ProvisionalCell, ProvisionalWrite};
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use crate::state::event_ref::EventRef;
 use crate::state::marker::{EventMarker, SectionClear, encode_marker_payload};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{EvidenceLookup, ResolveCellError};
 use crate::state::store::{
-    CacheBatch, CellBuffer, CellStore, CoordinateBatch, dedupe, expand_to_input_order,
-    sorted_unique_coordinates,
+    CacheBatch, CellBuffer, CellStore, CoordinateBatch, distinct, sorted_unique_coordinates,
 };
 use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
 use crate::timers::duration::CompactDuration;

@@ -459,7 +459,8 @@ fn blob_ttl_coalesces_the_present_blobs_ttl() {
 #[test]
 fn prop_marker_slice_decodes_by_coordinate() {
     fn prop(coordinate: Vec<u8>, legacy: bool, metadata: i32) -> Result<bool> {
-        let marker = EventMarker::frozen(message_event(), &[], &[], &evidence([].into(), None));
+        let marker =
+            EventMarker::frozen(message_event(), &[], Vec::new(), &evidence([].into(), None));
         let payload = encode_marker_payload(&marker)?;
         let mut state = MarkerState::default();
         let legacy_ttl = Some(CompactDuration::new(3600));

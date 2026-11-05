@@ -9,9 +9,8 @@
 use crate::Key;
 use crate::error::ClassifyError;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::{Segment, SegmentVersion};
+use crate::timers::store::{Segment, StoredSegment};
 use crate::timers::{TimerType, Trigger};
 use futures::Stream;
 use smallvec::SmallVec;
@@ -47,46 +46,39 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     fn segment(&self) -> &Segment;
 
     // =========================================================================
-    // Segment Operations (3 methods)
+    // Segment Operations
     // =========================================================================
 
     /// Persists this store's segment configuration.
     fn insert_segment(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Retrieves this store's segment from persistent storage.
-    fn get_segment(&self) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send;
+    /// Retrieves this store's segment and slab watermark in one read.
+    fn get_segment(
+        &self,
+    ) -> impl Future<Output = Result<Option<StoredSegment>, Self::Error>> + Send;
 
     /// Deletes this store's segment and all associated metadata.
     fn delete_segment(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // =========================================================================
-    // Slab Metadata Operations (4 methods)
+    // Slab Metadata Operations
     // =========================================================================
 
     /// Lists all slab IDs in this store's segment.
-    fn get_slabs(&self) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send;
+    fn get_slabs(&self) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send + use<'_, Self>;
 
     /// Lists slab IDs in a specified inclusive range within this store's
     /// segment.
     fn get_slab_range(
         &self,
         range: RangeInclusive<SlabId>,
-    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send + use<'_, Self>;
 
     /// Registers (inserts) a slab ID under this store's segment.
     fn insert_slab(&self, slab: Slab) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Unregisters (deletes) a slab ID from this store's segment.
     fn delete_slab(&self, slab_id: SlabId) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Reads the persisted `slab_watermark` for this segment.
-    ///
-    /// `None` = pre-migration / fresh segment → callers should treat as
-    /// "scan from slab 0". When `Some(w)`, every slab clustering row in this
-    /// segment has `slab_id > w` (invariant I1).
-    fn get_slab_watermark(
-        &self,
-    ) -> impl Future<Output = Result<Option<SlabId>, Self::Error>> + Send;
 
     /// Persists `slab_watermark` for this segment as a single UPDATE.
     ///
@@ -112,21 +104,21 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // =========================================================================
-    // Slab Trigger Operations (4 methods)
+    // Slab Trigger Operations
     // =========================================================================
 
     /// Streams all triggers of a specific type within a slab's time range.
-    fn get_slab_triggers(
-        &self,
-        slab: &Slab,
+    fn get_slab_triggers<'a>(
+        &'a self,
+        slab: &'a Slab,
         timer_type: TimerType,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'a, Self>;
 
     /// Streams ALL triggers within a slab across all timer types.
     fn get_slab_triggers_all_types(
         &self,
         slab: Slab,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'_, Self>;
 
     /// Inserts a trigger into the slab index.
     fn insert_slab_trigger(
@@ -151,28 +143,28 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // =========================================================================
-    // Key Trigger Operations (7 methods)
+    // Key Trigger Operations
     // =========================================================================
 
     /// Streams all scheduled times for a given key and timer type.
-    fn get_key_times(
-        &self,
+    fn get_key_times<'a>(
+        &'a self,
         timer_type: TimerType,
-        key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send;
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + use<'a, Self>;
 
     /// Streams all triggers for a given key and timer type.
-    fn get_key_triggers(
-        &self,
+    fn get_key_triggers<'a>(
+        &'a self,
         timer_type: TimerType,
-        key: &Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'a, Self>;
 
     /// Streams ALL triggers for a given key across all timer types.
-    fn get_key_triggers_all_types(
-        &self,
-        key: &Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
+    fn get_key_triggers_all_types<'a>(
+        &'a self,
+        key: &'a Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send + use<'a, Self>;
 
     /// Upserts a trigger into the key-based index.
     ///
@@ -231,15 +223,4 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<Option<Trigger>, Self::Error>> + Send;
-
-    // =========================================================================
-    // Version Management (1 method)
-    // =========================================================================
-
-    /// Updates the schema version and slab size for this store's segment.
-    fn update_segment_version(
-        &self,
-        new_version: SegmentVersion,
-        new_slab_size: CompactDuration,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

@@ -126,7 +126,7 @@ pub async fn committed_json_value(
 ) -> color_eyre::Result<Option<Value>> {
     let id = CollectionId::new(state_key, StateType::Application, StateName::try_new(name)?);
     match Committed::into_inner(
-        CellRead::<Values>::read(cell_store, &id, &value_cell())
+        CellRead::<Values>::read(cell_store, &id, value_cell().as_ref())
             .await?
             .0,
     ) {

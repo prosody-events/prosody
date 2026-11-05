@@ -2,11 +2,12 @@ use super::projection::CassandraProjection;
 use super::{CassandraStoreError, TABLE_KEYED_STATE_CELL, cassandra_queries};
 use crate::cassandra::macros::{format_sql, prepare_statement};
 use crate::state::cell::{Presence, Values};
-use crate::state::cell_key::{Direction, EdgeKind};
+use crate::state::cell_key::Direction;
 use educe::Educe;
 use futures::try_join;
 use scylla::client::session::Session;
 use scylla::statement::prepared::PreparedStatement;
+use std::ops::Bound;
 
 const POINT: &str = "SELECT {}, encoding, version, event, TTL(data), TTL(prev_data) FROM \
                      $keyspace.{} WHERE segment_id = ? AND key = ? AND state_type = ? AND name = \
@@ -97,12 +98,12 @@ impl ReadStatements {
             backward_excluded,
             backward_unbounded,
         ) = try_join!(
-            prepare_scan(shape(Direction::Forward, EdgeKind::Included)),
-            prepare_scan(shape(Direction::Forward, EdgeKind::Excluded)),
-            prepare_scan(shape(Direction::Forward, EdgeKind::Unbounded)),
-            prepare_scan(shape(Direction::Backward, EdgeKind::Included)),
-            prepare_scan(shape(Direction::Backward, EdgeKind::Excluded)),
-            prepare_scan(shape(Direction::Backward, EdgeKind::Unbounded))
+            prepare_scan(shape(Direction::Forward, Bound::Included(()))),
+            prepare_scan(shape(Direction::Forward, Bound::Excluded(()))),
+            prepare_scan(shape(Direction::Forward, Bound::Unbounded)),
+            prepare_scan(shape(Direction::Backward, Bound::Included(()))),
+            prepare_scan(shape(Direction::Backward, Bound::Excluded(()))),
+            prepare_scan(shape(Direction::Backward, Bound::Unbounded))
         )?;
         Ok(Self {
             point,
@@ -121,27 +122,27 @@ impl ReadStatements {
 
 impl ScanStatements {
     /// Selects the prepared scan for this direction and start edge.
-    pub(super) fn select(&self, direction: Direction, start: EdgeKind) -> &PreparedStatement {
+    pub(super) fn select(&self, direction: Direction, start: Bound<()>) -> &PreparedStatement {
         match (direction, start) {
-            (Direction::Forward, EdgeKind::Included) => &self.forward_included,
-            (Direction::Forward, EdgeKind::Excluded) => &self.forward_excluded,
-            (Direction::Forward, EdgeKind::Unbounded) => &self.forward_unbounded,
-            (Direction::Backward, EdgeKind::Included) => &self.backward_included,
-            (Direction::Backward, EdgeKind::Excluded) => &self.backward_excluded,
-            (Direction::Backward, EdgeKind::Unbounded) => &self.backward_unbounded,
+            (Direction::Forward, Bound::Included(())) => &self.forward_included,
+            (Direction::Forward, Bound::Excluded(())) => &self.forward_excluded,
+            (Direction::Forward, Bound::Unbounded) => &self.forward_unbounded,
+            (Direction::Backward, Bound::Included(())) => &self.backward_included,
+            (Direction::Backward, Bound::Excluded(())) => &self.backward_excluded,
+            (Direction::Backward, Bound::Unbounded) => &self.backward_unbounded,
         }
     }
 }
 
 /// Returns the comparator and order. Unbounded starts bind the minimum
 /// coordinate.
-const fn shape(direction: Direction, start: EdgeKind) -> (&'static str, &'static str) {
+const fn shape(direction: Direction, start: Bound<()>) -> (&'static str, &'static str) {
     match (direction, start) {
-        (Direction::Forward, EdgeKind::Included | EdgeKind::Unbounded) => (">=", "ASC"),
-        (Direction::Forward, EdgeKind::Excluded) => (">", "ASC"),
-        (Direction::Backward, EdgeKind::Included) => ("<=", "DESC"),
-        (Direction::Backward, EdgeKind::Excluded) => ("<", "DESC"),
-        (Direction::Backward, EdgeKind::Unbounded) => (">=", "DESC"),
+        (Direction::Forward, Bound::Included(()) | Bound::Unbounded) => (">=", "ASC"),
+        (Direction::Forward, Bound::Excluded(())) => (">", "ASC"),
+        (Direction::Backward, Bound::Included(())) => ("<=", "DESC"),
+        (Direction::Backward, Bound::Excluded(())) => ("<", "DESC"),
+        (Direction::Backward, Bound::Unbounded) => (">=", "DESC"),
     }
 }
 

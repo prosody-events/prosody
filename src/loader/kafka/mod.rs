@@ -48,6 +48,7 @@ use crate::consumer::ConsumerConfiguration;
 use crate::consumer::decode::{DecodedRecord, RecordMeta, decode_record};
 use crate::consumer::message::ConsumerRecord;
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
+use crate::kafka_log::LogContext;
 use crate::propagator::new_propagator;
 use crate::{JsonCodec, Offset, Partition, Topic};
 use ahash::HashMap;
@@ -226,7 +227,7 @@ where
         // Point lookups don't benefit from prefetching. Start with small fetch
         // sizes for ~1KB messages; rdkafka auto-adjusts if larger messages appear.
         // fetch.max.bytes >= message.max.bytes is required by rdkafka.
-        let consumer: BaseConsumer = ClientConfig::new()
+        let consumer: BaseConsumer<LogContext> = ClientConfig::new()
             .set("bootstrap.servers", config.bootstrap_servers.join(","))
             .set("client.id", &client_id)
             .set("group.id", &group_id)
@@ -240,7 +241,7 @@ where
             .set("fetch.max.bytes", "1048576")
             .set("fetch.wait.max.ms", "100")
             .set_log_level(RDKafkaLogLevel::Error)
-            .create()
+            .create_with_context(LogContext)
             .map_err(KafkaLoaderError::ConsumerCreation)?;
 
         let (tx, rx) = mpsc::channel(config.max_permits);
@@ -286,7 +287,7 @@ where
     /// Fails with [`KafkaLoaderError::LoaderShutdown`] if the semaphore or
     /// either channel has closed, or with a decode/Kafka error if the message
     /// can't be found or decoded.
-    #[instrument(level = "debug", skip(self, mode), fields(cached = Empty), err)]
+    #[instrument(level = "debug", skip(self, mode), fields(cached = Empty), err(level = "warn"))]
     async fn load_message_impl(
         &self,
         topic: Topic,
@@ -343,7 +344,7 @@ where
     /// Sends a load request to the background poll loop, which handles Kafka
     /// polling and message decoding. The decoded message is cached using
     /// `quick_cache`'s S3-FIFO eviction policy for efficient repeated access.
-    #[instrument(skip(self), level = "debug", err)]
+    #[instrument(skip(self), level = "debug", err(level = "warn"))]
     async fn load_from_kafka(
         &self,
         topic: Topic,

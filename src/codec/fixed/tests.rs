@@ -10,7 +10,7 @@ fn zero_sized_codecs_accept_only_valid_payloads() -> color_eyre::Result<()> {
     let mut codec = UnitCodec;
     let mut encoded = Vec::new();
     codec.serialize((), &mut encoded)?;
-    assert!(encoded.is_empty());
+    assert_eq!(encoded, b"");
     assert_eq!(codec.deserialize(&mut encoded)?, ());
     assert_eq!(
         codec.deserialize(&mut [1]),

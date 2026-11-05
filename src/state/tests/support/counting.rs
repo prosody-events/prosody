@@ -2,9 +2,9 @@
 
 use super::*;
 use crate::state::cell::Values;
+use crate::state::cell_key::CellRef;
 use crate::state::marker::MarkerState;
-use crate::state::store::CellRead;
-use crate::state::store::CommittedBatch;
+use crate::state::store::{CellRead, ReadBatch};
 use futures::StreamExt;
 use std::num::NonZeroUsize;
 
@@ -100,6 +100,24 @@ impl<S> CountingCellStore<S> {
             + self.counts.abort_provisional.load(Ordering::Relaxed)
     }
 
+    /// Every durable read of any kind: point, batch, scan, marker, and raw
+    /// provisional reads.
+    pub(crate) fn durable_reads(&self) -> usize {
+        [
+            &self.counts.marker_state,
+            &self.counts.value_reads,
+            &self.counts.value_batches,
+            &self.counts.presence_reads,
+            &self.counts.value_scans,
+            &self.counts.presence_scans,
+            &self.counts.provisional_cell_at,
+            &self.counts.provisional_many,
+        ]
+        .iter()
+        .map(|count| count.load(Ordering::Relaxed))
+        .sum()
+    }
+
     pub(crate) fn marker_reads(&self) -> usize {
         self.counts.marker_state.load(Ordering::Relaxed)
     }
@@ -183,7 +201,7 @@ impl<S: CellRead<P>, P: CountProjection> CellRead<P> for CountingCellStore<S> {
     async fn read<'a>(
         &'a self,
         collection: &'a CollectionId,
-        cell: &'a CellKey,
+        cell: CellRef<'a>,
     ) -> Result<Durable<P>, Self::Error> {
         {
             P::point(&self.counts).fetch_add(1, Ordering::Relaxed);
@@ -195,7 +213,7 @@ impl<S: CellRead<P>, P: CountProjection> CellRead<P> for CountingCellStore<S> {
         &'a self,
         collection: &'a CollectionId,
         scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + 'a {
+    ) -> impl Stream<Item = Result<(CellKey, P::Payload), Self::Error>> + Send + use<'a, S, P> {
         {
             P::scan(&self.counts).fetch_add(1, Ordering::Relaxed);
             self.counts.scan_hint.store(
@@ -212,7 +230,7 @@ impl<S: CellRead<P>, P: CountProjection> CellRead<P> for CountingCellStore<S> {
         &'a self,
         collection: &'a CollectionId,
         section: Section,
-        batch: &'a CoordinateBatch,
+        batch: &'a ReadBatch<'_>,
     ) -> Result<CacheBatch<P>, Self::Error> {
         P::batch(&self.counts).fetch_add(1, Ordering::Relaxed);
         self.counts.batch_widths.lock().push(batch.len());
@@ -237,8 +255,9 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
         collection: &'a CollectionId,
         section: Section,
         batch: &'a CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>> + Send + 'a
-    {
+    ) -> impl Future<Output = Result<CellBuffer<(Coordinate, ProvisionalCell)>, Self::Error>>
+    + Send
+    + use<'a, S> {
         self.counts.provisional_many.fetch_add(1, Ordering::Relaxed);
         self.inner.provisional_many(collection, section, batch)
     }
@@ -246,15 +265,12 @@ impl<S: CellStore> CellStore for CountingCellStore<S> {
     async fn write_provisional<'a>(
         &'a self,
         collection: &'a CollectionRef,
-        writes: &'a [(CellKey, ProvisionalWrite)],
-        marker: Option<&'a EventMarker>,
+        stage: ProvisionalStage<'a>,
     ) -> Result<(), Self::Error> {
         self.counts
             .write_provisional
             .fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .write_provisional(collection, writes, marker)
-            .await
+        self.inner.write_provisional(collection, stage).await
     }
 
     async fn write_resolved<'a>(
@@ -339,7 +355,7 @@ impl CellResolver for CountingResolver {
     fn resolve(
         ctx: Self::Context<'_>,
         stored: Value,
-    ) -> impl Future<Output = Result<Value, StateAccessError>> + Send {
+    ) -> impl Future<Output = Result<Value, StateAccessError>> + Send + use<'_> {
         ctx.bump();
         ready(Ok(stored))
     }
@@ -363,20 +379,20 @@ mod tests {
         };
 
         store.reset();
-        CellRead::<Values>::read(&store, &id, &cell).await?;
+        CellRead::<Values>::read(&store, &id, cell.as_ref()).await?;
         assert_eq!(store.visible_point_reads(), 1);
         assert_eq!(store.batch_reads(), 0);
         assert_eq!(store.raw_point_reads(), 0);
 
         store.reset();
         let batch = batch_of([0])?;
-        CellRead::<Values>::read_many(&store, &id, Section::new(0), &batch)
+        CellRead::<Values>::read_many(&store, &id, Section::new(0), &batch.as_ref())
             .await
             .map(|cells| {
                 cells
                     .into_iter()
                     .map(|(committed, _)| committed)
-                    .collect::<CommittedBatch>()
+                    .collect::<CellBuffer<Committed>>()
             })?;
         assert_eq!(store.batch_reads(), 1);
         assert_eq!(store.visible_point_reads(), 0);

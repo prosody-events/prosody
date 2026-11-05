@@ -17,8 +17,9 @@ mod backend;
 mod owner;
 mod scripted;
 
+pub(crate) use backend::MemoryHarness;
 pub(crate) use backend::publish_source;
-pub(super) use backend::{MemoryHarness, MemoryReaderBackend, ReaderBackend};
+pub(super) use backend::{MemoryReaderBackend, ReaderBackend};
 pub(super) use owner::{OwnerSession, owner_commit_cell, owner_stage};
 pub(crate) use owner::{owner_commit, registry_of, source_state_key};
 pub(crate) use scripted::{CountingIdentityStore, ScriptedCellSource};
@@ -75,27 +76,21 @@ pub(super) fn mock_clock_cache(budget: u64) -> (ReaderCache, Arc<Mock>) {
 }
 
 /// Collects a fallible reader stream into a `Vec`, surfacing the first error.
-pub(super) async fn collect_stream<T>(
-    stream: impl Stream<Item = Result<T, StateReaderError>>,
-) -> Result<Vec<T>> {
-    Ok(stream.try_collect().await?)
-}
-
-/// Opens a reader query and collects its fallible stream.
-pub(super) async fn collect_query<T, S>(
-    query: impl Future<Output = Result<S, StateReaderError>>,
-) -> Result<Vec<T>>
+pub(super) fn collect_stream<T, S>(stream: S) -> impl Future<Output = Result<Vec<T>>> + use<T, S>
 where
     S: Stream<Item = Result<T, StateReaderError>>,
 {
-    Box::pin(collect_stream(query.await?)).await
+    stream.map_err(Into::into).try_collect()
 }
 
 /// Runs `check` over `items` with bounded concurrency, in input order.
 /// [`SHARD_FANOUT_CONCURRENCY`] bounds the overlapping round trips, as the
 /// production stores do. Use this for reader operations only. Owner handle
 /// operations serialize under the session gate, so they gain nothing here.
-fn fan_out<I, F, Fut, T>(items: I, mut check: F) -> impl Stream<Item = Result<T>>
+fn fan_out<I, F, Fut, T>(
+    items: I,
+    mut check: F,
+) -> impl Stream<Item = Result<T>> + use<I, F, Fut, T>
 where
     I: IntoIterator,
     F: FnMut(I::Item) -> Fut,

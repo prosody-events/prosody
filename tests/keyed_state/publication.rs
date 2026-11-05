@@ -32,9 +32,7 @@ pub(crate) async fn assert_routing_row(
     group_id: &str,
     topic: Topic,
 ) -> Result<()> {
-    let store = CassandraStore::new(&common::test_cassandra_config()).await?;
-    let queries = Arc::new(PublicationQueries::new(store.session(), common::TEST_KEYSPACE).await?);
-    let publication_store = CassandraPublicationStore::new(store, queries);
+    let publication_store = publication_store().await?;
 
     let name = StateName::try_new("cart").map_err(|e| eyre!("name: {e}"))?;
     let own: Vec<_> = publication_store
@@ -68,6 +66,14 @@ pub(crate) async fn assert_routing_row(
         "a private collection must never write a routing row"
     );
     Ok(())
+}
+
+/// Opens a store over the `keyed_state_publication` table in the shared test
+/// keyspace, so a test can check routing rows directly.
+pub(crate) async fn publication_store() -> Result<CassandraPublicationStore> {
+    let store = CassandraStore::new(&common::test_cassandra_config()).await?;
+    let queries = Arc::new(PublicationQueries::new(store.session(), common::TEST_KEYSPACE).await?);
+    Ok(CassandraPublicationStore::new(store, queries))
 }
 
 /// Reads the published `cart` and `receipt` back through standalone
