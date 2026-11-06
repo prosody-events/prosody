@@ -743,6 +743,21 @@ When launching multi-agent workflows:
   a few short bounded fields (status, one-line summary, report path) and put
   all detail in report files the agent writes to the scratchpad.
 
+## Disk space
+
+Builds fill the disk quickly, mostly through `target` directories in
+worktrees. A full disk crashes `rustc` and stops the Docker backends.
+
+- Check free space with `df -h .` before a large build or test run, and
+  between workflow phases.
+- When free space is low, run `cargo clean` in every worktree that
+  `git worktree list` names. Below 60 GiB, skip a worktree that a running build
+  uses (`ps -eo args | grep 'rustc --crate-name'`). Below 20 GiB, clean every
+  worktree.
+- After a cleanup, run `docker compose ps`. Start a stopped backend with
+  `docker compose start`. Do not use `up`, because it can recreate a shared
+  container.
+
 ## Research
 
 - Automatically use context7 for code generation and library documentation.
