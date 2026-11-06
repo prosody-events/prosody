@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::convert::Infallible;
 use std::ptr;
 use std::str;
@@ -33,7 +34,7 @@ impl BinaryExtractor for PrefixExtractor {
             return Ok(BinaryMetadata::default());
         }
         Ok(BinaryMetadata {
-            event_id: str::from_utf8(&buf[4..end]).ok(),
+            event_id: str::from_utf8(&buf[4..end]).ok().map(Cow::Borrowed),
             event_type: None,
         })
     }
@@ -133,18 +134,10 @@ fn missing_event_id_yields_none() -> color_eyre::Result<()> {
 
 fn json_id(input: &[u8]) -> Result<Option<String>, JsonExtractError> {
     let mut buf = input.to_vec();
-    Ok(JsonExtractor::default()
+    Ok(JsonExtractor
         .extract(&mut buf)?
         .event_id
-        .map(str::to_owned))
-}
-
-fn json_type(input: &[u8]) -> Result<Option<String>, JsonExtractError> {
-    let mut buf = input.to_vec();
-    Ok(JsonExtractor::default()
-        .extract(&mut buf)?
-        .event_type
-        .map(str::to_owned))
+        .map(Cow::into_owned))
 }
 
 #[test]
@@ -177,70 +170,7 @@ fn json_id_finds_top_level_field_regardless_of_noise() -> Result<(), JsonExtract
 }
 
 #[test]
-fn json_id_value_with_escapes_is_decoded() -> Result<(), JsonExtractError> {
-    // serde/simd_json decode escape sequences in place; we get the
-    // unescaped string back.
-    let input = br#"{"id":"a\"b"}"#;
-    assert_eq!(json_id(input)?.as_deref(), Some("a\"b"));
-    Ok(())
-}
-
-#[test]
-fn json_id_null_value_yields_none() -> Result<(), JsonExtractError> {
-    // `null` deserializes to Option::None — a successful extraction with
-    // no id present.
-    assert_eq!(json_id(br#"{"id":null}"#)?, None);
-    Ok(())
-}
-
-#[test]
 fn json_id_rejects_invalid_json() {
     assert!(json_id(b"").is_err());
     assert!(json_id(b"   ").is_err());
-}
-
-#[test]
-fn json_id_via_binary_codec() -> color_eyre::Result<()> {
-    let mut wire = br#"{"id":"evt-1","payload":{"x":1}}"#.to_vec();
-    let original = wire.clone();
-    let mut codec = JsonBinaryMessageCodec::default();
-    let payload = codec.deserialize(&mut wire)?;
-    assert_eq!(payload.bytes, original);
-    assert_eq!(payload.event_id(), Some("evt-1"));
-    Ok(())
-}
-
-#[test]
-fn json_type_extracts_field() -> Result<(), JsonExtractError> {
-    assert_eq!(
-        json_type(br#"{"type":"user.created"}"#)?.as_deref(),
-        Some("user.created")
-    );
-    Ok(())
-}
-
-#[test]
-fn json_type_with_id_field_present() -> Result<(), JsonExtractError> {
-    let input = br#"{"id":"evt-1","type":"order.placed"}"#;
-    assert_eq!(json_id(input)?.as_deref(), Some("evt-1"));
-    assert_eq!(json_type(input)?.as_deref(), Some("order.placed"));
-    Ok(())
-}
-
-#[test]
-fn json_type_missing_returns_none() -> Result<(), JsonExtractError> {
-    assert_eq!(json_type(br#"{"id":"x"}"#)?, None);
-    Ok(())
-}
-
-#[test]
-fn json_type_via_binary_codec() -> color_eyre::Result<()> {
-    let mut wire = br#"{"id":"evt-1","type":"user.created","data":{}}"#.to_vec();
-    let original = wire.clone();
-    let mut codec = JsonBinaryMessageCodec::default();
-    let payload = codec.deserialize(&mut wire)?;
-    assert_eq!(payload.bytes, original);
-    assert_eq!(payload.event_id(), Some("evt-1"));
-    assert_eq!(payload.event_type(), Some("user.created"));
-    Ok(())
 }

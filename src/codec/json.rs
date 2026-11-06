@@ -14,6 +14,11 @@ use crate::{EventIdentity, EventType};
 /// after the call returns.
 /// Both serializers borrow the JSON tree because the writer does not consume
 /// it. Both decoders mutate input for `simd_json` and reuse its cached buffers.
+///
+/// Both backends follow these decoding rules:
+/// - An integer outside the `i64` and `u64` ranges decodes as a float.
+/// - A lone UTF-16 surrogate escape, such as `"\ud800"`, is an error, because a
+///   Rust string cannot hold it.
 #[derive(Default)]
 pub struct JsonCodec {
     #[cfg(not(target_arch = "arm"))]
