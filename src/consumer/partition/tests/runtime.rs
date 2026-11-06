@@ -1,4 +1,29 @@
 use super::*;
+use std::sync::atomic::Ordering;
+
+/// A partition shuts its handler down once, whether a revoke ends it before or
+/// after its startup.
+///
+/// The current-thread runtime does not poll the spawned partition task before
+/// the first shutdown. So that partition sees the drain before its first
+/// startup step.
+#[tokio::test]
+async fn shutdown_ends_the_handler_once_on_every_path() -> color_eyre::Result<()> {
+    let before_startup = TestHandler::new();
+    let (partition_manager, _records) = start(default_config(), before_startup.clone());
+    partition_manager.shutdown().await;
+    assert_eq!(before_startup.shutdowns.load(Ordering::Acquire), 1);
+
+    let after_message = TestHandler::new();
+    let (partition_manager, records) = start(default_config(), after_message.clone());
+    records
+        .send(ConsumerRecord::Message(create_test_message(0, "key")?))
+        .await?;
+    wait_for_processed_offsets(&after_message, 1, Duration::from_secs(1)).await?;
+    partition_manager.shutdown().await;
+    assert_eq!(after_message.shutdowns.load(Ordering::Acquire), 1);
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_partition_manager_event_type_filtering() -> color_eyre::Result<()> {
@@ -138,12 +163,13 @@ pub(super) async fn wait_for_partition_stalled(
     }
 }
 
-/// A test handler that records processed offsets and detects concurrent
-/// processing.
+/// A test handler that records processed offsets, detects concurrent
+/// processing, and counts its shutdowns.
 #[derive(Clone)]
 pub(super) struct TestHandler {
     pub(super) processed_offsets: Arc<Mutex<Vec<Offset>>>,
     pub(super) has_concurrent_processing: Arc<Mutex<bool>>,
+    shutdowns: Arc<AtomicUsize>,
     keys_in_processing: Arc<Mutex<Vec<Key>>>,
     notify: Arc<Notify>,
     delay: Duration,
@@ -161,6 +187,7 @@ impl TestHandler {
         Self {
             processed_offsets: Arc::new(Mutex::new(Vec::new())),
             has_concurrent_processing: Arc::new(Mutex::new(false)),
+            shutdowns: Arc::default(),
             keys_in_processing: Arc::new(Mutex::new(Vec::new())),
             notify: Arc::new(Notify::new()),
             delay,
@@ -238,7 +265,9 @@ impl EventHandler for TestHandler {
         // todo: add timer test
     }
 
-    async fn shutdown(self) {}
+    async fn shutdown(self) {
+        self.shutdowns.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 /// Helper functions to create test messages.
