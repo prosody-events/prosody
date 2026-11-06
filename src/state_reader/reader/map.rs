@@ -51,7 +51,8 @@ where
     ///
     /// # Errors
     ///
-    /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
+    /// Any [`StateReaderError`]: an acquisition or identity failure, an empty
+    /// key, or a key encoding or store failure from the bound handle.
     pub async fn contains_key<K: Into<Key>>(
         &self,
         key: K,
@@ -109,7 +110,8 @@ where
     ///
     /// # Errors
     ///
-    /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
+    /// Any [`StateReaderError`]: an acquisition or identity failure, an empty
+    /// key, or a key encoding or store failure from the bound handle.
     pub async fn contains_many<'a, K: Into<Key>, Q, I>(
         &self,
         key: K,
