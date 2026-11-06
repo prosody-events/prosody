@@ -82,9 +82,8 @@ struct PartitionParams {
 /// out of the long-lived coroutine state machine, preventing future-size
 /// explosion with the deeply nested middleware handler type `T`.
 ///
-/// Every exit shuts the handler down exactly once. A revoke during startup
-/// ends the partition before [`run_partition`] runs, and still shuts the
-/// handler down.
+/// Shuts the handler down when the partition ends, also when a revoke ends
+/// it during startup.
 pub(super) async fn handle_messages<T, S, SP, P, Q>(
     config: PartitionConfiguration<S, SP, P>,
     partition_info: PartitionInfo,
@@ -92,7 +91,7 @@ pub(super) async fn handle_messages<T, S, SP, P, Q>(
     context: PartitionContext<Q>,
 ) where
     Q: Stream<Item = ConsumerRecord<P>>,
-    T: EventHandler<Payload = P> + Send + Sync + 'static,
+    T: EventHandler<Payload = P>,
     S: TriggerStoreProvider,
     SP: PartitionStateProvider<S::Store>,
     <SP::Manager as PartitionStateManager>::Session:
@@ -170,7 +169,7 @@ async fn run_partition<T, S, M, P, Q>(
     params: PartitionParams,
 ) where
     Q: Stream<Item = ConsumerRecord<P>>,
-    T: EventHandler<Payload = P> + Send + Sync + 'static,
+    T: EventHandler<Payload = P>,
     S: TriggerStore,
     M: PartitionStateManager<Session: EventSession<Loader: MessageLoader<Payload = P>>>,
     P: Send + Sync + 'static + EventType + EventIdentity,

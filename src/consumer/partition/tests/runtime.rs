@@ -1,8 +1,8 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
-/// A partition shuts its handler down exactly once, whether a revoke ends it
-/// before or after its startup.
+/// A partition shuts its handler down once, whether a revoke ends it before or
+/// after its startup.
 ///
 /// The current-thread runtime does not poll the spawned partition task before
 /// the first shutdown. So that partition sees the drain before its first
