@@ -245,7 +245,8 @@ impl Arbitrary for ValueTrace {
 }
 
 /// Drives a value trace through the erased handle and a `(floor, visible)`
-/// model, asserting `erased == typed == visible` after every op. `floor` is the
+/// model, asserting `erased == typed == visible` and that erased `contains`
+/// reports whether `visible` holds a value after every op. `floor` is the
 /// last durably committed value; `visible` is the read-your-writes value.
 /// `set`/`clear` move only `visible`; `commit` promotes `visible` to `floor`;
 /// `rollback` reverts `visible` to `floor`. Commit/rollback are issued through
@@ -295,6 +296,10 @@ where
                 }
             }
             let erased = handle.get().await.map_err(|e| eyre!("erased get: {e}"))?;
+            let present = handle
+                .contains()
+                .await
+                .map_err(|e| eyre!("erased contains: {e}"))?;
             let typed = ctx
                 .state(Registered::new(
                     value_state::<<P as ErasedStateCodec>::Codec>(VALUE_NAME),
@@ -305,6 +310,7 @@ where
                 .map_err(|e| eyre!("typed get: {e}"))?;
             if !opt_same::<P>(erased.as_ref(), typed.as_ref())
                 || !opt_same::<P>(erased.as_ref(), visible.as_ref())
+                || present != visible.is_some()
             {
                 return Ok(false);
             }

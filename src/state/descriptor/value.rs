@@ -139,6 +139,20 @@ where
         op.get(ValueKind::<T>::ENTRIES, &()).await
     }
 
+    /// Tests whether a value is present, without decoding or resolving it.
+    /// Owner reads include buffered changes. Standalone readers see the
+    /// committed value. A message reference can remain present after its
+    /// Kafka message expires.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    #[instrument(name = "value.contains", skip_all, fields(collection = self.cells.name().as_str()), err)]
+    #[read(op)]
+    pub async fn contains(&self) -> Result<bool, CellStateError<CellCodecError<T>>> {
+        op.contains(ValueKind::<T>::ENTRIES, &()).await
+    }
+
     /// Lowers `value` through the resolver, encodes it, and stages a write.
     ///
     /// # Errors
