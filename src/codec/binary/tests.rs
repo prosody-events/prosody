@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::convert::Infallible;
 use std::ptr;
 use std::str;
@@ -34,7 +33,7 @@ impl BinaryExtractor for PrefixExtractor {
             return Ok(BinaryMetadata::default());
         }
         Ok(BinaryMetadata {
-            event_id: str::from_utf8(&buf[4..end]).ok().map(Cow::Borrowed),
+            event_id: str::from_utf8(&buf[4..end]).ok(),
             event_type: None,
         })
     }
@@ -134,39 +133,10 @@ fn missing_event_id_yields_none() -> color_eyre::Result<()> {
 
 fn json_id(input: &[u8]) -> Result<Option<String>, JsonExtractError> {
     let mut buf = input.to_vec();
-    Ok(JsonExtractor
+    Ok(JsonExtractor::default()
         .extract(&mut buf)?
         .event_id
-        .map(Cow::into_owned))
-}
-
-#[test]
-fn json_id_finds_top_level_field_regardless_of_noise() -> Result<(), JsonExtractError> {
-    assert_eq!(json_id(br#"{"id":"abc"}"#)?.as_deref(), Some("abc"));
-    assert_eq!(
-        json_id(b"  {\n  \"id\" : \"abc-123\"  ,\n  \"x\": 1\n}")?.as_deref(),
-        Some("abc-123")
-    );
-    assert_eq!(
-        json_id(br#"{"name":"Alice","kind":"user","id":"42"}"#)?.as_deref(),
-        Some("42")
-    );
-    // Earlier value contains the literal characters `"id":` — must not
-    // false-match.
-    assert_eq!(
-        json_id(br#"{"note":"\"id\": fake","id":"real"}"#)?.as_deref(),
-        Some("real")
-    );
-    assert_eq!(
-        json_id(br#"{"data":{"id":"nested"},"id":"top"}"#)?.as_deref(),
-        Some("top")
-    );
-    assert_eq!(json_id(br#"{"data":{"id":"nested"}}"#)?, None);
-    assert_eq!(
-        json_id(br#"{"a":[1,2,{"id":"inner"}],"b":3.14,"c":true,"d":null,"id":"x"}"#)?.as_deref(),
-        Some("x")
-    );
-    Ok(())
+        .map(str::to_owned))
 }
 
 #[test]

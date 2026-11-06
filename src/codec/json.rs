@@ -1,8 +1,12 @@
 //! JSON codec backed by `serde_json` (ARM) or `simd_json` (non-ARM).
 
 #[cfg(not(target_arch = "arm"))]
-use simd_json::serde::from_slice_with_buffers;
+use serde::Deserialize;
+#[cfg(not(target_arch = "arm"))]
+use simd_json::{Buffers, Deserializer, Node, Tape, fill_tape};
 use std::cell::RefCell;
+#[cfg(not(target_arch = "arm"))]
+use std::mem;
 
 use crate::codec::Codec;
 use crate::{EventIdentity, EventType};
@@ -13,7 +17,7 @@ use crate::{EventIdentity, EventType};
 /// buffer with tape data; the bytes passed to `deserialize` are unspecified
 /// after the call returns.
 /// Both serializers borrow the JSON tree because the writer does not consume
-/// it. Both decoders mutate input for `simd_json` and reuse its cached buffers.
+/// it. Both decoders mutate input for `simd_json` and reuse its parser state.
 ///
 /// Both backends follow these decoding rules:
 /// - An integer outside the `i64` and `u64` ranges decodes as a float.
@@ -22,7 +26,18 @@ use crate::{EventIdentity, EventType};
 #[derive(Default)]
 pub struct JsonCodec {
     #[cfg(not(target_arch = "arm"))]
-    buffers: simd_json::Buffers,
+    parser: SimdParser,
+}
+
+/// Reusable `simd_json` parser state.
+///
+/// It keeps the parse buffers and the tape across calls. After the first
+/// calls grow them, a parse allocates nothing.
+#[cfg(not(target_arch = "arm"))]
+#[derive(Default)]
+pub(crate) struct SimdParser {
+    buffers: Buffers,
+    tape: Vec<Node<'static>>,
 }
 
 impl Codec for JsonCodec {
@@ -38,7 +53,7 @@ impl Codec for JsonCodec {
         }
         #[cfg(not(target_arch = "arm"))]
         {
-            from_slice_with_buffers(buf, &mut self.buffers).map_err(JsonCodecError::Simd)
+            self.parser.parse(buf).map_err(JsonCodecError::Simd)
         }
     }
 
@@ -56,6 +71,22 @@ impl Codec for JsonCodec {
             static CACHE: RefCell<JsonCodec> = RefCell::new(JsonCodec::default());
         }
         CACHE.with_borrow_mut(f)
+    }
+}
+
+#[cfg(not(target_arch = "arm"))]
+impl SimdParser {
+    /// Parses `buf` in place and deserializes it as `T`.
+    pub(crate) fn parse<'a, T: Deserialize<'a>>(
+        &mut self,
+        buf: &'a mut [u8],
+    ) -> Result<T, simd_json::Error> {
+        let mut tape = Tape(mem::take(&mut self.tape)).reset();
+        let filled = fill_tape(buf, &mut self.buffers, &mut tape);
+        let mut deserializer = Deserializer::from_tape(tape);
+        let value = filled.and_then(|()| T::deserialize(&mut deserializer));
+        self.tape = deserializer.into_tape().reset().0;
+        value
     }
 }
 

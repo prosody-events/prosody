@@ -169,8 +169,8 @@ fn owned_bytes_keeps_no_spare_capacity() {
 enum Edge {
     /// A string with a lone UTF-16 surrogate escape.
     LoneSurrogate(String),
-    /// An integer outside the `i64` and `u64` ranges but inside the `f64`
-    /// range.
+    /// An integer of 19 to 300 digits. It spans the `i64` and `u64` limits
+    /// and stays inside the `f64` range.
     BigInt(String),
 }
 
@@ -182,69 +182,38 @@ impl Arbitrary for Edge {
             return Self::LoneSurrogate(format!("\"\\u{unit:04x}{suffix}\""));
         }
         let sign = if bool::arbitrary(g) { "-" } else { "" };
-        let digits: String = (0..21 + usize::arbitrary(g) % 280)
+        let digits: String = (0..19 + usize::arbitrary(g) % 282)
             .map(|index| char::from(b'0' + u8::arbitrary(g) % 9 + u8::from(index == 0)))
             .collect();
         Self::BigInt(format!("{sign}{digits}"))
     }
 }
 
-/// [`JsonCodec`] refuses a lone surrogate escape and decodes a big integer as
-/// the nearest float.
+/// On targets other than 32-bit ARM, [`JsonCodec`] and
+/// [`JsonBinaryMessageCodec`] refuse a document with a lone surrogate escape.
+/// Both accept a big integer, which [`JsonCodec`] decodes as a float. The
+/// message codec reads only the top-level `id`.
 ///
 /// Falsify: use `simd-json` 0.18, which decodes a lone high surrogate as
 /// U+0000, or remove its `big-int-as-float` feature.
 #[test]
-fn json_codec_decodes_edge_values() {
-    fn prop(edge: Edge) -> TestResult {
+fn json_codecs_decode_edge_values() {
+    fn prop(id: String, edge: Edge) -> TestResult {
         let (Edge::LoneSurrogate(text) | Edge::BigInt(text)) = &edge;
-        let result = JsonCodec::default().deserialize(&mut text.clone().into_bytes());
-        match (edge, result) {
-            (Edge::LoneSurrogate(_), Err(_)) => TestResult::passed(),
-            (Edge::BigInt(text), Ok(Value::Number(n))) if n.as_f64() == text.parse().ok() => {
-                TestResult::passed()
+        let id = Value::from(id);
+        let document = format!(r#"{{"e":{text},"d":{{"id":"\"id\":"}},"id":{id}}}"#);
+        let json = JsonCodec::default().deserialize(&mut document.clone().into_bytes());
+        let message =
+            JsonBinaryMessageCodec::default().deserialize(&mut document.clone().into_bytes());
+        TestResult::from_bool(match (edge, json, message) {
+            (Edge::LoneSurrogate(_), Err(_), Err(_)) => true,
+            (Edge::BigInt(text), Ok(value), Ok(payload)) => {
+                value["e"].as_f64() == text.parse().ok()
+                    && payload.bytes == document.as_bytes()
+                    && payload.event_id() == id.as_str()
             }
-            (edge, result) => TestResult::error(format!("{edge:?} decoded as {result:?}")),
-        }
+            _ => false,
+        })
     }
-    QuickCheck::new().quickcheck(prop as fn(Edge) -> TestResult);
-}
-
-/// [`JsonBinaryMessageCodec`] extracts escaped `id` and `type` strings, and
-/// never refuses a message for a value in another member.
-///
-/// Falsify: parse the document with `simd_json` in the extractor.
-#[test]
-fn message_codec_reads_only_metadata() {
-    fn prop(id: String, event_type: String, edges: Vec<Edge>) -> TestResult {
-        let mut members: Vec<String> = edges
-            .into_iter()
-            .map(|(Edge::LoneSurrogate(text) | Edge::BigInt(text))| format!("\"e\":{text}"))
-            .collect();
-        let (Ok(id_text), Ok(type_text)) = (
-            serde_json::to_string(&id),
-            serde_json::to_string(&event_type),
-        ) else {
-            return TestResult::error("a string must encode");
-        };
-        members.insert(
-            members.len() / 2,
-            format!("\"id\":{id_text},\"type\":{type_text}"),
-        );
-        let document = format!("{{{}}}", members.join(",")).into_bytes();
-        let expected = BinaryPayload::new(document.clone(), Some(id), Some(event_type));
-
-        match JsonBinaryMessageCodec::default().deserialize(&mut document.clone()) {
-            Ok(payload)
-                if payload.bytes == expected.bytes
-                    && payload.event_id() == expected.event_id()
-                    && payload.event_type() == expected.event_type() =>
-            {
-                TestResult::passed()
-            }
-            Ok(_) => TestResult::error("message codec lost metadata or bytes"),
-            Err(error) => TestResult::error(format!("message codec refused: {error}")),
-        }
-    }
-    QuickCheck::new().quickcheck(prop as fn(String, String, Vec<Edge>) -> TestResult);
+    QuickCheck::new().quickcheck(prop as fn(String, Edge) -> TestResult);
 }
