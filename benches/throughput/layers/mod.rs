@@ -87,7 +87,7 @@ async fn rdkafka(settings: &Settings, workload: &Workload, group: String) -> Res
         .set("group.id", group)
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
-        .set("partition.assignment.strategy", "cooperative-sticky")
+        .set("group.protocol", "consumer")
         .create()?;
     consumer.subscribe(&[workload.topic.as_ref()])?;
 

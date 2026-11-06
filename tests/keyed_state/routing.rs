@@ -1,8 +1,8 @@
 //! Publication when the group splits its subscribed topics across members.
 //!
 //! Two pipeline consumers in one group subscribe to the same two
-//! single-partition topics. The cooperative-sticky assignor gives each member
-//! one partition. Partition zero of the lexically first topic owns publication.
+//! single-partition topics. The broker's assignor gives each member one
+//! partition. Partition zero of the lexically first topic owns publication.
 //! Its owner must publish a routing row for the other topic too, although it
 //! never consumes that topic. The owner must also process its own partition.
 //!
@@ -96,8 +96,8 @@ async fn run_split_group(first: Topic, second: Topic) -> Result<()> {
         .build()?;
     let (messages_tx, mut messages) = channel(10);
 
-    // Both members must join the first generation, so the assignor splits the
-    // two partitions between them.
+    // Both members must join the group, so the broker splits the two
+    // partitions between them.
     let (one, two) = match tokio::join!(
         start_member(&consumer_config, &subsystem, messages_tx.clone()),
         start_member(&consumer_config, &subsystem, messages_tx),

@@ -49,6 +49,18 @@ chain. Handler timeouts cancel handlers that exceed their deadline, preventing a
 
 ## Usage
 
+### Kafka version
+
+Prosody requires Kafka 4.0 or later. Consumers use the broker-side consumer
+group protocol (KIP-848). The broker assigns partitions, and a rebalance
+changes only the members whose partitions move. Brokers older than 4.0 do
+not support this protocol. librdkafka does not fall back to the classic
+protocol. A consumer that connects to an older broker logs a fatal error
+and gets no partitions, so its readiness probe stays unready.
+
+The broker chooses the assignor. Set the broker property
+`group.consumer.assignors` to change it.
+
 ### Build prerequisites
 
 Building Prosody compiles its peer wire contract, so the Protocol Buffers

@@ -234,6 +234,12 @@ async fn release_probe(probe_server: Option<ProbeServer>, error: ConsumerError) 
 /// configured interval, and each partition fetches ahead at most
 /// [`partition_prefetch`](ConsumerConfiguration::partition_prefetch).
 ///
+/// The group uses the broker-side consumer protocol (KIP-848). The broker
+/// assigns partitions and sends each member only its own changes, so a
+/// rebalance never pauses the whole group. The broker's default assignor
+/// applies. Brokers older than Kafka 4.0 reject this protocol, and librdkafka
+/// then raises a fatal error.
+///
 /// # Errors
 ///
 /// [`ConsumerError::Hostname`] when the client id cannot be derived.
@@ -265,7 +271,7 @@ fn client_config(consumer_config: &ConsumerConfiguration) -> Result<ClientConfig
         )
         .set("enable.auto.offset.store", "false")
         .set("auto.offset.reset", "earliest")
-        .set("partition.assignment.strategy", "cooperative-sticky")
+        .set("group.protocol", "consumer")
         .set(
             "queued.max.messages.kbytes",
             prefetch.div_ceil(1 << 10).to_string(),
