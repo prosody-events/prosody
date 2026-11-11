@@ -1,7 +1,5 @@
-//! This module tests message ordering in the Prosody system using
-//! property-based testing with `QuickCheck`. It verifies that messages are
-//! received in the order they were produced per key, utilizing integration
-//! tests with Kafka, via the Prosody library.
+//! Tests that several direct-mode consumers deliver each key at least once,
+//! in produce order, while the group moves partitions between them.
 
 #![recursion_limit = "512"]
 
@@ -12,7 +10,7 @@ use std::sync::LazyLock;
 use std::time::Duration as StdDuration;
 
 use ahash::{HashMap, HashMapExt};
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, ensure, eyre};
 use derive_quickcheck_arbitrary::Arbitrary;
 use futures::future::join_all;
 use itertools::Itertools;
@@ -32,6 +30,8 @@ use tokio::task::JoinSet;
 use tracing::info;
 
 mod common;
+#[path = "messsage_ordering/verify.rs"]
+mod verify;
 use common::handler::ChannelHandler;
 use common::{TEST_RUNTIME, create_cassandra_trigger_store_config};
 use uuid::Uuid;
@@ -415,45 +415,26 @@ fn spawn_message_verifier(
     });
 }
 
-/// Verifies that the received messages align with the expected ones.
-///
-/// # Arguments
-///
-/// * `expected` - Map of expected key-value message pairs.
-/// * `received` - Map of actually received message data.
+/// Checks each key's deliveries with [`verify::verify_key`].
 ///
 /// # Errors
 ///
-/// Returns an error if the verification process reveals a mismatch.
+/// Returns an error if a key lost a message, delivered one out of order, or
+/// was not produced.
 fn verify_results(
     expected: &HashMap<u64, BTreeSet<u64>>,
-    received: HashMap<String, Vec<u64>>,
+    mut received: HashMap<String, Vec<u64>>,
 ) -> Result<()> {
-    // Prepare actual data map from received messages for comparison
-    let mut actual: HashMap<u64, BTreeSet<u64>> = HashMap::with_capacity(expected.len());
-
-    for (key, received_messages) in received {
-        let key: u64 = key.parse()?;
-        let received_set: BTreeSet<u64> = received_messages.iter().copied().collect();
-        actual.insert(key, received_set);
-
-        // Verify order of messages
-        let mut sorted = received_messages.clone();
-        sorted.sort_unstable();
-
-        if received_messages != sorted {
-            return Err(eyre!(
-                "invalid order for key {key}; expected: {sorted:?}, actual: {received_messages:?}"
-            ));
-        }
+    for (&key, messages) in expected {
+        let produced = messages.iter().copied().collect_vec();
+        let deliveries = received.remove(&key.to_string()).unwrap_or_default();
+        verify::verify_key(key, &produced, &deliveries)?;
     }
 
-    // Compare expected and actual results
-    if *expected != actual {
-        return Err(eyre!(
-            "all messages were not received; expected: {expected:?}, actual: {actual:?}"
-        ));
-    }
-
+    ensure!(
+        received.is_empty(),
+        "received messages for keys that were not produced: {:?}",
+        received.keys()
+    );
     Ok(())
 }
