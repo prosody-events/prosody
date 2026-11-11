@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.8.0](https://github.com/prosody-events/prosody/compare/prosody-v0.7.1...prosody-v0.8.0) (2026-11-11)
+
+
+### Features
+
+* **state:** add a presence check to value collections ([#104](https://github.com/prosody-events/prosody/issues/104)) ([7aed98c](https://github.com/prosody-events/prosody/commit/7aed98cb16d6618a4afb14a62dd34081ad5f2f24))
+* use the broker-side consumer group protocol (KIP-848) ([#127](https://github.com/prosody-events/prosody/issues/127)) ([962cd52](https://github.com/prosody-events/prosody/commit/962cd52468aeed3232fae4a81b96f3f202eb15a9))
+
+
+### Bug Fixes
+
+* alert operators on failures that do not heal ([#120](https://github.com/prosody-events/prosody/issues/120)) ([29ba48a](https://github.com/prosody-events/prosody/commit/29ba48ae78eec40b4b6edda9cb42ba8cda06162b))
+* close the TESTING.md edit gate on partial reads and missing jq ([#124](https://github.com/prosody-events/prosody/issues/124)) ([69db8f7](https://github.com/prosody-events/prosody/commit/69db8f7cdaa4d3c3502f33a5297dbbcd4db47dc3))
+* **consumer:** add a fetch wait setting ([#126](https://github.com/prosody-events/prosody/issues/126)) ([bf93a5f](https://github.com/prosody-events/prosody/commit/bf93a5f46f5b950c4a53995993a3bf735a8ad4f1))
+* **deps:** upgrade dependencies ([#129](https://github.com/prosody-events/prosody/issues/129)) ([7c96010](https://github.com/prosody-events/prosody/commit/7c960101222b8bcbb487b5128e83e7c344f9582b))
+* log expected, retried failures at warn ([#118](https://github.com/prosody-events/prosody/issues/118)) ([1e1813a](https://github.com/prosody-events/prosody/commit/1e1813ae98bfdc2ab96565d3b1eb1ed8a457d774))
+* shut the handler down when a revoke ends a partition during startup ([#130](https://github.com/prosody-events/prosody/issues/130)) ([477a61e](https://github.com/prosody-events/prosody/commit/477a61e897d9c8edb3c68b1cf06d352cbfe3d81a))
+* stop timer key-index reads from scanning fired-timer tombstones ([#115](https://github.com/prosody-events/prosody/issues/115)) ([2e7d3ca](https://github.com/prosody-events/prosody/commit/2e7d3cad9689a9286105baf83a75516aa187f06a))
+* **timers:** convert slab watermark on slab-size migration and read segment statics once ([#111](https://github.com/prosody-events/prosody/issues/111)) ([9353b48](https://github.com/prosody-events/prosody/commit/9353b4859ab72fc3e24e4b6780933fefc292bebf))
+* **timers:** give the scheduler actor sole ownership of timer memory ([#119](https://github.com/prosody-events/prosody/issues/119)) ([c6282a6](https://github.com/prosody-events/prosody/commit/c6282a6757ed45c9a53fadb4c6acc7bd0c8ba1d1))
+
+
+### Performance Improvements
+
+* read each partition from its own librdkafka queue ([#114](https://github.com/prosody-events/prosody/issues/114)) ([98e39f0](https://github.com/prosody-events/prosody/commit/98e39f07144f87f4d642acfb70254edb4b4255af))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * prosody-macros bumped from 0.7.1 to 0.8.0
+
 ## [0.7.1](https://github.com/prosody-events/prosody/compare/prosody-v0.7.0...prosody-v0.7.1) (2026-10-13)
 
 
