@@ -4,7 +4,7 @@ use super::{
 use crate::test_util::ArbJson;
 use crate::{EventIdentity, EventType};
 use bytes::{Bytes, BytesMut};
-use quickcheck::{QuickCheck, TestResult};
+use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use serde_json::Value;
 
 /// The format tokens are persisted in keyed-state identity rows; changing
@@ -162,4 +162,58 @@ fn owned_bytes_keeps_no_spare_capacity() {
         }
     }
     QuickCheck::new().quickcheck(prop as fn(Vec<u8>, u8) -> TestResult);
+}
+
+/// Valid JSON text that a full decoder must handle specially.
+#[derive(Clone, Debug)]
+enum Edge {
+    /// A string with a lone UTF-16 surrogate escape.
+    LoneSurrogate(String),
+    /// An integer of 19 to 300 digits. It spans the `i64` and `u64` limits
+    /// and stays inside the `f64` range.
+    BigInt(String),
+}
+
+impl Arbitrary for Edge {
+    fn arbitrary(g: &mut Gen) -> Self {
+        if bool::arbitrary(g) {
+            let unit = 0xD800 + u16::arbitrary(g) % 0x0800;
+            let suffix = g.choose(&["", "x", "\\u0041"]).copied().unwrap_or_default();
+            return Self::LoneSurrogate(format!("\"\\u{unit:04x}{suffix}\""));
+        }
+        let sign = if bool::arbitrary(g) { "-" } else { "" };
+        let digits: String = (0..19 + usize::arbitrary(g) % 282)
+            .map(|index| char::from(b'0' + u8::arbitrary(g) % 9 + u8::from(index == 0)))
+            .collect();
+        Self::BigInt(format!("{sign}{digits}"))
+    }
+}
+
+/// On targets other than 32-bit ARM, [`JsonCodec`] and
+/// [`JsonBinaryMessageCodec`] refuse a document with a lone surrogate escape.
+/// Both accept a big integer, which [`JsonCodec`] decodes as a float. The
+/// message codec reads only the top-level `id`.
+///
+/// Falsify: use `simd-json` 0.18, which decodes a lone high surrogate as
+/// U+0000, or remove its `big-int-as-float` feature.
+#[test]
+fn json_codecs_decode_edge_values() {
+    fn prop(id: String, edge: Edge) -> TestResult {
+        let (Edge::LoneSurrogate(text) | Edge::BigInt(text)) = &edge;
+        let id = Value::from(id);
+        let document = format!(r#"{{"e":{text},"d":{{"id":"\"id\":"}},"id":{id}}}"#);
+        let json = JsonCodec::default().deserialize(&mut document.clone().into_bytes());
+        let message =
+            JsonBinaryMessageCodec::default().deserialize(&mut document.clone().into_bytes());
+        TestResult::from_bool(match (edge, json, message) {
+            (Edge::LoneSurrogate(_), Err(_), Err(_)) => true,
+            (Edge::BigInt(text), Ok(value), Ok(payload)) => {
+                value["e"].as_f64() == text.parse().ok()
+                    && payload.bytes == document.as_bytes()
+                    && payload.event_id() == id.as_str()
+            }
+            _ => false,
+        })
+    }
+    QuickCheck::new().quickcheck(prop as fn(String, Edge) -> TestResult);
 }

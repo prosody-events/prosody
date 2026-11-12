@@ -6,8 +6,6 @@ use bytes::Bytes;
 use serde::de::value::MapAccessDeserializer;
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
-#[cfg(not(target_arch = "arm"))]
-use simd_json::serde::from_slice_with_buffers;
 use std::cell::RefCell;
 use std::convert::Infallible;
 use std::error::Error as StdError;
@@ -15,6 +13,8 @@ use std::fmt::{Formatter, Result as FmtResult};
 use std::marker::PhantomData;
 
 use crate::codec::Codec;
+#[cfg(not(target_arch = "arm"))]
+use crate::codec::json::SimdParser;
 use crate::{EventIdentity, EventType};
 
 /// Metadata extracted from a binary payload at decode time.
@@ -219,9 +219,9 @@ impl<E: BinaryExtractor, F: BinaryFormat> Codec for BinaryCodec<E, F> {
 /// All JSON values are valid messages. Values without string metadata fields
 /// return no metadata.
 ///
-/// On non-ARM targets the extractor owns a `simd_json::Buffers` instance; the
-/// parent [`BinaryCodec`] holds one [`JsonExtractor`] for its lifetime, so the
-/// buffers are reused across calls.
+/// On non-ARM targets the extractor owns a reusable `simd_json` parser. The
+/// parent [`BinaryCodec`] holds one [`JsonExtractor`] for its lifetime, so a
+/// warm extraction allocates nothing.
 ///
 /// Returns absent fields as `None`. The bytes in `buf` are left in an
 /// unspecified state on non-ARM targets due to `simd_json`'s in-place rewrite;
@@ -230,7 +230,7 @@ impl<E: BinaryExtractor, F: BinaryFormat> Codec for BinaryCodec<E, F> {
 #[derive(Default)]
 pub struct JsonExtractor {
     #[cfg(not(target_arch = "arm"))]
-    buffers: simd_json::Buffers,
+    parser: SimdParser,
 }
 
 /// [`BinaryCodec`] preconfigured with [`JsonExtractor`] for metadata
@@ -425,8 +425,7 @@ impl BinaryExtractor for JsonExtractor {
         }
         #[cfg(not(target_arch = "arm"))]
         {
-            let JsonDocument(view) =
-                from_slice_with_buffers::<JsonDocument<'a>>(buf, &mut self.buffers)?;
+            let JsonDocument(view) = self.parser.parse::<JsonDocument<'a>>(buf)?;
             Ok(BinaryMetadata {
                 event_id: view.id,
                 event_type: view.event_type,
@@ -438,7 +437,7 @@ impl BinaryExtractor for JsonExtractor {
         // `JsonExtractor` is concrete here, so a `thread_local!` of its own
         // type is well-formed. The `Option` slot lets us hand the extractor
         // out by `take` and put it back after `f` returns, preserving the
-        // `simd_json::Buffers` allocation across calls. A panic inside `f`
+        // parser allocations across calls. A panic inside `f`
         // leaves the slot empty; the next call constructs fresh.
         thread_local! {
             static CACHE: RefCell<Option<JsonExtractor>> = const { RefCell::new(None) };
