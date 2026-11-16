@@ -1,10 +1,10 @@
 //! The partition's keyed-state manager.
 //!
-//! Acquisition validates descriptor identities and publishes assignment routing
-//! before it returns a manager. Admission resolves durable residue and retires
-//! committed sources before the key can dispatch. Each dispatched event
-//! receives a session over the shared cell store, dedup store, registry,
-//! loader, and dirty workspace.
+//! Acquisition validates descriptor identities and removes the routing rows of
+//! unpublished collections before it returns a manager. Admission resolves
+//! durable residue and retires committed sources before the key can dispatch.
+//! Each dispatched event receives a session over the shared cell store, dedup
+//! store, registry, loader, dirty workspace, and the routes of its topic.
 //!
 //! Kafka partition ownership provides exclusive access. The partition loop
 //! derives each `EventRef` and supplies it to the manager.
@@ -24,13 +24,18 @@ use crate::error::ClassifyError;
 use crate::state::backend::AdmissionChecks;
 use crate::state::descriptor_identity::DescriptorIdentityStore;
 use crate::state::dirty::DirtyStore;
+use crate::state::publication::PublicationStore;
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::session::{EventSession, KeyedStateSession, SessionParts, TerminationWatch};
 #[cfg(test)]
 use crate::state::store::CellStore;
 use crate::state::{EventRef, StateBackend, StateKey};
 #[cfg(test)]
-use crate::state::{PartitionBackend, memory::MemoryDescriptorIdentityStore};
+use crate::state::{
+    PartitionBackend,
+    memory::{MemoryDescriptorIdentityStore, MemoryPublicationStore},
+};
 use crate::timers::TimerManager;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
@@ -42,6 +47,9 @@ use tokio::sync::watch;
 
 /// The identity store error of a backend.
 type IdentityErr<B> = <<B as StateBackend>::Identity as DescriptorIdentityStore>::Error;
+
+/// The routing store error of a backend.
+type PublicationErr<B> = <<B as StateBackend>::Publications as PublicationStore>::Error;
 
 /// The owned, per-event lifetime of a keyed-state session.
 ///
@@ -238,6 +246,7 @@ where
     segment_id: SegmentId,
     dedup_ttl: CompactDuration,
     checks: B::Checks,
+    routes: TopicRoutes<B::Publications>,
 }
 
 /// Owns a partition's cell store, dedup store, dirty workspace, and loader.
@@ -274,7 +283,7 @@ where
         event: EventRef,
         termination: TerminationWatch,
     ) -> EventStateScope<Self::Session> {
-        EventStateScope::new(KeyedStateSession::new(SessionParts {
+        let parts = SessionParts {
             cell: self.inner.cell.clone(),
             dirty: self.inner.dirty.clone(),
             dedup: self.inner.dedup.clone(),
@@ -285,7 +294,9 @@ where
             dedup_ttl: self.inner.dedup_ttl,
             checks: self.inner.checks.clone(),
             termination,
-        }))
+        };
+        let routes = self.inner.routes.clone();
+        EventStateScope::new(KeyedStateSession::with_routes(parts, routes))
     }
 
     async fn admit<T>(
@@ -329,7 +340,8 @@ pub(crate) fn test_manager<S: CellStore, D: DeduplicationStore, L, K: AdmissionC
     segment_id: SegmentId,
     checks: K,
     loader: L,
-) -> StateManager<PartitionBackend<D, MemoryDescriptorIdentityStore, S, K>, L> {
+) -> StateManager<PartitionBackend<D, MemoryDescriptorIdentityStore, S, K, MemoryPublicationStore>, L>
+{
     StateManager {
         inner: Arc::new(StateManagerInner {
             cell,
@@ -340,6 +352,7 @@ pub(crate) fn test_manager<S: CellStore, D: DeduplicationStore, L, K: AdmissionC
             segment_id,
             dedup_ttl: CompactDuration::new(30),
             checks,
+            routes: TopicRoutes::Unpublished,
         }),
     }
 }

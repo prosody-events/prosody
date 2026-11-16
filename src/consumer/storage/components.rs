@@ -103,14 +103,14 @@ where
 {
     dedup_ttl_seconds(inputs.dedup_ttl)?;
     let dedup = MemoryDeduplicationStoreProvider::new();
-    let publisher = keyed_state.memory_publication_setup(publications)?;
+    let routes = keyed_state.memory_routes(publications)?;
     let state = memory_state_provider::<C>(
         keyed_state,
         dedup.clone(),
         cells,
         identities,
         loader.clone(),
-        publisher,
+        routes,
     );
     Ok(ConsumerComponents {
         trigger: InMemoryTriggerStoreProvider::new(),
@@ -150,13 +150,13 @@ where
     let store = cells.session.clone();
     let keyspace = store.keyspace();
     let session = store.session();
-    let (trigger, segment, message_queries, timer_queries, dedup_queries, publisher, cache) = try_join!(
+    let (trigger, segment, message_queries, timer_queries, dedup_queries, routes, cache) = try_join!(
         CassandraTriggerStoreProvider::with_store(store.clone(), keyspace).err_into(),
         CassandraSegmentStore::new(store.clone(), keyspace).map_err(creation_error),
         MessageQueries::new(session, keyspace).map_err(creation_error),
         TimerQueries::new(session, keyspace).map_err(creation_error),
         DeduplicationQueries::new(session, keyspace).map_err(creation_error),
-        keyed_state.cassandra_publication_setup(publications),
+        keyed_state.cassandra_routes(publications),
         keyed_state.open_cache(),
     )?;
 
@@ -184,7 +184,7 @@ where
         identities,
         cache,
         loader.clone(),
-        publisher,
+        routes,
     );
     Ok(ConsumerComponents {
         trigger,

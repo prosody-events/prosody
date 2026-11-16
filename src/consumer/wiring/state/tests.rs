@@ -1,11 +1,12 @@
-//! Tests for keyed-state wiring: publication setup and the routing set read
+//! Tests for keyed-state wiring: route setup and the partition counts read
 //! from broker metadata.
 
 use super::*;
 use crate::JsonCodec;
 use crate::state::descriptor::{StateDescriptor, value_state};
+use crate::subsystem::SubsystemName;
 use color_eyre::Result;
-use color_eyre::eyre::{bail, ensure};
+use color_eyre::eyre::ensure;
 use rdkafka::error::RDKafkaErrorCode::UnknownTopicOrPartition;
 use rdkafka::mocking::MockCluster;
 use rdkafka::producer::DefaultProducerContext;
@@ -51,29 +52,25 @@ fn broker_metadata_counts_every_topic() -> Result<()> {
     Ok(())
 }
 
-/// The routing fetch succeeds when the broker knows every topic, and fails
-/// construction when one topic is missing.
+/// The count fetch returns the count of each topic that the broker knows,
+/// and fails construction when one topic is missing.
 #[tokio::test]
-async fn fetch_routes_requires_every_topic() -> Result<()> {
+async fn fetch_counts_requires_every_topic() -> Result<()> {
     let cluster = MockCluster::<DefaultProducerContext>::new(1)?;
     for (topic, count) in BROKER_TOPICS {
         cluster.create_topic(topic, count, 1)?;
     }
     let bootstrap = cluster.bootstrap_servers();
-    let group: ConsumerGroup = Arc::from("routes");
-    let topics = |names: &[&str]| {
-        PublicationTopics::new(names.iter().map(|&name| Topic::from(name)).collect())
-    };
+    let topics = |names: &[&str]| names.iter().map(|&name| Topic::from(name)).collect();
 
-    let Some(present) = topics(&["routes-three", "routes-one"]) else {
-        bail!("the present topic set must not be empty");
-    };
-    fetch_routes(bootstrap.clone(), group.clone(), present).await?;
+    let counts = fetch_counts(bootstrap.clone(), topics(&["routes-three", "routes-one"])).await?;
+    let broker: Vec<_> = BROKER_TOPICS
+        .iter()
+        .map(|&(topic, count)| Ok((Topic::from(topic), PartitionCount::try_from(count)?)))
+        .collect::<Result<_>>()?;
+    ensure!(counts == broker, "the fetch returned {counts:?}");
 
-    let Some(missing) = topics(&["routes-three", "routes-absent"]) else {
-        bail!("the missing topic set must not be empty");
-    };
-    let failure = fetch_routes(bootstrap, group, missing).await;
+    let failure = fetch_counts(bootstrap, topics(&["routes-three", "routes-absent"])).await;
     ensure!(
         matches!(
             failure,
@@ -104,10 +101,10 @@ async fn published_memory_state_requires_mock_mode() -> Result<()> {
         .build()?;
     let inputs = KeyedStateInputs::new(state, &consumer, "v1", Duration::from_secs(30))?;
 
-    let result = inputs.memory_publication_setup(MemoryPublicationStore::new());
+    let result = inputs.memory_routes(MemoryPublicationStore::new());
 
     assert!(matches!(
-        result,
+        result.map(|_| ()),
         Err(ConsumerError::KeyedState(
             KeyedStateInitError::PublishedMemoryStorage
         ))

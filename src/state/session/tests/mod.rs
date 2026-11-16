@@ -20,7 +20,7 @@ use crate::state::cell_key::{CellKey, Section};
 use crate::state::descriptor::value_state;
 use crate::state::dirty::DirtyStore;
 use crate::state::manager::EventStateScope;
-use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
+use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::Promoted;
 use crate::state::store::CellRead;
@@ -29,7 +29,7 @@ use crate::state::tests::cell_suite::{
 };
 use crate::state::tests::support::{assert_no_settlement_residue, probe};
 use crate::state::{
-    CollectionId, EventRef, PartitionBackend, StateKey, StateName, StateType, StoreOutcome,
+    CollectionId, EventRef, MemoryBackend, StateKey, StateName, StateType, StoreOutcome,
 };
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
@@ -51,8 +51,7 @@ const VALUE_NAME: &str = "cart";
 /// delegates cleanly — the property arms it to schedule stage and promote
 /// failures at runtime.
 type TestStore = FailingCellStore<MemoryCellStore>;
-type TestBackend =
-    PartitionBackend<MemoryDeduplicationStore, MemoryDescriptorIdentityStore, TestStore, ()>;
+type TestBackend = MemoryBackend<MemoryDeduplicationStore, TestStore>;
 /// The per-event session type the fixture mints (loader slot unused, so `()`).
 type Session = KeyedStateSession<TestBackend, ()>;
 

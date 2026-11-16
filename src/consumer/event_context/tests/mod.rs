@@ -29,13 +29,13 @@ use crate::state::descriptor::{
     Registered, StateDescriptor, deque_state, map_state, set_state, value_state,
 };
 use crate::state::dirty::DirtyStore;
-use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
+use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::order_codec::Utf8KeyCodec;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CELL_BATCH;
 use crate::state::tests::support::{CountingCellStore, MemoryDeduplicationStore};
-use crate::state::{EventRef, PartitionBackend, StateKey};
+use crate::state::{EventRef, MemoryBackend, StateKey};
 use crate::test_util::ArbJson;
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::duration::CompactDuration;

@@ -11,7 +11,6 @@ use crate::loader::MemoryLoader;
 use crate::state::SharedStateBackend;
 use crate::state::manager::StateManagerProvider;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
-use crate::state::publisher::NoPublisher;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::tests::support::MemoryDeduplicationStore;
 use crate::telemetry::Telemetry;
@@ -64,7 +63,6 @@ fn memory_state_provider(registry: CollectionDefRegistry) -> MemoryStateProvider
             MemoryDeduplicationStore::new(),
         ),
         MemoryLoader::new(),
-        NoPublisher,
         registry,
         Arc::from("test-group"),
         CompactDuration::new(30),

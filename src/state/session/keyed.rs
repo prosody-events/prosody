@@ -9,6 +9,7 @@ use crate::state::cell_key::{CellKey, CellRef, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::identity::{CollectionId, CollectionRef};
 use crate::state::overlay::Overlay;
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::CollectionDef;
 use crate::state::store::{Answers, CellRead, ReadBatch};
 use crate::state::{StateBackend, StateName, StateType, StoreOutcome};
@@ -68,9 +69,13 @@ where
     B: StateBackend,
 {
     /// Creates a session for one event, wrapping the partition's cell store in
-    /// a per-event `Overlay` over the shared dirty workspace.
+    /// a per-event `Overlay` over the shared dirty workspace. `routes` are the
+    /// routes of the partition's topic.
     #[must_use]
-    pub fn new(parts: SessionParts<B, L>) -> Self {
+    pub(crate) fn with_routes(
+        parts: SessionParts<B, L>,
+        routes: TopicRoutes<B::Publications>,
+    ) -> Self {
         let SessionParts {
             cell,
             dirty,
@@ -94,6 +99,7 @@ where
                 event,
                 dedup_ttl,
                 checks,
+                routes,
                 termination,
                 reload_marker: SyncMutex::new(None),
                 terminated: AtomicBool::new(false),
@@ -103,6 +109,13 @@ where
             // A freshly-minted session is attempt 1: `pinned == *epoch.read()`.
             pinned: AttemptEpoch::INITIAL,
         }
+    }
+
+    /// Creates a session whose topic writes no routing row.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn new(parts: SessionParts<B, L>) -> Self {
+        Self::with_routes(parts, TopicRoutes::Unpublished)
     }
 
     /// The collection id for `(state_type, name)` under this session's key.
@@ -388,6 +401,7 @@ where
         let dirty = self.inner.overlay.dirty();
         let ttl = self.inner.registry.ttl_for(state_type, name);
         let collection_ref = CollectionRef::new(id.clone(), ttl);
+        self.inner.routes.ensure(state_type, name).await?;
         let written = write_direct(
             self.inner.overlay.lower(),
             &collection_ref,

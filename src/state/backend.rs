@@ -6,6 +6,9 @@ use crate::Key;
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::error::ClassifyError;
 use crate::state::descriptor_identity::DescriptorIdentityStore;
+use crate::state::memory::{MemoryDescriptorIdentityStore, MemoryPublicationStore};
+use crate::state::publication::PublicationStore;
+use crate::state::publisher::Routes;
 use crate::{Partition, Topic};
 use std::convert::Infallible;
 use std::error::Error;
@@ -41,42 +44,52 @@ pub trait StateBackend: Send + Sync + 'static {
 
     /// The uniform durable cell store.
     fn cell(&self) -> Self::Cell;
+
+    /// The store of the routing rows for published collections.
+    type Publications: PublicationStore;
+
+    /// The routing rows of the process.
+    fn routes(&self) -> Routes<Self::Publications>;
 }
 
 /// The one concrete backend every factory mints; [`StateBackend`] projects its
 /// store type so callers name only `B`.
-#[derive(Clone, Debug)]
-pub struct PartitionBackend<D, I, C, K> {
+#[derive(Clone)]
+pub struct PartitionBackend<D, I, C, K, P> {
     dedup: D,
     identity: I,
     cell: C,
     checks: K,
+    routes: Routes<P>,
 }
 
-impl<D, I, C, K> PartitionBackend<D, I, C, K> {
-    /// Bundles the stores and admission checks.
+impl<D, I, C, K, P> PartitionBackend<D, I, C, K, P> {
+    /// Bundles the stores, admission checks, and routes.
     #[must_use]
-    pub fn new(dedup: D, identity: I, cell: C, checks: K) -> Self {
+    pub(crate) fn new(dedup: D, identity: I, cell: C, checks: K, routes: Routes<P>) -> Self {
         Self {
             dedup,
             identity,
             cell,
             checks,
+            routes,
         }
     }
 }
 
-impl<D, I, C, K> StateBackend for PartitionBackend<D, I, C, K>
+impl<D, I, C, K, P> StateBackend for PartitionBackend<D, I, C, K, P>
 where
     D: DeduplicationStore,
     I: DescriptorIdentityStore + Clone,
     C: CellStore,
     K: AdmissionChecks,
+    P: PublicationStore,
 {
     type Cell = C;
     type Checks = K;
     type Dedup = D;
     type Identity = I;
+    type Publications = P;
 
     fn dedup(&self) -> D {
         self.dedup.clone()
@@ -93,6 +106,10 @@ where
     fn cell(&self) -> C {
         self.cell.clone()
     }
+
+    fn routes(&self) -> Routes<P> {
+        self.routes.clone()
+    }
 }
 
 /// Creates the keyed-state dependencies for each partition assignment.
@@ -104,6 +121,11 @@ pub trait StateBackendFactory<T>: Clone + Send + Sync + 'static {
     /// Creates the backend for the partition without waiting for any I/O.
     fn for_partition(&self, topic: Topic, partition: Partition, triggers: T) -> Self::Backend;
 }
+
+/// The backend over memory stores. Memory assignments have no admission
+/// checks.
+pub(crate) type MemoryBackend<D, C> =
+    PartitionBackend<D, MemoryDescriptorIdentityStore, C, (), MemoryPublicationStore>;
 
 /// Clones shared test stores for each partition.
 #[cfg(test)]
@@ -135,7 +157,7 @@ where
     I: DescriptorIdentityStore + Clone,
     D: DeduplicationStore,
 {
-    type Backend = PartitionBackend<D, I, S, ()>;
+    type Backend = PartitionBackend<D, I, S, (), MemoryPublicationStore>;
 
     fn for_partition(&self, _topic: Topic, _partition: Partition, _triggers: T) -> Self::Backend {
         PartitionBackend::new(
@@ -143,6 +165,7 @@ where
             self.identity.clone(),
             self.cell.clone(),
             (),
+            Routes::Unpublished,
         )
     }
 }

@@ -57,6 +57,7 @@ where
         let registry = &self.inner.registry;
         let lower = self.inner.overlay.lower();
         let state_key = &self.inner.state_key;
+        let routes = &self.inner.routes;
         let mut marker_touched = Vec::with_capacity(touched.len());
         for ((state_type, name), ..) in &touched {
             if registry.commit_mode_for(*state_type, name) == CommitMode::ReadCommitted {
@@ -74,10 +75,12 @@ where
         let capacity = touched.len();
         let collections = stream::iter(touched)
             .map(|((state_type, name), cleared, cells)| {
-                let id = CollectionId::new(state_key.clone(), state_type, name);
-                cooperative(stage_collection(
-                    lower, registry, event, id, cleared, cells, &evidence,
-                ))
+                let evidence = &evidence;
+                cooperative(async move {
+                    routes.ensure(state_type, &name).await?;
+                    let id = CollectionId::new(state_key.clone(), state_type, name);
+                    stage_collection(lower, registry, event, id, cleared, cells, evidence).await
+                })
             })
             .buffer_unordered(STATE_FANOUT_CONCURRENCY)
             // Fold without a short circuit: every stage call must return

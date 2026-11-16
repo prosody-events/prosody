@@ -24,9 +24,9 @@ use thiserror::Error;
 #[non_exhaustive]
 pub enum StateReaderError {
     /// No publication rows exist for the collection yet. Always transient.
-    /// Zero rows cannot distinguish a misconfigured name from a publisher that
-    /// does not own its leader assignment yet. A withdrawal that empties the
-    /// snapshot can also be admitted later. Only a retry tells these apart.
+    /// Zero rows cannot distinguish a misconfigured name from a group that has
+    /// not written the collection yet. A withdrawal that empties the snapshot
+    /// can also be admitted later. Only a retry tells these apart.
     #[error("no publication rows for {subsystem}/{name}")]
     UnknownPublication {
         /// The subsystem the reader routed under.

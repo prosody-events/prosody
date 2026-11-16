@@ -157,9 +157,9 @@ pub struct KeyedStateConfiguration {
     /// default) is valid for consumers that neither publish state nor answer
     /// requests.
     ///
-    /// Keep this set across the deploy that un-publishes a collection. The
-    /// publication owner withdraws a collection's routing row only while it is
-    /// still registered `Private` under a configured subsystem. Dropping the
+    /// Keep this set across the deploy that un-publishes a collection. A
+    /// consumer withdraws a collection's routing rows only while it is still
+    /// registered `Private` under a configured subsystem. Dropping the
     /// subsystem or the registration in the same deploy as `.published(false)`
     /// strands the row instead of withdrawing it. See [`StateVisibility`].
     ///

@@ -20,6 +20,7 @@ use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::MemoryLoader;
 use crate::state::config::KeyedStateConfiguration;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
+use crate::state::publisher::Routes;
 use crate::telemetry::Telemetry;
 use crate::timers::store::TriggerStoreProvider;
 use crate::timers::store::cassandra::CassandraTriggerStoreProvider;
@@ -149,7 +150,7 @@ where
         MemoryCells::new(),
         MemoryDescriptorIdentityStore::new(),
         MemoryLoader::new(),
-        None,
+        Routes::Unpublished,
     );
     initialize_consumer::<_, _, _, C, _>(
         consumer,

@@ -57,8 +57,7 @@ impl DeduplicationStore for RecordingDedup {
 }
 
 /// Backend of a [`recording_session`].
-pub type RecordingBackend =
-    PartitionBackend<RecordingDedup, MemoryDescriptorIdentityStore, MemoryCellStore, ()>;
+pub type RecordingBackend = MemoryBackend<RecordingDedup, MemoryCellStore>;
 
 /// Session type built by [`recording_session`].
 pub type RecordingSession = KeyedStateSession<RecordingBackend, MemoryLoader<Value>>;

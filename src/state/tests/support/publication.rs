@@ -41,7 +41,7 @@ pub(crate) struct ScriptedPublicationStore {
     inner: MemoryPublicationStore,
     calls: Arc<Mutex<Vec<PublicationCall>>>,
     read_fail: Arc<Mutex<Option<ErrorCategory>>>,
-    remove_fail: Arc<Mutex<Option<ErrorCategory>>>,
+    write_fail: Arc<Mutex<Option<ErrorCategory>>>,
     read_gate: Arc<Mutex<Option<Arc<ReleaseGate>>>>,
 }
 
@@ -51,7 +51,7 @@ impl ScriptedPublicationStore {
             inner: MemoryPublicationStore::new(),
             calls: Arc::new(Mutex::new(Vec::new())),
             read_fail: Arc::new(Mutex::new(None)),
-            remove_fail: Arc::new(Mutex::new(None)),
+            write_fail: Arc::new(Mutex::new(None)),
             read_gate: Arc::new(Mutex::new(None)),
         }
     }
@@ -60,8 +60,9 @@ impl ScriptedPublicationStore {
         *self.read_fail.lock() = Some(category);
     }
 
-    pub(crate) fn fail_removes_with(&self, category: ErrorCategory) {
-        *self.remove_fail.lock() = Some(category);
+    /// Fails each upsert and removal with `category`. `None` heals the store.
+    pub(crate) fn fail_writes_with(&self, category: Option<ErrorCategory>) {
+        *self.write_fail.lock() = category;
     }
 
     pub(crate) fn heal_reads(&self) {
@@ -99,15 +100,19 @@ impl ScriptedPublicationStore {
         let _ = self.inner.upsert(subsystem, state_type, name, row).await;
     }
 
-    pub(crate) fn calls(&self) -> Vec<PublicationCall> {
-        self.calls.lock().clone()
-    }
-
     pub(crate) fn reads(&self) -> usize {
         self.calls
             .lock()
             .iter()
             .filter(|call| matches!(call, PublicationCall::Read { .. }))
+            .count()
+    }
+
+    pub(crate) fn upserts(&self) -> usize {
+        self.calls
+            .lock()
+            .iter()
+            .filter(|call| matches!(call, PublicationCall::Upsert { .. }))
             .count()
     }
 
@@ -141,6 +146,11 @@ impl PublicationStore for ScriptedPublicationStore {
             topic: row.topic.to_string(),
             partition_count: i32::from(row.partition_count),
         });
+        // A real upsert suspends, so concurrent first writers can interleave.
+        yield_now().await;
+        if let Some(category) = *self.write_fail.lock() {
+            return Err(ScriptedPublicationError(category));
+        }
         self.inner
             .upsert(subsystem, state_type, name, row)
             .await
@@ -158,7 +168,7 @@ impl PublicationStore for ScriptedPublicationStore {
             name: name.as_str().to_owned(),
             group: group_id.to_owned(),
         });
-        if let Some(category) = *self.remove_fail.lock() {
+        if let Some(category) = *self.write_fail.lock() {
             return Err(ScriptedPublicationError(category));
         }
         self.inner

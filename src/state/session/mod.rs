@@ -21,6 +21,7 @@ use crate::state::collection::WritableStateSession;
 use crate::state::dirty::DirtyStore;
 use crate::state::marker::StageId;
 use crate::state::overlay::Overlay;
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::{EventRef, StateBackend, StateKey};
 use crate::timers::duration::CompactDuration;
@@ -169,6 +170,7 @@ where
     stage_id: OnceLock<StageId>,
     dedup_ttl: CompactDuration,
     checks: B::Checks,
+    routes: TopicRoutes<B::Publications>,
     termination: TerminationWatch,
     /// The deferred-reload identity override: the dedup id of the message
     /// the current dispatch loaded, on a timer session. Last-wins and never

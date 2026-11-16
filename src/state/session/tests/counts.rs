@@ -16,7 +16,7 @@ use crate::state::cell::Values;
 use crate::state::cell_key::{CellKey, Section};
 use crate::state::descriptor::value_state;
 use crate::state::dirty::{DirtyStore, DirtyVal};
-use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
+use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::Promoted;
 use crate::state::session::sealed::StateLifecycle;
@@ -25,7 +25,7 @@ use crate::state::store::{CELL_BATCH, CellRead};
 use crate::state::tests::cell_suite::{MemoryDeduplicationStore, cell_at};
 use crate::state::tests::support::{CountingCellStore, admit_collection};
 use crate::state::{
-    CollectionId, CollectionRef, CommitMode, EventRef, PartitionBackend, StateKey, StateName,
+    CollectionId, CollectionRef, CommitMode, EventRef, MemoryBackend, StateKey, StateName,
     StateType,
 };
 use crate::test_util::TEST_RUNTIME;
@@ -42,8 +42,7 @@ use uuid::Uuid;
 /// [`CountingCellStore`] over shared in-memory cells, so `batch_reads` /
 /// `visible_point_reads` count exactly the stage's `get_many` / `get`.
 type CountingCell = CountingCellStore<MemoryCellStore>;
-type CountingBackend =
-    PartitionBackend<MemoryDeduplicationStore, MemoryDescriptorIdentityStore, CountingCell, ()>;
+type CountingBackend = MemoryBackend<MemoryDeduplicationStore, CountingCell>;
 type CountingSession = KeyedStateSession<CountingBackend, ()>;
 
 /// A single-collection session over a fresh key (row isolation) whose lower

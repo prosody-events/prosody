@@ -31,8 +31,7 @@ type CountingStore = CountingCellStore<MemoryCellStore>;
 
 /// The backend the cursor-laziness pin drives: a memory cell store wrapped in a
 /// read-counting decorator, so a single `next()`'s durable reads are bounded.
-type CountingBackend =
-    PartitionBackend<MemoryDeduplicationStore, MemoryDescriptorIdentityStore, CountingStore, ()>;
+type CountingBackend = MemoryBackend<MemoryDeduplicationStore, CountingStore>;
 
 /// The context the cursor-laziness pin drives.
 type CountingContext =

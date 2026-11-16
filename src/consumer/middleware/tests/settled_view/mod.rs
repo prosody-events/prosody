@@ -371,17 +371,16 @@ async fn non_finalized_arms_discard_overlay_keeping_commit_floor() -> Result<()>
 async fn permanent_finalize_failure_discards_overlay_keeping_floor() -> Result<()> {
     use crate::consumer::middleware::tests::test_support::RecordingDedup;
     use crate::consumer::partition::ShutdownPhase;
-    use crate::state::PartitionBackend;
+    use crate::state::MemoryBackend;
     use crate::state::dirty::DirtyStore;
-    use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
+    use crate::state::memory::MemoryCells;
     use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
     use crate::state::tests::cell_suite::FailingCellStore;
     use crate::timers::duration::CompactDuration;
     use tokio::sync::watch;
 
     type SkipStore = FailingCellStore<MemoryCellStore>;
-    type SkipBackend =
-        PartitionBackend<RecordingDedup, MemoryDescriptorIdentityStore, SkipStore, ()>;
+    type SkipBackend = MemoryBackend<RecordingDedup, SkipStore>;
     type SkipSession = KeyedStateSession<SkipBackend, MemoryLoader<Value>>;
 
     let mut registry = CollectionDefRegistry::default();

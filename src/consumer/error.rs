@@ -221,8 +221,8 @@ pub enum KeyedStateInitError {
     PublishedMemoryStorage,
 
     /// Broker metadata cannot supply a partition count for a subscribed topic,
-    /// so the consumer has no complete routing set to publish.
-    #[error("cannot build the keyed-state routing set: {0}")]
+    /// so the consumer cannot build a routing row for that topic.
+    #[error("cannot build the keyed-state routing rows: {0}")]
     Routing(#[from] RoutingError),
 
     /// Keyed-state collections were registered on the low-level

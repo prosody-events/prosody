@@ -7,14 +7,14 @@ use crate::loader::MemoryLoader;
 use crate::segment::partition_segment_id;
 use crate::state::descriptor::StateDescriptor;
 use crate::state::identity::StateKey;
-use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
+use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::Promoted;
 use crate::state::session::sealed::StateLifecycle;
 use crate::state::session::{Finalized, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
 use crate::state::tests::support::{MemoryDeduplicationStore, probe};
-use crate::state::{EventRef, PartitionBackend};
+use crate::state::{EventRef, MemoryBackend};
 use crate::state_reader::PartitionCount;
 use crate::state_reader::partition_for_key;
 use crate::timers::duration::CompactDuration;
@@ -33,7 +33,7 @@ use tokio::sync::watch;
 /// serves every backend. Only `C` varies: [`MemoryCellStore`] for the memory
 /// reader, `CassandraStore` for the live-Cassandra reader.
 pub(in crate::state_reader::tests) type OwnerBackend<C> =
-    PartitionBackend<MemoryDeduplicationStore, MemoryDescriptorIdentityStore, C, ()>;
+    MemoryBackend<MemoryDeduplicationStore, C>;
 
 /// The real per-event session the seeding handles bind over, generic over
 /// cell store `C`.
