@@ -161,13 +161,7 @@ impl KeyedStateInputs {
         counts: impl IntoIterator<Item = (Topic, PartitionCount)>,
     ) -> Routes<S> {
         match &self.config.subsystem {
-            Some(subsystem) => Routes::new(
-                store,
-                subsystem.clone(),
-                &self.registry,
-                self.group.clone(),
-                counts,
-            ),
+            Some(subsystem) => Routes::new(store, subsystem.clone(), self.group.clone(), counts),
             None => Routes::Unpublished,
         }
     }

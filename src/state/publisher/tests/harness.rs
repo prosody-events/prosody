@@ -118,7 +118,6 @@ impl Harness {
         let routes = Routes::new(
             self.publications.clone(),
             self.subsystem.clone(),
-            &self.registry,
             self.group.clone(),
             counts,
         );

@@ -1,7 +1,7 @@
 //! Publication of keyed-state routing rows.
 //!
 //! A reader in another consumer group finds the state of a collection through
-//! its routing rows. [`TopicTable`] owns the rule for when a row is written.
+//! its routing rows. [`Assignment`] owns the rule for when a row is written.
 
 use crate::error::{ClassifyError, ErrorCategory, log_at};
 use crate::state::access::StateAccessError;
@@ -38,104 +38,76 @@ pub struct Publisher<S> {
     store: S,
     subsystem: SubsystemName,
     group: ConsumerGroup,
-    /// The registered collections that are not published.
-    private: Box<[(StateType, StateName)]>,
-    /// Closes when the rows of `private` are removed. A failed removal leaves
-    /// it open, so the next acquisition tries again.
+    /// The partition count of each subscribed topic. `for_topic` reads it only
+    /// when a collection is published.
+    counts: HashMap<Topic, PartitionCount>,
+    /// Closes when the rows of the collections that are not published are
+    /// removed. A failed removal leaves it open, so the next acquisition tries
+    /// again.
     withdrawn: OnceCell<()>,
-    /// The table of each subscribed topic, or `None` when no collection is
-    /// published.
-    topics: Option<HashMap<Topic, Arc<TopicTable<S>>>>,
 }
 
 /// The routes of one partition assignment.
 #[derive(Clone)]
 pub(crate) enum TopicRoutes<S> {
-    /// The topic writes no routing row.
+    /// The assignment writes no routing row.
     Unpublished,
-    /// The topic writes the routing rows of the published collections.
-    Published {
-        table: Arc<TopicTable<S>>,
-        /// One latch for each collection in `table.published`, at the same
-        /// index. The assignment owns them, so a process holds one latch for
-        /// each assigned partition and published collection.
-        durable: Arc<[OnceCell<()>]>,
-    },
+    /// The assignment writes the routing rows of the published collections.
+    Published(Arc<Assignment<S>>),
 }
 
-/// The routing row of one topic, and the published collections. Each
-/// partition assignment of the topic has its own latches over this table.
+/// The routing row of one partition assignment, and one route for each
+/// published collection.
 ///
 /// Invariant: a group advertises a collection under a topic only if a handler
 /// for that topic wrote the collection. In each partition assignment, the row
-/// is durable before the first cell write of the collection from the topic. An
-/// extra row is allowed. A missing row is never allowed.
+/// is durable before the first cell write of the collection. An extra row is
+/// allowed. A missing row is never allowed.
 ///
-/// A latch shares one upsert between concurrent first writers. A failed upsert
-/// leaves the latch open, so the next write tries again. A new assignment
-/// writes the row again, so a rebalance restores a row that was removed from
-/// outside. Never remove the rows of a published collection.
-pub(crate) struct TopicTable<S> {
-    store: S,
-    subsystem: SubsystemName,
+/// The latch of a route shares one upsert between concurrent first writers. A
+/// failed upsert leaves the latch open, so the next write tries again. A new
+/// assignment has new latches, so a rebalance restores a row that was removed
+/// from outside. Never remove the rows of a published collection.
+pub(crate) struct Assignment<S> {
+    publisher: Arc<Publisher<S>>,
     row: StatePublication,
-    published: Arc<[(StateType, StateName)]>,
+    routes: Box<[Route]>,
+}
+
+/// One published collection, and the latch that closes when its routing row is
+/// durable in this assignment.
+struct Route {
+    state_type: StateType,
+    name: StateName,
+    durable: OnceCell<()>,
 }
 
 impl<S: PublicationStore> Routes<S> {
     /// Builds the routes of `group` under `subsystem`.
     ///
-    /// `counts` holds the partition count of each subscribed topic. The routes
-    /// read it only when a collection is published.
+    /// `counts` holds the partition count of each subscribed topic.
     pub(crate) fn new(
         store: S,
         subsystem: SubsystemName,
-        registry: &CollectionDefRegistry,
         group: ConsumerGroup,
         counts: impl IntoIterator<Item = (Topic, PartitionCount)>,
     ) -> Self {
-        let (published, private): (Vec<_>, Vec<_>) = registry
-            .collections()
-            .map(|(state_type, name)| (state_type, name.clone()))
-            .partition(|(state_type, name)| registry.is_published(*state_type, name));
-        let published: Arc<[_]> = published.into();
-
-        let topics = (!published.is_empty()).then(|| {
-            counts
-                .into_iter()
-                .map(|(topic, partition_count)| {
-                    let table = TopicTable {
-                        store: store.clone(),
-                        subsystem: subsystem.clone(),
-                        row: StatePublication {
-                            group_id: group.clone(),
-                            topic,
-                            partition_count,
-                        },
-                        published: published.clone(),
-                    };
-                    (topic, Arc::new(table))
-                })
-                .collect()
-        });
-
         Self::Subsystem(Arc::new(Publisher {
             store,
             subsystem,
             group,
-            private: private.into(),
+            counts: counts.into_iter().collect(),
             withdrawn: OnceCell::new(),
-            topics,
         }))
     }
 
-    /// Removes the rows of the group for each registered collection that is
+    /// Removes the rows of the group for each collection in `registry` that is
     /// not published. This step retires a collection that was published
     /// before. It runs once for each process.
     ///
     /// A failed removal never fails the acquisition. This call logs the error,
     /// and the next acquisition tries again.
-    pub(crate) async fn withdraw(&self) {
+    pub(crate) async fn withdraw(&self, registry: &CollectionDefRegistry) {
         let Self::Subsystem(publisher) = self else {
             return;
         };
@@ -143,17 +115,20 @@ impl<S: PublicationStore> Routes<S> {
             store,
             subsystem,
             group,
-            private,
             withdrawn,
             ..
         } = publisher.as_ref();
         let removal = withdrawn
             .get_or_try_init(|| {
-                stream::iter(private.iter())
-                    .map(Ok)
-                    .try_for_each_concurrent(STATE_FANOUT_CONCURRENCY, |(state_type, name)| {
-                        store.remove_group(subsystem, *state_type, name, group)
-                    })
+                stream::iter(
+                    registry
+                        .collections()
+                        .filter(|(state_type, name)| !registry.is_published(*state_type, name)),
+                )
+                .map(Ok)
+                .try_for_each_concurrent(STATE_FANOUT_CONCURRENCY, |(state_type, name)| {
+                    store.remove_group(subsystem, state_type, name, group)
+                })
             })
             .await;
         if let Err(error) = removal {
@@ -173,23 +148,43 @@ impl<S: PublicationStore> Routes<S> {
         }
     }
 
-    /// The routes of a new partition assignment of `topic`. Each call makes
-    /// new latches, so call it once for each assignment.
+    /// The routes of a new partition assignment of `topic`, with one route for
+    /// each published collection in `registry`. Each call makes new latches,
+    /// so call it once for each assignment.
     ///
-    /// Returns `None` when a collection is published and the consumer does
-    /// not subscribe to `topic`.
-    pub(crate) fn for_topic(&self, topic: Topic) -> Option<TopicRoutes<S>> {
+    /// Returns `None` when a collection is published and the consumer does not
+    /// subscribe to `topic`.
+    pub(crate) fn for_topic(
+        &self,
+        topic: Topic,
+        registry: &CollectionDefRegistry,
+    ) -> Option<TopicRoutes<S>> {
         let Self::Subsystem(publisher) = self else {
             return Some(TopicRoutes::Unpublished);
         };
-        let Some(topics) = &publisher.topics else {
+        let routes: Box<[Route]> = registry
+            .collections()
+            .filter(|(state_type, name)| registry.is_published(*state_type, name))
+            .map(|(state_type, name)| Route {
+                state_type,
+                name: name.clone(),
+                durable: OnceCell::new(),
+            })
+            .collect();
+        if routes.is_empty() {
             return Some(TopicRoutes::Unpublished);
+        }
+
+        let row = StatePublication {
+            group_id: publisher.group.clone(),
+            topic,
+            partition_count: *publisher.counts.get(&topic)?,
         };
-        let table = topics.get(&topic)?;
-        Some(TopicRoutes::Published {
-            durable: table.published.iter().map(|_| OnceCell::new()).collect(),
-            table: table.clone(),
-        })
+        Some(TopicRoutes::Published(Arc::new(Assignment {
+            publisher: publisher.clone(),
+            row,
+            routes,
+        })))
     }
 }
 
@@ -204,28 +199,29 @@ impl<S: PublicationStore> TopicRoutes<S> {
     /// [`StateAccessError::Store`] when the upsert fails. Its category is never
     /// `Permanent`.
     pub(crate) async fn ensure(&self, id: &CollectionId) -> Result<(), StateAccessError> {
-        let Self::Published { table, durable } = self else {
+        let Self::Published(assignment) = self else {
             return Ok(());
         };
-        let TopicTable {
-            store,
-            subsystem,
+        let Assignment {
+            publisher,
             row,
-            published,
-        } = table.as_ref();
+            routes,
+        } = assignment.as_ref();
         let (state_type, name) = (id.state_type(), id.name());
         // A scan suits the few published collections, and it hashes nothing.
-        let Some(latch) = published
+        let Some(route) = routes
             .iter()
-            .zip(durable.iter())
-            .find_map(|(route, latch)| {
-                (route.0 == state_type && route.1 == *name).then_some(latch)
-            })
+            .find(|route| route.state_type == state_type && route.name == *name)
         else {
             return Ok(());
         };
-        latch
-            .get_or_try_init(|| store.upsert(subsystem, state_type, name, row))
+        route
+            .durable
+            .get_or_try_init(|| {
+                publisher
+                    .store
+                    .upsert(&publisher.subsystem, state_type, name, row)
+            })
             .await
             .map(|&()| ())
             .map_err(|error| {

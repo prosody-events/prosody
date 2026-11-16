@@ -104,9 +104,9 @@ where
             .map_err(StateAcquireError::Identity)?;
         // An unvalidated registry must not change routing rows.
         let routes = backend.routes();
-        routes.withdraw().await;
+        routes.withdraw(&self.registry).await;
         let routes = routes
-            .for_topic(topic)
+            .for_topic(topic, &self.registry)
             .ok_or(StateAcquireError::Unrouted(topic))?;
         Ok(StateManager {
             inner: Arc::new(StateManagerInner {
