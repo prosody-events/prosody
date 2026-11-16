@@ -196,8 +196,7 @@ impl V1SlabTriggerModel {
     pub fn get_triggers(&self, segment_id: &SegmentId, slab_id: SlabId) -> Vec<TriggerV1Tuple> {
         self.triggers
             .get(&(*segment_id, slab_id))
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|set| set.iter().cloned().collect())
     }
 
     /// Returns all slabs in the model.

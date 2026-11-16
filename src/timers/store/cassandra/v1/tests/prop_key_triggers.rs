@@ -181,8 +181,7 @@ impl V1KeyTriggerModel {
     pub fn get_triggers(&self, segment_id: &SegmentId, key: &Key) -> Vec<TriggerV1Tuple> {
         self.triggers
             .get(&(*segment_id, key.clone()))
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|set| set.iter().cloned().collect())
     }
 
     /// Returns all (`segment_id`, `key`) pairs in the model.

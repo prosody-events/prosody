@@ -94,15 +94,13 @@ where
         rows: &[StatePublication],
         prior: Option<&ValidatedPublications>,
     ) -> Result<Admission, StateReaderError> {
-        let prior_groups: GroupIds = prior
-            .map(|snapshot| {
-                snapshot
-                    .sources()
-                    .iter()
-                    .map(|source| source.group_id.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let prior_groups: GroupIds = prior.map_or_default(|snapshot| {
+            snapshot
+                .sources()
+                .iter()
+                .map(|source| source.group_id.clone())
+                .collect()
+        });
         let asserted = DurableDescriptorIdentity::from_identity(
             self.context.state_type,
             self.context.name.as_str(),

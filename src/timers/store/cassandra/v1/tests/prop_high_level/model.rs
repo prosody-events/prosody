@@ -81,8 +81,7 @@ impl V1HighLevelModel {
                 let triggers_to_remove: Vec<TriggerV1Tuple> = self
                     .key_index
                     .get(&(*segment_id, key.clone()))
-                    .map(|set| set.iter().cloned().collect())
-                    .unwrap_or_default();
+                    .map_or_default(|set| set.iter().cloned().collect());
 
                 // Remove from slab index for each trigger
                 for (k, time) in &triggers_to_remove {
@@ -103,8 +102,7 @@ impl V1HighLevelModel {
                 let triggers_to_remove: Vec<TriggerV1Tuple> = self
                     .slab_index
                     .get(&(*segment_id, *slab_id))
-                    .map(|set| set.iter().cloned().collect())
-                    .unwrap_or_default();
+                    .map_or_default(|set| set.iter().cloned().collect());
 
                 // Remove from key index for each trigger
                 for (key, time) in &triggers_to_remove {
@@ -132,8 +130,7 @@ impl V1HighLevelModel {
     ) -> Vec<TriggerV1Tuple> {
         self.slab_index
             .get(&(*segment_id, slab_id))
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|set| set.iter().cloned().collect())
     }
 
     /// Gets triggers from V1 key index.
@@ -141,7 +138,6 @@ impl V1HighLevelModel {
     pub fn get_key_triggers(&self, segment_id: &SegmentId, key: &Key) -> Vec<TriggerV1Tuple> {
         self.key_index
             .get(&(*segment_id, key.clone()))
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|set| set.iter().cloned().collect())
     }
 }

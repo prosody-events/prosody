@@ -208,15 +208,12 @@ impl KeyTriggerModel {
     /// Gets scheduled times for a key and timer type in ascending order.
     #[must_use]
     pub fn get_times(&self, timer_type: TimerType, key: &Key) -> Vec<CompactDateTime> {
-        self.triggers
-            .get(key)
-            .map(|set| {
-                set.iter()
-                    .filter(|((tt, _), _)| *tt == timer_type)
-                    .map(|((_, time), _)| *time)
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.triggers.get(key).map_or_default(|set| {
+            set.iter()
+                .filter(|((tt, _), _)| *tt == timer_type)
+                .map(|((_, time), _)| *time)
+                .collect()
+        })
     }
 
     /// Gets full triggers for a key and timer type in ascending order.
@@ -226,28 +223,22 @@ impl KeyTriggerModel {
         timer_type: TimerType,
         key: &Key,
     ) -> Vec<(TimerType, CompactDateTime, i32)> {
-        self.triggers
-            .get(key)
-            .map(|set| {
-                set.iter()
-                    .filter(|((tt, _), _)| *tt == timer_type)
-                    .map(|((tt, time), tag)| (*tt, *time, *tag))
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.triggers.get(key).map_or_default(|set| {
+            set.iter()
+                .filter(|((tt, _), _)| *tt == timer_type)
+                .map(|((tt, time), tag)| (*tt, *time, *tag))
+                .collect()
+        })
     }
 
     /// Gets all triggers for a key across all types in ascending order.
     #[must_use]
     pub fn get_all_types(&self, key: &Key) -> Vec<(TimerType, CompactDateTime, i32)> {
-        self.triggers
-            .get(key)
-            .map(|set| {
-                set.iter()
-                    .map(|((tt, time), tag)| (*tt, *time, *tag))
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.triggers.get(key).map_or_default(|set| {
+            set.iter()
+                .map(|((tt, time), tag)| (*tt, *time, *tag))
+                .collect()
+        })
     }
 
     /// Returns all keys in the model.

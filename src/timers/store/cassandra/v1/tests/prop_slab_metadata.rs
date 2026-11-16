@@ -138,8 +138,7 @@ impl V1SlabMetadataModel {
     pub fn get_slabs(&self, segment_id: &SegmentId) -> Vec<SlabId> {
         self.slabs
             .get(segment_id)
-            .map(|set| set.iter().copied().collect())
-            .unwrap_or_default()
+            .map_or_default(|set| set.iter().copied().collect())
     }
 
     /// Returns all segment IDs in the model.

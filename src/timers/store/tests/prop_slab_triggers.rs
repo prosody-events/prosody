@@ -186,15 +186,12 @@ impl SlabTriggerModel {
     /// Gets triggers of a specific type from a slab in ascending order.
     #[must_use]
     pub fn get_by_type(&self, slab_id: SlabId, timer_type: TimerType) -> Vec<TriggerTuple> {
-        self.triggers
-            .get(&slab_id)
-            .map(|set| {
-                set.iter()
-                    .filter(|(tt, ..)| *tt == timer_type)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.triggers.get(&slab_id).map_or_default(|set| {
+            set.iter()
+                .filter(|(tt, ..)| *tt == timer_type)
+                .cloned()
+                .collect()
+        })
     }
 
     /// Gets all triggers from a slab in ascending order.
@@ -202,8 +199,7 @@ impl SlabTriggerModel {
     pub fn get_all_types(&self, slab_id: SlabId) -> Vec<TriggerTuple> {
         self.triggers
             .get(&slab_id)
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|set| set.iter().cloned().collect())
     }
 
     /// Returns all slab IDs present in the model.
