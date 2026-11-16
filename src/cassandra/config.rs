@@ -1,7 +1,8 @@
 //! Configuration for Cassandra connectivity.
 
 use crate::util::{
-    from_duration_env_with_fallback, from_env_with_fallback, from_option_env, from_vec_env,
+    from_duration_env_with_fallback, from_env_with_fallback, from_option_env,
+    from_option_env_or_file, from_vec_env,
 };
 use derive_builder::Builder;
 use educe::Educe;
@@ -47,9 +48,16 @@ pub struct CassandraConfiguration {
 
     /// Preferred rack identifier for topology-aware routing.
     ///
-    /// Environment variable: `PROSODY_CASSANDRA_RACK`
+    /// Environment variable: `PROSODY_CASSANDRA_RACK`, or
+    /// `PROSODY_CASSANDRA_RACK_FILE` to name a file that holds the value
     /// Default: None
-    #[builder(default = "from_option_env(\"PROSODY_CASSANDRA_RACK\")?", setter(into))]
+    ///
+    /// The rack applies only together with `datacenter`. When no node in the
+    /// datacenter is in the rack, queries go to any node in the datacenter.
+    #[builder(
+        default = "from_option_env_or_file(\"PROSODY_CASSANDRA_RACK\")?",
+        setter(into)
+    )]
     pub rack: Option<String>,
 
     /// Username for authenticating with Cassandra.

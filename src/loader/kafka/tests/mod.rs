@@ -35,6 +35,7 @@ fn loader_config() -> LoaderConfiguration {
     LoaderConfiguration {
         bootstrap_servers: vec![BOOTSTRAP.to_owned()],
         group_id: "prosody-test".to_owned(),
+        rack: None,
         max_permits: 10,
         cache_size: 1, // Minimal size to stress test deadlock prevention and eviction
         poll_interval: Duration::from_millis(1),
@@ -202,6 +203,7 @@ mod interleaved;
 /// Test: Request offset that was deleted before the request
 /// Expected: Should detect deleted offset via lazy validation
 mod loading;
+mod rack;
 mod seek_decision;
 /// Unit tests proving `create_load_span` wires the "load" span to the
 /// producer-propagated context exactly as [`related_span!`] dictates, for

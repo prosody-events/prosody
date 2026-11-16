@@ -221,26 +221,8 @@ where
         config: LoaderConfiguration,
         heartbeats: &HeartbeatRegistry,
     ) -> Result<Self, KafkaLoaderError> {
-        let group_id = format!("{}.loader", config.group_id);
         let client_id = hostname().map_err(|error| KafkaLoaderError::Hostname(Arc::new(error)))?;
-
-        // Point lookups don't benefit from prefetching. Start with small fetch
-        // sizes for ~1KB messages; rdkafka auto-adjusts if larger messages appear.
-        // fetch.max.bytes >= message.max.bytes is required by rdkafka.
-        let consumer: BaseConsumer<LogContext> = ClientConfig::new()
-            .set("bootstrap.servers", config.bootstrap_servers.join(","))
-            .set("client.id", &client_id)
-            .set("group.id", &group_id)
-            .set("enable.auto.commit", "false")
-            .set("enable.auto.offset.store", "false")
-            .set("auto.offset.reset", "earliest")
-            .set("queued.min.messages", "1")
-            .set("queued.max.messages.kbytes", "64")
-            .set("fetch.message.max.bytes", "16384")
-            .set("message.max.bytes", "1048576")
-            .set("fetch.max.bytes", "1048576")
-            .set("fetch.wait.max.ms", "100")
-            .set_log_level(RDKafkaLogLevel::Error)
+        let consumer: BaseConsumer<LogContext> = client_config(&config, &client_id)
             .create_with_context(LogContext)
             .map_err(KafkaLoaderError::ConsumerCreation)?;
 
@@ -410,4 +392,34 @@ fn loader_capacity(max_uncommitted: usize) -> usize {
     max_uncommitted
         .saturating_mul(RESOLVE_FANOUT)
         .min(Semaphore::MAX_PERMITS)
+}
+
+/// The loader consumer's librdkafka configuration. It joins the group
+/// `{group_id}.loader` but never commits, and it fetches the rack's replica
+/// when [`LoaderConfiguration::rack`] is set.
+///
+/// Point lookups do not benefit from prefetch. The fetch sizes suit messages
+/// of about 1 KiB, and librdkafka grows them for larger messages.
+/// librdkafka requires `fetch.max.bytes` >= `message.max.bytes`.
+fn client_config(config: &LoaderConfiguration, client_id: &str) -> ClientConfig {
+    let mut client_config = ClientConfig::new();
+    client_config
+        .set("bootstrap.servers", config.bootstrap_servers.join(","))
+        .set("client.id", client_id)
+        .set("group.id", format!("{}.loader", config.group_id))
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .set("auto.offset.reset", "earliest")
+        .set("queued.min.messages", "1")
+        .set("queued.max.messages.kbytes", "64")
+        .set("fetch.message.max.bytes", "16384")
+        .set("message.max.bytes", "1048576")
+        .set("fetch.max.bytes", "1048576")
+        .set("fetch.wait.max.ms", "100")
+        .set_log_level(RDKafkaLogLevel::Error);
+
+    if let Some(rack) = &config.rack {
+        client_config.set("client.rack", rack);
+    }
+    client_config
 }

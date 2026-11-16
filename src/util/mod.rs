@@ -17,10 +17,11 @@
 /// they stay in sync when the env var is unset.
 pub const DEFAULT_IDEMPOTENCE_CACHE_SIZE: usize = 8192;
 
-use std::env;
 use std::fmt::Display;
+use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
+use std::{env, fs};
 
 /// Retrieves and parses an environment variable into the specified type.
 ///
@@ -56,6 +57,34 @@ where
     }
 
     parse_with_error(env_var, &value_str).map(Some)
+}
+
+/// Retrieves and parses an optional value from an environment variable or
+/// from a file.
+///
+/// The variable itself has priority, with the same rules as
+/// [`from_option_env`]. When it is unset, the variable `{env_var}_FILE` can
+/// name a file that holds the value. A setup step writes this file when the
+/// value is known only after the process environment is fixed. Prosody reads
+/// the file once and trims the content. A blank file gives `Ok(None)`.
+///
+/// # Errors
+///
+/// Returns an error if the value cannot be parsed, or if `{env_var}_FILE`
+/// names a file that cannot be read.
+pub fn from_option_env_or_file<T>(env_var: &str) -> Result<Option<T>, String>
+where
+    T: FromStr<Err: Display>,
+{
+    if env_value(env_var).is_some() {
+        return from_option_env(env_var);
+    }
+
+    let file_var = format!("{env_var}_FILE");
+    let Some(path) = env_value(&file_var) else {
+        return Ok(None);
+    };
+    from_option_file(&file_var, Path::new(&path))
 }
 
 /// Retrieves and parses an optional environment variable with a fallback
@@ -229,6 +258,26 @@ fn env_value(env_var: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+/// Parses the trimmed content of the file at `path`, which `file_var` names.
+/// A blank file counts as unset.
+fn from_option_file<T>(file_var: &str, path: &Path) -> Result<Option<T>, String>
+where
+    T: FromStr<Err: Display>,
+{
+    let content = fs::read_to_string(path).map_err(|error| {
+        format!(
+            "failed to read file '{}' from environment variable '${file_var}': {error:#}",
+            path.display()
+        )
+    })?;
+
+    let value = content.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    parse_with_error(file_var, value).map(Some)
+}
+
 /// Retrieves the value of an environment variable that has no fallback.
 fn get_env_value(env_var: &str) -> Result<String, String> {
     env_value(env_var).ok_or_else(|| {
@@ -246,3 +295,6 @@ fn parse_duration_with_error(env_var: &str, value_str: &str) -> Result<Duration,
         )),
     }
 }
+
+#[cfg(test)]
+mod tests;

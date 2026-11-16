@@ -9,6 +9,7 @@ environment variables for unset fields, so you can mix both approaches.
 |-----------------------------|----------------------------------------------------|--------------|----------|----------|
 | `PROSODY_BOOTSTRAP_SERVERS` | Kafka servers to connect to                        | -            | ✓        | ✓        |
 | `PROSODY_GROUP_ID`          | Consumer group name                                | -            | ✓        |          |
+| `PROSODY_KAFKA_RACK`        | Fetch from a replica in this rack (see [Rack affinity](#rack-affinity)) | - | ✓ |          |
 | `PROSODY_SUBSCRIBED_TOPICS` | Topics to read from                                | -            | ✓        |          |
 | `PROSODY_ALLOWED_EVENTS`    | Only process events matching these prefixes        | (all)        | ✓        |          |
 | `PROSODY_SOURCE_SYSTEM`     | Tag for outgoing messages (prevents reprocessing)  | `<group id>` |          | ✓        |
@@ -154,8 +155,35 @@ Persistent storage for timers, deferral, deduplication, and keyed state. It is n
 | `PROSODY_CASSANDRA_USER`       | Username                           | -       |
 | `PROSODY_CASSANDRA_PASSWORD`   | Password                           | -       |
 | `PROSODY_CASSANDRA_DATACENTER` | Prefer this datacenter for queries | -       |
-| `PROSODY_CASSANDRA_RACK`       | Prefer this rack for queries       | -       |
+| `PROSODY_CASSANDRA_RACK`       | Prefer this rack for queries (see [Rack affinity](#rack-affinity)) | - |
 | `PROSODY_CASSANDRA_RETENTION`  | Delete data older than this        | 1y      |
+
+## Rack affinity
+
+Traffic between racks or availability zones costs more and adds latency. Two settings keep reads
+in the consumer's own rack:
+
+- `PROSODY_KAFKA_RACK` becomes librdkafka's `client.rack`. The consumer and its message loader
+  then fetch from a replica whose `broker.rack` has the same value (KIP-392). The brokers must
+  set `replica.selector.class` to `org.apache.kafka.common.replica.RackAwareReplicaSelector`.
+- `PROSODY_CASSANDRA_RACK` sends queries to nodes in this rack of
+  `PROSODY_CASSANDRA_DATACENTER`. Set the datacenter too, because the rack has no effect
+  without it.
+
+A value must equal the rack name that the brokers or the Cassandra nodes use. Kafka and
+Cassandra can name the same zone differently, so the two settings are separate. Zone names can
+also differ between cloud accounts. On AWS, for example, `us-east-1a` can be a different zone in
+each account. Name racks by a value that is the same everywhere, such as the AWS zone ID
+(`use1-az1`).
+
+When no replica or node is in the rack, Prosody reads from other racks with no error. A
+follower replica serves a record only after the leader's high watermark includes it, so a
+fetch from a follower can add a small delay.
+
+Each rack setting also has a `_FILE` form, for example `PROSODY_KAFKA_RACK_FILE`. It names a
+file that holds the value, which Prosody reads once at startup. Use it when a setup step finds
+the rack after the process environment is fixed, such as a Kubernetes init container that finds
+the zone of its node. The plain variable has priority over the file.
 
 ## Telemetry
 
