@@ -18,7 +18,6 @@
 pub const DEFAULT_IDEMPOTENCE_CACHE_SIZE: usize = 8192;
 
 use std::fmt::Display;
-use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 use std::{env, fs};
@@ -47,26 +46,19 @@ pub fn from_option_env<T>(env_var: &str) -> Result<Option<T>, String>
 where
     T: FromStr<Err: Display>,
 {
-    let Some(value_str) = env_value(env_var) else {
-        return Ok(None);
-    };
-
-    // Return None if the value is "none" (case-insensitive)
-    if value_str.trim().eq_ignore_ascii_case("none") {
-        return Ok(None);
-    }
-
-    parse_with_error(env_var, &value_str).map(Some)
+    option_value(env_var)
+        .map(|value| parse_with_error(env_var, &value))
+        .transpose()
 }
 
 /// Retrieves and parses an optional value from an environment variable or
 /// from a file.
 ///
-/// The variable itself has priority, with the same rules as
-/// [`from_option_env`]. When it is unset, the variable `{env_var}_FILE` can
-/// name a file that holds the value. A setup step writes this file when the
-/// value is known only after the process environment is fixed. Prosody reads
-/// the file once and trims the content. A blank file gives `Ok(None)`.
+/// The variable has priority. When it is unset or blank, the variable
+/// `{env_var}_FILE` can name a file that holds the value. A setup step writes
+/// this file when it finds the value after the process environment is fixed.
+/// Prosody trims the value from either source. A blank value or `none`
+/// (case-insensitive) gives `Ok(None)`.
 ///
 /// # Errors
 ///
@@ -76,15 +68,7 @@ pub fn from_option_env_or_file<T>(env_var: &str) -> Result<Option<T>, String>
 where
     T: FromStr<Err: Display>,
 {
-    if env_value(env_var).is_some() {
-        return from_option_env(env_var);
-    }
-
-    let file_var = format!("{env_var}_FILE");
-    let Some(path) = env_value(&file_var) else {
-        return Ok(None);
-    };
-    from_option_file(&file_var, Path::new(&path))
+    option_env_or_file(env_var, |name| env::var(name).ok())
 }
 
 /// Retrieves and parses an optional environment variable with a fallback
@@ -197,16 +181,9 @@ pub fn from_duration_env_with_fallback(
 /// Returns an error if the environment variable is set but cannot be parsed as
 /// a valid duration (unless the value is "none", which returns `Ok(None)`).
 pub fn from_option_duration_env(env_var: &str) -> Result<Option<Duration>, String> {
-    let Some(value_str) = env_value(env_var) else {
-        return Ok(None);
-    };
-
-    // Return None if the value is "none" (case-insensitive)
-    if value_str.trim().eq_ignore_ascii_case("none") {
-        return Ok(None);
-    }
-
-    parse_duration_with_error(env_var, &value_str).map(Some)
+    option_value(env_var)
+        .map(|value| parse_duration_with_error(env_var, &value))
+        .transpose()
 }
 
 /// Retrieves and parses an optional duration environment variable with a
@@ -258,24 +235,47 @@ fn env_value(env_var: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-/// Parses the trimmed content of the file at `path`, which `file_var` names.
-/// A blank file counts as unset.
-fn from_option_file<T>(file_var: &str, path: &Path) -> Result<Option<T>, String>
+/// Implements [`from_option_env_or_file`] with `lookup` as the source of
+/// variables.
+fn option_env_or_file<T>(
+    env_var: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<T>, String>
 where
     T: FromStr<Err: Display>,
 {
-    let content = fs::read_to_string(path).map_err(|error| {
-        format!(
-            "failed to read file '{}' from environment variable '${file_var}': {error:#}",
-            path.display()
-        )
-    })?;
+    let value = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
+    if let Some(value) = value(env_var) {
+        return parse_option(env_var, &value);
+    }
 
-    let value = content.trim();
-    if value.is_empty() {
+    let file_var = format!("{env_var}_FILE");
+    let Some(path) = value(&file_var) else {
+        return Ok(None);
+    };
+    let content = fs::read_to_string(&path).map_err(|error| {
+        format!("failed to read file '{path}' from environment variable '${file_var}': {error:#}")
+    })?;
+    parse_option(&file_var, &content)
+}
+
+/// The variable's value, or `None` when it is unset, blank, or `none`
+/// (case-insensitive).
+fn option_value(env_var: &str) -> Option<String> {
+    env_value(env_var).filter(|value| !value.trim().eq_ignore_ascii_case("none"))
+}
+
+/// Parses the trimmed `value` of `var`. A blank value or `none`
+/// (case-insensitive) gives `Ok(None)`.
+fn parse_option<T>(var: &str, value: &str) -> Result<Option<T>, String>
+where
+    T: FromStr<Err: Display>,
+{
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
         return Ok(None);
     }
-    parse_with_error(file_var, value).map(Some)
+    parse_with_error(var, value).map(Some)
 }
 
 /// Retrieves the value of an environment variable that has no fallback.

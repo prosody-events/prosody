@@ -171,10 +171,9 @@ in the consumer's own rack:
   without it.
 
 A value must equal the rack name that the brokers or the Cassandra nodes use. Kafka and
-Cassandra can name the same zone differently, so the two settings are separate. Zone names can
-also differ between cloud accounts. On AWS, for example, `us-east-1a` can be a different zone in
-each account. Name racks by a value that is the same everywhere, such as the AWS zone ID
-(`use1-az1`).
+Cassandra can name the same zone differently, so the two settings are separate. Some cloud
+providers give one zone a different name in each account. Name racks by a zone ID that is the
+same in every account.
 
 When no replica or node is in the rack, Prosody reads from other racks with no error. A
 follower replica serves a record only after the leader's high watermark includes it, so a
@@ -182,8 +181,8 @@ fetch from a follower can add a small delay.
 
 Each rack setting also has a `_FILE` form, for example `PROSODY_KAFKA_RACK_FILE`. It names a
 file that holds the value, which Prosody reads once at startup. Use it when a setup step finds
-the rack after the process environment is fixed, such as a Kubernetes init container that finds
-the zone of its node. The plain variable has priority over the file.
+the rack after the process environment is fixed. The plain variable has priority over the file.
+Prosody trims the value from either source. A blank value or `none` means no rack.
 
 ## Telemetry
 
