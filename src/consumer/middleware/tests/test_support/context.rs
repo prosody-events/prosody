@@ -178,8 +178,7 @@ impl<P, S> MockEventContext<P, S> {
     pub fn timer_operations(&self) -> Vec<TimerOperation> {
         self.timer_operations
             .as_ref()
-            .map(|ops| ops.lock().clone())
-            .unwrap_or_default()
+            .map_or_default(|ops| ops.lock().clone())
     }
 
     /// Count scheduled timers of a specific type.

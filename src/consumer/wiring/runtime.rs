@@ -243,7 +243,9 @@ async fn release_probe(probe_server: Option<ProbeServer>, error: ConsumerError) 
 /// # Errors
 ///
 /// [`ConsumerError::Hostname`] when the client id cannot be derived.
-fn client_config(consumer_config: &ConsumerConfiguration) -> Result<ClientConfig, ConsumerError> {
+pub(super) fn client_config(
+    consumer_config: &ConsumerConfiguration,
+) -> Result<ClientConfig, ConsumerError> {
     let bootstrap = if consumer_config.mock {
         for topic in &consumer_config.subscribed_topics {
             crate::create_mock_topic(topic)
@@ -290,5 +292,9 @@ fn client_config(consumer_config: &ConsumerConfiguration) -> Result<ClientConfig
             consumer_config.fetch_wait.as_millis().to_string(),
         )
         .set_log_level(RDKafkaLogLevel::Error);
+
+    if let Some(rack) = &consumer_config.rack {
+        config.set("client.rack", rack);
+    }
     Ok(config)
 }

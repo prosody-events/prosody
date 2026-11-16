@@ -64,7 +64,7 @@ pub fn partition_for_key(key: &[u8], count: PartitionCount) -> Result<Partition,
         return Err(EmptyKeyError);
     }
     // 0 <= remainder < count <= i32::MAX, so the cast is lossless and non-negative.
-    Ok((crc32fast::hash(key) % count.0.get()) as Partition)
+    Ok((crc32fast::hash(key) % count.0) as Partition)
 }
 
 /// The key passed to [`partition_for_key`] was empty.

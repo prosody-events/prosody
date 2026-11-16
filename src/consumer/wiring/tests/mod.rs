@@ -56,6 +56,7 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 
 mod lifecycle;
+mod rack;
 mod responding;
 mod selection;
 

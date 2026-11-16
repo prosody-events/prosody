@@ -604,8 +604,7 @@ impl HighLevelModel {
     ) -> Vec<TriggerTuple> {
         self.slab_index
             .get(&(*segment_id, slab_id, timer_type))
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|set| set.iter().cloned().collect())
     }
 
     /// Gets triggers from key index.
@@ -618,8 +617,7 @@ impl HighLevelModel {
     ) -> Vec<TriggerTuple> {
         self.key_index
             .get(&(*segment_id, key.clone(), timer_type))
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|set| set.iter().cloned().collect())
     }
 }
 

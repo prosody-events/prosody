@@ -324,10 +324,7 @@ where
             return Ok(false);
         }
     }
-    if !assert_peeks(handle).await? {
-        return Ok(false);
-    }
-    Ok(true)
+    assert_peeks(handle).await
 }
 
 /// Handle-internal peek parity: `peek_front == get(0)` and

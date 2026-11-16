@@ -154,11 +154,10 @@ impl TimerDeferStore for MemoryTimerDeferStore {
                 .deferred
                 .get_async(key.as_ref())
                 .await
-                .map(|entry| {
+                .map_or_default(|entry| {
                     let (timers, _) = entry.get();
                     timers.keys().copied().collect::<Vec<_>>()
-                })
-                .unwrap_or_default())
+                }))
         }
     }
 

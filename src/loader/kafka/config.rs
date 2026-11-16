@@ -21,6 +21,10 @@ pub struct LoaderConfiguration {
     /// Consumer group ID base name. The loader appends `.loader`.
     pub group_id: String,
 
+    /// Rack sent as librdkafka's `client.rack`, so a fetch can use a replica
+    /// in the same rack. See [`ConsumerConfiguration::rack`].
+    pub rack: Option<String>,
+
     /// Maximum number of loaded messages retained by callers.
     ///
     /// Controls the semaphore and request-channel capacity.
@@ -77,6 +81,7 @@ impl LoaderConfiguration {
         Self {
             bootstrap_servers: consumer_config.bootstrap_servers.clone(),
             group_id: consumer_config.group_id.clone(),
+            rack: consumer_config.rack.clone(),
             max_permits: loader_capacity(consumer_config.max_uncommitted),
             cache_size: consumer_config.loader.cache_size,
             poll_interval: consumer_config.poll_interval,
