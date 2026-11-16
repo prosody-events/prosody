@@ -47,6 +47,7 @@ use crate::state::descriptor::{
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::Promoted;
 use crate::state::session::sealed::StateLifecycle;
@@ -158,6 +159,7 @@ fn make_session_with_dirty(
         event,
         dedup_ttl: CompactDuration::new(30),
         checks: (),
+        routes: TopicRoutes::Unpublished,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     })
 }

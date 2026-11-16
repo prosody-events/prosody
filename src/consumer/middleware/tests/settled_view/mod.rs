@@ -16,6 +16,7 @@ use crate::state::cell::Values;
 use crate::state::descriptor::tests::{TestSession, test_session_parts};
 use crate::state::descriptor::{CellStateError, Registered, ValueHandle, value_state};
 use crate::state::memory::MemoryCellStore;
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::sealed::StateLifecycle;
 use crate::state::store::CellRead;
@@ -409,6 +410,7 @@ async fn permanent_finalize_failure_discards_overlay_keeping_floor() -> Result<(
         },
         dedup_ttl: CompactDuration::new(30),
         checks: (),
+        routes: TopicRoutes::Unpublished,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     });
     let context = MockEventContext::new()

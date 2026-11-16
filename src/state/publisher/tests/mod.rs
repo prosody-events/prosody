@@ -1,15 +1,15 @@
-//! The advertised routes must equal the topics that wrote each collection.
+//! The advertised routes must equal the routes that each assignment wrote.
 //!
 //! Two processes of one group share the durable stores. Each process owns its
 //! routes and acquires its partitions through a real `StateManagerProvider`.
-//! Writes use both durable write paths: the settle-time finalize and the
-//! mid-handler commit. A restart replaces one process while the other keeps
-//! its latches. A plain model holds the expected rows.
+//! Each acquisition is one partition assignment with its own latches. Writes
+//! use both durable write paths: the settle-time finalize and the mid-handler
+//! commit. A plain model holds the expected rows.
 
 use super::*;
 use crate::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
-use crate::error::{ClassifyError, ErrorCategory, RetryAlert};
+use crate::error::RetryAlert;
 use crate::segment::partition_segment_id;
 use crate::state::cell::Values;
 use crate::state::descriptor::value_state;
@@ -23,14 +23,19 @@ use crate::state::session::{Finalized, Promoted, TerminationWatch};
 use crate::state::store::CellRead;
 use crate::state::tests::cell_suite::{MemoryDeduplicationStore, value_cell};
 use crate::state::tests::support::{ScriptedPublicationStore, probe};
-use crate::state::{CollectionId, PartitionBackend, StateBackendFactory, StateKey};
+use crate::state::{PartitionBackend, StateBackendFactory, StateKey, StoreOutcome};
 use crate::test_util::{ModelProperty, TEST_RUNTIME};
 use crate::timers::duration::CompactDuration;
 use crate::{Key, Partition};
 use color_eyre::eyre::{Result, ensure, eyre};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::collections::BTreeSet;
+use strum::VariantArray;
 use tokio::sync::watch;
+
+mod harness;
+
+use harness::Harness;
 
 const GROUP: &str = "group-a";
 const OTHER_GROUP: &str = "group-b";
@@ -41,7 +46,8 @@ const RETIRED_TOPIC: (&str, i32) = ("orders-retired", 2);
 /// The subscribed topics and their partition counts.
 const TOPICS: [(&str, i32); 3] = [("orders-a", 3), ("orders-b", 7), ("orders-c", 1)];
 
-/// The registered collections. `wishlist` is private, so it never has a route.
+/// The registered collections. The first two are published. `wishlist` is
+/// private, so it never has a route.
 const COLLECTIONS: [(&str, StateVisibility, CommitMode); 3] = [
     (
         "cart",
@@ -63,108 +69,82 @@ const COLLECTIONS: [(&str, StateVisibility, CommitMode); 3] = [
 /// The number of processes in the group.
 const PROCESSES: usize = 2;
 
-/// One consumer process of the group.
-type Process = StateManagerProvider<Factory, ()>;
+/// A partition assignment `(process, topic, partition)`, with indices into the
+/// fixture tables.
+type Slot = (usize, usize, Partition);
 
-/// A `(collection, topic)` pair, as indices into the fixture tables.
-type RouteIndex = (usize, usize);
+/// A routing row `(collection, group, topic, partition count)`.
+type Row = (usize, ConsumerGroup, Topic, i32);
 
-/// Mints the backends of one process over the shared durable stores.
-#[derive(Clone)]
-struct Factory {
-    cells: MemoryCells,
-    identities: MemoryDescriptorIdentityStore,
-    routes: Routes<ScriptedPublicationStore>,
-}
-
-impl StateBackendFactory<()> for Factory {
-    type Backend = PartitionBackend<
-        MemoryDeduplicationStore,
-        MemoryDescriptorIdentityStore,
-        MemoryCellStore,
-        (),
-        ScriptedPublicationStore,
-    >;
-
-    fn for_partition(&self, _topic: Topic, _partition: Partition, (): ()) -> Self::Backend {
-        PartitionBackend::new(
-            MemoryDeduplicationStore::default(),
-            self.identities.clone(),
-            MemoryCellStore::new(self.cells.clone()),
-            (),
-            self.routes.clone(),
-        )
-    }
-}
-
-/// The durable write path that a handler uses.
-#[derive(Clone, Copy, Debug)]
-enum Funnel {
-    Finalize,
-    Commit,
-}
-
-/// One durable write of one collection from one partition of one topic.
+/// One durable write of one collection from one partition of one topic. An
+/// unseeded write buffers nothing, so it has nothing to write.
 #[derive(Clone, Copy, Debug)]
 struct Write {
-    process: usize,
-    topic: usize,
-    partition: Partition,
+    slot: Slot,
     collection: usize,
-    funnel: Funnel,
+    seeded: bool,
+    commit: bool,
 }
 
 impl Arbitrary for Write {
     fn arbitrary(g: &mut Gen) -> Self {
         Self {
-            process: usize::arbitrary(g) % PROCESSES,
-            topic: usize::arbitrary(g) % TOPICS.len(),
-            partition: Partition::from(u8::arbitrary(g) % 2),
+            slot: slot(g),
             collection: usize::arbitrary(g) % COLLECTIONS.len(),
-            funnel: if bool::arbitrary(g) {
-                Funnel::Finalize
-            } else {
-                Funnel::Commit
-            },
+            seeded: u8::arbitrary(g) % 4 != 0,
+            commit: bool::arbitrary(g),
         }
     }
 }
 
 #[derive(Clone, Debug)]
 enum Op {
-    /// One write, or two concurrent writes. The routing store rejects each
-    /// upsert when `upsert_fails` is set.
+    /// One write, or two concurrent writes. The routing store fails each
+    /// upsert with `failure`.
     Write {
         first: Write,
         racer: Option<Write>,
-        upsert_fails: bool,
+        failure: Option<ErrorCategory>,
     },
-    /// The process stops, and a new process acquires a partition. When
-    /// `removal_fails` is set, the first acquisition fails and the next one
-    /// succeeds.
-    Restart { process: usize, removal_fails: bool },
+    /// An operator or an older version removes the rows of the group for a
+    /// published collection.
+    Remove { collection: usize },
+    /// A rebalance moves a partition away from its process and back.
+    Reassign { slot: Slot },
+    /// The process stops, and a new process acquires a partition. The routing
+    /// store fails the removals of that acquisition with `failure`.
+    Restart {
+        process: usize,
+        failure: Option<ErrorCategory>,
+    },
 }
 
 impl Arbitrary for Op {
     fn arbitrary(g: &mut Gen) -> Self {
-        if u8::arbitrary(g) % 6 == 0 {
-            return Self::Restart {
+        match u8::arbitrary(g) % 10 {
+            0 => Self::Restart {
                 process: usize::arbitrary(g) % PROCESSES,
-                removal_fails: bool::arbitrary(g),
-            };
-        }
-        Self::Write {
-            first: Write::arbitrary(g),
-            racer: Option::arbitrary(g),
-            upsert_fails: u8::arbitrary(g) % 4 == 0,
+                failure: failure(g),
+            },
+            1 => Self::Remove {
+                collection: usize::arbitrary(g) % 2,
+            },
+            2 | 3 => Self::Reassign { slot: slot(g) },
+            _ => Self::Write {
+                first: Write::arbitrary(g),
+                racer: Option::arbitrary(g),
+                failure: failure(g),
+            },
         }
     }
 }
 
-/// `stale` seeds rows that earlier deployments left in the routing table.
+/// `stale` seeds rows that earlier deployments left in the routing table. The
+/// routing store fails the removals of the first acquisitions with `failure`.
 #[derive(Clone, Debug)]
 struct Trace {
     stale: bool,
+    failure: Option<ErrorCategory>,
     ops: Vec<Op>,
 }
 
@@ -172,228 +152,29 @@ impl Arbitrary for Trace {
     fn arbitrary(g: &mut Gen) -> Self {
         Self {
             stale: bool::arbitrary(g),
+            failure: failure(g),
             ops: Vec::arbitrary(g),
         }
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        let stale = self.stale;
-        Box::new(self.ops.shrink().map(move |ops| Self { stale, ops }))
+        let (stale, failure) = (self.stale, self.failure);
+        Box::new(self.ops.shrink().map(move |ops| Self {
+            stale,
+            failure,
+            ops,
+        }))
     }
 }
 
-/// The durable stores, which outlive each process, and the live processes.
-struct Harness {
-    publications: ScriptedPublicationStore,
-    cells: MemoryCells,
-    identities: MemoryDescriptorIdentityStore,
-    subsystem: SubsystemName,
-    registry: Arc<CollectionDefRegistry>,
-    group: ConsumerGroup,
-    processes: Vec<Process>,
-    // The senders keep the termination receivers of each session open.
-    shutdown: watch::Sender<ShutdownPhase>,
-    cancel: watch::Sender<bool>,
-}
-
-impl Harness {
-    /// Seeds the stale rows when `stale` is set, then starts each process.
-    async fn start(stale: bool) -> Result<Self> {
-        let mut registry = CollectionDefRegistry::default();
-        for (collection, visibility, commit_mode) in COLLECTIONS {
-            registry.register(
-                &value_state::<JsonCodec>(collection),
-                CollectionDef {
-                    commit_mode,
-                    visibility,
-                    ..CollectionDef::new(None)
-                },
-            )?;
-        }
-        let subsystem = SubsystemName::try_new("orders")?;
-        let publications = ScriptedPublicationStore::new();
-        if stale {
-            // An earlier deployment published every collection from a topic
-            // that the group left. Another group publishes them too.
-            for (collection, ..) in COLLECTIONS {
-                for owner in [GROUP, OTHER_GROUP] {
-                    let row = StatePublication {
-                        group_id: Arc::from(owner),
-                        topic: Topic::from(RETIRED_TOPIC.0),
-                        partition_count: PartitionCount::try_from(RETIRED_TOPIC.1)?,
-                    };
-                    publications
-                        .seed(&subsystem, StateType::Application, &name(collection)?, &row)
-                        .await;
-                }
-            }
-        }
-
-        let (shutdown, _) = watch::channel(ShutdownPhase::default());
-        let (cancel, _) = watch::channel(false);
-        let mut harness = Self {
-            publications,
-            cells: MemoryCells::new(),
-            identities: MemoryDescriptorIdentityStore::new(),
-            subsystem,
-            registry: Arc::new(registry),
-            group: Arc::from(GROUP),
-            processes: Vec::with_capacity(PROCESSES),
-            shutdown,
-            cancel,
-        };
-        for process in 0..PROCESSES {
-            let started = harness.process()?;
-            harness.processes.push(started);
-            harness.join(process, false).await?;
-        }
-
-        let unsubscribed = Topic::from("orders-unsubscribed");
-        let acquired = harness.processes[0].acquire(unsubscribed, 0, ()).await;
-        ensure!(
-            matches!(acquired, Err(StateAcquireError::Unrouted(topic)) if topic == unsubscribed),
-            "a publishing process acquired a topic that it does not subscribe to"
-        );
-        Ok(harness)
-    }
-
-    /// A new process with new routes over the durable stores.
-    fn process(&self) -> Result<Process> {
-        let counts = TOPICS
-            .iter()
-            .map(|&(topic, count)| Ok((Topic::from(topic), PartitionCount::try_from(count)?)))
-            .collect::<Result<Vec<_>>>()?;
-        let routes = Routes::new(
-            self.publications.clone(),
-            self.subsystem.clone(),
-            &self.registry,
-            self.group.clone(),
-            counts,
-        );
-        let factory = Factory {
-            cells: self.cells.clone(),
-            identities: self.identities.clone(),
-            routes,
-        };
-        Ok(StateManagerProvider::new(
-            factory,
-            (),
-            self.registry.clone(),
-            self.group.clone(),
-            CompactDuration::new(30),
-        ))
-    }
-
-    /// Replaces `process` with a new process.
-    async fn restart(&mut self, process: usize, removal_fails: bool) -> Result<()> {
-        self.processes[process] = self.process()?;
-        self.join(process, removal_fails).await
-    }
-
-    /// Acquires the first partition of `process`, as an assignment does.
-    async fn join(&self, process: usize, removal_fails: bool) -> Result<()> {
-        let topic = Topic::from(TOPICS[0].0);
-        if removal_fails {
-            self.publications
-                .fail_writes_with(Some(ErrorCategory::Transient));
-            let acquired = self.processes[process].acquire(topic, 0, ()).await;
-            self.publications.fail_writes_with(None);
-            ensure!(
-                matches!(&acquired, Err(error @ StateAcquireError::Withdrawal(_))
-                    if error.classify_error() == ErrorCategory::Transient),
-                "a failed removal did not fail the acquisition"
-            );
-        }
-        self.processes[process].acquire(topic, 0, ()).await?;
-        Ok(())
-    }
-
-    /// Runs write number `n` through a new session of the write's partition.
-    /// Returns the write result, and whether the cell is durable afterwards.
-    async fn write(&self, write: Write, n: u128) -> Result<(Result<(), StateAccessError>, bool)> {
-        let topic = Topic::from(TOPICS[write.topic].0);
-        let name = name(COLLECTIONS[write.collection].0)?;
-        let key: Key = Arc::from(format!("key-{n}"));
-        let manager = self.processes[write.process]
-            .acquire(topic, write.partition, ())
-            .await?;
-        let termination = TerminationWatch::new(self.shutdown.subscribe(), self.cancel.subscribe());
-        let scope = manager.session(key.clone(), probe(n), termination);
-        let session = scope.handle();
-        session
-            .seed(StateType::Application, &name, &value_cell(), Some(b"v"))
-            .await;
-
-        let result = match write.funnel {
-            Funnel::Commit => {
-                let permit = session.permit().await;
-                session
-                    .commit(&permit, StateType::Application, &name)
-                    .await
-                    .map(|_| ())
-            }
-            Funnel::Finalize => match session.finalize().await {
-                Ok(Finalized::Clean) => Ok(()),
-                Ok(Finalized::Staged(staged)) => {
-                    let promoted = staged.promote(&RetryAlert::default(), || false).await;
-                    ensure!(
-                        matches!(promoted, Promoted::Complete),
-                        "the promote of write {n} did not complete"
-                    );
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            },
-        };
-
-        let segment = partition_segment_id(topic, write.partition, &self.group);
-        let id = CollectionId::new(StateKey::new(segment, key), StateType::Application, name);
-        let store = MemoryCellStore::new(self.cells.clone());
-        let committed = CellRead::<Values>::read(&store, &id, value_cell().as_ref())
-            .await?
-            .0
-            .into_inner();
-        let durable = committed.is_some() || !self.cells.provisional_coordinates(&id).is_empty();
-        Ok((result, durable))
-    }
-
-    /// The `(topic, partition count)` rows of `group` for `collection`.
-    async fn rows(&self, collection: usize, group: &str) -> Result<BTreeSet<(Topic, i32)>> {
-        let name = name(COLLECTIONS[collection].0)?;
-        Ok(self
-            .publications
-            .rows(&self.subsystem, StateType::Application, &name)
-            .await
-            .into_iter()
-            .filter(|row| row.group_id.as_ref() == group)
-            .map(|row| (row.topic, i32::from(row.partition_count)))
-            .collect())
-    }
-
-    /// Compares the routing table with the model's `advertised` routes.
-    async fn matches(&self, advertised: &BTreeSet<RouteIndex>, stale: bool) -> Result<bool> {
-        let retired: BTreeSet<_> = stale
-            .then_some((Topic::from(RETIRED_TOPIC.0), RETIRED_TOPIC.1))
-            .into_iter()
-            .collect();
-        for collection in 0..COLLECTIONS.len() {
-            let mut expected: BTreeSet<(Topic, i32)> = advertised
-                .iter()
-                .filter(|(written, _)| *written == collection)
-                .map(|&(_, topic)| (Topic::from(TOPICS[topic].0), TOPICS[topic].1))
-                .collect();
-            // A process removes the stale row of a private collection only.
-            if published(collection) {
-                expected.extend(&retired);
-            }
-            if self.rows(collection, GROUP).await? != expected
-                || self.rows(collection, OTHER_GROUP).await? != retired
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
+/// The expected routing table, and the routes that each live assignment made
+/// durable.
+#[derive(Default)]
+struct Model {
+    rows: BTreeSet<Row>,
+    latched: BTreeSet<(Slot, usize)>,
+    /// Whether each live process removed the rows of the private collections.
+    withdrawn: [bool; PROCESSES],
 }
 
 fn name(value: &str) -> Result<StateName> {
@@ -404,90 +185,164 @@ fn published(collection: usize) -> bool {
     COLLECTIONS[collection].1 == StateVisibility::Published
 }
 
-/// Runs `trace` against the model. Returns `Ok(false)` on a model mismatch.
-async fn run_trace(trace: Trace) -> Result<bool> {
-    let mut harness = Harness::start(trace.stale).await?;
-    // The model: the routes that the group advertises, and the routes that
-    // each live process made durable.
-    let mut advertised: BTreeSet<RouteIndex> = BTreeSet::new();
-    let mut latched: [BTreeSet<RouteIndex>; PROCESSES] = Default::default();
-    let mut writes = 0_u128;
+fn slot(g: &mut Gen) -> Slot {
+    (
+        usize::arbitrary(g) % PROCESSES,
+        usize::arbitrary(g) % TOPICS.len(),
+        Partition::from(u8::arbitrary(g) % 2),
+    )
+}
 
-    for op in trace.ops {
-        match op {
-            Op::Restart {
-                process,
-                removal_fails,
-            } => {
-                harness.restart(process, removal_fails).await?;
-                latched[process].clear();
-            }
-            Op::Write {
-                first,
-                racer,
-                upsert_fails,
-            } => {
-                let failure = upsert_fails.then_some(ErrorCategory::Transient);
-                harness.publications.fail_writes_with(failure);
-                let before = harness.publications.upserts();
-                let outcomes = match racer {
-                    Some(racer) => {
-                        let (one, two) = tokio::join!(
-                            harness.write(first, writes),
-                            harness.write(racer, writes + 1)
-                        );
-                        vec![(first, one?), (racer, two?)]
-                    }
-                    None => vec![(first, harness.write(first, writes).await?)],
-                };
-                writes += 2;
-                harness.publications.fail_writes_with(None);
+/// The first assignment of a process: partition 0 of the first topic.
+fn home(process: usize) -> Slot {
+    (process, 0, Partition::from(0_u8))
+}
 
-                // The routes that each process latched in this operation.
-                let mut opened: BTreeSet<(usize, RouteIndex)> = BTreeSet::new();
-                for (write, (result, durable)) in outcomes {
-                    let route = (write.collection, write.topic);
-                    let needs_upsert =
-                        published(write.collection) && !latched[write.process].contains(&route);
-                    if needs_upsert && upsert_fails {
-                        // The route is not durable, so no cell can be durable.
-                        let rejected = matches!(&result, Err(error)
-                            if error.classify_error() == ErrorCategory::Transient);
-                        if !rejected || durable {
-                            return Ok(false);
-                        }
-                    } else {
-                        if result.is_err() || !durable {
-                            return Ok(false);
-                        }
-                        if needs_upsert {
-                            opened.insert((write.process, route));
-                        }
-                    }
-                }
-                // Concurrent first writers in one process share one upsert.
-                if !upsert_fails && harness.publications.upserts() - before != opened.len() {
-                    return Ok(false);
-                }
-                for (process, route) in opened {
-                    latched[process].insert(route);
-                    advertised.insert(route);
-                }
-            }
-        }
-        if !harness.matches(&advertised, trace.stale).await? {
+/// A store failure in one third of the cases, of any category.
+fn failure(g: &mut Gen) -> Option<ErrorCategory> {
+    let category = ErrorCategory::VARIANTS[usize::arbitrary(g) % ErrorCategory::VARIANTS.len()];
+    (u8::arbitrary(g) % 3 == 0).then_some(category)
+}
+
+/// Runs one write operation. Returns `Ok(false)` on a model mismatch.
+async fn run_writes(
+    harness: &mut Harness,
+    model: &mut Model,
+    writes: &[Write],
+    failure: Option<ErrorCategory>,
+    n: u128,
+) -> Result<bool> {
+    // A write runs in the live assignment of its partition. A partition that
+    // has no assignment is acquired first.
+    for write in writes {
+        if !harness.assignments.contains_key(&write.slot)
+            && !harness.assign(model, write.slot, None).await?
+        {
             return Ok(false);
         }
+    }
+    harness.publications.fail_writes_with(failure);
+    let upserts = harness.publications.upserts();
+    let outcomes = match writes {
+        [first, racer] => {
+            let (one, two) = tokio::join!(harness.write(*first, n), harness.write(*racer, n + 1));
+            vec![(*first, one?), (*racer, two?)]
+        }
+        _ => vec![(writes[0], harness.write(writes[0], n).await?)],
+    };
+    harness.publications.fail_writes_with(None);
+
+    // The routes that each assignment latched in this operation.
+    let mut opened: BTreeSet<(Slot, usize)> = BTreeSet::new();
+    for (write, (result, durable)) in outcomes {
+        let route = (write.slot, write.collection);
+        let needs_upsert =
+            write.seeded && published(write.collection) && !model.latched.contains(&route);
+        if let (true, Some(category)) = (needs_upsert, failure) {
+            // The route is not durable, so no cell can be durable. A routing
+            // failure is never Permanent, so settle retries the event.
+            let expected = match category {
+                ErrorCategory::Terminal => ErrorCategory::Terminal,
+                ErrorCategory::Transient | ErrorCategory::Permanent => ErrorCategory::Transient,
+            };
+            if !matches!(&result, Err(error) if error.classify_error() == expected) || durable {
+                return Ok(false);
+            }
+        } else {
+            // An unseeded write writes nothing, and it never fails. A
+            // `ReadUncommitted` finalize writes its cells but stages nothing.
+            let reported = write.seeded
+                && (write.commit || COLLECTIONS[write.collection].2 == CommitMode::ReadCommitted);
+            if !matches!(result, Ok(staged) if staged == reported) || durable != write.seeded {
+                return Ok(false);
+            }
+            if needs_upsert {
+                opened.insert(route);
+            }
+        }
+    }
+    // Concurrent first writers in one assignment share one upsert.
+    if failure.is_none() && harness.publications.upserts() - upserts != opened.len() {
+        return Ok(false);
+    }
+    for (slot, collection) in opened {
+        let (_, topic, _) = slot;
+        let (label, count) = TOPICS[topic];
+        model.latched.insert((slot, collection));
+        model
+            .rows
+            .insert((collection, harness.group.clone(), Topic::from(label), count));
     }
     Ok(true)
 }
 
-/// After each operation, a published collection advertises exactly the topics
-/// that wrote it, with the partition count of each topic. Seeded stale rows of
-/// published collections and of other groups stay. A private collection
-/// advertises nothing for the group. A write whose upsert fails leaves no
-/// durable cell. Concurrent first writers in one process share one upsert. A
-/// restart of one process removes no row that the other process latched.
+/// Runs `trace` against the model. Returns `Ok(false)` on a model mismatch.
+async fn run_trace(trace: Trace) -> Result<bool> {
+    let mut model = Model::default();
+    let mut harness = Harness::start(trace.stale, &mut model).await?;
+    for process in 0..PROCESSES {
+        if !harness
+            .assign(&mut model, home(process), trace.failure)
+            .await?
+        {
+            return Ok(false);
+        }
+    }
+    let mut writes = 0_u128;
+
+    for op in trace.ops {
+        let matched = match op {
+            Op::Write {
+                first,
+                racer,
+                failure,
+            } => {
+                let batch: Vec<Write> = [first].into_iter().chain(racer).collect();
+                writes += 2;
+                run_writes(&mut harness, &mut model, &batch, failure, writes).await?
+            }
+            Op::Remove { collection } => {
+                let name = name(COLLECTIONS[collection].0)?;
+                harness
+                    .publications
+                    .remove_group(&harness.subsystem, StateType::Application, &name, GROUP)
+                    .await?;
+                model
+                    .rows
+                    .retain(|row| row.0 != collection || row.1.as_ref() != GROUP);
+                true
+            }
+            Op::Reassign { slot } => harness.assign(&mut model, slot, None).await?,
+            Op::Restart { process, failure } => {
+                harness.processes[process] = harness.process()?;
+                harness.assignments.retain(|slot, _| slot.0 != process);
+                model.latched.retain(|(slot, _)| slot.0 != process);
+                model.withdrawn[process] = false;
+                harness.assign(&mut model, home(process), failure).await?
+            }
+        };
+        if !matched || harness.rows().await? != model.rows {
+            return Ok(false);
+        }
+    }
+
+    // A publishing process never acquires a topic that it does not subscribe
+    // to.
+    let unsubscribed = Topic::from("orders-unsubscribed");
+    let acquired = harness.processes[0].acquire(unsubscribed, 0, ()).await;
+    Ok(matches!(acquired, Err(StateAcquireError::Unrouted(topic)) if topic == unsubscribed))
+}
+
+/// After each operation, the routing table holds exactly the expected rows. A
+/// published collection advertises each topic that wrote it in a live or past
+/// assignment, unless a removal from outside deleted the row. Each new
+/// assignment writes the row again before its first write. A write whose
+/// upsert fails returns an error that is not Permanent and leaves no durable
+/// cell. A write with nothing buffered writes no row and never fails.
+/// Concurrent first writers in one assignment share one upsert. A failed
+/// removal of private rows never fails an acquisition, and the next
+/// acquisition of the process completes it. Stale rows of published
+/// collections and of other groups stay.
 #[test]
 fn advertised_routes_equal_the_topics_that_wrote() {
     fn property(trace: Trace) -> Result<bool> {

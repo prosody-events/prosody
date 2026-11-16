@@ -8,6 +8,7 @@ use crate::segment::partition_segment_id;
 use crate::state::descriptor::StateDescriptor;
 use crate::state::identity::StateKey;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::Promoted;
 use crate::state::session::sealed::StateLifecycle;
@@ -88,6 +89,7 @@ fn owner_session<C: CellStore>(
         event,
         dedup_ttl: CompactDuration::new(30),
         checks: (),
+        routes: TopicRoutes::Unpublished,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     })
 }

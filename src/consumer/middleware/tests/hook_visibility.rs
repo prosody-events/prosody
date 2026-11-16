@@ -10,6 +10,7 @@ use crate::state::collection::sealed::{ReadEngine, Reads, Session};
 use crate::state::descriptor::value_state;
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
@@ -227,6 +228,7 @@ async fn dedup_shutdown_hook_reads_the_committed_value() -> Result<()> {
             },
             dedup_ttl: CompactDuration::new(30),
             checks: (),
+            routes: TopicRoutes::Unpublished,
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
         });
     session
@@ -318,6 +320,7 @@ async fn rejected_promote_hook_reads_repaired_collections() -> Result<()> {
             },
             dedup_ttl: CompactDuration::new(30),
             checks: (),
+            routes: TopicRoutes::Unpublished,
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
         });
     session

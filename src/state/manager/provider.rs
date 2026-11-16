@@ -1,6 +1,6 @@
 //! The process-wide provider that acquires a partition's state manager.
 
-use super::{IdentityErr, PartitionStateProvider, PublicationErr, StateManager, StateManagerInner};
+use super::{IdentityErr, PartitionStateProvider, StateManager, StateManagerInner};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::segment::partition_segment_id;
 use crate::state::descriptor_identity::{DescriptorIdentityError, acquire_descriptor_identities};
@@ -15,9 +15,9 @@ use thiserror::Error;
 use tokio::sync::OnceCell;
 
 /// Process-wide [`PartitionStateProvider`] over a
-/// `StateBackendFactory`: acquisition validates descriptor identities and
-/// removes the routing rows of unpublished collections before it mints the
-/// manager.
+/// `StateBackendFactory`: acquisition validates descriptor identities before
+/// it mints the manager. It also tries to remove the routing rows of
+/// unpublished collections.
 #[derive(Clone)]
 pub struct StateManagerProvider<F, L> {
     backend: F,
@@ -25,9 +25,13 @@ pub struct StateManagerProvider<F, L> {
     registry: Arc<CollectionDefRegistry>,
     consumer_group: Arc<str>,
     dedup_ttl: CompactDuration,
-    /// Process-level latch for identity validation and for the removal of
-    /// unpublished routing rows. It re-runs after an error.
-    ready: Arc<OnceCell<()>>,
+    /// Process-level latch for descriptor-identity validation. The identity
+    /// table is group-global, so validating the registry against it is a
+    /// once-per-process concern, not per-partition. Shared across provider
+    /// clones (an `Arc`), `get_or_try_init` runs the validation once on
+    /// success and re-runs on `Err` — preserving retry-until-shutdown while
+    /// the invariant *no state op runs under an unvalidated identity* holds.
+    validated: Arc<OnceCell<()>>,
 }
 
 impl<F, L> StateManagerProvider<F, L> {
@@ -60,7 +64,7 @@ impl<F, L> StateManagerProvider<F, L> {
             registry,
             consumer_group,
             dedup_ttl,
-            ready: Arc::new(OnceCell::new()),
+            validated: Arc::new(OnceCell::new()),
         }
     }
 }
@@ -71,7 +75,7 @@ where
     L: Clone + Send + Sync + 'static,
     T: Send,
 {
-    type AcquireError = StateAcquireError<IdentityErr<F::Backend>, PublicationErr<F::Backend>>;
+    type AcquireError = StateAcquireError<IdentityErr<F::Backend>>;
     type Manager = StateManager<F::Backend, L>;
 
     async fn acquire(
@@ -92,19 +96,15 @@ where
         // equivalent. Identity lives on the shared control-plane store,
         // decoupled from any kind's data store.
         let identity = backend.identity();
-        let routes = backend.routes();
-        self.ready
-            .get_or_try_init(|| async {
+        self.validated
+            .get_or_try_init(|| {
                 acquire_descriptor_identities(&identity, &self.registry, &self.consumer_group)
-                    .await
-                    .map_err(StateAcquireError::Identity)?;
-                // An unvalidated registry must not change routing rows.
-                routes
-                    .withdraw()
-                    .await
-                    .map_err(StateAcquireError::Withdrawal)
             })
-            .await?;
+            .await
+            .map_err(StateAcquireError::Identity)?;
+        // An unvalidated registry must not change routing rows.
+        let routes = backend.routes();
+        routes.withdraw().await;
         let routes = routes
             .for_topic(topic)
             .ok_or(StateAcquireError::Unrouted(topic))?;
@@ -127,10 +127,9 @@ where
 /// Error raised when a [`StateManagerProvider`] cannot acquire a
 /// partition's manager.
 #[derive(Debug, Error)]
-pub enum StateAcquireError<StoreErr, PublicationErr>
+pub enum StateAcquireError<StoreErr>
 where
     StoreErr: ClassifyError + Error + Send + Sync + 'static,
-    PublicationErr: ClassifyError + Error + Send + Sync + 'static,
 {
     /// Durable descriptor-identity validation failed. A mismatch is
     /// Permanent and recurs until the deployed descriptors match the
@@ -139,11 +138,6 @@ where
     #[error("keyed-state descriptor identity acquisition failed: {0:#}")]
     Identity(DescriptorIdentityError<StoreErr>),
 
-    /// The store could not remove the routing rows of a collection that is
-    /// not published. The next acquisition attempt tries again.
-    #[error("cannot remove the routing rows of an unpublished collection: {0:#}")]
-    Withdrawal(PublicationErr),
-
     /// Kafka assigned a topic that the consumer does not subscribe to, so the
     /// topic has no routes. A consumer that publishes state subscribes only to
     /// literal topics, so this error marks a broken invariant.
@@ -151,15 +145,13 @@ where
     Unrouted(Topic),
 }
 
-impl<StoreErr, PublicationErr> ClassifyError for StateAcquireError<StoreErr, PublicationErr>
+impl<StoreErr> ClassifyError for StateAcquireError<StoreErr>
 where
     StoreErr: ClassifyError + Error + Send + Sync + 'static,
-    PublicationErr: ClassifyError + Error + Send + Sync + 'static,
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {
             Self::Identity(e) => e.classify_error(),
-            Self::Withdrawal(e) => e.classify_error(),
             Self::Unrouted(_) => ErrorCategory::Permanent,
         }
     }

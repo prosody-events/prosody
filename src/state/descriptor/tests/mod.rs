@@ -17,6 +17,7 @@ use crate::loader::MemoryLoader;
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::order_codec::{I64KeyCodec, Utf8KeyCodec};
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
@@ -146,6 +147,7 @@ pub(crate) fn session_parts<L>(
         },
         dedup_ttl: CompactDuration::new(30),
         checks: (),
+        routes: TopicRoutes::Unpublished,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     };
     (parts, cell_store)
@@ -198,6 +200,7 @@ pub(crate) fn session_over<C: CellStore>(
         },
         dedup_ttl: CompactDuration::new(30),
         checks: (),
+        routes: TopicRoutes::Unpublished,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     })
 }

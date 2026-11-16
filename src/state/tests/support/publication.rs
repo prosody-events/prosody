@@ -116,6 +116,14 @@ impl ScriptedPublicationStore {
             .count()
     }
 
+    pub(crate) fn removes(&self) -> usize {
+        self.calls
+            .lock()
+            .iter()
+            .filter(|call| matches!(call, PublicationCall::Remove { .. }))
+            .count()
+    }
+
     pub(crate) async fn rows(
         &self,
         subsystem: &SubsystemName,

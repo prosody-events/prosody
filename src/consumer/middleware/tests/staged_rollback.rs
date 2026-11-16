@@ -3,6 +3,7 @@ use crate::consumer::middleware::tests::test_support::cart;
 use crate::loader::MemoryLoader;
 use crate::state::descriptor::Registered;
 use crate::state::memory::MemoryCellStore;
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::{EventRef, StateKey, StateName};
 use color_eyre::eyre::{Result, bail, eyre};
@@ -133,6 +134,7 @@ async fn permanent_skip_hook_reads_through_the_stamp() -> Result<()> {
             },
             dedup_ttl: CompactDuration::new(30),
             checks: (),
+            routes: TopicRoutes::Unpublished,
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
         });
 

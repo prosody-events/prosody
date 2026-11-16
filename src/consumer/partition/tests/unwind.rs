@@ -15,6 +15,7 @@ use crate::state::descriptor::tests::TestSession;
 use crate::state::descriptor::{CellStateError, Registered, ValueHandle, value_state};
 use crate::state::dirty::DirtyStore;
 use crate::state::manager::EventStateScope;
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::tests::cell_suite::value_cell;
@@ -72,6 +73,7 @@ impl Fixture {
             },
             dedup_ttl: CompactDuration::new(30),
             checks: (),
+            routes: TopicRoutes::Unpublished,
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
         })
     }

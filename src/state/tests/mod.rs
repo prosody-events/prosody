@@ -1,4 +1,5 @@
 use crate::state::CommitDecision;
+use crate::state::publisher::TopicRoutes;
 use crate::state::store::CellRead;
 use crate::state::tests::support::{StageInspection, evidence};
 use crate::test_util::TEST_RUNTIME;
@@ -122,6 +123,7 @@ fn session_with_loader<L>(
         event,
         dedup_ttl: CompactDuration::new(30),
         checks: (),
+        routes: TopicRoutes::Unpublished,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     })
 }

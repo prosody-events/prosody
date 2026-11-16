@@ -232,6 +232,11 @@ where
 
 /// Reads every topic's partition count from broker metadata.
 ///
+/// Partition counts never change, because a Prosody deployment never increases
+/// them. So this call runs once, at construction, and every routing row is
+/// final. Do not take counts from librdkafka statistics. A statistics report
+/// lists only the topics that this client held.
+///
 /// A short-lived client fetches the metadata. It has no group id, so it never
 /// joins the consumer group, and its drop does not wait for a group leave.
 async fn fetch_counts(

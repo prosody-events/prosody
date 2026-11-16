@@ -407,8 +407,7 @@ one complete stop-then-start deployment. Each consumer process then removes the
 routing rows of its group for the collection when it first acquires a
 partition. Deleting the registration or subsystem first strands the routing
 rows. Routing rows and committed state have no automatic expiry, so other
-groups can continue to discover and read the collection. To remove the row of
-a topic that no longer writes a published collection, delete the row by hand.
+groups can continue to discover and read the collection.
 
 **Topics of a publishing consumer.** A publishing consumer reads the partition
 count of each subscribed topic from the brokers when it starts. Construction

@@ -126,6 +126,9 @@ where
     /// The partition's admission checks.
     pub(crate) checks: B::Checks,
 
+    /// The routes of the partition assignment.
+    pub(crate) routes: TopicRoutes<B::Publications>,
+
     /// Termination signals captured at mint.
     pub termination: TerminationWatch,
 }

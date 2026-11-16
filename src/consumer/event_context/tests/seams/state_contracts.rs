@@ -1,5 +1,6 @@
 use super::*;
 use crate::state::erased::{ErasedKeyRead, StateCursor};
+use crate::state::publisher::TopicRoutes;
 
 /// A synthetic error classifying `Terminal`, to pin the boundary fold.
 #[derive(Debug, Error)]
@@ -57,6 +58,7 @@ fn counting_context(registry: CollectionDefRegistry) -> (CountingContext, Counti
         },
         dedup_ttl: CompactDuration::new(30),
         checks: (),
+        routes: TopicRoutes::Unpublished,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     };
     let ctx = MockEventContext::<Value>::new().with_session(KeyedStateSession::new(parts));

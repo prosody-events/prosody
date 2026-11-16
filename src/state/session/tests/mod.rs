@@ -21,6 +21,7 @@ use crate::state::descriptor::value_state;
 use crate::state::dirty::DirtyStore;
 use crate::state::manager::EventStateScope;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::Promoted;
 use crate::state::store::CellRead;
@@ -138,6 +139,7 @@ impl Fixture {
             event,
             dedup_ttl: CompactDuration::new(30),
             checks: (),
+            routes: TopicRoutes::Unpublished,
             termination: TerminationWatch::new(self.shutdown_rx.clone(), self.cancel_rx.clone()),
         }))
     }
@@ -162,6 +164,7 @@ impl Fixture {
             event,
             dedup_ttl: CompactDuration::new(30),
             checks: (),
+            routes: TopicRoutes::Unpublished,
             termination: TerminationWatch::new(self.shutdown_rx.clone(), cancel_rx),
         }))
     }

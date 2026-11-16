@@ -1,5 +1,6 @@
 use super::*;
 use crate::state::cell::Values;
+use crate::state::publisher::TopicRoutes;
 use crate::state::store::CellRead;
 use std::future::ready;
 
@@ -111,6 +112,7 @@ pub fn recording_session_with_loader(
         event,
         dedup_ttl: CompactDuration::new(30),
         checks: (),
+        routes: TopicRoutes::Unpublished,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     });
     (session, cell_store, dirty, recorded)

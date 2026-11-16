@@ -17,6 +17,7 @@ use crate::state::cell_key::{CellKey, Section};
 use crate::state::descriptor::value_state;
 use crate::state::dirty::{DirtyStore, DirtyVal};
 use crate::state::memory::{MemoryCellStore, MemoryCells};
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::Promoted;
 use crate::state::session::sealed::StateLifecycle;
@@ -101,6 +102,7 @@ impl CountingFixture {
             event: EventRef::Message { dedup_id },
             dedup_ttl: CompactDuration::new(30),
             checks: (),
+            routes: TopicRoutes::Unpublished,
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
         });
         let id = CollectionId::new(

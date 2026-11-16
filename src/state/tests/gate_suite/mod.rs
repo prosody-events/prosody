@@ -42,6 +42,7 @@ use crate::consumer::middleware::RepinProof;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::cell::Values;
+use crate::state::publisher::TopicRoutes;
 use crate::state::store::CellRead;
 
 use super::super::fjall::test_db;
@@ -157,6 +158,7 @@ impl GateFixture {
             event: probe(n),
             dedup_ttl: CompactDuration::new(30),
             checks: (),
+            routes: TopicRoutes::Unpublished,
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
         })
     }

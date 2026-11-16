@@ -17,6 +17,7 @@ use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellRead;
@@ -128,6 +129,7 @@ fn flaky_session(
         event,
         dedup_ttl: CompactDuration::new(30),
         checks: (),
+        routes: TopicRoutes::Unpublished,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     });
     let cart_id = CollectionId::new(
