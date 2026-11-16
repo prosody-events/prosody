@@ -48,7 +48,7 @@ use crate::consumer::ConsumerConfiguration;
 use crate::consumer::decode::{DecodedRecord, RecordMeta, decode_record};
 use crate::consumer::message::ConsumerRecord;
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
-use crate::kafka::{self, LogContext};
+use crate::kafka::{LogContext, base_config};
 use crate::propagator::new_propagator;
 use crate::{JsonCodec, Offset, Partition, Topic};
 use ahash::HashMap;
@@ -402,7 +402,7 @@ fn loader_capacity(max_uncommitted: usize) -> usize {
 /// of about 1 KiB, and librdkafka grows them for larger messages.
 /// librdkafka requires `fetch.max.bytes` >= `message.max.bytes`.
 fn client_config(config: &LoaderConfiguration, client_id: &str) -> ClientConfig {
-    let mut client_config = kafka::client_config(config.bootstrap_servers.join(","));
+    let mut client_config = base_config(config.bootstrap_servers.join(","));
     client_config
         .set("client.id", client_id)
         .set("group.id", format!("{}.loader", config.group_id))

@@ -12,7 +12,7 @@ use crate::consumer::source::Reader;
 use crate::consumer::sweep::drain_managers;
 use crate::consumer::{Managers, ProsodyConsumer, RuntimeState, WatermarkVersion};
 use crate::heartbeat::HeartbeatRegistry;
-use crate::kafka;
+use crate::kafka::base_config;
 use crate::loader::MessageLoader;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::EventSession;
@@ -257,7 +257,7 @@ pub(super) fn client_config(
     };
 
     let prefetch = consumer_config.partition_prefetch.get();
-    let mut config = kafka::client_config(bootstrap);
+    let mut config = base_config(bootstrap);
     config
         .set("client.id", hostname()?)
         .set("group.id", &consumer_config.group_id)

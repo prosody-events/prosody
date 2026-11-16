@@ -7,7 +7,7 @@ use crate::consumer::middleware::deduplication::{
     CassandraDeduplicationStoreProvider, MemoryDeduplicationStoreProvider,
 };
 use crate::error::ClassifyError;
-use crate::kafka::{LogContext, client_config};
+use crate::kafka::{LogContext, base_config};
 use crate::loader::{KafkaLoader, MemoryLoader};
 use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
@@ -251,7 +251,7 @@ async fn fetch_routes(
 ) -> Result<RoutingSet, ConsumerError> {
     spawn_blocking(move || {
         let client: BaseConsumer<LogContext> =
-            client_config(bootstrap_servers).create_with_context(LogContext)?;
+            base_config(bootstrap_servers).create_with_context(LogContext)?;
         let metadata = client.fetch_metadata(None, METADATA_TIMEOUT)?;
         let routes = topics
             .route(&group, |topic| partition_count(&metadata, topic))

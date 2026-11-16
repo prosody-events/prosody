@@ -4,7 +4,7 @@
 //! Kafka topics. It handles configuration, message serialization, and injection
 //! of OpenTelemetry context for distributed tracing.
 
-use crate::kafka::{LogContext, client_config};
+use crate::kafka::{LogContext, base_config};
 use derive_builder::Builder;
 use educe::Educe;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
@@ -199,7 +199,7 @@ impl<C: Codec> ProsodyProducer<C> {
             config.bootstrap_servers.join(",")
         };
 
-        let mut client_config = client_config(bootstrap);
+        let mut client_config = base_config(bootstrap);
         client_config
             .set("client.id", hostname()?)
             .set("compression.codec", "lz4")

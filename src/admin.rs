@@ -3,7 +3,7 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::kafka::{LogContext, client_config};
+use crate::kafka::{LogContext, base_config};
 use derive_builder::Builder;
 use rdkafka::TopicPartitionList;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
@@ -174,7 +174,7 @@ impl ProsodyAdminClient {
         let options = AdminOptions::new().operation_timeout(Some(Duration::from_secs(30)));
 
         Ok(Self {
-            client: client_config(config.bootstrap_servers.join(","))
+            client: base_config(config.bootstrap_servers.join(","))
                 .create_with_context(LogContext)?,
             options,
             bootstrap_servers: config.bootstrap_servers.clone(),
@@ -262,7 +262,7 @@ impl ProsodyAdminClient {
         expected_partitions: Option<u16>,
     ) -> Result<(), ProsodyAdminClientError> {
         let consumer: Arc<BaseConsumer<LogContext>> = Arc::new(
-            client_config(self.bootstrap_servers.join(",")).create_with_context(LogContext)?,
+            base_config(self.bootstrap_servers.join(",")).create_with_context(LogContext)?,
         );
         let deadline = Instant::now() + TOPIC_READY_TIMEOUT;
         loop {

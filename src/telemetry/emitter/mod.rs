@@ -6,7 +6,7 @@
 
 use crate::consumer::DemandType;
 use crate::error::ErrorCategory;
-use crate::kafka::{LogContext, client_config};
+use crate::kafka::{LogContext, base_config};
 use crate::telemetry::event::{
     Data, MessageEventType, MessageSentEvent, MessageTelemetryEvent, TimerEventType,
     TimerTelemetryEvent,
@@ -334,7 +334,7 @@ pub fn spawn_telemetry_emitter(
     }
 
     let hostname: Arc<str> = hostname()?.into();
-    let producer: FutureProducer<LogContext> = client_config(bootstrap_servers.join(","))
+    let producer: FutureProducer<LogContext> = base_config(bootstrap_servers.join(","))
         .set("client.id", hostname.as_ref())
         // Telemetry is best-effort: ack from leader only, no idempotence overhead
         .set("acks", "1")

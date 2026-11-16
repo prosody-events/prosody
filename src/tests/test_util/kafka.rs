@@ -1,10 +1,21 @@
-//! Kafka topic fixtures for unit tests that run against the local broker.
+//! Kafka fixtures and checks for unit tests.
 
 use crate::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
+use crate::kafka::base_config;
 use color_eyre::Result;
+use rdkafka::ClientConfig;
 
 /// The local broker that `docker-compose.yaml` starts.
 pub(crate) const BOOTSTRAP: &str = "localhost:9094";
+
+/// Whether `config` keeps every setting of [`base_config`] for its own
+/// bootstrap servers.
+pub(crate) fn extends_base(config: &ClientConfig) -> bool {
+    let base = base_config(config.get("bootstrap.servers").unwrap_or_default());
+    base.config_map()
+        .into_iter()
+        .all(|(key, value)| config.get(key) == Some(value))
+}
 
 /// The admin client every test shares.
 pub(crate) fn admin() -> Result<&'static ProsodyAdminClient> {
