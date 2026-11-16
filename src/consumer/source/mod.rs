@@ -25,7 +25,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use crate::Codec;
 use crate::consumer::decode::{ResultRequestReader, decode_record};
 use crate::consumer::message::ConsumerRecord;
-use crate::kafka_log::log_error;
+use crate::kafka::log_error;
 use crate::otel::SpanRelation;
 use crate::propagator::new_propagator;
 

@@ -51,7 +51,7 @@ pub mod consumer;
 pub mod error;
 pub mod heartbeat;
 pub mod high_level;
-mod kafka_log;
+mod kafka;
 pub mod loader;
 pub mod otel;
 pub mod peer;

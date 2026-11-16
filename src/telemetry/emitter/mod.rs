@@ -6,7 +6,7 @@
 
 use crate::consumer::DemandType;
 use crate::error::ErrorCategory;
-use crate::kafka_log::LogContext;
+use crate::kafka::{LogContext, client_config};
 use crate::telemetry::event::{
     Data, MessageEventType, MessageSentEvent, MessageTelemetryEvent, TimerEventType,
     TimerTelemetryEvent,
@@ -18,8 +18,6 @@ use bytes::Bytes;
 use chrono::{DateTime, SecondsFormat, Utc};
 use derive_builder::Builder;
 use futures::StreamExt;
-use rdkafka::ClientConfig;
-use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::error::KafkaError;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
@@ -336,10 +334,7 @@ pub fn spawn_telemetry_emitter(
     }
 
     let hostname: Arc<str> = hostname()?.into();
-    let bootstrap = bootstrap_servers.join(",");
-
-    let producer: FutureProducer<LogContext> = ClientConfig::new()
-        .set("bootstrap.servers", &bootstrap)
+    let producer: FutureProducer<LogContext> = client_config(bootstrap_servers.join(","))
         .set("client.id", hostname.as_ref())
         // Telemetry is best-effort: ack from leader only, no idempotence overhead
         .set("acks", "1")
@@ -351,7 +346,6 @@ pub fn spawn_telemetry_emitter(
         // 1 in-flight request per connection preserves per-partition ordering
         .set("max.in.flight.requests.per.connection", "1")
         .set("compression.codec", "lz4")
-        .set_log_level(RDKafkaLogLevel::Error)
         .create_with_context(LogContext)?;
 
     let rx = telemetry.subscribe();

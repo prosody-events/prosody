@@ -48,13 +48,13 @@ use crate::consumer::ConsumerConfiguration;
 use crate::consumer::decode::{DecodedRecord, RecordMeta, decode_record};
 use crate::consumer::message::ConsumerRecord;
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
-use crate::kafka_log::LogContext;
+use crate::kafka::{self, LogContext};
 use crate::propagator::new_propagator;
 use crate::{JsonCodec, Offset, Partition, Topic};
 use ahash::HashMap;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use quick_cache::sync::Cache;
-use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
+use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::{KafkaError, KafkaResult};
 use rdkafka::message::BorrowedMessage;
@@ -402,9 +402,8 @@ fn loader_capacity(max_uncommitted: usize) -> usize {
 /// of about 1 KiB, and librdkafka grows them for larger messages.
 /// librdkafka requires `fetch.max.bytes` >= `message.max.bytes`.
 fn client_config(config: &LoaderConfiguration, client_id: &str) -> ClientConfig {
-    let mut client_config = ClientConfig::new();
+    let mut client_config = kafka::client_config(config.bootstrap_servers.join(","));
     client_config
-        .set("bootstrap.servers", config.bootstrap_servers.join(","))
         .set("client.id", client_id)
         .set("group.id", format!("{}.loader", config.group_id))
         .set("enable.auto.commit", "false")
@@ -415,8 +414,7 @@ fn client_config(config: &LoaderConfiguration, client_id: &str) -> ClientConfig 
         .set("fetch.message.max.bytes", "16384")
         .set("message.max.bytes", "1048576")
         .set("fetch.max.bytes", "1048576")
-        .set("fetch.wait.max.ms", "100")
-        .set_log_level(RDKafkaLogLevel::Error);
+        .set("fetch.wait.max.ms", "100");
 
     if let Some(rack) = &config.rack {
         client_config.set("client.rack", rack);

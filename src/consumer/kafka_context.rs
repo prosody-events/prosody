@@ -43,7 +43,7 @@ use crate::consumer::{
     ConsumerConfiguration, ConsumerError, EventHandler, HandlerProvider, Managers,
     WatermarkVersion, get_assigned_partition_count,
 };
-use crate::kafka_log::{log_error, log_line};
+use crate::kafka::{log_error, log_line};
 use crate::loader::MessageLoader;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::EventSession;

@@ -12,6 +12,7 @@ use crate::consumer::source::Reader;
 use crate::consumer::sweep::drain_managers;
 use crate::consumer::{Managers, ProsodyConsumer, RuntimeState, WatermarkVersion};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::kafka;
 use crate::loader::MessageLoader;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::EventSession;
@@ -20,7 +21,6 @@ use crate::timers::store::TriggerStoreProvider;
 use crate::{Codec, EventIdentity, EventType};
 use parking_lot::Mutex;
 use rdkafka::ClientConfig;
-use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -257,9 +257,8 @@ pub(super) fn client_config(
     };
 
     let prefetch = consumer_config.partition_prefetch.get();
-    let mut config = ClientConfig::new();
+    let mut config = kafka::client_config(bootstrap);
     config
-        .set("bootstrap.servers", bootstrap)
         .set("client.id", hostname()?)
         .set("group.id", &consumer_config.group_id)
         .set("enable.auto.commit", "true")
@@ -290,8 +289,7 @@ pub(super) fn client_config(
         .set(
             "fetch.wait.max.ms",
             consumer_config.fetch_wait.as_millis().to_string(),
-        )
-        .set_log_level(RDKafkaLogLevel::Error);
+        );
 
     if let Some(rack) = &consumer_config.rack {
         config.set("client.rack", rack);

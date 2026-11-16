@@ -22,9 +22,7 @@ fn broker_metadata_counts_every_topic() -> Result<()> {
     for (topic, count) in BROKER_TOPICS {
         cluster.create_topic(topic, count, 1)?;
     }
-    let client: BaseConsumer = ClientConfig::new()
-        .set("bootstrap.servers", cluster.bootstrap_servers())
-        .create()?;
+    let client: BaseConsumer = client_config(cluster.bootstrap_servers()).create()?;
     let metadata = client.fetch_metadata(None, METADATA_TIMEOUT)?;
 
     for (topic, count) in BROKER_TOPICS {

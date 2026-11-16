@@ -659,9 +659,10 @@ makes the abort and retry loop alerts fire once, and a repeat of the alert
 logs at warn. An inner retry layer logs a failure
 that it returns at debug, because the outer layer owns the outcome.
 Before you lower a log to warn, trace its error to the owner that logs it at
-error. Create every Kafka client with `kafka_log::LogContext`; the consumer
-context calls the same log functions. Log
-Kafka poll errors with `kafka_log::log_error`. Then librdkafka connection
+error. Build every Kafka client configuration with `kafka::client_config`,
+and create the client with `kafka::LogContext`; the consumer context calls the
+same log functions. Log
+Kafka poll errors with `kafka::log_error`. Then librdkafka connection
 failures log at warn, and other Kafka errors log at error.
 Hand-built spans are reserved for the cases the attribute cannot express: a
 function returning `impl Stream` (instrument each inner await with a clone of

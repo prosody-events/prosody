@@ -4,14 +4,12 @@
 //! Kafka topics. It handles configuration, message serialization, and injection
 //! of OpenTelemetry context for distributed tracing.
 
-use crate::kafka_log::LogContext;
+use crate::kafka::{LogContext, client_config};
 use derive_builder::Builder;
 use educe::Educe;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use quick_cache::sync::Cache;
-use rdkafka::ClientConfig;
 use rdkafka::client::Client;
-use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::future_producer::FutureProducerContext;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
@@ -201,10 +199,8 @@ impl<C: Codec> ProsodyProducer<C> {
             config.bootstrap_servers.join(",")
         };
 
-        // Configure the Kafka client with sensible defaults
-        let mut client_config = ClientConfig::new();
+        let mut client_config = client_config(bootstrap);
         client_config
-            .set("bootstrap.servers", bootstrap)
             .set("client.id", hostname()?)
             .set("compression.codec", "lz4")
             .set("enable.idempotence", "true")
@@ -212,10 +208,8 @@ impl<C: Codec> ProsodyProducer<C> {
             // default. The reader's `partition_for_key` computes crc32(key) % count.
             // Setting it here keeps produced messages on the same partition even if a
             // future librdkafka release changes its default partitioner.
-            .set("partitioner", "consistent_random")
-            .set_log_level(RDKafkaLogLevel::Error);
+            .set("partitioner", "consistent_random");
 
-        // Create idempotence cache if size is non-zero
         let idempotence_cache = NonZeroUsize::new(config.idempotence_cache_size)
             .map(|size| Arc::new(Cache::new(size.into())));
 

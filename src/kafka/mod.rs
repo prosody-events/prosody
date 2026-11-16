@@ -1,4 +1,8 @@
-//! Log levels for librdkafka callbacks.
+//! Shared setup for every librdkafka client: connection settings and log
+//! levels.
+//!
+//! Build each client configuration with [`client_config`], and create each
+//! client with [`LogContext`].
 //!
 //! librdkafka reconnects to a broker by itself after a connection fails, but
 //! the default rdkafka client context logs each failure at error. A failed
@@ -9,7 +13,7 @@
 //! every other librdkafka error.
 
 use rdkafka::ClientContext;
-use rdkafka::config::RDKafkaLogLevel;
+use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
 use rdkafka::consumer::ConsumerContext;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use tracing::Level;
@@ -37,6 +41,24 @@ impl ClientContext for LogContext {
 }
 
 impl ConsumerContext for LogContext {}
+
+/// The base configuration for a librdkafka client that connects to
+/// `bootstrap_servers`. It forwards librdkafka log lines at error and above.
+///
+/// The client closes a broker connection after 230 s without traffic, and it
+/// connects again when it next needs that broker. Some networks silently drop
+/// a flow that stays idle past a limit: 350 s for EC2 connection tracking on
+/// Nitro v6 instances, NAT gateways, and NLBs, and 4 minutes on Azure. A
+/// request on a dropped flow stalls until `socket.timeout.ms` ends it.
+/// librdkafka uses the same 230 s by default for Azure brokers.
+pub(crate) fn client_config(bootstrap_servers: impl Into<String>) -> ClientConfig {
+    let mut config = ClientConfig::new();
+    config
+        .set("bootstrap.servers", bootstrap_servers)
+        .set("connections.max.idle.ms", "230000")
+        .set_log_level(RDKafkaLogLevel::Error);
+    config
+}
 
 /// Logs one librdkafka log line at the level that [`line_level`] selects.
 pub(crate) fn log_line(level: RDKafkaLogLevel, fac: &str, message: &str) {

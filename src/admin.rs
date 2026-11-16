@@ -3,9 +3,8 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::kafka_log::LogContext;
+use crate::kafka::{LogContext, client_config};
 use derive_builder::Builder;
-use rdkafka::ClientConfig;
 use rdkafka::TopicPartitionList;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::consumer::{BaseConsumer, Consumer};
@@ -169,17 +168,14 @@ impl ProsodyAdminClient {
     ///
     /// Returns a `ProsodyAdminClientError` if the client creation fails.
     pub fn new(config: &AdminConfiguration) -> Result<ProsodyAdminClient, ProsodyAdminClientError> {
-        // Validate the configuration
         config.validate()?;
-
-        let mut client_config = ClientConfig::new();
-        client_config.set("bootstrap.servers", config.bootstrap_servers.join(","));
 
         // Use 30s timeout for admin operations to handle concurrent test execution
         let options = AdminOptions::new().operation_timeout(Some(Duration::from_secs(30)));
 
         Ok(Self {
-            client: client_config.create_with_context(LogContext)?,
+            client: client_config(config.bootstrap_servers.join(","))
+                .create_with_context(LogContext)?,
             options,
             bootstrap_servers: config.bootstrap_servers.clone(),
         })
@@ -266,9 +262,7 @@ impl ProsodyAdminClient {
         expected_partitions: Option<u16>,
     ) -> Result<(), ProsodyAdminClientError> {
         let consumer: Arc<BaseConsumer<LogContext>> = Arc::new(
-            ClientConfig::new()
-                .set("bootstrap.servers", self.bootstrap_servers.join(","))
-                .create_with_context(LogContext)?,
+            client_config(self.bootstrap_servers.join(",")).create_with_context(LogContext)?,
         );
         let deadline = Instant::now() + TOPIC_READY_TIMEOUT;
         loop {
