@@ -21,7 +21,7 @@ use crate::Topic;
 use crate::consumer::sweep::drain_managers;
 use crate::consumer::{Managers, WatermarkVersion};
 use crate::heartbeat::Heartbeat;
-use crate::kafka_log::log_error;
+use crate::kafka::log_error;
 
 /// Runs the Kafka poll loop until `shutdown` is set, then closes the client.
 ///
