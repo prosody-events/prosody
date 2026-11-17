@@ -32,6 +32,7 @@ use crate::peer::router::runtime::PreparedPeerRuntime;
 use crate::peer::runtime::prepare_network;
 use crate::state::config::KeyedStateConfiguration;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
+use crate::state::publisher::Routes;
 use crate::state_reader::{MemoryReaderBackend, ReaderBackend, StateReaderDependencies};
 use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
@@ -336,7 +337,7 @@ fn retain_manager(
             MemoryCells::new(),
             MemoryDescriptorIdentityStore::new(),
             MemoryLoader::new(),
-            None,
+            Routes::Unpublished,
         ),
         timer_slab_size: CompactDuration::new(30),
         timer_semaphores: Arc::new(from_fn(|_| Arc::new(Semaphore::new(1)))),
@@ -415,7 +416,7 @@ async fn start<R: ResultRequestReader + 'static>(
         MemoryCells::new(),
         MemoryDescriptorIdentityStore::new(),
         MemoryLoader::new(),
-        None,
+        Routes::Unpublished,
     );
     Box::pin(initialize_consumer::<_, _, _, JsonCodec, _>(
         config,

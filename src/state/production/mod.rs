@@ -4,12 +4,16 @@ use crate::ConsumerGroup;
 use crate::consumer::middleware::deduplication::DeduplicationStoreProvider;
 use crate::state::cached::Cached;
 use crate::state::cassandra::{
-    CassandraCellResources, CassandraDescriptorIdentityStore, CassandraStore,
+    CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
+    CassandraStore,
 };
 use crate::state::fjall::{FjallClient, MarkerCheckSet};
-use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
+use crate::state::memory::{
+    MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore,
+};
+use crate::state::publisher::Routes;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::{PartitionBackend, StateBackendFactory};
+use crate::state::{MemoryBackend, PartitionBackend, StateBackendFactory};
 use crate::timers::store::TriggerStore;
 use crate::{Partition, Topic};
 use std::sync::Arc;
@@ -25,11 +29,12 @@ pub(crate) struct CassandraStateBackendFactory<DP> {
     registry: Arc<CollectionDefRegistry>,
     dedup: DP,
     consumer_group: ConsumerGroup,
+    routes: Routes<CassandraPublicationStore>,
 }
 
 impl<DP> CassandraStateBackendFactory<DP> {
-    /// Creates the factory with shared cells, identities, registry, and dedup
-    /// stores.
+    /// Creates the factory with shared cells, identities, registry, dedup
+    /// stores, and routes.
     #[must_use]
     pub(crate) fn new(
         client: FjallClient,
@@ -38,6 +43,7 @@ impl<DP> CassandraStateBackendFactory<DP> {
         registry: Arc<CollectionDefRegistry>,
         dedup: DP,
         consumer_group: ConsumerGroup,
+        routes: Routes<CassandraPublicationStore>,
     ) -> Self {
         Self {
             client,
@@ -46,6 +52,7 @@ impl<DP> CassandraStateBackendFactory<DP> {
             registry,
             dedup,
             consumer_group,
+            routes,
         }
     }
 }
@@ -60,6 +67,7 @@ where
         CassandraDescriptorIdentityStore,
         Cached<CassandraStore>,
         MarkerCheckSet,
+        CassandraPublicationStore,
     >;
 
     fn for_partition(&self, topic: Topic, partition: Partition, _triggers: S) -> Self::Backend {
@@ -71,7 +79,8 @@ where
         let cassandra =
             CassandraStore::new(session.clone(), queries.clone(), self.registry.clone());
         let cell = Cached::new(slot.clone(), cassandra);
-        PartitionBackend::new(dedup, self.identity.clone(), cell, slot.into())
+        let routes = self.routes.clone();
+        PartitionBackend::new(dedup, self.identity.clone(), cell, slot.into(), routes)
     }
 }
 
@@ -83,6 +92,7 @@ pub(crate) struct MemoryStateBackendFactory<DP> {
     identity: MemoryDescriptorIdentityStore,
     dedup: DP,
     consumer_group: ConsumerGroup,
+    routes: Routes<MemoryPublicationStore>,
 }
 
 impl<DP> MemoryStateBackendFactory<DP> {
@@ -95,12 +105,14 @@ impl<DP> MemoryStateBackendFactory<DP> {
         identity: MemoryDescriptorIdentityStore,
         dedup: DP,
         consumer_group: ConsumerGroup,
+        routes: Routes<MemoryPublicationStore>,
     ) -> Self {
         Self {
             cells,
             identity,
             dedup,
             consumer_group,
+            routes,
         }
     }
 }
@@ -110,13 +122,13 @@ where
     DP: DeduplicationStoreProvider,
     S: TriggerStore,
 {
-    type Backend = PartitionBackend<DP::Store, MemoryDescriptorIdentityStore, MemoryCellStore, ()>;
+    type Backend = MemoryBackend<DP::Store, MemoryCellStore>;
 
     fn for_partition(&self, topic: Topic, partition: Partition, _triggers: S) -> Self::Backend {
         let dedup = self
             .dedup
             .create_store(topic, partition, &self.consumer_group);
         let cell = MemoryCellStore::new(self.cells.clone());
-        PartitionBackend::new(dedup, self.identity.clone(), cell, ())
+        PartitionBackend::new(dedup, self.identity.clone(), cell, (), self.routes.clone())
     }
 }

@@ -1,4 +1,5 @@
 use crate::state::CommitDecision;
+use crate::state::publisher::TopicRoutes;
 use crate::state::store::CellRead;
 use crate::state::tests::support::{StageInspection, evidence};
 use crate::test_util::TEST_RUNTIME;
@@ -34,9 +35,7 @@ use super::cell::{Cell, Committed, ProvisionalWrite, Values};
 use super::cell_key::CellKey;
 use super::descriptor::{StateDescriptor, WithResolver, deque, deque_state, map_state};
 use super::marker::EventMarker;
-use super::memory::{
-    MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore,
-};
+use super::memory::{MemoryCellStore, MemoryCells, MemoryPublicationStore};
 use super::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use super::registry::{CollectionDef, CollectionDefRegistry};
 use super::resolve::{EvidenceLookup, resolve_event_marker};
@@ -44,7 +43,7 @@ use super::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use super::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, distinct};
 use super::{
     CELLS_INLINE, CollectionId, CollectionRef, CommitMode, Coordinate, Direction, EventRef,
-    PartitionBackend, StateKey, StateName, StateType,
+    MemoryBackend, StateKey, StateName, StateType,
 };
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
@@ -100,12 +99,7 @@ fn forwarding_default_preserves_ttl() -> Result<()> {
 
 /// The per-partition backend over a [`CountingCellStore`], so a directed test
 /// can test the lower-store scan count a collection op issues.
-type CountingBackend = PartitionBackend<
-    MemoryDeduplicationStore,
-    MemoryDescriptorIdentityStore,
-    CountingCellStore<MemoryCellStore>,
-    (),
->;
+type CountingBackend = MemoryBackend<MemoryDeduplicationStore, CountingCellStore<MemoryCellStore>>;
 
 /// Mints a session over `counting` carrying `loader` for one event. Dropped
 /// senders are fine — `watch::Receiver::borrow` keeps returning the last value.
@@ -129,6 +123,7 @@ fn session_with_loader<L>(
         event,
         dedup_ttl: CompactDuration::new(30),
         checks: (),
+        routes: TopicRoutes::Unpublished,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     })
 }

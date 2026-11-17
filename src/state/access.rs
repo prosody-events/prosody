@@ -80,9 +80,15 @@ impl StateAccessError {
     where
         E: ClassifyError + Error,
     {
+        Self::store_as(error, error.classify_error())
+    }
+
+    /// Type-erases a store error into [`Self::Store`] with the given
+    /// `category`.
+    pub(crate) fn store_as<E: Error>(error: &E, category: ErrorCategory) -> Self {
         Self::Store {
             message: error.to_string(),
-            category: error.classify_error(),
+            category,
         }
     }
 

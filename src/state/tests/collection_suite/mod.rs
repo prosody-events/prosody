@@ -45,8 +45,9 @@ use crate::state::descriptor::{
     DequeHandle, MapHandle, StateDescriptor, deque, deque_state, map_state,
 };
 use crate::state::dirty::DirtyStore;
-use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
+use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::Promoted;
 use crate::state::session::sealed::StateLifecycle;
@@ -55,7 +56,7 @@ use crate::state::store::{CELL_BATCH, CellRead, CellStore};
 use crate::state::tests::support::admit_collection;
 use crate::state::tests::support::seed_commit_evidence;
 use crate::state::{
-    CollectionId, CollectionRef, CommitMode, Direction, EventRef, PartitionBackend, StateKey,
+    CollectionId, CollectionRef, CommitMode, Direction, EventRef, MemoryBackend, StateKey,
     StateName, StateType,
 };
 use crate::timers::duration::CompactDuration;
@@ -93,8 +94,7 @@ const INTERLEAVE_SEED: usize = 20;
 
 /// The per-partition backend for the suites: a memory cell store and dedup
 /// store, behind the standard [`PartitionBackend`] bundle.
-type SuiteBackend =
-    PartitionBackend<MemoryDeduplicationStore, MemoryDescriptorIdentityStore, MemoryCellStore, ()>;
+type SuiteBackend = MemoryBackend<MemoryDeduplicationStore, MemoryCellStore>;
 
 /// The real per-event session the handles bind over.
 type SuiteSession = KeyedStateSession<SuiteBackend, MemoryLoader<Value>>;
@@ -159,6 +159,7 @@ fn make_session_with_dirty(
         event,
         dedup_ttl: CompactDuration::new(30),
         checks: (),
+        routes: TopicRoutes::Unpublished,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     })
 }

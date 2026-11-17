@@ -48,12 +48,11 @@ pub enum StateVisibility {
     ///
     /// To retire a published collection, set `.published(false)` but keep both
     /// its registration and the consumer's `subsystem` for one stop-then-start
-    /// deploy. The publication owner only withdraws the routing rows of names
-    /// that are still registered, now `Private`, and have a configured
-    /// subsystem. Deleting the registration or dropping the `subsystem` config
-    /// strands the `(subsystem, name)` routing row. With `TTL = None` that
-    /// stranded row and its cells stay discoverable by cross-group readers
-    /// indefinitely.
+    /// deploy. A consumer withdraws only the routing rows of names that are
+    /// still registered, now `Private`, and have a configured subsystem.
+    /// Deleting the registration or dropping the `subsystem` config strands the
+    /// `(subsystem, name)` routing rows. With `TTL = None` those stranded rows
+    /// and their cells stay discoverable by cross-group readers indefinitely.
     Published,
 }
 

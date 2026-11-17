@@ -119,8 +119,7 @@ pub(super) async fn handle_messages<T, S, SP, P, Q>(
     );
     let trigger_store = trigger_provider.create_store(segment);
 
-    // Acquisition publishes routing for the owner. It then validates
-    // descriptor identities before event dispatch.
+    // Acquisition validates descriptor identities before event dispatch.
     let state_manager = retry_init(
         &context.shutdown_rx,
         &partition_info,

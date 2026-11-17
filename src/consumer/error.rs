@@ -220,9 +220,8 @@ pub enum KeyedStateInitError {
     #[error("published keyed state with in-memory storage requires mock mode")]
     PublishedMemoryStorage,
 
-    /// Broker metadata cannot supply a partition count for a subscribed topic,
-    /// so the consumer has no complete routing set to publish.
-    #[error("cannot build the keyed-state routing set: {0}")]
+    /// The consumer cannot build a routing row for a subscribed topic.
+    #[error("cannot build the keyed-state routing rows: {0}")]
     Routing(#[from] RoutingError),
 
     /// Keyed-state collections were registered on the low-level
@@ -238,7 +237,7 @@ pub enum KeyedStateInitError {
     StateUnsupported,
 }
 
-/// Why broker metadata cannot supply a subscribed topic's partition count.
+/// Why the consumer cannot build a routing row for a subscribed topic.
 #[derive(Debug, Error)]
 pub enum RoutingError {
     /// The subscribed name is a `^` pattern. A pattern has no fixed topic set,

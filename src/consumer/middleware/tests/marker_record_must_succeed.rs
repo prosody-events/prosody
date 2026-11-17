@@ -16,13 +16,14 @@ use crate::state::cell::Values;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
 use crate::state::dirty::DirtyStore;
-use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
+use crate::state::memory::{MemoryCellStore, MemoryCells};
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellRead;
 use crate::state::tests::support::StageInspection;
 use crate::state::{
-    CollectionId, EventRef, PartitionBackend, StateKey, StateName, StateType, TimerEventRef,
+    CollectionId, EventRef, MemoryBackend, StateKey, StateName, StateType, TimerEventRef,
 };
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -93,8 +94,7 @@ impl DeduplicationStore for FlakyMarkerDedup {
     }
 }
 
-type FlakyBackend =
-    PartitionBackend<FlakyMarkerDedup, MemoryDescriptorIdentityStore, MemoryCellStore, ()>;
+type FlakyBackend = MemoryBackend<FlakyMarkerDedup, MemoryCellStore>;
 type FlakySession = KeyedStateSession<FlakyBackend, MemoryLoader<serde_json::Value>>;
 
 /// The fixed message dedup id the sessions below carry on their
@@ -129,6 +129,7 @@ fn flaky_session(
         event,
         dedup_ttl: CompactDuration::new(30),
         checks: (),
+        routes: TopicRoutes::Unpublished,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     });
     let cart_id = CollectionId::new(

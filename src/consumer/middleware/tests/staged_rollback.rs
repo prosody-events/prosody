@@ -3,6 +3,7 @@ use crate::consumer::middleware::tests::test_support::cart;
 use crate::loader::MemoryLoader;
 use crate::state::descriptor::Registered;
 use crate::state::memory::MemoryCellStore;
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::{EventRef, StateKey, StateName};
 use color_eyre::eyre::{Result, bail, eyre};
@@ -96,9 +97,9 @@ impl SettlementHandler for SkipReadProbe {
 async fn permanent_skip_hook_reads_through_the_stamp() -> Result<()> {
     use crate::consumer::middleware::tests::test_support::RecordingDedup;
     use crate::consumer::partition::ShutdownPhase;
-    use crate::state::PartitionBackend;
+    use crate::state::MemoryBackend;
     use crate::state::dirty::DirtyStore;
-    use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
+    use crate::state::memory::MemoryCells;
     use crate::state::session::sealed::StateLifecycle;
     use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
     use crate::state::tests::cell_suite::FailingCellStore;
@@ -106,8 +107,7 @@ async fn permanent_skip_hook_reads_through_the_stamp() -> Result<()> {
     use tokio::sync::watch;
 
     type SkipStore = FailingCellStore<MemoryCellStore>;
-    type SkipBackend =
-        PartitionBackend<RecordingDedup, MemoryDescriptorIdentityStore, SkipStore, ()>;
+    type SkipBackend = MemoryBackend<RecordingDedup, SkipStore>;
 
     let mut registry = CollectionDefRegistry::default();
     registry.register(&cart(), CollectionDef::new(None))?;
@@ -134,6 +134,7 @@ async fn permanent_skip_hook_reads_through_the_stamp() -> Result<()> {
             },
             dedup_ttl: CompactDuration::new(30),
             checks: (),
+            routes: TopicRoutes::Unpublished,
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
         });
 

@@ -9,13 +9,14 @@ use crate::state::cell::Values;
 use crate::state::collection::sealed::{ReadEngine, Reads, Session};
 use crate::state::descriptor::value_state;
 use crate::state::dirty::DirtyStore;
-use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
+use crate::state::memory::{MemoryCellStore, MemoryCells};
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
 use crate::state::tests::cell_suite::{FailingCellStore, value_cell};
 use crate::state::{
-    CollectionId, CollectionRef, EventRef, PartitionBackend, StateKey, StateName, StateType,
+    CollectionId, CollectionRef, EventRef, MemoryBackend, StateKey, StateName, StateType,
 };
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
@@ -189,8 +190,7 @@ impl DeduplicationStore for FlushTripDedup {
 /// The abort hook reads the promoted value.
 #[tokio::test(start_paused = true)]
 async fn dedup_shutdown_hook_reads_the_committed_value() -> Result<()> {
-    type TripBackend =
-        PartitionBackend<FlushTripDedup, MemoryDescriptorIdentityStore, MemoryCellStore, ()>;
+    type TripBackend = MemoryBackend<FlushTripDedup, MemoryCellStore>;
 
     let cart = StateName::try_new("cart")?;
     let mut registry = CollectionDefRegistry::default();
@@ -228,6 +228,7 @@ async fn dedup_shutdown_hook_reads_the_committed_value() -> Result<()> {
             },
             dedup_ttl: CompactDuration::new(30),
             checks: (),
+            routes: TopicRoutes::Unpublished,
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
         });
     session
@@ -274,8 +275,7 @@ async fn dedup_shutdown_hook_reads_the_committed_value() -> Result<()> {
 #[tokio::test]
 async fn rejected_promote_hook_reads_repaired_collections() -> Result<()> {
     type SplitStore = FailingCellStore<MemoryCellStore>;
-    type SplitBackend =
-        PartitionBackend<RecordingDedup, MemoryDescriptorIdentityStore, SplitStore, ()>;
+    type SplitBackend = MemoryBackend<RecordingDedup, SplitStore>;
 
     let cart = StateName::try_new("cart")?;
     let wishlist = StateName::try_new("wishlist")?;
@@ -320,6 +320,7 @@ async fn rejected_promote_hook_reads_repaired_collections() -> Result<()> {
             },
             dedup_ttl: CompactDuration::new(30),
             checks: (),
+            routes: TopicRoutes::Unpublished,
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
         });
     session

@@ -38,14 +38,14 @@ use crate::state::cell::Committed;
 use crate::state::descriptor::tests::{TestSession, test_session_parts};
 use crate::state::descriptor::{Registered, StateDescriptor, ValueDescriptor, value_state};
 use crate::state::dirty::DirtyStore;
-use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
+use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::{
     EventSession, KeyedStateSession, LifecycleAccess, SessionParts, TerminationWatch,
 };
 use crate::state::tests::cell_suite::value_cell;
 use crate::state::tests::support::UnavailableState;
-use crate::state::{CollectionId, EventRef, PartitionBackend, StateKey, StateName, StateType};
+use crate::state::{CollectionId, EventRef, MemoryBackend, StateKey, StateName, StateType};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger, UncommittedTimer};

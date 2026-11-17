@@ -396,14 +396,18 @@ then pass it to `StateReaderClient::new`. The high-level client shares one
 dependency family across its consumer and all readers, so composing a reader
 never opens a second Cassandra session, Kafka loader, or cache.
 
+**Routing rows.** A reader finds the state of a collection through routing
+rows. A consumer writes the row of a topic just before a handler for that topic
+first writes the collection. A topic that never writes the collection gets no
+row. Until the first write, a reader finds no source for the collection.
+
 **Retiring a published collection.** Change the collection to
 `.published(false)`. Keep its registration and the consumer's `subsystem` for
-one complete stop-then-start deployment. The consumer that owns partition 0
-of the first subscribed topic in lexical order then removes the routing row
-when it next acquires that partition. Deleting the registration or subsystem
-first strands the routing row. Routing rows and committed state have no
-automatic expiry, so other groups can continue to discover and read the
-collection.
+one complete stop-then-start deployment. Each consumer process then removes the
+routing rows of its group for the collection when it first acquires a
+partition. Deleting the registration or subsystem first strands the routing
+rows. Routing rows and committed state have no automatic expiry, so other
+groups can continue to discover and read the collection.
 
 **Topics of a publishing consumer.** A publishing consumer reads the partition
 count of each subscribed topic from the brokers when it starts. Construction

@@ -81,6 +81,7 @@ where
             event,
             dedup_ttl,
             checks,
+            routes,
             termination,
         } = parts;
         Self {
@@ -94,6 +95,7 @@ where
                 event,
                 dedup_ttl,
                 checks,
+                routes,
                 termination,
                 reload_marker: SyncMutex::new(None),
                 terminated: AtomicBool::new(false),
@@ -390,6 +392,7 @@ where
         let collection_ref = CollectionRef::new(id.clone(), ttl);
         let written = write_direct(
             self.inner.overlay.lower(),
+            &self.inner.routes,
             &collection_ref,
             &dirty.cleared_sections(&id),
             dirty.collection_snapshot(&id),

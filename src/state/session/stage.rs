@@ -1,5 +1,6 @@
 //! Staging, abort, and resolution of a session's collections.
 
+use super::SessionInner;
 use super::sealed::StagedCollection;
 use crate::error::RetryAlert;
 use crate::state::CommitDecision;
@@ -9,13 +10,15 @@ use crate::state::cell_key::{CellKey, Section};
 use crate::state::dirty::{CellSnapshot, ClearedSections, DirtyVal, ResolvedCells};
 use crate::state::identity::{CollectionId, CollectionRef};
 use crate::state::marker::{EventEvidence, FrozenStage, SectionClear};
+use crate::state::publication::PublicationStore;
+use crate::state::publisher::TopicRoutes;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::resolve_event_marker;
 use crate::state::retry::{Step, StepOutcome, retry_step};
 use crate::state::store::{CELL_BATCH, CellBuffer, CellRead, CellStore, CoordinateBatch};
 use crate::state::{
-    CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY, StateKey, StateName,
-    StateType,
+    CommitMode, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY, StateBackend, StateKey,
+    StateName, StateType,
 };
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -72,20 +75,22 @@ fn stage_chunks<I: Iterator<Item = (CellKey, Option<Bytes>)>>(
 /// Returns `None` when there is nothing to stage, and for a `ReadUncommitted`
 /// collection, which writes resolved values at stage time.
 /// A `Cleared` cell in a cleared section is dropped on both arms. The clear's
-/// gap erase covers it, so the write stays row-disjoint. This is a free
-/// function so no `self` borrow crosses the concurrent fan-out.
-pub(super) async fn stage_collection<S>(
-    lower: &S,
-    registry: &CollectionDefRegistry,
-    event: EventRef,
+/// gap erase covers it, so the write stays row-disjoint.
+pub(super) async fn stage_collection<B: StateBackend, L>(
+    session: &SessionInner<B, L>,
     id: CollectionId,
     cleared: ClearedSections,
     cells: CellSnapshot,
     evidence: &EventEvidence,
-) -> Result<Option<StagedCollection>, StateAccessError>
-where
-    S: CellStore,
-{
+) -> Result<Option<StagedCollection>, StateAccessError> {
+    let SessionInner {
+        overlay,
+        registry,
+        event,
+        routes,
+        ..
+    } = session;
+    let (lower, event) = (overlay.lower(), *event);
     let collection_ref =
         CollectionRef::new(id.clone(), registry.ttl_for(id.state_type(), id.name()));
     let cleared = &cleared;
@@ -153,6 +158,7 @@ where
             // clears-only collection stages no writes, but its Staged row still
             // lands so that promote applies the clear.
             let stage = FrozenStage::new(event, writes, cleared, evidence);
+            routes.ensure(id).await?;
             lower
                 .write_provisional(&collection_ref, stage.request())
                 .await
@@ -167,7 +173,7 @@ where
                 .into_iter()
                 .map(|(cell, value)| (cell, value.into_data()))
                 .collect();
-            write_direct(lower, &collection_ref, cleared, resolved).await?;
+            write_direct(lower, routes, &collection_ref, cleared, resolved).await?;
             Ok(None)
         }
     }
@@ -176,9 +182,11 @@ where
 /// Writes resolved cells and their frozen section clears in one direct write.
 /// A `Cleared` cell in a cleared section is dropped, because the clear's gap
 /// erase covers it and the write must stay row-disjoint. Returns `false` when
-/// there is nothing to write.
-pub(super) async fn write_direct<S: CellStore>(
+/// there is nothing to write. The routing row becomes durable before the
+/// cells.
+pub(super) async fn write_direct<S: CellStore, P: PublicationStore>(
     lower: &S,
+    routes: &TopicRoutes<P>,
     collection: &CollectionRef,
     cleared: &ClearedSections,
     mut cells: ResolvedCells,
@@ -191,6 +199,7 @@ pub(super) async fn write_direct<S: CellStore>(
         .iter()
         .map(|&section| SectionClear::frozen_resolved(section, &cells))
         .collect();
+    routes.ensure(collection.id()).await?;
     lower
         .write_resolved(collection, &cells, &clears)
         .await

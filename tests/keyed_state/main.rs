@@ -10,8 +10,7 @@
 //! The two tests differ only in registration. One configures no subsystem, so
 //! every collection is private and the publication machinery is off entirely.
 //! The other publishes under a subsystem and additionally checks what that made
-//! discoverable; see [`publication`]. The [`routing`] test checks publication
-//! when two group members split the subscribed topics.
+//! discoverable; see [`publication`].
 
 #![recursion_limit = "512"]
 
@@ -45,7 +44,6 @@ mod cart;
 #[path = "../common/mod.rs"]
 mod common;
 mod publication;
-mod routing;
 
 /// The single message key both tests produce under, so every event serializes
 /// per-key and the timer fires only after both messages settle.
@@ -61,9 +59,11 @@ enum Registration {
 }
 
 /// A live pipeline consumer driving [`CartHandler`] over a freshly created
-/// topic.
+/// topic. The consumer also subscribes to an idle topic that receives no
+/// message.
 struct CartEnv {
     topic: Topic,
+    idle: Topic,
     admin: &'static ProsodyAdminClient,
     consumer: ProsodyConsumer<JsonCodec>,
     router: LocalRouter,
@@ -95,13 +95,14 @@ impl CartEnv {
         init_test_logging();
 
         let (topic, admin) = common::kafka::create_topic_with_partitions(1).await?;
+        let (idle, _) = common::kafka::create_topic_with_partitions(1).await?;
         let bootstrap = vec!["localhost:9094".to_owned()];
         let group_id = Uuid::new_v4().to_string();
         let consumer_config = ConsumerConfiguration::builder()
             .bootstrap_servers(bootstrap.clone())
             .group_id(group_id.clone())
             .probe_port(None)
-            .subscribed_topics(&[topic.to_string()])
+            .subscribed_topics(&[topic.to_string(), idle.to_string()])
             .build()?;
 
         let (observations_tx, observations) = channel(10);
@@ -161,6 +162,7 @@ impl CartEnv {
 
         Ok(Self {
             topic,
+            idle,
             admin,
             consumer,
             router,
@@ -178,7 +180,7 @@ impl CartEnv {
 
     /// [`Self::run`], then `scenario` against the settled environment.
     ///
-    /// Always shuts the consumer down and deletes the topic before returning,
+    /// Always shuts the consumer down and deletes the topics before returning,
     /// even when the scenario fails: an early return would leave the consumer's
     /// client threads alive and hang the test binary far past every hang-guard.
     async fn run_then<F, Fut>(mut self, scenario: F) -> Result<()>
@@ -210,7 +212,12 @@ impl CartEnv {
             .delete_topic(&self.topic)
             .await
             .map_err(Into::into);
-        outcome.and(router_shutdown).and(cleanup)
+        let idle_cleanup: Result<()> = self
+            .admin
+            .delete_topic(&self.idle)
+            .await
+            .map_err(Into::into);
+        outcome.and(router_shutdown).and(cleanup).and(idle_cleanup)
     }
 }
 
@@ -228,6 +235,7 @@ async fn test_keyed_state_round_trip_through_pipeline() -> Result<()> {
 
 /// A published collection's first durable write publishes a routing row into
 /// `keyed_state_publication` carrying the topic's live Kafka partition count.
+/// The idle topic writes nothing, so it has no routing row.
 ///
 /// Same scenario as the round trip, but `cart` and `receipt` are registered
 /// published under a configured subsystem. The timer read-back fires only after

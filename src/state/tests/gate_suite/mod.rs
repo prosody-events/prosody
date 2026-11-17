@@ -24,15 +24,15 @@ use super::super::descriptor::{
     CellStateError, MapStateError, StateDescriptor, deque, deque_state, map, map_state, value_state,
 };
 use super::super::dirty::DirtyStore;
-use super::super::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
+use super::super::memory::{MemoryCellStore, MemoryCells};
 use super::super::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use super::super::registry::{CollectionDef, CollectionDefRegistry};
 use super::super::session::sealed::StateLifecycle;
 use super::super::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use super::super::store::{CELL_BATCH, CellStore};
 use super::super::{
-    CollectionId, CollectionRef, PartitionBackend, StateAccessError, StateKey, StateName,
-    StateType, StoreOutcome,
+    CollectionId, CollectionRef, MemoryBackend, StateAccessError, StateKey, StateName, StateType,
+    StoreOutcome,
 };
 use super::cell_suite::{MemoryDeduplicationStore, value_cell};
 use super::collection_suite::finalize_and_promote;
@@ -42,6 +42,7 @@ use crate::consumer::middleware::RepinProof;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::cell::Values;
+use crate::state::publisher::TopicRoutes;
 use crate::state::store::CellRead;
 
 use super::super::fjall::test_db;
@@ -83,12 +84,7 @@ async fn let_task_park() {
 type GateStore = HoldingCellStore<CountingCellStore<MemoryCellStore>>;
 
 /// The per-partition backend the gate-suite sessions run over.
-type GateBackend = PartitionBackend<
-    MemoryDeduplicationStore,
-    MemoryDescriptorIdentityStore,
-    Cached<GateStore>,
-    (),
->;
+type GateBackend = MemoryBackend<MemoryDeduplicationStore, Cached<GateStore>>;
 
 /// One test's fixture: the composed cache, its seams, and session minting.
 struct GateFixture {
@@ -162,6 +158,7 @@ impl GateFixture {
             event: probe(n),
             dedup_ttl: CompactDuration::new(30),
             checks: (),
+            routes: TopicRoutes::Unpublished,
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
         })
     }

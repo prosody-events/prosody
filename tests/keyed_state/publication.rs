@@ -24,9 +24,10 @@ use std::sync::Arc;
 const READER_CACHE_BYTES: u64 = 1_048_576;
 
 /// Reads the `keyed_state_publication` table directly. Asserts exactly one
-/// routing row for `group_id` under `(subsystem, cart)`, carrying `topic` and
-/// the topic's partition count, then asserts the private `last_seen` collection
-/// has no row at all — checked against the real table rather than a mock store.
+/// routing row for `group_id` under each published collection the handler
+/// writes, `cart` and `receipt`. Each row carries `topic` and the topic's
+/// partition count. Then asserts the private `last_seen` collection has no row
+/// at all. The check reads the real table.
 pub(crate) async fn assert_routing_row(
     subsystem: &SubsystemName,
     group_id: &str,
@@ -34,30 +35,22 @@ pub(crate) async fn assert_routing_row(
 ) -> Result<()> {
     let publication_store = publication_store().await?;
 
-    let name = StateName::try_new("cart").map_err(|e| eyre!("name: {e}"))?;
-    let own: Vec<_> = publication_store
-        .read_publications(subsystem, StateType::Application, &name)
-        .await?
-        .into_iter()
-        .filter(|r| r.group_id.as_ref() == group_id)
-        .collect();
-    ensure!(
-        own.len() == 1,
-        "exactly one routing row for this group, got {}",
-        own.len()
-    );
-    ensure!(
-        own[0].topic == topic,
-        "row must carry the writing topic, got {:?}",
-        own[0].topic
-    );
-    ensure!(
-        i32::from(own[0].partition_count) == 1_i32,
-        "row must carry the topic's partition count (1), got {}",
-        i32::from(own[0].partition_count)
-    );
+    for published in ["cart", RECEIPT] {
+        let name = StateName::try_new(published)?;
+        let own: Vec<_> = publication_store
+            .read_publications(subsystem, StateType::Application, &name)
+            .await?
+            .into_iter()
+            .filter(|r| r.group_id.as_ref() == group_id)
+            .map(|r| (r.topic, i32::from(r.partition_count)))
+            .collect();
+        ensure!(
+            own == [(topic, 1_i32)],
+            "{published} must have one row for the writing topic with count 1, got {own:?}"
+        );
+    }
 
-    let private = StateName::try_new(LAST_SEEN).map_err(|e| eyre!("name: {e}"))?;
+    let private = StateName::try_new(LAST_SEEN)?;
     ensure!(
         publication_store
             .read_publications(subsystem, StateType::Application, &private)

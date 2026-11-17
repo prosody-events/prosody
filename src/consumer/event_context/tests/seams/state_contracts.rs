@@ -1,5 +1,6 @@
 use super::*;
 use crate::state::erased::{ErasedKeyRead, StateCursor};
+use crate::state::publisher::TopicRoutes;
 
 /// A synthetic error classifying `Terminal`, to pin the boundary fold.
 #[derive(Debug, Error)]
@@ -31,8 +32,7 @@ type CountingStore = CountingCellStore<MemoryCellStore>;
 
 /// The backend the cursor-laziness pin drives: a memory cell store wrapped in a
 /// read-counting decorator, so a single `next()`'s durable reads are bounded.
-type CountingBackend =
-    PartitionBackend<MemoryDeduplicationStore, MemoryDescriptorIdentityStore, CountingStore, ()>;
+type CountingBackend = MemoryBackend<MemoryDeduplicationStore, CountingStore>;
 
 /// The context the cursor-laziness pin drives.
 type CountingContext =
@@ -58,6 +58,7 @@ fn counting_context(registry: CollectionDefRegistry) -> (CountingContext, Counti
         },
         dedup_ttl: CompactDuration::new(30),
         checks: (),
+        routes: TopicRoutes::Unpublished,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
     };
     let ctx = MockEventContext::<Value>::new().with_session(KeyedStateSession::new(parts));

@@ -1,23 +1,7 @@
 //! Scripted publication storage used by routing and refresh tests.
 
 use super::*;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum PublicationCall {
-    Upsert {
-        name: String,
-        group: String,
-        topic: String,
-        partition_count: i32,
-    },
-    Remove {
-        name: String,
-        group: String,
-    },
-    Read {
-        name: String,
-    },
-}
+use tokio::task::yield_now;
 
 struct ReleaseGate {
     entered: Semaphore,
@@ -39,9 +23,11 @@ impl ParkedRead {
 #[derive(Clone)]
 pub(crate) struct ScriptedPublicationStore {
     inner: MemoryPublicationStore,
-    calls: Arc<Mutex<Vec<PublicationCall>>>,
+    reads: Arc<AtomicUsize>,
+    upserts: Arc<AtomicUsize>,
+    removes: Arc<AtomicUsize>,
     read_fail: Arc<Mutex<Option<ErrorCategory>>>,
-    remove_fail: Arc<Mutex<Option<ErrorCategory>>>,
+    write_fail: Arc<Mutex<Option<ErrorCategory>>>,
     read_gate: Arc<Mutex<Option<Arc<ReleaseGate>>>>,
 }
 
@@ -49,9 +35,11 @@ impl ScriptedPublicationStore {
     pub(crate) fn new() -> Self {
         Self {
             inner: MemoryPublicationStore::new(),
-            calls: Arc::new(Mutex::new(Vec::new())),
+            reads: Arc::default(),
+            upserts: Arc::default(),
+            removes: Arc::default(),
             read_fail: Arc::new(Mutex::new(None)),
-            remove_fail: Arc::new(Mutex::new(None)),
+            write_fail: Arc::new(Mutex::new(None)),
             read_gate: Arc::new(Mutex::new(None)),
         }
     }
@@ -60,8 +48,9 @@ impl ScriptedPublicationStore {
         *self.read_fail.lock() = Some(category);
     }
 
-    pub(crate) fn fail_removes_with(&self, category: ErrorCategory) {
-        *self.remove_fail.lock() = Some(category);
+    /// Fails each upsert and removal with `category`. `None` heals the store.
+    pub(crate) fn fail_writes_with(&self, category: Option<ErrorCategory>) {
+        *self.write_fail.lock() = category;
     }
 
     pub(crate) fn heal_reads(&self) {
@@ -99,16 +88,16 @@ impl ScriptedPublicationStore {
         let _ = self.inner.upsert(subsystem, state_type, name, row).await;
     }
 
-    pub(crate) fn calls(&self) -> Vec<PublicationCall> {
-        self.calls.lock().clone()
+    pub(crate) fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn reads(&self) -> usize {
-        self.calls
-            .lock()
-            .iter()
-            .filter(|call| matches!(call, PublicationCall::Read { .. }))
-            .count()
+    pub(crate) fn upserts(&self) -> usize {
+        self.upserts.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn removes(&self) -> usize {
+        self.removes.load(Ordering::SeqCst)
     }
 
     pub(crate) async fn rows(
@@ -135,12 +124,12 @@ impl PublicationStore for ScriptedPublicationStore {
         name: &StateName,
         row: &StatePublication,
     ) -> Result<(), Self::Error> {
-        self.calls.lock().push(PublicationCall::Upsert {
-            name: name.as_str().to_owned(),
-            group: row.group_id.to_string(),
-            topic: row.topic.to_string(),
-            partition_count: i32::from(row.partition_count),
-        });
+        self.upserts.fetch_add(1, Ordering::SeqCst);
+        // A real write suspends, so concurrent callers can interleave.
+        yield_now().await;
+        if let Some(category) = *self.write_fail.lock() {
+            return Err(ScriptedPublicationError(category));
+        }
         self.inner
             .upsert(subsystem, state_type, name, row)
             .await
@@ -154,11 +143,9 @@ impl PublicationStore for ScriptedPublicationStore {
         name: &StateName,
         group_id: &str,
     ) -> Result<(), Self::Error> {
-        self.calls.lock().push(PublicationCall::Remove {
-            name: name.as_str().to_owned(),
-            group: group_id.to_owned(),
-        });
-        if let Some(category) = *self.remove_fail.lock() {
+        self.removes.fetch_add(1, Ordering::SeqCst);
+        yield_now().await;
+        if let Some(category) = *self.write_fail.lock() {
             return Err(ScriptedPublicationError(category));
         }
         self.inner
@@ -173,9 +160,7 @@ impl PublicationStore for ScriptedPublicationStore {
         state_type: StateType,
         name: &StateName,
     ) -> Result<PublicationRows, Self::Error> {
-        self.calls.lock().push(PublicationCall::Read {
-            name: name.as_str().to_owned(),
-        });
+        self.reads.fetch_add(1, Ordering::SeqCst);
         let gate = self.read_gate.lock().clone();
         if let Some(gate) = gate {
             gate.entered.add_permits(1);

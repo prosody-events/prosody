@@ -155,9 +155,8 @@ impl CollectionDefRegistry {
         })
     }
 
-    /// Whether `(state_type, name)` is registered as `Published`. The
-    /// assignment publisher consults this when it replaces the routing set.
-    /// An unregistered name is never published.
+    /// Whether `(state_type, name)` is registered as `Published`. An
+    /// unregistered name is never published.
     #[must_use]
     pub(crate) fn is_published(&self, state_type: StateType, name: &StateName) -> bool {
         self.lookup_collection(state_type, name)

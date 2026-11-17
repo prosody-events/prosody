@@ -53,7 +53,6 @@ where
             .overlay
             .dirty()
             .touched(&self.inner.state_key.key);
-        let event = self.inner.event;
         let registry = &self.inner.registry;
         let lower = self.inner.overlay.lower();
         let state_key = &self.inner.state_key;
@@ -75,9 +74,7 @@ where
         let collections = stream::iter(touched)
             .map(|((state_type, name), cleared, cells)| {
                 let id = CollectionId::new(state_key.clone(), state_type, name);
-                cooperative(stage_collection(
-                    lower, registry, event, id, cleared, cells, &evidence,
-                ))
+                cooperative(stage_collection(&self.inner, id, cleared, cells, &evidence))
             })
             .buffer_unordered(STATE_FANOUT_CONCURRENCY)
             // Fold without a short circuit: every stage call must return

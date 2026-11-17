@@ -135,7 +135,7 @@ pub use store::CellBuffer;
 // exposing any of it from the crate root (`pub(crate) use` is not a `pub use`).
 #[cfg(test)]
 pub(crate) use backend::SharedStateBackend;
-pub(crate) use backend::{PartitionBackend, StateBackend, StateBackendFactory};
+pub(crate) use backend::{MemoryBackend, PartitionBackend, StateBackend, StateBackendFactory};
 
 /// Maximum concurrent per-collection durable operations in the keyed-state
 /// lifecycle (stage, promote, rollback, admission).

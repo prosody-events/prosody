@@ -5,7 +5,6 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::segment::partition_segment_id;
 use crate::state::descriptor_identity::{DescriptorIdentityError, acquire_descriptor_identities};
 use crate::state::dirty::DirtyStore;
-use crate::state::publisher::{AssignmentPublisher, NoPublisher};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::{StateBackend, StateBackendFactory};
 use crate::timers::duration::CompactDuration;
@@ -16,13 +15,13 @@ use thiserror::Error;
 use tokio::sync::OnceCell;
 
 /// Process-wide [`PartitionStateProvider`] over a
-/// `StateBackendFactory`: acquisition publishes routing and validates
-/// descriptor identities before it mints the manager.
+/// `StateBackendFactory`: acquisition validates descriptor identities before
+/// it mints the manager. It also tries to remove the routing rows of
+/// unpublished collections.
 #[derive(Clone)]
-pub struct StateManagerProvider<F, L, P = NoPublisher> {
+pub struct StateManagerProvider<F, L> {
     backend: F,
     loader: L,
-    publisher: P,
     registry: Arc<CollectionDefRegistry>,
     consumer_group: Arc<str>,
     dedup_ttl: CompactDuration,
@@ -35,11 +34,8 @@ pub struct StateManagerProvider<F, L, P = NoPublisher> {
     validated: Arc<OnceCell<()>>,
 }
 
-impl<F, L, P> StateManagerProvider<F, L, P> {
+impl<F, L> StateManagerProvider<F, L> {
     /// Creates the provider.
-    ///
-    /// `publisher` uses the assignment that this provider receives. It does not
-    /// observe Kafka or track assignments itself.
     ///
     /// `consumer_group` supplies state-cell identity through
     /// `segment::partition_segment_id`.
@@ -58,7 +54,6 @@ impl<F, L, P> StateManagerProvider<F, L, P> {
     pub(crate) fn new(
         backend: F,
         loader: L,
-        publisher: P,
         registry: Arc<CollectionDefRegistry>,
         consumer_group: Arc<str>,
         dedup_ttl: CompactDuration,
@@ -66,7 +61,6 @@ impl<F, L, P> StateManagerProvider<F, L, P> {
         Self {
             backend,
             loader,
-            publisher,
             registry,
             consumer_group,
             dedup_ttl,
@@ -75,14 +69,13 @@ impl<F, L, P> StateManagerProvider<F, L, P> {
     }
 }
 
-impl<F, L, P, T> PartitionStateProvider<T> for StateManagerProvider<F, L, P>
+impl<F, L, T> PartitionStateProvider<T> for StateManagerProvider<F, L>
 where
     F: StateBackendFactory<T>,
     L: Clone + Send + Sync + 'static,
-    P: AssignmentPublisher,
     T: Send,
 {
-    type AcquireError = StateAcquireError<IdentityErr<F::Backend>, P::Error>;
+    type AcquireError = StateAcquireError<IdentityErr<F::Backend>>;
     type Manager = StateManager<F::Backend, L>;
 
     async fn acquire(
@@ -109,10 +102,12 @@ where
             })
             .await
             .map_err(StateAcquireError::Identity)?;
-        self.publisher
-            .publish_if_owner(topic, partition)
-            .await
-            .map_err(StateAcquireError::Publication)?;
+        // An unvalidated registry must not change routing rows.
+        let routes = backend.routes();
+        routes.withdraw(&self.registry).await;
+        let routes = routes
+            .for_topic(topic, &self.registry)
+            .ok_or(StateAcquireError::Unrouted(topic))?;
         Ok(StateManager {
             inner: Arc::new(StateManagerInner {
                 cell: backend.cell(),
@@ -123,6 +118,7 @@ where
                 segment_id,
                 dedup_ttl: self.dedup_ttl,
                 checks: backend.checks(),
+                routes,
             }),
         })
     }
@@ -131,32 +127,35 @@ where
 /// Error raised when a [`StateManagerProvider`] cannot acquire a
 /// partition's manager.
 #[derive(Debug, Error)]
-pub enum StateAcquireError<StoreErr, PublicationErr>
+pub enum StateAcquireError<StoreErr>
 where
     StoreErr: ClassifyError + Error + Send + Sync + 'static,
-    PublicationErr: ClassifyError + Error + Send + Sync + 'static,
 {
-    /// Routing-set publication failed on its owning assignment.
-    #[error("keyed-state publication failed at partition acquisition: {0:#}")]
-    Publication(PublicationErr),
-
     /// Durable descriptor-identity validation failed. A mismatch is
     /// Permanent and recurs until the deployed descriptors match the
     /// segment's frozen identity; a store failure retries on the next
     /// acquisition attempt.
     #[error("keyed-state descriptor identity acquisition failed: {0:#}")]
     Identity(DescriptorIdentityError<StoreErr>),
+
+    /// Kafka assigned a topic that the consumer does not subscribe to, so the
+    /// topic has no routes. A consumer that publishes state subscribes only to
+    /// literal topics, so this error marks a broken invariant.
+    #[error(
+        "Prosody cannot acquire the keyed state of topic {0}: the consumer does not subscribe to \
+         it. Keyed-state routes exist only for subscribed topics."
+    )]
+    Unrouted(Topic),
 }
 
-impl<StoreErr, PublicationErr> ClassifyError for StateAcquireError<StoreErr, PublicationErr>
+impl<StoreErr> ClassifyError for StateAcquireError<StoreErr>
 where
     StoreErr: ClassifyError + Error + Send + Sync + 'static,
-    PublicationErr: ClassifyError + Error + Send + Sync + 'static,
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            Self::Publication(e) => e.classify_error(),
             Self::Identity(e) => e.classify_error(),
+            Self::Unrouted(_) => ErrorCategory::Permanent,
         }
     }
 }
