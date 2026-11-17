@@ -7,7 +7,7 @@ use crate::consumer::middleware::deduplication::{
     CassandraDeduplicationStoreProvider, MemoryDeduplicationStoreProvider,
 };
 use crate::error::ClassifyError;
-use crate::kafka_log::LogContext;
+use crate::kafka::{LogContext, base_config};
 use crate::loader::{KafkaLoader, MemoryLoader};
 use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
@@ -23,7 +23,6 @@ use crate::state::registry::CollectionDefRegistry;
 use crate::state_reader::PartitionCount;
 use crate::timers::duration::CompactDuration;
 use crate::{Codec, ConsumerGroup, EventIdentity, EventType, METADATA_TIMEOUT, Topic};
-use rdkafka::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::RDKafkaErrorCode;
 use rdkafka::metadata::Metadata;
@@ -238,9 +237,8 @@ async fn fetch_counts(
     topics: Vec<Topic>,
 ) -> Result<Vec<(Topic, PartitionCount)>, ConsumerError> {
     spawn_blocking(move || {
-        let client: BaseConsumer<LogContext> = ClientConfig::new()
-            .set("bootstrap.servers", bootstrap_servers)
-            .create_with_context(LogContext)?;
+        let client: BaseConsumer<LogContext> =
+            base_config(bootstrap_servers).create_with_context(LogContext)?;
         let metadata = client.fetch_metadata(None, METADATA_TIMEOUT)?;
         let counts = topics
             .into_iter()
