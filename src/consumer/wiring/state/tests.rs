@@ -16,7 +16,7 @@ const BROKER_TOPICS: [(&str, i32); 2] = [("routes-three", 3_i32), ("routes-one",
 
 /// Broker metadata gives a count for every topic in the cluster, including
 /// topics this client never consumed. It rejects a topic the broker does not
-/// know, and a pattern subscription.
+/// know.
 #[test]
 fn broker_metadata_counts_every_topic() -> Result<()> {
     let cluster = MockCluster::<DefaultProducerContext>::new(1)?;
@@ -41,13 +41,6 @@ fn broker_metadata_counts_every_topic() -> Result<()> {
             Err(RoutingError::Broker(_, UnknownTopicOrPartition))
         ),
         "an absent topic must be unknown"
-    );
-    ensure!(
-        matches!(
-            partition_count(&metadata, "^routes-.*"),
-            Err(RoutingError::Pattern(_))
-        ),
-        "a pattern must be rejected, not looked up"
     );
     Ok(())
 }
@@ -108,6 +101,33 @@ async fn published_memory_state_requires_mock_mode() -> Result<()> {
         Err(ConsumerError::KeyedState(
             KeyedStateInitError::PublishedMemoryStorage
         ))
+    ));
+    Ok(())
+}
+
+/// A consumer with a published collection rejects a pattern subscription at
+/// construction. The check covers the mock memory arm.
+#[tokio::test]
+async fn published_state_rejects_pattern_subscription() -> Result<()> {
+    let mut state = KeyedStateConfiguration::builder()
+        .subsystem(Some(SubsystemName::try_new("orders")?))
+        .build()?;
+    let _ = state.register(value_state::<JsonCodec>("cart").published(true));
+    let consumer = ConsumerConfiguration::builder()
+        .bootstrap_servers(vec!["unused:9092".to_owned()])
+        .group_id("orders")
+        .subscribed_topics(&["^orders-.*".to_owned()])
+        .mock(true)
+        .build()?;
+    let inputs = KeyedStateInputs::new(state, &consumer, "v1", Duration::from_secs(30))?;
+
+    let result = inputs.memory_routes(MemoryPublicationStore::new());
+
+    assert!(matches!(
+        result.map(|_| ()),
+        Err(ConsumerError::KeyedState(KeyedStateInitError::Routing(
+            RoutingError::Pattern(_)
+        )))
     ));
     Ok(())
 }

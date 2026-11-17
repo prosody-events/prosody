@@ -3,7 +3,7 @@
 //! A reader in another consumer group finds the state of a collection through
 //! its routing rows. [`Assignment`] owns the rule for when a row is written.
 
-use crate::error::{ClassifyError, ErrorCategory, log_at};
+use crate::error::{ClassifyError, ErrorCategory, RetryAlert, log_at};
 use crate::state::access::StateAccessError;
 use crate::state::identity::CollectionId;
 use crate::state::publication::{PublicationStore, StatePublication};
@@ -15,7 +15,7 @@ use crate::{ConsumerGroup, Topic};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
 use tracing::Level;
 
 #[cfg(test)]
@@ -41,10 +41,10 @@ pub struct Publisher<S> {
     /// The partition count of each subscribed topic. `for_topic` reads it only
     /// when a collection is published.
     counts: HashMap<Topic, PartitionCount>,
-    /// Closes when the rows of the collections that are not published are
-    /// removed. A failed removal leaves it open, so the next acquisition tries
-    /// again.
-    withdrawn: OnceCell<()>,
+    /// Holds `true` when `withdraw` is complete. A removal holds the lock.
+    withdrawn: Mutex<bool>,
+    /// Chooses the log level of a failed removal.
+    alert: RetryAlert,
 }
 
 /// The routes of one partition assignment.
@@ -61,13 +61,12 @@ pub(crate) enum TopicRoutes<S> {
 ///
 /// Invariant: a group advertises a collection under a topic only if a handler
 /// for that topic wrote the collection. In each partition assignment, the row
-/// is durable before the first cell write of the collection. An extra row is
-/// allowed. A missing row is never allowed.
+/// is durable before the first cell write of the collection. Prosody never
+/// removes the row of a published collection. If something else removes the
+/// row, the next assignment of the topic writes it again.
 ///
 /// The latch of a route shares one upsert between concurrent first writers. A
-/// failed upsert leaves the latch open, so the next write tries again. A new
-/// assignment has new latches, so a rebalance restores a row that was removed
-/// from outside. Never remove the rows of a published collection.
+/// failed upsert leaves the latch open, so the next write tries again.
 pub(crate) struct Assignment<S> {
     publisher: Arc<Publisher<S>>,
     row: StatePublication,
@@ -97,7 +96,8 @@ impl<S: PublicationStore> Routes<S> {
             subsystem,
             group,
             counts: counts.into_iter().collect(),
-            withdrawn: OnceCell::new(),
+            withdrawn: Mutex::new(false),
+            alert: RetryAlert::default(),
         }))
     }
 
@@ -105,8 +105,13 @@ impl<S: PublicationStore> Routes<S> {
     /// not published. This step retires a collection that was published
     /// before. It runs once for each process.
     ///
-    /// A failed removal never fails the acquisition. This call logs the error,
-    /// and the next acquisition tries again.
+    /// An acquisition never waits for the removal of another acquisition. A
+    /// failed removal never fails the acquisition. This call logs the error,
+    /// and a later acquisition tries again.
+    ///
+    /// During a rolling deploy that publishes a collection, an older process
+    /// can remove the new rows of that collection. The next assignment of each
+    /// topic writes them again.
     pub(crate) async fn withdraw(&self, registry: &CollectionDefRegistry) {
         let Self::Subsystem(publisher) = self else {
             return;
@@ -116,35 +121,46 @@ impl<S: PublicationStore> Routes<S> {
             subsystem,
             group,
             withdrawn,
+            alert,
             ..
         } = publisher.as_ref();
-        let removal = withdrawn
-            .get_or_try_init(|| {
-                stream::iter(
-                    registry
-                        .collections()
-                        .filter(|(state_type, name)| !registry.is_published(*state_type, name)),
-                )
-                .map(Ok)
-                .try_for_each_concurrent(STATE_FANOUT_CONCURRENCY, |(state_type, name)| {
-                    store.remove_group(subsystem, state_type, name, group)
-                })
-            })
-            .await;
-        if let Err(error) = removal {
-            let level = match error.classify_error() {
-                ErrorCategory::Transient => Level::WARN,
-                ErrorCategory::Permanent | ErrorCategory::Terminal => Level::ERROR,
-            };
-            log_at!(
-                level,
-                error = %error,
-                subsystem = %subsystem,
-                "Prosody cannot remove the routing rows of collections that are no longer \
-                 published. Readers in other consumer groups can still find these collections. \
-                 Prosody tries again at the next partition assignment. If this message repeats, \
-                 make sure that Cassandra is available."
-            );
+        let Ok(mut done) = withdrawn.try_lock() else {
+            return;
+        };
+        if *done {
+            return;
+        }
+
+        let removal = stream::iter(
+            registry
+                .collections()
+                .filter(|(state_type, name)| !registry.is_published(*state_type, name)),
+        )
+        .map(Ok)
+        .try_for_each_concurrent(STATE_FANOUT_CONCURRENCY, |(state_type, name)| {
+            store.remove_group(subsystem, state_type, name, group)
+        })
+        .await;
+        match removal {
+            Ok(()) => *done = true,
+            Err(error) => {
+                // A Terminal error means the client is closing. The
+                // acquisition path reports it.
+                let category = error.classify_error();
+                let level = match category {
+                    ErrorCategory::Terminal => Level::DEBUG,
+                    ErrorCategory::Transient | ErrorCategory::Permanent => alert.level(category),
+                };
+                log_at!(
+                    level,
+                    error = %error,
+                    subsystem = %subsystem,
+                    "Prosody cannot remove the routing rows of collections that are no longer \
+                     published. Readers in other consumer groups can still find these collections. \
+                     Prosody tries again at the next partition assignment. If this message \
+                     repeats, make sure that Cassandra is available."
+                );
+            }
         }
     }
 
@@ -223,7 +239,6 @@ impl<S: PublicationStore> TopicRoutes<S> {
                     .upsert(&publisher.subsystem, state_type, name, row)
             })
             .await
-            .map(|&()| ())
             .map_err(|error| {
                 // A routing failure says nothing about the event's data, so it
                 // retries as Transient instead of discarding the event's state.
@@ -231,10 +246,8 @@ impl<S: PublicationStore> TopicRoutes<S> {
                     ErrorCategory::Terminal => ErrorCategory::Terminal,
                     ErrorCategory::Transient | ErrorCategory::Permanent => ErrorCategory::Transient,
                 };
-                StateAccessError::Store {
-                    message: error.to_string(),
-                    category,
-                }
-            })
+                StateAccessError::store_as(&error, category)
+            })?;
+        Ok(())
     }
 }

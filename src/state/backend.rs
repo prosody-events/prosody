@@ -122,8 +122,10 @@ pub trait StateBackendFactory<T>: Clone + Send + Sync + 'static {
     fn for_partition(&self, topic: Topic, partition: Partition, triggers: T) -> Self::Backend;
 }
 
-/// The backend over memory stores. Memory assignments have no admission
-/// checks.
+/// A backend with in-memory identity and publication stores.
+///
+/// It has no admission checks. `C` can be any cell store, including
+/// `CassandraStore`.
 pub(crate) type MemoryBackend<D, C> =
     PartitionBackend<D, MemoryDescriptorIdentityStore, C, (), MemoryPublicationStore>;
 

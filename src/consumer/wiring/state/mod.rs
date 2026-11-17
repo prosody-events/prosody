@@ -127,6 +127,7 @@ impl KeyedStateInputs {
     ) -> Result<Routes<CassandraPublicationStore>, ConsumerError> {
         // Only published collections need counts.
         let counts = if self.registry.has_published() {
+            self.require_literal_topics()?;
             fetch_counts(self.bootstrap_servers.clone(), self.topics.clone()).await?
         } else {
             Vec::new()
@@ -141,14 +142,34 @@ impl KeyedStateInputs {
         &self,
         store: MemoryPublicationStore,
     ) -> Result<Routes<MemoryPublicationStore>, ConsumerError> {
-        if self.registry.has_published() && !self.mock {
-            return Err(KeyedStateInitError::PublishedMemoryStorage.into());
+        if self.registry.has_published() {
+            if !self.mock {
+                return Err(KeyedStateInitError::PublishedMemoryStorage.into());
+            }
+            self.require_literal_topics()?;
         }
         let counts = self
             .topics
             .iter()
             .map(|&topic| (topic, PartitionCount::MOCK));
         Ok(self.routes(store, counts))
+    }
+
+    /// Rejects a `^` pattern subscription. A pattern has no fixed topic set,
+    /// so a consumer that publishes keyed state must subscribe to literal
+    /// topics.
+    fn require_literal_topics(&self) -> Result<(), ConsumerError> {
+        match self
+            .topics
+            .iter()
+            .map(AsRef::<str>::as_ref)
+            .find(|name| name.starts_with('^'))
+        {
+            Some(name) => {
+                Err(KeyedStateInitError::from(RoutingError::Pattern(name.to_owned())).into())
+            }
+            None => Ok(()),
+        }
     }
 
     /// The routes under the configured subsystem. A consumer without a
@@ -257,9 +278,6 @@ async fn fetch_counts(
 /// of partitions it lists. A partition without a leader still counts, because
 /// the broker lists it.
 fn partition_count(metadata: &Metadata, topic: &str) -> Result<PartitionCount, RoutingError> {
-    if topic.starts_with('^') {
-        return Err(RoutingError::Pattern(topic.to_owned()));
-    }
     let broker = |code| RoutingError::Broker(topic.to_owned(), code);
     let entry = metadata
         .topics()
