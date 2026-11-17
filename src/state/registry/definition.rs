@@ -51,8 +51,8 @@ pub enum StateVisibility {
     /// deploy. A consumer withdraws only the routing rows of names that are
     /// still registered, now `Private`, and have a configured subsystem.
     /// Deleting the registration or dropping the `subsystem` config strands the
-    /// `(subsystem, name)` routing row. With `TTL = None` that stranded row and
-    /// its cells stay discoverable by cross-group readers indefinitely.
+    /// `(subsystem, name)` routing rows. With `TTL = None` those stranded rows
+    /// and their cells stay discoverable by cross-group readers indefinitely.
     Published,
 }
 

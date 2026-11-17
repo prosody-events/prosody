@@ -1,10 +1,11 @@
 //! The advertised routes must equal the routes that each assignment wrote.
 //!
-//! Two processes of one group share the durable stores. Each process owns its
-//! routes and acquires its partitions through a real `StateManagerProvider`.
-//! Each acquisition is one partition assignment with its own latches. Writes
-//! use both durable write paths: the settle-time finalize and the mid-handler
-//! commit. A plain model holds the expected rows.
+//! Two processes of one group share the durable stores. Each partition has one
+//! owner process. Each process owns its routes and acquires its partitions
+//! through a real `StateManagerProvider`, all at the same time, as a rebalance
+//! does. Each acquisition is one partition assignment with its own latches.
+//! Writes use both durable write paths: the settle-time finalize and the
+//! mid-handler commit. A plain model holds the expected rows.
 
 use super::*;
 use crate::JsonCodec;
@@ -23,14 +24,16 @@ use crate::state::session::{Finalized, Promoted, TerminationWatch};
 use crate::state::store::CellRead;
 use crate::state::tests::cell_suite::{MemoryDeduplicationStore, value_cell};
 use crate::state::tests::support::{ScriptedPublicationStore, probe};
-use crate::state::{PartitionBackend, StateBackendFactory, StateKey, StoreOutcome};
-use crate::test_util::{ModelProperty, TEST_RUNTIME};
+use crate::state::{SharedStateBackend, StateKey, StoreOutcome};
+use crate::test_util::ModelProperty;
 use crate::timers::duration::CompactDuration;
 use crate::{Key, Partition};
 use color_eyre::eyre::{Result, ensure, eyre};
+use futures::future::join_all;
 use quickcheck::{Arbitrary, Gen, QuickCheck};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use strum::VariantArray;
+use tokio::runtime::Builder;
 use tokio::sync::watch;
 
 mod harness;
@@ -69,15 +72,16 @@ const COLLECTIONS: [(&str, StateVisibility, CommitMode); 3] = [
 /// The number of processes in the group.
 const PROCESSES: usize = 2;
 
-/// A partition assignment `(process, topic, partition)`, with indices into the
-/// fixture tables.
-type Slot = (usize, usize, Partition);
+/// A partition `(topic, partition)` of a subscribed topic, with the topic as an
+/// index into [`TOPICS`].
+type Slot = (usize, Partition);
 
 /// A routing row `(collection, group, topic, partition count)`.
 type Row = (usize, ConsumerGroup, Topic, i32);
 
-/// One durable write of one collection from one partition of one topic. An
-/// unseeded write buffers nothing, so it has nothing to write.
+/// One durable write of one collection from one partition. It runs in the
+/// assignment of the partition owner. An unseeded write buffers nothing, so it
+/// has nothing to write.
 #[derive(Clone, Copy, Debug)]
 struct Write {
     slot: Slot,
@@ -107,14 +111,15 @@ enum Op {
         failure: Option<ErrorCategory>,
     },
     /// An operator or an older version removes the rows of the group for a
-    /// published collection.
+    /// collection.
     Remove { collection: usize },
-    /// A rebalance moves a partition away from its process and back.
-    Reassign { slot: Slot },
-    /// The process stops, and a new process acquires a partition. The routing
-    /// store fails the removals of that acquisition with `failure`.
+    /// A rebalance moves a partition to `process`, which can be its owner.
+    Reassign { slot: Slot, process: usize },
+    /// The owner of `slot` stops. A new process acquires all of its partitions.
+    /// The routing store fails the removals of these acquisitions with
+    /// `failure`.
     Restart {
-        process: usize,
+        slot: Slot,
         failure: Option<ErrorCategory>,
     },
 }
@@ -123,13 +128,16 @@ impl Arbitrary for Op {
     fn arbitrary(g: &mut Gen) -> Self {
         match u8::arbitrary(g) % 10 {
             0 => Self::Restart {
-                process: usize::arbitrary(g) % PROCESSES,
+                slot: slot(g),
                 failure: failure(g),
             },
             1 => Self::Remove {
-                collection: usize::arbitrary(g) % 2,
+                collection: usize::arbitrary(g) % COLLECTIONS.len(),
             },
-            2 | 3 => Self::Reassign { slot: slot(g) },
+            2 | 3 => Self::Reassign {
+                slot: slot(g),
+                process: usize::arbitrary(g) % PROCESSES,
+            },
             _ => Self::Write {
                 first: Write::arbitrary(g),
                 racer: Option::arbitrary(g),
@@ -177,25 +185,19 @@ struct Model {
     withdrawn: [bool; PROCESSES],
 }
 
-fn name(value: &str) -> Result<StateName> {
-    StateName::try_new(value).map_err(|error| eyre!("name: {error}"))
-}
-
 fn published(collection: usize) -> bool {
     COLLECTIONS[collection].1 == StateVisibility::Published
 }
 
 fn slot(g: &mut Gen) -> Slot {
-    (
-        usize::arbitrary(g) % PROCESSES,
-        usize::arbitrary(g) % TOPICS.len(),
-        Partition::from(u8::arbitrary(g) % 2),
-    )
+    let topic = usize::arbitrary(g) % TOPICS.len();
+    (topic, Partition::from(u8::arbitrary(g)) % TOPICS[topic].1)
 }
 
-/// The first assignment of a process: partition 0 of the first topic.
-fn home(process: usize) -> Slot {
-    (process, 0, Partition::from(0_u8))
+/// Every partition of the subscribed topics.
+fn slots() -> impl Iterator<Item = Slot> {
+    (0..TOPICS.len())
+        .flat_map(|topic| (0_i32..TOPICS[topic].1).map(move |partition| (topic, partition)))
 }
 
 /// A store failure in one third of the cases, of any category.
@@ -204,31 +206,24 @@ fn failure(g: &mut Gen) -> Option<ErrorCategory> {
     (u8::arbitrary(g) % 3 == 0).then_some(category)
 }
 
-/// Runs one write operation. Returns `Ok(false)` on a model mismatch.
+/// Runs `first` and a concurrent `racer`. Returns `Ok(false)` on a model
+/// mismatch.
 async fn run_writes(
-    harness: &mut Harness,
+    harness: &Harness,
     model: &mut Model,
-    writes: &[Write],
+    first: Write,
+    racer: Option<Write>,
     failure: Option<ErrorCategory>,
     n: u128,
 ) -> Result<bool> {
-    // A write runs in the live assignment of its partition. A partition that
-    // has no assignment is acquired first.
-    for write in writes {
-        if !harness.assignments.contains_key(&write.slot)
-            && !harness.assign(model, write.slot, None).await?
-        {
-            return Ok(false);
-        }
-    }
     harness.publications.fail_writes_with(failure);
     let upserts = harness.publications.upserts();
-    let outcomes = match writes {
-        [first, racer] => {
-            let (one, two) = tokio::join!(harness.write(*first, n), harness.write(*racer, n + 1));
-            vec![(*first, one?), (*racer, two?)]
+    let outcomes = match racer {
+        Some(racer) => {
+            let (one, two) = tokio::join!(harness.write(first, n), harness.write(racer, n + 1));
+            vec![(first, one?), (racer, two?)]
         }
-        _ => vec![(writes[0], harness.write(writes[0], n).await?)],
+        None => vec![(first, harness.write(first, n).await?)],
     };
     harness.publications.fail_writes_with(None);
 
@@ -266,8 +261,7 @@ async fn run_writes(
         return Ok(false);
     }
     for (slot, collection) in opened {
-        let (_, topic, _) = slot;
-        let (label, count) = TOPICS[topic];
+        let (label, count) = TOPICS[slot.0];
         model.latched.insert((slot, collection));
         model
             .rows
@@ -281,8 +275,9 @@ async fn run_trace(trace: Trace) -> Result<bool> {
     let mut model = Model::default();
     let mut harness = Harness::start(trace.stale, &mut model).await?;
     for process in 0..PROCESSES {
+        let owned: Vec<Slot> = slots().skip(process).step_by(PROCESSES).collect();
         if !harness
-            .assign(&mut model, home(process), trace.failure)
+            .assign(&mut model, process, &owned, trace.failure)
             .await?
         {
             return Ok(false);
@@ -297,12 +292,11 @@ async fn run_trace(trace: Trace) -> Result<bool> {
                 racer,
                 failure,
             } => {
-                let batch: Vec<Write> = [first].into_iter().chain(racer).collect();
                 writes += 2;
-                run_writes(&mut harness, &mut model, &batch, failure, writes).await?
+                run_writes(&harness, &mut model, first, racer, failure, writes).await?
             }
             Op::Remove { collection } => {
-                let name = name(COLLECTIONS[collection].0)?;
+                let name = StateName::try_new(COLLECTIONS[collection].0)?;
                 harness
                     .publications
                     .remove_group(&harness.subsystem, StateType::Application, &name, GROUP)
@@ -312,13 +306,24 @@ async fn run_trace(trace: Trace) -> Result<bool> {
                     .retain(|row| row.0 != collection || row.1.as_ref() != GROUP);
                 true
             }
-            Op::Reassign { slot } => harness.assign(&mut model, slot, None).await?,
-            Op::Restart { process, failure } => {
+            Op::Reassign { slot, process } => {
+                harness.assignments.remove(&slot);
+                harness.assign(&mut model, process, &[slot], None).await?
+            }
+            Op::Restart { slot, failure } => {
+                let process = harness.assignments[&slot].0;
+                let owned: Vec<Slot> = harness
+                    .assignments
+                    .iter()
+                    .filter(|(_, (owner, _))| *owner == process)
+                    .map(|(&slot, _)| slot)
+                    .collect();
+                harness
+                    .assignments
+                    .retain(|_, (owner, _)| *owner != process);
                 harness.processes[process] = harness.process()?;
-                harness.assignments.retain(|slot, _| slot.0 != process);
-                model.latched.retain(|(slot, _)| slot.0 != process);
                 model.withdrawn[process] = false;
-                harness.assign(&mut model, home(process), failure).await?
+                harness.assign(&mut model, process, &owned, failure).await?
             }
         };
         if !matched || harness.rows().await? != model.rows {
@@ -333,20 +338,25 @@ async fn run_trace(trace: Trace) -> Result<bool> {
     Ok(matches!(acquired, Err(StateAcquireError::Unrouted(topic)) if topic == unsubscribed))
 }
 
-/// After each operation, the routing table holds exactly the expected rows. A
-/// published collection advertises each topic that wrote it in a live or past
-/// assignment, unless a removal from outside deleted the row. Each new
-/// assignment writes the row again before its first write. A write whose
-/// upsert fails returns an error that is not Permanent and leaves no durable
-/// cell. A write with nothing buffered writes no row and never fails.
-/// Concurrent first writers in one assignment share one upsert. A failed
-/// removal of private rows never fails an acquisition, and the next
-/// acquisition of the process completes it. Stale rows of published
-/// collections and of other groups stay.
+/// After each operation, the routing table holds exactly the expected rows.
+/// [`Assignment`] owns the rule for which rows exist.
+///
+/// A write whose upsert fails returns an error that is not Permanent and
+/// leaves no durable cell. A write with nothing buffered writes no row and
+/// never fails. Concurrent acquisitions of a process make one removal attempt.
+/// A failed removal never fails an acquisition, and the next acquisition of
+/// the process tries again. Stale rows of published collections and of other
+/// groups stay. A process never acquires a topic that it does not subscribe to
+/// while a collection is published.
 #[test]
 fn advertised_routes_equal_the_topics_that_wrote() {
+    // A current-thread runtime defers each yield to the end of the poll, so a
+    // suspended store call lets the other acquisitions and writes run.
     fn property(trace: Trace) -> Result<bool> {
-        TEST_RUNTIME.block_on(run_trace(trace))
+        Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_trace(trace))
     }
     QuickCheck::new().quickcheck(ModelProperty(property));
 }

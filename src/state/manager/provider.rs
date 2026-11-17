@@ -141,7 +141,10 @@ where
     /// Kafka assigned a topic that the consumer does not subscribe to, so the
     /// topic has no routes. A consumer that publishes state subscribes only to
     /// literal topics, so this error marks a broken invariant.
-    #[error("topic {0} has no keyed-state routes because the consumer does not subscribe to it")]
+    #[error(
+        "Prosody cannot acquire the keyed state of topic {0}: the consumer does not subscribe to \
+         it. Keyed-state routes exist only for subscribed topics."
+    )]
     Unrouted(Topic),
 }
 

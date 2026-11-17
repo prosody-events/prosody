@@ -10,7 +10,10 @@ use crate::consumer::{DemandType, EventContext, EventHandler, Keyed, Uncommitted
 use crate::loader::MemoryLoader;
 use crate::state::SharedStateBackend;
 use crate::state::manager::StateManagerProvider;
-use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
+use crate::state::memory::{
+    MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore,
+};
+use crate::state::publisher::Routes;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::tests::support::MemoryDeduplicationStore;
 use crate::telemetry::Telemetry;
@@ -49,7 +52,12 @@ trait HasProcessedOffsets {
 /// tests: state is always wired, so even tests that never touch state mint a
 /// real (empty-registry) provider over the in-memory backend.
 type MemoryStateProvider = StateManagerProvider<
-    SharedStateBackend<MemoryCellStore, MemoryDescriptorIdentityStore, MemoryDeduplicationStore>,
+    SharedStateBackend<
+        MemoryCellStore,
+        MemoryDescriptorIdentityStore,
+        MemoryDeduplicationStore,
+        MemoryPublicationStore,
+    >,
     MemoryLoader<serde_json::Value>,
 >;
 
@@ -61,6 +69,7 @@ fn memory_state_provider(registry: CollectionDefRegistry) -> MemoryStateProvider
             MemoryCellStore::new(MemoryCells::new()),
             MemoryDescriptorIdentityStore::new(),
             MemoryDeduplicationStore::new(),
+            Routes::Unpublished,
         ),
         MemoryLoader::new(),
         registry,

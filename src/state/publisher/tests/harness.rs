@@ -4,38 +4,18 @@
 use super::*;
 
 /// One consumer process of the group.
-type Process = StateManagerProvider<Factory, ()>;
+type Process = StateManagerProvider<
+    SharedStateBackend<
+        MemoryCellStore,
+        MemoryDescriptorIdentityStore,
+        MemoryDeduplicationStore,
+        ScriptedPublicationStore,
+    >,
+    (),
+>;
 
 /// The state manager of one partition assignment.
 type Manager = <Process as PartitionStateProvider<()>>::Manager;
-
-/// Mints the backends of one process over the shared durable stores.
-#[derive(Clone)]
-pub(super) struct Factory {
-    cells: MemoryCells,
-    identities: MemoryDescriptorIdentityStore,
-    routes: Routes<ScriptedPublicationStore>,
-}
-
-impl StateBackendFactory<()> for Factory {
-    type Backend = PartitionBackend<
-        MemoryDeduplicationStore,
-        MemoryDescriptorIdentityStore,
-        MemoryCellStore,
-        (),
-        ScriptedPublicationStore,
-    >;
-
-    fn for_partition(&self, _topic: Topic, _partition: Partition, (): ()) -> Self::Backend {
-        PartitionBackend::new(
-            MemoryDeduplicationStore::default(),
-            self.identities.clone(),
-            MemoryCellStore::new(self.cells.clone()),
-            (),
-            self.routes.clone(),
-        )
-    }
-}
 
 /// The durable stores, which outlive each process, and the live assignments.
 pub(super) struct Harness {
@@ -46,7 +26,8 @@ pub(super) struct Harness {
     registry: Arc<CollectionDefRegistry>,
     pub(super) group: ConsumerGroup,
     pub(super) processes: Vec<Process>,
-    pub(super) assignments: HashMap<Slot, Manager>,
+    /// The owner process and the state manager of each partition.
+    pub(super) assignments: BTreeMap<Slot, (usize, Manager)>,
     // The senders keep the termination receivers of each session open.
     shutdown: watch::Sender<ShutdownPhase>,
     cancel: watch::Sender<bool>,
@@ -79,7 +60,12 @@ impl Harness {
                         partition_count: PartitionCount::try_from(RETIRED_TOPIC.1)?,
                     };
                     publications
-                        .seed(&subsystem, StateType::Application, &name(label)?, &row)
+                        .seed(
+                            &subsystem,
+                            StateType::Application,
+                            &StateName::try_new(label)?,
+                            &row,
+                        )
                         .await;
                     model
                         .rows
@@ -98,7 +84,7 @@ impl Harness {
             registry: Arc::new(registry),
             group: Arc::from(GROUP),
             processes: Vec::with_capacity(PROCESSES),
-            assignments: HashMap::new(),
+            assignments: BTreeMap::new(),
             shutdown,
             cancel,
         };
@@ -121,13 +107,14 @@ impl Harness {
             self.group.clone(),
             counts,
         );
-        let factory = Factory {
-            cells: self.cells.clone(),
-            identities: self.identities.clone(),
+        let backend = SharedStateBackend::new(
+            MemoryCellStore::new(self.cells.clone()),
+            self.identities.clone(),
+            MemoryDeduplicationStore::default(),
             routes,
-        };
+        );
         Ok(StateManagerProvider::new(
-            factory,
+            backend,
             (),
             self.registry.clone(),
             self.group.clone(),
@@ -135,27 +122,27 @@ impl Harness {
         ))
     }
 
-    /// Acquires `slot` as a new assignment. The routing store fails each
-    /// removal with `failure`. Returns `false` on a model mismatch.
+    /// Acquires `slots` in `process` at the same time, each as a new
+    /// assignment. The routing store fails each removal with `failure`.
+    /// Returns `false` on a model mismatch.
     pub(super) async fn assign(
         &mut self,
         model: &mut Model,
-        slot: Slot,
+        process: usize,
+        slots: &[Slot],
         failure: Option<ErrorCategory>,
     ) -> Result<bool> {
-        let (process, topic, partition) = slot;
+        let provider = &self.processes[process];
         self.publications.fail_writes_with(failure);
         let removes = self.publications.removes();
-        let acquired = self.processes[process]
-            .acquire(Topic::from(TOPICS[topic].0), partition, ())
-            .await;
+        let acquired = join_all(slots.iter().map(|&(topic, partition)| {
+            provider.acquire(Topic::from(TOPICS[topic].0), partition, ())
+        }))
+        .await;
         self.publications.fail_writes_with(None);
 
-        // A failed removal never fails the acquisition. The next acquisition
-        // of the process tries the removal again.
-        let Ok(manager) = acquired else {
-            return Ok(false);
-        };
+        // The acquisitions make one removal attempt together. A failed removal
+        // never fails an acquisition, and the next acquisition tries again.
         let private = (0..COLLECTIONS.len()).filter(|&c| !published(c)).count();
         let expected = if model.withdrawn[process] { 0 } else { private };
         if self.publications.removes() - removes != expected {
@@ -167,8 +154,13 @@ impl Harness {
                 .rows
                 .retain(|row| published(row.0) || row.1.as_ref() != GROUP);
         }
-        model.latched.retain(|(latched, _)| *latched != slot);
-        self.assignments.insert(slot, manager);
+        for (&slot, acquired) in slots.iter().zip(acquired) {
+            let Ok(manager) = acquired else {
+                return Ok(false);
+            };
+            model.latched.retain(|(latched, _)| *latched != slot);
+            self.assignments.insert(slot, (process, manager));
+        }
         Ok(true)
     }
 
@@ -180,11 +172,11 @@ impl Harness {
         write: Write,
         n: u128,
     ) -> Result<(Result<bool, StateAccessError>, bool)> {
-        let (_, topic, partition) = write.slot;
+        let (topic, partition) = write.slot;
         let topic = Topic::from(TOPICS[topic].0);
-        let name = name(COLLECTIONS[write.collection].0)?;
+        let name = StateName::try_new(COLLECTIONS[write.collection].0)?;
         let key: Key = Arc::from(format!("key-{n}"));
-        let manager = self
+        let (_, manager) = self
             .assignments
             .get(&write.slot)
             .ok_or_else(|| eyre!("write {n} has no assignment"))?;
@@ -235,7 +227,11 @@ impl Harness {
         for (collection, (label, ..)) in COLLECTIONS.into_iter().enumerate() {
             let found = self
                 .publications
-                .rows(&self.subsystem, StateType::Application, &name(label)?)
+                .rows(
+                    &self.subsystem,
+                    StateType::Application,
+                    &StateName::try_new(label)?,
+                )
                 .await;
             rows.extend(found.into_iter().map(|row| {
                 let count = i32::from(row.partition_count);

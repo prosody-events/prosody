@@ -16,15 +16,14 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
-use tracing::Level;
 
 #[cfg(test)]
 mod tests;
 
 /// The routing rows of one consumer process. A process builds them once.
 ///
-/// `StateBackend::routes` returns this type, and public bounds make that trait
-/// reachable, so `Routes` and `Publisher` must be `pub`.
+/// `Routes` and `Publisher` are `pub` because the public trait `StateBackend`
+/// returns `Routes`.
 #[derive(Clone)]
 pub enum Routes<S> {
     /// The consumer has no subsystem, so it owns no routing row.
@@ -56,14 +55,14 @@ pub(crate) enum TopicRoutes<S> {
     Published(Arc<Assignment<S>>),
 }
 
-/// The routing row of one partition assignment, and one route for each
-/// published collection.
+/// The routing rows that one partition assignment writes. It holds the row
+/// value and one route for each published collection.
 ///
 /// Invariant: a group advertises a collection under a topic only if a handler
-/// for that topic wrote the collection. In each partition assignment, the row
-/// is durable before the first cell write of the collection. Prosody never
-/// removes the row of a published collection. If something else removes the
-/// row, the next assignment of the topic writes it again.
+/// for that topic tried to write the collection. In each partition assignment,
+/// the row is durable before the first stage or direct write of the collection.
+/// Prosody never removes the row of a published collection. If something else
+/// removes the row, the next assignment of the topic writes it again.
 ///
 /// The latch of a route shares one upsert between concurrent first writers. A
 /// failed upsert leaves the latch open, so the next write tries again.
@@ -81,7 +80,7 @@ struct Route {
     durable: OnceCell<()>,
 }
 
-impl<S: PublicationStore> Routes<S> {
+impl<S> Routes<S> {
     /// Builds the routes of `group` under `subsystem`.
     ///
     /// `counts` holds the partition count of each subscribed topic.
@@ -108,23 +107,14 @@ impl<S: PublicationStore> Routes<S> {
     /// An acquisition never waits for the removal of another acquisition. A
     /// failed removal never fails the acquisition. This call logs the error,
     /// and a later acquisition tries again.
-    ///
-    /// During a rolling deploy that publishes a collection, an older process
-    /// can remove the new rows of that collection. The next assignment of each
-    /// topic writes them again.
-    pub(crate) async fn withdraw(&self, registry: &CollectionDefRegistry) {
+    pub(crate) async fn withdraw(&self, registry: &CollectionDefRegistry)
+    where
+        S: PublicationStore,
+    {
         let Self::Subsystem(publisher) = self else {
             return;
         };
-        let Publisher {
-            store,
-            subsystem,
-            group,
-            withdrawn,
-            alert,
-            ..
-        } = publisher.as_ref();
-        let Ok(mut done) = withdrawn.try_lock() else {
+        let Ok(mut done) = publisher.withdrawn.try_lock() else {
             return;
         };
         if *done {
@@ -138,29 +128,23 @@ impl<S: PublicationStore> Routes<S> {
         )
         .map(Ok)
         .try_for_each_concurrent(STATE_FANOUT_CONCURRENCY, |(state_type, name)| {
-            store.remove_group(subsystem, state_type, name, group)
+            publisher
+                .store
+                .remove_group(&publisher.subsystem, state_type, name, &publisher.group)
         })
         .await;
         match removal {
             Ok(()) => *done = true,
-            Err(error) => {
-                // A Terminal error means the client is closing. The
-                // acquisition path reports it.
-                let category = error.classify_error();
-                let level = match category {
-                    ErrorCategory::Terminal => Level::DEBUG,
-                    ErrorCategory::Transient | ErrorCategory::Permanent => alert.level(category),
-                };
-                log_at!(
-                    level,
-                    error = %error,
-                    subsystem = %subsystem,
-                    "Prosody cannot remove the routing rows of collections that are no longer \
-                     published. Readers in other consumer groups can still find these collections. \
-                     Prosody tries again at the next partition assignment. If this message \
-                     repeats, make sure that Cassandra is available."
-                );
-            }
+            Err(error) => log_at!(
+                publisher.alert.level(error.classify_error()),
+                error = %error,
+                subsystem = %publisher.subsystem,
+                group = %publisher.group,
+                "Prosody cannot remove the routing rows of collections that are no longer \
+                 published. Readers in other consumer groups can still find these collections. \
+                 Prosody tries again at the next partition assignment. If this message \
+                 repeats, make sure that Cassandra is available."
+            ),
         }
     }
 

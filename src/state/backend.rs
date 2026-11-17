@@ -129,37 +129,40 @@ pub trait StateBackendFactory<T>: Clone + Send + Sync + 'static {
 pub(crate) type MemoryBackend<D, C> =
     PartitionBackend<D, MemoryDescriptorIdentityStore, C, (), MemoryPublicationStore>;
 
-/// Clones shared test stores for each partition.
+/// Clones shared test stores and routes for each partition.
 #[cfg(test)]
-#[derive(Clone, Debug)]
-pub struct SharedStateBackend<S, I, D> {
+#[derive(Clone)]
+pub struct SharedStateBackend<S, I, D, P> {
     cell: S,
     identity: I,
     dedup: D,
+    routes: Routes<P>,
 }
 
 #[cfg(test)]
-impl<S, I, D> SharedStateBackend<S, I, D> {
+impl<S, I, D, P> SharedStateBackend<S, I, D, P> {
     /// Creates a backend factory that hands out clones of the supplied parts.
     #[must_use]
-    pub fn new(cell: S, identity: I, dedup: D) -> Self {
+    pub fn new(cell: S, identity: I, dedup: D, routes: Routes<P>) -> Self {
         Self {
             cell,
             identity,
             dedup,
+            routes,
         }
     }
 }
 
 /// Shared test stores do not use the trigger handle.
 #[cfg(test)]
-impl<S, I, D, T> StateBackendFactory<T> for SharedStateBackend<S, I, D>
+impl<S, I, D, P, T> StateBackendFactory<T> for SharedStateBackend<S, I, D, P>
 where
     S: CellStore + Clone,
     I: DescriptorIdentityStore + Clone,
     D: DeduplicationStore,
+    P: PublicationStore,
 {
-    type Backend = PartitionBackend<D, I, S, (), MemoryPublicationStore>;
+    type Backend = PartitionBackend<D, I, S, (), P>;
 
     fn for_partition(&self, _topic: Topic, _partition: Partition, _triggers: T) -> Self::Backend {
         PartitionBackend::new(
@@ -167,7 +170,7 @@ where
             self.identity.clone(),
             self.cell.clone(),
             (),
-            Routes::Unpublished,
+            self.routes.clone(),
         )
     }
 }

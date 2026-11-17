@@ -161,7 +161,7 @@ pub struct KeyedStateConfiguration {
     /// consumer withdraws a collection's routing rows only while it is still
     /// registered `Private` under a configured subsystem. Dropping the
     /// subsystem or the registration in the same deploy as `.published(false)`
-    /// strands the row instead of withdrawing it. See [`StateVisibility`].
+    /// strands the rows instead of withdrawing them. See [`StateVisibility`].
     ///
     /// Environment variable: `PROSODY_SUBSYSTEM`. `none` disables it.
     #[builder(default = "from_option_env(SUBSYSTEM_ENV)?")]

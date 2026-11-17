@@ -17,7 +17,6 @@ use crate::state::fjall::FjallClient;
 use crate::state::manager::StateManagerProvider;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
-use crate::state::publication::PublicationStore;
 use crate::state::publisher::Routes;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state_reader::PartitionCount;
@@ -66,8 +65,13 @@ impl KeyedStateInputs {
         CompactDuration::try_from(consumer_config.slab_size)
             .map_err(ConsumerError::InvalidSlabSize)?;
         let registry = Arc::new(config.build_registry().map_err(KeyedStateInitError::from)?);
-        let topics: Vec<Topic> = consumer_config
-            .subscribed_topics
+        let subscribed = &consumer_config.subscribed_topics;
+        if registry.has_published()
+            && let Some(pattern) = subscribed.iter().find(|name| name.starts_with('^'))
+        {
+            return Err(KeyedStateInitError::from(RoutingError::Pattern(pattern.clone())).into());
+        }
+        let topics = subscribed
             .iter()
             .map(|topic| Topic::from(topic.as_str()))
             .collect();
@@ -113,8 +117,10 @@ impl KeyedStateInputs {
         })
     }
 
-    /// The routes for a Cassandra arm. Broker metadata supplies the partition
-    /// count of each subscribed topic, and this call fetches it once.
+    /// The routes for a Cassandra arm. A consumer with a published collection
+    /// reads the partition count of each subscribed topic from broker
+    /// metadata. This call fetches it once. Otherwise this call fetches
+    /// nothing.
     ///
     /// # Errors
     ///
@@ -126,7 +132,6 @@ impl KeyedStateInputs {
     ) -> Result<Routes<CassandraPublicationStore>, ConsumerError> {
         // Only published collections need counts.
         let counts = if self.registry.has_published() {
-            self.require_literal_topics()?;
             fetch_counts(self.bootstrap_servers.clone(), self.topics.clone()).await?
         } else {
             Vec::new()
@@ -141,11 +146,8 @@ impl KeyedStateInputs {
         &self,
         store: MemoryPublicationStore,
     ) -> Result<Routes<MemoryPublicationStore>, ConsumerError> {
-        if self.registry.has_published() {
-            if !self.mock {
-                return Err(KeyedStateInitError::PublishedMemoryStorage.into());
-            }
-            self.require_literal_topics()?;
+        if self.registry.has_published() && !self.mock {
+            return Err(KeyedStateInitError::PublishedMemoryStorage.into());
         }
         let counts = self
             .topics
@@ -154,28 +156,11 @@ impl KeyedStateInputs {
         Ok(self.routes(store, counts))
     }
 
-    /// Rejects a `^` pattern subscription. A pattern has no fixed topic set,
-    /// so a consumer that publishes keyed state must subscribe to literal
-    /// topics.
-    fn require_literal_topics(&self) -> Result<(), ConsumerError> {
-        match self
-            .topics
-            .iter()
-            .map(AsRef::<str>::as_ref)
-            .find(|name| name.starts_with('^'))
-        {
-            Some(name) => {
-                Err(KeyedStateInitError::from(RoutingError::Pattern(name.to_owned())).into())
-            }
-            None => Ok(()),
-        }
-    }
-
     /// The routes under the configured subsystem. A consumer without a
     /// subsystem publishes nothing. The low-level
     /// [`ProsodyConsumer::new`](crate::consumer::ProsodyConsumer::new)
     /// constructor never calls this: it rejects registrations.
-    fn routes<S: PublicationStore>(
+    fn routes<S>(
         &self,
         store: S,
         counts: impl IntoIterator<Item = (Topic, PartitionCount)>,

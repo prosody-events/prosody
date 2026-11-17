@@ -1,11 +1,10 @@
 //! The partition's keyed-state manager.
 //!
 //! Acquisition validates descriptor identities before it returns a manager.
-//! It also tries to remove the routing rows of unpublished collections.
 //! Admission resolves durable residue and retires committed sources before the
-//! key can dispatch. Each dispatched event receives a session over the shared
-//! cell store, dedup store, registry, loader, dirty workspace, and the routes
-//! of the assignment.
+//! key can dispatch. Each dispatched event receives a session. The session
+//! shares the cell store, dedup store, registry, loader, dirty workspace, and
+//! the routes of the assignment.
 //!
 //! Kafka partition ownership provides exclusive access. The partition loop
 //! derives each `EventRef` and supplies it to the manager.

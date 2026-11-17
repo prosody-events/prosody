@@ -43,7 +43,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
-use tokio::task::yield_now;
 use uuid::Uuid;
 
 mod reader;

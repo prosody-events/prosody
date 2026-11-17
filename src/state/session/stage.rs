@@ -75,8 +75,7 @@ fn stage_chunks<I: Iterator<Item = (CellKey, Option<Bytes>)>>(
 /// Returns `None` when there is nothing to stage, and for a `ReadUncommitted`
 /// collection, which writes resolved values at stage time.
 /// A `Cleared` cell in a cleared section is dropped on both arms. The clear's
-/// gap erase covers it, so the write stays row-disjoint. This is a free
-/// function so no `self` borrow crosses the concurrent fan-out.
+/// gap erase covers it, so the write stays row-disjoint.
 pub(super) async fn stage_collection<B: StateBackend, L>(
     session: &SessionInner<B, L>,
     id: CollectionId,
