@@ -13,7 +13,6 @@ use crate::{Offset, Partition, Topic};
 use ahash::AHashMap;
 use futures::future::join_all;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
-use rdkafka::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::OwnedHeaders;
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -75,9 +74,7 @@ async fn try_load_reports_transient_capacity_exhaustion() -> color_eyre::Result<
 }
 
 fn producer() -> color_eyre::Result<FutureProducer> {
-    let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", BOOTSTRAP)
-        .create()?;
+    let producer: FutureProducer = base_config(BOOTSTRAP).create()?;
     Ok(producer)
 }
 
@@ -156,8 +153,7 @@ async fn delete_records_multi(
 
 fn watermark_consumer() -> color_eyre::Result<Arc<BaseConsumer>> {
     Ok(Arc::new(
-        ClientConfig::new()
-            .set("bootstrap.servers", BOOTSTRAP)
+        base_config(BOOTSTRAP)
             .set("group.id", "prosody-test-setup")
             .create()?,
     ))

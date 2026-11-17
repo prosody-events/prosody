@@ -5,6 +5,7 @@
 use crate::codec::JsonCodec;
 use crate::consumer::decode::IgnoreRequests;
 use crate::consumer::source::Reader;
+use crate::kafka::base_config;
 use crate::otel::SpanRelation;
 use crate::test_util::TEST_RUNTIME;
 use crate::test_util::kafka::{BOOTSTRAP, with_topic};
@@ -14,7 +15,7 @@ use rdkafka::consumer::base_consumer::PartitionQueue;
 use rdkafka::consumer::{BaseConsumer, Consumer, DefaultConsumerContext};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
-use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
+use rdkafka::{Message, Offset, TopicPartitionList};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::spawn_blocking;
@@ -98,8 +99,7 @@ fn topic_name(name: &str) -> String {
 }
 
 fn consumer() -> Result<Arc<BaseConsumer>> {
-    let consumer = ClientConfig::new()
-        .set("bootstrap.servers", BOOTSTRAP)
+    let consumer = base_config(BOOTSTRAP)
         .set("group.id", Uuid::new_v4().to_string())
         .set("enable.auto.commit", "false")
         .create()?;
@@ -115,9 +115,7 @@ fn assignment(topic: &str) -> Result<TopicPartitionList> {
 
 /// Sends [`RECORDS`] keyed records to partition 0 of `topic`, one at a time.
 async fn produce(topic: &str) -> Result<()> {
-    let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", BOOTSTRAP)
-        .create()?;
+    let producer: FutureProducer = base_config(BOOTSTRAP).create()?;
     for _ in 0..RECORDS {
         let record = FutureRecord::to(topic)
             .partition(0)

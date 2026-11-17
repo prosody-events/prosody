@@ -5,7 +5,7 @@ use super::{
     RecordMeta, Request, Responses, Span, SpanRelation, TextMapCompositePropagator, Timeout, Topic,
     TryRecvError, debug, decode_record, error, mpsc, new_propagator, related_span, select, warn,
 };
-use crate::kafka_log::log_error;
+use crate::kafka::log_error;
 use crate::subsystem::SubsystemName;
 
 pub(super) fn poll_loop<C: Codec>(
