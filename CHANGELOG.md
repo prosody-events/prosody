@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.9.0](https://github.com/prosody-events/prosody/compare/prosody-v0.8.0...prosody-v0.9.0) (2026-11-17)
+
+
+### Features
+
+* add a Kafka rack for fetches from the closest replica ([#137](https://github.com/prosody-events/prosody/issues/137)) ([bc9e7de](https://github.com/prosody-events/prosody/commit/bc9e7de9c256beb317da93890453d318b7a0e6d7))
+
+
+### Bug Fixes
+
+* close idle Kafka connections before the network drops them ([#140](https://github.com/prosody-events/prosody/issues/140)) ([3794fe9](https://github.com/prosody-events/prosody/commit/3794fe973e6c909fa80d63648360c47a8c5fb2bf))
+* **state:** publish routing rows only for topics that write state ([#139](https://github.com/prosody-events/prosody/issues/139)) ([015e04c](https://github.com/prosody-events/prosody/commit/015e04c2748ad3fe04ec6f7140eea86b62c0cd51))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * prosody-macros bumped from 0.8.0 to 0.9.0
+
 ## [0.8.0](https://github.com/prosody-events/prosody/compare/prosody-v0.7.1...prosody-v0.8.0) (2026-11-11)
 
 
