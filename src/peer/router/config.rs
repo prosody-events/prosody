@@ -3,15 +3,19 @@
 use crate::peer::PeerEndpoint;
 use crate::peer::router::cache_config::PeerCacheConfiguration;
 use crate::peer::router::directory::{RegistrationTtl, RegistrationTtlError};
+use crate::peer::router::interface::{InterfaceError, default_address};
 use crate::peer::router::runtime::RouterConfiguration;
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback, from_option_env};
 use derive_builder::{Builder, UninitializedFieldError};
 use std::env::{VarError, var};
 use std::net::AddrParseError;
-use std::net::{IpAddr, SocketAddr, SocketAddrV6};
+use std::net::SocketAddr;
 use std::time::Duration;
 use thiserror::Error;
 use validator::{Validate, ValidationError, ValidationErrors};
+
+/// The peer listener port when the operator sets no address.
+const DEFAULT_PORT: u16 = 9099;
 
 /// How this process joins the peer fleet: what its listener binds, what it
 /// publishes about itself, how it answers, and what it may ask for.
@@ -29,8 +33,15 @@ use validator::{Validate, ValidationError, ValidationErrors};
 pub struct PeerConfiguration {
     /// The address for the peer listener.
     ///
-    /// Prosody selects an address when it starts the network router if this
-    /// value is absent. Local-only routers do not select an address.
+    /// Peers connect to the address that the listener binds. A listener on an
+    /// unspecified IP address, such as `0.0.0.0` or `::`, accepts on every
+    /// interface and publishes the default interface address of that family.
+    /// If this value is absent, a network router binds the default interface
+    /// address on port 9099. Local-only routers do not select an address.
+    ///
+    /// Without an advertised entry point, a held port does not stop startup.
+    /// The operating system then selects a port, and peers find it through the
+    /// peer directory.
     #[builder(default = "configured_bind_address()?")]
     pub bind_address: Option<SocketAddr>,
     /// The gRPC connect URI that peers on another network use.
@@ -67,33 +78,6 @@ fn configured_bind_address() -> Result<Option<SocketAddr>, PeerConfigurationBuil
     }
 }
 
-fn default_socket_address() -> Result<SocketAddr, PeerConfigurationError> {
-    let interface = netdev::get_interfaces()
-        .into_iter()
-        .find(|interface| interface.default)
-        .ok_or(PeerConfigurationError::NoDefaultInterface)?;
-    if let Some(network) = interface.ipv4.iter().find(|network| {
-        let address = network.addr();
-        !address.is_link_local() && !address.is_loopback() && !address.is_unspecified()
-    }) {
-        return Ok(SocketAddr::new(IpAddr::V4(network.addr()), 9099));
-    }
-    if let Some(network) = interface.ipv6.iter().find(|network| {
-        let address = network.addr();
-        !address.is_unicast_link_local() && !address.is_loopback() && !address.is_unspecified()
-    }) {
-        return Ok(SocketAddr::new(IpAddr::V6(network.addr()), 9099));
-    }
-    if let Some(network) = interface.ipv4.first() {
-        return Ok(SocketAddr::new(IpAddr::V4(network.addr()), 9099));
-    }
-    interface
-        .ipv6
-        .first()
-        .map(|network| SocketAddrV6::new(network.addr(), 9099, 0, interface.index).into())
-        .ok_or(PeerConfigurationError::NoInterfaceAddress)
-}
-
 impl PeerConfiguration {
     /// Creates a peer configuration builder.
     #[must_use]
@@ -114,7 +98,9 @@ impl PeerConfiguration {
     fn unvalidated_parts(&self) -> Result<PeerParts, PeerConfigurationError> {
         let lease = RegistrationTtl::try_from(self.registration_ttl)?;
         Ok(PeerParts {
-            bind: self.bind_address.map_or_else(default_socket_address, Ok)?,
+            bind: self
+                .bind_address
+                .map_or_else(|| default_address(None, DEFAULT_PORT), Ok)?,
             router: RouterConfiguration {
                 advertised: self
                     .advertised_connect
@@ -131,12 +117,6 @@ impl PeerConfiguration {
 }
 
 fn validate_peer(config: &PeerConfiguration) -> Result<(), ValidationError> {
-    if config
-        .bind_address
-        .is_some_and(|bind| bind.ip().is_unspecified())
-    {
-        return Err(ValidationError::new("unspecified_bind_address"));
-    }
     RouterConfiguration {
         advertised: config
             .advertised_connect
@@ -165,12 +145,9 @@ pub(crate) enum PeerConfigurationError {
     /// The registration lease is outside its supported range.
     #[error("invalid registration lease: {0:#}")]
     Lease(#[from] RegistrationTtlError),
-    /// The operating system did not identify a default interface.
-    #[error("the operating system did not identify a default network interface")]
-    NoDefaultInterface,
-    /// The default interface has no address.
-    #[error("the default network interface has no address")]
-    NoInterfaceAddress,
+    /// The default network interface has no address to bind.
+    #[error(transparent)]
+    Interface(#[from] InterfaceError),
 }
 
 /// Why the peer configuration builder cannot build a configuration.

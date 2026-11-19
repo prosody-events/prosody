@@ -40,7 +40,8 @@ mod tests;
 use self::generated::peer_service_server::PeerServiceServer;
 use self::service::PeerService;
 use crate::peer::router::RelayHop;
-use std::io::Error as IoError;
+use crate::peer::router::interface::{InterfaceError, default_address};
+use std::io::{Error as IoError, ErrorKind};
 use std::net::SocketAddr;
 use std::time::Duration;
 use thiserror::Error;
@@ -50,7 +51,7 @@ use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 use tonic_health::server::health_reporter;
 use tonic_reflection::server::{Builder as ReflectionBuilder, Error as ReflectionError};
-use tracing::error;
+use tracing::{error, info};
 
 /// The peer schema, embedded so reflection can publish it without a file.
 const DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/peer_descriptor.bin"));
@@ -61,11 +62,10 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// How long a pinged peer has to answer before its connection is closed.
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A listener that is already bound and the address it bound.
+/// A listener that is already bound and the address that peers connect to.
 ///
-/// The address is the one the operating system assigned, and it is the only
-/// address this type will give up: a caller cannot reach the configured one, so
-/// registration can only publish a port something bound.
+/// The port is the one the operating system assigned, so registration can only
+/// publish a port something bound. The IP address is never unspecified.
 pub(crate) struct BoundListener {
     listener: TcpListener,
     address: SocketAddr,
@@ -76,15 +76,54 @@ impl BoundListener {
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError::Bind`] when the address cannot be bound.
+    /// Returns [`TransportError`] when the address cannot be bound or has no
+    /// address to publish.
     pub(crate) async fn bind(address: SocketAddr) -> Result<Self, TransportError> {
-        let listener = TcpListener::bind(address).await?;
-        let address = listener.local_addr()?;
+        Self::listen(TcpListener::bind(address).await?)
+    }
+
+    /// Binds `address`. If another process holds the port, binds a port that
+    /// the operating system selects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError`] when neither port can be bound or the
+    /// listener has no address to publish.
+    pub(crate) async fn bind_any_port(address: SocketAddr) -> Result<Self, TransportError> {
+        match TcpListener::bind(address).await {
+            Err(held) if held.kind() == ErrorKind::AddrInUse => {
+                let mut any_port = address;
+                any_port.set_port(0);
+                let listener = TcpListener::bind(any_port)
+                    .await
+                    .map_err(|retry| TransportError::Held { held, retry })?;
+                let bound = Self::listen(listener)?;
+                info!(
+                    requested = %address,
+                    bound = %bound.address,
+                    "Another process holds the requested peer port. Prosody uses a port that \
+                     the operating system selected. If a firewall limits peer traffic, allow \
+                     this port."
+                );
+                Ok(bound)
+            }
+            bound => Self::listen(bound?),
+        }
+    }
+
+    /// Wraps a bound listener. A listener on an unspecified IP address
+    /// publishes the default interface address of the same family.
+    fn listen(listener: TcpListener) -> Result<Self, TransportError> {
+        let bound = listener.local_addr()?;
+        let address = if bound.ip().is_unspecified() {
+            default_address(Some(bound.ip()), bound.port())?
+        } else {
+            bound
+        };
         Ok(Self { listener, address })
     }
 
-    /// The address the operating system assigned. Its port is what registration
-    /// publishes.
+    /// The address that registration publishes.
     pub(crate) const fn address(&self) -> SocketAddr {
         self.address
     }
@@ -141,6 +180,17 @@ pub(crate) enum TransportError {
     /// The listener could not bind the address it was given.
     #[error("the peer listener could not bind: {0:#}")]
     Bind(#[from] IoError),
+
+    /// Another process holds the port, and no other port could be bound.
+    #[error(
+        "another process holds the peer port ({held:#}), and no other port could be bound: \
+         {retry:#}"
+    )]
+    Held { held: IoError, retry: IoError },
+
+    /// A wildcard listener has no interface address to publish.
+    #[error("the peer listener has no address to publish: {0:#}")]
+    Interface(#[from] InterfaceError),
 
     /// The embedded peer schema could not be published.
     #[error("the peer schema could not be published: {0:#}")]

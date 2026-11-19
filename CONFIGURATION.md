@@ -65,11 +65,10 @@ more fetch requests.
 
 Set these values with environment variables or `PeerConfiguration::builder()`.
 An explicit builder value replaces its environment value.
-Use a different bind address for each client that shares a host.
 
 | Environment variable | Default | Why it is needed | What it controls | Validation |
 |---|---:|---|---|---|
-| `PROSODY_PEER_BIND_ADDRESS` | Automatic | The peer server needs a reachable listener. | The socket address that the peer server binds and publishes. | Must be a specified IPv4 or IPv6 socket address. A network router selects the default-interface address on port `9099` when this value is absent. A local router does not select an address. |
+| `PROSODY_PEER_BIND_ADDRESS` | Automatic | The peer server needs a reachable listener. | The socket address that the peer server binds. | Must be an IPv4 or IPv6 socket address. A network router binds the default interface address on port `9099` when this value is absent. On an unspecified IP address, such as `0.0.0.0` or `::`, the server accepts on every interface and publishes the default interface address of that family. Without `PROSODY_PEER_ADVERTISED_CONNECT`, a held port does not stop startup: the operating system selects a port, and Prosody logs it at the info level. A local router does not select an address. |
 | `PROSODY_PEER_ADVERTISED_CONNECT` | unset | Peers on another network need an entry point. | The gRPC connect URI that remote peers use. | Must be a valid gRPC URI. |
 | `PROSODY_PEER_NETWORK_NAME` | unset | A shared label identifies peers that can use direct addresses. | The network group used to choose a direct address or advertised endpoint. | Must not be empty when set. |
 | `PROSODY_PEER_CACHE_CAPACITY` | 256 | Peer caches need a fixed memory bound. | The entry count for address and channel caches. | Must be greater than zero. |
