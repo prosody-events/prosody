@@ -52,6 +52,27 @@ fn a_registration_publishes_the_bound_address() -> Result<()> {
     })
 }
 
+/// If another process holds the port, the listener binds another port on the
+/// same IP address.
+#[test]
+fn a_held_port_falls_back_to_another_port() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let holder = BoundListener::bind(bind_address()).await?;
+        let held = holder.address();
+
+        let bound = BoundListener::bind(held).await?.address();
+        ensure!(
+            bound.ip() == held.ip(),
+            "the listener changed the IP address"
+        );
+        ensure!(
+            bound.port() != held.port(),
+            "the listener bound the held port"
+        );
+        Ok(())
+    })
+}
+
 #[test]
 fn reflection_is_always_served() -> Result<()> {
     init_test_logging();

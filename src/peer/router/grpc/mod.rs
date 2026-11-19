@@ -40,7 +40,7 @@ mod tests;
 use self::generated::peer_service_server::PeerServiceServer;
 use self::service::PeerService;
 use crate::peer::router::RelayHop;
-use std::io::Error as IoError;
+use std::io::{Error as IoError, ErrorKind};
 use std::net::SocketAddr;
 use std::time::Duration;
 use thiserror::Error;
@@ -50,7 +50,7 @@ use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 use tonic_health::server::health_reporter;
 use tonic_reflection::server::{Builder as ReflectionBuilder, Error as ReflectionError};
-use tracing::error;
+use tracing::{error, info};
 
 /// The peer schema, embedded so reflection can publish it without a file.
 const DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/peer_descriptor.bin"));
@@ -74,11 +74,29 @@ pub(crate) struct BoundListener {
 impl BoundListener {
     /// Binds `address`. Port zero asks the operating system for one.
     ///
+    /// If another process holds the port, the operating system selects a port
+    /// on the same IP address. Registration publishes the bound port, so peers
+    /// still find this listener.
+    ///
     /// # Errors
     ///
     /// Returns [`TransportError::Bind`] when the address cannot be bound.
     pub(crate) async fn bind(address: SocketAddr) -> Result<Self, TransportError> {
-        let listener = TcpListener::bind(address).await?;
+        let listener = match TcpListener::bind(address).await {
+            Err(error) if error.kind() == ErrorKind::AddrInUse => {
+                let mut any_port = address;
+                any_port.set_port(0);
+                let listener = TcpListener::bind(any_port).await?;
+                info!(
+                    requested = %address,
+                    bound = %listener.local_addr()?,
+                    "Another process holds the requested peer port. Prosody uses a port that \
+                     the operating system selected. No action is necessary."
+                );
+                listener
+            }
+            bound => bound?,
+        };
         let address = listener.local_addr()?;
         Ok(Self { listener, address })
     }

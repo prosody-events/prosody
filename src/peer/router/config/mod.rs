@@ -11,7 +11,14 @@ use std::net::AddrParseError;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::time::Duration;
 use thiserror::Error;
+use tracing::info;
 use validator::{Validate, ValidationError, ValidationErrors};
+
+#[cfg(test)]
+mod tests;
+
+/// The port that the peer listener binds when the operator sets no address.
+const DEFAULT_PORT: u16 = 9099;
 
 /// How this process joins the peer fleet: what its listener binds, what it
 /// publishes about itself, how it answers, and what it may ask for.
@@ -29,8 +36,14 @@ use validator::{Validate, ValidationError, ValidationErrors};
 pub struct PeerConfiguration {
     /// The address for the peer listener.
     ///
-    /// Prosody selects an address when it starts the network router if this
-    /// value is absent. Local-only routers do not select an address.
+    /// Peers connect to the address that the listener binds. Prosody replaces
+    /// an unspecified IP address, such as `0.0.0.0` or `::`, with the address
+    /// of the default network interface. If this value is absent, a network
+    /// router uses that address on port 9099. Local-only routers bind no
+    /// address.
+    ///
+    /// If another process holds the port, the operating system selects a
+    /// port. Peers find the bound port through the peer directory.
     #[builder(default = "configured_bind_address()?")]
     pub bind_address: Option<SocketAddr>,
     /// The gRPC connect URI that peers on another network use.
@@ -67,7 +80,8 @@ fn configured_bind_address() -> Result<Option<SocketAddr>, PeerConfigurationBuil
     }
 }
 
-fn default_socket_address() -> Result<SocketAddr, PeerConfigurationError> {
+/// Returns the first usable address of the default network interface on `port`.
+fn default_interface_address(port: u16) -> Result<SocketAddr, PeerConfigurationError> {
     let interface = netdev::get_interfaces()
         .into_iter()
         .find(|interface| interface.default)
@@ -76,21 +90,21 @@ fn default_socket_address() -> Result<SocketAddr, PeerConfigurationError> {
         let address = network.addr();
         !address.is_link_local() && !address.is_loopback() && !address.is_unspecified()
     }) {
-        return Ok(SocketAddr::new(IpAddr::V4(network.addr()), 9099));
+        return Ok(SocketAddr::new(IpAddr::V4(network.addr()), port));
     }
     if let Some(network) = interface.ipv6.iter().find(|network| {
         let address = network.addr();
         !address.is_unicast_link_local() && !address.is_loopback() && !address.is_unspecified()
     }) {
-        return Ok(SocketAddr::new(IpAddr::V6(network.addr()), 9099));
+        return Ok(SocketAddr::new(IpAddr::V6(network.addr()), port));
     }
     if let Some(network) = interface.ipv4.first() {
-        return Ok(SocketAddr::new(IpAddr::V4(network.addr()), 9099));
+        return Ok(SocketAddr::new(IpAddr::V4(network.addr()), port));
     }
     interface
         .ipv6
         .first()
-        .map(|network| SocketAddrV6::new(network.addr(), 9099, 0, interface.index).into())
+        .map(|network| SocketAddrV6::new(network.addr(), port, 0, interface.index).into())
         .ok_or(PeerConfigurationError::NoInterfaceAddress)
 }
 
@@ -114,7 +128,7 @@ impl PeerConfiguration {
     fn unvalidated_parts(&self) -> Result<PeerParts, PeerConfigurationError> {
         let lease = RegistrationTtl::try_from(self.registration_ttl)?;
         Ok(PeerParts {
-            bind: self.bind_address.map_or_else(default_socket_address, Ok)?,
+            bind: listener_address(self.bind_address)?,
             router: RouterConfiguration {
                 advertised: self
                     .advertised_connect
@@ -130,13 +144,26 @@ impl PeerConfiguration {
     }
 }
 
-fn validate_peer(config: &PeerConfiguration) -> Result<(), ValidationError> {
-    if config
-        .bind_address
-        .is_some_and(|bind| bind.ip().is_unspecified())
-    {
-        return Err(ValidationError::new("unspecified_bind_address"));
+/// Resolves the configured bind address to an address that peers can connect
+/// to. The result never has an unspecified IP address.
+fn listener_address(configured: Option<SocketAddr>) -> Result<SocketAddr, PeerConfigurationError> {
+    match configured {
+        None => default_interface_address(DEFAULT_PORT),
+        Some(bind) if bind.ip().is_unspecified() => {
+            let resolved = default_interface_address(bind.port())?;
+            info!(
+                configured = %bind,
+                resolved = %resolved,
+                "Peers cannot connect to an unspecified peer bind address. Prosody uses the \
+                 address of the default network interface. No action is necessary."
+            );
+            Ok(resolved)
+        }
+        Some(bind) => Ok(bind),
     }
+}
+
+fn validate_peer(config: &PeerConfiguration) -> Result<(), ValidationError> {
     RouterConfiguration {
         advertised: config
             .advertised_connect
