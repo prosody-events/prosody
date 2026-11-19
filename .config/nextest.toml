@@ -1,2 +1,11 @@
 [profile.default]
 status-level = "pass"
+
+# A backstop for hung tests, not a performance gate.
+#
+# Without it, nextest reports a hung test as slow and waits for it forever.
+# The runner then loses its connection and GitHub discards the job log, so no
+# one can see which test hung. With it, nextest stops the test and prints its
+# name and output. No test may run longer than five minutes, so ten minutes
+# leaves room for a slow runner.
+slow-timeout = { period = "60s", terminate-after = 10 }
