@@ -726,14 +726,57 @@ reference implementation.
 
 ## Workflows
 
-When launching multi-agent workflows:
+When launching multi-agent workflows or subagents:
 
-- **Select model and effort per task by complexity — don't let every agent
-  inherit the session model.** Reserve the top tier for the hardest
-  creative/correctness-critical work; use mid tiers for review lenses and
-  judgment-guided-but-narrow tasks; use the smallest tier and low effort for
-  mechanical work (grep enumeration, running gate commands). But never
-  downgrade a stage whose output gates a commit or ship decision.
+- **Set the model and the effort on every agent.** Do not let an agent
+  inherit the session model or the model's default effort. The defaults
+  differ: Opus 5.5 and Haiku 5.5 default to `medium`, and Sonnet 5.5 and
+  Fable 5.2 default to `high`. Pick the cheapest row that does the task well.
+  Never downgrade a stage whose output gates a commit or ship decision.
+
+  | Task | Model | Effort |
+  | --- | --- | --- |
+  | Mechanical work: grep enumeration, gate commands, file moves | Haiku 5.5 | `low` |
+  | Lookups, documentation research, summaries, checkable extraction | Haiku 5.5 | `medium` |
+  | Narrow review lenses, narrow edits that follow a clear rule | Sonnet 5.5 | `high` |
+  | Implementation, design, refactors, most agent work | Opus 5.5 | `medium` |
+  | Correctness-critical code: concurrency, durability, state machines | Opus 5.5 | `high` |
+  | Defect search, adversarial verification, long unattended runs | Fable 5.2 | `high` |
+
+- **The continuum.** Anthropic measured cost per solved task on a SWE-bench
+  Pro subset in November 2026. Lower rows cost more and solve more. Source:
+  <https://platform.claude.com/docs/en/about-claude/models/optimizing-for-cost-and-intelligence>.
+
+  | Model | Effort | Tasks solved | Cost per solved task |
+  | --- | --- | --- | --- |
+  | Sonnet 5.5 | `high` | 87.6% | $0.11 |
+  | Opus 5.5 | `low` | 87.4% | $0.12 |
+  | Opus 5.5 | `medium` | 93.1% | $0.22 |
+  | Opus 5.5 | `high` | 95.5% | $0.30 |
+  | Fable 5.2 | `low` | 94.6% | $0.39 |
+  | Opus 5.5 | `xhigh` | 96.5% | $0.75 |
+  | Fable 5.2 | `high` | 96.3% | $1.39 |
+
+  Haiku 5.5 scored 85% on GPQA Diamond. Opus 5.5 and Sonnet 5.5 scored 91%.
+  Haiku 5.5 cost about a twentieth of Opus 5.5 per correct answer.
+
+- **Raise the effort before you change the model.** Opus 5.5 at `high`
+  solves more coding tasks than Fable 5.2 at `low`, for less money. Opus 5.5
+  at `xhigh` equals Fable 5.2 at `high` for about half the cost.
+- **Use Fable 5.2 only where its lead was measured:** defect search,
+  demanding reasoning, and long-horizon agentic work. On defect search,
+  Fable 5.2 lost 4 points from `high` to `low`. Opus 5.5 lost 34 points from
+  `medium` to `low`. Never run a bug hunt on Opus 5.5 or Sonnet 5.5 at `low`.
+- **Do not use Fable 5.2 for research.** On a research benchmark it cost 2.9
+  times as much as Opus 5.5 and scored 1.9 points lower. Run research agents
+  at `medium`: Opus 5.5 lost 13 points at `low` on a research benchmark.
+- **Do not use `max` effort or fast mode.** `max` has no measured gain over
+  `xhigh` and uses many more tokens. Fast mode doubles the token price for the
+  same output. Use `xhigh` only where a gain was measured: on coding, Opus 5.5
+  at `xhigh` cost 2.5 times its `high` cost for one more point.
+- **Escalate failures, not all work.** When a test or checker judges the
+  output, run at the lower effort and re-run only the failures at a higher
+  effort. Anthropic measured the same pass rate for about half the cost.
 - **Disable the advisor in every agent prompt.** The advisor tool stalls and
   kills workflow agents; each prompt must explicitly forbid consulting it.
 - **Keep structured-output schemata trivially simple.** One of the most common
