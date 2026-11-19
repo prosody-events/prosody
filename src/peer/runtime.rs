@@ -208,12 +208,16 @@ pub(crate) async fn prepare_network<D: PeerDirectory>(
     parts: PeerParts,
     directory: D,
 ) -> Result<PreparedPeerRuntime<D>, ConsumerError> {
-    let listener =
-        BoundListener::bind(parts.bind)
-            .await
-            .map_err(|error| PeerInitError::Listener {
-                message: format!("{error:#}"),
-            })?;
+    // An advertised entry point forwards to the configured port, so that port
+    // must not move.
+    let bound = if parts.router.advertised.is_some() {
+        BoundListener::bind(parts.bind).await
+    } else {
+        BoundListener::bind_any_port(parts.bind).await
+    };
+    let listener = bound.map_err(|error| PeerInitError::Listener {
+        message: format!("{error:#}"),
+    })?;
     PreparedPeerRuntime::start(PeerInputs {
         directory,
         listener,
