@@ -26,6 +26,7 @@ pub(crate) mod cache_config;
 pub(crate) mod config;
 pub(crate) mod directory;
 pub(crate) mod grpc;
+pub(crate) mod interface;
 #[cfg(test)]
 pub(crate) mod loopback;
 pub(crate) mod relay;

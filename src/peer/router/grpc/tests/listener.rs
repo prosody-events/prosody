@@ -5,13 +5,16 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::peer::router::cache_config::PeerCacheConfiguration;
 use crate::peer::router::directory::tests::support::cassandra_directory;
 use crate::peer::router::directory::{PeerDirectory, RegistrationTtl};
-use crate::peer::router::grpc::BoundListener;
+use crate::peer::router::grpc::{BoundListener, TransportError};
 use crate::peer::router::loopback::listener::bind_address;
 use crate::peer::router::runtime::{PeerInputs, RouterConfiguration, start_runtime};
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
+use std::io::ErrorKind;
+use std::net::{Ipv4Addr, SocketAddr};
+use tokio::net::TcpStream;
 use tokio_stream::StreamExt;
 use tonic::transport::Endpoint as Dialled;
 use tonic_reflection::pb::v1::ServerReflectionRequest;
@@ -52,23 +55,40 @@ fn a_registration_publishes_the_bound_address() -> Result<()> {
     })
 }
 
-/// If another process holds the port, the listener binds another port on the
-/// same IP address.
+/// A held port stops a strict bind. The other bind moves to a port that the
+/// operating system selects, on the same IP address.
 #[test]
-fn a_held_port_falls_back_to_another_port() -> Result<()> {
+fn only_a_movable_bind_leaves_a_held_port() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let holder = BoundListener::bind(bind_address()).await?;
         let held = holder.address();
 
-        let bound = BoundListener::bind(held).await?.address();
+        let strict = BoundListener::bind(held).await;
         ensure!(
-            bound.ip() == held.ip(),
-            "the listener changed the IP address"
+            matches!(&strict, Err(TransportError::Bind(error)) if error.kind() == ErrorKind::AddrInUse),
+            "a strict bind left the held port"
         );
+
+        let moved = BoundListener::bind_any_port(held).await?.address();
+        ensure!(moved.ip() == held.ip(), "the bind changed the IP address");
+        ensure!(moved.port() != held.port(), "the bind used the held port");
+        Ok(())
+    })
+}
+
+/// A wildcard listener accepts on every interface, but it publishes an IPv4
+/// interface address that peers can connect to.
+#[test]
+fn a_wildcard_listener_publishes_an_interface_address() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let bound = BoundListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await?;
+        let published = bound.address();
         ensure!(
-            bound.port() != held.port(),
-            "the listener bound the held port"
+            published.is_ipv4() && !published.ip().is_unspecified(),
+            "the listener published {published}"
         );
+
+        TcpStream::connect((Ipv4Addr::LOCALHOST, published.port())).await?;
         Ok(())
     })
 }
