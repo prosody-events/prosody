@@ -1,3 +1,6 @@
+# Each Kafka and Cassandra container has a memory and CPU limit, and its JVM
+# has a fixed heap below that limit. By default a JVM sizes its heap from
+# Docker's total memory, not from its limit.
 services:
   lgtm:
     image: grafana/otel-lgtm:latest
@@ -13,6 +16,8 @@ services:
 
   kafka:
     image: apache/kafka:latest
+    mem_limit: 1536m
+    cpus: 2
     ports:
       - "9094:9094"
     volumes:
@@ -32,17 +37,26 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_HEAP_OPTS: -Xms768m -Xmx768m
     healthcheck:
       test: [ "CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list" ]
       interval: 15s
       timeout: 10s
       retries: 15
+  # Cassandra commits its whole heap at start. The limit leaves room above the
+  # heap and the direct memory for the JVM's own memory. With G1,
+  # cassandra-env.sh reads MAX_HEAP_SIZE alone.
   cassandra:
     image: cassandra:latest
+    mem_limit: 3g
+    cpus: 4
     ports:
       - "9042:9042"
     volumes:
       - cassandra_data:/var/lib/cassandra
+    environment:
+      MAX_HEAP_SIZE: 1536M
+      MAX_DIRECT_MEMORY_SIZE: 512M
     healthcheck:
       test: [ "CMD-SHELL", "cqlsh -e 'SELECT cluster_name FROM system.local;'" ]
       interval: 15s
