@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/prosody-events/prosody/compare/prosody-macros-v0.9.0...prosody-macros-v0.9.1) (2026-11-20)
+
+
+### Miscellaneous Chores
+
+* **prosody-macros:** Synchronize prosody versions
+
 ## [0.9.0](https://github.com/prosody-events/prosody/compare/prosody-macros-v0.8.0...prosody-macros-v0.9.0) (2026-11-17)
 
 

@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.9.1](https://github.com/prosody-events/prosody/compare/prosody-v0.9.0...prosody-v0.9.1) (2026-11-20)
+
+
+### Bug Fixes
+
+* **peer:** recover from a held or unspecified peer bind address ([#141](https://github.com/prosody-events/prosody/issues/141)) ([bd5c4ca](https://github.com/prosody-events/prosody/commit/bd5c4caeaff3273c7b604f820cdfb780147dcaa9))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * prosody-macros bumped from 0.9.0 to 0.9.1
+
 ## [0.9.0](https://github.com/prosody-events/prosody/compare/prosody-v0.8.0...prosody-v0.9.0) (2026-11-17)
 
 
