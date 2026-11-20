@@ -142,9 +142,7 @@ jobs:
           crate: cargo-nextest
           locked: true
       - name: Run tests
-        run: |
-          ( while true; do echo "== memory $(date -u +%T)"; free -m | sed -n 2,3p; ps -eo rss,comm --sort=-rss | head -6; sleep 15; done ) &
-          cargo nextest run
+        run: cargo nextest run
         env:
           PROSODY_BOOTSTRAP_SERVERS: localhost:9094
 
