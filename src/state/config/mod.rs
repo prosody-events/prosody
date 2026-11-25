@@ -103,12 +103,13 @@ pub struct KeyedStateConfiguration {
     ///
     /// The local keyed-state cache gives each new partition assignment an
     /// equal share of this budget. The share is the budget divided by the
-    /// number of partitions the consumer holds or is about to hold. A
-    /// partition flushes its writes to disk when they reach its share, and
-    /// it keeps that share until it is revoked. Thus memory use can exceed
-    /// the budget after the number of assigned partitions grows. A smaller
-    /// budget uses less memory but writes and compacts more files. Defaults
-    /// to 192 MiB.
+    /// number of partitions the consumer holds or is about to hold, between
+    /// 1 MiB and 64 MiB. A partition flushes its writes to disk when they
+    /// reach its share, and it keeps that share until it is revoked. Thus
+    /// memory use can exceed the budget after the number of assigned
+    /// partitions grows, or past budget / 1 MiB partitions. A smaller budget
+    /// uses less memory but writes and compacts more files. Defaults to
+    /// 192 MiB.
     ///
     /// Environment variable: `PROSODY_STATE_MEMTABLE_SIZE`. Accepts a
     /// positive human-readable byte size such as `256 MiB`. A bare number is

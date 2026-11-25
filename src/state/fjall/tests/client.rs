@@ -3,6 +3,7 @@
 use super::*;
 use crate::ByteSize;
 use crate::state::config::{DEFAULT_MEMTABLE_SIZE, KeyedStateConfiguration};
+use crate::state::fjall::OwnedPartitions;
 use crate::state::fjall::client::{database_builder, keyspace_options};
 use crate::state::fjall::lifecycle::{create, delete, memtable_share};
 use fjall::Keyspace;
@@ -62,9 +63,7 @@ impl Arbitrary for Trace {
 
 /// Lifecycle model: after the queued creates and deletes run, every live slot
 /// holds a keyspace, the database holds exactly those keyspaces, and no
-/// keyspace name serves two assignments. The creates that report success,
-/// less the deletes, equal the keyspaces in the database. The lifecycle task
-/// divides the memtable budget by that count. Revokes often land before the
+/// keyspace name serves two assignments. Revokes often land before the
 /// create runs, so the trace covers creates for assignments that already ended.
 /// The lifecycle task runs creates first, and this model does the same. Each
 /// iteration first deletes the keyspaces that a failed iteration left, so a
@@ -87,7 +86,6 @@ fn prop_keyspaces_track_live_slots() {
         let mut creates = Vec::new();
         let mut live: Vec<(usize, CacheSlot)> = Vec::new();
         let mut owners: HashMap<String, usize> = HashMap::new();
-        let mut existing: usize = 0;
 
         for (step, op) in trace.0.iter().chain([&Op::Settle]).enumerate() {
             match op {
@@ -103,16 +101,10 @@ fn prop_keyspaces_track_live_slots() {
                 }
                 Op::Settle => {
                     for slot in creates.drain(..) {
-                        if create(database, options.clone(), slot, &queue.downgrade()).await {
-                            existing += 1;
-                        }
+                        create(database, options.clone(), slot, &queue.downgrade()).await;
                     }
                     while let Ok(keyspace) = retired.try_recv() {
                         delete(database, keyspace).await;
-                        existing -= 1;
-                    }
-                    if existing != keyspace_names(database).len() {
-                        return Ok(false);
                     }
                     let mut held = BTreeSet::new();
                     for (id, slot) in &live {
@@ -163,8 +155,8 @@ fn clients_own_fresh_directories_that_fjall_removes() -> Result<()> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
     let _clients = runtime.block_on(async {
         Ok::<_, Report>((
-            FjallClient::open(&config).await?,
-            FjallClient::open(&config).await?,
+            FjallClient::open(&config, OwnedPartitions::default()).await?,
+            FjallClient::open(&config, OwnedPartitions::default()).await?,
         ))
     })?;
     assert_eq!(entries()?, 2, "each client opens its own subdirectory");
@@ -174,23 +166,20 @@ fn clients_own_fresh_directories_that_fjall_removes() -> Result<()> {
     Ok(())
 }
 
-/// The memtable shares of `partitions` keyspaces never exceed the budget, and
-/// together they leave less than one byte per keyspace unused.
+/// A memtable share stays between 1 MiB and 64 MiB. Above the floor, the
+/// shares of `partitions` keyspaces never exceed the budget, and together they
+/// leave less than one byte per keyspace unused.
 #[test]
 fn prop_memtable_shares_fill_the_budget() {
-    fn prop(budget: u64, partitions: u16) -> TestResult {
-        let Some(budget) = NonZeroU64::new(budget) else {
+    fn prop(kib: u32, partitions: u16) -> TestResult {
+        let Some(budget) = NonZeroU64::new(u64::from(kib) << 10_u32) else {
             return TestResult::discard();
         };
-        let share = u128::from(memtable_share(
-            ByteSize::new(budget),
-            usize::from(partitions),
-        ));
-        let keyspaces = u128::from(partitions.max(1));
-        let unused = u128::from(budget.get()) - share * keyspaces;
-        TestResult::from_bool(unused < keyspaces)
+        let share = memtable_share(ByteSize::new(budget), usize::from(partitions));
+        let exact = budget.get() / u64::from(partitions.max(1));
+        TestResult::from_bool(share == exact.clamp(1 << 20, 64 << 20))
     }
-    QuickCheck::new().quickcheck(prop as fn(u64, u16) -> TestResult);
+    QuickCheck::new().quickcheck(prop as fn(u32, u16) -> TestResult);
 }
 
 /// `owned_cache_size` sets fjall's block-cache capacity. `None` leaves the

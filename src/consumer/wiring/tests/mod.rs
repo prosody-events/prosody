@@ -430,6 +430,7 @@ async fn start<R: ResultRequestReader + 'static>(
             telemetry: &telemetry,
             heartbeats,
             managers,
+            owned: keyed_state.owned.clone(),
         },
         requests,
     ))

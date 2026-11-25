@@ -98,6 +98,7 @@ where
             telemetry: &telemetry,
             heartbeats,
             managers,
+            owned: keyed_state.owned.clone(),
         };
 
         match (consumer_config.mock, trigger_store_config) {

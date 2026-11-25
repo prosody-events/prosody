@@ -14,6 +14,7 @@ use crate::consumer::{Managers, ProsodyConsumer, RuntimeState, WatermarkVersion}
 use crate::heartbeat::HeartbeatRegistry;
 use crate::kafka::base_config;
 use crate::loader::MessageLoader;
+use crate::state::fjall::OwnedPartitions;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::EventSession;
 use crate::telemetry::Telemetry;
@@ -48,6 +49,9 @@ pub(in crate::consumer) struct StartupServices<'a> {
     pub(in crate::consumer) heartbeats: HeartbeatRegistry,
     /// The partition managers shared by startup, health, and shutdown.
     pub(in crate::consumer) managers: Arc<Managers>,
+    /// The partition count that the local cache divides its memtable budget
+    /// by.
+    pub(in crate::consumer) owned: OwnedPartitions,
 }
 
 /// Initializes a Prosody consumer with a trigger store provider, wiring the
@@ -84,6 +88,7 @@ where
         telemetry,
         heartbeats,
         managers,
+        owned,
     } = services;
 
     let watermark_version: Arc<WatermarkVersion> = Arc::default();
@@ -115,6 +120,7 @@ where
         ContextHandles {
             managers: managers.clone(),
             assignment_tx,
+            owned,
             telemetry: telemetry.sender(),
         },
         version,

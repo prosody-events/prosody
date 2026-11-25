@@ -50,8 +50,8 @@ pub(crate) use clock::Clock;
 pub(crate) use error::FjallCellCacheError;
 #[cfg(test)]
 pub(crate) use faults::Faults;
-pub(crate) use lifecycle::CacheSlot;
 use lifecycle::Retire;
+pub(crate) use lifecycle::{CacheSlot, OwnedPartitions};
 
 use crate::state::CollectionId;
 use crate::state::cell::{Committed, Projection, ProvisionalWrite, Values};

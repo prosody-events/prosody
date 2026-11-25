@@ -15,6 +15,7 @@
 //! collection evidence are the recovery source.
 
 use super::CacheSlot;
+use super::OwnedPartitions;
 use super::lifecycle::{self, Pending};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::config::KeyedStateConfiguration;
@@ -38,7 +39,8 @@ pub(crate) struct FjallClient {
 
 impl FjallClient {
     /// Opens an empty database in a fresh directory under `cache_dir` and
-    /// starts the lifecycle task.
+    /// starts the lifecycle task, which divides the memtable budget by
+    /// `owned`.
     ///
     /// The directory name is a new v4 UUID, so no other client can use it.
     /// fjall removes the directory when the last database handle drops.
@@ -46,11 +48,14 @@ impl FjallClient {
     /// # Errors
     ///
     /// Returns [`FjallClientError`] when the database cannot be opened.
-    pub async fn open(config: &KeyedStateConfiguration) -> Result<Self, FjallClientError> {
+    pub async fn open(
+        config: &KeyedStateConfiguration,
+        owned: OwnedPartitions,
+    ) -> Result<Self, FjallClientError> {
         let builder = database_builder(config);
         let database = spawn_blocking(move || builder.open()).await??;
         let (creates, retires) =
-            lifecycle::spawn(database, keyspace_options(), config.memtable_size);
+            lifecycle::spawn(database, keyspace_options(), config.memtable_size, owned);
         Ok(Self {
             creates,
             _retires: retires,
