@@ -13,7 +13,7 @@ use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
 };
 use crate::state::config::KeyedStateConfiguration;
-use crate::state::fjall::FjallClient;
+use crate::state::fjall::{FjallClient, OwnedPartitions};
 use crate::state::manager::StateManagerProvider;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
@@ -44,6 +44,8 @@ pub(crate) struct KeyedStateInputs {
     config: KeyedStateConfiguration,
     group: ConsumerGroup,
     pub(in crate::consumer) version: Arc<str>,
+    /// Set by the rebalance callback and read by the local cache.
+    pub(in crate::consumer) owned: OwnedPartitions,
     registry: Arc<CollectionDefRegistry>,
     topics: Vec<Topic>,
     bootstrap_servers: String,
@@ -79,6 +81,7 @@ impl KeyedStateInputs {
             config,
             group: Arc::from(consumer_config.group_id.as_str()),
             version: Arc::from(dedup_version),
+            owned: OwnedPartitions::default(),
             registry,
             topics,
             bootstrap_servers: consumer_config.bootstrap_servers.join(","),
@@ -108,7 +111,8 @@ impl KeyedStateInputs {
     ///
     /// [`KeyedStateInitError::Cache`] when the cache cannot be opened.
     pub(in crate::consumer) async fn open_cache(&self) -> Result<FjallClient, ConsumerError> {
-        FjallClient::open(&self.config).await.map_err(|error| {
+        let opened = FjallClient::open(&self.config, self.owned.clone()).await;
+        opened.map_err(|error| {
             KeyedStateInitError::Cache {
                 message: format!("{error:#}"),
                 category: error.classify_error(),

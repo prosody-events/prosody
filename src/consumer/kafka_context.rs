@@ -45,6 +45,7 @@ use crate::consumer::{
 };
 use crate::kafka::{log_error, log_line};
 use crate::loader::MessageLoader;
+use crate::state::fjall::OwnedPartitions;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::EventSession;
 use crate::telemetry::sender::TelemetrySender;
@@ -60,6 +61,8 @@ pub(super) struct ContextHandles {
     /// Publishes the assigned-partition count after each rebalance, so
     /// assignment readiness can be awaited rather than polled.
     pub(super) assignment_tx: watch::Sender<u32>,
+    /// The partition count that divides the local cache's memtable budget.
+    pub(super) owned: OwnedPartitions,
     /// Telemetry the context and the partitions it creates publish through.
     pub(super) telemetry: TelemetrySender,
 }
@@ -169,6 +172,9 @@ pub(super) struct Context<F: MakeManager> {
     /// can be awaited rather than polled.
     assignment_tx: watch::Sender<u32>,
 
+    /// Counts the partitions held or about to be held, for the local cache.
+    owned: OwnedPartitions,
+
     /// Publishes the rebalance events this context observes.
     telemetry: TelemetrySender,
 
@@ -255,6 +261,7 @@ where
         consumer: OnceLock::new(),
         managers: shared.managers,
         assignment_tx: shared.assignment_tx,
+        owned: shared.owned,
         telemetry: shared.telemetry,
         metrics: KafkaMetrics::new(&meter("prosody"), &config.group_id),
     })
@@ -321,6 +328,10 @@ impl<F: MakeManager> ConsumerContext for Context<F> {
                     return;
                 };
 
+                // Count the new partitions before any of them starts.
+                self.owned
+                    .set(self.managers.read().len() + partitions.count());
+
                 for element in partitions.elements() {
                     let topic = Topic::from(element.topic());
                     let partition = element.partition();
@@ -386,8 +397,9 @@ impl<F: MakeManager> ConsumerContext for Context<F> {
         // Publish the new assignment count so readiness can be awaited rather
         // than polled. Assign, revoke, and rebalance-error all fall through
         // here; empty rebalances returned early and left the count unchanged.
-        self.assignment_tx
-            .send_replace(get_assigned_partition_count(&self.managers));
+        let assigned = get_assigned_partition_count(&self.managers);
+        self.owned.set(assigned as usize);
+        self.assignment_tx.send_replace(assigned);
 
         debug!("pre-rebalance complete");
     }

@@ -26,6 +26,7 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::MessageLoader;
 use crate::peer::Router;
+use crate::state::fjall::OwnedPartitions;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::EventSession;
 use crate::state_reader::ConsumerReaderBackend;
@@ -45,6 +46,7 @@ struct PipelineMiddlewareStack {
     retry_middleware: RetryMiddleware,
     heartbeats: HeartbeatRegistry,
     telemetry: Telemetry,
+    owned: OwnedPartitions,
 }
 
 impl PipelineMiddlewareStack {
@@ -111,6 +113,7 @@ impl PipelineMiddlewareStack {
             telemetry: &self.telemetry,
             heartbeats: self.heartbeats,
             managers: Arc::clone(&managers),
+            owned: self.owned,
         };
         // Preparation is the last fallible step of this mode: no `?` after it
         // could drop a served listener.
@@ -254,7 +257,7 @@ where
             monopolization,
             defer,
         } = pipeline_config;
-        let (components, _keyed_state, heartbeats) = build_typed_state(&setup).await?;
+        let (components, keyed_state, heartbeats) = build_typed_state(&setup).await?;
         let failure_tracker = FailureTracker::new(
             defer.failure_window,
             defer.failure_threshold,
@@ -270,6 +273,7 @@ where
             retry_middleware: RetryMiddleware::new(retry)?,
             heartbeats,
             telemetry,
+            owned: keyed_state.owned,
         };
         let message_defer = MessageDeferMiddleware::new(
             defer,

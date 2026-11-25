@@ -3,8 +3,9 @@
 use super::*;
 use crate::ByteSize;
 use crate::state::config::KeyedStateConfiguration;
+use crate::state::fjall::OwnedPartitions;
 use crate::state::fjall::client::{database_builder, keyspace_options};
-use crate::state::fjall::lifecycle::{create, delete};
+use crate::state::fjall::lifecycle::{create, delete, memtable_share};
 use fjall::Keyspace;
 use quickcheck::{Arbitrary, Gen};
 use std::collections::HashMap;
@@ -77,7 +78,7 @@ fn prop_keyspaces_track_live_slots() {
                 Ok::<_, Report>((database, dir))
             })
             .await?;
-        let options = keyspace_options(None);
+        let options = keyspace_options();
         for name in keyspace_names(database) {
             database.delete_keyspace(database.keyspace(&name, || options.clone())?)?;
         }
@@ -100,7 +101,7 @@ fn prop_keyspaces_track_live_slots() {
                 }
                 Op::Settle => {
                     for slot in creates.drain(..) {
-                        create(database, &options, slot, &queue.downgrade()).await;
+                        create(database, options.clone(), slot, &queue.downgrade()).await;
                     }
                     while let Ok(keyspace) = retired.try_recv() {
                         delete(database, keyspace).await;
@@ -154,8 +155,8 @@ fn clients_own_fresh_directories_that_fjall_removes() -> Result<()> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
     let _clients = runtime.block_on(async {
         Ok::<_, Report>((
-            FjallClient::open(&config).await?,
-            FjallClient::open(&config).await?,
+            FjallClient::open(&config, OwnedPartitions::default()).await?,
+            FjallClient::open(&config, OwnedPartitions::default()).await?,
         ))
     })?;
     assert_eq!(entries()?, 2, "each client opens its own subdirectory");
@@ -163,6 +164,24 @@ fn clients_own_fresh_directories_that_fjall_removes() -> Result<()> {
 
     assert_eq!(entries()?, 0, "fjall must remove every client directory");
     Ok(())
+}
+
+/// A memtable share is at most 64 MiB. The shares of `partitions` keyspaces
+/// never sum to more than the budget. Below the cap, they leave less than one
+/// byte per keyspace unused.
+#[test]
+fn prop_memtable_shares_split_the_budget() {
+    fn prop(kib: u32, partitions: u16) -> TestResult {
+        let Some(budget) = NonZeroU64::new(u64::from(kib) << 10_u32) else {
+            return TestResult::discard();
+        };
+        let share = memtable_share(ByteSize::new(budget), usize::from(partitions));
+        let keyspaces = u64::from(partitions.max(1));
+        let unused = budget.get().checked_sub(share * keyspaces);
+        let split = unused.is_some_and(|unused| share == 64 << 20_u32 || unused < keyspaces);
+        TestResult::from_bool(share <= 64 << 20_u32 && split)
+    }
+    QuickCheck::new().quickcheck(prop as fn(u32, u16) -> TestResult);
 }
 
 /// `owned_cache_size` sets fjall's block-cache capacity. `None` leaves the

@@ -191,6 +191,7 @@ where
             telemetry: &telemetry,
             heartbeats,
             managers: Arc::clone(&managers),
+            owned: keyed_state.owned.clone(),
         };
         initialize_consumer::<_, _, _, C, _>(
             setup.consumer,

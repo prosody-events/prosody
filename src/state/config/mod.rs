@@ -21,7 +21,7 @@ const STATE_CACHE_DIR_ENV: &str = "PROSODY_STATE_CACHE_DIR";
 /// Environment variable for the owning keyed-state cache capacity.
 const STATE_OWNED_CACHE_SIZE_ENV: &str = "PROSODY_STATE_OWNED_CACHE_SIZE";
 
-/// Environment variable for the per-partition memtable size.
+/// Environment variable for the memtable budget of all partitions together.
 const STATE_MEMTABLE_SIZE_ENV: &str = "PROSODY_STATE_MEMTABLE_SIZE";
 
 /// Environment variable for the reader-side read-through cache capacity, in
@@ -40,6 +40,9 @@ const SUBSYSTEM_ENV: &str = "PROSODY_SUBSYSTEM";
 const DEFAULT_READ_CACHE_TTL: Duration = Duration::from_secs(5);
 
 const DEFAULT_READER_CACHE_SIZE: ByteSize = ByteSize::bytes(1 << 20_u32);
+
+/// The smallest memtable budget: fjall's smallest recommended memtable size.
+const MIN_MEMTABLE_SIZE: u64 = 8 << 20;
 
 /// Configuration for the pipeline consumer's keyed-state layer.
 ///
@@ -95,19 +98,24 @@ pub struct KeyedStateConfiguration {
     #[builder(default = "from_option_env(STATE_OWNED_CACHE_SIZE_ENV)?")]
     pub owned_cache_size: Option<ByteSize>,
 
-    /// Size at which the local keyed-state cache flushes a partition's
-    /// in-memory writes to disk.
+    /// Memory budget for the in-memory writes of all assigned partitions
+    /// together.
     ///
-    /// Each assigned partition holds up to this many bytes in memory, so
-    /// memory use scales with the number of assigned partitions. Flushes
-    /// also start when the storage engine's write-ahead log grows too large.
-    /// A smaller size uses less memory but writes and compacts more files.
-    /// `None` (the default) uses the storage engine's default of 64 MiB.
+    /// The local keyed-state cache gives each new partition assignment an
+    /// equal share of this budget. The share is the budget divided by the
+    /// number of partitions the consumer holds or is about to hold, at most
+    /// 64 MiB. A partition flushes its writes to disk when they reach its
+    /// share, and it keeps that share until it is revoked. Thus memory use
+    /// can exceed the budget after the number of assigned partitions grows.
+    /// A smaller budget uses less memory but writes and compacts more files.
+    /// `None` (the default) uses a budget of 192 MiB. Must be at least 8 MiB,
+    /// the smallest memtable size that the storage engine recommends.
     ///
     /// Environment variable: `PROSODY_STATE_MEMTABLE_SIZE`. Accepts a
-    /// positive human-readable byte size such as `16 MiB`. A bare number is
+    /// positive human-readable byte size such as `256 MiB`. A bare number is
     /// interpreted as bytes.
     #[builder(default = "from_option_env(STATE_MEMTABLE_SIZE_ENV)?")]
+    #[validate(range(min = MIN_MEMTABLE_SIZE))]
     pub memtable_size: Option<ByteSize>,
 
     /// Byte budget for the reader-side read-through cache. The high-level
