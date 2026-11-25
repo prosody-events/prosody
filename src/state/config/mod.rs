@@ -106,9 +106,7 @@ pub struct KeyedStateConfiguration {
     /// memory use can exceed the budget after the number of assigned
     /// partitions grows, or past budget / 1 MiB partitions. A smaller budget
     /// uses less memory but writes and compacts more files. `None` (the
-    /// default) sets no budget. Each partition then uses the storage
-    /// engine's default of 64 MiB, so memory use grows with the number of
-    /// assigned partitions.
+    /// default) uses a budget of 192 MiB.
     ///
     /// Environment variable: `PROSODY_STATE_MEMTABLE_SIZE`. Accepts a
     /// positive human-readable byte size such as `256 MiB`. A bare number is

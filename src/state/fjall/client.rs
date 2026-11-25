@@ -17,6 +17,7 @@
 use super::CacheSlot;
 use super::OwnedPartitions;
 use super::lifecycle::{self, Pending};
+use crate::ByteSize;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::config::KeyedStateConfiguration;
 use fjall::config::CompressionPolicy;
@@ -25,6 +26,9 @@ use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::{JoinError, spawn_blocking};
 use uuid::Uuid;
+
+/// The memtable budget when the configuration sets none.
+const DEFAULT_MEMTABLE_SIZE: ByteSize = ByteSize::bytes(192 << 20_u32);
 
 /// The queues of the lifecycle task that owns a fjall database.
 ///
@@ -54,8 +58,12 @@ impl FjallClient {
     ) -> Result<Self, FjallClientError> {
         let builder = database_builder(config);
         let database = spawn_blocking(move || builder.open()).await??;
-        let (creates, retires) =
-            lifecycle::spawn(database, keyspace_options(), config.memtable_size, owned);
+        let (creates, retires) = lifecycle::spawn(
+            database,
+            keyspace_options(),
+            config.memtable_size.unwrap_or(DEFAULT_MEMTABLE_SIZE),
+            owned,
+        );
         Ok(Self {
             creates,
             _retires: retires,

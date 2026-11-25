@@ -6,7 +6,7 @@
 //! for them. Creates run before deletes: a create lets an assignment start
 //! caching, and a delete only reclaims disk.
 //!
-//! The task also divides any memtable budget. Each new keyspace gets the
+//! The task also divides the memtable budget. Each new keyspace gets the
 //! budget divided by the [`OwnedPartitions`] count. A keyspace keeps its share
 //! until it is deleted, because fjall cannot change the memtable size of a live
 //! keyspace.
@@ -121,13 +121,12 @@ impl Drop for Retire {
 
 /// Starts the lifecycle task for `database` and returns its create and delete
 /// queues. The task creates each keyspace with `options` and a share of the
-/// memtable `budget` for each of the `owned` partitions. Without a budget,
-/// each keyspace keeps fjall's default memtable size. The caller runs
+/// memtable `budget` for each of the `owned` partitions. The caller runs
 /// inside a Tokio runtime.
 pub(super) fn spawn(
     database: Database,
     options: KeyspaceCreateOptions,
-    budget: Option<ByteSize>,
+    budget: ByteSize,
     owned: OwnedPartitions,
 ) -> (UnboundedSender<Pending>, UnboundedSender<Keyspace>) {
     let (creates, create_rx) = unbounded_channel();
@@ -150,7 +149,7 @@ pub(super) fn spawn(
 async fn run(
     database: Database,
     options: KeyspaceCreateOptions,
-    budget: Option<ByteSize>,
+    budget: ByteSize,
     owned: OwnedPartitions,
     mut creates: UnboundedReceiver<Pending>,
     mut retires: UnboundedReceiver<Keyspace>,
@@ -160,10 +159,8 @@ async fn run(
         select! {
             biased;
             Some(slot) = creates.recv() => {
-                let mut options = options.clone();
-                if let Some(budget) = budget {
-                    options = options.max_memtable_size(memtable_share(budget, owned.get()));
-                }
+                let share = memtable_share(budget, owned.get());
+                let options = options.clone().max_memtable_size(share);
                 create(&database, options, slot, &retire_queue).await;
             }
             Some(keyspace) = retires.recv() => delete(&database, keyspace).await,
